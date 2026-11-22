@@ -14,6 +14,8 @@ use serde_json::{Value, json};
 
 use crate::support::*;
 
+mod keyboard;
+
 /// The running pod whose log the test reads: one container, `nginx`.
 const POD: &str = "web-69c6f74b8b-qv4xv";
 /// The other pod of Deployment `web`.

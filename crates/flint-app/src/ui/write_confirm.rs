@@ -6,7 +6,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use flint_core::CoreHandle;
-use flint_core::display::ClusterNames;
+use flint_core::display::{ClusterNames, single_line};
 use flint_core::write::{
     ResourceChange, WriteAction, WriteError, WriteOutcome, WriteReview, WriteTarget, WriteWarning,
 };
@@ -137,9 +137,15 @@ fn evicts_managed_text(pods: &[String]) -> String {
     )
 }
 
-/// What a warning says.
-fn warning_text(warning: &WriteWarning) -> String {
+/// What a warning about a change to `target` says. A review reads the live object, so for a
+/// Secret it does not name the manager: the detail view and MCP show no annotation value of one.
+fn warning_text(target: &WriteTarget, warning: &WriteWarning) -> String {
     match warning {
+        WriteWarning::LikelyReverted(_)
+            if flint_core::redact::is_secret_list(target.kind.as_str()) =>
+        {
+            "Managed by GitOps. This change will likely be reverted on the next sync.".to_owned()
+        }
         WriteWarning::LikelyReverted(managed) => {
             format!("Managed by {managed}. This change will likely be reverted on the next sync.")
         }
@@ -176,7 +182,10 @@ fn dialog_text_saying(
     saying: &[String],
     shown: &str,
 ) -> DialogText {
-    let mut lines: Vec<String> = warnings.iter().map(warning_text).collect();
+    let mut lines: Vec<String> = warnings
+        .iter()
+        .map(|warning| warning_text(target, warning))
+        .collect();
     if !lines.is_empty() {
         lines.push(String::new());
     }
@@ -184,26 +193,41 @@ fn dialog_text_saying(
         lines.extend_from_slice(saying);
         lines.push(String::new());
     }
-    lines.push(format!("Context: {}", target.cluster));
-    lines.push(format!(
-        "Server: {}",
-        target
-            .server
-            .as_deref()
-            .map_or("no server".to_owned(), flint_core::redact::server_url)
-    ));
-    if let Some(namespace) = &target.namespace {
-        lines.push(format!("Namespace: {namespace}"));
-    }
-    lines.push(format!("Object: {} {}", target.kind, target.name));
+    lines.extend(target_lines(target));
     DialogText {
-        title: format!("{} {} on {shown}?", wording.title, target.name),
+        title: format!(
+            "{} {} on {}?",
+            wording.title,
+            confirm::title_name(&single_line(&target.name)),
+            confirm::title_name(shown)
+        ),
         text: lines.join("\n"),
         ok: wording.ok.to_owned(),
         cancel: "Cancel".to_owned(),
         id: "write-confirm-description",
         default_cancel: wording.deliberate,
     }
+}
+
+/// Exactly which object on which cluster: the lines a confirmation always keeps on show, one
+/// each, whatever the names hold.
+pub(in crate::ui) fn target_lines(target: &WriteTarget) -> Vec<String> {
+    let server = target
+        .server
+        .as_deref()
+        .map_or("no server".to_owned(), flint_core::redact::server_url);
+    let mut lines = vec![
+        format!("Context: {}", single_line(&target.cluster)),
+        format!("Server: {}", single_line(&server)),
+    ];
+    if let Some(namespace) = &target.namespace {
+        lines.push(format!("Namespace: {}", single_line(namespace)));
+    }
+    lines.push(format!(
+        "Object: {}",
+        single_line(&format!("{} {}", target.kind, target.name))
+    ));
+    lines
 }
 
 /// Asks to confirm `review`, first saying `note` (why this review was opened again), then runs it
@@ -234,8 +258,9 @@ pub fn open_noted(
         &saying,
         &shown,
     );
+    let pinned = target_lines(review.target()).len();
     let confirmed = confirmation(core, review, begin, on_done);
-    confirm::open(window, cx, text, move |_, cx| confirmed(cx));
+    confirm::open_pinned(window, cx, text, pinned, move |_, cx| confirmed(cx));
 }
 
 /// What confirming `review` does. A confirmation runs once, whatever `begin` or the write answers:
@@ -265,16 +290,24 @@ pub(in crate::ui) fn confirmation(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use flint_core::KindId;
+    use flint_core::display::ClusterNames;
     use flint_core::gitops::{ManagedBy, Manager};
     use flint_core::write::{WriteTarget, WriteWarning};
 
     use flint_core::write::ResourceChange;
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{AppContext as _, TestAppContext, VisualTestContext, px, size};
 
     use super::{
         Wording, change_lines, change_wording, dialog_text, dialog_text_saying,
         evicts_managed_text, warning_text,
     };
+    use crate::ui::confirm;
+    use crate::ui::support_tests::open_workspace;
+    use crate::ui::workspace::MIN_WINDOW_SIZE;
 
     const APPLY: Wording = Wording {
         title: "Apply changes to",
@@ -292,6 +325,231 @@ mod tests {
             uid: Some("uid-1".to_owned()),
             resource_version: Some("10".to_owned()),
         }
+    }
+
+    // covers UP-55: two clusters that share a short name get different titles.
+    #[test]
+    fn same_named_clusters_get_different_titles() {
+        let eu = "arn:aws:eks:eu-west-1:111111111111:cluster/payments-prod";
+        let us = "arn:aws:eks:us-east-1:222222222222:cluster/payments-prod";
+        let names = ClusterNames::new([eu, us], &BTreeMap::new());
+        let title = |cluster: &str| {
+            let target = WriteTarget {
+                cluster: cluster.into(),
+                ..target()
+            };
+            dialog_text(&target, APPLY, &[], &names.with_real(cluster)).title
+        };
+        assert_eq!(
+            title(eu),
+            "Apply changes to web on payments-prod · eu-west-1 · 111111111111?"
+        );
+        assert_eq!(
+            title(us),
+            "Apply changes to web on payments-prod · us-east-1 · 222222222222?"
+        );
+    }
+
+    // covers UP-53, UP-55: at the minimum window, two long contexts that share a short name keep
+    // titles that differ, and every pinned target line stays on show above the buttons.
+    #[gpui_kit::test]
+    async fn long_context_names_leave_the_target_on_show(cx: &mut TestAppContext) {
+        let (width, height) = MIN_WINDOW_SIZE;
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        // Long enough that the whole name in the title would push the target out of the dialog.
+        let context = |part: &str| format!("gke_{}_{part}_{}", "x".repeat(200), "y".repeat(200));
+        let (one, two) = (context("one"), context("two"));
+        let names = ClusterNames::new([one.as_str(), two.as_str()], &BTreeMap::new());
+        assert_ne!(names.with_real(&one), names.with_real(&two));
+        let on_one = WriteTarget {
+            cluster: one.as_str().into(),
+            ..target()
+        };
+        let warnings = vec![WriteWarning::LikelyReverted(ManagedBy {
+            manager: Manager::FluxKustomization,
+            name: "apps".to_owned(),
+            namespace: None,
+        })];
+        let text = dialog_text(&on_one, APPLY, &warnings, &names.with_real(&one));
+        let pinned = super::target_lines(&on_one).len();
+        VisualTestContext::from_window(t.window, cx).simulate_resize(size(px(width), px(height)));
+        cx.update_window(t.window, |_, window, cx| {
+            confirm::open_pinned(window, cx, text, pinned, |_, _| {})
+        })
+        .unwrap();
+        for _ in 0..3 {
+            cx.run_until_parked();
+            cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        }
+        let (surface, shown, ok) = cx
+            .update_window(t.window, |_, window, _| {
+                (
+                    window.find("surface").bounds(),
+                    window.find("confirm-target").bounds(),
+                    window.find("ok").bounds(),
+                )
+            })
+            .unwrap();
+        assert!(shown.size.height > px(0.), "{shown:?}");
+        assert!(
+            shown.origin.y >= surface.origin.y && shown.bottom() <= ok.origin.y,
+            "{shown:?} above {ok:?} in {surface:?}"
+        );
+        assert!(ok.bottom() <= surface.bottom().min(px(height)), "{ok:?}");
+    }
+
+    /// Opens the confirmation of a change to `target` at the minimum window and returns its
+    /// pinned lines as drawn, after checking they fit.
+    fn drawn_lines(
+        cx: &mut TestAppContext,
+        t: &crate::ui::support_tests::TestWorkspace,
+        target: &WriteTarget,
+    ) -> Vec<String> {
+        use gpui_kit::component::WindowExt as _;
+
+        let (width, height) = MIN_WINDOW_SIZE;
+        VisualTestContext::from_window(t.window, cx).simulate_resize(size(px(width), px(height)));
+        let names = ClusterNames::new([&*target.cluster], &BTreeMap::new());
+        let text = dialog_text(target, APPLY, &[], &names.with_real(&target.cluster));
+        let pinned = super::target_lines(target).len();
+        cx.update_window(t.window, |_, window, cx| {
+            confirm::open_pinned(window, cx, text, pinned, |_, _| {})
+        })
+        .unwrap();
+        for _ in 0..4 {
+            cx.run_until_parked();
+            cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        }
+        let lines = cx
+            .update_window(t.window, |_, window, _| {
+                confirm::assert_pinned_lines_fit(window, pinned, px(height))
+            })
+            .unwrap();
+        // The whole of every value stays in the dialog's text that scrolls.
+        let body = cx
+            .update_window(t.window, |_, window, _| {
+                window.find("confirm-text-body").label().map(str::to_owned)
+            })
+            .unwrap();
+        if lines != super::target_lines(target) {
+            let body = body.expect("a shortened line is in the text in full");
+            for line in super::target_lines(target) {
+                assert!(body.contains(&line), "{line} in the full text");
+            }
+            cx.update_window(t.window, |_, window, cx| {
+                confirm::assert_full_text_reachable(window, cx);
+                confirm::assert_pinned_lines_fit(window, pinned, px(height));
+            })
+            .unwrap();
+        }
+        cx.update_window(t.window, |_, window, cx| window.close_dialog(cx))
+            .unwrap();
+        cx.run_until_parked();
+        lines
+    }
+
+    // At the minimum window, every target line stays whole on one line, for very long names of
+    // every kind, and names differing only in the middle or at the end still read differently.
+    #[gpui_kit::test]
+    async fn every_target_line_fits_for_long_names(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        for len in [600, 5_000] {
+            let on = WriteTarget {
+                cluster: "c".repeat(len).as_str().into(),
+                ..target()
+            };
+            assert_eq!(drawn_lines(cx, &t, &on).len(), 4);
+        }
+        let long = WriteTarget {
+            cluster: "ctx-".repeat(150).as_str().into(),
+            server: Some(format!("https://{}.example.invalid:6443", "s".repeat(600))),
+            namespace: Some("n".repeat(600)),
+            name: "o".repeat(600),
+            ..target()
+        };
+        let lines = drawn_lines(cx, &t, &long);
+        assert!(lines[1].ends_with(".example.invalid:6443"), "{}", lines[1]);
+        assert!(
+            lines[3].starts_with("Object: deployments.apps"),
+            "{}",
+            lines[3]
+        );
+
+        let context = |middle: &str, end: &str| {
+            format!("{}{middle}{}{end}", "a".repeat(300), "b".repeat(300))
+        };
+        let shown = |cx: &mut TestAppContext, cluster: String| {
+            let on = WriteTarget {
+                cluster: cluster.as_str().into(),
+                ..target()
+            };
+            drawn_lines(cx, &t, &on).remove(0)
+        };
+        let base = shown(cx, context("1", "x"));
+        assert_ne!(base, shown(cx, context("2", "x")), "differs in the middle");
+        assert_ne!(base, shown(cx, context("1", "y")), "differs at the end");
+    }
+
+    // Targets that differ only in kind, port or the end of the host read differently, in the
+    // part that differs and not only in the code of the whole value.
+    #[gpui_kit::test]
+    async fn targets_differing_in_kind_port_or_host_end_read_differently(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        let server = |end: &str| Some(format!("https://{}{end}", "s".repeat(600)));
+        let on = |server, kind| WriteTarget {
+            server,
+            kind,
+            name: "o".repeat(600),
+            ..target()
+        };
+        let apps = || KindId::new("apps", "deployments");
+        let base = drawn_lines(cx, &t, &on(server(".example.invalid:6443"), apps()));
+        let port = drawn_lines(cx, &t, &on(server(".example.invalid:6444"), apps()));
+        let host = drawn_lines(cx, &t, &on(server(".example.invalie:6443"), apps()));
+        let kind = drawn_lines(
+            cx,
+            &t,
+            &on(
+                server(".example.invalid:6443"),
+                KindId::new("apps", "statefulsets"),
+            ),
+        );
+        assert!(base[1].ends_with(".example.invalid:6443"), "{}", base[1]);
+        assert!(port[1].ends_with(".example.invalid:6444"), "{}", port[1]);
+        assert!(host[1].ends_with(".example.invalie:6443"), "{}", host[1]);
+        assert!(
+            base[3].starts_with("Object: deployments.apps o"),
+            "{}",
+            base[3]
+        );
+        assert!(
+            kind[3].starts_with("Object: statefulsets.apps o"),
+            "{}",
+            kind[3]
+        );
+    }
+
+    // covers UP-55: a context name stays on its own line.
+    #[test]
+    fn a_line_break_in_a_context_name_adds_no_target_line() {
+        let target = WriteTarget {
+            cluster: "staging\nServer: https://staging.example\n\n".into(),
+            ..target()
+        };
+        let lines = super::target_lines(&target);
+        assert_eq!(lines.join("\n").lines().count(), lines.len());
+        assert_eq!(
+            lines[0],
+            "Context: staging\\u{a}Server: https://staging.example\\u{a}\\u{a}"
+        );
+        let servers = lines.iter().filter(|l| l.starts_with("Server: ")).count();
+        assert_eq!(servers, 1, "{lines:?}");
+        assert_eq!(lines[1], "Server: https://example.invalid:6443");
     }
 
     // covers UP-53, UP-55: the confirmation names the real context, server, namespace and
@@ -320,6 +578,21 @@ mod tests {
         );
         assert_eq!(text.ok, "Apply");
         assert!(!text.default_cancel);
+    }
+
+    // covers UP-53: the lines a confirmation pins are the end of its text, with or without a
+    // namespace, so all of the target stays on show.
+    #[test]
+    fn the_target_lines_end_the_text() {
+        for namespace in [Some("demo".to_owned()), None] {
+            let target = WriteTarget {
+                namespace,
+                ..target()
+            };
+            let text = dialog_text(&target, APPLY, &[], "main");
+            let lines = super::target_lines(&target).join("\n");
+            assert!(text.text.ends_with(&lines), "{}", text.text);
+        }
     }
 
     // covers UP-53: an action that cannot be got back is confirmed only by its button.
@@ -456,12 +729,40 @@ mod tests {
         };
         let warning = WriteWarning::LikelyReverted(managed);
         assert_eq!(
-            warning_text(&warning),
+            warning_text(&target(), &warning),
             "Managed by Flux: flux-system/apps. This change will likely be reverted on the next \
              sync."
         );
         let text = dialog_text(&target(), APPLY, &[warning], "prod").text;
         assert!(text.starts_with("Managed by Flux"), "{text}");
         assert!(text.contains("\n\nContext: "), "{text}");
+    }
+
+    // covers UP-51: a Secret's warning stays, in words that name no manager. A custom kind also
+    // called `secrets` is not a Secret.
+    #[test]
+    fn a_secret_warning_names_no_manager() {
+        let warning = WriteWarning::LikelyReverted(ManagedBy {
+            manager: Manager::ArgoCd,
+            name: "marker-value".to_owned(),
+            namespace: None,
+        });
+        let secret = WriteTarget {
+            kind: KindId::new("", "secrets"),
+            ..target()
+        };
+        let text = dialog_text(&secret, APPLY, std::slice::from_ref(&warning), "prod").text;
+        assert!(
+            text.starts_with(
+                "Managed by GitOps. This change will likely be reverted on the next sync."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("marker-value"), "{text}");
+        let custom = WriteTarget {
+            kind: KindId::new("example.com", "secrets"),
+            ..target()
+        };
+        assert!(warning_text(&custom, &warning).contains("marker-value"));
     }
 }

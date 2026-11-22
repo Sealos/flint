@@ -152,12 +152,14 @@ Flint is in early development.
 
 - Your kubeconfig contexts in a sidebar; Flint connects to the one you select and checks its health.
 - Every kind the cluster serves, CRDs included, from the cluster's own discovery: live lists with the `kubectl get`
-  columns, a namespace and text filter, and a detail view with metadata, conditions, events and read-only YAML.
+  columns, a namespace and text filter, and a detail view with metadata, conditions, events and YAML.
+- YAML editing with a server dry-run and diff, plus delete, scale, rollout restart, cordon and drain, all behind the
+  cluster protection.
 - A bottom dock with pod and workload logs (follow, search, timestamps, previous logs, save to a file) and shells into
   containers. Open them from a row's context menu, the detail pane or the keyboard. Log tabs have matching-lines-only
   and errors-only (warnings and errors) filters, with adjustable context lines.
 - Protected clusters: every cluster not on your machine is read-only in Flint until you unlock it for the session
-  or trust it (the lock button in the sidebar, or the palette). Today that means shells; editing joins it.
+  or trust it (the lock button in the sidebar, or the palette). That covers shells, edits and resource actions.
 - A command palette (⇧⌘P) that runs any action by name and shows its shortcut (see [Keys](#keys)).
 - A resource switcher (⌘P) for the active cluster's kinds and cached objects, Go Back (⌘[) to return to the previous
   kind and object, and Tab and Shift-Tab to move focus between panes outside text fields and shells.
@@ -167,12 +169,14 @@ Flint is in early development.
 
 **Coming next:**
 
-- Editing: YAML with dry-run and diff; delete, scale, restart, cordon and drain, all behind the cluster protection.
-- Curated views for core kinds, CPU and memory from metrics-server, and cluster dashboards.
-- Port-forwarding and Helm releases.
-- Cluster sets, then problem alerts and guarded fleet actions across them.
-- A signed and notarized app with a Homebrew cask.
-- [Regex search](https://github.com/Sealos/flint/issues/309) and [log time ranges](https://github.com/Sealos/flint/issues/265).
+- **v0.5, see and watch many clusters:** cluster sets with combined views, problem alerts, comparing an object across
+  clusters, cluster dashboards, and CPU and memory from metrics-server.
+- **v0.7, change many clusters:** guarded fleet actions with explicit targets, a dry run per cluster, one cluster at a
+  time, and a stop at the first failure.
+- **v1.0, first public release:** a signed and notarized app with a Homebrew cask, port-forwarding, and read-only Helm
+  releases.
+- **Later:** curated views for core kinds, [regex search](https://github.com/Sealos/flint/issues/309) and
+  [log time ranges](https://github.com/Sealos/flint/issues/265).
 
 ## Install from a release
 
@@ -256,7 +260,8 @@ Security** and choose **Open Anyway**.
 
 Each release also has an AppImage for x86_64 and aarch64 (arm64). Linux support is best effort: CI builds and
 tests it, but it is not tested on every desktop and distribution ([ADR-0016](docs/adr/0016-linux-appimage.md)). It
-needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13 or later).
+needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13 or later). The AppImage is the Linux install; deb and
+rpm packages are planned after 1.0.
 
 ```sh
 gh release download -R Sealos/flint --pattern 'flint-*-linux-x86_64.AppImage*'   # or linux-aarch64
@@ -377,7 +382,7 @@ kubeconfig_paths = ["~/work/kubeconfig"]
 # path = "/opt/homebrew/bin:/usr/bin:/bin"   # override the PATH taken from your login shell
 # helm = "/opt/homebrew/bin/helm"
 watch_mode = "all"                # or "on_view"
-# protect_local_clusters = false  # true protects clusters on this machine too (see trusted_clusters)
+# protect_local_clusters = false  # true protects known local clusters too (see trusted_clusters)
 
 [cluster_watch_mode]
 # big-prod-cluster = "on_view"
@@ -398,13 +403,14 @@ watch_mode = "all"                # or "on_view"
 
 # Clusters Flint may change (and open shells in) without asking, written by Trust This Cluster in
 # the sidebar's lock menu. Pinned to the server like exposure: a re-pointed context is protected
-# again. Clusters on this machine (localhost or *.localhost, 127.x.x.x, ::1, Docker Desktop's
-# kubernetes.docker.internal: kind, OrbStack, minikube on macOS) are unlocked anyway. A local
-# cluster on another address, such as minikube's Docker driver on Linux (192.168.49.2), stays
-# protected: trust it once. Local ones stay unlocked unless protect_local_clusters is true: set it
-# when a local address is a tunnel to a remote cluster (an SSH, SSM or Teleport proxy). A context
-# whose cluster has a proxy-url is never treated as local. While settings.toml does not parse,
-# nothing is trusted and local clusters are protected too.
+# again. Known local clusters are unlocked anyway: a context named exactly kind, minikube,
+# docker-desktop or orbstack, or starting with kind-, whose server is on this machine (localhost or
+# *.localhost, 127.x.x.x, ::1, Docker Desktop's kubernetes.docker.internal). Any other context on
+# those addresses is protected: unlock or trust it. So is a local cluster on another address, such
+# as minikube's Docker driver on Linux (192.168.49.2). Known local clusters stay unlocked unless
+# protect_local_clusters is true. A context whose cluster has a proxy-url is never treated as
+# local. While settings.toml does not parse, nothing is trusted and local clusters are protected
+# too.
 # [[trusted_clusters]]
 # context = "staging"
 # server = "https://staging.example.com:6443"

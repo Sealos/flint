@@ -42,7 +42,7 @@ fn unreachable_kubeconfig(contexts: &[&str]) -> String {
 #[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
 fn up_01_launch_and_see_my_clusters() -> Result<()> {
     let two = TwoClusters::start()?;
-    // A second file redefines fake-a (at a dead server) and adds an EKS context; a third comes
+    // A second file redefines kind-fake-a (at a dead server) and adds an EKS context; a third comes
     // from settings' kubeconfig_paths.
     let second = two.scratch.path().join("second");
     write(&second, &unreachable_kubeconfig(&[TwoClusters::A, ARN]))?;
@@ -74,7 +74,7 @@ fn up_01_launch_and_see_my_clusters() -> Result<()> {
     assert!(two.b.requests().is_empty(), "{:?}", two.b.requests());
     app.screenshot_themes("up01-clusters")?;
 
-    // The first definition of fake-a wins: it connects to the live server, not the dead one.
+    // The first definition of kind-fake-a wins: it connects to the live server, not the dead one.
     connect(&app, TwoClusters::A)?;
     assert!(!two.a.requests().is_empty());
     assert!(
@@ -265,17 +265,17 @@ fn up_06_kubeconfig_changes_on_disk() -> Result<()> {
     let two = TwoClusters::start()?;
     let kubeconfig = two.kubeconfig();
     let both = std::fs::read_to_string(&kubeconfig)?;
-    // Only fake-a at first.
+    // Only kind-fake-a at first.
     flint_e2e::fake_api::write_kubeconfigs(&kubeconfig, &[(&two.a, TwoClusters::A, None)])?;
     let app = App::launch(AppOptions::new(&kubeconfig))?;
     let state = app.wait_for("/kubeconfig/loaded", Equals(true.into()))?;
     assert_eq!(cluster_names(&state), [TwoClusters::A]);
     connect(&app, TwoClusters::A)?;
 
-    // A context is added (written in two steps, as a slow writer does): fake-b appears, and
-    // fake-a never disappears on the way.
+    // A context is added (written in two steps, as a slow writer does): kind-fake-b appears, and
+    // kind-fake-a never disappears on the way.
     let half = &both[..both.len() / 2];
-    app.edit_kubeconfig(|| {
+    app.edit_kubeconfig([&kubeconfig], || {
         std::fs::write(&kubeconfig, half)?;
         std::thread::sleep(Duration::from_millis(30));
         Ok(std::fs::write(&kubeconfig, &both)?)
@@ -286,7 +286,7 @@ fn up_06_kubeconfig_changes_on_disk() -> Result<()> {
         let names = cluster_names(&state);
         assert!(
             names.iter().any(|n| n == TwoClusters::A),
-            "fake-a flickered away: {names:?}"
+            "kind-fake-a flickered away: {names:?}"
         );
         assert_eq!(state["active_cluster"], TwoClusters::A);
         if names.len() == 2 {
@@ -294,13 +294,13 @@ fn up_06_kubeconfig_changes_on_disk() -> Result<()> {
         }
         assert!(
             Instant::now() < deadline,
-            "fake-b never appeared: {names:?}"
+            "kind-fake-b never appeared: {names:?}"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
 
     // The active cluster is removed: it is deselected, with a notice.
-    app.edit_kubeconfig(|| {
+    app.edit_kubeconfig([&kubeconfig], || {
         flint_e2e::fake_api::write_kubeconfigs(&kubeconfig, &[(&two.b, TwoClusters::B, None)])
     })?;
     let state = app.wait_for("/active_cluster", Equals(Value::Null))?;
@@ -398,7 +398,7 @@ fn up_08_up_12_app_and_flint_mcp_agree_on_exposure() -> Result<()> {
     };
 
     // Exposed by hand in settings.toml: the app shows it, and `flint mcp` lists it. Exposed,
-    // fake-a may be contacted from here on (UP-91).
+    // kind-fake-a may be contacted from here on (UP-91).
     app.mark_selected(TwoClusters::A);
     settings(&format!(
         "[[ai_exposed_clusters]]\ncontext = \"{}\"\nserver = \"{}\"\n",
@@ -411,7 +411,7 @@ fn up_08_up_12_app_and_flint_mcp_agree_on_exposure() -> Result<()> {
     )?;
     assert_eq!(listed(&mut mcp)?, [TwoClusters::A]);
 
-    // Re-pointed: fake-b exposed at fake-a's server. The app says "cluster changed" and
+    // Re-pointed: kind-fake-b exposed at kind-fake-a's server. The app says "cluster changed" and
     // `flint mcp` treats it as unknown.
     settings(&format!(
         "[[ai_exposed_clusters]]\ncontext = \"{}\"\nserver = \"{}\"\n",

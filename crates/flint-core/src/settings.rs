@@ -273,11 +273,11 @@ pub struct Settings {
     /// default: nothing is exposed.
     pub ai_exposed_clusters: Vec<AiExposure>,
     /// Clusters Flint may change without a session unlock (ADR-0015), as context name plus API
-    /// server URL. Empty by default: every cluster not on this machine is protected.
+    /// server URL. Empty by default: every cluster but a known local one is protected.
     pub trusted_clusters: Vec<TrustedCluster>,
-    /// Protect clusters whose API server is on this machine too (`localhost`, a loopback
-    /// address). Off by default, so kind, minikube, Docker Desktop and OrbStack start unlocked;
-    /// turn it on when a local address is a tunnel to a remote cluster.
+    /// Protect known local clusters too: contexts named as kind, minikube, Docker Desktop and
+    /// OrbStack name them, with an API server on this machine. Off by default, so they start
+    /// unlocked. Any other context is protected either way.
     pub protect_local_clusters: bool,
     /// Extra kubeconfig files, loaded after `KUBECONFIG` or `~/.kube/config`. `~` is expanded.
     pub kubeconfig_paths: Vec<PathBuf>,
@@ -407,9 +407,9 @@ impl Settings {
 
     /// What applies while `settings.toml` cannot be read, keeping the harmless parts of `self`
     /// (the settings in force before, or the defaults): nothing is exposed to AI agents or
-    /// trusted, and clusters on this machine are protected too, since the file may have said
-    /// `protect_local_clusters = true` (a local tunnel to a remote cluster). Every choice that
-    /// opens something up is dropped until the file parses again.
+    /// trusted, and known local clusters are protected too, since the file may have said
+    /// `protect_local_clusters = true`. Every choice that opens something up is dropped until
+    /// the file parses again.
     pub fn unreadable_fallback(self) -> Settings {
         Settings {
             ai_exposed_clusters: Vec::new(),
@@ -1669,25 +1669,27 @@ mod tests {
     }
 
     // covers UP-54: a settings.toml that does not parse opens nothing up. It may have said
-    // `protect_local_clusters = true` for a tunnel to production on a loopback address, so that
-    // address is protected until the file parses again; a missing or valid file keeps the
-    // exemption.
+    // `protect_local_clusters = true`, so a known local context is protected until the file
+    // parses again; a missing or valid file keeps its exemption. Another context on a loopback
+    // address is protected either way.
     #[test]
     fn an_unreadable_file_protects_local_clusters_and_trusts_nothing() {
         use crate::protection::{Protection, SessionUnlocks, protection};
         let unlocks = SessionUnlocks::default();
-        let tunnel = Some("https://127.0.0.1:8443");
-        let of = |s: &Settings| protection(s, &unlocks, "prod-tunnel", tunnel, None);
+        let loopback = Some("https://127.0.0.1:8443");
+        let of = |s: &Settings| protection(s, &unlocks, "kind-dev", loopback, None);
+        let other = |s: &Settings| protection(s, &unlocks, "team-dev", loopback, None);
 
         let dir = tempfile::tempdir().unwrap();
         let (missing, error) = load_settings_or_fallback(dir.path());
         assert_eq!(error, None);
         assert_eq!(of(&missing), Protection::Local);
+        assert_eq!(other(&missing), Protection::Protected);
 
         std::fs::write(
             dir.path().join(SETTINGS_FILE),
             "protect_local_clusters = true\n\
-             trusted_clusters = [{ context = \"prod-tunnel\", server = \"https://127.0.0.1:8443\" }]\n\
+             trusted_clusters = [{ context = \"team-dev\", server = \"https://127.0.0.1:8443\" }]\n\
              watch_mode = ",
         )
         .unwrap();
@@ -1695,11 +1697,13 @@ mod tests {
         assert!(error.is_some());
         assert!(broken.trusted_clusters.is_empty() && broken.ai_exposed_clusters.is_empty());
         assert_eq!(of(&broken), Protection::Protected);
+        assert_eq!(other(&broken), Protection::Protected);
 
         std::fs::write(dir.path().join(SETTINGS_FILE), "watch_mode = \"all\"\n").unwrap();
         let (valid, error) = load_settings_or_fallback(dir.path());
         assert_eq!(error, None);
         assert_eq!(of(&valid), Protection::Local);
+        assert_eq!(other(&valid), Protection::Protected);
     }
 
     // covers UP-54: settings.toml as a symlink to a file that is gone (a dotfiles checkout not

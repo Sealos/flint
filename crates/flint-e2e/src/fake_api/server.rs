@@ -21,6 +21,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use super::access::{self, AccessPolicy};
 use super::clock::Clock;
 use super::exec::{self as remote, Execs};
 use super::faults::{self, Effect, Fault, Faults};
@@ -192,11 +193,13 @@ struct Inner {
     /// Exec sessions and the images tests set. Locked after `state` when both are needed.
     execs: Mutex<Execs>,
     faults: Mutex<Faults>,
+    /// What `SelfSubjectAccessReview`s answer.
+    access: Mutex<AccessPolicy>,
     scripts: Mutex<Scripts>,
     watchers: Mutex<HashMap<Gvr, Vec<Watcher>>>,
     requests: Mutex<Vec<RequestRecord>>,
     /// Every request as it arrived, before faults or answers: what the app sent, and when.
-    arrivals: Mutex<Vec<RequestRecord>>,
+    arrivals: Arc<Mutex<Vec<RequestRecord>>>,
     /// Every write as it arrived, with its body; its status is set when it is answered.
     writes: Mutex<Vec<WriteRecord>>,
     /// Metrics samples queued per target. Locked after `state` when both are needed.
@@ -232,6 +235,36 @@ pub fn arrivals_at(url: &str) -> Option<Vec<RequestRecord>> {
         .and_then(|(_, inner)| inner.upgrade())?;
     drop(running);
     Some(lock(&inner.arrivals).clone())
+}
+
+/// A fake server's arrivals ([`arrival_log_at`]), readable after the server has stopped.
+#[derive(Clone, Debug)]
+pub struct ArrivalLog(Arc<Mutex<Vec<RequestRecord>>>);
+
+impl ArrivalLog {
+    /// The requests that have arrived so far, oldest first.
+    pub fn records(&self) -> Vec<RequestRecord> {
+        lock(&self.0).clone()
+    }
+
+    /// Whether both are the log of the same server.
+    pub fn is_same(&self, other: &ArrivalLog) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// The arrival log of the fake server running at `url`, which outlives the server; `None` when
+/// no fake server runs there.
+pub fn arrival_log_at(url: &str) -> Option<ArrivalLog> {
+    let url = url.trim_end_matches('/');
+    let running = lock(&RUNNING);
+    let inner = running
+        .iter()
+        .rev()
+        .find(|(u, _)| u == url)
+        .and_then(|(_, inner)| inner.upgrade())?;
+    drop(running);
+    Some(ArrivalLog(inner.arrivals.clone()))
 }
 
 /// A mark between the connections the fake server at `url` has accepted so far and those it
@@ -353,10 +386,11 @@ impl FakeApiServer {
             fixtures,
             options,
             faults: Mutex::default(),
+            access: Mutex::default(),
             scripts: Mutex::default(),
             watchers: Mutex::default(),
             requests: Mutex::default(),
-            arrivals: Mutex::default(),
+            arrivals: Arc::default(),
             writes: Mutex::default(),
             metrics: Mutex::default(),
             in_flight: AtomicUsize::new(0),
@@ -431,6 +465,17 @@ impl FakeApiServer {
     /// Writes [`FakeApiServer::kubeconfig`] to `path`.
     pub fn write_kubeconfig(&self, path: &Path, namespace: Option<&str>) -> Result<()> {
         kubeconfig::write(path, &self.kubeconfig(namespace))
+    }
+
+    /// A kubeconfig for this server under [`kubeconfig::REMOTE_CONTEXT`], which Flint protects
+    /// as it does any cluster it does not recognise as local.
+    pub fn remote_kubeconfig(&self, namespace: Option<&str>) -> kube::config::Kubeconfig {
+        self.kubeconfig_named(kubeconfig::REMOTE_CONTEXT, namespace)
+    }
+
+    /// Writes [`FakeApiServer::remote_kubeconfig`] to `path`.
+    pub fn write_remote_kubeconfig(&self, path: &Path, namespace: Option<&str>) -> Result<()> {
+        kubeconfig::write(path, &self.remote_kubeconfig(namespace))
     }
 
     /// A kube client for this server, built the way Flint builds them.
@@ -660,6 +705,12 @@ impl FakeApiServer {
         lock(&self.inner.faults).clear();
     }
 
+    /// Sets what `SelfSubjectAccessReview`s answer. It changes nothing else: the server still
+    /// serves every other request.
+    pub fn set_access(&self, policy: AccessPolicy) {
+        *lock(&self.inner.access) = policy;
+    }
+
     /// Every request answered (or dropped) so far, oldest first.
     pub fn requests(&self) -> Vec<RequestRecord> {
         lock(&self.inner.requests).clone()
@@ -829,7 +880,9 @@ async fn handle(
     let mut write_index = None;
     let call = if is_write {
         let write = writes::read(req).await;
-        if let Ok(write) = &write {
+        if let Ok(write) = &write
+            && !access::is_review(&write.method, &route)
+        {
             write_index = Some(record_write(&inner, &record, write));
         }
         Call::Write(write)
@@ -875,6 +928,10 @@ async fn handle(
         }
         Some(Effect::Delay(delay)) => {
             tokio::time::sleep(delay).await;
+            answer(&inner, call, upgrade, &route, verb, &query, &accept)
+        }
+        Some(Effect::Hold(point)) => {
+            point.wait().await;
             answer(&inner, call, upgrade, &route, verb, &query, &accept)
         }
         Some(Effect::StripUpgrade) => answer(&inner, call, false, &route, verb, &query, &accept),
@@ -932,6 +989,12 @@ fn answer(
     match call {
         Call::Read(req) => serve(inner, req, upgrade, route, verb, query, accept),
         Call::Write(Err(e)) => error(&e),
+        Call::Write(Ok(write)) if access::is_review(&write.method, route) => {
+            match access::answer(&lock(&inner.access), &write.body) {
+                Ok(review) => json_with(201, "application/json", &review),
+                Err(e) => error(&e),
+            }
+        }
         Call::Write(Ok(write)) if writes::handles(inner, &write.method, route) => {
             writes::serve(inner, &write, route, query).unwrap_or_else(|e| error(&e))
         }
@@ -1112,6 +1175,9 @@ fn respond(
                     ApiError::not_found(format!("OpenAPI document {path} is not recorded"))
                 })
         }
+        Route::MetricsDiscovery => metrics::api_resources(inner)
+            .map(|list| json_with(200, "application/json", &list))
+            .ok_or_else(|| ApiError::not_found("the server could not find the requested resource")),
         Route::Collection { gvr, namespace } => {
             known(inner, gvr, namespace.as_deref()).and_then(|resource| {
                 let ns = namespace.as_deref();

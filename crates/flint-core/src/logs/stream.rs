@@ -19,7 +19,7 @@ use tokio::time::Sleep;
 
 use super::line::{LineSource, LogLine};
 use super::session::{
-    ContainerWait, LogOptions, LogSince, LogState, LogTarget, PREVIOUS_NOT_AVAILABLE,
+    ContainerWait, FailedHop, LogOptions, LogSince, LogState, LogTarget, PREVIOUS_NOT_AVAILABLE,
 };
 use super::source::{
     AfterEnd, CRASH_LOOP, ErrorKind, LogError, LogRequest, LogSource, RawLine, RawLines,
@@ -79,6 +79,7 @@ impl Retry {
         let delay = self.backoff.delay(self.attempts);
         Reconnect {
             state: LogState::Reconnecting {
+                hop: error.map_or(FailedHop::Unknown, |e| e.hop),
                 error: error.map(|e| e.message.clone()),
                 attempt: self.attempts,
                 back_off,
@@ -149,6 +150,9 @@ pub(crate) struct Stream {
     tail: i64,
     /// Failed attempts in a row, for the backoff. Reset when a line arrives (and on a revive).
     retry: Retry,
+    /// Polls of a container that has not started, for their own backoff: nothing is failing, so
+    /// they do not count as attempts. Reset like `retry`, but not by a failure.
+    start_wait: Retry,
     /// The pod set this stream belongs to (workload sessions).
     member: Option<Member>,
     phase: Phase,
@@ -211,6 +215,7 @@ impl Stream {
             options,
             tail,
             retry: Retry::new(backoff),
+            start_wait: Retry::new(backoff),
             member,
             phase: Phase::Done,
             state: LogState::Connecting,
@@ -347,7 +352,7 @@ impl Stream {
             // Before anything else, even a drain or a deleted pod: the session must hear of it.
             Step::Opened(Err(e)) | Step::AfterEnd(Err(e)) if e.is_cluster() => {
                 self.cluster_error = true;
-                self.end(Some(e.message))
+                self.end_with(e)
             }
             // The pod by this name is not the stream's pod any more: nothing of it is read.
             Step::Opened(Err(e)) if e.kind == ErrorKind::PodGone => self.end(None),
@@ -391,9 +396,7 @@ impl Stream {
             Step::AfterEnd(Err(_) | Ok(AfterEnd::Restarts)) if starting.is_some() => {
                 self.wait_for_container(ContainerWait::NotStarted(None))
             }
-            Step::Opened(Err(e)) | Step::AfterEnd(Err(e)) if e.is_fatal() => {
-                self.end(Some(e.message))
-            }
+            Step::Opened(Err(e)) | Step::AfterEnd(Err(e)) if e.is_fatal() => self.end_with(e),
             Step::Opened(Err(e)) | Step::AfterEnd(Err(e)) | Step::Line(Err(e)) => {
                 self.retry(Some(e))
             }
@@ -444,6 +447,7 @@ impl Stream {
         self.deleted = false;
         self.starting = None;
         self.retry.reset();
+        self.start_wait.reset();
         self.set_state(LogState::Connecting);
         let request = self.resume_request();
         self.phase = Phase::Connect(self.source.open(&request));
@@ -525,6 +529,7 @@ impl Stream {
         }
         line.source = self.tag().cloned();
         self.retry.reset();
+        self.start_wait.reset();
         out(line);
     }
 
@@ -592,10 +597,10 @@ impl Stream {
         Phase::Connect(self.source.open(&request))
     }
 
-    /// Polls for a container that has not started. Counted for the delay, which grows, but
-    /// shown without an attempt: nothing is failing.
+    /// Polls for a container that has not started, at a delay that grows on its own count:
+    /// nothing is failing, so the reconnect attempts are left alone.
     fn wait_for_container(&mut self, wait: ContainerWait) -> Phase {
-        let next = self.retry.fail(None, false);
+        let next = self.start_wait.fail(None, false);
         self.set_state(LogState::Waiting { wait });
         Phase::Wait(next.sleep)
     }
@@ -608,6 +613,16 @@ impl Stream {
     fn end(&mut self, error: Option<String>) -> Phase {
         self.finish(LogState::Ended {
             error,
+            hop: FailedHop::Unknown,
+            pod_deleted: false,
+        })
+    }
+
+    /// Ends on `error`, keeping the hop it failed at.
+    fn end_with(&mut self, error: LogError) -> Phase {
+        self.finish(LogState::Ended {
+            error: Some(error.message),
+            hop: error.hop,
             pod_deleted: false,
         })
     }
@@ -616,6 +631,7 @@ impl Stream {
     fn end_deleted(&mut self) -> Phase {
         self.finish(LogState::Ended {
             error: None,
+            hop: FailedHop::Unknown,
             pod_deleted: true,
         })
     }
@@ -773,6 +789,7 @@ mod tests {
         assert_eq!(
             retry.fail(Some(&LogError::retry("reset")), false).state,
             LogState::Reconnecting {
+                hop: Default::default(),
                 error: Some("reset".into()),
                 attempt: 1,
                 back_off: false,
@@ -781,6 +798,7 @@ mod tests {
         assert_eq!(
             retry.fail(None, true).state,
             LogState::Reconnecting {
+                hop: Default::default(),
                 error: None,
                 attempt: 2,
                 back_off: true,
@@ -813,6 +831,7 @@ mod tests {
         assert_eq!(
             s.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false
             }
@@ -855,6 +874,7 @@ mod tests {
         assert_eq!(
             s.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false
             },
@@ -874,6 +894,7 @@ mod tests {
         assert_eq!(
             single.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: true,
             }
@@ -911,6 +932,7 @@ mod tests {
         assert_eq!(
             once.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: Some(notice.into()),
                 pod_deleted: false
             }
@@ -994,6 +1016,7 @@ mod tests {
         assert_eq!(
             finished.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: Some(notice.into()),
                 pod_deleted: false
             }
@@ -1004,7 +1027,7 @@ mod tests {
         assert!(drain(&mut restarts).await.is_empty());
         assert!(matches!(
             restarts.state(),
-            LogState::Reconnecting { attempt: 1, error: Some(e), back_off: false } if e == notice
+            LogState::Reconnecting { attempt: 1, error: Some(e), back_off: false, .. } if e == notice
         ));
     }
 
@@ -1054,6 +1077,7 @@ mod tests {
         assert_eq!(
             s.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false
             }
@@ -1069,6 +1093,7 @@ mod tests {
         assert_eq!(
             s.state(),
             &LogState::Reconnecting {
+                hop: Default::default(),
                 error: None,
                 attempt: 1,
                 back_off: true
@@ -1165,6 +1190,54 @@ mod tests {
 
     fn attempt(s: &Stream) -> u32 {
         attempt_of(s.state())
+    }
+
+    // covers UP-40: polling a container that has not started is not a failed attempt. The first
+    // real failure after a long wait is attempt 1 at the shortest delay, and the wait's own delay
+    // goes on growing until a line arrives or the stream is revived.
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_a_container_keeps_its_own_backoff() {
+        let not_started = || {
+            Step::AfterEnd(Ok(AfterEnd::NotStarted(ContainerWait::NotStarted(Some(
+                "ImagePullBackOff".into(),
+            )))))
+        };
+        let mut s = stream(&[], Some(Arc::new(LineSource::new("p", "c"))));
+        let mut waits = Vec::new();
+        for _ in 0..7 {
+            s.handle(not_started(), &mut |_| {});
+            waits.push(wait_left(&s).as_secs());
+        }
+        assert_eq!(waits, [1, 2, 4, 8, 16, 30, 30]);
+
+        s.handle(Step::Opened(Err(LogError::retry("down"))), &mut |_| {});
+        assert_eq!((attempt(&s), wait_left(&s).as_secs()), (1, 1));
+        s.handle(not_started(), &mut |_| {});
+        assert_eq!(
+            wait_left(&s).as_secs(),
+            30,
+            "a failure does not reset the wait"
+        );
+
+        // A line is progress for both.
+        s.handle(Step::Opened(Ok(stream::pending().boxed())), &mut |_| {});
+        s.handle(
+            Step::Line(Ok(RawLine {
+                text: "started".into(),
+                truncated: false,
+            })),
+            &mut |_| {},
+        );
+        s.handle(not_started(), &mut |_| {});
+        assert_eq!(wait_left(&s).as_secs(), 1, "a line resets the wait");
+
+        // So is a revive.
+        s.handle(not_started(), &mut |_| {});
+        assert_eq!(wait_left(&s).as_secs(), 2);
+        s.handle(Step::Opened(Err(LogError::fatal("gone"))), &mut |_| {});
+        s.revive();
+        s.handle(not_started(), &mut |_| {});
+        assert_eq!(wait_left(&s).as_secs(), 1, "a revive resets the wait");
     }
 
     // covers UP-40: the kubelet's "cannot read the log" answer is not progress, so a container
@@ -1265,6 +1338,7 @@ mod tests {
         assert_eq!(
             s.state(),
             &LogState::Reconnecting {
+                hop: Default::default(),
                 error: Some("reset".into()),
                 attempt: 1,
                 back_off: false,
@@ -1299,6 +1373,7 @@ mod tests {
         assert!(!s.is_done() && matches!(s.phase, Phase::Connect(_)));
         s.handle(Step::Eof, &mut |_| {});
         let deleted = LogState::Ended {
+            hop: Default::default(),
             error: None,
             pod_deleted: true,
         };
@@ -1318,6 +1393,7 @@ mod tests {
         assert_eq!(
             member.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false
             }
@@ -1331,9 +1407,11 @@ mod tests {
             Step::Opened(Err(LogError {
                 message: "NotFound: pods \"p\" not found".into(),
                 kind: ErrorKind::NotFound,
+                hop: FailedHop::Unknown,
             }))
         };
         let deleted = LogState::Ended {
+            hop: Default::default(),
             error: None,
             pod_deleted: true,
         };
@@ -1362,7 +1440,8 @@ mod tests {
             never.state(),
             LogState::Ended {
                 error: Some(_),
-                pod_deleted: false
+                pod_deleted: false,
+                ..
             }
         ));
     }
@@ -1385,6 +1464,7 @@ mod tests {
         assert_eq!(
             d.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false
             }
@@ -1411,6 +1491,7 @@ mod tests {
         assert_eq!(
             s.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false
             }
@@ -1444,6 +1525,7 @@ mod tests {
         assert_eq!(
             s.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: Some("re-pointed".into()),
                 pod_deleted: false,
             }

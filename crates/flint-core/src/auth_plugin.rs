@@ -44,6 +44,7 @@ use tower::BoxError;
 use tower::filter::{AsyncFilterLayer, AsyncPredicate};
 
 use crate::cluster::{CONNECT_TIMEOUT, PluginProblem};
+use crate::connection::policy::CredentialGrant;
 use crate::redact;
 
 /// A token this close to its expiry is refreshed first, as kube does.
@@ -70,6 +71,7 @@ const TIMED_OUT: &str = "flint:timed-out:";
 const TOO_LARGE: &str = "flint:too-large:";
 const RESTING: &str = "flint:resting:";
 const STOPPED: &str = "flint:stopped:";
+const NOT_ALLOWED: &str = "flint:not-allowed";
 
 /// What a plugin run returned.
 #[derive(Debug)]
@@ -87,13 +89,23 @@ pub(crate) enum Credential {
     None,
 }
 
+/// What [`resolve_with_grant`] left for the client.
+#[derive(Default)]
+pub(crate) struct Resolved {
+    /// A token with an expiry, for the client stack ([`TokenLayer`]), which refreshes it.
+    pub(crate) token: Option<RefreshingToken>,
+    /// The plugin's certificate and key replaced any the kubeconfig names.
+    pub(crate) replaced_certificate: bool,
+}
+
 /// Runs the exec plugin of `config`'s user, if kube would, and puts its credential in `config`
-/// in place of the plugin. A token with an expiry comes back as a [`TokenLayer`] for the client
-/// stack, which refreshes it. Cancel-safe: dropping the future kills the plugin.
-pub(crate) async fn resolve(
+/// in place of the plugin. Cancel-safe: dropping the future kills the plugin. So does `grant`
+/// being revoked, and a plugin it does not allow is not started.
+pub(crate) async fn resolve_with_grant(
     config: &mut kube::Config,
     context: &str,
-) -> Result<Option<TokenLayer>, AuthError> {
+    grant: &CredentialGrant,
+) -> Result<Resolved, AuthError> {
     let auth = &config.auth_info;
     // kube's precedence (`Auth::try_from`): all of these win over an exec plugin.
     let other = auth.auth_provider.is_some()
@@ -101,14 +113,23 @@ pub(crate) async fn resolve(
         || auth.token.is_some()
         || auth.token_file.is_some();
     if other || auth.exec.is_none() {
-        return Ok(None);
+        return Ok(Resolved::default());
     }
     let Some(exec) = config.auth_info.exec.take() else {
-        return Ok(None);
+        return Ok(Resolved::default());
     };
     let auth = &mut config.auth_info;
+    let lease = grant.lease();
     let terminal = Terminal::acquire(exec.interactive_mode == Some(ExecInteractiveMode::Always));
-    Ok(match run(&exec, terminal, || {}).await? {
+    let credential = tokio::select! {
+        biased;
+        () = lease.revoked() => return Err(not_allowed()),
+        credential = run(&exec, terminal, || {}) => credential?,
+    };
+    if !lease.holds() {
+        return Err(not_allowed());
+    }
+    Ok(match credential {
         Credential::Certificate { certificate, key } => {
             // kube reads these as base64; the plugin's certificate replaces any in kubeconfig.
             let base64 = base64::engine::general_purpose::STANDARD;
@@ -116,20 +137,24 @@ pub(crate) async fn resolve(
             auth.client_key_data = Some(SecretString::from(base64.encode(key.expose_secret())));
             auth.client_certificate = None;
             auth.client_key = None;
-            None
+            Resolved {
+                token: None,
+                replaced_certificate: true,
+            }
         }
         Credential::Token {
             token,
             expires: None,
         } => {
             auth.token = Some(token);
-            None
+            Resolved::default()
         }
         Credential::Token {
             token,
             expires: Some(expires),
-        } => Some(AsyncFilterLayer::new(RefreshingToken(Arc::new(
-            TokenShared {
+        } => Resolved {
+            token: Some(RefreshingToken(Arc::new(TokenShared {
+                grant: grant.clone(),
                 task: std::sync::Mutex::default(),
                 state: Arc::new(tokio::sync::Mutex::new(TokenState {
                     context: context.to_owned(),
@@ -139,9 +164,10 @@ pub(crate) async fn resolve(
                     refreshing: None,
                     resting: None,
                 })),
-            },
-        )))),
-        Credential::None => None,
+            }))),
+            replaced_certificate: false,
+        },
+        Credential::None => Resolved::default(),
     })
 }
 
@@ -620,11 +646,23 @@ pub(crate) fn problem(text: &str) -> Option<(Option<String>, PluginProblem)> {
         let until = until.to_owned();
         return Some((named(name), PluginProblem::Resting { until }));
     }
+    if text == NOT_ALLOWED {
+        return Some((None, PluginProblem::NotAllowed));
+    }
     if let Some(name) = text.strip_prefix(STOPPED) {
         return Some((named(name), PluginProblem::Stopped));
     }
     let name = text.strip_prefix(TOO_LARGE)?;
     Some((named(name), PluginProblem::TooLarge))
+}
+
+/// The error for a credential its [`CredentialGrant`] does not allow to run now.
+pub(crate) fn not_allowed() -> AuthError {
+    AuthError::AuthExec(NOT_ALLOWED.to_owned())
+}
+
+fn is_not_allowed(error: &AuthError) -> bool {
+    matches!(error, AuthError::AuthExec(text) if text == NOT_ALLOWED)
 }
 
 /// Per context, bumped by [`retry_now`]: a rest taken before the latest bump is over.
@@ -659,6 +697,8 @@ pub(crate) struct RefreshingToken(Arc<TokenShared>);
 /// What every clone of one client's [`RefreshingToken`] shares.
 struct TokenShared {
     state: Arc<tokio::sync::Mutex<TokenState>>,
+    /// Whether the plugin may run: asked before a refresh starts, and ends one that is running.
+    grant: CredentialGrant,
     /// The refresh task, aborted when the last clone goes (the client is dropped): its plugin is
     /// killed then, and the terminal given back, instead of running on for nobody.
     task: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
@@ -724,46 +764,56 @@ impl std::error::Error for SharedAuthError {
 }
 
 impl RefreshingToken {
-    async fn header(&self) -> Result<HeaderValue, BoxError> {
-        let refresh = {
-            let mut state = self.0.state.lock().await;
-            // The margin decides whether to refresh; a refresh's own result is used as it is
-            // (as kube does), even a token that expires within it.
-            if state.fresh() {
-                return bearer(&state.token);
-            }
-            if let Some(until) = state.rests_until() {
-                return Err(resting(&state.name(), until).into());
-            }
-            // Done, yet not taken down by its task: the task ended unexpectedly.
-            if state
-                .refreshing
-                .as_ref()
-                .is_some_and(|r| r.peek().is_some())
-            {
-                state.refreshing = None;
-            }
-            match &state.refreshing {
-                Some(refresh) => refresh.clone(),
-                None => {
-                    let terminal = Terminal::acquire(
-                        state.exec.interactive_mode == Some(ExecInteractiveMode::Always),
-                    );
-                    let refresh =
-                        self.start_refresh(state.exec.clone(), state.context.clone(), terminal);
-                    state.refreshing = Some(refresh.clone());
-                    refresh
+    /// The `Authorization` value to send now, refreshing the token first if it is due.
+    pub(crate) async fn header(&self) -> Result<HeaderValue, BoxError> {
+        loop {
+            let refresh = {
+                let mut state = self.0.state.lock().await;
+                // The margin decides whether to refresh; a refresh's own result is used as it is
+                // (as kube does), even a token that expires within it.
+                if state.fresh() {
+                    return bearer(&state.token);
                 }
-            }
-        };
-        match refresh.await {
-            Ok(token) => bearer(&token),
-            Err(error) => Err(SharedAuthError(error).into()),
+                if !self.0.grant.allowed() {
+                    return Err(not_allowed().into());
+                }
+                if let Some(until) = state.rests_until() {
+                    return Err(resting(&state.name(), until).into());
+                }
+                // Done, yet not taken down by its task: the task ended unexpectedly.
+                if state
+                    .refreshing
+                    .as_ref()
+                    .is_some_and(|r| r.peek().is_some())
+                {
+                    state.refreshing = None;
+                }
+                match &state.refreshing {
+                    Some(refresh) => refresh.clone(),
+                    None => {
+                        let terminal = Terminal::acquire(
+                            state.exec.interactive_mode == Some(ExecInteractiveMode::Always),
+                        );
+                        let refresh =
+                            self.start_refresh(state.exec.clone(), state.context.clone(), terminal);
+                        state.refreshing = Some(refresh.clone());
+                        refresh
+                    }
+                }
+            };
+            return match refresh.await {
+                Ok(token) => bearer(&token),
+                // That refresh was ended by a demotion, and the role has allowed it again since:
+                // its task has cleared it, so this request starts or joins a new one.
+                Err(error) if is_not_allowed(&error) && self.0.grant.allowed() => continue,
+                Err(error) => Err(SharedAuthError(error).into()),
+            };
         }
     }
 
     /// Runs the plugin again in a task of its own, which stores the token when it gets one. The
     /// returned future resolves to what it got, or to [`STOPPED`] if the task ended otherwise.
+    /// If the grant is revoked the plugin is killed, and what it printed by then is not kept.
     fn start_refresh(
         &self,
         exec: ExecConfig,
@@ -771,16 +821,27 @@ impl RefreshingToken {
         terminal: impl Future<Output = Acquired> + Send + 'static,
     ) -> Shared<BoxFuture<'static, Refreshed>> {
         let state = self.0.state.clone();
+        // Taken here, not in the task: a demotion before its first poll still ends it.
+        let lease = self.0.grant.lease();
         let name =
             redact::command_name(exec.command.as_deref().unwrap_or_default()).unwrap_or_default();
         let stopped = AuthError::AuthExec(format!("{STOPPED}{name}"));
         let task = tokio::spawn(async move {
             let mut started = false;
-            let result =
-                tokio::time::timeout(CONNECT_TIMEOUT, run(&exec, terminal, || started = true))
-                    .await;
+            let result = tokio::select! {
+                biased;
+                () = lease.revoked() => None,
+                result = tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    run(&exec, terminal, || started = true),
+                ) => Some(result),
+            };
             let mut state = state.lock().await;
             state.refreshing = None;
+            // Asked again with the lock held: a demotion may have come as the plugin finished.
+            let Some(result) = result.filter(|_| lease.holds()) else {
+                return Err(Arc::new(not_allowed()));
+            };
             match result {
                 Ok(Ok(Credential::Token {
                     token,

@@ -142,6 +142,49 @@ async fn keys_in_the_filter_return_to_the_rows(cx: &mut TestAppContext) {
     assert_eq!(t.selected(cx).as_deref(), Some("web"));
 }
 
+// covers UP-33: Enter on the rows opens the selected row and nothing else: with no selection,
+// or one the filter hides, it does nothing, and in the filter it only returns to the rows.
+#[gpui_kit::test]
+async fn enter_opens_only_the_selected_row(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0), ("demo", "web", 0)])
+        .await;
+    let list = t.list(cx).expect("a list is open");
+    let rows = list.read_with(cx, |l, _| l.focus_handle().clone());
+    cx.update_window(t.window, |_, window, cx| window.focus(&rows, cx))
+        .unwrap();
+    t.press(cx, "enter");
+    assert_eq!(t.selected(cx), None, "no row is selected by Enter");
+    assert!(t.detail(cx).is_none());
+
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.press(cx, "enter");
+    assert_eq!(focus(cx, &t), Focus::List);
+    assert_eq!(t.selected(cx), None, "Enter in the filter selects nothing");
+    assert!(t.detail(cx).is_none());
+
+    t.press(cx, "down");
+    assert_eq!(t.selected(cx).as_deref(), Some("api"));
+    let opened = t.detail(cx).expect("Down opened the row");
+    t.press(cx, "enter");
+    assert_eq!(t.selected(cx).as_deref(), Some("api"));
+    let same = t.detail(cx).expect("the detail stays");
+    assert_eq!(opened.entity_id(), same.entity_id(), "not opened again");
+    assert_eq!(focus(cx, &t), Focus::List);
+
+    // The filter hides the selected row: Enter on the rows does not pick another.
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.type_text(cx, "we");
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 1)
+        .await;
+    t.press(cx, "enter");
+    assert_eq!(focus(cx, &t), Focus::List);
+    t.press(cx, "enter");
+    assert_eq!(t.selected(cx).as_deref(), Some("api"));
+}
+
 // covers UP-33: Tab reaches a shell tab in the dock, where Tab then belongs to the shell.
 #[gpui_kit::test]
 async fn tab_reaches_the_dock(cx: &mut TestAppContext) {
@@ -175,17 +218,17 @@ async fn the_sidebar_moves_with_the_arrows_and_enter_connects(cx: &mut TestAppCo
     t.press(cx, "tab");
     assert_eq!(focus(cx, &t), Focus::Sidebar);
     // No cluster is active: the cursor starts on the first.
-    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("alpha"));
+    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("kind-alpha"));
     t.press(cx, "down");
-    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("beta"));
+    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("kind-beta"));
     t.press(cx, "down");
-    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("beta"));
+    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("kind-beta"));
     t.press(cx, "up");
-    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("alpha"));
+    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("kind-alpha"));
     t.press(cx, "enter");
     let workspace = t.workspace.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
-        workspace.read(cx).shown_cluster() == Some("alpha")
+        workspace.read(cx).shown_cluster() == Some("kind-alpha")
     })
     .await;
     assert_eq!(focus(cx, &t), Focus::Sidebar);
@@ -195,8 +238,8 @@ async fn the_sidebar_moves_with_the_arrows_and_enter_connects(cx: &mut TestAppCo
     t.focus_workspace(cx);
     assert!(!t.available(cx).contains(&"sidebar::SelectNextCluster"));
     // A cluster picked another way moves the cursor too.
-    t.activate(cx, "beta").await;
-    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("beta"));
+    t.activate(cx, "kind-beta").await;
+    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("kind-beta"));
 }
 
 // covers UP-33: in the navigation the arrows move over section headers and kinds, Enter opens a
@@ -311,7 +354,7 @@ async fn go_back_returns_to_the_kind_and_object_shown_before(cx: &mut TestAppCon
     t.feed(
         cx,
         flint_core::Event::DiscoveryChanged {
-            cluster: "alpha".into(),
+            cluster: "kind-alpha".into(),
             generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
                 without_pods,
@@ -323,7 +366,7 @@ async fn go_back_returns_to_the_kind_and_object_shown_before(cx: &mut TestAppCon
     t.feed(
         cx,
         flint_core::Event::DiscoveryChanged {
-            cluster: "alpha".into(),
+            cluster: "kind-alpha".into(),
             generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
                 standard_sections(),
@@ -335,7 +378,7 @@ async fn go_back_returns_to_the_kind_and_object_shown_before(cx: &mut TestAppCon
     t.dispatch(cx, "workspace::OpenView", json!({"kind": "services"}))
         .unwrap();
     assert!(t.available(cx).contains(&"workspace::GoBack"));
-    t.activate(cx, "beta").await;
+    t.activate(cx, "kind-beta").await;
     assert!(!t.available(cx).contains(&"workspace::GoBack"));
 }
 
@@ -360,14 +403,14 @@ async fn the_cursor_ring_shifts_nothing(cx: &mut TestAppContext) {
     };
     t.focus_workspace(cx);
     let (dot, label) = (
-        origin(cx, "cluster-dot-alpha"),
+        origin(cx, "cluster-dot-kind-alpha"),
         origin(cx, "nav-label-pods"),
     );
     let title = header(cx);
-    // The sidebar's cursor on alpha, then the navigation's on the Workloads header and Pods.
+    // The sidebar's cursor on kind-alpha, then the navigation's on the Workloads header and Pods.
     t.press(cx, "tab");
-    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("alpha"));
-    assert_eq!(origin(cx, "cluster-dot-alpha"), dot);
+    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("kind-alpha"));
+    assert_eq!(origin(cx, "cluster-dot-kind-alpha"), dot);
     t.press(cx, "tab");
     assert_eq!(
         nav_cursor(&nav(cx, &t)).as_deref(),
@@ -378,7 +421,258 @@ async fn the_cursor_ring_shifts_nothing(cx: &mut TestAppContext) {
     assert_eq!(nav_cursor(&nav(cx, &t)).as_deref(), Some("kind:pods"));
     assert_eq!(header(cx), title);
     assert_eq!(origin(cx, "nav-label-pods"), label);
-    assert_eq!(origin(cx, "cluster-dot-alpha"), dot);
+    assert_eq!(origin(cx, "cluster-dot-kind-alpha"), dot);
+}
+
+// covers #415: Go Back to another kind puts its filter back, in the field and on the rows.
+#[gpui_kit::test]
+async fn go_back_restores_the_list_filter(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let rows = [
+        ("demo", "api", 0),
+        ("demo", "web-a", 0),
+        ("demo", "web-b", 0),
+    ];
+    t.open_pods(cx, &rows).await;
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.type_text(cx, "web");
+    let list = t.list(cx).unwrap();
+    cx.wait_for(t.window, WAIT, move |_, cx| list.read(cx).shown().1 == 2)
+        .await;
+    t.dispatch(cx, "workspace::OpenView", json!({"kind": "services"}))
+        .unwrap();
+    t.feed_list(
+        cx,
+        objects(
+            KindId::new("", "services"),
+            &[("demo", "front", 0)],
+            flint_core::SyncState::Synced,
+            1,
+        ),
+    )
+    .await;
+    t.focus_workspace(cx);
+
+    t.press_key_of(cx, "workspace::GoBack");
+    let list = t.list(cx).expect("a list is open");
+    assert_eq!(list.read_with(cx, |l, _| l.filter_text().to_owned()), "web");
+    t.feed_list(cx, pods(&rows)).await;
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 2)
+        .await;
+    assert_eq!(t.selected(cx), None);
+    assert!(t.detail(cx).is_none());
+}
+
+// covers #415: while the restored filter's rows are computed, the rows of the old filter are
+// gone and the old selection is cleared, so nothing can be acted on by mistake.
+#[gpui_kit::test]
+async fn go_back_offers_no_stale_row_while_the_filter_is_restored(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(
+        cx,
+        &[
+            ("demo", "api", 0),
+            ("demo", "web-a", 0),
+            ("demo", "web-b", 0),
+        ],
+    )
+    .await;
+    let list = t.list(cx).unwrap();
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.type_text(cx, "web");
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 2)
+        .await;
+    t.dispatch(
+        cx,
+        "workspace::OpenObject",
+        json!({"kind": "pods", "namespace": "demo", "name": "web-a"}),
+    )
+    .unwrap();
+    assert_eq!(t.selected(cx).as_deref(), Some("web-a"));
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.type_text(cx, "-b");
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 1)
+        .await;
+
+    let permits = list.update(cx, |list, _| list.hold_computes());
+    t.focus_workspace(cx);
+    t.press_key_of(cx, "workspace::GoBack");
+    assert_eq!(list.read_with(cx, |l, _| l.filter_text().to_owned()), "web");
+    assert_eq!(
+        list.read_with(cx, |l, _| l.shown().1),
+        0,
+        "old rows dropped"
+    );
+    assert_eq!(t.selected(cx), None);
+    assert!(t.detail(cx).is_none(), "no detail is left as a target");
+    assert_eq!(
+        list.read_with(cx, |l, _| l.view_state().placeholder),
+        Some("loading"),
+        "pending, not an empty result"
+    );
+    assert!(t.find(cx, "list-filtering").is_some());
+    t.press(cx, "down");
+    assert_eq!(t.selected(cx), None, "no row to move to yet");
+
+    for _ in 0..8 {
+        permits.try_send(()).unwrap();
+    }
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 2)
+        .await;
+    assert_eq!(t.selected(cx), None, "the rows arriving select nothing");
+    assert_eq!(list.read_with(cx, |l, _| l.view_state().placeholder), None);
+    assert!(t.find(cx, "list-filtering").is_none());
+}
+
+// covers #415: rows computed for the text before the restore are never drawn.
+#[gpui_kit::test]
+async fn rows_of_the_old_text_are_dropped_after_a_restore(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let rows = [
+        ("demo", "api", 0),
+        ("demo", "web-a", 0),
+        ("demo", "web-b", 0),
+    ];
+    t.open_pods(cx, &rows).await;
+    let list = t.list(cx).unwrap();
+    let permits = list.update(cx, |list, _| list.hold_computes());
+    list.update(cx, |list, cx| list.set_snapshot(pods(&rows), cx));
+    let restoring = list.clone();
+    cx.update_window(t.window, |_, window, cx| {
+        restoring.update(cx, |list, cx| list.restore_filter("web", window, cx));
+    })
+    .unwrap();
+
+    // One permit: the old text's job ends, and the job replacing it stays gated.
+    let done = list.read_with(cx, |l, _| l.computes_done());
+    permits.try_send(()).unwrap();
+    let finished = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        finished.read(cx).computes_done() > done
+    })
+    .await;
+    assert_eq!(
+        list.read_with(cx, |l, _| l.shown().1),
+        0,
+        "the job for the old text is not drawn"
+    );
+    for _ in 0..8 {
+        permits.try_send(()).unwrap();
+    }
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 2)
+        .await;
+}
+
+// covers #415: the saved text typed again before its rows arrive is not yet on the rows: Go Back
+// drops the rows drawn for the cleared filter, so Down cannot open a pod the filter excludes.
+#[gpui_kit::test]
+async fn go_back_to_retyped_text_offers_no_unfiltered_row(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(
+        cx,
+        &[
+            ("demo", "api", 0),
+            ("demo", "web-a", 0),
+            ("demo", "web-b", 0),
+        ],
+    )
+    .await;
+    let list = t.list(cx).unwrap();
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.type_text(cx, "web");
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 2)
+        .await;
+    t.dispatch(
+        cx,
+        "workspace::OpenObject",
+        json!({"kind": "pods", "namespace": "demo", "name": "web-a"}),
+    )
+    .unwrap();
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    for _ in 0..3 {
+        t.press(cx, "backspace");
+    }
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 3)
+        .await;
+
+    let permits = list.update(cx, |list, _| list.hold_computes());
+    t.type_text(cx, "web");
+    t.focus_workspace(cx);
+    t.press_key_of(cx, "workspace::GoBack");
+    assert_eq!(
+        list.read_with(cx, |l, _| l.shown().1),
+        0,
+        "unfiltered rows dropped"
+    );
+    t.press(cx, "down");
+    assert_eq!(t.selected(cx), None, "no row to move to yet");
+
+    for _ in 0..8 {
+        permits.try_send(()).unwrap();
+    }
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 2)
+        .await;
+    assert_eq!(t.selected(cx), None);
+}
+
+// covers #415: an object restored with a filter that excludes it keeps its details, and the
+// list says why its row is missing once the restored rows are in.
+#[gpui_kit::test]
+async fn go_back_says_when_the_text_filter_hides_the_selection(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let rows = [("demo", "api", 0), ("demo", "web", 0)];
+    t.open_pods(cx, &rows).await;
+    t.dispatch(
+        cx,
+        "resource_list::SelectRow",
+        json!({"namespace": "demo", "name": "api"}),
+    )
+    .unwrap();
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.type_text(cx, "web");
+    let list = t.list(cx).unwrap();
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 1)
+        .await;
+    t.dispatch(cx, "workspace::OpenView", json!({"kind": "services"}))
+        .unwrap();
+    t.feed_list(
+        cx,
+        objects(
+            KindId::new("", "services"),
+            &[("demo", "front", 0)],
+            flint_core::SyncState::Synced,
+            1,
+        ),
+    )
+    .await;
+    t.focus_workspace(cx);
+
+    t.press_key_of(cx, "workspace::GoBack");
+    let list = t.list(cx).expect("a list is open");
+    t.feed_list(cx, pods(&rows)).await;
+    let banner = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        let view = banner.read(cx).view_state();
+        view.shown == 1 && view.banners.iter().any(|b| b.id == "list-filtered-out")
+    })
+    .await;
+    assert_eq!(t.selected(cx).as_deref(), Some("api"));
+    assert!(t.detail(cx).is_some());
+    assert!(t.find(cx, "list-filtered-out").is_some());
 }
 
 // covers UP-33: Go Back to the kind already open, with nothing to select, still puts focus in
@@ -571,15 +865,15 @@ async fn the_lock_stays_reachable_from_the_sidebar(cx: &mut TestAppContext) {
     .unwrap();
     let t = open_workspace_with(cx, dir.path(), alpha_and_beta).await;
     let lock = |cx: &mut TestAppContext| {
-        t.find(cx, "lock-alpha")
-            .expect("alpha's lock button is drawn")
+        t.find(cx, "lock-kind-alpha")
+            .expect("kind-alpha's lock button is drawn")
             .bounds()
     };
     t.focus_workspace(cx);
     let before = lock(cx);
     t.press(cx, "tab");
     assert_eq!(focus(cx, &t), Focus::Sidebar);
-    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("alpha"));
+    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("kind-alpha"));
     assert_eq!(lock(cx), before, "the ring moved the lock button");
 
     t.press_key_of(cx, "palette::ToggleCommandPalette");
@@ -593,7 +887,7 @@ async fn the_lock_stays_reachable_from_the_sidebar(cx: &mut TestAppContext) {
     .await;
     t.type_text(cx, "unlock cluster");
     t.press(cx, "enter");
-    t.type_text(cx, "alpha");
+    t.type_text(cx, "kind-alpha");
     t.press(cx, "enter");
     cx.wait_for(t.window, WAIT, move |window, cx| {
         gpui_kit::component::WindowExt::has_active_dialog(window, cx)

@@ -1,8 +1,9 @@
 //! Clusters are protected (read-only in Flint) by default (ADR-0015).
 //!
-//! A cluster is [`Protection::Protected`] unless its API server is on this machine
-//! ([`is_local_server`]), the user trusts it (`trusted_clusters` in `settings.toml`), or the user
-//! unlocked it for this session ([`SessionUnlocks`]). Trust and unlocks are pinned to the context
+//! A cluster is [`Protection::Protected`] unless it is a known local tool's context with its API
+//! server on this machine (`is_known_local_context`, [`is_local_server`]), the user trusts it
+//! (`trusted_clusters` in `settings.toml`), or the user unlocked it for this session
+//! ([`SessionUnlocks`]). Trust and unlocks are pinned to the context
 //! and the server it pointed at when the user chose, so a re-pointed context is protected again.
 //!
 //! The core is the gate: every action that changes a cluster, or runs code in it (exec today;
@@ -29,7 +30,8 @@ use crate::settings::{ClusterPin, Settings};
 pub enum Protection {
     /// Read-only in Flint until the user unlocks or trusts it.
     Protected,
-    /// Its API server is on this machine (kind, minikube, Docker Desktop, OrbStack).
+    /// A known local tool's context (kind, minikube, Docker Desktop, OrbStack) with its API
+    /// server on this machine.
     Local,
     /// Unlocked by the user until Flint quits, or until Lock Again.
     Unlocked,
@@ -56,8 +58,9 @@ impl Protection {
 
 /// The protection of `context`, now pointing at `server` through `proxy_url` (its cluster
 /// entry's `proxy-url`, if any). A context with no server is protected: nothing can be pinned
-/// to it, and nothing can connect either. A context behind a proxy is never local: the proxy
-/// decides where a loopback address leads.
+/// to it, and nothing can connect either. Only a known local tool's context on this machine is
+/// local (`is_known_local_context`). A context behind a proxy is never local: the proxy decides
+/// where a loopback address leads.
 pub fn protection(
     settings: &Settings,
     unlocks: &SessionUnlocks,
@@ -70,13 +73,33 @@ pub fn protection(
     };
     if settings.trust(context, Some(server)).is_trusted() && !unlocks.trust_revoked(context) {
         Protection::Trusted
-    } else if !settings.protect_local_clusters && proxy_url.is_none() && is_local_server(server) {
+    } else if !settings.protect_local_clusters
+        && proxy_url.is_none()
+        && is_known_local_context(context)
+        && is_local_server(server)
+    {
         Protection::Local
     } else if unlocks.is_unlocked(context, server) {
         Protection::Unlocked
     } else {
         Protection::Protected
     }
+}
+
+/// The context names local tools write to the kubeconfig, matched exactly.
+const LOCAL_CONTEXTS: [&str; 4] = ["kind", "minikube", "docker-desktop", "orbstack"];
+
+/// What kind puts before a cluster's name in its context name.
+const KIND_CONTEXT_PREFIX: &str = "kind-";
+
+/// Whether `context` is named as a local tool names its context: exactly `kind`, `minikube`,
+/// `docker-desktop` or `orbstack`, or `kind-<cluster>`. Anything else is not recognised, so it is
+/// protected like any other cluster.
+fn is_known_local_context(context: &str) -> bool {
+    LOCAL_CONTEXTS.contains(&context)
+        || context
+            .strip_prefix(KIND_CONTEXT_PREFIX)
+            .is_some_and(|cluster| !cluster.is_empty())
 }
 
 /// Docker Desktop's kubeconfig names its cluster by this host, which its installer maps to
@@ -311,6 +334,13 @@ pub enum WriteRefusal {
          from the cluster as it is now"
     )]
     Stale { cluster: String },
+    /// A kubeconfig file that could define the context can't be read, so what shows may be a
+    /// later file's definition, with its credentials.
+    #[error(
+        "\"{cluster}\" may be defined differently while one of your kubeconfig files can't be \
+         read; open the shell again once it loads"
+    )]
+    Unsettled { cluster: String },
     /// A load confirmed the context is gone from the kubeconfig files.
     #[error("\"{cluster}\" is no longer in your kubeconfig files")]
     Removed { cluster: String },
@@ -416,6 +446,107 @@ mod tests {
         // Unlocking at a new server replaces the old unlock.
         unlocks.unlock("kind", "https://127.0.0.1:7443");
         assert_eq!(of(&settings, "kind", Some(kind)), Protection::Protected);
+    }
+
+    // covers UP-54: on this machine, only the names local tools give their contexts are local.
+    #[test]
+    fn only_known_local_contexts_are_local() {
+        let settings = Settings::default();
+        let unlocks = SessionUnlocks::default();
+        let loopback = Some("https://127.0.0.1:8443");
+        let of = |context: &str| protection(&settings, &unlocks, context, loopback, None);
+        for known in [
+            "kind",
+            "kind-dev",
+            "kind-kind",
+            "minikube",
+            "docker-desktop",
+            "orbstack",
+        ] {
+            assert_eq!(of(known), Protection::Local, "{known}");
+            assert_eq!(
+                protection(
+                    &settings,
+                    &unlocks,
+                    known,
+                    Some("https://prod.example:6443"),
+                    None
+                ),
+                Protection::Protected,
+                "{known} away from this machine"
+            );
+            assert_eq!(
+                protection(
+                    &settings,
+                    &unlocks,
+                    known,
+                    loopback,
+                    Some("http://127.0.0.1:3128")
+                ),
+                Protection::Protected,
+                "{known} behind a proxy"
+            );
+            let strict = Settings {
+                protect_local_clusters: true,
+                ..Settings::default()
+            };
+            assert_eq!(
+                protection(&strict, &unlocks, known, loopback, None),
+                Protection::Protected,
+                "{known} with protect_local_clusters"
+            );
+        }
+        for other in [
+            "",
+            "kind-",
+            "Kind",
+            "KIND-dev",
+            "kind_dev",
+            "kinddev",
+            " kind",
+            "kind ",
+            "team-kind",
+            "team-kind-dev",
+            "minikube-team",
+            "team-minikube",
+            "Minikube",
+            "docker-desktop-team",
+            "docker-for-desktop",
+            "orbstack-team",
+            "team-orbstack",
+            "team-dev",
+        ] {
+            assert_eq!(of(other), Protection::Protected, "{other:?}");
+        }
+    }
+
+    // covers UP-54, UP-55: a loopback context that is not a known local tool's takes the same
+    // Unlock or Trust as any other cluster, pinned to its server.
+    #[test]
+    fn another_loopback_context_needs_an_unlock_or_trust() {
+        let unlocks = SessionUnlocks::default();
+        let mut settings = Settings::default();
+        let server = "https://127.0.0.1:8443";
+        let of = |s: &Settings, at: &str| protection(s, &unlocks, "team-dev", Some(at), None);
+        assert_eq!(of(&settings, server), Protection::Protected);
+
+        unlocks.unlock("team-dev", server);
+        assert_eq!(of(&settings, server), Protection::Unlocked);
+        assert_eq!(
+            of(&settings, "https://127.0.0.1:9443"),
+            Protection::Protected
+        );
+        assert!(unlocks.lock("team-dev"));
+        assert_eq!(of(&settings, server), Protection::Protected);
+
+        settings
+            .trusted_clusters
+            .push(ClusterPin::new("team-dev", server));
+        assert_eq!(of(&settings, server), Protection::Trusted);
+        assert_eq!(
+            of(&settings, "https://127.0.0.1:9443"),
+            Protection::Protected
+        );
     }
 
     // covers UP-54: behind a `proxy-url`, a loopback server is wherever the proxy sends it.

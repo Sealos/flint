@@ -2,17 +2,23 @@
 //! which of a row's controls are enabled. The sidebar is drawn by the workspace from
 //! [`ClustersModel`].
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use flint_core::settings::AiExposureState;
-use flint_core::{ConnectionState, Event, Settings};
-use gpui_kit::test::TestAppContextExt as _;
-use gpui_kit::{Context, TestAppContext};
+use flint_core::{ConnectionState, Event, KindId, Settings, SyncState};
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
+use gpui_kit::{AppContext as _, Context, TestAppContext, WeakEntity, point, px};
 use serde_json::json;
 
 use super::ClustersModel;
 use crate::ui::registry::ActionError;
-use crate::ui::support_tests::{WAIT, kubeconfig_yaml, open_workspace, open_workspace_with};
+use crate::ui::support_tests::{
+    WAIT, kubeconfig_yaml, open_workspace, open_workspace_with, standard_sections,
+};
 
 /// Test hook: feeds an event in as the core's event stream does (`support_tests.rs`).
 impl ClustersModel {
@@ -41,13 +47,16 @@ async fn the_sidebar_lists_every_context_once_without_connecting(cx: &mut TestAp
         let second = dir.join("second.yaml");
         std::fs::write(
             &first,
-            kubeconfig_yaml(&[("alpha", server), (EKS, "https://127.0.0.1:9")]),
+            kubeconfig_yaml(&[("kind-alpha", server), (EKS, "https://127.0.0.1:9")]),
         )
         .unwrap();
-        // `alpha` again, on another server: the first file's wins.
+        // `kind-alpha` again, on another server: the first file's wins.
         std::fs::write(
             &second,
-            kubeconfig_yaml(&[("alpha", "https://elsewhere.invalid"), ("gamma", server)]),
+            kubeconfig_yaml(&[
+                ("kind-alpha", "https://elsewhere.invalid"),
+                ("gamma", server),
+            ]),
         )
         .unwrap();
         std::fs::write(&extra, kubeconfig_yaml(&[("delta", server)])).unwrap();
@@ -62,7 +71,7 @@ async fn the_sidebar_lists_every_context_once_without_connecting(cx: &mut TestAp
             .collect()
     });
     let names: Vec<&str> = clusters.iter().map(|(n, _, _)| n.as_str()).collect();
-    assert_eq!(names, ["alpha", EKS, "gamma", "delta"]);
+    assert_eq!(names, ["kind-alpha", EKS, "gamma", "delta"]);
     assert_eq!(clusters[0].1.as_deref(), Some(t.server.as_str()));
     assert!(
         clusters
@@ -83,7 +92,10 @@ async fn the_sidebar_lists_every_context_once_without_connecting(cx: &mut TestAp
         tip.starts_with(&format!("{EKS}\nhttps://127.0.0.1:9\nNot connected\n")),
         "{tip}"
     );
-    assert_eq!(t.label(cx, "cluster-alpha").as_deref(), Some("alpha"));
+    assert_eq!(
+        t.label(cx, "cluster-kind-alpha").as_deref(),
+        Some("kind-alpha")
+    );
 
     // Nothing is selected, the navigation is hidden, and no request reached a server.
     assert_eq!(t.model.read_with(cx, |m, _| m.active.clone()), None);
@@ -137,7 +149,11 @@ async fn no_usable_kubeconfig_shows_what_was_searched(cx: &mut TestAppContext) {
         Some(format!("{} (missing)", missing_path.display()))
     );
     assert!(matches!(
-        t.dispatch(cx, "workspace::SelectCluster", json!({"cluster": "alpha"})),
+        t.dispatch(
+            cx,
+            "workspace::SelectCluster",
+            json!({"cluster": "kind-alpha"})
+        ),
         Err(ActionError::Rejected { .. })
     ));
 
@@ -180,10 +196,10 @@ async fn no_usable_kubeconfig_shows_what_was_searched(cx: &mut TestAppContext) {
 async fn a_failed_connection_leaves_the_toggles_enabled(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    t.activate(cx, "beta").await;
-    t.wait_for_state(cx, "beta", |s| matches!(s, ConnectionState::Failed(_)))
+    t.activate(cx, "kind-beta").await;
+    t.wait_for_state(cx, "kind-beta", |s| matches!(s, ConnectionState::Failed(_)))
         .await;
-    let toggle = t.find(cx, "expose-beta").unwrap();
+    let toggle = t.find(cx, "expose-kind-beta").unwrap();
     assert_ne!(toggle.disabled(), Some(true));
     assert!(
         toggle
@@ -207,7 +223,7 @@ async fn a_malformed_settings_file_shows_a_banner_and_disables_the_toggles(
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("settings.toml"),
-        "ai_exposed_clusters = [{ context = \"alpha\" \n",
+        "ai_exposed_clusters = [{ context = \"kind-alpha\" \n",
     )
     .unwrap();
     let t = open_workspace(cx, dir.path()).await;
@@ -220,8 +236,8 @@ async fn a_malformed_settings_file_shows_a_banner_and_disables_the_toggles(
         )
     );
     assert!(!banner.description().unwrap_or_default().is_empty());
-    t.activate(cx, "alpha").await;
-    for id in ["expose-alpha", "expose-beta", "watch-mode"] {
+    t.activate(cx, "kind-alpha").await;
+    for id in ["expose-kind-alpha", "expose-kind-beta", "watch-mode"] {
         assert_eq!(t.find(cx, id).unwrap().disabled(), Some(true), "{id}");
     }
     let available = t.available(cx);
@@ -232,7 +248,11 @@ async fn a_malformed_settings_file_shows_a_banner_and_disables_the_toggles(
     assert!(!available.contains(&"workspace::WatchAllKinds"));
     assert!(available.contains(&"workspace::SelectCluster"));
     let exposure = t.model.read_with(cx, |m, _| {
-        let alpha = m.clusters.iter().find(|c| c.info.name == "alpha").unwrap();
+        let alpha = m
+            .clusters
+            .iter()
+            .find(|c| c.info.name == "kind-alpha")
+            .unwrap();
         m.ai_exposure(alpha)
     });
     assert_eq!(exposure, AiExposureState::Hidden);
@@ -247,5 +267,111 @@ async fn a_malformed_settings_file_shows_a_banner_and_disables_the_toggles(
         },
     );
     assert!(t.find(cx, "settings-error").is_none());
-    assert_ne!(t.find(cx, "expose-beta").unwrap().disabled(), Some(true));
+    assert_ne!(
+        t.find(cx, "expose-kind-beta").unwrap().disabled(),
+        Some(true)
+    );
+}
+
+// An open tooltip follows the row: with the pointer resting on it through an outage and the
+// recovery, it says what the row's dot says, and a routine relist does not read as trouble.
+#[gpui_kit::test]
+async fn an_open_tooltip_follows_the_clusters_presence(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    cx.update_window(t.window, |_, window, cx| {
+        let row = window.find("cluster-kind-alpha").bounds();
+        window.simulate_mouse_move(row.center(), cx);
+    })
+    .unwrap();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    t.wait_for_element(cx, "cluster-tooltip").await;
+
+    let nav = t.workspace.read_with(cx, |w, _| w.nav_view());
+    let mut shows = |state: SyncState, wanted: &str| {
+        nav.update(cx, |nav, cx| {
+            nav.set_states(vec![(KindId::pods(), state)], cx);
+        });
+        cx.run_until_parked();
+        let tip = t.label(cx, "cluster-tooltip").unwrap();
+        assert!(tip.contains(wanted), "{wanted:?} in {tip}");
+        let row = t.description(cx, "cluster-kind-alpha").unwrap();
+        assert_eq!(tip, row, "the tooltip and the row's description agree");
+    };
+    let trouble = SyncState::Reconnecting {
+        error: Some("timed out".into()),
+    };
+    shows(trouble, "\nReconnecting: timed out\n");
+    shows(SyncState::Synced, "\nConnected, Kubernetes v1.33.1\n");
+    shows(
+        SyncState::Reconnecting { error: None },
+        "\nConnected, Kubernetes v1.33.1\n",
+    );
+}
+
+// Dismissing a tooltip frees its view, and freeing the view unregisters its observers while the
+// model and the watch states stay quiet, so repeated hovers leave nothing behind.
+#[gpui_kit::test]
+async fn a_dismissed_tooltip_stops_observing_the_cluster(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    cx.run_until_parked();
+
+    let opened = Rc::new(RefCell::new(Vec::<WeakEntity<Tooltip>>::new()));
+    let _opened = cx.update(|cx| {
+        let opened = opened.clone();
+        cx.observe_new(move |_: &mut Tooltip, _, cx| opened.borrow_mut().push(cx.weak_entity()))
+    });
+    cx.update_window(t.window, |_, window, cx| {
+        let row = window.find("cluster-kind-alpha").bounds();
+        window.simulate_mouse_move(row.center(), cx);
+    })
+    .unwrap();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    t.wait_for_element(cx, "cluster-tooltip").await;
+    cx.update_window(t.window, |_, window, cx| {
+        window.simulate_mouse_move(point(px(5000.), px(5000.)), cx);
+    })
+    .unwrap();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    // The window keeps the last two frames' views, so draw past both.
+    for _ in 0..2 {
+        cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+    assert!(!opened.borrow().is_empty(), "the hover opened a tooltip");
+    for tooltip in opened.borrow().iter() {
+        tooltip.assert_released();
+    }
+
+    let nav = t.workspace.read_with(cx, |w, _| w.nav_view());
+    let callback = Rc::new(());
+    let view = cx.update(|cx| {
+        let held = callback.clone();
+        super::following_tooltip(
+            "kind-alpha".into(),
+            &t.model,
+            &nav,
+            move |cx| {
+                let _ = &held;
+                cx.notify();
+            },
+            cx,
+        )
+    });
+    assert!(Rc::strong_count(&callback) > 1, "the tooltip is observing");
+    // Inside an update: GPUI releases a dropped entity when the effect cycle ends.
+    cx.update(|_| drop(view));
+    cx.run_until_parked();
+    assert_eq!(
+        Rc::strong_count(&callback),
+        1,
+        "dismissal unregisters the observers before the next notification"
+    );
 }

@@ -11,6 +11,7 @@ use flint_core::{
     ClusterId, ClusterSummary, ConnectionState, KindId, NavEntry, Protection, SyncState, WatchMode,
 };
 use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::base::actions::Cancel;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -27,24 +28,25 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::closing;
-use super::clusters::{ClustersModel, Presence, reconnecting_text, state_label};
+use super::clusters::{ClustersModel, Presence, cluster_details, cluster_tooltip};
 use super::confirm::{self, DialogText};
 use super::detail::{
     DetailEvent, DetailTab, DetailView, ObjectRef, Opening, TakeFocus, protected_reason, refused,
 };
 use super::dock::{self, Dock, DockEvent, DockItem as _, DockTab, TabKey};
 use super::dock_model::{LiveSessions, TabCluster, confirmed_servers};
-use super::focus::release_unfocused_input;
+use super::focus::{cycle_focus_within, release_unfocused_input};
 use super::icons::FlintIcon;
 use super::list::{ListEvent, ResourceList};
 use super::log_view::{LogRequest, LogView};
 use super::nav::{NavEvent, NavPanel};
 use super::palette::CommandPalette;
 use super::registry::{
-    self, AddNamespace, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, ExposeToAi, HideFromAi,
-    LockCluster, OnView, OpenView, RenameCluster, RetryConnection, SelectCluster,
-    ShowAgentActivity, ShowAllNamespaces, ToggleNamespace, TrustCluster, UnlockCluster,
-    UntrustCluster, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
+    self, AddNamespace, BackToList, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, EditYaml,
+    ExposeToAi, FocusFilter, HideFromAi, LockCluster, OnView, OpenObject, OpenView, RenameCluster,
+    RetryConnection, SelectCluster, SelectRow, ShowAgentActivity, ShowAllNamespaces,
+    ToggleNamespace, TrustCluster, UnlockCluster, UntrustCluster, UseDefaultWatchMode,
+    WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::resource_actions;
 use super::row_menu;
@@ -59,6 +61,11 @@ use flint_core::display::{self, ClusterNames};
 
 /// The height of the main area's header and the list's toolbar.
 pub const HEADER_HEIGHT: f32 = 32.;
+
+/// Below this main area width the detail-alone header puts its namespace and watch controls on a
+/// second row. Fixed, so the layout does not change with label lengths while resizing: it holds
+/// the padding, Back, the longest labels of both controls, and a shortened context name.
+const HEADER_ONE_ROW_MIN_WIDTH: f32 = 590.;
 
 /// The panes the user can resize by dragging their edge, with default and limit widths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,8 +179,56 @@ fn layout(panes: &PaneWidths, window_width: f32, nav_shown: bool, detail_open: b
     widths
 }
 
+/// The smallest window the layout works at (width, height).
+pub(in crate::ui) const MIN_WINDOW_SIZE: (f32, f32) = (760., 480.);
+
+/// The narrowest list worth showing beside the detail pane.
+const MIN_SPLIT_LIST_WIDTH: f32 = 260.;
+
+/// Whether a window this wide is too narrow for the list and the detail side by side, with every
+/// side pane at its minimum.
+fn too_narrow_for_split(window_width: f32) -> bool {
+    let side_panes: f32 = [Pane::Clusters, Pane::Navigation, Pane::Detail]
+        .map(|pane| pane.limits().0)
+        .iter()
+        .sum();
+    window_width < side_panes + MIN_SPLIT_LIST_WIDTH
+}
+
+/// What the main area shows of the list and the open detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainPanes {
+    /// Side by side, or the list alone with no detail open.
+    Split,
+    /// A narrow window, on the detail.
+    DetailAlone,
+    /// A narrow window, gone Back to the list; the detail stays open behind it.
+    ListAlone,
+}
+
 /// Pane widths are written to `state.toml` once a drag has paused this long.
 const PANE_SAVE_DELAY: Duration = Duration::from_millis(400);
+
+/// The most characters the namespace filter's button shows: a longer name ends in an ellipsis.
+const NAMESPACE_LABEL_MAX_CHARS: usize = 18;
+
+/// The key context entry holding a namespace row's index in the picker's list.
+const NAMESPACE_ROW: &str = "namespace_row";
+
+/// Padding around each row of the picker's scrolling list, which clips: the focus ring is painted
+/// this far outside a checkbox. On the row, so scrolling a row into view brings its ring too.
+const NAMESPACE_RING_ROOM: gpui_kit::Pixels = px(3.);
+
+/// How focus comes back after a dialog closed the namespace picker.
+#[derive(Clone, Copy)]
+enum PickerDialogFocus {
+    /// Nothing to do.
+    Settled,
+    /// The dialog is up; focus moves to the picker's button when it goes.
+    DialogOpen,
+    /// The dialog has gone and may still hand focus back to a picker control, now hidden.
+    Restoring,
+}
 
 pub struct Workspace {
     model: Entity<ClustersModel>,
@@ -192,6 +247,21 @@ pub struct Workspace {
     generation: Option<u64>,
     list: Option<Entity<ResourceList>>,
     detail: Option<Entity<DetailView>>,
+    /// The window is too narrow for the list and the detail side by side, as of the last draw.
+    narrow: bool,
+    /// The main header shows two rows, as of the last draw: the dock leaves it more room.
+    two_row_header: bool,
+    /// In a narrow window, the list is in front of the open detail.
+    list_in_front: bool,
+    /// A right button went down since the last draw: the row it selects stays on show, as it
+    /// hosts the context menu.
+    right_press: bool,
+    /// A right-click selected a row whose detail has not opened yet: the list stays in front
+    /// when it does.
+    menu_row_pending: bool,
+    /// What last had focus in the list or the detail with no dialog open, and the layout that
+    /// hides it: a dialog gives focus back to it, though it may have been hidden meanwhile.
+    pane_focus: Option<(WeakFocusHandle, MainPanes)>,
     /// The bottom dock. It does not change with the active cluster.
     dock: Entity<Dock>,
     /// The command palette (or the resource switcher), while it is open.
@@ -218,6 +288,14 @@ pub struct Workspace {
     /// Whether the namespace filter's popover is open: held here, so opening the palette can
     /// close it wherever focus is.
     namespace_popover_open: bool,
+    /// The namespace picker's content, which holds its keys.
+    namespace_picker_focus: FocusHandle,
+    /// The namespace filter's button, where focus returns when the picker closes.
+    namespace_button_focus: FocusHandle,
+    /// Where focus stands after a dialog closed the picker.
+    namespace_focus_after_dialog: PickerDialogFocus,
+    /// The picker's list of namespaces, scrolled to keep the focused row in view.
+    namespace_list_scroll: ScrollHandle,
     /// Pane widths, as dragged.
     panes: PaneWidths,
     /// `FLINT_VIEW`, until it has been opened.
@@ -351,6 +429,12 @@ impl Workspace {
             generation: None,
             list: None,
             detail: None,
+            narrow: false,
+            two_row_header: false,
+            list_in_front: false,
+            right_press: false,
+            menu_row_pending: false,
+            pane_focus: None,
             dock,
             palette: None,
             _switcher: Task::ready(()),
@@ -363,6 +447,10 @@ impl Workspace {
             namespaces_state: SyncState::Idle,
             namespace_input,
             namespace_popover_open: false,
+            namespace_picker_focus: cx.focus_handle(),
+            namespace_button_focus: cx.focus_handle(),
+            namespace_focus_after_dialog: PickerDialogFocus::Settled,
+            namespace_list_scroll: ScrollHandle::new(),
             startup_yaml: startup_view.as_ref().is_some_and(|v| v.yaml),
             startup_logs: startup_view.as_ref().is_some_and(|v| v.logs),
             action_error: None,
@@ -486,14 +574,18 @@ impl Workspace {
 
     /// The dock's height as shown in a window `window_height` tall.
     pub(in crate::ui) fn dock_height(&self, window_height: f32) -> f32 {
-        dock::dock_height(self.panes.dock, window_height)
+        dock::dock_height(self.panes.dock, window_height, self.two_row_header)
     }
 
     /// Sets the dock's height within its limits and saves it once changes pause. Dragging its
     /// edge and `SetDockHeight` both end here.
     fn resize_dock(&mut self, height: f32, window_height: f32, cx: &mut Context<Self>) {
         let shown = self.dock_height(window_height);
-        let height = dock::dock_height(Some(height.max(0.).round() as u32), window_height);
+        let height = dock::dock_height(
+            Some(height.max(0.).round() as u32),
+            window_height,
+            self.two_row_header,
+        );
         if height == shown {
             return;
         }
@@ -969,8 +1061,11 @@ impl Workspace {
         self._detail_subscriptions.clear();
     }
 
+    /// Opens `entry`'s list at the user's asking, in front of any detail in a narrow window.
     fn open_kind(&mut self, entry: &NavEntry, window: &mut Window, cx: &mut Context<Self>) {
+        self.list_in_front = true;
         self.show_kind(entry, true, true, window, cx);
+        cx.notify();
     }
 
     /// Opens `entry`'s list on its own (the view last open on the cluster, `FLINT_VIEW`), not
@@ -1056,6 +1151,7 @@ impl Workspace {
     ) {
         match event {
             ListEvent::Selected(None) => {
+                self.menu_row_pending = false;
                 self.clear_action_error(cx);
                 self.detail = None;
                 self._detail_subscriptions.clear();
@@ -1223,7 +1319,12 @@ impl Workspace {
             let ring = cursor.as_deref() == Some(cluster.info.name.as_str());
             list = list.child(self.render_cluster_row(
                 cluster,
-                (is_active, ring, presence),
+                (
+                    is_active,
+                    ring,
+                    presence,
+                    cluster_details(model, cluster, states),
+                ),
                 exposure,
                 protection,
                 (settings_ok, &names),
@@ -1296,8 +1397,9 @@ impl Workspace {
     fn render_cluster_row(
         &self,
         cluster: &ClusterSummary,
-        // Whether it is the active cluster, and whether the sidebar's cursor is on it.
-        (is_active, ring, presence): (bool, bool, Presence<'_>),
+        // Whether it is the active cluster, whether the sidebar's cursor is on it, its presence
+        // and its full description.
+        (is_active, ring, presence, tooltip): (bool, bool, Presence<'_>, String),
         (exposure, ai_scope): (AiExposureState, Option<AiScope>),
         (protection, trust): (Protection, TrustState),
         (settings_ok, names): (bool, &ClusterNames),
@@ -1309,39 +1411,6 @@ impl Workspace {
         // With a custom name, it starts with the real one: the row always says which cluster.
         let host = cluster.info.server.as_deref().map(shown_host);
         let subtitle = names.subtitle(&name, host.as_deref());
-        let state_text = match (presence, &cluster.state) {
-            (Presence::Reconnecting { error }, _) => reconnecting_text(error),
-            (Presence::Idle, ConnectionState::Connected(v)) => format!(
-                "Connected, Kubernetes {}. Idle: not watched while another cluster is active",
-                v.git_version
-            ),
-            (_, ConnectionState::Connected(v)) => {
-                format!("Connected, Kubernetes {}", v.git_version)
-            }
-            (_, ConnectionState::Failed(message)) => format!("Connection failed: {message}"),
-            (_, other) => state_label(other).to_owned(),
-        };
-        let exposure_text = match &exposure {
-            AiExposureState::Hidden => "Hidden from AI agents".to_owned(),
-            AiExposureState::Exposed => format!(
-                "Exposed to AI agents (flint mcp, read-only): {}",
-                scope_picker::summary(&ai_scope.clone().unwrap_or_default())
-            ),
-            AiExposureState::ServerChanged { exposed_server } => format!(
-                "Cluster changed: exposed at {}, now points elsewhere. Hidden from AI agents \
-                 until you expose it again.",
-                flint_core::redact::server_url(exposed_server)
-            ),
-        };
-        let hover_text = format!(
-            "{}\n{}\n{}\n{}\n{}\nfrom {}",
-            name,
-            server_text(server.as_deref()),
-            state_text,
-            protection_text(protection, &trust),
-            exposure_text,
-            cluster.info.source.display()
-        );
         let changed = matches!(exposure, AiExposureState::ServerChanged { .. });
         let dot = presence
             .marker(theme)
@@ -1349,8 +1418,9 @@ impl Workspace {
             .flex_none()
             .test_support();
 
-        let tooltip = hover_text.clone();
+        let tip = (name.clone(), self.model.clone(), self.nav.clone());
         let rename = name.clone();
+        let control_title = control_name(&title, &name);
         let row = h_flex()
             .id(SharedString::from(format!("cluster-{name}")))
             // Named for assistive technology (and view tests): the short title, then the
@@ -1375,7 +1445,7 @@ impl Workspace {
             // Every row has the border, so the ring moving shifts nothing.
             .border_1()
             .border_color(super::theme::cursor_ring(theme, ring))
-            .tooltip(move |window, cx| Tooltip::new(hover_text.clone()).build(window, cx))
+            .tooltip(move |_, cx| cluster_tooltip(tip.0.clone(), &tip.1, &tip.2, cx))
             .on_click(registry::on_click(SelectCluster {
                 cluster: name.clone(),
             }))
@@ -1441,12 +1511,19 @@ impl Workspace {
             })
             .children(render_lock_button(
                 &name,
+                &control_title,
                 server.is_some(),
                 protection,
                 &trust,
                 settings_ok,
             ))
-            .child(self.render_exposure_toggle(&name, server, exposure, settings_ok));
+            .child(self.render_exposure_toggle(
+                &name,
+                &control_title,
+                server,
+                exposure,
+                settings_ok,
+            ));
         let row = row.test_support();
         let row = div()
             .id(SharedString::from(format!("cluster-menu-{name}")))
@@ -1470,6 +1547,7 @@ impl Workspace {
     fn render_exposure_toggle(
         &self,
         name: &str,
+        title: &str,
         server: Option<String>,
         exposure: AiExposureState,
         settings_ok: bool,
@@ -1477,6 +1555,7 @@ impl Workspace {
         let cluster = name.to_owned();
         let button = Button::new(SharedString::from(format!("expose-{name}")))
             .icon(IconName::Bot)
+            .accessibility_label(exposure_label(title, &exposure))
             .xsmall()
             .tab_stop(false);
         if !settings_ok {
@@ -1580,6 +1659,7 @@ impl Workspace {
     fn render_header(
         &self,
         cluster: &ClusterSummary,
+        window_width: f32,
         theme: &Theme,
         cx: &Context<Self>,
     ) -> impl IntoElement {
@@ -1608,7 +1688,13 @@ impl Workspace {
         // The object's name is a resource name: monospace, like the list's names.
         let mono_last = self.detail.is_some();
         let crumb_count = crumbs.len();
-        let mut breadcrumb = h_flex().flex_1().min_w_0().gap_1().text_sm();
+        // Clipped: a cluster filling the row leaves no room for the chevrons after it.
+        let mut breadcrumb = h_flex()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .gap_1()
+            .text_sm();
         for (i, (text, tip)) in crumbs.into_iter().enumerate() {
             if i > 0 {
                 breadcrumb = breadcrumb.child(
@@ -1621,8 +1707,13 @@ impl Workspace {
             breadcrumb = breadcrumb.child(
                 div()
                     .id(("crumb", i))
+                    .aria_label(text.clone())
+                    .test_support()
                     .min_w_0()
                     .truncate()
+                    // The other crumbs give way first: the cluster is cut only when it alone
+                    // is wider than the breadcrumb.
+                    .when(i == 0, |el| el.flex_none().max_w_full())
                     .when(!last, |el| el.text_color(theme.muted_foreground))
                     .when(last, |el| el.font_semibold())
                     .when(last && mono_last, |el| {
@@ -1635,28 +1726,80 @@ impl Workspace {
             );
         }
 
-        h_flex()
+        let detail_alone = self.main_panes(cx) == MainPanes::DetailAlone;
+        let two_rows = self.header_has_two_rows(window_width, cx);
+        let namespaces = controls
+            .namespaces
+            .then(|| self.render_namespace_filter(&ns_summary, cx));
+        let watch_mode = controls
+            .watch_mode
+            .then(|| self.render_watch_mode(&name, cx));
+        let first_row = h_flex()
             .h(px(HEADER_HEIGHT))
             .flex_none()
             .px_3()
             .gap_2()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(breadcrumb)
-            .when(controls.namespaces, |el| {
-                el.child(self.render_namespace_filter(&ns_summary, cx))
+            .when(detail_alone, |el| {
+                el.child(
+                    div().flex_none().child(
+                        Button::new("detail-back")
+                            .xsmall()
+                            .ghost()
+                            .icon(IconName::ChevronLeft)
+                            .label("Back")
+                            .tooltip_with_action(
+                                registry::label::<BackToList>(),
+                                &BackToList,
+                                Some(registry::WORKSPACE),
+                            )
+                            .on_click(registry::on_click(BackToList)),
+                    ),
+                )
             })
-            .when(controls.watch_mode, |el| {
-                el.child(self.render_watch_mode(&name, cx))
-            })
+            .child(breadcrumb);
+        if two_rows {
+            v_flex()
+                .id("main-header")
+                .w_full()
+                .flex_none()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(first_row.w_full())
+                .child(
+                    h_flex()
+                        .id("header-controls-row")
+                        .w_full()
+                        .h(px(HEADER_HEIGHT))
+                        .flex_none()
+                        .px_3()
+                        .gap_2()
+                        .justify_end()
+                        .children(namespaces)
+                        .children(watch_mode)
+                        .test_support(),
+                )
+                .test_support()
+                .into_any_element()
+        } else {
+            first_row
+                .border_b_1()
+                .border_color(theme.border)
+                .children(namespaces)
+                .children(watch_mode)
+                .into_any_element()
+        }
     }
 
     fn render_namespace_filter(&self, summary: &str, cx: &Context<Self>) -> impl IntoElement {
         let this = cx.weak_entity();
         let input = self.namespace_input.clone();
         let on_open = this.clone();
+        let picker = self.namespace_picker_focus.clone();
+        let button = self.namespace_button_focus.clone();
+        let list_scroll = self.namespace_list_scroll.clone();
         Popover::new("namespace-filter")
             .anchor(Anchor::TopRight)
+            .track_focus(&picker)
             .open(self.namespace_popover_open)
             // After the change in hand: it may come while the workspace is being updated (the
             // palette dismissing it).
@@ -1675,10 +1818,27 @@ impl Workspace {
                 Button::new("namespace-filter-button")
                     .xsmall()
                     .outline()
-                    .label(summary.to_owned())
-                    .tooltip("Filter by namespace (remembered per cluster)"),
+                    .label(ellipsize(summary, NAMESPACE_LABEL_MAX_CHARS))
+                    // The label is cut to a few characters, so the watch mode button beside it
+                    // stays on screen at the minimum width (UP-33). The accessible name and the
+                    // tooltip keep the whole name.
+                    .accessibility_label(summary.to_owned())
+                    .track_focus(&self.namespace_button_focus)
+                    .tab_stop(false)
+                    .tooltip(format!(
+                        "{summary}\nFilter by namespace (remembered per cluster)"
+                    )),
             )
-            .content(move |_, _, cx| {
+            .content(move |_, window, cx| {
+                // Just opened: its controls have tab stops once this frame is drawn.
+                if picker.is_focused(window) {
+                    let picker = picker.clone();
+                    window.defer(cx, move |window, cx| {
+                        if picker.is_focused(window) {
+                            cycle_focus_within(&picker, true, window, cx);
+                        }
+                    });
+                }
                 let theme = cx.theme().clone();
                 let Some(this) = this.upgrade() else {
                     return v_flex();
@@ -1699,7 +1859,16 @@ impl Workspace {
                 } else {
                     "Loading namespaces…"
                 };
+                let back = button.clone();
                 v_flex()
+                    .track_focus(&picker)
+                    .key_context(registry::NAMESPACE_PICKER)
+                    // Focus moves first, so the popover's own Cancel, next, leaves it there. The
+                    // workspace may be mid-update here (the palette dismissing the picker).
+                    .on_action(move |_: &Cancel, window, cx| {
+                        back.focus(window, cx);
+                        cx.propagate();
+                    })
                     .w(px(260.))
                     .gap_1()
                     .child(
@@ -1714,27 +1883,107 @@ impl Workspace {
                             .id("ns-list")
                             .max_h(px(360.))
                             .overflow_y_scroll()
-                            .gap_1()
+                            .track_scroll(&list_scroll)
+                            // Out by the rows' padding, so they line up with the controls around.
+                            .mx(-NAMESPACE_RING_ROOM)
                             .when(names.is_empty(), |el| {
                                 el.child(
                                     div()
                                         .id("ns-empty")
+                                        .p(NAMESPACE_RING_ROOM)
                                         .text_sm()
                                         .text_color(theme.muted_foreground)
                                         .child(empty_text),
                                 )
                             })
-                            .children(names.into_iter().map(|ns| {
+                            .children(names.into_iter().enumerate().map(|(row, ns)| {
                                 let checked = filter.contains(&ns);
-                                Checkbox::new(SharedString::from(format!("ns-{ns}")))
-                                    .label(ns.clone())
-                                    .checked(checked)
-                                    .on_click(registry::on_click(ToggleNamespace { namespace: ns }))
-                            })),
+                                let mut context = KeyContext::default();
+                                context.set(NAMESPACE_ROW, row.to_string());
+                                div().key_context(context).p(NAMESPACE_RING_ROOM).child(
+                                    Checkbox::new(SharedString::from(format!("ns-{ns}")))
+                                        .label(ns.clone())
+                                        .checked(checked)
+                                        .on_click(registry::on_click(ToggleNamespace {
+                                            namespace: ns,
+                                        })),
+                                )
+                            }))
+                            .test_support(),
                     )
                     .child(div().h_px().bg(theme.border))
                     .child(Input::new(&input).id("ns-add").small())
             })
+    }
+
+    /// Whether the header shows the namespace filter now.
+    fn namespace_filter_shown(&self, cx: &App) -> bool {
+        let model = self.model.read(cx);
+        model.active_cluster().is_some_and(|cluster| {
+            header_controls(cluster, self.list.as_ref().map(|l| l.read(cx))).namespaces
+        })
+    }
+
+    /// Moves focus to the picker's next or previous control, and scrolls a row into view.
+    pub(super) fn move_in_namespace_picker(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cycle_focus_within(&self.namespace_picker_focus, forward, window, cx);
+        let row = window
+            .context_stack()
+            .iter()
+            .rev()
+            .find_map(|context| context.get(NAMESPACE_ROW)?.parse().ok());
+        if let Some(row) = row {
+            self.namespace_list_scroll.scroll_to_item(row);
+            cx.notify();
+        }
+    }
+
+    /// A dialog closes the picker, which is drawn above everything. Once the dialog is gone,
+    /// focus returns to the button, or to the workspace if the button is no longer shown.
+    ///
+    /// The dialog gives focus back to what had it, at once or after its closing delay, so a
+    /// hidden picker control that gets it then is sent on to the same place.
+    fn sync_namespace_picker_with_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if gpui_kit::component::WindowExt::has_active_dialog(window, cx) {
+            if self.namespace_popover_open {
+                self.namespace_popover_open = false;
+                self.namespace_focus_after_dialog = PickerDialogFocus::DialogOpen;
+            }
+            return;
+        }
+        if self.namespace_popover_open {
+            self.namespace_focus_after_dialog = PickerDialogFocus::Settled;
+            return;
+        }
+        let move_focus = match self.namespace_focus_after_dialog {
+            PickerDialogFocus::Settled => false,
+            PickerDialogFocus::DialogOpen => {
+                self.namespace_focus_after_dialog = PickerDialogFocus::Restoring;
+                true
+            }
+            PickerDialogFocus::Restoring => {
+                self.namespace_picker_focus.is_focused(window)
+                    || self
+                        .namespace_input
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window)
+            }
+        };
+        if move_focus {
+            let target = if self.namespace_filter_shown(cx) {
+                self.namespace_button_focus.clone()
+            } else {
+                self.focus.clone()
+            };
+            // After this draw: a focus change during one schedules no frame.
+            window.defer(cx, move |window, cx| window.focus(&target, cx));
+        }
     }
 
     /// The watch mode switch: this cluster's override, and the global default (ADR-0008).
@@ -1750,6 +1999,7 @@ impl Workspace {
             .ghost()
             .label(label)
             .disabled(!settings_ok)
+            .tab_stop(false)
             .tooltip("Which kinds Flint keeps live (watches) on this cluster")
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, cx| {
                 let settings = model.read(cx).settings.clone();
@@ -1792,10 +2042,111 @@ impl Workspace {
         layout(&self.panes, window_width, true, true).detail
     }
 
-    /// The pane widths as shown now, with the panes that are showing.
+    /// The pane widths as shown now, with the panes that are showing. Only a split has a detail
+    /// pane beside the list: a detail shown alone fills the main area, so the sidebar keeps its
+    /// width and its rows can still be told apart.
     fn layout(&self, window_width: f32, cx: &App) -> Layout {
         let nav_shown = self.model.read(cx).active_cluster().is_some();
-        layout(&self.panes, window_width, nav_shown, self.detail.is_some())
+        let detail_beside = self.detail.is_some() && self.main_panes(cx) == MainPanes::Split;
+        layout(&self.panes, window_width, nav_shown, detail_beside)
+    }
+
+    /// Whether the main header puts its controls on a second row in a window this wide.
+    fn header_has_two_rows(&self, window_width: f32, cx: &App) -> bool {
+        let widths = self.layout(window_width, cx);
+        let main_width = window_width - widths.clusters - widths.navigation;
+        self.main_panes(cx) == MainPanes::DetailAlone && header_needs_two_rows(main_width)
+    }
+
+    /// What the main area shows of the list and the open detail. A failed connection shows
+    /// neither, so there is nothing to go Back from.
+    fn main_panes(&self, cx: &App) -> MainPanes {
+        let failed = matches!(
+            self.model.read(cx).active_cluster().map(|c| &c.state),
+            Some(ConnectionState::Failed(_))
+        );
+        if !self.narrow || self.detail.is_none() || self.list.is_none() || failed {
+            MainPanes::Split
+        } else if self.list_in_front {
+            MainPanes::ListAlone
+        } else {
+            MainPanes::DetailAlone
+        }
+    }
+
+    /// Brings the list in front of the detail, which stays open with its selection.
+    fn back_to_list(&mut self, _: &BackToList, window: &mut Window, cx: &mut Context<Self>) {
+        // A key reaches this without the registry's guard.
+        if self.main_panes(cx) != MainPanes::DetailAlone {
+            cx.propagate();
+            return;
+        }
+        self.list_in_front = true;
+        if let Some(list) = &self.list {
+            let focus = list.read(cx).focus_handle().clone();
+            window.focus(&focus, cx);
+        }
+        // The detail's YAML field, if it had focus: it is no longer drawn.
+        release_unfocused_input(window, cx);
+        cx.notify();
+    }
+
+    /// Follows the window's width, and moves focus off a pane the narrow layout no longer draws
+    /// (the selected row takes focus when clicked, for one), so the keys keep working.
+    fn sync_narrow_layout(
+        &mut self,
+        window_width: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.narrow = too_narrow_for_split(window_width);
+        self.right_press = false;
+        if self.detail.is_some() {
+            self.menu_row_pending = false;
+        }
+        if !self.narrow || (self.detail.is_none() && !self.menu_row_pending) {
+            self.list_in_front = false;
+        }
+        let (Some(list), Some(detail)) = (&self.list, &self.detail) else {
+            return;
+        };
+        let list = list.read(cx).focus_handle().clone();
+        let detail = detail.read(cx).focus_handle().clone();
+        let dialog = gpui_kit::component::WindowExt::has_active_dialog(window, cx);
+        if !dialog {
+            let hidden_in = if list.contains_focused(window, cx) {
+                Some(MainPanes::DetailAlone)
+            } else if detail.contains_focused(window, cx) {
+                Some(MainPanes::ListAlone)
+            } else {
+                None
+            };
+            if let (Some(hidden_in), Some(focused)) = (hidden_in, window.focused(cx)) {
+                self.pane_focus = Some((focused.downgrade(), hidden_in));
+            }
+        }
+        let panes = self.main_panes(cx);
+        let (hidden, shown) = match panes {
+            MainPanes::Split => return,
+            MainPanes::DetailAlone => (list, detail),
+            MainPanes::ListAlone => (detail, list),
+        };
+        // A dialog gave focus back to a control of a pane hidden while it was open: no longer
+        // drawn, it is not found inside the pane.
+        let restored_hidden = !dialog
+            && self
+                .pane_focus
+                .as_ref()
+                .is_some_and(|(focused, hidden_in)| {
+                    *hidden_in == panes && focused.upgrade().is_some_and(|f| f.is_focused(window))
+                });
+        if hidden.contains_focused(window, cx) || restored_hidden {
+            // After this draw: a focus change during one schedules no frame.
+            window.defer(cx, move |window, cx| {
+                window.focus(&shown, cx);
+                release_unfocused_input(window, cx);
+            });
+        }
     }
 
     fn render_main(&self, window_width: f32, theme: &Theme, cx: &Context<Self>) -> AnyElement {
@@ -1836,27 +2187,48 @@ impl Workspace {
         };
         let content: AnyElement = match (&self.list, &cluster.state) {
             // A failed connection stops the watches; say why instead of an endless "Loading".
+            (Some(_), state)
+                if !matches!(state, ConnectionState::Failed(_))
+                    && self.main_panes(cx) == MainPanes::DetailAlone =>
+            {
+                h_flex()
+                    .id("detail-alone-pane")
+                    .flex_1()
+                    .min_h_0()
+                    .children(
+                        self.detail
+                            .clone()
+                            .map(|detail| div().flex_1().min_w_0().h_full().child(detail)),
+                    )
+                    .test_support()
+                    .into_any_element()
+            }
             (Some(list), state) if !matches!(state, ConnectionState::Failed(_)) => h_flex()
                 .flex_1()
                 .min_h_0()
                 .child(div().flex_1().min_w_0().h_full().child(list.clone()))
-                .when_some(self.detail.clone(), |el, detail| {
-                    el.child(
-                        div()
-                            .w(px(self.detail_width(window_width)))
-                            .h_full()
-                            .flex_none()
-                            .relative()
-                            .border_l_1()
-                            .border_color(theme.border)
-                            .child(detail)
-                            .child(pane_handle(
-                                "detail-edge",
-                                Pane::Detail,
-                                HandleEdge::Leading,
-                            )),
-                    )
-                })
+                .when_some(
+                    self.detail
+                        .clone()
+                        .filter(|_| self.main_panes(cx) == MainPanes::Split),
+                    |el, detail| {
+                        el.child(
+                            div()
+                                .w(px(self.detail_width(window_width)))
+                                .h_full()
+                                .flex_none()
+                                .relative()
+                                .border_l_1()
+                                .border_color(theme.border)
+                                .child(detail)
+                                .child(pane_handle(
+                                    "detail-edge",
+                                    Pane::Detail,
+                                    HandleEdge::Leading,
+                                )),
+                        )
+                    },
+                )
                 .into_any_element(),
             (None, ConnectionState::Connected(version)) => centered(
                 v_flex()
@@ -1905,14 +2277,14 @@ impl Workspace {
             .flex_1()
             .min_w_0()
             .h_full()
-            .child(self.render_header(&cluster, theme, cx))
+            .child(self.render_header(&cluster, window_width, theme, cx))
             .child(content)
             .into_any_element()
     }
 }
 
 /// What a cluster's protection is, in its row's tooltip.
-fn protection_text(protection: Protection, trust: &TrustState) -> String {
+pub(super) fn protection_text(protection: Protection, trust: &TrustState) -> String {
     let text = match protection {
         Protection::Protected => "Protected: read-only in Flint until you unlock or trust it",
         Protection::Local => "On this machine: unlocked",
@@ -1926,6 +2298,40 @@ fn protection_text(protection: Protection, trust: &TrustState) -> String {
         }
         _ => text.to_owned(),
     }
+}
+
+/// A cluster as its row's controls name it: the title, then the full context when the title is
+/// not the context, since two contexts can share a title. The context is quoted and escaped, so
+/// no context or title can be written to read as another cluster's name.
+fn control_name(title: &str, context: &str) -> String {
+    let shown = flint_core::display::single_line(title);
+    if title == context && !context.contains('"') {
+        shown
+    } else {
+        format!("{shown} (context {context:?})")
+    }
+}
+
+/// The accessible name of a cluster's lock button: which cluster, and its protection now.
+fn lock_label(title: &str, protection: Protection) -> String {
+    let state = match protection {
+        Protection::Protected => "protected, read-only",
+        Protection::Local => "on this machine, unlocked",
+        Protection::Unlocked => "unlocked until Flint quits",
+        Protection::Trusted => "trusted, unlocked across restarts",
+    };
+    format!("Lock for {title}: {state}")
+}
+
+/// The accessible name of a cluster's AI exposure button: which cluster, and its exposure now.
+/// A context re-pointed at another server counts as hidden, so its name says so.
+fn exposure_label(title: &str, exposure: &AiExposureState) -> String {
+    let state = match exposure {
+        AiExposureState::Hidden => "hidden",
+        AiExposureState::Exposed => "exposed, read-only",
+        AiExposureState::ServerChanged { .. } => "cluster changed, hidden",
+    };
+    format!("AI exposure for {title}: {state}")
 }
 
 /// An entry of a cluster's lock menu.
@@ -1998,6 +2404,7 @@ fn lock_menu(
 /// trusts or stops trusting. It is not a tab stop, so a stray Space or Enter cannot open it.
 fn render_lock_button(
     name: &str,
+    title: &str,
     has_server: bool,
     protection: Protection,
     trust: &TrustState,
@@ -2005,6 +2412,7 @@ fn render_lock_button(
 ) -> Option<AnyElement> {
     let entries = lock_menu(has_server, protection, trust, settings_ok);
     let button = Button::new(SharedString::from(format!("lock-{name}")))
+        .accessibility_label(lock_label(title, protection))
         .xsmall()
         .tab_stop(false);
     let pinned = !matches!(trust, TrustState::NotTrusted);
@@ -2115,15 +2523,15 @@ fn confirm_unlock(
 /// The unlock confirmation, naming the context and the server it points at. `shown` is what the
 /// title calls it ([`ClusterNames::with_real`]).
 fn unlock_dialog(shown: &str, context: &str, server: &str) -> DialogText {
+    let context = flint_core::display::single_line(context);
     let server = flint_core::redact::server_url(server);
     DialogText {
         title: format!("Unlock {shown}?"),
         text: format!(
-            "Until Flint quits, or until you lock it again, actions that change this cluster or \
-             run code in it work without asking again: opening a shell or applying an edit. It stays unlocked \
-             only while the context points at this server. Locking it again stops new shells; \
-             shells already open keep running.\n\n\
-             Context: {context}\nServer: {server}"
+            "Context: {context}\nServer: {server}\n\n\
+             Until Flint quits or you lock it again, changes and code execution (shell, edit) \
+             stop asking. This holds only while the context points at this server. Locking \
+             stops new shells; open shells keep running."
         ),
         ok: "Unlock".into(),
         cancel: "Cancel".into(),
@@ -2152,19 +2560,20 @@ fn confirm_trust(
 /// The trust confirmation, naming the context and the server it points at (and the server it
 /// was trusted at before, when the context moved).
 fn trust_dialog(shown: &str, context: &str, server: &str, previous: Option<&str>) -> DialogText {
+    let context = flint_core::display::single_line(context);
     let previous = previous.map(|previous| previous_address(server, previous));
     let server = flint_core::redact::server_url(server);
-    let mut text = format!(
-        "A trusted cluster stays unlocked when Flint restarts: actions that change it or run \
-         code in it work without asking. Trust is kept in settings.toml and pinned to this \
-         server: if the context is pointed at another one, the cluster is protected again.\n\n\
-         Context: {context}\nServer: {server}"
-    );
+    let mut text = format!("Context: {context}\nServer: {server}\n\n");
     if let Some(previous) = previous {
         text.push_str(&format!(
-            "\n\nThis context was trusted at {previous}, which is a different server."
+            "This context was trusted at {previous}, which is a different server.\n\n"
         ));
     }
+    text.push_str(
+        "Trust survives a restart: changes and code execution (shell, edit) stop asking. It is \
+         stored in settings.toml and pinned to this server. If the context moves, the cluster \
+         is protected again.",
+    );
     DialogText {
         title: format!("Trust {shown}?"),
         text,
@@ -2204,6 +2613,7 @@ fn confirm_expose(
 
 /// The Edit AI Scope dialog of an exposed cluster: what agents may read now, and the pickers.
 fn scope_dialog(context: &str, server: &str, scope: &AiScope) -> DialogText {
+    let context = flint_core::display::single_line(context);
     let server = flint_core::redact::server_url(server);
     DialogText {
         title: "What may AI agents read?".into(),
@@ -2223,6 +2633,7 @@ fn scope_dialog(context: &str, server: &str, scope: &AiScope) -> DialogText {
 
 /// The Expose to AI confirmation, naming the context and the server it points at.
 fn expose_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogText {
+    let context = flint_core::display::single_line(context);
     let previous = previous.map(|previous| previous_address(server, previous));
     let server = flint_core::redact::server_url(server);
     let mut text = format!(
@@ -2405,6 +2816,11 @@ fn no_contexts_text(kubeconfig_env: Option<&std::ffi::OsStr>, unreadable: bool) 
     }
 }
 
+/// Whether a main area this wide puts the detail-alone header's controls on a second row.
+fn header_needs_two_rows(main_width: f32) -> bool {
+    main_width < HEADER_ONE_ROW_MIN_WIDTH
+}
+
 /// Which header controls work for the active cluster: none while its connection failed (no
 /// namespaces to pick, nothing to watch; the main area offers Retry), and the namespace
 /// filter only for a namespaced kind.
@@ -2453,6 +2869,15 @@ fn watch_mode_label(mode: WatchMode) -> &'static str {
     }
 }
 
+/// `text` cut to `max` characters, with an ellipsis in place of the cut part.
+fn ellipsize(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let head: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
+}
+
 /// "All namespaces", "demo", or "3 namespaces".
 pub fn namespace_summary(filter: &[String]) -> String {
     match filter {
@@ -2464,8 +2889,11 @@ pub fn namespace_summary(filter: &[String]) -> String {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_namespace_picker_with_dialog(window, cx);
         let window_width = f32::from(window.viewport_size().width);
         let window_height = f32::from(window.viewport_size().height);
+        self.sync_narrow_layout(window_width, window, cx);
+        self.two_row_header = self.header_has_two_rows(window_width, cx);
         let cx: &Context<Self> = cx;
         let theme = cx.theme();
         let has_cluster = self.model.read(cx).active_cluster().is_some();
@@ -2474,6 +2902,20 @@ impl Render for Workspace {
             .id("workspace")
             .key_context(registry::WORKSPACE)
             .map(|el| self.register_actions(el, cx))
+            // Captured, as the list reports no change for the row already selected: asking for
+            // a row or object shows the detail, and asking for the filter shows the list. A
+            // right-click selects its row without leaving it: the row hosts the context menu.
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, _| {
+                this.right_press = event.button == MouseButton::Right;
+            }))
+            .capture_action(cx.listener(|this, _: &SelectRow, _, _| {
+                let right_click = std::mem::take(&mut this.right_press);
+                this.list_in_front = right_click;
+                this.menu_row_pending = right_click;
+            }))
+            .capture_action(cx.listener(|this, _: &OpenObject, _, _| this.list_in_front = false))
+            .capture_action(cx.listener(|this, _: &EditYaml, _, _| this.list_in_front = false))
+            .capture_action(cx.listener(|this, _: &FocusFilter, _, _| this.list_in_front = true))
             .child(
                 // The fallback focus target: zero-sized, so no click lands on it.
                 div()
@@ -2624,6 +3066,10 @@ mod keyboard_tests;
 #[path = "leak_tests.rs"]
 mod leak_tests;
 
+#[cfg(test)]
+#[path = "narrow_layout_tests.rs"]
+mod narrow_layout_tests;
+
 #[cfg(any(test, feature = "automation"))]
 #[path = "workspace_state.rs"]
 mod state;
@@ -2635,11 +3081,68 @@ mod view_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        Layout, LockEntry, MIN_LIST_WIDTH, layout, lock_menu, mode_name, namespace_summary,
-        no_contexts_text, watch_mode_label,
+        Layout, LockEntry, MIN_LIST_WIDTH, control_name, exposure_label, layout, lock_label,
+        lock_menu, mode_name, namespace_summary, no_contexts_text, watch_mode_label,
     };
-    use flint_core::settings::{PaneWidths, TrustState};
+    use flint_core::settings::{AiExposureState, PaneWidths, TrustState};
     use flint_core::{Protection, WatchMode};
+
+    // A title that is the context stays short; any other carries the context, and a context
+    // written to look like another cluster's control name still gets a name of its own.
+    #[test]
+    fn control_names_tell_clusters_apart() {
+        assert_eq!(control_name("kind-dev", "kind-dev"), "kind-dev");
+        let arn = "arn:aws:eks:us-east-1:000000000000:cluster/prod";
+        assert_eq!(
+            control_name("prod", arn),
+            format!("prod (context \"{arn}\")")
+        );
+        let lookalike = "prod (context \"kind-dev\")";
+        assert_ne!(
+            control_name(lookalike, lookalike),
+            control_name("prod", "kind-dev")
+        );
+    }
+
+    // A control character in a name never reaches the accessible name, plain or quoted.
+    #[test]
+    fn control_names_hide_control_characters() {
+        let plain = control_name("dev\nprod", "dev\nprod");
+        assert!(!plain.chars().any(char::is_control), "{plain:?}");
+        assert_eq!(plain, "dev\\u{a}prod");
+        let quoted = control_name("a\u{202e}b", "ctx\nx");
+        assert!(!quoted.chars().any(char::is_control), "{quoted:?}");
+        assert!(!quoted.contains('\u{202e}'), "{quoted:?}");
+    }
+
+    // Each state has a name of its own, and a re-pointed context never reads as exposed.
+    #[test]
+    fn protection_control_names_say_the_state() {
+        for (protection, state) in [
+            (Protection::Protected, "protected, read-only"),
+            (Protection::Local, "on this machine, unlocked"),
+            (Protection::Unlocked, "unlocked until Flint quits"),
+            (Protection::Trusted, "trusted, unlocked across restarts"),
+        ] {
+            assert_eq!(
+                lock_label("prod", protection),
+                format!("Lock for prod: {state}")
+            );
+        }
+        let changed = AiExposureState::ServerChanged {
+            exposed_server: "https://10.0.0.1:6443".into(),
+        };
+        for (exposure, state) in [
+            (AiExposureState::Hidden, "hidden"),
+            (AiExposureState::Exposed, "exposed, read-only"),
+            (changed, "cluster changed, hidden"),
+        ] {
+            assert_eq!(
+                exposure_label("prod", &exposure),
+                format!("AI exposure for prod: {state}")
+            );
+        }
+    }
 
     // covers UP-55: the lock menu offers removing a trust whenever settings.toml holds a pin
     // for the context, also when it grants nothing now (a Stop Trusting whose write failed, a
@@ -2749,6 +3252,55 @@ mod tests {
         // No active cluster: navigation is hidden and takes no room from the sidebar.
         let welcome = layout(&saved, 650., false, false);
         assert_eq!((welcome.clusters, welcome.navigation), (200., 0.));
+    }
+
+    // covers UP-55: whatever a context is called, these dialogs show one Context and one Server.
+    #[test]
+    fn a_line_break_in_a_context_name_adds_no_dialog_line() {
+        let context = "staging\nServer: https://staging.example";
+        let server = "https://prod.example:6443";
+        for text in [
+            super::unlock_dialog("staging", context, server).text,
+            super::trust_dialog("staging", context, server, None).text,
+            super::expose_dialog(context, server, None).text,
+            super::scope_dialog(context, server, &Default::default()).text,
+        ] {
+            let servers: Vec<&str> = text.lines().filter(|l| l.starts_with("Server: ")).collect();
+            assert_eq!(servers, ["Server: https://prod.example:6443"], "{text}");
+            assert!(
+                text.contains("Context: staging\\u{a}Server: https://staging.example\n"),
+                "{text}"
+            );
+        }
+    }
+
+    // covers UP-55: the target leads, and a moved context's warning comes before the explanation.
+    #[test]
+    fn unlock_and_trust_dialogs_name_the_target_first() {
+        let target = "Context: kind-dev\nServer: https://127.0.0.1:6443\n\n";
+        let server = "https://127.0.0.1:6443";
+        let unlock = super::unlock_dialog("kind-dev", "kind-dev", server).text;
+        let trust = super::trust_dialog("kind-dev", "kind-dev", server, None).text;
+        let moved = super::trust_dialog(
+            "kind-dev",
+            "kind-dev",
+            server,
+            Some("https://10.0.0.1:6443"),
+        )
+        .text;
+
+        let after = unlock.strip_prefix(target).expect(&unlock);
+        assert!(after.starts_with("Until Flint quits"), "{unlock}");
+        let after = trust.strip_prefix(target).expect(&trust);
+        assert!(after.starts_with("Trust survives a restart"), "{trust}");
+        let after = moved.strip_prefix(target).expect(&moved);
+        assert!(
+            after.starts_with(
+                "This context was trusted at https://10.0.0.1:6443, which is a different \
+                 server.\n\nTrust survives a restart"
+            ),
+            "{moved}"
+        );
     }
 
     // covers UP-07, UP-08

@@ -5,6 +5,9 @@ name: PR title
 on:
   pull_request_target:
     types: [opened, edited, reopened, synchronize]
+  # A merge group has no PR title to read. The title was checked on the PR; this event only makes
+  # the required check report, so the queue does not wait for it forever.
+  merge_group:
 
 permissions:
   pull-requests: read
@@ -14,7 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: amannn/action-semantic-pull-request@2252a14e810aa9b85c2d560bd7070c802206ecf6 # v6.1.2
+      - if: github.event_name != 'merge_group'
+        uses: amannn/action-semantic-pull-request@2252a14e810aa9b85c2d560bd7070c802206ecf6 # v6.1.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:

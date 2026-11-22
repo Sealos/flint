@@ -9,6 +9,10 @@ const ARGO_INSTANCE: &str = "argocd.argoproj.io/instance";
 const APP_INSTANCE: &str = "app.kubernetes.io/instance";
 /// What names an Argo CD application whose name cannot be read from its tracking id.
 const UNNAMED_APP: &str = "unknown application";
+/// What names a Flux Kustomization whose name cannot be read.
+const UNNAMED_KUSTOMIZATION: &str = "unknown kustomization";
+/// What names a Flux HelmRelease whose name cannot be read.
+const UNNAMED_RELEASE: &str = "unknown release";
 const FLUX_KUSTOMIZE: (&str, &str) = (
     "kustomize.toolkit.fluxcd.io/name",
     "kustomize.toolkit.fluxcd.io/namespace",
@@ -30,18 +34,24 @@ pub enum Manager {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedBy {
     pub manager: Manager,
+    /// Empty when only the tool is known.
     pub name: String,
     pub namespace: Option<String>,
 }
 
 impl std::fmt::Display for ManagedBy {
-    /// `Argo CD: web`, `Flux: flux-system/apps` or `Flux HelmRelease: flux-system/web`.
+    /// `Argo CD: web`, `Flux: flux-system/apps` or `Flux HelmRelease: flux-system/web`; just the
+    /// tool, such as `Argo CD`, without a name.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self.manager {
-            Manager::ArgoCd => "Argo CD: ",
-            Manager::FluxKustomization => "Flux: ",
-            Manager::FluxHelmRelease => "Flux HelmRelease: ",
+            Manager::ArgoCd => "Argo CD",
+            Manager::FluxKustomization => "Flux",
+            Manager::FluxHelmRelease => "Flux HelmRelease",
         })?;
+        if self.name.is_empty() {
+            return Ok(());
+        }
+        f.write_str(": ")?;
         if let Some(namespace) = &self.namespace {
             write!(f, "{namespace}/")?;
         }
@@ -146,7 +156,8 @@ pub fn managed_by<'a>(
 }
 
 /// [`managed_by`] for an object as the API server returned it. Nothing has masked such an object,
-/// so an id that looks masked is an unreadable one.
+/// so an id that looks masked is an unreadable one, and any other marker that is present but
+/// cannot be read still counts, as an unknown manager.
 pub(crate) fn managed_by_live<'a>(
     object: &Identity<'_>,
     read: impl Fn(&str) -> Option<&'a str>,
@@ -155,7 +166,33 @@ pub(crate) fn managed_by_live<'a>(
         Tracking::Masked => Tracking::Unreadable,
         other => other,
     });
-    manager_from(tracked, read)
+    manager_from(tracked, &read).or_else(|| unreadable_marker(&read))
+}
+
+/// The manager a present marker points to when none could be named. The common instance label
+/// is not a marker: alone it says nothing.
+fn unreadable_marker<'a>(read: &impl Fn(&str) -> Option<&'a str>) -> Option<ManagedBy> {
+    let unnamed = |manager, name: &str| ManagedBy {
+        manager,
+        name: name.to_owned(),
+        namespace: None,
+    };
+    if read(ARGO_INSTANCE).is_some() {
+        return Some(unnamed(Manager::ArgoCd, UNNAMED_APP));
+    }
+    [
+        (
+            Manager::FluxKustomization,
+            FLUX_KUSTOMIZE,
+            UNNAMED_KUSTOMIZATION,
+        ),
+        (Manager::FluxHelmRelease, FLUX_HELM, UNNAMED_RELEASE),
+    ]
+    .into_iter()
+    .find(|(_, (name_key, namespace_key), _)| {
+        read(name_key).is_some() || read(namespace_key).is_some()
+    })
+    .map(|(manager, _, name)| unnamed(manager, name))
 }
 
 fn manager_from<'a>(
@@ -208,12 +245,67 @@ pub fn managed_by_object(object: &Value) -> Option<ManagedBy> {
     })
 }
 
+/// Where a list row keeps its manager's text, among its labels. A colon is not valid in a label
+/// key, so no label of the object can take this place.
+pub const ROW_MANAGER_KEY: &str = "flint:managed-by";
+
+/// [`managed_by`] for a Secret as the API server returned it, for showing. A tracking id naming
+/// this exact Secret shows the tool only; no text from an annotation is output. Other markers
+/// count from its labels, and a name the credential redactor would touch is left out.
+pub fn managed_by_secret(object: &Value) -> Option<ManagedBy> {
+    let metadata = object.get("metadata")?;
+    let tracked = metadata
+        .get("annotations")
+        .and_then(|annotations| annotations.get(ARGO_TRACKING_ID))
+        .and_then(Value::as_str)
+        .is_some_and(|id| names_secret(id, &Identity::of(object)));
+    if tracked {
+        return Some(ManagedBy {
+            manager: Manager::ArgoCd,
+            name: String::new(),
+            namespace: None,
+        });
+    }
+    let manager = manager_from(None, |key: &str| metadata.get("labels")?.get(key)?.as_str())?;
+    (crate::redact::redact_credentials(&manager.to_string()).count == 0).then_some(manager)
+}
+
+/// Whether tracking id `id` is `<app>:/Secret:<namespace>/<name>` for exactly this Secret.
+fn names_secret(id: &str, object: &Identity<'_>) -> bool {
+    let (Some(""), "Secret", Some(namespace)) = (object.group, object.kind, object.namespace)
+    else {
+        return false;
+    };
+    id.strip_suffix(&format!(":/Secret:{namespace}/{}", object.name))
+        .is_some_and(is_plain_name)
+}
+
 /// [`managed_by_live`] for an object as JSON.
 pub(crate) fn managed_by_live_object(object: &Value) -> Option<ManagedBy> {
-    let metadata = object.get("metadata")?;
-    managed_by_live(&Identity::of(object), |key| {
-        label_or_annotation(metadata, key)
-    })
+    managed_by_live_metadata(&Identity::of(object), object.get("metadata")?)
+}
+
+/// The one reader of a live object's `metadata` (its labels and annotations), so every caller
+/// reads the same markers the same way.
+pub(crate) fn managed_by_live_metadata(
+    identity: &Identity<'_>,
+    metadata: &Value,
+) -> Option<ManagedBy> {
+    managed_by_live(identity, |key| live_label_or_annotation(metadata, key))
+}
+
+/// A marker on a live object: an empty label gives way to an annotation of the same key, and a
+/// value that is not text is present but empty.
+fn live_label_or_annotation<'a>(metadata: &'a Value, key: &str) -> Option<&'a str> {
+    let field = |map: &str| {
+        let value = metadata.get(map)?.get(key)?;
+        Some(value.as_str().unwrap_or_default())
+    };
+    let label = field("labels");
+    label
+        .filter(|value| !value.is_empty())
+        .or_else(|| field("annotations"))
+        .or(label)
 }
 
 fn label_or_annotation<'a>(metadata: &'a Value, key: &str) -> Option<&'a str> {
@@ -401,6 +493,115 @@ mod tests {
         );
         let none = object(json!({}), json!({}));
         assert_eq!(managed_by_live_object(&none), None);
+    }
+
+    fn live(object: &Value) -> Option<String> {
+        managed_by_live_object(object).map(|m| m.to_string())
+    }
+
+    // covers UP-51: a marker that is present but cannot be read counts on a live object, and
+    // stays out of what is shown from a redacted one.
+    #[test]
+    fn a_live_marker_that_cannot_be_read_is_an_unknown_manager() {
+        for (key, expected) in [
+            (ARGO_INSTANCE, "Argo CD: unknown application"),
+            (FLUX_KUSTOMIZE.0, "Flux: unknown kustomization"),
+            (FLUX_KUSTOMIZE.1, "Flux: unknown kustomization"),
+            (FLUX_HELM.0, "Flux HelmRelease: unknown release"),
+            (FLUX_HELM.1, "Flux HelmRelease: unknown release"),
+        ] {
+            for value in [json!("team/shop"), json!("a b"), json!(""), json!(7)] {
+                for marked in [
+                    object(json!({key: value}), json!({})),
+                    object(json!({}), json!({key: value})),
+                ] {
+                    assert_eq!(live(&marked).as_deref(), Some(expected), "{key}: {value}");
+                    assert_eq!(shown(&marked), None, "{key}: {value}");
+                }
+            }
+        }
+    }
+
+    // covers UP-51: a readable marker still names the manager beside an unreadable one.
+    #[test]
+    fn a_readable_marker_wins_over_an_unreadable_one() {
+        let both = object(
+            json!({ARGO_INSTANCE: "team/shop", FLUX_KUSTOMIZE.0: "apps"}),
+            json!({}),
+        );
+        assert_eq!(live(&both).as_deref(), Some("Flux: apps"));
+        let helm = object(
+            json!({FLUX_KUSTOMIZE.0: "a b", FLUX_HELM.0: "web"}),
+            json!({}),
+        );
+        assert_eq!(live(&helm).as_deref(), Some("Flux HelmRelease: web"));
+    }
+
+    // covers UP-51: an empty label gives way to the annotation of the same key on a live object.
+    #[test]
+    fn an_empty_live_label_does_not_hide_an_annotation() {
+        let marked = object(json!({ARGO_INSTANCE: ""}), json!({ARGO_INSTANCE: "shop"}));
+        assert_eq!(live(&marked).as_deref(), Some("Argo CD: shop"));
+        assert_eq!(shown(&marked), None, "the shown result reads as before");
+        let tracked = object(
+            json!({ARGO_TRACKING_ID: ""}),
+            json!({ARGO_TRACKING_ID: "shop:apps/Deployment:demo/web"}),
+        );
+        assert_eq!(live(&tracked).as_deref(), Some("Argo CD: shop"));
+    }
+
+    // covers UP-23: the common instance label alone is no marker, whatever it holds.
+    #[test]
+    fn a_lone_instance_label_gives_no_live_warning() {
+        for value in ["shop", "team/shop", ""] {
+            let lone = object(json!({APP_INSTANCE: value}), json!({}));
+            assert_eq!(live(&lone), None, "{value}");
+        }
+    }
+
+    fn secret(labels: Value, annotations: Value) -> Value {
+        json!({"apiVersion": "v1", "kind": "Secret", "metadata": {
+            "name": "web", "namespace": "demo", "labels": labels, "annotations": annotations,
+        }})
+    }
+
+    fn shown_secret(object: &Value) -> Option<String> {
+        managed_by_secret(object).map(|m| m.to_string())
+    }
+
+    // covers UP-23: a tracked Secret shows only the tool, and its labels still name a manager.
+    #[test]
+    fn a_tracked_secret_shows_only_the_tool() {
+        let tracked = secret(
+            json!({}),
+            json!({ARGO_TRACKING_ID: "plain-value:/Secret:demo/web"}),
+        );
+        assert_eq!(shown_secret(&tracked).as_deref(), Some("Argo CD"));
+        let flux = secret(json!({FLUX_KUSTOMIZE.0: "apps"}), json!({}));
+        assert_eq!(shown_secret(&flux).as_deref(), Some("Flux: apps"));
+    }
+
+    // covers UP-10: no other annotation of a Secret is read, since any of them may copy a value.
+    #[test]
+    fn a_secret_shows_nothing_from_its_other_annotations() {
+        for annotations in [
+            json!({ARGO_INSTANCE: "s3cr3t-value"}),
+            json!({FLUX_KUSTOMIZE.0: "s3cr3t-value"}),
+            json!({ARGO_TRACKING_ID: "s3cr3t-value"}),
+            json!({ARGO_TRACKING_ID: "s3cr3t-value:/Secret:demo/other"}),
+            json!({ARGO_TRACKING_ID: "s3cr3t-value:apps/Deployment:demo/web"}),
+            json!({ARGO_TRACKING_ID: "s3cr3t-value:/Secret:other/web"}),
+            json!({ARGO_TRACKING_ID: "s3cr3t-value:example.com/Secret:demo/web"}),
+            json!({ARGO_TRACKING_ID: "<redacted>"}),
+        ] {
+            let labelled = secret(json!({APP_INSTANCE: "shop"}), annotations);
+            assert_eq!(shown_secret(&labelled), None, "{labelled}");
+        }
+        let credential = secret(
+            json!({}),
+            json!({ARGO_TRACKING_ID: "AKIAIOSFODNN7EXAMPLE:/Secret:demo/web"}),
+        );
+        assert_eq!(shown_secret(&credential).as_deref(), Some("Argo CD"));
     }
 
     // covers UP-23

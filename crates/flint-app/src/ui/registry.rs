@@ -90,6 +90,12 @@ actions!(
         RetryConnection,
         /// Clear the namespace filter.
         ShowAllNamespaces,
+        /// Open the namespace filter's picker, with focus inside it.
+        OpenNamespaceFilter,
+        /// Move focus to the namespace picker's next control, wrapping around.
+        NamespacePickerNext,
+        /// Move focus to the namespace picker's previous control, wrapping around.
+        NamespacePickerPrevious,
         /// Watch every kind on the active cluster.
         WatchAllKinds,
         /// Watch only the kinds open in a view, on the active cluster.
@@ -102,6 +108,8 @@ actions!(
         DefaultWatchOpenViewsOnly,
         /// Go back to the kind and object shown before.
         GoBack,
+        /// In a narrow window, return from the detail to the list, keeping the selection.
+        BackToList,
         /// Move focus to the next pane: clusters, navigation, list, detail, dock.
         FocusNextPane,
         /// Move focus to the previous pane.
@@ -151,7 +159,9 @@ actions!(
         /// Move focus from the list's text filter back to its rows (Esc or Enter there).
         FocusRows,
         /// Down in the list's text filter: back to the rows, selecting the first if none is.
-        SelectFromFilter
+        SelectFromFilter,
+        /// Enter on the list's rows: open the selected row, as clicking it does.
+        OpenSelectedRow
     ]
 );
 actions!(
@@ -1596,6 +1606,10 @@ const LOG_SEARCH: &str = "LogView > Input";
 pub const PALETTE: &str = "CommandPalette";
 /// Keys the palette takes from its own search field (the arrows, Enter, Esc), over the field's.
 const PALETTE_INPUT: &str = "CommandPalette > Input";
+/// The namespace picker's key context.
+pub const NAMESPACE_PICKER: &str = "NamespacePicker";
+/// Keys the picker keeps for moving between its controls, also over its text field's.
+const NAMESPACE_PICKER_KEYS: &str = "NamespacePicker || (NamespacePicker > Input)";
 /// A focused text field, where gpui-component handles Cut, Copy, Paste and Select All.
 const TEXT_FIELD: &str = "Input";
 /// The cluster sidebar's key context, while it has focus.
@@ -2137,6 +2151,12 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<GoBack>("Go Back", "Go back to the kind and object shown before.")
             .of(C::View, S::Workspace)
             .keys(&["secondary-["], Some(WORKSPACE)),
+        Spec::unit::<BackToList>(
+            "Back to List",
+            "In a narrow window, return from the detail to the list, keeping the selection.",
+        )
+        .of(C::View, S::Workspace)
+        .keys(&["secondary-shift-b"], Some(WORKSPACE)),
         // Tab and Shift-Tab, outside text fields: a field keeps them for moving between
         // controls, and a shell tab sends them to the shell.
         Spec::unit::<FocusNextPane>(
@@ -2173,6 +2193,25 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         .of(C::Namespace, S::Workspace),
         Spec::unit::<ShowAllNamespaces>("Show All Namespaces", "Clear the namespace filter.")
             .of(C::Namespace, S::Workspace),
+        Spec::unit::<OpenNamespaceFilter>(
+            "Open Namespace Filter",
+            "Open the namespace filter's picker.",
+        )
+        .of(C::Namespace, S::Workspace),
+        Spec::unit::<NamespacePickerNext>(
+            "Next Namespace Control",
+            "Move focus to the namespace picker's next control.",
+        )
+        .of(C::Namespace, S::Workspace)
+        .keys(&["tab", "down"], Some(NAMESPACE_PICKER_KEYS))
+        .hidden(),
+        Spec::unit::<NamespacePickerPrevious>(
+            "Previous Namespace Control",
+            "Move focus to the namespace picker's previous control.",
+        )
+        .of(C::Namespace, S::Workspace)
+        .keys(&["shift-tab", "up"], Some(NAMESPACE_PICKER_KEYS))
+        .hidden(),
         Spec::with_args::<SetNamespaces>(
             "Set Namespace Filter…",
             "Show only these namespaces (remembered per cluster).",
@@ -2221,6 +2260,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         )
         .of(C::List, S::List)
         .keys(&["escape"], Some(LIST_ALONE))
+        .hidden(),
+        Spec::unit::<OpenSelectedRow>(
+            "Open Selected Row",
+            "Show the selected row's details, as clicking it does.",
+        )
+        .of(C::List, S::List)
+        .keys(&["enter"], Some(LIST_ALONE))
         .hidden(),
         Spec::with_args::<SelectRow>(
             "Select Object…",
@@ -3016,6 +3062,8 @@ pub mod tests {
             || (key == "escape" && context == Some(super::LOG_SEARCH))
             || context == Some(super::PALETTE_INPUT)
             || (matches!(key, "escape" | "enter" | "down") && context == Some(super::LIST_FILTER))
+            || (matches!(key, "tab" | "up" | "down")
+                && context == Some(super::NAMESPACE_PICKER_KEYS))
     }
 
     #[test]

@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 
 use super::row_actions_tests::{draw, menu, right_click, show_fetched};
 use crate::ui::confirm;
+use crate::ui::detail::TestPodLister;
 use crate::ui::registry;
 use crate::ui::resource_actions::{
     ResourceAction, RunningWrite, WriteKey, claim, release, request, running_on,
@@ -28,7 +29,7 @@ use crate::ui::support_tests::{
 
 const WRITES: [&str; 2] = ["Scale…", "Rollout Restart…"];
 
-/// Connects `alpha` with a discovery in which every kind can be deleted.
+/// Connects `kind-alpha` with a discovery in which every kind can be deleted.
 async fn connect_deletable(cx: &mut TestAppContext, t: &TestWorkspace) {
     t.connect_alpha(cx, standard_sections()).await;
     let mut found = discovery(standard_sections());
@@ -38,7 +39,7 @@ async fn connect_deletable(cx: &mut TestAppContext, t: &TestWorkspace) {
     t.feed(
         cx,
         Event::DiscoveryChanged {
-            cluster: "alpha".into(),
+            cluster: "kind-alpha".into(),
             generation: CURRENT_GENERATION,
             discovery: Some(Arc::new(found)),
             error: None,
@@ -114,6 +115,116 @@ async fn a_nodes_menu_follows_whether_it_is_cordoned(cx: &mut TestAppContext) {
     assert!(t.available(cx).contains(&"workspace::UncordonNode"));
 }
 
+/// Answers the detail pane's pod lists with one ready pod, `web-1`.
+fn list_one_pod(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        cx.set_global(TestPodLister(std::rc::Rc::new(|_, _, _, _| {
+            Box::pin(async {
+                Ok(vec![flint_core::WorkloadPod {
+                    name: "web-1".to_owned(),
+                    ready: true,
+                    containers: vec!["app".to_owned()],
+                    default_container: Some("app".to_owned()),
+                }])
+            })
+        })));
+    });
+}
+
+// covers #267: what RBAC forbids is disabled with its reason, what it allows stays enabled, and an
+// answer that is not clear leaves the action to the server.
+#[gpui_kit::test]
+async fn a_forbidden_action_is_disabled_saying_why(cx: &mut TestAppContext) {
+    use flint_core::access::Access;
+
+    use crate::ui::detail::access::Gated;
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_alpha(cx, dir.path(), "").await;
+    connect_deletable(cx, &t).await;
+    open_deployments(cx, &t).await;
+    list_one_pod(cx);
+    right_click(cx, &t, "web").await;
+    cx.run_until_parked();
+    let set = |cx: &mut TestAppContext, what, access| {
+        let detail = t.workspace.read_with(cx, |ws, _| ws.detail_view().unwrap());
+        detail.update(cx, |d, cx| d.set_access_for_tests(what, access, cx));
+    };
+    let entry = |cx: &mut TestAppContext, label: &str| {
+        let actions = t
+            .workspace
+            .read_with(cx, |ws, cx| row_menu::row_actions(ws, cx).unwrap());
+        let (_, entries) = row_menu::menu_state(&actions);
+        let found = entries
+            .into_iter()
+            .find(|e| e.label.starts_with(label))
+            .unwrap_or_else(|| panic!("no entry {label}"));
+        (found.enabled, found.reason)
+    };
+
+    let delete = Gated::Write(ResourceAction::Delete);
+    set(cx, delete, Access::Forbidden);
+    set(cx, Gated::Write(ResourceAction::Scale), Access::Allowed);
+    set(cx, Gated::Logs, Access::Forbidden);
+    set(cx, Gated::Shell, Access::Unknown);
+    assert_eq!(
+        entry(cx, "Delete…"),
+        (
+            false,
+            Some("your access does not allow delete on deployments in demo".to_owned())
+        )
+    );
+    assert_eq!(entry(cx, "Scale…"), (true, None));
+    assert_eq!(
+        entry(cx, "Logs"),
+        (
+            false,
+            Some("your access does not allow get on pods/log in demo".to_owned())
+        )
+    );
+    assert!(entry(cx, "Shell").0, "an unknown answer stays enabled");
+    assert!(
+        t.dispatch(cx, "workspace::DeleteObject", Value::Null)
+            .is_err()
+    );
+
+    set(cx, delete, Access::Unknown);
+    assert_eq!(entry(cx, "Delete…"), (true, None));
+}
+
+// covers #267: a workload's Logs button says why once every pod's logs are refused.
+#[gpui_kit::test]
+async fn a_workloads_logs_button_follows_a_refusal(cx: &mut TestAppContext) {
+    use flint_core::access::Access;
+
+    use crate::ui::detail::access::Gated;
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_alpha(cx, dir.path(), "").await;
+    connect_deletable(cx, &t).await;
+    open_deployments(cx, &t).await;
+    list_one_pod(cx);
+    right_click(cx, &t, "web").await;
+    cx.run_until_parked();
+    let detail = t.workspace.read_with(cx, |ws, _| ws.detail_view().unwrap());
+    detail.update(cx, |d, cx| {
+        d.set_access_for_tests(Gated::Logs, Access::Forbidden, cx);
+    });
+    draw(cx, &t);
+    let button = cx
+        .update_window(t.window, |_, window, _| {
+            window
+                .try_find("detail-logs")
+                .map(|b| b.disabled() == Some(true))
+        })
+        .unwrap();
+    assert_eq!(button, Some(true));
+    assert_eq!(
+        t.description(cx, "detail-logs").as_deref(),
+        Some("your access does not allow get on pods/log in demo")
+    );
+}
+
 // covers UP-53: a kind with no logs or shell gets only what it can do.
 #[gpui_kit::test]
 async fn a_deletable_kind_has_a_menu_with_delete(cx: &mut TestAppContext) {
@@ -153,7 +264,7 @@ async fn a_protected_clusters_actions_are_disabled_with_unlock(cx: &mut TestAppC
         ]
     );
     let unlock = t.find(cx, "menu-unlock").expect("the Unlock entry");
-    assert_eq!(unlock.label(), Some("Unlock alpha…"));
+    assert_eq!(unlock.label(), Some("Unlock kind-alpha…"));
     assert_eq!(
         rows.iter()
             .filter(|r| *r == crate::ui::detail::PROTECTED_NOTE)
@@ -558,18 +669,20 @@ async fn a_conflict_opens_a_new_review(cx: &mut TestAppContext) {
     let url = api.url.clone();
     let t = open_workspace_with(cx, dir.path(), move |dir, _| {
         let path = dir.join("kubeconfig");
-        std::fs::write(&path, kubeconfig_yaml(&[("alpha", &url)])).unwrap();
+        std::fs::write(&path, kubeconfig_yaml(&[("kind-alpha", &url)])).unwrap();
         vec![path]
     })
     .await;
-    t.activate(cx, "alpha").await;
-    t.wait_for_state(cx, "alpha", |s| matches!(s, ConnectionState::Connected(_)))
-        .await;
+    t.activate(cx, "kind-alpha").await;
+    t.wait_for_state(cx, "kind-alpha", |s| {
+        matches!(s, ConnectionState::Connected(_))
+    })
+    .await;
     let model = t.model.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
         model
             .read(cx)
-            .discovered("alpha")
+            .discovered("kind-alpha")
             .is_some_and(|d| d.discovery.is_some())
     })
     .await;
@@ -608,7 +721,7 @@ async fn a_conflict_opens_a_new_review(cx: &mut TestAppContext) {
         .update_window(t.window, |_, window, cx| confirm::shown(window, cx))
         .unwrap()
         .expect("the new review");
-    assert_eq!(shown.title, "Scale web on alpha?");
+    assert_eq!(shown.title, "Scale web on kind-alpha?");
 
     wait_for_one_ok(cx, &t).await;
     t.click(cx, "ok");
@@ -623,7 +736,7 @@ async fn a_conflict_opens_a_new_review(cx: &mut TestAppContext) {
 
 fn web_key() -> WriteKey {
     WriteKey::new(
-        "alpha",
+        "kind-alpha",
         &KindId::new("apps", "deployments"),
         Some("demo"),
         "web",
@@ -631,7 +744,7 @@ fn web_key() -> WriteKey {
 }
 
 fn node_key(name: &str) -> WriteKey {
-    WriteKey::new("alpha", &KindId::new("", "nodes"), None, name)
+    WriteKey::new("kind-alpha", &KindId::new("", "nodes"), None, name)
 }
 
 /// Every resource action the selected row's menu has, with why it cannot run.
@@ -655,18 +768,20 @@ pub(super) async fn connected(
     let url = api.url.clone();
     let t = open_workspace_with(cx, dir, move |dir, _| {
         let path = dir.join("kubeconfig");
-        std::fs::write(&path, kubeconfig_yaml(&[("alpha", &url)])).unwrap();
+        std::fs::write(&path, kubeconfig_yaml(&[("kind-alpha", &url)])).unwrap();
         vec![path]
     })
     .await;
-    t.activate(cx, "alpha").await;
-    t.wait_for_state(cx, "alpha", |s| matches!(s, ConnectionState::Connected(_)))
-        .await;
+    t.activate(cx, "kind-alpha").await;
+    t.wait_for_state(cx, "kind-alpha", |s| {
+        matches!(s, ConnectionState::Connected(_))
+    })
+    .await;
     let model = t.model.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
         model
             .read(cx)
-            .discovered("alpha")
+            .discovered("kind-alpha")
             .is_some_and(|d| d.discovery.is_some())
     })
     .await;

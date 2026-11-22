@@ -1,13 +1,16 @@
 //! View tests for the resource list, in a headless GPUI window (`#[gpui_kit::test]`). Rows are
 //! fed by hand; filtering and sorting run through a real core's `compute_view`.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use flint_core::{
-    Cell, Column, ColumnRole, ColumnType, CoreConfig, CoreHandle, KindId, KindSnapshot, Row,
-    Settings, SyncState,
+    Cell, Column, ColumnRole, ColumnType, ConnectionState, CoreConfig, CoreHandle, KindId,
+    KindSnapshot, RefusalCause, Row, Settings, SyncState,
 };
+use flint_e2e::fake_api::{CONTEXT, FakeApiServer, Fault, Gvr, Options};
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
     AnyWindowHandle, AppContext as _, Bounds, Entity, Point, TestAppContext, Window, WindowBounds,
@@ -15,6 +18,7 @@ use gpui_kit::{
 };
 
 use super::ResourceList;
+use crate::ui::support_tests::open_workspace_with;
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -297,7 +301,7 @@ async fn a_text_filter_keeps_the_column_widths(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 async fn a_narrow_list_cuts_names_in_the_middle(cx: &mut TestAppContext) {
     let (core, _dir) = core();
-    let (window, list) = open_sized(cx, core, "Pods", 360.);
+    let (window, list) = open_sized(cx, core, "Pods", 400.);
     list.update(cx, |list, cx| {
         list.set_snapshot(
             pods(
@@ -341,6 +345,188 @@ async fn a_narrow_list_cuts_names_in_the_middle(cx: &mut TestAppContext) {
         names.iter().all(|n| n.contains('…')),
         "names are not cut: {names:?}"
     );
+}
+
+/// One object of `plural` with the real pod columns.
+fn pod_like(plural: &str, name: &str, status: &str) -> Arc<KindSnapshot> {
+    let columns: Arc<[Column]> = vec![
+        column("Name", ColumnRole::Name, ColumnType::String, 0),
+        column("Namespace", ColumnRole::Namespace, ColumnType::String, 0),
+        column("Ready", ColumnRole::Value, ColumnType::String, 0),
+        column("Status", ColumnRole::Value, ColumnType::String, 0),
+        column("Restarts", ColumnRole::Value, ColumnType::Integer, 0),
+        column("Age", ColumnRole::Age, ColumnType::Date, 0),
+    ]
+    .into();
+    let row = Arc::new(Row {
+        uid: "uid-api".into(),
+        name: name.into(),
+        namespace: Some(NARROW_NAMESPACE.into()),
+        resource_version: "1".into(),
+        generation: None,
+        created: Some(0),
+        labels: Box::new([]),
+        cells: Box::new([
+            Cell::Name,
+            Cell::Namespace,
+            Cell::Text("0/1".into()),
+            Cell::Text(status.into()),
+            Cell::Int(12),
+            Cell::Age,
+        ]),
+    });
+    Arc::new(KindSnapshot {
+        cluster: "test".into(),
+        kind: KindId::new("", plural),
+        namespaced: true,
+        columns,
+        rows: vec![row],
+        state: SyncState::Synced,
+        version: 1,
+        ..Default::default()
+    })
+}
+
+const NARROW_NAMESPACE: &str = "local-path-storage";
+const LONG_POD: &str = "podinfo-frontend-7b9c8d5f4-abcde";
+
+/// Shows `snapshot`, scoped to `namespaces`, and waits for it to be laid out.
+async fn show_narrow(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    list: &Entity<ResourceList>,
+    snapshot: Arc<KindSnapshot>,
+    namespaces: &[&str],
+) {
+    let namespaces = namespaces.iter().map(|n| (*n).to_owned()).collect();
+    list.update(cx, |list, cx| {
+        list.set_namespaces(namespaces, cx);
+        list.set_snapshot(snapshot, cx);
+    });
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("row-uid-api").is_some()
+    })
+    .await;
+    cx.run_until_parked();
+}
+
+fn has_header(cx: &mut TestAppContext, window: AnyWindowHandle, column: &str) -> bool {
+    let id = format!("sort-{column}");
+    cx.update_window(window, |_, window, _| window.try_find(id).is_some())
+        .unwrap()
+}
+
+fn header_end(cx: &mut TestAppContext, window: AnyWindowHandle, column: &str) -> f32 {
+    let id = format!("sort-{column}");
+    cx.update_window(window, |_, window, _| {
+        let bounds = window.find(id).bounds();
+        f32::from(bounds.origin.x + bounds.size.width)
+    })
+    .unwrap()
+}
+
+// covers UP-20, UP-23: beside an open detail pane, in one namespace, Name and Status stay
+// readable: Ready and Namespace leave before Name is cut to a stub or Status runs off the pane.
+#[gpui_kit::test]
+async fn a_narrow_list_keeps_name_and_status_readable(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    // A 1280 px window less the default sidebar, navigation and detail panes.
+    let (window, list) = open_sized(cx, core, "Pods", 400.);
+    let pod = pod_like("pods", LONG_POD, "CrashLoopBackOff");
+    show_narrow(cx, window, &list, pod, &[NARROW_NAMESPACE]).await;
+    assert!(!has_header(cx, window, "Ready"));
+    assert!(!has_header(cx, window, "Namespace"));
+    let name = header_width(cx, window, "Name");
+    assert!(name >= 16. * 8.5 + 16. - 0.5, "Name is {name} wide");
+    let status_end = header_end(cx, window, "Status");
+    assert!(status_end <= 400., "Status ends at {status_end}");
+}
+
+// covers UP-20, UP-23: when the columns through Status fit, nothing is hidden: Restarts and Age
+// scroll instead.
+#[gpui_kit::test]
+async fn a_narrow_list_hides_nothing_when_status_fits(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open_sized(cx, core, "Pods", 450.);
+    let pod = pod_like("pods", LONG_POD, "Running");
+    show_narrow(cx, window, &list, pod, &[NARROW_NAMESPACE]).await;
+    for column in ["Name", "Namespace", "Ready", "Status", "Restarts", "Age"] {
+        assert!(has_header(cx, window, column), "{column} is hidden");
+    }
+    let status_end = header_end(cx, window, "Status");
+    assert!(status_end <= 450., "Status ends at {status_end}");
+}
+
+// covers UP-20, UP-23: across namespaces, two rows could differ only by namespace, so its column
+// stays, at its minimum.
+#[gpui_kit::test]
+async fn a_narrow_list_across_namespaces_keeps_namespace(cx: &mut TestAppContext) {
+    for namespaces in [&[][..], &[NARROW_NAMESPACE, "demo"][..]] {
+        let (core, _dir) = core();
+        let (window, list) = open_sized(cx, core, "Pods", 400.);
+        let pod = pod_like("pods", LONG_POD, "CrashLoopBackOff");
+        show_narrow(cx, window, &list, pod, namespaces).await;
+        assert!(!has_header(cx, window, "Ready"), "{namespaces:?}");
+        let namespace = header_width(cx, window, "Namespace");
+        assert!(
+            (namespace - (11. * 8.5 + 16.)).abs() < 0.5,
+            "Namespace is {namespace} wide for {namespaces:?}"
+        );
+    }
+}
+
+// covers UP-20, UP-23: choosing one namespace hides the column only once that namespace's rows
+// are drawn: until then the old rows may differ by namespace alone.
+#[gpui_kit::test]
+async fn namespace_stays_until_the_scoped_rows_arrive(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open_sized(cx, core, "Pods", 400.);
+    let pod = pod_like("pods", LONG_POD, "CrashLoopBackOff");
+    show_narrow(cx, window, &list, pod, &[]).await;
+    assert!(has_header(cx, window, "Namespace"));
+
+    let permits = list.update(cx, |list, _| list.hold_computes());
+    list.update(cx, |list, cx| {
+        list.set_namespaces(vec![NARROW_NAMESPACE.to_owned()], cx)
+    });
+    cx.update_window(window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert!(has_header(cx, window, "Namespace"), "hidden over old rows");
+
+    permits.send(()).await.unwrap();
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("sort-Namespace").is_none()
+    })
+    .await;
+}
+
+// covers UP-22: a CRD's own Ready printer column is never left out.
+#[gpui_kit::test]
+async fn a_narrow_list_keeps_a_custom_ready_column(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open_kind(cx, core, "widgets", "Widgets", 400.);
+    let widget = pod_like("widgets", LONG_POD, "CrashLoopBackOff");
+    show_narrow(cx, window, &list, widget, &[NARROW_NAMESPACE]).await;
+    assert!(has_header(cx, window, "Ready"));
+}
+
+// covers UP-20, UP-23: with Namespace hidden, the Name cell's tooltip says it, even for a name
+// that fits. With the column shown, a name that fits has no tooltip.
+#[gpui_kit::test]
+async fn a_hidden_namespace_shows_in_the_name_tooltip(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open_sized(cx, core, "Pods", 400.);
+    let pod = pod_like("pods", "api", "CrashLoopBackOff");
+    show_narrow(cx, window, &list, pod.clone(), &[NARROW_NAMESPACE]).await;
+    assert!(!has_header(cx, window, "Namespace"));
+    let tips = hover_cell(cx, window, "uid-api", "Name");
+    assert_eq!(tips, [format!("{NARROW_NAMESPACE}/api")]);
+
+    let (core, _dir) = self::core();
+    let (window, list) = open_sized(cx, core, "Pods", 400.);
+    show_narrow(cx, window, &list, pod, &[]).await;
+    assert!(has_header(cx, window, "Namespace"));
+    assert!(hover_cell(cx, window, "uid-api", "Name").is_empty());
 }
 
 /// The texts painted in the window's last frame.
@@ -773,6 +959,7 @@ async fn list_shows_loading_stale_and_failed_states(cx: &mut TestAppContext) {
                 &[],
                 SyncState::Failed {
                     error: "forbidden".into(),
+                    cause: Some(RefusalCause::Denied),
                 },
                 4,
             ),
@@ -783,6 +970,289 @@ async fn list_shows_loading_stale_and_failed_states(cx: &mut TestAppContext) {
         window.try_find("list-placeholder").is_some() && window.try_find("row-uid-web").is_none()
     })
     .await;
+}
+
+// covers UP-27
+#[gpui_kit::test]
+async fn a_denied_list_checks_access_then_says_no_access(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open(cx, core);
+    let refused = |retrying: bool, cause| {
+        let error = "pods is forbidden".to_owned();
+        if retrying {
+            SyncState::RetryingRefusal { error, cause }
+        } else {
+            SyncState::Failed { error, cause }
+        }
+    };
+    let denied = Some(RefusalCause::Denied);
+    // (state, rows, chip, placeholder, banner start)
+    let rows = [("demo", "web", 0)];
+    type Rows<'a> = &'a [(&'a str, &'a str, i64)];
+    let cases: [(SyncState, Rows<'_>, _, _, _); 6] = [
+        (
+            refused(true, denied),
+            &[],
+            "checking access",
+            Some("checking_access"),
+            None,
+        ),
+        (
+            refused(false, denied),
+            &[],
+            "no access",
+            Some("no_access"),
+            None,
+        ),
+        (
+            refused(true, denied),
+            &rows,
+            "checking access",
+            None,
+            Some("Checking access"),
+        ),
+        (
+            refused(false, denied),
+            &rows,
+            "no access",
+            None,
+            Some("No access"),
+        ),
+        // Not a denial: nothing may claim the account lacks access.
+        (
+            refused(true, Some(RefusalCause::NotFound)),
+            &[],
+            "reconnecting",
+            Some("reconnecting"),
+            Some("Reconnecting"),
+        ),
+        (refused(false, None), &[], "failed", Some("failed"), None),
+    ];
+    for (version, (state, shown, chip, placeholder, banner)) in cases.into_iter().enumerate() {
+        list.update(cx, |list, cx| {
+            list.set_snapshot(pods(shown, state.clone(), version as u64 + 1), cx)
+        });
+        // The rows and the state drawn with them land when the recompute does.
+        cx.wait_for(window, WAIT, |_, cx| {
+            let view = list.read(cx).view_state();
+            let text = view.banners.iter().find(|b| b.id == "list-banner");
+            view.sync == chip
+                && view.total == shown.len()
+                && view.placeholder == placeholder
+                && match banner {
+                    Some(start) => text.is_some_and(|b| b.text.starts_with(start)),
+                    None => text.is_none(),
+                }
+        })
+        .await;
+    }
+}
+
+// covers UP-27
+#[gpui_kit::test]
+async fn a_denial_over_filtered_out_rows_does_not_mention_them(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open(cx, core);
+    let error = "pods is forbidden".to_owned();
+    let cause = Some(RefusalCause::Denied);
+    let cases = [
+        (
+            SyncState::RetryingRefusal {
+                error: error.clone(),
+                cause,
+            },
+            "checking access",
+            "Checking access",
+        ),
+        (
+            SyncState::Failed {
+                error: error.clone(),
+                cause,
+            },
+            "no access",
+            "No access",
+        ),
+    ];
+    for (version, (state, chip, status)) in cases.into_iter().enumerate() {
+        list.update(cx, |list, cx| {
+            list.set_namespaces(vec!["elsewhere".to_owned()], cx);
+            list.set_snapshot(pods(&[("demo", "web", 0)], state, version as u64 + 1), cx)
+        });
+        cx.wait_for(window, WAIT, |_, cx| {
+            let view = list.read(cx).view_state();
+            view.sync == chip && view.placeholder == Some("no_match")
+        })
+        .await;
+        let hidden = list.read_with(cx, |list, _| list.access_banner(status, &error));
+        assert_eq!(hidden, format!("{status}: {error}"));
+
+        list.update(cx, |list, cx| list.set_namespaces(Vec::new(), cx));
+        cx.wait_for(window, WAIT, |_, cx| {
+            list.read(cx).view_state().placeholder.is_none()
+        })
+        .await;
+        let shown = list.read_with(cx, |list, _| list.access_banner(status, &error));
+        assert_eq!(
+            shown,
+            format!("{status}. These rows may be out of date: {error}")
+        );
+    }
+}
+
+// covers UP-27
+#[gpui_kit::test]
+async fn a_real_403_goes_from_checking_to_no_access_without_reconnecting(cx: &mut TestAppContext) {
+    let server = FakeApiServer::start_blocking(Options::default()).unwrap();
+    server.inject(Fault::forbidden().on(&Gvr::new("", "v1", "pods")));
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace_with(cx, dir.path(), |dir, _| {
+        let path = dir.join("kubeconfig");
+        server.write_kubeconfig(&path, Some("demo")).unwrap();
+        vec![path]
+    })
+    .await;
+    t.activate(cx, CONTEXT).await;
+    t.wait_for_state(cx, CONTEXT, |s| matches!(s, ConnectionState::Connected(_)))
+        .await;
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model
+            .read(cx)
+            .discovered(CONTEXT)
+            .is_some_and(|d| d.discovery.is_some())
+    })
+    .await;
+    t.dispatch(
+        cx,
+        "workspace::OpenView",
+        serde_json::json!({ "kind": "pods" }),
+    )
+    .unwrap();
+    let list = t.list(cx).expect("a list is open");
+
+    // Every state the list reports on its way, not only the ones a poll happens to see.
+    let seen: Rc<RefCell<Vec<String>>> = Rc::default();
+    let record = seen.clone();
+    let _recording = cx.update(|cx| {
+        cx.observe(&list, move |list, cx| {
+            let view = list.read(cx).view_state();
+            let banner = view.banners.iter().find(|b| b.id == "list-banner");
+            assert!(
+                banner.is_none(),
+                "no rows to warn about: {:?}",
+                banner.map(|b| &b.text)
+            );
+            assert_ne!(view.placeholder, Some("reconnecting"));
+            let sync = view.sync.to_string();
+            assert_ne!(sync, "reconnecting");
+            let mut seen = record.borrow_mut();
+            if seen.last() != Some(&sync) {
+                seen.push(sync);
+            }
+        })
+    });
+    let done = list.clone();
+    cx.wait_for(t.window, Duration::from_secs(30), move |_, cx| {
+        let view = done.read(cx).view_state();
+        view.sync == "no access" && view.placeholder == Some("no_access")
+    })
+    .await;
+    let seen = seen.borrow();
+    let checking = seen.iter().position(|s| s == "checking access");
+    let refused = seen.iter().position(|s| s == "no access");
+    assert!(
+        matches!((checking, refused), (Some(c), Some(r)) if c < r),
+        "checks access, then says so: {seen:?}"
+    );
+}
+
+// covers UP-27
+#[test]
+fn only_a_denial_is_titled_as_access() {
+    let title = |state: SyncState| super::access_title(&state, "Pods", None);
+    let error = || "refused".to_owned();
+    assert_eq!(
+        title(SyncState::RetryingRefusal {
+            error: error(),
+            cause: Some(RefusalCause::Denied),
+        })
+        .as_deref(),
+        Some("Checking access to Pods…")
+    );
+    assert_eq!(
+        title(SyncState::Failed {
+            error: error(),
+            cause: Some(RefusalCause::Denied),
+        })
+        .as_deref(),
+        Some("No access to Pods")
+    );
+    for cause in [Some(RefusalCause::NotFound), None] {
+        assert_eq!(
+            title(SyncState::Failed {
+                error: error(),
+                cause
+            }),
+            None
+        );
+        assert_eq!(
+            title(SyncState::RetryingRefusal {
+                error: error(),
+                cause
+            }),
+            None
+        );
+    }
+}
+
+fn namespace_limit(listed: &[&str], denied: &[&str]) -> flint_core::NamespaceLimit {
+    let names = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect();
+    flint_core::NamespaceLimit {
+        listed: names(listed),
+        denied: names(denied),
+        reason: "server text \"quoted-user\"".into(),
+        revisions: vec![1; listed.len()],
+    }
+}
+
+// covers UP-27: a denial of every namespace tried names them, and only a denial does.
+#[test]
+fn a_denied_limited_list_names_its_namespaces() {
+    let failed = |cause| SyncState::Failed {
+        error: "server text \"quoted-user\"".into(),
+        cause,
+    };
+    let denied = failed(Some(RefusalCause::Denied));
+    let title = |state: &SyncState, limit| super::access_title(state, "Pods", Some(&limit));
+    assert_eq!(
+        title(&denied, namespace_limit(&[], &["demo"])).as_deref(),
+        Some("No access to Pods in demo")
+    );
+    assert_eq!(
+        title(&denied, namespace_limit(&[], &["demo", "team-a"])).as_deref(),
+        Some("No access to Pods in 2 namespaces")
+    );
+    assert_eq!(
+        title(&denied, namespace_limit(&[], &[])).as_deref(),
+        Some("No access to Pods")
+    );
+    for cause in [Some(RefusalCause::NotFound), None] {
+        assert_eq!(title(&failed(cause), namespace_limit(&[], &["demo"])), None);
+    }
+}
+
+// covers UP-27: a namespace whose list failed may be missing rather than forbidden, so the
+// banner claims neither, and no server text reaches it.
+#[test]
+fn the_limited_banner_does_not_call_a_failed_namespace_forbidden() {
+    let text = super::limited_text("Pods", &namespace_limit(&["demo"], &["gone"]));
+    assert_eq!(
+        text,
+        "Showing Pods in 1 namespace only (demo): you may not list Pods in all namespaces. \
+         Could not list Pods in: gone."
+    );
+    assert!(!text.contains("Not allowed"), "{text}");
+    assert!(!text.contains("quoted-user"), "{text}");
 }
 
 // covers UP-20
@@ -1039,6 +1509,7 @@ async fn banners_say_what_the_rows_cover(cx: &mut TestAppContext) {
                 &rows,
                 SyncState::Failed {
                     error: "connection refused".into(),
+                    cause: None,
                 },
                 2,
             ),
@@ -1262,7 +1733,7 @@ async fn a_closed_list_is_released(cx: &mut TestAppContext) {
 
     // Closed by a cluster switch.
     let (services_list, services_filter) = filtering(cx);
-    t.activate(cx, "beta").await;
+    t.activate(cx, "kind-beta").await;
     cx.run_until_parked();
     assert!(t.list(cx).is_none());
     services_list.assert_released();
@@ -1296,7 +1767,7 @@ async fn a_list_closed_by_a_switch_from_the_dock_is_released(cx: &mut TestAppCon
     cx.update_window(t.window, |_, window, cx| {
         workspace.update(cx, |ws, cx| {
             let request = LogRequest {
-                cluster: "alpha".into(),
+                cluster: "kind-alpha".into(),
                 subject: LogSubject::Pod(LogTarget {
                     namespace: "demo".into(),
                     pod: "api".into(),
@@ -1309,13 +1780,16 @@ async fn a_list_closed_by_a_switch_from_the_dock_is_released(cx: &mut TestAppCon
         // The core reports the switch (as after SelectCluster) in the same update, before
         // anything is drawn.
         t.model.update(cx, |m, cx| {
-            m.feed(flint_core::Event::ActiveChanged(Some("beta".into())), cx)
+            m.feed(
+                flint_core::Event::ActiveChanged(Some("kind-beta".into())),
+                cx,
+            )
         });
     })
     .unwrap();
     let workspace = t.workspace.clone();
     cx.wait_for(t.window, crate::ui::support_tests::WAIT, move |_, cx| {
-        workspace.read(cx).shown_cluster() == Some("beta")
+        workspace.read(cx).shown_cluster() == Some("kind-beta")
     })
     .await;
     cx.run_until_parked();

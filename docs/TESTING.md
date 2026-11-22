@@ -8,8 +8,8 @@ must keep working. This document covers *how* it is tested. The choices behind i
 
 | Layer | What it proves | Runs where | Gating |
 |---|---|---|---|
-| **Unit** | One module's logic in isolation | `cargo test`, every PR (one CI job per crate) | Yes |
-| **View** | A GPUI view reacts correctly to state, actions and keys | Headless `#[gpui_kit::test]`, every PR | Yes |
+| **Unit** | One module's logic in isolation | `cargo test`; the full suite on master and on PRs that need it, a smoke subset on other PRs (one CI job per crate) | Yes |
+| **View** | A GPUI view reacts correctly to state, actions and keys | Headless `#[gpui_kit::test]`; full or smoke as for unit tests | Yes |
 | **Cluster** | Core and MCP behave correctly against a real API server | Linux CI with kind; locally with `scripts/dev-cluster.sh` | Yes on master and nightly |
 | **App e2e** | The real app, driven like a user, completes a user path | macOS CI against the fake API server; locally against kind | Yes |
 | **Screenshots** | Key views look right in light and dark | Captured during app e2e and attached to the PR | No (reviewed by people) |
@@ -273,7 +273,7 @@ A Rust crate of helpers and integration tests: the fake API server (below), and 
   way does not soften the check. A launch that fails is not checked. The exceptions are explicit:
   `App::select_cluster` marks the cluster selected, `App::mark_selected` does so for a selection made another way
   (the switcher, the palette), a cluster the test exposes to AI, or a request the test sends itself,
-  `App::edit_kubeconfig(|| …)` wraps the test's own kubeconfig changes (UP-06), and
+  `App::edit_kubeconfig(files, || …)` wraps the test's own changes to the files it names (UP-06), and
   `AppOptions::cluster_at_startup` sets `FLINT_CLUSTER` and counts that cluster as selected from the launch
   (`AppOptions::env` refuses `FLINT_CLUSTER`). `tests/app/harness.rs` breaks UP-90 and UP-91 on purpose in the app
   (including a delayed request, a file added through settings and a handled timeout) and asserts that the test
@@ -293,7 +293,7 @@ A Rust crate of helpers and integration tests: the fake API server (below), and 
   sessions across navigation), `tests/mcp.rs` the MCP
   paths. Paths
   left out say why at the top of their file: UP-05 (Finder launch, real cloud auth: manual), UP-14 to UP-16 (not
-  built yet), UP-26 (a load test against kind), and UP-13's live switch with macOS (a test must not change the
+  built yet), and UP-13's live switch with macOS (a test must not change the
   system appearance; dark mode itself is tested).
 - **Keys:** tests dispatch registered actions by name rather than pressing shortcuts, which differ by platform, and
   press only plain keys (`escape`, `backspace`).
@@ -325,8 +325,9 @@ Screenshots are named `upXX-<view>-light.png` and `upXX-<view>-dark.png`; a reru
 files. Without `FLINT_AUTOMATION_SCREENSHOTS` they go to the scratch config directory and are deleted with it.
 
 **In CI.** macOS runners are costly, so app e2e has no job of its own: it is a step of `macos (flint-app)`, after
-that job's tests. That job runs on every push to `master` and on PRs labelled `run-macos`, so a PR gets the
-screenshot comment only with that label.
+that job's tests. That job runs on every push to `master`, on PRs labelled `run-macos`, and on PRs that get the full
+suite (see "Which tests a pull request runs") when they change something the macOS job builds. A PR without any of
+these gets no screenshot comment.
 
 ```mermaid
 flowchart LR
@@ -371,7 +372,7 @@ A test, start to finish:
 
 ```rust
 let server = FakeApiServer::start().await?;
-server.write_kubeconfig(&dir.join("kubeconfig"), Some("demo"))?; // context "flint-e2e-fake"
+server.write_kubeconfig(&dir.join("kubeconfig"), Some("demo"))?; // context "kind-flint-e2e-fake"
 let core = /* CoreHandle on that kubeconfig, WatchTiming shortened */;
 let configmaps = server.gvr("configmaps");
 let mut sub = core.subscribe(CONTEXT, &KindId::new("", "configmaps"));
@@ -569,19 +570,34 @@ Rust's ownership rules make classic leaks rare, so Flint checks for the kinds th
 | `appimage (x86_64)` | Linux | A release build packaged with `scripts/package-appimage.sh`, then `scripts/smoke-appimage.sh`: `--version` and `mcp` answering `initialize` through the AppImage, without FUSE (`APPIMAGE_EXTRACT_AND_RUN=1`). No display, so the window is not opened |
 | `mcp-linux (x86_64)` | Linux | The static musl `flint-mcp` the release ships, built and packaged with `scripts/package-mcp-linux.sh` (which fails on a program interpreter or a shared library), then run in a bare `ubuntu:22.04`: `scripts/smoke-mcp-linux.sh` (`--version`, `initialize`) and, through `scripts/test-mcp-linux.sh`, `flint-e2e`'s MCP tests against the fake API server, built for musl too. The release's `build-mcp-linux` runs the same on x86_64 and aarch64 |
 | `leak-sanitizer (core, mcp)` | Linux, nightly | `flint-core` and `flint-mcp` tests under AddressSanitizer and LeakSanitizer (`memory.yml`) |
+| `macos-load (up-26)` | macOS, nightly | `up_26_large_list_stays_responsive` in `memory.yml`: the app with 10,000 fake pods and a burst of 200 deletes. Fails on a round-trip over the live-list latency bound; round-trip and RSS numbers are uploaded as an artifact |
 | `macos-app (dmg)` | macOS | `macos-app.yml`, only on PRs that touch the macOS packaging (`scripts/package-macos-app.sh`, `scripts/smoke-macos-app.sh`, `scripts/smoke-macos-app-test.sh`, `scripts/check-no-automation.sh`, `packaging/macos/`, `assets/brand/Flint.icns`, `LICENSE`, `macos-app.yml`, `release-please.yml`) and by hand. A release build (the runner's arm64 only) packaged as `Flint.app` in a DMG with `scripts/package-macos-app.sh`, with the version from `Cargo.toml`. Then `scripts/smoke-macos-app.sh` mounts the DMG read-only and checks the bundle identifier and version (PlistBuddy), the icon and LICENSE, the ad-hoc signature (`codesign --verify --deep --strict`, identifier `se.redstack.flint`), `--version`, `mcp` answering `initialize` and exiting 0 through `Flint.app/Contents/MacOS/flint`, and that the bundled binary has no automation channel; every hdiutil, codesign and binary call is time-limited. `scripts/smoke-macos-app-test.sh` then checks that the smoke test fails on DMGs with a wrong bundle ID, version, signature or no LICENSE. The release's `build-macos` runs the packaging and smoke scripts on the universal binary before it uploads the DMG. Not required |
-| `macos (flint-app)` | macOS | The app's clippy, view tests and docs, the same with `--features automation`, and a release build checked for automation code. A step in it runs the `flint-e2e` app tests (`--test app -- --ignored`) against the fake API server on the binary those tests built, and uploads the screenshots (light and dark) as an artifact. Runs on every push to `master`, and on a PR only with the `run-macos` label, whatever the PR changes; the label takes effect from the next push (macOS runners cost about ten times Linux ones; `linux (flint-app)` runs the app's clippy and tests on every PR). Not required |
+| `macos (flint-app)` | macOS | The app's clippy, view tests and docs, the same with `--features automation`, and a release build checked for automation code. A step in it runs the `flint-e2e` app tests (`--test app -- --ignored`) against the fake API server on the binary those tests built, and uploads the screenshots (light and dark) as an artifact. Runs on every push to `master`; on a PR with the `run-macos` label, whatever the PR changes; and on a PR that gets the full suite and changes what the macOS job builds (the `macos` group of `scripts/ci-changes.sh`). Labels are read when a run starts, so a label takes effect from the next push (macOS runners cost about ten times Linux ones; `linux (flint-app)` runs the app's clippy and tests on every PR). Not required |
 | `app e2e screenshots comment` | Linux | After `macos (flint-app)`, on same-repo PRs: posts or updates one PR comment linking the screenshots. The only job with `pull-requests: write` |
 | `cluster-e2e` | Linux | kind via `helm/kind-action`. Core and MCP cluster tests (`--include-ignored`), MCP e2e, and `flint-e2e`'s UP-09 and UP-10 on kind. Nightly (and by hand), the `fixture-drift` job re-records the fixtures from a fresh kind cluster and fails on structural drift from the committed set (#128) |
 
 **Required checks.** Merging into master requires `fmt`, `clippy`, `test (flint-core)`, `test (flint-mcp)`, `docs`,
 `cargo-deny (bans licenses sources)`, `unused-deps`, `module-tests`, `typos`, `actionlint`, `conventional` and
 `linux (flint-app)`. `linux (flint-app)` is the app check that gates: it runs the app's tests, the automation channel's
-included, on every PR. `macos (flint-app)` still runs on every PR that touches the app but is not required, since GitHub's
+included, on every PR (its tests are the smoke set on a smoke PR). `macos (flint-app)` is not required, since GitHub's
 macOS runners can queue for a long time; a PR whose macOS job has failed is held until it passes.
 
+**Which tests a pull request runs.** `.github/workflows/ci.yml` runs one of two suites, and the `suite (smoke)` or
+`suite (full)` check says which:
+
+- **Full.** Every push to `master`, and every PR that touches a path `needs_full` in `scripts/ci-changes.sh` lists.
+  That function is the source of truth for the paths; it covers most of `flint-core`'s sources, MCP, the code
+  paths that write to a cluster, manifests and the lockfile, and CI itself. Read it rather than a copy here. A PR
+  with the `full-ci` label also gets the full suite.
+- **Smoke.** Any other PR. Every test still compiles (`--no-run`), and each `test (<crate>)` job and
+  `linux (flint-app)` runs a named subset, failing if fewer than a minimum number of tests pass (so a filter that
+  stops matching cannot go green). The subsets are in `ci.yml`. A docs-only PR skips the builds, as before.
+
+Labels are read when a run starts, and labelling alone does not start CI: push a commit (or close and reopen the PR)
+after adding `full-ci` or `run-macos`. `scripts/ci-changes-test.sh` checks the classification.
+
 `cluster-e2e` needs `flint-core` and `flint-mcp` to build on Linux, which is part of the portability goal.
-App e2e runs on PRs, inside `macos (flint-app)`. `cluster-e2e` runs on PRs that touch `flint-core`, `flint-mcp`, or the parts of `flint-e2e` it runs (the fake API
+App e2e runs inside `macos (flint-app)`, on the PRs described above. `cluster-e2e` runs on PRs that touch `flint-core`, `flint-mcp`, or the parts of `flint-e2e` it runs (the fake API
 server, the harness, the fixtures and their recorder, the MCP tests), on master, and nightly.
 
 **The MCP server without GPUI.** The `flint-mcp` crate has a binary target, `flint-mcp`, that runs the same
@@ -645,16 +661,16 @@ milestone T; feature tests are in their feature's milestone.
 
 ### P1: before 1.0
 
-- **Harness (T):** teardown checks for UP-90 and UP-91 run in every app test (#127; its strict `TODO(#98)` wording
-  for UP-04 and UP-27 waits for #98); drift guard: UP-09 and UP-10 on both backends in `cluster-e2e` and a nightly fixture diff (#128, done); fake writes,
+- **Harness (T):** teardown checks for UP-90 and UP-91 run in every app test (#127); drift guard: UP-09 and UP-10 on both backends in `cluster-e2e` and a nightly fixture diff (#128, done); fake writes,
   a remote-looking cluster for protection, metrics, fixture variants, a fake `claude` and clock control (#129); the
   nightly memory soak test (#126).
 - **Gaps in M0 to M2:** missing and hanging exec plugins (UP-04, #130); a kubeconfig held half-written past the
   debounce (UP-06, #131); keyboard-only use, palette and switcher (UP-33, UP-30, UP-31, #132); the whole app under
   10,000 pods, nightly (UP-26, #133); Close Window in the app (UP-42: the app under test has no active window, so
-  the action does nothing there; view tests cover it) and an exit observed apart from `App::quit` (#174).
-- **Later milestones:** M3 editing, actions and protection (#134); M4 views, metrics, diagram, dashboard and
-  `get_cluster_summary` (#135); M5 port-forward and Helm on kind (#136); M5.5 MCP scope, redaction, activity log
+  the action does nothing there; view tests cover it) and saving on quit (a relaunch does not prove quit saved the
+  value, #263).
+- **Later milestones:** M3 editing, actions and protection (#134); M4 views, metrics, diagram and dashboard
+  (#135); M5 port-forward and Helm on kind (#136); M5.5 MCP scope, redaction, activity log
   (#137) and cluster sets (#138), with warm clusters and Claude analysis not scheduled; M6 Homebrew cask smoke (#139).
 
 ### v0.7: fleet actions
@@ -665,7 +681,7 @@ unit test (sequencing) and an e2e test on the fake API.
 
 ### P2
 
-Recordings (UP-110 to UP-116), a clipboard and save-path hook for automation, a fake
+Recordings (UP-110 to UP-114 and UP-116), a clipboard and save-path hook for automation, a fake
 port-forward, and a spike on running app e2e on Linux (with the AppImage's GPUI backend under Xvfb) so kind-backed
 app tests get cheap runners.
 

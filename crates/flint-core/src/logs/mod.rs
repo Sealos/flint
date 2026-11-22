@@ -11,6 +11,7 @@ mod budget;
 mod buffer;
 mod filter;
 mod line;
+mod pattern;
 mod pods;
 mod search;
 mod selection;
@@ -25,12 +26,15 @@ pub use filter::{FilterSpec, LogFilter, MAX_CONTEXT};
 pub use line::{
     LineFormat, LineId, LineSource, LogLine, MAX_LINE_BYTES, Severity, classify, strip_controls,
 };
+pub use pattern::{
+    GUARD_SCAN_BYTES, GUARD_SCAN_LINES, MAX_PATTERN_BYTES, PatternError, ScanCancel,
+};
 pub use pods::{Freshness, PodSet, WorkloadKind, WorkloadPod, WorkloadTarget};
 pub use search::{LogSearch, SearchMatcher, SearchQuery};
 pub use selection::LineSelection;
 pub use session::{
-    ContainerWait, LogOptions, LogSince, LogSnapshot, LogState, LogSubject, LogTarget, MAX_STREAMS,
-    PREVIOUS_NOT_AVAILABLE,
+    ContainerWait, FailedHop, LogOptions, LogSince, LogSnapshot, LogState, LogSubject, LogTarget,
+    MAX_STREAMS, NETWORK_FAILURES, PREVIOUS_NOT_AVAILABLE,
 };
 pub use workload::{PodSetStatus, StreamStatus};
 

@@ -3,7 +3,7 @@
 //! [`LogTabState::LINE_LIMIT`] lines go out, so a test can wait for a line without the state
 //! carrying the buffer.
 
-use flint_core::logs::LogLines;
+use flint_core::logs::{FailedHop, LogLines};
 use flint_core::{LogState, PodSetStatus, Severity};
 use gpui_kit::*;
 
@@ -108,6 +108,7 @@ pub fn status(state: &LogState, pod: bool) -> TabStatusState {
         LogState::Streaming => TabStatusState::Streaming,
         LogState::Reconnecting {
             error,
+            hop,
             attempt,
             back_off,
         } => TabStatusState::Reconnecting {
@@ -115,7 +116,7 @@ pub fn status(state: &LogState, pod: bool) -> TabStatusState {
             back_off: *back_off,
             reason: match error {
                 _ if *back_off => None,
-                Some(e) => Some(reconnect_reason(e, pod)),
+                Some(e) => Some(reconnect_reason(e, *hop, pod)),
                 None => None,
             },
         },
@@ -127,8 +128,12 @@ pub fn status(state: &LogState, pod: bool) -> TabStatusState {
                 reason: log_model::PREVIOUS_NOT_AVAILABLE.to_owned(),
             }
         }
-        LogState::Ended { error: Some(e), .. } => TabStatusState::Failed {
-            reason: log_model::explain(e, pod).headline,
+        LogState::Ended {
+            error: Some(e),
+            hop,
+            ..
+        } => TabStatusState::Failed {
+            reason: log_model::explain(e, *hop, pod).headline,
         },
         LogState::Ended { pod_deleted, .. } => TabStatusState::Ended {
             reason: pod_deleted.then(|| "pod deleted".to_owned()),
@@ -139,8 +144,8 @@ pub fn status(state: &LogState, pod: bool) -> TabStatusState {
 
 /// Why a stream reconnects, as its status line says it: in plain words, or the error's gist
 /// when there are none (sanitized, as every error in the state is).
-fn reconnect_reason(error: &str, pod: bool) -> String {
-    match log_model::explain(error, pod).short {
+fn reconnect_reason(error: &str, hop: FailedHop, pod: bool) -> String {
+    match log_model::explain(error, hop, pod).short {
         "error" => error_text(&log_model::gist(error)),
         short => short.to_owned(),
     }
@@ -235,6 +240,7 @@ mod tests {
         assert_eq!(json(&LogState::Streaming), json!({"state": "streaming"}));
         assert_eq!(
             json(&LogState::Reconnecting {
+                hop: Default::default(),
                 error: Some("connection refused".into()),
                 attempt: 2,
                 back_off: false,
@@ -245,6 +251,7 @@ mod tests {
         // Crash-looping: the wait is the kubelet's, not an error.
         assert_eq!(
             json(&LogState::Reconnecting {
+                hop: Default::default(),
                 error: Some("container is waiting".into()),
                 attempt: 1,
                 back_off: true,
@@ -253,6 +260,7 @@ mod tests {
         );
         assert_eq!(
             json(&LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: true,
             }),
@@ -260,6 +268,7 @@ mod tests {
         );
         assert_eq!(
             json(&LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false,
             }),
@@ -268,6 +277,7 @@ mod tests {
         assert_eq!(
             status(
                 &LogState::Ended {
+                    hop: Default::default(),
                     error: Some("Forbidden: pods \"web\" is forbidden".into()),
                     pod_deleted: false,
                 },
@@ -278,6 +288,7 @@ mod tests {
             }
         );
         let gone = LogState::Ended {
+            hop: Default::default(),
             error: Some(format!(
                 "{}: unable to retrieve container logs",
                 flint_core::logs::PREVIOUS_NOT_AVAILABLE
@@ -343,6 +354,7 @@ mod tests {
     fn an_unknown_reconnect_reason_is_its_gist() {
         let reason = |error: &str| match status(
             &LogState::Reconnecting {
+                hop: Default::default(),
                 error: Some(error.into()),
                 attempt: 3,
                 back_off: false,
@@ -358,6 +370,7 @@ mod tests {
         );
         let screen = crate::ui::log_model::state_text(
             &LogState::Reconnecting {
+                hop: Default::default(),
                 error: Some("stream reset by the proxy".into()),
                 attempt: 3,
                 back_off: false,
@@ -385,6 +398,7 @@ mod tests {
                 stream(
                     "web-2",
                     LogState::Ended {
+                        hop: Default::default(),
                         error: Some("Forbidden".into()),
                         pod_deleted: false,
                     },
@@ -392,6 +406,7 @@ mod tests {
                 stream(
                     "web-3",
                     LogState::Reconnecting {
+                        hop: Default::default(),
                         error: None,
                         attempt: 1,
                         back_off: false,
@@ -400,6 +415,7 @@ mod tests {
                 stream(
                     "web-4",
                     LogState::Ended {
+                        hop: Default::default(),
                         error: None,
                         pod_deleted: false,
                     },

@@ -1,8 +1,6 @@
 //! M1 user paths: browsing resources (docs/USER-PATHS.md).
 //!
-//! Not here: UP-26 (10,000 pods stay smooth, within a memory budget) is a load test with
-//! numbers recorded against kind (`crates/flint-core/tests/watch_load.rs`); an e2e pass or fail
-//! says nothing about smoothness.
+//! Not here: UP-26 (10,000 pods stay responsive) is the nightly load test in `load.rs`.
 
 use std::time::{Duration, Instant};
 
@@ -297,21 +295,21 @@ fn up_24_switch_clusters() -> Result<()> {
     connect(&app, TwoClusters::A)?;
     open_live(&app, "pods", 17)?;
     until(
-        "fake-a's watches",
+        "kind-fake-a's watches",
         || open_watches(&two.a, &gvrs),
         |n| *n >= 3,
     )?;
 
-    // Away to fake-b: fake-a's watches stop.
+    // Away to kind-fake-b: kind-fake-a's watches stop.
     connect(&app, TwoClusters::B)?;
     until(
-        "fake-a's watches to stop",
+        "kind-fake-a's watches to stop",
         || open_watches(&two.a, &gvrs),
         |n| *n == 0,
     )?;
     open_live(&app, "pods", 17)?;
 
-    // A change on fake-a while nobody watches; switching back loads fresh data.
+    // A change on kind-fake-a while nobody watches; switching back loads fresh data.
     let pods = two.a.gvr("pods");
     two.a
         .set_row(&pods, pod_row(&two.a, "while-away", "Running"));
@@ -322,7 +320,7 @@ fn up_24_switch_clusters() -> Result<()> {
     }
     app.wait_for("/list/rows", Any(json!({"name": "while-away"})))?;
     until(
-        "fake-b's watches to stop",
+        "kind-fake-b's watches to stop",
         || open_watches(&two.b, &gvrs),
         |n| *n == 0,
     )?;
@@ -411,7 +409,10 @@ fn up_27_recover_from_a_broken_watch() -> Result<()> {
     // In plain words ("the connection to https://… dropped"), not the client's chain
     // ("watch stream broke: ServiceError: error reading a body from connection").
     assert!(!banners.contains("ServiceError"), "{banners}");
-    assert!(banners.contains("the connection to https://"), "{banners}");
+    assert!(
+        banners.contains(&format!("the connection to {} dropped", fake.url())),
+        "{banners}"
+    );
     app.screenshot_themes("up27-reconnecting")?;
     assert_eq!(app.state()?["list"]["sync"], "reconnecting");
 

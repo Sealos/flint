@@ -45,7 +45,7 @@ impl Flow {
 
 fn web(api: &LocalApi) -> WriteTarget {
     WriteTarget {
-        cluster: "alpha".into(),
+        cluster: "kind-alpha".into(),
         server: Some(api.url.clone()),
         kind: KindId::new("apps", "deployments"),
         namespace: Some("demo".to_owned()),
@@ -153,20 +153,22 @@ async fn connected_unlocked(
     let url = api.url.clone();
     let t = open_workspace_with(cx, dir, move |dir, _| {
         let path = dir.join("kubeconfig");
-        std::fs::write(&path, kubeconfig_yaml(&[("alpha", &url)])).unwrap();
+        std::fs::write(&path, kubeconfig_yaml(&[("kind-alpha", &url)])).unwrap();
         vec![path]
     })
     .await;
     let core = t.workspace.read_with(cx, |ws, cx| ws.core(cx).clone());
-    core.unlock("alpha", &api.url);
-    t.activate(cx, "alpha").await;
-    t.wait_for_state(cx, "alpha", |s| matches!(s, ConnectionState::Connected(_)))
-        .await;
+    core.unlock("kind-alpha", &api.url);
+    t.activate(cx, "kind-alpha").await;
+    t.wait_for_state(cx, "kind-alpha", |s| {
+        matches!(s, ConnectionState::Connected(_))
+    })
+    .await;
     let model = t.model.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
         model
             .read(cx)
-            .discovered("alpha")
+            .discovered("kind-alpha")
             .is_some_and(|d| d.discovery.is_some())
     })
     .await;
@@ -236,6 +238,18 @@ async fn connected_to_fake(
     })
     .await;
     t
+}
+
+/// The text of the open confirmation, as drawn.
+fn shown_confirmation(cx: &mut TestAppContext, t: &TestWorkspace) -> String {
+    cx.update_window(t.window, |_, window, _| {
+        window
+            .find_all("write-confirm-description")
+            .iter()
+            .find_map(|e| e.label().map(str::to_owned))
+    })
+    .unwrap()
+    .expect("the confirmation")
 }
 
 /// The one write the server received.
@@ -458,7 +472,7 @@ async fn a_refused_write_is_reported_and_not_sent(cx: &mut TestAppContext) {
     let core = t.workspace.read_with(cx, |ws, cx| ws.core(cx).clone());
 
     let flow = open(cx, &t, &api, SCALE, true).await;
-    assert!(core.lock("alpha"), "it was unlocked");
+    assert!(core.lock("kind-alpha"), "it was unlocked");
     t.click(cx, "ok");
     wait_done(cx, &flow);
 
@@ -466,7 +480,7 @@ async fn a_refused_write_is_reported_and_not_sent(cx: &mut TestAppContext) {
     assert_eq!(
         flow.result(),
         Err(WriteError::Refused(WriteRefusal::Protected {
-            cluster: "alpha".to_owned()
+            cluster: "kind-alpha".to_owned()
         }))
     );
 }
@@ -547,12 +561,91 @@ async fn a_refused_confirmation_does_not_run_after_an_unlock(cx: &mut TestAppCon
     let core = t.workspace.read_with(cx, |ws, cx| ws.core(cx).clone());
 
     let (flow, confirmed) = handler(cx, &t, &api, true).await;
-    assert!(core.lock("alpha"));
+    assert!(core.lock("kind-alpha"));
     cx.update(|cx| confirmed(cx));
     wait_done(cx, &flow);
     assert!(matches!(flow.result(), Err(WriteError::Refused(_))));
 
-    core.unlock("alpha", &api.url);
+    core.unlock("kind-alpha", &api.url);
     assert_runs_once(cx, &api, &flow, &confirmed);
     assert_eq!(api.patches(), 0);
+}
+
+// covers UP-51: what a live object's marker says reaches the drawn confirmation, named when it
+// can be read and as an unknown manager when it cannot, and nothing is written.
+#[gpui_kit::test]
+async fn a_marked_object_is_warned_about_in_the_dialog(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let server = fake_api();
+    let t = connected_to_fake(cx, dir.path(), &server).await;
+
+    for (marker, value, expected) in [
+        (
+            "kustomize.toolkit.fluxcd.io/name",
+            "apps",
+            "Managed by Flux: apps. This change will likely be reverted on the next sync.",
+        ),
+        (
+            "argocd.argoproj.io/instance",
+            "team/shop",
+            "Managed by Argo CD: unknown application. This change will likely be reverted on \
+             the next sync.",
+        ),
+    ] {
+        let mut object = server.object(&deployments(), Some("demo"), "act").unwrap();
+        object["metadata"]["labels"] = json!({marker: value});
+        server.set_object(&deployments(), object);
+
+        let flow = open_on(cx, &t, act(&server), SCALE, true).await;
+        let text = shown_confirmation(cx, &t);
+        assert!(text.starts_with(expected), "{text}");
+        assert!(!text.contains("team/shop"), "{text}");
+        t.click(cx, "cancel");
+        draw(cx, &t);
+        assert_eq!(flow.begun.get(), 0);
+    }
+    assert!(server.writes().is_empty());
+}
+
+// covers UP-51: a Secret marked by an annotation is warned about in the drawn confirmation,
+// without the annotation's value.
+#[gpui_kit::test]
+async fn a_marked_secret_is_warned_about_without_its_value(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let server = fake_api();
+    let secrets = Gvr::core("secrets");
+    server.set_object(
+        &secrets,
+        json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": "creds", "namespace": "demo", "uid": "uid-creds",
+                         "resourceVersion": "5001",
+                         "annotations": {"argocd.argoproj.io/instance": "marker-value"}},
+            "data": {},
+        }),
+    );
+    let t = connected_to_fake(cx, dir.path(), &server).await;
+    let live = server.object(&secrets, Some("demo"), "creds").unwrap();
+    let target = WriteTarget {
+        kind: KindId::new("", "secrets"),
+        name: "creds".to_owned(),
+        uid: Some("uid-creds".to_owned()),
+        resource_version: live["metadata"]["resourceVersion"]
+            .as_str()
+            .map(str::to_owned),
+        ..act(&server)
+    };
+
+    let flow = open_on(cx, &t, target, WriteProposal::Delete, true).await;
+    let text = shown_confirmation(cx, &t);
+    assert!(
+        text.starts_with("Managed by GitOps. This change will likely be reverted"),
+        "{text}"
+    );
+    assert!(!text.contains("marker-value"), "{text}");
+    t.click(cx, "cancel");
+    draw(cx, &t);
+    assert_eq!(flow.begun.get(), 0);
+    assert!(server.writes().is_empty());
 }

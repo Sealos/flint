@@ -11,8 +11,14 @@ use flint_core::{
     Appearance, ClusterDiscovery, ClusterId, ClusterSummary, Command, ConnectionState, CoreHandle,
     Event, KindId, Protection, Settings, SyncState, WatchMode,
 };
+use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::Theme;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
+
+use super::nav::NavPanel;
+use super::scope_picker;
+use super::workspace::{protection_text, server_text};
 
 pub struct ClustersModel {
     core: CoreHandle,
@@ -421,8 +427,9 @@ pub enum Presence<'a> {
     Connecting,
     /// Connected and watched.
     Live,
+    /// Connection trouble, with the error that shows it.
     Reconnecting {
-        error: Option<&'a str>,
+        error: &'a str,
     },
     /// Connected, but its watches are stopped (cold).
     Idle,
@@ -499,19 +506,16 @@ impl<'a> Presence<'a> {
 
 /// The row's status while reconnecting. A watch error can carry the server's own message, so
 /// only its safe summary is shown.
-pub fn reconnecting_text(error: Option<&str>) -> String {
-    match error {
-        Some(error) => format!(
-            "Reconnecting: {}",
-            flint_core::redact::safe_error_summary(error)
-        ),
-        None => "Reconnecting".to_owned(),
-    }
+fn reconnecting_text(error: &str) -> String {
+    format!(
+        "Reconnecting: {}",
+        flint_core::redact::safe_error_summary(error)
+    )
 }
 
-/// The cluster is reconnecting when at least one watched kind is reconnecting and no kind is
-/// synced. Other states alone do not indicate connection trouble. Use the first reconnecting
-/// kind with an error by kind ID so the tooltip is stable.
+/// The cluster is reconnecting when a watched kind reports a connection error and no kind is
+/// synced. A routine relist has no error and a refusal is the server answering, so neither is
+/// connection trouble. Use the first such kind by kind ID so the tooltip is stable.
 fn reconnecting(states: &HashMap<KindId, SyncState>) -> Option<Presence<'_>> {
     if states.values().any(SyncState::is_current) {
         return None;
@@ -519,11 +523,97 @@ fn reconnecting(states: &HashMap<KindId, SyncState>) -> Option<Presence<'_>> {
     let (_, error) = states
         .iter()
         .filter_map(|(kind, state)| match state {
-            SyncState::Reconnecting { error } => Some((kind, error.as_deref())),
+            SyncState::Reconnecting { error: Some(error) } => Some((kind, error.as_str())),
             _ => None,
         })
-        .min_by_key(|(kind, error)| (error.is_none(), *kind))?;
+        .min_by_key(|(kind, _)| *kind)?;
     Some(Presence::Reconnecting { error })
+}
+
+/// A cluster row's full description: its tooltip and its accessible description.
+pub fn cluster_details(
+    model: &ClustersModel,
+    cluster: &ClusterSummary,
+    states: &HashMap<KindId, SyncState>,
+) -> String {
+    let name = &cluster.info.name;
+    let active = model.active.as_ref() == Some(name);
+    let state = match (Presence::of(&cluster.state, active, states), &cluster.state) {
+        (Presence::Reconnecting { error }, _) => reconnecting_text(error),
+        (Presence::Idle, ConnectionState::Connected(v)) => format!(
+            "Connected, Kubernetes {}. Idle: not watched while another cluster is active",
+            v.git_version
+        ),
+        (_, ConnectionState::Connected(v)) => format!("Connected, Kubernetes {}", v.git_version),
+        (_, ConnectionState::Failed(message)) => format!("Connection failed: {message}"),
+        (_, other) => state_label(other).to_owned(),
+    };
+    let exposure = match model.ai_exposure(cluster) {
+        AiExposureState::Hidden => "Hidden from AI agents".to_owned(),
+        AiExposureState::Exposed => format!(
+            "Exposed to AI agents (flint mcp, read-only): {}",
+            scope_picker::summary(&model.ai_scope(cluster).unwrap_or_default())
+        ),
+        AiExposureState::ServerChanged { exposed_server } => format!(
+            "Cluster changed: exposed at {}, now points elsewhere. Hidden from AI agents \
+             until you expose it again.",
+            flint_core::redact::server_url(&exposed_server)
+        ),
+    };
+    format!(
+        "{name}\n{}\n{state}\n{}\n{exposure}\nfrom {}",
+        server_text(cluster.info.server.as_deref()),
+        protection_text(model.protection(cluster), &model.trust(cluster)),
+        cluster.info.source.display()
+    )
+}
+
+/// A cluster row's tooltip. It stays open while the row's state changes, so it follows the
+/// model and the watch states rather than keeping the text it opened with.
+pub fn cluster_tooltip(
+    cluster: ClusterId,
+    model: &Entity<ClustersModel>,
+    nav: &Entity<NavPanel>,
+    cx: &mut App,
+) -> AnyView {
+    following_tooltip(cluster, model, nav, |cx| cx.notify(), cx).into()
+}
+
+/// Builds the tooltip view, calling `on_change` when the model or the watch states change. The
+/// view owns both subscriptions, so dismissing it unregisters them at once.
+fn following_tooltip(
+    cluster: ClusterId,
+    model: &Entity<ClustersModel>,
+    nav: &Entity<NavPanel>,
+    on_change: impl Fn(&mut Context<Tooltip>) + Clone + 'static,
+    cx: &mut App,
+) -> Entity<Tooltip> {
+    cx.new(|cx: &mut Context<Tooltip>| {
+        let on_model_change = on_change.clone();
+        let subscriptions = [
+            cx.observe(model, move |_, _, cx| on_model_change(cx)),
+            cx.observe(nav, move |_, _, cx| on_change(cx)),
+        ];
+        let (model, nav) = (model.downgrade(), nav.downgrade());
+        Tooltip::element(move |_, cx| {
+            // Moved into the content, which the view owns and drops with itself.
+            let _owned = &subscriptions;
+            let text = model
+                .upgrade()
+                .zip(nav.upgrade())
+                .and_then(|(model, nav)| {
+                    let model = model.read(cx);
+                    let row = model.clusters.iter().find(|c| c.info.name == cluster)?;
+                    Some(cluster_details(model, row, nav.read(cx).states()))
+                })
+                .unwrap_or_default();
+            div()
+                .id("cluster-tooltip")
+                .aria_label(text.clone())
+                .child(text)
+                .test_support()
+        })
+    })
 }
 
 /// A connection state's name in the automation state: `disconnected`, `connecting`,
@@ -676,10 +766,15 @@ mod tests {
             Presence::of(&connected, true, &HashMap::new()),
             Presence::Live
         );
-        let states = HashMap::from([(KindId::pods(), SyncState::Reconnecting { error: None })]);
+        let states = HashMap::from([(
+            KindId::pods(),
+            SyncState::Reconnecting {
+                error: Some("timed out".into()),
+            },
+        )]);
         assert_eq!(
             Presence::of(&connected, true, &states),
-            Presence::Reconnecting { error: None }
+            Presence::Reconnecting { error: "timed out" }
         );
         assert_eq!(Presence::of(&connected, false, &states), Presence::Idle);
         let failed = ConnectionState::Failed(flint_core::SafeErrorText::reduced("refused"));
@@ -707,23 +802,47 @@ mod tests {
                 KindId::new("", "secrets"),
                 SyncState::Failed {
                     error: "forbidden".into(),
+                    cause: Some(flint_core::RefusalCause::Denied),
                 },
             ),
         ]);
         assert_eq!(reconnecting(&states), None);
-        states.insert(pods, SyncState::Reconnecting { error: None });
+        states.insert(
+            pods,
+            SyncState::Reconnecting {
+                error: Some("timed out".into()),
+            },
+        );
         assert_eq!(
             reconnecting(&states),
-            Some(Presence::Reconnecting { error: None })
+            Some(Presence::Reconnecting { error: "timed out" })
         );
         states.insert(KindId::new("", "nodes"), SyncState::Synced);
         assert_eq!(reconnecting(&states), None);
     }
 
+    // A relist has no error, and a refusal being retried is the server answering, whatever its
+    // cause: neither is connection trouble, even on the only watched kind.
+    #[test]
+    fn a_routine_relist_or_a_retried_refusal_is_not_connection_trouble() {
+        let retrying = |cause| SyncState::RetryingRefusal {
+            error: "refused".into(),
+            cause,
+        };
+        for state in [
+            SyncState::Reconnecting { error: None },
+            retrying(Some(flint_core::RefusalCause::Denied)),
+            retrying(Some(flint_core::RefusalCause::NotFound)),
+            retrying(None),
+        ] {
+            let states = HashMap::from([(KindId::pods(), state)]);
+            assert_eq!(reconnecting(&states), None, "{states:?}");
+        }
+    }
+
     #[test]
     fn reconnecting_text_shows_only_a_safe_summary() {
-        assert_eq!(reconnecting_text(None), "Reconnecting");
-        let text = reconnecting_text(Some("denied for \"s3cret-value\"\nsecond line"));
+        let text = reconnecting_text("denied for \"s3cret-value\"\nsecond line");
         assert!(text.starts_with("Reconnecting: denied for"), "{text}");
         assert!(!text.contains("s3cret-value"), "{text}");
         assert!(!text.contains("second line"), "{text}");
@@ -752,7 +871,7 @@ mod tests {
         assert_eq!(
             reconnecting(&states),
             Some(Presence::Reconnecting {
-                error: Some("connection dropped")
+                error: "connection dropped"
             })
         );
     }

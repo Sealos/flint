@@ -19,7 +19,7 @@ async fn a_closed_window_releases_the_workspace(cx: &mut TestAppContext) {
     cx.update_window(t.window, |_, window, cx| {
         registry::dispatch(
             "workspace::SelectCluster",
-            json!({ "cluster": "alpha" }),
+            json!({ "cluster": "kind-alpha" }),
             window,
             cx,
         )
@@ -28,7 +28,7 @@ async fn a_closed_window_releases_the_workspace(cx: &mut TestAppContext) {
     .unwrap();
     let workspace = t.workspace.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
-        workspace.read(cx).cluster.as_deref() == Some("alpha")
+        workspace.read(cx).cluster.as_deref() == Some("kind-alpha")
     })
     .await;
     let pods = NavEntry {

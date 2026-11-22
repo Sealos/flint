@@ -59,12 +59,16 @@ where
 }
 
 /// A server that reads the request and answers with `response`, then closes.
-async fn answering(response: &'static str) -> String {
-    server(move |mut socket| async move {
-        let mut buf = [0u8; 4096];
-        let _ = socket.read(&mut buf).await;
-        let _ = socket.write_all(response.as_bytes()).await;
-        let _ = socket.shutdown().await;
+async fn answering(response: impl Into<Arc<str>>) -> String {
+    let response = response.into();
+    server(move |mut socket| {
+        let response = Arc::clone(&response);
+        async move {
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
     })
     .await
 }
@@ -77,14 +81,11 @@ fn closed_port() -> u16 {
 
 /// A server that answers every request with `status` and a JSON `body`.
 async fn answering_json(status: &str, body: &str) -> String {
-    let response: &'static str = Box::leak(
-        format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        )
-        .into_boxed_str(),
-    );
-    answering(response).await
+    answering(format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    ))
+    .await
 }
 
 // covers UP-04
@@ -254,14 +255,7 @@ async fn http_errors_say_what_the_status_means() {
         format!("a proxy in front of http://{proxy} could not reach it (502 Bad Gateway)")
     );
     let body = r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"Unauthorized","reason":"Unauthorized","code":401}"#;
-    let response: &'static str = Box::leak(
-        format!(
-            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        )
-        .into_boxed_str(),
-    );
-    let unauthorized = answering(response).await;
+    let unauthorized = answering_json("401 Unauthorized", body).await;
     assert_eq!(
         connect_error(&format!("http://{unauthorized}"), None).await,
         format!(
@@ -269,15 +263,25 @@ async fn http_errors_say_what_the_status_means() {
              renew the credentials"
         )
     );
-    // A Status that explains itself is kept, once: RBAC names the user and the path.
+    // A Status that explains itself is kept, once. The agent's text keeps the quoted names; the
+    // summary hides them.
     let forbidden = answering_json(
         "403 Forbidden",
         r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"forbidden: User \"jane\" cannot get path \"/version\"","reason":"Forbidden","code":403}"#,
     )
     .await;
+    let kc = kubeconfig(&format!("http://{forbidden}"), None);
+    let err = cluster::connect_and_check(&kc, "ctx", std::time::Duration::from_secs(20))
+        .await
+        .err()
+        .unwrap();
     assert_eq!(
-        connect_error(&format!("http://{forbidden}"), None).await,
+        err.for_agent(),
         "forbidden: User \"jane\" cannot get path \"/version\""
+    );
+    assert_eq!(
+        err.summary().as_str(),
+        "forbidden: User \"…\" cannot get path \"…\""
     );
 }
 

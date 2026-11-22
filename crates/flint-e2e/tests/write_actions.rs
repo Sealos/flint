@@ -81,6 +81,76 @@ impl Core {
     }
 }
 
+/// A core on a kubeconfig whose user entry is `user` (YAML, indented for it) and whose cluster
+/// trusts the server through the CA file `ca`, with the kubeconfig in `dir`.
+async fn core_with_user(
+    server: &FakeApiServer,
+    dir: tempfile::TempDir,
+    ca: &std::path::Path,
+    user: &str,
+) -> Core {
+    let kubeconfig = dir.path().join("kubeconfig");
+    std::fs::write(
+        &kubeconfig,
+        format!(
+            "apiVersion: v1\nkind: Config\ncurrent-context: {CONTEXT}\nclusters:\n- name: c\n  \
+             cluster:\n    server: {}\n    certificate-authority: {}\nusers:\n- name: u\n  \
+             user:\n{user}contexts:\n- name: {CONTEXT}\n  context:\n    cluster: c\n    user: \
+             u\n    namespace: demo\n",
+            server.url(),
+            ca.display(),
+        ),
+    )
+    .unwrap();
+    Core::start_on(dir, vec![kubeconfig], Settings::default()).await
+}
+
+/// A core whose user reads its token from a file, and that file's path and the CA file's.
+async fn core_with_token_file(server: &FakeApiServer) -> (Core, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let (token, ca) = (dir.path().join("token"), dir.path().join("ca"));
+    std::fs::write(&token, "reviewed").unwrap();
+    std::fs::write(&ca, server.ca_pem()).unwrap();
+    let user = format!("    tokenFile: {}\n", token.display());
+    let core = core_with_user(server, dir, &ca, &user).await;
+    (core, token, ca)
+}
+
+fn edit() -> WriteProposal {
+    WriteProposal::ApplyYaml {
+        yaml: "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: act\nspec:\n  \
+               replicas: 3\n  template:\n    metadata: {}\n"
+            .to_owned(),
+    }
+}
+
+/// Starts a review of [`edit`] and returns once its `GET` is held on the server.
+async fn review_held_at_get(
+    core: &Core,
+    server: &FakeApiServer,
+) -> tokio::task::JoinHandle<Result<flint_core::write::WriteReview, WriteError>> {
+    server.inject(
+        Fault::delay(Duration::from_secs(2))
+            .on(&deployments())
+            .verb(Verb::Get)
+            .named("act")
+            .times(1),
+    );
+    let review = tokio::spawn(core.handle.review_write(workload_target(server), edit()));
+    tokio::time::timeout(WAIT, async {
+        while !server
+            .arrivals()
+            .iter()
+            .any(|r| r.method == http::Method::GET && r.path.ends_with("/act"))
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the review's GET arrives");
+    review
+}
+
 fn deployments() -> Gvr {
     Gvr::new("apps", "v1", "deployments")
 }
@@ -238,6 +308,185 @@ async fn workload_actions_change_the_reviewed_object() {
         .await
         .unwrap();
     assert!(server.object(&deployments(), Some("demo"), "act").is_none());
+}
+
+// covers UP-54: an unchanged token file writes, and one rewritten before a review is the one that
+// review binds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reviewed_write_goes_out_on_an_unchanged_token_file() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let (core, token, _ca) = core_with_token_file(&server).await;
+
+    core.act(workload_target(&server), WriteProposal::Scale { to: 3 })
+        .await
+        .unwrap();
+    assert_eq!(live(&server)["spec"]["replicas"], 3);
+
+    std::fs::write(&token, "rotated").unwrap();
+    core.act(workload_target(&server), WriteProposal::Scale { to: 4 })
+        .await
+        .unwrap();
+    assert_eq!(live(&server)["spec"]["replicas"], 4);
+}
+
+// covers UP-54: a token file rewritten while a confirmation is open refuses the write, and a new
+// review goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_file_changed_after_the_review_refuses_the_write() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let (core, token, _ca) = core_with_token_file(&server).await;
+
+    let review = core
+        .handle
+        .review_write(workload_target(&server), WriteProposal::Scale { to: 5 })
+        .await
+        .unwrap();
+    std::fs::write(&token, "another").unwrap();
+    let refused = core.handle.run_write(review.into_intent()).await;
+    assert_eq!(refused.unwrap_err(), WriteError::CredentialChanged);
+    assert!(server.writes().is_empty(), "{:?}", server.writes());
+
+    core.act(workload_target(&server), WriteProposal::Scale { to: 5 })
+        .await
+        .unwrap();
+    assert_eq!(live(&server)["spec"]["replicas"], 5);
+}
+
+// covers UP-54: a token file rewritten during a review stops it before its dry run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_file_changed_during_a_review_gets_no_dry_run() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let (core, token, _ca) = core_with_token_file(&server).await;
+
+    let review = review_held_at_get(&core, &server).await;
+    std::fs::write(&token, "another").unwrap();
+    assert_eq!(
+        review.await.unwrap().unwrap_err(),
+        WriteError::CredentialChanged
+    );
+    assert!(server.writes().is_empty(), "{:?}", server.writes());
+}
+
+// covers UP-54: a token file that can no longer be read refuses the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_token_file_refuses_the_write() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let (core, token, _ca) = core_with_token_file(&server).await;
+
+    let review = core
+        .handle
+        .review_write(workload_target(&server), WriteProposal::Scale { to: 5 })
+        .await
+        .unwrap();
+    std::fs::remove_file(&token).unwrap();
+    let refused = core.handle.run_write(review.into_intent()).await;
+    assert_eq!(refused.unwrap_err(), WriteError::CredentialUnreadable);
+    assert!(server.writes().is_empty(), "{:?}", server.writes());
+}
+
+// covers UP-54: a certificate file rewritten while a confirmation is open refuses the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_certificate_file_changed_after_the_review_refuses_the_write() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let (core, _token, ca) = core_with_token_file(&server).await;
+
+    let review = core
+        .handle
+        .review_write(workload_target(&server), WriteProposal::Scale { to: 5 })
+        .await
+        .unwrap();
+    std::fs::write(&ca, format!("{}\n", server.ca_pem())).unwrap();
+    let refused = core.handle.run_write(review.into_intent()).await;
+    assert_eq!(refused.unwrap_err(), WriteError::CredentialChanged);
+    assert!(server.writes().is_empty(), "{:?}", server.writes());
+}
+
+// covers UP-54: with an exec plugin, a server that can't say who the credential is gets no
+// change: the only request with a body is the identity check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plugin_credential_without_an_identity_check_is_refused() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("ca");
+    std::fs::write(&ca, server.ca_pem()).unwrap();
+    let plugin = dir.path().join("plugin");
+    std::fs::write(
+        &plugin,
+        "#!/bin/sh\nprintf '{\"apiVersion\":\"client.authentication.k8s.io/v1\",\
+         \"kind\":\"ExecCredential\",\"status\":{\"token\":\"t\"}}'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&plugin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let user = format!(
+        "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: {}\n      \
+         interactiveMode: Never\n",
+        plugin.display()
+    );
+    let core = core_with_user(&server, dir, &ca, &user).await;
+
+    let refused = core
+        .handle
+        .review_write(workload_target(&server), WriteProposal::Scale { to: 5 })
+        .await;
+    assert_eq!(refused.unwrap_err(), WriteError::IdentityUnavailable);
+    assert!(
+        server
+            .writes()
+            .iter()
+            .all(|w| w.path.ends_with("/selfsubjectreviews")),
+        "{:?}",
+        server.writes()
+    );
+    assert_eq!(live(&server)["spec"]["replicas"], 2);
+}
+
+// covers UP-54: client files an exec plugin's certificate replaces are not part of the binding,
+// so a missing one does not stop the review at the files: it reaches the identity check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_files_a_plugin_replaces_are_not_bound() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("ca");
+    std::fs::write(&ca, server.ca_pem()).unwrap();
+    let pair = rcgen::generate_simple_self_signed(vec!["client".to_owned()]).unwrap();
+    let output = dir.path().join("output");
+    std::fs::write(
+        &output,
+        json!({
+            "apiVersion": "client.authentication.k8s.io/v1",
+            "kind": "ExecCredential",
+            "status": {
+                "clientCertificateData": pair.cert.pem(),
+                "clientKeyData": pair.signing_key.serialize_pem(),
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let plugin = dir.path().join("plugin");
+    std::fs::write(&plugin, format!("cat {}\n", output.display())).unwrap();
+    let missing = dir.path().join("missing");
+    let user = format!(
+        "    client-certificate: {missing}\n    client-key: {missing}\n    exec:\n      \
+         apiVersion: client.authentication.k8s.io/v1\n      command: /bin/sh\n      args:\n      \
+         - {plugin}\n      interactiveMode: Never\n",
+        missing = missing.display(),
+        plugin = plugin.display(),
+    );
+    let core = core_with_user(&server, dir, &ca, &user).await;
+
+    let refused = core
+        .handle
+        .review_write(workload_target(&server), WriteProposal::Scale { to: 5 })
+        .await;
+    assert_eq!(refused.unwrap_err(), WriteError::IdentityUnavailable);
 }
 
 // covers UP-53: scaling from zero goes through the scale subresource too, which omits the count.
@@ -411,6 +660,111 @@ async fn locking_during_a_drain_stops_the_next_eviction() {
     assert_eq!(evictions(&server, "pod-c"), 0);
 }
 
+// covers UP-54: a kubeconfig change between two evictions, not loaded yet, stops the next one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kubeconfig_change_during_a_drain_stops_the_next_eviction() {
+    let server = FakeApiServer::start().await.unwrap();
+    node(&server);
+    for name in ["pod-a", "pod-b", "pod-c"] {
+        server.add_pod(pod_on_node(name, "ReplicaSet"));
+    }
+    let core = Core::start(&server, Settings::default()).await;
+    let path = core._dir.path().join("kubeconfig");
+    let whole = std::fs::read_to_string(&path).unwrap();
+    let changed = whole.replace("user: {}", "user: {token: another}");
+    assert_ne!(changed, whole);
+    let review = core
+        .handle
+        .review_write(node_target(&server), drain())
+        .await
+        .unwrap();
+    server.inject(
+        Fault::delay(Duration::from_millis(400))
+            .on(&Gvr::core("pods"))
+            .verb(Verb::Other)
+            .named("pod-a")
+            .subresource("eviction")
+            .times(1),
+    );
+    let running = tokio::spawn(core.handle.run_write(review.into_intent()));
+    tokio::time::timeout(WAIT, async {
+        let first = "/api/v1/namespaces/demo/pods/pod-a/eviction";
+        while !server.arrivals().iter().any(|r| r.path == first) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first eviction");
+    std::fs::write(&path, changed).unwrap();
+
+    let drained = report(running.await.unwrap().unwrap());
+    assert_eq!(drained.evicted, [named("pod-a")]);
+    assert_eq!(drained.remaining, [named("pod-b"), named("pod-c")]);
+    assert_eq!(drained.stopped, Some(WriteError::ConnectionChanged));
+    assert_eq!(evictions(&server, "pod-b"), 0);
+    assert_eq!(evictions(&server, "pod-c"), 0);
+}
+
+// covers UP-53: when the node cannot be read after the pod list, the listed pods are reported as
+// not tried and no eviction is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_node_check_reports_the_listed_pods_as_not_tried() {
+    let server = FakeApiServer::start().await.unwrap();
+    node(&server);
+    for name in ["pod-a", "pod-b"] {
+        server.add_pod(pod_on_node(name, "ReplicaSet"));
+    }
+    let core = Core::start(&server, Settings::default()).await;
+    let review = core
+        .handle
+        .review_write(node_target(&server), drain())
+        .await
+        .unwrap();
+    // First match wins: the read before the cordon passes, and the check after the list fails.
+    let node_read = || {
+        Fault::delay(Duration::ZERO)
+            .on(&nodes())
+            .verb(Verb::Get)
+            .named(NODE)
+    };
+    server.inject(node_read().times(1));
+    server.inject(Fault::status(500).on(&nodes()).verb(Verb::Get).named(NODE));
+    let from = server.arrivals().len();
+    let running = tokio::spawn(core.handle.run_write(review.into_intent()));
+
+    let drained = report(running.await.unwrap().unwrap());
+    server.clear_faults();
+
+    assert!(drained.cordoned);
+    assert!(drained.evicted.is_empty());
+    assert_eq!(drained.remaining, [named("pod-a"), named("pod-b")]);
+    let stopped = drained.stopped.expect("the drain stopped");
+    assert!(
+        matches!(stopped, WriteError::NodeNotRechecked(_)),
+        "{stopped:?}"
+    );
+    assert!(stopped.to_string().contains("could not be checked again"));
+    assert_eq!(evictions(&server, "pod-a"), 0);
+    assert_eq!(evictions(&server, "pod-b"), 0);
+    let node_path = format!("/api/v1/nodes/{NODE}");
+    let seen = server.arrivals();
+    let order: Vec<_> = seen[from..]
+        .iter()
+        .filter(|r| r.path == node_path || r.path == "/api/v1/pods")
+        .map(|r| (r.method.clone(), r.path.as_str()))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            (http::Method::GET, node_path.as_str()),
+            (http::Method::GET, "/api/v1/pods"),
+            (http::Method::PATCH, node_path.as_str()),
+            (http::Method::GET, "/api/v1/pods"),
+            (http::Method::GET, node_path.as_str()),
+        ]
+    );
+}
+
 // covers UP-54: on a protected cluster an action is refused at review, and nothing is written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_protected_cluster_refuses_actions() {
@@ -486,8 +840,19 @@ fn every_action(server: &FakeApiServer) -> Vec<(WriteTarget, WriteProposal, Gvr,
 
 /// Adds Flux's label to the object `target` names.
 fn add_marker(server: &FakeApiServer, gvr: &Gvr, namespace: Option<&str>, name: &str) {
+    set_labels(server, gvr, namespace, name, json!({FLUX_LABEL: "apps"}));
+}
+
+/// Replaces the labels of an object, keeping its `resourceVersion`.
+fn set_labels(
+    server: &FakeApiServer,
+    gvr: &Gvr,
+    namespace: Option<&str>,
+    name: &str,
+    labels: Value,
+) {
     let mut object = server.object(gvr, namespace, name).expect("the object");
-    object["metadata"]["labels"] = json!({FLUX_LABEL: "apps"});
+    object["metadata"]["labels"] = labels;
     server.set_object(gvr, object);
 }
 
@@ -529,7 +894,117 @@ async fn a_marker_added_after_the_review_is_a_conflict() {
         assert_eq!(result.unwrap_err(), WriteError::Conflict, "{path}");
         let seen = since(&server, from);
         assert_eq!(writes_in(&seen), 0, "{seen:?}");
-        assert_eq!(seen[0], (http::Method::GET, path.to_owned()));
+        // Unrelated discovery traffic may interleave; only the reviewed object's requests count.
+        let object = |(_, p): &&(http::Method, String)| p == path;
+        let for_object: Vec<_> = seen.iter().filter(object).collect();
+        assert_eq!(
+            for_object,
+            [&(http::Method::GET, path.to_owned())],
+            "{path}: {seen:?}"
+        );
+    }
+}
+
+// covers UP-51: every action on a marked object, a node included, warns that it will likely be
+// reverted, and can still go ahead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_action_on_a_marked_object_warns() {
+    for action in 0..ACTIONS {
+        let server = FakeApiServer::start().await.unwrap();
+        workload(&server, 2);
+        node(&server);
+        let core = Core::start(&server, Settings::default()).await;
+        let (target, proposal, gvr, path) = every_action(&server).swap_remove(action);
+        add_marker(&server, &gvr, target.namespace.as_deref(), &target.name);
+        let review = core.handle.review_write(target, proposal).await.unwrap();
+        match review.warnings() {
+            [WriteWarning::LikelyReverted(managed)] => {
+                assert_eq!(managed.to_string(), "Flux: apps", "{path}");
+            }
+            other => panic!("{path}: {other:?}"),
+        }
+        core.handle.run_write(review.into_intent()).await.unwrap();
+    }
+}
+
+// covers UP-51: a marker that cannot be read warns as an unknown manager.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_marker_warns_as_an_unknown_manager() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let core = Core::start(&server, Settings::default()).await;
+    set_labels(
+        &server,
+        &deployments(),
+        Some("demo"),
+        "act",
+        json!({"argocd.argoproj.io/instance": "team/shop"}),
+    );
+    let review = core
+        .handle
+        .review_write(workload_target(&server), WriteProposal::Scale { to: 3 })
+        .await
+        .unwrap();
+    match review.warnings() {
+        [WriteWarning::LikelyReverted(managed)] => {
+            assert_eq!(managed.to_string(), "Argo CD: unknown application");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+// covers UP-51, UP-53: a marker that appears after a YAML review changes the object, so the
+// reviewed edit ends in a conflict and the object keeps what it had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_marker_added_after_a_yaml_review_is_a_conflict() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let core = Core::start(&server, Settings::default()).await;
+    let review = core
+        .handle
+        .review_write(workload_target(&server), edit())
+        .await
+        .unwrap();
+    assert!(review.warnings().is_empty());
+    let mut changed = live(&server);
+    changed["metadata"]["labels"] = json!({FLUX_LABEL: "apps"});
+    changed["metadata"]["resourceVersion"] = json!("5002");
+    server.set_object(&deployments(), changed);
+
+    let result = core.handle.run_write(review.into_intent()).await;
+    assert_eq!(result.unwrap_err(), WriteError::Conflict);
+    let after = live(&server);
+    assert_eq!(after["spec"]["replicas"], 2, "nothing was written");
+    assert_eq!(after["metadata"]["labels"][FLUX_LABEL], "apps");
+}
+
+// covers UP-51, UP-53: a marker removed or a manager changed after the review is a conflict for
+// every action, and nothing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_marker_changed_after_the_review_is_a_conflict() {
+    for labels in [json!({}), json!({FLUX_LABEL: "other"})] {
+        for action in 0..ACTIONS {
+            let server = FakeApiServer::start().await.unwrap();
+            workload(&server, 2);
+            node(&server);
+            let core = Core::start(&server, Settings::default()).await;
+            let (target, proposal, gvr, path) = every_action(&server).swap_remove(action);
+            let namespace = target.namespace.clone();
+            let name = target.name.clone();
+            add_marker(&server, &gvr, namespace.as_deref(), &name);
+            let review = core.handle.review_write(target, proposal).await.unwrap();
+            assert_eq!(review.warnings().len(), 1, "{path}");
+            set_labels(&server, &gvr, namespace.as_deref(), &name, labels.clone());
+            let from = server.requests().len();
+            let result = core.handle.run_write(review.into_intent()).await;
+            assert_eq!(
+                result.unwrap_err(),
+                WriteError::Conflict,
+                "{path}: {labels}"
+            );
+            let seen = since(&server, from);
+            assert_eq!(writes_in(&seen), 0, "{seen:?}");
+        }
     }
 }
 
@@ -727,6 +1202,62 @@ async fn a_pod_marked_after_the_review_stops_the_drain() {
     let seen = since(&server, from);
     assert_eq!(writes_in(&seen), 0, "{seen:?}");
     assert!(server.object(&nodes(), None, NODE).unwrap()["spec"]["unschedulable"].is_null());
+}
+
+// covers UP-51, UP-53: a pod whose marker is an annotation behind an empty label is named in the
+// review, and a change to that annotation after the checks that start the drain stops the drain
+// before the pod is evicted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_annotation_changed_during_the_drain_stops_the_eviction() {
+    let server = FakeApiServer::start().await.unwrap();
+    node(&server);
+    server.add_pod(pod_on_node("first", "ReplicaSet"));
+    let mut pod = pod_json("web", "ReplicaSet");
+    pod["metadata"]["labels"] = json!({FLUX_LABEL: ""});
+    pod["metadata"]["annotations"] = json!({FLUX_LABEL: "apps"});
+    server.add_pod(FakePod::from_json(pod));
+    let core = Core::start(&server, Settings::default()).await;
+    let review = core
+        .handle
+        .review_write(node_target(&server), drain())
+        .await
+        .unwrap();
+    match review.warnings() {
+        [WriteWarning::EvictsManaged(pods)] => {
+            assert_eq!(pods[0].managed.to_string(), "Flux: apps");
+        }
+        other => panic!("{other:?}"),
+    }
+    server.inject(
+        Fault::delay(Duration::from_millis(400))
+            .on(&Gvr::core("pods"))
+            .verb(Verb::Other)
+            .named("first")
+            .subresource("eviction")
+            .times(1),
+    );
+    let running = tokio::spawn(core.handle.run_write(review.into_intent()));
+    tokio::time::timeout(WAIT, async {
+        let first = "/api/v1/namespaces/demo/pods/first/eviction";
+        while !server.arrivals().iter().any(|r| r.path == first) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first eviction");
+    let pods = Gvr::core("pods");
+    let mut live = server.object(&pods, Some("demo"), "web").expect("the pod");
+    live["metadata"]["annotations"] = json!({FLUX_LABEL: "other"});
+    server.set_object(&pods, live);
+
+    let drained = report(running.await.unwrap().unwrap());
+    assert_eq!(drained.evicted, [named("first")]);
+    assert_eq!(
+        drained.blocked,
+        [(named("web"), BlockedReason::ManagedSinceReview)]
+    );
+    assert_eq!(evictions(&server, "web"), 0);
+    assert!(server.object(&pods, Some("demo"), "web").is_some());
 }
 
 // covers UP-53: a Deployment paused after the review is a conflict, and no patch is sent.

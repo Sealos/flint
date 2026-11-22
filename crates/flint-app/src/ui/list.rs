@@ -49,9 +49,8 @@ pub const ROW_HEIGHT: f32 = 24.;
 thread_local! {
     static CELL_TOOLTIPS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
-/// How narrow Name and Namespace get in a tight list (characters), so status columns fit. The
-/// Namespace column keeps room for its header and the sort arrow, as measured.
-const SQUEEZED_NAME_CHARS: usize = 12;
+/// How narrow Namespace gets in a tight list (characters), so status columns fit. It keeps room
+/// for its header and the sort arrow, as measured. Name stops at [`list_model::NAME_MIN_CHARS`].
 const SQUEEZED_NAMESPACE_CHARS: usize = 11;
 
 /// The object a list has selected.
@@ -135,6 +134,13 @@ pub struct ResourceList {
     /// Down left the filter while its rows were being computed: select the first row in this
     /// window once they are current, if the rows still have focus.
     select_first_in: Option<AnyWindowHandle>,
+    /// Go Back set the filter's text: rows computed for any other text are dropped, not drawn,
+    /// until rows for it arrive ([`ResourceList::restore_filter`]).
+    restoring_filter: bool,
+    /// The text the rows drawn were computed for; `query.text` runs ahead of it while typing.
+    rows_text: String,
+    /// The selected object, when the rows drawn exist without it: the filters exclude it.
+    hidden_selected: Option<Box<str>>,
     /// The namespace or text filter changed: the next measurement starts the column widths
     /// over, so they fit the rows now shown. Live updates under the same filters only grow them.
     remeasure: bool,
@@ -152,6 +158,9 @@ pub struct ResourceList {
     /// The pane width this frame was laid out for. The width is known only after layout, so
     /// when it changed, the next frame draws again with the new one.
     laid_out_width: Option<f32>,
+    /// Whether the rows on screen were computed for exactly one namespace. A newly chosen scope
+    /// does not count until its rows arrive: the old ones may still span several namespaces.
+    rows_in_one_namespace: bool,
     /// Whether the last recompute applied the sort: its column was drawn then. When that
     /// changes with the layout (Wide toggled, the pane resized), the rows are sorted again.
     sort_drawn: bool,
@@ -218,7 +227,8 @@ impl ResourceList {
                 }
             }
         });
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter by name, label…"));
+        let filter =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter by name, label, managed…"));
         let on_filter = cx.subscribe_in(&filter, window, |this, input, event, _, cx| {
             if let InputEvent::Change = event {
                 this.query.text = input.read(cx).value().to_string();
@@ -256,6 +266,9 @@ impl ResourceList {
             computing: false,
             dirty: false,
             select_first_in: None,
+            restoring_filter: false,
+            rows_text: String::new(),
+            hidden_selected: None,
             remeasure: false,
             scoped: 0,
             scroll: UniformListScrollHandle::new(),
@@ -263,6 +276,7 @@ impl ResourceList {
             drawn: Vec::new(),
             dropped_wide: 0,
             laid_out_width: None,
+            rows_in_one_namespace: false,
             sort_drawn: false,
             #[cfg(test)]
             compute_gate: None,
@@ -493,6 +507,7 @@ impl ResourceList {
         self.computing = true;
         self.dirty = false;
         let snapshot = self.latest.clone();
+        let job_text = self.query.text.clone();
         let query = ViewQuery {
             namespaces: self.query.namespaces.clone(),
             text: self.query.text.clone(),
@@ -508,6 +523,7 @@ impl ResourceList {
         let selected_uid = self.selected.as_ref().map(|s| s.uid.clone());
         let restart = std::mem::take(&mut self.remeasure);
         let namespaces = self.query.namespaces.clone();
+        let one_namespace = namespaces.len() == 1;
         let job_snapshot = snapshot.clone();
         #[cfg(test)]
         let gate = self.compute_gate.clone();
@@ -542,13 +558,16 @@ impl ResourceList {
                     list.query.sort.as_ref(),
                     &list.sortable_in(&snapshot.columns),
                 );
-                if now != job_sort {
+                if now != job_sort || (list.restoring_filter && job_text != list.query.text) {
                     list.remeasure |= restart;
                     list.recompute(cx);
                     return None;
                 }
+                list.restoring_filter = false;
+                list.rows_text = job_text;
                 list.widths.update(&snapshot.columns, &widths, restart);
                 list.scoped = scoped;
+                list.rows_in_one_namespace = one_namespace;
                 list.apply(snapshot, rows, uid, position, cx);
                 if list.dirty {
                     list.recompute(cx);
@@ -599,6 +618,9 @@ impl ResourceList {
                 let found = find_row(&self.shown, selected.namespace.as_deref(), &selected.name)
                     .map(|i| &self.shown.rows[i])
                     .filter(|row| row.uid == selected.uid);
+                self.hidden_selected = found
+                    .filter(|_| position.is_none())
+                    .map(|row| row.uid.clone());
                 match found {
                     Some(row) => {
                         self.selected_gone = false;
@@ -759,8 +781,8 @@ impl ResourceList {
     }
 
     /// The columns to draw and their widths, for a pane `available` points wide (unknown
-    /// before the first layout). Wide columns that do not fit are left out; spare width goes to
-    /// the Name column first.
+    /// before the first layout). Wide columns that do not fit are left out, then Ready and
+    /// Namespace as [`list_model::shed_columns`] allows; spare width goes to the Name column.
     fn layout(&self, available: Option<f32>) -> (Vec<(usize, f32)>, usize) {
         let columns = &self.shown.columns;
         let width = |chars: usize| chars as f32 * CHAR_WIDTH + CELL_PADDING;
@@ -771,13 +793,23 @@ impl ResourceList {
             available,
         );
         if let Some(room) = available {
-            list_model::squeeze_identity(
+            let name_min = width(list_model::NAME_MIN_CHARS);
+            let namespace_min = width(SQUEEZED_NAMESPACE_CHARS);
+            let sort = self.query.sort.as_ref();
+            let rules = list_model::ShedRules {
+                ready_repeats_status: list_model::ready_repeats_status(self.kind.as_str()),
+                one_namespace: self.rows_in_one_namespace,
+            };
+            list_model::shed_columns(
                 &mut drawn,
                 columns,
                 room,
-                width(SQUEEZED_NAME_CHARS),
-                width(SQUEEZED_NAMESPACE_CHARS),
+                name_min,
+                namespace_min,
+                rules,
+                |i| sort.is_some_and(|s| columns[i].key() == s.column),
             );
+            list_model::squeeze_identity(&mut drawn, columns, room, name_min, namespace_min);
             if let Some(name) = columns.iter().position(|c| c.role == ColumnRole::Name) {
                 let wanted = width(self.widths.wanted(name, &columns[name]));
                 list_model::widen_name(&mut drawn, columns, room, wanted);
@@ -802,6 +834,10 @@ impl ResourceList {
         let health = list_model::has_health_columns(self.kind.as_str());
         let selected_uid = self.selected.as_ref().map(|s| &*s.uid);
         let ncols = self.shown.columns.len().max(1);
+        let namespace_hidden = !self
+            .drawn
+            .iter()
+            .any(|&(col, _)| self.shown.columns[col].role == ColumnRole::Namespace);
         let mut elements = Vec::with_capacity(range.len());
         for ix in range {
             let Some(&row_ix) = self.rows.get(ix) else {
@@ -854,12 +890,19 @@ impl ResourceList {
                 } = list_model::CellStyle::of(
                     column,
                     || cell_text(row, col, now),
-                    width,
+                    list_model::text_width(column, row, secrets, width),
                     list_model::RowFlags {
                         masked: is_masked_column(secrets, &self.shown.columns, col),
                         ..flags
                     },
                 );
+                // With its column hidden, the Name cell is where the namespace can be read.
+                let tooltip = match row.namespace.as_deref() {
+                    Some(namespace) if namespace_hidden && column.role == ColumnRole::Name => {
+                        Some(SharedString::from(format!("{namespace}/{}", row.name)))
+                    }
+                    _ => tooltip,
+                };
                 let cell = div()
                     .id(("cell", ix * ncols + col))
                     .h_full()
@@ -886,6 +929,9 @@ impl ResourceList {
                             .child(shown.clone())
                             .test_text(shown),
                     )
+                    .when(column.role == ColumnRole::Name, |el| {
+                        el.children(managed::marker(row, secrets, theme))
+                    })
                     .when_some(tooltip, |el, text| {
                         el.tooltip(move |window, cx| {
                             #[cfg(test)]
@@ -1095,6 +1141,22 @@ impl ResourceList {
                 .test_support()
                 .into_any_element()
         };
+        if snapshot.rows.is_empty()
+            && let Some(title) =
+                access_title(&snapshot.state, label, snapshot.limited_to.as_deref())
+        {
+            let detail = match &snapshot.state {
+                // Nothing to fall back to: the error says how to pick namespaces.
+                SyncState::Failed { error, .. } if snapshot.limited_to.is_some() => {
+                    Some(error.clone())
+                }
+                SyncState::Failed { error, .. } => {
+                    Some(format!("{error}\nFlint retries in the background."))
+                }
+                _ => None,
+            };
+            return Some(message(title, detail, theme.muted_foreground));
+        }
         match &snapshot.state {
             SyncState::Idle | SyncState::Loading if snapshot.rows.is_empty() => Some(
                 h_flex()
@@ -1115,7 +1177,7 @@ impl ResourceList {
                 Some(format!("{} is not in its API discovery.", self.kind)),
                 theme.muted_foreground,
             )),
-            SyncState::Failed { error } if snapshot.rows.is_empty() => Some(message(
+            SyncState::Failed { error, .. } if snapshot.rows.is_empty() => Some(message(
                 format!("Could not list {label}"),
                 Some(match &snapshot.limited_to {
                     // Nothing to fall back to: the error says how to pick namespaces.
@@ -1129,6 +1191,30 @@ impl ResourceList {
                 error.clone(),
                 theme.warning,
             )),
+            SyncState::RetryingRefusal { error, .. } if snapshot.rows.is_empty() => Some(message(
+                format!("Reconnecting to list {label}…"),
+                Some(error.clone()),
+                theme.warning,
+            )),
+            _ if self.restoring_filter => Some(
+                h_flex()
+                    .id("list-placeholder")
+                    .size_full()
+                    .justify_center()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(Spinner::new().small())
+                    .child(
+                        div()
+                            .id("list-filtering")
+                            .child(format!("Filtering {label}…"))
+                            .test_support(),
+                    )
+                    .test_support()
+                    .into_any_element(),
+            ),
             _ if self.rows.is_empty() => {
                 let filtered = !self.query.text.trim().is_empty()
                     || (self.namespaced && !self.query.namespaces.is_empty());
@@ -1182,20 +1268,33 @@ impl ResourceList {
         }
     }
 
-    /// What the list says when the selected object's namespace is outside the namespace
-    /// filter (opened from the resource switcher): its row is hidden, its details show.
+    /// What the list says when a filter hides the selected object's row and its details still
+    /// show: its namespace is outside the namespace filter (opened from the resource switcher),
+    /// or the rows computed for the current text exclude it.
     pub(in crate::ui) fn filtered_out_text(&self) -> Option<String> {
         let selected = self.selected.as_ref()?;
-        let namespace = selected.namespace.as_deref()?;
         let filter = &self.query.namespaces;
-        if !self.namespaced || filter.is_empty() || filter.iter().any(|n| n == namespace) {
-            return None;
+        if let Some(namespace) = selected.namespace.as_deref()
+            && self.namespaced
+            && !filter.is_empty()
+            && !filter.iter().any(|n| n == namespace)
+        {
+            return Some(format!(
+                "{} is in namespace {namespace}, outside the namespace filter, so its row is \
+                 hidden; its details are shown.",
+                selected.name
+            ));
         }
-        Some(format!(
-            "{} is in namespace {namespace}, outside the namespace filter, so its row is hidden; \
-             its details are shown.",
-            selected.name
-        ))
+        let hidden_by_text = !self.restoring_filter
+            && !self.query.text.trim().is_empty()
+            && self.rows_text == self.query.text
+            && self.hidden_selected.as_deref() == Some(&*selected.uid);
+        hidden_by_text.then(|| {
+            format!(
+                "{} does not match the text filter, so its row is hidden; its details are shown.",
+                selected.name
+            )
+        })
     }
 
     /// Banners over the rows: an object asked for that is gone, or whose row the namespace
@@ -1227,15 +1326,28 @@ impl ResourceList {
                     .into_any_element(),
             );
         }
+        let has_rows = !snapshot.rows.is_empty();
         let state = match &snapshot.state {
-            SyncState::Reconnecting { error } => Some((
-                theme.warning,
-                match error {
-                    Some(e) => format!("Reconnecting. These rows may be out of date: {e}"),
-                    None => "Reconnecting. These rows may be out of date.".to_owned(),
-                },
+            // With no rows the placeholder says it all: there is nothing to call out of date.
+            s @ SyncState::RetryingRefusal { .. } if s.is_checking_access() && !has_rows => None,
+            s @ SyncState::RetryingRefusal { error, .. } if s.is_checking_access() => Some((
+                theme.muted_foreground,
+                self.access_banner("Checking access", error),
             )),
-            SyncState::Failed { error } if !snapshot.rows.is_empty() => Some((
+            s @ SyncState::Failed { error, .. } if s.is_no_access() && has_rows => Some((
+                theme.muted_foreground,
+                self.access_banner("No access", error),
+            )),
+            SyncState::Reconnecting { error: Some(e) }
+            | SyncState::RetryingRefusal { error: e, .. } => Some((
+                theme.warning,
+                format!("Reconnecting. These rows may be out of date: {e}"),
+            )),
+            SyncState::Reconnecting { error: None } => Some((
+                theme.warning,
+                "Reconnecting. These rows may be out of date.".to_owned(),
+            )),
+            SyncState::Failed { error, .. } if !snapshot.rows.is_empty() => Some((
                 theme.danger,
                 format!("The list failed and is retried. These rows may be out of date: {error}"),
             )),
@@ -1253,6 +1365,41 @@ impl ResourceList {
             );
         }
         banners
+    }
+
+    /// The banner for a denial over cached rows. Only rows the filters leave on show can be
+    /// called out of date.
+    fn access_banner(&self, status: &str, error: &str) -> String {
+        if self.rows.is_empty() {
+            format!("{status}: {error}")
+        } else {
+            format!("{status}. These rows may be out of date: {error}")
+        }
+    }
+}
+
+/// What the list is titled while an account's access is the question. `None` for anything that
+/// is not a denial: a missing API must not read as a permissions problem. A settled denial of
+/// a namespace-limited list names the namespaces tried.
+fn access_title(
+    state: &SyncState,
+    label: &str,
+    limit: Option<&flint_core::NamespaceLimit>,
+) -> Option<String> {
+    if state.is_checking_access() {
+        Some(format!("Checking access to {label}…"))
+    } else if state.is_no_access() {
+        Some(
+            match limit.map(|l| (l.listed.as_slice(), l.denied.as_slice())) {
+                Some(([], [namespace])) => format!("No access to {label} in {namespace}"),
+                Some(([], denied)) if !denied.is_empty() => {
+                    format!("No access to {label} in {} namespaces", denied.len())
+                }
+                _ => format!("No access to {label}"),
+            },
+        )
+    } else {
+        None
     }
 }
 
@@ -1276,8 +1423,12 @@ pub fn limited_text(label: &str, limit: &flint_core::NamespaceLimit) -> String {
     let mut text = format!(
         "Showing {label} in {count} only ({names}): you may not list {label} in all namespaces."
     );
+    // A lane fails on a 403 or a 404, and the limit does not say which: claim neither.
     if !limit.denied.is_empty() {
-        text.push_str(&format!(" Not allowed in: {}.", limit.denied.join(", ")));
+        text.push_str(&format!(
+            " Could not list {label} in: {}.",
+            limit.denied.join(", ")
+        ));
     }
     text
 }
@@ -1336,7 +1487,18 @@ fn state_chip(state: &SyncState, feed: Feed, theme: &Theme) -> AnyElement {
         SyncState::Idle => ("not watched", theme.muted_foreground, None),
         SyncState::Loading => ("loading", theme.muted_foreground, None),
         SyncState::Reconnecting { error } => ("reconnecting", theme.warning, error.clone()),
-        SyncState::Failed { error } => ("failed", theme.danger, Some(error.clone())),
+        SyncState::RetryingRefusal { error, .. } if state.is_checking_access() => (
+            "checking access",
+            theme.muted_foreground,
+            Some(error.clone()),
+        ),
+        SyncState::RetryingRefusal { error, .. } => {
+            ("reconnecting", theme.warning, Some(error.clone()))
+        }
+        SyncState::Failed { error, .. } if state.is_no_access() => {
+            ("no access", theme.muted_foreground, Some(error.clone()))
+        }
+        SyncState::Failed { error, .. } => ("failed", theme.danger, Some(error.clone())),
         SyncState::Unavailable => ("unavailable", theme.muted_foreground, None),
     };
     h_flex()
@@ -1408,17 +1570,17 @@ impl Render for ResourceList {
                         ),
                 )
                 // Visible whenever the columns are wider than the pane, so it is clear that
-                // more columns are to the right.
-                .when(available.is_some_and(|w| total_width > w), |el| {
-                    el.child(
-                        div().absolute().inset_0().child(
-                            Scrollbar::horizontal(&self.hscroll)
-                                .id("list-hscrollbar")
-                                .mode(ScrollbarMode::Always)
-                                .viewport_from_layout(),
-                        ),
-                    )
-                })
+                // more columns are to the right. Always mounted: it hides itself using this
+                // frame's layout, while `available` is a frame old, and its state then lives
+                // and dies with the list instead of following pane resizes.
+                .child(
+                    div().absolute().inset_0().child(
+                        Scrollbar::horizontal(&self.hscroll)
+                            .id("list-hscrollbar")
+                            .mode(ScrollbarMode::Always)
+                            .viewport_from_layout(),
+                    ),
+                )
                 .into_any_element(),
         };
         // The rows have focus (not the filter): ringed, as Tab between panes shows (UP-33).
@@ -1446,6 +1608,9 @@ impl Render for ResourceList {
 
 #[path = "list_actions.rs"]
 mod actions;
+
+#[path = "list_managed.rs"]
+mod managed;
 
 #[cfg(any(test, feature = "automation"))]
 #[path = "list_state.rs"]

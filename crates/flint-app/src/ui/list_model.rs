@@ -115,6 +115,8 @@ pub const NAME_MIN_CHARS: usize = 16;
 /// into spare width as far as any name needs.
 const NAME_MAX_CHARS: usize = 253;
 const AGE_CHARS: usize = 7;
+/// What a managed row's marker takes from its name cell, in characters.
+pub const MARKER_CHARS: usize = 5;
 /// Rows sampled per column when measuring. Enough to see the widths that matter without
 /// walking 10,000 rows on every update.
 const SAMPLE_ROWS: usize = 2_000;
@@ -149,10 +151,14 @@ pub fn measure_columns(snapshot: &KindSnapshot, rows: &[u32], now: i64) -> Vec<u
                 rows.iter()
                     .step_by(step)
                     .map(|&row| {
-                        snapshot.rows[row as usize]
-                            .cell_text(i, now)
-                            .chars()
-                            .count()
+                        let row = &snapshot.rows[row as usize];
+                        let marker = if column.role == ColumnRole::Name && shows_marker(row, secret)
+                        {
+                            MARKER_CHARS
+                        } else {
+                            0
+                        };
+                        row.cell_text(i, now).chars().count() + marker
                     })
                     .max()
                     .unwrap_or(0)
@@ -167,6 +173,20 @@ pub fn measure_columns(snapshot: &KindSnapshot, rows: &[u32], now: i64) -> Vec<u
             cells.max(header).clamp(MIN_CHARS, max)
         })
         .collect()
+}
+
+/// Whether `row` draws a GitOps marker. A Secret list draws none.
+pub fn shows_marker(row: &flint_core::Row, secret_list: bool) -> bool {
+    !secret_list && row.managed_by().is_some()
+}
+
+/// The width left for the text of `row`'s cell in `column`, `width` wide, beside any marker.
+pub fn text_width(column: &Column, row: &flint_core::Row, secret_list: bool, width: f32) -> f32 {
+    if column.role == ColumnRole::Name && shows_marker(row, secret_list) {
+        width - MARKER_CHARS as f32 * CHAR_WIDTH
+    } else {
+        width
+    }
 }
 
 /// The rows that set the column widths, in snapshot order: those in `namespaces` (all of them
@@ -320,6 +340,60 @@ pub fn fit_columns(
             (kept, dropped)
         }
         _ => (all, 0),
+    }
+}
+
+/// Which columns a narrow list may leave out.
+#[derive(Debug, Clone, Copy)]
+pub struct ShedRules {
+    /// Status says what Ready says ([`ready_repeats_status`]).
+    pub ready_repeats_status: bool,
+    /// The list shows exactly one namespace, so every row's namespace is the same.
+    pub one_namespace: bool,
+}
+
+/// Whether `kind`'s Ready column repeats its Status column. Only Pods are known to have both with
+/// that meaning: a CRD's `Ready` printer column can mean anything and is always kept.
+pub fn ready_repeats_status(kind: &str) -> bool {
+    kind == "pods"
+}
+
+/// Leaves out Ready, then Namespace, while the columns up to and including Status would not fit
+/// `room` even with Name and Namespace at their minimums. Columns after Status may scroll. A list
+/// without Status sheds nothing. Namespace leaves only when `rules` says the list shows one
+/// namespace, so two rows never look identical. A column for which `keep` holds stays: it is the
+/// one the list is sorted by, and hiding it would reorder the rows when a detail pane opens.
+pub fn shed_columns(
+    drawn: &mut Vec<(usize, f32)>,
+    columns: &[Column],
+    room: f32,
+    name_min: f32,
+    namespace_min: f32,
+    rules: ShedRules,
+    keep: impl Fn(usize) -> bool,
+) {
+    let named = |i: usize, name: &str| {
+        columns[i].role == ColumnRole::Value && columns[i].name.eq_ignore_ascii_case(name)
+    };
+    let is_ready = |i: usize| rules.ready_repeats_status && named(i, "Ready");
+    let is_namespace = |i: usize| rules.one_namespace && columns[i].role == ColumnRole::Namespace;
+    let candidates: [&dyn Fn(usize) -> bool; 2] = [&is_ready, &is_namespace];
+    for candidate in candidates {
+        let Some(status) = drawn.iter().position(|&(i, _)| named(i, "Status")) else {
+            return;
+        };
+        let needed: f32 = drawn[..=status]
+            .iter()
+            .map(|&(i, width)| match columns[i].role {
+                ColumnRole::Name => width.min(name_min),
+                ColumnRole::Namespace => width.min(namespace_min),
+                _ => width,
+            })
+            .sum();
+        if needed <= room {
+            return;
+        }
+        drawn.retain(|&(i, _)| !candidate(i) || keep(i));
     }
 }
 
@@ -976,6 +1050,74 @@ mod tests {
             "Status starts at {}",
             status_x(&tight)
         );
+    }
+
+    // covers UP-20, UP-22, UP-23: Ready, then Namespace, leave only when the columns through
+    // Status do not fit, and only when that cannot make two rows look the same.
+    #[test]
+    fn a_narrow_pane_sheds_ready_then_namespace() {
+        let columns = vec![
+            col("Name", 0, ColumnRole::Name, ColumnType::String),
+            col("Namespace", 0, ColumnRole::Namespace, ColumnType::String),
+            col("Ready", 0, ColumnRole::Value, ColumnType::String),
+            col("Status", 0, ColumnRole::Value, ColumnType::String),
+            col("Restarts", 0, ColumnRole::Value, ColumnType::Integer),
+        ];
+        let shed = |room: f32, rules: ShedRules, keep: Option<usize>| {
+            let mut drawn = vec![(0, 300.), (1, 170.), (2, 76.), (3, 152.), (4, 90.)];
+            shed_columns(&mut drawn, &columns, room, 152., 110., rules, |i| {
+                Some(i) == keep
+            });
+            drawn.into_iter().map(|(i, _)| i).collect::<Vec<_>>()
+        };
+        let pods_in_one = ShedRules {
+            ready_repeats_status: true,
+            one_namespace: true,
+        };
+        let pods_in_many = ShedRules {
+            one_namespace: false,
+            ..pods_in_one
+        };
+        let custom_in_one = ShedRules {
+            ready_repeats_status: false,
+            ..pods_in_one
+        };
+        // 152 + 110 + 76 + 152 = 490 through Status; Restarts may scroll.
+        assert_eq!(shed(490., pods_in_one, None), [0, 1, 2, 3, 4]);
+        assert_eq!(shed(489., pods_in_one, None), [0, 1, 3, 4], "Ready first");
+        assert_eq!(shed(413., pods_in_one, None), [0, 3, 4], "then Namespace");
+        assert_eq!(
+            shed(300., pods_in_one, Some(2)),
+            [0, 2, 3, 4],
+            "the sorted column stays"
+        );
+        assert_eq!(
+            shed(300., pods_in_many, None),
+            [0, 1, 3, 4],
+            "Namespace tells rows apart across namespaces"
+        );
+        assert_eq!(
+            shed(300., custom_in_one, None),
+            [0, 2, 3, 4],
+            "a custom Ready column stays"
+        );
+        assert!(ready_repeats_status("pods"));
+        assert!(!ready_repeats_status("pods.example.com"));
+        assert!(!ready_repeats_status("deployments.apps"));
+
+        // Without a Status column, nothing is shed.
+        let deployment = [columns[0].clone(), columns[2].clone()];
+        let mut drawn = vec![(0, 300.), (1, 76.)];
+        shed_columns(
+            &mut drawn,
+            &deployment,
+            100.,
+            152.,
+            110.,
+            pods_in_one,
+            |_| false,
+        );
+        assert_eq!(drawn.len(), 2);
     }
 
     // covers UP-20, UP-25, UP-27: a long name must not be cut while the list has room.

@@ -14,6 +14,7 @@ use super::source::{EventStream, Source, WatchRequest};
 use super::*;
 use crate::discovery::tests::kind;
 use crate::read::KindInfo;
+use crate::store::RefusalCause;
 use crate::table::tests::pod_table;
 use crate::table::{FetchError, WireEvent, WireObject};
 
@@ -123,7 +124,14 @@ impl Source for Fake {
         let mut s = self.state.lock().unwrap();
         *s.list_calls.entry(key.clone()).or_default() += 1;
         if let Some(error) = s.list_errors.get_mut(&key).and_then(VecDeque::pop_front) {
-            return async move { Err(error) }.boxed();
+            let delay = s.list_delay;
+            return async move {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error)
+            }
+            .boxed();
         }
         let queue = s.lists.entry(key).or_default();
         let page = if queue.len() > 1 {
@@ -240,6 +248,21 @@ fn start_engine_with(
     tokio::sync::watch::Receiver<Arc<KindSnapshot>>,
     Arc<Hub>,
 ) {
+    start_engine_configured(fake, kind, feed, scope, config())
+}
+
+/// [`start_engine_with`] with other timings.
+fn start_engine_configured(
+    fake: &Arc<Fake>,
+    kind: KindInfo,
+    feed: Feed,
+    scope: Option<engine::Scope>,
+    config: Arc<EngineConfig>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::watch::Receiver<Arc<KindSnapshot>>,
+    Arc<Hub>,
+) {
     let hub = Arc::new(Hub::new("c".into(), kind.id()));
     let rx = hub.subscribe();
     let epoch = hub.take_over(KindSnapshot::default());
@@ -249,7 +272,7 @@ fn start_engine_with(
         fake.clone(),
         hub.clone(),
         epoch,
-        config(),
+        config,
         Arc::new(tokio::sync::Semaphore::new(4)),
     )
     .with_scope(scope);
@@ -584,6 +607,194 @@ async fn errors_back_off_and_show_reconnecting() {
     task.abort();
 }
 
+/// A state as the tests below compare it, without its text.
+fn shape(state: &SyncState) -> &'static str {
+    match state {
+        SyncState::Synced => "synced",
+        SyncState::Reconnecting { error: None } => "relisting",
+        SyncState::Reconnecting { error: Some(_) } => "error",
+        SyncState::Failed { .. } => "failed",
+        _ => "other",
+    }
+}
+
+/// The hub's states, sampled every millisecond without repeats, until it is synced again.
+/// Every synced sample must already have `rows` published.
+async fn states_until_synced_again(hub: &Hub, rows: &[&str]) -> Vec<&'static str> {
+    let mut seen = vec![shape(&hub.state())];
+    for _ in 0..3000 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        // The state is read first: rows read after it are at least as new.
+        let state = hub.state();
+        let now = shape(&state);
+        if seen.last() != Some(&now) {
+            seen.push(now);
+            if state == SyncState::Synced {
+                assert_eq!(
+                    names(&hub.latest()),
+                    rows,
+                    "synced before its rows: {seen:?}"
+                );
+                return seen;
+            }
+        }
+    }
+    panic!("never synced again: {seen:?}");
+}
+
+fn expired_event() -> Result<WireEvent, FetchError> {
+    event(
+        "ERROR",
+        json!({"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure",
+               "message":"too old resource version: 1 (773)","reason":"Expired","code":410}),
+    )
+}
+
+// covers UP-27
+#[tokio::test(start_paused = true)]
+async fn an_outage_keeps_its_error_across_relists() {
+    let fake = Fake::new();
+    fake.list("pods", pod("u1", "old", "Running", "10", true));
+    fake.list("pods", pod("u2", "new", "Running", "50", true));
+    let (task, mut rx, hub) = start_engine_with(&fake, pods(), Feed::Watch, None);
+    until(&mut rx, |s| s.state == SyncState::Synced).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for _ in 0..3 {
+        fake.list_error("pods", FetchError::Other("connection refused".into()));
+    }
+    fake.state.lock().unwrap().list_delay = Duration::from_millis(5);
+    fake.sender("pods").unwrap().send(expired_event()).unwrap();
+    assert_eq!(
+        states_until_synced_again(&hub, &["new"]).await,
+        ["synced", "relisting", "error", "synced"]
+    );
+    task.abort();
+}
+
+// covers UP-27
+#[tokio::test(start_paused = true)]
+async fn a_held_synced_state_does_not_clear_the_outage_error() {
+    let fake = Fake::new();
+    fake.list("pods", pod("u1", "old", "Running", "10", true));
+    fake.list("pods", pod("u2", "new", "Running", "50", true));
+    fake.script("pods", WatchScript::Live);
+    // The list after the outage works, but its watch expires before the snapshot is due.
+    fake.script(
+        "pods",
+        WatchScript::Fail(FetchError::Expired("too old".into())),
+    );
+    let (task, mut rx, hub) = start_engine_with(&fake, pods(), Feed::Watch, None);
+    until(&mut rx, |s| s.state == SyncState::Synced).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for _ in 0..2 {
+        fake.list_error("pods", FetchError::Other("connection refused".into()));
+    }
+    fake.state.lock().unwrap().list_delay = Duration::from_millis(5);
+    fake.sender("pods").unwrap().send(expired_event()).unwrap();
+    assert_eq!(
+        states_until_synced_again(&hub, &["new"]).await,
+        ["synced", "relisting", "error", "synced"]
+    );
+    task.abort();
+}
+
+/// Waits (in paused time) until `key` has been listed `calls` times.
+async fn until_listed(fake: &Fake, key: &str, calls: usize) {
+    for _ in 0..20_000 {
+        if fake.list_calls(key) >= calls {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("{key} was not listed {calls} times");
+}
+
+// covers UP-27
+#[tokio::test(start_paused = true)]
+async fn a_relist_backoff_does_not_publish_a_held_synced_state() {
+    let fake = Fake::new();
+    fake.list("pods", pod("u1", "old", "Running", "10", true));
+    fake.list("pods", pod("u2", "new", "Running", "50", true));
+    fake.list("pods", pod("u3", "newer", "Running", "60", true));
+    fake.script("pods", WatchScript::Live);
+    // The list after the outage works, but its watch expires before the snapshot is due.
+    fake.script(
+        "pods",
+        WatchScript::Fail(FetchError::Expired("too old".into())),
+    );
+    // Every backoff is longer than the publish interval, so the snapshot falls due during it.
+    let timing = Arc::new(EngineConfig {
+        backoff_min: Duration::from_millis(200),
+        backoff_max: Duration::from_millis(200),
+        ..EngineConfig::default()
+    });
+    let (task, mut rx, hub) = start_engine_configured(&fake, pods(), Feed::Watch, None, timing);
+    until(&mut rx, |s| s.state == SyncState::Synced).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    fake.list_error("pods", FetchError::Other("connection refused".into()));
+    fake.state.lock().unwrap().list_delay = Duration::from_millis(50);
+    fake.sender("pods").unwrap().send(expired_event()).unwrap();
+    until_listed(&fake, "pods", 3).await;
+    assert_eq!(shape(&hub.state()), "error");
+    // A snapshot now makes the one for the list in flight wait out the publish interval.
+    let _peek = hub.peek();
+    assert_eq!(
+        states_until_synced_again(&hub, &["newer"]).await,
+        ["error", "synced"]
+    );
+    task.abort();
+}
+
+// covers UP-21, UP-27
+#[tokio::test(start_paused = true)]
+async fn a_lane_recovering_from_a_refusal_keeps_its_rows_through_a_410() {
+    let fake = Fake::new();
+    for _ in 0..10 {
+        fake.list_error("pods", forbidden());
+    }
+    for _ in 0..4 {
+        fake.list_error("pods/a", forbidden());
+    }
+    fake.list(
+        "pods/a",
+        pod_table(&[("u1", "a", "fresh", "Running")], true, "10"),
+    );
+    fake.list(
+        "pods/a",
+        pod_table(&[("u2", "a", "newer", "Running")], true, "20"),
+    );
+    fake.script(
+        "pods/a",
+        WatchScript::Fail(FetchError::Expired("too old".into())),
+    );
+    let (_scope_tx, scope) =
+        tokio::sync::watch::channel::<Arc<[String]>>(Arc::from(vec!["a".to_owned()]));
+    let (task, mut rx, hub) = start_engine_with(&fake, pods(), Feed::Watch, Some(scope));
+    until(&mut rx, |s| {
+        matches!(s.state, SyncState::Failed { .. })
+            && s.limited_to.as_ref().is_some_and(|l| l.denied == ["a"])
+    })
+    .await;
+    fake.state.lock().unwrap().list_delay = Duration::from_millis(50);
+    until_listed(&fake, "pods/a", 5).await;
+    // The relist after the 410 takes long enough to be seen.
+    fake.state.lock().unwrap().list_delay = Duration::from_millis(300);
+    // A snapshot now makes the lane's recovery snapshot wait out the publish interval.
+    let _peek = hub.peek();
+    let snap = until(&mut rx, |s| {
+        s.state == (SyncState::Reconnecting { error: None }) && names(s) == ["fresh"]
+    })
+    .await;
+    let limit = snap.limited_to.as_ref().unwrap();
+    assert_eq!(limit.listed, ["a"]);
+    assert!(limit.denied.is_empty(), "{:?}", limit.denied);
+    until(&mut rx, |s| {
+        s.state == SyncState::Synced && names(s) == ["newer"]
+    })
+    .await;
+    task.abort();
+}
+
 /// A server message with a quoted value, a token and a second line.
 const NOISY_MESSAGE: &str =
     "denied value \"quoted-value\" Authorization: Bearer abcdefghijklmnop\nsecond line";
@@ -599,8 +810,151 @@ fn assert_clean(text: &str) {
 fn reconnecting_error(snap: &KindSnapshot) -> Option<&str> {
     match &snap.state {
         SyncState::Reconnecting { error } => error.as_deref(),
+        SyncState::RetryingRefusal { error, .. } => Some(error),
         _ => None,
     }
+}
+
+fn refusal(text: &str) -> SyncState {
+    SyncState::RetryingRefusal {
+        error: text.into(),
+        cause: Some(RefusalCause::Denied),
+    }
+}
+
+// covers UP-27
+#[tokio::test(start_paused = true)]
+async fn a_refused_list_carries_its_cause_from_retry_to_failure() {
+    let cases: [(fn() -> FetchError, RefusalCause); 2] = [
+        (forbidden, RefusalCause::Denied),
+        (
+            || FetchError::NotFound("not found".into()),
+            RefusalCause::NotFound,
+        ),
+    ];
+    for (error, expected) in cases {
+        let fake = Fake::new();
+        for _ in 0..10 {
+            fake.list_error("pods", error());
+        }
+        let (task, mut rx) = start_engine(&fake, pods(), Feed::Watch);
+        let snap = until(&mut rx, |s| {
+            !matches!(s.state, SyncState::Idle | SyncState::Loading)
+        })
+        .await;
+        let SyncState::RetryingRefusal { cause, .. } = &snap.state else {
+            panic!("a refusal being retried: {:?}", snap.state);
+        };
+        assert_eq!(*cause, Some(expected));
+        let snap = until(&mut rx, |s| {
+            assert!(
+                !matches!(s.state, SyncState::Reconnecting { .. }),
+                "a refusal never reports a broken connection: {:?}",
+                s.state
+            );
+            matches!(s.state, SyncState::Failed { .. })
+        })
+        .await;
+        let SyncState::Failed { cause, .. } = &snap.state else {
+            unreachable!()
+        };
+        assert_eq!(*cause, Some(expected));
+        task.abort();
+    }
+}
+
+// covers UP-27
+#[tokio::test(start_paused = true)]
+async fn a_refused_list_being_retried_is_typed_and_clean() {
+    let fake = Fake::new();
+    for _ in 0..10 {
+        fake.list_error("pods", FetchError::Denied(NOISY_MESSAGE.into()));
+    }
+    let (task, mut rx) = start_engine(&fake, pods(), Feed::Watch);
+    let snap = until(&mut rx, |s| {
+        !matches!(s.state, SyncState::Idle | SyncState::Loading)
+    })
+    .await;
+    let SyncState::RetryingRefusal { error, .. } = &snap.state else {
+        panic!("a refusal being retried: {:?}", snap.state);
+    };
+    assert_clean(error);
+    until(&mut rx, |s| matches!(s.state, SyncState::Failed { .. })).await;
+    task.abort();
+}
+
+// covers UP-27
+#[tokio::test(start_paused = true)]
+async fn a_refused_watch_being_retried_is_typed_and_keeps_its_rows() {
+    for error in [forbidden(), FetchError::NotFound("not found".into())] {
+        let fake = Fake::new();
+        fake.list("pods", pod("u1", "a", "Running", "10", true));
+        fake.script("pods", WatchScript::Live);
+        fake.script("pods", WatchScript::Fail(error));
+        let (task, mut rx) = start_engine(&fake, pods(), Feed::Watch);
+        until(&mut rx, |s| s.state == SyncState::Synced).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(fake.state.lock().unwrap().senders.remove("pods"));
+        let snap = until(&mut rx, |s| s.state != SyncState::Synced).await;
+        assert!(
+            matches!(snap.state, SyncState::RetryingRefusal { .. }),
+            "{:?}",
+            snap.state
+        );
+        assert_eq!(names(&snap), ["a"]);
+        task.abort();
+    }
+}
+
+#[test]
+fn a_merged_list_reports_a_connection_error_over_a_refusal() {
+    let relist = SyncState::Reconnecting { error: None };
+    let down = SyncState::Reconnecting {
+        error: Some("connection refused".into()),
+    };
+    let refused = refusal("forbidden");
+    let pick = |states: &[&SyncState]| engine::most_troubled(states.iter().copied()).cloned();
+    assert_eq!(pick(&[&refused, &relist, &down]), Some(down.clone()));
+    // A denial must not hide another namespace's recovery.
+    assert_eq!(pick(&[&relist, &refused]), Some(relist.clone()));
+    assert_eq!(pick(&[&SyncState::Synced, &refused]), Some(refused.clone()));
+    assert_eq!(pick(&[&SyncState::Synced, &relist]), Some(relist));
+    assert_eq!(pick(&[&SyncState::Synced]), None);
+}
+
+#[tokio::test]
+async fn stored_rows_include_a_kind_retrying_a_refusal() {
+    let registry = HubRegistry::default();
+    let hub = registry.get_or_create("c", &KindId::pods());
+    let _rx = hub.subscribe();
+    hub.take_over(KindSnapshot::empty(
+        "c".into(),
+        KindId::pods(),
+        refusal("forbidden"),
+    ));
+    let stored = registry.stored("c", Duration::from_millis(10)).await;
+    assert_eq!(stored.len(), 1);
+}
+
+// covers UP-27
+#[tokio::test(start_paused = true)]
+async fn a_relist_during_a_refusal_keeps_the_refusal() {
+    let fake = Fake::new();
+    fake.list("pods", pod("u1", "old", "Running", "10", true));
+    fake.list("pods", pod("u2", "new", "Running", "50", true));
+    let (task, mut rx, hub) = start_engine_with(&fake, pods(), Feed::Watch, None);
+    until(&mut rx, |s| s.state == SyncState::Synced).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for _ in 0..2 {
+        fake.list_error("pods", forbidden());
+    }
+    fake.state.lock().unwrap().list_delay = Duration::from_millis(5);
+    fake.sender("pods").unwrap().send(expired_event()).unwrap();
+    assert_eq!(
+        states_until_synced_again(&hub, &["new"]).await,
+        ["synced", "relisting", "other", "synced"]
+    );
+    task.abort();
 }
 
 #[tokio::test(start_paused = true)]
@@ -642,7 +996,7 @@ async fn a_failed_list_shows_clean_text() {
     let snap = until(&mut rx, |s| reconnecting_error(s).is_some()).await;
     assert_clean(reconnecting_error(&snap).unwrap());
     let snap = until(&mut rx, |s| matches!(s.state, SyncState::Failed { .. })).await;
-    let SyncState::Failed { error } = &snap.state else {
+    let SyncState::Failed { error, .. } = &snap.state else {
         unreachable!()
     };
     assert_clean(error);
@@ -661,7 +1015,7 @@ async fn a_namespace_limited_list_shows_clean_text() {
         matches!(s.state, SyncState::Failed { .. }) && s.limited_to.is_some()
     })
     .await;
-    let SyncState::Failed { error } = &snap.state else {
+    let SyncState::Failed { error, .. } = &snap.state else {
         unreachable!()
     };
     assert_clean(error);
@@ -908,7 +1262,7 @@ async fn a_namespace_limited_user_gets_the_namespaces_they_may_list_merged() {
 
     // Nothing to fall back to yet: say how to get a list.
     let snap = until(&mut rx, |s| matches!(s.state, SyncState::Failed { .. })).await;
-    let SyncState::Failed { error } = &snap.state else {
+    let SyncState::Failed { error, .. } = &snap.state else {
         unreachable!()
     };
     assert!(error.contains("namespace filter"), "{error}");

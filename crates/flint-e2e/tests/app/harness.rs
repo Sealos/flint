@@ -43,13 +43,13 @@ fn teardown_checks_fail_a_test_that_breaks_them() -> Result<()> {
         error.contains(&format!(
             "UP-91: 1 request(s) reached the fake server at {}",
             two.b.url()
-        )) && error.contains("never selected \"fake-b\"")
+        )) && error.contains("never selected \"kind-fake-b\"")
             && error.contains("GET /version"),
         "{error}"
     );
     assert!(
         !error.contains(&two.a.url()),
-        "fake-a was selected: {error}"
+        "kind-fake-a was selected: {error}"
     );
 
     // Drop: a request before the test selected the cluster fails the test with a panic.
@@ -61,14 +61,14 @@ fn teardown_checks_fail_a_test_that_breaks_them() -> Result<()> {
         .expect_err("dropping the app to fail the test");
     let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
     assert!(
-        message.contains("before the test selected \"fake-a\""),
+        message.contains("before the test selected \"kind-fake-a\""),
         "{message}"
     );
 
     // The same steps through the harness's exceptions pass.
     let app = App::launch(AppOptions::new(two.kubeconfig()))?;
     app.wait_for("/kubeconfig/loaded", Equals(true.into()))?;
-    app.edit_kubeconfig(|| {
+    app.edit_kubeconfig([two.kubeconfig()], || {
         text.push_str("# changed again\n");
         write(&two.kubeconfig(), &text)
     })?;
@@ -109,7 +109,8 @@ fn teardown_counts_a_delayed_request_from_its_arrival() -> Result<()> {
     })?;
     let message = drop_panics(app);
     assert!(
-        message.contains("before the test selected \"fake-a\"") && message.contains("GET /version"),
+        message.contains("before the test selected \"kind-fake-a\"")
+            && message.contains("GET /version"),
         "{message}"
     );
     Ok(())
@@ -141,7 +142,7 @@ fn teardown_checks_kubeconfig_files_added_through_settings() -> Result<()> {
         error.contains(&format!(
             "UP-91: 1 request(s) reached the fake server at {}",
             two.b.url()
-        )) && error.contains("never selected \"fake-b\""),
+        )) && error.contains("never selected \"kind-fake-b\""),
         "{error}"
     );
     assert!(
@@ -172,7 +173,10 @@ fn teardown_stays_fatal_after_a_handled_timeout() -> Result<()> {
     assert!(started.elapsed() < Duration::from_secs(20));
     contact(&two.b)?;
     let message = drop_panics(app);
-    assert!(message.contains("never selected \"fake-b\""), "{message}");
+    assert!(
+        message.contains("never selected \"kind-fake-b\""),
+        "{message}"
+    );
 
     // Marked as failing: the report is printed, and the test's own error stands.
     let app = App::launch(AppOptions::new(two.kubeconfig()))?;

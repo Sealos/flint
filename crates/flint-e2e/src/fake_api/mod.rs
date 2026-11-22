@@ -5,7 +5,7 @@
 //! lists and objects, with timestamps shifted to the server's start ([`clock`]). Watches
 //! (including streaming lists) are served from the same rows and can be scripted
 //! ([`FakeApiServer::script_watch`]) or fed live ([`FakeApiServer::send_watch`]). Faults
-//! ([`Fault`]) refuse, delay or drop matching requests.
+//! ([`Fault`]) refuse, delay, hold until released or drop matching requests.
 //!
 //! Pod logs behave like a real cluster's for what Flint asks (`logs`): per container and
 //! previous instance, `follow`, `tailLines`, `sinceSeconds`/`sinceTime`, `timestamps` and
@@ -54,6 +54,7 @@
 //! # }
 //! ```
 
+mod access;
 pub mod clock;
 mod exec;
 mod faults;
@@ -71,16 +72,17 @@ mod state;
 mod tls;
 mod watch;
 
+pub use access::AccessPolicy;
 pub use exec::{ExecEnd, ExecImage, ExecRuntime, FakeExec, STDOUT_KEPT, TtySize, V4, V5};
-pub use faults::{Effect, Fault};
+pub use faults::{Effect, Fault, HoldPoint, RequestHold};
 pub use fixtures::{Fixtures, Gvr};
-pub use kubeconfig::CONTEXT;
+pub use kubeconfig::{CONTEXT, REMOTE_CONTEXT};
 pub use logs::ContainerLog;
 pub use pods::FakePod;
 pub use route::{Query, Verb};
 pub use row::FakeRow;
 pub use server::{
-    FakeApiServer, MetricsSample, MetricsTarget, Options, RequestRecord, WriteRecord, arrivals_at,
-    connection_mark_at, write_kubeconfigs,
+    ArrivalLog, FakeApiServer, MetricsSample, MetricsTarget, Options, RequestRecord, WriteRecord,
+    arrival_log_at, arrivals_at, connection_mark_at, write_kubeconfigs,
 };
 pub use watch::WatchStep;

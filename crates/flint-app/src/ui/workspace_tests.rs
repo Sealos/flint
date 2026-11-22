@@ -82,8 +82,8 @@ async fn registered_actions_drive_the_workspace(cx: &mut TestAppContext) {
         t.dispatch(cx, "workspace::SelectCluster", json!({"cluster": "gamma"})),
         Err(ActionError::Rejected { .. })
     ));
-    t.activate(cx, "beta").await;
-    // Nothing listens on beta's port: the sidebar and the main pane say so, naming the server.
+    t.activate(cx, "kind-beta").await;
+    // Nothing listens on kind-beta's port: the sidebar and the main pane say so, naming the server.
     let refused = format!(
         "connection refused by {}; is the API server running, and is the port right?",
         t.refused_server
@@ -104,8 +104,13 @@ async fn registered_actions_drive_the_workspace(cx: &mut TestAppContext) {
             workspace.update(cx, |ws, cx| ws.view_state(window, cx))
         })
         .unwrap();
-    assert_eq!(state.active_cluster.as_deref(), Some("beta"));
-    assert!(state.clusters.iter().any(|c| c.name == "beta" && c.active));
+    assert_eq!(state.active_cluster.as_deref(), Some("kind-beta"));
+    assert!(
+        state
+            .clusters
+            .iter()
+            .any(|c| c.name == "kind-beta" && c.active)
+    );
     assert_eq!(state.focus, Focus::Workspace);
     assert!(state.list.is_none() && state.detail.is_none() && state.dialog.is_none());
     assert!(state.header.is_some());
@@ -122,7 +127,7 @@ async fn registered_actions_drive_the_workspace(cx: &mut TestAppContext) {
     );
     // Hiding a hidden cluster would do nothing.
     assert!(matches!(
-        t.dispatch(cx, "workspace::HideFromAi", json!({"cluster": "beta"})),
+        t.dispatch(cx, "workspace::HideFromAi", json!({"cluster": "kind-beta"})),
         Err(ActionError::Rejected { .. })
     ));
     // Namespace names are trimmed; blank ones are refused.
@@ -132,9 +137,9 @@ async fn registered_actions_drive_the_workspace(cx: &mut TestAppContext) {
         json!({"namespaces": [" demo "]}),
     )
     .unwrap();
-    let filter = t
-        .workspace
-        .read_with(cx, |ws, _| ws.ui_state.namespace_filter("beta").to_vec());
+    let filter = t.workspace.read_with(cx, |ws, _| {
+        ws.ui_state.namespace_filter("kind-beta").to_vec()
+    });
     assert_eq!(filter, ["demo"]);
     assert!(matches!(
         t.dispatch(cx, "workspace::AddNamespace", json!({"namespace": "  "})),
@@ -252,7 +257,7 @@ async fn focus_comes_back_after_a_cluster_switch(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     t.open_pods(cx, &[("demo", "api", 0)]).await;
-    t.activate(cx, "beta").await;
+    t.activate(cx, "kind-beta").await;
     let workspace = t.workspace.clone();
     cx.wait_for(t.window, WAIT, move |window, cx| {
         workspace.read(cx).focus.is_focused(window)
@@ -307,8 +312,12 @@ async fn the_expose_dialog_answers_confirm_and_cancel(cx: &mut TestAppContext) {
             .unwrap()
     };
 
-    t.dispatch(cx, "workspace::ExposeToAi", json!({"cluster": "alpha"}))
-        .unwrap();
+    t.dispatch(
+        cx,
+        "workspace::ExposeToAi",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
     cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
         .await;
     // The automation state says what the dialog asks.
@@ -320,15 +329,23 @@ async fn the_expose_dialog_answers_confirm_and_cancel(cx: &mut TestAppContext) {
         .unwrap()
         .expect("the dialog is in the state");
     assert_eq!(dialog.title, "Expose to AI agents?");
-    assert!(dialog.text.contains("Context: alpha"), "{}", dialog.text);
+    assert!(
+        dialog.text.contains("Context: kind-alpha"),
+        "{}",
+        dialog.text
+    );
     assert_eq!(dialog.buttons, ["Expose", "Cancel"]);
     t.dispatch(cx, "ui::Cancel", Value::Null).unwrap();
     cx.wait_for(t.window, WAIT, |window, cx| !window.has_active_dialog(cx))
         .await;
     assert!(!has_dialog(cx));
 
-    t.dispatch(cx, "workspace::ExposeToAi", json!({"cluster": "alpha"}))
-        .unwrap();
+    t.dispatch(
+        cx,
+        "workspace::ExposeToAi",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
     cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
         .await;
     t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
@@ -338,7 +355,7 @@ async fn the_expose_dialog_answers_confirm_and_cancel(cx: &mut TestAppContext) {
         model
             .clusters
             .iter()
-            .find(|c| c.info.name == "alpha")
+            .find(|c| c.info.name == "kind-alpha")
             .is_some_and(|c| model.ai_exposure(c) == AiExposureState::Exposed)
     })
     .await;
@@ -512,13 +529,13 @@ async fn logs_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCont
     assert_eq!(active(cx), Some(0));
 
     // A cluster switch closes the list, not the dock: the sessions keep running.
-    t.activate(cx, "beta").await;
+    t.activate(cx, "kind-beta").await;
     cx.run_until_parked();
     assert_eq!(dock_tabs(cx, &t).1.len(), 3);
     let alive = first.upgrade().expect("the log tab survives the switch");
     assert_eq!(
         alive.read_with(cx, |v, _| v.request().cluster.clone()),
-        "alpha"
+        "kind-alpha"
     );
     drop(alive);
 
@@ -575,18 +592,18 @@ async fn tabs_are_pinned_to_their_server(cx: &mut TestAppContext) {
                 .collect::<Vec<_>>()
         })
     };
-    assert_eq!(labels(cx), ["web · app on alpha"]);
+    assert_eq!(labels(cx), ["web · app on kind-alpha"]);
     t.focus_workspace(cx);
     t.dispatch(cx, "detail::OpenLogs", Value::Null).unwrap();
     cx.run_until_parked();
     assert_eq!(labels(cx).len(), 1, "the same server: the same tab");
 
-    // `alpha` now points at another server (as after editing kubeconfig).
+    // `kind-alpha` now points at another server (as after editing kubeconfig).
     t.model.update(cx, |model, cx| {
         let alpha = model
             .clusters
             .iter_mut()
-            .find(|c| c.info.name == "alpha")
+            .find(|c| c.info.name == "kind-alpha")
             .unwrap();
         alpha.info.server = Some("https://10.0.0.9:6443".into());
         cx.notify();
@@ -595,7 +612,10 @@ async fn tabs_are_pinned_to_their_server(cx: &mut TestAppContext) {
     t.focus_workspace(cx);
     t.dispatch(cx, "detail::OpenLogs", Value::Null).unwrap();
     cx.run_until_parked();
-    assert_eq!(labels(cx), ["web · app on alpha", "web · app on alpha"]);
+    assert_eq!(
+        labels(cx),
+        ["web · app on kind-alpha", "web · app on kind-alpha"]
+    );
     let active = t.workspace.read_with(cx, |ws, cx| {
         let dock = ws.dock.read(cx);
         dock.tab_ids()
@@ -640,7 +660,7 @@ async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCo
     let first = t.workspace.read_with(cx, |ws, cx| {
         ws.dock.read(cx).active_terminal().unwrap().downgrade()
     });
-    // `alpha` never connects, so the shell fails at once and says why; the tab stays.
+    // `kind-alpha` never connects, so the shell fails at once and says why; the tab stays.
     let failed = first.upgrade().unwrap();
     cx.wait_for(t.window, WAIT, move |_, cx| {
         failed.read(cx).tab_status() == TabStatus::Failed
@@ -670,7 +690,7 @@ async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCo
     });
 
     // A cluster switch keeps the shells.
-    t.activate(cx, "beta").await;
+    t.activate(cx, "kind-beta").await;
     cx.run_until_parked();
     assert_eq!(dock_tabs(cx, &t).1.len(), 3);
     let alive = shell.upgrade().expect("the shell tab survives the switch");
@@ -789,11 +809,11 @@ async fn the_tab_list_opens_from_the_keyboard(cx: &mut TestAppContext) {
         .unwrap();
     assert_eq!(entries.len(), 2, "{entries:?}");
     assert!(
-        entries[0].starts_with("web · app — alpha · "),
+        entries[0].starts_with("web · app — kind-alpha · "),
         "{entries:?}"
     );
     assert!(
-        entries[1].starts_with("web · sidecar — alpha · "),
+        entries[1].starts_with("web · sidecar — kind-alpha · "),
         "{entries:?}"
     );
     cx.update_window(t.window, |_, window, cx| {
@@ -847,12 +867,12 @@ async fn a_re_pointed_context_ends_its_shells(cx: &mut TestAppContext) {
     let (id, mut fake) = open_fake_shell(cx, &t);
     assert_eq!(tab_status(cx, &t, id), TabStatus::Live);
     // Another change to the context (its connection) leaves the shell alone.
-    change_cluster(cx, &t, "alpha", |c| {
+    change_cluster(cx, &t, "kind-alpha", |c| {
         c.state = flint_core::ConnectionState::Disconnected
     });
     assert_eq!(tab_status(cx, &t, id), TabStatus::Live);
     assert!(!fake.is_closed());
-    change_cluster(cx, &t, "alpha", |c| {
+    change_cluster(cx, &t, "kind-alpha", |c| {
         c.info.server = Some("https://10.0.0.9:6443".into())
     });
     assert!(fake.is_closed(), "the shell's session ends");
@@ -869,7 +889,7 @@ async fn restarting_waits_for_a_connected_cluster(cx: &mut TestAppContext) {
     fake.set_state(flint_core::ExecState::Exited { code: Some(0) });
     fake.pump();
     cx.run_until_parked();
-    change_cluster(cx, &t, "alpha", |c| {
+    change_cluster(cx, &t, "kind-alpha", |c| {
         c.state = flint_core::ConnectionState::Disconnected
     });
     t.dispatch(cx, "dock::RestartShell", Value::Null).unwrap();
@@ -882,7 +902,7 @@ async fn restarting_waits_for_a_connected_cluster(cx: &mut TestAppContext) {
     assert_eq!(ids, [id], "no new tab");
     assert_eq!(
         refused.as_deref(),
-        Some("Can't restart the shell: alpha is not connected.")
+        Some("Can't restart the shell: kind-alpha is not connected.")
     );
 
     // A failed log tab whose context is gone from kubeconfig: Reconnect is refused the same way.
@@ -945,7 +965,7 @@ async fn the_refresh_key_reaches_refresh_from_a_running_tab(cx: &mut TestAppCont
     let t = open_workspace(cx, dir.path()).await;
     t.open_pods(cx, &[("demo", "web", 1)]).await;
     show_pod(cx, &t, "web").await;
-    // A log tab whose stream is still starting (`alpha` never answers), focused.
+    // A log tab whose stream is still starting (`kind-alpha` never answers), focused.
     t.dispatch(cx, "detail::OpenLogs", Value::Null).unwrap();
     cx.run_until_parked();
     let focus = t.workspace.read_with(cx, |ws, cx| {
@@ -1007,8 +1027,15 @@ async fn dismissing_the_tab_list_gives_focus_back(cx: &mut TestAppContext) {
             press(cx, &t, "escape");
         } else {
             cx.update_window(t.window, |_, window, cx| {
-                // Plain text in the log tab's toolbar: a click there takes no focus itself.
-                window.click("log-count", cx)
+                // Plain text in the log tab's toolbar: a click there takes no focus itself. The
+                // list covers the toolbar's right end, by a width that follows the tab's status
+                // when it opened, so only the start of the status is always clear of it.
+                window.render_frame(cx);
+                let list = window.find("popup-menu").bounds();
+                let offset = gpui_kit::point(gpui_kit::px(1.), gpui_kit::px(1.));
+                let target = window.find("log-state-text").bounds().origin + offset;
+                assert!(!list.contains(&target), "the click lands outside the list");
+                window.click_at("log-state-text", offset, cx)
             })
             .unwrap();
             cx.run_until_parked();
@@ -1169,23 +1196,32 @@ async fn a_burst_of_changes_ends_on_the_latest_state(cx: &mut TestAppContext) {
     let t = open_workspace(cx, dir.path()).await;
     t.model.update(cx, |m, _| {
         for n in 0..40 {
-            m.activate(if n % 2 == 0 { "alpha" } else { "beta" }.into());
+            m.activate(
+                if n % 2 == 0 {
+                    "kind-alpha"
+                } else {
+                    "kind-beta"
+                }
+                .into(),
+            );
         }
     });
     let model = t.model.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
-        model.read(cx).active.as_deref() == Some("beta")
+        model.read(cx).active.as_deref() == Some("kind-beta")
     })
     .await;
-    // beta's server refuses: it settles on failed; alpha's never answers: still connecting.
-    t.wait_for_state(cx, "beta", |s| matches!(s, ConnectionState::Failed(_)))
+    // kind-beta's server refuses: it settles on failed; kind-alpha's never answers: still connecting.
+    t.wait_for_state(cx, "kind-beta", |s| matches!(s, ConnectionState::Failed(_)))
         .await;
-    t.wait_for_state(cx, "alpha", |s| matches!(s, ConnectionState::Connecting))
-        .await;
+    t.wait_for_state(cx, "kind-alpha", |s| {
+        matches!(s, ConnectionState::Connecting)
+    })
+    .await;
     let names: Vec<String> = t.model.read_with(cx, |m, _| {
         m.clusters.iter().map(|c| c.info.name.clone()).collect()
     });
-    assert_eq!(names, ["alpha", "beta"]);
+    assert_eq!(names, ["kind-alpha", "kind-beta"]);
 }
 
 // covers UP-06 (#255): when the active cluster starts over in the core (a newer generation:
@@ -1198,7 +1234,7 @@ async fn a_cluster_that_starts_over_closes_its_views(cx: &mut TestAppContext) {
     t.open_pods(cx, &[("demo", "web", 0)]).await;
     assert!(t.list(cx).is_some());
     t.model.update(cx, |m, cx| {
-        if let Some(c) = m.clusters.iter_mut().find(|c| c.info.name == "alpha") {
+        if let Some(c) = m.clusters.iter_mut().find(|c| c.info.name == "kind-alpha") {
             c.generation += 1;
         }
         cx.notify();

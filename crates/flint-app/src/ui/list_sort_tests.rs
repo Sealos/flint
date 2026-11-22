@@ -81,7 +81,7 @@ async fn a_sort_is_remembered_per_cluster_and_kind(cx: &mut TestAppContext) {
     cx.run_until_parked();
     wait_for_saved(cx, &t, "server:Restarts").await;
     assert_eq!(
-        UiState::load(dir.path().to_owned()).list_sort("alpha", "pods"),
+        UiState::load(dir.path().to_owned()).list_sort("kind-alpha", "pods"),
         Some(&ListSort {
             column: "server:Restarts".into(),
             descending: true,
@@ -144,7 +144,7 @@ async fn a_sort_is_remembered_per_cluster_and_kind(cx: &mut TestAppContext) {
     })
     .await;
     assert_eq!(
-        UiState::load(dir.path().to_owned()).list_sort("alpha", "pods"),
+        UiState::load(dir.path().to_owned()).list_sort("kind-alpha", "pods"),
         None
     );
 }
@@ -156,7 +156,7 @@ async fn a_saved_sort_on_a_column_that_is_gone_keeps_the_default_order(cx: &mut 
     // Saved before a CRD lost its printer column, and a sort on Name for Nodes.
     std::fs::write(
         dir.path().join(STATE_FILE),
-        "[list_sorts.alpha]\n\
+        "[list_sorts.kind-alpha]\n\
          pods = { column = \"server:Gone\", descending = true }\n\
          nodes = { column = \"flint:name\", descending = true }\n",
     )
@@ -250,7 +250,7 @@ async fn a_saved_sort_on_a_wide_column_waits_for_wide(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join(STATE_FILE),
-        "[list_sorts.alpha]\npods = { column = \"server:Node\" }\n",
+        "[list_sorts.kind-alpha]\npods = { column = \"server:Node\" }\n",
     )
     .unwrap();
     let t = open_workspace(cx, dir.path()).await;
@@ -300,7 +300,7 @@ async fn a_saved_sort_waits_while_a_narrow_pane_leaves_its_column_out(cx: &mut T
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join(STATE_FILE),
-        "[list_sorts.alpha]\npods = { column = \"server:Node\" }\n",
+        "[list_sorts.kind-alpha]\npods = { column = \"server:Node\" }\n",
     )
     .unwrap();
     let t = open_workspace(cx, dir.path()).await;
@@ -415,7 +415,7 @@ async fn rows_and_their_sort_arrow_always_agree(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join(STATE_FILE),
-        "[list_sorts.alpha]\npods = { column = \"server:Node\" }\n",
+        "[list_sorts.kind-alpha]\npods = { column = \"server:Node\" }\n",
     )
     .unwrap();
     let t = open_workspace(cx, dir.path()).await;

@@ -9,6 +9,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
 use crate::cluster::{self, ClusterError};
+use crate::connection::policy::CredentialAccess;
+use crate::credential::CredentialSource;
 use kube::config::ExecInteractiveMode;
 
 /// A fake exec auth plugin: a shell script in a scratch directory, which it gets as
@@ -127,6 +129,16 @@ pub(crate) async fn wait_reaped(pid: libc::pid_t) {
 /// Waits until `pid`, started by Flint's child, no longer runs.
 pub(crate) async fn wait_dead(pid: libc::pid_t) {
     wait_until_gone(pid, |pid| !live(pid)).await;
+}
+
+fn always_allowed() -> CredentialGrant {
+    CredentialAccess::always().grant(CredentialSource::Plugin)
+}
+
+/// [`resolve_with_grant`] under the policy every connection has today.
+async fn resolve(config: &mut kube::Config, context: &str) -> Result<Resolved, AuthError> {
+    let grant = CredentialAccess::always().grant(CredentialSource::of(&config.auth_info));
+    resolve_with_grant(config, context, &grant).await
 }
 
 async fn config(kubeconfig: &Kubeconfig) -> kube::Config {
@@ -271,7 +283,7 @@ async fn a_token_without_expiry_is_used_as_it_is() {
 async fn a_plugin_certificate_becomes_the_client_identity() {
     let plugin = printing(r#"{"clientCertificateData":"CERT","clientKeyData":"KEY"}"#);
     let mut config = config(&plugin.kubeconfig("https://127.0.0.1:1")).await;
-    assert!(resolve(&mut config, "ctx").await.unwrap().is_none());
+    assert!(resolve(&mut config, "ctx").await.unwrap().token.is_none());
     let auth = &config.auth_info;
     assert!(auth.exec.is_none(), "kube must not run the plugin again");
     assert_eq!(auth.client_certificate_data.as_deref(), Some("Q0VSVA=="));
@@ -288,7 +300,7 @@ async fn a_kubeconfig_token_wins_over_the_plugin() {
     let mut kubeconfig = plugin.kubeconfig("https://127.0.0.1:1");
     kubeconfig.auth_infos[0].auth_info.as_mut().unwrap().token = Some("t-file".into());
     let mut config = config(&kubeconfig).await;
-    assert!(resolve(&mut config, "ctx").await.unwrap().is_none());
+    assert!(resolve(&mut config, "ctx").await.unwrap().token.is_none());
     assert_eq!(runs(&plugin), 0);
     assert!(config.auth_info.exec.is_some());
 }
@@ -458,7 +470,7 @@ async fn a_helper_holding_the_output_does_not_cost_the_credential() {
     );
     let mut config = config(&plugin.kubeconfig("https://127.0.0.1:1")).await;
     let started = std::time::Instant::now();
-    assert!(resolve(&mut config, "ctx").await.unwrap().is_none());
+    assert!(resolve(&mut config, "ctx").await.unwrap().token.is_none());
     assert!(started.elapsed() >= DRAIN_GRACE);
     assert_eq!(config.auth_info.token.unwrap().expose_secret(), "t-held");
     let helper: libc::pid_t = std::fs::read_to_string(plugin.dir.path().join("child"))
@@ -577,6 +589,7 @@ async fn a_refresh_waiting_for_the_foreground_times_out_without_cooldown() {
     }));
     let token = RefreshingToken(Arc::new(TokenShared {
         state: state.clone(),
+        grant: always_allowed(),
         task: std::sync::Mutex::default(),
     }));
     let waiting_for_foreground = async {
@@ -1043,6 +1056,7 @@ async fn a_refresh_that_died_is_replaced() {
         .shared();
     let _ = died.clone().await;
     let token = RefreshingToken(Arc::new(TokenShared {
+        grant: always_allowed(),
         task: std::sync::Mutex::default(),
         state: Arc::new(tokio::sync::Mutex::new(TokenState {
             context: "ctx".into(),

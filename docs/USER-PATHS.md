@@ -10,6 +10,8 @@ change.
 A path marked **Status: planned** is not built yet. It names the issue and milestone that track it. It does not gate
 an earlier release, and gets no tests until it ships. Its tests must pass in the change that removes the marker.
 
+A path marked **Status: not planned** is kept for reference only. Nothing tracks it and it gets no tests.
+
 ## How paths are tested
 
 The full strategy is in [`TESTING.md`](./TESTING.md).
@@ -173,10 +175,10 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ---
 
 ### UP-17 Agent asks what's wrong
+- **Status:** not planned. The MCP server stays at its six read-only tools ([ADR-0009](./adr/0009-read-only-mcp-server.md)).
 - **When** an agent calls `get_cluster_summary` for an exposed cluster.
 - **Then** it gets the dashboard's problem counts, usage and recent warnings, limited to the cluster's exposure scope
   and redacted, and the call appears in the activity log.
-- Tests: unit, mcp.
 
 ## M1: Browsing resources
 
@@ -202,7 +204,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **When** I open an object.
 - **Then** I see its metadata, labels, owners, conditions, related events, and read-only YAML with syntax highlighting.
   `managedFields` is hidden. An object Argo CD or Flux manages says so in the header, naming the application or
-  Kustomization or HelmRelease, read from its labels and annotations.
+  Kustomization or HelmRelease, read from its labels and annotations. A Secret tracked by Argo CD shows only the tool.
 - Tests: cluster, ui.
 
 ### UP-24 Switch clusters
@@ -275,8 +277,10 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ### UP-33 Use the app from the keyboard
 - **Then** I can move through clusters and lists with the arrow keys, open with Enter, and quit with Cmd-Q. Tab and
   Shift-Tab move focus between the panes: the cluster sidebar, the navigation, the list, the detail pane and the
-  dock's tab (a text field and a shell keep Tab for themselves). The pane with focus shows its cursor with the focus
-  ring. In the sidebar the arrows move between clusters and Enter connects to the one under the cursor. In the
+  dock's tab (a text field and a shell keep Tab for themselves). The header's namespace and watch-mode buttons are not
+  Tab stops; they work by mouse and from the command palette. The namespace picker takes focus as it opens, Tab,
+  Shift-Tab and the arrows go round its controls, and Esc closes it and returns focus to its button; a dialog closes
+  it. The pane with focus shows its cursor with the focus ring. In the sidebar the arrows move between clusters and Enter connects to the one under the cursor. In the
   navigation the arrows move over sections and kinds, Enter opens a kind (its list takes focus) or opens and closes a
   section, Right opens a section and Left closes it (from a kind, its own section). In a list, Cmd-F moves to its text
   filter, and Esc, Enter or Down there moves back to the rows, keeping the filter. With nothing selected, Down also
@@ -294,7 +298,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   new lines, see the previous container's logs, search with highlighted matches and move between them, and pause
   following, with the number of lines held back shown. Scrolling up stops following; scrolling back to the bottom (or
   Jump to Newest Line) follows again; while it does not follow, the toolbar says "Not following" beside Jump. The tab
-  says whether it is connecting, streaming, reconnecting (and which attempt), waiting for a crash-looping container
+  says whether it is connecting, streaming, reconnecting (and which attempt), waiting for a pod that isn't scheduled
+  yet or a container that hasn't started (and why, such as `ImagePullBackOff`), waiting for a crash-looping container
   to restart (back-off) or ended, and why in plain words (no permission, can't reach the API server) with the
   server's text under them; an unreachable node is told apart from an unreachable API server. Once a stream has
   ended there is nothing to pause. A previous instance whose log cannot be read says so (the container may have
@@ -794,10 +799,10 @@ Deferred until cluster sets are scheduled (#199).
 - Tests: unit, ui.
 
 ### UP-115 An agent asks what happened
+- **Status:** not planned. The MCP server stays at its six read-only tools ([ADR-0009](./adr/0009-read-only-mcp-server.md)).
 - **When** an agent queries a recording's time range through MCP on an exposed cluster.
 - **Then** it gets lines, events and metrics for that range, redacted and within the cluster's scope, and the call is
   in the activity log. Unexposed clusters' recordings are invisible to it.
-- Tests: unit, mcp.
 
 ### UP-116 Export a recording
 - **When** I export the last 30 minutes of a recording.

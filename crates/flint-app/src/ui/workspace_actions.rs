@@ -34,21 +34,23 @@ use super::super::registry::{
     EditYaml, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp, FocusFilter, FocusNextPane,
     FocusPreviousPane, FocusSearch, Forward, ForwardCurrent, GoBack, Guards, Hide, HideFromAi,
     HideOthers, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, NextTab, OnView, OpenContainerLogs,
-    OpenContainerShell, OpenLogs, OpenObject, OpenPreviousLogs, OpenSelectorLogs, OpenShell,
-    OpenView, PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs, Refresh, ReloadYamlEdit,
-    RestartShell, RetryConnection, ReviewYamlEdit, SaveLines, SaveLogs, SaveMatchingLines,
-    SaveScope, SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop,
-    SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine,
-    SelectPrev, SelectPrevLine, SelectRow, SelectText, SetDockHeight, SetNamespaces, SetPaneWidth,
-    ShowAll, ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml, SortBy, ToggleAnnotations,
-    ToggleCommandPalette, ToggleLabels, ToggleManagedFields, ToggleNamespace, ToggleNavSection,
-    TogglePause, ToggleResourceSwitcher, ToggleSecretValue, ToggleSources, ToggleTimestamps,
-    ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
+    OpenContainerShell, OpenLogs, OpenObject, OpenPreviousLogs, OpenSelectedRow, OpenSelectorLogs,
+    OpenShell, OpenView, PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs, Refresh,
+    ReloadYamlEdit, RestartShell, RetryConnection, ReviewYamlEdit, SaveLines, SaveLogs,
+    SaveMatchingLines, SaveScope, SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom,
+    ScrollToTop, SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext,
+    SelectNextLine, SelectPrev, SelectPrevLine, SelectRow, SelectText, SetDockHeight,
+    SetNamespaces, SetPaneWidth, ShowAll, ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml,
+    SortBy, ToggleAnnotations, ToggleCommandPalette, ToggleLabels, ToggleManagedFields,
+    ToggleNamespace, ToggleNavSection, TogglePause, ToggleResourceSwitcher, ToggleSecretValue,
+    ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
+    WatchOpenViewsOnly,
 };
+use super::super::registry::{BackToList, EditAiScope, Handler, ShowAgentActivity};
 use super::super::registry::{
-    CordonNode, DeleteObject, DrainNode, RestartObject, ScaleObject, ShowDrainReport, UncordonNode,
+    CordonNode, DeleteObject, DrainNode, NamespacePickerNext, NamespacePickerPrevious,
+    OpenNamespaceFilter, RestartObject, ScaleObject, ShowDrainReport, UncordonNode,
 };
-use super::super::registry::{EditAiScope, ShowAgentActivity};
 use super::super::registry::{
     LockCluster, RenameCluster, TrustCluster, UnlockCluster, UntrustCluster,
 };
@@ -57,7 +59,8 @@ use super::super::scope_picker::ScopePicker;
 use super::super::terminal_view::TerminalView;
 use super::super::ui_state;
 use super::{
-    Pane, Workspace, confirm_expose, confirm_trust, confirm_unlock, expose_dialog, scope_dialog,
+    MainPanes, Pane, Workspace, confirm_expose, confirm_trust, confirm_unlock, expose_dialog,
+    scope_dialog,
 };
 
 /// A guard: the view `$view` returns (`log`, `shell`, `detail` or `list_wide`) is open and,
@@ -72,6 +75,20 @@ macro_rules! view_open {
     };
 }
 
+/// [`Forward`] without the list's Enter: it opens the selected row only when the rows have focus,
+/// so with focus in the navigation or the detail pane the action is not available (and Enter
+/// propagates), rather than reported as done when nothing opens.
+struct NotOnRows<B>(B);
+
+impl<E: InteractiveElement> Bind<ResourceList> for NotOnRows<Forward<E, ResourceList>> {
+    fn bind<A: Action>(self, handler: Handler<ResourceList, A>) -> Self {
+        if std::any::TypeId::of::<A>() == std::any::TypeId::of::<OpenSelectedRow>() {
+            return self;
+        }
+        Self(self.0.bind(handler))
+    }
+}
+
 impl Workspace {
     /// Every workspace action and its handler, for [`Bind`].
     pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
@@ -81,6 +98,7 @@ impl Workspace {
         .bind::<ToggleResourceSwitcher>(Self::toggle_switcher)
         .bind::<OpenObject>(Self::open_object)
         .bind::<GoBack>(Self::go_back)
+        .bind::<BackToList>(Self::back_to_list)
         .bind::<FocusNextPane>(|this, _, window, cx| this.focus_pane(1, window, cx))
         .bind::<FocusPreviousPane>(|this, _, window, cx| this.focus_pane(-1, window, cx))
         .bind::<About>(Self::about)
@@ -134,6 +152,16 @@ impl Workspace {
                 this.set_namespace_filter(Vec::new(), cx)
             }
         })
+        .bind::<OpenNamespaceFilter>(|this, _, _, cx| {
+            this.namespace_popover_open = true;
+            cx.notify();
+        })
+        .bind::<NamespacePickerNext>(|this, _, window, cx| {
+            this.move_in_namespace_picker(true, window, cx)
+        })
+        .bind::<NamespacePickerPrevious>(|this, _, window, cx| {
+            this.move_in_namespace_picker(false, window, cx)
+        })
         .bind::<SetPaneWidth>(Self::set_pane_width)
         .bind::<OpenSelectorLogs>(Self::open_selector_logs)
         .bind::<SetDockHeight>(|this, action, window, cx| match check_dock_height(action) {
@@ -153,7 +181,9 @@ impl Workspace {
     ) -> E {
         let element = Self::bind_actions(OnView::new(element, cx)).into_element();
         let element =
-            ResourceList::bind_actions(Forward::new(element, self.list.as_ref())).into_element();
+            ResourceList::bind_actions(NotOnRows(Forward::new(element, self.list.as_ref())))
+                .0
+                .into_element();
         // The detail pane follows the selected row, which may change between frames.
         let detail = ForwardCurrent::new(element, self, cx, |ws| ws.detail.as_ref());
         let element = DetailView::bind_actions(detail).into_element();
@@ -176,6 +206,7 @@ impl Workspace {
     pub(super) fn guards(this: WeakEntity<Self>) -> Guards<Self> {
         Guards::new(this)
             // macOS has these in its app menu; Linux desktops have nothing they would do.
+            .when::<BackToList>(|ws, cx| ws.main_panes(cx) == MainPanes::DetailAlone)
             .when::<Hide>(|_, _| cfg!(target_os = "macos"))
             .when::<HideOthers>(|_, _| cfg!(target_os = "macos"))
             .when::<ShowAll>(|_, _| cfg!(target_os = "macos"))
@@ -234,6 +265,9 @@ impl Workspace {
                 |_, a, _| check_name::<AddNamespace>(&a.namespace),
             )
             .when::<ShowAllNamespaces>(|ws, _| ws.cluster.is_some())
+            .when::<OpenNamespaceFilter>(|ws, cx| ws.namespace_filter_shown(cx))
+            .when::<NamespacePickerNext>(|ws, _| ws.namespace_popover_open)
+            .when::<NamespacePickerPrevious>(|ws, _| ws.namespace_popover_open)
             .add::<SetPaneWidth>(|_, _| true, |ws, a, _| ws.check_pane_width(a))
             .add::<ToggleNavSection>(
                 |ws, cx| ws.nav.read(cx).has_sections(),
@@ -245,6 +279,7 @@ impl Workspace {
             .when::<SelectFirst>(view_open!(list_wide))
             .when::<SelectLast>(view_open!(list_wide))
             .when::<CloseDetail>(view_open!(list_wide))
+            .when::<OpenSelectedRow>(view_open!(list_wide))
             .when::<FocusFilter>(view_open!(list_wide))
             .when::<ToggleWide>(|ws, cx| list_wide(ws, cx) == Some(true))
             .add::<SelectRow>(view_open!(list_wide), |ws, a, cx| match &ws.list {
@@ -654,6 +689,24 @@ impl Workspace {
     /// Gives focus back after it left with a closed view (or a hidden dock): to the open list,
     /// or the workspace.
     pub(super) fn reclaim_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The picker's focused row left it (a namespace unchecked and not listed): it keeps focus,
+        // and hands it to its first control as it draws. After this draw, since a focus change
+        // during one schedules no frame.
+        if self.namespace_popover_open && self.namespace_filter_shown(cx) {
+            let lost = window.focused(cx);
+            cx.defer_in(window, move |this, window, cx| {
+                if window.focused(cx) != lost {
+                    return;
+                }
+                if this.namespace_popover_open {
+                    window.focus(&this.namespace_picker_focus, cx);
+                    release_unfocused_input(window, cx);
+                } else {
+                    this.reclaim_focus(window, cx);
+                }
+            });
+            return;
+        }
         let focus = match &self.list {
             Some(list) => list.read(cx).focus_handle().clone(),
             None => self.focus.clone(),
@@ -759,7 +812,7 @@ impl Workspace {
         let server = self.pinnable::<UnlockCluster>(&action.cluster, cx)?;
         let why = match self.model.read(cx).protection_of(&action.cluster) {
             Protection::Protected => return Ok(server),
-            Protection::Local => "the cluster is on this machine, so it is not protected",
+            Protection::Local => "the cluster is a known local cluster, so it is not protected",
             Protection::Unlocked => "the cluster is unlocked already",
             Protection::Trusted => "the cluster is trusted, so it is not protected",
         };
@@ -797,7 +850,7 @@ impl Workspace {
         let summary = self.cluster_summary(&action.cluster, cx).expect("checked");
         if model.protection(summary) == Protection::Local {
             return Err(ActionError::rejected::<TrustCluster>(
-                "the cluster is on this machine, so it is not protected",
+                "the cluster is a known local cluster, so it is not protected",
             ));
         }
         match model.trust(summary) {
