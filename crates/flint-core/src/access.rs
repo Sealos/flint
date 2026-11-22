@@ -52,6 +52,9 @@ pub struct AccessCheck {
     pub group: String,
     pub resource: String,
     pub subresource: Option<String>,
+    /// The object asked about. A Role can limit a verb with `resourceNames`, so a request for a
+    /// named object is asked by that name; `None` asks about the resource as a whole.
+    pub name: Option<String>,
     pub verb: String,
 }
 
@@ -178,6 +181,7 @@ fn review_of(check: &AccessCheck) -> SelfSubjectAccessReview {
                 group: Some(check.group.clone()),
                 resource: Some(check.resource.clone()),
                 subresource: check.subresource.clone(),
+                name: check.name.clone(),
                 verb: Some(check.verb.clone()),
                 ..Default::default()
             }),
@@ -253,6 +257,7 @@ mod tests {
             group: "apps".into(),
             resource: "deployments".into(),
             subresource: None,
+            name: None,
             verb: verb.into(),
         }
     }
@@ -296,6 +301,31 @@ mod tests {
             access_of(Some(&status(false, None, Some("webhook failed")))),
             Access::Unknown
         );
+    }
+
+    #[test]
+    fn a_named_check_is_reviewed_by_its_name() {
+        let named = AccessCheck {
+            name: Some("web".into()),
+            ..check("update")
+        };
+        let review = review_of(&named);
+        let attributes = review.spec.resource_attributes.unwrap();
+        assert_eq!(attributes.name.as_deref(), Some("web"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_name_has_its_own_answer() {
+        let cache = AccessCache::default();
+        let (id, asks) = (credential(), AtomicUsize::new(0));
+        let named = AccessCheck {
+            name: Some("web".into()),
+            ..check("update")
+        };
+        counted(&cache, "a", &id, &check("update"), &asks, Access::Forbidden).await;
+        let access = counted(&cache, "a", &id, &named, &asks, Access::Allowed).await;
+        assert_eq!(access, Access::Allowed);
+        assert_eq!(asks.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test(start_paused = true)]

@@ -17,6 +17,9 @@ pub struct AccessPolicy {
     only_namespace: Option<String>,
     /// `(verb, resource or resource/subresource)` refused everywhere.
     denied: Vec<(String, String)>,
+    /// `(verb, resource, name)`: the verb on that resource is allowed for this name only, as a
+    /// Role with `resourceNames` does.
+    named: Vec<(String, String, String)>,
 }
 
 impl AccessPolicy {
@@ -24,13 +27,20 @@ impl AccessPolicy {
     pub fn only_namespace(namespace: &str) -> Self {
         AccessPolicy {
             only_namespace: Some(namespace.to_owned()),
-            denied: Vec::new(),
+            ..AccessPolicy::default()
         }
     }
 
     /// Also refuses `verb` on `resource` (`pods/exec` for a subresource).
     pub fn deny(mut self, verb: &str, resource: &str) -> Self {
         self.denied.push((verb.to_owned(), resource.to_owned()));
+        self
+    }
+
+    /// Allows `verb` on `resource` for the object `name` only.
+    pub fn only_named(mut self, verb: &str, resource: &str, name: &str) -> Self {
+        self.named
+            .push((verb.to_owned(), resource.to_owned(), name.to_owned()));
         self
     }
 
@@ -45,10 +55,14 @@ impl AccessPolicy {
             "" => text("resource").to_owned(),
             sub => format!("{}/{sub}", text("resource")),
         };
-        !self
-            .denied
-            .iter()
-            .any(|(verb, denied)| verb == text("verb") && *denied == resource)
+        let other_name = self.named.iter().any(|(verb, limited, name)| {
+            verb == text("verb") && *limited == resource && name != text("name")
+        });
+        !other_name
+            && !self
+                .denied
+                .iter()
+                .any(|(verb, denied)| verb == text("verb") && *denied == resource)
     }
 }
 

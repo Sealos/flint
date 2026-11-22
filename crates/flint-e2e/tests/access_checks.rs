@@ -9,6 +9,11 @@ use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event
 use flint_core::{Settings, WatchMode};
 use flint_e2e::fake_api::{AccessPolicy, CONTEXT, FakeApiServer, Fault, Gvr};
 
+// The app-level path: ignored by default, as it opens a window.
+#[cfg(target_os = "macos")]
+#[path = "app/access.rs"]
+mod app_access;
+
 const WAIT: Duration = Duration::from_secs(30);
 
 struct Core {
@@ -69,6 +74,7 @@ fn check(namespace: Option<&str>, resource: &str, verb: &str) -> AccessCheck {
         group: "apps".into(),
         resource: resource.into(),
         subresource: None,
+        name: None,
         verb: verb.into(),
     }
 }
@@ -105,6 +111,23 @@ async fn a_namespace_limited_identity_sees_what_it_may_do() {
     let cluster_wide = check(None, "nodes", "patch");
     assert_eq!(core.ask(cluster_wide).await, Access::Forbidden);
     assert!(api.writes().is_empty(), "a check is not a write");
+}
+
+// covers #267: a Role limited by `resourceNames` allows the object it names, though the resource
+// as a whole is refused.
+#[tokio::test]
+async fn a_role_limited_to_one_name_is_asked_by_that_name() {
+    let api = FakeApiServer::start().await.unwrap();
+    api.set_access(AccessPolicy::default().only_named("update", "deployments", "web"));
+    let core = connect(&api).await;
+    let named = |name: &str| AccessCheck {
+        name: Some(name.into()),
+        ..check(Some("demo"), "deployments", "update")
+    };
+    assert_eq!(core.ask(named("web")).await, Access::Allowed);
+    assert_eq!(core.ask(named("api")).await, Access::Forbidden);
+    let unnamed = check(Some("demo"), "deployments", "update");
+    assert_eq!(core.ask(unnamed).await, Access::Forbidden);
 }
 
 // covers #267: the same question is asked once while its answer is fresh.

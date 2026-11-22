@@ -265,7 +265,12 @@ impl DetailView {
                 }
             }
         });
-        let object_access = access::ObjectAccess::new(&object.kind, object.namespace.as_deref());
+        let object_access = access::ObjectAccess::new(
+            &object.kind,
+            object.namespace.as_deref(),
+            &object.name,
+            subject,
+        );
         let mut view = DetailView {
             core,
             object,
@@ -753,21 +758,6 @@ impl DetailView {
                     .into_any_element(),
             );
         }
-        if let Subject::Workload(_) = self.subject {
-            return Some(
-                Button::new("detail-logs")
-                    .xsmall()
-                    .ghost()
-                    .label("Logs")
-                    .tooltip(format!(
-                        "Open the logs of every pod in the dock ({})",
-                        registry::key_hint("secondary-l")
-                    ))
-                    .on_click(registry::on_click(OpenLogs))
-                    .into_any_element(),
-            );
-        }
-        let containers: Vec<PodContainer> = self.log_containers().to_vec();
         let keys = registry::key_hint("secondary-l");
         let button = Button::new("detail-logs").xsmall().ghost().label("Logs");
         // Logs that cannot open (the pod could not be fetched, say) stay, disabled, saying why.
@@ -779,6 +769,15 @@ impl DetailView {
                     .into_any_element(),
             );
         }
+        if let Subject::Workload(_) = self.subject {
+            return Some(
+                button
+                    .tooltip(format!("Open the logs of every pod in the dock ({keys})"))
+                    .on_click(registry::on_click(OpenLogs))
+                    .into_any_element(),
+            );
+        }
+        let containers: Vec<PodContainer> = self.log_containers().to_vec();
         match containers.as_slice() {
             // Still loading: Logs waits for the pod.
             [] => Some(
