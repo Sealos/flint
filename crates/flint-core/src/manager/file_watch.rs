@@ -179,13 +179,14 @@ fn scan_scope(scope: &WatchScope) -> Watched {
 }
 
 type Scan = Box<dyn Fn(&WatchScope) -> Watched + Send>;
+type CaughtUp = Box<dyn Fn(&HashSet<PathBuf>) + Send>;
 
 struct Worker<W> {
     open: Box<dyn FnMut() -> Option<W> + Send>,
     scan: Scan,
     /// Called with the watched directories after they changed, so what was written before the
     /// watches started is read.
-    caught_up: Box<dyn Fn(&HashSet<PathBuf>) + Send>,
+    caught_up: CaughtUp,
     classes: Arc<Classes>,
     watch: Option<W>,
     /// The directories with a working watch.
