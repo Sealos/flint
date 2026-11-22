@@ -909,7 +909,17 @@ fn redact_args(args: &mut [Value]) -> usize {
 /// 253 bytes (no whitespace or control characters, so it cannot forge another line), and one the
 /// credential redactor would touch is left out rather than shown.
 pub fn managed_by_line(object: &Value) -> Option<String> {
-    let mut manager = flint_core::gitops::managed_by_object(object)?.to_string();
+    manager_line(flint_core::gitops::managed_by_object(object)?)
+}
+
+/// [`managed_by_line`] for a Secret, read **before** it is masked: its labels count, and a tracking
+/// id naming this Secret gives the tool only ([`flint_core::gitops::managed_by_secret`]).
+pub fn managed_by_secret_line(unmasked: &Value) -> Option<String> {
+    manager_line(flint_core::gitops::managed_by_secret(unmasked)?)
+}
+
+fn manager_line(manager: flint_core::gitops::ManagedBy) -> Option<String> {
+    let mut manager = manager.to_string();
     (redact_text(&mut manager) == 0).then(|| format!("# managed_by={manager}\n"))
 }
 
@@ -1409,6 +1419,25 @@ mod tests {
         );
         sanitize_secret(&mut labelled);
         assert_eq!(managed_by_line(&labelled), None);
+    }
+
+    // covers UP-10: read before masking, a Secret's own tracking id gives the tool only, and the
+    // output holds no annotation value.
+    #[test]
+    fn managed_by_secret_line_shows_only_the_tool_of_a_tracked_secret() {
+        let id = "plain-value:/Secret:demo/web";
+        let mut secret = serde_json::json!({"apiVersion": "v1", "kind": "Secret", "metadata": {
+            "name": "web", "namespace": "demo",
+            "annotations": {"argocd.argoproj.io/tracking-id": id, "note": "hunter2"},
+        }});
+        let line = managed_by_secret_line(&secret);
+        assert_eq!(line.as_deref(), Some("# managed_by=Argo CD\n"));
+        sanitize_secret(&mut secret);
+        let masked = secret.to_string();
+        assert!(
+            !masked.contains(id) && !masked.contains("hunter2"),
+            "{masked}"
+        );
     }
 
     // covers UP-09, UP-11
