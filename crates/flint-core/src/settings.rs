@@ -610,18 +610,20 @@ fn config_dir_from(
 
 pub fn load_settings(dir: &Path) -> Result<Settings, SettingsError> {
     let path = dir.join(SETTINGS_FILE);
-    let settings = load_toml(&path)?;
+    let Some(text) = read_toml(&path)? else {
+        return Ok(Settings::default());
+    };
+    let settings: Settings = parse_toml(&text, &path)?;
+    // Edits go through the table, and it refuses some values that a skipped unknown key can
+    // hold. A file that cannot be edited is not readable either.
+    let table: toml::Table = parse_toml(&text, &path)?;
     validate(&settings, &path)?;
     // Unknown keys are ignored, so a newer file still loads; a misspelling of a known key
     // (`protect_local_cluster`) would then fail open without a word. Say so in the log.
-    if let Ok(text) = std::fs::read_to_string(&path)
-        && let Ok(table) = toml::from_str::<toml::Table>(&text)
-    {
-        for (unknown, known) in misspelled_keys(&table) {
-            tracing::warn!(
-                "settings.toml: unknown key `{unknown}` is ignored; did you mean `{known}`?"
-            );
-        }
+    for (unknown, known) in misspelled_keys(&table) {
+        tracing::warn!(
+            "settings.toml: unknown key `{unknown}` is ignored; did you mean `{known}`?"
+        );
     }
     Ok(settings)
 }
@@ -1127,22 +1129,34 @@ fn edit_settings(
 }
 
 fn load_toml<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T, SettingsError> {
+    match read_toml(path)? {
+        Some(text) => parse_toml(&text, path),
+        None => Ok(T::default()),
+    }
+}
+
+/// The text of the file at `path`, or `None` if there is no file.
+fn read_toml(path: &Path) -> Result<Option<String>, SettingsError> {
     match std::fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).map_err(|source| SettingsError::Parse {
-            path: path.to_owned(),
-            source,
-        }),
+        Ok(text) => Ok(Some(text)),
         // A missing file is a fresh install. A symlink whose target is missing is not: the
         // user keeps the file elsewhere, and it may have said something (such as
         // `protect_local_clusters`) that defaults would quietly undo.
         Err(e) if e.kind() == io::ErrorKind::NotFound && path.symlink_metadata().is_err() => {
-            Ok(T::default())
+            Ok(None)
         }
         Err(source) => Err(SettingsError::Read {
             path: path.to_owned(),
             source,
         }),
     }
+}
+
+fn parse_toml<T: for<'de> Deserialize<'de>>(text: &str, path: &Path) -> Result<T, SettingsError> {
+    toml::from_str(text).map_err(|source| SettingsError::Parse {
+        path: path.to_owned(),
+        source,
+    })
 }
 
 /// Writes through a temporary file and a rename, so a reader (the MCP server re-reads settings on
@@ -2217,6 +2231,143 @@ mod tests {
         .unwrap();
         let loaded = load_state(dir.path()).unwrap();
         assert!(!loaded.list_sorts["a"]["pods"].descending);
+    }
+
+    /// Pins that would be in effect if the file were taken at its word, followed by `tail`.
+    fn pinned_file(tail: &str) -> String {
+        format!(
+            r#"protect_local_clusters = false
+appearance = "dark"
+
+[[ai_exposed_clusters]]
+context = "staging"
+server = "https://staging.example:6443"
+
+[[trusted_clusters]]
+context = "staging"
+server = "https://staging.example:6443"
+
+{tail}
+"#
+        )
+    }
+
+    /// Every setter, each returning whether it failed.
+    fn setter_results(dir: &Path) -> Vec<(&'static str, bool)> {
+        let server = "https://staging.example:6443";
+        let scope = AiScope::default();
+        vec![
+            // Before `set_ai_exposed`, which hides the cluster this needs exposed.
+            (
+                "set_ai_scope",
+                set_ai_scope(dir, "staging", server, &scope, &scope).is_err(),
+            ),
+            (
+                "set_ai_exposed",
+                set_ai_exposed(dir, "staging", None, &scope).is_err(),
+            ),
+            ("set_trusted", set_trusted(dir, "staging", None).is_err()),
+            (
+                "set_watch_mode",
+                set_watch_mode(dir, None, Some(WatchMode::All)).is_err(),
+            ),
+            (
+                "set_cluster_name",
+                set_cluster_name(dir, "staging", Some("name")).is_err(),
+            ),
+            (
+                "set_cluster_tag",
+                set_cluster_tag(dir, "staging", server, Some(ClusterTag::Blue)).is_err(),
+            ),
+            (
+                "set_appearance",
+                set_appearance(dir, Appearance::Light).is_err(),
+            ),
+            (
+                "set_log_buffer_lines",
+                set_log_buffer_lines(dir, 5000).is_err(),
+            ),
+            ("set_log_buffer_mib", set_log_buffer_mib(dir, 8).is_err()),
+        ]
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_edited_is_unreadable() {
+        for tail in [
+            "future = 9223372036854775808",
+            "[future]\nnested = 9223372036854775808",
+            "[future.deeper]\nlist = [1, 9223372036854775808]",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(SETTINGS_FILE);
+            let text = pinned_file(tail);
+            std::fs::write(&path, &text).unwrap();
+            assert!(toml::from_str::<toml::Table>(&text).is_err(), "{tail}");
+
+            assert!(
+                matches!(load_settings(dir.path()), Err(SettingsError::Parse { .. })),
+                "{tail}"
+            );
+            let (settings, reason) = load_settings_or_fallback(dir.path());
+            assert_eq!(settings, Settings::default().unreadable_fallback());
+            assert!(settings.ai_exposed_clusters.is_empty());
+            assert!(settings.trusted_clusters.is_empty());
+            assert!(settings.protect_local_clusters);
+            let reason = reason.expect("the reason is shown");
+            assert!(!reason.contains("9223372036854775808"), "{reason}");
+
+            for (setter, failed) in setter_results(dir.path()) {
+                assert!(failed, "{setter} on {tail}");
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    text.as_bytes(),
+                    "{setter} on {tail}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn files_readable_both_ways_load_unchanged() {
+        let largest = i64::MAX;
+        for tail in [
+            String::new(),
+            "future = 1".to_owned(),
+            format!("future = {largest}\nbelow = {}", i64::MIN),
+            "created = 2026-11-22T10:30:00Z\nday = 2026-11-22\nat = 10:30:00\nlocal = 2026-11-22T10:30:00.5".to_owned(),
+            "[future.deeper.still]\nratio = 1.5\non = true\nlist = [1, 2, 3]".to_owned(),
+            "[[future]]\nname = \"a\"\n[[future]]\nname = \"b\"\n[future.inner]\nn = 2".to_owned(),
+            "[cluster_names]\nstaging = \"Staging\"\n[cluster_watch_mode]\nstaging = \"all\"".to_owned(),
+            "[[cluster_tags]]\ncontext = \"staging\"\nserver = \"https://staging.example:6443\"\ntag = \"blue\"\nfuture = 2026-11-22".to_owned(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let text = pinned_file(&tail);
+            std::fs::write(dir.path().join(SETTINGS_FILE), &text).unwrap();
+            toml::from_str::<toml::Table>(&text).unwrap();
+            let typed: Settings = toml::from_str(&text).unwrap();
+
+            let loaded = load_settings(dir.path()).unwrap();
+            assert_eq!(loaded, typed, "{tail}");
+            assert_eq!(loaded.ai_exposed_clusters.len(), 1, "{tail}");
+            assert_eq!(loaded.trusted_clusters.len(), 1, "{tail}");
+            assert!(!loaded.protect_local_clusters, "{tail}");
+            assert_eq!(load_settings_or_fallback(dir.path()), (typed, None));
+            for (setter, failed) in setter_results(dir.path()) {
+                assert!(!failed, "{setter} on {tail}");
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!(
+            "log_buffer_lines = {max}\nlog_buffer_mib = {max}\nlog_total_mib = {max}\n",
+            max = u32::MAX
+        );
+        std::fs::write(dir.path().join(SETTINGS_FILE), &text).unwrap();
+        let loaded = load_settings(dir.path()).unwrap();
+        assert_eq!(loaded, toml::from_str::<Settings>(&text).unwrap());
+        assert_eq!(loaded.log_buffer_lines, u32::MAX);
+        assert_eq!(loaded.log_buffer_mib, u32::MAX);
+        assert_eq!(loaded.log_total_mib, u32::MAX);
     }
 
     #[test]
