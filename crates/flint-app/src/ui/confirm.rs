@@ -3,8 +3,11 @@
 //! dialog says (`shown`): GPUI keeps only a builder for a dialog, and nothing can read its text
 //! back.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher as _;
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _};
@@ -40,6 +43,14 @@ const DESCRIPTION_MAX_SHARE: f32 = 0.45;
 const DESCRIPTION_MAX_SHARE_OVER_CONTROLS: f32 = 0.3;
 /// The share of the window's height the pinned lines and the text under them may take together.
 const PINNED_DESCRIPTION_MAX_SHARE: f32 = 0.6;
+/// The same with controls under the text, which need their own room.
+const PINNED_DESCRIPTION_MAX_SHARE_OVER_CONTROLS: f32 = 0.42;
+/// The most characters of a name a dialog title quotes.
+const TITLE_NAME_CHARS: usize = 48;
+/// The most characters of a value a pinned line can show, however narrow they are.
+const MAX_LINE_CHARS: usize = 240;
+/// What a pinned value keeps until its width is known, in the dialog's first frame.
+const FIRST_FRAME_CHARS: usize = 40;
 /// The least height the text under pinned lines keeps, however much they wrap.
 const MIN_TEXT_HEIGHT: f32 = 48.;
 /// How far one arrow key scrolls a long text.
@@ -72,6 +83,19 @@ pub fn open_pinned(
         on_ok(window, cx);
         true
     });
+}
+
+/// [`open_pinned`] with `content` under the text, and an `on_ok` that may keep the dialog open, as
+/// in [`open_with`].
+pub fn open_pinned_with(
+    window: &mut Window,
+    cx: &mut App,
+    dialog: DialogText,
+    pinned: usize,
+    content: AnyView,
+    on_ok: impl Fn(&mut Window, &mut App) -> bool + 'static,
+) {
+    open_dialog(window, cx, dialog, pinned, Some(content), on_ok);
 }
 
 /// [`open`], with `content` (a view of its own, such as pickers) drawn under the text, and an
@@ -107,7 +131,8 @@ fn open_dialog(
             .push(focus.downgrade());
     }
     let (scrolling, target) = split_pinned(&dialog.text, pinned);
-    let (scrolling, target) = (SharedString::from(scrolling), SharedString::from(target));
+    let fitted = Rc::new(RefCell::new(FittedTarget::new(target)));
+    let scrolling = SharedString::from(scrolling);
     let scroll = ScrollHandle::new();
     let text_focus = cx.focus_handle();
     let target_height = Rc::new(Cell::new(px(0.)));
@@ -116,12 +141,19 @@ fn open_dialog(
         // A long text scrolls, so it cannot push the buttons or its last lines out of the dialog.
         let viewport = window.viewport_size().height;
         let text_height = if pinned > 0 {
-            (viewport * PINNED_DESCRIPTION_MAX_SHARE - target_height.get()).max(px(MIN_TEXT_HEIGHT))
+            let share = if content.is_some() {
+                PINNED_DESCRIPTION_MAX_SHARE_OVER_CONTROLS
+            } else {
+                PINNED_DESCRIPTION_MAX_SHARE
+            };
+            (viewport * share - target_height.get()).max(px(MIN_TEXT_HEIGHT))
         } else if content.is_some() {
             viewport * DESCRIPTION_MAX_SHARE_OVER_CONTROLS
         } else {
             viewport * DESCRIPTION_MAX_SHARE
         };
+        // What a pinned line had to shorten is here in full, in the text that scrolls.
+        let body = fitted.borrow().scrolling_text(&scrolling);
         // A Tab stop only when there is something to scroll to.
         let overflows = scroll.max_offset().y > px(0.);
         // The dialog's own background when unfocused, so focus does not move the text.
@@ -140,11 +172,11 @@ fn open_dialog(
                     .id(dialog.id)
                     .aria_label(dialog.text.clone())
                     // First, so that nothing can push it out of the dialog.
-                    .when(!target.is_empty(), |this| {
-                        this.child(pinned_target(target.clone(), target_height.clone()))
+                    .when(pinned > 0, |this| {
+                        this.child(pinned_target(fitted.clone(), target_height.clone()))
                     })
                     // Only the text scrolls: controls under it stay in place and clickable.
-                    .when(!scrolling.is_empty(), |this| {
+                    .when(!body.is_empty(), |this| {
                         this.child(
                             div()
                                 .id("confirm-text")
@@ -164,7 +196,8 @@ fn open_dialog(
                                 .child(
                                     div()
                                         .id("confirm-text-body")
-                                        .child(scrolling.clone())
+                                        .aria_label(body.clone())
+                                        .child(body.clone())
                                         .test_support(),
                                 ),
                         )
@@ -205,18 +238,236 @@ fn split_pinned(text: &str, pinned: usize) -> (String, String) {
     )
 }
 
-/// The lines that stay on show, measured so the text under them takes only the height left.
-fn pinned_target(target: SharedString, height: Rc<Cell<Pixels>>) -> impl IntoElement {
+/// The pinned lines as drawn: each on one line, shortened to the width they were last fitted to.
+struct FittedTarget {
+    full: String,
+    lines: Vec<SharedString>,
+    fitted_to: Option<(Pixels, Pixels)>,
+}
+
+impl FittedTarget {
+    fn new(full: String) -> Self {
+        let lines = fit_lines(&full, |line| line.chars().count() <= FIRST_FRAME_CHARS);
+        Self {
+            full,
+            lines,
+            fitted_to: None,
+        }
+    }
+
+    fn is_cut(&self) -> bool {
+        self.full.lines().ne(self.lines.iter().map(|l| l.as_ref()))
+    }
+
+    /// `text`, followed by the pinned lines in full when one of them is shortened.
+    fn scrolling_text(&self, text: &SharedString) -> SharedString {
+        match (self.is_cut(), text.is_empty()) {
+            (false, _) => text.clone(),
+            (true, true) => format!("Full target:\n{}", self.full).into(),
+            (true, false) => format!("{text}\n\nFull target:\n{}", self.full).into(),
+        }
+    }
+
+    /// Fits the lines to `width` in the text style being drawn; whether they changed.
+    fn fit(&mut self, width: Pixels, window: &Window) -> bool {
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        if self.fitted_to == Some((width, font_size)) {
+            return false;
+        }
+        self.fitted_to = Some((width, font_size));
+        let lines = fit_lines(&self.full, |line| {
+            let run = style.to_run(line.len());
+            let shaped =
+                window
+                    .text_system()
+                    .shape_line(line.to_owned().into(), font_size, &[run], None);
+            shaped.width <= width
+        });
+        let changed = lines != self.lines;
+        self.lines = lines;
+        changed
+    }
+}
+
+fn fit_lines(text: &str, fits: impl Fn(&str) -> bool) -> Vec<SharedString> {
+    text.lines().map(|l| fit_line(l, &fits).into()).collect()
+}
+
+/// `line` (`Label: value`) as it fits. Only the part that can lose its middle does: an object's
+/// name, under its whole kind, and a server's host (or path), between its scheme and port.
+fn fit_line(line: &str, fits: &impl Fn(&str) -> bool) -> String {
+    let Some((label, value)) = line.split_once(": ") else {
+        return fit_value("", line, fits);
+    };
+    let prefix = format!("{label}: ");
+    let kept = match label {
+        "Object" => fit_object(&prefix, value, fits),
+        "Server" => fit_server(&prefix, value, fits),
+        _ => None,
+    };
+    // Only when what must stay whole is itself wider than the line.
+    kept.unwrap_or_else(|| fit_value(&prefix, value, fits))
+}
+
+/// `Object: kind name`, with the whole kind; `None` if the kind alone does not fit.
+fn fit_object(prefix: &str, value: &str, fits: &impl Fn(&str) -> bool) -> Option<String> {
+    let (kind, name) = value.split_once(' ')?;
+    fit_around(&format!("{prefix}{kind} "), name, "", 0, value, fits)
+}
+
+/// `Server: scheme://host:port/path`, with the whole scheme and port. A long path loses its middle
+/// while the host fits; after that the path is left out and the host loses its middle, keeping
+/// its last two labels as far as they fit. `None` for anything that is not such a URL.
+fn fit_server(prefix: &str, value: &str, fits: &impl Fn(&str) -> bool) -> Option<String> {
+    let (scheme, rest) = value.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(end);
+    let port_at = authority
+        .rfind(':')
+        .filter(|&at| {
+            let port = &authority[at + 1..];
+            !port.is_empty() && port.chars().all(|c| c.is_ascii_digit())
+        })
+        .unwrap_or(authority.len());
+    let (host, port) = authority.split_at(port_at);
+    let start = format!("{prefix}{scheme}://");
+    if !path.is_empty()
+        && let Some(line) = fit_around(&format!("{start}{authority}"), path, "", 0, value, fits)
+    {
+        return Some(line);
+    }
+    let end = if path.is_empty() {
+        port.to_owned()
+    } else {
+        format!("{port}/…")
+    };
+    let last_labels = host
+        .rmatch_indices('.')
+        .nth(1)
+        .map_or(host, |(at, _)| &host[at..]);
+    let min_tail = escaped_parts(last_labels).len();
+    fit_around(&start, host, &end, min_tail, value, fits)
+}
+
+/// `prefix` and the most of `value` that `fits`, keeping its start and end around a short code of
+/// the whole value: two long values that differ only in the part left out still read differently.
+/// `value` is already escaped ([`flint_core::display::single_line`]); no escape is cut.
+fn fit_value(prefix: &str, value: &str, fits: &impl Fn(&str) -> bool) -> String {
+    fit_around(prefix, value, "", 0, value, fits)
+        .unwrap_or_else(|| format!("{prefix}…#{}…", value_code(value)))
+}
+
+/// `prefix`, the most of `middle` that fits, and `suffix`, with a code of `whole` where `middle`
+/// is cut. The end of `middle` keeps at least `min_tail` parts when that many fit. `None` if
+/// `prefix`, the code and `suffix` alone do not fit.
+fn fit_around(
+    prefix: &str,
+    middle: &str,
+    suffix: &str,
+    min_tail: usize,
+    whole: &str,
+    fits: &impl Fn(&str) -> bool,
+) -> Option<String> {
+    let parts = escaped_parts(middle);
+    let uncut = format!("{prefix}{middle}{suffix}");
+    if parts.len() <= MAX_LINE_CHARS && fits(&uncut) {
+        return Some(uncut);
+    }
+    let code = value_code(whole);
+    let cut = |kept: usize| {
+        let tail = (kept / 2).max(min_tail).min(kept.saturating_sub(1));
+        format!(
+            "{prefix}{}…#{code}…{}{suffix}",
+            parts[..kept - tail].concat(),
+            parts[parts.len() - tail..].concat()
+        )
+    };
+    if !fits(&cut(0)) {
+        return None;
+    }
+    // The most parts that fit, by bisection: at most `high` are kept.
+    let (mut low, mut high) = (0, parts.len().saturating_sub(1).min(MAX_LINE_CHARS));
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if fits(&cut(mid)) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Some(cut(low))
+}
+
+/// `value` in the pieces that may be cut between: a character, or a whole escape.
+fn escaped_parts(value: &str) -> Vec<&str> {
+    let mut parts = Vec::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(first) = rest.chars().next() {
+        let len = if rest.starts_with("\\\\") {
+            2
+        } else if rest.starts_with("\\u{") {
+            rest.find('}').map_or(first.len_utf8(), |end| end + 1)
+        } else {
+            first.len_utf8()
+        };
+        let (part, after) = rest.split_at(len);
+        parts.push(part);
+        rest = after;
+    }
+    parts
+}
+
+/// A short code of `value`, the same for the life of this process. Keyed per process, so a name
+/// cannot be crafted ahead of time to show another name's code.
+fn value_code(value: &str) -> String {
+    static KEY: OnceLock<RandomState> = OnceLock::new();
+    format!(
+        "{:08x}",
+        KEY.get_or_init(RandomState::new).hash_one(value) as u32
+    )
+}
+
+/// An already escaped name as a dialog title quotes it: bounded, so the title leaves room for
+/// the pinned lines, with its start and end kept.
+pub fn title_name(name: &str) -> String {
+    fit_value("", name, &|shown: &str| {
+        shown.chars().count() <= TITLE_NAME_CHARS
+    })
+}
+
+/// The lines that stay on show, each on one line, measured so the text under them takes only the
+/// height left.
+fn pinned_target(fitted: Rc<RefCell<FittedTarget>>, height: Rc<Cell<Pixels>>) -> impl IntoElement {
+    let lines = fitted.borrow().lines.clone();
     div()
         .id("confirm-target")
         .relative()
         .flex_none()
+        .w_full()
         .mb_2()
-        .child(target)
+        .children(lines.into_iter().enumerate().map(|(i, line)| {
+            div()
+                .id(("confirm-target-line", i))
+                .flex()
+                .w_full()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .id(("confirm-target-text", i))
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .aria_label(line.clone())
+                        .child(line)
+                        .test_support(),
+                )
+                .test_support()
+        }))
         .child(
             canvas(
                 move |bounds, window, _| {
-                    if height.replace(bounds.size.height) != bounds.size.height {
+                    let refit = fitted.borrow_mut().fit(bounds.size.width, window);
+                    if height.replace(bounds.size.height) != bounds.size.height || refit {
                         window.on_next_frame(|window, _| window.refresh());
                     }
                 },
@@ -373,6 +624,76 @@ pub fn shown(window: &mut Window, cx: &mut App) -> Option<DialogText> {
     Some(shown)
 }
 
+/// Asserts each of the `count` pinned lines is whole, inside the open dialog and above its
+/// buttons, with the buttons on screen, and returns the lines as drawn.
+#[cfg(test)]
+pub(in crate::ui) fn assert_pinned_lines_fit(
+    window: &mut Window,
+    count: usize,
+    height: Pixels,
+) -> Vec<String> {
+    use gpui_kit::test::TestWindowExt as _;
+
+    let surface = window.find("surface").bounds();
+    let (ok, cancel) = (window.find("ok").bounds(), window.find("cancel").bounds());
+    for button in [ok, cancel] {
+        assert!(
+            button.origin.y >= surface.origin.y && button.bottom() <= surface.bottom().min(height),
+            "{button:?} inside {surface:?}"
+        );
+    }
+    assert!(window.try_find(("confirm-target-line", count)).is_none());
+    (0..count)
+        .map(|i| {
+            let line = window.find(("confirm-target-line", i)).bounds();
+            let text = window.find(("confirm-target-text", i));
+            let drawn = text.bounds();
+            assert!(line.size.height > px(0.), "line {i}: {line:?}");
+            assert!(line.size.height < px(32.), "line {i} is one line: {line:?}");
+            assert!(line.origin.y >= surface.origin.y, "{line:?} in {surface:?}");
+            assert!(line.bottom() <= ok.origin.y, "{line:?} above {ok:?}");
+            assert!(line.origin.x >= surface.origin.x, "{line:?} in {surface:?}");
+            assert!(line.right() <= surface.right(), "{line:?} in {surface:?}");
+            assert!(
+                drawn.right() <= line.right(),
+                "{drawn:?} clipped by {line:?}"
+            );
+            text.label()
+                .expect("a pinned line says its text")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Asserts Tab reaches the open dialog's scrolling text and End shows the last of it, where the
+/// full target lines are.
+#[cfg(test)]
+pub(in crate::ui) fn assert_full_text_reachable(window: &mut Window, cx: &mut App) {
+    use gpui_kit::test::TestWindowExt as _;
+
+    for _ in 0..8 {
+        window.render_frame(cx);
+        if window.find("confirm-text").focused() == Some(true) {
+            break;
+        }
+        window.press("tab", cx);
+    }
+    assert_eq!(window.find("confirm-text").focused(), Some(true));
+    window.press("end", cx);
+    window.render_frame(cx);
+    window.render_frame(cx);
+    let view = window.find("confirm-text").bounds();
+    let body = window.find("confirm-text-body").bounds();
+    assert!(
+        body.origin.y < view.origin.y,
+        "{body:?} scrolled in {view:?}"
+    );
+    assert!(
+        body.bottom() <= view.bottom() + px(2.),
+        "{body:?} ends in {view:?}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use gpui_kit::test::TestWindowExt as _;
@@ -383,7 +704,9 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use super::{DialogText, open, scrolled_to, shown, split_pinned};
+    use super::{
+        DialogText, escaped_parts, fit_line, open, scrolled_to, shown, split_pinned, title_name,
+    };
     use crate::ui::registry;
 
     fn text(title: &str) -> DialogText {
@@ -443,6 +766,78 @@ mod tests {
         );
         assert_eq!(split(0).1, "");
         assert_eq!(split(9).0, "");
+    }
+
+    // A shortened value keeps both ends and a code of the whole, and never halves an escape.
+    #[test]
+    fn a_long_value_keeps_both_ends_and_whole_escapes() {
+        let fits = |line: &str| line.chars().count() <= 40;
+        let long = |middle: &str| format!("start-{}{middle}{}-end", "x".repeat(99), "y".repeat(99));
+        let one = fit_line(&format!("Context: {}", long("a")), &fits);
+        let two = fit_line(&format!("Context: {}", long("b")), &fits);
+        assert!(
+            one.starts_with("Context: start") && one.ends_with("-end"),
+            "{one}"
+        );
+        assert!(one.chars().count() <= 40, "{one}");
+        assert_ne!(one, two);
+        assert_eq!(fit_line("Server: short", &fits), "Server: short");
+
+        let escapes = "\\u{202e}\\\\".repeat(50);
+        assert_eq!(escaped_parts("a\\u{a}\\\\b"), ["a", "\\u{a}", "\\\\", "b"]);
+        let cut = fit_line(&format!("Object: {escapes}"), &fits);
+        let (head, rest) = cut["Object: ".len()..].split_once('…').unwrap();
+        let tail = rest.split_once('…').unwrap().1;
+        for side in [head, tail] {
+            assert!(escaped_parts(side).iter().all(|p| p.len() > 1), "{cut}");
+        }
+        assert!(title_name(&long("a")).chars().count() <= 48);
+        assert_eq!(title_name("web"), "web");
+    }
+
+    // A server keeps its scheme, port and the end of its host; an object its whole kind.
+    #[test]
+    fn identifying_parts_of_a_line_stay_whole() {
+        let fits = |line: &str| line.chars().count() <= 52;
+        let host = "s".repeat(300);
+        let server = fit_line(
+            &format!("Server: https://{host}.example.invalid:6443"),
+            &fits,
+        );
+        assert!(server.starts_with("Server: https://s"), "{server}");
+        assert!(server.ends_with(".example.invalid:6443"), "{server}");
+        let ipv6 = fit_line(
+            &format!("Server: https://[{}::1]:6443", "a:".repeat(99)),
+            &fits,
+        );
+        assert!(ipv6.ends_with("::1]:6443"), "{ipv6}");
+        let path = fit_line(
+            &format!(
+                "Server: https://api.example.invalid:6443/k8s/{}/end",
+                "p".repeat(300)
+            ),
+            // Room for the host, the code and both ends of the path.
+            &|line: &str| line.chars().count() <= 64,
+        );
+        assert!(
+            path.starts_with("Server: https://api.example.invalid:6443/"),
+            "{path}"
+        );
+        assert!(path.ends_with("/end"), "{path}");
+        let long_both = fit_line(
+            &format!(
+                "Server: https://{host}.example.invalid:6443/{}",
+                "p".repeat(300)
+            ),
+            &fits,
+        );
+        assert!(long_both.ends_with(":6443/…"), "{long_both}");
+        let object = fit_line(
+            &format!("Object: deployments.apps {}", "o".repeat(300)),
+            &fits,
+        );
+        assert!(object.starts_with("Object: deployments.apps o"), "{object}");
+        assert!(object.ends_with('o'), "{object}");
     }
 
     // The keys move a long text within its range, and leave every other key alone.

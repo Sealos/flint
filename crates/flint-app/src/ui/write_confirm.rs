@@ -6,7 +6,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use flint_core::CoreHandle;
-use flint_core::display::ClusterNames;
+use flint_core::display::{ClusterNames, single_line};
 use flint_core::write::{
     ResourceChange, WriteAction, WriteError, WriteOutcome, WriteReview, WriteTarget, WriteWarning,
 };
@@ -195,7 +195,12 @@ fn dialog_text_saying(
     }
     lines.extend(target_lines(target));
     DialogText {
-        title: format!("{} {} on {shown}?", wording.title, target.name),
+        title: format!(
+            "{} {} on {}?",
+            wording.title,
+            confirm::title_name(&single_line(&target.name)),
+            confirm::title_name(shown)
+        ),
         text: lines.join("\n"),
         ok: wording.ok.to_owned(),
         cancel: "Cancel".to_owned(),
@@ -204,25 +209,24 @@ fn dialog_text_saying(
     }
 }
 
-/// Exactly which object on which cluster: the lines a confirmation always keeps on show.
-fn target_lines(target: &WriteTarget) -> Vec<String> {
+/// Exactly which object on which cluster: the lines a confirmation always keeps on show, one
+/// each, whatever the names hold.
+pub(in crate::ui) fn target_lines(target: &WriteTarget) -> Vec<String> {
+    let server = target
+        .server
+        .as_deref()
+        .map_or("no server".to_owned(), flint_core::redact::server_url);
     let mut lines = vec![
-        format!(
-            "Context: {}",
-            flint_core::display::single_line(&target.cluster)
-        ),
-        format!(
-            "Server: {}",
-            target
-                .server
-                .as_deref()
-                .map_or("no server".to_owned(), flint_core::redact::server_url)
-        ),
+        format!("Context: {}", single_line(&target.cluster)),
+        format!("Server: {}", single_line(&server)),
     ];
     if let Some(namespace) = &target.namespace {
-        lines.push(format!("Namespace: {namespace}"));
+        lines.push(format!("Namespace: {}", single_line(namespace)));
     }
-    lines.push(format!("Object: {} {}", target.kind, target.name));
+    lines.push(format!(
+        "Object: {}",
+        single_line(&format!("{} {}", target.kind, target.name))
+    ));
     lines
 }
 
@@ -254,8 +258,7 @@ pub fn open_noted(
         &saying,
         &shown,
     );
-    // Counted as drawn, so the whole target stays pinned however its lines come out.
-    let pinned = target_lines(review.target()).join("\n").lines().count();
+    let pinned = target_lines(review.target()).len();
     let confirmed = confirmation(core, review, begin, on_done);
     confirm::open_pinned(window, cx, text, pinned, move |_, cx| confirmed(cx));
 }
@@ -395,6 +398,140 @@ mod tests {
             "{shown:?} above {ok:?} in {surface:?}"
         );
         assert!(ok.bottom() <= surface.bottom().min(px(height)), "{ok:?}");
+    }
+
+    /// Opens the confirmation of a change to `target` at the minimum window and returns its
+    /// pinned lines as drawn, after checking they fit.
+    fn drawn_lines(
+        cx: &mut TestAppContext,
+        t: &crate::ui::support_tests::TestWorkspace,
+        target: &WriteTarget,
+    ) -> Vec<String> {
+        use gpui_kit::component::WindowExt as _;
+
+        let (width, height) = MIN_WINDOW_SIZE;
+        VisualTestContext::from_window(t.window, cx).simulate_resize(size(px(width), px(height)));
+        let names = ClusterNames::new([&*target.cluster], &BTreeMap::new());
+        let text = dialog_text(target, APPLY, &[], &names.with_real(&target.cluster));
+        let pinned = super::target_lines(target).len();
+        cx.update_window(t.window, |_, window, cx| {
+            confirm::open_pinned(window, cx, text, pinned, |_, _| {})
+        })
+        .unwrap();
+        for _ in 0..4 {
+            cx.run_until_parked();
+            cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        }
+        let lines = cx
+            .update_window(t.window, |_, window, _| {
+                confirm::assert_pinned_lines_fit(window, pinned, px(height))
+            })
+            .unwrap();
+        // The whole of every value stays in the dialog's text that scrolls.
+        let body = cx
+            .update_window(t.window, |_, window, _| {
+                window.find("confirm-text-body").label().map(str::to_owned)
+            })
+            .unwrap();
+        if lines != super::target_lines(target) {
+            let body = body.expect("a shortened line is in the text in full");
+            for line in super::target_lines(target) {
+                assert!(body.contains(&line), "{line} in the full text");
+            }
+            cx.update_window(t.window, |_, window, cx| {
+                confirm::assert_full_text_reachable(window, cx);
+                confirm::assert_pinned_lines_fit(window, pinned, px(height));
+            })
+            .unwrap();
+        }
+        cx.update_window(t.window, |_, window, cx| window.close_dialog(cx))
+            .unwrap();
+        cx.run_until_parked();
+        lines
+    }
+
+    // At the minimum window, every target line stays whole on one line, for very long names of
+    // every kind, and names differing only in the middle or at the end still read differently.
+    #[gpui_kit::test]
+    async fn every_target_line_fits_for_long_names(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        for len in [600, 5_000] {
+            let on = WriteTarget {
+                cluster: "c".repeat(len).as_str().into(),
+                ..target()
+            };
+            assert_eq!(drawn_lines(cx, &t, &on).len(), 4);
+        }
+        let long = WriteTarget {
+            cluster: "ctx-".repeat(150).as_str().into(),
+            server: Some(format!("https://{}.example.invalid:6443", "s".repeat(600))),
+            namespace: Some("n".repeat(600)),
+            name: "o".repeat(600),
+            ..target()
+        };
+        let lines = drawn_lines(cx, &t, &long);
+        assert!(lines[1].ends_with(".example.invalid:6443"), "{}", lines[1]);
+        assert!(
+            lines[3].starts_with("Object: deployments.apps"),
+            "{}",
+            lines[3]
+        );
+
+        let context = |middle: &str, end: &str| {
+            format!("{}{middle}{}{end}", "a".repeat(300), "b".repeat(300))
+        };
+        let shown = |cx: &mut TestAppContext, cluster: String| {
+            let on = WriteTarget {
+                cluster: cluster.as_str().into(),
+                ..target()
+            };
+            drawn_lines(cx, &t, &on).remove(0)
+        };
+        let base = shown(cx, context("1", "x"));
+        assert_ne!(base, shown(cx, context("2", "x")), "differs in the middle");
+        assert_ne!(base, shown(cx, context("1", "y")), "differs at the end");
+    }
+
+    // Targets that differ only in kind, port or the end of the host read differently, in the
+    // part that differs and not only in the code of the whole value.
+    #[gpui_kit::test]
+    async fn targets_differing_in_kind_port_or_host_end_read_differently(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        let server = |end: &str| Some(format!("https://{}{end}", "s".repeat(600)));
+        let on = |server, kind| WriteTarget {
+            server,
+            kind,
+            name: "o".repeat(600),
+            ..target()
+        };
+        let apps = || KindId::new("apps", "deployments");
+        let base = drawn_lines(cx, &t, &on(server(".example.invalid:6443"), apps()));
+        let port = drawn_lines(cx, &t, &on(server(".example.invalid:6444"), apps()));
+        let host = drawn_lines(cx, &t, &on(server(".example.invalie:6443"), apps()));
+        let kind = drawn_lines(
+            cx,
+            &t,
+            &on(
+                server(".example.invalid:6443"),
+                KindId::new("apps", "statefulsets"),
+            ),
+        );
+        assert!(base[1].ends_with(".example.invalid:6443"), "{}", base[1]);
+        assert!(port[1].ends_with(".example.invalid:6444"), "{}", port[1]);
+        assert!(host[1].ends_with(".example.invalie:6443"), "{}", host[1]);
+        assert!(
+            base[3].starts_with("Object: deployments.apps o"),
+            "{}",
+            base[3]
+        );
+        assert!(
+            kind[3].starts_with("Object: statefulsets.apps o"),
+            "{}",
+            kind[3]
+        );
     }
 
     // covers UP-55: a context name stays on its own line.
