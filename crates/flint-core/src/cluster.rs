@@ -262,15 +262,12 @@ impl ClusterError {
         })
     }
 
-    /// What an AI agent reads (the MCP server): like [`ClusterError::summary`], but text from
-    /// the server or kube keeps its quoted values (an agent needs the names to act). It is
-    /// redacted whole and only then cut to one line of at most 300 characters, so a server
-    /// cannot hand it a long, multi-line message.
+    /// Error text for MCP replies. Bounded messages keep quoted names and have credentials
+    /// redacted before the first line is shortened.
     pub fn for_agent(&self) -> String {
         match self {
-            ClusterError::Kube(_) | ClusterError::Api(_) | ClusterError::Config { .. } => {
-                agent_line(&redact::redact_credentials(&self.to_string()).text)
-            }
+            ClusterError::Kube(message) | ClusterError::Api(message) => agent_error_text(message),
+            ClusterError::Config { .. } => agent_error_text(&self.to_string()),
             other => other.to_string(),
         }
     }
@@ -327,6 +324,16 @@ impl ClusterError {
 /// How much of a server's or kube's text the app shows, and an agent reads.
 const SHOWN_CHARS: usize = 200;
 const AGENT_CHARS: usize = 300;
+const AGENT_BYTES: usize = 4 * 1024;
+
+fn agent_error_text(message: &str) -> String {
+    // A clipped credential can lose the suffix that identifies it, and redaction can bring
+    // the exposed prefix into the visible line, so a longer message is not clipped and shown.
+    if message.len() > AGENT_BYTES {
+        return "Error details omitted because the message is too long".to_owned();
+    }
+    agent_line(&redact::redact_credentials(message).text)
+}
 
 /// The first line of redacted `text`, cut to [`AGENT_CHARS`] (with `…`). A `[REDACTED:<kind>]`
 /// marker across the cut goes whole.
@@ -975,8 +982,48 @@ mod tests {
 
     #[test]
     fn agent_text_is_one_line_of_a_tidied_block() {
-        let message = "denied\n-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----";
-        assert_eq!(ClusterError::Kube(message.into()).for_agent(), "denied");
+        let message = "YWJjZGVmZ2hpamtsbW5vcA==\n-----END PRIVATE KEY-----\ndenied";
+        assert_eq!(
+            ClusterError::Kube(message.into()).for_agent(),
+            "[REDACTED:private-key]"
+        );
+    }
+
+    #[test]
+    fn agent_text_hides_credentials_across_the_byte_bound() {
+        let url = "postgres://admin:";
+        let credential = "qéwerty-example-value";
+        for offset in [1, 2, 3, 8, 17] {
+            let pad = AGENT_BYTES - offset - url.len() - "password= ".len();
+            let start = format!("password={} ", "x".repeat(pad));
+            let short = redact::redact_credentials(&start);
+            assert!(short.text.chars().count() + url.len() + offset < AGENT_CHARS);
+            assert_eq!(start.len() + url.len() + offset, AGENT_BYTES);
+            let message = format!("{start}{url}{credential}@db.internal/app");
+            let shown = ClusterError::Api(message).for_agent();
+            assert!(!shown.contains('q'), "offset {offset}: {shown}");
+        }
+    }
+
+    #[test]
+    fn agent_text_limits_work_on_a_malformed_cookie_list() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut body = String::from("Cookie: [");
+            const MARKER: &str = "[REDACTED:";
+            const BODY_BYTES: usize = 1024 * 1024;
+            body.push_str(&MARKER.repeat((BODY_BYTES - body.len()).div_ceil(MARKER.len())));
+            body.truncate(BODY_BYTES);
+            let bounded = ClusterError::Api(body[..AGENT_BYTES].to_owned()).for_agent();
+            let oversized = ClusterError::Api(body).for_agent();
+            tx.send((bounded, oversized)).unwrap();
+        });
+        let (bounded, oversized) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(bounded.chars().count() <= AGENT_CHARS + 1);
+        assert_eq!(
+            oversized,
+            "Error details omitted because the message is too long"
+        );
     }
 
     // covers UP-04, UP-10
