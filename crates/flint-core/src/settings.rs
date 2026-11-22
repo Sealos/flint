@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::thresholds::{self, ThresholdMetric, ThresholdSettings, Thresholds};
+
 pub const SETTINGS_FILE: &str = "settings.toml";
 pub const STATE_FILE: &str = "state.toml";
 
@@ -349,6 +351,11 @@ pub struct Settings {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub cluster_tags: Vec<TaggedCluster>,
+    /// Dashboard warning thresholds (ADR-0017): global values and overrides per context and
+    /// server. Read them through [`Settings::thresholds_for`]. A value this version cannot use
+    /// falls back on its own and is logged when the file loads.
+    #[serde(skip_serializing_if = "ThresholdSettings::is_empty")]
+    pub thresholds: ThresholdSettings,
     /// Lines each log session keeps; older lines are dropped. Applies to sessions opened after
     /// a change. Read it through [`Settings::log_buffer_limit`].
     pub log_buffer_lines: u32,
@@ -376,6 +383,7 @@ impl Default for Settings {
             cluster_watch_mode: BTreeMap::new(),
             cluster_names: BTreeMap::new(),
             cluster_tags: Vec::new(),
+            thresholds: ThresholdSettings::default(),
             log_buffer_lines: DEFAULT_LOG_BUFFER_LINES,
             log_buffer_mib: DEFAULT_LOG_BUFFER_MIB,
             log_total_mib: DEFAULT_LOG_TOTAL_MIB,
@@ -469,6 +477,12 @@ impl Settings {
             .iter()
             .find(|e| e.context == context && same_server(&e.server, server))
             .map(|e| e.tag)
+    }
+
+    /// The dashboard thresholds in force for `context` at `server`. A context with no server gets
+    /// the global values.
+    pub fn thresholds_for(&self, context: &str, server: Option<&str>) -> Thresholds {
+        self.thresholds.for_cluster(context, server)
     }
 
     /// What applies while `settings.toml` cannot be read, keeping the harmless parts of `self`
@@ -622,6 +636,11 @@ pub fn load_settings(dir: &Path) -> Result<Settings, SettingsError> {
                 "settings.toml: unknown key `{unknown}` is ignored; did you mean `{known}`?"
             );
         }
+        if let Some(section) = table.get(thresholds::SECTION_KEY) {
+            for issue in ThresholdSettings::from_toml(section).1 {
+                tracing::warn!("settings.toml: {issue}");
+            }
+        }
     }
     Ok(settings)
 }
@@ -679,6 +698,7 @@ const SETTINGS_KEYS: &[&str] = &[
     "cluster_watch_mode",
     "cluster_names",
     "cluster_tags",
+    thresholds::SECTION_KEY,
     "log_buffer_lines",
     "log_buffer_mib",
     "log_total_mib",
@@ -1070,6 +1090,36 @@ pub fn set_cluster_tag(
     })
 }
 
+/// Sets one dashboard threshold, globally (`cluster` is `None`) or for a context at one server,
+/// and writes `settings.toml`. `value` `None` clears it, so it follows the next level down;
+/// clearing what is not set writes nothing. A value out of range, or a `thresholds` section of
+/// the wrong shape, is an error and leaves the file as it is. Returns the settings as written.
+pub fn set_threshold(
+    dir: &Path,
+    cluster: Option<&ClusterPin>,
+    metric: ThresholdMetric,
+    value: Option<u32>,
+) -> Result<Settings, SettingsError> {
+    let path = dir.join(SETTINGS_FILE);
+    let invalid = |path: &Path, error: thresholds::ThresholdWriteError| SettingsError::Invalid {
+        path: path.to_owned(),
+        reason: error.to_string(),
+    };
+    if value.is_none() {
+        let mut table: toml::Table = load_toml(&path)?;
+        let changed = thresholds::write_value(&mut table, cluster, metric, None)
+            .map_err(|e| invalid(&path, e))?;
+        if !changed {
+            return load_settings(dir);
+        }
+    }
+    edit_settings(dir, |table, path| {
+        thresholds::write_value(table, cluster, metric, value)
+            .map(drop)
+            .map_err(|e| invalid(path, e))
+    })
+}
+
 /// Sets the appearance and writes `settings.toml`. Returns the settings as written.
 pub fn set_appearance(dir: &Path, appearance: Appearance) -> Result<Settings, SettingsError> {
     edit_settings(dir, |table, _| {
@@ -1308,6 +1358,186 @@ mod cluster_tag_tests {
     #[test]
     fn cluster_tags_is_a_known_key() {
         let table: toml::Table = toml::from_str("cluster_tags = []").unwrap();
+        assert!(misspelled_keys(&table).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod threshold_settings_tests {
+    use super::*;
+    use crate::thresholds::ThresholdMetric::{CpuPercent, MemoryPercent, RestartsLastHour};
+
+    const A: &str = "https://a.example:6443";
+    const B: &str = "https://b.example:6443";
+
+    fn write(dir: &Path, text: &str) {
+        std::fs::write(dir.join(SETTINGS_FILE), text).unwrap();
+    }
+
+    fn read(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap()
+    }
+
+    // covers UP-67: a file from before thresholds loads with the defaults, and an unrelated save
+    // adds no thresholds key and keeps what it held.
+    #[test]
+    fn a_file_without_thresholds_loads_and_saves_unchanged_in_meaning() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = r#"
+            appearance = "dark"
+            protect_local_clusters = true
+            watch_mode = "on_view"
+            future_key = 1
+            [cluster_watch_mode]
+            prod = "all"
+            [[trusted_clusters]]
+            context = "prod"
+            server = "https://a.example:6443"
+        "#;
+        write(dir.path(), text);
+        let before = load_settings(dir.path()).unwrap();
+        assert_eq!(before.thresholds, ThresholdSettings::default());
+        assert_eq!(
+            before.thresholds_for("prod", Some(A)),
+            Thresholds::default()
+        );
+
+        let saved = set_appearance(dir.path(), Appearance::Dark).unwrap();
+        assert_eq!(saved, before);
+        let written = read(dir.path());
+        assert!(!written.contains("thresholds"), "{written}");
+        assert!(written.contains("future_key"), "{written}");
+        assert_eq!(load_settings(dir.path()).unwrap(), before);
+    }
+
+    // covers UP-67: an override replaces only what it sets, and stays with its server.
+    #[test]
+    fn an_override_is_bound_to_the_context_and_server() {
+        let dir = tempfile::tempdir().unwrap();
+        set_threshold(dir.path(), None, CpuPercent, Some(80)).unwrap();
+        let pin = ClusterPin::new("ctx", A);
+        let settings = set_threshold(dir.path(), Some(&pin), MemoryPercent, Some(60)).unwrap();
+
+        let here = settings.thresholds_for("ctx", Some("https://a.example:6443/"));
+        assert_eq!(here.get(MemoryPercent), 60);
+        assert_eq!(here.get(CpuPercent), 80, "from the global value");
+        assert_eq!(here.get(RestartsLastHour), 5, "from the default");
+        for (context, server) in [("ctx", Some(B)), ("ctx", None), ("other", Some(A))] {
+            let elsewhere = settings.thresholds_for(context, server);
+            assert_eq!(elsewhere.get(MemoryPercent), 90, "{context} {server:?}");
+            assert_eq!(elsewhere.get(CpuPercent), 80, "{context} {server:?}");
+        }
+        assert_eq!(load_settings(dir.path()).unwrap(), settings);
+    }
+
+    // covers UP-67: a bad section loses only itself, is reported, and survives an unrelated save.
+    #[test]
+    fn invalid_thresholds_fall_back_and_keep_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for section in [
+            "thresholds = 3",
+            "[thresholds]\ncpu_percent = 500",
+            "[thresholds]\nclusters = 3",
+            "[thresholds.clusters.prod]\ncpu_percent = 50",
+            "[[thresholds.clusters]]\ncontext = \"no-server\"\ncpu_percent = 50",
+        ] {
+            write(
+                dir.path(),
+                &format!("appearance = \"dark\"\nprotect_local_clusters = true\n{section}\n"),
+            );
+            let settings = load_settings(dir.path()).unwrap();
+            assert_eq!(settings.appearance, Appearance::Dark, "{section}");
+            assert!(settings.protect_local_clusters, "{section}");
+            assert_eq!(
+                settings.thresholds_for("no-server", Some(A)),
+                Thresholds::default(),
+                "{section}"
+            );
+            set_appearance(dir.path(), Appearance::Light).unwrap();
+            let kept: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+            let original: toml::Table = toml::from_str(&format!("{section}\n")).unwrap();
+            assert_eq!(
+                kept.get("thresholds"),
+                original.get("thresholds"),
+                "{section}"
+            );
+        }
+    }
+
+    // covers UP-67: a refused write changes nothing, and a section of the wrong shape is not
+    // replaced.
+    #[test]
+    fn a_refused_write_leaves_the_file_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let pin = ClusterPin::new("ctx", A);
+        for (text, cluster, value) in [
+            ("appearance = \"dark\"\n", None, Some(101)),
+            ("thresholds = 3\n", None, Some(80)),
+            ("[thresholds]\nclusters = 3\n", Some(&pin), Some(80)),
+            ("[thresholds]\nclusters = 3\n", Some(&pin), None),
+        ] {
+            write(dir.path(), text);
+            let error = set_threshold(dir.path(), cluster, CpuPercent, value).unwrap_err();
+            assert!(matches!(error, SettingsError::Invalid { .. }), "{text}");
+            assert_eq!(read(dir.path()), text);
+        }
+        let blank = ClusterPin::new("ctx", " ");
+        write(dir.path(), "appearance = \"dark\"\n");
+        assert!(set_threshold(dir.path(), Some(&blank), CpuPercent, Some(80)).is_err());
+    }
+
+    // covers UP-67: clearing leaves no empty section, keeps a newer version's keys, and a
+    // repeated entry cannot bring the value back.
+    #[test]
+    fn clearing_removes_only_what_it_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let pin = ClusterPin::new("ctx", A);
+        set_threshold(dir.path(), Some(&pin), CpuPercent, Some(50)).unwrap();
+        set_threshold(dir.path(), Some(&pin), CpuPercent, None).unwrap();
+        assert!(!read(dir.path()).contains("thresholds"));
+
+        write(
+            dir.path(),
+            r#"
+            [thresholds]
+            future_metric = 1
+            [[thresholds.clusters]]
+            context = "ctx"
+            server = "https://a.example:6443"
+            cpu_percent = 50
+            future_field = 2
+            [[thresholds.clusters]]
+            context = "ctx"
+            server = "https://a.example:6443/"
+            cpu_percent = 40
+            "#,
+        );
+        let settings = set_threshold(dir.path(), Some(&pin), CpuPercent, None).unwrap();
+        assert_eq!(settings.thresholds_for("ctx", Some(A)).get(CpuPercent), 90);
+        let written = read(dir.path());
+        assert!(written.contains("future_metric"), "{written}");
+        assert!(written.contains("future_field"), "{written}");
+    }
+
+    // covers UP-67
+    #[test]
+    fn clearing_what_is_not_set_does_not_touch_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE);
+        let pin = ClusterPin::new("ctx", A);
+        set_threshold(dir.path(), Some(&pin), CpuPercent, None).unwrap();
+        assert!(!path.exists(), "no file is created");
+
+        let text = "# kept by hand\n[thresholds]\ncpu_percent = 80\n";
+        write(dir.path(), text);
+        set_threshold(dir.path(), Some(&pin), CpuPercent, None).unwrap();
+        set_threshold(dir.path(), None, MemoryPercent, None).unwrap();
+        assert_eq!(read(dir.path()), text);
+    }
+
+    #[test]
+    fn thresholds_is_a_known_key() {
+        let table: toml::Table = toml::from_str("thresholds = 3").unwrap();
         assert!(misspelled_keys(&table).is_empty());
     }
 }

@@ -13,10 +13,17 @@ fn overrides(values: &[(ThresholdMetric, u32)]) -> ThresholdOverrides {
     overrides
 }
 
-fn invalid(cluster: Option<&str>, metric: ThresholdMetric) -> ThresholdIssue {
-    ThresholdIssue::InvalidValue {
-        cluster: cluster.map(str::to_owned),
-        metric,
+fn invalid(entry: Option<usize>, metric: ThresholdMetric) -> ThresholdIssue {
+    ThresholdIssue::InvalidValue { entry, metric }
+}
+
+const A: &str = "https://a.example:6443";
+const B: &str = "https://b.example:6443";
+
+fn cluster(context: &str, values: &[(ThresholdMetric, u32)]) -> ClusterThresholds {
+    ClusterThresholds {
+        cluster: ClusterPin::new(context, A),
+        overrides: overrides(values),
     }
 }
 
@@ -89,10 +96,7 @@ fn the_worst_level_never_hides_missing_data_as_healthy() {
 fn overrides_merge_field_by_field() {
     let settings = ThresholdSettings {
         global: overrides(&[(CpuPercent, 80), (RestartsLastHour, 3)]),
-        clusters: BTreeMap::from([(
-            "prod".to_owned(),
-            overrides(&[(CpuPercent, 70), (MemoryPercent, 60)]),
-        )]),
+        clusters: vec![cluster("prod", &[(CpuPercent, 70), (MemoryPercent, 60)])],
     };
     let cases = [
         ("prod", CpuPercent, 70),
@@ -103,12 +107,31 @@ fn overrides_merge_field_by_field() {
         ("dev", MemoryPercent, 90),
         ("dev", RestartsLastHour, 3),
     ];
-    for (cluster, metric, value) in cases {
+    for (context, metric, value) in cases {
         assert_eq!(
-            settings.for_cluster(cluster).get(metric),
+            settings.for_cluster(context, Some(A)).get(metric),
             value,
-            "{cluster} {metric:?}"
+            "{context} {metric:?}"
         );
+    }
+}
+
+// covers UP-67: an override does not follow a context name to another server.
+#[test]
+fn an_override_applies_only_at_its_server() {
+    let settings = ThresholdSettings {
+        global: overrides(&[(CpuPercent, 80)]),
+        clusters: vec![cluster("prod", &[(CpuPercent, 70)])],
+    };
+    let cases = [
+        (Some(A), 70),
+        (Some("https://a.example:6443/"), 70),
+        (Some(B), 80),
+        (None, 80),
+    ];
+    for (server, value) in cases {
+        let thresholds = settings.for_cluster("prod", server);
+        assert_eq!(thresholds.get(CpuPercent), value, "{server:?}");
     }
 }
 
@@ -155,7 +178,7 @@ fn an_invalid_value_falls_back_for_that_field_alone() {
     ] {
         let (settings, issues) = load(&format!("cpu_percent = {bad}\nmemory_percent = 70\n"));
         assert_eq!(issues, [invalid(None, CpuPercent)], "{bad}");
-        let thresholds = settings.for_cluster("any");
+        let thresholds = settings.for_cluster("any", Some(A));
         assert_eq!(thresholds.get(CpuPercent), 90, "{bad}");
         assert_eq!(thresholds.get(MemoryPercent), 70, "{bad}");
     }
@@ -164,33 +187,76 @@ fn an_invalid_value_falls_back_for_that_field_alone() {
 // covers UP-67
 #[test]
 fn an_invalid_cluster_value_falls_back_to_the_global_value() {
-    let (settings, issues) = load(
+    let (settings, issues) = load(&format!(
         "cpu_percent = 80\n\
-         [clusters.prod]\ncpu_percent = 500\nmemory_percent = 60\n\
-         [clusters.dev]\nrestarts_last_hour = 2\n",
-    );
-    assert_eq!(issues, [invalid(Some("prod"), CpuPercent)]);
-    assert_eq!(settings.for_cluster("prod").get(CpuPercent), 80);
-    assert_eq!(settings.for_cluster("prod").get(MemoryPercent), 60);
-    assert_eq!(settings.for_cluster("dev").get(RestartsLastHour), 2);
+         [[clusters]]\ncontext = \"prod\"\nserver = \"{A}\"\n\
+         cpu_percent = 500\nmemory_percent = 60\n\
+         [[clusters]]\ncontext = \"dev\"\nserver = \"{A}\"\nrestarts_last_hour = 2\n",
+    ));
+    assert_eq!(issues, [invalid(Some(0), CpuPercent)]);
+    let prod = settings.for_cluster("prod", Some(A));
+    assert_eq!(prod.get(CpuPercent), 80);
+    assert_eq!(prod.get(MemoryPercent), 60);
+    let dev = settings.for_cluster("dev", Some(A));
+    assert_eq!(dev.get(RestartsLastHour), 2);
 }
 
 #[test]
 fn a_wrong_shape_loses_only_what_it_covers() {
-    let (settings, issues) = load("cpu_percent = 80\nclusters = 3\n");
-    assert_eq!(issues, [ThresholdIssue::ClustersNotATable]);
-    assert_eq!(settings.for_cluster("prod").get(CpuPercent), 80);
+    for text in [
+        "cpu_percent = 80\nclusters = 3\n",
+        "cpu_percent = 80\n[clusters.prod]\ncpu_percent = 50\n",
+    ] {
+        let (settings, issues) = load(text);
+        assert_eq!(issues, [ThresholdIssue::ClustersNotAList], "{text}");
+        assert_eq!(settings.for_cluster("prod", Some(A)).get(CpuPercent), 80);
+    }
 
-    let (settings, issues) = load("[clusters]\nbroken = 1\n[clusters.prod]\nmemory_percent = 60\n");
-    let broken = ThresholdIssue::NotATable {
-        cluster: Some("broken".to_owned()),
-    };
-    assert_eq!(issues, [broken]);
-    assert_eq!(settings.for_cluster("prod").get(MemoryPercent), 60);
+    let (settings, issues) = load(&format!(
+        "clusters = [3, {{ context = \"no-server\", cpu_percent = 50 }}, \
+         {{ context = \" \", server = \"{A}\", cpu_percent = 50 }}, \
+         {{ context = \"prod\", server = \"{A}\", memory_percent = 60 }}]\n"
+    ));
+    assert_eq!(
+        issues,
+        [
+            ThresholdIssue::NotATable { entry: Some(0) },
+            ThresholdIssue::UnboundEntry { entry: 1 },
+            ThresholdIssue::UnboundEntry { entry: 2 },
+        ]
+    );
+    assert_eq!(settings.clusters, [cluster("prod", &[(MemoryPercent, 60)])]);
 
     let (settings, issues) = ThresholdSettings::from_toml(&toml::Value::Integer(3));
-    assert_eq!(issues, [ThresholdIssue::NotATable { cluster: None }]);
+    assert_eq!(issues, [ThresholdIssue::NotATable { entry: None }]);
     assert_eq!(settings, ThresholdSettings::default());
+}
+
+// covers UP-67: the earlier entry decides, a later one only fills gaps, and it is reported.
+#[test]
+fn a_repeated_cluster_entry_fills_gaps_and_is_reported() {
+    let (settings, issues) = load(&format!(
+        "[[clusters]]\ncontext = \"prod\"\nserver = \"{A}\"\ncpu_percent = 70\n\
+         [[clusters]]\ncontext = \"prod\"\nserver = \"{A}/\"\n\
+         cpu_percent = 50\nmemory_percent = 60\n",
+    ));
+    assert_eq!(issues, [ThresholdIssue::DuplicateEntry { entry: 1 }]);
+    assert_eq!(
+        settings.clusters,
+        [cluster("prod", &[(CpuPercent, 70), (MemoryPercent, 60)])]
+    );
+}
+
+#[test]
+fn an_issue_never_quotes_the_file() {
+    let (_, issues) = load(
+        "cpu_percent = \"s3cret\"\nclusters = [{ context = \"s3cret\", cpu_percent = 1 }, \
+         { context = \"s3cret\", server = \"https://s3cret\", memory_percent = 900 }]\n",
+    );
+    assert_eq!(issues.len(), 3);
+    for issue in issues {
+        assert!(!issue.to_string().contains("s3cret"), "{issue}");
+    }
 }
 
 #[test]
@@ -216,6 +282,7 @@ fn a_bad_section_does_not_fail_the_file_around_it() {
         "other = 4\nthresholds = 3\n",
         "other = 4\n[thresholds]\ncpu_percent = \"high\"\n",
         "other = 4\n[thresholds]\nclusters = []\n",
+        "other = 4\n[thresholds]\nclusters = 3\n",
     ] {
         let host: Host = toml::from_str(text).unwrap();
         assert_eq!(host.other, 4, "{text}");
@@ -230,10 +297,10 @@ fn settings_round_trip_through_toml_and_stay_out_when_empty() {
         other: 4,
         thresholds: ThresholdSettings {
             global: overrides(&[(CpuPercent, 80)]),
-            clusters: BTreeMap::from([
-                ("prod.example".to_owned(), overrides(&[(MemoryPercent, 60)])),
-                ("dev".to_owned(), overrides(&[(RestartsLastHour, 2)])),
-            ]),
+            clusters: vec![
+                cluster("prod.example", &[(MemoryPercent, 60)]),
+                cluster("dev", &[(RestartsLastHour, 2)]),
+            ],
         },
     };
     let text = toml::to_string_pretty(&host).unwrap();
@@ -243,7 +310,7 @@ fn settings_round_trip_through_toml_and_stay_out_when_empty() {
         other: 4,
         thresholds: ThresholdSettings {
             global: ThresholdOverrides::default(),
-            clusters: BTreeMap::from([("dev".to_owned(), ThresholdOverrides::default())]),
+            clusters: vec![cluster("dev", &[])],
         },
     };
     let text = toml::to_string_pretty(&empty).unwrap();
@@ -255,24 +322,28 @@ fn settings_round_trip_through_toml_and_stay_out_when_empty() {
 fn a_number_that_does_not_fit_i64_loses_only_its_field() {
     let text = r#"{"other": 4, "thresholds": {"cpu_percent": 9223372036854775808,
         "memory_percent": 60, "restarts_last_hour": -1, "warning_events_last_hour": 1.5,
-        "clusters": {"prod": {"cpu_percent": 18446744073709551615, "memory_percent": 70}}}}"#;
+        "clusters": [{"context": "prod", "server": "https://a.example:6443",
+            "cpu_percent": 18446744073709551615, "memory_percent": 70}]}}"#;
     let host: Host = serde_json::from_str(text).unwrap();
     assert_eq!(host.other, 4);
     assert_eq!(host.thresholds.global, overrides(&[(MemoryPercent, 60)]));
     assert_eq!(
         host.thresholds.clusters,
-        BTreeMap::from([("prod".to_owned(), overrides(&[(MemoryPercent, 70)]))]),
+        [cluster("prod", &[(MemoryPercent, 70)])],
     );
 }
 
 // covers UP-67
 #[test]
-fn cluster_keys_are_read_literally() {
-    let text = "other = 4\n[thresholds.clusters.\"$__toml_private_datetime\"]\n\
-                memory_percent = 60\n[thresholds.clusters.prod]\ncpu_percent = 80\n";
-    let host: Host = toml::from_str(text).unwrap();
+fn a_context_is_read_literally() {
+    let text = format!(
+        "other = 4\n[[thresholds.clusters]]\ncontext = \"$__toml_private_datetime\"\n\
+         server = \"{A}\"\nmemory_percent = 60\n"
+    );
+    let host: Host = toml::from_str(&text).unwrap();
     assert_eq!(host.other, 4);
-    let marker = host.thresholds.for_cluster("$__toml_private_datetime");
+    let marker = host
+        .thresholds
+        .for_cluster("$__toml_private_datetime", Some(A));
     assert_eq!(marker.get(MemoryPercent), 60);
-    assert_eq!(host.thresholds.for_cluster("prod").get(CpuPercent), 80);
 }
