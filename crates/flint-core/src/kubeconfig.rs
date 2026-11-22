@@ -301,6 +301,82 @@ fn is_null_device(_meta: &std::fs::Metadata) -> bool {
 /// How long a read of the kubeconfig files may hold up the cluster manager.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The pause before reading files again that changed during a read.
+const SETTLE_PAUSE: Duration = Duration::from_millis(20);
+
+/// One input file as it stood at a moment, to tell whether it changed during a read.
+///
+/// A regular file is compared by identity, times, size and every byte. What this cannot see is a
+/// file changed and put back byte for byte between two checks within one tick of the
+/// filesystem's clock, which leaves the same content when the read ends.
+#[derive(PartialEq, Eq)]
+enum InputFile {
+    Absent,
+    /// It could not be opened or read, for this reason.
+    Failed(std::io::ErrorKind),
+    /// Not a regular file, so its content is not read: opening one can block.
+    Special(FileIdentity),
+    Regular(FileIdentity, Vec<u8>),
+}
+
+/// What the file system says of an open file.
+#[derive(PartialEq, Eq)]
+struct FileIdentity {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    /// Device, inode and change time, which a writer can't set back.
+    #[cfg(unix)]
+    node: (u64, u64, i64, i64),
+}
+
+impl FileIdentity {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        FileIdentity {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            node: (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+}
+
+impl InputFile {
+    fn of(path: &Path) -> Self {
+        use std::io::{ErrorKind, Read};
+        let mut options = std::fs::File::options();
+        options.read(true);
+        // Opening a FIFO for reading would otherwise wait for a writer.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+        let mut file = match options.open(path) {
+            Ok(file) => file,
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                return InputFile::Absent;
+            }
+            Err(e) => return InputFile::Failed(e.kind()),
+        };
+        let meta = match file.metadata() {
+            Ok(meta) => meta,
+            Err(e) => return InputFile::Failed(e.kind()),
+        };
+        let identity = FileIdentity::of(&meta);
+        if !meta.is_file() {
+            return InputFile::Special(identity);
+        }
+        let mut bytes = Vec::new();
+        match file.read_to_end(&mut bytes) {
+            Ok(_) => InputFile::Regular(identity, bytes),
+            Err(e) => InputFile::Failed(e.kind()),
+        }
+    }
+
+    fn all(paths: &[PathBuf]) -> Vec<Self> {
+        paths.iter().map(|path| Self::of(path)).collect()
+    }
+}
+
 /// A file whose last parse found nothing in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlankFile {
@@ -320,6 +396,9 @@ pub(crate) struct FileRead {
     /// load depends on what they defined before
     /// ([`crate::recheck::ContextHistory::fail_emptied`]).
     pub blank: Vec<BlankFile>,
+    /// Whether every input file was the same when the read ended as when it began. If not, the
+    /// merged result may mix versions that never existed together.
+    pub consistent: bool,
 }
 
 impl FileRead {
@@ -335,10 +414,28 @@ impl FileRead {
             },
             exist: paths.iter().map(|p| (p.clone(), true)).collect(),
             blank: Vec::new(),
+            consistent: false,
+        }
+    }
+
+    /// Reads until a read is [consistent](Self::consistent) or `deadline` is near, and returns
+    /// the last one.
+    fn settled(
+        paths: &[PathBuf],
+        load: fn(&[PathBuf]) -> LoadedKubeconfig,
+        deadline: std::time::Instant,
+    ) -> Self {
+        loop {
+            let read = Self::of(paths, load);
+            if read.consistent || std::time::Instant::now() + SETTLE_PAUSE >= deadline {
+                return read;
+            }
+            std::thread::sleep(SETTLE_PAUSE);
         }
     }
 
     fn of(paths: &[PathBuf], load: fn(&[PathBuf]) -> LoadedKubeconfig) -> Self {
+        let before = InputFile::all(paths);
         let stamps: HashMap<&PathBuf, _> = paths.iter().map(|p| (p, file_stamp(p))).collect();
         let loaded = load(paths);
         let exist = loaded
@@ -354,10 +451,12 @@ impl FileRead {
                 stamp: stamps.get(path).copied().flatten(),
             })
             .collect();
+        let consistent = before == InputFile::all(paths);
         FileRead {
             loaded,
             exist,
             blank,
+            consistent,
         }
     }
 }
@@ -406,9 +505,9 @@ impl KubeconfigReader {
         self.turn(paths).try_lock().is_err()
     }
 
-    /// The files as they are now, or `None` if the read did not finish in time or an earlier
-    /// read of the same files still hasn't. A read that finishes after its caller gave up hands
-    /// its result to `on_late`.
+    /// The files as they are now, from one pass, or `None` if the read did not finish in time or
+    /// an earlier read of the same files still hasn't. A read that finishes after its caller gave
+    /// up hands its result to `on_late`. The result may be [inconsistent](FileRead::consistent).
     pub(crate) async fn read(
         &self,
         paths: &[PathBuf],
@@ -416,13 +515,27 @@ impl KubeconfigReader {
     ) -> Option<FileRead> {
         let turn = self.turn(paths).try_lock_owned().ok()?;
         let deadline = Instant::now() + self.timeout;
-        let answer = self.start(paths, turn, on_late.clone())?;
+        let answer = self.start(paths, turn, None, on_late.clone())?;
+        answer_by(answer, deadline, on_late).await
+    }
+
+    /// [`Self::read`], reading again within the timeout while the files change under it.
+    pub(crate) async fn read_settled(
+        &self,
+        paths: &[PathBuf],
+        on_late: impl FnOnce(FileRead) + Clone + Send + 'static,
+    ) -> Option<FileRead> {
+        let turn = self.turn(paths).try_lock_owned().ok()?;
+        let deadline = Instant::now() + self.timeout;
+        let answer = self.start(paths, turn, Some(deadline), on_late.clone())?;
         answer_by(answer, deadline, on_late).await
     }
 
     /// The files as they are after this call: a read already running is waited out, not used,
     /// and a new one starts after it. `None` if that does not finish within the timeout, the
-    /// wait included. A read that finishes after that hands its result to `on_late`.
+    /// wait included. Files that change during the read are read again within that time; if they
+    /// never hold still the result is [inconsistent](FileRead::consistent). A read that finishes
+    /// after that hands its result to `on_late`.
     pub(crate) async fn read_fresh(
         &self,
         paths: &[PathBuf],
@@ -432,15 +545,17 @@ impl KubeconfigReader {
         let turn = tokio::time::timeout_at(deadline, self.turn(paths).lock_owned())
             .await
             .ok()?;
-        let answer = self.start(paths, turn, on_late.clone())?;
+        let answer = self.start(paths, turn, Some(deadline), on_late.clone())?;
         answer_by(answer, deadline, on_late).await
     }
 
-    /// Starts a read on its own thread, which holds `turn` until the files are read.
+    /// Starts a read on its own thread, which holds `turn` until the files are read. With
+    /// `settle_by` it reads again until they hold still or that time is near.
     fn start(
         &self,
         paths: &[PathBuf],
         turn: OwnedMutexGuard<()>,
+        settle_by: Option<Instant>,
         on_late: impl FnOnce(FileRead) + Send + 'static,
     ) -> Option<oneshot::Receiver<FileRead>> {
         let (reply, answer) = oneshot::channel();
@@ -448,7 +563,10 @@ impl KubeconfigReader {
         let thread = std::thread::Builder::new()
             .name("kubeconfig-read".to_owned())
             .spawn(move || {
-                let read = FileRead::of(&owned, load);
+                let read = match settle_by {
+                    Some(deadline) => FileRead::settled(&owned, load, deadline.into_std()),
+                    None => FileRead::of(&owned, load),
+                };
                 drop(turn);
                 if let Err(read) = reply.send(read) {
                     on_late(read);
@@ -678,6 +796,71 @@ mod tests {
         let read = FileRead::of(std::slice::from_ref(&path), load_then_restore);
         assert_eq!(read.blank.len(), 1);
         assert_eq!(read.blank[0].path, path);
+    }
+
+    /// Parses the files, then applies once what is waiting beside each: `<name>.next` becomes its
+    /// content, keeping its modification time, and `<name>.gone` removes it.
+    fn load_then_change(paths: &[PathBuf]) -> LoadedKubeconfig {
+        let loaded = load(paths);
+        for path in paths {
+            let next = path.with_extension("next");
+            if let Ok(body) = std::fs::read(&next) {
+                std::fs::remove_file(&next).unwrap();
+                let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+                std::fs::write(path, body).unwrap();
+                if let Some(modified) = modified {
+                    let file = std::fs::File::options().write(true).open(path).unwrap();
+                    file.set_modified(modified).unwrap();
+                }
+            }
+            let gone = path.with_extension("gone");
+            if gone.exists() {
+                std::fs::remove_file(&gone).unwrap();
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        loaded
+    }
+
+    fn dev_at(server: &str) -> String {
+        config(&[("dev", "c1", "u1")], &[("c1", server)])
+    }
+
+    async fn fresh_server(paths: &[PathBuf]) -> Option<String> {
+        let reader = KubeconfigReader::new(load_then_change, Duration::from_secs(5));
+        let read = reader.read_fresh(paths, |_| {}).await.expect("settled");
+        read.loaded.context("dev").and_then(|c| c.server.clone())
+    }
+
+    // covers UP-54: a rewrite after the parse is seen though it keeps the size and the time.
+    #[tokio::test]
+    async fn a_same_size_rewrite_during_the_read_is_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "a", &dev_at("https://old"));
+        write(dir.path(), "a.next", &dev_at("https://new"));
+        let server = fresh_server(std::slice::from_ref(&path)).await;
+        assert_eq!(server.as_deref(), Some("https://new"));
+    }
+
+    // covers UP-54: a file that appears during the read can define the target.
+    #[tokio::test]
+    async fn a_file_appearing_during_the_read_is_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let later = write(dir.path(), "a", &dev_at("https://old"));
+        write(dir.path(), "b.next", &dev_at("https://new"));
+        let server = fresh_server(&[dir.path().join("b"), later]).await;
+        assert_eq!(server.as_deref(), Some("https://new"));
+    }
+
+    // covers UP-54: a file that disappears during the read no longer defines the target.
+    #[tokio::test]
+    async fn a_file_disappearing_during_the_read_is_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = write(dir.path(), "b", &dev_at("https://old"));
+        let later = write(dir.path(), "a", &dev_at("https://new"));
+        write(dir.path(), "b.gone", "");
+        let server = fresh_server(&[first, later]).await;
+        assert_eq!(server.as_deref(), Some("https://new"));
     }
 
     #[cfg(unix)]
