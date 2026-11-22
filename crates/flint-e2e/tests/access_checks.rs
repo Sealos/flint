@@ -9,11 +9,6 @@ use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event
 use flint_core::{Settings, WatchMode};
 use flint_e2e::fake_api::{AccessPolicy, CONTEXT, FakeApiServer, Fault, Gvr};
 
-// The app-level path: ignored by default, as it opens a window.
-#[cfg(target_os = "macos")]
-#[path = "app/access.rs"]
-mod app_access;
-
 const WAIT: Duration = Duration::from_secs(30);
 
 struct Core {
