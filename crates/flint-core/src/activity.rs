@@ -37,8 +37,9 @@ pub const MAX_FIELD_BYTES: usize = 253;
 /// use.
 pub const KEY_FILE: &str = "activity.key";
 /// The most probed clusters a record lists by key; the rest are counted in
-/// [`ActivityRecord::probed_more`], so one record stays far below [`MAX_FILE_BYTES`].
-pub const MAX_PROBED: usize = 256;
+/// [`ActivityRecord::probed_more`]. At about 6 KB a record, a few hundred `list_clusters` calls fit
+/// in the log before they push out earlier activity.
+pub const MAX_PROBED: usize = 64;
 /// The longest a writer waits for [`LOCK_FILE`] before it skips its record.
 pub const LOCK_WAIT: Duration = Duration::from_secs(1);
 /// The most records [`read`] returns, newest kept: more than the two files hold, so this only
@@ -141,25 +142,66 @@ impl Probed {
     }
 }
 
+/// The server a view of the log is for, to compare with the keys in its records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpectedServer {
+    /// The context has no server.
+    NoServer,
+    /// It has a server, but no key to digest it with: no record can be proven to be about it.
+    Unknown,
+    /// It has a server with this [`ServerKeys::server_key`].
+    Key(String),
+}
+
+/// How far a record that is about a context can be tied to the server a view is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Attribution {
+    /// Recorded for this context, but nothing proves it reached this server: the record has no
+    /// usable server key, or the view has none to compare it with.
+    Unverified,
+    /// The server keys are equal, or neither side has a server.
+    Verified,
+}
+
 impl ActivityRecord {
-    /// Whether the call is about the cluster with key `cluster` at the server with key `server`:
-    /// it named that context, or probed it. A context re-pointed at another server is another
-    /// cluster; a side without a server key (a context not exposed, a tab opened for a context
-    /// with no server) matches any server.
-    pub fn is_about(&self, cluster: &str, server: Option<&str>) -> bool {
-        let at = |cluster_key: Option<&str>, server_key: Option<&str>| {
-            cluster_key == Some(cluster)
-                && match (server_key, server) {
-                    (Some(at), Some(server)) => at == server,
-                    _ => true,
-                }
-        };
-        at(self.cluster_key.as_deref(), self.server_key.as_deref())
-            || self
-                .probed
-                .iter()
-                .any(|p| at(Some(&p.cluster_key), p.server_key.as_deref()))
+    /// Whether the call is about the cluster with key `cluster` at `server`: it named that
+    /// context, or probed it. See [`ActivityRecord::attribution`].
+    pub fn is_about(&self, cluster: &str, server: &ExpectedServer) -> bool {
+        self.attribution(cluster, server).is_some()
     }
+
+    /// How the call is tied to the cluster with key `cluster` at `server`, or none when it is not
+    /// about it. A context re-pointed at another server is another cluster, so two current keys
+    /// that differ never match. A key that cannot be compared (missing, or in the format of a
+    /// process started before an upgrade) leaves the call listed, as [`Attribution::Unverified`].
+    pub fn attribution(&self, cluster: &str, server: &ExpectedServer) -> Option<Attribution> {
+        let at = |cluster_key: Option<&str>, server_key: Option<&str>| {
+            if cluster_key != Some(cluster) {
+                return None;
+            }
+            match (server, server_key.filter(|k| is_current_server_key(k))) {
+                (ExpectedServer::Key(expected), Some(key)) => {
+                    (key == expected).then_some(Attribution::Verified)
+                }
+                (ExpectedServer::NoServer, None) if server_key.is_none() => {
+                    Some(Attribution::Verified)
+                }
+                _ => Some(Attribution::Unverified),
+            }
+        };
+        let named = at(self.cluster_key.as_deref(), self.server_key.as_deref());
+        let probed = self
+            .probed
+            .iter()
+            .filter_map(|p| at(Some(&p.cluster_key), p.server_key.as_deref()));
+        named.into_iter().chain(probed).max()
+    }
+}
+
+/// Whether `key` has the format of [`ServerKeys::server_key`]: 128 bits in lowercase hex. The
+/// unkeyed digest older versions wrote is 64 bits.
+fn is_current_server_key(key: &str) -> bool {
+    key.len() == 32 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// A stable key for a context name (FNV-1a, 64 bits, in hex): the same in every Flint version.
@@ -203,6 +245,16 @@ impl ServerKeys {
     pub fn with_secret(secret: &[u8]) -> Self {
         ServerKeys {
             key: Some(ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret)),
+        }
+    }
+
+    /// What a view of the context at `server` compares records with.
+    pub fn expected(&self, server: Option<&str>) -> ExpectedServer {
+        match server {
+            None => ExpectedServer::NoServer,
+            Some(url) => self
+                .server_key(url)
+                .map_or(ExpectedServer::Unknown, ExpectedServer::Key),
         }
     }
 
@@ -508,8 +560,8 @@ fn file_id(path: &Path) -> Option<(u64, u64)> {
 
 /// `record` with its cluster key, computed from its context when it has none. Its server key is
 /// never guessed from the shown server, which can drop the query or hide the server behind a
-/// placeholder: a record written without the key file has none, and its tab matches it by
-/// context alone.
+/// placeholder: a record written without the key file has none, and its tab lists it as
+/// [`Attribution::Unverified`].
 fn keyed(mut record: ActivityRecord) -> ActivityRecord {
     if record.cluster_key.is_none() {
         record.cluster_key = record.cluster.as_deref().map(cluster_key);
@@ -531,6 +583,10 @@ mod tests {
     /// Server keys under a fixed key, for records written by hand.
     fn server_key(url: &str) -> String {
         ServerKeys::with_secret(&[7; 32]).server_key(url).unwrap()
+    }
+
+    fn at(url: &str) -> ExpectedServer {
+        ExpectedServer::Key(server_key(url))
     }
 
     fn record(n: u64) -> ActivityRecord {
@@ -793,10 +849,10 @@ mod tests {
         append(dir.path(), &at_one).unwrap();
         let read = read(dir.path());
         let prod = cluster_key("prod");
-        assert!(read[0].is_about(&prod, Some(&server_key(one))));
-        assert!(!read[0].is_about(&prod, Some(&server_key(two))));
-        assert!(read[0].is_about(&prod, None));
-        assert!(!read[0].is_about(&cluster_key("staging"), None));
+        assert!(read[0].is_about(&prod, &at(one)));
+        assert!(!read[0].is_about(&prod, &at(two)));
+        assert!(read[0].is_about(&prod, &ExpectedServer::NoServer));
+        assert!(!read[0].is_about(&cluster_key("staging"), &ExpectedServer::NoServer));
     }
 
     // covers UP-16: a line without keys (written before them, or without a usable key file)
@@ -818,8 +874,11 @@ mod tests {
             assert_eq!(line.cluster_key, Some(cluster_key("prod")));
             assert_eq!(line.server_key, None);
             assert!(line.probed.is_empty() && line.probed_more == 0);
-            assert!(line.is_about(&cluster_key("prod"), Some(&server_key("https://a"))));
-            assert!(!line.is_about(&cluster_key("dev"), None));
+            assert_eq!(
+                line.attribution(&cluster_key("prod"), &at("https://a")),
+                Some(Attribution::Unverified)
+            );
+            assert!(!line.is_about(&cluster_key("dev"), &ExpectedServer::NoServer));
         }
     }
 
@@ -921,7 +980,10 @@ mod tests {
         append_call(dir.path(), &call, &reached).unwrap();
         let read = read(dir.path());
         assert_eq!(read, [call]);
-        assert!(read[0].is_about(&cluster_key("prod"), Some("anything")));
+        assert_eq!(
+            read[0].attribution(&cluster_key("prod"), &at("https://prod:6443")),
+            Some(Attribution::Unverified)
+        );
         assert_eq!(std::fs::read(dir.path().join(KEY_FILE)).unwrap(), b"short");
     }
 
@@ -996,9 +1058,8 @@ mod tests {
         )));
         let read = read(dir.path());
         assert_eq!(read, [listed]);
-        let about = |context: &str, server: &str| {
-            read[0].is_about(&cluster_key(context), Some(&server_key(server)))
-        };
+        let about =
+            |context: &str, server: &str| read[0].is_about(&cluster_key(context), &at(server));
         assert!(about("prod", "https://prod:6443/") && about("dev", "https://dev:6443"));
         assert!(!about("prod", "https://new-prod:6443") && !about("staging", "https://prod:6443"));
     }
@@ -1033,6 +1094,66 @@ mod tests {
         assert_eq!(mode, 0o600);
         append(dir.path(), &record(3)).unwrap();
         assert_eq!(read(dir.path()), [record(1), record(3)]);
+    }
+
+    // covers UP-16: a key in the format of a process started before an upgrade is neither matched
+    // to a server nor hidden, on a named call and on a probe.
+    #[test]
+    fn an_old_format_server_key_is_listed_unverified() {
+        let prod = cluster_key("prod");
+        let old = fnv1a(b"https://prod:6443");
+        assert_eq!(old.len(), 16);
+        let named = ActivityRecord {
+            server_key: Some(old.clone()),
+            ..record(1)
+        };
+        let probed = ActivityRecord {
+            cluster_key: None,
+            cluster: None,
+            server_key: None,
+            probed: vec![Probed {
+                cluster_key: prod.clone(),
+                server_key: Some(old),
+            }],
+            ..record(2)
+        };
+        for call in [&named, &probed] {
+            for server in [
+                at("https://prod:6443"),
+                ExpectedServer::Unknown,
+                ExpectedServer::NoServer,
+            ] {
+                assert_eq!(
+                    call.attribution(&prod, &server),
+                    Some(Attribution::Unverified)
+                );
+            }
+        }
+    }
+
+    // covers UP-16: without a key to compare with, a call is never presented as the server's,
+    // though its own key is current; a known server with a key still separates servers.
+    #[test]
+    fn a_view_without_a_key_verifies_nothing() {
+        let prod = cluster_key("prod");
+        let no_key = ServerKeys::default();
+        assert_eq!(
+            no_key.expected(Some("https://prod:6443")),
+            ExpectedServer::Unknown
+        );
+        assert_eq!(no_key.expected(None), ExpectedServer::NoServer);
+        assert_eq!(
+            record(1).attribution(&prod, &ExpectedServer::Unknown),
+            Some(Attribution::Unverified)
+        );
+        assert_eq!(
+            record(1).attribution(&prod, &at("https://prod:6443")),
+            Some(Attribution::Verified)
+        );
+        assert_eq!(
+            record(1).attribution(&prod, &at("https://other:6443")),
+            None
+        );
     }
 
     // covers UP-16: a rotation while the log is read does not show expired records or hide the
