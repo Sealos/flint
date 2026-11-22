@@ -262,11 +262,12 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   objects, and searching never makes a request to the cluster. The arrows move the selection; Enter on a kind opens its
   list, and on an object opens its kind's list with the object selected and its details shown; when the namespace
   filter hides it, the filter is left as it is and the list says the object is filtered out; when it no longer
-  exists, the list says so. The exact name comes first ("web" finds the Deployment web before web-cfg), Event objects come after other matches,
-  and objects matching only by scattered letters are left out when another object contains the query as a run. Each kind says
+  exists, the list says so. Event objects rank after all other matches. Within each of those two groups the exact
+  name comes first ("web" finds the Deployment web before web-cfg), and an object matching only by scattered letters
+  is left out when another in its group contains the query as a run. Each kind says
   how many of its objects are in memory, and in On view mode the switcher says only watched kinds list their
   objects. Esc closes it and puts focus back. Cmd-Shift-P swaps it for the command
-  palette and Cmd-P back. With nothing in memory yet it lists the kinds; with no cluster active it says to select one.
+  palette and, on macOS, Cmd-P back; on Linux, Ctrl-P there moves the selection up. With nothing in memory yet it lists the kinds; with no cluster active it says to select one.
 - Tests: unit (fuzzy matching, 50,000 objects per keystroke, reading the stores without a request), ui.
 
 ### UP-32 Choose light or dark
@@ -523,7 +524,8 @@ M3 used every number in the 5x block, so its later paths continue at UP-121.
 - **When** I select an object and open its row menu or the detail pane.
 - **Then** each action the cluster clearly forbids (Edit, Delete, Scale, Rollout Restart, Cordon, Uncordon, Drain, Logs,
   Shell) is disabled and names the missing permission, for example "your access does not allow delete on deployments
-  in demo". An action whose check fails or times out stays enabled, and the API server decides it.
+  in demo". A check that fails or times out does not disable an action by itself, and the API server decides
+  any action left enabled.
 - Tests: e2e (fake API server, `a_namespace_limited_identity_sees_what_it_may_do`,
   `a_namespace_limited_user_sees_forbidden_actions_disabled`).
 

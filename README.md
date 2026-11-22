@@ -160,10 +160,11 @@ Flint is in early development.
   and errors-only (warnings and errors) filters, with adjustable context lines.
 - Protected clusters: every cluster not on your machine is read-only in Flint until you unlock it for the session
   or trust it (the lock button in the sidebar, or the palette). That covers shells, edits and resource actions.
-- GitOps markers: list rows managed by Argo CD or Flux show an `Argo` or `Flux` marker, and the detail header names
-  the manager. Plain Helm objects are not GitOps-managed; a Flux HelmRelease is. Typing `argo`, `flux` or `managed` in
-  the list filter includes those rows, but the filter is a plain text search, so it also matches any other row with
-  that text, such as an unmanaged `argo-server` or a `managed-by=Helm` label.
+- GitOps markers: list rows with Argo CD or Flux tracking metadata show an `Argo` or `Flux` marker, and the detail
+  header names the manager. Helm alone does not count; a Flux HelmRelease is recognised by Flux's tracking metadata.
+  Outside Secret lists, which show no markers, typing `argo`, `flux` or `managed` in the list filter includes those
+  rows. The filter is a plain text search, so it also matches any other row with that text, such as an unmanaged
+  `argo-server` or a `managed-by=Helm` label.
 - Actions your RBAC clearly forbids (edit, delete, scale, restart, cordon, drain, logs, shell) are disabled and name
   the missing permission. The API server still decides every request.
 - Cluster colour tags: six colours, set from a cluster's row menu or the palette, shown as a dot in the sidebar and a
@@ -174,13 +175,13 @@ Flint is in early development.
   shells. Enter opens the selected list row.
 - Light and dark themes that follow the system (View > Appearance, or the `appearance` setting, overrides it).
 - A read-only MCP server, `flint mcp`, for AI agents, limited to the clusters you expose.
-- Builds for macOS (Apple Silicon and Intel) and, best effort, Linux (x86_64 and arm64). From 0.5.0, every release
-  file has [build provenance](#verify-a-download).
+- Builds for macOS (Apple Silicon and Intel) and, best effort, Linux (x86_64 and arm64). From 0.5.0, the 24
+  uploaded release files have [build provenance](#verify-a-download); GitHub's source archives do not.
 
 **Coming next:**
 
 - **Next focus, see and watch many clusters:** multi-cluster management, watching and alerting. None of this is in
-  0.5.0: it has no combined views, alerts, dashboards, thresholds or CPU and memory metrics.
+  0.5.0: it has no combined views, alerts, dashboards, thresholds or CPU and memory columns.
 - **v0.7, change many clusters:** guarded fleet actions with explicit targets, a dry run per cluster, one cluster at a
   time, and a stop at the first failure.
 - **v1.0, first public release:** a signed and notarized app with a Homebrew cask, port-forwarding, and read-only Helm
@@ -299,11 +300,11 @@ TMPDIR=$(mktemp -d) APPIMAGE_EXTRACT_AND_RUN=1 flint
 ```
 
 The AppImage is unsigned; see [Verify a download](#verify-a-download).
-On Linux there is no menu bar: the command palette (Ctrl-Shift-P) has every menu item, Quit is Ctrl-Q, Close Window is
-Ctrl-Shift-W (Ctrl-W closes the active dock tab, or the window when the dock shows none; inside a shell tab Ctrl-W goes
-to the shell and Ctrl-Shift-W closes the tab, as in Linux terminals), Restart Shell is Ctrl-Shift-R, and every other
-Cmd shortcut is Ctrl. Settings and
-state live in `~/.config/flint/` (`$XDG_CONFIG_HOME/flint/`).
+On Linux there is no menu bar: the command palette (Ctrl-Shift-P) has every menu item, Quit is Ctrl-Q, and Close
+Window is Ctrl-Shift-W (Ctrl-W closes the active dock tab, or the window when the dock shows none). Most Cmd shortcuts
+are Ctrl; [Keys](#keys) marks the exceptions. A focused shell keeps Ctrl with a letter or symbol, including Ctrl-P,
+Ctrl-[, Ctrl-J, Ctrl-W and Ctrl-Q, while Ctrl-Shift shortcuts stay Flint's and Ctrl-Shift-W closes the shell tab.
+Settings and state live in `~/.config/flint/` (`$XDG_CONFIG_HOME/flint/`).
 
 ### Linux MCP server only (`flint-mcp`)
 
@@ -350,7 +351,7 @@ now, with each action's shortcut, and asks for what an action needs (a cluster, 
 label selector). Cmd-P opens the resource switcher: type part of a kind or object name ("pods web" works too) and
 press Enter to open the kind's list, or the object selected with its details; it searches only what Flint already
 holds in memory, so it never asks the cluster. These are the default keys on macOS; on Linux, Cmd is Ctrl, except
-where the table says otherwise.
+where the table says otherwise and in a focused shell, which keeps Ctrl with a letter or symbol.
 
 With a log tab focused, run **Set Context Lines…** from the command palette to choose how many lines appear before
 and after each filtered match.
@@ -358,7 +359,7 @@ and after each filtered match.
 | Key | Action | Where |
 |---|---|---|
 | ⇧⌘P | Show Command Palette (again to close it) | anywhere |
-| ⌘P | Go to Resource: a kind, or an object in memory (again to close it) | anywhere |
+| ⌘P | Go to Resource: a kind, or an object in memory (again to close it; on Linux, Ctrl-P there moves up instead) | anywhere |
 | ↑ ↓ or ⌃P ⌃N, ⏎, ⎋ | Move, run the selected action or open the kind or object, close (or go back a step) | in the palette or the switcher |
 | ⇥, ⇧⇥ | Focus Next Pane, Focus Previous Pane: clusters, navigation, list, detail, dock | outside text fields and shells |
 | ↑ ↓, ⏎ | Move between clusters, connect to the selected one | the cluster sidebar |
@@ -370,7 +371,7 @@ and after each filtered match.
 | ⎋ | Close Detail | the detail pane |
 | ⌘1, ⌘2 | Show Overview, Show YAML | the detail pane |
 | ⌘R | Refresh Object; Retry Connection; Reconnect Logs or Restart Shell (Ctrl-Shift-R on Linux) | the detail pane; a failed cluster; the dock |
-| ⌘L, ⇧⌘L | Open Logs, Open Previous Logs | the selected pod or workload |
+| ⌘L, ⇧⌘L | Open Logs, Open Previous Logs (a pod only) | the selected pod or workload |
 | ⇧⌘E | Open Shell | the selected pod or workload |
 | ⌘J, ⇧⌘J | Toggle Dock, Show Dock Tabs | anywhere |
 | ⌃⇥, ⌃⇧⇥ | Next, Previous Dock Tab | the dock |
@@ -456,10 +457,11 @@ Flint's own diagnostics with credential redaction and rotates at 4 MiB, keeping 
 through `flint.log.3`). If the file is unavailable, logging continues on stderr. MCP uses stdout for the protocol.
 
 By default stderr shows warnings and errors, and `flint --verbose` (or `flint mcp --verbose`) adds info. The file
-always records info and above, so a bug report has context. `FLINT_LOG` takes precedence over `--verbose`, for
-example `FLINT_LOG=debug` or `FLINT_LOG=flint_core=debug`. On stderr the filter applies to Flint's own events, and
-other crates are capped at warnings and errors whatever it says. The file keeps Flint's own events only. Flint reads
-`RUST_LOG` when `FLINT_LOG` is unset, empty or invalid. `flint --help` lists
+records info and above by default, so a bug report has context. A valid `FLINT_LOG` takes precedence over `--verbose`
+and sets the filter for both destinations, for example `FLINT_LOG=debug` or `FLINT_LOG=flint_core=debug`; `off` turns
+both off. On stderr the filter applies to Flint's own events, and other crates are capped at warnings and errors
+whatever it says. The file keeps Flint's own events only. Flint reads `RUST_LOG` when `FLINT_LOG` is unset, empty or
+invalid. `flint --help` lists
 the commands, options and environment variables, with the development aids below under their own heading.
 
 `FLINT_CLUSTER=<context>` is a development and testing aid, for example for agents that take screenshots: at startup
@@ -536,7 +538,7 @@ Linux except the app, which is the only part that needs macOS. The cluster tests
 
 On a pull request, each check runs only when the change touches what it checks: `scripts/ci-changes.sh` sorts
 the changed paths into groups (Rust code, the app, the AppImage, dependencies, scripts, workflows), so a
-docs-only PR runs just `typos` and the PR title check. A skipped check counts as passed. Ordinary PRs run a smoke
+docs-only PR skips the builds and tests and runs only cheap checks such as `typos` and the PR title. A skipped check counts as passed. Ordinary PRs run a smoke
 suite: every test compiles and a named subset runs. Pushes to `master` and PRs touching the paths `needs_full` lists
 in that script, including the CI files, run the full suite. See
 [Which tests a pull request runs](docs/TESTING.md).
@@ -546,7 +548,7 @@ in that script, including the CI files, run the full suite. See
   `linux (flint-app)` runs its clippy and view tests, and `appimage (x86_64)` packages a release build with
   `scripts/package-appimage.sh` and smoke-tests it with `scripts/smoke-appimage.sh`.
 - **CI (macOS), one job, `macos (flint-app)`:** the app's clippy, view tests and docs, and a release build. It runs on
-  every push to `master`, on PRs labelled `run-macos`, and on full-suite PRs that change what it builds. macOS
+  every push to `master`, on PRs labelled `run-macos`, and on every full-suite PR. macOS
   runners cost about ten times as much as Linux ones, so only work that needs macOS runs there.
 - **macOS packaging, `macos-app (dmg)`:** on PRs that touch the DMG packaging, packages `Flint.app` and its DMG and
   runs `scripts/smoke-macos-app.sh` and its self-test (`scripts/smoke-macos-app-test.sh`). Not required.
@@ -596,9 +598,10 @@ server, is `refactor`, `test` or `chore` (or `fix` when it repairs a bug a user 
    (`scripts/package-mcp-linux.sh`): `flint-mcp-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` and
    `flint-mcp-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz`, each run in a bare `ubuntu:22.04` with the MCP e2e tests.
    Each binary also gets a CycloneDX SBOM, and every file comes with its SHA-256 checksum. The build jobs hold a
-   read-only token. An `attest` job records build provenance for every file, then a separate `upload` job attaches
-   them to the draft.
-4. Once every upload has succeeded, a `publish` job publishes the release and checks that all 24 files are on it.
+   read-only token. An `attest` job records build provenance for those 24 files, then a separate `upload` job
+   attaches them to the draft.
+4. Once every upload has succeeded, a `publish` job checks that all 24 files are on the draft and match their
+   checksums, then publishes the release.
 
 Until the first signed release, release binaries are **unsigned** (the app only ad-hoc signed). macOS blocks the
 first launch of a browser download until you allow it ([Install from a release](#install-from-a-release)). AppImages
