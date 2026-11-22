@@ -1272,6 +1272,7 @@ impl Workspace {
     fn render_sidebar(
         &self,
         widths: &Layout,
+        traffic_lights: Pixels,
         theme: &Theme,
         focused: bool,
         cx: &Context<Self>,
@@ -1379,16 +1380,7 @@ impl Workspace {
             .text_color(theme.sidebar_foreground)
             .border_r_1()
             .border_color(theme.sidebar_border)
-            .child(
-                div()
-                    .px_3()
-                    .pt_3()
-                    .pb_1()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(theme.muted_foreground)
-                    .child("CLUSTERS"),
-            )
+            .child(pane_title("CLUSTERS", traffic_lights, theme))
             .child(list)
             .child(pane_handle(
                 "clusters-edge",
@@ -1667,16 +1659,7 @@ impl Workspace {
             .text_color(theme.sidebar_foreground)
             .border_r_1()
             .border_color(theme.sidebar_border)
-            .child(
-                div()
-                    .px_3()
-                    .pt_3()
-                    .pb_1()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(theme.muted_foreground)
-                    .child("RESOURCES"),
-            )
+            .child(pane_title("RESOURCES", px(0.), theme))
             .child(div().flex_1().min_h_0().child(self.nav.clone()))
             .child(pane_handle(
                 "nav-edge",
@@ -1765,7 +1748,7 @@ impl Workspace {
         let watch_mode = controls
             .watch_mode
             .then(|| self.render_watch_mode(&name, cx));
-        let first_row = h_flex()
+        let first_row = super::theme::moves_window(h_flex())
             .h(px(HEADER_HEIGHT))
             .flex_none()
             .px_3()
@@ -2316,6 +2299,27 @@ impl Workspace {
             .child(self.render_header(&cluster, window_width, theme, cx))
             .child(content)
             .into_any_element()
+    }
+}
+
+/// A side pane's title. On macOS it is the top row, as tall as the main header, starts `leading`
+/// from the pane's edge (clear of the traffic lights) and moves the window.
+fn pane_title(title: &'static str, leading: Pixels, theme: &Theme) -> impl IntoElement {
+    let row = div()
+        .px_3()
+        .text_xs()
+        .font_semibold()
+        .text_color(theme.muted_foreground)
+        .child(title);
+    if cfg!(target_os = "macos") {
+        super::theme::moves_window(row)
+            .flex()
+            .flex_none()
+            .items_center()
+            .h(px(HEADER_HEIGHT))
+            .when(leading > px(0.), |el| el.pl(leading))
+    } else {
+        row.pt_3().pb_1()
     }
 }
 
@@ -2978,6 +2982,7 @@ impl Render for Workspace {
         let theme = cx.theme();
         let has_cluster = self.model.read(cx).active_cluster().is_some();
         let widths = self.layout(window_width, cx);
+        let traffic_lights = super::theme::traffic_light_inset(window);
         h_flex()
             .id("workspace")
             .key_context(registry::WORKSPACE)
@@ -3018,7 +3023,13 @@ impl Render for Workspace {
                 let height = f32::from(bottom - e.event.position.y);
                 this.resize_dock(height, f32::from(e.bounds.size.height), cx);
             }))
-            .child(self.render_sidebar(&widths, theme, self.sidebar_focus.is_focused(window), cx))
+            .child(self.render_sidebar(
+                &widths,
+                traffic_lights,
+                theme,
+                self.sidebar_focus.is_focused(window),
+                cx,
+            ))
             .when(has_cluster, |el| {
                 el.child(self.render_nav_column(widths.navigation, theme))
             })
@@ -3028,6 +3039,19 @@ impl Render for Workspace {
                     .flex_1()
                     .min_w_0()
                     .h_full()
+                    .relative()
+                    // With no cluster there is no header, and the window still needs a top to
+                    // drag it by.
+                    .when(!has_cluster, |el| {
+                        el.child(
+                            super::theme::moves_window(div())
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .w_full()
+                                .h(px(HEADER_HEIGHT)),
+                        )
+                    })
                     .child(h_flex().flex_1().min_h_0().w_full().child(self.render_main(
                         window_width,
                         theme,
