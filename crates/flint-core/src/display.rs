@@ -106,7 +106,7 @@ fn short_single_line(context: &str) -> String {
 }
 
 /// The most of an EKS region or account a label shows.
-const MAX_ARN_PART_CHARS: usize = 20;
+const MAX_ARN_PART_CHARS: usize = 16;
 /// How many characters of a context name a label quotes around where it differs.
 const EXCERPT_CHARS: usize = 16;
 /// How many of those come before the first character that differs.
@@ -151,41 +151,61 @@ struct Label<'a> {
     /// The context as one line.
     full: String,
     custom: Option<&'a str>,
-    /// The real name as shown so far.
-    real: String,
+    /// The short real name.
+    name: String,
+    /// What tells the real name from others, kept whole when the label is cut.
+    suffix: String,
     detail: Detail,
 }
 
 impl Label<'_> {
+    /// The real name before any cut.
+    fn real(&self) -> String {
+        format!("{}{}", self.name, self.suffix)
+    }
+
+    /// The custom name and the real name as drawn. The cut falls on the names, so the suffix
+    /// that tells this label from another always fits within [`MAX_LABEL_CHARS`].
+    fn fitted(&self) -> (Option<String>, String) {
+        let suffix = self.suffix.chars().count();
+        let custom = self.custom.map(|name| {
+            let room = MAX_LABEL_CHARS
+                .saturating_sub(BESIDE_REAL_CHARS + suffix + MIN_REAL_NAME_CHARS)
+                .clamp(MIN_CUSTOM_NAME_CHARS, MAX_NAME_BESIDE_REAL);
+            middle_truncate(name, room)
+        });
+        let beside = custom
+            .as_ref()
+            .map_or(0, |name| name.chars().count() + BESIDE_REAL_CHARS);
+        let room = MAX_LABEL_CHARS.saturating_sub(beside + suffix);
+        let real = format!("{}{}", middle_truncate(&self.name, room), self.suffix);
+        (custom, real)
+    }
+
     /// The label as drawn.
     fn shown(&self) -> String {
-        match self.custom {
-            Some(name) => format!(
-                "{} ({})",
-                middle_truncate(name, MAX_NAME_BESIDE_REAL),
-                self.real
-            ),
-            None => self.real.clone(),
+        match self.fitted() {
+            (Some(custom), real) => format!("{custom} ({real})"),
+            (None, real) => real,
         }
     }
 
     /// Adds the next detail, to tell this from `rivals`. `false` when none is left.
     fn say_more(&mut self, rivals: &[&str]) -> bool {
-        let short = short_name(&self.full);
         let region_and_account = parse_eks_arn(&self.full)
             .filter(|_| self.detail == Detail::Short)
             .map(|arn| {
                 format!(
-                    "{short} · {} · {}",
+                    " · {} · {}",
                     middle_truncate(arn.region, MAX_ARN_PART_CHARS),
                     middle_truncate(arn.account, MAX_ARN_PART_CHARS)
                 )
             });
-        if let Some(real) = region_and_account {
-            self.real = real;
+        if let Some(suffix) = region_and_account {
+            self.suffix = suffix;
             self.detail = Detail::RegionAndAccount;
         } else if self.detail != Detail::Excerpt {
-            self.real = format!("{short} · {}", differing_excerpt(&self.full, rivals));
+            self.suffix = format!(" · {}", differing_excerpt(&self.full, rivals));
             self.detail = Detail::Excerpt;
         } else {
             return false;
@@ -205,7 +225,8 @@ fn distinct_labels(contexts: &[&str], custom: &HashMap<String, String>) -> HashM
             context,
             full: single_line(context),
             custom: custom.get(context).map(String::as_str),
-            real: short_single_line(context),
+            name: short_single_line(context),
+            suffix: String::new(),
             detail: Detail::Short,
         })
         .collect();
@@ -215,7 +236,7 @@ fn distinct_labels(contexts: &[&str], custom: &HashMap<String, String>) -> HashM
         // the only thing that tells two clusters apart.
         let mut groups: HashMap<String, BTreeSet<usize>> = HashMap::new();
         for (at, label) in labels.iter().enumerate() {
-            for text in [label.real.clone(), label.shown()] {
+            for text in [label.real(), label.fitted().1, label.shown()] {
                 groups
                     .entry(cluster_name_key(&text))
                     .or_default()
@@ -242,10 +263,17 @@ fn distinct_labels(contexts: &[&str], custom: &HashMap<String, String>) -> HashM
     // What still reads the same (names that differ only in case, say) is numbered.
     let mut taken = BTreeSet::new();
     for label in &mut labels {
-        let real = label.real.clone();
+        let suffix = label.suffix.clone();
         let mut number = 2;
-        while !taken.insert(cluster_name_key(&label.shown())) {
-            label.real = format!("{real} · {number}");
+        loop {
+            let shown = cluster_name_key(&label.shown());
+            let real = cluster_name_key(&label.fitted().1);
+            if !taken.contains(&shown) && !taken.contains(&real) {
+                taken.insert(shown);
+                taken.insert(real);
+                break;
+            }
+            label.suffix = format!("{suffix} · {number}");
             number += 1;
         }
     }
@@ -253,6 +281,159 @@ fn distinct_labels(contexts: &[&str], custom: &HashMap<String, String>) -> HashM
         .iter()
         .map(|label| (label.context.to_owned(), label.shown()))
         .collect()
+}
+
+/// The longest label a dialog title quotes whole.
+const MAX_LABEL_CHARS: usize = 48;
+/// About what the sidebar shows of a name at its narrowest.
+const NARROW_NAME_CHARS: usize = 14;
+/// The most of a name's differing word that leads its compact label.
+const MAX_LEAD_CHARS: usize = NARROW_NAME_CHARS;
+/// How many of an account's last digits a compact label shows at least.
+const MIN_ACCOUNT_TAIL_CHARS: usize = 4;
+/// What " (" and ")" add around a real name beside a custom one.
+const BESIDE_REAL_CHARS: usize = 3;
+/// The least of a short real name a cut label keeps while a custom name gives way.
+const MIN_REAL_NAME_CHARS: usize = 8;
+/// The least of a custom name a cut label keeps.
+const MIN_CUSTOM_NAME_CHARS: usize = 4;
+
+/// The start of `label` that stays visible at the narrowest width, in comparable form.
+fn narrow_key(label: &str) -> String {
+    cluster_name_key(&label.chars().take(NARROW_NAME_CHARS).collect::<String>())
+}
+
+/// The word of `full` from where it stops matching the closest of `rivals`.
+fn differing_word(full: &str, rivals: &[&str]) -> String {
+    let shared = rivals
+        .iter()
+        .map(|rival| {
+            full.chars()
+                .zip(rival.chars())
+                .take_while(|(a, b)| a == b)
+                .count()
+        })
+        .max()
+        .unwrap_or(0);
+    full.chars()
+        .skip(shared)
+        .take_while(|c| !CUSTOM_NAME_PUNCTUATION.contains(*c))
+        .take(MAX_LEAD_CHARS)
+        .collect()
+}
+
+/// What tells the EKS context `full` from every one of `rivals`: its region, else the end of its
+/// account. `None` when neither does alone, or a rival is not an EKS context.
+fn eks_lead(full: &str, rivals: &[&str]) -> Option<String> {
+    let arn = parse_eks_arn(full)?;
+    let others = rivals
+        .iter()
+        .map(|rival| parse_eks_arn(rival))
+        .collect::<Option<Vec<_>>>()?;
+    if others.is_empty() {
+        return None;
+    }
+    if others.iter().all(|other| other.region != arn.region) {
+        return Some(arn.region.chars().take(MAX_LEAD_CHARS).collect());
+    }
+    if !others.iter().all(|other| other.account != arn.account) {
+        return None;
+    }
+    let digits: Vec<char> = arn.account.chars().collect();
+    let shared = others
+        .iter()
+        .map(|other| {
+            digits
+                .iter()
+                .zip(other.account.chars())
+                .take_while(|(a, b)| **a == *b)
+                .count()
+        })
+        .max()
+        .unwrap_or(0);
+    let keep = (digits.len() - shared)
+        .max(MIN_ACCOUNT_TAIL_CHARS)
+        .min(digits.len())
+        .min(MAX_LEAD_CHARS - 1);
+    let tail: String = digits[digits.len() - keep..].iter().collect();
+    Some(match keep < digits.len() {
+        true => format!("…{tail}"),
+        false => tail,
+    })
+}
+
+/// `text` led by `word`, within what a compact row shows. The cut falls on `text`.
+fn led_by(word: &str, text: &str) -> String {
+    let room = MAX_NAME_CHARS
+        .saturating_sub(word.chars().count() + " · ".chars().count())
+        .max(3);
+    format!("{word} · {}", middle_truncate(text, room))
+}
+
+/// What each context is called in compact rows and headers, which cut text at its end: its
+/// `custom` name, else its short name. A generated name whose visible start reads like another
+/// label's leads with what differs; a custom name does so only for another custom name. What
+/// still reads the same is numbered, so the difference survives the narrowest width.
+fn compact_labels(contexts: &[&str], custom: &HashMap<String, String>) -> HashMap<String, String> {
+    let unique: BTreeSet<&str> = contexts.iter().copied().collect();
+    let fulls: BTreeMap<&str, String> = unique.iter().map(|&c| (c, single_line(c))).collect();
+    let texts: BTreeMap<&str, String> = unique
+        .iter()
+        .map(|&c| {
+            let text = custom
+                .get(c)
+                .cloned()
+                .unwrap_or_else(|| short_single_line(c));
+            (c, text)
+        })
+        .collect();
+    let mut groups: HashMap<String, Vec<&str>> = HashMap::new();
+    for (&context, text) in &texts {
+        groups.entry(narrow_key(text)).or_default().push(context);
+    }
+    // Custom names first, so a generated label gives way to one.
+    let mut order: Vec<&str> = unique.iter().copied().collect();
+    order.sort_by_key(|context| !custom.contains_key(*context));
+    let mut taken = BTreeSet::new();
+    let mut labels = HashMap::with_capacity(unique.len());
+    for context in order {
+        let text = &texts[context];
+        let others: Vec<&str> = groups[&narrow_key(text)]
+            .iter()
+            .copied()
+            .filter(|&other| other != context)
+            .collect();
+        let word = if custom.contains_key(context) {
+            let rivals: Vec<&str> = others
+                .iter()
+                .filter(|other| custom.contains_key(**other))
+                .map(|other| texts[other].as_str())
+                .collect();
+            match rivals.is_empty() {
+                true => String::new(),
+                false => differing_word(text, &rivals),
+            }
+        } else {
+            let rivals: Vec<&str> = others.iter().map(|other| fulls[other].as_str()).collect();
+            match rivals.is_empty() {
+                true => String::new(),
+                false => eks_lead(&fulls[context], &rivals)
+                    .unwrap_or_else(|| differing_word(&fulls[context], &rivals)),
+            }
+        };
+        let base = match word.is_empty() {
+            true => text.clone(),
+            false => led_by(&word, text),
+        };
+        let mut label = base.clone();
+        let mut number = 2;
+        while !taken.insert(narrow_key(&label)) {
+            label = led_by(&number.to_string(), &base);
+            number += 1;
+        }
+        labels.insert(context.to_owned(), label);
+    }
+    labels
 }
 
 /// How much of a custom name is shown before the real one, so the real one always fits.
@@ -370,6 +551,8 @@ pub struct ClusterNames {
     /// What each context is called where it must be told from every other
     /// ([`distinct_labels`]).
     labels: HashMap<String, String>,
+    /// What each context is called in compact rows ([`compact_labels`]).
+    compact: HashMap<String, String>,
 }
 
 impl ClusterNames {
@@ -383,23 +566,32 @@ impl ClusterNames {
             .iter()
             .filter_map(|&c| Some((c, clean_custom_name(names.get(c)?)?)))
             .collect();
+        let generated = compact_labels(&contexts, &HashMap::new());
         let reads_like_another = |context: &str, name: &str| {
             let name = cluster_name_key(name);
             contexts.iter().any(|&other| {
                 other != context
                     && (cluster_name_key(other) == name
-                        || cluster_name_key(&short_name(other)) == name)
+                        || cluster_name_key(&short_name(other)) == name
+                        || generated
+                            .get(other)
+                            .is_some_and(|label| cluster_name_key(label) == name))
             }) || wanted
                 .iter()
                 .any(|(other, custom)| *other != context && cluster_name_key(custom) == name)
         };
-        let custom = wanted
+        let custom: HashMap<String, String> = wanted
             .iter()
             .filter(|(context, name)| !reads_like_another(context, name))
             .map(|(context, name)| ((*context).to_owned(), name.clone()))
             .collect();
         let labels = distinct_labels(&contexts, &custom);
-        ClusterNames { custom, labels }
+        let compact = compact_labels(&contexts, &custom);
+        ClusterNames {
+            custom,
+            labels,
+            compact,
+        }
     }
 
     /// The custom name of `context`, if it has a usable one.
@@ -409,10 +601,10 @@ impl ClusterNames {
 
     /// What `context` is called on screen.
     pub fn of(&self, context: &str) -> String {
-        match self.custom(context) {
-            Some(name) => name.to_owned(),
-            None => short_name(context),
-        }
+        self.compact
+            .get(context)
+            .cloned()
+            .unwrap_or_else(|| short_single_line(context))
     }
 
     /// [`ClusterNames::of`], followed by the real name when a custom name is shown: for anything
@@ -497,6 +689,112 @@ mod tests {
             .iter()
             .map(|(c, n)| ((*c).to_owned(), (*n).to_owned()))
             .collect()
+    }
+
+    /// What a surface that cuts text at its end shows of `label` in `chars` characters.
+    fn visible(label: &str, chars: usize) -> String {
+        cluster_name_key(&label.chars().take(chars).collect::<String>())
+    }
+
+    // covers UP-01: names alike at both ends stay distinct where they are cut.
+    #[test]
+    fn contexts_alike_at_both_ends_read_differently_on_every_surface() {
+        let eks =
+            |region: &str, name: &str| format!("arn:aws:eks:{region}:123456789012:cluster/{name}");
+        let sets: [Vec<String>; 4] = [
+            vec![
+                eks("eu-west-1", "payments-production-blue-cluster-main"),
+                eks("eu-west-1", "payments-production-green-cluster-main"),
+            ],
+            vec![
+                eks("eu-central-1", "payments-production-main"),
+                eks("us-central-1", "payments-production-main"),
+            ],
+            vec![
+                "team-platform-production-blue-cluster-main".to_owned(),
+                "team-platform-production-green-cluster-main".to_owned(),
+                "team-platform-production-gray-cluster-main".to_owned(),
+            ],
+            vec![
+                "production-cluster-a".to_owned(),
+                "production-cluster-b".to_owned(),
+            ],
+        ];
+        for contexts in &sets {
+            let refs: Vec<&str> = contexts.iter().map(String::as_str).collect();
+            let shown = ClusterNames::new(refs.iter().copied(), &BTreeMap::new());
+            // The sidebar and header at their narrowest, then a dialog title's limit.
+            let compact: BTreeSet<String> = refs
+                .iter()
+                .map(|c| visible(&shown.of(c), NARROW_NAME_CHARS))
+                .collect();
+            assert_eq!(compact.len(), refs.len(), "{refs:?}");
+            let titles: BTreeSet<String> = refs
+                .iter()
+                .map(|c| {
+                    let label = shown.with_real(c);
+                    assert!(label.chars().count() <= MAX_LABEL_CHARS, "{label}");
+                    cluster_name_key(&label)
+                })
+                .collect();
+            assert_eq!(titles.len(), refs.len(), "{refs:?}");
+        }
+    }
+
+    // covers UP-01: a cut title keeps what tells the real names apart.
+    #[test]
+    fn a_title_cut_for_a_custom_name_keeps_the_differing_region() {
+        let ca = "arn:aws:eks:ca-central-1:111111111111:cluster/payments-production-main";
+        let eu = "arn:aws:eks:eu-central-1:111111111111:cluster/payments-production-main";
+        let shown = ClusterNames::new(
+            [ca, eu],
+            &names(&[(ca, "Canada Production"), (eu, "Europe Production")]),
+        );
+        for (context, region) in [(ca, "ca-central-1"), (eu, "eu-central-1")] {
+            let label = shown.with_real(context);
+            assert!(label.contains(region), "{label}");
+            assert!(label.chars().count() <= MAX_LABEL_CHARS, "{label}");
+        }
+    }
+
+    // covers UP-01: a custom name and a generated label stay apart where rows cut them.
+    #[test]
+    fn a_generated_label_gives_way_to_a_custom_name_at_the_narrowest_width() {
+        let eu = "arn:aws:eks:eu-west-1:1:cluster/payments-prod";
+        let us = "arn:aws:eks:us-east-1:1:cluster/payments-prod";
+        let qa = "kind-qa";
+        for alias in ["eu-west-1 · payments-qa", "us-east-1 · payments-qa"] {
+            let shown = ClusterNames::new([eu, us, qa], &names(&[(qa, alias)]));
+            assert_eq!(shown.of(qa), alias);
+            let visible: BTreeSet<String> = [eu, us, qa]
+                .iter()
+                .map(|c| visible(&shown.of(c), NARROW_NAME_CHARS))
+                .collect();
+            assert_eq!(visible.len(), 3, "{alias}");
+        }
+    }
+
+    // covers UP-01: two custom names alike at the start lead with what differs.
+    #[test]
+    fn custom_names_alike_at_the_start_stay_distinct_when_cut() {
+        let shown = ClusterNames::new(
+            ["a", "b"],
+            &names(&[("a", "Production East"), ("b", "Production West")]),
+        );
+        assert_ne!(
+            visible(&shown.of("a"), NARROW_NAME_CHARS),
+            visible(&shown.of("b"), NARROW_NAME_CHARS)
+        );
+    }
+
+    // covers UP-01: accounts that differ late read as accounts, not as a bare digit.
+    #[test]
+    fn accounts_differing_at_the_end_show_their_last_digits() {
+        let a = "arn:aws:eks:us-east-1:000000000000:cluster/prod";
+        let b = "arn:aws:eks:us-east-1:000000000001:cluster/prod";
+        let shown = ClusterNames::new([a, b], &BTreeMap::new());
+        assert_eq!(shown.of(a), "…0000 · prod");
+        assert_eq!(shown.of(b), "…0001 · prod");
     }
 
     // covers UP-01
@@ -666,8 +964,10 @@ mod tests {
             "payments-prod · us-east-1 · 222222222222"
         );
         assert_eq!(shown.with_real("kind-dev"), "kind-dev");
-        // The compact name does not change.
-        assert_eq!(shown.of(eu), "payments-prod");
+        // The compact name leads with what differs, since rows and headers cut at the end.
+        assert_eq!(shown.of(eu), "eu-west-1 · paym…-prod");
+        assert_eq!(shown.of(us), "us-east-1 · paym…-prod");
+        assert_eq!(shown.of("kind-dev"), "kind-dev");
 
         // Same region and account in two partitions: the label quotes where they differ.
         let cn = "arn:aws-cn:eks:eu-west-1:111111111111:cluster/payments-prod";
@@ -693,9 +993,6 @@ mod tests {
             "main (payments-prod · eu-west-1 · 111111111111)"
         );
     }
-
-    /// The longest label [`ClusterNames::with_real`] may give, so a title stays a few lines.
-    const MAX_LABEL_CHARS: usize = 80;
 
     fn assert_told_apart(shown: &ClusterNames, contexts: &[&str]) {
         let labels: Vec<String> = contexts.iter().map(|c| shown.with_real(c)).collect();
