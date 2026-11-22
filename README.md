@@ -168,9 +168,10 @@ Flint is in early development.
 **Coming next:**
 
 - Editing: YAML with dry-run and diff; delete, scale, restart, cordon and drain, all behind the cluster protection.
+- Multi-cluster management, watching and alerting: cluster sets, then problem alerts and guarded fleet actions across
+  them.
 - Curated views for core kinds, CPU and memory from metrics-server, and cluster dashboards.
 - Port-forwarding and Helm releases.
-- Cluster sets, then problem alerts and guarded fleet actions across them.
 - A signed and notarized app with a Homebrew cask.
 - [Regex search](https://github.com/Sealos/flint/issues/309) and [log time ranges](https://github.com/Sealos/flint/issues/265).
 
@@ -256,7 +257,8 @@ Security** and choose **Open Anyway**.
 
 Each release also has an AppImage for x86_64 and aarch64 (arm64). Linux support is best effort: CI builds and
 tests it, but it is not tested on every desktop and distribution ([ADR-0016](docs/adr/0016-linux-appimage.md)). It
-needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13 or later).
+needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13 or later). The AppImage is the Linux install; deb and
+rpm packages are planned after 1.0.
 
 ```sh
 gh release download -R Sealos/flint --pattern 'flint-*-linux-x86_64.AppImage*'   # or linux-aarch64

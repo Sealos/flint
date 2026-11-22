@@ -40,5 +40,15 @@ disabled, and says why.
 - Protection lands with M3, the first milestone with write actions. Exec and port-forward (M2, M5) count as
   writes, because they run code in, or open a path into, the cluster; on a protected cluster they ask for an
   unlock. Until M3 ships protection, they work as today.
+- **Kubeconfig changes and writes:** before each request of a write, Flint checks the context against the kubeconfig
+  as it last loaded it. Flint reloads the files when its file watcher reports a change, after a 300 ms debounce. A
+  change that has not been loaded yet when the check runs, or that is made after the check and before the request is
+  sent, is not detected for that request.
+- **Exec and auth-provider credentials need Kubernetes 1.28 or newer for writes.** Their tokens can rotate at any
+  time, so a review is bound to the identity the server reports for the credential, not to the token. Flint asks for
+  it with a `SelfSubjectReview` (`authentication.k8s.io/v1`, served from Kubernetes 1.28) before each request of a
+  write. On an older server that API is missing, so Flint refuses the write before sending it. Token files and
+  client certificates are compared directly and have no such requirement, and reading a cluster does not use this
+  check.
 - New users with only remote clusters see actions disabled until they unlock or trust a cluster. The disabled
   state explains this and offers the unlock in place.

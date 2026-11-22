@@ -24,9 +24,8 @@ the background while the app runs, stored on disk.
   recording pauses with a "sign-in needed" badge and a notification; signing in resumes it, and the gap is marked.
 - **Viewing:** a Recordings list (sidebar and palette). A recording opens as a timeline: logs in the log tab below,
   events and CPU/memory tracks above on a shared time axis; clicking an event moves the logs to that moment.
-- **Agents:** read-only MCP tools list recordings and query a time range of lines, events and metrics, for exposed
-  clusters only, through the shared redactor and exposure scope, recorded in the activity log
-  ([ADR-0013](./0013-agent-trust-model.md)).
+- **Agents:** recordings are not available through MCP. The MCP server stays at its six read-only tools
+  ([ADR-0009](./0009-read-only-mcp-server.md)).
 - **Export:** a time range as plain-text logs plus events and metrics as CSV, with the "not redacted" warning that
   Save logs shows.
 
