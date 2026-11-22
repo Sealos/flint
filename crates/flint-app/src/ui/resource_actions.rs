@@ -13,10 +13,10 @@
 //! for one object, so the object is claimed as a confirmation runs, right before the write, and
 //! released when the write ends, whatever became of the window it started in.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use flint_core::KindId;
-use flint_core::display::ClusterNames;
+use flint_core::display::{ClusterNames, cluster_name_key, single_line};
 use flint_core::redact::first_line;
 use flint_core::write::{
     BlockedReason, DrainReport, PodName, WriteError, WriteOutcome, WriteProposal, WriteReview,
@@ -573,12 +573,14 @@ pub(in crate::ui) fn show_drain_report(window: &mut Window, cx: &mut App) {
 }
 
 /// The strip's line for the drains running: each is named, up to [`STRIP_NAMES`], then counted.
-/// Across clusters a name says which, by the label `names` tells it from all its siblings with.
-fn draining_text(keys: &[&WriteKey], names: &ClusterNames) -> Option<String> {
+/// Across clusters a name says which, by [`strip_cluster_labels`]. `names` is called only then:
+/// building the labels costs too much for a strip that does not show them.
+fn draining_text(keys: &[&WriteKey], names: impl FnOnce() -> ClusterNames) -> Option<String> {
     let across = keys.windows(2).any(|w| w[0].cluster != w[1].cluster);
-    let name = |key: &&WriteKey| match across {
-        true => format!("{}/{}", names.exact(&key.cluster), key.name),
-        false => key.name.clone(),
+    let labels = across.then(|| strip_cluster_labels(keys, &names()));
+    let name = |key: &&WriteKey| match &labels {
+        Some(labels) => format!("{}/{}", labels[key.cluster.as_str()], key.name),
+        None => key.name.clone(),
     };
     match keys {
         [] => None,
@@ -598,6 +600,31 @@ fn draining_text(keys: &[&WriteKey], names: &ClusterNames) -> Option<String> {
     }
 }
 
+/// What the strip calls each cluster of `keys`: its exact label, or its whole context on one line
+/// for all of them when two labels read the same. A context that left kubeconfig is named whole,
+/// and that can read like the short label of one still there.
+fn strip_cluster_labels<'a>(
+    keys: &[&'a WriteKey],
+    names: &ClusterNames,
+) -> HashMap<&'a str, String> {
+    let clusters: BTreeSet<&str> = keys.iter().map(|key| key.cluster.as_str()).collect();
+    let read: BTreeSet<String> = clusters
+        .iter()
+        .map(|cluster| cluster_name_key(&names.exact(cluster)))
+        .collect();
+    let distinct = read.len() == clusters.len();
+    clusters
+        .into_iter()
+        .map(|cluster| {
+            let label = match distinct {
+                true => names.exact(cluster),
+                false => single_line(cluster),
+            };
+            (cluster, label)
+        })
+        .collect()
+}
+
 /// What the strip says of a drain that ended.
 fn finished_text(finished: &FinishedDrain) -> String {
     let how = match finished.report.stopped {
@@ -609,7 +636,7 @@ fn finished_text(finished: &FinishedDrain) -> String {
 
 /// The workspace's strips for drains: those running, and the latest result with its button.
 pub(in crate::ui) fn drain_strips(
-    names: &ClusterNames,
+    names: impl FnOnce() -> ClusterNames,
     theme: &Theme,
     cx: &App,
 ) -> Vec<AnyElement> {
@@ -1289,19 +1316,22 @@ mod tests {
         let key = |cluster, name| WriteKey::new(cluster, &nodes, None, name);
         let (a, b, c, d) = (key("x", "a"), key("x", "b"), key("x", "c"), key("x", "d"));
         let names = ClusterNames::new(["x", "y"], &Default::default());
-        assert_eq!(draining_text(&[], &names), None);
-        assert_eq!(draining_text(&[&a], &names).unwrap(), "Draining a…");
+        assert_eq!(draining_text(&[], || names.clone()), None);
         assert_eq!(
-            draining_text(&[&a, &b], &names).unwrap(),
+            draining_text(&[&a], || names.clone()).unwrap(),
+            "Draining a…"
+        );
+        assert_eq!(
+            draining_text(&[&a, &b], || names.clone()).unwrap(),
             "Draining 2 nodes: a, b…"
         );
         assert_eq!(
-            draining_text(&[&a, &b, &c, &d], &names).unwrap(),
+            draining_text(&[&a, &b, &c, &d], || names.clone()).unwrap(),
             "Draining 4 nodes: a, b, c and 1 more…"
         );
         let other = key("y", "a");
         assert_eq!(
-            draining_text(&[&a, &other], &names).unwrap(),
+            draining_text(&[&a, &other], || names.clone()).unwrap(),
             "Draining 2 nodes: x/a, y/a…"
         );
     }
@@ -1317,7 +1347,7 @@ mod tests {
             WriteKey::new(two, &nodes, None, "node-1"),
         );
         let names = ClusterNames::new([one, two], &Default::default());
-        let text = draining_text(&[&a, &b], &names).unwrap();
+        let text = draining_text(&[&a, &b], || names.clone()).unwrap();
         assert!(
             text.contains(&format!("{}/node-1", names.with_real(one))),
             "{text}"
@@ -1352,7 +1382,7 @@ mod tests {
             [blue.cluster.as_str(), green.cluster.as_str()],
             &Default::default(),
         );
-        let text = draining_text(&[&blue, &green], &names).unwrap();
+        let text = draining_text(&[&blue, &green], || names.clone()).unwrap();
         let (one, two) = (names.exact(&blue.cluster), names.exact(&green.cluster));
         assert_ne!(one, two);
         assert!(text.contains(&format!("{one}/a")), "{text}");
@@ -1360,10 +1390,42 @@ mod tests {
 
         // A cluster that left kubeconfig mid-drain is named whole.
         let names = ClusterNames::new([blue.cluster.as_str()], &Default::default());
-        let text = draining_text(&[&blue, &green], &names).unwrap();
+        let text = draining_text(&[&blue, &green], || names.clone()).unwrap();
         assert!(
             text.contains("team-platform-production-green-cluster-main/a"),
             "{text}"
+        );
+    }
+
+    // covers UP-53: a context that left kubeconfig cannot read like one still there.
+    #[test]
+    fn the_strip_names_clusters_whole_when_a_removed_one_reads_like_another() {
+        let eks = "arn:aws:eks:eu-west-1:123456789012:cluster/prod";
+        let nodes = KindId::new("", "nodes");
+        let (kept, gone) = (
+            WriteKey::new(eks, &nodes, None, "node-1"),
+            WriteKey::new("prod", &nodes, None, "node-1"),
+        );
+        let names = ClusterNames::new([eks], &Default::default());
+        assert_eq!(names.exact(eks), names.exact("prod"));
+        assert_eq!(
+            draining_text(&[&kept, &gone], || names.clone()).unwrap(),
+            format!("Draining 2 nodes: {eks}/node-1, prod/node-1…")
+        );
+    }
+
+    // covers UP-53: the labels are built only for a strip that names clusters.
+    #[test]
+    fn the_strip_builds_labels_only_across_clusters() {
+        let nodes = KindId::new("", "nodes");
+        let key = |cluster, name| WriteKey::new(cluster, &nodes, None, name);
+        let (a, b) = (key("x", "a"), key("x", "b"));
+        let unused = || -> ClusterNames { panic!("labels built for one cluster") };
+        assert_eq!(draining_text(&[], unused), None);
+        assert_eq!(draining_text(&[&a], unused).unwrap(), "Draining a…");
+        assert_eq!(
+            draining_text(&[&a, &b], unused).unwrap(),
+            "Draining 2 nodes: a, b…"
         );
     }
 

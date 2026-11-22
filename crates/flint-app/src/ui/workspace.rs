@@ -3166,7 +3166,7 @@ impl Render for Workspace {
                         cx,
                     )))
                     .children(resource_actions::drain_strips(
-                        &self.cluster_names(cx),
+                        || self.cluster_names(cx),
                         theme,
                         cx,
                     ))

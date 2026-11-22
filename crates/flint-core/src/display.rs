@@ -291,6 +291,10 @@ const NARROW_NAME_CHARS: usize = 14;
 const MAX_LEAD_CHARS: usize = NARROW_NAME_CHARS;
 /// How many of an account's last digits a compact label shows at least.
 const MIN_ACCOUNT_TAIL_CHARS: usize = 4;
+/// What a compact label keeps for the region when it shows an account too.
+const MIN_REGION_ROOM_CHARS: usize = 6;
+/// The least of a region quoted for what differs in it.
+const MIN_REGION_CUT_CHARS: usize = 3;
 /// What " (" and ")" add around a real name beside a custom one.
 const BESIDE_REAL_CHARS: usize = 3;
 /// The least of a short real name a cut label keeps while a custom name gives way.
@@ -344,39 +348,64 @@ fn differing_word(full: &str, rivals: &[&str]) -> String {
             start = word_start(before);
         }
     }
-    // The end is what differs, so a cut keeps it.
-    let from = start.max(end.saturating_sub(MAX_LEAD_CHARS - 1));
-    let word: String = chars[from..end].iter().collect();
-    match from > start {
-        true => format!("…{word}"),
-        false => word,
-    }
+    // Keep the end when that still holds the first digit that differs, else start at that digit.
+    let tail = start.max(end.saturating_sub(MAX_LEAD_CHARS - 1));
+    let (from, to) = match tail <= shared {
+        true => (tail, end),
+        false => (shared, shared + MAX_LEAD_CHARS - 2),
+    };
+    marked_cut(&chars, from, to, start, end)
 }
 
-/// The end of `account`, with at least [`MIN_ACCOUNT_TAIL_CHARS`] and all that differs from
-/// `others`, so it reads as an account rather than a bare digit.
-fn account_tail(account: &str, others: &[&str]) -> String {
-    let digits: Vec<char> = account.chars().collect();
-    let shared = others
-        .iter()
-        .map(|other| {
-            digits
-                .iter()
-                .zip(other.chars())
-                .take_while(|(a, b)| **a == *b)
-                .count()
-        })
-        .max()
-        .unwrap_or(0);
-    let keep = (digits.len() - shared)
-        .max(MIN_ACCOUNT_TAIL_CHARS)
-        .min(digits.len())
-        .min(MAX_LEAD_CHARS - 1);
-    let tail: String = digits[digits.len() - keep..].iter().collect();
-    match keep < digits.len() {
-        true => format!("…{tail}"),
-        false => tail,
+/// `chars[from..to]`, with a mark on each side where it stops short of `start` or `end`.
+fn marked_cut(chars: &[char], from: usize, to: usize, start: usize, end: usize) -> String {
+    let before = if from > start { "…" } else { "" };
+    let after = if to < end { "…" } else { "" };
+    let cut: String = chars[from..to].iter().collect();
+    format!("{before}{cut}{after}")
+}
+
+/// The shortest run of `text`, of at least `least` characters and nearest its end, that differs
+/// from each of `others` at the same place, with its marks within `max`. `None` when none fits.
+fn telling_cut(text: &str, others: &BTreeSet<&str>, least: usize, max: usize) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let others: Vec<Vec<char>> = others.iter().map(|other| other.chars().collect()).collect();
+    let len = chars.len();
+    let tells = |from: usize, to: usize| {
+        others
+            .iter()
+            .all(|other| (from..to).any(|at| other.get(at) != Some(&chars[at])))
+    };
+    for width in least.min(len)..=len {
+        for to in (width..=len).rev() {
+            let from = to - width;
+            let marks = usize::from(from > 0) + usize::from(to < len);
+            if width + marks <= max && tells(from, to) {
+                return Some(marked_cut(&chars, from, to, 0, len));
+            }
+        }
     }
+    None
+}
+
+/// The part of `account` that tells it from `others`, at least [`MIN_ACCOUNT_TAIL_CHARS`] long so
+/// it reads as an account rather than a bare digit, and within `max`.
+fn account_cut(account: &str, others: &BTreeSet<&str>, max: usize) -> String {
+    telling_cut(account, others, MIN_ACCOUNT_TAIL_CHARS, max)
+        .unwrap_or_else(|| middle_truncate(account, max))
+}
+
+/// `region` within `max`: cut in the middle, where regions usually match, unless that reads like
+/// one of `others`; then the part that differs.
+fn region_cut(region: &str, others: &BTreeSet<&str>, max: usize) -> String {
+    let cut = middle_truncate(region, max);
+    if others
+        .iter()
+        .all(|other| middle_truncate(other, max) != cut)
+    {
+        return cut;
+    }
+    telling_cut(region, others, MIN_REGION_CUT_CHARS, max).unwrap_or(cut)
 }
 
 /// What tells the EKS context `full` from every one of `rivals`: its region, else the end of its
@@ -399,19 +428,30 @@ fn eks_lead(full: &str, rivals: &[&str]) -> Option<String> {
     if others.iter().all(|other| other.region != arn.region) {
         return Some(middle_truncate(arn.region, MAX_LEAD_CHARS));
     }
-    let accounts: Vec<&str> = others
+    let accounts: BTreeSet<&str> = others
         .iter()
         .map(|other| other.account)
         .filter(|account| *account != arn.account)
         .collect();
-    let tail = account_tail(arn.account, &accounts);
-    if accounts.len() == others.len() {
-        return Some(tail);
+    if others.iter().all(|other| other.account != arn.account) {
+        return Some(account_cut(arn.account, &accounts, MAX_LEAD_CHARS));
     }
-    let room = MAX_LEAD_CHARS
-        .saturating_sub(tail.chars().count() + 1)
-        .max(3);
-    Some(format!("{tail} {}", middle_truncate(arn.region, room)))
+    // Both are needed, and both must show within the narrowest width.
+    let account = account_cut(
+        arn.account,
+        &accounts,
+        MAX_LEAD_CHARS - 1 - MIN_REGION_ROOM_CHARS,
+    );
+    let regions: BTreeSet<&str> = others
+        .iter()
+        .map(|other| other.region)
+        .filter(|region| *region != arn.region)
+        .collect();
+    let room = MAX_LEAD_CHARS - 1 - account.chars().count();
+    Some(format!(
+        "{account} {}",
+        region_cut(arn.region, &regions, room)
+    ))
 }
 
 /// `text` led by `word`, within what a compact row shows. The cut falls on `text`.
@@ -1222,5 +1262,38 @@ mod tests {
         );
         assert_eq!(middle_truncate("abcdef", 5), "ab…ef");
         assert_eq!(middle_truncate("é".repeat(10).as_str(), 4), "é…éé");
+    }
+
+    // covers UP-01: with the name in two regions of two accounts, both show at the narrowest.
+    #[test]
+    fn compact_labels_fit_both_account_and_region() {
+        let arn = |region, account| format!("arn:aws:eks:{region}:{account}:cluster/prod");
+        let contexts = [
+            arn("us-east-1", "123456789012"),
+            arn("us-west-2", "123456789012"),
+            arn("us-east-1", "987654321098"),
+            arn("us-west-2", "987654321098"),
+        ];
+        let names = ClusterNames::new(contexts.iter().map(String::as_str), &BTreeMap::new());
+        let shown: Vec<String> = contexts.iter().map(|c| names.of(c)).collect();
+        let narrow: BTreeSet<String> = shown.iter().map(|label| narrow_key(label)).collect();
+        assert_eq!(narrow.len(), contexts.len(), "{shown:?}");
+        for label in &shown {
+            let lead = label.split(" · ").next().unwrap_or_default();
+            assert!(lead.chars().count() <= NARROW_NAME_CHARS, "{label}");
+            assert!(lead.starts_with('…') && lead.contains(' '), "{label}");
+        }
+    }
+
+    // covers UP-01: a long number keeps the digit that differs, not an arbitrary number.
+    #[test]
+    fn compact_labels_keep_the_first_differing_digit() {
+        let a = "team-platform-production-10000000000000000001-main";
+        let b = "team-platform-production-20000000000000000001-main";
+        let names = ClusterNames::new([a, b], &BTreeMap::new());
+        let (one, two) = (names.of(a), names.of(b));
+        assert!(one.starts_with("…1000"), "{one}");
+        assert!(two.starts_with("…2000"), "{two}");
+        assert_ne!(narrow_key(&one), narrow_key(&two));
     }
 }
