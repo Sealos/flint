@@ -1,5 +1,108 @@
 # Changelog
 
+## [0.5.0](https://github.com/Sealos/flint/compare/v0.4.0...v0.5.0) (2026-11-22)
+
+
+### Features
+
+* **app:** add cluster colour tags pinned to the server ([#544](https://github.com/Sealos/flint/issues/544)) ([bcca9f4](https://github.com/Sealos/flint/commit/bcca9f422a3a8c62276cf8752c1459bc9e2752ee))
+* **app:** disable actions the cluster's rbac forbids ([#539](https://github.com/Sealos/flint/issues/539)) ([8130066](https://github.com/Sealos/flint/commit/8130066dd4a259fc9890cb138ff51c50f09e2cd5))
+* **app:** open the selected list row with enter ([#543](https://github.com/Sealos/flint/issues/543)) ([19a936d](https://github.com/Sealos/flint/commit/19a936dbd62db4804663479d938e2ae55f91564e))
+* **app:** show and filter gitops-managed objects in lists ([#520](https://github.com/Sealos/flint/issues/520)) ([4f896bc](https://github.com/Sealos/flint/commit/4f896bc2b98801b61993c6ab0a97f989b49d7143))
+* **core:** add a credential policy seam that allows by default ([#552](https://github.com/Sealos/flint/issues/552)) ([6dd3faf](https://github.com/Sealos/flint/commit/6dd3fafff4d8c8ba16001a15aa6d97164c550b95)), closes [#445](https://github.com/Sealos/flint/issues/445)
+* **core:** add a worst-first attention rank for problem counts ([#575](https://github.com/Sealos/flint/issues/575)) ([b9c5075](https://github.com/Sealos/flint/commit/b9c507539dc59324b70ca3a8472c58c65cb2ffbb))
+* **core:** add pure connection state model and scheduler ([#551](https://github.com/Sealos/flint/issues/551)) ([7ac395f](https://github.com/Sealos/flint/commit/7ac395f2b301ddbc7362e36a32dcd43eb41a2a53))
+* **core:** add typed dashboard thresholds ([#548](https://github.com/Sealos/flint/issues/548)) ([d5201ba](https://github.com/Sealos/flint/commit/d5201ba2a447056b8b901d3d2218110acd980560))
+* **core:** carry the owning workload on a problem ([#563](https://github.com/Sealos/flint/issues/563)) ([5730739](https://github.com/Sealos/flint/commit/573073945add9550d7d8f85ec4f9474a0cd77fab))
+* **core:** classify crash loops, oom kills, not-ready nodes and failed jobs ([#545](https://github.com/Sealos/flint/issues/545)) ([620d930](https://github.com/Sealos/flint/commit/620d93044a5b7d61fb7a1bde82e66baa2aa68e4f))
+* **core:** classify image pull failures and short workloads ([#549](https://github.com/Sealos/flint/issues/549)) ([00b50b7](https://github.com/Sealos/flint/commit/00b50b772673eec6f73fa53ef9fa482d898e48a2))
+* **core:** decide alerts from problem snapshots ([#550](https://github.com/Sealos/flint/issues/550)) ([fa9b2be](https://github.com/Sealos/flint/commit/fa9b2be3164766f1d1f58213b2934e7520eb9f7f))
+* **core:** read pod and node metrics from metrics-server ([#537](https://github.com/Sealos/flint/issues/537)) ([c1b3ef2](https://github.com/Sealos/flint/commit/c1b3ef2c4ccf8c1c93942fc71809120354f39317))
+* **core:** summarise problems for the cluster dashboard ([#562](https://github.com/Sealos/flint/issues/562)) ([7573abe](https://github.com/Sealos/flint/commit/7573abe967c0979533b6ed578fa7ae10ecf2f86f))
+* **logs:** add regex search to the core matcher ([#565](https://github.com/Sealos/flint/issues/565)) ([da7ca31](https://github.com/Sealos/flint/commit/da7ca31feee4c486b4c4e2d28fc9130b606a485f))
+
+
+### Bug Fixes
+
+* **app:** give lock and ai exposure controls accessible names ([#527](https://github.com/Sealos/flint/issues/527)) ([48cdd9f](https://github.com/Sealos/flint/commit/48cdd9f35398d3c74367a6673f6f2db1f2171a5a))
+* **app:** keep every target line visible in write confirmations ([#546](https://github.com/Sealos/flint/issues/546)) ([189f9fc](https://github.com/Sealos/flint/commit/189f9fc0908df4a6d02bef7ca57050e756d606fb))
+* **app:** keep more of the list visible beside the dock ([#533](https://github.com/Sealos/flint/issues/533)) ([5ead177](https://github.com/Sealos/flint/commit/5ead17732d107732df63ef968aff2ecfcbb6c4f0))
+* **app:** keep the cluster in the breadcrumb at narrow widths ([#525](https://github.com/Sealos/flint/issues/525)) ([eb02f8c](https://github.com/Sealos/flint/commit/eb02f8c2cac08a5ae57eba36b492a75a188c8eeb))
+* **app:** keep the cluster row's reconnecting status precise ([#538](https://github.com/Sealos/flint/issues/538)) ([3e18a07](https://github.com/Sealos/flint/commit/3e18a074331a02d9def3068be5faf990bbcb04a4))
+* **app:** keep the dock tab list inside the window and its highlight in view ([#529](https://github.com/Sealos/flint/issues/529)) ([3dfce49](https://github.com/Sealos/flint/commit/3dfce49957dddde1c5a236cbdaf6c87f430e226a))
+* **app:** keep the row menu open when the row narrows ([#583](https://github.com/Sealos/flint/issues/583)) ([fd0c182](https://github.com/Sealos/flint/commit/fd0c1820b4f0ca8b9594c7fc7b378faf1dc5d678))
+* **app:** name the target first in unlock and trust dialogs ([#556](https://github.com/Sealos/flint/issues/556)) ([8861b09](https://github.com/Sealos/flint/commit/8861b090ea3016591d222fb4a9157b3734114c8c))
+* **app:** rank the resource switcher by relevance ([#531](https://github.com/Sealos/flint/issues/531)) ([05a935a](https://github.com/Sealos/flint/commit/05a935a1157edd583c3c96ffc091999d6f3907af))
+* **app:** restore the list's text filter on go back ([#535](https://github.com/Sealos/flint/issues/535)) ([85e7249](https://github.com/Sealos/flint/commit/85e72495598b5ac4d2f32bc8a0d5369a1db7dddd))
+* **app:** scroll a long fetch error and keep retry visible ([#594](https://github.com/Sealos/flint/issues/594)) ([72f2be8](https://github.com/Sealos/flint/commit/72f2be86d8c5fec50912e087cacca675d335534b))
+* **app:** show the full namespace focus ring and keep sidebar rows readable ([#553](https://github.com/Sealos/flint/issues/553)) ([98dcb48](https://github.com/Sealos/flint/commit/98dcb48e29d836dbba2d30ce56415536c54fd9a2))
+* **app:** stop calling a failed namespace forbidden in limited lists ([#542](https://github.com/Sealos/flint/issues/542)) ([4ff827a](https://github.com/Sealos/flint/commit/4ff827a10b818f42ee8b3ff0145e53d9a5027c59))
+* **app:** tell the yaml editor to reopen an object after its context moved ([#536](https://github.com/Sealos/flint/issues/536)) ([4a18cec](https://github.com/Sealos/flint/commit/4a18cecb91327ca6620d50c2e63982aad3617e9e))
+* **app:** wrap notices that end mid-word ([#532](https://github.com/Sealos/flint/issues/532)) ([bddf950](https://github.com/Sealos/flint/commit/bddf9506f9d445a67f1b4a57c594f7eb1220da99))
+* **core:** apply the problem hold-down before alerting ([#576](https://github.com/Sealos/flint/issues/576)) ([d52e025](https://github.com/Sealos/flint/commit/d52e025bbe8c7cf73dce9b8a37eb71bf9702a24e))
+* **core:** check the current kubeconfig before each write ([#541](https://github.com/Sealos/flint/issues/541)) ([d4bd0c2](https://github.com/Sealos/flint/commit/d4bd0c2b12c17c0d9c9650e68ab4c0af9ec308ce))
+* **core:** keep a paused cluster from starting connections ([#559](https://github.com/Sealos/flint/issues/559)) ([68fe7bf](https://github.com/Sealos/flint/commit/68fe7bff4cc6717871e3f64f6079c2fb67b073ad))
+* **core:** keep an out-of-order kubeconfig result from disturbing a running check ([#558](https://github.com/Sealos/flint/issues/558)) ([69d52a0](https://github.com/Sealos/flint/commit/69d52a0aece887f9b2884afd27cee9b44a4c4954))
+* **core:** keep dependency and protocol traffic out of stderr ([#582](https://github.com/Sealos/flint/issues/582)) ([67f71b3](https://github.com/Sealos/flint/commit/67f71b35bd8dd1f591b9f233fe16f86072c2db96))
+* **core:** make kubeconfig reads more consistent ([#555](https://github.com/Sealos/flint/issues/555)) ([1479200](https://github.com/Sealos/flint/commit/14792006670b1eb9b8c80b1d351d62b154af35dc))
+* **core:** mark activity calls that cannot be tied to a server ([#557](https://github.com/Sealos/flint/issues/557)) ([7c76bea](https://github.com/Sealos/flint/commit/7c76beacaf89ea91726b45fb0bca3969a608b3fd))
+* **core:** remove only activity key drafts a call created ([#528](https://github.com/Sealos/flint/issues/528)) ([ef30431](https://github.com/Sealos/flint/commit/ef30431384bd3352cfea8b1c09ed83af65e8bdd5))
+* **core:** shorten error text after redacting it ([#596](https://github.com/Sealos/flint/issues/596)) ([805459f](https://github.com/Sealos/flint/commit/805459f52f303a73e26f926b72d33fc513460dd8))
+* **core:** treat a settings file that cannot be edited as unreadable ([#592](https://github.com/Sealos/flint/issues/592)) ([7ec8c66](https://github.com/Sealos/flint/commit/7ec8c66ebc974d55f4b85ca9a213054d60524964))
+* **deps:** update url to a patched release ([#570](https://github.com/Sealos/flint/issues/570)) ([2ecf434](https://github.com/Sealos/flint/commit/2ecf434b2ce05b1c00bba3c2ad75f7c17b484f92))
+* **mcp:** apply reply redaction to recorded tool arguments ([#574](https://github.com/Sealos/flint/issues/574)) ([f5483f4](https://github.com/Sealos/flint/commit/f5483f4d78652c5b9b4b722875a2dbaf92b42c42))
+
+## [0.4.0](https://github.com/Sealos/flint/compare/v0.3.1...v0.4.0) (2026-11-22)
+
+
+### Features
+
+* **app:** add delete, scale, restart, cordon and drain ([#395](https://github.com/Sealos/flint/issues/395)) ([c7a730a](https://github.com/Sealos/flint/commit/c7a730a1b6c529e71450ea19652d79974cddb575))
+* **app:** edit yaml with review, apply and conflict reload ([#393](https://github.com/Sealos/flint/issues/393)) ([6c096ca](https://github.com/Sealos/flint/commit/6c096caf0f8e8b053aadad40e500f6b406b266ed))
+
+
+### Bug Fixes
+
+* **app:** down from the list filter selects the first row ([#455](https://github.com/Sealos/flint/issues/455)) ([d4e9cc8](https://github.com/Sealos/flint/commit/d4e9cc800b61b35399b2be2815c32c0f2df92174))
+* **app:** keep list columns still while typing in the filter ([#477](https://github.com/Sealos/flint/issues/477)) ([1dd0b35](https://github.com/Sealos/flint/commit/1dd0b35a6ce599c817b6f9f2cf0b7f42a03330fd))
+* **app:** keep name and status readable in a narrow list ([#494](https://github.com/Sealos/flint/issues/494)) ([72e5fbd](https://github.com/Sealos/flint/commit/72e5fbde0abc965b78161fd4e30683a921e7b6d0))
+* **app:** make the namespace picker keyboard-operable ([#504](https://github.com/Sealos/flint/issues/504)) ([a2ba73c](https://github.com/Sealos/flint/commit/a2ba73c84eeab40005fc7ddc8cd6c489fd6851a2)), closes [#422](https://github.com/Sealos/flint/issues/422)
+* **app:** name the missing namespace in the empty list and offer Show All ([#486](https://github.com/Sealos/flint/issues/486)) ([74623f9](https://github.com/Sealos/flint/commit/74623f91a7799872914db38526adbc9f0a6d849e))
+* **app:** never preselect quit in the command palette ([#452](https://github.com/Sealos/flint/issues/452)) ([8eaaa2c](https://github.com/Sealos/flint/commit/8eaaa2c0c468259e8a86bc24345bef25aaa28a9a))
+* **app:** raise the contrast of the disconnected dot ([#483](https://github.com/Sealos/flint/issues/483)) ([952684c](https://github.com/Sealos/flint/commit/952684c5483d07aef90d608d8279c4d0da592ee5))
+* **app:** rank listed namespaces above a typed partial name ([#480](https://github.com/Sealos/flint/issues/480)) ([7007897](https://github.com/Sealos/flint/commit/70078979e6a130af7d837709801a808b508787dd))
+* **app:** run a write confirmation once ([#471](https://github.com/Sealos/flint/issues/471)) ([c7d8a80](https://github.com/Sealos/flint/commit/c7d8a80460d7315ba2e0384e601610c5e302da19))
+* **app:** set a minimum window size and a detail-only narrow layout ([#517](https://github.com/Sealos/flint/issues/517)) ([fc359aa](https://github.com/Sealos/flint/commit/fc359aaef1a457c550df0854cfa5e9f648ce1b2f))
+* **app:** show a cluster's connection trouble in the sidebar ([#472](https://github.com/Sealos/flint/issues/472)) ([1ac1d27](https://github.com/Sealos/flint/commit/1ac1d27c9f43dd579a91efe491d57a74975030e2))
+* **app:** show a forbidden kind as no access at once ([#516](https://github.com/Sealos/flint/issues/516)) ([711168a](https://github.com/Sealos/flint/commit/711168a4cdd92e950a567e43f4fd4a40d1c9a33d)), closes [#411](https://github.com/Sealos/flint/issues/411)
+* **app:** show cleaned server addresses in the sidebar and dialogs ([#485](https://github.com/Sealos/flint/issues/485)) ([f7438ad](https://github.com/Sealos/flint/commit/f7438ada5d0c210fe0e708c6d38ecdf747e73f11))
+* **app:** show distinct, single-line cluster names in dialogs ([#524](https://github.com/Sealos/flint/issues/524)) ([dcdf1f6](https://github.com/Sealos/flint/commit/dcdf1f6c0786c8f9e7459d58335d9e5fd0843975))
+* **app:** show stale detail as stale and refetch it on reconnect ([#514](https://github.com/Sealos/flint/issues/514)) ([cbf167d](https://github.com/Sealos/flint/commit/cbf167db15ee13048f24f693afe9e8f8d078f8d3))
+* **app:** tell apart custom cluster names that look alike ([#470](https://github.com/Sealos/flint/issues/470)) ([53c544c](https://github.com/Sealos/flint/commit/53c544c33427e78d08871ec7a6824adb202362ec))
+* **core:** bind a reviewed write to its credential ([#492](https://github.com/Sealos/flint/issues/492)) ([f8a7e56](https://github.com/Sealos/flint/commit/f8a7e56173d64d6935d9c99037126e7bafedbadf))
+* **core:** bind a reviewed write to its whole connection definition ([#465](https://github.com/Sealos/flint/issues/465)) ([b678e3e](https://github.com/Sealos/flint/commit/b678e3e2372ad1738128bd9c7fa8f9132db39b56))
+* **core:** count only known local tools as local clusters ([#500](https://github.com/Sealos/flint/issues/500)) ([5faaad9](https://github.com/Sealos/flint/commit/5faaad99ca83d23813f408a97814649ccbc76010))
+* **core:** filter the log open failure and flush once at quit ([#401](https://github.com/Sealos/flint/issues/401)) ([e43ced1](https://github.com/Sealos/flint/commit/e43ced15bc04f43df43f1f02055cf23290b4feca))
+* **core:** free the api error test server responses ([#513](https://github.com/Sealos/flint/issues/513)) ([fe26714](https://github.com/Sealos/flint/commit/fe2671487a262381a6f8d0f527b07972e4f7ddb6))
+* **core:** handle escaped and single quotes in error summaries ([#521](https://github.com/Sealos/flint/issues/521)) ([12be899](https://github.com/Sealos/flint/commit/12be899ae858a4ad94e3374081f5d294dfbfef80))
+* **core:** hold protection changes until a kubeconfig is readable ([#515](https://github.com/Sealos/flint/issues/515)) ([e276c5f](https://github.com/Sealos/flint/commit/e276c5f7dcf41d0daaa09283a8a313e950c415e9))
+* **core:** keep clusters listed during a partial kubeconfig write ([#508](https://github.com/Sealos/flint/issues/508)) ([91f60a7](https://github.com/Sealos/flint/commit/91f60a7041b89b03839b0820ab60890dabae8b4b))
+* **core:** keep sync error text short and clean ([#491](https://github.com/Sealos/flint/issues/491)) ([9a793d3](https://github.com/Sealos/flint/commit/9a793d39f238f4b4943804b448da6be5b892cf3b))
+* **core:** more complete gitops detection for write warnings ([#509](https://github.com/Sealos/flint/issues/509)) ([d60e9b1](https://github.com/Sealos/flint/commit/d60e9b1165a3c0cdd0aace6d227d45d82c0b60bb)), closes [#211](https://github.com/Sealos/flint/issues/211)
+* **core:** publish a resynced list and its live state together ([#481](https://github.com/Sealos/flint/issues/481)) ([543b2de](https://github.com/Sealos/flint/commit/543b2de4d7103bbc69fd99199cc0a254c961ba18))
+* **core:** report routine relists and retried refusals precisely ([#497](https://github.com/Sealos/flint/issues/497)) ([80af9ff](https://github.com/Sealos/flint/commit/80af9ff68f996e78188d46707dd012577f399d73))
+* **core:** tidy error summaries and report pods when a drain stops early ([#507](https://github.com/Sealos/flint/issues/507)) ([1ffb559](https://github.com/Sealos/flint/commit/1ffb559cc74e38a61162c2ab8af17883449b8cca))
+* **core:** tidy write error text and recheck the gate during a drain ([#482](https://github.com/Sealos/flint/issues/482)) ([8c84d4d](https://github.com/Sealos/flint/commit/8c84d4dcf74670c5db3bcc8ef32b346fa921b516))
+* **core:** track the cluster entry's file and say why a pin was refused ([#398](https://github.com/Sealos/flint/issues/398)) ([4144066](https://github.com/Sealos/flint/commit/4144066d56c53875b40c3a334996ee69e156fa71))
+* **core:** word a stale launch pin without claiming the server moved ([#428](https://github.com/Sealos/flint/issues/428)) ([2dffbd3](https://github.com/Sealos/flint/commit/2dffbd38b7cd32705f54ec3b13ac78b209eab920))
+* **e2e:** ignore unrelated discovery requests in the marker conflict test ([#518](https://github.com/Sealos/flint/issues/518)) ([6085402](https://github.com/Sealos/flint/commit/60854022c53f02b7e7be91e5531a9972cd247f74))
+* **logs:** keep a separate backoff and full tooltip for waiting tabs ([#501](https://github.com/Sealos/flint/issues/501)) ([cd853ce](https://github.com/Sealos/flint/commit/cd853ce2a478ce7fb7fd9483c49950f84034ca61))
+* **logs:** no stale rows after a trim, and one publish per trim ([#403](https://github.com/Sealos/flint/issues/403)) ([c9d51c2](https://github.com/Sealos/flint/commit/c9d51c2e8c25a15d14e4075319360b7ce0de0661))
+* **logs:** say why a pod's logs have not started ([#453](https://github.com/Sealos/flint/issues/453)) ([97b6d71](https://github.com/Sealos/flint/commit/97b6d718afc745d527904d846d8ef6f2f7773868))
+* **mcp:** apply masking across whole responses and log tails ([#484](https://github.com/Sealos/flint/issues/484)) ([fa24546](https://github.com/Sealos/flint/commit/fa245461a3f543180581f9e8af078e8cd2793310))
+* **mcp:** apply output filtering to every cluster field ([#522](https://github.com/Sealos/flint/issues/522)) ([2dd8c40](https://github.com/Sealos/flint/commit/2dd8c405b5659b29d4dc939f5950f6c01183852f))
+* **mcp:** say when a scope check could not cover everything ([#402](https://github.com/Sealos/flint/issues/402)) ([39744fa](https://github.com/Sealos/flint/commit/39744fa89549b86e91185022f8508936971b2e5b))
+
 ## [0.3.1](https://github.com/Sealos/flint/compare/v0.3.0...v0.3.1) (2026-11-21)
 
 ### Upgrade note

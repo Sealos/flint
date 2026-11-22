@@ -14,15 +14,17 @@ use flint_core::{
     LineSource, LogLine, LogSnapshot, LogState, NavEntry, ObjectDetail, PodSet, PodSetStatus, Row,
     SafeErrorText, StreamStatus, SyncState, WorkloadPod,
 };
+use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
-use gpui_kit::{AppContext as _, SharedString, TestAppContext};
+use gpui_kit::{AppContext as _, DismissEvent, Focusable as _, SharedString, TestAppContext};
 use serde_json::{Value, json};
 
 use crate::ui::detail::{PENDING_TIMEOUT, TestPodLister};
 use crate::ui::dock::DockTab;
-use crate::ui::list::{ListEvent, Selected};
+use crate::ui::list::{ListEvent, ResourceList, Selected};
 use crate::ui::registry::{self, ActionError};
-use crate::ui::support_tests::{TestWorkspace, WAIT, open_workspace, pods};
+use crate::ui::row_menu::{OpenRowMenu, RowMenu};
+use crate::ui::support_tests::{TestWorkspace, WAIT, open_empty_workspace, open_workspace, pods};
 use crate::ui::view_state::{ActionAvailability, AppState, Focus};
 
 pub(super) async fn activate(cx: &mut TestAppContext, t: &TestWorkspace, cluster: &'static str) {
@@ -981,6 +983,116 @@ async fn a_failed_pod_list_refuses_shell_saying_why(cx: &mut TestAppContext) {
     assert_eq!(shell_button_disabled(cx, &t), Some(false));
 }
 
+// covers UP-06, UP-47: a pod list that failed is listed again when the kind's same rows are
+// published again, as they are when a pause of the cluster ends, and not on a change of rows.
+#[gpui_kit::test]
+async fn a_failed_pod_list_is_retried_when_the_same_rows_are_published(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let pods = FakePods::install(cx);
+    activate(cx, &t, "kind-alpha").await;
+    open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
+    select_row(cx, &t, "web");
+    let core = t.workspace.read_with(cx, |ws, cx| ws.core(cx).clone());
+    let kind = deployments(&[]).kind.clone();
+    let publish = |revision| {
+        core.store_for_tests(flint_core::KindSnapshot {
+            cluster: "kind-alpha".into(),
+            kind: kind.clone(),
+            state: flint_core::SyncState::Synced,
+            revision,
+            ..Default::default()
+        })
+    };
+    let _first = publish(7);
+    draw(cx, &t);
+    show_fetched(
+        cx,
+        &t,
+        detail(json!({
+            "kind": "Deployment",
+            "metadata": {"name": "web", "namespace": "demo"},
+            "spec": {"selector": {"matchLabels": {"app": "web"}}}
+        })),
+    );
+    let_pods_list(cx, &t);
+    pods.answer(cx, &t, Err("\"kind-alpha\" is not connected".into()));
+    assert!(pods.waiting().is_empty());
+
+    let _changed = publish(8);
+    draw(cx, &t);
+    cx.executor()
+        .advance_clock(crate::ui::detail::SHOW_PODS_DELAY * 10);
+    draw(cx, &t);
+    assert!(pods.waiting().is_empty(), "a change of rows does not retry");
+
+    let _again = publish(8);
+    draw(cx, &t);
+    cx.executor()
+        .advance_clock(crate::ui::detail::SHOW_PODS_DELAY * 10);
+    draw(cx, &t);
+    assert_eq!(pods.waiting(), [Freshness::Cached], "listed once more");
+    pods.answer(cx, &t, Err("\"kind-alpha\" is not connected".into()));
+    cx.executor()
+        .advance_clock(crate::ui::detail::SHOW_PODS_DELAY * 40);
+    draw(cx, &t);
+    assert!(pods.waiting().is_empty(), "a failure does not loop");
+}
+
+// covers UP-06, UP-47: a namespace-limited list has no revision of its own, and its republish
+// retries a failed pod list too.
+#[gpui_kit::test]
+async fn a_failed_pod_list_is_retried_on_a_limited_list_republish(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let pods = FakePods::install(cx);
+    activate(cx, &t, "kind-alpha").await;
+    open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
+    select_row(cx, &t, "web");
+    let core = t.workspace.read_with(cx, |ws, cx| ws.core(cx).clone());
+    let kind = deployments(&[]).kind.clone();
+    let publish = |revision| {
+        core.store_for_tests(flint_core::KindSnapshot {
+            cluster: "kind-alpha".into(),
+            kind: kind.clone(),
+            state: flint_core::SyncState::Synced,
+            limited_to: Some(Arc::new(flint_core::NamespaceLimit {
+                listed: vec!["demo".into()],
+                revisions: vec![revision],
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    };
+    let _first = publish(7);
+    draw(cx, &t);
+    show_fetched(
+        cx,
+        &t,
+        detail(json!({
+            "kind": "Deployment",
+            "metadata": {"name": "web", "namespace": "demo"},
+            "spec": {"selector": {"matchLabels": {"app": "web"}}}
+        })),
+    );
+    let_pods_list(cx, &t);
+    pods.answer(cx, &t, Err("\"kind-alpha\" is not connected".into()));
+
+    let _changed = publish(8);
+    draw(cx, &t);
+    cx.executor()
+        .advance_clock(crate::ui::detail::SHOW_PODS_DELAY * 10);
+    draw(cx, &t);
+    assert!(pods.waiting().is_empty(), "a change of rows does not retry");
+
+    let _again = publish(8);
+    draw(cx, &t);
+    cx.executor()
+        .advance_clock(crate::ui::detail::SHOW_PODS_DELAY * 10);
+    draw(cx, &t);
+    assert_eq!(pods.waiting(), [Freshness::Cached], "listed once more");
+}
+
 // covers UP-47, UP-41: a container shell asked for before the pod has loaded waits for it, as
 // Shell does; the guard and the handler agree on a deleted pod.
 #[gpui_kit::test]
@@ -1119,6 +1231,212 @@ async fn right_clicking_another_row_acts_on_it(cx: &mut TestAppContext) {
     click_entry(cx, &t, 0);
     click_submenu(cx, &t, 1);
     assert_eq!(dock_tabs(cx, &t).0, ["web · app"]);
+}
+
+// covers #496: the first right-click opens the detail pane beside the list, and the object is
+// still loading. The menu stays open through those frames until it is dismissed.
+#[gpui_kit::test]
+async fn a_row_menu_stays_open_while_its_object_loads(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "kind-alpha").await;
+    open_list(
+        cx,
+        &t,
+        deployments_entry(),
+        deployments(&["api", "web"]),
+        "web",
+    )
+    .await;
+    draw(cx, &t);
+    // Near the row's right edge, where the detail pane opens.
+    cx.update_window(t.window, |_, window, cx| {
+        let row = window.find("row-uid-web").bounds();
+        let at = gpui_kit::point(row.size.width - gpui_kit::px(8.), row.size.height / 2.);
+        window.click_with_options(
+            "row-uid-web",
+            gpui_kit::test::ClickOptions::new()
+                .with_offset(at)
+                .with_button(gpui_kit::MouseButton::Right),
+            cx,
+        );
+    })
+    .unwrap();
+    show_loading(cx, &t);
+    for frame in 0..4 {
+        draw(cx, &t);
+        let open = cx
+            .update_window(t.window, |_, window, _| {
+                window.try_find("popup-menu").is_some()
+            })
+            .unwrap();
+        assert!(open, "the menu closed by frame {frame}");
+    }
+    press(cx, &t, "escape");
+    draw(cx, &t);
+    let open = cx
+        .update_window(t.window, |_, window, _| {
+            window.try_find("popup-menu").is_some()
+        })
+        .unwrap();
+    assert!(!open, "escape dismisses the menu");
+}
+
+fn menu_open(cx: &mut TestAppContext, t: &TestWorkspace) -> bool {
+    draw(cx, t);
+    cx.update_window(t.window, |_, window, _| {
+        window.try_find("popup-menu").is_some()
+    })
+    .unwrap()
+}
+
+/// A pods list of `api` and `web` with `web` loaded and the list focused.
+async fn focused_pods(cx: &mut TestAppContext, t: &TestWorkspace) {
+    activate(cx, t, "kind-alpha").await;
+    open_list(
+        cx,
+        t,
+        pods_entry(),
+        pods(&[("demo", "api", 0), ("demo", "web", 1)]),
+        "api",
+    )
+    .await;
+    select_row(cx, t, "web");
+    show_fetched(cx, t, pod_detail("web"));
+    focus_list(cx, t);
+    draw(cx, t);
+}
+
+// covers #496: Escape closes the menu and focus returns to where it was.
+#[gpui_kit::test]
+async fn escape_returns_focus_from_a_row_menu(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    focused_pods(cx, &t).await;
+    right_click(cx, &t, "web").await;
+    assert_ne!(app_state(cx, &t).focus, Focus::List, "the menu has focus");
+    press(cx, &t, "escape");
+    assert!(!menu_open(cx, &t));
+    assert_eq!(app_state(cx, &t).focus, Focus::List);
+}
+
+// covers #496: a click outside closes the menu.
+#[gpui_kit::test]
+async fn a_click_outside_closes_a_row_menu(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    focused_pods(cx, &t).await;
+    right_click(cx, &t, "web").await;
+    cx.update_window(t.window, |_, window, cx| window.click("row-uid-api", cx))
+        .unwrap();
+    assert!(!menu_open(cx, &t));
+}
+
+// covers #496: a right-click on another row replaces the menu and dismissal returns focus to
+// the list.
+#[gpui_kit::test]
+async fn right_clicking_another_row_replaces_its_menu(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    focused_pods(cx, &t).await;
+    right_click(cx, &t, "web").await;
+    right_click(cx, &t, "api").await;
+    draw(cx, &t);
+    assert_eq!(
+        app_state(cx, &t).menu.unwrap().owner.as_deref(),
+        Some("row-menu-uid-api")
+    );
+    press(cx, &t, "escape");
+    assert!(!menu_open(cx, &t));
+    assert_eq!(app_state(cx, &t).focus, Focus::List);
+}
+
+#[gpui_kit::test]
+async fn a_replaced_row_menu_returns_focus_to_the_original_view(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (window, workspace, model) = open_empty_workspace(cx, dir.path()).await;
+    let sidebar_focus = workspace.read_with(cx, |ws, _| ws.sidebar_focus.clone());
+    let core = model.read_with(cx, |model, _| model.core().clone());
+    let list = cx
+        .update_window(window, |_, window, cx| {
+            window.focus(&sidebar_focus, cx);
+            cx.new(|cx| {
+                ResourceList::new(core, "test".into(), &pods_entry(), vec![], None, window, cx)
+            })
+        })
+        .unwrap();
+
+    // Open the menus directly so selecting a row does not move focus to the list first.
+    let build: RowMenu = Rc::new(|menu, _, _| menu.item(PopupMenuItem::new("Logs")));
+    let _replacement = cx
+        .update_window(window, |_, window, cx| {
+            assert!(sidebar_focus.is_focused(window));
+            let replacement = list.update(cx, |_, cx| {
+                let mut open = |uid: &str, replaced| {
+                    let back_to = OpenRowMenu::focus_before(replaced, window, cx).unwrap();
+                    let menu = OpenRowMenu::open(
+                        &build,
+                        uid.into(),
+                        Default::default(),
+                        back_to,
+                        window,
+                        cx,
+                    );
+                    assert!(menu.menu().read(cx).focus_handle(cx).is_focused(window));
+                    menu
+                };
+                let first = open("uid-web", None);
+                open("uid-api", Some(first))
+            });
+            replacement.menu().update(cx, |_, cx| cx.emit(DismissEvent));
+            replacement
+        })
+        .unwrap();
+
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(
+            window.focused(cx),
+            Some(sidebar_focus),
+            "dismissing the replacement returns focus to the sidebar"
+        );
+    })
+    .unwrap();
+}
+
+// covers #496: the menu closes when its row leaves the list, since it acts on that row.
+#[gpui_kit::test]
+async fn a_row_menu_closes_when_its_row_goes(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    focused_pods(cx, &t).await;
+    right_click(cx, &t, "web").await;
+    let list = t
+        .workspace
+        .read_with(cx, |ws, _| ws.list.as_ref().unwrap().clone());
+    list.update(cx, |list, cx| {
+        list.set_snapshot(pods(&[("demo", "api", 0)]), cx)
+    });
+    cx.run_until_parked();
+    assert!(!menu_open(cx, &t));
+    assert!(!menu_open(cx, &t), "it stays closed");
+    assert_eq!(app_state(cx, &t).focus, Focus::List);
+}
+
+// covers #496: a window that gets smaller dismisses the menu, whose limits were worked out for
+// the old size, and focus returns.
+#[gpui_kit::test]
+async fn a_shrunk_window_closes_a_row_menu(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    focused_pods(cx, &t).await;
+    right_click(cx, &t, "web").await;
+    let size = cx
+        .update_window(t.window, |_, window, _| window.viewport_size())
+        .unwrap();
+    gpui_kit::VisualTestContext::from_window(t.window, cx)
+        .simulate_resize(gpui_kit::size(size.width - gpui_kit::px(40.), size.height));
+    assert!(!menu_open(cx, &t));
+    assert_eq!(app_state(cx, &t).focus, Focus::List);
 }
 
 // covers UP-47, UP-40: an action that waited does not take focus from where the user went
@@ -1932,8 +2250,7 @@ async fn logs_asked_for_at_startup_take_focus(cx: &mut TestAppContext) {
     assert_ne!(app_state(cx, &t).focus, Focus::List, "the tab took focus");
 }
 
-// covers UP-47: a dismissed menu stops following its row (gpui-component keeps it until the
-// next right-click), so it is not built again while hidden.
+// covers UP-47: a dismissed menu stops following its row, so it is not built again.
 #[gpui_kit::test]
 async fn a_dismissed_menu_is_not_built_again(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();

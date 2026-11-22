@@ -128,6 +128,13 @@ pub enum Command {
         cluster: ClusterId,
         name: Option<String>,
     },
+    /// Set the colour tag of `cluster` at `server` (`None` removes it) and write it to
+    /// `settings.toml`. Cosmetic. The change arrives back as `Event::SettingsChanged`.
+    SetClusterTag {
+        cluster: ClusterId,
+        server: String,
+        tag: Option<crate::settings::ClusterTag>,
+    },
     /// Set the appearance (light, dark, or following macOS) and write it to `settings.toml`. The
     /// change arrives back as `Event::SettingsChanged`.
     SetAppearance(Appearance),
@@ -377,11 +384,17 @@ pub struct CoreHandle {
     next_subscription: Arc<AtomicU64>,
     unlocks: SessionUnlocks,
     log_budget: Arc<crate::logs::LogBudget>,
+    access: Arc<crate::access::AccessCache>,
     runtime: tokio::runtime::Handle,
     _runtime: Arc<RuntimeGuard>,
 }
 
 impl CoreHandle {
+    /// The cached access checks ([`crate::access`]).
+    pub(crate) fn access_cache(&self) -> Arc<crate::access::AccessCache> {
+        self.access.clone()
+    }
+
     /// Starts the tokio runtime on background threads and the cluster manager on it.
     pub fn start(config: CoreConfig) -> io::Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -405,6 +418,7 @@ impl CoreHandle {
             next_subscription: Arc::new(AtomicU64::new(1)),
             unlocks,
             log_budget,
+            access: Arc::default(),
             runtime: runtime.handle().clone(),
             _runtime: Arc::new(RuntimeGuard(Some(runtime))),
         })

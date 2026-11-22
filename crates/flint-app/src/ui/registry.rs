@@ -165,7 +165,9 @@ actions!(
         /// Move focus from the list's text filter back to its rows (Esc or Enter there).
         FocusRows,
         /// Down in the list's text filter: back to the rows, selecting the first if none is.
-        SelectFromFilter
+        SelectFromFilter,
+        /// Enter on the list's rows: open the selected row, as clicking it does.
+        OpenSelectedRow
     ]
 );
 actions!(
@@ -420,6 +422,29 @@ pub struct ToggleDrainOption {
 #[serde(deny_unknown_fields)]
 pub struct RenameCluster {
     pub cluster: String,
+}
+
+/// Set a cluster's colour tag, for the server it points at now. `endpoint`, from a menu drawn for
+/// that server, refuses the choice if the context has moved since.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = workspace, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct SetClusterTag {
+    pub cluster: String,
+    pub tag: flint_core::settings::ClusterTag,
+    #[serde(default)]
+    pub endpoint: Option<u64>,
+}
+
+/// Remove a cluster's colour tag at the server it points at now. `endpoint` as in
+/// [`SetClusterTag`].
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = workspace, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct ClearClusterTag {
+    pub cluster: String,
+    #[serde(default)]
+    pub endpoint: Option<u64>,
 }
 
 /// Lock a cluster unlocked for this session again (Lock Again).
@@ -1729,6 +1754,14 @@ const fn arg(name: &'static str, description: &'static str, kind: ArgKind) -> Ar
 }
 
 const CLUSTER: &[Arg] = &[arg("cluster", "kubeconfig context name", ArgKind::Cluster)];
+const CLUSTER_TAG: &[Arg] = &[
+    arg("cluster", "kubeconfig context name", ArgKind::Cluster),
+    arg(
+        "tag",
+        "the colour",
+        ArgKind::Choice(&["blue", "purple", "teal", "green", "yellow", "red"]),
+    ),
+];
 const DRAIN_OPTION: &[Arg] = &[arg(
     "option",
     "what the drain may also evict",
@@ -2070,6 +2103,19 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             CLUSTER,
         )
         .of(C::Cluster, S::Workspace),
+        Spec::with_args::<SetClusterTag>(
+            "Set Cluster Colour Tag…",
+            "Mark a cluster with a colour, for the server it points at now. Cosmetic: it changes \
+             nothing about protection, trust or AI exposure.",
+            CLUSTER_TAG,
+        )
+        .of(C::Cluster, S::Workspace),
+        Spec::with_args::<ClearClusterTag>(
+            "Clear Cluster Colour Tag…",
+            "Remove a cluster's colour tag at the server it points at now.",
+            CLUSTER,
+        )
+        .of(C::Cluster, S::Workspace),
         Spec::with_args::<LockCluster>(
             "Lock Cluster Again…",
             "Protect a cluster unlocked for this session again: read-only in Flint. Shells \
@@ -2277,6 +2323,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         )
         .of(C::List, S::List)
         .keys(&["escape"], Some(LIST_ALONE))
+        .hidden(),
+        Spec::unit::<OpenSelectedRow>(
+            "Open Selected Row",
+            "Show the selected row's details, as clicking it does.",
+        )
+        .of(C::List, S::List)
+        .keys(&["enter"], Some(LIST_ALONE))
         .hidden(),
         Spec::with_args::<SelectRow>(
             "Select Object…",

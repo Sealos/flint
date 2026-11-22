@@ -34,24 +34,26 @@ use super::super::registry::{
     EditYaml, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp, FocusFilter, FocusNextPane,
     FocusPreviousPane, FocusSearch, Forward, ForwardCurrent, GoBack, Guards, Hide, HideFromAi,
     HideOthers, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, NextTab, OnView, OpenContainerLogs,
-    OpenContainerShell, OpenLogs, OpenObject, OpenPreviousLogs, OpenSelectorLogs, OpenShell,
-    OpenView, PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs, Refresh, ReloadYamlEdit,
-    RestartShell, RetryConnection, ReviewYamlEdit, SaveLines, SaveLogs, SaveMatchingLines,
-    SaveScope, SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop,
-    SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine,
-    SelectPrev, SelectPrevLine, SelectRow, SelectText, SetDockHeight, SetNamespaces, SetPaneWidth,
-    ShowAll, ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml, SortBy, ToggleAnnotations,
-    ToggleCommandPalette, ToggleLabels, ToggleManagedFields, ToggleNamespace, ToggleNavSection,
-    TogglePause, ToggleResourceSwitcher, ToggleSecretValue, ToggleSources, ToggleTimestamps,
-    ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
+    OpenContainerShell, OpenLogs, OpenObject, OpenPreviousLogs, OpenSelectedRow, OpenSelectorLogs,
+    OpenShell, OpenView, PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs, Refresh,
+    ReloadYamlEdit, RestartShell, RetryConnection, ReviewYamlEdit, SaveLines, SaveLogs,
+    SaveMatchingLines, SaveScope, SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom,
+    ScrollToTop, SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext,
+    SelectNextLine, SelectPrev, SelectPrevLine, SelectRow, SelectText, SetDockHeight,
+    SetNamespaces, SetPaneWidth, ShowAll, ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml,
+    SortBy, ToggleAnnotations, ToggleCommandPalette, ToggleLabels, ToggleManagedFields,
+    ToggleNamespace, ToggleNavSection, TogglePause, ToggleResourceSwitcher, ToggleSecretValue,
+    ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
+    WatchOpenViewsOnly,
 };
-use super::super::registry::{BackToList, EditAiScope, ShowAgentActivity};
+use super::super::registry::{BackToList, EditAiScope, Handler, ShowAgentActivity};
+use super::super::registry::{
+    ClearClusterTag, LockCluster, RenameCluster, SetClusterTag, TrustCluster, UnlockCluster,
+    UntrustCluster,
+};
 use super::super::registry::{
     CordonNode, DeleteObject, DrainNode, NamespacePickerNext, NamespacePickerPrevious,
     OpenNamespaceFilter, RestartObject, ScaleObject, ShowDrainReport, UncordonNode,
-};
-use super::super::registry::{
-    LockCluster, RenameCluster, TrustCluster, UnlockCluster, UntrustCluster,
 };
 use super::super::resource_actions::{self, ResourceAction};
 use super::super::scope_picker::ScopePicker;
@@ -74,6 +76,20 @@ macro_rules! view_open {
     };
 }
 
+/// [`Forward`] without the list's Enter: it opens the selected row only when the rows have focus,
+/// so with focus in the navigation or the detail pane the action is not available (and Enter
+/// propagates), rather than reported as done when nothing opens.
+struct NotOnRows<B>(B);
+
+impl<E: InteractiveElement> Bind<ResourceList> for NotOnRows<Forward<E, ResourceList>> {
+    fn bind<A: Action>(self, handler: Handler<ResourceList, A>) -> Self {
+        if std::any::TypeId::of::<A>() == std::any::TypeId::of::<OpenSelectedRow>() {
+            return self;
+        }
+        Self(self.0.bind(handler))
+    }
+}
+
 impl Workspace {
     /// Every workspace action and its handler, for [`Bind`].
     pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
@@ -94,6 +110,17 @@ impl Workspace {
         .bind::<ShowAgentActivity>(Self::show_agent_activity)
         .bind::<UnlockCluster>(Self::unlock_cluster)
         .bind::<RenameCluster>(Self::rename_cluster)
+        .bind::<SetClusterTag>(|this, action, _, cx| {
+            this.write_cluster_tag::<SetClusterTag>(
+                &action.cluster,
+                action.endpoint,
+                Some(action.tag),
+                cx,
+            )
+        })
+        .bind::<ClearClusterTag>(|this, action, _, cx| {
+            this.write_cluster_tag::<ClearClusterTag>(&action.cluster, action.endpoint, None, cx)
+        })
         .bind::<LockCluster>(Self::lock_cluster)
         .bind::<TrustCluster>(Self::trust_cluster)
         .bind::<UntrustCluster>(Self::untrust_cluster)
@@ -166,7 +193,9 @@ impl Workspace {
     ) -> E {
         let element = Self::bind_actions(OnView::new(element, cx)).into_element();
         let element =
-            ResourceList::bind_actions(Forward::new(element, self.list.as_ref())).into_element();
+            ResourceList::bind_actions(NotOnRows(Forward::new(element, self.list.as_ref())))
+                .0
+                .into_element();
         // The detail pane follows the selected row, which may change between frames.
         let detail = ForwardCurrent::new(element, self, cx, |ws| ws.detail.as_ref());
         let element = DetailView::bind_actions(detail).into_element();
@@ -209,6 +238,14 @@ impl Workspace {
             .add::<UnlockCluster>(|_, _| true, |ws, a, cx| ws.unlock_target(a, cx).map(drop))
             .add::<RenameCluster>(Self::settings_ok, |ws, a, cx| {
                 ws.check_cluster::<RenameCluster>(&a.cluster, cx)
+            })
+            .add::<SetClusterTag>(Self::settings_ok, |ws, a, cx| {
+                ws.tag_server::<SetClusterTag>(&a.cluster, a.endpoint, cx)
+                    .map(drop)
+            })
+            .add::<ClearClusterTag>(Self::settings_ok, |ws, a, cx| {
+                ws.tag_server::<ClearClusterTag>(&a.cluster, a.endpoint, cx)
+                    .map(drop)
             })
             .add::<LockCluster>(|_, _| true, |ws, a, cx| ws.check_lock(a, cx))
             .add::<TrustCluster>(Self::settings_ok, |ws, a, cx| {
@@ -262,6 +299,7 @@ impl Workspace {
             .when::<SelectFirst>(view_open!(list_wide))
             .when::<SelectLast>(view_open!(list_wide))
             .when::<CloseDetail>(view_open!(list_wide))
+            .when::<OpenSelectedRow>(view_open!(list_wide))
             .when::<FocusFilter>(view_open!(list_wide))
             .when::<ToggleWide>(|ws, cx| list_wide(ws, cx) == Some(true))
             .add::<SelectRow>(view_open!(list_wide), |ws, a, cx| match &ws.list {
@@ -565,9 +603,12 @@ impl Workspace {
         match arg.kind {
             ArgKind::Cluster => choices({
                 let names = model.names();
+                // Clearing is offered only where there is a tag to clear.
+                let clearing = spec.name == ClearClusterTag::name_for_type();
                 model
                     .clusters
                     .iter()
+                    .filter(|c| !clearing || model.cluster_tag(c).is_some())
                     .map(|c| {
                         let name = c.info.name.clone();
                         let short = names.of(&name);
@@ -1169,6 +1210,51 @@ impl Workspace {
             .and_then(|c| c.info.server.clone());
         let model = self.model.clone();
         super::super::cluster_name::open(window, cx, model, action.cluster.clone(), server);
+    }
+
+    /// The server a colour tag for `cluster` is saved at: where it points now. Refused for a
+    /// context with no server, or one that moved since `endpoint` was read.
+    fn tag_server<A: Action>(
+        &self,
+        cluster: &str,
+        endpoint: Option<u64>,
+        cx: &App,
+    ) -> Result<String, ActionError> {
+        self.check_cluster::<A>(cluster, cx)?;
+        let summary = self.cluster_summary(cluster, cx).expect("checked");
+        if endpoint.is_some_and(|e| e != summary.endpoint) {
+            return Err(ActionError::rejected::<A>(format!(
+                "{cluster} now points at a different server"
+            )));
+        }
+        summary
+            .info
+            .server
+            .clone()
+            .ok_or_else(|| ActionError::rejected::<A>(format!("{cluster} has no API server")))
+    }
+
+    /// The server the sidebar shows for `cluster` now, which a tag menu is drawn for.
+    pub(in crate::ui) fn tag_menu_server(&self, cluster: &str, cx: &App) -> Option<String> {
+        self.cluster_summary(cluster, cx)?.info.server.clone()
+    }
+
+    /// Sends the tag to the core, which writes it in order with every other settings change.
+    fn write_cluster_tag<A: Action>(
+        &mut self,
+        cluster: &str,
+        endpoint: Option<u64>,
+        tag: Option<flint_core::settings::ClusterTag>,
+        cx: &mut Context<Self>,
+    ) {
+        match self.tag_server::<A>(cluster, endpoint, cx) {
+            Ok(server) => {
+                let cluster = cluster.to_owned();
+                self.model
+                    .update(cx, |m, _| m.set_cluster_tag(cluster, server, tag));
+            }
+            Err(e) => tracing::warn!("{e}"),
+        }
     }
 
     fn lock_cluster(&mut self, action: &LockCluster, _: &mut Window, cx: &mut Context<Self>) {

@@ -115,6 +115,8 @@ pub const NAME_MIN_CHARS: usize = 16;
 /// into spare width as far as any name needs.
 const NAME_MAX_CHARS: usize = 253;
 const AGE_CHARS: usize = 7;
+/// What a managed row's marker takes from its name cell, in characters.
+pub const MARKER_CHARS: usize = 5;
 /// Rows sampled per column when measuring. Enough to see the widths that matter without
 /// walking 10,000 rows on every update.
 const SAMPLE_ROWS: usize = 2_000;
@@ -149,10 +151,14 @@ pub fn measure_columns(snapshot: &KindSnapshot, rows: &[u32], now: i64) -> Vec<u
                 rows.iter()
                     .step_by(step)
                     .map(|&row| {
-                        snapshot.rows[row as usize]
-                            .cell_text(i, now)
-                            .chars()
-                            .count()
+                        let row = &snapshot.rows[row as usize];
+                        let marker = if column.role == ColumnRole::Name && shows_marker(row, secret)
+                        {
+                            MARKER_CHARS
+                        } else {
+                            0
+                        };
+                        row.cell_text(i, now).chars().count() + marker
                     })
                     .max()
                     .unwrap_or(0)
@@ -167,6 +173,20 @@ pub fn measure_columns(snapshot: &KindSnapshot, rows: &[u32], now: i64) -> Vec<u
             cells.max(header).clamp(MIN_CHARS, max)
         })
         .collect()
+}
+
+/// Whether `row` draws a GitOps marker. A Secret list draws none.
+pub fn shows_marker(row: &flint_core::Row, secret_list: bool) -> bool {
+    !secret_list && row.managed_by().is_some()
+}
+
+/// The width left for the text of `row`'s cell in `column`, `width` wide, beside any marker.
+pub fn text_width(column: &Column, row: &flint_core::Row, secret_list: bool, width: f32) -> f32 {
+    if column.role == ColumnRole::Name && shows_marker(row, secret_list) {
+        width - MARKER_CHARS as f32 * CHAR_WIDTH
+    } else {
+        width
+    }
 }
 
 /// The rows that set the column widths, in snapshot order: those in `namespaces` (all of them

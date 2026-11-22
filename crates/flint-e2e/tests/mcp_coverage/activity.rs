@@ -12,7 +12,7 @@ use crate::support::{EXPOSED, HIDDEN, NAMESPACE, POD, Setup};
 const RETURNED: &str = "placeholder-returned-content";
 
 /// Every file below `dir`, as bytes.
-fn files_below(dir: &Path) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
+pub(crate) fn files_below(dir: &Path) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
@@ -30,6 +30,119 @@ fn last(config_dir: &Path) -> ActivityRecord {
     activity::read(config_dir)
         .pop()
         .expect("the call was recorded")
+}
+
+/// A value the redactor recognises, and the part of it that must not be recorded.
+const PLANTED: &str = "password=placeholder-arg-value";
+const PLANTED_VALUE: &str = "placeholder-arg-value";
+
+// covers UP-16: every argument a record holds gets the same redaction as the reply, on each path
+// to the log: a tool that ran, and a call refused for its arguments.
+#[test]
+fn up_16_recorded_arguments_are_redacted_like_replies() -> Result<()> {
+    type Field = fn(&ActivityRecord) -> Option<&str>;
+    let setup = Setup::exposed()?;
+    let config_dir = setup.scratch.config_dir();
+    let mut mcp = setup.mcp()?;
+
+    let cases: Vec<(&str, serde_json::Value, Field)> = vec![
+        (
+            "list_resources",
+            json!({"cluster": PLANTED, "kind": "pods", "namespace": NAMESPACE}),
+            |r| r.cluster.as_deref(),
+        ),
+        (
+            "list_resources",
+            json!({"cluster": EXPOSED, "kind": PLANTED, "namespace": NAMESPACE}),
+            |r| r.kind.as_deref(),
+        ),
+        (
+            "list_resources",
+            json!({"cluster": EXPOSED, "kind": "pods", "namespace": PLANTED}),
+            |r| r.namespace.as_deref(),
+        ),
+        (
+            "get_resource",
+            json!({"cluster": EXPOSED, "kind": "pods", "namespace": NAMESPACE, "name": PLANTED}),
+            |r| r.name.as_deref(),
+        ),
+        (
+            "get_pod_logs",
+            json!({"cluster": EXPOSED, "namespace": NAMESPACE, "pod": POD, "container": PLANTED}),
+            |r| r.container.as_deref(),
+        ),
+        (
+            "get_pod_logs",
+            json!({"cluster": EXPOSED, "namespace": NAMESPACE, "pod": PLANTED}),
+            |r| r.name.as_deref(),
+        ),
+        (
+            "get_events",
+            json!({"cluster": EXPOSED, "namespace": NAMESPACE,
+                   "object_kind": PLANTED, "object_name": "x"}),
+            |r| r.kind.as_deref(),
+        ),
+        (
+            "get_events",
+            json!({"cluster": EXPOSED, "namespace": NAMESPACE,
+                   "object_kind": "pods", "object_name": PLANTED}),
+            |r| r.name.as_deref(),
+        ),
+        // Refused for its arguments before the tool ran (`kind` is missing).
+        (
+            "get_resource",
+            json!({"cluster": EXPOSED, "namespace": NAMESPACE, "name": PLANTED}),
+            |r| r.name.as_deref(),
+        ),
+        // A tool that does not exist: its name is what the call wrote.
+        (PLANTED, json!({}), |r| Some(r.tool.as_str())),
+    ];
+    let size_only = format!("…(+{} bytes)", PLANTED.len());
+    for (tool, arguments, field) in cases {
+        let context = format!("{tool} {arguments}");
+        // A call the protocol refuses has no reply text to check, and is still recorded.
+        if let Ok(reply) = mcp.call(tool, arguments) {
+            assert!(
+                !reply.text.contains(PLANTED_VALUE),
+                "{context}: {}",
+                reply.text
+            );
+        }
+        let record = last(&config_dir);
+        let recorded = field(&record).unwrap_or_default();
+        assert!(
+            recorded.contains("[REDACTED:") || (tool != PLANTED && recorded == size_only),
+            "{context}: {record:?}"
+        );
+    }
+    drop(mcp);
+    for (path, bytes) in files_below(&config_dir)? {
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(PLANTED_VALUE),
+            "planted value in {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+// covers UP-16: redaction leaves an ordinary name as written, so the record still matches its
+// cluster.
+#[test]
+fn up_16_ordinary_arguments_are_recorded_unchanged() -> Result<()> {
+    let setup = Setup::exposed()?;
+    let config_dir = setup.scratch.config_dir();
+    let mut mcp = setup.mcp()?;
+    let call = json!({"cluster": EXPOSED, "namespace": NAMESPACE, "pod": POD, "container": "web"});
+    mcp.call("get_pod_logs", call)?;
+    let record = last(&config_dir);
+    assert_eq!(record.cluster.as_deref(), Some(EXPOSED));
+    assert_eq!(record.cluster_key, Some(activity::cluster_key(EXPOSED)));
+    assert_eq!(record.kind.as_deref(), Some("pods"));
+    assert_eq!(record.namespace.as_deref(), Some(NAMESPACE));
+    assert_eq!(record.name.as_deref(), Some(POD));
+    assert_eq!(record.container.as_deref(), Some("web"));
+    Ok(())
 }
 
 // covers UP-16: each call from either process is in the log as soon as it returns, with its

@@ -53,9 +53,37 @@ Open the release on [GitHub Releases](https://github.com/Sealos/flint/releases),
   shasum -a 256 -c ./*.sha256
   ```
 
-The `publish` job already checks that all twelve files are on the draft, non-empty and matching their checksums, and
+- [ ] The provenance verifies. Every release asset (binaries, SBOMs and their `.sha256` files) has a build provenance
+  attestation naming the release commit, made by the `attest` job before the files were attached. For each file, in
+  the directory you downloaded into:
+
+  ```sh
+  gh attestation verify ./flint-vX.Y.Z-linux-x86_64.AppImage -R Sealos/flint
+  ```
+
+  It succeeds only if the file's digest was attested by a workflow run in `Sealos/flint`. To also pin the workflow,
+  add `--signer-workflow Sealos/flint/.github/workflows/release-please.yml`. v0.4.0 and earlier have no build provenance, so `gh attestation verify` with its default predicate fails on them.
+
+The `publish` job already checks that all 24 files (the twelve binaries and SBOMs, each with its `.sha256`) are on the draft, non-empty and matching their checksums, and
 that the release ends up published (and Latest when it should be). This step confirms what someone downloading it
 sees.
+
+### If the `release-commit` job fails
+
+The run stopped because the release tag is not the commit the run was triggered by, which happens when release-please
+picks up a merged release PR on a later `master` push. Nothing was built, attested or uploaded, and the release is
+still a draft. Re-running the same run fails the same way, because its commit does not change. To release from the
+tagged commit, put the release back to pending and re-run that commit's workflow run:
+
+```sh
+sha=$(gh api repos/Sealos/flint/commits/vX.Y.Z --jq .sha)   # the commit the tag names
+gh release delete vX.Y.Z -R Sealos/flint --cleanup-tag --yes
+gh pr edit <release PR> -R Sealos/flint --remove-label 'autorelease: tagged' --add-label 'autorelease: pending'
+gh run list -R Sealos/flint -w Release -c "$sha"            # find that commit's run
+gh run rerun <run id> -R Sealos/flint
+```
+
+Only do this for a draft. These commands delete a tag and start a release, so check the version and the commit first.
 
 ## 2. Install from the DMG on a clean Mac (UP-80)
 

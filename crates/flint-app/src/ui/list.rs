@@ -6,6 +6,7 @@
 //! a list of 50, however fast the watch changes.
 
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +19,6 @@ use flint_core::{
 use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
@@ -32,7 +32,7 @@ use list_model::{CELL_PADDING, CHAR_WIDTH};
 
 use super::list_model::{self, ColumnWidths, SortSpec};
 use super::notice::notice;
-use super::row_menu::RowMenu;
+use super::row_menu::{OpenRowMenu, RowMenu};
 
 use super::registry::{
     self, CloseDetail, SelectFirst, SelectLast, SelectNext, SelectPrev, SelectRow,
@@ -134,6 +134,13 @@ pub struct ResourceList {
     /// Down left the filter while its rows were being computed: select the first row in this
     /// window once they are current, if the rows still have focus.
     select_first_in: Option<AnyWindowHandle>,
+    /// Go Back set the filter's text: rows computed for any other text are dropped, not drawn,
+    /// until rows for it arrive ([`ResourceList::restore_filter`]).
+    restoring_filter: bool,
+    /// The text the rows drawn were computed for; `query.text` runs ahead of it while typing.
+    rows_text: String,
+    /// The selected object, when the rows drawn exist without it: the filters exclude it.
+    hidden_selected: Option<Box<str>>,
     /// The namespace or text filter changed: the next measurement starts the column widths
     /// over, so they fit the rows now shown. Live updates under the same filters only grow them.
     remeasure: bool,
@@ -168,6 +175,9 @@ pub struct ResourceList {
     filter: Entity<InputState>,
     /// A row's context menu, for kinds that have one (pods and workloads: UP-47).
     row_menu: Option<RowMenu>,
+    /// The row menu now open. The list holds it, not the row: opening the detail pane narrows
+    /// the row, which must not close the menu (#496).
+    open_row_menu: Option<OpenRowMenu>,
     _watch: Task<()>,
     _compute: Task<()>,
     _tick: Task<()>,
@@ -220,7 +230,8 @@ impl ResourceList {
                 }
             }
         });
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter by name, label…"));
+        let filter =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter by name, label, managed…"));
         let on_filter = cx.subscribe_in(&filter, window, |this, input, event, _, cx| {
             if let InputEvent::Change = event {
                 this.query.text = input.read(cx).value().to_string();
@@ -258,6 +269,9 @@ impl ResourceList {
             computing: false,
             dirty: false,
             select_first_in: None,
+            restoring_filter: false,
+            rows_text: String::new(),
+            hidden_selected: None,
             remeasure: false,
             scoped: 0,
             scroll: UniformListScrollHandle::new(),
@@ -274,6 +288,7 @@ impl ResourceList {
             focus: cx.focus_handle(),
             filter,
             row_menu: None,
+            open_row_menu: None,
             _watch: watch,
             _compute: Task::ready(()),
             _tick: tick,
@@ -313,6 +328,51 @@ impl ResourceList {
     /// Gives each row a context menu built by `menu`; right-clicking a row selects it first.
     pub fn set_row_menu(&mut self, menu: RowMenu) {
         self.row_menu = Some(menu);
+    }
+
+    /// Opens the row menu of `uid` at `position`, replacing one already open. Built after the
+    /// press has been handled, so the menu sees the row it selected.
+    fn show_row_menu(
+        &mut self,
+        uid: String,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(build) = self.row_menu.clone() else {
+            return;
+        };
+        let back_to = OpenRowMenu::focus_before(self.open_row_menu.take(), window, cx)
+            .unwrap_or_else(|| self.focus.clone());
+        cx.defer_in(window, move |list, window, cx| {
+            let open = OpenRowMenu::open(&build, uid, position, back_to, window, cx);
+            list.open_row_menu = Some(open);
+            cx.notify();
+        });
+    }
+
+    /// Called by the open menu when it is dismissed.
+    pub(in crate::ui) fn row_menu_closed(&mut self, cx: &mut Context<Self>) {
+        self.open_row_menu = None;
+        cx.notify();
+    }
+
+    /// The open menu to draw. One whose row has left the list is dismissed instead: its entries
+    /// would act on something no longer shown.
+    fn drawn_row_menu(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let open = self.open_row_menu.as_ref()?;
+        let listed = self
+            .rows
+            .iter()
+            .any(|&ix| &*self.shown.rows[ix as usize].uid == open.uid());
+        if !listed {
+            let menu = open.menu().clone();
+            cx.defer_in(window, move |_, _, cx| {
+                menu.update(cx, |_, cx| cx.emit(DismissEvent));
+            });
+            return None;
+        }
+        open.element(window, cx)
     }
 
     /// The snapshot being drawn and how many of its rows pass the filters, for tests.
@@ -496,6 +556,7 @@ impl ResourceList {
         self.computing = true;
         self.dirty = false;
         let snapshot = self.latest.clone();
+        let job_text = self.query.text.clone();
         let query = ViewQuery {
             namespaces: self.query.namespaces.clone(),
             text: self.query.text.clone(),
@@ -546,11 +607,13 @@ impl ResourceList {
                     list.query.sort.as_ref(),
                     &list.sortable_in(&snapshot.columns),
                 );
-                if now != job_sort {
+                if now != job_sort || (list.restoring_filter && job_text != list.query.text) {
                     list.remeasure |= restart;
                     list.recompute(cx);
                     return None;
                 }
+                list.restoring_filter = false;
+                list.rows_text = job_text;
                 list.widths.update(&snapshot.columns, &widths, restart);
                 list.scoped = scoped;
                 list.rows_in_one_namespace = one_namespace;
@@ -604,6 +667,9 @@ impl ResourceList {
                 let found = find_row(&self.shown, selected.namespace.as_deref(), &selected.name)
                     .map(|i| &self.shown.rows[i])
                     .filter(|row| row.uid == selected.uid);
+                self.hidden_selected = found
+                    .filter(|_| position.is_none())
+                    .map(|row| row.uid.clone());
                 match found {
                     Some(row) => {
                         self.selected_gone = false;
@@ -873,7 +939,7 @@ impl ResourceList {
                 } = list_model::CellStyle::of(
                     column,
                     || cell_text(row, col, now),
-                    width,
+                    list_model::text_width(column, row, secrets, width),
                     list_model::RowFlags {
                         masked: is_masked_column(secrets, &self.shown.columns, col),
                         ..flags
@@ -912,6 +978,9 @@ impl ResourceList {
                             .child(shown.clone())
                             .test_text(shown),
                     )
+                    .when(column.role == ColumnRole::Name, |el| {
+                        el.children(managed::marker(row, secrets, theme))
+                    })
                     .when_some(tooltip, |el, text| {
                         el.tooltip(move |window, cx| {
                             #[cfg(test)]
@@ -925,14 +994,20 @@ impl ResourceList {
             elements.push(match &self.row_menu {
                 // A right-click selects the row (a mouse down, before the menu opens on it), so
                 // the menu acts on it.
-                Some(menu) => {
-                    let menu = menu.clone();
+                Some(_) => {
+                    let press = row_press(select, row.uid.to_string(), cx.weak_entity());
+                    let on_right = press.clone();
                     div()
                         .id(SharedString::from(format!("row-menu-{}", row.uid)))
+                        .relative()
                         .w_full()
-                        .on_mouse_down(MouseButton::Right, registry::on_click_passing(select))
+                        // not-an-action: opens the menu; `row_press` selects through the registry.
+                        .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                            on_right(event.position, window, cx);
+                            cx.stop_propagation();
+                        })
                         .child(el)
-                        .context_menu(move |m, window, cx| menu(m, window, cx))
+                        .child(long_press_area(press))
                         .into_any_element()
                 }
                 None => el.into_any_element(),
@@ -1122,7 +1197,8 @@ impl ResourceList {
                 .into_any_element()
         };
         if snapshot.rows.is_empty()
-            && let Some(title) = access_title(&snapshot.state, label)
+            && let Some(title) =
+                access_title(&snapshot.state, label, snapshot.limited_to.as_deref())
         {
             let detail = match &snapshot.state {
                 // Nothing to fall back to: the error says how to pick namespaces.
@@ -1175,6 +1251,25 @@ impl ResourceList {
                 Some(error.clone()),
                 theme.warning,
             )),
+            _ if self.restoring_filter => Some(
+                h_flex()
+                    .id("list-placeholder")
+                    .size_full()
+                    .justify_center()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(Spinner::new().small())
+                    .child(
+                        div()
+                            .id("list-filtering")
+                            .child(format!("Filtering {label}…"))
+                            .test_support(),
+                    )
+                    .test_support()
+                    .into_any_element(),
+            ),
             _ if self.rows.is_empty() => {
                 let filtered = !self.query.text.trim().is_empty()
                     || (self.namespaced && !self.query.namespaces.is_empty());
@@ -1228,20 +1323,33 @@ impl ResourceList {
         }
     }
 
-    /// What the list says when the selected object's namespace is outside the namespace
-    /// filter (opened from the resource switcher): its row is hidden, its details show.
+    /// What the list says when a filter hides the selected object's row and its details still
+    /// show: its namespace is outside the namespace filter (opened from the resource switcher),
+    /// or the rows computed for the current text exclude it.
     pub(in crate::ui) fn filtered_out_text(&self) -> Option<String> {
         let selected = self.selected.as_ref()?;
-        let namespace = selected.namespace.as_deref()?;
         let filter = &self.query.namespaces;
-        if !self.namespaced || filter.is_empty() || filter.iter().any(|n| n == namespace) {
-            return None;
+        if let Some(namespace) = selected.namespace.as_deref()
+            && self.namespaced
+            && !filter.is_empty()
+            && !filter.iter().any(|n| n == namespace)
+        {
+            return Some(format!(
+                "{} is in namespace {namespace}, outside the namespace filter, so its row is \
+                 hidden; its details are shown.",
+                selected.name
+            ));
         }
-        Some(format!(
-            "{} is in namespace {namespace}, outside the namespace filter, so its row is hidden; \
-             its details are shown.",
-            selected.name
-        ))
+        let hidden_by_text = !self.restoring_filter
+            && !self.query.text.trim().is_empty()
+            && self.rows_text == self.query.text
+            && self.hidden_selected.as_deref() == Some(&*selected.uid);
+        hidden_by_text.then(|| {
+            format!(
+                "{} does not match the text filter, so its row is hidden; its details are shown.",
+                selected.name
+            )
+        })
     }
 
     /// Banners over the rows: an object asked for that is gone, or whose row the namespace
@@ -1326,12 +1434,25 @@ impl ResourceList {
 }
 
 /// What the list is titled while an account's access is the question. `None` for anything that
-/// is not a denial: a missing API must not read as a permissions problem.
-fn access_title(state: &SyncState, label: &str) -> Option<String> {
+/// is not a denial: a missing API must not read as a permissions problem. A settled denial of
+/// a namespace-limited list names the namespaces tried.
+fn access_title(
+    state: &SyncState,
+    label: &str,
+    limit: Option<&flint_core::NamespaceLimit>,
+) -> Option<String> {
     if state.is_checking_access() {
         Some(format!("Checking access to {label}…"))
     } else if state.is_no_access() {
-        Some(format!("No access to {label}"))
+        Some(
+            match limit.map(|l| (l.listed.as_slice(), l.denied.as_slice())) {
+                Some(([], [namespace])) => format!("No access to {label} in {namespace}"),
+                Some(([], denied)) if !denied.is_empty() => {
+                    format!("No access to {label} in {} namespaces", denied.len())
+                }
+                _ => format!("No access to {label}"),
+            },
+        )
     } else {
         None
     }
@@ -1357,8 +1478,12 @@ pub fn limited_text(label: &str, limit: &flint_core::NamespaceLimit) -> String {
     let mut text = format!(
         "Showing {label} in {count} only ({names}): you may not list {label} in all namespaces."
     );
+    // A lane fails on a 403 or a 404, and the limit does not say which: claim neither.
     if !limit.denied.is_empty() {
-        text.push_str(&format!(" Not allowed in: {}.", limit.denied.join(", ")));
+        text.push_str(&format!(
+            " Could not list {label} in: {}.",
+            limit.denied.join(", ")
+        ));
     }
     text
 }
@@ -1465,6 +1590,7 @@ impl Render for ResourceList {
         self.dropped_wide = dropped;
         self.resort_if_drawn_changed(cx);
         let total_width: f32 = self.drawn.iter().map(|(_, w)| w).sum();
+        let row_menu = self.drawn_row_menu(window, cx);
 
         let cx: &Context<Self> = cx;
         let theme = cx.theme();
@@ -1533,11 +1659,50 @@ impl Render for ResourceList {
                         .test_support(),
                 )
             })
+            .children(row_menu)
     }
+}
+
+/// Pressing a row for its menu, at a window position.
+type RowPress = Rc<dyn Fn(Point<Pixels>, &mut Window, &mut App)>;
+
+/// What pressing a row for its menu does: selects the row, then opens the menu on it.
+fn row_press(select: SelectRow, uid: String, list: WeakEntity<ResourceList>) -> RowPress {
+    let select = registry::on_click::<(), _>(select);
+    Rc::new(move |position, window, cx| {
+        select(&(), window, cx);
+        let _ = list.update(cx, |list, cx| {
+            list.show_row_menu(uid.clone(), position, window, cx)
+        });
+    })
+}
+
+/// A finger has no right button: a long press on the row opens its menu too.
+fn long_press_area(press: RowPress) -> impl IntoElement {
+    canvas(
+        |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+        move |_, hitbox, window, _| {
+            window.on_mouse_event(move |event: &LongPressEvent, phase, window, cx| {
+                if phase.bubble()
+                    && event.phase == TouchPhase::Started
+                    && !window.default_prevented()
+                    && hitbox.is_hovered(window)
+                {
+                    window.prevent_default();
+                    press(event.start_position, window, cx);
+                }
+            });
+        },
+    )
+    .absolute()
+    .size_full()
 }
 
 #[path = "list_actions.rs"]
 mod actions;
+
+#[path = "list_managed.rs"]
+mod managed;
 
 #[cfg(any(test, feature = "automation"))]
 #[path = "list_state.rs"]

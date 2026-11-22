@@ -39,7 +39,8 @@ and `flint-vX.Y.Z-linux-aarch64.AppImage`, each with a `.sha256`, next to the ma
 ## Considered Options
 
 - **deb and rpm packages:** native for their families, but two formats, each with its own dependency names and
-  repository story, and still nothing for Arch or others. Worth adding if users ask for an apt or dnf repository.
+  repository story, and still nothing for Arch or others. Planned after 1.0 (#468, #469); the AppImage remains the
+  Linux install until then.
 - **Flatpak (Flathub):** sandboxed, which fights what Flint needs: the user's kubeconfig files, the login shell's
   `PATH`, and exec plugins, `helm` and `claude` from the host. Each would need a portal or a sandbox hole.
 - **Snap:** the same sandbox problem under classic confinement review, and tied to Canonical's store.

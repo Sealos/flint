@@ -4,6 +4,7 @@ on:
   push:
     branches: [master]
   pull_request:
+  merge_group:
 
 permissions:
   contents: read
@@ -23,9 +24,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      rust: ${{ steps.filter.outputs.rust }}
-      appimage: ${{ steps.filter.outputs.appimage }}
-      macos: ${{ steps.filter.outputs.macos }}
+      # A full run does every job, whatever the paths (the `mode` and `queue` steps).
+      rust: ${{ steps.mode.outputs.full == 'true' && 'true' || steps.filter.outputs.rust }}
+      # A smoke PR builds the packages only when it changes their packaging.
+      appimage: ${{ steps.mode.outputs.full == 'true' && 'true' || steps.mode.outputs.full == 'false' && steps.mode.outputs.packaging || steps.filter.outputs.appimage }}
+      # In the merge queue, the `queue` step decides; everywhere else, the filter.
+      macos: ${{ (steps.mode.outputs.full == 'true' || steps.queue.outputs.full == 'true') && 'true' || steps.queue.outputs.macos || steps.filter.outputs.macos }}
+      # `false` only on a smoke PR. Jobs read anything else, a failed job included, as full.
+      full: ${{ steps.mode.outputs.full }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -41,6 +47,51 @@ jobs:
           else
             scripts/ci-changes.sh --all
           fi
+      # A merge group runs every Linux check (--all above), and macOS only when its diff can change
+      # the app: the filter's `macos` group (Rust inputs, the automation check, CI itself). Those
+      # runners are scarce, and master still runs macOS after every merge. Missing SHAs select
+      # every group, and a failed diff fails this job, which also runs every gated job.
+      - id: queue
+        if: github.event_name == 'merge_group'
+        env:
+          BASE: ${{ github.event.merge_group.base_sha }}
+          HEAD: ${{ github.event.merge_group.head_sha }}
+        run: |
+          if [ -n "$BASE" ] && [ -n "$HEAD" ]; then
+            scripts/ci-changes.sh "$BASE" "$HEAD"
+            scripts/ci-changes.sh --suite "$BASE" "$HEAD"
+          else
+            scripts/ci-changes.sh --all
+            scripts/ci-changes.sh --suite --all
+          fi
+      # Ordinary PRs get a smoke run; master and the merge queue always run the full suite. A PR
+      # runs it too with the full-ci label or when a path needs it (scripts/ci-changes.sh).
+      # Labels are read when a run starts, and `labeled` is deliberately not a trigger: it would
+      # replace finished required checks. After labelling, push a commit or close and reopen the
+      # PR.
+      - id: mode
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          FULL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+        run: |
+          if [ "$FULL_LABEL" = true ]; then
+            scripts/ci-changes.sh --suite --all
+          else
+            scripts/ci-changes.sh --suite "$BASE" "$HEAD"
+          fi
+
+  # Names which suite this run used, because a smoke `test (*)` passes under the same check name
+  # as a full one. Not a required check.
+  suite:
+    name: suite (${{ needs.changes.result == 'success' && needs.changes.outputs.full == 'false' && 'smoke' || 'full' }})
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: echo "The check name records the suite."
 
   fmt:
     needs: changes
@@ -70,10 +121,12 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: linux
+          # A queue branch's cache is never restored by master; it would only use up the budget.
+          save-if: ${{ github.event_name != 'merge_group' }}
       - run: cargo clippy -p flint-core -p flint-mcp -p flint-e2e --all-targets --locked -- -D warnings
 
   # One job per crate, so a failure points at the module that broke. flint-app's tests run in
-  # the macOS job below.
+  # the macOS jobs below.
   test:
     name: test (${{ matrix.crate }})
     needs: changes
@@ -82,37 +135,67 @@ jobs:
     if: ${{ !cancelled() }}
     env:
       RUN: ${{ needs.changes.result != 'success' || needs.changes.outputs.rust == 'true' }}
+      FULL: ${{ needs.changes.result != 'success' || needs.changes.outputs.full != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         crate: [flint-core, flint-mcp, flint-e2e]
+        # The smoke set of each crate, and the fewest passes that prove its filters still match.
+        include:
+          - crate: flint-core
+            smoke: "--lib -- --color never protection:: read_only:: redact::tests::"
+            smoke-min: 37
+          - crate: flint-mcp
+            smoke: --test mcp_stdio -- --color never
+            smoke-min: 5
+          - crate: flint-e2e
+            smoke: --test write_gate --test protected_cluster -- --color never
+            smoke-min: 10
     steps:
       - if: env.RUN == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - if: env.RUN == 'true'
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      # Read-only, from the cache cluster-e2e.yml saves on master: it holds the compiled test
+      # dependencies of these three crates. The `linux` cache is saved by clippy and holds only
+      # check metadata, so restoring it here rebuilt about 200 dependencies in every job.
       - if: env.RUN == 'true'
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: linux
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          shared-key: linux-cluster-e2e
+          save-if: false
       # The MCP e2e tests run flint-mcp; build it here rather than inside the tests.
       - if: env.RUN == 'true' && (matrix.crate == 'flint-e2e')
         run: cargo build -p flint-mcp --bin flint-mcp --locked
-      - if: env.RUN == 'true'
+      - if: env.RUN == 'true' && env.FULL == 'true'
         run: cargo test -p ${{ matrix.crate }} --locked
         env:
           FLINT_E2E_MCP_BIN: ${{ matrix.crate == 'flint-e2e' && format('{0}/target/debug/flint-mcp', github.workspace) || '' }}
+      - name: Build every test, run the smoke set
+        if: env.RUN == 'true' && env.FULL != 'true'
+        shell: bash
+        env:
+          CRATE: ${{ matrix.crate }}
+          SMOKE: ${{ matrix.smoke }}
+          SMOKE_MIN: ${{ matrix.smoke-min }}
+          FLINT_E2E_MCP_BIN: ${{ matrix.crate == 'flint-e2e' && format('{0}/target/debug/flint-mcp', github.workspace) || '' }}
+        run: |
+          cargo test -p "$CRATE" --locked --no-run
+          # shellcheck disable=SC2086 # one argument per word
+          cargo test -p "$CRATE" --locked $SMOKE | tee smoke.log
+          passed=$(awk '/^test result:/ { n += $4 } END { print n + 0 }' smoke.log)
+          if [ "$passed" -lt "$SMOKE_MIN" ]; then
+            echo "::error::smoke set ran $passed passing tests, expected at least $SMOKE_MIN"
+            exit 1
+          fi
 
   docs:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
@@ -121,6 +204,10 @@ jobs:
           shared-key: linux
           save-if: false
       - run: cargo doc -p flint-core -p flint-mcp -p flint-e2e --no-deps --document-private-items --locked
+        # On the step, not the job: rust-cache hashes RUST* variables into its key, so a job-level
+        # value here never matched the `linux` cache and every run rebuilt the dependencies.
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   # The app on Linux: GPUI builds there (X11/Wayland), and the headless view tests use GPUI's
   # test platform, so they run without a display. Flint ships a Linux AppImage (ADR-0016); the
@@ -147,11 +234,27 @@ jobs:
         run: cargo clippy -p flint-app --all-targets --features automation --locked -- -D warnings
       # One test run, as on macOS: the automation build compiles every test, the channel's too.
       - name: Tests (with the automation channel)
+        if: needs.changes.result != 'success' || needs.changes.outputs.full != 'false'
         # GPUI's leak detector: view tests that check a closed view was released
         # (`assert_released`, `assert_no_new_leaks`) list each leaked handle on failure.
         env:
           GPUI_LEAK_DETECTION: "1"
         run: cargo test -p flint-app --features automation --locked
+      - name: Build every test, run the smoke set
+        if: needs.changes.result == 'success' && needs.changes.outputs.full == 'false'
+        shell: bash
+        env:
+          GPUI_LEAK_DETECTION: "1"
+          SMOKE_MIN: "43"
+        run: |
+          cargo test -p flint-app --features automation --locked --no-run
+          cargo test -p flint-app --features automation --locked --bin flint -- --color never \
+            ui::write_confirm ui::registry:: ui::theme:: | tee smoke.log
+          passed=$(awk '/^test result:/ { n += $4 } END { print n + 0 }' smoke.log)
+          if [ "$passed" -lt "$SMOKE_MIN" ]; then
+            echo "::error::smoke set ran $passed passing tests, expected at least $SMOKE_MIN"
+            exit 1
+          fi
 
   # The release build packaged as an AppImage, as release-please does, then run without FUSE:
   # `--version` and `mcp` through the AppImage. x86_64 only; the release also builds aarch64. On
@@ -229,26 +332,72 @@ jobs:
       - name: MCP e2e in a clean Ubuntu 22.04
         run: scripts/test-mcp-linux.sh x86_64 "$ARCHIVE"
 
-  # Everything that needs macOS, in one job so one VM is paid for: the app's clippy, view tests
-  # and docs (also with the test-only automation channel), and a release build that catches
-  # profile-only problems (LTO, strip) before release-please does, and proves the automation
-  # channel is not in it.
-  # Also runs the app e2e tests (docs/TESTING.md, "Running app e2e"): macOS runners are costly,
-  # so they share this job's build instead of getting their own. Read-only; the PR comment that
-  # links the screenshots is posted by the Linux job below.
-  # Not on PRs by default: it takes about 15 minutes on a runner that costs ten times a Linux
-  # one, and linux (flint-app) already runs the app's clippy and tests. It runs on every push to
-  # master, so a macOS-only break shows up there before a release is cut. Add the run-macos
-  # label to a PR to run it before merging (for example, macOS-only code or packaging changes);
-  # the label counts from the next push, so add it before pushing (labelling alone does not
-  # start CI, which would rerun every other job too). On a labelled PR it runs whatever the
+  # The app's macOS checks, in two parallel jobs so a failure shows early and a slow stage can be
+  # rerun alone: macos-build (clippy, docs, release build) and macos-tests (view tests, app e2e).
+  # `macos (flint-app)` below is their result. Two jobs rather than one per stage because macOS
+  # runners are scarce and cost about ten times a Linux one.
+  # Not on PRs by default: linux (flint-app) already runs the app's clippy and tests. They run on
+  # every push to master, so a macOS-only break shows up there before a release is cut. Add the
+  # run-macos label to a PR to run them before merging (for example, macOS-only code or packaging
+  # changes); the label counts from the next push, so add it before pushing (labelling alone does
+  # not start CI, which would rerun every other job too). On a labelled PR they run whatever the
   # paths are.
-  macos:
-    name: macos (flint-app)
+  #
+  # Each job is the only writer of its own cache key, because a key is written once and the two
+  # build different output: `macos` holds check and release artifacts (macos-app.yml restores
+  # it), `macos-tests` the debug test build (memory.yml restores it). rust-cache hashes RUST*
+  # variables into the key, so RUSTDOCFLAGS stays on both jobs to match those workflows.
+  macos-build:
+    name: macos build (flint-app)
     needs: changes
+    # Same condition as macos-tests. If they ever differ, `macos (flint-app)` fails.
     if: >-
       ${{ !cancelled() && (github.event_name == 'pull_request'
-      && contains(github.event.pull_request.labels.*.name, 'run-macos')
+      && (contains(github.event.pull_request.labels.*.name, 'run-macos')
+      || needs.changes.result != 'success'
+      || needs.changes.outputs.full == 'true' && needs.changes.outputs.macos == 'true')
+      || github.event_name != 'pull_request'
+      && (needs.changes.result != 'success' || needs.changes.outputs.macos == 'true')) }}
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: clippy
+      # The only writer of this key, on master.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: macos
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Clippy
+        run: cargo clippy -p flint-app --all-targets --locked -- -D warnings
+      - name: Clippy (automation channel)
+        run: cargo clippy -p flint-app --all-targets --features automation --locked -- -D warnings
+      - name: Docs
+        run: cargo doc -p flint-app --no-deps --document-private-items --locked
+      # Catches profile-only problems (LTO, strip) before release-please does.
+      - name: Release build
+        run: cargo build --release --locked -p flint-app
+      - run: ./target/release/flint --help
+      # The automation channel is test-only (docs/TESTING.md): it must not be in what ships.
+      - name: Release binary has no automation channel
+        run: scripts/check-no-automation.sh ./target/release/flint
+
+  # The view tests and app e2e (docs/TESTING.md, "Running app e2e") share one job because e2e
+  # drives the debug binary the tests build. Read-only; the PR comment that links the screenshots
+  # is posted by the Linux job below.
+  macos-tests:
+    name: macos tests (flint-app)
+    needs: changes
+    # Same condition as macos-build. If they ever differ, `macos (flint-app)` fails.
+    if: >-
+      ${{ !cancelled() && (github.event_name == 'pull_request'
+      && (contains(github.event.pull_request.labels.*.name, 'run-macos')
+      || needs.changes.result != 'success'
+      || needs.changes.outputs.full == 'true' && needs.changes.outputs.macos == 'true')
       || github.event_name != 'pull_request'
       && (needs.changes.result != 'success' || needs.changes.outputs.macos == 'true')) }}
     runs-on: macos-latest
@@ -261,18 +410,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
-        with:
-          components: clippy
+      # The only writer of this key, on master.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: macos
+          shared-key: macos-tests
           save-if: ${{ github.ref == 'refs/heads/master' }}
-      - name: Clippy
-        run: cargo clippy -p flint-app --all-targets --locked -- -D warnings
-      - name: Clippy (automation channel)
-        run: cargo clippy -p flint-app --all-targets --features automation --locked -- -D warnings
       # One test run: the automation build compiles every test, the channel's too. The plain
-      # build is still checked by clippy above. With GPUI's leak detector, as on Linux: the
+      # build is checked by clippy in macos-build. With GPUI's leak detector, as on Linux: the
       # channel's task lives as long as the app and must not keep the workspace alive.
       - name: Tests (with the automation channel)
         env:
@@ -288,18 +432,9 @@ jobs:
           fi
           # What GPUI renders with here, for diagnosing a screenshot or window failure.
           system_profiler SPDisplaysDataType || true
-      - name: Docs
-        run: cargo doc -p flint-app --no-deps --document-private-items --locked
-      - name: Release build
-        run: cargo build --release --locked -p flint-app
-      - run: ./target/release/flint --help
-      # The automation channel is test-only (docs/TESTING.md): it must not be in what ships.
-      - name: Release binary has no automation channel
-        run: scripts/check-no-automation.sh ./target/release/flint
       # The real app, driven over its automation socket, one test per user path, against the
-      # fake API server. Failures fail the job; the screenshots are only uploaded. Last, so a
-      # failure here does not hide the docs and release checks above. It needs only
-      # target/debug/flint, which the release build does not touch.
+      # fake API server. Failures fail the job; the screenshots are only uploaded. It needs only
+      # target/debug/flint, built above.
       - name: App e2e
         id: e2e
         # A hung window or socket wait must not hold the runner for the job's full hour.
@@ -322,18 +457,37 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # The check name that release steps and merge tooling look for. Succeeds only if both macOS
+  # jobs did. Skipped only when both were skipped, so an unselected PR still shows no macOS pass;
+  # a failed, cancelled or lone skipped job fails it. `always()` so a cancelled job cannot leave
+  # this check looking merely skipped.
+  macos:
+    name: macos (flint-app)
+    needs: [macos-build, macos-tests]
+    if: ${{ always() && (needs.macos-build.result != 'skipped' || needs.macos-tests.result != 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Both macOS jobs passed
+        env:
+          BUILD: ${{ needs.macos-build.result }}
+          TESTS: ${{ needs.macos-tests.result }}
+        run: |
+          echo "macos build: $BUILD, macos tests: $TESTS"
+          [ "$BUILD" = success ] && [ "$TESTS" = success ]
+
   # Posts (or updates) one comment on the PR linking the app e2e screenshots. A cheap Linux job,
-  # so the macOS job keeps read-only permissions. Same-repo PRs only: a fork's token cannot
+  # so the macOS jobs keep read-only permissions. Same-repo PRs only: a fork's token cannot
   # write, and its screenshots need no comment to be found on the run page.
   app-e2e-comment:
     name: app e2e screenshots comment
-    needs: macos
+    needs: macos-tests
     # Also when an earlier macOS step failed (the comment then says e2e did not run, so it never
     # shows an older result). Not for Dependabot: its runs get a read-only token.
     if: >-
       !cancelled() && github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.actor != 'dependabot[bot]' && needs.macos.result != 'skipped'
+      github.actor != 'dependabot[bot]' && needs.macos-tests.result != 'skipped'
     # One comment writer per PR at a time, so two pushes cannot both post. Queued, not cancelled.
     concurrency:
       group: app-e2e-comment-${{ github.event.pull_request.number }}
@@ -349,8 +503,8 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           SHA: ${{ github.event.pull_request.head.sha }}
-          URL: ${{ needs.macos.outputs.screenshots-url }}
-          OUTCOME: ${{ needs.macos.outputs.e2e }}
+          URL: ${{ needs.macos-tests.outputs.screenshots-url }}
+          OUTCOME: ${{ needs.macos-tests.outputs.e2e }}
           RUN_ID: ${{ github.run_id }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -365,7 +519,7 @@ jobs:
           # The job outputs come from a job that ran PR code; accept only the expected shapes.
           case "$OUTCOME" in
             success|failure|cancelled) result="\`$OUTCOME\`" ;;
-            *) result="not run (an earlier step of \`macos (flint-app)\` failed)" ;;
+            *) result="not run (an earlier step of \`macos tests (flint-app)\` failed)" ;;
           esac
           if [[ "$URL" =~ ^https://github\.com/${REPO}/actions/runs/${RUN_ID}/artifacts/[0-9]+$ ]]; then
             link="[Download the screenshots]($URL) (light and dark, one per key view)."

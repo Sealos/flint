@@ -69,12 +69,15 @@ struct Inner {
 /// much.
 const RECORD_WAIT: Duration = Duration::from_secs(2);
 const _: () = assert!(activity::LOCK_WAIT.as_millis() < RECORD_WAIT.as_millis());
+/// The longest a call waits to learn whether the cluster it named is in the kubeconfig.
+const CONTEXT_WAIT: Duration = Duration::from_millis(500);
 
 impl Inner {
     /// Writes `record` to the activity log, keying the servers it `reached`, on the call's own
     /// path, waiting at most [`RECORD_WAIT`]. A record that could not be written in time, or at
     /// all, is logged.
     async fn record(&self, record: activity::ActivityRecord, reached: activity::Reached) {
+        let record = names_only(record);
         let dir = self.config_dir.clone();
         let write =
             tokio::task::spawn_blocking(move || activity::append_call(&dir, &record, &reached));
@@ -85,6 +88,35 @@ impl Inner {
             Err(_) => tracing::warn!("the agent activity log was not written in time"),
         }
     }
+}
+
+/// Invalid argument names are recorded by size.
+fn names_only(mut record: activity::ActivityRecord) -> activity::ActivityRecord {
+    let keep = |value: &mut Option<String>, valid: fn(&str) -> bool| {
+        if let Some(text) = value.as_mut().filter(|text| !valid(text)) {
+            *text = activity::size_only(text);
+        }
+    };
+    // Kind selectors are trimmed when resolved, so a padded one still names the kind it read.
+    if record.tool != "get_events"
+        && let Some(kind) = record.kind.as_mut()
+        && kind.trim().len() != kind.len()
+    {
+        *kind = kind.trim().to_owned();
+    }
+    let kind = match record.tool.as_str() {
+        "get_events" => is_event_object_kind,
+        _ => policy::is_object_name,
+    };
+    let name = match record.tool.as_str() {
+        "get_pod_logs" => policy::is_pod_name,
+        _ => policy::is_object_name,
+    };
+    keep(&mut record.kind, kind);
+    keep(&mut record.namespace, policy::is_label_name);
+    keep(&mut record.name, name);
+    keep(&mut record.container, policy::is_label_name);
+    record
 }
 
 /// Discovery results for one cluster.
@@ -167,7 +199,8 @@ type ToolResult = Result<CallToolResult, rmcp::ErrorData>;
 /// out, if the cluster could be reached.
 type Probed = (Result<String, String>, Option<policy::ScopeCheck>);
 
-/// What a tool call named, as the agent wrote it: recorded in the activity log.
+/// What a tool call named, as the agent wrote it: recorded in the activity log, which redacts it
+/// as it does for replies ([`activity::append`]).
 #[derive(Debug, Default, Clone)]
 struct Named {
     cluster: Option<String>,
@@ -257,6 +290,7 @@ impl FlintMcp {
         let reached = activity::Reached {
             server: endpoint,
             probed,
+            ..activity::Reached::default()
         };
         let record = activity::ActivityRecord {
             at_ms: activity::now_ms(),
@@ -308,6 +342,8 @@ struct CallNote {
     endpoint: Option<String>,
     /// The contexts `list_clusters` probed, with their servers as the kubeconfig has them.
     probed: Vec<(String, Option<String>)>,
+    /// The cluster it named is a context in the kubeconfig ([`FlintMcp::names_context`]).
+    context: bool,
     /// What its tool would record ([`FlintMcp::finish`]), and the servers it reached, written
     /// once the call's outcome is settled.
     record: Option<(activity::ActivityRecord, activity::Reached)>,
@@ -318,14 +354,11 @@ tokio::task_local! {
     static CALL: std::cell::RefCell<CallNote>;
 }
 
-/// What a call's raw arguments name, for a call rejected before its tool ran: only string
-/// values without control characters, under the names the tools use. [`activity::append`] caps
-/// their length.
+/// The string arguments that name resources, including on calls rejected by the schema.
 fn named_in(arguments: Option<&serde_json::Map<String, Value>>) -> Named {
     let text = |keys: &[&str]| {
         keys.iter()
             .find_map(|k| arguments?.get(*k)?.as_str())
-            .filter(|value| !value.chars().any(char::is_control))
             .map(str::to_owned)
     };
     Named {
@@ -378,6 +411,10 @@ fn check_namespace(namespace: Option<&str>) -> Result<(), ToolError> {
         Some(ns) if !policy::is_label_name(ns) => Err(not_found("namespaces", ns)),
         _ => Ok(()),
     }
+}
+
+fn is_event_object_kind(kind: &str) -> bool {
+    !kind.is_empty() && kind.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// Whether `kind` is core v1 Secret, whose values are never shown.
@@ -825,12 +862,15 @@ impl ServerHandler for FlintMcp {
                                 (failed(&text), false)
                             }
                         };
+                        // Within its turn: this can read the kubeconfig.
+                        let context = self.names_context(named.cluster.as_deref(), finished).await;
                         drop(turn);
-                        let (record, note) = CALL.with(|c| {
+                        let (record, mut note) = CALL.with(|c| {
                             let mut c = c.borrow_mut();
                             let record = c.record.take().filter(|_| finished);
                             (record, std::mem::take(&mut *c))
                         });
+                        note.context = context;
                         // A tool that ran left its record: its text is the cluster's, not rmcp's
                         // error for arguments that never reached it.
                         let result = if finished && record.is_none() {
@@ -844,7 +884,8 @@ impl ServerHandler for FlintMcp {
                 }
             }
         };
-        let (record, reached) = record.unwrap_or_else(|| {
+        let context = note.context;
+        let (record, mut reached) = record.unwrap_or_else(|| {
             let names_cluster = named.cluster.is_some();
             let bytes = match &result {
                 Ok(rmcp::model::CallToolResponse::Complete(done)) => done
@@ -860,6 +901,7 @@ impl ServerHandler for FlintMcp {
             let reached = activity::Reached {
                 server: note.endpoint.filter(|_| names_cluster),
                 probed: note.probed,
+                ..activity::Reached::default()
             };
             let record = activity::ActivityRecord {
                 at_ms: activity::now_ms(),
@@ -881,6 +923,7 @@ impl ServerHandler for FlintMcp {
             };
             (record, reached)
         });
+        reached.context = context;
         self.record(record, reached).await;
         result
     }
@@ -920,6 +963,30 @@ impl FlintMcp {
             })
         })
         .await?
+    }
+
+    /// Whether `cluster` is a context in the kubeconfig, for the call's record. A call that ran to
+    /// its end reads the current kubeconfig, for at most [`CONTEXT_WAIT`]; one cut short, or
+    /// without a readable one, goes by the kubeconfig last loaded.
+    async fn names_context(&self, cluster: Option<&str>, finished: bool) -> bool {
+        let Some(name) = cluster else {
+            return false;
+        };
+        if CALL
+            .try_with(|c| c.borrow().endpoint.is_some())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if finished && let Ok(Ok(ctx)) = tokio::time::timeout(CONTEXT_WAIT, self.context()).await {
+            return ctx.kubeconfig.context(name).is_some();
+        }
+        self.inner
+            .kubeconfig
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(_, loaded)| loaded.context(name).is_some())
     }
 
     /// The client for an exposed cluster. Clients are cached per context and rebuilt when the
@@ -1151,7 +1218,11 @@ impl FlintMcp {
                 .filter(|ns| scope.is_none_or(|s| s.allows_namespace(ns)));
             let mut row = json!({
                 "name": info.name,
-                "server": info.server.as_deref().map(flint_core::redact::server_url),
+                "server": info.server.as_deref().map(|url| {
+                    let mut shown = flint_core::redact::server_url(url);
+                    policy::redact_text(&mut shown);
+                    shown
+                }),
                 "default_namespace": default_namespace,
                 "reachable": reachable,
                 "server_version": version,
@@ -1227,7 +1298,10 @@ impl FlintMcp {
                                 .to_string(),
                         ))
                     })
-                    .map_err(|e| e.message);
+                    .map_err(|mut e| {
+                        policy::redact_text(&mut e.message);
+                        e.message
+                    });
                 // Apart from the probe, so a slow lookup cannot make the cluster look unreachable.
                 let unmatched = match &result {
                     Ok(_) => {
@@ -1371,11 +1445,13 @@ impl FlintMcp {
             value["apiVersion"] = json!(kind.api_version());
             value["kind"] = json!(kind.kind());
         }
-        // Redacted as a Secret by what was asked for, not only by what came back.
-        let redacted = if is_secret_kind(&kind) {
-            policy::sanitize_secret(&mut value)
+        // Redacted as a Secret by what was asked for, not only by what came back. A Secret's
+        // manager is read first, since masking hides its tracking id.
+        let (redacted, secret_manager) = if is_secret_kind(&kind) {
+            let manager = policy::managed_by_secret_line(&value);
+            (policy::sanitize_secret(&mut value), Some(manager))
         } else {
-            policy::sanitize(&mut value)
+            (policy::sanitize(&mut value), None)
         };
         let yaml = serde_saphyr::to_string(&value)?;
         let (text, truncated) = policy::truncate_bytes(&yaml, policy::OBJECT_BYTES);
@@ -1391,8 +1467,9 @@ impl FlintMcp {
                 policy::OBJECT_BYTES
             ));
         }
-        // After the other header lines, which callers expect first. Read from the redacted object.
-        if let Some(line) = policy::managed_by_line(&value) {
+        // After the other header lines, which callers expect first. Any other object's is read
+        // from its redacted form.
+        if let Some(line) = secret_manager.unwrap_or_else(|| policy::managed_by_line(&value)) {
             out.push_str(&line);
         }
         out.push_str(text);
@@ -1408,7 +1485,7 @@ impl FlintMcp {
         if let Some(kind) = p
             .object_kind
             .as_deref()
-            .filter(|k| !k.chars().all(|c| c.is_ascii_alphanumeric()) || k.is_empty())
+            .filter(|k| !is_event_object_kind(k))
         {
             return Err(not_found("kinds", kind));
         }
@@ -2056,13 +2133,6 @@ mod tests {
             !text.chars().any(|c| c.is_control() || c == '\u{202e}'),
             "{text:?}"
         );
-
-        // A value with control characters is not kept for the activity log.
-        let named = named_in(Some(&arguments(
-            json!({"cluster": "a\u{1b}[2Jb", "kind": "pods"}),
-        )));
-        assert_eq!(named.cluster, None);
-        assert_eq!(named.kind.as_deref(), Some("pods"));
 
         // A name past the limit is not read or echoed, not even its start.
         let huge = format!("hunter2{}", "x".repeat(UNSUPPORTED_NAME_BYTES));

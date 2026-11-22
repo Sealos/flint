@@ -8,6 +8,7 @@ use kube::Client;
 use kube::config::{KubeConfigOptions, Kubeconfig};
 
 use crate::api_error::{self, ApiError, Transport};
+use crate::connection::policy::{CredentialAccess, CredentialGrant};
 use crate::credential::{self, CredentialSource, WriteCredential};
 use crate::protection::{ClusterClients, WriteAccess};
 use crate::redact;
@@ -130,6 +131,9 @@ pub enum PluginProblem {
     Stopped,
     /// It printed more than a credential takes, and was killed.
     TooLarge,
+    /// The connection's credential policy does not let it run now, so it was not started, or
+    /// was ended.
+    NotAllowed,
 }
 
 fn plugin_problem_message(command: Option<&str>, problem: &PluginProblem) -> String {
@@ -152,6 +156,11 @@ fn plugin_problem_message(command: Option<&str>, problem: &PluginProblem) -> Str
         ),
         PluginProblem::TooLarge => {
             format!("authentication failed: {plugin} printed more output than a credential takes")
+        }
+        PluginProblem::NotAllowed => {
+            "authentication failed: this cluster's credential is not run in the background; \
+             select the cluster to sign in"
+                .to_owned()
         }
     }
 }
@@ -253,15 +262,12 @@ impl ClusterError {
         })
     }
 
-    /// What an AI agent reads (the MCP server): like [`ClusterError::summary`], but text from
-    /// the server or kube keeps its quoted values (an agent needs the names to act) and is cut
-    /// to one line of at most 300 characters, so a server cannot hand it a long, multi-line
-    /// message.
+    /// Error text for MCP replies. Bounded messages keep quoted names and have credentials
+    /// redacted before the first line is shortened.
     pub fn for_agent(&self) -> String {
         match self {
-            ClusterError::Kube(_) | ClusterError::Api(_) | ClusterError::Config { .. } => {
-                redact::first_line(&self.to_string(), AGENT_CHARS)
-            }
+            ClusterError::Kube(message) | ClusterError::Api(message) => agent_error_text(message),
+            ClusterError::Config { .. } => agent_error_text(&self.to_string()),
             other => other.to_string(),
         }
     }
@@ -318,6 +324,38 @@ impl ClusterError {
 /// How much of a server's or kube's text the app shows, and an agent reads.
 const SHOWN_CHARS: usize = 200;
 const AGENT_CHARS: usize = 300;
+const AGENT_BYTES: usize = 4 * 1024;
+
+fn agent_error_text(message: &str) -> String {
+    // A clipped credential can lose the suffix that identifies it, and redaction can bring
+    // the exposed prefix into the visible line, so a longer message is not clipped and shown.
+    if message.len() > AGENT_BYTES {
+        return "Error details omitted because the message is too long".to_owned();
+    }
+    agent_line(&redact::redact_credentials(message).text)
+}
+
+/// The first line of redacted `text`, cut to [`AGENT_CHARS`] (with `…`). A `[REDACTED:<kind>]`
+/// marker across the cut goes whole.
+fn agent_line(text: &str) -> String {
+    let line = redact::first_line(text, usize::MAX);
+    let Some((mut cut, _)) = line.char_indices().nth(AGENT_CHARS) else {
+        return line;
+    };
+    let last_marker = line
+        .match_indices("[REDACTED:")
+        .map(|(start, _)| start)
+        .take_while(|start| *start < cut)
+        .last();
+    if let Some(start) = last_marker
+        && line[start..]
+            .find(']')
+            .is_some_and(|end| start + end >= cut)
+    {
+        cut = start;
+    }
+    format!("{}…", &line[..cut])
+}
 
 /// Error text that is safe to show in the window, in logs and in the automation state. Only
 /// flint-core builds it ([`ClusterError::summary`]), so nothing unsanitized can be rendered as
@@ -404,12 +442,12 @@ pub struct ServerVersion {
 /// never comes. The rest of the client setup (reading certificate files) runs on a blocking
 /// thread.
 pub async fn connect(kubeconfig: &Kubeconfig, context: &str) -> Result<Client, ClusterError> {
-    let ready = prepare(kubeconfig, context).await?;
+    let ready = prepare(kubeconfig, context, &CredentialAccess::always()).await?;
     let target = ready.target;
     let (config, token) = (ready.config, ready.token);
     tokio::task::spawn_blocking(move || {
         let auth = kube::client::ConfigExt::auth_layer(&config)?;
-        build_client(&config, token, auth.as_ref(), Access::ReadOnly)
+        build_client(&config, token, auth.as_ref(), None, Access::ReadOnly)
     })
     .await
     .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
@@ -423,10 +461,12 @@ pub(crate) struct GatedConnection {
 }
 
 /// As [`connect`], with the client that can write, closed behind the write gate. Its certificate
-/// and key files are read once here, and both clients are built from those bytes.
-async fn connect_gated(
+/// and key files are read once here, and both clients are built from those bytes. `access` says
+/// whether its credential may run, now and for as long as the connection lives.
+pub(crate) async fn connect_gated_with_policy(
     kubeconfig: &Kubeconfig,
     context: &str,
+    access: &CredentialAccess,
 ) -> Result<GatedConnection, ClusterError> {
     let mut held = kubeconfig.clone();
     let name = context.to_owned();
@@ -436,26 +476,50 @@ async fn connect_gated(
     })
     .await
     .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?;
-    let ready = prepare(&held, context).await?;
+    let ready = prepare(&held, context, access).await?;
     let target = ready.target;
     let files = credential::files_in_use(files, ready.replaced_certificate);
-    let (config, token, source) = (ready.config, ready.token, ready.source);
+    let (config, token, source, grant) = (ready.config, ready.token, ready.source, ready.grant);
+    let lease = grant.lease();
     tokio::task::spawn_blocking(move || {
-        // Once: making it can run a credential command, which both clients then share.
+        // Each of these steps can run a credential command, which cannot be stopped once started:
+        // the role is asked before each, and after the last.
+        let still_held = || {
+            if lease.holds() {
+                Ok(())
+            } else {
+                Err(kube::Error::Auth(crate::auth_plugin::not_allowed()))
+            }
+        };
+        still_held()?;
+        // Once: both clients then share it.
         let auth = kube::client::ConfigExt::auth_layer(&config)?.map(std::sync::Arc::new);
-        let read = build_client(&config, token.clone(), auth.as_deref(), Access::ReadOnly)?;
+        let guarded = auth
+            .as_ref()
+            .and_then(|layer| credential::GuardedProvider::guarding(layer, &lease));
+        still_held()?;
+        let read = build_client(
+            &config,
+            token.clone(),
+            auth.as_deref(),
+            guarded.as_ref(),
+            Access::ReadOnly,
+        )?;
+        still_held()?;
         let write = build_client(
             &config,
             token.clone(),
             auth.as_deref(),
+            guarded.as_ref(),
             Access::Unrestricted,
         )?;
+        still_held()?;
         Ok::<_, kube::Error>(GatedConnection {
             clients: ClusterClients {
                 read,
                 writes: WriteAccess::new(write),
             },
-            credential: WriteCredential::new(files, source, token, auth),
+            credential: WriteCredential::with_grant(files, source, token, auth, grant, guarded),
         })
     })
     .await
@@ -470,12 +534,12 @@ pub async fn connect_unrestricted_for_tests(
     kubeconfig: &Kubeconfig,
     context: &str,
 ) -> Result<Client, ClusterError> {
-    let ready = prepare(kubeconfig, context).await?;
+    let ready = prepare(kubeconfig, context, &CredentialAccess::always()).await?;
     let target = ready.target;
     let (config, token) = (ready.config, ready.token);
     tokio::task::spawn_blocking(move || {
         let auth = kube::client::ConfigExt::auth_layer(&config)?;
-        build_client(&config, token, auth.as_ref(), Access::Unrestricted)
+        build_client(&config, token, auth.as_ref(), None, Access::Unrestricted)
     })
     .await
     .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
@@ -488,13 +552,20 @@ struct Prepared {
     token: Option<crate::auth_plugin::RefreshingToken>,
     /// Where the credential comes from, read before an exec plugin is replaced by its output.
     source: CredentialSource,
+    /// Whether that credential may run, for the life of the connection.
+    grant: CredentialGrant,
     /// An exec plugin's certificate and key replaced any the kubeconfig names.
     replaced_certificate: bool,
     target: Target,
 }
 
-/// Reads `context`'s connection settings and runs its exec auth plugin, if any.
-async fn prepare(kubeconfig: &Kubeconfig, context: &str) -> Result<Prepared, ClusterError> {
+/// Reads `context`'s connection settings and runs its exec auth plugin, if any and if `access`
+/// allows it. A credential it does not allow is refused before anything could run it.
+async fn prepare(
+    kubeconfig: &Kubeconfig,
+    context: &str,
+    access: &CredentialAccess,
+) -> Result<Prepared, ClusterError> {
     if !kubeconfig.contexts.iter().any(|c| c.name == context) {
         return Err(ClusterError::UnknownContext(context.to_owned()));
     }
@@ -510,6 +581,12 @@ async fn prepare(kubeconfig: &Kubeconfig, context: &str) -> Result<Prepared, Clu
             message: error_chain(&e),
         })?;
     let target = Target::of(kubeconfig, context);
+    let source = CredentialSource::of(&config.auth_info);
+    let grant = access.grant(source.clone());
+    if !grant.allowed() {
+        let denied = kube::Error::Auth(crate::auth_plugin::not_allowed());
+        return Err(ClusterError::kube(denied).for_target(&target));
+    }
     // kube's builder refuses a proxy (`proxy-url`, or `HTTPS_PROXY` and the like) before it runs
     // an exec plugin: so does this, with kube's own error, so no login opens for nothing. A
     // client it did build would have no read-only rule, so that is refused too.
@@ -522,14 +599,14 @@ async fn prepare(kubeconfig: &Kubeconfig, context: &str) -> Result<Prepared, Clu
             Ok(_) => ClusterError::Kube("connecting through a proxy is not supported".to_owned()),
         });
     }
-    let source = CredentialSource::of(&config.auth_info);
-    let resolved = crate::auth_plugin::resolve(&mut config, context)
+    let resolved = crate::auth_plugin::resolve_with_grant(&mut config, context, &grant)
         .await
         .map_err(|e| ClusterError::kube(kube::Error::Auth(e)).for_target(&target))?;
     Ok(Prepared {
         config,
         token: resolved.token,
         source,
+        grant,
         replaced_certificate: resolved.replaced_certificate,
         target,
     })
@@ -606,8 +683,9 @@ fn http_connector() -> hyper_util::client::legacy::connect::HttpConnector {
 /// tracing spans, and the client's `valid_until` (an exec plugin certificate's expiry, which
 /// kube only records and Flint never reads). A kubeconfig with a proxy goes through kube's own
 /// builder in [`connect`], before any exec plugin runs, which reports that proxies are not
-/// supported, as before. `token` is the refreshing
-/// token of an exec auth plugin ([`crate::auth_plugin::resolve`]), set after kube's auth layer.
+/// supported, as before. `token` is the refreshing token of an exec auth plugin
+/// ([`crate::auth_plugin::resolve_with_grant`]), set after kube's auth layer. `guarded`, if any,
+/// stands in for `auth` on requests, because `auth` could run a command a role may forbid.
 #[expect(
     clippy::disallowed_types,
     reason = "the one place that assembles a client"
@@ -616,6 +694,7 @@ fn build_client(
     config: &kube::Config,
     token: Option<crate::auth_plugin::RefreshingToken>,
     auth: Option<&kube::client::middleware::AuthLayer>,
+    guarded: Option<&credential::GuardedProvider>,
     access: Access,
 ) -> Result<Client, kube::Error> {
     use kube::client::ConfigExt;
@@ -637,7 +716,8 @@ fn build_client(
         .map_err(tower::BoxError::from)
         .service(http);
     let authed = ServiceBuilder::new()
-        .option_layer(auth)
+        .option_layer(guarded.cloned().map(tower::filter::AsyncFilterLayer::new))
+        .option_layer(auth.filter(|_| guarded.is_none()))
         .option_layer(token.map(crate::auth_plugin::TokenLayer::new))
         .service(transport.clone());
     let service = ServiceBuilder::new()
@@ -717,8 +797,19 @@ pub(crate) async fn connect_gated_and_check(
     context: &str,
     timeout: Duration,
 ) -> Result<(GatedConnection, ServerVersion), ClusterError> {
+    let access = CredentialAccess::always();
+    connect_gated_and_check_with_policy(kubeconfig, context, timeout, &access).await
+}
+
+/// As [`connect_gated_and_check`], with `access` deciding whether the credential may run.
+pub(crate) async fn connect_gated_and_check_with_policy(
+    kubeconfig: &Kubeconfig,
+    context: &str,
+    timeout: Duration,
+    access: &CredentialAccess,
+) -> Result<(GatedConnection, ServerVersion), ClusterError> {
     bounded(kubeconfig, context, timeout, async {
-        let connection = connect_gated(kubeconfig, context).await?;
+        let connection = connect_gated_with_policy(kubeconfig, context, access).await?;
         let version = server_version(&connection.clients.read).await?;
         Ok((connection, version))
     })
@@ -854,6 +945,86 @@ fn auth_error_message(err: &kube::client::AuthError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_text_is_tidied_before_it_is_cut() {
+        for pad in 230..=300 {
+            let message = format!(
+                "{} postgres://admin:example-value-123@db.internal:5432/app",
+                "x".repeat(pad)
+            );
+            let shown = ClusterError::Api(message).for_agent();
+            assert!(!shown.contains("exam"), "pad {pad}: {shown}");
+            assert!(
+                shown.chars().count() <= AGENT_CHARS + 1,
+                "pad {pad}: {shown}"
+            );
+            // A marker is whole, or not there at all.
+            if let Some(at) = shown.find("[R") {
+                assert!(shown[at..].contains(']'), "pad {pad}: {shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_marker_across_the_agent_cut_goes_whole() {
+        let marker = "[REDACTED:password]";
+        for inside in 1..marker.len() {
+            let line = format!("{}{marker} rest", "x".repeat(AGENT_CHARS - inside));
+            assert_eq!(
+                agent_line(&line),
+                format!("{}…", "x".repeat(AGENT_CHARS - inside))
+            );
+        }
+        let whole = format!("{}{marker}{}", "x".repeat(10), "y".repeat(AGENT_CHARS));
+        assert!(agent_line(&whole).contains(marker));
+    }
+
+    #[test]
+    fn agent_text_is_one_line_of_a_tidied_block() {
+        let message = "YWJjZGVmZ2hpamtsbW5vcA==\n-----END PRIVATE KEY-----\ndenied";
+        assert_eq!(
+            ClusterError::Kube(message.into()).for_agent(),
+            "[REDACTED:private-key]"
+        );
+    }
+
+    #[test]
+    fn agent_text_hides_credentials_across_the_byte_bound() {
+        let url = "postgres://admin:";
+        let credential = "qéwerty-example-value";
+        for offset in [1, 2, 3, 8, 17] {
+            let pad = AGENT_BYTES - offset - url.len() - "password= ".len();
+            let start = format!("password={} ", "x".repeat(pad));
+            let short = redact::redact_credentials(&start);
+            assert!(short.text.chars().count() + url.len() + offset < AGENT_CHARS);
+            assert_eq!(start.len() + url.len() + offset, AGENT_BYTES);
+            let message = format!("{start}{url}{credential}@db.internal/app");
+            let shown = ClusterError::Api(message).for_agent();
+            assert!(!shown.contains('q'), "offset {offset}: {shown}");
+        }
+    }
+
+    #[test]
+    fn agent_text_limits_work_on_a_malformed_cookie_list() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut body = String::from("Cookie: [");
+            const MARKER: &str = "[REDACTED:";
+            const BODY_BYTES: usize = 1024 * 1024;
+            body.push_str(&MARKER.repeat((BODY_BYTES - body.len()).div_ceil(MARKER.len())));
+            body.truncate(BODY_BYTES);
+            let bounded = ClusterError::Api(body[..AGENT_BYTES].to_owned()).for_agent();
+            let oversized = ClusterError::Api(body).for_agent();
+            tx.send((bounded, oversized)).unwrap();
+        });
+        let (bounded, oversized) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(bounded.chars().count() <= AGENT_CHARS + 1);
+        assert_eq!(
+            oversized,
+            "Error details omitted because the message is too long"
+        );
+    }
 
     // covers UP-04, UP-10
     #[test]
@@ -1078,7 +1249,7 @@ mod tests {
         });
         let config = kube::Config::new(url.parse().unwrap());
         assert!(config.default_retry, "the retry layer is on");
-        let client = build_client(&config, None, None, Access::Unrestricted).unwrap();
+        let client = build_client(&config, None, None, None, Access::Unrestricted).unwrap();
         let request = Request::post("/api/v1/namespaces/demo/pods/web/eviction")
             .body(Body::from(b"{}".to_vec()))
             .unwrap();
@@ -1097,7 +1268,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let config = kube::Config::new(url.parse().unwrap());
-        let client = build_client(&config, None, None, Access::ReadOnly).unwrap();
+        let client = build_client(&config, None, None, None, Access::ReadOnly).unwrap();
         let pod = "/api/v1/namespaces/demo/pods/web";
         for (method, path) in [
             (Method::POST, "/api/v1/namespaces/demo/pods".to_owned()),
