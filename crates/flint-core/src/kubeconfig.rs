@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use kube::config::{Kubeconfig, NamedContext};
 use tokio::sync::{Mutex, OwnedMutexGuard, oneshot};
+use tokio::time::Instant;
 
 use crate::settings::{Settings, expand_tilde};
 
@@ -411,14 +412,12 @@ impl KubeconfigReader {
     pub(crate) async fn read(
         &self,
         paths: &[PathBuf],
-        on_late: impl FnOnce(FileRead) + Send + 'static,
+        on_late: impl FnOnce(FileRead) + Clone + Send + 'static,
     ) -> Option<FileRead> {
         let turn = self.turn(paths).try_lock_owned().ok()?;
-        let answer = self.start(paths, turn, on_late)?;
-        tokio::time::timeout(self.timeout, answer)
-            .await
-            .ok()
-            .and_then(Result::ok)
+        let deadline = Instant::now() + self.timeout;
+        let answer = self.start(paths, turn, on_late.clone())?;
+        answer_by(answer, deadline, on_late).await
     }
 
     /// The files as they are after this call: a read already running is waited out, not used,
@@ -427,16 +426,14 @@ impl KubeconfigReader {
     pub(crate) async fn read_fresh(
         &self,
         paths: &[PathBuf],
-        on_late: impl FnOnce(FileRead) + Send + 'static,
+        on_late: impl FnOnce(FileRead) + Clone + Send + 'static,
     ) -> Option<FileRead> {
-        let read = async {
-            let turn = self.turn(paths).lock_owned().await;
-            self.start(paths, turn, on_late)?.await.ok()
-        };
-        tokio::time::timeout(self.timeout, read)
+        let deadline = Instant::now() + self.timeout;
+        let turn = tokio::time::timeout_at(deadline, self.turn(paths).lock_owned())
             .await
-            .ok()
-            .flatten()
+            .ok()?;
+        let answer = self.start(paths, turn, on_late.clone())?;
+        answer_by(answer, deadline, on_late).await
     }
 
     /// Starts a read on its own thread, which holds `turn` until the files are read.
@@ -462,6 +459,30 @@ impl KubeconfigReader {
             return None;
         }
         Some(answer)
+    }
+}
+
+/// Waits for `answer` until `deadline`. A result that comes after goes to `on_late`.
+async fn answer_by(
+    mut answer: oneshot::Receiver<FileRead>,
+    deadline: Instant,
+    on_late: impl FnOnce(FileRead),
+) -> Option<FileRead> {
+    match tokio::time::timeout_at(deadline, &mut answer).await {
+        Ok(read) => read.ok(),
+        Err(_) => {
+            give_up(&mut answer, on_late);
+            None
+        }
+    }
+}
+
+/// Stops waiting on `answer`. From here the reader's send fails and it runs its own `on_late`;
+/// a result it sent before that is handed to this `on_late`, so exactly one of them runs.
+fn give_up(answer: &mut oneshot::Receiver<FileRead>, on_late: impl FnOnce(FileRead)) {
+    answer.close();
+    if let Ok(read) = answer.try_recv() {
+        on_late(read);
     }
 }
 
@@ -587,6 +608,28 @@ mod tests {
             .expect("the late read reports")
             .unwrap();
         assert_eq!(late_rx.try_recv().ok(), None, "only the one read ran");
+    }
+
+    // covers UP-06: a result sent just as its caller timed out still reaches `on_late`.
+    #[test]
+    fn giving_up_keeps_a_result_already_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "config", &config(&[], &[]));
+        let (reply, mut answer) = oneshot::channel();
+        assert!(reply.send(FileRead::of(&[path], load)).is_ok());
+        let (late, late_rx) = std::sync::mpsc::channel();
+        give_up(&mut answer, move |_| late.send(()).unwrap());
+        assert!(late_rx.try_recv().is_ok(), "handed to on_late");
+    }
+
+    // covers UP-06: after the caller gave up, the reader's send fails, so it runs `on_late`.
+    #[test]
+    fn a_read_ending_after_the_caller_gave_up_gets_its_result_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "config", &config(&[], &[]));
+        let (reply, mut answer) = oneshot::channel();
+        give_up(&mut answer, |_| panic!("nothing was sent"));
+        assert!(reply.send(FileRead::of(&[path], load)).is_err());
     }
 
     // covers UP-06: a file counts as blank when its parse found nothing. One that says it has no

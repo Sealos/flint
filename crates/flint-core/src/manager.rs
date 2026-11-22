@@ -185,6 +185,8 @@ enum Internal {
         cluster: ClusterId,
         pin: ContextPin,
         paths: Vec<PathBuf>,
+        /// Which read it was ([`ClusterManager::read_seq`]).
+        seq: u64,
         read: Option<Box<FileRead>>,
         reply: oneshot::Sender<Result<(), WriteError>>,
     },
@@ -1002,15 +1004,22 @@ impl ClusterManager {
                 cluster,
                 pin,
                 paths,
+                seq,
                 read,
                 reply,
             } => {
-                let stalled = read.is_none() && paths == self.kubeconfig_paths;
+                // A late result already applied leaves nothing to hold for.
+                let timed_out =
+                    read.is_none() && paths == self.kubeconfig_paths && seq > self.applied_read;
                 let (answer, differs) = self.fresh_write_gate(&cluster, &pin, &paths, read);
                 let _ = reply.send(answer);
-                if stalled {
+                let asked = std::mem::take(&mut self.reread);
+                if timed_out && self.reader.busy(&paths) {
+                    // That read's end comes later, and it may be too old to apply.
+                    self.reread = true;
                     self.hold_stalled(paths);
-                } else if differs {
+                } else if timed_out || differs || asked || self.stalled_on.as_ref() == Some(&paths)
+                {
                     self.reload_kubeconfig().await;
                 }
             }
@@ -1420,7 +1429,7 @@ impl ClusterManager {
             return;
         }
         let paths = self.kubeconfig_paths.clone();
-        let (_, on_late) = self.next_read(&paths);
+        let (seq, on_late) = self.next_read(&paths);
         let (reader, internal) = (self.reader.clone(), self.internal_tx.clone());
         tokio::spawn(async move {
             let read = reader.read_fresh(&paths, on_late).await.map(Box::new);
@@ -1428,6 +1437,7 @@ impl ClusterManager {
                 cluster,
                 pin,
                 paths,
+                seq,
                 read,
                 reply,
             });
@@ -1502,6 +1512,7 @@ impl ClusterManager {
     /// gives access checks this right before saving.
     async fn files_still_show(&mut self, id: &str, server: &str) -> bool {
         let paths = self.kubeconfig_paths.clone();
+        let busy = self.reader.busy(&paths);
         let (_, on_late) = self.next_read(&paths);
         match self.reader.read(&paths, on_late).await {
             Some(mut fresh) => {
@@ -1509,6 +1520,7 @@ impl ClusterManager {
                 self.contexts.holds_in(&fresh.loaded, id, server)
             }
             None => {
+                self.reread |= busy;
                 self.hold_stalled(paths);
                 false
             }
@@ -1516,7 +1528,10 @@ impl ClusterManager {
     }
 
     /// Numbers a new read of `paths`, and what to do with its result if it comes in late.
-    fn next_read(&mut self, paths: &[PathBuf]) -> (u64, impl FnOnce(FileRead) + Send + 'static) {
+    fn next_read(
+        &mut self,
+        paths: &[PathBuf],
+    ) -> (u64, impl FnOnce(FileRead) + Clone + Send + 'static) {
         self.read_seq += 1;
         let seq = self.read_seq;
         let internal = self.internal_tx.clone();
@@ -2710,13 +2725,7 @@ mod tests {
 
         let (reader, paths) = (manager.reader.clone(), manager.kubeconfig_paths.clone());
         let in_flight = tokio::spawn(async move { reader.read(&paths, |_| {}).await });
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !dir.path().join("parsed").exists() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the first read parsed the file");
+        until_parsed(dir.path()).await;
 
         std::fs::write(&path, yaml.replace("user: {}", "user: {token: another}")).unwrap();
         let answer = ask_write(&mut manager, &pin);
@@ -2732,6 +2741,152 @@ mod tests {
         let read = next_internal(&mut manager).await;
         manager.handle_internal(read).await;
         assert_eq!(answer.await.unwrap(), Err(WriteError::ConnectionChanged));
+    }
+
+    /// Waits for [`load_then_wait`] to have parsed the files.
+    async fn until_parsed(dir: &Path) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !dir.join("parsed").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the read parsed the file");
+    }
+
+    /// Hands the manager a write check whose read did not finish, and returns its answer.
+    async fn timed_out_write(
+        manager: &mut ClusterManager,
+        pin: &ContextPin,
+        seq: u64,
+    ) -> Result<(), WriteError> {
+        let (reply, answer) = oneshot::channel();
+        let paths = manager.kubeconfig_paths.clone();
+        manager
+            .handle_internal(Internal::WriteRead {
+                cluster: "dev".into(),
+                pin: pin.clone(),
+                paths,
+                seq,
+                read: None,
+                reply,
+            })
+            .await;
+        answer.await.unwrap()
+    }
+
+    // covers UP-06, UP-54: a reload asked for while a write check reads the files runs when that
+    // read ends, though the write is refused, so the change shows and the hold ends.
+    #[tokio::test]
+    async fn a_reload_during_a_write_read_runs_when_the_read_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kubeconfig");
+        let yaml = kubeconfig_with("https://dev");
+        let mut manager = manager_reading(dir.path(), &yaml).await;
+        manager.unlocks.unlock("dev", "https://dev");
+        let pin = manager.contexts.pin_confirmed("dev");
+        let gate = dir.path().join("gate");
+        make_fifo(&gate);
+        manager.reader = KubeconfigReader::new(load_then_wait, Duration::from_secs(5));
+
+        let answer = ask_write(&mut manager, &pin);
+        until_parsed(dir.path()).await;
+        std::fs::write(&path, yaml.replace("user: {}", "user: {token: another}")).unwrap();
+        assert!(!manager.reload_kubeconfig().await, "the files are in use");
+        assert!(manager.held("dev"));
+        drop(std::fs::OpenOptions::new().write(true).open(&gate).unwrap());
+
+        let read = next_internal(&mut manager).await;
+        assert!(matches!(read, Internal::WriteRead { read: Some(_), .. }));
+        manager.handle_internal(read).await;
+        assert_eq!(answer.await.unwrap(), Err(WriteError::KubeconfigUnreadable));
+        assert!(!manager.held("dev"), "the pending reload ran");
+        assert!(
+            !manager.contexts.definition_holds("dev", &pin),
+            "the new content was applied"
+        );
+    }
+
+    // covers UP-06, UP-54: a read whose late result came in before its write check's timeout
+    // does not hold the files again, and that write stays refused.
+    #[tokio::test]
+    async fn a_timeout_after_its_late_result_does_not_hold_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://dev")).await;
+        manager.unlocks.unlock("dev", "https://dev");
+        let pin = manager.contexts.pin_confirmed("dev");
+        let paths = manager.kubeconfig_paths.clone();
+        let read = manager.reader.read(&paths, |_| {}).await.unwrap();
+        let (seq, _) = manager.next_read(&paths);
+        manager.hold_stalled(paths.clone());
+
+        let late = Internal::LateRead {
+            paths,
+            seq,
+            read: Box::new(read),
+        };
+        manager.handle_internal(late).await;
+        assert!(!manager.held("dev"), "the late result applied");
+        assert_eq!(
+            timed_out_write(&mut manager, &pin, seq).await,
+            Err(WriteError::KubeconfigUnreadable)
+        );
+        assert!(
+            !manager.held("dev"),
+            "no stall is left with nothing to end it"
+        );
+    }
+
+    // covers UP-06: a write check that timed out waiting behind a read that has since ended has
+    // no result coming, so the files are read again instead of staying held.
+    #[tokio::test]
+    async fn a_timeout_with_no_read_running_reads_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://dev")).await;
+        manager.unlocks.unlock("dev", "https://dev");
+        let pin = manager.contexts.pin_confirmed("dev");
+        let paths = manager.kubeconfig_paths.clone();
+        let (seq, _) = manager.next_read(&paths);
+
+        assert_eq!(
+            timed_out_write(&mut manager, &pin, seq).await,
+            Err(WriteError::KubeconfigUnreadable)
+        );
+        assert!(!manager.held("dev"));
+    }
+
+    // covers UP-06, UP-54: a write check's stall behind a read whose result is overtaken still
+    // ends when that read does, from a new read of the current content.
+    #[tokio::test]
+    async fn a_stall_behind_an_overtaken_read_ends_with_a_new_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kubeconfig");
+        let yaml = kubeconfig_with("https://dev");
+        let mut manager = manager_reading(dir.path(), &yaml).await;
+        manager.unlocks.unlock("dev", "https://dev");
+        let pin = manager.contexts.pin_confirmed("dev");
+        let gate = dir.path().join("gate");
+        make_fifo(&gate);
+        manager.reader = KubeconfigReader::new(load_then_wait, Duration::from_millis(40));
+        let paths = manager.kubeconfig_paths.clone();
+
+        let (_, on_late) = manager.next_read(&paths);
+        assert!(manager.reader.read(&paths, on_late).await.is_none());
+        let (seq, _) = manager.next_read(&paths);
+        assert_eq!(
+            timed_out_write(&mut manager, &pin, seq).await,
+            Err(WriteError::KubeconfigUnreadable)
+        );
+        assert!(manager.held("dev"), "held while the read runs");
+        manager.applied_read = seq;
+
+        std::fs::write(&path, yaml.replace("user: {}", "user: {token: another}")).unwrap();
+        drop(std::fs::OpenOptions::new().write(true).open(&gate).unwrap());
+        let late = next_internal(&mut manager).await;
+        assert!(matches!(late, Internal::LateRead { .. }));
+        manager.handle_internal(late).await;
+        assert!(!manager.held("dev"), "read again");
+        assert!(!manager.contexts.definition_holds("dev", &pin));
     }
 
     fn make_fifo(path: &Path) {
