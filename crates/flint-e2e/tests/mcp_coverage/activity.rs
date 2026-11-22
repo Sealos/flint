@@ -12,7 +12,7 @@ use crate::support::{EXPOSED, HIDDEN, NAMESPACE, POD, Setup};
 const RETURNED: &str = "placeholder-returned-content";
 
 /// Every file below `dir`, as bytes.
-fn files_below(dir: &Path) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
+pub(crate) fn files_below(dir: &Path) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
