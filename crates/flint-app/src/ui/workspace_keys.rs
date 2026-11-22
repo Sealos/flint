@@ -40,24 +40,26 @@ impl PartialEq for Place {
     }
 }
 
-/// The places shown before on the active cluster, oldest first, at most [`HISTORY`]. It
-/// starts over when another cluster becomes active.
+/// The places shown before on the active cluster, each with the text its list was filtered
+/// by, oldest first, at most [`HISTORY`]. It starts over when another cluster becomes active.
 #[derive(Debug, Default, Clone)]
-pub(in crate::ui) struct History(Vec<Place>);
+pub(in crate::ui) struct History(Vec<(Place, String)>);
 
 impl History {
-    /// Remembers `place`, unless it is the last one remembered.
-    pub fn push(&mut self, place: Place) {
-        if self.0.last() != Some(&place) {
-            self.0.push(place);
+    /// Remembers `place` and its `filter`. The last place remembered again keeps one entry,
+    /// with the newer filter.
+    pub fn push(&mut self, place: Place, filter: String) {
+        match self.0.last_mut() {
+            Some((last, text)) if *last == place => *text = filter,
+            _ => self.0.push((place, filter)),
         }
         if self.0.len() > HISTORY {
             self.0.remove(0);
         }
     }
 
-    /// The place shown last, forgotten.
-    pub fn pop(&mut self) -> Option<Place> {
+    /// The place shown last and its filter, forgotten.
+    pub fn pop(&mut self) -> Option<(Place, String)> {
         self.0.pop()
     }
 
@@ -68,7 +70,7 @@ impl History {
 
     /// The places remembered, latest first.
     pub fn places(&self) -> impl Iterator<Item = &Place> {
-        self.0.iter().rev()
+        self.0.iter().rev().map(|(place, _)| place)
     }
 
     pub fn clear(&mut self) {
@@ -197,7 +199,11 @@ impl Workspace {
     /// Remembers where the main area is before it shows `next`, for Go Back.
     pub(super) fn remember_place(&mut self, next: &Place, cx: &App) {
         if let Some(here) = self.place(cx).filter(|here| here != next) {
-            self.history.push(here);
+            let filter = self
+                .list
+                .as_ref()
+                .map_or_else(String::new, |list| list.read(cx).filter_text().to_owned());
+            self.history.push(here, filter);
         }
     }
 
@@ -234,7 +240,7 @@ impl Workspace {
         // Selecting a row or clearing the selection records nothing, so the last place
         // remembered can be the one shown; a press never goes there.
         let here = self.shown_place(cx);
-        while let Some(place) = self.history.pop() {
+        while let Some((place, filter)) = self.history.pop() {
             if here.as_ref() == Some(&place) {
                 continue;
             }
@@ -245,9 +251,14 @@ impl Workspace {
             self.show_kind(&entry, false, true, window, cx);
             if let Some(list) = &self.list {
                 let focus = list.read(cx).focus_handle().clone();
-                list.update(cx, |list, cx| match place.object {
-                    Some((namespace, name)) => list.select_listed(namespace, name, place.seen, cx),
-                    None => list.clear_selection(cx),
+                list.update(cx, |list, cx| {
+                    list.restore_filter(&filter, window, cx);
+                    match place.object {
+                        Some((namespace, name)) => {
+                            list.select_listed(namespace, name, place.seen, cx)
+                        }
+                        None => list.clear_selection(cx),
+                    }
                 });
                 // Also when the kind was open already.
                 window.focus(&focus, cx);
@@ -500,29 +511,40 @@ mod tests {
     fn history_goes_back_latest_first_without_repeats() {
         let mut history = History::default();
         assert!(history.is_empty());
-        history.push(place("pods", None));
-        history.push(place("pods", Some("web")));
+        history.push(place("pods", None), String::new());
+        history.push(place("pods", Some("web")), String::new());
         assert_eq!(history.places().count(), 2);
-        history.push(place("pods", Some("web")));
-        history.push(place("services", None));
-        assert_eq!(history.pop(), Some(place("services", None)));
-        assert_eq!(history.pop(), Some(place("pods", Some("web"))));
-        assert_eq!(history.pop(), Some(place("pods", None)));
-        assert_eq!(history.pop(), None);
-        history.push(place("pods", None));
+        history.push(place("pods", Some("web")), String::new());
+        history.push(place("services", None), String::new());
+        let mut popped = || history.pop().map(|(place, _)| place);
+        assert_eq!(popped(), Some(place("services", None)));
+        assert_eq!(popped(), Some(place("pods", Some("web"))));
+        assert_eq!(popped(), Some(place("pods", None)));
+        assert_eq!(popped(), None);
+        history.push(place("pods", None), String::new());
         history.clear();
         assert!(history.is_empty());
+    }
+
+    // covers #415: a place remembered twice in a row keeps the filter it was left with last.
+    #[test]
+    fn history_keeps_the_newest_filter_of_a_repeated_place() {
+        let mut history = History::default();
+        history.push(place("pods", None), "web".to_owned());
+        history.push(place("pods", None), "api".to_owned());
+        assert_eq!(history.pop(), Some((place("pods", None), "api".to_owned())));
+        assert_eq!(history.pop(), None);
     }
 
     #[test]
     fn history_keeps_the_latest_places() {
         let mut history = History::default();
         for i in 0..HISTORY + 5 {
-            history.push(place(&format!("kind{i}"), None));
+            history.push(place(&format!("kind{i}"), None), String::new());
         }
         let mut count = 0;
         let mut last = None;
-        while let Some(p) = history.pop() {
+        while let Some((p, _)) = history.pop() {
             count += 1;
             last = Some(p);
         }
