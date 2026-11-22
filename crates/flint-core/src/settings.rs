@@ -89,6 +89,55 @@ impl ClusterPin {
     }
 }
 
+/// A cluster's colour tag (ADR-0014), from a fixed palette the theme gives a colour in light and
+/// dark. Cosmetic: nothing that decides protection, trust, AI exposure or a write reads it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterTag {
+    #[default]
+    Blue,
+    Purple,
+    Teal,
+    Green,
+    Yellow,
+    Red,
+}
+
+impl ClusterTag {
+    /// The palette, in menu order.
+    pub const ALL: [ClusterTag; 6] = [
+        ClusterTag::Blue,
+        ClusterTag::Purple,
+        ClusterTag::Teal,
+        ClusterTag::Green,
+        ClusterTag::Yellow,
+        ClusterTag::Red,
+    ];
+
+    /// Its name on screen and for assistive technology: colour is never the only signal.
+    pub fn label(self) -> &'static str {
+        match self {
+            ClusterTag::Blue => "Blue",
+            ClusterTag::Purple => "Purple",
+            ClusterTag::Teal => "Teal",
+            ClusterTag::Green => "Green",
+            ClusterTag::Yellow => "Yellow",
+            ClusterTag::Red => "Red",
+        }
+    }
+}
+
+/// A colour tag, for a context at one API server, compared as a [`ClusterPin`] is: a context
+/// re-pointed elsewhere does not show it, and shows it again back at this server.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct TaggedCluster {
+    pub context: String,
+    pub server: String,
+    pub tag: ClusterTag,
+}
+
 /// One cluster the user exposed to AI agents (ADR-0009), pinned to its server like a
 /// [`ClusterPin`], and what agents may read of it (ADR-0013). An entry written before scopes
 /// existed has neither list, and exposes the whole cluster as it did.
@@ -293,6 +342,13 @@ pub struct Settings {
     /// written, and MCP, `FLINT_CLUSTER`, exposure and trust keep the context name. Read them
     /// through [`crate::display::ClusterNames`].
     pub cluster_names: BTreeMap<String, String>,
+    /// Colour tags, per context and server. Read them through [`Settings::cluster_tag`]. An entry
+    /// this version cannot read counts as no tag, and stays in the file.
+    #[serde(
+        deserialize_with = "readable_cluster_tags",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub cluster_tags: Vec<TaggedCluster>,
     /// Lines each log session keeps; older lines are dropped. Applies to sessions opened after
     /// a change. Read it through [`Settings::log_buffer_limit`].
     pub log_buffer_lines: u32,
@@ -319,6 +375,7 @@ impl Default for Settings {
             watch_mode: WatchMode::default(),
             cluster_watch_mode: BTreeMap::new(),
             cluster_names: BTreeMap::new(),
+            cluster_tags: Vec::new(),
             log_buffer_lines: DEFAULT_LOG_BUFFER_LINES,
             log_buffer_mib: DEFAULT_LOG_BUFFER_MIB,
             log_total_mib: DEFAULT_LOG_TOTAL_MIB,
@@ -405,6 +462,15 @@ impl Settings {
         }
     }
 
+    /// The colour tag of `context` at `server`. A context with no server has none.
+    pub fn cluster_tag(&self, context: &str, server: Option<&str>) -> Option<ClusterTag> {
+        let server = server?;
+        self.cluster_tags
+            .iter()
+            .find(|e| e.context == context && same_server(&e.server, server))
+            .map(|e| e.tag)
+    }
+
     /// What applies while `settings.toml` cannot be read, keeping the harmless parts of `self`
     /// (the settings in force before, or the defaults): nothing is exposed to AI agents or
     /// trusted, and known local clusters are protected too, since the file may have said
@@ -426,6 +492,20 @@ impl Settings {
             .map(|p| expand_tilde(p, home))
             .collect()
     }
+}
+
+/// The entries of `cluster_tags` this version can read. A tag is cosmetic, so an unknown colour
+/// or a malformed entry is no tag, and never makes the settings file unreadable.
+fn readable_cluster_tags<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<TaggedCluster>, D::Error> {
+    let toml::Value::Array(entries) = toml::Value::deserialize(deserializer)? else {
+        return Ok(Vec::new());
+    };
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| entry.try_into().ok())
+        .collect())
 }
 
 /// UI state from `state.toml`: what the window looked like, so the next start looks the same.
@@ -598,6 +678,7 @@ const SETTINGS_KEYS: &[&str] = &[
     "watch_mode",
     "cluster_watch_mode",
     "cluster_names",
+    "cluster_tags",
     "log_buffer_lines",
     "log_buffer_mib",
     "log_total_mib",
@@ -945,6 +1026,50 @@ pub fn set_cluster_name(
     })
 }
 
+/// Sets the colour tag of `context` at `server` (`None` removes it), and writes `settings.toml`.
+/// Its tags at other servers stay, for when the context points back, and so do entries this
+/// version cannot read. Removing a tag that has no entry writes nothing, so the file keeps its
+/// comments (or stays absent). Returns the settings as written.
+pub fn set_cluster_tag(
+    dir: &Path,
+    context: &str,
+    server: &str,
+    tag: Option<ClusterTag>,
+) -> Result<Settings, SettingsError> {
+    let is_this = |entry: &toml::Value| {
+        let field = |key| entry.get(key).and_then(toml::Value::as_str);
+        field("context") == Some(context) && field("server").is_some_and(|s| same_server(s, server))
+    };
+    if tag.is_none() {
+        let table: toml::Table = load_toml(&dir.join(SETTINGS_FILE))?;
+        let tagged = table
+            .get("cluster_tags")
+            .and_then(toml::Value::as_array)
+            .is_some_and(|entries| entries.iter().any(is_this));
+        if !tagged {
+            return load_settings(dir);
+        }
+    }
+    edit_settings(dir, |table, _| {
+        let mut entries = match table.remove("cluster_tags") {
+            Some(toml::Value::Array(entries)) => entries,
+            _ => Vec::new(),
+        };
+        entries.retain(|entry| !is_this(entry));
+        if let Some(tag) = tag {
+            entries.push(toml::Value::try_from(TaggedCluster {
+                context: context.to_owned(),
+                server: server.to_owned(),
+                tag,
+            })?);
+        }
+        if !entries.is_empty() {
+            table.insert("cluster_tags".into(), toml::Value::Array(entries));
+        }
+        Ok(())
+    })
+}
+
 /// Sets the appearance and writes `settings.toml`. Returns the settings as written.
 pub fn set_appearance(dir: &Path, appearance: Appearance) -> Result<Settings, SettingsError> {
     edit_settings(dir, |table, _| {
@@ -1041,6 +1166,149 @@ pub(crate) fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
     match (path.strip_prefix("~"), home) {
         (Ok(rest), Some(home)) => home.join(rest),
         _ => path.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod cluster_tag_tests {
+    use super::*;
+
+    const A: &str = "https://a.example:6443";
+    const B: &str = "https://b.example:6443";
+
+    fn load(dir: &Path, text: &str) -> Settings {
+        std::fs::write(dir.join(SETTINGS_FILE), text).unwrap();
+        load_settings(dir).unwrap()
+    }
+
+    // covers UP-83: an unknown colour or a malformed entry is no tag; its neighbours and every
+    // other setting still load.
+    #[test]
+    fn an_unreadable_tag_is_no_tag_and_other_settings_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = load(
+            dir.path(),
+            r#"
+            protect_local_clusters = true
+            cluster_tags = [
+                { context = "new", server = "https://a.example:6443", tag = "ultraviolet" },
+                { context = "no-server", tag = "red" },
+                "not a table",
+                { context = "good", server = "https://a.example:6443", tag = "teal" },
+            ]
+            [[trusted_clusters]]
+            context = "good"
+            server = "https://a.example:6443"
+            "#,
+        );
+        assert!(settings.protect_local_clusters);
+        assert!(settings.trust("good", Some(A)).is_trusted());
+        assert_eq!(settings.cluster_tag("new", Some(A)), None);
+        assert_eq!(settings.cluster_tag("no-server", Some(A)), None);
+        assert_eq!(
+            settings.cluster_tag("good", Some(A)),
+            Some(ClusterTag::Teal)
+        );
+    }
+
+    // covers UP-83
+    #[test]
+    fn cluster_tags_of_the_wrong_type_load_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = load(dir.path(), "cluster_tags = 3\nappearance = \"dark\"\n");
+        assert!(settings.cluster_tags.is_empty());
+        assert_eq!(settings.appearance, Appearance::Dark);
+        let written = set_cluster_tag(dir.path(), "a", A, Some(ClusterTag::Red)).unwrap();
+        assert_eq!(written.cluster_tag("a", Some(A)), Some(ClusterTag::Red));
+        assert_eq!(written.appearance, Appearance::Dark);
+    }
+
+    // covers UP-83: a colour chosen for one server never shows on another, and shows again when
+    // the context points back.
+    #[test]
+    fn a_tag_follows_the_server_not_the_context_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let tagged = set_cluster_tag(dir.path(), "ctx", A, Some(ClusterTag::Red)).unwrap();
+        assert_eq!(tagged.cluster_tag("ctx", Some(A)), Some(ClusterTag::Red));
+        assert_eq!(
+            tagged.cluster_tag("ctx", Some("https://a.example:6443/")),
+            Some(ClusterTag::Red),
+            "a trailing slash is the same server"
+        );
+        assert_eq!(tagged.cluster_tag("ctx", Some(B)), None, "re-pointed");
+        assert_eq!(tagged.cluster_tag("ctx", None), None, "no server");
+        assert_eq!(tagged.cluster_tag("other", Some(A)), None);
+
+        // A colour for the new server leaves the old one's for the way back.
+        let both = set_cluster_tag(dir.path(), "ctx", B, Some(ClusterTag::Blue)).unwrap();
+        assert_eq!(both.cluster_tag("ctx", Some(B)), Some(ClusterTag::Blue));
+        assert_eq!(both.cluster_tag("ctx", Some(A)), Some(ClusterTag::Red));
+
+        let cleared = set_cluster_tag(dir.path(), "ctx", B, None).unwrap();
+        assert_eq!(cleared.cluster_tag("ctx", Some(B)), None);
+        assert_eq!(cleared.cluster_tag("ctx", Some(A)), Some(ClusterTag::Red));
+    }
+
+    // covers UP-83: changing one tag keeps an entry from a newer version, and the rest of the file.
+    #[test]
+    fn writing_a_tag_keeps_what_it_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        load(
+            dir.path(),
+            r#"
+            future_key = 1
+            cluster_tags = [
+                { context = "new", server = "https://a.example:6443", tag = "ultraviolet" },
+            ]
+            "#,
+        );
+        set_cluster_tag(dir.path(), "ctx", A, Some(ClusterTag::Green)).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
+        assert!(text.contains("ultraviolet"), "{text}");
+        assert!(text.contains("future_key"), "{text}");
+        let settings = load_settings(dir.path()).unwrap();
+        assert_eq!(
+            settings.cluster_tag("ctx", Some(A)),
+            Some(ClusterTag::Green)
+        );
+
+        set_cluster_tag(dir.path(), "new", A, Some(ClusterTag::Blue)).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
+        assert!(
+            !text.contains("ultraviolet"),
+            "replaced by the choice: {text}"
+        );
+    }
+
+    // covers UP-83: the last tag removed leaves no empty key behind.
+    #[test]
+    fn clearing_the_last_tag_removes_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        set_cluster_tag(dir.path(), "ctx", A, Some(ClusterTag::Green)).unwrap();
+        set_cluster_tag(dir.path(), "ctx", A, None).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
+        assert!(!text.contains("cluster_tags"), "{text}");
+    }
+
+    // covers UP-83: clearing a tag that is not there leaves the file as it is, or absent.
+    #[test]
+    fn clearing_no_tag_does_not_touch_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE);
+        set_cluster_tag(dir.path(), "ctx", A, None).unwrap();
+        assert!(!path.exists(), "no file is created");
+
+        let text = "# kept by hand\nappearance = \"dark\"\n";
+        std::fs::write(&path, text).unwrap();
+        let settings = set_cluster_tag(dir.path(), "ctx", A, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(settings.appearance, Appearance::Dark);
+    }
+
+    #[test]
+    fn cluster_tags_is_a_known_key() {
+        let table: toml::Table = toml::from_str("cluster_tags = []").unwrap();
+        assert!(misspelled_keys(&table).is_empty());
     }
 }
 

@@ -8,6 +8,7 @@
 use std::rc::Rc;
 
 use flint_core::Appearance;
+use flint_core::settings::ClusterTag;
 use gpui_kit::component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode, ThemeSet};
 use gpui_kit::{App, Div, Hsla, Pixels, SharedString, Styled as _, WindowAppearance, div, px};
 
@@ -156,6 +157,18 @@ pub fn log_source_colors(theme: &Theme) -> [Hsla; 4] {
         }
     };
     [theme.blue, theme.magenta, theme.cyan, theme.green].map(shade)
+}
+
+/// The colour of a cluster's tag, from the theme's base palette.
+pub fn cluster_tag_color(tag: ClusterTag, theme: &Theme) -> Hsla {
+    match tag {
+        ClusterTag::Blue => theme.blue,
+        ClusterTag::Purple => theme.magenta,
+        ClusterTag::Teal => theme.cyan,
+        ClusterTag::Green => theme.green,
+        ClusterTag::Yellow => theme.yellow,
+        ClusterTag::Red => theme.red,
+    }
 }
 
 /// Installs Flint Light and Flint Dark in place of gpui-component's defaults, showing `mode`.
@@ -910,6 +923,39 @@ pub(super) mod tests {
                     if difference < APART {
                         failures.push(format!(
                             "{}: prefix colours {i} and {j} differ by {difference:.1}, need {APART}",
+                            t.theme_name()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A tag's dot and strip are graphics, so they need 3:1 on the sidebar and the detail pane,
+    /// and the palette's colours must differ from each other, in both themes.
+    // covers UP-83
+    #[test]
+    fn cluster_tag_colors_are_visible_and_distinct_in_both_themes() {
+        use flint_core::settings::ClusterTag;
+
+        const APART: f32 = 15.;
+        let (light, dark) = themes(&ACCENT);
+        let mut failures = Vec::new();
+        for t in [resolved(light), resolved(dark)] {
+            let colors = ClusterTag::ALL.map(|tag| (tag, super::cluster_tag_color(tag, &t)));
+            for (i, (tag, color)) in colors.iter().enumerate() {
+                for surface in [t.sidebar, t.background] {
+                    let ratio = contrast(*color, surface, surface);
+                    if ratio < 3. {
+                        failures.push(format!("{}: {tag:?} at {ratio:.2}:1", t.theme_name()));
+                    }
+                }
+                for (other, second) in &colors[i + 1..] {
+                    let difference = delta_e(*color, *second);
+                    if difference < APART {
+                        failures.push(format!(
+                            "{}: {tag:?} and {other:?} differ by {difference:.1}",
                             t.theme_name()
                         ));
                     }

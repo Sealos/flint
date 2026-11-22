@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use flint_core::activity::ActivityRecord;
-use flint_core::settings::{AiExposureState, AiScope, TrustState};
+use flint_core::settings::{AiExposureState, AiScope, ClusterTag, TrustState};
 use flint_core::{
     Appearance, ClusterDiscovery, ClusterId, ClusterSummary, Command, ConnectionState, CoreHandle,
     Event, KindId, Protection, Settings, SyncState, WatchMode,
@@ -16,6 +16,7 @@ use gpui_kit::component::Theme;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
+use super::cluster_tag;
 use super::nav::NavPanel;
 use super::scope_picker;
 use super::workspace::{protection_text, server_text};
@@ -254,6 +255,22 @@ impl ClustersModel {
     /// change comes back as a settings event.
     pub fn set_cluster_name(&mut self, cluster: ClusterId, name: Option<String>) {
         self.send(Command::SetClusterName { cluster, name });
+    }
+
+    /// The colour tag of `cluster`, at the server it points at now.
+    pub fn cluster_tag(&self, cluster: &ClusterSummary) -> Option<ClusterTag> {
+        self.settings
+            .cluster_tag(&cluster.info.name, cluster.info.server.as_deref())
+    }
+
+    /// Sets the colour tag of `cluster` at `server` (`None` removes it). The core writes
+    /// `settings.toml`; the change comes back as a settings event.
+    pub fn set_cluster_tag(&mut self, cluster: ClusterId, server: String, tag: Option<ClusterTag>) {
+        self.send(Command::SetClusterTag {
+            cluster,
+            server,
+            tag,
+        });
     }
 
     /// Sets the appearance. Written to `settings.toml`; the change comes back as a settings
@@ -560,8 +577,11 @@ pub fn cluster_details(
             flint_core::redact::server_url(&exposed_server)
         ),
     };
+    let tag_line = model
+        .cluster_tag(cluster)
+        .map_or_else(String::new, |t| format!("{}\n", cluster_tag::tag_text(t)));
     format!(
-        "{name}\n{}\n{state}\n{}\n{exposure}\nfrom {}",
+        "{name}\n{}\n{state}\n{}\n{exposure}\n{tag_line}from {}",
         server_text(cluster.info.server.as_deref()),
         protection_text(model.protection(cluster), &model.trust(cluster)),
         cluster.info.source.display()

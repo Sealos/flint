@@ -576,6 +576,16 @@ impl ClusterManager {
                 })
                 .await
             }
+            Command::SetClusterTag {
+                cluster,
+                server,
+                tag,
+            } => {
+                self.write_settings("the cluster tag", move |dir| {
+                    settings::set_cluster_tag(dir, &cluster, &server, tag)
+                })
+                .await
+            }
             Command::SetAppearance(appearance) => {
                 self.write_settings("the appearance", move |dir| {
                     settings::set_appearance(dir, appearance)

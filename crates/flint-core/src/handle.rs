@@ -128,6 +128,13 @@ pub enum Command {
         cluster: ClusterId,
         name: Option<String>,
     },
+    /// Set the colour tag of `cluster` at `server` (`None` removes it) and write it to
+    /// `settings.toml`. Cosmetic. The change arrives back as `Event::SettingsChanged`.
+    SetClusterTag {
+        cluster: ClusterId,
+        server: String,
+        tag: Option<crate::settings::ClusterTag>,
+    },
     /// Set the appearance (light, dark, or following macOS) and write it to `settings.toml`. The
     /// change arrives back as `Event::SettingsChanged`.
     SetAppearance(Appearance),

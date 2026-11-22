@@ -28,6 +28,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::closing;
+use super::cluster_tag;
 use super::clusters::{ClustersModel, Presence, cluster_details, cluster_tooltip};
 use super::confirm::{self, DialogText};
 use super::detail::{
@@ -58,6 +59,7 @@ use super::theme;
 use super::ui_state::{self, UiState};
 use super::write_confirm;
 use flint_core::display::{self, ClusterNames};
+use flint_core::settings::ClusterTag;
 
 /// The height of the main area's header and the list's toolbar.
 pub const HEADER_HEIGHT: f32 = 32.;
@@ -1327,7 +1329,7 @@ impl Workspace {
                 ),
                 exposure,
                 protection,
-                (settings_ok, &names),
+                (settings_ok, &names, model.cluster_tag(cluster)),
                 theme,
             ));
         }
@@ -1402,7 +1404,7 @@ impl Workspace {
         (is_active, ring, presence, tooltip): (bool, bool, Presence<'_>, String),
         (exposure, ai_scope): (AiExposureState, Option<AiScope>),
         (protection, trust): (Protection, TrustState),
-        (settings_ok, names): (bool, &ClusterNames),
+        (settings_ok, names, tag): (bool, &ClusterNames, Option<ClusterTag>),
         theme: &Theme,
     ) -> AnyElement {
         let name = cluster.info.name.clone();
@@ -1454,7 +1456,22 @@ impl Workspace {
                 v_flex()
                     .flex_1()
                     .min_w_0()
-                    .child(div().text_sm().line_height(px(18.)).truncate().child(title))
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .line_height(px(18.))
+                                    .truncate()
+                                    .child(title),
+                            )
+                            .when_some(tag, |line, tag| {
+                                line.child(cluster_tag::tag_dot(&name, tag, theme))
+                            }),
+                    )
                     .child(
                         div()
                             .id(SharedString::from(format!("cluster-server-{name}")))
@@ -1532,14 +1549,27 @@ impl Workspace {
         if !settings_ok {
             return row.into_any_element();
         }
-        row.context_menu(move |menu, _, _| {
-            menu.item(
-                PopupMenuItem::new("Rename…").on_click(registry::on_click(RenameCluster {
+        let (has_server, endpoint) = (cluster.info.server.is_some(), cluster.endpoint);
+        row.context_menu(move |menu, window, cx| {
+            let menu = menu.item(PopupMenuItem::new("Rename…").on_click(registry::on_click(
+                RenameCluster {
                     cluster: rename.clone(),
-                })),
-            )
+                },
+            )));
+            if !has_server {
+                return menu;
+            }
+            cluster_tag::tag_submenu(menu, rename.clone(), endpoint, tag, window, cx)
         })
         .into_any_element()
+    }
+
+    /// The colour strip over the detail pane, from the tag of the cluster its object is in.
+    fn detail_tag_strip(&self, theme: &Theme, cx: &App) -> Option<impl IntoElement> {
+        let detail = self.detail.as_ref()?.read(cx);
+        let summary = self.cluster_summary(&detail.object().cluster, cx)?;
+        let tag = self.model.read(cx).cluster_tag(summary)?;
+        Some(cluster_tag::tag_strip(tag, theme))
     }
 
     /// The Expose to AI button. Exposing asks for confirmation naming the context and server;
@@ -2195,11 +2225,15 @@ impl Workspace {
                     .id("detail-alone-pane")
                     .flex_1()
                     .min_h_0()
-                    .children(
-                        self.detail
-                            .clone()
-                            .map(|detail| div().flex_1().min_w_0().h_full().child(detail)),
-                    )
+                    .children(self.detail.clone().map(|detail| {
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .relative()
+                            .child(detail)
+                            .children(self.detail_tag_strip(theme, cx))
+                    }))
                     .test_support()
                     .into_any_element()
             }
@@ -2221,6 +2255,7 @@ impl Workspace {
                                 .border_l_1()
                                 .border_color(theme.border)
                                 .child(detail)
+                                .children(self.detail_tag_strip(theme, cx))
                                 .child(pane_handle(
                                     "detail-edge",
                                     Pane::Detail,
