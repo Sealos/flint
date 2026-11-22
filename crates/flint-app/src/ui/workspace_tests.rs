@@ -1027,8 +1027,15 @@ async fn dismissing_the_tab_list_gives_focus_back(cx: &mut TestAppContext) {
             press(cx, &t, "escape");
         } else {
             cx.update_window(t.window, |_, window, cx| {
-                // Plain text in the log tab's toolbar: a click there takes no focus itself.
-                window.click("log-count", cx)
+                // Plain text in the log tab's toolbar: a click there takes no focus itself. The
+                // list covers the toolbar's right end, by a width that follows the tab's status
+                // when it opened, so only the start of the status is always clear of it.
+                window.render_frame(cx);
+                let list = window.find("popup-menu").bounds();
+                let offset = gpui_kit::point(gpui_kit::px(1.), gpui_kit::px(1.));
+                let target = window.find("log-state-text").bounds().origin + offset;
+                assert!(!list.contains(&target), "the click lands outside the list");
+                window.click_at("log-state-text", offset, cx)
             })
             .unwrap();
             cx.run_until_parked();

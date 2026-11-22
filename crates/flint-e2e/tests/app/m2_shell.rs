@@ -50,18 +50,39 @@ const MULTI: &str = "multi-1";
 /// The fake API context's name as a dock chip shows it, shortened in the middle.
 const FAKE_CHIP: &str = "kind-fl…e2e-fake";
 
-/// A window with room for every dock height these tests set: the tallest is 460 points, and the
-/// dock leaves the main area 280. The launch size can be smaller, as it is clamped to the display.
+/// The window size the tests ask for. The display can clamp the height, so they use the size the
+/// window receives.
 const WINDOW: (f64, f64) = (1280.0, 800.0);
+/// What the dock leaves the main area.
+const MIN_MAIN_HEIGHT: f64 = 280.0;
+/// The dock's default height.
+const DEFAULT_DOCK_HEIGHT: f64 = 280.0;
+/// The room above the default height the tests need: two steps of at least two terminal rows.
+const MIN_DOCK_ROOM: f64 = 64.0;
 
-/// Gives the window the size [`WINDOW`], so the tests do not depend on the display's size.
-fn set_window_size(app: &App) -> Result<()> {
+/// Asks for [`WINDOW`] and returns the tallest dock the window it receives allows. The width must
+/// apply, as the column checks depend on it, and the height must leave the dock room to grow.
+fn set_window_size(app: &App) -> Result<f64> {
     let (width, height) = WINDOW;
     let applied = app.request("resize_window", json!({"width": width, "height": height}))?;
-    if applied["width"].as_f64() != Some(width) || applied["height"].as_f64() != Some(height) {
-        bail!("the window did not become {width}x{height}: {applied}");
+    if applied["width"].as_f64() != Some(width) {
+        bail!("the window did not become {width} wide: {applied}");
     }
-    Ok(())
+    let received = applied["height"].as_f64().context("the window's height")?;
+    let tallest = (received - MIN_MAIN_HEIGHT).floor();
+    if tallest < DEFAULT_DOCK_HEIGHT + MIN_DOCK_ROOM {
+        bail!("the window leaves the dock no room to grow: {applied}");
+    }
+    Ok(tallest)
+}
+
+/// Two growing dock heights above `height`, both within `tallest`.
+fn taller_dock_heights(height: f64, tallest: f64) -> (f64, f64) {
+    let room = tallest - height;
+    (
+        height + (room / 2.0).floor().min(120.0),
+        height + room.min(180.0),
+    )
 }
 
 /// The index of tab `id` in the state's dock.
@@ -286,7 +307,7 @@ fn up_41_shell_into_a_container() -> Result<()> {
     let cluster = TestCluster::fake(Options::default())?;
     let fake = cluster.fake_server().expect("a fake server");
     let app = App::launch(AppOptions::new(&cluster.kubeconfig))?;
-    set_window_size(&app)?;
+    let tallest_dock = set_window_size(&app)?;
     connect(&app, &cluster.context)?;
     let state = open_live(&app, "pods", 17)?;
     let row = row_id(&state, WEB)?;
@@ -346,10 +367,8 @@ fn up_41_shell_into_a_container() -> Result<()> {
     let height = state["dock"]["height"]
         .as_f64()
         .context("the dock's height")?;
-    app.dispatch(
-        "workspace::SetDockHeight",
-        json!({"height": height + 120.0}),
-    )?;
+    let (taller_dock, tallest_step) = taller_dock_heights(height, tallest_dock);
+    app.dispatch("workspace::SetDockHeight", json!({"height": taller_dock}))?;
     let state = app.wait_for(&at(i, "shell/rows"), Test::at_least(first.height + 1))?;
     let taller = size(&state, i);
     assert_eq!(taller.width, first.width, "only the rows change");
@@ -374,10 +393,7 @@ fn up_41_shell_into_a_container() -> Result<()> {
     // Then a taller dock, last: the grid it lays out has the new columns too, so once the
     // state shows the new rows it shows the final columns (the tab tells the pod a size once
     // it holds still, so the two widths may or may not reach it as separate resizes).
-    app.dispatch(
-        "workspace::SetDockHeight",
-        json!({"height": height + 180.0}),
-    )?;
+    app.dispatch("workspace::SetDockHeight", json!({"height": tallest_step}))?;
     let state = app.wait_for(&at(i, "shell/rows"), Test::at_least(taller.height + 1))?;
     let resized = size(&state, i);
     if resized.width <= taller.width {
@@ -803,7 +819,7 @@ fn up_42_sessions_outlive_navigation() -> Result<()> {
     let (a, b) = (&two.a, &two.b);
     let web = ContainerLog::new("demo", WEB);
     let mut app = App::launch(AppOptions::new(two.kubeconfig()))?;
-    set_window_size(&app)?;
+    let tallest_dock = set_window_size(&app)?;
     connect(&app, TwoClusters::A)?;
     open_live(&app, "pods", 17)?;
     app.select_row(Some("demo"), WEB)?;
@@ -880,8 +896,9 @@ fn up_42_sessions_outlive_navigation() -> Result<()> {
     app.screenshot_themes("up42-sessions-across-clusters")?;
 
     // The dock's height is kept.
-    app.dispatch("workspace::SetDockHeight", json!({"height": 333.0}))?;
-    app.wait_for("/dock/height", Equals(333.into()))?;
+    let kept = 333.0_f64.min(tallest_dock);
+    app.dispatch("workspace::SetDockHeight", json!({"height": kept}))?;
+    app.wait_for("/dock/height", Equals((kept as u64).into()))?;
 
     // Closing the tabs ends their sessions: Cmd-W with the dock focused, Cmd-W with focus in the
     // list (it closes the active tab there too, not the window: #177), and Close Dock Tab.
@@ -928,7 +945,7 @@ fn up_42_sessions_outlive_navigation() -> Result<()> {
     let scratch = app.quit()?;
     app = App::launch(AppOptions::new(two.kubeconfig()).reuse(scratch))?;
     set_window_size(&app)?;
-    let state = app.wait_for("/dock/height", Equals(333.into()))?;
+    let state = app.wait_for("/dock/height", Equals((kept as u64).into()))?;
     assert_eq!(state["dock"]["tabs"], json!([]));
     assert_eq!(state["dock"]["visible"], false);
 

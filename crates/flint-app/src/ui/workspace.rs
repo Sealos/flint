@@ -28,7 +28,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::closing;
-use super::clusters::{ClustersModel, Presence, reconnecting_text, state_label};
+use super::clusters::{ClustersModel, Presence, cluster_details, cluster_tooltip};
 use super::confirm::{self, DialogText};
 use super::detail::{
     DetailEvent, DetailTab, DetailView, ObjectRef, Opening, TakeFocus, protected_reason, refused,
@@ -61,6 +61,11 @@ use flint_core::display::{self, ClusterNames};
 
 /// The height of the main area's header and the list's toolbar.
 pub const HEADER_HEIGHT: f32 = 32.;
+
+/// Below this main area width the detail-alone header puts its namespace and watch controls on a
+/// second row. Fixed, so the layout does not change with label lengths while resizing: it holds
+/// the padding, Back, the longest labels of both controls, and a shortened context name.
+const HEADER_ONE_ROW_MIN_WIDTH: f32 = 590.;
 
 /// The panes the user can resize by dragging their edge, with default and limit widths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +249,8 @@ pub struct Workspace {
     detail: Option<Entity<DetailView>>,
     /// The window is too narrow for the list and the detail side by side, as of the last draw.
     narrow: bool,
+    /// The main header shows two rows, as of the last draw: the dock leaves it more room.
+    two_row_header: bool,
     /// In a narrow window, the list is in front of the open detail.
     list_in_front: bool,
     /// A right button went down since the last draw: the row it selects stays on show, as it
@@ -423,6 +430,7 @@ impl Workspace {
             list: None,
             detail: None,
             narrow: false,
+            two_row_header: false,
             list_in_front: false,
             right_press: false,
             menu_row_pending: false,
@@ -566,14 +574,18 @@ impl Workspace {
 
     /// The dock's height as shown in a window `window_height` tall.
     pub(in crate::ui) fn dock_height(&self, window_height: f32) -> f32 {
-        dock::dock_height(self.panes.dock, window_height)
+        dock::dock_height(self.panes.dock, window_height, self.two_row_header)
     }
 
     /// Sets the dock's height within its limits and saves it once changes pause. Dragging its
     /// edge and `SetDockHeight` both end here.
     fn resize_dock(&mut self, height: f32, window_height: f32, cx: &mut Context<Self>) {
         let shown = self.dock_height(window_height);
-        let height = dock::dock_height(Some(height.max(0.).round() as u32), window_height);
+        let height = dock::dock_height(
+            Some(height.max(0.).round() as u32),
+            window_height,
+            self.two_row_header,
+        );
         if height == shown {
             return;
         }
@@ -1307,7 +1319,12 @@ impl Workspace {
             let ring = cursor.as_deref() == Some(cluster.info.name.as_str());
             list = list.child(self.render_cluster_row(
                 cluster,
-                (is_active, ring, presence),
+                (
+                    is_active,
+                    ring,
+                    presence,
+                    cluster_details(model, cluster, states),
+                ),
                 exposure,
                 protection,
                 (settings_ok, &names),
@@ -1380,8 +1397,9 @@ impl Workspace {
     fn render_cluster_row(
         &self,
         cluster: &ClusterSummary,
-        // Whether it is the active cluster, and whether the sidebar's cursor is on it.
-        (is_active, ring, presence): (bool, bool, Presence<'_>),
+        // Whether it is the active cluster, whether the sidebar's cursor is on it, its presence
+        // and its full description.
+        (is_active, ring, presence, tooltip): (bool, bool, Presence<'_>, String),
         (exposure, ai_scope): (AiExposureState, Option<AiScope>),
         (protection, trust): (Protection, TrustState),
         (settings_ok, names): (bool, &ClusterNames),
@@ -1393,39 +1411,6 @@ impl Workspace {
         // With a custom name, it starts with the real one: the row always says which cluster.
         let host = cluster.info.server.as_deref().map(shown_host);
         let subtitle = names.subtitle(&name, host.as_deref());
-        let state_text = match (presence, &cluster.state) {
-            (Presence::Reconnecting { error }, _) => reconnecting_text(error),
-            (Presence::Idle, ConnectionState::Connected(v)) => format!(
-                "Connected, Kubernetes {}. Idle: not watched while another cluster is active",
-                v.git_version
-            ),
-            (_, ConnectionState::Connected(v)) => {
-                format!("Connected, Kubernetes {}", v.git_version)
-            }
-            (_, ConnectionState::Failed(message)) => format!("Connection failed: {message}"),
-            (_, other) => state_label(other).to_owned(),
-        };
-        let exposure_text = match &exposure {
-            AiExposureState::Hidden => "Hidden from AI agents".to_owned(),
-            AiExposureState::Exposed => format!(
-                "Exposed to AI agents (flint mcp, read-only): {}",
-                scope_picker::summary(&ai_scope.clone().unwrap_or_default())
-            ),
-            AiExposureState::ServerChanged { exposed_server } => format!(
-                "Cluster changed: exposed at {}, now points elsewhere. Hidden from AI agents \
-                 until you expose it again.",
-                flint_core::redact::server_url(exposed_server)
-            ),
-        };
-        let hover_text = format!(
-            "{}\n{}\n{}\n{}\n{}\nfrom {}",
-            name,
-            server_text(server.as_deref()),
-            state_text,
-            protection_text(protection, &trust),
-            exposure_text,
-            cluster.info.source.display()
-        );
         let changed = matches!(exposure, AiExposureState::ServerChanged { .. });
         let dot = presence
             .marker(theme)
@@ -1433,7 +1418,7 @@ impl Workspace {
             .flex_none()
             .test_support();
 
-        let tooltip = hover_text.clone();
+        let tip = (name.clone(), self.model.clone(), self.nav.clone());
         let rename = name.clone();
         let control_title = control_name(&title, &name);
         let row = h_flex()
@@ -1460,7 +1445,7 @@ impl Workspace {
             // Every row has the border, so the ring moving shifts nothing.
             .border_1()
             .border_color(super::theme::cursor_ring(theme, ring))
-            .tooltip(move |window, cx| Tooltip::new(hover_text.clone()).build(window, cx))
+            .tooltip(move |_, cx| cluster_tooltip(tip.0.clone(), &tip.1, &tip.2, cx))
             .on_click(registry::on_click(SelectCluster {
                 cluster: name.clone(),
             }))
@@ -1674,6 +1659,7 @@ impl Workspace {
     fn render_header(
         &self,
         cluster: &ClusterSummary,
+        window_width: f32,
         theme: &Theme,
         cx: &Context<Self>,
     ) -> impl IntoElement {
@@ -1702,7 +1688,13 @@ impl Workspace {
         // The object's name is a resource name: monospace, like the list's names.
         let mono_last = self.detail.is_some();
         let crumb_count = crumbs.len();
-        let mut breadcrumb = h_flex().flex_1().min_w_0().gap_1().text_sm();
+        // Clipped: a cluster filling the row leaves no room for the chevrons after it.
+        let mut breadcrumb = h_flex()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .gap_1()
+            .text_sm();
         for (i, (text, tip)) in crumbs.into_iter().enumerate() {
             if i > 0 {
                 breadcrumb = breadcrumb.child(
@@ -1715,8 +1707,13 @@ impl Workspace {
             breadcrumb = breadcrumb.child(
                 div()
                     .id(("crumb", i))
+                    .aria_label(text.clone())
+                    .test_support()
                     .min_w_0()
                     .truncate()
+                    // The other crumbs give way first: the cluster is cut only when it alone
+                    // is wider than the breadcrumb.
+                    .when(i == 0, |el| el.flex_none().max_w_full())
                     .when(!last, |el| el.text_color(theme.muted_foreground))
                     .when(last, |el| el.font_semibold())
                     .when(last && mono_last, |el| {
@@ -1729,14 +1726,20 @@ impl Workspace {
             );
         }
 
-        h_flex()
+        let detail_alone = self.main_panes(cx) == MainPanes::DetailAlone;
+        let two_rows = self.header_has_two_rows(window_width, cx);
+        let namespaces = controls
+            .namespaces
+            .then(|| self.render_namespace_filter(&ns_summary, cx));
+        let watch_mode = controls
+            .watch_mode
+            .then(|| self.render_watch_mode(&name, cx));
+        let first_row = h_flex()
             .h(px(HEADER_HEIGHT))
             .flex_none()
             .px_3()
             .gap_2()
-            .border_b_1()
-            .border_color(theme.border)
-            .when(self.main_panes(cx) == MainPanes::DetailAlone, |el| {
+            .when(detail_alone, |el| {
                 el.child(
                     div().flex_none().child(
                         Button::new("detail-back")
@@ -1753,13 +1756,38 @@ impl Workspace {
                     ),
                 )
             })
-            .child(breadcrumb)
-            .when(controls.namespaces, |el| {
-                el.child(self.render_namespace_filter(&ns_summary, cx))
-            })
-            .when(controls.watch_mode, |el| {
-                el.child(self.render_watch_mode(&name, cx))
-            })
+            .child(breadcrumb);
+        if two_rows {
+            v_flex()
+                .id("main-header")
+                .w_full()
+                .flex_none()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(first_row.w_full())
+                .child(
+                    h_flex()
+                        .id("header-controls-row")
+                        .w_full()
+                        .h(px(HEADER_HEIGHT))
+                        .flex_none()
+                        .px_3()
+                        .gap_2()
+                        .justify_end()
+                        .children(namespaces)
+                        .children(watch_mode)
+                        .test_support(),
+                )
+                .test_support()
+                .into_any_element()
+        } else {
+            first_row
+                .border_b_1()
+                .border_color(theme.border)
+                .children(namespaces)
+                .children(watch_mode)
+                .into_any_element()
+        }
     }
 
     fn render_namespace_filter(&self, summary: &str, cx: &Context<Self>) -> impl IntoElement {
@@ -2023,6 +2051,13 @@ impl Workspace {
         layout(&self.panes, window_width, nav_shown, detail_beside)
     }
 
+    /// Whether the main header puts its controls on a second row in a window this wide.
+    fn header_has_two_rows(&self, window_width: f32, cx: &App) -> bool {
+        let widths = self.layout(window_width, cx);
+        let main_width = window_width - widths.clusters - widths.navigation;
+        self.main_panes(cx) == MainPanes::DetailAlone && header_needs_two_rows(main_width)
+    }
+
     /// What the main area shows of the list and the open detail. A failed connection shows
     /// neither, so there is nothing to go Back from.
     fn main_panes(&self, cx: &App) -> MainPanes {
@@ -2157,6 +2192,7 @@ impl Workspace {
                     && self.main_panes(cx) == MainPanes::DetailAlone =>
             {
                 h_flex()
+                    .id("detail-alone-pane")
                     .flex_1()
                     .min_h_0()
                     .children(
@@ -2164,6 +2200,7 @@ impl Workspace {
                             .clone()
                             .map(|detail| div().flex_1().min_w_0().h_full().child(detail)),
                     )
+                    .test_support()
                     .into_any_element()
             }
             (Some(list), state) if !matches!(state, ConnectionState::Failed(_)) => h_flex()
@@ -2240,14 +2277,14 @@ impl Workspace {
             .flex_1()
             .min_w_0()
             .h_full()
-            .child(self.render_header(&cluster, theme, cx))
+            .child(self.render_header(&cluster, window_width, theme, cx))
             .child(content)
             .into_any_element()
     }
 }
 
 /// What a cluster's protection is, in its row's tooltip.
-fn protection_text(protection: Protection, trust: &TrustState) -> String {
+pub(super) fn protection_text(protection: Protection, trust: &TrustState) -> String {
     let text = match protection {
         Protection::Protected => "Protected: read-only in Flint until you unlock or trust it",
         Protection::Local => "On this machine: unlocked",
@@ -2491,11 +2528,10 @@ fn unlock_dialog(shown: &str, context: &str, server: &str) -> DialogText {
     DialogText {
         title: format!("Unlock {shown}?"),
         text: format!(
-            "Until Flint quits, or until you lock it again, actions that change this cluster or \
-             run code in it work without asking again: opening a shell or applying an edit. It stays unlocked \
-             only while the context points at this server. Locking it again stops new shells; \
-             shells already open keep running.\n\n\
-             Context: {context}\nServer: {server}"
+            "Context: {context}\nServer: {server}\n\n\
+             Until Flint quits or you lock it again, changes and code execution (shell, edit) \
+             stop asking. This holds only while the context points at this server. Locking \
+             stops new shells; open shells keep running."
         ),
         ok: "Unlock".into(),
         cancel: "Cancel".into(),
@@ -2527,17 +2563,17 @@ fn trust_dialog(shown: &str, context: &str, server: &str, previous: Option<&str>
     let context = flint_core::display::single_line(context);
     let previous = previous.map(|previous| previous_address(server, previous));
     let server = flint_core::redact::server_url(server);
-    let mut text = format!(
-        "A trusted cluster stays unlocked when Flint restarts: actions that change it or run \
-         code in it work without asking. Trust is kept in settings.toml and pinned to this \
-         server: if the context is pointed at another one, the cluster is protected again.\n\n\
-         Context: {context}\nServer: {server}"
-    );
+    let mut text = format!("Context: {context}\nServer: {server}\n\n");
     if let Some(previous) = previous {
         text.push_str(&format!(
-            "\n\nThis context was trusted at {previous}, which is a different server."
+            "This context was trusted at {previous}, which is a different server.\n\n"
         ));
     }
+    text.push_str(
+        "Trust survives a restart: changes and code execution (shell, edit) stop asking. It is \
+         stored in settings.toml and pinned to this server. If the context moves, the cluster \
+         is protected again.",
+    );
     DialogText {
         title: format!("Trust {shown}?"),
         text,
@@ -2780,6 +2816,11 @@ fn no_contexts_text(kubeconfig_env: Option<&std::ffi::OsStr>, unreadable: bool) 
     }
 }
 
+/// Whether a main area this wide puts the detail-alone header's controls on a second row.
+fn header_needs_two_rows(main_width: f32) -> bool {
+    main_width < HEADER_ONE_ROW_MIN_WIDTH
+}
+
 /// Which header controls work for the active cluster: none while its connection failed (no
 /// namespaces to pick, nothing to watch; the main area offers Retry), and the namespace
 /// filter only for a namespaced kind.
@@ -2852,6 +2893,7 @@ impl Render for Workspace {
         let window_width = f32::from(window.viewport_size().width);
         let window_height = f32::from(window.viewport_size().height);
         self.sync_narrow_layout(window_width, window, cx);
+        self.two_row_header = self.header_has_two_rows(window_width, cx);
         let cx: &Context<Self> = cx;
         let theme = cx.theme();
         let has_cluster = self.model.read(cx).active_cluster().is_some();
@@ -3230,6 +3272,35 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    // covers UP-55: the target leads, and a moved context's warning comes before the explanation.
+    #[test]
+    fn unlock_and_trust_dialogs_name_the_target_first() {
+        let target = "Context: kind-dev\nServer: https://127.0.0.1:6443\n\n";
+        let server = "https://127.0.0.1:6443";
+        let unlock = super::unlock_dialog("kind-dev", "kind-dev", server).text;
+        let trust = super::trust_dialog("kind-dev", "kind-dev", server, None).text;
+        let moved = super::trust_dialog(
+            "kind-dev",
+            "kind-dev",
+            server,
+            Some("https://10.0.0.1:6443"),
+        )
+        .text;
+
+        let after = unlock.strip_prefix(target).expect(&unlock);
+        assert!(after.starts_with("Until Flint quits"), "{unlock}");
+        let after = trust.strip_prefix(target).expect(&trust);
+        assert!(after.starts_with("Trust survives a restart"), "{trust}");
+        let after = moved.strip_prefix(target).expect(&moved);
+        assert!(
+            after.starts_with(
+                "This context was trusted at https://10.0.0.1:6443, which is a different \
+                 server.\n\nTrust survives a restart"
+            ),
+            "{moved}"
+        );
     }
 
     // covers UP-07, UP-08

@@ -8,7 +8,7 @@
 //!
 //! [`ProblemId`] names the cluster, the kind of problem and the exact object (by UID, so a
 //! recreated object is a different one). It holds nothing that changes while a problem lasts:
-//! no restart count, reason or time. A notifier that keeps the ids of the last pass can tell:
+//! no restart count, reason, owner or time. A notifier that keeps the ids of the last pass can tell:
 //!
 //! - **new**: the id was not in the last pass and has not been seen before;
 //! - **already reported**: the id was in the last pass;
@@ -26,6 +26,7 @@
 
 // module-tests: problems_tests.rs
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use k8s_openapi::api::apps::v1::{
@@ -33,7 +34,7 @@ use k8s_openapi::api::apps::v1::{
 };
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ContainerStateTerminated, ContainerStatus, Node, Pod, PodSpec};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference, Time};
 use k8s_openapi::jiff::{SignedDuration, Timestamp};
 
 /// Restarts a container needs before a back-off counts as a crash loop.
@@ -270,6 +271,116 @@ pub enum ProblemSubject {
     },
 }
 
+/// The controller a problem belongs to, for grouping.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProblemOwner {
+    /// The API group, empty for the core group.
+    pub group: String,
+    pub kind: String,
+    pub name: String,
+}
+
+impl ProblemOwner {
+    /// The controller of an object, seen through a ReplicaSet to its Deployment.
+    ///
+    /// A pod names only its ReplicaSet, which changes on each rollout. The Deployment is named
+    /// only when `replica_set` is that ReplicaSet's metadata, matched by name, UID and namespace,
+    /// and carries a controller owner reference of kind Deployment: an orphaned ReplicaSet keeps
+    /// its name and pod template hash, so those prove nothing. Without verified metadata the
+    /// ReplicaSet is the owner.
+    pub fn of_meta(meta: &ObjectMeta, replica_set: Option<&ObjectMeta>) -> Option<Self> {
+        let owner = controller_of(meta)?;
+        let group = api_group(&owner.api_version);
+        if group == "apps" && owner.kind == "ReplicaSet" {
+            let deployment = replica_set
+                .filter(|rs| {
+                    rs.name.as_deref() == Some(owner.name.as_str())
+                        && rs.uid.as_deref() == Some(owner.uid.as_str())
+                        && rs.namespace == meta.namespace
+                })
+                .and_then(deployment_of);
+            if let Some(deployment) = deployment {
+                return Some(Self::workload(WorkloadKind::Deployment, deployment));
+            }
+        }
+        Some(Self {
+            group: group.to_owned(),
+            kind: owner.kind.clone(),
+            name: owner.name.clone(),
+        })
+    }
+
+    /// A Deployment, StatefulSet or DaemonSet as an owner.
+    pub fn workload(kind: WorkloadKind, name: &str) -> Self {
+        let kind = match kind {
+            WorkloadKind::Deployment => "Deployment",
+            WorkloadKind::StatefulSet => "StatefulSet",
+            WorkloadKind::DaemonSet => "DaemonSet",
+        };
+        Self {
+            group: "apps".to_owned(),
+            kind: kind.to_owned(),
+            name: name.to_owned(),
+        }
+    }
+}
+
+/// ReplicaSet metadata for resolving pods to their Deployments, or the fact that there is none.
+///
+/// Collecting metadata into an index states that it is a complete read. When the ReplicaSets could
+/// not be read, use [`Self::unavailable`]. There is no default, so a caller has to say which it is.
+/// A pod's owner is known only if a complete read holds its ReplicaSet; see
+/// [`Problem::owner_known`].
+///
+/// Looked up by the UID in the pod's owner reference, within the pod's namespace, so a ReplicaSet
+/// recreated under the same name or one in another namespace is never mistaken for the owner.
+/// ReplicaSets without a UID cannot be matched and are left out.
+#[derive(Clone, Debug)]
+pub struct ReplicaSetIndex<'a> {
+    /// `None` when the ReplicaSets could not be read.
+    by_uid: Option<HashMap<&'a str, &'a ObjectMeta>>,
+}
+
+impl<'a> FromIterator<&'a ObjectMeta> for ReplicaSetIndex<'a> {
+    fn from_iter<I: IntoIterator<Item = &'a ObjectMeta>>(replica_sets: I) -> Self {
+        let by_uid = replica_sets
+            .into_iter()
+            .filter_map(|meta| Some((meta.uid.as_deref()?, meta)))
+            .collect();
+        Self {
+            by_uid: Some(by_uid),
+        }
+    }
+}
+
+impl ReplicaSetIndex<'_> {
+    /// The ReplicaSets could not be read in this pass.
+    pub fn unavailable() -> Self {
+        Self { by_uid: None }
+    }
+
+    /// The owner of `pod`, and whether it is known.
+    fn resolve(&self, pod: &ObjectMeta) -> (Option<ProblemOwner>, bool) {
+        let Some(controller) = controller_of(pod) else {
+            return (None, true);
+        };
+        if controller.kind != "ReplicaSet" || api_group(&controller.api_version) != "apps" {
+            return (ProblemOwner::of_meta(pod, None), true);
+        }
+        let replica_set = self
+            .by_uid
+            .as_ref()
+            .and_then(|read| read.get(controller.uid.as_str()).copied())
+            .filter(|rs| {
+                rs.namespace == pod.namespace && rs.name.as_deref() == Some(&controller.name)
+            });
+        (
+            ProblemOwner::of_meta(pod, replica_set),
+            replica_set.is_some(),
+        )
+    }
+}
+
 /// The stable identity of a problem; see the [module docs](self#identity).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProblemId {
@@ -283,6 +394,16 @@ pub struct ProblemId {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Problem {
     pub id: ProblemId,
+    /// The workload to group this under. Never part of the identity.
+    ///
+    /// For a container, its pod's controller, resolved to the Deployment when the ReplicaSet's
+    /// metadata was supplied. For a Job, its controller, such as a CronJob. For a Deployment,
+    /// StatefulSet or DaemonSet, itself. `None` for a node or an object with no controller.
+    pub owner: Option<ProblemOwner>,
+    /// Whether `owner` is the real controller. False for a pod whose ReplicaSet is not in a
+    /// complete read: `owner` then names that ReplicaSet, though a Deployment may control it, and
+    /// must not be used as an identity. The alert engine treats the kind as unchecked.
+    pub owner_known: bool,
     /// The known reason code, if the object gave one.
     pub reason: Option<ProblemReason>,
     /// When this was last known to start, if the object says.
@@ -382,11 +503,21 @@ impl Classifier {
         }
     }
 
-    /// The problems of every pod, in order.
+    /// The problems of every pod, in order, with no ReplicaSet metadata: the owner of a
+    /// ReplicaSet-owned pod is not known.
     pub fn pods<'a>(&self, pods: impl IntoIterator<Item = &'a Pod>) -> Vec<Problem> {
+        self.pods_with_replica_sets(pods, &ReplicaSetIndex::unavailable())
+    }
+
+    /// The problems of every pod, in order, resolving owners through `replica_sets`.
+    pub fn pods_with_replica_sets<'a>(
+        &self,
+        pods: impl IntoIterator<Item = &'a Pod>,
+        replica_sets: &ReplicaSetIndex<'_>,
+    ) -> Vec<Problem> {
         let mut out = Vec::new();
         for pod in pods {
-            self.pod(pod, &mut out);
+            self.pod_with_replica_sets(pod, replica_sets, &mut out);
         }
         out
     }
@@ -397,6 +528,16 @@ impl Classifier {
     /// an OOM kill that ended its final run. The same holds for ephemeral containers, which are
     /// never restarted, so a debug container with a mistyped image does not mark its pod.
     pub fn pod(&self, pod: &Pod, out: &mut Vec<Problem>) {
+        self.pod_with_replica_sets(pod, &ReplicaSetIndex::unavailable(), out);
+    }
+
+    /// As [`Self::pod`], resolving the pod's owner through `replica_sets`.
+    pub fn pod_with_replica_sets(
+        &self,
+        pod: &Pod,
+        replica_sets: &ReplicaSetIndex<'_>,
+        out: &mut Vec<Problem>,
+    ) {
         let meta = &pod.metadata;
         let (Some(name), Some(status), None) = (&meta.name, &pod.status, &meta.deletion_timestamp)
         else {
@@ -432,7 +573,12 @@ impl Classifier {
                 pod_uid: meta.uid.clone(),
                 container: container.name.clone(),
             };
-            out.push(self.problem(kind, subject, reason, since));
+            let (owner, owner_known) = replica_sets.resolve(meta);
+            let problem = self.problem(kind, subject, owner, reason, since);
+            out.push(Problem {
+                owner_known,
+                ..problem
+            });
         }
     }
 
@@ -466,7 +612,7 @@ impl Classifier {
             uid: meta.uid.clone(),
         };
         let reason = ProblemReason::of_node(ready.and_then(|c| c.reason.as_deref()));
-        Some(self.problem(ProblemKind::NodeNotReady, subject, reason, since))
+        Some(self.problem(ProblemKind::NodeNotReady, subject, None, reason, since))
     }
 
     /// The problem of one Job, if it has finished as failed.
@@ -490,7 +636,8 @@ impl Classifier {
         };
         let reason = ProblemReason::of_job(failed.reason.as_deref());
         let since = time(&failed.last_transition_time);
-        Some(self.problem(ProblemKind::JobFailed, subject, reason, since))
+        let owner = ProblemOwner::of_meta(meta, None);
+        Some(self.problem(ProblemKind::JobFailed, subject, owner, reason, since))
     }
 
     /// The problem of one Deployment, if it has settled short of its replicas.
@@ -629,13 +776,15 @@ impl Classifier {
         reason: Option<ProblemReason>,
         since: Option<Timestamp>,
     ) -> Option<Problem> {
+        let name = meta.name.clone()?;
+        let owner = Some(ProblemOwner::workload(kind, &name));
         let subject = ProblemSubject::Workload {
             kind,
             namespace: meta.namespace.clone().unwrap_or_default(),
-            name: meta.name.clone()?,
+            name,
             uid: meta.uid.clone(),
         };
-        Some(self.problem(ProblemKind::WorkloadShort, subject, reason, since))
+        Some(self.problem(ProblemKind::WorkloadShort, subject, owner, reason, since))
     }
 
     /// An image pull failure is the container's current state, so it comes before an OOM kill
@@ -729,6 +878,7 @@ impl Classifier {
         &self,
         kind: ProblemKind,
         subject: ProblemSubject,
+        owner: Option<ProblemOwner>,
         reason: Option<ProblemReason>,
         since: Option<Timestamp>,
     ) -> Problem {
@@ -738,6 +888,8 @@ impl Classifier {
                 kind,
                 subject,
             },
+            owner,
+            owner_known: true,
             reason,
             since,
         }
@@ -747,6 +899,26 @@ impl Classifier {
     fn within(&self, then: Timestamp, window: SignedDuration) -> bool {
         self.now.duration_since(then) < window
     }
+}
+
+/// The API group of an `apiVersion`, empty for the core group.
+fn api_group(api_version: &str) -> &str {
+    api_version.rsplit_once('/').map_or("", |(group, _)| group)
+}
+
+/// The owner reference marked as an object's controller.
+fn controller_of(meta: &ObjectMeta) -> Option<&OwnerReference> {
+    meta.owner_references
+        .as_ref()?
+        .iter()
+        .find(|owner| owner.controller == Some(true))
+}
+
+/// The name of the Deployment controlling a ReplicaSet, if one does.
+fn deployment_of(replica_set: &ObjectMeta) -> Option<&str> {
+    controller_of(replica_set)
+        .filter(|o| o.kind == "Deployment" && api_group(&o.api_version) == "apps")
+        .map(|o| o.name.as_str())
 }
 
 /// The Kubernetes termination reason for an OOM kill.
