@@ -21,6 +21,16 @@
 //! - The first check of each kind of problem is a baseline and raises nothing, unless
 //!   [`AlertConfig::alert_on_existing`] is set.
 //!
+//! # Hold-down
+//!
+//! A problem with a [`Problem::hold_down`] has no time in its status, so it may simply still be
+//! starting. It takes part in alerting only once its id has been present for that long.
+//!
+//! - One that clears first raises and resolves nothing, and its wait restarts if it returns.
+//! - A pass that cannot check its kind, or an unavailable cluster, leaves the wait running.
+//! - A group already open is not held back, including one in its cooldown.
+//! - A problem at the first check of its kind is baseline at once, so it never raises later.
+//!
 //! # Unknown owners
 //!
 //! A pod names only its ReplicaSet, which changes on each rollout, so its alert group is known
@@ -53,7 +63,9 @@ use std::sync::Arc;
 
 use k8s_openapi::jiff::{SignedDuration, Timestamp};
 
-use crate::problems::{Problem, ProblemKind, ProblemOwner, ProblemSeverity, ProblemSubject};
+use crate::problems::{
+    Problem, ProblemId, ProblemKind, ProblemOwner, ProblemSeverity, ProblemSubject,
+};
 
 /// How long a group must stay absent before it resolves and can raise again.
 ///
@@ -368,6 +380,13 @@ struct Tracked {
     summary: &'static str,
 }
 
+impl Tracked {
+    /// Whether the group has been clear for the whole cooldown.
+    fn cooldown_over(&self, now: Timestamp, cooldown: SignedDuration) -> bool {
+        matches!(self.status, Status::Clearing { since } if now.duration_since(since) >= cooldown)
+    }
+}
+
 #[derive(Debug)]
 struct RateWindow {
     start: Timestamp,
@@ -425,6 +444,8 @@ struct ClusterState {
     tracked: HashMap<AlertKey, Tracked>,
     /// The kinds of problem that have had their first check.
     baselined: HashSet<ProblemKind>,
+    /// When each present problem with a hold-down was first seen.
+    first_seen: HashMap<ProblemId, Timestamp>,
     window: RateWindow,
     unavailable_since: Option<Timestamp>,
     unavailable_reported: bool,
@@ -437,6 +458,7 @@ impl ClusterState {
         Self {
             tracked: HashMap::new(),
             baselined: HashSet::new(),
+            first_seen: HashMap::new(),
             window: RateWindow::new(now),
             unavailable_since: None,
             unavailable_reported: false,
@@ -448,6 +470,9 @@ impl ClusterState {
     fn clamp_times(&mut self, now: Timestamp) {
         self.window.start = self.window.start.min(now);
         self.unavailable_since = self.unavailable_since.map(|since| since.min(now));
+        for first in self.first_seen.values_mut() {
+            *first = (*first).min(now);
+        }
         for entry in self.tracked.values_mut() {
             if let Status::Clearing { since } = &mut entry.status {
                 *since = (*since).min(now);
@@ -580,7 +605,8 @@ impl AlertEngine {
 
         let unchecked = unchecked_kinds(cluster, problems, unchecked);
         let unchecked = unchecked.as_slice();
-        let (mut seen, mut untracked) = group(cluster, problems, unchecked);
+        let waiting = update_hold_downs(state, cluster, problems, unchecked, now, &config);
+        let (mut seen, mut untracked) = group(cluster, problems, unchecked, &waiting);
         let resolved = update_tracked(state, &mut seen, unchecked, now, config.cooldown);
         for (key, entry) in resolved {
             if !entry.raised {
@@ -675,16 +701,59 @@ fn unchecked_kinds(
     kinds
 }
 
-/// Groups a pass by key, returning the groups and how many problems cannot be kept.
+/// Updates the [hold-down](self#hold-down) waits from a pass, returning the problems still held.
+fn update_hold_downs<'a>(
+    state: &mut ClusterState,
+    cluster: &Arc<str>,
+    problems: &'a [Problem],
+    unchecked: &[ProblemKind],
+    now: Timestamp,
+    config: &AlertConfig,
+) -> HashSet<&'a ProblemId> {
+    let mut present = HashSet::new();
+    let mut waiting = HashSet::new();
+    for problem in problems {
+        if *problem.id.cluster != **cluster || unchecked.contains(&problem.kind()) {
+            continue;
+        }
+        let Some(hold_down) = problem.hold_down() else {
+            continue;
+        };
+        present.insert(&problem.id);
+        let first = *state.first_seen.entry(problem.id.clone()).or_insert(now);
+        if now.duration_since(first) >= hold_down {
+            continue;
+        }
+        let baseline = !config.alert_on_existing && !state.baselined.contains(&problem.kind());
+        let open = state
+            .tracked
+            .get(&key_of(problem))
+            .is_some_and(|entry| !entry.cooldown_over(now, config.cooldown));
+        if !baseline && !open {
+            waiting.insert(&problem.id);
+        }
+    }
+    state
+        .first_seen
+        .retain(|id, _| present.contains(id) || unchecked.contains(&id.kind));
+    waiting
+}
+
+/// Groups a pass by key, returning the groups and how many problems cannot be kept. Problems in
+/// `waiting` are left out, as if not yet seen.
 fn group(
     cluster: &Arc<str>,
     problems: &[Problem],
     unchecked: &[ProblemKind],
+    waiting: &HashSet<&ProblemId>,
 ) -> (HashMap<AlertKey, Seen>, u32) {
     let mut seen: HashMap<AlertKey, Seen> = HashMap::new();
     let mut oversized = 0;
     for problem in problems {
-        if *problem.id.cluster != **cluster || unchecked.contains(&problem.kind()) {
+        if *problem.id.cluster != **cluster
+            || unchecked.contains(&problem.kind())
+            || waiting.contains(&problem.id)
+        {
             continue;
         }
         let key = key_of(problem);
@@ -725,7 +794,7 @@ fn update_tracked(
             Status::Open | Status::Unknown => None,
         };
         // A group back after its deadline stays in `seen`, to raise as a new occurrence.
-        let expired = clearing_since.is_some_and(|since| now.duration_since(since) >= cooldown);
+        let expired = entry.cooldown_over(now, cooldown);
         if let Some(group) = (!expired).then(|| seen.remove(key)).flatten() {
             entry.status = Status::Open;
             entry.affected = group.affected;

@@ -973,7 +973,8 @@ mod tests {
     }
 
     // Each byte restarts a socket read timeout, so only an overall deadline ends this. The peer
-    // stops when the client hangs up.
+    // stops when the client hangs up, or after a few seconds, so a regressed deadline ends in a
+    // failed assertion instead of a hang with an unbounded answer buffer.
     #[test]
     fn a_trickling_answer_cannot_outlast_the_deadline() {
         let dir = tempfile::tempdir().unwrap();
@@ -982,7 +983,8 @@ mod tests {
         let peer = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             read_request(&stream);
-            while stream.write_all(b"x").is_ok() {
+            let give_up = std::time::Instant::now() + Duration::from_secs(3);
+            while std::time::Instant::now() < give_up && stream.write_all(b"x").is_ok() {
                 std::thread::sleep(Duration::from_millis(1));
             }
         });

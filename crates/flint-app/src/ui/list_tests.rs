@@ -1169,7 +1169,7 @@ async fn a_real_403_goes_from_checking_to_no_access_without_reconnecting(cx: &mu
 // covers UP-27
 #[test]
 fn only_a_denial_is_titled_as_access() {
-    let title = |state: SyncState| super::access_title(&state, "Pods");
+    let title = |state: SyncState| super::access_title(&state, "Pods", None);
     let error = || "refused".to_owned();
     assert_eq!(
         title(SyncState::RetryingRefusal {
@@ -1203,6 +1203,56 @@ fn only_a_denial_is_titled_as_access() {
             None
         );
     }
+}
+
+fn namespace_limit(listed: &[&str], denied: &[&str]) -> flint_core::NamespaceLimit {
+    let names = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect();
+    flint_core::NamespaceLimit {
+        listed: names(listed),
+        denied: names(denied),
+        reason: "server text \"quoted-user\"".into(),
+        revisions: vec![1; listed.len()],
+    }
+}
+
+// covers UP-27: a denial of every namespace tried names them, and only a denial does.
+#[test]
+fn a_denied_limited_list_names_its_namespaces() {
+    let failed = |cause| SyncState::Failed {
+        error: "server text \"quoted-user\"".into(),
+        cause,
+    };
+    let denied = failed(Some(RefusalCause::Denied));
+    let title = |state: &SyncState, limit| super::access_title(state, "Pods", Some(&limit));
+    assert_eq!(
+        title(&denied, namespace_limit(&[], &["demo"])).as_deref(),
+        Some("No access to Pods in demo")
+    );
+    assert_eq!(
+        title(&denied, namespace_limit(&[], &["demo", "team-a"])).as_deref(),
+        Some("No access to Pods in 2 namespaces")
+    );
+    assert_eq!(
+        title(&denied, namespace_limit(&[], &[])).as_deref(),
+        Some("No access to Pods")
+    );
+    for cause in [Some(RefusalCause::NotFound), None] {
+        assert_eq!(title(&failed(cause), namespace_limit(&[], &["demo"])), None);
+    }
+}
+
+// covers UP-27: a namespace whose list failed may be missing rather than forbidden, so the
+// banner claims neither, and no server text reaches it.
+#[test]
+fn the_limited_banner_does_not_call_a_failed_namespace_forbidden() {
+    let text = super::limited_text("Pods", &namespace_limit(&["demo"], &["gone"]));
+    assert_eq!(
+        text,
+        "Showing Pods in 1 namespace only (demo): you may not list Pods in all namespaces. \
+         Could not list Pods in: gone."
+    );
+    assert!(!text.contains("Not allowed"), "{text}");
+    assert!(!text.contains("quoted-user"), "{text}");
 }
 
 // covers UP-20
