@@ -5,7 +5,7 @@ that closes the gaps is in [`TESTING.md`](./TESTING.md#e2e-coverage-plan). Updat
 
 Audited on master at 057b773 (after #100, #106, #94 and #118), and rechecked for M2 at 34e83db by the M2 release
 review (#15). "#116" marks view tests that have since merged (aa59738). The app e2e tests are `#[ignore]`d in plain
-`cargo test`; CI runs them in the `macos (flint-app)` job (#117).
+`cargo test`; CI runs them in the `macos tests (flint-app)` job (#117).
 
 **Layers:** U unit, V view (`#[gpui_kit::test]`), F core or MCP against the fake API server, K cluster on kind
 (`cluster-e2e`), A app e2e (automation channel, fake API server unless noted), M MCP e2e over stdio, Man manual.

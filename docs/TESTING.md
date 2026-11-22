@@ -91,7 +91,7 @@ A test-only control socket lets e2e tests and agents drive the real app. The cod
   refuses both together). CI's `linux (flint-app)` and `macos (flint-app)` jobs run flint-app's clippy and tests with
   the feature, and `scripts/check-no-automation.sh <binary>` checks that a release binary has none of the channel's
   strings (release binaries are stripped, so there are no symbols to look for). Every job that builds a release
-  binary runs it on the executable, before an AppImage, DMG or archive compresses it: `macos (flint-app)`,
+  binary runs it on the executable, before an AppImage, DMG or archive compresses it: `macos build (flint-app)`,
   `appimage (x86_64)` and both release builds. `scripts/smoke-macos-app.sh` also runs it on the executable inside
   the mounted DMG's `Flint.app`, in `macos-app (dmg)` and the macOS release build. It fails closed (on an empty, compressed or non-Flint file too), and
   the `no-automation-check` lint job tests that (`scripts/check-no-automation-test.sh`). The channel builds on Linux
@@ -324,14 +324,14 @@ FLINT_E2E_APP_BIN="$PWD/target/debug/flint" cargo test -p flint-e2e --test app -
 Screenshots are named `upXX-<view>-light.png` and `upXX-<view>-dark.png`; a rerun replaces the previous run's
 files. Without `FLINT_AUTOMATION_SCREENSHOTS` they go to the scratch config directory and are deleted with it.
 
-**In CI.** macOS runners are costly, so app e2e has no job of its own: it is a step of `macos (flint-app)`, after
-that job's tests. That job runs on every push to `master`, on PRs labelled `run-macos`, and on PRs that get the full
-suite (see "Which tests a pull request runs") when they change something the macOS job builds. A PR without any of
+**In CI.** macOS runners are costly, so app e2e has no job of its own: it is a step of `macos tests (flint-app)`,
+after that job's tests. The macOS jobs run on every push to `master`, on PRs labelled `run-macos`, and on PRs that get
+the full suite (see "Which tests a pull request runs") when they change something the macOS jobs build. A PR without any of
 these gets no screenshot comment.
 
 ```mermaid
 flowchart LR
-  subgraph macos["macos (flint-app) - macOS, contents: read"]
+  subgraph macos["macos tests (flint-app) - macOS, contents: read"]
     T["cargo test -p flint-app --features automation<br/>(builds target/debug/flint)"] --> C["check the binary has the channel"]
     C --> E["App e2e: cargo test -p flint-e2e --test app -- --ignored<br/>FLINT_E2E_APP_BIN=target/debug/flint"]
     E --> U["upload-artifact (always)<br/>app-e2e-screenshots-RUN-ATTEMPT"]
@@ -345,10 +345,11 @@ flowchart LR
 - **No second build.** `cargo test -p flint-app --features automation` already builds `target/debug/flint` with the
   channel (the `flint mcp` integration test needs the binary). The e2e step points `FLINT_E2E_APP_BIN` at it, after a
   step that checks the binary contains the channel's socket name. Only the `flint-e2e` test crate is compiled anew.
-- **Gating.** A failing e2e test fails the job. Screenshots never do: they are uploaded with `if: always()` as
+- **Gating.** A failing e2e test fails the job, and with it the aggregate `macos (flint-app)` check, which passes only
+  if `macos build (flint-app)` and `macos tests (flint-app)` both passed. Screenshots never do: they are uploaded with `if: always()` as
   `app-e2e-screenshots-<run id>-<attempt>` (kept 14 days), so a failed run still has them.
-- **The PR comment.** A separate Linux job, `app e2e screenshots comment`, runs after `macos (flint-app)`. It alone
-  has `pull-requests: write`; the macOS job, which builds and runs PR code, stays read-only. It posts one comment
+- **The PR comment.** A separate Linux job, `app e2e screenshots comment`, runs after `macos tests (flint-app)`. It
+  alone has `pull-requests: write`; the macOS jobs, which build and run PR code, stay read-only. It posts one comment
   marked `<!-- flint-app-e2e-screenshots -->` and edits it on later pushes, naming the commit, the e2e outcome and the
   artifact link. It skips PRs from forks (their token cannot write; the artifact is on the run page) and runs only if
   the e2e step ran.

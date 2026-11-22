@@ -97,6 +97,7 @@ fn up_16_recorded_arguments_are_redacted_like_replies() -> Result<()> {
         // A tool that does not exist: its name is what the call wrote.
         (PLANTED, json!({}), |r| Some(r.tool.as_str())),
     ];
+    let size_only = format!("…(+{} bytes)", PLANTED.len());
     for (tool, arguments, field) in cases {
         let context = format!("{tool} {arguments}");
         // A call the protocol refuses has no reply text to check, and is still recorded.
@@ -109,7 +110,10 @@ fn up_16_recorded_arguments_are_redacted_like_replies() -> Result<()> {
         }
         let record = last(&config_dir);
         let recorded = field(&record).unwrap_or_default();
-        assert!(recorded.contains("[REDACTED:"), "{context}: {record:?}");
+        assert!(
+            recorded.contains("[REDACTED:") || (tool != PLANTED && recorded == size_only),
+            "{context}: {record:?}"
+        );
     }
     drop(mcp);
     for (path, bytes) in files_below(&config_dir)? {
