@@ -1690,6 +1690,141 @@ fn subs(ids: &[KindId]) -> HashSet<KindId> {
     ids.iter().cloned().collect()
 }
 
+fn connection_lost() -> FetchError {
+    FetchError::Other("the connection dropped".into())
+}
+
+/// From now on every list and watch of `plural` fails, and its open stream breaks.
+fn lose_connection(fake: &Fake, plural: &str) {
+    for _ in 0..2000 {
+        fake.list_error(plural, connection_lost());
+        fake.script(plural, WatchScript::Fail(connection_lost()));
+    }
+    if let Some(stream) = fake.sender(plural) {
+        let _ = stream.send(Err(connection_lost()));
+    }
+}
+
+fn is_reconnecting(snapshot: &KindSnapshot) -> bool {
+    matches!(snapshot.state, SyncState::Reconnecting { error: Some(_) })
+}
+
+// covers UP-27: a view closed and reopened during an outage keeps its rows, marked stale from the
+// first snapshot it reads; a kind with no earlier rows says reconnecting and never loading.
+#[tokio::test(start_paused = true)]
+async fn an_outage_keeps_a_closed_views_rows_until_the_kind_lists_again() {
+    const CRDS: &str = "customresourcedefinitions";
+    let fake = Fake::new();
+    fake.list("pods", pod("u1", "web", "Running", "5", true));
+    let hubs = HubRegistry::default();
+    let mut w = watches(&fake, &hubs);
+    let pods_id = KindId::pods();
+    let crds_id = KindId::custom_resource_definitions();
+    let open = subs(std::slice::from_ref(&pods_id));
+    let (_crd_hub, mut crd_rx) = hubs.subscribe("c", &crds_id);
+    let (hub, mut rx) = hubs.subscribe("c", &pods_id);
+    assert_eq!(rx.borrow().state, SyncState::Idle, "no outage yet");
+    w.reconcile(true, WatchMode::OnView, &open);
+    assert_eq!(
+        rx.borrow().state,
+        SyncState::Loading,
+        "a first connect loads"
+    );
+    until(&mut rx, |s| {
+        s.state == SyncState::Synced && s.rows.len() == 1
+    })
+    .await;
+    until(&mut crd_rx, |s| s.state == SyncState::Synced).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    lose_connection(&fake, "pods");
+    lose_connection(&fake, CRDS);
+    until(&mut rx, |s| is_reconnecting(s) && s.rows.len() == 1).await;
+    until(&mut crd_rx, is_reconnecting).await;
+
+    // The view closes, so its watch stops, and it opens again.
+    drop((hub, rx));
+    w.reconcile(true, WatchMode::OnView, &subs(&[]));
+    let (_hub, mut rx) = hubs.subscribe("c", &pods_id);
+    let first = rx.borrow_and_update().clone();
+    assert!(is_reconnecting(&first), "{:?}", first.state);
+    assert_eq!(first.rows.len(), 1, "the rows are there at once");
+    w.reconcile(true, WatchMode::OnView, &open);
+    assert!(is_reconnecting(&rx.borrow()));
+    assert_eq!(rx.borrow().rows.len(), 1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let during = rx.borrow().clone();
+    assert!(is_reconnecting(&during), "{:?}", during.state);
+    assert_eq!(during.rows.len(), 1, "a failed list keeps them");
+
+    // A kind never listed: no rows to keep, and it does not claim to be loading.
+    let (_other_hub, other) = hubs.subscribe("c", &KindId::new("", "configmaps"));
+    assert!(is_reconnecting(&other.borrow()));
+    assert!(other.borrow().rows.is_empty());
+
+    // The server is back with other rows: they replace the kept ones.
+    {
+        let mut state = fake.state.lock().unwrap();
+        state.list_errors.clear();
+        state.watches.clear();
+        state.lists.insert(
+            "pods".into(),
+            VecDeque::from([pod("u2", "api", "Running", "9", true)]),
+        );
+    }
+    let back = until(&mut rx, |s| s.state == SyncState::Synced).await;
+    assert_eq!(&*back.rows[0].name, "api");
+    assert!(hubs.resume("c", &pods_id).is_none(), "the outage is over");
+}
+
+// covers UP-27: rows from one connection never show on the next, and a synced kind ends it.
+#[tokio::test]
+async fn what_an_outage_kept_goes_with_the_connection_or_a_synced_kind() {
+    let hubs = HubRegistry::default();
+    let pods_id = KindId::pods();
+    let keep = |state: SyncState| {
+        let hub = hubs.get_or_create("c", &pods_id);
+        let mut store = crate::store::Store::new(true);
+        let page = serde_json::from_value(pod("u1", "web", "Running", "5", true)).unwrap();
+        store.apply(page, false, 0);
+        hub.take_over(store.snapshot(KindSnapshot::empty("c".into(), pods_id.clone(), state)));
+        hubs.keep_for_outage("c", &pods_id, &hub);
+        hub
+    };
+    let down = SyncState::Reconnecting {
+        error: Some("dropped".into()),
+    };
+    let hub = keep(down.clone());
+    hub.take_over(KindSnapshot::empty(
+        "c".into(),
+        pods_id.clone(),
+        SyncState::Idle,
+    ));
+    assert!(hubs.resume("c", &pods_id).is_some_and(|r| r.rows.is_some()));
+
+    keep(down.clone());
+    hubs.forget_outage("c");
+    hub.take_over(KindSnapshot::empty(
+        "c".into(),
+        pods_id.clone(),
+        SyncState::Idle,
+    ));
+    assert!(hubs.resume("c", &pods_id).is_none(), "a new connection");
+
+    keep(down);
+    hub.take_over(KindSnapshot::empty(
+        "c".into(),
+        pods_id.clone(),
+        SyncState::Synced,
+    ));
+    hub.take_over(KindSnapshot::empty(
+        "c".into(),
+        pods_id.clone(),
+        SyncState::Idle,
+    ));
+    assert!(hubs.resume("c", &pods_id).is_none(), "listed again");
+}
+
 // covers UP-25
 #[tokio::test]
 async fn watch_mode_transitions() {

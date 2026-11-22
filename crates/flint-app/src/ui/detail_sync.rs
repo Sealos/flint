@@ -81,6 +81,11 @@ impl Freshness {
         &self.state
     }
 
+    /// The connection is down, so a pane with no copy says so instead of loading or failing.
+    pub(super) fn is_reconnecting(&self) -> bool {
+        matches!(self.state, SyncState::Reconnecting { error: Some(_) })
+    }
+
     /// Follows the kind to `state`. Returns whether the pane must fetch again: the kind became
     /// current while the pane was stale or held a fetch error (`holds_error`).
     pub(super) fn update(&mut self, state: SyncState, holds_error: bool) -> bool {
@@ -227,6 +232,17 @@ mod tests {
         assert!(f.update(SyncState::Synced, false), "fetches on the return");
         f.fetched(false);
         assert!(!f.is_stale());
+    }
+
+    #[test]
+    fn only_a_connection_error_counts_as_reconnecting() {
+        let down = SyncState::Reconnecting {
+            error: Some("dropped".into()),
+        };
+        assert!(Freshness::new(down).is_reconnecting());
+        for state in [reconnecting(), SyncState::Loading, SyncState::Synced] {
+            assert!(!Freshness::new(state).is_reconnecting());
+        }
     }
 
     #[test]

@@ -188,6 +188,8 @@ pub(crate) struct Engine {
     /// Limits concurrent initial lists per cluster.
     limiter: Arc<Semaphore>,
     store: Store,
+    /// The rows from before an outage, shown (never as current) until the first list lands.
+    held: Option<Arc<KindSnapshot>>,
     state: SyncState,
     feed: Feed,
     synced_once: bool,
@@ -223,6 +225,7 @@ impl Engine {
             cluster,
             id: kind.id(),
             store: Store::new(kind.namespaced).with_kind(&kind),
+            held: None,
             kind,
             namespace: None,
             scope: None,
@@ -249,6 +252,15 @@ impl Engine {
     pub fn with_scope(mut self, scope: Option<Scope>) -> Self {
         if self.kind.namespaced {
             self.scope = scope;
+        }
+        self
+    }
+
+    /// Starts from what the hub was given for an outage: its state and its rows from before.
+    pub fn resuming(mut self, resume: Option<super::hub::Resume>) -> Self {
+        if let Some(resume) = resume {
+            self.state = resume.state;
+            self.held = resume.rows;
         }
         self
     }
@@ -305,6 +317,7 @@ impl Engine {
     /// next snapshot, at the usual deadline, so a status display never reports live ahead of
     /// the rows and a view gets no extra update.
     fn set_synced(&mut self) {
+        self.held = None;
         if self.state != SyncState::Synced && self.audience() > 0 {
             self.state = SyncState::Synced;
             self.dirty = true;
@@ -364,15 +377,25 @@ impl Engine {
         if !self.hub.has_peeks() {
             return;
         }
-        self.hub.answer_peeks(self.epoch, || {
-            self.store.snapshot(KindSnapshot {
+        self.hub.answer_peeks(self.epoch, || self.build_snapshot());
+    }
+
+    /// The rows now, in the current state: those held from before an outage until a list lands.
+    fn build_snapshot(&self) -> KindSnapshot {
+        match &self.held {
+            Some(held) => KindSnapshot {
+                state: self.state.clone(),
+                feed: self.feed,
+                ..(**held).clone()
+            },
+            None => self.store.snapshot(KindSnapshot {
                 cluster: self.cluster.clone(),
                 kind: self.id.clone(),
                 state: self.state.clone(),
                 feed: self.feed,
                 ..Default::default()
-            })
-        });
+            }),
+        }
     }
 
     /// Sends a snapshot if someone listens; otherwise only a held state is recorded.
@@ -389,14 +412,7 @@ impl Engine {
         if self.audience() == 0 {
             return false;
         }
-        let base = KindSnapshot {
-            cluster: self.cluster.clone(),
-            kind: self.id.clone(),
-            state: self.state.clone(),
-            feed: self.feed,
-            ..Default::default()
-        };
-        let snapshot = self.store.snapshot(base);
+        let snapshot = self.build_snapshot();
         let sent = self.hub.publish(self.epoch, snapshot);
         self.dirty = false;
         self.last_publish = Some(Instant::now());
@@ -858,6 +874,8 @@ impl Engine {
         let Some(mut scope) = self.scope.clone() else {
             return false;
         };
+        // The server answered, with a refusal: the lanes' rows are what it allows now.
+        self.held = None;
         tracing::info!(cluster = %self.cluster, kind = %self.id,
             "not allowed in all namespaces; listing namespace by namespace");
         let reason = sync_error_text(&reason);

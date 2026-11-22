@@ -570,6 +570,35 @@ async fn a_fetched_copy_is_stale_while_the_kind_loads(cx: &mut TestAppContext) {
     wait_for_stale(cx, &t, "Still loading").await;
 }
 
+// covers UP-27: a pane with no copy says reconnecting during an outage, without a spinner or a
+// fetch error, and goes back to its own message when the connection returns.
+#[gpui_kit::test]
+async fn a_pane_without_a_copy_says_reconnecting(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_and_select(cx, &t, KindId::pods(), &[("demo", "api", 0)], "api").await;
+    wait_for_failed_fetch(cx, &t).await;
+
+    let _sync = publish_sync(
+        cx,
+        &t,
+        SyncState::Reconnecting {
+            error: Some("the connection dropped".into()),
+        },
+    );
+    cx.wait_for(t.window, WAIT, |window, _| {
+        window.try_find("detail-reconnecting").is_some()
+            && window.try_find("detail-fetch-error").is_none()
+    })
+    .await;
+
+    let _sync = publish_sync(cx, &t, SyncState::Synced);
+    cx.wait_for(t.window, WAIT, |window, _| {
+        window.try_find("detail-reconnecting").is_none()
+    })
+    .await;
+}
+
 // covers UP-20, UP-23: an outage the subscription skipped (it only saw the kind current again)
 // still retries a held error, and further updates during a lasting failure wait their turn.
 #[gpui_kit::test]

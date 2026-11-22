@@ -32,6 +32,24 @@ pub(crate) struct Hub {
     /// snapshot of its own, kept nowhere else. They are not subscribers, so they neither make
     /// the task publish, nor jump the list queue, nor keep the hub from being released.
     peeks: Mutex<Vec<oneshot::Sender<Arc<KindSnapshot>>>>,
+    /// The outage of this hub's cluster, ended by any of its kinds listing again.
+    outage: Option<OutageSlot>,
+}
+
+/// A cluster that lost its connection: the error, and the last rows of the kinds whose watches
+/// stopped meanwhile, so reopening one shows them, marked stale, instead of an empty list.
+struct Outage {
+    error: String,
+    rows: HashMap<KindId, Arc<KindSnapshot>>,
+}
+
+type OutageSlot = Arc<Mutex<Option<Outage>>>;
+
+/// What a kind starting during an outage begins from.
+pub(crate) struct Resume {
+    pub state: SyncState,
+    /// Its rows from before, if it had any.
+    pub rows: Option<Arc<KindSnapshot>>,
 }
 
 /// Snapshot versions come from one counter for the whole process, so a version never repeats
@@ -53,6 +71,7 @@ impl Hub {
             feed: Mutex::new(Feed::Watch),
             on_publish: None,
             peeks: Mutex::new(Vec::new()),
+            outage: None,
         }
     }
 
@@ -133,6 +152,7 @@ impl Hub {
         let owner = self.owner.lock().unwrap_or_else(|e| e.into_inner());
         if *owner == epoch {
             *self.state.lock().unwrap_or_else(|e| e.into_inner()) = state.clone();
+            self.end_outage_if_synced(state);
             // A merger follows the state of its lanes even while they publish no snapshots.
             if let Some(notify) = &self.on_publish {
                 notify.notify_one();
@@ -170,6 +190,7 @@ impl Hub {
         // Held across the send, so whoever reads this state finds its rows published.
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         *state = snapshot.state.clone();
+        self.end_outage_if_synced(&state);
         *self.feed.lock().unwrap_or_else(|e| e.into_inner()) = snapshot.feed;
         snapshot.version = VERSION.fetch_add(1, Ordering::Relaxed) + 1;
         self.tx.send_replace(Arc::new(snapshot));
@@ -178,19 +199,96 @@ impl Hub {
             notify.notify_one();
         }
     }
+
+    /// A kind that lists again proves the cluster is back, so what the outage kept goes.
+    fn end_outage_if_synced(&self, state: &SyncState) {
+        if *state == SyncState::Synced
+            && let Some(outage) = &self.outage
+        {
+            *outage.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    /// Makes what a new subscriber reads first agree with an outage, so it never starts on an
+    /// empty "loading" list. Only the published snapshot changes: the recorded state stays the
+    /// watch task's, so a kind nothing watches never counts as reconnecting.
+    fn show_outage(&self, error: &str, rows: Option<&Arc<KindSnapshot>>) {
+        let _owner = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+        let latest = self.latest();
+        let (base, state) = match self.state() {
+            SyncState::Idle => (
+                rows.unwrap_or(&latest),
+                SyncState::Reconnecting {
+                    error: Some(error.to_owned()),
+                },
+            ),
+            // A running watch that had nobody to publish to.
+            state @ SyncState::Reconnecting { error: Some(_) } => (&latest, state),
+            _ => return,
+        };
+        if latest.state == state {
+            return;
+        }
+        let snapshot = KindSnapshot {
+            state,
+            version: VERSION.fetch_add(1, Ordering::Relaxed) + 1,
+            ..(**base).clone()
+        };
+        self.tx.send_replace(Arc::new(snapshot));
+    }
 }
 
 type HubMap = HashMap<(ClusterId, KindId), Arc<Hub>>;
 
+#[derive(Default)]
+struct Hubs {
+    map: HubMap,
+    outages: HashMap<ClusterId, OutageSlot>,
+}
+
+impl Hubs {
+    /// The connection error of `cluster`, if it is in an outage: no kind is current and one
+    /// reports a connection error, or one did when the last watch stopped.
+    fn outage_error(&self, cluster: &str) -> Option<String> {
+        let mut live: Option<(&KindId, String)> = None;
+        for ((c, kind), hub) in &self.map {
+            if c != cluster {
+                continue;
+            }
+            match hub.state() {
+                SyncState::Synced => return None,
+                SyncState::Reconnecting { error: Some(error) }
+                    if live.as_ref().is_none_or(|(k, _)| kind < *k) =>
+                {
+                    live = Some((kind, error));
+                }
+                _ => {}
+            }
+        }
+        live.map(|(_, error)| error).or_else(|| {
+            let slot = self.outages.get(cluster)?;
+            let outage = slot.lock().unwrap_or_else(|e| e.into_inner());
+            outage.as_ref().map(|o| o.error.clone())
+        })
+    }
+
+    /// The rows the outage kept for `kind`.
+    fn kept_rows(&self, cluster: &str, kind: &KindId) -> Option<Arc<KindSnapshot>> {
+        let slot = self.outages.get(cluster)?;
+        let outage = slot.lock().unwrap_or_else(|e| e.into_inner());
+        outage.as_ref()?.rows.get(kind).cloned()
+    }
+}
+
 /// Every hub of a core, shared between the manager (which starts and stops watches) and the
 /// front-end handle (which subscribes synchronously).
 #[derive(Clone, Default)]
-pub(crate) struct HubRegistry(Arc<Mutex<HubMap>>);
+pub(crate) struct HubRegistry(Arc<Mutex<Hubs>>);
 
 impl HubRegistry {
     pub fn get_or_create(&self, cluster: &str, kind: &KindId) -> Arc<Hub> {
-        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        entry(&mut map, cluster, kind)
+        let mut hubs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        entry(&mut hubs, cluster, kind)
     }
 
     /// Subscribes under the registry lock, so [`HubRegistry::release`] cannot drop the hub in
@@ -200,22 +298,68 @@ impl HubRegistry {
         cluster: &str,
         kind: &KindId,
     ) -> (Arc<Hub>, watch::Receiver<Arc<KindSnapshot>>) {
-        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let hub = entry(&mut map, cluster, kind);
+        let mut hubs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let hub = entry(&mut hubs, cluster, kind);
+        if let Some(error) = hubs.outage_error(cluster) {
+            hub.show_outage(&error, hubs.kept_rows(cluster, kind).as_ref());
+        }
         let rx = hub.subscribe();
         (hub, rx)
+    }
+
+    /// Keeps the last rows of a kind whose watch is stopping, if its cluster is in an outage.
+    /// Call it before the hub's rows are replaced.
+    pub fn keep_for_outage(&self, cluster: &str, kind: &KindId, hub: &Hub) {
+        let latest = hub.latest();
+        let mut hubs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(error) = hubs.outage_error(cluster) else {
+            return;
+        };
+        let slot = hubs.outages.entry(cluster.to_owned()).or_default();
+        let mut outage = slot.lock().unwrap_or_else(|e| e.into_inner());
+        let outage = outage.get_or_insert_with(|| Outage {
+            error: String::new(),
+            rows: HashMap::new(),
+        });
+        outage.error = error;
+        if !latest.rows.is_empty() {
+            outage.rows.insert(kind.clone(), latest);
+        }
+    }
+
+    /// What `kind` starts from if its cluster is in an outage. Its kept rows move to the caller.
+    pub fn resume(&self, cluster: &str, kind: &KindId) -> Option<Resume> {
+        let hubs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let error = hubs.outage_error(cluster)?;
+        let rows = hubs.outages.get(cluster).and_then(|slot| {
+            let mut outage = slot.lock().unwrap_or_else(|e| e.into_inner());
+            outage.as_mut()?.rows.remove(kind)
+        });
+        Some(Resume {
+            state: SyncState::Reconnecting { error: Some(error) },
+            rows,
+        })
+    }
+
+    /// Drops what an outage kept: the cluster has a new connection, or none.
+    pub fn forget_outage(&self, cluster: &str) {
+        let hubs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = hubs.outages.get(cluster) {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
     }
 
     /// The sync state of every kind of `cluster` that has a hub (watched, polled, or
     /// subscribed), without subscribing. Sorted by kind.
     pub fn states(&self, cluster: &str) -> Vec<(KindId, SyncState)> {
-        let map = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let mut states: Vec<_> = map
+        let hubs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut states: Vec<_> = hubs
+            .map
             .iter()
             .filter(|((c, _), _)| c == cluster)
             .map(|((_, kind), hub)| (kind.clone(), hub.state()))
             .collect();
-        drop(map);
+        drop(hubs);
         states.sort_by(|a, b| a.0.cmp(&b.0));
         states
     }
@@ -232,8 +376,9 @@ impl HubRegistry {
     /// release do not change. A kind that does not answer within `wait` is left out.
     pub async fn stored(&self, cluster: &str, wait: std::time::Duration) -> Vec<Arc<KindSnapshot>> {
         let hubs: Vec<Arc<Hub>> = {
-            let map = self.0.lock().unwrap_or_else(|e| e.into_inner());
-            map.iter()
+            let hubs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            hubs.map
+                .iter()
                 .filter(|((c, _), hub)| {
                     c == cluster
                         && matches!(
@@ -269,17 +414,24 @@ impl HubRegistry {
 
     /// Forgets a hub nobody reads. Only call it for kinds no task is running for.
     pub fn release(&self, cluster: &str, kind: &KindId) {
-        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hubs = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let key = (cluster.to_owned(), kind.clone());
-        if map.get(&key).is_some_and(|h| h.listeners() == 0) {
-            map.remove(&key);
+        if hubs.map.get(&key).is_some_and(|h| h.listeners() == 0) {
+            hubs.map.remove(&key);
         }
     }
 }
 
-fn entry(map: &mut HubMap, cluster: &str, kind: &KindId) -> Arc<Hub> {
-    map.entry((cluster.to_owned(), kind.clone()))
-        .or_insert_with(|| Arc::new(Hub::new(cluster.to_owned(), kind.clone())))
+fn entry(hubs: &mut Hubs, cluster: &str, kind: &KindId) -> Arc<Hub> {
+    let outage = hubs.outages.entry(cluster.to_owned()).or_default().clone();
+    hubs.map
+        .entry((cluster.to_owned(), kind.clone()))
+        .or_insert_with(|| {
+            Arc::new(Hub {
+                outage: Some(outage),
+                ..Hub::new(cluster.to_owned(), kind.clone())
+            })
+        })
         .clone()
 }
 
@@ -379,7 +531,8 @@ mod tests {
                 .await
                 .is_empty()
         );
-        let map = registry.0.lock().unwrap();
+        let hubs = registry.0.lock().unwrap();
+        let map = &hubs.map;
         assert_eq!(
             map.len(),
             2,
