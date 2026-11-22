@@ -1467,14 +1467,28 @@ fn daemon_sets_are_classified() {
             "placing on a new node",
             none(),
             ROLLING,
-            json!({"currentNumberScheduled": 2}),
-            false,
+            json!({"currentNumberScheduled": 2, "updatedNumberScheduled": 2, "numberReady": 2}),
+            true,
         ),
         (
             "rolling out",
             none(),
             ROLLING,
             json!({"updatedNumberScheduled": 1}),
+            false,
+        ),
+        (
+            "rolling out while a node has no pod",
+            none(),
+            ROLLING,
+            json!({"currentNumberScheduled": 2, "updatedNumberScheduled": 1}),
+            false,
+        ),
+        (
+            "OnDelete with a node missing a pod",
+            none(),
+            "OnDelete",
+            json!({"currentNumberScheduled": 2, "updatedNumberScheduled": 1}),
             false,
         ),
         (
@@ -1516,6 +1530,9 @@ fn daemon_sets_are_classified() {
     for (name, meta, strategy, status, expected) in cases {
         let got = classifier().daemon_set(&daemon_set(meta, strategy, status));
         assert_eq!(got.is_some(), expected, "{name}");
+        if let Some(problem) = got {
+            assert_eq!(problem.hold_down(), Some(WORKLOAD_HOLD_DOWN), "{name}");
+        }
     }
 }
 

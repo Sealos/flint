@@ -306,7 +306,9 @@ impl Problem {
     }
 
     /// How long this id must stay present across passes before it is worth alerting on, when the
-    /// object's status has no time to judge that from. The caller tracks when it first saw the id.
+    /// object's status has no time to judge that from. The caller tracks when it first saw the id
+    /// and must apply this: a DaemonSet placing a pod on a new node looks the same as one whose
+    /// pod admission rejects, and only the hold-down tells them apart.
     pub fn hold_down(&self) -> Option<SignedDuration> {
         matches!(
             self.id.subject,
@@ -580,11 +582,18 @@ impl Classifier {
 
     /// The problem of one DaemonSet, if it has settled short of ready pods.
     ///
-    /// Pods still being placed, such as on a new node, and a rolling update are not reported.
+    /// A rolling update is not reported. Neither is a set whose pods lag the template while some
+    /// nodes have none, since `OnDelete` or a rollout may be the cause.
+    ///
+    /// A missing pod is reported when every existing pod is on the current revision. A normal
+    /// placement on a new node has the same status as one admission keeps rejecting, so callers
+    /// must apply [`Problem::hold_down`] before alerting on it.
     pub fn daemon_set(&self, set: &DaemonSet) -> Option<Problem> {
         let meta = &set.metadata;
         let status = set.status.as_ref()?;
         let desired = status.desired_number_scheduled;
+        let current = status.current_number_scheduled;
+        let updated = status.updated_number_scheduled.unwrap_or(0);
         let on_delete = set
             .spec
             .update_strategy
@@ -592,8 +601,8 @@ impl Classifier {
             .is_some_and(|strategy| strategy.type_.as_deref() == Some(ON_DELETE));
         if !self.may_be_short(meta, desired, status.observed_generation)
             || status.number_ready >= desired
-            || status.current_number_scheduled < desired
-            || (!on_delete && status.updated_number_scheduled.unwrap_or(0) < desired)
+            || (current < desired && updated < current)
+            || (current >= desired && !on_delete && updated < desired)
         {
             return None;
         }
