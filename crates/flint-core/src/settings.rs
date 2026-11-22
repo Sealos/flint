@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::cluster_sets::{self, ClusterSet};
 use crate::thresholds::{self, ThresholdMetric, ThresholdSettings, Thresholds};
 
 pub const SETTINGS_FILE: &str = "settings.toml";
@@ -352,6 +353,14 @@ pub struct Settings {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub cluster_tags: Vec<TaggedCluster>,
+    /// Named sets of 2 to 5 clusters (ADR-0014), each member pinned to context and server. An
+    /// entry this version cannot use is left out, and stays in the file. Change them through
+    /// [`crate::cluster_sets`].
+    #[serde(
+        deserialize_with = "crate::cluster_sets::readable_cluster_sets",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub cluster_sets: Vec<ClusterSet>,
     /// Dashboard warning thresholds (ADR-0017): global values and overrides per context and
     /// server. Read them through [`Settings::thresholds_for`]. A value this version cannot use
     /// falls back on its own and is logged when the file loads.
@@ -384,6 +393,7 @@ impl Default for Settings {
             cluster_watch_mode: BTreeMap::new(),
             cluster_names: BTreeMap::new(),
             cluster_tags: Vec::new(),
+            cluster_sets: Vec::new(),
             thresholds: ThresholdSettings::default(),
             log_buffer_lines: DEFAULT_LOG_BUFFER_LINES,
             log_buffer_mib: DEFAULT_LOG_BUFFER_MIB,
@@ -641,6 +651,12 @@ pub fn load_settings(dir: &Path) -> Result<Settings, SettingsError> {
             tracing::warn!("settings.toml: {issue}");
         }
     }
+    if let Some(sets) = table.get(cluster_sets::SECTION_KEY) {
+        let ignored = cluster_sets::ignored_entries(sets);
+        if ignored > 0 {
+            tracing::warn!("settings.toml: ignoring {ignored} unusable cluster_sets entries");
+        }
+    }
     Ok(settings)
 }
 
@@ -697,6 +713,7 @@ const SETTINGS_KEYS: &[&str] = &[
     "cluster_watch_mode",
     "cluster_names",
     "cluster_tags",
+    cluster_sets::SECTION_KEY,
     thresholds::SECTION_KEY,
     "log_buffer_lines",
     "log_buffer_mib",
@@ -1160,33 +1177,45 @@ pub fn set_log_buffer_mib(dir: &Path, mib: u32) -> Result<Settings, SettingsErro
 /// The read, the edit and the write happen under [`SaveLock`], so saves from several Flint
 /// processes apply one after another, each to what the last one wrote. This can wait up to
 /// [`SAVE_LOCK_WAIT`]: call it off the UI thread and off async workers.
-fn edit_settings(
+pub(crate) fn edit_settings(
     dir: &Path,
     edit: impl FnOnce(&mut toml::Table, &Path) -> Result<(), SettingsError>,
+) -> Result<Settings, SettingsError> {
+    edit_settings_if_changed(dir, |table, path| edit(table, path).map(|()| true))
+}
+
+/// [`edit_settings`] for an edit that may find nothing to do once it holds the lock: when `edit`
+/// returns `false`, the file is not written, or created, and the settings it holds are returned.
+pub(crate) fn edit_settings_if_changed(
+    dir: &Path,
+    edit: impl FnOnce(&mut toml::Table, &Path) -> Result<bool, SettingsError>,
 ) -> Result<Settings, SettingsError> {
     let path = dir.join(SETTINGS_FILE);
     let lock = lock_for_save(&path, try_flock)?;
     edit_locked(&path, &lock, edit)
 }
 
-/// The read, edit and write of [`edit_settings`], all on the file `lock` was taken for. If
-/// `path` has come to lead elsewhere by the time of the write, nothing is written.
+/// The read, edit and write of [`edit_settings_if_changed`], all on the file `lock` was taken
+/// for. If `path` has come to lead elsewhere by the time of the write, nothing is written.
 fn edit_locked(
     path: &Path,
     lock: &SaveLock,
-    edit: impl FnOnce(&mut toml::Table, &Path) -> Result<(), SettingsError>,
+    edit: impl FnOnce(&mut toml::Table, &Path) -> Result<bool, SettingsError>,
 ) -> Result<Settings, SettingsError> {
     let mut table = match read_settings_text(&lock.target)? {
         Some(text) => parse_settings(&text, path)?.1,
         None => toml::Table::new(),
     };
-    edit(&mut table, path)?;
+    let changed = edit(&mut table, path)?;
     let text = toml::to_string_pretty(&table)?;
     let settings: Settings = toml::from_str(&text).map_err(|source| SettingsError::Parse {
         path: path.to_owned(),
         source,
     })?;
     validate(&settings, path)?;
+    if !changed {
+        return Ok(settings);
+    }
     let write_error = |source| SettingsError::Write {
         path: path.to_owned(),
         source,
@@ -1722,7 +1751,7 @@ mod save_lock_tests {
             std::fs::remove_file(&link).unwrap();
             std::os::unix::fs::symlink(&new, &link).unwrap();
             table.insert("appearance".into(), "dark".into());
-            Ok(())
+            Ok(true)
         });
         assert!(matches!(result, Err(SettingsError::Write { .. })));
         assert_eq!(std::fs::read_to_string(&old).unwrap(), old_text);
@@ -1747,7 +1776,7 @@ mod save_lock_tests {
             assert!(lock.file.is_none());
             edit_locked(&path, &lock, |table, _| {
                 table.remove("trusted_clusters");
-                Ok(())
+                Ok(true)
             })
             .unwrap();
             assert!(
