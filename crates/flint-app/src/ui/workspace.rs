@@ -28,7 +28,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::closing;
-use super::clusters::{ClustersModel, Presence, reconnecting_text, state_label};
+use super::clusters::{ClustersModel, Presence, cluster_details, cluster_tooltip};
 use super::confirm::{self, DialogText};
 use super::detail::{
     DetailEvent, DetailTab, DetailView, ObjectRef, Opening, TakeFocus, protected_reason, refused,
@@ -1319,7 +1319,12 @@ impl Workspace {
             let ring = cursor.as_deref() == Some(cluster.info.name.as_str());
             list = list.child(self.render_cluster_row(
                 cluster,
-                (is_active, ring, presence),
+                (
+                    is_active,
+                    ring,
+                    presence,
+                    cluster_details(model, cluster, states),
+                ),
                 exposure,
                 protection,
                 (settings_ok, &names),
@@ -1392,8 +1397,9 @@ impl Workspace {
     fn render_cluster_row(
         &self,
         cluster: &ClusterSummary,
-        // Whether it is the active cluster, and whether the sidebar's cursor is on it.
-        (is_active, ring, presence): (bool, bool, Presence<'_>),
+        // Whether it is the active cluster, whether the sidebar's cursor is on it, its presence
+        // and its full description.
+        (is_active, ring, presence, tooltip): (bool, bool, Presence<'_>, String),
         (exposure, ai_scope): (AiExposureState, Option<AiScope>),
         (protection, trust): (Protection, TrustState),
         (settings_ok, names): (bool, &ClusterNames),
@@ -1405,39 +1411,6 @@ impl Workspace {
         // With a custom name, it starts with the real one: the row always says which cluster.
         let host = cluster.info.server.as_deref().map(shown_host);
         let subtitle = names.subtitle(&name, host.as_deref());
-        let state_text = match (presence, &cluster.state) {
-            (Presence::Reconnecting { error }, _) => reconnecting_text(error),
-            (Presence::Idle, ConnectionState::Connected(v)) => format!(
-                "Connected, Kubernetes {}. Idle: not watched while another cluster is active",
-                v.git_version
-            ),
-            (_, ConnectionState::Connected(v)) => {
-                format!("Connected, Kubernetes {}", v.git_version)
-            }
-            (_, ConnectionState::Failed(message)) => format!("Connection failed: {message}"),
-            (_, other) => state_label(other).to_owned(),
-        };
-        let exposure_text = match &exposure {
-            AiExposureState::Hidden => "Hidden from AI agents".to_owned(),
-            AiExposureState::Exposed => format!(
-                "Exposed to AI agents (flint mcp, read-only): {}",
-                scope_picker::summary(&ai_scope.clone().unwrap_or_default())
-            ),
-            AiExposureState::ServerChanged { exposed_server } => format!(
-                "Cluster changed: exposed at {}, now points elsewhere. Hidden from AI agents \
-                 until you expose it again.",
-                flint_core::redact::server_url(exposed_server)
-            ),
-        };
-        let hover_text = format!(
-            "{}\n{}\n{}\n{}\n{}\nfrom {}",
-            name,
-            server_text(server.as_deref()),
-            state_text,
-            protection_text(protection, &trust),
-            exposure_text,
-            cluster.info.source.display()
-        );
         let changed = matches!(exposure, AiExposureState::ServerChanged { .. });
         let dot = presence
             .marker(theme)
@@ -1445,7 +1418,7 @@ impl Workspace {
             .flex_none()
             .test_support();
 
-        let tooltip = hover_text.clone();
+        let tip = (name.clone(), self.model.clone(), self.nav.clone());
         let rename = name.clone();
         let control_title = control_name(&title, &name);
         let row = h_flex()
@@ -1472,7 +1445,7 @@ impl Workspace {
             // Every row has the border, so the ring moving shifts nothing.
             .border_1()
             .border_color(super::theme::cursor_ring(theme, ring))
-            .tooltip(move |window, cx| Tooltip::new(hover_text.clone()).build(window, cx))
+            .tooltip(move |_, cx| cluster_tooltip(tip.0.clone(), &tip.1, &tip.2, cx))
             .on_click(registry::on_click(SelectCluster {
                 cluster: name.clone(),
             }))
@@ -2311,7 +2284,7 @@ impl Workspace {
 }
 
 /// What a cluster's protection is, in its row's tooltip.
-fn protection_text(protection: Protection, trust: &TrustState) -> String {
+pub(super) fn protection_text(protection: Protection, trust: &TrustState) -> String {
     let text = match protection {
         Protection::Protected => "Protected: read-only in Flint until you unlock or trust it",
         Protection::Local => "On this machine: unlocked",

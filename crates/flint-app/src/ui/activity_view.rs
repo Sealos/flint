@@ -134,35 +134,13 @@ fn time(at_ms: i64, tz: &TimeZone, today: jiff::civil::Date) -> String {
 /// row or pass itself off as another one. A backslash is doubled, so an escape and the same
 /// characters written by the agent read differently. Everything else is kept.
 fn shown(text: &str) -> String {
-    fn hidden(c: char) -> bool {
-        matches!(
-            c,
-            '\u{00ad}'
-                | '\u{034f}'
-                | '\u{061c}'
-                | '\u{115f}'..='\u{1160}'
-                | '\u{17b4}'..='\u{17b5}'
-                | '\u{180b}'..='\u{180f}'
-                | '\u{200b}'..='\u{200f}'
-                | '\u{2028}'..='\u{202e}'
-                | '\u{2060}'..='\u{206f}'
-                | '\u{3164}'
-                | '\u{fe00}'..='\u{fe0f}'
-                | '\u{feff}'
-                | '\u{ffa0}'
-                | '\u{fff9}'..='\u{fffb}'
-                | '\u{1bca0}'..='\u{1bca3}'
-                | '\u{1d173}'..='\u{1d17a}'
-                | '\u{e0000}'..='\u{e0fff}'
-        )
-    }
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         if c == '\\' {
             out.push_str("\\\\");
         } else if c.is_control() {
             out.extend(c.escape_default());
-        } else if hidden(c) {
+        } else if activity::is_invisible(c) {
             out.extend(c.escape_unicode());
         } else {
             out.push(c);
@@ -613,6 +591,9 @@ mod tests {
             '\u{2029}',
             '\u{206a}',
             '\u{3164}',
+            '\u{0600}',
+            '\u{06dd}',
+            '\u{110bd}',
             '\u{e0041}',
         ] {
             assert_eq!(
