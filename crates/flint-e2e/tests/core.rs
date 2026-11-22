@@ -2429,7 +2429,10 @@ async fn a_pause_ending_on_the_same_definition_tells_a_quiet_watch() {
     let mut pods = core.handle.subscribe(CONTEXT, &KindId::pods());
     let synced = until(&mut pods, "synced", |s| s.state == SyncState::Synced).await;
     let kind = KindId::pods();
-    let fetch = || core.handle.fetch_object(CONTEXT, &kind, Some("demo"), "web");
+    let fetch = || {
+        core.handle
+            .fetch_object(CONTEXT, &kind, Some("demo"), "web")
+    };
     fetch().await.expect("connected");
 
     break_kubeconfig(&core, &file).await;

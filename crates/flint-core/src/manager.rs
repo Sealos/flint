@@ -5194,7 +5194,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut manager, _, first) = pausable(dir.path(), NO_CONTEXTS).await;
         let old = manager.cluster("dev").unwrap().generation;
-        rewrite_file(&mut manager, &first, &kubeconfig_with("https://127.0.0.1:2")).await;
+        rewrite_file(
+            &mut manager,
+            &first,
+            &kubeconfig_with("https://127.0.0.1:2"),
+        )
+        .await;
         let current = manager.cluster("dev").unwrap().generation;
         assert_ne!(old, current);
         let listed = |generation, name: &str| Internal::NamespacesListed {
