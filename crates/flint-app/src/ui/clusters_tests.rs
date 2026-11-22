@@ -3,16 +3,19 @@
 //! [`ClustersModel`].
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use flint_core::settings::AiExposureState;
-use flint_core::{ConnectionState, Event, Settings};
-use gpui_kit::test::TestAppContextExt as _;
-use gpui_kit::{Context, TestAppContext};
+use flint_core::{ConnectionState, Event, KindId, Settings, SyncState};
+use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
+use gpui_kit::{AppContext as _, Context, TestAppContext};
 use serde_json::json;
 
 use super::ClustersModel;
 use crate::ui::registry::ActionError;
-use crate::ui::support_tests::{WAIT, kubeconfig_yaml, open_workspace, open_workspace_with};
+use crate::ui::support_tests::{
+    WAIT, kubeconfig_yaml, open_workspace, open_workspace_with, standard_sections,
+};
 
 /// Test hook: feeds an event in as the core's event stream does (`support_tests.rs`).
 impl ClustersModel {
@@ -264,5 +267,43 @@ async fn a_malformed_settings_file_shows_a_banner_and_disables_the_toggles(
     assert_ne!(
         t.find(cx, "expose-kind-beta").unwrap().disabled(),
         Some(true)
+    );
+}
+
+// An open tooltip follows the row: with the pointer resting on it through an outage and the
+// recovery, it says what the row's dot says, and a routine relist does not read as trouble.
+#[gpui_kit::test]
+async fn an_open_tooltip_follows_the_clusters_presence(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    cx.update_window(t.window, |_, window, cx| {
+        let row = window.find("cluster-kind-alpha").bounds();
+        window.simulate_mouse_move(row.center(), cx);
+    })
+    .unwrap();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    t.wait_for_element(cx, "cluster-tooltip").await;
+
+    let nav = t.workspace.read_with(cx, |w, _| w.nav_view());
+    let mut shows = |state: SyncState, wanted: &str| {
+        nav.update(cx, |nav, cx| {
+            nav.set_states(vec![(KindId::pods(), state)], cx);
+        });
+        cx.run_until_parked();
+        let tip = t.label(cx, "cluster-tooltip").unwrap();
+        assert!(tip.contains(wanted), "{wanted:?} in {tip}");
+        let row = t.description(cx, "cluster-kind-alpha").unwrap();
+        assert_eq!(tip, row, "the tooltip and the row's description agree");
+    };
+    let trouble = SyncState::Reconnecting {
+        error: Some("timed out".into()),
+    };
+    shows(trouble, "\nReconnecting: timed out\n");
+    shows(SyncState::Synced, "\nConnected, Kubernetes v1.33.1\n");
+    shows(
+        SyncState::Reconnecting { error: None },
+        "\nConnected, Kubernetes v1.33.1\n",
     );
 }
