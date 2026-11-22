@@ -2,7 +2,7 @@
 //! tooltip; these only decide what fits in a row. Front ends share them, so the sidebar, the
 //! command palette, and any CLI name clusters the same way.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use crate::kubeconfig::ContextInfo;
@@ -54,6 +54,98 @@ pub fn short_name(context: &str) -> String {
         Some(arn) => middle_truncate(arn.name, MAX_NAME_CHARS),
         None => middle_truncate(context, MAX_NAME_CHARS),
     }
+}
+
+/// `name` as one line of text that reads as what it is: line breaks, other control characters, and
+/// bidirectional or invisible characters are written as `\u{...}` escapes, and a backslash is
+/// doubled so two different names never read the same. Only for display: identity and every
+/// decision keep the raw name.
+pub fn single_line(name: &str) -> String {
+    let mut shown = String::with_capacity(name.len());
+    for c in name.chars() {
+        match c {
+            '\\' => shown.push_str("\\\\"),
+            c if draws_misleadingly(c) => shown.extend(c.escape_unicode()),
+            c => shown.push(c),
+        }
+    }
+    shown
+}
+
+/// Whether `c` breaks the line, reorders the text around it, or draws nothing.
+fn draws_misleadingly(c: char) -> bool {
+    c.is_control()
+        || (c.is_whitespace() && c != ' ')
+        || matches!(
+            c,
+            '\u{ad}'
+                | '\u{34f}'
+                | '\u{61c}'
+                | '\u{115f}'
+                | '\u{1160}'
+                | '\u{17b4}'
+                | '\u{17b5}'
+                | '\u{180b}'..='\u{180f}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{3164}'
+                | '\u{fe00}'..='\u{fe0f}'
+                | '\u{feff}'
+                | '\u{ffa0}'
+                | '\u{fff0}'..='\u{fffb}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0000}'..='\u{e0fff}'
+        )
+}
+
+/// [`short_name`] of a context as one line ([`single_line`]).
+fn short_single_line(context: &str) -> String {
+    short_name(&single_line(context))
+}
+
+/// The next, longer way to tell `context` from a sibling that reads like `label`: an EKS cluster's
+/// region and account, then the whole context name.
+fn more_of_real_name(context: &str, label: &str) -> String {
+    let full = single_line(context);
+    let short = short_name(&full);
+    match parse_eks_arn(&full) {
+        Some(arn) if label == short => format!("{short} · {} · {}", arn.region, arn.account),
+        _ => full,
+    }
+}
+
+/// The contexts whose [`short_single_line`] reads like another's, each with a label that does not.
+/// Labels only grow, so this ends; a context that is alone in its name is not in the result.
+fn sibling_labels(contexts: &[&str]) -> HashMap<String, String> {
+    let unique: BTreeSet<&str> = contexts.iter().copied().collect();
+    let mut labels: Vec<(&str, String)> = unique
+        .into_iter()
+        .map(|context| (context, short_single_line(context)))
+        .collect();
+    loop {
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        for (_, label) in &labels {
+            *uses.entry(cluster_name_key(label)).or_default() += 1;
+        }
+        let mut changed = false;
+        for (context, label) in &mut labels {
+            if uses[&cluster_name_key(label)] > 1 {
+                let next = more_of_real_name(context, label);
+                changed |= next != *label;
+                *label = next;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    labels
+        .into_iter()
+        .filter(|(context, label)| *label != short_single_line(context))
+        .map(|(context, label)| (context.to_owned(), label))
+        .collect()
 }
 
 /// How much of a custom name is shown before the real one, so the real one always fits.
@@ -168,6 +260,8 @@ fn latin_look_alike(c: char) -> char {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClusterNames {
     custom: HashMap<String, String>,
+    /// Real names of contexts that share a short name, told apart ([`sibling_labels`]).
+    siblings: HashMap<String, String>,
 }
 
 impl ClusterNames {
@@ -196,7 +290,10 @@ impl ClusterNames {
             .filter(|(context, name)| !reads_like_another(context, name))
             .map(|(context, name)| ((*context).to_owned(), name.clone()))
             .collect();
-        ClusterNames { custom }
+        ClusterNames {
+            custom,
+            siblings: sibling_labels(&contexts),
+        }
     }
 
     /// The custom name of `context`, if it has a usable one.
@@ -212,16 +309,18 @@ impl ClusterNames {
         }
     }
 
-    /// [`ClusterNames::of`], followed by the real short name when a custom name is shown: for
-    /// anything that protects or unlocks a cluster, where a name must not hide which one it is.
+    /// [`ClusterNames::of`], followed by the real name when a custom name is shown: for anything
+    /// that protects, unlocks or changes a cluster, where a name must not hide which one it is.
+    /// The real name is one line, and says more when another context shares its short name.
     pub fn with_real(&self, context: &str) -> String {
+        let real = self
+            .siblings
+            .get(context)
+            .cloned()
+            .unwrap_or_else(|| short_single_line(context));
         match self.custom(context) {
-            Some(name) => format!(
-                "{} ({})",
-                middle_truncate(name, MAX_NAME_BESIDE_REAL),
-                short_name(context)
-            ),
-            None => short_name(context),
+            Some(name) => format!("{} ({real})", middle_truncate(name, MAX_NAME_BESIDE_REAL)),
+            None => real,
         }
     }
 
@@ -448,6 +547,81 @@ mod tests {
         // A hand-edited name that is not valid is not shown.
         let shown = ClusterNames::new(["a"], &names(&[("a", "b\u{202e}c")]));
         assert_eq!(shown.of("a"), "a");
+    }
+
+    // covers UP-01, UP-55
+    #[test]
+    fn contexts_with_one_short_name_read_differently_where_it_matters() {
+        let eu = "arn:aws:eks:eu-west-1:111111111111:cluster/payments-prod";
+        let us = "arn:aws:eks:us-east-1:222222222222:cluster/payments-prod";
+        let shown = ClusterNames::new([eu, us, "kind-dev"], &BTreeMap::new());
+        assert_eq!(
+            shown.with_real(eu),
+            "payments-prod · eu-west-1 · 111111111111"
+        );
+        assert_eq!(
+            shown.with_real(us),
+            "payments-prod · us-east-1 · 222222222222"
+        );
+        assert_eq!(shown.with_real("kind-dev"), "kind-dev");
+        // The compact name does not change.
+        assert_eq!(shown.of(eu), "payments-prod");
+
+        // Same region and account in two partitions: only the whole name differs.
+        let cn = "arn:aws-cn:eks:eu-west-1:111111111111:cluster/payments-prod";
+        let shown = ClusterNames::new([eu, cn], &BTreeMap::new());
+        assert_eq!(shown.with_real(eu), eu);
+        assert_eq!(shown.with_real(cn), cn);
+
+        // Long names cut to the same text show in full.
+        let one = format!("gke_{}_one_{}", "x".repeat(30), "y".repeat(30));
+        let two = format!("gke_{}_two_{}", "x".repeat(30), "y".repeat(30));
+        let shown = ClusterNames::new([one.as_str(), two.as_str()], &BTreeMap::new());
+        assert_eq!(shown.with_real(&one), one);
+        assert_eq!(shown.with_real(&two), two);
+
+        // A custom name keeps the told-apart real name beside it.
+        let shown = ClusterNames::new([eu, us], &names(&[(eu, "main")]));
+        assert_eq!(
+            shown.with_real(eu),
+            "main (payments-prod · eu-west-1 · 111111111111)"
+        );
+    }
+
+    // covers UP-55
+    #[test]
+    fn a_name_is_shown_on_one_line_without_hidden_characters() {
+        assert_eq!(single_line("staging\nServer: x"), "staging\\u{a}Server: x");
+        for raw in [
+            "a\r\nb",
+            "a\u{85}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "a\u{202e}b",
+            "a\u{2066}b",
+            "a\u{200b}b",
+            "a\u{feff}b",
+            "a\u{e0041}b",
+        ] {
+            let shown = single_line(raw);
+            assert!(shown.is_ascii() && shown.lines().count() == 1, "{shown:?}");
+        }
+        // Ordinary names, in any script, stay as they are.
+        for plain in [
+            "kind-dev",
+            "arn:aws:eks:r:1:cluster/a",
+            "a b",
+            "本番",
+            "север",
+        ] {
+            assert_eq!(single_line(plain), plain);
+        }
+        // A name that spells out an escape does not read as the name holding that character.
+        assert_ne!(single_line("a\\u{a}b"), single_line("a\nb"));
+        // The short form is bounded and on one line too.
+        let long = "x\n".repeat(100);
+        assert_eq!(short_single_line(&long).chars().count(), MAX_NAME_CHARS);
+        assert_eq!(short_single_line(&long).lines().count(), 1);
     }
 
     // covers UP-01

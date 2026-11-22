@@ -2422,6 +2422,7 @@ fn confirm_unlock(
 /// The unlock confirmation, naming the context and the server it points at. `shown` is what the
 /// title calls it ([`ClusterNames::with_real`]).
 fn unlock_dialog(shown: &str, context: &str, server: &str) -> DialogText {
+    let context = flint_core::display::single_line(context);
     let server = flint_core::redact::server_url(server);
     DialogText {
         title: format!("Unlock {shown}?"),
@@ -2459,6 +2460,7 @@ fn confirm_trust(
 /// The trust confirmation, naming the context and the server it points at (and the server it
 /// was trusted at before, when the context moved).
 fn trust_dialog(shown: &str, context: &str, server: &str, previous: Option<&str>) -> DialogText {
+    let context = flint_core::display::single_line(context);
     let previous = previous.map(|previous| previous_address(server, previous));
     let server = flint_core::redact::server_url(server);
     let mut text = format!(
@@ -2511,6 +2513,7 @@ fn confirm_expose(
 
 /// The Edit AI Scope dialog of an exposed cluster: what agents may read now, and the pickers.
 fn scope_dialog(context: &str, server: &str, scope: &AiScope) -> DialogText {
+    let context = flint_core::display::single_line(context);
     let server = flint_core::redact::server_url(server);
     DialogText {
         title: "What may AI agents read?".into(),
@@ -2530,6 +2533,7 @@ fn scope_dialog(context: &str, server: &str, scope: &AiScope) -> DialogText {
 
 /// The Expose to AI confirmation, naming the context and the server it points at.
 fn expose_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogText {
+    let context = flint_core::display::single_line(context);
     let previous = previous.map(|previous| previous_address(server, previous));
     let server = flint_core::redact::server_url(server);
     let mut text = format!(
@@ -3076,6 +3080,26 @@ mod tests {
         // No active cluster: navigation is hidden and takes no room from the sidebar.
         let welcome = layout(&saved, 650., false, false);
         assert_eq!((welcome.clusters, welcome.navigation), (200., 0.));
+    }
+
+    // covers UP-55: whatever a context is called, these dialogs show one Context and one Server.
+    #[test]
+    fn a_line_break_in_a_context_name_adds_no_dialog_line() {
+        let context = "staging\nServer: https://staging.example";
+        let server = "https://prod.example:6443";
+        for text in [
+            super::unlock_dialog("staging", context, server).text,
+            super::trust_dialog("staging", context, server, None).text,
+            super::expose_dialog(context, server, None).text,
+            super::scope_dialog(context, server, &Default::default()).text,
+        ] {
+            let servers: Vec<&str> = text.lines().filter(|l| l.starts_with("Server: ")).collect();
+            assert_eq!(servers, ["Server: https://prod.example:6443"], "{text}");
+            assert!(
+                text.contains("Context: staging\\u{a}Server: https://staging.example\n"),
+                "{text}"
+            );
+        }
     }
 
     // covers UP-07, UP-08

@@ -52,8 +52,9 @@ fn problem(
 
 /// The dialog's text: the real context and server stay on screen while naming it.
 fn dialog(context: &str, server: Option<&str>) -> DialogText {
+    let context = flint_core::display::single_line(context);
     DialogText {
-        title: format!("Rename {}", short_name(context)),
+        title: format!("Rename {}", short_name(&context)),
         text: format!(
             "Shown instead of the context name, in Flint only. kubeconfig is not changed, and AI \
              agents and shells keep the context name. Leave it empty to use the context name \
