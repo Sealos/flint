@@ -4,9 +4,10 @@
 //!
 //! The log paths are in `m2.rs`. Not here, and why:
 //!
-//! - **Resizing the window** (UP-41): the automation channel cannot resize the window. The dock's
-//!   height (`workspace::SetDockHeight`) and the side panes' widths (`workspace::SetPaneWidth`)
-//!   resize the terminal through the same layout, and are tested.
+//! - **Resizing the window with a shell open** (UP-41): the tests set the window's size once,
+//!   before the dock's height matters. The dock's height (`workspace::SetDockHeight`) and the side
+//!   panes' widths (`workspace::SetPaneWidth`) resize the terminal through the same layout, and
+//!   are tested.
 //! - **Colours, wide characters, full-screen programs, the wheel and Cmd-C** (UP-41): the terminal
 //!   model's and the view's tests (`flint-core`'s `terminal.rs`, `ui/terminal_tests.rs`). The
 //!   state carries the screen's text, not its colours.
@@ -48,6 +49,20 @@ const PODINFO: &str = "podinfo-c6497595d-b8chj";
 const MULTI: &str = "multi-1";
 /// The fake API context's name as a dock chip shows it, shortened in the middle.
 const FAKE_CHIP: &str = "kind-fl…e2e-fake";
+
+/// A window with room for every dock height these tests set: the tallest is 460 points, and the
+/// dock leaves the main area 280. The launch size can be smaller, as it is clamped to the display.
+const WINDOW: (f64, f64) = (1280.0, 800.0);
+
+/// Gives the window the size [`WINDOW`], so the tests do not depend on the display's size.
+fn set_window_size(app: &App) -> Result<()> {
+    let (width, height) = WINDOW;
+    let applied = app.request("resize_window", json!({"width": width, "height": height}))?;
+    if applied["width"].as_f64() != Some(width) || applied["height"].as_f64() != Some(height) {
+        bail!("the window did not become {width}x{height}: {applied}");
+    }
+    Ok(())
+}
 
 /// The index of tab `id` in the state's dock.
 fn tab_index(state: &Value, id: u64) -> Result<usize> {
@@ -271,6 +286,7 @@ fn up_41_shell_into_a_container() -> Result<()> {
     let cluster = TestCluster::fake(Options::default())?;
     let fake = cluster.fake_server().expect("a fake server");
     let app = App::launch(AppOptions::new(&cluster.kubeconfig))?;
+    set_window_size(&app)?;
     connect(&app, &cluster.context)?;
     let state = open_live(&app, "pods", 17)?;
     let row = row_id(&state, WEB)?;
@@ -343,13 +359,12 @@ fn up_41_shell_into_a_container() -> Result<()> {
     wait_for_row(&app, i, &format!("{} {}", taller.height, taller.width))?;
     assert_eq!(exec.resizes(), [first, taller]);
 
-    // Narrower side panes are more columns. The window can't be resized over the automation
-    // channel; this is the same layout path. The dock spans the list and the detail pane. When
-    // the window is too narrow for every pane, the detail pane gives way first, then the
-    // navigation, then the sidebar; so in a 1024-point window a narrower sidebar alone only
-    // gives its room back to the squeezed navigation, and the dock keeps its width. Both side
-    // panes at their narrowest widen the dock in any window over 950 points (sidebar 140,
-    // navigation 150, detail 300, list 360).
+    // Narrower side panes are more columns, through the same layout path as a narrower window.
+    // The dock spans the list and the detail pane. When the window is too narrow for every pane,
+    // the detail pane gives way first, then the navigation, then the sidebar; so in a 1024-point
+    // window a narrower sidebar alone only gives its room back to the squeezed navigation, and
+    // the dock keeps its width. Both side panes at their narrowest widen the dock in any window
+    // over 950 points (sidebar 140, navigation 150, detail 300, list 360).
     for (pane, width) in [("navigation", 150.0), ("clusters", 140.0)] {
         app.dispatch(
             "workspace::SetPaneWidth",
@@ -788,6 +803,7 @@ fn up_42_sessions_outlive_navigation() -> Result<()> {
     let (a, b) = (&two.a, &two.b);
     let web = ContainerLog::new("demo", WEB);
     let mut app = App::launch(AppOptions::new(two.kubeconfig()))?;
+    set_window_size(&app)?;
     connect(&app, TwoClusters::A)?;
     open_live(&app, "pods", 17)?;
     app.select_row(Some("demo"), WEB)?;
@@ -911,6 +927,7 @@ fn up_42_sessions_outlive_navigation() -> Result<()> {
     // Quit checks that the app exited cleanly (`App::quit`).
     let scratch = app.quit()?;
     app = App::launch(AppOptions::new(two.kubeconfig()).reuse(scratch))?;
+    set_window_size(&app)?;
     let state = app.wait_for("/dock/height", Equals(333.into()))?;
     assert_eq!(state["dock"]["tabs"], json!([]));
     assert_eq!(state["dock"]["visible"], false);
