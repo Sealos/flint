@@ -262,16 +262,26 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
     }
 }
 
-/// Parses the file at `path`, as [`Kubeconfig::read_from`] does, from one handle: its kind is
-/// checked on the handle the bytes come from, since a path checked first can become a FIFO or a
-/// device, which can block for as long as nothing writes to it. Regular files and the null device
-/// are read (`KUBECONFIG=/dev/null` is the usual way to say "no kubeconfig").
+/// Parses the file at `path`, as [`Kubeconfig::read_from`] does, from one handle. A path that is
+/// already a FIFO or a device is refused without opening it, since opening one can wake a writer
+/// or set off the device. Its kind is checked again on the handle the bytes come from, as the
+/// path can become one between the two steps. Regular files and the null device are read
+/// (`KUBECONFIG=/dev/null` is the usual way to say "no kubeconfig").
 fn read_config(path: &Path) -> Result<Kubeconfig, String> {
+    let failed = |e: std::io::Error| KubeconfigError::ReadConfig(e, path.into()).to_string();
+    if std::fs::metadata(path).is_ok_and(|meta| !readable_kind(&meta)) {
+        return Err("not a regular file".to_owned());
+    }
+    let file = open_nonblocking(path).map_err(failed)?;
+    read_opened(path, file)
+}
+
+/// [`read_config`] from `file`, just opened at `path`.
+fn read_opened(path: &Path, mut file: std::fs::File) -> Result<Kubeconfig, String> {
     use std::io::Read;
     let failed = |e: std::io::Error| KubeconfigError::ReadConfig(e, path.into()).to_string();
-    let mut file = open_nonblocking(path).map_err(failed)?;
     let meta = file.metadata().map_err(failed)?;
-    if !meta.is_file() && !is_null_device(&meta) {
+    if !readable_kind(&meta) {
         return Err("not a regular file".to_owned());
     }
     let mut bytes = Vec::new();
@@ -356,6 +366,11 @@ fn parsed_to_nothing(config: &Kubeconfig) -> bool {
         && config.other.is_empty()
 }
 
+/// Whether a file of this kind may be opened and read as a kubeconfig.
+fn readable_kind(meta: &std::fs::Metadata) -> bool {
+    meta.is_file() || is_null_device(meta)
+}
+
 #[cfg(unix)]
 fn is_null_device(meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -430,6 +445,12 @@ impl FileIdentity {
 impl InputFile {
     fn of(path: &Path) -> Self {
         use std::io::ErrorKind;
+        // Known from the path alone: opening a FIFO or a device can have effects of its own.
+        if let Ok(meta) = std::fs::metadata(path)
+            && !meta.is_file()
+        {
+            return InputFile::Special(FileIdentity::of(&meta));
+        }
         match open_nonblocking(path) {
             Ok(file) => Self::from_open(path, file),
             Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
@@ -868,13 +889,72 @@ mod tests {
         });
         let answer = finished.recv_timeout(Duration::from_secs(2));
         if answer.is_err() {
-            // Lets the blocked thread end.
-            drop(std::fs::OpenOptions::new().write(true).open(&fifo));
+            // Lets a blocked thread end. Not waiting: with no reader left this fails at once.
+            use std::os::unix::fs::OpenOptionsExt;
+            drop(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&fifo),
+            );
         }
         assert_eq!(
             answer.expect("the parse did not block"),
             Err("not a regular file".to_owned())
         );
+    }
+
+    // covers UP-06: a FIFO already at the path is refused without being opened, so a writer
+    // waiting on it keeps waiting.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_the_path_is_not_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = make_fifo(dir.path(), "fifo");
+        let (opened, woke) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        let writer = std::thread::spawn(move || {
+            let file = std::fs::OpenOptions::new().write(true).open(&path);
+            let _ = opened.send(());
+            drop(file);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+
+        let parsed = read_config(&fifo).map(drop);
+        let input = InputFile::of(&fifo);
+        let loaded = load(std::slice::from_ref(&fifo));
+        let stayed = woke.recv_timeout(Duration::from_millis(100));
+
+        let release = open_nonblocking(&fifo).unwrap();
+        writer.join().unwrap();
+        drop(release);
+        assert!(stayed.is_err(), "the waiting writer was woken");
+        assert_eq!(parsed, Err("not a regular file".to_owned()));
+        assert!(matches!(input, InputFile::Special(_)));
+        assert_eq!(loaded.errors.len(), 1);
+    }
+
+    // covers UP-06: a path replaced by a FIFO after the check before opening is still refused,
+    // from the handle the bytes would come from.
+    #[cfg(unix)]
+    #[test]
+    fn a_handle_that_is_a_fifo_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = make_fifo(dir.path(), "fifo");
+        let handle = open_nonblocking(&fifo).unwrap();
+        assert_eq!(
+            read_opened(&fifo, handle).map(drop),
+            Err("not a regular file".to_owned())
+        );
+    }
+
+    // covers UP-06: the null device stays an empty kubeconfig.
+    #[cfg(unix)]
+    #[test]
+    fn the_null_device_still_reads_as_empty() {
+        let null = Path::new("/dev/null");
+        assert!(read_config(null).is_ok());
+        assert!(load(&[null.to_path_buf()]).errors.is_empty());
     }
 
     // covers UP-06: parsing from an open file gives what kube's own reader gives: every encoding,
