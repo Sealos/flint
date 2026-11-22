@@ -1725,11 +1725,18 @@ impl ClusterManager {
     /// time is applied as every file failing, which keeps the clusters and holds their writes,
     /// and counts as not done. Its result is applied when it comes in, if nothing newer was. So
     /// are files that kept changing through every read in that time.
+    ///
+    /// With a read of these files already running this returns false at once, without waiting
+    /// on it or holding anything: that read's own timeout decides whether the files stalled,
+    /// and the reload runs when its result comes in.
     async fn reload_kubeconfig(&mut self) -> bool {
         let paths = self.kubeconfig_paths.clone();
-        let busy = self.reader.busy(&paths);
         let (seq, on_late) = self.next_read(&paths);
-        match self.reader.read_settled(&paths, on_late).await {
+        let Ok(read) = self.reader.read_settled(&paths, on_late).await else {
+            self.reread = true;
+            return false;
+        };
+        match read {
             Some(read) if read.consistent => {
                 self.applied_read = seq;
                 self.stalled_on = None;
@@ -1737,7 +1744,6 @@ impl ClusterManager {
                 true
             }
             _ => {
-                self.reread |= busy;
                 self.hold_stalled(paths);
                 false
             }
@@ -2803,18 +2809,54 @@ mod tests {
         until_parsed(dir.path()).await;
         std::fs::write(&path, yaml.replace("user: {}", "user: {token: another}")).unwrap();
         assert!(!manager.reload_kubeconfig().await, "the files are in use");
-        assert!(manager.held("dev"));
+        assert!(!manager.held("dev"));
         drop(std::fs::OpenOptions::new().write(true).open(&gate).unwrap());
 
         let read = next_internal(&mut manager).await;
         assert!(matches!(read, Internal::WriteRead { read: Some(_), .. }));
         manager.handle_internal(read).await;
-        assert_eq!(answer.await.unwrap(), Err(WriteError::KubeconfigUnreadable));
+        assert_eq!(answer.await.unwrap(), Err(WriteError::ConnectionChanged));
         assert!(!manager.held("dev"), "the pending reload ran");
         assert!(
             !manager.contexts.definition_holds("dev", &pin),
             "the new content was applied"
         );
+    }
+
+    // covers UP-06, UP-54: a reload asked for while a healthy write check reads unchanged files
+    // is answered at once and holds nothing, the write goes through, and the reload then runs.
+    #[tokio::test]
+    async fn a_reload_during_a_healthy_write_read_lets_the_write_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://dev")).await;
+        manager.unlocks.unlock("dev", "https://dev");
+        let pin = manager.contexts.pin_confirmed("dev");
+        let gate = dir.path().join("gate");
+        make_fifo(&gate);
+        manager.reader = KubeconfigReader::new(load_then_wait, Duration::from_secs(5));
+
+        let answer = ask_write(&mut manager, &pin);
+        until_parsed(dir.path()).await;
+        let applied_before = manager.applied_read;
+        let (reply, reloaded) = oneshot::channel();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.handle_internal(Internal::ReloadKubeconfig { reply }),
+        )
+        .await
+        .expect("the loop does not wait on the read");
+        assert_eq!(reloaded.await, Ok(false), "answered, as not applied yet");
+        assert!(manager.reread, "the reload is queued");
+        assert!(!manager.held("dev") && manager.stalled_on.is_none());
+        drop(std::fs::OpenOptions::new().write(true).open(&gate).unwrap());
+
+        let read = next_internal(&mut manager).await;
+        assert!(matches!(read, Internal::WriteRead { read: Some(_), .. }));
+        manager.handle_internal(read).await;
+        assert_eq!(answer.await.unwrap(), Ok(()));
+        assert!(!manager.reread, "the queued reload ran");
+        assert!(manager.applied_read > applied_before, "and applied");
+        assert!(!manager.held("dev"));
     }
 
     // covers UP-06, UP-54: a read whose late result came in before its write check's timeout

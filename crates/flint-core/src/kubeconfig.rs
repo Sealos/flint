@@ -475,6 +475,10 @@ pub(crate) struct KubeconfigReader {
     turns: Arc<StdMutex<ReadTurns>>,
 }
 
+/// A read of the same files is already running, so no new one started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadBusy;
+
 /// The lock of each list of files.
 type ReadTurns = HashMap<Vec<PathBuf>, Arc<Mutex<()>>>;
 
@@ -519,16 +523,20 @@ impl KubeconfigReader {
         answer_by(answer, deadline, on_late).await
     }
 
-    /// [`Self::read`], reading again within the timeout while the files change under it.
+    /// [`Self::read`], reading again within the timeout while the files change under it. An
+    /// earlier read of the same files still running is [`ReadBusy`], told apart from a timeout
+    /// in the same step that tries to start this one.
     pub(crate) async fn read_settled(
         &self,
         paths: &[PathBuf],
         on_late: impl FnOnce(FileRead) + Clone + Send + 'static,
-    ) -> Option<FileRead> {
-        let turn = self.turn(paths).try_lock_owned().ok()?;
+    ) -> Result<Option<FileRead>, ReadBusy> {
+        let turn = self.turn(paths).try_lock_owned().map_err(|_| ReadBusy)?;
         let deadline = Instant::now() + self.timeout;
-        let answer = self.start(paths, turn, Some(deadline), on_late.clone())?;
-        answer_by(answer, deadline, on_late).await
+        let Some(answer) = self.start(paths, turn, Some(deadline), on_late.clone()) else {
+            return Ok(None);
+        };
+        Ok(answer_by(answer, deadline, on_late).await)
     }
 
     /// The files as they are after this call: a read already running is waited out, not used,
