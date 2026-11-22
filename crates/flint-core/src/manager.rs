@@ -10,10 +10,11 @@ use std::time::{Duration, Instant};
 
 use kube::Client;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::activity;
 use crate::cluster::{self, CONNECT_TIMEOUT, ClusterId, ServerVersion};
+use crate::connection::member::{Member, ServerIdentity};
 use crate::credential::WriteCredential;
 use crate::discovery::ClusterDiscovery;
 use crate::handle::{
@@ -62,6 +63,12 @@ pub(crate) struct Cluster {
     /// Id of the latest connection attempt, from the manager-wide counter, so a late result of an
     /// older attempt (even one made before the context was removed and re-added) is ignored.
     attempt: u64,
+    /// Stops the latest attempt, so one that a newer attempt or a new slot replaced ends rather
+    /// than run on. Its result, if already sent, is still discarded by `attempt`.
+    connect_task: Option<AbortHandle>,
+    /// A pause or a changed definition ended this slot's connection: a member connects again at
+    /// the first load that leaves it on its server and not paused.
+    reconnect: bool,
     /// The slot's generation, from the manager-wide counter: a new slot (a new context, one
     /// re-pointed or otherwise changed, one back after being removed) has a new one. Front ends
     /// tell a cluster that started over by it, whatever lists they skipped (#255).
@@ -98,6 +105,9 @@ impl Drop for Cluster {
         {
             task.abort();
         }
+        if let Some(attempt) = self.connect_task.take() {
+            attempt.abort();
+        }
     }
 }
 
@@ -116,6 +126,8 @@ impl Cluster {
             client: None,
             write_credential: None,
             attempt: 0,
+            connect_task: None,
+            reconnect: false,
             generation: 0,
             discovery: None,
             discovering: false,
@@ -294,6 +306,8 @@ enum Internal {
     },
     CrdsChanged {
         cluster: ClusterId,
+        /// The slot whose watch listed them ([`Cluster::generation`]).
+        generation: u64,
         fingerprint: u64,
         kinds: HashSet<KindId>,
     },
@@ -421,6 +435,8 @@ pub(crate) struct ClusterManager {
     /// In kubeconfig order.
     clusters: Vec<Cluster>,
     active: Option<ClusterId>,
+    /// Clusters kept running beside the active one. Empty outside tests for now.
+    members: HashMap<ClusterId, Member>,
     /// Source of connection attempt ids; never reused.
     next_attempt: u64,
     watcher: Option<FileWatcher>,
@@ -477,6 +493,7 @@ impl ClusterManager {
             kubeconfig_paths,
             clusters: Vec::new(),
             active: None,
+            members: HashMap::new(),
             next_attempt: 1,
             watcher: None,
             hubs,
@@ -798,10 +815,29 @@ impl ClusterManager {
         kinds
     }
 
-    /// Brings a cluster's watches in line with whether it is active, its watch mode, and the
-    /// open subscriptions, and follows its CRDs while it is active.
+    /// Whether `id` should run watches and follow its CRDs: the active cluster, or a member while
+    /// its slot still shows the server it joined for.
+    fn wants_watches(&self, id: &str) -> bool {
+        self.active.as_deref() == Some(id) || self.member_on_its_server(id)
+    }
+
+    /// Whether `id` is a member and its slot shows the server the member is bound to.
+    fn member_on_its_server(&self, id: &str) -> bool {
+        self.members
+            .get(id)
+            .zip(self.cluster(id))
+            .is_some_and(|(member, slot)| {
+                slot.info
+                    .server
+                    .as_deref()
+                    .is_some_and(|server| ServerIdentity::new(server) == *member.server())
+            })
+    }
+
+    /// Brings a cluster's watches in line with whether it wants them, its watch mode, and the
+    /// open subscriptions, and follows its CRDs while it wants them.
     fn reconcile(&mut self, id: &str) {
-        let active = self.active.as_deref() == Some(id);
+        let wanted = self.wants_watches(id);
         let mode = self.settings.watch_mode_for(id);
         let subscribed: HashSet<KindId> = self
             .subscriptions
@@ -812,10 +848,12 @@ impl ClusterManager {
         let hubs = self.hubs.clone();
         let internal = self.internal_tx.clone();
         let paused = self.paused(id);
+        let background = self.active.as_deref() != Some(id);
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
-        let follow = active && slot.discovery.is_some() && slot.client.is_some();
+        slot.watches.set_background(background);
+        let follow = wanted && slot.discovery.is_some() && slot.client.is_some();
         if !follow {
             // Before the watches stop, so the followers' hubs can be released (each follower
             // asks for that when it is gone; see `Follower`).
@@ -828,14 +866,19 @@ impl ClusterManager {
         }
         // Paused, what runs goes on and nothing new starts; the load that ends it catches up.
         if paused {
-            slot.watches.stop_unwanted(active, mode, &subscribed);
+            slot.watches.stop_unwanted(wanted, mode, &subscribed);
             return;
         }
-        slot.watches.reconcile(active, mode, &subscribed);
+        slot.watches.reconcile(wanted, mode, &subscribed);
         if follow && slot.crd_task.is_none() {
             let follower =
                 Follower::new(&hubs, id, KindId::custom_resource_definitions(), &internal);
-            slot.crd_task = Some(tokio::spawn(follow_crds(follower, internal.clone())));
+            let generation = slot.generation;
+            slot.crd_task = Some(tokio::spawn(follow_crds(
+                follower,
+                generation,
+                internal.clone(),
+            )));
         }
         if follow && slot.namespaces_task.is_none() {
             let follower = Follower::new(&hubs, id, KindId::namespaces(), &internal);
@@ -1206,9 +1249,11 @@ impl ClusterManager {
                 if slot.attempt != attempt {
                     return;
                 }
+                slot.connect_task = None;
                 // Dropped either way: the load that ends the pause connects again.
                 if paused {
                     slot.state = ConnectionState::Disconnected;
+                    slot.reconnect = true;
                     self.emit(Event::ConnectionChanged {
                         cluster,
                         state: ConnectionState::Disconnected,
@@ -1304,7 +1349,7 @@ impl ClusterManager {
                         Some(e)
                     }
                 };
-                // A failed discovery is retried with backoff while the cluster is active;
+                // A failed discovery is retried with backoff while the cluster wants watches;
                 // selecting the cluster again also retries it (see `activate`).
                 let failed_retry = if error.is_some() || partial {
                     let delay = DISCOVERY_RETRY
@@ -1325,14 +1370,14 @@ impl ClusterManager {
                     error,
                 });
                 self.reconcile(&cluster);
-                let active = self.active.as_deref() == Some(cluster.as_str());
+                let wanted = self.wants_watches(&cluster);
                 let delay = if retry {
                     Some(DISCOVERY_RETRY)
                 } else if again {
                     self.start_discovery(&cluster);
                     None
                 } else {
-                    failed_retry.filter(|_| active)
+                    failed_retry.filter(|_| wanted)
                 };
                 if let Some(delay) = delay {
                     let internal = self.internal_tx.clone();
@@ -1342,9 +1387,9 @@ impl ClusterManager {
                     });
                 }
             }
-            // Only while the cluster is active: a timer may outlive a switch to another one.
+            // Only while the cluster wants watches: a timer may outlive a switch to another one.
             Internal::RetryDiscovery { cluster } => {
-                if self.active.as_deref() == Some(cluster.as_str()) {
+                if self.wants_watches(&cluster) {
                     self.start_discovery(&cluster);
                 }
             }
@@ -1382,10 +1427,15 @@ impl ClusterManager {
             }
             Internal::CrdsChanged {
                 cluster,
+                generation,
                 fingerprint,
                 kinds,
             } => {
-                let Some(slot) = self.cluster_mut(&cluster) else {
+                // Queued by a slot since replaced: those CRDs are another server's.
+                let Some(slot) = self
+                    .cluster_mut(&cluster)
+                    .filter(|slot| slot.generation == generation)
+                else {
                     return;
                 };
                 slot.removed_crds = slot.crds.difference(&kinds).cloned().collect();
@@ -1941,6 +1991,7 @@ impl ClusterManager {
             return;
         };
         slot.attempt = attempt;
+        slot.reconnect = false;
         slot.state = ConnectionState::Connecting;
         slot.client = None;
         slot.write_credential = None;
@@ -1950,21 +2001,29 @@ impl ClusterManager {
             state: ConnectionState::Connecting,
         });
         tracing::info!(cluster, "connecting");
+        // Run the attempt as its own task so a panic inside kube or an auth plugin handler
+        // becomes a failed connection instead of a cluster stuck in "connecting".
+        let name = cluster.clone();
+        let attempt_task = tokio::spawn(async move {
+            cluster::connect_gated_and_check(&kubeconfig.merged, &name, CONNECT_TIMEOUT)
+                .await
+                .map_err(|e| e.summary())
+        });
+        if let Some(slot) = self.cluster_mut(id)
+            && let Some(superseded) = slot.connect_task.replace(attempt_task.abort_handle())
+        {
+            superseded.abort();
+        }
         tokio::spawn(async move {
-            // Run the attempt as its own task so a panic inside kube or an auth plugin handler
-            // becomes a failed connection instead of a cluster stuck in "connecting".
-            let name = cluster.clone();
-            let attempt_task = tokio::spawn(async move {
-                cluster::connect_gated_and_check(&kubeconfig.merged, &name, CONNECT_TIMEOUT)
-                    .await
-                    .map_err(|e| e.summary())
-            });
             // The app shows this message as it is: only safe text ([`ClusterError::summary`]).
-            let result = attempt_task.await.unwrap_or_else(|e| {
-                Err(cluster::SafeErrorText::reduced(&format!(
+            let result = match attempt_task.await {
+                Ok(result) => result,
+                // Aborted because something replaced it, so no one is waiting for this result.
+                Err(e) if e.is_cancelled() => return,
+                Err(e) => Err(cluster::SafeErrorText::reduced(&format!(
                     "connection task failed: {e}"
-                )))
-            });
+                ))),
+            };
             if let Err(e) = &result {
                 tracing::warn!(cluster, error = %e, "connection failed");
             }
@@ -1997,11 +2056,11 @@ impl ClusterManager {
                 self.hubs.get_or_create(id, &kind).wake.notify_one();
             }
         }
-        let active = self.active.as_deref() == Some(id);
+        let wanted = self.wants_watches(id);
         if self.cluster(id).is_some_and(|slot| {
             slot.client.is_some()
                 && !slot.discovering
-                && (slot.rediscover || (active && slot.discovery.is_none()))
+                && (slot.rediscover || (wanted && slot.discovery.is_none()))
         }) {
             self.start_discovery(id);
         }
@@ -2185,6 +2244,8 @@ impl ClusterManager {
                     fresh.namespace_filter = old.namespace_filter.clone();
                     fresh.update_scope();
                     fresh.generation = self.next_generation();
+                    fresh.reconnect =
+                        old.reconnect || !matches!(old.state, ConnectionState::Disconnected);
                     fresh
                 }
                 None => {
@@ -2223,6 +2284,17 @@ impl ClusterManager {
                 self.held.insert(name.clone());
             }
         }
+        // A member ends with its context, or on another server once a load confirms it. Until then
+        // the server may be a fallback, so it keeps its place and starts nothing.
+        let ended: Vec<ClusterId> = self
+            .members
+            .keys()
+            .filter(|id| !self.member_on_its_server(id) && !self.unsettled(id))
+            .cloned()
+            .collect();
+        for id in &ended {
+            self.members.remove(id);
+        }
         // The default namespace may have changed, and a filter set during a pause waits for this.
         for name in loaded.contexts.iter().map(|info| &info.name) {
             self.apply_scope(name);
@@ -2258,6 +2330,23 @@ impl ClusterManager {
             .collect::<Vec<_>>()
         {
             self.resume(&name);
+        }
+        for id in ended {
+            self.reconcile(&id);
+        }
+        // `ensure_connected` refuses a paused context, and the flag then waits for a later load.
+        let due: Vec<ClusterId> = self
+            .members
+            .keys()
+            .filter(|id| {
+                self.member_on_its_server(id)
+                    && !self.paused(id)
+                    && self.cluster(id).is_some_and(|slot| slot.reconnect)
+            })
+            .cloned()
+            .collect();
+        for id in due {
+            self.ensure_connected(&id);
         }
     }
 
@@ -2335,7 +2424,11 @@ impl Drop for Follower {
 
 /// Follows the CRD list of an active cluster and reports its fingerprint when it changes, so
 /// discovery can be refreshed. Ends when aborted or the hub goes away.
-async fn follow_crds(mut follower: Follower, out: mpsc::UnboundedSender<Internal>) {
+async fn follow_crds(
+    mut follower: Follower,
+    generation: u64,
+    out: mpsc::UnboundedSender<Internal>,
+) {
     let mut last = None;
     while let Some(snapshot) = follower.next_synced(CRD_DEBOUNCE).await {
         let fingerprint = crd_fingerprint(&snapshot);
@@ -2359,6 +2452,7 @@ async fn follow_crds(mut follower: Follower, out: mpsc::UnboundedSender<Internal
             .collect();
         let msg = Internal::CrdsChanged {
             cluster: follower.cluster.clone(),
+            generation,
             fingerprint,
             kinds,
         };
@@ -4734,6 +4828,496 @@ mod tests {
         }
     }
 
+    /// Makes `dev` a member of the running set, joined for the server it has now.
+    fn join_dev(manager: &mut ClusterManager) {
+        let server = manager.cluster("dev").unwrap().info.server.clone().unwrap();
+        let (member, _) = Member::join(ServerIdentity::new(server), None, None);
+        manager.members.insert("dev".to_owned(), member);
+    }
+
+    /// Gives `dev` a connection and discovery with one kind, in on-view mode, with a view open on
+    /// that kind.
+    async fn watching_dev(manager: &mut ClusterManager) -> KindId {
+        use crate::discovery::tests::kind;
+        let kinds = vec![kind("", "Pod", "pods", true, &["get", "list", "watch"])];
+        let pods = kinds[0].id();
+        manager.settings = Arc::new(Settings {
+            watch_mode: crate::settings::WatchMode::OnView,
+            ..Settings::default()
+        });
+        land_connection(manager).await;
+        let slot = manager.cluster_mut("dev").unwrap();
+        slot.watches.set_kinds(&kinds);
+        slot.discovery = Some(Arc::new(ClusterDiscovery::new(kinds)));
+        manager.handle_request(Request::Subscribe {
+            id: 1,
+            cluster: "dev".into(),
+            kind: pods.clone(),
+        });
+        pods
+    }
+
+    fn watches(manager: &ClusterManager, kind: &KindId) -> bool {
+        manager.watched_kinds("dev").iter().any(|(k, _)| k == kind)
+    }
+
+    // With no members, only the active cluster runs watches.
+    #[tokio::test]
+    async fn without_members_only_the_active_cluster_keeps_watches() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, _, _) = pausable(dir.path(), NO_CONTEXTS).await;
+        manager.active = Some("dev".to_owned());
+        let pods = watching_dev(&mut manager).await;
+        assert!(manager.wants_watches("dev"));
+        assert!(watches(&manager, &pods));
+
+        manager.active = None;
+        manager.reconcile("dev");
+        assert!(!manager.wants_watches("dev"));
+        assert!(!watches(&manager, &pods), "stopped with the switch");
+    }
+
+    #[tokio::test]
+    async fn a_member_keeps_watches_when_it_is_not_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, _, _) = pausable(dir.path(), NO_CONTEXTS).await;
+        manager.active = Some("dev".to_owned());
+        join_dev(&mut manager);
+        let pods = watching_dev(&mut manager).await;
+
+        manager.active = None;
+        manager.reconcile("dev");
+        assert!(manager.wants_watches("dev"));
+        assert!(watches(&manager, &pods), "a member goes on");
+    }
+
+    #[tokio::test]
+    async fn a_removed_members_watches_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, _, _) = pausable(dir.path(), NO_CONTEXTS).await;
+        join_dev(&mut manager);
+        let pods = watching_dev(&mut manager).await;
+        assert!(watches(&manager, &pods));
+
+        manager.members.remove("dev");
+        manager.reconcile("dev");
+        assert!(!watches(&manager, &pods));
+    }
+
+    // A confirmed move to another server ends the membership, and nothing connects there.
+    #[tokio::test]
+    async fn a_repointed_member_is_removed_without_connecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, _, first) = pausable(dir.path(), NO_CONTEXTS).await;
+        join_dev(&mut manager);
+        let pods = watching_dev(&mut manager).await;
+        let next = manager.next_attempt;
+
+        rewrite_file(
+            &mut manager,
+            &first,
+            &kubeconfig_with("https://127.0.0.1:2"),
+        )
+        .await;
+        assert!(!manager.members.contains_key("dev"));
+        assert!(!watches(&manager, &pods));
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Disconnected));
+        assert_eq!(manager.next_attempt, next, "no attempt started");
+    }
+
+    // A member whose context left the kubeconfig is no longer a member.
+    #[tokio::test]
+    async fn a_member_whose_context_is_gone_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, _, first) = pausable(dir.path(), NO_CONTEXTS).await;
+        join_dev(&mut manager);
+        rewrite_file(&mut manager, &first, NO_CONTEXTS).await;
+        assert!(manager.cluster("dev").is_none());
+        assert!(!manager.members.contains_key("dev"));
+    }
+
+    // A held member keeps what runs and starts no connection, discovery or watch.
+    #[tokio::test]
+    async fn a_held_member_starts_nothing() {
+        use crate::discovery::tests::kind;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, _, first) = pausable(dir.path(), NO_CONTEXTS).await;
+        join_dev(&mut manager);
+        let pods = watching_dev(&mut manager).await;
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(manager.held("dev"));
+        assert!(manager.members.contains_key("dev"), "a held slot stays");
+        assert!(watches(&manager, &pods), "what runs goes on");
+
+        let configmaps = kind(
+            "",
+            "ConfigMap",
+            "configmaps",
+            true,
+            &["get", "list", "watch"],
+        );
+        let slot = manager.cluster_mut("dev").unwrap();
+        let mut kinds = vec![configmaps.clone()];
+        kinds.extend(slot.discovery.as_ref().unwrap().kinds.iter().cloned());
+        slot.watches.set_kinds(&kinds);
+        manager.handle_request(Request::Subscribe {
+            id: 2,
+            cluster: "dev".into(),
+            kind: configmaps.id(),
+        });
+        assert!(!watches(&manager, &configmaps.id()), "no new watch");
+        assert!(watches(&manager, &pods), "subscribing stops nothing");
+
+        let next = manager.next_attempt;
+        manager
+            .handle_internal(Internal::RetryDiscovery {
+                cluster: "dev".into(),
+            })
+            .await;
+        // Disconnected, only the pause keeps this from starting an attempt.
+        manager.cluster_mut("dev").unwrap().state = ConnectionState::Disconnected;
+        manager.ensure_connected("dev");
+        let slot = manager.cluster("dev").unwrap();
+        assert!(!slot.discovering, "no discovery");
+        assert!(matches!(slot.state, ConnectionState::Disconnected));
+        assert_eq!(manager.next_attempt, next, "no attempt started");
+    }
+
+    // First seen behind a broken file, `dev` has no confirmed definition. A move to another server
+    // may be a fallback: the member stays and starts nothing there, comes back with its server,
+    // and ends only when a load confirms the move.
+    #[tokio::test]
+    async fn an_unconfirmed_move_keeps_a_member_until_a_load_confirms_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+        let at_a = kubeconfig_with("https://127.0.0.1:1");
+        let at_b = kubeconfig_with("https://127.0.0.1:2");
+        let mut manager = manager_reading_two(dir.path(), UNREADABLE, &at_a).await;
+        join_dev(&mut manager);
+        let next = manager.next_attempt;
+
+        rewrite_file(&mut manager, &second, &at_b).await;
+        assert!(manager.contexts.provisional("dev") && !manager.paused("dev"));
+        assert!(
+            manager.members.contains_key("dev"),
+            "the move is unconfirmed"
+        );
+        assert!(
+            !manager.wants_watches("dev"),
+            "nothing runs on the fallback"
+        );
+        assert!(manager.watched_kinds("dev").is_empty());
+        assert_eq!(manager.next_attempt, next, "no attempt started");
+
+        rewrite_file(&mut manager, &second, &at_a).await;
+        assert!(manager.wants_watches("dev"), "back on its server");
+
+        rewrite_file(&mut manager, &second, &at_b).await;
+        rewrite_file(&mut manager, &first, NO_CONTEXTS).await;
+        assert!(!manager.contexts.provisional("dev"));
+        assert!(
+            !manager.members.contains_key("dev"),
+            "the move is confirmed"
+        );
+    }
+
+    // Switching away during an outage drops the rows but not the error, so coming back says
+    // reconnecting rather than loading (UP-27).
+    #[tokio::test]
+    async fn switching_away_keeps_the_outage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, _, _) = pausable(dir.path(), NO_CONTEXTS).await;
+        manager.active = Some("dev".to_owned());
+        let pods = watching_dev(&mut manager).await;
+        let state = SyncState::Reconnecting {
+            error: Some("dropped".into()),
+        };
+        let hub = manager.hubs.get_or_create("dev", &pods);
+        hub.take_over(KindSnapshot::empty(
+            "dev".into(),
+            pods.clone(),
+            state.clone(),
+        ));
+
+        manager.active = Some("other".to_owned());
+        manager.reconcile("dev");
+        assert!(!watches(&manager, &pods));
+
+        manager.active = Some("dev".to_owned());
+        manager.reconcile("dev");
+        let hub = manager.hubs.get_or_create("dev", &pods);
+        assert_eq!(hub.latest().state, state);
+    }
+
+    // With no confirmed definition, the watches of a cluster that was active on the moved server
+    // stop with the switch.
+    #[tokio::test]
+    async fn a_member_moved_while_never_confirmed_keeps_no_watches() {
+        let dir = tempfile::tempdir().unwrap();
+        let second = dir.path().join("second");
+        let at_a = kubeconfig_with("https://127.0.0.1:1");
+        let mut manager = manager_reading_two(dir.path(), UNREADABLE, &at_a).await;
+        assert!(manager.contexts.provisional("dev") && !manager.paused("dev"));
+        join_dev(&mut manager);
+
+        rewrite_file(
+            &mut manager,
+            &second,
+            &kubeconfig_with("https://127.0.0.1:2"),
+        )
+        .await;
+        assert!(manager.contexts.provisional("dev") && !manager.paused("dev"));
+        assert!(manager.members.contains_key("dev"));
+
+        manager.active = Some("dev".to_owned());
+        let pods = watching_dev(&mut manager).await;
+        assert!(watches(&manager, &pods));
+        manager.active = None;
+        manager.reconcile("dev");
+        assert!(!manager.wants_watches("dev"));
+        assert!(!watches(&manager, &pods), "stopped with the switch");
+    }
+
+    // A member bound to another server wants nothing, and the load that removes it stops what
+    // still runs on the slot.
+    #[tokio::test]
+    async fn removing_a_stale_member_stops_its_watches() {
+        let dir = tempfile::tempdir().unwrap();
+        let at_b = kubeconfig_with("https://127.0.0.1:2");
+        let mut manager = manager_reading_two(dir.path(), UNREADABLE, &at_b).await;
+        manager.active = Some("dev".to_owned());
+        let pods = watching_dev(&mut manager).await;
+        let (member, _) = Member::join(ServerIdentity::new("https://127.0.0.1:1"), None, None);
+        manager.members.insert("dev".to_owned(), member);
+        manager.active = None;
+        assert!(!manager.wants_watches("dev"), "bound to another server");
+        assert!(watches(&manager, &pods));
+
+        rewrite_file(&mut manager, &dir.path().join("first"), NO_CONTEXTS).await;
+        assert!(!manager.contexts.provisional("dev"));
+        assert!(!manager.members.contains_key("dev"));
+        assert!(!watches(&manager, &pods), "stopped with the member");
+    }
+
+    // A removed member that is the active cluster keeps its watches.
+    #[tokio::test]
+    async fn removing_a_stale_member_leaves_the_active_cluster_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let at_b = kubeconfig_with("https://127.0.0.1:2");
+        let mut manager = manager_reading_two(dir.path(), UNREADABLE, &at_b).await;
+        manager.active = Some("dev".to_owned());
+        let pods = watching_dev(&mut manager).await;
+        let (member, _) = Member::join(ServerIdentity::new("https://127.0.0.1:1"), None, None);
+        manager.members.insert("dev".to_owned(), member);
+
+        rewrite_file(&mut manager, &dir.path().join("first"), NO_CONTEXTS).await;
+        assert!(!manager.members.contains_key("dev"));
+        assert!(watches(&manager, &pods));
+    }
+
+    // A fallback at another server is a real pause: the member keeps its place, wants nothing
+    // and starts nothing, and counts again once the load shows its server.
+    #[tokio::test]
+    async fn a_paused_member_on_a_fallback_server_keeps_its_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = kubeconfig_with("https://127.0.0.1:2");
+        let (mut manager, confirmed, first) = pausable(dir.path(), &fallback).await;
+        join_dev(&mut manager);
+        let next = manager.next_attempt;
+
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(manager.contexts.provisional("dev") && manager.paused("dev"));
+        assert!(manager.members.contains_key("dev"), "a pause keeps it");
+        assert!(!manager.wants_watches("dev"));
+        assert!(manager.watched_kinds("dev").is_empty());
+
+        rewrite_file(&mut manager, &first, &confirmed).await;
+        assert!(manager.members.contains_key("dev"));
+        assert!(manager.wants_watches("dev"));
+        assert_eq!(manager.next_attempt, next, "no attempt started");
+    }
+
+    // A connection result handled during a hold is dropped, and the load that ends the hold
+    // connects the member again even though it is not the active cluster.
+    #[tokio::test]
+    async fn a_member_whose_connection_a_hold_dropped_reconnects() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, confirmed, first) = pausable(dir.path(), NO_CONTEXTS).await;
+        join_dev(&mut manager);
+        let attempt = manager.next_attempt;
+        manager.next_attempt += 1;
+        let slot = manager.cluster_mut("dev").unwrap();
+        slot.attempt = attempt;
+        slot.state = ConnectionState::Connecting;
+
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(manager.held("dev"));
+        manager
+            .handle_internal(Internal::Connected {
+                cluster: "dev".into(),
+                attempt,
+                result: Err(cluster::SafeErrorText::fixed("refused")),
+            })
+            .await;
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Disconnected));
+
+        let next = manager.next_attempt;
+        rewrite_file(&mut manager, &first, &confirmed).await;
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Connecting));
+        assert_eq!(manager.next_attempt, next + 1, "one attempt started");
+    }
+
+    // A kubeconfig link moved to a file with a new credential for the same server reaches a
+    // member that is not active: its slot is replaced and connects again.
+    #[tokio::test]
+    async fn a_moved_link_reconnects_a_background_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, confirmed, first) = pausable(dir.path(), NO_CONTEXTS).await;
+        join_dev(&mut manager);
+        let pods = watching_dev(&mut manager).await;
+        let generation = manager.cluster("dev").unwrap().generation;
+
+        let moved = dir.path().join("moved");
+        std::fs::write(
+            &moved,
+            confirmed.replace("user: {}", "user: {token: rotated}"),
+        )
+        .unwrap();
+        point_link(&first, &moved);
+        let next = manager.next_attempt;
+        manager.reload_kubeconfig().await;
+
+        assert!(manager.members.contains_key("dev"));
+        assert!(
+            !watches(&manager, &pods),
+            "the old connection's watch stopped"
+        );
+        let slot = manager.cluster("dev").unwrap();
+        assert_ne!(slot.generation, generation);
+        assert!(matches!(slot.state, ConnectionState::Connecting));
+        assert_eq!(manager.next_attempt, next + 1, "one attempt started");
+    }
+
+    // CRDs listed by a slot since replaced are another connection's, and change nothing.
+    #[tokio::test]
+    async fn a_crd_list_from_a_replaced_slot_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, confirmed, first) = pausable(dir.path(), NO_CONTEXTS).await;
+        join_dev(&mut manager);
+        watching_dev(&mut manager).await;
+        let stale = manager.cluster("dev").unwrap().generation;
+        let changed = confirmed.replace("user: {}", "user: {token: rotated}");
+        rewrite_file(&mut manager, &first, &changed).await;
+
+        manager
+            .handle_internal(Internal::CrdsChanged {
+                cluster: "dev".into(),
+                generation: stale,
+                fingerprint: 1,
+                kinds: HashSet::from([KindId::new("example.com", "widgets")]),
+            })
+            .await;
+        let slot = manager.cluster("dev").unwrap();
+        assert!(slot.crds.is_empty());
+        assert_eq!(slot.crd_fingerprint, None);
+    }
+
+    // A view closed during an outage keeps its rows on the active cluster only.
+    #[tokio::test]
+    async fn only_the_active_cluster_keeps_a_closed_views_rows() {
+        for (active, kept) in [("dev", 1), ("other", 0)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut manager, _, _) = pausable(dir.path(), NO_CONTEXTS).await;
+            manager.active = Some("dev".to_owned());
+            join_dev(&mut manager);
+            let pods = watching_dev(&mut manager).await;
+            manager.active = Some(active.to_owned());
+            manager.reconcile("dev");
+            assert!(watches(&manager, &pods));
+
+            let row = Arc::new(crate::table::Row {
+                uid: "u1".into(),
+                name: "web".into(),
+                namespace: Some("default".into()),
+                resource_version: "1".into(),
+                generation: None,
+                created: None,
+                labels: Box::new([]),
+                cells: Vec::new().into(),
+            });
+            let state = SyncState::Reconnecting {
+                error: Some("dropped".into()),
+            };
+            let hub = manager.hubs.get_or_create("dev", &pods);
+            hub.take_over(KindSnapshot {
+                rows: vec![row],
+                ..KindSnapshot::empty("dev".into(), pods.clone(), state)
+            });
+
+            manager.handle_request(Request::Unsubscribe { id: 1 });
+            assert!(!watches(&manager, &pods));
+            let (_hub, rows) = manager.hubs.subscribe("dev", &pods);
+            assert_eq!(rows.borrow().rows.len(), kept, "with {active} active");
+        }
+    }
+
+    /// Waits for the client to close `socket`, reading whatever it sent first.
+    async fn closed_by_client(socket: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut buffer = [0; 1024];
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(socket.read(&mut buffer).await, Ok(0) | Err(_)) {}
+        })
+        .await
+        .expect("the attempt should have been aborted");
+    }
+
+    // A new attempt aborts the one it replaces, whose late result is ignored. Replacing the slot
+    // aborts the attempt too.
+    #[tokio::test]
+    async fn a_superseded_attempt_is_aborted_and_its_late_result_ignored() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}", listener.local_addr().unwrap());
+        let accept = async || {
+            let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept());
+            accepted.await.unwrap().unwrap().0
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with(&server);
+        let mut manager = manager_reading_two(dir.path(), &yaml, NO_CONTEXTS).await;
+
+        manager.activate("dev".to_owned());
+        let mut first = accept().await;
+        let superseded = manager.cluster("dev").unwrap().attempt;
+
+        manager.cluster_mut("dev").unwrap().state =
+            ConnectionState::Failed(cluster::SafeErrorText::fixed("refused"));
+        manager.ensure_connected("dev");
+        closed_by_client(&mut first).await;
+        let mut second = accept().await;
+        let current = manager.cluster("dev").unwrap().attempt;
+        assert_ne!(current, superseded);
+
+        manager
+            .handle_internal(Internal::Connected {
+                cluster: "dev".into(),
+                attempt: superseded,
+                result: Ok((built_connection(&manager).await, test_version())),
+            })
+            .await;
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Connecting));
+        assert!(slot.client.is_none(), "the late result is ignored");
+        assert_eq!(slot.attempt, current);
+
+        let moved = kubeconfig_with("https://127.0.0.1:1");
+        rewrite_file(&mut manager, &dir.path().join("first"), &moved).await;
+        closed_by_client(&mut second).await;
+    }
+
     // A paused context starts no connection, and the load that ends the pause starts it.
     #[tokio::test]
     async fn a_paused_active_context_connects_only_when_the_pause_ends() {
@@ -6027,7 +6611,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let crds = KindId::custom_resource_definitions();
         let follower = Follower::new(&hubs, "dev", crds.clone(), &tx);
-        let task = tokio::spawn(follow_crds(follower, tx.clone()));
+        let task = tokio::spawn(follow_crds(follower, 0, tx.clone()));
         // The watch manager stopped the CRD watch while the follower still listened: the hub
         // stays (someone reads it).
         hubs.release("dev", &crds);
