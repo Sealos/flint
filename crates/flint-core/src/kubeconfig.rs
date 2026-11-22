@@ -7,10 +7,11 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
-use kube::config::{Kubeconfig, NamedContext};
+use kube::config::{Kubeconfig, KubeconfigError, NamedContext};
 use tokio::sync::{Mutex, OwnedMutexGuard, oneshot};
 use tokio::time::Instant;
 
@@ -179,15 +180,10 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
                 continue;
             }
         }
-        // Opening a FIFO or a device can block for as long as nothing writes to it.
-        if !readable_kind(path) {
-            errors.push((path.clone(), "not a regular file".to_owned()));
-            continue;
-        }
-        let mut config = match Kubeconfig::read_from(path) {
+        let mut config = match read_config(path) {
             Ok(config) => config,
             Err(e) => {
-                errors.push((path.clone(), e.to_string()));
+                errors.push((path.clone(), e));
                 continue;
             }
         };
@@ -266,6 +262,97 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
     }
 }
 
+/// Parses the file at `path`, as [`Kubeconfig::read_from`] does, from one handle. A path that is
+/// already a FIFO or a device is refused without opening it, since opening one can wake a writer
+/// or set off the device. Its kind is checked again on the handle the bytes come from, as the
+/// path can become one between the two steps. Regular files and the null device are read
+/// (`KUBECONFIG=/dev/null` is the usual way to say "no kubeconfig").
+fn read_config(path: &Path) -> Result<Kubeconfig, String> {
+    let failed = |e: std::io::Error| KubeconfigError::ReadConfig(e, path.into()).to_string();
+    if std::fs::metadata(path).is_ok_and(|meta| !readable_kind(&meta)) {
+        return Err("not a regular file".to_owned());
+    }
+    let file = open_nonblocking(path).map_err(failed)?;
+    read_opened(path, file)
+}
+
+/// [`read_config`] from `file`, just opened at `path`.
+fn read_opened(path: &Path, mut file: std::fs::File) -> Result<Kubeconfig, String> {
+    use std::io::Read;
+    let failed = |e: std::io::Error| KubeconfigError::ReadConfig(e, path.into()).to_string();
+    let meta = file.metadata().map_err(failed)?;
+    if !readable_kind(&meta) {
+        return Err("not a regular file".to_owned());
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(failed)?;
+    let text = decode_config(bytes).map_err(failed)?;
+    let mut config = Kubeconfig::from_yaml(&text).map_err(|e| e.to_string())?;
+    if let Some(dir) = path.parent() {
+        resolve_file_references(&mut config, dir);
+    }
+    Ok(config)
+}
+
+/// The text of a kubeconfig file, in the encodings its byte order mark names.
+fn decode_config(bytes: Vec<u8>) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind};
+    let utf16 = |body: &[u8], unit: fn([u8; 2]) -> u16, name: &str| {
+        let invalid = || Error::new(ErrorKind::InvalidData, format!("Invalid {name}"));
+        let (pairs, rest) = body.as_chunks::<2>();
+        if !rest.is_empty() {
+            return Err(invalid());
+        }
+        let units: Vec<u16> = pairs.iter().map(|pair| unit(*pair)).collect();
+        String::from_utf16(&units).map_err(|_| invalid())
+    };
+    match bytes.as_slice() {
+        [0xFF, 0xFE, body @ ..] => utf16(body, u16::from_le_bytes, "UTF-16 LE"),
+        [0xFE, 0xFF, body @ ..] => utf16(body, u16::from_be_bytes, "UTF-16 BE"),
+        [0xEF, 0xBB, 0xBF, body @ ..] => String::from_utf8(body.to_vec())
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF-8 BOM")),
+        _ => String::from_utf8(bytes)
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF-8")),
+    }
+}
+
+/// Makes the files `config` refers to absolute, relative to `dir`, the kubeconfig's directory. An
+/// exec command counts as a file only if it has a path separator: a bare name is a `PATH` lookup.
+fn resolve_file_references(config: &mut Kubeconfig, dir: &Path) {
+    let resolve = |file: &mut Option<String>| {
+        if let Some(name) = file.as_deref()
+            && Path::new(name).is_relative()
+            && let Some(absolute) = dir.join(name).to_str()
+        {
+            *file = Some(absolute.to_owned());
+        }
+    };
+    for cluster in config
+        .clusters
+        .iter_mut()
+        .filter_map(|c| c.cluster.as_mut())
+    {
+        resolve(&mut cluster.certificate_authority);
+    }
+    for user in config
+        .auth_infos
+        .iter_mut()
+        .filter_map(|u| u.auth_info.as_mut())
+    {
+        resolve(&mut user.client_certificate);
+        resolve(&mut user.client_key);
+        resolve(&mut user.token_file);
+        if let Some(exec) = &mut user.exec
+            && exec
+                .command
+                .as_ref()
+                .is_some_and(|command| command.contains(std::path::MAIN_SEPARATOR))
+        {
+            resolve(&mut exec.command);
+        }
+    }
+}
+
 /// Whether a parse found nothing in its file, not even a `kind`.
 fn parsed_to_nothing(config: &Kubeconfig) -> bool {
     config.kind.is_none()
@@ -279,11 +366,9 @@ fn parsed_to_nothing(config: &Kubeconfig) -> bool {
         && config.other.is_empty()
 }
 
-/// Whether `path` is a kind of file a read returns from: a regular file, or the null device
-/// (`KUBECONFIG=/dev/null` is the usual way to say "no kubeconfig"). A path that can't be
-/// inspected is left for the read to report.
-fn readable_kind(path: &Path) -> bool {
-    std::fs::metadata(path).map_or(true, |meta| meta.is_file() || is_null_device(&meta))
+/// Whether a file of this kind may be opened and read as a kubeconfig.
+fn readable_kind(meta: &std::fs::Metadata) -> bool {
+    meta.is_file() || is_null_device(meta)
 }
 
 #[cfg(unix)]
@@ -304,6 +389,18 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// The pause before reading files again that changed during a read.
 const SETTLE_PAUSE: Duration = Duration::from_millis(20);
 
+/// The last number given to a read ([`FileRead::order`]).
+static READ_ORDER: AtomicU64 = AtomicU64::new(0);
+
+/// Opens `path` for reading without waiting: opening a FIFO would otherwise wait for a writer.
+fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::File::options();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+    options.open(path)
+}
+
 /// One input file as it stood at a moment, to tell whether it changed during a read.
 ///
 /// A regular file is compared by identity, times, size and every byte. What this cannot see is a
@@ -317,6 +414,9 @@ enum InputFile {
     /// Not a regular file, so its content is not read: opening one can block.
     Special(FileIdentity),
     Regular(FileIdentity, Vec<u8>),
+    /// The path no longer showed this file once its bytes were read, so they may be a version
+    /// that is already gone.
+    Changing,
 }
 
 /// What the file system says of an open file.
@@ -344,19 +444,25 @@ impl FileIdentity {
 
 impl InputFile {
     fn of(path: &Path) -> Self {
-        use std::io::{ErrorKind, Read};
-        let mut options = std::fs::File::options();
-        options.read(true);
-        // Opening a FIFO for reading would otherwise wait for a writer.
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
-        let mut file = match options.open(path) {
-            Ok(file) => file,
+        use std::io::ErrorKind;
+        // Known from the path alone: opening a FIFO or a device can have effects of its own.
+        if let Ok(meta) = std::fs::metadata(path)
+            && !meta.is_file()
+        {
+            return InputFile::Special(FileIdentity::of(&meta));
+        }
+        match open_nonblocking(path) {
+            Ok(file) => Self::from_open(path, file),
             Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
-                return InputFile::Absent;
+                InputFile::Absent
             }
-            Err(e) => return InputFile::Failed(e.kind()),
-        };
+            Err(e) => InputFile::Failed(e.kind()),
+        }
+    }
+
+    /// What `file`, just opened at `path`, holds.
+    fn from_open(path: &Path, mut file: std::fs::File) -> Self {
+        use std::io::Read;
         let meta = match file.metadata() {
             Ok(meta) => meta,
             Err(e) => return InputFile::Failed(e.kind()),
@@ -366,14 +472,23 @@ impl InputFile {
             return InputFile::Special(identity);
         }
         let mut bytes = Vec::new();
-        match file.read_to_end(&mut bytes) {
-            Ok(_) => InputFile::Regular(identity, bytes),
-            Err(e) => InputFile::Failed(e.kind()),
+        if let Err(e) = file.read_to_end(&mut bytes) {
+            return InputFile::Failed(e.kind());
+        }
+        // The handle keeps a replaced file readable, so only the path can say it is gone.
+        match std::fs::metadata(path) {
+            Ok(now) if FileIdentity::of(&now) == identity => InputFile::Regular(identity, bytes),
+            _ => InputFile::Changing,
         }
     }
 
     fn all(paths: &[PathBuf]) -> Vec<Self> {
         paths.iter().map(|path| Self::of(path)).collect()
+    }
+
+    /// Whether the path still showed this file when its reading ended.
+    fn held_still(&self) -> bool {
+        !matches!(self, InputFile::Changing)
     }
 }
 
@@ -399,6 +514,10 @@ pub(crate) struct FileRead {
     /// Whether every input file was the same when the read ended as when it began. If not, the
     /// merged result may mix versions that never existed together.
     pub consistent: bool,
+    /// Where this read started among all reads: a higher number started later. The reader's lock
+    /// makes reads of one list of files run one after another, but their results can still
+    /// arrive in another order.
+    pub order: u64,
 }
 
 impl FileRead {
@@ -415,6 +534,7 @@ impl FileRead {
             exist: paths.iter().map(|p| (p.clone(), true)).collect(),
             blank: Vec::new(),
             consistent: false,
+            order: 0,
         }
     }
 
@@ -447,6 +567,7 @@ impl FileRead {
     }
 
     fn of(paths: &[PathBuf], load: fn(&[PathBuf]) -> LoadedKubeconfig) -> Self {
+        let order = READ_ORDER.fetch_add(1, Ordering::SeqCst) + 1;
         let before = InputFile::all(paths);
         let stamps: HashMap<&PathBuf, _> = paths.iter().map(|p| (p, file_stamp(p))).collect();
         let loaded = load(paths);
@@ -463,12 +584,14 @@ impl FileRead {
                 stamp: stamps.get(path).copied().flatten(),
             })
             .collect();
-        let consistent = before == InputFile::all(paths);
+        let after = InputFile::all(paths);
+        let consistent = before == after && after.iter().all(InputFile::held_still);
         FileRead {
             loaded,
             exist,
             blank,
             consistent,
+            order,
         }
     }
 }
@@ -603,10 +726,15 @@ impl KubeconfigReader {
         let thread = std::thread::Builder::new()
             .name("kubeconfig-read".to_owned())
             .spawn(move || {
-                let read = match settle_by {
+                let mut read = match settle_by {
                     Some(deadline) => FileRead::settled(&owned, load, deadline.into_std()),
                     None => FileRead::of(&owned, load),
                 };
+                // Nobody is waiting on this thread any more, so one more pass costs the caller
+                // nothing and can turn a late result into one that shows the files as they are.
+                if settle_by.is_some() && !read.consistent && reply.is_closed() {
+                    read = FileRead::of(&owned, load);
+                }
                 drop(turn);
                 if let Err(read) = reply.send(read) {
                     on_late(read);
@@ -725,6 +853,153 @@ mod tests {
             let _ = std::fs::read(path);
         }
         load(paths)
+    }
+
+    // covers UP-54: a file replaced or removed after it was opened and before its bytes were read
+    // is not taken as what the path holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_changed_while_it_is_read_is_not_a_settled_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "a", &dev_at("https://old"));
+        let quiet = open_nonblocking(&path).unwrap();
+        assert!(InputFile::from_open(&path, quiet).held_still());
+
+        let replaced = open_nonblocking(&path).unwrap();
+        let next = write(dir.path(), "next", &dev_at("https://new"));
+        std::fs::rename(&next, &path).unwrap();
+        assert!(!InputFile::from_open(&path, replaced).held_still());
+
+        let removed = open_nonblocking(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(!InputFile::from_open(&path, removed).held_still());
+    }
+
+    // covers UP-06: the step that opens and parses a file refuses a FIFO itself, so a path that
+    // became one after any earlier check cannot block the read.
+    #[cfg(unix)]
+    #[test]
+    fn parsing_a_path_that_is_now_a_fifo_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = make_fifo(dir.path(), "fifo");
+        let (done, finished) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = done.send(read_config(&path).map(drop));
+        });
+        let answer = finished.recv_timeout(Duration::from_secs(2));
+        if answer.is_err() {
+            // Lets a blocked thread end. Not waiting: with no reader left this fails at once.
+            use std::os::unix::fs::OpenOptionsExt;
+            drop(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&fifo),
+            );
+        }
+        assert_eq!(
+            answer.expect("the parse did not block"),
+            Err("not a regular file".to_owned())
+        );
+    }
+
+    // covers UP-06: a FIFO already at the path is refused without being opened, so a writer
+    // waiting on it keeps waiting.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_the_path_is_not_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = make_fifo(dir.path(), "fifo");
+        let (opened, woke) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        let writer = std::thread::spawn(move || {
+            let file = std::fs::OpenOptions::new().write(true).open(&path);
+            let _ = opened.send(());
+            drop(file);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+
+        let parsed = read_config(&fifo).map(drop);
+        let input = InputFile::of(&fifo);
+        let loaded = load(std::slice::from_ref(&fifo));
+        let stayed = woke.recv_timeout(Duration::from_millis(100));
+
+        let release = open_nonblocking(&fifo).unwrap();
+        writer.join().unwrap();
+        drop(release);
+        assert!(stayed.is_err(), "the waiting writer was woken");
+        assert_eq!(parsed, Err("not a regular file".to_owned()));
+        assert!(matches!(input, InputFile::Special(_)));
+        assert_eq!(loaded.errors.len(), 1);
+    }
+
+    // covers UP-06: a path replaced by a FIFO after the check before opening is still refused,
+    // from the handle the bytes would come from.
+    #[cfg(unix)]
+    #[test]
+    fn a_handle_that_is_a_fifo_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = make_fifo(dir.path(), "fifo");
+        let handle = open_nonblocking(&fifo).unwrap();
+        assert_eq!(
+            read_opened(&fifo, handle).map(drop),
+            Err("not a regular file".to_owned())
+        );
+    }
+
+    // covers UP-06: the null device stays an empty kubeconfig.
+    #[cfg(unix)]
+    #[test]
+    fn the_null_device_still_reads_as_empty() {
+        let null = Path::new("/dev/null");
+        assert!(read_config(null).is_ok());
+        assert!(load(&[null.to_path_buf()]).errors.is_empty());
+    }
+
+    // covers UP-06: parsing from an open file gives what kube's own reader gives: every encoding,
+    // several documents, and file references resolved against the kubeconfig's directory.
+    #[test]
+    fn parsing_from_the_handle_matches_the_library_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    \
+                    server: https://one\n    certificate-authority: certs/ca.pem\nusers:\n\
+                    - name: u\n  user:\n    client-certificate: certs/c.pem\n    \
+                    client-key: /abs/k.pem\n    tokenFile: token\n    exec:\n      \
+                    apiVersion: client.authentication.k8s.io/v1\n      command: bin/login\n\
+                    - name: bare\n  user:\n    exec:\n      \
+                    apiVersion: client.authentication.k8s.io/v1\n      command: aws\n\
+                    contexts:\n- name: dev\n  context:\n    cluster: c\n    user: u\n---\n\
+                    apiVersion: v1\nkind: Config\nclusters:\n- name: second\n  cluster:\n    \
+                    server: https://two\n    certificate-authority: other.pem\n";
+        let utf16 = |bom: [u8; 2], unit: fn(u16) -> [u8; 2]| {
+            let units = body.encode_utf16().flat_map(unit);
+            bom.into_iter().chain(units).collect::<Vec<u8>>()
+        };
+        let encodings: [(&str, Vec<u8>); 5] = [
+            ("plain", body.as_bytes().to_vec()),
+            ("bom", [&[0xEF, 0xBB, 0xBF], body.as_bytes()].concat()),
+            ("le", utf16([0xFF, 0xFE], u16::to_le_bytes)),
+            ("be", utf16([0xFE, 0xFF], u16::to_be_bytes)),
+            ("empty", Vec::new()),
+        ];
+        for (name, bytes) in encodings {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let ours = read_config(&path).unwrap();
+            let theirs = Kubeconfig::read_from(&path).unwrap();
+            assert_eq!(format!("{ours:?}"), format!("{theirs:?}"), "{name}");
+        }
+    }
+
+    // covers UP-06: a UTF-16 file cut off halfway through a character is a failed file.
+    #[test]
+    fn a_truncated_utf16_file_is_a_failed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cut");
+        std::fs::write(&path, [0xFF, 0xFE, b'a']).unwrap();
+        let loaded = load(std::slice::from_ref(&path));
+        assert_eq!(loaded.errors.len(), 1);
     }
 
     // covers UP-06: a read that hangs gives up in time, no second read of the same files starts
