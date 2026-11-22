@@ -3074,10 +3074,104 @@ mod tests {
         answer
     }
 
+    /// How long a [`ReadHold`] keeps a load before letting it go by itself, so that a loop that
+    /// wrongly waits for the read fails the test instead of hanging it.
+    const READ_HOLD_LIMIT: Duration = Duration::from_secs(30);
+
+    /// Keeps [`held_read`] of one path from finishing until the test drops this or the limit
+    /// passes, as a stalled mount would.
+    struct ReadHold {
+        path: PathBuf,
+        state: Arc<ReadHoldState>,
+    }
+
+    #[derive(Default)]
+    struct ReadHoldState {
+        progress: std::sync::Mutex<ReadHoldProgress>,
+        changed: std::sync::Condvar,
+    }
+
+    #[derive(Default)]
+    struct ReadHoldProgress {
+        loads: usize,
+        released: bool,
+    }
+
+    static READ_HOLDS: std::sync::Mutex<Vec<(PathBuf, Arc<ReadHoldState>)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    impl ReadHold {
+        fn on(path: &Path) -> Self {
+            let state = Arc::new(ReadHoldState::default());
+            READ_HOLDS
+                .lock()
+                .unwrap()
+                .push((path.to_path_buf(), state.clone()));
+            Self {
+                path: path.to_path_buf(),
+                state,
+            }
+        }
+
+        /// Whether a load has started and is still being kept from finishing.
+        fn holding(&self) -> bool {
+            let progress = self.state.progress.lock().unwrap();
+            progress.loads > 0 && !progress.released
+        }
+
+        /// Waits for a load to reach the hold.
+        async fn until_holding(&self) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !self.holding() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the read reached the hold");
+        }
+    }
+
+    impl Drop for ReadHold {
+        fn drop(&mut self) {
+            READ_HOLDS
+                .lock()
+                .unwrap()
+                .retain(|(path, _)| *path != self.path);
+            self.state.progress.lock().unwrap().released = true;
+            self.state.changed.notify_all();
+        }
+    }
+
+    /// Loads `paths`, first waiting on the [`ReadHold`] of any of them.
+    fn held_read(paths: &[PathBuf]) -> LoadedKubeconfig {
+        let hold = READ_HOLDS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(path, _)| paths.contains(path))
+            .map(|(_, state)| state.clone());
+        if let Some(state) = hold {
+            let until = std::time::Instant::now() + READ_HOLD_LIMIT;
+            let mut progress = state.progress.lock().unwrap();
+            progress.loads += 1;
+            while !progress.released {
+                let left = until.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    progress.released = true;
+                    break;
+                }
+                progress = state.changed.wait_timeout(progress, left).unwrap().0;
+            }
+        }
+        kubeconfig::load(paths)
+    }
+
     // covers UP-54, UP-55: a write check on a hung read leaves the loop free, so Stop Trusting and
-    // Hide from AI save meanwhile, and it is refused within the timeout.
+    // Hide from AI save meanwhile, and it is refused when the read's timeout passes.
     #[tokio::test]
     async fn a_hung_read_refuses_the_write_and_leaves_the_loop_free() {
+        // Only the paused clock below reaches this, so no save can have waited it out.
+        const TIMEOUT: Duration = Duration::from_secs(3600);
         let dir = tempfile::tempdir().unwrap();
         let yaml = kubeconfig_with("https://dev");
         let mut manager = manager_reading_two(dir.path(), &yaml, &yaml).await;
@@ -3088,36 +3182,29 @@ mod tests {
         assert!(manager.set_pin(expose, "dev".into(), at).await);
         manager.unlocks.unlock("dev", "https://dev");
         let pin = manager.contexts.pin_confirmed("dev");
-        let second = dir.path().join("second");
-        std::fs::remove_file(&second).unwrap();
-        make_fifo(&second);
-        manager.reader = KubeconfigReader::new(blocking_load, Duration::from_millis(100));
+        let hold = ReadHold::on(&dir.path().join("second"));
+        manager.reader = KubeconfigReader::new(held_read, TIMEOUT);
 
-        let started = std::time::Instant::now();
         let mut answer = ask_write(&mut manager, &pin);
+        hold.until_holding().await;
         let hide = Pins::AiExposure(AiScope::default());
         assert!(manager.set_pin(hide, "dev".into(), None).await);
         assert!(manager.set_pin(Pins::Trust, "dev".into(), None).await);
-        assert!(
-            started.elapsed() < Duration::from_millis(100),
-            "not held up"
-        );
+        assert!(hold.holding(), "the saves did not wait for the read");
         assert!(answer.try_recv().is_err(), "no answer before the read");
+        let internal = manager.internal_rx.as_mut().unwrap();
+        assert!(internal.try_recv().is_err(), "the read has not ended");
         let kept = saved(dir.path());
         assert!(kept.ai_exposed_clusters.is_empty() && kept.trusted_clusters.is_empty());
 
+        tokio::time::pause();
+        tokio::time::advance(TIMEOUT).await;
         let read = next_internal(&mut manager).await;
         assert!(matches!(read, Internal::WriteRead { read: None, .. }));
+        assert!(hold.holding(), "refused on the timeout, not a late result");
         manager.handle_internal(read).await;
         assert_eq!(answer.await.unwrap(), Err(WriteError::KubeconfigUnreadable));
-        assert!(started.elapsed() < Duration::from_secs(2));
         assert!(manager.held("dev"), "later writes are refused at once");
-        drop(
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&second)
-                .unwrap(),
-        );
     }
 
     /// Parses the files, then waits on a FIFO named `gate` beside them if there is one, so what
