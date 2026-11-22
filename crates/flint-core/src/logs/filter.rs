@@ -12,6 +12,7 @@ use std::collections::VecDeque;
 
 use super::buffer::LogLines;
 use super::line::{LineId, LogLine, Severity};
+use super::pattern::ScanCancel;
 use super::search::{SearchMatcher, SearchQuery};
 
 /// Most lines of context a filter keeps around each passing line.
@@ -50,6 +51,8 @@ pub struct LogFilter {
     /// The last lines scanned and not shown, newest last, at most `context` of them: the
     /// context before the next passing line.
     before: VecDeque<LineId>,
+    /// Ends a scan early; clones of this filter share it.
+    cancel: ScanCancel,
 }
 
 impl LogFilter {
@@ -64,6 +67,12 @@ impl LogFilter {
 
     pub fn spec(&self) -> &FilterSpec {
         &self.spec
+    }
+
+    /// Stops a scan of this filter or of a clone of it: the scan ends at the next line, and
+    /// [`LogFilter::pending`] counts the lines it left.
+    pub fn cancel_handle(&self) -> ScanCancel {
+        self.cancel.clone()
     }
 
     /// Whether `line` passes, context aside.
@@ -86,7 +95,12 @@ impl LogFilter {
         }
         let from = self.scanned_to.max(first);
         let context = self.spec.context;
+        let mut reached = lines.end_id();
         for (id, line) in lines.range(from, lines.end_id()) {
+            if self.cancel.is_cancelled() {
+                reached = id;
+                break;
+            }
             if self.passes(line) {
                 self.rows.extend(self.before.drain(..));
                 self.rows.push_back(id);
@@ -101,7 +115,7 @@ impl LogFilter {
                 self.before.push_back(id);
             }
         }
-        self.scanned_to = self.scanned_to.max(lines.end_id());
+        self.scanned_to = self.scanned_to.max(reached);
     }
 
     /// Drops the rows before `first` (evicted from the buffer) without scanning anything, and
@@ -260,5 +274,28 @@ mod tests {
         // Context is capped.
         let wide = LogFilter::new(matching("hit", 10_000));
         assert_eq!(wide.spec().context, MAX_CONTEXT);
+    }
+
+    // #309: a regex filters like a plain query, and a cancelled scan leaves the rest pending.
+    #[test]
+    fn a_regex_filter_keeps_context_and_stops_when_cancelled() {
+        let lines = buffer(&["a", "status=500", "b", "status=200", "c"], 100);
+        let spec = FilterSpec {
+            query: Some(SearchQuery {
+                regex: true,
+                ..SearchQuery::new(r"status=5\d\d")
+            }),
+            errors_only: false,
+            context: 1,
+        };
+        let mut filter = LogFilter::new(spec.clone());
+        filter.update(&lines.view());
+        assert_eq!(rows(&filter), [0, 1, 2]);
+
+        let mut cancelled = LogFilter::new(spec);
+        cancelled.cancel_handle().cancel();
+        cancelled.update(&lines.view());
+        assert!(cancelled.rows().is_empty());
+        assert_eq!(cancelled.pending(&lines.view()), 5);
     }
 }

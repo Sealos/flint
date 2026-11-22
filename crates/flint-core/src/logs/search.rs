@@ -15,12 +15,14 @@ use std::collections::VecDeque;
 use std::ops::Range;
 
 use memchr::memmem;
+use regex::Regex;
 
 use super::buffer::LogLines;
 use super::line::{LineId, LogLine};
+use super::pattern::{self, GUARD_SCAN_BYTES, GUARD_SCAN_LINES, PatternError, ScanCancel};
 
-/// What to look for: a plain substring of a line's text (timestamps are not searched), and
-/// optionally of its `pod/container` source.
+/// What to look for: a plain substring of a line's text (timestamps are not searched), or a
+/// regular expression with [`SearchQuery::regex`], and optionally of its `pod/container` source.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SearchQuery {
     pub text: String,
@@ -29,6 +31,9 @@ pub struct SearchQuery {
     /// Also match a workload line's `pod/container` source, as the prefix shows it (set this
     /// when the prefix is shown). Off by default.
     pub sources: bool,
+    /// Read `text` as a regular expression. Off by default. A pattern that does not compile
+    /// matches nothing; [`SearchQuery::pattern_error`] says why.
+    pub regex: bool,
 }
 
 impl SearchQuery {
@@ -37,7 +42,15 @@ impl SearchQuery {
             text: text.into(),
             case_sensitive: false,
             sources: false,
+            regex: false,
         }
+    }
+
+    /// Why this query's pattern cannot be used, for a regex query that does not compile.
+    pub fn pattern_error(&self) -> Option<PatternError> {
+        (self.regex && !self.text.is_empty())
+            .then(|| pattern::compile(&self.text, self.case_sensitive).err())
+            .flatten()
     }
 
     /// The query made ready to test many lines: what [`LogSearch`] scans with.
@@ -74,6 +87,8 @@ impl SearchQuery {
 /// - **Other text, either case**: a substring search in the text lowercased char by char rules
 ///   out most lines; where it finds the pattern, chars are compared with simple lowercase
 ///   folding at each char boundary, so offsets stay those of the text.
+/// - **Regex**: a linear-time engine with a compiled size limit (see `pattern`); highlighting
+///   stops at a fixed amount of work per line.
 #[derive(Debug, Clone, Default)]
 pub struct SearchMatcher {
     find: Find,
@@ -95,6 +110,7 @@ enum Find {
         lower: memmem::Finder<'static>,
         chars: Vec<char>,
     },
+    Regex(Regex),
 }
 
 impl SearchMatcher {
@@ -102,6 +118,8 @@ impl SearchMatcher {
         let text = query.text.as_str();
         let find = if text.is_empty() {
             Find::Nothing
+        } else if query.regex {
+            pattern::compile(text, query.case_sensitive).map_or(Find::Nothing, Find::Regex)
         } else if query.case_sensitive
             || (text.is_ascii() && !text.bytes().any(|b| b.is_ascii_alphabetic()))
         {
@@ -142,6 +160,7 @@ impl SearchMatcher {
             Find::Folded { chars, .. } => {
                 self.might_fold_match(text) && folded_matches(text, chars).next().is_some()
             }
+            Find::Regex(regex) => regex.is_match(text),
         }
     }
 
@@ -163,6 +182,7 @@ impl SearchMatcher {
                 }
                 folded_matches(text, chars).collect()
             }
+            Find::Regex(regex) => pattern::bounded_ranges(regex, text),
         }
     }
 
@@ -245,6 +265,8 @@ pub struct LogSearch {
     matches: VecDeque<LineId>,
     /// Lines below this id have been scanned.
     scanned_to: LineId,
+    /// Ends a scan early; clones of this search share it.
+    cancel: ScanCancel,
 }
 
 impl LogSearch {
@@ -254,11 +276,18 @@ impl LogSearch {
             query,
             matches: VecDeque::new(),
             scanned_to: 0,
+            cancel: ScanCancel::default(),
         }
     }
 
     pub fn query(&self) -> &SearchQuery {
         &self.query
+    }
+
+    /// Stops a scan of this search or of a clone of it: the scan ends at the next line, and
+    /// [`LogSearch::pending`] counts the lines it left.
+    pub fn cancel_handle(&self) -> ScanCancel {
+        self.cancel.clone()
     }
 
     /// Catches up with `lines`: drops matches that were evicted and scans lines not seen yet.
@@ -268,15 +297,41 @@ impl LogSearch {
         let drop = self.matches.partition_point(|id| *id < first);
         self.matches.drain(..drop);
         let from = self.scanned_to.max(first);
+        let mut reached = lines.end_id();
         if !self.query.text.is_empty() {
-            self.matches.extend(
-                lines
-                    .range(from, lines.end_id())
-                    .filter(|(_, line)| self.matcher.matches_line(line))
-                    .map(|(id, _)| id),
-            );
+            for (id, line) in lines.range(from, lines.end_id()) {
+                if self.cancel.is_cancelled() {
+                    reached = id;
+                    break;
+                }
+                if self.matcher.matches_line(line) {
+                    self.matches.push_back(id);
+                }
+            }
         }
-        self.scanned_to = self.scanned_to.max(lines.end_id());
+        self.scanned_to = self.scanned_to.max(reached);
+    }
+
+    /// The lines not scanned yet that a guard tests. All of them for a plain query; for a regex,
+    /// a window of the newest, at most [`GUARD_SCAN_LINES`] lines and about [`GUARD_SCAN_BYTES`]
+    /// bytes, since guards and state polls run on the UI thread.
+    fn unscanned<'a>(&self, lines: &'a LogLines) -> impl Iterator<Item = &'a LogLine> + 'a {
+        let end = lines.end_id();
+        let from = self.scanned_to.max(lines.first_id());
+        let (from, mut budget) = if self.query.regex {
+            let from = from.max(end.saturating_sub(GUARD_SCAN_LINES as LineId));
+            (from, GUARD_SCAN_BYTES)
+        } else {
+            (from, usize::MAX)
+        };
+        lines
+            .range(from, end)
+            .map(|(_, line)| line)
+            .take_while(move |line| {
+                let fits = budget > 0;
+                budget = budget.saturating_sub(line.text.len());
+                fits
+            })
     }
 
     /// How many lines of `lines` the next [`LogSearch::update`] would scan: a front end that
@@ -289,25 +344,27 @@ impl LogSearch {
 
     /// Whether a line of `lines` matches, counting lines not scanned yet (tested here, without
     /// keeping the result): what an action's guard asks between two updates, which must
-    /// neither count evicted matches nor miss new ones.
+    /// neither count evicted matches nor miss new ones. A regex query tests a bounded part of
+    /// the lines not scanned yet ([`LogSearch::update`] covers them all).
     pub fn has_match_in(&self, lines: &LogLines) -> bool {
         let (first, end) = (lines.first_id(), lines.end_id());
         let present = self.matches.partition_point(|id| *id < first);
         self.matches.get(present).is_some_and(|id| *id < end)
-            || lines
-                .range(self.scanned_to.max(first), end)
-                .any(|(_, line)| self.matcher.matches_line(line))
+            || self
+                .unscanned(lines)
+                .any(|line| self.matcher.matches_line(line))
     }
 
     /// How many lines of `lines` match, counting lines not scanned yet and not evicted matches,
-    /// as [`LogSearch::has_match_in`] sees them.
+    /// as [`LogSearch::has_match_in`] sees them (for a regex query, a lower bound until the
+    /// next update).
     pub fn count_in(&self, lines: &LogLines) -> usize {
-        let (first, end) = (lines.first_id(), lines.end_id());
+        let first = lines.first_id();
         let present = self.matches.partition_point(|id| *id < first);
         self.matches.len() - present
-            + lines
-                .range(self.scanned_to.max(first), end)
-                .filter(|(_, line)| self.matcher.matches_line(line))
+            + self
+                .unscanned(lines)
+                .filter(|line| self.matcher.matches_line(line))
                 .count()
     }
 
@@ -645,6 +702,118 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn regex(text: &str) -> SearchQuery {
+        SearchQuery {
+            regex: true,
+            ..SearchQuery::new(text)
+        }
+    }
+
+    // #309
+    #[test]
+    fn a_regex_query_matches_highlights_and_follows_case() {
+        let q = regex(r"status=5\d\d");
+        assert!(q.is_match("STATUS=503"));
+        assert!(!q.is_match("status=200"));
+        assert_eq!(q.match_ranges("x status=500 status=501"), [2..12, 13..23]);
+        let sensitive = SearchQuery {
+            case_sensitive: true,
+            ..q
+        };
+        assert!(!sensitive.is_match("STATUS=503"));
+        // Without the mode, the same text is a plain substring.
+        assert!(!SearchQuery::new(r"a.c").is_match("abc"));
+        assert!(SearchQuery::new(r"a.c").is_match("a.c"));
+        assert_eq!(SearchQuery::new("(").pattern_error(), None);
+        assert!(regex(r"a.c").is_match("abc"));
+    }
+
+    // #309: a pattern that does not compile says why and matches nothing.
+    #[test]
+    fn an_invalid_pattern_matches_nothing_and_says_why() {
+        let q = regex("(oops");
+        assert_eq!(
+            q.pattern_error().unwrap().to_string(),
+            "Invalid pattern: unclosed group"
+        );
+        assert!(!q.is_match("(oops"));
+        assert!(q.match_ranges("(oops").is_empty());
+        assert_eq!(regex("").pattern_error(), None);
+        assert!(!regex("").is_match("anything"));
+    }
+
+    // #309: patterns that make a backtracking engine run for ever finish on a full buffer of
+    // the lines that trigger it. The limit is far above the time taken and only catches a hang.
+    #[test]
+    fn pathological_patterns_finish_on_a_full_buffer() {
+        let mut buffer = LogBuffer::new(100_000);
+        let line = "a".repeat(200);
+        for _ in 0..100_000 {
+            push(&mut buffer, &line);
+        }
+        let lines = buffer.view();
+        let started = std::time::Instant::now();
+        for pattern in [r"(a+)+$b", r"(a|aa)+b", r"(.*)*x", r"(a*)*b", r"(x+x+)+y"] {
+            let mut search = LogSearch::new(regex(pattern));
+            search.update(&lines);
+            assert_eq!(search.count(), 0, "{pattern}");
+            assert!(regex(pattern).match_ranges(&line).is_empty(), "{pattern}");
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    // #309: a guard between scans tests a bounded part of what was not scanned for a regex,
+    // and all of it for a plain query, as before.
+    #[test]
+    fn guards_test_a_bounded_part_of_the_unscanned_lines_for_a_regex() {
+        let mut buffer = LogBuffer::new(GUARD_SCAN_LINES * 3);
+        push(&mut buffer, "needle");
+        for _ in 0..GUARD_SCAN_LINES * 2 {
+            push(&mut buffer, "hay");
+        }
+        let lines = buffer.view();
+        let bounded = LogSearch::new(regex("needle"));
+        assert!(!bounded.has_match_in(&lines), "too old for a guard to test");
+        assert_eq!(bounded.count_in(&lines), 0);
+        let plain = LogSearch::new(SearchQuery::new("needle"));
+        assert!(plain.has_match_in(&lines));
+        assert_eq!(plain.count_in(&lines), 1);
+        // The scan itself covers every line.
+        let mut scanned = bounded.clone();
+        scanned.update(&lines);
+        assert_eq!(scanned.count(), 1);
+
+        // Long lines end the guard's test by bytes, well before the line limit.
+        let mut long = LogBuffer::new(100);
+        let text = "x".repeat(GUARD_SCAN_BYTES);
+        push(&mut long, &text);
+        push(&mut long, "needle");
+        assert!(!LogSearch::new(regex("needle")).has_match_in(&long.view()));
+    }
+
+    // #309: a cancelled scan stops, keeps what it found, and leaves the rest pending.
+    #[test]
+    fn a_cancelled_scan_stops_and_leaves_the_rest_pending() {
+        let mut buffer = LogBuffer::new(10);
+        for t in ["hit", "hit", "hit"] {
+            push(&mut buffer, t);
+        }
+        let mut search = LogSearch::new(regex("hit"));
+        search.cancel_handle().cancel();
+        search.update(&buffer.view());
+        assert_eq!(search.count(), 0);
+        assert_eq!(search.pending(&buffer.view()), 3);
+        // A clone shares the signal.
+        let running = LogSearch::new(regex("hit"));
+        let clone = running.clone();
+        running.cancel_handle().cancel();
+        assert!(clone.cancel_handle().is_cancelled());
     }
 
     /// A quick measure of highlighting a long, wrapped line: 64 KiB with a match every dozen
