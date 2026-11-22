@@ -811,9 +811,23 @@ impl ClusterManager {
         kinds
     }
 
-    /// Whether `id` should run watches and follow its CRDs: the active cluster or a member.
+    /// Whether `id` should run watches and follow its CRDs: the active cluster, or a member while
+    /// its slot still shows the server it joined for.
     fn wants_watches(&self, id: &str) -> bool {
-        self.active.as_deref() == Some(id) || self.members.contains_key(id)
+        self.active.as_deref() == Some(id) || self.member_on_its_server(id)
+    }
+
+    /// Whether `id` is a member and its slot shows the server the member is bound to.
+    fn member_on_its_server(&self, id: &str) -> bool {
+        self.members
+            .get(id)
+            .zip(self.cluster(id))
+            .is_some_and(|(member, slot)| {
+                slot.info
+                    .server
+                    .as_deref()
+                    .is_some_and(|server| ServerIdentity::new(server) == *member.server())
+            })
     }
 
     /// Brings a cluster's watches in line with whether it wants them, its watch mode, and the
@@ -2267,22 +2281,17 @@ impl ClusterManager {
                 self.held.insert(name.clone());
             }
         }
-        // A member ends with its context, or when a load confirms another server. While that is
-        // unconfirmed it stays, paused, since the server may be a fallback.
-        let (clusters, contexts) = (&self.clusters, &self.contexts);
-        self.members.retain(|id, member| {
-            clusters
-                .iter()
-                .find(|c| c.info.name == *id)
-                .is_some_and(|slot| {
-                    contexts.provisional(id)
-                        || slot
-                            .info
-                            .server
-                            .as_deref()
-                            .is_some_and(|s| ServerIdentity::new(s) == *member.server())
-                })
-        });
+        // A member ends with its context, or on another server unless that is a pause: the server
+        // may then be a fallback, so it keeps its place and starts nothing.
+        let ended: Vec<ClusterId> = self
+            .members
+            .keys()
+            .filter(|id| !self.member_on_its_server(id) && !self.paused(id))
+            .cloned()
+            .collect();
+        for id in &ended {
+            self.members.remove(id);
+        }
         // The default namespace may have changed, and a filter set during a pause waits for this.
         for name in loaded.contexts.iter().map(|info| &info.name) {
             self.apply_scope(name);
@@ -2318,6 +2327,9 @@ impl ClusterManager {
             .collect::<Vec<_>>()
         {
             self.resume(&name);
+        }
+        for id in ended {
+            self.reconcile(&id);
         }
     }
 
@@ -5117,9 +5129,100 @@ mod tests {
                 cluster: "dev".into(),
             })
             .await;
+        // Disconnected, only the pause keeps this from starting an attempt.
+        manager.cluster_mut("dev").unwrap().state = ConnectionState::Disconnected;
         manager.ensure_connected("dev");
         let slot = manager.cluster("dev").unwrap();
         assert!(!slot.discovering, "no discovery");
+        assert!(matches!(slot.state, ConnectionState::Disconnected));
+        assert_eq!(manager.next_attempt, next, "no attempt started");
+    }
+
+    // First seen behind a broken file, `dev` has no confirmed definition, so a move to another
+    // server is no pause: the member ends, and the watches started there stop with the switch.
+    #[tokio::test]
+    async fn a_member_moved_while_never_confirmed_keeps_no_watches() {
+        let dir = tempfile::tempdir().unwrap();
+        let second = dir.path().join("second");
+        let at_a = kubeconfig_with("https://127.0.0.1:1");
+        let mut manager = manager_reading_two(dir.path(), UNREADABLE, &at_a).await;
+        assert!(manager.contexts.provisional("dev") && !manager.paused("dev"));
+        join_dev(&mut manager);
+
+        rewrite_file(
+            &mut manager,
+            &second,
+            &kubeconfig_with("https://127.0.0.1:2"),
+        )
+        .await;
+        assert!(manager.contexts.provisional("dev") && !manager.paused("dev"));
+        assert!(!manager.members.contains_key("dev"));
+
+        manager.active = Some("dev".to_owned());
+        let pods = watching_dev(&mut manager).await;
+        assert!(watches(&manager, &pods));
+        manager.active = None;
+        manager.reconcile("dev");
+        assert!(!manager.wants_watches("dev"));
+        assert!(!watches(&manager, &pods), "stopped with the switch");
+    }
+
+    // A member bound to another server wants nothing, and the load that removes it stops what
+    // still runs on the slot.
+    #[tokio::test]
+    async fn removing_a_stale_member_stops_its_watches() {
+        let dir = tempfile::tempdir().unwrap();
+        let at_b = kubeconfig_with("https://127.0.0.1:2");
+        let mut manager = manager_reading_two(dir.path(), UNREADABLE, &at_b).await;
+        manager.active = Some("dev".to_owned());
+        let pods = watching_dev(&mut manager).await;
+        let (member, _) = Member::join(ServerIdentity::new("https://127.0.0.1:1"), None, None);
+        manager.members.insert("dev".to_owned(), member);
+        manager.active = None;
+        assert!(!manager.wants_watches("dev"), "bound to another server");
+        assert!(watches(&manager, &pods));
+
+        rewrite_file(&mut manager, &dir.path().join("first"), NO_CONTEXTS).await;
+        assert!(!manager.contexts.provisional("dev"));
+        assert!(!manager.members.contains_key("dev"));
+        assert!(!watches(&manager, &pods), "stopped with the member");
+    }
+
+    // A removed member that is the active cluster keeps its watches.
+    #[tokio::test]
+    async fn removing_a_stale_member_leaves_the_active_cluster_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let at_b = kubeconfig_with("https://127.0.0.1:2");
+        let mut manager = manager_reading_two(dir.path(), UNREADABLE, &at_b).await;
+        manager.active = Some("dev".to_owned());
+        let pods = watching_dev(&mut manager).await;
+        let (member, _) = Member::join(ServerIdentity::new("https://127.0.0.1:1"), None, None);
+        manager.members.insert("dev".to_owned(), member);
+
+        rewrite_file(&mut manager, &dir.path().join("first"), NO_CONTEXTS).await;
+        assert!(!manager.members.contains_key("dev"));
+        assert!(watches(&manager, &pods));
+    }
+
+    // A fallback at another server is a real pause: the member keeps its place, wants nothing
+    // and starts nothing, and counts again once the load shows its server.
+    #[tokio::test]
+    async fn a_paused_member_on_a_fallback_server_keeps_its_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = kubeconfig_with("https://127.0.0.1:2");
+        let (mut manager, confirmed, first) = pausable(dir.path(), &fallback).await;
+        join_dev(&mut manager);
+        let next = manager.next_attempt;
+
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(manager.contexts.provisional("dev") && manager.paused("dev"));
+        assert!(manager.members.contains_key("dev"), "a pause keeps it");
+        assert!(!manager.wants_watches("dev"));
+        assert!(manager.watched_kinds("dev").is_empty());
+
+        rewrite_file(&mut manager, &first, &confirmed).await;
+        assert!(manager.members.contains_key("dev"));
+        assert!(manager.wants_watches("dev"));
         assert_eq!(manager.next_attempt, next, "no attempt started");
     }
 
