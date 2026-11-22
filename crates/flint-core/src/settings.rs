@@ -1165,19 +1165,38 @@ fn edit_settings(
     edit: impl FnOnce(&mut toml::Table, &Path) -> Result<(), SettingsError>,
 ) -> Result<Settings, SettingsError> {
     let path = dir.join(SETTINGS_FILE);
-    let _lock = lock_for_save(&path)?;
-    let mut table = match read_settings_text(&path)? {
-        Some(text) => parse_settings(&text, &path)?.1,
+    let lock = lock_for_save(&path, try_flock)?;
+    edit_locked(&path, &lock, edit)
+}
+
+/// The read, edit and write of [`edit_settings`], all on the file `lock` was taken for. If
+/// `path` has come to lead elsewhere by the time of the write, nothing is written.
+fn edit_locked(
+    path: &Path,
+    lock: &SaveLock,
+    edit: impl FnOnce(&mut toml::Table, &Path) -> Result<(), SettingsError>,
+) -> Result<Settings, SettingsError> {
+    let mut table = match read_settings_text(&lock.target)? {
+        Some(text) => parse_settings(&text, path)?.1,
         None => toml::Table::new(),
     };
-    edit(&mut table, &path)?;
+    edit(&mut table, path)?;
     let text = toml::to_string_pretty(&table)?;
     let settings: Settings = toml::from_str(&text).map_err(|source| SettingsError::Parse {
-        path: path.clone(),
+        path: path.to_owned(),
         source,
     })?;
-    validate(&settings, &path)?;
-    write_atomic(&path, &text, DanglingLink::Keep)?;
+    validate(&settings, path)?;
+    let write_error = |source| SettingsError::Write {
+        path: path.to_owned(),
+        source,
+    };
+    if !lock.is_current(path).map_err(write_error)? {
+        return Err(write_error(io::Error::other(
+            "the settings file was moved during the save; try again",
+        )));
+    }
+    write_atomic(&lock.target, &text, DanglingLink::Keep)?;
     Ok(settings)
 }
 
@@ -1188,74 +1207,165 @@ const SAVE_LOCK_WAIT: Duration = Duration::from_secs(2);
 /// a save replaces the settings file and with it any lock held on it. The OS releases it when the
 /// holder exits, however that happens.
 struct SaveLock {
-    /// Closing it releases the lock.
-    _file: std::fs::File,
+    /// Closing it releases the lock. `None` on a filesystem without file locks, where the save
+    /// goes ahead unserialized: refusing it would make a revocation impossible there.
+    file: Option<std::fs::File>,
+    /// The file this lock is for: what the save reads and replaces.
+    target: PathBuf,
+}
+
+/// One non-blocking attempt at the lock on an open file.
+type TryLock = fn(&std::fs::File) -> io::Result<()>;
+
+fn try_flock(file: &std::fs::File) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: flock on a descriptor `file` owns.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 impl SaveLock {
     /// Takes the lock for the settings file at `settings`, trying for up to `wait`.
+    #[cfg(test)]
     fn take(settings: &Path, wait: Duration) -> io::Result<Self> {
-        use std::os::fd::AsRawFd as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let path = save_lock_path(settings);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Non-blocking, so that something other than a regular file here cannot hang the open.
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)?;
-        if !file.metadata()?.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the settings lock is not a regular file",
-            ));
-        }
+        Self::take_with(settings, wait, try_flock)
+    }
+
+    /// Takes the lock on the lock file that belongs to `settings` once it is held: a link may be
+    /// pointed elsewhere, or the lock file replaced, during the wait, so both are checked again
+    /// and a stale lock is dropped for the current one, all within `wait`.
+    fn take_with(settings: &Path, wait: Duration, try_lock: TryLock) -> io::Result<Self> {
         let deadline = Instant::now() + wait;
         loop {
-            // SAFETY: flock on a descriptor `file` owns.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Ok(SaveLock { _file: file });
+            let file = open_save_lock(&save_lock_path(&save_target(settings)))?;
+            match wait_for_lock(&file, deadline, try_lock) {
+                Ok(()) => {}
+                Err(error) if locks_unsupported(&error) => {
+                    tracing::warn!("saving settings without a lock: file locks are unsupported");
+                    return Ok(SaveLock {
+                        file: None,
+                        target: save_target(settings),
+                    });
+                }
+                Err(error) => return Err(error),
             }
-            let error = io::Error::last_os_error();
-            match error.kind() {
-                io::ErrorKind::Interrupted => continue,
-                io::ErrorKind::WouldBlock => {}
-                _ => return Err(error),
+            let target = save_target(settings);
+            if names_open_file(&save_lock_path(&target), &file)? {
+                return Ok(SaveLock {
+                    file: Some(file),
+                    target,
+                });
             }
+            drop(file);
             if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "another Flint is still saving settings; try again",
-                ));
+                return Err(save_lock_timeout());
             }
             std::thread::sleep(Duration::from_millis(1));
         }
     }
+
+    /// Whether `settings` still leads to the file this lock is for.
+    fn is_current(&self, settings: &Path) -> io::Result<bool> {
+        let target = save_target(settings);
+        match &self.file {
+            Some(file) => names_open_file(&save_lock_path(&target), file),
+            None => Ok(target == self.target),
+        }
+    }
 }
 
-/// The lock file beside the file a save really replaces, so paths that link to one settings file
+/// Opens (creating it if needed) the lock file at `path`.
+fn open_save_lock(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Non-blocking, so that something other than a regular file here cannot hang the open.
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the settings lock is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Tries `try_lock` until it succeeds or `deadline` passes.
+fn wait_for_lock(file: &std::fs::File, deadline: Instant, try_lock: TryLock) -> io::Result<()> {
+    loop {
+        let error = match try_lock(file) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        match error.kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::WouldBlock => {}
+            _ => return Err(error),
+        }
+        if Instant::now() >= deadline {
+            return Err(save_lock_timeout());
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn save_lock_timeout() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "another Flint is still saving settings; try again",
+    )
+}
+
+/// Whether `error` says this filesystem has no file locks, as opposed to a lock that failed.
+fn locks_unsupported(error: &io::Error) -> bool {
+    error
+        .raw_os_error()
+        .is_some_and(|code| [libc::ENOLCK, libc::ENOTSUP, libc::EOPNOTSUPP].contains(&code))
+}
+
+/// Whether `path` is the open `file` (false when it is gone or replaced).
+fn names_open_file(path: &Path, file: &std::fs::File) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let open = file.metadata()?;
+    match std::fs::symlink_metadata(path) {
+        Ok(current) => Ok(open.dev() == current.dev() && open.ino() == current.ino()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// The file a save of `settings` really replaces: through any symlink, or `settings` itself
+/// if it does not exist yet.
+fn save_target(settings: &Path) -> PathBuf {
+    std::fs::canonicalize(settings).unwrap_or_else(|_| settings.to_owned())
+}
+
+/// The lock file beside `target` (see [`save_target`]), so paths that link to one settings file
 /// share one lock, and a directory a save can write to is also one that can hold the lock.
-fn save_lock_path(settings: &Path) -> PathBuf {
-    let mut path = std::fs::canonicalize(settings)
-        .unwrap_or_else(|_| settings.to_owned())
-        .into_os_string();
+fn save_lock_path(target: &Path) -> PathBuf {
+    let mut path = target.as_os_str().to_owned();
     path.push(".lock");
     path.into()
 }
 
-/// [`SaveLock::take`] for a save. A dangling link fails as unreadable before anything is created
-/// beside it. If the lock cannot be set up, a settings file that cannot be read is reported as
-/// that. A timeout reads nothing: the holder may be stuck on that same read.
-fn lock_for_save(path: &Path) -> Result<SaveLock, SettingsError> {
+/// [`SaveLock::take_with`] for a save. A dangling link fails as unreadable before anything is
+/// created beside it. If the lock cannot be set up, a settings file that cannot be read is
+/// reported as that. A timeout reads nothing: the holder may be stuck on that same read.
+fn lock_for_save(path: &Path, try_lock: TryLock) -> Result<SaveLock, SettingsError> {
     if behind_dangling_link(path) {
         read_settings_text(path)?;
     }
-    SaveLock::take(path, SAVE_LOCK_WAIT).or_else(|source| {
+    SaveLock::take_with(path, SAVE_LOCK_WAIT, try_lock).or_else(|source| {
         if source.kind() != io::ErrorKind::TimedOut {
             read_settings_text(path)?;
         }
@@ -1557,6 +1667,104 @@ mod save_lock_tests {
             Err(SettingsError::Write { .. })
         ));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_lock_file_replaced_during_the_wait_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE);
+        let held = SaveLock::take(&path, Duration::ZERO).unwrap();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| SaveLock::take(&path, Duration::from_secs(10)));
+            std::thread::sleep(Duration::from_millis(100));
+            let sidecar = save_lock_path(&save_target(&path));
+            std::fs::remove_file(&sidecar).unwrap();
+            std::fs::write(&sidecar, "").unwrap();
+            drop(held);
+            let lock = waiter.join().unwrap().unwrap();
+            assert!(lock.is_current(&path).unwrap(), "on the new lock file");
+            assert!(SaveLock::take(&path, Duration::ZERO).is_err(), "held");
+        });
+    }
+
+    #[test]
+    fn a_link_retargeted_during_the_wait_locks_the_new_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let (old, new) = (root.join("old.toml"), root.join("new.toml"));
+        std::fs::write(&old, "appearance = \"light\"\n").unwrap();
+        std::fs::write(&new, "appearance = \"dark\"\n").unwrap();
+        let link = root.join(SETTINGS_FILE);
+        std::os::unix::fs::symlink(&old, &link).unwrap();
+        let held = SaveLock::take(&link, Duration::ZERO).unwrap();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| SaveLock::take(&link, Duration::from_secs(10)));
+            std::thread::sleep(Duration::from_millis(100));
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(&new, &link).unwrap();
+            drop(held);
+            assert_eq!(waiter.join().unwrap().unwrap().target, new);
+        });
+    }
+
+    #[test]
+    fn a_link_retargeted_under_the_lock_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let (old, new) = (root.join("old.toml"), root.join("new.toml"));
+        let (old_text, new_text) = ("appearance = \"light\"\n", "appearance = \"system\"\n");
+        std::fs::write(&old, old_text).unwrap();
+        std::fs::write(&new, new_text).unwrap();
+        let link = root.join(SETTINGS_FILE);
+        std::os::unix::fs::symlink(&old, &link).unwrap();
+        let lock = lock_for_save(&link, try_flock).unwrap();
+        let result = edit_locked(&link, &lock, |table, _| {
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(&new, &link).unwrap();
+            table.insert("appearance".into(), "dark".into());
+            Ok(())
+        });
+        assert!(matches!(result, Err(SettingsError::Write { .. })));
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), old_text);
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), new_text);
+    }
+
+    #[test]
+    fn a_filesystem_without_locks_still_saves_a_revocation() {
+        fn unsupported(code: i32) -> io::Result<()> {
+            Err(io::Error::from_raw_os_error(code))
+        }
+        let attempts: [TryLock; 3] = [
+            |_| unsupported(libc::ENOLCK),
+            |_| unsupported(libc::ENOTSUP),
+            |_| unsupported(libc::EOPNOTSUPP),
+        ];
+        for try_lock in attempts {
+            let dir = tempfile::tempdir().unwrap();
+            set_trusted(dir.path(), "dev", Some("https://dev")).unwrap();
+            let path = dir.path().join(SETTINGS_FILE);
+            let lock = lock_for_save(&path, try_lock).unwrap();
+            assert!(lock.file.is_none());
+            edit_locked(&path, &lock, |table, _| {
+                table.remove("trusted_clusters");
+                Ok(())
+            })
+            .unwrap();
+            assert!(
+                load_settings(dir.path())
+                    .unwrap()
+                    .trusted_clusters
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn any_other_lock_error_fails_the_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE);
+        let failed = lock_for_save(&path, |_| Err(io::Error::from_raw_os_error(libc::EIO)));
+        assert!(matches!(failed, Err(SettingsError::Write { .. })));
     }
 
     #[test]
