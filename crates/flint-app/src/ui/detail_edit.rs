@@ -158,8 +158,12 @@ fn edit_error_text(error: &WriteError) -> String {
     const AGAIN: &str = "copy your edit if you want to keep it, then open the object again";
     match error {
         WriteError::Refused(WriteRefusal::Moved { cluster }) => {
+            // One text for both causes: the context points at another server now, or a kubeconfig
+            // file could not be read, so the server it points at cannot be confirmed.
             format!(
-                "\"{cluster}\" points at another server than this object was opened from; {AGAIN}"
+                "\"{cluster}\" points at another server than this object was opened from, or \
+                 its kubeconfig could not be read to confirm it; {AGAIN}. If a kubeconfig file \
+                 is unreadable, fix it before you open the object again"
             )
         }
         WriteError::Refused(WriteRefusal::Stale { cluster }) => {
