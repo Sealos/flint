@@ -6,7 +6,7 @@ use std::sync::Arc;
 use flint_core::settings::AiExposure;
 use flint_core::{ConnectionState, SafeErrorText, ServerVersion, Settings};
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
-use gpui_kit::{AppContext as _, TestAppContext};
+use gpui_kit::{AppContext as _, Bounds, Pixels, TestAppContext, VisualTestContext, px, size};
 use serde_json::json;
 
 use crate::ui::registry;
@@ -289,4 +289,77 @@ async fn the_state_names_each_connection(cx: &mut TestAppContext) {
         });
         assert_eq!(got, want.map(|(c, e)| (c, e.map(str::to_owned))));
     }
+}
+
+fn bounds(cx: &mut TestAppContext, t: &TestWorkspace, id: &'static str) -> Bounds<Pixels> {
+    render(cx, t);
+    cx.update_window(t.window, |_, window, _| window.find(id).bounds())
+        .unwrap()
+}
+
+/// Asserts the list leaves room for the focus ring on every side of the row.
+#[track_caller]
+fn assert_ring_fits(cx: &mut TestAppContext, t: &TestWorkspace, row: &'static str) {
+    // How far the toolkit paints a focus ring outside a control.
+    const RING: Pixels = px(3.);
+    let list = bounds(cx, t, "ns-list");
+    let at = bounds(cx, t, row);
+    assert!(
+        at.left() - RING >= list.left()
+            && at.right() + RING <= list.right()
+            && at.top() - RING >= list.top()
+            && at.bottom() + RING <= list.bottom(),
+        "the ring of {row} at {at:?} is clipped by the list at {list:?}"
+    );
+}
+
+// The namespace rows draw the whole focus ring, on the first and last rows and while scrolled.
+#[gpui_kit::test]
+async fn the_namespace_list_leaves_room_for_the_focus_ring(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0)]).await;
+    t.workspace.update(cx, |ws, cx| {
+        ws.namespaces = (0..30).map(|i| format!("zz-{i:02}")).collect();
+        cx.notify();
+    });
+    t.click(cx, "namespace-filter-button");
+    t.wait_for_element(cx, "ns-all").await;
+
+    t.press(cx, "tab");
+    assert_ring_fits(cx, &t, "ns-zz-00");
+    // Up from the first row, past "All namespaces" and the text field, to the last row.
+    for _ in 0..3 {
+        t.press(cx, "up");
+    }
+    assert_ring_fits(cx, &t, "ns-zz-29");
+    t.press(cx, "up");
+    assert_ring_fits(cx, &t, "ns-zz-28");
+    // Back round to the first row, scrolling the list to its top.
+    for _ in 0..4 {
+        t.press(cx, "down");
+    }
+    assert_ring_fits(cx, &t, "ns-zz-00");
+}
+
+// At the minimum window size the detail shows alone, so the sidebar need not give way to a list
+// that is not drawn: its rows keep room for a cluster's name and address.
+#[gpui_kit::test]
+async fn the_sidebar_keeps_its_width_beside_the_detail_alone(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0), ("demo", "web", 0)])
+        .await;
+    VisualTestContext::from_window(t.window, cx).simulate_resize(size(px(760.), px(480.)));
+    render(cx, &t);
+    t.click(cx, "row-uid-web");
+    render(cx, &t);
+    assert!(shown(cx, &t, "detail-back"), "the detail shows alone");
+
+    for id in ["cluster-server-kind-alpha", "cluster-server-kind-beta"] {
+        let line = bounds(cx, &t, id).size.width;
+        // "127.0.0.1:65535" at the row's text size.
+        assert!(line >= px(90.), "{id} is {line:?} wide");
+    }
+    assert!(bounds(cx, &t, "detail-back").right() <= px(760.));
 }

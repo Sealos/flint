@@ -506,6 +506,76 @@ async fn the_active_tab_stays_in_view(cx: &mut TestAppContext) {
     assert!(tab_in_view(cx, window, tabs[0]));
 }
 
+/// Opens 17 shells in a 700x420 window, with the tab list open on tab `active` of them.
+fn open_long_tab_list(
+    cx: &mut TestAppContext,
+    active: usize,
+) -> (AnyWindowHandle, Entity<Dock>, Vec<FakeExec>) {
+    let (window, dock) = open_dock(cx);
+    cx.simulate_window_resize(window, size(px(700.), px(420.)));
+    let mut tabs = Vec::new();
+    let mut fakes = Vec::new();
+    for n in 1..=17 {
+        let (id, fake) = open_shell_in(cx, window, &dock, &format!("web-{n}"));
+        tabs.push(id);
+        fakes.push(fake);
+    }
+    activate(cx, window, tabs[active]);
+    // By its action: a click would leave the pointer over a row, highlighting it.
+    dispatch(cx, window, "dock::ShowTabList");
+    draw(cx, window);
+    draw(cx, window);
+    (window, dock, fakes)
+}
+
+/// Whether row `ix` of the open menu lies wholly inside the menu, and the menu inside the window.
+fn row_in_view(cx: &mut TestAppContext, window: AnyWindowHandle, ix: usize) -> bool {
+    cx.update_window(window, |_, window, _| {
+        let menu = window.find("popup-menu").bounds();
+        let viewport = window.viewport_size();
+        assert!(menu.top() >= px(0.), "{menu:?}");
+        assert!(menu.bottom() <= viewport.height, "{menu:?}");
+        let row = window.within("popup-menu").find(ix).bounds();
+        row.top() >= menu.top() - px(0.5) && row.bottom() <= menu.bottom() + px(0.5)
+    })
+    .unwrap()
+}
+
+// covers UP-42: a tab list taller than the window is capped to it, and the highlight stays in
+// view all the way down, and when it wraps back to the top (#419).
+#[gpui_kit::test]
+async fn the_tab_list_keeps_the_highlight_in_view(cx: &mut TestAppContext) {
+    let (window, _dock, _fakes) = open_long_tab_list(cx, 0);
+    assert!(row_in_view(cx, window, 0));
+    assert!(!row_in_view(cx, window, 16), "more rows than fit");
+    for ix in 0..17 {
+        cx.simulate_keystrokes(window, "down");
+        draw(cx, window);
+        assert!(row_in_view(cx, window, ix), "row {ix}");
+    }
+    cx.simulate_keystrokes(window, "down");
+    draw(cx, window);
+    assert!(row_in_view(cx, window, 0), "wrapped to the first row");
+}
+
+// covers UP-42: the tab list opens with the active tab in view, even the last of many (#419).
+#[gpui_kit::test]
+async fn the_tab_list_opens_on_the_active_tab(cx: &mut TestAppContext) {
+    let (window, _dock, _fakes) = open_long_tab_list(cx, 16);
+    assert!(row_in_view(cx, window, 16));
+}
+
+// covers UP-42: the tab list's height was worked out for the window it opened in, so it closes
+// when that window gets shorter (#419).
+#[gpui_kit::test]
+async fn the_tab_list_closes_when_the_window_shrinks(cx: &mut TestAppContext) {
+    let (window, dock, _fakes) = open_long_tab_list(cx, 0);
+    assert!(dock.read_with(cx, |d, _| d.tab_menu_for_tests().is_some()));
+    cx.simulate_window_resize(window, size(px(700.), px(300.)));
+    draw(cx, window);
+    assert!(dock.read_with(cx, |d, _| d.tab_menu_for_tests().is_none()));
+}
+
 // covers UP-42: an empty dock shows no tab strip, only how to open logs or a shell.
 #[gpui_kit::test]
 async fn an_empty_dock_says_how_to_open_a_tab(cx: &mut TestAppContext) {
