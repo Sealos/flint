@@ -156,6 +156,14 @@ impl CredentialSource {
             CredentialSource::Definition
         }
     }
+
+    /// Whether using this credential can start a program.
+    pub(crate) fn runs_a_command(&self) -> bool {
+        matches!(
+            self,
+            CredentialSource::Plugin | CredentialSource::AuthProvider
+        )
+    }
 }
 
 /// A certificate or key file, with the digest of the bytes the client was built from. `None`
@@ -341,10 +349,7 @@ impl WriteCredential {
         grant: CredentialGrant,
         guarded: Option<GuardedProvider>,
     ) -> Self {
-        let check_identity = matches!(
-            source,
-            CredentialSource::Plugin | CredentialSource::AuthProvider
-        );
+        let check_identity = source.runs_a_command();
         let token = match (source, refreshing) {
             (CredentialSource::TokenFile(path), _) => TokenSource::File(path),
             (CredentialSource::AuthProvider, _) => TokenSource::Provider(auth),
@@ -362,6 +367,16 @@ impl WriteCredential {
 
     pub(crate) fn id(&self) -> CredentialId {
         CredentialId(Arc::downgrade(&self.0))
+    }
+
+    /// Whether this connection's credential can start a program, whatever the kubeconfig says now.
+    pub(crate) fn runs_a_command(&self) -> bool {
+        self.0.grant.runs_a_command()
+    }
+
+    /// Whether a server refused this credential in the background since this was last asked.
+    pub(crate) fn take_refused(&self) -> bool {
+        self.0.grant.take_refused()
     }
 
     /// Reads the credential for one request, and returns `client` set to send exactly that.

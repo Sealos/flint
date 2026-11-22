@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use flint_core::handle::{Command, CoreHandle, MemberStatus};
 use flint_core::{KindId, Settings};
-use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, write_kubeconfigs};
+use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, WatchStep, write_kubeconfigs};
 
 #[allow(dead_code)]
 mod core_support;
@@ -105,7 +105,11 @@ async fn a_failing_and_a_hung_member_leave_another_live() {
     let (core, _path) = core_on(&[&a, &live, &failing, &hung]).await;
     let _on_live = core.handle.subscribe("b", &pod_kind());
 
-    set(&core.handle, &["b", "c", "d"]);
+    // The hung member goes first, and its request is on the server before anything is judged.
+    set(&core.handle, &["d", "b", "c"]);
+    tokio::time::timeout(WAIT, hold.reached())
+        .await
+        .expect("the hung member's request should reach its server");
     until_status(&core.handle, "b", |s| *s == MemberStatus::Live).await;
     live.wait_for_watches(&pods(), 1, WAIT).await.unwrap();
     until_status(&core.handle, "c", |s| {
@@ -117,6 +121,25 @@ async fn a_failing_and_a_hung_member_leave_another_live() {
     assert_eq!(d.status, MemberStatus::Connecting, "still hanging");
     assert_eq!(live.open_watches(&pods()), 1, "the live member goes on");
     hold.release();
+}
+
+#[tokio::test]
+async fn a_background_watch_refused_with_401_needs_sign_in() {
+    let [a, b] = servers().await;
+    let (core, _path) = core_on(&[&a, &b]).await;
+    let _on_b = core.handle.subscribe("b", &pod_kind());
+    set(&core.handle, &["a", "b"]);
+    until_status(&core.handle, "b", |s| *s == MemberStatus::Live).await;
+    b.wait_for_watches(&pods(), 1, WAIT).await.unwrap();
+
+    b.inject(Fault::status(401));
+    b.send_watch(&pods(), WatchStep::End);
+
+    until_status(&core.handle, "b", |s| {
+        matches!(s, MemberStatus::SignInNeeded { .. })
+    })
+    .await;
+    until_no_watches(&b).await;
 }
 
 #[tokio::test]

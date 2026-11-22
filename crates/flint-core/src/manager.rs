@@ -70,7 +70,7 @@ pub(crate) struct Cluster {
     /// Stops the latest attempt, so one that a newer attempt or a new slot replaced ends rather
     /// than run on. Its result, if already sent, is still discarded by `attempt`.
     connect_task: Option<AbortHandle>,
-    /// The role and policy a member's connection is made under.
+    /// The role and policy this slot's connections are made under.
     access: CredentialAccess,
     /// The running set's attempt that the connection in progress answers.
     member_attempt: Option<AttemptId>,
@@ -2026,12 +2026,12 @@ impl ClusterManager {
         let internal = self.internal_tx.clone();
         let attempt = self.next_attempt;
         let paused = self.paused(id);
-        // Only a member's connection can be demoted; any other is made as it always was.
-        let member = self.members.contains_key(id);
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
-        let access = member.then(|| slot.access.clone());
+        // Every connection is made under the slot's role, so one that later joins the set and
+        // moves to the background can be stopped from running its credential.
+        let access = slot.access.clone();
         if paused
             || matches!(
                 slot.state,
@@ -2066,18 +2066,13 @@ impl ClusterManager {
         let rejections = internal.clone();
         let attempt_task = tokio::spawn(async move {
             let merged = &kubeconfig.merged;
-            let result = match access {
-                Some(access) => {
-                    cluster::connect_gated_and_check_with_policy(
-                        merged,
-                        &name,
-                        CONNECT_TIMEOUT,
-                        &access,
-                    )
-                    .await
-                }
-                None => cluster::connect_gated_and_check(merged, &name, CONNECT_TIMEOUT).await,
-            };
+            let result = cluster::connect_gated_and_check_with_policy(
+                merged,
+                &name,
+                CONNECT_TIMEOUT,
+                &access,
+            )
+            .await;
             result.map_err(|e| {
                 if running_set::needs_sign_in(&e) {
                     let _ = rejections.send(Internal::AttemptRejected {
@@ -2299,6 +2294,8 @@ impl ClusterManager {
             .map(|c| (c.info.name.clone(), c))
             .collect();
         let mut changed_active = false;
+        // Dropping a slot aborts its attempt, which then never reports: its admission is freed here.
+        let mut discarded: Vec<AttemptId> = Vec::new();
         for info in &loaded.contexts {
             let fingerprint = cluster::context_fingerprint(&loaded.merged, &info.name);
             let was_paused = paused.contains(&info.name);
@@ -2318,6 +2315,7 @@ impl ClusterManager {
                     if self.active.as_deref() == Some(&info.name) {
                         changed_active = true;
                     }
+                    discarded.extend(old.member_attempt);
                     let mut fresh =
                         Cluster::new(info.clone(), fingerprint, &self.hubs, &self.engine_config);
                     fresh.namespace_filter = old.namespace_filter.clone();
@@ -2363,6 +2361,10 @@ impl ClusterManager {
                 self.held.insert(name.clone());
             }
         }
+        discarded.extend(old.values().filter_map(|slot| slot.member_attempt));
+        for attempt in discarded {
+            self.schedule.finish(attempt);
+        }
         // A member ends with its context, or on another server once a load confirms it. Until then
         // the server may be a fallback, so it keeps its place and starts nothing.
         let ended: Vec<ClusterId> = self
@@ -2403,7 +2405,7 @@ impl ClusterManager {
                     "\"{active}\" was removed from your kubeconfig files."
                 )));
             } else if changed_active {
-                self.ensure_connected(&active);
+                self.reconnect_active(&active);
             }
         }
         for name in paused
@@ -2619,6 +2621,8 @@ fn keep_skipped_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::member::MemberState;
+    use crate::credential::CredentialSource;
 
     // covers UP-20, UP-22
     #[test]
@@ -5317,6 +5321,229 @@ mod tests {
         assert_ne!(slot.generation, generation);
         assert!(matches!(slot.state, ConnectionState::Connecting));
         assert_eq!(manager.next_attempt, next + 1, "one attempt started");
+    }
+
+    /// Makes `dev` a live member with a connection, as if it had connected through its attempt.
+    async fn live_dev(manager: &mut ClusterManager) -> KindId {
+        join_dev(manager);
+        let pods = watching_dev(manager).await;
+        let attempt = manager.schedule.start_active(&"dev".to_owned());
+        let member = manager.members.get_mut("dev").unwrap();
+        assert!(member.begin_attempt(attempt));
+        let finished = MemberEvent::AttemptFinished {
+            attempt,
+            outcome: AttemptOutcome::Connected,
+        };
+        manager.apply_member("dev", finished, Instant::now());
+        pods
+    }
+
+    fn dev_state(manager: &ClusterManager) -> MemberState {
+        manager.members["dev"].state().clone()
+    }
+
+    // A connection made before the set existed keeps its credential's rules when the kubeconfig
+    // that defined it can no longer be read: moved to the background, it ends as signed out.
+    #[tokio::test]
+    async fn a_retained_command_credential_stops_while_its_kubeconfig_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, _, first) = pausable(dir.path(), NO_CONTEXTS).await;
+        manager.active = Some("dev".to_owned());
+        let pods = live_dev(&mut manager).await;
+        let slot = manager.cluster_mut("dev").unwrap();
+        let grant = slot.access.grant(CredentialSource::Plugin);
+        slot.write_credential = Some(WriteCredential::with_grant(
+            Vec::new(),
+            CredentialSource::Plugin,
+            None,
+            None,
+            grant.clone(),
+            None,
+        ));
+
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(manager.held("dev"));
+        assert!(manager.runs_a_command("dev"));
+        manager.activate("other".to_owned());
+
+        assert!(!grant.allowed(), "the retained credential may not run");
+        assert!(matches!(
+            dev_state(&manager),
+            MemberState::SignInNeeded { .. }
+        ));
+        let slot = manager.cluster("dev").unwrap();
+        assert!(slot.client.is_none() && slot.write_credential.is_none());
+        assert!(!watches(&manager, &pods));
+    }
+
+    // With no connection to ask, what can't be known counts as running a command.
+    #[tokio::test]
+    async fn an_unknown_credential_counts_as_running_a_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, confirmed, first) = pausable(dir.path(), NO_CONTEXTS).await;
+        assert!(!manager.runs_a_command("dev"), "an empty user runs nothing");
+        assert!(manager.runs_a_command("missing"));
+
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(manager.runs_a_command("dev"), "its file can't be read");
+
+        let no_user = confirmed.replace("- name: u\n  user: {}\n", "- name: x\n  user: {}\n");
+        rewrite_file(&mut manager, &first, &no_user).await;
+        assert!(manager.runs_a_command("dev"), "it names a user not defined");
+    }
+
+    // A legacy auth provider's command runs inside kube and can't be stopped once started, so a
+    // context using one neither connects nor refreshes unless it is in the foreground.
+    #[tokio::test]
+    async fn a_provider_command_never_runs_for_a_background_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let ran = dir.path().join("ran");
+        let script = dir.path().join("provider.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntouch '{}'\necho '{{\"token\":\"t\"}}'\n",
+                ran.display()
+            ),
+        )
+        .unwrap();
+        let provider = format!(
+            "user:\n    auth-provider:\n      name: gcp\n      config:\n        cmd-path: /bin/sh\n        \
+             cmd-args: {}\n        token-key: '{{.token}}'\n",
+            script.display()
+        );
+        let yaml = kubeconfig_with("https://127.0.0.1:1").replace("user: {}\n", &provider);
+        let mut manager = manager_reading_two(dir.path(), &yaml, NO_CONTEXTS).await;
+        assert!(manager.runs_a_command("dev"));
+
+        manager.set_running_set(vec!["dev".to_owned(), "other".to_owned()]);
+        for id in ["dev", "other"] {
+            assert!(matches!(
+                manager.members[id].state(),
+                MemberState::SignInNeeded { .. }
+            ));
+            assert!(manager.cluster(id).unwrap().connect_task.is_none());
+        }
+
+        // Nor does a connection asked for directly under the background role.
+        let access = manager.cluster("dev").unwrap().access.clone();
+        let refused =
+            cluster::connect_gated_with_policy(&manager.kubeconfig.merged, "dev", &access).await;
+        let Err(error) = refused else {
+            panic!("a background connection must be refused");
+        };
+        assert!(running_set::needs_sign_in(&error));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!ran.exists(), "the command never started");
+    }
+
+    // A reload that replaces the active member's credential on the same server binds the new
+    // connection to the member, so its failure is not reported as the old live state.
+    #[tokio::test]
+    async fn an_active_members_replacement_connection_reports_to_the_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, confirmed, first) = pausable(dir.path(), NO_CONTEXTS).await;
+        manager.active = Some("dev".to_owned());
+        live_dev(&mut manager).await;
+
+        let changed = confirmed.replace("user: {}", "user: {token: rotated}");
+        rewrite_file(&mut manager, &first, &changed).await;
+        assert_eq!(dev_state(&manager), MemberState::Connecting);
+        let slot = manager.cluster("dev").unwrap();
+        assert!(slot.member_attempt.is_some(), "bound to the member");
+        let attempt = slot.attempt;
+
+        manager
+            .handle_internal(Internal::Connected {
+                cluster: "dev".into(),
+                attempt,
+                result: Err(cluster::SafeErrorText::fixed("refused")),
+            })
+            .await;
+        assert!(matches!(dev_state(&manager), MemberState::Failed { .. }));
+    }
+
+    // A result from before a pause is never taken for the connection made after it, even when
+    // the file comes back unchanged before the result does.
+    #[tokio::test]
+    async fn a_pause_voids_a_member_attempt_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, confirmed, first) = pausable(dir.path(), NO_CONTEXTS).await;
+        join_dev(&mut manager);
+        manager.schedule.enqueue("dev".to_owned());
+        manager.pump_members(Instant::now());
+        let before = manager.cluster("dev").unwrap().attempt;
+        assert!(manager.cluster("dev").unwrap().member_attempt.is_some());
+
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Disconnected));
+        assert!(slot.member_attempt.is_none() && slot.connect_task.is_none());
+        assert_eq!(manager.schedule.slots_in_use(), 0, "its admission is free");
+
+        rewrite_file(&mut manager, &first, &confirmed).await;
+        manager
+            .handle_internal(Internal::Connected {
+                cluster: "dev".into(),
+                attempt: before,
+                result: Ok((built_connection(&manager).await, test_version())),
+            })
+            .await;
+        assert_eq!(dev_state(&manager), MemberState::Connecting);
+        assert!(manager.cluster("dev").unwrap().client.is_none());
+    }
+
+    // A 401 on a background member's connection means signing in, at once. One from while it
+    // was in the foreground is not held against it later.
+    #[tokio::test]
+    async fn a_refused_background_credential_needs_sign_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, _, _) = pausable(dir.path(), NO_CONTEXTS).await;
+        manager.active = Some("dev".to_owned());
+        let pods = live_dev(&mut manager).await;
+        let slot = manager.cluster_mut("dev").unwrap();
+        let grant = slot.access.grant(CredentialSource::Definition);
+        slot.write_credential = Some(WriteCredential::with_grant(
+            Vec::new(),
+            CredentialSource::Definition,
+            None,
+            None,
+            grant.clone(),
+            None,
+        ));
+
+        grant.note_refused();
+        manager.active = Some("other".to_owned());
+        manager.sync_roles();
+        manager.tick_members(Instant::now());
+        assert_eq!(
+            dev_state(&manager),
+            MemberState::Live,
+            "from the foreground"
+        );
+
+        grant.note_refused();
+        manager.tick_members(Instant::now());
+        assert!(matches!(
+            dev_state(&manager),
+            MemberState::SignInNeeded { .. }
+        ));
+        assert!(!watches(&manager, &pods));
+    }
+
+    // A load that discards a slot frees the admission its aborted attempt held.
+    #[tokio::test]
+    async fn a_discarded_slot_frees_its_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, _, first) = pausable(dir.path(), NO_CONTEXTS).await;
+        join_dev(&mut manager);
+        manager.schedule.enqueue("dev".to_owned());
+        manager.pump_members(Instant::now());
+        assert_eq!(manager.schedule.slots_in_use(), 1);
+
+        rewrite_file(&mut manager, &first, NO_CONTEXTS).await;
+        assert!(!manager.members.contains_key("dev"));
+        assert_eq!(manager.schedule.slots_in_use(), 0);
     }
 
     // CRDs listed by a slot since replaced are another connection's, and change nothing.

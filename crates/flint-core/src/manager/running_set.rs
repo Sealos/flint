@@ -21,7 +21,7 @@ use crate::connection::member::{
 };
 use crate::connection::policy::Role;
 use crate::connection::schedule::{AttemptId, Jitter};
-use crate::credential::CredentialSource;
+use crate::credential::{CredentialSource, WriteCredential};
 use crate::handle::{ConnectionState, Event, MemberReport, MemberStatus};
 use crate::store::SyncState;
 
@@ -32,6 +32,8 @@ pub(crate) const SET_SIZES: std::ops::RangeInclusive<usize> = 2..=5;
 const SET_TICK: Duration = Duration::from_millis(250);
 
 const SIGN_IN_IN_FRONT: &str = "this cluster's sign-in runs a program; select it to connect";
+
+const CREDENTIAL_REFUSED: &str = "the server refused this cluster's sign-in; select it to retry";
 
 /// Backoff jitter from the standard library's per-instance random keys.
 #[derive(Default)]
@@ -158,22 +160,51 @@ impl ClusterManager {
     }
 
     /// Whether `id`'s credential runs a program, which only the foreground connection may do.
+    /// A retained connection answers for itself, since the kubeconfig may no longer show what it
+    /// was made from. Without one, a definition that can't be known counts as running one.
     pub(super) fn runs_a_command(&self, id: &str) -> bool {
+        if let Some(credential) = self.cluster(id).and_then(|s| s.write_credential.as_ref()) {
+            return credential.runs_a_command();
+        }
+        if self.unsettled(id) {
+            return true;
+        }
         let merged = &self.kubeconfig.merged;
-        merged
+        let Some(context) = merged
             .contexts
             .iter()
             .find(|c| c.name == id)
             .and_then(|c| c.context.as_ref())
-            .and_then(|c| c.user.as_ref())
-            .and_then(|user| merged.auth_infos.iter().find(|a| &a.name == user))
+        else {
+            return true;
+        };
+        let Some(user) = &context.user else {
+            return false;
+        };
+        merged
+            .auth_infos
+            .iter()
+            .find(|a| &a.name == user)
             .and_then(|a| a.auth_info.as_ref())
-            .is_some_and(|auth| {
-                matches!(
-                    CredentialSource::of(auth),
-                    CredentialSource::Plugin | CredentialSource::AuthProvider
-                )
-            })
+            .is_none_or(|auth| CredentialSource::of(auth).runs_a_command())
+    }
+
+    /// Connects the active cluster again after a load replaced or released its slot. A member's
+    /// new connection is bound to a foreground attempt, so its result reaches the member.
+    pub(super) fn reconnect_active(&mut self, id: &str) {
+        let due = self.members.contains_key(id)
+            && !self.paused(id)
+            && self.cluster(id).is_some_and(|slot| slot.reconnect);
+        if due {
+            let now = Instant::now();
+            let attempt = self.cluster_mut(id).and_then(|s| s.member_attempt.take());
+            if let Some(attempt) = attempt {
+                self.schedule.finish(attempt);
+            }
+            self.apply_member(id, MemberEvent::ConnectionLost, now);
+            self.apply_member(id, MemberEvent::Activated, now);
+        }
+        self.ensure_connected(id);
     }
 
     /// Gives each slot's credential the role it has now: background for a member that is not
@@ -305,19 +336,56 @@ impl ClusterManager {
     }
 
     /// `id` just moved to the background. A credential that runs a program may not go on: a
-    /// connection that is up ends as signed out, and one still being made, which may have
-    /// started before it joined and so under no policy, is replaced by a queued attempt that
-    /// the policy refuses.
+    /// connection that is up ends as signed out. One still being made, or held by a member not
+    /// yet live, is replaced by a queued attempt that the policy refuses. With no connection and
+    /// a definition that can't be known yet, nothing can run, and the attempt after the pause
+    /// asks the policy.
     pub(super) fn demote_member(&mut self, id: &str, now: Instant) {
-        if !self.members.contains_key(id) || !self.runs_a_command(id) {
+        if !self.runs_a_command(id) {
             return;
         }
+        let Some(member) = self.members.get(id) else {
+            return;
+        };
+        let member_connecting = *member.state() == MemberState::Connecting;
+        let unsettled = self.unsettled(id);
+        let Some(slot) = self.cluster_mut(id) else {
+            return;
+        };
+        if !member_connecting && !matches!(slot.state, ConnectionState::Connecting) {
+            if slot.write_credential.is_some() || !unsettled {
+                let reason = SafeErrorText::reduced(SIGN_IN_IN_FRONT);
+                self.apply_member(id, MemberEvent::CredentialLost { reason }, now);
+            }
+            return;
+        }
+        if let Some(task) = slot.connect_task.take() {
+            task.abort();
+        }
+        slot.attempt = 0;
+        slot.discovering = false;
+        slot.watches.set_source(None);
+        slot.client = None;
+        slot.write_credential = None;
+        slot.state = ConnectionState::Disconnected;
+        let attempt = slot.member_attempt.take();
+        if let Some(attempt) = attempt {
+            self.schedule.finish(attempt);
+        }
+        self.emit(Event::ConnectionChanged {
+            cluster: id.to_owned(),
+            state: ConnectionState::Disconnected,
+        });
+        self.apply_member(id, MemberEvent::ConnectionLost, now);
+    }
+
+    /// A pause voids an attempt in flight: its task ends, so a result from before the pause can
+    /// never be taken for the connection made after it.
+    fn void_attempt_for_pause(&mut self, id: &str) {
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
         if !matches!(slot.state, ConnectionState::Connecting) {
-            let reason = SafeErrorText::reduced(SIGN_IN_IN_FRONT);
-            self.apply_member(id, MemberEvent::CredentialLost { reason }, now);
             return;
         }
         if let Some(task) = slot.connect_task.take() {
@@ -325,11 +393,15 @@ impl ClusterManager {
         }
         slot.attempt = 0;
         slot.state = ConnectionState::Disconnected;
+        slot.reconnect = true;
         let attempt = slot.member_attempt.take();
         if let Some(attempt) = attempt {
             self.schedule.finish(attempt);
         }
-        self.apply_member(id, MemberEvent::ConnectionLost, now);
+        self.emit(Event::ConnectionChanged {
+            cluster: id.to_owned(),
+            state: ConnectionState::Disconnected,
+        });
     }
 
     /// Brings the members' pauses in line with the manager's. Pauses are applied before
@@ -340,10 +412,14 @@ impl ClusterManager {
             let held = self.held(&id);
             // Kept through an unconfirmed move, a member must not connect to the server shown.
             let provisional = !held && (self.paused(&id) || !self.member_on_its_server(&id));
+            let was_paused = self.members.get(&id).is_some_and(|m| m.paused().is_some());
             for (pause, on) in [(Pause::Held, held), (Pause::Provisional, provisional)] {
                 if on {
                     self.apply_member(&id, MemberEvent::Paused(pause), now);
                 }
+            }
+            if !was_paused && (held || provisional) {
+                self.void_attempt_for_pause(&id);
             }
             for (pause, on) in [(Pause::Held, held), (Pause::Provisional, provisional)] {
                 if !on {
@@ -358,6 +434,15 @@ impl ClusterManager {
     pub(super) fn tick_members(&mut self, now: Instant) {
         let ids: Vec<ClusterId> = self.members.keys().cloned().collect();
         for id in ids {
+            // Asked for every member, so a refusal from before an activation is not kept for later.
+            let refused = self
+                .cluster(&id)
+                .and_then(|slot| slot.write_credential.as_ref())
+                .is_some_and(WriteCredential::take_refused);
+            if refused && self.active.as_deref() != Some(id.as_str()) {
+                let reason = SafeErrorText::reduced(CREDENTIAL_REFUSED);
+                self.apply_member(&id, MemberEvent::CredentialLost { reason }, now);
+            }
             if let Some((any_synced, error)) = self.watch_health(&id) {
                 self.apply_member(&id, MemberEvent::Watches { any_synced, error }, now);
             }

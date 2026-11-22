@@ -10,6 +10,7 @@
 //! allow, and a later return to an allowed role does not bring it back, however quickly it came.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::watch;
 
@@ -64,10 +65,7 @@ pub(crate) struct ForegroundOnly;
 
 impl CredentialPolicy for ForegroundOnly {
     fn may_run(&self, source: &CredentialSource, role: Role) -> bool {
-        match source {
-            CredentialSource::Definition | CredentialSource::TokenFile(_) => true,
-            CredentialSource::Plugin | CredentialSource::AuthProvider => role == Role::Foreground,
-        }
+        !source.runs_a_command() || role == Role::Foreground
     }
 }
 
@@ -114,6 +112,7 @@ impl CredentialAccess {
         CredentialGrant {
             access: self.clone(),
             source,
+            refused: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -123,11 +122,30 @@ impl CredentialAccess {
 pub(crate) struct CredentialGrant {
     access: CredentialAccess,
     source: CredentialSource,
+    /// A server answered 401 while this connection was in the background.
+    refused: Arc<AtomicBool>,
 }
 
 impl CredentialGrant {
     fn allows(&self, role: Role) -> bool {
         self.access.policy.may_run(&self.source, role)
+    }
+
+    /// Whether this connection's credential can start a program.
+    pub(crate) fn runs_a_command(&self) -> bool {
+        self.source.runs_a_command()
+    }
+
+    /// Records a 401. The foreground has its own sign-in path, so only a background one counts.
+    pub(crate) fn note_refused(&self) {
+        if self.access.role.borrow().role == Role::Background {
+            self.refused.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a 401 was recorded since this was last asked.
+    pub(crate) fn take_refused(&self) -> bool {
+        self.refused.swap(false, Ordering::Relaxed)
     }
 
     /// Whether the credential may run now.
