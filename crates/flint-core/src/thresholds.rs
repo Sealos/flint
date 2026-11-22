@@ -19,8 +19,11 @@
 //! and its `spec`.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::marker::PhantomData;
 use std::ops::RangeInclusive;
 
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -197,30 +200,6 @@ impl ThresholdOverrides {
         self.values.iter().all(Option::is_none)
     }
 
-    /// The valid values of `table`, with an issue for each known key holding an invalid one.
-    /// Unknown keys are ignored, so a newer file still loads.
-    fn from_table(table: &toml::Table, cluster: Option<&str>) -> (Self, Vec<ThresholdIssue>) {
-        let mut overrides = Self::default();
-        let mut issues = Vec::new();
-        for metric in ThresholdMetric::ALL {
-            let Some(value) = table.get(metric.key()) else {
-                continue;
-            };
-            let parsed = value
-                .as_integer()
-                .and_then(|v| u32::try_from(v).ok())
-                .filter(|v| metric.range().contains(v));
-            match parsed {
-                Some(_) => overrides.values[metric.index()] = parsed,
-                None => issues.push(ThresholdIssue::InvalidValue {
-                    cluster: cluster.map(str::to_owned),
-                    metric,
-                }),
-            }
-        }
-        (overrides, issues)
-    }
-
     fn entries(&self) -> impl Iterator<Item = (&'static str, u32)> + '_ {
         ThresholdMetric::ALL
             .into_iter()
@@ -272,32 +251,12 @@ impl ThresholdSettings {
 
     /// Reads the section, keeping every valid value and listing what it ignored. Never fails.
     pub fn from_toml(value: &toml::Value) -> (Self, Vec<ThresholdIssue>) {
-        let Some(table) = value.as_table() else {
-            let issue = ThresholdIssue::NotATable { cluster: None };
-            return (Self::default(), vec![issue]);
+        let read = if value.is_table() {
+            Loose::<Section>::deserialize(value.clone()).ok()
+        } else {
+            None
         };
-        let (global, mut issues) = ThresholdOverrides::from_table(table, None);
-        let mut clusters = BTreeMap::new();
-        match table.get(CLUSTERS_KEY).map(toml::Value::as_table) {
-            None => {}
-            Some(None) => issues.push(ThresholdIssue::ClustersNotATable),
-            Some(Some(entries)) => {
-                for (cluster, entry) in entries {
-                    let Some(entry) = entry.as_table() else {
-                        issues.push(ThresholdIssue::NotATable {
-                            cluster: Some(cluster.clone()),
-                        });
-                        continue;
-                    };
-                    let (overrides, found) = ThresholdOverrides::from_table(entry, Some(cluster));
-                    issues.extend(found);
-                    if !overrides.is_empty() {
-                        clusters.insert(cluster.clone(), overrides);
-                    }
-                }
-            }
-        }
-        (Self { global, clusters }, issues)
+        read.unwrap_or(Loose::Other).into_settings()
     }
 
     /// Whether the section says nothing, so it can be left out of the file.
@@ -308,9 +267,229 @@ impl ThresholdSettings {
 
 impl<'de> Deserialize<'de> for ThresholdSettings {
     /// Tolerant, as [`ThresholdSettings::from_toml`]. Use that directly to report the issues.
+    ///
+    /// Reads straight from the deserializer, not through `toml::Value`, which rejects numbers
+    /// that do not fit `i64` and reads a first key named like its datetime marker as a datetime.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = toml::Value::deserialize(deserializer)?;
-        Ok(Self::from_toml(&value).0)
+        Ok(Loose::<Section>::deserialize(deserializer)?
+            .into_settings()
+            .0)
+    }
+}
+
+/// A value of any type, read without failing: a table is handed to `T`, a number is kept, and
+/// anything else is skipped.
+enum Loose<T> {
+    Table(T),
+    Number(i128),
+    Other,
+}
+
+/// What a table reads its keys into.
+trait TableBody<'de>: Sized {
+    fn from_map<A: MapAccess<'de>>(map: A) -> Result<Self, A::Error>;
+}
+
+/// A table whose contents do not matter.
+struct Skipped;
+
+impl<'de> TableBody<'de> for Skipped {
+    fn from_map<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(Self)
+    }
+}
+
+struct LooseVisitor<T>(PhantomData<T>);
+
+impl<'de, T: TableBody<'de>> Visitor<'de> for LooseVisitor<T> {
+    type Value = Loose<T>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("any value")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+        T::from_map(map).map(Loose::Table)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(Loose::Other)
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(Loose::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(Loose::Number(value.into()))
+    }
+
+    fn visit_i128<E>(self, value: i128) -> Result<Self::Value, E> {
+        Ok(Loose::Number(value))
+    }
+
+    fn visit_u128<E>(self, value: u128) -> Result<Self::Value, E> {
+        Ok(i128::try_from(value).map_or(Loose::Other, Loose::Number))
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(Loose::Other)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(Loose::Other)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(Loose::Other)
+    }
+
+    fn visit_bytes<E>(self, _: &[u8]) -> Result<Self::Value, E> {
+        Ok(Loose::Other)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(Loose::Other)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(Loose::Other)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        IgnoredAny::deserialize(deserializer).map(|_| Loose::Other)
+    }
+}
+
+impl<'de, T: TableBody<'de>> Deserialize<'de> for Loose<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(LooseVisitor(PhantomData))
+    }
+}
+
+/// The metric keys of one table, as read: `None` when absent, `Some(None)` when not an integer.
+/// Other keys are ignored, so a newer file still loads.
+#[derive(Default)]
+struct Fields {
+    values: [Option<Option<i128>>; ThresholdMetric::ALL.len()],
+}
+
+impl Fields {
+    /// Reads the value of `key` if it names a metric. The caller reads the value otherwise.
+    fn read_value<'de, A: MapAccess<'de>>(
+        &mut self,
+        map: &mut A,
+        key: &str,
+    ) -> Result<bool, A::Error> {
+        let Some(metric) = ThresholdMetric::ALL.into_iter().find(|m| m.key() == key) else {
+            return Ok(false);
+        };
+        self.values[metric.index()] = Some(match map.next_value::<Loose<Skipped>>()? {
+            Loose::Number(number) => Some(number),
+            Loose::Table(_) | Loose::Other => None,
+        });
+        Ok(true)
+    }
+
+    /// The valid values, with an issue for each known key holding an invalid one.
+    fn resolve(&self, cluster: Option<&str>) -> (ThresholdOverrides, Vec<ThresholdIssue>) {
+        let mut overrides = ThresholdOverrides::default();
+        let mut issues = Vec::new();
+        for metric in ThresholdMetric::ALL {
+            let Some(read) = self.values[metric.index()] else {
+                continue;
+            };
+            let parsed = read
+                .and_then(|v| u32::try_from(v).ok())
+                .filter(|v| metric.range().contains(v));
+            match parsed {
+                Some(_) => overrides.values[metric.index()] = parsed,
+                None => issues.push(ThresholdIssue::InvalidValue {
+                    cluster: cluster.map(str::to_owned),
+                    metric,
+                }),
+            }
+        }
+        (overrides, issues)
+    }
+}
+
+impl<'de> TableBody<'de> for Fields {
+    fn from_map<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let mut fields = Self::default();
+        while let Some(key) = map.next_key::<String>()? {
+            if !fields.read_value(&mut map, &key)? {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(fields)
+    }
+}
+
+/// The `clusters` table: one entry per context name, keys read literally.
+struct Clusters(BTreeMap<String, Loose<Fields>>);
+
+impl<'de> TableBody<'de> for Clusters {
+    fn from_map<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let mut entries = BTreeMap::new();
+        while let Some(name) = map.next_key::<String>()? {
+            entries.insert(name, map.next_value()?);
+        }
+        Ok(Self(entries))
+    }
+}
+
+/// The whole `thresholds` section, as read.
+struct Section {
+    global: Fields,
+    clusters: Option<Loose<Clusters>>,
+}
+
+impl<'de> TableBody<'de> for Section {
+    fn from_map<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let mut global = Fields::default();
+        let mut clusters = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == CLUSTERS_KEY {
+                clusters = Some(map.next_value()?);
+            } else if !global.read_value(&mut map, &key)? {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(Self { global, clusters })
+    }
+}
+
+impl Loose<Section> {
+    fn into_settings(self) -> (ThresholdSettings, Vec<ThresholdIssue>) {
+        let Self::Table(section) = self else {
+            let issue = ThresholdIssue::NotATable { cluster: None };
+            return (ThresholdSettings::default(), vec![issue]);
+        };
+        let (global, mut issues) = section.global.resolve(None);
+        let mut clusters = BTreeMap::new();
+        match section.clusters {
+            None => {}
+            Some(Loose::Table(Clusters(entries))) => {
+                for (cluster, entry) in entries {
+                    let Loose::Table(fields) = entry else {
+                        issues.push(ThresholdIssue::NotATable {
+                            cluster: Some(cluster),
+                        });
+                        continue;
+                    };
+                    let (overrides, found) = fields.resolve(Some(&cluster));
+                    issues.extend(found);
+                    if !overrides.is_empty() {
+                        clusters.insert(cluster, overrides);
+                    }
+                }
+            }
+            Some(_) => issues.push(ThresholdIssue::ClustersNotATable),
+        }
+        (ThresholdSettings { global, clusters }, issues)
     }
 }
 

@@ -249,3 +249,30 @@ fn settings_round_trip_through_toml_and_stay_out_when_empty() {
     let text = toml::to_string_pretty(&empty).unwrap();
     assert!(!text.contains("thresholds"), "{text}");
 }
+
+// covers UP-67
+#[test]
+fn a_number_that_does_not_fit_i64_loses_only_its_field() {
+    let text = r#"{"other": 4, "thresholds": {"cpu_percent": 9223372036854775808,
+        "memory_percent": 60, "restarts_last_hour": -1, "warning_events_last_hour": 1.5,
+        "clusters": {"prod": {"cpu_percent": 18446744073709551615, "memory_percent": 70}}}}"#;
+    let host: Host = serde_json::from_str(text).unwrap();
+    assert_eq!(host.other, 4);
+    assert_eq!(host.thresholds.global, overrides(&[(MemoryPercent, 60)]));
+    assert_eq!(
+        host.thresholds.clusters,
+        BTreeMap::from([("prod".to_owned(), overrides(&[(MemoryPercent, 70)]))]),
+    );
+}
+
+// covers UP-67
+#[test]
+fn cluster_keys_are_read_literally() {
+    let text = "other = 4\n[thresholds.clusters.\"$__toml_private_datetime\"]\n\
+                memory_percent = 60\n[thresholds.clusters.prod]\ncpu_percent = 80\n";
+    let host: Host = toml::from_str(text).unwrap();
+    assert_eq!(host.other, 4);
+    let marker = host.thresholds.for_cluster("$__toml_private_datetime");
+    assert_eq!(marker.get(MemoryPercent), 60);
+    assert_eq!(host.thresholds.for_cluster("prod").get(CpuPercent), 80);
+}
