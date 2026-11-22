@@ -2,13 +2,16 @@
 //! which of a row's controls are enabled. The sidebar is drawn by the workspace from
 //! [`ClustersModel`].
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use flint_core::settings::AiExposureState;
 use flint_core::{ConnectionState, Event, KindId, Settings, SyncState};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
-use gpui_kit::{AppContext as _, Context, TestAppContext};
+use gpui_kit::{AppContext as _, Context, TestAppContext, WeakEntity, point, px};
 use serde_json::json;
 
 use super::ClustersModel;
@@ -305,5 +308,70 @@ async fn an_open_tooltip_follows_the_clusters_presence(cx: &mut TestAppContext) 
     shows(
         SyncState::Reconnecting { error: None },
         "\nConnected, Kubernetes v1.33.1\n",
+    );
+}
+
+// Dismissing a tooltip frees its view, and freeing the view unregisters its observers while the
+// model and the watch states stay quiet, so repeated hovers leave nothing behind.
+#[gpui_kit::test]
+async fn a_dismissed_tooltip_stops_observing_the_cluster(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    cx.run_until_parked();
+
+    let opened = Rc::new(RefCell::new(Vec::<WeakEntity<Tooltip>>::new()));
+    let _opened = cx.update(|cx| {
+        let opened = opened.clone();
+        cx.observe_new(move |_: &mut Tooltip, _, cx| opened.borrow_mut().push(cx.weak_entity()))
+    });
+    cx.update_window(t.window, |_, window, cx| {
+        let row = window.find("cluster-kind-alpha").bounds();
+        window.simulate_mouse_move(row.center(), cx);
+    })
+    .unwrap();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    t.wait_for_element(cx, "cluster-tooltip").await;
+    cx.update_window(t.window, |_, window, cx| {
+        window.simulate_mouse_move(point(px(5000.), px(5000.)), cx);
+    })
+    .unwrap();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    // The window keeps the last two frames' views, so draw past both.
+    for _ in 0..2 {
+        cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+    assert!(!opened.borrow().is_empty(), "the hover opened a tooltip");
+    for tooltip in opened.borrow().iter() {
+        tooltip.assert_released();
+    }
+
+    let nav = t.workspace.read_with(cx, |w, _| w.nav_view());
+    let callback = Rc::new(());
+    let view = cx.update(|cx| {
+        let held = callback.clone();
+        super::following_tooltip(
+            "kind-alpha".into(),
+            &t.model,
+            &nav,
+            move |cx| {
+                let _ = &held;
+                cx.notify();
+            },
+            cx,
+        )
+    });
+    assert!(Rc::strong_count(&callback) > 1, "the tooltip is observing");
+    // Inside an update: GPUI releases a dropped entity when the effect cycle ends.
+    cx.update(|_| drop(view));
+    cx.run_until_parked();
+    assert_eq!(
+        Rc::strong_count(&callback),
+        1,
+        "dismissal unregisters the observers before the next notification"
     );
 }

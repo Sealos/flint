@@ -576,13 +576,28 @@ pub fn cluster_tooltip(
     nav: &Entity<NavPanel>,
     cx: &mut App,
 ) -> AnyView {
-    let (model, nav) = (model.downgrade(), nav.downgrade());
+    following_tooltip(cluster, model, nav, |cx| cx.notify(), cx).into()
+}
+
+/// Builds the tooltip view, calling `on_change` when the model or the watch states change. The
+/// view owns both subscriptions, so dismissing it unregisters them at once.
+fn following_tooltip(
+    cluster: ClusterId,
+    model: &Entity<ClustersModel>,
+    nav: &Entity<NavPanel>,
+    on_change: impl Fn(&mut Context<Tooltip>) + Clone + 'static,
+    cx: &mut App,
+) -> Entity<Tooltip> {
     cx.new(|cx: &mut Context<Tooltip>| {
-        if let (Some(model), Some(nav)) = (model.upgrade(), nav.upgrade()) {
-            cx.observe(&model, |_, _, cx| cx.notify()).detach();
-            cx.observe(&nav, |_, _, cx| cx.notify()).detach();
-        }
+        let on_model_change = on_change.clone();
+        let subscriptions = [
+            cx.observe(model, move |_, _, cx| on_model_change(cx)),
+            cx.observe(nav, move |_, _, cx| on_change(cx)),
+        ];
+        let (model, nav) = (model.downgrade(), nav.downgrade());
         Tooltip::element(move |_, cx| {
+            // Moved into the content, which the view owns and drops with itself.
+            let _owned = &subscriptions;
             let text = model
                 .upgrade()
                 .zip(nav.upgrade())
@@ -599,7 +614,6 @@ pub fn cluster_tooltip(
                 .test_support()
         })
     })
-    .into()
 }
 
 /// A connection state's name in the automation state: `disconnected`, `connecting`,
