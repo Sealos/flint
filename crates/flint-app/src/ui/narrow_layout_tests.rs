@@ -485,3 +485,21 @@ fn the_main_window_has_a_minimum_size(cx: &mut TestAppContext) {
     let options = cx.update(|_| crate::ui::window_options(bounds));
     assert_eq!(options.window_min_size, Some(size(px(760.), px(480.))));
 }
+
+// #424: a long reason under the detail's header wraps instead of ending mid-word.
+#[gpui_kit::test]
+async fn a_long_caption_wraps_under_the_header(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    detail_alone(cx, &t).await;
+    let detail = t.detail(cx).unwrap();
+    detail.update(cx, |d, cx| {
+        d.set_sessions_blocked(Some("the context changed and needs a look ".repeat(8)), cx);
+    });
+    draw(cx, &t);
+    let height = bounds(cx, &t, "detail-captions").size.height;
+    assert!(
+        height > px(32.),
+        "the caption takes several lines: {height:?}"
+    );
+}

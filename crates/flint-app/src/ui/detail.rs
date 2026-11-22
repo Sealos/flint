@@ -31,7 +31,7 @@ use super::list::tabular_figures;
 use super::log_view::LogRequest;
 use super::menu_fit::{fit_picker, picker_item};
 use super::menu_record;
-use super::notice::{notice, notice_detail, notice_with};
+use super::notice::{MAX_NOTICE_LINES, notice, notice_detail, notice_with};
 use super::object::{self, MASK, Overview, PodContainer, SecretValue};
 use super::registry::{
     self, ApplyYamlEdit, BackToYamlEdit, CancelYamlEdit, Close, EditYaml, OpenContainerLogs,
@@ -982,7 +982,13 @@ impl DetailView {
             (logs, shell) => logs
                 .map(|why| refused(Opening::Logs, &why))
                 .into_iter()
-                .chain(shell.map(|why| refused(Opening::Shell, &why)))
+                .chain(shell.map(|why| {
+                    if why == protected_reason(&self.object.cluster) {
+                        actions::PROTECTED_CAPTION.to_owned()
+                    } else {
+                        refused(Opening::Shell, &why)
+                    }
+                }))
                 .collect(),
         }
     }
@@ -1006,7 +1012,7 @@ impl DetailView {
                     div()
                         .id(("detail-caption", ix))
                         .min_w_0()
-                        .truncate()
+                        .line_clamp(MAX_NOTICE_LINES)
                         .child(text.clone())
                         .test_text(text)
                         .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
