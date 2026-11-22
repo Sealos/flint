@@ -160,12 +160,52 @@ async fn a_relist_after_an_expired_watch_catches_up() {
 
     let pods = Gvr::core("pods");
     server.wait_for_watches(&pods, 1, WAIT).await.unwrap();
+    let lists = pod_lists(&server);
     server.send_watch(&pods, WatchStep::Expired);
     server.add_pod(crash_looping("during-relist"));
     until(&mut feed, "the relist", |s| {
         checked(s) && reports_pod(s, "during-relist")
     })
     .await;
+    assert!(pod_lists(&server) > lists, "no new list after the 410");
+    feed.stop().await;
+}
+
+fn pod_lists(server: &FakeApiServer) -> usize {
+    let pods = Gvr::core("pods");
+    server
+        .requests()
+        .iter()
+        .filter(|r| r.is_about(&pods) && r.verb == Verb::List)
+        .count()
+}
+
+#[tokio::test]
+async fn a_relist_that_keeps_expiring_stops_counting_as_current() {
+    let server = FakeApiServer::start().await.unwrap();
+    let store = trends();
+    let timing = TelemetryTiming {
+        relist_recovery: Duration::from_millis(200),
+        ..timing()
+    };
+    let kubeconfig = server.kubeconfig(None);
+    let mut feed = start_for_tests(&kubeconfig, CONTEXT, Arc::clone(&store), timing)
+        .await
+        .unwrap();
+    until(&mut feed, "the first read", checked).await;
+
+    let pods = Gvr::core("pods");
+    server.wait_for_watches(&pods, 1, WAIT).await.unwrap();
+    server.inject(Fault::status(410).on(&pods).verb(Verb::List));
+    server.send_watch(&pods, WatchStep::Expired);
+    let stale = until(&mut feed, "the kind going unknown", |s| {
+        matches!(s.kind(WatchedKind::Pods), KindCheck::Failed(_))
+    })
+    .await;
+    assert_eq!(stale.counts.get(ProblemCategory::FailingPods), None);
+
+    server.clear_faults();
+    until(&mut feed, "the recovery", checked).await;
     feed.stop().await;
 }
 

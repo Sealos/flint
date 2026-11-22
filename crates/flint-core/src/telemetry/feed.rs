@@ -2,9 +2,9 @@
 //! Table watches behind lists do not carry.
 //!
 //! A kind is current once its list has loaded and a watch has opened. An expired resource version
-//! or a dropped stream is routine and keeps the kind current while it recovers. A refused list or
-//! watch, or an event that cannot be read, is a failure, reported at once and retried with
-//! backoff.
+//! or a dropped stream is routine and keeps the kind current while it recovers, for at most
+//! [`TelemetryTiming::relist_recovery`]. A refused list or watch, or an event that cannot be
+//! read, is a failure, reported at once and retried with backoff.
 
 use std::hash::{BuildHasher as _, RandomState};
 use std::pin::pin;
@@ -19,7 +19,7 @@ use tokio::sync::Semaphore;
 use super::objects::{MAX_OBJECTS_PER_KIND, Tracked};
 use super::{CheckFailure, FailureCause, KindCheck, Shared, TelemetryTiming};
 use crate::api_error::{ApiError, ApiErrorKind};
-use crate::cluster::{ClusterError, SafeErrorText, Target};
+use crate::cluster::{ClusterError, SafeErrorText, Target, find_auth_error};
 
 /// Objects per page of a list.
 const PAGE_SIZE: u32 = 500;
@@ -95,14 +95,19 @@ impl KindFeed {
         let api = Api::<K>::all(self.client.clone());
         let max = self.timing.backoff_max;
         let mut backoff = Backoff::new(self.timing.backoff_min, max);
+        // While set, the objects held are older than the watch that was lost.
+        let mut recover_by: Option<Instant> = None;
+        let recovery = self.timing.relist_recovery;
         loop {
-            let mut version = match self.list(&api).await {
+            let mut version = match self.list_within(&api, recover_by).await {
                 Ok((items, version)) => {
+                    recover_by = None;
                     K::store(&mut self.shared.stores()).replace(items);
                     self.shared.dirty.notify_one();
                     version
                 }
                 Err(ListEnd::Expired) => {
+                    recover_by.get_or_insert_with(|| Instant::now() + recovery);
                     tokio::time::sleep(backoff.next()).await;
                     continue;
                 }
@@ -121,11 +126,8 @@ impl KindFeed {
                 match self.watch(&api, &mut version).await {
                     WatchEnd::Ended { healthy: true } => backoff.reset(),
                     // Opens but delivers nothing: only a fresh list can show the kind is current.
-                    WatchEnd::Ended { healthy: false } => {
-                        tokio::time::sleep(backoff.next()).await;
-                        break;
-                    }
-                    WatchEnd::Expired => {
+                    WatchEnd::Ended { healthy: false } | WatchEnd::Expired => {
+                        recover_by = Some(Instant::now() + recovery);
                         tokio::time::sleep(backoff.next()).await;
                         break;
                     }
@@ -147,6 +149,30 @@ impl KindFeed {
     fn invalidate<K: Tracked>(&self, check: KindCheck) {
         K::store(&mut self.shared.stores()).invalidate(check);
         self.shared.dirty.notify_one();
+    }
+
+    /// [`Self::list`], marking the kind unknown if it is still running at `recover_by`. The list
+    /// goes on, since finishing it is how the kind recovers.
+    async fn list_within<K: Tracked>(
+        &self,
+        api: &Api<K>,
+        recover_by: Option<Instant>,
+    ) -> Result<(Vec<K>, String), ListEnd> {
+        let mut list = pin!(self.list(api));
+        let Some(deadline) = recover_by else {
+            return list.await;
+        };
+        tokio::select! {
+            biased;
+            listed = &mut list => listed,
+            () = tokio::time::sleep_until(deadline.into()) => {
+                self.invalidate::<K>(KindCheck::Failed(CheckFailure {
+                    cause: FailureCause::Failed,
+                    detail: SafeErrorText::reduced("could not catch up with the cluster"),
+                }));
+                list.await
+            }
+        }
     }
 
     /// Every object of `K`, trimmed, and the version to watch from.
@@ -193,10 +219,13 @@ impl KindFeed {
     async fn watch<K: Tracked>(&self, api: &Api<K>, version: &mut String) -> WatchEnd {
         // Asks for bookmarks by default, which keep `version` fresh on a quiet kind.
         let params = WatchParams::default().timeout(self.timing.watch_timeout_secs);
-        let stream = match api.watch(&params, version).await {
-            Ok(stream) => stream,
-            Err(err) if is_expired(&err) => return WatchEnd::Expired,
-            Err(err) => return WatchEnd::Failed(failure_of(&err, &self.target)),
+        // Only the wait for response headers: a healthy watch may then stay quiet for long.
+        let opening = tokio::time::timeout(self.timing.list_timeout, api.watch(&params, version));
+        let stream = match opening.await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(err)) if is_expired(&err) => return WatchEnd::Expired,
+            Ok(Err(err)) => return WatchEnd::Failed(failure_of(&err, &self.target)),
+            Err(_) => return WatchEnd::Failed(timed_out()),
         };
         K::store(&mut self.shared.stores()).check = KindCheck::Current;
         self.shared.dirty.notify_one();
@@ -209,8 +238,8 @@ impl KindFeed {
             let event = match tokio::time::timeout(silence, stream.next()).await {
                 Ok(Some(Ok(event))) => event,
                 Ok(Some(Err(err))) if is_expired(&err) => return WatchEnd::Expired,
-                // Resuming would meet the same event, and skipping it would hide a change.
-                Ok(Some(Err(err @ kube::Error::SerdeError(_)))) => {
+                // The server refused, or resuming would meet the same unreadable event.
+                Ok(Some(Err(err @ (kube::Error::Api(_) | kube::Error::SerdeError(_))))) => {
                     return WatchEnd::Failed(failure_of(&err, &self.target));
                 }
                 // A dropped, closed or silent stream.
@@ -271,7 +300,8 @@ fn failure_of(err: &kube::Error, target: &Target) -> CheckFailure {
         Some(ApiErrorKind::Unauthorized) => FailureCause::LoginFailed,
         Some(ApiErrorKind::Forbidden) => FailureCause::Forbidden,
         Some(ApiErrorKind::NotFound) => FailureCause::NotServed,
-        _ if matches!(err, kube::Error::Auth(_)) => FailureCause::LoginFailed,
+        // A refresh that fails reaches here wrapped in the client's service error.
+        _ if find_auth_error(err).is_some() => FailureCause::LoginFailed,
         _ => FailureCause::Failed,
     };
     CheckFailure {
@@ -314,6 +344,16 @@ mod tests {
         ] {
             assert_eq!(failure_of(&api_error(code), &target).cause, cause);
         }
+    }
+
+    #[test]
+    fn a_credential_failure_wrapped_by_the_client_is_a_login_failure() {
+        let auth = crate::auth_plugin::not_allowed();
+        let wrapped = kube::Error::Service(Box::new(kube::Error::Auth(auth)));
+        assert_eq!(
+            failure_of(&wrapped, &Target::default()).cause,
+            FailureCause::LoginFailed
+        );
     }
 
     #[test]

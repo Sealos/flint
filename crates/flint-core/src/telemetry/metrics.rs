@@ -1,10 +1,12 @@
 //! Runs the node metrics poll into a [`TrendStore`] for as long as the feed lives.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use jiff::Timestamp;
 use kube::Client;
+use tokio::sync::mpsc;
 
 use super::{MetricsCheck, Shared};
 use crate::metrics::{MetricsPoll, MetricsResult, NodeMetrics, fetch_node_metrics};
@@ -35,6 +37,28 @@ fn check_of(result: &MetricsResult<NodeMetrics>) -> MetricsCheck {
     }
 }
 
+/// A poll whose task and fetch in flight each hold `running`, so that the channel's receiver sees
+/// it close only once the poll has really ended. Dropping a [`MetricsPoll`] only asks it to.
+fn poll_holding<R, F, Fut>(
+    every: Duration,
+    running: mpsc::Sender<()>,
+    mut fetch: F,
+) -> MetricsPoll<R>
+where
+    R: Send + Sync + 'static,
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = R> + Send + 'static,
+{
+    MetricsPoll::start(every, move || {
+        let held = running.clone();
+        let fetching = fetch();
+        async move {
+            let _held = held;
+            fetching.await
+        }
+    })
+}
+
 /// Polls until the task is stopped, which also ends the poll.
 pub(super) async fn run(
     cluster: Arc<str>,
@@ -42,12 +66,13 @@ pub(super) async fn run(
     trends: Arc<Mutex<TrendStore>>,
     shared: Arc<Shared>,
     every: Duration,
+    running: mpsc::Sender<()>,
 ) {
     let _forget = ForgetOnStop {
         cluster: Arc::clone(&cluster),
         trends: Arc::clone(&trends),
     };
-    let mut poll = MetricsPoll::start(every, move || {
+    let mut poll = poll_holding(every, running, move || {
         let client = client.clone();
         async move { fetch_node_metrics(&client).await }
     });
@@ -62,6 +87,8 @@ pub(super) async fn run(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
     use crate::metrics::{MetricsError, MetricsList, Usage};
     use crate::metrics_trend::{TrendResource, TrendScope};
@@ -82,6 +109,34 @@ mod tests {
             check_of(&Err(MetricsError::NotInstalled)),
             MetricsCheck::Unavailable(MetricsError::NotInstalled)
         );
+    }
+
+    #[tokio::test]
+    async fn the_channel_closes_only_after_a_fetch_in_flight_has_ended() {
+        struct Flag(Arc<AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (started, mut fetching) = mpsc::channel::<()>(1);
+        let (running, mut ended) = mpsc::channel::<()>(1);
+        let flag = Arc::clone(&dropped);
+        let poll = poll_holding(Duration::from_secs(60), running, move || {
+            let (flag, started) = (Flag(Arc::clone(&flag)), started.clone());
+            async move {
+                let _flag = flag;
+                let _ = started.send(()).await;
+                std::future::pending::<()>().await;
+            }
+        });
+        fetching.recv().await.unwrap();
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        drop(poll);
+        assert!(ended.recv().await.is_none());
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[test]

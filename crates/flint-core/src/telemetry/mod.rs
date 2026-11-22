@@ -37,7 +37,7 @@ use jiff::Timestamp;
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{Node, Pod};
-use tokio::sync::{Notify, Semaphore, watch};
+use tokio::sync::{Notify, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::alerts::ClusterSnapshot;
@@ -216,6 +216,8 @@ pub struct TelemetryTiming {
     pub list_timeout: Duration,
     /// The server-side timeout of a watch, in seconds.
     pub watch_timeout_secs: u32,
+    /// How long a kind that lost its watch may keep its objects as current while it lists again.
+    pub relist_recovery: Duration,
 }
 
 impl Default for TelemetryTiming {
@@ -228,6 +230,7 @@ impl Default for TelemetryTiming {
             backoff_max: Duration::from_secs(60),
             list_timeout: Duration::from_secs(30),
             watch_timeout_secs: 290,
+            relist_recovery: Duration::from_secs(60),
         }
     }
 }
@@ -264,6 +267,8 @@ impl Shared {
 pub struct Telemetry {
     latest: watch::Receiver<Arc<TelemetrySnapshot>>,
     tasks: JoinSet<()>,
+    /// Closes once the metrics poll, which runs in a task of its own, has ended.
+    poll_ended: mpsc::Receiver<()>,
 }
 
 impl Telemetry {
@@ -295,6 +300,7 @@ impl Telemetry {
             Timestamp::now(),
         ));
         let (sender, latest) = watch::channel(first);
+        let (poll_running, poll_ended) = mpsc::channel(1);
 
         let mut tasks = JoinSet::new();
         let kind = KindFeed {
@@ -317,9 +323,14 @@ impl Telemetry {
             trends,
             Arc::clone(&shared),
             timing.metrics_every,
+            poll_running,
         ));
         tasks.spawn(problems::run(cluster, shared, sender, timing));
-        Self { latest, tasks }
+        Self {
+            latest,
+            tasks,
+            poll_ended,
+        }
     }
 
     /// The most recent snapshot.
@@ -335,6 +346,8 @@ impl Telemetry {
     /// Stops every task and waits until they have ended.
     pub async fn stop(mut self) {
         self.tasks.shutdown().await;
+        // Nothing is ever sent: this returns when the last holder has gone.
+        let _ = self.poll_ended.recv().await;
     }
 }
 
