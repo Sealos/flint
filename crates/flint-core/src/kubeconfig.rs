@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
 use kube::config::{Kubeconfig, NamedContext};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, OwnedMutexGuard, oneshot};
 
 use crate::settings::{Settings, expand_tilde};
 
@@ -414,6 +414,38 @@ impl KubeconfigReader {
         on_late: impl FnOnce(FileRead) + Send + 'static,
     ) -> Option<FileRead> {
         let turn = self.turn(paths).try_lock_owned().ok()?;
+        let answer = self.start(paths, turn, on_late)?;
+        tokio::time::timeout(self.timeout, answer)
+            .await
+            .ok()
+            .and_then(Result::ok)
+    }
+
+    /// The files as they are after this call: a read already running is waited out, not used,
+    /// and a new one starts after it. `None` if that does not finish within the timeout, the
+    /// wait included. A read that finishes after that hands its result to `on_late`.
+    pub(crate) async fn read_fresh(
+        &self,
+        paths: &[PathBuf],
+        on_late: impl FnOnce(FileRead) + Send + 'static,
+    ) -> Option<FileRead> {
+        let read = async {
+            let turn = self.turn(paths).lock_owned().await;
+            self.start(paths, turn, on_late)?.await.ok()
+        };
+        tokio::time::timeout(self.timeout, read)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Starts a read on its own thread, which holds `turn` until the files are read.
+    fn start(
+        &self,
+        paths: &[PathBuf],
+        turn: OwnedMutexGuard<()>,
+        on_late: impl FnOnce(FileRead) + Send + 'static,
+    ) -> Option<oneshot::Receiver<FileRead>> {
         let (reply, answer) = oneshot::channel();
         let (load, owned) = (self.load, paths.to_vec());
         let thread = std::thread::Builder::new()
@@ -429,10 +461,7 @@ impl KubeconfigReader {
             tracing::warn!(error = %e, "could not start a kubeconfig read");
             return None;
         }
-        tokio::time::timeout(self.timeout, answer)
-            .await
-            .ok()
-            .and_then(Result::ok)
+        Some(answer)
     }
 }
 

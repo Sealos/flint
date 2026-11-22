@@ -397,12 +397,30 @@ impl ContextHistory {
     /// able to change it. Judged by the rules of [`Self::record`]; records nothing.
     pub fn holds_in(&self, fresh: &LoadedKubeconfig, context: &str, server: &str) -> bool {
         let pin = self.pin(context, Some(server));
+        self.pin_in(fresh, context, &pin) == FreshDefinition::Holds
+    }
+
+    /// What `fresh`, a read of the files newer than the last recorded load, says of the exact
+    /// definition `pin` was taken on. Judged by the rules of [`Self::record`]; records nothing.
+    pub fn pin_in(
+        &self,
+        fresh: &LoadedKubeconfig,
+        context: &str,
+        pin: &ContextPin,
+    ) -> FreshDefinition {
         let mut next = self.clone();
         next.record(fresh);
-        pin.definition.is_some()
-            && next.check(Pinned::Shell, context, &pin).is_none()
-            && !next.gate_moved(context, &pin)
-            && next.definition_holds(context, &pin)
+        if pin.definition.is_some()
+            && next.check(Pinned::Shell, context, pin).is_none()
+            && !next.gate_moved(context, pin)
+            && next.definition_holds(context, pin)
+        {
+            FreshDefinition::Holds
+        } else if !fresh.errors.is_empty() && next.provisional(context) {
+            FreshDefinition::Unreadable
+        } else {
+            FreshDefinition::Changed
+        }
     }
 
     /// Whether a file that failed in the last load could define `context`, its cluster or its
@@ -482,6 +500,17 @@ impl ContextHistory {
         };
         Some(reason(session, context, change))
     }
+}
+
+/// What a fresh read of the kubeconfig files says of a pinned definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FreshDefinition {
+    /// The files give the context exactly that definition, and no failed file could change it.
+    Holds,
+    /// A file that could define the context failed.
+    Unreadable,
+    /// The context has another definition now, or is gone.
+    Changed,
 }
 
 /// How a session's context changed since it opened.
