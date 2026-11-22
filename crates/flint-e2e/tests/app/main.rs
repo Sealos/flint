@@ -21,4 +21,5 @@ mod m2;
 mod m2_shell;
 mod m3;
 mod m3_writes;
+mod quit;
 mod support;
