@@ -25,6 +25,7 @@ pub mod logs;
 mod manager;
 pub mod metrics;
 pub mod paging;
+pub mod problems;
 pub mod protection;
 pub mod read;
 mod read_only;
@@ -57,6 +58,9 @@ pub use logs::{
     WorkloadTarget,
 };
 pub use metrics::{MetricsError, MetricsList, MetricsPoll, NodeMetrics, PodMetrics};
+pub use problems::{
+    Classifier, Problem, ProblemId, ProblemKind, ProblemReason, ProblemSeverity, ProblemSubject,
+};
 pub use protection::{Protection, SessionUnlocks, WriteRefusal};
 pub use read::{KindId, KindInfo, ObjectDetail};
 pub use settings::{Appearance, Settings, WatchMode};

@@ -10,6 +10,8 @@ change.
 A path marked **Status: planned** is not built yet. It names the issue and milestone that track it. It does not gate
 an earlier release, and gets no tests until it ships. Its tests must pass in the change that removes the marker.
 
+A path marked **Status: not planned** is kept for reference only. Nothing tracks it and it gets no tests.
+
 ## How paths are tested
 
 The full strategy is in [`TESTING.md`](./TESTING.md).
@@ -173,10 +175,10 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ---
 
 ### UP-17 Agent asks what's wrong
+- **Status:** not planned. The MCP server stays at its six read-only tools ([ADR-0009](./adr/0009-read-only-mcp-server.md)).
 - **When** an agent calls `get_cluster_summary` for an exposed cluster.
 - **Then** it gets the dashboard's problem counts, usage and recent warnings, limited to the cluster's exposure scope
   and redacted, and the call appears in the activity log.
-- Tests: unit, mcp.
 
 ## M1: Browsing resources
 
@@ -797,10 +799,10 @@ Deferred until cluster sets are scheduled (#199).
 - Tests: unit, ui.
 
 ### UP-115 An agent asks what happened
+- **Status:** not planned. The MCP server stays at its six read-only tools ([ADR-0009](./adr/0009-read-only-mcp-server.md)).
 - **When** an agent queries a recording's time range through MCP on an exposed cluster.
 - **Then** it gets lines, events and metrics for that range, redacted and within the cluster's scope, and the call is
   in the activity log. Unexposed clusters' recordings are invisible to it.
-- Tests: unit, mcp.
 
 ### UP-116 Export a recording
 - **When** I export the last 30 minutes of a recording.

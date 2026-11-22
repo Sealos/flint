@@ -33,8 +33,8 @@ itself, and a row opens a dashboard scoped to that namespace.
 - **Sequencing:** the columns ship first. They need only the workload watches, the Pods list, and the metrics-server
   poll. The overview lands right after the cluster dashboard, built from its components. Until then a row click keeps
   opening the detail pane.
-- **Agents:** nothing now. Later, the dashboard's `get_cluster_summary` MCP tool takes an optional namespace, within
-  the cluster's exposure scope and redaction ([ADR-0013](./0013-agent-trust-model.md)).
+- **Agents:** nothing. The MCP server stays at its six read-only tools
+  ([ADR-0009](./0009-read-only-mcp-server.md)).
 - **Cluster sets (deferred until cluster sets are scheduled)** ([ADR-0014](./0014-cluster-sets-and-combined-views.md)):
   namespaces with the same name merge into one row. Its columns are summed across members, and a member count shows
   ("3 clusters"). The status shown is the worst across members (Terminating beats Active), and the age is the oldest.
@@ -56,8 +56,8 @@ itself, and a row opens a dashboard scoped to that namespace.
 - **Sort by problems first:** puts the broken namespaces on top, but the list would reorder under the user as
   problems come and go. A click on Problems gives the same order on purpose.
 - **Ship everything with the dashboards:** one release, but delays columns that need nothing from the dashboard.
-- **A namespace MCP tool now:** agents can already list pods and events per namespace. A summary belongs with
-  `get_cluster_summary` once it exists.
+- **A namespace MCP tool:** agents can already list pods and events per namespace, and the tool set is frozen
+  ([ADR-0009](./0009-read-only-mcp-server.md)).
 - **Always sample every namespace:** every overview would open with a full hour, but a cluster with hundreds of
   namespaces would keep hundreds of series nobody reads.
 - **Keep the top N namespaces:** bounds the memory, but which namespaces have history would depend on a ranking the
