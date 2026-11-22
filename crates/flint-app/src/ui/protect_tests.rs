@@ -5,7 +5,7 @@
 
 use flint_core::settings::TrustState;
 use flint_core::{Event, ObjectDetail, Protection};
-use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
+use gpui_kit::test::{TestAppContextExt as _, TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
 
@@ -679,6 +679,76 @@ async fn an_old_trust_on_a_context_without_a_server_can_be_removed(cx: &mut Test
         Some(true),
         "nothing left to do"
     );
+}
+
+/// Whether the accessibility tree holds exactly one element named `label`, and it is `id`.
+fn named(cx: &mut TestAppContext, t: &TestWorkspace, id: &str, label: &str) -> bool {
+    draw(cx, t);
+    cx.update_window(t.window, |_, window, _| {
+        window
+            .try_find_by_label(label)
+            .is_some_and(|found| format!("{:?}", found.path().last()).contains(id))
+    })
+    .unwrap()
+}
+
+// The lock button's accessible name follows the cluster's real protection.
+#[gpui_kit::test]
+async fn the_lock_buttons_name_says_the_protection(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_settings(cx, dir.path(), PROTECT_LOCAL).await;
+    let id = "lock-kind-alpha";
+    let label = |state: &str| format!("Lock for kind-alpha: {state}");
+    assert!(named(cx, &t, id, &label("protected, read-only")));
+
+    let server = t.server.clone();
+    t.model
+        .update(cx, |m, cx| m.unlock("kind-alpha", &server, cx));
+    wait_for_protection(cx, &t, "kind-alpha", Protection::Unlocked).await;
+    assert!(named(cx, &t, id, &label("unlocked until Flint quits")));
+    assert!(!named(cx, &t, id, &label("protected, read-only")));
+
+    let server = t.server.clone();
+    t.model
+        .update(cx, |m, _| m.trust_cluster("kind-alpha".into(), server));
+    wait_for_protection(cx, &t, "kind-alpha", Protection::Trusted).await;
+    assert!(named(
+        cx,
+        &t,
+        id,
+        &label("trusted, unlocked across restarts")
+    ));
+}
+
+/// Two EKS contexts in different accounts, both titled `prod`.
+const PROD_A: &str = "arn:aws:eks:us-east-1:000000000000:cluster/prod";
+const PROD_B: &str = "arn:aws:eks:us-east-1:000000000001:cluster/prod";
+
+fn two_prods(
+    dir: &std::path::Path,
+    servers: &crate::ui::support_tests::Servers,
+) -> Vec<std::path::PathBuf> {
+    let kubeconfig = dir.join("kubeconfig");
+    let contexts = [
+        (PROD_A, servers.silent.as_str()),
+        (PROD_B, servers.refused.as_str()),
+    ];
+    std::fs::write(&kubeconfig, kubeconfig_yaml(&contexts)).unwrap();
+    vec![kubeconfig]
+}
+
+// Two contexts with one title and one state still have lock buttons with names of their own.
+#[gpui_kit::test]
+async fn lock_buttons_of_contexts_sharing_a_title_differ(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("settings.toml"), PROTECT_LOCAL).unwrap();
+    let t = open_workspace_with(cx, dir.path(), two_prods).await;
+    assert_eq!(protection(cx, &t, PROD_A), protection(cx, &t, PROD_B));
+    let state = "protected, read-only";
+    for context in [PROD_A, PROD_B] {
+        let label = format!("Lock for prod (context \"{context}\"): {state}");
+        assert!(named(cx, &t, &format!("lock-{context}"), &label));
+    }
 }
 
 // covers UP-55: when Stop Trusting's write fails, the cluster stays protected while its pin is
