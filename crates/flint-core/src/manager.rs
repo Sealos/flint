@@ -34,6 +34,8 @@ use crate::write::WriteError;
 
 /// Changes to watched files often come in bursts (editor save, `kind` rewriting the file).
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
+/// How many symlinks in a row are followed to find what to watch, as the OS limits them too.
+const MAX_LINK_HOPS: usize = 40;
 /// CRD changes come in bursts too (create, then status updates as names are accepted).
 const CRD_DEBOUNCE: Duration = Duration::from_millis(500);
 /// The API server publishes a new CRD in discovery a moment after the CRD changes. When
@@ -441,6 +443,8 @@ pub(crate) struct ClusterManager {
 
 struct FileWatcher {
     _watcher: RecommendedWatcher,
+    /// What it was set up for, to notice when a symlink has moved that.
+    watched: Watched,
     /// Whether the config directory is watched. It may not exist until settings are first written.
     settings_dir_watched: bool,
 }
@@ -1417,6 +1421,8 @@ impl ClusterManager {
                     // Before reloading, so a file written right after its directory is caught
                     // either by the reload or by the new watcher.
                     self.rebuild_watcher();
+                } else if changed.kubeconfig {
+                    self.follow_moved_links();
                 }
                 if changed.settings {
                     // First, since settings can change the kubeconfig file list.
@@ -2290,6 +2296,18 @@ impl ClusterManager {
         self.watcher = self.watch_files();
     }
 
+    /// Re-arms the watcher if a symlink now leads somewhere it does not watch. The new watcher
+    /// starts before the old one stops, so no event falls between them, and the old one stays
+    /// if the new one cannot start. The reload that follows reads anything written before.
+    fn follow_moved_links(&mut self) {
+        let current = Watched::for_files(&self.kubeconfig_paths, &self.config.config_dir);
+        if self.watcher.as_ref().is_some_and(|w| w.watched != current)
+            && let Some(watcher) = self.watch_files()
+        {
+            self.watcher = Some(watcher);
+        }
+    }
+
     /// Watches the directories holding the kubeconfig files and `settings.toml`, so files that
     /// are replaced by rename or created later are noticed. Each file is matched by its path and
     /// its resolved path (symlink targets, `/var` versus `/private/var`).
@@ -2297,35 +2315,16 @@ impl ClusterManager {
         // Create the config directory, so a settings.toml written there later (by hand or by
         // another Flint) is noticed. Failing is fine: the app's own writes create it too.
         let _ = std::fs::create_dir_all(&self.config.config_dir);
-        let kube_files: HashSet<PathBuf> = self
-            .kubeconfig_paths
-            .iter()
-            .flat_map(|p| watch_names(p))
-            .collect();
-        let settings_path = self.config.config_dir.join(settings::SETTINGS_FILE);
-        let settings_files: HashSet<PathBuf> = watch_names(&settings_path).into_iter().collect();
-        // Beside settings.toml, so it needs no directory of its own.
-        let activity_files: HashSet<PathBuf> = [activity::ACTIVITY_FILE, activity::PREVIOUS_FILE]
-            .iter()
-            .flat_map(|f| watch_names(&self.config.config_dir.join(f)))
-            .collect();
-        let (watch_dirs, pending) = watch_plan(kube_files.iter().chain(&settings_files));
-
+        let watched = Watched::for_files(&self.kubeconfig_paths, &self.config.config_dir);
         let (raw_tx, raw_rx) = mpsc::unbounded_channel::<Changed>();
-        let (kube_watched, settings_watched) = (kube_files.clone(), settings_files.clone());
-        let watched = Watched {
-            pending,
-            kube: kube_watched,
-            settings: settings_watched,
-            activity: activity_files,
-        };
+        let in_callback = watched.clone();
         let mut watcher =
             match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 let Ok(event) = res else { return };
                 if matches!(event.kind, EventKind::Access(_)) {
                     return;
                 }
-                let changed = classify(&event.paths, &watched);
+                let changed = classify(&event.paths, &in_callback);
                 if changed.kubeconfig || changed.settings || changed.activity {
                     let _ = raw_tx.send(changed);
                 }
@@ -2337,7 +2336,7 @@ impl ClusterManager {
                 }
             };
         let mut watched_dirs = HashSet::new();
-        for dir in &watch_dirs {
+        for dir in &watched.dirs {
             match watcher.watch(dir, RecursiveMode::NonRecursive) {
                 Ok(()) => {
                     watched_dirs.insert(dir.clone());
@@ -2345,13 +2344,15 @@ impl ClusterManager {
                 Err(e) => tracing::debug!(dir = %dir.display(), error = %e, "not watching dir"),
             }
         }
-        let settings_dir_watched = settings_files
+        let settings_dir_watched = watched
+            .settings
             .iter()
             .filter_map(|f| f.parent())
             .any(|d| watched_dirs.contains(&resolved(d)));
         tokio::spawn(debounce(raw_rx, self.internal_tx.clone()));
         Some(FileWatcher {
             _watcher: watcher,
+            watched,
             settings_dir_watched,
         })
     }
@@ -2390,7 +2391,10 @@ fn watch_plan<'a>(
 /// already hold kubeconfig files or `settings.toml` (a symlink's target directory restored
 /// with the file in it), so both are read again, besides rebuilding the watcher.
 /// The paths a file watcher reacts to.
+#[derive(Clone, PartialEq)]
 struct Watched {
+    /// The directories watched.
+    dirs: HashSet<PathBuf>,
     /// Missing directories whose creation means the watcher is rebuilt.
     pending: HashSet<PathBuf>,
     kube: HashSet<PathBuf>,
@@ -2398,8 +2402,34 @@ struct Watched {
     activity: HashSet<PathBuf>,
 }
 
+impl Watched {
+    /// What to watch for `kubeconfig` files and the settings in `config_dir`, as the disk has
+    /// them now.
+    fn for_files(kubeconfig: &[PathBuf], config_dir: &Path) -> Self {
+        let kube: HashSet<PathBuf> = kubeconfig.iter().flat_map(|p| watch_names(p)).collect();
+        let settings_path = config_dir.join(settings::SETTINGS_FILE);
+        let settings: HashSet<PathBuf> = watch_names(&settings_path).into_iter().collect();
+        // Beside settings.toml, so it needs no directory of its own.
+        let activity = [activity::ACTIVITY_FILE, activity::PREVIOUS_FILE]
+            .iter()
+            .flat_map(|f| watch_names(&config_dir.join(f)))
+            .collect();
+        let (dirs, pending) = watch_plan(kube.iter().chain(&settings));
+        Watched {
+            dirs,
+            pending,
+            kube,
+            settings,
+            activity,
+        }
+    }
+}
+
 fn classify(paths: &[PathBuf], watched: &Watched) -> Changed {
-    let rearm = paths.iter().any(|p| watched.pending.contains(p));
+    // A watched directory that is gone can no longer report its return.
+    let rearm = paths
+        .iter()
+        .any(|p| watched.pending.contains(p) || (watched.dirs.contains(p) && !p.exists()));
     let any = |set: &HashSet<PathBuf>| rearm || paths.iter().any(|p| set.contains(p));
     Changed {
         kubeconfig: any(&watched.kube),
@@ -2436,20 +2466,28 @@ fn watch_names(path: &Path) -> Vec<PathBuf> {
     if let Ok(target) = std::fs::canonicalize(path) {
         names.push(target);
     }
-    // A symlink whose target is missing cannot be canonicalized: name its target as the link
-    // says it (relative to the link's directory), and with that directory resolved, so
-    // restoring the target is noticed.
-    if let Ok(link) = std::fs::read_link(path) {
-        let target = match path.parent() {
+    // A symlink whose target is missing cannot be canonicalized: name each target along the
+    // chain as its link says it (relative to the link's directory), and with that directory
+    // resolved, so restoring a target or moving a later link is noticed.
+    let mut at = path.to_path_buf();
+    for _ in 0..MAX_LINK_HOPS {
+        let Ok(link) = std::fs::read_link(&at) else {
+            break;
+        };
+        let target = match at.parent() {
             Some(dir) if link.is_relative() => dir.join(link),
             _ => link,
         };
+        if names.contains(&target) {
+            break;
+        }
         if let (Some(dir), Some(name)) = (target.parent(), target.file_name())
             && let Ok(dir) = std::fs::canonicalize(dir)
         {
             names.push(dir.join(name));
         }
-        names.push(target);
+        names.push(target.clone());
+        at = target;
     }
     if let (Some(dir), Some(name)) = (path.parent(), path.file_name())
         && let Ok(dir) = std::fs::canonicalize(dir)
@@ -5950,6 +5988,7 @@ mod tests {
     #[test]
     fn a_directory_that_appears_reloads_settings_and_kubeconfig() {
         let watched = Watched {
+            dirs: HashSet::new(),
             pending: HashSet::from([PathBuf::from("/cfg/dotfiles")]),
             kube: HashSet::from([PathBuf::from("/k/config")]),
             settings: HashSet::from([PathBuf::from("/cfg/dotfiles/flint.toml")]),
@@ -5985,6 +6024,180 @@ mod tests {
         let absolute = dir.path().join("abs.toml");
         std::os::unix::fs::symlink(real.join("dotfiles/other.toml"), &absolute).unwrap();
         assert!(watch_names(&absolute).contains(&real.join("dotfiles/other.toml")));
+    }
+
+    /// A manager watching `paths` for real, loaded once.
+    async fn manager_watching(root: &Path, paths: Vec<PathBuf>) -> ClusterManager {
+        let (events, _rx) = crate::events::channel();
+        let config = CoreConfig {
+            config_dir: root.join("flint"),
+            settings: Settings::default(),
+            settings_error: None,
+            kubeconfig_base: paths,
+            home: None,
+            watch_files: true,
+            watch_timing: Default::default(),
+        };
+        let mut manager = ClusterManager::new(
+            config,
+            events,
+            HubRegistry::default(),
+            SessionUnlocks::default(),
+        );
+        manager.rebuild_watcher();
+        manager.reload_kubeconfig().await;
+        manager
+    }
+
+    /// Runs the manager's internal messages until `context` shows `server` (`None`: is gone).
+    /// Returns as soon as it does, and fails after a limit only a lost event can reach.
+    async fn until_server(manager: &mut ClusterManager, context: &str, server: Option<&str>) {
+        let mut internal = manager.internal_rx.take().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let shown = manager.cluster(context).map(|c| c.info.server.clone());
+            if shown.as_ref().map(|s| s.as_deref()) == server.map(Some) {
+                break;
+            }
+            match tokio::time::timeout_at(deadline, internal.recv()).await {
+                Ok(Some(msg)) => manager.handle_internal(msg).await,
+                _ => panic!("{context} still shows {shown:?}, wanted {server:?}"),
+            }
+        }
+        manager.internal_rx = Some(internal);
+    }
+
+    /// Points the symlink `link` at `target` in one step, as `ln -sfn` tools do.
+    fn point_link(link: &Path, target: &Path) {
+        let next = link.with_extension("next");
+        std::os::unix::fs::symlink(target, &next).unwrap();
+        std::fs::rename(&next, link).unwrap();
+    }
+
+    /// `root/name/config` defining `dev` at `server`.
+    fn config_in(root: &Path, name: &str, server: &str) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config");
+        std::fs::write(&file, kubeconfig_with(server)).unwrap();
+        file
+    }
+
+    #[tokio::test]
+    async fn a_link_moved_to_another_folder_is_still_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let first = config_in(&root, "a", "https://a");
+        let second = config_in(&root, "b", "https://b");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let mut manager = manager_watching(&root, vec![link.clone()]).await;
+        until_server(&mut manager, "dev", Some("https://a")).await;
+
+        point_link(&link, &second);
+        until_server(&mut manager, "dev", Some("https://b")).await;
+        std::fs::write(&second, kubeconfig_with("https://b-edited")).unwrap();
+        until_server(&mut manager, "dev", Some("https://b-edited")).await;
+    }
+
+    // Only a move of what is watched replaces the watcher; a plain edit keeps it.
+    #[test]
+    fn the_watch_plan_changes_only_when_a_link_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let first = config_in(&root, "a", "https://a");
+        let second = config_in(&root, "b", "https://b");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let paths = [link.clone()];
+        let before = Watched::for_files(&paths, &root);
+        std::fs::write(&first, kubeconfig_with("https://a-edited")).unwrap();
+        assert!(before == Watched::for_files(&paths, &root), "an edit");
+        point_link(&link, &second);
+        let after = Watched::for_files(&paths, &root);
+        assert!(before != after, "a move");
+        assert!(after.dirs.contains(&root.join("b")), "{:?}", after.dirs);
+    }
+
+    #[test]
+    fn a_link_cycle_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        assert!(watch_names(&a).contains(&b));
+    }
+
+    #[tokio::test]
+    async fn a_moved_link_in_a_chain_is_still_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let first = config_in(&root, "a", "https://a");
+        let second = config_in(&root, "b", "https://b");
+        std::fs::create_dir(root.join("hops")).unwrap();
+        let (near, far) = (root.join("hops/near"), root.join("hops/far"));
+        std::os::unix::fs::symlink(&first, &far).unwrap();
+        std::os::unix::fs::symlink(&far, &near).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&near, &link).unwrap();
+        let mut manager = manager_watching(&root, vec![link]).await;
+        until_server(&mut manager, "dev", Some("https://a")).await;
+
+        // The last link of the chain moves, not the one the file list names.
+        point_link(&far, &second);
+        until_server(&mut manager, "dev", Some("https://b")).await;
+        std::fs::write(&second, kubeconfig_with("https://b-edited")).unwrap();
+        until_server(&mut manager, "dev", Some("https://b-edited")).await;
+    }
+
+    #[tokio::test]
+    async fn a_link_target_that_disappears_and_returns_is_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let first = config_in(&root, "a", "https://a");
+        let second = config_in(&root, "b", "https://b");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let mut manager = manager_watching(&root, vec![link.clone()]).await;
+        until_server(&mut manager, "dev", Some("https://a")).await;
+        point_link(&link, &second);
+        until_server(&mut manager, "dev", Some("https://b")).await;
+
+        std::fs::remove_dir_all(root.join("b")).unwrap();
+        until_server(&mut manager, "dev", None).await;
+        config_in(&root, "b", "https://b-back");
+        until_server(&mut manager, "dev", Some("https://b-back")).await;
+        std::fs::write(&second, kubeconfig_with("https://b-edited")).unwrap();
+        until_server(&mut manager, "dev", Some("https://b-edited")).await;
+    }
+
+    #[tokio::test]
+    async fn each_of_several_kubeconfig_links_is_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let two = |server: &str| {
+            kubeconfig_with(server)
+                .replace("name: dev", "name: two")
+                .replace("name: c\n", "name: c2\n")
+                .replace("cluster: c\n", "cluster: c2\n")
+        };
+        let kept = config_in(&root, "kept", "https://kept");
+        let first = config_in(&root, "a", "https://a");
+        let second = config_in(&root, "b", "https://b");
+        std::fs::write(&first, two("https://a")).unwrap();
+        std::fs::write(&second, two("https://b")).unwrap();
+        let (one, moved) = (root.join("one"), root.join("moved"));
+        std::os::unix::fs::symlink(&kept, &one).unwrap();
+        std::os::unix::fs::symlink(&first, &moved).unwrap();
+        let mut manager = manager_watching(&root, vec![one, moved.clone()]).await;
+        until_server(&mut manager, "two", Some("https://a")).await;
+
+        point_link(&moved, &second);
+        until_server(&mut manager, "two", Some("https://b")).await;
+        std::fs::write(&second, two("https://b-edited")).unwrap();
+        until_server(&mut manager, "two", Some("https://b-edited")).await;
+        std::fs::write(&kept, kubeconfig_with("https://kept-edited")).unwrap();
+        until_server(&mut manager, "dev", Some("https://kept-edited")).await;
     }
 
     // covers UP-24
