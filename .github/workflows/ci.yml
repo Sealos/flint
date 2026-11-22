@@ -112,11 +112,14 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - if: env.RUN == 'true'
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      # Read-only, from the cache cluster-e2e.yml saves on master: it holds the compiled test
+      # dependencies of these three crates. The `linux` cache is saved by clippy and holds only
+      # check metadata, so restoring it here rebuilt about 200 dependencies in every job.
       - if: env.RUN == 'true'
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: linux
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          shared-key: linux-cluster-e2e
+          save-if: false
       # The MCP e2e tests run flint-mcp; build it here rather than inside the tests.
       - if: env.RUN == 'true' && (matrix.crate == 'flint-e2e')
         run: cargo build -p flint-mcp --bin flint-mcp --locked
@@ -130,8 +133,6 @@ jobs:
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
@@ -140,6 +141,10 @@ jobs:
           shared-key: linux
           save-if: false
       - run: cargo doc -p flint-core -p flint-mcp -p flint-e2e --no-deps --document-private-items --locked
+        # On the step, not the job: rust-cache hashes RUST* variables into its key, so a job-level
+        # value here never matched the `linux` cache and every run rebuilt the dependencies.
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   # The app on Linux: GPUI builds there (X11/Wayland), and the headless view tests use GPUI's
   # test platform, so they run without a display. Flint ships a Linux AppImage (ADR-0016); the
