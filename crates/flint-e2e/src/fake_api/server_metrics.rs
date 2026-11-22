@@ -447,42 +447,63 @@ mod tests {
         fetch(&client, "/api/v1/pods", TABLE).await.unwrap();
     }
 
+    /// The cell of `row` under the column called `wanted`.
+    fn cell<'a>(table: &'a Value, row: &'a Value, wanted: &str) -> &'a str {
+        let column = table["columnDefinitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|c| c["name"] == wanted)
+            .unwrap();
+        row["cells"][column].as_str().unwrap()
+    }
+
+    /// Reads `path` as a Table and as a plain list, and checks that every plain item stands for
+    /// the Table row of the same name: its usage, window and timestamp. The values come from the
+    /// recorded fixtures, so the test compares the two formats instead of fixing them.
+    async fn assert_plain_matches_table(client: &kube::Client, path: &str, kind: &str) {
+        let table = fetch(client, path, TABLE).await.unwrap();
+        let plain = fetch(client, path, "application/json").await.unwrap();
+        assert_eq!(plain["kind"], kind);
+        let rows = table["rows"].as_array().unwrap();
+        let items = plain["items"].as_array().unwrap();
+        assert!(!rows.is_empty(), "{path} has no recorded rows");
+        assert_eq!(items.len(), rows.len(), "{path}");
+        for (item, row) in items.iter().zip(rows) {
+            let meta = &row["object"]["metadata"];
+            assert_eq!(item["metadata"]["name"], meta["name"], "{path}");
+            assert_eq!(item["metadata"]["namespace"], meta["namespace"], "{path}");
+            let usage = if kind == "NodeMetricsList" {
+                item["usage"].clone()
+            } else {
+                assert!(item["containers"][0]["name"].is_string(), "{item}");
+                item["containers"][0]["usage"].clone()
+            };
+            assert_eq!(usage["cpu"], cell(&table, row, "cpu"), "{item}");
+            assert_eq!(usage["memory"], cell(&table, row, "memory"), "{item}");
+            assert_eq!(item["window"], cell(&table, row, "Window"), "{item}");
+            let timestamp = item["timestamp"].as_str().unwrap();
+            assert!(timestamp.ends_with('Z'), "{item}");
+            assert_eq!(item["timestamp"], meta["creationTimestamp"], "{item}");
+        }
+    }
+
     #[tokio::test]
     async fn a_plain_list_gives_recorded_rows_their_usage() {
         let server = FakeApiServer::start().await.unwrap();
         let client = server.unrestricted_client().await.unwrap();
-        let nodes = fetch(
+        assert_plain_matches_table(
             &client,
             "/apis/metrics.k8s.io/v1beta1/nodes",
-            "application/json",
+            "NodeMetricsList",
         )
-        .await
-        .unwrap();
-        let node = &nodes["items"][0];
-        assert_eq!(nodes["kind"], "NodeMetricsList");
-        assert_eq!(node["metadata"]["name"], "flint-dev-control-plane");
-        assert_eq!(node["usage"]["cpu"], "146036024n");
-        assert_eq!(node["usage"]["memory"], "1146616Ki");
-        assert_eq!(node["window"], "10.021s");
-        assert!(node["timestamp"].as_str().unwrap().ends_with('Z'));
-
-        let pods = fetch(
+        .await;
+        assert_plain_matches_table(
             &client,
             "/apis/metrics.k8s.io/v1beta1/namespaces/demo/pods",
-            "application/json",
+            "PodMetricsList",
         )
-        .await
-        .unwrap();
-        let db = pods["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p["metadata"]["name"] == "fixture-db-0")
-            .unwrap();
-        assert_eq!(db["metadata"]["namespace"], "demo");
-        assert!(db["containers"][0]["name"].is_string());
-        assert_eq!(db["containers"][0]["usage"]["cpu"], "0");
-        assert_eq!(db["containers"][0]["usage"]["memory"], "552Ki");
+        .await;
     }
 
     #[tokio::test]
