@@ -641,7 +641,10 @@ fn parse_replicas(typed: &str) -> Result<u32, String> {
 /// Which object a dialog before the review is about.
 fn object_lines(target: &WriteTarget) -> String {
     let mut lines = vec![
-        format!("Context: {}", target.cluster),
+        format!(
+            "Context: {}",
+            flint_core::display::single_line(&target.cluster)
+        ),
         format!(
             "Server: {}",
             target

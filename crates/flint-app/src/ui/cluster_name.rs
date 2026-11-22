@@ -50,10 +50,12 @@ fn problem(
         .then(|| "Another cluster already goes by this name.".to_owned())
 }
 
-/// The dialog's text: the real context and server stay on screen while naming it.
-fn dialog(context: &str, server: Option<&str>) -> DialogText {
+/// The dialog's text: the real context and server stay on screen while naming it. `shown` is what
+/// the title calls it ([`ClusterNames::with_real`]).
+fn dialog(shown: &str, context: &str, server: Option<&str>) -> DialogText {
+    let context = flint_core::display::single_line(context);
     DialogText {
-        title: format!("Rename {}", short_name(context)),
+        title: format!("Rename {shown}"),
         text: format!(
             "Shown instead of the context name, in Flint only. kubeconfig is not changed, and AI \
              agents and shells keep the context name. Leave it empty to use the context name \
@@ -118,7 +120,8 @@ pub fn open(
         error: None,
     });
     let content = field.clone().into();
-    let text = dialog(&context, server.as_deref());
+    let shown = model.read(cx).names().with_real(&context);
+    let text = dialog(&shown, &context, server.as_deref());
     confirm::open_with(window, cx, text, Some(content), move |_, cx| {
         let typed = field.read(cx).input.read(cx).value().to_string();
         let refused = {
@@ -143,6 +146,8 @@ pub fn open(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+
+    use flint_core::display::ClusterNames;
 
     use super::{dialog, problem};
 
@@ -201,15 +206,30 @@ mod tests {
     #[test]
     fn the_dialog_names_the_real_context_and_server() {
         let arn = "arn:aws:eks:eu-west-1:123456789012:cluster/example-prod";
-        let text = dialog(arn, Some("https://example.invalid")).text;
+        let text = dialog("example-prod", arn, Some("https://example.invalid")).text;
         assert!(text.contains(&format!("Context: {arn}")), "{text}");
         assert!(text.contains("Server: https://example.invalid"), "{text}");
         assert!(text.contains("kubeconfig is not changed"), "{text}");
     }
 
+    // covers UP-55: names that differ only in an escaped character get different titles.
+    #[test]
+    fn escaped_names_get_different_titles() {
+        let (a, b) = ("team \tA cluster-prod", "team \tB cluster-prod");
+        let names = ClusterNames::new([a, b], &BTreeMap::new());
+        let title = |context| dialog(&names.with_real(context), context, None).title;
+        assert_ne!(title(a), title(b));
+        assert_eq!(title(a).lines().count(), 1);
+    }
+
     #[test]
     fn the_dialog_shows_the_cleaned_server_address() {
-        let text = dialog("alpha", Some("https://admin:hunter2@prod.example:6443")).text;
+        let text = dialog(
+            "alpha",
+            "alpha",
+            Some("https://admin:hunter2@prod.example:6443"),
+        )
+        .text;
         assert!(text.contains("Server: https://prod.example:6443"), "{text}");
         assert!(
             !text.contains("hunter2") && !text.contains("admin"),
