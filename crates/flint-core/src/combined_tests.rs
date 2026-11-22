@@ -63,6 +63,7 @@ fn snapshot(cluster: &str, columns: Vec<Column>, mut rows: Vec<Arc<Row>>) -> Arc
 
 fn member(snapshot: Arc<KindSnapshot>) -> CombinedMember {
     CombinedMember {
+        display_name: snapshot.cluster.clone(),
         snapshot,
         tag: None,
     }
@@ -114,7 +115,7 @@ fn labels(list: &CombinedList, rows: &[RowRef]) -> Vec<String> {
             format!(
                 "{}/{}",
                 list.members()[at.member()].cluster(),
-                list.row(at).unwrap().name
+                list.row_info(at).unwrap().name
             )
         })
         .collect()
@@ -220,6 +221,7 @@ fn the_cluster_cell_carries_the_tag_for_its_dot() {
     let list = CombinedList::new(vec![
         CombinedMember {
             snapshot: snapshot("a", vec![name_col()], vec![row("n", "x", "1", &[])]),
+            display_name: "a".into(),
             tag: Some(ClusterTag::Red),
         },
         member(snapshot(
@@ -253,7 +255,7 @@ fn same_named_objects_in_two_clusters_have_different_ids() {
     let webs: Vec<_> = view
         .rows()
         .iter()
-        .filter(|&&at| &*list.row(at).unwrap().name == "web")
+        .filter(|&&at| list.row_info(at).unwrap().name == "web")
         .map(|&at| list.row_id(at).unwrap())
         .collect();
     assert_eq!(webs.len(), 2);
@@ -532,6 +534,141 @@ fn a_secret_column_never_shows_filters_or_sorts() {
 }
 
 #[test]
+fn debug_output_and_row_info_never_hold_a_secret_cell() {
+    let snapshot = secrets("a", "raw-token-value");
+    let input = member(snapshot);
+    assert!(!format!("{input:?}").contains("raw-token-value"));
+    let list = CombinedList::new(vec![input]).unwrap();
+    assert!(!format!("{list:?}").contains("raw-token-value"));
+    let view = list.compute(&CombinedQuery::default(), NOW);
+    let info = list.row_info(view.rows()[0]).unwrap();
+    assert_eq!(info.name, "s");
+    assert!(!format!("{info:?}").contains("raw-token-value"));
+    assert_eq!(list.members()[0].row_count(), 1);
+    assert_eq!(list.members()[0].state(), &SyncState::Idle);
+}
+
+fn named(id: &str, display_name: &str, row_name: &str) -> CombinedMember {
+    CombinedMember {
+        snapshot: snapshot(
+            id,
+            vec![name_col(), ns_col()],
+            vec![row("n", row_name, "same-uid", &[])],
+        ),
+        display_name: display_name.into(),
+        tag: None,
+    }
+}
+
+#[test]
+fn the_cluster_column_uses_the_display_name_and_filters_use_the_id() {
+    let list = CombinedList::new(vec![
+        named("ctx-zzz", "alpha", "one"),
+        named("ctx-aaa", "beta", "two"),
+    ])
+    .unwrap();
+    assert_eq!(list.members()[0].cluster(), "ctx-zzz");
+    assert_eq!(list.members()[0].display_name(), "alpha");
+
+    let cluster = list.columns()[CLUSTER_COLUMN].key.clone();
+    let view = list.compute(&sorted(cluster, false), NOW);
+    assert_eq!(labels(&list, view.rows()), ["ctx-zzz/one", "ctx-aaa/two"]);
+    assert!(matches!(
+        list.cell(view.rows()[0], CLUSTER_COLUMN, NOW),
+        CombinedCell::Cluster { name: "alpha", .. }
+    ));
+    assert_eq!(&*list.row_id(view.rows()[0]).unwrap().cluster, "ctx-zzz");
+
+    let search = |text: &str| {
+        let query = CombinedQuery {
+            text: text.into(),
+            ..Default::default()
+        };
+        labels(&list, list.compute(&query, NOW).rows())
+    };
+    assert_eq!(search("BETA"), ["ctx-aaa/two"]);
+    assert!(search("ctx-").is_empty(), "the id is not on screen");
+
+    let by_id = CombinedQuery {
+        clusters: vec!["ctx-aaa".into()],
+        ..Default::default()
+    };
+    assert_eq!(
+        labels(&list, list.compute(&by_id, NOW).rows()),
+        ["ctx-aaa/two"]
+    );
+    let by_name = CombinedQuery {
+        clusters: vec!["beta".into()],
+        ..Default::default()
+    };
+    assert_eq!(list.compute(&by_name, NOW).matched(), 0);
+}
+
+#[test]
+fn two_clusters_with_one_display_name_stay_apart() {
+    let list =
+        CombinedList::new(vec![named("id-b", "same", "x"), named("id-a", "same", "x")]).unwrap();
+    assert_eq!(list.members()[0].cluster(), "id-a");
+    let view = list.compute(&CombinedQuery::default(), NOW);
+    assert_ne!(
+        list.row_id(view.rows()[0]).unwrap(),
+        list.row_id(view.rows()[1]).unwrap()
+    );
+}
+
+#[test]
+fn large_integers_sort_exactly() {
+    let list = list(vec![snapshot(
+        "a",
+        vec![name_col(), ns_col(), value("V")],
+        vec![
+            row("n", "a-high", "1", &[Cell::Int(9_007_199_254_740_993)]),
+            row("n", "b-low", "2", &[Cell::Int(9_007_199_254_740_992)]),
+        ],
+    )]);
+    let view = list.compute(&sorted(key("V"), false), NOW);
+    assert_eq!(labels(&list, view.rows()), ["a/b-low", "a/a-high"]);
+    let view = list.compute(&sorted(key("V"), true), NOW);
+    assert_eq!(labels(&list, view.rows()), ["a/a-high", "a/b-low"]);
+}
+
+#[test]
+fn integers_and_floats_compare_exactly() {
+    use Ordering::{Equal, Greater, Less};
+    let big = 9_007_199_254_740_992_i64;
+    for (int, float, expected) in [
+        (9, 9.5, Less),
+        (10, 9.5, Greater),
+        (9, 9.0, Equal),
+        (-1, -0.5, Less),
+        (0, -0.5, Greater),
+        (-2, -1.5, Less),
+        (0, 0.0, Equal),
+        (0, -0.0, Greater),
+        (big + 1, big as f64, Greater),
+        (big, big as f64, Equal),
+        (i64::MAX, 9_223_372_036_854_775_808.0, Less),
+        (i64::MIN, -9_223_372_036_854_775_808.0, Equal),
+        (i64::MIN, -1e19, Greater),
+        (0, f64::INFINITY, Less),
+        (0, f64::NEG_INFINITY, Greater),
+        (i64::MAX, f64::NAN, Less),
+        (i64::MIN, -f64::NAN, Greater),
+    ] {
+        assert_eq!(
+            compare_int_float(int, float),
+            expected,
+            "{int} vs {float:?}"
+        );
+        assert_eq!(
+            SortKey::Float(float).compare(&SortKey::Int(int), false),
+            expected.reverse(),
+            "{float:?} vs {int}"
+        );
+    }
+}
+
+#[test]
 fn mixed_kinds_and_repeated_clusters_are_refused() {
     let pods = snapshot("a", vec![], vec![]);
     assert!(matches!(
@@ -547,6 +684,7 @@ fn mixed_kinds_and_repeated_clusters_are_refused() {
 #[test]
 fn no_members_is_an_empty_list() {
     let list = list(vec![]);
+    assert_eq!(names(&list), ["Cluster"]);
     let view = list.compute(&CombinedQuery::default(), NOW);
     assert_eq!(view.line_count(), 0);
     assert_eq!(view.line(0), None);

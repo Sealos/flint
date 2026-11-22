@@ -4,9 +4,11 @@
 //! - Columns are the union of the members' columns, by [`ColumnKey`], after a leading Cluster
 //!   column. A cell whose cluster lacks the column is [`CombinedCell::Blank`].
 //! - A row is addressed by [`RowRef`] within one list, and by [`CombinedRowId`] across lists. The
-//!   id always holds the cluster, so two clusters' objects of the same name never compare equal.
-//! - A Secret's masked columns follow [`crate::redact::is_masked_column`] per member: their raw
-//!   cells are not reachable from here, and sorting on one keeps the default order.
+//!   id always holds the [`ClusterId`], so two clusters' objects of the same name never compare
+//!   equal. The Cluster column shows, sorts and searches the display name passed in instead.
+//! - A Secret's masked columns follow [`crate::redact::is_masked_column`] per member. Rows and
+//!   snapshots stay private and out of `Debug`, so raw cells are not reachable from here, and
+//!   sorting on a masked column keeps the default order.
 //!
 //! `compute` costs O(n log n) in the rows that pass the filter. The default order merges the
 //! members' already sorted rows, and a collapsed group is counted but not sorted.
@@ -16,13 +18,14 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 
 use crate::cluster::ClusterId;
 use crate::read::KindId;
 use crate::redact::{is_masked_column, is_secret_list};
 use crate::settings::ClusterTag;
-use crate::store::KindSnapshot;
+use crate::store::{KindSnapshot, SyncState};
 use crate::table::{Cell, Column, ColumnRole, ColumnType, Row};
 use crate::view::{ViewQuery, natural_cmp};
 
@@ -34,11 +37,25 @@ pub const CLUSTER_COLUMN: usize = 0;
 pub const CLUSTER_COLUMN_KEY: &str = "flint:cluster";
 
 /// One member of a combined list.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CombinedMember {
     pub snapshot: Arc<KindSnapshot>,
+    /// The cluster's resolved name, as the sidebar shows it.
+    pub display_name: String,
     /// The cluster's colour tag, drawn as a dot in the Cluster column.
     pub tag: Option<ClusterTag>,
+}
+
+impl fmt::Debug for CombinedMember {
+    /// Leaves out the snapshot, whose rows hold a Secret's raw cells.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CombinedMember")
+            .field("cluster", &self.snapshot.cluster)
+            .field("display_name", &self.display_name)
+            .field("tag", &self.tag)
+            .field("rows", &self.snapshot.rows.len())
+            .finish()
+    }
 }
 
 /// Why members cannot be combined.
@@ -82,10 +99,11 @@ enum Slot {
     Shown(u32),
 }
 
-/// A member, in cluster-name order.
-#[derive(Debug, Clone)]
+/// A member, in display-name order.
+#[derive(Clone)]
 pub struct MemberView {
     cluster: Arc<str>,
+    display_name: Arc<str>,
     tag: Option<ClusterTag>,
     snapshot: Arc<KindSnapshot>,
     /// One per combined column.
@@ -93,18 +111,52 @@ pub struct MemberView {
 }
 
 impl MemberView {
+    /// The cluster's [`ClusterId`], for identity and exact filters.
     pub fn cluster(&self) -> &str {
         &self.cluster
+    }
+
+    /// The name the Cluster column shows, sorts and searches.
+    pub fn display_name(&self) -> &str {
+        &self.display_name
     }
 
     pub fn tag(&self) -> Option<ClusterTag> {
         self.tag
     }
 
-    /// The member's own snapshot, for its sync state and row count.
-    pub fn snapshot(&self) -> &Arc<KindSnapshot> {
-        &self.snapshot
+    /// How current this member's rows are, for its note in the list.
+    pub fn state(&self) -> &SyncState {
+        &self.snapshot.state
     }
+
+    /// How many rows this member holds, before any filter.
+    pub fn row_count(&self) -> usize {
+        self.snapshot.rows.len()
+    }
+}
+
+impl fmt::Debug for MemberView {
+    /// Leaves out the snapshot, whose rows hold a Secret's raw cells.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemberView")
+            .field("cluster", &self.cluster)
+            .field("display_name", &self.display_name)
+            .field("tag", &self.tag)
+            .field("rows", &self.row_count())
+            .finish()
+    }
+}
+
+/// A row's identity and metadata, without its cells: read those through
+/// [`CombinedList::cell`], which masks them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CombinedRowInfo<'a> {
+    pub uid: &'a str,
+    pub name: &'a str,
+    pub namespace: Option<&'a str>,
+    /// `metadata.creationTimestamp`, Unix seconds.
+    pub created: Option<i64>,
 }
 
 /// A row's place in one [`CombinedList`]. Meaningless in any other list: keep a
@@ -132,7 +184,7 @@ pub struct CombinedRowId {
 /// What a combined cell shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CombinedCell<'a> {
-    /// The Cluster column: the name, and the tag for its dot.
+    /// The Cluster column: the display name, and the tag for its dot.
     Cluster {
         name: &'a str,
         tag: Option<ClusterTag>,
@@ -149,13 +201,13 @@ pub enum CombinedCell<'a> {
 pub struct CombinedQuery {
     /// As [`ViewQuery::namespaces`].
     pub namespaces: Vec<String>,
-    /// As [`ViewQuery::text`]; a cluster whose name holds the text keeps all its rows.
+    /// As [`ViewQuery::text`]; a cluster whose display name holds the text keeps all its rows.
     pub text: String,
-    /// Only these clusters. Empty means all.
+    /// Only these clusters, matched exactly by id. Empty means all.
     pub clusters: Vec<ClusterId>,
     pub sort: Option<CombinedSort>,
     pub group_by_cluster: bool,
-    /// Clusters whose group shows its header only.
+    /// Clusters, by id, whose group shows its header only.
     pub collapsed: Vec<ClusterId>,
 }
 
@@ -237,16 +289,17 @@ impl CombinedView {
     }
 }
 
-/// Several clusters' snapshots of one kind.
-#[derive(Debug, Clone, Default)]
+/// Several clusters' snapshots of one kind. Built only by [`CombinedList::new`], so the Cluster
+/// column is always there, even with no members.
+#[derive(Debug, Clone)]
 pub struct CombinedList {
     columns: Arc<[CombinedColumn]>,
     members: Box<[MemberView]>,
 }
 
 impl CombinedList {
-    /// Merges `members`. The result does not depend on their order: members are held by cluster
-    /// name.
+    /// Merges `members`. The result does not depend on their order: members are held by display
+    /// name, then id.
     pub fn new(mut members: Vec<CombinedMember>) -> Result<Self, CombineError> {
         if let Some((first, rest)) = members.split_first()
             && let Some(other) = rest.iter().find(|m| m.snapshot.kind != first.snapshot.kind)
@@ -265,8 +318,9 @@ impl CombinedList {
             }
         }
         members.sort_by(|a, b| {
-            let (a, b) = (&a.snapshot.cluster, &b.snapshot.cluster);
-            natural_cmp(a, b).then_with(|| a.cmp(b))
+            natural_cmp(&a.display_name, &b.display_name)
+                .then_with(|| a.display_name.cmp(&b.display_name))
+                .then_with(|| a.snapshot.cluster.cmp(&b.snapshot.cluster))
         });
 
         let columns = union_columns(&members);
@@ -290,6 +344,7 @@ impl CombinedList {
                 }
                 MemberView {
                     cluster: snapshot.cluster.as_str().into(),
+                    display_name: member.display_name.as_str().into(),
                     tag: member.tag,
                     snapshot: snapshot.clone(),
                     slots: slots.into(),
@@ -307,7 +362,7 @@ impl CombinedList {
         &self.columns
     }
 
-    /// The members, by cluster name.
+    /// The members, by display name.
     pub fn members(&self) -> &[MemberView] {
         &self.members
     }
@@ -317,18 +372,29 @@ impl CombinedList {
         self.columns.iter().position(|c| c.key == *key)
     }
 
-    /// The row at `at`, which must come from a view of this list.
-    pub fn row(&self, at: RowRef) -> Option<&Arc<Row>> {
+    /// The row's metadata. `at` must come from a view of this list.
+    pub fn row_info(&self, at: RowRef) -> Option<CombinedRowInfo<'_>> {
+        let row = self.checked_row(at)?;
+        Some(CombinedRowInfo {
+            uid: &row.uid,
+            name: &row.name,
+            namespace: row.namespace.as_deref(),
+            created: row.created,
+        })
+    }
+
+    fn checked_row(&self, at: RowRef) -> Option<&Row> {
         self.members
             .get(at.member())?
             .snapshot
             .rows
             .get(at.row as usize)
+            .map(|row| &**row)
     }
 
     /// The identity of the row at `at`.
     pub fn row_id(&self, at: RowRef) -> Option<CombinedRowId> {
-        let row = self.row(at)?;
+        let row = self.checked_row(at)?;
         Some(CombinedRowId {
             cluster: self.members[at.member()].cluster.clone(),
             uid: row.uid.clone(),
@@ -342,7 +408,7 @@ impl CombinedList {
         };
         if column == CLUSTER_COLUMN {
             return CombinedCell::Cluster {
-                name: &member.cluster,
+                name: &member.display_name,
                 tag: member.tag,
             };
         }
@@ -444,7 +510,7 @@ impl CombinedList {
     fn filter_member(&self, member: usize, query: &CombinedQuery, now: i64) -> Vec<u32> {
         let view = &self.members[member];
         let needle = query.text.trim().to_ascii_lowercase();
-        let text = if view.cluster.to_ascii_lowercase().contains(&needle) {
+        let text = if view.display_name.to_ascii_lowercase().contains(&needle) {
             String::new()
         } else {
             query.text.clone()
@@ -480,10 +546,10 @@ impl CombinedList {
         &self.members[at.member()].snapshot.rows[at.row as usize]
     }
 
-    /// The same ordering as [`crate::view::compare_cells`] for a cell's own column.
+    /// The ordering of [`crate::view::compare_cells`], except that integers stay exact.
     fn sort_key(&self, at: RowRef, column: usize, now: i64) -> SortKey<'_> {
         if column == CLUSTER_COLUMN {
-            return SortKey::Num(f64::from(at.member));
+            return SortKey::Int(i64::from(at.member));
         }
         let Slot::Shown(index) = self.members[at.member()].slots[column] else {
             return SortKey::Empty;
@@ -497,12 +563,12 @@ impl CombinedList {
                 .as_deref()
                 .map_or(SortKey::Empty, SortKey::Text),
             Some(Cell::Age) => row.created.map_or(SortKey::Empty, |created| {
-                SortKey::Num(now.saturating_sub(created) as f64)
+                SortKey::Int(now.saturating_sub(created))
             }),
-            Some(Cell::Time(t)) => SortKey::Num(now.saturating_sub(*t) as f64),
-            Some(Cell::Int(i)) => SortKey::Num(*i as f64),
-            Some(Cell::Float(f)) => SortKey::Num(*f),
-            Some(Cell::Bool(b)) => SortKey::Num(f64::from(u8::from(*b))),
+            Some(Cell::Time(t)) => SortKey::Int(now.saturating_sub(*t)),
+            Some(Cell::Int(i)) => SortKey::Int(*i),
+            Some(Cell::Float(f)) => SortKey::Float(*f),
+            Some(Cell::Bool(b)) => SortKey::Int(i64::from(*b)),
             Some(Cell::Text(s)) if s.is_empty() || &**s == "<none>" => SortKey::Empty,
             Some(Cell::Text(s)) => SortKey::Text(s),
         }
@@ -517,7 +583,8 @@ struct ResolvedSort {
 
 enum SortKey<'a> {
     Empty,
-    Num(f64),
+    Int(i64),
+    Float(f64),
     Text(&'a str),
 }
 
@@ -527,13 +594,48 @@ impl SortKey<'_> {
             (SortKey::Empty, SortKey::Empty) => return Ordering::Equal,
             (SortKey::Empty, _) => return Ordering::Greater,
             (_, SortKey::Empty) => return Ordering::Less,
-            (SortKey::Num(x), SortKey::Num(y)) => x.total_cmp(y),
+            (SortKey::Int(x), SortKey::Int(y)) => x.cmp(y),
+            (SortKey::Float(x), SortKey::Float(y)) => x.total_cmp(y),
+            (SortKey::Int(x), SortKey::Float(y)) => compare_int_float(*x, *y),
+            (SortKey::Float(x), SortKey::Int(y)) => compare_int_float(*y, *x).reverse(),
             (SortKey::Text(x), SortKey::Text(y)) => natural_cmp(x, y),
-            (SortKey::Num(_), SortKey::Text(_)) => Ordering::Less,
-            (SortKey::Text(_), SortKey::Num(_)) => Ordering::Greater,
+            (SortKey::Text(_), _) => Ordering::Greater,
+            (_, SortKey::Text(_)) => Ordering::Less,
         };
         if descending { ord.reverse() } else { ord }
     }
+}
+
+/// Compares exactly, with no rounding of `int`. Agrees with [`f64::total_cmp`] so that sorting
+/// sees one total order: a negative NaN is below every integer, a positive NaN above, and `-0.0`
+/// just below the integer 0.
+fn compare_int_float(int: i64, float: f64) -> Ordering {
+    /// 2^63, the first float above every `i64`.
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0;
+    if float.is_nan() {
+        return if float.is_sign_negative() {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        };
+    }
+    if float >= LIMIT {
+        return Ordering::Less;
+    }
+    if float < -LIMIT {
+        return Ordering::Greater;
+    }
+    let whole = float.trunc();
+    int.cmp(&(whole as i64)).then_with(|| {
+        let fraction = float - whole;
+        if fraction > 0.0 {
+            Ordering::Less
+        } else if fraction < 0.0 || (float == 0.0 && float.is_sign_negative()) {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    })
 }
 
 /// Each column's key, numbering repeats of one key within the member.
