@@ -821,12 +821,13 @@ fn cell(value: Value, ty: ColumnType, role: ColumnRole, interner: &mut Interner,
 /// bookmark's fake row, for example).
 pub(crate) fn build_row(
     layout: &Layout,
+    kind: RowKind<'_>,
     meta: WireMeta,
     cells: Vec<Value>,
     interner: &mut Interner,
     now: i64,
 ) -> Option<Row> {
-    let manager = row_manager(&meta);
+    let manager = row_manager(kind, &meta);
     let name = meta.name.filter(|n| !n.is_empty())?;
     let namespace = meta
         .namespace
@@ -865,13 +866,30 @@ pub(crate) fn build_row(
     })
 }
 
-/// Who manages the object `meta` describes, as text. A row does not know its kind, so a tracking
-/// id is compared by namespace and name only.
-fn row_manager(meta: &WireMeta) -> Option<String> {
+/// The discovered group and kind of the rows being built. A Table row's own `kind` is
+/// `PartialObjectMetadata`, so only discovery can say what it is. The default is unknown, and then
+/// a tracking id is compared by namespace and name only.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RowKind<'a> {
+    pub group: Option<&'a str>,
+    pub kind: &'a str,
+}
+
+impl<'a> RowKind<'a> {
+    pub fn of(kind: &'a KindInfo) -> Self {
+        RowKind {
+            group: Some(kind.group()),
+            kind: kind.kind(),
+        }
+    }
+}
+
+/// Who manages the object `meta` describes, as text.
+fn row_manager(kind: RowKind<'_>, meta: &WireMeta) -> Option<String> {
     let name = meta.name.as_deref().filter(|n| !n.is_empty())?;
     let identity = gitops::Identity {
-        group: None,
-        kind: "",
+        group: kind.group,
+        kind: kind.kind,
         namespace: meta.namespace.as_deref().filter(|n| !n.is_empty()),
         name,
     };
@@ -911,6 +929,7 @@ pub(crate) fn next_layout(
 /// Empty when no layout is known yet: a Table's cells cannot be mapped without one.
 pub(crate) fn rows_with(
     object: WireObject,
+    kind: RowKind<'_>,
     layout: Option<&Layout>,
     interner: &mut Interner,
     now: i64,
@@ -925,7 +944,7 @@ pub(crate) fn rows_with(
             .into_iter()
             .filter_map(|r| {
                 let meta = r.object.map(|o| o.metadata).unwrap_or_default();
-                build_row(layout, meta, r.cells, interner, now)
+                build_row(layout, kind, meta, r.cells, interner, now)
             })
             .collect();
     }
@@ -933,10 +952,10 @@ pub(crate) fn rows_with(
         // A plain `*List`.
         Some(items) => items
             .into_iter()
-            .filter_map(|i| build_row(layout, i.metadata, Vec::new(), interner, now))
+            .filter_map(|i| build_row(layout, kind, i.metadata, Vec::new(), interner, now))
             .collect(),
         // A plain object (fallback watch event).
-        None => build_row(layout, object.metadata, Vec::new(), interner, now)
+        None => build_row(layout, kind, object.metadata, Vec::new(), interner, now)
             .into_iter()
             .collect(),
     }
@@ -946,6 +965,7 @@ pub(crate) fn rows_with(
 pub(crate) fn object_rows(
     object: WireObject,
     namespaced: bool,
+    kind: RowKind<'_>,
     layout: &mut Option<Layout>,
     interner: &mut Interner,
     now: i64,
@@ -953,7 +973,7 @@ pub(crate) fn object_rows(
     if let Some(next) = next_layout(&object, namespaced, layout.as_ref()) {
         *layout = Some(next);
     }
-    rows_with(object, layout.as_ref(), interner, now)
+    rows_with(object, kind, layout.as_ref(), interner, now)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1128,6 +1148,7 @@ pub async fn list_table(
     let mut rows = object_rows(
         object,
         kind.namespaced,
+        RowKind::of(kind),
         &mut layout,
         &mut interner,
         unix_now(),
@@ -1212,6 +1233,7 @@ pub(crate) mod tests {
         let rows = object_rows(
             parse(pod_table(&[("u1", "demo", "web-1", "Running")], true, "10")),
             true,
+            RowKind::default(),
             &mut layout,
             &mut interner,
             1_767_225_700,
@@ -1552,6 +1574,7 @@ pub(crate) mod tests {
         object_rows(
             parse(pod_table(&[("u1", "demo", "a", "Running")], true, "1")),
             true,
+            RowKind::default(),
             &mut layout,
             &mut interner,
             0,
@@ -1560,6 +1583,7 @@ pub(crate) mod tests {
         let rows = object_rows(
             parse(pod_table(&[("u2", "demo", "b", "Pending")], false, "2")),
             true,
+            RowKind::default(),
             &mut layout,
             &mut interner,
             0,
@@ -1571,6 +1595,7 @@ pub(crate) mod tests {
         object_rows(
             parse(pod_table(&[("u3", "demo", "c", "Running")], true, "3")),
             true,
+            RowKind::default(),
             &mut layout,
             &mut interner,
             0,
@@ -1592,7 +1617,14 @@ pub(crate) mod tests {
                 {"name":"Age","type":"date","format":"","priority":0}],
             "rows":[{"cells":["w1",1,"red","5m","5s"],"object":{"metadata":{"name":"w1","uid":"x"}}}]});
         let mut layout = None;
-        let rows = object_rows(parse(v), false, &mut layout, &mut Interner::default(), 1000);
+        let rows = object_rows(
+            parse(v),
+            false,
+            RowKind::default(),
+            &mut layout,
+            &mut Interner::default(),
+            1000,
+        );
         let layout = layout.unwrap();
         assert!(
             layout
@@ -1614,7 +1646,14 @@ pub(crate) mod tests {
             "items":[{"metadata":{"name":"p","namespace":"demo","creationTimestamp":"2026-01-01T00:00:00Z"},
                       "containers":[{"name":"c","usage":{"cpu":"1m"}}]}]});
         let mut layout = None;
-        let rows = object_rows(parse(list), true, &mut layout, &mut Interner::default(), 0);
+        let rows = object_rows(
+            parse(list),
+            true,
+            RowKind::default(),
+            &mut layout,
+            &mut Interner::default(),
+            0,
+        );
         let layout = layout.unwrap();
         assert_eq!(layout.format, ListFormat::Fallback);
         let names: Vec<&str> = layout.columns.iter().map(|c| &*c.name).collect();
@@ -1623,7 +1662,14 @@ pub(crate) mod tests {
         assert_eq!(&*rows[0].cells, &[Cell::Name, Cell::Namespace, Cell::Age]);
         // A plain watch event object.
         let event = json!({"kind":"Widget","metadata":{"name":"w","uid":"u"},"spec":{}});
-        let rows = object_rows(parse(event), false, &mut None, &mut Interner::default(), 0);
+        let rows = object_rows(
+            parse(event),
+            false,
+            RowKind::default(),
+            &mut None,
+            &mut Interner::default(),
+            0,
+        );
         assert_eq!(&*rows[0].uid, "u");
     }
 
@@ -1637,7 +1683,17 @@ pub(crate) mod tests {
         let object = parse(bookmark);
         assert!(object.is_initial_events_end());
         let mut layout = Some(Layout::fallback(true));
-        assert!(object_rows(object, true, &mut layout, &mut Interner::default(), 0).is_empty());
+        assert!(
+            object_rows(
+                object,
+                true,
+                RowKind::default(),
+                &mut layout,
+                &mut Interner::default(),
+                0
+            )
+            .is_empty()
+        );
         let plain = parse(pod_table(&[("u", "d", "n", "s")], true, "1"));
         assert!(!plain.is_initial_events_end());
     }

@@ -6,7 +6,8 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::store::KindSnapshot;
+use crate::read::KindInfo;
+use crate::store::{KindSnapshot, Store};
 use crate::view::{ViewQuery, compute};
 
 const TRACKING: &str = "argocd.argoproj.io/tracking-id";
@@ -24,10 +25,17 @@ fn rows(wire: Vec<Value>) -> Vec<Arc<Row>> {
         "rows": wire});
     let object: WireObject = serde_json::from_value(table).unwrap();
     let mut layout = None;
-    object_rows(object, true, &mut layout, &mut Interner::default(), 0)
-        .into_iter()
-        .map(Arc::new)
-        .collect()
+    object_rows(
+        object,
+        true,
+        RowKind::default(),
+        &mut layout,
+        &mut Interner::default(),
+        0,
+    )
+    .into_iter()
+    .map(Arc::new)
+    .collect()
 }
 
 fn mixed() -> Vec<Arc<Row>> {
@@ -136,4 +144,65 @@ fn a_marker_that_is_not_text_does_not_fail_the_list() {
     let odd = rows(vec![wire_row("odd", json!({}), json!({TRACKING: 7}))]);
     assert_eq!(odd.len(), 1);
     assert_eq!(odd[0].managed_by(), None);
+}
+
+fn deployments() -> KindInfo {
+    KindInfo {
+        resource: kube::core::ApiResource {
+            group: "apps".into(),
+            version: "v1".into(),
+            api_version: "apps/v1".into(),
+            kind: "Deployment".into(),
+            plural: "deployments".into(),
+        },
+        namespaced: true,
+        verbs: Vec::new(),
+        singular: "deployment".into(),
+        short_names: Vec::new(),
+    }
+}
+
+/// The manager a watched Deployment's row shows, carrying `labels` and tracking id `id`.
+fn watched_manager(labels: Value, id: &str) -> Option<String> {
+    let table = json!({"kind": "Table", "metadata": {"resourceVersion": "1"},
+        "columnDefinitions": [{"name": "Name", "type": "string", "format": "name"}],
+        "rows": [wire_row("web", labels, json!({TRACKING: id}))]});
+    let mut store = Store::new(true).with_kind(&deployments());
+    store.apply(serde_json::from_value(table).unwrap(), false, 0);
+    let snapshot = store.snapshot(KindSnapshot::default());
+    snapshot.rows[0].managed_by().map(str::to_owned)
+}
+
+// covers UP-23: an id copied from another group or kind does not outrank Flux, as in the detail
+// view, and the id naming this very object still does.
+#[test]
+fn a_flux_object_with_an_id_copied_from_another_kind_is_not_argo() {
+    let flux = || {
+        json!({"kustomize.toolkit.fluxcd.io/name": "apps",
+               "kustomize.toolkit.fluxcd.io/namespace": "flux-system"})
+    };
+    for copied in [
+        "shop:apps/StatefulSet:demo/web",
+        "shop:example.com/Deployment:demo/web",
+        "shop:/Deployment:demo/web",
+    ] {
+        assert_eq!(
+            watched_manager(flux(), copied).as_deref(),
+            Some("Flux: flux-system/apps"),
+            "{copied}"
+        );
+    }
+    assert_eq!(
+        watched_manager(flux(), "shop:apps/Deployment:demo/web").as_deref(),
+        Some("Argo CD: shop")
+    );
+}
+
+// covers UP-23: without another manager, a copied id still counts, so nothing loses its marker.
+#[test]
+fn a_copied_id_alone_still_names_argo() {
+    assert_eq!(
+        watched_manager(json!({}), "shop:apps/StatefulSet:demo/web").as_deref(),
+        Some("Argo CD: shop")
+    );
 }
