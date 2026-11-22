@@ -142,6 +142,49 @@ async fn keys_in_the_filter_return_to_the_rows(cx: &mut TestAppContext) {
     assert_eq!(t.selected(cx).as_deref(), Some("web"));
 }
 
+// covers UP-33: Enter on the rows opens the selected row and nothing else: with no selection,
+// or one the filter hides, it does nothing, and in the filter it only returns to the rows.
+#[gpui_kit::test]
+async fn enter_opens_only_the_selected_row(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0), ("demo", "web", 0)])
+        .await;
+    let list = t.list(cx).expect("a list is open");
+    let rows = list.read_with(cx, |l, _| l.focus_handle().clone());
+    cx.update_window(t.window, |_, window, cx| window.focus(&rows, cx))
+        .unwrap();
+    t.press(cx, "enter");
+    assert_eq!(t.selected(cx), None, "no row is selected by Enter");
+    assert!(t.detail(cx).is_none());
+
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.press(cx, "enter");
+    assert_eq!(focus(cx, &t), Focus::List);
+    assert_eq!(t.selected(cx), None, "Enter in the filter selects nothing");
+    assert!(t.detail(cx).is_none());
+
+    t.press(cx, "down");
+    assert_eq!(t.selected(cx).as_deref(), Some("api"));
+    let opened = t.detail(cx).expect("Down opened the row");
+    t.press(cx, "enter");
+    assert_eq!(t.selected(cx).as_deref(), Some("api"));
+    let same = t.detail(cx).expect("the detail stays");
+    assert_eq!(opened.entity_id(), same.entity_id(), "not opened again");
+    assert_eq!(focus(cx, &t), Focus::List);
+
+    // The filter hides the selected row: Enter on the rows does not pick another.
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.type_text(cx, "we");
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 1)
+        .await;
+    t.press(cx, "enter");
+    assert_eq!(focus(cx, &t), Focus::List);
+    t.press(cx, "enter");
+    assert_eq!(t.selected(cx).as_deref(), Some("api"));
+}
+
 // covers UP-33: Tab reaches a shell tab in the dock, where Tab then belongs to the shell.
 #[gpui_kit::test]
 async fn tab_reaches_the_dock(cx: &mut TestAppContext) {

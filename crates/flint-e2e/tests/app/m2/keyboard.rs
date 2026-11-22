@@ -149,6 +149,23 @@ fn up_33_keyboard_only() -> Result<()> {
     app.wait_for("/detail", Equals(Value::Null))?;
     app.wait_for("/focus", Equals("list".into()))?;
 
+    // Enter with nothing selected opens nothing, and in the filter it only returns to the rows.
+    app.press_key("enter")?;
+    assert_eq!(app.state()?["detail"], Value::Null);
+    app.press_key("secondary-f")?;
+    app.wait_for("/focus", Equals("list_filter".into()))?;
+    app.press_key("enter")?;
+    app.wait_for("/focus", Equals("list".into()))?;
+    assert_eq!(app.state()?["detail"], Value::Null);
+
+    // Enter on the selected row keeps it open, and writes nothing.
+    app.press_key("down")?;
+    app.wait_for("/detail/name", Equals(first.as_str().into()))?;
+    app.press_key("enter")?;
+    app.wait_for("/detail/name", Equals(first.as_str().into()))?;
+    app.wait_for("/focus", Equals("list".into()))?;
+    assert!(two.b.writes().is_empty(), "Enter wrote to the cluster");
+
     // Cmd-Q itself ends the app (it may go before it answers); `quit` then checks exit code 0.
     let _ = app.press_key("secondary-q");
     wait_for_socket_removed(&app)?;

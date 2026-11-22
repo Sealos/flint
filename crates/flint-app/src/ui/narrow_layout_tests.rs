@@ -369,6 +369,66 @@ async fn a_right_click_keeps_the_row_and_its_menu(cx: &mut TestAppContext) {
     assert!(shown(cx, &t, "detail-back"));
 }
 
+// covers UP-33: Enter on the selected row brings its detail back in front, as a click does; an
+// open menu or dialog keeps Enter.
+#[gpui_kit::test]
+async fn enter_on_the_selected_row_shows_its_detail(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    detail_alone(cx, &t).await;
+    t.click(cx, "detail-back");
+    draw(cx, &t);
+    assert_eq!(focus(cx, &t), Focus::List);
+
+    // A dialog over the list: Enter answers it (here, Cancel) and the list stays in front.
+    let dialog = DialogText {
+        title: "Delete web?".into(),
+        text: "Object: pods web".into(),
+        ok: "Delete".into(),
+        cancel: "Cancel".into(),
+        id: "write-confirm-description",
+        default_cancel: true,
+    };
+    let confirmed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let set = confirmed.clone();
+    cx.update_window(t.window, |_, window, cx| {
+        confirm::open(window, cx, dialog, move |_, _| set.set(true))
+    })
+    .unwrap();
+    draw(cx, &t);
+    t.press(cx, "enter");
+    draw(cx, &t);
+    assert!(!confirmed.get(), "Enter took the dialog's default, Cancel");
+    assert!(!shown(cx, &t, "write-confirm-description"));
+    assert!(shown(cx, &t, "row-uid-web"), "the list stays in front");
+
+    // A row's menu: Enter is the menu's, so the list stays in front.
+    cx.update_window(t.window, |_, window, cx| {
+        window.right_click("row-uid-web", cx)
+    })
+    .unwrap();
+    cx.wait_for(t.window, Duration::from_secs(5), |window, _| {
+        window.try_find("popup-menu").is_some()
+    })
+    .await;
+    draw(cx, &t);
+    t.press(cx, "enter");
+    draw(cx, &t);
+    assert!(!shown(cx, &t, "detail-back"), "the menu kept Enter");
+    if shown(cx, &t, "popup-menu") {
+        t.press(cx, "escape");
+        draw(cx, &t);
+    }
+    assert_eq!(focus(cx, &t), Focus::List);
+
+    t.press(cx, "enter");
+    draw(cx, &t);
+    assert!(shown(cx, &t, "detail-back"), "Enter shows the detail");
+    assert!(!shown(cx, &t, "row-uid-web"));
+    assert_eq!(t.selected(cx).as_deref(), Some("web"));
+    assert_eq!(focus(cx, &t), Focus::Detail);
+}
+
 // #421: Back's key is a letter, which native key events report the same on every platform.
 #[test]
 fn the_back_key_survives_key_normalization() {

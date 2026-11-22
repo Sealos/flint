@@ -5,8 +5,8 @@
 use gpui_kit::*;
 
 use super::super::registry::{
-    ActionError, Bind, CloseDetail, FocusFilter, FocusRows, OnView, SelectFirst, SelectFromFilter,
-    SelectLast, SelectNext, SelectPrev, SelectRow, SortBy, ToggleWide,
+    ActionError, Bind, CloseDetail, FocusFilter, FocusRows, OnView, OpenSelectedRow, SelectFirst,
+    SelectFromFilter, SelectLast, SelectNext, SelectPrev, SelectRow, SortBy, ToggleWide,
 };
 use super::{ResourceList, find_row, list_model};
 
@@ -24,6 +24,7 @@ impl ResourceList {
             .bind::<FocusFilter>(Self::focus_filter)
             .bind::<FocusRows>(Self::focus_rows)
             .bind::<SelectFromFilter>(Self::select_from_filter)
+            .bind::<OpenSelectedRow>(Self::open_selected_row)
     }
 
     pub(super) fn register_actions<E: InteractiveElement>(element: E, cx: &Context<Self>) -> E {
@@ -145,6 +146,33 @@ impl ResourceList {
             self.select_first_if_none(window, cx);
         }
         cx.notify();
+    }
+
+    /// Enter on the rows: asks for the selected row as a click does, so a narrow window brings
+    /// its detail to the front. The key stays with a control or dialog that has focus, and a
+    /// selection that is not among the rows shown opens nothing.
+    fn open_selected_row(
+        &mut self,
+        _: &OpenSelectedRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.focus.is_focused(window)
+            || gpui_kit::component::WindowExt::has_active_dialog(window, cx)
+        {
+            cx.propagate();
+            return;
+        }
+        let Some(selected) = &self.selected else {
+            return;
+        };
+        if self.position_of(&selected.uid).is_some() {
+            let row = SelectRow {
+                namespace: selected.namespace.clone(),
+                name: selected.name.clone(),
+            };
+            window.dispatch_action(Box::new(row), cx);
+        }
     }
 }
 

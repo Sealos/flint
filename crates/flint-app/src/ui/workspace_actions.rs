@@ -34,16 +34,17 @@ use super::super::registry::{
     EditYaml, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp, FocusFilter, FocusNextPane,
     FocusPreviousPane, FocusSearch, Forward, ForwardCurrent, GoBack, Guards, Hide, HideFromAi,
     HideOthers, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, NextTab, OnView, OpenContainerLogs,
-    OpenContainerShell, OpenLogs, OpenObject, OpenPreviousLogs, OpenSelectorLogs, OpenShell,
-    OpenView, PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs, Refresh, ReloadYamlEdit,
-    RestartShell, RetryConnection, ReviewYamlEdit, SaveLines, SaveLogs, SaveMatchingLines,
-    SaveScope, SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop,
-    SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine,
-    SelectPrev, SelectPrevLine, SelectRow, SelectText, SetDockHeight, SetNamespaces, SetPaneWidth,
-    ShowAll, ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml, SortBy, ToggleAnnotations,
-    ToggleCommandPalette, ToggleLabels, ToggleManagedFields, ToggleNamespace, ToggleNavSection,
-    TogglePause, ToggleResourceSwitcher, ToggleSecretValue, ToggleSources, ToggleTimestamps,
-    ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
+    OpenContainerShell, OpenLogs, OpenObject, OpenPreviousLogs, OpenSelectedRow, OpenSelectorLogs,
+    OpenShell, OpenView, PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs, Refresh,
+    ReloadYamlEdit, RestartShell, RetryConnection, ReviewYamlEdit, SaveLines, SaveLogs,
+    SaveMatchingLines, SaveScope, SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom,
+    ScrollToTop, SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext,
+    SelectNextLine, SelectPrev, SelectPrevLine, SelectRow, SelectText, SetDockHeight,
+    SetNamespaces, SetPaneWidth, ShowAll, ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml,
+    SortBy, ToggleAnnotations, ToggleCommandPalette, ToggleLabels, ToggleManagedFields,
+    ToggleNamespace, ToggleNavSection, TogglePause, ToggleResourceSwitcher, ToggleSecretValue,
+    ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
+    WatchOpenViewsOnly,
 };
 use super::super::registry::{BackToList, EditAiScope, ShowAgentActivity};
 use super::super::registry::{
@@ -262,6 +263,7 @@ impl Workspace {
             .when::<SelectFirst>(view_open!(list_wide))
             .when::<SelectLast>(view_open!(list_wide))
             .when::<CloseDetail>(view_open!(list_wide))
+            .when::<OpenSelectedRow>(view_open!(list_wide))
             .when::<FocusFilter>(view_open!(list_wide))
             .when::<ToggleWide>(|ws, cx| list_wide(ws, cx) == Some(true))
             .add::<SelectRow>(view_open!(list_wide), |ws, a, cx| match &ws.list {
