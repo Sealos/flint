@@ -460,7 +460,7 @@ pub fn is_invisible(c: char) -> bool {
             | '\u{fe00}'..='\u{fe0f}'
             | '\u{feff}'
             | '\u{ffa0}'
-            | '\u{fff9}'..='\u{fffb}'
+            | '\u{fff0}'..='\u{fffb}'
             | '\u{110bd}'
             | '\u{110cd}'
             | '\u{13430}'..='\u{1343f}'
@@ -481,10 +481,11 @@ fn is_unnamed(c: char) -> bool {
 
 /// `text` as a record may hold it, whole: with the redaction replies get, and nothing after the
 /// first value replaced. A value past [`MAX_READ_BYTES`] is not read, and one with a character
-/// [`is_unnamed`] is no name: of either, only the size is kept.
+/// [`is_unnamed`] is no name, and one already holding a `[REDACTED:<kind>]` marker is not read
+/// again: of any of these, only the size is kept.
 fn redacted(text: &str) -> String {
     let size = || format!("…(+{} bytes)", text.len());
-    if text.len() > MAX_READ_BYTES || text.chars().any(is_unnamed) {
+    if text.len() > MAX_READ_BYTES || text.contains("[REDACTED:") || text.chars().any(is_unnamed) {
         return size();
     }
     let replaced = crate::redact::redact_credentials(text);
@@ -886,6 +887,8 @@ mod tests {
             "password\u{3000}=abc",
             "pass\u{0600}word=abc",
             "pass\u{e0041}word=abc",
+            "pass\u{fff0}word=aaa bbb",
+            "pass\u{fff8}word=aaa bbb",
             "password\u{ff1d}abc",
             "password\u{ff1a}abc",
             "password\u{fe66}abc",
@@ -932,6 +935,18 @@ mod tests {
             cluster_key("token:prod"),
             "a value that matches no context is not keyed as written"
         );
+
+        for text in [
+            "password=[REDACTED:x] correct horse battery",
+            "token: [REDACTED:y] aaa bbb",
+            r#"{"password":"[REDACTED:x] correct horse"}"#,
+            "https://u:[REDACTED:p]x@host/a b",
+        ] {
+            let size = format!("…(+{} bytes)", text.len());
+            assert_eq!(recorded_name(text), size);
+            assert_eq!(key_of(text, &unknown), cluster_key(&size));
+            assert_eq!(key_of(text, &known), cluster_key(text));
+        }
     }
 
     // covers UP-16: a context the call reached stays matched by its own key, whatever its name
