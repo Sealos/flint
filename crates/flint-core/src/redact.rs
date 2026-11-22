@@ -131,10 +131,13 @@ pub fn mask_secret(object: &mut Value, marker: &str) {
 /// credential.
 ///
 /// Double quotes, backticks and single quotes are read in one pass, so one kind may appear inside
-/// another, and a backslash inside a quote escapes the next character. A single quote opens a
-/// value only at the start of the text or after whitespace or one of `:=([`, which leaves the
-/// apostrophe in `can't` alone. When the quoting cannot be followed (no closing quote, or a double
-/// quote or backtick straight after a word, as in `5" disk`), everything after it is hidden.
+/// another. A backslash escapes the next character inside double and single quotes, and is a
+/// plain character inside backticks, which serde does not escape. Inside single quotes a doubled
+/// apostrophe stands for one, and a double-quoted or backticked part is read as a whole. A single
+/// quote opens a value only at the start of the text or after whitespace or one of `:=([`, which
+/// leaves the apostrophe in `can't` alone. When the quoting cannot be followed (no closing quote,
+/// or a double quote or backtick straight after a word, as in `5" disk`), everything after it is
+/// hidden.
 pub fn redact_quoted(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut shown = 0;
@@ -183,13 +186,18 @@ fn follows_word(text: &str, at: usize) -> bool {
 }
 
 /// The byte offset of the quote closing a value whose content starts at `from`. A quote directly
-/// followed by a letter or digit is part of the value, whatever its kind.
+/// followed by a letter or digit is part of the value, whatever its kind. See [`redact_quoted`]
+/// for how each kind reads backslashes and nested quotes.
 fn closing_quote(text: &str, from: usize, quote: char) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut at = from;
     while at < bytes.len() {
         match bytes[at] {
-            b'\\' => at += 2,
+            b'\\' if quote != '`' => at += 2,
+            b'\'' if quote == '\'' && bytes.get(at + 1) == Some(&b'\'') => at += 2,
+            nested @ (b'"' | b'`') if quote == '\'' => {
+                at = closing_quote(text, at + 1, char::from(nested))? + 1;
+            }
             byte if char::from(byte) == quote => {
                 let ends = !text[at + 1..]
                     .chars()
@@ -662,6 +670,49 @@ mod tests {
             ("value \"a\"b rejected", "value \"…"),
             // Non-ASCII text around and inside a value.
             ("valore \"pässword\" è errato", "valore \"…\" è errato"),
+        ] {
+            assert_eq!(redact_quoted(text), shown, "{text}");
+        }
+    }
+
+    #[test]
+    fn doubled_apostrophes_stay_inside_a_single_quoted_value() {
+        for (text, shown) in [
+            ("rule 'it''s bad' failed", "rule '…' failed"),
+            ("rule '''' failed", "rule '…' failed"),
+            ("rule '' failed", "rule '…' failed"),
+            ("rule 'ends in ''", "rule '…"),
+            (
+                "Invalid value: 'self.name == \"a'' TAILSECRET\"': failed rule",
+                "Invalid value: '…': failed rule",
+            ),
+            (
+                "Invalid value: 'self.name == \"dogs' TAILSECRET\"': failed rule",
+                "Invalid value: '…': failed rule",
+            ),
+            (
+                "Invalid value: 'self.name == `a' TAILSECRET`': failed rule",
+                "Invalid value: '…': failed rule",
+            ),
+            ("rule 'a \"b'' TAILSECRET", "rule '…"),
+        ] {
+            assert_eq!(redact_quoted(text), shown, "{text}");
+        }
+    }
+
+    #[test]
+    fn backslashes_are_literal_inside_backticks() {
+        for (text, shown) in [
+            (
+                "unknown field `abc\\`, expected `name` or `value`",
+                "unknown field `…`, expected `…` or `…`",
+            ),
+            (
+                "unknown variant `abc\\\\`, expected one of `a`, `b`",
+                "unknown variant `…`, expected one of `…`, `…`",
+            ),
+            ("value \"abc\\\" def", "value \"…"),
+            ("value 'abc\\' def", "value '…"),
         ] {
             assert_eq!(redact_quoted(text), shown, "{text}");
         }
