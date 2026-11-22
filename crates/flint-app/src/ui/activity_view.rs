@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use flint_core::ClusterId;
-use flint_core::activity::{self, ActivityRecord, Outcome};
+use flint_core::activity::{self, ActivityRecord, Attribution, ExpectedServer, Outcome};
 use flint_core::settings::server_identity;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -26,6 +26,12 @@ use super::registry::{self, EditAiScope};
 const ROW_HEIGHT: f32 = 24.;
 /// What the view says before an agent called anything on the cluster.
 pub const EMPTY: &str = "No agent has called Flint's MCP tools on this cluster yet.";
+/// The mark on a call that cannot be tied to the tab's server.
+pub const UNVERIFIED: &str = "server not verified";
+/// Why a call has that mark, and what to do about it.
+const UNVERIFIED_HELP: &str = "Recorded for this context, but Flint cannot prove it reached this \
+                               server. The activity key may be unavailable, or the call may come \
+                               from a flint mcp process started before an upgrade: restart it.";
 
 /// One call, as the view shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,29 +44,35 @@ pub struct ActivityRow {
     /// How it ended: what came back, or `denied`, `failed`.
     pub result: String,
     pub outcome: Outcome,
+    /// The call cannot be tied to the tab's server ([`Attribution::Unverified`]).
+    pub unverified: bool,
 }
 
 impl ActivityRow {
     /// The row in one line, for accessibility and tests.
     pub fn label(&self) -> String {
+        let mark = if self.unverified {
+            format!(", {UNVERIFIED}")
+        } else {
+            String::new()
+        };
         format!(
-            "{} {} {} — {}",
+            "{} {} {} — {}{mark}",
             self.time, self.tool, self.target, self.result
         )
     }
 }
 
-/// The calls on `cluster` at the server with key `server` ([`activity::ServerKeys`]) in
-/// `records`, newest first, with times in `tz` and `now`
+/// The calls on `cluster` at `server` in `records`, newest first, with times in `tz` and `now`
 /// deciding whether a date is shown: those that named the context, and those that probed it
 /// (`list_clusters`). A context re-pointed at another server is another cluster: its calls there
-/// are not shown (a record without a server, from a context not exposed, is). A call that probed
-/// more clusters than its record lists ([`ActivityRecord::probed_more`]) is shown, marked, in the
+/// are not shown. A call whose server cannot be compared is shown, marked as not verified. A call
+/// that probed more clusters than its record lists ([`ActivityRecord::probed_more`]) is shown, marked, in the
 /// tab of every cluster it does not list: it may have probed it.
 pub fn rows(
     records: &[ActivityRecord],
     cluster: &str,
-    server: Option<&str>,
+    server: &ExpectedServer,
     tz: &TimeZone,
     now: Timestamp,
 ) -> Vec<ActivityRow> {
@@ -76,19 +88,23 @@ pub fn rows(
     // they were written, last first.
     mine.sort_by_key(|(ix, r)| std::cmp::Reverse((r.at_ms, *ix)));
     mine.into_iter()
-        .map(|(_, r)| ActivityRow {
-            time: time(r.at_ms, tz, today),
-            tool: shown(&r.tool),
-            target: if r.is_about(&cluster, server) {
-                target(r)
-            } else {
-                format!(
-                    "{} clusters, maybe this one: not all are listed",
-                    r.probed.len() as u64 + r.probed_more
-                )
-            },
-            result: result(r),
-            outcome: r.outcome,
+        .map(|(_, r)| {
+            let attribution = r.attribution(&cluster, server);
+            ActivityRow {
+                time: time(r.at_ms, tz, today),
+                tool: shown(&r.tool),
+                target: if attribution.is_some() {
+                    target(r)
+                } else {
+                    format!(
+                        "{} clusters, maybe this one: not all are listed",
+                        r.probed.len() as u64 + r.probed_more
+                    )
+                },
+                result: result(r),
+                outcome: r.outcome,
+                unverified: attribution == Some(Attribution::Unverified),
+            }
         })
         .collect()
 }
@@ -264,18 +280,8 @@ impl ActivityView {
         {
             return;
         }
-        // None without a key (then calls match by context alone).
-        let server_key = self
-            .server
-            .as_deref()
-            .and_then(|s| model.activity_keys.server_key(s));
-        self.rows = rows(
-            &records,
-            &self.cluster,
-            server_key.as_deref(),
-            &self.tz,
-            Timestamp::now(),
-        );
+        let server = model.activity_keys.expected(self.server.as_deref());
+        self.rows = rows(&records, &self.cluster, &server, &self.tz, Timestamp::now());
         self.shown = Some(records);
     }
 
@@ -330,6 +336,18 @@ impl ActivityView {
                                 .tooltip(move |window, cx| {
                                     Tooltip::new(target.clone()).build(window, cx)
                                 })
+                        })
+                        .when(row.unverified, |el| {
+                            el.child(
+                                div()
+                                    .id(("activity-unverified", ix))
+                                    .flex_none()
+                                    .text_color(theme.warning)
+                                    .child(UNVERIFIED)
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new(UNVERIFIED_HELP).build(window, cx)
+                                    }),
+                            )
                         })
                         .child(
                             div()
@@ -456,7 +474,7 @@ impl Render for ActivityView {
 
 #[cfg(test)]
 mod tests {
-    use flint_core::activity::{self, ActivityRecord, Outcome};
+    use flint_core::activity::{self, ActivityRecord, ExpectedServer, Outcome};
     use jiff::Timestamp;
     use jiff::tz::TimeZone;
 
@@ -469,6 +487,10 @@ mod tests {
 
     fn server_key(url: &str) -> String {
         keys().server_key(url).unwrap()
+    }
+
+    fn expect(url: &str) -> ExpectedServer {
+        ExpectedServer::Key(server_key(url))
     }
 
     fn record(at_ms: i64, cluster: &str) -> ActivityRecord {
@@ -522,16 +544,10 @@ mod tests {
             clusters,
             denied,
         ];
-        let labels: Vec<String> = rows(
-            &records,
-            "prod",
-            Some(&server_key("https://prod:6443/")),
-            &tz,
-            now,
-        )
-        .iter()
-        .map(ActivityRow::label)
-        .collect();
+        let labels: Vec<String> = rows(&records, "prod", &expect("https://prod:6443/"), &tz, now)
+            .iter()
+            .map(ActivityRow::label)
+            .collect();
         assert_eq!(
             labels,
             [
@@ -556,9 +572,15 @@ mod tests {
             container: Some("app\u{2066}\u{200b}\t".into()),
             ..record(now.as_millisecond(), "prod")
         };
-        let row = rows(&[sneaky], "prod", None, &TimeZone::UTC, now)
-            .pop()
-            .expect("the call is listed");
+        let row = rows(
+            &[sneaky],
+            "prod",
+            &ExpectedServer::NoServer,
+            &TimeZone::UTC,
+            now,
+        )
+        .pop()
+        .expect("the call is listed");
         assert_eq!(row.tool, "get_\\u{1b}[2Jresource");
         assert_eq!(
             row.target,
@@ -623,8 +645,8 @@ mod tests {
             at(None),
         ];
         let count = |server: Option<&str>| {
-            let key = server.map(server_key);
-            rows(&records, "prod", key.as_deref(), &TimeZone::UTC, now).len()
+            let server = server.map_or(ExpectedServer::NoServer, expect);
+            rows(&records, "prod", &server, &TimeZone::UTC, now).len()
         };
         assert_eq!(count(Some("https://prod:6443")), 2);
         assert_eq!(count(Some("https://old:6443/")), 2);
@@ -656,11 +678,11 @@ mod tests {
             ..record(now.as_millisecond(), "prod")
         };
         let labels = |cluster, server: Option<&str>| -> Vec<String> {
-            let key = server.map(server_key);
+            let server = server.map_or(ExpectedServer::NoServer, expect);
             rows(
                 std::slice::from_ref(&listed),
                 cluster,
-                key.as_deref(),
+                &server,
                 &TimeZone::UTC,
                 now,
             )
@@ -686,7 +708,7 @@ mod tests {
             rows(
                 std::slice::from_ref(&more),
                 cluster,
-                Some(&server_key("https://staging:6443")),
+                &expect("https://staging:6443"),
                 &TimeZone::UTC,
                 now,
             )
@@ -719,7 +741,7 @@ mod tests {
             rows(
                 std::slice::from_ref(&call),
                 "prod",
-                Some(&server_key(server)),
+                &expect(server),
                 &TimeZone::UTC,
                 now,
             )
@@ -745,10 +767,16 @@ mod tests {
             call(ms, "c"),
             call(ms, "d"),
         ];
-        let tools: Vec<String> = rows(&records, "prod", None, &TimeZone::UTC, now)
-            .into_iter()
-            .map(|r| r.tool)
-            .collect();
+        let tools: Vec<String> = rows(
+            &records,
+            "prod",
+            &ExpectedServer::NoServer,
+            &TimeZone::UTC,
+            now,
+        )
+        .into_iter()
+        .map(|r| r.tool)
+        .collect();
         assert_eq!(tools, ["d", "c", "b", "a"]);
 
         let long = "p".repeat(400);
@@ -757,7 +785,59 @@ mod tests {
             cluster_key: Some(activity::cluster_key(&long)),
             ..record(ms, "prod")
         };
-        assert_eq!(rows(&[cut], &long, None, &TimeZone::UTC, now).len(), 1);
+        assert_eq!(
+            rows(
+                &[cut],
+                &long,
+                &ExpectedServer::NoServer,
+                &TimeZone::UTC,
+                now
+            )
+            .len(),
+            1
+        );
+    }
+
+    // covers UP-16: a call that cannot be tied to the tab's server stays listed, marked: one from
+    // a process that still writes the old key, or any call while the key is unavailable. A call
+    // with a matching key is not marked.
+    #[test]
+    fn rows_mark_calls_they_cannot_tie_to_the_server() {
+        let now: Timestamp = "2026-11-20T12:00:00Z".parse().unwrap();
+        let ms = now.as_millisecond();
+        let old_format = ActivityRecord {
+            server_key: Some("cbf29ce484222325".into()),
+            ..record(ms, "prod")
+        };
+        let marks = |server: &ExpectedServer| -> Vec<bool> {
+            rows(
+                &[record(ms - 1, "prod"), old_format.clone()],
+                "prod",
+                server,
+                &TimeZone::UTC,
+                now,
+            )
+            .iter()
+            .map(|r| r.unverified)
+            .collect()
+        };
+        assert_eq!(marks(&expect("https://prod:6443")), [true, false]);
+        assert_eq!(marks(&expect("https://other:6443")), [true]);
+        assert_eq!(marks(&ExpectedServer::Unknown), [true, true]);
+        let row = rows(
+            std::slice::from_ref(&old_format),
+            "prod",
+            &expect("https://prod:6443"),
+            &TimeZone::UTC,
+            now,
+        )
+        .pop()
+        .unwrap();
+        assert!(
+            row.label().ends_with(", server not verified"),
+            "{}",
+            row.label()
+        );
     }
 
     #[test]
