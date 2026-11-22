@@ -1,12 +1,15 @@
 //! The running set: clusters kept connected and watched beside the active one.
 //!
-//! [`Member`] decides what each cluster does and [`Schedule`] when a background attempt may
-//! start; this carries out their answers on the cluster slots. Every attempt runs on its own task
+//! [`Member`] decides what each cluster does and
+//! [`Schedule`](crate::connection::schedule::Schedule) when a background attempt may start; this
+//! carries out their answers on the cluster slots. Every attempt runs on its own task
 //! and only its result comes back through the manager's loop, so a member that fails, hangs or
 //! needs a sign-in holds up no other. Credentials that run a program never run for a background
 //! member: it waits as signed out until it is selected.
 //!
 //! Membership grants nothing on the write path: writes ask the per-cluster gate as before.
+
+// module-tests: ../manager.rs (and flint-e2e's running_set.rs, on the fake API)
 
 use std::hash::{BuildHasher, RandomState};
 use std::time::{Duration, Instant};
@@ -99,7 +102,7 @@ impl ClusterManager {
                 return Some(format!("\"{id}\" names no server."));
             }
             // The server shown may be a fallback, which a member must not be bound to.
-            (!self.members.contains_key(id) && self.paused(id)).then(|| {
+            (!self.members.contains_key(id) && self.unsettled(id)).then(|| {
                 format!("\"{id}\" can't join while a kubeconfig file defining it is unreadable.")
             })
         })
@@ -335,7 +338,8 @@ impl ClusterManager {
         let ids: Vec<ClusterId> = self.members.keys().cloned().collect();
         for id in ids {
             let held = self.held(&id);
-            let provisional = !held && self.paused(&id);
+            // Kept through an unconfirmed move, a member must not connect to the server shown.
+            let provisional = !held && (self.paused(&id) || !self.member_on_its_server(&id));
             for (pause, on) in [(Pause::Held, held), (Pause::Provisional, provisional)] {
                 if on {
                     self.apply_member(&id, MemberEvent::Paused(pause), now);

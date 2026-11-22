@@ -5075,6 +5075,29 @@ mod tests {
         assert_eq!(manager.next_attempt, next, "no attempt started");
     }
 
+    // A member queued to connect when its context moves unconfirmed waits, however often the set
+    // is looked at, and connects once the context shows its server again.
+    #[tokio::test]
+    async fn a_queued_member_never_connects_to_an_unconfirmed_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let second = dir.path().join("second");
+        let at_a = kubeconfig_with("https://127.0.0.1:1");
+        let at_b = kubeconfig_with("https://127.0.0.1:2");
+        let mut manager = manager_reading_two(dir.path(), UNREADABLE, &at_a).await;
+        join_dev(&mut manager);
+        manager.schedule.enqueue("dev".to_owned());
+        let next = manager.next_attempt;
+
+        rewrite_file(&mut manager, &second, &at_b).await;
+        manager.tick_members(Instant::now() + Duration::from_secs(5));
+        assert!(manager.members["dev"].paused().is_some());
+        assert_eq!(manager.next_attempt, next, "no attempt on the fallback");
+
+        rewrite_file(&mut manager, &second, &at_a).await;
+        assert!(manager.members["dev"].paused().is_none());
+        assert_eq!(manager.next_attempt, next + 1, "connects on its server");
+    }
+
     // First seen behind a broken file, `dev` has no confirmed definition. A move to another server
     // may be a fallback: the member stays and starts nothing there, comes back with its server,
     // and ends only when a load confirms the move.
