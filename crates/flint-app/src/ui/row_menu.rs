@@ -17,8 +17,9 @@
 //! workload's pods, which opening the menu lists) has arrived. While it is open it is built
 //! again whenever what it shows changes.
 //!
-//! The list draws the menu; the workspace hands it the builder ([`row_menu`]) for the kinds that
-//! have these actions, so the list stays generic.
+//! The list holds and draws the open menu ([`OpenRowMenu`]) from its root, so the menu outlives
+//! a change to the row's size; the workspace hands it the builder ([`row_menu`]) for the kinds
+//! that have these actions, so the list stays generic.
 
 // module-tests: row_actions_tests.rs
 
@@ -35,6 +36,7 @@ use super::detail::{
     Opening, PROTECTED_NOTE, ShellPod, Subject, log_item, protected_reason, reason, refused,
     shell_item,
 };
+use super::list::ResourceList;
 use super::menu_fit::{
     dismiss_when_shrunk, fit_menu, fit_picker, note_width, pod_name_chars, wrapped_label,
 };
@@ -49,6 +51,120 @@ use super::workspace::Workspace;
 
 /// Builds a row's context menu (gpui-component's `context_menu` builder).
 pub type RowMenu = Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>;
+
+/// A row's open context menu, held by the list.
+pub(in crate::ui) struct OpenRowMenu {
+    uid: String,
+    position: Point<Pixels>,
+    menu: Entity<PopupMenu>,
+    back_to: FocusHandle,
+    _dismissed: Subscription,
+}
+
+impl OpenRowMenu {
+    /// Builds the menu of row `uid` at `position` and focuses it. `back_to` gets focus when it
+    /// closes, unless what closed it moved focus elsewhere.
+    pub(in crate::ui) fn open(
+        build: &RowMenu,
+        uid: String,
+        position: Point<Pixels>,
+        back_to: FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<ResourceList>,
+    ) -> Self {
+        let context = back_to.clone();
+        let menu = PopupMenu::build(window, cx, |menu, window, cx| {
+            // Shortcut hints resolve against this from the menu's first frame.
+            build(menu.action_context(context), window, cx)
+        });
+        let own = menu.focus_handle(cx);
+        own.focus(window, cx);
+        let back = back_to.clone();
+        let dismissed = cx.subscribe_in(
+            &menu,
+            window,
+            move |list, _, _: &DismissEvent, window, cx| {
+                list.row_menu_closed(cx);
+                // After the click that dismissed it has run, so what it focused is known.
+                let (back, own) = (back.clone(), own.clone());
+                cx.defer_in(window, move |_, window, cx| {
+                    let stranded = match window.focused(cx) {
+                        None => true,
+                        Some(focused) => focused == own || own.contains_focused(window, cx),
+                    };
+                    if stranded {
+                        window.focus(&back, cx);
+                    }
+                });
+            },
+        );
+        OpenRowMenu {
+            uid,
+            position,
+            menu,
+            back_to,
+            _dismissed: dismissed,
+        }
+    }
+
+    /// Where focus was before a new menu opens: if it is still in the menu being replaced,
+    /// where that one would have returned it.
+    pub(in crate::ui) fn focus_before(
+        replaced: Option<Self>,
+        window: &Window,
+        cx: &App,
+    ) -> Option<FocusHandle> {
+        let focused = window.focused(cx);
+        match replaced {
+            Some(old) => {
+                let own = old.menu.focus_handle(cx);
+                if focused.is_none() || own.is_focused(window) || own.contains_focused(window, cx) {
+                    Some(old.back_to)
+                } else {
+                    focused
+                }
+            }
+            None => focused,
+        }
+    }
+
+    pub(in crate::ui) fn uid(&self) -> &str {
+        &self.uid
+    }
+
+    pub(in crate::ui) fn menu(&self) -> &Entity<PopupMenu> {
+        &self.menu
+    }
+
+    /// The menu over the whole window, keeping its row's id so the window's state can tell whose
+    /// it is. Nothing while it has no entries. The layer keeps the wheel from scrolling the list
+    /// under an open menu.
+    pub(in crate::ui) fn element(&self, window: &Window, cx: &App) -> Option<AnyElement> {
+        if self.menu.read(cx).is_empty() {
+            return None;
+        }
+        let size = window.bounds().size;
+        Some(
+            deferred(
+                anchored().position(point(px(0.), px(0.))).child(
+                    div()
+                        .id(SharedString::from(format!("row-menu-{}", self.uid)))
+                        .w(size.width)
+                        .h(size.height)
+                        .on_scroll(|_, _, cx| cx.stop_propagation())
+                        .child(
+                            anchored()
+                                .position(self.position)
+                                .snap_to_window_with_margin(px(8.))
+                                .child(self.menu.clone()),
+                        ),
+                ),
+            )
+            .with_priority(gpui_kit::base::POPUP_PRIORITY)
+            .into_any_element(),
+        )
+    }
+}
 
 /// The longest reason an action gives that the menu shows; the rest is cut. Long enough for a
 /// long context name and all that is said about it: reasons wrap ([`say`]).
@@ -211,9 +327,8 @@ pub fn row_menu(workspace: WeakEntity<Workspace>) -> RowMenu {
         detail.update(cx, |detail, cx| detail.ensure_pods_listed(cx));
         let shown = Rc::new(RefCell::new(row_actions(ws.read(cx), cx)));
         // Built again whenever what it shows changes while it is open (the object or the pods
-        // arrived, the cluster disconnected, another row got selected). gpui-component keeps a
-        // dismissed menu until the row's next right-click, so the observers are dropped when
-        // the menu is dismissed, not when it goes.
+        // arrived, the cluster disconnected, another row got selected). The observers are
+        // dropped when the menu is dismissed.
         let rebuild = {
             let workspace = workspace.clone();
             let shown = shown.clone();
