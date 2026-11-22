@@ -167,7 +167,8 @@ type ToolResult = Result<CallToolResult, rmcp::ErrorData>;
 /// out, if the cluster could be reached.
 type Probed = (Result<String, String>, Option<policy::ScopeCheck>);
 
-/// What a tool call named, as the agent wrote it: recorded in the activity log.
+/// What a tool call named, as the agent wrote it: recorded in the activity log, which redacts it
+/// as it does for replies ([`activity::append`]).
 #[derive(Debug, Default, Clone)]
 struct Named {
     cluster: Option<String>,

@@ -1,6 +1,7 @@
 //! The agent activity log (ADR-0013, UP-16): one record per MCP tool call, so the user can see
 //! what an agent read. `flint mcp` appends; the app watches the file and shows it per cluster.
-//! A record says what was asked for and how much came back, never the returned content.
+//! A record says what was asked for and how much came back, never the returned content. Its text
+//! fields get the same redaction as the replies before they are written ([`append`]).
 //!
 //! The log is JSON lines in [`ACTIVITY_FILE`] in Flint's config directory. When an append would
 //! take it past [`MAX_FILE_BYTES`], it is renamed to [`PREVIOUS_FILE`] (replacing the one before)
@@ -33,6 +34,9 @@ pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 pub const LOCK_FILE: &str = "agent-activity.lock";
 /// The longest a text field is recorded: a DNS name's length, plenty for any Kubernetes name.
 pub const MAX_FIELD_BYTES: usize = 253;
+/// The longest text field that is read to be recorded: a longer one is recorded by its size
+/// alone, so the work per record stays bounded.
+pub const MAX_READ_BYTES: usize = 4096;
 /// The key of the server keys ([`ServerKeys`]): 32 random bytes, the owner's only, made on first
 /// use.
 pub const KEY_FILE: &str = "activity.key";
@@ -72,7 +76,7 @@ pub struct ActivityRecord {
     /// The API server the cluster was exposed with, when it is exposed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
-    /// What the call named, as the agent wrote it.
+    /// What the call named, as the agent wrote it, with credentials redacted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,7 +95,8 @@ pub struct ActivityRecord {
     pub truncated: bool,
     pub outcome: Outcome,
     /// [`cluster_key`] of the full `cluster`, set by [`append`]: what the app matches a context
-    /// by, since `cluster` may be cut.
+    /// by, since `cluster` may be cut or redacted. Of the context's own name only for a call that
+    /// reached it ([`append_call`]); otherwise of the redacted text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_key: Option<String>,
     /// [`ServerKeys::server_key`] of the server the cluster is exposed with, as the kubeconfig
@@ -343,6 +348,12 @@ pub fn append_call(
 ) -> std::io::Result<()> {
     let keys = ServerKeys::open(config_dir);
     let record = ActivityRecord {
+        // The name of a context the call reached, so its tab lists the call even when the name
+        // itself is redacted.
+        cluster_key: record.cluster_key.clone().or_else(|| {
+            reached.server.as_ref()?;
+            record.cluster.as_deref().map(cluster_key)
+        }),
         server_key: reached.server.as_deref().and_then(|s| keys.server_key(s)),
         probed: reached
             .probed
@@ -362,7 +373,7 @@ fn fnv1a(bytes: &[u8]) -> String {
 }
 
 /// Appends `record` to the log in `config_dir`, rotating it first if it would grow past
-/// [`MAX_FILE_BYTES`]. Creates the directory if needed. Text fields are cut at
+/// [`MAX_FILE_BYTES`]. Creates the directory if needed. Text fields are redacted, then cut at
 /// [`MAX_FIELD_BYTES`]: they hold what the agent wrote, and a few huge ones must not flush the
 /// log. Writers take [`LOCK_FILE`] for the whole check, rotation and write, so two of them never
 /// rotate the same file twice. A writer that cannot take it within [`LOCK_WAIT`] gives up with
@@ -420,12 +431,23 @@ fn ends_unterminated(file: &mut std::fs::File) -> std::io::Result<bool> {
     Ok(last[0] != b'\n')
 }
 
-/// `record` with each text field cut at [`MAX_FIELD_BYTES`], saying how much was left out, and
-/// at most [`MAX_PROBED`] probed clusters, counting the rest.
+/// `text` as a record may hold it, whole: with the redaction replies get. A value past
+/// [`MAX_READ_BYTES`] is not read, and one with control characters is no name and could carry on
+/// past what a rule recognises on its line: of either, only the size is kept.
+fn redacted(text: &str) -> String {
+    if text.len() > MAX_READ_BYTES || text.chars().any(char::is_control) {
+        return format!("…(+{} bytes)", text.len());
+    }
+    crate::redact::redact_credentials(text).text.into_owned()
+}
+
+/// `record` with each text field [`redacted`] and then cut at [`MAX_FIELD_BYTES`], saying how much
+/// was left out, and at most [`MAX_PROBED`] probed clusters, counting the rest.
 fn capped(record: &ActivityRecord) -> ActivityRecord {
-    let cap = |text: &String| {
+    let cap = |text: &str| {
+        let text = redacted(text);
         if text.len() <= MAX_FIELD_BYTES {
-            return text.clone();
+            return text;
         }
         let mut end = MAX_FIELD_BYTES;
         while !text.is_char_boundary(end) {
@@ -433,12 +455,12 @@ fn capped(record: &ActivityRecord) -> ActivityRecord {
         }
         format!("{}…(+{} bytes)", &text[..end], text.len() - end)
     };
-    let cap_opt = |text: &Option<String>| text.as_ref().map(cap);
+    let cap_opt = |text: &Option<String>| text.as_deref().map(cap);
     ActivityRecord {
         cluster_key: record
             .cluster_key
             .clone()
-            .or_else(|| record.cluster.as_deref().map(cluster_key)),
+            .or_else(|| Some(cluster_key(&redacted(record.cluster.as_deref()?)))),
         probed: record.probed.iter().take(MAX_PROBED).cloned().collect(),
         probed_more: record.probed_more + record.probed.len().saturating_sub(MAX_PROBED) as u64,
         tool: cap(&record.tool),
@@ -706,9 +728,115 @@ mod tests {
         let records = read(dir.path());
         assert_eq!(records.len(), 102);
         let name = records[100].name.as_deref().unwrap();
-        assert_eq!(name, format!("{}…(+1099747 bytes)", "x".repeat(253)));
+        assert_eq!(name, "…(+1100000 bytes)");
         let namespace = records[100].namespace.as_deref().unwrap();
         assert!(namespace.starts_with(&"é".repeat(126)) && namespace.ends_with("…(+348 bytes)"));
+    }
+
+    // covers UP-16: every text field gets the reply redaction before it is cut.
+    #[test]
+    fn text_fields_are_redacted_before_they_are_written() {
+        const PLANTED: &str = "password=placeholder-arg-value";
+        let dir = tempfile::tempdir().unwrap();
+        let padded = format!("{}{PLANTED}", "x ".repeat(120));
+        let planted = ActivityRecord {
+            tool: PLANTED.into(),
+            cluster: Some(PLANTED.into()),
+            server: Some(format!("https://prod:6443/{PLANTED}")),
+            kind: Some(PLANTED.into()),
+            namespace: Some(padded),
+            name: Some(format!("first\n{PLANTED}\nplaceholder-arg-value")),
+            container: Some(PLANTED.into()),
+            cluster_key: None,
+            ..record(1)
+        };
+        append(dir.path(), &planted).unwrap();
+        let bytes = std::fs::read_to_string(dir.path().join(ACTIVITY_FILE)).unwrap();
+        assert!(!bytes.contains("placeholder-arg-value"), "{bytes}");
+        let read = read(dir.path());
+        for field in [
+            Some(&read[0].tool),
+            read[0].cluster.as_ref(),
+            read[0].server.as_ref(),
+            read[0].kind.as_ref(),
+            read[0].container.as_ref(),
+        ] {
+            assert!(field.unwrap().contains("[REDACTED:"), "{:?}", read[0]);
+        }
+        assert_eq!(read[0].name.as_deref(), Some("…(+58 bytes)"));
+        // A call that reached no context is keyed by the text the record holds.
+        assert_ne!(read[0].cluster_key, Some(cluster_key(PLANTED)));
+    }
+
+    // covers UP-16: a value too long to redact is not read, not even its start.
+    #[test]
+    fn a_value_too_long_to_redact_keeps_none_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = format!(
+            "password=placeholder-arg-value {}",
+            "x".repeat(MAX_READ_BYTES)
+        );
+        let long = ActivityRecord {
+            name: Some(name.clone()),
+            ..record(1)
+        };
+        append(dir.path(), &long).unwrap();
+        let recorded = read(dir.path()).remove(0).name.unwrap();
+        assert_eq!(recorded, format!("…(+{} bytes)", name.len()));
+    }
+
+    // covers UP-16: a context the call reached stays matched by its own key, whatever its name
+    // looks like; ordinary names are recorded as written.
+    #[test]
+    fn redaction_keeps_attribution() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = "password=placeholder-context";
+        let url = "https://prod:6443";
+        let reached = Reached {
+            server: Some(url.into()),
+            probed: Vec::new(),
+        };
+        let exposed = ActivityRecord {
+            cluster: Some(context.into()),
+            cluster_key: None,
+            ..record(1)
+        };
+        append_call(dir.path(), &exposed, &reached).unwrap();
+        let keys = ServerKeys::open(dir.path());
+        let read_back = read(dir.path()).remove(0);
+        assert!(
+            !read_back
+                .cluster
+                .as_deref()
+                .unwrap()
+                .contains("placeholder-context")
+        );
+        assert!(read_back.is_about(&cluster_key(context), &keys.expected(Some(url))));
+
+        for ordinary in [
+            "kubernetes-admin@kubernetes",
+            "arn:aws:eks:us-east-1:000000000000:cluster/example",
+            "gke_example-project_us-central1-a_example",
+            "token-rotator-69c6f74b8b-qv4xv",
+            "password-manager",
+            "secrets",
+            "kind-dev",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let named = ActivityRecord {
+                cluster: Some(ordinary.into()),
+                namespace: Some(ordinary.into()),
+                name: Some(ordinary.into()),
+                cluster_key: None,
+                ..record(1)
+            };
+            append(dir.path(), &named).unwrap();
+            let got = read(dir.path()).remove(0);
+            assert_eq!(got.cluster.as_deref(), Some(ordinary));
+            assert_eq!(got.namespace.as_deref(), Some(ordinary));
+            assert_eq!(got.name.as_deref(), Some(ordinary));
+            assert_eq!(got.cluster_key, Some(cluster_key(ordinary)));
+        }
     }
 
     /// [`append`], tried again when it gives up on the lock, which a busy machine can make it do:
