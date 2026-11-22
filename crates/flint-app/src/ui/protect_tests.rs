@@ -737,16 +737,17 @@ fn two_prods(
     vec![kubeconfig]
 }
 
-// Two contexts with one title and one state still have lock buttons with names of their own.
+// Two contexts with one short name and one state still have lock buttons with names of their
+// own.
 #[gpui_kit::test]
-async fn lock_buttons_of_contexts_sharing_a_title_differ(cx: &mut TestAppContext) {
+async fn lock_buttons_of_contexts_sharing_a_short_name_differ(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("settings.toml"), PROTECT_LOCAL).unwrap();
     let t = open_workspace_with(cx, dir.path(), two_prods).await;
     assert_eq!(protection(cx, &t, PROD_A), protection(cx, &t, PROD_B));
     let state = "protected, read-only";
-    for context in [PROD_A, PROD_B] {
-        let label = format!("Lock for prod (context \"{context}\"): {state}");
+    for (context, title) in [(PROD_A, "0 · prod"), (PROD_B, "1 · prod")] {
+        let label = format!("Lock for {title} (context \"{context}\"): {state}");
         assert!(named(cx, &t, &format!("lock-{context}"), &label));
     }
 }
