@@ -1001,6 +1001,7 @@ impl ResourceList {
                         .id(SharedString::from(format!("row-menu-{}", row.uid)))
                         .relative()
                         .w_full()
+                        // not-an-action: opens the menu; `row_press` selects through the registry.
                         .on_mouse_down(MouseButton::Right, move |event, window, cx| {
                             on_right(event.position, window, cx);
                             cx.stop_propagation();
