@@ -2249,10 +2249,11 @@ fn protection_text(protection: Protection, trust: &TrustState) -> String {
 /// not the context, since two contexts can share a title. The context is quoted and escaped, so
 /// no context or title can be written to read as another cluster's name.
 fn control_name(title: &str, context: &str) -> String {
+    let shown = flint_core::display::single_line(title);
     if title == context && !context.contains('"') {
-        title.to_owned()
+        shown
     } else {
-        format!("{title} (context {context:?})")
+        format!("{shown} (context {context:?})")
     }
 }
 
@@ -3032,6 +3033,17 @@ mod tests {
             control_name(lookalike, lookalike),
             control_name("prod", "kind-dev")
         );
+    }
+
+    // A control character in a name never reaches the accessible name, plain or quoted.
+    #[test]
+    fn control_names_hide_control_characters() {
+        let plain = control_name("dev\nprod", "dev\nprod");
+        assert!(!plain.chars().any(char::is_control), "{plain:?}");
+        assert_eq!(plain, "dev\\u{a}prod");
+        let quoted = control_name("a\u{202e}b", "ctx\nx");
+        assert!(!quoted.chars().any(char::is_control), "{quoted:?}");
+        assert!(!quoted.contains('\u{202e}'), "{quoted:?}");
     }
 
     // Each state has a name of its own, and a re-pointed context never reads as exposed.
