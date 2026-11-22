@@ -123,6 +123,118 @@ pub fn notice_with(
         ))
 }
 
+/// The active context's move to another API server, as exact URLs: sanitize them to show them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::ui) struct ServerMove {
+    pub old: Option<String>,
+    pub new: Option<String>,
+}
+
+/// The server the active context was last confirmed at.
+#[derive(Debug)]
+struct ConfirmedServer {
+    context: String,
+    endpoint: u64,
+    server: Option<String>,
+}
+
+/// Notices when the active context moves to another server. Only servers the core confirmed
+/// count: one shown while a kubeconfig file can't be read may be a fallback. Choosing another
+/// context starts over.
+#[derive(Debug, Default)]
+pub(in crate::ui) struct ServerMoves {
+    seen: Option<ConfirmedServer>,
+    moved: Option<ServerMove>,
+}
+
+impl ServerMoves {
+    /// The last move of the active context, until another context is chosen.
+    pub fn moved(&self) -> Option<&ServerMove> {
+        self.moved.as_ref()
+    }
+
+    /// No context is active.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Takes in the active context as it is now.
+    pub fn observe(&mut self, context: &str, endpoint: u64, confirmed: bool, server: Option<&str>) {
+        if self.seen.as_ref().is_some_and(|s| s.context != context) {
+            self.clear();
+        }
+        if !confirmed {
+            return;
+        }
+        if let Some(seen) = &self.seen
+            && seen.endpoint != endpoint
+            && seen.server.as_deref() != server
+        {
+            self.moved = Some(ServerMove {
+                old: seen.server.clone(),
+                new: server.map(str::to_owned),
+            });
+        }
+        self.seen = Some(ConfirmedServer {
+            context: context.to_owned(),
+            endpoint,
+            server: server.map(str::to_owned),
+        });
+    }
+}
+
+#[cfg(test)]
+mod server_move_tests {
+    use super::{ServerMove, ServerMoves};
+
+    const OLD: &str = "https://10.0.0.1:6443";
+    const NEW: &str = "https://10.0.0.2:6443";
+
+    fn moved() -> Option<ServerMove> {
+        Some(ServerMove {
+            old: Some(OLD.to_owned()),
+            new: Some(NEW.to_owned()),
+        })
+    }
+
+    #[test]
+    fn a_confirmed_move_is_kept_until_another_context_is_chosen() {
+        let mut moves = ServerMoves::default();
+        moves.observe("dev", 1, true, Some(OLD));
+        assert_eq!(moves.moved(), None);
+        moves.observe("dev", 2, true, Some(NEW));
+        assert_eq!(moves.moved().cloned(), moved());
+        moves.observe("dev", 2, true, Some(NEW));
+        assert_eq!(moves.moved().cloned(), moved());
+        moves.observe("prod", 7, true, Some(OLD));
+        assert_eq!(moves.moved(), None);
+    }
+
+    #[test]
+    fn a_fallback_server_is_not_a_move() {
+        let mut moves = ServerMoves::default();
+        moves.observe("dev", 1, true, Some(OLD));
+        moves.observe("dev", 2, false, Some(NEW));
+        assert_eq!(moves.moved(), None);
+        // Confirmed back where it was: nothing moved.
+        moves.observe("dev", 3, true, Some(OLD));
+        assert_eq!(moves.moved(), None);
+        // A later confirmed move is compared with the last confirmed server.
+        moves.observe("dev", 4, false, Some(NEW));
+        moves.observe("dev", 4, true, Some(NEW));
+        assert_eq!(moves.moved().cloned(), moved());
+    }
+
+    #[test]
+    fn the_same_endpoint_is_not_a_move() {
+        let mut moves = ServerMoves::default();
+        moves.observe("dev", 1, true, Some(OLD));
+        // A trailing slash keeps the endpoint.
+        moves.observe("dev", 1, true, Some("https://10.0.0.1:6443/"));
+        assert_eq!(moves.moved(), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Named, not a glob: `gpui_kit::*` would make the `#[test]` the macro expands to its own.

@@ -42,6 +42,7 @@ use super::icons::FlintIcon;
 use super::list::{ListEvent, ResourceList};
 use super::log_view::{LogRequest, LogView};
 use super::nav::{NavEvent, NavPanel};
+use super::notice::{ServerMove, ServerMoves, notice};
 use super::palette::CommandPalette;
 use super::registry::{
     self, AddNamespace, BackToList, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, EditYaml,
@@ -255,6 +256,8 @@ pub struct Workspace {
     narrow: bool,
     /// The main header shows two rows, as of the last draw: the dock leaves it more room.
     two_row_header: bool,
+    /// The active context's last move to another API server, for the main area's notice.
+    server_moves: ServerMoves,
     /// In a narrow window, the list is in front of the open detail.
     list_in_front: bool,
     /// A right button went down since the last draw: the row it selects stays on show, as it
@@ -435,6 +438,7 @@ impl Workspace {
             detail: None,
             narrow: false,
             two_row_header: false,
+            server_moves: ServerMoves::default(),
             list_in_front: false,
             right_press: false,
             menu_row_pending: false,
@@ -939,6 +943,15 @@ impl Workspace {
             .and_then(|c| model.discovered(c))
             .cloned()
             .unwrap_or_default();
+        match model.active_cluster() {
+            Some(c) => self.server_moves.observe(
+                &c.info.name,
+                c.endpoint,
+                c.confirmed,
+                c.info.server.as_deref(),
+            ),
+            None => self.server_moves.clear(),
+        }
         let generation = model.active_cluster().map(|c| c.generation);
         let cluster_changed = active != self.cluster || generation != self.generation;
         if cluster_changed {
@@ -2382,6 +2395,12 @@ impl Workspace {
             .min_w_0()
             .h_full()
             .child(self.render_header(&cluster, window_width, theme, cx))
+            .children(self.server_moves.moved().map(|moved| {
+                let text = repointed_text(&model.names().with_real(&cluster.info.name), moved);
+                notice("context-repointed", text.clone(), theme.warning)
+                    .aria_label(text)
+                    .test_support()
+            }))
             .child(content)
             .into_any_element()
     }
@@ -2598,6 +2617,17 @@ fn render_lock_button(
 /// are compared on the exact URL, never on this text.
 pub(super) fn server_text(server: Option<&str>) -> String {
     server.map_or("no server".to_owned(), flint_core::redact::server_url)
+}
+
+/// The main area's notice that the active context moved. Servers are sanitized and kept on one
+/// line, so a kubeconfig value can neither show a credential nor pass for other text.
+fn repointed_text(cluster: &str, moved: &ServerMove) -> String {
+    let shown = |server: Option<&str>| display::single_line(&server_text(server));
+    format!(
+        "{cluster} now points at a different API server. Was {}, now {}.",
+        shown(moved.old.as_deref()),
+        shown(moved.new.as_deref()),
+    )
 }
 
 /// The host and port of a server URL as the UI shows it, for a row's compact second line.

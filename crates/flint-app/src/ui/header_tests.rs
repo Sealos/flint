@@ -277,6 +277,42 @@ async fn the_header_names_the_access_mode(cx: &mut TestAppContext) {
     t.wait_for_label(cx, "access-mode", "Read-only").await;
 }
 
+// #431: when the active context is re-pointed, the main area names both servers, without what a
+// kubeconfig URL may hold besides the address. Choosing another context clears it.
+#[gpui_kit::test]
+async fn a_re_pointed_context_names_both_servers(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    assert!(t.find(cx, "context-repointed").is_none());
+    let old = t.model.read_with(cx, |m, _| {
+        let server = m.active_cluster().unwrap().info.server.as_deref();
+        flint_core::redact::server_url(server.unwrap())
+    });
+
+    t.model.update(cx, |model, cx| {
+        let alpha = model
+            .clusters
+            .iter_mut()
+            .find(|c| c.info.name == "kind-alpha")
+            .unwrap();
+        alpha.info.server = Some("https://admin:hunter2@203.0.113.10:6443/?token=abc".into());
+        alpha.endpoint += 1;
+        alpha.confirmed = true;
+        cx.notify();
+    });
+    t.wait_for_element(cx, "context-repointed").await;
+    let text = t.label(cx, "context-repointed").unwrap();
+    assert!(text.contains("kind-alpha"), "{text}");
+    assert!(text.contains(&format!("Was {old},")), "{text}");
+    assert!(text.contains("now https://203.0.113.10:6443."), "{text}");
+    assert!(!text.contains("hunter2") && !text.contains("abc"), "{text}");
+
+    t.activate(cx, "kind-beta").await;
+    cx.run_until_parked();
+    assert!(t.find(cx, "context-repointed").is_none());
+}
+
 /// The workspace on the pods list, with `demo` in the filter so the picker has a namespace row.
 async fn open_with_picker_rows(cx: &mut TestAppContext, dir: &std::path::Path) -> TestWorkspace {
     let t = open_workspace(cx, dir).await;
