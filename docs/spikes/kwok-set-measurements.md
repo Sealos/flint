@@ -7,18 +7,19 @@ exist yet, so **no 5-member number has been measured**.
 ## Setup
 
 [kwok](https://kwok.sigs.k8s.io/) runs real API servers with simulated nodes and pods, so 10,000 pods need no kubelet.
-`scripts/kwok-set.sh` creates five clusters, `flint-kwok-1` to `flint-kwok-5`, each with 10,000 simulated pods in
+`scripts/kwok-set.sh` creates five clusters, `flint-kwok-<id>-1` to `-5` (the id comes from the scratch kubeconfig path), each with 10,000 simulated pods in
 `default`:
 
 ```sh
 scripts/kwok-set.sh create          # 5 clusters, 10,000 pods each; --members N and --pods N change both
 scripts/kwok-set.sh report          # pods per cluster, and container CPU and memory when docker is present
-scripts/kwok-set.sh delete          # removes only flint-kwok-1 to flint-kwok-5
+scripts/kwok-set.sh delete          # removes only this kubeconfig's five clusters
 ```
 
 Safety: the script writes only to its own scratch kubeconfig (`FLINT_KWOK_KUBECONFIG`, default
 `.dev/kwok-set/kubeconfig`), refuses `~/.kube/config` and `.dev/kubeconfig`, ignores the caller's `KUBECONFIG`, uses
-only the contexts it created (`kwok-flint-kwok-N`) and deletes only clusters with its own name prefix.
+only the contexts it created (`kwok-flint-kwok-<id>-N`) and deletes only clusters with its own run prefix, so a
+second worktree or kubeconfig never touches them. `report` counts only fixture pods (KWOK's scale label) in `default`.
 
 ## Method
 

@@ -11,13 +11,15 @@
 #     .dev/kwok-set/kubeconfig under the current directory). The path must contain "kwok-set".
 #     ~/.kube/config and .dev/kubeconfig are refused, also through links, and the caller's
 #     KUBECONFIG is ignored.
-#   - Every kubectl call names that file and one of this script's contexts (kwok-flint-kwok-N).
+#   - Cluster names carry a run id derived from the scratch kubeconfig path
+#     (flint-kwok-<id>-N), so another worktree or kubeconfig never sees or deletes them.
+#   - Every kubectl call names that file and one of this run's contexts (kwok-flint-kwok-<id>-N).
 #     Any other context is refused.
-#   - `delete` removes only clusters named flint-kwok-1 to flint-kwok-5.
+#   - `delete` removes only clusters named flint-kwok-<id>-1 to -5 of this run.
 #   - Nothing is installed; kwokctl, kubectl and docker (or the binary runtime) must exist.
 set -euo pipefail
 
-prefix=flint-kwok-
+prefix=
 max_members=5
 members=5
 pods=10000
@@ -53,10 +55,14 @@ resolve_kubeconfig() {
   scratch=$(real_path "$raw")
   case $scratch in *kwok-set*) ;; *) die "the scratch kubeconfig resolves outside kwok-set: $scratch" ;; esac
   for forbidden in "$HOME/.kube/config" "$PWD/.dev/kubeconfig"; do
-    if [ "$scratch" = "$(real_path "$forbidden")" ]; then die "refusing to use $forbidden"; fi
+    if [ "$scratch" = "$(real_path "$forbidden")" ] || [ "$scratch" -ef "$forbidden" ]; then
+      die "refusing to use $forbidden"
+    fi
   done
   case $scratch in */.kube/config | */.dev/kubeconfig) die "refusing to use $scratch" ;; esac
   export KUBECONFIG=$scratch
+  # Run id: the checksum of the resolved scratch path.
+  prefix=flint-kwok-$(printf '%s' "$scratch" | cksum | cut -d' ' -f1)-
 }
 
 need() { command -v "$1" > /dev/null 2>&1 || die "$1 is not installed (this script installs nothing)"; }
@@ -81,8 +87,12 @@ kc() {
   kubectl --kubeconfig "$scratch" --context "$ctx" "$@"
 }
 
+# Prints this run's cluster names. A failed listing fails the script; only a successful listing
+# with no match is empty.
 owned_clusters() {
-  kwokctl get clusters 2> /dev/null | grep -E "^${prefix}[1-5]$" || true
+  local listing
+  listing=$(kwokctl get clusters) || die "kwokctl get clusters failed"
+  printf '%s\n' "$listing" | grep -E "^${prefix}[1-5]$" || true
 }
 
 cmd_create() {
@@ -98,43 +108,61 @@ cmd_create() {
   done
   case $members in '' | *[!0-9]*) die "--members needs a number" ;; esac
   case $pods in '' | *[!0-9]*) die "--pods needs a number" ;; esac
+  # Decimal, so a leading zero is not read as octal. Validated before anything is created.
+  members=$((10#$members))
+  pods=$((10#$pods))
   if [ "$members" -lt 1 ] || [ "$members" -gt "$max_members" ]; then die "--members is 1 to $max_members"; fi
   for i in $(seq 1 "$members"); do
     echo "creating $(name_of "$i")"
-    kwokctl create cluster --name "$(name_of "$i")" --kubeconfig "$scratch" --wait 120s
-    check_context "$(context_of "$i")"
     # A node holds 110 pods by default.
-    kwokctl scale node --name "$(name_of "$i")" --replicas "$(( (pods + 109) / 110 ))"
-    kwokctl scale pod fake-pod --name "$(name_of "$i")" --replicas "$pods" --namespace default
+    {
+      kwokctl create cluster --name "$(name_of "$i")" --kubeconfig "$scratch" --wait 120s &&
+        check_context "$(context_of "$i")" &&
+        kwokctl scale node --name "$(name_of "$i")" --replicas "$(( (pods + 109) / 110 ))" &&
+        kwokctl scale pod fake-pod --name "$(name_of "$i")" --replicas "$pods" --namespace default
+    } || die "member $(name_of "$i") failed to create; run '$0 delete' to clean up"
   done
   echo "kubeconfig: $scratch"
   cmd_report
 }
 
 cmd_report() {
-  local found=0 name i count
+  local found=0 failed=0 name i count names
   need kwokctl
   need kubectl
-  for name in $(owned_clusters); do
+  names=$(owned_clusters)
+  for name in $names; do
     found=1
     i=${name#"$prefix"}
-    count=$(kc "$i" get pods --all-namespaces --no-headers 2> /dev/null | wc -l | tr -d ' ')
-    echo "$name context=$(context_of "$i") pods=$count"
+    # Only the fixture pods made by `kwokctl scale pod fake-pod`.
+    if count=$(kc "$i" get pods --namespace default --selector kwok.x-k8s.io/kwokctl-scale=fake-pod \
+      --no-headers | wc -l | tr -d ' '); then
+      echo "$name context=$(context_of "$i") pods=$count"
+    else
+      echo "error: member $name: could not list pods" >&2
+      failed=1
+    fi
   done
   if [ "$found" = 0 ]; then echo "no ${prefix}N clusters"; fi
   if command -v docker > /dev/null 2>&1; then
     docker stats --no-stream --format '{{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}}' 2> /dev/null \
       | grep "kwok-${prefix}" || true
   fi
+  return "$failed"
 }
 
 cmd_delete() {
-  local name
+  local name names failed=0
   need kwokctl
-  for name in $(owned_clusters); do
+  names=$(owned_clusters)
+  for name in $names; do
     echo "deleting $name"
-    kwokctl delete cluster --name "$name" --kubeconfig "$scratch"
+    kwokctl delete cluster --name "$name" --kubeconfig "$scratch" || {
+      echo "error: member $name: delete failed" >&2
+      failed=1
+    }
   done
+  return "$failed"
 }
 
 usage() { sed -n '2,16p' "$0"; }
