@@ -41,6 +41,7 @@ pub use super::dock_model::TabStatus;
 use super::dock_model::{self, LiveSessions, TabCluster, chip_labels, chip_tooltip};
 use super::focus::release_unfocused_input;
 use super::log_view::{LogRequest, LogView};
+use super::menu_fit;
 use super::menu_record;
 use super::registry::{
     self, ActionError, ActivateTab, Bind, CloseActiveTab, CloseTab, NextTab, OnView, PrevTab,
@@ -689,7 +690,9 @@ impl Dock {
                 Some((tab.id, label, self.active == Some(tab.id)))
             })
             .collect();
-        let menu = PopupMenu::build(window, cx, move |menu, _, cx| {
+        let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
+            menu_fit::dismiss_when_shrunk(window, cx);
+            let menu = menu_fit::fit_menu(menu, window);
             menu_record::record(cx, "dock-tab-list", || {
                 entries
                     .iter()
