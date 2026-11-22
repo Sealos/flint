@@ -652,7 +652,7 @@ milestone T; feature tests are in their feature's milestone.
 - **Gaps in M0 to M2:** missing and hanging exec plugins (UP-04, #130); a kubeconfig held half-written past the
   debounce (UP-06, #131); keyboard-only use, palette and switcher (UP-33, UP-30, UP-31, #132); the whole app under
   10,000 pods, nightly (UP-26, #133); Close Window in the app (UP-42: the app under test has no active window, so
-  the action does nothing there; view tests cover it) and an exit observed apart from `App::quit` (#174).
+  the action does nothing there; view tests cover it, #263).
 - **Later milestones:** M3 editing, actions and protection (#134); M4 views, metrics, diagram and dashboard
   (#135); M5 port-forward and Helm on kind (#136); M5.5 MCP scope, redaction, activity log
   (#137) and cluster sets (#138), with warm clusters and Claude analysis not scheduled; M6 Homebrew cask smoke (#139).
