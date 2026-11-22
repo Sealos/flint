@@ -297,6 +297,8 @@ enum Internal {
     },
     NamespacesListed {
         cluster: ClusterId,
+        /// The slot whose watch listed them ([`Cluster::generation`]).
+        generation: u64,
         names: Vec<String>,
     },
     /// A follower stopped: forget its hub unless a watch still feeds it.
@@ -586,8 +588,8 @@ impl ClusterManager {
             } => {
                 if let Some(slot) = self.cluster_mut(&cluster) {
                     slot.namespace_filter = namespaces;
-                    slot.update_scope();
                 }
+                self.apply_scope(&cluster);
             }
             Command::SetLogBufferLines(lines) => {
                 self.write_settings("the log buffer size", move |dir| {
@@ -801,6 +803,7 @@ impl ClusterManager {
             .collect();
         let hubs = self.hubs.clone();
         let internal = self.internal_tx.clone();
+        let paused = self.paused(id);
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
@@ -815,6 +818,11 @@ impl ClusterManager {
                 task.abort();
             }
         }
+        // Paused, what runs goes on and nothing new starts; the load that ends it catches up.
+        if paused {
+            slot.watches.stop_unwanted(active, mode, &subscribed);
+            return;
+        }
         slot.watches.reconcile(active, mode, &subscribed);
         if follow && slot.crd_task.is_none() {
             let follower =
@@ -823,7 +831,10 @@ impl ClusterManager {
         }
         if follow && slot.namespaces_task.is_none() {
             let follower = Follower::new(&hubs, id, KindId::namespaces(), &internal);
-            slot.namespaces_task = Some(tokio::spawn(follow_namespaces(follower, internal)));
+            let generation = slot.generation;
+            slot.namespaces_task = Some(tokio::spawn(follow_namespaces(
+                follower, generation, internal,
+            )));
         }
     }
 
@@ -838,12 +849,17 @@ impl ClusterManager {
     fn start_discovery(&mut self, id: &str) {
         let internal = self.internal_tx.clone();
         let target = cluster::Target::of(&self.kubeconfig.merged, id);
+        let paused = self.paused(id);
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
         let Some(client) = slot.client.as_ref().map(|c| c.read.clone()) else {
             return;
         };
+        if paused {
+            slot.rediscover = true;
+            return;
+        }
         if slot.discovering {
             slot.rediscover = true;
             return;
@@ -1181,10 +1197,20 @@ impl ClusterManager {
                 result,
             } => {
                 let target = cluster::Target::of(&self.kubeconfig.merged, &cluster);
+                let paused = self.paused(&cluster);
                 let Some(slot) = self.cluster_mut(&cluster) else {
                     return;
                 };
                 if slot.attempt != attempt {
+                    return;
+                }
+                // Dropped either way: the load that ends the pause connects again.
+                if paused {
+                    slot.state = ConnectionState::Disconnected;
+                    self.emit(Event::ConnectionChanged {
+                        cluster,
+                        state: ConnectionState::Disconnected,
+                    });
                     return;
                 }
                 let connected = result.is_ok();
@@ -1226,6 +1252,7 @@ impl ClusterManager {
                 attempt,
                 result,
             } => {
+                let paused = self.paused(&cluster);
                 let Some(slot) = self.cluster_mut(&cluster) else {
                     return;
                 };
@@ -1233,6 +1260,10 @@ impl ClusterManager {
                     return;
                 }
                 slot.discovering = false;
+                if paused {
+                    slot.rediscover = true;
+                    return;
+                }
                 let again = std::mem::take(&mut slot.rediscover);
                 let mut retry = false;
                 let mut partial = false;
@@ -1315,11 +1346,20 @@ impl ClusterManager {
                     self.start_discovery(&cluster);
                 }
             }
-            Internal::NamespacesListed { cluster, names } => {
-                if let Some(slot) = self.cluster_mut(&cluster) {
-                    slot.listed_namespaces = names;
-                    slot.update_scope();
-                }
+            Internal::NamespacesListed {
+                cluster,
+                generation,
+                names,
+            } => {
+                // Queued by a slot since replaced: those names are another server's.
+                let Some(slot) = self
+                    .cluster_mut(&cluster)
+                    .filter(|slot| slot.generation == generation)
+                else {
+                    return;
+                };
+                slot.listed_namespaces = names;
+                self.apply_scope(&cluster);
             }
             Internal::ReleaseHub { cluster, kind } => {
                 let running = self
@@ -1397,8 +1437,8 @@ impl ClusterManager {
         // confirmed (`ContextHistory`). Wait for the file rather than read from it.
         let slot = self.cluster(cluster).filter(|s| {
             let shown = s.info.server.as_deref();
-            // A held slot's connection goes on, but no load shows a definition to connect with.
-            (s.client.is_some() || !self.held(cluster))
+            // Streams already open go on; this is asked only for a new one.
+            !self.paused(cluster)
                 // The endpoint alone is enough only for a confirmed server: a fallback at the
                 // same URL can come with other credentials.
                 && (shown == pin.server()
@@ -1452,9 +1492,17 @@ impl ClusterManager {
             });
         }
         let pin = self.session_pin(cluster);
+        self.write_gate(cluster)?;
+        let provisional = self.contexts.provisional(cluster);
+        // Before the client: a paused context may have none, and this is why it is refused.
+        if provisional && self.paused(cluster) {
+            return Err(WriteRefusal::Unsettled {
+                cluster: cluster.to_owned(),
+            });
+        }
         let client = self.write_client(cluster)?;
         // A same-URL fallback keeps its pin, but it may carry another file's credentials.
-        if self.contexts.provisional(cluster) {
+        if provisional {
             return Err(WriteRefusal::Unsettled {
                 cluster: cluster.to_owned(),
             });
@@ -1496,8 +1544,10 @@ impl ClusterManager {
         }
     }
 
+    /// The client for a new one-off read of `cluster`. None while it is paused.
     fn client(&self, cluster: &str) -> Option<Client> {
         self.cluster(cluster)
+            .filter(|_| !self.paused(cluster))
             .and_then(|c| c.client.as_ref().map(|c| c.read.clone()))
     }
 
@@ -1711,6 +1761,20 @@ impl ClusterManager {
         self.held(id) || (self.cluster(id).is_some() && self.contexts.provisional(id))
     }
 
+    /// Whether nothing new may start for `id`: a held slot, or an entry that may be a later file's
+    /// fallback and differs from the definition a load last confirmed. A provisional entry that
+    /// matches it, or that no load ever confirmed, connects as usual.
+    fn paused(&self, id: &str) -> bool {
+        self.held(id)
+            || self.cluster(id).is_some_and(|slot| {
+                self.contexts.provisional(id)
+                    && self
+                        .settled
+                        .get(id)
+                        .is_some_and(|confirmed| *confirmed != slot.fingerprint)
+            })
+    }
+
     /// Reads the kubeconfig files now, ahead of the file watcher, and says whether they still
     /// give `id` the definition the last load showed at `server`. Anything else is a no, a read
     /// that fails included, and a read that stalls also holds writes as a reload's does. Another
@@ -1853,17 +1917,17 @@ impl ClusterManager {
         self.reconcile(&id);
     }
 
-    /// Starts a connection unless one is up or in progress. A held context waits: no load shows
-    /// a definition to connect with, and the load that does starts the attempt.
+    /// Starts a connection unless one is up or in progress. A paused context waits, and the load
+    /// that ends the pause starts the attempt.
     fn ensure_connected(&mut self, id: &str) {
         let kubeconfig = self.kubeconfig.clone();
         let internal = self.internal_tx.clone();
         let attempt = self.next_attempt;
-        let held = self.held(id);
+        let paused = self.paused(id);
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
-        if held
+        if paused
             || matches!(
                 slot.state,
                 ConnectionState::Connecting | ConnectionState::Connected(_)
@@ -1914,6 +1978,38 @@ impl ClusterManager {
                 result,
             });
         });
+    }
+
+    /// Gives `id`'s watches the namespaces it should list now. A new namespace starts a list, so
+    /// a paused cluster keeps what it has, and the load that ends the pause applies this.
+    fn apply_scope(&mut self, id: &str) {
+        if self.paused(id) {
+            return;
+        }
+        if let Some(slot) = self.cluster_mut(id) {
+            slot.update_scope();
+        }
+    }
+
+    /// Catches up a cluster whose pause just ended on the same definition: the discovery and
+    /// watches that waited start now. A watch that kept running publishes its rows once more, so
+    /// a view refused during the pause tries again even if the kind stays quiet. A slot replaced
+    /// by a changed definition runs no watch yet, so it publishes nothing here.
+    fn resume(&mut self, id: &str) {
+        if let Some(slot) = self.cluster(id) {
+            for kind in slot.watches.running().into_keys() {
+                self.hubs.get_or_create(id, &kind).wake.notify_one();
+            }
+        }
+        let active = self.active.as_deref() == Some(id);
+        if self.cluster(id).is_some_and(|slot| {
+            slot.client.is_some()
+                && !slot.discovering
+                && (slot.rediscover || (active && slot.discovery.is_none()))
+        }) {
+            self.start_discovery(id);
+        }
+        self.reconcile(id);
     }
 
     /// Reads the agent activity log and sends it to the front end.
@@ -2058,6 +2154,11 @@ impl ClusterManager {
         }
 
         let order: Vec<String> = self.clusters.iter().map(|c| c.info.name.clone()).collect();
+        let paused: HashSet<String> = order
+            .iter()
+            .filter(|name| self.paused(name))
+            .cloned()
+            .collect();
         let mut old: HashMap<String, Cluster> = self
             .clusters
             .drain(..)
@@ -2066,16 +2167,14 @@ impl ClusterManager {
         let mut changed_active = false;
         for info in &loaded.contexts {
             let fingerprint = cluster::context_fingerprint(&loaded.merged, &info.name);
-            let was_held = self.held(&info.name);
+            let was_paused = paused.contains(&info.name);
             let slot = match old.remove(&info.name) {
                 Some(mut existing) if existing.fingerprint == fingerprint => {
-                    // Back unchanged. No connection starts while held, so start it now.
-                    if was_held && self.active.as_deref() == Some(&info.name) {
+                    // Back unchanged. No connection starts while paused, so start it now.
+                    if was_paused && self.active.as_deref() == Some(&info.name) {
                         changed_active = true;
                     }
                     existing.info = info.clone();
-                    // The default namespace may have changed.
-                    existing.update_scope();
                     existing
                 }
                 Some(old) => {
@@ -2133,6 +2232,10 @@ impl ClusterManager {
                 self.held.insert(name.clone());
             }
         }
+        // The default namespace may have changed, and a filter set during a pause waits for this.
+        for name in loaded.contexts.iter().map(|info| &info.name) {
+            self.apply_scope(name);
+        }
 
         let snapshot = ClustersSnapshot {
             clusters: self
@@ -2156,6 +2259,14 @@ impl ClusterManager {
             } else if changed_active {
                 self.ensure_connected(&active);
             }
+        }
+        for name in paused
+            .iter()
+            .filter(|name| !self.paused(name))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.resume(&name);
         }
     }
 
@@ -2445,7 +2556,11 @@ async fn follow_crds(mut follower: Follower, out: mpsc::UnboundedSender<Internal
 
 /// Follows the namespaces the user can list on an active cluster, for namespace-limited lists.
 /// Ends when aborted or the hub goes away.
-async fn follow_namespaces(mut follower: Follower, out: mpsc::UnboundedSender<Internal>) {
+async fn follow_namespaces(
+    mut follower: Follower,
+    generation: u64,
+    out: mpsc::UnboundedSender<Internal>,
+) {
     let mut last: Option<Vec<String>> = None;
     while let Some(snapshot) = follower.next_synced(Duration::ZERO).await {
         let names: Vec<String> = snapshot.names().into_iter().map(str::to_owned).collect();
@@ -2455,6 +2570,7 @@ async fn follow_namespaces(mut follower: Follower, out: mpsc::UnboundedSender<In
         last = Some(names.clone());
         let msg = Internal::NamespacesListed {
             cluster: follower.cluster.clone(),
+            generation,
             names,
         };
         if out.send(msg).is_err() {
@@ -4662,6 +4778,470 @@ mod tests {
         let slot = manager.cluster("dev").unwrap();
         assert!(matches!(slot.state, ConnectionState::Connecting));
         assert_ne!(slot.attempt, attempt);
+    }
+
+    /// What the second file holds for each way a context pauses when the first breaks: another
+    /// definition (a fresh, provisional slot), or nothing (the slot stays, held).
+    fn pauses() -> [String; 2] {
+        [
+            kubeconfig_with("https://127.0.0.1:3"),
+            NO_CONTEXTS.to_owned(),
+        ]
+    }
+
+    /// A manager on two files with `dev` at an address nothing listens on, its first file broken
+    /// when `pause` is called.
+    async fn pausable(dir: &Path, second: &str) -> (ClusterManager, String, PathBuf) {
+        let yaml = kubeconfig_with("https://127.0.0.1:1");
+        let manager = manager_reading_two(dir, &yaml, second).await;
+        (manager, yaml, dir.join("first"))
+    }
+
+    /// Delivers a finished connection for `dev`'s current attempt, built without contacting
+    /// anything, and leaves no discovery marked as running.
+    async fn land_connection(manager: &mut ClusterManager) {
+        let attempt = manager.next_attempt;
+        manager.next_attempt += 1;
+        let slot = manager.cluster_mut("dev").unwrap();
+        slot.attempt = attempt;
+        slot.state = ConnectionState::Connecting;
+        let result = Ok((built_connection(manager).await, test_version()));
+        manager
+            .handle_internal(Internal::Connected {
+                cluster: "dev".into(),
+                attempt,
+                result,
+            })
+            .await;
+        manager.cluster_mut("dev").unwrap().discovering = false;
+    }
+
+    async fn built_connection(manager: &ClusterManager) -> cluster::GatedConnection {
+        let access = crate::connection::policy::CredentialAccess::always();
+        let built =
+            cluster::connect_gated_with_policy(&manager.kubeconfig.merged, "dev", &access).await;
+        let Ok(connection) = built else {
+            panic!("building a client contacts nothing");
+        };
+        connection
+    }
+
+    fn test_version() -> ServerVersion {
+        ServerVersion {
+            git_version: "v1.30.0".into(),
+            platform: "linux/arm64".into(),
+        }
+    }
+
+    // A paused context starts no connection, and the load that ends the pause starts it.
+    #[tokio::test]
+    async fn a_paused_active_context_connects_only_when_the_pause_ends() {
+        for second in pauses() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut manager, yaml, first) = pausable(dir.path(), &second).await;
+            rewrite_file(&mut manager, &first, UNREADABLE).await;
+            assert!(manager.paused("dev"));
+            let next = manager.next_attempt;
+
+            manager.activate("dev".to_owned());
+            manager.ensure_connected("dev");
+            let slot = manager.cluster("dev").unwrap();
+            assert!(matches!(slot.state, ConnectionState::Disconnected));
+            assert_eq!(manager.next_attempt, next, "no attempt started");
+
+            rewrite_file(&mut manager, &first, &yaml).await;
+            let slot = manager.cluster("dev").unwrap();
+            assert!(matches!(slot.state, ConnectionState::Connecting));
+            assert_eq!(slot.attempt, next, "the load started it");
+        }
+    }
+
+    // A connection that finishes during a pause is dropped, whichever way it went, and the
+    // cluster connects again when the pause ends.
+    #[tokio::test]
+    async fn a_connection_landing_during_a_pause_is_discarded() {
+        for second in pauses() {
+            for succeeded in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let (mut manager, yaml, first) = pausable(dir.path(), &second).await;
+                manager.active = Some("dev".to_owned());
+                let attempt = manager.next_attempt;
+                manager.next_attempt += 1;
+                let slot = manager.cluster_mut("dev").unwrap();
+                slot.attempt = attempt;
+                slot.state = ConnectionState::Connecting;
+                let result = if succeeded {
+                    Ok((built_connection(&manager).await, test_version()))
+                } else {
+                    Err(cluster::SafeErrorText::fixed("refused"))
+                };
+                rewrite_file(&mut manager, &first, UNREADABLE).await;
+                assert!(manager.paused("dev"));
+                // A changed definition has a fresh slot: give it the attempt, so that only the
+                // pause drops the result.
+                let slot = manager.cluster_mut("dev").unwrap();
+                slot.attempt = attempt;
+                slot.state = ConnectionState::Connecting;
+
+                manager
+                    .handle_internal(Internal::Connected {
+                        cluster: "dev".into(),
+                        attempt,
+                        result,
+                    })
+                    .await;
+                let slot = manager.cluster("dev").unwrap();
+                assert!(slot.client.is_none() && slot.write_credential.is_none());
+                assert!(!slot.discovering, "no discovery on a discarded result");
+                assert!(matches!(slot.state, ConnectionState::Disconnected));
+
+                rewrite_file(&mut manager, &first, &yaml).await;
+                let slot = manager.cluster("dev").unwrap();
+                assert!(matches!(slot.state, ConnectionState::Connecting));
+                assert_ne!(slot.attempt, attempt, "a new attempt");
+            }
+        }
+    }
+
+    // Selecting or subscribing to a paused cluster starts no discovery or watch, what already
+    // runs goes on, and both catch up when the pause ends.
+    #[tokio::test]
+    async fn a_paused_cluster_starts_no_discovery_or_watch() {
+        use crate::discovery::tests::kind;
+        let lw = &["get", "list", "watch"];
+        let kinds = vec![
+            kind("", "Pod", "pods", true, lw),
+            kind("", "ConfigMap", "configmaps", true, lw),
+        ];
+        let (pods, configmaps) = (kinds[0].id(), kinds[1].id());
+        for second in [NO_CONTEXTS] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut manager, yaml, first) = pausable(dir.path(), second).await;
+            manager.settings = Arc::new(Settings {
+                watch_mode: crate::settings::WatchMode::OnView,
+                ..Settings::default()
+            });
+            manager.active = Some("dev".to_owned());
+            land_connection(&mut manager).await;
+            let slot = manager.cluster_mut("dev").unwrap();
+            slot.watches.set_kinds(&kinds);
+            slot.discovery = Some(Arc::new(ClusterDiscovery::new(kinds.clone())));
+            let subscribe = |id, kind: &KindId| Request::Subscribe {
+                id,
+                cluster: "dev".into(),
+                kind: kind.clone(),
+            };
+            manager.handle_request(subscribe(1, &pods));
+            let running = |m: &ClusterManager, k: &KindId| {
+                m.watched_kinds("dev").iter().any(|(kind, _)| kind == k)
+            };
+            assert!(running(&manager, &pods));
+
+            rewrite_file(&mut manager, &first, UNREADABLE).await;
+            assert!(manager.paused("dev"));
+            manager.handle_request(subscribe(2, &configmaps));
+            assert!(!running(&manager, &configmaps), "no new watch");
+            assert!(running(&manager, &pods), "the running watch goes on");
+
+            manager.cluster_mut("dev").unwrap().discovery = None;
+            manager.activate("dev".to_owned());
+            assert!(!manager.cluster("dev").unwrap().discovering);
+            assert!(!running(&manager, &configmaps), "no new watch");
+            manager
+                .handle_internal(Internal::RetryDiscovery {
+                    cluster: "dev".into(),
+                })
+                .await;
+            assert!(!manager.cluster("dev").unwrap().discovering);
+
+            rewrite_file(&mut manager, &first, &yaml).await;
+            let slot = manager.cluster("dev").unwrap();
+            assert!(
+                slot.client.is_some(),
+                "the same definition keeps its client"
+            );
+            assert!(slot.discovering, "discovery caught up");
+            assert!(running(&manager, &configmaps), "the watch caught up");
+        }
+    }
+
+    // Selecting a paused cluster that has a client but no discovery does not run discovery.
+    #[tokio::test]
+    async fn selecting_a_paused_cluster_starts_no_discovery() {
+        for second in [NO_CONTEXTS] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut manager, _, first) = pausable(dir.path(), second).await;
+            land_connection(&mut manager).await;
+            rewrite_file(&mut manager, &first, UNREADABLE).await;
+            assert!(manager.paused("dev"));
+
+            manager.activate("dev".to_owned());
+            assert!(!manager.cluster("dev").unwrap().discovering);
+        }
+    }
+
+    // A discovery retry timer that fires during a pause runs nothing.
+    #[tokio::test]
+    async fn a_discovery_retry_during_a_pause_starts_nothing() {
+        for second in [NO_CONTEXTS] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut manager, _, first) = pausable(dir.path(), second).await;
+            manager.active = Some("dev".to_owned());
+            land_connection(&mut manager).await;
+            rewrite_file(&mut manager, &first, UNREADABLE).await;
+
+            manager
+                .handle_internal(Internal::RetryDiscovery {
+                    cluster: "dev".into(),
+                })
+                .await;
+            assert!(!manager.cluster("dev").unwrap().discovering);
+        }
+    }
+
+    // Discovery that finishes during a pause is dropped and runs again when the pause ends.
+    #[tokio::test]
+    async fn discovery_landing_during_a_pause_is_discarded() {
+        use crate::discovery::tests::kind;
+        for second in pauses() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut manager, yaml, first) = pausable(dir.path(), &second).await;
+            manager.active = Some("dev".to_owned());
+            land_connection(&mut manager).await;
+            let attempt = manager.cluster("dev").unwrap().attempt;
+            rewrite_file(&mut manager, &first, UNREADABLE).await;
+            assert!(manager.paused("dev"));
+            let held = manager.held("dev");
+            let slot = manager.cluster_mut("dev").unwrap();
+            slot.attempt = attempt;
+            slot.discovering = true;
+
+            let found = read::DiscoveredKinds {
+                kinds: vec![kind("", "Pod", "pods", true, &["get", "list", "watch"])],
+                skipped_groups: Vec::new(),
+                stale_groups: Default::default(),
+            };
+            manager
+                .handle_internal(Internal::Discovered {
+                    cluster: "dev".into(),
+                    attempt,
+                    result: Ok(found),
+                })
+                .await;
+            let slot = manager.cluster("dev").unwrap();
+            assert!(slot.discovery.is_none() && !slot.discovering);
+
+            rewrite_file(&mut manager, &first, &yaml).await;
+            let slot = manager.cluster("dev").unwrap();
+            if held {
+                assert!(slot.discovering, "the same definition runs discovery again");
+            } else {
+                assert!(slot.client.is_none(), "a changed definition reuses nothing");
+                assert!(matches!(slot.state, ConnectionState::Connecting));
+            }
+        }
+    }
+
+    // A pause that ends on another server drops the old connection, and a result of an attempt
+    // made before it is not taken for the new definition.
+    #[tokio::test]
+    async fn a_pause_ending_on_another_server_reuses_nothing() {
+        for second in pauses() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut manager, _, first) = pausable(dir.path(), &second).await;
+            manager.active = Some("dev".to_owned());
+            land_connection(&mut manager).await;
+            let old = manager.cluster("dev").unwrap().attempt;
+            let late = built_connection(&manager).await;
+            rewrite_file(&mut manager, &first, UNREADABLE).await;
+
+            let moved = kubeconfig_with("https://127.0.0.1:2");
+            rewrite_file(&mut manager, &first, &moved).await;
+            assert!(!manager.paused("dev"));
+            let slot = manager.cluster("dev").unwrap();
+            assert!(slot.client.is_none() && slot.write_credential.is_none());
+            assert!(matches!(slot.state, ConnectionState::Connecting));
+            let attempt = slot.attempt;
+            assert_ne!(attempt, old);
+
+            manager
+                .handle_internal(Internal::Connected {
+                    cluster: "dev".into(),
+                    attempt: old,
+                    result: Ok((late, test_version())),
+                })
+                .await;
+            let slot = manager.cluster("dev").unwrap();
+            assert!(slot.client.is_none(), "the old attempt's result is ignored");
+            assert!(matches!(slot.state, ConnectionState::Connecting));
+        }
+    }
+
+    // A paused context runs nothing: a later file's definition on the same server that differs
+    // only by its user, an exec plugin, never starts it. The held case then connects, which shows
+    // the plugin would have been seen.
+    #[tokio::test]
+    async fn a_paused_context_runs_no_plugin_and_uses_no_fallback_credential() {
+        let plugin = crate::auth_plugin::tests::FakePlugin::hanging();
+        let with_plugin = format!(
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: \
+             http://127.0.0.1:1\nusers:\n- name: u\n  user:\n{}contexts:\n- name: dev\n  \
+             context:\n    cluster: c\n    user: u\n",
+            plugin.user_yaml()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let confirmed = kubeconfig_with("http://127.0.0.1:1");
+        let mut manager = manager_reading_two(dir.path(), &confirmed, &with_plugin).await;
+        let first = dir.path().join("first");
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(!manager.held("dev") && manager.contexts.provisional("dev"));
+        assert!(manager.paused("dev"), "another user is another definition");
+        manager.activate("dev".to_owned());
+        manager.ensure_connected("dev");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(plugin.starts().is_empty(), "the fallback's plugin ran");
+        rewrite_file(&mut manager, &first, &confirmed).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            plugin.starts().is_empty(),
+            "it ran after the file came back"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading_two(dir.path(), &with_plugin, NO_CONTEXTS).await;
+        let first = dir.path().join("first");
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(manager.held("dev"));
+        manager.activate("dev".to_owned());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(plugin.starts().is_empty(), "a held context ran its plugin");
+        rewrite_file(&mut manager, &first, &with_plugin).await;
+        plugin.wait_started().await;
+    }
+
+    // A provisional context showing its confirmed definition is not paused: it connects and its
+    // discovery runs, and writes stay refused.
+    #[tokio::test]
+    async fn an_unchanged_provisional_context_keeps_connecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://127.0.0.1:1");
+        let (mut manager, _, first) = pausable(dir.path(), &yaml).await;
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(manager.contexts.provisional("dev") && !manager.held("dev"));
+        assert!(manager.unsettled("dev") && !manager.paused("dev"));
+
+        let next = manager.next_attempt;
+        manager.activate("dev".to_owned());
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Connecting));
+        assert_eq!(slot.attempt, next);
+
+        land_connection(&mut manager).await;
+        assert!(manager.cluster("dev").unwrap().client.is_some());
+        manager.unlocks.unlock("dev", "https://127.0.0.1:1");
+        assert_eq!(
+            manager.shell_client("dev", None).err(),
+            Some(WriteRefusal::Unsettled {
+                cluster: "dev".to_owned(),
+            })
+        );
+    }
+
+    // A provisional context showing its confirmed definition with no connection is refused as
+    // not connected: nothing about it changed. A paused one says it is uncertain.
+    #[tokio::test]
+    async fn an_unchanged_provisional_context_without_a_client_is_not_connected() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://127.0.0.1:1");
+        let (mut manager, _, first) = pausable(dir.path(), &yaml).await;
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(manager.contexts.provisional("dev") && !manager.paused("dev"));
+        manager.unlocks.unlock("dev", "https://127.0.0.1:1");
+        let not_connected = WriteRefusal::NotConnected {
+            cluster: "dev".to_owned(),
+        };
+        assert_eq!(
+            manager.shell_client("dev", None).err(),
+            Some(not_connected.clone())
+        );
+        assert!(matches!(
+            manager.bound_write_client("dev", None).err(),
+            Some(WriteError::Refused(WriteRefusal::NotConnected { .. }))
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let [other, _] = pauses();
+        let (mut manager, _, first) = pausable(dir.path(), &other).await;
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(manager.contexts.provisional("dev") && manager.paused("dev"));
+        manager.unlocks.unlock("dev", "https://127.0.0.1:3");
+        assert_eq!(
+            manager.shell_client("dev", None).err(),
+            Some(WriteRefusal::Unsettled {
+                cluster: "dev".to_owned(),
+            })
+        );
+        assert!(matches!(
+            manager.bound_write_client("dev", None).err(),
+            Some(WriteError::KubeconfigUnreadable)
+        ));
+    }
+
+    // A namespace list from an earlier slot of the context says nothing about this one.
+    #[tokio::test]
+    async fn a_late_namespace_list_of_an_old_slot_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, _, first) = pausable(dir.path(), NO_CONTEXTS).await;
+        let old = manager.cluster("dev").unwrap().generation;
+        rewrite_file(
+            &mut manager,
+            &first,
+            &kubeconfig_with("https://127.0.0.1:2"),
+        )
+        .await;
+        let current = manager.cluster("dev").unwrap().generation;
+        assert_ne!(old, current);
+        let listed = |generation, name: &str| Internal::NamespacesListed {
+            cluster: "dev".into(),
+            generation,
+            names: vec![name.to_owned()],
+        };
+
+        manager.handle_internal(listed(old, "from-a")).await;
+        assert!(manager.cluster("dev").unwrap().listed_namespaces.is_empty());
+
+        manager.handle_internal(listed(current, "from-b")).await;
+        assert_eq!(
+            manager.cluster("dev").unwrap().listed_namespaces,
+            ["from-b"]
+        );
+    }
+
+    // A context first seen while an earlier file is broken has no confirmed definition to differ
+    // from: it connects, and writes stay refused.
+    #[tokio::test]
+    async fn a_context_first_seen_behind_a_broken_file_connects() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://127.0.0.1:1");
+        let mut manager = manager_reading_two(dir.path(), UNREADABLE, &yaml).await;
+        assert!(manager.contexts.provisional("dev") && !manager.paused("dev"));
+
+        let next = manager.next_attempt;
+        manager.activate("dev".to_owned());
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Connecting));
+        assert_eq!(slot.attempt, next);
+
+        land_connection(&mut manager).await;
+        assert!(manager.cluster("dev").unwrap().client.is_some());
+        manager.unlocks.unlock("dev", "https://127.0.0.1:1");
+        assert_eq!(
+            manager.shell_client("dev", None).err(),
+            Some(WriteRefusal::Unsettled {
+                cluster: "dev".to_owned(),
+            })
+        );
     }
 
     // covers UP-06: once the broken file is valid without the context, it is gone.

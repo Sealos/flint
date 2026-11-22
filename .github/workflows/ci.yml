@@ -5,6 +5,8 @@ on:
     branches: [master]
   pull_request:
   merge_group:
+  # Started by ci-base-change.yml when a PR moves to another base. Runs the full suite.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -24,11 +26,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      rust: ${{ steps.filter.outputs.rust }}
-      # A smoke PR builds the packages only when it changes their packaging (the `mode` step).
-      appimage: ${{ steps.mode.outputs.appimage || steps.filter.outputs.appimage }}
+      # A full run does every job, whatever the paths (the `mode` and `queue` steps).
+      rust: ${{ steps.mode.outputs.full == 'true' && 'true' || steps.filter.outputs.rust }}
+      # A smoke PR builds the packages only when it changes their packaging.
+      appimage: ${{ steps.mode.outputs.full == 'true' && 'true' || steps.mode.outputs.full == 'false' && steps.mode.outputs.packaging || steps.filter.outputs.appimage }}
       # In the merge queue, the `queue` step decides; everywhere else, the filter.
-      macos: ${{ steps.queue.outputs.macos || steps.filter.outputs.macos }}
+      macos: ${{ (steps.mode.outputs.full == 'true' || steps.queue.outputs.full == 'true') && 'true' || steps.queue.outputs.macos || steps.filter.outputs.macos }}
       # `false` only on a smoke PR. Jobs read anything else, a failed job included, as full.
       full: ${{ steps.mode.outputs.full }}
     steps:
@@ -58,14 +61,16 @@ jobs:
         run: |
           if [ -n "$BASE" ] && [ -n "$HEAD" ]; then
             scripts/ci-changes.sh "$BASE" "$HEAD"
+            scripts/ci-changes.sh --suite "$BASE" "$HEAD"
           else
             scripts/ci-changes.sh --all
+            scripts/ci-changes.sh --suite --all
           fi
       # Ordinary PRs get a smoke run; master and the merge queue always run the full suite. A PR
-      # runs it too with the full-ci label or when it changes the write or connection safety
-      # path, dependencies or CI. Labels are read when a run starts, and `labeled` is deliberately
-      # not a trigger: it would replace finished required checks. After labelling, push a commit
-      # or close and reopen the PR.
+      # runs it too with the full-ci label or when a path needs it (scripts/ci-changes.sh).
+      # Labels are read when a run starts, and `labeled` is deliberately not a trigger: it would
+      # replace finished required checks. After labelling, push a commit or close and reopen the
+      # PR.
       - id: mode
         if: github.event_name == 'pull_request'
         env:
@@ -73,15 +78,10 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
           FULL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
         run: |
-          paths=$(git -c core.quotePath=false diff --name-only --no-renames "$BASE...$HEAD")
-          safety='^(crates/flint-core/src/(manager|write|kubeconfig|credential|protection|cluster|auth_plugin|redact|connection/|activity\.rs)|crates/flint-mcp/|crates/flint-e2e/tests/kubeconfig_reload\.rs$|Cargo\.lock$|\.github/(workflows|actions)/|scripts/ci-changes\.sh$)'
-          packaging='^(packaging/linux/|scripts/(package-appimage|smoke-appimage|package-mcp-linux|smoke-mcp-linux|test-mcp-linux|check-no-automation)\.sh$)'
-          if [ "$FULL_LABEL" = true ] || grep -Eq "$safety" <<<"$paths"; then
-            echo "full=true" | tee -a "$GITHUB_OUTPUT"
+          if [ "$FULL_LABEL" = true ]; then
+            scripts/ci-changes.sh --suite --all
           else
-            echo "full=false" | tee -a "$GITHUB_OUTPUT"
-            if grep -Eq "$packaging" <<<"$paths"; then appimage=true; else appimage=false; fi
-            echo "appimage=$appimage" | tee -a "$GITHUB_OUTPUT"
+            scripts/ci-changes.sh --suite "$BASE" "$HEAD"
           fi
 
   # Names which suite this run used, because a smoke `test (*)` passes under the same check name
@@ -160,11 +160,14 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - if: env.RUN == 'true'
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      # Read-only, from the cache cluster-e2e.yml saves on master: it holds the compiled test
+      # dependencies of these three crates. The `linux` cache is saved by clippy and holds only
+      # check metadata, so restoring it here rebuilt about 200 dependencies in every job.
       - if: env.RUN == 'true'
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: linux
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          shared-key: linux-cluster-e2e
+          save-if: false
       # The MCP e2e tests run flint-mcp; build it here rather than inside the tests.
       - if: env.RUN == 'true' && (matrix.crate == 'flint-e2e')
         run: cargo build -p flint-mcp --bin flint-mcp --locked
@@ -195,8 +198,6 @@ jobs:
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
@@ -205,6 +206,10 @@ jobs:
           shared-key: linux
           save-if: false
       - run: cargo doc -p flint-core -p flint-mcp -p flint-e2e --no-deps --document-private-items --locked
+        # On the step, not the job: rust-cache hashes RUST* variables into its key, so a job-level
+        # value here never matched the `linux` cache and every run rebuilt the dependencies.
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   # The app on Linux: GPUI builds there (X11/Wayland), and the headless view tests use GPUI's
   # test platform, so they run without a display. Flint ships a Linux AppImage (ADR-0016); the

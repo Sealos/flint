@@ -24,6 +24,8 @@ fn problem(kind: ProblemKind, subject: ProblemSubject) -> Problem {
             kind,
             subject,
         },
+        owner: None,
+        owner_known: true,
         reason: None,
         since: None,
     }
