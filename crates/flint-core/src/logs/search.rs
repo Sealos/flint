@@ -265,7 +265,7 @@ pub struct LogSearch {
     matches: VecDeque<LineId>,
     /// Lines below this id have been scanned.
     scanned_to: LineId,
-    /// Ends a scan early; clones of this search share it.
+    /// Ends the next scan early; each scan replaces it (see [`ScanCancel`]).
     cancel: ScanCancel,
 }
 
@@ -284,8 +284,9 @@ impl LogSearch {
         &self.query
     }
 
-    /// Stops a scan of this search or of a clone of it: the scan ends at the next line, and
-    /// [`LogSearch::pending`] counts the lines it left.
+    /// Stops the next scan of this search or of a clone made from it now: the scan ends at the
+    /// next line, [`LogSearch::pending`] counts the lines it left, and a later
+    /// [`LogSearch::update`] scans them. See [`ScanCancel`].
     pub fn cancel_handle(&self) -> ScanCancel {
         self.cancel.clone()
     }
@@ -298,9 +299,10 @@ impl LogSearch {
         self.matches.drain(..drop);
         let from = self.scanned_to.max(first);
         let mut reached = lines.end_id();
+        let cancel = std::mem::take(&mut self.cancel);
         if !self.query.text.is_empty() {
             for (id, line) in lines.range(from, lines.end_id()) {
-                if self.cancel.is_cancelled() {
+                if cancel.claim() {
                     reached = id;
                     break;
                 }
@@ -314,24 +316,21 @@ impl LogSearch {
 
     /// The lines not scanned yet that a guard tests. All of them for a plain query; for a regex,
     /// a window of the newest, at most [`GUARD_SCAN_LINES`] lines and about [`GUARD_SCAN_BYTES`]
-    /// bytes, since guards and state polls run on the UI thread.
+    /// bytes counted from the newest line back, since guards and state polls run on the UI
+    /// thread.
     fn unscanned<'a>(&self, lines: &'a LogLines) -> impl Iterator<Item = &'a LogLine> + 'a {
         let end = lines.end_id();
-        let from = self.scanned_to.max(lines.first_id());
-        let (from, mut budget) = if self.query.regex {
-            let from = from.max(end.saturating_sub(GUARD_SCAN_LINES as LineId));
-            (from, GUARD_SCAN_BYTES)
-        } else {
-            (from, usize::MAX)
-        };
-        lines
-            .range(from, end)
-            .map(|(_, line)| line)
-            .take_while(move |line| {
-                let fits = budget > 0;
-                budget = budget.saturating_sub(line.text.len());
-                fits
-            })
+        let mut from = self.scanned_to.max(lines.first_id());
+        if self.query.regex {
+            let oldest = from.max(end.saturating_sub(GUARD_SCAN_LINES as LineId));
+            let (mut at, mut budget) = (end, GUARD_SCAN_BYTES);
+            while at > oldest && budget > 0 {
+                at -= 1;
+                budget = budget.saturating_sub(lines.get(at).map_or(0, |line| line.text.len()));
+            }
+            from = at;
+        }
+        lines.range(from, end).map(|(_, line)| line)
     }
 
     /// How many lines of `lines` the next [`LogSearch::update`] would scan: a front end that
@@ -792,9 +791,23 @@ mod tests {
         // Long lines end the guard's test by bytes, well before the line limit.
         let mut long = LogBuffer::new(100);
         let text = "x".repeat(GUARD_SCAN_BYTES);
-        push(&mut long, &text);
         push(&mut long, "needle");
+        push(&mut long, &text);
         assert!(!LogSearch::new(regex("needle")).has_match_in(&long.view()));
+    }
+
+    // #309: the byte budget is spent from the newest line back, so a burst of old long lines
+    // cannot hide the line that just arrived.
+    #[test]
+    fn a_guard_spends_its_bytes_on_the_newest_lines() {
+        let mut buffer = LogBuffer::new(100);
+        let long = "x".repeat(GUARD_SCAN_BYTES);
+        push(&mut buffer, &long);
+        push(&mut buffer, &long);
+        push(&mut buffer, "needle");
+        let search = LogSearch::new(regex("needle"));
+        assert!(search.has_match_in(&buffer.view()));
+        assert_eq!(search.count_in(&buffer.view()), 1);
     }
 
     // #309: a cancelled scan stops, keeps what it found, and leaves the rest pending.
@@ -814,6 +827,88 @@ mod tests {
         let clone = running.clone();
         running.cancel_handle().cancel();
         assert!(clone.cancel_handle().is_cancelled());
+    }
+
+    // #309: the next update picks up where a cancelled one stopped.
+    #[test]
+    fn a_cancelled_scan_resumes_on_the_next_update() {
+        let mut buffer = LogBuffer::new(4);
+        for t in ["hit", "no", "hit"] {
+            push(&mut buffer, t);
+        }
+        let mut search = LogSearch::new(regex("hit"));
+        search.cancel_handle().cancel();
+        search.update(&buffer.view());
+        assert_eq!(search.pending(&buffer.view()), 3);
+        search.update(&buffer.view());
+        assert_eq!(search.matches(), &[0, 2]);
+        assert_eq!(search.pending(&buffer.view()), 0);
+
+        // Cancelled again, then lines arrive and evict some that were never scanned.
+        for t in ["hit", "no", "hit", "hit"] {
+            push(&mut buffer, t);
+        }
+        search.cancel_handle().cancel();
+        search.update(&buffer.view());
+        assert_eq!(search.count(), 0, "all evicted");
+        for t in ["no", "hit"] {
+            push(&mut buffer, t);
+        }
+        search.update(&buffer.view());
+        assert_eq!(search.matches(), &[5, 6, 8]);
+        assert_eq!(search.pending(&buffer.view()), 0);
+    }
+
+    // #309: one cancel stops one scan. A handle taken before a clone is made reaches that clone
+    // (how a scan moved to another thread is stopped); neither is left unable to scan.
+    #[test]
+    fn a_cancel_stops_one_scan_and_leaves_clones_able_to_scan() {
+        let mut buffer = LogBuffer::new(10);
+        for t in ["hit", "hit"] {
+            push(&mut buffer, t);
+        }
+        let mut original = LogSearch::new(regex("hit"));
+        let mut clone = original.clone();
+        original.cancel_handle().cancel();
+        clone.update(&buffer.view());
+        assert_eq!(clone.count(), 0, "the clone's scan was stopped");
+        original.update(&buffer.view());
+        assert_eq!(original.count(), 2, "the cancel was used up");
+        clone.update(&buffer.view());
+        assert_eq!(clone.count(), 2);
+
+        // After a scan each has its own signal.
+        push(&mut buffer, "hit");
+        clone.cancel_handle().cancel();
+        original.update(&buffer.view());
+        assert_eq!(original.count(), 3);
+    }
+
+    // #309: wherever a cancel lands in a running scan, the scans together see each line once.
+    #[test]
+    fn a_scan_cancelled_while_running_loses_and_repeats_no_line() {
+        let mut buffer = LogBuffer::new(20_000);
+        for n in 0..20_000 {
+            push(&mut buffer, if n % 3 == 0 { "hit" } else { "no" });
+        }
+        let lines = buffer.view();
+        let expected: Vec<LineId> = (0..20_000).filter(|n| n % 3 == 0).collect();
+        for _ in 0..8 {
+            let mut search = LogSearch::new(regex("hit"));
+            let cancel = search.cancel_handle();
+            let scan = std::thread::spawn({
+                let lines = lines.clone();
+                move || {
+                    search.update(&lines);
+                    search
+                }
+            });
+            cancel.cancel();
+            let mut search = scan.join().unwrap();
+            search.update(&lines);
+            assert_eq!(search.pending(&lines), 0);
+            assert!(search.matches().iter().eq(expected.iter()));
+        }
     }
 
     /// A quick measure of highlighting a long, wrapped line: 64 KiB with a match every dozen

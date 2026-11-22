@@ -51,7 +51,7 @@ pub struct LogFilter {
     /// The last lines scanned and not shown, newest last, at most `context` of them: the
     /// context before the next passing line.
     before: VecDeque<LineId>,
-    /// Ends a scan early; clones of this filter share it.
+    /// Ends the next scan early; each scan replaces it (see [`ScanCancel`]).
     cancel: ScanCancel,
 }
 
@@ -69,8 +69,9 @@ impl LogFilter {
         &self.spec
     }
 
-    /// Stops a scan of this filter or of a clone of it: the scan ends at the next line, and
-    /// [`LogFilter::pending`] counts the lines it left.
+    /// Stops the next scan of this filter or of a clone made from it now: the scan ends at the
+    /// next line, [`LogFilter::pending`] counts the lines it left, and a later
+    /// [`LogFilter::update`] scans them. See [`ScanCancel`].
     pub fn cancel_handle(&self) -> ScanCancel {
         self.cancel.clone()
     }
@@ -96,8 +97,9 @@ impl LogFilter {
         let from = self.scanned_to.max(first);
         let context = self.spec.context;
         let mut reached = lines.end_id();
+        let cancel = std::mem::take(&mut self.cancel);
         for (id, line) in lines.range(from, lines.end_id()) {
-            if self.cancel.is_cancelled() {
+            if cancel.claim() {
                 reached = id;
                 break;
             }
@@ -297,5 +299,51 @@ mod tests {
         cancelled.update(&lines.view());
         assert!(cancelled.rows().is_empty());
         assert_eq!(cancelled.pending(&lines.view()), 5);
+        cancelled.update(&lines.view());
+        assert_eq!(rows(&cancelled), [0, 1, 2]);
+        assert_eq!(cancelled.pending(&lines.view()), 0);
+    }
+
+    // #309: wherever a cancel lands, the rows and their context are those of an unbroken scan.
+    #[test]
+    fn a_filter_cancelled_while_running_resumes_with_the_same_rows() {
+        let texts: Vec<&str> = (0..20_000)
+            .map(|n| if n % 7 == 0 { "hit" } else { "no" })
+            .collect();
+        let lines = buffer(&texts, 20_000).view();
+        let mut whole = LogFilter::new(matching("hit", 2));
+        whole.update(&lines);
+        for _ in 0..8 {
+            let mut filter = LogFilter::new(matching("hit", 2));
+            let cancel = filter.cancel_handle();
+            let scan = std::thread::spawn({
+                let lines = lines.clone();
+                move || {
+                    filter.update(&lines);
+                    filter
+                }
+            });
+            cancel.cancel();
+            let mut filter = scan.join().unwrap();
+            filter.update(&lines);
+            assert_eq!(filter.pending(&lines), 0);
+            assert_eq!(filter.rows(), whole.rows());
+        }
+    }
+
+    // #309: lines evicted while a scan was stopped end the context, as any other gap does.
+    #[test]
+    fn a_cancelled_filter_resumes_across_eviction() {
+        let mut lines = buffer(&["hit", "x"], 4);
+        let mut filter = LogFilter::new(matching("hit", 1));
+        filter.cancel_handle().cancel();
+        filter.update(&lines.view());
+        assert_eq!(filter.pending(&lines.view()), 2);
+        for text in ["x", "x", "x", "x", "hit", "x"] {
+            lines.push(LogLine::parse(text, false));
+        }
+        filter.update(&lines.view());
+        assert_eq!(rows(&filter), [5, 6, 7]);
+        assert_eq!(filter.pending(&lines.view()), 0);
     }
 }

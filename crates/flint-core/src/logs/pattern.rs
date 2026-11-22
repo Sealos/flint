@@ -11,6 +11,7 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use regex::{Regex, RegexBuilder};
 
@@ -30,9 +31,14 @@ pub const GUARD_SCAN_BYTES: usize = 256 * 1024;
 
 /// How much of a line is highlighted for a regex query.
 const HIGHLIGHT_BYTES: usize = 4 * 1024;
-/// How many bytes one line's highlighting may search, counting a whole rescan per match:
-/// iterating matches can be quadratic in the text even with a linear engine.
-const HIGHLIGHT_WORK: usize = 128 * 1024;
+/// How far past [`HIGHLIGHT_BYTES`] the matcher reads, so that a match near the cut is decided
+/// by the real line. A match that would only be told apart further on than this can still be
+/// shortened: the bound on the text searched comes first.
+const HIGHLIGHT_LOOKAHEAD: usize = 256;
+/// How long one line's highlighting may take. Iterating matches can be quadratic in the text
+/// even with a linear engine, and how far the engine read for a match cannot be seen from its
+/// result, so the time spent is what is measured. Far above what an ordinary pattern needs.
+const HIGHLIGHT_TIME: Duration = Duration::from_millis(2);
 /// Most matches highlighted in one line.
 const HIGHLIGHT_MATCHES: usize = 256;
 
@@ -70,6 +76,9 @@ thread_local! {
 
 /// `pattern` compiled within the limits, from this thread's cache when it was compiled lately.
 pub(super) fn compile(pattern: &str, case_sensitive: bool) -> Compiled {
+    if pattern.len() > MAX_PATTERN_BYTES {
+        return Err(PatternError::TooLong);
+    }
     CACHE.with_borrow_mut(|cache| {
         if let Some(at) = cache
             .iter()
@@ -90,9 +99,6 @@ pub(super) fn compile(pattern: &str, case_sensitive: bool) -> Compiled {
 }
 
 fn build(pattern: &str, case_sensitive: bool) -> Compiled {
-    if pattern.len() > MAX_PATTERN_BYTES {
-        return Err(PatternError::TooLong);
-    }
     RegexBuilder::new(pattern)
         .case_insensitive(!case_sensitive)
         .size_limit(COMPILED_SIZE_LIMIT)
@@ -115,32 +121,48 @@ fn syntax_reason(text: &str) -> String {
         .to_owned()
 }
 
-/// The non-empty matches of `regex` in `text` to highlight, within the limits above. A match
-/// that ends where the text was cut is left out: `$` or `\b` may have matched only there.
+/// The non-empty matches of `regex` in `text` to highlight, within the limits above. The matcher
+/// reads a little past the cut, so `$`, `\b` or a longer alternative see the real line there; a
+/// match that crosses the cut is left out.
 pub(super) fn bounded_ranges(regex: &Regex, text: &str) -> Vec<Range<usize>> {
-    let mut cut = text.len().min(HIGHLIGHT_BYTES);
-    while !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let hay = &text[..cut];
+    ranges_within(regex, text, HIGHLIGHT_TIME)
+}
+
+fn ranges_within(regex: &Regex, text: &str, time: Duration) -> Vec<Range<usize>> {
+    let cut = char_floor(text, HIGHLIGHT_BYTES);
+    let hay = &text[..char_floor(text, HIGHLIGHT_BYTES + HIGHLIGHT_LOOKAHEAD)];
+    let started = Instant::now();
     let mut out = Vec::new();
-    let (mut work, mut from) = (0, 0);
     for found in regex.find_iter(hay) {
-        work += hay.len() - from;
-        from = found.end();
-        if !found.range().is_empty() && (cut == text.len() || found.end() < cut) {
+        if found.end() > cut {
+            break;
+        }
+        if !found.range().is_empty() {
             out.push(found.range());
         }
-        if work >= HIGHLIGHT_WORK || out.len() == HIGHLIGHT_MATCHES {
+        if out.len() == HIGHLIGHT_MATCHES || started.elapsed() >= time {
             break;
         }
     }
     out
 }
 
+/// The largest char boundary of `text` at or below `at`.
+fn char_floor(text: &str, at: usize) -> usize {
+    let mut at = at.min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
 /// Stops a scan running on the core's threads: the scan ends at the next line, having scanned
-/// the lines before it. Clones share the signal, and so do clones of the search or filter that
-/// handed it out.
+/// the lines before it, and the next update resumes from there.
+///
+/// A handle reaches the search or filter it came from and any clone made before their next scan,
+/// which is how a scan moved to another thread is stopped. One cancel stops one scan, the first
+/// to see it. Each scan then leaves its search or filter with a new signal, so a handle covers
+/// one scan: take a new one for the next.
 #[derive(Debug, Clone, Default)]
 pub struct ScanCancel(Arc<AtomicBool>);
 
@@ -149,14 +171,23 @@ impl ScanCancel {
         self.0.store(true, Ordering::Relaxed);
     }
 
+    /// Whether a cancel is waiting for a scan to see it.
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Relaxed)
+    }
+
+    /// Whether to stop here. Uses the cancel up, so that a clone sharing it can still scan.
+    pub(super) fn claim(&self) -> bool {
+        self.is_cancelled() && self.0.swap(false, Ordering::Relaxed)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A limit no test reaches, for tests about what is matched and not about time.
+    const UNHURRIED: Duration = Duration::from_secs(60);
 
     #[test]
     fn errors_say_what_is_wrong_in_one_line() {
@@ -191,6 +222,52 @@ mod tests {
             compile(&format!("p{n}"), true).unwrap();
         }
         CACHE.with_borrow(|cache| assert_eq!(cache.len(), CACHED_PATTERNS));
+    }
+
+    #[test]
+    fn an_oversize_pattern_is_refused_without_being_cached() {
+        let long = "a".repeat(MAX_PATTERN_BYTES + 1);
+        assert_eq!(compile(&long, true).unwrap_err(), PatternError::TooLong);
+        CACHE.with_borrow(|cache| {
+            assert!(cache.iter().all(|(p, ..)| p.len() <= MAX_PATTERN_BYTES));
+        });
+        assert!(compile(&"a".repeat(MAX_PATTERN_BYTES), true).is_ok());
+    }
+
+    // Empty matches cost next to nothing, so they must not use up the line's budget.
+    #[test]
+    fn empty_matches_do_not_starve_a_later_real_match() {
+        let regex = compile("x*", true).unwrap();
+        let text = format!("{}xx{}", "a".repeat(1000), "a".repeat(HIGHLIGHT_BYTES));
+        let expected = 1000..1002;
+        assert_eq!(
+            ranges_within(&regex, &text, UNHURRIED),
+            std::slice::from_ref(&expected)
+        );
+    }
+
+    // However cheap each match looks, the time limit ends the line.
+    #[test]
+    fn highlighting_stops_when_its_time_is_up() {
+        let regex = compile("a", true).unwrap();
+        let found = ranges_within(&regex, &"a".repeat(100), Duration::ZERO);
+        assert_eq!(found, std::slice::from_ref(&(0..1)));
+    }
+
+    // What the real line holds decides a match near the cut.
+    #[test]
+    fn a_match_that_continues_past_the_cut_is_left_out() {
+        let regex = compile("abc|a", true).unwrap();
+        let text = format!("{}abc{}", "-".repeat(HIGHLIGHT_BYTES - 2), "-".repeat(10));
+        assert!(ranges_within(&regex, &text, UNHURRIED).is_empty());
+        // A match that really ends at the cut is kept: the next character shows it.
+        let regex = compile(r"a\b", true).unwrap();
+        let text = format!("{}a {}", "-".repeat(HIGHLIGHT_BYTES - 1), "-".repeat(10));
+        let expected = HIGHLIGHT_BYTES - 1..HIGHLIGHT_BYTES;
+        assert_eq!(
+            ranges_within(&regex, &text, UNHURRIED),
+            std::slice::from_ref(&expected)
+        );
     }
 
     #[test]
