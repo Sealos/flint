@@ -5,7 +5,7 @@
 
 use flint_core::settings::TrustState;
 use flint_core::{Event, ObjectDetail, Protection};
-use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
+use gpui_kit::test::{TestAppContextExt as _, TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
 
@@ -679,6 +679,45 @@ async fn an_old_trust_on_a_context_without_a_server_can_be_removed(cx: &mut Test
         Some(true),
         "nothing left to do"
     );
+}
+
+/// Whether the accessibility tree holds exactly one element named `label`, and it is `id`.
+fn named(cx: &mut TestAppContext, t: &TestWorkspace, id: &str, label: &str) -> bool {
+    draw(cx, t);
+    cx.update_window(t.window, |_, window, _| {
+        window
+            .try_find_by_label(label)
+            .is_some_and(|found| format!("{:?}", found.path().last()).contains(id))
+    })
+    .unwrap()
+}
+
+// The lock button's accessible name follows the cluster's real protection.
+#[gpui_kit::test]
+async fn the_lock_buttons_name_says_the_protection(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_settings(cx, dir.path(), PROTECT_LOCAL).await;
+    let id = "lock-kind-alpha";
+    let label = |state: &str| format!("Lock for kind-alpha: {state}");
+    assert!(named(cx, &t, id, &label("protected, read-only")));
+
+    let server = t.server.clone();
+    t.model
+        .update(cx, |m, cx| m.unlock("kind-alpha", &server, cx));
+    wait_for_protection(cx, &t, "kind-alpha", Protection::Unlocked).await;
+    assert!(named(cx, &t, id, &label("unlocked until Flint quits")));
+    assert!(!named(cx, &t, id, &label("protected, read-only")));
+
+    let server = t.server.clone();
+    t.model
+        .update(cx, |m, _| m.trust_cluster("kind-alpha".into(), server));
+    wait_for_protection(cx, &t, "kind-alpha", Protection::Trusted).await;
+    assert!(named(
+        cx,
+        &t,
+        id,
+        &label("trusted, unlocked across restarts")
+    ));
 }
 
 // covers UP-55: when Stop Trusting's write fails, the cluster stays protected while its pin is

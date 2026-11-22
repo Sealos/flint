@@ -1428,6 +1428,7 @@ impl Workspace {
 
         let tooltip = hover_text.clone();
         let rename = name.clone();
+        let control_title = title.clone();
         let row = h_flex()
             .id(SharedString::from(format!("cluster-{name}")))
             // Named for assistive technology (and view tests): the short title, then the
@@ -1518,12 +1519,19 @@ impl Workspace {
             })
             .children(render_lock_button(
                 &name,
+                &control_title,
                 server.is_some(),
                 protection,
                 &trust,
                 settings_ok,
             ))
-            .child(self.render_exposure_toggle(&name, server, exposure, settings_ok));
+            .child(self.render_exposure_toggle(
+                &name,
+                &control_title,
+                server,
+                exposure,
+                settings_ok,
+            ));
         let row = row.test_support();
         let row = div()
             .id(SharedString::from(format!("cluster-menu-{name}")))
@@ -1547,6 +1555,7 @@ impl Workspace {
     fn render_exposure_toggle(
         &self,
         name: &str,
+        title: &str,
         server: Option<String>,
         exposure: AiExposureState,
         settings_ok: bool,
@@ -1554,6 +1563,7 @@ impl Workspace {
         let cluster = name.to_owned();
         let button = Button::new(SharedString::from(format!("expose-{name}")))
             .icon(IconName::Bot)
+            .accessibility_label(exposure_label(title, &exposure))
             .xsmall()
             .tab_stop(false);
         if !settings_ok {
@@ -2235,6 +2245,28 @@ fn protection_text(protection: Protection, trust: &TrustState) -> String {
     }
 }
 
+/// The accessible name of a cluster's lock button: which cluster, and its protection now.
+fn lock_label(title: &str, protection: Protection) -> String {
+    let state = match protection {
+        Protection::Protected => "protected, read-only",
+        Protection::Local => "on this machine, unlocked",
+        Protection::Unlocked => "unlocked until Flint quits",
+        Protection::Trusted => "trusted, unlocked across restarts",
+    };
+    format!("Lock for {title}: {state}")
+}
+
+/// The accessible name of a cluster's AI exposure button: which cluster, and its exposure now.
+/// A context re-pointed at another server counts as hidden, so its name says so.
+fn exposure_label(title: &str, exposure: &AiExposureState) -> String {
+    let state = match exposure {
+        AiExposureState::Hidden => "hidden",
+        AiExposureState::Exposed => "exposed, read-only",
+        AiExposureState::ServerChanged { .. } => "cluster changed, hidden",
+    };
+    format!("AI exposure for {title}: {state}")
+}
+
 /// An entry of a cluster's lock menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LockEntry {
@@ -2305,6 +2337,7 @@ fn lock_menu(
 /// trusts or stops trusting. It is not a tab stop, so a stray Space or Enter cannot open it.
 fn render_lock_button(
     name: &str,
+    title: &str,
     has_server: bool,
     protection: Protection,
     trust: &TrustState,
@@ -2312,6 +2345,7 @@ fn render_lock_button(
 ) -> Option<AnyElement> {
     let entries = lock_menu(has_server, protection, trust, settings_ok);
     let button = Button::new(SharedString::from(format!("lock-{name}")))
+        .accessibility_label(lock_label(title, protection))
         .xsmall()
         .tab_stop(false);
     let pinned = !matches!(trust, TrustState::NotTrusted);
@@ -2962,11 +2996,40 @@ mod view_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        Layout, LockEntry, MIN_LIST_WIDTH, layout, lock_menu, mode_name, namespace_summary,
-        no_contexts_text, watch_mode_label,
+        Layout, LockEntry, MIN_LIST_WIDTH, exposure_label, layout, lock_label, lock_menu,
+        mode_name, namespace_summary, no_contexts_text, watch_mode_label,
     };
-    use flint_core::settings::{PaneWidths, TrustState};
+    use flint_core::settings::{AiExposureState, PaneWidths, TrustState};
     use flint_core::{Protection, WatchMode};
+
+    // Each state has a name of its own, and a re-pointed context never reads as exposed.
+    #[test]
+    fn protection_control_names_say_the_state() {
+        for (protection, state) in [
+            (Protection::Protected, "protected, read-only"),
+            (Protection::Local, "on this machine, unlocked"),
+            (Protection::Unlocked, "unlocked until Flint quits"),
+            (Protection::Trusted, "trusted, unlocked across restarts"),
+        ] {
+            assert_eq!(
+                lock_label("prod", protection),
+                format!("Lock for prod: {state}")
+            );
+        }
+        let changed = AiExposureState::ServerChanged {
+            exposed_server: "https://10.0.0.1:6443".into(),
+        };
+        for (exposure, state) in [
+            (AiExposureState::Hidden, "hidden"),
+            (AiExposureState::Exposed, "exposed, read-only"),
+            (changed, "cluster changed, hidden"),
+        ] {
+            assert_eq!(
+                exposure_label("prod", &exposure),
+                format!("AI exposure for prod: {state}")
+            );
+        }
+    }
 
     // covers UP-55: the lock menu offers removing a trust whenever settings.toml holds a pin
     // for the context, also when it grants nothing now (a Stop Trusting whose write failed, a
