@@ -114,6 +114,62 @@ async fn a_nodes_menu_follows_whether_it_is_cordoned(cx: &mut TestAppContext) {
     assert!(t.available(cx).contains(&"workspace::UncordonNode"));
 }
 
+// covers #267: what RBAC forbids is disabled with its reason, what it allows stays enabled, and an
+// answer that is not clear leaves the action to the server.
+#[gpui_kit::test]
+async fn a_forbidden_action_is_disabled_saying_why(cx: &mut TestAppContext) {
+    use flint_core::access::Access;
+
+    use crate::ui::detail::access::Gated;
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_alpha(cx, dir.path(), "").await;
+    connect_deletable(cx, &t).await;
+    open_deployments(cx, &t).await;
+    right_click(cx, &t, "web").await;
+    let set = |cx: &mut TestAppContext, what, access| {
+        let detail = t.workspace.read_with(cx, |ws, _| ws.detail_view().unwrap());
+        detail.update(cx, |d, cx| d.set_access_for_tests(what, access, cx));
+    };
+    let entry = |cx: &mut TestAppContext, label: &str| {
+        let actions = t
+            .workspace
+            .read_with(cx, |ws, cx| row_menu::row_actions(ws, cx).unwrap());
+        let (_, entries) = row_menu::menu_state(&actions);
+        let found = entries.into_iter().find(|e| e.label == label).unwrap();
+        (found.enabled, found.reason)
+    };
+
+    let delete = Gated::Write(ResourceAction::Delete);
+    set(cx, delete, Access::Forbidden);
+    set(cx, Gated::Write(ResourceAction::Scale), Access::Allowed);
+    set(cx, Gated::Logs, Access::Forbidden);
+    set(cx, Gated::Shell, Access::Unknown);
+    assert_eq!(
+        entry(cx, "Delete…"),
+        (
+            false,
+            Some("your access does not allow delete on deployments in demo".to_owned())
+        )
+    );
+    assert_eq!(entry(cx, "Scale…"), (true, None));
+    assert_eq!(
+        entry(cx, "Logs"),
+        (
+            false,
+            Some("your access does not allow get on pods/log in demo".to_owned())
+        )
+    );
+    assert!(entry(cx, "Shell").0, "an unknown answer stays enabled");
+    assert!(
+        t.dispatch(cx, "workspace::DeleteObject", Value::Null)
+            .is_err()
+    );
+
+    set(cx, delete, Access::Unknown);
+    assert_eq!(entry(cx, "Delete…"), (true, None));
+}
+
 // covers UP-53: a kind with no logs or shell gets only what it can do.
 #[gpui_kit::test]
 async fn a_deletable_kind_has_a_menu_with_delete(cx: &mut TestAppContext) {

@@ -21,6 +21,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use super::access::{self, AccessPolicy};
 use super::clock::Clock;
 use super::exec::{self as remote, Execs};
 use super::faults::{self, Effect, Fault, Faults};
@@ -192,6 +193,8 @@ struct Inner {
     /// Exec sessions and the images tests set. Locked after `state` when both are needed.
     execs: Mutex<Execs>,
     faults: Mutex<Faults>,
+    /// What `SelfSubjectAccessReview`s answer.
+    access: Mutex<AccessPolicy>,
     scripts: Mutex<Scripts>,
     watchers: Mutex<HashMap<Gvr, Vec<Watcher>>>,
     requests: Mutex<Vec<RequestRecord>>,
@@ -383,6 +386,7 @@ impl FakeApiServer {
             fixtures,
             options,
             faults: Mutex::default(),
+            access: Mutex::default(),
             scripts: Mutex::default(),
             watchers: Mutex::default(),
             requests: Mutex::default(),
@@ -690,6 +694,12 @@ impl FakeApiServer {
         lock(&self.inner.faults).clear();
     }
 
+    /// Sets what `SelfSubjectAccessReview`s answer. It changes nothing else: the server still
+    /// serves every other request.
+    pub fn set_access(&self, policy: AccessPolicy) {
+        *lock(&self.inner.access) = policy;
+    }
+
     /// Every request answered (or dropped) so far, oldest first.
     pub fn requests(&self) -> Vec<RequestRecord> {
         lock(&self.inner.requests).clone()
@@ -859,7 +869,9 @@ async fn handle(
     let mut write_index = None;
     let call = if is_write {
         let write = writes::read(req).await;
-        if let Ok(write) = &write {
+        if let Ok(write) = &write
+            && !access::is_review(&write.method, &route)
+        {
             write_index = Some(record_write(&inner, &record, write));
         }
         Call::Write(write)
@@ -962,6 +974,12 @@ fn answer(
     match call {
         Call::Read(req) => serve(inner, req, upgrade, route, verb, query, accept),
         Call::Write(Err(e)) => error(&e),
+        Call::Write(Ok(write)) if access::is_review(&write.method, route) => {
+            match access::answer(&lock(&inner.access), &write.body) {
+                Ok(review) => json_with(201, "application/json", &review),
+                Err(e) => error(&e),
+            }
+        }
         Call::Write(Ok(write)) if writes::handles(inner, &write.method, route) => {
             writes::serve(inner, &write, route, query).unwrap_or_else(|e| error(&e))
         }
