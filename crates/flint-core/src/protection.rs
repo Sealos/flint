@@ -334,6 +334,13 @@ pub enum WriteRefusal {
          from the cluster as it is now"
     )]
     Stale { cluster: String },
+    /// A kubeconfig file that could define the context can't be read, so what shows may be a
+    /// later file's definition, with its credentials.
+    #[error(
+        "\"{cluster}\" may be defined differently while one of your kubeconfig files can't be \
+         read; open the shell again once it loads"
+    )]
+    Unsettled { cluster: String },
     /// A load confirmed the context is gone from the kubeconfig files.
     #[error("\"{cluster}\" is no longer in your kubeconfig files")]
     Removed { cluster: String },

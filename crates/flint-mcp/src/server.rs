@@ -69,6 +69,8 @@ struct Inner {
 /// much.
 const RECORD_WAIT: Duration = Duration::from_secs(2);
 const _: () = assert!(activity::LOCK_WAIT.as_millis() < RECORD_WAIT.as_millis());
+/// The longest a call waits to learn whether the cluster it named is in the kubeconfig.
+const CONTEXT_WAIT: Duration = Duration::from_millis(500);
 
 impl Inner {
     /// Writes `record` to the activity log, keying the servers it `reached`, on the call's own
@@ -167,7 +169,8 @@ type ToolResult = Result<CallToolResult, rmcp::ErrorData>;
 /// out, if the cluster could be reached.
 type Probed = (Result<String, String>, Option<policy::ScopeCheck>);
 
-/// What a tool call named, as the agent wrote it: recorded in the activity log.
+/// What a tool call named, as the agent wrote it: recorded in the activity log, which redacts it
+/// as it does for replies ([`activity::append`]).
 #[derive(Debug, Default, Clone)]
 struct Named {
     cluster: Option<String>,
@@ -257,6 +260,7 @@ impl FlintMcp {
         let reached = activity::Reached {
             server: endpoint,
             probed,
+            ..activity::Reached::default()
         };
         let record = activity::ActivityRecord {
             at_ms: activity::now_ms(),
@@ -308,6 +312,8 @@ struct CallNote {
     endpoint: Option<String>,
     /// The contexts `list_clusters` probed, with their servers as the kubeconfig has them.
     probed: Vec<(String, Option<String>)>,
+    /// The cluster it named is a context in the kubeconfig ([`FlintMcp::names_context`]).
+    context: bool,
     /// What its tool would record ([`FlintMcp::finish`]), and the servers it reached, written
     /// once the call's outcome is settled.
     record: Option<(activity::ActivityRecord, activity::Reached)>,
@@ -825,12 +831,15 @@ impl ServerHandler for FlintMcp {
                                 (failed(&text), false)
                             }
                         };
+                        // Within its turn: this can read the kubeconfig.
+                        let context = self.names_context(named.cluster.as_deref(), finished).await;
                         drop(turn);
-                        let (record, note) = CALL.with(|c| {
+                        let (record, mut note) = CALL.with(|c| {
                             let mut c = c.borrow_mut();
                             let record = c.record.take().filter(|_| finished);
                             (record, std::mem::take(&mut *c))
                         });
+                        note.context = context;
                         // A tool that ran left its record: its text is the cluster's, not rmcp's
                         // error for arguments that never reached it.
                         let result = if finished && record.is_none() {
@@ -844,7 +853,8 @@ impl ServerHandler for FlintMcp {
                 }
             }
         };
-        let (record, reached) = record.unwrap_or_else(|| {
+        let context = note.context;
+        let (record, mut reached) = record.unwrap_or_else(|| {
             let names_cluster = named.cluster.is_some();
             let bytes = match &result {
                 Ok(rmcp::model::CallToolResponse::Complete(done)) => done
@@ -860,6 +870,7 @@ impl ServerHandler for FlintMcp {
             let reached = activity::Reached {
                 server: note.endpoint.filter(|_| names_cluster),
                 probed: note.probed,
+                ..activity::Reached::default()
             };
             let record = activity::ActivityRecord {
                 at_ms: activity::now_ms(),
@@ -881,6 +892,7 @@ impl ServerHandler for FlintMcp {
             };
             (record, reached)
         });
+        reached.context = context;
         self.record(record, reached).await;
         result
     }
@@ -920,6 +932,30 @@ impl FlintMcp {
             })
         })
         .await?
+    }
+
+    /// Whether `cluster` is a context in the kubeconfig, for the call's record. A call that ran to
+    /// its end reads the current kubeconfig, for at most [`CONTEXT_WAIT`]; one cut short, or
+    /// without a readable one, goes by the kubeconfig last loaded.
+    async fn names_context(&self, cluster: Option<&str>, finished: bool) -> bool {
+        let Some(name) = cluster else {
+            return false;
+        };
+        if CALL
+            .try_with(|c| c.borrow().endpoint.is_some())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if finished && let Ok(Ok(ctx)) = tokio::time::timeout(CONTEXT_WAIT, self.context()).await {
+            return ctx.kubeconfig.context(name).is_some();
+        }
+        self.inner
+            .kubeconfig
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(_, loaded)| loaded.context(name).is_some())
     }
 
     /// The client for an exposed cluster. Clients are cached per context and rebuilt when the
@@ -1378,11 +1414,13 @@ impl FlintMcp {
             value["apiVersion"] = json!(kind.api_version());
             value["kind"] = json!(kind.kind());
         }
-        // Redacted as a Secret by what was asked for, not only by what came back.
-        let redacted = if is_secret_kind(&kind) {
-            policy::sanitize_secret(&mut value)
+        // Redacted as a Secret by what was asked for, not only by what came back. A Secret's
+        // manager is read first, since masking hides its tracking id.
+        let (redacted, secret_manager) = if is_secret_kind(&kind) {
+            let manager = policy::managed_by_secret_line(&value);
+            (policy::sanitize_secret(&mut value), Some(manager))
         } else {
-            policy::sanitize(&mut value)
+            (policy::sanitize(&mut value), None)
         };
         let yaml = serde_saphyr::to_string(&value)?;
         let (text, truncated) = policy::truncate_bytes(&yaml, policy::OBJECT_BYTES);
@@ -1398,8 +1436,9 @@ impl FlintMcp {
                 policy::OBJECT_BYTES
             ));
         }
-        // After the other header lines, which callers expect first. Read from the redacted object.
-        if let Some(line) = policy::managed_by_line(&value) {
+        // After the other header lines, which callers expect first. Any other object's is read
+        // from its redacted form.
+        if let Some(line) = secret_manager.unwrap_or_else(|| policy::managed_by_line(&value)) {
             out.push_str(&line);
         }
         out.push_str(text);

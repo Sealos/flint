@@ -5,7 +5,8 @@
 //! and returns a [`WriteReview`]. Its [`WriteIntent`] is what [`CoreHandle::run_write`] takes.
 //!
 //! - A confirmation authorizes nothing: the write gate is asked again before **every** request
-//!   (`RequestGate`), so locking a cluster stops a multi-step action at its next request.
+//!   (`RequestGate`), so locking a cluster stops a multi-step action at its next request. Each
+//!   time it reads the kubeconfig files, which must still show the exact definition reviewed.
 //! - A review is bound to what it read: its cluster, server, kind, namespace, name, uid and
 //!   `resourceVersion`. A [`ReviewedEdit`] can only be made here, and is refused for any other
 //!   target.
@@ -425,10 +426,28 @@ impl CoreHandle {
 }
 
 async fn kind_of(core: &CoreHandle, target: &WriteTarget) -> Result<KindInfo, WriteError> {
-    core.discovery(&target.cluster)
+    let discovery = core.discovery(&target.cluster).await;
+    if let Some(kind) = discovery.as_ref().and_then(|d| d.kind(&target.kind)) {
+        return Ok(kind.clone());
+    }
+    // Refused either way: a paused context has no discovery, so this only picks the words.
+    let refusal = match core.bound_write_client(&target.cluster, None).await {
+        Err(unreadable @ WriteError::KubeconfigUnreadable) => unreadable,
+        Err(protected @ WriteError::Refused(WriteRefusal::Protected { .. }))
+            if discovery.is_none() =>
+        {
+            protected
+        }
+        _ => return Err(WriteError::NotServed(target.kind.clone())),
+    };
+    // A target on a server the context no longer shows has moved, whatever else holds.
+    match core
+        .write_client(&target.cluster, Some(target.server.clone()))
         .await
-        .and_then(|d| d.kind(&target.kind).cloned())
-        .ok_or_else(|| WriteError::NotServed(target.kind.clone()))
+    {
+        Err(moved @ WriteRefusal::Moved { .. }) => Err(moved.into()),
+        _ => Err(refusal),
+    }
 }
 
 pub(crate) async fn read_live(

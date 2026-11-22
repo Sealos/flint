@@ -34,18 +34,19 @@ use super::super::registry::{
     EditYaml, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp, FocusFilter, FocusNextPane,
     FocusPreviousPane, FocusSearch, Forward, ForwardCurrent, GoBack, Guards, Hide, HideFromAi,
     HideOthers, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, NextTab, OnView, OpenContainerLogs,
-    OpenContainerShell, OpenLogs, OpenObject, OpenPreviousLogs, OpenSelectorLogs, OpenShell,
-    OpenView, PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs, Refresh, ReloadYamlEdit,
-    RestartShell, RetryConnection, ReviewYamlEdit, SaveLines, SaveLogs, SaveMatchingLines,
-    SaveScope, SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop,
-    SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine,
-    SelectPrev, SelectPrevLine, SelectRow, SelectText, SetDockHeight, SetNamespaces, SetPaneWidth,
-    ShowAll, ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml, SortBy, ToggleAnnotations,
-    ToggleCommandPalette, ToggleLabels, ToggleManagedFields, ToggleNamespace, ToggleNavSection,
-    TogglePause, ToggleResourceSwitcher, ToggleSecretValue, ToggleSources, ToggleTimestamps,
-    ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
+    OpenContainerShell, OpenLogs, OpenObject, OpenPreviousLogs, OpenSelectedRow, OpenSelectorLogs,
+    OpenShell, OpenView, PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs, Refresh,
+    ReloadYamlEdit, RestartShell, RetryConnection, ReviewYamlEdit, SaveLines, SaveLogs,
+    SaveMatchingLines, SaveScope, SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom,
+    ScrollToTop, SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext,
+    SelectNextLine, SelectPrev, SelectPrevLine, SelectRow, SelectText, SetDockHeight,
+    SetNamespaces, SetPaneWidth, ShowAll, ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml,
+    SortBy, ToggleAnnotations, ToggleCommandPalette, ToggleLabels, ToggleManagedFields,
+    ToggleNamespace, ToggleNavSection, TogglePause, ToggleResourceSwitcher, ToggleSecretValue,
+    ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
+    WatchOpenViewsOnly,
 };
-use super::super::registry::{BackToList, EditAiScope, ShowAgentActivity};
+use super::super::registry::{BackToList, EditAiScope, Handler, ShowAgentActivity};
 use super::super::registry::{
     ClearClusterTag, LockCluster, RenameCluster, SetClusterTag, TrustCluster, UnlockCluster,
     UntrustCluster,
@@ -73,6 +74,20 @@ macro_rules! view_open {
     ($view:ident, $check:expr) => {
         |ws: &Workspace, cx: &App| $view(ws, cx).is_some_and($check)
     };
+}
+
+/// [`Forward`] without the list's Enter: it opens the selected row only when the rows have focus,
+/// so with focus in the navigation or the detail pane the action is not available (and Enter
+/// propagates), rather than reported as done when nothing opens.
+struct NotOnRows<B>(B);
+
+impl<E: InteractiveElement> Bind<ResourceList> for NotOnRows<Forward<E, ResourceList>> {
+    fn bind<A: Action>(self, handler: Handler<ResourceList, A>) -> Self {
+        if std::any::TypeId::of::<A>() == std::any::TypeId::of::<OpenSelectedRow>() {
+            return self;
+        }
+        Self(self.0.bind(handler))
+    }
 }
 
 impl Workspace {
@@ -178,7 +193,9 @@ impl Workspace {
     ) -> E {
         let element = Self::bind_actions(OnView::new(element, cx)).into_element();
         let element =
-            ResourceList::bind_actions(Forward::new(element, self.list.as_ref())).into_element();
+            ResourceList::bind_actions(NotOnRows(Forward::new(element, self.list.as_ref())))
+                .0
+                .into_element();
         // The detail pane follows the selected row, which may change between frames.
         let detail = ForwardCurrent::new(element, self, cx, |ws| ws.detail.as_ref());
         let element = DetailView::bind_actions(detail).into_element();
@@ -282,6 +299,7 @@ impl Workspace {
             .when::<SelectFirst>(view_open!(list_wide))
             .when::<SelectLast>(view_open!(list_wide))
             .when::<CloseDetail>(view_open!(list_wide))
+            .when::<OpenSelectedRow>(view_open!(list_wide))
             .when::<FocusFilter>(view_open!(list_wide))
             .when::<ToggleWide>(|ws, cx| list_wide(ws, cx) == Some(true))
             .add::<SelectRow>(view_open!(list_wide), |ws, a, cx| match &ws.list {

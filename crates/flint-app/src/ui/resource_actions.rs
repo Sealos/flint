@@ -30,6 +30,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::confirm::{self, DialogText};
+use super::detail::access::Gated;
 use super::detail::{DetailView, Opening, Subject, protected_reason, refused};
 use super::notice::{notice, notice_with};
 use super::registry::{
@@ -256,7 +257,11 @@ pub(in crate::ui) fn kind_has_actions(kind: &KindId, deletable: bool) -> bool {
 
 /// The actions a row of `kind` offers, in menu order, the destructive one last. A node offers
 /// Uncordon when `cordoned`, else Cordon (also while that is not known yet, disabled).
-fn offered_for(kind: &KindId, deletable: bool, cordoned: Option<bool>) -> Vec<ResourceAction> {
+pub(in crate::ui) fn offered_for(
+    kind: &KindId,
+    deletable: bool,
+    cordoned: Option<bool>,
+) -> Vec<ResourceAction> {
     let mut actions = Vec::new();
     if is_scalable(kind) {
         actions.push(ResourceAction::Scale);
@@ -321,7 +326,10 @@ pub(in crate::ui) fn available(ws: &Workspace, action: ResourceAction, cx: &App)
         // Offered while the node is not known: it says what it waits for.
         detail.node_cordoned()?;
     }
-    Ok(())
+    match detail.forbidden(Gated::Write(action)) {
+        Some(why) => Err(why),
+        None => Ok(()),
+    }
 }
 
 /// Why the row does not offer `action`.
@@ -640,30 +648,18 @@ fn parse_replicas(typed: &str) -> Result<u32, String> {
 
 /// Which object a dialog before the review is about.
 fn object_lines(target: &WriteTarget) -> String {
-    let mut lines = vec![
-        format!(
-            "Context: {}",
-            flint_core::display::single_line(&target.cluster)
-        ),
-        format!(
-            "Server: {}",
-            target
-                .server
-                .as_deref()
-                .map_or("no server".to_owned(), flint_core::redact::server_url)
-        ),
-    ];
-    if let Some(namespace) = &target.namespace {
-        lines.push(format!("Namespace: {namespace}"));
-    }
-    lines.push(format!("Object: {} {}", target.kind, target.name));
-    lines.join("\n")
+    write_confirm::target_lines(target).join("\n")
+}
+
+/// The object's name as the title of a dialog before the review quotes it.
+fn pre_review_title_name(target: &WriteTarget) -> String {
+    confirm::title_name(&flint_core::display::single_line(&target.name))
 }
 
 fn scale_dialog(target: &WriteTarget, current: Option<u64>) -> DialogText {
     let now = current.map_or("not known yet".to_owned(), |n| n.to_string());
     DialogText {
-        title: format!("Scale {}", target.name),
+        title: format!("Scale {}", pre_review_title_name(target)),
         text: format!(
             "Replicas now: {now}. The next step shows the change to confirm.\n\n{}",
             object_lines(target)
@@ -720,7 +716,8 @@ fn open_scale(
     let text = scale_dialog(&target, current);
     let this = cx.weak_entity();
     let content = field.clone().into();
-    confirm::open_with(window, cx, text, Some(content), move |window, cx| {
+    let pinned = write_confirm::target_lines(&target).len();
+    confirm::open_pinned_with(window, cx, text, pinned, content, move |window, cx| {
         let typed = field.read(cx).input.read(cx).value().to_string();
         let to = match parse_replicas(&typed) {
             Ok(to) => to,
@@ -745,7 +742,7 @@ fn open_scale(
 
 fn drain_dialog(target: &WriteTarget) -> DialogText {
     DialogText {
-        title: format!("Drain {}", target.name),
+        title: format!("Drain {}", pre_review_title_name(target)),
         text: format!(
             "Cordons the node and evicts its pods. {}\nOther pods the options below do not \
              cover stay on the node and are reported. The next step shows the change to \
@@ -847,7 +844,8 @@ fn open_drain(target: WriteTarget, window: &mut Window, cx: &mut Context<Workspa
     let text = drain_dialog(&target);
     let this = cx.weak_entity();
     let content = choices.clone().into();
-    confirm::open_with(window, cx, text, Some(content), move |window, cx| {
+    let pinned = write_confirm::target_lines(&target).len();
+    confirm::open_pinned_with(window, cx, text, pinned, content, move |window, cx| {
         let chosen = choices.read(cx);
         let request = Request {
             action: ResourceAction::Drain,
@@ -1092,6 +1090,66 @@ mod tests {
                 parse_replicas(large).unwrap_err().contains("at most"),
                 "{large}"
             );
+        }
+    }
+
+    // The first drain and scale dialogs pin the same target lines above their controls, at the
+    // minimum window and with very long names.
+    #[gpui_kit::test]
+    async fn the_dialogs_before_a_review_pin_the_target(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::component::WindowExt as _;
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{AppContext as _, VisualTestContext, px, size};
+
+        use super::{WriteTarget, confirm, open_drain, open_scale};
+        use crate::ui::support_tests::open_workspace;
+        use crate::ui::workspace::MIN_WINDOW_SIZE;
+
+        let (width, height) = MIN_WINDOW_SIZE;
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        VisualTestContext::from_window(t.window, cx).simulate_resize(size(px(width), px(height)));
+        let target = WriteTarget {
+            cluster: "c".repeat(5_000).as_str().into(),
+            server: Some(format!("https://{}.example.invalid:6443", "s".repeat(600))),
+            kind: KindId::new("apps", "deployments"),
+            namespace: Some("n".repeat(600)),
+            name: "o".repeat(600),
+            uid: None,
+            resource_version: None,
+        };
+        for (control, drain) in [("scale-input", false), ("drain-force", true)] {
+            let on = target.clone();
+            cx.update_window(t.window, |_, window, cx| {
+                t.workspace.update(cx, |ws, cx| {
+                    if drain {
+                        open_drain(on, window, cx)
+                    } else {
+                        open_scale(ws, on, window, cx)
+                    }
+                })
+            })
+            .unwrap();
+            for _ in 0..4 {
+                cx.run_until_parked();
+                cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+                    .unwrap();
+            }
+            cx.update_window(t.window, |_, window, cx| {
+                let lines = confirm::assert_pinned_lines_fit(window, 4, px(height));
+                assert!(lines[0].starts_with("Context: c"), "{}", lines[0]);
+                let controls = window.find(control).bounds();
+                let ok = window.find("ok").bounds();
+                assert!(
+                    controls.bottom() <= ok.origin.y,
+                    "{controls:?} above {ok:?}"
+                );
+                confirm::assert_full_text_reachable(window, cx);
+                confirm::assert_pinned_lines_fit(window, 4, px(height));
+                window.close_dialog(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
         }
     }
 

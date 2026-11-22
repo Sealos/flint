@@ -159,7 +159,9 @@ actions!(
         /// Move focus from the list's text filter back to its rows (Esc or Enter there).
         FocusRows,
         /// Down in the list's text filter: back to the rows, selecting the first if none is.
-        SelectFromFilter
+        SelectFromFilter,
+        /// Enter on the list's rows: open the selected row, as clicking it does.
+        OpenSelectedRow
     ]
 );
 actions!(
@@ -2302,6 +2304,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         )
         .of(C::List, S::List)
         .keys(&["escape"], Some(LIST_ALONE))
+        .hidden(),
+        Spec::unit::<OpenSelectedRow>(
+            "Open Selected Row",
+            "Show the selected row's details, as clicking it does.",
+        )
+        .of(C::List, S::List)
+        .keys(&["enter"], Some(LIST_ALONE))
         .hidden(),
         Spec::with_args::<SelectRow>(
             "Select Object…",
