@@ -160,17 +160,27 @@ Flint is in early development.
   and errors-only (warnings and errors) filters, with adjustable context lines.
 - Protected clusters: every cluster not on your machine is read-only in Flint until you unlock it for the session
   or trust it (the lock button in the sidebar, or the palette). That covers shells, edits and resource actions.
+- GitOps markers: list rows managed by Argo CD or Flux show an `Argo` or `Flux` marker, and the detail header names
+  the manager. Plain Helm objects are not GitOps-managed; a Flux HelmRelease is. Typing `argo`, `flux` or `managed` in
+  the list filter includes those rows, but the filter is a plain text search, so it also matches any other row with
+  that text, such as an unmanaged `argo-server` or a `managed-by=Helm` label.
+- Actions your RBAC clearly forbids (edit, delete, scale, restart, cordon, drain, logs, shell) are disabled and name
+  the missing permission. The API server still decides every request.
+- Cluster colour tags: six colours, set from a cluster's row menu or the palette, shown as a dot in the sidebar and a
+  strip over the detail pane. A tag belongs to a context at one server and changes nothing about access.
 - A command palette (⇧⌘P) that runs any action by name and shows its shortcut (see [Keys](#keys)).
-- A resource switcher (⌘P) for the active cluster's kinds and cached objects, Go Back (⌘[) to return to the previous
-  kind and object, and Tab and Shift-Tab to move focus between panes outside text fields and shells.
+- A resource switcher (⌘P) for the active cluster's kinds and cached objects, ranked by relevance, Go Back (⌘[) to
+  return to the previous kind and object, and Tab and Shift-Tab to move focus between panes outside text fields and
+  shells. Enter opens the selected list row.
 - Light and dark themes that follow the system (View > Appearance, or the `appearance` setting, overrides it).
 - A read-only MCP server, `flint mcp`, for AI agents, limited to the clusters you expose.
-- Builds for macOS (Apple Silicon and Intel) and, best effort, Linux (x86_64 and arm64).
+- Builds for macOS (Apple Silicon and Intel) and, best effort, Linux (x86_64 and arm64). From 0.5.0, every release
+  file has [build provenance](#verify-a-download).
 
 **Coming next:**
 
-- **v0.5, see and watch many clusters:** cluster sets with combined views, problem alerts, comparing an object across
-  clusters, cluster dashboards, and CPU and memory from metrics-server.
+- **Next focus, see and watch many clusters:** multi-cluster management, watching and alerting. None of this is in
+  0.5.0: it has no combined views, alerts, dashboards, thresholds or CPU and memory metrics.
 - **v0.7, change many clusters:** guarded fleet actions with explicit targets, a dry run per cluster, one cluster at a
   time, and a stop at the first failure.
 - **v1.0, first public release:** a signed and notarized app with a Homebrew cask, port-forwarding, and read-only Helm
@@ -288,10 +298,11 @@ deletes it under the other.
 TMPDIR=$(mktemp -d) APPIMAGE_EXTRACT_AND_RUN=1 flint
 ```
 
-The AppImage is unsigned; the `.sha256` file is the check.
+The AppImage is unsigned; see [Verify a download](#verify-a-download).
 On Linux there is no menu bar: the command palette (Ctrl-Shift-P) has every menu item, Quit is Ctrl-Q, Close Window is
 Ctrl-Shift-W (Ctrl-W closes the active dock tab, or the window when the dock shows none; inside a shell tab Ctrl-W goes
-to the shell and Ctrl-Shift-W closes the tab, as in Linux terminals), and every Cmd shortcut is Ctrl. Settings and
+to the shell and Ctrl-Shift-W closes the tab, as in Linux terminals), Restart Shell is Ctrl-Shift-R, and every other
+Cmd shortcut is Ctrl. Settings and
 state live in `~/.config/flint/` (`$XDG_CONFIG_HOME/flint/`).
 
 ### Linux MCP server only (`flint-mcp`)
@@ -318,7 +329,19 @@ from `~/.config/flint/settings.toml` (`$XDG_CONFIG_HOME/flint/`, or `$FLINT_CONF
 writes its activity log. Like `flint`, it takes `PATH` from your login shell when it starts, so exec auth plugins
 (`aws`, `gke-gcloud-auth-plugin`, `kubelogin`) are found; set `path` in `settings.toml` to skip the shell. It exposes
 nothing until `settings.toml` says so: see [Expose a cluster without the app](#expose-a-cluster-without-the-app).
-The binary is unsigned; the `.sha256` file is the check.
+The binary is unsigned; see [Verify a download](#verify-a-download).
+
+### Verify a download
+
+These are two separate checks. The `.sha256` file, used in the steps above, shows that the download is complete and
+matches the file published beside it. From 0.5.0, build provenance also shows that the file was built by a workflow
+in `Sealos/flint`:
+
+```sh
+gh attestation verify ./flint-vX.Y.Z-linux-x86_64.AppImage -R Sealos/flint   # use the file you downloaded
+```
+
+v0.4.0 and earlier have no build provenance, so this command fails on them. Use their checksums.
 
 ## Keys
 
@@ -326,7 +349,8 @@ Cmd-Shift-P opens the command palette: type part of any action's name and press 
 now, with each action's shortcut, and asks for what an action needs (a cluster, a namespace, a kind, a column, a
 label selector). Cmd-P opens the resource switcher: type part of a kind or object name ("pods web" works too) and
 press Enter to open the kind's list, or the object selected with its details; it searches only what Flint already
-holds in memory, so it never asks the cluster. These are the default keys on macOS; on Linux, Cmd is Ctrl.
+holds in memory, so it never asks the cluster. These are the default keys on macOS; on Linux, Cmd is Ctrl, except
+where the table says otherwise.
 
 With a log tab focused, run **Set Context Lines…** from the command palette to choose how many lines appear before
 and after each filtered match.
@@ -341,10 +365,11 @@ and after each filtered match.
 | ↑ ↓, ⏎, → ← | Move, open the kind (or open or close the section), open the section, close it | the navigation |
 | ⌘[ | Go Back to the kind and object shown before | outside text fields |
 | ⌘F | Focus Filter | a list |
-| ↑ ↓, Home, End | Select the previous, next, first, last row | a list |
+| ↑ ↓, Home, End, ⏎ | Select the previous, next, first, last row; open the selected row | a list |
+| ⇧⌘B | Back to List, keeping the selection | the detail in a narrow window |
 | ⎋ | Close Detail | the detail pane |
 | ⌘1, ⌘2 | Show Overview, Show YAML | the detail pane |
-| ⌘R | Refresh Object; Retry Connection; Reconnect Logs or Restart Shell | the detail pane; a failed cluster; the dock |
+| ⌘R | Refresh Object; Retry Connection; Reconnect Logs or Restart Shell (Ctrl-Shift-R on Linux) | the detail pane; a failed cluster; the dock |
 | ⌘L, ⇧⌘L | Open Logs, Open Previous Logs | the selected pod or workload |
 | ⇧⌘E | Open Shell | the selected pod or workload |
 | ⌘J, ⇧⌘J | Toggle Dock, Show Dock Tabs | anywhere |
@@ -392,6 +417,13 @@ watch_mode = "all"                # or "on_view"
 [cluster_names]
 # "arn:aws:eks:eu-west-1:123456789012:cluster/example" = "example-eu"
 
+# Colour tags, written by a cluster's row menu: blue, purple, teal, green, yellow or red. Pinned to
+# the server, so a re-pointed context shows no tag.
+# [[cluster_tags]]
+# context = "staging"
+# server = "https://staging.example.com:6443"
+# tag = "yellow"
+
 # Clusters flint mcp may see, written by the sidebar's Expose to AI toggle. Each entry is a
 # context name and the API server URL it pointed to when you exposed it; if the context later
 # points elsewhere, it is hidden from agents and the sidebar shows "Changed".
@@ -424,9 +456,10 @@ Flint's own diagnostics with credential redaction and rotates at 4 MiB, keeping 
 through `flint.log.3`). If the file is unavailable, logging continues on stderr. MCP uses stdout for the protocol.
 
 By default stderr shows warnings and errors, and `flint --verbose` (or `flint mcp --verbose`) adds info. The file
-always records info and above, so a bug report has context. `FLINT_LOG` takes precedence over `--verbose` and sets
-the filter for both destinations, for example `FLINT_LOG=debug` or
-`FLINT_LOG=flint_core=debug`. Flint reads `RUST_LOG` when `FLINT_LOG` is unset, empty or invalid. `flint --help` lists
+always records info and above, so a bug report has context. `FLINT_LOG` takes precedence over `--verbose`, for
+example `FLINT_LOG=debug` or `FLINT_LOG=flint_core=debug`. On stderr the filter applies to Flint's own events, and
+other crates are capped at warnings and errors whatever it says. The file keeps Flint's own events only. Flint reads
+`RUST_LOG` when `FLINT_LOG` is unset, empty or invalid. `flint --help` lists
 the commands, options and environment variables, with the development aids below under their own heading.
 
 `FLINT_CLUSTER=<context>` is a development and testing aid, for example for agents that take screenshots: at startup
@@ -503,14 +536,17 @@ Linux except the app, which is the only part that needs macOS. The cluster tests
 
 On a pull request, each check runs only when the change touches what it checks: `scripts/ci-changes.sh` sorts
 the changed paths into groups (Rust code, the app, the AppImage, dependencies, scripts, workflows), so a
-docs-only PR runs just `typos` and the PR title check. A skipped check counts as passed. Pushes to `master`, and
-any change to the CI files themselves, run everything.
+docs-only PR runs just `typos` and the PR title check. A skipped check counts as passed. Ordinary PRs run a smoke
+suite: every test compiles and a named subset runs. Pushes to `master` and PRs touching the paths `needs_full` lists
+in that script, including the CI files, run the full suite. See
+[Which tests a pull request runs](docs/TESTING.md).
 
 - **CI (Linux):** `cargo fmt --check`, and for `flint-core` and `flint-mcp`: clippy with `-D warnings`,
-  `cargo test -p <crate>` as a separate job per crate, and `cargo doc` with `-D warnings`. For the app,
+  tests as a separate job per crate, and `cargo doc` with `-D warnings`. For the app,
   `linux (flint-app)` runs its clippy and view tests, and `appimage (x86_64)` packages a release build with
   `scripts/package-appimage.sh` and smoke-tests it with `scripts/smoke-appimage.sh`.
-- **CI (macOS), one job, `macos (flint-app)`:** the app's clippy, view tests and docs, and a release build. macOS
+- **CI (macOS), one job, `macos (flint-app)`:** the app's clippy, view tests and docs, and a release build. It runs on
+  every push to `master`, on PRs labelled `run-macos`, and on full-suite PRs that change what it builds. macOS
   runners cost about ten times as much as Linux ones, so only work that needs macOS runs there.
 - **macOS packaging, `macos-app (dmg)`:** on PRs that touch the DMG packaging, packages `Flint.app` and its DMG and
   runs `scripts/smoke-macos-app.sh` and its self-test (`scripts/smoke-macos-app-test.sh`). Not required.
@@ -559,9 +595,10 @@ server, is `refactor`, `test` or `chore` (or `fix` when it repairs a bug a user 
    `flint-vX.Y.Z-linux-aarch64.AppImage`, and the MCP server alone as a static musl binary on the same runners
    (`scripts/package-mcp-linux.sh`): `flint-mcp-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` and
    `flint-mcp-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz`, each run in a bare `ubuntu:22.04` with the MCP e2e tests.
-   Each file comes with its SHA-256 checksum. The build jobs hold a read-only token; a separate `upload` job takes
-   their files and attaches them to the draft.
-4. Once every upload has succeeded, a `publish` job publishes the release and checks that all twelve files are on it.
+   Each binary also gets a CycloneDX SBOM, and every file comes with its SHA-256 checksum. The build jobs hold a
+   read-only token. An `attest` job records build provenance for every file, then a separate `upload` job attaches
+   them to the draft.
+4. Once every upload has succeeded, a `publish` job publishes the release and checks that all 24 files are on it.
 
 Until the first signed release, release binaries are **unsigned** (the app only ad-hoc signed). macOS blocks the
 first launch of a browser download until you allow it ([Install from a release](#install-from-a-release)). AppImages

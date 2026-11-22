@@ -262,7 +262,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   objects, and searching never makes a request to the cluster. The arrows move the selection; Enter on a kind opens its
   list, and on an object opens its kind's list with the object selected and its details shown; when the namespace
   filter hides it, the filter is left as it is and the list says the object is filtered out; when it no longer
-  exists, the list says so. The exact name comes first ("web" finds the Deployment web before web-cfg). Each kind says
+  exists, the list says so. The exact name comes first ("web" finds the Deployment web before web-cfg), Event objects come after other matches,
+  and objects matching only by scattered letters are left out when another object contains the query as a run. Each kind says
   how many of its objects are in memory, and in On view mode the switcher says only watched kinds list their
   objects. Esc closes it and puts focus back. Cmd-Shift-P swaps it for the command
   palette and Cmd-P back. With nothing in memory yet it lists the kinds; with no cluster active it says to select one.
@@ -284,7 +285,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   navigation the arrows move over sections and kinds, Enter opens a kind (its list takes focus) or opens and closes a
   section, Right opens a section and Left closes it (from a kind, its own section). In a list, Cmd-F moves to its text
   filter, and Esc, Enter or Down there moves back to the rows, keeping the filter. With nothing selected, Down also
-  selects the first row and opens it. Cmd-[ goes back to the kind and
+  selects the first row and opens it. Enter on the rows opens the selected row; in a narrow window it brings the
+  detail back, and Cmd-Shift-B (Ctrl-Shift-B on Linux) returns to the list. Cmd-[ goes back to the kind and
   object shown before, on the active cluster, never to the place already shown.
 - Tests: ui.
 
@@ -514,6 +516,17 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   old revision shows it dimmed. Show is remembered per cluster.
 - Tests: unit (owner and replica rules), ui.
 
+M3 used every number in the 5x block, so its later paths continue at UP-121.
+
+### UP-121 I can only access one namespace
+- **Given** an identity whose RBAC allows it to work in namespace `demo` only, on a cluster that is not protected.
+- **When** I select an object and open its row menu or the detail pane.
+- **Then** each action the cluster clearly forbids (Edit, Delete, Scale, Rollout Restart, Cordon, Uncordon, Drain, Logs,
+  Shell) is disabled and names the missing permission, for example "your access does not allow delete on deployments
+  in demo". An action whose check fails or times out stays enabled, and the API server decides it.
+- Tests: e2e (fake API server, `a_namespace_limited_identity_sees_what_it_may_do`,
+  `a_namespace_limited_user_sees_forbidden_actions_disabled`).
+
 ## M4: Curated views, metrics and the resource diagram
 
 ### UP-60 Understand a workload at a glance
@@ -522,6 +535,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: cluster, ui.
 
 ### UP-61 See resource usage
+- **Status:** planned (#101, not in 0.5.0), not built yet.
 - **Then** pod and node lists show CPU and memory from metrics-server, refreshed about every 15 s. If metrics-server is
   missing, the columns are hidden and a hint is shown.
 - Tests: cluster (with and without metrics-server).
@@ -548,7 +562,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ---
 
 ### UP-65 See what's wrong when I connect
-- **Status:** planned (#101, v0.6), not built yet.
+- **Status:** planned (#101, not in 0.5.0), not built yet.
 - **When** I connect to a cluster, or pick Overview in the resource tree.
 - **Then** the dashboard shows counts of failing pods, not-ready nodes, recent Warning events, pending PVCs, failed Jobs
   and workloads short of replicas. Clicking a count opens the list filtered to exactly those objects. Counts update
@@ -556,7 +570,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: unit (problem rules), ui, e2e (fake API server).
 
 ### UP-66 See how full the cluster is
-- **Status:** planned (#101, v0.6), not built yet.
+- **Status:** planned (#101, not in 0.5.0), not built yet.
 - **When** metrics-server is installed and I look at the dashboard's usage tiles.
 - **Then** I see CPU and memory used against allocatable, and requests and limits against capacity, per node and in
   total, each with a sparkline of the last hour that keeps growing while I stay connected. Without metrics-server the
@@ -564,14 +578,14 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: unit (ring buffer, aggregation), ui.
 
 ### UP-67 Set warning thresholds
-- **Status:** planned (#102, v0.6), not built yet.
+- **Status:** planned (#102, not in 0.5.0), not built yet.
 - **When** I open the dashboard's Thresholds panel and set CPU warnings at 80% for this cluster only.
 - **Then** this cluster's tiles warn from 80%, other clusters keep the global default, and `settings.toml` holds the
   typed override.
 - Tests: unit (settings), ui.
 
 ### UP-68 Follow recent activity
-- **Status:** planned (#101, v0.6), not built yet.
+- **Status:** planned (#101, not in 0.5.0), not built yet.
 - **When** a rollout starts or a Warning event fires while the dashboard is open.
 - **Then** it appears at the top of the activity feed within seconds, and clicking it opens the object.
 - Tests: ui, e2e.
@@ -636,8 +650,8 @@ M4 used every number in the 6x block, so its later paths continue at UP-120.
 
 ## M5.5: Multi-cluster and AI
 
-Cluster sets (UP-82 to UP-85) are scheduled for v0.5 and v0.6. Warm clusters (UP-78, UP-79) are after 1.0 (#247). AI log
-analysis (UP-75 to UP-77) is not scheduled.
+Multi-cluster management, watching and alerting are the next focus and are not in 0.5.0, so cluster sets (UP-82 to
+UP-85) are not built yet. Warm clusters (UP-78, UP-79) are after 1.0 (#247). AI log analysis (UP-75 to UP-77) is not scheduled.
 
 M5.5 was added after M5 and M6 were numbered, so it shares the 7x block with M5 and uses UP-75 to UP-79.
 
