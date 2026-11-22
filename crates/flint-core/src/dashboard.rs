@@ -12,7 +12,8 @@
 //! # Missing data
 //!
 //! A category that could not be read is unknown, never zero, and stays unknown in
-//! [`ProblemCounts::level`]. Cluster-set totals report how many clusters they could not count.
+//! [`ProblemCounts::level`]. Cluster-set totals report how many clusters they could not count, and
+//! [`AttentionRank`] never orders an unreadable cluster as the healthiest.
 //!
 //! # Hold-down
 //!
@@ -22,6 +23,7 @@
 
 // module-tests: dashboard_tests.rs
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
 use k8s_openapi::api::core::v1::{Event, PersistentVolumeClaim};
@@ -127,12 +129,28 @@ impl ProblemCounts {
         self.counts[category.index()]
     }
 
-    /// The sum of every known count, for ordering clusters by most problems.
+    /// The sum of every known count, saturating at `u32::MAX`.
+    ///
+    /// An unknown category adds nothing, so an unreadable cluster totals zero like a healthy one.
+    /// Do not order clusters by this; use [`Self::attention_rank`].
     pub fn known_total(&self) -> u32 {
         self.counts
             .iter()
             .flatten()
             .fold(0, |total, count| total.saturating_add(*count))
+    }
+
+    /// How many categories could not be read.
+    fn unknown_categories(&self) -> usize {
+        self.counts.iter().filter(|count| count.is_none()).count()
+    }
+
+    /// This cluster's place in a worst-first order. See [`AttentionRank`].
+    pub fn attention_rank(&self) -> AttentionRank {
+        AttentionRank {
+            known_problems: Reverse(self.known_total()),
+            unknown_categories: Reverse(self.unknown_categories()),
+        }
     }
 
     /// How `category` stands against `thresholds`.
@@ -154,6 +172,23 @@ impl ProblemCounts {
             .max()
             .unwrap_or(ThresholdLevel::Unknown)
     }
+}
+
+/// A sort key that puts the cluster needing the most attention first, so an ascending sort is
+/// worst first.
+///
+/// Clusters compare by known problems, most first, then by unknown categories, most first. A
+/// confirmed problem therefore outranks missing data: one known problem sorts ahead of a fully
+/// unreadable cluster, while any unknown category sorts ahead of a fully healthy cluster.
+///
+/// Clusters with the same two numbers rank equal, whichever categories they fall in. Known
+/// problems saturate as in [`ProblemCounts::known_total`]. Callers that need a stable display
+/// order break ties themselves, for example by cluster name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AttentionRank {
+    // The derived order compares fields top to bottom, so their order is the ranking.
+    known_problems: Reverse<u32>,
+    unknown_categories: Reverse<usize>,
 }
 
 /// Counts added across clusters.
