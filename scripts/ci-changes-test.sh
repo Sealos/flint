@@ -35,6 +35,43 @@ expect "" ""
 expect "rust appimage macos" rust-toolchain.toml
 expect "rust appimage macos" .cargo/config.toml
 
+# Which suite a path needs: flint-core is full unless a module is named in needs_full.
+expect_suite() {
+  local want=$1 path=$2 got
+  got=$(printf '%s\n' "$path" | scripts/ci-changes.sh --suite --stdin | grep '^full=')
+  if [ "$got" != "full=$want" ]; then
+    echo "FAIL: suite of $path -> '$got', want 'full=$want'"
+    fail=1
+  fi
+}
+
+for path in \
+  crates/flint-core/src/handle.rs \
+  crates/flint-core/src/recheck.rs \
+  crates/flint-core/src/lib.rs \
+  crates/flint-core/src/logs/session.rs \
+  crates/flint-core/src/watch/engine.rs \
+  crates/flint-core/src/new_module.rs \
+  crates/flint-core/src/new_dir/new_module.rs \
+  crates/flint-core/src/paging_extra.rs \
+  crates/flint-core/tests/core_handle.rs \
+  crates/flint-app/src/ui/clusters.rs \
+  crates/flint-app/src/ui/workspace_actions.rs \
+  crates/flint-e2e/tests/access_checks.rs \
+  crates/flint-mcp/src/main.rs \
+  .github/workflows/ci.yml; do
+  expect_suite true "$path"
+done
+for path in \
+  crates/flint-core/src/paging.rs \
+  crates/flint-core/src/thresholds.rs \
+  crates/flint-core/src/thresholds_tests.rs \
+  crates/flint-app/src/ui/sidebar.rs \
+  docs/TESTING.md \
+  README.md; do
+  expect_suite false "$path"
+done
+
 # The git path: a file moved out of crates/ and a non-ASCII name must still count as Rust changes.
 script="$PWD/scripts/ci-changes.sh"
 repo=$(mktemp -d)

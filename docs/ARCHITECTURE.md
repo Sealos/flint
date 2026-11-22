@@ -21,8 +21,6 @@ in [`docs/adr/`](./adr/). The journeys every release must keep working, with sta
 - Browse every resource kind, including CRDs, with live updates ([ADR-0003](./adr/0003-generic-resource-views.md)).
 - Pod logs: follow, search, pick a container, show previous logs, toggle timestamps, and highlight errors and
   warnings.
-- AI log analysis (not scheduled): send selected log lines, redacted, to the user's own Claude Code CLI (`claude`) and read the
-  answer in a side panel ([ADR-0011](./adr/0011-ai-log-analysis-through-local-cli.md)).
 - Pod exec terminal.
 - Edit YAML in the app. Syntax and schema errors show inline as you type, and a server-side dry-run with a diff runs
   before apply ([ADR-0006](./adr/0006-yaml-validation-by-dry-run.md)).
@@ -39,7 +37,8 @@ in [`docs/adr/`](./adr/). The journeys every release must keep working, with sta
 
 ### v1 non-goals
 
-- Windows builds, and Linux packages other than the AppImage (deb, rpm, Flatpak, Snap).
+- Windows builds, and Linux packages other than the AppImage (Flatpak, Snap). The AppImage remains the Linux install
+  for 1.0; deb and rpm packages come after it (#468, #469).
 - Prometheus charts or stored metric history. Dashboards keep an hour of their own samples in memory
   ([ADR-0017](./adr/0017-cluster-dashboards.md)).
 - Local terminal tabs and node shells (shells into a node through a privileged pod).
@@ -47,8 +46,10 @@ in [`docs/adr/`](./adr/). The journeys every release must keep working, with sta
 - YAML schema autocomplete.
 - Saved port-forwards that come back after a restart.
 - An in-app auto-updater.
-- MCP write tools, an MCP server over HTTP, and a built-in AI chat panel. The log analysis panel shows one answer
-  per request and takes no follow-up prompts.
+- MCP tools beyond the six listed under [MCP server](#mcp-server), MCP write tools, an MCP server over HTTP, and a
+  built-in AI chat panel.
+- AI log analysis, which is not scheduled ([ADR-0011](./adr/0011-ai-log-analysis-through-local-cli.md)). The priority
+  is multi-cluster management, watching and alerting.
 - LLM API keys or provider clients in Flint. AI features go through the user's own tools.
 - Fleets of dozens of clusters. Combined views cover sets of 2 to 5 clusters
   ([ADR-0014](./adr/0014-cluster-sets-and-combined-views.md)).
@@ -441,13 +442,13 @@ history is not taken for a quiet pod (#254).
   more than 20,000 lines, on the core's threads (`CoreHandle::filter_logs`), so a 100k-line buffer filters without
   holding up a frame. The list then has one item per row shown; copies and saves of a filtered tab write the rows
   it shows. **Selection** (`LineSelection`) is a range of line ids that shrinks when its start is evicted, and is
-  what copy and AI log analysis read.
+  what copy reads.
 - **Highlighting:** the view colors each line by its severity with the theme's error and warning tokens. The rules
   live in `logs::classify`: case-insensitive whole words; `ERROR`, `FATAL`, `panic`, and any word ending in
   `Exception` or `Error` (such as `NullPointerException`) mark an error; `WARN` and `WARNING` mark a warning; an
   error wins over a warning.
 - **Copy** puts the selected lines on the clipboard as shown (with timestamps only when they are shown) and without
-  redaction. AI log analysis redacts what it sends (see below). In a workload session copy keeps the
+  redaction. In a workload session copy keeps the
   `[pod/container]` prefix unless the view hides it (`LineSelection::text_as`). "As shown" means the same parts:
   copies and saves write each in full, the server's RFC 3339 UTC timestamp and the whole `[pod/container]`, so a
   file stays unambiguous across days, time zones and pods, though the tab shows them short.
@@ -505,7 +506,7 @@ design is in [ADR-0011](./adr/0011-ai-log-analysis-through-local-cli.md).
 ### Bottom dock
 
 `flint-app/src/ui/dock.rs` (pure parts in `dock_model.rs`): a resizable panel under the main area, with one tab per
-session that outlives navigation (log tabs and shell tabs now; AI log analysis later). Tabs keep running across
+session that outlives navigation (log tabs and shell tabs). Tabs keep running across
 cluster switches. Cmd-J shows and hides the dock; Cmd-W closes the active tab wherever focus is in the window, and
 closes the window only when the dock shows no tab; Shift-Cmd-W (Close Window) always closes the window. Closing the
 window or quitting while a shell runs or a log tab follows asks first, naming how many sessions end (`ui/closing.rs`,
@@ -639,6 +640,17 @@ opens in a tab in the bottom dock.
     session is never handed a client for another server than its pin. A shell does the same (`ExecRequest::at`): it is
     refused before it starts if the context shows another server than its tab when the core takes the request. An unconfirmed entry follows the file it comes from on the same
     server, so a failed file between masks its removal.
+  - **Paused clusters.** While an earlier file can't be read, a context is paused if its slot is held, or if it is
+    provisional and its whole definition (context, cluster and user entries, `cluster::context_fingerprint`) differs
+    from the one a load last confirmed. Another user on the same server counts as different. Nothing new starts for
+    a paused cluster: no connection attempt or retry, discovery, watch, one-off read, log stream or auth plugin. A
+    namespace filter set meanwhile is remembered and applied when the pause ends. A result that lands during
+    the pause is dropped after its attempt id is checked. What already runs goes on. A provisional context that shows
+    its confirmed definition is not paused, and neither is one no load has confirmed yet (first seen while an earlier
+    file is broken): both connect. When the pause ends on the same definition, connection, discovery and watches
+    resume, and a watch that kept running publishes its rows once more, so a detail pane refused during the pause
+    tries again; a changed definition gets a fresh slot and reuses nothing. Pausing only decides what starts: writes on
+    any provisional or changed definition stay refused.
   - **Checks.** While the session connects or runs, it asks the manager every 30 s (`recheck::RECHECK_EVERY`,
     shared with log sessions, which are pinned the same way) whether the context changed since, never the server.
     A change ends it with `ExecFailureKind::ContextChanged` and the reason (`recheck::reason`): removed, now on
@@ -747,7 +759,7 @@ limits against capacity, per node and in total, with a sparkline of the last hou
 events and rollouts). The sparklines come from Flint's own 15-second metrics-server samples, kept in a bounded
 in-memory buffer while the cluster is connected. Thresholds are typed settings with per-cluster overrides, edited from
 the dashboard. The dashboard counts as an open view of the kinds it needs. A cluster set's dashboard shows one card per
-member, worst first, under a totals strip. `get_cluster_summary` gives agents the same summary. The same components,
+member, worst first, under a totals strip. The same components,
 scoped to one namespace, make the namespace overview (see [Namespaces](#namespaces)).
 
 ### Metrics
@@ -765,7 +777,7 @@ user enabled it (CrashLoopBackOff, OOMKilled, failed Jobs; up to 10 pods; stoppi
 are stored in `recordings.sqlite` in Flint's data directory (typed tables, owner-only, WAL), as written, with
 configurable retention (7 days, 500 MB per recording and 2 GB in total by default; starred ones kept). Expired
 credentials pause a recording with a "sign-in needed" badge. A recording opens as a timeline of logs, events and
-metric tracks. Agents can query recordings read-only through MCP, redacted and scoped; a time range can be exported.
+metric tracks. A time range can be exported.
 
 ### Port-forward
 
@@ -796,7 +808,8 @@ If `helm` is not on the resolved `PATH`, the Helm section shows an install hint 
 
 `flint mcp` runs a Model Context Protocol server over stdio for AI agents such as Claude Code and Claude Desktop
 ([ADR-0009](./adr/0009-read-only-mcp-server.md)). It does not start GPUI. It resolves `PATH`, loads kubeconfig and
-settings the same way the app does, and serves these read-only tools:
+settings the same way the app does, and serves these six read-only tools. The set is frozen: a new tool needs its
+own ADR.
 
 | Tool | Returns |
 |---|---|
@@ -1089,7 +1102,7 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
     with a cheap subsequence pass before the scoring; the rows are a virtual list, so long argument lists (thousands
     of namespaces) stay within a frame per keystroke.
   - Later features register their actions and the palette lists them: change namespace, toggle watch mode, toggle
-    Expose to AI, disconnect a cluster, open the diagram, analyze the selected log lines.
+    Expose to AI, disconnect a cluster, open the diagram.
 - **Action registry (`flint-app/src/ui/registry.rs`):** every interactive control is a named GPUI action with a Title
   Case label, a description, a category (Flint, Cluster, Namespace, View, List, Detail, Logs, Terminal), typed
   arguments (so a palette can offer pickers), default keys, and whether the palette shows it (automation-only actions
@@ -1214,12 +1227,12 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 | M1.5 | Look and keyboard: Flint Light and Flint Dark themes with orange accents that follow macOS, command palette, resource switcher |
 | M2 | Log viewer with streaming, search, timestamps and error highlighting; exec terminal |
 | M3 | YAML editing with inline syntax and schema validation, dry-run and diff, delete/scale/restart/cordon/drain, clusters protected by default |
-| M4 | Curated views for core kinds, metrics-server columns and node/pod usage, resource diagram, cluster dashboard with thresholds and `get_cluster_summary` |
+| M4 | Curated views for core kinds, metrics-server columns and node/pod usage, resource diagram, cluster dashboard with thresholds |
 | M5 | Port-forward panel with local ports and open in browser, Helm releases |
 | M5.5 | Multi-cluster and AI (history). Cluster sets (super mode), named sets, colour tags and a set dashboard are now scheduled across v0.5 and v0.6. Warm clusters are after 1.0 (#247). AI log analysis is not scheduled |
 | M6 | Universal (arm64 + x86_64) build, signing with hardened runtime, signed DMG, notarization and stapling, Homebrew cask, first public release |
 | M7 | Fleet actions on a cluster set (v0.7): rollout restart, scale, apply YAML and delete, with a per-cluster dry-run preview, one cluster at a time, stopping at the first failure |
-| M8 | Recordings: background capture of a workload's logs, events and metrics into SQLite, automatic recording on trouble, a timeline view, MCP access and export |
+| M8 | Recordings: background capture of a workload's logs, events and metrics into SQLite, automatic recording on trouble, a timeline view and export |
 
 ## Risks
 

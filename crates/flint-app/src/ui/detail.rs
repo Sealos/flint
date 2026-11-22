@@ -222,6 +222,8 @@ pub struct DetailView {
     protected: bool,
     /// The server the object's cluster shows, as the workspace says it: what an edit is for.
     server: Option<String>,
+    /// What RBAC says about this object's actions, for showing them ([`access`]).
+    access: access::ObjectAccess,
     /// The YAML edit under way, in its own editor: a list update never touches its text.
     edit: Option<edit::YamlEdit>,
     /// The pane's own focus, for Tab and Shift-Tab between panes (UP-33).
@@ -251,18 +253,32 @@ impl DetailView {
         let is_secret = object.kind.as_str() == "secrets";
         let subject = Subject::of(&object.kind);
         let mut subscription = core.subscribe(&object.cluster, &object.kind);
-        let freshness = sync::Freshness::new(subscription.latest().state.clone());
+        let first = subscription.latest();
+        let freshness = sync::Freshness::new(first.state.clone());
+        // What identifies the rows: a namespace-limited list has a revision per namespace instead
+        // of its own, and a snapshot no watch built has neither.
+        let mut rows = (first.revision, first.limited_to.clone());
         let follow_sync = cx.spawn_in(window, async move |this, cx| {
             while subscription.changed().await {
-                let state = subscription.latest().state.clone();
+                let snapshot = subscription.latest();
+                let next = (snapshot.revision, snapshot.limited_to.clone());
+                let republished = (next.0 != 0 || next.1.is_some()) && next == rows;
+                rows = next;
+                let state = snapshot.state.clone();
                 let followed = this.update_in(cx, |view, window, cx| {
-                    view.sync_changed(state, window, cx);
+                    view.sync_changed(state, republished, window, cx);
                 });
                 if followed.is_err() {
                     break;
                 }
             }
         });
+        let object_access = access::ObjectAccess::new(
+            &object.kind,
+            object.namespace.as_deref(),
+            &object.name,
+            subject,
+        );
         let mut view = DetailView {
             core,
             object,
@@ -295,6 +311,7 @@ impl DetailView {
             sessions_blocked: None,
             protected: false,
             server: None,
+            access: object_access,
             edit: None,
             focus: cx.focus_handle(),
             _fetch: Task::ready(()),
@@ -339,6 +356,11 @@ impl DetailView {
 
     pub fn object(&self) -> &ObjectRef {
         &self.object
+    }
+
+    /// Why RBAC forbids `what` on this object, if it clearly does.
+    pub(in crate::ui) fn forbidden(&self, what: access::Gated) -> Option<String> {
+        self.access.forbidden(what)
     }
 
     pub fn tab(&self) -> DetailTab {
@@ -406,7 +428,14 @@ impl DetailView {
     }
 
     /// The kind's sync state moved: redraw, and fetch again if the connection came back.
-    fn sync_changed(&mut self, state: SyncState, window: &mut Window, cx: &mut Context<Self>) {
+    /// `republished`: the same rows came again, as they do when a cluster's pause ends.
+    fn sync_changed(
+        &mut self,
+        state: SyncState,
+        republished: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if *self.freshness.state() != state {
             if !state.is_current() {
                 self.error_retries = 0;
@@ -417,6 +446,9 @@ impl DetailView {
             cx.notify();
         }
         self.retry_held_error(window, cx);
+        if republished && self.freshness.state().is_current() {
+            self.retry_failed_pods(cx);
+        }
     }
 
     fn holds_fetch_error(&self) -> bool {
@@ -744,21 +776,6 @@ impl DetailView {
                     .into_any_element(),
             );
         }
-        if let Subject::Workload(_) = self.subject {
-            return Some(
-                Button::new("detail-logs")
-                    .xsmall()
-                    .ghost()
-                    .label("Logs")
-                    .tooltip(format!(
-                        "Open the logs of every pod in the dock ({})",
-                        registry::key_hint("secondary-l")
-                    ))
-                    .on_click(registry::on_click(OpenLogs))
-                    .into_any_element(),
-            );
-        }
-        let containers: Vec<PodContainer> = self.log_containers().to_vec();
         let keys = registry::key_hint("secondary-l");
         let button = Button::new("detail-logs").xsmall().ghost().label("Logs");
         // Logs that cannot open (the pod could not be fetched, say) stay, disabled, saying why.
@@ -770,6 +787,15 @@ impl DetailView {
                     .into_any_element(),
             );
         }
+        if let Subject::Workload(_) = self.subject {
+            return Some(
+                button
+                    .tooltip(format!("Open the logs of every pod in the dock ({keys})"))
+                    .on_click(registry::on_click(OpenLogs))
+                    .into_any_element(),
+            );
+        }
+        let containers: Vec<PodContainer> = self.log_containers().to_vec();
         match containers.as_slice() {
             // Still loading: Logs waits for the pod.
             [] => Some(
@@ -1780,6 +1806,7 @@ fn timestamp_age(text: &str, now: i64) -> Option<String> {
 
 impl Render for DetailView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.follow_access(cx);
         let theme = cx.theme().clone();
         // The pane itself has focus (Tab between panes, UP-33): ringed.
         let focused = self.focus.is_focused(window);
@@ -1850,6 +1877,9 @@ impl Render for DetailView {
             })
     }
 }
+
+#[path = "detail_access.rs"]
+pub(in crate::ui) mod access;
 
 #[path = "detail_actions.rs"]
 mod actions;
