@@ -3865,7 +3865,10 @@ mod tests {
             Err(WriteError::KubeconfigUnreadable)
         );
         assert_eq!(manager.marks.stale_through, stale_through);
-        assert!(manager.reread && manager.refresh_only, "a refresh is queued");
+        assert!(
+            manager.reread && manager.refresh_only,
+            "a refresh is queued"
+        );
         assert!(manager.held("dev"), "held while the read runs");
 
         release_gate(&gate);
