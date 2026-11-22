@@ -259,6 +259,11 @@ type Route = Box<dyn Fn(&str) -> (u16, String) + Send + Sync>;
 
 /// A local API server answering by path, recording each request as `"METHOD /path"`.
 async fn stub(route: Route) -> (Client, Arc<Mutex<Vec<String>>>) {
+    stub_after(Duration::ZERO, route).await
+}
+
+/// [`stub`], taking `delay` to answer each request.
+async fn stub_after(delay: Duration, route: Route) -> (Client, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -281,6 +286,7 @@ async fn stub(route: Route) -> (Client, Arc<Mutex<Vec<String>>>) {
                 let (method, target) = (line.next().unwrap_or(""), line.next().unwrap_or(""));
                 let path = target.split('?').next().unwrap_or("");
                 log.lock().unwrap().push(format!("{method} {path}"));
+                tokio::time::sleep(delay).await;
                 let (code, body) = route(path);
                 let response = format!(
                     "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -336,7 +342,7 @@ fn pod_list() -> String {
                 "metadata": {"name": "odd-times", "namespace": "demo"},
                 "timestamp": "yesterday",
                 "window": "a while",
-                "containers": []
+                "containers": [{"name": "app", "usage": {"cpu": "1m", "memory": "1Mi"}}]
             }
         ]
     })
@@ -632,4 +638,130 @@ async fn the_pod_and_node_polls_deliver_a_first_result() {
             .is_empty()
     );
     assert!(seen.lock().unwrap().iter().all(|r| r.starts_with("GET ")));
+}
+
+// ---------------------------------------------------------------------------------------------
+// One sample against one budget, and items that cannot be read
+
+fn named(name: &str, limits: (Option<&str>, Option<&str>)) -> Container {
+    Container {
+        name: name.to_owned(),
+        ..container((None, None), limits)
+    }
+}
+
+fn sample(names: &[&str]) -> PodMetrics {
+    PodMetrics {
+        namespace: "demo".to_owned(),
+        name: "web".to_owned(),
+        timestamp: None,
+        window: None,
+        containers: names
+            .iter()
+            .map(|name| ContainerMetrics {
+                name: (*name).to_owned(),
+                usage: Usage {
+                    cpu: "500m".parse().unwrap(),
+                    memory: "1Mi".parse().unwrap(),
+                },
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn a_running_init_container_has_no_percentage() {
+    let spec = PodSpec {
+        containers: vec![named("app", (Some("100m"), None))],
+        init_containers: Some(vec![named("migrate", (Some("1"), None))]),
+        ..Default::default()
+    };
+    assert_eq!(sample(&["migrate"]).budget_in(&spec), None);
+    assert_eq!(sample(&["app", "migrate"]).budget_in(&spec), None);
+    assert_eq!(
+        sample(&["app"]).budget_in(&spec),
+        Some(PodBudget::of_pod(&spec))
+    );
+}
+
+#[test]
+fn a_budget_needs_a_sample_of_exactly_the_long_running_containers() {
+    let mut sidecar = named("proxy", (Some("1"), None));
+    sidecar.restart_policy = Some("Always".to_owned());
+    let spec = PodSpec {
+        containers: vec![named("app", (Some("1"), None))],
+        init_containers: Some(vec![sidecar]),
+        ..Default::default()
+    };
+    // A sidecar that started before the app, an empty sample, and a repeated name.
+    for names in [&["proxy"][..], &[], &["app", "app"], &["app", "other"]] {
+        assert_eq!(sample(names).budget_in(&spec), None, "{names:?}");
+    }
+    assert_eq!(
+        sample(&["proxy", "app"]).budget_in(&spec),
+        Some(PodBudget::of_pod(&spec))
+    );
+}
+
+#[tokio::test]
+async fn one_unreadable_item_keeps_the_others() {
+    let body = json!({"items": [
+        {"metadata": {"name": "good", "namespace": "demo"},
+         "containers": [{"name": "app", "usage": {"cpu": "1m", "memory": "1Mi"}}]},
+        {"metadata": {"name": "no-usage", "namespace": "demo"},
+         "containers": [{"name": "app"}]},
+        {"metadata": {"name": "number", "namespace": "demo"},
+         "containers": [{"name": "app", "usage": {"cpu": 1, "memory": "1Mi"}}]},
+        "not an object"
+    ]})
+    .to_string();
+    let (client, _) = stub(Box::new(move |_| (200, body.clone()))).await;
+    let list = fetch_pod_metrics(&client, None).await.unwrap();
+    assert_eq!(list.skipped, 3);
+    assert_eq!(list.items.len(), 1);
+}
+
+#[tokio::test]
+async fn an_empty_sample_is_missing_not_zero() {
+    let body = json!({"items": [
+        {"metadata": {"name": "empty", "namespace": "demo"}, "containers": []},
+        {"metadata": {"name": "absent", "namespace": "demo"}}
+    ]})
+    .to_string();
+    let (client, _) = stub(Box::new(move |_| (200, body.clone()))).await;
+    let list = fetch_pod_metrics(&client, None).await.unwrap();
+    assert_eq!((list.items.len(), list.skipped), (0, 2));
+}
+
+#[tokio::test]
+async fn one_deadline_covers_the_list_and_the_discovery_after_it() {
+    let (client, seen) = stub_after(
+        Duration::from_millis(300),
+        Box::new(|_| status(404, "NotFound", "not found")),
+    )
+    .await;
+    let result = fetch_pod_metrics_within(&client, Some("demo"), Duration::from_millis(450)).await;
+    assert_eq!(result, Err(failed("timed out reading metrics")));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn a_zero_container_limit_is_unset_but_a_zero_request_stays() {
+    let budget =
+        PodBudget::of_container(&container((Some("0"), Some("0")), (Some("0"), Some("0Mi"))));
+    assert_eq!(budget.limits, Amounts::default());
+    assert_eq!(budget.requests.cpu, Some(Cpu::from_nanos(0)));
+    assert_eq!(budget.requests.memory, Some(Memory::from_bytes(0)));
+    // A zero limit on one container leaves the pod without a total.
+    let spec = PodSpec {
+        containers: vec![
+            named("a", (None, Some("0"))),
+            named("b", (None, Some("1Mi"))),
+        ],
+        ..Default::default()
+    };
+    assert_eq!(PodBudget::of_pod(&spec).limits.memory, None);
+    // Allocatable is not a limit: zero stays zero.
+    let allocatable = Amounts::from_quantities(&quantities(Some("0"), Some("0")).unwrap());
+    assert_eq!(allocatable.memory, Some(Memory::from_bytes(0)));
 }

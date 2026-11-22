@@ -4,8 +4,8 @@
 //! - [`fetch_pod_metrics`] and [`fetch_node_metrics`] list metrics through a client the caller
 //!   already has, and tell "not installed" from "forbidden" from "failed" ([`MetricsError`]).
 //! - [`MetricsPoll`] repeats a fetch while it is held, and stops when dropped.
-//! - [`Usage::against`] compares usage with a [`PodBudget`]'s requests and limits, or with a
-//!   node's allocatable [`Amounts`].
+//! - [`Usage::against`] compares usage with the [`PodBudget`] from [`PodMetrics::budget_in`], or
+//!   with a node's allocatable [`Amounts`].
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -216,6 +216,18 @@ impl PodMetrics {
                 memory: Memory(total.memory.0.saturating_add(container.usage.memory.0)),
             })
     }
+
+    /// The budget to compare [`Self::total`] with, or `None` if this sample does not cover
+    /// exactly the containers that run alongside each other. That is the case while an init
+    /// container runs or before every container reports, when any percentage would compare the
+    /// use of some containers with the budget of others.
+    pub fn budget_in(&self, spec: &PodSpec) -> Option<PodBudget> {
+        let mut sampled: Vec<&str> = self.containers.iter().map(|c| c.name.as_str()).collect();
+        let mut expected: Vec<&str> = long_running(spec).map(|c| c.name.as_str()).collect();
+        sampled.sort_unstable();
+        expected.sort_unstable();
+        (!sampled.is_empty() && sampled == expected).then(|| PodBudget::of_pod(spec))
+    }
 }
 
 /// A node's `metrics.k8s.io` NodeMetrics.
@@ -233,7 +245,7 @@ pub struct NodeMetrics {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricsList<T> {
     pub items: Vec<T>,
-    /// Items left out because their name or a quantity could not be read.
+    /// Items left out because they could not be read or, for a pod, hold no container sample.
     pub skipped: usize,
 }
 
@@ -258,8 +270,9 @@ pub type MetricsResult<T> = Result<MetricsList<T>, MetricsError>;
 // Fetching
 
 #[derive(Deserialize)]
-struct WireList<T> {
-    items: Vec<T>,
+struct WireList {
+    /// Decoded one by one, so that one unreadable item cannot lose the others.
+    items: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -307,7 +320,12 @@ struct WireNode {
 }
 
 impl WirePod {
+    /// `None` also for an empty `containers`, which metrics-server returns when it could not
+    /// calculate usage: that is a missing sample, not a measured zero.
     fn parse(self) -> Option<PodMetrics> {
+        if self.containers.is_empty() {
+            return None;
+        }
         let containers = self
             .containers
             .into_iter()
@@ -344,6 +362,19 @@ pub async fn fetch_pod_metrics(
     client: &Client,
     namespace: Option<&str>,
 ) -> MetricsResult<PodMetrics> {
+    fetch_pod_metrics_within(client, namespace, FETCH_TIMEOUT).await
+}
+
+/// [`fetch_pod_metrics`] with `limit` over all its requests.
+async fn fetch_pod_metrics_within(
+    client: &Client,
+    namespace: Option<&str>,
+    limit: Duration,
+) -> MetricsResult<PodMetrics> {
+    within(limit, read_pod_metrics(client, namespace)).await
+}
+
+async fn read_pod_metrics(client: &Client, namespace: Option<&str>) -> MetricsResult<PodMetrics> {
     let path = match namespace {
         None => format!("{API_PATH}/pods"),
         Some(namespace) if is_dns_label(namespace) => {
@@ -351,7 +382,7 @@ pub async fn fetch_pod_metrics(
         }
         Some(_) => return Err(failed("not a valid namespace name")),
     };
-    match list::<WirePod>(client, path).await {
+    match list(client, path).await {
         Ok(items) => Ok(collect(items, WirePod::parse)),
         Err(err) if namespace.is_some() && is_not_found(&err) => {
             Err(namespaced_not_found(client, &err).await)
@@ -362,10 +393,23 @@ pub async fn fetch_pod_metrics(
 
 /// Lists NodeMetrics with a single `GET`.
 pub async fn fetch_node_metrics(client: &Client) -> MetricsResult<NodeMetrics> {
-    match list::<WireNode>(client, format!("{API_PATH}/nodes")).await {
-        Ok(items) => Ok(collect(items, WireNode::parse)),
-        Err(err) => Err(classify(&err)),
-    }
+    within(FETCH_TIMEOUT, async {
+        match list(client, format!("{API_PATH}/nodes")).await {
+            Ok(items) => Ok(collect(items, WireNode::parse)),
+            Err(err) => Err(classify(&err)),
+        }
+    })
+    .await
+}
+
+/// `fetch`'s result, or a failure once `limit` has passed.
+async fn within<T>(
+    limit: Duration,
+    fetch: impl Future<Output = MetricsResult<T>>,
+) -> MetricsResult<T> {
+    tokio::time::timeout(limit, fetch)
+        .await
+        .unwrap_or_else(|_| Err(failed("timed out reading metrics")))
 }
 
 /// Why a list failed: from the server, or Flint's own limit on it.
@@ -374,21 +418,26 @@ enum ListError {
     Other(MetricsError),
 }
 
-/// The list at `path`. metrics.k8s.io does not page, so this asks for everything at once.
-async fn list<T: DeserializeOwned>(client: &Client, path: String) -> Result<Vec<T>, ListError> {
+/// The items at `path`. metrics.k8s.io does not page, so this asks for everything at once.
+async fn list(client: &Client, path: String) -> Result<Vec<serde_json::Value>, ListError> {
     let request = Request::new(path)
         .list(&ListParams::default())
         .map_err(|e| ListError::Other(failed(&e.to_string())))?;
-    match tokio::time::timeout(FETCH_TIMEOUT, client.request::<WireList<T>>(request)).await {
-        Ok(Ok(list)) => Ok(list.items),
-        Ok(Err(err)) => Err(ListError::Kube(err)),
-        Err(_) => Err(ListError::Other(failed("timed out reading metrics"))),
+    match client.request::<WireList>(request).await {
+        Ok(list) => Ok(list.items),
+        Err(err) => Err(ListError::Kube(err)),
     }
 }
 
-fn collect<W, T>(items: Vec<W>, parse: impl Fn(W) -> Option<T>) -> MetricsList<T> {
+fn collect<W: DeserializeOwned, T>(
+    items: Vec<serde_json::Value>,
+    parse: impl Fn(W) -> Option<T>,
+) -> MetricsList<T> {
     let total = items.len();
-    let items: Vec<T> = items.into_iter().filter_map(parse).collect();
+    let items: Vec<T> = items
+        .into_iter()
+        .filter_map(|item| parse(serde_json::from_value(item).ok()?))
+        .collect();
     MetricsList {
         skipped: total - items.len(),
         items,
@@ -420,15 +469,13 @@ fn classify_kube(err: &kube::Error) -> MetricsError {
 /// A 404 for one namespace's pods can mean the namespace is gone while the API is fine, so the
 /// API's own resource list decides whether metrics are missing.
 async fn namespaced_not_found(client: &Client, err: &ListError) -> MetricsError {
-    let lookup = client.list_api_group_resources(GROUP_VERSION);
-    match tokio::time::timeout(FETCH_TIMEOUT, lookup).await {
-        Ok(Ok(api)) if api.resources.iter().any(|r| r.name == "pods") => match err {
+    match client.list_api_group_resources(GROUP_VERSION).await {
+        Ok(api) if api.resources.iter().any(|r| r.name == "pods") => match err {
             ListError::Kube(e) => MetricsError::Failed(ClusterError::kube_ref(e).summary()),
             ListError::Other(e) => e.clone(),
         },
-        Ok(Ok(_)) => MetricsError::NotInstalled,
-        Ok(Err(lookup_err)) => classify_kube(&lookup_err),
-        Err(_) => failed("timed out reading metrics"),
+        Ok(_) => MetricsError::NotInstalled,
+        Err(lookup_err) => classify_kube(&lookup_err),
     }
 }
 
@@ -554,9 +601,14 @@ pub struct PodBudget {
 }
 
 impl PodBudget {
-    /// One container's requests and limits.
+    /// One container's requests and limits. A zero limit counts as not set, because the kubelet
+    /// applies no cap for it.
     pub fn of_container(container: &Container) -> Self {
         let (requests, limits) = Amounts::from_requirements(container.resources.as_ref());
+        let limits = Amounts {
+            cpu: limits.cpu.filter(|cpu| cpu.nanos() > 0),
+            memory: limits.memory.filter(|memory| memory.bytes() > 0),
+        };
         Self { requests, limits }
     }
 
@@ -567,18 +619,11 @@ impl PodBudget {
     /// Requests add up over the containers that set one. A limit total exists only if every
     /// container has that limit, since one without is unbounded. Pod-level resources, when set,
     /// replace the total for that resource.
-    pub fn of_pod(spec: &PodSpec) -> Self {
-        let sidecars = spec
-            .init_containers
-            .iter()
-            .flatten()
-            .filter(|c| c.restart_policy.as_deref() == Some("Always"));
-        let budgets: Vec<Self> = spec
-            .containers
-            .iter()
-            .chain(sidecars)
-            .map(Self::of_container)
-            .collect();
+    ///
+    /// Private because it only fits a sample of those same containers: see
+    /// [`PodMetrics::budget_in`].
+    fn of_pod(spec: &PodSpec) -> Self {
+        let budgets: Vec<Self> = long_running(spec).map(Self::of_container).collect();
         let (pod_requests, pod_limits) = Amounts::from_requirements(spec.resources.as_ref());
         Self {
             requests: Amounts {
@@ -600,6 +645,17 @@ impl PodBudget {
             },
         }
     }
+}
+
+/// The containers that run alongside each other once a pod has started: its containers and
+/// restartable (sidecar) init containers.
+fn long_running(spec: &PodSpec) -> impl Iterator<Item = &Container> {
+    let sidecars = spec
+        .init_containers
+        .iter()
+        .flatten()
+        .filter(|c| c.restart_policy.as_deref() == Some("Always"));
+    spec.containers.iter().chain(sidecars)
 }
 
 /// The sum of the values that are set, or `None` if none is.
