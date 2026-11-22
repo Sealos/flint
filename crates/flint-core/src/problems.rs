@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use k8s_openapi::api::apps::v1::{
-    DaemonSet, Deployment, StatefulSet, StatefulSetSpec, StatefulSetStatus,
+    DaemonSet, Deployment, ReplicaSet, StatefulSet, StatefulSetSpec, StatefulSetStatus,
 };
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ContainerStateTerminated, ContainerStatus, Node, Pod, PodSpec};
@@ -325,12 +325,23 @@ impl ProblemOwner {
     }
 }
 
+/// The outcome of reading a cluster's ReplicaSets, for [`ReplicaSetIndex::from_read`].
+#[derive(Clone, Copy, Debug)]
+pub enum ReplicaSetRead<'a> {
+    /// Every ReplicaSet the pods being classified could belong to.
+    Complete(&'a [ReplicaSet]),
+    /// Some ReplicaSets, such as a list that failed part way through its pages. A ReplicaSet
+    /// missing from these says nothing about the pod that names it, so they are not used.
+    Partial(&'a [ReplicaSet]),
+    /// The read failed.
+    Failed,
+}
+
 /// ReplicaSet metadata for resolving pods to their Deployments, or the fact that there is none.
 ///
-/// Collecting metadata into an index states that it is a complete read. When the ReplicaSets could
-/// not be read, use [`Self::unavailable`]. There is no default, so a caller has to say which it is.
-/// A pod's owner is known only if a complete read holds its ReplicaSet; see
-/// [`Problem::owner_known`].
+/// Build one with [`Self::from_read`], or [`Self::unavailable`] when the ReplicaSets could not be
+/// read. There is no default, so a caller has to say which it is. A pod's owner is known only if a
+/// complete read holds its ReplicaSet; see [`Problem::owner_known`].
 ///
 /// Looked up by the UID in the pod's owner reference, within the pod's namespace, so a ReplicaSet
 /// recreated under the same name or one in another namespace is never mistaken for the owner.
@@ -341,8 +352,28 @@ pub struct ReplicaSetIndex<'a> {
     by_uid: Option<HashMap<&'a str, &'a ObjectMeta>>,
 }
 
+/// Test fixtures hold bare metadata. Production code goes through [`ReplicaSetIndex::from_read`],
+/// so that collecting a partial list cannot state that it is complete.
+#[cfg(test)]
 impl<'a> FromIterator<&'a ObjectMeta> for ReplicaSetIndex<'a> {
     fn from_iter<I: IntoIterator<Item = &'a ObjectMeta>>(replica_sets: I) -> Self {
+        Self::complete(replica_sets)
+    }
+}
+
+impl<'a> ReplicaSetIndex<'a> {
+    /// The index for the outcome of a read. Only a complete read can resolve an owner: a partial
+    /// or failed one is [`Self::unavailable`], never an empty set of owners.
+    pub fn from_read(read: ReplicaSetRead<'a>) -> Self {
+        match read {
+            ReplicaSetRead::Complete(replica_sets) => {
+                Self::complete(replica_sets.iter().map(|replica_set| &replica_set.metadata))
+            }
+            ReplicaSetRead::Partial(_) | ReplicaSetRead::Failed => Self::unavailable(),
+        }
+    }
+
+    fn complete(replica_sets: impl IntoIterator<Item = &'a ObjectMeta>) -> Self {
         let by_uid = replica_sets
             .into_iter()
             .filter_map(|meta| Some((meta.uid.as_deref()?, meta)))
@@ -503,9 +534,10 @@ impl Classifier {
         }
     }
 
-    /// The problems of every pod, in order, with no ReplicaSet metadata: the owner of a
-    /// ReplicaSet-owned pod is not known.
-    pub fn pods<'a>(&self, pods: impl IntoIterator<Item = &'a Pod>) -> Vec<Problem> {
+    /// The problems of every pod during a ReplicaSet outage. Test-only, so production code has to
+    /// choose an index.
+    #[cfg(test)]
+    pub(crate) fn pods<'a>(&self, pods: impl IntoIterator<Item = &'a Pod>) -> Vec<Problem> {
         self.pods_with_replica_sets(pods, &ReplicaSetIndex::unavailable())
     }
 
@@ -522,16 +554,12 @@ impl Classifier {
         out
     }
 
-    /// Appends the problems of one pod, at most one per container.
+    /// Appends the problems of one pod, at most one per container, resolving its owner through
+    /// `replica_sets`.
     ///
     /// A deleting or succeeded pod has none. A failed pod will not restart, so it can only report
     /// an OOM kill that ended its final run. The same holds for ephemeral containers, which are
     /// never restarted, so a debug container with a mistyped image does not mark its pod.
-    pub fn pod(&self, pod: &Pod, out: &mut Vec<Problem>) {
-        self.pod_with_replica_sets(pod, &ReplicaSetIndex::unavailable(), out);
-    }
-
-    /// As [`Self::pod`], resolving the pod's owner through `replica_sets`.
     pub fn pod_with_replica_sets(
         &self,
         pod: &Pod,
