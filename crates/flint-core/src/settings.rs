@@ -1181,29 +1181,41 @@ pub(crate) fn edit_settings(
     dir: &Path,
     edit: impl FnOnce(&mut toml::Table, &Path) -> Result<(), SettingsError>,
 ) -> Result<Settings, SettingsError> {
+    edit_settings_if_changed(dir, |table, path| edit(table, path).map(|()| true))
+}
+
+/// [`edit_settings`] for an edit that may find nothing to do once it holds the lock: when `edit`
+/// returns `false`, the file is not written, or created, and the settings it holds are returned.
+pub(crate) fn edit_settings_if_changed(
+    dir: &Path,
+    edit: impl FnOnce(&mut toml::Table, &Path) -> Result<bool, SettingsError>,
+) -> Result<Settings, SettingsError> {
     let path = dir.join(SETTINGS_FILE);
     let lock = lock_for_save(&path, try_flock)?;
     edit_locked(&path, &lock, edit)
 }
 
-/// The read, edit and write of [`edit_settings`], all on the file `lock` was taken for. If
-/// `path` has come to lead elsewhere by the time of the write, nothing is written.
+/// The read, edit and write of [`edit_settings_if_changed`], all on the file `lock` was taken
+/// for. If `path` has come to lead elsewhere by the time of the write, nothing is written.
 fn edit_locked(
     path: &Path,
     lock: &SaveLock,
-    edit: impl FnOnce(&mut toml::Table, &Path) -> Result<(), SettingsError>,
+    edit: impl FnOnce(&mut toml::Table, &Path) -> Result<bool, SettingsError>,
 ) -> Result<Settings, SettingsError> {
     let mut table = match read_settings_text(&lock.target)? {
         Some(text) => parse_settings(&text, path)?.1,
         None => toml::Table::new(),
     };
-    edit(&mut table, path)?;
+    let changed = edit(&mut table, path)?;
     let text = toml::to_string_pretty(&table)?;
     let settings: Settings = toml::from_str(&text).map_err(|source| SettingsError::Parse {
         path: path.to_owned(),
         source,
     })?;
     validate(&settings, path)?;
+    if !changed {
+        return Ok(settings);
+    }
     let write_error = |source| SettingsError::Write {
         path: path.to_owned(),
         source,
@@ -1739,7 +1751,7 @@ mod save_lock_tests {
             std::fs::remove_file(&link).unwrap();
             std::os::unix::fs::symlink(&new, &link).unwrap();
             table.insert("appearance".into(), "dark".into());
-            Ok(())
+            Ok(true)
         });
         assert!(matches!(result, Err(SettingsError::Write { .. })));
         assert_eq!(std::fs::read_to_string(&old).unwrap(), old_text);
@@ -1764,7 +1776,7 @@ mod save_lock_tests {
             assert!(lock.file.is_none());
             edit_locked(&path, &lock, |table, _| {
                 table.remove("trusted_clusters");
-                Ok(())
+                Ok(true)
             })
             .unwrap();
             assert!(

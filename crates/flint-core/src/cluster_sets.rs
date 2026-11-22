@@ -11,7 +11,9 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::display::{MAX_CUSTOM_NAME_CHARS, clean_custom_name, cluster_name_key};
-use crate::settings::{ClusterPin, Settings, SettingsError, edit_settings, load_settings};
+use crate::settings::{
+    ClusterPin, Settings, SettingsError, edit_settings_if_changed, load_settings,
+};
 
 /// The key of the setting in `settings.toml`.
 pub(crate) const SECTION_KEY: &str = "cluster_sets";
@@ -68,7 +70,7 @@ impl ClusterSet {
     }
 
     /// Each member with its status, in order. `current_server` gives the server a context points
-    /// at now, or `None` when the context is gone or has no server.
+    /// at now, or `None` when the context is gone or has no server. A blank server is no server.
     pub fn member_statuses<'s>(
         &self,
         current_server: impl Fn(&str) -> Option<&'s str>,
@@ -76,7 +78,8 @@ impl ClusterSet {
         self.members
             .iter()
             .map(|pin| {
-                let status = match current_server(&pin.context) {
+                let server = current_server(&pin.context).filter(|s| !s.trim().is_empty());
+                let status = match server {
                     Some(server) if pin.matches(&pin.context, server) => MemberStatus::Current,
                     Some(_) => MemberStatus::Changed,
                     None => MemberStatus::Missing,
@@ -110,7 +113,7 @@ pub fn create_cluster_set(
             return Err(name_taken(path, &set.name));
         }
         entries.push(toml::Value::try_from(&set)?);
-        Ok(())
+        Ok(true)
     })
 }
 
@@ -148,7 +151,7 @@ pub fn rename_cluster_set(
         });
         let table = entries[index].as_table_mut().expect("a readable entry");
         table.insert("name".into(), toml::Value::String(cleaned));
-        Ok(())
+        Ok(true)
     })
 }
 
@@ -163,19 +166,27 @@ pub fn delete_cluster_set(dir: &Path, name: &str) -> Result<Settings, SettingsEr
     if !settings.cluster_sets.iter().any(|set| set.key() == key) {
         return Ok(settings);
     }
+    remove_entries(dir, &key)
+}
+
+/// Removes the sets under `key` while holding the save lock. If another save got there first,
+/// nothing is removed and the file is not written.
+fn remove_entries(dir: &Path, key: &str) -> Result<Settings, SettingsError> {
     edit_entries(dir, |entries, _| {
+        let before = entries.len();
         entries.retain(|entry| readable(entry).is_none_or(|set| set.key() != key));
-        Ok(())
+        Ok(entries.len() != before)
     })
 }
 
-/// Edits the raw entries under the save lock, so entries this version cannot read survive. A
-/// `cluster_sets` that is not a list is an error and leaves the file as it is.
+/// Edits the raw entries under the save lock, so entries this version cannot read survive. The
+/// file is written only when `edit` returns `true`. A `cluster_sets` that is not a list is an
+/// error and leaves the file as it is.
 fn edit_entries(
     dir: &Path,
-    edit: impl FnOnce(&mut Vec<toml::Value>, &Path) -> Result<(), SettingsError>,
+    edit: impl FnOnce(&mut Vec<toml::Value>, &Path) -> Result<bool, SettingsError>,
 ) -> Result<Settings, SettingsError> {
-    edit_settings(dir, |table, path| {
+    edit_settings_if_changed(dir, |table, path| {
         let mut entries = match table.remove(SECTION_KEY) {
             Some(toml::Value::Array(entries)) => entries,
             None => Vec::new(),
@@ -183,11 +194,11 @@ fn edit_entries(
                 return Err(invalid(path, format!("{SECTION_KEY} is not a list")));
             }
         };
-        edit(&mut entries, path)?;
+        let changed = edit(&mut entries, path)?;
         if !entries.is_empty() {
             table.insert(SECTION_KEY.into(), toml::Value::Array(entries));
         }
-        Ok(())
+        Ok(changed)
     })
 }
 
@@ -414,6 +425,47 @@ members = [{ context = "only-one", server = "https://e" }]
         delete_cluster_set(dir.path(), "gone").unwrap();
         delete_cluster_set(dir.path(), "bad\nname").unwrap();
         assert_eq!(read(dir.path()), text);
+    }
+
+    #[test]
+    fn a_delete_that_loses_the_race_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = cluster_name_key("gone");
+
+        let settings = remove_entries(dir.path(), &key).unwrap();
+        assert!(settings.cluster_sets.is_empty());
+        assert!(
+            !dir.path().join(SETTINGS_FILE).exists(),
+            "a removed file is not recreated"
+        );
+
+        let text = "# a comment\nprotect_local_clusters = true\n\n[[cluster_sets]]\nname = \"keep\"\nmembers = [{ context = \"a\", server = \"https://a\" }, { context = \"b\", server = \"https://b\" }]\n";
+        write(dir.path(), text);
+        let settings = remove_entries(dir.path(), &key).unwrap();
+        assert_eq!(names(&settings), ["keep"]);
+        assert!(settings.protect_local_clusters);
+        assert_eq!(read(dir.path()), text);
+    }
+
+    #[test]
+    fn a_blank_server_is_missing_not_changed() {
+        let set = ClusterSet::new(
+            "set",
+            vec![
+                ClusterPin::new("empty", "https://empty:6443"),
+                ClusterPin::new("spaces", "https://spaces:6443"),
+            ],
+        )
+        .unwrap();
+        let statuses = set.member_statuses(|context| match context {
+            "empty" => Some(""),
+            _ => Some("  \t"),
+        });
+        assert!(
+            statuses
+                .iter()
+                .all(|(_, status)| *status == MemberStatus::Missing)
+        );
     }
 
     #[test]
