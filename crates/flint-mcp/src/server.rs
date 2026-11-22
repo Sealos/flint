@@ -2,7 +2,7 @@
 //! once), recomputes the kubeconfig file list from it, reloads kubeconfig when a file changed,
 //! checks the cluster against the opt-in list, and only then touches the network.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -10,7 +10,9 @@ use std::time::Duration;
 use flint_core::activity;
 use flint_core::cache::{SlotMap, slot};
 use flint_core::cluster::{self, ClusterError, Target};
-use flint_core::kubeconfig::{self, ContextInfo, FileStamps, LoadedKubeconfig};
+use flint_core::kubeconfig::{
+    self, ConfirmedDefinitions, ContextInfo, FileStamps, LoadedKubeconfig,
+};
 use flint_core::read::{self, KindInfo, ResolveKindError};
 use flint_core::settings;
 use flint_core::table::{self, TablePage};
@@ -51,8 +53,10 @@ struct Inner {
     /// appended on each call.
     kubeconfig_base: Vec<PathBuf>,
     home: Option<PathBuf>,
-    /// The last parsed kubeconfig and the file stamps it was parsed from.
-    kubeconfig: Mutex<Option<(FileStamps, Arc<LoadedKubeconfig>)>>,
+    /// The last parsed kubeconfig.
+    kubeconfig: Mutex<Option<ParsedKubeconfig>>,
+    /// Held across a parse, so loads are recorded in the order they read the files.
+    confirmed: Mutex<ConfirmedDefinitions>,
     clients: SlotMap<Client>,
     discovery: SlotMap<Discovered>,
     /// Which program this is, for advice that can be followed where it runs.
@@ -61,6 +65,18 @@ struct Inner {
     warned_scopes: std::sync::Mutex<std::collections::HashSet<String>>,
     /// How many tool calls run and wait, and the reply bytes not yet written (#252).
     admission: Admission,
+}
+
+/// One parse of the kubeconfig files, and what it decided.
+struct ParsedKubeconfig {
+    /// The file stamps it was parsed from.
+    stamps: FileStamps,
+    kubeconfig: Arc<LoadedKubeconfig>,
+    /// The contexts this load paused, judged when it was recorded so that a call never reads
+    /// them against a later load.
+    paused: Arc<HashSet<String>>,
+    /// An emptied file is settling, so the same stamps must be parsed again.
+    settling: bool,
 }
 
 /// The longest a call waits for its activity record to be written, rather than hold its reply.
@@ -648,6 +664,7 @@ impl FlintMcp {
                 kubeconfig_base,
                 home,
                 kubeconfig: Mutex::default(),
+                confirmed: Mutex::default(),
                 clients: Mutex::default(),
                 discovery: Mutex::default(),
                 warned_scopes: std::sync::Mutex::default(),
@@ -933,6 +950,8 @@ impl ServerHandler for FlintMcp {
 struct CallContext {
     settings: flint_core::Settings,
     kubeconfig: Arc<LoadedKubeconfig>,
+    /// The contexts this kubeconfig paused: refused before any client is built.
+    paused: Arc<HashSet<String>>,
 }
 
 impl FlintMcp {
@@ -956,10 +975,11 @@ impl FlintMcp {
                 &settings,
                 inner.home.as_deref(),
             );
-            let kubeconfig = inner.load_kubeconfig(&paths);
+            let (kubeconfig, paused) = inner.load_kubeconfig(&paths);
             Ok(CallContext {
                 settings,
                 kubeconfig,
+                paused,
             })
         })
         .await?
@@ -986,13 +1006,16 @@ impl FlintMcp {
             .lock()
             .unwrap()
             .as_ref()
-            .is_some_and(|(_, loaded)| loaded.context(name).is_some())
+            .is_some_and(|parsed| parsed.kubeconfig.context(name).is_some())
     }
 
     /// The client for an exposed cluster. Clients are cached per context and rebuilt when the
     /// context's kubeconfig entries change.
     async fn client(&self, ctx: &CallContext, name: &str) -> Result<Conn, ToolError> {
         let info = policy::exposed_cluster(&ctx.settings, &ctx.kubeconfig, name)?;
+        if ctx.paused.contains(name) {
+            return Err(ToolError::new(policy::paused_cluster(name)));
+        }
         // The server this call's settings expose the cluster at: what its record names.
         let _ = CALL.try_with(|c| {
             let mut note = c.borrow_mut();
@@ -1712,19 +1735,45 @@ impl FlintMcp {
 
 impl Inner {
     /// The merged kubeconfig for `paths`, parsed again only when a file changed. Exec auth
-    /// plugins are set to never prompt: stdin is the MCP stream.
-    fn load_kubeconfig(&self, paths: &[PathBuf]) -> Arc<LoadedKubeconfig> {
+    /// plugins are set to never prompt: stdin is the MCP stream. Also returns the contexts that
+    /// load paused. `self.kubeconfig` is never held across the parse, since a call's record reads
+    /// it from async code and a file can stall.
+    fn load_kubeconfig(&self, paths: &[PathBuf]) -> (Arc<LoadedKubeconfig>, Arc<HashSet<String>>) {
+        if let Some(parsed) = self.parsed(&FileStamps::of(paths)) {
+            return parsed;
+        }
+        let mut confirmed = self.confirmed.lock().unwrap();
+        // Stamped before the parse, and after waiting for any parse ahead of this one.
         let stamps = FileStamps::of(paths);
-        if let Some((cached, loaded)) = &*self.kubeconfig.lock().unwrap()
-            && *cached == stamps
-        {
-            return loaded.clone();
+        if let Some(parsed) = self.parsed(&stamps) {
+            return parsed;
         }
         let mut loaded = kubeconfig::load(paths);
         cluster::disable_interactive_exec(&mut loaded.merged);
-        let loaded = Arc::new(loaded);
-        *self.kubeconfig.lock().unwrap() = Some((stamps, loaded.clone()));
-        loaded
+        confirmed.record(&mut loaded, &stamps);
+        let paused: HashSet<String> = loaded
+            .contexts
+            .iter()
+            .filter(|info| confirmed.paused(&loaded, &info.name))
+            .map(|info| info.name.clone())
+            .collect();
+        let (loaded, paused) = (Arc::new(loaded), Arc::new(paused));
+        *self.kubeconfig.lock().unwrap() = Some(ParsedKubeconfig {
+            stamps,
+            kubeconfig: loaded.clone(),
+            paused: paused.clone(),
+            settling: confirmed.settling(),
+        });
+        (loaded, paused)
+    }
+
+    /// The last parse, if it still stands for files stamped `stamps`.
+    fn parsed(&self, stamps: &FileStamps) -> Option<(Arc<LoadedKubeconfig>, Arc<HashSet<String>>)> {
+        let cached = self.kubeconfig.lock().unwrap();
+        let parsed = cached
+            .as_ref()
+            .filter(|parsed| parsed.stamps == *stamps && !parsed.settling)?;
+        Some((parsed.kubeconfig.clone(), parsed.paused.clone()))
     }
 }
 

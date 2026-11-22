@@ -19,7 +19,7 @@ use futures::future::BoxFuture;
 use tokio::time::{Instant, Sleep};
 
 use crate::cluster::context_fingerprint;
-use crate::kubeconfig::{BlankFile, LoadedKubeconfig};
+use crate::kubeconfig::{BlankFile, FileStamps, LoadedKubeconfig};
 use crate::settings::server_identity;
 
 /// How often a running session checks its context still points at the server it opened on.
@@ -502,6 +502,139 @@ impl ContextHistory {
     }
 }
 
+/// How long a kubeconfig file that defined something must stay emptied and unwritten before it
+/// counts as really empty. A writer that truncates first is done well within this.
+pub(crate) const EMPTY_SETTLE: Duration = Duration::from_secs(5);
+
+/// A file's modification time and size.
+type Stamp = Option<(std::time::SystemTime, u64)>;
+
+/// The files found emptied and still waiting to count as really empty: since when, and the
+/// stamp they had then.
+#[derive(Debug, Default)]
+pub(crate) struct EmptiedFiles(HashMap<PathBuf, (std::time::Instant, Stamp)>);
+
+impl EmptiedFiles {
+    /// Of the files in `blank` that mattered when they last loaded, those not yet emptied and
+    /// unwritten for `settle`. Those still count as failed.
+    pub fn waiting(
+        &mut self,
+        history: &ContextHistory,
+        blank: &[BlankFile],
+        now: std::time::Instant,
+        settle: Duration,
+    ) -> Vec<BlankFile> {
+        let emptied: Vec<&BlankFile> = blank
+            .iter()
+            .filter(|file| history.file_mattered(&file.path))
+            .collect();
+        self.0
+            .retain(|path, _| emptied.iter().any(|file| &file.path == path));
+        let mut waiting = Vec::new();
+        for file in emptied {
+            let since = match self.0.get(&file.path) {
+                Some((since, stamp)) if *stamp == file.stamp => *since,
+                _ => {
+                    self.0.insert(file.path.clone(), (now, file.stamp));
+                    now
+                }
+            };
+            if now.duration_since(since) < settle {
+                waiting.push(file.clone());
+            }
+        }
+        waiting
+    }
+}
+
+/// Each context's definition when a load last showed it with no unreadable file that could
+/// change it.
+#[derive(Debug, Default)]
+pub(crate) struct SettledDefinitions(HashMap<String, Option<u64>>);
+
+impl SettledDefinitions {
+    /// Whether `name`, showing the definition `shown`, may be a later file's fallback and differs
+    /// from its confirmed definition. One that matches it, or that no load ever confirmed, is
+    /// not paused.
+    pub fn paused(&self, history: &ContextHistory, name: &str, shown: Option<u64>) -> bool {
+        history.provisional(name)
+            && self
+                .0
+                .get(name)
+                .is_some_and(|confirmed| *confirmed != shown)
+    }
+
+    /// Takes the definitions `loaded`, already recorded in `history`, confirms. Returns the
+    /// contexts whose confirmed definition this changed.
+    pub fn update(&mut self, history: &ContextHistory, loaded: &LoadedKubeconfig) -> Vec<String> {
+        let mut changed = Vec::new();
+        for info in &loaded.contexts {
+            if history.provisional(&info.name) {
+                continue;
+            }
+            let definition = context_fingerprint(&loaded.merged, &info.name);
+            let before = self.0.insert(info.name.clone(), definition);
+            if before.is_some_and(|b| b != definition) {
+                changed.push(info.name.clone());
+            }
+        }
+        changed
+    }
+}
+
+/// Which contexts' definitions are confirmed across kubeconfig loads, for a process that reads
+/// the files itself. It applies the desktop app's rule: while a file can't be read, a context
+/// showing anything but its confirmed definition is paused, and one unchanged from it goes on.
+#[derive(Debug, Default)]
+pub struct ConfirmedDefinitions {
+    history: ContextHistory,
+    settled: SettledDefinitions,
+    emptied: EmptiedFiles,
+    settling: bool,
+}
+
+impl ConfirmedDefinitions {
+    /// Records a load of the files stamped `stamps` (taken before it). A file that gave something
+    /// and is now empty counts as failed in `loaded` until it has stayed so for a moment.
+    pub fn record(&mut self, loaded: &mut LoadedKubeconfig, stamps: &FileStamps) {
+        self.record_at(loaded, stamps, std::time::Instant::now(), EMPTY_SETTLE);
+    }
+
+    fn record_at(
+        &mut self,
+        loaded: &mut LoadedKubeconfig,
+        stamps: &FileStamps,
+        now: std::time::Instant,
+        settle: Duration,
+    ) {
+        let blank: Vec<BlankFile> = loaded
+            .blank
+            .iter()
+            .map(|path| BlankFile {
+                path: path.clone(),
+                stamp: stamps.stamp(path),
+            })
+            .collect();
+        let waiting = self.emptied.waiting(&self.history, &blank, now, settle);
+        self.settling = !waiting.is_empty();
+        self.history.fail_emptied(loaded, &waiting);
+        self.history.record(loaded);
+        self.settled.update(&self.history, loaded);
+    }
+
+    /// Whether an emptied file is still settling: the same files must be loaded again later,
+    /// even unchanged, for it to count as really empty.
+    pub fn settling(&self) -> bool {
+        self.settling
+    }
+
+    /// Whether nothing new may start on `name` in `loaded`, the load last recorded.
+    pub fn paused(&self, loaded: &LoadedKubeconfig, name: &str) -> bool {
+        let shown = context_fingerprint(&loaded.merged, name);
+        self.settled.paused(&self.history, name, shown)
+    }
+}
+
 /// What a fresh read of the kubeconfig files says of a pinned definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FreshDefinition {
@@ -663,6 +796,97 @@ mod tests {
         h.record(&next);
         assert!(h.provisional("dev"));
         assert!(!h.definition_holds("dev", &pin));
+    }
+
+    /// Two files, in order: `first` and `second`, each loaded through `confirmed`.
+    fn load_files(
+        confirmed: &mut ConfirmedDefinitions,
+        paths: &[PathBuf],
+        at: std::time::Instant,
+    ) -> LoadedKubeconfig {
+        let stamps = FileStamps::of(paths);
+        let mut loaded = crate::kubeconfig::load(paths);
+        confirmed.record_at(&mut loaded, &stamps, at, Duration::from_secs(5));
+        loaded
+    }
+
+    fn config(token: &str) -> String {
+        format!(
+            "clusters:\n- name: c\n  cluster:\n    server: https://one\n\
+             contexts:\n- name: dev\n  context:\n    cluster: c\n    user: u\n\
+             users:\n- name: u\n  user:\n    token: {token}\n"
+        )
+    }
+
+    // covers UP-54: with an earlier file unreadable, a context showing its confirmed definition
+    // goes on, one showing another is paused, and repairing the file ends the pause.
+    #[test]
+    fn a_context_is_paused_only_on_a_definition_it_never_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+        let paths = [first.clone(), second.clone()];
+        let now = std::time::Instant::now();
+        std::fs::write(&first, config("one")).unwrap();
+        std::fs::write(&second, config("two")).unwrap();
+        let mut confirmed = ConfirmedDefinitions::default();
+        let loaded = load_files(&mut confirmed, &paths, now);
+        assert!(!confirmed.paused(&loaded, "dev"));
+
+        std::fs::write(&first, "not: [valid").unwrap();
+        let loaded = load_files(&mut confirmed, &paths, now);
+        assert!(confirmed.paused(&loaded, "dev"), "the second file's entry");
+
+        std::fs::write(&second, config("one")).unwrap();
+        let loaded = load_files(&mut confirmed, &paths, now);
+        assert!(!confirmed.paused(&loaded, "dev"), "same as confirmed");
+
+        std::fs::write(&second, config("two")).unwrap();
+        std::fs::write(&first, config("one")).unwrap();
+        let loaded = load_files(&mut confirmed, &paths, now);
+        assert!(!confirmed.paused(&loaded, "dev"), "repaired");
+    }
+
+    // covers UP-54: a file first seen broken gives no confirmed definition, so nothing pauses.
+    #[test]
+    fn a_context_first_seen_with_a_broken_file_is_not_paused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+        std::fs::write(&first, "not: [valid").unwrap();
+        std::fs::write(&second, config("two")).unwrap();
+        let mut confirmed = ConfirmedDefinitions::default();
+        let paths = [first, second];
+        let loaded = load_files(&mut confirmed, &paths, std::time::Instant::now());
+        assert!(!confirmed.paused(&loaded, "dev"));
+    }
+
+    // covers UP-54: an emptied file counts as failed while it settles, then as really empty, the
+    // same as in the app; a file that gave nothing is an ordinary empty file throughout.
+    #[test]
+    fn an_emptied_file_pauses_until_it_settles() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+        let paths = [first.clone(), second.clone()];
+        let now = std::time::Instant::now();
+        std::fs::write(&first, config("one")).unwrap();
+        std::fs::write(&second, config("two")).unwrap();
+        let mut confirmed = ConfirmedDefinitions::default();
+        load_files(&mut confirmed, &paths, now);
+
+        std::fs::write(&first, "").unwrap();
+        let loaded = load_files(&mut confirmed, &paths, now);
+        assert!(confirmed.settling());
+        assert_eq!(loaded.errors.len(), 1);
+        assert!(confirmed.paused(&loaded, "dev"));
+
+        let later = now + Duration::from_secs(5);
+        let loaded = load_files(&mut confirmed, &paths, later);
+        assert!(!confirmed.settling());
+        assert!(loaded.errors.is_empty());
+        assert!(!confirmed.paused(&loaded, "dev"), "the change is confirmed");
+
+        let mut fresh = ConfirmedDefinitions::default();
+        let loaded = load_files(&mut fresh, &paths, now);
+        assert!(!fresh.settling() && loaded.errors.is_empty());
     }
 
     const STAGING: Option<&str> = Some("https://staging");

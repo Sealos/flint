@@ -15,6 +15,7 @@ use kube::config::{Kubeconfig, KubeconfigError, NamedContext};
 use tokio::sync::{Mutex, OwnedMutexGuard, oneshot};
 use tokio::time::Instant;
 
+pub use crate::recheck::ConfirmedDefinitions;
 use crate::settings::{Settings, expand_tilde};
 
 /// One kubeconfig context, as Flint shows it in the sidebar.
@@ -146,6 +147,11 @@ pub struct FileStamps(Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>);
 impl FileStamps {
     pub fn of(paths: &[PathBuf]) -> Self {
         FileStamps(paths.iter().map(|p| (p.clone(), file_stamp(p))).collect())
+    }
+
+    /// The stamp of `path`, if it is one of these files and could be checked.
+    pub(crate) fn stamp(&self, path: &Path) -> Option<(std::time::SystemTime, u64)> {
+        self.0.iter().find(|(p, _)| p == path).and_then(|(_, s)| *s)
     }
 }
 

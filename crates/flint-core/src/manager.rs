@@ -25,7 +25,10 @@ use crate::kubeconfig::{
 use crate::logs::{self, KubeLogSource, KubePodSource, LogError, SessionConfig};
 use crate::protection::{ClusterClients, GatedClient, SessionUnlocks, WriteRefusal, protection};
 use crate::read::{self, KindId, KindInfo};
-use crate::recheck::{ContextHistory, ContextPin, FreshDefinition, Pinned};
+use crate::recheck::{
+    ContextHistory, ContextPin, EMPTY_SETTLE, EmptiedFiles, FreshDefinition, Pinned,
+    SettledDefinitions,
+};
 use crate::settings::{self, AiScope, Settings, server_identity};
 use crate::store::{KindSnapshot, SyncState};
 use crate::watch::{ClusterWatches, EngineConfig, HubRegistry, KubeSource};
@@ -158,10 +161,6 @@ impl Cluster {
         }
     }
 }
-
-/// How long a kubeconfig file that defined something must stay emptied and unwritten before it
-/// counts as really empty. A writer that truncates first is done well within this.
-const EMPTY_SETTLE: Duration = Duration::from_secs(5);
 
 /// The pause before reading again files that were still changing when a read gave up.
 const READ_AGAIN_AFTER: Duration = Duration::from_millis(250);
@@ -409,9 +408,8 @@ pub(crate) struct ClusterManager {
     write_checks: Arc<()>,
     /// Which reads count ([`ReadMarks`]).
     marks: ReadMarks,
-    /// The files found emptied and still waiting to count as really empty: since when, and
-    /// their stamp then.
-    emptied: HashMap<PathBuf, (Instant, Option<(std::time::SystemTime, u64)>)>,
+    /// The files found emptied and still waiting to count as really empty.
+    emptied: EmptiedFiles,
     /// How long a file must stay emptied, unwritten, before it counts as really empty.
     empty_settle: Duration,
     /// A follow-up read of emptied files is scheduled.
@@ -442,7 +440,7 @@ pub(crate) struct ClusterManager {
     held: HashSet<ClusterId>,
     /// Each context's definition when a load last showed it with no unreadable file that could
     /// change it.
-    settled: HashMap<ClusterId, Option<u64>>,
+    settled: SettledDefinitions,
 }
 
 impl ClusterManager {
@@ -488,7 +486,7 @@ impl ClusterManager {
             log_budget,
             unlocks,
             held: HashSet::new(),
-            settled: HashMap::new(),
+            settled: SettledDefinitions::default(),
             reader: KubeconfigReader::default(),
             stalled_on: None,
             read_seq: 0,
@@ -497,7 +495,7 @@ impl ClusterManager {
             refresh_only: false,
             write_checks: Arc::default(),
             marks: ReadMarks::default(),
-            emptied: HashMap::new(),
+            emptied: EmptiedFiles::default(),
             empty_settle: EMPTY_SETTLE,
             settle_armed: false,
         }
@@ -1785,13 +1783,9 @@ impl ClusterManager {
     /// matches it, or that no load ever confirmed, connects as usual.
     fn paused(&self, id: &str) -> bool {
         self.held(id)
-            || self.cluster(id).is_some_and(|slot| {
-                self.contexts.provisional(id)
-                    && self
-                        .settled
-                        .get(id)
-                        .is_some_and(|confirmed| *confirmed != slot.fingerprint)
-            })
+            || self
+                .cluster(id)
+                .is_some_and(|slot| self.settled.paused(&self.contexts, id, slot.fingerprint))
     }
 
     /// Reads the kubeconfig files now, ahead of the file watcher, and says whether they still
@@ -1869,26 +1863,9 @@ impl ClusterManager {
     /// unwritten for [`Self::empty_settle`]. Those still count as failed, and a follow-up read
     /// is scheduled for them.
     fn still_settling(&mut self, blank: &[BlankFile]) -> Vec<BlankFile> {
-        let now = Instant::now();
-        let emptied: Vec<&BlankFile> = blank
-            .iter()
-            .filter(|file| self.contexts.file_mattered(&file.path))
-            .collect();
-        self.emptied
-            .retain(|path, _| emptied.iter().any(|file| &file.path == path));
-        let mut waiting = Vec::new();
-        for file in emptied {
-            let since = match self.emptied.get(&file.path) {
-                Some((since, stamp)) if *stamp == file.stamp => *since,
-                _ => {
-                    self.emptied.insert(file.path.clone(), (now, file.stamp));
-                    now
-                }
-            };
-            if now.duration_since(since) < self.empty_settle {
-                waiting.push(file.clone());
-            }
-        }
+        let waiting =
+            self.emptied
+                .waiting(&self.contexts, blank, Instant::now(), self.empty_settle);
         if !waiting.is_empty() && !self.settle_armed {
             self.settle_armed = true;
             let (internal, after) = (self.internal_tx.clone(), self.empty_settle);
@@ -2230,14 +2207,9 @@ impl ClusterManager {
         self.contexts.record(&loaded);
         // An unlock names only the server. A context that comes out of an uncertain spell on
         // another definition may hold another user or token there, so it is locked again.
-        for info in &loaded.contexts {
-            if self.contexts.provisional(&info.name) {
-                continue;
-            }
-            let definition = cluster::context_fingerprint(&loaded.merged, &info.name);
-            let before = self.settled.insert(info.name.clone(), definition);
-            if uncertain.contains(info.name.as_str()) && before.is_some_and(|b| b != definition) {
-                self.unlocks.lock(&info.name);
+        for name in self.settled.update(&self.contexts, &loaded) {
+            if uncertain.contains(name.as_str()) {
+                self.unlocks.lock(&name);
             }
         }
         // A context that a file which can't be parsed defined is not gone: keep its slot, in its

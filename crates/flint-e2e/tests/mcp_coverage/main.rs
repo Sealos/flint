@@ -6,6 +6,7 @@
 
 mod activity;
 mod boundary;
+mod kubeconfig_files;
 mod redaction;
 mod scope;
 mod support;
