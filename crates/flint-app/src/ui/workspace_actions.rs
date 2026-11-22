@@ -46,7 +46,7 @@ use super::super::registry::{
     ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
     WatchOpenViewsOnly,
 };
-use super::super::registry::{BackToList, EditAiScope, ShowAgentActivity};
+use super::super::registry::{BackToList, EditAiScope, Handler, ShowAgentActivity};
 use super::super::registry::{
     CordonNode, DeleteObject, DrainNode, NamespacePickerNext, NamespacePickerPrevious,
     OpenNamespaceFilter, RestartObject, ScaleObject, ShowDrainReport, UncordonNode,
@@ -73,6 +73,20 @@ macro_rules! view_open {
     ($view:ident, $check:expr) => {
         |ws: &Workspace, cx: &App| $view(ws, cx).is_some_and($check)
     };
+}
+
+/// [`Forward`] without the list's Enter: it opens the selected row only when the rows have focus,
+/// so with focus in the navigation or the detail pane the action is not available (and Enter
+/// propagates), rather than reported as done when nothing opens.
+struct NotOnRows<B>(B);
+
+impl<E: InteractiveElement> Bind<ResourceList> for NotOnRows<Forward<E, ResourceList>> {
+    fn bind<A: Action>(self, handler: Handler<ResourceList, A>) -> Self {
+        if std::any::TypeId::of::<A>() == std::any::TypeId::of::<OpenSelectedRow>() {
+            return self;
+        }
+        Self(self.0.bind(handler))
+    }
 }
 
 impl Workspace {
@@ -167,7 +181,9 @@ impl Workspace {
     ) -> E {
         let element = Self::bind_actions(OnView::new(element, cx)).into_element();
         let element =
-            ResourceList::bind_actions(Forward::new(element, self.list.as_ref())).into_element();
+            ResourceList::bind_actions(NotOnRows(Forward::new(element, self.list.as_ref())))
+                .0
+                .into_element();
         // The detail pane follows the selected row, which may change between frames.
         let detail = ForwardCurrent::new(element, self, cx, |ws| ws.detail.as_ref());
         let element = DetailView::bind_actions(detail).into_element();
