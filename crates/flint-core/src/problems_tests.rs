@@ -783,6 +783,8 @@ fn severity_follows_the_kind() {
         (ProblemKind::NodeNotReady, ProblemSeverity::Critical),
         (ProblemKind::OomKilled, ProblemSeverity::Warning),
         (ProblemKind::JobFailed, ProblemSeverity::Warning),
+        (ProblemKind::ImagePull, ProblemSeverity::Critical),
+        (ProblemKind::WorkloadShort, ProblemSeverity::Warning),
     ] {
         assert_eq!(kind.severity(), severity, "{kind:?}");
     }
@@ -810,8 +812,593 @@ fn reasons_keep_their_kubernetes_spelling() {
         assert_eq!(ProblemReason::of_node(Some(name)), Some(reason));
         assert_eq!(reason.as_str(), name);
     }
+    for (name, reason) in [
+        ("ErrImagePull", ProblemReason::ErrImagePull),
+        ("ImagePullBackOff", ProblemReason::ImagePullBackOff),
+        ("InvalidImageName", ProblemReason::InvalidImageName),
+    ] {
+        assert_eq!(ProblemReason::of_image_pull(Some(name)), Some(reason));
+        assert_eq!(reason.as_str(), name);
+    }
+    assert_eq!(
+        ProblemReason::ProgressDeadlineExceeded.as_str(),
+        "ProgressDeadlineExceeded"
+    );
+    assert_eq!(
+        ProblemReason::MinimumReplicasUnavailable.as_str(),
+        "MinimumReplicasUnavailable"
+    );
     assert_eq!(ProblemReason::CrashLoopBackOff.as_str(), "CrashLoopBackOff");
     assert_eq!(ProblemReason::OomKilled.as_str(), "OOMKilled");
+}
+
+fn aged_pod(phase: &str, created_seconds_ago: i64, container: Value) -> Pod {
+    let created = (now() - SignedDuration::from_secs(created_seconds_ago)).to_string();
+    pod_with(
+        phase,
+        json!([]),
+        json!([container]),
+        json!({"creationTimestamp": created}),
+    )
+}
+
+#[test]
+fn image_pull_failures_are_classified() {
+    use ProblemReason as R;
+    let cases: Vec<(&str, &str, i64, Value, Option<ProblemReason>)> = vec![
+        (
+            "failed pull past the grace",
+            "Pending",
+            60,
+            status(0, waiting("ErrImagePull"), none()),
+            Some(R::ErrImagePull),
+        ),
+        (
+            "back-off past the grace",
+            "Pending",
+            600,
+            status(0, waiting("ImagePullBackOff"), none()),
+            Some(R::ImagePullBackOff),
+        ),
+        (
+            "failed pull inside the grace may still clear",
+            "Pending",
+            59,
+            status(0, waiting("ErrImagePull"), none()),
+            None,
+        ),
+        (
+            "back-off inside the grace may still clear",
+            "Pending",
+            59,
+            status(0, waiting("ImagePullBackOff"), none()),
+            None,
+        ),
+        (
+            "an invalid name cannot clear, so it has no grace",
+            "Pending",
+            1,
+            status(0, waiting("InvalidImageName"), none()),
+            Some(R::InvalidImageName),
+        ),
+        (
+            "a pull still running is not a failure",
+            "Pending",
+            600,
+            status(0, waiting("ContainerCreating"), none()),
+            None,
+        ),
+        (
+            "a failed pod will not pull again",
+            "Failed",
+            600,
+            status(0, waiting("ImagePullBackOff"), none()),
+            None,
+        ),
+        (
+            "the current pull failure outranks an earlier OOM kill",
+            "Running",
+            600,
+            status(
+                1,
+                waiting("ImagePullBackOff"),
+                ended("OOMKilled", 137, 9, 8),
+            ),
+            Some(R::ImagePullBackOff),
+        ),
+    ];
+    for (name, phase, age, container, expected) in cases {
+        let problems = pod_problems(&aged_pod(phase, age, container));
+        let got: Vec<_> = problems.iter().map(|p| (p.kind(), p.reason)).collect();
+        let want: Vec<_> = expected
+            .map(|reason| (ProblemKind::ImagePull, Some(reason)))
+            .into_iter()
+            .collect();
+        assert_eq!(got, want, "{name}");
+    }
+}
+
+#[test]
+fn an_image_pull_keeps_its_identity_between_retries() {
+    let failed = aged_pod("Pending", 600, status(0, waiting("ErrImagePull"), none()));
+    let backing_off = aged_pod(
+        "Pending",
+        600,
+        status(0, waiting("ImagePullBackOff"), none()),
+    );
+    assert_eq!(
+        pod_problems(&failed)[0].id,
+        pod_problems(&backing_off)[0].id
+    );
+}
+
+#[test]
+fn a_debug_container_with_a_bad_image_is_not_a_problem() {
+    let mut pod = aged_pod("Running", 600, status(0, running(5), none()));
+    let debug = serde_json::from_value(status(0, waiting("ImagePullBackOff"), none())).unwrap();
+    pod.status.as_mut().unwrap().ephemeral_container_statuses = Some(vec![debug]);
+    assert!(pod_problems(&pod).is_empty());
+}
+
+/// An object created an hour before [`NOW`], with `extra` merged into its metadata.
+fn workload_meta(extra: Value) -> Value {
+    let mut meta = json!({
+        "name": "w", "namespace": "ns", "uid": "uid-w", "generation": 2,
+        "creationTimestamp": ago(60),
+    });
+    meta.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    meta
+}
+
+fn condition(type_: &str, status: &str, reason: &str, minutes_ago: i64) -> Value {
+    json!({"type": type_, "status": status, "reason": reason, "lastTransitionTime": ago(minutes_ago)})
+}
+
+fn deployment(
+    meta: Value,
+    spec: Value,
+    available: i32,
+    updated: i32,
+    conditions: Value,
+) -> Deployment {
+    let mut full_spec = json!({"selector": {}, "template": {}});
+    full_spec
+        .as_object_mut()
+        .unwrap()
+        .extend(spec.as_object().unwrap().clone());
+    serde_json::from_value(json!({
+        "metadata": workload_meta(meta),
+        "spec": full_spec,
+        "status": {
+            "observedGeneration": 2, "availableReplicas": available,
+            "updatedReplicas": updated, "conditions": conditions,
+        },
+    }))
+    .unwrap()
+}
+
+#[test]
+fn deployments_are_classified() {
+    use ProblemReason as R;
+    let settled = condition("Progressing", "True", "NewReplicaSetAvailable", 30);
+    let rolling = condition("Progressing", "True", "ReplicaSetUpdated", 1);
+    let stalled = condition("Progressing", "False", "ProgressDeadlineExceeded", 3);
+    let down = condition("Available", "False", "MinimumReplicasUnavailable", 3);
+    let just_down = condition("Available", "False", "MinimumReplicasUnavailable", 1);
+    let up = condition("Available", "True", "MinimumReplicasAvailable", 30);
+    let three = json!({"replicas": 3});
+    type Case = (
+        &'static str,
+        Value,
+        Value,
+        i32,
+        i32,
+        Value,
+        Option<Option<ProblemReason>>,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "healthy",
+            none(),
+            three.clone(),
+            3,
+            3,
+            json!([settled, up]),
+            None,
+        ),
+        (
+            "settled and down past the grace",
+            none(),
+            three.clone(),
+            1,
+            3,
+            json!([settled, down]),
+            Some(Some(R::MinimumReplicasUnavailable)),
+        ),
+        (
+            "settled and only just down",
+            none(),
+            three.clone(),
+            1,
+            3,
+            json!([settled, just_down]),
+            None,
+        ),
+        (
+            "short within maxUnavailable stays available",
+            none(),
+            json!({"replicas": 100}),
+            90,
+            100,
+            json!([settled, up]),
+            None,
+        ),
+        (
+            "a rollout is moving, even with Available false",
+            none(),
+            three.clone(),
+            1,
+            1,
+            json!([rolling, down]),
+            None,
+        ),
+        (
+            "a stalled rollout is reported",
+            none(),
+            three.clone(),
+            2,
+            1,
+            json!([stalled, up]),
+            Some(Some(R::ProgressDeadlineExceeded)),
+        ),
+        (
+            "a rollout stopped by a create error is reported once down",
+            none(),
+            three.clone(),
+            1,
+            1,
+            json!([
+                condition("Progressing", "False", "ReplicaSetCreateError", 5),
+                down
+            ]),
+            Some(Some(R::MinimumReplicasUnavailable)),
+        ),
+        (
+            "a stalled rollout that has caught up is not",
+            none(),
+            three.clone(),
+            3,
+            3,
+            json!([stalled, up]),
+            None,
+        ),
+        (
+            "paused mid-rollout",
+            none(),
+            json!({"replicas": 3, "paused": true}),
+            1,
+            1,
+            json!([stalled, down]),
+            None,
+        ),
+        (
+            "scaled to zero",
+            none(),
+            json!({"replicas": 0}),
+            0,
+            0,
+            json!([settled, down]),
+            None,
+        ),
+        (
+            "replicas defaults to one",
+            none(),
+            json!({}),
+            0,
+            1,
+            json!([settled, down]),
+            Some(Some(R::MinimumReplicasUnavailable)),
+        ),
+        (
+            "no progress deadline, mid-rollout",
+            none(),
+            three.clone(),
+            1,
+            1,
+            json!([down]),
+            None,
+        ),
+        (
+            "no progress deadline, settled",
+            none(),
+            three.clone(),
+            1,
+            3,
+            json!([down]),
+            Some(Some(R::MinimumReplicasUnavailable)),
+        ),
+        (
+            "the controller has not seen the new spec",
+            json!({"generation": 3}),
+            three.clone(),
+            1,
+            3,
+            json!([settled, down]),
+            None,
+        ),
+        (
+            "first start",
+            json!({"creationTimestamp": ago(4)}),
+            three.clone(),
+            1,
+            3,
+            json!([settled, down]),
+            None,
+        ),
+        (
+            "deleting",
+            json!({"deletionTimestamp": ago(1)}),
+            three.clone(),
+            1,
+            3,
+            json!([settled, down]),
+            None,
+        ),
+    ];
+    for (name, meta, spec, available, updated, conditions, expected) in cases {
+        let object = deployment(meta, spec, available, updated, conditions);
+        let got = classifier().deployment(&object);
+        assert_eq!(got.as_ref().map(|p| p.reason), expected, "{name}");
+        if let Some(problem) = got {
+            assert_eq!(problem.kind(), ProblemKind::WorkloadShort, "{name}");
+        }
+    }
+}
+
+fn stateful_set(meta: Value, spec: Value, status: Value) -> StatefulSet {
+    let mut full_spec = json!({"selector": {}, "serviceName": "s", "template": {}});
+    full_spec
+        .as_object_mut()
+        .unwrap()
+        .extend(spec.as_object().unwrap().clone());
+    let mut full_status = json!({
+        "observedGeneration": 2, "replicas": 3, "readyReplicas": 1, "updatedReplicas": 3,
+        "currentRevision": "r1", "updateRevision": "r1",
+    });
+    full_status
+        .as_object_mut()
+        .unwrap()
+        .extend(status.as_object().unwrap().clone());
+    serde_json::from_value(json!({
+        "metadata": workload_meta(meta),
+        "spec": full_spec,
+        "status": full_status,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn stateful_sets_are_classified() {
+    let three = || json!({"replicas": 3});
+    let new_revision = || json!({"updateRevision": "r2", "updatedReplicas": 1});
+    let partitioned = json!({"replicas": 3, "updateStrategy": {
+        "type": "RollingUpdate", "rollingUpdate": {"partition": 2},
+    }});
+    let on_delete = json!({"replicas": 3, "updateStrategy": {"type": "OnDelete"}});
+    let cases: Vec<(&str, Value, Value, Value, bool)> = vec![
+        ("settled and short", none(), three(), none(), true),
+        (
+            "healthy",
+            none(),
+            three(),
+            json!({"readyReplicas": 3}),
+            false,
+        ),
+        ("scaling up", none(), three(), json!({"replicas": 2}), false),
+        ("rolling out", none(), three(), new_revision(), false),
+        (
+            "the last replica of a rollout is still starting",
+            none(),
+            three(),
+            json!({"updateRevision": "r2", "updatedReplicas": 3}),
+            false,
+        ),
+        (
+            "a partition is done rolling",
+            none(),
+            partitioned.clone(),
+            new_revision(),
+            true,
+        ),
+        (
+            "a partition still rolling",
+            none(),
+            partitioned,
+            json!({"updateRevision": "r2", "updatedReplicas": 0}),
+            false,
+        ),
+        (
+            "OnDelete is never rolling",
+            none(),
+            on_delete,
+            new_revision(),
+            true,
+        ),
+        (
+            "scaled to zero",
+            none(),
+            json!({"replicas": 0}),
+            json!({"replicas": 0, "readyReplicas": 0}),
+            false,
+        ),
+        (
+            "stale status",
+            json!({"generation": 3}),
+            three(),
+            none(),
+            false,
+        ),
+        (
+            "first start",
+            json!({"creationTimestamp": ago(4)}),
+            three(),
+            none(),
+            false,
+        ),
+        (
+            "deleting",
+            json!({"deletionTimestamp": ago(1)}),
+            three(),
+            none(),
+            false,
+        ),
+    ];
+    for (name, meta, spec, status, expected) in cases {
+        let got = classifier().stateful_set(&stateful_set(meta, spec, status));
+        assert_eq!(got.is_some(), expected, "{name}");
+    }
+}
+
+fn daemon_set(meta: Value, strategy: &str, status: Value) -> DaemonSet {
+    let mut full_status = json!({
+        "observedGeneration": 2, "desiredNumberScheduled": 3, "currentNumberScheduled": 3,
+        "numberReady": 2, "numberMisscheduled": 0, "updatedNumberScheduled": 3,
+    });
+    full_status
+        .as_object_mut()
+        .unwrap()
+        .extend(status.as_object().unwrap().clone());
+    serde_json::from_value(json!({
+        "metadata": workload_meta(meta),
+        "spec": {"selector": {}, "template": {}, "updateStrategy": {"type": strategy}},
+        "status": full_status,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn daemon_sets_are_classified() {
+    const ROLLING: &str = "RollingUpdate";
+    let cases: Vec<(&str, Value, &str, Value, bool)> = vec![
+        ("settled and short", none(), ROLLING, none(), true),
+        ("healthy", none(), ROLLING, json!({"numberReady": 3}), false),
+        (
+            "placing on a new node",
+            none(),
+            ROLLING,
+            json!({"currentNumberScheduled": 2}),
+            false,
+        ),
+        (
+            "rolling out",
+            none(),
+            ROLLING,
+            json!({"updatedNumberScheduled": 1}),
+            false,
+        ),
+        (
+            "OnDelete is never rolling",
+            none(),
+            "OnDelete",
+            json!({"updatedNumberScheduled": 1}),
+            true,
+        ),
+        (
+            "no matching nodes",
+            none(),
+            ROLLING,
+            json!({"desiredNumberScheduled": 0, "currentNumberScheduled": 0, "numberReady": 0}),
+            false,
+        ),
+        (
+            "stale status",
+            json!({"generation": 3}),
+            ROLLING,
+            none(),
+            false,
+        ),
+        (
+            "first start",
+            json!({"creationTimestamp": ago(4)}),
+            ROLLING,
+            none(),
+            false,
+        ),
+        (
+            "deleting",
+            json!({"deletionTimestamp": ago(1)}),
+            ROLLING,
+            none(),
+            false,
+        ),
+    ];
+    for (name, meta, strategy, status, expected) in cases {
+        let got = classifier().daemon_set(&daemon_set(meta, strategy, status));
+        assert_eq!(got.is_some(), expected, "{name}");
+    }
+}
+
+#[test]
+fn only_workloads_without_timestamps_need_a_hold_down() {
+    let three = json!({"replicas": 3});
+    let set = classifier()
+        .stateful_set(&stateful_set(none(), three.clone(), none()))
+        .unwrap();
+    let daemon = classifier()
+        .daemon_set(&daemon_set(none(), "RollingUpdate", none()))
+        .unwrap();
+    let stalled = json!([condition(
+        "Progressing",
+        "False",
+        "ProgressDeadlineExceeded",
+        3
+    )]);
+    let timed = classifier()
+        .deployment(&deployment(none(), three, 1, 1, stalled))
+        .unwrap();
+    assert_eq!(set.hold_down(), Some(WORKLOAD_HOLD_DOWN));
+    assert_eq!(daemon.hold_down(), Some(WORKLOAD_HOLD_DOWN));
+    assert_eq!(timed.hold_down(), None);
+}
+
+#[test]
+fn workload_identity_ignores_counts_and_separates_kinds() {
+    let short = stateful_set(none(), json!({"replicas": 3}), none());
+    let shorter = stateful_set(none(), json!({"replicas": 3}), json!({"readyReplicas": 0}));
+    let recreated = stateful_set(json!({"uid": "uid-new"}), json!({"replicas": 3}), none());
+    let id = |set: &StatefulSet| classifier().stateful_set(set).unwrap().id;
+    assert_eq!(id(&short), id(&shorter));
+    assert_ne!(id(&short), id(&recreated));
+    let daemon = classifier().daemon_set(&daemon_set(none(), "RollingUpdate", none()));
+    assert_ne!(id(&short), daemon.unwrap().id);
+}
+
+#[test]
+fn new_kinds_never_carry_server_messages() {
+    const SECRET: &str = "token=hunter2";
+    let container = json!({
+        "name": "c", "image": SECRET, "imageID": "", "ready": false, "restartCount": 0,
+        "state": {"waiting": {"reason": "ErrImagePull", "message": SECRET}},
+    });
+    let pod = aged_pod("Pending", 600, container);
+    let stalled = json!([{"type": "Progressing", "status": "False", "message": SECRET,
+        "reason": "ProgressDeadlineExceeded", "lastTransitionTime": ago(3)}]);
+    let unknown = json!([
+        condition("Progressing", "True", "NewReplicaSetAvailable", 30),
+        {"type": "Available", "status": "False", "reason": SECRET, "message": SECRET,
+            "lastTransitionTime": ago(3)},
+    ]);
+    let three = json!({"replicas": 3});
+    let mut problems = pod_problems(&pod);
+    problems.extend(classifier().deployment(&deployment(none(), three.clone(), 1, 1, stalled)));
+    problems.extend(classifier().deployment(&deployment(none(), three, 1, 3, unknown)));
+    assert_eq!(problems.len(), 3);
+    for problem in problems {
+        let printed = format!("{problem:?} {}", problem.summary());
+        assert!(!printed.contains(SECRET), "{printed}");
+    }
 }
 
 #[test]

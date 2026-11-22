@@ -28,9 +28,12 @@
 
 use std::sync::Arc;
 
+use k8s_openapi::api::apps::v1::{
+    DaemonSet, Deployment, StatefulSet, StatefulSetSpec, StatefulSetStatus,
+};
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ContainerStateTerminated, ContainerStatus, Node, Pod, PodSpec};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
 use k8s_openapi::jiff::{SignedDuration, Timestamp};
 
 /// Restarts a container needs before a back-off counts as a crash loop.
@@ -72,6 +75,30 @@ pub const NODE_NOT_READY_GRACE: SignedDuration = SignedDuration::from_secs(2 * 6
 /// take several minutes on a cloud instance.
 pub const NODE_JOIN_GRACE: SignedDuration = SignedDuration::from_secs(10 * 60);
 
+/// How long after creation a pod's image pull may fail without being reported.
+///
+/// The kubelet retries after 10, 20 and 40 seconds, so a brief registry error clears inside this
+/// window. Both retry states are held back alike, so a problem does not flap between them. An
+/// invalid image name can never succeed and is reported at once.
+pub const IMAGE_PULL_GRACE: SignedDuration = SignedDuration::from_secs(60);
+
+/// How long after creation a workload may be short of replicas without being reported.
+///
+/// Covers a first start, including pulling images and passing readiness probes. StatefulSet and
+/// DaemonSet status carries no timestamps, so their age is the only clock available.
+pub const WORKLOAD_START_GRACE: SignedDuration = SignedDuration::from_secs(5 * 60);
+
+/// How long a settled Deployment must report `Available=False` before it is reported.
+///
+/// Long enough for a replacement pod to start after a pod or node is lost.
+pub const DEPLOYMENT_UNAVAILABLE_GRACE: SignedDuration = SignedDuration::from_secs(2 * 60);
+
+/// How long a caller should keep seeing a StatefulSet or DaemonSet shortfall before alerting.
+///
+/// Their status has no timestamps and cannot separate a stuck pod from the last pod of a rollout
+/// still starting, so a single pass cannot apply a grace. See [`Problem::hold_down`].
+pub const WORKLOAD_HOLD_DOWN: SignedDuration = SignedDuration::from_secs(2 * 60);
+
 /// What kind of problem an object has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ProblemKind {
@@ -83,14 +110,18 @@ pub enum ProblemKind {
     NodeNotReady,
     /// A Job has finished as failed.
     JobFailed,
+    /// A container cannot start because its image cannot be pulled.
+    ImagePull,
+    /// A workload has settled with fewer ready replicas than it wants.
+    WorkloadShort,
 }
 
 impl ProblemKind {
     /// How urgent this kind of problem is.
     pub const fn severity(self) -> ProblemSeverity {
         match self {
-            Self::CrashLoop | Self::NodeNotReady => ProblemSeverity::Critical,
-            Self::OomKilled | Self::JobFailed => ProblemSeverity::Warning,
+            Self::CrashLoop | Self::NodeNotReady | Self::ImagePull => ProblemSeverity::Critical,
+            Self::OomKilled | Self::JobFailed | Self::WorkloadShort => ProblemSeverity::Warning,
         }
     }
 }
@@ -125,6 +156,16 @@ pub enum ProblemReason {
     FailedIndexes,
     /// An indexed Job passed its limit of failed indexes.
     MaxFailedIndexesExceeded,
+    /// The latest image pull failed.
+    ErrImagePull,
+    /// The kubelet is backing off retries of a failing image pull.
+    ImagePullBackOff,
+    /// The container's image name cannot be parsed.
+    InvalidImageName,
+    /// A Deployment rollout stopped making progress within its deadline.
+    ProgressDeadlineExceeded,
+    /// A Deployment has fewer available replicas than its update strategy requires.
+    MinimumReplicasUnavailable,
 }
 
 impl ProblemReason {
@@ -140,7 +181,25 @@ impl ProblemReason {
             Self::PodFailurePolicy => "PodFailurePolicy",
             Self::FailedIndexes => "FailedIndexes",
             Self::MaxFailedIndexesExceeded => "MaxFailedIndexesExceeded",
+            Self::ErrImagePull => "ErrImagePull",
+            Self::ImagePullBackOff => "ImagePullBackOff",
+            Self::InvalidImageName => "InvalidImageName",
+            Self::ProgressDeadlineExceeded => PROGRESS_DEADLINE_EXCEEDED,
+            Self::MinimumReplicasUnavailable => "MinimumReplicasUnavailable",
         }
+    }
+
+    fn of_image_pull(reason: Option<&str>) -> Option<Self> {
+        match reason? {
+            "ErrImagePull" => Some(Self::ErrImagePull),
+            "ImagePullBackOff" => Some(Self::ImagePullBackOff),
+            "InvalidImageName" => Some(Self::InvalidImageName),
+            _ => None,
+        }
+    }
+
+    fn of_deployment_available(reason: Option<&str>) -> Option<Self> {
+        (reason? == "MinimumReplicasUnavailable").then_some(Self::MinimumReplicasUnavailable)
     }
 
     fn of_node(reason: Option<&str>) -> Option<Self> {
@@ -163,6 +222,14 @@ impl ProblemReason {
     }
 }
 
+/// A kind of workload that keeps a number of replicas running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum WorkloadKind {
+    Deployment,
+    StatefulSet,
+    DaemonSet,
+}
+
 /// The object a problem concerns. UIDs are optional only because the API types make them so.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ProblemSubject {
@@ -177,6 +244,13 @@ pub enum ProblemSubject {
     Node { name: String, uid: Option<String> },
     /// A Job.
     Job {
+        namespace: String,
+        name: String,
+        uid: Option<String>,
+    },
+    /// A Deployment, StatefulSet or DaemonSet.
+    Workload {
+        kind: WorkloadKind,
         namespace: String,
         name: String,
         uid: Option<String>,
@@ -201,7 +275,9 @@ pub struct Problem {
     /// When this was last known to start, if the object says.
     ///
     /// For a crash loop or OOM kill, the latest termination, so it moves on each restart. For a
-    /// node or Job, the last transition of its condition. Never part of the identity.
+    /// node, Job or Deployment, the last transition of its condition. Image pull failures and
+    /// StatefulSet or DaemonSet shortfalls have no time in their status, so this is `None`.
+    /// Never part of the identity.
     pub since: Option<Timestamp>,
 }
 
@@ -214,6 +290,19 @@ impl Problem {
     /// How urgent the problem is.
     pub fn severity(&self) -> ProblemSeverity {
         self.id.kind.severity()
+    }
+
+    /// How long this id must stay present across passes before it is worth alerting on, when the
+    /// object's status has no time to judge that from. The caller tracks when it first saw the id.
+    pub fn hold_down(&self) -> Option<SignedDuration> {
+        matches!(
+            self.id.subject,
+            ProblemSubject::Workload {
+                kind: WorkloadKind::StatefulSet | WorkloadKind::DaemonSet,
+                ..
+            }
+        )
+        .then_some(WORKLOAD_HOLD_DOWN)
     }
 
     /// Flint's description of the problem. Never contains server-supplied text.
@@ -244,6 +333,14 @@ impl Problem {
                 "Indexed Job failed on some of its indexes"
             }
             (ProblemKind::JobFailed, _) => "Job failed",
+            (ProblemKind::ImagePull, Some(R::InvalidImageName)) => {
+                "Container image name is invalid"
+            }
+            (ProblemKind::ImagePull, _) => "Container image cannot be pulled",
+            (ProblemKind::WorkloadShort, Some(R::ProgressDeadlineExceeded)) => {
+                "Rollout stopped before reaching its desired replicas"
+            }
+            (ProblemKind::WorkloadShort, _) => "Workload has fewer ready replicas than desired",
         }
     }
 }
@@ -277,7 +374,7 @@ impl Classifier {
     ///
     /// A deleting or succeeded pod has none. A failed pod will not restart, so it can only report
     /// an OOM kill that ended its final run. The same holds for ephemeral containers, which are
-    /// never restarted.
+    /// never restarted, so a debug container with a mistyped image does not mark its pod.
     pub fn pod(&self, pod: &Pod, out: &mut Vec<Problem>) {
         let meta = &pod.metadata;
         let (Some(name), Some(status), None) = (&meta.name, &pod.status, &meta.deletion_timestamp)
@@ -289,6 +386,10 @@ impl Classifier {
             return;
         }
         let finished = phase == Some("Failed");
+        let pull_grace = meta
+            .creation_timestamp
+            .as_ref()
+            .is_some_and(|created| self.within(created.0, IMAGE_PULL_GRACE));
         let init = status.init_container_statuses.iter().flatten();
         let restartable = init
             .chain(status.container_statuses.iter().flatten())
@@ -300,7 +401,7 @@ impl Classifier {
             .map(|container| (container, true));
         for (container, final_run) in restartable.chain(ephemeral) {
             let Some((kind, reason, since)) =
-                self.container(container, pod.spec.as_ref(), final_run)
+                self.container(container, pod.spec.as_ref(), final_run, pull_grace)
             else {
                 continue;
             };
@@ -371,15 +472,151 @@ impl Classifier {
         Some(self.problem(ProblemKind::JobFailed, subject, reason, since))
     }
 
-    /// A crash loop takes precedence over an OOM kill, so one failure is not counted twice.
+    /// The problem of one Deployment, if it has settled short of its replicas.
+    ///
+    /// A paused Deployment is left alone. While a rollout or scale-up is moving, the controller's
+    /// own progress deadline decides. Once settled, `Available=False` must outlast
+    /// [`DEPLOYMENT_UNAVAILABLE_GRACE`]; a shortfall within the update strategy's
+    /// `maxUnavailable` keeps `Available=True` and is not reported.
+    pub fn deployment(&self, deployment: &Deployment) -> Option<Problem> {
+        let meta = &deployment.metadata;
+        let spec = &deployment.spec;
+        let status = deployment.status.as_ref()?;
+        let desired = spec.replicas.unwrap_or(DEFAULT_REPLICAS);
+        if spec.paused == Some(true)
+            || !self.may_be_short(meta, desired, status.observed_generation)
+            || status.available_replicas.unwrap_or(0) >= desired
+        {
+            return None;
+        }
+        let conditions = status.conditions.as_deref().unwrap_or_default();
+        let condition = |type_: &str| {
+            conditions
+                .iter()
+                .find(|c| c.type_.as_deref() == Some(type_))
+        };
+        let progressing = condition("Progressing");
+        if let Some(stalled) = progressing.filter(|c| {
+            c.status.as_deref() == Some("False")
+                && c.reason.as_deref() == Some(PROGRESS_DEADLINE_EXCEEDED)
+        }) {
+            let since = time(&stalled.last_transition_time);
+            let reason = Some(ProblemReason::ProgressDeadlineExceeded);
+            return self.workload(WorkloadKind::Deployment, meta, reason, since);
+        }
+        let moving = match progressing {
+            // `False` is a stop, such as a quota refusing new pods, so it has settled too.
+            Some(c) => {
+                c.status.as_deref() != Some("False")
+                    && c.reason.as_deref() != Some("NewReplicaSetAvailable")
+            }
+            // With the progress deadline disabled there is no condition to read.
+            None => status.updated_replicas.unwrap_or(0) < desired,
+        };
+        if moving {
+            return None;
+        }
+        let unavailable =
+            condition("Available").filter(|c| c.status.as_deref() == Some("False"))?;
+        let since = time(&unavailable.last_transition_time);
+        if since.is_some_and(|since| self.within(since, DEPLOYMENT_UNAVAILABLE_GRACE)) {
+            return None;
+        }
+        let reason = ProblemReason::of_deployment_available(unavailable.reason.as_deref());
+        self.workload(WorkloadKind::Deployment, meta, reason, since)
+    }
+
+    /// The problem of one StatefulSet, if it has settled short of ready replicas.
+    ///
+    /// Readiness is compared rather than availability, which older API servers omit.
+    pub fn stateful_set(&self, set: &StatefulSet) -> Option<Problem> {
+        let meta = &set.metadata;
+        let spec = &set.spec;
+        let status = set.status.as_ref()?;
+        let desired = spec.replicas.unwrap_or(DEFAULT_REPLICAS);
+        if !self.may_be_short(meta, desired, status.observed_generation)
+            || status.ready_replicas.unwrap_or(0) >= desired
+            || status.replicas < desired
+            || is_rolling_out(spec, status, desired)
+        {
+            return None;
+        }
+        self.workload(WorkloadKind::StatefulSet, meta, None, None)
+    }
+
+    /// The problem of one DaemonSet, if it has settled short of ready pods.
+    ///
+    /// Pods still being placed, such as on a new node, and a rolling update are not reported.
+    pub fn daemon_set(&self, set: &DaemonSet) -> Option<Problem> {
+        let meta = &set.metadata;
+        let status = set.status.as_ref()?;
+        let desired = status.desired_number_scheduled;
+        let on_delete = set
+            .spec
+            .update_strategy
+            .as_ref()
+            .is_some_and(|strategy| strategy.type_.as_deref() == Some(ON_DELETE));
+        if !self.may_be_short(meta, desired, status.observed_generation)
+            || status.number_ready >= desired
+            || status.current_number_scheduled < desired
+            || (!on_delete && status.updated_number_scheduled.unwrap_or(0) < desired)
+        {
+            return None;
+        }
+        self.workload(WorkloadKind::DaemonSet, meta, None, None)
+    }
+
+    /// Whether a workload's status can be judged at all: it is not deleting, wants replicas, is
+    /// past its first start, and its controller has seen the latest spec.
+    fn may_be_short(&self, meta: &ObjectMeta, desired: i32, observed: Option<i64>) -> bool {
+        let starting = meta
+            .creation_timestamp
+            .as_ref()
+            .is_some_and(|created| self.within(created.0, WORKLOAD_START_GRACE));
+        let current = meta
+            .generation
+            .is_none_or(|generation| observed.is_some_and(|seen| seen >= generation));
+        desired > 0 && meta.deletion_timestamp.is_none() && !starting && current
+    }
+
+    fn workload(
+        &self,
+        kind: WorkloadKind,
+        meta: &ObjectMeta,
+        reason: Option<ProblemReason>,
+        since: Option<Timestamp>,
+    ) -> Option<Problem> {
+        let subject = ProblemSubject::Workload {
+            kind,
+            namespace: meta.namespace.clone().unwrap_or_default(),
+            name: meta.name.clone()?,
+            uid: meta.uid.clone(),
+        };
+        Some(self.problem(ProblemKind::WorkloadShort, subject, reason, since))
+    }
+
+    /// An image pull failure is the container's current state, so it comes before an OOM kill
+    /// from an earlier run. A crash loop takes precedence over an OOM kill, so one failure is not
+    /// counted twice.
     ///
     /// `final_run` means the container will not run again, so only its current state counts.
+    /// `pull_grace` holds back image pull failures that are still likely to clear.
     fn container(
         &self,
         status: &ContainerStatus,
         spec: Option<&PodSpec>,
         final_run: bool,
+        pull_grace: bool,
     ) -> Option<(ProblemKind, Option<ProblemReason>, Option<Timestamp>)> {
+        if !final_run {
+            let waiting = status.state.as_ref().and_then(|s| s.waiting.as_ref());
+            let pull = waiting.and_then(|w| ProblemReason::of_image_pull(w.reason.as_deref()));
+            if let Some(reason) =
+                pull.filter(|r| !pull_grace || *r == ProblemReason::InvalidImageName)
+            {
+                return Some((ProblemKind::ImagePull, Some(reason), None));
+            }
+        }
         let current = status.state.as_ref().and_then(|s| s.terminated.as_ref());
         let previous = status
             .last_state
@@ -469,6 +706,35 @@ impl Classifier {
 
 /// The Kubernetes termination reason for an OOM kill.
 const OOM_KILLED: &str = "OOMKilled";
+
+/// The Deployment condition reason for a rollout that stopped making progress.
+const PROGRESS_DEADLINE_EXCEEDED: &str = "ProgressDeadlineExceeded";
+
+/// The update strategy under which pods change only when something else deletes them.
+const ON_DELETE: &str = "OnDelete";
+
+/// The API's default when a Deployment or StatefulSet does not set `replicas`.
+const DEFAULT_REPLICAS: i32 = 1;
+
+/// Whether a StatefulSet is still moving replicas to its update revision.
+///
+/// Without a partition, the controller makes the revisions equal only once every replica is
+/// updated and ready, so differing revisions mean the rollout is still running. `OnDelete` never
+/// moves replicas itself, and a partition holds the lower ordinals back for good, so its
+/// revisions can differ indefinitely and only the replicas it will update are counted.
+fn is_rolling_out(spec: &StatefulSetSpec, status: &StatefulSetStatus, desired: i32) -> bool {
+    let strategy = spec.update_strategy.as_ref();
+    if strategy.is_some_and(|s| s.type_.as_deref() == Some(ON_DELETE))
+        || status.current_revision == status.update_revision
+    {
+        return false;
+    }
+    let partition = strategy
+        .and_then(|s| s.rolling_update.as_ref())
+        .and_then(|rolling| rolling.partition)
+        .unwrap_or(0);
+    partition <= 0 || status.updated_replicas.unwrap_or(0) < desired.saturating_sub(partition)
+}
 
 fn is_oom(terminated: &ContainerStateTerminated) -> bool {
     terminated.reason.as_deref() == Some(OOM_KILLED)
