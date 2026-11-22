@@ -105,46 +105,153 @@ fn short_single_line(context: &str) -> String {
     short_name(&single_line(context))
 }
 
-/// The next, longer way to tell `context` from a sibling that reads like `label`: an EKS cluster's
-/// region and account, then the whole context name.
-fn more_of_real_name(context: &str, label: &str) -> String {
-    let full = single_line(context);
-    let short = short_name(&full);
-    match parse_eks_arn(&full) {
-        Some(arn) if label == short => format!("{short} · {} · {}", arn.region, arn.account),
-        _ => full,
+/// The most of an EKS region or account a label shows.
+const MAX_ARN_PART_CHARS: usize = 20;
+/// How many characters of a context name a label quotes around where it differs.
+const EXCERPT_CHARS: usize = 16;
+/// How many of those come before the first character that differs.
+const EXCERPT_LEAD: usize = 4;
+
+/// The part of `full` that tells it from `rivals`: a bounded excerpt from where it stops matching
+/// the closest of them.
+fn differing_excerpt(full: &str, rivals: &[&str]) -> String {
+    let chars: Vec<char> = full.chars().collect();
+    let shared = rivals
+        .iter()
+        .map(|rival| {
+            chars
+                .iter()
+                .zip(rival.chars())
+                .take_while(|(a, b)| **a == *b)
+                .count()
+        })
+        .max()
+        .unwrap_or(0);
+    let start = shared
+        .saturating_sub(EXCERPT_LEAD)
+        .min(chars.len().saturating_sub(EXCERPT_CHARS));
+    let end = (start + EXCERPT_CHARS).min(chars.len());
+    let excerpt: String = chars[start..end].iter().collect();
+    let before = if start > 0 { "…" } else { "" };
+    let after = if end < chars.len() { "…" } else { "" };
+    format!("{before}{excerpt}{after}")
+}
+
+/// What a label adds to the short real name, in the order they are tried.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Detail {
+    Short,
+    RegionAndAccount,
+    Excerpt,
+}
+
+/// One context on its way to a label of its own.
+struct Label<'a> {
+    context: &'a str,
+    /// The context as one line.
+    full: String,
+    custom: Option<&'a str>,
+    /// The real name as shown so far.
+    real: String,
+    detail: Detail,
+}
+
+impl Label<'_> {
+    /// The label as drawn.
+    fn shown(&self) -> String {
+        match self.custom {
+            Some(name) => format!(
+                "{} ({})",
+                middle_truncate(name, MAX_NAME_BESIDE_REAL),
+                self.real
+            ),
+            None => self.real.clone(),
+        }
+    }
+
+    /// Adds the next detail, to tell this from `rivals`. `false` when none is left.
+    fn say_more(&mut self, rivals: &[&str]) -> bool {
+        let short = short_name(&self.full);
+        let region_and_account = parse_eks_arn(&self.full)
+            .filter(|_| self.detail == Detail::Short)
+            .map(|arn| {
+                format!(
+                    "{short} · {} · {}",
+                    middle_truncate(arn.region, MAX_ARN_PART_CHARS),
+                    middle_truncate(arn.account, MAX_ARN_PART_CHARS)
+                )
+            });
+        if let Some(real) = region_and_account {
+            self.real = real;
+            self.detail = Detail::RegionAndAccount;
+        } else if self.detail != Detail::Excerpt {
+            self.real = format!("{short} · {}", differing_excerpt(&self.full, rivals));
+            self.detail = Detail::Excerpt;
+        } else {
+            return false;
+        }
+        true
     }
 }
 
-/// The contexts whose [`short_single_line`] reads like another's, each with a label that does not.
-/// Labels only grow, so this ends; a context that is alone in its name is not in the result.
-fn sibling_labels(contexts: &[&str]) -> HashMap<String, String> {
+/// What each of `contexts` is called where a name must not hide which cluster it is: its custom
+/// name, if any, beside its real name. Compares the labels as drawn, so no two read the same
+/// ([`cluster_name_key`]), and each stays bounded however long its context name is.
+fn distinct_labels(contexts: &[&str], custom: &HashMap<String, String>) -> HashMap<String, String> {
     let unique: BTreeSet<&str> = contexts.iter().copied().collect();
-    let mut labels: Vec<(&str, String)> = unique
+    let mut labels: Vec<Label<'_>> = unique
         .into_iter()
-        .map(|context| (context, short_single_line(context)))
+        .map(|context| Label {
+            context,
+            full: single_line(context),
+            custom: custom.get(context).map(String::as_str),
+            real: short_single_line(context),
+            detail: Detail::Short,
+        })
         .collect();
+    // Each pass adds detail to a label, and a label has only so much to add.
     loop {
-        let mut uses: HashMap<String, usize> = HashMap::new();
-        for (_, label) in &labels {
-            *uses.entry(cluster_name_key(label)).or_default() += 1;
-        }
-        let mut changed = false;
-        for (context, label) in &mut labels {
-            if uses[&cluster_name_key(label)] > 1 {
-                let next = more_of_real_name(context, label);
-                changed |= next != *label;
-                *label = next;
+        // A real name counts as well as the whole label: a custom name beside it must not be
+        // the only thing that tells two clusters apart.
+        let mut groups: HashMap<String, BTreeSet<usize>> = HashMap::new();
+        for (at, label) in labels.iter().enumerate() {
+            for text in [label.real.clone(), label.shown()] {
+                groups
+                    .entry(cluster_name_key(&text))
+                    .or_default()
+                    .insert(at);
             }
+        }
+        let mut rivals: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+        for group in groups.values().filter(|group| group.len() > 1) {
+            for &at in group {
+                let others = group.iter().copied().filter(|&other| other != at);
+                rivals.entry(at).or_default().extend(others);
+            }
+        }
+        let fulls: Vec<String> = labels.iter().map(|l| l.full.clone()).collect();
+        let mut changed = false;
+        for (at, others) in rivals {
+            let others: Vec<&str> = others.iter().map(|&o| fulls[o].as_str()).collect();
+            changed |= labels[at].say_more(&others);
         }
         if !changed {
             break;
         }
     }
+    // What still reads the same (names that differ only in case, say) is numbered.
+    let mut taken = BTreeSet::new();
+    for label in &mut labels {
+        let real = label.real.clone();
+        let mut number = 2;
+        while !taken.insert(cluster_name_key(&label.shown())) {
+            label.real = format!("{real} · {number}");
+            number += 1;
+        }
+    }
     labels
-        .into_iter()
-        .filter(|(context, label)| *label != short_single_line(context))
-        .map(|(context, label)| (context.to_owned(), label))
+        .iter()
+        .map(|label| (label.context.to_owned(), label.shown()))
         .collect()
 }
 
@@ -260,8 +367,9 @@ fn latin_look_alike(c: char) -> char {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClusterNames {
     custom: HashMap<String, String>,
-    /// Real names of contexts that share a short name, told apart ([`sibling_labels`]).
-    siblings: HashMap<String, String>,
+    /// What each context is called where it must be told from every other
+    /// ([`distinct_labels`]).
+    labels: HashMap<String, String>,
 }
 
 impl ClusterNames {
@@ -290,10 +398,8 @@ impl ClusterNames {
             .filter(|(context, name)| !reads_like_another(context, name))
             .map(|(context, name)| ((*context).to_owned(), name.clone()))
             .collect();
-        ClusterNames {
-            custom,
-            siblings: sibling_labels(&contexts),
-        }
+        let labels = distinct_labels(&contexts, &custom);
+        ClusterNames { custom, labels }
     }
 
     /// The custom name of `context`, if it has a usable one.
@@ -311,17 +417,13 @@ impl ClusterNames {
 
     /// [`ClusterNames::of`], followed by the real name when a custom name is shown: for anything
     /// that protects, unlocks or changes a cluster, where a name must not hide which one it is.
-    /// The real name is one line, and says more when another context shares its short name.
+    /// The real name is one line, and says more when the result would read like another
+    /// context's. Bounded, so a dialog's title leaves room for what it pins.
     pub fn with_real(&self, context: &str) -> String {
-        let real = self
-            .siblings
+        self.labels
             .get(context)
             .cloned()
-            .unwrap_or_else(|| short_single_line(context));
-        match self.custom(context) {
-            Some(name) => format!("{} ({real})", middle_truncate(name, MAX_NAME_BESIDE_REAL)),
-            None => real,
-        }
+            .unwrap_or_else(|| short_single_line(context))
     }
 
     /// The second line of `context`'s compact row: with a custom name, the real name comes
@@ -567,18 +669,22 @@ mod tests {
         // The compact name does not change.
         assert_eq!(shown.of(eu), "payments-prod");
 
-        // Same region and account in two partitions: only the whole name differs.
+        // Same region and account in two partitions: the label quotes where they differ.
         let cn = "arn:aws-cn:eks:eu-west-1:111111111111:cluster/payments-prod";
         let shown = ClusterNames::new([eu, cn], &BTreeMap::new());
-        assert_eq!(shown.with_real(eu), eu);
-        assert_eq!(shown.with_real(cn), cn);
+        assert_told_apart(&shown, &[eu, cn]);
+        assert!(
+            shown.with_real(cn).contains("aws-cn"),
+            "{}",
+            shown.with_real(cn)
+        );
 
-        // Long names cut to the same text show in full.
+        // Long names cut to the same text quote the part that differs.
         let one = format!("gke_{}_one_{}", "x".repeat(30), "y".repeat(30));
         let two = format!("gke_{}_two_{}", "x".repeat(30), "y".repeat(30));
         let shown = ClusterNames::new([one.as_str(), two.as_str()], &BTreeMap::new());
-        assert_eq!(shown.with_real(&one), one);
-        assert_eq!(shown.with_real(&two), two);
+        assert_told_apart(&shown, &[&one, &two]);
+        assert!(shown.with_real(&one).contains("_one_"));
 
         // A custom name keeps the told-apart real name beside it.
         let shown = ClusterNames::new([eu, us], &names(&[(eu, "main")]));
@@ -586,6 +692,64 @@ mod tests {
             shown.with_real(eu),
             "main (payments-prod · eu-west-1 · 111111111111)"
         );
+    }
+
+    /// The longest label [`ClusterNames::with_real`] may give, so a title stays a few lines.
+    const MAX_LABEL_CHARS: usize = 80;
+
+    fn assert_told_apart(shown: &ClusterNames, contexts: &[&str]) {
+        let labels: Vec<String> = contexts.iter().map(|c| shown.with_real(c)).collect();
+        let keys: BTreeSet<String> = labels.iter().map(|l| cluster_name_key(l)).collect();
+        assert_eq!(keys.len(), contexts.len(), "{labels:?}");
+        for label in &labels {
+            assert!(label.chars().count() <= MAX_LABEL_CHARS, "{label}");
+            assert_eq!(label.lines().count(), 1, "{label}");
+        }
+    }
+
+    // covers UP-55: a custom name beside a real one cannot rebuild another cluster's label.
+    #[test]
+    fn a_custom_name_cannot_rebuild_a_sibling_label() {
+        let east = "operations (east-cluster-prod)";
+        let west = "operations (west-cluster-prod)";
+        let named = "east-cluster-prod";
+        let shown = ClusterNames::new([east, west, named], &names(&[(named, "operations")]));
+        assert_eq!(shown.custom(named), Some("operations"));
+        assert_told_apart(&shown, &[east, west, named]);
+    }
+
+    // covers UP-55: however long, contexts that share a short name get short, different labels.
+    #[test]
+    fn long_contexts_get_a_bounded_label_that_differs() {
+        let one = format!("gke_{}_one_{}", "x".repeat(120), "y".repeat(120));
+        let two = format!("gke_{}_two_{}", "x".repeat(120), "y".repeat(120));
+        let shown = ClusterNames::new([one.as_str(), two.as_str()], &BTreeMap::new());
+        assert_told_apart(&shown, &[&one, &two]);
+        assert!(shown.with_real(&one).contains("one"));
+        assert!(shown.with_real(&two).contains("two"));
+
+        // Long parts of an ARN are bounded too.
+        let region = "r".repeat(200);
+        let eu = format!("arn:aws:eks:{region}-1:111:cluster/payments");
+        let us = format!("arn:aws:eks:{region}-2:111:cluster/payments");
+        let shown = ClusterNames::new([eu.as_str(), us.as_str()], &BTreeMap::new());
+        assert_told_apart(&shown, &[&eu, &us]);
+
+        // Names that differ only in case read the same, and are still told apart.
+        let upper = format!("{}-A-{}", "x".repeat(40), "y".repeat(40));
+        let lower = format!("{}-a-{}", "x".repeat(40), "y".repeat(40));
+        let shown = ClusterNames::new([upper.as_str(), lower.as_str()], &BTreeMap::new());
+        assert_told_apart(&shown, &[&upper, &lower]);
+    }
+
+    // covers UP-55: names that differ only in an escaped character keep that difference.
+    #[test]
+    fn escaped_names_stay_told_apart() {
+        let a = "team \tA cluster-prod";
+        let b = "team \tB cluster-prod";
+        assert_eq!(short_single_line(a), short_single_line(b));
+        let shown = ClusterNames::new([a, b], &BTreeMap::new());
+        assert_told_apart(&shown, &[a, b]);
     }
 
     // covers UP-55
