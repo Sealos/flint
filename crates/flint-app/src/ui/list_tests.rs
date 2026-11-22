@@ -1555,13 +1555,16 @@ async fn a_selection_outlives_its_namespace_leaving_a_limited_list(cx: &mut Test
         list.selected_seen = Some(5);
         list.set_snapshot(limited(&[], "team-a", 6, 2), cx)
     });
-    cx.run_until_parked();
+    // The rows are computed off the test's executor: wait until these are the ones applied.
+    cx.wait_for(window, WAIT, |_, cx| list.read(cx).shown.version == 2)
+        .await;
     assert_eq!(gone.load(std::sync::atomic::Ordering::SeqCst), 0);
 
     list.update(cx, |list, cx| {
         list.set_snapshot(limited(&[], "demo", 7, 3), cx)
     });
-    cx.run_until_parked();
+    cx.wait_for(window, WAIT, |_, cx| list.read(cx).shown.version == 3)
+        .await;
     assert_eq!(gone.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
