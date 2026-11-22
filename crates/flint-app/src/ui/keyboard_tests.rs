@@ -383,6 +383,139 @@ async fn the_cursor_ring_shifts_nothing(cx: &mut TestAppContext) {
 
 // covers UP-33: Go Back to the kind already open, with nothing to select, still puts focus in
 // the list.
+// covers #415: Go Back to another kind puts its filter back, in the field and on the rows.
+#[gpui_kit::test]
+async fn go_back_restores_the_list_filter(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let rows = [
+        ("demo", "api", 0),
+        ("demo", "web-a", 0),
+        ("demo", "web-b", 0),
+    ];
+    t.open_pods(cx, &rows).await;
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.type_text(cx, "web");
+    let list = t.list(cx).unwrap();
+    cx.wait_for(t.window, WAIT, move |_, cx| list.read(cx).shown().1 == 2)
+        .await;
+    t.dispatch(cx, "workspace::OpenView", json!({"kind": "services"}))
+        .unwrap();
+    t.feed_list(
+        cx,
+        objects(
+            KindId::new("", "services"),
+            &[("demo", "front", 0)],
+            flint_core::SyncState::Synced,
+            1,
+        ),
+    )
+    .await;
+    t.focus_workspace(cx);
+
+    t.press_key_of(cx, "workspace::GoBack");
+    let list = t.list(cx).expect("a list is open");
+    assert_eq!(list.read_with(cx, |l, _| l.filter_text().to_owned()), "web");
+    t.feed_list(cx, pods(&rows)).await;
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 2)
+        .await;
+    assert_eq!(t.selected(cx), None);
+    assert!(t.detail(cx).is_none());
+}
+
+// covers #415: while the restored filter's rows are computed, the rows of the old filter are
+// gone and the old selection is cleared, so nothing can be acted on by mistake.
+#[gpui_kit::test]
+async fn go_back_offers_no_stale_row_while_the_filter_is_restored(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(
+        cx,
+        &[
+            ("demo", "api", 0),
+            ("demo", "web-a", 0),
+            ("demo", "web-b", 0),
+        ],
+    )
+    .await;
+    let list = t.list(cx).unwrap();
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.type_text(cx, "web");
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 2)
+        .await;
+    t.dispatch(
+        cx,
+        "workspace::OpenObject",
+        json!({"kind": "pods", "namespace": "demo", "name": "web-a"}),
+    )
+    .unwrap();
+    assert_eq!(t.selected(cx).as_deref(), Some("web-a"));
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.type_text(cx, "-b");
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 1)
+        .await;
+
+    let permits = list.update(cx, |list, _| list.hold_computes());
+    t.focus_workspace(cx);
+    t.press_key_of(cx, "workspace::GoBack");
+    assert_eq!(list.read_with(cx, |l, _| l.filter_text().to_owned()), "web");
+    assert_eq!(
+        list.read_with(cx, |l, _| l.shown().1),
+        0,
+        "old rows dropped"
+    );
+    assert_eq!(t.selected(cx), None);
+    assert!(t.detail(cx).is_none(), "no detail is left as a target");
+    t.press(cx, "down");
+    assert_eq!(t.selected(cx), None, "no row to move to yet");
+
+    for _ in 0..8 {
+        permits.try_send(()).unwrap();
+    }
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 2)
+        .await;
+    assert_eq!(t.selected(cx), None, "the rows arriving select nothing");
+}
+
+// covers #415: rows computed for the text before the restore are never drawn.
+#[gpui_kit::test]
+async fn rows_of_the_old_text_are_dropped_after_a_restore(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let rows = [
+        ("demo", "api", 0),
+        ("demo", "web-a", 0),
+        ("demo", "web-b", 0),
+    ];
+    t.open_pods(cx, &rows).await;
+    let list = t.list(cx).unwrap();
+    let permits = list.update(cx, |list, _| list.hold_computes());
+    list.update(cx, |list, cx| list.set_snapshot(pods(&rows), cx));
+    let restoring = list.clone();
+    cx.update_window(t.window, |_, window, cx| {
+        restoring.update(cx, |list, cx| list.restore_filter("web", window, cx));
+    })
+    .unwrap();
+
+    permits.try_send(()).unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        list.read_with(cx, |l, _| l.shown().1),
+        0,
+        "the job for the old text is not drawn"
+    );
+    for _ in 0..8 {
+        permits.try_send(()).unwrap();
+    }
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 2)
+        .await;
+}
+
 #[gpui_kit::test]
 async fn go_back_to_the_open_kind_focuses_the_list(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();

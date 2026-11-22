@@ -134,6 +134,9 @@ pub struct ResourceList {
     /// Down left the filter while its rows were being computed: select the first row in this
     /// window once they are current, if the rows still have focus.
     select_first_in: Option<AnyWindowHandle>,
+    /// Go Back set the filter's text: rows computed for any other text are dropped, not drawn,
+    /// until rows for it arrive ([`ResourceList::restore_filter`]).
+    restoring_filter: bool,
     /// The namespace or text filter changed: the next measurement starts the column widths
     /// over, so they fit the rows now shown. Live updates under the same filters only grow them.
     remeasure: bool,
@@ -258,6 +261,7 @@ impl ResourceList {
             computing: false,
             dirty: false,
             select_first_in: None,
+            restoring_filter: false,
             remeasure: false,
             scoped: 0,
             scroll: UniformListScrollHandle::new(),
@@ -496,6 +500,7 @@ impl ResourceList {
         self.computing = true;
         self.dirty = false;
         let snapshot = self.latest.clone();
+        let job_text = self.query.text.clone();
         let query = ViewQuery {
             namespaces: self.query.namespaces.clone(),
             text: self.query.text.clone(),
@@ -546,11 +551,12 @@ impl ResourceList {
                     list.query.sort.as_ref(),
                     &list.sortable_in(&snapshot.columns),
                 );
-                if now != job_sort {
+                if now != job_sort || (list.restoring_filter && job_text != list.query.text) {
                     list.remeasure |= restart;
                     list.recompute(cx);
                     return None;
                 }
+                list.restoring_filter = false;
                 list.widths.update(&snapshot.columns, &widths, restart);
                 list.scoped = scoped;
                 list.rows_in_one_namespace = one_namespace;
