@@ -2974,7 +2974,11 @@ mod tests {
             "a write keeps its own refusal"
         );
         // A client that is never used: building one contacts nothing.
-        let client = kube::Client::try_from(kube::Config::new("https://dev".parse().unwrap()))
+        let unused = dir.path().join("unused");
+        std::fs::write(&unused, &yaml).unwrap();
+        let loaded = crate::kubeconfig::load(&[unused]);
+        let client = crate::cluster::connect(&loaded.merged, "dev")
+            .await
             .expect("a client");
         let connect = |manager: &mut ClusterManager| {
             manager.cluster_mut("dev").unwrap().client = Some(ClusterClients {
