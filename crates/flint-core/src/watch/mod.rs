@@ -148,19 +148,7 @@ impl ClusterWatches {
 
     /// Starts and stops watches to match the inputs.
     pub fn reconcile(&mut self, active: bool, mode: WatchMode, subscribed: &HashSet<KindId>) {
-        let wanted = self.wanted(active, mode, subscribed);
-        let stale: Vec<KindId> = self
-            .running
-            .iter()
-            .filter(|(id, r)| {
-                wanted.get(*id) != Some(&r.feed)
-                    || self.kind(id).is_none_or(|k| k.resource != r.kind.resource)
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in stale {
-            self.stop(&id);
-        }
+        let wanted = self.stop_unwanted(active, mode, subscribed);
         let mut starting: Vec<(&KindId, &Feed)> = wanted
             .iter()
             .filter(|(id, _)| !self.running.contains_key(*id))
@@ -185,6 +173,29 @@ impl ClusterWatches {
                 }
             }
         }
+    }
+
+    /// Stops what the inputs no longer want and starts nothing. Returns what they want.
+    pub fn stop_unwanted(
+        &mut self,
+        active: bool,
+        mode: WatchMode,
+        subscribed: &HashSet<KindId>,
+    ) -> HashMap<KindId, Feed> {
+        let wanted = self.wanted(active, mode, subscribed);
+        let stale: Vec<KindId> = self
+            .running
+            .iter()
+            .filter(|(id, r)| {
+                wanted.get(*id) != Some(&r.feed)
+                    || self.kind(id).is_none_or(|k| k.resource != r.kind.resource)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            self.stop(&id);
+        }
+        wanted
     }
 
     fn start(&mut self, id: &KindId, feed: Feed) {

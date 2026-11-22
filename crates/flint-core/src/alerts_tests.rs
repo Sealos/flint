@@ -1,7 +1,8 @@
-use serde_json::json;
-
 use super::*;
-use crate::problems::ProblemId;
+use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+use crate::problems::{Classifier, ProblemId, ReplicaSetIndex, WorkloadKind};
 
 const CLUSTER: &str = "cluster-a";
 
@@ -24,27 +25,22 @@ fn config() -> AlertConfig {
     }
 }
 
-fn observation(kind: ProblemKind, subject: ProblemSubject, owner: Option<&str>) -> Observation {
-    Observation {
-        problem: Problem {
-            id: ProblemId {
-                cluster: cluster(),
-                kind,
-                subject,
-            },
-            reason: None,
-            since: None,
+fn observation(kind: ProblemKind, subject: ProblemSubject, owner: Option<&str>) -> Problem {
+    Problem {
+        id: ProblemId {
+            cluster: cluster(),
+            kind,
+            subject,
         },
-        owner: owner.map(|name| AlertOwner {
-            group: "apps".into(),
-            kind: "Deployment".into(),
-            name: name.into(),
-        }),
+        owner: owner.map(|name| ProblemOwner::workload(WorkloadKind::Deployment, name)),
+        owner_known: true,
+        reason: None,
+        since: None,
     }
 }
 
 /// A crash loop in a pod of Deployment `owner`.
-fn crash(owner: &str, pod: &str) -> Observation {
+fn crash(owner: &str, pod: &str) -> Problem {
     let subject = ProblemSubject::Container {
         namespace: "ns".into(),
         pod: pod.into(),
@@ -54,7 +50,7 @@ fn crash(owner: &str, pod: &str) -> Observation {
     observation(ProblemKind::CrashLoop, subject, Some(owner))
 }
 
-fn node(name: &str) -> Observation {
+fn node(name: &str) -> Problem {
     let subject = ProblemSubject::Node {
         name: name.into(),
         uid: Some(format!("uid-{name}")),
@@ -62,7 +58,7 @@ fn node(name: &str) -> Observation {
     observation(ProblemKind::NodeNotReady, subject, None)
 }
 
-fn job(name: &str) -> Observation {
+fn job(name: &str) -> Problem {
     let subject = ProblemSubject::Job {
         namespace: "ns".into(),
         name: name.into(),
@@ -92,8 +88,8 @@ fn render(event: &AlertEvent) -> String {
 }
 
 enum Pass {
-    Up(Vec<Observation>),
-    Partial(Vec<Observation>, Vec<ProblemKind>),
+    Up(Vec<Problem>),
+    Partial(Vec<Problem>, Vec<ProblemKind>),
     Down,
 }
 use Pass::{Down, Partial, Up};
@@ -338,9 +334,9 @@ fn scenarios() {
         let mut engine = AlertEngine::new(config);
         for (index, Step(minute, pass, expected)) in steps.into_iter().enumerate() {
             let snapshot = match &pass {
-                Up(observations) => ClusterSnapshot::complete(observations),
-                Partial(observations, unchecked) => ClusterSnapshot::Available {
-                    observations,
+                Up(problems) => ClusterSnapshot::complete(problems),
+                Partial(problems, unchecked) => ClusterSnapshot::Available {
+                    problems,
                     unchecked,
                 },
                 Down => ClusterSnapshot::Unavailable,
@@ -378,114 +374,13 @@ fn unavailable_before_any_read_tracks_nothing() {
 }
 
 #[test]
-fn owners_are_read_from_metadata() {
-    type Expected = Option<(&'static str, &'static str, &'static str)>;
-    let refs = |api: &str, kind: &str, name: &str, controller: bool| {
-        json!([{
-            "apiVersion": api, "kind": kind, "name": name, "uid": "u", "controller": controller,
-        }])
-    };
-    let rs = |name: &str| refs("apps/v1", "ReplicaSet", name, true);
-    let rs_meta = |name: &str, owners: serde_json::Value| {
-        Some(json!({"name": name, "ownerReferences": owners}))
-    };
-    let owned_by_deployment = |deployment: &str, rs_name: &str| {
-        rs_meta(rs_name, refs("apps/v1", "Deployment", deployment, true))
-    };
-    let cases: Vec<(&str, serde_json::Value, Option<serde_json::Value>, Expected)> = vec![
-        (
-            "deployment",
-            rs("web-abc12"),
-            owned_by_deployment("web", "web-abc12"),
-            Some(("apps", "Deployment", "web")),
-        ),
-        (
-            "hyphenated deployment",
-            rs("my-web-abc12"),
-            owned_by_deployment("my-web", "my-web-abc12"),
-            Some(("apps", "Deployment", "my-web")),
-        ),
-        (
-            "no replicaset metadata",
-            rs("web-abc12"),
-            None,
-            Some(("apps", "ReplicaSet", "web-abc12")),
-        ),
-        (
-            "orphaned replicaset",
-            rs("web-abc12"),
-            rs_meta("web-abc12", json!([])),
-            Some(("apps", "ReplicaSet", "web-abc12")),
-        ),
-        (
-            "deployment reference is not the controller",
-            rs("web-abc12"),
-            rs_meta("web-abc12", refs("apps/v1", "Deployment", "web", false)),
-            Some(("apps", "ReplicaSet", "web-abc12")),
-        ),
-        (
-            "replicaset owned by another kind",
-            rs("web-abc12"),
-            rs_meta("web-abc12", refs("apps/v1", "StatefulSet", "web", true)),
-            Some(("apps", "ReplicaSet", "web-abc12")),
-        ),
-        (
-            "metadata of a different replicaset",
-            rs("web-abc12"),
-            owned_by_deployment("web", "web-other"),
-            Some(("apps", "ReplicaSet", "web-abc12")),
-        ),
-        (
-            "other api group",
-            refs("example.io/v1", "ReplicaSet", "web-abc12", true),
-            owned_by_deployment("web", "web-abc12"),
-            Some(("example.io", "ReplicaSet", "web-abc12")),
-        ),
-        (
-            "statefulset",
-            refs("apps/v1", "StatefulSet", "db", true),
-            None,
-            Some(("apps", "StatefulSet", "db")),
-        ),
-        (
-            "core group",
-            refs("v1", "ReplicationController", "rc", true),
-            None,
-            Some(("", "ReplicationController", "rc")),
-        ),
-        (
-            "not a controller",
-            refs("apps/v1", "StatefulSet", "db", false),
-            None,
-            None,
-        ),
-        ("no owners", json!([]), None, None),
-    ];
-    for (case, owners, replica_set, expected) in cases {
-        let meta: ObjectMeta = serde_json::from_value(json!({"ownerReferences": owners})).unwrap();
-        let replica_set: Option<ObjectMeta> =
-            replica_set.map(|rs| serde_json::from_value(rs).unwrap());
-        let expected = expected.map(|(group, kind, name)| AlertOwner {
-            group: group.into(),
-            kind: kind.into(),
-            name: name.into(),
-        });
-        assert_eq!(
-            AlertOwner::of_meta(&meta, replica_set.as_ref()),
-            expected,
-            "{case}"
-        );
-    }
-}
-
-#[test]
 fn tracking_is_bounded_and_overflow_is_summarised_once() {
     let mut engine = AlertEngine::new(config());
     engine
         .observe(&cluster(), at(0), ClusterSnapshot::complete(&[]))
         .unwrap();
     let extra = 10;
-    let many: Vec<Observation> = (0..MAX_TRACKED_PER_CLUSTER + extra)
+    let many: Vec<Problem> = (0..MAX_TRACKED_PER_CLUSTER + extra)
         .map(|i| node(&format!("n{i}")))
         .collect();
     let snapshot = ClusterSnapshot::complete(&many);
@@ -505,7 +400,7 @@ fn warnings_cannot_take_the_room_kept_for_critical_groups() {
     engine
         .observe(&cluster(), at(0), ClusterSnapshot::complete(&[]))
         .unwrap();
-    let mut seen: Vec<Observation> = (0..MAX_TRACKED_PER_CLUSTER)
+    let mut seen: Vec<Problem> = (0..MAX_TRACKED_PER_CLUSTER)
         .map(|i| job(&format!("j{i}")))
         .collect();
     engine
@@ -525,9 +420,8 @@ fn growing_overflow_is_summarised_with_its_severity() {
     engine
         .observe(&cluster(), at(0), ClusterSnapshot::complete(&[]))
         .unwrap();
-    let nodes = |count: usize| -> Vec<Observation> {
-        (0..count).map(|i| node(&format!("n{i:04}"))).collect()
-    };
+    let nodes =
+        |count: usize| -> Vec<Problem> { (0..count).map(|i| node(&format!("n{i:04}"))).collect() };
     let first = nodes(MAX_TRACKED_PER_CLUSTER + 1);
     engine
         .observe(&cluster(), at(1), ClusterSnapshot::complete(&first))
@@ -658,4 +552,317 @@ fn text_is_flints_wording_without_names() {
         assert_eq!(event.text(), expected);
         assert!(!event.text().contains(secret));
     }
+}
+
+/// A crash-looping pod controlled by ReplicaSet `replica_set`, whose UID is `uid-<replica_set>`.
+fn replica_set_pod(name: &str, replica_set: &str) -> Pod {
+    serde_json::from_value(serde_json::json!({
+        "metadata": {
+            "name": name, "namespace": "ns", "uid": format!("uid-{name}"),
+            "ownerReferences": [{
+                "apiVersion": "apps/v1", "kind": "ReplicaSet", "name": replica_set,
+                "uid": format!("uid-{replica_set}"), "controller": true,
+            }],
+        },
+        "spec": {"containers": [{"name": "c"}]},
+        "status": {"phase": "Running", "containerStatuses": [{
+            "name": "c", "image": "i", "imageID": "", "ready": false, "restartCount": 5,
+            "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+        }]},
+    }))
+    .unwrap()
+}
+
+/// The metadata of ReplicaSet `name`, controlled by Deployment `deployment` if given.
+fn replica_set(name: &str, deployment: Option<&str>) -> ObjectMeta {
+    let owners: Vec<_> = deployment
+        .into_iter()
+        .map(|deployment| {
+            serde_json::json!({
+                "apiVersion": "apps/v1", "kind": "Deployment", "name": deployment,
+                "uid": format!("uid-{deployment}"), "controller": true,
+            })
+        })
+        .collect();
+    serde_json::from_value(serde_json::json!({
+        "name": name, "namespace": "ns", "uid": format!("uid-{name}"), "ownerReferences": owners,
+    }))
+    .unwrap()
+}
+
+/// An engine fed from classified pods and a ReplicaSet read.
+struct OwnerHarness {
+    engine: AlertEngine,
+}
+
+impl OwnerHarness {
+    fn new() -> Self {
+        Self {
+            engine: AlertEngine::new(config()),
+        }
+    }
+
+    /// One pass with `replica_sets` as the read metadata, or none if it could not be read.
+    fn pass(
+        &mut self,
+        minute: i64,
+        pods: &[Pod],
+        replica_sets: Option<&[ObjectMeta]>,
+    ) -> Vec<String> {
+        let index: ReplicaSetIndex<'_> = match replica_sets {
+            Some(metas) => metas.iter().collect(),
+            None => ReplicaSetIndex::unavailable(),
+        };
+        let problems = Classifier::new(CLUSTER, at(minute)).pods_with_replica_sets(pods, &index);
+        let snapshot = ClusterSnapshot::complete(&problems);
+        let events = self
+            .engine
+            .observe(&cluster(), at(minute), snapshot)
+            .unwrap();
+        events.iter().map(render).collect()
+    }
+
+    fn open_names(&self) -> Vec<String> {
+        let open = self.engine.open(CLUSTER);
+        open.iter()
+            .map(|alert| match &alert.key.subject {
+                AlertSubject::Workload { owner, .. } => format!("{} {}", owner.kind, owner.name),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    fn open_states(&self) -> Vec<OpenAlertState> {
+        let open = self.engine.open(CLUSTER);
+        open.iter().map(|alert| alert.state).collect()
+    }
+
+    /// Passes over `minutes` that must all produce no event.
+    fn quiet(
+        &mut self,
+        minutes: std::ops::RangeInclusive<i64>,
+        pods: &[Pod],
+        replica_sets: Option<&[ObjectMeta]>,
+    ) {
+        for minute in minutes {
+            let events = self.pass(minute, pods, replica_sets);
+            assert!(events.is_empty(), "minute {minute}: {events:?}");
+        }
+    }
+}
+
+#[test]
+fn owner_metadata_going_missing_neither_duplicates_nor_resolves() {
+    let pods = [replica_set_pod("web-abc12-1", "web-abc12")];
+    let read = [replica_set("web-abc12", Some("web"))];
+    let mut owners = OwnerHarness::new();
+    assert!(owners.pass(0, &[], Some(&read)).is_empty());
+    assert_eq!(owners.pass(1, &pods, Some(&read)), ["raise web x1"]);
+    owners.quiet(2..=30, &pods, None);
+    assert_eq!(owners.open_names(), ["Deployment web"]);
+    assert_eq!(owners.open_states(), [OpenAlertState::Unknown]);
+}
+
+#[test]
+fn owner_metadata_coming_back_neither_duplicates_nor_resolves() {
+    let pods = [replica_set_pod("web-abc12-1", "web-abc12")];
+    let read = [replica_set("web-abc12", Some("web"))];
+    let mut owners = OwnerHarness::new();
+    assert!(owners.pass(0, &[], Some(&read)).is_empty());
+    assert_eq!(owners.pass(1, &pods, Some(&read)), ["raise web x1"]);
+    assert!(owners.pass(2, &pods, None).is_empty());
+    owners.quiet(3..=30, &pods, Some(&read));
+    assert_eq!(owners.open_names(), ["Deployment web"]);
+    assert_eq!(owners.open_states(), [OpenAlertState::Open]);
+}
+
+#[test]
+fn a_partial_replica_set_read_does_not_split_a_deployment() {
+    let pods = [
+        replica_set_pod("web-abc12-1", "web-abc12"),
+        replica_set_pod("web-def34-1", "web-def34"),
+    ];
+    let partial = [replica_set("web-abc12", Some("web"))];
+    let full = [
+        replica_set("web-abc12", Some("web")),
+        replica_set("web-def34", Some("web")),
+    ];
+    let mut owners = OwnerHarness::new();
+    assert!(owners.pass(0, &[], Some(&full)).is_empty());
+    owners.quiet(1..=14, &pods, Some(&partial));
+    assert!(owners.open_names().is_empty(), "nothing raises on a guess");
+    assert_eq!(owners.pass(15, &pods, Some(&full)), ["raise web x2"]);
+    owners.quiet(16..=20, &pods, Some(&partial));
+    owners.quiet(21..=40, &pods, Some(&full));
+    assert_eq!(owners.open_names(), ["Deployment web"]);
+}
+
+#[test]
+fn web_and_web_api_never_affect_each_other() {
+    let web = [replica_set_pod("web-abc12-1", "web-abc12")];
+    let api = [replica_set_pod("web-api-xyz12-1", "web-api-xyz12")];
+    let read = [
+        replica_set("web-abc12", Some("web")),
+        replica_set("web-api-xyz12", Some("web-api")),
+    ];
+    let mut owners = OwnerHarness::new();
+    owners.pass(0, &[], Some(&read));
+    assert_eq!(owners.pass(1, &web, Some(&read)), ["raise web x1"]);
+    owners.quiet(2..=30, &api, None);
+    assert_eq!(
+        owners.pass(31, &api, Some(&read)),
+        ["raise web-api x1"],
+        "web-api raises as soon as it is known, without waiting for web"
+    );
+    owners.quiet(32..=40, &api, Some(&read));
+    assert_eq!(
+        owners.pass(41, &api, Some(&read)),
+        ["resolve web"],
+        "a web-api pod must not keep web open"
+    );
+    assert_eq!(owners.open_names(), ["Deployment web-api"]);
+}
+
+#[test]
+fn a_rollout_during_an_outage_neither_duplicates_nor_resolves() {
+    let old = [replica_set_pod("web-abc12-1", "web-abc12")];
+    let new = [replica_set_pod("web-def34-1", "web-def34")];
+    let read = [
+        replica_set("web-abc12", Some("web")),
+        replica_set("web-def34", Some("web")),
+    ];
+    let mut owners = OwnerHarness::new();
+    owners.pass(0, &[], Some(&read));
+    assert_eq!(owners.pass(1, &old, Some(&read)), ["raise web x1"]);
+    owners.quiet(2..=5, &old, None);
+    owners.quiet(6..=30, &new, None);
+    owners.quiet(31..=60, &new, Some(&read));
+    assert_eq!(owners.open_names(), ["Deployment web"]);
+    assert_eq!(owners.open_states(), [OpenAlertState::Open]);
+}
+
+#[test]
+fn a_problem_coming_and_going_in_an_outage_waits_for_its_owner() {
+    let pods = [replica_set_pod("web-abc12-1", "web-abc12")];
+    let read = [replica_set("web-abc12", Some("web"))];
+    let mut owners = OwnerHarness::new();
+    owners.pass(0, &[], Some(&read));
+    for minute in 1..=240 {
+        let seen: &[Pod] = if minute % 2 == 1 { &pods } else { &[] };
+        let events = owners.pass(minute, seen, None);
+        assert!(events.is_empty(), "minute {minute}: {events:?}");
+    }
+    assert!(owners.open_names().is_empty());
+    assert_eq!(owners.pass(241, &pods, Some(&read)), ["raise web x1"]);
+    owners.quiet(242..=250, &pods, Some(&read));
+
+    let mut gone = OwnerHarness::new();
+    gone.pass(0, &[], Some(&read));
+    gone.quiet(1..=5, &pods, None);
+    gone.quiet(6..=20, &[], Some(&read));
+    assert!(gone.open_names().is_empty(), "it never raised");
+}
+
+#[test]
+fn a_real_recovery_in_an_outage_resolves_once_owners_are_known() {
+    let web = replica_set_pod("web-abc12-1", "web-abc12");
+    let api = replica_set_pod("api-xyz12-1", "api-xyz12");
+    let read = [
+        replica_set("web-abc12", Some("web")),
+        replica_set("api-xyz12", Some("api")),
+    ];
+    let mut owners = OwnerHarness::new();
+    owners.pass(0, &[], Some(&read));
+    assert_eq!(
+        owners.pass(1, std::slice::from_ref(&web), Some(&read)),
+        ["raise web x1"]
+    );
+    // Web recovers, while another pod of the kind keeps the kind unchecked.
+    let rest = [api];
+    owners.quiet(2..=40, &rest, None);
+    assert_eq!(owners.open_states(), [OpenAlertState::Unknown]);
+    assert_eq!(owners.pass(41, &rest, Some(&read)), ["raise api x1"]);
+    owners.quiet(42..=50, &rest, Some(&read));
+    assert_eq!(owners.pass(51, &rest, Some(&read)), ["resolve web"]);
+}
+
+#[test]
+fn a_pass_with_no_problem_of_a_kind_is_a_check_even_without_replica_sets() {
+    let pods = [replica_set_pod("web-abc12-1", "web-abc12")];
+    let read = [replica_set("web-abc12", Some("web"))];
+    let mut owners = OwnerHarness::new();
+    owners.pass(0, &[], Some(&read));
+    assert_eq!(owners.pass(1, &pods, Some(&read)), ["raise web x1"]);
+    assert!(owners.pass(2, &pods, None).is_empty());
+    owners.quiet(3..=12, &[], None);
+    assert_eq!(owners.pass(13, &[], None), ["resolve web"]);
+}
+
+#[test]
+fn a_new_crash_after_an_outage_raises_once() {
+    let pods = [replica_set_pod("web-abc12-1", "web-abc12")];
+    let read = [replica_set("web-abc12", Some("web"))];
+    let mut owners = OwnerHarness::new();
+    owners.pass(0, &[], Some(&read));
+    owners.quiet(1..=5, &[], None);
+    owners.quiet(6..=10, &pods, None);
+    assert_eq!(owners.pass(11, &pods, Some(&read)), ["raise web x1"]);
+    owners.quiet(12..=30, &pods, Some(&read));
+    assert_eq!(owners.open_names(), ["Deployment web"]);
+}
+
+#[test]
+fn an_unknown_owner_leaves_other_kinds_checked() {
+    let pods = [replica_set_pod("web-abc12-1", "web-abc12")];
+    let mut problems = Classifier::new(CLUSTER, at(1)).pods(&pods);
+    problems.push(node("n1"));
+    let mut engine = AlertEngine::new(config());
+    engine
+        .observe(&cluster(), at(0), ClusterSnapshot::complete(&[]))
+        .unwrap();
+    let events = engine
+        .observe(&cluster(), at(1), ClusterSnapshot::complete(&problems))
+        .unwrap();
+    let got: Vec<String> = events.iter().map(render).collect();
+    assert_eq!(got, ["raise n1 x1"]);
+}
+
+#[test]
+fn an_unknown_owner_in_another_cluster_changes_nothing() {
+    let pods = [replica_set_pod("web-abc12-1", "web-abc12")];
+    let foreign = Classifier::new("cluster-b", at(1)).pods(&pods);
+    let unchecked = unchecked_kinds(&cluster(), &foreign, &[]);
+    assert!(unchecked.is_empty());
+}
+
+#[test]
+fn a_new_crash_alerts_as_soon_as_its_owner_is_known() {
+    let pods = [replica_set_pod("web-abc12-1", "web-abc12")];
+    let read = [replica_set("web-abc12", Some("web"))];
+    let mut owners = OwnerHarness::new();
+    owners.pass(0, &[], Some(&[]));
+    assert!(owners.pass(1, &pods, None).is_empty());
+    assert_eq!(owners.pass(2, &pods, Some(&read)), ["raise web x1"]);
+    assert_eq!(owners.open_names(), ["Deployment web"]);
+}
+
+#[test]
+fn a_problem_of_unknown_owner_at_the_first_check_is_baseline() {
+    let pods = [replica_set_pod("web-abc12-1", "web-abc12")];
+    let read = [replica_set("web-abc12", Some("web"))];
+    let mut owners = OwnerHarness::new();
+    owners.quiet(0..=5, &pods, None);
+    assert!(owners.pass(6, &pods, Some(&read)).is_empty());
+    assert_eq!(owners.open_names(), ["Deployment web"]);
+}
+
+#[test]
+fn a_replica_set_read_with_no_deployment_stays_its_own_owner() {
+    let pods = [replica_set_pod("solo-abc12-1", "solo-abc12")];
+    let read = [replica_set("solo-abc12", None)];
+    let mut owners = OwnerHarness::new();
+    owners.pass(0, &[], Some(&read));
+    assert_eq!(owners.pass(1, &pods, Some(&read)), ["raise solo-abc12 x1"]);
+    owners.quiet(2..=20, &pods, None);
+    assert_eq!(owners.open_names(), ["ReplicaSet solo-abc12"]);
 }
