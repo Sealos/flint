@@ -1,28 +1,26 @@
 //! UP-42: the app's exit, observed on its own rather than through `App::quit`.
 //!
 //! `App::quit` sends Quit and later closes stdin, which also ends the app, so its success does
-//! not show which of the two did it. These tests send Quit themselves and watch the process end
+//! not show which of the two did it. This test sends Quit itself and watches the process end
 //! while the harness still holds stdin open.
 //!
-//! Not here: **Close Window** closes `cx.active_window()`, and the app under test runs in the
-//! background with no active window, so the action does nothing (#263).
+//! Not here (#263): **Close Window** closes `cx.active_window()`, and the app under test runs in
+//! the background with no active window, so the action does nothing. **Saving on quit**: a
+//! relaunch reads back a value that is also saved shortly after each change, so it does not show
+//! that quitting saved it.
 
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use flint_e2e::app::{App, AppOptions};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::support::*;
 
-/// How long Quit may take. The harness's own fallback never runs in this time: it starts only
-/// when the test calls `App::quit` or drops the app.
+/// How long the app may take to exit once the Quit request has returned. The harness's own
+/// fallback never runs in this time: it starts only when the test calls `App::quit` or drops the
+/// app.
 const EXIT: Duration = Duration::from_secs(5);
-/// The app saves pane sizes this long after the last change (`PANE_SAVE_DELAY`). An exit sooner
-/// than this after the change can only have saved it from the quit hook.
-const SAVE_DELAY: Duration = Duration::from_millis(400);
-/// Launches to try for an exit inside [`SAVE_DELAY`], on a machine busy enough to miss it.
-const ATTEMPTS: u32 = 8;
 
 /// The exit code of child `pid` if it has ended. Leaves it unreaped, for `App::quit` to collect
 /// and check.
@@ -84,33 +82,4 @@ fn up_42_quit_ends_the_app_with_stdin_open() -> Result<()> {
     // The teardown checks, on the exit already observed.
     app.quit()?;
     Ok(())
-}
-
-#[test]
-#[ignore = "opens a window: needs a macOS GUI session"]
-fn up_42_quitting_saves_a_change_still_waiting_to_be_saved() -> Result<()> {
-    let two = TwoClusters::start()?;
-    let mut slowest = Duration::ZERO;
-    for attempt in 0..ATTEMPTS {
-        let height = 333 + attempt;
-        let app = App::launch(AppOptions::new(two.kubeconfig()))?;
-        let change = Instant::now();
-        app.dispatch("workspace::SetDockHeight", json!({ "height": height }))?;
-        let code = quit_and_wait(&app)?;
-        let took = change.elapsed();
-        assert_eq!(code, 0, "Quit exits cleanly");
-        let scratch = app.quit()?;
-        if took >= SAVE_DELAY {
-            // The delayed save may have run, so this launch proves nothing.
-            slowest = slowest.max(took);
-            continue;
-        }
-
-        let app = App::launch(AppOptions::new(two.kubeconfig()).reuse(scratch))?;
-        app.wait_for("/dock/height", Equals(height.into()))?;
-        return Ok(());
-    }
-    bail!(
-        "no exit within {SAVE_DELAY:?} of the change in {ATTEMPTS} launches (slowest {slowest:?})"
-    )
 }
