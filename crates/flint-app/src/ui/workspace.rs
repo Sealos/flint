@@ -204,6 +204,9 @@ enum MainPanes {
 /// Pane widths are written to `state.toml` once a drag has paused this long.
 const PANE_SAVE_DELAY: Duration = Duration::from_millis(400);
 
+/// The most characters the namespace filter's button shows: a longer name ends in an ellipsis.
+const NAMESPACE_LABEL_MAX_CHARS: usize = 18;
+
 /// The key context entry holding a namespace row's index in the picker's list.
 const NAMESPACE_ROW: &str = "namespace_row";
 
@@ -1777,10 +1780,16 @@ impl Workspace {
                 Button::new("namespace-filter-button")
                     .xsmall()
                     .outline()
-                    .label(summary.to_owned())
+                    .label(ellipsize(summary, NAMESPACE_LABEL_MAX_CHARS))
+                    // The label is cut to a few characters, so the watch mode button beside it
+                    // stays on screen at the minimum width (UP-33). The accessible name and the
+                    // tooltip keep the whole name.
+                    .accessibility_label(summary.to_owned())
                     .track_focus(&self.namespace_button_focus)
                     .tab_stop(false)
-                    .tooltip("Filter by namespace (remembered per cluster)"),
+                    .tooltip(format!(
+                        "{summary}\nFilter by namespace (remembered per cluster)"
+                    )),
             )
             .content(move |_, window, cx| {
                 // Just opened: its controls have tab stops once this frame is drawn.
@@ -2771,6 +2780,15 @@ fn watch_mode_label(mode: WatchMode) -> &'static str {
         WatchMode::All => "Live: all kinds",
         WatchMode::OnView => "Live: open views only",
     }
+}
+
+/// `text` cut to `max` characters, with an ellipsis in place of the cut part.
+fn ellipsize(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let head: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
 }
 
 /// "All namespaces", "demo", or "3 namespaces".
