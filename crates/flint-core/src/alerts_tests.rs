@@ -138,6 +138,26 @@ fn scenarios() {
             ],
         ),
         (
+            "a recurrence first seen after the cooldown resolves and raises again",
+            config(),
+            vec![
+                Step(0, Up(vec![]), &[]),
+                Step(1, Up(vec![web()]), &["raise web x1"]),
+                Step(2, Up(vec![]), &[]),
+                Step(12, Up(vec![web()]), &["resolve web", "raise web x1"]),
+                Step(13, Up(vec![web()]), &[]),
+            ],
+        ),
+        (
+            "a baseline group that recurs after the cooldown raises without a resolve",
+            config(),
+            vec![
+                Step(0, Up(vec![web()]), &[]),
+                Step(1, Up(vec![]), &[]),
+                Step(20, Up(vec![web()]), &["raise web x1"]),
+            ],
+        ),
+        (
             "a rollout's replacement pods stay one alert",
             config(),
             vec![
@@ -456,6 +476,68 @@ fn tracking_is_bounded_and_overflow_is_summarised_once() {
     assert_eq!(summary.untracked as usize, extra);
     let events = engine.observe(&cluster(), at(7), snapshot).unwrap();
     assert_eq!(events, vec![], "overflow must not repeat");
+}
+
+#[test]
+fn warnings_cannot_take_the_room_kept_for_critical_groups() {
+    let mut engine = AlertEngine::new(config());
+    engine
+        .observe(&cluster(), at(0), ClusterSnapshot::complete(&[]))
+        .unwrap();
+    let mut seen: Vec<Observation> = (0..MAX_TRACKED_PER_CLUSTER)
+        .map(|i| job(&format!("j{i}")))
+        .collect();
+    engine
+        .observe(&cluster(), at(1), ClusterSnapshot::complete(&seen))
+        .unwrap();
+    seen.push(node("n1"));
+    let events = engine
+        .observe(&cluster(), at(7), ClusterSnapshot::complete(&seen))
+        .unwrap();
+    let got: Vec<String> = events.iter().map(render).collect();
+    assert!(got.contains(&"raise n1 x1".to_owned()), "{got:?}");
+}
+
+#[test]
+fn growing_overflow_is_summarised_with_its_severity() {
+    let mut engine = AlertEngine::new(config());
+    engine
+        .observe(&cluster(), at(0), ClusterSnapshot::complete(&[]))
+        .unwrap();
+    let nodes = |count: usize| -> Vec<Observation> {
+        (0..count).map(|i| node(&format!("n{i:04}"))).collect()
+    };
+    let first = nodes(MAX_TRACKED_PER_CLUSTER + 1);
+    engine
+        .observe(&cluster(), at(1), ClusterSnapshot::complete(&first))
+        .unwrap();
+    let grown = nodes(MAX_TRACKED_PER_CLUSTER + 3);
+    let events = engine
+        .observe(&cluster(), at(7), ClusterSnapshot::complete(&grown))
+        .unwrap();
+    let Some(AlertEvent::Summary(summary)) = events.last() else {
+        panic!("no summary: {events:?}");
+    };
+    assert_eq!(summary.untracked, 2);
+    assert_eq!(summary.highest, Some(ProblemSeverity::Critical));
+}
+
+#[test]
+fn resolved_text_states_what_was_observed() {
+    let cases = [
+        (
+            ProblemKind::OomKilled,
+            "Out-of-memory kill no longer reported",
+        ),
+        (
+            ProblemKind::NodeNotReady,
+            "Node no longer reported as not ready",
+        ),
+        (ProblemKind::JobFailed, "Job failure no longer reported"),
+    ];
+    for (kind, expected) in cases {
+        assert_eq!(resolved_text(kind), expected);
+    }
 }
 
 #[test]

@@ -59,6 +59,10 @@ pub const MAX_CLUSTERS: usize = 256;
 /// The most groups tracked per cluster. Further ones are counted in a summary.
 pub const MAX_TRACKED_PER_CLUSTER: usize = 512;
 
+/// How many of the tracked slots only critical groups can take, so that long-lived warnings
+/// cannot crowd out a new critical problem.
+pub const CRITICAL_RESERVED_PER_CLUSTER: usize = 64;
+
 /// The longest name kept in a key: the Kubernetes limit for a DNS subdomain name.
 pub const MAX_NAME_BYTES: usize = 253;
 
@@ -270,7 +274,7 @@ pub struct AlertSummary {
     pub resolved: u32,
     /// Problem groups beyond what the engine can track.
     pub untracked: u32,
-    /// The most urgent of the `new` groups.
+    /// The most urgent of the `new` groups and of the `untracked` groups with a known kind.
     pub highest: Option<ProblemSeverity>,
 }
 
@@ -312,9 +316,9 @@ impl AlertEvent {
 fn resolved_text(kind: ProblemKind) -> &'static str {
     match kind {
         ProblemKind::CrashLoop => "Container is no longer crashing",
-        ProblemKind::OomKilled => "No recent out-of-memory kills",
-        ProblemKind::NodeNotReady => "Node is ready again",
-        ProblemKind::JobFailed => "Job failure has cleared",
+        ProblemKind::OomKilled => "Out-of-memory kill no longer reported",
+        ProblemKind::NodeNotReady => "Node no longer reported as not ready",
+        ProblemKind::JobFailed => "Job failure no longer reported",
     }
 }
 
@@ -442,8 +446,8 @@ struct ClusterState {
     window: RateWindow,
     unavailable_since: Option<Timestamp>,
     unavailable_reported: bool,
-    /// Whether the last pass had more groups than fit, so a summary is not repeated.
-    overflowing: bool,
+    /// How many groups did not fit in the last pass, so only growth is reported.
+    last_untracked: u32,
 }
 
 impl ClusterState {
@@ -454,7 +458,7 @@ impl ClusterState {
             window: RateWindow::new(now),
             unavailable_since: None,
             unavailable_reported: false,
-            overflowing: false,
+            last_untracked: 0,
         }
     }
 
@@ -608,9 +612,11 @@ impl AlertEngine {
 
         let mut new: Vec<(AlertKey, Seen)> = seen.into_iter().collect();
         new.sort_by(|(a, _), (b, _)| alert_order(a).cmp(&alert_order(b)));
+        let mut untracked_highest = None;
         for (key, group) in new {
-            if state.tracked.len() >= MAX_TRACKED_PER_CLUSTER {
+            if state.tracked.len() >= tracking_limit(key.kind.severity()) {
                 untracked += 1;
+                untracked_highest = untracked_highest.max(Some(key.kind.severity()));
                 continue;
             }
             let baseline = !config.alert_on_existing && !state.baselined.contains(&key.kind);
@@ -642,10 +648,12 @@ impl AlertEngine {
                 state.baselined.insert(kind);
             }
         }
-        if untracked > 0 && !state.overflowing {
-            state.window.pending_untracked = untracked;
+        let growth = untracked.saturating_sub(state.last_untracked);
+        if growth > 0 {
+            state.window.pending_untracked += growth;
+            state.window.pending_highest = state.window.pending_highest.max(untracked_highest);
         }
-        state.overflowing = untracked > 0;
+        state.last_untracked = untracked;
         events.extend(state.window.take_summary(cluster));
         events
     }
@@ -654,6 +662,14 @@ impl AlertEngine {
 /// Most urgent first, then by key, so results do not depend on snapshot or hash order.
 fn alert_order(key: &AlertKey) -> (Reverse<ProblemSeverity>, &AlertKey) {
     (Reverse(key.kind.severity()), key)
+}
+
+/// How many groups may be tracked before a new group of this severity no longer fits.
+fn tracking_limit(severity: ProblemSeverity) -> usize {
+    match severity {
+        ProblemSeverity::Critical => MAX_TRACKED_PER_CLUSTER,
+        ProblemSeverity::Warning => MAX_TRACKED_PER_CLUSTER - CRITICAL_RESERVED_PER_CLUSTER,
+    }
 }
 
 /// Groups a pass by key, returning the groups and how many observations cannot be kept.
@@ -698,20 +714,23 @@ fn update_tracked(
 ) -> Vec<(AlertKey, Tracked)> {
     let mut resolved = Vec::new();
     state.tracked.retain(|key, entry| {
-        if let Some(group) = seen.remove(key) {
+        if unchecked.contains(&key.kind) {
+            entry.status = Status::Unknown;
+            return true;
+        }
+        let clearing_since = match entry.status {
+            Status::Clearing { since } => Some(since),
+            Status::Open | Status::Unknown => None,
+        };
+        // A group back after its deadline stays in `seen`, to raise as a new occurrence.
+        let expired = clearing_since.is_some_and(|since| now.duration_since(since) >= cooldown);
+        if let Some(group) = (!expired).then(|| seen.remove(key)).flatten() {
             entry.status = Status::Open;
             entry.affected = group.affected;
             entry.summary = group.summary;
             return true;
         }
-        if unchecked.contains(&key.kind) {
-            entry.status = Status::Unknown;
-            return true;
-        }
-        let since = match entry.status {
-            Status::Clearing { since } => since,
-            Status::Open | Status::Unknown => now,
-        };
+        let since = clearing_since.unwrap_or(now);
         if now.duration_since(since) >= cooldown {
             resolved.push((key.clone(), *entry));
             return false;
