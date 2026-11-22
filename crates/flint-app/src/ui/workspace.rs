@@ -62,6 +62,11 @@ use flint_core::display::{self, ClusterNames};
 /// The height of the main area's header and the list's toolbar.
 pub const HEADER_HEIGHT: f32 = 32.;
 
+/// Below this main area width the detail-alone header puts its namespace and watch controls on a
+/// second row. Fixed, so the layout does not change with label lengths while resizing: it holds
+/// the padding, Back, the longest labels of both controls, and a shortened context name.
+const HEADER_ONE_ROW_MIN_WIDTH: f32 = 590.;
+
 /// The panes the user can resize by dragging their edge, with default and limit widths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pane {
@@ -1674,6 +1679,7 @@ impl Workspace {
     fn render_header(
         &self,
         cluster: &ClusterSummary,
+        window_width: f32,
         theme: &Theme,
         cx: &Context<Self>,
     ) -> impl IntoElement {
@@ -1740,14 +1746,22 @@ impl Workspace {
             );
         }
 
-        h_flex()
+        let detail_alone = self.main_panes(cx) == MainPanes::DetailAlone;
+        let widths = self.layout(window_width, cx);
+        let main_width = window_width - widths.clusters - widths.navigation;
+        let two_rows = detail_alone && header_needs_two_rows(main_width);
+        let namespaces = controls
+            .namespaces
+            .then(|| self.render_namespace_filter(&ns_summary, cx));
+        let watch_mode = controls
+            .watch_mode
+            .then(|| self.render_watch_mode(&name, cx));
+        let first_row = h_flex()
             .h(px(HEADER_HEIGHT))
             .flex_none()
             .px_3()
             .gap_2()
-            .border_b_1()
-            .border_color(theme.border)
-            .when(self.main_panes(cx) == MainPanes::DetailAlone, |el| {
+            .when(detail_alone, |el| {
                 el.child(
                     div().flex_none().child(
                         Button::new("detail-back")
@@ -1764,13 +1778,38 @@ impl Workspace {
                     ),
                 )
             })
-            .child(breadcrumb)
-            .when(controls.namespaces, |el| {
-                el.child(self.render_namespace_filter(&ns_summary, cx))
-            })
-            .when(controls.watch_mode, |el| {
-                el.child(self.render_watch_mode(&name, cx))
-            })
+            .child(breadcrumb);
+        if two_rows {
+            v_flex()
+                .id("main-header")
+                .w_full()
+                .flex_none()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(first_row.w_full())
+                .child(
+                    h_flex()
+                        .id("header-controls-row")
+                        .w_full()
+                        .h(px(HEADER_HEIGHT))
+                        .flex_none()
+                        .px_3()
+                        .gap_2()
+                        .justify_end()
+                        .children(namespaces)
+                        .children(watch_mode)
+                        .test_support(),
+                )
+                .test_support()
+                .into_any_element()
+        } else {
+            first_row
+                .border_b_1()
+                .border_color(theme.border)
+                .children(namespaces)
+                .children(watch_mode)
+                .into_any_element()
+        }
     }
 
     fn render_namespace_filter(&self, summary: &str, cx: &Context<Self>) -> impl IntoElement {
@@ -2168,6 +2207,7 @@ impl Workspace {
                     && self.main_panes(cx) == MainPanes::DetailAlone =>
             {
                 h_flex()
+                    .id("detail-alone-pane")
                     .flex_1()
                     .min_h_0()
                     .children(
@@ -2175,6 +2215,7 @@ impl Workspace {
                             .clone()
                             .map(|detail| div().flex_1().min_w_0().h_full().child(detail)),
                     )
+                    .test_support()
                     .into_any_element()
             }
             (Some(list), state) if !matches!(state, ConnectionState::Failed(_)) => h_flex()
@@ -2251,7 +2292,7 @@ impl Workspace {
             .flex_1()
             .min_w_0()
             .h_full()
-            .child(self.render_header(&cluster, theme, cx))
+            .child(self.render_header(&cluster, window_width, theme, cx))
             .child(content)
             .into_any_element()
     }
@@ -2789,6 +2830,11 @@ fn no_contexts_text(kubeconfig_env: Option<&std::ffi::OsStr>, unreadable: bool) 
         title: "No clusters found",
         lines,
     }
+}
+
+/// Whether a main area this wide puts the detail-alone header's controls on a second row.
+fn header_needs_two_rows(main_width: f32) -> bool {
+    main_width < HEADER_ONE_ROW_MIN_WIDTH
 }
 
 /// Which header controls work for the active cluster: none while its connection failed (no
