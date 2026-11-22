@@ -249,6 +249,8 @@ pub struct Workspace {
     detail: Option<Entity<DetailView>>,
     /// The window is too narrow for the list and the detail side by side, as of the last draw.
     narrow: bool,
+    /// The main header shows two rows, as of the last draw: the dock leaves it more room.
+    two_row_header: bool,
     /// In a narrow window, the list is in front of the open detail.
     list_in_front: bool,
     /// A right button went down since the last draw: the row it selects stays on show, as it
@@ -428,6 +430,7 @@ impl Workspace {
             list: None,
             detail: None,
             narrow: false,
+            two_row_header: false,
             list_in_front: false,
             right_press: false,
             menu_row_pending: false,
@@ -571,14 +574,18 @@ impl Workspace {
 
     /// The dock's height as shown in a window `window_height` tall.
     pub(in crate::ui) fn dock_height(&self, window_height: f32) -> f32 {
-        dock::dock_height(self.panes.dock, window_height)
+        dock::dock_height(self.panes.dock, window_height, self.two_row_header)
     }
 
     /// Sets the dock's height within its limits and saves it once changes pause. Dragging its
     /// edge and `SetDockHeight` both end here.
     fn resize_dock(&mut self, height: f32, window_height: f32, cx: &mut Context<Self>) {
         let shown = self.dock_height(window_height);
-        let height = dock::dock_height(Some(height.max(0.).round() as u32), window_height);
+        let height = dock::dock_height(
+            Some(height.max(0.).round() as u32),
+            window_height,
+            self.two_row_header,
+        );
         if height == shown {
             return;
         }
@@ -1747,9 +1754,7 @@ impl Workspace {
         }
 
         let detail_alone = self.main_panes(cx) == MainPanes::DetailAlone;
-        let widths = self.layout(window_width, cx);
-        let main_width = window_width - widths.clusters - widths.navigation;
-        let two_rows = detail_alone && header_needs_two_rows(main_width);
+        let two_rows = self.header_has_two_rows(window_width, cx);
         let namespaces = controls
             .namespaces
             .then(|| self.render_namespace_filter(&ns_summary, cx));
@@ -2071,6 +2076,13 @@ impl Workspace {
         let nav_shown = self.model.read(cx).active_cluster().is_some();
         let detail_beside = self.detail.is_some() && self.main_panes(cx) == MainPanes::Split;
         layout(&self.panes, window_width, nav_shown, detail_beside)
+    }
+
+    /// Whether the main header puts its controls on a second row in a window this wide.
+    fn header_has_two_rows(&self, window_width: f32, cx: &App) -> bool {
+        let widths = self.layout(window_width, cx);
+        let main_width = window_width - widths.clusters - widths.navigation;
+        self.main_panes(cx) == MainPanes::DetailAlone && header_needs_two_rows(main_width)
     }
 
     /// What the main area shows of the list and the open detail. A failed connection shows
@@ -2909,6 +2921,7 @@ impl Render for Workspace {
         let window_width = f32::from(window.viewport_size().width);
         let window_height = f32::from(window.viewport_size().height);
         self.sync_narrow_layout(window_width, window, cx);
+        self.two_row_header = self.header_has_two_rows(window_width, cx);
         let cx: &Context<Self> = cx;
         let theme = cx.theme();
         let has_cluster = self.model.read(cx).active_cluster().is_some();

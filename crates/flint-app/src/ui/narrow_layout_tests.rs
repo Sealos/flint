@@ -773,6 +773,47 @@ async fn the_detail_alone_header_puts_its_controls_on_a_second_row(cx: &mut Test
     assert_eq!(detail.bottom(), px(480.), "the detail is not cut off");
 }
 
+// #433: with the dock at its tallest, the two-row header still leaves a failed detail its Retry.
+#[gpui_kit::test]
+async fn a_failed_detail_keeps_retry_above_a_tall_dock(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, ROWS).await;
+    t.click(cx, "row-uid-web");
+    draw(cx, &t);
+    let view = t.detail(cx).unwrap();
+    view.update(cx, |view, cx| {
+        view.show_failed("connection refused".into(), cx)
+    });
+    t.dispatch(cx, "dock::ToggleDock", Value::Null).unwrap();
+    // The tallest the dock gets at the minimum window height in the other layouts.
+    t.dispatch(
+        cx,
+        "workspace::SetDockHeight",
+        serde_json::json!({"height": 320}),
+    )
+    .unwrap();
+    resize(cx, &t, 760., 480.);
+    assert!(shown(cx, &t, "header-controls-row"));
+
+    let pane = bounds(cx, &t, "detail-alone-pane");
+    let dock = bounds(cx, &t, "dock-pane");
+    let retry = bounds(cx, &t, "detail-retry");
+    assert!(pane.size.height >= px(128.), "{pane:?}");
+    assert!(
+        retry.top() >= pane.top() && retry.bottom() <= pane.bottom(),
+        "{retry:?} inside {pane:?}"
+    );
+    assert!(retry.bottom() <= dock.top(), "{retry:?} above {dock:?}");
+
+    // The limit does not rewrite the saved height: the list's layout gets it back.
+    let saved = t.workspace.read_with(cx, |ws, _| ws.panes.dock);
+    assert_eq!(saved, Some(320));
+    t.click(cx, "detail-back");
+    draw(cx, &t);
+    assert_eq!(bounds(cx, &t, "dock-pane").size.height, px(320.));
+}
+
 // #421: the main window cannot be made smaller than the layout supports.
 #[gpui_kit::test]
 fn the_main_window_has_a_minimum_size(cx: &mut TestAppContext) {

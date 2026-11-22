@@ -56,6 +56,9 @@ pub const DEFAULT_HEIGHT: f32 = 280.;
 pub const MIN_HEIGHT: f32 = 120.;
 /// The dock leaves the main area at least this much (its header and a few rows).
 const MIN_MAIN_HEIGHT: f32 = 160.;
+/// The same under the two-row header: both rows, the detail's title and tabs, and a failed
+/// fetch's message with its Retry button.
+const MIN_MAIN_HEIGHT_TWO_ROW_HEADER: f32 = 256.;
 /// What a tab whose context left kubeconfig says of it.
 const REMOVED: &str = "This context is no longer in kubeconfig.";
 /// What an empty dock says.
@@ -64,10 +67,16 @@ const EMPTY: &str = "No logs or shells open.";
 const TAB_BAR_HEIGHT: f32 = 28.;
 
 /// The dock's height in a window `window_height` tall: as saved (or the default), within
-/// [`MIN_HEIGHT`] and what leaves the main area [`MIN_MAIN_HEIGHT`]. The saved height is
-/// untouched, so a taller window gets it back.
-pub fn dock_height(saved: Option<u32>, window_height: f32) -> f32 {
-    let max = (window_height - MIN_MAIN_HEIGHT).max(MIN_HEIGHT);
+/// [`MIN_HEIGHT`] and what leaves the main area [`MIN_MAIN_HEIGHT`], or
+/// [`MIN_MAIN_HEIGHT_TWO_ROW_HEADER`] under a two-row header. The saved height is untouched, so
+/// a taller window or another layout gets it back.
+pub fn dock_height(saved: Option<u32>, window_height: f32, two_row_header: bool) -> f32 {
+    let min_main = if two_row_header {
+        MIN_MAIN_HEIGHT_TWO_ROW_HEADER
+    } else {
+        MIN_MAIN_HEIGHT
+    };
+    let max = (window_height - min_main).max(MIN_HEIGHT);
     saved
         .map_or(DEFAULT_HEIGHT, |h| h as f32)
         .clamp(MIN_HEIGHT, max)
@@ -1099,11 +1108,16 @@ mod tests {
     // covers UP-42: the dock keeps a usable height and leaves the main area room.
     #[test]
     fn the_dock_height_stays_within_its_limits() {
-        assert_eq!(dock_height(None, 800.), DEFAULT_HEIGHT);
-        assert_eq!(dock_height(Some(400), 800.), 400.);
-        assert_eq!(dock_height(Some(50), 800.), MIN_HEIGHT);
+        assert_eq!(dock_height(None, 800., false), DEFAULT_HEIGHT);
+        assert_eq!(dock_height(Some(400), 800., false), 400.);
+        assert_eq!(dock_height(Some(50), 800., false), MIN_HEIGHT);
         // A short window: the main area keeps its room, down to the dock's minimum.
-        assert_eq!(dock_height(Some(700), 800.), 640.);
-        assert_eq!(dock_height(Some(700), 200.), MIN_HEIGHT);
+        assert_eq!(dock_height(Some(700), 800., false), 640.);
+        assert_eq!(dock_height(Some(700), 200., false), MIN_HEIGHT);
+        // A two-row header takes more of the window, with the same lower limit.
+        assert_eq!(dock_height(Some(700), 480., false), 320.);
+        assert_eq!(dock_height(Some(700), 480., true), 224.);
+        assert_eq!(dock_height(Some(200), 480., true), 200.);
+        assert_eq!(dock_height(Some(700), 200., true), MIN_HEIGHT);
     }
 }
