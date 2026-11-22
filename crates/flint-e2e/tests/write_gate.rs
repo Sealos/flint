@@ -6,7 +6,7 @@ use std::time::Duration;
 use flint_core::handle::{Command, Event};
 use flint_core::write::{WriteError, WriteReview};
 use flint_core::{Settings, WriteRefusal};
-use flint_e2e::fake_api::{CONTEXT, FakeApiServer, Fault, RequestHold, Verb};
+use flint_e2e::fake_api::{CONTEXT, FakeApiServer, Fault, REMOTE_CONTEXT, RequestHold, Verb};
 use tokio::task::JoinHandle;
 
 mod core_support;
@@ -117,6 +117,50 @@ async fn a_context_repointed_and_back_between_requests_is_refused() {
         .review_write(write_target(&a), three_replicas())
         .await
         .expect("a new review starts from the context as it is now");
+}
+
+// covers UP-54, UP-55: on default settings, a loopback context without a local tool's name starts
+// protected: nothing reaches the server until it is unlocked for that server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_remote_looking_context_refuses_writes_until_unlocked() {
+    let server = FakeApiServer::start().await.unwrap();
+    server.set_object(&deployments(), object());
+    let dir = tempfile::tempdir().unwrap();
+    let kubeconfig = dir.path().join("kubeconfig");
+    server
+        .write_remote_kubeconfig(&kubeconfig, Some("demo"))
+        .unwrap();
+    let core =
+        Core::start_on_context(dir, vec![kubeconfig], Settings::default(), REMOTE_CONTEXT).await;
+    let target = || flint_core::write::WriteTarget {
+        cluster: REMOTE_CONTEXT.into(),
+        ..write_target(&server)
+    };
+
+    assert_eq!(
+        core.handle
+            .review_write(target(), three_replicas())
+            .await
+            .unwrap_err(),
+        WriteError::Refused(WriteRefusal::Protected {
+            cluster: REMOTE_CONTEXT.to_owned(),
+        })
+    );
+    assert_eq!(puts(&server), 0, "a protected cluster gets no dry run");
+    assert!(server.writes().is_empty(), "nothing was written");
+
+    core.handle.unlock(REMOTE_CONTEXT, &server.url());
+    let review = core
+        .handle
+        .review_write(target(), three_replicas())
+        .await
+        .expect("an unlocked cluster can be reviewed");
+    core.handle
+        .run_write(review.into_intent())
+        .await
+        .expect("an unlocked cluster can be written");
+    let written = server.object(&deployments(), Some("demo"), EDITED).unwrap();
+    assert_eq!(written["spec"]["replicas"], 3);
 }
 
 // covers UP-54: a cluster locked after the review's GET gets no dry run.

@@ -11,6 +11,10 @@ use kube::config::{
 /// The default context (and cluster and user) name in the kubeconfig.
 pub const CONTEXT: &str = "kind-flint-e2e-fake";
 
+/// A context name outside the names local tools use, so a fake server on loopback under it is
+/// treated as a remote cluster.
+pub const REMOTE_CONTEXT: &str = "flint-e2e-remote";
+
 /// A kubeconfig with one context named `context` (cluster and user share the name) for
 /// `server`, trusting `ca_pem`, without credentials (the fake server does not authenticate).
 pub fn kubeconfig(
