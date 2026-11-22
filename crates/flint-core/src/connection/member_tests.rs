@@ -20,6 +20,14 @@ fn server() -> ServerIdentity {
     ServerIdentity::new(URL)
 }
 
+fn other_server() -> ServerIdentity {
+    ServerIdentity::new("https://two.example:6443")
+}
+
+fn repointed(server: ServerIdentity, confirmed: bool) -> MemberEvent {
+    MemberEvent::Repointed { server, confirmed }
+}
+
 fn attempt_id() -> AttemptId {
     Schedule::<u32>::default().start_active(&0)
 }
@@ -105,7 +113,9 @@ fn every_event(attempt: AttemptId) -> Vec<MemberEvent> {
             reason: text("401"),
         },
         MemberEvent::Activated,
-        MemberEvent::Repointed { server: server() },
+        MemberEvent::Deactivated,
+        repointed(server(), true),
+        repointed(other_server(), false),
         MemberEvent::Tick,
     ]
 }
@@ -382,8 +392,7 @@ fn a_repoint_to_another_server_removes_the_member_in_every_state() {
             if paused {
                 let _ = member.apply(MemberEvent::Paused(Pause::Held), now, &mut NoJitter);
             }
-            let server = ServerIdentity::new("https://two.example:6443");
-            let event = MemberEvent::Repointed { server };
+            let event = repointed(other_server(), true);
             assert_eq!(
                 member.apply(event, now, &mut NoJitter),
                 MemberAction::Remove
@@ -398,7 +407,7 @@ fn any_change_to_the_url_counts_as_a_repoint() {
     let mut member = live(now);
     let server = ServerIdentity::new(format!("{URL}/"));
     assert_eq!(
-        member.apply(MemberEvent::Repointed { server }, now, &mut NoJitter),
+        member.apply(repointed(server, true), now, &mut NoJitter),
         MemberAction::Remove
     );
 }
@@ -407,11 +416,187 @@ fn any_change_to_the_url_counts_as_a_repoint() {
 fn the_same_server_is_not_a_repoint() {
     let now = Instant::now();
     for mut member in every_state(now) {
-        let before = member.clone();
-        let event = MemberEvent::Repointed { server: server() };
-        assert_eq!(member.apply(event, now, &mut NoJitter), MemberAction::None);
-        assert_eq!(member, before);
+        for confirmed in [true, false] {
+            let before = member.clone();
+            let event = repointed(server(), confirmed);
+            assert_eq!(member.apply(event, now, &mut NoJitter), MemberAction::None);
+            assert_eq!(member, before);
+        }
     }
+}
+
+#[test]
+fn an_unconfirmed_server_only_pauses_the_member_in_every_state() {
+    let now = Instant::now();
+    for mut member in every_state(now) {
+        let expected = if member.state() == &MemberState::Connecting {
+            MemberAction::Dequeue
+        } else {
+            MemberAction::None
+        };
+        let state = member.state().clone();
+        let action = member.apply(repointed(other_server(), false), now, &mut NoJitter);
+        assert_eq!(action, expected);
+        assert_eq!(member.state(), &state);
+        assert_eq!(member.paused(), Some(Pause::Provisional));
+        assert_eq!(member.server(), &server());
+    }
+}
+
+#[test]
+fn a_fallback_during_a_provisional_pause_keeps_the_pinned_connection() {
+    let now = Instant::now();
+    let mut member = live(now);
+    let _ = member.apply(MemberEvent::Paused(Pause::Provisional), now, &mut NoJitter);
+    assert_eq!(
+        member.apply(repointed(other_server(), false), now, &mut NoJitter),
+        MemberAction::None
+    );
+    assert_eq!(member.state(), &MemberState::Live);
+    assert_eq!(member.server(), &server());
+    let _ = member.apply(MemberEvent::Resumed(Pause::Provisional), now, &mut NoJitter);
+    assert!(member.checkable());
+}
+
+#[test]
+fn a_confirmed_change_after_a_fallback_removes_the_member() {
+    let now = Instant::now();
+    let mut member = live(now);
+    let _ = member.apply(repointed(other_server(), false), now, &mut NoJitter);
+    assert_eq!(
+        member.apply(repointed(other_server(), true), now, &mut NoJitter),
+        MemberAction::Remove
+    );
+}
+
+#[test]
+fn an_activation_during_a_pause_starts_in_the_foreground_when_it_ends() {
+    let now = Instant::now();
+    for pause in [Pause::Held, Pause::Provisional] {
+        for mut member in [sign_in_needed(now), failed(now), connecting()] {
+            let _ = member.apply(MemberEvent::Paused(pause), now, &mut NoJitter);
+            let before = member.state().clone();
+            assert_eq!(
+                member.apply(MemberEvent::Activated, now, &mut NoJitter),
+                MemberAction::None
+            );
+            assert_eq!(member.state(), &before, "nothing starts during the pause");
+            assert_eq!(
+                member.apply(MemberEvent::Resumed(pause), now, &mut NoJitter),
+                MemberAction::StartNow
+            );
+            assert_eq!(member.state(), &MemberState::Connecting);
+            assert_eq!(member.failures(), 0);
+        }
+    }
+}
+
+#[test]
+fn an_activation_waits_for_the_last_pause_in_either_order() {
+    let now = Instant::now();
+    for (first, last) in [
+        (Pause::Held, Pause::Provisional),
+        (Pause::Provisional, Pause::Held),
+    ] {
+        let mut member = sign_in_needed(now);
+        let before = member.state().clone();
+        let _ = member.apply(MemberEvent::Paused(first), now, &mut NoJitter);
+        let _ = member.apply(MemberEvent::Paused(last), now, &mut NoJitter);
+        let _ = member.apply(MemberEvent::Activated, now, &mut NoJitter);
+        assert_eq!(
+            member.apply(MemberEvent::Resumed(first), now, &mut NoJitter),
+            MemberAction::None
+        );
+        assert_eq!(member.state(), &before);
+        assert!(!member.begin_attempt(attempt_id()));
+        assert_eq!(
+            member.apply(MemberEvent::Resumed(last), now, &mut NoJitter),
+            MemberAction::StartNow
+        );
+    }
+}
+
+#[test]
+fn a_remembered_activation_is_used_once() {
+    let now = Instant::now();
+    let mut member = sign_in_needed(now);
+    let _ = member.apply(MemberEvent::Paused(Pause::Held), now, &mut NoJitter);
+    let _ = member.apply(MemberEvent::Activated, now, &mut NoJitter);
+    let _ = member.apply(MemberEvent::Resumed(Pause::Held), now, &mut NoJitter);
+    let _ = member.apply(MemberEvent::Paused(Pause::Held), now, &mut NoJitter);
+    assert_eq!(
+        member.apply(MemberEvent::Resumed(Pause::Held), now, &mut NoJitter),
+        MemberAction::Enqueue
+    );
+}
+
+#[test]
+fn an_activation_covers_a_credential_lost_later_in_the_pause() {
+    let now = Instant::now();
+    let mut member = live(now);
+    let _ = member.apply(MemberEvent::Paused(Pause::Held), now, &mut NoJitter);
+    let _ = member.apply(MemberEvent::Activated, now, &mut NoJitter);
+    let lost = MemberEvent::CredentialLost {
+        reason: text("401"),
+    };
+    let _ = member.apply(lost, now, &mut NoJitter);
+    assert_eq!(
+        member.apply(MemberEvent::Resumed(Pause::Held), now, &mut NoJitter),
+        MemberAction::StartNow
+    );
+}
+
+#[test]
+fn a_confirmed_repoint_clears_a_remembered_activation() {
+    let now = Instant::now();
+    let mut member = sign_in_needed(now);
+    let _ = member.apply(MemberEvent::Paused(Pause::Held), now, &mut NoJitter);
+    let _ = member.apply(MemberEvent::Activated, now, &mut NoJitter);
+    assert_eq!(
+        member.apply(repointed(other_server(), true), now, &mut NoJitter),
+        MemberAction::Remove
+    );
+    assert_eq!(
+        member.apply(MemberEvent::Resumed(Pause::Held), now, &mut NoJitter),
+        MemberAction::None
+    );
+    assert!(matches!(member.state(), MemberState::SignInNeeded { .. }));
+}
+
+#[test]
+fn an_unconfirmed_server_keeps_a_remembered_activation() {
+    let now = Instant::now();
+    let mut member = sign_in_needed(now);
+    let _ = member.apply(MemberEvent::Paused(Pause::Held), now, &mut NoJitter);
+    let _ = member.apply(MemberEvent::Activated, now, &mut NoJitter);
+    let _ = member.apply(repointed(other_server(), false), now, &mut NoJitter);
+    assert_eq!(
+        member.apply(MemberEvent::Resumed(Pause::Held), now, &mut NoJitter),
+        MemberAction::None
+    );
+    assert_eq!(
+        member.apply(MemberEvent::Resumed(Pause::Provisional), now, &mut NoJitter),
+        MemberAction::StartNow
+    );
+    assert_eq!(member.server(), &server());
+}
+
+#[test]
+fn selecting_another_cluster_clears_a_remembered_activation() {
+    let now = Instant::now();
+    let mut member = sign_in_needed(now);
+    let before = member.state().clone();
+    let _ = member.apply(MemberEvent::Paused(Pause::Held), now, &mut NoJitter);
+    let _ = member.apply(MemberEvent::Activated, now, &mut NoJitter);
+    assert_eq!(
+        member.apply(MemberEvent::Deactivated, now, &mut NoJitter),
+        MemberAction::None
+    );
+    assert_eq!(
+        member.apply(MemberEvent::Resumed(Pause::Held), now, &mut NoJitter),
+        MemberAction::None
+    );
+    assert_eq!(member.state(), &before);
 }
 
 #[test]

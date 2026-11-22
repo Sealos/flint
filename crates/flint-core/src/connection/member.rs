@@ -3,7 +3,8 @@
 //! [`Member::apply`] changes the state and returns the one thing the caller must do. A pause is
 //! an overlay on the state: reads already running continue, nothing new starts, and an attempt
 //! in flight when the pause begins no longer counts, so its result is discarded and the member
-//! is queued again when the pause ends.
+//! is queued again when the pause ends. An activation during a pause starts nothing, and is
+//! carried out in the foreground when the last pause ends.
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -93,9 +94,13 @@ pub(crate) enum MemberEvent {
     },
     /// The user made this member the active cluster.
     Activated,
-    /// The kubeconfig now gives this `server` for the member's context.
+    /// The user made another cluster active, so an activation waiting on a pause no longer holds.
+    Deactivated,
+    /// The kubeconfig now gives this `server` for the member's context. `confirmed` is false when
+    /// the server may be a fallback showing while a higher-priority file is unreadable.
     Repointed {
         server: ServerIdentity,
+        confirmed: bool,
     },
     Paused(Pause),
     Resumed(Pause),
@@ -127,6 +132,8 @@ pub(crate) struct Member {
     server: ServerIdentity,
     held: bool,
     provisional: bool,
+    /// Activated during a pause, and not yet started or withdrawn.
+    activation_pending: bool,
     failures: u32,
     attempt: Option<AttemptId>,
 }
@@ -149,6 +156,7 @@ impl Member {
             server,
             held: paused == Some(Pause::Held),
             provisional: paused == Some(Pause::Provisional),
+            activation_pending: false,
             failures: 0,
             attempt: None,
         };
@@ -213,8 +221,11 @@ impl Member {
             MemberEvent::Watches { any_synced, error } => self.watches(any_synced, error, now),
             MemberEvent::CredentialLost { reason } => self.credential_lost(reason),
             MemberEvent::Activated => self.activated(),
-            MemberEvent::Repointed { server } if server != self.server => MemberAction::Remove,
-            MemberEvent::Repointed { .. } => MemberAction::None,
+            MemberEvent::Deactivated => {
+                self.activation_pending = false;
+                MemberAction::None
+            }
+            MemberEvent::Repointed { server, confirmed } => self.repointed(&server, confirmed),
             MemberEvent::Paused(pause) => self.pause(pause),
             MemberEvent::Resumed(pause) => self.resume(pause),
             MemberEvent::Tick => self.tick(now, jitter),
@@ -282,8 +293,13 @@ impl Member {
 
     fn activated(&mut self) -> MemberAction {
         if self.paused().is_some() {
+            self.activation_pending = true;
             return MemberAction::None;
         }
+        self.start_foreground()
+    }
+
+    fn start_foreground(&mut self) -> MemberAction {
         match self.state {
             MemberState::SignInNeeded { .. } | MemberState::Failed { .. } => {
                 self.failures = 0;
@@ -292,6 +308,19 @@ impl Member {
             }
             MemberState::Connecting if self.attempt.is_none() => MemberAction::StartNow,
             _ => MemberAction::None,
+        }
+    }
+
+    /// A different server removes the member only once confirmed. Until then it may be a
+    /// fallback, so the member keeps its server and pauses.
+    fn repointed(&mut self, server: &ServerIdentity, confirmed: bool) -> MemberAction {
+        if *server == self.server {
+            MemberAction::None
+        } else if confirmed {
+            self.activation_pending = false;
+            MemberAction::Remove
+        } else {
+            self.pause(Pause::Provisional)
         }
     }
 
@@ -314,7 +343,13 @@ impl Member {
             Pause::Provisional => &mut self.provisional,
         };
         let was_set = std::mem::replace(flag, false);
-        if was_set && self.paused().is_none() && self.state == MemberState::Connecting {
+        if !was_set || self.paused().is_some() {
+            return MemberAction::None;
+        }
+        if std::mem::take(&mut self.activation_pending) {
+            return self.start_foreground();
+        }
+        if self.state == MemberState::Connecting {
             MemberAction::Enqueue
         } else {
             MemberAction::None
