@@ -1028,23 +1028,34 @@ pub fn set_cluster_name(
 
 /// Sets the colour tag of `context` at `server` (`None` removes it), and writes `settings.toml`.
 /// Its tags at other servers stay, for when the context points back, and so do entries this
-/// version cannot read. Returns the settings as written.
+/// version cannot read. Removing a tag that has no entry writes nothing, so the file keeps its
+/// comments (or stays absent). Returns the settings as written.
 pub fn set_cluster_tag(
     dir: &Path,
     context: &str,
     server: &str,
     tag: Option<ClusterTag>,
 ) -> Result<Settings, SettingsError> {
+    let is_this = |entry: &toml::Value| {
+        let field = |key| entry.get(key).and_then(toml::Value::as_str);
+        field("context") == Some(context) && field("server").is_some_and(|s| same_server(s, server))
+    };
+    if tag.is_none() {
+        let table: toml::Table = load_toml(&dir.join(SETTINGS_FILE))?;
+        let tagged = table
+            .get("cluster_tags")
+            .and_then(toml::Value::as_array)
+            .is_some_and(|entries| entries.iter().any(is_this));
+        if !tagged {
+            return load_settings(dir);
+        }
+    }
     edit_settings(dir, |table, _| {
         let mut entries = match table.remove("cluster_tags") {
             Some(toml::Value::Array(entries)) => entries,
             _ => Vec::new(),
         };
-        entries.retain(|entry| {
-            let field = |key| entry.get(key).and_then(toml::Value::as_str);
-            !(field("context") == Some(context)
-                && field("server").is_some_and(|s| same_server(s, server)))
-        });
+        entries.retain(|entry| !is_this(entry));
         if let Some(tag) = tag {
             entries.push(toml::Value::try_from(TaggedCluster {
                 context: context.to_owned(),
@@ -1277,6 +1288,21 @@ mod cluster_tag_tests {
         set_cluster_tag(dir.path(), "ctx", A, None).unwrap();
         let text = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
         assert!(!text.contains("cluster_tags"), "{text}");
+    }
+
+    // covers UP-83: clearing a tag that is not there leaves the file as it is, or absent.
+    #[test]
+    fn clearing_no_tag_does_not_touch_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE);
+        set_cluster_tag(dir.path(), "ctx", A, None).unwrap();
+        assert!(!path.exists(), "no file is created");
+
+        let text = "# kept by hand\nappearance = \"dark\"\n";
+        std::fs::write(&path, text).unwrap();
+        let settings = set_cluster_tag(dir.path(), "ctx", A, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(settings.appearance, Appearance::Dark);
     }
 
     #[test]

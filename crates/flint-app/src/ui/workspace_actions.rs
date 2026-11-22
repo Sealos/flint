@@ -585,9 +585,12 @@ impl Workspace {
         match arg.kind {
             ArgKind::Cluster => choices({
                 let names = model.names();
+                // Clearing is offered only where there is a tag to clear.
+                let clearing = spec.name == ClearClusterTag::name_for_type();
                 model
                     .clusters
                     .iter()
+                    .filter(|c| !clearing || model.cluster_tag(c).is_some())
                     .map(|c| {
                         let name = c.info.name.clone();
                         let short = names.of(&name);
@@ -1211,6 +1214,11 @@ impl Workspace {
             .server
             .clone()
             .ok_or_else(|| ActionError::rejected::<A>(format!("{cluster} has no API server")))
+    }
+
+    /// The server the sidebar shows for `cluster` now, which a tag menu is drawn for.
+    pub(in crate::ui) fn tag_menu_server(&self, cluster: &str, cx: &App) -> Option<String> {
+        self.cluster_summary(cluster, cx)?.info.server.clone()
     }
 
     /// Sends the tag to the core, which writes it in order with every other settings change.
