@@ -14,13 +14,13 @@ use flint_core::write::{
     WriteAction, WriteError, WriteOutcome, WriteReview, WriteTarget, WriteWarning,
 };
 use flint_core::{
-    ExecFailureKind, ExecRequest, ExecSession, ExecSnapshot, ExecState, KindId, KindSnapshot,
-    LogOptions, LogSession, LogSnapshot, LogState, LogTarget, PodSet, Settings, Subscription,
-    SyncState, TerminalSize, WorkloadKind, WorkloadTarget, cluster, table,
+    ExecFailureKind, ExecRequest, ExecSession, ExecSnapshot, ExecState, Freshness, KindId,
+    KindSnapshot, LogOptions, LogSession, LogSnapshot, LogState, LogTarget, PodSet, Settings,
+    Subscription, SyncState, TerminalSize, WorkloadKind, WorkloadTarget, cluster, table,
 };
 use flint_e2e::fake_api::{
-    CONTEXT, ContainerLog, ExecEnd, FakeApiServer, FakePod, Fault, Gvr, Options, TtySize, Verb,
-    WatchStep,
+    CONTEXT, ContainerLog, ExecEnd, FakeApiServer, FakePod, Fault, Gvr, Options, REMOTE_CONTEXT,
+    TtySize, Verb, WatchStep,
 };
 
 mod core_support;
@@ -2134,4 +2134,264 @@ async fn an_unread_event_queue_stays_bounded_through_reloads_and_discoveries() {
         Some((generation, true)),
         "the last slot's discovery"
     );
+}
+
+const UNPARSABLE: &str = "apiVersion: v1\nkind: Config\nclusters:\n- name: [";
+
+/// Breaks `file` and waits for the load that reports it.
+async fn break_kubeconfig(core: &Core, file: &Path) {
+    let events = core.handle.events();
+    std::fs::write(file, UNPARSABLE).unwrap();
+    core.handle.send(Command::ReloadKubeconfig);
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Event::ClustersChanged(snapshot) = events.recv().await.unwrap()
+                && !snapshot.errors.is_empty()
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the load reports the broken file");
+}
+
+/// A kubeconfig for `server` under `context`, with `user` as its user entry.
+fn kubeconfig_with_user(server: &FakeApiServer, context: &str, user: serde_json::Value) -> String {
+    let mut config = serde_json::to_value(server.kubeconfig_named(context, Some("demo"))).unwrap();
+    config["users"][0]["user"] = user;
+    config.to_string()
+}
+
+/// A core on two files giving `context` different tokens, active on the first. Broken, that file
+/// leaves the second's definition showing, which pauses the context.
+async fn core_on_two_definitions(server: &FakeApiServer, context: &str) -> (Core, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+    let token = |t: &str| serde_json::json!({ "token": t });
+    std::fs::write(&first, kubeconfig_with_user(server, context, token("a"))).unwrap();
+    std::fs::write(&second, kubeconfig_with_user(server, context, token("b"))).unwrap();
+    let paths = vec![first.clone(), second];
+    let core = Core::start_on_context(dir, paths, Settings::default(), context).await;
+    (core, first)
+}
+
+/// An exec plugin whose credential is about to expire, so any new request runs it again, and the
+/// file that counts its runs.
+fn expiring_plugin(dir: &Path) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let runs = dir.join("plugin-runs");
+    let script = dir.join("plugin.sh");
+    let body = format!(
+        "#!/bin/sh\necho run >> '{}'\n\
+         exp=$(date -u -d '+1 second' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+         || date -u -v+1S +%Y-%m-%dT%H:%M:%SZ)\n\
+         printf '{{\"apiVersion\":\"client.authentication.k8s.io/v1\",\
+         \"kind\":\"ExecCredential\",\
+         \"status\":{{\"token\":\"t\",\"expirationTimestamp\":\"%s\"}}}}' \"$exp\"\n",
+        runs.display()
+    );
+    std::fs::write(&script, body).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (script, runs)
+}
+
+fn plugin_runs(file: &Path) -> usize {
+    std::fs::read_to_string(file).map_or(0, |runs| runs.lines().count())
+}
+
+// covers UP-06: a held context with a client starts no new read and runs no plugin. A log stream
+// that was already open goes on, and what was asked for works again when the file is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_context_starts_no_new_read_and_its_open_log_goes_on() {
+    let server = FakeApiServer::start().await.unwrap();
+    server.add_pod(FakePod::new("demo", "talker", &["app"]).label("app", "talker"));
+    server.add_pod(FakePod::new("demo", "other", &["app"]).label("app", "other"));
+    let dir = tempfile::tempdir().unwrap();
+    let (script, runs) = expiring_plugin(dir.path());
+    let file = dir.path().join("kubeconfig");
+    let user = serde_json::json!({ "exec": {
+        "apiVersion": "client.authentication.k8s.io/v1",
+        "command": script.to_str().unwrap(),
+        "interactiveMode": "Never",
+    }});
+    let yaml = kubeconfig_with_user(&server, CONTEXT, user);
+    std::fs::write(&file, &yaml).unwrap();
+    let core = Core::start_on(dir, vec![file.clone()], Settings::default()).await;
+
+    let log_target = |pod: &str| LogTarget {
+        namespace: "demo".into(),
+        pod: pod.into(),
+        container: None,
+    };
+    let talker = ContainerLog::new("demo", "talker");
+    let mut running = core
+        .handle
+        .open_logs(CONTEXT, log_target("talker"), LogOptions::default());
+    until_log(&mut running, "streaming", |s| {
+        s.state == LogState::Streaming
+    })
+    .await;
+    server.wait_for_log_streams(1, WAIT).await.unwrap();
+
+    break_kubeconfig(&core, &file).await;
+    // Past the credential's expiry: a request now would have to run the plugin.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let plugin_before = plugin_runs(&runs);
+    let new_reads = |s: &FakeApiServer| {
+        s.requests()
+            .iter()
+            .filter(|r| {
+                r.query.contains("labelSelector")
+                    || r.path.ends_with("/pods/other")
+                    || r.path.ends_with("/pods/other/log")
+            })
+            .count()
+    };
+    let reads_before = new_reads(&server);
+
+    let selector = || PodSet::Selector("app=other".into());
+    let listed = core
+        .handle
+        .workload_pods(CONTEXT, "demo", selector(), Freshness::Current)
+        .await;
+    assert_eq!(
+        listed.unwrap_err(),
+        format!("\"{CONTEXT}\" is not connected")
+    );
+    let fetched = core
+        .handle
+        .fetch_object(CONTEXT, &KindId::new("", "pods"), Some("demo"), "other")
+        .await;
+    assert_eq!(
+        fetched.unwrap_err(),
+        format!("\"{CONTEXT}\" is not connected")
+    );
+    let mut opened = core
+        .handle
+        .open_logs(CONTEXT, log_target("other"), LogOptions::default());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_ne!(opened.latest().state, LogState::Streaming);
+    assert_eq!(new_reads(&server), reads_before, "no new read went out");
+    assert_eq!(plugin_runs(&runs), plugin_before, "the plugin did not run");
+
+    assert!(server.append_log(&talker, "still here\n") >= 1);
+    until_log(&mut running, "the open stream", |s| {
+        log_texts(s).iter().any(|line| line == "still here")
+    })
+    .await;
+
+    std::fs::write(&file, &yaml).unwrap();
+    core.handle.send(Command::ReloadKubeconfig);
+    tokio::time::timeout(WAIT, async {
+        while core
+            .handle
+            .workload_pods(CONTEXT, "demo", selector(), Freshness::Current)
+            .await
+            .is_err()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("reads work again once the file is back");
+    until_log(&mut opened, "the session opened meanwhile", |s| {
+        s.state == LogState::Streaming
+    })
+    .await;
+}
+
+// covers UP-06: a namespace filter set while a context is held starts no list there, and applies
+// when the same definition comes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_namespace_filter_set_while_held_waits_for_the_file() {
+    let server = FakeApiServer::start().await.unwrap();
+    let secrets = Gvr::core("secrets");
+    server.inject(
+        Fault::forbidden()
+            .on(&secrets)
+            .verb(Verb::List)
+            .verb(Verb::Watch)
+            .cluster_wide(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("kubeconfig");
+    server.write_kubeconfig(&file, Some("demo")).unwrap();
+    let yaml = std::fs::read_to_string(&file).unwrap();
+    let core = Core::start_on(dir, vec![file.clone()], Settings::default()).await;
+    let mut sub = core.subscribe(&KindId::new("", "secrets"));
+    until(&mut sub, "limited to the namespace", |s| {
+        s.state == SyncState::Synced && s.limited_to.is_some()
+    })
+    .await;
+
+    break_kubeconfig(&core, &file).await;
+    let listed = |s: &FakeApiServer| {
+        s.requests()
+            .iter()
+            .filter(|r| r.path.contains("/namespaces/kube-system/secrets"))
+            .count()
+    };
+    core.handle.send(Command::SetNamespaceFilter {
+        cluster: CONTEXT.into(),
+        namespaces: vec!["kube-system".into()],
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(listed(&server), 0, "no lane starts while held");
+
+    std::fs::write(&file, &yaml).unwrap();
+    core.handle.send(Command::ReloadKubeconfig);
+    tokio::time::timeout(WAIT, async {
+        while listed(&server) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the remembered filter applies when the file is back");
+}
+
+// covers UP-06: a shell on a paused context is refused as stale, not as an unreachable cluster.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shell_on_a_paused_context_reports_it_stale() {
+    let server = FakeApiServer::start().await.unwrap();
+    let (core, first) = core_on_two_definitions(&server, CONTEXT).await;
+    break_kubeconfig(&core, &first).await;
+    let request = ExecRequest::shell(CONTEXT, "demo", "web").at(Some(server.url()));
+    let mut shell = core.handle.exec(request);
+    let state = tokio::time::timeout(WAIT, async {
+        loop {
+            let snapshot = shell.latest();
+            if snapshot.state.is_finished() {
+                break snapshot.state.clone();
+            }
+            shell.changed().await;
+        }
+    })
+    .await
+    .expect("the shell is refused");
+    let ExecState::Failed(failure) = state else {
+        panic!("the shell did not fail: {state:?}");
+    };
+    assert_eq!(failure.kind, ExecFailureKind::NotStartedStale);
+}
+
+// covers UP-06, UP-54: a protected context keeps its own refusal while paused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_protected_paused_context_is_refused_as_protected() {
+    let server = FakeApiServer::start().await.unwrap();
+    server.set_object(&deployments(), editable("5000", serde_json::json!({})));
+    let (core, first) = core_on_two_definitions(&server, REMOTE_CONTEXT).await;
+    break_kubeconfig(&core, &first).await;
+    let target = WriteTarget {
+        cluster: REMOTE_CONTEXT.into(),
+        ..write_target(&server)
+    };
+    let refused = core.handle.review_write(target, three_replicas()).await;
+    assert_eq!(
+        refused.unwrap_err(),
+        WriteError::Refused(WriteRefusal::Protected {
+            cluster: REMOTE_CONTEXT.into(),
+        })
+    );
+    assert_eq!(puts(&server), (0, 0), "nothing was sent");
 }

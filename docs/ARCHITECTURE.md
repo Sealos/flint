@@ -643,7 +643,8 @@ opens in a tab in the bottom dock.
   - **Paused clusters.** While an earlier file can't be read, a context is paused if its slot is held, or if it is
     provisional and its whole definition (context, cluster and user entries, `cluster::context_fingerprint`) differs
     from the one a load last confirmed. Another user on the same server counts as different. Nothing new starts for
-    a paused cluster: no connection attempt or retry, discovery, watch or auth plugin. A result that lands during
+    a paused cluster: no connection attempt or retry, discovery, watch, one-off read, log stream or auth plugin. A
+    namespace filter set meanwhile is remembered and applied when the pause ends. A result that lands during
     the pause is dropped after its attempt id is checked. What already runs goes on. A provisional context that shows
     its confirmed definition is not paused, and neither is one no load has confirmed yet (first seen while an earlier
     file is broken): both connect. When the pause ends on the same definition, connection, discovery and watches

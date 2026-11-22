@@ -586,8 +586,8 @@ impl ClusterManager {
             } => {
                 if let Some(slot) = self.cluster_mut(&cluster) {
                     slot.namespace_filter = namespaces;
-                    slot.update_scope();
                 }
+                self.apply_scope(&cluster);
             }
             Command::SetLogBufferLines(lines) => {
                 self.write_settings("the log buffer size", move |dir| {
@@ -1344,8 +1344,8 @@ impl ClusterManager {
             Internal::NamespacesListed { cluster, names } => {
                 if let Some(slot) = self.cluster_mut(&cluster) {
                     slot.listed_namespaces = names;
-                    slot.update_scope();
                 }
+                self.apply_scope(&cluster);
             }
             Internal::ReleaseHub { cluster, kind } => {
                 let running = self
@@ -1423,8 +1423,8 @@ impl ClusterManager {
         // confirmed (`ContextHistory`). Wait for the file rather than read from it.
         let slot = self.cluster(cluster).filter(|s| {
             let shown = s.info.server.as_deref();
-            // A paused slot's connection goes on, but nothing new connects for it.
-            (s.client.is_some() || !self.paused(cluster))
+            // Streams already open go on; this is asked only for a new one.
+            !self.paused(cluster)
                 // The endpoint alone is enough only for a confirmed server: a fallback at the
                 // same URL can come with other credentials.
                 && (shown == pin.server()
@@ -1478,14 +1478,15 @@ impl ClusterManager {
             });
         }
         let pin = self.session_pin(cluster);
-        let client = self.write_client(cluster)?;
-        // A same-URL fallback keeps its pin, but it may carry another file's credentials.
+        self.write_gate(cluster)?;
+        // A same-URL fallback keeps its pin, but it may carry another file's credentials. Before
+        // the client: a paused context has none, and this is the reason it is refused.
         if self.contexts.provisional(cluster) {
             return Err(WriteRefusal::Unsettled {
                 cluster: cluster.to_owned(),
             });
         }
-        Ok((client, pin))
+        Ok((self.write_client(cluster)?, pin))
     }
 
     /// [`Self::shell_client`] for one request of a reviewed write, with the credential of the
@@ -1495,7 +1496,7 @@ impl ClusterManager {
         cluster: &str,
         server: Option<Option<String>>,
     ) -> Result<crate::handle::BoundWriteClient, WriteError> {
-        if self.paused(cluster) {
+        if self.held(cluster) {
             return Err(WriteError::KubeconfigUnreadable);
         }
         let (client, pin) =
@@ -1522,8 +1523,10 @@ impl ClusterManager {
         }
     }
 
+    /// The client for a new one-off read of `cluster`. None while it is paused.
     fn client(&self, cluster: &str) -> Option<Client> {
         self.cluster(cluster)
+            .filter(|_| !self.paused(cluster))
             .and_then(|c| c.client.as_ref().map(|c| c.read.clone()))
     }
 
@@ -1956,6 +1959,17 @@ impl ClusterManager {
         });
     }
 
+    /// Gives `id`'s watches the namespaces it should list now. A new namespace starts a list, so
+    /// a paused cluster keeps what it has, and the load that ends the pause applies this.
+    fn apply_scope(&mut self, id: &str) {
+        if self.paused(id) {
+            return;
+        }
+        if let Some(slot) = self.cluster_mut(id) {
+            slot.update_scope();
+        }
+    }
+
     /// Catches up a cluster whose pause just ended on the same definition: the discovery and
     /// watches that waited start now.
     fn resume(&mut self, id: &str) {
@@ -2133,8 +2147,6 @@ impl ClusterManager {
                         changed_active = true;
                     }
                     existing.info = info.clone();
-                    // The default namespace may have changed.
-                    existing.update_scope();
                     existing
                 }
                 Some(old) => {
@@ -2191,6 +2203,10 @@ impl ClusterManager {
                 self.clusters.insert(at.min(self.clusters.len()), slot);
                 self.held.insert(name.clone());
             }
+        }
+        // The default namespace may have changed, and a filter set during a pause waits for this.
+        for name in loaded.contexts.iter().map(|info| &info.name) {
+            self.apply_scope(name);
         }
 
         let snapshot = ClustersSnapshot {
