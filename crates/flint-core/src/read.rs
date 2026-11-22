@@ -15,6 +15,7 @@ use kube::api::{Api, ApiResource, DynamicObject, ListParams, LogParams};
 use kube::core::discovery::v2::APIGroupDiscovery;
 use kube::discovery::verbs;
 
+use crate::api_error::{ApiError, Transport};
 use crate::cluster::ClusterError;
 use crate::paging;
 
@@ -356,7 +357,7 @@ async fn discover_per_group(
     let groups = bounded_request(limit, client.list_api_groups())
         .await?
         .groups;
-    let mut found: Vec<(String, Result<Vec<KindInfo>, ClusterError>)> =
+    let mut found: Vec<(String, Result<Vec<KindInfo>, GroupFailure>)> =
         futures::stream::iter(groups.into_iter().filter_map(|group| {
             let gv = group
                 .preferred_version
@@ -364,9 +365,12 @@ async fn discover_per_group(
             Some((group.name, gv))
         }))
         .map(|(name, gv)| async move {
-            let result = bounded_request(limit, client.list_api_group_resources(&gv.group_version))
-                .await
-                .map(|list| kinds_from_resource_list(&name, &gv.version, list));
+            let result =
+                match bounded(limit, client.list_api_group_resources(&gv.group_version)).await {
+                    Ok(Ok(list)) => Ok(kinds_from_resource_list(&name, &gv.version, list)),
+                    Ok(Err(e)) => Err(GroupFailure::of_request(&e)),
+                    Err(e) => Err(GroupFailure::of(None, &e)),
+                };
             (name, result)
         })
         .buffer_unordered(DISCOVERY_CONCURRENCY)
@@ -377,8 +381,13 @@ async fn discover_per_group(
     for (name, result) in found {
         match result {
             Ok(group_kinds) => kinds.extend(group_kinds),
-            Err(e) => {
-                tracing::warn!(group = name, error = %e.summary(), "discovery failed for an API group; leaving it out");
+            Err(failure) => {
+                tracing::warn!(
+                    group = loggable_group(&name),
+                    status = failure.status,
+                    failure = failure.category,
+                    "discovery failed for an API group; leaving it out"
+                );
                 skipped_groups.push(name);
             }
         }
@@ -388,6 +397,50 @@ async fn discover_per_group(
         skipped_groups,
         stale_groups: Vec::new(),
     })
+}
+
+/// Why one group's discovery failed, for the log: an HTTP status and a category Flint words
+/// itself, with no text from the response.
+struct GroupFailure {
+    status: Option<u16>,
+    category: &'static str,
+}
+
+impl GroupFailure {
+    fn of_request(err: &kube::Error) -> Self {
+        let status = ApiError::from_kube(err).map(|api| api.code);
+        Self::of(status, &ClusterError::kube_ref(err))
+    }
+
+    fn of(status: Option<u16>, err: &ClusterError) -> Self {
+        let category = match err {
+            ClusterError::Api(_) | ClusterError::Http { .. } => "http error",
+            ClusterError::Timeout { .. } => "timeout",
+            ClusterError::Transport { problem, .. } => match problem {
+                Transport::Refused => "connection refused",
+                Transport::Unresolved => "host not resolved",
+                Transport::Tls(_) => "tls failure",
+                Transport::Reset => "connection reset",
+                Transport::Dropped => "connection dropped",
+                Transport::Unreachable => "network unreachable",
+            },
+            ClusterError::ExecPlugin { .. } | ClusterError::ExecPluginNotFound { .. } => {
+                "auth plugin failure"
+            }
+            ClusterError::Kube(_) => "client error",
+            ClusterError::UnknownContext(_) | ClusterError::Config { .. } => "invalid config",
+        };
+        Self { status, category }
+    }
+}
+
+/// A group name as the log shows it: a valid name whole, anything else as a fixed placeholder.
+fn loggable_group(name: &str) -> &str {
+    if is_dns1123_subdomain(name) {
+        name
+    } else {
+        "<invalid group name>"
+    }
 }
 
 fn kinds_from_resource_list(group: &str, version: &str, list: APIResourceList) -> Vec<KindInfo> {

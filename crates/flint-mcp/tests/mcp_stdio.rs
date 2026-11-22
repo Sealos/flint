@@ -207,17 +207,32 @@ fn exposing(context: &str, server: &str) -> String {
 /// Starts a loopback API that serves just enough discovery for pods and answers everything else
 /// with a 404 `Status` naming the last path segment, as a real API server does.
 fn not_found_api() -> String {
+    api_with_failing_groups(&[], "")
+}
+
+/// [`not_found_api`] that also lists `groups`, each answering its discovery request with a 500
+/// `Status` whose reason and message hold `status_text`.
+fn api_with_failing_groups(groups: &[&str], status_text: &str) -> String {
+    let groups: Vec<Value> = groups
+        .iter()
+        .map(|name| {
+            let version = json!({"groupVersion": format!("{name}/v1"), "version": "v1"});
+            json!({"name": name, "versions": [version], "preferredVersion": version})
+        })
+        .collect();
+    let status_text = status_text.to_owned();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let server = format!("http://{}", listener.local_addr().unwrap());
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            std::thread::spawn(move || answer_not_found_api(stream));
+            let (groups, status_text) = (groups.clone(), status_text.clone());
+            std::thread::spawn(move || answer_fake_api(stream, &groups, &status_text));
         }
     });
     server
 }
 
-fn answer_not_found_api(mut stream: std::net::TcpStream) {
+fn answer_fake_api(mut stream: std::net::TcpStream, groups: &[Value], status_text: &str) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() {
@@ -237,7 +252,7 @@ fn answer_not_found_api(mut stream: std::net::TcpStream) {
         "/api" => ("200 OK", json!({"kind": "APIVersions", "versions": ["v1"]})),
         "/apis" => (
             "200 OK",
-            json!({"kind": "APIGroupList", "apiVersion": "v1", "groups": []}),
+            json!({"kind": "APIGroupList", "apiVersion": "v1", "groups": groups}),
         ),
         "/api/v1" => (
             "200 OK",
@@ -245,6 +260,13 @@ fn answer_not_found_api(mut stream: std::net::TcpStream) {
                 "name": "pods", "singularName": "pod", "namespaced": true, "kind": "Pod",
                 "verbs": ["get", "list", "watch"]
             }]}),
+        ),
+        _ if !groups.is_empty() && path.starts_with("/apis/") => (
+            "500 Internal Server Error",
+            json!({
+                "kind": "Status", "apiVersion": "v1", "metadata": {}, "status": "Failure",
+                "message": status_text, "reason": status_text, "code": 500
+            }),
         ),
         _ => {
             let name = path.rsplit('/').next().unwrap_or_default();
@@ -319,6 +341,61 @@ fn protocol_traffic_stays_out_of_stderr_at_any_log_filter() {
         if flint_debug_shown {
             assert!(stderr.contains("resolved PATH"), "{filter}: {stderr}");
         }
+    }
+}
+
+/// A group whose discovery fails is logged by its name and HTTP status, with nothing else the
+/// server sent, in stderr and the log file. A name that is not a valid group is not repeated.
+#[test]
+fn a_failed_discovery_group_logs_only_its_name_and_status() {
+    const STATUS_MARKER: &str = "flint-status-marker";
+    const NAME_MARKER: &str = "Flint_Group_Marker";
+    let api = api_with_failing_groups(&["metrics.example.io", NAME_MARKER], STATUS_MARKER);
+    let scratch = tempfile::tempdir().unwrap();
+    let kubeconfig = scratch.path().join("kubeconfig");
+    std::fs::write(
+        &kubeconfig,
+        format!("apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: {api}\nusers:\n- name: u\n  user:\n    token: fake\ncontexts:\n- name: dev\n  context:\n    cluster: c\n    user: u\n"),
+    )
+    .unwrap();
+    let config_dir = scratch.path().join("config");
+    let home = config_dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(config_dir.join("settings.toml"), exposing("dev", &api)).unwrap();
+    let stderr_path = scratch.path().join("stderr.log");
+    let stderr = std::fs::File::create(&stderr_path).unwrap();
+    let mut server =
+        Server::start_logging(kubeconfig.as_os_str(), &config_dir, "warn", stderr.into());
+    // Any tool that resolves a kind runs discovery. The pod itself is not there.
+    let (failed, reply) = server.call(
+        "get_resource",
+        json!({"cluster": "dev", "kind": "pods", "namespace": "web", "name": "absent"}),
+    );
+    assert!(failed, "{reply}");
+    drop(server);
+
+    let log_path = if cfg!(target_os = "macos") {
+        home.join("Library/Logs/Flint/flint.log")
+    } else {
+        config_dir.join("state/flint/flint.log")
+    };
+    for (source, text) in [
+        ("stderr", std::fs::read_to_string(&stderr_path).unwrap()),
+        ("log file", std::fs::read_to_string(&log_path).unwrap()),
+    ] {
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("discovery failed"))
+            .collect();
+        assert_eq!(lines.len(), 2, "{source}: {text}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("metrics.example.io") && line.contains("500")),
+            "{source}: {text}"
+        );
+        assert!(!text.contains(STATUS_MARKER), "{source}: {text}");
+        assert!(!text.contains(NAME_MARKER), "{source}: {text}");
     }
 }
 
