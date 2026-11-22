@@ -149,31 +149,45 @@ fn store(
             .with_cell(index("Window")?, WINDOW),
         None => state.new_row(&gvr, namespace, name, &cells)?,
     };
-    let usage = json!({"cpu": sample.cpu, "memory": sample.memory});
-    let mut object = json!({
-        "apiVersion": gvr.api_version(),
-        "kind": state.kind(&gvr),
-        "metadata": row.metadata(),
-        "timestamp": clock.fixture_now(),
-        "window": WINDOW,
-    });
-    match target {
-        MetricsTarget::Pod { .. } => {
-            let container = state
-                .object(&Gvr::core("pods"), namespace, name)
-                .ok()
-                .and_then(|pod| {
-                    pod.pointer("/spec/containers/0/name")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-                .unwrap_or_else(|| "app".to_owned());
-            object["containers"] = json!([{"name": container, "usage": usage}]);
-        }
-        MetricsTarget::Node { .. } => object["usage"] = usage,
-    }
+    let object = state.metrics_object(
+        &gvr,
+        &row,
+        (&sample.cpu, &sample.memory),
+        WINDOW,
+        &clock.fixture_now(),
+    );
     state.put_metrics(&gvr, row, object);
     Ok(())
+}
+
+/// The `APIResourceList` of `metrics.k8s.io/v1beta1`, which clients read to tell a missing API
+/// from a missing namespace. `None` if the server serves none of it.
+pub(super) fn api_resources(inner: &Inner) -> Option<Value> {
+    let resources: Vec<Value> = inner
+        .fixtures
+        .resources
+        .iter()
+        .filter(|r| {
+            is_metrics(&r.gvr) && r.gvr.version == VERSION && !inner.options.hidden.contains(&r.gvr)
+        })
+        .map(|r| {
+            json!({
+                "name": r.gvr.resource,
+                "singularName": "",
+                "namespaced": r.namespaced,
+                "kind": r.kind,
+                "verbs": r.verbs,
+            })
+        })
+        .collect();
+    (!inner.options.no_metrics && !resources.is_empty()).then(|| {
+        json!({
+            "kind": "APIResourceList",
+            "apiVersion": "v1",
+            "groupVersion": format!("{GROUP}/{VERSION}"),
+            "resources": resources,
+        })
+    })
 }
 
 impl FakeApiServer {
@@ -431,6 +445,83 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, kube::Error::Api(status) if status.code == 404));
         fetch(&client, "/api/v1/pods", TABLE).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_plain_list_gives_recorded_rows_their_usage() {
+        let server = FakeApiServer::start().await.unwrap();
+        let client = server.unrestricted_client().await.unwrap();
+        let nodes = fetch(
+            &client,
+            "/apis/metrics.k8s.io/v1beta1/nodes",
+            "application/json",
+        )
+        .await
+        .unwrap();
+        let node = &nodes["items"][0];
+        assert_eq!(nodes["kind"], "NodeMetricsList");
+        assert_eq!(node["metadata"]["name"], "flint-dev-control-plane");
+        assert_eq!(node["usage"]["cpu"], "146036024n");
+        assert_eq!(node["usage"]["memory"], "1146616Ki");
+        assert_eq!(node["window"], "10.021s");
+        assert!(node["timestamp"].as_str().unwrap().ends_with('Z'));
+
+        let pods = fetch(
+            &client,
+            "/apis/metrics.k8s.io/v1beta1/namespaces/demo/pods",
+            "application/json",
+        )
+        .await
+        .unwrap();
+        let db = pods["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["metadata"]["name"] == "fixture-db-0")
+            .unwrap();
+        assert_eq!(db["metadata"]["namespace"], "demo");
+        assert!(db["containers"][0]["name"].is_string());
+        assert_eq!(db["containers"][0]["usage"]["cpu"], "0");
+        assert_eq!(db["containers"][0]["usage"]["memory"], "552Ki");
+    }
+
+    #[tokio::test]
+    async fn the_group_version_lists_its_resources_unless_metrics_are_off() {
+        let path = "/apis/metrics.k8s.io/v1beta1";
+        let server = FakeApiServer::start().await.unwrap();
+        let client = server.unrestricted_client().await.unwrap();
+        let api = client
+            .list_api_group_resources("metrics.k8s.io/v1beta1")
+            .await
+            .unwrap();
+        let names: Vec<_> = api.resources.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            names.contains(&"pods") && names.contains(&"nodes"),
+            "{names:?}"
+        );
+
+        let hidden = FakeApiServer::start_with(Options {
+            hidden: vec![Gvr::new(GROUP, VERSION, "pods")],
+            ..Options::default()
+        })
+        .await
+        .unwrap();
+        let client = hidden.unrestricted_client().await.unwrap();
+        let api = client
+            .list_api_group_resources("metrics.k8s.io/v1beta1")
+            .await
+            .unwrap();
+        assert!(api.resources.iter().all(|r| r.name != "pods"));
+
+        let off = FakeApiServer::start_with(Options {
+            no_metrics: true,
+            ..Options::default()
+        })
+        .await
+        .unwrap();
+        let client = off.unrestricted_client().await.unwrap();
+        let err = fetch(&client, path, "application/json").await.unwrap_err();
+        assert!(matches!(err, kube::Error::Api(status) if status.code == 404));
     }
 
     #[tokio::test]
