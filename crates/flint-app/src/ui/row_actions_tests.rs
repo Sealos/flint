@@ -981,6 +981,116 @@ async fn a_failed_pod_list_refuses_shell_saying_why(cx: &mut TestAppContext) {
     assert_eq!(shell_button_disabled(cx, &t), Some(false));
 }
 
+// covers UP-06, UP-47: a pod list that failed is listed again when the kind's same rows are
+// published again, as they are when a pause of the cluster ends, and not on a change of rows.
+#[gpui_kit::test]
+async fn a_failed_pod_list_is_retried_when_the_same_rows_are_published(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let pods = FakePods::install(cx);
+    activate(cx, &t, "kind-alpha").await;
+    open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
+    select_row(cx, &t, "web");
+    let core = t.workspace.read_with(cx, |ws, cx| ws.core(cx).clone());
+    let kind = deployments(&[]).kind.clone();
+    let publish = |revision| {
+        core.store_for_tests(flint_core::KindSnapshot {
+            cluster: "kind-alpha".into(),
+            kind: kind.clone(),
+            state: flint_core::SyncState::Synced,
+            revision,
+            ..Default::default()
+        })
+    };
+    let _first = publish(7);
+    draw(cx, &t);
+    show_fetched(
+        cx,
+        &t,
+        detail(json!({
+            "kind": "Deployment",
+            "metadata": {"name": "web", "namespace": "demo"},
+            "spec": {"selector": {"matchLabels": {"app": "web"}}}
+        })),
+    );
+    let_pods_list(cx, &t);
+    pods.answer(cx, &t, Err("\"kind-alpha\" is not connected".into()));
+    assert!(pods.waiting().is_empty());
+
+    let _changed = publish(8);
+    draw(cx, &t);
+    cx.executor()
+        .advance_clock(crate::ui::detail::SHOW_PODS_DELAY * 10);
+    draw(cx, &t);
+    assert!(pods.waiting().is_empty(), "a change of rows does not retry");
+
+    let _again = publish(8);
+    draw(cx, &t);
+    cx.executor()
+        .advance_clock(crate::ui::detail::SHOW_PODS_DELAY * 10);
+    draw(cx, &t);
+    assert_eq!(pods.waiting(), [Freshness::Cached], "listed once more");
+    pods.answer(cx, &t, Err("\"kind-alpha\" is not connected".into()));
+    cx.executor()
+        .advance_clock(crate::ui::detail::SHOW_PODS_DELAY * 40);
+    draw(cx, &t);
+    assert!(pods.waiting().is_empty(), "a failure does not loop");
+}
+
+// covers UP-06, UP-47: a namespace-limited list has no revision of its own, and its republish
+// retries a failed pod list too.
+#[gpui_kit::test]
+async fn a_failed_pod_list_is_retried_on_a_limited_list_republish(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let pods = FakePods::install(cx);
+    activate(cx, &t, "kind-alpha").await;
+    open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
+    select_row(cx, &t, "web");
+    let core = t.workspace.read_with(cx, |ws, cx| ws.core(cx).clone());
+    let kind = deployments(&[]).kind.clone();
+    let publish = |revision| {
+        core.store_for_tests(flint_core::KindSnapshot {
+            cluster: "kind-alpha".into(),
+            kind: kind.clone(),
+            state: flint_core::SyncState::Synced,
+            limited_to: Some(Arc::new(flint_core::NamespaceLimit {
+                listed: vec!["demo".into()],
+                revisions: vec![revision],
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    };
+    let _first = publish(7);
+    draw(cx, &t);
+    show_fetched(
+        cx,
+        &t,
+        detail(json!({
+            "kind": "Deployment",
+            "metadata": {"name": "web", "namespace": "demo"},
+            "spec": {"selector": {"matchLabels": {"app": "web"}}}
+        })),
+    );
+    let_pods_list(cx, &t);
+    pods.answer(cx, &t, Err("\"kind-alpha\" is not connected".into()));
+
+    let _changed = publish(8);
+    draw(cx, &t);
+    cx.executor()
+        .advance_clock(crate::ui::detail::SHOW_PODS_DELAY * 10);
+    draw(cx, &t);
+    assert!(pods.waiting().is_empty(), "a change of rows does not retry");
+
+    let _again = publish(8);
+    draw(cx, &t);
+    cx.executor()
+        .advance_clock(crate::ui::detail::SHOW_PODS_DELAY * 10);
+    draw(cx, &t);
+    assert_eq!(pods.waiting(), [Freshness::Cached], "listed once more");
+}
+
 // covers UP-47, UP-41: a container shell asked for before the pod has loaded waits for it, as
 // Shell does; the guard and the handler agree on a deleted pod.
 #[gpui_kit::test]
