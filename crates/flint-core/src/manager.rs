@@ -260,6 +260,9 @@ enum Internal {
         result: Result<(cluster::GatedConnection, ServerVersion), cluster::SafeErrorText>,
     },
     FilesChanged(Changed),
+    /// The file watches changed and now cover these directories. Anything may have been written
+    /// before they started, so everything is read again.
+    WatchesStarted(HashSet<PathBuf>),
     /// A kubeconfig read finished after its caller stopped waiting.
     LateRead {
         paths: Vec<PathBuf>,
@@ -1409,18 +1412,33 @@ impl ClusterManager {
                     // is caught by the read the watcher asks for once they have.
                     self.arm_watcher();
                 }
-                if changed.settings {
-                    // First, since settings can change the kubeconfig file list.
-                    self.reload_settings().await;
-                }
-                if changed.kubeconfig {
-                    self.marks.changed(self.read_seq);
-                    self.reload_kubeconfig().await;
-                }
-                if changed.activity {
-                    self.reload_activity().await;
-                }
+                self.reload_changed(changed).await;
             }
+            Internal::WatchesStarted(dirs) => {
+                tracing::debug!(dirs = dirs.len(), "file watches changed");
+                self.reload_changed(Changed {
+                    kubeconfig: true,
+                    settings: true,
+                    activity: true,
+                    rearm: false,
+                })
+                .await;
+            }
+        }
+    }
+
+    /// Reads again what `changed` names.
+    async fn reload_changed(&mut self, changed: Changed) {
+        if changed.settings {
+            // First, since settings can change the kubeconfig file list.
+            self.reload_settings().await;
+        }
+        if changed.kubeconfig {
+            self.marks.changed(self.read_seq);
+            self.reload_kubeconfig().await;
+        }
+        if changed.activity {
+            self.reload_activity().await;
         }
     }
 
@@ -5851,6 +5869,25 @@ mod tests {
         manager.internal_rx = Some(internal);
     }
 
+    /// Runs the manager's internal messages until the watches on `dir` have started and the
+    /// read that follows is done, so a later edit can only be seen through a live event.
+    async fn until_watching(manager: &mut ClusterManager, dir: &Path) {
+        let mut internal = manager.internal_rx.take().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let msg = match tokio::time::timeout_at(deadline, internal.recv()).await {
+                Ok(Some(msg)) => msg,
+                _ => panic!("{} is still not watched", dir.display()),
+            };
+            let started = matches!(&msg, Internal::WatchesStarted(dirs) if dirs.contains(dir));
+            manager.handle_internal(msg).await;
+            if started {
+                break;
+            }
+        }
+        manager.internal_rx = Some(internal);
+    }
+
     /// Points the symlink `link` at `target` in one step, as `ln -sfn` tools do.
     fn point_link(link: &Path, target: &Path) {
         let next = link.with_extension("next");
@@ -5879,9 +5916,31 @@ mod tests {
         until_server(&mut manager, "dev", Some("https://a")).await;
 
         point_link(&link, &second);
+        until_watching(&mut manager, &root.join("b")).await;
         until_server(&mut manager, "dev", Some("https://b")).await;
         std::fs::write(&second, kubeconfig_with("https://b-edited")).unwrap();
         until_server(&mut manager, "dev", Some("https://b-edited")).await;
+    }
+
+    // inotify keeps one watch on a directory whose parent is renamed, under both names.
+    #[tokio::test]
+    async fn a_target_whose_parent_was_renamed_is_still_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let first = config_in(&root, "old/team", "https://a");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let mut manager = manager_watching(&root, vec![link.clone()]).await;
+        until_watching(&mut manager, &root.join("old/team")).await;
+        until_server(&mut manager, "dev", Some("https://a")).await;
+
+        std::fs::rename(root.join("old"), root.join("new")).unwrap();
+        let moved = root.join("new/team/config");
+        point_link(&link, &moved);
+        until_watching(&mut manager, &root.join("new/team")).await;
+        until_server(&mut manager, "dev", Some("https://a")).await;
+        std::fs::write(&moved, kubeconfig_with("https://edited")).unwrap();
+        until_server(&mut manager, "dev", Some("https://edited")).await;
     }
 
     // Only a move of what is watched replaces the watcher; a plain edit keeps it.
@@ -5929,6 +5988,7 @@ mod tests {
 
         // The last link of the chain moves, not the one the file list names.
         point_link(&far, &second);
+        until_watching(&mut manager, &root.join("b")).await;
         until_server(&mut manager, "dev", Some("https://b")).await;
         std::fs::write(&second, kubeconfig_with("https://b-edited")).unwrap();
         until_server(&mut manager, "dev", Some("https://b-edited")).await;
@@ -5945,11 +6005,13 @@ mod tests {
         let mut manager = manager_watching(&root, vec![link.clone()]).await;
         until_server(&mut manager, "dev", Some("https://a")).await;
         point_link(&link, &second);
+        until_watching(&mut manager, &root.join("b")).await;
         until_server(&mut manager, "dev", Some("https://b")).await;
 
         std::fs::remove_dir_all(root.join("b")).unwrap();
         until_server(&mut manager, "dev", None).await;
         config_in(&root, "b", "https://b-back");
+        until_watching(&mut manager, &root.join("b")).await;
         until_server(&mut manager, "dev", Some("https://b-back")).await;
         std::fs::write(&second, kubeconfig_with("https://b-edited")).unwrap();
         until_server(&mut manager, "dev", Some("https://b-edited")).await;
@@ -5978,6 +6040,7 @@ mod tests {
         until_server(&mut manager, "two", Some("https://a")).await;
 
         point_link(&moved, &second);
+        until_watching(&mut manager, &root.join("b")).await;
         until_server(&mut manager, "two", Some("https://b")).await;
         std::fs::write(&second, two("https://b-edited")).unwrap();
         until_server(&mut manager, "two", Some("https://b-edited")).await;

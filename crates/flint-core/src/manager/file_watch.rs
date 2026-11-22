@@ -60,13 +60,8 @@ impl FileWatcher {
             open: Box::new(move || open_notify(in_open.clone(), raw_tx.clone())),
             scan: Box::new(scan_scope),
             // Everything may have changed before the new watches started.
-            caught_up: Box::new(move || {
-                let _ = internal.send(Internal::FilesChanged(Changed {
-                    kubeconfig: true,
-                    settings: true,
-                    activity: true,
-                    rearm: false,
-                }));
+            caught_up: Box::new(move |dirs| {
+                let _ = internal.send(Internal::WatchesStarted(dirs.clone()));
             }),
             classes,
             watch: None,
@@ -108,20 +103,16 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The directory watches the worker changes; a seam for tests to refuse one.
+/// One set of directory watches; a seam for tests to refuse one. Watches are never removed one
+/// by one: two paths can share one OS watch after a rename, and removing a path can restart the
+/// whole backend. A changed set is installed on a new backend, and dropping the old ends it.
 trait DirWatch: Send {
     fn watch(&mut self, dir: &Path) -> notify::Result<()>;
-    fn unwatch(&mut self, dir: &Path);
 }
 
 impl DirWatch for RecommendedWatcher {
     fn watch(&mut self, dir: &Path) -> notify::Result<()> {
         Watcher::watch(self, dir, RecursiveMode::NonRecursive)
-    }
-
-    fn unwatch(&mut self, dir: &Path) {
-        // A directory that is gone has no watch left to remove.
-        let _ = Watcher::unwatch(self, dir);
     }
 }
 
@@ -192,8 +183,9 @@ type Scan = Box<dyn Fn(&WatchScope) -> Watched + Send>;
 struct Worker<W> {
     open: Box<dyn FnMut() -> Option<W> + Send>,
     scan: Scan,
-    /// Called after watches changed, so what was written before they started is read.
-    caught_up: Box<dyn Fn() + Send>,
+    /// Called with the watched directories after they changed, so what was written before the
+    /// watches started is read.
+    caught_up: Box<dyn Fn(&HashSet<PathBuf>) + Send>,
     classes: Arc<Classes>,
     watch: Option<W>,
     /// The directories with a working watch.
@@ -236,7 +228,7 @@ impl<W: DirWatch> Worker<W> {
             let (changed, settled) = self.settle(scope);
             retry = !settled;
             if changed {
-                (self.caught_up)();
+                (self.caught_up)(&self.registered);
             }
         }
     }
@@ -249,53 +241,43 @@ impl<W: DirWatch> Worker<W> {
         for _ in 0..MAX_SETTLE_PASSES {
             let lost: Vec<PathBuf> = lock(&self.classes.lost).drain().collect();
             let plan = (self.scan)(scope);
-            if self.watch.is_none() {
-                self.watch = (self.open)();
-            }
-            let Some(watch) = self.watch.as_mut() else {
-                return (changed, false);
-            };
-            for dir in &lost {
-                if self.registered.remove(dir) {
-                    watch.unwatch(dir);
-                    changed = true;
+            let lost_watch = lost.iter().any(|dir| self.registered.contains(dir));
+            if self.watch.is_none() || lost_watch || plan.dirs != self.registered {
+                if !self.install(plan, lost_watch) {
+                    return (changed, false);
                 }
-            }
-            if plan.dirs == self.registered && plan == *self.classes.current() {
+            } else if plan != *self.classes.current() {
+                self.classes.publish(plan);
+            } else {
                 return (changed, true);
-            }
-            if !self.apply(plan) {
-                return (changed, false);
             }
             changed = true;
         }
         (changed, false)
     }
 
-    /// Adds the new watches before removing the old, reacting to both meanwhile. Whether
-    /// anything changed: with no progress, only time (a freed quota) can help.
-    fn apply(&mut self, plan: Watched) -> bool {
-        let Some(watch) = self.watch.as_mut() else {
+    /// Starts `plan` on a new backend, then drops the old one, reacting to both meanwhile. A
+    /// directory that fails leaves the set incomplete, so a later retry builds it again.
+    /// Whether anything changed (`forced`: the old watches stopped following their paths):
+    /// with no progress, only time (a freed quota) can help.
+    fn install(&mut self, plan: Watched, forced: bool) -> bool {
+        let Some(mut next) = (self.open)() else {
             return false;
         };
         let before = self.classes.current();
-        let mut progress = plan != *before;
         self.classes.publish(before.merged(&plan));
-        for dir in plan.dirs.difference(&self.registered.clone()) {
-            match watch.watch(dir) {
+        let mut registered = HashSet::new();
+        for dir in &plan.dirs {
+            match next.watch(dir) {
                 Ok(()) => {
-                    self.registered.insert(dir.clone());
-                    progress = true;
+                    registered.insert(dir.clone());
                 }
                 Err(e) => tracing::debug!(dir = %dir.display(), error = %e, "not watching dir"),
             }
         }
-        let stale: Vec<PathBuf> = self.registered.difference(&plan.dirs).cloned().collect();
-        for dir in stale {
-            watch.unwatch(&dir);
-            self.registered.remove(&dir);
-            progress = true;
-        }
+        let progress = forced || plan != *before || registered != self.registered;
+        self.watch = Some(next);
+        self.registered = registered;
         self.classes.publish(plan);
         progress
     }
@@ -477,26 +459,31 @@ mod tests {
 
     const WAIT: Duration = Duration::from_secs(10);
 
+    /// What every fake backend shares. Calls name the backend, numbered from 1.
     #[derive(Clone, Default)]
     struct FakeWatch {
-        registered: Arc<Mutex<HashSet<PathBuf>>>,
         refused: Arc<Mutex<HashSet<PathBuf>>>,
         calls: Arc<Mutex<Vec<String>>>,
     }
 
-    impl DirWatch for FakeWatch {
+    struct FakeBackend {
+        id: usize,
+        shared: FakeWatch,
+    }
+
+    impl DirWatch for FakeBackend {
         fn watch(&mut self, dir: &Path) -> notify::Result<()> {
-            if lock(&self.refused).contains(dir) {
+            if lock(&self.shared.refused).contains(dir) {
                 return Err(notify::Error::generic("no watches left"));
             }
-            lock(&self.calls).push(format!("watch {}", dir.display()));
-            lock(&self.registered).insert(dir.to_path_buf());
+            lock(&self.shared.calls).push(format!("{} watch {}", self.id, dir.display()));
             Ok(())
         }
+    }
 
-        fn unwatch(&mut self, dir: &Path) {
-            lock(&self.calls).push(format!("unwatch {}", dir.display()));
-            lock(&self.registered).remove(dir);
+    impl Drop for FakeBackend {
+        fn drop(&mut self) {
+            lock(&self.shared.calls).push(format!("{} drop", self.id));
         }
     }
 
@@ -526,12 +513,19 @@ mod tests {
         let fake = FakeWatch::default();
         let classes = Arc::new(Classes::default());
         let (tx, caught_up) = std_mpsc::channel();
-        let (opened, seen) = (fake.clone(), fake.registered.clone());
+        let shared = fake.clone();
+        let mut opened = 0;
         let watcher = FileWatcher::spawn(Worker {
-            open: Box::new(move || Some(opened.clone())),
+            open: Box::new(move || {
+                opened += 1;
+                Some(FakeBackend {
+                    id: opened,
+                    shared: shared.clone(),
+                })
+            }),
             scan,
-            caught_up: Box::new(move || {
-                let _ = tx.send(lock(&seen).clone());
+            caught_up: Box::new(move |dirs| {
+                let _ = tx.send(dirs.clone());
             }),
             classes: classes.clone(),
             watch: None,
@@ -599,11 +593,8 @@ mod tests {
         let seen = h.caught_up.recv_timeout(WAIT).unwrap();
         assert_eq!(seen, HashSet::from([PathBuf::from("/b")]));
         let calls = lock(&h.fake.calls).clone();
-        let (added, removed) = (
-            calls.iter().position(|c| c == "watch /b").unwrap(),
-            calls.iter().position(|c| c == "unwatch /a").unwrap(),
-        );
-        assert!(added < removed, "{calls:?}");
+        // The new backend is watching before the old one ends.
+        assert_eq!(calls, ["1 watch /a", "2 watch /b", "1 drop"]);
     }
 
     #[test]
@@ -673,7 +664,24 @@ mod tests {
         h.watcher.request(scope());
         h.caught_up.recv_timeout(WAIT).unwrap();
         let calls = lock(&h.fake.calls).clone();
-        assert_eq!(calls, ["watch /a", "unwatch /a", "watch /a"]);
+        assert_eq!(calls, ["1 watch /a", "2 watch /a", "1 drop"]);
+    }
+
+    #[test]
+    fn a_backend_with_a_failed_watch_is_replaced_by_a_complete_one() {
+        let current = Arc::new(Mutex::new(plan(&["/a"])));
+        let h = harness(fixed(&current));
+        lock(&h.fake.refused).insert(PathBuf::from("/a"));
+        h.watcher.request(scope());
+        assert!(h.caught_up.recv_timeout(WAIT).unwrap().is_empty());
+
+        // The retry starts from a new backend, not from the one that failed.
+        lock(&h.fake.refused).clear();
+        let seen = h.caught_up.recv_timeout(WAIT).unwrap();
+        assert_eq!(seen, HashSet::from([PathBuf::from("/a")]));
+        let calls = lock(&h.fake.calls).clone();
+        let watched = calls.iter().find(|c| c.ends_with("watch /a")).unwrap();
+        assert!(!watched.starts_with("1 "), "{calls:?}");
     }
 
     #[test]
