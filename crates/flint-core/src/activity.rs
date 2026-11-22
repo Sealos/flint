@@ -96,7 +96,7 @@ pub struct ActivityRecord {
     pub outcome: Outcome,
     /// [`cluster_key`] of the full `cluster`, set by [`append`]: what the app matches a context
     /// by, since `cluster` may be cut or redacted. Of the context's own name only for a call that
-    /// reached it ([`append_call`]); otherwise of the redacted text.
+    /// named a context in the kubeconfig ([`append_call`]); otherwise of the redacted text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_key: Option<String>,
     /// [`ServerKeys::server_key`] of the server the cluster is exposed with, as the kubeconfig
@@ -125,6 +125,9 @@ pub struct Reached {
     pub server: Option<String>,
     /// The contexts the call probed, each with its server.
     pub probed: Vec<(String, Option<String>)>,
+    /// The cluster the call named is a context in the kubeconfig the call loaded, whether or not
+    /// it is exposed or was connected to.
+    pub context: bool,
 }
 
 /// A cluster a call read about without naming it, by its keys.
@@ -210,7 +213,9 @@ fn is_current_server_key(key: &str) -> bool {
 }
 
 /// A stable key for a context name (FNV-1a, 64 bits, in hex): the same in every Flint version.
-/// Context names are not secret (the record holds them), so this one is not keyed.
+/// Not keyed, so a tab can find its calls without the key file. A record holds this digest of a
+/// name as written only for a context in the kubeconfig ([`append_call`]); any other value is
+/// redacted first.
 pub fn cluster_key(context: &str) -> String {
     fnv1a(context.as_bytes())
 }
@@ -348,10 +353,10 @@ pub fn append_call(
 ) -> std::io::Result<()> {
     let keys = ServerKeys::open(config_dir);
     let record = ActivityRecord {
-        // The name of a context the call reached, so its tab lists the call even when the name
+        // The name of a context in the kubeconfig, so its tab lists the call even when the name
         // itself is redacted.
         cluster_key: record.cluster_key.clone().or_else(|| {
-            reached.server.as_ref()?;
+            (reached.context || reached.server.is_some()).then_some(())?;
             record.cluster.as_deref().map(cluster_key)
         }),
         server_key: reached.server.as_deref().and_then(|s| keys.server_key(s)),
@@ -431,14 +436,69 @@ fn ends_unterminated(file: &mut std::fs::File) -> std::io::Result<bool> {
     Ok(last[0] != b'\n')
 }
 
-/// `text` as a record may hold it, whole: with the redaction replies get. A value past
-/// [`MAX_READ_BYTES`] is not read, and one with control characters is no name and could carry on
-/// past what a rule recognises on its line: of either, only the size is kept.
+/// Whether `c` does not show as itself: a format character (Unicode category Cf: bidi controls,
+/// zero-width characters, tags), a line or paragraph separator, or another default-ignorable
+/// character such as a variation selector or a blank filler.
+pub fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00ad}'
+            | '\u{034f}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
+            | '\u{115f}'..='\u{1160}'
+            | '\u{17b4}'..='\u{17b5}'
+            | '\u{180b}'..='\u{180f}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+            | '\u{ffa0}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0000}'..='\u{e0fff}'
+    )
+}
+
+/// Whether a value holding `c` is no name to record: a control or invisible character, a space
+/// other than the ASCII one, or a fullwidth or small form of `=` or `:`.
+fn is_unnamed(c: char) -> bool {
+    c.is_control()
+        || is_invisible(c)
+        || (c.is_whitespace() && c != ' ')
+        || matches!(c, '\u{ff1d}' | '\u{ff1a}' | '\u{fe66}' | '\u{fe55}')
+}
+
+/// `text` as a record may hold it, whole: with the redaction replies get, and nothing after the
+/// first value replaced. A value past [`MAX_READ_BYTES`] is not read, and one with a character
+/// [`is_unnamed`] is no name: of either, only the size is kept.
 fn redacted(text: &str) -> String {
-    if text.len() > MAX_READ_BYTES || text.chars().any(char::is_control) {
-        return format!("…(+{} bytes)", text.len());
+    let size = || format!("…(+{} bytes)", text.len());
+    if text.len() > MAX_READ_BYTES || text.chars().any(is_unnamed) {
+        return size();
     }
-    crate::redact::redact_credentials(text).text.into_owned()
+    let replaced = crate::redact::redact_credentials(text);
+    if replaced.count == 0 {
+        return replaced.text.into_owned();
+    }
+    through_first_marker(&replaced.text).map_or_else(size, str::to_owned)
+}
+
+/// `text` up to and including its first `[REDACTED:<kind>]` marker.
+fn through_first_marker(text: &str) -> Option<&str> {
+    let start = text.find("[REDACTED:")?;
+    let end = start + text[start..].find(']')?;
+    Some(&text[..=end])
 }
 
 /// `record` with each text field [`redacted`] and then cut at [`MAX_FIELD_BYTES`], saying how much
@@ -785,6 +845,95 @@ mod tests {
         assert_eq!(recorded, format!("…(+{} bytes)", name.len()));
     }
 
+    /// What `append` records for `text` in the name field.
+    fn recorded_name(text: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let call = ActivityRecord {
+            name: Some(text.into()),
+            ..record(1)
+        };
+        append(dir.path(), &call).unwrap();
+        read(dir.path()).remove(0).name.unwrap()
+    }
+
+    // covers UP-16: a field keeps nothing that follows the first replaced value.
+    #[test]
+    fn nothing_after_a_replaced_value_is_recorded() {
+        for (text, kept) in [
+            ("password=correct horse battery", "password=[REDACTED:"),
+            ("token=aaa bbb", "token=[REDACTED:"),
+            ("before password=aaa bbb ccc", "before password=[REDACTED:"),
+        ] {
+            let got = recorded_name(text);
+            assert!(got.starts_with(kept), "{got}");
+            assert!(got.ends_with(']'), "{got}");
+            for word in ["horse", "battery", "aaa", "bbb", "ccc"] {
+                assert!(!got.contains(word), "{got}");
+            }
+        }
+    }
+
+    // covers UP-16: a value with characters that do not show, or a fullwidth separator, is
+    // recorded by its size alone; ordinary non-ASCII names are recorded as written.
+    #[test]
+    fn a_value_with_hidden_characters_is_recorded_by_size() {
+        for text in [
+            "pass\u{200b}word=abc",
+            "password\u{2028}=abc",
+            "password=abc\u{2028}def",
+            "password=abc\u{2029}def",
+            "password\u{00a0}=abc",
+            "password\u{3000}=abc",
+            "pass\u{0600}word=abc",
+            "pass\u{e0041}word=abc",
+            "password\u{ff1d}abc",
+            "password\u{ff1a}abc",
+            "password\u{fe66}abc",
+            "password\u{fe55}abc",
+        ] {
+            assert_eq!(recorded_name(text), format!("…(+{} bytes)", text.len()));
+        }
+        for ordinary in ["naïve-日本語", "prod-é", "кластер", "🚀-prod"] {
+            assert_eq!(recorded_name(ordinary), ordinary);
+        }
+    }
+
+    // covers UP-16: a call that names a context in the kubeconfig is keyed by that name, reached
+    // or not, and two such contexts keep two keys. Any other value is not keyed as written.
+    #[test]
+    fn only_a_context_in_the_kubeconfig_is_keyed_by_its_name() {
+        let key_of = |context: &str, reached: &Reached| {
+            let dir = tempfile::tempdir().unwrap();
+            let call = ActivityRecord {
+                cluster: Some(context.into()),
+                server: None,
+                cluster_key: None,
+                server_key: None,
+                ..record(1)
+            };
+            append_call(dir.path(), &call, reached).unwrap();
+            read(dir.path()).remove(0).cluster_key.unwrap()
+        };
+        let known = Reached {
+            context: true,
+            ..Reached::default()
+        };
+        let (prod, staging) = (
+            key_of("token:prod", &known),
+            key_of("token:staging", &known),
+        );
+        assert_eq!(prod, cluster_key("token:prod"));
+        assert_eq!(staging, cluster_key("token:staging"));
+        assert_ne!(prod, staging);
+
+        let unknown = Reached::default();
+        assert_ne!(
+            key_of("token:prod", &unknown),
+            cluster_key("token:prod"),
+            "a value that matches no context is not keyed as written"
+        );
+    }
+
     // covers UP-16: a context the call reached stays matched by its own key, whatever its name
     // looks like; ordinary names are recorded as written.
     #[test]
@@ -794,7 +943,7 @@ mod tests {
         let url = "https://prod:6443";
         let reached = Reached {
             server: Some(url.into()),
-            probed: Vec::new(),
+            ..Reached::default()
         };
         let exposed = ActivityRecord {
             cluster: Some(context.into()),
@@ -934,7 +1083,7 @@ mod tests {
         wide.server_key = None;
         let reached = Reached {
             server: Some(server.clone()),
-            probed: Vec::new(),
+            ..Reached::default()
         };
         append_call(dir.path(), &wide, &reached).unwrap();
         let read = read(dir.path());
@@ -1031,6 +1180,7 @@ mod tests {
         let reached = Reached {
             server: Some(url.into()),
             probed: vec![("dev".into(), Some(url.into()))],
+            ..Reached::default()
         };
         append_call(one.path(), &record(1), &reached).unwrap();
         let read = read(one.path());
@@ -1099,7 +1249,7 @@ mod tests {
         assert_eq!(ServerKeys::open(dir.path()).server_key("https://a"), None);
         let reached = Reached {
             server: Some("https://prod:6443".into()),
-            probed: Vec::new(),
+            ..Reached::default()
         };
         let call = ActivityRecord {
             server_key: None,
@@ -1130,6 +1280,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            ..Reached::default()
         };
         let listed = ActivityRecord {
             tool: "list_clusters".into(),
