@@ -320,6 +320,25 @@ impl ContextHistory {
         }
     }
 
+    /// Counts each file in `blank` that defined contexts when it last loaded as failed in
+    /// `loaded`: a writer that truncates before it writes leaves such a file for a moment, and
+    /// what it defines is unknown until it has content again. A blank file that defined nothing
+    /// is an ordinary empty file.
+    pub fn fail_emptied(&self, loaded: &mut LoadedKubeconfig, blank: &[PathBuf]) {
+        for path in blank {
+            if self
+                .defines
+                .get(path)
+                .is_some_and(|names| !names.is_empty())
+            {
+                loaded.defines.retain(|(defined, _)| defined != path);
+                loaded
+                    .errors
+                    .push((path.clone(), "the file is empty".to_owned()));
+            }
+        }
+    }
+
     /// The pin for a session on `context` whose client was built for `server`: stale unless
     /// that is the context's confirmed server.
     pub fn pin(&self, context: &str, server: Option<&str>) -> ContextPin {

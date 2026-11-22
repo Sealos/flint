@@ -430,6 +430,47 @@ async fn run_when_settled(core: &CoreHandle, review: &WriteReview) -> Result<(),
     }
 }
 
+// covers UP-06, UP-54: a file emptied by a writer counts as failed, whether it is zero bytes or
+// only whitespace: the context stays, writes are refused and nothing is sent. The same file back,
+// the earlier review runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_emptied_kubeconfig_refuses_writes_until_the_same_file_is_back() {
+    for blank in ["", " \n\t\n"] {
+        let server = FakeApiServer::start().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kubeconfig");
+        let core = core_with_deployment(&server, dir.path(), &path).await;
+        let whole = std::fs::read_to_string(&path).unwrap();
+        let review = core
+            .review_write(target(&server), proposal())
+            .await
+            .unwrap();
+        let before = mutating(&server);
+
+        std::fs::write(&path, blank).unwrap();
+        core.reload_kubeconfig().await.unwrap();
+        assert_eq!(
+            core.review_write(target(&server), proposal())
+                .await
+                .unwrap_err(),
+            WriteError::KubeconfigUnreadable
+        );
+        assert_eq!(
+            core.run_write(review.clone().into_intent())
+                .await
+                .unwrap_err(),
+            WriteError::KubeconfigUnreadable
+        );
+        assert_eq!(mutating(&server), before, "no mutating request");
+
+        std::fs::write(&path, &whole).unwrap();
+        core.reload_kubeconfig().await.unwrap();
+        run_when_settled(&core, &review).await.unwrap();
+        let object = server.object(&deployments(), Some("demo"), EDITED).unwrap();
+        assert_eq!(object["spec"]["replicas"], 3);
+    }
+}
+
 // covers UP-06, UP-54: with the file broken, a new review and a run of an earlier one are refused
 // and send nothing that could change the cluster. The same file back, the earlier review runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

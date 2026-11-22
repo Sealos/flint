@@ -20,7 +20,7 @@ use crate::discovery::ClusterDiscovery;
 use crate::handle::{
     ClusterSummary, ClustersSnapshot, Command, ConnectionState, CoreConfig, Event, Request,
 };
-use crate::kubeconfig::{self, ContextInfo, LoadedKubeconfig};
+use crate::kubeconfig::{self, ContextInfo, FileRead, KubeconfigReader, LoadedKubeconfig};
 use crate::logs::{self, KubeLogSource, KubePodSource, LogError, SessionConfig};
 use crate::protection::{ClusterClients, GatedClient, SessionUnlocks, WriteRefusal, protection};
 use crate::read::{self, KindId, KindInfo};
@@ -267,6 +267,10 @@ pub(crate) struct ClusterManager {
     contexts: ContextHistory,
     /// The kubeconfig files for the current settings: the base files plus `kubeconfig_paths`.
     kubeconfig_paths: Vec<PathBuf>,
+    /// Reads those files without letting a stuck one hold up this loop.
+    reader: KubeconfigReader,
+    /// The files whose read is stuck, once that was applied and reported.
+    stalled_on: Option<Vec<PathBuf>>,
     settings: Arc<Settings>,
     settings_error: Option<String>,
     /// The newest Trust or Stop Trusting request whose write has finished.
@@ -346,6 +350,8 @@ impl ClusterManager {
             unlocks,
             held: HashSet::new(),
             settled: HashMap::new(),
+            reader: KubeconfigReader::default(),
+            stalled_on: None,
         }
     }
 
@@ -1212,7 +1218,14 @@ impl ClusterManager {
             });
         }
         let pin = self.session_pin(cluster);
-        self.write_client(cluster).map(|client| (client, pin))
+        let client = self.write_client(cluster)?;
+        // A same-URL fallback keeps its pin, but it may carry another file's credentials.
+        if self.contexts.provisional(cluster) {
+            return Err(WriteRefusal::Unsettled {
+                cluster: cluster.to_owned(),
+            });
+        }
+        Ok((client, pin))
     }
 
     /// [`Self::shell_client`] for one request of a reviewed write, with the credential of the
@@ -1225,7 +1238,12 @@ impl ClusterManager {
         if self.held(cluster) {
             return Err(WriteError::KubeconfigUnreadable);
         }
-        let (client, pin) = self.shell_client(cluster, server)?;
+        let (client, pin) =
+            self.shell_client(cluster, server)
+                .map_err(|refusal| match refusal {
+                    WriteRefusal::Unsettled { .. } => WriteError::KubeconfigUnreadable,
+                    refusal => refusal.into(),
+                })?;
         let credential = self
             .cluster(cluster)
             .and_then(|slot| slot.write_credential.clone())
@@ -1273,6 +1291,18 @@ impl ClusterManager {
     /// The gate for a session about to run a command with the client it was given at `pin`: for
     /// the server that client talks to, in the same step as checking the context still names it.
     fn launch_gate(&self, cluster: &str, pin: &ContextPin) -> Result<(), WriteRefusal> {
+        self.pin_gate(cluster, pin)?;
+        if self.contexts.provisional(cluster) {
+            return Err(WriteRefusal::Unsettled {
+                cluster: cluster.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether `pin` is still good for starting something on `cluster`, and the gate is open for
+    /// its server.
+    fn pin_gate(&self, cluster: &str, pin: &ContextPin) -> Result<(), WriteRefusal> {
         if self.contexts.check(Pinned::Shell, cluster, pin).is_some()
             || self.contexts.gate_moved(cluster, pin)
         {
@@ -1295,7 +1325,7 @@ impl ClusterManager {
         if self.held(cluster) {
             return Err(WriteError::KubeconfigUnreadable);
         }
-        self.launch_gate(cluster, pin)?;
+        self.pin_gate(cluster, pin)?;
         if self.contexts.provisional(cluster) {
             Err(WriteError::KubeconfigUnreadable)
         } else if self.contexts.definition_holds(cluster, pin) {
@@ -1346,9 +1376,25 @@ impl ClusterManager {
     /// that fails included. What gives access checks this right before saving.
     async fn files_still_show(&mut self, id: &str, server: &str) -> bool {
         let paths = self.kubeconfig_paths.clone();
-        match tokio::task::spawn_blocking(move || kubeconfig::load(&paths)).await {
-            Ok(fresh) => self.contexts.holds_in(&fresh, id, server),
-            Err(_) => false,
+        let on_late = self.reload_when_read();
+        match self.reader.read(&paths, on_late).await {
+            Some(mut fresh) => {
+                self.contexts.fail_emptied(&mut fresh.loaded, &fresh.blank);
+                self.contexts.holds_in(&fresh.loaded, id, server)
+            }
+            None => false,
+        }
+    }
+
+    /// For a read that ends after it was given up on: loads the files again, since what it
+    /// waited on has moved.
+    fn reload_when_read(&self) -> impl FnOnce() + Send + 'static {
+        let internal = self.internal_tx.clone();
+        move || {
+            let _ = internal.send(Internal::FilesChanged(Changed {
+                kubeconfig: true,
+                ..Changed::default()
+            }));
         }
     }
 
@@ -1469,26 +1515,39 @@ impl ClusterManager {
     }
 
     /// Loads the kubeconfig files and applies them. Whether that was done: a file that fails to
-    /// parse still counts, and is reported in the cluster list.
+    /// parse still counts, and is reported in the cluster list. A read that does not finish in
+    /// time is applied as every file failing, which keeps the clusters and holds their writes,
+    /// and counts as not done.
     async fn reload_kubeconfig(&mut self) -> bool {
         let paths = self.kubeconfig_paths.clone();
-        let loaded = tokio::task::spawn_blocking(move || {
-            let loaded = kubeconfig::load(&paths);
-            let exist: Vec<(PathBuf, bool)> = loaded
-                .paths
-                .iter()
-                .map(|p| (p.clone(), p.exists()))
-                .collect();
-            (loaded, exist)
-        })
-        .await;
-        let (loaded, path_exist) = match loaded {
-            Ok((loaded, exist)) => (Arc::new(loaded), exist),
-            Err(e) => {
-                self.emit(Event::Error(format!("kubeconfig reload failed: {e}")));
-                return false;
+        let on_late = self.reload_when_read();
+        let read = self.reader.read(&paths, on_late).await;
+        let finished = read.is_some();
+        let read = match read {
+            Some(read) => {
+                self.stalled_on = None;
+                read
+            }
+            // Already applied and reported.
+            None if self.stalled_on.as_ref() == Some(&paths) => return false,
+            None => {
+                self.emit(Event::Error(
+                    "Your kubeconfig files are taking too long to read. Clusters stay as they \
+                     were, and changes to them are refused until the files can be read."
+                        .to_owned(),
+                ));
+                let stalled = FileRead::stalled(&paths);
+                self.stalled_on = Some(paths);
+                stalled
             }
         };
+        let FileRead {
+            mut loaded,
+            exist: path_exist,
+            blank,
+        } = read;
+        self.contexts.fail_emptied(&mut loaded, &blank);
+        let loaded = Arc::new(loaded);
         tracing::info!(
             contexts = loaded.contexts.len(),
             files = loaded.paths.len(),
@@ -1603,7 +1662,7 @@ impl ClusterManager {
                 self.ensure_connected(&active);
             }
         }
-        true
+        finished
     }
 
     /// (Re)creates the file watcher for the current kubeconfig files and `settings.toml`, if
@@ -2256,6 +2315,131 @@ mod tests {
         );
         let logs = manager.log_client("dev", &pin).err().expect("no client");
         assert!(logs.is_cluster(), "{}", logs.message);
+    }
+
+    /// Reads every path whatever its kind, so a FIFO blocks as a stalled mount would.
+    fn blocking_load(paths: &[PathBuf]) -> LoadedKubeconfig {
+        for path in paths {
+            let _ = std::fs::read(path);
+        }
+        kubeconfig::load(paths)
+    }
+
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    }
+
+    // covers UP-06, UP-54: with a kubeconfig read hung, the context is held and nothing widens,
+    // while Hide from AI and Stop Trusting still save. When the read ends, a reload is asked for
+    // and the files apply again.
+    #[tokio::test]
+    async fn a_hung_read_holds_contexts_and_still_saves_revocations() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://dev");
+        let mut manager = manager_reading_two(dir.path(), &yaml, &yaml).await;
+        manager.config.config_dir = dir.path().join("config");
+        let at = Some("https://dev".to_owned());
+        assert!(manager.set_pin(Pins::Trust, "dev".into(), at.clone()).await);
+        let expose = Pins::AiExposure(AiScope::default());
+        assert!(manager.set_pin(expose, "dev".into(), at.clone()).await);
+
+        let second = dir.path().join("second");
+        std::fs::remove_file(&second).unwrap();
+        make_fifo(&second);
+        manager.reader = KubeconfigReader::new(blocking_load, Duration::from_millis(50));
+
+        assert!(
+            !manager.reload_kubeconfig().await,
+            "the read did not finish"
+        );
+        assert!(manager.cluster("dev").is_some(), "the last state stays");
+        assert!(manager.held("dev") && manager.unsettled("dev"));
+        assert!(!manager.set_pin(Pins::Trust, "dev".into(), at.clone()).await);
+
+        let started = std::time::Instant::now();
+        assert!(!manager.reload_kubeconfig().await, "still stuck");
+        assert!(started.elapsed() < Duration::from_millis(50), "no new wait");
+        let hide = Pins::AiExposure(AiScope::default());
+        assert!(manager.set_pin(hide, "dev".into(), None).await);
+        assert!(manager.set_pin(Pins::Trust, "dev".into(), None).await);
+        let kept = saved(dir.path());
+        assert!(kept.ai_exposed_clusters.is_empty() && kept.trusted_clusters.is_empty());
+
+        // A writer that opens and closes the FIFO ends the blocked read.
+        drop(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&second)
+                .unwrap(),
+        );
+        let internal = manager.internal_rx.as_mut().unwrap();
+        let late = tokio::time::timeout(Duration::from_secs(5), internal.recv())
+            .await
+            .expect("the late read asks for a reload");
+        assert!(matches!(
+            late,
+            Some(Internal::FilesChanged(Changed {
+                kubeconfig: true,
+                ..
+            }))
+        ));
+        std::fs::remove_file(&second).unwrap();
+        std::fs::write(&second, &yaml).unwrap();
+        assert!(manager.reload_kubeconfig().await);
+        assert!(!manager.unsettled("dev"), "settled again");
+    }
+
+    // covers UP-06, UP-54: an unlocked context on a same-URL fallback with another token starts
+    // no shell, though the pin stays good and the unlock is kept. With the file back it does.
+    #[tokio::test]
+    async fn a_same_url_fallback_starts_no_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://dev");
+        let fallback = yaml.replace("user: {}", "user: {token: fallback}");
+        let mut manager = manager_reading_two(dir.path(), &yaml, &fallback).await;
+        offline(&mut manager);
+        manager.unlocks.unlock("dev", "https://dev");
+        let pin = manager.contexts.pin_confirmed("dev");
+        assert_eq!(manager.launch_gate("dev", &pin), Ok(()));
+
+        let first = dir.path().join("first");
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        offline(&mut manager);
+        assert!(!manager.held("dev") && manager.contexts.provisional("dev"));
+        let unsettled = WriteRefusal::Unsettled {
+            cluster: "dev".into(),
+        };
+        assert_eq!(manager.launch_gate("dev", &pin), Err(unsettled.clone()));
+        assert_eq!(
+            manager.write_pin_gate("dev", &pin),
+            Err(WriteError::KubeconfigUnreadable),
+            "a write keeps its own refusal"
+        );
+        // A client that is never used: building one contacts nothing.
+        let client = kube::Client::try_from(kube::Config::new("https://dev".parse().unwrap()))
+            .expect("a client");
+        let connect = |manager: &mut ClusterManager| {
+            manager.cluster_mut("dev").unwrap().client = Some(ClusterClients {
+                read: client.clone(),
+                writes: crate::protection::WriteAccess::new(client.clone()),
+            });
+        };
+        connect(&mut manager);
+        assert_eq!(manager.shell_client("dev", None).err(), Some(unsettled));
+        assert_eq!(
+            manager.bound_write_client("dev", None).err(),
+            Some(WriteError::KubeconfigUnreadable)
+        );
+
+        rewrite_file(&mut manager, &first, &yaml).await;
+        offline(&mut manager);
+        manager.unlocks.unlock("dev", "https://dev");
+        assert_eq!(manager.launch_gate("dev", &pin), Ok(()));
+        connect(&mut manager);
+        assert!(manager.shell_client("dev", None).is_ok());
     }
 
     // covers UP-54: a session's launch check goes through the request channel and answers for
