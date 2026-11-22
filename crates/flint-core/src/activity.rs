@@ -285,28 +285,19 @@ fn load_or_make_key(config_dir: &Path) -> std::io::Result<[u8; 32]> {
     }
     std::fs::create_dir_all(config_dir)?;
     let rng = ring::rand::SystemRandom::new();
+    let no_random = |_| std::io::Error::other("no random bytes from the system");
     let mut secret = [0u8; 32];
     rng.fill(&mut secret).map_err(no_random)?;
     // A random name: a draft a crashed process left behind can never be taken for this one.
-    let draft = config_dir.join(format!(".{KEY_FILE}.{}", random_name(&rng)?));
+    let mut name = [0u8; 16];
+    rng.fill(&mut name).map_err(no_random)?;
+    let draft = config_dir.join(format!(".{KEY_FILE}.{:032x}", u128::from_ne_bytes(name)));
     if link_key(&draft, &path, &secret)? {
         Ok(secret)
     } else {
         // Another process made it first: use theirs.
         read_key(&path)
     }
-}
-
-fn no_random(_: ring::error::Unspecified) -> std::io::Error {
-    std::io::Error::other("no random bytes from the system")
-}
-
-/// A file name part no other file has: 128 random bits in hex.
-fn random_name(rng: &ring::rand::SystemRandom) -> std::io::Result<String> {
-    use ring::rand::SecureRandom as _;
-    let mut name = [0u8; 16];
-    rng.fill(&mut name).map_err(no_random)?;
-    Ok(format!("{:032x}", u128::from_ne_bytes(name)))
 }
 
 /// Writes `secret` whole to a new file at `draft` and links it to `path`: a reader never sees part
@@ -468,29 +459,27 @@ struct Lock {
 }
 
 impl Lock {
-    /// Takes the lock on `path`, trying for up to `wait`. The file is created owner-only, and one
-    /// with another mode is replaced ([`open_lock_file`]). A lock counts only on the file now at
-    /// `path`: after a replacement, a writer still on the old file moves to the new one.
+    /// Takes the lock on `path` (created owner-only), trying for up to `wait`.
     fn take(path: &Path, wait: Duration) -> std::io::Result<Self> {
         use std::os::fd::AsRawFd as _;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(OWNER_ONLY)
+            .open(path)?;
+        owner_only(path)?;
         let deadline = Instant::now() + wait;
-        let mut file = open_lock_file(path)?;
         loop {
             // SAFETY: flock on a descriptor `file` owns.
-            let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            let error = std::io::Error::last_os_error();
-            let current = is_file_at(&file, path)?;
-            if locked == 0 && current {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                 return Ok(Lock { _file: file });
             }
-            if !current {
-                file = open_lock_file(path)?;
-            } else {
-                match error.kind() {
-                    std::io::ErrorKind::Interrupted => continue,
-                    std::io::ErrorKind::WouldBlock => {}
-                    _ => return Err(error),
-                }
+            let error = std::io::Error::last_os_error();
+            match error.kind() {
+                std::io::ErrorKind::Interrupted => continue,
+                std::io::ErrorKind::WouldBlock => {}
+                _ => return Err(error),
             }
             if Instant::now() >= deadline {
                 return Err(std::io::Error::new(
@@ -504,62 +493,6 @@ impl Lock {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
-}
-
-/// Opens the lock file at `path`, creating it owner-only. A file with another mode may be open
-/// read-only in another user's process, which could hold the lock through that descriptor, and a
-/// chmod does not close it: such a file is replaced by a fresh one.
-fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let open = || {
-        OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(OWNER_ONLY)
-            .open(path)
-    };
-    let file = open()?;
-    if file.metadata()?.permissions().mode() & 0o777 == OWNER_ONLY {
-        return Ok(file);
-    }
-    drop(file);
-    replace_lock_file(path)?;
-    open()
-}
-
-/// Renames a fresh owner-only file over `path`, unless another writer just did.
-fn replace_lock_file(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let draft = dir.join(format!(
-        ".{LOCK_FILE}.{}",
-        random_name(&ring::rand::SystemRandom::new())?
-    ));
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(OWNER_ONLY)
-        .open(&draft)?;
-    let replaced = file
-        .set_permissions(std::fs::Permissions::from_mode(OWNER_ONLY))
-        .and_then(|()| std::fs::metadata(path))
-        .and_then(|now| {
-            if now.permissions().mode() & 0o777 == OWNER_ONLY {
-                return Ok(());
-            }
-            std::fs::rename(&draft, path)
-        });
-    // Gone after a rename; still here when another writer replaced the file first or on error.
-    let _ = std::fs::remove_file(&draft);
-    replaced
-}
-
-/// Whether `file` is the file now at `path`.
-fn is_file_at(file: &std::fs::File, path: &Path) -> std::io::Result<bool> {
-    use std::os::unix::fs::MetadataExt as _;
-    let open = file.metadata()?;
-    Ok(file_id(path) == Some((open.dev(), open.ino())))
 }
 
 /// The records in `config_dir`, oldest first, at most [`MAX_RECORDS`] (the newest). A missing
@@ -1221,57 +1154,6 @@ mod tests {
             record(1).attribution(&prod, &at("https://other:6443")),
             None
         );
-    }
-
-    // covers UP-16: a lock file with a wider mode is replaced, so a descriptor opened before the
-    // upgrade that holds the lock no longer stops records.
-    #[test]
-    fn a_lock_held_through_an_old_descriptor_does_not_stop_records() {
-        use std::os::fd::AsRawFd as _;
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        let dir = tempfile::tempdir().unwrap();
-        let lock = dir.path().join(LOCK_FILE);
-        std::fs::write(&lock, b"").unwrap();
-        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let old = std::fs::File::open(&lock).unwrap();
-        // SAFETY: flock on a descriptor `old` owns.
-        assert_eq!(
-            unsafe { libc::flock(old.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        append(dir.path(), &record(1)).unwrap();
-        assert_eq!(read(dir.path()), [record(1)]);
-        let now = std::fs::metadata(&lock).unwrap();
-        assert_eq!(now.permissions().mode() & 0o777, 0o600);
-        assert_ne!(now.ino(), old.metadata().unwrap().ino());
-        let mut names: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        names.sort();
-        assert_eq!(names, [ACTIVITY_FILE, LOCK_FILE], "no drafts left behind");
-    }
-
-    // covers UP-16: a writer waiting on a lock file that is replaced moves to the new file.
-    #[test]
-    fn a_waiting_writer_moves_to_a_replaced_lock_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let lock = dir.path().join(LOCK_FILE);
-        let held = Lock::take(&lock, Duration::ZERO).unwrap();
-        let path = lock.clone();
-        let waiter = std::thread::spawn(move || Lock::take(&path, Duration::from_secs(5)));
-        std::thread::sleep(Duration::from_millis(20));
-        let draft = dir.path().join("fresh");
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(OWNER_ONLY)
-            .open(&draft)
-            .unwrap();
-        std::fs::rename(&draft, &lock).unwrap();
-        let taken = waiter.join().unwrap().unwrap();
-        assert!(is_file_at(&taken._file, &lock).unwrap());
-        assert!(!is_file_at(&held._file, &lock).unwrap());
     }
 
     // covers UP-16: a rotation while the log is read does not show expired records or hide the
