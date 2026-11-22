@@ -5,7 +5,8 @@
 //! and returns a [`WriteReview`]. Its [`WriteIntent`] is what [`CoreHandle::run_write`] takes.
 //!
 //! - A confirmation authorizes nothing: the write gate is asked again before **every** request
-//!   (`RequestGate`), so locking a cluster stops a multi-step action at its next request.
+//!   (`RequestGate`), so locking a cluster stops a multi-step action at its next request. Each
+//!   time it reads the kubeconfig files, which must still show the exact definition reviewed.
 //! - A review is bound to what it read: its cluster, server, kind, namespace, name, uid and
 //!   `resourceVersion`. A [`ReviewedEdit`] can only be made here, and is refused for any other
 //!   target.

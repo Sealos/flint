@@ -4,12 +4,15 @@
 //! through [`CoreHandle`] (ADR-0002); one-shot callers such as the MCP server use the functions
 //! in [`cluster`] and [`read`] directly on their own tokio runtime.
 
+pub mod access;
 pub mod activity;
+pub mod alerts;
 pub mod api_error;
 mod auth_plugin;
 pub mod bootstrap;
 pub mod cache;
 pub mod cluster;
+mod connection;
 mod credential;
 pub mod discovery;
 pub mod display;
@@ -24,6 +27,7 @@ pub mod logs;
 mod manager;
 pub mod metrics;
 pub mod paging;
+pub mod problems;
 pub mod protection;
 pub mod read;
 mod read_only;
@@ -39,6 +43,10 @@ mod watch;
 pub mod write;
 mod write_actions;
 
+pub use alerts::{
+    Alert, AlertConfig, AlertEngine, AlertEvent, AlertKey, AlertOwner, AlertSubject, AlertSummary,
+    ClusterLimitReached, ClusterSnapshot, Observation, OpenAlert, OpenAlertState,
+};
 pub use cluster::{ClusterId, SafeErrorText, ServerVersion};
 pub use discovery::{
     ClusterDiscovery, NavEntry, NavEntryError, NavSection, Navigation, SectionKind,
@@ -57,6 +65,9 @@ pub use logs::{
     WorkloadTarget,
 };
 pub use metrics::{MetricsError, MetricsList, MetricsPoll, NodeMetrics, PodMetrics};
+pub use problems::{
+    Classifier, Problem, ProblemId, ProblemKind, ProblemReason, ProblemSeverity, ProblemSubject,
+};
 pub use protection::{Protection, SessionUnlocks, WriteRefusal};
 pub use read::{KindId, KindInfo, ObjectDetail};
 pub use settings::{Appearance, Settings, WatchMode};

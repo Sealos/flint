@@ -222,6 +222,8 @@ pub struct DetailView {
     protected: bool,
     /// The server the object's cluster shows, as the workspace says it: what an edit is for.
     server: Option<String>,
+    /// What RBAC says about this object's actions, for showing them ([`access`]).
+    access: access::ObjectAccess,
     /// The YAML edit under way, in its own editor: a list update never touches its text.
     edit: Option<edit::YamlEdit>,
     /// The pane's own focus, for Tab and Shift-Tab between panes (UP-33).
@@ -263,6 +265,12 @@ impl DetailView {
                 }
             }
         });
+        let object_access = access::ObjectAccess::new(
+            &object.kind,
+            object.namespace.as_deref(),
+            &object.name,
+            subject,
+        );
         let mut view = DetailView {
             core,
             object,
@@ -295,6 +303,7 @@ impl DetailView {
             sessions_blocked: None,
             protected: false,
             server: None,
+            access: object_access,
             edit: None,
             focus: cx.focus_handle(),
             _fetch: Task::ready(()),
@@ -339,6 +348,11 @@ impl DetailView {
 
     pub fn object(&self) -> &ObjectRef {
         &self.object
+    }
+
+    /// Why RBAC forbids `what` on this object, if it clearly does.
+    pub(in crate::ui) fn forbidden(&self, what: access::Gated) -> Option<String> {
+        self.access.forbidden(what)
     }
 
     pub fn tab(&self) -> DetailTab {
@@ -744,21 +758,6 @@ impl DetailView {
                     .into_any_element(),
             );
         }
-        if let Subject::Workload(_) = self.subject {
-            return Some(
-                Button::new("detail-logs")
-                    .xsmall()
-                    .ghost()
-                    .label("Logs")
-                    .tooltip(format!(
-                        "Open the logs of every pod in the dock ({})",
-                        registry::key_hint("secondary-l")
-                    ))
-                    .on_click(registry::on_click(OpenLogs))
-                    .into_any_element(),
-            );
-        }
-        let containers: Vec<PodContainer> = self.log_containers().to_vec();
         let keys = registry::key_hint("secondary-l");
         let button = Button::new("detail-logs").xsmall().ghost().label("Logs");
         // Logs that cannot open (the pod could not be fetched, say) stay, disabled, saying why.
@@ -770,6 +769,15 @@ impl DetailView {
                     .into_any_element(),
             );
         }
+        if let Subject::Workload(_) = self.subject {
+            return Some(
+                button
+                    .tooltip(format!("Open the logs of every pod in the dock ({keys})"))
+                    .on_click(registry::on_click(OpenLogs))
+                    .into_any_element(),
+            );
+        }
+        let containers: Vec<PodContainer> = self.log_containers().to_vec();
         match containers.as_slice() {
             // Still loading: Logs waits for the pod.
             [] => Some(
@@ -1780,6 +1788,7 @@ fn timestamp_age(text: &str, now: i64) -> Option<String> {
 
 impl Render for DetailView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.follow_access(cx);
         let theme = cx.theme().clone();
         // The pane itself has focus (Tab between panes, UP-33): ringed.
         let focused = self.focus.is_focused(window);
@@ -1850,6 +1859,9 @@ impl Render for DetailView {
             })
     }
 }
+
+#[path = "detail_access.rs"]
+pub(in crate::ui) mod access;
 
 #[path = "detail_actions.rs"]
 mod actions;

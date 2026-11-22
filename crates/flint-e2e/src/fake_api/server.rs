@@ -21,6 +21,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use super::access::{self, AccessPolicy};
 use super::clock::Clock;
 use super::exec::{self as remote, Execs};
 use super::faults::{self, Effect, Fault, Faults};
@@ -192,6 +193,8 @@ struct Inner {
     /// Exec sessions and the images tests set. Locked after `state` when both are needed.
     execs: Mutex<Execs>,
     faults: Mutex<Faults>,
+    /// What `SelfSubjectAccessReview`s answer.
+    access: Mutex<AccessPolicy>,
     scripts: Mutex<Scripts>,
     watchers: Mutex<HashMap<Gvr, Vec<Watcher>>>,
     requests: Mutex<Vec<RequestRecord>>,
@@ -383,6 +386,7 @@ impl FakeApiServer {
             fixtures,
             options,
             faults: Mutex::default(),
+            access: Mutex::default(),
             scripts: Mutex::default(),
             watchers: Mutex::default(),
             requests: Mutex::default(),
@@ -461,6 +465,17 @@ impl FakeApiServer {
     /// Writes [`FakeApiServer::kubeconfig`] to `path`.
     pub fn write_kubeconfig(&self, path: &Path, namespace: Option<&str>) -> Result<()> {
         kubeconfig::write(path, &self.kubeconfig(namespace))
+    }
+
+    /// A kubeconfig for this server under [`kubeconfig::REMOTE_CONTEXT`], which Flint protects
+    /// as it does any cluster it does not recognise as local.
+    pub fn remote_kubeconfig(&self, namespace: Option<&str>) -> kube::config::Kubeconfig {
+        self.kubeconfig_named(kubeconfig::REMOTE_CONTEXT, namespace)
+    }
+
+    /// Writes [`FakeApiServer::remote_kubeconfig`] to `path`.
+    pub fn write_remote_kubeconfig(&self, path: &Path, namespace: Option<&str>) -> Result<()> {
+        kubeconfig::write(path, &self.remote_kubeconfig(namespace))
     }
 
     /// A kube client for this server, built the way Flint builds them.
@@ -690,6 +705,12 @@ impl FakeApiServer {
         lock(&self.inner.faults).clear();
     }
 
+    /// Sets what `SelfSubjectAccessReview`s answer. It changes nothing else: the server still
+    /// serves every other request.
+    pub fn set_access(&self, policy: AccessPolicy) {
+        *lock(&self.inner.access) = policy;
+    }
+
     /// Every request answered (or dropped) so far, oldest first.
     pub fn requests(&self) -> Vec<RequestRecord> {
         lock(&self.inner.requests).clone()
@@ -859,7 +880,9 @@ async fn handle(
     let mut write_index = None;
     let call = if is_write {
         let write = writes::read(req).await;
-        if let Ok(write) = &write {
+        if let Ok(write) = &write
+            && !access::is_review(&write.method, &route)
+        {
             write_index = Some(record_write(&inner, &record, write));
         }
         Call::Write(write)
@@ -966,6 +989,12 @@ fn answer(
     match call {
         Call::Read(req) => serve(inner, req, upgrade, route, verb, query, accept),
         Call::Write(Err(e)) => error(&e),
+        Call::Write(Ok(write)) if access::is_review(&write.method, route) => {
+            match access::answer(&lock(&inner.access), &write.body) {
+                Ok(review) => json_with(201, "application/json", &review),
+                Err(e) => error(&e),
+            }
+        }
         Call::Write(Ok(write)) if writes::handles(inner, &write.method, route) => {
             writes::serve(inner, &write, route, query).unwrap_or_else(|e| error(&e))
         }
@@ -1146,6 +1175,9 @@ fn respond(
                     ApiError::not_found(format!("OpenAPI document {path} is not recorded"))
                 })
         }
+        Route::MetricsDiscovery => metrics::api_resources(inner)
+            .map(|list| json_with(200, "application/json", &list))
+            .ok_or_else(|| ApiError::not_found("the server could not find the requested resource")),
         Route::Collection { gvr, namespace } => {
             known(inner, gvr, namespace.as_deref()).and_then(|resource| {
                 let ns = namespace.as_deref();

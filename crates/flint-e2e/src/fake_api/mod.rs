@@ -54,6 +54,7 @@
 //! # }
 //! ```
 
+mod access;
 pub mod clock;
 mod exec;
 mod faults;
@@ -71,10 +72,11 @@ mod state;
 mod tls;
 mod watch;
 
+pub use access::AccessPolicy;
 pub use exec::{ExecEnd, ExecImage, ExecRuntime, FakeExec, STDOUT_KEPT, TtySize, V4, V5};
 pub use faults::{Effect, Fault, HoldPoint, RequestHold};
 pub use fixtures::{Fixtures, Gvr};
-pub use kubeconfig::CONTEXT;
+pub use kubeconfig::{CONTEXT, REMOTE_CONTEXT};
 pub use logs::ContainerLog;
 pub use pods::FakePod;
 pub use route::{Query, Verb};

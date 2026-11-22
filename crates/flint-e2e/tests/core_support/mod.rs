@@ -35,6 +35,16 @@ impl Core {
 
     /// A core reading the kubeconfig files `paths`, in order, with its config in `dir`.
     pub async fn start_on(dir: tempfile::TempDir, paths: Vec<PathBuf>, settings: Settings) -> Core {
+        Core::start_on_context(dir, paths, settings, CONTEXT).await
+    }
+
+    /// [`Core::start_on`], activating `context`.
+    pub async fn start_on_context(
+        dir: tempfile::TempDir,
+        paths: Vec<PathBuf>,
+        settings: Settings,
+        context: &str,
+    ) -> Core {
         let settings = Settings {
             watch_mode: WatchMode::OnView,
             ..settings
@@ -55,14 +65,14 @@ impl Core {
         })
         .unwrap();
         let core = Core { handle, dir };
-        core.activate().await;
+        core.activate(context).await;
         core
     }
 
-    /// Activates the fake context and waits for its discovery.
-    async fn activate(&self) {
+    /// Activates `context` and waits for its discovery.
+    async fn activate(&self, context: &str) {
         let events = self.handle.events();
-        self.handle.send(Command::Activate(CONTEXT.to_owned()));
+        self.handle.send(Command::Activate(context.to_owned()));
         tokio::time::timeout(WAIT, async {
             loop {
                 match events.recv().await.expect("core running") {

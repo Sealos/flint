@@ -1378,11 +1378,13 @@ impl FlintMcp {
             value["apiVersion"] = json!(kind.api_version());
             value["kind"] = json!(kind.kind());
         }
-        // Redacted as a Secret by what was asked for, not only by what came back.
-        let redacted = if is_secret_kind(&kind) {
-            policy::sanitize_secret(&mut value)
+        // Redacted as a Secret by what was asked for, not only by what came back. A Secret's
+        // manager is read first, since masking hides its tracking id.
+        let (redacted, secret_manager) = if is_secret_kind(&kind) {
+            let manager = policy::managed_by_secret_line(&value);
+            (policy::sanitize_secret(&mut value), Some(manager))
         } else {
-            policy::sanitize(&mut value)
+            (policy::sanitize(&mut value), None)
         };
         let yaml = serde_saphyr::to_string(&value)?;
         let (text, truncated) = policy::truncate_bytes(&yaml, policy::OBJECT_BYTES);
@@ -1398,8 +1400,9 @@ impl FlintMcp {
                 policy::OBJECT_BYTES
             ));
         }
-        // After the other header lines, which callers expect first. Read from the redacted object.
-        if let Some(line) = policy::managed_by_line(&value) {
+        // After the other header lines, which callers expect first. Any other object's is read
+        // from its redacted form.
+        if let Some(line) = secret_manager.unwrap_or_else(|| policy::managed_by_line(&value)) {
             out.push_str(&line);
         }
         out.push_str(text);

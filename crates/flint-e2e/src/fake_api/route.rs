@@ -15,6 +15,8 @@ pub enum Route {
     OpenApiIndex,
     /// `/openapi/v3/<path>`
     OpenApiDocument(String),
+    /// `/apis/metrics.k8s.io/v1beta1`, the one per-group discovery Flint reads.
+    MetricsDiscovery,
     /// A collection: list or watch.
     Collection { gvr: Gvr, namespace: Option<String> },
     /// One object.
@@ -58,6 +60,7 @@ impl Route {
             ["openapi", "v3", rest @ ..] if !rest.is_empty() => {
                 Route::OpenApiDocument(rest.join("/"))
             }
+            ["apis", "metrics.k8s.io", "v1beta1"] => Route::MetricsDiscovery,
             ["api", version, rest @ ..] => resource_route("", version, rest),
             ["apis", group, version, rest @ ..] => resource_route(group, version, rest),
             _ => Route::Other,
@@ -105,7 +108,9 @@ impl Route {
         }
         match self {
             Route::Version => Verb::Version,
-            Route::DiscoveryCore | Route::DiscoveryGroups => Verb::Discovery,
+            Route::DiscoveryCore | Route::DiscoveryGroups | Route::MetricsDiscovery => {
+                Verb::Discovery
+            }
             Route::OpenApiIndex | Route::OpenApiDocument(_) => Verb::OpenApi,
             Route::Collection { .. } if query.watch => Verb::Watch,
             Route::Collection { .. } => Verb::List,
