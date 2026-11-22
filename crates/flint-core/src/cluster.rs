@@ -336,12 +336,26 @@ fn agent_error_text(message: &str) -> String {
 }
 
 /// The first line of redacted `text`, cut to [`AGENT_CHARS`] (with `…`). A `[REDACTED:<kind>]`
-/// marker across the cut goes whole.
+/// marker across the cut goes whole. The cut text must survive a second redaction unchanged
+/// (a later pass can take the `…` after `Cookie: ` for a value), so the cut moves back until it
+/// does, and the `…` stays.
 fn agent_line(text: &str) -> String {
     let line = redact::first_line(text, usize::MAX);
-    let Some((mut cut, _)) = line.char_indices().nth(AGENT_CHARS) else {
-        return line;
-    };
+    let mut limit = AGENT_CHARS;
+    loop {
+        let Some(cut) = cut_line(&line, limit) else {
+            return line;
+        };
+        if limit == 0 || redact::redact_credentials(&cut).text == cut {
+            return cut;
+        }
+        limit -= 1;
+    }
+}
+
+/// `line` cut to `limit` chars with a trailing `…`, or `None` when it already fits.
+fn cut_line(line: &str, limit: usize) -> Option<String> {
+    let (mut cut, _) = line.char_indices().nth(limit)?;
     let last_marker = line
         .match_indices("[REDACTED:")
         .map(|(start, _)| start)
@@ -354,7 +368,7 @@ fn agent_line(text: &str) -> String {
     {
         cut = start;
     }
-    format!("{}…", &line[..cut])
+    Some(format!("{}…", &line[..cut]))
 }
 
 /// Error text that is safe to show in the window, in logs and in the automation state. Only
@@ -963,6 +977,20 @@ mod tests {
             if let Some(at) = shown.find("[R") {
                 assert!(shown[at..].contains(']'), "pad {pad}: {shown}");
             }
+        }
+    }
+
+    #[test]
+    fn agent_text_keeps_its_cap_when_a_cut_ends_in_a_cookie_header() {
+        for pad in 280..=300 {
+            let message = format!("{} Cookie: abcdef", "x".repeat(pad));
+            let shown = ClusterError::Api(message).for_agent();
+            assert!(
+                shown.chars().count() <= AGENT_CHARS + 1,
+                "pad {pad}: {shown}"
+            );
+            assert!(shown.ends_with('…'), "pad {pad}: {shown}");
+            assert_eq!(redact::redact_credentials(&shown).text, shown, "pad {pad}");
         }
     }
 
