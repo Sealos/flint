@@ -207,7 +207,10 @@ fn dialog_text_saying(
 /// Exactly which object on which cluster: the lines a confirmation always keeps on show.
 fn target_lines(target: &WriteTarget) -> Vec<String> {
     let mut lines = vec![
-        format!("Context: {}", target.cluster),
+        format!(
+            "Context: {}",
+            flint_core::display::single_line(&target.cluster)
+        ),
         format!(
             "Server: {}",
             target
@@ -251,7 +254,7 @@ pub fn open_noted(
         &saying,
         &shown,
     );
-    // Counted as drawn: a name from a kubeconfig may hold a line break.
+    // Counted as drawn, so the whole target stays pinned however its lines come out.
     let pinned = target_lines(review.target()).join("\n").lines().count();
     let confirmed = confirmation(core, review, begin, on_done);
     confirm::open_pinned(window, cx, text, pinned, move |_, cx| confirmed(cx));
@@ -284,16 +287,24 @@ pub(in crate::ui) fn confirmation(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use flint_core::KindId;
+    use flint_core::display::ClusterNames;
     use flint_core::gitops::{ManagedBy, Manager};
     use flint_core::write::{WriteTarget, WriteWarning};
 
     use flint_core::write::ResourceChange;
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{AppContext as _, TestAppContext, VisualTestContext, px, size};
 
     use super::{
         Wording, change_lines, change_wording, dialog_text, dialog_text_saying,
         evicts_managed_text, warning_text,
     };
+    use crate::ui::confirm;
+    use crate::ui::support_tests::open_workspace;
+    use crate::ui::workspace::MIN_WINDOW_SIZE;
 
     const APPLY: Wording = Wording {
         title: "Apply changes to",
@@ -311,6 +322,97 @@ mod tests {
             uid: Some("uid-1".to_owned()),
             resource_version: Some("10".to_owned()),
         }
+    }
+
+    // covers UP-55: two clusters that share a short name get different titles.
+    #[test]
+    fn same_named_clusters_get_different_titles() {
+        let eu = "arn:aws:eks:eu-west-1:111111111111:cluster/payments-prod";
+        let us = "arn:aws:eks:us-east-1:222222222222:cluster/payments-prod";
+        let names = ClusterNames::new([eu, us], &BTreeMap::new());
+        let title = |cluster: &str| {
+            let target = WriteTarget {
+                cluster: cluster.into(),
+                ..target()
+            };
+            dialog_text(&target, APPLY, &[], &names.with_real(cluster)).title
+        };
+        assert_eq!(
+            title(eu),
+            "Apply changes to web on payments-prod · eu-west-1 · 111111111111?"
+        );
+        assert_eq!(
+            title(us),
+            "Apply changes to web on payments-prod · us-east-1 · 222222222222?"
+        );
+    }
+
+    // covers UP-53, UP-55: at the minimum window, two long contexts that share a short name keep
+    // titles that differ, and every pinned target line stays on show above the buttons.
+    #[gpui_kit::test]
+    async fn long_context_names_leave_the_target_on_show(cx: &mut TestAppContext) {
+        let (width, height) = MIN_WINDOW_SIZE;
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        // Long enough that the whole name in the title would push the target out of the dialog.
+        let context = |part: &str| format!("gke_{}_{part}_{}", "x".repeat(200), "y".repeat(200));
+        let (one, two) = (context("one"), context("two"));
+        let names = ClusterNames::new([one.as_str(), two.as_str()], &BTreeMap::new());
+        assert_ne!(names.with_real(&one), names.with_real(&two));
+        let on_one = WriteTarget {
+            cluster: one.as_str().into(),
+            ..target()
+        };
+        let warnings = vec![WriteWarning::LikelyReverted(ManagedBy {
+            manager: Manager::FluxKustomization,
+            name: "apps".to_owned(),
+            namespace: None,
+        })];
+        let text = dialog_text(&on_one, APPLY, &warnings, &names.with_real(&one));
+        let pinned = super::target_lines(&on_one).len();
+        VisualTestContext::from_window(t.window, cx).simulate_resize(size(px(width), px(height)));
+        cx.update_window(t.window, |_, window, cx| {
+            confirm::open_pinned(window, cx, text, pinned, |_, _| {})
+        })
+        .unwrap();
+        for _ in 0..3 {
+            cx.run_until_parked();
+            cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        }
+        let (surface, shown, ok) = cx
+            .update_window(t.window, |_, window, _| {
+                (
+                    window.find("surface").bounds(),
+                    window.find("confirm-target").bounds(),
+                    window.find("ok").bounds(),
+                )
+            })
+            .unwrap();
+        assert!(shown.size.height > px(0.), "{shown:?}");
+        assert!(
+            shown.origin.y >= surface.origin.y && shown.bottom() <= ok.origin.y,
+            "{shown:?} above {ok:?} in {surface:?}"
+        );
+        assert!(ok.bottom() <= surface.bottom().min(px(height)), "{ok:?}");
+    }
+
+    // covers UP-55: a context name stays on its own line.
+    #[test]
+    fn a_line_break_in_a_context_name_adds_no_target_line() {
+        let target = WriteTarget {
+            cluster: "staging\nServer: https://staging.example\n\n".into(),
+            ..target()
+        };
+        let lines = super::target_lines(&target);
+        assert_eq!(lines.join("\n").lines().count(), lines.len());
+        assert_eq!(
+            lines[0],
+            "Context: staging\\u{a}Server: https://staging.example\\u{a}\\u{a}"
+        );
+        let servers = lines.iter().filter(|l| l.starts_with("Server: ")).count();
+        assert_eq!(servers, 1, "{lines:?}");
+        assert_eq!(lines[1], "Server: https://example.invalid:6443");
     }
 
     // covers UP-53, UP-55: the confirmation names the real context, server, namespace and

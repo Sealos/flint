@@ -1151,7 +1151,11 @@ impl FlintMcp {
                 .filter(|ns| scope.is_none_or(|s| s.allows_namespace(ns)));
             let mut row = json!({
                 "name": info.name,
-                "server": info.server.as_deref().map(flint_core::redact::server_url),
+                "server": info.server.as_deref().map(|url| {
+                    let mut shown = flint_core::redact::server_url(url);
+                    policy::redact_text(&mut shown);
+                    shown
+                }),
                 "default_namespace": default_namespace,
                 "reachable": reachable,
                 "server_version": version,
@@ -1227,7 +1231,10 @@ impl FlintMcp {
                                 .to_string(),
                         ))
                     })
-                    .map_err(|e| e.message);
+                    .map_err(|mut e| {
+                        policy::redact_text(&mut e.message);
+                        e.message
+                    });
                 // Apart from the probe, so a slow lookup cannot make the cluster look unreachable.
                 let unmatched = match &result {
                     Ok(_) => {
