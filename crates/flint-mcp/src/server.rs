@@ -97,6 +97,13 @@ fn names_only(mut record: activity::ActivityRecord) -> activity::ActivityRecord 
             *text = activity::size_only(text);
         }
     };
+    // Kind selectors are trimmed when resolved, so a padded one still names the kind it read.
+    if record.tool != "get_events"
+        && let Some(kind) = record.kind.as_mut()
+        && kind.trim().len() != kind.len()
+    {
+        *kind = kind.trim().to_owned();
+    }
     let kind = match record.tool.as_str() {
         "get_events" => is_event_object_kind,
         _ => policy::is_object_name,

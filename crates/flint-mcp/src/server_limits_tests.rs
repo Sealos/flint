@@ -1045,3 +1045,32 @@ async fn a_context_with_any_name_keeps_its_key() {
         Some(flint_core::activity::cluster_key(name))
     );
 }
+
+#[test]
+fn a_padded_kind_selector_is_recorded_as_the_kind_it_read() {
+    let recorded = |tool: &str, kind: &str| {
+        let record = flint_core::activity::ActivityRecord {
+            at_ms: 0,
+            tool: tool.into(),
+            cluster: None,
+            server: None,
+            kind: Some(kind.into()),
+            namespace: None,
+            name: None,
+            container: None,
+            items: None,
+            bytes: 0,
+            truncated: false,
+            outcome: flint_core::activity::Outcome::Denied,
+            cluster_key: None,
+            server_key: None,
+            probed: Vec::new(),
+            probed_more: 0,
+        };
+        super::names_only(record).kind.unwrap()
+    };
+    assert_eq!(recorded("list_resources", " pods "), "pods");
+    assert_eq!(recorded("get_resource", "\npods\n"), "pods");
+    assert_eq!(recorded("list_resources", "po ds"), "…(+5 bytes)");
+    assert_eq!(recorded("get_events", " Pod "), "…(+5 bytes)");
+}
