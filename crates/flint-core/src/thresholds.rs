@@ -17,9 +17,11 @@
 //! cluster is, so it does not follow a context name to another server, and applies again when the
 //! context points back.
 //!
-//! Loading is tolerant, so a mistake here never makes the whole settings file unreadable: an
-//! invalid value falls back for that field alone, and [`ThresholdSettings::from_toml`] says which
-//! field. Issues never quote a value from the file, and name a cluster entry by its position.
+//! Loading is tolerant: an invalid value falls back for that field alone, and
+//! [`ThresholdSettings::from_toml`] says which field. Only what `toml::Value` cannot represent,
+//! such as an integer beyond `i64`, makes the whole settings file unreadable, because the file
+//! could not be edited either. Issues never quote a value from the file, and name a cluster entry
+//! by its position.
 //!
 //! To add a metric, add a [`ThresholdMetric`] variant and its entry in [`ThresholdMetric::ALL`]
 //! and its `spec`.
@@ -346,12 +348,10 @@ impl ThresholdSettings {
 impl<'de> Deserialize<'de> for ThresholdSettings {
     /// Tolerant, as [`ThresholdSettings::from_toml`]. Use that directly to report the issues.
     ///
-    /// Reads straight from the deserializer, not through `toml::Value`, which rejects numbers
-    /// that do not fit `i64` and reads a first key named like its datetime marker as a datetime.
+    /// Reads through `toml::Value`, as settings edits do, so the section parses here exactly
+    /// when the file can be edited: what `toml::Value` refuses makes the file unreadable.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(Loose::<Section>::deserialize(deserializer)?
-            .into_settings()
-            .0)
+        Ok(Self::from_toml(&toml::Value::deserialize(deserializer)?).0)
     }
 }
 

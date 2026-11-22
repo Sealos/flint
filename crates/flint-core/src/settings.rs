@@ -1537,8 +1537,51 @@ mod threshold_settings_tests {
 
     #[test]
     fn thresholds_is_a_known_key() {
+        let table: toml::Table = toml::from_str("threshold = 3").unwrap();
+        assert_eq!(
+            misspelled_keys(&table),
+            [("threshold".to_owned(), thresholds::SECTION_KEY)],
+        );
         let table: toml::Table = toml::from_str("thresholds = 3").unwrap();
         assert!(misspelled_keys(&table).is_empty());
+    }
+
+    // covers UP-67
+    #[test]
+    fn a_threshold_value_a_table_refuses_makes_the_file_unreadable_for_load_and_edit() {
+        let pins = format!(
+            "protect_local_clusters = false\n\
+             trusted_clusters = [{{ context = \"t\", server = \"{A}\" }}]\n\
+             [[ai_exposed_clusters]]\ncontext = \"x\"\nserver = \"{A}\"\n"
+        );
+        let entry = format!("context = \"prod\"\nserver = \"{A}\"\n");
+        for section in [
+            "[thresholds]\ncpu_percent = 9223372036854775808\n".to_owned(),
+            format!("[[thresholds.clusters]]\n{entry}cpu_percent = 18446744073709551615\n"),
+            "[thresholds]\n\"$__toml_private_datetime\" = 1\n".to_owned(),
+            format!("[[thresholds.clusters]]\n\"$__toml_private_datetime\" = 1\n{entry}"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let text = format!("{pins}{section}");
+            write(dir.path(), &text);
+
+            assert!(
+                matches!(load_settings(dir.path()), Err(SettingsError::Parse { .. })),
+                "{section}"
+            );
+            let (loaded, reason) = load_settings_or_fallback(dir.path());
+            assert!(reason.is_some(), "{section}");
+            assert!(loaded.ai_exposed_clusters.is_empty());
+            assert!(loaded.trusted_clusters.is_empty());
+            assert!(loaded.protect_local_clusters);
+
+            let scope = AiScope::default();
+            assert!(set_ai_exposed(dir.path(), "x", None, &scope).is_err());
+            assert!(set_ai_exposed(dir.path(), "new", Some(B), &scope).is_err());
+            assert!(set_trusted(dir.path(), "t", None).is_err());
+            assert!(set_trusted(dir.path(), "new", Some(B)).is_err());
+            assert_eq!(read(dir.path()), text, "the file is left as it is");
+        }
     }
 }
 
