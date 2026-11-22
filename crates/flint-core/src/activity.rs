@@ -232,38 +232,42 @@ fn load_or_make_key(config_dir: &Path) -> std::io::Result<[u8; 32]> {
         read => return read,
     }
     std::fs::create_dir_all(config_dir)?;
+    let rng = ring::rand::SystemRandom::new();
+    let no_random = |_| std::io::Error::other("no random bytes from the system");
     let mut secret = [0u8; 32];
-    ring::rand::SystemRandom::new()
-        .fill(&mut secret)
-        .map_err(|_| std::io::Error::other("no random bytes from the system"))?;
-    // Written whole under a name of this process's own, then linked into place: a reader never
-    // sees part of a key, and a key already there is never replaced.
-    let draft = config_dir.join(format!(
-        ".{KEY_FILE}.{}.{}",
-        std::process::id(),
-        DRAFTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let linked = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(OWNER_ONLY)
-            .open(&draft)?;
-        file.write_all(&secret)?;
-        file.sync_all()?;
-        std::fs::hard_link(&draft, &path)
-    })();
-    let _ = std::fs::remove_file(&draft);
-    match linked {
-        Ok(()) => Ok(secret),
+    rng.fill(&mut secret).map_err(no_random)?;
+    // A random name: a draft a crashed process left behind can never be taken for this one.
+    let mut name = [0u8; 16];
+    rng.fill(&mut name).map_err(no_random)?;
+    let draft = config_dir.join(format!(".{KEY_FILE}.{:032x}", u128::from_ne_bytes(name)));
+    if link_key(&draft, &path, &secret)? {
+        Ok(secret)
+    } else {
         // Another process made it first: use theirs.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read_key(&path),
-        Err(e) => Err(e),
+        read_key(&path)
     }
 }
 
-/// Tells this process's key drafts apart.
-static DRAFTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Writes `secret` whole to a new file at `draft` and links it to `path`: a reader never sees part
+/// of a key, and a key already there is never replaced (then this returns false). Removes `draft`
+/// only once this call has created it, so a file already at that name stays and is an error.
+fn link_key(draft: &Path, path: &Path, secret: &[u8; 32]) -> std::io::Result<bool> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(OWNER_ONLY)
+        .open(draft)?;
+    let linked = file
+        .write_all(secret)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::hard_link(draft, path));
+    let _ = std::fs::remove_file(draft);
+    match linked {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
+}
 
 /// A key file: exactly 32 bytes, made the owner's only if it is not.
 fn read_key(path: &Path) -> std::io::Result<[u8; 32]> {
@@ -871,6 +875,32 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, [KEY_FILE], "no drafts left behind");
+    }
+
+    // covers UP-16: a draft a crashed process left behind neither stops the key being made nor
+    // is removed by a call that did not create it.
+    #[test]
+    fn a_leftover_key_draft_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let leftover = dir
+            .path()
+            .join(format!(".{KEY_FILE}.{}.0", std::process::id()));
+        std::fs::write(&leftover, b"left by a crash").unwrap();
+        let key = dir.path().join(KEY_FILE);
+
+        let error = link_key(&leftover, &key, &[1; 32]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&leftover).unwrap(), b"left by a crash");
+        assert!(!key.exists());
+
+        assert!(
+            ServerKeys::open(dir.path())
+                .server_key("https://a")
+                .is_some()
+        );
+        assert_eq!(std::fs::read(&key).unwrap().len(), 32);
+        assert_eq!(std::fs::read(&leftover).unwrap(), b"left by a crash");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
     // covers UP-16: without a usable key file a call is still recorded, without a server key;

@@ -26,9 +26,8 @@ sorted by most problems first, under a totals strip. A count opens the combined 
 - **Thresholds are configurable:** typed defaults in `settings.toml` (for example CPU and memory warnings at 90% of
   allocatable, restarts in the last hour, Warning events in the last hour) with optional per-cluster overrides,
   edited from a Thresholds panel on the dashboard.
-- **Agents:** a read-only MCP tool, `get_cluster_summary`, returns the same problem counts, usage and recent warnings
-  for an exposed cluster, within its scope and redaction, and is recorded in the activity log
-  ([ADR-0013](./0013-agent-trust-model.md)).
+- **Agents:** no dashboard tool. The MCP server stays at its six read-only tools
+  ([ADR-0009](./0009-read-only-mcp-server.md)).
 
 ## Considered Options
 

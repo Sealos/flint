@@ -16,6 +16,7 @@ use gpui_kit::component::input::EditorState;
 use gpui_kit::*;
 use serde_json::Value;
 
+use super::access::Gated;
 use super::{DetailEvent, DetailTab, DetailView, Fetch, protected_reason};
 
 pub(super) enum Phase {
@@ -190,6 +191,12 @@ impl DetailView {
         }
         if self.protected {
             return Some(protected_reason(&self.object.cluster));
+        }
+        // An edit under way keeps its text and its buttons: the server answers its review.
+        if self.edit.is_none()
+            && let Some(why) = self.access.forbidden(Gated::Edit)
+        {
+            return Some(why);
         }
         (!matches!(self.fetch, Fetch::Loaded { .. })).then(|| "The object is not loaded".to_owned())
     }

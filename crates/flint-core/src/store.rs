@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cluster::ClusterId;
-use crate::read::KindId;
-use crate::table::{self, Column, Interner, Layout, ListFormat, Row, WireObject};
+use crate::read::{KindId, KindInfo};
+use crate::table::{self, Column, Interner, Layout, ListFormat, Row, RowKind, WireObject};
 
 /// Why the server refused a list or watch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +201,9 @@ impl KindSnapshot {
 #[derive(Debug)]
 pub(crate) struct Store {
     namespaced: bool,
+    /// The discovered group and kind of its rows; `None` and empty when unknown.
+    group: Option<Box<str>>,
+    kind: Box<str>,
     layout: Option<Layout>,
     rows: HashMap<Box<str>, Arc<Row>>,
     /// Rows of a list in progress; swapped in when it completes, so a relist never shows a
@@ -242,6 +245,8 @@ impl Store {
     pub fn new(namespaced: bool) -> Self {
         Store {
             namespaced,
+            group: None,
+            kind: Box::default(),
             layout: None,
             rows: HashMap::new(),
             pending: None,
@@ -250,6 +255,13 @@ impl Store {
             superseded: false,
             revision: 0,
         }
+    }
+
+    /// Names the discovered kind of its rows, so a row's tracking id is compared with it.
+    pub fn with_kind(mut self, kind: &KindInfo) -> Self {
+        self.group = Some(kind.group().into());
+        self.kind = kind.kind().into();
+        self
     }
 
     /// The visible rows changed, or were listed anew.
@@ -327,7 +339,11 @@ impl Store {
             }
             *slot = Some(next);
         }
-        let rows = table::rows_with(object, slot.as_ref(), &mut self.interner, now);
+        let kind = RowKind {
+            group: self.group.as_deref(),
+            kind: &self.kind,
+        };
+        let rows = table::rows_with(object, kind, slot.as_ref(), &mut self.interner, now);
         let target = self.pending.as_mut().unwrap_or(&mut self.rows);
         let mut changed = false;
         let mut superseded = false;

@@ -28,11 +28,21 @@ async fn silent_server() -> (
 
 /// A server whose settings expose `silent` at `server` (none when `None`).
 fn server(dir: &std::path::Path, silent: Option<&str>, limits: Limits) -> FlintMcp {
+    server_with(dir, silent, "", limits)
+}
+
+/// [`server`], with `cluster_extra` added to the kubeconfig's cluster entry.
+fn server_with(
+    dir: &std::path::Path,
+    silent: Option<&str>,
+    cluster_extra: &str,
+    limits: Limits,
+) -> FlintMcp {
     let url = silent.unwrap_or("http://127.0.0.1:1");
     std::fs::write(
         dir.join("kubeconfig"),
         format!(
-            "apiVersion: v1\nkind: Config\nclusters:\n- name: silent\n  cluster:\n    server: {url}\n\
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: silent\n  cluster:\n    server: {url}\n{cluster_extra}\
              users:\n- name: u\n  user:\n    token: not-a-real-token\ncontexts:\n- name: silent\n  \
              context:\n    cluster: silent\n    user: u\n"
         ),
@@ -743,4 +753,76 @@ async fn a_probe_past_the_deadline_keeps_its_clusters() {
     assert_eq!(record.tool, "list_clusters");
     assert_eq!(record.outcome, flint_core::activity::Outcome::Failed);
     assert_eq!(record.probed.len(), 1, "{record:?}");
+}
+
+/// A server answering every request with a 403 whose message is `message`.
+async fn forbidding_server(message: &'static str) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0; 4096];
+                let _ = socket.read(&mut request).await;
+                let body = json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                    "message": message, "reason": "Forbidden", "code": 403})
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    url
+}
+
+/// The one row `list_clusters` returns from `server`.
+async fn cluster_row(server: &FlintMcp) -> Value {
+    let mut client = Client::start(server, 64 * 1024).await;
+    client.call(1, "list_clusters", json!({})).await;
+    let reply = client.next().await;
+    let out: Value = serde_json::from_str(text(&reply)).unwrap();
+    out["clusters"][0].clone()
+}
+
+#[tokio::test]
+async fn a_cluster_row_tidies_the_proxy_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = forbidding_server("denied").await;
+    let proxy = "    proxy-url: http://proxyuser:proxy-pass-123@127.0.0.1:9\n";
+    let server = server_with(dir.path(), Some(&url), proxy, Limits::default());
+    let row = cluster_row(&server).await;
+    let error = row["error"].as_str().expect("the probe failed");
+    assert!(error.contains("[REDACTED:password]"), "{row}");
+    assert!(!row.to_string().contains("proxy-pass-123"), "{row}");
+}
+
+#[tokio::test]
+async fn a_cluster_row_tidies_a_quoted_server_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = forbidding_server(
+        "denied for Authorization: Bearer abcdefghijklmnop0123 password=example-value",
+    )
+    .await;
+    let server = server(dir.path(), Some(&url), Limits::default());
+    let row = cluster_row(&server).await;
+    let error = row["error"].as_str().expect("the probe failed");
+    assert!(error.contains("[REDACTED:authorization]"), "{row}");
+    assert!(!error.contains("abcdefghijklmnop0123"), "{row}");
+    assert!(!error.contains("example-value"), "{row}");
+}
+
+#[tokio::test]
+async fn a_cluster_row_tidies_a_labelled_server_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = forbidding_server("denied").await;
+    let with_path = format!("{url}/password=example-value");
+    let server = server(dir.path(), Some(&with_path), Limits::default());
+    let row = cluster_row(&server).await;
+    let shown = row["server"].as_str().expect("a server");
+    assert!(shown.starts_with(&url), "{row}");
+    assert!(!shown.contains("example-value"), "{row}");
 }

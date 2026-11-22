@@ -96,6 +96,38 @@ impl ResourceList {
         self.selected.as_ref().map(|s| s.name.clone())
     }
 
+    /// The text the rows are filtered by.
+    pub(in crate::ui) fn filter_text(&self) -> &str {
+        &self.query.text
+    }
+
+    /// Puts back the filter a list was left with (Go Back). The rows drawn for the old text go
+    /// at once: until the new text's rows arrive there is no row to click, open a menu on or
+    /// move to, so no action can land on a row the filter hides.
+    pub(in crate::ui) fn restore_filter(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The field can already hold the text while the rows drawn are still another text's.
+        let field_matches = self.query.text == text;
+        if field_matches && (self.restoring_filter || self.rows_text == text) {
+            return;
+        }
+        self.query.text = text.to_owned();
+        self.select_first_in = None;
+        self.restoring_filter = true;
+        self.rows = std::sync::Arc::from(Vec::new());
+        self.selected_ix = None;
+        if !field_matches {
+            self.filter
+                .update(cx, |input, cx| input.set_value(text.to_owned(), window, cx));
+        }
+        self.recompute(cx);
+        cx.notify();
+    }
+
     fn select_row(&mut self, action: &SelectRow, window: &mut Window, cx: &mut Context<Self>) {
         match self.row_position(action.namespace.as_deref(), &action.name) {
             Some(ix) => self.select_index(ix, window, cx),
