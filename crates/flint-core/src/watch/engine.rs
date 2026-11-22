@@ -19,7 +19,7 @@
 //! Changes are published as snapshots at most every `publish_interval`, and only while someone
 //! listens.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +33,7 @@ use crate::cluster::ClusterId;
 use crate::read::{KindId, KindInfo};
 use crate::redact;
 use crate::store::{Feed, KindSnapshot, NamespaceLimit, RefusalCause, Store, SyncState};
-use crate::table::{Column, EventType, FetchError, ListFormat, unix_now};
+use crate::table::{Column, EventType, FetchError, ListFormat, Row, unix_now};
 
 use super::hub::Hub;
 use super::source::{EventStream, Source, WatchRequest};
@@ -188,6 +188,8 @@ pub(crate) struct Engine {
     /// Limits concurrent initial lists per cluster.
     limiter: Arc<Semaphore>,
     store: Store,
+    /// The rows from before an outage, shown (never as current) until the first list lands.
+    held: Option<Arc<KindSnapshot>>,
     state: SyncState,
     feed: Feed,
     synced_once: bool,
@@ -223,6 +225,7 @@ impl Engine {
             cluster,
             id: kind.id(),
             store: Store::new(kind.namespaced).with_kind(&kind),
+            held: None,
             kind,
             namespace: None,
             scope: None,
@@ -249,6 +252,20 @@ impl Engine {
     pub fn with_scope(mut self, scope: Option<Scope>) -> Self {
         if self.kind.namespaced {
             self.scope = scope;
+        }
+        self
+    }
+
+    /// Starts from what the hub was given for an outage: its state and its rows from before.
+    pub fn resuming(mut self, resume: Option<super::hub::Resume>) -> Self {
+        if let Some(resume) = resume {
+            self.held = resume.rows.map(|rows| {
+                Arc::new(KindSnapshot {
+                    state: resume.state.clone(),
+                    ..(*rows).clone()
+                })
+            });
+            self.state = resume.state;
         }
         self
     }
@@ -305,6 +322,7 @@ impl Engine {
     /// next snapshot, at the usual deadline, so a status display never reports live ahead of
     /// the rows and a view gets no extra update.
     fn set_synced(&mut self) {
+        self.held = None;
         if self.state != SyncState::Synced && self.audience() > 0 {
             self.state = SyncState::Synced;
             self.dirty = true;
@@ -364,15 +382,25 @@ impl Engine {
         if !self.hub.has_peeks() {
             return;
         }
-        self.hub.answer_peeks(self.epoch, || {
-            self.store.snapshot(KindSnapshot {
+        self.hub.answer_peeks(self.epoch, || self.build_snapshot());
+    }
+
+    /// The rows now, in the current state: those held from before an outage until a list lands.
+    fn build_snapshot(&self) -> KindSnapshot {
+        match &self.held {
+            Some(held) => KindSnapshot {
+                state: self.state.clone(),
+                feed: self.feed,
+                ..(**held).clone()
+            },
+            None => self.store.snapshot(KindSnapshot {
                 cluster: self.cluster.clone(),
                 kind: self.id.clone(),
                 state: self.state.clone(),
                 feed: self.feed,
                 ..Default::default()
-            })
-        });
+            }),
+        }
     }
 
     /// Sends a snapshot if someone listens; otherwise only a held state is recorded.
@@ -389,14 +417,7 @@ impl Engine {
         if self.audience() == 0 {
             return false;
         }
-        let base = KindSnapshot {
-            cluster: self.cluster.clone(),
-            kind: self.id.clone(),
-            state: self.state.clone(),
-            feed: self.feed,
-            ..Default::default()
-        };
-        let snapshot = self.store.snapshot(base);
+        let snapshot = self.build_snapshot();
         let sent = self.hub.publish(self.epoch, snapshot);
         self.dirty = false;
         self.last_publish = Some(Instant::now());
@@ -858,6 +879,8 @@ impl Engine {
         let Some(mut scope) = self.scope.clone() else {
             return false;
         };
+        // Rows from before an outage stay, per namespace, until that namespace's lane answers.
+        let mut held = self.held.take().map(HeldLanes::new);
         tracing::info!(cluster = %self.cluster, kind = %self.id,
             "not allowed in all namespaces; listing namespace by namespace");
         let reason = sync_error_text(&reason);
@@ -879,6 +902,10 @@ impl Engine {
             }
             // Rows are merged only for subscribers; status displays need the state alone.
             let listening = self.hub.listeners() > 0;
+            if let Some(waiting) = held.as_mut() {
+                waiting.settle(&lanes);
+            }
+            held.take_if(|waiting| waiting.is_settled());
             let merged = merge_lanes(
                 &lanes,
                 &reason,
@@ -887,6 +914,12 @@ impl Engine {
                 listening,
                 None,
             );
+            // Every lane has listed, so nothing from before the outage may stand beside them.
+            held.take_if(|_| merged.state.is_current());
+            let merged = match &held {
+                Some(waiting) => waiting.over(merged, listening),
+                None => merged,
+            };
             let state = merged.state.clone();
             // For a subscriber, synced is reported by the snapshot that carries the merged rows.
             if !listening || state != SyncState::Synced {
@@ -894,7 +927,8 @@ impl Engine {
             }
             self.set_feed(merged.feed);
             if self.hub.has_peeks() {
-                self.answer_namespaced_peeks(&lanes, &reason, cause).await;
+                self.answer_namespaced_peeks(&lanes, &reason, cause, held.as_ref())
+                    .await;
             }
             if listening {
                 // At most one snapshot per interval, however many lanes change.
@@ -952,6 +986,7 @@ impl Engine {
         lanes: &BTreeMap<String, Lane>,
         reason: &str,
         cause: RefusalCause,
+        held: Option<&HeldLanes>,
     ) {
         let asked: Vec<(String, oneshot::Receiver<Arc<KindSnapshot>>)> = lanes
             .iter()
@@ -972,6 +1007,10 @@ impl Engine {
             true,
             Some(&answers),
         );
+        let merged = match held {
+            Some(waiting) if !merged.state.is_current() => waiting.over(merged, true),
+            _ => merged,
+        };
         self.hub.answer_peeks(self.epoch, || KindSnapshot {
             cluster: self.cluster.clone(),
             kind: self.id.clone(),
@@ -1018,6 +1057,78 @@ struct Lane {
 impl Drop for Lane {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+/// Rows from before an outage for a list that turned out to be namespace-limited: each
+/// namespace's stay until its lane lists or is refused for good, or leaves the scope.
+struct HeldLanes {
+    /// Its state is the outage's.
+    snapshot: Arc<KindSnapshot>,
+    waiting: HashSet<String>,
+}
+
+impl HeldLanes {
+    fn new(snapshot: Arc<KindSnapshot>) -> Self {
+        let waiting = snapshot
+            .rows
+            .iter()
+            .filter_map(|row| row.namespace.as_deref().map(str::to_owned))
+            .collect();
+        HeldLanes { snapshot, waiting }
+    }
+
+    fn settle(&mut self, lanes: &BTreeMap<String, Lane>) {
+        self.waiting.retain(|ns| {
+            lanes.get(ns).is_some_and(|lane| {
+                !matches!(
+                    lane.hub.state(),
+                    SyncState::Synced | SyncState::Failed { .. }
+                )
+            })
+        });
+    }
+
+    fn is_settled(&self) -> bool {
+        self.waiting.is_empty()
+    }
+
+    /// `merged`, not current, with the rows of the namespaces still waiting. Rows built for other
+    /// columns are left out, so cells always fit the columns.
+    fn over(&self, mut merged: KindSnapshot, with_rows: bool) -> KindSnapshot {
+        if merged.state == SyncState::Loading {
+            merged.state = self.snapshot.state.clone();
+        }
+        if !with_rows {
+            return merged;
+        }
+        if merged.rows.is_empty() {
+            merged.columns = self.snapshot.columns.clone();
+            merged.format = self.snapshot.format;
+        } else if merged.columns != self.snapshot.columns {
+            return merged;
+        }
+        let listed: HashSet<&str> = merged
+            .rows
+            .iter()
+            .filter_map(|row| row.namespace.as_deref())
+            .collect();
+        let kept: Vec<Arc<Row>> = self
+            .snapshot
+            .rows
+            .iter()
+            .filter(|row| {
+                row.namespace
+                    .as_deref()
+                    .is_some_and(|ns| self.waiting.contains(ns) && !listed.contains(ns))
+            })
+            .cloned()
+            .collect();
+        merged.rows.extend(kept);
+        merged.rows.sort_by(|a, b| {
+            (a.namespace.as_deref(), &*a.name).cmp(&(b.namespace.as_deref(), &*b.name))
+        });
+        merged
     }
 }
 
@@ -1357,6 +1468,61 @@ mod tests {
             merge_lanes(&lanes, "forbidden", RefusalCause::Denied, true, true, None).state,
             SyncState::Loading
         );
+    }
+
+    // covers UP-27: a namespace's rows from before an outage stay until its own lane answers.
+    #[tokio::test]
+    async fn held_rows_wait_for_their_lane_and_leave_with_the_scope() {
+        let cols = columns();
+        let before = lane(SyncState::Synced, &["old-a"], &cols, "a");
+        let mut rows = before.rx.borrow().rows.clone();
+        rows.extend(
+            lane(SyncState::Synced, &["old-b"], &cols, "b")
+                .rx
+                .borrow()
+                .rows
+                .iter()
+                .cloned(),
+        );
+        rows.extend(
+            lane(SyncState::Synced, &["old-c"], &cols, "c")
+                .rx
+                .borrow()
+                .rows
+                .iter()
+                .cloned(),
+        );
+        let down = SyncState::Reconnecting {
+            error: Some("dropped".into()),
+        };
+        let mut held = HeldLanes::new(Arc::new(KindSnapshot {
+            columns: cols.clone(),
+            rows,
+            state: down.clone(),
+            ..Default::default()
+        }));
+
+        // "a" has listed, "b" is refused for good, "c" has not answered; nothing is current.
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "a".to_owned(),
+            lane(SyncState::Synced, &["new-a"], &cols, "a"),
+        );
+        lanes.insert(
+            "b".to_owned(),
+            lane(failed("no", RefusalCause::Denied), &[], &cols, "b"),
+        );
+        lanes.insert("c".to_owned(), lane(SyncState::Loading, &[], &cols, "c"));
+        held.settle(&lanes);
+        let merged = merge_lanes(&lanes, "forbidden", RefusalCause::Denied, true, true, None);
+        let shown = held.over(merged, true);
+        assert_eq!(names(&shown), ["new-a", "old-c"]);
+        assert_eq!(shown.state, down, "never loading, never current");
+
+        // "c" leaves the scope: nothing is left to hold.
+        lanes.remove("c");
+        held.settle(&lanes);
+        assert!(held.is_settled());
     }
 
     // covers UP-21
