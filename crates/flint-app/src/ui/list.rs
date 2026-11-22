@@ -681,8 +681,15 @@ impl ResourceList {
                         }
                     }
                     // Only a synced list proves the object is gone; a reconnecting one may be
-                    // empty or stale.
-                    None if self.shown.state.is_current() && !self.selected_gone => {
+                    // empty or stale, and a limited one must have listed its namespace anew.
+                    None if self.shown.state.is_current()
+                        && !self.selected_gone
+                        && list_model::listing_proves_gone(
+                            self.shown.limited_to.as_deref(),
+                            selected.namespace.as_deref(),
+                            self.selected_seen,
+                        ) =>
+                    {
                         self.selected_gone = true;
                         cx.emit(ListEvent::SelectedGone);
                     }

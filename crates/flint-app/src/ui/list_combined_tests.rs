@@ -436,6 +436,254 @@ async fn a_server_column_named_cluster_keeps_the_row_identity(cx: &mut TestAppCo
     assert!(shown.rows[0].cells.contains(&"workload-a".to_owned()));
 }
 
+/// `snapshot`, listed namespace by namespace: `default` at `revision`, and `other` denied.
+fn limited(snapshot: Arc<KindSnapshot>, listed: &[&str], revision: u64) -> Arc<KindSnapshot> {
+    let mut limited = (*snapshot).clone();
+    limited.revision = revision;
+    limited.limited_to = Some(Arc::new(flint_core::NamespaceLimit {
+        listed: listed.iter().map(|n| (*n).to_owned()).collect(),
+        denied: vec!["other".into()],
+        reason: "pods is forbidden".into(),
+        revisions: vec![revision; listed.len()],
+    }));
+    Arc::new(limited)
+}
+
+fn one(snapshot: Arc<KindSnapshot>) -> CombinedSource {
+    CombinedSource::new(vec![member(snapshot, "prod", None)]).unwrap()
+}
+
+fn prod(rows: &[(&str, &str)]) -> Arc<KindSnapshot> {
+    snapshot("ctx-prod", "Status", rows, SyncState::Synced)
+}
+
+fn click(cx: &mut TestAppContext, window: AnyWindowHandle, id: &'static str) {
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(id, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+async fn a_limited_member_says_which_namespaces_it_covers(cx: &mut TestAppContext) {
+    let (window, list) = open(
+        cx,
+        one(limited(prod(&[("api", "Running")]), &["default"], 3)),
+    );
+    let shown = state(cx, &list);
+    let banner = shown
+        .banners
+        .iter()
+        .find(|b| b.id == "list-limited-ctx-prod")
+        .expect("the limited member's banner");
+    assert!(banner.text.contains("default"), "{}", banner.text);
+    assert!(banner.text.contains("other"), "{}", banner.text);
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("member-limited-ctx-prod").is_some());
+    })
+    .unwrap();
+
+    // No rows in what it covers is not "no rows".
+    list.update(cx, |list, cx| {
+        list.set_source(one(limited(prod(&[]), &["default"], 4)), cx)
+    });
+    cx.run_until_parked();
+    let empty = list.read_with(cx, |list, _| list.empty_state());
+    assert_eq!(
+        empty,
+        Some(super::super::super::list_model::combined::EmptyState::NoRowsListed)
+    );
+}
+
+#[gpui_kit::test]
+async fn a_selection_survives_until_its_namespace_is_listed_anew(cx: &mut TestAppContext) {
+    let rows = [("api", "Running")];
+    let (window, list) = open(cx, one(limited(prod(&rows), &["default"], 5)));
+    click(cx, window, "row-ctx-prod/uid-api");
+    let selected = |cx: &mut TestAppContext| list.read_with(cx, |l, _| l.selected().is_some());
+    assert!(selected(cx));
+
+    // Its namespace left the watch: the object may still exist.
+    list.update(cx, |list, cx| {
+        list.set_source(one(limited(prod(&[]), &["team-a"], 6)), cx)
+    });
+    cx.run_until_parked();
+    assert!(selected(cx), "a namespace not listed proves nothing");
+
+    // Published again from the same rows of its namespace.
+    list.update(cx, |list, cx| {
+        list.set_source(one(limited(prod(&[]), &["default"], 5)), cx)
+    });
+    cx.run_until_parked();
+    assert!(selected(cx), "rows no newer than it was seen in");
+
+    // Its own namespace was listed anew without it.
+    list.update(cx, |list, cx| {
+        list.set_source(one(limited(prod(&[]), &["default"], 7)), cx)
+    });
+    cx.run_until_parked();
+    assert!(!selected(cx));
+}
+
+#[gpui_kit::test]
+async fn a_key_steps_from_the_selection_in_the_new_view(cx: &mut TestAppContext) {
+    let (window, list) = open(cx, fixture());
+    // Computed before the click, over a list where staging's rows come first.
+    let reordered = CombinedSource::new(vec![
+        member(
+            snapshot("ctx-staging", "Node", &[("db", "n")], SyncState::Synced),
+            "a-staging",
+            None,
+        ),
+        member(
+            prod(&[("api", "Running"), ("web", "Pending")]),
+            "prod",
+            None,
+        ),
+    ])
+    .unwrap();
+    let query = list.read_with(cx, |list, _| list.query.clone());
+    let computed = super::compute_view(&reordered, &query, None, None, None, 0);
+    click(cx, window, "row-ctx-prod/uid-web");
+
+    let expected = CombinedRowId {
+        cluster: "ctx-prod".into(),
+        uid: "uid-web".into(),
+    };
+    let line = list.update(cx, |list, cx| {
+        list.install(computed, reordered.clone(), None, false, cx);
+        // Before the follow-up computation runs.
+        let line = list.selected_line.expect("the selection's line");
+        let flint_core::combined::CombinedLine::Row(at) = list.view.line(line).unwrap() else {
+            panic!("not a row");
+        };
+        list.shown.list.row_id(at)
+    });
+    assert_eq!(line, Some(expected));
+}
+
+#[gpui_kit::test]
+async fn a_chip_of_a_cluster_that_left_cannot_filter(cx: &mut TestAppContext) {
+    let member_of = |cluster: &str, name: &str| {
+        member(
+            snapshot(cluster, "Status", &[("api", "x")], SyncState::Synced),
+            name,
+            None,
+        )
+    };
+    let three = CombinedSource::new(vec![
+        member_of("ctx-a", "a"),
+        member_of("ctx-b", "b"),
+        member_of("ctx-c", "c"),
+    ])
+    .unwrap();
+    let two = CombinedSource::new(vec![member_of("ctx-a", "a"), member_of("ctx-b", "b")]).unwrap();
+    let (_window, list) = open(cx, three);
+    list.update(cx, |list, cx| {
+        list.set_source(two, cx);
+        // Its chip is still drawn until the new view lands.
+        list.toggle_cluster_filter("ctx-c", cx);
+        list.toggle_group("ctx-c", cx);
+    });
+    let shown = state(cx, &list);
+    assert_eq!(shown.shown, 2);
+    list.read_with(cx, |list, _| {
+        assert!(list.query.clusters.is_empty());
+        assert!(list.query.collapsed.is_empty());
+    });
+}
+
+#[gpui_kit::test]
+async fn the_filter_keys_move_between_filter_and_rows(cx: &mut TestAppContext) {
+    use crate::ui::registry::{FocusFilter, FocusRows, SelectFromFilter};
+    use gpui_kit::Focusable as _;
+
+    let (window, list) = open(cx, fixture());
+    let in_filter = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            list.read(cx).filter.focus_handle(cx).is_focused(window)
+        })
+        .unwrap()
+    };
+    let dispatch = |cx: &mut TestAppContext, action: Box<dyn gpui_kit::Action>| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.dispatch_action(action, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+
+    dispatch(cx, Box::new(FocusFilter));
+    assert!(in_filter(cx));
+    dispatch(cx, Box::new(FocusRows));
+    assert!(!in_filter(cx));
+    assert!(list.read_with(cx, |list, _| list.selected().is_none()));
+
+    dispatch(cx, Box::new(FocusFilter));
+    dispatch(cx, Box::new(SelectFromFilter));
+    assert!(!in_filter(cx));
+    assert!(list.read_with(cx, |list, _| list.selected().is_some()));
+
+    // The registry's keys reach them from inside the filter's input.
+    let press = |cx: &mut TestAppContext, key: &'static str| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.press(key, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    for key in ["escape", "enter", "down"] {
+        dispatch(cx, Box::new(FocusFilter));
+        assert!(in_filter(cx));
+        press(cx, key);
+        assert!(!in_filter(cx), "{key} returns to the rows");
+    }
+}
+
+#[gpui_kit::test]
+async fn a_list_is_loading_until_its_first_view(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::ui::registry::init(cx);
+    });
+    let (_window, list) = cx.update(|cx| {
+        gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| CombinedResourceList::new("Pods".into(), fixture(), Vec::new(), window, cx))
+        })
+        .unwrap()
+    });
+    let before = list.read_with(cx, |list, _| list.view_state());
+    assert_eq!(before.placeholder, Some("loading"));
+    assert_eq!(before.count, "4");
+    let after = state(cx, &list);
+    assert_eq!(after.placeholder, None);
+    assert_eq!(after.shown, 4);
+}
+
+#[gpui_kit::test]
+async fn filtering_keeps_the_measured_widths(cx: &mut TestAppContext) {
+    let (_window, list) = open(cx, fixture());
+    let widths = |cx: &mut TestAppContext| {
+        cx.run_until_parked();
+        list.read_with(cx, |list, _| list.measured.as_ref().unwrap().widths.clone())
+    };
+    let first = widths(cx);
+    list.update(cx, |list, cx| list.toggle_cluster_filter("ctx-prod", cx));
+    assert!(
+        Arc::ptr_eq(&first, &widths(cx)),
+        "a filter does not measure"
+    );
+    list.update(cx, |list, cx| {
+        list.set_namespaces(vec!["default".into()], cx)
+    });
+    assert!(!Arc::ptr_eq(&first, &widths(cx)), "a new scope measures");
+}
+
 #[gpui_kit::test]
 async fn a_member_that_is_not_current_gets_a_note(cx: &mut TestAppContext) {
     let (_window, list) = open(cx, fixture());

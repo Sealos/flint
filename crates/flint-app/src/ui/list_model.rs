@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use flint_core::redact::{is_masked_column, is_secret_list};
-use flint_core::{Column, ColumnRole, ColumnType, KindSnapshot, SortBy};
+use flint_core::{Column, ColumnRole, ColumnType, KindSnapshot, NamespaceLimit, SortBy};
 
 /// The user's sort choice, by column key ([`Column::key`]), as `state.toml` keeps it per cluster
 /// and kind. Columns can change between snapshots (an edited CRD's printer columns), so the
@@ -657,6 +657,22 @@ fn word_tone(word: &str) -> Tone {
     }
 }
 
+/// Whether a current list without an object proves it gone. A namespace-limited list proves it
+/// only once the object's own namespace was listed after `seen`, the revision of the rows it
+/// was last in: a namespace no longer covered, or republished from old rows, says nothing.
+pub fn listing_proves_gone(
+    limit: Option<&NamespaceLimit>,
+    namespace: Option<&str>,
+    seen: Option<u64>,
+) -> bool {
+    let (Some(limit), Some(namespace)) = (limit, namespace) else {
+        return true;
+    };
+    limit
+        .revision_of(namespace)
+        .is_some_and(|now| now > seen.unwrap_or(0))
+}
+
 /// The view-model of a list over several clusters ([`flint_core::combined`]).
 #[cfg_attr(
     not(test),
@@ -671,9 +687,41 @@ pub mod combined {
         CombinedMember, CombinedQuery, CombinedRowId, CombinedSort, CombinedView, RowRef,
     };
     use flint_core::redact::{is_masked_column, is_secret_list};
-    use flint_core::{ClusterId, Column, ColumnRole, Feed, KindId, SyncState};
+    use flint_core::{ClusterId, Column, ColumnRole, Feed, KindId, NamespaceLimit, SyncState};
 
-    use super::visible_columns;
+    use super::{listing_proves_gone, visible_columns};
+
+    /// What one member's rows cover, which the core keeps private to it.
+    #[derive(Debug, Clone, Default)]
+    pub struct MemberCoverage {
+        /// The revision of the member's whole list.
+        pub revision: u64,
+        /// Set when the member lists namespace by namespace.
+        pub limit: Option<Arc<NamespaceLimit>>,
+    }
+
+    /// Where a selected row was last seen, to judge a later list without it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RowSeen {
+        pub namespace: Option<Box<str>>,
+        pub revision: u64,
+    }
+
+    /// The selection judged against a new list and view.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct TrackedRow {
+        pub line: Option<usize>,
+        pub seen: Option<RowSeen>,
+        pub gone: bool,
+    }
+
+    /// Column widths measured for one list and namespace scope.
+    #[derive(Debug, Clone)]
+    pub struct MeasuredWidths {
+        pub list: Arc<CombinedList>,
+        pub namespaces: Vec<String>,
+        pub widths: Arc<[usize]>,
+    }
 
     /// What a combined list draws from: the merged list, plus what the core keeps private to
     /// it and the shared cell code needs. Replaced as a whole, so its parts always agree.
@@ -686,6 +734,8 @@ pub mod combined {
         pub masked: Arc<[bool]>,
         /// Per member of [`CombinedList::members`].
         pub feeds: Arc<[Feed]>,
+        /// Per member of [`CombinedList::members`].
+        pub coverage: Arc<[MemberCoverage]>,
         /// `None` with no members.
         pub kind: Option<KindId>,
     }
@@ -697,6 +747,16 @@ pub mod combined {
             let feed_of: HashMap<ClusterId, Feed> = members
                 .iter()
                 .map(|m| (m.snapshot.cluster.clone(), m.snapshot.feed))
+                .collect();
+            let coverage_of: HashMap<ClusterId, MemberCoverage> = members
+                .iter()
+                .map(|m| {
+                    let coverage = MemberCoverage {
+                        revision: m.snapshot.revision,
+                        limit: m.snapshot.limited_to.clone(),
+                    };
+                    (m.snapshot.cluster.clone(), coverage)
+                })
                 .collect();
             let masked_keys: HashSet<ColumnKey> = members.iter().flat_map(masked_keys).collect();
             let list = CombinedList::new(members)?;
@@ -711,11 +771,17 @@ pub mod combined {
                 .iter()
                 .map(|m| feed_of.get(m.cluster()).copied().unwrap_or_default())
                 .collect();
+            let coverage = list
+                .members()
+                .iter()
+                .map(|m| coverage_of.get(m.cluster()).cloned().unwrap_or_default())
+                .collect();
             Ok(Self {
                 list: Arc::new(list),
                 columns,
                 masked,
                 feeds,
+                coverage,
                 kind,
             })
         }
@@ -839,14 +905,55 @@ pub mod combined {
         })
     }
 
-    /// Whether the row `id` has left its cluster: only a current member can prove it.
-    pub fn row_gone(list: &CombinedList, id: &CombinedRowId, now: i64) -> bool {
-        let Some(member) = list.members().iter().find(|m| m.cluster() == &*id.cluster) else {
-            return true;
+    /// Where the row at `at` is now, by its own member's coverage.
+    pub fn row_seen(source: &CombinedSource, at: RowRef) -> Option<RowSeen> {
+        let row = source.list.row_info(at)?;
+        let coverage = source.coverage.get(at.member())?;
+        let revision = match (&coverage.limit, row.namespace) {
+            (Some(limit), Some(namespace)) => limit.revision_of(namespace).unwrap_or(0),
+            _ => coverage.revision,
         };
-        if !member.state().is_current() {
-            return false;
+        Some(RowSeen {
+            namespace: row.namespace.map(Into::into),
+            revision,
+        })
+    }
+
+    /// Finds the selected row `id` in a new list. It is gone only if its cluster left, or a
+    /// current list of its cluster covers its namespace and no longer holds it.
+    pub fn track_selection(
+        source: &CombinedSource,
+        view: &CombinedView,
+        id: &CombinedRowId,
+        seen: Option<&RowSeen>,
+        now: i64,
+    ) -> TrackedRow {
+        let list = &source.list;
+        if let Some(line) = line_of(list, view, id)
+            && let Some(CombinedLine::Row(at)) = view.line(line)
+        {
+            return TrackedRow {
+                line: Some(line),
+                seen: row_seen(source, at),
+                gone: false,
+            };
         }
+        let kept = |seen: Option<RowSeen>| TrackedRow {
+            line: None,
+            seen,
+            gone: false,
+        };
+        let Some(member) = list
+            .members()
+            .iter()
+            .position(|m| m.cluster() == &*id.cluster)
+        else {
+            return TrackedRow {
+                gone: true,
+                ..kept(None)
+            };
+        };
+        // Hidden by a filter or a collapsed group, it still exists.
         let all = list.compute(
             &CombinedQuery {
                 clusters: vec![id.cluster.to_string()],
@@ -854,9 +961,68 @@ pub mod combined {
             },
             now,
         );
-        !all.rows()
+        let held = all
+            .rows()
             .iter()
-            .any(|&at| list.row_info(at).is_some_and(|row| row.uid == &*id.uid))
+            .find(|&&at| list.row_info(at).is_some_and(|row| row.uid == &*id.uid));
+        if let Some(&at) = held {
+            return kept(row_seen(source, at));
+        }
+        let limit = source.coverage[member].limit.as_deref();
+        let proven = match seen {
+            Some(seen) => {
+                listing_proves_gone(limit, seen.namespace.as_deref(), Some(seen.revision))
+            }
+            None => limit.is_none(),
+        };
+        TrackedRow {
+            gone: list.members()[member].state().is_current() && proven,
+            ..kept(seen.cloned())
+        }
+    }
+
+    /// The widths for `query`'s namespaces. Filters, sorts and collapsing keep them, so only a
+    /// new list or scope measures again, from `view` when it already holds exactly that scope.
+    pub fn measure_scope(
+        source: &CombinedSource,
+        query: &CombinedQuery,
+        view: &CombinedView,
+        cached: Option<MeasuredWidths>,
+        now: i64,
+    ) -> MeasuredWidths {
+        if let Some(cached) = cached
+            && Arc::ptr_eq(&cached.list, &source.list)
+            && cached.namespaces == query.namespaces
+        {
+            return cached;
+        }
+        let whole_scope = query.text.is_empty()
+            && query.clusters.is_empty()
+            && query.sort.is_none()
+            && !query.group_by_cluster;
+        let widths = if whole_scope {
+            measure(source, view.rows(), now)
+        } else {
+            let scope = CombinedQuery {
+                namespaces: query.namespaces.clone(),
+                ..CombinedQuery::default()
+            };
+            measure(source, source.list.compute(&scope, now).rows(), now)
+        };
+        MeasuredWidths {
+            list: source.list.clone(),
+            namespaces: query.namespaces.clone(),
+            widths: widths.into(),
+        }
+    }
+
+    /// A limited member's short note: the namespaces its rows come from.
+    pub fn limited_note(limit: &NamespaceLimit) -> String {
+        if limit.listed.is_empty() {
+            "no namespaces listed".to_owned()
+        } else {
+            format!("only {}", limit.listed.join(", "))
+        }
     }
 
     /// The nearest row line after (or before) `from`, skipping group headers.
@@ -885,6 +1051,8 @@ pub mod combined {
     pub enum EmptyState {
         Loading,
         NoRows,
+        /// No rows, but a chosen cluster lists only some namespaces: others may hold some.
+        NoRowsListed,
         NoMatch,
         /// A chosen cluster holds no rows and is not current, so its contents are unknown.
         Unresolved,
@@ -904,17 +1072,20 @@ pub mod combined {
             .list
             .members()
             .iter()
-            .filter(|m| chosen.is_empty() || chosen.iter().any(|c| c == m.cluster()))
+            .zip(source.coverage.iter())
+            .filter(|(m, _)| chosen.is_empty() || chosen.iter().any(|c| c == m.cluster()))
             .collect();
-        Some(if members.iter().any(|m| m.row_count() > 0) {
+        Some(if members.iter().any(|(m, _)| m.row_count() > 0) {
             EmptyState::NoMatch
         } else if members
             .iter()
-            .any(|m| matches!(m.state(), SyncState::Idle | SyncState::Loading))
+            .any(|(m, _)| matches!(m.state(), SyncState::Idle | SyncState::Loading))
         {
             EmptyState::Loading
-        } else if members.iter().any(|m| !m.state().is_current()) {
+        } else if members.iter().any(|(m, _)| !m.state().is_current()) {
             EmptyState::Unresolved
+        } else if members.iter().any(|(_, c)| c.limit.is_some()) {
+            EmptyState::NoRowsListed
         } else {
             EmptyState::NoRows
         })

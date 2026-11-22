@@ -30,10 +30,15 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::super::cluster_tag::tag_dot;
-use super::super::list_model::combined::{self as model, CombinedSource, EmptyState};
+use super::super::list_model::combined::{
+    self as model, CombinedSource, EmptyState, MeasuredWidths, RowSeen, TrackedRow,
+};
 use super::super::list_model::{self, CELL_PADDING, CHAR_WIDTH, ColumnWidths};
-use super::super::registry::{self, CloseDetail, SelectFirst, SelectLast, SelectNext, SelectPrev};
-use super::{CONTEXT, ROW_HEIGHT, state_chip, tabular_figures};
+use super::super::registry::{
+    self, CloseDetail, FocusFilter, FocusRows, SelectFirst, SelectFromFilter, SelectLast,
+    SelectNext, SelectPrev,
+};
+use super::{CONTEXT, ROW_HEIGHT, limited_text, state_chip, tabular_figures};
 
 /// Selects a row by its cluster and uid, as clicking it does.
 #[derive(Debug, Clone, Default, PartialEq, Action)]
@@ -97,6 +102,14 @@ pub struct CombinedResourceList {
     widths: ColumnWidths,
     pub(in super::super) selected: Option<CombinedRowId>,
     selected_line: Option<usize>,
+    /// Where the selected row was last listed, to tell it gone from no longer covered.
+    selected_seen: Option<RowSeen>,
+    /// Whether `view` is a finished computation, not the empty one the list opens with.
+    view_ready: bool,
+    /// Down in the filter while rows were computing: select the first row once they land.
+    select_first_in: Option<AnyWindowHandle>,
+    /// The widths of the newest list and namespace scope.
+    measured: Option<MeasuredWidths>,
     computing: bool,
     dirty: bool,
     remeasure: bool,
@@ -159,6 +172,10 @@ impl CombinedResourceList {
             widths: ColumnWidths::default(),
             selected: None,
             selected_line: None,
+            selected_seen: None,
+            view_ready: false,
+            select_first_in: None,
+            measured: None,
             computing: false,
             dirty: false,
             remeasure: false,
@@ -209,13 +226,29 @@ impl CombinedResourceList {
         }
     }
 
+    /// Whether `cluster` is still a member. Its chip or header can outlive it until the next
+    /// view is drawn, and a filter on it would match nothing with no chip left to clear it.
+    fn is_member(&self, cluster: &str) -> bool {
+        self.latest
+            .list
+            .members()
+            .iter()
+            .any(|m| m.cluster() == cluster)
+    }
+
     pub fn toggle_cluster_filter(&mut self, cluster: &str, cx: &mut Context<Self>) {
+        if !self.is_member(cluster) {
+            return;
+        }
         let members = self.latest.list.members().len();
         model::toggle_cluster(&mut self.query.clusters, cluster, members);
         self.recompute(cx);
     }
 
     pub fn toggle_group(&mut self, cluster: &str, cx: &mut Context<Self>) {
+        if !self.is_member(cluster) {
+            return;
+        }
         let collapsed = &mut self.query.collapsed;
         match collapsed.iter().position(|c| c == cluster) {
             Some(at) => {
@@ -254,52 +287,81 @@ impl CombinedResourceList {
             ..self.query.clone()
         };
         let selected = self.selected.clone();
+        let seen = self.selected_seen.clone();
+        let cached = self.measured.clone();
         let restart = std::mem::take(&mut self.remeasure);
         let job_source = source.clone();
         let job = cx.background_spawn(async move {
-            let now = unix_now();
-            let list = &job_source.list;
-            let view = list.compute(&query, now);
-            // Widths follow the namespaces only, so typing or sorting moves no column.
-            let scope = CombinedQuery {
-                namespaces: query.namespaces.clone(),
-                ..CombinedQuery::default()
-            };
-            let measured = model::measure(&job_source, list.compute(&scope, now).rows(), now);
-            let line = selected
-                .as_ref()
-                .and_then(|id| model::line_of(list, &view, id));
-            let gone = line.is_none()
-                && selected
-                    .as_ref()
-                    .is_some_and(|id| model::row_gone(list, id, now));
-            (view, measured, selected, line, gone)
+            compute_view(&job_source, &query, selected, seen, cached, unix_now())
         });
         self._compute = cx.spawn(async move |this, cx| {
-            let (view, measured, job_selected, line, gone) = job.await;
-            let _ = this.update(cx, |list, cx| {
-                list.computing = false;
-                list.widths.update(&source.columns, &measured, restart);
-                list.shown = source;
-                list.view = Arc::new(view);
-                list.applied_sort = sort;
-                list.drawn = list.layout(list.laid_out_width);
-                if list.selected == job_selected {
-                    list.selected_line = line;
-                    if gone {
-                        list.selected = None;
-                        list.selected_line = None;
-                        cx.emit(CombinedListEvent::Selected(None));
-                    }
-                } else {
-                    list.dirty = true;
-                }
-                cx.notify();
-                if list.dirty {
-                    list.recompute(cx);
-                }
+            let computed = job.await;
+            let select_first = this.update(cx, |list, cx| {
+                list.install(computed, source, sort, restart, cx)
             });
+            if let Ok(Some(window)) = select_first {
+                let _ = window.update(cx, |_, window, cx| {
+                    let _ = this.update(cx, |list, cx| {
+                        if list.focus.is_focused(window) {
+                            list.select_first_if_none(window, cx);
+                        }
+                    });
+                });
+            }
         });
+    }
+
+    /// Publishes a finished computation: the source, its view and the selection's line
+    /// together, so a key never steps from a line of another view. Returns the window to
+    /// select the first row in, once no further computation is due.
+    fn install(
+        &mut self,
+        computed: Computed,
+        source: CombinedSource,
+        sort: Option<CombinedSort>,
+        restart: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyWindowHandle> {
+        self.computing = false;
+        self.view_ready = true;
+        self.widths
+            .update(&source.columns, &computed.measured.widths, restart);
+        self.measured = Some(computed.measured);
+        self.shown = source;
+        self.view = Arc::new(computed.view);
+        self.applied_sort = sort;
+        self.drawn = self.layout(self.laid_out_width);
+        if self.selected == computed.selected {
+            let tracked = computed.tracked.unwrap_or(TrackedRow {
+                line: None,
+                seen: None,
+                gone: false,
+            });
+            self.selected_line = tracked.line;
+            self.selected_seen = tracked.seen;
+            if tracked.gone {
+                self.selected = None;
+                self.selected_line = None;
+                self.selected_seen = None;
+                cx.emit(CombinedListEvent::Selected(None));
+            }
+        } else {
+            // Chosen while this ran, on the view before it.
+            self.selected_line = self
+                .selected
+                .as_ref()
+                .and_then(|id| model::line_of(&self.shown.list, &self.view, id));
+            self.dirty = true;
+        }
+        cx.notify();
+        if self.dirty {
+            self.recompute(cx);
+        }
+        if self.computing {
+            None
+        } else {
+            self.select_first_in.take()
+        }
     }
 
     /// The columns to draw and their widths. The table scrolls sideways when they do not fit;
@@ -331,6 +393,7 @@ impl CombinedResourceList {
         };
         window.focus(&self.focus, cx);
         self.selected_line = Some(line);
+        self.selected_seen = model::row_seen(&self.shown, at);
         self.scroll.scroll_to_item(line, ScrollStrategy::Top);
         if self.selected.as_ref() != Some(&id) {
             self.selected = Some(id.clone());
@@ -378,8 +441,47 @@ impl CombinedResourceList {
         }
     }
 
+    fn select_first_if_none(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected.is_none()
+            && let Some(line) = model::edge_row(&self.view, false)
+        {
+            self.select_line(line, window, cx);
+        }
+    }
+
+    fn on_focus_filter(&mut self, _: &FocusFilter, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_first_in = None;
+        let focus = self.filter.focus_handle(cx);
+        window.focus(&focus, cx);
+    }
+
+    /// Back to the rows from the filter; the filter keeps its text.
+    fn on_focus_rows(&mut self, _: &FocusRows, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_first_in = None;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// Down in the filter: back to the rows, on the first if none is selected. While rows are
+    /// computing it waits for them, so it never lands on a row the filter hides.
+    fn on_select_from_filter(
+        &mut self,
+        _: &SelectFromFilter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus, cx);
+        if self.computing {
+            self.select_first_in = Some(window.window_handle());
+        } else {
+            self.select_first_if_none(window, cx);
+        }
+        cx.notify();
+    }
+
     fn on_close(&mut self, _: &CloseDetail, _: &mut Window, cx: &mut Context<Self>) {
         self.selected_line = None;
+        self.selected_seen = None;
         if self.selected.take().is_some() {
             cx.emit(CombinedListEvent::Selected(None));
             cx.notify();
@@ -698,10 +800,7 @@ impl CombinedResourceList {
                     .flex_none()
                     .font_features(tabular_figures())
                     .text_color(theme.muted_foreground)
-                    .child(model::count_text(
-                        self.view.matched(),
-                        self.shown.total_rows(),
-                    ))
+                    .child(self.count())
                     .test_support(),
             )
             .child(div().flex_1())
@@ -788,13 +887,50 @@ impl CombinedResourceList {
                             .child(member.row_count().to_string()),
                     )
                     .child(state_chip(member.state(), self.shown.feeds[i], theme))
+                    .when_some(self.shown.coverage[i].limit.as_ref(), |el, limit| {
+                        let note = SharedString::from(model::limited_note(limit));
+                        let detail = limit_detail(&self.label, limit);
+                        el.child(
+                            div()
+                                .id(SharedString::from(format!("member-limited-{cluster}")))
+                                .max_w(px(240.))
+                                .truncate()
+                                .text_color(theme.warning)
+                                .child(note.clone())
+                                .test_text(note)
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(detail.clone()).build(window, cx)
+                                })
+                                .test_support(),
+                        )
+                    })
                     .test_support()
             }))
     }
 
+    /// The toolbar's count. Until the first view lands, nothing is known to be filtered out.
+    pub(super) fn count(&self) -> String {
+        let total = self.shown.total_rows();
+        let matched = if self.view_ready {
+            self.view.matched()
+        } else {
+            total
+        };
+        model::count_text(matched, total)
+    }
+
+    /// What replaces the rows, if anything. Loading until the first view lands, since the
+    /// empty view the list opens with says nothing about what matches.
+    pub(super) fn empty_state(&self) -> Option<EmptyState> {
+        if !self.view_ready {
+            return Some(EmptyState::Loading);
+        }
+        model::empty_state(&self.shown, &self.view, &self.query.clusters)
+    }
+
     fn placeholder(&self, theme: &Theme) -> Option<AnyElement> {
         let label = &self.label;
-        let empty = model::empty_state(&self.shown, &self.view, &self.query.clusters)?;
+        let empty = self.empty_state()?;
         let base = h_flex()
             .id("list-placeholder")
             .size_full()
@@ -809,6 +945,9 @@ impl CombinedResourceList {
                     .child(Spinner::new().small())
                     .child(format!("Loading {label}…")),
                 EmptyState::NoRows => base.child(format!("No {label}")),
+                EmptyState::NoRowsListed => base.child(format!(
+                    "No {label} in the namespaces listed. Each cluster's note says which."
+                )),
                 EmptyState::NoMatch => base.child(format!("No {label} match the filters")),
                 EmptyState::Unresolved => base.child(format!(
                     "Could not list {label} on every cluster. Each cluster's note says why."
@@ -817,6 +956,45 @@ impl CombinedResourceList {
             .test_support()
             .into_any_element(),
         )
+    }
+}
+
+/// One background computation's result, for [`CombinedResourceList::install`].
+struct Computed {
+    view: CombinedView,
+    measured: MeasuredWidths,
+    selected: Option<CombinedRowId>,
+    tracked: Option<TrackedRow>,
+}
+
+fn compute_view(
+    source: &CombinedSource,
+    query: &CombinedQuery,
+    selected: Option<CombinedRowId>,
+    seen: Option<RowSeen>,
+    cached: Option<MeasuredWidths>,
+    now: i64,
+) -> Computed {
+    let view = source.list.compute(query, now);
+    // Widths follow the namespaces only, so typing or sorting moves no column.
+    let measured = model::measure_scope(source, query, &view, cached, now);
+    let tracked = selected
+        .as_ref()
+        .map(|id| model::track_selection(source, &view, id, seen.as_ref(), now));
+    Computed {
+        view,
+        measured,
+        selected,
+        tracked,
+    }
+}
+
+/// What a limited member's rows cover, in full.
+pub(super) fn limit_detail(label: &str, limit: &flint_core::NamespaceLimit) -> String {
+    if limit.listed.is_empty() {
+        format!("Could not list {label} in any namespace: {}", limit.reason)
+    } else {
+        limited_text(label, limit)
     }
 }
 
@@ -893,6 +1071,9 @@ impl Render for CombinedResourceList {
             .on_action(cx.listener(Self::on_first))
             .on_action(cx.listener(Self::on_last))
             .on_action(cx.listener(Self::on_close))
+            .on_action(cx.listener(Self::on_focus_filter))
+            .on_action(cx.listener(Self::on_focus_rows))
+            .on_action(cx.listener(Self::on_select_from_filter))
             .on_action(cx.listener(Self::on_select_row))
             .on_action(cx.listener(Self::on_sort))
             .on_action(cx.listener(Self::on_filter_cluster))

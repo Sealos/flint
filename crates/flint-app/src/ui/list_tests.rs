@@ -1512,6 +1512,59 @@ async fn new_columns_are_reported_before_the_next_frame(cx: &mut TestAppContext)
     assert_eq!(state.rows[0].cells, ["api", "demo", "3"]);
 }
 
+// A limited list that no longer covers the selected object's namespace says nothing about it:
+// it is gone only once that namespace is listed anew without it.
+#[gpui_kit::test]
+async fn a_selection_outlives_its_namespace_leaving_a_limited_list(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open(cx, core);
+    let gone = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = gone.clone();
+    let _subscription = cx.update(|cx| {
+        cx.subscribe(&list, move |_, event: &super::ListEvent, _| {
+            if matches!(event, super::ListEvent::SelectedGone) {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        })
+    });
+    let limited = |rows: &[(&str, &str, i64)], listed: &str, revision: u64, version: u64| {
+        let mut snapshot = (*pods(rows, SyncState::Synced, version)).clone();
+        snapshot.limited_to = Some(Arc::new(flint_core::NamespaceLimit {
+            listed: vec![listed.into()],
+            denied: Vec::new(),
+            reason: "pods is forbidden".into(),
+            revisions: vec![revision],
+        }));
+        Arc::new(snapshot)
+    };
+    let web = [("demo", "web", 0)];
+    list.update(cx, |list, cx| {
+        list.set_snapshot(limited(&web, "demo", 5, 1), cx)
+    });
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("row-uid-web").is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("row-uid-web", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    list.update(cx, |list, cx| {
+        list.selected_seen = Some(5);
+        list.set_snapshot(limited(&[], "team-a", 6, 2), cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(gone.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    list.update(cx, |list, cx| {
+        list.set_snapshot(limited(&[], "demo", 7, 3), cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(gone.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 // covers UP-21, UP-27: banners over the rows. A list the user may not read in every namespace
 // says which namespaces it shows; a failed list that still has rows keeps them under a banner
 // saying they may be out of date, until it syncs again.

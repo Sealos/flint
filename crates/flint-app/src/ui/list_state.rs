@@ -94,6 +94,18 @@ impl CombinedResourceList {
                     format!("{}: {}", m.display_name(), sync_word(m.state(), feed(i))),
                 )
             })
+            .chain(members.iter().enumerate().filter_map(|(i, m)| {
+                let limit = self.shown.coverage[i].limit.as_ref()?;
+                Some(Banner::new(
+                    &format!("list-limited-{}", m.cluster()),
+                    Level::Info,
+                    format!(
+                        "{}: {}",
+                        m.display_name(),
+                        combined::limit_detail(&self.label, limit)
+                    ),
+                ))
+            }))
             .collect();
         ListState {
             kind: self
@@ -105,7 +117,7 @@ impl CombinedResourceList {
             sync,
             total: self.shown.total_rows(),
             shown: self.view.matched(),
-            count: list_model::combined::count_text(self.view.matched(), self.shown.total_rows()),
+            count: self.count(),
             columns: names,
             rows,
             rows_truncated: self.view.rows().len() > ListState::ROW_LIMIT,
@@ -118,14 +130,10 @@ impl CombinedResourceList {
                 })
             }),
             wide: self.show_wide,
-            placeholder: list_model::combined::empty_state(
-                &self.shown,
-                &self.view,
-                &self.query.clusters,
-            )
-            .map(|empty| match empty {
+            placeholder: self.empty_state().map(|empty| match empty {
                 list_model::combined::EmptyState::Loading => "loading",
-                list_model::combined::EmptyState::NoRows => "empty",
+                list_model::combined::EmptyState::NoRows
+                | list_model::combined::EmptyState::NoRowsListed => "empty",
                 list_model::combined::EmptyState::NoMatch => "no_match",
                 list_model::combined::EmptyState::Unresolved => "failed",
             }),
