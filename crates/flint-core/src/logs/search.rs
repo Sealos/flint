@@ -716,7 +716,15 @@ mod tests {
         let q = regex(r"status=5\d\d");
         assert!(q.is_match("STATUS=503"));
         assert!(!q.is_match("status=200"));
-        assert_eq!(q.match_ranges("x status=500 status=501"), [2..12, 13..23]);
+        let text = "x status=500 status=501";
+        // The first match is always kept; later ones depend on the highlight's time limit.
+        assert_eq!(q.match_ranges(text)[0], 2..12);
+        let compiled = crate::logs::pattern::compile(&q.text, false).unwrap();
+        let unhurried = std::time::Duration::from_secs(60);
+        assert_eq!(
+            crate::logs::pattern::ranges_within(&compiled, text, unhurried),
+            [2..12, 13..23]
+        );
         let sensitive = SearchQuery {
             case_sensitive: true,
             ..q

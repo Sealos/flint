@@ -128,7 +128,7 @@ pub(super) fn bounded_ranges(regex: &Regex, text: &str) -> Vec<Range<usize>> {
     ranges_within(regex, text, HIGHLIGHT_TIME)
 }
 
-fn ranges_within(regex: &Regex, text: &str, time: Duration) -> Vec<Range<usize>> {
+pub(super) fn ranges_within(regex: &Regex, text: &str, time: Duration) -> Vec<Range<usize>> {
     let cut = char_floor(text, HIGHLIGHT_BYTES);
     let hay = &text[..char_floor(text, HIGHLIGHT_BYTES + HIGHLIGHT_LOOKAHEAD)];
     let started = Instant::now();
