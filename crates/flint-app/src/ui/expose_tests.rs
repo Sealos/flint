@@ -166,23 +166,25 @@ fn two_prods(
     vec![kubeconfig]
 }
 
-// Two contexts with one title and one state still have toggles with names of their own.
+// Two contexts with one short name and one state still have toggles with names of their own.
 #[gpui_kit::test]
-async fn toggles_of_contexts_sharing_a_title_differ(cx: &mut TestAppContext) {
+async fn toggles_of_contexts_sharing_a_short_name_differ(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace_with(cx, dir.path(), two_prods).await;
-    for (context, id) in [
+    for (context, title, id) in [
         (
             PROD_A,
+            "…0000 · prod",
             concat!("expose-", "arn:aws:eks:us-east-1:000000000000:cluster/prod"),
         ),
         (
             PROD_B,
+            "…0001 · prod",
             concat!("expose-", "arn:aws:eks:us-east-1:000000000001:cluster/prod"),
         ),
     ] {
         assert_eq!(exposure(cx, &t, context), AiExposureState::Hidden);
-        let label = format!("AI exposure for prod (context \"{context}\"): hidden");
+        let label = format!("AI exposure for {title} (context \"{context}\"): hidden");
         assert!(named(cx, &t, id, &label));
     }
 }

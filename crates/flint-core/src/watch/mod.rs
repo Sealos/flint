@@ -5,7 +5,9 @@
 //! - **On view**: only kinds with an open subscription are watched.
 //! - In both modes a subscribed kind is watched (or polled, for APIs that cannot watch), and
 //!   nothing is watched while the cluster is not active. Stopping a kind drops its rows, so
-//!   coming back starts from a fresh list.
+//!   coming back starts from a fresh list. A view closed on the active cluster during an outage
+//!   keeps its last rows until the cluster lists again or goes cold, so reopening it shows them
+//!   as stale rather than an empty list.
 
 mod engine;
 mod hub;
@@ -107,12 +109,21 @@ impl ClusterWatches {
     /// Sets the connection (or clears it); call [`ClusterWatches::reconcile`] after.
     pub fn set_source(&mut self, source: Option<Arc<dyn Source>>) {
         self.stop_all();
+        // Rows from the previous connection say nothing about this one.
+        self.hubs.forget_outage(&self.cluster);
         self.source = source;
     }
 
     /// Sets discovery results; call [`ClusterWatches::reconcile`] after.
     pub fn set_kinds(&mut self, kinds: &[KindInfo]) {
-        self.kinds = Some(kinds.iter().map(|k| (k.id(), k.clone())).collect());
+        let next: HashMap<KindId, KindInfo> = kinds.iter().map(|k| (k.id(), k.clone())).collect();
+        // Rows kept through an outage belong to the resource they were listed from.
+        for (id, old) in self.kinds.iter().flatten() {
+            if next.get(id).is_none_or(|k| k.resource != old.resource) {
+                self.hubs.forget_kept(&self.cluster, id);
+            }
+        }
+        self.kinds = Some(next);
     }
 
     pub fn kind(&self, id: &KindId) -> Option<&KindInfo> {
@@ -195,6 +206,9 @@ impl ClusterWatches {
         for id in stale {
             self.stop(&id);
         }
+        if !active {
+            self.hubs.release_kept_rows(&self.cluster);
+        }
         wanted
     }
 
@@ -203,10 +217,23 @@ impl ClusterWatches {
             return;
         };
         let hub = self.hubs.get_or_create(&self.cluster, id);
-        let mut loading = KindSnapshot::empty(self.cluster.clone(), id.clone(), SyncState::Loading);
-        loading.namespaced = kind.namespaced;
-        loading.feed = feed;
-        let epoch = hub.take_over(loading);
+        let resume = self.hubs.resume(&self.cluster, id);
+        let mut first = match &resume {
+            Some(hub::Resume {
+                state,
+                rows: Some(rows),
+            }) => KindSnapshot {
+                state: state.clone(),
+                ..(**rows).clone()
+            },
+            Some(resume) => {
+                KindSnapshot::empty(self.cluster.clone(), id.clone(), resume.state.clone())
+            }
+            None => KindSnapshot::empty(self.cluster.clone(), id.clone(), SyncState::Loading),
+        };
+        first.namespaced = kind.namespaced;
+        first.feed = feed;
+        let epoch = hub.take_over(first);
         let engine = engine::Engine::new(
             self.cluster.clone(),
             kind.clone(),
@@ -216,7 +243,8 @@ impl ClusterWatches {
             self.config.clone(),
             self.limiter.clone(),
         )
-        .with_scope(Some(self.scope.subscribe()));
+        .with_scope(Some(self.scope.subscribe()))
+        .resuming(resume);
         let task = tokio::spawn(engine.run(feed));
         self.running.insert(
             id.clone(),
@@ -234,6 +262,13 @@ impl ClusterWatches {
             return;
         };
         running.task.abort();
+        // A kind whose resource changed would show the old one's rows.
+        if self
+            .kind(id)
+            .is_some_and(|k| k.resource == running.kind.resource)
+        {
+            self.hubs.keep_for_outage(&self.cluster, id, &running.hub);
+        }
         let state = if self.kind(id).is_some() {
             SyncState::Idle
         } else {
@@ -270,6 +305,7 @@ impl ClusterWatches {
 impl Drop for ClusterWatches {
     fn drop(&mut self) {
         self.stop_all();
+        self.hubs.forget_outage(&self.cluster);
     }
 }
 

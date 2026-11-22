@@ -1817,6 +1817,21 @@ impl Render for DetailView {
         let focused = self.focus.is_focused(window);
         let cx: &mut Context<Self> = cx;
         let content: AnyElement = match (&self.fetch, self.tab) {
+            // Nothing to show from before the outage. It fetches again when the kind is back.
+            (Fetch::Loading | Fetch::Failed(_), _)
+                if self.freshness.is_reconnecting() && !self.gone =>
+            {
+                h_flex()
+                    .id("detail-reconnecting")
+                    .flex_1()
+                    .justify_center()
+                    .items_center()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("Reconnecting")
+                    .test_support()
+                    .into_any_element()
+            }
             (Fetch::Loading, _) => h_flex()
                 .flex_1()
                 .justify_center()

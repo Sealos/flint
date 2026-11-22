@@ -972,6 +972,38 @@ async fn list_shows_loading_stale_and_failed_states(cx: &mut TestAppContext) {
     .await;
 }
 
+// covers UP-27: with no rows from before the outage it says so, in the plain message that has no
+// spinner, and rows that come with the state stay on screen as stale.
+#[gpui_kit::test]
+async fn an_outage_without_rows_says_reconnecting_not_loading(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open(cx, core);
+    let down = SyncState::Reconnecting {
+        error: Some("the connection dropped".into()),
+    };
+    list.update(cx, |list, cx| {
+        list.set_snapshot(pods(&[], down.clone(), 1), cx)
+    });
+    cx.wait_for(window, WAIT, |_, cx| {
+        let view = list.read(cx).view_state();
+        view.placeholder == Some("reconnecting") && view.sync == "reconnecting"
+    })
+    .await;
+
+    let rows = [("demo", "web", 0)];
+    list.update(cx, |list, cx| {
+        list.set_snapshot(pods(&rows, down.clone(), 2), cx)
+    });
+    cx.wait_for(window, WAIT, |window, cx| {
+        let view = list.read(cx).view_state();
+        window.try_find("row-uid-web").is_some()
+            && view.placeholder.is_none()
+            && view.sync == "reconnecting"
+            && view.banners.iter().any(|b| b.id == "list-banner")
+    })
+    .await;
+}
+
 // covers UP-27
 #[gpui_kit::test]
 async fn a_denied_list_checks_access_then_says_no_access(cx: &mut TestAppContext) {

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use flint_core::activity::ActivityRecord;
 use flint_core::settings::{AiExposureState, AiScope, ClusterTag, TrustState};
@@ -453,6 +454,11 @@ pub enum Presence<'a> {
     Failed,
 }
 
+/// One slow breath of the reconnecting dot. The app has no reduced-motion setting to follow, so
+/// the pulse stays slow and shallow: at its dimmest the dot still has 3:1 contrast (UP-32).
+const PULSE_PERIOD: Duration = Duration::from_millis(2400);
+const PULSE_MIN_OPACITY: f32 = 0.85;
+
 /// The shape of a cluster's presence marker. Shape carries the state without colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DotShape {
@@ -496,6 +502,17 @@ impl<'a> Presence<'a> {
     pub fn marker(self, theme: &Theme) -> Div {
         let (color, shape) = self.dot(theme);
         match shape {
+            DotShape::Filled if self.pulses() => div().size_2().child(
+                super::theme::status_dot(color, true)
+                    .size_2()
+                    .with_animation(
+                        "reconnecting-pulse",
+                        Animation::new(PULSE_PERIOD)
+                            .repeat()
+                            .with_easing(pulsating_between(PULSE_MIN_OPACITY, 1.)),
+                        |dot, opacity| dot.opacity(opacity),
+                    ),
+            ),
             DotShape::Filled => super::theme::status_dot(color, true).size_2(),
             DotShape::Ring => super::theme::status_dot(color, false).size_2(),
             DotShape::Dash => div()
@@ -505,6 +522,11 @@ impl<'a> Presence<'a> {
                 .justify_center()
                 .child(div().w_2().h(px(2.)).rounded_full().bg(color)),
         }
+    }
+
+    /// Whether the marker pulses: only while reconnecting.
+    fn pulses(self) -> bool {
+        matches!(self, Presence::Reconnecting { .. })
     }
 
     /// Its name in the automation state.
@@ -760,6 +782,42 @@ mod tests {
         assert_eq!(startup_cluster("KIND-FLINT-DEV", &clusters), None);
         assert_eq!(startup_cluster("", &clusters), None);
         assert_eq!(startup_cluster("prod", &[]), None);
+    }
+
+    // covers UP-32: only reconnecting pulses, and it keeps the colour and shape of its state.
+    #[test]
+    fn only_reconnecting_pulses() {
+        let theme = gpui_kit::component::Theme::default();
+        let reconnecting = Presence::Reconnecting { error: "dropped" };
+        assert!(reconnecting.pulses());
+        assert_eq!(reconnecting.dot(&theme), Presence::Connecting.dot(&theme));
+        for quiet in [
+            Presence::NotConnected,
+            Presence::Connecting,
+            Presence::Live,
+            Presence::Idle,
+            Presence::Failed,
+        ] {
+            assert!(!quiet.pulses(), "{quiet:?}");
+        }
+    }
+
+    // covers UP-32: the dimmest frame of the pulse stays readable on the row it is drawn on.
+    #[test]
+    fn the_pulse_keeps_three_to_one_at_its_dimmest() {
+        use crate::ui::accent::CANDIDATES;
+        use crate::ui::theme::tests::{contrast, resolved};
+        use crate::ui::theme::themes;
+        for accent in CANDIDATES {
+            let (light, dark) = themes(&accent);
+            for theme in [resolved(light), resolved(dark)] {
+                let dimmest = theme.warning.opacity(super::PULSE_MIN_OPACITY);
+                for row in [theme.sidebar, theme.sidebar.blend(theme.list_active)] {
+                    let ratio = contrast(dimmest, row, theme.background);
+                    assert!(ratio >= 3.0, "{}: {ratio:.2}:1", accent.name);
+                }
+            }
+        }
     }
 
     // covers UP-32: not connected reads without colour or a tooltip, by its shape.
