@@ -2302,22 +2302,22 @@ impl Workspace {
     }
 }
 
-/// A side pane's title. On macOS it is the top row, as tall as the main header, starts `leading`
-/// from the pane's edge (clear of the traffic lights) and moves the window.
-fn pane_title(title: &'static str, leading: Pixels, theme: &Theme) -> impl IntoElement {
+/// A side pane's title. On macOS it is the top row, as tall as the main header, and moves the
+/// window. A pane under the traffic lights (`traffic_lights` above zero) leaves the row to them
+/// and shows no title.
+fn pane_title(title: &'static str, traffic_lights: Pixels, theme: &Theme) -> impl IntoElement {
     let row = div()
         .px_3()
         .text_xs()
         .font_semibold()
         .text_color(theme.muted_foreground)
-        .child(title);
+        .when(traffic_lights == px(0.), |el| el.child(title));
     if cfg!(target_os = "macos") {
         super::theme::moves_window(row)
             .flex()
             .flex_none()
             .items_center()
             .h(px(HEADER_HEIGHT))
-            .when(leading > px(0.), |el| el.pl(leading))
     } else {
         row.pt_3().pb_1()
     }
