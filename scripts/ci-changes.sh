@@ -52,24 +52,29 @@ all() {
   turn_on $CHECKS
 }
 
-# The paths that always get the full suite: the write and connection path, redaction, MCP, the
-# automation channel, manifests and CI.
+# The paths that always get the full suite: all of flint-core except the modules named below, the
+# app and test code that calls its write and connection path, MCP, the automation channel,
+# manifests and CI.
 needs_full() {
   case "$1" in
-    crates/flint-core/src/manager* | crates/flint-core/src/write* | \
-      crates/flint-core/src/kubeconfig* | crates/flint-core/src/credential* | \
-      crates/flint-core/src/protection* | crates/flint-core/src/cluster* | \
-      crates/flint-core/src/auth_plugin* | crates/flint-core/src/redact* | \
-      crates/flint-core/src/connection/* | crates/flint-core/src/activity.rs | \
-      crates/flint-core/src/read_only* | crates/flint-core/src/exec* | \
-      crates/flint-core/src/api_error* | crates/flint-core/src/logging* | \
-      crates/flint-core/src/settings* | crates/flint-core/clippy.toml)
+    # The only flint-core sources a smoke run covers: self-contained helpers. A new file is full
+    # until it is added here.
+    crates/flint-core/src/paging.rs | crates/flint-core/src/thresholds.rs | \
+      crates/flint-core/src/thresholds_tests.rs)
+      return 1
+      ;;
+    crates/flint-core/src/* | crates/flint-core/tests/* | crates/flint-core/clippy.toml)
       return 0
       ;;
     crates/flint-mcp/*) return 0 ;;
     crates/flint-app/src/main.rs | crates/flint-app/src/ui/write_confirm* | \
       crates/flint-app/src/ui/resource_actions* | crates/flint-app/src/ui/detail_edit* | \
       crates/flint-app/src/ui/protect_tests* | crates/flint-app/src/ui/automation/* | \
+      crates/flint-app/src/ui/clusters* | crates/flint-app/src/ui/detail.rs | \
+      crates/flint-app/src/ui/detail_access* | crates/flint-app/src/ui/detail_actions* | \
+      crates/flint-app/src/ui/registry* | crates/flint-app/src/ui/row_menu* | \
+      crates/flint-app/src/ui/terminal_model* | crates/flint-app/src/ui/terminal_view* | \
+      crates/flint-app/src/ui/view_state* | crates/flint-app/src/ui/workspace* | \
       crates/flint-app/tests/mcp_subcommand.rs)
       return 0
       ;;
@@ -77,7 +82,8 @@ needs_full() {
       crates/flint-e2e/src/fake_api/kubeconfig.rs | crates/flint-e2e/tests/mcp* | \
       crates/flint-e2e/tests/write_* | crates/flint-e2e/tests/protected_cluster.rs | \
       crates/flint-e2e/tests/kubeconfig_reload.rs | crates/flint-e2e/tests/app/m3_writes.rs | \
-      crates/flint-e2e/tests/app/exec_plugins.rs)
+      crates/flint-e2e/tests/app/exec_plugins.rs | crates/flint-e2e/tests/access_checks.rs | \
+      crates/flint-e2e/tests/core.rs | crates/flint-e2e/tests/core_support/*)
       return 0
       ;;
     # Every manifest: a default-feature change reaches what the release binary contains.
@@ -86,7 +92,7 @@ needs_full() {
       return 0
       ;;
     .github/workflows/* | .github/actions/*) return 0 ;;
-    scripts/ci-changes.sh | scripts/check-client-construction.sh | \
+    scripts/ci-changes.sh | scripts/ci-changes-test.sh | scripts/check-client-construction.sh | \
       scripts/check-no-automation.sh | scripts/check-no-automation-test.sh)
       return 0
       ;;

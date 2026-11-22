@@ -7,8 +7,6 @@ on:
     branches: [master]
   pull_request:
   merge_group:
-  # Started by ci-base-change.yml when a PR moves to another base. Runs every check.
-  workflow_dispatch:
 
 permissions:
   contents: read
