@@ -7,12 +7,11 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
 use kube::config::{Kubeconfig, NamedContext};
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex, oneshot};
 
 use crate::settings::{Settings, expand_tilde};
 
@@ -65,6 +64,8 @@ pub struct LoadedKubeconfig {
     pub cluster_sources: HashMap<String, PathBuf>,
     /// The same for each user entry, which can come from yet another file.
     pub user_sources: HashMap<String, PathBuf>,
+    /// The files that parsed to nothing at all: no document, or only comments and whitespace.
+    pub blank: Vec<PathBuf>,
 }
 
 impl LoadedKubeconfig {
@@ -142,18 +143,14 @@ pub struct FileStamps(Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>);
 
 impl FileStamps {
     pub fn of(paths: &[PathBuf]) -> Self {
-        FileStamps(
-            paths
-                .iter()
-                .map(|p| {
-                    let stamp = std::fs::metadata(p)
-                        .ok()
-                        .and_then(|m| Some((m.modified().ok()?, m.len())));
-                    (p.clone(), stamp)
-                })
-                .collect(),
-        )
+        FileStamps(paths.iter().map(|p| (p.clone(), file_stamp(p))).collect())
     }
+}
+
+/// A file's modification time and size, or `None` if it can't be checked.
+fn file_stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
 }
 
 /// Reads and merges `paths` in order. Missing files are skipped silently; unreadable or invalid
@@ -169,6 +166,7 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
     let mut defines = Vec::new();
     let mut cluster_sources = HashMap::new();
     let mut user_sources = HashMap::new();
+    let mut blank = Vec::new();
     for path in paths {
         // A path that can't be checked may hold a file: it counts as one that failed to load.
         match path.try_exists() {
@@ -192,6 +190,10 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
                 continue;
             }
         };
+        // From this parse, not a second read: the file may have content again by now.
+        if parsed_to_nothing(&config) {
+            blank.push(path.clone());
+        }
         config.kind = None;
         config.api_version = None;
         dedupe_by_name(&mut config.clusters, |c| &c.name);
@@ -259,7 +261,21 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
         defines,
         cluster_sources,
         user_sources,
+        blank,
     }
+}
+
+/// Whether a parse found nothing in its file, not even a `kind`.
+fn parsed_to_nothing(config: &Kubeconfig) -> bool {
+    config.kind.is_none()
+        && config.api_version.is_none()
+        && config.preferences.is_none()
+        && config.clusters.is_empty()
+        && config.auth_infos.is_empty()
+        && config.contexts.is_empty()
+        && config.current_context.is_none()
+        && config.extensions.is_none()
+        && config.other.is_empty()
 }
 
 /// Whether `path` is a kind of file a read returns from: a regular file, or the null device
@@ -284,15 +300,25 @@ fn is_null_device(_meta: &std::fs::Metadata) -> bool {
 /// How long a read of the kubeconfig files may hold up the cluster manager.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A file whose last parse found nothing in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlankFile {
+    pub path: PathBuf,
+    /// Its modification time and size from before that parse: another stamp later means it was
+    /// written again.
+    pub stamp: Option<(std::time::SystemTime, u64)>,
+}
+
 /// One finished read of the kubeconfig files.
 #[derive(Debug)]
 pub(crate) struct FileRead {
     pub loaded: LoadedKubeconfig,
     /// Each path, and whether it exists.
     pub exist: Vec<(PathBuf, bool)>,
-    /// The files that hold nothing but whitespace. Whether that is a failed load depends on what
-    /// they defined before ([`crate::recheck::ContextHistory::fail_emptied`]).
-    pub blank: Vec<PathBuf>,
+    /// The files that parsed to nothing ([`LoadedKubeconfig::blank`]). Whether that is a failed
+    /// load depends on what they defined before
+    /// ([`crate::recheck::ContextHistory::fail_emptied`]).
+    pub blank: Vec<BlankFile>,
 }
 
 impl FileRead {
@@ -312,6 +338,7 @@ impl FileRead {
     }
 
     fn of(paths: &[PathBuf], load: fn(&[PathBuf]) -> LoadedKubeconfig) -> Self {
+        let stamps: HashMap<&PathBuf, _> = paths.iter().map(|p| (p, file_stamp(p))).collect();
         let loaded = load(paths);
         let exist = loaded
             .paths
@@ -319,10 +346,12 @@ impl FileRead {
             .map(|p| (p.clone(), p.exists()))
             .collect();
         let blank = loaded
-            .defines
+            .blank
             .iter()
-            .filter(|(path, names)| names.is_empty() && is_blank(path))
-            .map(|(path, _)| path.clone())
+            .map(|path| BlankFile {
+                path: path.clone(),
+                stamp: stamps.get(path).copied().flatten(),
+            })
             .collect();
         FileRead {
             loaded,
@@ -332,35 +361,26 @@ impl FileRead {
     }
 }
 
-/// Whether the file holds nothing but whitespace. One that can't be read again says no: the load
-/// that just read it decides.
-fn is_blank(path: &Path) -> bool {
-    std::fs::read(path).is_ok_and(|bytes| bytes.iter().all(u8::is_ascii_whitespace))
-}
-
 /// Reads the kubeconfig files off the caller's task, for at most a fixed time.
 ///
 /// A blocked read can't be cancelled, so it runs on its own thread (a runtime waits for its
-/// blocking tasks when it shuts down) and at most one runs for a given list of files. A read of
-/// another list may start beside it, so that dropping a stuck path from the list recovers.
+/// blocking tasks when it shuts down) and at most one runs for a given list of files, tracked
+/// until its thread exits. A read of another list may start beside it, so that dropping a stuck
+/// path from the list recovers.
+#[derive(Clone)]
 pub(crate) struct KubeconfigReader {
     load: fn(&[PathBuf]) -> LoadedKubeconfig,
     timeout: Duration,
-    running: Option<(Vec<PathBuf>, Arc<AtomicBool>)>,
+    /// One lock per list of files, held by the thread reading them.
+    turns: Arc<StdMutex<ReadTurns>>,
 }
+
+/// The lock of each list of files.
+type ReadTurns = HashMap<Vec<PathBuf>, Arc<Mutex<()>>>;
 
 impl Default for KubeconfigReader {
     fn default() -> Self {
         Self::new(load, READ_TIMEOUT)
-    }
-}
-
-/// Marks a read finished, however its thread ends.
-struct Finished(Arc<AtomicBool>);
-
-impl Drop for Finished {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -369,41 +389,44 @@ impl KubeconfigReader {
         KubeconfigReader {
             load,
             timeout,
-            running: None,
+            turns: Arc::default(),
         }
     }
 
+    /// The lock for `paths`. Forgets the locks nothing holds or waits for.
+    fn turn(&self, paths: &[PathBuf]) -> Arc<Mutex<()>> {
+        let mut turns = self.turns.lock().unwrap_or_else(PoisonError::into_inner);
+        turns.retain(|_, turn| Arc::strong_count(turn) > 1);
+        turns.entry(paths.to_vec()).or_default().clone()
+    }
+
+    /// Whether a read of `paths` is still running.
+    pub(crate) fn busy(&self, paths: &[PathBuf]) -> bool {
+        self.turn(paths).try_lock().is_err()
+    }
+
     /// The files as they are now, or `None` if the read did not finish in time or an earlier
-    /// read of the same files still hasn't. A read that finishes after its caller gave up calls
-    /// `on_late`, so the caller can read again.
+    /// read of the same files still hasn't. A read that finishes after its caller gave up hands
+    /// its result to `on_late`.
     pub(crate) async fn read(
-        &mut self,
+        &self,
         paths: &[PathBuf],
-        on_late: impl FnOnce() + Send + 'static,
+        on_late: impl FnOnce(FileRead) + Send + 'static,
     ) -> Option<FileRead> {
-        if let Some((running, finished)) = &self.running
-            && running == paths
-            && !finished.load(Ordering::Acquire)
-        {
-            return None;
-        }
-        let finished = Arc::new(AtomicBool::new(false));
-        self.running = Some((paths.to_vec(), finished.clone()));
+        let turn = self.turn(paths).try_lock_owned().ok()?;
         let (reply, answer) = oneshot::channel();
         let (load, owned) = (self.load, paths.to_vec());
         let thread = std::thread::Builder::new()
             .name("kubeconfig-read".to_owned())
             .spawn(move || {
-                let guard = Finished(finished);
                 let read = FileRead::of(&owned, load);
-                drop(guard);
-                if reply.send(read).is_err() {
-                    on_late();
+                drop(turn);
+                if let Err(read) = reply.send(read) {
+                    on_late(read);
                 }
             });
         if let Err(e) = thread {
             tracing::warn!(error = %e, "could not start a kubeconfig read");
-            self.running = None;
             return None;
         }
         tokio::time::timeout(self.timeout, answer)
@@ -504,12 +527,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fifo = make_fifo(dir.path(), "fifo");
         let paths = vec![fifo.clone()];
-        let mut reader = KubeconfigReader::new(blocking_load, Duration::from_millis(50));
+        let reader = KubeconfigReader::new(blocking_load, Duration::from_millis(50));
         let (late, mut late_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let first = late.clone();
         let read = reader
-            .read(&paths, move || {
+            .read(&paths, move |_| {
                 let _ = first.send(());
             })
             .await;
@@ -517,7 +540,7 @@ mod tests {
         let started = std::time::Instant::now();
         let second = late.clone();
         let read = reader
-            .read(&paths, move || {
+            .read(&paths, move |_| {
                 let _ = second.send(());
             })
             .await;
@@ -526,7 +549,7 @@ mod tests {
 
         // Another list of files is not held up by the stuck one.
         let other = vec![write(dir.path(), "other", &config(&[], &[]))];
-        assert!(reader.read(&other, || {}).await.is_some());
+        assert!(reader.read(&other, |_| {}).await.is_some());
 
         // A writer that opens and closes the FIFO ends the blocked read.
         drop(std::fs::OpenOptions::new().write(true).open(&fifo).unwrap());
@@ -537,16 +560,81 @@ mod tests {
         assert_eq!(late_rx.try_recv().ok(), None, "only the one read ran");
     }
 
-    // covers UP-06: only a file with nothing but whitespace counts as blank.
+    // covers UP-06: a file counts as blank when its parse found nothing. One that says it has no
+    // contexts, or supplies only a cluster entry, does not.
     #[test]
-    fn a_blank_file_is_told_from_a_file_without_contexts() {
+    fn a_blank_file_is_one_that_supplied_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let empty = write(dir.path(), "empty", "");
         let spaces = write(dir.path(), "spaces", " \n\t\n");
-        let no_contexts = write(dir.path(), "none", &config(&[], &[]));
-        let read = FileRead::of(&[empty.clone(), spaces.clone(), no_contexts], load);
-        assert_eq!(read.blank, [empty, spaces]);
+        let no_entries = write(dir.path(), "none", &config(&[], &[]));
+        let cluster_only = write(
+            dir.path(),
+            "cluster",
+            &config(&[], &[("c1", "https://one")]),
+        );
+        let read = FileRead::of(
+            &[
+                empty.clone(),
+                spaces.clone(),
+                no_entries.clone(),
+                cluster_only,
+            ],
+            load,
+        );
+        let blank: Vec<_> = read.blank.iter().map(|b| b.path.clone()).collect();
+        assert_eq!(blank, [empty, spaces]);
         assert!(read.loaded.errors.is_empty(), "the load itself is clean");
+    }
+
+    /// Parses the first file, then puts content back in it, as a truncating writer does.
+    fn load_then_restore(paths: &[PathBuf]) -> LoadedKubeconfig {
+        let loaded = load(paths);
+        std::fs::write(
+            &paths[0],
+            config(&[("dev", "c1", "u1")], &[("c1", "https://one")]),
+        )
+        .unwrap();
+        loaded
+    }
+
+    // covers UP-06: what the parse saw decides, though the file has content again by now.
+    #[test]
+    fn a_file_restored_right_after_its_parse_still_counts_as_blank() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "first", "");
+        let read = FileRead::of(std::slice::from_ref(&path), load_then_restore);
+        assert_eq!(read.blank.len(), 1);
+        assert_eq!(read.blank[0].path, path);
+    }
+
+    #[cfg(unix)]
+    static COUNTED_LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg(unix)]
+    fn counted_blocking_load(paths: &[PathBuf]) -> LoadedKubeconfig {
+        COUNTED_LOADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        blocking_load(paths)
+    }
+
+    // covers UP-06: going back to a list of files whose read is still stuck starts no second
+    // thread for it, however many other lists were read in between.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn switching_lists_keeps_track_of_a_stuck_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = make_fifo(dir.path(), "fifo");
+        let stuck = vec![fifo.clone()];
+        let other = vec![write(dir.path(), "other", &config(&[], &[]))];
+        let reader = KubeconfigReader::new(counted_blocking_load, Duration::from_millis(30));
+        assert!(reader.read(&stuck, |_| {}).await.is_none());
+        for _ in 0..3 {
+            assert!(reader.read(&other, |_| {}).await.is_some());
+            assert!(reader.read(&stuck, |_| {}).await.is_none());
+        }
+        let loads = COUNTED_LOADS.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(loads, 4, "one read of the stuck list, three of the other");
+        drop(std::fs::OpenOptions::new().write(true).open(&fifo).unwrap());
     }
 
     // covers UP-06: a path that can't be checked is reported as failed, and the files after it

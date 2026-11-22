@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kube::Client;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -20,7 +20,9 @@ use crate::discovery::ClusterDiscovery;
 use crate::handle::{
     ClusterSummary, ClustersSnapshot, Command, ConnectionState, CoreConfig, Event, Request,
 };
-use crate::kubeconfig::{self, ContextInfo, FileRead, KubeconfigReader, LoadedKubeconfig};
+use crate::kubeconfig::{
+    self, BlankFile, ContextInfo, FileRead, KubeconfigReader, LoadedKubeconfig,
+};
 use crate::logs::{self, KubeLogSource, KubePodSource, LogError, SessionConfig};
 use crate::protection::{ClusterClients, GatedClient, SessionUnlocks, WriteRefusal, protection};
 use crate::read::{self, KindId, KindInfo};
@@ -154,6 +156,10 @@ impl Cluster {
     }
 }
 
+/// How long a kubeconfig file that defined something must stay emptied and unwritten before it
+/// counts as really empty. A writer that truncates first is done well within this.
+const EMPTY_SETTLE: Duration = Duration::from_secs(5);
+
 enum Internal {
     /// Reload kubeconfig, then say so ([`crate::CoreHandle::reload_kubeconfig`]).
     ReloadKubeconfig {
@@ -165,6 +171,15 @@ enum Internal {
         result: Result<(cluster::GatedConnection, ServerVersion), cluster::SafeErrorText>,
     },
     FilesChanged(Changed),
+    /// A kubeconfig read finished after its caller stopped waiting.
+    LateRead {
+        paths: Vec<PathBuf>,
+        /// Which read it was ([`ClusterManager::read_seq`]).
+        seq: u64,
+        read: Box<FileRead>,
+    },
+    /// Time to look again at files that were found emptied.
+    SettleEmptied,
     Discovered {
         cluster: ClusterId,
         attempt: u64,
@@ -271,6 +286,19 @@ pub(crate) struct ClusterManager {
     reader: KubeconfigReader,
     /// The files whose read is stuck, once that was applied and reported.
     stalled_on: Option<Vec<PathBuf>>,
+    /// The number of reads started, which orders their results.
+    read_seq: u64,
+    /// The newest read whose result was applied.
+    applied_read: u64,
+    /// A reload was asked for while a read was running, so that read may predate the reason.
+    reread: bool,
+    /// The files found emptied and still waiting to count as really empty: since when, and
+    /// their stamp then.
+    emptied: HashMap<PathBuf, (Instant, Option<(std::time::SystemTime, u64)>)>,
+    /// How long a file must stay emptied, unwritten, before it counts as really empty.
+    empty_settle: Duration,
+    /// A follow-up read of emptied files is scheduled.
+    settle_armed: bool,
     settings: Arc<Settings>,
     settings_error: Option<String>,
     /// The newest Trust or Stop Trusting request whose write has finished.
@@ -352,6 +380,12 @@ impl ClusterManager {
             settled: HashMap::new(),
             reader: KubeconfigReader::default(),
             stalled_on: None,
+            read_seq: 0,
+            applied_read: 0,
+            reread: false,
+            emptied: HashMap::new(),
+            empty_settle: EMPTY_SETTLE,
+            settle_armed: false,
         }
     }
 
@@ -942,6 +976,20 @@ impl ClusterManager {
                 let applied = self.reload_kubeconfig().await;
                 let _ = reply.send(applied);
             }
+            Internal::LateRead { paths, seq, read } => {
+                if paths == self.kubeconfig_paths && seq > self.applied_read {
+                    self.applied_read = seq;
+                    self.stalled_on = None;
+                    self.apply_files(*read);
+                }
+                if std::mem::take(&mut self.reread) {
+                    self.reload_kubeconfig().await;
+                }
+            }
+            Internal::SettleEmptied => {
+                self.settle_armed = false;
+                self.reload_kubeconfig().await;
+            }
             Internal::Connected {
                 cluster,
                 attempt,
@@ -1373,29 +1421,87 @@ impl ClusterManager {
 
     /// Reads the kubeconfig files now, ahead of the file watcher, and says whether they still
     /// give `id` the definition the last load showed at `server`. Anything else is a no, a read
-    /// that fails included. What gives access checks this right before saving.
+    /// that fails included, and a read that stalls also holds writes as a reload's does. What
+    /// gives access checks this right before saving.
     async fn files_still_show(&mut self, id: &str, server: &str) -> bool {
         let paths = self.kubeconfig_paths.clone();
-        let on_late = self.reload_when_read();
+        let (_, on_late) = self.next_read(&paths);
         match self.reader.read(&paths, on_late).await {
             Some(mut fresh) => {
                 self.contexts.fail_emptied(&mut fresh.loaded, &fresh.blank);
                 self.contexts.holds_in(&fresh.loaded, id, server)
             }
-            None => false,
+            None => {
+                self.hold_stalled(paths);
+                false
+            }
         }
     }
 
-    /// For a read that ends after it was given up on: loads the files again, since what it
-    /// waited on has moved.
-    fn reload_when_read(&self) -> impl FnOnce() + Send + 'static {
+    /// Numbers a new read of `paths`, and what to do with its result if it comes in late.
+    fn next_read(&mut self, paths: &[PathBuf]) -> (u64, impl FnOnce(FileRead) + Send + 'static) {
+        self.read_seq += 1;
+        let seq = self.read_seq;
         let internal = self.internal_tx.clone();
-        move || {
-            let _ = internal.send(Internal::FilesChanged(Changed {
-                kubeconfig: true,
-                ..Changed::default()
-            }));
+        let paths = paths.to_vec();
+        (seq, move |read| {
+            let _ = internal.send(Internal::LateRead {
+                paths,
+                seq,
+                read: Box::new(read),
+            });
+        })
+    }
+
+    /// Applies a read of `paths` that did not finish as every file failing, which keeps the
+    /// clusters and holds their writes. Once per stall.
+    fn hold_stalled(&mut self, paths: Vec<PathBuf>) {
+        if self.stalled_on.as_ref() == Some(&paths) {
+            return;
         }
+        self.emit(Event::Error(
+            "Your kubeconfig files are taking too long to read. Clusters stay as they were, and \
+             changes to them are refused until the files can be read."
+                .to_owned(),
+        ));
+        let stalled = FileRead::stalled(&paths);
+        self.stalled_on = Some(paths);
+        self.apply_files(stalled);
+    }
+
+    /// Of the files in `blank` that mattered when they last loaded, those not yet emptied and
+    /// unwritten for [`Self::empty_settle`]. Those still count as failed, and a follow-up read
+    /// is scheduled for them.
+    fn still_settling(&mut self, blank: &[BlankFile]) -> Vec<BlankFile> {
+        let now = Instant::now();
+        let emptied: Vec<&BlankFile> = blank
+            .iter()
+            .filter(|file| self.contexts.file_mattered(&file.path))
+            .collect();
+        self.emptied
+            .retain(|path, _| emptied.iter().any(|file| &file.path == path));
+        let mut waiting = Vec::new();
+        for file in emptied {
+            let since = match self.emptied.get(&file.path) {
+                Some((since, stamp)) if *stamp == file.stamp => *since,
+                _ => {
+                    self.emptied.insert(file.path.clone(), (now, file.stamp));
+                    now
+                }
+            };
+            if now.duration_since(since) < self.empty_settle {
+                waiting.push(file.clone());
+            }
+        }
+        if !waiting.is_empty() && !self.settle_armed {
+            self.settle_armed = true;
+            let (internal, after) = (self.internal_tx.clone(), self.empty_settle);
+            tokio::spawn(async move {
+                tokio::time::sleep(after).await;
+                let _ = internal.send(Internal::SettleEmptied);
+            });
+        }
+        waiting
     }
 
     fn cluster(&self, id: &str) -> Option<&Cluster> {
@@ -1517,36 +1623,35 @@ impl ClusterManager {
     /// Loads the kubeconfig files and applies them. Whether that was done: a file that fails to
     /// parse still counts, and is reported in the cluster list. A read that does not finish in
     /// time is applied as every file failing, which keeps the clusters and holds their writes,
-    /// and counts as not done.
+    /// and counts as not done. Its result is applied when it comes in, if nothing newer was.
     async fn reload_kubeconfig(&mut self) -> bool {
         let paths = self.kubeconfig_paths.clone();
-        let on_late = self.reload_when_read();
-        let read = self.reader.read(&paths, on_late).await;
-        let finished = read.is_some();
-        let read = match read {
+        let busy = self.reader.busy(&paths);
+        let (seq, on_late) = self.next_read(&paths);
+        match self.reader.read(&paths, on_late).await {
             Some(read) => {
+                self.applied_read = seq;
                 self.stalled_on = None;
-                read
+                self.apply_files(read);
+                true
             }
-            // Already applied and reported.
-            None if self.stalled_on.as_ref() == Some(&paths) => return false,
             None => {
-                self.emit(Event::Error(
-                    "Your kubeconfig files are taking too long to read. Clusters stay as they \
-                     were, and changes to them are refused until the files can be read."
-                        .to_owned(),
-                ));
-                let stalled = FileRead::stalled(&paths);
-                self.stalled_on = Some(paths);
-                stalled
+                self.reread |= busy;
+                self.hold_stalled(paths);
+                false
             }
-        };
+        }
+    }
+
+    /// Takes a read of the kubeconfig files as the current state.
+    fn apply_files(&mut self, read: FileRead) {
         let FileRead {
             mut loaded,
             exist: path_exist,
             blank,
         } = read;
-        self.contexts.fail_emptied(&mut loaded, &blank);
+        let settling = self.still_settling(&blank);
+        self.contexts.fail_emptied(&mut loaded, &settling);
         let loaded = Arc::new(loaded);
         tracing::info!(
             contexts = loaded.contexts.len(),
@@ -1662,7 +1767,6 @@ impl ClusterManager {
                 self.ensure_connected(&active);
             }
         }
-        finished
     }
 
     /// (Re)creates the file watcher for the current kubeconfig files and `settings.toml`, if
@@ -2325,6 +2429,125 @@ mod tests {
         kubeconfig::load(paths)
     }
 
+    /// The next message the manager's tasks sent it.
+    async fn next_internal(manager: &mut ClusterManager) -> Internal {
+        let internal = manager.internal_rx.as_mut().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), internal.recv())
+            .await
+            .expect("a message in time")
+            .expect("the channel is open")
+    }
+
+    /// A load that always finishes just after the short timeout of these tests.
+    fn slow_load(paths: &[PathBuf]) -> LoadedKubeconfig {
+        let loaded = kubeconfig::load(paths);
+        std::thread::sleep(Duration::from_millis(120));
+        loaded
+    }
+
+    // covers UP-06, UP-54: a Trust check that is the first read to stall holds writes, as a
+    // reload's stall does.
+    #[tokio::test]
+    async fn a_stalled_access_check_holds_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://dev");
+        let mut manager = manager_reading_two(dir.path(), &yaml, &yaml).await;
+        manager.config.config_dir = dir.path().join("config");
+        let second = dir.path().join("second");
+        std::fs::remove_file(&second).unwrap();
+        make_fifo(&second);
+        manager.reader = KubeconfigReader::new(blocking_load, Duration::from_millis(50));
+        let pin = manager.contexts.pin_confirmed("dev");
+
+        let at = Some("https://dev".to_owned());
+        assert!(!manager.set_pin(Pins::Trust, "dev".into(), at).await);
+        assert!(manager.held("dev") && manager.unsettled("dev"));
+        assert_eq!(
+            manager.write_pin_gate("dev", &pin),
+            Err(WriteError::KubeconfigUnreadable)
+        );
+        drop(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&second)
+                .unwrap(),
+        );
+    }
+
+    // covers UP-06: reads that always end just after the deadline still reach the state, so the
+    // clusters do not stay held. A late read of another list, or older than one applied, does not.
+    #[tokio::test]
+    async fn a_late_read_is_applied_only_while_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://dev");
+        let mut manager = manager_reading_two(dir.path(), &yaml, &yaml).await;
+        manager.reader = KubeconfigReader::new(slow_load, Duration::from_millis(40));
+
+        assert!(!manager.reload_kubeconfig().await);
+        assert!(manager.held("dev"), "held while the read is out");
+        let late = next_internal(&mut manager).await;
+        manager.handle_internal(late).await;
+        assert!(!manager.held("dev"), "the late result was applied");
+
+        // Held again, with this read overtaken by a newer applied one: it changes nothing.
+        assert!(!manager.reload_kubeconfig().await);
+        let late = next_internal(&mut manager).await;
+        manager.reader = KubeconfigReader::default();
+        manager.applied_read = manager.read_seq + 1;
+        manager.handle_internal(late).await;
+        assert!(manager.held("dev"), "an overtaken read is dropped");
+
+        assert!(manager.reload_kubeconfig().await);
+        manager.reader = KubeconfigReader::new(slow_load, Duration::from_millis(40));
+        assert!(!manager.reload_kubeconfig().await);
+        let late = next_internal(&mut manager).await;
+        manager.kubeconfig_paths.pop();
+        manager.handle_internal(late).await;
+        assert!(manager.held("dev"), "a read of another list is dropped");
+    }
+
+    // covers UP-06, UP-54: an emptied file holds writes while it settles, and one that stays
+    // empty and unwritten then removes its contexts through a follow-up read.
+    #[tokio::test]
+    async fn a_file_left_empty_removes_its_contexts_after_settling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kubeconfig");
+        let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://dev")).await;
+        manager.empty_settle = Duration::from_millis(150);
+        let pin = manager.contexts.pin_confirmed("dev");
+
+        std::fs::write(&path, "").unwrap();
+        manager.reload_kubeconfig().await;
+        assert!(manager.cluster("dev").is_some(), "kept while settling");
+        assert_eq!(
+            manager.write_pin_gate("dev", &pin),
+            Err(WriteError::KubeconfigUnreadable)
+        );
+
+        let follow_up = next_internal(&mut manager).await;
+        assert!(matches!(follow_up, Internal::SettleEmptied));
+        manager.handle_internal(follow_up).await;
+        assert!(manager.cluster("dev").is_none(), "gone once settled");
+        assert!(manager.contexts.removed("dev"));
+        assert!(manager.write_pin_gate("dev", &pin).is_err());
+    }
+
+    // covers UP-06: a file written again while it settles starts the wait over.
+    #[tokio::test]
+    async fn rewriting_an_emptied_file_restarts_its_settling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kubeconfig");
+        let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://dev")).await;
+        manager.empty_settle = Duration::from_millis(200);
+
+        std::fs::write(&path, "").unwrap();
+        manager.reload_kubeconfig().await;
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        std::fs::write(&path, "\n").unwrap();
+        manager.reload_kubeconfig().await;
+        assert!(manager.cluster("dev").is_some(), "written again: it waits");
+    }
+
     fn make_fifo(path: &Path) {
         use std::os::unix::ffi::OsStrExt;
         let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
@@ -2375,17 +2598,8 @@ mod tests {
                 .open(&second)
                 .unwrap(),
         );
-        let internal = manager.internal_rx.as_mut().unwrap();
-        let late = tokio::time::timeout(Duration::from_secs(5), internal.recv())
-            .await
-            .expect("the late read asks for a reload");
-        assert!(matches!(
-            late,
-            Some(Internal::FilesChanged(Changed {
-                kubeconfig: true,
-                ..
-            }))
-        ));
+        let late = next_internal(&mut manager).await;
+        assert!(matches!(late, Internal::LateRead { .. }), "the late read");
         std::fs::remove_file(&second).unwrap();
         std::fs::write(&second, &yaml).unwrap();
         assert!(manager.reload_kubeconfig().await);

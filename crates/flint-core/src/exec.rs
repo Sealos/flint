@@ -1963,6 +1963,7 @@ mod tests {
                 defines: Vec::new(),
                 cluster_sources: Default::default(),
                 user_sources: Default::default(),
+                blank: Vec::new(),
             }
         }
 

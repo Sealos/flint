@@ -19,7 +19,7 @@ use futures::future::BoxFuture;
 use tokio::time::{Instant, Sleep};
 
 use crate::cluster::context_fingerprint;
-use crate::kubeconfig::LoadedKubeconfig;
+use crate::kubeconfig::{BlankFile, LoadedKubeconfig};
 use crate::settings::server_identity;
 
 /// How often a running session checks its context still points at the server it opened on.
@@ -182,6 +182,9 @@ pub(crate) struct ContextHistory {
     records: HashMap<String, Record>,
     /// The context names each file defined when it last loaded, shadowed ones included.
     defines: HashMap<PathBuf, HashSet<String>>,
+    /// The files that won a cluster or user entry when they last loaded: a file can give a
+    /// context its server or credentials without defining any context.
+    supplies: HashSet<PathBuf>,
     /// The last generation handed out; generations are unique across contexts.
     last: u64,
     /// The last load had a file it could not read, so a server shown may be a fallback.
@@ -210,6 +213,15 @@ impl ContextHistory {
             self.defines
                 .insert(path.clone(), names.iter().cloned().collect());
         }
+        self.supplies
+            .retain(|path| failed.contains(&path.as_path()));
+        self.supplies.extend(
+            loaded
+                .cluster_sources
+                .values()
+                .chain(loaded.user_sources.values())
+                .cloned(),
+        );
         // A failed file known to define `name` (shadowed, when it last loaded) may define it
         // still. A failed file that never loaded is unknown, and masks only by rank.
         let defines = &self.defines;
@@ -320,17 +332,23 @@ impl ContextHistory {
         }
     }
 
-    /// Counts each file in `blank` that defined contexts when it last loaded as failed in
-    /// `loaded`: a writer that truncates before it writes leaves such a file for a moment, and
-    /// what it defines is unknown until it has content again. A blank file that defined nothing
-    /// is an ordinary empty file.
-    pub fn fail_emptied(&self, loaded: &mut LoadedKubeconfig, blank: &[PathBuf]) {
-        for path in blank {
-            if self
+    /// Whether `path` gave the merge a context, or a winning cluster or user entry, when it last
+    /// loaded.
+    pub fn file_mattered(&self, path: &Path) -> bool {
+        self.supplies.contains(path)
+            || self
                 .defines
                 .get(path)
                 .is_some_and(|names| !names.is_empty())
-            {
+    }
+
+    /// Counts each file in `blank` that mattered when it last loaded as failed in `loaded`: a
+    /// writer that truncates before it writes leaves such a file for a moment, and what it
+    /// defines is unknown until it has content again. A blank file that gave nothing is an
+    /// ordinary empty file.
+    pub fn fail_emptied(&self, loaded: &mut LoadedKubeconfig, blank: &[BlankFile]) {
+        for BlankFile { path, .. } in blank {
+            if self.file_mattered(path) {
                 loaded.defines.retain(|(defined, _)| defined != path);
                 loaded
                     .errors
@@ -591,6 +609,33 @@ mod tests {
         assert!(!h.shown("nope", STAGING).confirmed);
     }
 
+    // covers UP-06: a file that gave only the winning user entry is not an ordinary empty file
+    // when it is truncated, so the later file's user is not taken for the definition.
+    #[test]
+    fn a_truncated_file_with_only_a_user_entry_counts_as_failed() {
+        let mut h = ContextHistory::default();
+        let mut first = load(&[("dev", STAGING, "b")], &[]);
+        first.contexts[0].user = Some("u".to_owned());
+        first
+            .user_sources
+            .insert("u".to_owned(), PathBuf::from("a"));
+        h.record(&first);
+        let pin = h.pin("dev", STAGING);
+
+        let mut next = load(&[("dev", STAGING, "b")], &[]);
+        next.contexts[0].user = Some("u".to_owned());
+        next.user_sources.insert("u".to_owned(), PathBuf::from("b"));
+        let blank = BlankFile {
+            path: PathBuf::from("a"),
+            stamp: None,
+        };
+        h.fail_emptied(&mut next, &[blank]);
+        assert_eq!(next.errors.len(), 1);
+        h.record(&next);
+        assert!(h.provisional("dev"));
+        assert!(!h.definition_holds("dev", &pin));
+    }
+
     const STAGING: Option<&str> = Some("https://staging");
     const PROD: Option<&str> = Some("https://prod");
 
@@ -638,6 +683,7 @@ mod tests {
             defines,
             cluster_sources: HashMap::new(),
             user_sources: HashMap::new(),
+            blank: Vec::new(),
         }
     }
 
