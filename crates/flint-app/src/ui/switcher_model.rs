@@ -993,8 +993,9 @@ mod tests {
         assert!(spent < Duration::from_secs(1), "{spent:?}");
     }
 
-    /// 50,000 objects across 40 kinds and 200 namespaces, named as real clusters name them.
-    fn large() -> Index {
+    /// `objects` objects across 40 kinds and 200 namespaces, named as real clusters name them.
+    fn large(objects: usize) -> Index {
+        let per_kind = objects / 40;
         let entries: Vec<NavEntry> = (0..40)
             .map(|k| {
                 entry(
@@ -1009,9 +1010,9 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(k, e)| {
-                let names: Vec<(String, String)> = (0..1250)
+                let names: Vec<(String, String)> = (0..per_kind)
                     .map(|i| {
-                        let n = k * 1250 + i;
+                        let n = k * per_kind + i;
                         (
                             format!("team-{}", n % 200),
                             format!("payments-api-{n:05x}-{}", n % 7),
@@ -1028,36 +1029,111 @@ mod tests {
         Index::new(&entries, &snapshots)
     }
 
-    // covers UP-31: typing a name letter by letter over 50,000 objects stays within a frame.
-    // About 16-23 ms per keystroke at worst in this unoptimized test build here. The limit is
-    // 100 ms, so a slow shared CI runner does not fail it, while a quadratic slowdown, a lost
-    // pre-check or an allocation per candidate (each several times slower here) still would.
-    #[test]
-    fn searching_fifty_thousand_objects_fits_in_a_frame() {
-        let index = large();
-        assert_eq!(index.objects, 50_000);
-        let query = "team-17/payments-api-00bc9";
-        let mut search = Search::default();
-        let mut slowest = Duration::ZERO;
-        for end in 1..=query.len() {
-            // The best of three, from the same state, so a busy machine's pauses do not count.
-            let before = search.clone();
-            let mut spent = Duration::MAX;
-            for _ in 0..3 {
-                let mut attempt = before.clone();
-                let start = Instant::now();
-                let found = attempt.run(&index, &query[..end]);
-                spent = spent.min(start.elapsed());
-                assert!(!found.hits.is_empty(), "{}", &query[..end]);
-                search = attempt;
-            }
-            slowest = slowest.max(spent);
+    /// Counts the allocations made on the current thread, so other tests running at once do
+    /// not change the count.
+    mod allocations {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static COUNT: Cell<u64> = const { Cell::new(0) };
         }
-        let found = search.run(&index, query);
+
+        struct Counting;
+
+        fn count() {
+            let _ = COUNT.try_with(|c| c.set(c.get() + 1));
+        }
+
+        // SAFETY: every call is passed unchanged to the system allocator.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                count();
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                count();
+                unsafe { System.alloc_zeroed(layout) }
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                count();
+                unsafe { System.realloc(ptr, layout, new_size) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+
+        #[global_allocator]
+        static ALLOCATOR: Counting = Counting;
+
+        /// What `f` returns, and how many allocations it made.
+        pub fn counted<T>(f: impl FnOnce() -> T) -> (T, u64) {
+            let before = COUNT.with(Cell::get);
+            let value = f();
+            (value, COUNT.with(Cell::get) - before)
+        }
+    }
+
+    /// A name typed letter by letter, the switcher's slowest ordinary use.
+    const TYPED: &str = "team-17/payments-api-00bc9";
+
+    // covers UP-31: a keystroke allocates for the results it lists, never per object searched.
+    // The count does not depend on how busy the machine is.
+    #[test]
+    fn typing_over_fifty_thousand_objects_allocates_per_result() {
+        let index = large(50_000);
+        assert_eq!(index.objects, 50_000);
+        let mut search = Search::default();
+        let mut most = 0;
+        for end in 1..=TYPED.len() {
+            let (found, made) = allocations::counted(|| search.run(&index, &TYPED[..end]));
+            assert!(!found.hits.is_empty(), "{}", &TYPED[..end]);
+            most = most.max(made);
+        }
+        let found = search.run(&index, TYPED);
         assert_eq!(
             &*index.items[found.hits[0].item as usize].text,
             "team-17/payments-api-00bc9-0"
         );
-        assert!(slowest < Duration::from_millis(100), "{slowest:?}");
+        // 462 here: a few for each listed result. One per object would be at least 50,000.
+        assert!(most <= RESULTS as u64 * 4, "{most} allocations");
+    }
+
+    /// The fastest of `rounds` more typings of [`TYPED`] over each index, kept in `best`.
+    fn time_typing(indexes: [&Index; 2], best: &mut [Duration; 2], rounds: usize) {
+        for _ in 0..rounds {
+            for (index, best) in indexes.into_iter().zip(best.iter_mut()) {
+                let mut search = Search::default();
+                let start = Instant::now();
+                for end in 1..=TYPED.len() {
+                    std::hint::black_box(search.run(index, &TYPED[..end]));
+                }
+                *best = (*best).min(start.elapsed());
+            }
+        }
+    }
+
+    // covers UP-31: four times the objects cost at most about four times the time (3.2 here).
+    // Both sizes are timed in turn and only each one's fastest run counts, so the ratio holds on
+    // a busy machine, where a fixed limit in milliseconds does not. A search quadratic in the
+    // objects would take about 16 times as long.
+    #[test]
+    fn typing_time_grows_linearly_with_the_objects() {
+        const LIMIT: u32 = 6;
+        let (small, big) = (large(4_000), large(16_000));
+        let mut best = [Duration::MAX; 2];
+        time_typing([&small, &big], &mut best, 5);
+        // Pauses only ever add time, so more rounds can clear a noisy result but not a real one.
+        for _ in 0..20 {
+            if best[1] < best[0] * LIMIT {
+                break;
+            }
+            time_typing([&small, &big], &mut best, 1);
+        }
+        assert!(best[1] < best[0] * LIMIT, "{best:?}");
     }
 }

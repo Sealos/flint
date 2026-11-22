@@ -1081,11 +1081,11 @@ async fn the_dock_toggles_and_remembers_its_height(cx: &mut TestAppContext) {
     // Taller than the 700 px window allows: the main area keeps its room.
     t.dispatch(cx, "workspace::SetDockHeight", json!({"height": 5000}))
         .unwrap();
-    assert_eq!(saved(cx), Some(540));
+    assert_eq!(saved(cx), Some(420));
     cx.wait_for(t.window, WAIT, |window, _| {
         window
             .try_find("dock-pane")
-            .is_some_and(|p| (f32::from(p.bounds().size.height) - 540.).abs() < 1.)
+            .is_some_and(|p| (f32::from(p.bounds().size.height) - 420.).abs() < 1.)
     })
     .await;
 
@@ -1094,14 +1094,14 @@ async fn the_dock_toggles_and_remembers_its_height(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let path = dir.path().join(flint_core::settings::STATE_FILE);
     cx.wait_for(t.window, WAIT, |_, _| {
-        std::fs::read_to_string(&path).is_ok_and(|s| s.contains("dock = 540"))
+        std::fs::read_to_string(&path).is_ok_and(|s| s.contains("dock = 420"))
     })
     .await;
     assert_eq!(
         crate::ui::ui_state::UiState::load(dir.path().to_owned())
             .panes()
             .dock,
-        Some(540)
+        Some(420)
     );
 
     t.focus_workspace(cx);
