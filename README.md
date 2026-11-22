@@ -152,12 +152,14 @@ Flint is in early development.
 
 - Your kubeconfig contexts in a sidebar; Flint connects to the one you select and checks its health.
 - Every kind the cluster serves, CRDs included, from the cluster's own discovery: live lists with the `kubectl get`
-  columns, a namespace and text filter, and a detail view with metadata, conditions, events and read-only YAML.
+  columns, a namespace and text filter, and a detail view with metadata, conditions, events and YAML.
+- YAML editing with a server dry-run and diff, plus delete, scale, rollout restart, cordon and drain, all behind the
+  cluster protection.
 - A bottom dock with pod and workload logs (follow, search, timestamps, previous logs, save to a file) and shells into
   containers. Open them from a row's context menu, the detail pane or the keyboard. Log tabs have matching-lines-only
   and errors-only (warnings and errors) filters, with adjustable context lines.
 - Protected clusters: every cluster not on your machine is read-only in Flint until you unlock it for the session
-  or trust it (the lock button in the sidebar, or the palette). Today that means shells; editing joins it.
+  or trust it (the lock button in the sidebar, or the palette). That covers shells, edits and resource actions.
 - A command palette (⇧⌘P) that runs any action by name and shows its shortcut (see [Keys](#keys)).
 - A resource switcher (⌘P) for the active cluster's kinds and cached objects, Go Back (⌘[) to return to the previous
   kind and object, and Tab and Shift-Tab to move focus between panes outside text fields and shells.
@@ -167,12 +169,14 @@ Flint is in early development.
 
 **Coming next:**
 
-- Editing: YAML with dry-run and diff; delete, scale, restart, cordon and drain, all behind the cluster protection.
-- Curated views for core kinds, CPU and memory from metrics-server, and cluster dashboards.
-- Port-forwarding and Helm releases.
-- Cluster sets, then problem alerts and guarded fleet actions across them.
-- A signed and notarized app with a Homebrew cask.
-- [Regex search](https://github.com/Sealos/flint/issues/309) and [log time ranges](https://github.com/Sealos/flint/issues/265).
+- **v0.5, see and watch many clusters:** cluster sets with combined views, problem alerts, comparing an object across
+  clusters, cluster dashboards, and CPU and memory from metrics-server.
+- **v0.7, change many clusters:** guarded fleet actions with explicit targets, a dry run per cluster, one cluster at a
+  time, and a stop at the first failure.
+- **v1.0, first public release:** a signed and notarized app with a Homebrew cask, port-forwarding, and read-only Helm
+  releases.
+- **Later:** curated views for core kinds, [regex search](https://github.com/Sealos/flint/issues/309) and
+  [log time ranges](https://github.com/Sealos/flint/issues/265).
 
 ## Install from a release
 
@@ -256,7 +260,8 @@ Security** and choose **Open Anyway**.
 
 Each release also has an AppImage for x86_64 and aarch64 (arm64). Linux support is best effort: CI builds and
 tests it, but it is not tested on every desktop and distribution ([ADR-0016](docs/adr/0016-linux-appimage.md)). It
-needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13 or later).
+needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13 or later). The AppImage is the Linux install; deb and
+rpm packages are planned after 1.0.
 
 ```sh
 gh release download -R Sealos/flint --pattern 'flint-*-linux-x86_64.AppImage*'   # or linux-aarch64

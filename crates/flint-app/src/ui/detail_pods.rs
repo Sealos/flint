@@ -90,6 +90,14 @@ impl DetailView {
         }
     }
 
+    /// Lists a failed list again soon. Only for a republish of the kind's rows, which is rare, so
+    /// a lasting error (RBAC) does not turn into polling.
+    pub(super) fn retry_failed_pods(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.pods, Pods::Failed(_)) {
+            self.relist_soon(cx);
+        }
+    }
+
     /// Lists the stale pods once [`RELIST_DELAY`] has passed, unless that is already due.
     fn relist_soon(&mut self, cx: &mut Context<Self>) {
         if self._relist.is_some() {

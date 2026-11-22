@@ -2,17 +2,22 @@
 //! that returns to the list and keeps the selection, and a confirmation stays fully usable at the
 //! minimum window size.
 
+use flint_core::{ConnectionState, Event, ServerVersion};
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
-    AppContext as _, Bounds, Context, InteractiveElement as _, IntoElement, Pixels, Render,
-    Styled as _, TestAppContext, VisualTestContext, Window, div, px, size,
+    AppContext as _, Bounds, Context, ElementId, InteractiveElement as _, IntoElement, Pixels,
+    Render, Styled as _, TestAppContext, VisualTestContext, Window, div, px, size,
 };
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::ui::confirm::{self, DialogText};
-use crate::ui::support_tests::{TestWorkspace, open_workspace};
+use crate::ui::support_tests::{
+    CURRENT_GENERATION, TestWorkspace, discovery, kubeconfig_yaml, open_workspace,
+    open_workspace_with, pods, standard_sections,
+};
 use crate::ui::view_state::Focus;
 
 const ROWS: &[(&str, &str, i64)] = &[("demo", "api", 0), ("demo", "web", 0)];
@@ -60,6 +65,39 @@ async fn detail_alone(cx: &mut TestAppContext, t: &TestWorkspace) {
     t.click(cx, "row-uid-web");
     draw(cx, t);
     assert!(t.detail(cx).is_some());
+}
+
+// UP-33: a long namespace in the filter is cut short in its button, so the watch mode button
+// next to it stays on screen at the minimum width with the detail alone.
+#[gpui_kit::test]
+async fn a_long_namespace_keeps_the_watch_mode_button_on_screen(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let long = "a-very-long-namespace-name-for-a-team-that-keeps-going-and-going-on";
+    detail_alone(cx, &t).await;
+    t.dispatch(
+        cx,
+        "workspace::ToggleNamespace",
+        serde_json::json!({ "namespace": long }),
+    )
+    .unwrap();
+    // The button's name and tooltip keep the whole namespace, while its text is cut short.
+    t.wait_for_label(cx, "namespace-filter-button", long).await;
+    draw(cx, &t);
+    let tooltip = t.description(cx, "namespace-filter-button");
+    assert!(
+        tooltip.is_some_and(|text| text.contains(long)),
+        "the tooltip names the whole namespace"
+    );
+    draw(cx, &t);
+    for id in ["namespace-filter-button", "watch-mode"] {
+        let at = bounds(cx, &t, id);
+        assert!(
+            at.origin.x >= px(0.) && at.right() <= px(760.),
+            "{id} is on screen: {at:?}"
+        );
+        assert!(at.size.width > px(40.), "{id} stays clickable: {at:?}");
+    }
 }
 
 // #421: below the breakpoint the detail replaces the list, and Back (a click) returns to the
@@ -536,6 +574,304 @@ async fn the_back_key_only_acts_on_the_detail_alone(cx: &mut TestAppContext) {
     t.press_key_of(cx, "workspace::BackToList");
     assert_eq!(focus(cx, &t), Focus::Detail, "focus stays where it was");
     assert!(!t.available(cx).contains(&"workspace::BackToList"));
+}
+
+// #433: at the minimum size a long object name gives way before the cluster, which stays whole.
+#[gpui_kit::test]
+async fn the_breadcrumb_keeps_the_cluster_at_the_minimum_size(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let long = "web-".repeat(60);
+    let rows = [("demo", long.as_str(), 0)];
+    t.open_pods(cx, &rows).await;
+    let cluster = ElementId::from(("crumb", 0usize));
+    let whole = crumb_width(cx, &t, &cluster);
+
+    resize(cx, &t, 760., 480.);
+    t.click(cx, ElementId::Name(format!("row-uid-{long}").into()));
+    draw(cx, &t);
+    assert!(shown(cx, &t, "detail-back"));
+
+    assert_eq!(t.label(cx, cluster.clone()).as_deref(), Some("kind-alpha"));
+    let narrow = crumb_width(cx, &t, &cluster);
+    assert_eq!(narrow, whole, "the cluster's name is not cut");
+}
+
+fn crumb_width(cx: &mut TestAppContext, t: &TestWorkspace, id: &ElementId) -> Pixels {
+    crumb_bounds(cx, t, id).size.width
+}
+
+fn crumb_bounds(cx: &mut TestAppContext, t: &TestWorkspace, id: &ElementId) -> Bounds<Pixels> {
+    let id = id.clone();
+    cx.update_window(t.window, |_, window, _| window.find(id).bounds())
+        .unwrap()
+}
+
+/// A workspace showing `kind-alpha` under the custom name `name`.
+async fn workspace_with_cluster_name(
+    cx: &mut TestAppContext,
+    dir: &std::path::Path,
+    name: &str,
+) -> TestWorkspace {
+    let settings = format!("[cluster_names]\nkind-alpha = \"{name}\"\n");
+    std::fs::write(dir.join("settings.toml"), settings).unwrap();
+    open_workspace(cx, dir).await
+}
+
+/// The cluster crumb's width with room for all of it.
+fn full_cluster_width(cx: &mut TestAppContext, t: &TestWorkspace) -> Pixels {
+    resize(cx, t, 2400., 900.);
+    crumb_width(cx, t, &ElementId::from(("crumb", 0usize)))
+}
+
+// #433: alone in the breadcrumb, a long cluster name uses the whole row.
+#[gpui_kit::test]
+async fn a_long_cluster_name_alone_shows_in_full(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let name = "prod-eu-1";
+    let t = workspace_with_cluster_name(cx, dir.path(), name).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    assert!(t.list(cx).is_none(), "the cluster is the only crumb");
+    let whole = full_cluster_width(cx, &t);
+
+    resize(cx, &t, 760., 480.);
+    let cluster = ElementId::from(("crumb", 0usize));
+    assert_eq!(t.label(cx, cluster.clone()).as_deref(), Some(name));
+    assert_eq!(crumb_width(cx, &t, &cluster), whole);
+}
+
+// #433: a long object name gives way before a long cluster name that fits.
+#[gpui_kit::test]
+async fn a_long_object_gives_way_before_a_long_cluster(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = workspace_with_cluster_name(cx, dir.path(), "production-eu").await;
+    let object = "web-".repeat(60);
+    let rows = [("demo", object.as_str(), 0)];
+    t.open_pods(cx, &rows).await;
+    let whole = full_cluster_width(cx, &t);
+
+    resize(cx, &t, 760., 480.);
+    t.click(cx, ElementId::Name(format!("row-uid-{object}").into()));
+    draw(cx, &t);
+    assert!(shown(cx, &t, "detail-back"));
+
+    let cluster = ElementId::from(("crumb", 0usize));
+    assert_eq!(crumb_width(cx, &t, &cluster), whole);
+    let shown_object = crumb_width(cx, &t, &ElementId::from(("crumb", 2usize)));
+    assert!(
+        shown_object < px(760.),
+        "the object is cut: {shown_object:?}"
+    );
+}
+
+/// A context name that stays wider than the header's first row once shortened to its display
+/// length: each of these characters is drawn twice as wide as a Latin capital in tests.
+const WIDE_CONTEXT: &str = "𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀𠀀";
+
+/// A workspace over the one context `context`, connected, with Pods open.
+async fn workspace_on_context(
+    cx: &mut TestAppContext,
+    dir: &std::path::Path,
+    context: &'static str,
+) -> TestWorkspace {
+    let t = open_workspace_with(cx, dir, |dir, servers| {
+        let kubeconfig = dir.join("kubeconfig");
+        let yaml = kubeconfig_yaml(&[(context, &servers.silent)]);
+        std::fs::write(&kubeconfig, yaml).unwrap();
+        vec![kubeconfig]
+    })
+    .await;
+    t.activate(cx, context).await;
+    t.wait_for_state(cx, context, |s| matches!(s, ConnectionState::Connecting))
+        .await;
+    t.feed(
+        cx,
+        Event::ConnectionChanged {
+            cluster: context.into(),
+            state: ConnectionState::Connected(ServerVersion {
+                git_version: "v1.33.1".into(),
+                platform: "linux/arm64".into(),
+            }),
+        },
+    );
+    t.feed(
+        cx,
+        Event::DiscoveryChanged {
+            cluster: context.into(),
+            generation: CURRENT_GENERATION,
+            discovery: Some(Arc::new(discovery(standard_sections()))),
+            error: None,
+        },
+    );
+    t.open_kind(cx, "pods", pods(ROWS)).await;
+    t
+}
+
+// #433: a cluster name wider than the first row is cut there, clear of Back and the controls.
+#[gpui_kit::test]
+async fn a_cluster_name_too_long_to_fit_truncates_inside_the_header(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = workspace_on_context(cx, dir.path(), WIDE_CONTEXT).await;
+    let whole = full_cluster_width(cx, &t);
+
+    resize(cx, &t, 760., 480.);
+    t.click(cx, "row-uid-web");
+    draw(cx, &t);
+    assert!(shown(cx, &t, "detail-back"));
+
+    let cluster = crumb_bounds(cx, &t, &ElementId::from(("crumb", 0usize)));
+    assert!(cluster.size.width < whole, "the name is cut");
+    let header = bounds(cx, &t, "main-header");
+    assert!(
+        cluster.right() <= header.right() - px(12.),
+        "{cluster:?} stays inside the row of {header:?}"
+    );
+    let back = bounds(cx, &t, "detail-back");
+    assert!(
+        cluster.left() >= back.right(),
+        "{cluster:?} clear of {back:?}"
+    );
+    for id in ["namespace-filter-button", "watch-mode"] {
+        let control = bounds(cx, &t, id);
+        assert!(
+            cluster.bottom() <= control.top(),
+            "{cluster:?} above {id}: {control:?}"
+        );
+    }
+}
+
+// #433: the longest custom name fits the first row whole, above the controls.
+#[gpui_kit::test]
+async fn the_longest_custom_name_shows_whole_above_the_controls(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let name = "W".repeat(flint_core::display::MAX_CUSTOM_NAME_CHARS);
+    let t = workspace_with_cluster_name(cx, dir.path(), &name).await;
+    t.open_pods(cx, ROWS).await;
+    let whole = full_cluster_width(cx, &t);
+
+    resize(cx, &t, 760., 480.);
+    t.click(cx, "row-uid-web");
+    draw(cx, &t);
+    assert!(shown(cx, &t, "detail-back"));
+
+    let cluster = crumb_bounds(cx, &t, &ElementId::from(("crumb", 0usize)));
+    assert_eq!(cluster.size.width, whole, "the name is not cut");
+    let controls = bounds(cx, &t, "namespace-filter-button");
+    assert!(
+        cluster.bottom() <= controls.top(),
+        "{cluster:?} above {controls:?}"
+    );
+}
+
+// #433: with the controls on the breadcrumb's row, a long cluster name is cut before them.
+#[gpui_kit::test]
+async fn a_long_cluster_name_stops_before_controls_on_its_row(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let name = "W".repeat(flint_core::display::MAX_CUSTOM_NAME_CHARS);
+    let t = workspace_with_cluster_name(cx, dir.path(), &name).await;
+    t.open_pods(cx, ROWS).await;
+    let whole = full_cluster_width(cx, &t);
+
+    resize(cx, &t, 760., 480.);
+    assert!(!shown(cx, &t, "main-header"), "the list keeps one row");
+    let cluster = crumb_bounds(cx, &t, &ElementId::from(("crumb", 0usize)));
+    assert!(cluster.size.width < whole, "the name is cut");
+    let controls = bounds(cx, &t, "namespace-filter-button");
+    assert!(
+        cluster.right() <= controls.left(),
+        "{cluster:?} runs into {controls:?}"
+    );
+}
+
+// #433: the controls on the second row still work through their registered actions.
+#[gpui_kit::test]
+async fn the_second_row_controls_work_by_their_actions(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    detail_alone(cx, &t).await;
+
+    t.dispatch(cx, "workspace::OpenNamespaceFilter", Value::Null)
+        .unwrap();
+    draw(cx, &t);
+    assert!(shown(cx, &t, "ns-all"), "the picker opens");
+    t.press(cx, "escape");
+    draw(cx, &t);
+    assert!(!shown(cx, &t, "ns-all"));
+    let focused = t
+        .find(cx, "namespace-filter-button")
+        .and_then(|button| button.focused());
+    assert_eq!(focused, Some(true), "focus returns to the button");
+
+    t.dispatch(cx, "workspace::WatchOpenViewsOnly", Value::Null)
+        .unwrap();
+    t.wait_for_label(cx, "watch-mode", "Live: open views only")
+        .await;
+}
+
+// #433: at the minimum size the detail-alone header moves its controls to a second row, inside
+// the window and above the detail.
+#[gpui_kit::test]
+async fn the_detail_alone_header_puts_its_controls_on_a_second_row(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    detail_alone(cx, &t).await;
+
+    let back = bounds(cx, &t, "detail-back");
+    let header = bounds(cx, &t, "main-header");
+    let detail = bounds(cx, &t, "detail-alone-pane");
+    for id in ["namespace-filter-button", "watch-mode"] {
+        let at = bounds(cx, &t, id);
+        assert!(at.top() >= back.bottom(), "{id} is below Back: {at:?}");
+        assert!(
+            at.left() >= px(0.) && at.right() <= px(760.) && at.bottom() <= px(480.),
+            "{id} is inside the window: {at:?}"
+        );
+        assert!(at.bottom() <= header.bottom(), "{id} is in the header");
+        assert!(at.bottom() <= detail.top(), "{at:?} above {detail:?}");
+    }
+    assert_eq!(detail.top(), header.bottom(), "the detail starts below it");
+    assert_eq!(detail.bottom(), px(480.), "the detail is not cut off");
+}
+
+// #433: with the dock at its tallest, the two-row header still leaves a failed detail its Retry.
+#[gpui_kit::test]
+async fn a_failed_detail_keeps_retry_above_a_tall_dock(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, ROWS).await;
+    t.click(cx, "row-uid-web");
+    draw(cx, &t);
+    let view = t.detail(cx).unwrap();
+    view.update(cx, |view, cx| {
+        view.show_failed("connection refused".into(), cx)
+    });
+    t.dispatch(cx, "dock::ToggleDock", Value::Null).unwrap();
+    // The tallest the dock gets at the minimum window height in the other layouts.
+    t.dispatch(
+        cx,
+        "workspace::SetDockHeight",
+        serde_json::json!({"height": 320}),
+    )
+    .unwrap();
+    resize(cx, &t, 760., 480.);
+    assert!(shown(cx, &t, "header-controls-row"));
+
+    let pane = bounds(cx, &t, "detail-alone-pane");
+    let dock = bounds(cx, &t, "dock-pane");
+    let retry = bounds(cx, &t, "detail-retry");
+    assert!(pane.size.height >= px(128.), "{pane:?}");
+    assert!(
+        retry.top() >= pane.top() && retry.bottom() <= pane.bottom(),
+        "{retry:?} inside {pane:?}"
+    );
+    assert!(retry.bottom() <= dock.top(), "{retry:?} above {dock:?}");
+
+    // The limit does not rewrite the saved height: the list's layout gets it back.
+    let saved = t.workspace.read_with(cx, |ws, _| ws.panes.dock);
+    assert_eq!(saved, Some(320));
+    t.click(cx, "detail-back");
+    draw(cx, &t);
+    assert_eq!(bounds(cx, &t, "dock-pane").size.height, px(320.));
 }
 
 // #421: the main window cannot be made smaller than the layout supports.

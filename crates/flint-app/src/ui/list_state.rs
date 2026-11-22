@@ -112,6 +112,7 @@ impl ResourceList {
             {
                 Some("reconnecting")
             }
+            _ if self.restoring_filter => Some("loading"),
             _ if self.rows.is_empty() => {
                 let filtered = !self.query.text.trim().is_empty()
                     || (snapshot.namespaced && !self.query.namespaces.is_empty());
