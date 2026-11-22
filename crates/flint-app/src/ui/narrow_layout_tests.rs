@@ -12,8 +12,9 @@ use serde_json::Value;
 use std::time::Duration;
 
 use crate::ui::confirm::{self, DialogText};
-use crate::ui::support_tests::{TestWorkspace, open_workspace};
+use crate::ui::support_tests::{TestWorkspace, objects, open_workspace};
 use crate::ui::view_state::Focus;
+use flint_core::{KindId, SyncState};
 
 const ROWS: &[(&str, &str, i64)] = &[("demo", "api", 0), ("demo", "web", 0)];
 
@@ -484,6 +485,35 @@ fn the_main_window_has_a_minimum_size(cx: &mut TestAppContext) {
     let bounds = Bounds::default();
     let options = cx.update(|_| crate::ui::window_options(bounds));
     assert_eq!(options.window_min_size, Some(size(px(760.), px(480.))));
+}
+
+// #424: with the dock at its tallest, a long reconnect notice still leaves rows under the headers.
+#[gpui_kit::test]
+async fn a_long_notice_leaves_rows_beside_a_tall_dock(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, ROWS).await;
+    t.dispatch(cx, "dock::ToggleDock", Value::Null).unwrap();
+    t.dispatch(
+        cx,
+        "workspace::SetDockHeight",
+        serde_json::json!({"height": 5000}),
+    )
+    .unwrap();
+    resize(cx, &t, 760., 480.);
+    let error = "connection refused by the API server, is it running ".repeat(16);
+    let state = SyncState::Reconnecting { error: Some(error) };
+    t.feed_list(cx, objects(KindId::pods(), ROWS, state, 2))
+        .await;
+    draw(cx, &t);
+
+    let dock = bounds(cx, &t, "dock-pane");
+    let banner = bounds(cx, &t, "list-banner");
+    assert!(banner.bottom() <= dock.top(), "{banner:?} above {dock:?}");
+    assert!(shown(cx, &t, "row-uid-api"), "a row is drawn");
+    let row = bounds(cx, &t, "row-uid-api");
+    assert!(row.top() >= banner.bottom(), "{row:?} under {banner:?}");
+    assert!(row.bottom() <= dock.top(), "{row:?} above {dock:?}");
 }
 
 // #424: a long reason under the detail's header wraps instead of ending mid-word.

@@ -31,7 +31,7 @@ use super::list::tabular_figures;
 use super::log_view::LogRequest;
 use super::menu_fit::{fit_picker, picker_item};
 use super::menu_record;
-use super::notice::{MAX_NOTICE_LINES, notice, notice_detail, notice_with};
+use super::notice::{clamped, notice, notice_detail, notice_with};
 use super::object::{self, MASK, Overview, PodContainer, SecretValue};
 use super::registry::{
     self, ApplyYamlEdit, BackToYamlEdit, CancelYamlEdit, Close, EditYaml, OpenContainerLogs,
@@ -1009,10 +1009,9 @@ impl DetailView {
                 .text_color(theme.muted_foreground)
                 .children(captions.into_iter().enumerate().map(|(ix, text)| {
                     let full: SharedString = text.clone().into();
-                    div()
+                    clamped(div())
                         .id(("detail-caption", ix))
                         .min_w_0()
-                        .line_clamp(MAX_NOTICE_LINES)
                         .child(text.clone())
                         .test_text(text)
                         .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
