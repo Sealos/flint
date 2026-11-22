@@ -14,6 +14,7 @@ pub mod cache;
 pub mod cluster;
 mod connection;
 mod credential;
+pub mod dashboard;
 pub mod discovery;
 pub mod display;
 pub mod env_path;
