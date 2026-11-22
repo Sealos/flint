@@ -101,6 +101,37 @@ async fn a_long_namespace_keeps_the_watch_mode_button_on_screen(cx: &mut TestApp
     }
 }
 
+/// Asserts the header's access mode and controls are whole and inside the window's width.
+#[track_caller]
+fn assert_header_on_screen(cx: &mut TestAppContext, t: &TestWorkspace) {
+    draw(cx, t);
+    for id in ["access-mode", "namespace-filter-button", "watch-mode"] {
+        let at = bounds(cx, t, id);
+        assert!(
+            at.origin.x >= px(0.) && at.right() <= px(760.),
+            "{id} is on screen: {at:?}"
+        );
+    }
+    let mode = bounds(cx, t, "access-mode");
+    let filter = bounds(cx, t, "namespace-filter-button");
+    assert!(
+        mode.right() <= filter.origin.x || mode.bottom() <= filter.origin.y,
+        "the access mode and the filter do not overlap: {mode:?} {filter:?}"
+    );
+}
+
+// #432: the access mode stays on screen at the minimum width, over the list and the detail.
+#[gpui_kit::test]
+async fn the_access_mode_fits_the_minimum_width(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 0)]).await;
+    resize(cx, &t, 760., 480.);
+    assert_header_on_screen(cx, &t);
+    detail_alone(cx, &t).await;
+    assert_header_on_screen(cx, &t);
+}
+
 // #421: below the breakpoint the detail replaces the list, and Back (a click) returns to the
 // list with the row still selected and the detail still open behind it.
 #[gpui_kit::test]
@@ -806,11 +837,12 @@ async fn a_long_cluster_name_stops_before_controls_on_its_row(cx: &mut TestAppCo
     t.open_pods(cx, ROWS).await;
     let whole = full_cluster_width(cx, &t);
 
-    resize(cx, &t, 760., 480.);
+    // Just wide enough for one row.
+    resize(cx, &t, 1062., 480.);
     assert!(!shown(cx, &t, "main-header"), "the list keeps one row");
     let cluster = crumb_bounds(cx, &t, &ElementId::from(("crumb", 0usize)));
     assert!(cluster.size.width < whole, "the name is cut");
-    let controls = bounds(cx, &t, "namespace-filter-button");
+    let controls = bounds(cx, &t, "access-mode");
     assert!(
         cluster.right() <= controls.left(),
         "{cluster:?} runs into {controls:?}"

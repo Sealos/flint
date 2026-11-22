@@ -65,10 +65,11 @@ use flint_core::settings::ClusterTag;
 /// The height of the main area's header and the list's toolbar.
 pub const HEADER_HEIGHT: f32 = 32.;
 
-/// Below this main area width the detail-alone header puts its namespace and watch controls on a
-/// second row. Fixed, so the layout does not change with label lengths while resizing: it holds
-/// the padding, Back, the longest labels of both controls, and a shortened context name.
-const HEADER_ONE_ROW_MIN_WIDTH: f32 = 590.;
+/// Below this main area width the header puts its access mode, namespace and watch controls on a
+/// second row, in their short forms. Fixed, so the layout does not change with label lengths
+/// while resizing: it holds the padding, Back, the longest labels of the three, and a shortened
+/// context name.
+const HEADER_ONE_ROW_MIN_WIDTH: f32 = 640.;
 
 /// The panes the user can resize by dragging their edge, with default and limit widths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1764,7 +1765,7 @@ impl Workspace {
             .then(|| self.render_namespace_filter(&ns_summary, cx));
         let watch_mode = controls
             .watch_mode
-            .then(|| self.render_watch_mode(&name, cx));
+            .then(|| self.render_watch_mode(&name, two_rows, cx));
         let first_row = h_flex()
             .h(px(HEADER_HEIGHT))
             .flex_none()
@@ -1788,6 +1789,7 @@ impl Workspace {
                 )
             })
             .child(breadcrumb);
+        let access_mode = self.render_access_mode(cluster, two_rows, theme, cx);
         if two_rows {
             v_flex()
                 .id("main-header")
@@ -1805,6 +1807,7 @@ impl Workspace {
                         .px_3()
                         .gap_2()
                         .justify_end()
+                        .child(access_mode)
                         .children(namespaces)
                         .children(watch_mode)
                         .test_support(),
@@ -1815,10 +1818,58 @@ impl Workspace {
             first_row
                 .border_b_1()
                 .border_color(theme.border)
+                .child(access_mode)
                 .children(namespaces)
                 .children(watch_mode)
                 .into_any_element()
         }
+    }
+
+    /// The active cluster's access mode, in words, from the same check the sidebar's lock shows.
+    /// Modes that allow writes get a filled, bold badge. Changing the mode stays on the lock.
+    /// `compact` shortens the words drawn; the accessible name and tooltip keep the whole mode.
+    fn render_access_mode(
+        &self,
+        cluster: &ClusterSummary,
+        compact: bool,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let model = self.model.read(cx);
+        let protection = model.protection(cluster);
+        let tip = protection_text(protection, &model.trust(cluster));
+        let text = access_mode_text(protection);
+        let (icon, writable) = match protection {
+            Protection::Protected => (FlintIcon::Lock, false),
+            Protection::Local | Protection::Unlocked => (FlintIcon::LockOpen, true),
+            Protection::Trusted => (FlintIcon::ShieldCheck, true),
+        };
+        let color = if writable {
+            theme.warning
+        } else {
+            theme.muted_foreground
+        };
+        h_flex()
+            .id("access-mode")
+            .aria_label(text)
+            .test_support()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .px_1p5()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(color.opacity(if writable { 0.7 } else { 0.3 }))
+            .when(writable, |el| el.bg(color.opacity(0.12)).font_semibold())
+            .text_xs()
+            .text_color(color)
+            .child(Icon::new(icon).xsmall())
+            .child(match (compact, writable) {
+                (false, _) => text,
+                (true, false) => "Read-only",
+                (true, true) => "Writable",
+            })
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
     }
 
     fn render_namespace_filter(&self, summary: &str, cx: &Context<Self>) -> impl IntoElement {
@@ -2018,7 +2069,13 @@ impl Workspace {
     }
 
     /// The watch mode switch: this cluster's override, and the global default (ADR-0008).
-    fn render_watch_mode(&self, cluster: &str, cx: &Context<Self>) -> impl IntoElement {
+    /// `compact` draws a short label; the accessible name and tooltip keep the whole mode.
+    fn render_watch_mode(
+        &self,
+        cluster: &str,
+        compact: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let settings = self.model.read(cx).settings.clone();
         let effective = settings.watch_mode_for(cluster);
         let label = watch_mode_label(effective);
@@ -2028,10 +2085,17 @@ impl Workspace {
         Button::new("watch-mode")
             .xsmall()
             .ghost()
-            .label(label)
+            .label(if compact {
+                watch_mode_short_label(effective)
+            } else {
+                label
+            })
+            .accessibility_label(label)
             .disabled(!settings_ok)
             .tab_stop(false)
-            .tooltip("Which kinds Flint keeps live (watches) on this cluster")
+            .tooltip(format!(
+                "{label}\nWhich kinds Flint keeps live (watches) on this cluster"
+            ))
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, cx| {
                 let settings = model.read(cx).settings.clone();
                 let own = settings.cluster_watch_mode.get(&cluster).copied();
@@ -2084,9 +2148,13 @@ impl Workspace {
 
     /// Whether the main header puts its controls on a second row in a window this wide.
     fn header_has_two_rows(&self, window_width: f32, cx: &App) -> bool {
+        header_needs_two_rows(self.main_width(window_width, cx))
+    }
+
+    /// The main area's width in a window this wide.
+    fn main_width(&self, window_width: f32, cx: &App) -> f32 {
         let widths = self.layout(window_width, cx);
-        let main_width = window_width - widths.clusters - widths.navigation;
-        self.main_panes(cx) == MainPanes::DetailAlone && header_needs_two_rows(main_width)
+        window_width - widths.clusters - widths.navigation
     }
 
     /// What the main area shows of the list and the open detail. A failed connection shows
@@ -2345,6 +2413,16 @@ fn control_name(title: &str, context: &str) -> String {
         shown
     } else {
         format!("{shown} (context {context:?})")
+    }
+}
+
+/// The header's words for a cluster's access mode.
+fn access_mode_text(protection: Protection) -> &'static str {
+    match protection {
+        Protection::Protected => "Read-only",
+        Protection::Local => "Local: writable",
+        Protection::Unlocked => "Unlocked: writable",
+        Protection::Trusted => "Trusted: writable",
     }
 }
 
@@ -2946,6 +3024,14 @@ fn watch_mode_label(mode: WatchMode) -> &'static str {
     match mode {
         WatchMode::All => "Live: all kinds",
         WatchMode::OnView => "Live: open views only",
+    }
+}
+
+/// The watch mode button's label on a narrow header's second row.
+fn watch_mode_short_label(mode: WatchMode) -> &'static str {
+    match mode {
+        WatchMode::All => "Live: all",
+        WatchMode::OnView => "Live: open",
     }
 }
 

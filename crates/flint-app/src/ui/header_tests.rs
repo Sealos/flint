@@ -245,6 +245,38 @@ async fn the_watch_mode_follows_the_menu_and_persists(cx: &mut TestAppContext) {
     assert!(saved.cluster_watch_mode.is_empty());
 }
 
+// #432: the header says the access mode in words, from the model's protection, and follows it.
+#[gpui_kit::test]
+async fn the_header_names_the_access_mode(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    let shown = t.label(cx, "access-mode");
+    let protection = t
+        .model
+        .read_with(cx, |m, _| m.protection(m.active_cluster().unwrap()).name());
+    let expected = match protection {
+        "protected" => "Read-only",
+        "local" => "Local: writable",
+        "unlocked" => "Unlocked: writable",
+        "trusted" => "Trusted: writable",
+        other => panic!("unknown protection {other}"),
+    };
+    assert_eq!(shown.as_deref(), Some(expected));
+
+    // Another server, so no longer a local cluster: the label follows the real state.
+    t.model.update(cx, |model, cx| {
+        let alpha = model
+            .clusters
+            .iter_mut()
+            .find(|c| c.info.name == "kind-alpha")
+            .unwrap();
+        alpha.info.server = Some("https://203.0.113.10:6443".into());
+        cx.notify();
+    });
+    t.wait_for_label(cx, "access-mode", "Read-only").await;
+}
+
 /// The workspace on the pods list, with `demo` in the filter so the picker has a namespace row.
 async fn open_with_picker_rows(cx: &mut TestAppContext, dir: &std::path::Path) -> TestWorkspace {
     let t = open_workspace(cx, dir).await;
