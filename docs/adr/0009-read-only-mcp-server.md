@@ -19,7 +19,10 @@ own chat UI or hold LLM API keys. The user brings their own agent.
 ## Consequences
 
 The MCP process and the app share `settings.toml`. The MCP server reads the opt-in list again on every call, so
-toggling a cluster in the app takes effect immediately. Any future write tool needs its own ADR.
+toggling a cluster in the app takes effect immediately.
+
+The tool set is frozen at six read-only tools: `list_clusters`, `list_resource_kinds`, `list_resources`,
+`get_resource`, `get_events` and `get_pod_logs`. Any new tool, read or write, needs its own ADR.
 
 An exposure is stored as context name plus API server URL, not as a name alone. A context name can point to a
 different cluster in another `KUBECONFIG`, or after it is re-pointed (for example with

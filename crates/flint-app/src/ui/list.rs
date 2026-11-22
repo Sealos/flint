@@ -134,6 +134,13 @@ pub struct ResourceList {
     /// Down left the filter while its rows were being computed: select the first row in this
     /// window once they are current, if the rows still have focus.
     select_first_in: Option<AnyWindowHandle>,
+    /// Go Back set the filter's text: rows computed for any other text are dropped, not drawn,
+    /// until rows for it arrive ([`ResourceList::restore_filter`]).
+    restoring_filter: bool,
+    /// The text the rows drawn were computed for; `query.text` runs ahead of it while typing.
+    rows_text: String,
+    /// The selected object, when the rows drawn exist without it: the filters exclude it.
+    hidden_selected: Option<Box<str>>,
     /// The namespace or text filter changed: the next measurement starts the column widths
     /// over, so they fit the rows now shown. Live updates under the same filters only grow them.
     remeasure: bool,
@@ -220,7 +227,8 @@ impl ResourceList {
                 }
             }
         });
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter by name, label…"));
+        let filter =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter by name, label, managed…"));
         let on_filter = cx.subscribe_in(&filter, window, |this, input, event, _, cx| {
             if let InputEvent::Change = event {
                 this.query.text = input.read(cx).value().to_string();
@@ -258,6 +266,9 @@ impl ResourceList {
             computing: false,
             dirty: false,
             select_first_in: None,
+            restoring_filter: false,
+            rows_text: String::new(),
+            hidden_selected: None,
             remeasure: false,
             scoped: 0,
             scroll: UniformListScrollHandle::new(),
@@ -496,6 +507,7 @@ impl ResourceList {
         self.computing = true;
         self.dirty = false;
         let snapshot = self.latest.clone();
+        let job_text = self.query.text.clone();
         let query = ViewQuery {
             namespaces: self.query.namespaces.clone(),
             text: self.query.text.clone(),
@@ -546,11 +558,13 @@ impl ResourceList {
                     list.query.sort.as_ref(),
                     &list.sortable_in(&snapshot.columns),
                 );
-                if now != job_sort {
+                if now != job_sort || (list.restoring_filter && job_text != list.query.text) {
                     list.remeasure |= restart;
                     list.recompute(cx);
                     return None;
                 }
+                list.restoring_filter = false;
+                list.rows_text = job_text;
                 list.widths.update(&snapshot.columns, &widths, restart);
                 list.scoped = scoped;
                 list.rows_in_one_namespace = one_namespace;
@@ -604,6 +618,9 @@ impl ResourceList {
                 let found = find_row(&self.shown, selected.namespace.as_deref(), &selected.name)
                     .map(|i| &self.shown.rows[i])
                     .filter(|row| row.uid == selected.uid);
+                self.hidden_selected = found
+                    .filter(|_| position.is_none())
+                    .map(|row| row.uid.clone());
                 match found {
                     Some(row) => {
                         self.selected_gone = false;
@@ -873,7 +890,7 @@ impl ResourceList {
                 } = list_model::CellStyle::of(
                     column,
                     || cell_text(row, col, now),
-                    width,
+                    list_model::text_width(column, row, secrets, width),
                     list_model::RowFlags {
                         masked: is_masked_column(secrets, &self.shown.columns, col),
                         ..flags
@@ -912,6 +929,9 @@ impl ResourceList {
                             .child(shown.clone())
                             .test_text(shown),
                     )
+                    .when(column.role == ColumnRole::Name, |el| {
+                        el.children(managed::marker(row, secrets, theme))
+                    })
                     .when_some(tooltip, |el, text| {
                         el.tooltip(move |window, cx| {
                             #[cfg(test)]
@@ -1175,6 +1195,25 @@ impl ResourceList {
                 Some(error.clone()),
                 theme.warning,
             )),
+            _ if self.restoring_filter => Some(
+                h_flex()
+                    .id("list-placeholder")
+                    .size_full()
+                    .justify_center()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(Spinner::new().small())
+                    .child(
+                        div()
+                            .id("list-filtering")
+                            .child(format!("Filtering {label}…"))
+                            .test_support(),
+                    )
+                    .test_support()
+                    .into_any_element(),
+            ),
             _ if self.rows.is_empty() => {
                 let filtered = !self.query.text.trim().is_empty()
                     || (self.namespaced && !self.query.namespaces.is_empty());
@@ -1228,20 +1267,33 @@ impl ResourceList {
         }
     }
 
-    /// What the list says when the selected object's namespace is outside the namespace
-    /// filter (opened from the resource switcher): its row is hidden, its details show.
+    /// What the list says when a filter hides the selected object's row and its details still
+    /// show: its namespace is outside the namespace filter (opened from the resource switcher),
+    /// or the rows computed for the current text exclude it.
     pub(in crate::ui) fn filtered_out_text(&self) -> Option<String> {
         let selected = self.selected.as_ref()?;
-        let namespace = selected.namespace.as_deref()?;
         let filter = &self.query.namespaces;
-        if !self.namespaced || filter.is_empty() || filter.iter().any(|n| n == namespace) {
-            return None;
+        if let Some(namespace) = selected.namespace.as_deref()
+            && self.namespaced
+            && !filter.is_empty()
+            && !filter.iter().any(|n| n == namespace)
+        {
+            return Some(format!(
+                "{} is in namespace {namespace}, outside the namespace filter, so its row is \
+                 hidden; its details are shown.",
+                selected.name
+            ));
         }
-        Some(format!(
-            "{} is in namespace {namespace}, outside the namespace filter, so its row is hidden; \
-             its details are shown.",
-            selected.name
-        ))
+        let hidden_by_text = !self.restoring_filter
+            && !self.query.text.trim().is_empty()
+            && self.rows_text == self.query.text
+            && self.hidden_selected.as_deref() == Some(&*selected.uid);
+        hidden_by_text.then(|| {
+            format!(
+                "{} does not match the text filter, so its row is hidden; its details are shown.",
+                selected.name
+            )
+        })
     }
 
     /// Banners over the rows: an object asked for that is gone, or whose row the namespace
@@ -1538,6 +1590,9 @@ impl Render for ResourceList {
 
 #[path = "list_actions.rs"]
 mod actions;
+
+#[path = "list_managed.rs"]
+mod managed;
 
 #[cfg(any(test, feature = "automation"))]
 #[path = "list_state.rs"]
