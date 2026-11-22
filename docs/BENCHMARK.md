@@ -16,10 +16,13 @@ What the test does:
    show every pod and to be `live` (synced, watching).
 3. The app's resident set size (`ps -o rss`, KiB) is read at that point: `rss_before_burst_kib`. `list_opened_ms`
    is the time from opening the view to a live list of all pods, with the app already running and connected.
-4. The server force-deletes 200 pods. The test records every round trip from a delete to the list showing the new
-   count (p50, p99, max) and samples RSS every 50 ms (`rss_peak_during_burst_kib`).
+4. The server force-deletes 200 pods. While that runs, the test polls the app's automation `state` and times each
+   poll (`round_trip_p50_us`, `round_trip_p99_us`, `round_trip_max_us`). These are how long the app takes to
+   answer a `state` request during the burst, that is, how responsive it stays. They are not how long a delete
+   takes to reach the list. The time from the first delete until the list shows the new count is `converged_ms`.
+   RSS is sampled every 50 ms (`rss_peak_during_burst_kib`).
 
-It fails only when a round trip passes the live-list latency bound in `docs/TESTING.md`; memory is recorded, not
+It fails only when a `state` poll passes the live-list latency bound in `docs/TESTING.md`; memory is recorded, not
 gated.
 
 Isolation: only the fake API server is used. The script sets `KUBECONFIG=/dev/null` and exits when the caller's
@@ -33,7 +36,7 @@ scripts/benchmark.sh [--profile debug|optimized] [result.json]
 - `optimized` is the default. The automation channel the test needs refuses `--release` at compile time, so this
   builds the dev profile with opt-level 3 and no debug info into `target/benchmark`. It is the closest build to
   a shipped one that the harness can drive. Debug assertions and the automation channel stay compiled in, so
-  treat its memory as an upper bound for a release build, not as the release figure.
+  its memory is an optimized-dev measurement, not a release figure. Release RSS is not measured (see below).
 
 Requirements: macOS with a GUI session (the test opens a window), `jq`, a Rust toolchain.
 
@@ -43,12 +46,13 @@ Each row is one run of `scripts/benchmark.sh --profile optimized`, commit `dcdf1
 (clean tree), Apple M4 Pro, 48 GiB, macOS 27.0.1, rustc 1.100.0. The fake API is on the same machine, so
 network latency is zero. 10,017 pods = the 10,000 generated plus the 17 in the fixtures.
 
-| Run | Pods | RSS live list (MiB) | RSS peak in burst (MiB) | List opened (ms) | Delete round trip p50 / max (ms) |
+| Run | Pods | RSS live list (MiB) | RSS peak in burst (MiB) | List opened (ms) | `state` poll p50 / max during burst (ms) |
 | --- | --- | --- | --- | --- | --- |
 | 1 | 10,017 | 137.8 | 137.9 | 227 | 4.6 / 6.0 |
 | 2 | 10,017 | 137.1 | 137.3 | 388 | 5.4 / 7.5 |
 
-Only 12 round trips were sampled per run, so the p50 and max are coarse. RSS is the whole app (window, GPUI,
+Only 12 `state` polls were timed per run, so the p50 and max are coarse. These runs' `converged_ms` was not
+recorded, so no delete-to-list time is reported here. RSS is the whole app (window, GPUI,
 discovery of 74 kinds) with one list open, not the list's own cost.
 
 ## Not measured
@@ -56,6 +60,7 @@ discovery of 74 kinds) with one list open, not the list's own cost.
 The issue (#276) asks for more than the existing test provides. None of this has been run, so none of it is
 claimed:
 
+- **Release-build RSS.** The harness cannot drive a `--release` build, so only the optimized-dev figures above exist.
 - **1,000 and 5,000 pods.** The pod count is a constant in the test. Adding sizes needs a change in
   `crates/flint-e2e/tests/app/load.rs`.
 - **RSS after 30 minutes with logs following.** The test is a short burst. A soak needs a log-following step in

@@ -19,6 +19,7 @@ set -euo pipefail
 
 profile=optimized
 out=
+caller=$PWD
 while [ $# -gt 0 ]; do
   case $1 in
     --profile) profile=${2:-}; shift 2 ;;
@@ -38,6 +39,9 @@ if [ "$(uname -s)" != Darwin ]; then
   exit 1
 fi
 
+# A relative output path is the caller's, not the repository's.
+case $out in '' | /*) ;; *) out=$caller/$out ;; esac
+
 repo=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo"
 commit=$(git rev-parse HEAD)
@@ -49,14 +53,30 @@ if [ "$profile" = optimized ]; then
   export CARGO_PROFILE_DEV_OPT_LEVEL=3
   export CARGO_PROFILE_DEV_DEBUG=0
 fi
-target=${CARGO_TARGET_DIR:-$repo/target}
 
-cargo build -p flint-app --features automation --bin flint --locked
+# The executable cargo reports, as crates/flint-e2e/src/binaries.rs does: a configured target
+# directory or build target changes where it lands, so no path is assumed.
+messages=$(cargo build -p flint-app --features automation --bin flint --locked \
+  --message-format=json-render-diagnostics)
+app_bin=$(printf '%s\n' "$messages" | jq -rR 'fromjson? | select(.reason == "compiler-artifact"
+  and .target.name == "flint" and .executable != null) | .executable' | tail -n 1)
+if [ -z "$app_bin" ] || [ ! -f "$app_bin" ]; then
+  echo "error: cargo built no flint executable" >&2
+  exit 1
+fi
+
 raw=$(mktemp)
 trap 'rm -f "$raw"' EXIT
-FLINT_E2E_APP_BIN="$target/debug/flint" FLINT_E2E_LOAD_REPORT="$raw" \
+# A failing load test still writes its report (with the failure in it); keep that report and
+# return the test's status after it is packaged.
+status=0
+FLINT_E2E_APP_BIN="$app_bin" FLINT_E2E_LOAD_REPORT="$raw" \
   cargo test -p flint-e2e --test app --locked -- \
-  --ignored --exact load::up_26_large_list_stays_responsive --nocapture
+  --ignored --exact load::up_26_large_list_stays_responsive --nocapture || status=$?
+if [ ! -s "$raw" ]; then
+  echo "error: the load test wrote no report (exit status $status)" >&2
+  exit $((status == 0 ? 1 : status))
+fi
 
 result=$(jq -n --slurpfile load "$raw" \
   --arg commit "$commit" --argjson dirty "$dirty" --arg profile "$profile" \
@@ -71,3 +91,4 @@ if [ -n "$out" ]; then
   printf '%s\n' "$result" >"$out"
 fi
 printf '%s\n' "$result"
+exit "$status"
