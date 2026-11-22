@@ -1662,12 +1662,11 @@ impl Render for ResourceList {
     }
 }
 
+/// Pressing a row for its menu, at a window position.
+type RowPress = Rc<dyn Fn(Point<Pixels>, &mut Window, &mut App)>;
+
 /// What pressing a row for its menu does: selects the row, then opens the menu on it.
-fn row_press(
-    select: SelectRow,
-    uid: String,
-    list: WeakEntity<ResourceList>,
-) -> Rc<dyn Fn(Point<Pixels>, &mut Window, &mut App)> {
+fn row_press(select: SelectRow, uid: String, list: WeakEntity<ResourceList>) -> RowPress {
     let select = registry::on_click::<(), _>(select);
     Rc::new(move |position, window, cx| {
         select(&(), window, cx);
@@ -1678,7 +1677,7 @@ fn row_press(
 }
 
 /// A finger has no right button: a long press on the row opens its menu too.
-fn long_press_area(press: Rc<dyn Fn(Point<Pixels>, &mut Window, &mut App)>) -> impl IntoElement {
+fn long_press_area(press: RowPress) -> impl IntoElement {
     canvas(
         |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
         move |_, hitbox, window, _| {
