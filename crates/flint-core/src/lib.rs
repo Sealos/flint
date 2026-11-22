@@ -38,6 +38,7 @@ pub mod redact;
 pub mod settings;
 pub mod store;
 pub mod table;
+pub mod telemetry;
 pub mod terminal;
 pub mod thresholds;
 pub mod view;
