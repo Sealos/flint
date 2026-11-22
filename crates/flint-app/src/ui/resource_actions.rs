@@ -546,10 +546,12 @@ pub(in crate::ui) fn show_drain_report(window: &mut Window, cx: &mut App) {
 /// Across clusters a name says which.
 fn draining_text(keys: &[&WriteKey]) -> Option<String> {
     let across = keys.windows(2).any(|w| w[0].cluster != w[1].cluster);
+    // The whole context: a label worked out from the running drains alone could be the one
+    // the sidebar gives another cluster.
     let name = |key: &&WriteKey| match across {
         true => format!(
             "{}/{}",
-            flint_core::display::short_name(&key.cluster),
+            flint_core::display::single_line(&key.cluster),
             key.name
         ),
         false => key.name.clone(),
@@ -1268,6 +1270,33 @@ mod tests {
         assert_eq!(
             draining_text(&[&a, &other]).unwrap(),
             "Draining 2 nodes: x/a, y/a…"
+        );
+    }
+
+    // covers UP-53: clusters alike at both ends read differently on the strip.
+    #[test]
+    fn the_strip_tells_similar_clusters_apart() {
+        let nodes = KindId::new("", "nodes");
+        let blue = WriteKey::new(
+            "team-platform-production-blue-cluster-main",
+            &nodes,
+            None,
+            "a",
+        );
+        let green = WriteKey::new(
+            "team-platform-production-green-cluster-main",
+            &nodes,
+            None,
+            "a",
+        );
+        let text = draining_text(&[&blue, &green]).unwrap();
+        assert!(
+            text.contains("team-platform-production-blue-cluster-main/a"),
+            "{text}"
+        );
+        assert!(
+            text.contains("team-platform-production-green-cluster-main/a"),
+            "{text}"
         );
     }
 
