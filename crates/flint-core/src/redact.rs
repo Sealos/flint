@@ -126,31 +126,84 @@ pub fn mask_secret(object: &mut Value, marker: &str) {
     }
 }
 
-/// Replaces every double-quoted and backquoted string in `text` with `"…"`. Parse errors can
-/// quote a value from the file they read ("invalid type: string \"...\"", "unknown variant
-/// `...`"), which may be a credential.
+/// Replaces every quoted string in `text` with its quotes around `…`. Parse and server errors can
+/// quote a value ("invalid type: string \"...\"", "unknown variant `...`"), which may be a
+/// credential.
+///
+/// Double quotes, backticks and single quotes are read in one pass, so one kind may appear inside
+/// another, and a backslash inside a quote escapes the next character. A single quote opens a
+/// value only at the start of the text or after whitespace or one of `:=([`, which leaves the
+/// apostrophe in `can't` alone. When the quoting cannot be followed (no closing quote, or a double
+/// quote or backtick straight after a word, as in `5" disk`), everything after it is hidden.
 pub fn redact_quoted(text: &str) -> String {
-    redact_between(&redact_between(text, '"'), '`')
+    let mut out = String::with_capacity(text.len());
+    let mut shown = 0;
+    while let Some((open, quote)) = next_opening_quote(text, shown) {
+        out.push_str(&text[shown..=open]);
+        out.push('…');
+        let close = (!follows_word(text, open))
+            .then(|| closing_quote(text, open + 1, quote))
+            .flatten();
+        let Some(close) = close else {
+            return out;
+        };
+        out.push(quote);
+        shown = close + 1;
+    }
+    out.push_str(&text[shown..]);
+    out
 }
 
-fn redact_between(text: &str, quote: char) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut parts = text.split(quote);
-    if let Some(first) = parts.next() {
-        out.push_str(first);
-    }
-    let mut inside = true;
-    for part in parts {
-        if inside {
-            out.push(quote);
-            out.push('…');
-        } else {
-            out.push(quote);
-            out.push_str(part);
+/// The next quote from byte `from` that starts a quoted value, with its byte offset. All quotes
+/// are ASCII, so a byte match is always a whole character.
+fn next_opening_quote(text: &str, from: usize) -> Option<(usize, char)> {
+    text.bytes()
+        .enumerate()
+        .skip(from)
+        .find_map(|(i, byte)| match byte {
+            b'"' | b'`' => Some((i, char::from(byte))),
+            b'\'' if single_quote_opens(text, i) => Some((i, '\'')),
+            _ => None,
+        })
+}
+
+/// Whether the single quote at `at` starts a value rather than being an apostrophe.
+fn single_quote_opens(text: &str, at: usize) -> bool {
+    text[..at]
+        .chars()
+        .next_back()
+        .is_none_or(|c| c.is_whitespace() || matches!(c, ':' | '=' | '(' | '['))
+}
+
+fn follows_word(text: &str, at: usize) -> bool {
+    text[..at]
+        .chars()
+        .next_back()
+        .is_some_and(char::is_alphanumeric)
+}
+
+/// The byte offset of the quote closing a value whose content starts at `from`. A quote directly
+/// followed by a letter or digit is part of the value, whatever its kind.
+fn closing_quote(text: &str, from: usize, quote: char) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut at = from;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            byte if char::from(byte) == quote => {
+                let ends = !text[at + 1..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphanumeric);
+                if ends {
+                    return Some(at);
+                }
+                at += 1;
+            }
+            _ => at += 1,
         }
-        inside = !inside;
     }
-    out
+    None
 }
 
 /// What may be shown of an error from parsing a file that can hold credentials (kubeconfig,
@@ -566,6 +619,105 @@ mod tests {
             redact_quoted("unknown variant `abc`"),
             "unknown variant `…`"
         );
+    }
+
+    #[test]
+    fn quoted_values_are_hidden() {
+        for (text, shown) in [
+            // Double quotes and backticks, as before.
+            ("value \"abc\" rejected", "value \"…\" rejected"),
+            (
+                "unknown variant `abc`, expected",
+                "unknown variant `…`, expected",
+            ),
+            ("a \"b\" c \"d\" e", "a \"…\" c \"…\" e"),
+            ("empty \"\" stays", "empty \"…\" stays"),
+            ("no quotes here", "no quotes here"),
+            ("", ""),
+            // One kind inside another.
+            ("value \"a`b'c\" rejected", "value \"…\" rejected"),
+            ("value `a\"b` rejected", "value `…` rejected"),
+            // Backslash escapes.
+            ("value \"pa\\\"ss\": bad", "value \"…\": bad"),
+            ("value \"ends in \\\\\": bad", "value \"…\": bad"),
+            ("value 'pa\\'ss' is bad", "value '…' is bad"),
+            // Single quotes after whitespace, at the start and after `:=([`.
+            ("password 'abc' is weak", "password '…' is weak"),
+            ("'abc' is weak", "'…' is weak"),
+            ("key:'abc' bad", "key:'…' bad"),
+            ("key='abc' bad", "key='…' bad"),
+            ("call('abc') bad", "call('…') bad"),
+            ("list['abc'] bad", "list['…'] bad"),
+            ("value 'can't guess' is weak", "value '…' is weak"),
+            // No closing quote: hidden to the end.
+            ("value \"abc def", "value \"…"),
+            ("value `abc def", "value `…"),
+            ("value 'abc def", "value '…"),
+            ("value \"abc\\\" def", "value \"…"),
+            // A quote straight after a word: hidden to the end.
+            ("5\" disk rejected: value \"abc\" not allowed", "5\"…"),
+            ("5` disk rejected: value `abc` not allowed", "5`…"),
+            // A quote followed by a letter or digit does not close the value.
+            ("value \"a\"b\" rejected", "value \"…\" rejected"),
+            ("value \"a\"b rejected", "value \"…"),
+            // Non-ASCII text around and inside a value.
+            ("valore \"pässword\" è errato", "valore \"…\" è errato"),
+        ] {
+            assert_eq!(redact_quoted(text), shown, "{text}");
+        }
+    }
+
+    #[test]
+    fn apostrophes_in_words_stay() {
+        for text in [
+            "can't reach the server",
+            "the pods' status isn't ready",
+            "user's token wasn't accepted",
+            "l'été",
+        ] {
+            assert_eq!(redact_quoted(text), text);
+        }
+        assert_eq!(
+            redact_quoted("can't set \"abc\" or 'def' here"),
+            "can't set \"…\" or '…' here"
+        );
+    }
+
+    #[test]
+    fn server_quoted_names_stay_hidden_in_access_errors() {
+        assert_eq!(
+            redact_quoted("pods \"web\" is forbidden: User \"jane\" cannot get resource \"pods\""),
+            "pods \"…\" is forbidden: User \"…\" cannot get resource \"…\""
+        );
+    }
+
+    #[test]
+    fn server_error_text_hides_escaped_and_single_quoted_values() {
+        for (text, value) in [
+            ("password 'hunter2-secret' is weak", "hunter2-secret"),
+            (
+                "Invalid value: \"pa\\\"ss-TAILSECRET\": must match",
+                "TAILSECRET",
+            ),
+            (
+                "Secret \"x\" is invalid: data.password: Invalid value: \"pa\\\"ss-TAILSECRET\": \
+                 must match",
+                "TAILSECRET",
+            ),
+            (
+                "spec.env[0].value: Invalid value: \"abc\\\"TAILSECRET def\": must not contain \
+                 quotes",
+                "TAILSECRET",
+            ),
+            (
+                "5\" disk rejected: value \"QUOTEDSECRET\" not allowed",
+                "QUOTEDSECRET",
+            ),
+        ] {
+            for shown in [safe_server_error(text), hide_server_values(text)] {
+                assert!(!shown.contains(value), "{text}: {shown}");
+            }
+        }
     }
 
     #[test]
