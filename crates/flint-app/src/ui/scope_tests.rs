@@ -457,3 +457,56 @@ async fn the_mode_controls_work_from_the_keyboard(cx: &mut TestAppContext) {
     assert_eq!(note, "Agents may read all namespaces; kinds pods.");
     assert_eq!(scope_of(cx, &t), Some(saved));
 }
+
+// Typing selects; choosing All afterwards drops the text, so Save grants what the control shows.
+#[gpui_kit::test]
+async fn all_supersedes_a_name_left_in_the_field(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    edit_scope(cx, &t, &scope(&[], &["pods"])).await;
+    click(cx, &t, "scope-ns-add");
+    t.type_text(cx, "billing");
+    settle(cx, &t);
+    let note = t.label(cx, "confirm-footer-note").unwrap_or_default();
+    assert_eq!(note, "Agents may read namespaces billing; kinds pods.");
+    click(cx, &t, "scope-ns-all");
+    let note = t.label(cx, "confirm-footer-note").unwrap_or_default();
+    assert_eq!(note, "Agents may read all namespaces; kinds pods.");
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    wait_for_dialog(cx, &t, false).await;
+    assert_eq!(scope_of(cx, &t), Some(scope(&[], &["pods"])));
+}
+
+// A name left in the field in Selected mode is still added on saving.
+#[gpui_kit::test]
+async fn a_name_left_in_selected_mode_is_added(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    edit_scope(cx, &t, &scope(&[], &["pods"])).await;
+    click(cx, &t, "scope-ns-selected");
+    click(cx, &t, "scope-ns-add");
+    t.type_text(cx, "billing");
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    wait_for_scope(cx, &t, scope(&["billing"], &["pods"])).await;
+}
+
+// At the minimum window size every saved choice and the buttons stay inside the dialog.
+#[gpui_kit::test]
+async fn five_saved_choices_fit_the_minimum_window(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let saved = scope(
+        &["ns-a", "ns-b", "ns-c", "ns-d", "ns-e"],
+        &["kind-a", "kind-b", "kind-c", "kind-d", "kind-e"],
+    );
+    edit_scope(cx, &t, &saved).await;
+    gpui_kit::VisualTestContext::from_window(t.window, cx)
+        .simulate_resize(gpui_kit::size(gpui_kit::px(760.), gpui_kit::px(480.)));
+    settle(cx, &t);
+    let ok = t.find(cx, "ok").unwrap().bounds();
+    assert!(ok.bottom() <= gpui_kit::px(480.), "{ok:?}");
+    for id in ["scope-ns-ns-e", "scope-kind-kind-e"] {
+        let row = t.find(cx, id).unwrap().bounds();
+        assert!(row.bottom() <= ok.origin.y, "{id}: {row:?} above {ok:?}");
+    }
+}

@@ -28,6 +28,9 @@ use super::registry::{
 
 /// The most characters of names the note beside the buttons lists; past it, it counts them.
 const NOTE_NAMES_CHARS: usize = 32;
+/// The share of the window's height the pickers may take before they scroll, leaving room for
+/// the dialog's title, text and buttons at the minimum window size.
+const BODY_MAX_SHARE: f32 = 0.42;
 
 /// Whether a picker grants everything or only the values selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,9 +133,17 @@ impl ScopePicker {
         let input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Add a namespace by name…"));
         let on_input = cx.subscribe_in(&input, window, |this, input, event, window, cx| {
-            if let InputEvent::PressEnter { .. } = event {
-                let _ = this.take_typed(input, window, cx);
-                cx.notify();
+            match event {
+                InputEvent::PressEnter { .. } => {
+                    let _ = this.take_typed(input, window, cx);
+                    cx.notify();
+                }
+                // Text in the field limits the scope once saved, so the mode says Selected.
+                InputEvent::Change if !input.read(cx).value().trim().is_empty() => {
+                    this.namespace_mode = Mode::Selected;
+                    cx.notify();
+                }
+                _ => {}
             }
         });
         ScopePicker {
@@ -266,8 +277,12 @@ impl ScopePicker {
 
     /// The pickers' actions and their handlers.
     pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
-        bind.bind::<ScopeAllNamespaces>(|this, _, _, cx| {
+        bind.bind::<ScopeAllNamespaces>(|this, _, window, cx| {
             this.selected_namespaces.clear();
+            // All supersedes a name still in the field, which saving would otherwise add.
+            this.input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            this.input_error = None;
             this.namespace_mode = Mode::All;
             cx.notify();
         })
@@ -437,7 +452,8 @@ fn described(scope: &AiScope, names: impl Fn(&str, &[String]) -> String) -> Stri
 }
 
 impl Render for ScopePicker {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let body_height = window.viewport_size().height * BODY_MAX_SHARE;
         let focus = self.focus.clone();
         let theme = cx.theme().clone();
         let namespace_rows = self.namespaces.iter().map(|ns| {
@@ -473,20 +489,27 @@ impl Render for ScopePicker {
             .min_w_0()
             .gap_1()
             .child(Self::section("Namespaces agents may read", cx))
+            // One row, so the modes take the height the single All control used to.
             .child(
-                Radio::new("scope-ns-all")
-                    .label("All namespaces")
-                    .checked(self.namespace_mode == Mode::All)
-                    .on_click(registry::on_click_in(focus.clone(), ScopeAllNamespaces)),
-            )
-            .child(
-                Radio::new("scope-ns-selected")
-                    .label("Selected namespaces")
-                    .checked(self.namespace_mode == Mode::Selected)
-                    .on_click(registry::on_click_in(
-                        focus.clone(),
-                        ScopeSelectedNamespaces,
-                    )),
+                h_flex()
+                    .gap_3()
+                    .child(
+                        Radio::new("scope-ns-all")
+                            .label("All")
+                            .accessibility_label("All namespaces")
+                            .checked(self.namespace_mode == Mode::All)
+                            .on_click(registry::on_click_in(focus.clone(), ScopeAllNamespaces)),
+                    )
+                    .child(
+                        Radio::new("scope-ns-selected")
+                            .label("Selected")
+                            .accessibility_label("Selected namespaces")
+                            .checked(self.namespace_mode == Mode::Selected)
+                            .on_click(registry::on_click_in(
+                                focus.clone(),
+                                ScopeSelectedNamespaces,
+                            )),
+                    ),
             )
             .child(
                 div()
@@ -517,16 +540,22 @@ impl Render for ScopePicker {
             .gap_1()
             .child(Self::section("Kinds agents may read", cx))
             .child(
-                Radio::new("scope-kind-all")
-                    .label("All kinds")
-                    .checked(self.kind_mode == Mode::All)
-                    .on_click(registry::on_click_in(focus.clone(), ScopeAllKinds)),
-            )
-            .child(
-                Radio::new("scope-kind-selected")
-                    .label("Selected kinds")
-                    .checked(self.kind_mode == Mode::Selected)
-                    .on_click(registry::on_click_in(focus.clone(), ScopeSelectedKinds)),
+                h_flex()
+                    .gap_3()
+                    .child(
+                        Radio::new("scope-kind-all")
+                            .label("All")
+                            .accessibility_label("All kinds")
+                            .checked(self.kind_mode == Mode::All)
+                            .on_click(registry::on_click_in(focus.clone(), ScopeAllKinds)),
+                    )
+                    .child(
+                        Radio::new("scope-kind-selected")
+                            .label("Selected")
+                            .accessibility_label("Selected kinds")
+                            .checked(self.kind_mode == Mode::Selected)
+                            .on_click(registry::on_click_in(focus.clone(), ScopeSelectedKinds)),
+                    ),
             )
             .child(
                 v_flex()
@@ -546,6 +575,9 @@ impl Render for ScopePicker {
         let element = v_flex()
             .id("ai-scope")
             .track_focus(&self.focus)
+            // Scrolls rather than letting a short window clip the last rows.
+            .max_h(body_height)
+            .overflow_y_scroll()
             .pt_2()
             .gap_1()
             .child(
