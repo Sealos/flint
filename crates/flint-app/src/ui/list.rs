@@ -6,6 +6,7 @@
 //! a list of 50, however fast the watch changes.
 
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +19,6 @@ use flint_core::{
 use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
@@ -32,7 +32,7 @@ use list_model::{CELL_PADDING, CHAR_WIDTH};
 
 use super::list_model::{self, ColumnWidths, SortSpec};
 use super::notice::notice;
-use super::row_menu::RowMenu;
+use super::row_menu::{OpenRowMenu, RowMenu};
 
 use super::registry::{
     self, CloseDetail, SelectFirst, SelectLast, SelectNext, SelectPrev, SelectRow,
@@ -175,6 +175,9 @@ pub struct ResourceList {
     filter: Entity<InputState>,
     /// A row's context menu, for kinds that have one (pods and workloads: UP-47).
     row_menu: Option<RowMenu>,
+    /// The row menu now open. The list holds it, not the row: opening the detail pane narrows
+    /// the row, which must not close the menu (#496).
+    open_row_menu: Option<OpenRowMenu>,
     _watch: Task<()>,
     _compute: Task<()>,
     _tick: Task<()>,
@@ -285,6 +288,7 @@ impl ResourceList {
             focus: cx.focus_handle(),
             filter,
             row_menu: None,
+            open_row_menu: None,
             _watch: watch,
             _compute: Task::ready(()),
             _tick: tick,
@@ -324,6 +328,51 @@ impl ResourceList {
     /// Gives each row a context menu built by `menu`; right-clicking a row selects it first.
     pub fn set_row_menu(&mut self, menu: RowMenu) {
         self.row_menu = Some(menu);
+    }
+
+    /// Opens the row menu of `uid` at `position`, replacing one already open. Built after the
+    /// press has been handled, so the menu sees the row it selected.
+    fn show_row_menu(
+        &mut self,
+        uid: String,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(build) = self.row_menu.clone() else {
+            return;
+        };
+        let back_to = OpenRowMenu::focus_before(self.open_row_menu.take(), window, cx)
+            .unwrap_or_else(|| self.focus.clone());
+        cx.defer_in(window, move |list, window, cx| {
+            let open = OpenRowMenu::open(&build, uid, position, back_to, window, cx);
+            list.open_row_menu = Some(open);
+            cx.notify();
+        });
+    }
+
+    /// Called by the open menu when it is dismissed.
+    pub(in crate::ui) fn row_menu_closed(&mut self, cx: &mut Context<Self>) {
+        self.open_row_menu = None;
+        cx.notify();
+    }
+
+    /// The open menu to draw. One whose row has left the list is dismissed instead: its entries
+    /// would act on something no longer shown.
+    fn drawn_row_menu(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let open = self.open_row_menu.as_ref()?;
+        let listed = self
+            .rows
+            .iter()
+            .any(|&ix| &*self.shown.rows[ix as usize].uid == open.uid());
+        if !listed {
+            let menu = open.menu().clone();
+            cx.defer_in(window, move |_, _, cx| {
+                menu.update(cx, |_, cx| cx.emit(DismissEvent));
+            });
+            return None;
+        }
+        open.element(window, cx)
     }
 
     /// The snapshot being drawn and how many of its rows pass the filters, for tests.
@@ -945,14 +994,19 @@ impl ResourceList {
             elements.push(match &self.row_menu {
                 // A right-click selects the row (a mouse down, before the menu opens on it), so
                 // the menu acts on it.
-                Some(menu) => {
-                    let menu = menu.clone();
+                Some(_) => {
+                    let press = row_press(select, row.uid.to_string(), cx.weak_entity());
+                    let on_right = press.clone();
                     div()
                         .id(SharedString::from(format!("row-menu-{}", row.uid)))
+                        .relative()
                         .w_full()
-                        .on_mouse_down(MouseButton::Right, registry::on_click_passing(select))
+                        .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                            on_right(event.position, window, cx);
+                            cx.stop_propagation();
+                        })
                         .child(el)
-                        .context_menu(move |m, window, cx| menu(m, window, cx))
+                        .child(long_press_area(press))
                         .into_any_element()
                 }
                 None => el.into_any_element(),
@@ -1535,6 +1589,7 @@ impl Render for ResourceList {
         self.dropped_wide = dropped;
         self.resort_if_drawn_changed(cx);
         let total_width: f32 = self.drawn.iter().map(|(_, w)| w).sum();
+        let row_menu = self.drawn_row_menu(window, cx);
 
         let cx: &Context<Self> = cx;
         let theme = cx.theme();
@@ -1603,7 +1658,44 @@ impl Render for ResourceList {
                         .test_support(),
                 )
             })
+            .children(row_menu)
     }
+}
+
+/// What pressing a row for its menu does: selects the row, then opens the menu on it.
+fn row_press(
+    select: SelectRow,
+    uid: String,
+    list: WeakEntity<ResourceList>,
+) -> Rc<dyn Fn(Point<Pixels>, &mut Window, &mut App)> {
+    let select = registry::on_click::<(), _>(select);
+    Rc::new(move |position, window, cx| {
+        select(&(), window, cx);
+        let _ = list.update(cx, |list, cx| {
+            list.show_row_menu(uid.clone(), position, window, cx)
+        });
+    })
+}
+
+/// A finger has no right button: a long press on the row opens its menu too.
+fn long_press_area(press: Rc<dyn Fn(Point<Pixels>, &mut Window, &mut App)>) -> impl IntoElement {
+    canvas(
+        |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+        move |_, hitbox, window, _| {
+            window.on_mouse_event(move |event: &LongPressEvent, phase, window, cx| {
+                if phase.bubble()
+                    && event.phase == TouchPhase::Started
+                    && !window.default_prevented()
+                    && hitbox.is_hovered(window)
+                {
+                    window.prevent_default();
+                    press(event.start_position, window, cx);
+                }
+            });
+        },
+    )
+    .absolute()
+    .size_full()
 }
 
 #[path = "list_actions.rs"]

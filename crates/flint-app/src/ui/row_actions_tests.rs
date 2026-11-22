@@ -1231,6 +1231,160 @@ async fn right_clicking_another_row_acts_on_it(cx: &mut TestAppContext) {
     assert_eq!(dock_tabs(cx, &t).0, ["web · app"]);
 }
 
+// covers #496: the first right-click opens the detail pane beside the list, and the object is
+// still loading. The menu stays open through those frames until it is dismissed.
+#[gpui_kit::test]
+async fn a_row_menu_stays_open_while_its_object_loads(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "kind-alpha").await;
+    open_list(
+        cx,
+        &t,
+        deployments_entry(),
+        deployments(&["api", "web"]),
+        "web",
+    )
+    .await;
+    draw(cx, &t);
+    // Near the row's right edge, where the detail pane opens.
+    cx.update_window(t.window, |_, window, cx| {
+        let row = window.find("row-uid-web").bounds();
+        let at = gpui_kit::point(row.size.width - gpui_kit::px(8.), row.size.height / 2.);
+        window.click_with_options(
+            "row-uid-web",
+            gpui_kit::test::ClickOptions::new()
+                .with_offset(at)
+                .with_button(gpui_kit::MouseButton::Right),
+            cx,
+        );
+    })
+    .unwrap();
+    show_loading(cx, &t);
+    for frame in 0..4 {
+        draw(cx, &t);
+        let open = cx
+            .update_window(t.window, |_, window, _| {
+                window.try_find("popup-menu").is_some()
+            })
+            .unwrap();
+        assert!(open, "the menu closed by frame {frame}");
+    }
+    press(cx, &t, "escape");
+    draw(cx, &t);
+    let open = cx
+        .update_window(t.window, |_, window, _| {
+            window.try_find("popup-menu").is_some()
+        })
+        .unwrap();
+    assert!(!open, "escape dismisses the menu");
+}
+
+fn menu_open(cx: &mut TestAppContext, t: &TestWorkspace) -> bool {
+    draw(cx, t);
+    cx.update_window(t.window, |_, window, _| {
+        window.try_find("popup-menu").is_some()
+    })
+    .unwrap()
+}
+
+/// A pods list of `api` and `web` with `web` loaded and the list focused.
+async fn focused_pods(cx: &mut TestAppContext, t: &TestWorkspace) {
+    activate(cx, t, "kind-alpha").await;
+    open_list(
+        cx,
+        t,
+        pods_entry(),
+        pods(&[("demo", "api", 0), ("demo", "web", 1)]),
+        "api",
+    )
+    .await;
+    select_row(cx, t, "web");
+    show_fetched(cx, t, pod_detail("web"));
+    focus_list(cx, t);
+    draw(cx, t);
+}
+
+// covers #496: Escape closes the menu and focus returns to where it was.
+#[gpui_kit::test]
+async fn escape_returns_focus_from_a_row_menu(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    focused_pods(cx, &t).await;
+    right_click(cx, &t, "web").await;
+    assert_ne!(app_state(cx, &t).focus, Focus::List, "the menu has focus");
+    press(cx, &t, "escape");
+    assert!(!menu_open(cx, &t));
+    assert_eq!(app_state(cx, &t).focus, Focus::List);
+}
+
+// covers #496: a click outside closes the menu.
+#[gpui_kit::test]
+async fn a_click_outside_closes_a_row_menu(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    focused_pods(cx, &t).await;
+    right_click(cx, &t, "web").await;
+    cx.update_window(t.window, |_, window, cx| window.click("row-uid-api", cx))
+        .unwrap();
+    assert!(!menu_open(cx, &t));
+}
+
+// covers #496: a right-click on another row replaces the menu, which then acts on that row, and
+// focus still returns to where it was before the first menu.
+#[gpui_kit::test]
+async fn right_clicking_another_row_replaces_its_menu(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    focused_pods(cx, &t).await;
+    right_click(cx, &t, "web").await;
+    right_click(cx, &t, "api").await;
+    draw(cx, &t);
+    assert_eq!(
+        app_state(cx, &t).menu.unwrap().owner.as_deref(),
+        Some("row-menu-uid-api")
+    );
+    press(cx, &t, "escape");
+    assert!(!menu_open(cx, &t));
+    assert_eq!(app_state(cx, &t).focus, Focus::List);
+}
+
+// covers #496: the menu closes when its row leaves the list, since it acts on that row.
+#[gpui_kit::test]
+async fn a_row_menu_closes_when_its_row_goes(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    focused_pods(cx, &t).await;
+    right_click(cx, &t, "web").await;
+    let list = t
+        .workspace
+        .read_with(cx, |ws, _| ws.list.as_ref().unwrap().clone());
+    list.update(cx, |list, cx| {
+        list.set_snapshot(pods(&[("demo", "api", 0)]), cx)
+    });
+    cx.run_until_parked();
+    assert!(!menu_open(cx, &t));
+    assert!(!menu_open(cx, &t), "it stays closed");
+    assert_eq!(app_state(cx, &t).focus, Focus::List);
+}
+
+// covers #496: a window that gets smaller dismisses the menu, whose limits were worked out for
+// the old size, and focus returns.
+#[gpui_kit::test]
+async fn a_shrunk_window_closes_a_row_menu(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    focused_pods(cx, &t).await;
+    right_click(cx, &t, "web").await;
+    let size = cx
+        .update_window(t.window, |_, window, _| window.viewport_size())
+        .unwrap();
+    gpui_kit::VisualTestContext::from_window(t.window, cx)
+        .simulate_resize(gpui_kit::size(size.width - gpui_kit::px(40.), size.height));
+    assert!(!menu_open(cx, &t));
+    assert_eq!(app_state(cx, &t).focus, Focus::List);
+}
+
 // covers UP-47, UP-40: an action that waited does not take focus from where the user went
 // meanwhile (its tab still opens); one whose focus stayed put takes it. It shows that it waits,
 // and gives up, saying so, if its object never loads.
@@ -2042,8 +2196,7 @@ async fn logs_asked_for_at_startup_take_focus(cx: &mut TestAppContext) {
     assert_ne!(app_state(cx, &t).focus, Focus::List, "the tab took focus");
 }
 
-// covers UP-47: a dismissed menu stops following its row (gpui-component keeps it until the
-// next right-click), so it is not built again while hidden.
+// covers UP-47: a dismissed menu stops following its row, so it is not built again.
 #[gpui_kit::test]
 async fn a_dismissed_menu_is_not_built_again(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
