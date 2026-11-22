@@ -76,16 +76,27 @@ struct Server {
 impl Server {
     /// Starts `flint-mcp` with only the given kubeconfig list and config dir, and initializes it.
     fn start(kubeconfig: &std::ffi::OsStr, config_dir: &std::path::Path) -> Server {
+        Self::start_logging(kubeconfig, config_dir, "warn", Stdio::inherit())
+    }
+
+    /// Like [`Server::start`], with the given log filter and stderr.
+    fn start_logging(
+        kubeconfig: &std::ffi::OsStr,
+        config_dir: &std::path::Path,
+        log_filter: &str,
+        stderr: Stdio,
+    ) -> Server {
         let mut child = Command::new(env!("CARGO_BIN_EXE_flint-mcp"))
             .env("KUBECONFIG", kubeconfig)
             .env("FLINT_CONFIG_DIR", config_dir)
             // Keeps the log file out of the real home.
             .env("HOME", config_dir.join("home"))
             .env("XDG_STATE_HOME", config_dir.join("state"))
-            .env("FLINT_LOG", "warn")
+            .env("FLINT_LOG", log_filter)
+            .env_remove("RUST_LOG")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(stderr)
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
@@ -191,6 +202,55 @@ fn exposing(context: &str, server: &str) -> String {
     format!(
         "path = \"/usr/bin:/bin\"\n\n[[ai_exposed_clusters]]\ncontext = \"{context}\"\nserver = \"{server}\"\n"
     )
+}
+
+/// Protocol traffic stays out of stderr at any log filter, on every path through the server: a
+/// request, its reply, an error reply and a line that does not parse. Flint's own debug events
+/// still print, so an empty stderr cannot pass. No cluster, no network.
+#[test]
+fn protocol_traffic_stays_out_of_stderr_at_any_log_filter() {
+    const MARKER: &str = "flint-protocol-marker";
+    // A bare target directive turns Flint's events off, so it has no control event to look for.
+    for (filter, flint_debug_shown) in [
+        ("debug", true),
+        ("trace", true),
+        ("rmcp::service=debug", false),
+        ("rmcp::service=debug,flint_core=debug", true),
+    ] {
+        let scratch = tempfile::tempdir().unwrap();
+        let config_dir = scratch.path().join("config");
+        std::fs::create_dir_all(config_dir.join("home")).unwrap();
+        std::fs::write(
+            config_dir.join("settings.toml"),
+            "path = \"/usr/bin:/bin\"\n",
+        )
+        .unwrap();
+        let stderr_path = scratch.path().join("stderr.log");
+        let stderr = std::fs::File::create(&stderr_path).unwrap();
+        let mut server = Server::start_logging(
+            std::ffi::OsStr::new("/dev/null"),
+            &config_dir,
+            filter,
+            stderr.into(),
+        );
+        let stdin = server.stdin.as_mut().unwrap();
+        writeln!(stdin, "{{not json {MARKER}").unwrap();
+        stdin.flush().unwrap();
+        server.exchange(
+            "tools/call",
+            json!({"name": "list_clusters", "arguments": {"marker": MARKER}}),
+        );
+        // Answered with a protocol error rather than a failed tool result.
+        let unknown = server.exchange("tools/call", json!({"name": MARKER, "arguments": {}}));
+        assert!(unknown.get("error").is_some(), "{unknown}");
+        drop(server);
+
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+        assert!(!stderr.contains(MARKER), "{filter}: {stderr}");
+        if flint_debug_shown {
+            assert!(stderr.contains("resolved PATH"), "{filter}: {stderr}");
+        }
+    }
 }
 
 /// Diagnostics reach stderr and the log file, leaving stdout for the protocol. If the log

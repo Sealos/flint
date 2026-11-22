@@ -113,7 +113,7 @@ fn subscriber<W: Write>(
     let stderr = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_writer(move || RedactingWriter(stderr()))
-        .with_filter(stderr_filter);
+        .with_filter(stderr_filter.and(filter_fn(shown_on_stderr)));
     let file = file.map(|file| {
         tracing_subscriber::fmt::layer()
             .with_ansi(false)
@@ -130,6 +130,20 @@ fn subscriber<W: Write>(
             })))
     });
     tracing_subscriber::registry().with(stderr).with(file)
+}
+
+/// Keeps protocol traffic out of stderr whatever the filter says. Below WARN, rmcp prints whole
+/// requests, results and unparsable lines. Two of its warnings repeat protocol content too: the
+/// error reply to a request (`id` and `error`) and the version a client asked for.
+fn shown_on_stderr(metadata: &tracing::Metadata<'_>) -> bool {
+    if metadata.target().split("::").next() != Some("rmcp") {
+        return true;
+    }
+    let fields = metadata.fields();
+    let error_reply = fields.field("id").is_some() && fields.field("error").is_some();
+    *metadata.level() <= tracing::Level::WARN
+        && !error_reply
+        && fields.field("client_requested").is_none()
 }
 
 struct RedactingWriter<W>(W);
@@ -567,6 +581,51 @@ mod tests {
         assert!(!log.contains("example-credential"), "{log}");
         assert!(!log.contains("dependency"), "{log}");
         assert!(!log.contains("filtered out"), "{log}");
+    }
+
+    #[test]
+    fn stderr_keeps_rmcp_to_warnings_without_protocol_content() {
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = subscriber(
+            EnvFilter::new("trace,rmcp::service=trace"),
+            EnvFilter::new("off"),
+            None,
+            move || writer.clone(),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "rmcp", "hidden crate root");
+            tracing::info!(target: "rmcp::service", "hidden module");
+            let (id, error) = (1, "hidden error reply");
+            tracing::warn!(target: "rmcp::service", %id, ?error, "response error");
+            let client_requested = "hidden version";
+            tracing::warn!(target: "rmcp::service", %client_requested, "no version");
+            tracing::warn!(target: "rmcp::service", "shown rmcp warning");
+            tracing::error!(target: "rmcp", "shown rmcp error");
+            tracing::debug!(target: "rmcpfoo", "shown other crate");
+            tracing::debug!(target: "flint_core", "shown flint debug");
+        });
+        let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(!output.contains("hidden"), "{output}");
+        for shown in [
+            "shown rmcp warning",
+            "shown rmcp error",
+            "shown other crate",
+            "shown flint debug",
+        ] {
+            assert!(output.contains(shown), "{shown}: {output}");
+        }
     }
 
     #[test]
