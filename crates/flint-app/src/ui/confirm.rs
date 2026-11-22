@@ -36,6 +36,19 @@ pub struct DialogText {
 /// focus on the dialog's own node, [`init`] answers them.
 pub const DEFAULT_CANCEL: &str = "DefaultCancel";
 
+/// What a gated confirmation ([`open_gated`]) says beside its buttons, and whether it can be
+/// confirmed now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmState {
+    /// What confirming would do, or why it cannot be confirmed.
+    pub note: String,
+    /// OK is disabled, and its handler refuses a click, Enter and automation alike.
+    pub blocked: bool,
+}
+
+/// Reads a gated confirmation's state from its content, on every frame and every confirm.
+type Gate = Rc<dyn Fn(&App) -> ConfirmState>;
+
 /// The share of the window's height a confirmation's text may take before it scrolls, leaving
 /// room for a wrapped title and the buttons at the minimum window size.
 const DESCRIPTION_MAX_SHARE: f32 = 0.45;
@@ -79,7 +92,7 @@ pub fn open_pinned(
     pinned: usize,
     on_ok: impl Fn(&mut Window, &mut App) + 'static,
 ) {
-    open_dialog(window, cx, dialog, pinned, None, move |window, cx| {
+    open_dialog(window, cx, dialog, pinned, None, None, move |window, cx| {
         on_ok(window, cx);
         true
     });
@@ -95,7 +108,7 @@ pub fn open_pinned_with(
     content: AnyView,
     on_ok: impl Fn(&mut Window, &mut App) -> bool + 'static,
 ) {
-    open_dialog(window, cx, dialog, pinned, Some(content), on_ok);
+    open_dialog(window, cx, dialog, pinned, Some(content), None, on_ok);
 }
 
 /// [`open`], with `content` (a view of its own, such as pickers) drawn under the text, and an
@@ -108,7 +121,23 @@ pub fn open_with(
     content: Option<AnyView>,
     on_ok: impl Fn(&mut Window, &mut App) -> bool + 'static,
 ) {
-    open_dialog(window, cx, dialog, 0, content, on_ok);
+    open_dialog(window, cx, dialog, 0, content, None, on_ok);
+}
+
+/// [`open_with`], with `state` read from the content: its note is drawn beside the buttons, and
+/// while it is blocked OK is disabled and `on_ok` does not run, however it is asked for. Not for
+/// a [`DialogText::default_cancel`] confirmation, which has a footer of its own.
+pub fn open_gated(
+    window: &mut Window,
+    cx: &mut App,
+    dialog: DialogText,
+    content: AnyView,
+    state: impl Fn(&App) -> ConfirmState + 'static,
+    on_ok: impl Fn(&mut Window, &mut App) -> bool + 'static,
+) {
+    debug_assert!(!dialog.default_cancel);
+    let gate: Gate = Rc::new(state);
+    open_dialog(window, cx, dialog, 0, Some(content), Some(gate), on_ok);
 }
 
 fn open_dialog(
@@ -117,6 +146,7 @@ fn open_dialog(
     dialog: DialogText,
     pinned: usize,
     content: Option<AnyView>,
+    gate: Option<Gate>,
     on_ok: impl Fn(&mut Window, &mut App) -> bool + 'static,
 ) {
     #[cfg(any(test, feature = "automation"))]
@@ -136,8 +166,12 @@ fn open_dialog(
     let scroll = ScrollHandle::new();
     let text_focus = cx.focus_handle();
     let target_height = Rc::new(Cell::new(px(0.)));
+    // What a gated footer's buttons answer from: opening the dialog does not focus it.
+    let gate_focus = gate.as_ref().map(|_| cx.focus_handle());
     window.open_alert_dialog(cx, move |alert, window, cx| {
         let on_ok = on_ok.clone();
+        let gate = gate.clone();
+        let gated = gate.as_ref().map(|gate| gate(cx));
         // A long text scrolls, so it cannot push the buttons or its last lines out of the dialog.
         let viewport = window.viewport_size().height;
         let text_height = if pinned > 0 {
@@ -206,6 +240,7 @@ fn open_dialog(
                     .when_some(default_cancel.as_ref(), |this, focus| {
                         this.track_focus(focus).key_context(DEFAULT_CANCEL)
                     })
+                    .when_some(gate_focus.as_ref(), |this, focus| this.track_focus(focus))
                     .test_support(),
             )
             .ok_text(dialog.ok.clone())
@@ -215,7 +250,13 @@ fn open_dialog(
                 this.keyboard(false)
                     .footer(default_cancel_footer(&dialog, focus))
             })
-            .on_ok(move |_, window, cx| on_ok(window, cx))
+            .when_some(
+                gate_focus.as_ref().zip(gated.as_ref()),
+                |this, (focus, state)| this.footer(gated_footer(&dialog, state, focus, cx)),
+            )
+            .on_ok(move |_, window, cx| {
+                !gate.as_ref().is_some_and(|gate| gate(cx).blocked) && on_ok(window, cx)
+            })
     });
     // The dialog took focus as it opened: hand it on to the description.
     if let Some(focus) = focus {
@@ -587,6 +628,63 @@ fn default_cancel_footer(dialog: &DialogText, focus: &FocusHandle) -> impl IntoE
                     )),
             ),
     )
+}
+
+/// The buttons of a gated confirmation with its note beside them. They answer from `focus`,
+/// inside the dialog, whatever holds focus.
+fn gated_footer(
+    dialog: &DialogText,
+    state: &ConfirmState,
+    focus: &FocusHandle,
+    cx: &App,
+) -> impl IntoElement {
+    use gpui_kit::base::actions::{Cancel, Confirm};
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::dialog::DialogFooter;
+    use gpui_kit::component::{Disableable as _, h_flex};
+
+    use super::registry;
+
+    let color = if state.blocked {
+        cx.theme().danger
+    } else {
+        cx.theme().muted_foreground
+    };
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap_3()
+        .child(
+            div()
+                .id("confirm-footer-note")
+                .flex_1()
+                .min_w_0()
+                .text_xs()
+                .text_color(color)
+                .aria_label(state.note.clone())
+                .child(state.note.clone())
+                .test_support(),
+        )
+        .child(
+            div().flex_none().child(
+                DialogFooter::new()
+                    .child(
+                        Button::new("cancel")
+                            .label(dialog.cancel.clone())
+                            .on_click(registry::on_click_in(focus.clone(), Cancel)),
+                    )
+                    .child(
+                        Button::new("ok")
+                            .label(dialog.ok.clone())
+                            .primary()
+                            .disabled(state.blocked)
+                            .on_click(registry::on_click_in(
+                                focus.clone(),
+                                Confirm { secondary: false },
+                            )),
+                    ),
+            ),
+        )
 }
 
 /// The confirmations opened per window, oldest first, as long as they are drawn. GPUI stacks

@@ -48,6 +48,12 @@ async fn wait_for_scope(cx: &mut TestAppContext, t: &TestWorkspace, wanted: AiSc
     .await;
 }
 
+/// Answers the question a broadening save asks, on its button's action.
+async fn accept_broadening(cx: &mut TestAppContext, t: &TestWorkspace) {
+    t.wait_for_element(cx, "scope-broaden-description").await;
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+}
+
 fn scope(namespaces: &[&str], kinds: &[&str]) -> AiScope {
     AiScope::new(
         namespaces.iter().map(|s| (*s).to_owned()).collect(),
@@ -140,7 +146,9 @@ async fn the_expose_dialog_limits_what_agents_read(cx: &mut TestAppContext) {
     click(cx, &t, "scope-ns-all");
     click(cx, &t, "scope-kind-all");
     t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    accept_broadening(cx, &t).await;
     wait_for_scope(cx, &t, AiScope::default()).await;
+    wait_for_dialog(cx, &t, false).await;
     let toml = t.settings_toml();
     assert!(
         !toml.contains("namespaces") && toml.contains("kind-alpha"),
@@ -255,6 +263,7 @@ async fn a_scope_is_never_widened_or_re_exposed_unseen(cx: &mut TestAppContext) 
     .await;
     click(cx, &t, "scope-ns-all");
     t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    accept_broadening(cx, &t).await;
     let model = t.model.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
         model.read(cx).last_error.is_some()
@@ -324,6 +333,7 @@ async fn a_scope_changed_on_disk_is_not_overwritten(cx: &mut TestAppContext) {
     wait_for_scope(cx, &t, scope(&["billing"], &[])).await;
     click(cx, &t, "scope-ns-all");
     t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    accept_broadening(cx, &t).await;
     let model = t.model.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
         model.read(cx).last_error.is_some()
@@ -335,4 +345,115 @@ async fn a_scope_changed_on_disk_is_not_overwritten(cx: &mut TestAppContext) {
         "{error}"
     );
     assert_eq!(scope_of(cx, &t), Some(scope(&["billing"], &[])));
+}
+
+/// Opens Edit AI Scope on a cluster exposed with `saved`.
+async fn edit_scope(cx: &mut TestAppContext, t: &TestWorkspace, saved: &AiScope) {
+    let server = t.server.clone();
+    let exposed = saved.clone();
+    t.model.update(cx, |m, _| {
+        m.expose_to_ai("kind-alpha".into(), server, exposed)
+    });
+    wait_for_scope(cx, t, saved.clone()).await;
+    t.dispatch(
+        cx,
+        "workspace::EditAiScope",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
+    wait_for_dialog(cx, t, true).await;
+}
+
+fn settle(cx: &mut TestAppContext, t: &TestWorkspace) {
+    cx.run_until_parked();
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+}
+
+// Unchecking the last value stays Selected: Save is refused, by click and by Enter, and says why.
+#[gpui_kit::test]
+async fn clearing_the_last_value_cannot_be_saved(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let saved = scope(&["shop"], &["pods"]);
+    edit_scope(cx, &t, &saved).await;
+    click(cx, &t, "scope-ns-shop");
+    let note = t.label(cx, "confirm-footer-note").unwrap_or_default();
+    assert_eq!(note, "Select a namespace, or choose All namespaces.");
+    t.click(cx, "ok");
+    settle(cx, &t);
+    t.press(cx, "enter");
+    settle(cx, &t);
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    settle(cx, &t);
+    assert!(t.has_dialog(cx), "kept open");
+    assert!(t.find(cx, "scope-broaden-description").is_none());
+    assert_eq!(scope_of(cx, &t), Some(saved));
+    // Choosing a value makes it savable again, and says what it grants.
+    click(cx, &t, "scope-ns-shop");
+    let note = t.label(cx, "confirm-footer-note").unwrap_or_default();
+    assert_eq!(note, "Agents may read namespaces shop; kinds pods.");
+}
+
+// A broadening save asks, naming what it adds. Enter goes back without saving; only the button
+// accepts it.
+#[gpui_kit::test]
+async fn enter_never_accepts_a_broadening_save(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let saved = scope(&["shop"], &["pods"]);
+    edit_scope(cx, &t, &saved).await;
+    click(cx, &t, "scope-ns-all");
+    t.press(cx, "enter");
+    t.wait_for_element(cx, "scope-broaden-description").await;
+    let text = t.label(cx, "scope-broaden-description").unwrap_or_default();
+    assert!(text.contains("This adds: all namespaces."), "{text}");
+    t.press(cx, "enter");
+    settle(cx, &t);
+    assert!(t.find(cx, "scope-broaden-description").is_none());
+    assert!(t.find(cx, "scope-ns-all").is_some(), "back at the pickers");
+    assert_eq!(scope_of(cx, &t), Some(saved));
+
+    t.press(cx, "enter");
+    // The action its Add Access button performs (two dialogs are drawn, each with an "ok").
+    accept_broadening(cx, &t).await;
+    wait_for_scope(cx, &t, scope(&[], &["pods"])).await;
+    wait_for_dialog(cx, &t, false).await;
+}
+
+// Narrowing saves at once, with no second question.
+#[gpui_kit::test]
+async fn narrowing_needs_no_extra_step(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    edit_scope(cx, &t, &scope(&["demo", "shop"], &["pods"])).await;
+    click(cx, &t, "scope-ns-demo");
+    t.press(cx, "enter");
+    wait_for_scope(cx, &t, scope(&["shop"], &["pods"])).await;
+    wait_for_dialog(cx, &t, false).await;
+}
+
+// The mode controls are Tab stops, and Space on one takes effect without saving.
+#[gpui_kit::test]
+async fn the_mode_controls_work_from_the_keyboard(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let saved = scope(&["shop"], &["pods"]);
+    edit_scope(cx, &t, &saved).await;
+    let mut reached = false;
+    for _ in 0..16 {
+        t.press(cx, "tab");
+        settle(cx, &t);
+        if t.find(cx, "scope-ns-all").and_then(|e| e.focused()) == Some(true) {
+            reached = true;
+            break;
+        }
+    }
+    assert!(reached, "Tab reaches All namespaces");
+    t.press(cx, "space");
+    settle(cx, &t);
+    let note = t.label(cx, "confirm-footer-note").unwrap_or_default();
+    assert_eq!(note, "Agents may read all namespaces; kinds pods.");
+    assert_eq!(scope_of(cx, &t), Some(saved));
 }
