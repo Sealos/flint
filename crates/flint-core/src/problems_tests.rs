@@ -165,6 +165,24 @@ fn containers_are_classified() {
             None,
         ),
         (
+            "one exit after a long healthy run is not a loop",
+            "Running",
+            status(6, ended("Error", 1, 2, 0), ended("Error", 1, 600, 3)),
+            None,
+        ),
+        (
+            "one exit long after the previous run is not a loop",
+            "Running",
+            status(6, ended("Error", 1, 2, 0), ended("Error", 1, 200, 199)),
+            None,
+        ),
+        (
+            "one exit with no previous run on record is not a loop",
+            "Running",
+            status(6, ended("Error", 1, 2, 0), none()),
+            None,
+        ),
+        (
             "other waiting reasons are not a loop",
             "Running",
             status(6, waiting("ContainerCreating"), ended("Error", 1, 3, 2)),
@@ -359,6 +377,23 @@ fn a_just_exited_container_is_a_loop_only_if_it_will_restart() {
             "NotIn does not match a listed code",
             Some("Never"),
             with_rules("Never", vec![exit_rule("Restart", "NotIn", &[1])]),
+            1,
+            false,
+        ),
+        (
+            "matching RestartAllContainers rule restarts",
+            Some("Never"),
+            with_rules("Never", vec![exit_rule("RestartAllContainers", "In", &[1])]),
+            1,
+            true,
+        ),
+        (
+            "unmatched RestartAllContainers rule falls back to Never",
+            Some("Never"),
+            with_rules(
+                "Never",
+                vec![exit_rule("RestartAllContainers", "In", &[42])],
+            ),
             1,
             false,
         ),
@@ -816,6 +851,12 @@ fn reasons_keep_their_kubernetes_spelling() {
         ("ErrImagePull", ProblemReason::ErrImagePull),
         ("ImagePullBackOff", ProblemReason::ImagePullBackOff),
         ("InvalidImageName", ProblemReason::InvalidImageName),
+        ("ErrImageNeverPull", ProblemReason::ErrImageNeverPull),
+        ("RegistryUnavailable", ProblemReason::RegistryUnavailable),
+        (
+            "SignatureValidationFailed",
+            ProblemReason::SignatureValidationFailed,
+        ),
     ] {
         assert_eq!(ProblemReason::of_image_pull(Some(name)), Some(reason));
         assert_eq!(reason.as_str(), name);
@@ -880,6 +921,48 @@ fn image_pull_failures_are_classified() {
             1,
             status(0, waiting("InvalidImageName"), none()),
             Some(R::InvalidImageName),
+        ),
+        (
+            "an image that may not be pulled and is missing",
+            "Pending",
+            60,
+            status(0, waiting("ErrImageNeverPull"), none()),
+            Some(R::ErrImageNeverPull),
+        ),
+        (
+            "an unavailable registry",
+            "Pending",
+            60,
+            status(0, waiting("RegistryUnavailable"), none()),
+            Some(R::RegistryUnavailable),
+        ),
+        (
+            "a failed signature check",
+            "Pending",
+            60,
+            status(0, waiting("SignatureValidationFailed"), none()),
+            Some(R::SignatureValidationFailed),
+        ),
+        (
+            "a missing image may still be loaded inside the grace",
+            "Pending",
+            59,
+            status(0, waiting("ErrImageNeverPull"), none()),
+            None,
+        ),
+        (
+            "an unavailable registry may still clear inside the grace",
+            "Pending",
+            59,
+            status(0, waiting("RegistryUnavailable"), none()),
+            None,
+        ),
+        (
+            "a failed signature check may still clear inside the grace",
+            "Pending",
+            59,
+            status(0, waiting("SignatureValidationFailed"), none()),
+            None,
         ),
         (
             "a pull still running is not a failure",
@@ -1157,6 +1240,74 @@ fn deployments_are_classified() {
     }
 }
 
+#[test]
+fn a_stalled_rollout_is_judged_by_its_new_replicas() {
+    let stalled = || {
+        json!([condition(
+            "Progressing",
+            "False",
+            "ProgressDeadlineExceeded",
+            3
+        )])
+    };
+    let rolling = json!([condition("Progressing", "True", "ReplicaSetUpdated", 1)]);
+    // (name, conditions, total, available, updated, reported)
+    let cases = [
+        (
+            "old pods still serve every replica",
+            stalled(),
+            4,
+            3,
+            1,
+            true,
+        ),
+        (
+            "new pods are up but an old one remains",
+            stalled(),
+            4,
+            3,
+            3,
+            true,
+        ),
+        (
+            "every replica is new and available",
+            stalled(),
+            3,
+            3,
+            3,
+            false,
+        ),
+        ("scaling down after catching up", stalled(), 5, 5, 5, false),
+        (
+            "a moving rollout with old pods serving",
+            rolling,
+            4,
+            3,
+            1,
+            false,
+        ),
+    ];
+    for (name, conditions, total, available, updated, expected) in cases {
+        let mut object = deployment(
+            none(),
+            json!({"replicas": 3}),
+            available,
+            updated,
+            conditions,
+        );
+        object.status.as_mut().unwrap().replicas = Some(total);
+        let got = classifier().deployment(&object);
+        assert_eq!(got.is_some(), expected, "{name}");
+        if let Some(problem) = got {
+            assert_eq!(
+                problem.reason,
+                Some(ProblemReason::ProgressDeadlineExceeded),
+                "{name}"
+            );
+        }
+    }
+}
+
 fn stateful_set(meta: Value, spec: Value, status: Value) -> StatefulSet {
     let mut full_spec = json!({"selector": {}, "serviceName": "s", "template": {}});
     full_spec
@@ -1197,6 +1348,34 @@ fn stateful_sets_are_classified() {
             false,
         ),
         ("scaling up", none(), three(), json!({"replicas": 2}), false),
+        (
+            "every existing pod is ready but the next was not created",
+            none(),
+            three(),
+            json!({"replicas": 2, "readyReplicas": 2}),
+            true,
+        ),
+        (
+            "no pod could be created",
+            none(),
+            three(),
+            json!({"replicas": 0, "readyReplicas": 0}),
+            true,
+        ),
+        (
+            "a parallel set creates all its pods at once, so a gap is not ordering",
+            none(),
+            json!({"replicas": 3, "podManagementPolicy": "Parallel"}),
+            json!({"replicas": 2}),
+            true,
+        ),
+        (
+            "a rollout that is short of a pod is still moving",
+            none(),
+            three(),
+            json!({"replicas": 2, "readyReplicas": 2, "updateRevision": "r2", "updatedReplicas": 1}),
+            false,
+        ),
         ("rolling out", none(), three(), new_revision(), false),
         (
             "the last replica of a rollout is still starting",

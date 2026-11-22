@@ -78,8 +78,9 @@ pub const NODE_JOIN_GRACE: SignedDuration = SignedDuration::from_secs(10 * 60);
 /// How long after creation a pod's image pull may fail without being reported.
 ///
 /// The kubelet retries after 10, 20 and 40 seconds, so a brief registry error clears inside this
-/// window. Both retry states are held back alike, so a problem does not flap between them. An
-/// invalid image name can never succeed and is reported at once.
+/// window. Every retried failure is held back alike, so a problem does not flap between them,
+/// including a missing image that may still be loaded onto the node. An invalid image name can
+/// never succeed and is reported at once.
 pub const IMAGE_PULL_GRACE: SignedDuration = SignedDuration::from_secs(60);
 
 /// How long after creation a workload may be short of replicas without being reported.
@@ -162,6 +163,12 @@ pub enum ProblemReason {
     ImagePullBackOff,
     /// The container's image name cannot be parsed.
     InvalidImageName,
+    /// The image is not on the node and the pull policy forbids pulling it.
+    ErrImageNeverPull,
+    /// The image registry could not be reached.
+    RegistryUnavailable,
+    /// The image failed signature validation.
+    SignatureValidationFailed,
     /// A Deployment rollout stopped making progress within its deadline.
     ProgressDeadlineExceeded,
     /// A Deployment has fewer available replicas than its update strategy requires.
@@ -184,6 +191,9 @@ impl ProblemReason {
             Self::ErrImagePull => "ErrImagePull",
             Self::ImagePullBackOff => "ImagePullBackOff",
             Self::InvalidImageName => "InvalidImageName",
+            Self::ErrImageNeverPull => "ErrImageNeverPull",
+            Self::RegistryUnavailable => "RegistryUnavailable",
+            Self::SignatureValidationFailed => "SignatureValidationFailed",
             Self::ProgressDeadlineExceeded => PROGRESS_DEADLINE_EXCEEDED,
             Self::MinimumReplicasUnavailable => "MinimumReplicasUnavailable",
         }
@@ -194,6 +204,9 @@ impl ProblemReason {
             "ErrImagePull" => Some(Self::ErrImagePull),
             "ImagePullBackOff" => Some(Self::ImagePullBackOff),
             "InvalidImageName" => Some(Self::InvalidImageName),
+            "ErrImageNeverPull" => Some(Self::ErrImageNeverPull),
+            "RegistryUnavailable" => Some(Self::RegistryUnavailable),
+            "SignatureValidationFailed" => Some(Self::SignatureValidationFailed),
             _ => None,
         }
     }
@@ -336,6 +349,12 @@ impl Problem {
             (ProblemKind::ImagePull, Some(R::InvalidImageName)) => {
                 "Container image name is invalid"
             }
+            (ProblemKind::ImagePull, Some(R::ErrImageNeverPull)) => {
+                "Container image is missing and its pull policy forbids pulling it"
+            }
+            (ProblemKind::ImagePull, Some(R::SignatureValidationFailed)) => {
+                "Container image failed signature validation"
+            }
             (ProblemKind::ImagePull, _) => "Container image cannot be pulled",
             (ProblemKind::WorkloadShort, Some(R::ProgressDeadlineExceeded)) => {
                 "Rollout stopped before reaching its desired replicas"
@@ -475,9 +494,10 @@ impl Classifier {
     /// The problem of one Deployment, if it has settled short of its replicas.
     ///
     /// A paused Deployment is left alone. While a rollout or scale-up is moving, the controller's
-    /// own progress deadline decides. Once settled, `Available=False` must outlast
-    /// [`DEPLOYMENT_UNAVAILABLE_GRACE`]; a shortfall within the update strategy's
-    /// `maxUnavailable` keeps `Available=True` and is not reported.
+    /// own progress deadline decides, and a rollout past it is reported until its new replicas
+    /// have replaced the old ones, even while old pods keep every replica available. Once
+    /// settled, `Available=False` must outlast [`DEPLOYMENT_UNAVAILABLE_GRACE`]; a shortfall
+    /// within the update strategy's `maxUnavailable` keeps `Available=True` and is not reported.
     pub fn deployment(&self, deployment: &Deployment) -> Option<Problem> {
         let meta = &deployment.metadata;
         let spec = &deployment.spec;
@@ -485,10 +505,13 @@ impl Classifier {
         let desired = spec.replicas.unwrap_or(DEFAULT_REPLICAS);
         if spec.paused == Some(true)
             || !self.may_be_short(meta, desired, status.observed_generation)
-            || status.available_replicas.unwrap_or(0) >= desired
         {
             return None;
         }
+        let available = status.available_replicas.unwrap_or(0);
+        let updated = status.updated_replicas.unwrap_or(0);
+        let caught_up =
+            available >= desired && updated >= desired && status.replicas.unwrap_or(0) <= updated;
         let conditions = status.conditions.as_deref().unwrap_or_default();
         let condition = |type_: &str| {
             conditions
@@ -497,12 +520,16 @@ impl Classifier {
         };
         let progressing = condition("Progressing");
         if let Some(stalled) = progressing.filter(|c| {
-            c.status.as_deref() == Some("False")
+            !caught_up
+                && c.status.as_deref() == Some("False")
                 && c.reason.as_deref() == Some(PROGRESS_DEADLINE_EXCEEDED)
         }) {
             let since = time(&stalled.last_transition_time);
             let reason = Some(ProblemReason::ProgressDeadlineExceeded);
             return self.workload(WorkloadKind::Deployment, meta, reason, since);
+        }
+        if available >= desired {
+            return None;
         }
         let moving = match progressing {
             // `False` is a stop, such as a quota refusing new pods, so it has settled too.
@@ -511,7 +538,7 @@ impl Classifier {
                     && c.reason.as_deref() != Some("NewReplicaSetAvailable")
             }
             // With the progress deadline disabled there is no condition to read.
-            None => status.updated_replicas.unwrap_or(0) < desired,
+            None => updated < desired,
         };
         if moving {
             return None;
@@ -529,14 +556,21 @@ impl Classifier {
     /// The problem of one StatefulSet, if it has settled short of ready replicas.
     ///
     /// Readiness is compared rather than availability, which older API servers omit.
+    ///
+    /// A missing pod counts unless an ordered scale-up is waiting for an existing pod to become
+    /// ready. With every existing pod ready the controller creates the next one at once, so a
+    /// gap that lasts means it cannot, as under a pod quota. [`Problem::hold_down`] covers the
+    /// moment between two creations.
     pub fn stateful_set(&self, set: &StatefulSet) -> Option<Problem> {
         let meta = &set.metadata;
         let spec = &set.spec;
         let status = set.status.as_ref()?;
         let desired = spec.replicas.unwrap_or(DEFAULT_REPLICAS);
+        let ready = status.ready_replicas.unwrap_or(0);
+        let ordered = spec.pod_management_policy.as_deref() != Some(PARALLEL);
         if !self.may_be_short(meta, desired, status.observed_generation)
-            || status.ready_replicas.unwrap_or(0) >= desired
-            || status.replicas < desired
+            || ready >= desired
+            || (ordered && status.replicas < desired && ready < status.replicas)
             || is_rolling_out(spec, status, desired)
         {
             return None;
@@ -668,14 +702,16 @@ impl Classifier {
                 return false;
             };
             return self.within(started, CRASH_LOOP_STABLE_AFTER)
-                && previous.is_some_and(|t| {
-                    ran_for(t).is_some_and(|d| !is_stable(d)) && follows_directly(t, started)
-                });
+                && previous.is_some_and(|t| is_short_run_before(t, started));
         }
-        // Just exited, before the kubelet reports the back-off. Only a loop if it will restart.
+        // Just exited, before the kubelet reports the back-off. Only a loop if it follows another
+        // short run, so a single failure is not one, and if it will restart.
         current.is_some_and(|t| {
             t.exit_code != 0
                 && ran_for(t).is_some_and(|d| !is_stable(d))
+                && time(&t.started_at).is_some_and(|started| {
+                    previous.is_some_and(|p| is_short_run_before(p, started))
+                })
                 && spec.is_some_and(|spec| restarts_on_failure(spec, &status.name, t.exit_code))
         })
     }
@@ -713,6 +749,9 @@ const PROGRESS_DEADLINE_EXCEEDED: &str = "ProgressDeadlineExceeded";
 /// The update strategy under which pods change only when something else deletes them.
 const ON_DELETE: &str = "OnDelete";
 
+/// The StatefulSet pod management policy that creates pods without waiting for earlier ones.
+const PARALLEL: &str = "Parallel";
+
 /// The API's default when a Deployment or StatefulSet does not set `replicas`.
 const DEFAULT_REPLICAS: i32 = 1;
 
@@ -744,10 +783,12 @@ fn is_stable(ran: SignedDuration) -> bool {
     ran >= CRASH_LOOP_STABLE_AFTER
 }
 
-/// Whether a start at `started` is the next attempt after `previous`, not a later recovery.
-fn follows_directly(previous: &ContainerStateTerminated, started: Timestamp) -> bool {
-    time(&previous.finished_at)
-        .is_some_and(|finished| started.duration_since(finished) <= CRASH_LOOP_MAX_RESTART_GAP)
+/// Whether `previous` was a short run and a start at `started` is the next attempt after it, not
+/// a later recovery.
+fn is_short_run_before(previous: &ContainerStateTerminated, started: Timestamp) -> bool {
+    ran_for(previous).is_some_and(|ran| !is_stable(ran))
+        && time(&previous.finished_at)
+            .is_some_and(|finished| started.duration_since(finished) <= CRASH_LOOP_MAX_RESTART_GAP)
 }
 
 /// Whether the kubelet will restart container `name` after it exits with non-zero `exit_code`.
@@ -772,7 +813,7 @@ fn restarts_on_failure(spec: &PodSpec, name: &str, exit_code: i32) -> bool {
             _ => return false,
         };
         if matched {
-            return rule.action == "Restart";
+            return matches!(rule.action.as_str(), "Restart" | "RestartAllContainers");
         }
     }
     let policy = container
