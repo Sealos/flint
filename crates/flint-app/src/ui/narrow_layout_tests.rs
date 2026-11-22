@@ -12,7 +12,7 @@ use serde_json::Value;
 use std::time::Duration;
 
 use crate::ui::confirm::{self, DialogText};
-use crate::ui::support_tests::{TestWorkspace, open_workspace};
+use crate::ui::support_tests::{TestWorkspace, open_workspace, standard_sections};
 use crate::ui::view_state::Focus;
 
 const ROWS: &[(&str, &str, i64)] = &[("demo", "api", 0), ("demo", "web", 0)];
@@ -500,9 +500,93 @@ async fn the_breadcrumb_keeps_the_cluster_at_the_minimum_size(cx: &mut TestAppCo
 }
 
 fn crumb_width(cx: &mut TestAppContext, t: &TestWorkspace, id: &ElementId) -> Pixels {
+    crumb_bounds(cx, t, id).size.width
+}
+
+fn crumb_bounds(cx: &mut TestAppContext, t: &TestWorkspace, id: &ElementId) -> Bounds<Pixels> {
     let id = id.clone();
-    cx.update_window(t.window, |_, window, _| window.find(id).bounds().size.width)
+    cx.update_window(t.window, |_, window, _| window.find(id).bounds())
         .unwrap()
+}
+
+/// A workspace showing `kind-alpha` under the custom name `name`.
+async fn workspace_with_cluster_name(
+    cx: &mut TestAppContext,
+    dir: &std::path::Path,
+    name: &str,
+) -> TestWorkspace {
+    let settings = format!("[cluster_names]\nkind-alpha = \"{name}\"\n");
+    std::fs::write(dir.join("settings.toml"), settings).unwrap();
+    open_workspace(cx, dir).await
+}
+
+/// The cluster crumb's width with room for all of it.
+fn full_cluster_width(cx: &mut TestAppContext, t: &TestWorkspace) -> Pixels {
+    resize(cx, t, 2400., 900.);
+    crumb_width(cx, t, &ElementId::from(("crumb", 0usize)))
+}
+
+// #433: alone in the breadcrumb, a long cluster name uses the whole row.
+#[gpui_kit::test]
+async fn a_long_cluster_name_alone_shows_in_full(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let name = "prod-eu-1";
+    let t = workspace_with_cluster_name(cx, dir.path(), name).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    assert!(t.list(cx).is_none(), "the cluster is the only crumb");
+    let whole = full_cluster_width(cx, &t);
+
+    resize(cx, &t, 760., 480.);
+    let cluster = ElementId::from(("crumb", 0usize));
+    assert_eq!(t.label(cx, cluster.clone()).as_deref(), Some(name));
+    assert_eq!(crumb_width(cx, &t, &cluster), whole);
+}
+
+// #433: a long object name gives way before a long cluster name that fits.
+#[gpui_kit::test]
+async fn a_long_object_gives_way_before_a_long_cluster(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = workspace_with_cluster_name(cx, dir.path(), "production-eu").await;
+    let object = "web-".repeat(60);
+    let rows = [("demo", object.as_str(), 0)];
+    t.open_pods(cx, &rows).await;
+    let whole = full_cluster_width(cx, &t);
+
+    resize(cx, &t, 760., 480.);
+    t.click(cx, ElementId::Name(format!("row-uid-{object}").into()));
+    draw(cx, &t);
+    assert!(shown(cx, &t, "detail-back"));
+
+    let cluster = ElementId::from(("crumb", 0usize));
+    assert_eq!(crumb_width(cx, &t, &cluster), whole);
+    let shown_object = crumb_width(cx, &t, &ElementId::from(("crumb", 2usize)));
+    assert!(
+        shown_object < px(760.),
+        "the object is cut: {shown_object:?}"
+    );
+}
+
+// #433: a cluster name wider than the breadcrumb is cut and stays clear of the header's controls.
+#[gpui_kit::test]
+async fn a_cluster_name_too_long_to_fit_truncates_inside_the_header(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let name = "W".repeat(flint_core::display::MAX_CUSTOM_NAME_CHARS);
+    let t = workspace_with_cluster_name(cx, dir.path(), &name).await;
+    t.open_pods(cx, ROWS).await;
+    let whole = full_cluster_width(cx, &t);
+
+    resize(cx, &t, 760., 480.);
+    t.click(cx, "row-uid-web");
+    draw(cx, &t);
+    assert!(shown(cx, &t, "detail-back"));
+
+    let cluster = crumb_bounds(cx, &t, &ElementId::from(("crumb", 0usize)));
+    assert!(cluster.size.width < whole, "the name is cut");
+    let controls = bounds(cx, &t, "namespace-filter-button");
+    assert!(
+        cluster.right() <= controls.left(),
+        "{cluster:?} runs into {controls:?}"
+    );
 }
 
 // #421: the main window cannot be made smaller than the layout supports.

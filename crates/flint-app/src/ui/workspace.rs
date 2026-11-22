@@ -1685,7 +1685,13 @@ impl Workspace {
         // The object's name is a resource name: monospace, like the list's names.
         let mono_last = self.detail.is_some();
         let crumb_count = crumbs.len();
-        let mut breadcrumb = h_flex().flex_1().min_w_0().gap_1().text_sm();
+        // Clipped: a cluster filling the row leaves no room for the chevrons after it.
+        let mut breadcrumb = h_flex()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .gap_1()
+            .text_sm();
         for (i, (text, tip)) in crumbs.into_iter().enumerate() {
             if i > 0 {
                 breadcrumb = breadcrumb.child(
@@ -1702,8 +1708,9 @@ impl Workspace {
                     .test_support()
                     .min_w_0()
                     .truncate()
-                    // The other crumbs give way first: the cluster shrinks only past its cap.
-                    .when(i == 0, |el| el.flex_none().max_w(relative(0.6)))
+                    // The other crumbs give way first: the cluster is cut only when it alone
+                    // is wider than the breadcrumb.
+                    .when(i == 0, |el| el.flex_none().max_w_full())
                     .when(!last, |el| el.text_color(theme.muted_foreground))
                     .when(last, |el| el.font_semibold())
                     .when(last && mono_last, |el| {
