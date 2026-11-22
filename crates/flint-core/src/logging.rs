@@ -132,18 +132,32 @@ fn subscriber<W: Write>(
     tracing_subscriber::registry().with(stderr).with(file)
 }
 
-/// Keeps protocol traffic out of stderr whatever the filter says. Below WARN, rmcp prints whole
-/// requests, results and unparsable lines. Two of its warnings repeat protocol content too: the
-/// error reply to a request (`id` and `error`) and the version a client asked for.
+/// The workspace's crates, as named by the first segment of an event's target.
+const FLINT_CRATES: [&str; 5] = ["flint", "flint_app", "flint_core", "flint_e2e", "flint_mcp"];
+
+/// Dependency modules whose warnings repeat an API response: `kube_client::client` prints bodies
+/// it cannot decode and `kube_runtime::watcher` prints the API's `Status`. Targets are per module,
+/// so their other warnings (a watch timeout, an early end of stream) go too; Flint reports those
+/// failures itself.
+const RESPONSE_PRINTING_TARGETS: [&str; 2] = ["kube_client::client", "kube_runtime::watcher"];
+
+/// Keeps dependency and protocol traffic out of stderr whatever the filter says. Flint's crates
+/// follow the filter. Everything else is limited to warnings and errors, without spans, whose
+/// fields can hold a request URL. Of those, the ones that repeat a response are left out, as are
+/// rmcp's that name a request `id` (an error reply among them) or the version a client asked for.
 fn shown_on_stderr(metadata: &tracing::Metadata<'_>) -> bool {
-    if metadata.target().split("::").next() != Some("rmcp") {
+    let target = metadata.target();
+    let krate = target.split("::").next().unwrap_or_default();
+    if FLINT_CRATES.contains(&krate) {
         return true;
     }
+    if metadata.is_span() || *metadata.level() > tracing::Level::WARN {
+        return false;
+    }
     let fields = metadata.fields();
-    let error_reply = fields.field("id").is_some() && fields.field("error").is_some();
-    *metadata.level() <= tracing::Level::WARN
-        && !error_reply
-        && fields.field("client_requested").is_none()
+    !RESPONSE_PRINTING_TARGETS.contains(&target)
+        && (krate != "rmcp"
+            || (fields.field("id").is_none() && fields.field("client_requested").is_none()))
 }
 
 struct RedactingWriter<W>(W);
@@ -584,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn stderr_keeps_rmcp_to_warnings_without_protocol_content() {
+    fn stderr_limits_dependencies_to_warnings_without_traffic() {
         #[derive(Clone, Default)]
         struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl Write for Captured {
@@ -599,7 +613,7 @@ mod tests {
         let captured = Captured::default();
         let writer = captured.clone();
         let subscriber = subscriber(
-            EnvFilter::new("trace,rmcp::service=trace"),
+            EnvFilter::new("trace,rmcp::service=trace,kube_client=trace,flint_corex=trace"),
             EnvFilter::new("off"),
             None,
             move || writer.clone(),
@@ -609,20 +623,33 @@ mod tests {
             tracing::info!(target: "rmcp::service", "hidden module");
             let (id, error) = (1, "hidden error reply");
             tracing::warn!(target: "rmcp::service", %id, ?error, "response error");
+            tracing::warn!(target: "rmcp::service", %id, "hidden request id");
             let client_requested = "hidden version";
             tracing::warn!(target: "rmcp::service", %client_requested, "no version");
+            tracing::debug!(target: "kube_client::client", "hidden api status");
+            tracing::warn!(target: "kube_client::client", "hidden api body");
+            tracing::warn!(target: "kube_runtime::watcher", "hidden watch status");
+            tracing::debug!(target: "rmcpfoo", "hidden other crate");
+            tracing::debug!(target: "flint_corex", "hidden lookalike crate");
+            tracing::debug!(target: "flint_core_extra::read", "hidden longer crate name");
+            let span = tracing::warn_span!(target: "hyper", "request", url = "hidden span field");
+            let _entered = span.enter();
             tracing::warn!(target: "rmcp::service", "shown rmcp warning");
             tracing::error!(target: "rmcp", "shown rmcp error");
-            tracing::debug!(target: "rmcpfoo", "shown other crate");
+            tracing::warn!(target: "kube_client::client::tls", "shown kube warning");
+            tracing::warn!(target: "flint_corex", "shown lookalike warning");
             tracing::debug!(target: "flint_core", "shown flint debug");
+            tracing::trace!(target: "flint_mcp::server", "shown flint module trace");
         });
         let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         assert!(!output.contains("hidden"), "{output}");
         for shown in [
             "shown rmcp warning",
             "shown rmcp error",
-            "shown other crate",
+            "shown kube warning",
+            "shown lookalike warning",
             "shown flint debug",
+            "shown flint module trace",
         ] {
             assert!(output.contains(shown), "{shown}: {output}");
         }

@@ -204,35 +204,97 @@ fn exposing(context: &str, server: &str) -> String {
     )
 }
 
-/// Protocol traffic stays out of stderr at any log filter, on every path through the server: a
-/// request, its reply, an error reply and a line that does not parse. Flint's own debug events
-/// still print, so an empty stderr cannot pass. No cluster, no network.
+/// Starts a loopback API that serves just enough discovery for pods and answers everything else
+/// with a 404 `Status` naming the last path segment, as a real API server does.
+fn not_found_api() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || answer_not_found_api(stream));
+        }
+    });
+    server
+}
+
+fn answer_not_found_api(mut stream: std::net::TcpStream) {
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).is_err() {
+        return;
+    }
+    let mut header = String::new();
+    while reader.read_line(&mut header).is_ok_and(|read| read > 0) && header.trim() != "" {
+        header.clear();
+    }
+    let target = request_line.split(' ').nth(1).unwrap_or("/");
+    let path = target.split('?').next().unwrap_or(target);
+    let (status, body) = match path {
+        "/version" => (
+            "200 OK",
+            json!({"major": "1", "minor": "33", "gitVersion": "v1.33.0"}),
+        ),
+        "/api" => ("200 OK", json!({"kind": "APIVersions", "versions": ["v1"]})),
+        "/apis" => (
+            "200 OK",
+            json!({"kind": "APIGroupList", "apiVersion": "v1", "groups": []}),
+        ),
+        "/api/v1" => (
+            "200 OK",
+            json!({"kind": "APIResourceList", "groupVersion": "v1", "resources": [{
+                "name": "pods", "singularName": "pod", "namespaced": true, "kind": "Pod",
+                "verbs": ["get", "list", "watch"]
+            }]}),
+        ),
+        _ => {
+            let name = path.rsplit('/').next().unwrap_or_default();
+            (
+                "404 Not Found",
+                json!({
+                    "kind": "Status", "apiVersion": "v1", "metadata": {}, "status": "Failure",
+                    "message": format!("pods \"{name}\" not found"), "reason": "NotFound",
+                    "details": {"name": name, "kind": "pods"}, "code": 404
+                }),
+            )
+        }
+    };
+    let body = body.to_string();
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+}
+
+/// Protocol traffic and API error bodies stay out of stderr at any log filter, on every path
+/// through the server: a request, its reply, an error reply, a line that does not parse and a
+/// 404 from the API. Flint's own debug events still print, so an empty stderr cannot pass.
 #[test]
 fn protocol_traffic_stays_out_of_stderr_at_any_log_filter() {
     const MARKER: &str = "flint-protocol-marker";
+    const API_MARKER: &str = "flintcanary123";
+    let api = not_found_api();
     // A bare target directive turns Flint's events off, so it has no control event to look for.
     for (filter, flint_debug_shown) in [
         ("debug", true),
         ("trace", true),
-        ("rmcp::service=debug", false),
+        ("kube_client=debug", false),
         ("rmcp::service=debug,flint_core=debug", true),
     ] {
         let scratch = tempfile::tempdir().unwrap();
-        let config_dir = scratch.path().join("config");
-        std::fs::create_dir_all(config_dir.join("home")).unwrap();
+        let kubeconfig = scratch.path().join("kubeconfig");
         std::fs::write(
-            config_dir.join("settings.toml"),
-            "path = \"/usr/bin:/bin\"\n",
+            &kubeconfig,
+            format!("apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: {api}\nusers:\n- name: u\n  user:\n    token: fake\ncontexts:\n- name: dev\n  context:\n    cluster: c\n    user: u\n"),
         )
         .unwrap();
+        let config_dir = scratch.path().join("config");
+        std::fs::create_dir_all(config_dir.join("home")).unwrap();
+        std::fs::write(config_dir.join("settings.toml"), exposing("dev", &api)).unwrap();
         let stderr_path = scratch.path().join("stderr.log");
         let stderr = std::fs::File::create(&stderr_path).unwrap();
-        let mut server = Server::start_logging(
-            std::ffi::OsStr::new("/dev/null"),
-            &config_dir,
-            filter,
-            stderr.into(),
-        );
+        let mut server =
+            Server::start_logging(kubeconfig.as_os_str(), &config_dir, filter, stderr.into());
         let stdin = server.stdin.as_mut().unwrap();
         writeln!(stdin, "{{not json {MARKER}").unwrap();
         stdin.flush().unwrap();
@@ -243,10 +305,17 @@ fn protocol_traffic_stays_out_of_stderr_at_any_log_filter() {
         // Answered with a protocol error rather than a failed tool result.
         let unknown = server.exchange("tools/call", json!({"name": MARKER, "arguments": {}}));
         assert!(unknown.get("error").is_some(), "{unknown}");
+        let (failed, reply) = server.call(
+            "get_resource",
+            json!({"cluster": "dev", "kind": "pods", "namespace": "web", "name": API_MARKER}),
+        );
+        assert!(failed, "{filter}: {reply}");
+        assert!(reply.contains(API_MARKER), "{filter}: {reply}");
         drop(server);
 
         let stderr = std::fs::read_to_string(&stderr_path).unwrap();
         assert!(!stderr.contains(MARKER), "{filter}: {stderr}");
+        assert!(!stderr.contains(API_MARKER), "{filter}: {stderr}");
         if flint_debug_shown {
             assert!(stderr.contains("resolved PATH"), "{filter}: {stderr}");
         }
