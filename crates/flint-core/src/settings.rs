@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -1155,11 +1156,16 @@ pub fn set_log_buffer_mib(dir: &Path, mib: u32) -> Result<Settings, SettingsErro
 /// as [`Settings`], and writes it. A file that does not load today is left as it is, so an edit
 /// cannot bring its other values into effect. Keys this version does not know survive; comments
 /// and formatting are not preserved.
+///
+/// The read, the edit and the write happen under [`SaveLock`], so saves from several Flint
+/// processes apply one after another, each to what the last one wrote. This can wait up to
+/// [`SAVE_LOCK_WAIT`]: call it off the UI thread and off async workers.
 fn edit_settings(
     dir: &Path,
     edit: impl FnOnce(&mut toml::Table, &Path) -> Result<(), SettingsError>,
 ) -> Result<Settings, SettingsError> {
     let path = dir.join(SETTINGS_FILE);
+    let _lock = lock_for_save(&path)?;
     let mut table = match read_settings_text(&path)? {
         Some(text) => parse_settings(&text, &path)?.1,
         None => toml::Table::new(),
@@ -1173,6 +1179,91 @@ fn edit_settings(
     validate(&settings, &path)?;
     write_atomic(&path, &text, DanglingLink::Keep)?;
     Ok(settings)
+}
+
+/// How long a save waits for another process's save before it fails.
+const SAVE_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// An exclusive `flock` serializing saves of one settings file. It is on a separate file, because
+/// a save replaces the settings file and with it any lock held on it. The OS releases it when the
+/// holder exits, however that happens.
+struct SaveLock {
+    /// Closing it releases the lock.
+    _file: std::fs::File,
+}
+
+impl SaveLock {
+    /// Takes the lock for the settings file at `settings`, trying for up to `wait`.
+    fn take(settings: &Path, wait: Duration) -> io::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let path = save_lock_path(settings);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Non-blocking, so that something other than a regular file here cannot hang the open.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the settings lock is not a regular file",
+            ));
+        }
+        let deadline = Instant::now() + wait;
+        loop {
+            // SAFETY: flock on a descriptor `file` owns.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(SaveLock { _file: file });
+            }
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => {}
+                _ => return Err(error),
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "another Flint is still saving settings; try again",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// The lock file beside the file a save really replaces, so paths that link to one settings file
+/// share one lock, and a directory a save can write to is also one that can hold the lock.
+fn save_lock_path(settings: &Path) -> PathBuf {
+    let mut path = std::fs::canonicalize(settings)
+        .unwrap_or_else(|_| settings.to_owned())
+        .into_os_string();
+    path.push(".lock");
+    path.into()
+}
+
+/// [`SaveLock::take`] for a save. A dangling link fails as unreadable before anything is created
+/// beside it. If the lock cannot be set up, a settings file that cannot be read is reported as
+/// that. A timeout reads nothing: the holder may be stuck on that same read.
+fn lock_for_save(path: &Path) -> Result<SaveLock, SettingsError> {
+    if behind_dangling_link(path) {
+        read_settings_text(path)?;
+    }
+    SaveLock::take(path, SAVE_LOCK_WAIT).or_else(|source| {
+        if source.kind() != io::ErrorKind::TimedOut {
+            read_settings_text(path)?;
+        }
+        Err(SettingsError::Write {
+            path: path.to_owned(),
+            source,
+        })
+    })
 }
 
 fn load_toml<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T, SettingsError> {
@@ -1321,6 +1412,163 @@ pub(crate) fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
     match (path.strip_prefix("~"), home) {
         (Ok(rest), Some(home)) => home.join(rest),
         _ => path.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod save_lock_tests {
+    use super::*;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc;
+
+    const CHILD_DIR: &str = "FLINT_TEST_SAVE_LOCK_DIR";
+    const CHILD_ROLE: &str = "FLINT_TEST_SAVE_LOCK_ROLE";
+    const EDITS: usize = 30;
+    const HELD_MARKER: &str = "held";
+
+    /// Not a test of its own: what [`spawn_child`] runs in another process.
+    #[test]
+    fn child_process() {
+        let (Some(dir), Ok(role)) = (std::env::var_os(CHILD_DIR), std::env::var(CHILD_ROLE)) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        if role == "hold" {
+            let _lock = SaveLock::take(&dir.join(SETTINGS_FILE), Duration::from_secs(10)).unwrap();
+            std::fs::write(dir.join(HELD_MARKER), "").unwrap();
+            std::thread::sleep(Duration::from_secs(60));
+        } else {
+            for i in 0..EDITS {
+                let name = format!("{role}{i}");
+                set_cluster_name(&dir, &name, Some(&name)).unwrap();
+            }
+        }
+    }
+
+    fn spawn_child(dir: &Path, role: &str) -> Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "settings::save_lock_tests::child_process"])
+            .env(CHILD_DIR, dir)
+            .env(CHILD_ROLE, role)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn two_processes_saving_at_once_lose_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let children = ["a", "b"].map(|role| spawn_child(dir.path(), role));
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+        let saved = load_settings(dir.path()).unwrap();
+        for role in ["a", "b"] {
+            for i in 0..EDITS {
+                let name = format!("{role}{i}");
+                assert_eq!(saved.cluster_names.get(&name), Some(&name));
+            }
+        }
+    }
+
+    #[test]
+    fn a_stale_save_does_not_undo_a_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        set_trusted(path, "dev", Some("https://dev")).unwrap();
+        let (read_tx, read_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            // Dropped if an assertion below fails, so the stale save cannot wait forever.
+            let finish_tx = finish_tx;
+            let stale = scope.spawn(move || {
+                edit_settings(path, move |table, _| {
+                    read_tx.send(()).unwrap();
+                    finish_rx.recv().unwrap();
+                    table.insert("appearance".into(), "dark".into());
+                    Ok(())
+                })
+            });
+            read_rx.recv().unwrap();
+            let revoke = scope.spawn(move || set_trusted(path, "dev", None));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!revoke.is_finished(), "the revocation waits for the save");
+            finish_tx.send(()).unwrap();
+            stale.join().unwrap().unwrap();
+            revoke.join().unwrap().unwrap();
+        });
+        let saved = load_settings(path).unwrap();
+        assert!(saved.trusted_clusters.is_empty(), "still revoked");
+        assert_eq!(saved.appearance, Appearance::Dark, "both edits kept");
+    }
+
+    #[test]
+    fn a_held_lock_fails_the_save_within_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE);
+        std::fs::write(&path, "appearance = \"light\"\n").unwrap();
+        let held = SaveLock::take(&path, Duration::ZERO).unwrap();
+
+        let started = Instant::now();
+        let error = set_appearance(dir.path(), Appearance::Dark).unwrap_err();
+        let waited = started.elapsed();
+        assert!(waited >= SAVE_LOCK_WAIT && waited < SAVE_LOCK_WAIT * 5);
+        let SettingsError::Write { source, .. } = &error else {
+            panic!("expected a write error, got {error:?}");
+        };
+        assert_eq!(source.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("another Flint"));
+        assert_eq!(
+            load_settings(dir.path()).unwrap().appearance,
+            Appearance::Light
+        );
+
+        drop(held);
+        set_appearance(dir.path(), Appearance::Dark).unwrap();
+    }
+
+    #[test]
+    fn a_crashed_holder_does_not_block_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut holder = spawn_child(dir.path(), "hold");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !dir.path().join(HELD_MARKER).exists() {
+            assert!(Instant::now() < deadline, "the holder never took the lock");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let path = dir.path().join(SETTINGS_FILE);
+        assert!(SaveLock::take(&path, Duration::ZERO).is_err(), "it is held");
+
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        set_appearance(dir.path(), Appearance::Dark).unwrap();
+    }
+
+    #[test]
+    fn a_lock_path_that_is_not_a_file_fails_without_hanging() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE);
+        let fifo = std::ffi::CString::new(save_lock_path(&path).as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(matches!(
+            set_appearance(dir.path(), Appearance::Dark),
+            Err(SettingsError::Write { .. })
+        ));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_dangling_config_dir_stays_a_read_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("config");
+        std::os::unix::fs::symlink(dir.path().join("gone"), &link).unwrap();
+        assert!(matches!(
+            set_appearance(&link, Appearance::Dark),
+            Err(SettingsError::Read { .. })
+        ));
+        assert!(!dir.path().join("gone").exists());
     }
 }
 
