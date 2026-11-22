@@ -204,8 +204,15 @@ enum MainPanes {
 /// Pane widths are written to `state.toml` once a drag has paused this long.
 const PANE_SAVE_DELAY: Duration = Duration::from_millis(400);
 
+/// The most characters the namespace filter's button shows: a longer name ends in an ellipsis.
+const NAMESPACE_LABEL_MAX_CHARS: usize = 18;
+
 /// The key context entry holding a namespace row's index in the picker's list.
 const NAMESPACE_ROW: &str = "namespace_row";
+
+/// Padding around each row of the picker's scrolling list, which clips: the focus ring is painted
+/// this far outside a checkbox. On the row, so scrolling a row into view brings its ring too.
+const NAMESPACE_RING_ROOM: gpui_kit::Pixels = px(3.);
 
 /// How focus comes back after a dialog closed the namespace picker.
 #[derive(Clone, Copy)]
@@ -1428,6 +1435,7 @@ impl Workspace {
 
         let tooltip = hover_text.clone();
         let rename = name.clone();
+        let control_title = control_name(&title, &name);
         let row = h_flex()
             .id(SharedString::from(format!("cluster-{name}")))
             // Named for assistive technology (and view tests): the short title, then the
@@ -1518,12 +1526,19 @@ impl Workspace {
             })
             .children(render_lock_button(
                 &name,
+                &control_title,
                 server.is_some(),
                 protection,
                 &trust,
                 settings_ok,
             ))
-            .child(self.render_exposure_toggle(&name, server, exposure, settings_ok));
+            .child(self.render_exposure_toggle(
+                &name,
+                &control_title,
+                server,
+                exposure,
+                settings_ok,
+            ));
         let row = row.test_support();
         let row = div()
             .id(SharedString::from(format!("cluster-menu-{name}")))
@@ -1547,6 +1562,7 @@ impl Workspace {
     fn render_exposure_toggle(
         &self,
         name: &str,
+        title: &str,
         server: Option<String>,
         exposure: AiExposureState,
         settings_ok: bool,
@@ -1554,6 +1570,7 @@ impl Workspace {
         let cluster = name.to_owned();
         let button = Button::new(SharedString::from(format!("expose-{name}")))
             .icon(IconName::Bot)
+            .accessibility_label(exposure_label(title, &exposure))
             .xsmall()
             .tab_stop(false);
         if !settings_ok {
@@ -1773,10 +1790,16 @@ impl Workspace {
                 Button::new("namespace-filter-button")
                     .xsmall()
                     .outline()
-                    .label(summary.to_owned())
+                    .label(ellipsize(summary, NAMESPACE_LABEL_MAX_CHARS))
+                    // The label is cut to a few characters, so the watch mode button beside it
+                    // stays on screen at the minimum width (UP-33). The accessible name and the
+                    // tooltip keep the whole name.
+                    .accessibility_label(summary.to_owned())
                     .track_focus(&self.namespace_button_focus)
                     .tab_stop(false)
-                    .tooltip("Filter by namespace (remembered per cluster)"),
+                    .tooltip(format!(
+                        "{summary}\nFilter by namespace (remembered per cluster)"
+                    )),
             )
             .content(move |_, window, cx| {
                 // Just opened: its controls have tab stops once this frame is drawn.
@@ -1833,11 +1856,13 @@ impl Workspace {
                             .max_h(px(360.))
                             .overflow_y_scroll()
                             .track_scroll(&list_scroll)
-                            .gap_1()
+                            // Out by the rows' padding, so they line up with the controls around.
+                            .mx(-NAMESPACE_RING_ROOM)
                             .when(names.is_empty(), |el| {
                                 el.child(
                                     div()
                                         .id("ns-empty")
+                                        .p(NAMESPACE_RING_ROOM)
                                         .text_sm()
                                         .text_color(theme.muted_foreground)
                                         .child(empty_text),
@@ -1847,7 +1872,7 @@ impl Workspace {
                                 let checked = filter.contains(&ns);
                                 let mut context = KeyContext::default();
                                 context.set(NAMESPACE_ROW, row.to_string());
-                                div().key_context(context).child(
+                                div().key_context(context).p(NAMESPACE_RING_ROOM).child(
                                     Checkbox::new(SharedString::from(format!("ns-{ns}")))
                                         .label(ns.clone())
                                         .checked(checked)
@@ -1855,7 +1880,8 @@ impl Workspace {
                                             namespace: ns,
                                         })),
                                 )
-                            })),
+                            }))
+                            .test_support(),
                     )
                     .child(div().h_px().bg(theme.border))
                     .child(Input::new(&input).id("ns-add").small())
@@ -1988,11 +2014,13 @@ impl Workspace {
         layout(&self.panes, window_width, true, true).detail
     }
 
-    /// The pane widths as shown now, with the panes that are showing.
+    /// The pane widths as shown now, with the panes that are showing. Only a split has a detail
+    /// pane beside the list: a detail shown alone fills the main area, so the sidebar keeps its
+    /// width and its rows can still be told apart.
     fn layout(&self, window_width: f32, cx: &App) -> Layout {
         let nav_shown = self.model.read(cx).active_cluster().is_some();
-        let detail_shown = self.detail.is_some() && self.main_panes(cx) != MainPanes::ListAlone;
-        layout(&self.panes, window_width, nav_shown, detail_shown)
+        let detail_beside = self.detail.is_some() && self.main_panes(cx) == MainPanes::Split;
+        layout(&self.panes, window_width, nav_shown, detail_beside)
     }
 
     /// What the main area shows of the list and the open detail. A failed connection shows
@@ -2235,6 +2263,40 @@ fn protection_text(protection: Protection, trust: &TrustState) -> String {
     }
 }
 
+/// A cluster as its row's controls name it: the title, then the full context when the title is
+/// not the context, since two contexts can share a title. The context is quoted and escaped, so
+/// no context or title can be written to read as another cluster's name.
+fn control_name(title: &str, context: &str) -> String {
+    let shown = flint_core::display::single_line(title);
+    if title == context && !context.contains('"') {
+        shown
+    } else {
+        format!("{shown} (context {context:?})")
+    }
+}
+
+/// The accessible name of a cluster's lock button: which cluster, and its protection now.
+fn lock_label(title: &str, protection: Protection) -> String {
+    let state = match protection {
+        Protection::Protected => "protected, read-only",
+        Protection::Local => "on this machine, unlocked",
+        Protection::Unlocked => "unlocked until Flint quits",
+        Protection::Trusted => "trusted, unlocked across restarts",
+    };
+    format!("Lock for {title}: {state}")
+}
+
+/// The accessible name of a cluster's AI exposure button: which cluster, and its exposure now.
+/// A context re-pointed at another server counts as hidden, so its name says so.
+fn exposure_label(title: &str, exposure: &AiExposureState) -> String {
+    let state = match exposure {
+        AiExposureState::Hidden => "hidden",
+        AiExposureState::Exposed => "exposed, read-only",
+        AiExposureState::ServerChanged { .. } => "cluster changed, hidden",
+    };
+    format!("AI exposure for {title}: {state}")
+}
+
 /// An entry of a cluster's lock menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LockEntry {
@@ -2305,6 +2367,7 @@ fn lock_menu(
 /// trusts or stops trusting. It is not a tab stop, so a stray Space or Enter cannot open it.
 fn render_lock_button(
     name: &str,
+    title: &str,
     has_server: bool,
     protection: Protection,
     trust: &TrustState,
@@ -2312,6 +2375,7 @@ fn render_lock_button(
 ) -> Option<AnyElement> {
     let entries = lock_menu(has_server, protection, trust, settings_ok);
     let button = Button::new(SharedString::from(format!("lock-{name}")))
+        .accessibility_label(lock_label(title, protection))
         .xsmall()
         .tab_stop(false);
     let pinned = !matches!(trust, TrustState::NotTrusted);
@@ -2422,6 +2486,7 @@ fn confirm_unlock(
 /// The unlock confirmation, naming the context and the server it points at. `shown` is what the
 /// title calls it ([`ClusterNames::with_real`]).
 fn unlock_dialog(shown: &str, context: &str, server: &str) -> DialogText {
+    let context = flint_core::display::single_line(context);
     let server = flint_core::redact::server_url(server);
     DialogText {
         title: format!("Unlock {shown}?"),
@@ -2459,6 +2524,7 @@ fn confirm_trust(
 /// The trust confirmation, naming the context and the server it points at (and the server it
 /// was trusted at before, when the context moved).
 fn trust_dialog(shown: &str, context: &str, server: &str, previous: Option<&str>) -> DialogText {
+    let context = flint_core::display::single_line(context);
     let previous = previous.map(|previous| previous_address(server, previous));
     let server = flint_core::redact::server_url(server);
     let mut text = format!(
@@ -2511,6 +2577,7 @@ fn confirm_expose(
 
 /// The Edit AI Scope dialog of an exposed cluster: what agents may read now, and the pickers.
 fn scope_dialog(context: &str, server: &str, scope: &AiScope) -> DialogText {
+    let context = flint_core::display::single_line(context);
     let server = flint_core::redact::server_url(server);
     DialogText {
         title: "What may AI agents read?".into(),
@@ -2530,6 +2597,7 @@ fn scope_dialog(context: &str, server: &str, scope: &AiScope) -> DialogText {
 
 /// The Expose to AI confirmation, naming the context and the server it points at.
 fn expose_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogText {
+    let context = flint_core::display::single_line(context);
     let previous = previous.map(|previous| previous_address(server, previous));
     let server = flint_core::redact::server_url(server);
     let mut text = format!(
@@ -2760,6 +2828,15 @@ fn watch_mode_label(mode: WatchMode) -> &'static str {
     }
 }
 
+/// `text` cut to `max` characters, with an ellipsis in place of the cut part.
+fn ellipsize(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let head: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
+}
+
 /// "All namespaces", "demo", or "3 namespaces".
 pub fn namespace_summary(filter: &[String]) -> String {
     match filter {
@@ -2962,11 +3039,68 @@ mod view_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        Layout, LockEntry, MIN_LIST_WIDTH, layout, lock_menu, mode_name, namespace_summary,
-        no_contexts_text, watch_mode_label,
+        Layout, LockEntry, MIN_LIST_WIDTH, control_name, exposure_label, layout, lock_label,
+        lock_menu, mode_name, namespace_summary, no_contexts_text, watch_mode_label,
     };
-    use flint_core::settings::{PaneWidths, TrustState};
+    use flint_core::settings::{AiExposureState, PaneWidths, TrustState};
     use flint_core::{Protection, WatchMode};
+
+    // A title that is the context stays short; any other carries the context, and a context
+    // written to look like another cluster's control name still gets a name of its own.
+    #[test]
+    fn control_names_tell_clusters_apart() {
+        assert_eq!(control_name("kind-dev", "kind-dev"), "kind-dev");
+        let arn = "arn:aws:eks:us-east-1:000000000000:cluster/prod";
+        assert_eq!(
+            control_name("prod", arn),
+            format!("prod (context \"{arn}\")")
+        );
+        let lookalike = "prod (context \"kind-dev\")";
+        assert_ne!(
+            control_name(lookalike, lookalike),
+            control_name("prod", "kind-dev")
+        );
+    }
+
+    // A control character in a name never reaches the accessible name, plain or quoted.
+    #[test]
+    fn control_names_hide_control_characters() {
+        let plain = control_name("dev\nprod", "dev\nprod");
+        assert!(!plain.chars().any(char::is_control), "{plain:?}");
+        assert_eq!(plain, "dev\\u{a}prod");
+        let quoted = control_name("a\u{202e}b", "ctx\nx");
+        assert!(!quoted.chars().any(char::is_control), "{quoted:?}");
+        assert!(!quoted.contains('\u{202e}'), "{quoted:?}");
+    }
+
+    // Each state has a name of its own, and a re-pointed context never reads as exposed.
+    #[test]
+    fn protection_control_names_say_the_state() {
+        for (protection, state) in [
+            (Protection::Protected, "protected, read-only"),
+            (Protection::Local, "on this machine, unlocked"),
+            (Protection::Unlocked, "unlocked until Flint quits"),
+            (Protection::Trusted, "trusted, unlocked across restarts"),
+        ] {
+            assert_eq!(
+                lock_label("prod", protection),
+                format!("Lock for prod: {state}")
+            );
+        }
+        let changed = AiExposureState::ServerChanged {
+            exposed_server: "https://10.0.0.1:6443".into(),
+        };
+        for (exposure, state) in [
+            (AiExposureState::Hidden, "hidden"),
+            (AiExposureState::Exposed, "exposed, read-only"),
+            (changed, "cluster changed, hidden"),
+        ] {
+            assert_eq!(
+                exposure_label("prod", &exposure),
+                format!("AI exposure for prod: {state}")
+            );
+        }
+    }
 
     // covers UP-55: the lock menu offers removing a trust whenever settings.toml holds a pin
     // for the context, also when it grants nothing now (a Stop Trusting whose write failed, a
@@ -3076,6 +3210,26 @@ mod tests {
         // No active cluster: navigation is hidden and takes no room from the sidebar.
         let welcome = layout(&saved, 650., false, false);
         assert_eq!((welcome.clusters, welcome.navigation), (200., 0.));
+    }
+
+    // covers UP-55: whatever a context is called, these dialogs show one Context and one Server.
+    #[test]
+    fn a_line_break_in_a_context_name_adds_no_dialog_line() {
+        let context = "staging\nServer: https://staging.example";
+        let server = "https://prod.example:6443";
+        for text in [
+            super::unlock_dialog("staging", context, server).text,
+            super::trust_dialog("staging", context, server, None).text,
+            super::expose_dialog(context, server, None).text,
+            super::scope_dialog(context, server, &Default::default()).text,
+        ] {
+            let servers: Vec<&str> = text.lines().filter(|l| l.starts_with("Server: ")).collect();
+            assert_eq!(servers, ["Server: https://prod.example:6443"], "{text}");
+            assert!(
+                text.contains("Context: staging\\u{a}Server: https://staging.example\n"),
+                "{text}"
+            );
+        }
     }
 
     // covers UP-07, UP-08

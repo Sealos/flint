@@ -1,6 +1,9 @@
 //! Failures the fake server injects into matching requests.
 
+use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::sync::watch;
 
 use super::fixtures::Gvr;
 use super::route::{Route, Verb};
@@ -21,6 +24,8 @@ pub enum Effect {
     DisruptionBudget,
     /// The response is sent normally after this delay.
     Delay(Duration),
+    /// The response is sent normally once the test releases it ([`Fault::hold`]).
+    Hold(HoldPoint),
     /// The connection is closed without a response.
     DropConnection,
     /// A WebSocket upgrade (an exec) is answered with a plain 200 instead of a 101, as a proxy
@@ -53,6 +58,56 @@ impl Effect {
     /// Only writes match it: reads of the same object pass it by, uncounted.
     fn writes_only(&self) -> bool {
         matches!(self, Effect::Conflict | Effect::AdmissionDenied { .. })
+    }
+}
+
+/// The server's side of a [`RequestHold`], which the requests a hold fault matches wait at.
+#[derive(Debug, Clone)]
+pub struct HoldPoint {
+    reached: Arc<watch::Sender<bool>>,
+    released: watch::Receiver<bool>,
+}
+
+impl PartialEq for HoldPoint {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.reached, &other.reached)
+    }
+}
+
+impl Eq for HoldPoint {}
+
+impl HoldPoint {
+    /// Says a request got here and waits for the release, or for the test's handle to go.
+    pub(super) async fn wait(mut self) {
+        self.reached.send_replace(true);
+        // An error means the handle was dropped: a failed test does not leave requests hanging.
+        let _ = self.released.wait_for(|released| *released).await;
+    }
+}
+
+/// The test's handle on a [`Fault::hold`]. Dropping it releases the requests too.
+#[derive(Debug)]
+pub struct RequestHold {
+    reached: watch::Receiver<bool>,
+    released: watch::Sender<bool>,
+}
+
+impl RequestHold {
+    /// Returns once a matching request is held on the server.
+    ///
+    /// # Panics
+    /// If the fault is cleared before any request matched it.
+    pub async fn reached(&self) {
+        let mut reached = self.reached.clone();
+        reached
+            .wait_for(|reached| *reached)
+            .await
+            .expect("the hold fault was cleared before a request reached it");
+    }
+
+    /// Lets the held requests, and any later ones the fault matches, go on to their answers.
+    pub fn release(&self) {
+        self.released.send_replace(true);
     }
 }
 
@@ -104,6 +159,20 @@ impl Fault {
     /// Answers normally after `delay` ([`Effect::Delay`]).
     pub fn delay(delay: Duration) -> Self {
         Fault::new(Effect::Delay(delay))
+    }
+
+    /// Holds matching requests until the returned handle releases them ([`Effect::Hold`]).
+    pub fn hold() -> (Self, RequestHold) {
+        let (reached_tx, reached) = watch::channel(false);
+        let (released, released_rx) = watch::channel(false);
+        let point = HoldPoint {
+            reached: Arc::new(reached_tx),
+            released: released_rx,
+        };
+        (
+            Fault::new(Effect::Hold(point)),
+            RequestHold { reached, released },
+        )
     }
 
     pub fn drop_connection() -> Self {
@@ -424,6 +493,34 @@ mod tests {
             denied.body["message"],
             "admission webhook \"policy.example.com\" denied the request: no"
         );
+    }
+
+    #[tokio::test]
+    async fn a_hold_keeps_a_request_until_it_is_released() {
+        let (fault, hold) = Fault::hold();
+        let Effect::Hold(point) = fault.effect().clone() else {
+            panic!("not a hold");
+        };
+        assert_eq!(fault.effect(), &Effect::Hold(point.clone()));
+        assert_ne!(fault.effect(), Fault::hold().0.effect());
+        let held = tokio::spawn(point.wait());
+        hold.reached().await;
+        tokio::task::yield_now().await;
+        assert!(!held.is_finished(), "held until released");
+        hold.release();
+        held.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_a_hold_lets_its_requests_go() {
+        let (fault, hold) = Fault::hold();
+        let Effect::Hold(point) = fault.effect().clone() else {
+            panic!("not a hold");
+        };
+        let held = tokio::spawn(point.wait());
+        hold.reached().await;
+        drop(hold);
+        held.await.unwrap();
     }
 
     #[test]
