@@ -16,7 +16,7 @@ user can expose a production cluster and still know what an agent could see and 
    private key blocks, cloud access keys, vendor tokens, passwords in URLs, and `password=`, `token=` and `secret=`
    style pairs. The same applies to other message text an agent can read: list columns, status, condition and
    container termination messages in objects, and container arguments. The result says how many values were
-   replaced. The app's own views are not redacted. AI log analysis (ADR-0011) uses the same redactor.
+   replaced. The app's own views are not redacted. AI log analysis (ADR-0011), which is not scheduled, would use the same redactor.
 3. **An agent activity log.** Every MCP call is recorded: when, which cluster, which tool, what it named (kind,
    namespace, object, container), how much came back, whether it was cut short or denied. Returned content is never
    recorded. The app shows the log per cluster.

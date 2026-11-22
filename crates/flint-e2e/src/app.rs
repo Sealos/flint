@@ -35,7 +35,7 @@
 //! windows at once.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -463,28 +463,32 @@ impl App {
     }
 
     fn request_within(&self, cmd: &str, args: Value, timeout: Duration) -> Result<Value, AppError> {
+        let line = self.request_line(cmd, &args);
+        let answer = exchange(&self.socket, &line, timeout)
+            .map_err(|e| self.error("transport", format!("{cmd}: {e}"), None))?;
+        self.response(cmd, &answer)
+    }
+
+    fn request_line(&self, cmd: &str, args: &Value) -> String {
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let line = json!({"id": id, "cmd": cmd, "args": args}).to_string();
-        let failed = |code: &str, message: String, data: Option<Box<Value>>| AppError {
+        json!({"id": id, "cmd": cmd, "args": args}).to_string()
+    }
+
+    fn error(&self, code: &str, message: String, data: Option<Box<Value>>) -> AppError {
+        AppError {
             code: code.to_owned(),
             message,
             data,
             log_tail: self.log_tail(),
-        };
-        let transport = |e: std::io::Error| failed("transport", format!("{cmd}: {e}"), None);
-        let mut stream = UnixStream::connect(&self.socket).map_err(transport)?;
-        stream.set_read_timeout(Some(timeout)).map_err(transport)?;
-        stream
-            .write_all(format!("{line}\n").as_bytes())
-            .map_err(transport)?;
-        let mut answer = String::new();
-        BufReader::new(stream)
-            .read_line(&mut answer)
-            .map_err(transport)?;
-        let response: Value = serde_json::from_str(&answer).map_err(|e| {
-            failed(
+        }
+    }
+
+    /// The result in a response line, or the error it reports.
+    fn response(&self, cmd: &str, answer: &str) -> Result<Value, AppError> {
+        let response: Value = serde_json::from_str(answer).map_err(|e| {
+            self.error(
                 "transport",
                 format!("{cmd}: not a response ({e}): {answer:?}"),
                 None,
@@ -494,7 +498,7 @@ impl App {
             Ok(response["result"].clone())
         } else {
             let error = &response["error"];
-            Err(failed(
+            Err(self.error(
                 error["code"].as_str().unwrap_or("unknown"),
                 format!(
                     "{cmd}: {}",
@@ -593,11 +597,44 @@ impl App {
     /// Dispatches a registered action by name (`detail::ShowYaml`, `flint::AppearanceDark`).
     /// `args` is `Value::Null` for an action without arguments.
     pub fn dispatch(&self, action: &str, args: Value) -> Result<Value, AppError> {
+        self.send_action(action, args, None)
+    }
+
+    /// [`App::dispatch`] that fails with a `timeout` error naming the action and `deadline` if
+    /// the whole exchange (connecting, sending, reading the answer) takes longer.
+    ///
+    /// The request has its own connection, closed on timeout, so a late answer cannot reach a
+    /// later request. The app cannot be told to cancel: an action it already received may still
+    /// run after this returns.
+    pub fn dispatch_within(
+        &self,
+        action: &str,
+        args: Value,
+        deadline: Duration,
+    ) -> Result<Value, AppError> {
+        self.send_action(action, args, Some(deadline))
+    }
+
+    fn send_action(
+        &self,
+        action: &str,
+        args: Value,
+        deadline: Option<Duration>,
+    ) -> Result<Value, AppError> {
+        const CMD: &str = "dispatch_action";
         let mut request = json!({ "name": action });
         if !args.is_null() {
             request["args"] = args;
         }
-        self.request("dispatch_action", request)
+        let Some(deadline) = deadline else {
+            return self.request(CMD, request);
+        };
+        let line = self.request_line(CMD, &request);
+        let answer = exchange_by(&self.socket, &line, deadline).map_err(|e| {
+            let (code, message) = dispatch_failure(action, deadline, &e);
+            self.error(code, message, None)
+        })?;
+        self.response(CMD, &answer)
     }
 
     /// Types text into the focused element, one keystroke per character.
@@ -819,9 +856,169 @@ impl Drop for App {
     }
 }
 
+/// Sends `line` on a new connection and reads one answer line, each read limited to `timeout`.
+fn exchange(socket: &Path, line: &str, timeout: Duration) -> io::Result<String> {
+    let mut stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.write_all(format!("{line}\n").as_bytes())?;
+    let mut answer = String::new();
+    BufReader::new(stream).read_line(&mut answer)?;
+    Ok(answer)
+}
+
+/// [`exchange`] with one limit on all of it, so an answer arriving a byte at a time cannot
+/// outlast it. Fails with [`io::ErrorKind::TimedOut`]. Connecting runs on a helper thread, as a
+/// blocking connect to a full backlog has no timeout; if it connects late, nothing is sent.
+fn exchange_by(socket: &Path, line: &str, limit: Duration) -> io::Result<String> {
+    let start = Instant::now();
+    let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "deadline passed");
+    // Capped because a socket refuses very long timeouts; the loops below re-arm it.
+    let left = || {
+        let left = limit.saturating_sub(start.elapsed());
+        if left.is_zero() {
+            Err(timed_out())
+        } else {
+            Ok(left.min(ANSWER))
+        }
+    };
+    let retry = |e: &io::Error| {
+        matches!(
+            e.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+        )
+    };
+
+    let (connected, connection) = std::sync::mpsc::channel();
+    let path = socket.to_owned();
+    std::thread::Builder::new()
+        .name("automation-connect".into())
+        .spawn(move || {
+            let _ = connected.send(UnixStream::connect(path));
+        })?;
+    let mut stream = connection.recv_timeout(limit).map_err(|_| timed_out())??;
+
+    let request = format!("{line}\n");
+    let mut unsent = request.as_bytes();
+    while !unsent.is_empty() {
+        stream.set_write_timeout(Some(left()?))?;
+        match stream.write(unsent) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => unsent = &unsent[n..],
+            Err(e) if retry(&e) => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    let mut answer = Vec::new();
+    let mut chunk = [0; 4096];
+    loop {
+        stream.set_read_timeout(Some(left()?))?;
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                answer.extend_from_slice(&chunk[..n]);
+                if let Some(end) = answer.iter().position(|&b| b == b'\n') {
+                    answer.truncate(end + 1);
+                    break;
+                }
+            }
+            Err(e) if retry(&e) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    String::from_utf8(answer).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// The error code and message of a [`App::dispatch_within`] that got no answer.
+fn dispatch_failure(action: &str, deadline: Duration, error: &io::Error) -> (&'static str, String) {
+    if error.kind() == io::ErrorKind::TimedOut {
+        (
+            "timeout",
+            format!("dispatch_action: {action}: no answer within {deadline:?}"),
+        )
+    } else {
+        ("transport", format!("dispatch_action: {action}: {error}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::os::unix::net::UnixListener;
+
     use super::*;
+
+    /// Reads one line from a connection.
+    fn read_request(stream: &UnixStream) -> String {
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        line
+    }
+
+    #[test]
+    fn a_silent_app_fails_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s");
+        // Never accepts: the request sits unanswered in the socket.
+        let _listener = UnixListener::bind(&path).unwrap();
+        let limit = Duration::from_millis(50);
+        let start = Instant::now();
+        let error = exchange_by(&path, "{}", limit).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() >= limit);
+        assert!(start.elapsed() < ANSWER, "waited for the default");
+        let (code, message) = dispatch_failure("detail::ShowYaml", limit, &error);
+        assert_eq!(code, "timeout");
+        assert!(message.contains("detail::ShowYaml"), "{message}");
+        assert!(message.contains("50ms"), "{message}");
+    }
+
+    // Each byte restarts a socket read timeout, so only an overall deadline ends this. The peer
+    // stops when the client hangs up, or after a few seconds, so a regressed deadline ends in a
+    // failed assertion instead of a hang with an unbounded answer buffer.
+    #[test]
+    fn a_trickling_answer_cannot_outlast_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&stream);
+            let give_up = std::time::Instant::now() + Duration::from_secs(3);
+            while std::time::Instant::now() < give_up && stream.write_all(b"x").is_ok() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let error = exchange_by(&path, "{}", Duration::from_millis(50)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        peer.join().unwrap();
+    }
+
+    // The peer answers the first request only once the client has given up on it, the order
+    // that would pair a late answer with the next request on a shared connection.
+    #[test]
+    fn a_late_answer_does_not_reach_the_next_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(first.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            line.clear();
+            // End of file: the client closed this connection.
+            assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+            let _ = first.write_all(b"late\n");
+            let (second, _) = listener.accept().unwrap();
+            assert_eq!(read_request(&second), "second\n");
+            (&second).write_all(b"answer\n").unwrap();
+        });
+        let error = exchange_by(&path, "first", Duration::from_millis(50)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let answer = exchange_by(&path, "second", ANSWER).unwrap();
+        assert_eq!(answer, "answer\n");
+        peer.join().unwrap();
+    }
 
     #[test]
     fn tests_become_wait_for_arguments() {

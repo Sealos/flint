@@ -1027,8 +1027,15 @@ async fn dismissing_the_tab_list_gives_focus_back(cx: &mut TestAppContext) {
             press(cx, &t, "escape");
         } else {
             cx.update_window(t.window, |_, window, cx| {
-                // Plain text in the log tab's toolbar: a click there takes no focus itself.
-                window.click("log-count", cx)
+                // Plain text in the log tab's toolbar: a click there takes no focus itself. The
+                // list covers the toolbar's right end, by a width that follows the tab's status
+                // when it opened, so only the start of the status is always clear of it.
+                window.render_frame(cx);
+                let list = window.find("popup-menu").bounds();
+                let offset = gpui_kit::point(gpui_kit::px(1.), gpui_kit::px(1.));
+                let target = window.find("log-state-text").bounds().origin + offset;
+                assert!(!list.contains(&target), "the click lands outside the list");
+                window.click_at("log-state-text", offset, cx)
             })
             .unwrap();
             cx.run_until_parked();
@@ -1074,11 +1081,11 @@ async fn the_dock_toggles_and_remembers_its_height(cx: &mut TestAppContext) {
     // Taller than the 700 px window allows: the main area keeps its room.
     t.dispatch(cx, "workspace::SetDockHeight", json!({"height": 5000}))
         .unwrap();
-    assert_eq!(saved(cx), Some(540));
+    assert_eq!(saved(cx), Some(420));
     cx.wait_for(t.window, WAIT, |window, _| {
         window
             .try_find("dock-pane")
-            .is_some_and(|p| (f32::from(p.bounds().size.height) - 540.).abs() < 1.)
+            .is_some_and(|p| (f32::from(p.bounds().size.height) - 420.).abs() < 1.)
     })
     .await;
 
@@ -1087,14 +1094,14 @@ async fn the_dock_toggles_and_remembers_its_height(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let path = dir.path().join(flint_core::settings::STATE_FILE);
     cx.wait_for(t.window, WAIT, |_, _| {
-        std::fs::read_to_string(&path).is_ok_and(|s| s.contains("dock = 540"))
+        std::fs::read_to_string(&path).is_ok_and(|s| s.contains("dock = 420"))
     })
     .await;
     assert_eq!(
         crate::ui::ui_state::UiState::load(dir.path().to_owned())
             .panes()
             .dock,
-        Some(540)
+        Some(420)
     );
 
     t.focus_workspace(cx);

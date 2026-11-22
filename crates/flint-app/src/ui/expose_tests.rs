@@ -2,14 +2,14 @@
 //! hiding does not, a stray key cannot flip it, and a re-pointed context shows as changed.
 
 use flint_core::settings::AiExposureState;
-use gpui_kit::test::TestAppContextExt as _;
+use gpui_kit::test::{TestAppContextExt as _, TestQueryExt as _};
 use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
 
 use super::super::expose_dialog;
 use crate::ui::registry::ActionError;
 use crate::ui::support_tests::{
-    TestWorkspace, WAIT, alpha_and_beta, open_workspace, open_workspace_with,
+    TestWorkspace, WAIT, alpha_and_beta, kubeconfig_yaml, open_workspace, open_workspace_with,
 };
 
 fn exposure(cx: &mut TestAppContext, t: &TestWorkspace, cluster: &str) -> AiExposureState {
@@ -99,6 +99,92 @@ async fn exposing_asks_first_and_hiding_does_not(cx: &mut TestAppContext) {
     wait_for_exposure(cx, &t, "kind-alpha", AiExposureState::Hidden).await;
     assert!(!t.has_dialog(cx));
     assert!(toggle_tip(cx, &t, "expose-kind-alpha").starts_with("Hidden from AI agents"));
+}
+
+/// Whether the accessibility tree holds exactly one element named `label`, and it is `id`.
+fn named(cx: &mut TestAppContext, t: &TestWorkspace, id: &'static str, label: &str) -> bool {
+    t.find(cx, id);
+    cx.update_window(t.window, |_, window, _| {
+        window
+            .try_find_by_label(label)
+            .is_some_and(|found| format!("{:?}", found.path().last()).contains(id))
+    })
+    .unwrap()
+}
+
+// The toggle's accessible name follows the real exposure, and clicking it still does what it did.
+#[gpui_kit::test]
+async fn the_toggles_name_says_the_exposure(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let id = "expose-kind-alpha";
+    assert!(named(cx, &t, id, "AI exposure for kind-alpha: hidden"));
+
+    t.click(cx, id);
+    wait_for_dialog(cx, &t, true).await;
+    t.click(cx, "ok");
+    wait_for_exposure(cx, &t, "kind-alpha", AiExposureState::Exposed).await;
+    wait_for_dialog(cx, &t, false).await;
+    assert!(named(
+        cx,
+        &t,
+        id,
+        "AI exposure for kind-alpha: exposed, read-only"
+    ));
+    assert!(!named(cx, &t, id, "AI exposure for kind-alpha: hidden"));
+
+    let old = "https://10.0.0.1:6443";
+    let stale = tempfile::tempdir().unwrap();
+    std::fs::write(
+        stale.path().join("settings.toml"),
+        format!("ai_exposed_clusters = [{{ context = \"kind-alpha\", server = \"{old}\" }}]\n"),
+    )
+    .unwrap();
+    let t = open_workspace_with(cx, stale.path(), alpha_and_beta).await;
+    assert!(named(
+        cx,
+        &t,
+        id,
+        "AI exposure for kind-alpha: cluster changed, hidden"
+    ));
+}
+
+/// Two EKS contexts in different accounts, both titled `prod`.
+const PROD_A: &str = "arn:aws:eks:us-east-1:000000000000:cluster/prod";
+const PROD_B: &str = "arn:aws:eks:us-east-1:000000000001:cluster/prod";
+
+fn two_prods(
+    dir: &std::path::Path,
+    servers: &crate::ui::support_tests::Servers,
+) -> Vec<std::path::PathBuf> {
+    let kubeconfig = dir.join("kubeconfig");
+    let contexts = [
+        (PROD_A, servers.silent.as_str()),
+        (PROD_B, servers.refused.as_str()),
+    ];
+    std::fs::write(&kubeconfig, kubeconfig_yaml(&contexts)).unwrap();
+    vec![kubeconfig]
+}
+
+// Two contexts with one title and one state still have toggles with names of their own.
+#[gpui_kit::test]
+async fn toggles_of_contexts_sharing_a_title_differ(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace_with(cx, dir.path(), two_prods).await;
+    for (context, id) in [
+        (
+            PROD_A,
+            concat!("expose-", "arn:aws:eks:us-east-1:000000000000:cluster/prod"),
+        ),
+        (
+            PROD_B,
+            concat!("expose-", "arn:aws:eks:us-east-1:000000000001:cluster/prod"),
+        ),
+    ] {
+        assert_eq!(exposure(cx, &t, context), AiExposureState::Hidden);
+        let label = format!("AI exposure for prod (context \"{context}\"): hidden");
+        assert!(named(cx, &t, id, &label));
+    }
 }
 
 // covers UP-07: the toggle is not a tab stop, so Tab never lands on it, and Space or Enter

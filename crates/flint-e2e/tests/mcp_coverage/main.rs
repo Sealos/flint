@@ -5,6 +5,7 @@
 //! Not covered here: the app's activity view (UP-16) and UP-93, which has no sending path yet.
 
 mod activity;
+mod boundary;
 mod redaction;
 mod scope;
 mod support;

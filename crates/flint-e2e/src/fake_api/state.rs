@@ -622,7 +622,68 @@ impl State {
         if let Some(object) = self.objects.get(gvr).and_then(|o| o.get(&key)) {
             return object.clone();
         }
+        if is_metrics(gvr)
+            && let Some(object) = self.metrics_object_from_cells(gvr, row)
+        {
+            return object;
+        }
         json!({"apiVersion": gvr.api_version(), "kind": self.kind(gvr), "metadata": row.metadata()})
+    }
+
+    /// The `PodMetrics` or `NodeMetrics` object of `row` with this usage. A pod's usage is its
+    /// first container's, or a container called `app` if the pod is not served.
+    pub(crate) fn metrics_object(
+        &self,
+        gvr: &Gvr,
+        row: &FakeRow,
+        (cpu, memory): (&str, &str),
+        window: &str,
+        timestamp: &str,
+    ) -> Value {
+        let usage = json!({"cpu": cpu, "memory": memory});
+        let mut object = json!({
+            "apiVersion": gvr.api_version(),
+            "kind": self.kind(gvr),
+            "metadata": row.metadata(),
+            "timestamp": timestamp,
+            "window": window,
+        });
+        if gvr.resource == "pods" {
+            let container = self
+                .object(&Gvr::core("pods"), row.namespace(), row.name())
+                .ok()
+                .and_then(|pod| {
+                    pod.pointer("/spec/containers/0/name")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| "app".to_owned());
+            object["containers"] = json!([{"name": container, "usage": usage}]);
+        } else {
+            object["usage"] = usage;
+        }
+        object
+    }
+
+    /// The metrics object a recorded row stands for: the recording kept only its Table, whose
+    /// cells hold the usage and whose creation time is when it was read.
+    fn metrics_object_from_cells(&self, gvr: &Gvr, row: &FakeRow) -> Option<Value> {
+        let columns = self.columns(gvr);
+        let cell = |wanted: &str| {
+            let index = columns
+                .as_array()?
+                .iter()
+                .position(|c| c["name"] == wanted)?;
+            row.cells().get(index)?.as_str()
+        };
+        let timestamp = row.metadata()["creationTimestamp"].as_str()?;
+        Some(self.metrics_object(
+            gvr,
+            row,
+            (cell("cpu")?, cell("memory")?),
+            cell("Window")?,
+            timestamp,
+        ))
     }
 
     /// A plain list (`PodList`): the full object of every row, recorded or made from the row.
