@@ -983,7 +983,11 @@ pub struct LogOutput {
 pub fn log_output(fetched: &str, max_lines: usize, max_bytes: usize, older: bool) -> LogOutput {
     let redacted = flint_core::redact::redact_credentials(fetched);
     let all = &*redacted.text;
-    let safe_start = if older { leading_cut_off_lines(all) } else { 0 };
+    let safe_start = if older {
+        leading_cut_off_lines(fetched, all)
+    } else {
+        0
+    };
     let (tail, cut_lines) = tail_lines(fetched, max_lines);
     let skipped = fetched[..fetched.len() - tail.len()].matches('\n').count();
     let window = &all[redacted_line_start(fetched, all, skipped).max(safe_start)..];
@@ -1061,71 +1065,157 @@ pub fn next_log_tail(tail: i64, lines: u32, complete: i64) -> i64 {
     }
 }
 
-/// Where `text` stops continuing a block whose start was not fetched: 0 when it does not begin
-/// with one.
-fn leading_cut_off_lines(text: &str) -> usize {
-    leading_key_lines(text).max(leading_cookie_items(text))
+/// Where the redacted text `shown` of `fetched` stops continuing a block whose start was not
+/// fetched: 0 when it does not begin with one.
+fn leading_cut_off_lines(fetched: &str, shown: &str) -> usize {
+    let key_lines = if first_end_has_no_begin(fetched) {
+        key_lines_before_end(fetched, shown)
+    } else {
+        0
+    };
+    key_lines
+        .max(leading_pem_body(shown))
+        .max(leading_cookie_items(shown))
 }
 
-/// The end of the run of key-shaped lines at the start of `text`, optionally after a log prefix.
-/// The run counts when an END line follows it, or when it has the shape of a PEM body
-/// ([`PemBody`]).
-fn leading_key_lines(text: &str) -> usize {
+/// Whether the first private key END line of `text` comes with no BEGIN line before it.
+fn first_end_has_no_begin(text: &str) -> bool {
+    for line in text.lines() {
+        if line.contains("-----BEGIN ") && line.contains("PRIVATE KEY") {
+            return false;
+        }
+        if closes_private_key(line) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The end of the last line of `shown` before the first END line that continues a key, whatever
+/// other output is between them. The END line is read from `fetched`, since redaction may have
+/// moved the words before it. A real footer vouches for every key-shaped line; a message that
+/// only names it vouches for full-width lines and for lines with the same prefix as its own.
+fn key_lines_before_end(fetched: &str, shown: &str) -> usize {
+    let footer = fetched.lines().find(|l| closes_private_key(l));
+    let source = footer.and_then(footer_prefix);
+    let real_footer =
+        source.is_some_and(|s| is_bare_prefix(s) || is_bare_prefix(without_log_level(s)));
+    let continues = |line: &str, token: &str| {
+        real_footer
+            || (PEM_WIDTHS.contains(&token.len()) && mixed_base64(token))
+            || source.is_some_and(|s| same_source(&line[..line.rfind(token).unwrap_or(0)], s))
+    };
     let mut end = 0;
+    let mut offset = 0;
+    for line in shown.split_inclusive('\n') {
+        if closes_private_key(line) {
+            return end;
+        }
+        offset += line.len();
+        if key_token(line).is_some_and(|token| continues(line, token)) {
+            end = offset;
+        }
+    }
+    0
+}
+
+/// What comes before the END marker of `line`, without an opening quote. Text after the marker
+/// does not make it a message: a log writer may append fields to a real footer.
+fn footer_prefix(line: &str) -> Option<&str> {
+    let at = line.find("-----END ")?;
+    Some(line[..at].trim_end_matches(['"', '\'']).trim())
+}
+
+/// Whether two line prefixes are the same apart from their digits, as in two timestamps.
+fn same_source(a: &str, b: &str) -> bool {
+    let letters = |s: &str| -> String {
+        s.trim()
+            .trim_end_matches(['"', '\''])
+            .chars()
+            .filter(|c| !c.is_ascii_digit())
+            .collect()
+    };
+    letters(a) == letters(b)
+}
+
+/// The end of the lines at the start of `text` that read as a PEM body ([`PemBody`]) with no
+/// END line in reach. Other output may sit between them, up to [`MAX_INTERLEAVED_LINES`] in a
+/// row.
+fn leading_pem_body(text: &str) -> usize {
     let mut body = PemBody::default();
+    let mut end = 0;
+    let mut offset = 0;
+    let mut other = 0;
     for line in text.split_inclusive('\n') {
-        let Some(token) = key_token(line) else {
-            let closes = closes_private_key(line);
-            return if body.is_complete() || (end > 0 && closes) {
-                end
-            } else {
-                0
-            };
-        };
-        body.push(line, token);
-        end += line.len();
+        if closes_private_key(line) || line.trim() == "[REDACTED:private-key]" {
+            break;
+        }
+        offset += line.len();
+        if key_token(line).is_some_and(|token| body.takes(line, token)) {
+            end = offset;
+            other = 0;
+        } else {
+            other += 1;
+            if other > MAX_INTERLEAVED_LINES {
+                break;
+            }
+        }
     }
     if body.is_complete() { end } else { 0 }
 }
 
 /// Line widths PEM encoders wrap base64 at.
 const PEM_WIDTHS: [usize; 2] = [64, 76];
-/// Full-width lines a run needs to count as a PEM body when no END line is in reach.
+/// Full-width lines of one width a body needs when no END line is in reach.
 const MIN_PEM_LINES: usize = 2;
+/// Lines of other output tolerated in a row between two lines of a body.
+const MAX_INTERLEAVED_LINES: usize = 32;
 
-/// Tracks whether a run of lines reads as a PEM body: full lines of one standard width with a
-/// mix of base64 characters, then at most one shorter line, each alone after a log prefix.
+/// Counts the lines that read as a PEM body: full lines of a standard width with a mix of base64
+/// characters, or a shorter last line, each alone after a log prefix. A padded last line ends
+/// the body: shorter tokens after it are other output, until another full line appears.
 #[derive(Default)]
 struct PemBody {
-    width: usize,
-    full_lines: usize,
+    full_lines: [usize; PEM_WIDTHS.len()],
     ended: bool,
-    broken: bool,
 }
 
 impl PemBody {
-    fn push(&mut self, line: &str, token: &str) {
-        let width = token.len();
-        let padding_inside = token.trim_end_matches('=').contains('=');
-        if self.broken || self.ended || padding_inside || !is_log_prefix(line) {
-            self.broken = true;
-        } else if self.width == 0 {
-            self.width = width;
-            self.broken = !PEM_WIDTHS.contains(&width) || !mixed_base64(token);
-            self.full_lines = 1;
-        } else if width == self.width {
-            self.broken = !mixed_base64(token);
-            self.full_lines += 1;
-        } else if width < self.width {
-            self.ended = true;
-        } else {
-            self.broken = true;
+    /// Whether `line`, ending in `token`, belongs to the body.
+    fn takes(&mut self, line: &str, token: &str) -> bool {
+        if token.trim_end_matches('=').contains('=') || !is_log_prefix(line) {
+            return false;
         }
+        let width = token.len();
+        if let Some(at) = PEM_WIDTHS.iter().position(|w| *w == width)
+            && mixed_base64(token)
+        {
+            self.full_lines[at] += 1;
+            self.ended = false;
+            return true;
+        }
+        let shorter = self
+            .full_lines
+            .iter()
+            .zip(PEM_WIDTHS)
+            .any(|(lines, full)| *lines > 0 && width < full);
+        if !shorter || self.ended {
+            return false;
+        }
+        self.ended = is_padded_last_line(token);
+        true
     }
 
     fn is_complete(&self) -> bool {
-        !self.broken && self.full_lines >= MIN_PEM_LINES
+        self.full_lines.iter().any(|lines| *lines >= MIN_PEM_LINES)
     }
+}
+
+/// Whether `token` can only be the last line of a base64 body: valid padding on a length that
+/// is a multiple of four, with the character mix of key material.
+fn is_padded_last_line(token: &str) -> bool {
+    let padding = token.len() - token.trim_end_matches('=').len();
+    matches!(padding, 1 | 2) && token.len().is_multiple_of(4) && mixed_base64(token)
 }
 
 /// Whether `token` has upper case, lower case and digits, as base64 of random bytes does.
@@ -1136,11 +1226,16 @@ fn mixed_base64(token: &str) -> bool {
 }
 
 /// Whether what comes before the last word of `line` is nothing, a bare timestamp, or a prefix
-/// closed by `|`, `]` or `>`, rather than a message the word belongs to.
+/// closed by `|`, `]` or `>`, optionally followed by a log level, rather than a message the word
+/// belongs to.
 fn is_log_prefix(line: &str) -> bool {
     let trimmed = line.trim_end();
     let word = trimmed.split_whitespace().next_back().unwrap_or("");
     let prefix = trimmed[..trimmed.len() - word.len()].trim_end();
+    is_bare_prefix(prefix) || is_bare_prefix(without_log_level(prefix))
+}
+
+fn is_bare_prefix(prefix: &str) -> bool {
     prefix.is_empty()
         || prefix.ends_with(['|', ']', '>'])
         || prefix.bytes().all(|b| {
@@ -1148,10 +1243,24 @@ fn is_log_prefix(line: &str) -> bool {
         })
 }
 
+/// `prefix` without a log level as its last word; unchanged when it has none.
+fn without_log_level(prefix: &str) -> &str {
+    const LEVELS: [&str; 10] = [
+        "TRACE", "DEBUG", "INFO", "NOTICE", "WARN", "WARNING", "ERROR", "ERR", "FATAL", "CRITICAL",
+    ];
+    let word = prefix.split_whitespace().next_back().unwrap_or("");
+    let level = word.trim_end_matches(':');
+    if LEVELS.iter().any(|l| l.eq_ignore_ascii_case(level)) {
+        prefix[..prefix.len() - word.len()].trim_end()
+    } else {
+        prefix
+    }
+}
+
 /// The last word of `line` when it could be a line of base64 key material.
 fn key_token(line: &str) -> Option<&str> {
     let word = line.split_whitespace().next_back()?;
-    let word = word.trim_end_matches([',', '"', '\'']);
+    let word = word.trim_matches([',', '"', '\'']);
     let word = word.strip_suffix("\\n").unwrap_or(word);
     (word.len() >= 16
         && word
