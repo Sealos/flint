@@ -9,7 +9,7 @@ use gpui_kit::TestAppContext;
 use gpui_kit::test::TestAppContextExt as _;
 use serde_json::json;
 
-use crate::ui::activity_view::{SETUP_NOTE, TEST_PROMPT, setup_steps};
+use crate::ui::activity_view::{SETUP_NOTE, TEST_PROMPT, register_command};
 use crate::ui::dock::DockTab;
 use crate::ui::registry::ActionError;
 use crate::ui::support_tests::{TestWorkspace, WAIT, open_workspace};
@@ -241,23 +241,60 @@ async fn an_exposed_cluster_without_calls_shows_setup_steps(cx: &mut TestAppCont
     assert!(t.find(cx, "activity-copy-prompt").is_none());
 }
 
-// The steps follow the README: the app bundle's binary behind a stable path on macOS, the
-// AppImage on Linux.
+// The command names the executable running now, in the README's form for a stable path.
 #[test]
-fn setup_steps_match_the_documented_commands() {
+fn the_setup_command_registers_the_given_server() {
     let readme = include_str!("../../../../README.md");
-    let macos = setup_steps(true);
-    assert!(
-        macos[0].command.contains(
-            "sudo ln -sf /Applications/Flint.app/Contents/MacOS/flint /usr/local/bin/flint"
-        )
+    assert!(readme.contains(&register_command("/usr/local/bin/flint mcp")));
+    assert_eq!(
+        register_command("'/home/me/My Flint.AppImage' mcp"),
+        "claude mcp add flint -- '/home/me/My Flint.AppImage' mcp"
     );
-    for step in macos[1..].iter().chain(setup_steps(false)) {
-        assert!(readme.contains(step.command), "{}", step.command);
+}
+
+// covers UP-16: at the smallest dock the copy button stays in view, and the keyboard scrolls the
+// steps to their end without moving focus off it.
+#[gpui_kit::test]
+async fn the_setup_steps_stay_reachable_in_a_short_dock(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let server = t.server.clone();
+    t.model.update(cx, |m, cx| {
+        m.expose_to_ai("kind-alpha".into(), server, AiScope::default());
+        cx.notify();
+    });
+    t.dispatch(
+        cx,
+        "workspace::ShowAgentActivity",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
+    t.wait_for_element(cx, "activity-setup").await;
+    t.dispatch(cx, "workspace::SetDockHeight", json!({"height": 120.0}))
+        .unwrap();
+    cx.run_until_parked();
+    t.focus_workspace(cx);
+    for _ in 0..8 {
+        if t.find(cx, "activity-copy-prompt")
+            .is_some_and(|b| b.focused() == Some(true))
+        {
+            break;
+        }
+        t.press(cx, "tab");
     }
-    assert!(
-        readme.contains(
-            "sudo ln -sf /Applications/Flint.app/Contents/MacOS/flint /usr/local/bin/flint"
-        )
+    let button = t.find(cx, "activity-copy-prompt").unwrap();
+    assert_eq!(button.focused(), Some(true));
+    let pane = t.find(cx, "dock-pane").unwrap().bounds();
+    assert!(button.bounds().bottom() <= pane.bottom(), "{pane:?}");
+
+    let viewport = t.find(cx, "activity-setup").unwrap().bounds();
+    let note = t.find(cx, "activity-setup-note").unwrap().bounds();
+    assert!(note.bottom() > viewport.bottom(), "the steps overflow");
+    t.press(cx, "end");
+    let note = t.find(cx, "activity-setup-note").unwrap().bounds();
+    assert!(note.bottom() <= viewport.bottom(), "{note:?} {viewport:?}");
+    assert_eq!(
+        t.find(cx, "activity-copy-prompt").unwrap().focused(),
+        Some(true)
     );
 }

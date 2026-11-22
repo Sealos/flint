@@ -20,9 +20,10 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use super::clusters::ClustersModel;
+use super::confirm::scroll_by_key;
 use super::dock::{DockItem, TabKey, TabStatus};
 use super::log_view::LatestCopy;
-use super::registry::{self, EditAiScope};
+use super::registry::{self, EditAiScope, SelectFirst, SelectLast, SelectNext, SelectPrev};
 
 /// A row's height.
 const ROW_HEIGHT: f32 = 24.;
@@ -45,36 +46,15 @@ pub const SETUP_NOTE: &str = "The agent reads only what is exposed through Flint
                               here.";
 /// The step that leads to [`TEST_PROMPT`].
 const TEST_STEP: &str = "Ask your agent to run this read-only check. The call should appear \
-                         here. If this cluster is missing, list_clusters says which kubeconfig \
-                         files the server read.";
+                         here. If this cluster is missing, follow the hint list_clusters \
+                         returns.";
+/// The step that leads to the registration command.
+const REGISTER_STEP: &str = "Register this Flint with Claude Code. Other MCP clients run the \
+                             part after --:";
 
-/// One setup step: what to do, and the command for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SetupStep {
-    pub text: &'static str,
-    pub command: &'static str,
-}
-
-/// How to connect an MCP client on this platform, as the README documents it.
-pub fn setup_steps(macos: bool) -> &'static [SetupStep] {
-    const MACOS: &[SetupStep] = &[
-        SetupStep {
-            text: "Link the app's binary to a stable path:",
-            command: "sudo mkdir -p /usr/local/bin && sudo ln -sf \
-                      /Applications/Flint.app/Contents/MacOS/flint /usr/local/bin/flint",
-        },
-        SetupStep {
-            text: "Register it with Claude Code. Other MCP clients take the same command, \
-                   /usr/local/bin/flint mcp:",
-            command: "claude mcp add flint -- /usr/local/bin/flint mcp",
-        },
-    ];
-    const LINUX: &[SetupStep] = &[SetupStep {
-        text: "Register the AppImage with Claude Code. Other MCP clients take the same command. \
-               Without FUSE, see the README:",
-        command: "claude mcp add flint -- \"$HOME/.local/bin/flint\" mcp",
-    }];
-    if macos { MACOS } else { LINUX }
+/// The command that registers `server`, the command that starts this Flint's MCP server.
+pub fn register_command(server: &str) -> String {
+    format!("claude mcp add flint -- {server}")
 }
 
 /// One call, as the view shows it.
@@ -262,6 +242,9 @@ pub struct ActivityView {
     rows: Vec<ActivityRow>,
     /// The test prompt was copied: its button says so.
     copied: bool,
+    /// The setup steps' command, for the executable running now.
+    setup_command: SharedString,
+    setup_scroll: ScrollHandle,
     _observe: Subscription,
 }
 
@@ -288,6 +271,8 @@ impl ActivityView {
             tz: TimeZone::system(),
             rows: Vec::new(),
             copied: false,
+            setup_command: register_command(&crate::registered_command()).into(),
+            setup_scroll: ScrollHandle::new(),
             _observe: observe,
         };
         view.refresh(cx);
@@ -324,11 +309,26 @@ impl ActivityView {
         cx.notify();
     }
 
-    /// What to do on an exposed cluster no agent has called. The copy button takes the tab's
+    /// The copy button, in the header so it stays visible at any dock height. It takes the tab's
     /// focus: Tab moves between panes here, so that is how the keyboard reaches it.
-    fn render_setup(&self, theme: &gpui_kit::component::Theme, cx: &Context<Self>) -> Div {
+    fn copy_prompt_button(&self) -> Button {
+        let label = if self.copied {
+            "Copied"
+        } else {
+            "Copy Test Prompt"
+        };
+        Button::new("activity-copy-prompt")
+            .outline()
+            .xsmall()
+            .label(label)
+            .track_focus(&self.focus)
+            .on_click(registry::on_click_in(self.focus.clone(), input::Copy))
+    }
+
+    /// What to do on an exposed cluster no agent has called.
+    fn render_setup(&self, theme: &gpui_kit::component::Theme) -> Div {
         let step = |text: &'static str| div().text_color(theme.muted_foreground).child(text);
-        let code = |text: &'static str| {
+        let code = |text: SharedString| {
             div()
                 .p_2()
                 .rounded(theme.radius)
@@ -336,21 +336,16 @@ impl ActivityView {
                 .font_family(theme.mono_font_family.clone())
                 .child(text)
         };
-        let label = if self.copied {
-            "Copied"
-        } else {
-            "Copy Test Prompt"
-        };
         v_flex()
-            .on_action(cx.listener(Self::copy_prompt))
             .gap_2()
             .px_3()
             .pb_3()
             .text_xs()
-            .children(
-                setup_steps(cfg!(target_os = "macos"))
-                    .iter()
-                    .map(|s| v_flex().gap_1().child(step(s.text)).child(code(s.command))),
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(step(REGISTER_STEP))
+                    .child(code(self.setup_command.clone())),
             )
             .child(
                 v_flex()
@@ -358,18 +353,8 @@ impl ActivityView {
                     .aria_label(TEST_PROMPT)
                     .gap_1()
                     .child(step(TEST_STEP))
-                    .child(code(TEST_PROMPT))
+                    .child(code(TEST_PROMPT.into()))
                     .test_support(),
-            )
-            .child(
-                h_flex().child(
-                    Button::new("activity-copy-prompt")
-                        .outline()
-                        .xsmall()
-                        .label(label)
-                        .track_focus(&self.focus)
-                        .on_click(registry::on_click_in(self.focus.clone(), input::Copy)),
-                ),
             )
             .child(
                 div()
@@ -453,6 +438,20 @@ impl ActivityView {
     }
 }
 
+/// Makes action `A`, bound to `key`, scroll as that key does.
+fn scrolls_on<A: Action, E: InteractiveElement>(
+    element: E,
+    scroll: &ScrollHandle,
+    key: &'static str,
+) -> E {
+    let scroll = scroll.clone();
+    element.on_action(move |_: &A, window, cx| {
+        if let Ok(key) = Keystroke::parse(key) {
+            scroll_by_key(&scroll, &key, window, cx);
+        }
+    })
+}
+
 impl DockItem for ActivityView {
     fn tab_key(&self) -> TabKey {
         TabKey::Activity(self.cluster.clone())
@@ -512,6 +511,17 @@ impl Render for ActivityView {
             .id("agent-activity")
             // With the setup steps, their copy button holds the tab's focus.
             .when(!setup, |el| el.track_focus(&self.focus))
+            .when(setup, |el| {
+                let scroll = self.setup_scroll.clone();
+                let el = el.on_action(cx.listener(Self::copy_prompt)).on_key_down(
+                    move |event, window, cx| scroll_by_key(&scroll, &event.keystroke, window, cx),
+                );
+                // These keys are the list's everywhere in the workspace: here they scroll.
+                let el = scrolls_on::<SelectPrev, _>(el, &self.setup_scroll, "up");
+                let el = scrolls_on::<SelectNext, _>(el, &self.setup_scroll, "down");
+                let el = scrolls_on::<SelectFirst, _>(el, &self.setup_scroll, "home");
+                scrolls_on::<SelectLast, _>(el, &self.setup_scroll, "end")
+            })
             .size_full()
             .child(
                 h_flex()
@@ -530,6 +540,7 @@ impl Render for ActivityView {
                             .child(count)
                             .test_support(),
                     )
+                    .when(setup, |el| el.child(self.copy_prompt_button()))
                     .when(exposed, |el| {
                         el.child(
                             Button::new("activity-edit-scope")
@@ -561,7 +572,8 @@ impl Render for ActivityView {
                         .flex_1()
                         .min_h_0()
                         .overflow_y_scroll()
-                        .child(self.render_setup(&theme, cx))
+                        .track_scroll(&self.setup_scroll)
+                        .child(self.render_setup(&theme))
                         .test_support(),
                 )
             })
