@@ -1428,7 +1428,7 @@ impl Workspace {
 
         let tooltip = hover_text.clone();
         let rename = name.clone();
-        let control_title = title.clone();
+        let control_title = control_name(&title, &name);
         let row = h_flex()
             .id(SharedString::from(format!("cluster-{name}")))
             // Named for assistive technology (and view tests): the short title, then the
@@ -2245,6 +2245,17 @@ fn protection_text(protection: Protection, trust: &TrustState) -> String {
     }
 }
 
+/// A cluster as its row's controls name it: the title, then the full context when the title is
+/// not the context, since two contexts can share a title. The context is quoted and escaped, so
+/// no context or title can be written to read as another cluster's name.
+fn control_name(title: &str, context: &str) -> String {
+    if title == context && !context.contains('"') {
+        title.to_owned()
+    } else {
+        format!("{title} (context {context:?})")
+    }
+}
+
 /// The accessible name of a cluster's lock button: which cluster, and its protection now.
 fn lock_label(title: &str, protection: Protection) -> String {
     let state = match protection {
@@ -2996,11 +3007,28 @@ mod view_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        Layout, LockEntry, MIN_LIST_WIDTH, exposure_label, layout, lock_label, lock_menu,
-        mode_name, namespace_summary, no_contexts_text, watch_mode_label,
+        Layout, LockEntry, MIN_LIST_WIDTH, control_name, exposure_label, layout, lock_label,
+        lock_menu, mode_name, namespace_summary, no_contexts_text, watch_mode_label,
     };
     use flint_core::settings::{AiExposureState, PaneWidths, TrustState};
     use flint_core::{Protection, WatchMode};
+
+    // A title that is the context stays short; any other carries the context, and a context
+    // written to look like another cluster's control name still gets a name of its own.
+    #[test]
+    fn control_names_tell_clusters_apart() {
+        assert_eq!(control_name("kind-dev", "kind-dev"), "kind-dev");
+        let arn = "arn:aws:eks:us-east-1:000000000000:cluster/prod";
+        assert_eq!(
+            control_name("prod", arn),
+            format!("prod (context \"{arn}\")")
+        );
+        let lookalike = "prod (context \"kind-dev\")";
+        assert_ne!(
+            control_name(lookalike, lookalike),
+            control_name("prod", "kind-dev")
+        );
+    }
 
     // Each state has a name of its own, and a re-pointed context never reads as exposed.
     #[test]

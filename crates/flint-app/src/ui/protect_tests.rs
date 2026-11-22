@@ -720,6 +720,37 @@ async fn the_lock_buttons_name_says_the_protection(cx: &mut TestAppContext) {
     ));
 }
 
+/// Two EKS contexts in different accounts, both titled `prod`.
+const PROD_A: &str = "arn:aws:eks:us-east-1:000000000000:cluster/prod";
+const PROD_B: &str = "arn:aws:eks:us-east-1:000000000001:cluster/prod";
+
+fn two_prods(
+    dir: &std::path::Path,
+    servers: &crate::ui::support_tests::Servers,
+) -> Vec<std::path::PathBuf> {
+    let kubeconfig = dir.join("kubeconfig");
+    let contexts = [
+        (PROD_A, servers.silent.as_str()),
+        (PROD_B, servers.refused.as_str()),
+    ];
+    std::fs::write(&kubeconfig, kubeconfig_yaml(&contexts)).unwrap();
+    vec![kubeconfig]
+}
+
+// Two contexts with one title and one state still have lock buttons with names of their own.
+#[gpui_kit::test]
+async fn lock_buttons_of_contexts_sharing_a_title_differ(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("settings.toml"), PROTECT_LOCAL).unwrap();
+    let t = open_workspace_with(cx, dir.path(), two_prods).await;
+    assert_eq!(protection(cx, &t, PROD_A), protection(cx, &t, PROD_B));
+    let state = "protected, read-only";
+    for context in [PROD_A, PROD_B] {
+        let label = format!("Lock for prod (context \"{context}\"): {state}");
+        assert!(named(cx, &t, &format!("lock-{context}"), &label));
+    }
+}
+
 // covers UP-55: when Stop Trusting's write fails, the cluster stays protected while its pin is
 // still in settings.toml, and both removing the pin again and trusting it again (after the
 // confirmation) are offered.

@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use super::super::expose_dialog;
 use crate::ui::registry::ActionError;
 use crate::ui::support_tests::{
-    TestWorkspace, WAIT, alpha_and_beta, open_workspace, open_workspace_with,
+    TestWorkspace, WAIT, alpha_and_beta, kubeconfig_yaml, open_workspace, open_workspace_with,
 };
 
 fn exposure(cx: &mut TestAppContext, t: &TestWorkspace, cluster: &str) -> AiExposureState {
@@ -147,6 +147,44 @@ async fn the_toggles_name_says_the_exposure(cx: &mut TestAppContext) {
         id,
         "AI exposure for kind-alpha: cluster changed, hidden"
     ));
+}
+
+/// Two EKS contexts in different accounts, both titled `prod`.
+const PROD_A: &str = "arn:aws:eks:us-east-1:000000000000:cluster/prod";
+const PROD_B: &str = "arn:aws:eks:us-east-1:000000000001:cluster/prod";
+
+fn two_prods(
+    dir: &std::path::Path,
+    servers: &crate::ui::support_tests::Servers,
+) -> Vec<std::path::PathBuf> {
+    let kubeconfig = dir.join("kubeconfig");
+    let contexts = [
+        (PROD_A, servers.silent.as_str()),
+        (PROD_B, servers.refused.as_str()),
+    ];
+    std::fs::write(&kubeconfig, kubeconfig_yaml(&contexts)).unwrap();
+    vec![kubeconfig]
+}
+
+// Two contexts with one title and one state still have toggles with names of their own.
+#[gpui_kit::test]
+async fn toggles_of_contexts_sharing_a_title_differ(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace_with(cx, dir.path(), two_prods).await;
+    for (context, id) in [
+        (
+            PROD_A,
+            concat!("expose-", "arn:aws:eks:us-east-1:000000000000:cluster/prod"),
+        ),
+        (
+            PROD_B,
+            concat!("expose-", "arn:aws:eks:us-east-1:000000000001:cluster/prod"),
+        ),
+    ] {
+        assert_eq!(exposure(cx, &t, context), AiExposureState::Hidden);
+        let label = format!("AI exposure for prod (context \"{context}\"): hidden");
+        assert!(named(cx, &t, id, &label));
+    }
 }
 
 // covers UP-07: the toggle is not a tab stop, so Tab never lands on it, and Space or Enter
