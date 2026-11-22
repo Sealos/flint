@@ -43,6 +43,7 @@ use tower::{BoxError, Layer as _, Service, ServiceExt as _};
 
 use crate::api_error::ApiError;
 use crate::auth_plugin::RefreshingToken;
+use crate::connection::policy::{CredentialGrant, CredentialLease};
 use crate::write::WriteError;
 
 /// The most a credential file may hold.
@@ -297,6 +298,10 @@ struct Parts {
     token: TokenSource,
     /// The credential comes from a plugin: its identity is what a review binds.
     check_identity: bool,
+    /// Whether the credential may be used now.
+    grant: CredentialGrant,
+    /// The provider's layer behind its guard, if a role can stop a command it would run.
+    guarded: Option<GuardedProvider>,
 }
 
 /// Which connection's credential something was learned with. Holds none of it: the credential
@@ -316,11 +321,25 @@ pub(crate) struct Presented {
 }
 
 impl WriteCredential {
+    /// A credential under [`AlwaysAllow`](crate::connection::policy::AlwaysAllow).
+    #[cfg(test)]
     pub(crate) fn new(
         files: Vec<HeldFile>,
         source: CredentialSource,
         refreshing: Option<RefreshingToken>,
         auth: Option<Arc<AuthLayer>>,
+    ) -> Self {
+        let grant = crate::connection::policy::CredentialAccess::always().grant(source.clone());
+        Self::with_grant(files, source, refreshing, auth, grant, None)
+    }
+
+    pub(crate) fn with_grant(
+        files: Vec<HeldFile>,
+        source: CredentialSource,
+        refreshing: Option<RefreshingToken>,
+        auth: Option<Arc<AuthLayer>>,
+        grant: CredentialGrant,
+        guarded: Option<GuardedProvider>,
     ) -> Self {
         let check_identity = matches!(
             source,
@@ -336,6 +355,8 @@ impl WriteCredential {
             files,
             token,
             check_identity,
+            grant,
+            guarded,
         }))
     }
 
@@ -344,9 +365,12 @@ impl WriteCredential {
     }
 
     /// Reads the credential for one request, and returns `client` set to send exactly that.
-    /// Fails closed: anything that can't be read or confirmed refuses the request.
+    /// Fails closed: anything that can't be read or confirmed refuses the request, and so does a
+    /// credential its grant does not allow, with nothing run or sent.
     pub(crate) async fn present(&self, client: Client) -> Result<Presented, WriteError> {
         let parts = &self.0;
+        let lease = parts.grant.lease();
+        still_held(&lease)?;
         let mut material = Digester::new().ok_or(WriteError::CredentialUnreadable)?;
         for file in &parts.files {
             let held = file.held.ok_or(WriteError::CredentialUnreadable)?;
@@ -368,10 +392,25 @@ impl WriteCredential {
                     .await
                     .map_err(|_| WriteError::IdentityUnverified)?,
             ),
-            TokenSource::Provider(layer) => Some(
-                provider_header(layer.as_deref().ok_or(WriteError::IdentityUnverified)?).await?,
-            ),
+            TokenSource::Provider(layer) => {
+                let layer = layer.as_deref().ok_or(WriteError::IdentityUnverified)?;
+                let header = async {
+                    match &parts.guarded {
+                        Some(guarded) => tokio::time::timeout(IDENTITY_TIMEOUT, guarded.header())
+                            .await
+                            .map_err(|_| WriteError::IdentityUnverified)?
+                            .map_err(|_| WriteError::IdentityUnverified),
+                        None => provider_header(layer).await,
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    () = lease.revoked() => return Err(WriteError::IdentityUnverified),
+                    header = header => Some(header?),
+                }
+            }
         };
+        still_held(&lease)?;
         let client = match header {
             Some(header) => crate::cluster::sending_credential(client, BoundHeader(header)),
             None => client,
@@ -381,12 +420,88 @@ impl WriteCredential {
         } else {
             None
         };
+        still_held(&lease)?;
         Ok(Presented {
             client,
             binding: CredentialBinding {
                 material: material.finish().ok_or(WriteError::CredentialUnreadable)?,
                 identity,
             },
+        })
+    }
+}
+
+fn still_held(lease: &CredentialLease) -> Result<(), WriteError> {
+    if lease.holds() {
+        Ok(())
+    } else {
+        Err(WriteError::IdentityUnverified)
+    }
+}
+
+/// An auth provider's kube layer, when that layer can run a command and a role can forbid it.
+///
+/// kube runs that command with `std::process` on a blocking thread, behind a lock of its own, so
+/// it cannot be killed, and a request waiting on that lock would start another. So requests take
+/// their turn here instead, and the grant is asked once each has its turn. The first denial ends
+/// the connection's lease for good: a command may still be finishing, its output is dropped, and
+/// only a new connection runs the command again.
+#[derive(Clone)]
+pub(crate) struct GuardedProvider(Arc<GuardedParts>);
+
+struct GuardedParts {
+    layer: Arc<AuthLayer>,
+    lease: CredentialLease,
+    turn: tokio::sync::Mutex<()>,
+}
+
+impl GuardedProvider {
+    /// A guard for `layer` under `lease`, or `None` if nothing it does needs one: a fixed token
+    /// runs nothing, and a credential no role can deny needs no check.
+    pub(crate) fn guarding(layer: &Arc<AuthLayer>, lease: &CredentialLease) -> Option<Self> {
+        let refreshes = matches!(layer.layer(()), tower::util::Either::Right(_));
+        (refreshes && lease.can_be_denied()).then(|| {
+            GuardedProvider(Arc::new(GuardedParts {
+                layer: layer.clone(),
+                lease: lease.clone(),
+                turn: tokio::sync::Mutex::new(()),
+            }))
+        })
+    }
+
+    /// The `Authorization` value from kube's layer, which may run the command.
+    pub(crate) async fn header(&self) -> Result<HeaderValue, BoxError> {
+        let parts = &self.0;
+        let resolving = async {
+            let _turn = parts.turn.lock().await;
+            if !parts.lease.holds() {
+                return Err(crate::auth_plugin::not_allowed().into());
+            }
+            layer_header(&parts.layer).await
+        };
+        let header = tokio::select! {
+            biased;
+            () = parts.lease.revoked() => Err(crate::auth_plugin::not_allowed().into()),
+            header = resolving => header,
+        }?;
+        if parts.lease.holds() {
+            Ok(header)
+        } else {
+            Err(crate::auth_plugin::not_allowed().into())
+        }
+    }
+}
+
+impl<B: Send + 'static> tower::filter::AsyncPredicate<Request<B>> for GuardedProvider {
+    type Future = BoxFuture<'static, Result<Request<B>, BoxError>>;
+    type Request = Request<B>;
+
+    fn check(&mut self, mut request: Request<B>) -> Self::Future {
+        let guarded = self.clone();
+        Box::pin(async move {
+            let value = guarded.header().await?;
+            request.headers_mut().insert(AUTHORIZATION, value);
+            Ok(request)
         })
     }
 }
@@ -402,6 +517,14 @@ fn file_token_header(bytes: Vec<u8>) -> Result<HeaderValue, WriteError> {
 
 /// The `Authorization` value `layer` sets now, resolved once. Nothing is sent to get it.
 async fn provider_header(layer: &AuthLayer) -> Result<HeaderValue, WriteError> {
+    tokio::time::timeout(IDENTITY_TIMEOUT, layer_header(layer))
+        .await
+        .map_err(|_| WriteError::IdentityUnverified)?
+        .map_err(|_| WriteError::IdentityUnverified)
+}
+
+/// What kube's auth layer would set on a request. It may run the provider's command.
+async fn layer_header(layer: &AuthLayer) -> Result<HeaderValue, BoxError> {
     let read = tower::service_fn(|request: Request<Body>| {
         // Handed back in a response: the auth layer only wraps a service that answers with one.
         let mut answer = http::Response::new(());
@@ -415,15 +538,12 @@ async fn provider_header(layer: &AuthLayer) -> Result<HeaderValue, WriteError> {
         .layer(read)
         .oneshot(Request::new(Body::empty()))
         .boxed();
-    let resolved = tokio::time::timeout(IDENTITY_TIMEOUT, resolving)
-        .await
-        .map_err(|_| WriteError::IdentityUnverified)?
-        .map_err(|_| WriteError::IdentityUnverified)?;
+    let resolved = resolving.await?;
     let mut value = resolved
         .headers()
         .get(AUTHORIZATION)
         .cloned()
-        .ok_or(WriteError::IdentityUnverified)?;
+        .ok_or_else(|| BoxError::from("the auth layer set no credential"))?;
     value.set_sensitive(true);
     Ok(value)
 }
