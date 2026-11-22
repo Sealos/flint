@@ -212,9 +212,11 @@ impl DetailView {
                 if matches!(self.subject, Subject::Workload(_)) && !self.pods_stale =>
             {
                 Targets {
-                    logs: (pods.len() <= MAX_LOG_TARGETS)
-                        .then(|| pods.iter().map(|p| p.name.clone()).collect())
-                        .unwrap_or_default(),
+                    logs: if pods.len() <= MAX_LOG_TARGETS {
+                        pods.iter().map(|p| p.name.clone()).collect()
+                    } else {
+                        Vec::new()
+                    },
                     shell: self.shell_pod().map(|p| p.pod),
                 }
             }
