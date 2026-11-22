@@ -2363,12 +2363,12 @@ impl ClusterManager {
                 self.held.insert(name.clone());
             }
         }
-        // A member ends with its context, or on another server unless that is a pause: the server
-        // may then be a fallback, so it keeps its place and starts nothing.
+        // A member ends with its context, or on another server once a load confirms it. Until then
+        // the server may be a fallback, so it keeps its place and starts nothing.
         let ended: Vec<ClusterId> = self
             .members
             .keys()
-            .filter(|id| !self.member_on_its_server(id) && !self.paused(id))
+            .filter(|id| !self.member_on_its_server(id) && !self.unsettled(id))
             .cloned()
             .collect();
         for id in &ended {
@@ -5075,8 +5075,74 @@ mod tests {
         assert_eq!(manager.next_attempt, next, "no attempt started");
     }
 
-    // First seen behind a broken file, `dev` has no confirmed definition, so a move to another
-    // server is no pause: the member ends, and the watches started there stop with the switch.
+    // First seen behind a broken file, `dev` has no confirmed definition. A move to another server
+    // may be a fallback: the member stays and starts nothing there, comes back with its server,
+    // and ends only when a load confirms the move.
+    #[tokio::test]
+    async fn an_unconfirmed_move_keeps_a_member_until_a_load_confirms_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+        let at_a = kubeconfig_with("https://127.0.0.1:1");
+        let at_b = kubeconfig_with("https://127.0.0.1:2");
+        let mut manager = manager_reading_two(dir.path(), UNREADABLE, &at_a).await;
+        join_dev(&mut manager);
+        let next = manager.next_attempt;
+
+        rewrite_file(&mut manager, &second, &at_b).await;
+        assert!(manager.contexts.provisional("dev") && !manager.paused("dev"));
+        assert!(
+            manager.members.contains_key("dev"),
+            "the move is unconfirmed"
+        );
+        assert!(
+            !manager.wants_watches("dev"),
+            "nothing runs on the fallback"
+        );
+        assert!(manager.watched_kinds("dev").is_empty());
+        assert_eq!(manager.next_attempt, next, "no attempt started");
+
+        rewrite_file(&mut manager, &second, &at_a).await;
+        assert!(manager.wants_watches("dev"), "back on its server");
+
+        rewrite_file(&mut manager, &second, &at_b).await;
+        rewrite_file(&mut manager, &first, NO_CONTEXTS).await;
+        assert!(!manager.contexts.provisional("dev"));
+        assert!(
+            !manager.members.contains_key("dev"),
+            "the move is confirmed"
+        );
+    }
+
+    // Switching away during an outage drops the rows but not the error, so coming back says
+    // reconnecting rather than loading (UP-27).
+    #[tokio::test]
+    async fn switching_away_keeps_the_outage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, _, _) = pausable(dir.path(), NO_CONTEXTS).await;
+        manager.active = Some("dev".to_owned());
+        let pods = watching_dev(&mut manager).await;
+        let state = SyncState::Reconnecting {
+            error: Some("dropped".into()),
+        };
+        let hub = manager.hubs.get_or_create("dev", &pods);
+        hub.take_over(KindSnapshot::empty(
+            "dev".into(),
+            pods.clone(),
+            state.clone(),
+        ));
+
+        manager.active = Some("other".to_owned());
+        manager.reconcile("dev");
+        assert!(!watches(&manager, &pods));
+
+        manager.active = Some("dev".to_owned());
+        manager.reconcile("dev");
+        let hub = manager.hubs.get_or_create("dev", &pods);
+        assert_eq!(hub.latest().state, state);
+    }
+
+    // With no confirmed definition, the watches of a cluster that was active on the moved server
+    // stop with the switch.
     #[tokio::test]
     async fn a_member_moved_while_never_confirmed_keeps_no_watches() {
         let dir = tempfile::tempdir().unwrap();
@@ -5093,7 +5159,7 @@ mod tests {
         )
         .await;
         assert!(manager.contexts.provisional("dev") && !manager.paused("dev"));
-        assert!(!manager.members.contains_key("dev"));
+        assert!(manager.members.contains_key("dev"));
 
         manager.active = Some("dev".to_owned());
         let pods = watching_dev(&mut manager).await;

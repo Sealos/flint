@@ -273,11 +273,11 @@ impl ClusterWatches {
             return;
         };
         running.task.abort();
-        // A kind whose resource changed would show the old one's rows.
-        if !self.background
-            && self
-                .kind(id)
-                .is_some_and(|k| k.resource == running.kind.resource)
+        // A kind whose resource changed would show the old one's rows. A background cluster keeps
+        // the error too: `stop_unwanted` then drops its rows.
+        if self
+            .kind(id)
+            .is_some_and(|k| k.resource == running.kind.resource)
         {
             self.hubs.keep_for_outage(&self.cluster, id, &running.hub);
         }
