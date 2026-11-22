@@ -1423,8 +1423,10 @@ async fn reload_until_shown(core: &Core, server: &FakeApiServer, confirmed: bool
 }
 
 // covers UP-06, UP-54: while a later file's definition shows because the first file can't be
-// read, its pin is stale from the first request. Neither a review there nor a write reviewed
-// before it reaches a server, and writes work again once the file is back.
+// read, a new review of that definition is refused by the fresh read of the files. A write
+// reviewed earlier is pinned to the real server, which the slot no longer shows, so the loaded
+// state refuses it as moved. Neither reaches a server, and writes work again once the file is
+// back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_write_through_a_fallback_definition_is_refused() {
     let (real, fallback) = (
@@ -1450,16 +1452,18 @@ async fn a_write_through_a_fallback_definition_is_refused() {
 
     std::fs::write(&first, "apiVersion: v1\nkind: Config\nclusters:\n- name: [").unwrap();
     reload_until_shown(&core, &fallback, false).await;
-    let moved = WriteError::Refused(WriteRefusal::Moved {
-        cluster: CONTEXT.to_owned(),
-    });
     let review = core
         .handle
         .review_write(write_target(&fallback), three_replicas())
         .await;
-    assert_eq!(review.unwrap_err(), moved);
+    assert_eq!(review.unwrap_err(), WriteError::KubeconfigUnreadable);
     let write = core.handle.run_write(reviewed.into_intent()).await;
-    assert_eq!(write.unwrap_err(), moved);
+    assert_eq!(
+        write.unwrap_err(),
+        WriteError::Refused(WriteRefusal::Moved {
+            cluster: CONTEXT.to_owned(),
+        })
+    );
     assert_eq!(puts(&real), (1, 0), "the write never left");
     assert_eq!(puts(&fallback), (0, 0));
     assert!(

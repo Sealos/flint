@@ -9,6 +9,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
 use crate::cluster::{self, ClusterError};
+use crate::connection::policy::CredentialAccess;
+use crate::credential::CredentialSource;
 use kube::config::ExecInteractiveMode;
 
 /// A fake exec auth plugin: a shell script in a scratch directory, which it gets as
@@ -127,6 +129,16 @@ pub(crate) async fn wait_reaped(pid: libc::pid_t) {
 /// Waits until `pid`, started by Flint's child, no longer runs.
 pub(crate) async fn wait_dead(pid: libc::pid_t) {
     wait_until_gone(pid, |pid| !live(pid)).await;
+}
+
+fn always_allowed() -> CredentialGrant {
+    CredentialAccess::always().grant(CredentialSource::Plugin)
+}
+
+/// [`resolve_with_grant`] under the policy every connection has today.
+async fn resolve(config: &mut kube::Config, context: &str) -> Result<Resolved, AuthError> {
+    let grant = CredentialAccess::always().grant(CredentialSource::of(&config.auth_info));
+    resolve_with_grant(config, context, &grant).await
 }
 
 async fn config(kubeconfig: &Kubeconfig) -> kube::Config {
@@ -577,6 +589,7 @@ async fn a_refresh_waiting_for_the_foreground_times_out_without_cooldown() {
     }));
     let token = RefreshingToken(Arc::new(TokenShared {
         state: state.clone(),
+        grant: always_allowed(),
         task: std::sync::Mutex::default(),
     }));
     let waiting_for_foreground = async {
@@ -1043,6 +1056,7 @@ async fn a_refresh_that_died_is_replaced() {
         .shared();
     let _ = died.clone().await;
     let token = RefreshingToken(Arc::new(TokenShared {
+        grant: always_allowed(),
         task: std::sync::Mutex::default(),
         state: Arc::new(tokio::sync::Mutex::new(TokenState {
             context: "ctx".into(),

@@ -34,18 +34,24 @@ pub enum Manager {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedBy {
     pub manager: Manager,
+    /// Empty when only the tool is known.
     pub name: String,
     pub namespace: Option<String>,
 }
 
 impl std::fmt::Display for ManagedBy {
-    /// `Argo CD: web`, `Flux: flux-system/apps` or `Flux HelmRelease: flux-system/web`.
+    /// `Argo CD: web`, `Flux: flux-system/apps` or `Flux HelmRelease: flux-system/web`; just the
+    /// tool, such as `Argo CD`, without a name.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self.manager {
-            Manager::ArgoCd => "Argo CD: ",
-            Manager::FluxKustomization => "Flux: ",
-            Manager::FluxHelmRelease => "Flux HelmRelease: ",
+            Manager::ArgoCd => "Argo CD",
+            Manager::FluxKustomization => "Flux",
+            Manager::FluxHelmRelease => "Flux HelmRelease",
         })?;
+        if self.name.is_empty() {
+            return Ok(());
+        }
+        f.write_str(": ")?;
         if let Some(namespace) = &self.namespace {
             write!(f, "{namespace}/")?;
         }
@@ -237,6 +243,41 @@ pub fn managed_by_object(object: &Value) -> Option<ManagedBy> {
     managed_by(&Identity::of(object), |key| {
         label_or_annotation(metadata, key)
     })
+}
+
+/// Where a list row keeps its manager's text, among its labels. A colon is not valid in a label
+/// key, so no label of the object can take this place.
+pub const ROW_MANAGER_KEY: &str = "flint:managed-by";
+
+/// [`managed_by`] for a Secret as the API server returned it, for showing. A tracking id naming
+/// this exact Secret shows the tool only; no text from an annotation is output. Other markers
+/// count from its labels, and a name the credential redactor would touch is left out.
+pub fn managed_by_secret(object: &Value) -> Option<ManagedBy> {
+    let metadata = object.get("metadata")?;
+    let tracked = metadata
+        .get("annotations")
+        .and_then(|annotations| annotations.get(ARGO_TRACKING_ID))
+        .and_then(Value::as_str)
+        .is_some_and(|id| names_secret(id, &Identity::of(object)));
+    if tracked {
+        return Some(ManagedBy {
+            manager: Manager::ArgoCd,
+            name: String::new(),
+            namespace: None,
+        });
+    }
+    let manager = manager_from(None, |key: &str| metadata.get("labels")?.get(key)?.as_str())?;
+    (crate::redact::redact_credentials(&manager.to_string()).count == 0).then_some(manager)
+}
+
+/// Whether tracking id `id` is `<app>:/Secret:<namespace>/<name>` for exactly this Secret.
+fn names_secret(id: &str, object: &Identity<'_>) -> bool {
+    let (Some(""), "Secret", Some(namespace)) = (object.group, object.kind, object.namespace)
+    else {
+        return false;
+    };
+    id.strip_suffix(&format!(":/Secret:{namespace}/{}", object.name))
+        .is_some_and(is_plain_name)
 }
 
 /// [`managed_by_live`] for an object as JSON.
@@ -516,6 +557,51 @@ mod tests {
             let lone = object(json!({APP_INSTANCE: value}), json!({}));
             assert_eq!(live(&lone), None, "{value}");
         }
+    }
+
+    fn secret(labels: Value, annotations: Value) -> Value {
+        json!({"apiVersion": "v1", "kind": "Secret", "metadata": {
+            "name": "web", "namespace": "demo", "labels": labels, "annotations": annotations,
+        }})
+    }
+
+    fn shown_secret(object: &Value) -> Option<String> {
+        managed_by_secret(object).map(|m| m.to_string())
+    }
+
+    // covers UP-23: a tracked Secret shows only the tool, and its labels still name a manager.
+    #[test]
+    fn a_tracked_secret_shows_only_the_tool() {
+        let tracked = secret(
+            json!({}),
+            json!({ARGO_TRACKING_ID: "plain-value:/Secret:demo/web"}),
+        );
+        assert_eq!(shown_secret(&tracked).as_deref(), Some("Argo CD"));
+        let flux = secret(json!({FLUX_KUSTOMIZE.0: "apps"}), json!({}));
+        assert_eq!(shown_secret(&flux).as_deref(), Some("Flux: apps"));
+    }
+
+    // covers UP-10: no other annotation of a Secret is read, since any of them may copy a value.
+    #[test]
+    fn a_secret_shows_nothing_from_its_other_annotations() {
+        for annotations in [
+            json!({ARGO_INSTANCE: "s3cr3t-value"}),
+            json!({FLUX_KUSTOMIZE.0: "s3cr3t-value"}),
+            json!({ARGO_TRACKING_ID: "s3cr3t-value"}),
+            json!({ARGO_TRACKING_ID: "s3cr3t-value:/Secret:demo/other"}),
+            json!({ARGO_TRACKING_ID: "s3cr3t-value:apps/Deployment:demo/web"}),
+            json!({ARGO_TRACKING_ID: "s3cr3t-value:/Secret:other/web"}),
+            json!({ARGO_TRACKING_ID: "s3cr3t-value:example.com/Secret:demo/web"}),
+            json!({ARGO_TRACKING_ID: "<redacted>"}),
+        ] {
+            let labelled = secret(json!({APP_INSTANCE: "shop"}), annotations);
+            assert_eq!(shown_secret(&labelled), None, "{labelled}");
+        }
+        let credential = secret(
+            json!({}),
+            json!({ARGO_TRACKING_ID: "AKIAIOSFODNN7EXAMPLE:/Secret:demo/web"}),
+        );
+        assert_eq!(shown_secret(&credential).as_deref(), Some("Argo CD"));
     }
 
     // covers UP-23
