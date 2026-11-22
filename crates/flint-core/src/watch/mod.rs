@@ -5,8 +5,9 @@
 //! - **On view**: only kinds with an open subscription are watched.
 //! - In both modes a subscribed kind is watched (or polled, for APIs that cannot watch), and
 //!   nothing is watched while the cluster is not active. Stopping a kind drops its rows, so
-//!   coming back starts from a fresh list. During an outage its last rows are kept until the
-//!   cluster lists again, so coming back shows them as stale rather than an empty list.
+//!   coming back starts from a fresh list. A view closed on the active cluster during an outage
+//!   keeps its last rows until the cluster lists again or goes cold, so reopening it shows them
+//!   as stale rather than an empty list.
 
 mod engine;
 mod hub;
@@ -115,7 +116,14 @@ impl ClusterWatches {
 
     /// Sets discovery results; call [`ClusterWatches::reconcile`] after.
     pub fn set_kinds(&mut self, kinds: &[KindInfo]) {
-        self.kinds = Some(kinds.iter().map(|k| (k.id(), k.clone())).collect());
+        let next: HashMap<KindId, KindInfo> = kinds.iter().map(|k| (k.id(), k.clone())).collect();
+        // Rows kept through an outage belong to the resource they were listed from.
+        for (id, old) in self.kinds.iter().flatten() {
+            if next.get(id).is_none_or(|k| k.resource != old.resource) {
+                self.hubs.forget_kept(&self.cluster, id);
+            }
+        }
+        self.kinds = Some(next);
     }
 
     pub fn kind(&self, id: &KindId) -> Option<&KindInfo> {
@@ -197,6 +205,9 @@ impl ClusterWatches {
             .collect();
         for id in stale {
             self.stop(&id);
+        }
+        if !active {
+            self.hubs.release_kept_rows(&self.cluster);
         }
         wanted
     }

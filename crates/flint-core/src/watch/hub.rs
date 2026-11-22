@@ -236,6 +236,20 @@ impl Hub {
         };
         self.tx.send_replace(Arc::new(snapshot));
     }
+
+    /// Takes back what [`Hub::show_outage`] put on a hub no watch owns.
+    fn clear_shown_outage(&self) {
+        let _owner = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+        let latest = self.latest();
+        if self.state() != SyncState::Idle || latest.state == SyncState::Idle {
+            return;
+        }
+        let mut idle =
+            KindSnapshot::empty(latest.cluster.clone(), latest.kind.clone(), SyncState::Idle);
+        idle.namespaced = latest.namespaced;
+        idle.version = VERSION.fetch_add(1, Ordering::Relaxed) + 1;
+        self.tx.send_replace(Arc::new(idle));
+    }
 }
 
 type HubMap = HashMap<(ClusterId, KindId), Arc<Hub>>;
@@ -272,11 +286,21 @@ impl Hubs {
         })
     }
 
-    /// The rows the outage kept for `kind`.
-    fn kept_rows(&self, cluster: &str, kind: &KindId) -> Option<Arc<KindSnapshot>> {
+    /// The rows the outage kept for `kind`, with the error they were kept under. A quiet watch
+    /// still reporting synced has not noticed the drop, so it does not overrule them.
+    fn kept(&self, cluster: &str, kind: &KindId) -> Option<(String, Arc<KindSnapshot>)> {
         let slot = self.outages.get(cluster)?;
         let outage = slot.lock().unwrap_or_else(|e| e.into_inner());
-        outage.as_ref()?.rows.get(kind).cloned()
+        let outage = outage.as_ref()?;
+        Some((outage.error.clone(), outage.rows.get(kind)?.clone()))
+    }
+
+    fn clear_shown_outages(&self, cluster: &str) {
+        for ((c, _), hub) in &self.map {
+            if c == cluster {
+                hub.clear_shown_outage();
+            }
+        }
     }
 }
 
@@ -300,21 +324,26 @@ impl HubRegistry {
     ) -> (Arc<Hub>, watch::Receiver<Arc<KindSnapshot>>) {
         let mut hubs = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let hub = entry(&mut hubs, cluster, kind);
-        if let Some(error) = hubs.outage_error(cluster) {
-            hub.show_outage(&error, hubs.kept_rows(cluster, kind).as_ref());
+        match hubs.kept(cluster, kind) {
+            Some((error, rows)) => hub.show_outage(&error, Some(&rows)),
+            None => {
+                if let Some(error) = hubs.outage_error(cluster) {
+                    hub.show_outage(&error, None);
+                }
+            }
         }
         let rx = hub.subscribe();
         (hub, rx)
     }
 
-    /// Keeps the last rows of a kind whose watch is stopping, if its cluster is in an outage.
-    /// Call it before the hub's rows are replaced.
+    /// Keeps the last rows of a kind whose watch is stopping, if that watch has lost its
+    /// connection. Call it before the hub's rows are replaced.
     pub fn keep_for_outage(&self, cluster: &str, kind: &KindId, hub: &Hub) {
-        let latest = hub.latest();
-        let mut hubs = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(error) = hubs.outage_error(cluster) else {
+        let SyncState::Reconnecting { error: Some(error) } = hub.state() else {
             return;
         };
+        let latest = hub.latest();
+        let mut hubs = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let slot = hubs.outages.entry(cluster.to_owned()).or_default();
         let mut outage = slot.lock().unwrap_or_else(|e| e.into_inner());
         let outage = outage.get_or_insert_with(|| Outage {
@@ -330,22 +359,55 @@ impl HubRegistry {
     /// What `kind` starts from if its cluster is in an outage. Its kept rows move to the caller.
     pub fn resume(&self, cluster: &str, kind: &KindId) -> Option<Resume> {
         let hubs = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let error = hubs.outage_error(cluster)?;
-        let rows = hubs.outages.get(cluster).and_then(|slot| {
-            let mut outage = slot.lock().unwrap_or_else(|e| e.into_inner());
-            outage.as_mut()?.rows.remove(kind)
-        });
+        let kept = hubs.kept(cluster, kind);
+        let error = match &kept {
+            Some((error, _)) => error.clone(),
+            None => hubs.outage_error(cluster)?,
+        };
+        if kept.is_some()
+            && let Some(slot) = hubs.outages.get(cluster)
+            && let Some(outage) = slot.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+        {
+            outage.rows.remove(kind);
+        }
         Some(Resume {
             state: SyncState::Reconnecting { error: Some(error) },
-            rows,
+            rows: kept.map(|(_, rows)| rows),
         })
     }
 
-    /// Drops what an outage kept: the cluster has a new connection, or none.
+    /// Drops what an outage kept: the cluster has a new connection, or none. That includes rows
+    /// already shown on a hub no watch owns, so nobody reads the old connection's rows.
     pub fn forget_outage(&self, cluster: &str) {
         let hubs = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = hubs.outages.get(cluster) {
             *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        hubs.clear_shown_outages(cluster);
+    }
+
+    /// Drops the kept rows of a cluster going cold (ADR-0008: a cluster that is not active holds
+    /// no rows). The error stays, so coming back during the outage says reconnecting.
+    pub fn release_kept_rows(&self, cluster: &str) {
+        let hubs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = hubs.outages.get(cluster)
+            && let Some(outage) = slot.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+        {
+            outage.rows = HashMap::new();
+        }
+        hubs.clear_shown_outages(cluster);
+    }
+
+    /// Drops the rows kept for `kind`: discovery no longer serves them under the same resource.
+    pub fn forget_kept(&self, cluster: &str, kind: &KindId) {
+        let hubs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = hubs.outages.get(cluster)
+            && let Some(outage) = slot.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+        {
+            outage.rows.remove(kind);
+        }
+        if let Some(hub) = hubs.map.get(&(cluster.to_owned(), kind.clone())) {
+            hub.clear_shown_outage();
         }
     }
 

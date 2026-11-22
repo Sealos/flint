@@ -1825,6 +1825,114 @@ async fn what_an_outage_kept_goes_with_the_connection_or_a_synced_kind() {
     assert!(hubs.resume("c", &pods_id).is_none(), "listed again");
 }
 
+/// A hub for pods holding one row in `state`.
+fn hub_with_row(hubs: &HubRegistry, state: SyncState) -> Arc<Hub> {
+    let hub = hubs.get_or_create("c", &KindId::pods());
+    let mut store = crate::store::Store::new(true);
+    let page = serde_json::from_value(pod("u1", "web", "Running", "5", true)).unwrap();
+    store.apply(page, false, 0);
+    hub.take_over(store.snapshot(KindSnapshot::empty("c".into(), KindId::pods(), state)));
+    hub
+}
+
+fn idle(kind: KindId) -> KindSnapshot {
+    KindSnapshot::empty("c".into(), kind, SyncState::Idle)
+}
+
+fn down() -> SyncState {
+    SyncState::Reconnecting {
+        error: Some("dropped".into()),
+    }
+}
+
+// covers UP-27: rows already shown to a subscriber go with the connection, the cluster going
+// cold, or the kind's resource changing.
+#[tokio::test]
+async fn rows_shown_from_an_outage_are_taken_back() {
+    let clears: [fn(&HubRegistry); 3] = [
+        |hubs| hubs.forget_outage("c"),
+        |hubs| hubs.release_kept_rows("c"),
+        |hubs| hubs.forget_kept("c", &KindId::pods()),
+    ];
+    for clear in clears {
+        let hubs = HubRegistry::default();
+        let hub = hub_with_row(&hubs, down());
+        hubs.keep_for_outage("c", &KindId::pods(), &hub);
+        hub.take_over(idle(KindId::pods()));
+        let (_hub, rx) = hubs.subscribe("c", &KindId::pods());
+        assert_eq!(rx.borrow().rows.len(), 1, "shown from the outage");
+        clear(&hubs);
+        assert!(rx.borrow().rows.is_empty());
+        assert_eq!(rx.borrow().state, SyncState::Idle);
+        assert!(
+            hubs.resume("c", &KindId::pods())
+                .is_none_or(|r| r.rows.is_none())
+        );
+    }
+}
+
+// covers UP-27: a quiet watch that has not noticed the drop does not cost a failed kind its rows.
+#[tokio::test]
+async fn a_quiet_synced_kind_does_not_veto_the_rows_of_a_failed_one() {
+    let hubs = HubRegistry::default();
+    let crds = hubs.get_or_create("c", &KindId::custom_resource_definitions());
+    crds.take_over(KindSnapshot::empty(
+        "c".into(),
+        KindId::custom_resource_definitions(),
+        SyncState::Synced,
+    ));
+    let hub = hub_with_row(&hubs, down());
+    hubs.keep_for_outage("c", &KindId::pods(), &hub);
+    hub.take_over(idle(KindId::pods()));
+    let (_hub, rx) = hubs.subscribe("c", &KindId::pods());
+    assert_eq!(rx.borrow().state, down());
+    assert_eq!(rx.borrow().rows.len(), 1);
+    let resume = hubs.resume("c", &KindId::pods()).expect("kept");
+    assert!(resume.rows.is_some());
+}
+
+// covers UP-27: discovery serving a closed kind from another resource drops its kept rows.
+#[tokio::test]
+async fn a_changed_resource_drops_the_rows_kept_for_it() {
+    let fake = Fake::new();
+    let hubs = HubRegistry::default();
+    let mut w = watches(&fake, &hubs);
+    let hub = hub_with_row(&hubs, down());
+    hubs.keep_for_outage("c", &KindId::pods(), &hub);
+    hub.take_over(idle(KindId::pods()));
+
+    w.set_kinds(&kinds());
+    assert!(
+        hubs.resume("c", &KindId::pods())
+            .is_some_and(|r| r.rows.is_some())
+    );
+
+    hubs.keep_for_outage("c", &KindId::pods(), &hub_with_row(&hubs, down()));
+    hub.take_over(idle(KindId::pods()));
+    let mut moved = kinds();
+    moved[0].resource.version = "v2".into();
+    w.set_kinds(&moved);
+    assert!(
+        hubs.resume("c", &KindId::pods())
+            .is_none_or(|r| r.rows.is_none())
+    );
+}
+
+// covers UP-24, UP-27: a cluster switched away from keeps no rows, only that it was down.
+#[tokio::test]
+async fn a_cold_cluster_keeps_no_rows() {
+    let fake = Fake::new();
+    let hubs = HubRegistry::default();
+    let mut w = watches(&fake, &hubs);
+    let hub = hub_with_row(&hubs, down());
+    hubs.keep_for_outage("c", &KindId::pods(), &hub);
+    hub.take_over(idle(KindId::pods()));
+    w.reconcile(false, WatchMode::OnView, &subs(&[]));
+    let resume = hubs.resume("c", &KindId::pods()).expect("still down");
+    assert!(resume.rows.is_none());
+    assert_eq!(resume.state, down());
+}
+
 // covers UP-25
 #[tokio::test]
 async fn watch_mode_transitions() {

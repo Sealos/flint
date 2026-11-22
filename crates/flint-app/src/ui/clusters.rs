@@ -455,9 +455,9 @@ pub enum Presence<'a> {
 }
 
 /// One slow breath of the reconnecting dot. The app has no reduced-motion setting to follow, so
-/// the pulse stays slow and shallow: the dot never fades enough to lose its colour (UP-32).
+/// the pulse stays slow and shallow: at its dimmest the dot still has 3:1 contrast (UP-32).
 const PULSE_PERIOD: Duration = Duration::from_millis(2400);
-const PULSE_MIN_OPACITY: f32 = 0.7;
+const PULSE_MIN_OPACITY: f32 = 0.85;
 
 /// The shape of a cluster's presence marker. Shape carries the state without colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -799,6 +799,24 @@ mod tests {
             Presence::Failed,
         ] {
             assert!(!quiet.pulses(), "{quiet:?}");
+        }
+    }
+
+    // covers UP-32: the dimmest frame of the pulse stays readable on the row it is drawn on.
+    #[test]
+    fn the_pulse_keeps_three_to_one_at_its_dimmest() {
+        use crate::ui::accent::CANDIDATES;
+        use crate::ui::theme::tests::{contrast, resolved};
+        use crate::ui::theme::themes;
+        for accent in CANDIDATES {
+            let (light, dark) = themes(&accent);
+            for theme in [resolved(light), resolved(dark)] {
+                let dimmest = theme.warning.opacity(super::PULSE_MIN_OPACITY);
+                for row in [theme.sidebar, theme.sidebar.blend(theme.list_active)] {
+                    let ratio = contrast(dimmest, row, theme.background);
+                    assert!(ratio >= 3.0, "{}: {ratio:.2}:1", accent.name);
+                }
+            }
         }
     }
 
