@@ -362,7 +362,11 @@ actions!(
         /// In the AI scope pickers: let agents read every namespace.
         ScopeAllNamespaces,
         /// In the AI scope pickers: let agents read every kind.
-        ScopeAllKinds
+        ScopeAllKinds,
+        /// In the AI scope pickers: let agents read only the namespaces selected.
+        ScopeSelectedNamespaces,
+        /// In the AI scope pickers: let agents read only the kinds selected.
+        ScopeSelectedKinds
     ]
 );
 
@@ -2053,6 +2057,18 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<ScopeAllKinds>(
             "Scope All Kinds",
             "In the AI scope pickers, let agents read every kind.",
+        )
+        .of(C::Cluster, S::Dialog)
+        .hidden(),
+        Spec::unit::<ScopeSelectedNamespaces>(
+            "Scope Selected Namespaces",
+            "In the AI scope pickers, let agents read only the namespaces selected.",
+        )
+        .of(C::Cluster, S::Dialog)
+        .hidden(),
+        Spec::unit::<ScopeSelectedKinds>(
+            "Scope Selected Kinds",
+            "In the AI scope pickers, let agents read only the kinds selected.",
         )
         .of(C::Cluster, S::Dialog)
         .hidden(),

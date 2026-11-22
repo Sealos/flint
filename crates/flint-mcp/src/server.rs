@@ -2,7 +2,7 @@
 //! once), recomputes the kubeconfig file list from it, reloads kubeconfig when a file changed,
 //! checks the cluster against the opt-in list, and only then touches the network.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -10,7 +10,10 @@ use std::time::Duration;
 use flint_core::activity;
 use flint_core::cache::{SlotMap, slot};
 use flint_core::cluster::{self, ClusterError, Target};
-use flint_core::kubeconfig::{self, ContextInfo, FileStamps, LoadedKubeconfig};
+use flint_core::kubeconfig::{
+    self, ConfirmedDefinitions, ContextInfo, FileStamps, JudgedRead, KubeconfigRead,
+    LoadedKubeconfig, ReadOutcome,
+};
 use flint_core::read::{self, KindInfo, ResolveKindError};
 use flint_core::settings;
 use flint_core::table::{self, TablePage};
@@ -51,8 +54,12 @@ struct Inner {
     /// appended on each call.
     kubeconfig_base: Vec<PathBuf>,
     home: Option<PathBuf>,
-    /// The last parsed kubeconfig and the file stamps it was parsed from.
-    kubeconfig: Mutex<Option<(FileStamps, Arc<LoadedKubeconfig>)>>,
+    /// The last parsed kubeconfig.
+    kubeconfig: Mutex<Option<ParsedKubeconfig>>,
+    /// Never held across a read of the files.
+    confirmed: Mutex<ConfirmedDefinitions>,
+    /// How the files are read.
+    read_files: fn(&[PathBuf]) -> KubeconfigRead,
     clients: SlotMap<Client>,
     discovery: SlotMap<Discovered>,
     /// Which program this is, for advice that can be followed where it runs.
@@ -61,6 +68,19 @@ struct Inner {
     warned_scopes: std::sync::Mutex<std::collections::HashSet<String>>,
     /// How many tool calls run and wait, and the reply bytes not yet written (#252).
     admission: Admission,
+}
+
+/// One parse of the kubeconfig files, and what it decided.
+struct ParsedKubeconfig {
+    /// The file stamps it was parsed from.
+    stamps: FileStamps,
+    kubeconfig: Arc<LoadedKubeconfig>,
+    /// The contexts this load paused, judged when it was recorded so that a call never reads
+    /// them against a later load.
+    paused: Arc<HashSet<String>>,
+    /// Every file read and none is settling. Otherwise the files are read again on the next
+    /// call even with the same stamps: restoring a file's permissions changes none.
+    reusable: bool,
 }
 
 /// The longest a call waits for its activity record to be written, rather than hold its reply.
@@ -648,6 +668,8 @@ impl FlintMcp {
                 kubeconfig_base,
                 home,
                 kubeconfig: Mutex::default(),
+                confirmed: Mutex::default(),
+                read_files: KubeconfigRead::settled,
                 clients: Mutex::default(),
                 discovery: Mutex::default(),
                 warned_scopes: std::sync::Mutex::default(),
@@ -933,6 +955,8 @@ impl ServerHandler for FlintMcp {
 struct CallContext {
     settings: flint_core::Settings,
     kubeconfig: Arc<LoadedKubeconfig>,
+    /// The contexts this kubeconfig paused: refused before any client is built.
+    paused: Arc<HashSet<String>>,
 }
 
 impl FlintMcp {
@@ -956,10 +980,11 @@ impl FlintMcp {
                 &settings,
                 inner.home.as_deref(),
             );
-            let kubeconfig = inner.load_kubeconfig(&paths);
+            let (kubeconfig, paused) = inner.load_kubeconfig(&paths);
             Ok(CallContext {
                 settings,
                 kubeconfig,
+                paused,
             })
         })
         .await?
@@ -986,7 +1011,7 @@ impl FlintMcp {
             .lock()
             .unwrap()
             .as_ref()
-            .is_some_and(|(_, loaded)| loaded.context(name).is_some())
+            .is_some_and(|parsed| parsed.kubeconfig.context(name).is_some())
     }
 
     /// The client for an exposed cluster. Clients are cached per context and rebuilt when the
@@ -999,6 +1024,9 @@ impl FlintMcp {
             note.server = info.server.as_deref().map(flint_core::redact::server_url);
             note.endpoint = info.server.clone();
         });
+        if ctx.paused.contains(name) {
+            return Err(ToolError::new(policy::paused_cluster(name)));
+        }
         let scope = policy::cluster_scope(&ctx.settings, info);
         let fingerprint = cluster::context_fingerprint(&ctx.kubeconfig.merged, &info.name)
             .ok_or_else(|| ToolError::new(format!("cluster \"{name}\" not found")))?;
@@ -1712,19 +1740,51 @@ impl FlintMcp {
 
 impl Inner {
     /// The merged kubeconfig for `paths`, parsed again only when a file changed. Exec auth
-    /// plugins are set to never prompt: stdin is the MCP stream.
-    fn load_kubeconfig(&self, paths: &[PathBuf]) -> Arc<LoadedKubeconfig> {
+    /// plugins are set to never prompt: stdin is the MCP stream. Also returns the contexts that
+    /// load paused. No lock is held across the read: a file can stall, and a call on another
+    /// list of files must still get through.
+    fn load_kubeconfig(&self, paths: &[PathBuf]) -> (Arc<LoadedKubeconfig>, Arc<HashSet<String>>) {
+        // Stamped before the read, so a change during it shows as a miss on the next call.
         let stamps = FileStamps::of(paths);
-        if let Some((cached, loaded)) = &*self.kubeconfig.lock().unwrap()
-            && *cached == stamps
-        {
-            return loaded.clone();
+        if let Some(parsed) = self.parsed(&stamps) {
+            return parsed;
         }
-        let mut loaded = kubeconfig::load(paths);
-        cluster::disable_interactive_exec(&mut loaded.merged);
-        let loaded = Arc::new(loaded);
-        *self.kubeconfig.lock().unwrap() = Some((stamps, loaded.clone()));
-        loaded
+        let mut read = (self.read_files)(paths);
+        cluster::disable_interactive_exec(&mut read.loaded_mut().merged);
+        // Held until the result is stored, so history and the stored parse move together.
+        let mut confirmed = self.confirmed.lock().unwrap();
+        let JudgedRead {
+            loaded,
+            paused,
+            outcome,
+        } = confirmed.judge(read);
+        let mut stored = self.kubeconfig.lock().unwrap();
+        if outcome == ReadOutcome::Obsolete
+            && let Some(newer) = stored
+                .as_ref()
+                .filter(|parsed| parsed.kubeconfig.paths == paths)
+        {
+            return (newer.kubeconfig.clone(), newer.paused.clone());
+        }
+        let (loaded, paused) = (Arc::new(loaded), Arc::new(paused));
+        if matches!(outcome, ReadOutcome::Clean | ReadOutcome::Recheck) {
+            *stored = Some(ParsedKubeconfig {
+                stamps,
+                kubeconfig: loaded.clone(),
+                paused: paused.clone(),
+                reusable: outcome == ReadOutcome::Clean,
+            });
+        }
+        (loaded, paused)
+    }
+
+    /// The last parse, if it still stands for files stamped `stamps`.
+    fn parsed(&self, stamps: &FileStamps) -> Option<(Arc<LoadedKubeconfig>, Arc<HashSet<String>>)> {
+        let cached = self.kubeconfig.lock().unwrap();
+        let parsed = cached
+            .as_ref()
+            .filter(|parsed| parsed.reusable && parsed.stamps == *stamps)?;
+        Some((parsed.kubeconfig.clone(), parsed.paused.clone()))
     }
 }
 
@@ -1812,6 +1872,71 @@ fn table_rows(
 mod tests {
     use super::*;
     use flint_core::table::{Cell, Column, ColumnRole, ColumnType, ListFormat, Row};
+
+    /// Whether a read of a file called `stuck` has been let go, and whether it has started.
+    static STALL: (Mutex<(bool, bool)>, std::sync::Condvar) =
+        (Mutex::new((false, false)), std::sync::Condvar::new());
+
+    /// Reads the files, then stalls if they include one called `stuck`, until the test lets go.
+    fn read_stalling(paths: &[PathBuf]) -> KubeconfigRead {
+        let read = KubeconfigRead::settled(paths);
+        if paths.iter().any(|path| path.ends_with("stuck")) {
+            let mut state = STALL.0.lock().unwrap();
+            state.1 = true;
+            STALL.1.notify_all();
+            while !state.0 {
+                state = STALL.1.wait(state).unwrap();
+            }
+        }
+        read
+    }
+
+    // covers UP-54: a read stalled on one list of files holds up no call on another list, and
+    // its late result does not replace what that call recorded.
+    #[test]
+    fn a_stalled_read_does_not_block_another_file_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = |token: &str| {
+            format!(
+                "clusters:\n- name: c\n  cluster:\n    server: https://one\n\
+                 contexts:\n- name: dev\n  context:\n    cluster: c\n    user: u\n\
+                 users:\n- name: u\n  user:\n    token: {token}\n"
+            )
+        };
+        let (stuck, good) = (dir.path().join("stuck"), dir.path().join("good"));
+        std::fs::write(&stuck, config("one")).unwrap();
+        std::fs::write(&good, config("two")).unwrap();
+        let mut server = FlintMcp::new(PathBuf::from("/nonexistent"), Vec::new(), None);
+        Arc::get_mut(&mut server.inner).unwrap().read_files = read_stalling;
+        let inner = server.inner.clone();
+
+        let late = {
+            let (inner, paths) = (inner.clone(), vec![stuck]);
+            std::thread::spawn(move || inner.load_kubeconfig(&paths))
+        };
+        {
+            let mut state = STALL.0.lock().unwrap();
+            while !state.1 {
+                state = STALL.1.wait(state).unwrap();
+            }
+        }
+        let (done, answer) = std::sync::mpsc::channel();
+        {
+            let (inner, paths) = (inner.clone(), vec![good.clone()]);
+            std::thread::spawn(move || done.send(inner.load_kubeconfig(&paths)));
+        }
+        let got = answer.recv_timeout(Duration::from_secs(10));
+        STALL.0.lock().unwrap().0 = true;
+        STALL.1.notify_all();
+        let (loaded, paused) = got.expect("the other list of files was held up");
+        assert!(loaded.context("dev").is_some() && paused.is_empty());
+
+        let (_, late_paused) = late.join().unwrap();
+        assert!(late_paused.contains("dev"), "not what is confirmed now");
+        let stored = inner.kubeconfig.lock().unwrap();
+        let stored = stored.as_ref().expect("a parse is stored");
+        assert_eq!(stored.kubeconfig.paths, vec![good]);
+    }
 
     // covers UP-14: rows listed namespace by namespace share one column layout, or fall back to
     // the plain one when the pages' columns differ.
