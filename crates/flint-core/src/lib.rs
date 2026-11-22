@@ -12,6 +12,7 @@ mod auth_plugin;
 pub mod bootstrap;
 pub mod cache;
 pub mod cluster;
+pub mod combined;
 mod connection;
 mod credential;
 pub mod dashboard;
