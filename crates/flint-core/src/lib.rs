@@ -10,6 +10,7 @@ mod auth_plugin;
 pub mod bootstrap;
 pub mod cache;
 pub mod cluster;
+mod connection;
 mod credential;
 pub mod discovery;
 pub mod display;
@@ -22,6 +23,7 @@ pub mod kubeconfig;
 mod logging;
 pub mod logs;
 mod manager;
+pub mod metrics;
 pub mod paging;
 pub mod problems;
 pub mod protection;
@@ -55,6 +57,7 @@ pub use logs::{
     PodSet, PodSetStatus, SearchQuery, Severity, StreamStatus, WorkloadKind, WorkloadPod,
     WorkloadTarget,
 };
+pub use metrics::{MetricsError, MetricsList, MetricsPoll, NodeMetrics, PodMetrics};
 pub use problems::{
     Classifier, Problem, ProblemId, ProblemKind, ProblemReason, ProblemSeverity, ProblemSubject,
 };

@@ -882,8 +882,12 @@ fn refused(refusal: &WriteRefusal, connected: bool) -> ExecFailure {
         }
         WriteRefusal::Moved { .. } => ExecFailureKind::NotStartedMoved,
         WriteRefusal::Removed { .. } => ExecFailureKind::NotStartedRemoved,
-        WriteRefusal::Stale { .. } if connected => ExecFailureKind::EndedStale,
-        WriteRefusal::Stale { .. } => ExecFailureKind::NotStartedStale,
+        WriteRefusal::Stale { .. } | WriteRefusal::Unsettled { .. } if connected => {
+            ExecFailureKind::EndedStale
+        }
+        WriteRefusal::Stale { .. } | WriteRefusal::Unsettled { .. } => {
+            ExecFailureKind::NotStartedStale
+        }
         WriteRefusal::NotConnected { .. } | WriteRefusal::Stopped => ExecFailureKind::Unreachable,
     };
     ExecFailure::new(kind, refusal.to_string())
@@ -1959,6 +1963,7 @@ mod tests {
                 defines: Vec::new(),
                 cluster_sources: Default::default(),
                 user_sources: Default::default(),
+                blank: Vec::new(),
             }
         }
 

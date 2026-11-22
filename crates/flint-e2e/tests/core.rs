@@ -8,92 +8,28 @@ use std::time::Duration;
 
 use flint_core::WriteRefusal;
 use flint_core::exec::BracketedPaste;
-use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event};
+use flint_core::handle::{Command, Event};
 use flint_core::read::{self, ListQuery};
 use flint_core::write::{
-    WriteAction, WriteError, WriteOutcome, WriteProposal, WriteReview, WriteTarget, WriteWarning,
+    WriteAction, WriteError, WriteOutcome, WriteReview, WriteTarget, WriteWarning,
 };
 use flint_core::{
     ExecFailureKind, ExecRequest, ExecSession, ExecSnapshot, ExecState, KindId, KindSnapshot,
     LogOptions, LogSession, LogSnapshot, LogState, LogTarget, PodSet, Settings, Subscription,
-    SyncState, TerminalSize, WatchMode, WatchTiming, WorkloadKind, WorkloadTarget, cluster, table,
+    SyncState, TerminalSize, WorkloadKind, WorkloadTarget, cluster, table,
 };
 use flint_e2e::fake_api::{
     CONTEXT, ContainerLog, ExecEnd, FakeApiServer, FakePod, Fault, Gvr, Options, TtySize, Verb,
     WatchStep,
 };
 
-const WAIT: Duration = Duration::from_secs(30);
+mod core_support;
 
-/// A core on a scratch config dir, watching only what is open, connected to `server`.
-struct Core {
-    handle: CoreHandle,
-    _dir: tempfile::TempDir,
-}
+use core_support::{Core, EDITED, WAIT, deployments, editable, three_replicas, write_target};
 
 impl Core {
     async fn start(server: &FakeApiServer, namespace: Option<&str>) -> Core {
         Core::start_with(server, namespace, Settings::default()).await
-    }
-
-    /// [`Core::start`] with `settings` (watching only what is open).
-    async fn start_with(
-        server: &FakeApiServer,
-        namespace: Option<&str>,
-        settings: Settings,
-    ) -> Core {
-        let dir = tempfile::tempdir().unwrap();
-        let kubeconfig = dir.path().join("kubeconfig");
-        server.write_kubeconfig(&kubeconfig, namespace).unwrap();
-        Core::start_on(dir, vec![kubeconfig], settings).await
-    }
-
-    /// A core reading the kubeconfig files `paths`, in order, with its config in `dir`.
-    async fn start_on(dir: tempfile::TempDir, paths: Vec<PathBuf>, settings: Settings) -> Core {
-        let settings = Settings {
-            watch_mode: WatchMode::OnView,
-            ..settings
-        };
-        let handle = CoreHandle::start(CoreConfig {
-            config_dir: dir.path().join("config"),
-            settings,
-            settings_error: None,
-            kubeconfig_base: paths,
-            home: None,
-            watch_files: false,
-            // The fake server answers at once; real waits would only slow the tests down.
-            watch_timing: WatchTiming {
-                backoff_min: Duration::from_millis(10),
-                backoff_max: Duration::from_millis(50),
-                denied_backoff_min: Duration::from_millis(10),
-            },
-        })
-        .unwrap();
-        let core = Core { handle, _dir: dir };
-        core.activate().await;
-        core
-    }
-
-    /// Activates the fake context and waits for its discovery.
-    async fn activate(&self) {
-        let events = self.handle.events();
-        self.handle.send(Command::Activate(CONTEXT.to_owned()));
-        tokio::time::timeout(WAIT, async {
-            loop {
-                match events.recv().await.expect("core running") {
-                    Event::ConnectionChanged {
-                        state: ConnectionState::Failed(e),
-                        ..
-                    } => panic!("connection failed: {e}"),
-                    Event::DiscoveryChanged {
-                        discovery: Some(_), ..
-                    } => return,
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("discovery in time");
     }
 
     fn subscribe(&self, kind: &KindId) -> Subscription {
@@ -973,48 +909,6 @@ async fn shell_runs(core: &Core) {
     .await;
 }
 
-const EDITED: &str = "edit-me";
-
-fn deployments() -> Gvr {
-    Gvr::new("apps", "v1", "deployments")
-}
-
-/// A Deployment to edit, at version `version`, with `labels`.
-fn editable(version: &str, labels: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        "apiVersion": "apps/v1",
-        "kind": "Deployment",
-        "metadata": {
-            "name": EDITED,
-            "namespace": "demo",
-            "uid": "uid-edit",
-            "resourceVersion": version,
-            "labels": labels,
-        },
-        "spec": {"replicas": 1},
-    })
-}
-
-fn write_target(server: &FakeApiServer) -> WriteTarget {
-    WriteTarget {
-        cluster: CONTEXT.into(),
-        server: Some(server.url()),
-        kind: KindId::new("apps", "deployments"),
-        namespace: Some("demo".to_owned()),
-        name: EDITED.to_owned(),
-        uid: None,
-        resource_version: None,
-    }
-}
-
-fn three_replicas() -> WriteProposal {
-    WriteProposal::ApplyYaml {
-        yaml: format!(
-            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: {EDITED}\nspec:\n  replicas: 3\n"
-        ),
-    }
-}
-
 /// The `PUT`s the server received: dry runs, and real ones.
 fn puts(server: &FakeApiServer) -> (usize, usize) {
     let all: Vec<_> = server
@@ -1529,8 +1423,10 @@ async fn reload_until_shown(core: &Core, server: &FakeApiServer, confirmed: bool
 }
 
 // covers UP-06, UP-54: while a later file's definition shows because the first file can't be
-// read, its pin is stale from the first request. Neither a review there nor a write reviewed
-// before it reaches a server, and writes work again once the file is back.
+// read, a new review of that definition is refused by the fresh read of the files. A write
+// reviewed earlier is pinned to the real server, which the slot no longer shows, so the loaded
+// state refuses it as moved. Neither reaches a server, and writes work again once the file is
+// back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_write_through_a_fallback_definition_is_refused() {
     let (real, fallback) = (
@@ -1556,16 +1452,18 @@ async fn a_write_through_a_fallback_definition_is_refused() {
 
     std::fs::write(&first, "apiVersion: v1\nkind: Config\nclusters:\n- name: [").unwrap();
     reload_until_shown(&core, &fallback, false).await;
-    let moved = WriteError::Refused(WriteRefusal::Moved {
-        cluster: CONTEXT.to_owned(),
-    });
     let review = core
         .handle
         .review_write(write_target(&fallback), three_replicas())
         .await;
-    assert_eq!(review.unwrap_err(), moved);
+    assert_eq!(review.unwrap_err(), WriteError::KubeconfigUnreadable);
     let write = core.handle.run_write(reviewed.into_intent()).await;
-    assert_eq!(write.unwrap_err(), moved);
+    assert_eq!(
+        write.unwrap_err(),
+        WriteError::Refused(WriteRefusal::Moved {
+            cluster: CONTEXT.to_owned(),
+        })
+    );
     assert_eq!(puts(&real), (1, 0), "the write never left");
     assert_eq!(puts(&fallback), (0, 0));
     assert!(
@@ -2136,7 +2034,7 @@ async fn an_unread_event_queue_stays_bounded_through_reloads_and_discoveries() {
     let server = FakeApiServer::start().await.unwrap();
     let core = Core::start(&server, None).await;
     let events = core.handle.events();
-    let kubeconfig = core._dir.path().join("kubeconfig");
+    let kubeconfig = core.dir.path().join("kubeconfig");
     let discoveries = || {
         server
             .requests()
