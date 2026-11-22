@@ -5,6 +5,7 @@
 //! in [`cluster`] and [`read`] directly on their own tokio runtime.
 
 pub mod activity;
+pub mod alerts;
 pub mod api_error;
 mod auth_plugin;
 pub mod bootstrap;
@@ -40,6 +41,10 @@ mod watch;
 pub mod write;
 mod write_actions;
 
+pub use alerts::{
+    Alert, AlertConfig, AlertEngine, AlertEvent, AlertKey, AlertOwner, AlertSubject, AlertSummary,
+    ClusterLimitReached, ClusterSnapshot, Observation, OpenAlert, OpenAlertState,
+};
 pub use cluster::{ClusterId, SafeErrorText, ServerVersion};
 pub use discovery::{
     ClusterDiscovery, NavEntry, NavEntryError, NavSection, Navigation, SectionKind,

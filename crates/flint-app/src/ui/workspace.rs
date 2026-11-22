@@ -204,8 +204,15 @@ enum MainPanes {
 /// Pane widths are written to `state.toml` once a drag has paused this long.
 const PANE_SAVE_DELAY: Duration = Duration::from_millis(400);
 
+/// The most characters the namespace filter's button shows: a longer name ends in an ellipsis.
+const NAMESPACE_LABEL_MAX_CHARS: usize = 18;
+
 /// The key context entry holding a namespace row's index in the picker's list.
 const NAMESPACE_ROW: &str = "namespace_row";
+
+/// Padding around each row of the picker's scrolling list, which clips: the focus ring is painted
+/// this far outside a checkbox. On the row, so scrolling a row into view brings its ring too.
+const NAMESPACE_RING_ROOM: gpui_kit::Pixels = px(3.);
 
 /// How focus comes back after a dialog closed the namespace picker.
 #[derive(Clone, Copy)]
@@ -1794,10 +1801,16 @@ impl Workspace {
                 Button::new("namespace-filter-button")
                     .xsmall()
                     .outline()
-                    .label(summary.to_owned())
+                    .label(ellipsize(summary, NAMESPACE_LABEL_MAX_CHARS))
+                    // The label is cut to a few characters, so the watch mode button beside it
+                    // stays on screen at the minimum width (UP-33). The accessible name and the
+                    // tooltip keep the whole name.
+                    .accessibility_label(summary.to_owned())
                     .track_focus(&self.namespace_button_focus)
                     .tab_stop(false)
-                    .tooltip("Filter by namespace (remembered per cluster)"),
+                    .tooltip(format!(
+                        "{summary}\nFilter by namespace (remembered per cluster)"
+                    )),
             )
             .content(move |_, window, cx| {
                 // Just opened: its controls have tab stops once this frame is drawn.
@@ -1854,11 +1867,13 @@ impl Workspace {
                             .max_h(px(360.))
                             .overflow_y_scroll()
                             .track_scroll(&list_scroll)
-                            .gap_1()
+                            // Out by the rows' padding, so they line up with the controls around.
+                            .mx(-NAMESPACE_RING_ROOM)
                             .when(names.is_empty(), |el| {
                                 el.child(
                                     div()
                                         .id("ns-empty")
+                                        .p(NAMESPACE_RING_ROOM)
                                         .text_sm()
                                         .text_color(theme.muted_foreground)
                                         .child(empty_text),
@@ -1868,7 +1883,7 @@ impl Workspace {
                                 let checked = filter.contains(&ns);
                                 let mut context = KeyContext::default();
                                 context.set(NAMESPACE_ROW, row.to_string());
-                                div().key_context(context).child(
+                                div().key_context(context).p(NAMESPACE_RING_ROOM).child(
                                     Checkbox::new(SharedString::from(format!("ns-{ns}")))
                                         .label(ns.clone())
                                         .checked(checked)
@@ -1876,7 +1891,8 @@ impl Workspace {
                                             namespace: ns,
                                         })),
                                 )
-                            })),
+                            }))
+                            .test_support(),
                     )
                     .child(div().h_px().bg(theme.border))
                     .child(Input::new(&input).id("ns-add").small())
@@ -2009,11 +2025,13 @@ impl Workspace {
         layout(&self.panes, window_width, true, true).detail
     }
 
-    /// The pane widths as shown now, with the panes that are showing.
+    /// The pane widths as shown now, with the panes that are showing. Only a split has a detail
+    /// pane beside the list: a detail shown alone fills the main area, so the sidebar keeps its
+    /// width and its rows can still be told apart.
     fn layout(&self, window_width: f32, cx: &App) -> Layout {
         let nav_shown = self.model.read(cx).active_cluster().is_some();
-        let detail_shown = self.detail.is_some() && self.main_panes(cx) != MainPanes::ListAlone;
-        layout(&self.panes, window_width, nav_shown, detail_shown)
+        let detail_beside = self.detail.is_some() && self.main_panes(cx) == MainPanes::Split;
+        layout(&self.panes, window_width, nav_shown, detail_beside)
     }
 
     /// What the main area shows of the list and the open detail. A failed connection shows
@@ -2819,6 +2837,15 @@ fn watch_mode_label(mode: WatchMode) -> &'static str {
         WatchMode::All => "Live: all kinds",
         WatchMode::OnView => "Live: open views only",
     }
+}
+
+/// `text` cut to `max` characters, with an ellipsis in place of the cut part.
+fn ellipsize(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let head: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
 }
 
 /// "All namespaces", "demo", or "3 namespaces".
