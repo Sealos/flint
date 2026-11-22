@@ -986,7 +986,7 @@ async fn the_claim_is_released_however_a_write_ends(cx: &mut TestAppContext) {
 async fn start_drain(cx: &mut TestAppContext, t: &TestWorkspace) {
     t.dispatch(cx, "workspace::DrainNode", Value::Null).unwrap();
     t.wait_for_element(cx, "drain-emptydir").await;
-    draw(cx, t);
+    wait_for_one_ok(cx, t).await;
     t.click(cx, "ok");
     wait_for_confirmation(cx, t, "DaemonSet and mirror pods stay").await;
     wait_for_one_ok(cx, t).await;
