@@ -310,15 +310,22 @@ fn fit_line(line: &str, fits: &impl Fn(&str) -> bool) -> String {
     kept.unwrap_or_else(|| fit_value(&prefix, value, fits))
 }
 
-/// `Object: kind name`, with the whole kind; `None` if the kind alone does not fit.
+/// `Object: kind name`, with the whole kind. With no room for a cut name, the name is only its
+/// code. `None` if the kind and that code do not fit: the code is what tells two objects apart,
+/// so it stays even at the cost of the kind's middle.
 fn fit_object(prefix: &str, value: &str, fits: &impl Fn(&str) -> bool) -> Option<String> {
     let (kind, name) = value.split_once(' ')?;
-    fit_around(&format!("{prefix}{kind} "), name, "", 0, value, fits)
+    let start = format!("{prefix}{kind} ");
+    fit_around(&start, name, "", 0, value, fits).or_else(|| {
+        let code_only = format!("{start}#{}", value_code(value));
+        fits(&code_only).then_some(code_only)
+    })
 }
 
 /// `Server: scheme://host:port/path`, with the whole scheme and port. A long path loses its middle
 /// while the host fits; after that the path is left out and the host loses its middle, keeping
-/// its last two labels as far as they fit. `None` for anything that is not such a URL.
+/// its last two labels as far as they fit. A path left out always leaves the code of the whole
+/// URL, since paths can route to different clusters. `None` for anything that is not such a URL.
 fn fit_server(prefix: &str, value: &str, fits: &impl Fn(&str) -> bool) -> Option<String> {
     let (scheme, rest) = value.split_once("://")?;
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
@@ -337,17 +344,16 @@ fn fit_server(prefix: &str, value: &str, fits: &impl Fn(&str) -> bool) -> Option
     {
         return Some(line);
     }
-    let end = if path.is_empty() {
-        port.to_owned()
-    } else {
-        format!("{port}/…")
-    };
     let last_labels = host
         .rmatch_indices('.')
         .nth(1)
         .map_or(host, |(at, _)| &host[at..]);
     let min_tail = escaped_parts(last_labels).len();
-    fit_around(&start, host, &end, min_tail, value, fits)
+    if path.is_empty() {
+        fit_around(&start, host, port, min_tail, value, fits)
+    } else {
+        fit_cut(&start, host, &format!("{port}/…"), min_tail, value, fits)
+    }
 }
 
 /// `prefix` and the most of `value` that `fits`, keeping its start and end around a short code of
@@ -358,9 +364,7 @@ fn fit_value(prefix: &str, value: &str, fits: &impl Fn(&str) -> bool) -> String 
         .unwrap_or_else(|| format!("{prefix}…#{}…", value_code(value)))
 }
 
-/// `prefix`, the most of `middle` that fits, and `suffix`, with a code of `whole` where `middle`
-/// is cut. The end of `middle` keeps at least `min_tail` parts when that many fit. `None` if
-/// `prefix`, the code and `suffix` alone do not fit.
+/// `prefix`, `middle` and `suffix` if they fit, or else [`fit_cut`].
 fn fit_around(
     prefix: &str,
     middle: &str,
@@ -369,11 +373,25 @@ fn fit_around(
     whole: &str,
     fits: &impl Fn(&str) -> bool,
 ) -> Option<String> {
-    let parts = escaped_parts(middle);
     let uncut = format!("{prefix}{middle}{suffix}");
-    if parts.len() <= MAX_LINE_CHARS && fits(&uncut) {
+    if escaped_parts(middle).len() <= MAX_LINE_CHARS && fits(&uncut) {
         return Some(uncut);
     }
+    fit_cut(prefix, middle, suffix, min_tail, whole, fits)
+}
+
+/// `prefix`, the most of `middle` that fits, and `suffix`, with a code of `whole` where `middle`
+/// is cut. The end of `middle` keeps at least `min_tail` parts when that many fit. `None` if
+/// `prefix`, the code and `suffix` alone do not fit.
+fn fit_cut(
+    prefix: &str,
+    middle: &str,
+    suffix: &str,
+    min_tail: usize,
+    whole: &str,
+    fits: &impl Fn(&str) -> bool,
+) -> Option<String> {
+    let parts = escaped_parts(middle);
     let code = value_code(whole);
     let cut = |kept: usize| {
         let tail = (kept / 2).max(min_tail).min(kept.saturating_sub(1));
@@ -838,6 +856,112 @@ mod tests {
         );
         assert!(object.starts_with("Object: deployments.apps o"), "{object}");
         assert!(object.ends_with('o'), "{object}");
+    }
+
+    /// The width of a code with its two marks, and so the least a shortened line needs after its
+    /// label.
+    const CUT_CODE_CHARS: usize = 11;
+
+    fn fit_to(line: &str, width: usize) -> String {
+        fit_line(line, &|shown: &str| shown.chars().count() <= width)
+    }
+
+    /// Asserts every pair of `values` reads differently under `label`, at each width from the
+    /// tightest a code fits in, and that each line stays within the width.
+    fn assert_all_render_differently(label: &str, values: &[String]) {
+        let tightest = label.chars().count() + 2 + CUT_CODE_CHARS;
+        for width in tightest..=140 {
+            let lines: Vec<String> = values
+                .iter()
+                .map(|value| fit_to(&format!("{label}: {value}"), width))
+                .collect();
+            for (i, line) in lines.iter().enumerate() {
+                assert!(line.chars().count() <= width, "{width}: {line}");
+                for (j, other) in lines.iter().enumerate().skip(i + 1) {
+                    assert_ne!(
+                        line, other,
+                        "width {width}: {} and {}",
+                        values[i], values[j]
+                    );
+                }
+            }
+        }
+    }
+
+    // Two clusters behind one gateway differ only in the path: with no room for the path's code,
+    // the host gives up its middle so that the code stays.
+    #[test]
+    fn servers_differing_in_the_path_differ_when_the_authority_barely_fits() {
+        let line = |path: &str| format!("Server: https://gw.example.invalid:6443{path}");
+        let width = line("/…").chars().count();
+        let one = fit_to(&line("/k8s/clusters/one"), width);
+        let two = fit_to(&line("/k8s/clusters/two"), width);
+        assert_ne!(one, two);
+        for shown in [&one, &two] {
+            assert!(shown.chars().count() <= width, "{shown}");
+            assert!(shown.starts_with("Server: https://"), "{shown}");
+            assert!(shown.contains("…#"), "{shown}");
+            assert!(shown.ends_with(":6443/…"), "{shown}");
+        }
+    }
+
+    // A kind that fits with room for the code alone stays whole, under a shorter placeholder.
+    #[test]
+    fn a_kind_that_fits_stays_whole_under_a_shorter_placeholder() {
+        let start = "Object: widgets.storage.example.invalid ";
+        // The code and its `#`, without the marks a cut name has around them.
+        let width = start.chars().count() + CUT_CODE_CHARS - 2;
+        let one = fit_to(&format!("{start}{}-one", "n".repeat(40)), width);
+        let two = fit_to(&format!("{start}{}-two", "n".repeat(40)), width);
+        assert_ne!(one, two);
+        for shown in [&one, &two] {
+            assert!(shown.starts_with(&format!("{start}#")), "{shown}");
+            assert!(shown.chars().count() <= width, "{shown}");
+        }
+    }
+
+    // Whatever the width, two different servers or objects never draw the same pinned line.
+    #[test]
+    fn distinct_targets_render_differently_at_every_width() {
+        let long = "h".repeat(120);
+        let servers: Vec<String> = [
+            "https://gw.example.invalid:6443".to_owned(),
+            "https://gw.example.invalid:6443/".to_owned(),
+            "https://gw.example.invalid:6444".to_owned(),
+            "http://gw.example.invalid:6443".to_owned(),
+            "https://gw.example.invalid".to_owned(),
+            "https://gw.example.invalid/k8s/clusters/one".to_owned(),
+            "https://gw.example.invalid:6443/k8s/clusters/one".to_owned(),
+            "https://gw.example.invalid:6443/k8s/clusters/two".to_owned(),
+            "https://gw.example.invalid:6444/k8s/clusters/one".to_owned(),
+            "https://gw.example.invalid:6443/k8s?cluster=one".to_owned(),
+            "https://gw.example.invalid:6443/k8s?cluster=two".to_owned(),
+            "https://[2001:db8::1]:6443/one".to_owned(),
+            "https://[2001:db8::1]:6443/two".to_owned(),
+            "https://a.io/x".to_owned(),
+            "https://a.io/y".to_owned(),
+            format!("https://{long}a{long}.example.invalid:6443/one"),
+            format!("https://{long}b{long}.example.invalid:6443/one"),
+            format!("https://{long}a{long}.example.invalid:6443/two"),
+            format!("https://gw.example.invalid:6443/{long}a{long}"),
+            format!("https://gw.example.invalid:6443/{long}b{long}"),
+        ]
+        .into();
+        assert_all_render_differently("Server", &servers);
+
+        let objects: Vec<String> = [
+            "deployments.apps web-one".to_owned(),
+            "deployments.apps web-two".to_owned(),
+            "statefulsets.apps web-one".to_owned(),
+            "widgets.one.example.invalid web".to_owned(),
+            "widgets.two.example.invalid web".to_owned(),
+            format!("widgets.storage.example.invalid {long}a{long}"),
+            format!("widgets.storage.example.invalid {long}b{long}"),
+            format!("widgets.{long}a.example.invalid web"),
+            format!("widgets.{long}b.example.invalid web"),
+        ]
+        .into();
+        assert_all_render_differently("Object", &objects);
     }
 
     // The keys move a long text within its range, and leave every other key alone.
