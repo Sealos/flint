@@ -325,6 +325,10 @@ impl ClusterError {
 const SHOWN_CHARS: usize = 200;
 const AGENT_CHARS: usize = 300;
 const AGENT_BYTES: usize = 4 * 1024;
+/// Extra redaction passes over an error before it is cut.
+const REDACT_PASSES: usize = 3;
+/// How far the cut may move back so that the `…` is not taken for a value.
+const CUT_BACKOFF: usize = 64;
 
 fn agent_error_text(message: &str) -> String {
     // A clipped credential can lose the suffix that identifies it, and redaction can bring
@@ -332,16 +336,40 @@ fn agent_error_text(message: &str) -> String {
     if message.len() > AGENT_BYTES {
         return "Error details omitted because the message is too long".to_owned();
     }
-    agent_line(&redact::redact_credentials(message).text)
+    // A masked value can itself be recognised by a later pass (a header whose value was
+    // masked), so the text is redacted until it is stable, before it is cut.
+    let mut text = redact::redact_credentials(message).text.into_owned();
+    for _ in 0..REDACT_PASSES {
+        let next = redact::redact_credentials(&text).text.into_owned();
+        if next == text {
+            break;
+        }
+        text = next;
+    }
+    agent_line(&text)
 }
 
 /// The first line of redacted `text`, cut to [`AGENT_CHARS`] (with `…`). A `[REDACTED:<kind>]`
-/// marker across the cut goes whole.
+/// marker across the cut goes whole. The cut text must survive a second redaction unchanged
+/// (a later pass can take the `…` after `Cookie: ` for a value), so the cut moves back until it
+/// does, and the `…` stays.
 fn agent_line(text: &str) -> String {
     let line = redact::first_line(text, usize::MAX);
-    let Some((mut cut, _)) = line.char_indices().nth(AGENT_CHARS) else {
-        return line;
-    };
+    for limit in (AGENT_CHARS.saturating_sub(CUT_BACKOFF)..=AGENT_CHARS).rev() {
+        let Some(shorter) = cut_line(&line, limit) else {
+            return line;
+        };
+        if redact::redact_credentials(&shorter).text == shorter {
+            return shorter;
+        }
+    }
+    // Nothing near the cap is stable: drop the line down to its stable start.
+    "…".to_owned()
+}
+
+/// `line` cut to `limit` chars with a trailing `…`, or `None` when it already fits.
+fn cut_line(line: &str, limit: usize) -> Option<String> {
+    let (mut cut, _) = line.char_indices().nth(limit)?;
     let last_marker = line
         .match_indices("[REDACTED:")
         .map(|(start, _)| start)
@@ -354,7 +382,7 @@ fn agent_line(text: &str) -> String {
     {
         cut = start;
     }
-    format!("{}…", &line[..cut])
+    Some(format!("{}…", &line[..cut]))
 }
 
 /// Error text that is safe to show in the window, in logs and in the automation state. Only
@@ -964,6 +992,36 @@ mod tests {
                 assert!(shown[at..].contains(']'), "pad {pad}: {shown}");
             }
         }
+    }
+
+    #[test]
+    fn agent_text_keeps_its_cap_when_a_cut_ends_in_a_cookie_header() {
+        for pad in 280..=300 {
+            let message = format!("{} Cookie: abcdef", "x".repeat(pad));
+            let shown = ClusterError::Api(message).for_agent();
+            assert!(
+                shown.chars().count() <= AGENT_CHARS + 1,
+                "pad {pad}: {shown}"
+            );
+            assert!(shown.ends_with('…'), "pad {pad}: {shown}");
+            assert_eq!(redact::redact_credentials(&shown).text, shown, "pad {pad}");
+        }
+    }
+
+    #[test]
+    fn agent_text_keeps_diagnostics_after_a_masked_header_value() {
+        let message = format!(
+            "Authorization: password=abc {} then the real cause: connection refused",
+            "y ".repeat(20)
+        );
+        let shown = ClusterError::Api(message).for_agent();
+        assert!(shown.contains("connection refused"), "{shown}");
+        assert!(!shown.contains("abc"), "{shown}");
+        let long = format!("Authorization: password=abc {}", "z".repeat(400));
+        let shown = ClusterError::Api(long).for_agent();
+        assert!(shown.chars().count() <= AGENT_CHARS + 1, "{shown}");
+        assert!(shown.ends_with('…'), "{shown}");
+        assert!(shown.contains("zzzz"), "{shown}");
     }
 
     #[test]
