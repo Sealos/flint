@@ -1004,43 +1004,116 @@ mod tests {
 
     // covers UP-06: a read that hangs gives up in time, no second read of the same files starts
     // while it is stuck, and its late end is reported so the caller can read again.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_hung_read_times_out_and_runs_only_once() {
         let dir = tempfile::tempdir().unwrap();
-        let fifo = make_fifo(dir.path(), "fifo");
-        let paths = vec![fifo.clone()];
-        let reader = KubeconfigReader::new(blocking_load, Duration::from_millis(50));
+        let held = write(dir.path(), "held", &config(&[], &[]));
+        let hold = LoadHold::on(&held);
+        let paths = vec![held];
+        let reader = KubeconfigReader::new(held_load, Duration::from_millis(50));
         let (late, mut late_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let first = late.clone();
         let read = reader
-            .read(&paths, move |_| {
+            .read_once(&paths, move |_| {
                 let _ = first.send(());
             })
             .await;
-        assert!(read.is_none(), "timed out");
-        let started = std::time::Instant::now();
+        assert!(matches!(read, Ok(None)), "timed out");
         let second = late.clone();
         let read = reader
-            .read(&paths, move |_| {
+            .read_once(&paths, move |_| {
                 let _ = second.send(());
             })
             .await;
-        assert!(read.is_none(), "still running");
-        assert!(started.elapsed() < Duration::from_millis(50), "no new wait");
+        assert!(matches!(read, Err(ReadBusy)), "refused without a new wait");
 
-        // Another list of files is not held up by the stuck one.
+        // Another list of files is not held up by the stuck one. On a slow machine its result
+        // can come after the timeout, so it is taken from either route.
         let other = vec![write(dir.path(), "other", &config(&[], &[]))];
-        assert!(reader.read(&other, |_| {}).await.is_some());
+        let (other_late, mut other_rx) = tokio::sync::mpsc::unbounded_channel();
+        let answer = reader
+            .read_once(&other, move |read| {
+                let _ = other_late.send(read);
+            })
+            .await
+            .expect("not held up by the stuck list");
+        let finished = match answer {
+            Some(read) => Some(read),
+            None => other_rx.recv().await,
+        };
+        assert!(finished.expect("it finished").loaded.errors.is_empty());
 
-        // A writer that opens and closes the FIFO ends the blocked read.
-        drop(std::fs::OpenOptions::new().write(true).open(&fifo).unwrap());
+        hold.release();
+        // Bounds a hang only: the release has already let the read finish.
         tokio::time::timeout(Duration::from_secs(5), late_rx.recv())
             .await
             .expect("the late read reports")
             .unwrap();
-        assert_eq!(late_rx.try_recv().ok(), None, "only the one read ran");
+        // Every sender is gone once the read's thread is done, so this sees any second report.
+        drop(late);
+        let end = tokio::time::timeout(Duration::from_secs(5), late_rx.recv())
+            .await
+            .expect("the read's thread ends");
+        assert_eq!(end, None, "only the one read reported");
+        assert_eq!(hold.loads(), 1, "only the one read ran");
+    }
+
+    /// Keeps [`held_load`] of one path from finishing until the test lets it go, as a stalled
+    /// mount would. A FIFO can't do this reliably: on macOS a writer that closes before the
+    /// reader has entered `read` can leave that reader blocked with no end of file.
+    #[derive(Default)]
+    struct LoadHold {
+        state: StdMutex<LoadHoldState>,
+        changed: std::sync::Condvar,
+    }
+
+    #[derive(Default)]
+    struct LoadHoldState {
+        released: bool,
+        loads: usize,
+    }
+
+    static LOAD_HOLDS: StdMutex<Vec<(PathBuf, Arc<LoadHold>)>> = StdMutex::new(Vec::new());
+
+    impl LoadHold {
+        fn on(path: &Path) -> Arc<Self> {
+            let hold = Arc::new(Self::default());
+            let entry = (path.to_path_buf(), hold.clone());
+            LOAD_HOLDS.lock().unwrap().push(entry);
+            hold
+        }
+
+        fn wait(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.loads += 1;
+            while !state.released {
+                state = self.changed.wait(state).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            self.state.lock().unwrap().released = true;
+            self.changed.notify_all();
+        }
+
+        fn loads(&self) -> usize {
+            self.state.lock().unwrap().loads
+        }
+    }
+
+    /// Loads `paths`, first waiting on the [`LoadHold`] of any of them.
+    fn held_load(paths: &[PathBuf]) -> LoadedKubeconfig {
+        let hold = LOAD_HOLDS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(path, _)| paths.contains(path))
+            .map(|(_, hold)| hold.clone());
+        if let Some(hold) = hold {
+            hold.wait();
+        }
+        load(paths)
     }
 
     // covers UP-06: a result sent just as its caller timed out still reaches `on_late`.

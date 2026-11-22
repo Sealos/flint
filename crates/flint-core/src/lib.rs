@@ -45,8 +45,8 @@ pub mod write;
 mod write_actions;
 
 pub use alerts::{
-    Alert, AlertConfig, AlertEngine, AlertEvent, AlertKey, AlertOwner, AlertSubject, AlertSummary,
-    ClusterLimitReached, ClusterSnapshot, Observation, OpenAlert, OpenAlertState,
+    Alert, AlertConfig, AlertEngine, AlertEvent, AlertKey, AlertSubject, AlertSummary,
+    ClusterLimitReached, ClusterSnapshot, OpenAlert, OpenAlertState,
 };
 pub use cluster::{ClusterId, SafeErrorText, ServerVersion};
 pub use discovery::{
@@ -67,7 +67,8 @@ pub use logs::{
 };
 pub use metrics::{MetricsError, MetricsList, MetricsPoll, NodeMetrics, PodMetrics};
 pub use problems::{
-    Classifier, Problem, ProblemId, ProblemKind, ProblemReason, ProblemSeverity, ProblemSubject,
+    Classifier, Problem, ProblemId, ProblemKind, ProblemOwner, ProblemReason, ProblemSeverity,
+    ProblemSubject, ReplicaSetIndex,
 };
 pub use protection::{Protection, SessionUnlocks, WriteRefusal};
 pub use read::{KindId, KindInfo, ObjectDetail};
