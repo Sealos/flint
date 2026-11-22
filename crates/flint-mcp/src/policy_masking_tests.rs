@@ -333,3 +333,54 @@ fn a_cut_off_body_with_a_prefix_and_a_short_last_line_is_left_out() {
     assert_eq!(out.text, "");
     assert!(out.truncated);
 }
+
+#[test]
+fn a_cut_off_body_with_other_output_between_its_lines_is_left_out() {
+    let k = KEY_LINE;
+    for log in [
+        format!(
+            "{k}\n{k}\nINFO ready\n{k}\n{k}\nINFO ready\n{k}\n{k}\n-----END PRIVATE KEY-----\nafter\n"
+        ),
+        format!("{k}\nINFO ready\n{k}\n{k}\n-----END PRIVATE KEY-----\nafter\n"),
+        format!("INFO ready\n{k}\nINFO ready\n{k}\nINFO ready\n{k}\nafter\n"),
+    ] {
+        let out = log_output(&log, 100, 64 * 1024, true);
+        assert!(!out.text.contains(k), "{out:?}");
+        assert!(out.text.ends_with("after\n"), "{out:?}");
+        assert!(out.truncated, "{out:?}");
+    }
+}
+
+#[test]
+fn a_cut_off_body_after_a_log_level_is_left_out() {
+    for prefix in [
+        "2026-01-01T00:00:00Z INFO ",
+        "2026-01-01T00:00:00Z app | warn: ",
+        "ERROR ",
+    ] {
+        let log = format!("{prefix}{KEY_LINE}\n").repeat(4) + "after\n";
+        let out = log_output(&log, 100, 64 * 1024, true);
+        assert_eq!(out.text, "after\n", "{prefix}");
+        assert!(out.truncated);
+
+        let ended = format!("{prefix}{KEY_LINE}\n").repeat(4)
+            + &format!("{prefix}-----END PRIVATE KEY-----\nafter\n");
+        let out = log_output(&ended, 100, 64 * 1024, true);
+        assert!(!out.text.contains(KEY_LINE), "{out:?}");
+    }
+}
+
+#[test]
+fn lines_before_a_whole_block_are_kept() {
+    let log = format!("plain\n{}after\n", pem("", 4));
+    let out = log_output(&log, 100, 64 * 1024, true);
+    assert!(out.text.starts_with("plain\n"), "{out:?}");
+    assert!(!out.truncated, "{out:?}");
+}
+
+#[test]
+fn a_message_after_a_log_level_is_kept() {
+    let log = format!("2026-01-01T00:00:00Z INFO verified checksum {KEY_LINE}\n").repeat(4);
+    let out = log_output(&log, 100, 64 * 1024, true);
+    assert_eq!((out.text.as_str(), out.truncated), (log.as_str(), false));
+}
