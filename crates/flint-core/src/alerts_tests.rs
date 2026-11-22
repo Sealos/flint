@@ -1,7 +1,5 @@
-use serde_json::json;
-
 use super::*;
-use crate::problems::ProblemId;
+use crate::problems::{ProblemId, WorkloadKind};
 
 const CLUSTER: &str = "cluster-a";
 
@@ -24,27 +22,21 @@ fn config() -> AlertConfig {
     }
 }
 
-fn observation(kind: ProblemKind, subject: ProblemSubject, owner: Option<&str>) -> Observation {
-    Observation {
-        problem: Problem {
-            id: ProblemId {
-                cluster: cluster(),
-                kind,
-                subject,
-            },
-            reason: None,
-            since: None,
+fn observation(kind: ProblemKind, subject: ProblemSubject, owner: Option<&str>) -> Problem {
+    Problem {
+        id: ProblemId {
+            cluster: cluster(),
+            kind,
+            subject,
         },
-        owner: owner.map(|name| AlertOwner {
-            group: "apps".into(),
-            kind: "Deployment".into(),
-            name: name.into(),
-        }),
+        owner: owner.map(|name| ProblemOwner::workload(WorkloadKind::Deployment, name)),
+        reason: None,
+        since: None,
     }
 }
 
 /// A crash loop in a pod of Deployment `owner`.
-fn crash(owner: &str, pod: &str) -> Observation {
+fn crash(owner: &str, pod: &str) -> Problem {
     let subject = ProblemSubject::Container {
         namespace: "ns".into(),
         pod: pod.into(),
@@ -54,7 +46,7 @@ fn crash(owner: &str, pod: &str) -> Observation {
     observation(ProblemKind::CrashLoop, subject, Some(owner))
 }
 
-fn node(name: &str) -> Observation {
+fn node(name: &str) -> Problem {
     let subject = ProblemSubject::Node {
         name: name.into(),
         uid: Some(format!("uid-{name}")),
@@ -62,7 +54,7 @@ fn node(name: &str) -> Observation {
     observation(ProblemKind::NodeNotReady, subject, None)
 }
 
-fn job(name: &str) -> Observation {
+fn job(name: &str) -> Problem {
     let subject = ProblemSubject::Job {
         namespace: "ns".into(),
         name: name.into(),
@@ -92,8 +84,8 @@ fn render(event: &AlertEvent) -> String {
 }
 
 enum Pass {
-    Up(Vec<Observation>),
-    Partial(Vec<Observation>, Vec<ProblemKind>),
+    Up(Vec<Problem>),
+    Partial(Vec<Problem>, Vec<ProblemKind>),
     Down,
 }
 use Pass::{Down, Partial, Up};
@@ -338,9 +330,9 @@ fn scenarios() {
         let mut engine = AlertEngine::new(config);
         for (index, Step(minute, pass, expected)) in steps.into_iter().enumerate() {
             let snapshot = match &pass {
-                Up(observations) => ClusterSnapshot::complete(observations),
-                Partial(observations, unchecked) => ClusterSnapshot::Available {
-                    observations,
+                Up(problems) => ClusterSnapshot::complete(problems),
+                Partial(problems, unchecked) => ClusterSnapshot::Available {
+                    problems,
                     unchecked,
                 },
                 Down => ClusterSnapshot::Unavailable,
@@ -378,114 +370,13 @@ fn unavailable_before_any_read_tracks_nothing() {
 }
 
 #[test]
-fn owners_are_read_from_metadata() {
-    type Expected = Option<(&'static str, &'static str, &'static str)>;
-    let refs = |api: &str, kind: &str, name: &str, controller: bool| {
-        json!([{
-            "apiVersion": api, "kind": kind, "name": name, "uid": "u", "controller": controller,
-        }])
-    };
-    let rs = |name: &str| refs("apps/v1", "ReplicaSet", name, true);
-    let rs_meta = |name: &str, owners: serde_json::Value| {
-        Some(json!({"name": name, "ownerReferences": owners}))
-    };
-    let owned_by_deployment = |deployment: &str, rs_name: &str| {
-        rs_meta(rs_name, refs("apps/v1", "Deployment", deployment, true))
-    };
-    let cases: Vec<(&str, serde_json::Value, Option<serde_json::Value>, Expected)> = vec![
-        (
-            "deployment",
-            rs("web-abc12"),
-            owned_by_deployment("web", "web-abc12"),
-            Some(("apps", "Deployment", "web")),
-        ),
-        (
-            "hyphenated deployment",
-            rs("my-web-abc12"),
-            owned_by_deployment("my-web", "my-web-abc12"),
-            Some(("apps", "Deployment", "my-web")),
-        ),
-        (
-            "no replicaset metadata",
-            rs("web-abc12"),
-            None,
-            Some(("apps", "ReplicaSet", "web-abc12")),
-        ),
-        (
-            "orphaned replicaset",
-            rs("web-abc12"),
-            rs_meta("web-abc12", json!([])),
-            Some(("apps", "ReplicaSet", "web-abc12")),
-        ),
-        (
-            "deployment reference is not the controller",
-            rs("web-abc12"),
-            rs_meta("web-abc12", refs("apps/v1", "Deployment", "web", false)),
-            Some(("apps", "ReplicaSet", "web-abc12")),
-        ),
-        (
-            "replicaset owned by another kind",
-            rs("web-abc12"),
-            rs_meta("web-abc12", refs("apps/v1", "StatefulSet", "web", true)),
-            Some(("apps", "ReplicaSet", "web-abc12")),
-        ),
-        (
-            "metadata of a different replicaset",
-            rs("web-abc12"),
-            owned_by_deployment("web", "web-other"),
-            Some(("apps", "ReplicaSet", "web-abc12")),
-        ),
-        (
-            "other api group",
-            refs("example.io/v1", "ReplicaSet", "web-abc12", true),
-            owned_by_deployment("web", "web-abc12"),
-            Some(("example.io", "ReplicaSet", "web-abc12")),
-        ),
-        (
-            "statefulset",
-            refs("apps/v1", "StatefulSet", "db", true),
-            None,
-            Some(("apps", "StatefulSet", "db")),
-        ),
-        (
-            "core group",
-            refs("v1", "ReplicationController", "rc", true),
-            None,
-            Some(("", "ReplicationController", "rc")),
-        ),
-        (
-            "not a controller",
-            refs("apps/v1", "StatefulSet", "db", false),
-            None,
-            None,
-        ),
-        ("no owners", json!([]), None, None),
-    ];
-    for (case, owners, replica_set, expected) in cases {
-        let meta: ObjectMeta = serde_json::from_value(json!({"ownerReferences": owners})).unwrap();
-        let replica_set: Option<ObjectMeta> =
-            replica_set.map(|rs| serde_json::from_value(rs).unwrap());
-        let expected = expected.map(|(group, kind, name)| AlertOwner {
-            group: group.into(),
-            kind: kind.into(),
-            name: name.into(),
-        });
-        assert_eq!(
-            AlertOwner::of_meta(&meta, replica_set.as_ref()),
-            expected,
-            "{case}"
-        );
-    }
-}
-
-#[test]
 fn tracking_is_bounded_and_overflow_is_summarised_once() {
     let mut engine = AlertEngine::new(config());
     engine
         .observe(&cluster(), at(0), ClusterSnapshot::complete(&[]))
         .unwrap();
     let extra = 10;
-    let many: Vec<Observation> = (0..MAX_TRACKED_PER_CLUSTER + extra)
+    let many: Vec<Problem> = (0..MAX_TRACKED_PER_CLUSTER + extra)
         .map(|i| node(&format!("n{i}")))
         .collect();
     let snapshot = ClusterSnapshot::complete(&many);
@@ -505,7 +396,7 @@ fn warnings_cannot_take_the_room_kept_for_critical_groups() {
     engine
         .observe(&cluster(), at(0), ClusterSnapshot::complete(&[]))
         .unwrap();
-    let mut seen: Vec<Observation> = (0..MAX_TRACKED_PER_CLUSTER)
+    let mut seen: Vec<Problem> = (0..MAX_TRACKED_PER_CLUSTER)
         .map(|i| job(&format!("j{i}")))
         .collect();
     engine
@@ -525,9 +416,8 @@ fn growing_overflow_is_summarised_with_its_severity() {
     engine
         .observe(&cluster(), at(0), ClusterSnapshot::complete(&[]))
         .unwrap();
-    let nodes = |count: usize| -> Vec<Observation> {
-        (0..count).map(|i| node(&format!("n{i:04}"))).collect()
-    };
+    let nodes =
+        |count: usize| -> Vec<Problem> { (0..count).map(|i| node(&format!("n{i:04}"))).collect() };
     let first = nodes(MAX_TRACKED_PER_CLUSTER + 1);
     engine
         .observe(&cluster(), at(1), ClusterSnapshot::complete(&first))

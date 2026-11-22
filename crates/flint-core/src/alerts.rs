@@ -33,10 +33,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::jiff::{SignedDuration, Timestamp};
 
-use crate::problems::{Problem, ProblemKind, ProblemSeverity, ProblemSubject, WorkloadKind};
+use crate::problems::{Problem, ProblemKind, ProblemOwner, ProblemSeverity, ProblemSubject};
 
 /// How long a group must stay absent before it resolves and can raise again.
 ///
@@ -65,11 +64,6 @@ pub const CRITICAL_RESERVED_PER_CLUSTER: usize = 64;
 
 /// The longest name kept in a key: the Kubernetes limit for a DNS subdomain name.
 pub const MAX_NAME_BYTES: usize = 253;
-
-/// The API group of an `apiVersion`, empty for the core group.
-fn api_group(api_version: &str) -> &str {
-    api_version.rsplit_once('/').map_or("", |(group, _)| group)
-}
 
 /// Every kind of problem, for tracking which have had their first check.
 const ALL_KINDS: [ProblemKind; 6] = [
@@ -108,61 +102,13 @@ impl Default for AlertConfig {
     }
 }
 
-/// The controller that owns an object.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AlertOwner {
-    /// The API group, empty for the core group.
-    pub group: String,
-    pub kind: String,
-    pub name: String,
-}
-
-impl AlertOwner {
-    /// The controller of an object, seen through a ReplicaSet to its Deployment.
-    ///
-    /// A pod names only its ReplicaSet, which changes on each rollout. The Deployment is named
-    /// only when `replica_set` is that ReplicaSet's metadata and carries a controller owner
-    /// reference of kind Deployment: an orphaned ReplicaSet keeps its name and pod template
-    /// hash, so those prove nothing. Without verified metadata the ReplicaSet is the owner.
-    pub fn of_meta(meta: &ObjectMeta, replica_set: Option<&ObjectMeta>) -> Option<Self> {
-        let owners = meta.owner_references.as_ref()?;
-        let owner = owners.iter().find(|o| o.controller == Some(true))?;
-        let group = api_group(&owner.api_version);
-        if group == "apps" && owner.kind == "ReplicaSet" {
-            let deployment = replica_set
-                .filter(|rs| rs.name.as_deref() == Some(owner.name.as_str()))
-                .and_then(|rs| rs.owner_references.as_ref())
-                .and_then(|refs| refs.iter().find(|o| o.controller == Some(true)))
-                .filter(|o| o.kind == "Deployment" && api_group(&o.api_version) == "apps");
-            if let Some(deployment) = deployment {
-                return Some(Self {
-                    group: "apps".to_owned(),
-                    kind: "Deployment".to_owned(),
-                    name: deployment.name.clone(),
-                });
-            }
-        }
-        Some(Self {
-            group: group.to_owned(),
-            kind: owner.kind.clone(),
-            name: owner.name.clone(),
-        })
-    }
-
-    fn is_bounded(&self) -> bool {
-        [&self.group, &self.kind, &self.name]
-            .iter()
-            .all(|part| part.len() <= MAX_NAME_BYTES)
-    }
-}
-
 /// What an alert is about.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum AlertSubject {
     /// Everything under one controller.
     Workload {
         namespace: String,
-        owner: AlertOwner,
+        owner: ProblemOwner,
     },
     /// A pod with no usable owner.
     Pod { namespace: String, name: String },
@@ -176,7 +122,10 @@ impl AlertSubject {
     fn is_bounded(&self) -> bool {
         match self {
             Self::Workload { namespace, owner } => {
-                namespace.len() <= MAX_NAME_BYTES && owner.is_bounded()
+                namespace.len() <= MAX_NAME_BYTES
+                    && [&owner.group, &owner.kind, &owner.name]
+                        .iter()
+                        .all(|part| part.len() <= MAX_NAME_BYTES)
             }
             Self::Pod { namespace, name } | Self::Job { namespace, name } => {
                 namespace.len() <= MAX_NAME_BYTES && name.len() <= MAX_NAME_BYTES
@@ -193,64 +142,46 @@ pub struct AlertKey {
     pub subject: AlertSubject,
 }
 
-/// A problem with the owner of its object, which [`Problem`] does not carry.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Observation {
-    pub problem: Problem,
-    /// From [`AlertOwner::of_meta`] on the pod or Job. Ignored for nodes.
-    pub owner: Option<AlertOwner>,
-}
-
-impl Observation {
-    fn key(&self) -> AlertKey {
-        let subject = match (&self.problem.id.subject, &self.owner) {
-            (ProblemSubject::Node { name, .. }, _) => AlertSubject::Node { name: name.clone() },
-            (
-                ProblemSubject::Container { namespace, .. } | ProblemSubject::Job { namespace, .. },
-                Some(owner),
-            ) => AlertSubject::Workload {
-                namespace: namespace.clone(),
-                owner: owner.clone(),
+/// The alert group of a problem. A workload's own problem is keyed by the workload itself.
+fn key_of(problem: &Problem) -> AlertKey {
+    let subject = match (&problem.id.subject, &problem.owner) {
+        (ProblemSubject::Node { name, .. }, _) => AlertSubject::Node { name: name.clone() },
+        (
+            ProblemSubject::Container { namespace, .. } | ProblemSubject::Job { namespace, .. },
+            Some(owner),
+        ) => AlertSubject::Workload {
+            namespace: namespace.clone(),
+            owner: owner.clone(),
+        },
+        (
+            ProblemSubject::Workload {
+                kind,
+                namespace,
+                name,
+                ..
             },
-            (
-                ProblemSubject::Workload {
-                    kind,
-                    namespace,
-                    name,
-                    ..
-                },
-                _,
-            ) => AlertSubject::Workload {
-                namespace: namespace.clone(),
-                owner: AlertOwner {
-                    group: "apps".to_owned(),
-                    kind: match kind {
-                        WorkloadKind::Deployment => "Deployment",
-                        WorkloadKind::StatefulSet => "StatefulSet",
-                        WorkloadKind::DaemonSet => "DaemonSet",
-                    }
-                    .to_owned(),
-                    name: name.clone(),
-                },
+            _,
+        ) => AlertSubject::Workload {
+            namespace: namespace.clone(),
+            owner: ProblemOwner::workload(*kind, name),
+        },
+        (ProblemSubject::Container { namespace, pod, .. }, None) => AlertSubject::Pod {
+            namespace: namespace.clone(),
+            name: pod.clone(),
+        },
+        (
+            ProblemSubject::Job {
+                namespace, name, ..
             },
-            (ProblemSubject::Container { namespace, pod, .. }, None) => AlertSubject::Pod {
-                namespace: namespace.clone(),
-                name: pod.clone(),
-            },
-            (
-                ProblemSubject::Job {
-                    namespace, name, ..
-                },
-                None,
-            ) => AlertSubject::Job {
-                namespace: namespace.clone(),
-                name: name.clone(),
-            },
-        };
-        AlertKey {
-            kind: self.problem.kind(),
-            subject,
-        }
+            None,
+        ) => AlertSubject::Job {
+            namespace: namespace.clone(),
+            name: name.clone(),
+        },
+    };
+    AlertKey {
+        kind: problem.kind(),
+        subject,
     }
 }
 
@@ -260,7 +191,7 @@ pub enum ClusterSnapshot<'a> {
     /// The cluster was read. Problems of an `unchecked` kind could not be determined, so what is
     /// known about them is kept as unknown.
     Available {
-        observations: &'a [Observation],
+        problems: &'a [Problem],
         unchecked: &'a [ProblemKind],
     },
     /// The cluster could not be read.
@@ -269,9 +200,9 @@ pub enum ClusterSnapshot<'a> {
 
 impl<'a> ClusterSnapshot<'a> {
     /// A snapshot in which every kind of problem was checked.
-    pub fn complete(observations: &'a [Observation]) -> Self {
+    pub fn complete(problems: &'a [Problem]) -> Self {
         Self::Available {
-            observations,
+            problems,
             unchecked: &[],
         }
     }
@@ -531,7 +462,7 @@ impl AlertEngine {
 
     /// Applies one pass over `cluster` at time `now`, returning what to deliver.
     ///
-    /// Observations naming another cluster are ignored. An unavailable cluster that has never
+    /// Problems naming another cluster are ignored. An unavailable cluster that has never
     /// been read has nothing to keep and is not tracked.
     pub fn observe(
         &mut self,
@@ -542,7 +473,7 @@ impl AlertEngine {
         match snapshot {
             ClusterSnapshot::Unavailable => Ok(self.observe_unavailable(cluster, now)),
             ClusterSnapshot::Available {
-                observations,
+                problems,
                 unchecked,
             } => {
                 if !self.clusters.contains_key(cluster) {
@@ -552,7 +483,7 @@ impl AlertEngine {
                     self.clusters
                         .insert(Arc::clone(cluster), ClusterState::new(now));
                 }
-                Ok(self.observe_available(cluster, now, observations, unchecked))
+                Ok(self.observe_available(cluster, now, problems, unchecked))
             }
         }
     }
@@ -611,7 +542,7 @@ impl AlertEngine {
         &mut self,
         cluster: &Arc<str>,
         now: Timestamp,
-        observations: &[Observation],
+        problems: &[Problem],
         unchecked: &[ProblemKind],
     ) -> Vec<AlertEvent> {
         let config = self.config;
@@ -629,7 +560,7 @@ impl AlertEngine {
             });
         }
 
-        let (mut seen, mut untracked) = group(cluster, observations, unchecked);
+        let (mut seen, mut untracked) = group(cluster, problems, unchecked);
         let resolved = update_tracked(state, &mut seen, unchecked, now, config.cooldown);
         for (key, entry) in resolved {
             if !entry.raised {
@@ -705,20 +636,19 @@ fn tracking_limit(severity: ProblemSeverity) -> usize {
     }
 }
 
-/// Groups a pass by key, returning the groups and how many observations cannot be kept.
+/// Groups a pass by key, returning the groups and how many problems cannot be kept.
 fn group(
     cluster: &Arc<str>,
-    observations: &[Observation],
+    problems: &[Problem],
     unchecked: &[ProblemKind],
 ) -> (HashMap<AlertKey, Seen>, u32) {
     let mut seen: HashMap<AlertKey, Seen> = HashMap::new();
     let mut oversized = 0;
-    for observation in observations {
-        let problem = &observation.problem;
+    for problem in problems {
         if *problem.id.cluster != **cluster || unchecked.contains(&problem.kind()) {
             continue;
         }
-        let key = observation.key();
+        let key = key_of(problem);
         if !key.subject.is_bounded() {
             oversized += 1;
             continue;

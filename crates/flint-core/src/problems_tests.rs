@@ -1638,3 +1638,223 @@ fn ten_thousand_pods_classify_quickly() {
     );
     assert!(elapsed < LIMIT, "took {elapsed:?}");
 }
+
+#[test]
+fn owners_are_read_from_metadata() {
+    type Expected = Option<(&'static str, &'static str, &'static str)>;
+    let refs = |api: &str, kind: &str, name: &str, controller: bool| {
+        json!([{
+            "apiVersion": api, "kind": kind, "name": name, "uid": "u", "controller": controller,
+        }])
+    };
+    let rs = |name: &str| refs("apps/v1", "ReplicaSet", name, true);
+    let rs_meta = |name: &str, owners: serde_json::Value| {
+        Some(json!({"name": name, "ownerReferences": owners}))
+    };
+    let owned_by_deployment = |deployment: &str, rs_name: &str| {
+        rs_meta(rs_name, refs("apps/v1", "Deployment", deployment, true))
+    };
+    let cases: Vec<(&str, serde_json::Value, Option<serde_json::Value>, Expected)> = vec![
+        (
+            "deployment",
+            rs("web-abc12"),
+            owned_by_deployment("web", "web-abc12"),
+            Some(("apps", "Deployment", "web")),
+        ),
+        (
+            "hyphenated deployment",
+            rs("my-web-abc12"),
+            owned_by_deployment("my-web", "my-web-abc12"),
+            Some(("apps", "Deployment", "my-web")),
+        ),
+        (
+            "no replicaset metadata",
+            rs("web-abc12"),
+            None,
+            Some(("apps", "ReplicaSet", "web-abc12")),
+        ),
+        (
+            "orphaned replicaset",
+            rs("web-abc12"),
+            rs_meta("web-abc12", json!([])),
+            Some(("apps", "ReplicaSet", "web-abc12")),
+        ),
+        (
+            "deployment reference is not the controller",
+            rs("web-abc12"),
+            rs_meta("web-abc12", refs("apps/v1", "Deployment", "web", false)),
+            Some(("apps", "ReplicaSet", "web-abc12")),
+        ),
+        (
+            "replicaset owned by another kind",
+            rs("web-abc12"),
+            rs_meta("web-abc12", refs("apps/v1", "StatefulSet", "web", true)),
+            Some(("apps", "ReplicaSet", "web-abc12")),
+        ),
+        (
+            "metadata of a different replicaset",
+            rs("web-abc12"),
+            owned_by_deployment("web", "web-other"),
+            Some(("apps", "ReplicaSet", "web-abc12")),
+        ),
+        (
+            "other api group",
+            refs("example.io/v1", "ReplicaSet", "web-abc12", true),
+            owned_by_deployment("web", "web-abc12"),
+            Some(("example.io", "ReplicaSet", "web-abc12")),
+        ),
+        (
+            "statefulset",
+            refs("apps/v1", "StatefulSet", "db", true),
+            None,
+            Some(("apps", "StatefulSet", "db")),
+        ),
+        (
+            "core group",
+            refs("v1", "ReplicationController", "rc", true),
+            None,
+            Some(("", "ReplicationController", "rc")),
+        ),
+        (
+            "not a controller",
+            refs("apps/v1", "StatefulSet", "db", false),
+            None,
+            None,
+        ),
+        ("no owners", json!([]), None, None),
+    ];
+    for (case, owners, replica_set, expected) in cases {
+        let meta: ObjectMeta = serde_json::from_value(json!({"ownerReferences": owners})).unwrap();
+        let replica_set: Option<ObjectMeta> =
+            replica_set.map(|rs| serde_json::from_value(rs).unwrap());
+        let expected = expected.map(|(group, kind, name)| ProblemOwner {
+            group: group.into(),
+            kind: kind.into(),
+            name: name.into(),
+        });
+        assert_eq!(
+            ProblemOwner::of_meta(&meta, replica_set.as_ref()),
+            expected,
+            "{case}"
+        );
+    }
+}
+
+/// A crash-looping pod in `namespace` whose controller is ReplicaSet `web-abc12` with `rs_uid`.
+fn replica_set_pod(namespace: &str, rs_uid: &str) -> Pod {
+    let mut pod = crash_looping_pod("uid-1", CRASH_LOOP_MIN_RESTARTS, 1);
+    pod.metadata.namespace = Some(namespace.to_owned());
+    pod.metadata.owner_references = serde_json::from_value(json!([{
+        "apiVersion": "apps/v1", "kind": "ReplicaSet", "name": "web-abc12",
+        "uid": rs_uid, "controller": true,
+    }]))
+    .unwrap();
+    pod
+}
+
+fn replica_set_meta(namespace: &str, uid: &str, deployment: &str) -> ObjectMeta {
+    serde_json::from_value(json!({
+        "name": "web-abc12", "namespace": namespace, "uid": uid,
+        "ownerReferences": [{
+            "apiVersion": "apps/v1", "kind": "Deployment", "name": deployment,
+            "uid": "deployment-uid", "controller": true,
+        }],
+    }))
+    .unwrap()
+}
+
+fn owner(group: &str, kind: &str, name: &str) -> Option<ProblemOwner> {
+    Some(ProblemOwner {
+        group: group.into(),
+        kind: kind.into(),
+        name: name.into(),
+    })
+}
+
+#[test]
+fn a_pod_problem_resolves_its_replica_set_to_the_deployment() {
+    let pod = replica_set_pod("ns", "rs-uid");
+    let fallback = owner("apps", "ReplicaSet", "web-abc12");
+    let cases = [
+        (
+            "matching metadata",
+            vec![replica_set_meta("ns", "rs-uid", "web")],
+            owner("apps", "Deployment", "web"),
+        ),
+        ("no metadata", vec![], fallback.clone()),
+        (
+            "same name in another namespace",
+            vec![replica_set_meta("other", "rs-other", "elsewhere")],
+            fallback.clone(),
+        ),
+        (
+            "recreated with a new uid",
+            vec![replica_set_meta("ns", "rs-new", "web")],
+            fallback.clone(),
+        ),
+        (
+            "uid in another namespace",
+            vec![replica_set_meta("other", "rs-uid", "elsewhere")],
+            fallback,
+        ),
+    ];
+    for (case, replica_sets, expected) in cases {
+        let index: ReplicaSetIndex<'_> = replica_sets.iter().collect();
+        let problems = classifier().pods_with_replica_sets([&pod], &index);
+        assert_eq!(problems.len(), 1, "{case}");
+        assert_eq!(problems[0].owner, expected, "{case}");
+    }
+}
+
+#[test]
+fn an_owner_is_carried_for_every_subject_and_is_not_identity() {
+    let pod = replica_set_pod("ns", "rs-uid");
+    let plain = classifier().pods([&pod]);
+    assert_eq!(plain[0].owner, owner("apps", "ReplicaSet", "web-abc12"));
+
+    let replica_sets = [replica_set_meta("ns", "rs-uid", "web")];
+    let index: ReplicaSetIndex<'_> = replica_sets.iter().collect();
+    let resolved = classifier().pods_with_replica_sets([&pod], &index);
+    assert_eq!(plain[0].id, resolved[0].id, "the owner is not in the id");
+    assert_eq!(plain[0].hold_down(), resolved[0].hold_down());
+
+    let mut job_pod = crash_looping_pod("uid-1", CRASH_LOOP_MIN_RESTARTS, 1);
+    job_pod.metadata.owner_references = serde_json::from_value(json!([{
+        "apiVersion": "batch/v1", "kind": "Job", "name": "backup", "uid": "j", "controller": true,
+    }]))
+    .unwrap();
+    assert_eq!(
+        classifier().pods([&job_pod])[0].owner,
+        owner("batch", "Job", "backup")
+    );
+
+    let conditions = json!([job_condition("Failed", "True", "BackoffLimitExceeded")]);
+    let mut failed = job(conditions, false);
+    assert_eq!(classifier().job(&failed).unwrap().owner, None);
+    failed.metadata.owner_references = serde_json::from_value(json!([{
+        "apiVersion": "batch/v1", "kind": "CronJob", "name": "nightly", "uid": "c",
+        "controller": true,
+    }]))
+    .unwrap();
+    assert_eq!(
+        classifier().job(&failed).unwrap().owner,
+        owner("batch", "CronJob", "nightly")
+    );
+
+    let down = node(60, Some(("False", "KubeletNotReady", 30)), false);
+    assert_eq!(classifier().node(&down).unwrap().owner, None);
+
+    let meta = ObjectMeta {
+        name: Some("db".into()),
+        namespace: Some("ns".into()),
+        ..ObjectMeta::default()
+    };
+    for (kind, expected) in [
+        (WorkloadKind::Deployment, "Deployment"),
+        (WorkloadKind::StatefulSet, "StatefulSet"),
+        (WorkloadKind::DaemonSet, "DaemonSet"),
+    ] {
+        let problem = classifier().workload(kind, &meta, None, None).unwrap();
+        assert_eq!(problem.owner, owner("apps", expected, "db"));
+    }
+}
