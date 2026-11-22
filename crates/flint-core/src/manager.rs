@@ -36,7 +36,11 @@ use crate::watch::{ClusterWatches, EngineConfig, HubRegistry, KubeSource};
 use crate::write::WriteError;
 
 mod file_watch;
+mod running_set;
 
+use crate::connection::member::{AttemptOutcome, MemberEvent};
+use crate::connection::policy::{CredentialAccess, ForegroundOnly, Role};
+use crate::connection::schedule::{AttemptId, Schedule};
 use file_watch::{FileWatcher, WatchScope};
 #[cfg(test)]
 use file_watch::{Watched, classify, missing_dirs, watch_names, watch_plan};
@@ -66,6 +70,12 @@ pub(crate) struct Cluster {
     /// Stops the latest attempt, so one that a newer attempt or a new slot replaced ends rather
     /// than run on. Its result, if already sent, is still discarded by `attempt`.
     connect_task: Option<AbortHandle>,
+    /// The role and policy a member's connection is made under.
+    access: CredentialAccess,
+    /// The running set's attempt that the connection in progress answers.
+    member_attempt: Option<AttemptId>,
+    /// The latest attempt whose credential was refused, so its failure means signing in.
+    rejected_attempt: Option<u64>,
     /// A pause or a changed definition ended this slot's connection: a member connects again at
     /// the first load that leaves it on its server and not paused.
     reconnect: bool,
@@ -127,6 +137,9 @@ impl Cluster {
             write_credential: None,
             attempt: 0,
             connect_task: None,
+            access: CredentialAccess::new(Arc::new(ForegroundOnly), Role::Foreground),
+            member_attempt: None,
+            rejected_attempt: None,
             reconnect: false,
             generation: 0,
             discovery: None,
@@ -270,6 +283,13 @@ enum Internal {
         attempt: u64,
         result: Result<(cluster::GatedConnection, ServerVersion), cluster::SafeErrorText>,
     },
+    /// Sent just before the [`Internal::Connected`] of an attempt whose credential was refused.
+    AttemptRejected {
+        cluster: ClusterId,
+        attempt: u64,
+    },
+    /// Time to look at the running set again.
+    MemberTick,
     FilesChanged(Changed),
     /// The file watches changed and now cover these directories. Anything may have been written
     /// before they started, so everything is read again.
@@ -435,8 +455,12 @@ pub(crate) struct ClusterManager {
     /// In kubeconfig order.
     clusters: Vec<Cluster>,
     active: Option<ClusterId>,
-    /// Clusters kept running beside the active one. Empty outside tests for now.
+    /// Clusters kept running beside the active one ([`Command::SetRunningSet`]).
     members: HashMap<ClusterId, Member>,
+    /// When members' background connection attempts may start.
+    schedule: Schedule<ClusterId>,
+    /// Runs while the set has members.
+    set_ticker: Option<JoinHandle<()>>,
     /// Source of connection attempt ids; never reused.
     next_attempt: u64,
     watcher: Option<FileWatcher>,
@@ -494,6 +518,8 @@ impl ClusterManager {
             clusters: Vec::new(),
             active: None,
             members: HashMap::new(),
+            schedule: Schedule::default(),
+            set_ticker: None,
             next_attempt: 1,
             watcher: None,
             hubs,
@@ -558,6 +584,7 @@ impl ClusterManager {
     async fn handle_command(&mut self, command: Command) {
         match command {
             Command::Activate(id) => self.activate(id),
+            Command::SetRunningSet(ids) => self.set_running_set(ids),
             Command::SetAiExposed {
                 cluster,
                 server,
@@ -633,6 +660,9 @@ impl ClusterManager {
 
     fn handle_request(&mut self, request: Request) {
         match request {
+            Request::RunningSet { reply } => {
+                let _ = reply.send(self.member_reports());
+            }
             // Requests are handled without waiting: the reload runs as an internal message.
             Request::ReloadKubeconfig { reply } => {
                 let _ = self.internal_tx.send(Internal::ReloadKubeconfig { reply });
@@ -1250,17 +1280,27 @@ impl ClusterManager {
                     return;
                 }
                 slot.connect_task = None;
+                let member_attempt = slot.member_attempt.take();
+                let rejected = slot.rejected_attempt.take() == Some(attempt);
                 // Dropped either way: the load that ends the pause connects again.
                 if paused {
                     slot.state = ConnectionState::Disconnected;
                     slot.reconnect = true;
                     self.emit(Event::ConnectionChanged {
-                        cluster,
+                        cluster: cluster.clone(),
                         state: ConnectionState::Disconnected,
                     });
+                    // The pause already voided the member's attempt: this frees its slot.
+                    let outcome = AttemptOutcome::Failed(cluster::SafeErrorText::reduced("paused"));
+                    self.finish_member_attempt(&cluster, member_attempt, outcome, Instant::now());
                     return;
                 }
                 let connected = result.is_ok();
+                let outcome = match &result {
+                    Ok(_) => AttemptOutcome::Connected,
+                    Err(error) if rejected => AttemptOutcome::AuthRejected(error.clone()),
+                    Err(error) => AttemptOutcome::Failed(error.clone()),
+                };
                 match result {
                     Ok((connection, version)) => {
                         slot.watches.set_source(Some(KubeSource::new(
@@ -1293,7 +1333,18 @@ impl ClusterManager {
                     self.start_discovery(&cluster);
                     self.reconcile(&cluster);
                 }
+                let now = Instant::now();
+                self.finish_member_attempt(&cluster, member_attempt, outcome, now);
+                self.pump_members(now);
             }
+            Internal::AttemptRejected { cluster, attempt } => {
+                if let Some(slot) = self.cluster_mut(&cluster)
+                    && slot.attempt == attempt
+                {
+                    slot.rejected_attempt = Some(attempt);
+                }
+            }
+            Internal::MemberTick => self.tick_members(Instant::now()),
             Internal::Discovered {
                 cluster,
                 attempt,
@@ -1946,11 +1997,16 @@ impl ClusterManager {
         if self.active.as_deref() != Some(&id) {
             let previous = self.active.replace(id.clone());
             self.emit(Event::ActiveChanged(Some(id.clone())));
+            self.sync_roles();
             if let Some(previous) = previous {
+                let now = Instant::now();
+                self.apply_member(&previous, MemberEvent::Deactivated, now);
+                self.demote_member(&previous, now);
                 // Its watches stop; its client and discovery stay (ADR-0008).
                 self.reconcile(&previous);
             }
         }
+        self.apply_member(&id, MemberEvent::Activated, Instant::now());
         self.ensure_connected(&id);
         // A connected cluster whose discovery failed gets another try when selected.
         if let Some(slot) = self.cluster_mut(&id)
@@ -1970,9 +2026,12 @@ impl ClusterManager {
         let internal = self.internal_tx.clone();
         let attempt = self.next_attempt;
         let paused = self.paused(id);
+        // Only a member's connection can be demoted; any other is made as it always was.
+        let member = self.members.contains_key(id);
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
+        let access = member.then(|| slot.access.clone());
         if paused
             || matches!(
                 slot.state,
@@ -2004,10 +2063,30 @@ impl ClusterManager {
         // Run the attempt as its own task so a panic inside kube or an auth plugin handler
         // becomes a failed connection instead of a cluster stuck in "connecting".
         let name = cluster.clone();
+        let rejections = internal.clone();
         let attempt_task = tokio::spawn(async move {
-            cluster::connect_gated_and_check(&kubeconfig.merged, &name, CONNECT_TIMEOUT)
-                .await
-                .map_err(|e| e.summary())
+            let merged = &kubeconfig.merged;
+            let result = match access {
+                Some(access) => {
+                    cluster::connect_gated_and_check_with_policy(
+                        merged,
+                        &name,
+                        CONNECT_TIMEOUT,
+                        &access,
+                    )
+                    .await
+                }
+                None => cluster::connect_gated_and_check(merged, &name, CONNECT_TIMEOUT).await,
+            };
+            result.map_err(|e| {
+                if running_set::needs_sign_in(&e) {
+                    let _ = rejections.send(Internal::AttemptRejected {
+                        cluster: name.clone(),
+                        attempt,
+                    });
+                }
+                e.summary()
+            })
         });
         if let Some(slot) = self.cluster_mut(id)
             && let Some(superseded) = slot.connect_task.replace(attempt_task.abort_handle())
@@ -2294,7 +2373,11 @@ impl ClusterManager {
             .collect();
         for id in &ended {
             self.members.remove(id);
+            self.schedule.dequeue(id);
         }
+        self.arm_set_ticker();
+        self.sync_roles();
+        self.sync_member_pauses(Instant::now());
         // The default namespace may have changed, and a filter set during a pause waits for this.
         for name in loaded.contexts.iter().map(|info| &info.name) {
             self.apply_scope(name);
@@ -2334,7 +2417,8 @@ impl ClusterManager {
         for id in ended {
             self.reconcile(&id);
         }
-        // `ensure_connected` refuses a paused context, and the flag then waits for a later load.
+        // A paused context starts nothing, and the flag then waits for a later load. The rest go
+        // through the queue, so a change to many contexts does not reconnect them all at once.
         let due: Vec<ClusterId> = self
             .members
             .keys()
@@ -2345,9 +2429,16 @@ impl ClusterManager {
             })
             .cloned()
             .collect();
+        let now = Instant::now();
         for id in due {
-            self.ensure_connected(&id);
+            // An attempt already running for this slot answers the flag.
+            if self.cluster(&id).is_some_and(|slot| {
+                !matches!(slot.state, ConnectionState::Connecting) || slot.member_attempt.is_none()
+            }) {
+                self.apply_member(&id, MemberEvent::ConnectionLost, now);
+            }
         }
+        self.pump_members(now);
     }
 
     /// Asks for the file watches to match the current kubeconfig files and `settings.toml`, if
@@ -5069,7 +5160,11 @@ mod tests {
         rewrite_file(&mut manager, &first, &confirmed).await;
         assert!(manager.members.contains_key("dev"));
         assert!(manager.wants_watches("dev"));
-        assert_eq!(manager.next_attempt, next, "no attempt started");
+        assert_eq!(
+            manager.next_attempt,
+            next + 1,
+            "connects once the pause ends"
+        );
     }
 
     // A connection result handled during a hold is dropped, and the load that ends the hold

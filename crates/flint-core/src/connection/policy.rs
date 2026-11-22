@@ -60,10 +60,6 @@ impl CredentialPolicy for AlwaysAllow {
 
 /// Credentials that run a program do so only for the foreground connection. Static credentials
 /// and token files run nothing, so they are allowed in either role.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "not wired into a connection yet")
-)]
 pub(crate) struct ForegroundOnly;
 
 impl CredentialPolicy for ForegroundOnly {
@@ -84,10 +80,6 @@ pub(crate) struct CredentialAccess {
 }
 
 impl CredentialAccess {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "not wired into a connection yet")
-    )]
     pub(crate) fn new(policy: Arc<dyn CredentialPolicy>, role: Role) -> Self {
         let (role, _) = watch::channel(RoleState::new(role));
         CredentialAccess {
@@ -106,7 +98,6 @@ impl CredentialAccess {
     }
 
     /// Changes the role. A refresh the new role does not allow is ended.
-    #[cfg_attr(not(test), expect(dead_code, reason = "no connection is demoted yet"))]
     pub(crate) fn set_role(&self, role: Role) {
         self.role.send_if_modified(|state| {
             let changed = state.role != role;
