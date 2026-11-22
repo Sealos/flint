@@ -8,7 +8,9 @@
 
 use flint_core::alerts::{Alert, AlertSubject};
 use flint_core::problems::ProblemSeverity;
+use flint_core::read::{DiscoveredKinds, KindInfo};
 use flint_core::settings::{AiExposureState, AiScope, Settings};
+use flint_mcp::policy;
 
 /// The longest name accepted: the Kubernetes limit for a DNS subdomain name.
 const MAX_IDENTIFIER_BYTES: usize = 253;
@@ -29,6 +31,8 @@ pub enum DisabledReason {
     ServerChanged,
     /// The alert's object is outside what agents may read of this cluster.
     OutOfScope,
+    /// API discovery could not confirm what kind of object the alert is about.
+    Unresolved,
     /// A name is not a plain identifier, so it cannot be quoted safely.
     UnsafeName,
 }
@@ -42,6 +46,7 @@ impl DisabledReason {
                 "This cluster's API server changed. Expose it again to investigate with an agent."
             }
             Self::OutOfScope => "This alert is outside the AI access scope of this cluster.",
+            Self::Unresolved => "Flint could not confirm this alert's object on the cluster.",
             Self::UnsafeName => "This alert has a name that cannot be passed to an agent safely.",
         }
     }
@@ -85,20 +90,39 @@ impl<'a> Target<'a> {
         }
     }
 
-    /// Whether `scope` lets agents read this object. A kind Flint cannot map to its id is
-    /// allowed only when the scope is unlimited, since it may be cluster-scoped.
-    fn in_scope(&self, scope: &AiScope) -> bool {
-        if scope.is_everything() {
-            return true;
+    /// The one discovered kind this object is, if discovery surely says so: its group is fully
+    /// read, exactly one kind matches, and that kind agrees on whether the object is namespaced.
+    fn resolve<'k>(&self, kinds: &'k [KindInfo], incomplete: &[String]) -> Option<&'k KindInfo> {
+        if incomplete
+            .iter()
+            .any(|group| group.eq_ignore_ascii_case(self.group))
+        {
+            return None;
         }
+        let mut matches = kinds
+            .iter()
+            .filter(|k| k.group() == self.group && k.kind() == self.kind);
+        let kind = matches.next()?;
+        (matches.next().is_none() && kind.namespaced == self.namespace.is_some()).then_some(kind)
+    }
+
+    /// Whether `scope` lets agents read this object of the resolved `kind`, by the rules the MCP
+    /// server enforces.
+    fn in_scope(
+        &self,
+        scope: &AiScope,
+        kind: &KindInfo,
+        kinds: &[KindInfo],
+        incomplete: &[String],
+    ) -> bool {
         if self
             .namespace
             .is_some_and(|namespace| !scope.allows_namespace(namespace))
         {
             return false;
         }
-        kind_id(self.group, self.kind)
-            .is_some_and(|(id, namespaced)| scope.allows_kind(id, namespaced))
+        let resolved = policy::resolve_scope_kinds(scope, kinds, incomplete);
+        !policy::kinds_in_scope(&resolved.scope, std::slice::from_ref(kind)).is_empty()
     }
 
     fn is_quotable(&self) -> bool {
@@ -107,22 +131,6 @@ impl<'a> Target<'a> {
             && is_identifier(self.kind)
             && is_identifier(self.name)
     }
-}
-
-/// The kind id scopes use for an alert's object, and whether that kind is namespaced.
-fn kind_id(group: &str, kind: &str) -> Option<(&'static str, bool)> {
-    Some(match (group, kind) {
-        ("", "Pod") => ("pods", true),
-        ("", "Node") => ("nodes", false),
-        ("", "ReplicationController") => ("replicationcontrollers", true),
-        ("apps", "Deployment") => ("deployments.apps", true),
-        ("apps", "StatefulSet") => ("statefulsets.apps", true),
-        ("apps", "DaemonSet") => ("daemonsets.apps", true),
-        ("apps", "ReplicaSet") => ("replicasets.apps", true),
-        ("batch", "Job") => ("jobs.batch", true),
-        ("batch", "CronJob") => ("cronjobs.batch", true),
-        _ => return None,
-    })
 }
 
 /// Whether `value` is a bounded name of ASCII letters, digits and `-._:/@`, starting with a letter
@@ -141,12 +149,14 @@ fn is_identifier(value: &str) -> bool {
 /// The prompt for `alert`, whose cluster currently points at `server`. Fails closed: exposure and
 /// scope are checked against `settings` before any name is used.
 ///
-/// Scope kinds are compared as exact kind ids, so a hand-written alias disables the action
-/// rather than widening it.
+/// `discovered` is the cluster's API discovery, `None` when it could not be read. Scope kinds
+/// resolve against it as they do in the MCP server, and an object it cannot identify is disabled
+/// whatever the scope.
 pub fn investigate_prompt(
     alert: &Alert,
     settings: &Settings,
     server: Option<&str>,
+    discovered: Option<&DiscoveredKinds>,
 ) -> InvestigatePrompt {
     match settings.ai_exposure(&alert.cluster, server) {
         AiExposureState::Exposed => {}
@@ -159,7 +169,14 @@ pub fn investigate_prompt(
         return InvestigatePrompt::Disabled(DisabledReason::NotExposed);
     };
     let target = Target::of(&alert.key.subject);
-    if !target.in_scope(&scope) {
+    let Some(discovered) = discovered else {
+        return InvestigatePrompt::Disabled(DisabledReason::Unresolved);
+    };
+    let incomplete = discovered.incomplete_groups();
+    let Some(kind) = target.resolve(&discovered.kinds, &incomplete) else {
+        return InvestigatePrompt::Disabled(DisabledReason::Unresolved);
+    };
+    if !target.in_scope(&scope, kind, &discovered.kinds, &incomplete) {
         return InvestigatePrompt::Disabled(DisabledReason::OutOfScope);
     }
     if !is_identifier(&alert.cluster) || !target.is_quotable() {
@@ -246,15 +263,76 @@ mod tests {
         }
     }
 
+    fn kind_info(
+        group: &str,
+        kind: &str,
+        plural: &str,
+        short: &[&str],
+        namespaced: bool,
+    ) -> KindInfo {
+        let api_version = if group.is_empty() {
+            "v1".to_owned()
+        } else {
+            format!("{group}/v1")
+        };
+        KindInfo {
+            resource: kube::discovery::ApiResource {
+                group: group.into(),
+                version: "v1".into(),
+                api_version,
+                kind: kind.into(),
+                plural: plural.into(),
+            },
+            namespaced,
+            verbs: ["get", "list"].map(String::from).to_vec(),
+            singular: kind.to_lowercase(),
+            short_names: short.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    fn discovery() -> DiscoveredKinds {
+        DiscoveredKinds {
+            kinds: vec![
+                kind_info("", "Pod", "pods", &["po"], true),
+                kind_info("", "Node", "nodes", &["no"], false),
+                kind_info("apps", "Deployment", "deployments", &["deploy"], true),
+                kind_info("example.com", "Widget", "widgets", &[], true),
+            ],
+            ..DiscoveredKinds::default()
+        }
+    }
+
+    fn widget() -> AlertSubject {
+        AlertSubject::Workload {
+            namespace: "shop".into(),
+            owner: ProblemOwner {
+                group: "example.com".into(),
+                kind: "Widget".into(),
+                name: "w".into(),
+            },
+        }
+    }
+
+    fn reason_with(
+        alert: &Alert,
+        settings: &Settings,
+        discovered: Option<&DiscoveredKinds>,
+    ) -> DisabledReason {
+        match investigate_prompt(alert, settings, Some(SERVER), discovered) {
+            InvestigatePrompt::Disabled(reason) => reason,
+            InvestigatePrompt::Ready(prompt) => panic!("expected disabled, got {prompt}"),
+        }
+    }
+
     fn reason(alert: &Alert, settings: &Settings, server: Option<&str>) -> DisabledReason {
-        match investigate_prompt(alert, settings, server) {
+        match investigate_prompt(alert, settings, server, Some(&discovery())) {
             InvestigatePrompt::Disabled(reason) => reason,
             InvestigatePrompt::Ready(prompt) => panic!("expected disabled, got {prompt}"),
         }
     }
 
     fn ready(alert: &Alert, settings: &Settings) -> String {
-        match investigate_prompt(alert, settings, Some(SERVER)) {
+        match investigate_prompt(alert, settings, Some(SERVER), Some(&discovery())) {
             InvestigatePrompt::Ready(prompt) => prompt,
             InvestigatePrompt::Disabled(reason) => panic!("disabled: {reason:?}"),
         }
@@ -337,21 +415,79 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_owner_kind_needs_an_unlimited_scope() {
-        let subject = AlertSubject::Workload {
-            namespace: "shop".into(),
-            owner: ProblemOwner {
-                group: "example.com".into(),
-                kind: "Widget".into(),
-                name: "w".into(),
-            },
-        };
-        let alert = alert_on("prod", subject);
+    fn hand_written_kinds_resolve_as_the_mcp_server_resolves_them() {
+        let alert = alert_on("prod", deployment("shop", "api"));
+        for written in ["deploy", "Deployment", "deployments.apps"] {
+            ready(&alert, &exposed("prod", &["shop"], &[written]));
+        }
         assert_eq!(
-            reason(&alert, &exposed("prod", &["shop"], &[]), Some(SERVER)),
+            reason(&alert, &exposed("prod", &[], &["po"]), Some(SERVER)),
             DisabledReason::OutOfScope
         );
-        ready(&alert, &exposed("prod", &[], &[]));
+    }
+
+    #[test]
+    fn a_custom_controller_follows_the_scope() {
+        let alert = alert_on("prod", widget());
+        ready(&alert, &exposed("prod", &["shop"], &[]));
+        ready(&alert, &exposed("prod", &[], &["widgets.example.com"]));
+        assert_eq!(
+            reason(&alert, &exposed("prod", &[], &["pods"]), Some(SERVER)),
+            DisabledReason::OutOfScope
+        );
+    }
+
+    #[test]
+    fn a_target_discovery_cannot_confirm_is_disabled_under_any_scope() {
+        let alert = alert_on("prod", widget());
+        let skipped = DiscoveredKinds {
+            skipped_groups: vec!["example.com".into()],
+            ..discovery()
+        };
+        let stale = DiscoveredKinds {
+            stale_groups: vec!["EXAMPLE.com".into()],
+            ..discovery()
+        };
+        let missing = DiscoveredKinds {
+            kinds: vec![kind_info("", "Pod", "pods", &[], true)],
+            ..DiscoveredKinds::default()
+        };
+        let mut ambiguous = discovery();
+        ambiguous
+            .kinds
+            .push(kind_info("example.com", "Widget", "widgetz", &[], true));
+        let mut cluster_scoped = discovery();
+        cluster_scoped.kinds[3].namespaced = false;
+
+        for settings in [exposed("prod", &[], &[]), exposed("prod", &["shop"], &[])] {
+            assert_eq!(
+                reason_with(&alert, &settings, None),
+                DisabledReason::Unresolved
+            );
+            for discovered in [&skipped, &stale, &missing, &ambiguous, &cluster_scoped] {
+                assert_eq!(
+                    reason_with(&alert, &settings, Some(discovered)),
+                    DisabledReason::Unresolved
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_name_grants_nothing_while_discovery_is_incomplete() {
+        let alert = alert_on("prod", deployment("shop", "api"));
+        let incomplete = DiscoveredKinds {
+            skipped_groups: vec!["metrics.k8s.io".into()],
+            ..discovery()
+        };
+        assert_eq!(
+            reason_with(
+                &alert,
+                &exposed("prod", &[], &["deploy"]),
+                Some(&incomplete)
+            ),
+            DisabledReason::OutOfScope
+        );
     }
 
     #[test]
@@ -420,6 +556,7 @@ mod tests {
             DisabledReason::NotExposed,
             DisabledReason::ServerChanged,
             DisabledReason::OutOfScope,
+            DisabledReason::Unresolved,
             DisabledReason::UnsafeName,
         ]
         .map(DisabledReason::message);

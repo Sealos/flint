@@ -43,8 +43,10 @@ pub struct Notification {
 }
 
 impl Notification {
-    /// The notification for an alert event.
-    pub fn from_event(event: &AlertEvent) -> Self {
+    /// The notification for an alert event. `cluster_label` is what the title calls the cluster:
+    /// [`flint_core::display::ClusterNames::with_real`], so similar clusters stay distinct. It is
+    /// cleaned like any other shown text.
+    pub fn from_event(event: &AlertEvent, cluster_label: &str) -> Self {
         let text = event.text();
         let (heading, body, cluster) = match event {
             AlertEvent::Raised(alert) => (
@@ -68,7 +70,7 @@ impl Notification {
             AlertEvent::ClusterAvailable { cluster } => ("Cluster available", text, cluster),
         };
         Self {
-            title: format!("{heading}: {}", clean(cluster)),
+            title: format!("{heading}: {}", clean(cluster_label)),
             body,
             cluster: Arc::clone(cluster),
         }
@@ -161,7 +163,8 @@ pub trait NotificationSender {
 pub struct MacosSender;
 
 impl MacosSender {
-    /// The title and body are script arguments, so they are never parsed as AppleScript.
+    /// The title and body are script arguments, so they are never parsed as AppleScript. `--`
+    /// ends the options, so they are never read as flags either.
     fn command(notification: &Notification) -> Command {
         let mut command = Command::new("/usr/bin/osascript");
         command
@@ -171,6 +174,7 @@ impl MacosSender {
                 "display notification (item 2 of argv) with title (item 1 of argv)",
             ])
             .args(["-e", "end run"])
+            .arg("--")
             .arg(&notification.title)
             .arg(&notification.body);
         command
@@ -222,9 +226,11 @@ fn run(mut command: Command) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::BTreeMap;
     use std::ffi::OsStr;
 
     use flint_core::alerts::{AlertKey, AlertSummary};
+    use flint_core::display::ClusterNames;
     use flint_core::problems::{ProblemKind, ProblemOwner};
 
     use super::*;
@@ -269,7 +275,7 @@ mod tests {
     #[test]
     fn a_raised_alert_names_its_cluster_and_subject() {
         let event = AlertEvent::Raised(alert("prod", pod("api-0")));
-        let notification = Notification::from_event(&event);
+        let notification = Notification::from_event(&event, "prod");
         assert_eq!(notification.title, "Critical alert: prod");
         assert_eq!(notification.body, "Container keeps crashing: default/api-0");
         assert_eq!(&*notification.cluster, "prod");
@@ -318,7 +324,7 @@ mod tests {
             ),
         ];
         for (event, title) in cases {
-            let notification = Notification::from_event(&event);
+            let notification = Notification::from_event(&event, "prod");
             assert_eq!(notification.title, title);
             assert_eq!(notification.cluster, cluster);
         }
@@ -335,11 +341,35 @@ mod tests {
             },
         };
         let event = AlertEvent::Raised(alert(HOSTILE, subject));
-        let notification = Notification::from_event(&event);
+        let notification = Notification::from_event(&event, HOSTILE);
         assert_safe(&notification.title);
         assert_safe(&notification.body);
         assert!(!notification.body.contains('<'));
         assert_eq!(&*notification.cluster, HOSTILE);
+    }
+
+    #[test]
+    fn similar_clusters_keep_distinct_titles() {
+        let project = "a-very-long-gcp-project-name-for-testing";
+        let name = "a-very-long-shared-cluster-name-for-testing";
+        let first = format!("gke_{project}_europe-west1-b_{name}");
+        let second = format!("gke_{project}_europe-west1-c_{name}");
+        assert_eq!(clean(&first), clean(&second));
+
+        let names = ClusterNames::new([first.as_str(), second.as_str()], &BTreeMap::new());
+        let title = |context: &str| {
+            let event = AlertEvent::Raised(alert(context, pod("api-0")));
+            Notification::from_event(&event, &names.with_real(context)).title
+        };
+        assert_ne!(title(&first), title(&second));
+    }
+
+    #[test]
+    fn opening_a_notification_uses_the_exact_cluster_not_its_label() {
+        let event = AlertEvent::Raised(alert("exact-context", pod("api-0")));
+        let notification = Notification::from_event(&event, "Label\n<b>");
+        assert_eq!(notification.title, "Critical alert: Label b");
+        assert_eq!(&*notification.cluster, "exact-context");
     }
 
     #[test]
@@ -368,6 +398,7 @@ mod tests {
         };
         let mac = MacosSender::command(&notification);
         let args: Vec<&OsStr> = mac.get_args().collect();
+        assert_eq!(args[args.len() - 3], OsStr::new("--"));
         assert_eq!(args[args.len() - 2], OsStr::new(&notification.title));
         assert_eq!(args[args.len() - 1], OsStr::new("-body"));
         assert!(
@@ -393,7 +424,7 @@ mod tests {
     fn a_sender_receives_the_notification() {
         let sender = FakeSender::default();
         let notification =
-            Notification::from_event(&AlertEvent::Raised(alert("prod", pod("api-0"))));
+            Notification::from_event(&AlertEvent::Raised(alert("prod", pod("api-0"))), "prod");
         let dyn_sender: &dyn NotificationSender = &sender;
         dyn_sender.send(&notification).unwrap();
         assert_eq!(*sender.sent.borrow(), vec![notification]);
