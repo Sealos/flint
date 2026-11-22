@@ -273,10 +273,10 @@ mod tests {
     #[test]
     fn highlights_skip_empty_matches_and_keep_offsets() {
         let regex = compile("x*", true).unwrap();
-        assert_eq!(bounded_ranges(&regex, "axxbx"), [1..3, 4..5]);
+        assert_eq!(ranges_within(&regex, "axxbx", UNHURRIED), [1..3, 4..5]);
         let regex = compile(r"\d+", true).unwrap();
         let text = "öö 12 ä 345";
-        let ranges = bounded_ranges(&regex, text);
+        let ranges = ranges_within(&regex, text, UNHURRIED);
         assert_eq!(&text[ranges[0].clone()], "12");
         assert_eq!(&text[ranges[1].clone()], "345");
     }
@@ -285,10 +285,10 @@ mod tests {
     #[test]
     fn a_long_line_is_cut_without_inventing_a_match() {
         let regex = compile("a$", true).unwrap();
-        assert!(bounded_ranges(&regex, &"a".repeat(HIGHLIGHT_BYTES * 2)).is_empty());
+        assert!(ranges_within(&regex, &"a".repeat(HIGHLIGHT_BYTES * 2), UNHURRIED).is_empty());
         let regex = compile("ö", true).unwrap();
         let text = format!("{}{}", "x".repeat(HIGHLIGHT_BYTES - 1), "ö".repeat(4));
-        assert!(bounded_ranges(&regex, &text).is_empty());
+        assert!(ranges_within(&regex, &text, UNHURRIED).is_empty());
     }
 
     #[test]
