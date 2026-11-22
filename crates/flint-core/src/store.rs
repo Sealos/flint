@@ -13,6 +13,15 @@ use crate::cluster::ClusterId;
 use crate::read::KindId;
 use crate::table::{self, Column, Interner, Layout, ListFormat, Row, WireObject};
 
+/// Why the server refused a list or watch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalCause {
+    /// 403: the account may not do this.
+    Denied,
+    /// 404: the API or namespace is not there.
+    NotFound,
+}
+
 /// Where a kind's list stands.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SyncState {
@@ -29,10 +38,18 @@ pub enum SyncState {
     Reconnecting { error: Option<String> },
     /// The server refused the list or watch (forbidden, not found), which can be transient, and
     /// it is being retried soon. Becomes [`SyncState::Failed`] if a list keeps being refused.
-    /// Rows are the last known state and may be stale.
-    RetryingRefusal { error: String },
+    /// Rows are the last known state and may be stale. `cause` is `None` when the namespaces of
+    /// a merged list were refused for different reasons.
+    RetryingRefusal {
+        error: String,
+        cause: Option<RefusalCause>,
+    },
     /// The server refuses the list (forbidden, not found). Retried slowly. Rows may be empty.
-    Failed { error: String },
+    /// `cause` is `None` when the namespaces of a merged list were refused for different reasons.
+    Failed {
+        error: String,
+        cause: Option<RefusalCause>,
+    },
     /// Discovery does not know this kind on this cluster.
     Unavailable,
 }
@@ -41,6 +58,28 @@ impl SyncState {
     /// Whether the rows can be shown as current.
     pub fn is_current(&self) -> bool {
         matches!(self, SyncState::Synced)
+    }
+
+    /// Whether a denial is being retried before it is believed.
+    pub fn is_checking_access(&self) -> bool {
+        matches!(
+            self,
+            SyncState::RetryingRefusal {
+                cause: Some(RefusalCause::Denied),
+                ..
+            }
+        )
+    }
+
+    /// Whether the account has been refused this list for good (it is still retried slowly).
+    pub fn is_no_access(&self) -> bool {
+        matches!(
+            self,
+            SyncState::Failed {
+                cause: Some(RefusalCause::Denied),
+                ..
+            }
+        )
     }
 }
 

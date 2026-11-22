@@ -1,13 +1,16 @@
 //! View tests for the resource list, in a headless GPUI window (`#[gpui_kit::test]`). Rows are
 //! fed by hand; filtering and sorting run through a real core's `compute_view`.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use flint_core::{
-    Cell, Column, ColumnRole, ColumnType, CoreConfig, CoreHandle, KindId, KindSnapshot, Row,
-    Settings, SyncState,
+    Cell, Column, ColumnRole, ColumnType, ConnectionState, CoreConfig, CoreHandle, KindId,
+    KindSnapshot, RefusalCause, Row, Settings, SyncState,
 };
+use flint_e2e::fake_api::{CONTEXT, FakeApiServer, Fault, Gvr, Options};
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
     AnyWindowHandle, AppContext as _, Bounds, Entity, Point, TestAppContext, Window, WindowBounds,
@@ -15,6 +18,7 @@ use gpui_kit::{
 };
 
 use super::ResourceList;
+use crate::ui::support_tests::open_workspace_with;
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -955,6 +959,7 @@ async fn list_shows_loading_stale_and_failed_states(cx: &mut TestAppContext) {
                 &[],
                 SyncState::Failed {
                     error: "forbidden".into(),
+                    cause: Some(RefusalCause::Denied),
                 },
                 4,
             ),
@@ -965,6 +970,239 @@ async fn list_shows_loading_stale_and_failed_states(cx: &mut TestAppContext) {
         window.try_find("list-placeholder").is_some() && window.try_find("row-uid-web").is_none()
     })
     .await;
+}
+
+// covers UP-27
+#[gpui_kit::test]
+async fn a_denied_list_checks_access_then_says_no_access(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open(cx, core);
+    let refused = |retrying: bool, cause| {
+        let error = "pods is forbidden".to_owned();
+        if retrying {
+            SyncState::RetryingRefusal { error, cause }
+        } else {
+            SyncState::Failed { error, cause }
+        }
+    };
+    let denied = Some(RefusalCause::Denied);
+    // (state, rows, chip, placeholder, banner start)
+    let rows = [("demo", "web", 0)];
+    type Rows<'a> = &'a [(&'a str, &'a str, i64)];
+    let cases: [(SyncState, Rows<'_>, _, _, _); 6] = [
+        (
+            refused(true, denied),
+            &[],
+            "checking access",
+            Some("checking_access"),
+            None,
+        ),
+        (
+            refused(false, denied),
+            &[],
+            "no access",
+            Some("no_access"),
+            None,
+        ),
+        (
+            refused(true, denied),
+            &rows,
+            "checking access",
+            None,
+            Some("Checking access"),
+        ),
+        (
+            refused(false, denied),
+            &rows,
+            "no access",
+            None,
+            Some("No access"),
+        ),
+        // Not a denial: nothing may claim the account lacks access.
+        (
+            refused(true, Some(RefusalCause::NotFound)),
+            &[],
+            "reconnecting",
+            Some("reconnecting"),
+            Some("Reconnecting"),
+        ),
+        (refused(false, None), &[], "failed", Some("failed"), None),
+    ];
+    for (version, (state, shown, chip, placeholder, banner)) in cases.into_iter().enumerate() {
+        list.update(cx, |list, cx| {
+            list.set_snapshot(pods(shown, state.clone(), version as u64 + 1), cx)
+        });
+        // The rows and the state drawn with them land when the recompute does.
+        cx.wait_for(window, WAIT, |_, cx| {
+            let view = list.read(cx).view_state();
+            let text = view.banners.iter().find(|b| b.id == "list-banner");
+            view.sync == chip
+                && view.total == shown.len()
+                && view.placeholder == placeholder
+                && match banner {
+                    Some(start) => text.is_some_and(|b| b.text.starts_with(start)),
+                    None => text.is_none(),
+                }
+        })
+        .await;
+    }
+}
+
+// covers UP-27
+#[gpui_kit::test]
+async fn a_denial_over_filtered_out_rows_does_not_mention_them(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open(cx, core);
+    let error = "pods is forbidden".to_owned();
+    let cause = Some(RefusalCause::Denied);
+    let cases = [
+        (
+            SyncState::RetryingRefusal {
+                error: error.clone(),
+                cause,
+            },
+            "checking access",
+            "Checking access",
+        ),
+        (
+            SyncState::Failed {
+                error: error.clone(),
+                cause,
+            },
+            "no access",
+            "No access",
+        ),
+    ];
+    for (version, (state, chip, status)) in cases.into_iter().enumerate() {
+        list.update(cx, |list, cx| {
+            list.set_namespaces(vec!["elsewhere".to_owned()], cx);
+            list.set_snapshot(pods(&[("demo", "web", 0)], state, version as u64 + 1), cx)
+        });
+        cx.wait_for(window, WAIT, |_, cx| {
+            let view = list.read(cx).view_state();
+            view.sync == chip && view.placeholder == Some("no_match")
+        })
+        .await;
+        let hidden = list.read_with(cx, |list, _| list.access_banner(status, &error));
+        assert_eq!(hidden, format!("{status}: {error}"));
+
+        list.update(cx, |list, cx| list.set_namespaces(Vec::new(), cx));
+        cx.wait_for(window, WAIT, |_, cx| {
+            list.read(cx).view_state().placeholder.is_none()
+        })
+        .await;
+        let shown = list.read_with(cx, |list, _| list.access_banner(status, &error));
+        assert_eq!(
+            shown,
+            format!("{status}. These rows may be out of date: {error}")
+        );
+    }
+}
+
+// covers UP-27
+#[gpui_kit::test]
+async fn a_real_403_goes_from_checking_to_no_access_without_reconnecting(cx: &mut TestAppContext) {
+    let server = FakeApiServer::start_blocking(Options::default()).unwrap();
+    server.inject(Fault::forbidden().on(&Gvr::new("", "v1", "pods")));
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace_with(cx, dir.path(), |dir, _| {
+        let path = dir.join("kubeconfig");
+        server.write_kubeconfig(&path, Some("demo")).unwrap();
+        vec![path]
+    })
+    .await;
+    t.activate(cx, CONTEXT).await;
+    t.wait_for_state(cx, CONTEXT, |s| matches!(s, ConnectionState::Connected(_)))
+        .await;
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model
+            .read(cx)
+            .discovered(CONTEXT)
+            .is_some_and(|d| d.discovery.is_some())
+    })
+    .await;
+    t.dispatch(
+        cx,
+        "workspace::OpenView",
+        serde_json::json!({ "kind": "pods" }),
+    )
+    .unwrap();
+    let list = t.list(cx).expect("a list is open");
+
+    // Every state the list reports on its way, not only the ones a poll happens to see.
+    let seen: Rc<RefCell<Vec<String>>> = Rc::default();
+    let record = seen.clone();
+    let _recording = cx.update(|cx| {
+        cx.observe(&list, move |list, cx| {
+            let view = list.read(cx).view_state();
+            let banner = view.banners.iter().find(|b| b.id == "list-banner");
+            assert!(
+                banner.is_none(),
+                "no rows to warn about: {:?}",
+                banner.map(|b| &b.text)
+            );
+            assert_ne!(view.placeholder, Some("reconnecting"));
+            let sync = view.sync.to_string();
+            assert_ne!(sync, "reconnecting");
+            let mut seen = record.borrow_mut();
+            if seen.last() != Some(&sync) {
+                seen.push(sync);
+            }
+        })
+    });
+    let done = list.clone();
+    cx.wait_for(t.window, Duration::from_secs(30), move |_, cx| {
+        let view = done.read(cx).view_state();
+        view.sync == "no access" && view.placeholder == Some("no_access")
+    })
+    .await;
+    let seen = seen.borrow();
+    let checking = seen.iter().position(|s| s == "checking access");
+    let refused = seen.iter().position(|s| s == "no access");
+    assert!(
+        matches!((checking, refused), (Some(c), Some(r)) if c < r),
+        "checks access, then says so: {seen:?}"
+    );
+}
+
+// covers UP-27
+#[test]
+fn only_a_denial_is_titled_as_access() {
+    let title = |state: SyncState| super::access_title(&state, "Pods");
+    let error = || "refused".to_owned();
+    assert_eq!(
+        title(SyncState::RetryingRefusal {
+            error: error(),
+            cause: Some(RefusalCause::Denied),
+        })
+        .as_deref(),
+        Some("Checking access to Pods…")
+    );
+    assert_eq!(
+        title(SyncState::Failed {
+            error: error(),
+            cause: Some(RefusalCause::Denied),
+        })
+        .as_deref(),
+        Some("No access to Pods")
+    );
+    for cause in [Some(RefusalCause::NotFound), None] {
+        assert_eq!(
+            title(SyncState::Failed {
+                error: error(),
+                cause
+            }),
+            None
+        );
+        assert_eq!(
+            title(SyncState::RetryingRefusal {
+                error: error(),
+                cause
+            }),
+            None
+        );
+    }
 }
 
 // covers UP-20
@@ -1221,6 +1459,7 @@ async fn banners_say_what_the_rows_cover(cx: &mut TestAppContext) {
                 &rows,
                 SyncState::Failed {
                     error: "connection refused".into(),
+                    cause: None,
                 },
                 2,
             ),

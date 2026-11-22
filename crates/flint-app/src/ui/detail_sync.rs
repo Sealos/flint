@@ -111,11 +111,11 @@ impl Freshness {
         const STALE: &str = "This object may be out of date";
         match &self.state {
             SyncState::Reconnecting { error: Some(e) }
-            | SyncState::RetryingRefusal { error: e } => {
+            | SyncState::RetryingRefusal { error: e, .. } => {
                 format!("Reconnecting. {STALE}: {}", show(e))
             }
             SyncState::Reconnecting { error: None } => format!("Reconnecting. {STALE}."),
-            SyncState::Failed { error } => {
+            SyncState::Failed { error, .. } => {
                 format!("The list failed and is retried. {STALE}: {}", show(error))
             }
             SyncState::Synced => format!("Connection restored. {STALE} until it is fetched."),
@@ -150,6 +150,8 @@ fn clock(at: Timestamp, tz: &TimeZone, now: Timestamp) -> String {
 
 #[cfg(test)]
 mod tests {
+    use flint_core::RefusalCause;
+
     use super::*;
 
     fn reconnecting() -> SyncState {
@@ -160,8 +162,14 @@ mod tests {
     fn every_state_that_is_not_current_is_stale() {
         for state in [
             reconnecting(),
-            SyncState::RetryingRefusal { error: "x".into() },
-            SyncState::Failed { error: "x".into() },
+            SyncState::RetryingRefusal {
+                error: "x".into(),
+                cause: Some(RefusalCause::Denied),
+            },
+            SyncState::Failed {
+                error: "x".into(),
+                cause: Some(RefusalCause::Denied),
+            },
             SyncState::Unavailable,
         ] {
             assert!(Freshness::new(state.clone()).is_stale(), "{state:?}");
@@ -225,6 +233,7 @@ mod tests {
     fn only_the_server_error_goes_through_show() {
         let f = Freshness::new(SyncState::Failed {
             error: "secret".into(),
+            cause: Some(RefusalCause::Denied),
         });
         let text = f.headline_with(|_| "hidden".to_owned());
         assert!(text.ends_with(": hidden"), "{text}");

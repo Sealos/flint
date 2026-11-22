@@ -14,6 +14,7 @@ use super::source::{EventStream, Source, WatchRequest};
 use super::*;
 use crate::discovery::tests::kind;
 use crate::read::KindInfo;
+use crate::store::RefusalCause;
 use crate::table::tests::pod_table;
 use crate::table::{FetchError, WireEvent, WireObject};
 
@@ -809,13 +810,57 @@ fn assert_clean(text: &str) {
 fn reconnecting_error(snap: &KindSnapshot) -> Option<&str> {
     match &snap.state {
         SyncState::Reconnecting { error } => error.as_deref(),
-        SyncState::RetryingRefusal { error } => Some(error),
+        SyncState::RetryingRefusal { error, .. } => Some(error),
         _ => None,
     }
 }
 
 fn refusal(text: &str) -> SyncState {
-    SyncState::RetryingRefusal { error: text.into() }
+    SyncState::RetryingRefusal {
+        error: text.into(),
+        cause: Some(RefusalCause::Denied),
+    }
+}
+
+// covers UP-27
+#[tokio::test(start_paused = true)]
+async fn a_refused_list_carries_its_cause_from_retry_to_failure() {
+    let cases: [(fn() -> FetchError, RefusalCause); 2] = [
+        (forbidden, RefusalCause::Denied),
+        (
+            || FetchError::NotFound("not found".into()),
+            RefusalCause::NotFound,
+        ),
+    ];
+    for (error, expected) in cases {
+        let fake = Fake::new();
+        for _ in 0..10 {
+            fake.list_error("pods", error());
+        }
+        let (task, mut rx) = start_engine(&fake, pods(), Feed::Watch);
+        let snap = until(&mut rx, |s| {
+            !matches!(s.state, SyncState::Idle | SyncState::Loading)
+        })
+        .await;
+        let SyncState::RetryingRefusal { cause, .. } = &snap.state else {
+            panic!("a refusal being retried: {:?}", snap.state);
+        };
+        assert_eq!(*cause, Some(expected));
+        let snap = until(&mut rx, |s| {
+            assert!(
+                !matches!(s.state, SyncState::Reconnecting { .. }),
+                "a refusal never reports a broken connection: {:?}",
+                s.state
+            );
+            matches!(s.state, SyncState::Failed { .. })
+        })
+        .await;
+        let SyncState::Failed { cause, .. } = &snap.state else {
+            unreachable!()
+        };
+        assert_eq!(*cause, Some(expected));
+        task.abort();
+    }
 }
 
 // covers UP-27
@@ -830,7 +875,7 @@ async fn a_refused_list_being_retried_is_typed_and_clean() {
         !matches!(s.state, SyncState::Idle | SyncState::Loading)
     })
     .await;
-    let SyncState::RetryingRefusal { error } = &snap.state else {
+    let SyncState::RetryingRefusal { error, .. } = &snap.state else {
         panic!("a refusal being retried: {:?}", snap.state);
     };
     assert_clean(error);
@@ -870,7 +915,9 @@ fn a_merged_list_reports_a_connection_error_over_a_refusal() {
     let refused = refusal("forbidden");
     let pick = |states: &[&SyncState]| engine::most_troubled(states.iter().copied()).cloned();
     assert_eq!(pick(&[&refused, &relist, &down]), Some(down.clone()));
-    assert_eq!(pick(&[&relist, &refused]), Some(refused.clone()));
+    // A denial must not hide another namespace's recovery.
+    assert_eq!(pick(&[&relist, &refused]), Some(relist.clone()));
+    assert_eq!(pick(&[&SyncState::Synced, &refused]), Some(refused.clone()));
     assert_eq!(pick(&[&SyncState::Synced, &relist]), Some(relist));
     assert_eq!(pick(&[&SyncState::Synced]), None);
 }
@@ -949,7 +996,7 @@ async fn a_failed_list_shows_clean_text() {
     let snap = until(&mut rx, |s| reconnecting_error(s).is_some()).await;
     assert_clean(reconnecting_error(&snap).unwrap());
     let snap = until(&mut rx, |s| matches!(s.state, SyncState::Failed { .. })).await;
-    let SyncState::Failed { error } = &snap.state else {
+    let SyncState::Failed { error, .. } = &snap.state else {
         unreachable!()
     };
     assert_clean(error);
@@ -968,7 +1015,7 @@ async fn a_namespace_limited_list_shows_clean_text() {
         matches!(s.state, SyncState::Failed { .. }) && s.limited_to.is_some()
     })
     .await;
-    let SyncState::Failed { error } = &snap.state else {
+    let SyncState::Failed { error, .. } = &snap.state else {
         unreachable!()
     };
     assert_clean(error);
@@ -1215,7 +1262,7 @@ async fn a_namespace_limited_user_gets_the_namespaces_they_may_list_merged() {
 
     // Nothing to fall back to yet: say how to get a list.
     let snap = until(&mut rx, |s| matches!(s.state, SyncState::Failed { .. })).await;
-    let SyncState::Failed { error } = &snap.state else {
+    let SyncState::Failed { error, .. } = &snap.state else {
         unreachable!()
     };
     assert!(error.contains("namespace filter"), "{error}");

@@ -458,6 +458,7 @@ async fn a_pod_open_through_an_outage_stays_marked_until_fetched(cx: &mut TestAp
         &t,
         SyncState::RetryingRefusal {
             error: "forbidden for now".into(),
+            cause: Some(flint_core::RefusalCause::Denied),
         },
     );
     wait_for_stale(cx, &t, "forbidden for now").await;

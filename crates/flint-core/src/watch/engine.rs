@@ -32,7 +32,7 @@ use tokio::time::{Instant, sleep, sleep_until};
 use crate::cluster::ClusterId;
 use crate::read::{KindId, KindInfo};
 use crate::redact;
-use crate::store::{Feed, KindSnapshot, NamespaceLimit, Store, SyncState};
+use crate::store::{Feed, KindSnapshot, NamespaceLimit, RefusalCause, Store, SyncState};
 use crate::table::{Column, EventType, FetchError, ListFormat, unix_now};
 
 use super::hub::Hub;
@@ -461,26 +461,28 @@ impl Engine {
     async fn fail(&mut self, error: FetchError, backoff: &mut Backoff) {
         tracing::debug!(cluster = %self.cluster, kind = %self.id, namespace = ?self.namespace,
             error = %sync_error_text(error.message()), "watch error");
-        let delay = match &error {
-            FetchError::Denied(m) | FetchError::NotFound(m) => {
+        let delay = match refusal_of(&error) {
+            Some((m, cause)) => {
                 let final_ = self.denial_is_final();
                 self.denials += 1;
                 if final_ {
                     self.set_state(SyncState::Failed {
                         error: sync_error_text(m),
+                        cause: Some(cause),
                     });
                     self.denied_wait.next()
                 } else {
                     self.set_state(SyncState::RetryingRefusal {
                         error: sync_error_text(m),
+                        cause: Some(cause),
                     });
                     let n = self.denials.saturating_sub(1).min(8);
                     jittered(self.config.denied_backoff_min * 2u32.pow(n))
                 }
             }
-            other => {
+            None => {
                 self.set_state(SyncState::Reconnecting {
-                    error: Some(sync_error_text(&other.to_string())),
+                    error: Some(sync_error_text(&error.to_string())),
                 });
                 backoff.next()
             }
@@ -494,8 +496,13 @@ impl Engine {
     async fn watch_refused(&mut self, error: FetchError, retrying: bool) -> Option<Option<String>> {
         if !retrying && self.watch_denials < self.config.transient_denials {
             self.watch_denials += 1;
-            self.set_state(SyncState::RetryingRefusal {
-                error: sync_error_text(&error.to_string()),
+            let text = sync_error_text(&error.to_string());
+            self.set_state(match refusal_of(&error) {
+                Some((_, cause)) => SyncState::RetryingRefusal {
+                    error: text,
+                    cause: Some(cause),
+                },
+                None => SyncState::Reconnecting { error: Some(text) },
             });
             let n = self.watch_denials.saturating_sub(1).min(8);
             self.pause(jittered(self.config.denied_backoff_min * 2u32.pow(n)))
@@ -535,7 +542,7 @@ impl Engine {
                 {
                     // Not in all namespaces: list namespace by namespace until the
                     // all-namespaces list works again.
-                    if !self.run_namespaced(reason).await {
+                    if !self.run_namespaced(reason, RefusalCause::Denied).await {
                         return;
                     }
                     self.store = Store::new(self.kind.namespaced);
@@ -847,7 +854,7 @@ impl Engine {
     /// scope as it changes, and tries the all-namespaces list again now and then (the refusal
     /// may have been transient, or the user got more rights). Returns `true` when that list
     /// works again; lanes stop when this returns or the task stops.
-    async fn run_namespaced(&mut self, reason: String) -> bool {
+    async fn run_namespaced(&mut self, reason: String, cause: RefusalCause) -> bool {
         let Some(mut scope) = self.scope.clone() else {
             return false;
         };
@@ -872,7 +879,14 @@ impl Engine {
             }
             // Rows are merged only for subscribers; status displays need the state alone.
             let listening = self.hub.listeners() > 0;
-            let merged = merge_lanes(&lanes, &reason, self.kind.namespaced, listening, None);
+            let merged = merge_lanes(
+                &lanes,
+                &reason,
+                cause,
+                self.kind.namespaced,
+                listening,
+                None,
+            );
             let state = merged.state.clone();
             // For a subscriber, synced is reported by the snapshot that carries the merged rows.
             if !listening || state != SyncState::Synced {
@@ -880,7 +894,7 @@ impl Engine {
             }
             self.set_feed(merged.feed);
             if self.hub.has_peeks() {
-                self.answer_namespaced_peeks(&lanes, &reason).await;
+                self.answer_namespaced_peeks(&lanes, &reason, cause).await;
             }
             if listening {
                 // At most one snapshot per interval, however many lanes change.
@@ -933,7 +947,12 @@ impl Engine {
     /// read must not change what status displays show. While it waits for the lanes (at most
     /// [`LANE_PEEK_WAIT`]), this task follows no scope change and publishes nothing; the lanes
     /// keep watching meanwhile.
-    async fn answer_namespaced_peeks(&self, lanes: &BTreeMap<String, Lane>, reason: &str) {
+    async fn answer_namespaced_peeks(
+        &self,
+        lanes: &BTreeMap<String, Lane>,
+        reason: &str,
+        cause: RefusalCause,
+    ) {
         let asked: Vec<(String, oneshot::Receiver<Arc<KindSnapshot>>)> = lanes
             .iter()
             .map(|(ns, lane)| (ns.clone(), lane.hub.peek()))
@@ -945,7 +964,14 @@ impl Engine {
                 answers.insert(ns, snapshot);
             }
         }
-        let merged = merge_lanes(lanes, reason, self.kind.namespaced, true, Some(&answers));
+        let merged = merge_lanes(
+            lanes,
+            reason,
+            cause,
+            self.kind.namespaced,
+            true,
+            Some(&answers),
+        );
         self.hub.answer_peeks(self.epoch, || KindSnapshot {
             cluster: self.cluster.clone(),
             kind: self.id.clone(),
@@ -1009,6 +1035,7 @@ const LANE_PEEK_WAIT: Duration = Duration::from_millis(250);
 fn merge_lanes(
     lanes: &BTreeMap<String, Lane>,
     reason: &str,
+    refusal: RefusalCause,
     namespaced: bool,
     with_rows: bool,
     answers: Option<&HashMap<String, Arc<KindSnapshot>>>,
@@ -1077,13 +1104,18 @@ fn merge_lanes(
         SyncState::Failed {
             error: match denied.first() {
                 Some(v) => match &v.state {
-                    SyncState::Failed { error } => error.clone(),
+                    SyncState::Failed { error, .. } => error.clone(),
                     _ => reason.to_owned(),
                 },
                 None => format!(
                     "{reason}. Pick the namespaces you may use in the namespace filter to list \
                      them one by one."
                 ),
+            },
+            cause: if denied.is_empty() {
+                Some(refusal)
+            } else {
+                shared_cause(denied.iter().map(|v| &v.state))
             },
         }
     } else if open
@@ -1092,7 +1124,14 @@ fn merge_lanes(
     {
         SyncState::Loading
     } else if let Some(state) = most_troubled(open.iter().map(|v| &v.state)) {
-        state.clone()
+        match state {
+            // The message of the most useful lane, the cause of them all.
+            SyncState::RetryingRefusal { error, .. } => SyncState::RetryingRefusal {
+                error: error.clone(),
+                cause: shared_cause(views.iter().map(|v| &v.state)),
+            },
+            other => other.clone(),
+        }
     } else if lagging {
         SyncState::Reconnecting { error: None }
     } else {
@@ -1120,14 +1159,39 @@ fn merge_lanes(
     }
 }
 
+/// The cause every refusal among `states` shares, retrying or settled. `None` when they differ.
+fn shared_cause<'a>(states: impl Iterator<Item = &'a SyncState>) -> Option<RefusalCause> {
+    let mut causes = states.filter_map(|state| match state {
+        SyncState::Failed { cause, .. } | SyncState::RetryingRefusal { cause, .. } => Some(*cause),
+        _ => None,
+    });
+    let first = causes.next()??;
+    causes.all(|cause| cause == Some(first)).then_some(first)
+}
+
+/// The server's message and cause when `error` is a refusal (403 or 404).
+fn refusal_of(error: &FetchError) -> Option<(&str, RefusalCause)> {
+    match error {
+        FetchError::Denied(m) => Some((m, RefusalCause::Denied)),
+        FetchError::NotFound(m) => Some((m, RefusalCause::NotFound)),
+        _ => None,
+    }
+}
+
 /// The state a merged list reports for lanes that are retrying: a connection error first, so a
-/// refusal in one namespace cannot hide it, then a refusal, then a routine relist.
+/// refusal in one namespace cannot hide it, then a refusal that is not a denial, then a relist,
+/// then a denial. A denial ranks last so it cannot hide another lane's recovery, and is reported
+/// only when no lane is reconnecting and every refusing lane is denied.
 pub(super) fn most_troubled<'a>(
     states: impl Iterator<Item = &'a SyncState>,
 ) -> Option<&'a SyncState> {
     states
         .filter_map(|state| match state {
             SyncState::Reconnecting { error: Some(_) } => Some((0, state)),
+            SyncState::RetryingRefusal {
+                cause: Some(RefusalCause::Denied),
+                ..
+            } => Some((3, state)),
             SyncState::RetryingRefusal { .. } => Some((1, state)),
             SyncState::Reconnecting { error: None } => Some((2, state)),
             _ => None,
@@ -1271,9 +1335,9 @@ mod tests {
         );
         lanes.insert(
             "c".to_owned(),
-            lane(SyncState::Failed { error: "no".into() }, &[], &cols, "c"),
+            lane(failed("no", RefusalCause::Denied), &[], &cols, "c"),
         );
-        let merged = merge_lanes(&lanes, "forbidden", true, true, None);
+        let merged = merge_lanes(&lanes, "forbidden", RefusalCause::Denied, true, true, None);
         assert_eq!(names(&merged), ["x", "z", "y"]);
         assert_eq!(merged.state, SyncState::Synced);
         let limit = merged.limited_to.unwrap();
@@ -1290,7 +1354,7 @@ mod tests {
         // The least ready lane decides the state.
         lanes.insert("d".to_owned(), lane(SyncState::Loading, &[], &cols, "d"));
         assert_eq!(
-            merge_lanes(&lanes, "forbidden", true, true, None).state,
+            merge_lanes(&lanes, "forbidden", RefusalCause::Denied, true, true, None).state,
             SyncState::Loading
         );
     }
@@ -1298,12 +1362,127 @@ mod tests {
     // covers UP-21
     #[tokio::test]
     async fn without_lanes_the_list_fails_and_says_how_to_pick_namespaces() {
-        let merged = merge_lanes(&BTreeMap::new(), "forbidden", true, true, None);
-        let SyncState::Failed { error } = merged.state else {
+        let merged = merge_lanes(
+            &BTreeMap::new(),
+            "forbidden",
+            RefusalCause::Denied,
+            true,
+            true,
+            None,
+        );
+        let SyncState::Failed { error, cause } = merged.state else {
             panic!("failed expected");
         };
         assert!(error.starts_with("forbidden") && error.contains("namespace filter"));
+        assert_eq!(cause, Some(RefusalCause::Denied));
         assert!(merged.rows.is_empty());
+
+        // The cause is the original refusal's, not an assumed denial.
+        let merged = merge_lanes(
+            &BTreeMap::new(),
+            "not found",
+            RefusalCause::NotFound,
+            true,
+            true,
+            None,
+        );
+        assert!(matches!(
+            merged.state,
+            SyncState::Failed {
+                cause: Some(RefusalCause::NotFound),
+                ..
+            }
+        ));
+    }
+
+    fn failed(error: &str, cause: RefusalCause) -> SyncState {
+        SyncState::Failed {
+            error: error.into(),
+            cause: Some(cause),
+        }
+    }
+
+    fn retrying(error: &str, cause: RefusalCause) -> SyncState {
+        SyncState::RetryingRefusal {
+            error: error.into(),
+            cause: Some(cause),
+        }
+    }
+
+    fn merged_state(states: Vec<SyncState>) -> SyncState {
+        let cols = columns();
+        let lanes: BTreeMap<String, Lane> = states
+            .into_iter()
+            .zip(["a", "b", "c"])
+            .map(|(state, ns)| (ns.to_owned(), lane(state, &[], &cols, ns)))
+            .collect();
+        merge_lanes(&lanes, "forbidden", RefusalCause::Denied, true, true, None).state
+    }
+
+    fn cause_of(state: &SyncState) -> Option<RefusalCause> {
+        match state {
+            SyncState::Failed { cause, .. } | SyncState::RetryingRefusal { cause, .. } => *cause,
+            other => panic!("a refusal expected: {other:?}"),
+        }
+    }
+
+    // covers UP-27
+    #[tokio::test]
+    async fn merged_lanes_report_denied_only_when_every_refused_lane_is_denied() {
+        use RefusalCause::{Denied, NotFound};
+        let all_denied = merged_state(vec![failed("x", Denied), failed("y", Denied)]);
+        assert_eq!(cause_of(&all_denied), Some(Denied));
+        let all_missing = merged_state(vec![failed("x", NotFound), failed("y", NotFound)]);
+        assert_eq!(cause_of(&all_missing), Some(NotFound));
+        // In either order: the first lane must not decide.
+        for states in [
+            vec![failed("x", Denied), failed("y", NotFound)],
+            vec![failed("x", NotFound), failed("y", Denied)],
+        ] {
+            let mixed = merged_state(states);
+            assert!(matches!(mixed, SyncState::Failed { .. }), "{mixed:?}");
+            assert_eq!(cause_of(&mixed), None);
+        }
+    }
+
+    // covers UP-27
+    #[tokio::test]
+    async fn merged_lanes_being_retried_do_not_claim_a_denial_for_a_missing_lane() {
+        use RefusalCause::{Denied, NotFound};
+        let all_denied = merged_state(vec![retrying("x", Denied), retrying("y", Denied)]);
+        assert_eq!(cause_of(&all_denied), Some(Denied));
+        // Mixed is `None` whichever lane comes first and whether a lane retries or has settled.
+        for states in [
+            vec![retrying("x", Denied), retrying("y", NotFound)],
+            vec![retrying("x", NotFound), retrying("y", Denied)],
+            vec![failed("x", NotFound), retrying("y", Denied)],
+            vec![failed("x", Denied), retrying("y", NotFound)],
+        ] {
+            let mixed = merged_state(states);
+            assert!(
+                matches!(mixed, SyncState::RetryingRefusal { .. }),
+                "{mixed:?}"
+            );
+            assert_eq!(cause_of(&mixed), None);
+        }
+        let same = merged_state(vec![failed("x", Denied), retrying("y", Denied)]);
+        assert_eq!(cause_of(&same), Some(Denied));
+    }
+
+    // covers UP-27
+    #[tokio::test]
+    async fn a_relist_in_one_lane_is_not_hidden_by_a_denial_in_another() {
+        use RefusalCause::{Denied, NotFound};
+        let relist = SyncState::Reconnecting { error: None };
+        for states in [
+            vec![relist.clone(), retrying("x", Denied)],
+            vec![retrying("x", Denied), relist.clone()],
+        ] {
+            assert_eq!(merged_state(states), relist);
+        }
+        // Other refusals already read as reconnecting and keep their error.
+        let missing = merged_state(vec![relist.clone(), retrying("x", NotFound)]);
+        assert_eq!(cause_of(&missing), Some(NotFound));
     }
 
     #[test]
