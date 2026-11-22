@@ -66,8 +66,10 @@ pub const CRITICAL_RESERVED_PER_CLUSTER: usize = 64;
 /// The longest name kept in a key: the Kubernetes limit for a DNS subdomain name.
 pub const MAX_NAME_BYTES: usize = 253;
 
-/// The label the Deployment controller puts on its ReplicaSets' pods.
-const POD_TEMPLATE_HASH: &str = "pod-template-hash";
+/// The API group of an `apiVersion`, empty for the core group.
+fn api_group(api_version: &str) -> &str {
+    api_version.rsplit_once('/').map_or("", |(group, _)| group)
+}
 
 /// Every kind of problem, for tracking which have had their first check.
 const ALL_KINDS: [ProblemKind; 4] = [
@@ -116,26 +118,32 @@ pub struct AlertOwner {
 impl AlertOwner {
     /// The controller of an object, seen through a ReplicaSet to its Deployment.
     ///
-    /// A pod names only its ReplicaSet, which changes on each rollout. The Deployment controller
-    /// names a ReplicaSet `<deployment>-<pod-template-hash>`, so the Deployment is known when
-    /// the pod's hash label matches that suffix. Otherwise the ReplicaSet itself is the owner.
-    pub fn of_meta(meta: &ObjectMeta) -> Option<Self> {
+    /// A pod names only its ReplicaSet, which changes on each rollout. The Deployment is named
+    /// only when `replica_set` is that ReplicaSet's metadata and carries a controller owner
+    /// reference of kind Deployment: an orphaned ReplicaSet keeps its name and pod template
+    /// hash, so those prove nothing. Without verified metadata the ReplicaSet is the owner.
+    pub fn of_meta(meta: &ObjectMeta, replica_set: Option<&ObjectMeta>) -> Option<Self> {
         let owners = meta.owner_references.as_ref()?;
         let owner = owners.iter().find(|o| o.controller == Some(true))?;
-        let group = owner
-            .api_version
-            .rsplit_once('/')
-            .map_or("", |(group, _)| group);
-        let deployment = (group == "apps" && owner.kind == "ReplicaSet")
-            .then(|| meta.labels.as_ref()?.get(POD_TEMPLATE_HASH))
-            .flatten()
-            .and_then(|hash| owner.name.strip_suffix(hash.as_str()))
-            .and_then(|rest| rest.strip_suffix('-'))
-            .filter(|name| !name.is_empty());
+        let group = api_group(&owner.api_version);
+        if group == "apps" && owner.kind == "ReplicaSet" {
+            let deployment = replica_set
+                .filter(|rs| rs.name.as_deref() == Some(owner.name.as_str()))
+                .and_then(|rs| rs.owner_references.as_ref())
+                .and_then(|refs| refs.iter().find(|o| o.controller == Some(true)))
+                .filter(|o| o.kind == "Deployment" && api_group(&o.api_version) == "apps");
+            if let Some(deployment) = deployment {
+                return Some(Self {
+                    group: "apps".to_owned(),
+                    kind: "Deployment".to_owned(),
+                    name: deployment.name.clone(),
+                });
+            }
+        }
         Some(Self {
             group: group.to_owned(),
-            kind: deployment.map_or_else(|| owner.kind.clone(), |_| "Deployment".to_owned()),
-            name: deployment.unwrap_or(&owner.name).to_owned(),
+            kind: owner.kind.clone(),
+            name: owner.name.clone(),
         })
     }
 
@@ -315,7 +323,7 @@ impl AlertEvent {
 
 fn resolved_text(kind: ProblemKind) -> &'static str {
     match kind {
-        ProblemKind::CrashLoop => "Container is no longer crashing",
+        ProblemKind::CrashLoop => "Crash loop no longer reported",
         ProblemKind::OomKilled => "Out-of-memory kill no longer reported",
         ProblemKind::NodeNotReady => "Node no longer reported as not ready",
         ProblemKind::JobFailed => "Job failure no longer reported",

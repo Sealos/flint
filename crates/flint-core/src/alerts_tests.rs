@@ -385,75 +385,96 @@ fn owners_are_read_from_metadata() {
             "apiVersion": api, "kind": kind, "name": name, "uid": "u", "controller": controller,
         }])
     };
-    let hash = json!({"pod-template-hash": "abc12"});
-    let none = json!({});
     let rs = |name: &str| refs("apps/v1", "ReplicaSet", name, true);
-    let cases: Vec<(&str, serde_json::Value, &serde_json::Value, Expected)> = vec![
+    let rs_meta = |name: &str, owners: serde_json::Value| {
+        Some(json!({"name": name, "ownerReferences": owners}))
+    };
+    let owned_by_deployment = |deployment: &str, rs_name: &str| {
+        rs_meta(rs_name, refs("apps/v1", "Deployment", deployment, true))
+    };
+    let cases: Vec<(&str, serde_json::Value, Option<serde_json::Value>, Expected)> = vec![
         (
             "deployment",
             rs("web-abc12"),
-            &hash,
+            owned_by_deployment("web", "web-abc12"),
             Some(("apps", "Deployment", "web")),
         ),
         (
             "hyphenated deployment",
             rs("my-web-abc12"),
-            &hash,
+            owned_by_deployment("my-web", "my-web-abc12"),
             Some(("apps", "Deployment", "my-web")),
         ),
         (
-            "hash does not match",
-            rs("web-other"),
-            &hash,
-            Some(("apps", "ReplicaSet", "web-other")),
-        ),
-        (
-            "no hash label",
+            "no replicaset metadata",
             rs("web-abc12"),
-            &none,
+            None,
             Some(("apps", "ReplicaSet", "web-abc12")),
         ),
         (
-            "name is only the hash",
-            rs("-abc12"),
-            &hash,
-            Some(("apps", "ReplicaSet", "-abc12")),
+            "orphaned replicaset",
+            rs("web-abc12"),
+            rs_meta("web-abc12", json!([])),
+            Some(("apps", "ReplicaSet", "web-abc12")),
+        ),
+        (
+            "deployment reference is not the controller",
+            rs("web-abc12"),
+            rs_meta("web-abc12", refs("apps/v1", "Deployment", "web", false)),
+            Some(("apps", "ReplicaSet", "web-abc12")),
+        ),
+        (
+            "replicaset owned by another kind",
+            rs("web-abc12"),
+            rs_meta("web-abc12", refs("apps/v1", "StatefulSet", "web", true)),
+            Some(("apps", "ReplicaSet", "web-abc12")),
+        ),
+        (
+            "metadata of a different replicaset",
+            rs("web-abc12"),
+            owned_by_deployment("web", "web-other"),
+            Some(("apps", "ReplicaSet", "web-abc12")),
         ),
         (
             "other api group",
             refs("example.io/v1", "ReplicaSet", "web-abc12", true),
-            &hash,
+            owned_by_deployment("web", "web-abc12"),
             Some(("example.io", "ReplicaSet", "web-abc12")),
         ),
         (
             "statefulset",
             refs("apps/v1", "StatefulSet", "db", true),
-            &none,
+            None,
             Some(("apps", "StatefulSet", "db")),
         ),
         (
             "core group",
             refs("v1", "ReplicationController", "rc", true),
-            &none,
+            None,
             Some(("", "ReplicationController", "rc")),
         ),
         (
             "not a controller",
             refs("apps/v1", "StatefulSet", "db", false),
-            &none,
+            None,
             None,
         ),
-        ("no owners", json!([]), &none, None),
+        ("no owners", json!([]), None, None),
     ];
-    for (case, owners, labels, expected) in cases {
-        let meta: ObjectMeta =
-            serde_json::from_value(json!({"ownerReferences": owners, "labels": labels})).unwrap();
+    for (case, owners, replica_set, expected) in cases {
+        let meta: ObjectMeta = serde_json::from_value(json!({"ownerReferences": owners})).unwrap();
+        let replica_set: Option<ObjectMeta> =
+            replica_set.map(|rs| serde_json::from_value(rs).unwrap());
         let expected = expected.map(|(group, kind, name)| AlertOwner {
             group: group.into(),
             kind: kind.into(),
             name: name.into(),
         });
-        assert_eq!(AlertOwner::of_meta(&meta), expected, "{case}");
+        assert_eq!(
+            AlertOwner::of_meta(&meta, replica_set.as_ref()),
+            expected,
+            "{case}"
+        );
     }
 }
 
@@ -618,10 +639,7 @@ fn text_is_flints_wording_without_names() {
             AlertEvent::Raised(alert.clone()),
             "Container keeps crashing and restarting (2 affected)",
         ),
-        (
-            AlertEvent::Resolved(alert),
-            "Container is no longer crashing",
-        ),
+        (AlertEvent::Resolved(alert), "Crash loop no longer reported"),
         (
             AlertEvent::Summary(summary),
             "2 new problems, 1 resolved problem",
