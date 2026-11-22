@@ -9,6 +9,7 @@ use gpui_kit::TestAppContext;
 use gpui_kit::test::TestAppContextExt as _;
 use serde_json::json;
 
+use crate::ui::activity_view::{SETUP_NOTE, TEST_PROMPT, setup_steps};
 use crate::ui::dock::DockTab;
 use crate::ui::registry::ActionError;
 use crate::ui::support_tests::{TestWorkspace, WAIT, open_workspace};
@@ -178,4 +179,85 @@ async fn show_agent_activity_works_for_any_context(cx: &mut TestAppContext) {
     );
     t.wait_for_label(cx, "activity-count", "1 call").await;
     assert!(t.find(cx, "activity-empty").is_none());
+}
+
+// covers UP-16: an exposed cluster no agent has called says how to connect one, and the test
+// prompt copies from the keyboard: Tab reaches the tab's copy button, Enter presses it. The steps
+// go away with the first call; a cluster that is not exposed never shows them.
+#[gpui_kit::test]
+async fn an_exposed_cluster_without_calls_shows_setup_steps(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.dispatch(
+        cx,
+        "workspace::ShowAgentActivity",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
+    t.wait_for_element(cx, "activity-empty").await;
+    assert!(t.find(cx, "activity-setup").is_none());
+
+    let server = t.server.clone();
+    t.model.update(cx, |m, cx| {
+        m.expose_to_ai("kind-alpha".into(), server, AiScope::default());
+        cx.notify();
+    });
+    t.wait_for_element(cx, "activity-setup").await;
+    assert_eq!(
+        t.label(cx, "activity-test-prompt").as_deref(),
+        Some(TEST_PROMPT)
+    );
+    assert_eq!(
+        t.label(cx, "activity-setup-note").as_deref(),
+        Some(SETUP_NOTE)
+    );
+
+    t.focus_workspace(cx);
+    for _ in 0..8 {
+        if t.find(cx, "activity-copy-prompt")
+            .is_some_and(|b| b.focused() == Some(true))
+        {
+            break;
+        }
+        t.press(cx, "tab");
+    }
+    assert_eq!(
+        t.find(cx, "activity-copy-prompt").unwrap().focused(),
+        Some(true)
+    );
+    t.press(cx, "enter");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|i| i.text()).as_deref(),
+        Some(TEST_PROMPT)
+    );
+
+    set_activity(
+        cx,
+        &t,
+        vec![record(1_000, "kind-alpha", "list_resource_kinds")],
+    );
+    t.wait_for_label(cx, "activity-count", "1 call").await;
+    assert!(t.find(cx, "activity-setup").is_none());
+    assert!(t.find(cx, "activity-copy-prompt").is_none());
+}
+
+// The steps follow the README: the app bundle's binary behind a stable path on macOS, the
+// AppImage on Linux.
+#[test]
+fn setup_steps_match_the_documented_commands() {
+    let readme = include_str!("../../../../README.md");
+    let macos = setup_steps(true);
+    assert!(
+        macos[0].command.contains(
+            "sudo ln -sf /Applications/Flint.app/Contents/MacOS/flint /usr/local/bin/flint"
+        )
+    );
+    for step in macos[1..].iter().chain(setup_steps(false)) {
+        assert!(readme.contains(step.command), "{}", step.command);
+    }
+    assert!(
+        readme.contains(
+            "sudo ln -sf /Applications/Flint.app/Contents/MacOS/flint /usr/local/bin/flint"
+        )
+    );
 }

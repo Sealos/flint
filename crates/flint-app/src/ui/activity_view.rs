@@ -11,6 +11,7 @@ use flint_core::activity::{self, ActivityRecord, Attribution, ExpectedServer, Ou
 use flint_core::settings::server_identity;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -20,6 +21,7 @@ use jiff::tz::TimeZone;
 
 use super::clusters::ClustersModel;
 use super::dock::{DockItem, TabKey, TabStatus};
+use super::log_view::LatestCopy;
 use super::registry::{self, EditAiScope};
 
 /// A row's height.
@@ -32,6 +34,48 @@ pub const UNVERIFIED: &str = "server not verified";
 const UNVERIFIED_HELP: &str = "Recorded for this context, but Flint cannot prove it reached this \
                                server. The activity key may be unavailable, or the call may come \
                                from a flint mcp process started before an upgrade: restart it.";
+/// A first call to try: it reads only which clusters are exposed, and names none, so no cluster
+/// name from a kubeconfig ends up in a prompt.
+pub const TEST_PROMPT: &str = "Using Flint's MCP tools, call list_clusters and tell me which \
+                               clusters you can see. Only read; do not change anything.";
+/// What the setup steps must not let a reader assume.
+pub const SETUP_NOTE: &str = "The agent reads only what is exposed through Flint. Masking is \
+                              pattern-based, so a credential in an unusual format can get \
+                              through. Activity logging is best-effort, so a call may be missing \
+                              here.";
+/// The step that leads to [`TEST_PROMPT`].
+const TEST_STEP: &str = "Ask your agent to run this read-only check. The call should appear \
+                         here. If this cluster is missing, list_clusters says which kubeconfig \
+                         files the server read.";
+
+/// One setup step: what to do, and the command for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetupStep {
+    pub text: &'static str,
+    pub command: &'static str,
+}
+
+/// How to connect an MCP client on this platform, as the README documents it.
+pub fn setup_steps(macos: bool) -> &'static [SetupStep] {
+    const MACOS: &[SetupStep] = &[
+        SetupStep {
+            text: "Link the app's binary to a stable path:",
+            command: "sudo mkdir -p /usr/local/bin && sudo ln -sf \
+                      /Applications/Flint.app/Contents/MacOS/flint /usr/local/bin/flint",
+        },
+        SetupStep {
+            text: "Register it with Claude Code. Other MCP clients take the same command, \
+                   /usr/local/bin/flint mcp:",
+            command: "claude mcp add flint -- /usr/local/bin/flint mcp",
+        },
+    ];
+    const LINUX: &[SetupStep] = &[SetupStep {
+        text: "Register the AppImage with Claude Code. Other MCP clients take the same command. \
+               Without FUSE, see the README:",
+        command: "claude mcp add flint -- \"$HOME/.local/bin/flint\" mcp",
+    }];
+    if macos { MACOS } else { LINUX }
+}
 
 /// One call, as the view shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,6 +260,8 @@ pub struct ActivityView {
     tz: TimeZone,
     /// The rows shown, rebuilt when the model changes.
     rows: Vec<ActivityRow>,
+    /// The test prompt was copied: its button says so.
+    copied: bool,
     _observe: Subscription,
 }
 
@@ -241,6 +287,7 @@ impl ActivityView {
             scroll: UniformListScrollHandle::new(),
             tz: TimeZone::system(),
             rows: Vec::new(),
+            copied: false,
             _observe: observe,
         };
         view.refresh(cx);
@@ -267,6 +314,71 @@ impl ActivityView {
     #[cfg(any(test, feature = "automation"))]
     pub fn rows(&self) -> &[ActivityRow] {
         &self.rows
+    }
+
+    /// Edit > Copy while the setup steps show: the test prompt. As the latest copy, so a slower
+    /// copy of log lines asked for earlier cannot replace it.
+    fn copy_prompt(&mut self, _: &input::Copy, _: &mut Window, cx: &mut Context<Self>) {
+        let copy = LatestCopy::start(cx);
+        self.copied = LatestCopy::land(copy, TEST_PROMPT.to_owned(), cx);
+        cx.notify();
+    }
+
+    /// What to do on an exposed cluster no agent has called. The copy button takes the tab's
+    /// focus: Tab moves between panes here, so that is how the keyboard reaches it.
+    fn render_setup(&self, theme: &gpui_kit::component::Theme, cx: &Context<Self>) -> Div {
+        let step = |text: &'static str| div().text_color(theme.muted_foreground).child(text);
+        let code = |text: &'static str| {
+            div()
+                .p_2()
+                .rounded(theme.radius)
+                .bg(theme.muted)
+                .font_family(theme.mono_font_family.clone())
+                .child(text)
+        };
+        let label = if self.copied {
+            "Copied"
+        } else {
+            "Copy Test Prompt"
+        };
+        v_flex()
+            .on_action(cx.listener(Self::copy_prompt))
+            .gap_2()
+            .px_3()
+            .pb_3()
+            .text_xs()
+            .children(
+                setup_steps(cfg!(target_os = "macos"))
+                    .iter()
+                    .map(|s| v_flex().gap_1().child(step(s.text)).child(code(s.command))),
+            )
+            .child(
+                v_flex()
+                    .id("activity-test-prompt")
+                    .aria_label(TEST_PROMPT)
+                    .gap_1()
+                    .child(step(TEST_STEP))
+                    .child(code(TEST_PROMPT))
+                    .test_support(),
+            )
+            .child(
+                h_flex().child(
+                    Button::new("activity-copy-prompt")
+                        .outline()
+                        .xsmall()
+                        .label(label)
+                        .track_focus(&self.focus)
+                        .on_click(registry::on_click_in(self.focus.clone(), input::Copy)),
+                ),
+            )
+            .child(
+                div()
+                    .id("activity-setup-note")
+                    .text_color(theme.muted_foreground)
+                    .aria_label(SETUP_NOTE)
+                    .child(SETUP_NOTE)
+                    .test_support(),
+            )
     }
 
     fn render_rows(
@@ -395,9 +507,11 @@ impl Render for ActivityView {
                 .is_some()
         };
         let rows = self.rows.len();
+        let setup = exposed && rows == 0;
         v_flex()
             .id("agent-activity")
-            .track_focus(&self.focus)
+            // With the setup steps, their copy button holds the tab's focus.
+            .when(!setup, |el| el.track_focus(&self.focus))
             .size_full()
             .child(
                 h_flex()
@@ -437,6 +551,17 @@ impl Render for ActivityView {
                         .text_color(theme.muted_foreground)
                         .aria_label(EMPTY)
                         .child(EMPTY)
+                        .test_support(),
+                )
+            })
+            .when(setup, |el| {
+                el.child(
+                    div()
+                        .id("activity-setup")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .child(self.render_setup(&theme, cx))
                         .test_support(),
                 )
             })
