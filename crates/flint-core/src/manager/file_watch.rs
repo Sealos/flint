@@ -561,7 +561,7 @@ mod tests {
         let in_scan = scanned.clone();
         let h = harness(Box::new(move |scope| {
             lock(&in_scan).push(scope.config_dir.clone());
-            let _ = entered_tx.send(());
+            let _ = entered_tx.send(scope.config_dir.clone());
             let _ = lock(&released).recv();
             plan(&["/cfg"])
         }));
@@ -578,13 +578,12 @@ mod tests {
         }
         assert!(start.elapsed() < Duration::from_secs(1));
 
+        // The first scope is scanned again to confirm it settled, then the newest follows.
         drop(release);
-        h.caught_up.recv_timeout(WAIT).unwrap();
-        entered.recv_timeout(WAIT).unwrap();
+        while entered.recv_timeout(WAIT).unwrap() != Path::new("/three") {}
         let scanned = lock(&scanned).clone();
         assert!(!scanned.contains(&PathBuf::from("/one")), "{scanned:?}");
         assert!(!scanned.contains(&PathBuf::from("/two")), "{scanned:?}");
-        assert!(scanned.contains(&PathBuf::from("/three")), "{scanned:?}");
     }
 
     #[test]

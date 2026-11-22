@@ -67,9 +67,17 @@ async fn reloads_when_kubeconfig_changes() {
     std::fs::write(&tmp, kubeconfig(&["one", "two"])).unwrap();
     std::fs::rename(&tmp, &path).unwrap();
 
-    let second = tokio::time::timeout(Duration::from_secs(10), next_clusters(&events))
-        .await
-        .expect("reload after the file changed");
+    // The read that follows the watches starting can report the first list once more.
+    let second = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let clusters = next_clusters(&events).await;
+            if clusters != ["one"] {
+                return clusters;
+            }
+        }
+    })
+    .await
+    .expect("reload after the file changed");
     assert_eq!(second, ["one", "two"]);
 }
 
