@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::cluster_sets::{self, ClusterSet};
 use crate::thresholds::{self, ThresholdMetric, ThresholdSettings, Thresholds};
 
 pub const SETTINGS_FILE: &str = "settings.toml";
@@ -352,6 +353,14 @@ pub struct Settings {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub cluster_tags: Vec<TaggedCluster>,
+    /// Named sets of 2 to 5 clusters (ADR-0014), each member pinned to context and server. An
+    /// entry this version cannot use is left out, and stays in the file. Change them through
+    /// [`crate::cluster_sets`].
+    #[serde(
+        deserialize_with = "crate::cluster_sets::readable_cluster_sets",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub cluster_sets: Vec<ClusterSet>,
     /// Dashboard warning thresholds (ADR-0017): global values and overrides per context and
     /// server. Read them through [`Settings::thresholds_for`]. A value this version cannot use
     /// falls back on its own and is logged when the file loads.
@@ -384,6 +393,7 @@ impl Default for Settings {
             cluster_watch_mode: BTreeMap::new(),
             cluster_names: BTreeMap::new(),
             cluster_tags: Vec::new(),
+            cluster_sets: Vec::new(),
             thresholds: ThresholdSettings::default(),
             log_buffer_lines: DEFAULT_LOG_BUFFER_LINES,
             log_buffer_mib: DEFAULT_LOG_BUFFER_MIB,
@@ -641,6 +651,12 @@ pub fn load_settings(dir: &Path) -> Result<Settings, SettingsError> {
             tracing::warn!("settings.toml: {issue}");
         }
     }
+    if let Some(sets) = table.get(cluster_sets::SECTION_KEY) {
+        let ignored = cluster_sets::ignored_entries(sets);
+        if ignored > 0 {
+            tracing::warn!("settings.toml: ignoring {ignored} unusable cluster_sets entries");
+        }
+    }
     Ok(settings)
 }
 
@@ -697,6 +713,7 @@ const SETTINGS_KEYS: &[&str] = &[
     "cluster_watch_mode",
     "cluster_names",
     "cluster_tags",
+    cluster_sets::SECTION_KEY,
     thresholds::SECTION_KEY,
     "log_buffer_lines",
     "log_buffer_mib",
@@ -1160,7 +1177,7 @@ pub fn set_log_buffer_mib(dir: &Path, mib: u32) -> Result<Settings, SettingsErro
 /// The read, the edit and the write happen under [`SaveLock`], so saves from several Flint
 /// processes apply one after another, each to what the last one wrote. This can wait up to
 /// [`SAVE_LOCK_WAIT`]: call it off the UI thread and off async workers.
-fn edit_settings(
+pub(crate) fn edit_settings(
     dir: &Path,
     edit: impl FnOnce(&mut toml::Table, &Path) -> Result<(), SettingsError>,
 ) -> Result<Settings, SettingsError> {
