@@ -76,16 +76,27 @@ struct Server {
 impl Server {
     /// Starts `flint-mcp` with only the given kubeconfig list and config dir, and initializes it.
     fn start(kubeconfig: &std::ffi::OsStr, config_dir: &std::path::Path) -> Server {
+        Self::start_logging(kubeconfig, config_dir, "warn", Stdio::inherit())
+    }
+
+    /// Like [`Server::start`], with the given log filter and stderr.
+    fn start_logging(
+        kubeconfig: &std::ffi::OsStr,
+        config_dir: &std::path::Path,
+        log_filter: &str,
+        stderr: Stdio,
+    ) -> Server {
         let mut child = Command::new(env!("CARGO_BIN_EXE_flint-mcp"))
             .env("KUBECONFIG", kubeconfig)
             .env("FLINT_CONFIG_DIR", config_dir)
             // Keeps the log file out of the real home.
             .env("HOME", config_dir.join("home"))
             .env("XDG_STATE_HOME", config_dir.join("state"))
-            .env("FLINT_LOG", "warn")
+            .env("FLINT_LOG", log_filter)
+            .env_remove("RUST_LOG")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(stderr)
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
@@ -191,6 +202,201 @@ fn exposing(context: &str, server: &str) -> String {
     format!(
         "path = \"/usr/bin:/bin\"\n\n[[ai_exposed_clusters]]\ncontext = \"{context}\"\nserver = \"{server}\"\n"
     )
+}
+
+/// Starts a loopback API that serves just enough discovery for pods and answers everything else
+/// with a 404 `Status` naming the last path segment, as a real API server does.
+fn not_found_api() -> String {
+    api_with_failing_groups(&[], "")
+}
+
+/// [`not_found_api`] that also lists `groups`, each answering its discovery request with a 500
+/// `Status` whose reason and message hold `status_text`.
+fn api_with_failing_groups(groups: &[&str], status_text: &str) -> String {
+    let groups: Vec<Value> = groups
+        .iter()
+        .map(|name| {
+            let version = json!({"groupVersion": format!("{name}/v1"), "version": "v1"});
+            json!({"name": name, "versions": [version], "preferredVersion": version})
+        })
+        .collect();
+    let status_text = status_text.to_owned();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let (groups, status_text) = (groups.clone(), status_text.clone());
+            std::thread::spawn(move || answer_fake_api(stream, &groups, &status_text));
+        }
+    });
+    server
+}
+
+fn answer_fake_api(mut stream: std::net::TcpStream, groups: &[Value], status_text: &str) {
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).is_err() {
+        return;
+    }
+    let mut header = String::new();
+    while reader.read_line(&mut header).is_ok_and(|read| read > 0) && header.trim() != "" {
+        header.clear();
+    }
+    let target = request_line.split(' ').nth(1).unwrap_or("/");
+    let path = target.split('?').next().unwrap_or(target);
+    let (status, body) = match path {
+        "/version" => (
+            "200 OK",
+            json!({"major": "1", "minor": "33", "gitVersion": "v1.33.0"}),
+        ),
+        "/api" => ("200 OK", json!({"kind": "APIVersions", "versions": ["v1"]})),
+        "/apis" => (
+            "200 OK",
+            json!({"kind": "APIGroupList", "apiVersion": "v1", "groups": groups}),
+        ),
+        "/api/v1" => (
+            "200 OK",
+            json!({"kind": "APIResourceList", "groupVersion": "v1", "resources": [{
+                "name": "pods", "singularName": "pod", "namespaced": true, "kind": "Pod",
+                "verbs": ["get", "list", "watch"]
+            }]}),
+        ),
+        _ if !groups.is_empty() && path.starts_with("/apis/") => (
+            "500 Internal Server Error",
+            json!({
+                "kind": "Status", "apiVersion": "v1", "metadata": {}, "status": "Failure",
+                "message": status_text, "reason": status_text, "code": 500
+            }),
+        ),
+        _ => {
+            let name = path.rsplit('/').next().unwrap_or_default();
+            (
+                "404 Not Found",
+                json!({
+                    "kind": "Status", "apiVersion": "v1", "metadata": {}, "status": "Failure",
+                    "message": format!("pods \"{name}\" not found"), "reason": "NotFound",
+                    "details": {"name": name, "kind": "pods"}, "code": 404
+                }),
+            )
+        }
+    };
+    let body = body.to_string();
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+}
+
+/// Protocol traffic and API error bodies stay out of stderr at any log filter, on every path
+/// through the server: a request, its reply, an error reply, a line that does not parse and a
+/// 404 from the API. Flint's own debug events still print, so an empty stderr cannot pass.
+#[test]
+fn protocol_traffic_stays_out_of_stderr_at_any_log_filter() {
+    const MARKER: &str = "flint-protocol-marker";
+    const API_MARKER: &str = "flintcanary123";
+    let api = not_found_api();
+    // A bare target directive turns Flint's events off, so it has no control event to look for.
+    for (filter, flint_debug_shown) in [
+        ("debug", true),
+        ("trace", true),
+        ("kube_client=debug", false),
+        ("rmcp::service=debug,flint_core=debug", true),
+    ] {
+        let scratch = tempfile::tempdir().unwrap();
+        let kubeconfig = scratch.path().join("kubeconfig");
+        std::fs::write(
+            &kubeconfig,
+            format!("apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: {api}\nusers:\n- name: u\n  user:\n    token: fake\ncontexts:\n- name: dev\n  context:\n    cluster: c\n    user: u\n"),
+        )
+        .unwrap();
+        let config_dir = scratch.path().join("config");
+        std::fs::create_dir_all(config_dir.join("home")).unwrap();
+        std::fs::write(config_dir.join("settings.toml"), exposing("dev", &api)).unwrap();
+        let stderr_path = scratch.path().join("stderr.log");
+        let stderr = std::fs::File::create(&stderr_path).unwrap();
+        let mut server =
+            Server::start_logging(kubeconfig.as_os_str(), &config_dir, filter, stderr.into());
+        let stdin = server.stdin.as_mut().unwrap();
+        writeln!(stdin, "{{not json {MARKER}").unwrap();
+        stdin.flush().unwrap();
+        server.exchange(
+            "tools/call",
+            json!({"name": "list_clusters", "arguments": {"marker": MARKER}}),
+        );
+        // Answered with a protocol error rather than a failed tool result.
+        let unknown = server.exchange("tools/call", json!({"name": MARKER, "arguments": {}}));
+        assert!(unknown.get("error").is_some(), "{unknown}");
+        let (failed, reply) = server.call(
+            "get_resource",
+            json!({"cluster": "dev", "kind": "pods", "namespace": "web", "name": API_MARKER}),
+        );
+        assert!(failed, "{filter}: {reply}");
+        assert!(reply.contains(API_MARKER), "{filter}: {reply}");
+        drop(server);
+
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+        assert!(!stderr.contains(MARKER), "{filter}: {stderr}");
+        assert!(!stderr.contains(API_MARKER), "{filter}: {stderr}");
+        if flint_debug_shown {
+            assert!(stderr.contains("resolved PATH"), "{filter}: {stderr}");
+        }
+    }
+}
+
+/// A group whose discovery fails is logged by its name and HTTP status, with nothing else the
+/// server sent, in stderr and the log file. A name that is not a valid group is not repeated.
+#[test]
+fn a_failed_discovery_group_logs_only_its_name_and_status() {
+    const STATUS_MARKER: &str = "flint-status-marker";
+    const NAME_MARKER: &str = "Flint_Group_Marker";
+    let api = api_with_failing_groups(&["metrics.example.io", NAME_MARKER], STATUS_MARKER);
+    let scratch = tempfile::tempdir().unwrap();
+    let kubeconfig = scratch.path().join("kubeconfig");
+    std::fs::write(
+        &kubeconfig,
+        format!("apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: {api}\nusers:\n- name: u\n  user:\n    token: fake\ncontexts:\n- name: dev\n  context:\n    cluster: c\n    user: u\n"),
+    )
+    .unwrap();
+    let config_dir = scratch.path().join("config");
+    let home = config_dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(config_dir.join("settings.toml"), exposing("dev", &api)).unwrap();
+    let stderr_path = scratch.path().join("stderr.log");
+    let stderr = std::fs::File::create(&stderr_path).unwrap();
+    let mut server =
+        Server::start_logging(kubeconfig.as_os_str(), &config_dir, "warn", stderr.into());
+    // Any tool that resolves a kind runs discovery. The pod itself is not there.
+    let (failed, reply) = server.call(
+        "get_resource",
+        json!({"cluster": "dev", "kind": "pods", "namespace": "web", "name": "absent"}),
+    );
+    assert!(failed, "{reply}");
+    drop(server);
+
+    let log_path = if cfg!(target_os = "macos") {
+        home.join("Library/Logs/Flint/flint.log")
+    } else {
+        config_dir.join("state/flint/flint.log")
+    };
+    for (source, text) in [
+        ("stderr", std::fs::read_to_string(&stderr_path).unwrap()),
+        ("log file", std::fs::read_to_string(&log_path).unwrap()),
+    ] {
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("discovery failed"))
+            .collect();
+        assert_eq!(lines.len(), 2, "{source}: {text}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("metrics.example.io") && line.contains("500")),
+            "{source}: {text}"
+        );
+        assert!(!text.contains(STATUS_MARKER), "{source}: {text}");
+        assert!(!text.contains(NAME_MARKER), "{source}: {text}");
+    }
 }
 
 /// Diagnostics reach stderr and the log file, leaving stdout for the protocol. If the log
