@@ -330,6 +330,10 @@ fn scenarios() {
             ],
         ),
     ];
+    run_scenarios(cases);
+}
+
+fn run_scenarios(cases: Vec<(&str, AlertConfig, Vec<Step>)>) {
     for (name, config, steps) in cases {
         let mut engine = AlertEngine::new(config);
         for (index, Step(minute, pass, expected)) in steps.into_iter().enumerate() {
@@ -346,6 +350,259 @@ fn scenarios() {
             assert_eq!(got, expected, "{name}: step {index}");
         }
     }
+}
+
+/// A replica shortfall of workload `name`, whose object has UID `uid`.
+fn shortfall(kind: WorkloadKind, name: &str, uid: &str) -> Problem {
+    let subject = ProblemSubject::Workload {
+        kind,
+        namespace: "ns".into(),
+        name: name.into(),
+        uid: Some(uid.into()),
+    };
+    observation(ProblemKind::WorkloadShort, subject, None)
+}
+
+/// A pass in which StatefulSet `db` is short. Its hold-down is two minutes.
+fn db_short() -> Pass {
+    Up(vec![shortfall(WorkloadKind::StatefulSet, "db", "uid-db")])
+}
+
+/// The same StatefulSet after being deleted and created again.
+fn db_recreated() -> Pass {
+    Up(vec![shortfall(WorkloadKind::StatefulSet, "db", "uid-new")])
+}
+
+fn shortfalls_unchecked() -> Pass {
+    Partial(vec![], vec![ProblemKind::WorkloadShort])
+}
+
+#[test]
+fn hold_down_scenarios() {
+    let on_existing = AlertConfig {
+        alert_on_existing: true,
+        ..config()
+    };
+    let agent = || Up(vec![shortfall(WorkloadKind::DaemonSet, "agent", "uid-a")]);
+    let long_name = "d".repeat(MAX_NAME_BYTES + 1);
+    let oversized = || {
+        Up(vec![shortfall(
+            WorkloadKind::StatefulSet,
+            &long_name,
+            "uid-long",
+        )])
+    };
+    let cases: Vec<(&str, AlertConfig, Vec<Step>)> = vec![
+        (
+            "a shortfall raises only once it has lasted the hold-down",
+            config(),
+            vec![
+                Step(0, Up(vec![]), &[]),
+                Step(1, db_short(), &[]),
+                Step(2, db_short(), &[]),
+                Step(3, db_short(), &["raise db x1"]),
+                Step(4, db_short(), &[]),
+            ],
+        ),
+        (
+            "a DaemonSet shortfall waits too",
+            config(),
+            vec![
+                Step(0, Up(vec![]), &[]),
+                Step(1, agent(), &[]),
+                Step(3, agent(), &["raise agent x1"]),
+            ],
+        ),
+        (
+            "a shortfall that clears in time raises and resolves nothing",
+            config(),
+            vec![
+                Step(0, Up(vec![]), &[]),
+                Step(1, db_short(), &[]),
+                Step(2, Up(vec![]), &[]),
+                Step(30, Up(vec![]), &[]),
+            ],
+        ),
+        (
+            "the wait restarts when a shortfall returns",
+            config(),
+            vec![
+                Step(0, Up(vec![]), &[]),
+                Step(1, db_short(), &[]),
+                Step(2, Up(vec![]), &[]),
+                Step(3, db_short(), &[]),
+                Step(4, db_short(), &[]),
+                Step(5, db_short(), &["raise db x1"]),
+            ],
+        ),
+        (
+            "a recreated object starts its own wait",
+            config(),
+            vec![
+                Step(0, Up(vec![]), &[]),
+                Step(1, db_short(), &[]),
+                Step(3, db_recreated(), &[]),
+                Step(5, db_recreated(), &["raise db x1"]),
+            ],
+        ),
+        (
+            "an unchecked pass keeps the wait running",
+            config(),
+            vec![
+                Step(0, Up(vec![]), &[]),
+                Step(1, db_short(), &[]),
+                Step(2, shortfalls_unchecked(), &[]),
+                Step(3, db_short(), &["raise db x1"]),
+            ],
+        ),
+        (
+            "nothing raises or resolves while the kind is unchecked",
+            config(),
+            vec![
+                Step(0, Up(vec![]), &[]),
+                Step(1, db_short(), &[]),
+                Step(3, shortfalls_unchecked(), &[]),
+                Step(30, shortfalls_unchecked(), &[]),
+                Step(31, db_short(), &["raise db x1"]),
+            ],
+        ),
+        (
+            "an unavailable pass keeps the wait running",
+            config(),
+            vec![
+                Step(0, Up(vec![]), &[]),
+                Step(1, db_short(), &[]),
+                Step(2, Down, &[]),
+                Step(3, db_short(), &["raise db x1"]),
+            ],
+        ),
+        (
+            "a clock set back does not extend the wait",
+            config(),
+            vec![
+                Step(100, Up(vec![]), &[]),
+                Step(101, db_short(), &[]),
+                Step(50, db_short(), &[]),
+                Step(51, db_short(), &[]),
+                Step(52, db_short(), &["raise db x1"]),
+            ],
+        ),
+        (
+            "a clock set back during an unchecked pass does not extend the wait",
+            config(),
+            vec![
+                Step(100, Up(vec![]), &[]),
+                Step(101, db_short(), &[]),
+                Step(50, shortfalls_unchecked(), &[]),
+                Step(52, db_short(), &["raise db x1"]),
+            ],
+        ),
+        (
+            "an open alert that returns inside the cooldown does not wait",
+            config(),
+            vec![
+                Step(0, Up(vec![]), &[]),
+                Step(1, db_short(), &[]),
+                Step(3, db_short(), &["raise db x1"]),
+                Step(4, Up(vec![]), &[]),
+                Step(5, db_short(), &[]),
+                Step(6, Up(vec![]), &[]),
+                Step(15, Up(vec![]), &[]),
+                Step(16, Up(vec![]), &["resolve db"]),
+            ],
+        ),
+        (
+            "an open alert survives its object being recreated",
+            config(),
+            vec![
+                Step(0, Up(vec![]), &[]),
+                Step(1, db_short(), &[]),
+                Step(3, db_short(), &["raise db x1"]),
+                Step(4, db_recreated(), &[]),
+                Step(20, db_recreated(), &[]),
+            ],
+        ),
+        (
+            "a return after the cooldown resolves, then waits again",
+            config(),
+            vec![
+                Step(0, Up(vec![]), &[]),
+                Step(1, db_short(), &[]),
+                Step(3, db_short(), &["raise db x1"]),
+                Step(4, Up(vec![]), &[]),
+                Step(15, db_short(), &["resolve db"]),
+                Step(16, db_short(), &[]),
+                Step(17, db_short(), &["raise db x1"]),
+            ],
+        ),
+        (
+            "a shortfall at the first check stays baseline past the hold-down",
+            config(),
+            vec![
+                Step(0, db_short(), &[]),
+                Step(3, db_short(), &[]),
+                Step(30, db_short(), &[]),
+            ],
+        ),
+        (
+            "alerting on existing problems still waits for the hold-down",
+            on_existing,
+            vec![
+                Step(0, db_short(), &[]),
+                Step(1, db_short(), &[]),
+                Step(2, db_short(), &["raise db x1"]),
+            ],
+        ),
+        (
+            "a Deployment shortfall has no hold-down",
+            config(),
+            vec![
+                Step(0, Up(vec![]), &[]),
+                Step(
+                    1,
+                    Up(vec![shortfall(WorkloadKind::Deployment, "web", "uid-web")]),
+                    &["raise web x1"],
+                ),
+            ],
+        ),
+        (
+            "a waiting shortfall with an oversized name is not summarised early",
+            config(),
+            vec![
+                Step(0, Up(vec![]), &[]),
+                Step(1, oversized(), &[]),
+                Step(3, oversized(), &["summary new=0 resolved=0 untracked=1"]),
+            ],
+        ),
+    ];
+    run_scenarios(cases);
+}
+
+#[test]
+fn a_waiting_shortfall_is_not_listed_as_open() {
+    let mut engine = AlertEngine::new(config());
+    let short = [shortfall(WorkloadKind::StatefulSet, "db", "uid-db")];
+    let empty = ClusterSnapshot::complete(&[]);
+    engine.observe(&cluster(), at(0), empty).unwrap();
+    let up = ClusterSnapshot::complete(&short);
+    engine.observe(&cluster(), at(1), up).unwrap();
+    assert!(engine.open(CLUSTER).is_empty());
+}
+
+#[test]
+fn forget_clears_the_wait() {
+    let mut engine = AlertEngine::new(AlertConfig {
+        alert_on_existing: true,
+        ..config()
+    });
+    let short = [shortfall(WorkloadKind::StatefulSet, "db", "uid-db")];
+    let up = ClusterSnapshot::complete(&short);
+    assert!(engine.observe(&cluster(), at(0), up).unwrap().is_empty());
+    engine.forget(CLUSTER);
+    assert!(engine.observe(&cluster(), at(2), up).unwrap().is_empty());
+    let raised = engine.observe(&cluster(), at(4), up).unwrap();
+    let raised: Vec<String> = raised.iter().map(render).collect();
+    assert_eq!(raised, ["raise db x1"]);
 }
 
 #[test]
