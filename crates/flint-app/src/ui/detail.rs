@@ -253,12 +253,20 @@ impl DetailView {
         let is_secret = object.kind.as_str() == "secrets";
         let subject = Subject::of(&object.kind);
         let mut subscription = core.subscribe(&object.cluster, &object.kind);
-        let freshness = sync::Freshness::new(subscription.latest().state.clone());
+        let first = subscription.latest();
+        let freshness = sync::Freshness::new(first.state.clone());
+        // What identifies the rows: a namespace-limited list has a revision per namespace instead
+        // of its own, and a snapshot no watch built has neither.
+        let mut rows = (first.revision, first.limited_to.clone());
         let follow_sync = cx.spawn_in(window, async move |this, cx| {
             while subscription.changed().await {
-                let state = subscription.latest().state.clone();
+                let snapshot = subscription.latest();
+                let next = (snapshot.revision, snapshot.limited_to.clone());
+                let republished = (next.0 != 0 || next.1.is_some()) && next == rows;
+                rows = next;
+                let state = snapshot.state.clone();
                 let followed = this.update_in(cx, |view, window, cx| {
-                    view.sync_changed(state, window, cx);
+                    view.sync_changed(state, republished, window, cx);
                 });
                 if followed.is_err() {
                     break;
@@ -420,7 +428,14 @@ impl DetailView {
     }
 
     /// The kind's sync state moved: redraw, and fetch again if the connection came back.
-    fn sync_changed(&mut self, state: SyncState, window: &mut Window, cx: &mut Context<Self>) {
+    /// `republished`: the same rows came again, as they do when a cluster's pause ends.
+    fn sync_changed(
+        &mut self,
+        state: SyncState,
+        republished: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if *self.freshness.state() != state {
             if !state.is_current() {
                 self.error_retries = 0;
@@ -431,6 +446,9 @@ impl DetailView {
             cx.notify();
         }
         self.retry_held_error(window, cx);
+        if republished && self.freshness.state().is_current() {
+            self.retry_failed_pods(cx);
+        }
     }
 
     fn holds_fetch_error(&self) -> bool {
