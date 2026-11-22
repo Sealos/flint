@@ -381,6 +381,257 @@ async fn the_cursor_ring_shifts_nothing(cx: &mut TestAppContext) {
     assert_eq!(origin(cx, "cluster-dot-kind-alpha"), dot);
 }
 
+// covers #415: Go Back to another kind puts its filter back, in the field and on the rows.
+#[gpui_kit::test]
+async fn go_back_restores_the_list_filter(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let rows = [
+        ("demo", "api", 0),
+        ("demo", "web-a", 0),
+        ("demo", "web-b", 0),
+    ];
+    t.open_pods(cx, &rows).await;
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.type_text(cx, "web");
+    let list = t.list(cx).unwrap();
+    cx.wait_for(t.window, WAIT, move |_, cx| list.read(cx).shown().1 == 2)
+        .await;
+    t.dispatch(cx, "workspace::OpenView", json!({"kind": "services"}))
+        .unwrap();
+    t.feed_list(
+        cx,
+        objects(
+            KindId::new("", "services"),
+            &[("demo", "front", 0)],
+            flint_core::SyncState::Synced,
+            1,
+        ),
+    )
+    .await;
+    t.focus_workspace(cx);
+
+    t.press_key_of(cx, "workspace::GoBack");
+    let list = t.list(cx).expect("a list is open");
+    assert_eq!(list.read_with(cx, |l, _| l.filter_text().to_owned()), "web");
+    t.feed_list(cx, pods(&rows)).await;
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 2)
+        .await;
+    assert_eq!(t.selected(cx), None);
+    assert!(t.detail(cx).is_none());
+}
+
+// covers #415: while the restored filter's rows are computed, the rows of the old filter are
+// gone and the old selection is cleared, so nothing can be acted on by mistake.
+#[gpui_kit::test]
+async fn go_back_offers_no_stale_row_while_the_filter_is_restored(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(
+        cx,
+        &[
+            ("demo", "api", 0),
+            ("demo", "web-a", 0),
+            ("demo", "web-b", 0),
+        ],
+    )
+    .await;
+    let list = t.list(cx).unwrap();
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.type_text(cx, "web");
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 2)
+        .await;
+    t.dispatch(
+        cx,
+        "workspace::OpenObject",
+        json!({"kind": "pods", "namespace": "demo", "name": "web-a"}),
+    )
+    .unwrap();
+    assert_eq!(t.selected(cx).as_deref(), Some("web-a"));
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.type_text(cx, "-b");
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 1)
+        .await;
+
+    let permits = list.update(cx, |list, _| list.hold_computes());
+    t.focus_workspace(cx);
+    t.press_key_of(cx, "workspace::GoBack");
+    assert_eq!(list.read_with(cx, |l, _| l.filter_text().to_owned()), "web");
+    assert_eq!(
+        list.read_with(cx, |l, _| l.shown().1),
+        0,
+        "old rows dropped"
+    );
+    assert_eq!(t.selected(cx), None);
+    assert!(t.detail(cx).is_none(), "no detail is left as a target");
+    assert_eq!(
+        list.read_with(cx, |l, _| l.view_state().placeholder),
+        Some("loading"),
+        "pending, not an empty result"
+    );
+    assert!(t.find(cx, "list-filtering").is_some());
+    t.press(cx, "down");
+    assert_eq!(t.selected(cx), None, "no row to move to yet");
+
+    for _ in 0..8 {
+        permits.try_send(()).unwrap();
+    }
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 2)
+        .await;
+    assert_eq!(t.selected(cx), None, "the rows arriving select nothing");
+    assert_eq!(list.read_with(cx, |l, _| l.view_state().placeholder), None);
+    assert!(t.find(cx, "list-filtering").is_none());
+}
+
+// covers #415: rows computed for the text before the restore are never drawn.
+#[gpui_kit::test]
+async fn rows_of_the_old_text_are_dropped_after_a_restore(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let rows = [
+        ("demo", "api", 0),
+        ("demo", "web-a", 0),
+        ("demo", "web-b", 0),
+    ];
+    t.open_pods(cx, &rows).await;
+    let list = t.list(cx).unwrap();
+    let permits = list.update(cx, |list, _| list.hold_computes());
+    list.update(cx, |list, cx| list.set_snapshot(pods(&rows), cx));
+    let restoring = list.clone();
+    cx.update_window(t.window, |_, window, cx| {
+        restoring.update(cx, |list, cx| list.restore_filter("web", window, cx));
+    })
+    .unwrap();
+
+    // One permit: the old text's job ends, and the job replacing it stays gated.
+    let done = list.read_with(cx, |l, _| l.computes_done());
+    permits.try_send(()).unwrap();
+    let finished = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        finished.read(cx).computes_done() > done
+    })
+    .await;
+    assert_eq!(
+        list.read_with(cx, |l, _| l.shown().1),
+        0,
+        "the job for the old text is not drawn"
+    );
+    for _ in 0..8 {
+        permits.try_send(()).unwrap();
+    }
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 2)
+        .await;
+}
+
+// covers #415: the saved text typed again before its rows arrive is not yet on the rows: Go Back
+// drops the rows drawn for the cleared filter, so Down cannot open a pod the filter excludes.
+#[gpui_kit::test]
+async fn go_back_to_retyped_text_offers_no_unfiltered_row(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(
+        cx,
+        &[
+            ("demo", "api", 0),
+            ("demo", "web-a", 0),
+            ("demo", "web-b", 0),
+        ],
+    )
+    .await;
+    let list = t.list(cx).unwrap();
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.type_text(cx, "web");
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 2)
+        .await;
+    t.dispatch(
+        cx,
+        "workspace::OpenObject",
+        json!({"kind": "pods", "namespace": "demo", "name": "web-a"}),
+    )
+    .unwrap();
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    for _ in 0..3 {
+        t.press(cx, "backspace");
+    }
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 3)
+        .await;
+
+    let permits = list.update(cx, |list, _| list.hold_computes());
+    t.type_text(cx, "web");
+    t.focus_workspace(cx);
+    t.press_key_of(cx, "workspace::GoBack");
+    assert_eq!(
+        list.read_with(cx, |l, _| l.shown().1),
+        0,
+        "unfiltered rows dropped"
+    );
+    t.press(cx, "down");
+    assert_eq!(t.selected(cx), None, "no row to move to yet");
+
+    for _ in 0..8 {
+        permits.try_send(()).unwrap();
+    }
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 2)
+        .await;
+    assert_eq!(t.selected(cx), None);
+}
+
+// covers #415: an object restored with a filter that excludes it keeps its details, and the
+// list says why its row is missing once the restored rows are in.
+#[gpui_kit::test]
+async fn go_back_says_when_the_text_filter_hides_the_selection(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let rows = [("demo", "api", 0), ("demo", "web", 0)];
+    t.open_pods(cx, &rows).await;
+    t.dispatch(
+        cx,
+        "resource_list::SelectRow",
+        json!({"namespace": "demo", "name": "api"}),
+    )
+    .unwrap();
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.type_text(cx, "web");
+    let list = t.list(cx).unwrap();
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 1)
+        .await;
+    t.dispatch(cx, "workspace::OpenView", json!({"kind": "services"}))
+        .unwrap();
+    t.feed_list(
+        cx,
+        objects(
+            KindId::new("", "services"),
+            &[("demo", "front", 0)],
+            flint_core::SyncState::Synced,
+            1,
+        ),
+    )
+    .await;
+    t.focus_workspace(cx);
+
+    t.press_key_of(cx, "workspace::GoBack");
+    let list = t.list(cx).expect("a list is open");
+    t.feed_list(cx, pods(&rows)).await;
+    let banner = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        let view = banner.read(cx).view_state();
+        view.shown == 1 && view.banners.iter().any(|b| b.id == "list-filtered-out")
+    })
+    .await;
+    assert_eq!(t.selected(cx).as_deref(), Some("api"));
+    assert!(t.detail(cx).is_some());
+    assert!(t.find(cx, "list-filtered-out").is_some());
+}
+
 // covers UP-33: Go Back to the kind already open, with nothing to select, still puts focus in
 // the list.
 #[gpui_kit::test]

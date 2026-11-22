@@ -2491,11 +2491,10 @@ fn unlock_dialog(shown: &str, context: &str, server: &str) -> DialogText {
     DialogText {
         title: format!("Unlock {shown}?"),
         text: format!(
-            "Until Flint quits, or until you lock it again, actions that change this cluster or \
-             run code in it work without asking again: opening a shell or applying an edit. It stays unlocked \
-             only while the context points at this server. Locking it again stops new shells; \
-             shells already open keep running.\n\n\
-             Context: {context}\nServer: {server}"
+            "Context: {context}\nServer: {server}\n\n\
+             Until Flint quits or you lock it again, changes and code execution (shell, edit) \
+             stop asking. This holds only while the context points at this server. Locking \
+             stops new shells; open shells keep running."
         ),
         ok: "Unlock".into(),
         cancel: "Cancel".into(),
@@ -2527,17 +2526,17 @@ fn trust_dialog(shown: &str, context: &str, server: &str, previous: Option<&str>
     let context = flint_core::display::single_line(context);
     let previous = previous.map(|previous| previous_address(server, previous));
     let server = flint_core::redact::server_url(server);
-    let mut text = format!(
-        "A trusted cluster stays unlocked when Flint restarts: actions that change it or run \
-         code in it work without asking. Trust is kept in settings.toml and pinned to this \
-         server: if the context is pointed at another one, the cluster is protected again.\n\n\
-         Context: {context}\nServer: {server}"
-    );
+    let mut text = format!("Context: {context}\nServer: {server}\n\n");
     if let Some(previous) = previous {
         text.push_str(&format!(
-            "\n\nThis context was trusted at {previous}, which is a different server."
+            "This context was trusted at {previous}, which is a different server.\n\n"
         ));
     }
+    text.push_str(
+        "Trust survives a restart: changes and code execution (shell, edit) stop asking. It is \
+         stored in settings.toml and pinned to this server. If the context moves, the cluster \
+         is protected again.",
+    );
     DialogText {
         title: format!("Trust {shown}?"),
         text,
@@ -3230,6 +3229,35 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    // covers UP-55: the target leads, and a moved context's warning comes before the explanation.
+    #[test]
+    fn unlock_and_trust_dialogs_name_the_target_first() {
+        let target = "Context: kind-dev\nServer: https://127.0.0.1:6443\n\n";
+        let server = "https://127.0.0.1:6443";
+        let unlock = super::unlock_dialog("kind-dev", "kind-dev", server).text;
+        let trust = super::trust_dialog("kind-dev", "kind-dev", server, None).text;
+        let moved = super::trust_dialog(
+            "kind-dev",
+            "kind-dev",
+            server,
+            Some("https://10.0.0.1:6443"),
+        )
+        .text;
+
+        let after = unlock.strip_prefix(target).expect(&unlock);
+        assert!(after.starts_with("Until Flint quits"), "{unlock}");
+        let after = trust.strip_prefix(target).expect(&trust);
+        assert!(after.starts_with("Trust survives a restart"), "{trust}");
+        let after = moved.strip_prefix(target).expect(&moved);
+        assert!(
+            after.starts_with(
+                "This context was trusted at https://10.0.0.1:6443, which is a different \
+                 server.\n\nTrust survives a restart"
+            ),
+            "{moved}"
+        );
     }
 
     // covers UP-07, UP-08
