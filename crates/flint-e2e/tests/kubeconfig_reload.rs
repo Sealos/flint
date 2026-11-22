@@ -430,6 +430,158 @@ async fn run_when_settled(core: &CoreHandle, review: &WriteReview) -> Result<(),
     }
 }
 
+// covers UP-06, UP-54: a kubeconfig changed on disk and not loaded yet sends no mutating request,
+// whether it moved, changed only the credential at the same URL, or can't be used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_not_loaded_yet_refuses_the_write() {
+    type Change = fn(&str, &str) -> String;
+    let cases: [(Change, WriteError); 5] = [
+        (
+            |whole, url| whole.replace(url, "https://127.0.0.1:1"),
+            WriteError::ConnectionChanged,
+        ),
+        (
+            |whole, _| whole.replace("user: {}", "user: {token: another}"),
+            WriteError::ConnectionChanged,
+        ),
+        (|_, _| String::new(), WriteError::KubeconfigUnreadable),
+        (|_, _| " \n".to_owned(), WriteError::KubeconfigUnreadable),
+        (|_, _| BROKEN.to_owned(), WriteError::KubeconfigUnreadable),
+    ];
+    for (change, refusal) in cases {
+        let server = FakeApiServer::start().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kubeconfig");
+        let core = core_with_deployment(&server, dir.path(), &path).await;
+        let whole = std::fs::read_to_string(&path).unwrap();
+        let review = core
+            .review_write(target(&server), proposal())
+            .await
+            .unwrap();
+        let before = mutating(&server);
+
+        let changed = change(&whole, &server.url());
+        assert_ne!(changed, whole);
+        std::fs::write(&path, changed).unwrap();
+        assert_eq!(
+            core.run_write(review.into_intent()).await.unwrap_err(),
+            refusal
+        );
+        assert_eq!(mutating(&server), before, "no mutating request");
+    }
+}
+
+// covers UP-06, UP-54: a path replaced by a FIFO is refused in time, and sends nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kubeconfig_replaced_by_a_fifo_refuses_the_write() {
+    let server = FakeApiServer::start().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kubeconfig");
+    let core = core_with_deployment(&server, dir.path(), &path).await;
+    let review = core
+        .review_write(target(&server), proposal())
+        .await
+        .unwrap();
+    let before = mutating(&server);
+
+    std::fs::remove_file(&path).unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let refused =
+        tokio::time::timeout(Duration::from_secs(6), core.run_write(review.into_intent()))
+            .await
+            .expect("refused within the read timeout");
+    assert_eq!(refused.unwrap_err(), WriteError::KubeconfigUnreadable);
+    assert_eq!(mutating(&server), before, "no mutating request");
+}
+
+// covers UP-06, UP-54: an unchanged kubeconfig lets the write through. A change a write found is
+// loaded the normal way, with no file watcher here, so a new review works on the new definition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_goes_through_unchanged_and_loads_a_change_it_finds() {
+    let server = FakeApiServer::start().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kubeconfig");
+    let core = core_with_deployment(&server, dir.path(), &path).await;
+    let whole = std::fs::read_to_string(&path).unwrap();
+    let review = core
+        .review_write(target(&server), proposal())
+        .await
+        .unwrap();
+    core.run_write(review.into_intent()).await.unwrap();
+    let object = server.object(&deployments(), Some("demo"), EDITED).unwrap();
+    assert_eq!(object["spec"]["replicas"], 3);
+
+    let review = core
+        .review_write(target(&server), proposal())
+        .await
+        .unwrap();
+    std::fs::write(&path, whole.replace("user: {}", "user: {token: another}")).unwrap();
+    assert_eq!(
+        core.run_write(review.into_intent()).await.unwrap_err(),
+        WriteError::ConnectionChanged
+    );
+    tokio::time::timeout(WAIT, async {
+        loop {
+            match core.review_write(target(&server), proposal()).await {
+                Ok(_) => return,
+                Err(
+                    WriteError::Refused(WriteRefusal::NotConnected { .. })
+                    | WriteError::NotServed(_)
+                    | WriteError::ConnectionChanged,
+                ) => tokio::time::sleep(Duration::from_millis(25)).await,
+                Err(other) => panic!("{other}"),
+            }
+        }
+    })
+    .await
+    .expect("the new definition loads");
+}
+
+// covers UP-06, UP-54: a file emptied by a writer counts as failed, whether it is zero bytes or
+// only whitespace: the context stays, writes are refused and nothing is sent. The same file back,
+// the earlier review runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_emptied_kubeconfig_refuses_writes_until_the_same_file_is_back() {
+    for blank in ["", " \n\t\n"] {
+        let server = FakeApiServer::start().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kubeconfig");
+        let core = core_with_deployment(&server, dir.path(), &path).await;
+        let whole = std::fs::read_to_string(&path).unwrap();
+        let review = core
+            .review_write(target(&server), proposal())
+            .await
+            .unwrap();
+        let before = mutating(&server);
+
+        std::fs::write(&path, blank).unwrap();
+        core.reload_kubeconfig().await.unwrap();
+        assert_eq!(
+            core.review_write(target(&server), proposal())
+                .await
+                .unwrap_err(),
+            WriteError::KubeconfigUnreadable
+        );
+        assert_eq!(
+            core.run_write(review.clone().into_intent())
+                .await
+                .unwrap_err(),
+            WriteError::KubeconfigUnreadable
+        );
+        assert_eq!(mutating(&server), before, "no mutating request");
+
+        std::fs::write(&path, &whole).unwrap();
+        core.reload_kubeconfig().await.unwrap();
+        run_when_settled(&core, &review).await.unwrap();
+        let object = server.object(&deployments(), Some("demo"), EDITED).unwrap();
+        assert_eq!(object["spec"]["replicas"], 3);
+    }
+}
+
 // covers UP-06, UP-54: with the file broken, a new review and a run of an earlier one are refused
 // and send nothing that could change the cluster. The same file back, the earlier review runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

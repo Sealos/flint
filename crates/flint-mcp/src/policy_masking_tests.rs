@@ -333,3 +333,120 @@ fn a_cut_off_body_with_a_prefix_and_a_short_last_line_is_left_out() {
     assert_eq!(out.text, "");
     assert!(out.truncated);
 }
+
+#[test]
+fn a_cut_off_body_with_other_output_between_its_lines_is_left_out() {
+    let k = KEY_LINE;
+    for log in [
+        format!(
+            "{k}\n{k}\nINFO ready\n{k}\n{k}\nINFO ready\n{k}\n{k}\n-----END PRIVATE KEY-----\nafter\n"
+        ),
+        format!("{k}\nINFO ready\n{k}\n{k}\n-----END PRIVATE KEY-----\nafter\n"),
+        format!("INFO ready\n{k}\nINFO ready\n{k}\nINFO ready\n{k}\nafter\n"),
+    ] {
+        let out = log_output(&log, 100, 64 * 1024, true);
+        assert!(!out.text.contains(k), "{out:?}");
+        assert!(out.text.ends_with("after\n"), "{out:?}");
+        assert!(out.truncated, "{out:?}");
+    }
+}
+
+#[test]
+fn a_cut_off_body_after_a_log_level_is_left_out() {
+    for prefix in [
+        "2026-01-01T00:00:00Z INFO ",
+        "2026-01-01T00:00:00Z app | warn: ",
+        "ERROR ",
+    ] {
+        let log = format!("{prefix}{KEY_LINE}\n").repeat(4) + "after\n";
+        let out = log_output(&log, 100, 64 * 1024, true);
+        assert_eq!(out.text, "after\n", "{prefix}");
+        assert!(out.truncated);
+
+        let ended = format!("{prefix}{KEY_LINE}\n").repeat(4)
+            + &format!("{prefix}-----END PRIVATE KEY-----\nafter\n");
+        let out = log_output(&ended, 100, 64 * 1024, true);
+        assert!(!out.text.contains(KEY_LINE), "{out:?}");
+    }
+}
+
+#[test]
+fn lines_before_a_whole_block_are_kept() {
+    let log = format!("plain\n{}after\n", pem("", 4));
+    let out = log_output(&log, 100, 64 * 1024, true);
+    assert!(out.text.starts_with("plain\n"), "{out:?}");
+    assert!(!out.truncated, "{out:?}");
+}
+
+#[test]
+fn a_message_after_a_log_level_is_kept() {
+    let log = format!("2026-01-01T00:00:00Z INFO verified checksum {KEY_LINE}\n").repeat(4);
+    let out = log_output(&log, 100, 64 * 1024, true);
+    assert_eq!((out.text.as_str(), out.truncated), (log.as_str(), false));
+}
+
+#[test]
+fn a_message_naming_the_end_line_keeps_the_lines_before_it() {
+    for message in [
+        "ERROR invalid PEM: missing -----END PRIVATE KEY----- in tls.key",
+        "ERROR tls: expected -----END PRIVATE KEY-----",
+    ] {
+        let log = format!("INFO handled request 0123456789abcdefABCD\n{message}\nafter\n");
+        let out = log_output(&log, 100, 64 * 1024, true);
+        assert_eq!((out.text.as_str(), out.truncated), (log.as_str(), false));
+    }
+}
+
+#[test]
+fn key_lines_before_a_message_naming_the_end_line_are_left_out() {
+    let message = "ERROR invalid PEM: missing -----END PRIVATE KEY----- in tls.key";
+    let log = format!("{KEY_LINE}\napp-1 {KEY_LINE}\n{message}\nafter\n");
+    let out = log_output(&log, 100, 64 * 1024, true);
+    assert!(!out.text.contains(KEY_LINE), "{out:?}");
+    assert!(out.text.ends_with("after\n"), "{out:?}");
+    assert!(out.truncated);
+}
+
+#[test]
+fn a_short_last_line_before_a_footer_with_any_prefix_is_left_out() {
+    let last = "ExampleLastLine0123=";
+    for prefix in ["", "app-1 ", "2026-01-01T00:00:00Z app | ", "\""] {
+        for fields in ["", " source=tls"] {
+            let log = format!("{prefix}{last}\n{prefix}-----END PRIVATE KEY-----{fields}\nafter\n");
+            let out = log_output(&log, 100, 64 * 1024, true);
+            assert!(!out.text.contains(last), "{prefix}: {out:?}");
+            assert!(out.text.ends_with("after\n"), "{out:?}");
+        }
+    }
+}
+
+#[test]
+fn a_padded_last_line_ends_a_cut_off_body() {
+    let k = KEY_LINE;
+    let log = format!(
+        "{k}\n{k}\nExampleLastLine0123=\nWARN retrying\nINFO ReconciliationComplete\nafter\n"
+    );
+    let out = log_output(&log, 100, 64 * 1024, true);
+    assert_eq!(
+        out.text,
+        "WARN retrying\nINFO ReconciliationComplete\nafter\n"
+    );
+    assert!(out.truncated);
+}
+
+#[test]
+fn full_key_lines_after_a_padded_line_are_still_left_out() {
+    let k = KEY_LINE;
+    let log =
+        format!("{k}\n{k}\nExampleLastLine0123=\nINFO ready\n{k}\nExampleLastLine456\nafter\n");
+    let out = log_output(&log, 100, 64 * 1024, true);
+    assert_eq!(out.text, "after\n");
+}
+
+#[test]
+fn an_unpadded_short_line_does_not_end_a_cut_off_body() {
+    let k = KEY_LINE;
+    let log = format!("{k}\n{k}\nINFO ReconciliationComplete\nExampleLastLine0123\nafter\n");
+    let out = log_output(&log, 100, 64 * 1024, true);
+    assert_eq!(out.text, "after\n");
+}
