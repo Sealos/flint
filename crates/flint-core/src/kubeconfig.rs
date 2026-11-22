@@ -508,11 +508,19 @@ mod tests {
         let (late, mut late_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let first = late.clone();
-        let read = reader.read(&paths, move || drop(first.send(()))).await;
+        let read = reader
+            .read(&paths, move || {
+                let _ = first.send(());
+            })
+            .await;
         assert!(read.is_none(), "timed out");
         let started = std::time::Instant::now();
         let second = late.clone();
-        let read = reader.read(&paths, move || drop(second.send(()))).await;
+        let read = reader
+            .read(&paths, move || {
+                let _ = second.send(());
+            })
+            .await;
         assert!(read.is_none(), "still running");
         assert!(started.elapsed() < Duration::from_millis(50), "no new wait");
 
