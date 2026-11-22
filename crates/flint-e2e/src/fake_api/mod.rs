@@ -5,7 +5,7 @@
 //! lists and objects, with timestamps shifted to the server's start ([`clock`]). Watches
 //! (including streaming lists) are served from the same rows and can be scripted
 //! ([`FakeApiServer::script_watch`]) or fed live ([`FakeApiServer::send_watch`]). Faults
-//! ([`Fault`]) refuse, delay or drop matching requests.
+//! ([`Fault`]) refuse, delay, hold until released or drop matching requests.
 //!
 //! Pod logs behave like a real cluster's for what Flint asks (`logs`): per container and
 //! previous instance, `follow`, `tailLines`, `sinceSeconds`/`sinceTime`, `timestamps` and
@@ -72,7 +72,7 @@ mod tls;
 mod watch;
 
 pub use exec::{ExecEnd, ExecImage, ExecRuntime, FakeExec, STDOUT_KEPT, TtySize, V4, V5};
-pub use faults::{Effect, Fault};
+pub use faults::{Effect, Fault, HoldPoint, RequestHold};
 pub use fixtures::{Fixtures, Gvr};
 pub use kubeconfig::CONTEXT;
 pub use logs::ContainerLog;

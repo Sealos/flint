@@ -3,6 +3,7 @@
 
 use std::cmp::Ordering;
 
+use crate::gitops::ROW_MANAGER_KEY;
 use crate::redact::{is_masked_column, is_secret_list};
 use crate::store::KindSnapshot;
 use crate::table::{Cell, Row};
@@ -12,8 +13,9 @@ pub struct ViewQuery {
     /// Only rows in these namespaces. Empty means all namespaces. Ignored for cluster-scoped
     /// kinds.
     pub namespaces: Vec<String>,
-    /// Case-insensitive substring of the name, namespace, any cell text, or a `key=value` label.
-    /// A Secret's masked columns are not searched.
+    /// Case-insensitive substring of the name, namespace, any cell text, a `key=value` label, or
+    /// `managed by <manager>` (so `managed` finds every GitOps-managed object, `argo` or `flux`
+    /// those of one controller). A Secret's masked columns and its manager are not searched.
     pub text: String,
     pub sort: Option<SortBy>,
 }
@@ -48,7 +50,10 @@ pub fn compute(snapshot: &KindSnapshot, query: &ViewQuery, now: i64) -> Vec<u32>
     let masked = |column: usize| is_masked_column(secret, &snapshot.columns, column);
     let needle = query.text.trim().to_ascii_lowercase();
     if !needle.is_empty() {
-        picked.retain(|&i| matches_text(&snapshot.rows[i as usize], &needle, now, masked));
+        picked.retain(|&i| {
+            let row = &snapshot.rows[i as usize];
+            matches_text(row, &needle, now, masked) || (!secret && matches_manager(row, &needle))
+        });
     }
     if let Some(sort) = query
         .sort
@@ -93,7 +98,14 @@ fn matches_text(row: &Row, needle: &str, now: i64, masked: impl Fn(usize) -> boo
     }
     row.labels
         .iter()
+        .filter(|(k, _)| &**k != ROW_MANAGER_KEY)
         .any(|(k, v)| contains_ignore_case(&format!("{k}={v}"), needle))
+}
+
+/// Whether the row's GitOps manager, read as `managed by <manager>`, holds `needle`.
+fn matches_manager(row: &Row, needle: &str) -> bool {
+    row.managed_by()
+        .is_some_and(|manager| contains_ignore_case(&format!("managed by {manager}"), needle))
 }
 
 /// Whether `haystack` contains `needle` (already lowercase), ignoring ASCII case.

@@ -202,7 +202,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **When** I open an object.
 - **Then** I see its metadata, labels, owners, conditions, related events, and read-only YAML with syntax highlighting.
   `managedFields` is hidden. An object Argo CD or Flux manages says so in the header, naming the application or
-  Kustomization or HelmRelease, read from its labels and annotations.
+  Kustomization or HelmRelease, read from its labels and annotations. A Secret tracked by Argo CD shows only the tool.
 - Tests: cluster, ui.
 
 ### UP-24 Switch clusters

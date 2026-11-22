@@ -660,6 +660,51 @@ async fn locking_during_a_drain_stops_the_next_eviction() {
     assert_eq!(evictions(&server, "pod-c"), 0);
 }
 
+// covers UP-54: a kubeconfig change between two evictions, not loaded yet, stops the next one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kubeconfig_change_during_a_drain_stops_the_next_eviction() {
+    let server = FakeApiServer::start().await.unwrap();
+    node(&server);
+    for name in ["pod-a", "pod-b", "pod-c"] {
+        server.add_pod(pod_on_node(name, "ReplicaSet"));
+    }
+    let core = Core::start(&server, Settings::default()).await;
+    let path = core._dir.path().join("kubeconfig");
+    let whole = std::fs::read_to_string(&path).unwrap();
+    let changed = whole.replace("user: {}", "user: {token: another}");
+    assert_ne!(changed, whole);
+    let review = core
+        .handle
+        .review_write(node_target(&server), drain())
+        .await
+        .unwrap();
+    server.inject(
+        Fault::delay(Duration::from_millis(400))
+            .on(&Gvr::core("pods"))
+            .verb(Verb::Other)
+            .named("pod-a")
+            .subresource("eviction")
+            .times(1),
+    );
+    let running = tokio::spawn(core.handle.run_write(review.into_intent()));
+    tokio::time::timeout(WAIT, async {
+        let first = "/api/v1/namespaces/demo/pods/pod-a/eviction";
+        while !server.arrivals().iter().any(|r| r.path == first) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first eviction");
+    std::fs::write(&path, changed).unwrap();
+
+    let drained = report(running.await.unwrap().unwrap());
+    assert_eq!(drained.evicted, [named("pod-a")]);
+    assert_eq!(drained.remaining, [named("pod-b"), named("pod-c")]);
+    assert_eq!(drained.stopped, Some(WriteError::ConnectionChanged));
+    assert_eq!(evictions(&server, "pod-b"), 0);
+    assert_eq!(evictions(&server, "pod-c"), 0);
+}
+
 // covers UP-53: when the node cannot be read after the pod list, the listed pods are reported as
 // not tried and no eviction is sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
