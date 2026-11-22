@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use flint_core::activity::ActivityRecord;
-use flint_core::settings::{AiExposureState, AiScope, TrustState};
+use flint_core::settings::{AiExposureState, AiScope, ClusterTag, TrustState};
 use flint_core::{
     Appearance, ClusterDiscovery, ClusterId, ClusterSummary, Command, ConnectionState, CoreHandle,
     Event, KindId, Protection, Settings, SyncState, WatchMode,
@@ -248,6 +248,22 @@ impl ClustersModel {
     /// change comes back as a settings event.
     pub fn set_cluster_name(&mut self, cluster: ClusterId, name: Option<String>) {
         self.send(Command::SetClusterName { cluster, name });
+    }
+
+    /// The colour tag of `cluster`, at the server it points at now.
+    pub fn cluster_tag(&self, cluster: &ClusterSummary) -> Option<ClusterTag> {
+        self.settings
+            .cluster_tag(&cluster.info.name, cluster.info.server.as_deref())
+    }
+
+    /// Sets the colour tag of `cluster` at `server` (`None` removes it). The core writes
+    /// `settings.toml`; the change comes back as a settings event.
+    pub fn set_cluster_tag(&mut self, cluster: ClusterId, server: String, tag: Option<ClusterTag>) {
+        self.send(Command::SetClusterTag {
+            cluster,
+            server,
+            tag,
+        });
     }
 
     /// Sets the appearance. Written to `settings.toml`; the change comes back as a settings
