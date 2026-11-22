@@ -54,11 +54,11 @@ use super::terminal_view::TerminalView;
 pub const DEFAULT_HEIGHT: f32 = 280.;
 /// The lowest the dock gets: its tab bar, a toolbar and a few lines.
 pub const MIN_HEIGHT: f32 = 120.;
-/// The dock leaves the main area at least this much (its header and a few rows).
-const MIN_MAIN_HEIGHT: f32 = 160.;
-/// The same under the two-row header: both rows, the detail's title and tabs, and a failed
-/// fetch's message with its Retry button.
-const MIN_MAIN_HEIGHT_TWO_ROW_HEADER: f32 = 256.;
+/// The dock leaves the main area at least this much: its headers and several list rows.
+const MIN_MAIN_HEIGHT: f32 = 280.;
+/// The same under the two-row header, whose rows, detail title and tabs, and a failed fetch's
+/// message with its Retry button need 256.
+const MIN_MAIN_HEIGHT_TWO_ROW_HEADER: f32 = MIN_MAIN_HEIGHT;
 /// What a tab whose context left kubeconfig says of it.
 const REMOVED: &str = "This context is no longer in kubeconfig.";
 /// What an empty dock says.
@@ -1112,11 +1112,12 @@ mod tests {
         assert_eq!(dock_height(Some(400), 800., false), 400.);
         assert_eq!(dock_height(Some(50), 800., false), MIN_HEIGHT);
         // A short window: the main area keeps its room, down to the dock's minimum.
-        assert_eq!(dock_height(Some(700), 800., false), 640.);
+        assert_eq!(dock_height(Some(700), 800., false), 520.);
+        assert_eq!(dock_height(None, 420., false), 140.);
         assert_eq!(dock_height(Some(700), 200., false), MIN_HEIGHT);
-        // A two-row header takes more of the window, with the same lower limit.
-        assert_eq!(dock_height(Some(700), 480., false), 320.);
-        assert_eq!(dock_height(Some(700), 480., true), 224.);
+        // A two-row header keeps the same room, with the same lower limit.
+        assert_eq!(dock_height(Some(700), 480., false), 200.);
+        assert_eq!(dock_height(Some(700), 480., true), 200.);
         assert_eq!(dock_height(Some(200), 480., true), 200.);
         assert_eq!(dock_height(Some(700), 200., true), MIN_HEIGHT);
     }

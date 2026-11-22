@@ -1,6 +1,6 @@
 //! View tests for narrow windows: below the breakpoint the detail shows alone, with a Back control
 //! that returns to the list and keeps the selection, and a confirmation stays fully usable at the
-//! minimum window size.
+//! minimum window size. In a short window the list keeps several rows beside the dock.
 
 use flint_core::{ConnectionState, Event, ServerVersion};
 use gpui_kit::base::TestSupportExt as _;
@@ -576,6 +576,39 @@ async fn the_back_key_only_acts_on_the_detail_alone(cx: &mut TestAppContext) {
     assert!(!t.available(cx).contains(&"workspace::BackToList"));
 }
 
+// #420: in a short window the dock gives way so the list keeps several rows, and a taller window
+// gets the remembered height back.
+#[gpui_kit::test]
+async fn a_short_window_keeps_list_rows_beside_the_dock(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let rows = [("a", "row-uid-a"), ("b", "row-uid-b"), ("c", "row-uid-c")]
+        .into_iter()
+        .chain([("d", "row-uid-d"), ("e", "row-uid-e"), ("f", "row-uid-f")])
+        .collect::<Vec<_>>();
+    let pods: Vec<_> = rows.iter().map(|(name, _)| ("demo", *name, 0)).collect();
+    t.open_pods(cx, &pods).await;
+    t.dispatch(cx, "dock::ToggleDock", Value::Null).unwrap();
+    t.dispatch(
+        cx,
+        "workspace::SetDockHeight",
+        serde_json::json!({"height": 400}),
+    )
+    .unwrap();
+    resize(cx, &t, 700., 420.);
+
+    let dock = bounds(cx, &t, "dock-pane");
+    assert_eq!(dock.size.height, px(140.));
+    for (_, id) in rows {
+        let row = bounds(cx, &t, id);
+        assert!(row.bottom() <= dock.top(), "{row:?} above {dock:?}");
+    }
+    assert_eq!(t.workspace.read_with(cx, |ws, _| ws.panes.dock), Some(400));
+
+    resize(cx, &t, 1000., 800.);
+    assert_eq!(bounds(cx, &t, "dock-pane").size.height, px(400.));
+}
+
 // #433: at the minimum size a long object name gives way before the cluster, which stays whole.
 #[gpui_kit::test]
 async fn the_breadcrumb_keeps_the_cluster_at_the_minimum_size(cx: &mut TestAppContext) {
@@ -846,7 +879,7 @@ async fn a_failed_detail_keeps_retry_above_a_tall_dock(cx: &mut TestAppContext) 
         view.show_failed("connection refused".into(), cx)
     });
     t.dispatch(cx, "dock::ToggleDock", Value::Null).unwrap();
-    // The tallest the dock gets at the minimum window height in the other layouts.
+    // Taller than the dock gets at the minimum window height.
     t.dispatch(
         cx,
         "workspace::SetDockHeight",
@@ -866,11 +899,13 @@ async fn a_failed_detail_keeps_retry_above_a_tall_dock(cx: &mut TestAppContext) 
     );
     assert!(retry.bottom() <= dock.top(), "{retry:?} above {dock:?}");
 
-    // The limit does not rewrite the saved height: the list's layout gets it back.
+    // The limit does not rewrite the saved height: a taller window gets it back.
     let saved = t.workspace.read_with(cx, |ws, _| ws.panes.dock);
     assert_eq!(saved, Some(320));
     t.click(cx, "detail-back");
     draw(cx, &t);
+    assert_eq!(bounds(cx, &t, "dock-pane").size.height, px(200.));
+    resize(cx, &t, 760., 800.);
     assert_eq!(bounds(cx, &t, "dock-pane").size.height, px(320.));
 }
 
