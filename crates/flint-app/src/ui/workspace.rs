@@ -1880,10 +1880,10 @@ impl Workspace {
             .text_xs()
             .text_color(color)
             .child(Icon::new(icon).xsmall())
-            .child(match (compact, writable) {
-                (false, _) => text,
-                (true, false) => "Read-only",
-                (true, true) => "Writable",
+            .child(if compact {
+                access_mode_short_text(protection)
+            } else {
+                text
             })
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
     }
@@ -2448,6 +2448,16 @@ fn access_mode_text(protection: Protection) -> &'static str {
     }
 }
 
+/// The access mode on a narrow header's second row: still tells every mode apart.
+fn access_mode_short_text(protection: Protection) -> &'static str {
+    match protection {
+        Protection::Protected => "Read-only",
+        Protection::Local => "Local",
+        Protection::Unlocked => "Unlocked",
+        Protection::Trusted => "Trusted",
+    }
+}
+
 /// The accessible name of a cluster's lock button: which cluster, and its protection now.
 fn lock_label(title: &str, protection: Protection) -> String {
     let state = match protection {
@@ -2626,11 +2636,14 @@ pub(super) fn server_text(server: Option<&str>) -> String {
 /// line, so a kubeconfig value can neither show a credential nor pass for other text.
 fn repointed_text(cluster: &str, moved: &ServerMove) -> String {
     let shown = |server: Option<&str>| display::single_line(&server_text(server));
-    format!(
-        "{cluster} now points at a different API server. Was {}, now {}.",
-        shown(moved.old.as_deref()),
-        shown(moved.new.as_deref()),
-    )
+    let (old, new) = (shown(moved.old.as_deref()), shown(moved.new.as_deref()));
+    if old == new {
+        return format!(
+            "{cluster} now points at a different API server. Both show as {new}: \
+             what changed is in a part of the URL Flint hides."
+        );
+    }
+    format!("{cluster} now points at a different API server. Was {old}, now {new}.")
 }
 
 /// The host and port of a server URL as the UI shows it, for a row's compact second line.
@@ -3284,11 +3297,36 @@ mod view_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        Layout, LockEntry, MIN_LIST_WIDTH, control_name, exposure_label, layout, lock_label,
-        lock_menu, mode_name, namespace_summary, no_contexts_text, watch_mode_label,
+        Layout, LockEntry, MIN_LIST_WIDTH, ServerMove, access_mode_short_text, control_name,
+        exposure_label, layout, lock_label, lock_menu, mode_name, namespace_summary,
+        no_contexts_text, repointed_text, watch_mode_label,
     };
     use flint_core::settings::{AiExposureState, PaneWidths, TrustState};
     use flint_core::{Protection, WatchMode};
+
+    #[test]
+    fn the_short_access_modes_stay_distinct() {
+        let short = [
+            Protection::Protected,
+            Protection::Local,
+            Protection::Unlocked,
+            Protection::Trusted,
+        ]
+        .map(access_mode_short_text);
+        assert_eq!(short, ["Read-only", "Local", "Unlocked", "Trusted"]);
+    }
+
+    #[test]
+    fn a_move_between_servers_that_show_alike_says_so() {
+        let moved = ServerMove {
+            old: Some("https://proxy.example.com/k8s/@old".to_owned()),
+            new: Some("https://proxy.example.com/k8s/@new".to_owned()),
+        };
+        let text = repointed_text("dev", &moved);
+        assert!(text.contains("Flint hides"), "{text}");
+        assert!(!text.contains("Was "), "{text}");
+        assert!(!text.contains("@old") && !text.contains("@new"), "{text}");
+    }
 
     // A title that is the context stays short; any other carries the context, and a context
     // written to look like another cluster's control name still gets a name of its own.

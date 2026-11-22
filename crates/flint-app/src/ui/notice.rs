@@ -145,12 +145,15 @@ struct ConfirmedServer {
 pub(in crate::ui) struct ServerMoves {
     seen: Option<ConfirmedServer>,
     moved: Option<ServerMove>,
+    /// The context now shows a server no load confirmed, so a move's new server may not be it.
+    unconfirmed: bool,
 }
 
 impl ServerMoves {
-    /// The last move of the active context, until another context is chosen.
+    /// The last move of the active context, until another context is chosen. Kept but not
+    /// given while the context shows an unconfirmed server.
     pub fn moved(&self) -> Option<&ServerMove> {
-        self.moved.as_ref()
+        self.moved.as_ref().filter(|_| !self.unconfirmed)
     }
 
     /// No context is active.
@@ -163,6 +166,7 @@ impl ServerMoves {
         if self.seen.as_ref().is_some_and(|s| s.context != context) {
             self.clear();
         }
+        self.unconfirmed = !confirmed;
         if !confirmed {
             return;
         }
@@ -222,6 +226,18 @@ mod server_move_tests {
         // A later confirmed move is compared with the last confirmed server.
         moves.observe("dev", 4, false, Some(NEW));
         moves.observe("dev", 4, true, Some(NEW));
+        assert_eq!(moves.moved().cloned(), moved());
+    }
+
+    #[test]
+    fn a_move_is_not_given_while_a_fallback_shows() {
+        let mut moves = ServerMoves::default();
+        moves.observe("dev", 1, true, Some(OLD));
+        moves.observe("dev", 2, true, Some(NEW));
+        // The core keeps the confirmed endpoint while another server shows.
+        moves.observe("dev", 2, false, Some("https://10.0.0.3:6443"));
+        assert_eq!(moves.moved(), None);
+        moves.observe("dev", 2, true, Some(NEW));
         assert_eq!(moves.moved().cloned(), moved());
     }
 
