@@ -2870,12 +2870,17 @@ pub mod tests {
         }
     }
 
-    /// Asserts that `bind_actions` binds exactly the registry's actions of `scope`.
+    /// Window-level actions the root handles, not the view that owns their scope: they are
+    /// `Scope::Workspace` so the native menu disables them without a window.
+    const HANDLED_BY_ROOT: [&str; 2] = ["flint::MinimizeWindow", "flint::ZoomWindow"];
+
+    /// Asserts that `bind_actions` binds exactly the registry's actions of `scope`, apart from
+    /// those the root handles.
     pub fn assert_binds_scope(scope: Scope, bind_actions: fn(Names) -> Names) {
         let mut bound = bind_actions(Names(Vec::new())).0;
         let mut wanted: Vec<&str> = actions()
             .iter()
-            .filter(|s| s.scope == scope)
+            .filter(|s| s.scope == scope && !HANDLED_BY_ROOT.contains(&s.name))
             .map(|s| s.name)
             .collect();
         bound.sort_unstable();
