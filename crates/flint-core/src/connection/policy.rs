@@ -5,15 +5,14 @@
 //! do that for a connection in a given [`Role`], and a [`CredentialGrant`] applies the answer to
 //! one connection: before its credential is resolved, before a refresh starts, and while a
 //! refresh runs, which a demotion ends. A denial fails closed: nothing is started or sent.
+//!
+//! A [`CredentialLease`] is one use of a grant. It ends at the first role the grant does not
+//! allow, and a later return to an allowed role does not bring it back, however quickly it came.
 
 use std::sync::Arc;
 
-use http::Request;
 use tokio::sync::watch;
-use tower::BoxError;
-use tower::filter::Predicate;
 
-use crate::auth_plugin;
 use crate::credential::CredentialSource;
 
 /// What a connection is to the app right now.
@@ -22,8 +21,26 @@ pub(crate) enum Role {
     /// The cluster the person is working in.
     Foreground,
     /// A cluster kept connected while another one is in front.
-    #[cfg_attr(not(test), expect(dead_code, reason = "no connection is demoted yet"))]
     Background,
+}
+
+const ROLES: [Role; 2] = [Role::Foreground, Role::Background];
+
+/// The current role, and how many times each role has been entered. The counts survive a change
+/// a watcher did not get to see, which the role alone does not.
+#[derive(Debug, Clone, Copy)]
+struct RoleState {
+    role: Role,
+    entered: [u64; ROLES.len()],
+}
+
+impl RoleState {
+    fn new(role: Role) -> Self {
+        RoleState {
+            role,
+            entered: [0; ROLES.len()],
+        }
+    }
 }
 
 /// Which credentials may run, for a connection in a role. Asked often and from async code, so it
@@ -63,7 +80,7 @@ impl CredentialPolicy for ForegroundOnly {
 #[derive(Clone)]
 pub(crate) struct CredentialAccess {
     policy: Arc<dyn CredentialPolicy>,
-    role: Arc<watch::Sender<Role>>,
+    role: Arc<watch::Sender<RoleState>>,
 }
 
 impl CredentialAccess {
@@ -72,7 +89,7 @@ impl CredentialAccess {
         expect(dead_code, reason = "not wired into a connection yet")
     )]
     pub(crate) fn new(policy: Arc<dyn CredentialPolicy>, role: Role) -> Self {
-        let (role, _) = watch::channel(role);
+        let (role, _) = watch::channel(RoleState::new(role));
         CredentialAccess {
             policy,
             role: Arc::new(role),
@@ -81,7 +98,7 @@ impl CredentialAccess {
 
     /// [`AlwaysAllow`], for a connection in the foreground.
     pub(crate) fn always() -> Self {
-        let (role, _) = watch::channel(Role::Foreground);
+        let (role, _) = watch::channel(RoleState::new(Role::Foreground));
         CredentialAccess {
             policy: Arc::new(AlwaysAllow),
             role: Arc::new(role),
@@ -91,7 +108,14 @@ impl CredentialAccess {
     /// Changes the role. A refresh the new role does not allow is ended.
     #[cfg_attr(not(test), expect(dead_code, reason = "no connection is demoted yet"))]
     pub(crate) fn set_role(&self, role: Role) {
-        self.role.send_replace(role);
+        self.role.send_if_modified(|state| {
+            let changed = state.role != role;
+            if changed {
+                state.role = role;
+                state.entered[role as usize] += 1;
+            }
+            changed
+        });
     }
 
     /// This access, for a connection whose credential comes from `source`.
@@ -118,31 +142,70 @@ impl CredentialGrant {
     /// Whether the credential may run now.
     pub(crate) fn allowed(&self) -> bool {
         // Copied out, so the policy runs without the channel's lock.
-        let role = *self.access.role.borrow();
+        let role = self.access.role.borrow().role;
         self.allows(role)
     }
 
-    /// Resolves once the credential may no longer run, at once if it may not now.
-    pub(crate) async fn revoked(&self) {
-        let mut changes = self.access.role.subscribe();
-        loop {
-            let role = *changes.borrow_and_update();
-            if !self.allows(role) || changes.changed().await.is_err() {
-                return;
-            }
+    /// Whether some role would stop this credential.
+    fn can_be_denied(&self) -> bool {
+        !ROLES.iter().all(|role| self.allows(*role))
+    }
+
+    /// One use of the credential, from now until the grant is first denied.
+    pub(crate) fn lease(&self) -> CredentialLease {
+        let state = *self.access.role.borrow();
+        CredentialLease {
+            began_allowed: self.allows(state.role),
+            entered: state.entered,
+            grant: self.clone(),
         }
+    }
+
+    /// Resolves once the credential may no longer run, at once if it may not now.
+    #[cfg(test)]
+    pub(crate) async fn revoked(&self) {
+        self.lease().revoked().await;
     }
 }
 
-/// Stops a request before an auth layer that would run the credential's program.
-impl<B> Predicate<Request<B>> for CredentialGrant {
-    type Request = Request<B>;
+/// One use of a [`CredentialGrant`]: a login, a refresh, a write's check, or the life of a
+/// connection whose command cannot be stopped. Once ended it stays ended.
+#[derive(Clone)]
+pub(crate) struct CredentialLease {
+    grant: CredentialGrant,
+    began_allowed: bool,
+    /// [`RoleState::entered`] when it began.
+    entered: [u64; ROLES.len()],
+}
 
-    fn check(&mut self, request: Request<B>) -> Result<Request<B>, BoxError> {
-        if self.allowed() {
-            Ok(request)
-        } else {
-            Err(auth_plugin::not_allowed().into())
+impl CredentialLease {
+    fn holds_in(&self, state: &RoleState) -> bool {
+        self.began_allowed
+            && ROLES.iter().all(|role| {
+                self.grant.allows(*role)
+                    || state.entered[*role as usize] == self.entered[*role as usize]
+            })
+    }
+
+    /// Whether no role the grant denies has been entered since this began.
+    pub(crate) fn holds(&self) -> bool {
+        let state = *self.grant.access.role.borrow();
+        self.holds_in(&state)
+    }
+
+    /// Whether the credential behind this can be stopped by a role at all.
+    pub(crate) fn can_be_denied(&self) -> bool {
+        self.grant.can_be_denied()
+    }
+
+    /// Resolves once this has ended, at once if it already has.
+    pub(crate) async fn revoked(&self) {
+        let mut changes = self.grant.access.role.subscribe();
+        loop {
+            let state = *changes.borrow_and_update();
+            if !self.holds_in(&state) || changes.changed().await.is_err() {
+                return;
+            }
         }
     }
 }

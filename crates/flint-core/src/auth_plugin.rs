@@ -119,12 +119,16 @@ pub(crate) async fn resolve_with_grant(
         return Ok(Resolved::default());
     };
     let auth = &mut config.auth_info;
+    let lease = grant.lease();
     let terminal = Terminal::acquire(exec.interactive_mode == Some(ExecInteractiveMode::Always));
     let credential = tokio::select! {
         biased;
-        () = grant.revoked() => return Err(not_allowed()),
+        () = lease.revoked() => return Err(not_allowed()),
         credential = run(&exec, terminal, || {}) => credential?,
     };
+    if !lease.holds() {
+        return Err(not_allowed());
+    }
     Ok(match credential {
         Credential::Certificate { certificate, key } => {
             // kube reads these as base64; the plugin's certificate replaces any in kubeconfig.
@@ -657,6 +661,10 @@ pub(crate) fn not_allowed() -> AuthError {
     AuthError::AuthExec(NOT_ALLOWED.to_owned())
 }
 
+fn is_not_allowed(error: &AuthError) -> bool {
+    matches!(error, AuthError::AuthExec(text) if text == NOT_ALLOWED)
+}
+
 /// Per context, bumped by [`retry_now`]: a rest taken before the latest bump is over.
 static RETRY_EPOCHS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u64>>> =
     std::sync::LazyLock::new(Default::default);
@@ -758,43 +766,48 @@ impl std::error::Error for SharedAuthError {
 impl RefreshingToken {
     /// The `Authorization` value to send now, refreshing the token first if it is due.
     pub(crate) async fn header(&self) -> Result<HeaderValue, BoxError> {
-        let refresh = {
-            let mut state = self.0.state.lock().await;
-            // The margin decides whether to refresh; a refresh's own result is used as it is
-            // (as kube does), even a token that expires within it.
-            if state.fresh() {
-                return bearer(&state.token);
-            }
-            if !self.0.grant.allowed() {
-                return Err(not_allowed().into());
-            }
-            if let Some(until) = state.rests_until() {
-                return Err(resting(&state.name(), until).into());
-            }
-            // Done, yet not taken down by its task: the task ended unexpectedly.
-            if state
-                .refreshing
-                .as_ref()
-                .is_some_and(|r| r.peek().is_some())
-            {
-                state.refreshing = None;
-            }
-            match &state.refreshing {
-                Some(refresh) => refresh.clone(),
-                None => {
-                    let terminal = Terminal::acquire(
-                        state.exec.interactive_mode == Some(ExecInteractiveMode::Always),
-                    );
-                    let refresh =
-                        self.start_refresh(state.exec.clone(), state.context.clone(), terminal);
-                    state.refreshing = Some(refresh.clone());
-                    refresh
+        loop {
+            let refresh = {
+                let mut state = self.0.state.lock().await;
+                // The margin decides whether to refresh; a refresh's own result is used as it is
+                // (as kube does), even a token that expires within it.
+                if state.fresh() {
+                    return bearer(&state.token);
                 }
-            }
-        };
-        match refresh.await {
-            Ok(token) => bearer(&token),
-            Err(error) => Err(SharedAuthError(error).into()),
+                if !self.0.grant.allowed() {
+                    return Err(not_allowed().into());
+                }
+                if let Some(until) = state.rests_until() {
+                    return Err(resting(&state.name(), until).into());
+                }
+                // Done, yet not taken down by its task: the task ended unexpectedly.
+                if state
+                    .refreshing
+                    .as_ref()
+                    .is_some_and(|r| r.peek().is_some())
+                {
+                    state.refreshing = None;
+                }
+                match &state.refreshing {
+                    Some(refresh) => refresh.clone(),
+                    None => {
+                        let terminal = Terminal::acquire(
+                            state.exec.interactive_mode == Some(ExecInteractiveMode::Always),
+                        );
+                        let refresh =
+                            self.start_refresh(state.exec.clone(), state.context.clone(), terminal);
+                        state.refreshing = Some(refresh.clone());
+                        refresh
+                    }
+                }
+            };
+            return match refresh.await {
+                Ok(token) => bearer(&token),
+                // That refresh was ended by a demotion, and the role has allowed it again since:
+                // its task has cleared it, so this request starts or joins a new one.
+                Err(error) if is_not_allowed(&error) && self.0.grant.allowed() => continue,
+                Err(error) => Err(SharedAuthError(error).into()),
+            };
         }
     }
 
@@ -808,7 +821,8 @@ impl RefreshingToken {
         terminal: impl Future<Output = Acquired> + Send + 'static,
     ) -> Shared<BoxFuture<'static, Refreshed>> {
         let state = self.0.state.clone();
-        let grant = self.0.grant.clone();
+        // Taken here, not in the task: a demotion before its first poll still ends it.
+        let lease = self.0.grant.lease();
         let name =
             redact::command_name(exec.command.as_deref().unwrap_or_default()).unwrap_or_default();
         let stopped = AuthError::AuthExec(format!("{STOPPED}{name}"));
@@ -816,7 +830,7 @@ impl RefreshingToken {
             let mut started = false;
             let result = tokio::select! {
                 biased;
-                () = grant.revoked() => None,
+                () = lease.revoked() => None,
                 result = tokio::time::timeout(
                     CONNECT_TIMEOUT,
                     run(&exec, terminal, || started = true),
@@ -825,7 +839,7 @@ impl RefreshingToken {
             let mut state = state.lock().await;
             state.refreshing = None;
             // Asked again with the lock held: a demotion may have come as the plugin finished.
-            let Some(result) = result.filter(|_| grant.allowed()) else {
+            let Some(result) = result.filter(|_| lease.holds()) else {
                 return Err(Arc::new(not_allowed()));
             };
             match result {

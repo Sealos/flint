@@ -451,33 +451,46 @@ pub(crate) async fn connect_gated_with_policy(
     let target = ready.target;
     let files = credential::files_in_use(files, ready.replaced_certificate);
     let (config, token, source, grant) = (ready.config, ready.token, ready.source, ready.grant);
+    let lease = grant.lease();
     tokio::task::spawn_blocking(move || {
-        // Making the auth layer can run a credential command: the role may have changed.
-        if !grant.allowed() {
-            return Err(kube::Error::Auth(crate::auth_plugin::not_allowed()));
-        }
-        // Once: making it can run a credential command, which both clients then share.
+        // Each of these steps can run a credential command, which cannot be stopped once started:
+        // the role is asked before each, and after the last.
+        let still_held = || {
+            if lease.holds() {
+                Ok(())
+            } else {
+                Err(kube::Error::Auth(crate::auth_plugin::not_allowed()))
+            }
+        };
+        still_held()?;
+        // Once: both clients then share it.
         let auth = kube::client::ConfigExt::auth_layer(&config)?.map(std::sync::Arc::new);
+        let guarded = auth
+            .as_ref()
+            .and_then(|layer| credential::GuardedProvider::guarding(layer, &lease));
+        still_held()?;
         let read = build_client(
             &config,
             token.clone(),
             auth.as_deref(),
-            Some(&grant),
+            guarded.as_ref(),
             Access::ReadOnly,
         )?;
+        still_held()?;
         let write = build_client(
             &config,
             token.clone(),
             auth.as_deref(),
-            Some(&grant),
+            guarded.as_ref(),
             Access::Unrestricted,
         )?;
+        still_held()?;
         Ok::<_, kube::Error>(GatedConnection {
             clients: ClusterClients {
                 read,
                 writes: WriteAccess::new(write),
             },
-            credential: WriteCredential::with_grant(files, source, token, auth, grant),
+            credential: WriteCredential::with_grant(files, source, token, auth, grant, guarded),
         })
     })
     .await
@@ -642,8 +655,8 @@ fn http_connector() -> hyper_util::client::legacy::connect::HttpConnector {
 /// kube only records and Flint never reads). A kubeconfig with a proxy goes through kube's own
 /// builder in [`connect`], before any exec plugin runs, which reports that proxies are not
 /// supported, as before. `token` is the refreshing token of an exec auth plugin
-/// ([`crate::auth_plugin::resolve_with_grant`]), set after kube's auth layer. `grant`, if any, is
-/// asked before that auth layer on each request.
+/// ([`crate::auth_plugin::resolve_with_grant`]), set after kube's auth layer. `guarded`, if any,
+/// stands in for `auth` on requests, because `auth` could run a command a role may forbid.
 #[expect(
     clippy::disallowed_types,
     reason = "the one place that assembles a client"
@@ -652,7 +665,7 @@ fn build_client(
     config: &kube::Config,
     token: Option<crate::auth_plugin::RefreshingToken>,
     auth: Option<&kube::client::middleware::AuthLayer>,
-    grant: Option<&CredentialGrant>,
+    guarded: Option<&credential::GuardedProvider>,
     access: Access,
 ) -> Result<Client, kube::Error> {
     use kube::client::ConfigExt;
@@ -674,14 +687,8 @@ fn build_client(
         .map_err(tower::BoxError::from)
         .service(http);
     let authed = ServiceBuilder::new()
-        // Outside kube's auth layer, which can run an auth provider's command on any request.
-        .option_layer(
-            grant
-                .filter(|_| auth.is_some())
-                .cloned()
-                .map(tower::filter::FilterLayer::new),
-        )
-        .option_layer(auth)
+        .option_layer(guarded.cloned().map(tower::filter::AsyncFilterLayer::new))
+        .option_layer(auth.filter(|_| guarded.is_none()))
         .option_layer(token.map(crate::auth_plugin::TokenLayer::new))
         .service(transport.clone());
     let service = ServiceBuilder::new()

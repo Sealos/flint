@@ -7,6 +7,7 @@ use kube::config::Kubeconfig;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::*;
+use crate::auth_plugin;
 use crate::auth_plugin::tests::{FakePlugin, wait_dead, wait_reaped};
 use crate::cluster::{self, ClusterError, PluginProblem};
 use crate::write::WriteError;
@@ -345,6 +346,197 @@ async fn always_allow_refreshes_in_any_role() {
         .unwrap();
     assert_eq!(runs(&plugin), 2);
     assert_eq!(api.requests(), 2);
+}
+
+#[tokio::test]
+async fn a_demotion_undone_at_once_still_ends_the_running_refresh() {
+    let plugin = expiring(
+        "if [ \"$n\" = 2 ]; then\n\
+         sleep 600 &\n\
+         echo $! > \"$PLUGIN_DIR/child.tmp\" && mv \"$PLUGIN_DIR/child.tmp\" \"$PLUGIN_DIR/child\"\n\
+         wait\n\
+         fi\n\
+         printf '{\"status\":{\"token\":\"t-next\",\
+         \"expirationTimestamp\":\"2999-01-01T00:00:00Z\"}}'",
+    );
+    let api = CountingApi::start().await;
+    let access = foreground_only(Role::Foreground);
+    let connection =
+        cluster::connect_gated_with_policy(&plugin.kubeconfig(&api.url), "ctx", &access)
+            .await
+            .unwrap_or_else(|_| panic!("the foreground connect runs the plugin"));
+    let read = connection.clients.read.clone();
+    let request = tokio::spawn(async move { cluster::server_version(&read).await });
+    let child_file = plugin.dir.path().join("child");
+    for _ in 0..500 {
+        if child_file.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let child: libc::pid_t = std::fs::read_to_string(&child_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let login = plugin.starts()[1];
+
+    // With no await between them, a watcher of the role sees only the last value.
+    access.set_role(Role::Background);
+    access.set_role(Role::Foreground);
+
+    wait_reaped(login).await;
+    wait_dead(child).await;
+    // The old run is over; being in front again, the request gets a run of its own.
+    tokio::time::timeout(Duration::from_secs(10), request)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_or_else(|_| panic!("the foreground request refreshes again"));
+    assert_eq!(runs(&plugin), 3);
+    assert_eq!(api.requests(), 1);
+}
+
+#[tokio::test]
+async fn a_plugin_token_with_no_expiry_keeps_reading_after_a_demotion() {
+    let plugin = FakePlugin::new(
+        "echo run >> \"$PLUGIN_DIR/runs\"\n\
+         printf '{\"status\":{\"token\":\"t-lasting\"}}'\n",
+    );
+    let api = CountingApi::start().await;
+    let access = foreground_only(Role::Foreground);
+    let connection =
+        cluster::connect_gated_with_policy(&plugin.kubeconfig(&api.url), "ctx", &access)
+            .await
+            .unwrap_or_else(|_| panic!("the foreground connect runs the plugin"));
+    access.set_role(Role::Background);
+
+    cluster::server_version(&connection.clients.read)
+        .await
+        .unwrap_or_else(|_| panic!("a cached credential needs nothing run"));
+    assert_eq!(runs(&plugin), 1);
+    assert_eq!(api.requests(), 1);
+
+    let write = connection
+        .credential
+        .present(connection.clients.read.clone())
+        .await;
+    assert!(matches!(write, Err(WriteError::IdentityUnverified)));
+    assert_eq!(runs(&plugin), 1);
+}
+
+/// A provider whose first run after a `hold` file appears waits for a `release` file, for at most
+/// ten seconds, since a command kube started cannot be killed.
+fn held_provider_kubeconfig(server: &str, dir: &Path) -> (Kubeconfig, PathBuf) {
+    let (script, count) = (dir.join("provider"), dir.join("count"));
+    let (hold, started) = (dir.join("hold"), dir.join("started"));
+    let release = dir.join("release");
+    std::fs::write(
+        &script,
+        format!(
+            "echo run >> {count}\n\
+             if [ -e {hold} ] && [ ! -e {started} ]; then\n\
+             : > {started}\n\
+             i=0\n\
+             while [ ! -e {release} ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done\n\
+             fi\n\
+             printf '{{\"token\":\"t-provider\",\"expiry\":\"2020-01-01T00:00:00Z\"}}'\n",
+            count = count.display(),
+            hold = hold.display(),
+            started = started.display(),
+            release = release.display(),
+        ),
+    )
+    .unwrap();
+    let kubeconfig = Kubeconfig::from_yaml(&format!(
+        "apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: {server}\n\
+         users:\n- name: u\n  user:\n    auth-provider:\n      name: gcp\n      config:\n        \
+         cmd-path: /bin/sh\n        cmd-args: {script}\n        token-key: '{{.token}}'\n        \
+         expiry-key: '{{.expiry}}'\ncontexts:\n- name: ctx\n  context:\n    cluster: c\n    \
+         user: u\n",
+        script = script.display(),
+    ))
+    .unwrap();
+    (kubeconfig, count)
+}
+
+#[tokio::test]
+async fn a_demoted_provider_starts_no_queued_command_and_stays_unusable() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = CountingApi::start().await;
+    let (kubeconfig, count) = held_provider_kubeconfig(&api.url, dir.path());
+    let access = foreground_only(Role::Foreground);
+    let connection = cluster::connect_gated_with_policy(&kubeconfig, "ctx", &access)
+        .await
+        .unwrap_or_else(|_| panic!("the foreground connect builds the auth layer"));
+    let ran = count_of(&count);
+    std::fs::write(dir.path().join("hold"), "").unwrap();
+
+    let read = connection.clients.read.clone();
+    let running = tokio::spawn(async move { cluster::server_version(&read).await });
+    let started = dir.path().join("started");
+    for _ in 0..500 {
+        if started.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(started.exists());
+    let read = connection.clients.read.clone();
+    let queued = tokio::spawn(async move { cluster::server_version(&read).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    access.set_role(Role::Background);
+    std::fs::write(dir.path().join("release"), "").unwrap();
+
+    for request in [running, queued] {
+        let error = tokio::time::timeout(Duration::from_secs(15), request)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect_err("a demoted connection sends nothing");
+        assert!(is_not_allowed(&error));
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        count_of(&count),
+        ran + 1,
+        "no command starts after the demotion"
+    );
+
+    // Only a new connection may run the command again.
+    access.set_role(Role::Foreground);
+    let error = cluster::server_version(&connection.clients.read)
+        .await
+        .unwrap_err();
+    assert!(is_not_allowed(&error));
+    let write = connection
+        .credential
+        .present(connection.clients.read.clone())
+        .await;
+    assert!(matches!(write, Err(WriteError::IdentityUnverified)));
+    assert_eq!(count_of(&count), ran + 1);
+    assert_eq!(api.requests(), 0);
+}
+
+#[tokio::test]
+async fn always_allow_keeps_an_auth_provider_running_in_any_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = CountingApi::start().await;
+    let (kubeconfig, count) = provider_kubeconfig(&api.url, dir.path());
+    let access = CredentialAccess::new(Arc::new(AlwaysAllow), Role::Foreground);
+    let connection = cluster::connect_gated_with_policy(&kubeconfig, "ctx", &access)
+        .await
+        .unwrap_or_else(|_| panic!("every credential may run"));
+    let ran = count_of(&count);
+    access.set_role(Role::Background);
+    access.set_role(Role::Foreground);
+    access.set_role(Role::Background);
+    cluster::server_version(&connection.clients.read)
+        .await
+        .unwrap_or_else(|_| panic!("every credential may run"));
+    assert_eq!(count_of(&count), ran + 1);
+    assert_eq!(api.requests(), 1);
 }
 
 #[test]
