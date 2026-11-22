@@ -62,9 +62,9 @@ Open the release on [GitHub Releases](https://github.com/Sealos/flint/releases),
   ```
 
   It succeeds only if the file's digest was attested by a workflow run in `Sealos/flint`. To also pin the workflow,
-  add `--signer-workflow Sealos/flint/.github/workflows/release-please.yml`. v0.3.1 and earlier have no attestations.
+  add `--signer-workflow Sealos/flint/.github/workflows/release-please.yml`. v0.4.0 and earlier have no build provenance, so `gh attestation verify` with its default predicate fails on them.
 
-The `publish` job already checks that all twelve files are on the draft, non-empty and matching their checksums, and
+The `publish` job already checks that all 24 files (the twelve binaries and SBOMs, each with its `.sha256`) are on the draft, non-empty and matching their checksums, and
 that the release ends up published (and Latest when it should be). This step confirms what someone downloading it
 sees.
 
