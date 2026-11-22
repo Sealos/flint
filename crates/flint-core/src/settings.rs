@@ -624,22 +624,20 @@ fn config_dir_from(
 
 pub fn load_settings(dir: &Path) -> Result<Settings, SettingsError> {
     let path = dir.join(SETTINGS_FILE);
-    let settings = load_toml(&path)?;
-    validate(&settings, &path)?;
+    let Some(text) = read_settings_text(&path)? else {
+        return Ok(Settings::default());
+    };
+    let (settings, table) = parse_settings(&text, &path)?;
     // Unknown keys are ignored, so a newer file still loads; a misspelling of a known key
     // (`protect_local_cluster`) would then fail open without a word. Say so in the log.
-    if let Ok(text) = std::fs::read_to_string(&path)
-        && let Ok(table) = toml::from_str::<toml::Table>(&text)
-    {
-        for (unknown, known) in misspelled_keys(&table) {
-            tracing::warn!(
-                "settings.toml: unknown key `{unknown}` is ignored; did you mean `{known}`?"
-            );
-        }
-        if let Some(section) = table.get(thresholds::SECTION_KEY) {
-            for issue in ThresholdSettings::from_toml(section).1 {
-                tracing::warn!("settings.toml: {issue}");
-            }
+    for (unknown, known) in misspelled_keys(&table) {
+        tracing::warn!(
+            "settings.toml: unknown key `{unknown}` is ignored; did you mean `{known}`?"
+        );
+    }
+    if let Some(section) = table.get(thresholds::SECTION_KEY) {
+        for issue in ThresholdSettings::from_toml(section).1 {
+            tracing::warn!("settings.toml: {issue}");
         }
     }
     Ok(settings)
@@ -797,7 +795,11 @@ pub fn load_state(dir: &Path) -> Result<State, SettingsError> {
 }
 
 pub fn save_state(dir: &Path, state: &State) -> Result<(), SettingsError> {
-    write_atomic(&dir.join(STATE_FILE), &toml::to_string_pretty(state)?)
+    write_atomic(
+        &dir.join(STATE_FILE),
+        &toml::to_string_pretty(state)?,
+        DanglingLink::Replace,
+    )
 }
 
 /// Server URLs compare equal when they differ only by a trailing slash.
@@ -1149,21 +1151,18 @@ pub fn set_log_buffer_mib(dir: &Path, mib: u32) -> Result<Settings, SettingsErro
     })
 }
 
-/// Reads `settings.toml` as a TOML table, lets `edit` change it, checks the result still parses
-/// as [`Settings`], and writes it. Keys this version does not know survive; comments and
-/// formatting are not preserved.
+/// Reads `settings.toml`, lets `edit` change it as a TOML table, checks the result still parses
+/// as [`Settings`], and writes it. A file that does not load today is left as it is, so an edit
+/// cannot bring its other values into effect. Keys this version does not know survive; comments
+/// and formatting are not preserved.
 fn edit_settings(
     dir: &Path,
     edit: impl FnOnce(&mut toml::Table, &Path) -> Result<(), SettingsError>,
 ) -> Result<Settings, SettingsError> {
     let path = dir.join(SETTINGS_FILE);
-    let mut table: toml::Table = match std::fs::read_to_string(&path) {
-        Ok(text) => toml::from_str(&text).map_err(|source| SettingsError::Parse {
-            path: path.clone(),
-            source,
-        })?,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => toml::Table::new(),
-        Err(source) => return Err(SettingsError::Read { path, source }),
+    let mut table = match read_settings_text(&path)? {
+        Some(text) => parse_settings(&text, &path)?.1,
+        None => toml::Table::new(),
     };
     edit(&mut table, &path)?;
     let text = toml::to_string_pretty(&table)?;
@@ -1172,21 +1171,26 @@ fn edit_settings(
         source,
     })?;
     validate(&settings, &path)?;
-    write_atomic(&path, &text)?;
+    write_atomic(&path, &text, DanglingLink::Keep)?;
     Ok(settings)
 }
 
 fn load_toml<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T, SettingsError> {
+    match read_toml(path)? {
+        Some(text) => parse_toml(&text, path),
+        None => Ok(T::default()),
+    }
+}
+
+/// The text of the file at `path`, or `None` if there is no file.
+fn read_toml(path: &Path) -> Result<Option<String>, SettingsError> {
     match std::fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).map_err(|source| SettingsError::Parse {
-            path: path.to_owned(),
-            source,
-        }),
+        Ok(text) => Ok(Some(text)),
         // A missing file is a fresh install. A symlink whose target is missing is not: the
         // user keeps the file elsewhere, and it may have said something (such as
         // `protect_local_clusters`) that defaults would quietly undo.
         Err(e) if e.kind() == io::ErrorKind::NotFound && path.symlink_metadata().is_err() => {
-            Ok(T::default())
+            Ok(None)
         }
         Err(source) => Err(SettingsError::Read {
             path: path.to_owned(),
@@ -1195,9 +1199,57 @@ fn load_toml<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T, S
     }
 }
 
+/// The text of `settings.toml`, or `None` on a first run. A config directory reached through a
+/// link that leads nowhere is not a first run: the file may be there once the link resolves.
+fn read_settings_text(path: &Path) -> Result<Option<String>, SettingsError> {
+    let text = read_toml(path)?;
+    if text.is_none() && behind_dangling_link(path) {
+        return Err(SettingsError::Read {
+            path: path.to_owned(),
+            source: io::ErrorKind::NotFound.into(),
+        });
+    }
+    Ok(text)
+}
+
+/// Whether the deepest part of `path` that exists is a link that cannot be followed.
+fn behind_dangling_link(path: &Path) -> bool {
+    path.ancestors()
+        .find(|p| {
+            !p.symlink_metadata()
+                .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+        })
+        .is_some_and(|p| std::fs::metadata(p).is_err())
+}
+
+/// `text` as [`Settings`] and as a table, both from this one text, checked with [`validate`].
+/// The table is what an edit changes, so a text only one of the two accepts is refused.
+fn parse_settings(text: &str, path: &Path) -> Result<(Settings, toml::Table), SettingsError> {
+    let settings: Settings = parse_toml(text, path)?;
+    let table: toml::Table = parse_toml(text, path)?;
+    validate(&settings, path)?;
+    Ok((settings, table))
+}
+
+fn parse_toml<T: for<'de> Deserialize<'de>>(text: &str, path: &Path) -> Result<T, SettingsError> {
+    toml::from_str(text).map_err(|source| SettingsError::Parse {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+/// What a save does when the file is a symlink whose target is missing.
+#[derive(Clone, Copy, PartialEq)]
+enum DanglingLink {
+    /// Fail and leave the link, which still says where the file lives.
+    Keep,
+    /// Put a regular file in its place: losing the link costs less than losing the save.
+    Replace,
+}
+
 /// Writes through a temporary file and a rename, so a reader (the MCP server re-reads settings on
 /// every call) never sees a half-written file.
-fn write_atomic(path: &Path, text: &str) -> Result<(), SettingsError> {
+fn write_atomic(path: &Path, text: &str, dangling: DanglingLink) -> Result<(), SettingsError> {
     let err = |source| SettingsError::Write {
         path: path.to_owned(),
         source,
@@ -1206,7 +1258,18 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), SettingsError> {
         std::fs::create_dir_all(parent).map_err(err)?;
     }
     // Write through a symlink (for example a dotfiles checkout) instead of replacing the link.
-    let path = &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let path = &match std::fs::canonicalize(path) {
+        Ok(resolved) => resolved,
+        Err(_)
+            if dangling == DanglingLink::Replace
+                || path
+                    .symlink_metadata()
+                    .is_err_and(|e| e.kind() == io::ErrorKind::NotFound) =>
+        {
+            path.to_owned()
+        }
+        Err(source) => return Err(err(source)),
+    };
     let tmp = path.with_extension(format!("toml.tmp-{}", std::process::id()));
     std::fs::write(&tmp, text).map_err(err)?;
     std::fs::rename(&tmp, path).map_err(err)
@@ -2490,6 +2553,313 @@ mod tests {
         .unwrap();
         let loaded = load_state(dir.path()).unwrap();
         assert!(!loaded.list_sorts["a"]["pods"].descending);
+    }
+
+    /// Pins that would be in effect if the file were taken at its word, followed by `tail`.
+    fn pinned_file(tail: &str) -> String {
+        format!(
+            r#"protect_local_clusters = false
+appearance = "dark"
+
+[[ai_exposed_clusters]]
+context = "staging"
+server = "https://staging.example:6443"
+
+[[trusted_clusters]]
+context = "staging"
+server = "https://staging.example:6443"
+
+{tail}
+"#
+        )
+    }
+
+    /// Every setter, each returning whether it failed.
+    fn setter_results(dir: &Path) -> Vec<(&'static str, bool)> {
+        let server = "https://staging.example:6443";
+        let scope = AiScope::default();
+        vec![
+            // Before `set_ai_exposed`, which hides the cluster this needs exposed.
+            (
+                "set_ai_scope",
+                set_ai_scope(dir, "staging", server, &scope, &scope).is_err(),
+            ),
+            (
+                "set_ai_exposed",
+                set_ai_exposed(dir, "staging", None, &scope).is_err(),
+            ),
+            ("set_trusted", set_trusted(dir, "staging", None).is_err()),
+            (
+                "set_watch_mode",
+                set_watch_mode(dir, None, Some(WatchMode::All)).is_err(),
+            ),
+            (
+                "set_cluster_name",
+                set_cluster_name(dir, "staging", Some("name")).is_err(),
+            ),
+            (
+                "set_cluster_tag",
+                set_cluster_tag(dir, "staging", server, Some(ClusterTag::Blue)).is_err(),
+            ),
+            (
+                "set_appearance",
+                set_appearance(dir, Appearance::Light).is_err(),
+            ),
+            (
+                "set_log_buffer_lines",
+                set_log_buffer_lines(dir, 5000).is_err(),
+            ),
+            ("set_log_buffer_mib", set_log_buffer_mib(dir, 8).is_err()),
+        ]
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_edited_is_unreadable() {
+        for tail in [
+            "future = 9223372036854775808",
+            "[future]\nnested = 9223372036854775808",
+            "[future.deeper]\nlist = [1, 9223372036854775808]",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(SETTINGS_FILE);
+            let text = pinned_file(tail);
+            std::fs::write(&path, &text).unwrap();
+            assert!(toml::from_str::<toml::Table>(&text).is_err(), "{tail}");
+
+            assert!(
+                matches!(load_settings(dir.path()), Err(SettingsError::Parse { .. })),
+                "{tail}"
+            );
+            let (settings, reason) = load_settings_or_fallback(dir.path());
+            assert_eq!(settings, Settings::default().unreadable_fallback());
+            assert!(settings.ai_exposed_clusters.is_empty());
+            assert!(settings.trusted_clusters.is_empty());
+            assert!(settings.protect_local_clusters);
+            let reason = reason.expect("the reason is shown");
+            assert!(!reason.contains("9223372036854775808"), "{reason}");
+
+            for (setter, failed) in setter_results(dir.path()) {
+                assert!(failed, "{setter} on {tail}");
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    text.as_bytes(),
+                    "{setter} on {tail}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn files_readable_both_ways_load_unchanged() {
+        let largest = i64::MAX;
+        for tail in [
+            String::new(),
+            "future = 1".to_owned(),
+            format!("future = {largest}\nbelow = {}", i64::MIN),
+            "created = 2026-11-22T10:30:00Z\nday = 2026-11-22\nat = 10:30:00\nlocal = 2026-11-22T10:30:00.5".to_owned(),
+            "[future.deeper.still]\nratio = 1.5\non = true\nlist = [1, 2, 3]".to_owned(),
+            "[[future]]\nname = \"a\"\n[[future]]\nname = \"b\"\n[future.inner]\nn = 2".to_owned(),
+            "[cluster_names]\nstaging = \"Staging\"\n[cluster_watch_mode]\nstaging = \"all\"".to_owned(),
+            "[[cluster_tags]]\ncontext = \"staging\"\nserver = \"https://staging.example:6443\"\ntag = \"blue\"\nfuture = 2026-11-22".to_owned(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let text = pinned_file(&tail);
+            std::fs::write(dir.path().join(SETTINGS_FILE), &text).unwrap();
+            toml::from_str::<toml::Table>(&text).unwrap();
+            let typed: Settings = toml::from_str(&text).unwrap();
+
+            let loaded = load_settings(dir.path()).unwrap();
+            assert_eq!(loaded, typed, "{tail}");
+            assert_eq!(loaded.ai_exposed_clusters.len(), 1, "{tail}");
+            assert_eq!(loaded.trusted_clusters.len(), 1, "{tail}");
+            assert!(!loaded.protect_local_clusters, "{tail}");
+            assert_eq!(load_settings_or_fallback(dir.path()), (typed, None));
+            for (setter, failed) in setter_results(dir.path()) {
+                assert!(!failed, "{setter} on {tail}");
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!(
+            "log_buffer_lines = {max}\nlog_buffer_mib = {max}\nlog_total_mib = {max}\n",
+            max = u32::MAX
+        );
+        std::fs::write(dir.path().join(SETTINGS_FILE), &text).unwrap();
+        let loaded = load_settings(dir.path()).unwrap();
+        assert_eq!(loaded, toml::from_str::<Settings>(&text).unwrap());
+        assert_eq!(loaded.log_buffer_lines, u32::MAX);
+        assert_eq!(loaded.log_buffer_mib, u32::MAX);
+        assert_eq!(loaded.log_total_mib, u32::MAX);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_through_a_dangling_symlink_keeps_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("dotfiles.toml");
+        let link = dir.path().join(SETTINGS_FILE);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        for (setter, failed) in setter_results(dir.path()) {
+            assert!(failed, "{setter}");
+            assert_eq!(std::fs::read_link(&link).unwrap(), target, "{setter}");
+            assert!(!target.exists(), "{setter}");
+        }
+        // The target can vanish after the file was read, too.
+        assert!(matches!(
+            write_atomic(&link, "appearance = \"light\"\n", DanglingLink::Keep),
+            Err(SettingsError::Write { .. })
+        ));
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert!(!target.exists());
+        let leftovers = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(leftovers, 1, "only the link remains");
+
+        // Once the target is back, the link still leads to it and saves go through it.
+        std::fs::write(&target, "protect_local_clusters = true\n").unwrap();
+        assert!(load_settings(dir.path()).unwrap().protect_local_clusters);
+        set_appearance(dir.path(), Appearance::Light).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        let saved: Settings = toml::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert!(saved.protect_local_clusters);
+        assert_eq!(saved.appearance, Appearance::Light);
+    }
+
+    #[test]
+    fn a_save_creates_a_missing_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("not-yet").join("config");
+        set_appearance(&config, Appearance::Light).unwrap();
+        assert_eq!(
+            load_settings(&config).unwrap().appearance,
+            Appearance::Light
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_dir_behind_a_dangling_link_is_unreadable() {
+        let root = tempfile::tempdir().unwrap();
+        let gone = root.path().join("gone");
+        let link = root.path().join("config");
+        std::os::unix::fs::symlink(&gone, &link).unwrap();
+        let chained = root.path().join("chained");
+        std::os::unix::fs::symlink(&link, &chained).unwrap();
+
+        for dir in [link.clone(), chained, link.join("nested").join("flint")] {
+            assert!(
+                matches!(load_settings(&dir), Err(SettingsError::Read { .. })),
+                "{}",
+                dir.display()
+            );
+            let (settings, reason) = load_settings_or_fallback(&dir);
+            assert_eq!(settings, Settings::default().unreadable_fallback());
+            assert!(reason.is_some(), "{}", dir.display());
+            for (setter, failed) in setter_results(&dir) {
+                assert!(failed, "{setter} on {}", dir.display());
+            }
+            assert_eq!(std::fs::read_link(&link).unwrap(), gone);
+            assert!(!gone.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_config_dir_or_file_is_a_first_run() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("not-yet").join("flint");
+        assert_eq!(
+            load_settings_or_fallback(&missing),
+            (Settings::default(), None)
+        );
+
+        // A link to a directory that exists, with no settings file in it yet.
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = root.path().join("config");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(
+            load_settings_or_fallback(&link),
+            (Settings::default(), None)
+        );
+        assert_eq!(
+            load_settings_or_fallback(&link.join("not-yet")),
+            (Settings::default(), None)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_state_save_replaces_a_dangling_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("gone-state.toml");
+        let link = dir.path().join(STATE_FILE);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut state = State::default();
+        state
+            .namespace_filters
+            .insert("kind-dev".into(), vec!["demo".into()]);
+        save_state(dir.path(), &state).unwrap();
+
+        assert!(link.symlink_metadata().unwrap().file_type().is_file());
+        assert!(!target.exists());
+        assert_eq!(load_state(dir.path()).unwrap(), state);
+    }
+
+    #[test]
+    fn a_file_that_does_not_load_is_not_edited() {
+        let pinned = pinned_file("");
+        for text in [
+            pinned.replace("appearance = \"dark\"", "appearance = 'purple'"),
+            format!("watch_mode = 'sometimes'\n{pinned}"),
+            format!("log_buffer_lines = -1\n{pinned}"),
+            pinned.replace(
+                "[[trusted_clusters]]",
+                "namespaces = [\" \"]\n\n[[trusted_clusters]]",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(SETTINGS_FILE);
+            std::fs::write(&path, &text).unwrap();
+            assert!(load_settings(dir.path()).is_err(), "{text}");
+
+            for (setter, failed) in setter_results(dir.path()) {
+                assert!(failed, "{setter} on {text}");
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    text.as_bytes(),
+                    "{setter} on {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typed_and_table_parsing_use_the_given_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE);
+        std::fs::write(
+            &path,
+            "appearance = \"light\"\nfuture = 9223372036854775808\n",
+        )
+        .unwrap();
+
+        let (settings, table) =
+            parse_settings("appearance = \"dark\"\nfuture = 1\n", &path).unwrap();
+        assert_eq!(settings.appearance, Appearance::Dark);
+        assert_eq!(table["appearance"].as_str(), Some("dark"));
+        assert_eq!(table["future"].as_integer(), Some(1));
+
+        // The text alone decides: what is on disk, valid or not, plays no part.
+        std::fs::write(&path, "appearance = \"light\"\n").unwrap();
+        assert!(matches!(
+            parse_settings("future = 9223372036854775808\n", &path),
+            Err(SettingsError::Parse { .. })
+        ));
+        std::fs::remove_file(&path).unwrap();
+        let (settings, _) = parse_settings("appearance = \"dark\"\n", &path).unwrap();
+        assert_eq!(settings.appearance, Appearance::Dark);
     }
 
     #[test]

@@ -77,6 +77,7 @@ impl Inner {
     /// path, waiting at most [`RECORD_WAIT`]. A record that could not be written in time, or at
     /// all, is logged.
     async fn record(&self, record: activity::ActivityRecord, reached: activity::Reached) {
+        let record = names_only(record);
         let dir = self.config_dir.clone();
         let write =
             tokio::task::spawn_blocking(move || activity::append_call(&dir, &record, &reached));
@@ -87,6 +88,35 @@ impl Inner {
             Err(_) => tracing::warn!("the agent activity log was not written in time"),
         }
     }
+}
+
+/// Invalid argument names are recorded by size.
+fn names_only(mut record: activity::ActivityRecord) -> activity::ActivityRecord {
+    let keep = |value: &mut Option<String>, valid: fn(&str) -> bool| {
+        if let Some(text) = value.as_mut().filter(|text| !valid(text)) {
+            *text = activity::size_only(text);
+        }
+    };
+    // Kind selectors are trimmed when resolved, so a padded one still names the kind it read.
+    if record.tool != "get_events"
+        && let Some(kind) = record.kind.as_mut()
+        && kind.trim().len() != kind.len()
+    {
+        *kind = kind.trim().to_owned();
+    }
+    let kind = match record.tool.as_str() {
+        "get_events" => is_event_object_kind,
+        _ => policy::is_object_name,
+    };
+    let name = match record.tool.as_str() {
+        "get_pod_logs" => policy::is_pod_name,
+        _ => policy::is_object_name,
+    };
+    keep(&mut record.kind, kind);
+    keep(&mut record.namespace, policy::is_label_name);
+    keep(&mut record.name, name);
+    keep(&mut record.container, policy::is_label_name);
+    record
 }
 
 /// Discovery results for one cluster.
@@ -324,14 +354,11 @@ tokio::task_local! {
     static CALL: std::cell::RefCell<CallNote>;
 }
 
-/// What a call's raw arguments name, for a call rejected before its tool ran: only string
-/// values without control characters, under the names the tools use. [`activity::append`] caps
-/// their length.
+/// The string arguments that name resources, including on calls rejected by the schema.
 fn named_in(arguments: Option<&serde_json::Map<String, Value>>) -> Named {
     let text = |keys: &[&str]| {
         keys.iter()
             .find_map(|k| arguments?.get(*k)?.as_str())
-            .filter(|value| !value.chars().any(char::is_control))
             .map(str::to_owned)
     };
     Named {
@@ -384,6 +411,10 @@ fn check_namespace(namespace: Option<&str>) -> Result<(), ToolError> {
         Some(ns) if !policy::is_label_name(ns) => Err(not_found("namespaces", ns)),
         _ => Ok(()),
     }
+}
+
+fn is_event_object_kind(kind: &str) -> bool {
+    !kind.is_empty() && kind.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// Whether `kind` is core v1 Secret, whose values are never shown.
@@ -1454,7 +1485,7 @@ impl FlintMcp {
         if let Some(kind) = p
             .object_kind
             .as_deref()
-            .filter(|k| !k.chars().all(|c| c.is_ascii_alphanumeric()) || k.is_empty())
+            .filter(|k| !is_event_object_kind(k))
         {
             return Err(not_found("kinds", kind));
         }
@@ -2102,13 +2133,6 @@ mod tests {
             !text.chars().any(|c| c.is_control() || c == '\u{202e}'),
             "{text:?}"
         );
-
-        // A value with control characters is not kept for the activity log.
-        let named = named_in(Some(&arguments(
-            json!({"cluster": "a\u{1b}[2Jb", "kind": "pods"}),
-        )));
-        assert_eq!(named.cluster, None);
-        assert_eq!(named.kind.as_deref(), Some("pods"));
 
         // A name past the limit is not read or echoed, not even its start.
         let huge = format!("hunter2{}", "x".repeat(UNSUPPORTED_NAME_BYTES));

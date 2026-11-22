@@ -1,4 +1,4 @@
-# Memory and startup benchmark
+# Memory benchmark
 
 How to measure Flint's memory with a large list, and what has and has not been measured. Numbers here come from
 runs of `scripts/benchmark.sh`; anything not run is listed under [Not measured](#not-measured), not estimated.
