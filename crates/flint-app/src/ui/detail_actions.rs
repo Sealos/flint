@@ -20,6 +20,7 @@ use super::super::registry::{
     ToggleManagedFields, ToggleSecretValue,
 };
 use super::super::terminal_model::ShellRequest;
+use super::access::Gated;
 use super::{
     DetailEvent, DetailTab, DetailView, Fetch, PENDING_TIMEOUT, Pending, Pods, Subject, TakeFocus,
     Waiting,
@@ -352,7 +353,7 @@ impl DetailView {
 
     /// The app containers of the fetched pod; empty for other kinds or before the fetch.
     fn pod_shell_containers(&self) -> impl Iterator<Item = &super::super::object::PodContainer> {
-        self.log_containers().iter().filter(|c| !c.init)
+        self.fetched_containers().iter().filter(|c| !c.init)
     }
 
     /// Why the fetched pod takes no shell any more: it finished or is being deleted.
@@ -431,6 +432,11 @@ impl DetailView {
             return Err(ActionError::rejected::<A>(protected_reason(
                 &self.object.cluster,
             )));
+        }
+        if self.subject != Subject::Other
+            && let Some(why) = self.access.forbidden(Gated::Shell)
+        {
+            return Err(ActionError::rejected::<A>(why));
         }
         let target = match self.subject {
             Subject::Other => {
@@ -579,8 +585,16 @@ impl DetailView {
         }
     }
 
-    /// The fetched pod's containers; empty for other kinds or before the fetch.
+    /// The containers Logs can pick from: the fetched pod's, none while RBAC forbids its logs.
     pub(in crate::ui) fn log_containers(&self) -> &[super::super::object::PodContainer] {
+        if self.access.forbidden(Gated::Logs).is_some() {
+            return &[];
+        }
+        self.fetched_containers()
+    }
+
+    /// The fetched pod's containers; empty for other kinds or before the fetch.
+    fn fetched_containers(&self) -> &[super::super::object::PodContainer] {
         match &self.fetch {
             Fetch::Loaded { overview, .. } => &overview.containers,
             _ => &[],
@@ -596,6 +610,11 @@ impl DetailView {
         container: Option<&str>,
         previous: bool,
     ) -> Result<Plan<LogRequest>, ActionError> {
+        if self.subject != Subject::Other
+            && let Some(why) = self.access.forbidden(Gated::Logs)
+        {
+            return Err(ActionError::rejected::<A>(why));
+        }
         let cluster = self.object.cluster.clone();
         let namespace = self.object.namespace.clone().unwrap_or_default();
         match self.subject {
