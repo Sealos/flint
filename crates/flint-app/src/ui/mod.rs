@@ -213,19 +213,34 @@ fn install_menus(appearance: Appearance, cx: &mut App) {
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
-    cx.on_action(|_: &MinimizeWindow, cx| on_front_window(cx, Window::minimize_window));
-    cx.on_action(|_: &ZoomWindow, cx| on_front_window(cx, Window::zoom_window));
     cx.on_action(|_: &OpenHelp, cx| cx.open_url(env!("CARGO_PKG_REPOSITORY")));
+    base::Root::register_plugin(cx, |_, _| WindowActions);
     set_menus(appearance, cx);
 }
 
-/// Runs `act` on the front window. The action is dispatched through that window, which cannot be
-/// updated until the dispatch ends, so this acts right after.
-fn on_front_window(cx: &mut App, act: fn(&Window)) {
-    if let Some(window) = cx.active_window() {
-        cx.defer(move |cx| {
-            let _ = window.update(cx, |_, window, _| act(window));
-        });
+/// The actions that need a window. They are handled around each window's whole content, dialogs
+/// included, and not globally, so the native menu disables them while no window is active.
+struct WindowActions;
+
+impl Render for WindowActions {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+impl base::RootPlugin for WindowActions {
+    fn decorate(
+        &self,
+        surface: AnyElement,
+        _: &base::Root,
+        _: &mut Window,
+        _: &mut App,
+    ) -> impl IntoElement {
+        div()
+            .size_full()
+            .on_action(|_: &MinimizeWindow, window, _| window.minimize_window())
+            .on_action(|_: &ZoomWindow, window, _| window.zoom_window())
+            .child(surface)
     }
 }
 

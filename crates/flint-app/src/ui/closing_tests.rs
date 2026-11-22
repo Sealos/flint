@@ -444,6 +444,43 @@ fn the_dialog_names_the_sessions_that_end() {
     );
 }
 
+// Minimize and Zoom act on the active window: the native menu enables them while there is one,
+// also with a dialog holding focus, and disables them when there is none. Hiding stays the app's.
+// The test window implements neither, so this asks and does not dispatch them.
+#[gpui_kit::test]
+async fn minimize_and_zoom_need_an_active_window(cx: &mut TestAppContext) {
+    use crate::ui::registry::{Hide, MinimizeWindow, ZoomWindow};
+    let offered = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            [
+                cx.is_action_available(&MinimizeWindow),
+                cx.is_action_available(&ZoomWindow),
+            ]
+        })
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let t = open(cx, dir.path()).await;
+    let (_, _web) = open_fake_shell_in(cx, &t, "web");
+    focus_list(cx, &t);
+    assert_eq!(offered(cx), [true, true], "with the window active");
+
+    t.press_key_of(cx, "flint::Quit");
+    shown_dialog(cx, &t).await;
+    assert_eq!(offered(cx), [true, true], "with a dialog holding focus");
+    cancel(cx, &t).await;
+
+    cx.update_window(t.window, |_, window, cx| window.blur(cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(offered(cx), [true, true], "with nothing focused");
+
+    VisualTestContext::from_window(t.window, cx).deactivate_window();
+    cx.run_until_parked();
+    assert_eq!(cx.update(|cx| cx.active_window()), None);
+    assert_eq!(offered(cx), [false, false], "with no active window");
+    assert!(cx.update(|cx| cx.is_action_available(&Hide)));
+}
+
 // The Window menu holds Minimize and Zoom above the closing items. The test window implements
 // neither, so this checks their place and does not dispatch them.
 #[gpui_kit::test]

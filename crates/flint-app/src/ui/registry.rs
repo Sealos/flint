@@ -1918,10 +1918,10 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<ShowAll>("Show All", "Show the windows of every app again.")
             .of(C::Flint, S::App),
         Spec::unit::<MinimizeWindow>("Minimize", "Minimize the front window.")
-            .of(C::Flint, S::App)
+            .of(C::Flint, S::Workspace)
             .keys(MINIMIZE, None),
         Spec::unit::<ZoomWindow>("Zoom", "Zoom the front window, or return it to its earlier size.")
-            .of(C::Flint, S::App),
+            .of(C::Flint, S::Workspace),
         Spec::unit::<OpenHelp>("Flint Help", "Open Flint's project page in the browser.")
             .of(C::Flint, S::App),
         // The Edit menu, for the text fields (the list filter, the namespace field, dialogs):
@@ -2998,13 +2998,11 @@ pub mod tests {
         assert_eq!(find("flint::MinimizeWindow").unwrap().keys, minimize);
         assert!(find("flint::ZoomWindow").unwrap().keys.is_empty());
         assert!(find("flint::OpenHelp").unwrap().keys.is_empty());
-        for name in [
-            "flint::MinimizeWindow",
-            "flint::ZoomWindow",
-            "flint::OpenHelp",
-        ] {
-            assert_eq!(find(name).unwrap().scope, Scope::App, "{name}");
+        // These two need a window, so that the native menu disables them without one.
+        for name in ["flint::MinimizeWindow", "flint::ZoomWindow"] {
+            assert_eq!(find(name).unwrap().scope, Scope::Workspace, "{name}");
         }
+        assert_eq!(find("flint::OpenHelp").unwrap().scope, Scope::App);
         let redo = if mac {
             "secondary-shift-z"
         } else {
