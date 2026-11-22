@@ -789,7 +789,7 @@ async fn cluster_row(server: &FlintMcp) -> Value {
 }
 
 #[tokio::test]
-async fn a_cluster_row_hides_a_proxy_password() {
+async fn a_cluster_row_tidies_the_proxy_field() {
     let dir = tempfile::tempdir().unwrap();
     let url = forbidding_server("denied").await;
     let proxy = "    proxy-url: http://proxyuser:proxy-pass-123@127.0.0.1:9\n";
@@ -801,7 +801,7 @@ async fn a_cluster_row_hides_a_proxy_password() {
 }
 
 #[tokio::test]
-async fn a_cluster_row_hides_values_the_server_quoted() {
+async fn a_cluster_row_tidies_a_quoted_server_message() {
     let dir = tempfile::tempdir().unwrap();
     let url = forbidding_server(
         "denied for Authorization: Bearer abcdefghijklmnop0123 password=example-value",
@@ -816,7 +816,7 @@ async fn a_cluster_row_hides_values_the_server_quoted() {
 }
 
 #[tokio::test]
-async fn a_cluster_row_hides_a_labelled_value_in_the_server_path() {
+async fn a_cluster_row_tidies_a_labelled_server_path() {
     let dir = tempfile::tempdir().unwrap();
     let url = forbidding_server("denied").await;
     let with_path = format!("{url}/password=example-value");

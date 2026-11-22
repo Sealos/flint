@@ -1069,7 +1069,7 @@ pub fn next_log_tail(tail: i64, lines: u32, complete: i64) -> i64 {
 /// fetched: 0 when it does not begin with one.
 fn leading_cut_off_lines(fetched: &str, shown: &str) -> usize {
     let key_lines = if first_end_has_no_begin(fetched) {
-        key_lines_before_end(shown)
+        key_lines_before_end(fetched, shown)
     } else {
         0
     };
@@ -1091,21 +1091,51 @@ fn first_end_has_no_begin(text: &str) -> bool {
     false
 }
 
-/// The end of the last key-shaped line before the first END line, whatever other output is
-/// between them.
-fn key_lines_before_end(text: &str) -> usize {
+/// The end of the last line of `shown` before the first END line that continues a key, whatever
+/// other output is between them. The END line is read from `fetched`, since redaction may have
+/// moved the words before it. A real footer vouches for every key-shaped line; a message that
+/// only names it vouches for full-width lines and for lines with the same prefix as its own.
+fn key_lines_before_end(fetched: &str, shown: &str) -> usize {
+    let footer = fetched.lines().find(|l| closes_private_key(l));
+    let source = footer.and_then(footer_prefix);
+    let real_footer =
+        source.is_some_and(|s| is_bare_prefix(s) || is_bare_prefix(without_log_level(s)));
+    let continues = |line: &str, token: &str| {
+        real_footer
+            || (PEM_WIDTHS.contains(&token.len()) && mixed_base64(token))
+            || source.is_some_and(|s| same_source(&line[..line.rfind(token).unwrap_or(0)], s))
+    };
     let mut end = 0;
     let mut offset = 0;
-    for line in text.split_inclusive('\n') {
+    for line in shown.split_inclusive('\n') {
         if closes_private_key(line) {
             return end;
         }
         offset += line.len();
-        if key_token(line).is_some() {
+        if key_token(line).is_some_and(|token| continues(line, token)) {
             end = offset;
         }
     }
     0
+}
+
+/// What comes before the END marker of `line`, without an opening quote. Text after the marker
+/// does not make it a message: a log writer may append fields to a real footer.
+fn footer_prefix(line: &str) -> Option<&str> {
+    let at = line.find("-----END ")?;
+    Some(line[..at].trim_end_matches(['"', '\'']).trim())
+}
+
+/// Whether two line prefixes are the same apart from their digits, as in two timestamps.
+fn same_source(a: &str, b: &str) -> bool {
+    let letters = |s: &str| -> String {
+        s.trim()
+            .trim_end_matches(['"', '\''])
+            .chars()
+            .filter(|c| !c.is_ascii_digit())
+            .collect()
+    };
+    letters(a) == letters(b)
 }
 
 /// The end of the lines at the start of `text` that read as a PEM body ([`PemBody`]) with no
@@ -1142,10 +1172,12 @@ const MIN_PEM_LINES: usize = 2;
 const MAX_INTERLEAVED_LINES: usize = 32;
 
 /// Counts the lines that read as a PEM body: full lines of a standard width with a mix of base64
-/// characters, or a shorter last line, each alone after a log prefix.
+/// characters, or a shorter last line, each alone after a log prefix. A padded last line ends
+/// the body: shorter tokens after it are other output, until another full line appears.
 #[derive(Default)]
 struct PemBody {
     full_lines: [usize; PEM_WIDTHS.len()],
+    ended: bool,
 }
 
 impl PemBody {
@@ -1159,17 +1191,31 @@ impl PemBody {
             && mixed_base64(token)
         {
             self.full_lines[at] += 1;
+            self.ended = false;
             return true;
         }
-        self.full_lines
+        let shorter = self
+            .full_lines
             .iter()
             .zip(PEM_WIDTHS)
-            .any(|(lines, full)| *lines > 0 && width < full)
+            .any(|(lines, full)| *lines > 0 && width < full);
+        if !shorter || self.ended {
+            return false;
+        }
+        self.ended = is_padded_last_line(token);
+        true
     }
 
     fn is_complete(&self) -> bool {
         self.full_lines.iter().any(|lines| *lines >= MIN_PEM_LINES)
     }
+}
+
+/// Whether `token` can only be the last line of a base64 body: valid padding on a length that
+/// is a multiple of four, with the character mix of key material.
+fn is_padded_last_line(token: &str) -> bool {
+    let padding = token.len() - token.trim_end_matches('=').len();
+    matches!(padding, 1 | 2) && token.len().is_multiple_of(4) && mixed_base64(token)
 }
 
 /// Whether `token` has upper case, lower case and digits, as base64 of random bytes does.
@@ -1214,7 +1260,7 @@ fn without_log_level(prefix: &str) -> &str {
 /// The last word of `line` when it could be a line of base64 key material.
 fn key_token(line: &str) -> Option<&str> {
     let word = line.split_whitespace().next_back()?;
-    let word = word.trim_end_matches([',', '"', '\'']);
+    let word = word.trim_matches([',', '"', '\'']);
     let word = word.strip_suffix("\\n").unwrap_or(word);
     (word.len() >= 16
         && word
