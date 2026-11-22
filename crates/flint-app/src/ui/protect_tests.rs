@@ -746,7 +746,7 @@ async fn lock_buttons_of_contexts_sharing_a_short_name_differ(cx: &mut TestAppCo
     let t = open_workspace_with(cx, dir.path(), two_prods).await;
     assert_eq!(protection(cx, &t, PROD_A), protection(cx, &t, PROD_B));
     let state = "protected, read-only";
-    for (context, title) in [(PROD_A, "0 · prod"), (PROD_B, "1 · prod")] {
+    for (context, title) in [(PROD_A, "…0000 · prod"), (PROD_B, "…0001 · prod")] {
         let label = format!("Lock for {title} (context \"{context}\"): {state}");
         assert!(named(cx, &t, &format!("lock-{context}"), &label));
     }

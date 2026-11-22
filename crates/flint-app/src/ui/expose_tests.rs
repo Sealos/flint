@@ -174,12 +174,12 @@ async fn toggles_of_contexts_sharing_a_short_name_differ(cx: &mut TestAppContext
     for (context, title, id) in [
         (
             PROD_A,
-            "0 · prod",
+            "…0000 · prod",
             concat!("expose-", "arn:aws:eks:us-east-1:000000000000:cluster/prod"),
         ),
         (
             PROD_B,
-            "1 · prod",
+            "…0001 · prod",
             concat!("expose-", "arn:aws:eks:us-east-1:000000000001:cluster/prod"),
         ),
     ] {

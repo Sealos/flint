@@ -546,13 +546,14 @@ pub(in crate::ui) fn show_drain_report(window: &mut Window, cx: &mut App) {
 /// Across clusters a name says which.
 fn draining_text(keys: &[&WriteKey]) -> Option<String> {
     let across = keys.windows(2).any(|w| w[0].cluster != w[1].cluster);
-    // The real names, told apart from the other clusters on this line.
-    let clusters = flint_core::display::ClusterNames::new(
-        keys.iter().map(|key| key.cluster.as_str()),
-        &BTreeMap::new(),
-    );
+    // The whole context: a label worked out from the running drains alone could be the one
+    // the sidebar gives another cluster.
     let name = |key: &&WriteKey| match across {
-        true => format!("{}/{}", clusters.of(&key.cluster), key.name),
+        true => format!(
+            "{}/{}",
+            flint_core::display::single_line(&key.cluster),
+            key.name
+        ),
         false => key.name.clone(),
     };
     match keys {
@@ -1289,8 +1290,14 @@ mod tests {
             "a",
         );
         let text = draining_text(&[&blue, &green]).unwrap();
-        assert!(text.contains("blue"), "{text}");
-        assert!(text.contains("green"), "{text}");
+        assert!(
+            text.contains("team-platform-production-blue-cluster-main/a"),
+            "{text}"
+        );
+        assert!(
+            text.contains("team-platform-production-green-cluster-main/a"),
+            "{text}"
+        );
     }
 
     // covers UP-52: a review opened again says the object changed and that nothing ran.
