@@ -131,6 +131,39 @@ fn count_of(path: &Path) -> usize {
         .count()
 }
 
+// Every clone sees a revocation, and no later role undoes it. A credential that runs nothing is
+// not affected.
+#[test]
+fn a_revoked_access_stays_denied_for_every_clone() {
+    let access = foreground_only(Role::Foreground);
+    let command = access.grant(CredentialSource::Plugin);
+    let cloned = command.clone();
+    let lease = command.lease();
+    let fixed = access.clone().grant(CredentialSource::Definition);
+
+    access.revoke();
+    access.set_role(Role::Foreground);
+
+    assert!(!command.allowed() && !cloned.allowed() && !lease.holds());
+    assert!(!access.grant(CredentialSource::Plugin).lease().holds());
+    assert!(fixed.allowed());
+}
+
+// A pause denies commands, and only a use begun after it may run one.
+#[test]
+fn a_pause_ends_a_use_and_a_resume_allows_a_new_one() {
+    let access = foreground_only(Role::Foreground);
+    let grant = access.grant(CredentialSource::Plugin);
+    let before = grant.lease();
+
+    access.set_role(Role::Paused);
+    assert!(!grant.allowed());
+    access.set_role(Role::Foreground);
+
+    assert!(grant.allowed() && grant.lease().holds());
+    assert!(!before.holds());
+}
+
 #[test]
 fn always_allow_allows_every_source_in_every_role() {
     for source in [

@@ -379,6 +379,12 @@ impl WriteCredential {
         self.0.grant.take_refused()
     }
 
+    /// Whether this connection can no longer authenticate new requests: its provider's lease
+    /// ended, which no later role brings back.
+    pub(crate) fn spent(&self) -> bool {
+        self.0.guarded.as_ref().is_some_and(GuardedProvider::spent)
+    }
+
     /// Reads the credential for one request, and returns `client` set to send exactly that.
     /// Fails closed: anything that can't be read or confirmed refuses the request, and so does a
     /// credential its grant does not allow, with nothing run or sent.
@@ -482,6 +488,10 @@ impl GuardedProvider {
                 turn: tokio::sync::Mutex::new(()),
             }))
         })
+    }
+
+    fn spent(&self) -> bool {
+        !self.0.lease.holds()
     }
 
     /// The `Authorization` value from kube's layer, which may run the command.

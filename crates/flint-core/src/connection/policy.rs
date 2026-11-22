@@ -23,9 +23,19 @@ pub(crate) enum Role {
     Foreground,
     /// A cluster kept connected while another one is in front.
     Background,
+    /// Its definition can't be confirmed for now. Reads already running go on, and the connection
+    /// may return to another role when the pause ends.
+    Paused,
+    /// The connection was replaced or dropped. Final: no later role applies to it.
+    Retired,
 }
 
-const ROLES: [Role; 2] = [Role::Foreground, Role::Background];
+const ROLES: [Role; 4] = [
+    Role::Foreground,
+    Role::Background,
+    Role::Paused,
+    Role::Retired,
+];
 
 /// The current role, and how many times each role has been entered. The counts survive a change
 /// a watcher did not get to see, which the role alone does not.
@@ -95,16 +105,22 @@ impl CredentialAccess {
         }
     }
 
-    /// Changes the role. A refresh the new role does not allow is ended.
+    /// Changes the role, unless this access is retired. A refresh the new role does not allow is
+    /// ended.
     pub(crate) fn set_role(&self, role: Role) {
         self.role.send_if_modified(|state| {
-            let changed = state.role != role;
+            let changed = state.role != role && state.role != Role::Retired;
             if changed {
                 state.role = role;
                 state.entered[role as usize] += 1;
             }
             changed
         });
+    }
+
+    /// Ends this access for good, for every clone of every client made under it.
+    pub(crate) fn revoke(&self) {
+        self.set_role(Role::Retired);
     }
 
     /// This access, for a connection whose credential comes from `source`.
@@ -136,9 +152,9 @@ impl CredentialGrant {
         self.source.runs_a_command()
     }
 
-    /// Records a 401. The foreground has its own sign-in path, so only a background one counts.
+    /// Records a 401. The foreground has its own sign-in path, so only one outside it counts.
     pub(crate) fn note_refused(&self) {
-        if self.access.role.borrow().role == Role::Background {
+        if self.access.role.borrow().role != Role::Foreground {
             self.refused.store(true, Ordering::Relaxed);
         }
     }
