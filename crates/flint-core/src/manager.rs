@@ -21,7 +21,7 @@ use crate::handle::{
     ClusterSummary, ClustersSnapshot, Command, ConnectionState, CoreConfig, Event, Request,
 };
 use crate::kubeconfig::{
-    self, BlankFile, ContextInfo, FileRead, KubeconfigReader, LoadedKubeconfig,
+    self, BlankFile, ContextInfo, FileRead, KubeconfigReader, LoadedKubeconfig, ReadBusy,
 };
 use crate::logs::{self, KubeLogSource, KubePodSource, LogError, SessionConfig};
 use crate::protection::{ClusterClients, GatedClient, SessionUnlocks, WriteRefusal, protection};
@@ -160,6 +160,64 @@ impl Cluster {
 /// counts as really empty. A writer that truncates first is done well within this.
 const EMPTY_SETTLE: Duration = Duration::from_secs(5);
 
+/// The pause before reading again files that were still changing when a read gave up.
+const READ_AGAIN_AFTER: Duration = Duration::from_millis(250);
+
+/// How many such reads follow one another before waiting for another reason to read.
+const READ_AGAIN_LIMIT: u8 = 8;
+
+/// What the order of kubeconfig reads allows.
+///
+/// Every read takes the next number from [`ClusterManager::read_seq`] before it starts, so a read
+/// numbered before a change may not have seen it. One rule follows: **a result counts only if its
+/// read was numbered after the last known change and, while writes are held, not before the hold.**
+/// A result that does not count grants no write and ends no hold.
+#[derive(Debug, Default)]
+struct ReadMarks {
+    /// The newest read numbered before the last known change of the files.
+    stale_through: u64,
+    /// While writes are held: the newest read numbered when the hold was set.
+    held_from: Option<u64>,
+    /// A follow-up read of files that would not hold still is scheduled.
+    retry_armed: bool,
+    /// The follow-up reads since a read last applied or the files last changed.
+    retries: u8,
+}
+
+impl ReadMarks {
+    /// The files changed, or may have, after every read up to `newest` was numbered.
+    fn changed(&mut self, newest: u64) {
+        self.stale_through = newest;
+        self.retries = 0;
+    }
+
+    /// Whether read `seq` started after the last known change, so it can answer a write.
+    fn current(&self, seq: u64) -> bool {
+        seq > self.stale_through
+    }
+
+    /// Whether the result of read `seq` may become the state, with `applied` the newest applied.
+    fn may_apply(&self, seq: u64, applied: u64) -> bool {
+        seq > applied && self.current(seq) && self.held_from.is_none_or(|from| seq >= from)
+    }
+
+    /// Whether another follow-up read may be scheduled, and counts it.
+    fn arm_retry(&mut self) -> bool {
+        if self.retry_armed || self.retries >= READ_AGAIN_LIMIT {
+            return false;
+        }
+        self.retry_armed = true;
+        self.retries += 1;
+        true
+    }
+
+    /// A read was applied, so no hold is left and the follow-up reads start over.
+    fn applied(&mut self) {
+        self.held_from = None;
+        self.retries = 0;
+    }
+}
+
 enum Internal {
     /// Reload kubeconfig, then say so ([`crate::CoreHandle::reload_kubeconfig`]).
     ReloadKubeconfig {
@@ -180,6 +238,8 @@ enum Internal {
     },
     /// Time to look again at files that were found emptied.
     SettleEmptied,
+    /// Time to read again files that were still changing when a read gave up.
+    ReadAgain,
     /// The read of the kubeconfig files made for one write check, started after it was asked.
     WriteRead {
         cluster: ClusterId,
@@ -188,6 +248,8 @@ enum Internal {
         /// Which read it was ([`ClusterManager::read_seq`]).
         seq: u64,
         read: Option<Box<FileRead>>,
+        /// When the check has to be answered by, a second read included.
+        deadline: tokio::time::Instant,
         reply: oneshot::Sender<Result<(), WriteError>>,
     },
     Discovered {
@@ -302,6 +364,8 @@ pub(crate) struct ClusterManager {
     applied_read: u64,
     /// A reload was asked for while a read was running, so that read may predate the reason.
     reread: bool,
+    /// Which reads count ([`ReadMarks`]).
+    marks: ReadMarks,
     /// The files found emptied and still waiting to count as really empty: since when, and
     /// their stamp then.
     emptied: HashMap<PathBuf, (Instant, Option<(std::time::SystemTime, u64)>)>,
@@ -393,6 +457,7 @@ impl ClusterManager {
             read_seq: 0,
             applied_read: 0,
             reread: false,
+            marks: ReadMarks::default(),
             emptied: HashMap::new(),
             empty_settle: EMPTY_SETTLE,
             settle_armed: false,
@@ -983,19 +1048,19 @@ impl ClusterManager {
     async fn handle_internal(&mut self, msg: Internal) {
         match msg {
             Internal::ReloadKubeconfig { reply } => {
+                self.marks.changed(self.read_seq);
                 let applied = self.reload_kubeconfig().await;
                 let _ = reply.send(applied);
             }
             Internal::LateRead { paths, seq, read } => {
-                let current = paths == self.kubeconfig_paths && seq > self.applied_read;
+                let current =
+                    paths == self.kubeconfig_paths && self.marks.may_apply(seq, self.applied_read);
                 // A reload asked for since this read began knows of a newer file, and a read
                 // that saw its files change is no state they were ever in.
                 let superseded = std::mem::take(&mut self.reread);
                 let torn = current && !read.consistent;
                 if current && !superseded && !torn {
-                    self.applied_read = seq;
-                    self.stalled_on = None;
-                    self.apply_files(*read);
+                    self.take_read(seq, *read);
                 }
                 if superseded || torn {
                     self.reload_kubeconfig().await;
@@ -1005,18 +1070,32 @@ impl ClusterManager {
                 self.settle_armed = false;
                 self.reload_kubeconfig().await;
             }
+            Internal::ReadAgain => {
+                self.marks.retry_armed = false;
+                if self.stalled_on.is_some() {
+                    self.reload_kubeconfig().await;
+                }
+            }
             Internal::WriteRead {
                 cluster,
                 pin,
                 paths,
                 seq,
                 read,
+                deadline,
                 reply,
             } => {
                 // A late result already applied leaves nothing to hold for.
                 let timed_out =
                     read.is_none() && paths == self.kubeconfig_paths && seq > self.applied_read;
-                let (answer, differs) = self.fresh_write_gate(&cluster, &pin, &paths, read);
+                let (answer, differs) = if read.is_some() && !self.marks.current(seq) {
+                    let answer = self
+                        .revalidate_write(&cluster, &pin, &paths, deadline)
+                        .await;
+                    (answer, false)
+                } else {
+                    self.fresh_write_gate(&cluster, &pin, &paths, read)
+                };
                 let _ = reply.send(answer);
                 let asked = std::mem::take(&mut self.reread);
                 if timed_out && self.reader.busy(&paths) {
@@ -1226,6 +1305,7 @@ impl ClusterManager {
                     self.reload_settings().await;
                 }
                 if changed.kubeconfig {
+                    self.marks.changed(self.read_seq);
                     self.reload_kubeconfig().await;
                 }
                 if changed.activity {
@@ -1436,6 +1516,7 @@ impl ClusterManager {
         let paths = self.kubeconfig_paths.clone();
         let (seq, on_late) = self.next_read(&paths);
         let (reader, internal) = (self.reader.clone(), self.internal_tx.clone());
+        let deadline = reader.deadline();
         tokio::spawn(async move {
             let read = reader.read_fresh(&paths, on_late).await.map(Box::new);
             let _ = internal.send(Internal::WriteRead {
@@ -1444,6 +1525,7 @@ impl ClusterManager {
                 paths,
                 seq,
                 read,
+                deadline,
                 reply,
             });
         });
@@ -1464,18 +1546,62 @@ impl ClusterManager {
         if paths != self.kubeconfig_paths {
             return (Err(WriteError::ConnectionChanged), false);
         }
-        let Some(mut fresh) = read else {
+        let Some(fresh) = read else {
             return (Err(WriteError::KubeconfigUnreadable), false);
         };
-        if !fresh.consistent {
-            return (Err(WriteError::KubeconfigUnreadable), true);
+        let answer = self.read_gives_pin(cluster, pin, &fresh);
+        let differs = answer.is_err();
+        (answer, differs)
+    }
+
+    /// Whether `read` is consistent and gives `pin`'s exact definition. Records nothing.
+    fn read_gives_pin(
+        &self,
+        cluster: &str,
+        pin: &ContextPin,
+        read: &FileRead,
+    ) -> Result<(), WriteError> {
+        if !read.consistent {
+            return Err(WriteError::KubeconfigUnreadable);
         }
-        self.contexts.fail_emptied(&mut fresh.loaded, &fresh.blank);
-        match self.contexts.pin_in(&fresh.loaded, cluster, pin) {
-            FreshDefinition::Holds => (Ok(()), false),
-            FreshDefinition::Unreadable => (Err(WriteError::KubeconfigUnreadable), true),
-            FreshDefinition::Changed => (Err(WriteError::ConnectionChanged), true),
+        let mut loaded = read.loaded.clone();
+        self.contexts.fail_emptied(&mut loaded, &read.blank);
+        match self.contexts.pin_in(&loaded, cluster, pin) {
+            FreshDefinition::Holds => Ok(()),
+            FreshDefinition::Unreadable => Err(WriteError::KubeconfigUnreadable),
+            FreshDefinition::Changed => Err(WriteError::ConnectionChanged),
         }
+    }
+
+    /// Answers a write check whose read predates a known change, from one new read that must
+    /// finish by `deadline`. That read is also the reload the change asked for. If it can't
+    /// start or finish in time the write is refused; it is never sent on the older read.
+    async fn revalidate_write(
+        &mut self,
+        cluster: &str,
+        pin: &ContextPin,
+        paths: &[PathBuf],
+        deadline: tokio::time::Instant,
+    ) -> Result<(), WriteError> {
+        self.write_pin_gate(cluster, pin)?;
+        if paths != self.kubeconfig_paths {
+            return Err(WriteError::ConnectionChanged);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(WriteError::KubeconfigUnreadable);
+        }
+        let mut answer = Err(WriteError::KubeconfigUnreadable);
+        let applied = self
+            .read_and_apply(Some(deadline), |manager, read| {
+                answer = manager.read_gives_pin(cluster, pin, read);
+            })
+            .await;
+        if !applied {
+            return Err(WriteError::KubeconfigUnreadable);
+        }
+        // Applying can lock the cluster or move its gate. A refusal from the read itself stands.
+        answer?;
+        self.write_pin_gate(cluster, pin)
     }
 
     /// `cluster`'s protection for `server`, if it allows changes.
@@ -1516,22 +1642,22 @@ impl ClusterManager {
 
     /// Reads the kubeconfig files now, ahead of the file watcher, and says whether they still
     /// give `id` the definition the last load showed at `server`. Anything else is a no, a read
-    /// that fails included, and a read that stalls also holds writes as a reload's does. What
-    /// gives access checks this right before saving.
+    /// that fails included, and a read that stalls also holds writes as a reload's does. Another
+    /// read of the files still running is a no too, but no stall: that read's own timeout says
+    /// whether they stalled. What gives access checks this right before saving.
     async fn files_still_show(&mut self, id: &str, server: &str) -> bool {
         let paths = self.kubeconfig_paths.clone();
-        let busy = self.reader.busy(&paths);
         let (_, on_late) = self.next_read(&paths);
-        match self.reader.read(&paths, on_late).await {
-            Some(mut fresh) => {
+        match self.reader.read_once(&paths, on_late).await {
+            Ok(Some(mut fresh)) => {
                 self.contexts.fail_emptied(&mut fresh.loaded, &fresh.blank);
                 fresh.consistent && self.contexts.holds_in(&fresh.loaded, id, server)
             }
-            None => {
-                self.reread |= busy;
+            Ok(None) => {
                 self.hold_stalled(paths);
                 false
             }
+            Err(ReadBusy) => false,
         }
     }
 
@@ -1554,8 +1680,11 @@ impl ClusterManager {
     }
 
     /// Applies a read of `paths` that did not finish as every file failing, which keeps the
-    /// clusters and holds their writes. Once per stall.
+    /// clusters and holds their writes. Files of the last state that are not in `paths` count as
+    /// failed too, so what they defined stays until a finished read shows it gone. Only a read
+    /// numbered from here on ends the hold ([`ReadMarks`]). Reported once per stall.
     fn hold_stalled(&mut self, paths: Vec<PathBuf>) {
+        self.marks.held_from = Some(self.read_seq);
         if self.stalled_on.as_ref() == Some(&paths) {
             return;
         }
@@ -1564,7 +1693,9 @@ impl ClusterManager {
              changes to them are refused until the files can be read."
                 .to_owned(),
         ));
-        let stalled = FileRead::stalled(&paths);
+        let mut stalled = FileRead::stalled(&paths);
+        let last = &self.kubeconfig;
+        stalled.keep_undecided(last.paths.iter().chain(last.errors.iter().map(|(p, _)| p)));
         self.stalled_on = Some(paths);
         self.apply_files(stalled);
     }
@@ -1728,26 +1859,63 @@ impl ClusterManager {
     ///
     /// With a read of these files already running this returns false at once, without waiting
     /// on it or holding anything: that read's own timeout decides whether the files stalled,
-    /// and the reload runs when its result comes in.
+    /// and the reload runs when its result comes in. Files still changing when the time ran out
+    /// are read again a little later, as no late result will come for them.
     async fn reload_kubeconfig(&mut self) -> bool {
+        self.read_and_apply(None, |_, _| {}).await
+    }
+
+    /// [`Self::reload_kubeconfig`], finishing by `by` if given. `inspect` sees a consistent read
+    /// just before it is applied.
+    async fn read_and_apply(
+        &mut self,
+        by: Option<tokio::time::Instant>,
+        inspect: impl FnOnce(&Self, &FileRead),
+    ) -> bool {
         let paths = self.kubeconfig_paths.clone();
         let (seq, on_late) = self.next_read(&paths);
-        let Ok(read) = self.reader.read_settled(&paths, on_late).await else {
+        let Ok(read) = self.reader.read_settled(&paths, by, on_late).await else {
             self.reread = true;
+            self.marks.changed(self.read_seq);
             return false;
         };
+        self.reread = false;
         match read {
             Some(read) if read.consistent => {
-                self.applied_read = seq;
-                self.stalled_on = None;
-                self.apply_files(read);
+                inspect(self, &read);
+                self.take_read(seq, read);
                 true
             }
-            _ => {
+            Some(_) => {
+                self.hold_stalled(paths);
+                self.read_again_later();
+                false
+            }
+            None => {
                 self.hold_stalled(paths);
                 false
             }
         }
+    }
+
+    /// Takes the finished read `seq` as the current state, which ends any hold.
+    fn take_read(&mut self, seq: u64, read: FileRead) {
+        self.applied_read = seq;
+        self.stalled_on = None;
+        self.marks.applied();
+        self.apply_files(read);
+    }
+
+    /// Schedules one more read of files that would not hold still, up to [`READ_AGAIN_LIMIT`].
+    fn read_again_later(&mut self) {
+        if !self.marks.arm_retry() {
+            return;
+        }
+        let internal = self.internal_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(READ_AGAIN_AFTER).await;
+            let _ = internal.send(Internal::ReadAgain);
+        });
     }
 
     /// Takes a read of the kubeconfig files as the current state.
@@ -2785,6 +2953,7 @@ mod tests {
                 paths,
                 seq,
                 read: None,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(5),
                 reply,
             })
             .await;
@@ -3021,6 +3190,226 @@ mod tests {
         assert_eq!(manager.active.as_deref(), Some("dev"), "still selected");
         assert!(manager.cluster("dev").is_some() && !manager.held("dev"));
         assert!(!manager.reread, "the pending reload ran");
+    }
+
+    /// Hands the manager a write check whose read finished with `read`, and returns its answer.
+    async fn finished_write(
+        manager: &mut ClusterManager,
+        pin: &ContextPin,
+        seq: u64,
+        read: FileRead,
+    ) -> Result<(), WriteError> {
+        let (reply, answer) = oneshot::channel();
+        let paths = manager.kubeconfig_paths.clone();
+        manager
+            .handle_internal(Internal::WriteRead {
+                cluster: "dev".into(),
+                pin: pin.clone(),
+                paths,
+                seq,
+                read: Some(Box::new(read)),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+                reply,
+            })
+            .await;
+        answer.await.unwrap()
+    }
+
+    /// A manager with a write check's consistent read of the old file in hand, the file since
+    /// re-pointed, and the watcher's reload queued behind a read that is still running.
+    async fn write_read_overtaken_by_a_change(
+        dir: &Path,
+    ) -> (
+        ClusterManager,
+        ContextPin,
+        u64,
+        FileRead,
+        JoinHandle<Option<FileRead>>,
+    ) {
+        let mut manager = manager_reading(dir, &kubeconfig_with("https://dev")).await;
+        manager.unlocks.unlock("dev", "https://dev");
+        let pin = manager.contexts.pin_confirmed("dev");
+        let paths = manager.kubeconfig_paths.clone();
+        let old = manager.reader.read(&paths, |_| {}).await.unwrap();
+        assert!(old.consistent);
+        let (seq, _) = manager.next_read(&paths);
+
+        make_fifo(&dir.join("gate"));
+        manager.reader = KubeconfigReader::new(load_then_wait, Duration::from_secs(5));
+        let reader = manager.reader.clone();
+        let running = tokio::spawn(async move { reader.read(&paths, |_| {}).await });
+        until_parsed(dir).await;
+        std::fs::write(dir.join("kubeconfig"), kubeconfig_with("https://moved")).unwrap();
+        let changed = Changed {
+            kubeconfig: true,
+            ..Changed::default()
+        };
+        manager
+            .handle_internal(Internal::FilesChanged(changed))
+            .await;
+        assert!(manager.reread, "the reload is queued");
+        (manager, pin, seq, old, running)
+    }
+
+    // covers UP-54: a file changed after the reader checked it leaves a read that says it is
+    // consistent. With the reload still queued, that read grants nothing.
+    #[tokio::test]
+    async fn a_queued_change_refuses_a_write_while_files_cannot_be_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, pin, seq, old, running) =
+            write_read_overtaken_by_a_change(dir.path()).await;
+
+        assert_eq!(
+            finished_write(&mut manager, &pin, seq, old).await,
+            Err(WriteError::KubeconfigUnreadable)
+        );
+        let gate = dir.path().join("gate");
+        drop(std::fs::OpenOptions::new().write(true).open(&gate).unwrap());
+        running.await.unwrap();
+    }
+
+    // covers UP-54: the same read, once the files can be read again, is checked against a new
+    // read, which finds the server the file points to now.
+    #[tokio::test]
+    async fn a_queued_change_revalidates_the_write_from_a_new_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, pin, seq, old, running) =
+            write_read_overtaken_by_a_change(dir.path()).await;
+        let gate = dir.path().join("gate");
+        drop(std::fs::OpenOptions::new().write(true).open(&gate).unwrap());
+        running.await.unwrap();
+
+        assert_eq!(
+            finished_write(&mut manager, &pin, seq, old).await,
+            Err(WriteError::ConnectionChanged)
+        );
+        assert!(!manager.reread, "the queued reload ran");
+        assert!(!manager.contexts.definition_holds("dev", &pin));
+    }
+
+    // covers UP-06: a result older than the read that holds the files does not end the hold; the
+    // newer read's own result does.
+    #[tokio::test]
+    async fn an_older_late_read_does_not_clear_a_newer_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://dev");
+        let mut manager = manager_reading_two(dir.path(), &yaml, &yaml).await;
+        manager.reader = KubeconfigReader::new(slow_load, Duration::from_millis(40));
+        let paths = manager.kubeconfig_paths.clone();
+
+        assert!(!manager.reload_kubeconfig().await);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.reader.busy(&paths) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the first read ended");
+        assert!(!manager.reload_kubeconfig().await);
+
+        let older = next_internal(&mut manager).await;
+        manager.handle_internal(older).await;
+        assert!(manager.held("dev"), "the newer read is still out");
+        let newer = next_internal(&mut manager).await;
+        manager.handle_internal(newer).await;
+        assert!(!manager.held("dev"), "its own result ends the hold");
+    }
+
+    // covers UP-06: when the only file defining the selected context is replaced and the new file
+    // stalls, the context stays until a finished read shows it is gone.
+    #[tokio::test]
+    async fn a_stalled_replacement_file_keeps_the_previous_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://dev")).await;
+        manager.active = Some("dev".into());
+        let pin = manager.contexts.pin_confirmed("dev");
+        let replacement = dir.path().join("replacement");
+        make_fifo(&replacement);
+        manager.kubeconfig_paths = vec![replacement.clone()];
+        manager.reader = KubeconfigReader::new(blocking_load, Duration::from_millis(40));
+
+        assert!(!manager.reload_kubeconfig().await);
+        assert_eq!(manager.active.as_deref(), Some("dev"), "still selected");
+        assert!(manager.held("dev"));
+        assert_eq!(
+            manager.write_pin_gate("dev", &pin),
+            Err(WriteError::KubeconfigUnreadable)
+        );
+
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&replacement)
+            .unwrap();
+        let without_dev = dir.path().join("without-dev");
+        std::fs::write(
+            &without_dev,
+            "apiVersion: v1\nkind: Config\nclusters: []\nusers: []\ncontexts: []\n",
+        )
+        .unwrap();
+        std::fs::rename(&without_dev, &replacement).unwrap();
+        drop(writer);
+        let late = next_internal(&mut manager).await;
+        manager.handle_internal(late).await;
+        assert!(
+            manager.cluster("dev").is_none(),
+            "a finished read removed it"
+        );
+        assert_eq!(manager.active, None);
+    }
+
+    // covers UP-54, UP-55: an access check that meets a healthy write check's read answers no,
+    // and holds no cluster. The write check is not disturbed.
+    #[tokio::test]
+    async fn an_access_check_behind_a_healthy_read_holds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://dev")).await;
+        manager.config.config_dir = dir.path().join("config");
+        manager.unlocks.unlock("dev", "https://dev");
+        let pin = manager.contexts.pin_confirmed("dev");
+        let gate = dir.path().join("gate");
+        make_fifo(&gate);
+        manager.reader = KubeconfigReader::new(load_then_wait, Duration::from_secs(5));
+
+        let answer = ask_write(&mut manager, &pin);
+        until_parsed(dir.path()).await;
+        let at = Some("https://dev".to_owned());
+        assert!(
+            !manager.set_pin(Pins::Trust, "dev".into(), at).await,
+            "the files could not be confirmed"
+        );
+        assert!(saved(dir.path()).trusted_clusters.is_empty());
+        assert!(!manager.held("dev") && manager.stalled_on.is_none());
+
+        drop(std::fs::OpenOptions::new().write(true).open(&gate).unwrap());
+        let read = next_internal(&mut manager).await;
+        manager.handle_internal(read).await;
+        assert_eq!(answer.await.unwrap(), Ok(()));
+    }
+
+    /// Parses the files, then changes the first one unless a `still` file sits beside it.
+    fn load_then_touch_until_still(paths: &[PathBuf]) -> LoadedKubeconfig {
+        if paths[0].with_file_name("still").exists() {
+            kubeconfig::load(paths)
+        } else {
+            load_then_touch(paths)
+        }
+    }
+
+    // covers UP-06: files that were still changing when a reload gave up are read again without
+    // any watcher, so the hold ends once they are quiet.
+    #[tokio::test]
+    async fn files_changing_past_the_deadline_are_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://dev")).await;
+        manager.reader =
+            KubeconfigReader::new(load_then_touch_until_still, Duration::from_millis(60));
+
+        assert!(!manager.reload_kubeconfig().await);
+        assert!(manager.held("dev"));
+        std::fs::write(dir.path().join("still"), "").unwrap();
+        let again = next_internal(&mut manager).await;
+        manager.handle_internal(again).await;
+        assert!(!manager.held("dev"), "a follow-up read ended the hold");
     }
 
     fn make_fifo(path: &Path) {

@@ -418,6 +418,18 @@ impl FileRead {
         }
     }
 
+    /// Counts `previous` files that are not in this read as failed too. Until a finished read of
+    /// the new list shows otherwise, what they defined is not known to be gone.
+    pub fn keep_undecided<'a>(&mut self, previous: impl Iterator<Item = &'a PathBuf>) {
+        for path in previous {
+            let listed = self.loaded.paths.contains(path);
+            if !listed && !self.loaded.errors.iter().any(|(p, _)| p == path) {
+                let reason = "waiting for a finished read of the new file list".to_owned();
+                self.loaded.errors.push((path.clone(), reason));
+            }
+        }
+    }
+
     /// Reads until a read is [consistent](Self::consistent) or `deadline` is near, and returns
     /// the last one.
     fn settled(
@@ -509,30 +521,50 @@ impl KubeconfigReader {
         self.turn(paths).try_lock().is_err()
     }
 
-    /// The files as they are now, from one pass, or `None` if the read did not finish in time or
-    /// an earlier read of the same files still hasn't. A read that finishes after its caller gave
-    /// up hands its result to `on_late`. The result may be [inconsistent](FileRead::consistent).
+    /// When a read starting now has to be done by.
+    pub(crate) fn deadline(&self) -> Instant {
+        Instant::now() + self.timeout
+    }
+
+    /// [`Self::read_once`], with a read already running counted as not finishing.
+    #[cfg(test)]
     pub(crate) async fn read(
         &self,
         paths: &[PathBuf],
         on_late: impl FnOnce(FileRead) + Clone + Send + 'static,
     ) -> Option<FileRead> {
-        let turn = self.turn(paths).try_lock_owned().ok()?;
-        let deadline = Instant::now() + self.timeout;
-        let answer = self.start(paths, turn, None, on_late.clone())?;
-        answer_by(answer, deadline, on_late).await
+        self.read_once(paths, on_late).await.ok().flatten()
     }
 
-    /// [`Self::read`], reading again within the timeout while the files change under it. An
-    /// earlier read of the same files still running is [`ReadBusy`], told apart from a timeout
-    /// in the same step that tries to start this one.
-    pub(crate) async fn read_settled(
+    /// The files as they are now, from one pass, or `None` if the read did not finish in time. An
+    /// earlier read of the same files still running is [`ReadBusy`]. A read that finishes after
+    /// its caller gave up hands its result to `on_late`. The result may be
+    /// [inconsistent](FileRead::consistent).
+    pub(crate) async fn read_once(
         &self,
         paths: &[PathBuf],
         on_late: impl FnOnce(FileRead) + Clone + Send + 'static,
     ) -> Result<Option<FileRead>, ReadBusy> {
         let turn = self.turn(paths).try_lock_owned().map_err(|_| ReadBusy)?;
-        let deadline = Instant::now() + self.timeout;
+        let deadline = self.deadline();
+        let Some(answer) = self.start(paths, turn, None, on_late.clone()) else {
+            return Ok(None);
+        };
+        Ok(answer_by(answer, deadline, on_late).await)
+    }
+
+    /// [`Self::read_once`], reading again until `by` (at most the timeout) while the files change
+    /// under it. An earlier read of the same files still running is [`ReadBusy`], told apart from
+    /// a timeout in the same step that tries to start this one.
+    pub(crate) async fn read_settled(
+        &self,
+        paths: &[PathBuf],
+        by: Option<Instant>,
+        on_late: impl FnOnce(FileRead) + Clone + Send + 'static,
+    ) -> Result<Option<FileRead>, ReadBusy> {
+        let turn = self.turn(paths).try_lock_owned().map_err(|_| ReadBusy)?;
+        let limit = self.deadline();
+        let deadline = by.map_or(limit, |by| by.min(limit));
         let Some(answer) = self.start(paths, turn, Some(deadline), on_late.clone()) else {
             return Ok(None);
         };
