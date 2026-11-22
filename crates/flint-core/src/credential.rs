@@ -43,6 +43,7 @@ use tower::{BoxError, Layer as _, Service, ServiceExt as _};
 
 use crate::api_error::ApiError;
 use crate::auth_plugin::RefreshingToken;
+use crate::connection::policy::CredentialGrant;
 use crate::write::WriteError;
 
 /// The most a credential file may hold.
@@ -297,6 +298,8 @@ struct Parts {
     token: TokenSource,
     /// The credential comes from a plugin: its identity is what a review binds.
     check_identity: bool,
+    /// Whether the credential may be used now.
+    grant: CredentialGrant,
 }
 
 /// A client for one request, and what its credential was when checked.
@@ -306,11 +309,24 @@ pub(crate) struct Presented {
 }
 
 impl WriteCredential {
+    /// A credential under [`AlwaysAllow`](crate::connection::policy::AlwaysAllow).
+    #[cfg(test)]
     pub(crate) fn new(
         files: Vec<HeldFile>,
         source: CredentialSource,
         refreshing: Option<RefreshingToken>,
         auth: Option<Arc<AuthLayer>>,
+    ) -> Self {
+        let grant = crate::connection::policy::CredentialAccess::always().grant(source.clone());
+        Self::with_grant(files, source, refreshing, auth, grant)
+    }
+
+    pub(crate) fn with_grant(
+        files: Vec<HeldFile>,
+        source: CredentialSource,
+        refreshing: Option<RefreshingToken>,
+        auth: Option<Arc<AuthLayer>>,
+        grant: CredentialGrant,
     ) -> Self {
         let check_identity = matches!(
             source,
@@ -326,13 +342,16 @@ impl WriteCredential {
             files,
             token,
             check_identity,
+            grant,
         }))
     }
 
     /// Reads the credential for one request, and returns `client` set to send exactly that.
-    /// Fails closed: anything that can't be read or confirmed refuses the request.
+    /// Fails closed: anything that can't be read or confirmed refuses the request, and so does a
+    /// credential its grant does not allow, with nothing run or sent.
     pub(crate) async fn present(&self, client: Client) -> Result<Presented, WriteError> {
         let parts = &self.0;
+        parts.still_allowed()?;
         let mut material = Digester::new().ok_or(WriteError::CredentialUnreadable)?;
         for file in &parts.files {
             let held = file.held.ok_or(WriteError::CredentialUnreadable)?;
@@ -354,10 +373,16 @@ impl WriteCredential {
                     .await
                     .map_err(|_| WriteError::IdentityUnverified)?,
             ),
-            TokenSource::Provider(layer) => Some(
-                provider_header(layer.as_deref().ok_or(WriteError::IdentityUnverified)?).await?,
-            ),
+            TokenSource::Provider(layer) => {
+                let layer = layer.as_deref().ok_or(WriteError::IdentityUnverified)?;
+                tokio::select! {
+                    biased;
+                    () = parts.grant.revoked() => return Err(WriteError::IdentityUnverified),
+                    header = provider_header(layer) => Some(header?),
+                }
+            }
         };
+        parts.still_allowed()?;
         let client = match header {
             Some(header) => crate::cluster::sending_credential(client, BoundHeader(header)),
             None => client,
@@ -367,6 +392,7 @@ impl WriteCredential {
         } else {
             None
         };
+        parts.still_allowed()?;
         Ok(Presented {
             client,
             binding: CredentialBinding {
@@ -374,6 +400,16 @@ impl WriteCredential {
                 identity,
             },
         })
+    }
+}
+
+impl Parts {
+    fn still_allowed(&self) -> Result<(), WriteError> {
+        if self.grant.allowed() {
+            Ok(())
+        } else {
+            Err(WriteError::IdentityUnverified)
+        }
     }
 }
 
