@@ -189,6 +189,35 @@ impl Named {
     }
 }
 
+fn activity_record(
+    tool: impl Into<String>,
+    named: Named,
+    server: Option<String>,
+    items: Option<u64>,
+    bytes: usize,
+    truncated: bool,
+    outcome: activity::Outcome,
+) -> activity::ActivityRecord {
+    activity::ActivityRecord {
+        at_ms: activity::now_ms(),
+        tool: tool.into(),
+        server,
+        cluster: named.cluster,
+        kind: named.kind,
+        namespace: named.namespace,
+        name: named.name,
+        container: named.container,
+        items,
+        bytes: bytes as u64,
+        truncated,
+        outcome,
+        cluster_key: None,
+        server_key: None,
+        probed: Vec::new(),
+        probed_more: 0,
+    }
+}
+
 /// How many items a reply holds and whether it was cut short, read from the reply's own
 /// fields (what the agent saw): `count` (or `lines` for logs, `clusters` for list_clusters) and
 /// `truncated` in JSON, and a `# truncated=true` header line in get_resource's YAML.
@@ -262,24 +291,7 @@ impl FlintMcp {
             probed,
             ..activity::Reached::default()
         };
-        let record = activity::ActivityRecord {
-            at_ms: activity::now_ms(),
-            tool: tool.to_owned(),
-            server,
-            cluster: named.cluster,
-            kind: named.kind,
-            namespace: named.namespace,
-            name: named.name,
-            container: named.container,
-            items,
-            bytes: text.len() as u64,
-            truncated,
-            outcome,
-            cluster_key: None,
-            server_key: None,
-            probed: Vec::new(),
-            probed_more: 0,
-        };
+        let record = activity_record(tool, named, server, items, text.len(), truncated, outcome);
         // Within `call_tool`, the record waits for the call's outcome there: a deadline that
         // fires after this still makes it a timeout. Called directly (tests), it is written now.
         if let Err((record, reached)) = CALL
@@ -649,24 +661,15 @@ impl FlintMcp {
                 // cluster the call was about.
                 inner
                     .record(
-                        activity::ActivityRecord {
-                            at_ms: activity::now_ms(),
+                        activity_record(
                             tool,
-                            server: None,
-                            cluster: None,
-                            kind: None,
-                            namespace: None,
-                            name: None,
-                            container: None,
-                            items: None,
-                            bytes: 0,
-                            truncated: false,
-                            outcome: activity::Outcome::Failed,
-                            cluster_key: None,
-                            server_key: None,
-                            probed: Vec::new(),
-                            probed_more: 0,
-                        },
+                            Named::default(),
+                            None,
+                            None,
+                            0,
+                            false,
+                            activity::Outcome::Failed,
+                        ),
                         activity::Reached::default(),
                     )
                     .await;
@@ -872,24 +875,15 @@ impl ServerHandler for FlintMcp {
                 probed: note.probed,
                 ..activity::Reached::default()
             };
-            let record = activity::ActivityRecord {
-                at_ms: activity::now_ms(),
+            let record = activity_record(
                 tool,
-                server: note.server.filter(|_| names_cluster),
-                cluster: named.cluster,
-                kind: named.kind,
-                namespace: named.namespace,
-                name: named.name,
-                container: named.container,
-                items: None,
-                bytes: bytes as u64,
-                truncated: false,
-                outcome: activity::Outcome::Failed,
-                cluster_key: None,
-                server_key: None,
-                probed: Vec::new(),
-                probed_more: 0,
-            };
+                named,
+                note.server.filter(|_| names_cluster),
+                None,
+                bytes,
+                false,
+                activity::Outcome::Failed,
+            );
             (record, reached)
         });
         reached.context = context;
