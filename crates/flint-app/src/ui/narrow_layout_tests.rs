@@ -62,6 +62,39 @@ async fn detail_alone(cx: &mut TestAppContext, t: &TestWorkspace) {
     assert!(t.detail(cx).is_some());
 }
 
+// UP-33: a long namespace in the filter is cut short in its button, so the watch mode button
+// next to it stays on screen at the minimum width with the detail alone.
+#[gpui_kit::test]
+async fn a_long_namespace_keeps_the_watch_mode_button_on_screen(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let long = "a-very-long-namespace-name-for-a-team-that-keeps-going-and-going-on";
+    detail_alone(cx, &t).await;
+    t.dispatch(
+        cx,
+        "workspace::ToggleNamespace",
+        serde_json::json!({ "namespace": long }),
+    )
+    .unwrap();
+    // The button's name and tooltip keep the whole namespace, while its text is cut short.
+    t.wait_for_label(cx, "namespace-filter-button", long).await;
+    draw(cx, &t);
+    let tooltip = t.description(cx, "namespace-filter-button");
+    assert!(
+        tooltip.is_some_and(|text| text.contains(long)),
+        "the tooltip names the whole namespace"
+    );
+    draw(cx, &t);
+    for id in ["namespace-filter-button", "watch-mode"] {
+        let at = bounds(cx, &t, id);
+        assert!(
+            at.origin.x >= px(0.) && at.right() <= px(760.),
+            "{id} is on screen: {at:?}"
+        );
+        assert!(at.size.width > px(40.), "{id} stays clickable: {at:?}");
+    }
+}
+
 // #421: below the breakpoint the detail replaces the list, and Back (a click) returns to the
 // list with the row still selected and the detail still open behind it.
 #[gpui_kit::test]
