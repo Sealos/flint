@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kube::Client;
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -32,10 +31,12 @@ use crate::store::{KindSnapshot, SyncState};
 use crate::watch::{ClusterWatches, EngineConfig, HubRegistry, KubeSource};
 use crate::write::WriteError;
 
-/// Changes to watched files often come in bursts (editor save, `kind` rewriting the file).
-const RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
-/// How many symlinks in a row are followed to find what to watch, as the OS limits them too.
-const MAX_LINK_HOPS: usize = 40;
+mod file_watch;
+
+use file_watch::{FileWatcher, WatchScope};
+#[cfg(test)]
+use file_watch::{Watched, classify, missing_dirs, watch_names, watch_plan};
+
 /// CRD changes come in bursts too (create, then status updates as names are accepted).
 const CRD_DEBOUNCE: Duration = Duration::from_millis(500);
 /// The API server publishes a new CRD in discovery a moment after the CRD changes. When
@@ -441,14 +442,6 @@ pub(crate) struct ClusterManager {
     settled: HashMap<ClusterId, Option<u64>>,
 }
 
-struct FileWatcher {
-    _watcher: RecommendedWatcher,
-    /// What it was set up for, to notice when a symlink has moved that.
-    watched: Watched,
-    /// Whether the config directory is watched. It may not exist until settings are first written.
-    settings_dir_watched: bool,
-}
-
 impl ClusterManager {
     /// The log sessions' shared budget, for [`crate::LogSession::set_shown`].
     pub(crate) fn log_budget(&self) -> Arc<logs::LogBudget> {
@@ -516,7 +509,7 @@ impl ClusterManager {
         self.emit_settings();
         // Watching first, so a change after the first reads (an agent's call landing meanwhile)
         // is noticed.
-        self.rebuild_watcher();
+        self.arm_watcher();
         self.reload_activity().await;
         self.reload_kubeconfig().await;
         loop {
@@ -1038,14 +1031,8 @@ impl ClusterManager {
         match result {
             Ok(Ok(settings)) => {
                 self.apply_settings(Ok(settings)).await;
-                if self
-                    .watcher
-                    .as_ref()
-                    .is_some_and(|w| !w.settings_dir_watched)
-                {
-                    // The write may have created the config directory.
-                    self.rebuild_watcher();
-                }
+                // The write may have created the config directory.
+                self.arm_watcher();
                 true
             }
             // A settings write error can quote the file: one sanitized line.
@@ -1107,7 +1094,7 @@ impl ClusterManager {
         );
         if paths != self.kubeconfig_paths {
             self.kubeconfig_paths = paths;
-            self.rebuild_watcher();
+            self.arm_watcher();
             self.reload_kubeconfig().await;
         }
     }
@@ -1417,12 +1404,10 @@ impl ClusterManager {
                 }
             }
             Internal::FilesChanged(changed) => {
-                if changed.rearm {
-                    // Before reloading, so a file written right after its directory is caught
-                    // either by the reload or by the new watcher.
-                    self.rebuild_watcher();
-                } else if changed.kubeconfig {
-                    self.follow_moved_links();
+                if changed.rearm || changed.kubeconfig || changed.settings {
+                    // A symlink may have moved. Anything written before the new watches start
+                    // is caught by the read the watcher asks for once they have.
+                    self.arm_watcher();
                 }
                 if changed.settings {
                     // First, since settings can change the kubeconfig file list.
@@ -2286,230 +2271,21 @@ impl ClusterManager {
         }
     }
 
-    /// (Re)creates the file watcher for the current kubeconfig files and `settings.toml`, if
-    /// watching is enabled. Dropping the old watcher stops it.
-    fn rebuild_watcher(&mut self) {
+    /// Asks for the file watches to match the current kubeconfig files and `settings.toml`, if
+    /// watching is enabled. The scan runs on the watcher's own thread, so a stuck mount cannot
+    /// hold up this loop; once watches changed, that thread asks for everything to be read again.
+    fn arm_watcher(&mut self) {
         if !self.config.watch_files {
             return;
         }
-        self.watcher = None;
-        self.watcher = self.watch_files();
-    }
-
-    /// Re-arms the watcher if a symlink now leads somewhere it does not watch. The new watcher
-    /// starts before the old one stops, so no event falls between them, and the old one stays
-    /// if the new one cannot start. The reload that follows reads anything written before.
-    fn follow_moved_links(&mut self) {
-        let current = Watched::for_files(&self.kubeconfig_paths, &self.config.config_dir);
-        if self.watcher.as_ref().is_some_and(|w| w.watched != current)
-            && let Some(watcher) = self.watch_files()
-        {
-            self.watcher = Some(watcher);
+        if self.watcher.is_none() {
+            self.watcher = FileWatcher::start(self.internal_tx.clone());
         }
-    }
-
-    /// Watches the directories holding the kubeconfig files and `settings.toml`, so files that
-    /// are replaced by rename or created later are noticed. Each file is matched by its path and
-    /// its resolved path (symlink targets, `/var` versus `/private/var`).
-    fn watch_files(&self) -> Option<FileWatcher> {
-        // Create the config directory, so a settings.toml written there later (by hand or by
-        // another Flint) is noticed. Failing is fine: the app's own writes create it too.
-        let _ = std::fs::create_dir_all(&self.config.config_dir);
-        let watched = Watched::for_files(&self.kubeconfig_paths, &self.config.config_dir);
-        let (raw_tx, raw_rx) = mpsc::unbounded_channel::<Changed>();
-        let in_callback = watched.clone();
-        let mut watcher =
-            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                let Ok(event) = res else { return };
-                if matches!(event.kind, EventKind::Access(_)) {
-                    return;
-                }
-                let changed = classify(&event.paths, &in_callback);
-                if changed.kubeconfig || changed.settings || changed.activity {
-                    let _ = raw_tx.send(changed);
-                }
-            }) {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::warn!(error = %e, "cannot watch kubeconfig and settings files");
-                    return None;
-                }
-            };
-        let mut watched_dirs = HashSet::new();
-        for dir in &watched.dirs {
-            match watcher.watch(dir, RecursiveMode::NonRecursive) {
-                Ok(()) => {
-                    watched_dirs.insert(dir.clone());
-                }
-                Err(e) => tracing::debug!(dir = %dir.display(), error = %e, "not watching dir"),
-            }
-        }
-        let settings_dir_watched = watched
-            .settings
-            .iter()
-            .filter_map(|f| f.parent())
-            .any(|d| watched_dirs.contains(&resolved(d)));
-        tokio::spawn(debounce(raw_rx, self.internal_tx.clone()));
-        Some(FileWatcher {
-            _watcher: watcher,
-            watched,
-            settings_dir_watched,
-        })
-    }
-}
-
-/// `dir` resolved (symlinks, `..`), or as given if it cannot be.
-fn resolved(dir: &Path) -> PathBuf {
-    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
-}
-
-/// The directories to watch so `files` are noticed, each once by its resolved name (inotify
-/// merges a directory's aliases into one watch, and removing one alias's watch would remove
-/// the other's), and the missing directories whose creation means the watcher is rebuilt. A
-/// directory that does not exist yet cannot be watched: its nearest existing ancestor is.
-fn watch_plan<'a>(
-    files: impl Iterator<Item = &'a PathBuf>,
-) -> (HashSet<PathBuf>, HashSet<PathBuf>) {
-    let dirs: HashSet<&Path> = files.filter_map(|f| f.parent()).collect();
-    let mut watch_dirs = HashSet::new();
-    let mut pending = HashSet::new();
-    for dir in dirs {
-        match missing_dirs(dir) {
-            Some((ancestor, missing)) => {
-                watch_dirs.insert(resolved(&ancestor));
-                pending.extend(missing);
-            }
-            None => {
-                watch_dirs.insert(resolved(dir));
-            }
-        }
-    }
-    (watch_dirs, pending)
-}
-
-/// What an event on `paths` changed. A missing directory that appeared (`pending`) may
-/// already hold kubeconfig files or `settings.toml` (a symlink's target directory restored
-/// with the file in it), so both are read again, besides rebuilding the watcher.
-/// The paths a file watcher reacts to.
-#[derive(Clone, PartialEq)]
-struct Watched {
-    /// The directories watched.
-    dirs: HashSet<PathBuf>,
-    /// Missing directories whose creation means the watcher is rebuilt.
-    pending: HashSet<PathBuf>,
-    kube: HashSet<PathBuf>,
-    settings: HashSet<PathBuf>,
-    activity: HashSet<PathBuf>,
-}
-
-impl Watched {
-    /// What to watch for `kubeconfig` files and the settings in `config_dir`, as the disk has
-    /// them now.
-    fn for_files(kubeconfig: &[PathBuf], config_dir: &Path) -> Self {
-        let kube: HashSet<PathBuf> = kubeconfig.iter().flat_map(|p| watch_names(p)).collect();
-        let settings_path = config_dir.join(settings::SETTINGS_FILE);
-        let settings: HashSet<PathBuf> = watch_names(&settings_path).into_iter().collect();
-        // Beside settings.toml, so it needs no directory of its own.
-        let activity = [activity::ACTIVITY_FILE, activity::PREVIOUS_FILE]
-            .iter()
-            .flat_map(|f| watch_names(&config_dir.join(f)))
-            .collect();
-        let (dirs, pending) = watch_plan(kube.iter().chain(&settings));
-        Watched {
-            dirs,
-            pending,
-            kube,
-            settings,
-            activity,
-        }
-    }
-}
-
-fn classify(paths: &[PathBuf], watched: &Watched) -> Changed {
-    // A watched directory that is gone can no longer report its return.
-    let rearm = paths
-        .iter()
-        .any(|p| watched.pending.contains(p) || (watched.dirs.contains(p) && !p.exists()));
-    let any = |set: &HashSet<PathBuf>| rearm || paths.iter().any(|p| set.contains(p));
-    Changed {
-        kubeconfig: any(&watched.kube),
-        settings: any(&watched.settings),
-        activity: any(&watched.activity),
-        rearm,
-    }
-}
-
-/// For a directory that does not exist: its nearest existing ancestor, and every directory
-/// from there down to it that is missing (as given and with the ancestor resolved, since
-/// events may name either), whose creation means the watcher should be rebuilt. `None` when
-/// the directory exists.
-fn missing_dirs(dir: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
-    if dir.is_dir() {
-        return None;
-    }
-    let ancestor = dir.ancestors().skip(1).find(|a| a.is_dir())?.to_path_buf();
-    let resolved = std::fs::canonicalize(&ancestor).ok();
-    let mut missing = Vec::new();
-    for path in dir.ancestors().take_while(|a| *a != ancestor) {
-        missing.push(path.to_path_buf());
-        if let (Some(resolved), Ok(rest)) = (&resolved, path.strip_prefix(&ancestor)) {
-            missing.push(resolved.join(rest));
-        }
-    }
-    Some((ancestor, missing))
-}
-
-/// The paths a file may be reported under: as given, resolved (if it exists), and with its
-/// directory resolved (if only the directory exists yet).
-fn watch_names(path: &Path) -> Vec<PathBuf> {
-    let mut names = vec![path.to_path_buf()];
-    if let Ok(target) = std::fs::canonicalize(path) {
-        names.push(target);
-    }
-    // A symlink whose target is missing cannot be canonicalized: name each target along the
-    // chain as its link says it (relative to the link's directory), and with that directory
-    // resolved, so restoring a target or moving a later link is noticed.
-    let mut at = path.to_path_buf();
-    for _ in 0..MAX_LINK_HOPS {
-        let Ok(link) = std::fs::read_link(&at) else {
-            break;
-        };
-        let target = match at.parent() {
-            Some(dir) if link.is_relative() => dir.join(link),
-            _ => link,
-        };
-        if names.contains(&target) {
-            break;
-        }
-        if let (Some(dir), Some(name)) = (target.parent(), target.file_name())
-            && let Ok(dir) = std::fs::canonicalize(dir)
-        {
-            names.push(dir.join(name));
-        }
-        names.push(target.clone());
-        at = target;
-    }
-    if let (Some(dir), Some(name)) = (path.parent(), path.file_name())
-        && let Ok(dir) = std::fs::canonicalize(dir)
-    {
-        names.push(dir.join(name));
-    }
-    names
-}
-
-/// Ends when the watcher is dropped (its sender closes) or the manager stops.
-async fn debounce(mut raw: mpsc::UnboundedReceiver<Changed>, out: mpsc::UnboundedSender<Internal>) {
-    while let Some(first) = raw.recv().await {
-        tokio::time::sleep(RELOAD_DEBOUNCE).await;
-        let mut changed = first;
-        while let Ok(more) = raw.try_recv() {
-            changed.kubeconfig |= more.kubeconfig;
-            changed.settings |= more.settings;
-            changed.activity |= more.activity;
-            changed.rearm |= more.rearm;
-        }
-        if out.send(Internal::FilesChanged(changed)).is_err() {
-            break;
+        if let Some(watcher) = &self.watcher {
+            watcher.request(WatchScope {
+                kubeconfig: self.kubeconfig_paths.clone(),
+                config_dir: self.config.config_dir.clone(),
+            });
         }
     }
 }
@@ -5994,14 +5770,22 @@ mod tests {
             settings: HashSet::from([PathBuf::from("/cfg/dotfiles/flint.toml")]),
             activity: HashSet::from([PathBuf::from("/cfg/agent-activity.jsonl")]),
         };
-        let changed = classify(&[PathBuf::from("/cfg/dotfiles")], &watched);
+        let changed = classify(&[PathBuf::from("/cfg/dotfiles")], false, &watched);
         assert!(changed.rearm && changed.settings && changed.kubeconfig && changed.activity);
-        let changed = classify(&[PathBuf::from("/k/config")], &watched);
+        let changed = classify(&[PathBuf::from("/k/config")], false, &watched);
         assert!(!changed.rearm && !changed.settings && changed.kubeconfig && !changed.activity);
-        let changed = classify(&[PathBuf::from("/cfg/dotfiles/flint.toml")], &watched);
+        let changed = classify(
+            &[PathBuf::from("/cfg/dotfiles/flint.toml")],
+            false,
+            &watched,
+        );
         assert!(!changed.rearm && changed.settings && !changed.kubeconfig && !changed.activity);
         // covers UP-16: an agent's call reloads only the activity log.
-        let changed = classify(&[PathBuf::from("/cfg/agent-activity.jsonl")], &watched);
+        let changed = classify(
+            &[PathBuf::from("/cfg/agent-activity.jsonl")],
+            false,
+            &watched,
+        );
         assert!(!changed.rearm && !changed.settings && !changed.kubeconfig && changed.activity);
     }
 
@@ -6044,7 +5828,7 @@ mod tests {
             HubRegistry::default(),
             SessionUnlocks::default(),
         );
-        manager.rebuild_watcher();
+        manager.arm_watcher();
         manager.reload_kubeconfig().await;
         manager
     }
@@ -6182,7 +5966,8 @@ mod tests {
                 .replace("cluster: c\n", "cluster: c2\n")
         };
         let kept = config_in(&root, "kept", "https://kept");
-        let first = config_in(&root, "a", "https://a");
+        // In the folder of the link that stays, which must stay watched when this one moves.
+        let first = root.join("kept/first");
         let second = config_in(&root, "b", "https://b");
         std::fs::write(&first, two("https://a")).unwrap();
         std::fs::write(&second, two("https://b")).unwrap();
