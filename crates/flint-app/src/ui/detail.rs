@@ -31,7 +31,7 @@ use super::list::tabular_figures;
 use super::log_view::LogRequest;
 use super::menu_fit::{fit_picker, picker_item};
 use super::menu_record;
-use super::notice::{notice, notice_detail, notice_with};
+use super::notice::{clamped, notice, notice_detail, notice_with};
 use super::object::{self, MASK, Overview, PodContainer, SecretValue};
 use super::registry::{
     self, ApplyYamlEdit, BackToYamlEdit, CancelYamlEdit, Close, EditYaml, OpenContainerLogs,
@@ -1008,7 +1008,13 @@ impl DetailView {
             (logs, shell) => logs
                 .map(|why| refused(Opening::Logs, &why))
                 .into_iter()
-                .chain(shell.map(|why| refused(Opening::Shell, &why)))
+                .chain(shell.map(|why| {
+                    if why == protected_reason(&self.object.cluster) {
+                        actions::PROTECTED_CAPTION.to_owned()
+                    } else {
+                        refused(Opening::Shell, &why)
+                    }
+                }))
                 .collect(),
         }
     }
@@ -1029,10 +1035,9 @@ impl DetailView {
                 .text_color(theme.muted_foreground)
                 .children(captions.into_iter().enumerate().map(|(ix, text)| {
                     let full: SharedString = text.clone().into();
-                    div()
+                    clamped(div())
                         .id(("detail-caption", ix))
                         .min_w_0()
-                        .truncate()
                         .child(text.clone())
                         .test_text(text)
                         .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))

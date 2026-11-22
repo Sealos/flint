@@ -374,7 +374,7 @@ async fn a_protected_cluster_disables_shell_until_unlocked(cx: &mut TestAppConte
     assert_eq!(disabled(cx, &t, "detail-shell"), Some(true));
     assert_eq!(disabled(cx, &t, "detail-logs"), Some(false));
     assert_eq!(disabled(cx, &t, "detail-unlock"), Some(false));
-    assert_eq!(captions(cx, &t), [format!("Can't open a shell: {why}.")]);
+    assert_eq!(captions(cx, &t), ["Read-only: unlock to open a shell."]);
     assert_eq!(
         t.dispatch(cx, "detail::OpenShell", Value::Null),
         Err(ActionError::NotAvailable("detail::OpenShell".into()))

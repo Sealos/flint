@@ -123,6 +123,10 @@ pub(in crate::ui) fn protected_reason(cluster: &str) -> String {
 /// [`protected_reason`] where the Unlock entry right after it names the cluster.
 pub(in crate::ui) const PROTECTED_NOTE: &str = "Protected: read-only until unlocked";
 
+/// [`protected_reason`] as the caption under the pane's buttons, where a long cluster name
+/// would crowd it out. The Shell button's tooltip still names the cluster.
+pub(in crate::ui) const PROTECTED_CAPTION: &str = "Read-only: unlock to open a shell.";
+
 /// A refusal as one sentence that names what was refused, then why: "Can't open a shell: no
 /// pod of Deployment web is ready." Every refusal the strip over the dock and the pane's
 /// captions show is worded here.
