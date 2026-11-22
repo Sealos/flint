@@ -1150,14 +1150,16 @@ impl ClusterManager {
                 // Starting a read beside a running one would count as a missed reload and make
                 // every check in flight stale, so an out-of-order result is refused instead.
                 let behind_a_read = !in_order && self.reader.busy(&paths);
-                let (answer, differs) = if behind_a_read && self.marks.current(seq) {
+                // A read can still start between that look and a read from here. An out-of-order
+                // result is no news of a change, so finding the reader busy then moves no mark.
+                let why = if in_order {
+                    ReadFor::Change
+                } else {
+                    ReadFor::Refresh
+                };
+                let (answer, differs) = if behind_a_read {
                     (Err(WriteError::KubeconfigUnreadable), false)
                 } else if read.is_some() && (!in_order || !self.marks.current(seq)) {
-                    let why = if self.marks.current(seq) {
-                        ReadFor::Refresh
-                    } else {
-                        ReadFor::Change
-                    };
                     let answer = self
                         .revalidate_write(&cluster, &pin, &paths, deadline, why)
                         .await;
@@ -1179,7 +1181,7 @@ impl ClusterManager {
                     || self.change_queued()
                     || self.stalled_on.as_ref() == Some(&paths)
                 {
-                    self.reload_kubeconfig().await;
+                    self.read_and_apply(None, why, |_, _| {}).await;
                 } else {
                     self.refresh_if_idle().await;
                 }
@@ -3786,6 +3788,198 @@ mod tests {
 
         let gate = dir.path().join("gate");
         release_gate(&gate);
+        let read = next_internal(&mut manager).await;
+        manager.handle_internal(read).await;
+        assert_eq!(running.await.unwrap(), Err(WriteError::ConnectionChanged));
+        assert!(!manager.reread, "the reload ran");
+    }
+
+    /// A manager with reads A and B numbered, B's result taken, the files since reported changed
+    /// so both are stale, a write check started after that still running, and A's result in hand
+    /// with its number.
+    async fn stale_result_behind_a_check(
+        dir: &Path,
+    ) -> (
+        ClusterManager,
+        ContextPin,
+        oneshot::Receiver<Result<(), WriteError>>,
+        (u64, FileRead),
+    ) {
+        let mut manager = manager_reading(dir, &kubeconfig_with("https://dev")).await;
+        manager.unlocks.unlock("dev", "https://dev");
+        let pin = manager.contexts.pin_confirmed("dev");
+        let paths = manager.kubeconfig_paths.clone();
+        let older = manager.reader.read(&paths, |_| {}).await.unwrap();
+        let (older_seq, _) = manager.next_read(&paths);
+        let newer = manager.reader.read(&paths, |_| {}).await.unwrap();
+        let (newer_seq, _) = manager.next_read(&paths);
+        assert_eq!(
+            finished_write(&mut manager, &pin, newer_seq, newer).await,
+            Ok(())
+        );
+        let changed = Changed {
+            kubeconfig: true,
+            ..Changed::default()
+        };
+        manager
+            .handle_internal(Internal::FilesChanged(changed))
+            .await;
+        assert!(!manager.marks.current(older_seq) && !manager.marks.current(newer_seq));
+        make_fifo(&dir.join("gate"));
+        manager.reader = KubeconfigReader::new(load_then_wait, Duration::from_secs(5));
+        let running = ask_write(&mut manager, &pin);
+        until_parsed(dir).await;
+        (manager, pin, running, (older_seq, older))
+    }
+
+    // covers UP-54: a stale out-of-order result is refused without making a check that started
+    // after the change stale, and the refresh it leaves runs once that check is done.
+    #[tokio::test]
+    async fn a_stale_out_of_order_result_leaves_a_running_check_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, pin, running, (older_seq, older)) =
+            stale_result_behind_a_check(dir.path()).await;
+        let running_seq = manager.read_seq;
+        let stale_through = manager.marks.stale_through;
+
+        assert_eq!(
+            finished_write(&mut manager, &pin, older_seq, older).await,
+            Err(WriteError::KubeconfigUnreadable),
+            "an out-of-order result grants nothing"
+        );
+        assert_eq!(manager.marks.stale_through, stale_through);
+        assert!(manager.marks.current(running_seq));
+        assert!(
+            manager.reread && manager.refresh_only,
+            "a refresh is queued"
+        );
+
+        release_gate(&dir.path().join("gate"));
+        let read = next_internal(&mut manager).await;
+        manager.handle_internal(read).await;
+        assert_eq!(running.await.unwrap(), Ok(()));
+        assert!(!manager.reread, "the refresh ran");
+    }
+
+    // covers UP-54: a change queued behind the running read stays a change through a stale
+    // out-of-order result, so the running read still can't answer.
+    #[tokio::test]
+    async fn a_stale_out_of_order_result_keeps_a_queued_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, pin, running, (older_seq, older)) =
+            stale_result_behind_a_check(dir.path()).await;
+        std::fs::write(
+            dir.path().join("kubeconfig"),
+            kubeconfig_with("https://moved"),
+        )
+        .unwrap();
+        let changed = Changed {
+            kubeconfig: true,
+            ..Changed::default()
+        };
+        manager
+            .handle_internal(Internal::FilesChanged(changed))
+            .await;
+        assert!(manager.change_queued());
+        let stale_through = manager.marks.stale_through;
+
+        assert_eq!(
+            finished_write(&mut manager, &pin, older_seq, older).await,
+            Err(WriteError::KubeconfigUnreadable)
+        );
+        assert!(manager.change_queued(), "still a change");
+        assert_eq!(manager.marks.stale_through, stale_through);
+
+        release_gate(&dir.path().join("gate"));
+        let read = next_internal(&mut manager).await;
+        manager.handle_internal(read).await;
+        assert_eq!(running.await.unwrap(), Err(WriteError::ConnectionChanged));
+        assert!(!manager.reread, "the reload ran");
+    }
+
+    // covers UP-54: a stale out-of-order result starts a read that stalls, so the reload after it
+    // finds the reader busy. That moves no mark, and the stalled read still ends the hold.
+    #[tokio::test]
+    async fn a_stale_out_of_order_result_moves_no_mark_when_the_reader_turns_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://dev")).await;
+        manager.unlocks.unlock("dev", "https://dev");
+        let pin = manager.contexts.pin_confirmed("dev");
+        let paths = manager.kubeconfig_paths.clone();
+        let older = manager.reader.read(&paths, |_| {}).await.unwrap();
+        let (older_seq, _) = manager.next_read(&paths);
+        let newer = manager.reader.read(&paths, |_| {}).await.unwrap();
+        let (newer_seq, _) = manager.next_read(&paths);
+        assert_eq!(
+            finished_write(&mut manager, &pin, newer_seq, newer).await,
+            Ok(())
+        );
+        let changed = Changed {
+            kubeconfig: true,
+            ..Changed::default()
+        };
+        manager
+            .handle_internal(Internal::FilesChanged(changed))
+            .await;
+        assert!(!manager.marks.current(older_seq));
+        let gate = dir.path().join("gate");
+        make_fifo(&gate);
+        manager.reader = KubeconfigReader::new(load_then_wait, Duration::from_millis(40));
+        let stale_through = manager.marks.stale_through;
+
+        assert_eq!(
+            finished_write(&mut manager, &pin, older_seq, older).await,
+            Err(WriteError::KubeconfigUnreadable)
+        );
+        assert_eq!(manager.marks.stale_through, stale_through);
+        assert!(
+            manager.reread && manager.refresh_only,
+            "a refresh is queued"
+        );
+        assert!(manager.held("dev"), "held while the read runs");
+
+        release_gate(&gate);
+        let late = next_internal(&mut manager).await;
+        assert!(matches!(late, Internal::LateRead { .. }));
+        manager.reader = KubeconfigReader::new(kubeconfig::load, Duration::from_secs(5));
+        manager.handle_internal(late).await;
+        assert!(!manager.held("dev"), "the stalled read ended the hold");
+        assert!(!manager.reread, "the refresh ran");
+    }
+
+    // covers UP-54: a refresh that finds the reader busy leaves a queued change a change, moves no
+    // mark and grants nothing.
+    #[tokio::test]
+    async fn a_refresh_that_finds_the_reader_busy_keeps_a_queued_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, pin, running, _) = stale_result_behind_a_check(dir.path()).await;
+        std::fs::write(
+            dir.path().join("kubeconfig"),
+            kubeconfig_with("https://moved"),
+        )
+        .unwrap();
+        let changed = Changed {
+            kubeconfig: true,
+            ..Changed::default()
+        };
+        manager
+            .handle_internal(Internal::FilesChanged(changed))
+            .await;
+        assert!(manager.change_queued());
+        let stale_through = manager.marks.stale_through;
+        let paths = manager.kubeconfig_paths.clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+        assert_eq!(
+            manager
+                .revalidate_write("dev", &pin, &paths, deadline, ReadFor::Refresh)
+                .await,
+            Err(WriteError::KubeconfigUnreadable)
+        );
+        assert!(manager.change_queued(), "still a change");
+        assert_eq!(manager.marks.stale_through, stale_through);
+
+        release_gate(&dir.path().join("gate"));
         let read = next_internal(&mut manager).await;
         manager.handle_internal(read).await;
         assert_eq!(running.await.unwrap(), Err(WriteError::ConnectionChanged));
