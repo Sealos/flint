@@ -5,8 +5,8 @@
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
-    AppContext as _, Bounds, Context, InteractiveElement as _, IntoElement, Pixels, Render,
-    Styled as _, TestAppContext, VisualTestContext, Window, div, px, size,
+    AppContext as _, Bounds, Context, ElementId, InteractiveElement as _, IntoElement, Pixels,
+    Render, Styled as _, TestAppContext, VisualTestContext, Window, div, px, size,
 };
 use serde_json::Value;
 use std::time::Duration;
@@ -476,6 +476,33 @@ async fn the_back_key_only_acts_on_the_detail_alone(cx: &mut TestAppContext) {
     t.press_key_of(cx, "workspace::BackToList");
     assert_eq!(focus(cx, &t), Focus::Detail, "focus stays where it was");
     assert!(!t.available(cx).contains(&"workspace::BackToList"));
+}
+
+// #433: at the minimum size a long object name gives way before the cluster, which stays whole.
+#[gpui_kit::test]
+async fn the_breadcrumb_keeps_the_cluster_at_the_minimum_size(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let long = "web-".repeat(60);
+    let rows = [("demo", long.as_str(), 0)];
+    t.open_pods(cx, &rows).await;
+    let cluster = ElementId::from(("crumb", 0usize));
+    let whole = crumb_width(cx, &t, &cluster);
+
+    resize(cx, &t, 760., 480.);
+    t.click(cx, ElementId::Name(format!("row-uid-{long}").into()));
+    draw(cx, &t);
+    assert!(shown(cx, &t, "detail-back"));
+
+    assert_eq!(t.label(cx, cluster.clone()).as_deref(), Some("kind-alpha"));
+    let narrow = crumb_width(cx, &t, &cluster);
+    assert_eq!(narrow, whole, "the cluster's name is not cut");
+}
+
+fn crumb_width(cx: &mut TestAppContext, t: &TestWorkspace, id: &ElementId) -> Pixels {
+    let id = id.clone();
+    cx.update_window(t.window, |_, window, _| window.find(id).bounds().size.width)
+        .unwrap()
 }
 
 // #421: the main window cannot be made smaller than the layout supports.

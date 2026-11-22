@@ -1698,8 +1698,12 @@ impl Workspace {
             breadcrumb = breadcrumb.child(
                 div()
                     .id(("crumb", i))
+                    .aria_label(text.clone())
+                    .test_support()
                     .min_w_0()
                     .truncate()
+                    // The other crumbs give way first: the cluster shrinks only past its cap.
+                    .when(i == 0, |el| el.flex_none().max_w(relative(0.6)))
                     .when(!last, |el| el.text_color(theme.muted_foreground))
                     .when(last, |el| el.font_semibold())
                     .when(last && mono_last, |el| {
