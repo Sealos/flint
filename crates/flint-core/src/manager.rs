@@ -801,7 +801,7 @@ impl ClusterManager {
             .collect();
         let hubs = self.hubs.clone();
         let internal = self.internal_tx.clone();
-        let paused = self.unsettled(id);
+        let paused = self.paused(id);
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
@@ -844,7 +844,7 @@ impl ClusterManager {
     fn start_discovery(&mut self, id: &str) {
         let internal = self.internal_tx.clone();
         let target = cluster::Target::of(&self.kubeconfig.merged, id);
-        let paused = self.unsettled(id);
+        let paused = self.paused(id);
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
@@ -1190,7 +1190,7 @@ impl ClusterManager {
                 result,
             } => {
                 let target = cluster::Target::of(&self.kubeconfig.merged, &cluster);
-                let paused = self.unsettled(&cluster);
+                let paused = self.paused(&cluster);
                 let Some(slot) = self.cluster_mut(&cluster) else {
                     return;
                 };
@@ -1245,7 +1245,7 @@ impl ClusterManager {
                 attempt,
                 result,
             } => {
-                let paused = self.unsettled(&cluster);
+                let paused = self.paused(&cluster);
                 let Some(slot) = self.cluster_mut(&cluster) else {
                     return;
                 };
@@ -1422,7 +1422,7 @@ impl ClusterManager {
         let slot = self.cluster(cluster).filter(|s| {
             let shown = s.info.server.as_deref();
             // A paused slot's connection goes on, but nothing new connects for it.
-            (s.client.is_some() || !self.unsettled(cluster))
+            (s.client.is_some() || !self.paused(cluster))
                 // The endpoint alone is enough only for a confirmed server: a fallback at the
                 // same URL can come with other credentials.
                 && (shown == pin.server()
@@ -1735,6 +1735,20 @@ impl ClusterManager {
         self.held(id) || (self.cluster(id).is_some() && self.contexts.provisional(id))
     }
 
+    /// Whether nothing new may start for `id`: a held slot, or an entry that may be a later file's
+    /// fallback and differs from the definition a load last confirmed. A provisional entry that
+    /// matches it, or that no load ever confirmed, connects as usual.
+    fn paused(&self, id: &str) -> bool {
+        self.held(id)
+            || self.cluster(id).is_some_and(|slot| {
+                self.contexts.provisional(id)
+                    && self
+                        .settled
+                        .get(id)
+                        .is_some_and(|confirmed| *confirmed != slot.fingerprint)
+            })
+    }
+
     /// Reads the kubeconfig files now, ahead of the file watcher, and says whether they still
     /// give `id` the definition the last load showed at `server`. Anything else is a no, a read
     /// that fails included, and a read that stalls also holds writes as a reload's does. Another
@@ -1877,13 +1891,13 @@ impl ClusterManager {
         self.reconcile(&id);
     }
 
-    /// Starts a connection unless one is up or in progress. An unsettled context waits: no load
-    /// confirms a definition to connect with, and the load that does starts the attempt.
+    /// Starts a connection unless one is up or in progress. A paused context waits, and the load
+    /// that ends the pause starts the attempt.
     fn ensure_connected(&mut self, id: &str) {
         let kubeconfig = self.kubeconfig.clone();
         let internal = self.internal_tx.clone();
         let attempt = self.next_attempt;
-        let paused = self.unsettled(id);
+        let paused = self.paused(id);
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
@@ -2098,7 +2112,7 @@ impl ClusterManager {
         let order: Vec<String> = self.clusters.iter().map(|c| c.info.name.clone()).collect();
         let paused: HashSet<String> = order
             .iter()
-            .filter(|name| self.unsettled(name))
+            .filter(|name| self.paused(name))
             .cloned()
             .collect();
         let mut old: HashMap<String, Cluster> = self
@@ -2202,7 +2216,7 @@ impl ClusterManager {
         }
         for name in paused
             .iter()
-            .filter(|name| !self.unsettled(name))
+            .filter(|name| !self.paused(name))
             .cloned()
             .collect::<Vec<_>>()
         {
@@ -4523,15 +4537,20 @@ mod tests {
         assert_ne!(slot.attempt, attempt);
     }
 
-    /// What the second file holds for each way a context pauses when the first breaks: the same
-    /// definition (the slot stays, provisional), or nothing (the slot stays, held).
-    const PAUSES: [Option<&str>; 2] = [None, Some(NO_CONTEXTS)];
+    /// What the second file holds for each way a context pauses when the first breaks: another
+    /// definition (a fresh, provisional slot), or nothing (the slot stays, held).
+    fn pauses() -> [String; 2] {
+        [
+            kubeconfig_with("https://127.0.0.1:3"),
+            NO_CONTEXTS.to_owned(),
+        ]
+    }
 
     /// A manager on two files with `dev` at an address nothing listens on, its first file broken
-    /// when `pause` is called. The second file is `second`, or the first's text.
-    async fn pausable(dir: &Path, second: Option<&str>) -> (ClusterManager, String, PathBuf) {
+    /// when `pause` is called.
+    async fn pausable(dir: &Path, second: &str) -> (ClusterManager, String, PathBuf) {
         let yaml = kubeconfig_with("https://127.0.0.1:1");
-        let manager = manager_reading_two(dir, &yaml, second.unwrap_or(&yaml)).await;
+        let manager = manager_reading_two(dir, &yaml, second).await;
         (manager, yaml, dir.join("first"))
     }
 
@@ -4574,11 +4593,11 @@ mod tests {
     // A paused context starts no connection, and the load that ends the pause starts it.
     #[tokio::test]
     async fn a_paused_active_context_connects_only_when_the_pause_ends() {
-        for second in PAUSES {
+        for second in pauses() {
             let dir = tempfile::tempdir().unwrap();
-            let (mut manager, yaml, first) = pausable(dir.path(), second).await;
+            let (mut manager, yaml, first) = pausable(dir.path(), &second).await;
             rewrite_file(&mut manager, &first, UNREADABLE).await;
-            assert!(manager.unsettled("dev"));
+            assert!(manager.paused("dev"));
             let next = manager.next_attempt;
 
             manager.activate("dev".to_owned());
@@ -4598,10 +4617,10 @@ mod tests {
     // cluster connects again when the pause ends.
     #[tokio::test]
     async fn a_connection_landing_during_a_pause_is_discarded() {
-        for second in PAUSES {
+        for second in pauses() {
             for succeeded in [true, false] {
                 let dir = tempfile::tempdir().unwrap();
-                let (mut manager, yaml, first) = pausable(dir.path(), second).await;
+                let (mut manager, yaml, first) = pausable(dir.path(), &second).await;
                 manager.active = Some("dev".to_owned());
                 let attempt = manager.next_attempt;
                 manager.next_attempt += 1;
@@ -4614,7 +4633,12 @@ mod tests {
                     Err(cluster::SafeErrorText::fixed("refused"))
                 };
                 rewrite_file(&mut manager, &first, UNREADABLE).await;
-                assert!(manager.unsettled("dev"));
+                assert!(manager.paused("dev"));
+                // A changed definition has a fresh slot: give it the attempt, so that only the
+                // pause drops the result.
+                let slot = manager.cluster_mut("dev").unwrap();
+                slot.attempt = attempt;
+                slot.state = ConnectionState::Connecting;
 
                 manager
                     .handle_internal(Internal::Connected {
@@ -4647,7 +4671,7 @@ mod tests {
             kind("", "ConfigMap", "configmaps", true, lw),
         ];
         let (pods, configmaps) = (kinds[0].id(), kinds[1].id());
-        for second in PAUSES {
+        for second in [NO_CONTEXTS] {
             let dir = tempfile::tempdir().unwrap();
             let (mut manager, yaml, first) = pausable(dir.path(), second).await;
             manager.settings = Arc::new(Settings {
@@ -4671,7 +4695,7 @@ mod tests {
             assert!(running(&manager, &pods));
 
             rewrite_file(&mut manager, &first, UNREADABLE).await;
-            assert!(manager.unsettled("dev"));
+            assert!(manager.paused("dev"));
             manager.handle_request(subscribe(2, &configmaps));
             assert!(!running(&manager, &configmaps), "no new watch");
             assert!(running(&manager, &pods), "the running watch goes on");
@@ -4701,12 +4725,12 @@ mod tests {
     // Selecting a paused cluster that has a client but no discovery does not run discovery.
     #[tokio::test]
     async fn selecting_a_paused_cluster_starts_no_discovery() {
-        for second in PAUSES {
+        for second in [NO_CONTEXTS] {
             let dir = tempfile::tempdir().unwrap();
             let (mut manager, _, first) = pausable(dir.path(), second).await;
             land_connection(&mut manager).await;
             rewrite_file(&mut manager, &first, UNREADABLE).await;
-            assert!(manager.unsettled("dev"));
+            assert!(manager.paused("dev"));
 
             manager.activate("dev".to_owned());
             assert!(!manager.cluster("dev").unwrap().discovering);
@@ -4716,7 +4740,7 @@ mod tests {
     // A discovery retry timer that fires during a pause runs nothing.
     #[tokio::test]
     async fn a_discovery_retry_during_a_pause_starts_nothing() {
-        for second in PAUSES {
+        for second in [NO_CONTEXTS] {
             let dir = tempfile::tempdir().unwrap();
             let (mut manager, _, first) = pausable(dir.path(), second).await;
             manager.active = Some("dev".to_owned());
@@ -4736,15 +4760,18 @@ mod tests {
     #[tokio::test]
     async fn discovery_landing_during_a_pause_is_discarded() {
         use crate::discovery::tests::kind;
-        for second in PAUSES {
+        for second in pauses() {
             let dir = tempfile::tempdir().unwrap();
-            let (mut manager, yaml, first) = pausable(dir.path(), second).await;
+            let (mut manager, yaml, first) = pausable(dir.path(), &second).await;
             manager.active = Some("dev".to_owned());
             land_connection(&mut manager).await;
-            let slot = manager.cluster_mut("dev").unwrap();
-            slot.discovering = true;
-            let attempt = slot.attempt;
+            let attempt = manager.cluster("dev").unwrap().attempt;
             rewrite_file(&mut manager, &first, UNREADABLE).await;
+            assert!(manager.paused("dev"));
+            let held = manager.held("dev");
+            let slot = manager.cluster_mut("dev").unwrap();
+            slot.attempt = attempt;
+            slot.discovering = true;
 
             let found = read::DiscoveredKinds {
                 kinds: vec![kind("", "Pod", "pods", true, &["get", "list", "watch"])],
@@ -4762,7 +4789,13 @@ mod tests {
             assert!(slot.discovery.is_none() && !slot.discovering);
 
             rewrite_file(&mut manager, &first, &yaml).await;
-            assert!(manager.cluster("dev").unwrap().discovering);
+            let slot = manager.cluster("dev").unwrap();
+            if held {
+                assert!(slot.discovering, "the same definition runs discovery again");
+            } else {
+                assert!(slot.client.is_none(), "a changed definition reuses nothing");
+                assert!(matches!(slot.state, ConnectionState::Connecting));
+            }
         }
     }
 
@@ -4770,9 +4803,9 @@ mod tests {
     // made before it is not taken for the new definition.
     #[tokio::test]
     async fn a_pause_ending_on_another_server_reuses_nothing() {
-        for second in PAUSES {
+        for second in pauses() {
             let dir = tempfile::tempdir().unwrap();
-            let (mut manager, _, first) = pausable(dir.path(), second).await;
+            let (mut manager, _, first) = pausable(dir.path(), &second).await;
             manager.active = Some("dev".to_owned());
             land_connection(&mut manager).await;
             let old = manager.cluster("dev").unwrap().attempt;
@@ -4781,7 +4814,7 @@ mod tests {
 
             let moved = kubeconfig_with("https://127.0.0.1:2");
             rewrite_file(&mut manager, &first, &moved).await;
-            assert!(!manager.unsettled("dev"));
+            assert!(!manager.paused("dev"));
             let slot = manager.cluster("dev").unwrap();
             assert!(slot.client.is_none() && slot.write_credential.is_none());
             assert!(matches!(slot.state, ConnectionState::Connecting));
@@ -4801,9 +4834,9 @@ mod tests {
         }
     }
 
-    // While a context is paused no credential of any file runs for it: a later file's fallback
-    // with an exec plugin is never started, and neither is the definition that failed. The held
-    // case then connects, which shows the plugin would have been seen.
+    // A paused context runs nothing: a later file's definition on the same server that differs
+    // only by its user, an exec plugin, never starts it. The held case then connects, which shows
+    // the plugin would have been seen.
     #[tokio::test]
     async fn a_paused_context_runs_no_plugin_and_uses_no_fallback_credential() {
         let plugin = crate::auth_plugin::tests::FakePlugin::hanging();
@@ -4820,6 +4853,7 @@ mod tests {
         let first = dir.path().join("first");
         rewrite_file(&mut manager, &first, UNREADABLE).await;
         assert!(!manager.held("dev") && manager.contexts.provisional("dev"));
+        assert!(manager.paused("dev"), "another user is another definition");
         manager.activate("dev".to_owned());
         manager.ensure_connected("dev");
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -4841,6 +4875,60 @@ mod tests {
         assert!(plugin.starts().is_empty(), "a held context ran its plugin");
         rewrite_file(&mut manager, &first, &with_plugin).await;
         plugin.wait_started().await;
+    }
+
+    // A provisional context showing its confirmed definition is not paused: it connects and its
+    // discovery runs, and writes stay refused.
+    #[tokio::test]
+    async fn an_unchanged_provisional_context_keeps_connecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://127.0.0.1:1");
+        let (mut manager, _, first) = pausable(dir.path(), &yaml).await;
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(manager.contexts.provisional("dev") && !manager.held("dev"));
+        assert!(manager.unsettled("dev") && !manager.paused("dev"));
+
+        let next = manager.next_attempt;
+        manager.activate("dev".to_owned());
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Connecting));
+        assert_eq!(slot.attempt, next);
+
+        land_connection(&mut manager).await;
+        assert!(manager.cluster("dev").unwrap().client.is_some());
+        manager.unlocks.unlock("dev", "https://127.0.0.1:1");
+        assert_eq!(
+            manager.shell_client("dev", None).err(),
+            Some(WriteRefusal::Unsettled {
+                cluster: "dev".to_owned(),
+            })
+        );
+    }
+
+    // A context first seen while an earlier file is broken has no confirmed definition to differ
+    // from: it connects, and writes stay refused.
+    #[tokio::test]
+    async fn a_context_first_seen_behind_a_broken_file_connects() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://127.0.0.1:1");
+        let mut manager = manager_reading_two(dir.path(), UNREADABLE, &yaml).await;
+        assert!(manager.contexts.provisional("dev") && !manager.paused("dev"));
+
+        let next = manager.next_attempt;
+        manager.activate("dev".to_owned());
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Connecting));
+        assert_eq!(slot.attempt, next);
+
+        land_connection(&mut manager).await;
+        assert!(manager.cluster("dev").unwrap().client.is_some());
+        manager.unlocks.unlock("dev", "https://127.0.0.1:1");
+        assert_eq!(
+            manager.shell_client("dev", None).err(),
+            Some(WriteRefusal::Unsettled {
+                cluster: "dev".to_owned(),
+            })
+        );
     }
 
     // covers UP-06: once the broken file is valid without the context, it is gone.
@@ -5036,7 +5124,6 @@ mod tests {
             &hubs,
             &manager.engine_config,
         );
-        manager.contexts.record(&loaded);
         manager.kubeconfig = Arc::new(loaded);
         manager.clusters.push(slot);
 

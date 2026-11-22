@@ -1399,6 +1399,19 @@ async fn a_gitops_warning_survives_an_edit_that_removes_the_label() {
 /// Reloads the kubeconfig and waits until the context shows `server`, connected and discovered,
 /// as a `confirmed` definition or a fallback.
 async fn reload_until_shown(core: &Core, server: &FakeApiServer, confirmed: bool) {
+    reload_until_listed(core, server, confirmed).await;
+    tokio::time::timeout(WAIT, async {
+        while core.handle.discovery(CONTEXT).await.is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the context is discovered");
+}
+
+/// Reloads the kubeconfig and waits until the context lists `server`, as a `confirmed` definition
+/// or a fallback. A paused context stops here: it does not connect.
+async fn reload_until_listed(core: &Core, server: &FakeApiServer, confirmed: bool) {
     let events = core.handle.events();
     core.handle.send(Command::ReloadKubeconfig);
     let url = server.url();
@@ -1413,9 +1426,6 @@ async fn reload_until_shown(core: &Core, server: &FakeApiServer, confirmed: bool
             {
                 break;
             }
-        }
-        while core.handle.discovery(CONTEXT).await.is_none() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
@@ -1451,7 +1461,7 @@ async fn a_write_through_a_fallback_definition_is_refused() {
     assert_eq!(puts(&real), (1, 0));
 
     std::fs::write(&first, "apiVersion: v1\nkind: Config\nclusters:\n- name: [").unwrap();
-    reload_until_shown(&core, &fallback, false).await;
+    reload_until_listed(&core, &fallback, false).await;
     let review = core
         .handle
         .review_write(write_target(&fallback), three_replicas())

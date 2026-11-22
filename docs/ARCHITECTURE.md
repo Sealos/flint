@@ -640,6 +640,15 @@ opens in a tab in the bottom dock.
     session is never handed a client for another server than its pin. A shell does the same (`ExecRequest::at`): it is
     refused before it starts if the context shows another server than its tab when the core takes the request. An unconfirmed entry follows the file it comes from on the same
     server, so a failed file between masks its removal.
+  - **Paused clusters.** While an earlier file can't be read, a context is paused if its slot is held, or if it is
+    provisional and its whole definition (context, cluster and user entries, `cluster::context_fingerprint`) differs
+    from the one a load last confirmed. Another user on the same server counts as different. Nothing new starts for
+    a paused cluster: no connection attempt or retry, discovery, watch or auth plugin. A result that lands during
+    the pause is dropped after its attempt id is checked. What already runs goes on. A provisional context that shows
+    its confirmed definition is not paused, and neither is one no load has confirmed yet (first seen while an earlier
+    file is broken): both connect. When the pause ends on the same definition, connection, discovery and watches
+    resume; a changed definition gets a fresh slot and reuses nothing. Pausing only decides what starts: writes on
+    any provisional or changed definition stay refused.
   - **Checks.** While the session connects or runs, it asks the manager every 30 s (`recheck::RECHECK_EVERY`,
     shared with log sessions, which are pinned the same way) whether the context changed since, never the server.
     A change ends it with `ExecFailureKind::ContextChanged` and the reason (`recheck::reason`): removed, now on
