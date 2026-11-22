@@ -36,7 +36,7 @@ use std::sync::Arc;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::jiff::{SignedDuration, Timestamp};
 
-use crate::problems::{Problem, ProblemKind, ProblemSeverity, ProblemSubject};
+use crate::problems::{Problem, ProblemKind, ProblemSeverity, ProblemSubject, WorkloadKind};
 
 /// How long a group must stay absent before it resolves and can raise again.
 ///
@@ -72,11 +72,13 @@ fn api_group(api_version: &str) -> &str {
 }
 
 /// Every kind of problem, for tracking which have had their first check.
-const ALL_KINDS: [ProblemKind; 4] = [
+const ALL_KINDS: [ProblemKind; 6] = [
     ProblemKind::CrashLoop,
     ProblemKind::OomKilled,
     ProblemKind::NodeNotReady,
     ProblemKind::JobFailed,
+    ProblemKind::ImagePull,
+    ProblemKind::WorkloadShort,
 ];
 
 /// Tuning for an [`AlertEngine`].
@@ -210,6 +212,27 @@ impl Observation {
                 namespace: namespace.clone(),
                 owner: owner.clone(),
             },
+            (
+                ProblemSubject::Workload {
+                    kind,
+                    namespace,
+                    name,
+                    ..
+                },
+                _,
+            ) => AlertSubject::Workload {
+                namespace: namespace.clone(),
+                owner: AlertOwner {
+                    group: "apps".to_owned(),
+                    kind: match kind {
+                        WorkloadKind::Deployment => "Deployment",
+                        WorkloadKind::StatefulSet => "StatefulSet",
+                        WorkloadKind::DaemonSet => "DaemonSet",
+                    }
+                    .to_owned(),
+                    name: name.clone(),
+                },
+            },
             (ProblemSubject::Container { namespace, pod, .. }, None) => AlertSubject::Pod {
                 namespace: namespace.clone(),
                 name: pod.clone(),
@@ -327,6 +350,8 @@ fn resolved_text(kind: ProblemKind) -> &'static str {
         ProblemKind::OomKilled => "Out-of-memory kill no longer reported",
         ProblemKind::NodeNotReady => "Node no longer reported as not ready",
         ProblemKind::JobFailed => "Job failure no longer reported",
+        ProblemKind::ImagePull => "Image pull failure no longer reported",
+        ProblemKind::WorkloadShort => "Missing replicas no longer reported",
     }
 }
 
