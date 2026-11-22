@@ -53,8 +53,8 @@ use super::terminal_view::TerminalView;
 pub const DEFAULT_HEIGHT: f32 = 280.;
 /// The lowest the dock gets: its tab bar, a toolbar and a few lines.
 pub const MIN_HEIGHT: f32 = 120.;
-/// The dock leaves the main area at least this much (its header and a few rows).
-const MIN_MAIN_HEIGHT: f32 = 160.;
+/// The dock leaves the main area at least this much: its headers and several list rows.
+const MIN_MAIN_HEIGHT: f32 = 280.;
 /// What a tab whose context left kubeconfig says of it.
 const REMOVED: &str = "This context is no longer in kubeconfig.";
 /// What an empty dock says.
@@ -1100,7 +1100,8 @@ mod tests {
         assert_eq!(dock_height(Some(400), 800.), 400.);
         assert_eq!(dock_height(Some(50), 800.), MIN_HEIGHT);
         // A short window: the main area keeps its room, down to the dock's minimum.
-        assert_eq!(dock_height(Some(700), 800.), 640.);
+        assert_eq!(dock_height(Some(700), 800.), 520.);
+        assert_eq!(dock_height(None, 420.), 140.);
         assert_eq!(dock_height(Some(700), 200.), MIN_HEIGHT);
     }
 }
