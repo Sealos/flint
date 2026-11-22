@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use flint_core::display::{
     CUSTOM_NAME_PUNCTUATION, ClusterNames, MAX_CUSTOM_NAME_CHARS, clean_custom_name,
-    cluster_name_key, saved_name_key, short_name,
+    cluster_name_key, saved_name_key,
 };
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::input::{Input, InputState};
@@ -48,6 +48,17 @@ fn problem(
         .custom(context)
         .is_none()
         .then(|| "Another cluster already goes by this name.".to_owned())
+}
+
+/// What `context` is called once its custom name is removed: the name field's placeholder.
+fn name_without_custom(
+    names: &BTreeMap<String, String>,
+    contexts: &[&str],
+    context: &str,
+) -> String {
+    let mut others = names.clone();
+    others.remove(context);
+    ClusterNames::new(contexts.iter().copied(), &others).of(context)
 }
 
 /// The dialog's text: the real context and server stay on screen while naming it. `shown` is what
@@ -103,16 +114,21 @@ pub fn open(
     context: String,
     server: Option<String>,
 ) {
-    let current = model
-        .read(cx)
-        .settings
-        .cluster_names
-        .get(&context)
-        .cloned()
-        .unwrap_or_default();
+    let (current, placeholder) = {
+        let m = model.read(cx);
+        let contexts: Vec<&str> = m.clusters.iter().map(|c| c.info.name.as_str()).collect();
+        (
+            m.settings
+                .cluster_names
+                .get(&context)
+                .cloned()
+                .unwrap_or_default(),
+            name_without_custom(&m.settings.cluster_names, &contexts, &context),
+        )
+    };
     let input = cx.new(|cx| {
         InputState::new(window, cx)
-            .placeholder(short_name(&context))
+            .placeholder(placeholder)
             .default_value(current)
     });
     let field = cx.new(|_| NameField {
@@ -149,7 +165,19 @@ mod tests {
 
     use flint_core::display::ClusterNames;
 
-    use super::{dialog, problem};
+    use super::{dialog, name_without_custom, problem};
+
+    // covers UP-01: the placeholder is the name the cluster goes back to, told from its siblings.
+    #[test]
+    fn the_placeholder_tells_similar_clusters_apart() {
+        let eu = "arn:aws:eks:eu-west-1:123456789012:cluster/payments-production-main";
+        let us = "arn:aws:eks:eu-west-2:123456789012:cluster/payments-production-main";
+        let contexts = [eu, us];
+        let names = BTreeMap::from([(eu.to_owned(), "main".to_owned())]);
+        let placeholder = name_without_custom(&names, &contexts, eu);
+        assert!(placeholder.starts_with("eu-west-1 · "), "{placeholder}");
+        assert_ne!(placeholder, name_without_custom(&names, &contexts, us));
+    }
 
     // covers UP-01: what the dialog refuses, before anything is written.
     #[test]

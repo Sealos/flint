@@ -303,49 +303,66 @@ fn narrow_key(label: &str) -> String {
     cluster_name_key(&label.chars().take(NARROW_NAME_CHARS).collect::<String>())
 }
 
-/// The word of `full` from where it stops matching the closest of `rivals`.
+/// The word of `full` from where it stops matching the closest of `rivals`. A difference inside a
+/// number names the whole word, and a word that is only a number comes with the word before it,
+/// so a label never leads with a bare digit.
 fn differing_word(full: &str, rivals: &[&str]) -> String {
+    let chars: Vec<char> = full.chars().collect();
     let shared = rivals
         .iter()
         .map(|rival| {
-            full.chars()
+            chars
+                .iter()
                 .zip(rival.chars())
-                .take_while(|(a, b)| a == b)
+                .take_while(|(a, b)| **a == *b)
                 .count()
         })
         .max()
         .unwrap_or(0);
-    full.chars()
-        .skip(shared)
-        .take_while(|c| !CUSTOM_NAME_PUNCTUATION.contains(*c))
-        .take(MAX_LEAD_CHARS)
-        .collect()
+    let is_separator = |c: char| CUSTOM_NAME_PUNCTUATION.contains(c);
+    let end = chars[shared..]
+        .iter()
+        .position(|c| is_separator(*c))
+        .map_or(chars.len(), |at| shared + at);
+    let differing = &chars[shared..end];
+    if differing.is_empty() || !differing.iter().all(char::is_ascii_digit) {
+        return differing.iter().take(MAX_LEAD_CHARS).collect();
+    }
+    let word_start = |mut at: usize| {
+        while at > 0 && !is_separator(chars[at - 1]) {
+            at -= 1;
+        }
+        at
+    };
+    let mut start = word_start(shared);
+    if chars[start..end].iter().all(char::is_ascii_digit) {
+        let mut before = start;
+        while before > 0 && is_separator(chars[before - 1]) {
+            before -= 1;
+        }
+        if before > 0 {
+            start = word_start(before);
+        }
+    }
+    // The end is what differs, so a cut keeps it.
+    let from = start.max(end.saturating_sub(MAX_LEAD_CHARS - 1));
+    let word: String = chars[from..end].iter().collect();
+    match from > start {
+        true => format!("…{word}"),
+        false => word,
+    }
 }
 
-/// What tells the EKS context `full` from every one of `rivals`: its region, else the end of its
-/// account. `None` when neither does alone, or a rival is not an EKS context.
-fn eks_lead(full: &str, rivals: &[&str]) -> Option<String> {
-    let arn = parse_eks_arn(full)?;
-    let others = rivals
-        .iter()
-        .map(|rival| parse_eks_arn(rival))
-        .collect::<Option<Vec<_>>>()?;
-    if others.is_empty() {
-        return None;
-    }
-    if others.iter().all(|other| other.region != arn.region) {
-        return Some(arn.region.chars().take(MAX_LEAD_CHARS).collect());
-    }
-    if !others.iter().all(|other| other.account != arn.account) {
-        return None;
-    }
-    let digits: Vec<char> = arn.account.chars().collect();
+/// The end of `account`, with at least [`MIN_ACCOUNT_TAIL_CHARS`] and all that differs from
+/// `others`, so it reads as an account rather than a bare digit.
+fn account_tail(account: &str, others: &[&str]) -> String {
+    let digits: Vec<char> = account.chars().collect();
     let shared = others
         .iter()
         .map(|other| {
             digits
                 .iter()
-                .zip(other.account.chars())
+                .zip(other.chars())
                 .take_while(|(a, b)| **a == *b)
                 .count()
         })
@@ -356,10 +373,45 @@ fn eks_lead(full: &str, rivals: &[&str]) -> Option<String> {
         .min(digits.len())
         .min(MAX_LEAD_CHARS - 1);
     let tail: String = digits[digits.len() - keep..].iter().collect();
-    Some(match keep < digits.len() {
+    match keep < digits.len() {
         true => format!("…{tail}"),
         false => tail,
-    })
+    }
+}
+
+/// What tells the EKS context `full` from every one of `rivals`: its region, else the end of its
+/// account, else both when each rival shares one of them. `None` when a rival shares both, or is
+/// not an EKS context.
+fn eks_lead(full: &str, rivals: &[&str]) -> Option<String> {
+    let arn = parse_eks_arn(full)?;
+    let others = rivals
+        .iter()
+        .map(|rival| parse_eks_arn(rival))
+        .collect::<Option<Vec<_>>>()?;
+    if others.is_empty()
+        || others
+            .iter()
+            .any(|other| other.region == arn.region && other.account == arn.account)
+    {
+        return None;
+    }
+    // Cut in the middle: regions differ at their end.
+    if others.iter().all(|other| other.region != arn.region) {
+        return Some(middle_truncate(arn.region, MAX_LEAD_CHARS));
+    }
+    let accounts: Vec<&str> = others
+        .iter()
+        .map(|other| other.account)
+        .filter(|account| *account != arn.account)
+        .collect();
+    let tail = account_tail(arn.account, &accounts);
+    if accounts.len() == others.len() {
+        return Some(tail);
+    }
+    let room = MAX_LEAD_CHARS
+        .saturating_sub(tail.chars().count() + 1)
+        .max(3);
+    Some(format!("{tail} {}", middle_truncate(arn.region, room)))
 }
 
 /// `text` led by `word`, within what a compact row shows. The cut falls on `text`.
@@ -618,6 +670,16 @@ impl ClusterNames {
             .unwrap_or_else(|| short_single_line(context))
     }
 
+    /// [`ClusterNames::with_real`] for a known context, else the whole context on one line: a
+    /// context that left kubeconfig has no label told from the others, and a short form could
+    /// read as one of them.
+    pub fn exact(&self, context: &str) -> String {
+        self.labels
+            .get(context)
+            .cloned()
+            .unwrap_or_else(|| single_line(context))
+    }
+
     /// The second line of `context`'s compact row: with a custom name, the real name comes
     /// first, so the row always says which cluster it is.
     pub fn subtitle(&self, context: &str, server_host: Option<&str>) -> String {
@@ -795,6 +857,66 @@ mod tests {
         let shown = ClusterNames::new([a, b], &BTreeMap::new());
         assert_eq!(shown.of(a), "…0000 · prod");
         assert_eq!(shown.of(b), "…0001 · prod");
+    }
+
+    // covers UP-01: a last digit that differs never leads a label alone.
+    #[test]
+    fn regions_and_accounts_differing_by_a_last_digit_are_not_a_bare_digit() {
+        let eks = |region: &str, account: &str| {
+            format!("arn:aws:eks:{region}:{account}:cluster/payments-production-main")
+        };
+        // Each rival shares the region or the account, so neither alone tells them apart.
+        let grid = [
+            eks("eu-west-1", "123456789010"),
+            eks("eu-west-1", "123456789011"),
+            eks("eu-west-2", "123456789010"),
+            eks("eu-west-2", "123456789011"),
+        ];
+        let long_region = [
+            eks("us-gov-northwest-1", "123456789012"),
+            eks("us-gov-northwest-2", "123456789012"),
+        ];
+        for contexts in [&grid[..], &long_region[..]] {
+            let refs: Vec<&str> = contexts.iter().map(String::as_str).collect();
+            let shown = ClusterNames::new(refs.iter().copied(), &BTreeMap::new());
+            let visible_names: BTreeSet<String> = refs
+                .iter()
+                .map(|c| visible(&shown.of(c), NARROW_NAME_CHARS))
+                .collect();
+            assert_eq!(visible_names.len(), refs.len(), "{refs:?}");
+            for context in &refs {
+                let label = shown.of(context);
+                let lead = label.split(" · ").next().unwrap();
+                assert!(lead.chars().count() > 1, "{label}");
+                assert!(!lead.chars().all(|c| c.is_ascii_digit()), "{label}");
+            }
+            assert_told_apart(&shown, &refs);
+        }
+
+        // Outside EKS, a number comes with the word before it.
+        let one = "team-platform-production-1-main";
+        let two = "team-platform-production-2-main";
+        let shown = ClusterNames::new([one, two], &BTreeMap::new());
+        assert!(
+            shown.of(one).starts_with("production-1 · "),
+            "{}",
+            shown.of(one)
+        );
+        assert!(
+            shown.of(two).starts_with("production-2 · "),
+            "{}",
+            shown.of(two)
+        );
+    }
+
+    // covers UP-01: a context no longer listed is named whole, so it cannot read as a sibling.
+    #[test]
+    fn an_unlisted_context_is_named_whole() {
+        let listed = "arn:aws:eks:eu-west-1:123456789012:cluster/prod";
+        let gone = "arn:aws:eks:eu-west-2:123456789012:cluster/prod";
+        let shown = ClusterNames::new([listed], &BTreeMap::new());
+        assert_eq!(shown.exact(listed), shown.with_real(listed));
+        assert_eq!(shown.exact(gone), gone);
     }
 
     // covers UP-01
