@@ -1704,6 +1704,13 @@ mod actions;
 #[path = "list_managed.rs"]
 mod managed;
 
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "opening a combined list is wired in later")
+)]
+#[path = "list_combined.rs"]
+pub mod combined;
+
 #[cfg(any(test, feature = "automation"))]
 #[path = "list_state.rs"]
 mod state;

@@ -657,6 +657,267 @@ fn word_tone(word: &str) -> Tone {
     }
 }
 
+/// The view-model of a list over several clusters ([`flint_core::combined`]).
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "opening a combined list is wired in later")
+)]
+pub mod combined {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
+    use flint_core::combined::{
+        ColumnKey, CombineError, CombinedCell, CombinedColumn, CombinedLine, CombinedList,
+        CombinedMember, CombinedQuery, CombinedRowId, CombinedSort, CombinedView, RowRef,
+    };
+    use flint_core::redact::{is_masked_column, is_secret_list};
+    use flint_core::{ClusterId, Column, ColumnRole, Feed, KindId, SyncState};
+
+    use super::visible_columns;
+
+    /// What a combined list draws from: the merged list, plus what the core keeps private to
+    /// it and the shared cell code needs. Replaced as a whole, so its parts always agree.
+    #[derive(Debug, Clone)]
+    pub struct CombinedSource {
+        pub list: Arc<CombinedList>,
+        /// One per combined column, for the code single-cluster lists draw cells with.
+        pub columns: Arc<[Column]>,
+        /// Per combined column: whether any member masks it, so it cannot be sorted.
+        pub masked: Arc<[bool]>,
+        /// Per member of [`CombinedList::members`].
+        pub feeds: Arc<[Feed]>,
+        /// `None` with no members.
+        pub kind: Option<KindId>,
+    }
+
+    impl CombinedSource {
+        /// Merges `members`. What a later caller hands the list to open or update it.
+        pub fn new(members: Vec<CombinedMember>) -> Result<Self, CombineError> {
+            let kind = members.first().map(|m| m.snapshot.kind.clone());
+            let feed_of: HashMap<ClusterId, Feed> = members
+                .iter()
+                .map(|m| (m.snapshot.cluster.clone(), m.snapshot.feed))
+                .collect();
+            let masked_keys: HashSet<ColumnKey> = members.iter().flat_map(masked_keys).collect();
+            let list = CombinedList::new(members)?;
+            let columns: Arc<[Column]> = list.columns().iter().map(as_column).collect();
+            let masked = list
+                .columns()
+                .iter()
+                .map(|c| masked_keys.contains(&c.key))
+                .collect();
+            let feeds = list
+                .members()
+                .iter()
+                .map(|m| feed_of.get(m.cluster()).copied().unwrap_or_default())
+                .collect();
+            Ok(Self {
+                list: Arc::new(list),
+                columns,
+                masked,
+                feeds,
+                kind,
+            })
+        }
+
+        /// Rows across all members, before any filter.
+        pub fn total_rows(&self) -> usize {
+            self.list.members().iter().map(|m| m.row_count()).sum()
+        }
+    }
+
+    /// The keys of the columns `member` masks, numbered as the core numbers repeated headers.
+    fn masked_keys(member: &CombinedMember) -> Vec<ColumnKey> {
+        let snapshot = &member.snapshot;
+        let secret = is_secret_list(snapshot.kind.as_str());
+        let mut seen: HashMap<String, u32> = HashMap::new();
+        let mut masked = Vec::new();
+        for (i, column) in snapshot.columns.iter().enumerate() {
+            let key = column.key();
+            let count = seen.entry(key.clone()).or_default();
+            let occurrence = *count;
+            *count += 1;
+            if is_masked_column(secret, &snapshot.columns, i) {
+                masked.push(ColumnKey { key, occurrence });
+            }
+        }
+        masked
+    }
+
+    fn as_column(column: &CombinedColumn) -> Column {
+        Column {
+            name: column.name.clone(),
+            ty: column.ty,
+            format: column.format.clone(),
+            description: column.description.clone(),
+            priority: column.priority,
+            role: column.role.unwrap_or(ColumnRole::Value),
+        }
+    }
+
+    /// The sort after clicking the column `clicked`: ascending, descending, then default.
+    pub fn next_sort(current: Option<&CombinedSort>, clicked: &ColumnKey) -> Option<CombinedSort> {
+        match current {
+            Some(s) if s.column == *clicked && s.descending => None,
+            Some(s) if s.column == *clicked => Some(CombinedSort {
+                column: clicked.clone(),
+                descending: true,
+            }),
+            _ => Some(CombinedSort {
+                column: clicked.clone(),
+                descending: false,
+            }),
+        }
+    }
+
+    /// The sort to apply: `None` while its column is gone, not drawn, or masked by any member.
+    pub fn effective_sort(
+        source: &CombinedSource,
+        sort: Option<&CombinedSort>,
+        show_wide: bool,
+    ) -> Option<CombinedSort> {
+        let sort = sort?;
+        let column = source.list.column_index(&sort.column)?;
+        let drawn = visible_columns(&source.columns, show_wide).contains(&column);
+        (drawn && !source.masked[column]).then(|| sort.clone())
+    }
+
+    /// The cluster filter after clicking `cluster`'s chip. Empty means every cluster: the first
+    /// click narrows to one, and choosing the last one left out goes back to every cluster.
+    pub fn toggle_cluster(chosen: &mut Vec<ClusterId>, cluster: &str, members: usize) {
+        if let Some(at) = chosen.iter().position(|c| c == cluster) {
+            chosen.remove(at);
+            return;
+        }
+        chosen.push(cluster.to_owned());
+        if chosen.len() >= members {
+            chosen.clear();
+        }
+    }
+
+    /// Each column's width in characters over the sampled `rows`, for
+    /// [`super::ColumnWidths::update`]. The Cluster column leaves room for its dot.
+    pub fn measure(source: &CombinedSource, rows: &[RowRef], now: i64) -> Vec<usize> {
+        let step = (rows.len() / super::SAMPLE_ROWS).max(1);
+        source
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(col, column)| {
+                let cells = rows
+                    .iter()
+                    .step_by(step)
+                    .map(|&at| match source.list.cell(at, col, now) {
+                        CombinedCell::Cluster { name, tag } => {
+                            name.chars().count() + if tag.is_some() { 2 } else { 0 }
+                        }
+                        CombinedCell::Value(text) => text.chars().count(),
+                        CombinedCell::Masked => crate::ui::object::MASK.chars().count(),
+                        CombinedCell::Blank => 0,
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let max = if column.role == ColumnRole::Name {
+                    super::NAME_MAX_CHARS
+                } else {
+                    super::MAX_CHARS
+                };
+                cells
+                    .max(column.name.chars().count() + 2)
+                    .clamp(super::MIN_CHARS, max)
+            })
+            .collect()
+    }
+
+    /// The line of the row `id` in `view`, if it is shown. Linear: run off the UI thread, or
+    /// for a single click.
+    pub fn line_of(list: &CombinedList, view: &CombinedView, id: &CombinedRowId) -> Option<usize> {
+        (0..view.line_count()).find(|&line| {
+            matches!(view.line(line), Some(CombinedLine::Row(at))
+                if list.members()[at.member()].cluster() == &*id.cluster
+                    && list.row_info(at).is_some_and(|row| row.uid == &*id.uid))
+        })
+    }
+
+    /// Whether the row `id` has left its cluster: only a current member can prove it.
+    pub fn row_gone(list: &CombinedList, id: &CombinedRowId, now: i64) -> bool {
+        let Some(member) = list.members().iter().find(|m| m.cluster() == &*id.cluster) else {
+            return true;
+        };
+        if !member.state().is_current() {
+            return false;
+        }
+        let all = list.compute(
+            &CombinedQuery {
+                clusters: vec![id.cluster.to_string()],
+                ..CombinedQuery::default()
+            },
+            now,
+        );
+        !all.rows()
+            .iter()
+            .any(|&at| list.row_info(at).is_some_and(|row| row.uid == &*id.uid))
+    }
+
+    /// The nearest row line after (or before) `from`, skipping group headers.
+    pub fn step_row(view: &CombinedView, from: Option<usize>, forward: bool) -> Option<usize> {
+        let is_row = |line: &usize| matches!(view.line(*line), Some(CombinedLine::Row(_)));
+        let count = view.line_count();
+        match (from, forward) {
+            (None, _) => (0..count).find(is_row),
+            (Some(at), true) => (at + 1..count).find(is_row).or(Some(at)),
+            (Some(at), false) => (0..at).rev().find(is_row).or(Some(at)),
+        }
+    }
+
+    /// The first or last row line.
+    pub fn edge_row(view: &CombinedView, last: bool) -> Option<usize> {
+        let is_row = |line: &usize| matches!(view.line(*line), Some(CombinedLine::Row(_)));
+        if last {
+            (0..view.line_count()).rev().find(is_row)
+        } else {
+            (0..view.line_count()).find(is_row)
+        }
+    }
+
+    /// What replaces the rows when none pass.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum EmptyState {
+        Loading,
+        NoRows,
+        NoMatch,
+    }
+
+    /// `None` while any row passes. Each member's own problem stays on its note.
+    pub fn empty_state(source: &CombinedSource, view: &CombinedView) -> Option<EmptyState> {
+        if view.matched() > 0 {
+            return None;
+        }
+        if source.total_rows() > 0 {
+            return Some(EmptyState::NoMatch);
+        }
+        let loading = source
+            .list
+            .members()
+            .iter()
+            .any(|m| matches!(m.state(), SyncState::Idle | SyncState::Loading));
+        Some(if loading {
+            EmptyState::Loading
+        } else {
+            EmptyState::NoRows
+        })
+    }
+
+    /// The toolbar's count: "7", or "2 of 7" when filters hide some.
+    pub fn count_text(matched: usize, total: usize) -> String {
+        if matched == total {
+            total.to_string()
+        } else {
+            format!("{matched} of {total}")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

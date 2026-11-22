@@ -1,6 +1,7 @@
 //! The resource list's part of the visible view tree ([`crate::ui::view_state`]).
 // module-tests: list_tests.rs
 
+use flint_core::combined::CombinedCell;
 use flint_core::redact::{is_masked_column, is_secret_list};
 use flint_core::table::unix_now;
 use flint_core::{Feed, ListFormat, SyncState};
@@ -11,7 +12,116 @@ use super::super::object::MASK;
 use super::super::view_state::{
     Banner, Focus, Level, ListState, RowState, SortState, error_text, sync_word,
 };
+use super::combined::{self, CombinedResourceList};
 use super::{ResourceList, cell_text, limited_text, list_model};
+
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "opening a combined list is wired in later")
+)]
+impl CombinedResourceList {
+    /// The list as drawn: the Cluster column first, a row's cells read through its own member,
+    /// and a banner per member that is not current.
+    pub fn view_state(&self) -> ListState {
+        let list = &self.shown.list;
+        let columns: Vec<usize> = if self.drawn.is_empty() {
+            list_model::visible_columns(&self.shown.columns, self.show_wide)
+        } else {
+            self.drawn.iter().map(|&(col, _)| col).collect()
+        };
+        let names: Vec<String> = columns
+            .iter()
+            .map(|&col| list.columns()[col].name.to_string())
+            .collect();
+        let now = unix_now();
+        let rows = self
+            .view
+            .rows()
+            .iter()
+            .take(ListState::ROW_LIMIT)
+            .filter_map(|&at| {
+                let info = list.row_info(at)?;
+                let id = list.row_id(at)?;
+                let cells: Vec<String> = columns
+                    .iter()
+                    .map(|&col| match list.cell(at, col, now) {
+                        CombinedCell::Cluster { name, .. } => name.to_owned(),
+                        CombinedCell::Value(text) => text.into_owned(),
+                        CombinedCell::Blank => String::new(),
+                        CombinedCell::Masked => MASK.to_owned(),
+                    })
+                    .collect();
+                Some(RowState {
+                    id: combined::row_id(&id.cluster, &id.uid),
+                    namespace: info.namespace.map(str::to_owned),
+                    name: info.name.to_owned(),
+                    selected: self.selected.as_ref() == Some(&id),
+                    cells_by_column: names.iter().cloned().zip(cells.iter().cloned()).collect(),
+                    cells,
+                })
+            })
+            .collect();
+        let members = list.members();
+        let feed = |i: usize| self.shown.feeds[i] == Feed::Poll;
+        let sync = members
+            .iter()
+            .enumerate()
+            .find(|(_, m)| !m.state().is_current())
+            .or(members.iter().enumerate().next())
+            .map_or("not watched", |(i, m)| sync_word(m.state(), feed(i)));
+        let banners = members
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.state().is_current())
+            .map(|(i, m)| {
+                let level = match m.state() {
+                    SyncState::Failed { .. } => Level::Danger,
+                    SyncState::Reconnecting { .. } | SyncState::RetryingRefusal { .. } => {
+                        Level::Warning
+                    }
+                    _ => Level::Muted,
+                };
+                Banner::new(
+                    &format!("list-member-{}", m.cluster()),
+                    level,
+                    format!("{}: {}", m.display_name(), sync_word(m.state(), feed(i))),
+                )
+            })
+            .collect();
+        ListState {
+            kind: self
+                .shown
+                .kind
+                .as_ref()
+                .map_or_else(String::new, ToString::to_string),
+            label: self.label.clone(),
+            sync,
+            total: self.shown.total_rows(),
+            shown: self.view.matched(),
+            count: list_model::combined::count_text(self.view.matched(), self.shown.total_rows()),
+            columns: names,
+            rows,
+            rows_truncated: self.view.rows().len() > ListState::ROW_LIMIT,
+            filter: self.query.text.clone(),
+            sort: self.applied_sort.as_ref().and_then(|sort| {
+                let col = list.column_index(&sort.column)?;
+                Some(SortState {
+                    column: list.columns()[col].name.to_string(),
+                    descending: sort.descending,
+                })
+            }),
+            wide: self.show_wide,
+            placeholder: list_model::combined::empty_state(&self.shown, &self.view).map(|empty| {
+                match empty {
+                    list_model::combined::EmptyState::Loading => "loading",
+                    list_model::combined::EmptyState::NoRows => "empty",
+                    list_model::combined::EmptyState::NoMatch => "no_match",
+                }
+            }),
+            banners,
+        }
+    }
+}
 
 impl ResourceList {
     /// The sort in effect, if its column is in the snapshot drawn: its header and direction.
