@@ -556,7 +556,12 @@ fn scrolled_to(key: &Keystroke, y: f32, max: f32, page: f32) -> Option<f32> {
     Some(to.clamp(-max, 0.))
 }
 
-fn scroll_by_key(scroll: &ScrollHandle, key: &Keystroke, window: &mut Window, cx: &mut App) {
+pub(super) fn scroll_by_key(
+    scroll: &ScrollHandle,
+    key: &Keystroke,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let offset = scroll.offset();
     let (max, page) = (scroll.max_offset().y, scroll.bounds().size.height);
     if let Some(y) = scrolled_to(key, offset.y.into(), max.into(), page.into()) {
