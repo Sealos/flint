@@ -11,6 +11,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use flint_core::activity::{self, Outcome};
 use flint_e2e::binaries;
+use flint_e2e::fake_api::{Fault, Verb};
 use flint_e2e::mcp::Mcp;
 use serde_json::{Value, json};
 
@@ -90,6 +91,7 @@ fn sweep() -> Vec<(&'static str, Value)> {
     vec![
         ("list_clusters", json!({})),
         ("list_resource_kinds", cluster.clone()),
+        ("list_resource_kinds", cluster.clone()),
         (
             "list_resources",
             json!({"cluster": EXPOSED, "kind": "pods"}),
@@ -155,8 +157,9 @@ const fn reach(
     }
 }
 
-const SWEEP_REACH: [Reach; 18] = [
+const SWEEP_REACH: [Reach; 19] = [
     reach("list_clusters", Outcome::Ok, false, Outcome::Ok),
+    reach("list_resource_kinds", Outcome::Failed, false, Outcome::Ok),
     reach("list_resource_kinds", Outcome::Ok, false, Outcome::Ok),
     reach("list_resources", Outcome::Ok, false, Outcome::Ok),
     reach("list_resources", Outcome::Ok, false, Outcome::Ok),
@@ -227,12 +230,23 @@ fn logged_mcp(setup: &Setup) -> Result<Mcp> {
     Mcp::flint(&script, &kubeconfig, &config_dir)
 }
 
-/// Searches every file below the config directory and the scratch `HOME`, after checking that
-/// the server's log is among them and has content.
+/// The first discovery falls back and logs a debug event. The fake API only serves aggregated
+/// discovery, so that call fails and the next discovery succeeds.
+fn refuse_first_discovery(setup: &Setup) {
+    setup
+        .api
+        .inject(Fault::status(406).verb(Verb::Discovery).times(1));
+}
+
+/// Searches every file below the config directory and the scratch `HOME`, after checking for
+/// the discovery fallback event in the server's log.
 fn assert_absent_on_disk(setup: &Setup, values: &[&str]) -> Result<()> {
     let home = setup.scratch.home();
     let log = std::fs::read(server_log(&home)).context("the server's log file")?;
-    assert!(!log.is_empty(), "the server logged nothing");
+    assert!(
+        String::from_utf8_lossy(&log).contains("no aggregated discovery, discovering each group"),
+        "the server log is missing the discovery fallback debug event"
+    );
     let mut files = files_below(&setup.scratch.config_dir())?;
     files.extend(files_below(&home)?);
     for (path, bytes) in files {
@@ -255,6 +269,7 @@ fn up_14_nothing_out_of_scope_crosses_any_tool() -> Result<()> {
     let setup = Setup::exposed()?;
     plant(&setup);
     let mut mcp = logged_mcp(&setup)?;
+    refuse_first_discovery(&setup);
     let calls = sweep();
     assert_eq!(calls.len(), SWEEP_REACH.len());
 
@@ -413,29 +428,33 @@ fn up_15_a_secret_object_crosses_no_tool() -> Result<()> {
         }),
     );
     let mut mcp = logged_mcp(&setup)?;
+    refuse_first_discovery(&setup);
     let values = [ENCODED_VALUE, STRING_VALUE, APPLIED_VALUE];
 
     let list = |namespace: Option<&str>| json!({"cluster": EXPOSED, "kind": "secrets", "namespace": namespace});
     let get = |kind: &str| json!({"cluster": EXPOSED, "kind": kind, "namespace": NAMESPACE, "name": "held"});
     let calls = [
-        ("list_clusters", json!({})),
-        ("list_resource_kinds", json!({"cluster": EXPOSED})),
-        ("list_resources", list(None)),
-        ("list_resources", list(Some(NAMESPACE))),
-        ("get_resource", get("secrets")),
-        ("get_resource", get("secret")),
+        ("list_clusters", json!({}), false),
+        ("list_resource_kinds", json!({"cluster": EXPOSED}), true),
+        ("list_resource_kinds", json!({"cluster": EXPOSED}), false),
+        ("list_resources", list(None), false),
+        ("list_resources", list(Some(NAMESPACE)), false),
+        ("get_resource", get("secrets"), false),
+        ("get_resource", get("secret"), false),
         (
             "get_events",
             json!({"cluster": EXPOSED, "namespace": NAMESPACE, "object_name": "held"}),
+            false,
         ),
         (
             "get_pod_logs",
             json!({"cluster": EXPOSED, "namespace": NAMESPACE, "pod": POD}),
+            false,
         ),
     ];
-    for (tool, args) in &calls {
+    for (tool, args, is_error) in &calls {
         let got = mcp.call(tool, args.clone())?;
-        assert!(!got.is_error, "{tool} {args}: {}", got.text);
+        assert_eq!(got.is_error, *is_error, "{tool} {args}: {}", got.text);
         for value in values {
             assert!(!got.text.contains(value), "{tool} {args}: {}", got.text);
         }
