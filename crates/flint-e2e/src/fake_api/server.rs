@@ -463,6 +463,17 @@ impl FakeApiServer {
         kubeconfig::write(path, &self.kubeconfig(namespace))
     }
 
+    /// A kubeconfig for this server under [`kubeconfig::REMOTE_CONTEXT`], which Flint protects
+    /// as it does any cluster it does not recognise as local.
+    pub fn remote_kubeconfig(&self, namespace: Option<&str>) -> kube::config::Kubeconfig {
+        self.kubeconfig_named(kubeconfig::REMOTE_CONTEXT, namespace)
+    }
+
+    /// Writes [`FakeApiServer::remote_kubeconfig`] to `path`.
+    pub fn write_remote_kubeconfig(&self, path: &Path, namespace: Option<&str>) -> Result<()> {
+        kubeconfig::write(path, &self.remote_kubeconfig(namespace))
+    }
+
     /// A kube client for this server, built the way Flint builds them.
     pub async fn client(&self) -> Result<kube::Client> {
         Ok(flint_core::cluster::connect(&self.kubeconfig(None), kubeconfig::CONTEXT).await?)
@@ -1146,6 +1157,9 @@ fn respond(
                     ApiError::not_found(format!("OpenAPI document {path} is not recorded"))
                 })
         }
+        Route::MetricsDiscovery => metrics::api_resources(inner)
+            .map(|list| json_with(200, "application/json", &list))
+            .ok_or_else(|| ApiError::not_found("the server could not find the requested resource")),
         Route::Collection { gvr, namespace } => {
             known(inner, gvr, namespace.as_deref()).and_then(|resource| {
                 let ns = namespace.as_deref();
