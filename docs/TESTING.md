@@ -665,7 +665,7 @@ unit test (sequencing) and an e2e test on the fake API.
 
 ### P2
 
-Recordings (UP-110 to UP-116), a clipboard and save-path hook for automation, a fake
+Recordings (UP-110 to UP-114 and UP-116), a clipboard and save-path hook for automation, a fake
 port-forward, and a spike on running app e2e on Linux (with the AppImage's GPUI backend under Xvfb) so kind-backed
 app tests get cheap runners.
 

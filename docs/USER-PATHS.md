@@ -179,7 +179,6 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **When** an agent calls `get_cluster_summary` for an exposed cluster.
 - **Then** it gets the dashboard's problem counts, usage and recent warnings, limited to the cluster's exposure scope
   and redacted, and the call appears in the activity log.
-- Tests: unit, mcp.
 
 ## M1: Browsing resources
 
@@ -804,7 +803,6 @@ Deferred until cluster sets are scheduled (#199).
 - **When** an agent queries a recording's time range through MCP on an exposed cluster.
 - **Then** it gets lines, events and metrics for that range, redacted and within the cluster's scope, and the call is
   in the activity log. Unexposed clusters' recordings are invisible to it.
-- Tests: unit, mcp.
 
 ### UP-116 Export a recording
 - **When** I export the last 30 minutes of a recording.

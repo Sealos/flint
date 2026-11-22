@@ -37,7 +37,7 @@ the background while the app runs, stored on disk.
   problems with the laptop's lid closed, but adds a second long-lived process with cluster credentials, its own
   lifecycle and its own sign-in story. Deferred.
 - **Plain files per recording (JSON lines or text):** simpler to write, but time-range queries across lines, events
-  and metrics, retention by size and age, and concurrent reads by `flint mcp` all want an indexed store.
+  and metrics, and retention by size and age, want an indexed store.
 - **Redacting or encrypting at rest:** redaction can destroy evidence irreversibly; encryption adds key management
   and slows search. Owner-only files match how shells and kubectl cache sensitive data.
 - **Automatic recording without guards:** a bad rollout could record hundreds of pods; hence the opt-in, the pod cap
@@ -48,5 +48,4 @@ the background while the app runs, stored on disk.
 - Flint gains a SQLite dependency (bundled, so no system library) and a schema with migrations.
 - Recordings keep their cluster connected like a warm cluster, and count toward the memory and watch budgets; the
   soak test covers a running recording.
-- `flint mcp` reads `recordings.sqlite` read-only while the app writes it, which WAL mode allows.
 - The data directory now holds sensitive logs; the docs say where and how to delete them.
