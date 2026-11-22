@@ -193,18 +193,7 @@ fn dialog_text_saying(
         lines.extend_from_slice(saying);
         lines.push(String::new());
     }
-    lines.push(format!("Context: {}", target.cluster));
-    lines.push(format!(
-        "Server: {}",
-        target
-            .server
-            .as_deref()
-            .map_or("no server".to_owned(), flint_core::redact::server_url)
-    ));
-    if let Some(namespace) = &target.namespace {
-        lines.push(format!("Namespace: {namespace}"));
-    }
-    lines.push(format!("Object: {} {}", target.kind, target.name));
+    lines.extend(target_lines(target));
     DialogText {
         title: format!("{} {} on {shown}?", wording.title, target.name),
         text: lines.join("\n"),
@@ -213,6 +202,25 @@ fn dialog_text_saying(
         id: "write-confirm-description",
         default_cancel: wording.deliberate,
     }
+}
+
+/// Exactly which object on which cluster: the lines a confirmation always keeps on show.
+fn target_lines(target: &WriteTarget) -> Vec<String> {
+    let mut lines = vec![
+        format!("Context: {}", target.cluster),
+        format!(
+            "Server: {}",
+            target
+                .server
+                .as_deref()
+                .map_or("no server".to_owned(), flint_core::redact::server_url)
+        ),
+    ];
+    if let Some(namespace) = &target.namespace {
+        lines.push(format!("Namespace: {namespace}"));
+    }
+    lines.push(format!("Object: {} {}", target.kind, target.name));
+    lines
 }
 
 /// Asks to confirm `review`, first saying `note` (why this review was opened again), then runs it
@@ -243,8 +251,10 @@ pub fn open_noted(
         &saying,
         &shown,
     );
+    // Counted as drawn: a name from a kubeconfig may hold a line break.
+    let pinned = target_lines(review.target()).join("\n").lines().count();
     let confirmed = confirmation(core, review, begin, on_done);
-    confirm::open(window, cx, text, move |_, cx| confirmed(cx));
+    confirm::open_pinned(window, cx, text, pinned, move |_, cx| confirmed(cx));
 }
 
 /// What confirming `review` does. A confirmation runs once, whatever `begin` or the write answers:
@@ -329,6 +339,21 @@ mod tests {
         );
         assert_eq!(text.ok, "Apply");
         assert!(!text.default_cancel);
+    }
+
+    // covers UP-53: the lines a confirmation pins are the end of its text, with or without a
+    // namespace, so all of the target stays on show.
+    #[test]
+    fn the_target_lines_end_the_text() {
+        for namespace in [Some("demo".to_owned()), None] {
+            let target = WriteTarget {
+                namespace,
+                ..target()
+            };
+            let text = dialog_text(&target, APPLY, &[], "main");
+            let lines = super::target_lines(&target).join("\n");
+            assert!(text.text.ends_with(&lines), "{}", text.text);
+        }
     }
 
     // covers UP-53: an action that cannot be got back is confirmed only by its button.

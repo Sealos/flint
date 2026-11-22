@@ -567,7 +567,7 @@ async fn a_user_allowed_only_some_namespaces_can_still_browse() {
         matches!(s.state, SyncState::Failed { .. }) && s.limited_to.is_some()
     })
     .await;
-    let SyncState::Failed { error } = &snap.state else {
+    let SyncState::Failed { error, .. } = &snap.state else {
         unreachable!()
     };
     assert!(error.contains("namespace filter"), "{error}");

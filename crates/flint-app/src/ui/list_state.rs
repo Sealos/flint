@@ -104,6 +104,8 @@ impl ResourceList {
         match &snapshot.state {
             SyncState::Idle | SyncState::Loading if snapshot.rows.is_empty() => Some("loading"),
             SyncState::Unavailable => Some("unavailable"),
+            s if snapshot.rows.is_empty() && s.is_checking_access() => Some("checking_access"),
+            s if snapshot.rows.is_empty() && s.is_no_access() => Some("no_access"),
             SyncState::Failed { .. } if snapshot.rows.is_empty() => Some("failed"),
             SyncState::Reconnecting { .. } | SyncState::RetryingRefusal { .. }
                 if snapshot.rows.is_empty() =>
@@ -142,15 +144,24 @@ impl ResourceList {
                 limited_text(&self.label, limit),
             ));
         }
+        let has_rows = !snapshot.rows.is_empty();
         let state = match &snapshot.state {
+            s @ SyncState::RetryingRefusal { .. } if s.is_checking_access() && !has_rows => None,
+            s @ SyncState::RetryingRefusal { error, .. } if s.is_checking_access() => Some((
+                Level::Muted,
+                format!("Checking access: {}", error_text(error)),
+            )),
+            s @ SyncState::Failed { error, .. } if s.is_no_access() && has_rows => {
+                Some((Level::Muted, format!("No access: {}", error_text(error))))
+            }
             SyncState::Reconnecting { error: Some(e) }
-            | SyncState::RetryingRefusal { error: e } => {
+            | SyncState::RetryingRefusal { error: e, .. } => {
                 Some((Level::Warning, format!("Reconnecting: {}", error_text(e))))
             }
             SyncState::Reconnecting { error: None } => {
                 Some((Level::Warning, "Reconnecting".to_owned()))
             }
-            SyncState::Failed { error } if !snapshot.rows.is_empty() => {
+            SyncState::Failed { error, .. } if !snapshot.rows.is_empty() => {
                 Some((Level::Danger, format!("Failed: {}", error_text(error))))
             }
             _ if snapshot.format == ListFormat::Fallback => Some((

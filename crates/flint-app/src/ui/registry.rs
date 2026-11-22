@@ -108,6 +108,8 @@ actions!(
         DefaultWatchOpenViewsOnly,
         /// Go back to the kind and object shown before.
         GoBack,
+        /// In a narrow window, return from the detail to the list, keeping the selection.
+        BackToList,
         /// Move focus to the next pane: clusters, navigation, list, detail, dock.
         FocusNextPane,
         /// Move focus to the previous pane.
@@ -2147,6 +2149,12 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<GoBack>("Go Back", "Go back to the kind and object shown before.")
             .of(C::View, S::Workspace)
             .keys(&["secondary-["], Some(WORKSPACE)),
+        Spec::unit::<BackToList>(
+            "Back to List",
+            "In a narrow window, return from the detail to the list, keeping the selection.",
+        )
+        .of(C::View, S::Workspace)
+        .keys(&["secondary-shift-b"], Some(WORKSPACE)),
         // Tab and Shift-Tab, outside text fields: a field keeps them for moving between
         // controls, and a shell tab sends them to the shell.
         Spec::unit::<FocusNextPane>(

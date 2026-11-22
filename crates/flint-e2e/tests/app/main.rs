@@ -13,6 +13,7 @@
 
 mod exec_plugins;
 mod harness;
+mod load;
 mod m0;
 mod m1;
 mod m2;

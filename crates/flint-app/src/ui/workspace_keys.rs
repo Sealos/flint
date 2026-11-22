@@ -168,6 +168,12 @@ impl Workspace {
             None if step > 0 => 0,
             None => panes.len() - 1,
         };
+        // In a narrow window the list and the detail take turns: the one reached is shown.
+        match panes[next].0 {
+            Pane::List => self.list_in_front = true,
+            Pane::Detail => self.list_in_front = false,
+            _ => {}
+        }
         window.focus(&panes[next].1, cx);
         // A field left behind (the list's filter, a log tab's search).
         release_unfocused_input(window, cx);
