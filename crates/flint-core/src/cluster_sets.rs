@@ -114,8 +114,9 @@ pub fn create_cluster_set(
     })
 }
 
-/// Renames the set called `name`. It may change the case of its own name, but not take another
-/// set's. Returns the settings as written.
+/// Renames the set called `name`, dropping any hidden copy the file holds under that name. It may
+/// change the case of its own name, but not take another set's. Entries this version cannot use
+/// stay. Returns the settings as written.
 pub fn rename_cluster_set(
     dir: &Path,
     name: &str,
@@ -128,13 +129,23 @@ pub fn rename_cluster_set(
                 format!("a cluster set name has 1 to {MAX_CUSTOM_NAME_CHARS} allowed characters"),
             )
         })?;
-        let index = clean_custom_name(name)
-            .and_then(|old| position(entries, &cluster_name_key(&old)))
+        let old_key = clean_custom_name(name).map(|old| cluster_name_key(&old));
+        let index = old_key
+            .as_deref()
+            .and_then(|key| position(entries, key))
             .ok_or_else(|| invalid(path, "there is no cluster set with that name".to_owned()))?;
         let new_key = cluster_name_key(&cleaned);
         if position(entries, &new_key).is_some_and(|other| other != index) {
             return Err(name_taken(path, &cleaned));
         }
+        // Hidden copies under the old name go, or one would appear as a set once this one moves.
+        // `index` is the first readable holder of the name, so removing later ones keeps it valid.
+        let mut at = 0;
+        entries.retain(|entry| {
+            let keep = at == index || readable(entry).is_none_or(|s| Some(s.key()) != old_key);
+            at += 1;
+            keep
+        });
         let table = entries[index].as_table_mut().expect("a readable entry");
         table.insert("name".into(), toml::Value::String(cleaned));
         Ok(())
@@ -361,6 +372,34 @@ members = [{ context = "a", server = "https://a" }, { context = "c", server = "h
         );
         let settings = delete_cluster_set(dir.path(), "Prod").unwrap();
         assert_eq!(names(&settings), ["keep"]);
+        assert!(
+            read(dir.path()).contains("only-one"),
+            "unusable entry stays"
+        );
+    }
+
+    #[test]
+    fn rename_does_not_bring_a_hidden_copy_into_view() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            r#"
+[[cluster_sets]]
+name = "prod"
+members = [{ context = "a", server = "https://a" }, { context = "b", server = "https://b" }]
+
+[[cluster_sets]]
+name = "PROD"
+members = [{ context = "c", server = "https://c" }, { context = "d", server = "https://d" }]
+
+[[cluster_sets]]
+name = "prod"
+members = [{ context = "only-one", server = "https://e" }]
+"#,
+        );
+        let settings = rename_cluster_set(dir.path(), "prod", "live").unwrap();
+        assert_eq!(names(&settings), ["live"]);
+        assert_eq!(settings.cluster_sets[0].members[0].context, "a");
         assert!(
             read(dir.path()).contains("only-one"),
             "unusable entry stays"
