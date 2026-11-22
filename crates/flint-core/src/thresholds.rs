@@ -332,7 +332,9 @@ impl ThresholdSettings {
     /// Reads the section, keeping every valid value and listing what it ignored. Never fails.
     pub fn from_toml(value: &toml::Value) -> (Self, Vec<ThresholdIssue>) {
         let read = if value.is_table() {
-            Loose::<Section>::deserialize(value.clone()).ok()
+            let mut value = value.clone();
+            drop_bindings_that_are_not_text(&mut value);
+            Loose::<Section>::deserialize(value).ok()
         } else {
             None
         };
@@ -352,6 +354,19 @@ impl<'de> Deserialize<'de> for ThresholdSettings {
     /// when the file can be edited: what `toml::Value` refuses makes the file unreadable.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Ok(Self::from_toml(&toml::Value::deserialize(deserializer)?).0)
+    }
+}
+
+/// Removes each cluster entry's context or server that is not a string. `toml::Value` hands a
+/// date to a reader as text, which would bind the entry to a context the writer cannot match.
+fn drop_bindings_that_are_not_text(section: &mut toml::Value) {
+    let entries = section
+        .get_mut(CLUSTERS_KEY)
+        .and_then(toml::Value::as_array_mut);
+    for entry in entries.into_iter().flatten() {
+        if let Some(entry) = entry.as_table_mut() {
+            entry.retain(|key, value| !(key == CONTEXT_KEY || key == SERVER_KEY) || value.is_str());
+        }
     }
 }
 

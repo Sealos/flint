@@ -1228,7 +1228,49 @@ fn parse_settings(text: &str, path: &Path) -> Result<(Settings, toml::Table), Se
     let settings: Settings = parse_toml(text, path)?;
     let table: toml::Table = parse_toml(text, path)?;
     validate(&settings, path)?;
+    check_saves_faithfully(text, &table, path)?;
     Ok((settings, table))
+}
+
+/// The key the TOML parser uses internally to carry a date. Written by hand, it turns the table
+/// around it into a date and drops that table's other keys.
+const TOML_DATETIME_KEY: &str = "$__toml_private_datetime";
+
+/// Refuses a text an edit could not write back as it reads: one holding [`TOML_DATETIME_KEY`],
+/// or one whose table renders to TOML that does not parse (keys nested too deep for a header).
+fn check_saves_faithfully(
+    text: &str,
+    table: &toml::Table,
+    path: &Path,
+) -> Result<(), SettingsError> {
+    let invalid = |reason: &str| SettingsError::Invalid {
+        path: path.to_owned(),
+        reason: reason.to_owned(),
+    };
+    let parsed = toml::de::DeTable::parse(text).map_err(|_| invalid("it cannot be parsed"))?;
+    if table_has_datetime_key(parsed.get_ref()) {
+        return Err(invalid("it uses a key reserved by the TOML parser"));
+    }
+    let nested_too_deep = || invalid("its keys are nested too deeply to save");
+    let rendered = toml::to_string_pretty(table).map_err(|_| nested_too_deep())?;
+    toml::from_str::<toml::Table>(&rendered).map_err(|_| nested_too_deep())?;
+    Ok(())
+}
+
+fn table_has_datetime_key(table: &toml::de::DeTable<'_>) -> bool {
+    table.iter().any(|(key, value)| {
+        key.get_ref().as_ref() == TOML_DATETIME_KEY || value_has_datetime_key(value.get_ref())
+    })
+}
+
+fn value_has_datetime_key(value: &toml::de::DeValue<'_>) -> bool {
+    match value {
+        toml::de::DeValue::Table(table) => table_has_datetime_key(table),
+        toml::de::DeValue::Array(items) => items
+            .iter()
+            .any(|item| value_has_datetime_key(item.get_ref())),
+        _ => false,
+    }
 }
 
 fn parse_toml<T: for<'de> Deserialize<'de>>(text: &str, path: &Path) -> Result<T, SettingsError> {
@@ -1644,6 +1686,116 @@ mod threshold_settings_tests {
             assert!(set_trusted(dir.path(), "t", None).is_err());
             assert!(set_trusted(dir.path(), "new", Some(B)).is_err());
             assert_eq!(read(dir.path()), text, "the file is left as it is");
+        }
+    }
+
+    // covers UP-67: a file that loads but could not be written back, or that a save would
+    // rewrite into something else, takes the unreadable path with its pins out of effect.
+    #[test]
+    fn a_file_a_save_cannot_reproduce_is_unreadable() {
+        let pins = format!(
+            "protect_local_clusters = false\n\
+             trusted_clusters = [{{ context = \"t\", server = \"{A}\" }}]\n\
+             [[ai_exposed_clusters]]\ncontext = \"x\"\nserver = \"{A}\"\n"
+        );
+        let deep = format!("cpu_percent{} = {{}}", ".a".repeat(79));
+        for section in [
+            format!("[thresholds]\n{deep}\n"),
+            "[thresholds]\ncpu_percent = 80\n\"$__toml_private_datetime\" = \"2026-11-22\"\n"
+                .to_owned(),
+            "[future]\nkept = 1\n\"\\u0024__toml_private_datetime\" = \"2026-11-22\"\n".to_owned(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let text = format!("{pins}{section}");
+            write(dir.path(), &text);
+
+            let (loaded, reason) = load_settings_or_fallback(dir.path());
+            assert!(reason.is_some(), "{section}");
+            assert!(loaded.ai_exposed_clusters.is_empty(), "{section}");
+            assert!(loaded.trusted_clusters.is_empty(), "{section}");
+            assert!(loaded.protect_local_clusters, "{section}");
+            assert!(set_appearance(dir.path(), Appearance::Dark).is_err());
+            assert_eq!(read(dir.path()), text, "the file is left as it is");
+        }
+    }
+
+    // covers UP-67: a binding must be a string; a date is not the context of that name.
+    #[test]
+    fn a_date_is_not_a_cluster_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        for binding in [
+            format!("context = 2026-11-22\nserver = \"{A}\""),
+            "context = \"2026-11-22\"\nserver = 2026-11-22".to_owned(),
+        ] {
+            write(
+                dir.path(),
+                &format!("[[thresholds.clusters]]\n{binding}\ncpu_percent = 50\n"),
+            );
+            let settings = load_settings(dir.path()).unwrap();
+            assert!(settings.thresholds.clusters.is_empty(), "{binding}");
+            for server in [A, "2026-11-22"] {
+                let found = settings.thresholds_for("2026-11-22", Some(server));
+                assert_eq!(found.get(CpuPercent), 90, "{binding}");
+            }
+        }
+    }
+
+    // covers UP-67: a value that is ignored is reported in the log, by key and without its value.
+    #[test]
+    fn an_ignored_threshold_is_logged() {
+        #[derive(Clone, Default)]
+        struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl io::Write for Log {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "[thresholds]\ncpu_percent = 500\n");
+        let log = Log::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || load_settings(dir.path()).unwrap());
+        let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("cpu_percent"), "{logged}");
+        assert!(!logged.contains("500"), "{logged}");
+    }
+
+    // covers UP-67: saving and clearing a threshold keeps trust, exposure and protection.
+    #[test]
+    fn a_threshold_edit_keeps_trust_and_exposure() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            &format!(
+                "protect_local_clusters = false\n\
+                 trusted_clusters = [{{ context = \"t\", server = \"{A}\" }}]\n\
+                 [[ai_exposed_clusters]]\ncontext = \"x\"\nserver = \"{A}\"\n\
+                 namespaces = [\"apps\"]\n"
+            ),
+        );
+        let before = load_settings(dir.path()).unwrap();
+        assert_eq!(before.ai_exposed_clusters.len(), 1);
+        assert_eq!(before.trusted_clusters.len(), 1);
+        let pin = ClusterPin::new("x", A);
+        for (cluster, value) in [
+            (None, Some(80)),
+            (Some(&pin), Some(60)),
+            (Some(&pin), None),
+            (None, None),
+        ] {
+            let saved = set_threshold(dir.path(), cluster, CpuPercent, value).unwrap();
+            assert_eq!(saved.ai_exposed_clusters, before.ai_exposed_clusters);
+            assert_eq!(saved.trusted_clusters, before.trusted_clusters);
+            assert_eq!(saved.protect_local_clusters, before.protect_local_clusters);
+            assert_eq!(load_settings(dir.path()).unwrap(), saved);
         }
     }
 }
