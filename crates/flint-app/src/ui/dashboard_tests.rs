@@ -219,13 +219,22 @@ fn a_cluster_that_cannot_be_read_is_unknown_never_zero() {
 }
 
 #[test]
-fn older_lists_do_not_fill_in_a_cluster_that_cannot_be_read() {
+fn events_and_claims_do_not_depend_on_the_watched_kinds() {
     let snapshot = snapshot(Availability::CannotBeChecked(None), MetricsCheck::Waiting);
     let events = [warning("web-0", ago(30))];
     let claims = [pending_claim()];
     let model = build(&snapshot, &TrendStore::new(), Some(&events), Some(&claims));
+    assert_eq!(tile(&model, ProblemCategory::WarningEvents).count, Some(1));
+    assert_eq!(tile(&model, ProblemCategory::PendingClaims).count, Some(1));
+    assert_eq!(tile(&model, ProblemCategory::FailingPods).count, None);
+    let WarningsPanel::Rows { rows, total } = &model.warnings else {
+        panic!("{:?}", model.warnings);
+    };
+    assert_eq!((rows.len(), *total), (1, 1));
+
+    let model = build(&snapshot, &TrendStore::new(), None, Some(&claims));
     assert_eq!(tile(&model, ProblemCategory::WarningEvents).count, None);
-    assert_eq!(tile(&model, ProblemCategory::PendingClaims).count, None);
+    assert_eq!(tile(&model, ProblemCategory::PendingClaims).count, Some(1));
     assert_eq!(model.warnings, WarningsPanel::Unavailable);
 }
 
@@ -378,6 +387,97 @@ fn an_old_sample_is_not_passed_off_as_current() {
     assert!(!cpu.shape.is_empty(), "the history stays");
 }
 
+fn node_metrics(name: &str, cpu: u64) -> NodeMetrics {
+    NodeMetrics {
+        name: name.into(),
+        timestamp: None,
+        window: None,
+        usage: Usage {
+            cpu: Cpu::from_nanos(cpu),
+            memory: Memory::from_bytes(1 << 30),
+        },
+    }
+}
+
+fn metric_values(model: &DashboardModel) -> (Option<&str>, Option<&str>, bool) {
+    let MetricsPanel::Tiles { cpu, memory, .. } = &model.metrics else {
+        panic!("{:?}", model.metrics);
+    };
+    (
+        cpu.value.as_deref(),
+        memory.value.as_deref(),
+        !cpu.shape.is_empty() && !memory.shape.is_empty(),
+    )
+}
+
+#[test]
+fn a_poll_missing_a_node_shows_no_current_total() {
+    let step = POLL_INTERVAL.as_secs() as i64;
+    let mut store = TrendStore::new();
+    let both = vec![
+        node_metrics("node-1", 500_000_000),
+        node_metrics("node-2", 500_000_000),
+    ];
+    store.record(
+        CLUSTER,
+        ago(step),
+        &Ok(MetricsList {
+            items: both,
+            skipped: 0,
+        }),
+    );
+    store.record(
+        CLUSTER,
+        now(),
+        &Ok(MetricsList {
+            items: vec![node_metrics("node-1", 500_000_000)],
+            skipped: 0,
+        }),
+    );
+    let snapshot = snapshot(Availability::Checked, MetricsCheck::Current { nodes: 1 });
+    let model = build(&snapshot, &store, Some(&[]), Some(&[]));
+    assert_eq!(metric_values(&model), (None, None, true));
+}
+
+#[test]
+fn an_empty_poll_shows_no_current_total() {
+    let mut store = trends(&[(500_000_000, 1 << 30)]);
+    store.record(
+        CLUSTER,
+        now(),
+        &Ok(MetricsList {
+            items: Vec::new(),
+            skipped: 0,
+        }),
+    );
+    let snapshot = snapshot(Availability::Checked, MetricsCheck::Current { nodes: 0 });
+    let model = build(&snapshot, &store, Some(&[]), Some(&[]));
+    assert_eq!(metric_values(&model), (None, None, true));
+}
+
+#[test]
+fn a_complete_poll_stays_current_while_the_next_is_slow() {
+    let store = trends(&[(500_000_000, 1 << 30)]);
+    let step = POLL_INTERVAL.as_secs() as i64;
+    let read_at = |steps: i64| {
+        DashboardModel::build(&DashboardInput {
+            snapshot: &checked(),
+            trends: &store,
+            thresholds: &Thresholds::default(),
+            warning_events: Some(&[]),
+            pending_claims: Some(&[]),
+            now: now()
+                .checked_add(jiff::SignedDuration::from_secs(step * steps))
+                .unwrap(),
+        })
+    };
+    assert_eq!(
+        metric_values(&read_at(2)),
+        (Some("500m"), Some("1.0 GiB"), true)
+    );
+    assert_eq!(metric_values(&read_at(3)), (None, None, true));
+}
+
 #[test]
 fn a_failed_poll_keeps_the_history_without_a_current_value() {
     let snapshot = snapshot(
@@ -470,8 +570,13 @@ async fn draws_a_full_dashboard(cx: &mut TestAppContext) {
     let first = model.tiles[2].clone();
     let (window, _) = open(cx, model);
     assert_eq!(
-        label(cx, window, tile_content_id(&first)).as_deref(),
+        label(cx, window, tile_id(&first)).as_deref(),
         Some("Warning events: 2")
+    );
+    assert_eq!(
+        label(cx, window, tile_content_id(&first)).as_deref(),
+        Some(""),
+        "the name is on the control, not repeated on its content"
     );
     assert_eq!(
         label(cx, window, "dashboard-cpu").as_deref(),

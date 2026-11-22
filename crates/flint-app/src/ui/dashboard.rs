@@ -74,7 +74,8 @@ pub enum DashboardEvent {
     OpenFilteredList(ProblemCategory),
 }
 
-/// What the dashboard is built from. `None` for events or claims means they could not be read.
+/// What the dashboard is built from. Events and claims are read apart from the telemetry feed, so
+/// the caller passes `None` for a list whose own read failed or is stale.
 #[derive(Clone, Copy, Debug)]
 pub struct DashboardInput<'a> {
     pub snapshot: &'a TelemetrySnapshot,
@@ -310,25 +311,37 @@ fn tile(category: ProblemCategory, input: &DashboardInput<'_>) -> ProblemTile {
     }
 }
 
-/// The count of `category`. The telemetry feed does not watch events or claims, so those come
-/// from the input when it has them. A cluster that cannot be read has no counts at all, whatever
-/// older lists the caller still holds.
+/// The count of `category`. The telemetry feed does not watch events or claims, so those depend
+/// only on the caller's own reads. Every other count needs a readable feed.
 fn tile_count(category: ProblemCategory, input: &DashboardInput<'_>) -> Option<u32> {
     let snapshot = input.snapshot;
-    if !matches!(
-        snapshot.availability,
-        Availability::Checked | Availability::Partial
-    ) {
-        return None;
-    }
-    let supplied = match category {
+    match category {
         ProblemCategory::WarningEvents => input
             .warning_events
             .map(|events| count_recent_warnings(events, input.now)),
         ProblemCategory::PendingClaims => input.pending_claims.map(count_pending_claims),
-        _ => None,
-    };
-    supplied.or_else(|| snapshot.counts.get(category))
+        _ => matches!(
+            snapshot.availability,
+            Availability::Checked | Availability::Partial
+        )
+        .then(|| snapshot.counts.get(category))
+        .flatten(),
+    }
+}
+
+/// The cluster total of the newest poll that produced a sample, or `None` if that poll could not
+/// total every node. A time before that poll makes the series end exactly at its step.
+fn latest_poll_total(input: &DashboardInput<'_>, resource: TrendResource) -> Option<u64> {
+    input
+        .trends
+        .series(
+            &input.snapshot.cluster,
+            TrendScope::Total,
+            resource,
+            Timestamp::MIN,
+        )?
+        .last()
+        .flatten()
 }
 
 fn metrics(input: &DashboardInput<'_>) -> MetricsPanel {
@@ -345,7 +358,8 @@ fn metrics(input: &DashboardInput<'_>) -> MetricsPanel {
             Some(format!("CPU and memory cannot be checked: {detail}"))
         }
     };
-    let current = notice.is_none();
+    // An empty answer records nothing in the trend, so only the poll's own node count shows it.
+    let current = matches!(input.snapshot.metrics, MetricsCheck::Current { nodes } if nodes > 0);
     let tile = |label, resource, format: fn(u64) -> String| {
         let samples: Vec<Option<u64>> = input
             .trends
@@ -357,17 +371,15 @@ fn metrics(input: &DashboardInput<'_>) -> MetricsPanel {
             )
             .map(Iterator::collect)
             .unwrap_or_default();
-        let value = current
-            .then(|| {
-                samples
-                    .iter()
-                    .rev()
-                    .take(CURRENT_VALUE_STEPS)
-                    .flatten()
-                    .next()
-                    .map(|value| format(*value))
-            })
-            .flatten();
+        let recent = samples
+            .iter()
+            .rev()
+            .take(CURRENT_VALUE_STEPS)
+            .any(Option::is_some);
+        let value = (current && recent)
+            .then(|| latest_poll_total(input, resource))
+            .flatten()
+            .map(format);
         MetricTile {
             label,
             value,
@@ -405,12 +417,7 @@ fn format_memory(bytes: u64) -> String {
 }
 
 fn warnings(input: &DashboardInput<'_>) -> WarningsPanel {
-    // Without a readable cluster the count is unknown, so the list must not contradict it.
-    let readable = matches!(
-        input.snapshot.availability,
-        Availability::Checked | Availability::Partial
-    );
-    let Some(events) = input.warning_events.filter(|_| readable) else {
+    let Some(events) = input.warning_events else {
         return WarningsPanel::Unavailable;
     };
     let mut recent: Vec<(Timestamp, &KubeEvent)> = events

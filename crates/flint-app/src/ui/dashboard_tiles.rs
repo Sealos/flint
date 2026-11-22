@@ -28,8 +28,8 @@ pub fn tile_id(tile: &ProblemTile) -> ElementId {
     ("dashboard-tile", tile.category as usize).into()
 }
 
-/// The element id of a problem tile's content, which carries its description: a button takes no
-/// label of its own when it holds custom content.
+/// The element id of a problem tile's content. It carries the description only when the tile is
+/// not a button; a button is named on the control itself.
 pub fn tile_content_id(tile: &ProblemTile) -> ElementId {
     ("dashboard-tile-content", tile.category as usize).into()
 }
@@ -84,7 +84,7 @@ pub fn problem_tiles(tiles: &[ProblemTile], focus: FocusHandle, theme: &Theme) -
 fn problem_tile(tile: &ProblemTile, focus: FocusHandle, theme: &Theme) -> AnyElement {
     let body = v_flex()
         .id(tile_content_id(tile))
-        .aria_label(tile.description())
+        .when(!tile.opens_list(), |el| el.aria_label(tile.description()))
         .items_start()
         .w_full()
         .gap_0p5()
@@ -112,6 +112,7 @@ fn problem_tile(tile: &ProblemTile, focus: FocusHandle, theme: &Theme) -> AnyEle
         .test_support();
     if tile.opens_list() {
         Button::new(tile_id(tile))
+            .accessibility_label(tile.description())
             .outline()
             .flex_1()
             .min_w(px(TILE_MIN_WIDTH))
