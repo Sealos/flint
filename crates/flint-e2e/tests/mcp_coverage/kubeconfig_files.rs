@@ -129,10 +129,13 @@ fn up_54_a_broken_file_pauses_only_a_changed_definition() -> Result<()> {
     assert!(files.uses("steady") > 0);
     let first_runs = files.uses("shared-first");
     assert!(first_runs > 0);
+    let server_key = last_server_key(&files);
+    assert!(server_key.is_some());
 
     std::fs::write(&files.first, "clusters: [not valid")?;
     assert_reads(&mut mcp, STEADY)?;
     assert_paused(&mut mcp, SHARED)?;
+    assert_eq!(last_server_key(&files), server_key, "the refused call's");
     let listed = mcp.call_json("list_clusters", json!({}))?;
     let row = |name: &str| {
         listed["clusters"]
@@ -150,6 +153,38 @@ fn up_54_a_broken_file_pauses_only_a_changed_definition() -> Result<()> {
     assert_reads(&mut mcp, STEADY)?;
     assert_eq!(files.uses("shared-second"), 0, "still never ran");
     assert!(files.steady.arrivals().len() > 1 && files.shared.arrivals().len() > 1);
+    Ok(())
+}
+
+/// The server key of the last recorded call.
+fn last_server_key(files: &Files) -> Option<String> {
+    flint_core::activity::read(&files.scratch.config_dir())
+        .pop()
+        .and_then(|record| record.server_key)
+}
+
+// covers UP-54: restoring a file's permissions changes neither its time nor its size, and still
+// ends the pause.
+#[cfg(unix)]
+#[test]
+fn up_54_a_permission_repair_ends_the_pause() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let files = Files::new()?;
+    let mut mcp = files.mcp()?;
+    assert_reads(&mut mcp, SHARED)?;
+    let readable = std::fs::metadata(&files.first)?.permissions();
+
+    // Written first: a new stamp is what makes the next call read the file and fail.
+    std::fs::write(&files.first, format!("{}\n", files.first_text))?;
+    std::fs::set_permissions(&files.first, std::fs::Permissions::from_mode(0o000))?;
+    if std::fs::read(&files.first).is_ok() {
+        // Running as root, which no file mode stops.
+        return Ok(());
+    }
+    assert_paused(&mut mcp, SHARED)?;
+    std::fs::set_permissions(&files.first, readable)?;
+    assert_reads(&mut mcp, SHARED)?;
+    assert_eq!(files.uses("shared-second"), 0);
     Ok(())
 }
 

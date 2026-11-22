@@ -15,7 +15,7 @@ use kube::config::{Kubeconfig, KubeconfigError, NamedContext};
 use tokio::sync::{Mutex, OwnedMutexGuard, oneshot};
 use tokio::time::Instant;
 
-pub use crate::recheck::ConfirmedDefinitions;
+pub use crate::recheck::{ConfirmedDefinitions, JudgedRead, ReadOutcome};
 use crate::settings::{Settings, expand_tilde};
 
 /// One kubeconfig context, as Flint shows it in the sidebar.
@@ -147,11 +147,6 @@ pub struct FileStamps(Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>);
 impl FileStamps {
     pub fn of(paths: &[PathBuf]) -> Self {
         FileStamps(paths.iter().map(|p| (p.clone(), file_stamp(p))).collect())
-    }
-
-    /// The stamp of `path`, if it is one of these files and could be checked.
-    pub(crate) fn stamp(&self, path: &Path) -> Option<(std::time::SystemTime, u64)> {
-        self.0.iter().find(|(p, _)| p == path).and_then(|(_, s)| *s)
     }
 }
 
@@ -599,6 +594,25 @@ impl FileRead {
             consistent,
             order,
         }
+    }
+}
+
+/// A read of the kubeconfig files for [`ConfirmedDefinitions::judge`], by a process that reads
+/// them itself.
+#[derive(Debug)]
+pub struct KubeconfigRead(pub(crate) FileRead);
+
+impl KubeconfigRead {
+    /// Reads `paths`, again while they change under the read, for a few seconds at most. This
+    /// blocks, so hold no lock across it.
+    pub fn settled(paths: &[PathBuf]) -> Self {
+        let deadline = std::time::Instant::now() + READ_TIMEOUT;
+        KubeconfigRead(FileRead::settled(paths, load, deadline))
+    }
+
+    /// What was read, to adjust before it is judged.
+    pub fn loaded_mut(&mut self) -> &mut LoadedKubeconfig {
+        &mut self.0.loaded
     }
 }
 
