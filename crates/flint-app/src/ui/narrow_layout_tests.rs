@@ -910,6 +910,37 @@ async fn a_failed_detail_keeps_retry_above_a_tall_dock(cx: &mut TestAppContext) 
     assert_eq!(bounds(cx, &t, "dock-pane").size.height, px(320.));
 }
 
+#[gpui_kit::test]
+async fn a_long_failed_detail_keeps_retry_above_a_tall_dock(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    detail_alone(cx, &t).await;
+    t.dispatch(cx, "dock::ToggleDock", Value::Null).unwrap();
+    t.dispatch(
+        cx,
+        "workspace::SetDockHeight",
+        serde_json::json!({"height": 320}),
+    )
+    .unwrap();
+    let error = "The API server refused the connection while fetching the object.\n".repeat(64);
+    t.detail(cx)
+        .unwrap()
+        .update(cx, |view, cx| view.show_failed(error, cx));
+    draw(cx, &t);
+
+    let pane = bounds(cx, &t, "detail-alone-pane");
+    let dock = bounds(cx, &t, "dock-pane");
+    let retry = bounds(cx, &t, "detail-retry");
+    assert!(retry.size.width > px(0.) && retry.size.height > px(0.));
+    assert!(
+        retry.left() >= pane.left()
+            && retry.right() <= pane.right()
+            && retry.top() >= pane.top()
+            && retry.bottom() <= pane.bottom().min(dock.top()),
+        "{retry:?} inside {pane:?} and above {dock:?}"
+    );
+}
+
 // #421: the main window cannot be made smaller than the layout supports.
 #[gpui_kit::test]
 fn the_main_window_has_a_minimum_size(cx: &mut TestAppContext) {

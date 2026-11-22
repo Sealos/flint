@@ -1325,6 +1325,12 @@ fn synthetic_log() -> String {
     unfold(&out)
 }
 
+/// True when the memory workflow runs the tests under AddressSanitizer, which slows code by a
+/// large factor: the speed limits below are skipped there, every output check still runs.
+fn under_sanitizer() -> bool {
+    std::env::var("ASAN_OPTIONS").is_ok_and(|options| !options.is_empty())
+}
+
 /// Throughput over a 10 MB log. The floor is low so unoptimized builds pass; run with
 /// `--release -- --nocapture` for the number that matters.
 #[test]
@@ -1343,7 +1349,11 @@ fn ten_megabytes_of_logs_are_fast() {
         out.count
     );
     assert!(out.count > 0 && !out.text.contains("hunter2"));
-    assert!(mb / secs > 20.0, "{:.1} MB/s", mb / secs);
+    assert!(
+        under_sanitizer() || mb / secs > 20.0,
+        "{:.1} MB/s",
+        mb / secs
+    );
 }
 
 /// One long line full of quoted values stays linear: each value is scanned once, so a line as
@@ -1378,7 +1388,10 @@ fn long_lines_of_quoted_values_are_linear() {
         let secs = start.elapsed().as_secs_f64();
         println!("{unit}: 1 MiB line in {:.1} ms", secs * 1000.0);
         assert_eq!(out.count, MIB / unit.len(), "{unit}");
-        assert!(secs < 2.0, "{unit}: {secs:.2} s for 1 MiB");
+        assert!(
+            under_sanitizer() || secs < 2.0,
+            "{unit}: {secs:.2} s for 1 MiB"
+        );
     }
     // Values the pair rule leaves alone are not scanned to the end of the line again and again.
     for unit in [
@@ -1392,6 +1405,9 @@ fn long_lines_of_quoted_values_are_linear() {
         redact_credentials(&line);
         let secs = start.elapsed().as_secs_f64();
         println!("{unit}: 1 MiB line in {:.1} ms", secs * 1000.0);
-        assert!(secs < 2.0, "{unit}: {secs:.2} s for 1 MiB");
+        assert!(
+            under_sanitizer() || secs < 2.0,
+            "{unit}: {secs:.2} s for 1 MiB"
+        );
     }
 }

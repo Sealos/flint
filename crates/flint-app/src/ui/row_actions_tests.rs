@@ -14,15 +14,17 @@ use flint_core::{
     LineSource, LogLine, LogSnapshot, LogState, NavEntry, ObjectDetail, PodSet, PodSetStatus, Row,
     SafeErrorText, StreamStatus, SyncState, WorkloadPod,
 };
+use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
-use gpui_kit::{AppContext as _, SharedString, TestAppContext};
+use gpui_kit::{AppContext as _, DismissEvent, Focusable as _, SharedString, TestAppContext};
 use serde_json::{Value, json};
 
 use crate::ui::detail::{PENDING_TIMEOUT, TestPodLister};
 use crate::ui::dock::DockTab;
-use crate::ui::list::{ListEvent, Selected};
+use crate::ui::list::{ListEvent, ResourceList, Selected};
 use crate::ui::registry::{self, ActionError};
-use crate::ui::support_tests::{TestWorkspace, WAIT, open_workspace, pods};
+use crate::ui::row_menu::{OpenRowMenu, RowMenu};
+use crate::ui::support_tests::{TestWorkspace, WAIT, open_empty_workspace, open_workspace, pods};
 use crate::ui::view_state::{ActionAvailability, AppState, Focus};
 
 pub(super) async fn activate(cx: &mut TestAppContext, t: &TestWorkspace, cluster: &'static str) {
@@ -1330,8 +1332,8 @@ async fn a_click_outside_closes_a_row_menu(cx: &mut TestAppContext) {
     assert!(!menu_open(cx, &t));
 }
 
-// covers #496: a right-click on another row replaces the menu, which then acts on that row, and
-// focus still returns to where it was before the first menu.
+// covers #496: a right-click on another row replaces the menu and dismissal returns focus to
+// the list.
 #[gpui_kit::test]
 async fn right_clicking_another_row_replaces_its_menu(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
@@ -1347,6 +1349,58 @@ async fn right_clicking_another_row_replaces_its_menu(cx: &mut TestAppContext) {
     press(cx, &t, "escape");
     assert!(!menu_open(cx, &t));
     assert_eq!(app_state(cx, &t).focus, Focus::List);
+}
+
+#[gpui_kit::test]
+async fn a_replaced_row_menu_returns_focus_to_the_original_view(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (window, workspace, model) = open_empty_workspace(cx, dir.path()).await;
+    let sidebar_focus = workspace.read_with(cx, |ws, _| ws.sidebar_focus.clone());
+    let core = model.read_with(cx, |model, _| model.core().clone());
+    let list = cx
+        .update_window(window, |_, window, cx| {
+            window.focus(&sidebar_focus, cx);
+            cx.new(|cx| {
+                ResourceList::new(core, "test".into(), &pods_entry(), vec![], None, window, cx)
+            })
+        })
+        .unwrap();
+
+    // Open the menus directly so selecting a row does not move focus to the list first.
+    let build: RowMenu = Rc::new(|menu, _, _| menu.item(PopupMenuItem::new("Logs")));
+    let _replacement = cx
+        .update_window(window, |_, window, cx| {
+            assert!(sidebar_focus.is_focused(window));
+            let replacement = list.update(cx, |_, cx| {
+                let mut open = |uid: &str, replaced| {
+                    let back_to = OpenRowMenu::focus_before(replaced, window, cx).unwrap();
+                    let menu = OpenRowMenu::open(
+                        &build,
+                        uid.into(),
+                        Default::default(),
+                        back_to,
+                        window,
+                        cx,
+                    );
+                    assert!(menu.menu().read(cx).focus_handle(cx).is_focused(window));
+                    menu
+                };
+                let first = open("uid-web", None);
+                open("uid-api", Some(first))
+            });
+            replacement.menu().update(cx, |_, cx| cx.emit(DismissEvent));
+            replacement
+        })
+        .unwrap();
+
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(
+            window.focused(cx),
+            Some(sidebar_focus),
+            "dismissing the replacement returns focus to the sidebar"
+        );
+    })
+    .unwrap();
 }
 
 // covers #496: the menu closes when its row leaves the list, since it acts on that row.

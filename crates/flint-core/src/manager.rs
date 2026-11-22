@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kube::Client;
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 
@@ -27,14 +26,21 @@ use crate::kubeconfig::{
 use crate::logs::{self, KubeLogSource, KubePodSource, LogError, SessionConfig};
 use crate::protection::{ClusterClients, GatedClient, SessionUnlocks, WriteRefusal, protection};
 use crate::read::{self, KindId, KindInfo};
-use crate::recheck::{ContextHistory, ContextPin, FreshDefinition, Pinned};
+use crate::recheck::{
+    ContextHistory, ContextPin, EMPTY_SETTLE, EmptiedFiles, FreshDefinition, Pinned,
+    SettledDefinitions,
+};
 use crate::settings::{self, AiScope, Settings, server_identity};
 use crate::store::{KindSnapshot, SyncState};
 use crate::watch::{ClusterWatches, EngineConfig, HubRegistry, KubeSource};
 use crate::write::WriteError;
 
-/// Changes to watched files often come in bursts (editor save, `kind` rewriting the file).
-const RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
+mod file_watch;
+
+use file_watch::{FileWatcher, WatchScope};
+#[cfg(test)]
+use file_watch::{Watched, classify, missing_dirs, watch_names, watch_plan};
+
 /// CRD changes come in bursts too (create, then status updates as names are accepted).
 const CRD_DEBOUNCE: Duration = Duration::from_millis(500);
 /// The API server publishes a new CRD in discovery a moment after the CRD changes. When
@@ -60,6 +66,9 @@ pub(crate) struct Cluster {
     /// Stops the latest attempt, so one that a newer attempt or a new slot replaced ends rather
     /// than run on. Its result, if already sent, is still discarded by `attempt`.
     connect_task: Option<AbortHandle>,
+    /// A pause or a changed definition ended this slot's connection: a member connects again at
+    /// the first load that leaves it on its server and not paused.
+    reconnect: bool,
     /// The slot's generation, from the manager-wide counter: a new slot (a new context, one
     /// re-pointed or otherwise changed, one back after being removed) has a new one. Front ends
     /// tell a cluster that started over by it, whatever lists they skipped (#255).
@@ -118,6 +127,7 @@ impl Cluster {
             write_credential: None,
             attempt: 0,
             connect_task: None,
+            reconnect: false,
             generation: 0,
             discovery: None,
             discovering: false,
@@ -163,10 +173,6 @@ impl Cluster {
         }
     }
 }
-
-/// How long a kubeconfig file that defined something must stay emptied and unwritten before it
-/// counts as really empty. A writer that truncates first is done well within this.
-const EMPTY_SETTLE: Duration = Duration::from_secs(5);
 
 /// The pause before reading again files that were still changing when a read gave up.
 const READ_AGAIN_AFTER: Duration = Duration::from_millis(250);
@@ -265,6 +271,9 @@ enum Internal {
         result: Result<(cluster::GatedConnection, ServerVersion), cluster::SafeErrorText>,
     },
     FilesChanged(Changed),
+    /// The file watches changed and now cover these directories. Anything may have been written
+    /// before they started, so everything is read again.
+    WatchesStarted(HashSet<PathBuf>),
     /// A kubeconfig read finished after its caller stopped waiting.
     LateRead {
         paths: Vec<PathBuf>,
@@ -297,6 +306,8 @@ enum Internal {
     },
     CrdsChanged {
         cluster: ClusterId,
+        /// The slot whose watch listed them ([`Cluster::generation`]).
+        generation: u64,
         fingerprint: u64,
         kinds: HashSet<KindId>,
     },
@@ -411,9 +422,8 @@ pub(crate) struct ClusterManager {
     write_checks: Arc<()>,
     /// Which reads count ([`ReadMarks`]).
     marks: ReadMarks,
-    /// The files found emptied and still waiting to count as really empty: since when, and
-    /// their stamp then.
-    emptied: HashMap<PathBuf, (Instant, Option<(std::time::SystemTime, u64)>)>,
+    /// The files found emptied and still waiting to count as really empty.
+    emptied: EmptiedFiles,
     /// How long a file must stay emptied, unwritten, before it counts as really empty.
     empty_settle: Duration,
     /// A follow-up read of emptied files is scheduled.
@@ -446,13 +456,7 @@ pub(crate) struct ClusterManager {
     held: HashSet<ClusterId>,
     /// Each context's definition when a load last showed it with no unreadable file that could
     /// change it.
-    settled: HashMap<ClusterId, Option<u64>>,
-}
-
-struct FileWatcher {
-    _watcher: RecommendedWatcher,
-    /// Whether the config directory is watched. It may not exist until settings are first written.
-    settings_dir_watched: bool,
+    settled: SettledDefinitions,
 }
 
 impl ClusterManager {
@@ -499,7 +503,7 @@ impl ClusterManager {
             log_budget,
             unlocks,
             held: HashSet::new(),
-            settled: HashMap::new(),
+            settled: SettledDefinitions::default(),
             reader: KubeconfigReader::default(),
             stalled_on: None,
             read_seq: 0,
@@ -508,7 +512,7 @@ impl ClusterManager {
             refresh_only: false,
             write_checks: Arc::default(),
             marks: ReadMarks::default(),
-            emptied: HashMap::new(),
+            emptied: EmptiedFiles::default(),
             empty_settle: EMPTY_SETTLE,
             settle_armed: false,
         }
@@ -523,7 +527,7 @@ impl ClusterManager {
         self.emit_settings();
         // Watching first, so a change after the first reads (an agent's call landing meanwhile)
         // is noticed.
-        self.rebuild_watcher();
+        self.arm_watcher();
         self.reload_activity().await;
         self.reload_kubeconfig().await;
         loop {
@@ -844,9 +848,11 @@ impl ClusterManager {
         let hubs = self.hubs.clone();
         let internal = self.internal_tx.clone();
         let paused = self.paused(id);
+        let background = self.active.as_deref() != Some(id);
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
+        slot.watches.set_background(background);
         let follow = wanted && slot.discovery.is_some() && slot.client.is_some();
         if !follow {
             // Before the watches stop, so the followers' hubs can be released (each follower
@@ -867,7 +873,12 @@ impl ClusterManager {
         if follow && slot.crd_task.is_none() {
             let follower =
                 Follower::new(&hubs, id, KindId::custom_resource_definitions(), &internal);
-            slot.crd_task = Some(tokio::spawn(follow_crds(follower, internal.clone())));
+            let generation = slot.generation;
+            slot.crd_task = Some(tokio::spawn(follow_crds(
+                follower,
+                generation,
+                internal.clone(),
+            )));
         }
         if follow && slot.namespaces_task.is_none() {
             let follower = Follower::new(&hubs, id, KindId::namespaces(), &internal);
@@ -1064,14 +1075,8 @@ impl ClusterManager {
         match result {
             Ok(Ok(settings)) => {
                 self.apply_settings(Ok(settings)).await;
-                if self
-                    .watcher
-                    .as_ref()
-                    .is_some_and(|w| !w.settings_dir_watched)
-                {
-                    // The write may have created the config directory.
-                    self.rebuild_watcher();
-                }
+                // The write may have created the config directory.
+                self.arm_watcher();
                 true
             }
             // A settings write error can quote the file: one sanitized line.
@@ -1133,7 +1138,7 @@ impl ClusterManager {
         );
         if paths != self.kubeconfig_paths {
             self.kubeconfig_paths = paths;
-            self.rebuild_watcher();
+            self.arm_watcher();
             self.reload_kubeconfig().await;
         }
     }
@@ -1248,6 +1253,7 @@ impl ClusterManager {
                 // Dropped either way: the load that ends the pause connects again.
                 if paused {
                     slot.state = ConnectionState::Disconnected;
+                    slot.reconnect = true;
                     self.emit(Event::ConnectionChanged {
                         cluster,
                         state: ConnectionState::Disconnected,
@@ -1421,10 +1427,15 @@ impl ClusterManager {
             }
             Internal::CrdsChanged {
                 cluster,
+                generation,
                 fingerprint,
                 kinds,
             } => {
-                let Some(slot) = self.cluster_mut(&cluster) else {
+                // Queued by a slot since replaced: those CRDs are another server's.
+                let Some(slot) = self
+                    .cluster_mut(&cluster)
+                    .filter(|slot| slot.generation == generation)
+                else {
                     return;
                 };
                 slot.removed_crds = slot.crds.difference(&kinds).cloned().collect();
@@ -1444,23 +1455,38 @@ impl ClusterManager {
                 }
             }
             Internal::FilesChanged(changed) => {
-                if changed.rearm {
-                    // Before reloading, so a file written right after its directory is caught
-                    // either by the reload or by the new watcher.
-                    self.rebuild_watcher();
+                if changed.rearm || changed.kubeconfig || changed.settings {
+                    // A symlink may have moved. Anything written before the new watches start
+                    // is caught by the read the watcher asks for once they have.
+                    self.arm_watcher();
                 }
-                if changed.settings {
-                    // First, since settings can change the kubeconfig file list.
-                    self.reload_settings().await;
-                }
-                if changed.kubeconfig {
-                    self.marks.changed(self.read_seq);
-                    self.reload_kubeconfig().await;
-                }
-                if changed.activity {
-                    self.reload_activity().await;
-                }
+                self.reload_changed(changed).await;
             }
+            Internal::WatchesStarted(dirs) => {
+                tracing::debug!(dirs = dirs.len(), "file watches changed");
+                self.reload_changed(Changed {
+                    kubeconfig: true,
+                    settings: true,
+                    activity: true,
+                    rearm: false,
+                })
+                .await;
+            }
+        }
+    }
+
+    /// Reads again what `changed` names.
+    async fn reload_changed(&mut self, changed: Changed) {
+        if changed.settings {
+            // First, since settings can change the kubeconfig file list.
+            self.reload_settings().await;
+        }
+        if changed.kubeconfig {
+            self.marks.changed(self.read_seq);
+            self.reload_kubeconfig().await;
+        }
+        if changed.activity {
+            self.reload_activity().await;
         }
     }
 
@@ -1807,13 +1833,9 @@ impl ClusterManager {
     /// matches it, or that no load ever confirmed, connects as usual.
     fn paused(&self, id: &str) -> bool {
         self.held(id)
-            || self.cluster(id).is_some_and(|slot| {
-                self.contexts.provisional(id)
-                    && self
-                        .settled
-                        .get(id)
-                        .is_some_and(|confirmed| *confirmed != slot.fingerprint)
-            })
+            || self
+                .cluster(id)
+                .is_some_and(|slot| self.settled.paused(&self.contexts, id, slot.fingerprint))
     }
 
     /// Reads the kubeconfig files now, ahead of the file watcher, and says whether they still
@@ -1891,26 +1913,9 @@ impl ClusterManager {
     /// unwritten for [`Self::empty_settle`]. Those still count as failed, and a follow-up read
     /// is scheduled for them.
     fn still_settling(&mut self, blank: &[BlankFile]) -> Vec<BlankFile> {
-        let now = Instant::now();
-        let emptied: Vec<&BlankFile> = blank
-            .iter()
-            .filter(|file| self.contexts.file_mattered(&file.path))
-            .collect();
-        self.emptied
-            .retain(|path, _| emptied.iter().any(|file| &file.path == path));
-        let mut waiting = Vec::new();
-        for file in emptied {
-            let since = match self.emptied.get(&file.path) {
-                Some((since, stamp)) if *stamp == file.stamp => *since,
-                _ => {
-                    self.emptied.insert(file.path.clone(), (now, file.stamp));
-                    now
-                }
-            };
-            if now.duration_since(since) < self.empty_settle {
-                waiting.push(file.clone());
-            }
-        }
+        let waiting =
+            self.emptied
+                .waiting(&self.contexts, blank, Instant::now(), self.empty_settle);
         if !waiting.is_empty() && !self.settle_armed {
             self.settle_armed = true;
             let (internal, after) = (self.internal_tx.clone(), self.empty_settle);
@@ -1986,6 +1991,7 @@ impl ClusterManager {
             return;
         };
         slot.attempt = attempt;
+        slot.reconnect = false;
         slot.state = ConnectionState::Connecting;
         slot.client = None;
         slot.write_credential = None;
@@ -2238,6 +2244,8 @@ impl ClusterManager {
                     fresh.namespace_filter = old.namespace_filter.clone();
                     fresh.update_scope();
                     fresh.generation = self.next_generation();
+                    fresh.reconnect =
+                        old.reconnect || !matches!(old.state, ConnectionState::Disconnected);
                     fresh
                 }
                 None => {
@@ -2260,14 +2268,9 @@ impl ClusterManager {
         self.contexts.record(&loaded);
         // An unlock names only the server. A context that comes out of an uncertain spell on
         // another definition may hold another user or token there, so it is locked again.
-        for info in &loaded.contexts {
-            if self.contexts.provisional(&info.name) {
-                continue;
-            }
-            let definition = cluster::context_fingerprint(&loaded.merged, &info.name);
-            let before = self.settled.insert(info.name.clone(), definition);
-            if uncertain.contains(info.name.as_str()) && before.is_some_and(|b| b != definition) {
-                self.unlocks.lock(&info.name);
+        for name in self.settled.update(&self.contexts, &loaded) {
+            if uncertain.contains(name.as_str()) {
+                self.unlocks.lock(&name);
             }
         }
         // A context that a file which can't be parsed defined is not gone: keep its slot, in its
@@ -2331,200 +2334,37 @@ impl ClusterManager {
         for id in ended {
             self.reconcile(&id);
         }
+        // `ensure_connected` refuses a paused context, and the flag then waits for a later load.
+        let due: Vec<ClusterId> = self
+            .members
+            .keys()
+            .filter(|id| {
+                self.member_on_its_server(id)
+                    && !self.paused(id)
+                    && self.cluster(id).is_some_and(|slot| slot.reconnect)
+            })
+            .cloned()
+            .collect();
+        for id in due {
+            self.ensure_connected(&id);
+        }
     }
 
-    /// (Re)creates the file watcher for the current kubeconfig files and `settings.toml`, if
-    /// watching is enabled. Dropping the old watcher stops it.
-    fn rebuild_watcher(&mut self) {
+    /// Asks for the file watches to match the current kubeconfig files and `settings.toml`, if
+    /// watching is enabled. The scan runs on the watcher's own thread, so a stuck mount cannot
+    /// hold up this loop; once watches changed, that thread asks for everything to be read again.
+    fn arm_watcher(&mut self) {
         if !self.config.watch_files {
             return;
         }
-        self.watcher = None;
-        self.watcher = self.watch_files();
-    }
-
-    /// Watches the directories holding the kubeconfig files and `settings.toml`, so files that
-    /// are replaced by rename or created later are noticed. Each file is matched by its path and
-    /// its resolved path (symlink targets, `/var` versus `/private/var`).
-    fn watch_files(&self) -> Option<FileWatcher> {
-        // Create the config directory, so a settings.toml written there later (by hand or by
-        // another Flint) is noticed. Failing is fine: the app's own writes create it too.
-        let _ = std::fs::create_dir_all(&self.config.config_dir);
-        let kube_files: HashSet<PathBuf> = self
-            .kubeconfig_paths
-            .iter()
-            .flat_map(|p| watch_names(p))
-            .collect();
-        let settings_path = self.config.config_dir.join(settings::SETTINGS_FILE);
-        let settings_files: HashSet<PathBuf> = watch_names(&settings_path).into_iter().collect();
-        // Beside settings.toml, so it needs no directory of its own.
-        let activity_files: HashSet<PathBuf> = [activity::ACTIVITY_FILE, activity::PREVIOUS_FILE]
-            .iter()
-            .flat_map(|f| watch_names(&self.config.config_dir.join(f)))
-            .collect();
-        let (watch_dirs, pending) = watch_plan(kube_files.iter().chain(&settings_files));
-
-        let (raw_tx, raw_rx) = mpsc::unbounded_channel::<Changed>();
-        let (kube_watched, settings_watched) = (kube_files.clone(), settings_files.clone());
-        let watched = Watched {
-            pending,
-            kube: kube_watched,
-            settings: settings_watched,
-            activity: activity_files,
-        };
-        let mut watcher =
-            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                let Ok(event) = res else { return };
-                if matches!(event.kind, EventKind::Access(_)) {
-                    return;
-                }
-                let changed = classify(&event.paths, &watched);
-                if changed.kubeconfig || changed.settings || changed.activity {
-                    let _ = raw_tx.send(changed);
-                }
-            }) {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::warn!(error = %e, "cannot watch kubeconfig and settings files");
-                    return None;
-                }
-            };
-        let mut watched_dirs = HashSet::new();
-        for dir in &watch_dirs {
-            match watcher.watch(dir, RecursiveMode::NonRecursive) {
-                Ok(()) => {
-                    watched_dirs.insert(dir.clone());
-                }
-                Err(e) => tracing::debug!(dir = %dir.display(), error = %e, "not watching dir"),
-            }
+        if self.watcher.is_none() {
+            self.watcher = FileWatcher::start(self.internal_tx.clone());
         }
-        let settings_dir_watched = settings_files
-            .iter()
-            .filter_map(|f| f.parent())
-            .any(|d| watched_dirs.contains(&resolved(d)));
-        tokio::spawn(debounce(raw_rx, self.internal_tx.clone()));
-        Some(FileWatcher {
-            _watcher: watcher,
-            settings_dir_watched,
-        })
-    }
-}
-
-/// `dir` resolved (symlinks, `..`), or as given if it cannot be.
-fn resolved(dir: &Path) -> PathBuf {
-    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
-}
-
-/// The directories to watch so `files` are noticed, each once by its resolved name (inotify
-/// merges a directory's aliases into one watch, and removing one alias's watch would remove
-/// the other's), and the missing directories whose creation means the watcher is rebuilt. A
-/// directory that does not exist yet cannot be watched: its nearest existing ancestor is.
-fn watch_plan<'a>(
-    files: impl Iterator<Item = &'a PathBuf>,
-) -> (HashSet<PathBuf>, HashSet<PathBuf>) {
-    let dirs: HashSet<&Path> = files.filter_map(|f| f.parent()).collect();
-    let mut watch_dirs = HashSet::new();
-    let mut pending = HashSet::new();
-    for dir in dirs {
-        match missing_dirs(dir) {
-            Some((ancestor, missing)) => {
-                watch_dirs.insert(resolved(&ancestor));
-                pending.extend(missing);
-            }
-            None => {
-                watch_dirs.insert(resolved(dir));
-            }
-        }
-    }
-    (watch_dirs, pending)
-}
-
-/// What an event on `paths` changed. A missing directory that appeared (`pending`) may
-/// already hold kubeconfig files or `settings.toml` (a symlink's target directory restored
-/// with the file in it), so both are read again, besides rebuilding the watcher.
-/// The paths a file watcher reacts to.
-struct Watched {
-    /// Missing directories whose creation means the watcher is rebuilt.
-    pending: HashSet<PathBuf>,
-    kube: HashSet<PathBuf>,
-    settings: HashSet<PathBuf>,
-    activity: HashSet<PathBuf>,
-}
-
-fn classify(paths: &[PathBuf], watched: &Watched) -> Changed {
-    let rearm = paths.iter().any(|p| watched.pending.contains(p));
-    let any = |set: &HashSet<PathBuf>| rearm || paths.iter().any(|p| set.contains(p));
-    Changed {
-        kubeconfig: any(&watched.kube),
-        settings: any(&watched.settings),
-        activity: any(&watched.activity),
-        rearm,
-    }
-}
-
-/// For a directory that does not exist: its nearest existing ancestor, and every directory
-/// from there down to it that is missing (as given and with the ancestor resolved, since
-/// events may name either), whose creation means the watcher should be rebuilt. `None` when
-/// the directory exists.
-fn missing_dirs(dir: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
-    if dir.is_dir() {
-        return None;
-    }
-    let ancestor = dir.ancestors().skip(1).find(|a| a.is_dir())?.to_path_buf();
-    let resolved = std::fs::canonicalize(&ancestor).ok();
-    let mut missing = Vec::new();
-    for path in dir.ancestors().take_while(|a| *a != ancestor) {
-        missing.push(path.to_path_buf());
-        if let (Some(resolved), Ok(rest)) = (&resolved, path.strip_prefix(&ancestor)) {
-            missing.push(resolved.join(rest));
-        }
-    }
-    Some((ancestor, missing))
-}
-
-/// The paths a file may be reported under: as given, resolved (if it exists), and with its
-/// directory resolved (if only the directory exists yet).
-fn watch_names(path: &Path) -> Vec<PathBuf> {
-    let mut names = vec![path.to_path_buf()];
-    if let Ok(target) = std::fs::canonicalize(path) {
-        names.push(target);
-    }
-    // A symlink whose target is missing cannot be canonicalized: name its target as the link
-    // says it (relative to the link's directory), and with that directory resolved, so
-    // restoring the target is noticed.
-    if let Ok(link) = std::fs::read_link(path) {
-        let target = match path.parent() {
-            Some(dir) if link.is_relative() => dir.join(link),
-            _ => link,
-        };
-        if let (Some(dir), Some(name)) = (target.parent(), target.file_name())
-            && let Ok(dir) = std::fs::canonicalize(dir)
-        {
-            names.push(dir.join(name));
-        }
-        names.push(target);
-    }
-    if let (Some(dir), Some(name)) = (path.parent(), path.file_name())
-        && let Ok(dir) = std::fs::canonicalize(dir)
-    {
-        names.push(dir.join(name));
-    }
-    names
-}
-
-/// Ends when the watcher is dropped (its sender closes) or the manager stops.
-async fn debounce(mut raw: mpsc::UnboundedReceiver<Changed>, out: mpsc::UnboundedSender<Internal>) {
-    while let Some(first) = raw.recv().await {
-        tokio::time::sleep(RELOAD_DEBOUNCE).await;
-        let mut changed = first;
-        while let Ok(more) = raw.try_recv() {
-            changed.kubeconfig |= more.kubeconfig;
-            changed.settings |= more.settings;
-            changed.activity |= more.activity;
-            changed.rearm |= more.rearm;
-        }
-        if out.send(Internal::FilesChanged(changed)).is_err() {
-            break;
+        if let Some(watcher) = &self.watcher {
+            watcher.request(WatchScope {
+                kubeconfig: self.kubeconfig_paths.clone(),
+                config_dir: self.config.config_dir.clone(),
+            });
         }
     }
 }
@@ -2584,7 +2424,11 @@ impl Drop for Follower {
 
 /// Follows the CRD list of an active cluster and reports its fingerprint when it changes, so
 /// discovery can be refreshed. Ends when aborted or the hub goes away.
-async fn follow_crds(mut follower: Follower, out: mpsc::UnboundedSender<Internal>) {
+async fn follow_crds(
+    mut follower: Follower,
+    generation: u64,
+    out: mpsc::UnboundedSender<Internal>,
+) {
     let mut last = None;
     while let Some(snapshot) = follower.next_synced(CRD_DEBOUNCE).await {
         let fingerprint = crd_fingerprint(&snapshot);
@@ -2608,6 +2452,7 @@ async fn follow_crds(mut follower: Follower, out: mpsc::UnboundedSender<Internal
             .collect();
         let msg = Internal::CrdsChanged {
             cluster: follower.cluster.clone(),
+            generation,
             fingerprint,
             kinds,
         };
@@ -5122,6 +4967,7 @@ mod tests {
             kind: configmaps.id(),
         });
         assert!(!watches(&manager, &configmaps.id()), "no new watch");
+        assert!(watches(&manager, &pods), "subscribing stops nothing");
 
         let next = manager.next_attempt;
         manager
@@ -5224,6 +5070,132 @@ mod tests {
         assert!(manager.members.contains_key("dev"));
         assert!(manager.wants_watches("dev"));
         assert_eq!(manager.next_attempt, next, "no attempt started");
+    }
+
+    // A connection result handled during a hold is dropped, and the load that ends the hold
+    // connects the member again even though it is not the active cluster.
+    #[tokio::test]
+    async fn a_member_whose_connection_a_hold_dropped_reconnects() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, confirmed, first) = pausable(dir.path(), NO_CONTEXTS).await;
+        join_dev(&mut manager);
+        let attempt = manager.next_attempt;
+        manager.next_attempt += 1;
+        let slot = manager.cluster_mut("dev").unwrap();
+        slot.attempt = attempt;
+        slot.state = ConnectionState::Connecting;
+
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(manager.held("dev"));
+        manager
+            .handle_internal(Internal::Connected {
+                cluster: "dev".into(),
+                attempt,
+                result: Err(cluster::SafeErrorText::fixed("refused")),
+            })
+            .await;
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Disconnected));
+
+        let next = manager.next_attempt;
+        rewrite_file(&mut manager, &first, &confirmed).await;
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Connecting));
+        assert_eq!(manager.next_attempt, next + 1, "one attempt started");
+    }
+
+    // A kubeconfig link moved to a file with a new credential for the same server reaches a
+    // member that is not active: its slot is replaced and connects again.
+    #[tokio::test]
+    async fn a_moved_link_reconnects_a_background_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, confirmed, first) = pausable(dir.path(), NO_CONTEXTS).await;
+        join_dev(&mut manager);
+        let pods = watching_dev(&mut manager).await;
+        let generation = manager.cluster("dev").unwrap().generation;
+
+        let moved = dir.path().join("moved");
+        std::fs::write(
+            &moved,
+            confirmed.replace("user: {}", "user: {token: rotated}"),
+        )
+        .unwrap();
+        point_link(&first, &moved);
+        let next = manager.next_attempt;
+        manager.reload_kubeconfig().await;
+
+        assert!(manager.members.contains_key("dev"));
+        assert!(
+            !watches(&manager, &pods),
+            "the old connection's watch stopped"
+        );
+        let slot = manager.cluster("dev").unwrap();
+        assert_ne!(slot.generation, generation);
+        assert!(matches!(slot.state, ConnectionState::Connecting));
+        assert_eq!(manager.next_attempt, next + 1, "one attempt started");
+    }
+
+    // CRDs listed by a slot since replaced are another connection's, and change nothing.
+    #[tokio::test]
+    async fn a_crd_list_from_a_replaced_slot_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, confirmed, first) = pausable(dir.path(), NO_CONTEXTS).await;
+        join_dev(&mut manager);
+        watching_dev(&mut manager).await;
+        let stale = manager.cluster("dev").unwrap().generation;
+        let changed = confirmed.replace("user: {}", "user: {token: rotated}");
+        rewrite_file(&mut manager, &first, &changed).await;
+
+        manager
+            .handle_internal(Internal::CrdsChanged {
+                cluster: "dev".into(),
+                generation: stale,
+                fingerprint: 1,
+                kinds: HashSet::from([KindId::new("example.com", "widgets")]),
+            })
+            .await;
+        let slot = manager.cluster("dev").unwrap();
+        assert!(slot.crds.is_empty());
+        assert_eq!(slot.crd_fingerprint, None);
+    }
+
+    // A view closed during an outage keeps its rows on the active cluster only.
+    #[tokio::test]
+    async fn only_the_active_cluster_keeps_a_closed_views_rows() {
+        for (active, kept) in [("dev", 1), ("other", 0)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut manager, _, _) = pausable(dir.path(), NO_CONTEXTS).await;
+            manager.active = Some("dev".to_owned());
+            join_dev(&mut manager);
+            let pods = watching_dev(&mut manager).await;
+            manager.active = Some(active.to_owned());
+            manager.reconcile("dev");
+            assert!(watches(&manager, &pods));
+
+            let row = Arc::new(crate::table::Row {
+                uid: "u1".into(),
+                name: "web".into(),
+                namespace: Some("default".into()),
+                resource_version: "1".into(),
+                generation: None,
+                created: None,
+                labels: Box::new([]),
+                cells: Vec::new().into(),
+            });
+            let state = SyncState::Reconnecting {
+                error: Some("dropped".into()),
+            };
+            let hub = manager.hubs.get_or_create("dev", &pods);
+            hub.take_over(KindSnapshot {
+                rows: vec![row],
+                ..KindSnapshot::empty("dev".into(), pods.clone(), state)
+            });
+
+            manager.handle_request(Request::Unsubscribe { id: 1 });
+            assert!(!watches(&manager, &pods));
+            let (_hub, rows) = manager.hubs.subscribe("dev", &pods);
+            assert_eq!(rows.borrow().rows.len(), kept, "with {active} active");
+        }
     }
 
     /// Waits for the client to close `socket`, reading whatever it sent first.
@@ -6300,19 +6272,28 @@ mod tests {
     #[test]
     fn a_directory_that_appears_reloads_settings_and_kubeconfig() {
         let watched = Watched {
+            dirs: HashSet::new(),
             pending: HashSet::from([PathBuf::from("/cfg/dotfiles")]),
             kube: HashSet::from([PathBuf::from("/k/config")]),
             settings: HashSet::from([PathBuf::from("/cfg/dotfiles/flint.toml")]),
             activity: HashSet::from([PathBuf::from("/cfg/agent-activity.jsonl")]),
         };
-        let changed = classify(&[PathBuf::from("/cfg/dotfiles")], &watched);
+        let changed = classify(&[PathBuf::from("/cfg/dotfiles")], false, &watched);
         assert!(changed.rearm && changed.settings && changed.kubeconfig && changed.activity);
-        let changed = classify(&[PathBuf::from("/k/config")], &watched);
+        let changed = classify(&[PathBuf::from("/k/config")], false, &watched);
         assert!(!changed.rearm && !changed.settings && changed.kubeconfig && !changed.activity);
-        let changed = classify(&[PathBuf::from("/cfg/dotfiles/flint.toml")], &watched);
+        let changed = classify(
+            &[PathBuf::from("/cfg/dotfiles/flint.toml")],
+            false,
+            &watched,
+        );
         assert!(!changed.rearm && changed.settings && !changed.kubeconfig && !changed.activity);
         // covers UP-16: an agent's call reloads only the activity log.
-        let changed = classify(&[PathBuf::from("/cfg/agent-activity.jsonl")], &watched);
+        let changed = classify(
+            &[PathBuf::from("/cfg/agent-activity.jsonl")],
+            false,
+            &watched,
+        );
         assert!(!changed.rearm && !changed.settings && !changed.kubeconfig && changed.activity);
     }
 
@@ -6337,6 +6318,226 @@ mod tests {
         assert!(watch_names(&absolute).contains(&real.join("dotfiles/other.toml")));
     }
 
+    /// A manager watching `paths` for real, loaded once.
+    async fn manager_watching(root: &Path, paths: Vec<PathBuf>) -> ClusterManager {
+        let (events, _rx) = crate::events::channel();
+        let config = CoreConfig {
+            config_dir: root.join("flint"),
+            settings: Settings::default(),
+            settings_error: None,
+            kubeconfig_base: paths,
+            home: None,
+            watch_files: true,
+            watch_timing: Default::default(),
+        };
+        let mut manager = ClusterManager::new(
+            config,
+            events,
+            HubRegistry::default(),
+            SessionUnlocks::default(),
+        );
+        manager.arm_watcher();
+        manager.reload_kubeconfig().await;
+        manager
+    }
+
+    /// Runs the manager's internal messages until `context` shows `server` (`None`: is gone).
+    /// Returns as soon as it does, and fails after a limit only a lost event can reach.
+    async fn until_server(manager: &mut ClusterManager, context: &str, server: Option<&str>) {
+        let mut internal = manager.internal_rx.take().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let shown = manager.cluster(context).map(|c| c.info.server.clone());
+            if shown.as_ref().map(|s| s.as_deref()) == server.map(Some) {
+                break;
+            }
+            match tokio::time::timeout_at(deadline, internal.recv()).await {
+                Ok(Some(msg)) => manager.handle_internal(msg).await,
+                _ => panic!("{context} still shows {shown:?}, wanted {server:?}"),
+            }
+        }
+        manager.internal_rx = Some(internal);
+    }
+
+    /// Runs the manager's internal messages until the watches on `dir` have started and the
+    /// read that follows is done, so a later edit can only be seen through a live event.
+    async fn until_watching(manager: &mut ClusterManager, dir: &Path) {
+        let mut internal = manager.internal_rx.take().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let msg = match tokio::time::timeout_at(deadline, internal.recv()).await {
+                Ok(Some(msg)) => msg,
+                _ => panic!("{} is still not watched", dir.display()),
+            };
+            let started = matches!(&msg, Internal::WatchesStarted(dirs) if dirs.contains(dir));
+            manager.handle_internal(msg).await;
+            if started {
+                break;
+            }
+        }
+        manager.internal_rx = Some(internal);
+    }
+
+    /// Points the symlink `link` at `target` in one step, as `ln -sfn` tools do.
+    fn point_link(link: &Path, target: &Path) {
+        let next = link.with_extension("next");
+        std::os::unix::fs::symlink(target, &next).unwrap();
+        std::fs::rename(&next, link).unwrap();
+    }
+
+    /// `root/name/config` defining `dev` at `server`.
+    fn config_in(root: &Path, name: &str, server: &str) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config");
+        std::fs::write(&file, kubeconfig_with(server)).unwrap();
+        file
+    }
+
+    #[tokio::test]
+    async fn a_link_moved_to_another_folder_is_still_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let first = config_in(&root, "a", "https://a");
+        let second = config_in(&root, "b", "https://b");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let mut manager = manager_watching(&root, vec![link.clone()]).await;
+        until_server(&mut manager, "dev", Some("https://a")).await;
+
+        point_link(&link, &second);
+        until_watching(&mut manager, &root.join("b")).await;
+        until_server(&mut manager, "dev", Some("https://b")).await;
+        std::fs::write(&second, kubeconfig_with("https://b-edited")).unwrap();
+        until_server(&mut manager, "dev", Some("https://b-edited")).await;
+    }
+
+    // inotify keeps one watch on a directory whose parent is renamed, under both names.
+    #[tokio::test]
+    async fn a_target_whose_parent_was_renamed_is_still_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let first = config_in(&root, "old/team", "https://a");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let mut manager = manager_watching(&root, vec![link.clone()]).await;
+        until_watching(&mut manager, &root.join("old/team")).await;
+        until_server(&mut manager, "dev", Some("https://a")).await;
+
+        std::fs::rename(root.join("old"), root.join("new")).unwrap();
+        let moved = root.join("new/team/config");
+        point_link(&link, &moved);
+        until_watching(&mut manager, &root.join("new/team")).await;
+        until_server(&mut manager, "dev", Some("https://a")).await;
+        std::fs::write(&moved, kubeconfig_with("https://edited")).unwrap();
+        until_server(&mut manager, "dev", Some("https://edited")).await;
+    }
+
+    // Only a move of what is watched replaces the watcher; a plain edit keeps it.
+    #[test]
+    fn the_watch_plan_changes_only_when_a_link_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let first = config_in(&root, "a", "https://a");
+        let second = config_in(&root, "b", "https://b");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let paths = [link.clone()];
+        let before = Watched::for_files(&paths, &root);
+        std::fs::write(&first, kubeconfig_with("https://a-edited")).unwrap();
+        assert!(before == Watched::for_files(&paths, &root), "an edit");
+        point_link(&link, &second);
+        let after = Watched::for_files(&paths, &root);
+        assert!(before != after, "a move");
+        assert!(after.dirs.contains(&root.join("b")), "{:?}", after.dirs);
+    }
+
+    #[test]
+    fn a_link_cycle_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        assert!(watch_names(&a).contains(&b));
+    }
+
+    #[tokio::test]
+    async fn a_moved_link_in_a_chain_is_still_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let first = config_in(&root, "a", "https://a");
+        let second = config_in(&root, "b", "https://b");
+        std::fs::create_dir(root.join("hops")).unwrap();
+        let (near, far) = (root.join("hops/near"), root.join("hops/far"));
+        std::os::unix::fs::symlink(&first, &far).unwrap();
+        std::os::unix::fs::symlink(&far, &near).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&near, &link).unwrap();
+        let mut manager = manager_watching(&root, vec![link]).await;
+        until_server(&mut manager, "dev", Some("https://a")).await;
+
+        // The last link of the chain moves, not the one the file list names.
+        point_link(&far, &second);
+        until_watching(&mut manager, &root.join("b")).await;
+        until_server(&mut manager, "dev", Some("https://b")).await;
+        std::fs::write(&second, kubeconfig_with("https://b-edited")).unwrap();
+        until_server(&mut manager, "dev", Some("https://b-edited")).await;
+    }
+
+    #[tokio::test]
+    async fn a_link_target_that_disappears_and_returns_is_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let first = config_in(&root, "a", "https://a");
+        let second = config_in(&root, "b", "https://b");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let mut manager = manager_watching(&root, vec![link.clone()]).await;
+        until_server(&mut manager, "dev", Some("https://a")).await;
+        point_link(&link, &second);
+        until_watching(&mut manager, &root.join("b")).await;
+        until_server(&mut manager, "dev", Some("https://b")).await;
+
+        std::fs::remove_dir_all(root.join("b")).unwrap();
+        until_server(&mut manager, "dev", None).await;
+        config_in(&root, "b", "https://b-back");
+        until_watching(&mut manager, &root.join("b")).await;
+        until_server(&mut manager, "dev", Some("https://b-back")).await;
+        std::fs::write(&second, kubeconfig_with("https://b-edited")).unwrap();
+        until_server(&mut manager, "dev", Some("https://b-edited")).await;
+    }
+
+    #[tokio::test]
+    async fn each_of_several_kubeconfig_links_is_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let two = |server: &str| {
+            kubeconfig_with(server)
+                .replace("name: dev", "name: two")
+                .replace("name: c\n", "name: c2\n")
+                .replace("cluster: c\n", "cluster: c2\n")
+        };
+        let kept = config_in(&root, "kept", "https://kept");
+        // In the folder of the link that stays, which must stay watched when this one moves.
+        let first = root.join("kept/first");
+        let second = config_in(&root, "b", "https://b");
+        std::fs::write(&first, two("https://a")).unwrap();
+        std::fs::write(&second, two("https://b")).unwrap();
+        let (one, moved) = (root.join("one"), root.join("moved"));
+        std::os::unix::fs::symlink(&kept, &one).unwrap();
+        std::os::unix::fs::symlink(&first, &moved).unwrap();
+        let mut manager = manager_watching(&root, vec![one, moved.clone()]).await;
+        until_server(&mut manager, "two", Some("https://a")).await;
+
+        point_link(&moved, &second);
+        until_watching(&mut manager, &root.join("b")).await;
+        until_server(&mut manager, "two", Some("https://b")).await;
+        std::fs::write(&second, two("https://b-edited")).unwrap();
+        until_server(&mut manager, "two", Some("https://b-edited")).await;
+        std::fs::write(&kept, kubeconfig_with("https://kept-edited")).unwrap();
+        until_server(&mut manager, "dev", Some("https://kept-edited")).await;
+    }
+
     // covers UP-24
     #[tokio::test]
     async fn a_stopped_follower_asks_for_its_hub_to_be_released() {
@@ -6344,7 +6545,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let crds = KindId::custom_resource_definitions();
         let follower = Follower::new(&hubs, "dev", crds.clone(), &tx);
-        let task = tokio::spawn(follow_crds(follower, tx.clone()));
+        let task = tokio::spawn(follow_crds(follower, 0, tx.clone()));
         // The watch manager stopped the CRD watch while the follower still listened: the hub
         // stays (someone reads it).
         hubs.release("dev", &crds);

@@ -77,9 +77,12 @@ fn none() -> Value {
 }
 
 fn pod_problems(pod: &Pod) -> Vec<Problem> {
-    let mut out = Vec::new();
-    classifier().pod(pod, &mut out);
-    out
+    outage_problems([pod])
+}
+
+/// The problems of `pods` with the ReplicaSets stated as unreadable.
+fn outage_problems<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> Vec<Problem> {
+    classifier().pods_with_replica_sets(pods, &ReplicaSetIndex::unavailable())
 }
 
 #[test]
@@ -719,7 +722,11 @@ fn identity_survives_restarts_and_changes_with_the_object() {
     assert_ne!(first.id, recreated.id, "a recreated pod is a new problem");
 
     let mut other_cluster = Vec::new();
-    Classifier::new("cluster-b", now()).pod(&crash_looping_pod("uid-1", 3, 5), &mut other_cluster);
+    Classifier::new("cluster-b", now()).pod_with_replica_sets(
+        &crash_looping_pod("uid-1", 3, 5),
+        &ReplicaSetIndex::unavailable(),
+        &mut other_cluster,
+    );
     assert_ne!(
         first.id, other_cluster[0].id,
         "the cluster is part of identity"
@@ -754,8 +761,7 @@ fn a_loop_keeps_its_identity_through_its_short_runs() {
 #[test]
 fn a_notifier_can_tell_new_reported_and_returned_problems_apart() {
     let ids = |pods: &[&Pod]| -> HashSet<ProblemId> {
-        classifier()
-            .pods(pods.iter().copied())
+        outage_problems(pods.iter().copied())
             .into_iter()
             .map(|p| p.id)
             .collect()
@@ -1626,7 +1632,7 @@ fn ten_thousand_pods_classify_quickly() {
         .collect();
 
     let started = Instant::now();
-    let problems = classifier().pods(&pods);
+    let problems = outage_problems(&pods);
     let elapsed = started.elapsed();
 
     assert_eq!(problems.len(), PODS / BROKEN_EVERY);
@@ -1825,7 +1831,7 @@ fn a_pod_problem_resolves_its_replica_set_to_the_deployment() {
 #[test]
 fn an_owner_is_carried_for_every_subject_and_is_not_identity() {
     let pod = replica_set_pod("ns", "rs-uid");
-    let plain = classifier().pods([&pod]);
+    let plain = outage_problems([&pod]);
     assert_eq!(plain[0].owner, owner("apps", "ReplicaSet", "web-abc12"));
 
     let replica_sets = [replica_set_meta("ns", "rs-uid", "web")];
@@ -1840,7 +1846,7 @@ fn an_owner_is_carried_for_every_subject_and_is_not_identity() {
     }]))
     .unwrap();
     assert_eq!(
-        classifier().pods([&job_pod])[0].owner,
+        outage_problems([&job_pod])[0].owner,
         owner("batch", "Job", "backup")
     );
 
@@ -1913,9 +1919,141 @@ fn an_index_tells_a_read_replica_set_from_an_unknown_one() {
         assert_eq!(resolved(&pod, &index), (replica_set.clone(), false));
     }
     assert!(
-        !classifier().pods([&pod])[0].owner_known,
-        "the plain entry point cannot pass a ReplicaSet off as a known owner"
+        !outage_problems([&pod])[0].owner_known,
+        "an outage cannot pass a ReplicaSet off as a known owner"
     );
+}
+
+/// A ReplicaSet object as a caller would hold it, controlled by Deployment `web`.
+fn typed_replica_set(namespace: &str, uid: &str) -> ReplicaSet {
+    ReplicaSet {
+        metadata: replica_set_meta(namespace, uid, "web"),
+        ..ReplicaSet::default()
+    }
+}
+
+#[test]
+fn a_complete_read_resolves_a_pod_through_its_replica_set_to_the_deployment() {
+    let pod = replica_set_pod("ns", "rs-uid");
+    let read = [typed_replica_set("ns", "rs-uid")];
+    let index = ReplicaSetIndex::from_read(ReplicaSetRead::Complete(&read));
+    assert_eq!(
+        resolved(&pod, &index),
+        (owner("apps", "Deployment", "web"), true)
+    );
+}
+
+#[test]
+fn a_replica_set_missing_from_a_complete_read_is_an_unknown_owner() {
+    let pod = replica_set_pod("ns", "rs-uid");
+    let others = [typed_replica_set("ns", "rs-other")];
+    for read in [&others[..], &[]] {
+        let index = ReplicaSetIndex::from_read(ReplicaSetRead::Complete(read));
+        assert_eq!(
+            resolved(&pod, &index),
+            (owner("apps", "ReplicaSet", "web-abc12"), false)
+        );
+    }
+}
+
+#[test]
+fn a_partial_or_failed_read_resolves_no_owner() {
+    let pod = replica_set_pod("ns", "rs-uid");
+    let held = [typed_replica_set("ns", "rs-uid")];
+    for read in [ReplicaSetRead::Partial(&held), ReplicaSetRead::Failed] {
+        let index = ReplicaSetIndex::from_read(read);
+        assert_eq!(
+            resolved(&pod, &index),
+            (owner("apps", "ReplicaSet", "web-abc12"), false),
+            "{read:?}"
+        );
+    }
+}
+
+#[test]
+fn an_outage_leaves_crash_oom_and_image_pull_unchecked_rather_than_healthy() {
+    use crate::alerts::{AlertConfig, AlertEngine, ClusterSnapshot, OpenAlertState};
+
+    let with_owner = |container: Value, uid: &str, rs_uid: &str| {
+        let mut pod = pod_with(
+            "Running",
+            json!([]),
+            json!([container]),
+            json!({"uid": uid, "creationTimestamp": ago(30)}),
+        );
+        pod.metadata.owner_references = replica_set_pod("ns", rs_uid).metadata.owner_references;
+        pod
+    };
+    let pods = [
+        with_owner(
+            status(5, waiting("CrashLoopBackOff"), ended("Error", 1, 4, 3)),
+            "uid-crash",
+            "rs-crash",
+        ),
+        with_owner(
+            status(1, running(5), ended("OOMKilled", 137, 20, 6)),
+            "uid-oom",
+            "rs-oom",
+        ),
+        with_owner(
+            status(0, waiting("ImagePullBackOff"), none()),
+            "uid-pull",
+            "rs-pull",
+        ),
+    ];
+    let read = [
+        typed_replica_set("ns", "rs-crash"),
+        typed_replica_set("ns", "rs-oom"),
+        typed_replica_set("ns", "rs-pull"),
+    ];
+    let complete = ReplicaSetIndex::from_read(ReplicaSetRead::Complete(&read));
+    let found = classifier().pods_with_replica_sets(&pods, &complete);
+    let kinds: Vec<_> = found.iter().map(Problem::kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            ProblemKind::CrashLoop,
+            ProblemKind::OomKilled,
+            ProblemKind::ImagePull
+        ]
+    );
+
+    let mut engine = AlertEngine::new(AlertConfig {
+        cooldown: SignedDuration::from_secs(10 * 60),
+        burst_limit: 10,
+        burst_window: SignedDuration::from_secs(5 * 60),
+        unavailable_after: SignedDuration::from_secs(2 * 60),
+        alert_on_existing: false,
+    });
+    let cluster: Arc<str> = Arc::from("cluster-a");
+    let at = |minute: i64| now() + SignedDuration::from_secs(minute * 60);
+    let baseline = engine
+        .observe(&cluster, at(0), ClusterSnapshot::complete(&[]))
+        .unwrap();
+    assert!(baseline.is_empty());
+    let raised = engine
+        .observe(&cluster, at(1), ClusterSnapshot::complete(&found))
+        .unwrap();
+    assert_eq!(raised.len(), 3);
+
+    for read in [ReplicaSetRead::Partial(&read), ReplicaSetRead::Failed] {
+        let index = ReplicaSetIndex::from_read(read);
+        let during = classifier().pods_with_replica_sets(&pods, &index);
+        assert_eq!(during.len(), 3, "the problems are still reported");
+        assert!(during.iter().all(|problem| !problem.owner_known));
+        for minute in 2..=30 {
+            let events = engine
+                .observe(&cluster, at(minute), ClusterSnapshot::complete(&during))
+                .unwrap();
+            assert!(events.is_empty(), "minute {minute}: {events:?}");
+        }
+        let open = engine.open("cluster-a");
+        assert_eq!(open.len(), 3, "nothing resolves during an outage");
+        assert!(
+            open.iter()
+                .all(|alert| alert.state == OpenAlertState::Unknown)
+        );
+    }
 }
 
 #[test]
@@ -1928,6 +2066,6 @@ fn only_a_replica_set_owner_can_be_unknown() {
     .unwrap();
     let bare = crash_looping_pod("uid-2", CRASH_LOOP_MIN_RESTARTS, 1);
     for pod in [&stateful, &bare] {
-        assert!(classifier().pods([pod])[0].owner_known);
+        assert!(outage_problems([pod])[0].owner_known);
     }
 }

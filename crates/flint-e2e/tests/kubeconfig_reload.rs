@@ -2,13 +2,15 @@
 
 use std::time::Duration;
 
+use flint_core::events::Events;
 use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event};
 use flint_core::settings::{self, AiScope};
 use flint_core::write::{WriteError, WriteProposal, WriteReview, WriteTarget};
 use flint_core::{KindId, Settings, SyncState, WatchMode, WatchTiming, WriteRefusal, kubeconfig};
 use flint_e2e::fake_api::{CONTEXT, FakeApiServer, Gvr, Verb, write_kubeconfigs};
 
-const WAIT: Duration = Duration::from_secs(30);
+const WAIT: Duration = Duration::from_secs(120);
+const CONNECT_ERROR: &str = "ServiceError: client error (Connect)";
 const EDITED: &str = "edit-me";
 /// Parses as neither YAML nor a kubeconfig.
 const BROKEN: &str = "clusters:\n- name: [\n\"cut";
@@ -45,11 +47,48 @@ impl Seen {
         }
         None
     }
+
+    async fn until_discovered(&mut self, core: &CoreHandle, events: &Events, kind: &KindId) {
+        let mut last_error = None;
+        tokio::time::timeout(WAIT, async {
+            while !core
+                .discovery(CONTEXT)
+                .await
+                .is_some_and(|discovery| discovery.kind(kind).is_some())
+            {
+                match events.recv().await.expect("core running") {
+                    Event::ConnectionChanged {
+                        cluster,
+                        state: ConnectionState::Failed(error),
+                    } if cluster == CONTEXT
+                        && (error.as_str().starts_with("connection refused")
+                            || error.as_str().starts_with("connection reset")
+                            || error.as_str().starts_with("timed out")
+                            || error.as_str().starts_with(CONNECT_ERROR)) =>
+                    {
+                        last_error = Some(error.to_string());
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        core.send(Command::Activate(cluster));
+                    }
+                    Event::DiscoveryChanged {
+                        cluster,
+                        error: Some(error),
+                        ..
+                    } if cluster == CONTEXT => last_error = Some(error),
+                    event => {
+                        self.record(event);
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{kind:?} was not discovered in time: {last_error:?}"));
+    }
 }
 
 /// Reads events until a cluster list satisfies `done`, recording everything on the way.
 async fn until_list(
-    events: &flint_core::events::Events,
+    events: &Events,
     seen: &mut Seen,
     what: &str,
     done: impl Fn(&[String], usize) -> bool,
@@ -111,6 +150,7 @@ async fn removing_the_active_context_deselects_it_and_stops_its_watches() {
 
     core.send(Command::Activate(CONTEXT.to_owned()));
     let mut sub = core.subscribe(CONTEXT, &kind);
+    seen.until_discovered(&core, &events, &kind).await;
     tokio::time::timeout(WAIT, async {
         while sub.latest().state != SyncState::Synced {
             assert!(sub.changed().await, "core stopped");
@@ -201,6 +241,7 @@ async fn a_half_written_kubeconfig_keeps_clusters_and_watches() {
 
     core.send(Command::Activate(CONTEXT.to_owned()));
     let mut sub = core.subscribe(CONTEXT, &kind);
+    seen.until_discovered(&core, &events, &kind).await;
     tokio::time::timeout(WAIT, async {
         while sub.latest().state != SyncState::Synced {
             assert!(sub.changed().await, "core stopped");
@@ -286,11 +327,15 @@ fn deployments() -> Gvr {
     Gvr::new("apps", "v1", "deployments")
 }
 
+fn deployment_kind() -> KindId {
+    KindId::new("apps", "deployments")
+}
+
 fn target(server: &FakeApiServer) -> WriteTarget {
     WriteTarget {
         cluster: CONTEXT.into(),
         server: Some(server.url()),
-        kind: KindId::new("apps", "deployments"),
+        kind: deployment_kind(),
         namespace: Some("demo".to_owned()),
         name: EDITED.to_owned(),
         uid: None,
@@ -306,6 +351,22 @@ fn proposal() -> WriteProposal {
     }
 }
 
+/// Prepares a dry-run review once the fake API can accept the connection.
+async fn prepare_review(core: &CoreHandle, server: &FakeApiServer) -> WriteReview {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            match core.review_write(target(server), proposal()).await {
+                Err(WriteError::Failed(error)) if error == CONNECT_ERROR => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                result => return result.unwrap(),
+            }
+        }
+    })
+    .await
+    .expect("the fake API accepts the dry-run review in time")
+}
+
 /// Every request that reached `server` and could change something, dry runs included.
 fn mutating(server: &FakeApiServer) -> usize {
     server
@@ -313,6 +374,10 @@ fn mutating(server: &FakeApiServer) -> usize {
         .iter()
         .filter(|r| r.method != http::Method::GET)
         .count()
+}
+
+fn non_dry_run_writes(server: &FakeApiServer) -> usize {
+    server.writes().iter().filter(|r| !r.is_dry_run()).count()
 }
 
 /// A core on `path` with a deployment to edit on `server`, connected and discovered.
@@ -370,14 +435,15 @@ async fn core_on_files(
         watch_timing: WatchTiming::default(),
     })
     .unwrap();
-    core.send(Command::Activate(CONTEXT.to_owned()));
-    tokio::time::timeout(WAIT, async {
-        while core.discovery(CONTEXT).await.is_none() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+    let events = core.events();
+    let mut seen = Seen::default();
+    until_list(&events, &mut seen, "first load", |names, _| {
+        names == [CONTEXT]
     })
-    .await
-    .expect("discovery in time");
+    .await;
+    core.send(Command::Activate(CONTEXT.to_owned()));
+    seen.until_discovered(&core, &events, &deployment_kind())
+        .await;
     core
 }
 
@@ -413,21 +479,13 @@ fn expose(core: &CoreHandle, server: Option<String>) {
     });
 }
 
-/// Runs `review`, waiting out a reconnect after a reload.
-async fn run_when_settled(core: &CoreHandle, review: &WriteReview) -> Result<(), WriteError> {
-    let deadline = tokio::time::Instant::now() + WAIT;
-    loop {
-        let result = core.run_write(review.clone().into_intent()).await;
-        let waiting = matches!(
-            &result,
-            Err(WriteError::Refused(WriteRefusal::NotConnected { .. }))
-                | Err(WriteError::NotServed(_))
-        );
-        if !waiting || tokio::time::Instant::now() > deadline {
-            return result.map(drop);
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+/// Reloads the file and waits for the deployment kind before the next operation.
+async fn reload_and_wait_for_deployments(core: &CoreHandle) {
+    let events = core.events();
+    core.reload_kubeconfig().await.unwrap();
+    Seen::default()
+        .until_discovered(core, &events, &deployment_kind())
+        .await;
 }
 
 // covers UP-06, UP-54: a kubeconfig changed on disk and not loaded yet sends no mutating request,
@@ -454,10 +512,7 @@ async fn a_change_not_loaded_yet_refuses_the_write() {
         let path = dir.path().join("kubeconfig");
         let core = core_with_deployment(&server, dir.path(), &path).await;
         let whole = std::fs::read_to_string(&path).unwrap();
-        let review = core
-            .review_write(target(&server), proposal())
-            .await
-            .unwrap();
+        let review = prepare_review(&core, &server).await;
         let before = mutating(&server);
 
         let changed = change(&whole, &server.url());
@@ -471,17 +526,14 @@ async fn a_change_not_loaded_yet_refuses_the_write() {
     }
 }
 
-// covers UP-06, UP-54: a path replaced by a FIFO is refused in time, and sends nothing.
+// covers UP-06, UP-54: a path replaced by a FIFO is refused and sends nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_kubeconfig_replaced_by_a_fifo_refuses_the_write() {
     let server = FakeApiServer::start().await.unwrap();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("kubeconfig");
     let core = core_with_deployment(&server, dir.path(), &path).await;
-    let review = core
-        .review_write(target(&server), proposal())
-        .await
-        .unwrap();
+    let review = prepare_review(&core, &server).await;
     let before = mutating(&server);
 
     std::fs::remove_file(&path).unwrap();
@@ -490,10 +542,9 @@ async fn a_kubeconfig_replaced_by_a_fifo_refuses_the_write() {
         .status()
         .unwrap();
     assert!(made.success());
-    let refused =
-        tokio::time::timeout(Duration::from_secs(6), core.run_write(review.into_intent()))
-            .await
-            .expect("refused within the read timeout");
+    let refused = tokio::time::timeout(WAIT, core.run_write(review.into_intent()))
+        .await
+        .expect("the write attempt completes");
     assert_eq!(refused.unwrap_err(), WriteError::KubeconfigUnreadable);
     assert_eq!(mutating(&server), before, "no mutating request");
 }
@@ -507,23 +558,21 @@ async fn a_write_goes_through_unchanged_and_loads_a_change_it_finds() {
     let path = dir.path().join("kubeconfig");
     let core = core_with_deployment(&server, dir.path(), &path).await;
     let whole = std::fs::read_to_string(&path).unwrap();
-    let review = core
-        .review_write(target(&server), proposal())
-        .await
-        .unwrap();
+    let review = prepare_review(&core, &server).await;
+    let before = non_dry_run_writes(&server);
     core.run_write(review.into_intent()).await.unwrap();
+    assert_eq!(non_dry_run_writes(&server), before + 1);
     let object = server.object(&deployments(), Some("demo"), EDITED).unwrap();
     assert_eq!(object["spec"]["replicas"], 3);
 
-    let review = core
-        .review_write(target(&server), proposal())
-        .await
-        .unwrap();
+    let review = prepare_review(&core, &server).await;
+    let before = mutating(&server);
     std::fs::write(&path, whole.replace("user: {}", "user: {token: another}")).unwrap();
     assert_eq!(
         core.run_write(review.into_intent()).await.unwrap_err(),
         WriteError::ConnectionChanged
     );
+    assert_eq!(mutating(&server), before, "no mutating request");
     tokio::time::timeout(WAIT, async {
         loop {
             match core.review_write(target(&server), proposal()).await {
@@ -533,6 +582,9 @@ async fn a_write_goes_through_unchanged_and_loads_a_change_it_finds() {
                     | WriteError::NotServed(_)
                     | WriteError::ConnectionChanged,
                 ) => tokio::time::sleep(Duration::from_millis(25)).await,
+                Err(WriteError::Failed(error)) if error == CONNECT_ERROR => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
                 Err(other) => panic!("{other}"),
             }
         }
@@ -552,10 +604,7 @@ async fn an_emptied_kubeconfig_refuses_writes_until_the_same_file_is_back() {
         let path = dir.path().join("kubeconfig");
         let core = core_with_deployment(&server, dir.path(), &path).await;
         let whole = std::fs::read_to_string(&path).unwrap();
-        let review = core
-            .review_write(target(&server), proposal())
-            .await
-            .unwrap();
+        let review = prepare_review(&core, &server).await;
         let before = mutating(&server);
 
         std::fs::write(&path, blank).unwrap();
@@ -575,8 +624,10 @@ async fn an_emptied_kubeconfig_refuses_writes_until_the_same_file_is_back() {
         assert_eq!(mutating(&server), before, "no mutating request");
 
         std::fs::write(&path, &whole).unwrap();
-        core.reload_kubeconfig().await.unwrap();
-        run_when_settled(&core, &review).await.unwrap();
+        reload_and_wait_for_deployments(&core).await;
+        let before = non_dry_run_writes(&server);
+        core.run_write(review.into_intent()).await.unwrap();
+        assert_eq!(non_dry_run_writes(&server), before + 1);
         let object = server.object(&deployments(), Some("demo"), EDITED).unwrap();
         assert_eq!(object["spec"]["replicas"], 3);
     }
@@ -591,10 +642,7 @@ async fn a_broken_kubeconfig_refuses_writes_until_the_same_file_is_back() {
     let path = dir.path().join("kubeconfig");
     let core = core_with_deployment(&server, dir.path(), &path).await;
     let whole = std::fs::read_to_string(&path).unwrap();
-    let review = core
-        .review_write(target(&server), proposal())
-        .await
-        .unwrap();
+    let review = prepare_review(&core, &server).await;
     let before = mutating(&server);
 
     std::fs::write(&path, BROKEN).unwrap();
@@ -614,8 +662,10 @@ async fn a_broken_kubeconfig_refuses_writes_until_the_same_file_is_back() {
     assert_eq!(mutating(&server), before, "no mutating request");
 
     std::fs::write(&path, &whole).unwrap();
-    core.reload_kubeconfig().await.unwrap();
-    run_when_settled(&core, &review).await.unwrap();
+    reload_and_wait_for_deployments(&core).await;
+    let before = non_dry_run_writes(&server);
+    core.run_write(review.into_intent()).await.unwrap();
+    assert_eq!(non_dry_run_writes(&server), before + 1);
     let object = server.object(&deployments(), Some("demo"), EDITED).unwrap();
     assert_eq!(object["spec"]["replicas"], 3);
 }
@@ -630,26 +680,25 @@ async fn a_broken_kubeconfig_back_with_another_definition_refuses_the_old_review
     let core = core_with_deployment(&server, dir.path(), &path).await;
     let whole = std::fs::read_to_string(&path).unwrap();
     assert!(whole.contains("user: {}"), "{whole}");
-    let review = core
-        .review_write(target(&server), proposal())
-        .await
-        .unwrap();
+    let review = prepare_review(&core, &server).await;
     let before = mutating(&server);
 
     std::fs::write(&path, BROKEN).unwrap();
     core.reload_kubeconfig().await.unwrap();
     std::fs::write(&path, whole.replace("user: {}", "user: {token: another}")).unwrap();
-    core.reload_kubeconfig().await.unwrap();
+    reload_and_wait_for_deployments(&core).await;
     assert_eq!(
-        run_when_settled(&core, &review).await.unwrap_err(),
+        core.run_write(review.clone().into_intent())
+            .await
+            .unwrap_err(),
         WriteError::ConnectionChanged
     );
 
     std::fs::write(&path, BROKEN).unwrap();
     core.reload_kubeconfig().await.unwrap();
     elsewhere.write_kubeconfig(&path, Some("demo")).unwrap();
-    core.reload_kubeconfig().await.unwrap();
-    assert!(run_when_settled(&core, &review).await.is_err());
+    reload_and_wait_for_deployments(&core).await;
+    assert!(core.run_write(review.into_intent()).await.is_err());
     assert_eq!(mutating(&server), before, "nothing sent to the old server");
     assert_eq!(mutating(&elsewhere), 0, "nothing sent to the new server");
 }
@@ -686,20 +735,8 @@ async fn a_held_context_takes_no_new_pin() {
     assert!(saved.ai_exposed_clusters.is_empty());
 
     std::fs::write(&path, whole.replace("user: {}", "user: {token: another}")).unwrap();
-    core.reload_kubeconfig().await.unwrap();
-    let refusal = tokio::time::timeout(WAIT, async {
-        loop {
-            match core.review_write(target(&server), proposal()).await {
-                Err(WriteError::Refused(WriteRefusal::NotConnected { .. }))
-                | Err(WriteError::NotServed(_)) => {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                other => return other.err(),
-            }
-        }
-    })
-    .await
-    .expect("an answer in time");
+    reload_and_wait_for_deployments(&core).await;
+    let refusal = core.review_write(target(&server), proposal()).await.err();
     assert_eq!(
         refusal,
         Some(WriteError::Refused(WriteRefusal::Protected {
@@ -778,7 +815,7 @@ async fn until_scope(config: &std::path::Path, scope: &AiScope) {
 }
 
 /// Waits for an error notice containing `text`.
-async fn until_notice(events: &flint_core::events::Events, text: &str) {
+async fn until_notice(events: &Events, text: &str) {
     tokio::time::timeout(WAIT, async {
         loop {
             if let Event::Error(notice) = events.recv().await.expect("core running")

@@ -3,6 +3,7 @@
 //! pane, above the bottom dock (log tabs, which outlive cluster switches).
 
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 
 use flint_core::redact::safe_error_summary;
@@ -2623,7 +2624,8 @@ fn trust_dialog(shown: &str, context: &str, server: &str, previous: Option<&str>
 /// Asks before exposing a cluster to AI agents (or before changing what they may read of an
 /// exposed one), naming the context and the server it points at, with the scope pickers under
 /// the text. Confirming runs `save` with the context, the server and the scope checked: one
-/// write of the entry and its scope.
+/// write of the entry and its scope. A scope with nothing chosen cannot be confirmed, and one
+/// that adds access to what is saved asks again, naming what it adds.
 fn confirm_expose(
     window: &mut Window,
     cx: &mut App,
@@ -2634,16 +2636,60 @@ fn confirm_expose(
     save: impl Fn(&mut ClustersModel, String, String, AiScope) + 'static,
 ) {
     let content = picker.clone().into();
-    confirm::open_with(window, cx, dialog, Some(content), move |window, cx| {
+    let state = {
+        let picker = picker.clone();
+        move |cx: &App| picker.read(cx).confirm_state(cx)
+    };
+    let save = Rc::new(save);
+    confirm::open_gated(window, cx, dialog, content, state, move |window, cx| {
         // A name still typed in the namespace field is added first; one that is not a
-        // namespace name keeps the dialog open, saying so, rather than being dropped (which,
-        // with nothing checked, would expose every namespace).
+        // namespace name keeps the dialog open, saying so, rather than being dropped.
         let Ok(scope) = picker.update(cx, |p, cx| p.confirmed_scope(window, cx)) else {
             return false;
         };
-        model.update(cx, |m, _| save(m, context.clone(), server.clone(), scope));
-        true
+        let added = picker.read(cx).added_access(&scope);
+        if added.is_empty() {
+            model.update(cx, |m, _| save(m, context.clone(), server.clone(), scope));
+            return true;
+        }
+        let question = broaden_dialog(&context, &server, &added, &scope);
+        let (model, save, context, server) =
+            (model.clone(), save.clone(), context.clone(), server.clone());
+        let answered = std::cell::Cell::new(false);
+        // The context and server stay on show, however long the list of what is added.
+        confirm::open_pinned(window, cx, question, 2, move |window, cx| {
+            if answered.replace(true) {
+                return;
+            }
+            let scope = scope.clone();
+            model.update(cx, |m, _| save(m, context.clone(), server.clone(), scope));
+            // This question closes by itself; the pickers under it close with it.
+            window.defer(cx, |window, cx| {
+                gpui_kit::component::WindowExt::close_dialog(window, cx)
+            });
+        });
+        false
     });
+}
+
+/// Asks before a save that lets agents read more than the saved scope, naming what it adds.
+/// Enter goes back to the pickers: only the button accepts it.
+fn broaden_dialog(context: &str, server: &str, added: &[String], scope: &AiScope) -> DialogText {
+    let context = flint_core::display::single_line(context);
+    let server = flint_core::redact::server_url(server);
+    let added = flint_core::display::single_line(&added.join("; "));
+    let grant = flint_core::display::single_line(&scope_picker::summary(scope));
+    DialogText {
+        title: "Give AI agents more access?".into(),
+        text: format!(
+            "This adds: {added}.\n\nAgents will be able to read {grant}.\n\n\
+             Context: {context}\nServer: {server}"
+        ),
+        ok: "Add Access".into(),
+        cancel: "Go Back".into(),
+        id: "scope-broaden-description",
+        default_cancel: true,
+    }
 }
 
 /// The Edit AI Scope dialog of an exposed cluster: what agents may read now, and the pickers.
@@ -2653,9 +2699,8 @@ fn scope_dialog(context: &str, server: &str, scope: &AiScope) -> DialogText {
     DialogText {
         title: "What may AI agents read?".into(),
         text: format!(
-            "Agents using Flint's MCP server read only the namespaces and kinds checked below; \
-             anything else looks to them as if the cluster were not exposed. Nothing checked \
-             means everything. Now: {}.\n\n\
+            "Agents using Flint's MCP server read only the namespaces and kinds chosen below; \
+             anything else looks to them as if the cluster were not exposed. Now: {}.\n\n\
              Context: {context}\nServer: {server}",
             scope_picker::summary(scope)
         ),

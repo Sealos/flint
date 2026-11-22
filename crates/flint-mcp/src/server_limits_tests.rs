@@ -604,7 +604,8 @@ async fn a_call_that_names_a_context_keeps_its_key_unconnected() {
     let records = records();
     assert_eq!(records[0].cluster_key, Some(cluster_key("token:prod")));
     assert_eq!(records[1].cluster_key, Some(cluster_key("token:staging")));
-    assert_ne!(records[2].cluster_key, Some(cluster_key("token:other")));
+    assert_eq!(records[2].cluster.as_deref(), Some("…(+11 bytes)"));
+    assert_eq!(records[2].cluster_key, None);
 }
 
 // covers UP-16: a refused call's arguments are unvalidated, so its record holds the tool and the
@@ -801,16 +802,18 @@ async fn a_probe_past_the_deadline_keeps_its_clusters() {
 }
 
 /// A server answering every request with a 403 whose message is `message`.
-async fn forbidding_server(message: &'static str) -> String {
+async fn forbidding_server(message: impl Into<std::sync::Arc<str>>) -> String {
+    let message: std::sync::Arc<str> = message.into();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
+            let message = std::sync::Arc::clone(&message);
             tokio::spawn(async move {
                 let mut request = [0; 4096];
                 let _ = socket.read(&mut request).await;
                 let body = json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
-                    "message": message, "reason": "Forbidden", "code": 403})
+                    "message": &*message, "reason": "Forbidden", "code": 403})
                 .to_string();
                 let response = format!(
                     "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\n\
@@ -870,4 +873,206 @@ async fn a_cluster_row_tidies_a_labelled_server_path() {
     let shown = row["server"].as_str().expect("a server");
     assert!(shown.starts_with(&url), "{row}");
     assert!(!shown.contains("example-value"), "{row}");
+}
+
+// covers UP-16: a server message is shortened after it is tidied, wherever the cut falls.
+#[tokio::test]
+async fn a_cluster_row_tidies_a_url_across_the_cut() {
+    for pad in 230..=300 {
+        let dir = tempfile::tempdir().unwrap();
+        let message = format!(
+            "{} postgres://admin:example-value-123@db.internal:5432/app",
+            "x".repeat(pad)
+        );
+        let url = forbidding_server(message).await;
+        let server = server(dir.path(), Some(&url), Limits::default());
+        let row = cluster_row(&server).await;
+        let error = row["error"].as_str().expect("the probe failed");
+        assert!(!error.contains("exam"), "pad {pad}: {row}");
+    }
+}
+
+/// The records and the raw log left by `calls`, sent in order.
+async fn recorded(calls: &[(&str, Value)]) -> (Vec<flint_core::activity::ActivityRecord>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let server = server(dir.path(), None, Limits::default());
+    let mut client = Client::start(&server, 64 * 1024).await;
+    for (id, (tool, arguments)) in (1..).zip(calls) {
+        client.call(id, tool, arguments.clone()).await;
+        client.next().await;
+    }
+    let records = || flint_core::activity::read(dir.path());
+    wait_for("the calls are recorded", || records().len() == calls.len()).await;
+    let log = std::fs::read_to_string(dir.path().join("agent-activity.jsonl"));
+    (records(), log.unwrap())
+}
+
+// covers UP-16: a value that is no name is recorded by its size, whether or not the call's
+// other arguments were accepted, and the call is still listed.
+#[tokio::test]
+async fn a_value_that_is_no_name_is_recorded_by_size() {
+    let value = r#"{"apiVersion":"v1","kind":"Secret","data":{"session":"b3BhcXVlLXZhbHVl"}}"#;
+    let size = format!("…(+{} bytes)", value.len());
+    let multiline = "web\nnext";
+    let calls = [
+        (
+            "get_events",
+            json!({"cluster": "silent", "object_name": value, "limit": 5}),
+        ),
+        (
+            "get_events",
+            json!({"cluster": "silent", "object_name": value, "limit": "x"}),
+        ),
+        (
+            "get_events",
+            json!({"cluster": "silent", "namespace": value}),
+        ),
+        (
+            "get_events",
+            json!({"cluster": "silent", "object_kind": value}),
+        ),
+        (
+            "get_pod_logs",
+            json!({"cluster": "silent", "namespace": "web", "pod": "web-1", "container": value}),
+        ),
+        ("get_events", json!({"cluster": value})),
+        (
+            "get_events",
+            json!({"cluster": "silent", "object_kind": "Pod.Debug"}),
+        ),
+        (
+            "get_pod_logs",
+            json!({"cluster": "silent", "namespace": "web", "pod": "Bad_Pod"}),
+        ),
+        (
+            "get_events",
+            json!({"cluster": "silent", "object_name": multiline, "limit": 5}),
+        ),
+        (
+            "get_events",
+            json!({"cluster": "silent", "object_name": multiline, "limit": "x"}),
+        ),
+        ("list_resource_kinds", json!({"cluster": "a\u{1b}[2Jb"})),
+    ];
+    let (records, log) = recorded(&calls).await;
+    assert!(!log.contains("b3BhcXVlLXZhbHVl"), "{log}");
+    assert_eq!(records[0].name.as_ref(), Some(&size));
+    assert_eq!(records[1].name.as_ref(), Some(&size));
+    assert_eq!(records[2].namespace.as_ref(), Some(&size));
+    assert_eq!(records[3].kind.as_ref(), Some(&size));
+    assert_eq!(records[4].container.as_ref(), Some(&size));
+    assert_eq!(records[5].cluster.as_ref(), Some(&size));
+    assert_eq!(records[6].kind.as_deref(), Some("…(+9 bytes)"));
+    assert_eq!(records[7].name.as_deref(), Some("…(+7 bytes)"));
+    assert_eq!(records[8].name.as_deref(), Some("…(+8 bytes)"));
+    assert_eq!(records[9].name, records[8].name);
+    assert_eq!(records[10].cluster.as_deref(), Some("…(+6 bytes)"));
+    assert_eq!(records[10].cluster_key, None);
+}
+
+// covers UP-16: ordinary names are recorded as written.
+#[tokio::test]
+async fn valid_names_are_recorded_as_written() {
+    let calls = [
+        (
+            "get_events",
+            json!({"cluster": "silent", "namespace": "web", "object_name": "web-1",
+                "object_kind": "Pod", "limit": 5}),
+        ),
+        (
+            "get_events",
+            json!({"cluster": "silent", "object_name": "system:controller:job", "limit": "x"}),
+        ),
+        (
+            "get_pod_logs",
+            json!({"cluster": "silent", "namespace": "web", "pod": "web-1", "container": "app"}),
+        ),
+        (
+            "get_resource",
+            json!({"cluster": "team/gone", "kind": "deployments.apps", "name": "web"}),
+        ),
+    ];
+    let (records, log) = recorded(&calls).await;
+    assert_eq!(records[0].cluster.as_deref(), Some("silent"));
+    assert_eq!(
+        records[0].cluster_key,
+        Some(flint_core::activity::cluster_key("silent"))
+    );
+    assert_eq!(records[0].namespace.as_deref(), Some("web"));
+    assert_eq!(records[0].name.as_deref(), Some("web-1"));
+    assert_eq!(records[0].kind.as_deref(), Some("Pod"));
+    assert_eq!(records[1].name.as_deref(), Some("system:controller:job"));
+    assert_eq!(records[2].container.as_deref(), Some("app"));
+    assert_eq!(records[3].cluster.as_deref(), Some("…(+9 bytes)"));
+    assert_eq!(records[3].cluster_key, None);
+    assert!(!log.contains("team/gone"), "{log}");
+    assert_eq!(records[3].kind.as_deref(), Some("deployments.apps"));
+}
+
+// covers UP-16: a context's name is kept whatever its characters, so its tab lists the call.
+#[tokio::test]
+async fn a_context_with_any_name_keeps_its_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let name = "team a/password=placeholder-context";
+    std::fs::write(
+        dir.path().join("kubeconfig"),
+        format!(
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: \
+             http://127.0.0.1:1\nusers:\n- name: u\n  user:\n    token: not-a-real-token\n\
+             contexts:\n- name: {name}\n  context:\n    cluster: c\n    user: u\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("settings.toml"), "").unwrap();
+    let server = FlintMcp::with_limits(
+        dir.path().to_owned(),
+        vec![dir.path().join("kubeconfig")],
+        None,
+        Limits::default(),
+    );
+    let mut client = Client::start(&server, 64 * 1024).await;
+    client
+        .call(1, "list_resource_kinds", json!({"cluster": name}))
+        .await;
+    client.next().await;
+    let records = || flint_core::activity::read(dir.path());
+    wait_for("the call is recorded", || records().len() == 1).await;
+    let record = &records()[0];
+    assert_eq!(
+        record.cluster.as_deref(),
+        Some("team a/password=[REDACTED:password]")
+    );
+    assert_eq!(
+        record.cluster_key,
+        Some(flint_core::activity::cluster_key(name))
+    );
+}
+
+#[test]
+fn a_padded_kind_selector_is_recorded_as_the_kind_it_read() {
+    let recorded = |tool: &str, kind: &str| {
+        let record = flint_core::activity::ActivityRecord {
+            at_ms: 0,
+            tool: tool.into(),
+            cluster: None,
+            server: None,
+            kind: Some(kind.into()),
+            namespace: None,
+            name: None,
+            container: None,
+            items: None,
+            bytes: 0,
+            truncated: false,
+            outcome: flint_core::activity::Outcome::Denied,
+            cluster_key: None,
+            server_key: None,
+            probed: Vec::new(),
+            probed_more: 0,
+        };
+        super::names_only(record).kind.unwrap()
+    };
+    assert_eq!(recorded("list_resources", " pods "), "pods");
+    assert_eq!(recorded("get_resource", "\npods\n"), "pods");
+    assert_eq!(recorded("list_resources", "po ds"), "…(+5 bytes)");
+    assert_eq!(recorded("get_events", " Pod "), "…(+5 bytes)");
 }

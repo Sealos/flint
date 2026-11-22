@@ -1916,6 +1916,7 @@ impl Render for LogView {
 
 #[path = "log_actions.rs"]
 mod actions;
+pub(in crate::ui) use actions::LatestCopy;
 
 #[path = "log_filter.rs"]
 mod filter;
