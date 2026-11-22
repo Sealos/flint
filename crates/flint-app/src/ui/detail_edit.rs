@@ -8,9 +8,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use flint_core::ObjectDetail;
 use flint_core::write::WriteTarget;
 use flint_core::write::{WriteAction, WriteError, WriteOutcome, WriteProposal, WriteReview};
+use flint_core::{ObjectDetail, WriteRefusal};
 use gpui_kit::component::diff::{DiffFile, DiffState};
 use gpui_kit::component::input::EditorState;
 use gpui_kit::*;
@@ -149,6 +149,31 @@ fn texts(review: &WriteReview) -> Option<(&str, &str)> {
     match review.action() {
         WriteAction::ApplyYaml(edit) => Some((edit.before(), edit.after())),
         _ => None,
+    }
+}
+
+/// A failed step as the editor says it. The core's wording for a context that moved is about a
+/// shell tab; here the way forward is to open the object again, which starts a new edit, so the
+/// text says to copy this one first. Only the wording differs: the refusal stands.
+fn edit_error_text(error: &WriteError) -> String {
+    const AGAIN: &str = "copy your edit if you want to keep it, then open the object again";
+    match error {
+        WriteError::Refused(WriteRefusal::Moved { cluster }) => {
+            // One text for both causes: the context points at another server now, or a kubeconfig
+            // file could not be read, so the server it points at cannot be confirmed.
+            format!(
+                "\"{cluster}\" points at another server than this object was opened from, or \
+                 its kubeconfig could not be read to confirm it; {AGAIN}. If a kubeconfig file \
+                 is unreadable, fix it before you open the object again"
+            )
+        }
+        WriteError::Refused(WriteRefusal::Stale { cluster }) => {
+            format!(
+                "\"{cluster}\" changed in your kubeconfig files since this object was opened; \
+                 {AGAIN}"
+            )
+        }
+        other => other.to_string(),
     }
 }
 
@@ -338,7 +363,7 @@ impl DetailView {
             edit.error = None;
         } else {
             edit.phase = Phase::Editing;
-            edit.error = Some(error.to_string());
+            edit.error = Some(edit_error_text(&error));
         }
     }
 
@@ -463,9 +488,16 @@ impl DetailView {
 
 #[cfg(test)]
 mod tests {
+    use flint_core::write::WriteError;
+    use flint_core::{KindId, ObjectDetail, SyncState, WriteRefusal};
+    use gpui_kit::test::TestAppContextExt as _;
+    use gpui_kit::{AppContext as _, TestAppContext};
     use serde_json::json;
 
-    use super::{editable_yaml, patch, sets_status, with_resource_version};
+    use super::{
+        Fetch, Phase, edit_error_text, editable_yaml, patch, sets_status, with_resource_version,
+    };
+    use crate::ui::support_tests::{WAIT, objects, open_workspace, standard_sections};
 
     // covers UP-51: the editor opens without status or managedFields, at its version.
     #[test]
@@ -524,5 +556,110 @@ mod tests {
     fn an_edit_that_sets_status_is_recognised() {
         assert!(sets_status("kind: X\nstatus:\n  phase: Ready\n"));
         assert!(!sets_status("kind: X\nspec:\n  status: keep\n"));
+    }
+
+    // The editor's own wording for a moved context: no mention of a shell, and the way forward.
+    #[test]
+    fn a_moved_context_says_to_open_the_object_again() {
+        let cluster = "dev".to_owned();
+        for refusal in [
+            WriteRefusal::Moved {
+                cluster: cluster.clone(),
+            },
+            WriteRefusal::Stale {
+                cluster: cluster.clone(),
+            },
+        ] {
+            let text = edit_error_text(&WriteError::Refused(refusal));
+            assert!(text.contains("\"dev\""), "{text}");
+            assert!(text.contains("open the object again"), "{text}");
+            assert!(text.contains("copy your edit"), "{text}");
+            assert!(!text.contains("shell"), "{text}");
+            assert!(!text.contains("tab"), "{text}");
+        }
+    }
+
+    #[test]
+    fn other_failures_keep_the_cores_wording() {
+        for error in [
+            WriteError::Conflict,
+            WriteError::Rejected("denied by policy".to_owned()),
+            WriteError::Refused(WriteRefusal::Protected {
+                cluster: "prod".to_owned(),
+            }),
+        ] {
+            assert_eq!(edit_error_text(&error), error.to_string());
+        }
+    }
+
+    // A refused apply keeps the typed text, back at the editing step, with the editor's wording.
+    #[gpui_kit::test]
+    async fn a_refused_apply_keeps_the_edit_and_says_to_reopen(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        let kind = KindId::pods();
+        t.connect_alpha(cx, standard_sections()).await;
+        t.open_kind(
+            cx,
+            kind.plural(),
+            objects(kind.clone(), &[("demo", "api", 0)], SyncState::Synced, 1),
+        )
+        .await;
+        t.dispatch(
+            cx,
+            "resource_list::SelectRow",
+            json!({"namespace": "demo", "name": "api"}),
+        )
+        .unwrap();
+        let view = t.detail(cx).expect("the detail pane is open");
+        let failed = view.clone();
+        cx.wait_for(t.window, WAIT, move |_, cx| {
+            matches!(&failed.read(cx).fetch, Fetch::Failed(_))
+        })
+        .await;
+        let object = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "api", "namespace": "demo", "uid": "uid-api", "resourceVersion": "1"
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+        });
+        let detail = ObjectDetail {
+            yaml: serde_saphyr::to_string(&object).unwrap(),
+            object,
+            managed_fields: None,
+            events: Vec::new(),
+            events_truncated: false,
+            events_error: None,
+        };
+        let typed = "kind: Pod\nspec: typed\n";
+        cx.update_window(t.window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.show_fetched(detail, window, cx);
+                v.start_edit(window, cx);
+                let edit = v.edit.as_ref().expect("the edit started");
+                edit.editor
+                    .update(cx, |state, cx| state.set_value(typed, window, cx));
+                v.edit_applying(cx);
+                v.edit_applied(
+                    Err(WriteError::Refused(WriteRefusal::Moved {
+                        cluster: "kind-alpha".to_owned(),
+                    })),
+                    window,
+                    cx,
+                );
+            })
+        })
+        .unwrap();
+        cx.run_until_parked();
+        view.read_with(cx, |v, cx| {
+            let edit = v.edit.as_ref().expect("the edit is kept");
+            assert!(matches!(edit.phase, Phase::Editing));
+            assert_eq!(edit.editor.read(cx).value().to_string(), typed);
+            let error = edit.error.as_deref().unwrap();
+            assert!(error.contains("open the object again"), "{error}");
+            assert!(!error.contains("shell"), "{error}");
+        });
     }
 }
