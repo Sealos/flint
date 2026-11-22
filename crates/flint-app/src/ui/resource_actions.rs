@@ -30,6 +30,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::confirm::{self, DialogText};
+use super::detail::access::Gated;
 use super::detail::{DetailView, Opening, Subject, protected_reason, refused};
 use super::notice::{notice, notice_with};
 use super::registry::{
@@ -256,7 +257,11 @@ pub(in crate::ui) fn kind_has_actions(kind: &KindId, deletable: bool) -> bool {
 
 /// The actions a row of `kind` offers, in menu order, the destructive one last. A node offers
 /// Uncordon when `cordoned`, else Cordon (also while that is not known yet, disabled).
-fn offered_for(kind: &KindId, deletable: bool, cordoned: Option<bool>) -> Vec<ResourceAction> {
+pub(in crate::ui) fn offered_for(
+    kind: &KindId,
+    deletable: bool,
+    cordoned: Option<bool>,
+) -> Vec<ResourceAction> {
     let mut actions = Vec::new();
     if is_scalable(kind) {
         actions.push(ResourceAction::Scale);
@@ -321,7 +326,10 @@ pub(in crate::ui) fn available(ws: &Workspace, action: ResourceAction, cx: &App)
         // Offered while the node is not known: it says what it waits for.
         detail.node_cordoned()?;
     }
-    Ok(())
+    match detail.forbidden(Gated::Write(action)) {
+        Some(why) => Err(why),
+        None => Ok(()),
+    }
 }
 
 /// Why the row does not offer `action`.
