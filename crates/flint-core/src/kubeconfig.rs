@@ -149,9 +149,13 @@ impl FileStamps {
     }
 }
 
-/// A file's modification time and size, or `None` if it can't be checked.
+/// A file's modification time and size, or `None` if it can't be checked. The null device has
+/// one fixed stamp: writing to it moves its times, but it always reads as empty.
 fn file_stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
     let meta = std::fs::metadata(path).ok()?;
+    if is_null_device(&meta) {
+        return Some((std::time::UNIX_EPOCH, 0));
+    }
     Some((meta.modified().ok()?, meta.len()))
 }
 
@@ -406,6 +410,9 @@ fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
 /// A regular file is compared by identity, times, size and every byte. What this cannot see is a
 /// file changed and put back byte for byte between two checks within one tick of the
 /// filesystem's clock, which leaves the same content when the read ends.
+///
+/// The null device is compared by which device it is and not by its times, which any write to it
+/// moves. It has no content to change, and [`Self::matches_parse`] rejects a read that found some.
 #[derive(PartialEq, Eq)]
 enum InputFile {
     Absent,
@@ -413,6 +420,7 @@ enum InputFile {
     Failed(std::io::ErrorKind),
     /// Not a regular file, so its content is not read: opening one can block.
     Special(FileIdentity),
+    NullDevice(NullNode),
     Regular(FileIdentity, Vec<u8>),
     /// The path no longer showed this file once its bytes were read, so they may be a version
     /// that is already gone.
@@ -442,6 +450,25 @@ impl FileIdentity {
     }
 }
 
+/// Which null device node a path shows: what stays the same while it is written to.
+#[derive(PartialEq, Eq)]
+struct NullNode {
+    /// Device, inode and the device number the node stands for.
+    #[cfg(unix)]
+    node: (u64, u64, u64),
+}
+
+impl NullNode {
+    fn of(_meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        NullNode {
+            #[cfg(unix)]
+            node: (_meta.dev(), _meta.ino(), _meta.rdev()),
+        }
+    }
+}
+
 impl InputFile {
     fn of(path: &Path) -> Self {
         use std::io::ErrorKind;
@@ -449,7 +476,7 @@ impl InputFile {
         if let Ok(meta) = std::fs::metadata(path)
             && !meta.is_file()
         {
-            return InputFile::Special(FileIdentity::of(&meta));
+            return Self::not_regular(&meta);
         }
         match open_nonblocking(path) {
             Ok(file) => Self::from_open(path, file),
@@ -467,10 +494,10 @@ impl InputFile {
             Ok(meta) => meta,
             Err(e) => return InputFile::Failed(e.kind()),
         };
-        let identity = FileIdentity::of(&meta);
         if !meta.is_file() {
-            return InputFile::Special(identity);
+            return Self::not_regular(&meta);
         }
+        let identity = FileIdentity::of(&meta);
         let mut bytes = Vec::new();
         if let Err(e) = file.read_to_end(&mut bytes) {
             return InputFile::Failed(e.kind());
@@ -482,6 +509,14 @@ impl InputFile {
         }
     }
 
+    fn not_regular(meta: &std::fs::Metadata) -> Self {
+        if is_null_device(meta) {
+            InputFile::NullDevice(NullNode::of(meta))
+        } else {
+            InputFile::Special(FileIdentity::of(meta))
+        }
+    }
+
     fn all(paths: &[PathBuf]) -> Vec<Self> {
         paths.iter().map(|path| Self::of(path)).collect()
     }
@@ -489,6 +524,12 @@ impl InputFile {
     /// Whether the path still showed this file when its reading ended.
     fn held_still(&self) -> bool {
         !matches!(self, InputFile::Changing)
+    }
+
+    /// Whether the parse of `path` fits this file. The null device's checks can't see the path
+    /// showing another file for a moment, so a parse of it must have found it empty.
+    fn matches_parse(&self, path: &PathBuf, loaded: &LoadedKubeconfig) -> bool {
+        !matches!(self, InputFile::NullDevice(_)) || loaded.blank.contains(path)
     }
 }
 
@@ -585,7 +626,12 @@ impl FileRead {
             })
             .collect();
         let after = InputFile::all(paths);
-        let consistent = before == after && after.iter().all(InputFile::held_still);
+        let consistent = before == after
+            && after.iter().all(InputFile::held_still)
+            && paths
+                .iter()
+                .zip(&after)
+                .all(|(path, file)| file.matches_parse(path, &loaded));
         FileRead {
             loaded,
             exist,
@@ -955,6 +1001,82 @@ mod tests {
         let null = Path::new("/dev/null");
         assert!(read_config(null).is_ok());
         assert!(load(&[null.to_path_buf()]).errors.is_empty());
+    }
+
+    /// Writes to the null device on both sides of the parse, with time for its clock to move.
+    #[cfg(unix)]
+    fn load_while_null_is_written(paths: &[PathBuf]) -> LoadedKubeconfig {
+        let write_null = || {
+            std::thread::sleep(Duration::from_millis(5));
+            std::fs::write("/dev/null", b"x").unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        write_null();
+        let loaded = load(paths);
+        write_null();
+        loaded
+    }
+
+    // covers UP-54: writes to the null device change nothing a kubeconfig read depends on.
+    #[cfg(unix)]
+    #[test]
+    fn writing_to_the_null_device_during_a_read_keeps_it_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let shown = write(dir.path(), "a", &dev_at("https://one"));
+        let paths = [PathBuf::from("/dev/null"), shown];
+        let stamps = FileStamps::of(&paths);
+        let read = FileRead::of(&paths, load_while_null_is_written);
+        assert!(read.consistent);
+        assert_eq!(stamps, FileStamps::of(&paths));
+        assert_eq!(read.blank.len(), 1);
+    }
+
+    /// Points the symlink at `target` as one step.
+    #[cfg(unix)]
+    fn point_link(link: &Path, target: &Path) {
+        let next = link.with_extension("link");
+        std::os::unix::fs::symlink(target, &next).unwrap();
+        std::fs::rename(&next, link).unwrap();
+    }
+
+    /// Parses while the link shows the real file beside it, then puts the null device back.
+    #[cfg(unix)]
+    fn load_during_a_swap_from_null(paths: &[PathBuf]) -> LoadedKubeconfig {
+        point_link(&paths[0], &paths[0].with_extension("real"));
+        let loaded = load(paths);
+        point_link(&paths[0], Path::new("/dev/null"));
+        loaded
+    }
+
+    /// Parses, then leaves the link on another character device.
+    #[cfg(unix)]
+    fn load_then_point_at_zero(paths: &[PathBuf]) -> LoadedKubeconfig {
+        let loaded = load(paths);
+        point_link(&paths[0], Path::new("/dev/zero"));
+        loaded
+    }
+
+    // covers UP-54: a path that showed real content or another device during the read is not
+    // settled, though the null device's own identity never changed.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_swapped_away_from_the_null_device_is_not_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("config");
+        write(dir.path(), "config.real", &dev_at("https://real"));
+        std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+        let paths = [link];
+
+        let read = FileRead::of(&paths, load_during_a_swap_from_null);
+        assert!(
+            read.loaded.context("dev").is_some(),
+            "the parse saw content"
+        );
+        assert!(!read.consistent);
+
+        let read = FileRead::of(&paths, load_then_point_at_zero);
+        assert!(!read.consistent);
+        assert!(matches!(InputFile::of(&paths[0]), InputFile::Special(_)));
     }
 
     // covers UP-06: parsing from an open file gives what kube's own reader gives: every encoding,
