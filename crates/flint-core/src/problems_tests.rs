@@ -1649,8 +1649,9 @@ fn owners_are_read_from_metadata() {
     };
     let rs = |name: &str| refs("apps/v1", "ReplicaSet", name, true);
     let rs_meta = |name: &str, owners: serde_json::Value| {
-        Some(json!({"name": name, "ownerReferences": owners}))
+        Some(json!({"name": name, "uid": "u", "ownerReferences": owners}))
     };
+    let deployment_refs = refs("apps/v1", "Deployment", "web", true);
     let owned_by_deployment = |deployment: &str, rs_name: &str| {
         rs_meta(rs_name, refs("apps/v1", "Deployment", deployment, true))
     };
@@ -1695,6 +1696,21 @@ fn owners_are_read_from_metadata() {
             "metadata of a different replicaset",
             rs("web-abc12"),
             owned_by_deployment("web", "web-other"),
+            Some(("apps", "ReplicaSet", "web-abc12")),
+        ),
+        (
+            "same name with another uid",
+            rs("web-abc12"),
+            Some(json!({"name": "web-abc12", "uid": "new", "ownerReferences": deployment_refs})),
+            Some(("apps", "ReplicaSet", "web-abc12")),
+        ),
+        (
+            "same name and uid in another namespace",
+            rs("web-abc12"),
+            Some(json!({
+                "name": "web-abc12", "namespace": "other", "uid": "u",
+                "ownerReferences": deployment_refs,
+            })),
             Some(("apps", "ReplicaSet", "web-abc12")),
         ),
         (
@@ -1857,4 +1873,103 @@ fn an_owner_is_carried_for_every_subject_and_is_not_identity() {
         let problem = classifier().workload(kind, &meta, None, None).unwrap();
         assert_eq!(problem.owner, owner("apps", expected, "db"));
     }
+}
+
+fn resolved(pod: &Pod, index: &ReplicaSetIndex<'_>) -> (Option<ProblemOwner>, OwnerSource) {
+    let problem = classifier().pods_with_replica_sets([pod], index).remove(0);
+    (problem.owner, problem.owner_source)
+}
+
+#[test]
+fn an_index_tells_a_read_replica_set_from_an_unknown_one() {
+    let pod = replica_set_pod("ns", "rs-uid");
+    let through = OwnerSource::ReplicaSet("web-abc12".into());
+    let placeholder = owner("apps", "ReplicaSet", "web-abc12");
+
+    let read = [replica_set_meta("ns", "rs-uid", "web")];
+    let index: ReplicaSetIndex<'_> = read.iter().collect();
+    assert_eq!(
+        resolved(&pod, &index),
+        (owner("apps", "Deployment", "web"), through.clone())
+    );
+
+    let mut orphan = replica_set_meta("ns", "rs-uid", "web");
+    orphan.owner_references = None;
+    let orphans = [orphan];
+    let index: ReplicaSetIndex<'_> = orphans.iter().collect();
+    assert_eq!(
+        resolved(&pod, &index),
+        (placeholder.clone(), through),
+        "read with no Deployment: the ReplicaSet is the real owner"
+    );
+
+    for index in [
+        ReplicaSetIndex::unavailable(),
+        std::iter::empty::<&ObjectMeta>().collect(),
+    ] {
+        assert_eq!(
+            resolved(&pod, &index),
+            (placeholder.clone(), OwnerSource::UnresolvedReplicaSet)
+        );
+    }
+    assert_eq!(
+        classifier().pods([&pod])[0].owner_source,
+        OwnerSource::UnresolvedReplicaSet,
+        "the plain entry point cannot pass a placeholder off as an owner"
+    );
+}
+
+#[test]
+fn remembered_replica_sets_survive_a_pass_without_metadata() {
+    let pod = replica_set_pod("ns", "rs-uid");
+    let deployment = owner("apps", "Deployment", "web");
+    let through = OwnerSource::ReplicaSet("web-abc12".into());
+    let read = [replica_set_meta("ns", "rs-uid", "web")];
+    let mut memory = ReplicaSetMemory::default();
+    memory.update(&read.iter().collect());
+
+    let unavailable = ReplicaSetIndex::unavailable();
+    memory.update(&unavailable);
+    let index = ReplicaSetIndex::unavailable().remembering(&memory);
+    assert_eq!(resolved(&pod, &index), (deployment, through));
+
+    let other_namespace = replica_set_pod("other", "rs-uid");
+    assert_eq!(
+        resolved(&other_namespace, &index).1,
+        OwnerSource::UnresolvedReplicaSet,
+        "a remembered UID must match the namespace too"
+    );
+
+    let none: [ObjectMeta; 0] = [];
+    memory.update(&none.iter().collect());
+    let index = ReplicaSetIndex::unavailable().remembering(&memory);
+    assert_eq!(
+        resolved(&pod, &index).1,
+        OwnerSource::UnresolvedReplicaSet,
+        "a complete read without the ReplicaSet confirms it is gone"
+    );
+}
+
+#[test]
+fn replica_set_memory_is_bounded_and_follows_owner_changes() {
+    let metas: Vec<ObjectMeta> = (0..4)
+        .map(|n| replica_set_meta("ns", &format!("rs-{n}"), "web"))
+        .collect();
+    let mut memory = ReplicaSetMemory::default();
+    memory.update_within(&metas.iter().collect(), 2);
+    assert_eq!(memory.by_uid.len(), 2);
+
+    let kept: Vec<String> = memory.by_uid.keys().cloned().collect();
+    let moved: Vec<ObjectMeta> = kept
+        .iter()
+        .map(|uid| replica_set_meta("ns", uid, "api"))
+        .collect();
+    memory.update_within(&moved.iter().collect(), 2);
+    assert_eq!(memory.by_uid.len(), 2);
+    assert!(
+        memory
+            .by_uid
+            .values()
+            .all(|rs| rs.deployment.as_deref() == Some("api"))
+    );
 }

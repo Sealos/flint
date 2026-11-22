@@ -66,8 +66,8 @@ pub use logs::{
 };
 pub use metrics::{MetricsError, MetricsList, MetricsPoll, NodeMetrics, PodMetrics};
 pub use problems::{
-    Classifier, Problem, ProblemId, ProblemKind, ProblemOwner, ProblemReason, ProblemSeverity,
-    ProblemSubject, ReplicaSetIndex,
+    Classifier, OwnerSource, Problem, ProblemId, ProblemKind, ProblemOwner, ProblemReason,
+    ProblemSeverity, ProblemSubject, ReplicaSetIndex, ReplicaSetMemory,
 };
 pub use protection::{Protection, SessionUnlocks, WriteRefusal};
 pub use read::{KindId, KindInfo, ObjectDetail};
