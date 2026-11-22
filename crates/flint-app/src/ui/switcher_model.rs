@@ -9,8 +9,9 @@
 //! [`RESULTS`] the full scoring, for their order and highlights.
 //!
 //! Two rules keep the list relevant: objects matching only by scattered letters are left out
-//! when another object has the query as a run ([`has_run`]), and Event objects, which repeat
-//! the name of what they are about, come after every other match.
+//! when another object of the same sort (Event, or not) has the query as a run
+//! ([`RunFinder`]), and Event objects, which repeat the name of what they are about, come after
+//! every other match.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -123,54 +124,144 @@ fn is_event_kind(kind: &KindId) -> bool {
     kind.plural() == "events" && matches!(kind.group(), "" | "events.k8s.io")
 }
 
-/// Whether the lowercase `words` appear in `text` in order, each as a run of characters. A run
+/// Finds the lowercase words of a query in texts, in order, each as a run of characters. A run
 /// may step over a separator the word does not have, so "webapi" is a run in `web-api`.
-fn has_run(text: &str, words: &[String]) -> bool {
-    if text.is_ascii() && words.iter().all(|w| w.is_ascii()) {
-        let mut text = text.as_bytes();
-        words.iter().all(|word| {
-            let end = run_end(text, word.as_bytes(), u8::eq_ignore_ascii_case, |b| {
-                is_separator(b as char)
-            });
-            end.map(|end| text = &text[end..]).is_some()
+///
+/// Built once per query. Every partial run is tracked at once, one bit per word position, so a
+/// text is read once however often it repeats the word's start.
+#[derive(Debug)]
+struct RunFinder {
+    words: Vec<RunWord>,
+    /// Reused between texts: bit `i` is set when a run has matched the word's first `i + 1`
+    /// characters and is still alive at the character just read.
+    partial: Vec<u64>,
+}
+
+/// One word of a [`RunFinder`].
+#[derive(Debug)]
+struct RunWord {
+    len: usize,
+    /// The word's distinct characters, sorted, so the ASCII ones come first.
+    chars: Vec<char>,
+    /// For each ASCII character, its index in `chars`, or [`NOT_IN_WORD`].
+    ascii: [u8; 128],
+    /// For each of `chars`, a bitset of the positions holding it, `len.div_ceil(64)` values.
+    positions: Vec<u64>,
+}
+
+/// In [`RunWord::ascii`]: the word does not have this character.
+const NOT_IN_WORD: u8 = u8::MAX;
+
+impl RunWord {
+    fn new(word: &str) -> Self {
+        let word: Vec<char> = word.chars().collect();
+        let mut chars = word.clone();
+        chars.sort_unstable();
+        chars.dedup();
+        let blocks = word.len().div_ceil(64);
+        let mut positions = vec![0; chars.len() * blocks];
+        for (at, c) in word.iter().enumerate() {
+            if let Ok(ix) = chars.binary_search(c) {
+                positions[ix * blocks + at / 64] |= 1 << (at % 64);
+            }
+        }
+        let mut ascii = [NOT_IN_WORD; 128];
+        for (ix, c) in chars.iter().enumerate().take_while(|(_, c)| c.is_ascii()) {
+            ascii[*c as usize] = ix as u8;
+        }
+        RunWord {
+            len: word.len(),
+            chars,
+            ascii,
+            positions,
+        }
+    }
+
+    /// Takes in one character, `ix` in `chars` if the word has it. Returns whether a run of the
+    /// whole word ends here, the earliest any run can.
+    #[inline]
+    fn step(&self, ix: Option<usize>, separator: bool, partial: &mut [u64]) -> bool {
+        let Some(ix) = ix else {
+            // A separator the word does not have leaves every run where it is.
+            if !separator {
+                partial.fill(0);
+            }
+            return false;
+        };
+        let blocks = partial.len();
+        let here = &self.positions[ix * blocks..(ix + 1) * blocks];
+        let mut carry = 1;
+        for b in 0..blocks {
+            let old = partial[b];
+            // The runs whose next character is this one advance. Any other run steps over a
+            // separator, and ends on anything else.
+            let above = if b + 1 < blocks { here[b + 1] << 63 } else { 0 };
+            let stay = if separator {
+                old & !((here[b] >> 1) | above)
+            } else {
+                0
+            };
+            partial[b] = (((old << 1) | carry) & here[b]) | stay;
+            carry = old >> 63;
+        }
+        partial[blocks - 1] & (1 << ((self.len - 1) % 64)) != 0
+    }
+
+    /// Where the first run of this word in the ASCII `text` ends.
+    fn end_in_ascii(&self, text: &[u8], partial: &mut Vec<u64>) -> Option<usize> {
+        partial.clear();
+        partial.resize(self.len.div_ceil(64), 0);
+        let mut at = 0;
+        // A plain loop: this runs for every object per keystroke.
+        while at < text.len() {
+            let byte = text[at].to_ascii_lowercase();
+            at += 1;
+            let ix = self.ascii[byte as usize];
+            let ix = (ix != NOT_IN_WORD).then_some(ix as usize);
+            if self.step(ix, is_separator(byte as char), partial) {
+                return Some(at);
+            }
+        }
+        None
+    }
+
+    /// Reads `text` up to the end of the first run of this word. Returns whether there is one.
+    fn find(&self, text: &mut impl Iterator<Item = char>, partial: &mut Vec<u64>) -> bool {
+        partial.clear();
+        partial.resize(self.len.div_ceil(64), 0);
+        text.any(|c| {
+            let ix = self.chars.binary_search(&c).ok();
+            self.step(ix, is_separator(c), partial)
         })
-    } else {
-        let lower: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
-        let mut text = lower.as_slice();
-        words.iter().all(|word| {
-            let word: Vec<char> = word.chars().collect();
-            let end = run_end(text, &word, char::eq, is_separator);
-            end.map(|end| text = &text[end..]).is_some()
-        })
+    }
+}
+
+impl RunFinder {
+    fn new<'a>(words: impl IntoIterator<Item = &'a str>) -> Self {
+        RunFinder {
+            words: words.into_iter().map(RunWord::new).collect(),
+            partial: Vec::new(),
+        }
+    }
+
+    /// Whether the words appear in `text` in order, each as a run.
+    fn found_in(&mut self, text: &str) -> bool {
+        let partial = &mut self.partial;
+        if text.is_ascii() {
+            let mut rest = text.as_bytes();
+            self.words.iter().all(|w| {
+                let end = w.end_in_ascii(rest, partial);
+                end.map(|end| rest = &rest[end..]).is_some()
+            })
+        } else {
+            let mut text = text.chars().flat_map(char::to_lowercase);
+            self.words.iter().all(|w| w.find(&mut text, partial))
+        }
     }
 }
 
 fn is_separator(c: char) -> bool {
     matches!(c, '-' | '_' | '.' | '/' | ' ')
-}
-
-/// Where the first run of `word` in `text` ends.
-fn run_end<T: Copy>(
-    text: &[T],
-    word: &[T],
-    same: impl Fn(&T, &T) -> bool,
-    separator: impl Fn(T) -> bool,
-) -> Option<usize> {
-    let first = word.first()?;
-    (0..text.len())
-        .filter(|&start| same(&text[start], first))
-        .find_map(|start| {
-            let (mut t, mut w) = (start, 0);
-            while w < word.len() && t < text.len() {
-                if same(&text[t], &word[w]) {
-                    w += 1;
-                } else if !separator(text[t]) {
-                    return None;
-                }
-                t += 1;
-            }
-            (w == word.len()).then_some(t)
-        })
 }
 
 /// Everything the switcher searches: the kinds first, in navigation order, then the objects by
@@ -282,9 +373,10 @@ impl Search {
     /// namespace) earns extra points. A match of the text beats the same match of the second
     /// text; among equal scores, the shorter text first, then index order (kinds first).
     ///
-    /// When any object has the query as a run, in its text or second text, objects with only
-    /// scattered letters are left out. Kinds always stay: "svc" still finds Services. Event
-    /// objects come after every other match.
+    /// When any object has the query as a run, in its text or second text, objects of the same
+    /// sort with only scattered letters are left out: Events and other objects are judged
+    /// apart, so a run in an Event hides no other object. Kinds always stay: "svc" still finds
+    /// Services. Event objects come after every other match.
     pub fn run(&mut self, index: &Index, query: &str) -> Found {
         let mut matcher = Matcher::new(query);
         if matcher.is_empty() {
@@ -356,24 +448,30 @@ impl Search {
                 .split_whitespace()
                 .map(|w| w.chars().flat_map(char::to_lowercase).collect())
                 .collect();
+            let mut finder = RunFinder::new(words.iter().map(String::as_str));
             let runs: Vec<bool> = scored
                 .iter()
                 .map(|s| {
                     let item = &index.items[s.1 as usize];
-                    has_run(&item.text, &words) || has_run(&item.alt, &words)
+                    // An object's second text ends with its text, so one read covers both.
+                    // A kind is never filtered, so its runs do not matter.
+                    item.object.is_some() && finder.found_in(&item.alt)
                 })
                 .collect();
-            let object_run = scored
-                .iter()
-                .zip(&runs)
-                .any(|(s, &run)| run && index.items[s.1 as usize].object.is_some());
-            if object_run {
-                let mut runs = runs.into_iter();
-                scored.retain(|s| {
-                    let run = runs.next().unwrap_or(false);
-                    run || index.items[s.1 as usize].object.is_none()
-                });
-            }
+            let run_among = |event: bool| {
+                scored.iter().zip(&runs).any(|(s, &run)| {
+                    let item = &index.items[s.1 as usize];
+                    run && item.object.is_some() && item.event == event
+                })
+            };
+            let (object_run, event_run) = (run_among(false), run_among(true));
+            let mut runs = runs.iter();
+            scored.retain(|s| {
+                let run = runs.next().is_some_and(|&run| run);
+                let item = &index.items[s.1 as usize];
+                let run_exists = if item.event { event_run } else { object_run };
+                run || item.object.is_none() || !run_exists
+            });
         }
         let total = scored.len();
         let length = |ix: u32| index.items[ix as usize].text.len();
@@ -420,7 +518,7 @@ mod tests {
 
     use flint_core::{KindId, KindSnapshot, NavEntry, Row, SyncState};
 
-    use super::{Index, RESULTS, Search};
+    use super::{Index, RESULTS, RunFinder, Search, is_separator};
 
     fn entry(group: &str, plural: &str, kind: &str, label: &str) -> NavEntry {
         NavEntry {
@@ -749,6 +847,150 @@ mod tests {
             texts(&index, &mut Search::default(), "svc"),
             ["demo/my-svc", "Services"]
         );
+    }
+
+    // #418: a run in an Event does not hide an ordinary object, and the two are filtered apart:
+    // scattered Events still give way to an Event with a run, and ordinary objects to theirs.
+    #[test]
+    fn events_and_other_objects_are_filtered_apart() {
+        let entries = [
+            entry("", "pods", "Pod", "Pods"),
+            entry("", "events", "Event", "Events"),
+        ];
+        let index = Index::new(
+            &entries,
+            &[
+                snapshot(KindId::pods(), &[(Some("demo"), "api-1")]),
+                snapshot(
+                    KindId::events(),
+                    &[(Some("demo"), "web.17a1"), (Some("demo"), "api-1.17b")],
+                ),
+            ],
+        );
+        assert_eq!(
+            texts(&index, &mut Search::default(), "a1"),
+            ["demo/api-1", "demo/web.17a1"]
+        );
+
+        let index = Index::new(
+            &entries,
+            &[
+                snapshot(
+                    KindId::pods(),
+                    &[(Some("demo"), "api-1"), (Some("demo"), "a1-web")],
+                ),
+                snapshot(KindId::events(), &[(Some("demo"), "api-1.17b")]),
+            ],
+        );
+        assert_eq!(
+            texts(&index, &mut Search::default(), "a1"),
+            ["demo/a1-web", "demo/api-1.17b"]
+        );
+    }
+
+    /// The rule [`RunFinder`] implements, one start at a time.
+    fn plain_run_end(text: &[char], word: &[char]) -> Option<usize> {
+        (0..text.len()).find_map(|start| {
+            if text[start] != *word.first()? {
+                return None;
+            }
+            let (mut t, mut w) = (start, 0);
+            while w < word.len() && t < text.len() {
+                if text[t] == word[w] {
+                    w += 1;
+                } else if !is_separator(text[t]) {
+                    return None;
+                }
+                t += 1;
+            }
+            (w == word.len()).then_some(t)
+        })
+    }
+
+    fn plain_has_run(text: &str, words: &[&str]) -> bool {
+        let text: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
+        let mut rest = text.as_slice();
+        words.iter().all(|word| {
+            let word: Vec<char> = word.chars().collect();
+            let end = plain_run_end(rest, &word);
+            end.map(|end| rest = &rest[end..]).is_some()
+        })
+    }
+
+    /// Every string of up to `max` characters from `alphabet`.
+    fn strings(alphabet: &[char], max: usize) -> Vec<String> {
+        let mut all = vec![String::new()];
+        let mut from = 0;
+        for _ in 0..max {
+            let to = all.len();
+            for i in from..to {
+                for c in alphabet {
+                    let next = format!("{}{c}", all[i]);
+                    all.push(next);
+                }
+            }
+            from = to;
+        }
+        all
+    }
+
+    // #418: the one-pass check agrees with the plain rule on every short text and word, over
+    // repeats, separators in the text and in the word, several words and non-ASCII.
+    #[test]
+    fn the_run_check_keeps_the_rule() {
+        for alphabet in [['a', 'b', '-'], ['é', 'b', '.']] {
+            let texts = strings(&alphabet, 7);
+            let words: Vec<String> = strings(&alphabet, 3).split_off(1);
+            for word in &words {
+                let mut finder = RunFinder::new([word.as_str()]);
+                for text in &texts {
+                    let expected = plain_has_run(text, &[word]);
+                    assert_eq!(finder.found_in(text), expected, "{word:?} in {text:?}");
+                }
+            }
+            for (first, second) in words.iter().zip(words.iter().rev()) {
+                let mut finder = RunFinder::new([first.as_str(), second.as_str()]);
+                for text in &texts {
+                    let expected = plain_has_run(text, &[first, second]);
+                    assert_eq!(
+                        finder.found_in(text),
+                        expected,
+                        "{first:?} {second:?} {text:?}"
+                    );
+                }
+            }
+        }
+        // Case, and a word longer than one block of bits, with a separator across the boundary.
+        let long = "a".repeat(70);
+        let mut finder = RunFinder::new([long.as_str()]);
+        assert!(finder.found_in(&format!("{}-{}", "A".repeat(64), "a".repeat(6))));
+        assert!(!finder.found_in(&format!("{}x{}", "a".repeat(64), "a".repeat(6))));
+        assert!(!finder.found_in(&"a".repeat(69)));
+    }
+
+    // #418: a long repeated prefix that never completes a run costs one pass per name, not one
+    // per occurrence of the query's first letter. These names are over twice as long as the
+    // ones below and every one matches, so the linear passes alone take a few hundred ms in
+    // this unoptimized build. Rescanning the prefix took over 3 s, which the limit still fails.
+    #[test]
+    fn a_repeated_prefix_over_fifty_thousand_objects_fits_in_a_frame() {
+        let prefix = "a".repeat(60);
+        let names: Vec<String> = (0..50_000).map(|i| format!("{prefix}x-b-{i}")).collect();
+        let rows: Vec<(Option<&str>, &str)> =
+            names.iter().map(|n| (Some("demo"), n.as_str())).collect();
+        let index = Index::new(
+            &[entry("", "pods", "Pod", "Pods")],
+            &[snapshot(KindId::pods(), &rows)],
+        );
+        let query = format!("{prefix}b");
+        let mut spent = Duration::MAX;
+        for _ in 0..3 {
+            let start = Instant::now();
+            let found = Search::default().run(&index, &query);
+            spent = spent.min(start.elapsed());
+            assert_eq!(found.matched, 50_000);
+        }
+        assert!(spent < Duration::from_secs(1), "{spent:?}");
     }
 
     /// 50,000 objects across 40 kinds and 200 namespaces, named as real clusters name them.
