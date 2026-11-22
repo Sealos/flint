@@ -180,11 +180,12 @@ Flint is in early development.
 
 **Coming next:**
 
-- **Next focus, see and watch many clusters:** multi-cluster management, watching and alerting. None of this is in
-  0.5.0: it has no combined views, alerts, dashboards, thresholds or CPU and memory columns.
-- **v0.7, change many clusters:** guarded fleet actions with explicit targets, a dry run per cluster, one cluster at a
+- **v0.6, see and watch many clusters:** multi-cluster management and watching. None of this is in 0.5.0: it has no
+  combined views, alerts, dashboards, thresholds or CPU and memory columns.
+- **v0.7, know what's wrong:** alerting and health signals across clusters. Not in 0.5.0.
+- **v0.8, change many clusters:** guarded fleet actions with explicit targets, a dry run per cluster, one cluster at a
   time, and a stop at the first failure.
-- **v1.0, first public release:** a signed and notarized app with a Homebrew cask, port-forwarding, and read-only Helm
+- **1.0, first public release:** a signed and notarized app with a Homebrew cask, port-forwarding, and read-only Helm
   releases.
 - **Later:** curated views for core kinds, [regex search](https://github.com/Sealos/flint/issues/309) and
   [log time ranges](https://github.com/Sealos/flint/issues/265).
