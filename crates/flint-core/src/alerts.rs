@@ -21,19 +21,23 @@
 //! - The first check of each kind of problem is a baseline and raises nothing, unless
 //!   [`AlertConfig::alert_on_existing`] is set.
 //!
-//! # Unresolved owners
+//! # Unknown owners
 //!
-//! A pod of a ReplicaSet whose metadata is unknown ([`OwnerSource::UnresolvedReplicaSet`]) may
-//! belong to a Deployment, so its placeholder owner is not an alert identity:
+//! A pod names only its ReplicaSet, which changes on each rollout, so its alert group is known
+//! only once the ReplicaSet has been read. A problem whose owner is not known
+//! ([`Problem::owner_known`] is false) makes its whole kind unchecked for that pass, exactly as
+//! if the caller had listed it in [`ClusterSnapshot::Available`]: nothing of that kind raises or
+//! resolves, and its groups are [`OpenAlertState::Unknown`]. Owners are never guessed from names.
 //!
-//! - It keeps an open group alive: its ReplicaSet's own, or that of any Deployment whose name
-//!   could have generated the ReplicaSet's (`<deployment>-<hash>`). Those groups stay
-//!   [`OpenAlertState::Unknown`] instead of clearing, and it raises nothing new. The name is used
-//!   only to avoid a false resolve, never to name an owner.
-//! - With no such group it waits for its owner, for at most [`OWNER_UNKNOWN_WAIT`]. If the owner
-//!   is still unknown, as when ReplicaSets cannot be listed at all, it raises under the
-//!   ReplicaSet, so a real crash always alerts.
-//! - Once the owner is known, a group raised under the ReplicaSet moves to it silently.
+//! Once every problem of the kind has a known owner, normal transitions continue. A group still
+//! seen is open again without an event, one no longer seen starts a full cooldown, and a new
+//! group raises, unless the kind has never been checked, when that pass is its baseline.
+//!
+//! The limit this accepts: while ReplicaSets cannot be read, crash, OOM and image-pull alerts for
+//! ReplicaSet-owned pods wait, and the cluster's "could not be checked" state is what the person
+//! sees. Other owners with a problem of that kind wait too, because the kind is the unit of
+//! checking. A pass with no problem of a kind has nothing of unknown owner, so it still counts
+//! as a check of that kind.
 //!
 //! # Text
 //!
@@ -43,16 +47,13 @@
 // module-tests: alerts_tests.rs
 
 use std::cmp::Reverse;
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
 use k8s_openapi::jiff::{SignedDuration, Timestamp};
 
-use crate::problems::{
-    OwnerSource, Problem, ProblemKind, ProblemOwner, ProblemSeverity, ProblemSubject, WorkloadKind,
-};
+use crate::problems::{Problem, ProblemKind, ProblemOwner, ProblemSeverity, ProblemSubject};
 
 /// How long a group must stay absent before it resolves and can raise again.
 ///
@@ -68,12 +69,6 @@ pub const DEFAULT_BURST_WINDOW: SignedDuration = SignedDuration::from_secs(5 * 6
 
 /// How long a cluster must stay unavailable before that is reported.
 pub const DEFAULT_UNAVAILABLE_AFTER: SignedDuration = SignedDuration::from_secs(2 * 60);
-
-/// How long a new problem waits for its ReplicaSet's owner before raising without it.
-///
-/// Long enough to ride out a failed list, and short enough that a cluster where ReplicaSets
-/// cannot be read still alerts promptly.
-pub const OWNER_UNKNOWN_WAIT: SignedDuration = SignedDuration::from_secs(2 * 60);
 
 /// The most clusters the engine tracks.
 pub const MAX_CLUSTERS: usize = 256;
@@ -206,39 +201,6 @@ fn key_of(problem: &Problem) -> AlertKey {
         kind: problem.kind(),
         subject,
     }
-}
-
-/// The key of the group for ReplicaSet `name`.
-fn replica_set_key(kind: ProblemKind, namespace: &str, name: &str) -> AlertKey {
-    AlertKey {
-        kind,
-        subject: AlertSubject::Workload {
-            namespace: namespace.to_owned(),
-            owner: ProblemOwner {
-                group: "apps".to_owned(),
-                kind: "ReplicaSet".to_owned(),
-                name: name.to_owned(),
-            },
-        },
-    }
-}
-
-/// The groups of the Deployments whose name could have generated this ReplicaSet's key.
-fn possible_deployments(replica_set: &AlertKey) -> Vec<AlertKey> {
-    let AlertSubject::Workload { namespace, owner } = &replica_set.subject else {
-        return Vec::new();
-    };
-    owner
-        .name
-        .match_indices('-')
-        .map(|(end, _)| AlertKey {
-            kind: replica_set.kind,
-            subject: AlertSubject::Workload {
-                namespace: namespace.clone(),
-                owner: ProblemOwner::workload(WorkloadKind::Deployment, &owner.name[..end]),
-            },
-        })
-        .collect()
 }
 
 /// One pass over a cluster.
@@ -402,8 +364,6 @@ struct Tracked {
     status: Status,
     /// Whether this group raised its own alert, and so reports its own resolution.
     raised: bool,
-    /// Keyed by a ReplicaSet only because its real owner was not known.
-    placeholder: bool,
     affected: u32,
     summary: &'static str,
 }
@@ -463,8 +423,6 @@ impl RateWindow {
 #[derive(Debug)]
 struct ClusterState {
     tracked: HashMap<AlertKey, Tracked>,
-    /// New problems waiting for their owner, by ReplicaSet key, with when each was first seen.
-    awaiting_owner: HashMap<AlertKey, Timestamp>,
     /// The kinds of problem that have had their first check.
     baselined: HashSet<ProblemKind>,
     window: RateWindow,
@@ -478,7 +436,6 @@ impl ClusterState {
     fn new(now: Timestamp) -> Self {
         Self {
             tracked: HashMap::new(),
-            awaiting_owner: HashMap::new(),
             baselined: HashSet::new(),
             window: RateWindow::new(now),
             unavailable_since: None,
@@ -491,9 +448,6 @@ impl ClusterState {
     fn clamp_times(&mut self, now: Timestamp) {
         self.window.start = self.window.start.min(now);
         self.unavailable_since = self.unavailable_since.map(|since| since.min(now));
-        for since in self.awaiting_owner.values_mut() {
-            *since = (*since).min(now);
-        }
         for entry in self.tracked.values_mut() {
             if let Status::Clearing { since } = &mut entry.status {
                 *since = (*since).min(now);
@@ -506,40 +460,6 @@ impl ClusterState {
 struct Seen {
     affected: u32,
     summary: &'static str,
-}
-
-impl Seen {
-    /// Adds these problems to the group at `key`.
-    fn merge_into(self, groups: &mut HashMap<AlertKey, Seen>, key: AlertKey) {
-        groups
-            .entry(key)
-            .and_modify(|group| {
-                group.affected = group.affected.saturating_add(self.affected);
-                group.summary = group.summary.min(self.summary);
-            })
-            .or_insert(self);
-    }
-}
-
-/// A pass, grouped by key.
-#[derive(Default)]
-struct Grouped {
-    seen: HashMap<AlertKey, Seen>,
-    /// Problems whose owner is unknown, by the key of their ReplicaSet.
-    unresolved: HashMap<AlertKey, Seen>,
-    /// The real group of each ReplicaSet whose owner this pass knows.
-    owners: HashMap<AlertKey, AlertKey>,
-    /// Problems that cannot be kept.
-    oversized: u32,
-}
-
-/// What a pass's unresolved problems mean for the tracked groups.
-#[derive(Default)]
-struct Unresolved {
-    /// Groups that may be the owner of an unresolved problem, so must not clear.
-    held: HashSet<AlertKey>,
-    /// Groups in `seen` that are keyed by a ReplicaSet as a placeholder.
-    placeholders: HashSet<AlertKey>,
 }
 
 /// The alert decisions for a set of clusters; see the [module docs](self).
@@ -658,22 +578,10 @@ impl AlertEngine {
             });
         }
 
-        let Grouped {
-            mut seen,
-            unresolved,
-            owners,
-            oversized: mut untracked,
-        } = group(cluster, problems, unchecked);
-        move_placeholders(state, &owners);
-        let Unresolved { held, placeholders } = settle_unresolved(
-            state,
-            &mut seen,
-            unresolved,
-            unchecked,
-            config.alert_on_existing,
-            now,
-        );
-        let resolved = update_tracked(state, &mut seen, unchecked, &held, now, config.cooldown);
+        let unchecked = unchecked_kinds(cluster, problems, unchecked);
+        let unchecked = unchecked.as_slice();
+        let (mut seen, mut untracked) = group(cluster, problems, unchecked);
+        let resolved = update_tracked(state, &mut seen, unchecked, now, config.cooldown);
         for (key, entry) in resolved {
             if !entry.raised {
                 continue;
@@ -710,7 +618,6 @@ impl AlertEngine {
             let entry = Tracked {
                 status: Status::Open,
                 raised,
-                placeholder: placeholders.contains(&key),
                 affected: group.affected,
                 summary: group.summary,
             };
@@ -749,125 +656,54 @@ fn tracking_limit(severity: ProblemSeverity) -> usize {
     }
 }
 
-/// Groups a pass by key.
-fn group(cluster: &Arc<str>, problems: &[Problem], unchecked: &[ProblemKind]) -> Grouped {
-    let mut grouped = Grouped::default();
+/// The kinds this pass cannot judge: those the caller named, and any with a problem whose owner
+/// is unknown. See [unknown owners](self#unknown-owners).
+fn unchecked_kinds(
+    cluster: &Arc<str>,
+    problems: &[Problem],
+    unchecked: &[ProblemKind],
+) -> Vec<ProblemKind> {
+    let mut kinds = unchecked.to_vec();
+    for problem in problems {
+        if !problem.owner_known
+            && *problem.id.cluster == **cluster
+            && !kinds.contains(&problem.kind())
+        {
+            kinds.push(problem.kind());
+        }
+    }
+    kinds
+}
+
+/// Groups a pass by key, returning the groups and how many problems cannot be kept.
+fn group(
+    cluster: &Arc<str>,
+    problems: &[Problem],
+    unchecked: &[ProblemKind],
+) -> (HashMap<AlertKey, Seen>, u32) {
+    let mut seen: HashMap<AlertKey, Seen> = HashMap::new();
+    let mut oversized = 0;
     for problem in problems {
         if *problem.id.cluster != **cluster || unchecked.contains(&problem.kind()) {
             continue;
         }
         let key = key_of(problem);
         if !key.subject.is_bounded() {
-            grouped.oversized += 1;
+            oversized += 1;
             continue;
         }
-        let one = Seen {
-            affected: 1,
-            summary: problem.summary(),
-        };
-        if problem.owner_source == OwnerSource::UnresolvedReplicaSet {
-            one.merge_into(&mut grouped.unresolved, key);
-            continue;
-        }
-        if let (OwnerSource::ReplicaSet(name), ProblemSubject::Container { namespace, .. }) =
-            (&problem.owner_source, &problem.id.subject)
-        {
-            let replica_set = replica_set_key(problem.kind(), namespace, name);
-            grouped.owners.entry(replica_set).or_insert(key.clone());
-        }
-        one.merge_into(&mut grouped.seen, key);
+        let summary = problem.summary();
+        seen.entry(key)
+            .and_modify(|group| {
+                group.affected = group.affected.saturating_add(1);
+                group.summary = group.summary.min(summary);
+            })
+            .or_insert(Seen {
+                affected: 1,
+                summary,
+            });
     }
-    grouped
-}
-
-/// Moves groups raised under a ReplicaSet to the owner this pass knows, without any event.
-fn move_placeholders(state: &mut ClusterState, owners: &HashMap<AlertKey, AlertKey>) {
-    for (replica_set, owner) in owners {
-        if !state
-            .tracked
-            .get(replica_set)
-            .is_some_and(|entry| entry.placeholder)
-        {
-            continue;
-        }
-        if replica_set == owner {
-            // Read, and no Deployment controls it: the ReplicaSet is the real owner.
-            if let Some(entry) = state.tracked.get_mut(replica_set) {
-                entry.placeholder = false;
-            }
-            continue;
-        }
-        let Some(moved) = state.tracked.remove(replica_set) else {
-            continue;
-        };
-        match state.tracked.entry(owner.clone()) {
-            Entry::Occupied(mut existing) => {
-                let existing = existing.get_mut();
-                existing.raised |= moved.raised;
-                existing.status = Status::Open;
-            }
-            Entry::Vacant(vacant) => {
-                vacant.insert(Tracked {
-                    status: Status::Open,
-                    placeholder: false,
-                    ..moved
-                });
-            }
-        }
-    }
-}
-
-/// Applies the rules for [unresolved owners](self#unresolved-owners), moving what should count
-/// as seen into `seen`.
-fn settle_unresolved(
-    state: &mut ClusterState,
-    seen: &mut HashMap<AlertKey, Seen>,
-    unresolved: HashMap<AlertKey, Seen>,
-    unchecked: &[ProblemKind],
-    alert_on_existing: bool,
-    now: Timestamp,
-) -> Unresolved {
-    let mut result = Unresolved::default();
-    let mut waiting = HashMap::new();
-    let mut unresolved: Vec<(AlertKey, Seen)> = unresolved.into_iter().collect();
-    unresolved.sort_by(|(a, _), (b, _)| alert_order(a).cmp(&alert_order(b)));
-    for (key, group) in unresolved {
-        if let Some(entry) = state.tracked.get(&key) {
-            if entry.placeholder {
-                result.placeholders.insert(key.clone());
-            }
-            group.merge_into(seen, key);
-            continue;
-        }
-        let owners: Vec<AlertKey> = possible_deployments(&key)
-            .into_iter()
-            .filter(|owner| state.tracked.contains_key(owner))
-            .collect();
-        if !owners.is_empty() {
-            result.held.extend(owners);
-            continue;
-        }
-        let since = state.awaiting_owner.get(&key).copied().unwrap_or(now);
-        let baseline = !alert_on_existing && !state.baselined.contains(&key.kind);
-        if baseline
-            || now.duration_since(since) >= OWNER_UNKNOWN_WAIT
-            || waiting.len() >= MAX_TRACKED_PER_CLUSTER
-        {
-            result.placeholders.insert(key.clone());
-            group.merge_into(seen, key);
-        } else {
-            waiting.insert(key, since);
-        }
-    }
-    // A kind that could not be checked says nothing about whether its problems went away.
-    waiting.extend(
-        state
-            .awaiting_owner
-            .drain()
-            .filter(|(key, _)| unchecked.contains(&key.kind)),
-    );
-    state.awaiting_owner = waiting;
-    result
+    (seen, oversized)
 }
 
 /// Updates known groups from a pass, removing them from `seen` and returning those that resolved.
@@ -875,7 +711,6 @@ fn update_tracked(
     state: &mut ClusterState,
     seen: &mut HashMap<AlertKey, Seen>,
     unchecked: &[ProblemKind],
-    held: &HashSet<AlertKey>,
     now: Timestamp,
     cooldown: SignedDuration,
 ) -> Vec<(AlertKey, Tracked)> {
@@ -883,15 +718,6 @@ fn update_tracked(
     state.tracked.retain(|key, entry| {
         if unchecked.contains(&key.kind) {
             entry.status = Status::Unknown;
-            return true;
-        }
-        if held.contains(key) {
-            entry.status = Status::Unknown;
-            if let Some(group) = seen.remove(key) {
-                entry.status = Status::Open;
-                entry.affected = group.affected;
-                entry.summary = group.summary;
-            }
             return true;
         }
         let clearing_since = match entry.status {

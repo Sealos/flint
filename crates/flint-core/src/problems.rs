@@ -325,23 +325,12 @@ impl ProblemOwner {
     }
 }
 
-/// How a problem's [`Problem::owner`] was established.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum OwnerSource {
-    /// From the object itself, with no ReplicaSet to see through.
-    Direct,
-    /// Through this ReplicaSet, whose metadata was read or remembered.
-    ReplicaSet(String),
-    /// The pod's controller is a ReplicaSet whose metadata is not known, so `owner` names the
-    /// ReplicaSet only as a placeholder: a Deployment may control it.
-    UnresolvedReplicaSet,
-}
-
 /// ReplicaSet metadata for resolving pods to their Deployments, or the fact that there is none.
 ///
-/// Collecting metadata into an index states that it is a complete read: a ReplicaSet absent from
-/// it is gone. When the ReplicaSets could not be read, use [`Self::unavailable`]. There is no
-/// default, so a caller has to say which it is.
+/// Collecting metadata into an index states that it is a complete read. When the ReplicaSets could
+/// not be read, use [`Self::unavailable`]. There is no default, so a caller has to say which it is.
+/// A pod's owner is known only if a complete read holds its ReplicaSet; see
+/// [`Problem::owner_known`].
 ///
 /// Looked up by the UID in the pod's owner reference, within the pod's namespace, so a ReplicaSet
 /// recreated under the same name or one in another namespace is never mistaken for the owner.
@@ -350,7 +339,6 @@ pub enum OwnerSource {
 pub struct ReplicaSetIndex<'a> {
     /// `None` when the ReplicaSets could not be read.
     by_uid: Option<HashMap<&'a str, &'a ObjectMeta>>,
-    remembered: Option<&'a ReplicaSetMemory>,
 }
 
 impl<'a> FromIterator<&'a ObjectMeta> for ReplicaSetIndex<'a> {
@@ -361,121 +349,35 @@ impl<'a> FromIterator<&'a ObjectMeta> for ReplicaSetIndex<'a> {
             .collect();
         Self {
             by_uid: Some(by_uid),
-            remembered: None,
         }
     }
 }
 
-impl<'a> ReplicaSetIndex<'a> {
+impl ReplicaSetIndex<'_> {
     /// The ReplicaSets could not be read in this pass.
     pub fn unavailable() -> Self {
-        Self {
-            by_uid: None,
-            remembered: None,
-        }
+        Self { by_uid: None }
     }
 
-    /// Falls back on `memory` while the ReplicaSets cannot be read.
-    pub fn remembering(mut self, memory: &'a ReplicaSetMemory) -> Self {
-        self.remembered = Some(memory);
-        self
-    }
-
-    /// The owner of `pod` and how it was established.
-    fn resolve(&self, pod: &ObjectMeta) -> (Option<ProblemOwner>, OwnerSource) {
+    /// The owner of `pod`, and whether it is known.
+    fn resolve(&self, pod: &ObjectMeta) -> (Option<ProblemOwner>, bool) {
         let Some(controller) = controller_of(pod) else {
-            return (None, OwnerSource::Direct);
+            return (None, true);
         };
         if controller.kind != "ReplicaSet" || api_group(&controller.api_version) != "apps" {
-            return (ProblemOwner::of_meta(pod, None), OwnerSource::Direct);
+            return (ProblemOwner::of_meta(pod, None), true);
         }
-        let through = || OwnerSource::ReplicaSet(controller.name.clone());
-        let Some(read) = &self.by_uid else {
-            let remembered = self
-                .remembered
-                .and_then(|memory| memory.by_uid.get(controller.uid.as_str()))
-                .filter(|rs| rs.name == controller.name && rs.namespace == pod.namespace);
-            return match remembered {
-                Some(RememberedReplicaSet {
-                    deployment: Some(deployment),
-                    ..
-                }) => (
-                    Some(ProblemOwner::workload(WorkloadKind::Deployment, deployment)),
-                    through(),
-                ),
-                Some(_) => (ProblemOwner::of_meta(pod, None), through()),
-                None => (
-                    ProblemOwner::of_meta(pod, None),
-                    OwnerSource::UnresolvedReplicaSet,
-                ),
-            };
-        };
-        match read.get(controller.uid.as_str()) {
-            Some(replica_set)
-                if replica_set.namespace == pod.namespace
-                    && replica_set.name.as_deref() == Some(controller.name.as_str()) =>
-            {
-                (ProblemOwner::of_meta(pod, Some(replica_set)), through())
-            }
-            _ => (
-                ProblemOwner::of_meta(pod, None),
-                OwnerSource::UnresolvedReplicaSet,
-            ),
-        }
-    }
-}
-
-/// The most ReplicaSets a [`ReplicaSetMemory`] keeps. Beyond it new ones are not remembered, and
-/// their pods count as unresolved during a pass without metadata.
-pub const MAX_REMEMBERED_REPLICA_SETS: usize = 16_384;
-
-/// Which Deployment each ReplicaSet of one cluster belongs to, kept across passes by UID.
-///
-/// Lets a pass that cannot read ReplicaSets resolve pods as the last read did. Update it with
-/// each pass's index: a complete read refreshes it and drops ReplicaSets that are gone, and an
-/// unavailable one leaves it as it is.
-#[derive(Clone, Debug, Default)]
-pub struct ReplicaSetMemory {
-    by_uid: HashMap<String, RememberedReplicaSet>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RememberedReplicaSet {
-    namespace: Option<String>,
-    name: String,
-    /// `None` for a ReplicaSet read with no Deployment controlling it.
-    deployment: Option<String>,
-}
-
-impl ReplicaSetMemory {
-    /// Learns from `index`; see the [type docs](Self).
-    pub fn update(&mut self, index: &ReplicaSetIndex<'_>) {
-        self.update_within(index, MAX_REMEMBERED_REPLICA_SETS);
-    }
-
-    fn update_within(&mut self, index: &ReplicaSetIndex<'_>, limit: usize) {
-        let Some(read) = &index.by_uid else {
-            return;
-        };
-        self.by_uid.retain(|uid, _| read.contains_key(uid.as_str()));
-        for (uid, meta) in read {
-            let Some(name) = &meta.name else {
-                continue;
-            };
-            let deployment = deployment_of(meta);
-            if let Some(known) = self.by_uid.get_mut(*uid) {
-                if known.deployment.as_deref() != deployment {
-                    known.deployment = deployment.map(str::to_owned);
-                }
-            } else if self.by_uid.len() < limit {
-                let remembered = RememberedReplicaSet {
-                    namespace: meta.namespace.clone(),
-                    name: name.clone(),
-                    deployment: deployment.map(str::to_owned),
-                };
-                self.by_uid.insert((*uid).to_owned(), remembered);
-            }
-        }
+        let replica_set = self
+            .by_uid
+            .as_ref()
+            .and_then(|read| read.get(controller.uid.as_str()).copied())
+            .filter(|rs| {
+                rs.namespace == pod.namespace && rs.name.as_deref() == Some(&controller.name)
+            });
+        (
+            ProblemOwner::of_meta(pod, replica_set),
+            replica_set.is_some(),
+        )
     }
 }
 
@@ -498,8 +400,10 @@ pub struct Problem {
     /// metadata was supplied. For a Job, its controller, such as a CronJob. For a Deployment,
     /// StatefulSet or DaemonSet, itself. `None` for a node or an object with no controller.
     pub owner: Option<ProblemOwner>,
-    /// How `owner` was established, so a placeholder is not taken for a real owner.
-    pub owner_source: OwnerSource,
+    /// Whether `owner` is the real controller. False for a pod whose ReplicaSet is not in a
+    /// complete read: `owner` then names that ReplicaSet, though a Deployment may control it, and
+    /// must not be used as an identity. The alert engine treats the kind as unchecked.
+    pub owner_known: bool,
     /// The known reason code, if the object gave one.
     pub reason: Option<ProblemReason>,
     /// When this was last known to start, if the object says.
@@ -599,8 +503,8 @@ impl Classifier {
         }
     }
 
-    /// The problems of every pod, in order, with no ReplicaSet metadata: a ReplicaSet-owned pod
-    /// is marked [`OwnerSource::UnresolvedReplicaSet`].
+    /// The problems of every pod, in order, with no ReplicaSet metadata: the owner of a
+    /// ReplicaSet-owned pod is not known.
     pub fn pods<'a>(&self, pods: impl IntoIterator<Item = &'a Pod>) -> Vec<Problem> {
         self.pods_with_replica_sets(pods, &ReplicaSetIndex::unavailable())
     }
@@ -669,10 +573,10 @@ impl Classifier {
                 pod_uid: meta.uid.clone(),
                 container: container.name.clone(),
             };
-            let (owner, owner_source) = replica_sets.resolve(meta);
+            let (owner, owner_known) = replica_sets.resolve(meta);
             let problem = self.problem(kind, subject, owner, reason, since);
             out.push(Problem {
-                owner_source,
+                owner_known,
                 ..problem
             });
         }
@@ -985,7 +889,7 @@ impl Classifier {
                 subject,
             },
             owner,
-            owner_source: OwnerSource::Direct,
+            owner_known: true,
             reason,
             since,
         }

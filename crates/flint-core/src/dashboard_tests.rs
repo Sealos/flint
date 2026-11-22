@@ -25,7 +25,7 @@ fn problem(kind: ProblemKind, subject: ProblemSubject) -> Problem {
             subject,
         },
         owner: None,
-        owner_source: crate::problems::OwnerSource::Direct,
+        owner_known: true,
         reason: None,
         since: None,
     }
