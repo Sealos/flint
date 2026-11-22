@@ -1,10 +1,11 @@
 //! The watch manager (ADR-0008): which kinds of a cluster are watched, given the watch mode,
-//! whether the cluster is active, and what the front end has open.
+//! whether the cluster wants watches (it is active or a member of the running set), and what the
+//! front end has open.
 //!
-//! - **All**: while the cluster is active, every listable and watchable kind is watched.
+//! - **All**: while the cluster wants watches, every listable and watchable kind is watched.
 //! - **On view**: only kinds with an open subscription are watched.
 //! - In both modes a subscribed kind is watched (or polled, for APIs that cannot watch), and
-//!   nothing is watched while the cluster is not active. Stopping a kind drops its rows, so
+//!   nothing is watched while the cluster does not want watches. Stopping a kind drops its rows, so
 //!   coming back starts from a fresh list.
 
 mod engine;
@@ -62,7 +63,7 @@ pub(crate) struct ClusterWatches {
     /// From discovery; `None` until it ran.
     kinds: Option<HashMap<KindId, KindInfo>>,
     running: HashMap<KindId, Running>,
-    /// Kinds watched whenever the cluster is active, in both modes (the CRD list, which keeps
+    /// Kinds watched whenever the cluster wants watches, in both modes (the CRD list, which keeps
     /// discovery fresh).
     always: HashSet<KindId>,
     /// The namespaces a kind the user may not list in all namespaces is listed in, one by one
@@ -122,12 +123,12 @@ impl ClusterWatches {
     /// What should run, by kind.
     fn wanted(
         &self,
-        active: bool,
+        watching: bool,
         mode: WatchMode,
         subscribed: &HashSet<KindId>,
     ) -> HashMap<KindId, Feed> {
         let mut wanted = HashMap::new();
-        let (true, Some(_), Some(kinds)) = (active, &self.source, &self.kinds) else {
+        let (true, Some(_), Some(kinds)) = (watching, &self.source, &self.kinds) else {
             return wanted;
         };
         for (id, kind) in kinds {
@@ -147,8 +148,8 @@ impl ClusterWatches {
     }
 
     /// Starts and stops watches to match the inputs.
-    pub fn reconcile(&mut self, active: bool, mode: WatchMode, subscribed: &HashSet<KindId>) {
-        let wanted = self.stop_unwanted(active, mode, subscribed);
+    pub fn reconcile(&mut self, watching: bool, mode: WatchMode, subscribed: &HashSet<KindId>) {
+        let wanted = self.stop_unwanted(watching, mode, subscribed);
         let mut starting: Vec<(&KindId, &Feed)> = wanted
             .iter()
             .filter(|(id, _)| !self.running.contains_key(*id))
@@ -161,7 +162,7 @@ impl ClusterWatches {
             self.start(&id, feed);
         }
         // Tell open views about kinds this cluster does not serve.
-        if active && let Some(kinds) = &self.kinds {
+        if watching && let Some(kinds) = &self.kinds {
             for id in subscribed.iter().filter(|id| !kinds.contains_key(*id)) {
                 let hub = self.hubs.get_or_create(&self.cluster, id);
                 if hub.latest().state != SyncState::Unavailable {
@@ -178,11 +179,11 @@ impl ClusterWatches {
     /// Stops what the inputs no longer want and starts nothing. Returns what they want.
     pub fn stop_unwanted(
         &mut self,
-        active: bool,
+        watching: bool,
         mode: WatchMode,
         subscribed: &HashSet<KindId>,
     ) -> HashMap<KindId, Feed> {
-        let wanted = self.wanted(active, mode, subscribed);
+        let wanted = self.wanted(watching, mode, subscribed);
         let stale: Vec<KindId> = self
             .running
             .iter()
