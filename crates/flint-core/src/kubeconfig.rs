@@ -149,13 +149,9 @@ impl FileStamps {
     }
 }
 
-/// A file's modification time and size, or `None` if it can't be checked. The null device has
-/// one fixed stamp: writing to it moves its times, but it always reads as empty.
+/// A file's modification time and size, or `None` if it can't be checked.
 fn file_stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
     let meta = std::fs::metadata(path).ok()?;
-    if is_null_device(&meta) {
-        return Some((std::time::UNIX_EPOCH, 0));
-    }
     Some((meta.modified().ok()?, meta.len()))
 }
 
@@ -276,8 +272,19 @@ fn read_config(path: &Path) -> Result<Kubeconfig, String> {
     if std::fs::metadata(path).is_ok_and(|meta| !readable_kind(&meta)) {
         return Err("not a regular file".to_owned());
     }
-    let file = open_nonblocking(path).map_err(failed)?;
+    let file = open_nonblocking(path).map_err(|e| {
+        let on_null = e.kind() != std::io::ErrorKind::NotFound
+            && std::fs::metadata(path).is_ok_and(|meta| is_null_device(&meta));
+        if on_null { null_unread(&e) } else { failed(e) }
+    })?;
     read_opened(path, file)
+}
+
+/// How the error of a null device that could not be opened or read begins. No bytes came from it.
+const NULL_UNREAD: &str = "the null device could not be read";
+
+fn null_unread(error: &std::io::Error) -> String {
+    format!("{NULL_UNREAD}: {error}")
 }
 
 /// [`read_config`] from `file`, just opened at `path`.
@@ -289,7 +296,13 @@ fn read_opened(path: &Path, mut file: std::fs::File) -> Result<Kubeconfig, Strin
         return Err("not a regular file".to_owned());
     }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(failed)?;
+    if let Err(e) = file.read_to_end(&mut bytes) {
+        return Err(if is_null_device(&meta) {
+            null_unread(&e)
+        } else {
+            failed(e)
+        });
+    }
     let text = decode_config(bytes).map_err(failed)?;
     let mut config = Kubeconfig::from_yaml(&text).map_err(|e| e.to_string())?;
     if let Some(dir) = path.parent() {
@@ -527,9 +540,16 @@ impl InputFile {
     }
 
     /// Whether the parse of `path` fits this file. The null device's checks can't see the path
-    /// showing another file for a moment, so a parse of it must have found it empty.
+    /// showing another file for a moment, so a parse of it must have found it empty or failed
+    /// to read it at all.
     fn matches_parse(&self, path: &PathBuf, loaded: &LoadedKubeconfig) -> bool {
-        !matches!(self, InputFile::NullDevice(_)) || loaded.blank.contains(path)
+        let unread = || {
+            loaded
+                .errors
+                .iter()
+                .any(|(failed, error)| failed == path && error.starts_with(NULL_UNREAD))
+        };
+        !matches!(self, InputFile::NullDevice(_)) || loaded.blank.contains(path) || unread()
     }
 }
 
@@ -1024,11 +1044,79 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let shown = write(dir.path(), "a", &dev_at("https://one"));
         let paths = [PathBuf::from("/dev/null"), shown];
-        let stamps = FileStamps::of(&paths);
         let read = FileRead::of(&paths, load_while_null_is_written);
         assert!(read.consistent);
-        assert_eq!(stamps, FileStamps::of(&paths));
         assert_eq!(read.blank.len(), 1);
+    }
+
+    // covers UP-54: a context parsed while the path briefly showed a real file is not kept under
+    // the null device's stamp: the stamp is the node's own time, so a later write forces a parse.
+    #[cfg(unix)]
+    #[test]
+    fn a_null_device_stamp_follows_writes_after_a_swapped_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("config");
+        write(dir.path(), "config.real", &dev_at("https://real"));
+        std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+        let paths = [link];
+        let null_time = || std::fs::metadata("/dev/null").unwrap().modified().unwrap();
+
+        let earliest = null_time();
+        let stamps = FileStamps::of(&paths);
+        let latest = null_time();
+        let (_, Some((stamped, size))) = &stamps.0[0] else {
+            panic!("the null device has a stamp");
+        };
+        assert!((earliest..=latest).contains(stamped));
+        assert_eq!(*size, std::fs::metadata("/dev/null").unwrap().len());
+
+        let loaded = load_during_a_swap_from_null(&paths);
+        assert!(loaded.context("dev").is_some(), "the parse saw content");
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::write("/dev/null", b"x").unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        // Linux does not move a device node's time on write; macOS does.
+        #[cfg(target_os = "macos")]
+        assert_ne!(stamps, FileStamps::of(&paths));
+    }
+
+    /// A parse that could not read the null device.
+    #[cfg(unix)]
+    fn load_with_null_unread(paths: &[PathBuf]) -> LoadedKubeconfig {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        LoadedKubeconfig {
+            paths: paths.to_vec(),
+            errors: vec![(paths[0].clone(), null_unread(&denied))],
+            ..LoadedKubeconfig::default()
+        }
+    }
+
+    // covers UP-54: an unchanged null device that can't be read is a stable error for that file.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_null_device_is_a_stable_error() {
+        let paths = [PathBuf::from("/dev/null")];
+        let read = FileRead::of(&paths, load_with_null_unread);
+        assert!(read.consistent);
+        assert_eq!(read.loaded.errors.len(), 1);
+        assert!(read.blank.is_empty());
+    }
+
+    // covers UP-54: a parse error is real content, even one that reads like a failed read of the
+    // null device, so a path that showed it for a moment is not settled.
+    #[cfg(unix)]
+    #[test]
+    fn invalid_content_during_a_swap_from_null_is_not_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("config");
+        write(dir.path(), "config.real", &format!("{NULL_UNREAD}: [\n"));
+        std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+        let paths = [link];
+
+        let read = FileRead::of(&paths, load_during_a_swap_from_null);
+        assert_eq!(read.loaded.errors.len(), 1, "the parse failed");
+        assert!(!read.loaded.errors[0].1.starts_with(NULL_UNREAD));
+        assert!(!read.consistent);
     }
 
     /// Points the symlink at `target` as one step.
