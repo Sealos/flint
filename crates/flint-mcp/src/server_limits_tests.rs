@@ -802,16 +802,18 @@ async fn a_probe_past_the_deadline_keeps_its_clusters() {
 }
 
 /// A server answering every request with a 403 whose message is `message`.
-async fn forbidding_server(message: &'static str) -> String {
+async fn forbidding_server(message: impl Into<std::sync::Arc<str>>) -> String {
+    let message: std::sync::Arc<str> = message.into();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
+            let message = std::sync::Arc::clone(&message);
             tokio::spawn(async move {
                 let mut request = [0; 4096];
                 let _ = socket.read(&mut request).await;
                 let body = json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
-                    "message": message, "reason": "Forbidden", "code": 403})
+                    "message": &*message, "reason": "Forbidden", "code": 403})
                 .to_string();
                 let response = format!(
                     "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\n\
@@ -882,7 +884,7 @@ async fn a_cluster_row_tidies_a_url_across_the_cut() {
             "{} postgres://admin:example-value-123@db.internal:5432/app",
             "x".repeat(pad)
         );
-        let url = forbidding_server(message.leak()).await;
+        let url = forbidding_server(message).await;
         let server = server(dir.path(), Some(&url), Limits::default());
         let row = cluster_row(&server).await;
         let error = row["error"].as_str().expect("the probe failed");
