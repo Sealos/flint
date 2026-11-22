@@ -15,6 +15,7 @@ use kube::config::{Kubeconfig, KubeconfigError, NamedContext};
 use tokio::sync::{Mutex, OwnedMutexGuard, oneshot};
 use tokio::time::Instant;
 
+pub use crate::recheck::{ConfirmedDefinitions, JudgedRead, ReadOutcome};
 use crate::settings::{Settings, expand_tilde};
 
 /// One kubeconfig context, as Flint shows it in the sidebar.
@@ -593,6 +594,25 @@ impl FileRead {
             consistent,
             order,
         }
+    }
+}
+
+/// A read of the kubeconfig files for [`ConfirmedDefinitions::judge`], by a process that reads
+/// them itself.
+#[derive(Debug)]
+pub struct KubeconfigRead(pub(crate) FileRead);
+
+impl KubeconfigRead {
+    /// Reads `paths`, again while they change under the read, for a few seconds at most. This
+    /// blocks, so hold no lock across it.
+    pub fn settled(paths: &[PathBuf]) -> Self {
+        let deadline = std::time::Instant::now() + READ_TIMEOUT;
+        KubeconfigRead(FileRead::settled(paths, load, deadline))
+    }
+
+    /// What was read, to adjust before it is judged.
+    pub fn loaded_mut(&mut self) -> &mut LoadedKubeconfig {
+        &mut self.0.loaded
     }
 }
 
