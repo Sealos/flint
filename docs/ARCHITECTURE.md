@@ -237,7 +237,7 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   do. Lock Again leaves running shells running; it stops new ones, and its menu entry, palette entry and dialog say
   so. Stop Trusting also locks the cluster, even if it was unlocked for the session. A trusted context whose
   cluster entry is gone (no server) cannot be unlocked or trusted, but its lock menu still removes the old trust.
-- Sessions the user started (log streams, exec terminals, port-forwards) keep running when the user switches to
+- Sessions the user started (log streams, exec terminals) keep running when the user switches to
   another cluster, warm or cold. They end only when the user closes them or quits Flint.
 
 ## Resources
@@ -792,7 +792,11 @@ can forward several ports of one target at once.
 A panel lists the active forwards: target, local and remote port, and state, with stop buttons. Ports named `http`
 or `web`, or with `appProtocol` `http`, get an **Open in browser** action for `http://localhost:<port>`. Ports named
 `https`, or with `appProtocol` `https`, open `https://localhost:<port>`. Unnamed ports offer Open in browser from the
-row's context menu. Forwards bind to `127.0.0.1` only and end when the app quits.
+row's context menu. Forwards bind to `127.0.0.1` only.
+
+A forward takes the same gate as exec. Every connection asks the gate and takes a fresh client pinned to the definition
+the forward started on, and a running forward asks again every two seconds. A forward ends when its cluster is
+protected again, re-pointed, paused or removed, when the active cluster changes, and when the app quits.
 
 ### Helm
 

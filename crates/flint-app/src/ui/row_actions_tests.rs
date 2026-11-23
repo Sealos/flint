@@ -479,7 +479,10 @@ async fn a_pod_rows_menu_opens_logs_previous_logs_and_a_shell(cx: &mut TestAppCo
     // The pod is still loading (on a slow server): the entries wait for it.
     show_loading(cx, &t);
     right_click(cx, &t, "web").await;
-    assert_eq!(menu(cx, &t), ["Logs", "Previous Logs", "Shell"]);
+    assert_eq!(
+        menu(cx, &t),
+        ["Logs", "Previous Logs", "Shell", "Forward Port"]
+    );
     click_entry(cx, &t, 0);
     assert_eq!(
         dock_tabs(cx, &t).0,
@@ -492,7 +495,10 @@ async fn a_pod_rows_menu_opens_logs_previous_logs_and_a_shell(cx: &mut TestAppCo
     // Loaded, with two containers: each entry picks one, the default marked. Previous Logs
     // lists the one that restarted.
     right_click(cx, &t, "web").await;
-    assert_eq!(menu(cx, &t), ["Logs", "Previous Logs", "Shell"]);
+    assert_eq!(
+        menu(cx, &t),
+        ["Logs", "Previous Logs", "Shell", "Forward Port"]
+    );
     click_entry(cx, &t, 1);
     assert_eq!(submenu(cx, &t), ["app (default)"]);
     click_submenu(cx, &t, 1);
@@ -621,7 +627,8 @@ async fn keys_act_on_the_selected_pod_row(cx: &mut TestAppContext) {
             "Logs".to_owned(),
             "Previous Logs".to_owned(),
             why.to_owned(),
-            "Shell".to_owned()
+            "Shell".to_owned(),
+            "Forward Port".to_owned()
         ]
     );
     assert_eq!(
@@ -1188,7 +1195,7 @@ async fn an_open_menu_follows_its_row(cx: &mut TestAppContext) {
     show_fetched(cx, &t, pod_detail("web"));
     assert_eq!(
         open_menu(cx, &t, "web").await,
-        ["Logs", "Previous Logs", "Shell"]
+        ["Logs", "Previous Logs", "Shell", "Forward Port"]
     );
     // The pod finished while the menu was open.
     let mut finished = pod_detail("web");
@@ -1200,6 +1207,8 @@ async fn an_open_menu_follows_its_row(cx: &mut TestAppContext) {
             "Logs",
             "Previous Logs",
             "Shell",
+            "pod web has finished (Succeeded)",
+            "Forward Port",
             "pod web has finished (Succeeded)"
         ]
     );

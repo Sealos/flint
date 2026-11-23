@@ -33,6 +33,7 @@ mod manager;
 pub mod metrics;
 pub mod metrics_trend;
 pub mod paging;
+pub mod port_forward;
 pub mod problems;
 pub mod protection;
 pub mod read;

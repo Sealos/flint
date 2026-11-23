@@ -1116,6 +1116,14 @@ fn serve(
         } if *gvr == Gvr::core("pods") && subresource == "exec" => {
             execs::open_exec(inner, req, upgrade, ns, name, query)
         }
+        Route::Subresource {
+            gvr,
+            namespace: Some(ns),
+            name,
+            subresource,
+        } if *gvr == Gvr::core("pods") && subresource == "portforward" => {
+            forwards::open_forward(inner, req, upgrade, ns, name, query)
+        }
         _ => respond(inner, req.method(), route, verb, query, accept),
     }
 }
@@ -1430,6 +1438,9 @@ mod pods;
 
 #[path = "server_exec.rs"]
 mod execs;
+
+#[path = "server_forward.rs"]
+mod forwards;
 
 #[path = "server_writes.rs"]
 mod writes;

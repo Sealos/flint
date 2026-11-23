@@ -210,8 +210,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ### UP-24 Switch clusters
 - **When** I switch to another cluster and back, and the old cluster is not kept warm (`warm_clusters = 1`, or it went
   cold).
-- **Then** the old cluster's watches stop. Switching back loads fresh data. Log, exec and port-forward sessions keep
-  running across the switch. (Before M5.5 every cluster behaves this way. Warm clusters are UP-78.)
+- **Then** the old cluster's watches stop. Switching back loads fresh data. Log and exec sessions keep running across
+  the switch; port-forwards stop. (Before M5.5 every cluster behaves this way. Warm clusters are UP-78.)
 - Tests: cluster, ui (from M5.5 with `warm_clusters = 1`).
 
 ### UP-25 Change the watch mode

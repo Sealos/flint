@@ -24,6 +24,7 @@ use crate::logs::{
     PodSet, WorkloadPod,
 };
 use crate::manager::ClusterManager;
+use crate::port_forward::{ForwardRequest, PortForward};
 use crate::protection::{GatedClient, SessionUnlocks, WriteRefusal};
 use crate::read::{KindId, ObjectDetail};
 use crate::recheck::{ContextPin, RECHECK_EVERY};
@@ -413,6 +414,13 @@ pub(crate) enum Request {
     },
     /// [`Self::CheckWriteGate`] for a write, which also needs the definition pinned at `pin`.
     CheckWritePin {
+        cluster: ClusterId,
+        pin: ContextPin,
+        reply: oneshot::Sender<Result<(), WriteError>>,
+    },
+    /// Whether a port-forward pinned at `pin` may carry on: the write gate for a pinned write,
+    /// and the context is not paused. Answered from memory.
+    CheckForward {
         cluster: ClusterId,
         pin: ContextPin,
         reply: oneshot::Sender<Result<(), WriteError>>,
@@ -1231,6 +1239,38 @@ impl CoreHandle {
             crate::exec::start(client, request, channels).await;
         });
         session
+    }
+
+    /// Starts a port-forward on a connected cluster, through the same gate as [`Self::exec`]. It
+    /// listens on `127.0.0.1` only and ends when stopped or dropped, or when the gate refuses.
+    /// Never blocks.
+    pub fn port_forward(&self, request: ForwardRequest) -> PortForward {
+        let (forward, channels) = PortForward::new(request.clone());
+        let client = self.bound_write_client(&request.cluster, request.server.clone());
+        let requests = self.requests.clone();
+        let admitted = self.bound.clone();
+        self.runtime.spawn(async move {
+            let pin = client.await.and_then(|(_, pin, _)| match &admitted {
+                Some(member) if !member.holds(&request.cluster, &pin) => Err(WriteRefusal::Stale {
+                    cluster: request.cluster.to_string(),
+                }
+                .into()),
+                _ => Ok(pin),
+            });
+            match pin {
+                Ok(pin) => {
+                    let dialer = Arc::new(crate::port_forward::KubeDialer {
+                        requests,
+                        request: request.clone(),
+                        pin,
+                        admitted,
+                    });
+                    crate::port_forward::run(dialer, request, channels).await;
+                }
+                Err(refusal) => crate::port_forward::refuse(&channels, &refusal),
+            }
+        });
+        forward
     }
 
     /// The client for an action that changes `cluster` or runs code in it, with the context's

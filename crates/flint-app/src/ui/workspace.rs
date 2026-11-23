@@ -724,7 +724,7 @@ impl Workspace {
         let opening = match &key {
             TabKey::Logs(_) => Opening::ReconnectLogs,
             TabKey::Shell(_) => Opening::RestartShell,
-            TabKey::Activity(_) | TabKey::Compare(..) => return,
+            TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Forwards(_) => return,
         };
         let check = self.model.read(cx).core().check_member(&member);
         self.sets.restart = cx.spawn_in(window, async move |this, cx| {
@@ -752,7 +752,7 @@ impl Workspace {
             TabKey::Logs(_) => Opening::ReconnectLogs,
             TabKey::Shell(_) => Opening::RestartShell,
             // Runs no session to start again.
-            TabKey::Activity(_) | TabKey::Compare(..) => return,
+            TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Forwards(_) => return,
         };
         if let Some(reason) = self.sessions_blocked(key.context(), cx) {
             self.refuse(refused(opening, &reason), cx);
@@ -792,7 +792,7 @@ impl Workspace {
                         DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
                     }
                     // It returned above: an activity tab has no session to start again.
-                    TabKey::Activity(_) | TabKey::Compare(..) => {
+                    TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Forwards(_) => {
                         unreachable!("these tabs do not restart")
                     }
                 },
@@ -893,6 +893,8 @@ impl Workspace {
             TabKey::Shell(_) => summary.map_or(0, |c| c.definition),
             TabKey::Logs(_) => summary.map_or(0, |c| c.endpoint),
             TabKey::Activity(_) | TabKey::Compare(..) => 0,
+            // Pinned like a shell: the core ends a forward on the same changes.
+            TabKey::Forwards(_) => summary.map_or(0, |c| c.definition),
         };
         TabCluster::new(context, self.shown_server(context, cx).as_deref()).defined_by(definition)
     }
@@ -1094,6 +1096,8 @@ impl Workspace {
         let cluster_changed = active != self.cluster || generation != self.generation;
         if cluster_changed {
             self.generation = generation;
+            // A forward is a channel into the cluster: it never outlives the connection shown.
+            self.stop_forwards(cx);
             // Switching clusters closes the old cluster's views; dropping the list drops its
             // subscription (UP-24).
             self.cluster = active.clone();
@@ -3789,6 +3793,9 @@ fn takes_focus(focus: &TakeFocus, window: &Window, cx: &App) -> bool {
 
 #[path = "workspace_actions.rs"]
 mod actions;
+
+#[path = "workspace_forwards.rs"]
+mod forwards;
 
 #[path = "workspace_keys.rs"]
 mod keys;

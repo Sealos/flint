@@ -23,6 +23,8 @@ pub(in crate::ui) enum Gated {
     Edit,
     Logs,
     Shell,
+    /// A pod's port-forward. A Service's pod is picked per connection, so the server answers.
+    PortForward,
     Write(ResourceAction),
 }
 
@@ -35,6 +37,9 @@ fn gated_for(kind: &KindId, subject: Subject) -> Vec<Gated> {
     let mut gated = vec![Gated::Edit];
     if subject != Subject::Other {
         gated.extend([Gated::Logs, Gated::Shell]);
+    }
+    if subject == Subject::Pod {
+        gated.push(Gated::PortForward);
     }
     gated.extend(
         resource_actions::offered_for(kind, true, None)
@@ -137,6 +142,11 @@ impl ObjectAccess {
                 Subject::Pod => vec![pod("exec", &self.name)],
                 Subject::Workload(_) => self.targets.shell.iter().map(|p| pod("exec", p)).collect(),
                 Subject::Other => Vec::new(),
+            },
+            // A GET WebSocket upgrade, like a shell: `get` is what it always needs.
+            Gated::PortForward => match self.subject {
+                Subject::Pod => vec![pod("portforward", &self.name)],
+                _ => Vec::new(),
             },
             Gated::Write(ResourceAction::Delete) => vec![object("delete")],
             Gated::Write(ResourceAction::Scale) => {
@@ -436,6 +446,24 @@ mod tests {
             pod.forbidden(Gated::Shell).as_deref(),
             Some("your access does not allow get on pods/exec in demo")
         );
+    }
+
+    // A forward sends a GET upgrade; a Service's pod is not known until a connection picks it.
+    #[test]
+    fn a_pods_port_forward_is_refused_by_get_on_portforward() {
+        let mut pod = object("", "pods", Some("demo"), "web-1");
+        let get = on_pods("portforward", "get", Some("web-1"));
+        assert_eq!(wanted(&pod, Gated::PortForward), std::slice::from_ref(&get));
+        assert_eq!(pod.forbidden(Gated::PortForward), None, "not asked yet");
+        pod.answers.insert(get.clone(), Access::Unknown);
+        assert_eq!(pod.forbidden(Gated::PortForward), None, "not known");
+        pod.answers.insert(get, Access::Forbidden);
+        assert_eq!(
+            pod.forbidden(Gated::PortForward).as_deref(),
+            Some("your access does not allow get on pods/portforward in demo")
+        );
+        let service = object("", "services", Some("demo"), "web");
+        assert!(wanted(&service, Gated::PortForward).is_empty());
     }
 
     #[test]

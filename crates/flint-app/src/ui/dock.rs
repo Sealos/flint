@@ -45,6 +45,7 @@ use super::focus::release_unfocused_input;
 use super::log_view::{LogRequest, LogView};
 use super::menu_fit;
 use super::menu_record;
+use super::port_forward_view::PortForwardsView;
 use super::registry::{
     self, ActionError, ActivateTab, Bind, CloseActiveTab, CloseTab, NextTab, OnView, PrevTab,
     ReconnectLogs, RestartShell, ShowTabList, ToggleDock,
@@ -95,6 +96,8 @@ pub enum TabKey {
     Activity(ClusterId),
     /// An object compared across clusters, opened from this context: no session.
     Compare(ClusterId, CompareTarget),
+    /// A cluster's port-forward panel: one tab per cluster.
+    Forwards(ClusterId),
 }
 
 impl TabKey {
@@ -103,7 +106,9 @@ impl TabKey {
         match self {
             TabKey::Logs(request) => &request.cluster,
             TabKey::Shell(request) => &request.cluster,
-            TabKey::Activity(cluster) | TabKey::Compare(cluster, _) => cluster,
+            TabKey::Activity(cluster) | TabKey::Compare(cluster, _) | TabKey::Forwards(cluster) => {
+                cluster
+            }
         }
     }
 }
@@ -134,6 +139,7 @@ pub enum DockTab {
     Shell(Entity<TerminalView>),
     Activity(Entity<ActivityView>),
     Compare(Entity<CompareView>),
+    Forwards(Entity<PortForwardsView>),
 }
 
 impl DockTab {
@@ -143,6 +149,7 @@ impl DockTab {
             DockTab::Shell(view) => view.read(cx),
             DockTab::Activity(view) => view.read(cx),
             DockTab::Compare(view) => view.read(cx),
+            DockTab::Forwards(view) => view.read(cx),
         }
     }
 
@@ -152,6 +159,7 @@ impl DockTab {
             DockTab::Shell(view) => view.clone().into(),
             DockTab::Activity(view) => view.clone().into(),
             DockTab::Compare(view) => view.clone().into(),
+            DockTab::Forwards(view) => view.clone().into(),
         }
     }
 }
@@ -176,6 +184,7 @@ fn observe(tab: &DockTab, id: u64, cx: &mut Context<Dock>) -> Subscription {
         DockTab::Shell(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
         DockTab::Activity(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
         DockTab::Compare(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
+        DockTab::Forwards(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
     }
 }
 
@@ -278,8 +287,24 @@ impl Dock {
     pub fn active_log(&self) -> Option<&Entity<LogView>> {
         match self.active_tab().filter(|_| self.visible)? {
             DockTab::Logs(view) => Some(view),
-            DockTab::Shell(_) | DockTab::Activity(_) | DockTab::Compare(_) => None,
+            _ => None,
         }
+    }
+
+    /// The forwards tab shown, if the dock is visible and showing one.
+    pub fn active_forwards(&self) -> Option<&Entity<PortForwardsView>> {
+        match self.active_tab().filter(|_| self.visible)? {
+            DockTab::Forwards(view) => Some(view),
+            _ => None,
+        }
+    }
+
+    /// Every forwards tab's view, shown or not.
+    pub fn forward_views(&self) -> impl Iterator<Item = &Entity<PortForwardsView>> {
+        self.tabs.iter().filter_map(|t| match &t.tab {
+            DockTab::Forwards(view) => Some(view),
+            _ => None,
+        })
     }
 
     /// The shell tab shown, if the dock is visible and showing one: where terminal actions go.
@@ -287,7 +312,7 @@ impl Dock {
     pub fn terminals(&self) -> impl Iterator<Item = &Entity<TerminalView>> {
         self.tabs.iter().filter_map(|t| match &t.tab {
             DockTab::Shell(view) => Some(view),
-            DockTab::Logs(_) | DockTab::Activity(_) | DockTab::Compare(_) => None,
+            _ => None,
         })
     }
 
@@ -295,7 +320,7 @@ impl Dock {
     pub fn log_views(&self) -> impl Iterator<Item = &Entity<LogView>> {
         self.tabs.iter().filter_map(|t| match &t.tab {
             DockTab::Logs(view) => Some(view),
-            DockTab::Shell(_) | DockTab::Activity(_) | DockTab::Compare(_) => None,
+            _ => None,
         })
     }
 
@@ -310,7 +335,7 @@ impl Dock {
     pub fn active_terminal(&self) -> Option<&Entity<TerminalView>> {
         match self.active_tab().filter(|_| self.visible)? {
             DockTab::Shell(view) => Some(view),
-            DockTab::Logs(_) | DockTab::Activity(_) | DockTab::Compare(_) => None,
+            _ => None,
         }
     }
 
@@ -323,8 +348,8 @@ impl Dock {
             let (reads_to_end, count) = match item.tab_key() {
                 TabKey::Shell(_) => (false, &mut live.shells),
                 TabKey::Logs(request) => (request.previous, &mut live.logs),
-                // Runs no session: closing it ends nothing.
-                TabKey::Activity(_) | TabKey::Compare(..) => continue,
+                // Runs no session: closing it ends nothing. Forwards say so in their tooltip.
+                TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Forwards(_) => continue,
             };
             if dock_model::ends_a_session(item.tab_status(), reads_to_end) {
                 *count += 1;

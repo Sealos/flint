@@ -932,6 +932,13 @@ impl ClusterManager {
             } => {
                 self.check_write_pin(cluster, pin, reply);
             }
+            Request::CheckForward {
+                cluster,
+                pin,
+                reply,
+            } => {
+                let _ = reply.send(self.forward_gate(&cluster, &pin));
+            }
             Request::CheckContext {
                 cluster,
                 pin,
@@ -2045,6 +2052,19 @@ impl ClusterManager {
         } else {
             Err(WriteError::ConnectionChanged)
         }
+    }
+
+    /// Whether a port-forward on `pin` may carry on: as for a write, and not while the context
+    /// is paused. From memory, so a running forward can ask often.
+    fn forward_gate(&self, cluster: &str, pin: &ContextPin) -> Result<(), WriteError> {
+        self.write_pin_gate(cluster, pin)?;
+        if self.paused(cluster) {
+            return Err(WriteRefusal::Unsettled {
+                cluster: cluster.to_owned(),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     /// Answers whether a write may go out on `pin`, from a read of the files that starts after
@@ -3351,6 +3371,26 @@ mod tests {
         assert_eq!(manager.write_gate("dev").err(), protected);
         manager.reload_settings().await;
         assert_eq!(manager.write_gate("dev").err(), protected);
+    }
+
+    // covers UP-54: a running port-forward stops being allowed once its context is held
+    // (paused behind a kubeconfig file that can't be read) or re-pointed.
+    #[tokio::test]
+    async fn a_forward_is_refused_while_held_or_re_pointed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://dev")).await;
+        let pin = manager.contexts.pin_confirmed("dev");
+        manager.held.insert("dev".into());
+        assert!(matches!(
+            manager.forward_gate("dev", &pin),
+            Err(WriteError::KubeconfigUnreadable)
+        ));
+        manager.held.remove("dev");
+        rewrite(&mut manager, dir.path(), &kubeconfig_with("https://old")).await;
+        assert!(matches!(
+            manager.forward_gate("dev", &pin),
+            Err(WriteError::Refused(WriteRefusal::Moved { .. }))
+        ));
     }
 
     // covers UP-06, UP-41: a shell's check (`Request::CheckContext`) compares the context with
