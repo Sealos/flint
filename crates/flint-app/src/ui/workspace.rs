@@ -1698,7 +1698,12 @@ impl Workspace {
         let filter = self.ui_state.namespace_filter(&name).to_vec();
         let list = self.list.as_ref().map(|l| l.read(cx));
         let controls = header_controls(cluster, list);
-        let ns_summary = namespace_summary(&filter);
+        let ns_summary = namespace_button_text(&filter, list.and_then(|l| l.limited_to()));
+        // Only a namespace's own name can be long; the limited text must stay whole.
+        let ns_label = match filter.as_slice() {
+            [one] if *one == ns_summary => ellipsize(&ns_summary, NAMESPACE_LABEL_MAX_CHARS),
+            _ => ns_summary.clone(),
+        };
 
         let mut crumbs: Vec<(SharedString, String)> = vec![(
             self.model.read(cx).names().of(&name).into(),
@@ -1761,7 +1766,7 @@ impl Workspace {
         let two_rows = self.header_has_two_rows(window_width, cx);
         let namespaces = controls
             .namespaces
-            .then(|| self.render_namespace_filter(&ns_summary, cx));
+            .then(|| self.render_namespace_filter(&ns_summary, ns_label, cx));
         let watch_mode = controls
             .watch_mode
             .then(|| self.render_watch_mode(&name, two_rows, cx));
@@ -1871,7 +1876,12 @@ impl Workspace {
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
     }
 
-    fn render_namespace_filter(&self, summary: &str, cx: &Context<Self>) -> impl IntoElement {
+    fn render_namespace_filter(
+        &self,
+        summary: &str,
+        label: String,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let this = cx.weak_entity();
         let input = self.namespace_input.clone();
         let on_open = this.clone();
@@ -1899,7 +1909,7 @@ impl Workspace {
                 Button::new("namespace-filter-button")
                     .xsmall()
                     .outline()
-                    .label(ellipsize(summary, NAMESPACE_LABEL_MAX_CHARS))
+                    .label(label)
                     // The label is cut to a few characters, so the watch mode button beside it
                     // stays on screen at the minimum width (UP-33). The accessible name and the
                     // tooltip keep the whole name.
@@ -3100,6 +3110,27 @@ pub fn namespace_summary(filter: &[String]) -> String {
         [] => "All namespaces".to_owned(),
         [one] => one.clone(),
         many => format!("{} namespaces", many.len()),
+    }
+}
+
+/// The namespace button's text: [`namespace_summary`], or, on a list that fell back to the
+/// namespaces the account can read and does not cover the whole selection, what it really covers.
+fn namespace_button_text(filter: &[String], limit: Option<&flint_core::NamespaceLimit>) -> String {
+    let Some(limit) = limit else {
+        return namespace_summary(filter);
+    };
+    if filter.is_empty() {
+        return match limit.listed.len() {
+            0 => "No namespaces (limited)".to_owned(),
+            1 => "1 namespace (limited)".to_owned(),
+            n => format!("{n} namespaces (limited)"),
+        };
+    }
+    let covered = filter.iter().filter(|n| limit.listed.contains(n)).count();
+    match filter.len() {
+        selected if covered == selected => namespace_summary(filter),
+        1 => "0 of 1 namespace (limited)".to_owned(),
+        selected => format!("{covered} of {selected} namespaces (limited)"),
     }
 }
 
