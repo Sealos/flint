@@ -11,17 +11,19 @@
 //! - **Pinned.** An alert keeps the identity of the cluster that raised it. Opening it after that
 //!   context was removed or re-pointed is refused, whichever cluster is active now.
 //! - **Investigate** only copies a prompt, through the exposure and scope checks in
-//!   [`investigate_prompt`]. It writes nothing and starts no agent.
+//!   [`investigate_prompt`]. It writes nothing and starts no agent. It is offered in the app's
+//!   menu for every alert kept, because a banner has no action button without a signed app.
 
 // module-tests: alert_center_tests.rs
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use flint_core::alerts::{AlertConfig, AlertEngine, AlertEvent, ClusterSnapshot};
 use flint_core::discovery::ClusterDiscovery;
-use flint_core::handle::{ClusterSummary, ConnectionState, ReadPin};
+use flint_core::handle::{ActivationRefused, ClusterSummary, ConnectionState, ReadPin};
 use flint_core::problems::ProblemKind;
 use flint_core::read::DiscoveredKinds;
 use flint_core::settings::WatchMode;
@@ -31,20 +33,20 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::*;
 use jiff::{SignedDuration, Timestamp};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+#[cfg(any(test, feature = "automation"))]
+use serde::Serialize;
 
-use super::clusters::ClustersModel;
-use super::registry;
+use super::clusters::{ClustersModel, Discovered};
+use super::{menu_fit, registry};
 use crate::notifications::investigate_prompt::{InvestigatePrompt, investigate_prompt};
 use crate::notifications::{
-    DeliveryError, Notification, NotificationSender, clean, platform_sender,
+    ACCEPTED_TEXT, DeliveryError, Notification, NotificationSender, clean, distinct_labels,
+    platform_sender,
 };
 
-/// How many past alerts the app keeps to open from.
+/// How many past alerts the app keeps to open from. The menu lists them all.
 const MAX_RECENT: usize = 20;
-
-/// How many recent alerts the menu lists.
-const MENU_ALERTS: usize = 5;
 
 /// How often a pass runs with no change, since the engine's cooldowns pass with time.
 const PASS_EVERY: Duration = Duration::from_secs(15);
@@ -124,23 +126,61 @@ pub fn check_origin<'a>(
     clusters: &'a [ClusterSummary],
     label: &str,
 ) -> Result<&'a ClusterSummary, String> {
-    let label = clean(label);
     let Some(summary) = clusters.iter().find(|c| c.info.name == context) else {
-        return Err(format!(
-            "\"{label}\" was removed from kubeconfig, so this alert cannot be opened."
-        ));
+        return Err(refusal_text(ActivationRefused::Removed, label));
     };
     if !origin.holds(summary) {
-        return Err(format!(
-            "\"{label}\" changed since this alert was raised, so it was not opened."
-        ));
+        return Err(refusal_text(ActivationRefused::Changed, label));
     }
     if summary.paused {
-        return Err(format!(
-            "\"{label}\" is paused until its kubeconfig is confirmed, so it was not opened."
-        ));
+        return Err(refusal_text(ActivationRefused::Paused, label));
     }
     Ok(summary)
+}
+
+/// What to tell the person when an alert's cluster was not opened.
+fn refusal_text(refused: ActivationRefused, label: &str) -> String {
+    let label = clean(label);
+    match refused {
+        ActivationRefused::Removed => {
+            format!("\"{label}\" was removed from kubeconfig, so this alert cannot be opened.")
+        }
+        ActivationRefused::Changed => {
+            format!("\"{label}\" changed since this alert was raised, so it was not opened.")
+        }
+        ActivationRefused::Paused => {
+            format!(
+                "\"{label}\" is paused until its kubeconfig is confirmed, so it was not opened."
+            )
+        }
+        ActivationRefused::Stopped => {
+            format!("\"{label}\" was not opened because Flint's core stopped.")
+        }
+    }
+}
+
+/// The catalog that may vouch for a cluster's kinds: from its current slot, and only if the last
+/// discovery succeeded. After a failure the event still carries the previous result.
+fn verified_discovery(found: Option<&Discovered>, generation: u64) -> Option<&ClusterDiscovery> {
+    found
+        .filter(|d| d.generation == generation && d.error.is_none())
+        .and_then(|d| d.discovery.as_deref())
+}
+
+/// Sends `notifications` in order, stopping as soon as `live` says they were cancelled.
+fn send_batch(
+    sender: &dyn NotificationSender,
+    notifications: &[Notification],
+    live: impl Fn() -> bool,
+) -> Vec<(String, Result<(), DeliveryError>)> {
+    let mut answers = Vec::with_capacity(notifications.len());
+    for notification in notifications {
+        if !live() {
+            break;
+        }
+        answers.push((notification.tag.clone(), sender.send(notification)));
+    }
+    answers
 }
 
 /// What is known about a cluster in one pass.
@@ -226,8 +266,12 @@ pub struct TrackerInput<'a> {
 pub enum Delivery {
     /// Not answered yet.
     Sending,
+    /// Held until the OS answers the permission prompt.
+    AwaitingPermission,
     /// The OS accepted it, which does not prove it was shown.
     Accepted,
+    /// Alerts were turned off before an answer arrived.
+    Cancelled,
     Refused(DeliveryError),
 }
 
@@ -235,17 +279,23 @@ impl Delivery {
     fn text(&self) -> String {
         match self {
             Self::Sending => "Sending the last notification…".to_owned(),
-            Self::Accepted => "The system accepted the last notification.".to_owned(),
+            Self::AwaitingPermission => "Waiting for permission to notify…".to_owned(),
+            Self::Accepted => ACCEPTED_TEXT.to_owned(),
+            Self::Cancelled => "Not sent: alerts were turned off.".to_owned(),
             Self::Refused(error) => error.message(),
         }
     }
 
+    #[cfg(any(test, feature = "automation"))]
     fn state(&self) -> &'static str {
         match self {
             Self::Sending => "sending",
+            Self::AwaitingPermission => "awaiting_permission",
             Self::Accepted => "accepted",
+            Self::Cancelled => "cancelled",
             Self::Refused(DeliveryError::NotPermitted) => "not_permitted",
             Self::Refused(DeliveryError::NeedsAppBundle) => "needs_app_bundle",
+            Self::Refused(DeliveryError::Unanswered) => "unknown",
             Self::Refused(DeliveryError::Failed(_)) => "failed",
         }
     }
@@ -288,12 +338,20 @@ impl AlertTracker {
     }
 
     /// Forgets every cluster, so turning notifications on again starts from a new baseline
-    /// rather than a backlog.
+    /// rather than a backlog. What was still on its way is cancelled.
     pub fn reset(&mut self) {
         self.engine = AlertEngine::new(AlertConfig::default());
         self.origins.clear();
         self.unwatched_since.clear();
         self.checked.clear();
+        for recent in &mut self.recent {
+            if matches!(
+                recent.delivery,
+                Delivery::Sending | Delivery::AwaitingPermission
+            ) {
+                recent.delivery = Delivery::Cancelled;
+            }
+        }
     }
 
     fn forget(&mut self, cluster: &str) {
@@ -301,6 +359,14 @@ impl AlertTracker {
         self.origins.remove(cluster);
         self.unwatched_since.remove(cluster);
         self.checked.remove(cluster);
+    }
+
+    /// Drops the alerts of contexts that left kubeconfig, whether or not they were still tracked.
+    /// Returns whether any went.
+    fn purge_removed(&mut self, present: impl Fn(&str) -> bool) -> bool {
+        let before = self.recent.len();
+        self.recent.retain(|r| present(&r.notification.cluster));
+        self.recent.len() != before
     }
 
     /// Applies one pass and returns what to send.
@@ -314,6 +380,7 @@ impl AlertTracker {
         for cluster in gone {
             self.forget(&cluster);
         }
+        self.purge_removed(|cluster| inputs.iter().any(|i| &*i.cluster == cluster));
         let mut sent = Vec::new();
         for input in inputs {
             // A context that now means another cluster shares no history with the old one.
@@ -366,12 +433,16 @@ impl AlertTracker {
             let events = match events {
                 Ok(events) => events,
                 Err(limit) => {
+                    self.checked.remove(&input.cluster);
                     tracing::warn!("desktop notifications: {limit}");
                     continue;
                 }
             };
-            self.origins
-                .insert(Arc::clone(&input.cluster), input.origin.clone());
+            // A cluster the engine did not admit holds no entry here either.
+            if self.engine.tracks(&input.cluster) {
+                self.origins
+                    .insert(Arc::clone(&input.cluster), input.origin.clone());
+            }
             for event in events {
                 sent.push(self.record(event, input));
             }
@@ -379,11 +450,14 @@ impl AlertTracker {
         sent
     }
 
-    /// Drops a cluster's history once it has had no feed for [`UNWATCHED_GRACE`].
+    /// A cluster with no feed is unreadable at once, so its groups are unknown and no cooldown
+    /// runs. Its history is dropped once that has lasted [`UNWATCHED_GRACE`].
     fn note_unwatched(&mut self, cluster: &Arc<str>, now: Timestamp) {
+        self.checked.remove(cluster);
         if !self.origins.contains_key(cluster) {
             return;
         }
+        self.engine.mark_unknown(cluster);
         let since = *self
             .unwatched_since
             .entry(Arc::clone(cluster))
@@ -398,7 +472,13 @@ impl AlertTracker {
         let tag = format!("flint-alert-{}-{}", self.run, self.next);
         let notification = Notification::from_event(&event, &input.label).tagged(tag);
         if self.recent.len() == MAX_RECENT {
-            self.recent.pop_front();
+            // A raised alert is the one that can be investigated, so it is kept the longest.
+            let oldest = self
+                .recent
+                .iter()
+                .position(|r| !matches!(r.event, AlertEvent::Raised(_)))
+                .unwrap_or(0);
+            self.recent.remove(oldest);
         }
         self.recent.push_back(RecentAlert {
             notification: notification.clone(),
@@ -427,11 +507,12 @@ impl AlertTracker {
 }
 
 /// What the automation channel reports.
+#[cfg(any(test, feature = "automation"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AlertsState {
     pub enabled: bool,
-    /// What the OS last answered: `none`, `sending`, `accepted`, `not_permitted`,
-    /// `needs_app_bundle` or `failed`.
+    /// What the OS last answered: `none`, `sending`, `awaiting_permission`, `accepted`,
+    /// `cancelled`, `not_permitted`, `needs_app_bundle`, `unknown` or `failed`.
     pub delivery: &'static str,
     /// Clusters whose last pass could check every kind of problem.
     pub checked: Vec<String>,
@@ -439,6 +520,7 @@ pub struct AlertsState {
 }
 
 /// One alert in [`AlertsState`].
+#[cfg(any(test, feature = "automation"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AlertRowState {
     pub tag: String,
@@ -456,6 +538,12 @@ pub struct AlertCenter {
     enabled: bool,
     /// What the OS last answered, from turning on or from a notification.
     delivery: Option<Delivery>,
+    /// Changes at each toggle: work started under an older value is cancelled.
+    session: Arc<AtomicU64>,
+    /// The OS has not answered the permission request yet, so nothing can be sent.
+    awaiting_permission: bool,
+    /// What arose meanwhile, oldest first and at most [`MAX_RECENT`].
+    held: VecDeque<Notification>,
     note: Option<&'static str>,
     _note: Task<()>,
     _tasks: Vec<Task<()>>,
@@ -478,7 +566,17 @@ impl AlertCenter {
             std::process::id(),
             Timestamp::now().as_millisecond()
         );
-        let observe = cx.observe(&model, |this, _, cx| this.sync_enabled(cx));
+        let observe = cx.observe(&model, |this, model, cx| {
+            // At once, and with alerts off too: no pass may come to clear a removed context.
+            let clusters = &model.read(cx).clusters;
+            if this
+                .tracker
+                .purge_removed(|id| clusters.iter().any(|c| c.info.name == id))
+            {
+                cx.notify();
+            }
+            this.sync_enabled(cx);
+        });
         let mut updates = model.read(cx).core().telemetry_updates();
         let on_change = cx.spawn(async move |this, cx| {
             while updates.changed().await {
@@ -502,6 +600,9 @@ impl AlertCenter {
             tracker: AlertTracker::new(run),
             enabled: false,
             delivery: None,
+            session: Arc::new(AtomicU64::new(0)),
+            awaiting_permission: false,
+            held: VecDeque::new(),
             note: None,
             _note: Task::ready(()),
             _tasks: vec![on_change, on_timer],
@@ -519,7 +620,10 @@ impl AlertCenter {
             return;
         }
         self.enabled = enabled;
+        let session = self.session.fetch_add(1, Ordering::SeqCst) + 1;
         self.tracker.reset();
+        self.held.clear();
+        self.awaiting_permission = enabled;
         self.delivery = None;
         cx.notify();
         if !enabled {
@@ -529,16 +633,42 @@ impl AlertCenter {
         cx.spawn(async move |this, cx| {
             let answer = cx.background_spawn(async move { sender.prepare() }).await;
             let _ = this.update(cx, |this, cx| {
-                if this.enabled
-                    && let Err(error) = answer
-                {
-                    this.delivery = Some(Delivery::Refused(error));
-                    cx.notify();
+                if this.session.load(Ordering::SeqCst) == session {
+                    this.permission_answered(answer, cx);
                 }
             });
         })
         .detach();
         self.pass(cx);
+    }
+
+    /// Sends what waited for the permission prompt, or records why it cannot be sent.
+    fn permission_answered(&mut self, answer: Result<(), DeliveryError>, cx: &mut Context<Self>) {
+        self.awaiting_permission = false;
+        let held: Vec<Notification> = self
+            .held
+            .drain(..)
+            .filter(|n| self.tracker.find(&n.tag).is_some())
+            .collect();
+        match answer {
+            Ok(()) if held.is_empty() => {
+                self.delivery = None;
+            }
+            Ok(()) => {
+                for notification in &held {
+                    self.tracker.delivered(&notification.tag, Delivery::Sending);
+                }
+                self.submit(held, cx);
+            }
+            Err(error) => {
+                for notification in &held {
+                    self.tracker
+                        .delivered(&notification.tag, Delivery::Refused(error.clone()));
+                }
+                self.delivery = Some(Delivery::Refused(error));
+            }
+        }
+        cx.notify();
     }
 
     /// One pass over every cluster. Reads only what the feeds and the model already hold.
@@ -554,22 +684,28 @@ impl AlertCenter {
             .iter()
             .map(|summary| core.telemetry(&summary.info.name))
             .collect();
+        let labels: Vec<(&str, String)> = model
+            .clusters
+            .iter()
+            .map(|summary| {
+                let id = summary.info.name.as_str();
+                (id, names.with_real(id))
+            })
+            .collect();
+        let labels = distinct_labels(&labels);
         let inputs: Vec<TrackerInput<'_>> = model
             .clusters
             .iter()
             .zip(&feeds)
-            .map(|(summary, feed)| {
+            .zip(labels)
+            .map(|((summary, feed), label)| {
                 let id = summary.info.name.as_str();
-                let discovery = model
-                    .discovery
-                    .get(id)
-                    .filter(|d| d.generation == summary.generation)
-                    .and_then(|d| d.discovery.as_deref());
+                let discovery = verified_discovery(model.discovery.get(id), summary.generation);
                 let snapshot = feed.as_ref().map(|feed| &*feed.snapshot);
                 TrackerInput {
                     cluster: Arc::from(id),
                     origin: AlertOrigin::of(summary),
-                    label: names.with_real(id),
+                    label,
                     reading: reading(
                         summary,
                         model.settings.watch_mode_for(id),
@@ -584,19 +720,42 @@ impl AlertCenter {
         if notifications.is_empty() {
             return;
         }
+        if self.awaiting_permission {
+            for notification in notifications {
+                self.tracker
+                    .delivered(&notification.tag, Delivery::AwaitingPermission);
+                if self.held.len() == MAX_RECENT {
+                    self.held.pop_front();
+                }
+                self.held.push_back(notification);
+            }
+            self.delivery = Some(Delivery::AwaitingPermission);
+            cx.notify();
+            return;
+        }
+        self.submit(notifications, cx);
+    }
+
+    /// Sends a batch off the UI thread. Turning alerts off stops it before its next notification,
+    /// and whatever it was still doing then is not reported.
+    fn submit(&mut self, notifications: Vec<Notification>, cx: &mut Context<Self>) {
         self.delivery = Some(Delivery::Sending);
         cx.notify();
         let sender = Arc::clone(&self.sender);
+        let session = Arc::clone(&self.session);
+        let started = session.load(Ordering::SeqCst);
         cx.spawn(async move |this, cx| {
-            let answers: Vec<(String, Result<(), DeliveryError>)> = cx
+            let answers = cx
                 .background_spawn(async move {
-                    notifications
-                        .iter()
-                        .map(|n| (n.tag.clone(), sender.send(n)))
-                        .collect()
+                    send_batch(&*sender, &notifications, || {
+                        session.load(Ordering::SeqCst) == started
+                    })
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                if this.session.load(Ordering::SeqCst) != started {
+                    return;
+                }
                 for (tag, answer) in answers {
                     let delivery = match answer {
                         Ok(()) => Delivery::Accepted,
@@ -638,9 +797,36 @@ impl AlertCenter {
 
     /// Opens the cluster that raised the alert, by its exact context.
     pub fn open(&mut self, tag: &str, cx: &mut Context<Self>) {
-        if let Some((_, context)) = self.checked_cluster(tag, cx) {
-            self.model.update(cx, |model, _| model.activate(context));
+        if let Some((recent, context)) = self.checked_cluster(tag, cx) {
+            self.activate(&recent.origin, context, None, cx);
         }
+    }
+
+    /// Has the core activate `context` if it still is `origin`, and only then copies `prompt`.
+    fn activate(
+        &mut self,
+        origin: &AlertOrigin,
+        context: String,
+        prompt: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let label = self.model.read(cx).names().exact(&context);
+        let answer = self.model.update(cx, |model, _| {
+            model.activate_pinned(&context, origin.pin.clone(), origin.generation)
+        });
+        cx.spawn(async move |this, cx| {
+            let answer = answer.await;
+            let _ = this.update(cx, |this, cx| match answer {
+                Ok(()) => {
+                    if let Some(prompt) = prompt {
+                        cx.write_to_clipboard(ClipboardItem::new_string(prompt));
+                        this.show_note("Prompt copied", cx);
+                    }
+                }
+                Err(refused) => this.refuse(refusal_text(refused, &label), cx),
+            });
+        })
+        .detach();
     }
 
     /// Opens the alert's cluster and copies a read-only prompt, when its exposure allows one.
@@ -657,15 +843,13 @@ impl AlertCenter {
             return;
         };
         let model = self.model.read(cx);
-        let discovered = model
-            .discovery
-            .get(&context)
-            .filter(|d| d.generation == recent.origin.generation)
-            .and_then(|d| d.discovery.as_deref())
-            .map(|d| DiscoveredKinds {
-                kinds: d.kinds.clone(),
-                skipped_groups: d.incomplete_groups.clone(),
-                stale_groups: Vec::new(),
+        let discovered =
+            verified_discovery(model.discovery.get(&context), recent.origin.generation).map(|d| {
+                DiscoveredKinds {
+                    kinds: d.kinds.clone(),
+                    skipped_groups: d.incomplete_groups.clone(),
+                    stale_groups: Vec::new(),
+                }
             });
         let prompt = investigate_prompt(
             alert,
@@ -675,9 +859,7 @@ impl AlertCenter {
         );
         match prompt {
             InvestigatePrompt::Ready(prompt) => {
-                cx.write_to_clipboard(ClipboardItem::new_string(prompt));
-                self.model.update(cx, |model, _| model.activate(context));
-                self.show_note("Prompt copied", cx);
+                self.activate(&recent.origin, context, Some(prompt), cx);
             }
             InvestigatePrompt::Disabled(reason) => self.refuse(reason.message().to_owned(), cx),
         }
@@ -695,6 +877,7 @@ impl AlertCenter {
         });
     }
 
+    #[cfg(any(test, feature = "automation"))]
     pub fn view_state(&self) -> AlertsState {
         AlertsState {
             enabled: self.enabled,
@@ -740,6 +923,11 @@ pub fn install(model: &Entity<ClustersModel>, cx: &mut App) {
     });
 }
 
+/// A menu row: the whole title, whose label tells clusters apart, then the shortened body.
+fn menu_row(notification: &Notification) -> String {
+    format!("{}: {}", notification.title, clean(&notification.body))
+}
+
 /// The header's notifications menu: the setting, what it covers, what the OS last answered, and
 /// the latest alerts. `None` in a window without a running center.
 pub fn render_button(cx: &App) -> Option<impl IntoElement + use<>> {
@@ -757,9 +945,10 @@ pub fn render_button(cx: &App) -> Option<impl IntoElement + use<>> {
             .label(label)
             .tab_stop(false)
             .tooltip("Desktop notifications for problems on watched clusters")
-            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, cx| {
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
+                menu_fit::dismiss_when_shrunk(window, cx);
                 let state = center.read(cx);
-                let mut menu = menu
+                let mut menu = menu_fit::fit_menu(menu, window)
                     .item(
                         PopupMenuItem::new("Desktop notifications")
                             .checked(state.enabled)
@@ -770,16 +959,13 @@ pub fn render_button(cx: &App) -> Option<impl IntoElement + use<>> {
                 if let Some(delivery) = &state.delivery {
                     menu = menu.separator().label(delivery.text());
                 }
-                let recent: Vec<&RecentAlert> = state.tracker.recent().take(MENU_ALERTS).collect();
+                let recent: Vec<&RecentAlert> = state.tracker.recent().collect();
                 if !recent.is_empty() {
                     menu = menu.separator().label("Recent alerts");
                 }
                 for alert in recent {
                     let tag = alert.notification.tag.clone();
-                    let text = clean(&format!(
-                        "{}: {}",
-                        alert.notification.title, alert.notification.body
-                    ));
+                    let text = menu_row(&alert.notification);
                     menu = menu.item(
                         PopupMenuItem::new(text)
                             .on_click(registry::on_click(OpenAlert { tag: tag.clone() })),

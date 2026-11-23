@@ -621,6 +621,73 @@ fn open_reports_unknown_while_unavailable() {
 }
 
 #[test]
+fn flapping_clusters_are_rate_limited_and_coalesced() {
+    let config = AlertConfig::default();
+    let mut engine = AlertEngine::new(config);
+    let clusters: Vec<Arc<str>> = (0..5).map(|n| Arc::from(format!("c{n}"))).collect();
+    let mut sent = 0;
+    // Each cluster is down for two minutes and up for ten seconds, for half an hour.
+    let mut second = 0;
+    for cluster in &clusters {
+        engine
+            .observe(cluster, at(0), ClusterSnapshot::complete(&[]))
+            .unwrap();
+    }
+    while second < 1800 {
+        for offset in [0, 120] {
+            let now = at(0) + SignedDuration::from_secs(second + offset);
+            for cluster in &clusters {
+                sent += engine
+                    .observe(cluster, now, ClusterSnapshot::Unavailable)
+                    .unwrap()
+                    .len();
+            }
+        }
+        let now = at(0) + SignedDuration::from_secs(second + 130);
+        for cluster in &clusters {
+            sent += engine
+                .observe(cluster, now, ClusterSnapshot::complete(&[]))
+                .unwrap()
+                .len();
+        }
+        second += 140;
+    }
+    // Six windows at five changes each, against about 130 without a limit.
+    assert!(sent <= 35, "{sent} notifications");
+}
+
+#[test]
+fn a_pass_that_verified_nothing_is_not_a_recovery() {
+    let name = cluster();
+    let mut engine = AlertEngine::new(AlertConfig::default());
+    engine
+        .observe(&name, at(0), ClusterSnapshot::complete(&[]))
+        .unwrap();
+    engine
+        .observe(&name, at(1), ClusterSnapshot::Unavailable)
+        .unwrap();
+    let down = engine
+        .observe(&name, at(4), ClusterSnapshot::Unavailable)
+        .unwrap();
+    assert_eq!(down.len(), 1);
+    let blind = engine
+        .observe(
+            &name,
+            at(5),
+            ClusterSnapshot::Available {
+                problems: &[],
+                unchecked: &ALL_KINDS,
+            },
+        )
+        .unwrap();
+    assert!(blind.is_empty(), "{blind:?}");
+    let back = engine
+        .observe(&name, at(6), ClusterSnapshot::complete(&[]))
+        .unwrap();
+    assert!(matches!(back[..], [AlertEvent::ClusterAvailable { .. }]));
+}
+
+#[test]
 fn unavailable_before_any_read_tracks_nothing() {
     let mut engine = AlertEngine::new(config());
     for minute in [0, 10] {

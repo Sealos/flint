@@ -15,6 +15,7 @@ pub mod investigate_prompt;
 #[path = "notifications_macos.rs"]
 mod macos;
 
+use std::collections::HashSet;
 #[cfg(any(test, not(target_os = "macos")))]
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -162,13 +163,52 @@ fn is_shown(c: char) -> bool {
     single_line(text) == *text
 }
 
-/// Why the OS did not take a notification.
+/// `labels` (exact context, shown label) cleaned, in order, with no two alike. Labels that only
+/// differ in removed characters get a number, in the order of their exact contexts. It is at the
+/// end, which [`clean`] keeps when it shortens a name.
+pub(crate) fn distinct_labels(labels: &[(&str, String)]) -> Vec<String> {
+    let mut shown: Vec<String> = labels.iter().map(|(_, label)| clean(label)).collect();
+    let mut order: Vec<usize> = (0..labels.len()).collect();
+    order.sort_by_key(|&index| labels[index].0);
+    let mut taken: HashSet<String> = HashSet::new();
+    let repeated: HashSet<String> = shown
+        .iter()
+        .filter(|label| !taken.insert((*label).clone()))
+        .cloned()
+        .collect();
+    for index in order {
+        if !repeated.contains(&shown[index]) {
+            continue;
+        }
+        let base = shown[index].clone();
+        let unique = (1..)
+            .map(|number| clean(&format!("{base} [{number}]")))
+            .find(|candidate| !taken.contains(candidate))
+            .expect("the numbers do not run out");
+        taken.insert(unique.clone());
+        shown[index] = unique;
+    }
+    shown
+}
+
+/// What a sent notification's status says. `notify-send` can exit successfully with no
+/// notification service running, so on Linux it claims only that it was handed over.
+pub(crate) const ACCEPTED_TEXT: &str = if cfg!(target_os = "macos") {
+    "The system accepted the last notification."
+} else {
+    "Sent to the notification service, which may not display it."
+};
+
+/// Why the OS did not take a notification. Only macOS reports the permission and bundle cases.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum DeliveryError {
     /// The OS has not granted Flint permission to notify, or it was turned off.
     NotPermitted,
     /// macOS only notifies from an app bundle, and this process is not running from one.
     NeedsAppBundle,
+    /// The OS gave no answer in time, so whether it took the notification is unknown.
+    Unanswered,
     /// The notifier is missing, or it failed.
     Failed(String),
 }
@@ -185,6 +225,7 @@ impl DeliveryError {
             Self::NeedsAppBundle => {
                 "Not delivered: macOS only posts notifications for Flint.app.".to_owned()
             }
+            Self::Unanswered => "Delivery unknown: the system did not answer in time.".to_owned(),
             Self::Failed(why) => format!("Not delivered: {why}."),
         }
     }
@@ -469,6 +510,34 @@ mod tests {
         ] {
             assert!(error.message().starts_with("Not delivered"), "{error:?}");
         }
+    }
+
+    #[test]
+    fn labels_stay_distinct_after_cleaning() {
+        let labels = [
+            ("prod&", "prod&".to_owned()),
+            ("prod", "prod".to_owned()),
+            ("prod [1]", "prod [1]".to_owned()),
+            ("dev", "dev".to_owned()),
+        ];
+        let shown = distinct_labels(&labels);
+        assert_eq!(shown[3], "dev");
+        assert_eq!(shown[2], "prod [1]", "a real name keeps its text");
+        let unique: HashSet<&String> = shown.iter().collect();
+        assert_eq!(unique.len(), labels.len(), "{shown:?}");
+
+        let long = "x".repeat(100);
+        let labels = [(long.as_str(), long.clone()), ("y", format!("{long}&"))];
+        let shown = distinct_labels(&labels);
+        assert_ne!(shown[0], shown[1]);
+        assert!(shown.iter().all(|label| clean(label) == *label));
+    }
+
+    #[test]
+    fn an_unanswered_notification_is_reported_as_unknown() {
+        let text = DeliveryError::Unanswered.message();
+        assert!(text.contains("unknown"), "{text}");
+        assert!(!text.starts_with("Not delivered"), "{text}");
     }
 
     #[test]

@@ -45,10 +45,6 @@ fn center() -> Result<objc2::rc::Retained<UNUserNotificationCenter>, DeliveryErr
     Ok(UNUserNotificationCenter::currentNotificationCenter())
 }
 
-fn no_answer() -> DeliveryError {
-    DeliveryError::Failed("macOS did not answer".to_owned())
-}
-
 fn permission(center: &UNUserNotificationCenter) -> Result<Permission, DeliveryError> {
     let (answer, answered) = mpsc::channel();
     let completion = RcBlock::new(move |settings: NonNull<UNNotificationSettings>| {
@@ -69,7 +65,9 @@ fn permission(center: &UNUserNotificationCenter) -> Result<Permission, DeliveryE
         });
     });
     center.getNotificationSettingsWithCompletionHandler(&completion);
-    answered.recv_timeout(ANSWER_WAIT).map_err(|_| no_answer())
+    answered
+        .recv_timeout(ANSWER_WAIT)
+        .map_err(|_| DeliveryError::Unanswered)
 }
 
 fn error_text(error: *mut NSError) -> Option<String> {
@@ -95,7 +93,8 @@ impl NotificationSender for MacosSender {
         );
         match answered.recv_timeout(PROMPT_WAIT) {
             Ok((true, _)) => Ok(()),
-            Ok((false, None)) | Err(_) => Err(DeliveryError::NotPermitted),
+            Ok((false, None)) => Err(DeliveryError::NotPermitted),
+            Err(_) => Err(DeliveryError::Unanswered),
             Ok((false, Some(why))) => {
                 tracing::warn!("notification permission: {why}");
                 Err(DeliveryError::NotPermitted)
@@ -125,7 +124,7 @@ impl NotificationSender for MacosSender {
         match answered.recv_timeout(ANSWER_WAIT) {
             Ok(None) => Ok(()),
             Ok(Some(why)) => Err(DeliveryError::Failed(why)),
-            Err(_) => Err(no_answer()),
+            Err(_) => Err(DeliveryError::Unanswered),
         }
     }
 }

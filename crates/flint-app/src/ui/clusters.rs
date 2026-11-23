@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flint_core::activity::ActivityRecord;
+use flint_core::handle::{ActivationRefused, ReadPin};
 use flint_core::settings::{AiExposureState, AiScope, ClusterTag, TrustState};
 use flint_core::{
     Appearance, ClusterDiscovery, ClusterId, ClusterSummary, Command, ConnectionState, CoreHandle,
@@ -195,6 +196,17 @@ impl ClustersModel {
 
     pub fn activate(&mut self, cluster: ClusterId) {
         self.send(Command::Activate(cluster));
+    }
+
+    /// Activates `cluster` only if the core still holds it as this slot and identity.
+    pub fn activate_pinned(
+        &mut self,
+        cluster: &str,
+        pin: ReadPin,
+        generation: u64,
+    ) -> impl Future<Output = Result<(), ActivationRefused>> + use<> {
+        self.last_error = None;
+        self.core.activate_pinned(cluster, pin, generation)
     }
 
     /// Sends a command and clears the previous command's error. The core reports a failure as an

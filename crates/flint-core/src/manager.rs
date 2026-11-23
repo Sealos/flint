@@ -18,7 +18,8 @@ use crate::connection::member::{Member, ServerIdentity};
 use crate::credential::{CredentialSource, WriteCredential};
 use crate::discovery::ClusterDiscovery;
 use crate::handle::{
-    ClusterSummary, ClustersSnapshot, Command, ConnectionState, CoreConfig, Event, Request,
+    ActivationRefused, ClusterSummary, ClustersSnapshot, Command, ConnectionState, CoreConfig,
+    Event, ReadPin, Request,
 };
 use crate::kubeconfig::{
     self, BlankFile, ContextInfo, FileRead, KubeconfigReader, LoadedKubeconfig, ReadBusy,
@@ -716,6 +717,14 @@ impl ClusterManager {
             // Requests are handled without waiting: the reload runs as an internal message.
             Request::ReloadKubeconfig { reply } => {
                 let _ = self.internal_tx.send(Internal::ReloadKubeconfig { reply });
+            }
+            Request::ActivatePinned {
+                cluster,
+                pin,
+                generation,
+                reply,
+            } => {
+                let _ = reply.send(self.activate_pinned(cluster, &pin, generation));
             }
             Request::Subscribe { id, cluster, kind } => {
                 self.subscriptions.insert(id, (cluster.clone(), kind));
@@ -2263,6 +2272,27 @@ impl ClusterManager {
             self.start_discovery(&id);
         }
         self.reconcile(&id);
+    }
+
+    /// [`Self::activate`], only if `id` is still the slot and identity the caller pinned.
+    fn activate_pinned(
+        &mut self,
+        id: ClusterId,
+        pin: &ReadPin,
+        generation: u64,
+    ) -> Result<(), ActivationRefused> {
+        let Some(slot) = self.clusters.iter().find(|c| c.info.name == id) else {
+            return Err(ActivationRefused::Removed);
+        };
+        let now = slot.summary(&self.contexts, self.unsettled(&id), self.paused(&id));
+        if now.generation != generation || now.read_pin() != *pin {
+            return Err(ActivationRefused::Changed);
+        }
+        if now.paused {
+            return Err(ActivationRefused::Paused);
+        }
+        self.activate(id);
+        Ok(())
     }
 
     /// Makes `id` the selection and returns the one before it, already out of the foreground: this
@@ -6381,6 +6411,31 @@ users:
             slot.connect_task.is_none(),
             "no connection bypassed the queue"
         );
+    }
+
+    #[tokio::test]
+    async fn a_pinned_activation_refuses_a_context_that_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, _, _) = pausable(dir.path(), NO_CONTEXTS).await;
+        manager.active = None;
+        let now = manager.summaries().remove(0);
+        let (pin, generation) = (now.read_pin(), now.generation);
+
+        let mut moved = pin.clone();
+        moved.server = Some("https://other.example:6443".to_owned());
+        let refused = manager.activate_pinned("dev".into(), &moved, generation);
+        assert_eq!(refused, Err(ActivationRefused::Changed));
+        let refused = manager.activate_pinned("dev".into(), &pin, generation + 1);
+        assert_eq!(refused, Err(ActivationRefused::Changed));
+        let refused = manager.activate_pinned("gone".into(), &pin, generation);
+        assert_eq!(refused, Err(ActivationRefused::Removed));
+        assert_eq!(manager.active, None, "nothing was activated");
+
+        assert_eq!(
+            manager.activate_pinned("dev".into(), &pin, generation),
+            Ok(())
+        );
+        assert_eq!(manager.active.as_deref(), Some("dev"));
     }
 
     // A first connection that failed, then a hold and the same file back: the retry reports to

@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use flint_core::alerts::AlertEvent;
 use flint_core::dashboard::{ProblemSnapshot, ProblemSummariser};
@@ -18,10 +19,10 @@ use k8s_openapi::api::core::v1::{Node, NodeCondition, NodeStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
 use super::{
-    ALL_KINDS, AlertOrigin, AlertTracker, Delivery, MAX_RECENT, Reading, TrackerInput,
-    check_origin, out_of_scope_kinds, reading,
+    ALL_KINDS, AlertOrigin, AlertTracker, Delivery, Discovered, MAX_RECENT, Reading, TrackerInput,
+    check_origin, menu_row, out_of_scope_kinds, reading, send_batch, verified_discovery,
 };
-use crate::notifications::{DeliveryError, Notification};
+use crate::notifications::{DeliveryError, Notification, NotificationSender};
 
 const PROD: &str = "prod";
 const SERVER: &str = "https://prod.example:6443";
@@ -381,6 +382,151 @@ fn tags_differ_between_runs_and_alerts() {
         at(1300),
     );
     assert!(next.iter().all(|n| n.tag != first.tag));
+}
+
+#[test]
+fn a_failed_rediscovery_vouches_for_nothing() {
+    let catalog = Arc::new(complete());
+    let found = |error: Option<&str>, generation| Discovered {
+        discovery: Some(Arc::clone(&catalog)),
+        error: error.map(str::to_owned),
+        generation,
+    };
+    assert!(verified_discovery(Some(&found(None, 1)), 1).is_some());
+    assert!(verified_discovery(Some(&found(Some("timed out"), 1)), 1).is_none());
+    assert!(verified_discovery(Some(&found(None, 1)), 2).is_none());
+    assert!(verified_discovery(None, 1).is_none());
+}
+
+#[test]
+fn recovery_needs_a_pass_that_checked_every_kind() {
+    let prod = connected(PROD);
+    let mut tracker = tracker();
+    raised(&mut tracker, &prod, "n1");
+    for second in [610, 800] {
+        tracker.observe(&[input(&prod, Reading::Lost)], at(second));
+    }
+    let healthy = snapshot(PROD, Vec::new(), at(900));
+    let blind = Reading::Feed {
+        snapshot: &healthy,
+        discovery: None,
+    };
+    let sent = tracker.observe(&[input(&prod, blind)], at(900));
+    assert!(sent.is_empty(), "{sent:?}");
+    let back = feed(&mut tracker, &prod, vec![bad_node(PROD, "n1")], at(915));
+    assert_eq!(back.len(), 1, "{back:?}");
+    assert!(back[0].title.starts_with("Cluster available"));
+}
+
+#[test]
+fn a_feed_gap_does_not_complete_a_resolution_cooldown() {
+    let prod = connected(PROD);
+    let mut tracker = tracker();
+    raised(&mut tracker, &prod, "n1");
+    // Clear from 610, so the cooldown would end at 1210, inside the gap.
+    assert!(feed(&mut tracker, &prod, Vec::new(), at(610)).is_empty());
+    let gap = tracker.observe(&[input(&prod, Reading::NotWatched)], at(1200));
+    assert!(gap.is_empty(), "{gap:?}");
+    assert!(tracker.checked.is_empty(), "a gap is not checked");
+    let back = feed(&mut tracker, &prod, Vec::new(), at(1215));
+    assert!(back.is_empty(), "the cooldown restarts: {back:?}");
+    let done = feed(&mut tracker, &prod, Vec::new(), at(1815));
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert!(done[0].title.starts_with("Alert resolved"));
+}
+
+#[test]
+fn only_admitted_contexts_are_tracked() {
+    let mut tracker = tracker();
+    for index in 0..300 {
+        let mut paused = connected(&format!("never-watched-{index}"));
+        paused.paused = true;
+        tracker.observe(&[input(&paused, Reading::Lost)], at(0));
+    }
+    assert!(tracker.origins.is_empty());
+}
+
+#[test]
+fn removing_a_context_purges_its_alerts() {
+    let prod = connected(PROD);
+    let other = connected("other");
+    let mut tracker = tracker();
+    let sent = raised(&mut tracker, &prod, "n1");
+    let reading = Reading::NotWatched;
+    tracker.observe(&[input(&prod, reading), input(&other, reading)], at(610));
+    assert!(tracker.find(&sent.tag).is_some());
+    tracker.observe(&[input(&other, reading)], at(620));
+    assert!(tracker.find(&sent.tag).is_none());
+    assert_eq!(tracker.recent().count(), 0);
+}
+
+#[test]
+fn turning_off_cancels_what_was_on_its_way() {
+    let prod = connected(PROD);
+    let mut tracker = tracker();
+    let sent = raised(&mut tracker, &prod, "n1");
+    tracker.reset();
+    assert_eq!(
+        tracker.find(&sent.tag).unwrap().delivery,
+        Delivery::Cancelled
+    );
+}
+
+#[derive(Default)]
+struct CountingSender {
+    sent: AtomicUsize,
+}
+
+impl NotificationSender for CountingSender {
+    fn prepare(&self) -> Result<(), DeliveryError> {
+        Ok(())
+    }
+
+    fn send(&self, _: &Notification) -> Result<(), DeliveryError> {
+        self.sent.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[test]
+fn a_cancelled_batch_stops_before_its_next_submission() {
+    let prod = connected(PROD);
+    let mut tracker = tracker();
+    let one = raised(&mut tracker, &prod, "n1");
+    let batch = vec![one.clone(), one.clone(), one];
+    let sender = CountingSender::default();
+    let answers = send_batch(&sender, &batch, || sender.sent.load(Ordering::SeqCst) < 1);
+    assert_eq!(answers.len(), 1);
+    assert_eq!(sender.sent.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_menu_row_keeps_the_whole_label() {
+    let label = format!("{}-suffix [2]", "x".repeat(50));
+    let notification = Notification {
+        title: format!("Critical alert: {label}"),
+        body: "y".repeat(200),
+        cluster: Arc::from(PROD),
+        tag: String::new(),
+    };
+    assert!(menu_row(&notification).contains(&label));
+}
+
+#[test]
+fn raised_alerts_outlast_other_events_in_the_list() {
+    let prod = connected(PROD);
+    let mut tracker = tracker();
+    let sent = raised(&mut tracker, &prod, "n1");
+    let input = input(&prod, Reading::Lost);
+    for _ in 0..MAX_RECENT + 5 {
+        tracker.record(
+            AlertEvent::ClusterAvailable {
+                cluster: Arc::from(PROD),
+            },
+            &input,
+        );
+    }
+    assert!(tracker.find(&sent.tag).is_some());
 }
 
 #[test]

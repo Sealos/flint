@@ -74,7 +74,8 @@ fn an_alert_reports_delivery_and_opens_only_its_own_cluster() -> Result<()> {
     app.dispatch("workspace::OpenAlert", json!({"tag": tag}))?;
     let state = app.wait_for("/banners", Test::at_least(1))?;
     let banners = state["banners"].to_string();
-    anyhow::ensure!(banners.contains("removed"), "{banners}");
+    anyhow::ensure!(banners.contains("no longer available"), "{banners}");
+    anyhow::ensure!(state["alerts"]["recent"] == json!([]), "{state}");
     anyhow::ensure!(state["active_cluster"] == TwoClusters::B, "{state}");
     Ok(())
 }
