@@ -71,8 +71,9 @@ impl PartialEq for FeedId {
 #[derive(Default)]
 pub(super) struct Feed {
     source: Option<(WeakEntity<ClustersModel>, ClusterId)>,
-    /// Keeps the cluster's feed running in watch mode On view while this view lives.
-    _interest: Option<OverviewInterest>,
+    /// Keeps the cluster's feed running in watch mode On view while this view lives, and is the
+    /// only way this view reads it, so it never shows a later slot of the same context.
+    interest: Option<OverviewInterest>,
     /// The feed the values on screen came from. `None` for the waiting state.
     shown: Option<FeedId>,
     /// Stands in for the core's running feed.
@@ -83,22 +84,31 @@ pub(super) struct Feed {
     dirty: bool,
     _read: Option<Task<()>>,
     _updates: Option<Task<()>>,
+    _registered: Option<Task<()>>,
     _age_out: Option<Task<()>>,
 }
 
 impl DashboardView {
-    /// A dashboard of `cluster`, kept current until it is dropped.
+    /// A dashboard of `cluster`'s slot `generation`, kept current until it is dropped.
     pub fn following(
         model: Entity<ClustersModel>,
         cluster: ClusterId,
+        generation: u64,
         cx: &mut Context<Self>,
     ) -> Self {
         let (waiting, lists) = read(None, &cluster, &Thresholds::default(), Timestamp::now());
         let mut view = Self::new(waiting, cx);
         view.lists = lists;
         let mut updates = model.read(cx).core().telemetry_updates();
-        view.feed._interest = Some(model.read(cx).core().open_overview(&cluster));
+        let interest = model.read(cx).core().open_overview_on(&cluster, generation);
+        let registered = interest.registered();
+        view.feed.interest = Some(interest);
         view.feed.source = Some((model.downgrade(), cluster));
+        // A feed already running changes nothing on the board when this view registers.
+        view.feed._registered = Some(cx.spawn(async move |this, cx| {
+            registered.await;
+            let _ = this.update(cx, |view, cx| view.refresh(cx));
+        }));
         view.feed._updates = Some(cx.spawn(async move |this, cx| {
             while updates.changed().await {
                 if this.update(cx, |view, cx| view.refresh(cx)).is_err() {
@@ -118,19 +128,18 @@ impl DashboardView {
     }
 
     /// The feed running for this view's cluster now.
-    fn current_feed(&self, cx: &App) -> Option<FeedId> {
+    fn current_feed(&self) -> Option<FeedId> {
         #[cfg(test)]
         if let Some(current) = &self.feed.test_current {
             return current.clone();
         }
-        let (model, cluster) = self.feed.source.as_ref()?;
-        let telemetry = model.upgrade()?.read(cx).core().telemetry(cluster)?;
+        let telemetry = self.feed.interest.as_ref()?.telemetry()?;
         Some(FeedId::of(&telemetry))
     }
 
     /// Whether what is shown came from the feed running now.
-    pub(super) fn shows_current_feed(&self, cx: &App) -> bool {
-        self.feed.shown == self.current_feed(cx)
+    pub(super) fn shows_current_feed(&self, _: &App) -> bool {
+        self.feed.shown == self.current_feed()
     }
 
     /// Takes down values whose feed has stopped or been replaced.
@@ -156,7 +165,7 @@ impl DashboardView {
         lists: ProblemLists,
         cx: &mut Context<Self>,
     ) {
-        if self.current_feed(cx) != feed {
+        if self.current_feed() != feed {
             self.feed.dirty = true;
             return;
         }
@@ -192,7 +201,7 @@ impl DashboardView {
         let thresholds = model
             .settings
             .thresholds_for(&cluster, active.info.server.as_deref());
-        let telemetry = model.core().telemetry(&cluster);
+        let telemetry = self.feed.interest.as_ref().and_then(|i| i.telemetry());
         let feed = telemetry.as_ref().map(FeedId::of);
         self.feed.reading = true;
         self.feed.dirty = false;
