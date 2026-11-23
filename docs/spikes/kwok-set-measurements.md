@@ -24,7 +24,8 @@ measurement below.
 
 Safety: the script writes only to its own scratch kubeconfig, refuses `~/.kube/config` and `.dev/kubeconfig`, ignores
 the caller's `KUBECONFIG`, uses only the contexts it created and deletes only clusters with its own run prefix. The
-test (`crates/flint-core/tests/kwok_set.rs`) also refuses any other context name and any server not on `127.0.0.1`.
+test (`crates/flint-core/tests/kwok_set.rs`) also refuses the default kubeconfig through any link, any other context
+name, and any server that is not the `127.0.0.1` endpoint kwokctl records for that cluster.
 
 ## Summary
 
@@ -38,11 +39,14 @@ test (`crates/flint-core/tests/kwok_set.rs`) also refuses any other context name
 **Budgets.** Neither #447 nor this document sets a budget for a running set. The closest figures are the warm-cluster
 targets of [ADR-0012](../adr/0012-keep-recently-used-clusters-warm.md), planned in #247 and not implemented:
 
-- **Memory, exceeded if applied to a running set:** `warm_memory_mib` is 128 MiB for the background clusters. The
-  5-member footprint less the 1-cluster footprint is about 490 to 540 MiB for the four background members, roughly
-  four times that figure. The ADR's limit is on estimated store size, so this compares it with a footprint.
+- **Memory, compliance unverified:** `warm_memory_mib` is 128 MiB for the background clusters and limits the estimated
+  size of their row stores, which these runs did not measure. In `All`, at the "after churn" checkpoint, the
+  whole-process footprint of the 5-member runs (686 to 711 MiB) less that of the 1-cluster runs (168 to 170 MiB) is
+  516 to 543 MiB. That delta includes allocations outside the row stores, such as typed telemetry objects, so it does
+  not show whether the ADR's budget is met.
 - **CPU, within the target:** under 1% of one core with 3 idle warm clusters. Five idle members used 0.24 to 0.34%,
-  with no object changes during the idle window.
+  with no test-generated churn during the idle window. KWOK still renews node Leases, so the window is not free of
+  watch traffic.
 
 ## Method (`OnView`, first measurement)
 
@@ -91,7 +95,9 @@ Both are left out of the table.
 Release build of `2172951f` plus the mode switch in the test, with the same environment, clusters, churn and memory
 and CPU measures. Each member runs the kinds of mode All and a feed with 7 typed watches. "All members synced" now
 also waits until every feed reports all 7 kinds current. It does not wait for the other kinds of mode All, so some of
-their initial list cost can fall after that point.
+their initial list cost can fall after that point. "Churn seen after" and "CPU during churn" end when the pod lists
+show every label. The feed's separate pod watch may still be processing those updates, so its remaining CPU can fall
+outside that figure.
 
 **Noise:** other builds and test clusters ran throughout. The 1-minute load average read between 15.6 and 34.7 on 12
 cores at the run boundaries. The `OnView` runs saw about 50, so differences in timing between the two tables are not
@@ -122,6 +128,7 @@ All, because both run together in this mode.
 
 - The GUI app, its rendering and frame times: this measures the core in a test process.
 - The feed apart from the other watches of mode All.
+- The row-store size estimate that ADR-0012's memory budget applies to.
 - Real clusters, where rows carry more labels and cell text and event rates differ.
 - Pod creation and deletion churn, relists, member failure and reconnects: the churn here is label updates only.
 - A quiet machine: no run was made without other builds running.
