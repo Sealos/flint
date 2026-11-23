@@ -392,6 +392,12 @@ impl CombinedList {
             .map(|row| &**row)
     }
 
+    /// The row of member `member` with `uid`, whatever filters hide it. Linear.
+    pub fn find_row(&self, member: usize, uid: &str) -> Option<&Row> {
+        let rows = &self.members.get(member)?.snapshot.rows;
+        rows.iter().find(|row| &*row.uid == uid).map(|row| &**row)
+    }
+
     /// The identity of the row at `at`.
     pub fn row_id(&self, at: RowRef) -> Option<CombinedRowId> {
         let row = self.checked_row(at)?;

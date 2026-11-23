@@ -9,6 +9,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use flint_core::ClusterId;
@@ -425,6 +426,7 @@ impl CombinedResourceList {
         self.view = Arc::new(computed.view);
         self.applied_sort = sort;
         self.drawn = self.layout(self.laid_out_width);
+        self.problems.set_awaiting(computed.awaiting);
         if self.selected == computed.selected {
             let tracked = computed.tracked.unwrap_or(TrackedRow {
                 line: None,
@@ -433,7 +435,7 @@ impl CombinedResourceList {
             });
             self.selected_line = tracked.line;
             self.selected_seen = tracked.seen;
-            if tracked.gone {
+            if tracked.gone || computed.selected_filtered_out {
                 self.selected = None;
                 self.selected_line = None;
                 self.selected_seen = None;
@@ -643,9 +645,25 @@ impl CombinedResourceList {
     }
 
     fn on_problems(&mut self, _: &ToggleCombinedProblems, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.has_problem_filter() {
+            return;
+        }
         self.problems.toggle();
         self.recompute(cx);
         cx.notify();
+    }
+
+    /// Whether the Problems toggle applies to the kind shown.
+    pub(in super::super) fn has_problem_filter(&self) -> bool {
+        self.shown
+            .kind
+            .as_ref()
+            .is_some_and(|kind| ProblemListKind::of(kind).is_some())
+    }
+
+    /// The namespaces and clusters the list is narrowed to. Empty means all.
+    pub(in super::super) fn problem_scope(&self) -> (Vec<String>, Vec<String>) {
+        (self.query.namespaces.clone(), self.query.clusters.clone())
     }
 
     /// Takes the newest problems of the members.
@@ -666,11 +684,13 @@ impl CombinedResourceList {
     pub(in super::super) fn problems_note(&self) -> Option<String> {
         let kind = self.shown.kind.as_ref()?;
         let members = self.shown.list.members();
-        self.problems.unchecked_note(
-            kind,
-            &self.label,
-            members.iter().map(|m| (m.cluster(), m.display_name())),
-        )
+        self.problems
+            .unchecked_note(
+                kind,
+                &self.label,
+                members.iter().map(|m| (m.cluster(), m.display_name())),
+            )
+            .or_else(|| self.problems.awaiting_note())
     }
 
     fn render_lines(
@@ -963,17 +983,11 @@ impl CombinedResourceList {
                         ToggleGroupByCluster,
                     )),
             )
-            .when(
-                self.shown
-                    .kind
-                    .as_ref()
-                    .is_some_and(|kind| ProblemListKind::of(kind).is_some()),
-                |el| {
-                    el.child(problems::toggle_button(self.problems.is_on()).on_click(
-                        registry::on_click_in(self.focus.clone(), ToggleCombinedProblems),
-                    ))
-                },
-            )
+            .when(self.has_problem_filter(), |el| {
+                el.child(problems::toggle_button(self.problems.is_on()).on_click(
+                    registry::on_click_in(self.focus.clone(), ToggleCombinedProblems),
+                ))
+            })
             .when(wide, |el| {
                 el.child(
                     Button::new("toggle-wide")
@@ -1155,6 +1169,10 @@ struct Computed {
     measured: MeasuredWidths,
     selected: Option<CombinedRowId>,
     tracked: Option<TrackedRow>,
+    /// Rows shown only because the feed has not judged them yet.
+    awaiting: usize,
+    /// The Problems toggle hides the selected row, so its detail must close.
+    selected_filtered_out: bool,
 }
 
 fn compute_view(
@@ -1166,20 +1184,47 @@ fn compute_view(
     cached: Option<MeasuredWidths>,
     now: i64,
 ) -> Computed {
+    let awaiting = AtomicUsize::new(0);
     let view = source.list.compute_where(query, now, |member, row| {
-        keep.is_none_or(|keep| keep.keeps(member, row))
+        keep.is_none_or(|keep| {
+            if keep.awaits_check(member, row) {
+                awaiting.fetch_add(1, Ordering::Relaxed);
+            }
+            keep.keeps(member, row)
+        })
     });
     // Widths follow the namespaces only, so typing or sorting moves no column.
     let measured = model::measure_scope(source, query, &view, cached, now);
     let tracked = selected
         .as_ref()
         .map(|id| model::track_selection(source, &view, id, seen.as_ref(), now));
+    let hidden = tracked
+        .as_ref()
+        .is_some_and(|t| t.line.is_none() && !t.gone);
+    let selected_filtered_out = hidden
+        && keep
+            .zip(selected.as_ref())
+            .is_some_and(|(keep, id)| problems_hide(source, keep, id));
     Computed {
         view,
         measured,
         selected,
         tracked,
+        awaiting: awaiting.into_inner(),
+        selected_filtered_out,
     }
+}
+
+/// Whether the Problems toggle is what hides the row `id`, rather than a text filter or a group.
+fn problems_hide(source: &CombinedSource, keep: &MemberFilter, id: &CombinedRowId) -> bool {
+    let list = &source.list;
+    list.members()
+        .iter()
+        .position(|m| m.cluster() == &*id.cluster)
+        .is_some_and(|member| {
+            list.find_row(member, &id.uid)
+                .is_some_and(|row| !keep.keeps(member, row))
+        })
 }
 
 /// What a limited member's rows cover, in full.

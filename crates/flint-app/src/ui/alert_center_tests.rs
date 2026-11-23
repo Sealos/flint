@@ -94,6 +94,7 @@ fn snapshot(cluster: &str, problems: Vec<Problem>, now: Timestamp) -> TelemetryS
         problems: problems.into(),
         unchecked: Vec::new(),
         settling: Vec::new(),
+        checked: Arc::default(),
         counts,
         metrics: MetricsCheck::Waiting,
         capacity: None,

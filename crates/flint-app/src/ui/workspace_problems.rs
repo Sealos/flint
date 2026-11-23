@@ -15,13 +15,52 @@ use super::Workspace;
 
 type Feeds = Vec<(ClusterId, Option<Arc<TelemetrySnapshot>>)>;
 
+/// Which connection a cluster on screen is: a context moved to another server is another one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::ui) struct FeedIdentity {
+    pub(in crate::ui) cluster: ClusterId,
+    pub(in crate::ui) generation: u64,
+    pub(in crate::ui) endpoint: u64,
+}
+
 /// The last values read, and the read under way.
 #[derive(Default)]
-pub(super) struct ProblemFeed {
+pub(in crate::ui) struct ProblemFeed {
+    identities: Vec<FeedIdentity>,
     seen: Feeds,
     values: HashMap<ClusterId, ClusterProblems>,
     building: bool,
     _build: Option<Task<()>>,
+}
+
+impl ProblemFeed {
+    /// Notes the connections on screen. Values read from any other are dropped.
+    pub(in crate::ui) fn follow(&mut self, identities: Vec<FeedIdentity>) {
+        if self.identities != identities {
+            self.identities = identities;
+            self.values.clear();
+            self.seen.clear();
+        }
+    }
+
+    /// Takes a finished read, unless the connections changed while it ran.
+    pub(in crate::ui) fn finish(
+        &mut self,
+        read_for: &[FeedIdentity],
+        values: HashMap<ClusterId, ClusterProblems>,
+    ) {
+        self.building = false;
+        if self.identities == read_for {
+            self.values = values;
+        } else {
+            self.seen.clear();
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::ui) fn value(&self, cluster: &str) -> Option<&ClusterProblems> {
+        self.values.get(cluster)
+    }
 }
 
 fn same_feeds(a: &Feeds, b: &Feeds) -> bool {
@@ -37,6 +76,26 @@ fn same_feeds(a: &Feeds, b: &Feeds) -> bool {
 }
 
 impl Workspace {
+    /// The connection of each cluster on screen.
+    fn problem_identities(&self, cx: &App) -> Vec<FeedIdentity> {
+        let model = self.model.read(cx);
+        let identity = |id: &str| {
+            let summary = model.clusters.iter().find(|s| s.info.name == id);
+            FeedIdentity {
+                cluster: id.to_owned(),
+                generation: summary.map_or(0, |s| s.generation),
+                endpoint: summary.map_or(0, |s| s.endpoint),
+            }
+        };
+        match &self.sets.running {
+            Some(run) => run
+                .current_members()
+                .map(|member| identity(member.context()))
+                .collect(),
+            None => self.cluster.iter().map(|id| identity(id)).collect(),
+        }
+    }
+
     /// The feed of each cluster on screen. A member that left its admitted server, or a slot
     /// that is not the one the views show, has none, so it reads as not checked.
     fn problem_feeds(&self, cx: &App) -> Feeds {
@@ -73,6 +132,8 @@ impl Workspace {
     /// Reads what changed, off the UI thread, and shows the newest values. Called on the
     /// workspace's one-second tick; with nothing new it compares pointers and stops.
     pub(super) fn refresh_problems(&mut self, cx: &mut Context<Self>) {
+        let identities = self.problem_identities(cx);
+        self.problem_feed.follow(identities.clone());
         self.show_problems(cx);
         if self.problem_feed.building {
             return;
@@ -92,15 +153,15 @@ impl Workspace {
         self.problem_feed._build = Some(cx.spawn(async move |this, cx| {
             let values = job.await;
             let _ = this.update(cx, |ws, cx| {
-                ws.problem_feed.building = false;
-                ws.problem_feed.values = values;
+                ws.problem_feed.finish(&identities, values);
                 ws.show_problems(cx);
             });
         }));
     }
 
     /// Gives the open list and the navigation the values of the clusters on screen. A cluster
-    /// not read yet is not checked, so values of the last cluster never show for this one.
+    /// not read yet is not checked, so values of the last cluster never show for this one. The
+    /// counts cover what the list shows: its namespaces and, in a set, its chosen clusters.
     fn show_problems(&mut self, cx: &mut Context<Self>) {
         let clusters: Vec<ClusterId> = match &self.sets.running {
             Some(run) => run
@@ -116,12 +177,18 @@ impl Workspace {
                 (id.clone(), known.unwrap_or_default())
             })
             .collect();
+        let (namespaces, chosen) = match (&self.sets.running, &self.cluster) {
+            (Some(run), _) => run.list.read(cx).problem_scope(),
+            (None, Some(cluster)) => (self.ui_state.namespace_filter(cluster).to_vec(), Vec::new()),
+            (None, None) => (Vec::new(), Vec::new()),
+        };
         let ordered: Vec<ClusterProblems> = clusters
             .iter()
+            .filter(|id| chosen.is_empty() || chosen.contains(id))
             .filter_map(|id| values.get(id).cloned())
             .collect();
         self.nav.update(cx, |nav, cx| {
-            nav.set_problem_badges(nav_badges(&ordered), cx)
+            nav.set_problem_badges(nav_badges(&ordered, &namespaces), cx)
         });
         if let Some(run) = &self.sets.running {
             run.list

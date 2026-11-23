@@ -42,7 +42,7 @@ use serde::Serialize;
 
 use super::clusters::{ClustersModel, Discovered};
 use super::workspace::SettingsDir;
-use super::{menu_fit, registry};
+use super::{menu_fit, pending_threshold, registry};
 use crate::notifications::investigate_prompt::{InvestigatePrompt, event_prompt};
 use crate::notifications::{
     ACCEPTED_TEXT, DeliveryError, Notification, NotificationSender, clean, distinct_labels,
@@ -72,10 +72,11 @@ pub const COVERAGE: &str = "Only clusters on Live: all kinds are checked in the 
 pub const NOT_COVERED: &str = "Clusters on Live: open views only have no background detection.";
 
 /// Every kind of problem.
-const ALL_KINDS: [ProblemKind; 6] = [
+const ALL_KINDS: [ProblemKind; 7] = [
     ProblemKind::CrashLoop,
     ProblemKind::OomKilled,
     ProblemKind::ImagePull,
+    ProblemKind::PodPending,
     ProblemKind::NodeNotReady,
     ProblemKind::JobFailed,
     ProblemKind::WorkloadShort,
@@ -275,7 +276,10 @@ pub fn reading<'a>(
 /// The API groups a kind of problem is read from. A pod's owner is read through its ReplicaSet.
 fn groups_of(kind: ProblemKind) -> &'static [&'static str] {
     match kind {
-        ProblemKind::CrashLoop | ProblemKind::OomKilled | ProblemKind::ImagePull => &["", "apps"],
+        ProblemKind::CrashLoop
+        | ProblemKind::OomKilled
+        | ProblemKind::ImagePull
+        | ProblemKind::PodPending => &["", "apps"],
         ProblemKind::NodeNotReady => &[""],
         ProblemKind::JobFailed => &["batch"],
         ProblemKind::WorkloadShort => &["apps"],
@@ -1167,6 +1171,7 @@ impl AlertCenter {
 pub fn install(model: &Entity<ClustersModel>, cx: &mut App) {
     let center = cx.new(|cx| AlertCenter::new(model.clone(), platform_sender(), cx));
     cx.set_global(Alerts(center.clone()));
+    pending_threshold::install(model, cx);
     let toggle_model = model.clone();
     cx.on_action(move |_: &ToggleDesktopNotifications, cx| {
         toggle_model.update(cx, |model, _| {
@@ -1219,7 +1224,8 @@ pub fn render_button(cx: &App) -> Option<impl IntoElement + use<>> {
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
                 menu_fit::dismiss_when_shrunk(window, cx);
                 let state = center.read(cx);
-                let mut menu = menu_fit::fit_menu(menu, window)
+                let pending = pending_threshold::PendingChoices::of(state.model.read(cx));
+                let menu = menu_fit::fit_menu(menu, window)
                     .item(
                         PopupMenuItem::new("Desktop notifications")
                             .checked(state.global)
@@ -1227,6 +1233,8 @@ pub fn render_button(cx: &App) -> Option<impl IntoElement + use<>> {
                     )
                     .label(COVERAGE)
                     .label(NOT_COVERED);
+                let mut menu = pending_threshold::submenu(menu, pending, window, cx);
+                let state = center.read(cx);
                 let model = state.model.read(cx);
                 if let Some(active) = model.active_cluster() {
                     let id = active.info.name.clone();

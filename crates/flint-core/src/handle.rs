@@ -159,6 +159,14 @@ pub enum Command {
         cluster: ClusterId,
         namespaces: Vec<String>,
     },
+    /// Set one threshold, for every cluster (`cluster: None`) or one context at one server, and
+    /// write it to `settings.toml`. `value: None` clears it. A value out of range is reported as
+    /// [`Event::Error`] and changes nothing. The change arrives back as `Event::SettingsChanged`.
+    SetThreshold {
+        cluster: Option<ClusterPin>,
+        metric: crate::thresholds::ThresholdMetric,
+        value: Option<u32>,
+    },
     /// Set the lines each log session keeps and write it to `settings.toml`. Sessions opened
     /// afterwards use it. The change arrives back as `Event::SettingsChanged`.
     SetLogBufferLines(u32),

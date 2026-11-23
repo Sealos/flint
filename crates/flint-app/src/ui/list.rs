@@ -693,6 +693,11 @@ impl ResourceList {
                     .collect(),
                 None => rows,
             };
+            let awaiting = job_problems.as_ref().map_or(0, |filter| {
+                rows.iter()
+                    .filter(|&&i| filter.awaits_check(&job_snapshot.rows[i as usize]))
+                    .count()
+            });
             let measured = list_model::rows_to_measure(&job_snapshot, &namespaces);
             let widths = list_model::measure_columns(&job_snapshot, &measured, unix_now());
             let scoped = list_model::rows_in_namespaces(&job_snapshot, &namespaces);
@@ -700,10 +705,10 @@ impl ResourceList {
                 rows.iter()
                     .position(|&i| job_snapshot.rows[i as usize].uid == *uid)
             });
-            (rows, widths, scoped, selected_uid, position)
+            (rows, widths, scoped, selected_uid, position, awaiting)
         });
         self._compute = cx.spawn(async move |this, cx| {
-            let (rows, widths, scoped, uid, position) = job.await;
+            let (rows, widths, scoped, uid, position, awaiting) = job.await;
             let select_first = this.update(cx, |list, cx| {
                 list.computing = false;
                 #[cfg(test)]
@@ -732,6 +737,7 @@ impl ResourceList {
                 list.widths.update(&snapshot.columns, &widths, restart);
                 list.scoped = scoped;
                 list.rows_in_one_namespace = one_namespace;
+                list.problems.set_awaiting(awaiting);
                 list.apply(snapshot, rows, uid, position, cx);
                 if list.dirty {
                     list.recompute(cx);
@@ -814,7 +820,24 @@ impl ResourceList {
             // The selection changed while this ran: find it again.
             Some(_) => self.dirty = true,
         }
+        if self.problems_hide_selected() {
+            self.hidden_selected = None;
+            self.clear_selection(cx);
+        }
         cx.notify();
+    }
+
+    /// Whether the Problems toggle is what hides the selected row, so its detail must close.
+    fn problems_hide_selected(&self) -> bool {
+        let (Some(selected), Some(hidden)) = (&self.selected, &self.hidden_selected) else {
+            return false;
+        };
+        let Some(filter) = self.problems.row_filter(&self.kind, &self.cluster) else {
+            return false;
+        };
+        find_row(&self.shown, selected.namespace.as_deref(), &selected.name)
+            .map(|i| &self.shown.rows[i])
+            .is_some_and(|row| row.uid == *hidden && !filter.keeps(row))
     }
 
     fn select_index(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1882,7 +1905,6 @@ mod managed;
 #[path = "list_combined.rs"]
 pub mod combined;
 
-#[cfg(any(test, feature = "automation"))]
 #[path = "list_problems.rs"]
 pub(in crate::ui) mod problems;
 
@@ -1890,6 +1912,7 @@ pub(in crate::ui) mod problems;
 #[path = "list_problems_tests.rs"]
 mod problems_tests;
 
+#[cfg(any(test, feature = "automation"))]
 #[path = "list_state.rs"]
 mod state;
 

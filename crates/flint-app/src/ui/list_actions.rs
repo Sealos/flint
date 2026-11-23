@@ -182,6 +182,7 @@ impl ResourceList {
         let cluster = self.cluster.as_str();
         self.problems
             .unchecked_note(&self.kind, &self.label, std::iter::once((cluster, cluster)))
+            .or_else(|| self.problems.awaiting_note())
     }
 
     fn focus_filter(&mut self, _: &FocusFilter, window: &mut Window, cx: &mut Context<Self>) {

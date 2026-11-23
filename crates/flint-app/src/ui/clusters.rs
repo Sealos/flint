@@ -398,6 +398,21 @@ impl ClustersModel {
         });
     }
 
+    /// Sets one threshold, for all clusters or one context at one server (`None` clears it).
+    /// Written to `settings.toml`; the change comes back as a settings event.
+    pub fn set_threshold(
+        &mut self,
+        cluster: Option<flint_core::settings::ClusterPin>,
+        metric: flint_core::thresholds::ThresholdMetric,
+        value: Option<u32>,
+    ) {
+        self.send(Command::SetThreshold {
+            cluster,
+            metric,
+            value,
+        });
+    }
+
     /// Tells the core which namespaces the user filters `cluster` on, for kinds the user may not
     /// list in all namespaces.
     pub fn set_namespace_filter(&mut self, cluster: ClusterId, namespaces: Vec<String>) {

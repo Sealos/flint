@@ -331,6 +331,12 @@ impl Workspace {
                     .as_ref()
                     .is_some_and(|list| list.read(cx).has_problem_filter())
             })
+            .when::<super::super::list::combined::ToggleCombinedProblems>(|ws, cx| {
+                ws.sets
+                    .running
+                    .as_ref()
+                    .is_some_and(|run| run.list.read(cx).has_problem_filter())
+            })
             .add::<SelectRow>(view_open!(list_wide), |ws, a, cx| match &ws.list {
                 Some(l) => l.read(cx).check_select_row(a),
                 None => Err(ActionError::unavailable::<SelectRow>()),

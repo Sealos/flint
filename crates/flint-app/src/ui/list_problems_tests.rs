@@ -8,7 +8,9 @@ use flint_core::dashboard::{ProblemSnapshot, ProblemSummariser};
 use flint_core::problems::{
     Classifier, Problem, ProblemId, ProblemKind, ProblemSubject, ReplicaSetIndex,
 };
-use flint_core::telemetry::{Availability, KindCheck, TelemetrySnapshot, WatchedKind};
+use flint_core::telemetry::{
+    Availability, CheckedObjects, KindCheck, TelemetrySnapshot, WatchedKind,
+};
 use flint_core::{Cell, ConnectionState, KindId, Row};
 use flint_e2e::fake_api::{CONTEXT, FakeApiServer, Options};
 use gpui_kit::TestAppContext;
@@ -18,6 +20,7 @@ use k8s_openapi::jiff::Timestamp;
 
 use super::problems::{ClusterProblems, ProblemBadge, ProblemFilter, nav_badges};
 use crate::ui::support_tests::open_workspace_with;
+use crate::ui::workspace::problems::{FeedIdentity, ProblemFeed};
 
 const WAIT: Duration = Duration::from_secs(30);
 const FIXTURE_PODS: &str = include_str!("../../../flint-e2e/fixtures/objects/core/v1/pods.json");
@@ -29,14 +32,37 @@ fn fixture_problems() -> Vec<Problem> {
     Classifier::new("fixture", now).pods_with_replica_sets(&pods, &ReplicaSetIndex::unavailable())
 }
 
+/// The uids of the fixture's pods, and of the healthy row the tests add.
+fn fixture_uids() -> Vec<String> {
+    let list: serde_json::Value = serde_json::from_str(FIXTURE_PODS).unwrap();
+    let items = list["items"].as_array().unwrap();
+    items
+        .iter()
+        .map(|pod| pod["metadata"]["uid"].as_str().unwrap().to_owned())
+        .chain(["uid-healthy".to_owned()])
+        .collect()
+}
+
 fn snapshot(
     problems: Vec<Problem>,
     availability: Availability,
     pods: KindCheck,
 ) -> TelemetrySnapshot {
+    snapshot_judging(problems, availability, pods, fixture_uids())
+}
+
+/// A snapshot whose pass judged exactly the pods with `judged` uids.
+fn snapshot_judging(
+    problems: Vec<Problem>,
+    availability: Availability,
+    pods: KindCheck,
+    judged: Vec<String>,
+) -> TelemetrySnapshot {
     let at = Timestamp::UNIX_EPOCH;
     let mut kinds = WatchedKind::ALL.map(|kind| (kind, KindCheck::Current));
     kinds[WatchedKind::Pods as usize].1 = pods;
+    let mut checked = CheckedObjects::default();
+    checked.record_uids(WatchedKind::Pods, judged);
     TelemetrySnapshot {
         cluster: "fixture".into(),
         at,
@@ -45,6 +71,7 @@ fn snapshot(
         problems: problems.into(),
         unchecked: Vec::new(),
         settling: Vec::new(),
+        checked: Arc::new(checked),
         counts: ProblemSummariser::default().summarise(&ProblemSnapshot::unavailable(), at),
         metrics: Default::default(),
         capacity: None,
@@ -73,9 +100,26 @@ fn filter_of(cluster: &str, problems: ClusterProblems) -> ProblemFilter {
     filter
 }
 
-/// A cluster checked in full, whose one problem is the pod `name` with `uid`.
-pub(super) fn checked_with_pod(name: &str, uid: &str) -> ClusterProblems {
-    let problem = Problem {
+/// A cluster checked in full, whose one problem is the pod `name` with `uid`, and whose pass also
+/// judged the healthy pods `healthy`.
+pub(super) fn checked_with_pod(name: &str, uid: &str, healthy: &[&str]) -> ClusterProblems {
+    let problem = crash_loop(name, uid);
+    let judged = healthy
+        .iter()
+        .copied()
+        .chain([uid])
+        .map(str::to_owned)
+        .collect();
+    ClusterProblems::read(Some(&snapshot_judging(
+        vec![problem],
+        Availability::Checked,
+        KindCheck::Current,
+        judged,
+    )))
+}
+
+fn crash_loop(name: &str, uid: &str) -> Problem {
+    Problem {
         id: ProblemId {
             cluster: "c".into(),
             kind: ProblemKind::CrashLoop,
@@ -90,12 +134,114 @@ pub(super) fn checked_with_pod(name: &str, uid: &str) -> ClusterProblems {
         owner_known: true,
         reason: None,
         since: None,
+    }
+}
+
+#[test]
+fn a_recreated_pod_the_feed_has_not_judged_stays_and_is_named() {
+    let problems = checked_with_pod("web", "uid-old", &["uid-healthy"]);
+    let mut filter = filter_of("c", problems);
+    let keep = filter.row_filter(&KindId::pods(), "c").unwrap();
+    let recreated = row("web", "uid-new");
+    assert!(keep.keeps(&recreated), "not judged yet, so not hidden");
+    assert!(keep.awaits_check(&recreated));
+    let healthy = row("healthy", "uid-healthy");
+    assert!(!keep.keeps(&healthy), "judged and healthy, so hidden");
+    assert!(!keep.awaits_check(&healthy));
+    assert!(!keep.awaits_check(&row("web", "uid-old")));
+
+    filter.set_awaiting(1);
+    assert!(filter.awaiting_note().unwrap().contains("not been checked"));
+    filter.toggle();
+    assert_eq!(filter.awaiting_note(), None);
+}
+
+#[test]
+fn a_badge_counts_only_the_namespaces_shown() {
+    let problems = checked_with_pod("web", "uid-web", &[]);
+    let in_scope = nav_badges(std::slice::from_ref(&problems), &["default".to_owned()]);
+    assert_eq!(in_scope[&KindId::pods()].text, "1");
+    let out_of_scope = nav_badges(std::slice::from_ref(&problems), &["other".to_owned()]);
+    assert!(!out_of_scope.contains_key(&KindId::pods()));
+    let all = nav_badges(&[problems], &[]);
+    assert_eq!(all[&KindId::pods()].text, "1");
+}
+
+#[test]
+fn a_problem_on_two_containers_of_one_pod_counts_once_in_its_namespace() {
+    let mut second = crash_loop("web", "uid-web");
+    if let ProblemSubject::Container { container, .. } = &mut second.id.subject {
+        *container = "sidecar".to_owned();
+    }
+    let problems = ClusterProblems::read(Some(&snapshot(
+        vec![crash_loop("web", "uid-web"), second],
+        Availability::Checked,
+        KindCheck::Current,
+    )));
+    let badges = nav_badges(&[problems], &["default".to_owned()]);
+    assert_eq!(badges[&KindId::pods()].text, "1");
+}
+
+#[test]
+fn a_stuck_pending_pod_is_kept_by_the_filter_and_counted() {
+    let problem = Problem {
+        id: ProblemId {
+            cluster: "c".into(),
+            kind: ProblemKind::PodPending,
+            subject: ProblemSubject::Pod {
+                namespace: "default".to_owned(),
+                name: "stuck".to_owned(),
+                uid: Some("uid-stuck".to_owned()),
+            },
+        },
+        owner: None,
+        owner_known: true,
+        reason: None,
+        since: None,
     };
-    ClusterProblems::read(Some(&snapshot(
+    let problems = ClusterProblems::read(Some(&snapshot_judging(
         vec![problem],
         Availability::Checked,
         KindCheck::Current,
-    )))
+        vec!["uid-stuck".to_owned()],
+    )));
+    assert_eq!(
+        nav_badges(std::slice::from_ref(&problems), &[])[&KindId::pods()].text,
+        "1"
+    );
+    let filter = filter_of("c", problems);
+    let keep = filter.row_filter(&KindId::pods(), "c").unwrap();
+    assert!(keep.keeps(&row("stuck", "uid-stuck")));
+}
+
+fn identity(endpoint: u64) -> FeedIdentity {
+    FeedIdentity {
+        cluster: "c".to_owned(),
+        generation: 1,
+        endpoint,
+    }
+}
+
+#[test]
+fn a_repointed_context_drops_values_and_refuses_an_earlier_read() {
+    let values = || HashMap::from([("c".to_owned(), checked_with_pod("web", "uid-web", &[]))]);
+    let mut feed = ProblemFeed::default();
+    feed.follow(vec![identity(1)]);
+    feed.finish(&[identity(1)], values());
+    assert!(feed.value("c").is_some());
+
+    feed.follow(vec![identity(2)]);
+    assert!(
+        feed.value("c").is_none(),
+        "the old server's values are gone"
+    );
+    feed.finish(&[identity(1)], values());
+    assert!(
+        feed.value("c").is_none(),
+        "a read of the old server is dropped"
+    );
+    feed.finish(&[identity(2)], values());
+    assert!(feed.value("c").is_some());
 }
 
 #[test]
@@ -149,7 +295,7 @@ fn a_kind_that_cannot_be_checked_keeps_its_rows_and_is_never_zero() {
         assert!(!filter.is_checked(&KindId::pods(), "c"));
         let note = filter.unchecked_note(&KindId::pods(), "Pods", [("c", "c")].into_iter());
         assert!(note.unwrap().contains("cannot be checked"));
-        assert_eq!(nav_badges(&[read])[&KindId::pods()].text, "?");
+        assert_eq!(nav_badges(&[read], &[])[&KindId::pods()].text, "?");
     }
 }
 
@@ -160,7 +306,7 @@ fn a_checked_kind_with_no_problem_has_no_badge() {
         Availability::Checked,
         KindCheck::Current,
     )));
-    assert!(!nav_badges(&[clean]).contains_key(&KindId::pods()));
+    assert!(!nav_badges(&[clean], &[]).contains_key(&KindId::pods()));
 }
 
 #[test]
@@ -170,7 +316,7 @@ fn a_set_counts_what_it_could_check_and_says_the_rest_is_unknown() {
         Availability::Checked,
         KindCheck::Current,
     )));
-    let badges = nav_badges(&[found.clone(), ClusterProblems::unchecked()]);
+    let badges = nav_badges(&[found.clone(), ClusterProblems::unchecked()], &[]);
     let ProblemBadge { text, detail } = &badges[&KindId::pods()];
     assert_eq!(text, "2+");
     assert!(detail.contains("1 of 2 clusters"));
@@ -237,10 +383,11 @@ fn filtering_ten_thousand_rows_stays_responsive() {
             since: None,
         })
         .collect();
-    let base = ClusterProblems::read(Some(&snapshot(
+    let base = ClusterProblems::read(Some(&snapshot_judging(
         problems,
         Availability::Checked,
         KindCheck::Current,
+        (0..10_000).map(|i| format!("uid-{i}")).collect(),
     )));
     let filter = filter_of("c", base);
     let keep = filter.row_filter(&KindId::pods(), "c").unwrap();
@@ -298,4 +445,71 @@ async fn the_toggle_on_the_fake_api_shows_exactly_the_failing_pods(cx: &mut Test
         list.view_state().rows.into_iter().map(|r| r.name).collect()
     });
     assert_eq!(names, ["broken-image", "crash-loop"]);
+}
+
+#[gpui_kit::test]
+async fn turning_problems_on_closes_a_row_it_hides(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let server = FakeApiServer::start_blocking(Options::default()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace_with(cx, dir.path(), |dir, _| {
+        let path = dir.join("kubeconfig");
+        server.write_kubeconfig(&path, Some("demo")).unwrap();
+        vec![path]
+    })
+    .await;
+    t.activate(cx, CONTEXT).await;
+    t.wait_for_state(cx, CONTEXT, |s| matches!(s, ConnectionState::Connected(_)))
+        .await;
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model
+            .read(cx)
+            .discovered(CONTEXT)
+            .is_some_and(|d| d.discovery.is_some())
+    })
+    .await;
+    t.dispatch(
+        cx,
+        "workspace::OpenView",
+        serde_json::json!({ "kind": "pods" }),
+    )
+    .unwrap();
+    let list = t.list(cx).expect("a list is open");
+    let watched = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        watched.read(cx).view_state().rows.len() > 2
+    })
+    .await;
+    let (namespace, name) = list.read_with(cx, |list, _| {
+        let healthy = list
+            .shown
+            .rows
+            .iter()
+            .find(|row| !["broken-image", "crash-loop"].contains(&&*row.name))
+            .expect("a healthy pod");
+        (
+            healthy.namespace.as_deref().map(str::to_owned),
+            healthy.name.to_string(),
+        )
+    });
+    t.dispatch(
+        cx,
+        "resource_list::SelectRow",
+        serde_json::json!({ "namespace": namespace, "name": name }),
+    )
+    .unwrap();
+    assert!(list.read_with(cx, |list, _| list.selected.is_some()));
+    t.dispatch(
+        cx,
+        "resource_list::ToggleProblemsOnly",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    let watched = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        let list = watched.read(cx);
+        list.view_state().rows.len() == 2 && list.selected.is_none()
+    })
+    .await;
 }

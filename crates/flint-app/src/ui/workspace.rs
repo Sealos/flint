@@ -3797,7 +3797,7 @@ mod actions;
 mod keys;
 
 #[path = "workspace_problems.rs"]
-mod problems;
+pub(in crate::ui) mod problems;
 
 #[path = "workspace_sets.rs"]
 mod sets;

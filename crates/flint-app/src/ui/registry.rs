@@ -49,6 +49,7 @@ use super::list::combined::{
     SelectCombinedRow, SortCombined, ToggleClusterFilter, ToggleClusterGroup,
     ToggleCombinedProblems, ToggleCombinedWide, ToggleGroupByCluster,
 };
+pub use super::pending_threshold::SetPendingThreshold;
 
 actions!(
     flint,
@@ -1861,6 +1862,20 @@ const CLUSTER_ALERTS: &[Arg] = &[
         ArgKind::Choice(&["default", "on", "off"]),
     ),
 ];
+const PENDING_THRESHOLD: &[Arg] = &[
+    Arg {
+        name: "cluster",
+        description: "kubeconfig context name; all clusters when left out",
+        required: false,
+        kind: ArgKind::Cluster,
+    },
+    Arg {
+        name: "seconds",
+        description: "seconds from 1 to 86400; clears the value when left out",
+        required: false,
+        kind: ArgKind::Number,
+    },
+];
 const COMPARE_OBJECT: &[Arg] = &[
     arg("cluster", "kubeconfig context name", ArgKind::Cluster),
     arg("kind", "the kind, as plural or plural.group", ArgKind::Text),
@@ -2087,6 +2102,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Set Cluster Alerts…",
             "Choose whether one cluster posts desktop notifications.",
             CLUSTER_ALERTS,
+        )
+        .of(C::Flint, S::App)
+        .hidden(),
+        Spec::with_args::<SetPendingThreshold>(
+            "Set Pending Pod Threshold…",
+            "Choose how long a pod may stay Pending before it counts as a problem.",
+            PENDING_THRESHOLD,
         )
         .of(C::Flint, S::App)
         .hidden(),

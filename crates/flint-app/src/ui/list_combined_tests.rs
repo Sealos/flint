@@ -167,6 +167,51 @@ fn key(key: &str) -> ColumnKey {
 }
 
 #[gpui_kit::test]
+async fn problems_only_closes_a_selected_row_it_hides(cx: &mut TestAppContext) {
+    use super::super::problems_tests::checked_with_pod;
+
+    let (window, list) = open(cx, fixture());
+    click(cx, window, "row-ctx-prod/uid-api");
+    assert!(list.read_with(cx, |list, _| list.selected.is_some()));
+    list.update(cx, |list, cx| {
+        list.problems.toggle();
+        list.set_problems(
+            std::collections::HashMap::from([(
+                "ctx-prod".to_owned(),
+                checked_with_pod("web", "uid-web", &["uid-api"]),
+            )]),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert_eq!(list.read_with(cx, |list, _| list.selected.clone()), None);
+}
+
+#[gpui_kit::test]
+async fn the_problems_toggle_does_nothing_for_a_kind_it_cannot_judge(cx: &mut TestAppContext) {
+    let configmaps = |cluster: &str| {
+        let mut shown = (*snapshot(cluster, "Data", &[("a", "1")], SyncState::Synced)).clone();
+        shown.kind = KindId::new("", "configmaps");
+        Arc::new(shown)
+    };
+    let source = CombinedSource::new(vec![
+        member(configmaps("ctx-prod"), "prod", None),
+        member(configmaps("ctx-staging"), "staging", None),
+    ])
+    .unwrap();
+    let (window, list) = open(cx, source);
+    assert!(!list.read_with(cx, |list, _| list.has_problem_filter()));
+    window
+        .update(cx, |_, window, cx| {
+            list.update(cx, |list, cx| {
+                list.on_problems(&super::ToggleCombinedProblems, window, cx);
+            });
+        })
+        .unwrap();
+    assert!(!list.read_with(cx, |list, _| list.problems.is_on()));
+}
+
+#[gpui_kit::test]
 async fn problems_only_hides_checked_rows_and_keeps_an_unchecked_member(cx: &mut TestAppContext) {
     use super::super::problems::ClusterProblems;
     use super::super::problems_tests::checked_with_pod;
@@ -176,7 +221,10 @@ async fn problems_only_hides_checked_rows_and_keeps_an_unchecked_member(cx: &mut
         list.problems.toggle();
         list.set_problems(
             std::collections::HashMap::from([
-                ("ctx-prod".to_owned(), checked_with_pod("web", "uid-web")),
+                (
+                    "ctx-prod".to_owned(),
+                    checked_with_pod("web", "uid-web", &["uid-api"]),
+                ),
                 ("ctx-staging".to_owned(), ClusterProblems::unchecked()),
             ]),
             cx,

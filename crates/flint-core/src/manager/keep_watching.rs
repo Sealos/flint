@@ -552,6 +552,15 @@ impl ClusterManager {
         );
     }
 
+    /// Gives each background feed its Pending threshold.
+    pub(super) fn apply_kept_pending_thresholds(&self) {
+        for (id, kept) in &self.keep.feeds {
+            if let Some(feed) = &kept.feed {
+                feed.set_pending_after(self.pending_after(id));
+            }
+        }
+    }
+
     /// A background connection finished. A plugin's cluster never retries by itself.
     pub(super) fn kept_connected(
         &mut self,
@@ -559,6 +568,7 @@ impl ClusterManager {
         attempt: u64,
         result: Result<kube::Client, bool>,
     ) {
+        let pending_after = self.pending_after(id);
         let Some(kept) = self.keep.feeds.get_mut(id) else {
             return;
         };
@@ -580,6 +590,7 @@ impl ClusterManager {
                     Arc::clone(&trends),
                     self.telemetry_timing,
                     requests,
+                    pending_after,
                 );
                 self.telemetry.publish(id, &mut feed, trends);
                 kept.feed = Some(feed);

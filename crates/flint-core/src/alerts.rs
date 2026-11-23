@@ -99,13 +99,14 @@ pub const CRITICAL_RESERVED_PER_CLUSTER: usize = 64;
 pub const MAX_NAME_BYTES: usize = 253;
 
 /// Every kind of problem, for tracking which have had their first check.
-const ALL_KINDS: [ProblemKind; 6] = [
+const ALL_KINDS: [ProblemKind; 7] = [
     ProblemKind::CrashLoop,
     ProblemKind::OomKilled,
     ProblemKind::NodeNotReady,
     ProblemKind::JobFailed,
     ProblemKind::ImagePull,
     ProblemKind::WorkloadShort,
+    ProblemKind::PodPending,
 ];
 
 /// Tuning for an [`AlertEngine`].
@@ -180,7 +181,9 @@ fn key_of(problem: &Problem) -> AlertKey {
     let subject = match (&problem.id.subject, &problem.owner) {
         (ProblemSubject::Node { name, .. }, _) => AlertSubject::Node { name: name.clone() },
         (
-            ProblemSubject::Container { namespace, .. } | ProblemSubject::Job { namespace, .. },
+            ProblemSubject::Container { namespace, .. }
+            | ProblemSubject::Pod { namespace, .. }
+            | ProblemSubject::Job { namespace, .. },
             Some(owner),
         ) => AlertSubject::Workload {
             namespace: namespace.clone(),
@@ -198,7 +201,15 @@ fn key_of(problem: &Problem) -> AlertKey {
             namespace: namespace.clone(),
             owner: ProblemOwner::workload(*kind, name),
         },
-        (ProblemSubject::Container { namespace, pod, .. }, None) => AlertSubject::Pod {
+        (ProblemSubject::Container { namespace, pod, .. }, None)
+        | (
+            ProblemSubject::Pod {
+                namespace,
+                name: pod,
+                ..
+            },
+            None,
+        ) => AlertSubject::Pod {
             namespace: namespace.clone(),
             name: pod.clone(),
         },
@@ -316,6 +327,7 @@ fn resolved_text(kind: ProblemKind) -> &'static str {
         ProblemKind::JobFailed => "Job failure no longer reported",
         ProblemKind::ImagePull => "Image pull failure no longer reported",
         ProblemKind::WorkloadShort => "Missing replicas no longer reported",
+        ProblemKind::PodPending => "Pod no longer reported as stuck Pending",
     }
 }
 

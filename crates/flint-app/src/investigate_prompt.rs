@@ -313,7 +313,10 @@ pub fn investigate_prompt(
 /// Pods even when the alert names their owner.
 fn comes_from_pods(kind: ProblemKind) -> bool {
     match kind {
-        ProblemKind::CrashLoop | ProblemKind::OomKilled | ProblemKind::ImagePull => true,
+        ProblemKind::CrashLoop
+        | ProblemKind::OomKilled
+        | ProblemKind::ImagePull
+        | ProblemKind::PodPending => true,
         ProblemKind::NodeNotReady | ProblemKind::JobFailed | ProblemKind::WorkloadShort => false,
     }
 }

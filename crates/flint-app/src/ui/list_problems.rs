@@ -4,8 +4,9 @@
 //! objects with [`flint_core::problems::Classifier`]. This module only reads a finished
 //! [`TelemetrySnapshot`], so it adds no LIST or watch.
 //!
-//! A row is hidden only when its kind was checked on its cluster and the row is not a problem.
-//! A kind that could not be checked keeps its rows and says so, and its count is never zero.
+//! A row is hidden only when its kind was checked on its cluster, the feed has judged that exact
+//! object, and it is not a problem. A kind that could not be checked keeps its rows and says so,
+//! and its count is never zero. A row newer than the feed, such as a recreated pod, stays too.
 //!
 //! Matching a row is one hash lookup, on the background job that already filters the list.
 
@@ -15,7 +16,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use flint_core::problems::{ProblemId, ProblemSubject, WorkloadKind};
-use flint_core::telemetry::{Availability, KindCheck, TelemetrySnapshot, WatchedKind};
+use flint_core::telemetry::{
+    Availability, CheckedObjects, KindCheck, TelemetrySnapshot, WatchedKind,
+};
 use flint_core::{ClusterId, KindId, Row};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Selectable as _, Sizable as _};
@@ -106,6 +109,11 @@ fn subject(subject: &ProblemSubject) -> (ProblemListKind, Option<&str>, &str, Op
             pod,
             pod_uid.as_deref(),
         ),
+        ProblemSubject::Pod {
+            namespace,
+            name,
+            uid,
+        } => (ProblemListKind::Pods, Some(namespace), name, uid.as_deref()),
         ProblemSubject::Node { name, uid } => (ProblemListKind::Nodes, None, name, uid.as_deref()),
         ProblemSubject::Job {
             namespace,
@@ -128,11 +136,41 @@ fn subject(subject: &ProblemSubject) -> (ProblemListKind, Option<&str>, &str, Op
     }
 }
 
+/// The problem objects of one kind on one cluster, and which objects the feed judged.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Findings {
+    objects: CountedObjects,
+    by_namespace: HashMap<String, usize>,
+    judged: Arc<CheckedObjects>,
+}
+
+impl Findings {
+    fn insert(&mut self, namespace: Option<&str>, name: &str, uid: Option<&str>) {
+        let before = self.objects.len();
+        self.objects.insert(namespace, name, uid);
+        if let Some(namespace) = namespace.filter(|_| self.objects.len() > before) {
+            *self.by_namespace.entry(namespace.to_owned()).or_default() += 1;
+        }
+    }
+
+    /// How many objects are in `namespaces`; all of them when none is chosen or the kind is
+    /// cluster-scoped.
+    fn count_in(&self, namespaces: &[String]) -> usize {
+        if namespaces.is_empty() || self.by_namespace.is_empty() {
+            return self.objects.len();
+        }
+        namespaces
+            .iter()
+            .filter_map(|namespace| self.by_namespace.get(namespace))
+            .sum()
+    }
+}
+
 /// What one cluster's feed says about one kind.
 #[derive(Clone, Debug)]
 enum KindProblems {
     Unchecked,
-    Checked(Arc<CountedObjects>),
+    Checked(Arc<Findings>),
 }
 
 /// The objects with problems on one cluster, per kind. Cheap to clone.
@@ -167,7 +205,7 @@ impl ClusterProblems {
             return Self::unchecked();
         };
         let settling: HashSet<&ProblemId> = snapshot.settling.iter().collect();
-        let mut found: [CountedObjects; ProblemListKind::ALL.len()] = Default::default();
+        let mut found: [Findings; ProblemListKind::ALL.len()] = Default::default();
         for problem in snapshot.problems.iter() {
             if settling.contains(&problem.id) {
                 continue;
@@ -177,7 +215,9 @@ impl ClusterProblems {
         }
         let by_kind = ProblemListKind::ALL.map(|kind| {
             if *snapshot.kind(kind.watched()) == KindCheck::Current {
-                KindProblems::Checked(Arc::new(std::mem::take(&mut found[kind as usize])))
+                let mut findings = std::mem::take(&mut found[kind as usize]);
+                findings.judged = Arc::clone(&snapshot.checked);
+                KindProblems::Checked(Arc::new(findings))
             } else {
                 KindProblems::Unchecked
             }
@@ -193,12 +233,29 @@ impl ClusterProblems {
         matches!(self.of(kind), KindProblems::Checked(_))
     }
 
-    /// Whether `row` stays with the toggle on: a problem, or of a kind that was not checked.
+    /// Whether `row` stays with the toggle on: a problem, of a kind that was not checked, or an
+    /// object the feed has not judged yet.
     fn keeps(&self, kind: ProblemListKind, row: &Row) -> bool {
         match self.of(kind) {
             KindProblems::Unchecked => true,
-            KindProblems::Checked(objects) => {
-                objects.matches(row.namespace.as_deref(), &row.name, &row.uid)
+            KindProblems::Checked(found) => {
+                found
+                    .objects
+                    .matches(row.namespace.as_deref(), &row.name, &row.uid)
+                    || !found.judged.contains(kind.watched(), &row.uid)
+            }
+        }
+    }
+
+    /// Whether `row` is kept only because the feed has not judged it yet.
+    fn awaits_check(&self, kind: ProblemListKind, row: &Row) -> bool {
+        match self.of(kind) {
+            KindProblems::Unchecked => false,
+            KindProblems::Checked(found) => {
+                !found.judged.contains(kind.watched(), &row.uid)
+                    && !found
+                        .objects
+                        .matches(row.namespace.as_deref(), &row.name, &row.uid)
             }
         }
     }
@@ -261,8 +318,12 @@ impl ProblemBadge {
     }
 }
 
-/// The navigation's badges over `clusters`.
-pub fn nav_badges(clusters: &[ClusterProblems]) -> HashMap<KindId, ProblemBadge> {
+/// The navigation's badges over `clusters`, counting only `namespaces` (all when empty), the same
+/// scope the list shows.
+pub fn nav_badges(
+    clusters: &[ClusterProblems],
+    namespaces: &[String],
+) -> HashMap<KindId, ProblemBadge> {
     ProblemListKind::ALL
         .into_iter()
         .filter_map(|kind| {
@@ -271,7 +332,7 @@ pub fn nav_badges(clusters: &[ClusterProblems]) -> HashMap<KindId, ProblemBadge>
             for cluster in clusters {
                 match cluster.of(kind) {
                     KindProblems::Unchecked => unchecked += 1,
-                    KindProblems::Checked(objects) => found += objects.len(),
+                    KindProblems::Checked(findings) => found += findings.count_in(namespaces),
                 }
             }
             let badge = ProblemBadge::new(found, unchecked, clusters.len())?;
@@ -285,6 +346,8 @@ pub fn nav_badges(clusters: &[ClusterProblems]) -> HashMap<KindId, ProblemBadge>
 pub struct ProblemFilter {
     on: bool,
     clusters: HashMap<ClusterId, ClusterProblems>,
+    /// Rows shown only because the feed has not judged them yet.
+    awaiting: usize,
 }
 
 impl ProblemFilter {
@@ -294,6 +357,24 @@ impl ProblemFilter {
 
     pub fn toggle(&mut self) {
         self.on = !self.on;
+        self.awaiting = 0;
+    }
+
+    /// Records how many shown rows the feed has not judged yet.
+    pub fn set_awaiting(&mut self, rows: usize) {
+        self.awaiting = rows;
+    }
+
+    /// With the toggle on, says that some rows have not been checked yet.
+    pub fn awaiting_note(&self) -> Option<String> {
+        match self.awaiting {
+            _ if !self.on => None,
+            0 => None,
+            1 => Some("1 new row has not been checked for problems yet.".to_owned()),
+            rows => Some(format!(
+                "{rows} new rows have not been checked for problems yet."
+            )),
+        }
     }
 
     /// Takes the newest values. Returns whether the rows must be filtered again.
@@ -375,6 +456,11 @@ impl RowFilter {
     pub fn keeps(&self, row: &Row) -> bool {
         self.problems.keeps(self.kind, row)
     }
+
+    /// Whether `row` is kept only because the feed has not judged it yet.
+    pub fn awaits_check(&self, row: &Row) -> bool {
+        self.problems.awaits_check(self.kind, row)
+    }
 }
 
 /// A combined job's filter.
@@ -390,5 +476,12 @@ impl MemberFilter {
         self.members
             .get(member)
             .is_none_or(|problems| problems.keeps(self.kind, row))
+    }
+
+    /// Whether `row` is kept only because the feed has not judged it yet.
+    pub fn awaits_check(&self, member: usize, row: &Row) -> bool {
+        self.members
+            .get(member)
+            .is_some_and(|problems| problems.awaits_check(self.kind, row))
     }
 }
