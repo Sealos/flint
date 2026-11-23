@@ -3,11 +3,16 @@
 // module-tests: dashboard_tests.rs
 
 use gpui_kit::base::TestSupportExt as _;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::overview::{
+    CAPACITY_UNKNOWN, CapacityCard, CapacityPanel, InventoryCount, InventoryPanel, MAX_NODE_ROWS,
+    MAX_PROBLEM_ROWS, NO_PROBLEMS, NO_PROBLEMS_SO_FAR, NodeRow, PROBLEMS_UNKNOWN, ProblemRow,
+    ProblemsPanel,
+};
 use super::sparkline::sparkline;
 use super::{
     CANNOT_BE_CHECKED, DashboardStatus, INSTALL_COMMAND, INSTALL_HINT, MAX_WARNING_ROWS,
@@ -15,6 +20,7 @@ use super::{
     ProblemList, ProblemLists, ProblemTile, WARNINGS_UNAVAILABLE, WarningRow, WarningsPanel,
 };
 use crate::ui::registry;
+use flint_core::problems::ProblemSeverity;
 use flint_core::thresholds::ThresholdLevel;
 
 /// On a tile whose count includes objects still in their grace period.
@@ -91,7 +97,7 @@ pub fn problem_tiles(
         }
         row = row.child(problem_tile(tile, drill, focus.clone(), theme));
     }
-    section("Problems now", theme)
+    section("What's wrong", theme)
         .child(row)
         .when(!by_kind.is_empty(), |el| {
             el.child(short_kind_buttons(by_kind, focus))
@@ -277,6 +283,330 @@ fn metric_tile(id: &'static str, tile: &MetricTile, theme: &Theme) -> impl IntoE
                 .child(sparkline(tile.shape.clone(), theme.primary)),
         )
         .test_support()
+}
+
+/// The individual problems, each opening its object on this cluster.
+pub fn problems_section(
+    panel: &ProblemsPanel,
+    focus: FocusHandle,
+    theme: &Theme,
+) -> impl IntoElement {
+    let muted = theme.muted_foreground;
+    let body = match panel {
+        ProblemsPanel::Unknown => note(
+            "dashboard-problems-unknown",
+            PROBLEMS_UNKNOWN.to_owned(),
+            muted,
+        )
+        .into_any_element(),
+        ProblemsPanel::Rows {
+            rows,
+            total,
+            settling,
+            incomplete,
+        } => {
+            let empty = incomplete_or_clear(*incomplete);
+            v_flex()
+                .w_full()
+                .min_w_0()
+                .when(rows.is_empty(), |el| {
+                    el.child(note("dashboard-problems-empty", empty.to_owned(), muted))
+                })
+                .children(
+                    rows.iter()
+                        .enumerate()
+                        .map(|(index, row)| problem_row(index, row, focus.clone(), theme)),
+                )
+                .when(*total > MAX_PROBLEM_ROWS, |el| {
+                    el.child(note(
+                        "dashboard-problems-more",
+                        format!("Showing the {MAX_PROBLEM_ROWS} most urgent of {total}."),
+                        muted,
+                    ))
+                })
+                .when(*settling > 0, |el| {
+                    el.child(note(
+                        "dashboard-problems-settling",
+                        format!("{settling} more may still settle by themselves."),
+                        muted,
+                    ))
+                })
+                .when(*incomplete && !rows.is_empty(), |el| {
+                    el.child(note(
+                        "dashboard-problems-incomplete",
+                        "Some kinds could not be checked, so there may be more.".to_owned(),
+                        theme.warning,
+                    ))
+                })
+                .into_any_element()
+        }
+    };
+    section("Problems by severity", theme).child(body)
+}
+
+const fn incomplete_or_clear(incomplete: bool) -> &'static str {
+    if incomplete {
+        NO_PROBLEMS_SO_FAR
+    } else {
+        NO_PROBLEMS
+    }
+}
+
+fn problem_row(
+    index: usize,
+    row: &ProblemRow,
+    focus: FocusHandle,
+    theme: &Theme,
+) -> impl IntoElement {
+    let color = match row.severity {
+        ProblemSeverity::Critical => theme.danger,
+        ProblemSeverity::Warning => theme.warning,
+    };
+    let severity = match row.severity {
+        ProblemSeverity::Critical => "Critical",
+        ProblemSeverity::Warning => "Warning",
+    };
+    Button::new(("dashboard-problem", index))
+        .accessibility_label(format!("Open {}", row.label()))
+        .ghost()
+        .small()
+        .w_full()
+        .child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .gap_3()
+                .text_xs()
+                .child(
+                    div()
+                        .w(px(56.))
+                        .flex_none()
+                        .text_color(color)
+                        .child(severity),
+                )
+                .child(
+                    div()
+                        .w(px(240.))
+                        .flex_shrink(1.)
+                        .min_w_0()
+                        .truncate()
+                        .child(row.object.clone()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(theme.muted_foreground)
+                        .child(row.summary),
+                ),
+        )
+        .on_click(registry::on_click_in(focus, row.open.clone()))
+}
+
+/// What is left of each resource, then the nodes, most allocated first.
+pub fn capacity_section(panel: &CapacityPanel, theme: &Theme) -> impl IntoElement {
+    let body = match panel {
+        CapacityPanel::Unknown => note(
+            "dashboard-capacity-unknown",
+            CAPACITY_UNKNOWN.to_owned(),
+            theme.muted_foreground,
+        )
+        .into_any_element(),
+        CapacityPanel::Known {
+            cards,
+            rows,
+            total_nodes,
+            usage_note,
+        } => v_flex()
+            .gap_2()
+            .w_full()
+            .min_w_0()
+            .child(
+                h_flex().flex_wrap().gap_2().w_full().children(
+                    cards
+                        .iter()
+                        .enumerate()
+                        .map(|(index, card)| capacity_card(index, card, theme)),
+                ),
+            )
+            .when_some(usage_note.clone(), |el, text| {
+                el.child(note("dashboard-usage-note", text, theme.warning))
+            })
+            .when(!rows.is_empty(), |el| {
+                el.child(allocation_table(rows, theme))
+            })
+            .when(*total_nodes > MAX_NODE_ROWS, |el| {
+                el.child(note(
+                    "dashboard-nodes-more",
+                    format!("Showing the {MAX_NODE_ROWS} most allocated of {total_nodes} nodes."),
+                    theme.muted_foreground,
+                ))
+            })
+            .into_any_element(),
+    };
+    section("Capacity left", theme).child(body)
+}
+
+fn capacity_line(label: &'static str, value: String, theme: &Theme) -> impl IntoElement {
+    h_flex()
+        .justify_between()
+        .gap_2()
+        .text_xs()
+        .child(div().text_color(theme.muted_foreground).child(label))
+        .child(div().truncate().child(value))
+}
+
+fn capacity_card(index: usize, card: &CapacityCard, theme: &Theme) -> impl IntoElement {
+    let filled = card
+        .requested_percent
+        .map_or(0., |p| p.min(100) as f32 / 100.);
+    let over = card.requested_percent.is_some_and(|p| p > 100);
+    v_flex()
+        .id(("dashboard-capacity", index))
+        .aria_label(card.description())
+        .flex_1()
+        .min_w(px(METRIC_MIN_WIDTH))
+        .p_3()
+        .gap_1()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border)
+        .child(
+            h_flex()
+                .justify_between()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(card.label),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(format!("{} left", card.left)),
+                ),
+        )
+        .child(
+            div()
+                .h(px(4.))
+                .w_full()
+                .rounded(theme.radius)
+                .bg(theme.muted)
+                .child(
+                    div()
+                        .h_full()
+                        .w(relative(filled))
+                        .rounded(theme.radius)
+                        .bg(if over { theme.warning } else { theme.primary }),
+                ),
+        )
+        .child(capacity_line(
+            "Allocatable",
+            card.allocatable.clone(),
+            theme,
+        ))
+        .child(capacity_line("Requested", card.requested.clone(), theme))
+        .when_some(card.used.clone(), |el, used| {
+            el.child(capacity_line("Used now", used, theme))
+        })
+        .when_some(card.limits.clone(), |el, limits| {
+            el.child(capacity_line("Limits", limits, theme))
+        })
+        .test_support()
+}
+
+fn table_cell(text: impl Into<SharedString>) -> Div {
+    div().flex_1().min_w_0().truncate().child(text.into())
+}
+
+fn allocation_table(rows: &[NodeRow], theme: &Theme) -> impl IntoElement {
+    let header = h_flex()
+        .w_full()
+        .min_w_0()
+        .gap_3()
+        .h(px(24.))
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .child(table_cell("Node"))
+        .child(table_cell("CPU requested"))
+        .child(table_cell("Memory requested"))
+        .child(table_cell("Pods"))
+        .child(table_cell("CPU used"))
+        .child(table_cell("Memory used"));
+    v_flex()
+        .id("dashboard-allocation")
+        .aria_label("Allocation by node, most allocated first")
+        .w_full()
+        .min_w_0()
+        .child(header)
+        .children(rows.iter().enumerate().map(|(index, row)| {
+            h_flex()
+                .id(("dashboard-node", index))
+                .aria_label(row.label())
+                .w_full()
+                .min_w_0()
+                .gap_3()
+                .h(px(24.))
+                .text_xs()
+                .child(table_cell(row.name.clone()))
+                .child(table_cell(row.cpu_requested.clone()))
+                .child(table_cell(row.memory_requested.clone()))
+                .child(table_cell(row.pods.clone()))
+                .child(table_cell(row.cpu_used.clone()))
+                .child(table_cell(row.memory_used.clone()))
+                .test_support()
+        }))
+        .test_support()
+}
+
+/// The version, and a count per kind that opens its list.
+pub fn inventory_section(
+    panel: &InventoryPanel,
+    focus: FocusHandle,
+    theme: &Theme,
+) -> impl IntoElement {
+    let version = format!("Kubernetes {}", panel.version);
+    section("What's in the cluster", theme)
+        .child(note("dashboard-version", version, theme.foreground))
+        .child(
+            h_flex().flex_wrap().gap_2().w_full().children(
+                panel
+                    .counts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, count)| inventory_count(index, count, focus.clone(), theme)),
+            ),
+        )
+}
+
+fn inventory_count(
+    index: usize,
+    count: &InventoryCount,
+    focus: FocusHandle,
+    theme: &Theme,
+) -> AnyElement {
+    let text = format!("{} {}", count.value(), count.label);
+    if count.count.is_some() {
+        Button::new(("dashboard-count", index))
+            .accessibility_label(format!("Open {}", count.description()))
+            .outline()
+            .small()
+            .label(text)
+            .on_click(registry::on_click_in(focus, count.open.clone()))
+            .into_any_element()
+    } else {
+        div()
+            .id(("dashboard-count-unknown", index))
+            .aria_label(count.description())
+            .px_2()
+            .text_sm()
+            .text_color(theme.muted_foreground)
+            .child(text)
+            .test_support()
+            .into_any_element()
+    }
 }
 
 pub fn warnings_section(panel: &WarningsPanel, theme: &Theme) -> impl IntoElement {

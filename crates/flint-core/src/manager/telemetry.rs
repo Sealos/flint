@@ -10,6 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 use kube::config::Kubeconfig;
+use tokio::sync::watch;
 
 use super::{Cluster, ClusterManager};
 use crate::ClusterId;
@@ -28,13 +29,62 @@ pub(super) struct SlotFeed {
     _feed: Telemetry,
 }
 
+/// An overview showing, and the slot it was opened on.
+pub(super) struct OpenOverview {
+    cluster: ClusterId,
+    generation: u64,
+    /// Tells a bound overview whether it may read this slot's feed.
+    live: Option<watch::Sender<bool>>,
+}
+
 impl ClusterManager {
     /// Records an overview open on `cluster`'s current connection generation. A context that
     /// starts over needs a new one, so an overview of its old definition starts nothing.
     pub(super) fn open_overview(&mut self, id: u64, cluster: ClusterId) {
         if let Some(generation) = self.cluster(&cluster).map(|slot| slot.generation) {
-            self.overviews.insert(id, (cluster, generation));
+            let overview = OpenOverview {
+                cluster,
+                generation,
+                live: None,
+            };
+            self.overviews.insert(id, overview);
         }
+    }
+
+    /// Records an overview only if `cluster` is still the slot `generation`.
+    pub(super) fn open_overview_on(
+        &mut self,
+        id: u64,
+        cluster: ClusterId,
+        generation: u64,
+        live: watch::Sender<bool>,
+    ) {
+        if self
+            .cluster(&cluster)
+            .is_some_and(|slot| slot.generation == generation)
+        {
+            live.send_replace(true);
+            let overview = OpenOverview {
+                cluster,
+                generation,
+                live: Some(live),
+            };
+            self.overviews.insert(id, overview);
+        }
+    }
+
+    /// Ends every overview whose slot is gone, before a later slot's feed can be listed.
+    fn end_replaced_overviews(&mut self) {
+        let clusters = &self.clusters;
+        self.overviews.retain(|_, overview| {
+            let holds = clusters
+                .iter()
+                .any(|c| c.info.name == overview.cluster && c.generation == overview.generation);
+            if !holds && let Some(live) = &overview.live {
+                live.send_replace(false);
+            }
+            holds
+        });
     }
 
     pub(super) fn close_overview(&mut self, id: u64) {
@@ -48,7 +98,7 @@ impl ClusterManager {
             && self.cluster(id).is_some_and(|slot| {
                 self.overviews
                     .values()
-                    .any(|(cluster, generation)| cluster == id && *generation == slot.generation)
+                    .any(|open| open.cluster == id && open.generation == slot.generation)
             })
     }
 
@@ -104,6 +154,7 @@ impl ClusterManager {
     /// Stops every feed no longer wanted or on an older connection and takes it off the board.
     /// Starts nothing, so a load can call it before saying what changed.
     pub(super) fn stop_unwanted_telemetry(&mut self) {
+        self.end_replaced_overviews();
         for index in 0..self.clusters.len() {
             let id = self.clusters[index].info.name.clone();
             let wanted = self.wants_telemetry(&id);
