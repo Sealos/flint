@@ -6,10 +6,11 @@ use std::sync::Arc;
 use jiff::Timestamp;
 use tokio::sync::watch;
 
+use super::capacity::{Inventory, capacity_of};
 use super::objects::Stores;
 use super::{
     Availability, CheckFailure, KindCheck, MetricsCheck, Shared, TelemetrySnapshot,
-    TelemetryTiming, WatchedKind,
+    TelemetryTiming, VersionCheck, WatchedKind,
 };
 use crate::dashboard::{ProblemCategory, ProblemSnapshot, ProblemSummariser};
 use crate::problems::{Classifier, Problem, ProblemKind, ReplicaSetIndex, ReplicaSetRead};
@@ -40,6 +41,7 @@ pub(super) async fn run(
             _ = tick.tick() => {}
         }
         let metrics = shared.metrics();
+        let version = shared.version();
         let next = {
             let stores = shared.stores();
             evaluate(
@@ -47,6 +49,7 @@ pub(super) async fn run(
                 &stores,
                 &mut summariser,
                 metrics,
+                version,
                 Timestamp::now(),
             )
         };
@@ -65,6 +68,7 @@ fn evaluate(
     stores: &Stores,
     summariser: &mut ProblemSummariser,
     metrics: MetricsCheck,
+    version: VersionCheck,
     now: Timestamp,
 ) -> TelemetrySnapshot {
     let classifier = Classifier::new(Arc::clone(cluster), now);
@@ -108,6 +112,11 @@ fn evaluate(
         },
         now,
     );
+    let settling = problems
+        .iter()
+        .filter(|problem| summariser.is_settling(problem, now))
+        .map(|problem| problem.id.clone())
+        .collect();
     TelemetrySnapshot {
         cluster: Arc::clone(cluster),
         at: now,
@@ -115,8 +124,12 @@ fn evaluate(
         kinds,
         problems: problems.into(),
         unchecked,
+        settling,
         counts,
         metrics,
+        capacity: capacity_of(stores),
+        inventory: Inventory::of(stores),
+        version,
     }
 }
 
@@ -209,6 +222,7 @@ mod tests {
             stores,
             &mut ProblemSummariser::default(),
             MetricsCheck::Waiting,
+            VersionCheck::Waiting,
             now(),
         )
     }
@@ -318,7 +332,7 @@ mod tests {
     #[test]
     fn a_held_problem_is_classified_and_counted() {
         let mut stores = all_current();
-        stores.nodes.replace(vec![not_ready_node()]);
+        stores.nodes.replace(vec![(not_ready_node(), ())]);
         let snapshot = pass(&stores);
         assert_eq!(snapshot.problems.len(), 1);
         assert_eq!(snapshot.problems[0].kind(), ProblemKind::NodeNotReady);

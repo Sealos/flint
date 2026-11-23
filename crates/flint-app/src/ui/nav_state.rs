@@ -6,12 +6,16 @@ use super::{Marker, NavPanel, NavRow, marker};
 impl NavPanel {
     /// The sections, and the entries of the open ones. `None` with no cluster active.
     pub fn view_state(&self) -> Option<NavState> {
-        let cluster = self.cluster.as_ref()?;
-        let error = self.error.as_deref().map(error_text);
-        let Some(discovery) = &self.discovery else {
-            let status = if self.awaiting_confirmation {
+        // An open set's kinds are still coming; the active cluster's state is not theirs.
+        let own = self.set.is_none();
+        let error = self.error.as_deref().filter(|_| own).map(error_text);
+        let Some((cluster, discovery)) = self.tree() else {
+            if own {
+                self.cluster.as_ref()?;
+            }
+            let status = if own && self.awaiting_confirmation {
                 "waiting"
-            } else if self.connection_failed || self.error.is_some() {
+            } else if own && (self.connection_failed || self.error.is_some()) {
                 "failed"
             } else {
                 "discovering"

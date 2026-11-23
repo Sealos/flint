@@ -34,6 +34,7 @@ use super::clusters::{
     ClustersModel, Presence, cluster_details, cluster_tooltip, connection_stopped, state_label,
 };
 use super::confirm::{self, DialogText};
+use super::connection_progress;
 use super::dashboard::{DashboardEvent, DashboardView};
 use super::detail::{
     DetailEvent, DetailTab, DetailView, ObjectRef, Opening, TakeFocus, protected_reason, refused,
@@ -410,6 +411,10 @@ impl Workspace {
                     let Some(cluster) = this.cluster.clone() else {
                         return;
                     };
+                    // The elapsed time and the retry countdown.
+                    if this.model.read(cx).can_cancel_connection() {
+                        cx.notify();
+                    }
                     let states = this.model.read(cx).core().sync_states(&cluster);
                     if this.nav.update(cx, |nav, cx| nav.set_states(states, cx)) {
                         cx.notify();
@@ -500,6 +505,13 @@ impl Workspace {
         };
         this.show_appearance(window, cx);
         this.load_saved_sets(cx);
+        if let Some(alerts) = cx.try_global::<super::alert_center::Alerts>() {
+            let center = alerts.0.clone();
+            this._subscriptions
+                .push(cx.observe_in(&center, window, |this, _, window, cx| {
+                    this.show_alert_overview(false, window, cx);
+                }));
+        }
         this
     }
 
@@ -1119,6 +1131,9 @@ impl Workspace {
                 nav.set_states(Vec::new(), cx);
             }
         });
+        // The overview first: opening it closes a set, whose held members then need no feed.
+        self.show_alert_overview(cluster_changed, window, cx);
+        self.refresh_set_kinds(cx);
         // An open switcher follows the active cluster and its discovery.
         self.refresh_switcher(cx);
         let (Some(cluster), Some(discovery)) = (active, discovered.discovery) else {
@@ -1219,9 +1234,31 @@ impl Workspace {
         self.ui_state.namespace_filter(cluster).to_vec()
     }
 
+    /// Shows the overview an opened alert asked for, once this is its cluster. A move to another
+    /// cluster first drops the request.
+    fn show_alert_overview(&mut self, moved: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(center) = cx
+            .try_global::<super::alert_center::Alerts>()
+            .map(|alerts| alerts.0.clone())
+        else {
+            return;
+        };
+        let Some(wanted) = center.read(cx).wanted_overview().cloned() else {
+            return;
+        };
+        let here = self.cluster.as_deref() == Some(wanted.context.as_str())
+            && self.generation == Some(wanted.generation);
+        if here || moved {
+            center.update(cx, |center, _| center.clear_overview());
+        }
+        if here {
+            self.open_dashboard(window, cx);
+        }
+    }
+
     /// Shows the active cluster's overview in place of its list. Go Back returns to the list.
     fn open_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(cluster) = self.cluster.clone() else {
+        let (Some(cluster), Some(generation)) = (self.cluster.clone(), self.generation) else {
             return;
         };
         if let Some((view, _)) = &self.dashboard {
@@ -1238,7 +1275,7 @@ impl Workspace {
         self.remember_place(&overview, cx);
         self.close_list(cx);
         let model = self.model.clone();
-        let view = cx.new(|cx| DashboardView::following(model, cluster, cx));
+        let view = cx.new(|cx| DashboardView::following(model, cluster, generation, cx));
         let events = cx.subscribe_in(&view, window, Self::on_dashboard_event);
         let focus = view.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
@@ -1662,15 +1699,22 @@ impl Workspace {
             .border_color(super::theme::cursor_ring(theme, ring))
             .tooltip(move |_, cx| cluster_tooltip(tip.0.clone(), &tip.1, &tip.2, cx))
             // While choosing clusters a click chooses: it must not connect to this one.
-            .when(self.sets.picking(), |row| {
-                row.on_click(registry::on_click(registry::TogglePickedCluster {
+            // So does a Cmd-click, which starts choosing.
+            .on_click({
+                let choose = registry::on_click(registry::TogglePickedCluster {
                     cluster: name.clone(),
-                }))
-            })
-            .when(!self.sets.picking(), |row| {
-                row.on_click(registry::on_click(SelectCluster {
+                });
+                let select = registry::on_click(SelectCluster {
                     cluster: name.clone(),
-                }))
+                });
+                let picking = self.sets.picking();
+                move |event: &ClickEvent, window, cx| {
+                    if sets::click_chooses(picking, event.modifiers(), cx) {
+                        choose(event, window, cx);
+                    } else {
+                        select(event, window, cx);
+                    }
+                }
             })
             .children(self.render_pick_box(&name))
             .child(dot)
@@ -2378,9 +2422,14 @@ impl Workspace {
     /// pane beside the list: a detail shown alone fills the main area, so the sidebar keeps its
     /// width and its rows can still be told apart.
     fn layout(&self, window_width: f32, cx: &App) -> Layout {
-        let nav_shown = self.model.read(cx).active_cluster().is_some();
         let detail_beside = self.detail.is_some() && self.main_panes(cx) == MainPanes::Split;
-        layout(&self.panes, window_width, nav_shown, detail_beside)
+        layout(&self.panes, window_width, self.nav_shown(cx), detail_beside)
+    }
+
+    /// Whether the navigation is on screen: for the active cluster, or for an open set, which
+    /// needs its kinds even with nothing active.
+    fn nav_shown(&self, cx: &App) -> bool {
+        self.model.read(cx).active_cluster().is_some() || self.sets.is_open()
     }
 
     /// Whether the main header puts its controls on a second row in a window this wide.
@@ -2529,6 +2578,11 @@ impl Workspace {
             .dashboard
             .as_ref()
             .filter(|_| !matches!(cluster.state, ConnectionState::Failed(_)));
+        let overview_notice = dashboard
+            .filter(|_| matches!(cluster.state, ConnectionState::Connecting))
+            .and_then(|_| {
+                connection_progress::connecting_notice(&cluster, model.active_progress(), theme)
+            });
         let content: AnyElement = match (&self.list, &cluster.state) {
             _ if dashboard.is_some() => div()
                 .flex_1()
@@ -2622,6 +2676,10 @@ impl Workspace {
                             .text_color(theme.muted_foreground)
                             .child(message.to_string()),
                     )
+                    .children(connection_progress::retry_notice(
+                        model.active_progress(),
+                        theme,
+                    ))
                     .child(
                         div().pt_2().child(
                             Button::new("connection-retry")
@@ -2632,12 +2690,11 @@ impl Workspace {
                         ),
                     ),
             ),
-            _ => centered(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child("Connecting…"),
-            ),
+            _ => centered(connection_progress::connecting(
+                &cluster,
+                model.active_progress(),
+                theme,
+            )),
         };
         v_flex()
             .flex_1()
@@ -2650,6 +2707,7 @@ impl Workspace {
                     .aria_label(text)
                     .test_support()
             }))
+            .children(overview_notice)
             .child(content)
             .into_any_element()
     }
@@ -3471,7 +3529,7 @@ impl Render for Workspace {
                 self.sidebar_focus.is_focused(window),
                 cx,
             ))
-            .when(has_cluster, |el| {
+            .when(self.nav_shown(cx), |el| {
                 el.child(self.render_nav_column(widths.navigation, theme))
             })
             .child(

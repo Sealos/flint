@@ -32,14 +32,14 @@ use super::super::nav::NavPanel;
 use super::super::palette::{ArgInput, Choice, ChoiceSource, CommandPalette, Mode, PaletteEvent};
 use super::super::registry::{
     About, ActionError, ActionSpec, ActivateTab, AddNamespace, ApplyYamlEdit, Arg, ArgKind,
-    BackToYamlEdit, Bind, CancelYamlEdit, ClearSelection, Close, CloseActiveTab, CloseDetail,
-    CloseTab, CopyLines, CopyText, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, DragSelection,
-    EditYaml, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp, FocusFilter, FocusNextPane,
-    FocusPreviousPane, FocusSearch, Forward, ForwardCurrent, GoBack, Guards, Hide, HideFromAi,
-    HideOthers, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, NextTab, OnView, OpenContainerLogs,
-    OpenContainerShell, OpenLogs, OpenObject, OpenPreviousLogs, OpenSelectedRow, OpenSelectorLogs,
-    OpenShell, OpenView, PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs, Refresh,
-    ReloadYamlEdit, RestartShell, RetryConnection, ReviewYamlEdit, SaveLines, SaveLogs,
+    BackToYamlEdit, Bind, CancelConnection, CancelYamlEdit, ClearSelection, Close, CloseActiveTab,
+    CloseDetail, CloseTab, CopyLines, CopyText, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly,
+    DragSelection, EditYaml, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp, FocusFilter,
+    FocusNextPane, FocusPreviousPane, FocusSearch, Forward, ForwardCurrent, GoBack, Guards, Hide,
+    HideFromAi, HideOthers, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, NextTab, OnView,
+    OpenContainerLogs, OpenContainerShell, OpenLogs, OpenObject, OpenPreviousLogs, OpenSelectedRow,
+    OpenSelectorLogs, OpenShell, OpenView, PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs,
+    Refresh, ReloadYamlEdit, RestartShell, RetryConnection, ReviewYamlEdit, SaveLines, SaveLogs,
     SaveMatchingLines, SaveScope, SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom,
     ScrollToTop, SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext,
     SelectNextLine, SelectPrev, SelectPrevLine, SelectRow, SelectText, SetDockHeight,
@@ -152,6 +152,11 @@ impl Workspace {
         })
         .bind::<ShowDrainReport>(|_, _, window, cx| resource_actions::show_drain_report(window, cx))
         .bind::<RetryConnection>(Self::retry_connection)
+        .bind::<CancelConnection>(|this, _, _, cx| {
+            if this.model.read(cx).can_cancel_connection() {
+                this.model.update(cx, |model, _| model.cancel_connection());
+            }
+        })
         .bind::<WatchAllKinds>(|this, _, _, cx| this.set_watch_mode(true, Some(WatchMode::All), cx))
         .bind::<WatchOpenViewsOnly>(|this, _, _, cx| {
             this.set_watch_mode(true, Some(WatchMode::OnView), cx)
@@ -264,13 +269,14 @@ impl Workspace {
             })
             .add::<UntrustCluster>(Self::settings_ok, |ws, a, cx| ws.check_untrust(a, cx))
             .when::<RetryConnection>(|ws, cx| ws.retry_enabled(cx))
+            .when::<CancelConnection>(|ws, cx| ws.model.read(cx).can_cancel_connection())
             .when::<WatchAllKinds>(|ws, cx| ws.cluster.is_some() && ws.settings_ok(cx))
             .when::<WatchOpenViewsOnly>(|ws, cx| ws.cluster.is_some() && ws.settings_ok(cx))
             .when::<UseDefaultWatchMode>(|ws, cx| ws.cluster.is_some() && ws.settings_ok(cx))
             .when::<DefaultWatchAllKinds>(Self::settings_ok)
             .when::<DefaultWatchOpenViewsOnly>(Self::settings_ok)
             .add::<OpenView>(
-                |ws, _| ws.cluster.is_some(),
+                |ws, _| ws.cluster.is_some() || ws.sets.is_open(),
                 |ws, a, cx| ws.check_open_view(a, cx),
             )
             .add::<OpenObject>(
@@ -942,7 +948,7 @@ impl Workspace {
 
     fn check_open_view(&self, action: &OpenView, cx: &App) -> Result<(), ActionError> {
         self.check_listed_on::<OpenView>(action.cluster.as_deref(), action.server.as_deref(), cx)?;
-        match self.nav_entry(&action.kind, cx) {
+        match self.view_entry(&action.kind, cx) {
             Some(_) => Ok(()),
             None => Err(ActionError::rejected::<OpenView>(format!(
                 "the active cluster does not serve {} (or discovery has not finished)",
@@ -1448,9 +1454,18 @@ impl Workspace {
             tracing::warn!("{e}");
             return;
         }
-        match self.nav_entry(&action.kind, cx) {
+        match self.view_entry(&action.kind, cx) {
             Some(entry) => self.open_kind(&entry, window, cx),
             None => tracing::warn!("{}", self.check_open_view(action, cx).unwrap_err()),
+        }
+    }
+
+    /// The entry a view of `kind` opens: from what the open set serves, and nothing else while a
+    /// set is open, or from the active cluster.
+    pub(in crate::ui) fn view_entry(&self, kind: &str, cx: &App) -> Option<NavEntry> {
+        match self.nav.read(cx).set_kinds() {
+            Some(set) => set.entry(kind),
+            None => self.nav_entry(kind, cx),
         }
     }
 

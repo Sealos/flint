@@ -5,9 +5,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use flint_core::handle::{Command, CoreHandle, MemberStatus};
-use flint_core::{KindId, Settings};
-use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, WatchStep, write_kubeconfigs};
+use flint_core::handle::{Command, CoreHandle, MemberStatus, Subscription};
+use flint_core::settings::ClusterPin;
+use flint_core::{KindId, Settings, SyncState};
+use flint_e2e::fake_api::{FakeApiServer, FakeRow, Fault, Gvr, WatchStep, write_kubeconfigs};
 
 #[allow(dead_code)]
 mod core_support;
@@ -187,4 +188,165 @@ async fn a_repointed_member_leaves_and_never_reaches_the_new_server() {
         elsewhere.requests().is_empty(),
         "nothing connects to the new server"
     );
+}
+
+#[tokio::test]
+async fn a_combined_view_sends_nothing_to_the_server_its_active_member_moved_to() {
+    let [a, b, elsewhere] = servers().await;
+    let (core, path) = core_on(&[&a, &b]).await;
+    let pins = vec![ClusterPin::new("a", a.url()), ClusterPin::new("b", b.url())];
+    let admitted = core.handle.admit_running_set(pins).await.unwrap();
+    let member = admitted.into_iter().find(|m| m.context() == "a").unwrap();
+    let combined = core.handle.bound_to(member);
+    let _view = combined.subscribe("a", &pod_kind());
+    a.wait_for_watches(&pods(), 1, WAIT).await.unwrap();
+
+    write_config(&path, &[&elsewhere, &b]);
+    core.handle.reload_kubeconfig().await.unwrap();
+
+    // The active cluster's own view does reach the new server, so its watches have been decided.
+    let services = elsewhere.gvr("services");
+    let _own_view = core.handle.subscribe("a", &KindId::new("", "services"));
+    elsewhere
+        .wait_for_watches(&services, 1, WAIT)
+        .await
+        .unwrap();
+    until_no_watches(&a).await;
+    let reached: Vec<_> = elsewhere
+        .requests()
+        .into_iter()
+        .filter(|r| r.is_about(&pods()))
+        .map(|r| r.path)
+        .collect();
+    assert!(reached.is_empty(), "{reached:?}");
+}
+
+fn pod_row(name: &str) -> FakeRow {
+    FakeRow::build(Some("default"), name, vec![serde_json::json!(name)])
+}
+
+async fn until_row(view: &mut Subscription, name: &str) {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if view.latest().names().contains(&name) {
+                return;
+            }
+            view.changed().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{name} did not arrive"));
+}
+
+#[tokio::test]
+async fn a_member_view_never_shows_the_server_its_context_moved_to() {
+    let [a, b, elsewhere] = servers().await;
+    a.set_row(&pods(), pod_row("admitted-pod"));
+    elsewhere.set_row(&pods(), pod_row("replacement-pod"));
+    let (core, path) = core_on(&[&a, &b]).await;
+    let pins = vec![ClusterPin::new("a", a.url()), ClusterPin::new("b", b.url())];
+    let admitted = core.handle.admit_running_set(pins).await.unwrap();
+    let member = admitted.into_iter().find(|m| m.context() == "a").unwrap();
+    let combined = core.handle.bound_to(member);
+    let mut member_view = combined.subscribe("a", &pod_kind());
+    until_row(&mut member_view, "admitted-pod").await;
+
+    write_config(&path, &[&elsewhere, &b]);
+    core.handle.reload_kubeconfig().await.unwrap();
+    let mut plain_view = core.handle.subscribe("a", &pod_kind());
+    until_row(&mut plain_view, "replacement-pod").await;
+
+    let mut refused = combined.subscribe("a", &pod_kind());
+    assert!(refused.changed().await, "the first read");
+    // Answered after the refused subscription was handled.
+    core.handle.running_set().await;
+    for snapshot in [member_view.latest(), refused.latest()] {
+        assert!(snapshot.rows.is_empty(), "{:?}", snapshot.names());
+        assert_eq!(snapshot.state, SyncState::Idle);
+    }
+    assert!(plain_view.latest().names().contains(&"replacement-pod"));
+}
+
+fn unserved_kind() -> KindId {
+    KindId::new("example.io", "widgets")
+}
+
+async fn until_state(view: &mut Subscription, state: SyncState) {
+    tokio::time::timeout(WAIT, async {
+        while view.latest().state != state {
+            view.changed().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the view did not reach {state:?}"));
+}
+
+#[tokio::test]
+async fn a_member_view_inherits_nothing_from_the_previous_server() {
+    let [a, b, replacement] = servers().await;
+    let (core, path) = core_on(&[&a, &b]).await;
+    let mut plain = core.handle.subscribe("a", &unserved_kind());
+    until_state(&mut plain, SyncState::Unavailable).await;
+
+    // The new server answers nothing yet, so its discovery can't have decided the kind.
+    let (fault, hold) = Fault::hold();
+    replacement.inject(fault);
+    write_config(&path, &[&replacement, &b]);
+    core.handle.reload_kubeconfig().await.unwrap();
+    let pins = vec![
+        ClusterPin::new("a", replacement.url()),
+        ClusterPin::new("b", b.url()),
+    ];
+    let admitted = core.handle.admit_running_set(pins).await.unwrap();
+    let member = admitted.into_iter().find(|m| m.context() == "a").unwrap();
+    let combined = core.handle.bound_to(member);
+    let mut bound = combined.subscribe("a", &unserved_kind());
+    assert!(bound.changed().await, "the first read");
+    // Answered after the subscription was handled.
+    core.handle.running_set().await;
+    assert_eq!(bound.latest().state, SyncState::Idle);
+
+    hold.release();
+    until_state(&mut plain, SyncState::Unavailable).await;
+    until_state(&mut bound, SyncState::Unavailable).await;
+}
+
+#[tokio::test]
+async fn a_member_view_cut_off_on_a_fallback_stays_cut_off_when_restored() {
+    let [a, b, fallback] = servers().await;
+    a.set_row(&pods(), pod_row("admitted-pod"));
+    let dir = tempfile::tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let secondary = dir.path().join("secondary");
+    write_config(&primary, &[&a, &b]);
+    write_config(&secondary, &[&fallback, &b]);
+    let restored = std::fs::read(&primary).unwrap();
+    let core = Core::start_on_context(
+        dir,
+        vec![primary.clone(), secondary],
+        Settings::default(),
+        "a",
+    )
+    .await;
+    let pins = vec![ClusterPin::new("a", a.url()), ClusterPin::new("b", b.url())];
+    let admitted = core.handle.admit_running_set(pins).await.unwrap();
+    let member = admitted.into_iter().find(|m| m.context() == "a").unwrap();
+    let combined = core.handle.bound_to(member);
+    let mut view = combined.subscribe("a", &pod_kind());
+    until_row(&mut view, "admitted-pod").await;
+
+    std::fs::write(&primary, "not: [valid").unwrap();
+    core.handle.reload_kubeconfig().await.unwrap();
+    until_no_watches(&a).await;
+    std::fs::write(&primary, restored).unwrap();
+    core.handle.reload_kubeconfig().await.unwrap();
+
+    // The context's own view reaches its server again, so its watches have been decided.
+    let services = a.gvr("services");
+    let _own_view = core.handle.subscribe("a", &KindId::new("", "services"));
+    a.wait_for_watches(&services, 1, WAIT).await.unwrap();
+    assert_eq!(a.open_watches(&pods()), 0, "the cut view asks for nothing");
+    let snapshot = view.latest();
+    assert!(snapshot.rows.is_empty(), "{:?}", snapshot.names());
+    assert_eq!(snapshot.state, SyncState::Idle);
 }

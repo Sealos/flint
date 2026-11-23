@@ -5,18 +5,21 @@ use std::sync::Arc;
 
 use flint_core::dashboard::{ProblemCategory, ProblemCounts, ProblemSnapshot, ProblemSummariser};
 use flint_core::problems::{
-    Problem, ProblemId, ProblemKind, ProblemSubject, WORKLOAD_HOLD_DOWN, WorkloadKind,
+    Problem, ProblemId, ProblemKind, ProblemSeverity, ProblemSubject, WORKLOAD_HOLD_DOWN,
+    WorkloadKind,
 };
+use gpui_kit::test::TestAppContextExt as _;
 use gpui_kit::{Entity, TestAppContext};
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use super::dashboard::{
-    DashboardModel, DashboardView, FeedId, ProblemList, ProblemLists, ProblemTile, lists_of,
+    DashboardModel, DashboardView, FeedId, ProblemList, ProblemLists, ProblemRow, ProblemTile,
+    ProblemsPanel, lists_of, slot_to_read,
 };
 use super::list::{CountedObjects, ObjectFilter};
-use super::registry::{Scope, tests::assert_binds_scope};
-use super::support_tests::{TestWorkspace, open_workspace, pods, standard_sections};
+use super::registry::{OpenObject, Scope, tests::assert_binds_scope};
+use super::support_tests::{TestWorkspace, WAIT, open_workspace, pods, standard_sections};
 use flint_core::thresholds::ThresholdLevel;
 
 const OPEN: &str = "workspace::OpenClusterOverview";
@@ -159,6 +162,41 @@ fn short_workloads_list_only_what_the_tile_counted() {
     let third = counts(&mixed, &mut summariser, later);
     assert_eq!(third.get(ProblemCategory::ShortWorkloads), Some(1));
     assert!(short_kinds(&mixed, &third).is_empty());
+}
+
+#[gpui_kit::test]
+async fn an_opened_alert_shows_the_overview_only_on_its_own_cluster(cx: &mut TestAppContext) {
+    use super::alert_center::{AlertCenter, Alerts};
+    use crate::notifications::FreedesktopSender;
+    use gpui_kit::AppContext as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    cx.run_until_parked();
+    let model = t.model.clone();
+    let center = cx.update(|cx| {
+        let center = cx.new(|cx| AlertCenter::new(model, Arc::new(FreedesktopSender), cx));
+        cx.set_global(Alerts(center.clone()));
+        center
+    });
+    let generation = t.model.read_with(cx, |model, _| {
+        model.active_cluster().expect("alpha is active").generation
+    });
+    let ask = |cx: &mut TestAppContext, context: &'static str, generation: u64| {
+        center.update(cx, |center, _| center.want_overview(context, generation));
+        t.model.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+    };
+
+    ask(cx, "kind-beta", generation);
+    assert!(dashboard(cx, &t).is_none(), "another cluster's alert");
+    ask(cx, "kind-alpha", generation + 1);
+    assert!(dashboard(cx, &t).is_none(), "a re-pointed cluster's alert");
+
+    ask(cx, "kind-alpha", generation);
+    assert!(dashboard(cx, &t).is_some(), "the active cluster's alert");
+    assert!(center.read_with(cx, |center, _| center.wanted_overview().is_none()));
 }
 
 #[gpui_kit::test]
@@ -347,9 +385,157 @@ async fn a_problem_tile_opens_its_objects_and_the_kind_shows_all_again(cx: &mut 
     assert_eq!(t.row_count(cx), 1);
     t.dispatch(cx, "workspace::OpenView", json!({"kind": "pods"}))
         .unwrap();
-    cx.run_until_parked();
     assert!(list.read_with(cx, |list, _| list.only().is_none()));
+    // The rows are computed on a core thread, which `run_until_parked` does not wait for.
+    let widened = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| widened.read(cx).shown().1 != 1)
+        .await;
+    cx.run_until_parked();
     assert_eq!(t.row_count(cx), 2);
+}
+
+/// The overview showing one problem row that opens `web-0`, for `cluster` on `server`.
+fn show_problem_row(
+    cx: &mut TestAppContext,
+    view: &Entity<DashboardView>,
+    cluster: &str,
+    server: Option<String>,
+) {
+    let row = ProblemRow {
+        severity: ProblemSeverity::Critical,
+        summary: "Container keeps crashing and restarting",
+        object: "Pod demo/web-0 (app)".to_owned(),
+        open: OpenObject {
+            kind: "pods".to_owned(),
+            namespace: Some("demo".to_owned()),
+            name: "web-0".to_owned(),
+            cluster: Some(cluster.to_owned()),
+            server,
+        },
+    };
+    view.update(cx, |view, cx| {
+        let mut model = view.model().clone();
+        model.problems = ProblemsPanel::Rows {
+            rows: vec![row],
+            total: 1,
+            settling: 0,
+            incomplete: false,
+        };
+        view.set_model(model, cx);
+    });
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+async fn a_later_slot_does_not_label_this_feed(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let _view = open(cx, &t).await;
+    let summary = t
+        .workspace
+        .read_with(cx, |ws, cx| ws.cluster_summary("kind-alpha", cx).cloned())
+        .expect("connected");
+    let followed = summary.generation;
+    assert!(slot_to_read(Some(&summary), "kind-alpha", followed).is_some());
+
+    let mut moved = summary;
+    moved.generation = followed + 1;
+    moved.info.server = Some("https://moved.example".to_owned());
+    assert!(
+        slot_to_read(Some(&moved), "kind-alpha", followed).is_none(),
+        "the moved context's server must not label the followed slot's feed"
+    );
+}
+
+#[gpui_kit::test]
+async fn an_overview_link_of_a_gone_feed_opens_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let view = open(cx, &t).await;
+    let server = t.workspace.read_with(cx, |ws, cx| {
+        ws.cluster_summary("kind-alpha", cx)
+            .and_then(|summary| summary.info.server.clone())
+    });
+    let old = FeedId::for_test("kind-alpha");
+    view.update(cx, |view, cx| {
+        view.set_running_feed_for_test(Some(old.clone()));
+        let (model, lists) = (view.model().clone(), ProblemLists::new());
+        view.finish_read_for_test(Some(old.clone()), model, lists, cx);
+    });
+    show_problem_row(cx, &view, "kind-alpha", server);
+    let link = view.read_with(cx, |view, _| match &view.model().problems {
+        ProblemsPanel::Rows { rows, .. } => rows[0].open.clone(),
+        ProblemsPanel::Unknown => panic!("no rows"),
+    });
+
+    // Replaced: the row is still drawn, and its click must not reach the workspace.
+    view.update(cx, |view, cx| {
+        view.set_running_feed_for_test(Some(FeedId::for_test("kind-alpha")));
+        assert!(view.refuses_link(|model| model.links_object(&link), cx));
+    });
+    t.click(cx, ("dashboard-problem", 0usize));
+    cx.run_until_parked();
+    assert!(dashboard(cx, &t).is_some(), "the stale row opened nothing");
+    assert!(t.list(cx).is_none());
+}
+
+#[gpui_kit::test]
+async fn a_link_from_the_frame_before_a_feed_stopped_opens_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let view = open(cx, &t).await;
+    let old = FeedId::for_test("kind-alpha");
+    view.update(cx, |view, cx| {
+        view.set_running_feed_for_test(Some(old.clone()));
+        let (model, lists) = (view.model().clone(), ProblemLists::new());
+        view.finish_read_for_test(Some(old.clone()), model, lists, cx);
+    });
+    show_problem_row(cx, &view, "kind-alpha", Some("https://one".to_owned()));
+    let link = view.read_with(cx, |view, _| match &view.model().problems {
+        ProblemsPanel::Rows { rows, .. } => rows[0].open.clone(),
+        ProblemsPanel::Unknown => panic!("no rows"),
+    });
+    // Cleared but not yet redrawn: the old frame's row is still under the pointer.
+    view.update(cx, |view, cx| {
+        view.set_running_feed_for_test(None);
+        view.refresh(cx);
+        assert!(view.refuses_link(|model| model.links_object(&link), cx));
+    });
+}
+
+#[gpui_kit::test]
+async fn a_problem_row_opens_its_exact_object(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let view = open(cx, &t).await;
+    let server = t.workspace.read_with(cx, |ws, cx| {
+        ws.cluster_summary("kind-alpha", cx)
+            .and_then(|summary| summary.info.server.clone())
+    });
+    show_problem_row(cx, &view, "kind-alpha", server);
+    t.click(cx, ("dashboard-problem", 0usize));
+    cx.run_until_parked();
+    assert!(dashboard(cx, &t).is_none(), "the overview gave way");
+    t.feed_list(cx, pods(&[("demo", "web-0", 0), ("demo", "web-1", 0)]))
+        .await;
+    assert_eq!(t.selected(cx).as_deref(), Some("web-0"));
+}
+
+#[gpui_kit::test]
+async fn a_problem_row_from_another_server_opens_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let view = open(cx, &t).await;
+    show_problem_row(
+        cx,
+        &view,
+        "kind-alpha",
+        Some("https://replaced.invalid".to_owned()),
+    );
+    t.click(cx, ("dashboard-problem", 0usize));
+    cx.run_until_parked();
+    assert!(dashboard(cx, &t).is_some(), "the overview stays");
+    assert!(t.list(cx).is_none());
 }
 
 #[gpui_kit::test]

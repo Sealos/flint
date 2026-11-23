@@ -38,6 +38,7 @@ use crate::write::WriteError;
 
 mod file_watch;
 mod running_set;
+mod selected_retry;
 mod telemetry;
 
 use crate::connection::member::{AttemptOutcome, MemberEvent};
@@ -82,6 +83,10 @@ pub(crate) struct Cluster {
     member_attempt: Option<AttemptId>,
     /// The latest attempt whose credential was refused, so its failure means signing in.
     rejected_attempt: Option<u64>,
+    /// The latest attempt that failed in a way time can fix, so it may be retried.
+    transient_attempt: Option<u64>,
+    /// An automatic retry was ended by a change: nothing reconnects it until it is selected.
+    awaits_selection: bool,
     /// A pause or a changed definition ended this slot's connection: a member connects again at
     /// the first load that leaves it on its server and not paused.
     reconnect: bool,
@@ -150,6 +155,8 @@ impl Cluster {
             attempt_lease: None,
             member_attempt: None,
             rejected_attempt: None,
+            transient_attempt: None,
+            awaits_selection: false,
             reconnect: false,
             generation: 0,
             discovery: None,
@@ -309,6 +316,16 @@ enum Internal {
     AttemptRejected {
         cluster: ClusterId,
         attempt: u64,
+    },
+    /// Sent just before the [`Internal::Connected`] of an attempt that failed in a way time can
+    /// fix.
+    AttemptTransient {
+        cluster: ClusterId,
+        attempt: u64,
+    },
+    /// The selected cluster's retry timer `timer` ran out.
+    SelectedRetryDue {
+        timer: u64,
     },
     /// Time to look at the running set again.
     MemberTick,
@@ -481,6 +498,8 @@ pub(crate) struct ClusterManager {
     members: HashMap<ClusterId, Member>,
     /// When members' background connection attempts may start.
     schedule: Schedule<ClusterId>,
+    /// Automatic retries of the selected cluster.
+    retries: selected_retry::RetryDriver,
     /// Runs while the set has members.
     set_ticker: Option<JoinHandle<()>>,
     /// Source of connection attempt ids; never reused.
@@ -488,10 +507,13 @@ pub(crate) struct ClusterManager {
     watcher: Option<FileWatcher>,
     hubs: HubRegistry,
     engine_config: Arc<EngineConfig>,
-    /// Open subscriptions by id.
-    subscriptions: HashMap<u64, (ClusterId, KindId)>,
+    /// Open subscriptions by id, each with the member it was admitted on if a set opened it.
+    subscriptions: HashMap<u64, (ClusterId, KindId, Option<crate::handle::AdmittedMember>)>,
+    /// Keeps each member subscription's channel open after it is cut off or refused, so it
+    /// reads as empty rather than as a stopped core.
+    member_feeds: HashMap<u64, crate::watch::MemberFeed>,
     /// Open overviews by id, with the slot generation each was opened on.
-    overviews: HashMap<u64, (ClusterId, u64)>,
+    overviews: HashMap<u64, telemetry::OpenOverview>,
     /// Running log sessions by id. They belong to no cluster slot, so they outlive cluster
     /// switches and kubeconfig reloads (UP-42).
     log_sessions: HashMap<u64, JoinHandle<()>>,
@@ -559,12 +581,14 @@ impl ClusterManager {
             active: None,
             members: HashMap::new(),
             schedule: Schedule::default(),
+            retries: Default::default(),
             set_ticker: None,
             next_attempt: 1,
             watcher: None,
             hubs,
             engine_config,
             subscriptions: HashMap::new(),
+            member_feeds: HashMap::new(),
             overviews: HashMap::new(),
             log_sessions: HashMap::new(),
             log_budget,
@@ -610,6 +634,7 @@ impl ClusterManager {
                 Ok(request) = requests.recv() => self.handle_request(request),
                 Some(msg) = internal_rx.recv() => self.handle_internal(msg).await,
             }
+            self.sync_selected_retry();
             self.sync_telemetry();
         }
     }
@@ -629,6 +654,10 @@ impl ClusterManager {
     async fn handle_command(&mut self, command: Command) {
         match command {
             Command::Activate(id) => self.activate(id),
+            Command::CancelConnection {
+                cluster,
+                generation,
+            } => self.cancel_connection(&cluster, generation),
             Command::SetRunningSet(ids) => self.set_running_set(ids),
             Command::SetAiExposed {
                 cluster,
@@ -685,6 +714,16 @@ impl ClusterManager {
                 })
                 .await
             }
+            Command::SetClusterAlerts {
+                cluster,
+                server,
+                enabled,
+            } => {
+                self.write_settings("the cluster's alerts", move |dir| {
+                    settings::set_cluster_alerts(dir, &cluster, &server, enabled)
+                })
+                .await
+            }
             Command::SetNamespaceFilter {
                 cluster,
                 namespaces,
@@ -727,26 +766,35 @@ impl ClusterManager {
                 let _ = reply.send(self.activate_pinned(cluster, &pin, generation));
             }
             Request::Subscribe { id, cluster, kind } => {
-                self.subscriptions.insert(id, (cluster.clone(), kind));
+                self.subscriptions.insert(id, (cluster.clone(), kind, None));
                 self.reconcile(&cluster);
             }
-            Request::SubscribeMember { id, member, kind } => {
-                self.subscribe_member(id, member, kind);
+            Request::SubscribeMember {
+                id,
+                cluster,
+                member,
+                kind,
+                feed,
+            } => {
+                self.subscribe_member(id, &cluster, member, kind, feed);
             }
             Request::Unsubscribe { id } => {
-                if let Some((cluster, kind)) = self.subscriptions.remove(&id) {
-                    self.reconcile(&cluster);
-                    let running = self
-                        .clusters
-                        .iter()
-                        .find(|c| c.info.name == cluster)
-                        .is_some_and(|c| c.watches.running().contains_key(&kind));
-                    if !running {
-                        self.hubs.release(&cluster, &kind);
+                self.member_feeds.remove(&id);
+                if let Some((cluster, kind, member)) = self.subscriptions.remove(&id) {
+                    if member.is_some() {
+                        self.hubs.remove_member(&cluster, &kind, id);
                     }
+                    self.reconcile(&cluster);
+                    self.release_hub_if_unwatched(&cluster, &kind);
                 }
             }
             Request::OpenOverview { id, cluster } => self.open_overview(id, cluster),
+            Request::OpenOverviewOn {
+                id,
+                cluster,
+                generation,
+                live,
+            } => self.open_overview_on(id, cluster, generation, live),
             Request::CloseOverview { id } => self.close_overview(id),
             Request::Discovery { cluster, reply } => {
                 let discovery = self
@@ -1005,13 +1053,21 @@ impl ClusterManager {
     /// Brings a cluster's watches in line with whether it wants them, its watch mode, and the
     /// open subscriptions, and follows its CRDs while it wants them.
     fn reconcile(&mut self, id: &str) {
+        // Before anything below can start a watch on the context's current server.
+        self.cut_off_changed_members(Some(id));
         let wanted = self.wants_watches(id);
         let mode = self.settings.watch_mode_for(id);
         let subscribed: HashSet<KindId> = self
             .subscriptions
             .values()
-            .filter(|(c, _)| c == id)
-            .map(|(_, k)| k.clone())
+            .filter(|(c, _, member)| {
+                // A member's subscription asks for nothing once its context left that server.
+                c == id
+                    && member
+                        .as_ref()
+                        .is_none_or(|m| self.member_changed(m).is_none())
+            })
+            .map(|(_, k, _)| k.clone())
             .collect();
         let hubs = self.hubs.clone();
         let internal = self.internal_tx.clone();
@@ -1421,6 +1477,7 @@ impl ClusterManager {
                 attempt,
                 result,
             } => {
+                self.end_invalid_retry();
                 let target = cluster::Target::of(&self.kubeconfig.merged, &cluster);
                 let paused = self.paused(&cluster);
                 let Some(slot) = self.cluster_mut(&cluster) else {
@@ -1524,6 +1581,14 @@ impl ClusterManager {
                     slot.rejected_attempt = Some(attempt);
                 }
             }
+            Internal::AttemptTransient { cluster, attempt } => {
+                if let Some(slot) = self.cluster_mut(&cluster)
+                    && slot.attempt == attempt
+                {
+                    slot.transient_attempt = Some(attempt);
+                }
+            }
+            Internal::SelectedRetryDue { timer } => self.selected_retry_due(timer).await,
             Internal::MemberTick => self.tick_members(Instant::now()),
             Internal::Discovered {
                 cluster,
@@ -2113,7 +2178,9 @@ impl ClusterManager {
             ConnectionState::Disconnected if paused && slot.client.is_none() => {
                 slot.state = ConnectionState::AwaitingConfirmation;
             }
-            ConnectionState::Failed(_) if paused && slot.client.is_none() => {
+            ConnectionState::Failed(_)
+                if paused && slot.client.is_none() && !slot.awaits_selection =>
+            {
                 slot.reconnect = true;
                 slot.state = ConnectionState::AwaitingConfirmation;
             }
@@ -2241,10 +2308,16 @@ impl ClusterManager {
         // Someone selected or retried a cluster: a prompting plugin resting after a timed-out
         // refresh may run again now.
         crate::auth_plugin::retry_now(&id);
-        if self.cluster_mut(&id).is_none() {
+        let Some(slot) = self.cluster_mut(&id) else {
             self.emit(Event::Error(format!("cluster \"{id}\" no longer exists")));
             return;
-        }
+        };
+        slot.awaits_selection = false;
+        let idle = !matches!(
+            slot.state,
+            ConnectionState::Connecting | ConnectionState::Connected(_)
+        );
+        self.retries.retry.selected(idle);
         if self.active.as_deref() != Some(&id) {
             // Judged while it is still in the background, so a connection already refused is
             // replaced below rather than reused.
@@ -2385,6 +2458,11 @@ impl ClusterManager {
             result.map_err(|e| {
                 if running_set::needs_sign_in(&e) {
                     let _ = rejections.send(Internal::AttemptRejected {
+                        cluster: name.clone(),
+                        attempt,
+                    });
+                } else if crate::connection::retry::transient(&e) {
+                    let _ = rejections.send(Internal::AttemptTransient {
                         cluster: name.clone(),
                         attempt,
                     });
@@ -2606,6 +2684,7 @@ impl ClusterManager {
         let mut changed_active = false;
         // Dropping a slot aborts its attempt, which then never reports: its admission is freed here.
         let mut discarded: Vec<AttemptId> = Vec::new();
+        let mut retry_replaced = None;
         for info in &loaded.contexts {
             let fingerprint = cluster::context_fingerprint(&loaded.merged, &info.name);
             let was_paused = paused.contains(&info.name);
@@ -2624,6 +2703,9 @@ impl ClusterManager {
                     // namespace filter still applies.
                     if self.active.as_deref() == Some(&info.name) {
                         changed_active = true;
+                        if self.retries.retry.has_retried(&info.name, old.generation) {
+                            retry_replaced = Some(info.name.clone());
+                        }
                     }
                     discarded.extend(old.member_attempt);
                     let mut fresh =
@@ -2631,11 +2713,18 @@ impl ClusterManager {
                     fresh.namespace_filter = old.namespace_filter.clone();
                     fresh.update_scope();
                     fresh.generation = self.next_generation();
-                    fresh.reconnect = old.reconnect
-                        || !matches!(
-                            old.state,
-                            ConnectionState::Disconnected | ConnectionState::AwaitingConfirmation
-                        );
+                    // A slot that waits for a new selection goes on waiting through later loads.
+                    if old.awaits_selection {
+                        fresh.awaits_selection = true;
+                        fresh.state = old.state.clone();
+                    }
+                    fresh.reconnect = !old.awaits_selection
+                        && (old.reconnect
+                            || !matches!(
+                                old.state,
+                                ConnectionState::Disconnected
+                                    | ConnectionState::AwaitingConfirmation
+                            ));
                     fresh
                 }
                 None => {
@@ -2701,6 +2790,16 @@ impl ClusterManager {
             self.members.remove(id);
             self.schedule.dequeue(id);
         }
+        // On every load: a context on a fallback now may be back on its server by the next one.
+        let mut to_reconcile = self.cut_off_changed_members(None);
+        for id in &ended {
+            if !to_reconcile.contains(id) {
+                to_reconcile.push(id.clone());
+            }
+        }
+        if let Some(id) = &retry_replaced {
+            self.retry_replaced(id);
+        }
         // Before anything reports this load, so no context is shown paused with a feed running.
         self.stop_unwanted_telemetry();
         self.arm_set_ticker();
@@ -2727,7 +2826,7 @@ impl ClusterManager {
                 self.emit(Event::Error(format!(
                     "\"{active}\" was removed from your kubeconfig files."
                 )));
-            } else if changed_active {
+            } else if changed_active && !self.cluster(&active).is_some_and(|s| s.awaits_selection) {
                 self.reconnect_active(&active);
             }
         }
@@ -2739,7 +2838,7 @@ impl ClusterManager {
         {
             self.resume(&name);
         }
-        for id in ended {
+        for id in to_reconcile {
             self.reconcile(&id);
         }
         // A paused context starts nothing, and the flag then waits for a later load. The rest go
@@ -6065,7 +6164,8 @@ users:
             ])
             .unwrap();
         let kind = KindId::pods();
-        manager.subscribe_member(1, admitted[0].clone(), kind.clone());
+        let feed = || tokio::sync::watch::Sender::new(Arc::default());
+        manager.subscribe_member(1, "dev", admitted[0].clone(), kind.clone(), feed());
         assert!(manager.subscriptions.contains_key(&1), "still admitted");
 
         rewrite(
@@ -6074,11 +6174,103 @@ users:
             &kubeconfig_with("https://replacement"),
         )
         .await;
-        manager.subscribe_member(2, admitted[0].clone(), kind.clone());
+        manager.subscribe_member(2, "dev", admitted[0].clone(), kind.clone(), feed());
         rewrite(&mut manager, dir.path(), &original).await;
-        manager.subscribe_member(3, admitted[0].clone(), kind);
+        manager.subscribe_member(3, "dev", admitted[0].clone(), kind, feed());
         assert!(!manager.subscriptions.contains_key(&2), "moved");
         assert!(!manager.subscriptions.contains_key(&3), "moved back");
+    }
+
+    // Seen on a fallback by a load, a member's subscription has ended, even if the next load puts
+    // the context back before anything else reconciles it.
+    #[tokio::test]
+    async fn a_member_subscription_cut_on_a_fallback_stays_cut_once_restored() {
+        use crate::settings::ClusterPin;
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = kubeconfig_with("https://127.0.0.1:2");
+        let (mut manager, confirmed, first) = pausable(dir.path(), &fallback).await;
+        let admitted = manager
+            .admit_running_set(vec![
+                ClusterPin::new("dev", "https://127.0.0.1:1"),
+                ClusterPin::new("other", "https://other"),
+            ])
+            .unwrap();
+        let pods = KindId::pods();
+        let (feed, rows) = tokio::sync::watch::channel(Arc::default());
+        manager.subscribe_member(1, "dev", admitted[0].clone(), pods.clone(), feed);
+
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(!manager.subscriptions.contains_key(&1), "cut by the load");
+        rewrite_file(&mut manager, &first, &confirmed).await;
+        assert!(!manager.subscriptions.contains_key(&1), "stays cut");
+
+        let hub = manager.hubs.get_or_create("dev", &pods);
+        let epoch = hub.take_over(KindSnapshot::empty(
+            "dev".into(),
+            pods.clone(),
+            SyncState::Loading,
+        ));
+        assert!(hub.publish(
+            epoch,
+            KindSnapshot::empty("dev".into(), pods, SyncState::Synced)
+        ));
+        assert_eq!(rows.borrow().state, SyncState::Idle);
+    }
+
+    // Opening and closing member views leaves no channel in a hub a plain view keeps open, and
+    // a cut-off view leaves no hub behind.
+    #[tokio::test]
+    async fn closed_and_cut_off_member_views_leave_nothing_in_the_hubs() {
+        use crate::settings::ClusterPin;
+        let dir = tempfile::tempdir().unwrap();
+        let original = kubeconfig_with("https://remote-a");
+        let mut manager = manager_reading(dir.path(), &original).await;
+        let admitted = manager
+            .admit_running_set(vec![
+                ClusterPin::new("dev", "https://remote-a"),
+                ClusterPin::new("other", "https://other"),
+            ])
+            .unwrap();
+        let pods = KindId::pods();
+        let (hub, _plain) = manager.hubs.subscribe("dev", &pods);
+        for id in 1..=3 {
+            let (feed, rows) = tokio::sync::watch::channel(Arc::default());
+            manager.handle_request(Request::SubscribeMember {
+                id,
+                cluster: "dev".into(),
+                member: admitted[0].clone(),
+                kind: pods.clone(),
+                feed,
+            });
+            drop(rows);
+            manager.handle_request(Request::Unsubscribe { id });
+        }
+        assert!(hub.member_feeds_empty(), "closed channels stay behind");
+
+        let services = KindId::new("", "services");
+        let (feed, _rows) = tokio::sync::watch::channel(Arc::default());
+        manager.subscribe_member(4, "dev", admitted[0].clone(), services.clone(), feed);
+        assert!(
+            manager
+                .hubs
+                .states("dev")
+                .iter()
+                .any(|(k, _)| *k == services)
+        );
+        rewrite(
+            &mut manager,
+            dir.path(),
+            &kubeconfig_with("https://replacement"),
+        )
+        .await;
+        assert!(
+            !manager
+                .hubs
+                .states("dev")
+                .iter()
+                .any(|(k, _)| *k == services),
+            "no watch and no listener left"
+        );
     }
 
     // A reload that replaces the active member's credential on the same server binds the new
@@ -6389,6 +6581,321 @@ users:
         manager.select("other");
         assert_eq!(manager.connection_role("dev"), Role::Background);
         assert!(!lease.holds(), "no command runs once it is not selected");
+    }
+
+    /// Ends `dev`'s attempt with a failure time can fix, as the attempt's task reports it.
+    async fn fail_selected(manager: &mut ClusterManager) {
+        let attempt = manager.cluster("dev").unwrap().attempt;
+        manager
+            .handle_internal(Internal::AttemptTransient {
+                cluster: "dev".into(),
+                attempt,
+            })
+            .await;
+        manager
+            .handle_internal(Internal::Connected {
+                cluster: "dev".into(),
+                attempt,
+                result: Err(cluster::SafeErrorText::fixed("connection refused")),
+            })
+            .await;
+        manager.sync_selected_retry();
+    }
+
+    fn retry_waiting(manager: &ClusterManager) -> bool {
+        manager
+            .retries
+            .retry
+            .progress()
+            .is_some_and(|p| p.next_retry.is_some())
+    }
+
+    #[tokio::test]
+    async fn the_selected_cluster_retries_a_transient_failure_until_canceled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager =
+            manager_reading(dir.path(), &kubeconfig_with("https://127.0.0.1:1")).await;
+        manager.activate("dev".to_owned());
+        manager.sync_selected_retry();
+        fail_selected(&mut manager).await;
+        assert!(retry_waiting(&manager));
+
+        let next = manager.next_attempt;
+        manager.selected_retry_due(manager.retries.timer_id).await;
+        assert_eq!(manager.next_attempt, next + 1, "the retry started");
+        manager.sync_selected_retry();
+        let generation = manager.cluster("dev").unwrap().generation;
+
+        manager.cancel_connection("dev", generation);
+        manager.sync_selected_retry();
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Failed(_)));
+        assert!(slot.connect_task.is_none());
+        assert!(!retry_waiting(&manager));
+        let next = manager.next_attempt;
+        manager.selected_retry_due(manager.retries.timer_id).await;
+        assert_eq!(manager.next_attempt, next, "canceled");
+    }
+
+    #[tokio::test]
+    async fn an_automatic_retry_never_runs_a_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let exec = "user:\n    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      \
+                    command: /usr/bin/false\n      interactiveMode: Never\n";
+        let yaml = kubeconfig_with("https://127.0.0.1:1").replace("user: {}\n", exec);
+        let mut manager = manager_reading(dir.path(), &yaml).await;
+        manager.activate("dev".to_owned());
+        manager.sync_selected_retry();
+        fail_selected(&mut manager).await;
+        assert!(!retry_waiting(&manager));
+        let next = manager.next_attempt;
+        manager.selected_retry_due(manager.retries.timer_id).await;
+        assert_eq!(manager.next_attempt, next);
+    }
+
+    #[tokio::test]
+    async fn a_pause_ends_a_waiting_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, _, first) = pausable(dir.path(), NO_CONTEXTS).await;
+        manager.activate("dev".to_owned());
+        manager.sync_selected_retry();
+        fail_selected(&mut manager).await;
+        assert!(retry_waiting(&manager));
+        let timer = manager.retries.timer_id;
+
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(manager.paused("dev"));
+        let next = manager.next_attempt;
+        manager.selected_retry_due(timer).await;
+        assert_eq!(manager.next_attempt, next, "nothing is sent while paused");
+    }
+
+    #[tokio::test]
+    async fn a_changed_definition_or_removal_ends_a_waiting_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager =
+            manager_reading(dir.path(), &kubeconfig_with("https://127.0.0.1:1")).await;
+        manager.activate("dev".to_owned());
+        manager.sync_selected_retry();
+        fail_selected(&mut manager).await;
+        let timer = manager.retries.timer_id;
+
+        rewrite(
+            &mut manager,
+            dir.path(),
+            &kubeconfig_with("https://127.0.0.1:2"),
+        )
+        .await;
+        let next = manager.next_attempt;
+        manager.selected_retry_due(timer).await;
+        assert_eq!(manager.next_attempt, next, "not sent to the new definition");
+        manager.sync_selected_retry();
+        assert!(!retry_waiting(&manager));
+
+        let without_dev = "apiVersion: v1\nkind: Config\nclusters:\n- name: o\n  cluster:\n    \
+                           server: https://other\nusers:\n- name: u\n  user: {}\ncontexts:\n- \
+                           name: other\n  context:\n    cluster: o\n    user: u\n";
+        rewrite(&mut manager, dir.path(), without_dev).await;
+        manager.sync_selected_retry();
+        assert!(manager.retries.retry.progress().is_none());
+    }
+
+    /// Takes `dev` from a transient failure to an automatic retry under way, and returns its
+    /// attempt.
+    async fn retry_under_way(manager: &mut ClusterManager) -> u64 {
+        manager.activate("dev".to_owned());
+        manager.sync_selected_retry();
+        fail_selected(manager).await;
+        assert!(retry_waiting(manager));
+        retry_fires(manager).await;
+        manager.sync_selected_retry();
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Connecting));
+        slot.attempt
+    }
+
+    async fn retry_fires(manager: &mut ClusterManager) {
+        let timer = manager.retries.timer_id;
+        manager.selected_retry_due(timer).await;
+    }
+
+    /// Delivers a finished connection for `attempt`, as its task would.
+    async fn deliver_connection(manager: &mut ClusterManager, attempt: u64) {
+        let result = Ok((built_connection(manager).await, test_version()));
+        manager
+            .handle_internal(Internal::Connected {
+                cluster: "dev".into(),
+                attempt,
+                result,
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_retry_under_way_ends_when_another_cluster_is_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager =
+            manager_reading(dir.path(), &kubeconfig_with("https://127.0.0.1:1")).await;
+        let attempt = retry_under_way(&mut manager).await;
+
+        // Already up, so selecting it dials nothing.
+        manager.cluster_mut("other").unwrap().state = ConnectionState::Connected(test_version());
+        manager.activate("other".to_owned());
+        manager.sync_selected_retry();
+        deliver_connection(&mut manager, attempt).await;
+
+        let slot = manager.cluster("dev").unwrap();
+        assert!(slot.client.is_none(), "its result is not installed");
+        assert!(slot.connect_task.is_none(), "its task is stopped");
+    }
+
+    #[tokio::test]
+    async fn a_queued_retry_result_is_refused_once_its_cluster_is_not_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager =
+            manager_reading(dir.path(), &kubeconfig_with("https://127.0.0.1:1")).await;
+        let attempt = retry_under_way(&mut manager).await;
+
+        manager.cluster_mut("other").unwrap().state = ConnectionState::Connected(test_version());
+        manager.activate("other".to_owned());
+        // The result is handled before the loop looks at the retry again.
+        deliver_connection(&mut manager, attempt).await;
+
+        assert!(manager.cluster("dev").unwrap().client.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_retry_under_way_ends_when_its_definition_turns_provisional() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://127.0.0.1:1");
+        let mut manager = manager_reading_two(dir.path(), &yaml, &yaml).await;
+        let attempt = retry_under_way(&mut manager).await;
+
+        rewrite_file(&mut manager, &dir.path().join("first"), UNREADABLE).await;
+        assert!(manager.unsettled("dev"));
+        manager.sync_selected_retry();
+        deliver_connection(&mut manager, attempt).await;
+
+        assert!(manager.cluster("dev").unwrap().client.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pause_keeps_the_retries_stopped_until_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, yaml, first) = pausable(dir.path(), NO_CONTEXTS).await;
+        manager.activate("dev".to_owned());
+        manager.sync_selected_retry();
+        fail_selected(&mut manager).await;
+        assert!(retry_waiting(&manager));
+
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        manager.sync_selected_retry();
+        rewrite_file(&mut manager, &first, &yaml).await;
+        manager.sync_selected_retry();
+        // The load that ended the pause connects, and that attempt fails.
+        fail_selected(&mut manager).await;
+        assert!(!retry_waiting(&manager), "no new series starts");
+
+        manager.activate("dev".to_owned());
+        manager.sync_selected_retry();
+        fail_selected(&mut manager).await;
+        assert!(retry_waiting(&manager), "selecting it starts over");
+    }
+
+    #[tokio::test]
+    async fn a_retry_does_not_probe_a_server_the_file_no_longer_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager =
+            manager_reading(dir.path(), &kubeconfig_with("https://127.0.0.1:1")).await;
+        manager.activate("dev".to_owned());
+        manager.sync_selected_retry();
+        fail_selected(&mut manager).await;
+
+        // Edited, with the watcher's reload still to come.
+        let path = dir.path().join("kubeconfig");
+        std::fs::write(path, kubeconfig_with("https://127.0.0.1:2")).unwrap();
+        let next = manager.next_attempt;
+        retry_fires(&mut manager).await;
+        assert_eq!(manager.next_attempt, next, "nothing was dialed");
+    }
+
+    #[tokio::test]
+    async fn a_reload_that_ends_a_waiting_retry_needs_a_new_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager =
+            manager_reading(dir.path(), &kubeconfig_with("https://127.0.0.1:1")).await;
+        manager.activate("dev".to_owned());
+        manager.sync_selected_retry();
+        fail_selected(&mut manager).await;
+        let next = manager.next_attempt;
+
+        let moved = kubeconfig_with("https://127.0.0.1:2");
+        rewrite(&mut manager, dir.path(), &moved).await;
+        manager.sync_selected_retry();
+        assert_eq!(manager.next_attempt, next, "the new server is not dialed");
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Failed(_)));
+        assert!(!retry_waiting(&manager));
+
+        manager.activate("dev".to_owned());
+        assert_eq!(manager.next_attempt, next + 1, "selecting it connects");
+    }
+
+    // The connection made after a retry was ended brings back neither the member's feed nor its
+    // interest in the kind, even with the context back on the server it was admitted on.
+    #[tokio::test]
+    async fn a_reconnect_after_a_retry_leaves_a_cut_off_member_view_cut_off() {
+        use crate::settings::ClusterPin;
+        let dir = tempfile::tempdir().unwrap();
+        let original = kubeconfig_with("https://127.0.0.1:1");
+        let mut manager = manager_reading(dir.path(), &original).await;
+        let admitted = manager
+            .admit_running_set(vec![
+                ClusterPin::new("dev", "https://127.0.0.1:1"),
+                ClusterPin::new("other", "https://other"),
+            ])
+            .unwrap();
+        let pods = KindId::pods();
+        let (feed, rows) = tokio::sync::watch::channel(Arc::default());
+        manager.subscribe_member(1, "dev", admitted[0].clone(), pods.clone(), feed);
+        manager.activate("dev".to_owned());
+        manager.sync_selected_retry();
+        fail_selected(&mut manager).await;
+        assert!(retry_waiting(&manager));
+        let next = manager.next_attempt;
+
+        rewrite(
+            &mut manager,
+            dir.path(),
+            &kubeconfig_with("https://127.0.0.1:2"),
+        )
+        .await;
+        manager.sync_selected_retry();
+        assert!(!manager.subscriptions.contains_key(&1), "cut by the load");
+        rewrite(&mut manager, dir.path(), &original).await;
+        manager.sync_selected_retry();
+        assert_eq!(manager.next_attempt, next, "waits for a new selection");
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Failed(_)));
+
+        manager.activate("dev".to_owned());
+        let attempt = manager.cluster("dev").unwrap().attempt;
+        deliver_connection(&mut manager, attempt).await;
+        assert!(manager.cluster("dev").unwrap().client.is_some());
+        assert!(!manager.subscriptions.contains_key(&1), "stays cut");
+        assert!(!manager.cluster("dev").unwrap().watches.is_running(&pods));
+
+        let hub = manager.hubs.get_or_create("dev", &pods);
+        let epoch = hub.take_over(KindSnapshot::empty(
+            "dev".into(),
+            pods.clone(),
+            SyncState::Loading,
+        ));
+        assert!(hub.publish(
+            epoch,
+            KindSnapshot::empty("dev".into(), pods, SyncState::Synced)
+        ));
+        assert_eq!(rows.borrow().state, SyncState::Idle);
     }
 
     // A log session asks for a background member's connection; the queue decides when it starts.

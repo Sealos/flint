@@ -80,6 +80,9 @@ pub enum Command {
     /// Make a cluster the active one, connecting it if it is not connected. Selecting a cluster
     /// whose connection failed retries it.
     Activate(ClusterId),
+    /// Ends the selected cluster's connection attempt and its automatic retries, if it is still
+    /// the slot `generation`. It stays failed until selected or retried.
+    CancelConnection { cluster: ClusterId, generation: u64 },
     /// Expose a cluster to AI agents at `server` (`Some`), limited to `scope` (ADR-0013), or hide
     /// it (`None`), in `settings.toml`. `server` is the URL the user confirmed; if the context
     /// no longer points there, nothing is written and an error is reported. Exposing an exposed
@@ -141,6 +144,13 @@ pub enum Command {
     /// Turn desktop notifications on or off and write it to `settings.toml`. The change arrives
     /// back as `Event::SettingsChanged`.
     SetDesktopNotifications(bool),
+    /// Set whether `cluster` at `server` posts desktop alerts (`None` follows the global setting)
+    /// and write it to `settings.toml`. The change arrives back as `Event::SettingsChanged`.
+    SetClusterAlerts {
+        cluster: ClusterId,
+        server: String,
+        enabled: Option<bool>,
+    },
     /// The namespaces the user filters `cluster` on (empty: all). When the user may not list a
     /// kind in all namespaces, it is listed in these one by one; without a filter, in the
     /// context's default namespace, else in every namespace the user can list. The filter
@@ -275,8 +285,10 @@ pub(crate) enum Request {
     /// [`Self::Subscribe`] for a running-set member: nothing starts unless it still holds.
     SubscribeMember {
         id: u64,
+        cluster: ClusterId,
         member: AdmittedMember,
         kind: KindId,
+        feed: crate::watch::MemberFeed,
     },
     Unsubscribe {
         id: u64,
@@ -285,6 +297,14 @@ pub(crate) enum Request {
     OpenOverview {
         id: u64,
         cluster: ClusterId,
+    },
+    /// [`Self::OpenOverview`] only if `cluster` is still the slot `generation`.
+    OpenOverviewOn {
+        id: u64,
+        cluster: ClusterId,
+        generation: u64,
+        /// True while the overview is registered on that slot.
+        live: watch::Sender<bool>,
     },
     CloseOverview {
         id: u64,
@@ -399,6 +419,20 @@ pub enum ConnectionState {
     AwaitingConfirmation,
 }
 
+/// How the selected cluster's connection has been going since it was selected or last retried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionProgress {
+    pub cluster: ClusterId,
+    /// The slot it is for ([`ClusterSummary::generation`]).
+    pub generation: u64,
+    /// When the first attempt started.
+    pub since: std::time::Instant,
+    /// Automatic retries scheduled so far.
+    pub retries: u32,
+    /// When the next automatic retry starts, if one is waiting.
+    pub next_retry: Option<std::time::Instant>,
+}
+
 /// A cluster as the sidebar shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterSummary {
@@ -505,6 +539,9 @@ pub enum Event {
         cluster: ClusterId,
         state: ConnectionState,
     },
+    /// The selected cluster's connection attempts, while it is not connected. `None` once there
+    /// is nothing to show.
+    ConnectionProgress(Option<ConnectionProgress>),
     /// Settings were loaded, reloaded, or written. When `settings.toml` cannot be read, `error`
     /// says why and `settings` are the defaults (nothing exposed), as the MCP server also treats
     /// an unreadable file as nothing exposed.
@@ -641,25 +678,36 @@ impl CoreHandle {
     /// [`Subscription::changed`] resolves at once; later ones at most about every 100 ms, however
     /// fast the cluster changes. Dropping the subscription closes it. Never blocks.
     pub fn subscribe(&self, cluster: &str, kind: &KindId) -> Subscription {
-        let (hub, mut rx) = self.hubs.subscribe(cluster, kind);
-        rx.mark_changed();
-        // A running watch publishes what it held back while nobody listened.
-        hub.wake.notify_one();
         let id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
-        // A handle bound to another context starts nothing.
-        let _ = match self.read_binding(cluster) {
-            Ok(Some(member)) => self.requests.try_send(Request::SubscribeMember {
-                id,
-                member,
-                kind: kind.clone(),
-            }),
-            Ok(None) => self.requests.try_send(Request::Subscribe {
-                id,
-                cluster: cluster.to_owned(),
-                kind: kind.clone(),
-            }),
-            Err(_) => Ok(()),
+        let (mut rx, request) = match self.bound.as_deref() {
+            // Bound to a member: its own channel, which the core connects only while the member
+            // holds, so it can't read what a watch of a replacement server publishes.
+            Some(member) => {
+                let empty = KindSnapshot::empty(cluster.to_owned(), kind.clone(), SyncState::Idle);
+                let (feed, rx) = watch::channel(Arc::new(empty));
+                let request = Request::SubscribeMember {
+                    id,
+                    cluster: cluster.to_owned(),
+                    member: member.clone(),
+                    kind: kind.clone(),
+                    feed,
+                };
+                (rx, request)
+            }
+            None => {
+                let (hub, rx) = self.hubs.subscribe(cluster, kind);
+                // A running watch publishes what it held back while nobody listened.
+                hub.wake.notify_one();
+                let request = Request::Subscribe {
+                    id,
+                    cluster: cluster.to_owned(),
+                    kind: kind.clone(),
+                };
+                (rx, request)
+            }
         };
+        rx.mark_changed();
+        let _ = self.requests.try_send(request);
         Subscription {
             id,
             cluster: cluster.to_owned(),
@@ -683,6 +731,32 @@ impl CoreHandle {
         OverviewInterest {
             id,
             requests: self.requests.clone(),
+            bound: None,
+        }
+    }
+
+    /// [`Self::open_overview`] for the slot `generation` of `cluster`. The core compares them as
+    /// it registers, so a context re-pointed meanwhile registers nothing, and
+    /// [`OverviewInterest::telemetry`] never reads the feed of a later slot.
+    pub fn open_overview_on(&self, cluster: &str, generation: u64) -> OverviewInterest {
+        let id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
+        let (live, seen) = watch::channel(false);
+        if matches!(self.read_binding(cluster), Ok(None)) {
+            let _ = self.requests.try_send(Request::OpenOverviewOn {
+                id,
+                cluster: cluster.to_owned(),
+                generation,
+                live,
+            });
+        }
+        OverviewInterest {
+            id,
+            requests: self.requests.clone(),
+            bound: Some(BoundOverview {
+                cluster: cluster.to_owned(),
+                board: self.telemetry.clone(),
+                live: seen,
+            }),
         }
     }
 
@@ -1347,6 +1421,37 @@ impl Drop for Subscription {
 pub struct OverviewInterest {
     id: u64,
     requests: async_channel::Sender<Request>,
+    /// Set by [`CoreHandle::open_overview_on`].
+    bound: Option<BoundOverview>,
+}
+
+/// Where an overview opened on one slot reads its feed.
+#[derive(Debug)]
+struct BoundOverview {
+    cluster: ClusterId,
+    board: crate::telemetry::TelemetryBoard,
+    live: watch::Receiver<bool>,
+}
+
+impl OverviewInterest {
+    /// The feed of the slot this overview was opened on. `None` until the core registers it, and
+    /// for good once that slot is replaced. The core clears the mark before it lists a later
+    /// slot's feed, so the mark is read after the feed.
+    pub fn telemetry(&self) -> Option<crate::telemetry::ClusterTelemetry> {
+        let bound = self.bound.as_ref()?;
+        let telemetry = bound.board.get(&bound.cluster);
+        (*bound.live.borrow()).then_some(telemetry).flatten()
+    }
+
+    /// Resolves once the core has registered this overview, or will never do so.
+    pub fn registered(&self) -> impl Future<Output = ()> + Send + 'static + use<> {
+        let live = self.bound.as_ref().map(|bound| bound.live.clone());
+        async move {
+            if let Some(mut live) = live {
+                let _ = live.wait_for(|registered| *registered).await;
+            }
+        }
+    }
 }
 
 impl Drop for OverviewInterest {
