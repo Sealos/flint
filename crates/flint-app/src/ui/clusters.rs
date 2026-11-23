@@ -20,7 +20,7 @@ use gpui_kit::*;
 use super::cluster_tag;
 use super::nav::NavPanel;
 use super::scope_picker;
-use super::workspace::{protection_text, server_text};
+use super::workspace::{WRITES_PAUSED_TIP, protection_text, server_text};
 
 pub struct ClustersModel {
     core: CoreHandle,
@@ -335,6 +335,25 @@ impl ClustersModel {
         )
     }
 
+    /// Whether the core refuses writes on `cluster`'s definition now. The core's published state
+    /// answers first, so this is never behind the gate; the summary only keeps it paused longer.
+    pub fn writes_paused(&self, cluster: &ClusterSummary) -> bool {
+        cluster.provisional
+            || self
+                .core
+                .definition_holds()
+                .writes_paused(&cluster.info.name)
+    }
+
+    /// Whether the core starts nothing new on `cluster` now: no connection, log stream or shell.
+    pub fn sessions_paused(&self, cluster: &ClusterSummary) -> bool {
+        cluster.paused
+            || self
+                .core
+                .definition_holds()
+                .sessions_paused(&cluster.info.name)
+    }
+
     /// [`ClustersModel::protection`] of the context named `cluster`; protected if there is none.
     pub fn protection_of(&self, cluster: &str) -> Protection {
         self.clusters
@@ -607,7 +626,11 @@ pub fn cluster_details(
     format!(
         "{name}\n{}\n{state}\n{}\n{exposure}\n{tag_line}from {}",
         server_text(cluster.info.server.as_deref()),
-        protection_text(model.protection(cluster), &model.trust(cluster)),
+        if model.writes_paused(cluster) {
+            WRITES_PAUSED_TIP.to_owned()
+        } else {
+            protection_text(model.protection(cluster), &model.trust(cluster))
+        },
         cluster.info.source.display()
     )
 }
@@ -721,6 +744,7 @@ mod tests {
             endpoint: 1,
             confirmed: true,
             provisional: false,
+            paused: false,
         }
     }
 

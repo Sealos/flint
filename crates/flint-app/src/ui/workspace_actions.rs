@@ -409,10 +409,10 @@ impl Workspace {
                 dock.is_visible() && dock.tab_count() > 1
             })
             .when::<ShowTabList>(|ws, cx| ws.dock.read(cx).tab_count() > 0)
-            .when::<ReconnectLogs>(|ws, cx| ws.dock.read(cx).restartable(true, cx).is_some())
+            .when::<ReconnectLogs>(|ws, cx| restartable_here(ws, true, cx))
             // Not on a protected cluster: the tab says why, with Unlock… beside it.
             .when::<RestartShell>(|ws, cx| {
-                ws.dock.read(cx).restartable(false, cx).is_some()
+                restartable_here(ws, false, cx)
                     && shell(ws, cx).is_some_and(|s| s.restart_blocked().is_none())
             })
             .add::<ActivateTab>(
@@ -943,10 +943,16 @@ impl Workspace {
         Ok(())
     }
 
-    /// Why log and shell sessions cannot open on `cluster` now (it is not connected), if so.
-    /// A cluster still connecting may: the object to act on is loading too.
+    /// Why log and shell sessions cannot open on `cluster` now (it is paused or not connected),
+    /// if so. A cluster still connecting may: the object to act on is loading too.
     pub(in crate::ui) fn sessions_blocked(&self, cluster: &str, cx: &App) -> Option<String> {
-        match self.cluster_summary(cluster, cx).map(|c| &c.state) {
+        let summary = self.cluster_summary(cluster, cx);
+        if summary.is_some_and(|c| self.model.read(cx).sessions_paused(c)) {
+            return Some(format!(
+                "{cluster} is waiting for its kubeconfig to be confirmed"
+            ));
+        }
+        match summary.map(|c| &c.state) {
             Some(ConnectionState::Connected(_) | ConnectionState::Connecting) => None,
             // Already a short, safe summary (`ClusterError::summary`).
             Some(ConnectionState::Failed(error)) => {
@@ -1444,6 +1450,18 @@ fn detail<'a>(ws: &Workspace, cx: &'a App) -> Option<&'a DetailView> {
 }
 
 /// The shell tab the dock shows, if it is visible and shows one.
+/// Whether the dock's shown tab can start its log (`logs`) or shell session again, on a cluster
+/// that takes new sessions now.
+fn restartable_here(ws: &Workspace, logs: bool, cx: &App) -> bool {
+    let dock = ws.dock.read(cx);
+    dock.restartable(logs, cx)
+        .and_then(|id| dock.tab(id))
+        .is_some_and(|tab| {
+            ws.sessions_blocked(tab.item(cx).tab_key().context(), cx)
+                .is_none()
+        })
+}
+
 fn shell<'a>(ws: &Workspace, cx: &'a App) -> Option<&'a TerminalView> {
     ws.dock.read(cx).active_terminal().map(|t| t.read(cx))
 }

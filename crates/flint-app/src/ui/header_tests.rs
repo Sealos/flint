@@ -303,6 +303,53 @@ async fn the_header_says_writes_are_paused(cx: &mut TestAppContext) {
     t.wait_for_label(cx, "access-mode", &before).await;
 }
 
+// While writes are paused the sidebar's lock does not say unlocked, whatever the protection.
+#[gpui_kit::test]
+async fn the_sidebar_lock_says_writes_are_paused(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    t.model.update(cx, |model, cx| {
+        let alpha = model
+            .clusters
+            .iter_mut()
+            .find(|c| c.info.name == "kind-alpha")
+            .unwrap();
+        alpha.provisional = true;
+        cx.notify();
+    });
+    t.wait_for_label(cx, "lock-kind-alpha", "Lock for kind-alpha: writes paused")
+        .await;
+}
+
+// A paused cluster blocks starting a log or shell session again, and stops once the pause ends.
+#[gpui_kit::test]
+async fn a_paused_cluster_blocks_starting_a_session_again(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    let blocked = |t: &TestWorkspace, cx: &mut TestAppContext| {
+        t.workspace
+            .read_with(cx, |ws, cx| ws.sessions_blocked("kind-alpha", cx))
+    };
+    assert_eq!(blocked(&t, cx), None);
+    let set_paused = |paused, cx: &mut TestAppContext| {
+        t.model.update(cx, |model, cx| {
+            let alpha = model
+                .clusters
+                .iter_mut()
+                .find(|c| c.info.name == "kind-alpha")
+                .unwrap();
+            alpha.paused = paused;
+            cx.notify();
+        });
+    };
+    set_paused(true, cx);
+    assert!(blocked(&t, cx).is_some_and(|why| why.contains("waiting for its kubeconfig")));
+    set_paused(false, cx);
+    assert_eq!(blocked(&t, cx), None);
+}
+
 // Waiting for the kubeconfig is not a failed connection: it says so and offers no Retry.
 #[gpui_kit::test]
 async fn waiting_for_confirmation_is_not_a_failure(cx: &mut TestAppContext) {

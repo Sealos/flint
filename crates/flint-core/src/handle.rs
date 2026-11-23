@@ -296,8 +296,9 @@ pub enum ConnectionState {
     Connected(ServerVersion),
     /// Why it failed, as safe to show ([`crate::cluster::ClusterError::summary`]).
     Failed(crate::SafeErrorText),
-    /// Not connecting until a kubeconfig file that may define this cluster can be read. Nothing
-    /// went wrong with the connection, and the load that settles the definition connects it.
+    /// Paused with no connection: the core starts none until a kubeconfig file that may define
+    /// this cluster can be read. Nothing went wrong with the connection, and the load that ends
+    /// the pause clears this. A context that is not paused never shows it.
     AwaitingConfirmation,
 }
 
@@ -324,6 +325,9 @@ pub struct ClusterSummary {
     /// refuses every write. Not the opposite of `confirmed`: a confirmed server can be provisional
     /// again while a file is unreadable.
     pub provisional: bool,
+    /// The core starts nothing new on this context: its definition differs from the confirmed
+    /// one, or only an unreadable file still defines it. A first-seen context is never paused.
+    pub paused: bool,
 }
 
 /// What the core's answer to a reload means: `None` when it stopped without answering.
@@ -427,6 +431,7 @@ pub struct CoreHandle {
     hubs: HubRegistry,
     next_subscription: Arc<AtomicU64>,
     unlocks: SessionUnlocks,
+    holds: crate::recheck::DefinitionHolds,
     log_budget: Arc<crate::logs::LogBudget>,
     access: Arc<crate::access::AccessCache>,
     runtime: tokio::runtime::Handle,
@@ -453,6 +458,7 @@ impl CoreHandle {
         let unlocks = SessionUnlocks::default();
         let manager = ClusterManager::new(config, event_tx, hubs.clone(), unlocks.clone());
         let log_budget = manager.log_budget();
+        let holds = manager.definition_holds();
         runtime.spawn(manager.run(cmd_rx, req_rx));
         Ok(Self {
             commands: cmd_tx,
@@ -461,6 +467,7 @@ impl CoreHandle {
             hubs,
             next_subscription: Arc::new(AtomicU64::new(1)),
             unlocks,
+            holds,
             log_budget,
             access: Arc::default(),
             runtime: runtime.handle().clone(),
@@ -876,6 +883,11 @@ impl CoreHandle {
     /// The session's unlocks, for showing each cluster's [`crate::Protection`].
     pub fn unlocks(&self) -> &SessionUnlocks {
         &self.unlocks
+    }
+
+    /// Which contexts the core holds now, for showing. The write gate does not read this.
+    pub fn definition_holds(&self) -> &crate::recheck::DefinitionHolds {
+        &self.holds
     }
 
     /// Lists the pods of a workload (or a label selector) in `namespace` on a connected

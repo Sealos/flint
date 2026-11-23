@@ -681,6 +681,14 @@ impl Workspace {
             self.refuse(refused(opening, &reason), cx);
             return;
         }
+        if matches!(key, TabKey::Shell(_))
+            && self
+                .cluster_summary(key.context(), cx)
+                .is_some_and(|c| self.model.read(cx).writes_paused(c))
+        {
+            self.refuse(refused(opening, &writes_paused_reason(key.context())), cx);
+            return;
+        }
         if matches!(key, TabKey::Shell(_)) && self.is_protected(key.context(), cx) {
             let shown = self.cluster_names(cx).exact(key.context());
             self.refuse(refused(opening, &protected_reason(&shown)), cx);
@@ -912,6 +920,12 @@ impl Workspace {
             let blocked = self.restart_blocked(&cluster, cx);
             shell.update(cx, |s, cx| s.set_restart_blocked(blocked, cx));
         }
+        let logs: Vec<_> = self.dock.read(cx).log_views().cloned().collect();
+        for log in logs {
+            let cluster = log.read(cx).tab_key().context().to_owned();
+            let blocked = self.sessions_blocked(&cluster, cx);
+            log.update(cx, |l, cx| l.set_reconnect_blocked(blocked, cx));
+        }
     }
 
     /// Why a shell on `cluster` cannot start again, as far as the context and its protection
@@ -922,6 +936,9 @@ impl Workspace {
             None => blocked(format!("no kubeconfig context named {cluster}"), false),
             Some(c) if c.info.server.is_none() => {
                 blocked(format!("{cluster} has no API server in kubeconfig"), false)
+            }
+            Some(c) if self.model.read(cx).writes_paused(c) => {
+                blocked(writes_paused_reason(cluster), false)
             }
             Some(_) if self.is_protected(cluster, cx) => blocked(
                 protected_reason(&self.cluster_names(cx).exact(cluster)),
@@ -1342,7 +1359,11 @@ impl Workspace {
             let presence = Presence::of(&cluster.state, is_active, states);
             let exposure = (model.ai_exposure(cluster), model.ai_scope(cluster));
             let settings_ok = model.settings_error.is_none();
-            let protection = (model.protection(cluster), model.trust(cluster));
+            let protection = (
+                model.protection(cluster),
+                model.trust(cluster),
+                model.writes_paused(cluster),
+            );
             let ring = cursor.as_deref() == Some(cluster.info.name.as_str());
             list = list.child(self.render_cluster_row(
                 cluster,
@@ -1419,7 +1440,7 @@ impl Workspace {
         // and its full description.
         (is_active, ring, presence, tooltip): (bool, bool, Presence<'_>, String),
         (exposure, ai_scope): (AiExposureState, Option<AiScope>),
-        (protection, trust): (Protection, TrustState),
+        (protection, trust, writes_paused): (Protection, TrustState, bool),
         (settings_ok, names, tag): (bool, &ClusterNames, Option<ClusterTag>),
         theme: &Theme,
     ) -> AnyElement {
@@ -1549,6 +1570,7 @@ impl Workspace {
                 protection,
                 &trust,
                 settings_ok,
+                writes_paused,
             ))
             .child(self.render_exposure_toggle(
                 &name,
@@ -1843,7 +1865,7 @@ impl Workspace {
         let model = self.model.read(cx);
         let protection = model.protection(cluster);
         // Checked first: whatever the protection, the core refuses writes on this definition.
-        let paused = cluster.provisional;
+        let paused = model.writes_paused(cluster);
         let tip = if paused {
             WRITES_PAUSED_TIP.to_owned()
         } else {
@@ -2486,8 +2508,13 @@ fn access_mode_text(protection: Protection) -> &'static str {
 /// The access mode while the core refuses writes on a definition it can't confirm yet.
 const WRITES_PAUSED: &str = "Writes paused";
 
-const WRITES_PAUSED_TIP: &str =
+pub(super) const WRITES_PAUSED_TIP: &str =
     "Writes are paused until Flint can read your kubeconfig files and confirm this cluster";
+
+/// Why a shell cannot start on a cluster whose writes are paused.
+fn writes_paused_reason(cluster: &str) -> String {
+    format!("writes to {cluster} are paused until Flint can read your kubeconfig")
+}
 
 /// The access mode on a narrow header's second row: still tells every mode apart.
 fn access_mode_short_text(protection: Protection) -> &'static str {
@@ -2596,10 +2623,16 @@ fn render_lock_button(
     protection: Protection,
     trust: &TrustState,
     settings_ok: bool,
+    writes_paused: bool,
 ) -> Option<AnyElement> {
     let entries = lock_menu(has_server, protection, trust, settings_ok);
+    let label = if writes_paused {
+        format!("Lock for {title}: writes paused")
+    } else {
+        lock_label(title, protection)
+    };
     let button = Button::new(SharedString::from(format!("lock-{name}")))
-        .accessibility_label(lock_label(title, protection))
+        .accessibility_label(label)
         .xsmall()
         .tab_stop(false);
     let pinned = !matches!(trust, TrustState::NotTrusted);
@@ -2642,6 +2675,15 @@ fn render_lock_button(
             "Trusted: unlocked across restarts. Click to stop trusting it (shells already open \
              keep running).",
         ),
+    };
+    // The menu stays, so the lock can still be changed, but nothing here says unlocked.
+    let (button, tip) = if writes_paused {
+        (
+            button.ghost().icon(FlintIcon::Lock),
+            "Writes paused until Flint can read your kubeconfig files. Click for the lock options.",
+        )
+    } else {
+        (button, tip)
     };
     let cluster = name.to_owned();
     let menu =

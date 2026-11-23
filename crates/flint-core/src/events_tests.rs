@@ -172,6 +172,7 @@ fn snapshot(contexts: &[String]) -> Event {
             endpoint: 1,
             confirmed: true,
             provisional: false,
+            paused: false,
         })
         .collect();
     Event::ClustersChanged(Arc::new(crate::handle::ClustersSnapshot {
