@@ -24,8 +24,8 @@
 //!
 //! # Bounds
 //!
-//! Objects are cut down to what classification reads, and a pod's requests and limits to a few
-//! numbers ([`PodLoad`]), at most [`MAX_OBJECTS_PER_KIND`] per kind.
+//! Objects are cut down to what classification reads, and pods' requests and limits to per-node
+//! totals, at most [`MAX_OBJECTS_PER_KIND`] per kind.
 //! A kind over that limit is reported as [`KindCheck::TooLarge`] rather than counted in part.
 //! Retries back off up to [`TelemetryTiming::backoff_max`], and lists run a few at a time.
 
@@ -59,7 +59,7 @@ use crate::protection::ClusterClients;
 
 pub(crate) use board::TelemetryBoard;
 pub use board::{ClusterTelemetry, TelemetryUpdates};
-pub use capacity::{Allocatable, ClusterCapacity, Inventory, NodeCapacity, PodLoad, Reserved};
+pub use capacity::{Allocatable, ClusterCapacity, Inventory, NodeCapacity, Reserved};
 use feed::KindFeed;
 pub use objects::MAX_OBJECTS_PER_KIND;
 use objects::Stores;

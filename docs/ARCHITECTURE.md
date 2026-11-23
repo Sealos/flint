@@ -760,7 +760,7 @@ Warning events. **Capacity left** shows CPU, memory and pod slots against alloca
 usage, then one row per node, most allocated first, and a sparkline of the last hour. Requests come from the watched
 pods, so they show without metrics-server; usage then shows as unavailable. **What's in the cluster** has the
 Kubernetes version, read once per feed, and counts of nodes, pods and workloads that open their lists. The feed keeps
-a few numbers per pod rather than its resource lists. The sparklines come from Flint's own 15-second metrics-server
+per-node totals rather than each pod's resource lists. The sparklines come from Flint's own 15-second metrics-server
 samples, kept in a bounded in-memory buffer while the cluster is connected. Thresholds are typed settings with per-cluster overrides, edited from
 the dashboard. The dashboard counts as an open view of the kinds it needs. A cluster set's dashboard shows one card per
 member, worst first, under a totals strip. The same components,

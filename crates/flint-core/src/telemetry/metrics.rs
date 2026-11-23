@@ -4,18 +4,20 @@
 //! trend lock is shared with readers on other threads and is never waited on while blocking: a
 //! held lock leaves this task cancellable, and no further request starts until it is released.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::Duration;
 
 use jiff::Timestamp;
+use k8s_openapi::api::core::v1::Node;
 use kube::Client;
 use tokio::sync::watch;
 
 use super::usage::{Bounded, read_nodes};
 use super::{MetricsCheck, RequestGate, Shared, SideReads, UsageRead};
 use crate::cluster::SafeErrorText;
-use crate::metrics::{MetricsError, MetricsResult, NodeMetrics};
+use crate::metrics::{MetricsError, MetricsList, MetricsResult, NodeMetrics};
 use crate::metrics_trend::TrendStore;
 
 /// How soon a poll tries a held trend lock again.
@@ -77,6 +79,27 @@ fn check_of(result: &MetricsResult<NodeMetrics>) -> MetricsCheck {
     }
 }
 
+/// How many nodes `list` says nothing about, of those the feed watches. Not knowing the nodes
+/// counts as one, since the list cannot then be shown to cover the cluster.
+fn unreported_nodes(list: &MetricsList<NodeMetrics>, watched: Option<&[Node]>) -> usize {
+    let Some(watched) = watched else { return 1 };
+    let reported: HashSet<&str> = list.items.iter().map(|node| node.name.as_str()).collect();
+    watched
+        .iter()
+        .filter_map(|node| node.metadata.name.as_deref())
+        .filter(|name| !reported.contains(name))
+        .count()
+}
+
+/// Marks a list that misses a watched node as skipping it, so its sum is not recorded as the
+/// cluster's total. The nodes it does report keep their own series.
+fn note_coverage(result: &mut MetricsResult<NodeMetrics>, shared: &Shared) {
+    if let Ok(list) = result {
+        let missing = unreported_nodes(list, shared.stores().nodes.current());
+        list.skipped = list.skipped.saturating_add(missing);
+    }
+}
+
 /// Records `result`, waiting for the lock in a way the task can be stopped during.
 async fn record(trends: &Mutex<TrendStore>, cluster: &str, result: &MetricsResult<NodeMetrics>) {
     loop {
@@ -118,7 +141,7 @@ async fn poll<F, Fut>(
         trends: Arc::clone(&trends),
     };
     loop {
-        let (result, usage) = match fetch().await {
+        let (mut result, usage) = match fetch().await {
             Bounded::Listed(result) => {
                 let result = readable(result);
                 let usage = SideReads::node_usage_of(&result);
@@ -131,6 +154,7 @@ async fn poll<F, Fut>(
                 UsageRead::TooLarge,
             ),
         };
+        note_coverage(&mut result, &shared);
         record(&trends, &cluster, &result).await;
         // A sample extends the trends even when usage is unchanged, so listeners are told.
         let sampled = result.as_ref().is_ok_and(|list| !list.items.is_empty());
@@ -151,7 +175,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
-    use crate::metrics::{MetricsList, Usage};
+    use crate::metrics::Usage;
     use crate::metrics_trend::{TrendResource, TrendScope};
 
     fn node_list() -> MetricsResult<NodeMetrics> {
@@ -249,6 +273,47 @@ mod tests {
         drop(held);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_poll_missing_a_watched_node_records_no_cluster_total() {
+        let trends = Arc::new(Mutex::new(TrendStore::new()));
+        let shared = shared();
+        {
+            let mut stores = shared.stores();
+            let node = |name: &str| Node {
+                metadata: kube::api::ObjectMeta {
+                    name: Some(name.to_owned()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            stores.nodes.replace(vec![(node("a"), ()), (node("b"), ())]);
+            stores.nodes.check = super::super::KindCheck::Current;
+        }
+        let (reads, mut seen) = watch::channel(SideReads::default());
+        let task = tokio::spawn(poll(
+            "one".into(),
+            || async { Bounded::Listed(node_list()) },
+            Arc::clone(&trends),
+            shared,
+            Duration::from_secs(15),
+            reads,
+        ));
+        seen.changed().await.unwrap();
+        let total: Vec<_> = try_lock(&trends)
+            .unwrap()
+            .series(
+                "one",
+                TrendScope::Total,
+                TrendResource::Cpu,
+                Timestamp::now(),
+            )
+            .unwrap()
+            .flatten()
+            .collect();
+        task.abort();
+        assert!(total.is_empty(), "a partial poll is not a total: {total:?}");
     }
 
     #[test]
