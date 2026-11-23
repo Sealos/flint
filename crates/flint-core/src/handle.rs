@@ -141,6 +141,13 @@ pub enum Command {
     /// Turn desktop notifications on or off and write it to `settings.toml`. The change arrives
     /// back as `Event::SettingsChanged`.
     SetDesktopNotifications(bool),
+    /// Set whether `cluster` at `server` posts desktop alerts (`None` follows the global setting)
+    /// and write it to `settings.toml`. The change arrives back as `Event::SettingsChanged`.
+    SetClusterAlerts {
+        cluster: ClusterId,
+        server: String,
+        enabled: Option<bool>,
+    },
     /// The namespaces the user filters `cluster` on (empty: all). When the user may not list a
     /// kind in all namespaces, it is listed in these one by one; without a filter, in the
     /// context's default namespace, else in every namespace the user can list. The filter

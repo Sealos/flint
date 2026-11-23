@@ -500,6 +500,13 @@ impl Workspace {
         };
         this.show_appearance(window, cx);
         this.load_saved_sets(cx);
+        if let Some(alerts) = cx.try_global::<super::alert_center::Alerts>() {
+            let center = alerts.0.clone();
+            this._subscriptions
+                .push(cx.observe_in(&center, window, |this, _, window, cx| {
+                    this.show_alert_overview(false, window, cx);
+                }));
+        }
         this
     }
 
@@ -1119,6 +1126,7 @@ impl Workspace {
                 nav.set_states(Vec::new(), cx);
             }
         });
+        self.show_alert_overview(cluster_changed, window, cx);
         // An open switcher follows the active cluster and its discovery.
         self.refresh_switcher(cx);
         let (Some(cluster), Some(discovery)) = (active, discovered.discovery) else {
@@ -1217,6 +1225,28 @@ impl Workspace {
     #[cfg(test)]
     pub(in crate::ui) fn saved_namespace_filter(&self, cluster: &str) -> Vec<String> {
         self.ui_state.namespace_filter(cluster).to_vec()
+    }
+
+    /// Shows the overview an opened alert asked for, once this is its cluster. A move to another
+    /// cluster first drops the request.
+    fn show_alert_overview(&mut self, moved: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(center) = cx
+            .try_global::<super::alert_center::Alerts>()
+            .map(|alerts| alerts.0.clone())
+        else {
+            return;
+        };
+        let Some(wanted) = center.read(cx).wanted_overview().cloned() else {
+            return;
+        };
+        let here = self.cluster.as_deref() == Some(wanted.context.as_str())
+            && self.generation == Some(wanted.generation);
+        if here || moved {
+            center.update(cx, |center, _| center.clear_overview());
+        }
+        if here {
+            self.open_dashboard(window, cx);
+        }
     }
 
     /// Shows the active cluster's overview in place of its list. Go Back returns to the list.

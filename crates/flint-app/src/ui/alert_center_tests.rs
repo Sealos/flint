@@ -495,7 +495,12 @@ fn a_cancelled_batch_stops_before_its_next_submission() {
     let one = raised(&mut tracker, &prod, "n1");
     let batch = vec![one.clone(), one.clone(), one];
     let sender = CountingSender::default();
-    let answers = send_batch(&sender, &batch, || sender.sent.load(Ordering::SeqCst) < 1);
+    let answers = send_batch(
+        &sender,
+        &batch,
+        || sender.sent.load(Ordering::SeqCst) < 1,
+        |_| false,
+    );
     assert_eq!(answers.len(), 1);
     assert_eq!(sender.sent.load(Ordering::SeqCst), 1);
 }
@@ -527,6 +532,55 @@ fn raised_alerts_outlast_other_events_in_the_list() {
         );
     }
     assert!(tracker.find(&sent.tag).is_some());
+}
+
+#[test]
+fn a_muted_cluster_raises_nothing_and_comes_back_from_a_new_baseline() {
+    let prod = connected(PROD);
+    let discovery = complete();
+    let mut tracker = tracker();
+    let sent = raised(&mut tracker, &prod, "n1");
+    assert!(tracker.origins.contains_key(PROD));
+
+    let muted = tracker.observe(&[input(&prod, Reading::Muted)], at(10));
+    assert!(muted.is_empty());
+    assert!(!tracker.origins.contains_key(PROD));
+    assert!(tracker.checked.is_empty());
+    let kept = tracker.find(&sent.tag).expect("its alert stays listed");
+    assert_eq!(kept.delivery, Delivery::Cancelled);
+
+    let bad = snapshot(PROD, vec![bad_node(PROD, "n1")], at(20));
+    let back = Reading::Feed {
+        snapshot: &bad,
+        discovery: Some(&discovery),
+    };
+    assert!(tracker.observe(&[input(&prod, back)], at(20)).is_empty());
+}
+
+#[test]
+fn a_batch_skips_a_cluster_muted_while_it_is_sent() {
+    #[derive(Default)]
+    struct Recording(std::sync::Mutex<Vec<String>>);
+    impl NotificationSender for Recording {
+        fn prepare(&self) -> Result<(), DeliveryError> {
+            Ok(())
+        }
+        fn send(&self, notification: &Notification) -> Result<(), DeliveryError> {
+            self.0.lock().unwrap().push(notification.tag.clone());
+            Ok(())
+        }
+    }
+    let note = |cluster: &str, tag: &str| Notification {
+        title: "t".into(),
+        body: "b".into(),
+        cluster: Arc::from(cluster),
+        tag: tag.into(),
+    };
+    let sender = Recording::default();
+    let batch = [note("off", "1"), note(PROD, "2")];
+    let answers = send_batch(&sender, &batch, || true, |cluster| cluster == "off");
+    assert_eq!(answers.len(), 1);
+    assert_eq!(*sender.0.lock().unwrap(), ["2"]);
 }
 
 #[test]

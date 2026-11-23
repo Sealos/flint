@@ -685,6 +685,16 @@ impl ClusterManager {
                 })
                 .await
             }
+            Command::SetClusterAlerts {
+                cluster,
+                server,
+                enabled,
+            } => {
+                self.write_settings("the cluster's alerts", move |dir| {
+                    settings::set_cluster_alerts(dir, &cluster, &server, enabled)
+                })
+                .await
+            }
             Command::SetNamespaceFilter {
                 cluster,
                 namespaces,
