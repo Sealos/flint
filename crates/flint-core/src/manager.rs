@@ -37,6 +37,7 @@ use crate::write::WriteError;
 
 mod file_watch;
 mod running_set;
+mod telemetry;
 
 use crate::connection::member::{AttemptOutcome, MemberEvent};
 use crate::connection::policy::{CredentialAccess, CredentialLease, ForegroundOnly, Role};
@@ -103,6 +104,8 @@ pub(crate) struct Cluster {
     /// Discoveries that failed in a row, for the retry backoff.
     discovery_failures: u32,
     watches: ClusterWatches,
+    /// The telemetry feed on this slot's connection ([`ClusterManager::sync_telemetry`]).
+    telemetry: Option<telemetry::SlotFeed>,
     /// Follows the CRD list while the cluster is active.
     crd_task: Option<JoinHandle<()>>,
     /// Follows the namespace list while the cluster is active, for namespace-limited lists.
@@ -160,6 +163,7 @@ impl Cluster {
             discovery_retries: 0,
             discovery_failures: 0,
             watches,
+            telemetry: None,
             crd_task: None,
             namespaces_task: None,
             namespace_filter: Vec::new(),
@@ -169,6 +173,7 @@ impl Cluster {
 
     /// Ends the slot's connection and its permission to run a credential command.
     fn clear_connection(&mut self) {
+        self.telemetry = None;
         self.watches.set_source(None);
         self.client = None;
         self.write_credential = None;
@@ -494,6 +499,9 @@ pub(crate) struct ClusterManager {
     log_sessions: HashMap<u64, JoinHandle<()>>,
     /// The memory budget all log sessions share (`log_total_mib`).
     log_budget: Arc<logs::LogBudget>,
+    /// The running telemetry feeds, as the front end reads them.
+    telemetry: crate::telemetry::TelemetryBoard,
+    telemetry_timing: crate::telemetry::TelemetryTiming,
     /// The clusters the user unlocked for this session, shared with the front end (ADR-0015).
     unlocks: SessionUnlocks,
     /// Contexts the last load did not show, listed only because a file that defined them can't
@@ -508,6 +516,11 @@ impl ClusterManager {
     /// The log sessions' shared budget, for [`crate::LogSession::set_shown`].
     pub(crate) fn log_budget(&self) -> Arc<logs::LogBudget> {
         self.log_budget.clone()
+    }
+
+    /// The running telemetry feeds, for [`crate::CoreHandle::telemetry`].
+    pub(crate) fn telemetry_board(&self) -> crate::telemetry::TelemetryBoard {
+        self.telemetry.clone()
     }
 
     pub(crate) fn new(
@@ -548,6 +561,8 @@ impl ClusterManager {
             subscriptions: HashMap::new(),
             log_sessions: HashMap::new(),
             log_budget,
+            telemetry: Default::default(),
+            telemetry_timing: Default::default(),
             unlocks,
             held: HashSet::new(),
             settled: SettledDefinitions::default(),
@@ -587,6 +602,7 @@ impl ClusterManager {
                 Ok(request) = requests.recv() => self.handle_request(request),
                 Some(msg) = internal_rx.recv() => self.handle_internal(msg).await,
             }
+            self.sync_telemetry();
         }
     }
 
@@ -2172,6 +2188,7 @@ impl ClusterManager {
         // This attempt answers the wait, so the load that ended it must not reset the state.
         slot.awaiting_confirmation = false;
         slot.state = ConnectionState::Connecting;
+        slot.telemetry = None;
         slot.client = None;
         slot.write_credential = None;
         slot.access.revoke();

@@ -421,6 +421,7 @@ pub struct CoreHandle {
     next_subscription: Arc<AtomicU64>,
     unlocks: SessionUnlocks,
     log_budget: Arc<crate::logs::LogBudget>,
+    telemetry: crate::telemetry::TelemetryBoard,
     access: Arc<crate::access::AccessCache>,
     runtime: tokio::runtime::Handle,
     _runtime: Arc<RuntimeGuard>,
@@ -446,6 +447,7 @@ impl CoreHandle {
         let unlocks = SessionUnlocks::default();
         let manager = ClusterManager::new(config, event_tx, hubs.clone(), unlocks.clone());
         let log_budget = manager.log_budget();
+        let telemetry = manager.telemetry_board();
         runtime.spawn(manager.run(cmd_rx, req_rx));
         Ok(Self {
             commands: cmd_tx,
@@ -455,6 +457,7 @@ impl CoreHandle {
             next_subscription: Arc::new(AtomicU64::new(1)),
             unlocks,
             log_budget,
+            telemetry,
             access: Arc::default(),
             runtime: runtime.handle().clone(),
             _runtime: Arc::new(RuntimeGuard(Some(runtime))),
@@ -467,6 +470,23 @@ impl CoreHandle {
         let (reply, rx) = oneshot::channel();
         let _ = self.requests.try_send(Request::RunningSet { reply });
         async move { rx.await.unwrap_or_default() }
+    }
+
+    /// What the running feed of `cluster` knows. `None` while it has no feed: it is neither
+    /// selected nor in the running set, is not connected, is paused, or its sign-in runs a program
+    /// and it is in the background. Never blocks.
+    pub fn telemetry(&self, cluster: &str) -> Option<crate::telemetry::ClusterTelemetry> {
+        self.telemetry.get(cluster)
+    }
+
+    /// [`Self::telemetry`] of every cluster with a running feed, by cluster name.
+    pub fn all_telemetry(&self) -> Vec<crate::telemetry::ClusterTelemetry> {
+        self.telemetry.all()
+    }
+
+    /// Wakes when any cluster's telemetry changes, or a feed starts or stops.
+    pub fn telemetry_updates(&self) -> crate::telemetry::TelemetryUpdates {
+        self.telemetry.updates()
     }
 
     /// Opens a live list of `kind` on `cluster`. While the subscription lives, the kind is

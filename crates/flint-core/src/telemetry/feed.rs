@@ -22,7 +22,7 @@ use crate::api_error::{ApiError, ApiErrorKind};
 use crate::cluster::{ClusterError, SafeErrorText, Target, find_auth_error};
 
 /// Objects per page of a list.
-const PAGE_SIZE: u32 = 500;
+pub(super) const PAGE_SIZE: u32 = 500;
 
 /// How long a watch must have run for its end to count as routine when it delivered nothing.
 const STABLE_WATCH: Duration = Duration::from_secs(5);
@@ -288,14 +288,14 @@ fn is_expired(err: &kube::Error) -> bool {
     ApiError::from_kube(err).is_some_and(|api| api.kind() == ApiErrorKind::Gone)
 }
 
-fn timed_out() -> CheckFailure {
+pub(super) fn timed_out() -> CheckFailure {
     CheckFailure {
         cause: FailureCause::Failed,
         detail: SafeErrorText::reduced("timed out reading the cluster"),
     }
 }
 
-fn failure_of(err: &kube::Error, target: &Target) -> CheckFailure {
+pub(super) fn failure_of(err: &kube::Error, target: &Target) -> CheckFailure {
     let cause = match ApiError::from_kube(err).map(|api| api.kind()) {
         Some(ApiErrorKind::Unauthorized) => FailureCause::LoginFailed,
         Some(ApiErrorKind::Forbidden) => FailureCause::Forbidden,

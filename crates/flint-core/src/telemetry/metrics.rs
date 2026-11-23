@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use kube::Client;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
-use super::{MetricsCheck, Shared};
+use super::{MetricsCheck, Shared, SideReads};
 use crate::metrics::{MetricsPoll, MetricsResult, NodeMetrics, fetch_node_metrics};
 use crate::metrics_trend::TrendStore;
 
@@ -67,6 +67,7 @@ pub(super) async fn run(
     shared: Arc<Shared>,
     every: Duration,
     running: mpsc::Sender<()>,
+    reads: watch::Sender<SideReads>,
 ) {
     let _forget = ForgetOnStop {
         cluster: Arc::clone(&cluster),
@@ -81,6 +82,12 @@ pub(super) async fn run(
             continue;
         };
         lock(&trends).record(&cluster, Timestamp::now(), &result);
+        let usage = SideReads::node_usage_of(&result);
+        reads.send_if_modified(|current| {
+            let changed = current.node_usage != usage;
+            current.node_usage = usage;
+            changed
+        });
         shared.set_metrics(check_of(&result));
     }
 }
