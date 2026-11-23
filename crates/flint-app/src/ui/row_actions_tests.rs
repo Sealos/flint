@@ -1422,6 +1422,63 @@ async fn a_row_menu_closes_when_its_row_goes(cx: &mut TestAppContext) {
     assert_eq!(app_state(cx, &t).focus, Focus::List);
 }
 
+// covers #251: a pod inserted above the right-clicked row moves the row, and its menu stays open
+// on that row.
+#[gpui_kit::test]
+async fn a_row_menu_stays_open_when_the_list_reorders(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    focused_pods(cx, &t).await;
+    right_click(cx, &t, "web").await;
+    let list = t
+        .workspace
+        .read_with(cx, |ws, _| ws.list.as_ref().unwrap().clone());
+    list.update(cx, |list, cx| {
+        list.set_snapshot(
+            pods(&[("demo", "aaa", 0), ("demo", "api", 0), ("demo", "web", 1)]),
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    assert!(menu_open(cx, &t));
+    assert_eq!(
+        app_state(cx, &t).menu.unwrap().owner.as_deref(),
+        Some("row-menu-uid-web")
+    );
+}
+
+// covers #251: a crash-looping sidecar's previous logs open from the row menu although the
+// default container never restarted.
+#[gpui_kit::test]
+async fn previous_logs_open_for_a_restarted_sidecar(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "kind-alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    show_fetched(
+        cx,
+        &t,
+        detail(json!({
+            "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "demo", "uid": "uid-web"},
+            "spec": {"containers": [{"name": "app"}, {"name": "sidecar"}]},
+            "status": {"containerStatuses": [
+                {"name": "app", "restartCount": 0, "state": {"running": {}}},
+                {"name": "sidecar", "restartCount": 3,
+                 "state": {"waiting": {"reason": "CrashLoopBackOff"}}}
+            ]}
+        })),
+    );
+    right_click(cx, &t, "web").await;
+    click_entry(cx, &t, 1);
+    assert_eq!(submenu(cx, &t), ["sidecar"]);
+    click_submenu(cx, &t, 1);
+    let (tabs, _) = dock_tabs(cx, &t);
+    assert_eq!(tabs.len(), 1, "{tabs:?}");
+    assert!(tabs[0].contains("sidecar"), "{tabs:?}");
+}
+
 // covers #496: a window that gets smaller dismisses the menu, whose limits were worked out for
 // the old size, and focus returns.
 #[gpui_kit::test]
