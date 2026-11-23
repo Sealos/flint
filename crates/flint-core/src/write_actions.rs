@@ -6,7 +6,9 @@
 //! the user reviewed by its uid (a `resourceVersion` would conflict with every status update of
 //! a live workload or node): a conflict comes back as [`ActionError::Conflict`], for the review
 //! to open again. Before an action runs, the live object is read again: another uid or GitOps
-//! manager than the review saw is a conflict too. Nothing here retries.
+//! manager than the review saw is a conflict too. A fleet action also holds its write to the
+//! `resourceVersion` of that read ([`Held`]), which a single-cluster action does not, for the
+//! reason above. Nothing here retries.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -14,8 +16,7 @@ use std::time::{Duration, Instant};
 
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{
-    Api, ApiResource, DeleteParams, DynamicObject, EvictParams, ListParams, Patch, PatchParams,
-    Preconditions,
+    Api, ApiResource, DeleteParams, DynamicObject, EvictParams, ListParams, Preconditions,
 };
 use kube::{Client, ResourceExt as _};
 use serde_json::{Value, json};
@@ -216,15 +217,52 @@ fn drain_options(change: &ResourceChange) -> Option<DrainOptions> {
     }
 }
 
+/// What a held write must still find: the version of the last read, and the pod template's
+/// metadata its patch builds on. Not `Debug`: annotations can hold anything.
+struct Held {
+    resource_version: String,
+    template_metadata: Option<Value>,
+}
+
+impl Held {
+    fn of(live: &Value) -> Result<Self, WriteError> {
+        let resource_version = live
+            .pointer("/metadata/resourceVersion")
+            .and_then(Value::as_str)
+            .ok_or(WriteError::Conflict)?
+            .to_owned();
+        Ok(Self {
+            resource_version,
+            template_metadata: live.pointer("/spec/template/metadata").cloned(),
+        })
+    }
+
+    fn test(&self) -> Value {
+        json!({
+            "op": "test",
+            "path": "/metadata/resourceVersion",
+            "value": self.resource_version,
+        })
+    }
+}
+
+/// How one action's PATCH is sent.
+#[derive(Clone, Copy, Default)]
+struct PatchMode<'a> {
+    dry_run: bool,
+    held: Option<&'a Held>,
+}
+
 /// Reads the live object once. Another uid or GitOps manager than the review saw, or a Deployment
-/// paused for a restart, is a conflict, and a failed read refuses the action.
+/// paused for a restart, is a conflict, and a failed read refuses the action. Returns what a
+/// review holding the object requires of the write that follows.
 async fn recheck(
     gate: &mut impl ActionGate,
     kind: &KindInfo,
     target: &WriteTarget,
     change: &ResourceChange,
     reviewed: &Reviewed,
-) -> Result<(), WriteError> {
+) -> Result<Option<Held>, WriteError> {
     let client = gate.client().await?;
     let live = read_live(&client, kind, target).await?;
     let uid = live.pointer("/metadata/uid").and_then(Value::as_str);
@@ -236,7 +274,7 @@ async fn recheck(
     {
         return Err(WriteError::Conflict);
     }
-    Ok(())
+    reviewed.hold_spec.then(|| Held::of(&live)).transpose()
 }
 
 /// The object `target` names, by the uid its review read.
@@ -262,12 +300,16 @@ pub(crate) async fn dry_run(
     reviewed: &Reviewed,
 ) -> Result<(), WriteError> {
     let object = action_object(kind, target)?;
-    recheck(gate, kind, target, change, reviewed).await?;
+    let held = recheck(gate, kind, target, change, reviewed).await?;
+    let mode = PatchMode {
+        dry_run: true,
+        held: held.as_ref(),
+    };
     match change {
         ResourceChange::Scale { from, to } => {
-            send_scale(gate, &object, *from, *to, true).await?;
+            send_scale(gate, &object, *from, *to, mode).await?;
         }
-        ResourceChange::RolloutRestart => send_restart(gate, &object, true).await?,
+        ResourceChange::RolloutRestart => send_restart(gate, &object, mode).await?,
         _ => {
             return Err(WriteError::Rejected(
                 "this action has no server dry run".to_owned(),
@@ -290,11 +332,15 @@ pub(crate) async fn run(
         resource_version: None,
         drain,
     };
-    recheck(gate, kind, target, change, reviewed).await?;
+    let held = recheck(gate, kind, target, change, reviewed).await?;
+    let mode = PatchMode {
+        dry_run: false,
+        held: held.as_ref(),
+    };
     match change {
         ResourceChange::Delete => delete(gate, &object).await?,
-        ResourceChange::Scale { from, to } => scale(gate, &object, *from, *to).await?,
-        ResourceChange::RolloutRestart => rollout_restart(gate, &object).await?,
+        ResourceChange::Scale { from, to } => send_scale(gate, &object, *from, *to, mode).await?,
+        ResourceChange::RolloutRestart => send_restart(gate, &object, mode).await?,
         ResourceChange::Cordon => set_cordoned(gate, &object, true).await?,
         ResourceChange::Uncordon => set_cordoned(gate, &object, false).await?,
         ResourceChange::Drain {
@@ -361,6 +407,91 @@ impl ActionObject {
             None => Api::all_with(client, &self.resource),
         }
     }
+
+    /// Refuses a name or namespace that would not be exactly one segment of a URL's path.
+    fn check_path_segments(&self) -> Result<(), ActionError> {
+        let namespace_ok = self.namespace.as_deref().is_none_or(is_namespace_name);
+        if namespace_ok && is_object_name(&self.name) {
+            Ok(())
+        } else {
+            Err(ActionError::Unsupported(
+                "the object's name or namespace is not valid".to_owned(),
+            ))
+        }
+    }
+
+    /// The URL of a PATCH of this object, or of its `subresource`, once
+    /// [`Self::check_path_segments`] has accepted it.
+    fn patch_url(&self, client: Client, subresource: Option<&str>, dry_run: bool) -> String {
+        let mut url = format!("{}/{}", self.api(client).resource_url(), self.name);
+        if let Some(subresource) = subresource {
+            url.push('/');
+            url.push_str(subresource);
+        }
+        url.push_str("?fieldManager=");
+        url.push_str(FIELD_MANAGER);
+        if dry_run {
+            url.push_str("&dryRun=All");
+        }
+        url
+    }
+}
+
+/// Whether `name` is a DNS subdomain, as the name of every kind with a PATCH action here must be.
+pub(crate) fn is_object_name(name: &str) -> bool {
+    name.len() <= 253 && name.split('.').all(is_dns_label)
+}
+
+/// Whether `namespace` is a DNS label, as the API server requires of a namespace.
+pub(crate) fn is_namespace_name(namespace: &str) -> bool {
+    namespace.len() <= 63 && is_dns_label(namespace)
+}
+
+fn is_dns_label(label: &str) -> bool {
+    let alphanumeric = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    let bytes = label.as_bytes();
+    bytes.first().is_some_and(|b| alphanumeric(*b))
+        && bytes.last().is_some_and(|b| alphanumeric(*b))
+        && bytes.iter().all(|b| alphanumeric(*b) || *b == b'-')
+}
+
+/// A PATCH body, by the content type it is sent as.
+enum PatchBody {
+    Merge(Value),
+    Json(Value),
+}
+
+/// Sends one PATCH through the gate. A JSON Patch's failed test is a conflict.
+async fn send_patch(
+    gate: &mut impl ActionGate,
+    object: &ActionObject,
+    subresource: Option<&str>,
+    body: PatchBody,
+    dry_run: bool,
+) -> Result<(), ActionError> {
+    object.check_path_segments()?;
+    let client = gate.client().await?;
+    let url = object.patch_url(client.clone(), subresource, dry_run);
+    let (content_type, body, tested) = match body {
+        PatchBody::Merge(body) => ("application/merge-patch+json", body, false),
+        PatchBody::Json(body) => ("application/json-patch+json", body, true),
+    };
+    let request = http::Request::patch(url)
+        .header(http::header::CONTENT_TYPE, content_type)
+        .header(http::header::ACCEPT, "application/json")
+        .body(body.to_string().into_bytes())
+        .map_err(|e| ActionError::Failed(e.to_string()))?;
+    let sent = tokio::time::timeout(REQUEST_TIMEOUT, client.request_text(request)).await;
+    let Ok(result) = sent else {
+        return Err(ActionError::Failed(timed_out()));
+    };
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) if tested && is_failed_patch_test(&error) => Err(ActionError::Conflict(
+            "the object changed since it was reviewed".to_owned(),
+        )),
+        Err(error) => Err(ActionError::of(error)),
+    }
 }
 
 /// Why an action did not happen.
@@ -425,13 +556,6 @@ fn names_another_uid(error: &kube::Error) -> bool {
         .is_some_and(|d| d.causes.iter().any(|c| c.field == "metadata.uid"))
 }
 
-fn patch_params() -> PatchParams {
-    PatchParams {
-        field_manager: Some(FIELD_MANAGER.to_owned()),
-        ..Default::default()
-    }
-}
-
 fn uid_precondition(uid: &str) -> Preconditions {
     Preconditions {
         uid: Some(uid.to_owned()),
@@ -457,23 +581,14 @@ pub(crate) async fn delete(
 /// Changes a workload's replicas from `from`, the count reviewed, to `to`. A JSON Patch tests the
 /// uid and the count, so another change to either is a conflict and a status update is not. It
 /// goes through the `scale` subresource, which is what a scale-only role may patch. That
-/// subresource omits `replicas` at zero, so a count of zero is tested as an empty `spec`.
-pub(crate) async fn scale(
-    gate: &mut impl ActionGate,
-    object: &ActionObject,
-    from: u32,
-    to: u32,
-) -> Result<(), ActionError> {
-    send_scale(gate, object, from, to, false).await
-}
-
-/// [`scale`], stored only if `dry_run` is false.
+/// subresource omits `replicas` at zero, so a count of zero is tested as an empty `spec`. A `Scale`
+/// carries its workload's `resourceVersion`, so a held scale tests that too.
 async fn send_scale(
     gate: &mut impl ActionGate,
     object: &ActionObject,
     from: u32,
     to: u32,
-    dry_run: bool,
+    mode: PatchMode<'_>,
 ) -> Result<(), ActionError> {
     let resource = &object.resource;
     if !is_scalable(resource) {
@@ -482,43 +597,18 @@ async fn send_scale(
             resource.plural
         )));
     }
-    let client = gate.client().await?;
-    let uid = json!({ "op": "test", "path": "/metadata/uid", "value": object.uid });
-    let patch = if from == 0 {
-        json!([
-            uid,
-            { "op": "test", "path": "/spec", "value": {} },
-            { "op": "add", "path": "/spec/replicas", "value": to },
-        ])
+    let mut operations =
+        vec![json!({ "op": "test", "path": "/metadata/uid", "value": object.uid })];
+    operations.extend(mode.held.map(Held::test));
+    if from == 0 {
+        operations.push(json!({ "op": "test", "path": "/spec", "value": {} }));
+        operations.push(json!({ "op": "add", "path": "/spec/replicas", "value": to }));
     } else {
-        json!([
-            uid,
-            { "op": "test", "path": "/spec/replicas", "value": from },
-            { "op": "replace", "path": "/spec/replicas", "value": to },
-        ])
-    };
-    let url = format!(
-        "{}/{}/scale?fieldManager={FIELD_MANAGER}{}",
-        object.api(client.clone()).resource_url(),
-        object.name,
-        if dry_run { "&dryRun=All" } else { "" },
-    );
-    let request = http::Request::patch(url)
-        .header(http::header::CONTENT_TYPE, "application/json-patch+json")
-        .header(http::header::ACCEPT, "application/json")
-        .body(patch.to_string().into_bytes())
-        .map_err(|e| ActionError::Failed(e.to_string()))?;
-    let sent = tokio::time::timeout(REQUEST_TIMEOUT, client.request_text(request)).await;
-    let Ok(result) = sent else {
-        return Err(ActionError::Failed(timed_out()));
-    };
-    match result {
-        Ok(_) => Ok(()),
-        Err(error) if is_failed_patch_test(&error) => Err(ActionError::Conflict(
-            "the replica count or the object changed since it was reviewed".to_owned(),
-        )),
-        Err(error) => Err(ActionError::of(error)),
+        operations.push(json!({ "op": "test", "path": "/spec/replicas", "value": from }));
+        operations.push(json!({ "op": "replace", "path": "/spec/replicas", "value": to }));
     }
+    let body = PatchBody::Json(Value::Array(operations));
+    send_patch(gate, object, Some("scale"), body, mode.dry_run).await
 }
 
 /// Whether a JSON Patch failed one of its tests: the API server answers that as Invalid with no
@@ -530,19 +620,12 @@ fn is_failed_patch_test(error: &kube::Error) -> bool {
     status.code == 422 && status.details.as_ref().is_none_or(|d| d.causes.is_empty())
 }
 
-/// Restarts a Deployment's, DaemonSet's or StatefulSet's pods, as `kubectl rollout restart`.
-pub(crate) async fn rollout_restart(
-    gate: &mut impl ActionGate,
-    object: &ActionObject,
-) -> Result<(), ActionError> {
-    send_restart(gate, object, false).await
-}
-
-/// [`rollout_restart`], stored only if `dry_run` is false.
+/// Restarts a Deployment's, DaemonSet's or StatefulSet's pods, as `kubectl rollout restart`. A
+/// held restart is a JSON Patch, whose test of the version applies to the object it changes.
 async fn send_restart(
     gate: &mut impl ActionGate,
     object: &ActionObject,
-    dry_run: bool,
+    mode: PatchMode<'_>,
 ) -> Result<(), ActionError> {
     let resource = &object.resource;
     if !is_restartable(resource) {
@@ -551,23 +634,43 @@ async fn send_restart(
             resource.plural
         )));
     }
-    let client = gate.client().await?;
     let now = jiff::Timestamp::now().to_string();
-    let patch = json!({
-        "metadata": { "uid": object.uid },
-        "spec": { "template": { "metadata": { "annotations": { RESTARTED_AT: now } } } },
-    });
-    let params = PatchParams {
-        dry_run,
-        ..patch_params()
+    let body = match mode.held {
+        Some(held) => PatchBody::Json(held_restart(&object.uid, held, &now)),
+        None => PatchBody::Merge(json!({
+            "metadata": { "uid": object.uid },
+            "spec": { "template": { "metadata": { "annotations": { RESTARTED_AT: now } } } },
+        })),
     };
-    timed(
-        object
-            .api(client)
-            .patch(&object.name, &params, &Patch::Merge(&patch)),
-    )
-    .await
-    .map(drop)
+    send_patch(gate, object, None, body, mode.dry_run).await
+}
+
+/// The JSON Patch of a held restart. The version test makes the annotations it writes back the
+/// ones it read.
+fn held_restart(uid: &str, held: &Held, now: &str) -> Value {
+    let (path, value) = match &held.template_metadata {
+        Some(metadata) => {
+            let mut annotations = metadata
+                .get("annotations")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            annotations.insert(RESTARTED_AT.to_owned(), now.into());
+            (
+                "/spec/template/metadata/annotations",
+                Value::Object(annotations),
+            )
+        }
+        None => (
+            "/spec/template/metadata",
+            json!({ "annotations": { RESTARTED_AT: now } }),
+        ),
+    };
+    json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        held.test(),
+        { "op": "add", "path": path, "value": value },
+    ])
 }
 
 /// Marks a node unschedulable, or schedulable again.
@@ -576,17 +679,11 @@ pub(crate) async fn set_cordoned(
     node: &ActionObject,
     cordoned: bool,
 ) -> Result<(), ActionError> {
-    let client = gate.client().await?;
-    let patch = json!({
+    let body = PatchBody::Merge(json!({
         "metadata": { "uid": node.uid },
         "spec": { "unschedulable": cordoned },
-    });
-    timed(
-        node.api(client)
-            .patch(&node.name, &patch_params(), &Patch::Merge(&patch)),
-    )
-    .await
-    .map(drop)
+    }));
+    send_patch(gate, node, None, body, false).await
 }
 
 /// What a drain may evict beyond what `kubectl drain` does by default, and how long it waits.
@@ -1061,11 +1158,28 @@ mod tests {
 
     use super::*;
 
+    async fn scale(
+        gate: &mut impl ActionGate,
+        object: &ActionObject,
+        from: u32,
+        to: u32,
+    ) -> Result<(), ActionError> {
+        send_scale(gate, object, from, to, PatchMode::default()).await
+    }
+
+    async fn rollout_restart(
+        gate: &mut impl ActionGate,
+        object: &ActionObject,
+    ) -> Result<(), ActionError> {
+        send_restart(gate, object, PatchMode::default()).await
+    }
+
     /// A request the fake API server saw.
     #[derive(Debug, Clone)]
     struct Seen {
         method: String,
         path: String,
+        query: String,
         body: Value,
     }
 
@@ -1100,6 +1214,7 @@ mod tests {
                 let entry = Seen {
                     method: parts.method.to_string(),
                     path: parts.uri.path().to_owned(),
+                    query: parts.uri.query().unwrap_or_default().to_owned(),
                     body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
                 };
                 seen.lock().unwrap().push(entry.clone());
@@ -1372,6 +1487,141 @@ mod tests {
                 {"op": "add", "path": "/spec/replicas", "value": 3},
             ])
         );
+    }
+
+    fn held_target() -> WriteTarget {
+        WriteTarget {
+            cluster: "dev".into(),
+            server: None,
+            kind: crate::read::KindId::new("apps", "deployments"),
+            namespace: Some("demo".into()),
+            name: "web".into(),
+            uid: Some("uid-web".into()),
+            resource_version: None,
+        }
+    }
+
+    fn held_live() -> Value {
+        json!({
+            "apiVersion": "apps/v1", "kind": "Deployment",
+            "metadata": {"name": "web", "namespace": "demo", "uid": "uid-web",
+                         "resourceVersion": "42"},
+            "spec": {"replicas": 2, "template": {"metadata": {"annotations": {"keep": "me"}}}},
+        })
+    }
+
+    /// The PATCH a dry run of `change` sends, with the object at [`held_live`].
+    async fn dry_run_patch(change: ResourceChange) -> Seen {
+        let live = held_live();
+        let reviewed = Reviewed {
+            spec: ReviewedSpec::of(&live),
+            hold_spec: true,
+            ..Default::default()
+        };
+        let reply: Reply = Arc::new(move |seen| {
+            if seen.method == "GET" {
+                (200, live.clone())
+            } else {
+                ok(seen)
+            }
+        });
+        let (client, log) = fake(reply);
+        let kind = kind_info(resource("apps", "v1", "Deployment", "deployments"));
+        dry_run(
+            &mut writes(client, open()),
+            &kind,
+            &held_target(),
+            &change,
+            &reviewed,
+        )
+        .await
+        .unwrap();
+        let seen = log.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one read, one patch");
+        assert_eq!(seen[1].method, "PATCH");
+        seen[1].clone()
+    }
+
+    // covers UP-100: a held scale tests the version the recheck read, on a dry run.
+    #[tokio::test]
+    async fn a_held_scale_tests_the_version_read() {
+        let seen = dry_run_patch(ResourceChange::Scale { from: 2, to: 3 }).await;
+        assert_eq!(
+            seen.path,
+            "/apis/apps/v1/namespaces/demo/deployments/web/scale"
+        );
+        assert_eq!(seen.query, "fieldManager=flint&dryRun=All");
+        assert_eq!(
+            seen.body,
+            json!([
+                {"op": "test", "path": "/metadata/uid", "value": "uid-web"},
+                {"op": "test", "path": "/metadata/resourceVersion", "value": "42"},
+                {"op": "test", "path": "/spec/replicas", "value": 2},
+                {"op": "replace", "path": "/spec/replicas", "value": 3},
+            ])
+        );
+    }
+
+    // covers UP-100: a held restart tests the version read and keeps the other annotations.
+    #[tokio::test]
+    async fn a_held_restart_tests_the_version_read() {
+        let seen = dry_run_patch(ResourceChange::RolloutRestart).await;
+        assert_eq!(seen.path, "/apis/apps/v1/namespaces/demo/deployments/web");
+        assert_eq!(seen.query, "fieldManager=flint&dryRun=All");
+        let operations = seen.body.as_array().expect("a JSON Patch");
+        assert_eq!(
+            operations[..2],
+            [
+                json!({"op": "test", "path": "/metadata/uid", "value": "uid-web"}),
+                json!({"op": "test", "path": "/metadata/resourceVersion", "value": "42"}),
+            ]
+        );
+        assert_eq!(operations[2]["path"], "/spec/template/metadata/annotations");
+        assert_eq!(operations[2]["value"]["keep"], "me");
+        assert!(operations[2]["value"][RESTARTED_AT].is_string());
+    }
+
+    // covers UP-53: a name or namespace that is not one path segment reaches no PATCH.
+    #[tokio::test]
+    async fn a_patch_needs_plain_path_segments() {
+        let (client, log) = fake(Arc::new(ok));
+        let mut gated = writes(client, open());
+        let names = [
+            "web#x",
+            "web?dryRun=All",
+            "web/x",
+            "web%23",
+            "..",
+            "Web",
+            "",
+        ];
+        let objects = names
+            .iter()
+            .map(|name| ActionObject {
+                name: (*name).to_owned(),
+                ..deployment()
+            })
+            .chain(
+                ["demo#x", "demo/x", "demo.x"]
+                    .iter()
+                    .map(|namespace| ActionObject {
+                        namespace: Some((*namespace).to_owned()),
+                        ..deployment()
+                    }),
+            );
+        for object in objects {
+            for result in [
+                scale(&mut gated, &object, 2, 3).await,
+                rollout_restart(&mut gated, &object).await,
+                set_cordoned(&mut gated, &object, true).await,
+            ] {
+                assert!(
+                    matches!(result, Err(ActionError::Unsupported(_))),
+                    "{object:?}: {result:?}"
+                );
+            }
+        }
+        assert!(log.lock().unwrap().is_empty());
     }
 
     // covers UP-53: a paused Deployment would accept a restart and restart nothing.

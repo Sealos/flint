@@ -24,6 +24,7 @@ use crate::read::KindId;
 use crate::write::{
     ResourceChange, WriteAction, WriteError, WriteIntent, WriteProposal, WriteTarget, WriteWarning,
 };
+use crate::write_actions::{is_namespace_name, is_object_name};
 
 /// What a fleet action does to the object on each cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +59,8 @@ pub enum FleetPlanError {
     NoTargets,
     #[error("\"{0}\" is in the target list twice")]
     Duplicate(ClusterId),
+    #[error("the object's name or namespace is not valid")]
+    InvalidObject,
 }
 
 /// An action, its object, and the admitted members it targets, in run order.
@@ -74,6 +77,10 @@ impl FleetPlan {
         object: FleetObject,
         members: Vec<AdmittedMember>,
     ) -> Result<Self, FleetPlanError> {
+        let namespace_ok = object.namespace.as_deref().is_none_or(is_namespace_name);
+        if !namespace_ok || !is_object_name(&object.name) {
+            return Err(FleetPlanError::InvalidObject);
+        }
         if members.is_empty() {
             return Err(FleetPlanError::NoTargets);
         }

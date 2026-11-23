@@ -120,6 +120,31 @@ fn a_plan_needs_targets() {
 }
 
 #[test]
+fn a_plan_needs_a_plain_name_and_namespace() {
+    let plan = |namespace: &str, name: &str| {
+        let object = FleetObject {
+            kind: KindId::new("apps", "deployments"),
+            namespace: Some(namespace.to_owned()),
+            name: name.to_owned(),
+        };
+        FleetPlan::new(FleetAction::RolloutRestart, object, Vec::new()).unwrap_err()
+    };
+    for name in [
+        "web#x", "web?x=1", "web/x", "web%23", "..", "-web", "Web", "",
+    ] {
+        assert_eq!(plan("demo", name), FleetPlanError::InvalidObject, "{name}");
+    }
+    for namespace in ["demo#x", "demo?x=1", "demo/x", "demo.x", ""] {
+        assert_eq!(
+            plan(namespace, "web"),
+            FleetPlanError::InvalidObject,
+            "{namespace}"
+        );
+    }
+    assert_eq!(plan("demo", "web.v2-1"), FleetPlanError::NoTargets);
+}
+
+#[test]
 fn each_action_is_its_write_proposal() {
     assert_eq!(
         FleetAction::RolloutRestart.proposal(),

@@ -12,7 +12,7 @@ use flint_core::handle::{AdmittedMember, Command, MemberStatus};
 use flint_core::settings::ClusterPin;
 use flint_core::write::{WriteError, WriteWarning};
 use flint_core::{KindId, Settings, WriteRefusal};
-use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, Verb, write_kubeconfigs};
+use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, RequestHold, Verb, write_kubeconfigs};
 use serde_json::{Value, json};
 
 #[allow(dead_code)]
@@ -63,6 +63,37 @@ fn real_writes(server: &FakeApiServer) -> usize {
 fn all_writes(server: &FakeApiServer) -> usize {
     server.writes().len()
 }
+
+/// The writes the server accepted and stored.
+fn stored_writes(server: &FakeApiServer) -> usize {
+    server
+        .writes()
+        .iter()
+        .filter(|w| !w.is_dry_run() && w.status.is_some_and(|code| code < 300))
+        .count()
+}
+
+/// Holds the next PATCH that `action` sends to `server`, after its recheck has read the object.
+fn hold_patch(server: &FakeApiServer, action: FleetAction) -> RequestHold {
+    let (fault, hold) = Fault::hold();
+    let fault = fault.on(&deployments()).verb(Verb::Other).times(1);
+    server.inject(match action {
+        FleetAction::Scale { .. } => fault.subresource("scale"),
+        _ => fault,
+    });
+    hold
+}
+
+/// A controller's change to the image, which leaves the uid and the replica count alone.
+fn change_image(server: &FakeApiServer) -> Value {
+    let mut changed = live(server);
+    changed["metadata"]["resourceVersion"] = json!("101");
+    changed["spec"]["template"]["spec"] = json!({"containers": [{"name": "app", "image": "next"}]});
+    server.set_object(&deployments(), changed);
+    live(server)
+}
+
+const ACTIONS: [FleetAction; 2] = [FleetAction::RolloutRestart, FleetAction::Scale { to: 5 }];
 
 fn write_config(path: &Path, servers: &[&FakeApiServer]) {
     let entries: Vec<_> = servers
@@ -475,4 +506,124 @@ async fn a_dropped_cluster_and_a_cancelled_run_send_nothing() {
         ]
     );
     assert_eq!(real_writes(fleet.server("b")), 0);
+}
+
+// covers UP-100: a change that lands after the last read refuses the write and stops the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_just_before_the_patch_stops_the_run() {
+    for action in ACTIONS {
+        let fleet = Fleet::start(&[]).await;
+        let preview = fleet.preview(action).await;
+        let (b, c) = (fleet.server("b"), fleet.server("c"));
+        let hold = hold_patch(b, action);
+        let run = tokio::spawn(
+            fleet
+                .core
+                .handle
+                .run_fleet(preview, FleetCancel::new(), |_| {}),
+        );
+        tokio::time::timeout(WAIT, hold.reached()).await.unwrap();
+        let changed = change_image(b);
+        hold.release();
+
+        let report = tokio::time::timeout(WAIT, run).await.unwrap().unwrap();
+        assert_eq!(
+            statuses(&report),
+            [
+                FleetStatus::Done,
+                FleetStatus::Failed(WriteError::Conflict),
+                AFTER_FAILURE,
+            ],
+            "{action:?}"
+        );
+        assert_eq!(live(b), changed, "{action:?}");
+        assert_eq!(stored_writes(b), 0, "{action:?}");
+        assert_eq!(real_writes(c), 0, "{action:?}");
+    }
+}
+
+// covers UP-100: the same change during a preview's dry run is that cluster's refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_just_before_the_dry_run_is_refused() {
+    for action in ACTIONS {
+        let fleet = Fleet::start(&[]).await;
+        let b = fleet.server("b");
+        let hold = hold_patch(b, action);
+        let plan = FleetPlan::new(action, object(), fleet.members.clone()).unwrap();
+        let preview = tokio::spawn(fleet.core.handle.preview_fleet(plan));
+        tokio::time::timeout(WAIT, hold.reached()).await.unwrap();
+        let changed = change_image(b);
+        hold.release();
+
+        let preview = tokio::time::timeout(WAIT, preview).await.unwrap().unwrap();
+        assert_eq!(
+            preview.entries()[1].refusal(),
+            Some(&WriteError::Conflict),
+            "{action:?}"
+        );
+        assert_eq!(live(b), changed, "{action:?}");
+        assert_eq!(stored_writes(b), 0, "{action:?}");
+    }
+}
+
+// covers UP-100: a name or namespace that is not one path segment is refused before any request,
+// so a preview can never reach the object without its dry run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_that_is_not_a_path_segment_sends_nothing() {
+    let fleet = Fleet::start(&[]).await;
+    let object_requests = |server: &FakeApiServer| {
+        server
+            .arrivals()
+            .iter()
+            .filter(|r| r.path.contains("/deployments/"))
+            .count()
+    };
+    let before: Vec<_> = fleet.servers.iter().map(object_requests).collect();
+    let named = |namespace: &str, name: &str| FleetObject {
+        kind: KindId::new("apps", "deployments"),
+        namespace: Some(namespace.to_owned()),
+        name: name.to_owned(),
+    };
+    let mut objects: Vec<_> = ["web#x", "web?x=1", "web/scale", "web%23x", "..", "Web", ""]
+        .into_iter()
+        .map(|name| named("demo", name))
+        .collect();
+    objects.extend(
+        ["demo#x", "demo?x=1", "demo/x", "demo.x"]
+            .into_iter()
+            .map(|namespace| named(namespace, NAME)),
+    );
+    for action in ACTIONS {
+        for object in &objects {
+            let plan = FleetPlan::new(action, object.clone(), fleet.members.clone());
+            let refused = plan.is_err();
+            if let Ok(plan) = plan {
+                fleet.core.handle.preview_fleet(plan).await;
+            }
+            for server in &fleet.servers {
+                assert_eq!(replicas(server), 2, "{object:?} changed the object");
+                assert_eq!(real_writes(server), 0, "{object:?} lost its dry run");
+            }
+            assert!(refused, "{object:?}");
+        }
+    }
+    let after: Vec<_> = fleet.servers.iter().map(object_requests).collect();
+    assert_eq!(after, before, "no request for a refused name");
+}
+
+// covers UP-100: every write of a preview is a dry run, and no cluster's object changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_preview_only_sends_dry_runs() {
+    for action in ACTIONS {
+        let fleet = Fleet::start(&[]).await;
+        let before: Vec<_> = fleet.servers.iter().map(live).collect();
+        let preview = fleet.preview(action).await;
+        assert!(preview.entries().iter().all(|e| e.refusal().is_none()));
+        for (server, before) in fleet.servers.iter().zip(&before) {
+            let writes = server.writes();
+            assert_eq!(writes.len(), 1, "{action:?}");
+            assert!(writes[0].query.contains("dryRun=All"), "{action:?}");
+            assert_eq!(live(server), *before, "{action:?}");
+        }
+    }
 }
