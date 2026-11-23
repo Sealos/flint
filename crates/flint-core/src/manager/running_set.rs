@@ -14,8 +14,6 @@
 use std::hash::{BuildHasher, RandomState};
 use std::time::{Duration, Instant};
 
-use kube::config::AuthInfo;
-
 use super::ClusterManager;
 use crate::cluster::{ClusterError, ClusterId, SafeErrorText};
 use crate::connection::member::{
@@ -23,7 +21,7 @@ use crate::connection::member::{
 };
 use crate::connection::policy::Role;
 use crate::connection::schedule::{AttemptId, Jitter};
-use crate::credential::{CredentialSource, WriteCredential, presents_a_credential};
+use crate::credential::{CredentialSource, WriteCredential};
 use crate::handle::{ConnectionState, Event, MemberReport, MemberStatus};
 use crate::store::SyncState;
 
@@ -191,20 +189,9 @@ impl ClusterManager {
         self.unsettled(id) || self.definition_runs_a_command(id)
     }
 
-    /// Whether the definition the kubeconfig shows for `id` now would run a program.
+    /// Whether the definition the kubeconfig shows for `id` now would run a program. A context
+    /// with no user runs none, and one that can't be resolved counts as running one.
     pub(super) fn definition_runs_a_command(&self, id: &str) -> bool {
-        self.definition_auth_is(id, |auth| CredentialSource::of(auth).runs_a_command())
-    }
-
-    /// Whether connecting with the definition the kubeconfig shows for `id` now would present a
-    /// credential of any kind.
-    pub(super) fn definition_sends_a_credential(&self, id: &str) -> bool {
-        self.definition_auth_is(id, presents_a_credential)
-    }
-
-    /// `test` of the user `id`'s definition names. A context with no user has no credential, and
-    /// one that can't be resolved counts as passing, so that callers fail closed.
-    fn definition_auth_is(&self, id: &str, test: impl FnOnce(&AuthInfo) -> bool) -> bool {
         let merged = &self.kubeconfig.merged;
         let Some(context) = merged
             .contexts
@@ -222,7 +209,7 @@ impl ClusterManager {
             .iter()
             .find(|a| &a.name == user)
             .and_then(|a| a.auth_info.as_ref())
-            .is_none_or(test)
+            .is_none_or(|auth| CredentialSource::of(auth).runs_a_command())
     }
 
     /// Asks for `id`'s next connection through its member state: at once for the active cluster,
