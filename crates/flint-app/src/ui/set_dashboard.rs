@@ -8,13 +8,15 @@
 //! are read from the member's feed when a count is clicked.
 
 #[cfg(test)]
+use std::cell::RefCell;
+#[cfg(test)]
 use std::collections::HashMap;
 
 use flint_core::KindId;
 use flint_core::dashboard::{ProblemCategory, ProblemCounts, ProblemTotals};
 use flint_core::metrics_trend::{TrendResource, TrendScope};
 use flint_core::settings::ClusterTag;
-use flint_core::telemetry::ClusterTelemetry;
+use flint_core::telemetry::{Availability, ClusterTelemetry};
 use flint_core::thresholds::{ThresholdLevel, ThresholdMetric, Thresholds};
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{ActiveTheme as _, Theme, h_flex, v_flex};
@@ -42,6 +44,9 @@ const SPARKLINE_HEIGHT: f32 = 24.;
 #[serde(deny_unknown_fields)]
 pub struct OpenSetMember {
     pub cluster: String,
+    /// The [`SetDashboardView::drawn_feeds`] the link was drawn with.
+    #[serde(default)]
+    pub drawn: Option<u64>,
 }
 
 /// Open the combined list filtered to what a dashboard count counted.
@@ -57,6 +62,9 @@ pub struct OpenSetProblem {
     /// Which kind of short workload, when the count covers several.
     #[serde(default)]
     pub kind: Option<String>,
+    /// The [`SetDashboardView::drawn_feeds`] the link was drawn with.
+    #[serde(default)]
+    pub drawn: Option<u64>,
 }
 
 /// The category [`OpenSetProblem`] names.
@@ -169,6 +177,33 @@ impl SetCard {
             Some(note) => format!("{}: {note} {}", self.shown, counts.join(", ")),
             None => format!("{}: {}", self.shown, counts.join(", ")),
         }
+    }
+
+    /// Drops every value of the card, which now says `state`.
+    fn take_down(&mut self, state: CardState) {
+        self.state = state;
+        for tile in &mut self.tiles {
+            tile.count = None;
+            tile.level = ThresholdLevel::Unknown;
+        }
+        self.counts = ProblemCounts::from_fn(|_| None);
+        self.level = ThresholdLevel::Unknown;
+        self.cpu = None;
+        self.memory = None;
+        self.short_kinds.clear();
+        self.feed = None;
+    }
+}
+
+/// What a card must say instead of its values while its feed is in `availability`, if anything.
+/// A feed that lost its cluster keeps its id on the aged values it serves.
+pub(in crate::ui) fn unreadable_state(availability: &Availability) -> Option<CardState> {
+    match availability {
+        Availability::Checked | Availability::Partial => None,
+        Availability::Starting => Some(CardState::Waiting),
+        Availability::CannotBeChecked(_) => Some(CardState::Unavailable(
+            "This cluster cannot be checked.".to_owned(),
+        )),
     }
 }
 
@@ -431,6 +466,17 @@ fn total_opens(cards: &[SetCard], category: ProblemCategory) -> bool {
     kinds.len() <= 1
 }
 
+/// The one kind a total of short workloads counted, which its link opens.
+fn total_kind(cards: &[SetCard], category: ProblemCategory) -> Option<&'static str> {
+    if category != ProblemCategory::ShortWorkloads {
+        return None;
+    }
+    cards
+        .iter()
+        .filter(|card| card.counts.get(category).is_some_and(|count| count > 0))
+        .find_map(|card| card.short_kinds.first().copied())
+}
+
 /// The dashboard of `members`. Runs off the UI thread.
 pub(in crate::ui) fn build(members: Vec<MemberRead>, now: Timestamp) -> SetDashboardModel {
     assemble(
@@ -452,11 +498,46 @@ pub(in crate::ui) fn lists_now(telemetry: &ClusterTelemetry) -> ProblemLists {
 pub(in crate::ui) struct TestFeeds {
     pub feeds: HashMap<String, FeedId>,
     pub lists: HashMap<String, ProblemLists>,
+    /// A member's feed state, `Checked` when absent.
+    pub availability: HashMap<String, Availability>,
+    /// Replaces a member's feed and lists right after its next read.
+    pub replace_after_read: RefCell<Option<(String, FeedId, ProblemLists)>>,
+    replaced: RefCell<HashMap<String, (FeedId, ProblemLists)>>,
+}
+
+#[cfg(test)]
+impl TestFeeds {
+    /// One read of `cluster`'s feed: its id, state and lists, all from the same moment.
+    pub fn read(&self, cluster: &str) -> Option<(FeedId, Availability, Option<ProblemLists>)> {
+        let replaced = self.replaced.borrow().get(cluster).cloned();
+        let (feed, lists) = match replaced {
+            Some((feed, lists)) => (feed, Some(lists)),
+            None => (
+                self.feeds.get(cluster)?.clone(),
+                self.lists.get(cluster).cloned(),
+            ),
+        };
+        let next = self
+            .replace_after_read
+            .borrow_mut()
+            .take_if(|(member, ..)| member == cluster);
+        if let Some((member, feed, lists)) = next {
+            self.replaced.borrow_mut().insert(member, (feed, lists));
+        }
+        let availability = self
+            .availability
+            .get(cluster)
+            .cloned()
+            .unwrap_or(Availability::Checked);
+        Some((feed, availability, lists))
+    }
 }
 
 /// Draws a [`SetDashboardModel`]. The workspace feeds it, and answers its links.
 pub struct SetDashboardView {
     pub(in crate::ui) model: SetDashboardModel,
+    /// Moves whenever a card's feed changes, so a link drawn before that opens nothing.
+    pub(in crate::ui) drawn_feeds: u64,
     focus: FocusHandle,
     scroll: ScrollHandle,
     #[cfg(test)]
@@ -480,6 +561,7 @@ impl SetDashboardView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             model: SetDashboardModel::default(),
+            drawn_feeds: 0,
             focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
             #[cfg(test)]
@@ -495,9 +577,33 @@ impl SetDashboardView {
     /// Shows `model`, redrawing only if it differs.
     pub fn set_model(&mut self, model: SetDashboardModel, cx: &mut Context<Self>) {
         if self.model != model {
+            let feeds_moved = self.model.cards.len() != model.cards.len()
+                || model.cards.iter().any(|card| {
+                    self.model
+                        .card(&card.cluster)
+                        .is_none_or(|old| old.feed != card.feed)
+                });
+            if feeds_moved {
+                self.drawn_feeds += 1;
+            }
             self.model = model;
             cx.notify();
         }
+    }
+
+    /// Takes down the named cards now, and the totals they counted towards.
+    pub(in crate::ui) fn take_down(
+        &mut self,
+        cards: Vec<(String, CardState)>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut next = self.model.cards.clone();
+        for (cluster, state) in cards {
+            if let Some(card) = next.iter_mut().find(|card| card.cluster == cluster) {
+                card.take_down(state);
+            }
+        }
+        self.set_model(assemble(next), cx);
     }
 }
 
@@ -575,7 +681,7 @@ fn metric_row(id: String, metric: &CardMetric, theme: &Theme) -> impl IntoElemen
         .test_support()
 }
 
-fn render_card(card: &SetCard, focus: &FocusHandle, theme: &Theme) -> impl IntoElement {
+fn render_card(card: &SetCard, drawn: u64, focus: &FocusHandle, theme: &Theme) -> impl IntoElement {
     let cluster = &card.cluster;
     let opens = card.state.counts();
     let header = h_flex()
@@ -593,6 +699,7 @@ fn render_card(card: &SetCard, focus: &FocusHandle, theme: &Theme) -> impl IntoE
                     focus.clone(),
                     OpenSetMember {
                         cluster: cluster.clone(),
+                        drawn: Some(drawn),
                     },
                 ))
         })
@@ -608,7 +715,10 @@ fn render_card(card: &SetCard, focus: &FocusHandle, theme: &Theme) -> impl IntoE
         .then(|| OpenSetProblem {
             category: name.to_owned(),
             cluster: Some(cluster.clone()),
-            kind: None,
+            kind: (tile.category == ProblemCategory::ShortWorkloads)
+                .then(|| card.short_kinds.first().map(|kind| (*kind).to_owned()))
+                .flatten(),
+            drawn: Some(drawn),
         });
         let mut rows = vec![
             count_link(
@@ -634,6 +744,7 @@ fn render_card(card: &SetCard, focus: &FocusHandle, theme: &Theme) -> impl IntoE
                         category: name.to_owned(),
                         cluster: Some(cluster.clone()),
                         kind: Some((*kind).to_owned()),
+                        drawn: Some(drawn),
                     }),
                     focus,
                     theme,
@@ -692,6 +803,7 @@ impl Render for SetDashboardView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let members = self.model.cards.len();
+        let drawn = self.drawn_feeds;
         let focus = &self.focus;
         v_flex()
             .id("set-dashboard")
@@ -712,7 +824,8 @@ impl Render for SetDashboardView {
                         let action = total.opens.then(|| OpenSetProblem {
                             category: name.to_owned(),
                             cluster: None,
-                            kind: None,
+                            kind: total_kind(&self.model.cards, total.category).map(str::to_owned),
+                            drawn: Some(drawn),
                         });
                         div()
                             .id(SharedString::from(format!("set-total-tile-{name}")))
@@ -759,7 +872,7 @@ impl Render for SetDashboardView {
                         self.model
                             .cards
                             .iter()
-                            .map(|card| render_card(card, focus, theme)),
+                            .map(|card| render_card(card, drawn, focus, theme)),
                     )
                     .test_support(),
             )

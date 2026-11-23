@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use flint_core::dashboard::{ProblemCategory, ProblemCounts};
+use flint_core::telemetry::Availability;
 use flint_core::thresholds::{ThresholdLevel, Thresholds};
 use flint_core::{KindId, KindSnapshot, SyncState};
 use gpui_kit::{AppContext as _, Entity, TestAppContext};
@@ -15,7 +16,7 @@ use super::super::feed::{FeedId, ProblemList, ProblemLists};
 use super::super::{NO_VALUE, ProblemTile, category_label};
 use super::{
     CardState, MemberRead, SetCard, SetDashboardModel, SetDashboardView, TestFeeds, TotalTile,
-    assemble, card, kind_entry,
+    assemble, card, kind_entry, total_kind,
 };
 
 fn tiles(count: impl Fn(ProblemCategory) -> Option<u32>) -> Vec<ProblemTile> {
@@ -272,6 +273,7 @@ async fn open_set(
                 ("kind-beta".to_owned(), failing_lists("uid-web")),
             ]
             .into(),
+            ..TestFeeds::default()
         });
         let mut quiet = card_with("kind-alpha", CardState::Live, Some(0), "alpha");
         quiet.feed = Some(alpha);
@@ -364,6 +366,170 @@ async fn a_read_of_a_gone_feed_is_not_shown(cx: &mut TestAppContext) {
     let (workspace, shown) = (t.workspace.clone(), view.clone());
     workspace.update(cx, |ws, cx| ws.finish_set_read(&shown, late, cx));
     assert_eq!(view.read_with(cx, |view, _| view.model.clone()), before);
+}
+
+/// `kind-beta`'s card and the failing total, read with no build having finished.
+fn beta_and_total(cx: &mut TestAppContext, view: &Entity<SetDashboardView>) -> (bool, String) {
+    view.read_with(cx, |view, _| {
+        let card = view.model.card("kind-beta").unwrap();
+        assert_eq!(card.feed, None);
+        assert!(card.tiles.iter().all(|tile| tile.count.is_none()));
+        assert!(view.model.partial.as_deref().unwrap().contains("kind-beta"));
+        let failing = total(&view.model, ProblemCategory::FailingPods);
+        (card.state.counts(), failing.value(2))
+    })
+}
+
+#[gpui_kit::test]
+async fn a_member_that_left_its_server_is_taken_down_during_a_build(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, view) = open_set(cx, dir.path()).await;
+    view.update(cx, |view, _| view.reading = true);
+    t.workspace
+        .update(cx, |ws, cx| ws.discard_member_for_test("kind-beta", cx));
+    assert_eq!(beta_and_total(cx, &view), (false, "0+".to_owned()));
+    assert!(view.read_with(cx, |view, _| view.dirty));
+}
+
+#[gpui_kit::test]
+async fn an_unreachable_feed_is_taken_down_and_opens_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, view) = open_set(cx, dir.path()).await;
+    view.update(cx, |view, _| {
+        let test = view.test_feeds.as_mut().unwrap();
+        test.availability
+            .insert("kind-beta".to_owned(), Availability::CannotBeChecked(None));
+    });
+    // The click comes first: the aged snapshot keeps the feed's id.
+    t.dispatch(cx, OPEN_MEMBER, json!({ "cluster": "kind-beta" }))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(dashboard_open(cx, &t));
+    t.workspace
+        .update(cx, |ws, cx| ws.refresh_set_dashboard_for_test(cx));
+    assert_eq!(beta_and_total(cx, &view), (false, "0+".to_owned()));
+}
+
+#[gpui_kit::test]
+async fn a_feed_replaced_during_a_click_never_supplies_its_objects(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, view) = open_set(cx, dir.path()).await;
+    view.update(cx, |view, _| {
+        let test = view.test_feeds.as_mut().unwrap();
+        *test.replace_after_read.borrow_mut() = Some((
+            "kind-beta".to_owned(),
+            FeedId::for_test("replacement"),
+            failing_lists("no-such-uid"),
+        ));
+    });
+    t.dispatch(
+        cx,
+        OPEN_PROBLEM,
+        json!({ "category": "failing_pods", "cluster": "kind-beta" }),
+    )
+    .unwrap();
+    cx.run_until_parked();
+    // One read: the rendered feed's own objects, none of the replacement's.
+    assert_eq!(matched(cx, &t), 1);
+}
+
+#[gpui_kit::test]
+async fn a_link_drawn_before_a_feed_changed_opens_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, view) = open_set(cx, dir.path()).await;
+    let drawn = view.read_with(cx, |view, _| view.drawn_feeds);
+    view.update(cx, |view, cx| {
+        let mut model = view.model.clone();
+        let replaced = FeedId::for_test("replacement");
+        model
+            .cards
+            .iter_mut()
+            .find(|card| card.cluster == "kind-beta")
+            .unwrap()
+            .feed = Some(replaced.clone());
+        view.test_feeds
+            .as_mut()
+            .unwrap()
+            .feeds
+            .insert("kind-beta".to_owned(), replaced);
+        view.set_model(model, cx);
+    });
+    assert_ne!(view.read_with(cx, |view, _| view.drawn_feeds), drawn);
+    for (action, args) in [
+        (
+            OPEN_PROBLEM,
+            json!({ "category": "failing_pods", "cluster": "kind-beta", "drawn": drawn }),
+        ),
+        (
+            OPEN_MEMBER,
+            json!({ "cluster": "kind-beta", "drawn": drawn }),
+        ),
+    ] {
+        t.dispatch(cx, action, args).unwrap();
+        cx.run_until_parked();
+        assert!(dashboard_open(cx, &t), "{action} left the dashboard");
+    }
+}
+
+fn short_lists(kind: &'static str, uid: &str) -> ProblemLists {
+    let mut counted = CountedObjects::default();
+    counted.insert(Some("default"), "web", Some(uid));
+    ProblemLists::from([(
+        ProblemCategory::ShortWorkloads,
+        vec![ProblemList {
+            kind,
+            filter: ObjectFilter {
+                label: format!("short {kind}"),
+                objects: Arc::new(counted),
+            },
+        }],
+    )])
+}
+
+#[gpui_kit::test]
+async fn a_total_whose_members_now_disagree_on_kind_opens_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, view) = open_set(cx, dir.path()).await;
+    view.update(cx, |view, _| {
+        let test = view.test_feeds.as_mut().unwrap();
+        test.lists.insert(
+            "kind-alpha".to_owned(),
+            short_lists("deployments", "uid-web"),
+        );
+        test.lists.insert(
+            "kind-beta".to_owned(),
+            short_lists("statefulsets", "uid-api"),
+        );
+    });
+    for args in [
+        json!({ "category": "short_workloads" }),
+        json!({ "category": "short_workloads", "kind": "deployments" }),
+    ] {
+        t.dispatch(cx, OPEN_PROBLEM, args).unwrap();
+        cx.run_until_parked();
+        assert!(dashboard_open(cx, &t));
+        assert_eq!(shown_label(cx, &t), None);
+    }
+}
+
+#[test]
+fn a_total_link_names_the_kind_its_counted_members_show() {
+    let short = |cluster: &str, kind: &'static str, count: u32| {
+        let counts =
+            move |category| Some(u32::from(category == ProblemCategory::ShortWorkloads) * count);
+        SetCard {
+            short_kinds: vec![kind],
+            tiles: tiles(counts),
+            counts: ProblemCounts::from_fn(counts),
+            ..card_with(cluster, CardState::Live, Some(0), cluster)
+        }
+    };
+    let cards = [short("a", "deployments", 0), short("b", "statefulsets", 2)];
+    assert_eq!(
+        total_kind(&cards, ProblemCategory::ShortWorkloads),
+        Some("statefulsets")
+    );
+    assert_eq!(total_kind(&cards, ProblemCategory::FailingPods), None);
 }
 
 #[gpui_kit::test]

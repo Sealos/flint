@@ -12,12 +12,13 @@ use flint_core::KindId;
 use flint_core::combined::CombinedObjects;
 use flint_core::dashboard::ProblemCategory;
 use flint_core::settings::WatchMode;
+use flint_core::telemetry::Availability;
 use gpui_kit::*;
 use jiff::Timestamp;
 
 use super::super::super::dashboard::set::{
-    self, AGE_OUT_INTERVAL, MemberRead, OpenSetMember, OpenSetProblem, SetDashboardModel,
-    SetDashboardView, category_named, kind_entry,
+    self, AGE_OUT_INTERVAL, CardState, MemberRead, OpenSetMember, OpenSetProblem, SetCard,
+    SetDashboardModel, SetDashboardView, category_named, kind_entry,
 };
 use super::super::super::dashboard::{FeedId, ProblemList, ProblemLists};
 use super::super::super::focus::release_unfocused_input;
@@ -32,12 +33,35 @@ fn pick_list<'a>(
 ) -> Option<&'a ProblemList> {
     let lists = lists.get(&category)?;
     match kind {
-        Some(kind) => lists.iter().find(|list| list.kind == kind),
+        // A member counting nothing holds an empty placeholder of some other kind.
+        Some(kind) => lists.iter().find(|list| list.kind == kind).or_else(|| {
+            lists
+                .iter()
+                .all(|list| list.filter.objects.len() == 0)
+                .then(|| lists.first())
+                .flatten()
+        }),
         None => match lists.as_slice() {
             [list] => Some(list),
             _ => None,
         },
     }
+}
+
+/// Whether a link was drawn before the feeds on the dashboard last changed.
+fn drawn_earlier(view: &Entity<SetDashboardView>, drawn: Option<u64>, cx: &App) -> bool {
+    drawn.is_some_and(|drawn| drawn != view.read(cx).drawn_feeds)
+}
+
+/// Whether `card`'s feed still splits its short workloads into the kinds the card shows.
+fn shows_drawn_kinds(lists: &ProblemLists, category: ProblemCategory, card: &SetCard) -> bool {
+    category != ProblemCategory::ShortWorkloads
+        || lists.get(&category).is_some_and(|lists| {
+            lists
+                .iter()
+                .map(|list| list.kind)
+                .eq(card.short_kinds.iter().copied())
+        })
 }
 
 impl Workspace {
@@ -140,33 +164,80 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The feed `cluster` runs now, if it is an admitted member that may be read.
-    fn running_feed_of(&self, cluster: &str, cx: &App) -> Option<FeedId> {
+    /// The feed `cluster` runs now and its state, from one read.
+    fn feed_state(&self, cluster: &str, cx: &App) -> Option<(FeedId, Availability)> {
         #[cfg(test)]
         if let Some(view) = self.set_dashboard()
             && let Some(test) = &view.read(cx).test_feeds
         {
-            return test.feeds.get(cluster).cloned();
+            return test
+                .read(cluster)
+                .map(|(feed, availability, _)| (feed, availability));
         }
+        let member = self.sets.member(cluster)?;
+        let telemetry = self.model.read(cx).core().member_telemetry(member)?;
+        let availability = telemetry.snapshot.availability.clone();
+        Some((FeedId::of(&telemetry), availability))
+    }
+
+    /// The feed `cluster` runs now, if it is an admitted member whose feed can read it.
+    fn running_feed_of(&self, cluster: &str, cx: &App) -> Option<FeedId> {
         if self.set_row_refusal(cluster, cx).is_some() {
             return None;
         }
-        let member = self.sets.member(cluster)?;
-        let telemetry = self.model.read(cx).core().member_telemetry(member)?;
-        Some(FeedId::of(&telemetry))
+        let (feed, availability) = self.feed_state(cluster, cx)?;
+        set::unreadable_state(&availability)
+            .is_none()
+            .then_some(feed)
     }
 
-    /// The objects behind `cluster`'s counts, read from its feed now.
-    fn member_lists(&self, cluster: &str, cx: &App) -> Option<ProblemLists> {
+    /// The objects behind `cluster`'s counts, only if one read finds `drawn` still running and
+    /// able to read the cluster. The check and the objects come from the same snapshot.
+    fn lists_of_feed(&self, cluster: &str, drawn: &FeedId, cx: &App) -> Option<ProblemLists> {
+        if self.set_row_refusal(cluster, cx).is_some() {
+            return None;
+        }
         #[cfg(test)]
         if let Some(view) = self.set_dashboard()
             && let Some(test) = &view.read(cx).test_feeds
         {
-            return test.lists.get(cluster).cloned();
+            let (feed, availability, lists) = test.read(cluster)?;
+            return (feed == *drawn && set::unreadable_state(&availability).is_none())
+                .then_some(lists)
+                .flatten();
         }
         let member = self.sets.member(cluster)?;
         let telemetry = self.model.read(cx).core().member_telemetry(member)?;
-        Some(set::lists_now(&telemetry))
+        (FeedId::of(&telemetry) == *drawn
+            && set::unreadable_state(&telemetry.snapshot.availability).is_none())
+        .then(|| set::lists_now(&telemetry))
+    }
+
+    /// What `card` must say instead of its values, if its feed is no longer the one it shows.
+    fn withdrawn_state(&self, card: &SetCard, cx: &App) -> Option<CardState> {
+        if let Some(why) = self.set_row_refusal(&card.cluster, cx) {
+            return Some(CardState::Blocked(why));
+        }
+        let Some((feed, availability)) = self.feed_state(&card.cluster, cx) else {
+            return Some(CardState::Waiting);
+        };
+        set::unreadable_state(&availability)
+            .or_else(|| (card.feed.as_ref() != Some(&feed)).then_some(CardState::Waiting))
+    }
+
+    /// Takes down, on the spot, every card whose member or feed no longer backs it.
+    fn take_down_stale_cards(&self, view: &Entity<SetDashboardView>, cx: &mut Context<Self>) {
+        let stale: Vec<(String, CardState)> = view
+            .read(cx)
+            .model
+            .cards
+            .iter()
+            .filter(|card| card.feed.is_some())
+            .filter_map(|card| Some((card.cluster.clone(), self.withdrawn_state(card, cx)?)))
+            .collect();
+        if !stale.is_empty() {
+            view.update(cx, |view, cx| view.take_down(stale, cx));
+        }
     }
 
     /// Each member as it stands now, and those left out when the set opened. Reads only what
@@ -214,17 +285,25 @@ impl Workspace {
         admitted.chain(left_out).collect()
     }
 
-    /// Rebuilds the open dashboard off the UI thread, one build at a time.
+    /// Takes down what no longer holds at once, then rebuilds the rest.
     pub(super) fn refresh_set_dashboard(&mut self, cx: &mut Context<Self>) {
+        if let Some(view) = self.set_dashboard() {
+            self.take_down_stale_cards(&view, cx);
+        }
+        self.rebuild_set_dashboard(cx);
+    }
+
+    /// Rebuilds the open dashboard off the UI thread, one build at a time.
+    fn rebuild_set_dashboard(&mut self, cx: &mut Context<Self>) {
         let Some(view) = self.set_dashboard() else {
             return;
         };
-        #[cfg(test)]
-        if view.read(cx).test_feeds.is_some() {
-            return;
-        }
         if view.read(cx).reading {
             view.update(cx, |view, _| view.dirty = true);
+            return;
+        }
+        #[cfg(test)]
+        if view.read(cx).test_feeds.is_some() {
             return;
         }
         let reads = self.member_reads(cx);
@@ -264,7 +343,7 @@ impl Workspace {
             view.update(cx, |view, cx| view.set_model(built, cx));
         }
         if stale || again {
-            self.refresh_set_dashboard(cx);
+            self.rebuild_set_dashboard(cx);
         }
     }
 
@@ -286,8 +365,10 @@ impl Workspace {
         let Some(view) = self.set_dashboard() else {
             return;
         };
-        if !self.card_is_current(&view, &action.cluster, cx) {
-            self.refresh_set_dashboard(cx);
+        if drawn_earlier(&view, action.drawn, cx)
+            || !self.card_is_current(&view, &action.cluster, cx)
+        {
+            self.rebuild_set_dashboard(cx);
             return;
         }
         self.close_set_dashboard(window, cx);
@@ -309,37 +390,49 @@ impl Workspace {
         let Some(category) = category_named(&action.category) else {
             return;
         };
-        let (targets, members): (Vec<String>, usize) = {
+        if drawn_earlier(&view, action.drawn, cx) {
+            self.rebuild_set_dashboard(cx);
+            return;
+        }
+        let (targets, members): (Vec<SetCard>, usize) = {
             let model = &view.read(cx).model;
             let targets = model
                 .cards
                 .iter()
                 .filter(|card| action.cluster.as_ref().is_none_or(|c| *c == card.cluster))
                 .filter(|card| card.state.counts() && card.counts.get(category).is_some())
-                .map(|card| card.cluster.clone())
+                .cloned()
                 .collect();
             (targets, model.cards.len())
         };
         if targets.is_empty() {
-            self.refresh_set_dashboard(cx);
+            self.rebuild_set_dashboard(cx);
             return;
         }
         let mut objects = CombinedObjects::default();
         let mut opened: Option<(&'static str, String)> = None;
-        for cluster in &targets {
-            if !self.card_is_current(&view, cluster, cx) {
-                self.refresh_set_dashboard(cx);
-                return;
-            }
-            let lists = self.member_lists(cluster, cx);
+        for card in &targets {
+            let lists = card
+                .feed
+                .as_ref()
+                .and_then(|feed| self.lists_of_feed(&card.cluster, feed, cx));
             let Some(list) = lists
                 .as_ref()
+                .filter(|lists| shows_drawn_kinds(lists, category, card))
                 .and_then(|lists| pick_list(lists, category, action.kind.as_deref()))
             else {
-                self.refresh_set_dashboard(cx);
+                self.rebuild_set_dashboard(cx);
                 return;
             };
-            list.filter.objects.add_to(cluster, &mut objects);
+            // Two members counting different kinds cannot open as one list.
+            if list.filter.objects.len() > 0
+                && !objects.is_empty()
+                && opened.as_ref().is_some_and(|(kind, _)| *kind != list.kind)
+            {
+                self.rebuild_set_dashboard(cx);
+                return;
+            }
+            list.filter.objects.add_to(&card.cluster, &mut objects);
             // A member counting nothing has a placeholder kind, which must not set the list's.
             if opened.is_none() || list.filter.objects.len() > 0 {
                 opened = Some((list.kind, list.filter.label.clone()));
@@ -348,6 +441,10 @@ impl Workspace {
         let Some((kind, label)) = opened else {
             return;
         };
+        if action.kind.as_deref().is_some_and(|pinned| pinned != kind) && !objects.is_empty() {
+            self.rebuild_set_dashboard(cx);
+            return;
+        }
         let Some((id, kind_label)) = kind_entry(kind) else {
             return;
         };
@@ -424,5 +521,15 @@ impl Workspace {
 
     pub(in crate::ui) fn set_is_open_for_test(&self) -> bool {
         self.sets.is_open()
+    }
+
+    /// A member leaving its server, as the sweep finds it.
+    pub(in crate::ui) fn discard_member_for_test(&mut self, cluster: &str, cx: &mut Context<Self>) {
+        self.discard_member(cluster, format!("{cluster} changed"), cx);
+        self.refresh_set_dashboard(cx);
+    }
+
+    pub(in crate::ui) fn refresh_set_dashboard_for_test(&mut self, cx: &mut Context<Self>) {
+        self.refresh_set_dashboard(cx);
     }
 }
