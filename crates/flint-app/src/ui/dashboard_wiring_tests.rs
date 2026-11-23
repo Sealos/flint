@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use super::dashboard::{
     DashboardModel, DashboardView, FeedId, ProblemList, ProblemLists, ProblemRow, ProblemTile,
-    ProblemsPanel, lists_of,
+    ProblemsPanel, lists_of, slot_to_read,
 };
 use super::list::{CountedObjects, ObjectFilter};
 use super::registry::{OpenObject, Scope, tests::assert_binds_scope};
@@ -419,6 +419,83 @@ fn show_problem_row(
         view.set_model(model, cx);
     });
     cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+async fn a_later_slot_does_not_label_this_feed(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let _view = open(cx, &t).await;
+    let summary = t
+        .workspace
+        .read_with(cx, |ws, cx| ws.cluster_summary("kind-alpha", cx).cloned())
+        .expect("connected");
+    let followed = summary.generation;
+    assert!(slot_to_read(Some(&summary), "kind-alpha", followed).is_some());
+
+    let mut moved = summary;
+    moved.generation = followed + 1;
+    moved.info.server = Some("https://moved.example".to_owned());
+    assert!(
+        slot_to_read(Some(&moved), "kind-alpha", followed).is_none(),
+        "the moved context's server must not label the followed slot's feed"
+    );
+}
+
+#[gpui_kit::test]
+async fn an_overview_link_of_a_gone_feed_opens_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let view = open(cx, &t).await;
+    let server = t.workspace.read_with(cx, |ws, cx| {
+        ws.cluster_summary("kind-alpha", cx)
+            .and_then(|summary| summary.info.server.clone())
+    });
+    let old = FeedId::for_test("kind-alpha");
+    view.update(cx, |view, cx| {
+        view.set_running_feed_for_test(Some(old.clone()));
+        let (model, lists) = (view.model().clone(), ProblemLists::new());
+        view.finish_read_for_test(Some(old.clone()), model, lists, cx);
+    });
+    show_problem_row(cx, &view, "kind-alpha", server);
+    let link = view.read_with(cx, |view, _| match &view.model().problems {
+        ProblemsPanel::Rows { rows, .. } => rows[0].open.clone(),
+        ProblemsPanel::Unknown => panic!("no rows"),
+    });
+
+    // Replaced: the row is still drawn, and its click must not reach the workspace.
+    view.update(cx, |view, cx| {
+        view.set_running_feed_for_test(Some(FeedId::for_test("kind-alpha")));
+        assert!(view.refuses_link(|model| model.links_object(&link), cx));
+    });
+    t.click(cx, ("dashboard-problem", 0usize));
+    cx.run_until_parked();
+    assert!(dashboard(cx, &t).is_some(), "the stale row opened nothing");
+    assert!(t.list(cx).is_none());
+}
+
+#[gpui_kit::test]
+async fn a_link_from_the_frame_before_a_feed_stopped_opens_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let view = open(cx, &t).await;
+    let old = FeedId::for_test("kind-alpha");
+    view.update(cx, |view, cx| {
+        view.set_running_feed_for_test(Some(old.clone()));
+        let (model, lists) = (view.model().clone(), ProblemLists::new());
+        view.finish_read_for_test(Some(old.clone()), model, lists, cx);
+    });
+    show_problem_row(cx, &view, "kind-alpha", Some("https://one".to_owned()));
+    let link = view.read_with(cx, |view, _| match &view.model().problems {
+        ProblemsPanel::Rows { rows, .. } => rows[0].open.clone(),
+        ProblemsPanel::Unknown => panic!("no rows"),
+    });
+    // Cleared but not yet redrawn: the old frame's row is still under the pointer.
+    view.update(cx, |view, cx| {
+        view.set_running_feed_for_test(None);
+        view.refresh(cx);
+        assert!(view.refuses_link(|model| model.links_object(&link), cx));
+    });
 }
 
 #[gpui_kit::test]

@@ -21,7 +21,7 @@ use flint_core::telemetry::{
     TelemetrySnapshot, UsageRead, VersionCheck, WatchedKind,
 };
 use flint_core::thresholds::Thresholds;
-use flint_core::{ClusterId, OverviewInterest};
+use flint_core::{ClusterId, ClusterSummary, OverviewInterest};
 use gpui_kit::*;
 use jiff::Timestamp;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -71,11 +71,15 @@ impl PartialEq for FeedId {
 #[derive(Default)]
 pub(super) struct Feed {
     source: Option<(WeakEntity<ClustersModel>, ClusterId)>,
+    /// The slot this view follows: its server is the one that labels the feed's values.
+    generation: u64,
     /// Keeps the cluster's feed running in watch mode On view while this view lives, and is the
     /// only way this view reads it, so it never shows a later slot of the same context.
     interest: Option<OverviewInterest>,
     /// The feed the values on screen came from. `None` for the waiting state.
     shown: Option<FeedId>,
+    /// Values taken down since the last frame: their links may still be under the pointer.
+    taken_down: Option<DashboardModel>,
     /// Stands in for the core's running feed.
     #[cfg(test)]
     test_current: Option<Option<FeedId>>,
@@ -110,6 +114,7 @@ impl DashboardView {
         let registered = interest.registered();
         view.feed.interest = Some(interest);
         view.feed.source = Some((model.downgrade(), cluster));
+        view.feed.generation = generation;
         // A feed already running changes nothing on the board when this view registers.
         view.feed._registered = Some(cx.spawn(async move |this, cx| {
             registered.await;
@@ -154,6 +159,7 @@ impl DashboardView {
             return;
         }
         self.feed.shown = None;
+        self.feed.taken_down = Some(self.model.clone());
         let cluster = self
             .feed
             .source
@@ -185,6 +191,21 @@ impl DashboardView {
         self.set_data(model, lists, cx);
     }
 
+    /// Whether `link`, drawn from this view's values, must not open: its feed has gone.
+    pub(in crate::ui) fn refuses_link(
+        &self,
+        link: impl Fn(&DashboardModel) -> bool,
+        cx: &App,
+    ) -> bool {
+        self.feed.taken_down.as_ref().is_some_and(&link)
+            || (link(&self.model) && !self.shows_current_feed(cx))
+    }
+
+    /// A new frame is on screen, so no click can come from the values taken down before it.
+    pub(super) fn frame_drawn(&mut self) {
+        self.feed.taken_down = None;
+    }
+
     /// Reads the feed off the UI thread, unless a read is running; then it reads again after.
     pub(in crate::ui) fn refresh(&mut self, cx: &mut Context<Self>) {
         self.clear_if_feed_gone(cx);
@@ -204,9 +225,7 @@ impl DashboardView {
         };
         let model = model.read(cx);
         // The workspace closes this view on a switch; until it does, nothing new is shown.
-        let Some(active) = model
-            .active_cluster()
-            .filter(|active| active.info.name == cluster)
+        let Some(active) = slot_to_read(model.active_cluster(), &cluster, self.feed.generation)
         else {
             return;
         };
@@ -238,6 +257,15 @@ impl DashboardView {
             });
         }));
     }
+}
+
+/// The active cluster's summary, if it describes the slot this view follows.
+pub(in crate::ui) fn slot_to_read<'a>(
+    active: Option<&'a ClusterSummary>,
+    cluster: &str,
+    generation: u64,
+) -> Option<&'a ClusterSummary> {
+    active.filter(|active| active.info.name == cluster && active.generation == generation)
 }
 
 #[cfg(test)]
