@@ -482,8 +482,9 @@ pub async fn connect(kubeconfig: &Kubeconfig, context: &str) -> Result<Client, C
     .map_err(|e| ClusterError::kube(e).for_target(&target))
 }
 
-/// Asked before a client's credential is prepared and before each attempt of each request,
-/// retries included. An `Err` stops the attempt before any credential is resolved or sent.
+/// Asked before a client's credential is prepared, before its program starts, and around the
+/// credential step of each attempt of each request, retries included. An `Err` stops the attempt
+/// before the credential is resolved or sent.
 #[derive(Clone)]
 pub struct SendCheck(
     std::sync::Arc<
@@ -501,8 +502,12 @@ impl SendCheck {
         SendCheck(std::sync::Arc::new(check))
     }
 
+    pub(crate) async fn refusal(&self) -> Result<(), String> {
+        (self.0)().await
+    }
+
     async fn holds(&self) -> Result<(), ClusterError> {
-        (self.0)().await.map_err(ClusterError::Kube)
+        self.refusal().await.map_err(ClusterError::Kube)
     }
 }
 
@@ -519,15 +524,24 @@ impl<B: Send + 'static> tower::filter::AsyncPredicate<http::Request<B>> for Send
     }
 }
 
-/// As [`connect`], with `check` asked before the credential is prepared, before the client is
-/// built, and before each attempt of each request the client sends.
+/// As [`connect`], with `check` asked before the credential is prepared, right before its program
+/// starts, before the client is built, and before and after the credential step of each attempt
+/// of each request the client sends.
 pub async fn connect_checked(
     kubeconfig: &Kubeconfig,
     context: &str,
     check: SendCheck,
 ) -> Result<Client, ClusterError> {
     check.holds().await?;
-    let ready = prepare(kubeconfig, context, &CredentialAccess::always()).await?;
+    let access = CredentialAccess::always_checked(check.clone());
+    let ready = match prepare(kubeconfig, context, &access).await {
+        Ok(ready) => ready,
+        // A check that stopped holding is the reason, whatever failed because of it.
+        Err(error) => {
+            check.holds().await?;
+            return Err(error);
+        }
+    };
     check.holds().await?;
     let target = ready.target;
     let (config, token) = (ready.config, ready.token);
@@ -829,6 +843,8 @@ fn build_observed_client(
         .option_layer(guarded.cloned().map(tower::filter::AsyncFilterLayer::new))
         .option_layer(auth.filter(|_| guarded.is_none()))
         .option_layer(token.map(crate::auth_plugin::TokenLayer::new))
+        // Again once the credential is resolved: that can wait for a refresh.
+        .option_layer(check.cloned().map(tower::filter::AsyncFilterLayer::new))
         .service(transport.clone());
     let service = ServiceBuilder::new()
         // Outermost, so it judges the path as asked for, before a server URL's prefix is added.
