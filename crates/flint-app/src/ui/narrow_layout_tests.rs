@@ -132,6 +132,27 @@ async fn the_access_mode_fits_the_minimum_width(cx: &mut TestAppContext) {
     assert_header_on_screen(cx, &t);
 }
 
+// #412: the longer limited label still fits beside the access mode and the watch mode.
+#[gpui_kit::test]
+async fn the_limited_namespace_label_fits_the_minimum_width(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, ROWS).await;
+    let mut limited = (*pods(ROWS)).clone();
+    limited.limited_to = Some(Arc::new(flint_core::NamespaceLimit {
+        listed: (0..12).map(|i| format!("team-{i:02}")).collect(),
+        denied: Vec::new(),
+        reason: "pods is forbidden".into(),
+        revisions: vec![1; 12],
+    }));
+    let list = t.list(cx).unwrap();
+    list.update(cx, |list, cx| list.set_snapshot(Arc::new(limited), cx));
+    t.wait_for_label(cx, "namespace-filter-button", "12 namespaces (limited)")
+        .await;
+    resize(cx, &t, 760., 480.);
+    assert_header_on_screen(cx, &t);
+}
+
 // #421: below the breakpoint the detail replaces the list, and Back (a click) returns to the
 // list with the row still selected and the detail still open behind it.
 #[gpui_kit::test]

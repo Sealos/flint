@@ -313,6 +313,47 @@ async fn a_re_pointed_context_names_both_servers(cx: &mut TestAppContext) {
     assert!(t.find(cx, "context-repointed").is_none());
 }
 
+// #412: with no filter, a list that fell back to the namespaces the account can read says so on
+// the button, whole. A chosen filter keeps its own text.
+#[gpui_kit::test]
+async fn the_namespace_button_says_when_the_list_is_limited(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    t.open_kind(cx, "pods", pods(ROWS)).await;
+    let mut limited = (*pods(&[("demo", "api", 0)])).clone();
+    limited.limited_to = Some(std::sync::Arc::new(flint_core::NamespaceLimit {
+        listed: vec!["demo".into()],
+        denied: Vec::new(),
+        reason: "pods is forbidden".into(),
+        revisions: vec![1],
+    }));
+    let list = t.list(cx).unwrap();
+    list.update(cx, |list, cx| {
+        list.set_snapshot(std::sync::Arc::new(limited), cx)
+    });
+    t.wait_for_label(cx, "namespace-filter-button", "1 namespace (limited)")
+        .await;
+    let drawn = cx
+        .update_window(t.window, |_, window, _| {
+            window.find("namespace-filter-button").bounds().size.width
+        })
+        .unwrap();
+    assert!(
+        drawn > gpui_kit::px(125.),
+        "the text is not cut short: {drawn:?}"
+    );
+
+    t.dispatch(
+        cx,
+        "workspace::ToggleNamespace",
+        json!({"namespace": "demo"}),
+    )
+    .unwrap();
+    t.wait_for_label(cx, "namespace-filter-button", "demo")
+        .await;
+}
+
 /// The workspace on the pods list, with `demo` in the filter so the picker has a namespace row.
 async fn open_with_picker_rows(cx: &mut TestAppContext, dir: &std::path::Path) -> TestWorkspace {
     let t = open_workspace(cx, dir).await;
