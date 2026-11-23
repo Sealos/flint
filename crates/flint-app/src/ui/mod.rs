@@ -126,6 +126,7 @@ pub fn run(boot: Bootstrap) {
         _ => None,
     };
     let ui_state = UiState::load(boot.config_dir.clone());
+    let settings_dir = boot.config_dir.clone();
     // A development and testing aid, for screenshots of both themes: `light` or `dark`, over the
     // `appearance` setting and macOS.
     let forced_appearance = match std::env::var("FLINT_APPEARANCE").as_deref() {
@@ -139,6 +140,7 @@ pub fn run(boot: Bootstrap) {
         .with_assets(icons::FlintAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            cx.set_global(workspace::SettingsDir(settings_dir.clone()));
             // The window is not open yet: start from the app's appearance; the workspace
             // follows the window's from then on.
             theme::init(

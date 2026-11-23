@@ -283,8 +283,9 @@ async fn a_row_resolves_to_its_own_cluster(cx: &mut TestAppContext) {
     let seen = events.clone();
     let _subscription = cx.update(|cx| {
         cx.subscribe(&list, move |_, event: &CombinedListEvent, _| {
-            let CombinedListEvent::Selected(id) = event;
-            seen.lock().unwrap().push(id.clone());
+            if let CombinedListEvent::Selected(id) = event {
+                seen.lock().unwrap().push(id.clone());
+            }
         })
     });
     cx.update_window(window, |_, window, cx| {

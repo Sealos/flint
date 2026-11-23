@@ -38,6 +38,11 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use super::list::combined::{
+    SelectCombinedRow, SortCombined, ToggleClusterFilter, ToggleClusterGroup, ToggleCombinedWide,
+    ToggleGroupByCluster,
+};
+
 actions!(
     flint,
     [
@@ -556,6 +561,42 @@ pub struct SetPaneWidth {
     pub width: f32,
 }
 
+actions!(
+    cluster_sets,
+    [
+        /// Start or stop choosing several clusters in the sidebar.
+        ToggleClusterPicking,
+        /// Run the clusters chosen in the sidebar as a set and open their combined list.
+        OpenPickedClusters,
+        /// Stop the running set and close its combined list.
+        CloseClusterSet
+    ]
+);
+
+/// Add a cluster to the sidebar's choice, or take it out.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = cluster_sets, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct TogglePickedCluster {
+    pub cluster: String,
+}
+
+/// Save the clusters chosen in the sidebar under a name.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = cluster_sets, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct SaveClusterSet {
+    pub name: String,
+}
+
+/// Run a saved set and open its combined list.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = cluster_sets, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct OpenClusterSet {
+    pub name: String,
+}
+
 /// Select the row of an object in the open list, as clicking it does.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
 #[action(namespace = resource_list, no_json)]
@@ -728,6 +769,10 @@ pub enum Scope {
     Navigation,
     /// The open resource list.
     List,
+    /// Choosing, saving and opening a set of clusters.
+    ClusterSets,
+    /// The open list over several clusters.
+    CombinedList,
     /// The detail pane.
     Detail,
     /// An open dialog (the Expose to AI confirmation).
@@ -1754,6 +1799,19 @@ const fn arg(name: &'static str, description: &'static str, kind: ArgKind) -> Ar
 }
 
 const CLUSTER: &[Arg] = &[arg("cluster", "kubeconfig context name", ArgKind::Cluster)];
+const SET_NAME: &[Arg] = &[arg("name", "the cluster set's name", ArgKind::Text)];
+const COMBINED_ROW: &[Arg] = &[
+    arg("cluster", "kubeconfig context name", ArgKind::Cluster),
+    arg("uid", "the object's uid", ArgKind::Text),
+];
+const COMBINED_COLUMN: &[Arg] = &[
+    arg("key", "the column's key", ArgKind::Text),
+    arg(
+        "occurrence",
+        "which column with that key, from 0",
+        ArgKind::Number,
+    ),
+];
 const CLUSTER_TAG: &[Arg] = &[
     arg("cluster", "kubeconfig context name", ArgKind::Cluster),
     arg(
@@ -2343,6 +2401,80 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             COLUMN,
         )
         .of(C::List, S::List),
+        // Cluster sets.
+        Spec::unit::<ToggleClusterPicking>(
+            "Choose Several Clusters",
+            "Start or stop choosing several clusters in the sidebar.",
+        )
+        .of(C::Cluster, S::ClusterSets),
+        Spec::with_args::<TogglePickedCluster>(
+            "Toggle Cluster in Choice…",
+            "Add a cluster to the sidebar's choice, or take it out.",
+            CLUSTER,
+        )
+        .of(C::Cluster, S::ClusterSets)
+        .hidden(),
+        Spec::unit::<OpenPickedClusters>(
+            "Open Chosen Clusters",
+            "Run the chosen clusters as a set and open their combined list.",
+        )
+        .of(C::Cluster, S::ClusterSets),
+        Spec::with_args::<SaveClusterSet>(
+            "Save Cluster Set…",
+            "Save the chosen clusters under a name.",
+            SET_NAME,
+        )
+        .of(C::Cluster, S::ClusterSets),
+        Spec::with_args::<OpenClusterSet>(
+            "Open Cluster Set…",
+            "Run a saved set and open its combined list.",
+            SET_NAME,
+        )
+        .of(C::Cluster, S::ClusterSets),
+        Spec::unit::<CloseClusterSet>(
+            "Close Cluster Set",
+            "Stop the running set and close its combined list.",
+        )
+        .of(C::Cluster, S::ClusterSets),
+        // The combined list.
+        Spec::with_args::<SelectCombinedRow>(
+            "Select Combined Row…",
+            "Select a row of the combined list by its cluster and uid.",
+            COMBINED_ROW,
+        )
+        .of(C::List, S::CombinedList)
+        .hidden(),
+        Spec::with_args::<SortCombined>(
+            "Sort Combined List…",
+            "Sort the combined list by a column.",
+            COMBINED_COLUMN,
+        )
+        .of(C::List, S::CombinedList)
+        .hidden(),
+        Spec::with_args::<ToggleClusterFilter>(
+            "Filter Combined List by Cluster…",
+            "Add a cluster to the combined list's filter, or take it out.",
+            CLUSTER,
+        )
+        .of(C::List, S::CombinedList)
+        .hidden(),
+        Spec::with_args::<ToggleClusterGroup>(
+            "Collapse Cluster Group…",
+            "Collapse or expand a cluster's group in the combined list.",
+            CLUSTER,
+        )
+        .of(C::List, S::CombinedList)
+        .hidden(),
+        Spec::unit::<ToggleGroupByCluster>(
+            "Group Combined List by Cluster",
+            "Turn grouping the combined list by cluster on or off.",
+        )
+        .of(C::List, S::CombinedList),
+        Spec::unit::<ToggleCombinedWide>(
+            "Toggle Wide Combined Columns",
+            "Show or hide the combined list's extra columns.",
+        )
+        .of(C::List, S::CombinedList),
         // Detail pane.
         Spec::unit::<Close>("Close Detail", "Close the detail pane.")
             .of(C::Detail, S::Detail)

@@ -401,6 +401,9 @@ impl DetailView {
         if let Some(why) = &self.sessions_blocked {
             return Some(why.clone());
         }
+        if let Some(why) = self.row_writes_paused() {
+            return Some(why.to_owned());
+        }
         if self.protected {
             return Some(protected_reason(&self.cluster_label));
         }
@@ -489,6 +492,11 @@ impl DetailView {
             _task: Task::ready(()),
         });
         cx.notify();
+    }
+
+    /// The handle this view's writes are reviewed through: bound to its member for a set's row.
+    pub(in crate::ui) fn write_core(&self) -> &flint_core::CoreHandle {
+        &self.core
     }
 
     fn edit_target(&self, detail: &ObjectDetail) -> WriteTarget {
