@@ -28,3 +28,4 @@ mod m3_writes;
 mod notifications;
 mod quit;
 mod support;
+mod window_close;
