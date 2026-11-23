@@ -19,11 +19,32 @@ FLINT_KWOK_MEMBERS=5 FLINT_KWOK_PODS=10000 \
 scripts/kwok-set.sh delete          # removes only this kubeconfig's five clusters
 ```
 
+The test runs in `WatchMode::All`, the default. `FLINT_KWOK_WATCH_MODE=on-view` selects the mode of the first
+measurement below.
+
 Safety: the script writes only to its own scratch kubeconfig, refuses `~/.kube/config` and `.dev/kubeconfig`, ignores
 the caller's `KUBECONFIG`, uses only the contexts it created and deletes only clusters with its own run prefix. The
 test (`crates/flint-core/tests/kwok_set.rs`) also refuses any other context name and any server not on `127.0.0.1`.
 
-## Method
+## Summary
+
+| 5 members, 10,000 pods each | `OnView` at `8713495b` | `All` with the feed at `2172951f` |
+|---|---|---|
+| All members synced after | 3.08 to 3.30 s | 3.52 to 3.57 s |
+| CPU for activation and initial lists | 620 to 666 ms | 2.07 to 2.33 s |
+| Footprint after churn | 44 MiB | 686 to 711 MiB |
+| CPU over 30 s idle | 7.27 to 7.95 ms | 72.74 to 103.05 ms |
+
+**Budgets.** Neither #447 nor this document sets a budget for a running set. The closest figures are the warm-cluster
+targets of [ADR-0012](../adr/0012-keep-recently-used-clusters-warm.md), planned in #247 and not implemented:
+
+- **Memory, exceeded if applied to a running set:** `warm_memory_mib` is 128 MiB for the background clusters. The
+  5-member footprint less the 1-cluster footprint is about 490 to 540 MiB for the four background members, roughly
+  four times that figure. The ADR's limit is on estimated store size, so this compares it with a footprint.
+- **CPU, within the target:** under 1% of one core with 3 idle warm clusters. Five idle members used 0.24 to 0.34%,
+  with no object changes during the idle window.
+
+## Method (`OnView`, first measurement)
 
 - **Environment:** Apple M4 Pro, 12 cores, 48 GiB; Docker on OrbStack with 31.4 GiB; kwokctl 0.8.0; Kubernetes
   v1.36.1; release build of the running set at `8713495b` plus the test.
@@ -41,7 +62,7 @@ test (`crates/flint-core/tests/kwok_set.rs`) also refuses any other context name
 **Noise:** other builds and test clusters ran on this machine throughout, with a load average of about 50 on 12 cores.
 Treat timings and CPU as noisy upper-range samples, not as a benchmark. Each column has three runs, in order.
 
-## Results
+## Results (`OnView`)
 
 | Measure | 1 cluster (10,000 pods) | 5-member set (50,000 pods) |
 |---|---|---|
@@ -65,11 +86,43 @@ memory in total (1.0 to 1.3 GiB per member, from one `docker stats` sample after
 An earlier 5-member run overlapped the script's final `report`, and another ran before the footprint was recorded.
 Both are left out of the table.
 
+## Results (`All`, with the telemetry feed)
+
+Release build of `2172951f` plus the mode switch in the test, with the same environment, clusters, churn and memory
+and CPU measures. Each member runs the kinds of mode All and a feed with 7 typed watches. "All members synced" now
+also waits until every feed reports all 7 kinds current. It does not wait for the other kinds of mode All, so some of
+their initial list cost can fall after that point.
+
+**Noise:** other builds and test clusters ran throughout. The 1-minute load average read between 15.6 and 34.7 on 12
+cores at the run boundaries. The `OnView` runs saw about 50, so differences in timing between the two tables are not
+precise. Each column has three runs, in order.
+
+| Measure | 1 cluster (10,000 pods) | 5-member set (50,000 pods) |
+|---|---|---|
+| Pod lists synced after | 449, 526, 797 ms | 3.17, 2.95, 2.96 s |
+| All members synced after | 1.05, 1.03, 1.04 s | 3.57, 3.52, 3.52 s |
+| CPU for activation and initial lists | 417, 409, 517 ms | 2.33, 2.10, 2.07 s |
+| Footprint when synced | 168, 169, 170 MiB | 659, 682, 665 MiB |
+| Footprint after 30 s idle | 168, 169, 170 MiB | 663, 711, 700 MiB |
+| Footprint after churn | 168, 169, 170 MiB | 686, 711, 700 MiB |
+| RSS when synced | 179, 180, 181 MiB | 618, 723, 713 MiB |
+| RSS after 30 s idle | 129, 106, 146 MiB | 520, 398, 369 MiB |
+| RSS after churn | 81, 80, 148 MiB | 403, 432, 412 MiB |
+| Peak RSS | 179, 180, 181 MiB | 618, 723, 713 MiB |
+| CPU over 30 s idle | 13.91, 11.03, 11.81 ms | 72.74, 103.05, 96.86 ms |
+| Label updates in the churn | 1,000 | 5,000 |
+| Churn seen after | 18.43, 19.76, 18.40 s | 18.81, 18.76, 18.56 s |
+| CPU during churn | 543, 525, 518 ms | 2.96, 3.05, 2.88 s |
+
+RSS before the core started was 9 MiB in every run. The footprint is about 15 times the `OnView` figure for the same
+set. These runs do not show how much of the increase comes from the feeds and how much from the other kinds of mode
+All, because both run together in this mode.
+
 ## Not measured
 
 - The GUI app, its rendering and frame times: this measures the core in a test process.
-- `WatchMode::All`: only the pods list of each member is watched.
+- The feed apart from the other watches of mode All.
 - Real clusters, where rows carry more labels and cell text and event rates differ.
 - Pod creation and deletion churn, relists, member failure and reconnects: the churn here is label updates only.
 - A quiet machine: no run was made without other builds running.
-- Set runtime changes after `8713495b`: these numbers were not repeated on later commits.
+- Set runtime changes after `2172951f`: these numbers were not repeated on later commits.

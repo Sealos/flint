@@ -16,6 +16,7 @@ use std::process::Command as Process;
 use std::time::{Duration, Instant};
 
 use flint_core::handle::{Command, CoreConfig, CoreHandle, MemberStatus, Subscription};
+use flint_core::telemetry::KindCheck;
 use flint_core::{KindId, KindSnapshot, Settings, SyncState, WatchMode, kubeconfig};
 
 const FIXTURE_LABEL: &str = "kwok.x-k8s.io/kwokctl-scale";
@@ -28,6 +29,16 @@ fn env_number(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
         .map_or(default, |v| v.parse().unwrap_or_else(|_| panic!("{name}")))
+}
+
+/// `FLINT_KWOK_WATCH_MODE`: `all`, the default and the only mode that runs the telemetry feeds
+/// without an overview, or `on-view`.
+fn watch_mode() -> WatchMode {
+    match std::env::var("FLINT_KWOK_WATCH_MODE").as_deref() {
+        Err(_) | Ok("all") => WatchMode::All,
+        Ok("on-view") => WatchMode::OnView,
+        Ok(other) => panic!("FLINT_KWOK_WATCH_MODE: {other}"),
+    }
 }
 
 /// The scratch kubeconfig, refused unless it is plainly not a real one.
@@ -188,6 +199,26 @@ async fn until(subscription: &mut Subscription, done: impl Fn(&KindSnapshot) -> 
     .expect("the member reached the state in time");
 }
 
+/// Waits until every member's feed has loaded and is watching all of its kinds.
+async fn until_feeds_current(core: &CoreHandle, contexts: &[String]) {
+    let current = |context: &String| {
+        core.telemetry(context).is_some_and(|feed| {
+            feed.snapshot
+                .kinds
+                .iter()
+                .all(|(_, check)| *check == KindCheck::Current)
+        })
+    };
+    let mut updates = core.telemetry_updates();
+    tokio::time::timeout(WAIT, async {
+        while !contexts.iter().all(current) {
+            assert!(updates.changed().await, "core stopped");
+        }
+    })
+    .await
+    .expect("every feed became current in time");
+}
+
 /// Labels `churn` fixture pods of one member with `value`, from child processes.
 fn start_churn(
     path: &Path,
@@ -232,6 +263,7 @@ async fn measure_running_set() {
     let member_count = env_number("FLINT_KWOK_MEMBERS", 5);
     let pods = env_number("FLINT_KWOK_PODS", 10_000);
     let churn = env_number("FLINT_KWOK_CHURN", 1000);
+    let mode = watch_mode();
     let contexts = member_contexts(&path, member_count);
     let dir = tempfile::tempdir().unwrap();
 
@@ -239,7 +271,7 @@ async fn measure_running_set() {
     let core = CoreHandle::start(CoreConfig {
         config_dir: dir.path().join("config"),
         settings: Settings {
-            watch_mode: WatchMode::OnView,
+            watch_mode: mode,
             ..Settings::default()
         },
         settings_error: None,
@@ -268,6 +300,10 @@ async fn measure_running_set() {
             s.state == SyncState::Synced && fixture_rows(s) >= pods
         })
         .await;
+    }
+    let lists_synced_after = started.elapsed();
+    if mode == WatchMode::All {
+        until_feeds_current(&core, &contexts).await;
     }
     let synced_after = started.elapsed();
     let cpu_sync = cpu_time() - cpu_start;
@@ -310,6 +346,8 @@ async fn measure_running_set() {
     eprintln!("--- kwok running set ---");
     eprintln!("members: {member_count}");
     eprintln!("fixture pods per member: {pods}; rows held: {rows}");
+    eprintln!("watch mode: {mode:?}");
+    eprintln!("pod lists synced after: {lists_synced_after:.2?}");
     eprintln!("all members synced after: {synced_after:.2?}");
     eprintln!("CPU for activation and initial lists: {cpu_sync:.2?}");
     eprintln!("RSS before start: {rss_idle:.0} MiB");
