@@ -67,6 +67,15 @@ exe=$app/Contents/MacOS/flint
 cmp -s "$app/Contents/Resources/LICENSE" "$repo/LICENSE" || fail "Flint.app has no Contents/Resources/LICENSE"
 cmp -s "$app/Contents/Resources/LICENSE-LUCIDE" "$repo/crates/flint-app/assets/icons/LICENSE-LUCIDE" ||
   fail "Flint.app has no Contents/Resources/LICENSE-LUCIDE"
+# Release builds set THIRD_PARTY_NOTICES to the file that must be inside.
+if [ -n "${THIRD_PARTY_NOTICES:-}" ]; then
+  [ -s "$THIRD_PARTY_NOTICES" ] || fail "no notices at $THIRD_PARTY_NOTICES"
+  cmp -s "$app/Contents/Resources/THIRD-PARTY-NOTICES.txt" "$THIRD_PARTY_NOTICES" ||
+    fail "Flint.app has no matching Contents/Resources/THIRD-PARTY-NOTICES.txt"
+  [ -s "${RUST_LIBRARY_NOTICES:-}" ] || fail "RUST_LIBRARY_NOTICES names no file"
+  cmp -s "$app/Contents/Resources/COPYRIGHT-library.html" "$RUST_LIBRARY_NOTICES" ||
+    fail "Flint.app has no matching Contents/Resources/COPYRIGHT-library.html"
+fi
 
 plist=$app/Contents/Info.plist
 plutil -lint "$plist" || fail "Info.plist does not parse"
