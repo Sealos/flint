@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::watch;
 
+use crate::cluster::SendCheck;
 use crate::credential::CredentialSource;
 
 /// What a connection is to the app right now.
@@ -85,6 +86,8 @@ impl CredentialPolicy for ForegroundOnly {
 pub(crate) struct CredentialAccess {
     policy: Arc<dyn CredentialPolicy>,
     role: Arc<watch::Sender<RoleState>>,
+    /// Asked right before a credential's program starts, for a caller whose answer takes a wait.
+    launch_check: Option<SendCheck>,
 }
 
 impl CredentialAccess {
@@ -93,15 +96,20 @@ impl CredentialAccess {
         CredentialAccess {
             policy,
             role: Arc::new(role),
+            launch_check: None,
         }
     }
 
     /// [`AlwaysAllow`], for a connection in the foreground.
     pub(crate) fn always() -> Self {
-        let (role, _) = watch::channel(RoleState::new(Role::Foreground));
+        Self::new(Arc::new(AlwaysAllow), Role::Foreground)
+    }
+
+    /// [`Self::always`], with `check` asked right before a credential's program starts.
+    pub(crate) fn always_checked(check: SendCheck) -> Self {
         CredentialAccess {
-            policy: Arc::new(AlwaysAllow),
-            role: Arc::new(role),
+            launch_check: Some(check),
+            ..Self::always()
         }
     }
 
@@ -223,6 +231,14 @@ impl CredentialLease {
     /// after this check finds `start` already begun, and [`Self::revoked`] then ends what it began.
     pub(crate) fn start_if_held<T>(&self, start: impl FnOnce() -> T) -> Option<T> {
         self.holds().then(start)
+    }
+
+    /// Why the credential's program must not start now, if the access has a check that says so.
+    pub(crate) async fn launch_refusal(&self) -> Option<String> {
+        match &self.grant.access.launch_check {
+            Some(check) => check.refusal().await.err(),
+            None => None,
+        }
     }
 
     /// Whether the credential behind this can be stopped by a role at all.
