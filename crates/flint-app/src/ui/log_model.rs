@@ -463,7 +463,7 @@ impl LineHighlights {
     }
 }
 
-/// [`shown_line`] with the matches from `find`, which is given the short source label when it is
+/// `shown_line` with the matches from `find`, which is given the short source label when it is
 /// shown. Matches in the message are clipped to the part of it drawn.
 pub fn shown_line_with(
     line: &LogLine,
