@@ -53,7 +53,12 @@ if [ -n "${THIRD_PARTY_NOTICES:-}" ]; then
     echo "error: the AppImage has no matching usr/share/doc/flint/THIRD-PARTY-NOTICES.txt" >&2
     exit 1
   fi
-  echo "notices: THIRD-PARTY-NOTICES.txt"
+  if [ ! -s "${RUST_LIBRARY_NOTICES:-}" ] ||
+    ! cmp -s "$scratch/squashfs-root/usr/share/doc/flint/COPYRIGHT-library.html" "$RUST_LIBRARY_NOTICES"; then
+    echo "error: the AppImage has no matching usr/share/doc/flint/COPYRIGHT-library.html" >&2
+    exit 1
+  fi
+  echo "notices: THIRD-PARTY-NOTICES.txt, COPYRIGHT-library.html"
 fi
 
 mkdir -p "$scratch/config"

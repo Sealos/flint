@@ -34,7 +34,12 @@ if [ -n "${THIRD_PARTY_NOTICES:-}" ]; then
     echo "error: the archive has no matching flint-mcp/THIRD-PARTY-NOTICES.txt" >&2
     exit 1
   fi
-  echo "archive: THIRD-PARTY-NOTICES.txt"
+  if [ ! -s "${RUST_LIBRARY_NOTICES:-}" ] ||
+    ! cmp -s "$scratch/flint-mcp/COPYRIGHT-library.html" "$RUST_LIBRARY_NOTICES"; then
+    echo "error: the archive has no matching flint-mcp/COPYRIGHT-library.html" >&2
+    exit 1
+  fi
+  echo "archive: THIRD-PARTY-NOTICES.txt, COPYRIGHT-library.html"
 fi
 
 got=$("$binary" --version)

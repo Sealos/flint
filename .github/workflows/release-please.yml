@@ -149,6 +149,7 @@ jobs:
       TAG: ${{ needs.release-please.outputs.tag_name }}
       VERSION: ${{ needs.release-please.outputs.version }}
       THIRD_PARTY_NOTICES: dist-notices/THIRD-PARTY-NOTICES.txt
+      RUST_LIBRARY_NOTICES: dist-notices/COPYRIGHT-library.html
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -163,6 +164,9 @@ jobs:
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # The rustc component ships it, so it comes from the toolchain that builds this job's binary.
+      - name: Copy the Rust standard library notices
+        run: cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" "$RUST_LIBRARY_NOTICES"
       - name: Build arm64
         run: cargo build --release --locked -p flint-app --target aarch64-apple-darwin
       - name: Build x86_64
@@ -180,12 +184,13 @@ jobs:
             target/x86_64-apple-darwin/release/flint
           lipo -info dist/flint/flint
           test "$(dist/flint/flint --version)" = "flint $VERSION"
-          cp LICENSE README.md crates/flint-app/assets/icons/LICENSE-LUCIDE "$THIRD_PARTY_NOTICES" dist/flint/
+          cp LICENSE README.md crates/flint-app/assets/icons/LICENSE-LUCIDE "$THIRD_PARTY_NOTICES" "$RUST_LIBRARY_NOTICES" dist/flint/
       - name: Package
         run: |
           ARCHIVE="flint-${TAG}-macos-universal.tar.gz"
           tar -czf "$ARCHIVE" -C dist flint
           tar -xzOf "$ARCHIVE" flint/THIRD-PARTY-NOTICES.txt | cmp - "$THIRD_PARTY_NOTICES"
+          tar -xzOf "$ARCHIVE" flint/COPYRIGHT-library.html | cmp - "$RUST_LIBRARY_NOTICES"
           shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
       # The same universal binary as Flint.app (ad-hoc signed until #25) in a drag-to-Applications
@@ -236,6 +241,7 @@ jobs:
       TAG: ${{ needs.release-please.outputs.tag_name }}
       VERSION: ${{ needs.release-please.outputs.version }}
       THIRD_PARTY_NOTICES: dist-notices/THIRD-PARTY-NOTICES.txt
+      RUST_LIBRARY_NOTICES: dist-notices/COPYRIGHT-library.html
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -251,6 +257,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.arch }}
+      # The rustc component ships it, so it comes from the toolchain that builds this job's binary.
+      - name: Copy the Rust standard library notices
+        run: cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" "$RUST_LIBRARY_NOTICES"
       - name: Release build
         run: cargo build --release --locked -p flint-app
       # On the ELF binary, before the AppImage compresses it (docs/TESTING.md).
@@ -268,7 +277,7 @@ jobs:
       # Again with only the host packages the README documents (see ci.yml).
       - name: Smoke test in a clean Ubuntu 24.04
         run: |
-          docker run --rm -v "$PWD:/w:ro" -w /w -e APPIMAGE -e VERSION -e THIRD_PARTY_NOTICES -e DEBIAN_FRONTEND=noninteractive \
+          docker run --rm -v "$PWD:/w:ro" -w /w -e APPIMAGE -e VERSION -e THIRD_PARTY_NOTICES -e RUST_LIBRARY_NOTICES-e DEBIAN_FRONTEND=noninteractive \
             ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8 \
             bash -c 'apt-get update -qq &&
               grep -v "^#" packaging/linux/ubuntu-runtime-packages.txt |
@@ -308,6 +317,7 @@ jobs:
       VERSION: ${{ needs.release-please.outputs.version }}
       ARCH: ${{ matrix.arch }}
       THIRD_PARTY_NOTICES: dist-notices/THIRD-PARTY-NOTICES.txt
+      RUST_LIBRARY_NOTICES: dist-notices/COPYRIGHT-library.html
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -327,6 +337,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: mcp-${{ matrix.arch }}
+      # The rustc component ships it, so it comes from the toolchain that builds this job's binary.
+      - name: Copy the Rust standard library notices
+        run: cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" "$RUST_LIBRARY_NOTICES"
       - name: Build and package
         run: |
           scripts/package-mcp-linux.sh "$ARCH" "$VERSION" | tee package.log
@@ -337,7 +350,7 @@ jobs:
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
       - name: Smoke test in a clean Ubuntu 22.04
         run: |
-          docker run --rm -v "$PWD:/w:ro" -w /w -e ARCHIVE -e VERSION -e THIRD_PARTY_NOTICES \
+          docker run --rm -v "$PWD:/w:ro" -w /w -e ARCHIVE -e VERSION -e THIRD_PARTY_NOTICES -e RUST_LIBRARY_NOTICES\
             ubuntu:22.04@sha256:f64b2ffc2f10ab8f8505aa56b2664bd846cbb9df87c7e2532e30f7667021c0e6 \
             scripts/smoke-mcp-linux.sh "$ARCHIVE" "$VERSION"
       - name: MCP e2e in a clean Ubuntu 22.04

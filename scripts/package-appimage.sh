@@ -121,6 +121,8 @@ install -Dm644 "$runtime_license" "$appdir/usr/share/doc/appimage-runtime/LICENS
 if [ -n "${THIRD_PARTY_NOTICES:-}" ]; then
   [ -s "$THIRD_PARTY_NOTICES" ] || { echo "error: no notices at $THIRD_PARTY_NOTICES" >&2; exit 1; }
   install -Dm644 "$THIRD_PARTY_NOTICES" "$appdir/usr/share/doc/flint/THIRD-PARTY-NOTICES.txt"
+  [ -s "${RUST_LIBRARY_NOTICES:-}" ] || { echo "error: RUST_LIBRARY_NOTICES names no file" >&2; exit 1; }
+  install -Dm644 "$RUST_LIBRARY_NOTICES" "$appdir/usr/share/doc/flint/COPYRIGHT-library.html"
 fi
 
 # The binary must be called flint: the desktop file's Exec and the AppRun link point at it.

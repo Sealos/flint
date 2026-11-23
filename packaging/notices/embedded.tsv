@@ -1,0 +1,35 @@
+# License-like files below a crate's root, audited per release. Bound to the Cargo.lock checksum.
+# name	version	checksum	path	action	reason
+cosmic-text	0.19.0	be17b688510d934ce13f48a2beba700e11583e281e0fda99c22bb256a14eda73	fonts/FiraMono-LICENSE	include	bundled font license
+cosmic-text	0.19.0	be17b688510d934ce13f48a2beba700e11583e281e0fda99c22bb256a14eda73	fonts/Inter-LICENSE	include	bundled font license
+cosmic-text	0.19.0	be17b688510d934ce13f48a2beba700e11583e281e0fda99c22bb256a14eda73	fonts/NotoSans-LICENSE	include	bundled font license
+fontdb	0.23.0	457e789b3d1202543297a350643cf459f836cade38934e7a4cf6a39e7cde2905	tests/fonts/LICENSE.txt	exclude	test fixture
+freetype-sys	0.20.1	0e7edc5b9669349acfda99533e9e0bcf26a51862ab43b08ee7745c55d28eb134	freetype2/LICENSE.TXT	include	bundled FreeType
+freetype-sys	0.20.1	0e7edc5b9669349acfda99533e9e0bcf26a51862ab43b08ee7745c55d28eb134	freetype2/docs/FTL.TXT	include	FreeType license named by LICENSE.TXT
+freetype-sys	0.20.1	0e7edc5b9669349acfda99533e9e0bcf26a51862ab43b08ee7745c55d28eb134	freetype2/src/tools/no-copyright	exclude	maintainer tool
+freetype-sys	0.20.1	0e7edc5b9669349acfda99533e9e0bcf26a51862ab43b08ee7745c55d28eb134	freetype2/src/tools/update-copyright	exclude	maintainer tool
+freetype-sys	0.20.1	0e7edc5b9669349acfda99533e9e0bcf26a51862ab43b08ee7745c55d28eb134	freetype2/src/tools/update-copyright-year	exclude	maintainer tool
+markup5ever_rcdom	0.3.0	edaa21ab3701bfee5099ade5f7e1f84553fd19228cf332f13cd6e964bf59be18	xml5lib-tests/LICENSE	exclude	test data
+markup5ever_rcdom	0.3.0	edaa21ab3701bfee5099ade5f7e1f84553fd19228cf332f13cd6e964bf59be18	html5lib-tests/LICENSE	exclude	test data
+markup5ever_rcdom	0.3.0	edaa21ab3701bfee5099ade5f7e1f84553fd19228cf332f13cd6e964bf59be18	html5lib-tests/lint_lib/_vendor/funcparserlib/LICENSE	exclude	test tooling
+regex-syntax	0.8.12	d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6	src/unicode_tables/LICENSE-UNICODE	include	Unicode data tables
+ring	0.17.14	a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7	third_party/fiat/LICENSE	include	bundled fiat-crypto code
+ring	0.17.14	a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7	src/polyfill/once_cell/LICENSE-APACHE	include	bundled once_cell code
+ring	0.17.14	a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7	src/polyfill/once_cell/LICENSE-MIT	include	bundled once_cell code
+rustybuzz	0.20.1	fd3c7c96f8a08ee34eff8857b11b49b07d71d1c3f4e88f8a88d4c9e9f90b1702	scripts/ms-use/COPYING	include	source of generated tables
+security-framework	3.7.0	b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d	THIRD_PARTY	include	third-party notice
+tiff	0.11.3	b63feaf3343d35b6ca4d50483f94843803b0f51634937cc2ec519fc32232bc52	tests/COPYRIGHT	exclude	test images
+tracing-core	0.1.36	db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a	src/spin/LICENSE	include	bundled spin code
+tree-sitter	0.26.13	17ebdd3a5a7e28a1890b876fdbd0c3c0fe0a6336cffaa104f11b9f720c9daa29	src/unicode/LICENSE	include	bundled ICU headers
+ttf-parser	0.25.1	d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31	tests/fonts/colr_1_LICENSE	exclude	test font
+wayland-protocols-plasma	0.3.12	2b6d8cf1eb2c1c31ed1f5643c88a6e53538129d4af80030c8cabd1f9fa884d91	plasma-wayland-protocols/COPYING.LIB	include	protocol definitions
+wayland-protocols	0.32.13	23d0c813de3daa2ed6520af85a3bd49b0e722a3078506899aa9686fea58dc4b6	protocols/COPYING	include	protocol definitions
+wayland-protocols-plasma	0.3.12	2b6d8cf1eb2c1c31ed1f5643c88a6e53538129d4af80030c8cabd1f9fa884d91	plasma-wayland-protocols/LICENSES/BSD-3-Clause.txt	include	protocol definitions
+wayland-protocols-plasma	0.3.12	2b6d8cf1eb2c1c31ed1f5643c88a6e53538129d4af80030c8cabd1f9fa884d91	plasma-wayland-protocols/LICENSES/CC0-1.0.txt	include	protocol definitions
+wayland-protocols-plasma	0.3.12	2b6d8cf1eb2c1c31ed1f5643c88a6e53538129d4af80030c8cabd1f9fa884d91	plasma-wayland-protocols/LICENSES/LGPL-2.1-or-later.txt	include	protocol definitions
+wayland-protocols-plasma	0.3.12	2b6d8cf1eb2c1c31ed1f5643c88a6e53538129d4af80030c8cabd1f9fa884d91	plasma-wayland-protocols/LICENSES/MIT-CMU.txt	include	protocol definitions
+wayland-protocols-plasma	0.3.12	2b6d8cf1eb2c1c31ed1f5643c88a6e53538129d4af80030c8cabd1f9fa884d91	plasma-wayland-protocols/LICENSES/MIT.txt	include	protocol definitions
+granit-parser	2.2.0	9bd04d0d9c7079b416b458d2317aea4aa964c81938cb7c20f559758c4f422dc8	.licenses/ChenYuheng-Apache	license	inherited notice named by LICENSE
+granit-parser	2.2.0	9bd04d0d9c7079b416b458d2317aea4aa964c81938cb7c20f559758c4f422dc8	.licenses/ChenYuheng-MIT	license	inherited notice named by LICENSE
+granit-parser	2.2.0	9bd04d0d9c7079b416b458d2317aea4aa964c81938cb7c20f559758c4f422dc8	.licenses/Ethiraric-Apache	license	inherited notice named by LICENSE
+granit-parser	2.2.0	9bd04d0d9c7079b416b458d2317aea4aa964c81938cb7c20f559758c4f422dc8	.licenses/Ethiraric-MIT	license	inherited notice named by LICENSE

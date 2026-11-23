@@ -63,6 +63,8 @@ install -m 644 "$repo/crates/flint-app/assets/icons/LICENSE-LUCIDE" "$app/Conten
 if [ -n "${THIRD_PARTY_NOTICES:-}" ]; then
   [ -s "$THIRD_PARTY_NOTICES" ] || { echo "error: no notices at $THIRD_PARTY_NOTICES" >&2; exit 1; }
   install -m 644 "$THIRD_PARTY_NOTICES" "$app/Contents/Resources/THIRD-PARTY-NOTICES.txt"
+  [ -s "${RUST_LIBRARY_NOTICES:-}" ] || { echo "error: RUST_LIBRARY_NOTICES names no file" >&2; exit 1; }
+  install -m 644 "$RUST_LIBRARY_NOTICES" "$app/Contents/Resources/COPYRIGHT-library.html"
 fi
 sed "s/@VERSION@/$version/g" "$repo/packaging/macos/Info.plist" >"$app/Contents/Info.plist"
 printf 'APPL????' >"$app/Contents/PkgInfo"

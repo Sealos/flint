@@ -72,6 +72,9 @@ if [ -n "${THIRD_PARTY_NOTICES:-}" ]; then
   [ -s "$THIRD_PARTY_NOTICES" ] || fail "no notices at $THIRD_PARTY_NOTICES"
   cmp -s "$app/Contents/Resources/THIRD-PARTY-NOTICES.txt" "$THIRD_PARTY_NOTICES" ||
     fail "Flint.app has no matching Contents/Resources/THIRD-PARTY-NOTICES.txt"
+  [ -s "${RUST_LIBRARY_NOTICES:-}" ] || fail "RUST_LIBRARY_NOTICES names no file"
+  cmp -s "$app/Contents/Resources/COPYRIGHT-library.html" "$RUST_LIBRARY_NOTICES" ||
+    fail "Flint.app has no matching Contents/Resources/COPYRIGHT-library.html"
 fi
 
 plist=$app/Contents/Info.plist
