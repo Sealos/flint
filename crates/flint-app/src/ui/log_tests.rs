@@ -1011,7 +1011,7 @@ async fn esc_clears_the_search_then_leaves_it_and_never_closes_the_detail(cx: &m
 // shows: a copy replaces the selection hint, and times out.
 #[gpui_kit::test]
 async fn the_toolbar_is_one_row_and_notices_replace_each_other(cx: &mut TestAppContext) {
-    for width in [1280., 860., 760., 470.] {
+    for width in [1280., 980., 860., 760., 470.] {
         let (core, _dir) = core();
         let (window, view) = open_sized(cx, core, workload_request(), width);
         let mut buffer = LogBuffer::new(1000);
