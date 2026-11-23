@@ -369,6 +369,15 @@ impl WriteCredential {
         CredentialId(Arc::downgrade(&self.0))
     }
 
+    /// The bytes of the certificate or key file at `path`, only while it still holds what this
+    /// connection was built from. Blocks on the file system.
+    pub(crate) fn held_file_bytes(&self, path: &Path) -> Option<Vec<u8>> {
+        let file = self.0.files.iter().find(|file| file.path == path)?;
+        let held = file.held?;
+        let now = read_file(path).ok()?;
+        (digest_of(&now)?.0 == held.0.0).then_some(now)
+    }
+
     /// Whether this connection's credential can start a program, whatever the kubeconfig says now.
     pub(crate) fn runs_a_command(&self) -> bool {
         self.0.grant.runs_a_command()

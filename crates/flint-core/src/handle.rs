@@ -18,6 +18,7 @@ use crate::cluster::{ClusterId, ServerVersion};
 use crate::credential::WriteCredential;
 use crate::discovery::ClusterDiscovery;
 use crate::exec::{ContextCheck, ContextWatch, ExecRequest, ExecSession, LaunchCheck};
+use crate::helm::{HelmError, HelmOutput, HelmPin, HelmQuery, HelmTarget};
 use crate::kubeconfig::ContextInfo;
 use crate::logs::{
     Freshness, LogFilter, LogLines, LogOptions, LogSearch, LogSnapshot, LogSubject, LogTarget,
@@ -423,6 +424,14 @@ pub(crate) enum Request {
         cluster: ClusterId,
         pin: ContextPin,
         reply: oneshot::Sender<Option<String>>,
+    },
+    /// What a `helm` run on `cluster` is held to, if it may run: at `pin`, or at the context's
+    /// definition now for a view opening.
+    HelmTarget {
+        cluster: ClusterId,
+        pin: Option<ContextPin>,
+        member: Option<AdmittedMember>,
+        reply: oneshot::Sender<Result<HelmTarget, HelmError>>,
     },
 }
 
@@ -1231,6 +1240,59 @@ impl CoreHandle {
             crate::exec::start(client, request, channels).await;
         });
         session
+    }
+
+    /// What a `helm` run on `cluster` would be held to, in one step with checking it may run.
+    fn helm_target(
+        &self,
+        cluster: &str,
+        pin: Option<ContextPin>,
+    ) -> impl Future<Output = Result<HelmTarget, HelmError>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let sent = self.requests.try_send(Request::HelmTarget {
+            cluster: cluster.to_owned(),
+            pin,
+            member: self.bound.as_deref().cloned(),
+            reply,
+        });
+        async move {
+            if sent.is_err() {
+                return Err(HelmError::Stopped);
+            }
+            rx.await.unwrap_or(Err(HelmError::Stopped))
+        }
+    }
+
+    /// Pins a Helm view to `cluster`'s definition now: refused unless it is connected, settled
+    /// and its credential runs no program.
+    pub fn helm_pin(
+        &self,
+        cluster: &str,
+    ) -> impl Future<Output = Result<HelmPin, HelmError>> + Send + 'static {
+        let target = self.helm_target(cluster, None);
+        async move { target.await.map(|target| HelmPin(target.pin)) }
+    }
+
+    /// Runs one read-only `helm` query on `cluster`, only while it is still the definition `pin`
+    /// was taken on, checked before the run and again before its answer is given. Dropping the
+    /// future ends the run. Works on any executor.
+    pub fn helm_read(
+        &self,
+        cluster: &str,
+        pin: &HelmPin,
+        query: HelmQuery,
+    ) -> impl Future<Output = Result<HelmOutput, HelmError>> + Send + 'static {
+        let target = self.helm_target(cluster, Some(pin.0.clone()));
+        let after = self.clone();
+        let cluster = cluster.to_owned();
+        let pin = pin.0.clone();
+        let run = spawn_aborting(&self.runtime, async move {
+            let target = target.await?;
+            let output = crate::helm::run(&target, &query).await?;
+            after.helm_target(&cluster, Some(pin)).await?;
+            Ok(output)
+        });
+        async move { run.await.unwrap_or(Err(HelmError::Stopped)) }
     }
 
     /// The client for an action that changes `cluster` or runs code in it, with the context's

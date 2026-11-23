@@ -93,6 +93,11 @@ impl ContextPin {
         self.server.as_deref()
     }
 
+    /// The hash of the whole definition when pinned ([`crate::cluster::context_fingerprint`]).
+    pub fn definition(&self) -> Option<u64> {
+        self.definition
+    }
+
     /// A pin that matches no context's confirmed definition.
     pub fn stale() -> Self {
         ContextPin {

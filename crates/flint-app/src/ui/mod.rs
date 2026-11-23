@@ -31,6 +31,7 @@ mod dock_model;
 #[cfg(test)]
 mod dock_tests;
 mod focus;
+mod helm_view;
 mod icons;
 mod keep_watching;
 mod list;

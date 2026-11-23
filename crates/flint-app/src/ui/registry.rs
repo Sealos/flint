@@ -394,6 +394,40 @@ pub struct ShowAgentActivity {
     pub cluster: String,
 }
 
+/// Show a cluster's Helm releases, read-only, in a dock tab: details, history, values with
+/// secrets masked, and the manifest.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = workspace, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct ShowHelmReleases {
+    pub cluster: String,
+}
+
+/// Select a release in the Helm releases tab shown, as clicking it does.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = workspace, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct SelectHelmRelease {
+    pub namespace: String,
+    pub name: String,
+}
+
+actions!(
+    workspace,
+    [
+        /// Read the releases in the Helm releases tab again.
+        RefreshHelmReleases,
+        /// Show the selected Helm release's details.
+        ShowHelmDetails,
+        /// Show the selected Helm release's history.
+        ShowHelmHistory,
+        /// Show the selected Helm release's values, with secrets masked.
+        ShowHelmValues,
+        /// Show the selected Helm release's manifest, with secrets masked.
+        ShowHelmManifest,
+    ]
+);
+
 actions!(
     ai_scope,
     [
@@ -1959,6 +1993,10 @@ const ROW: &[Arg] = &[
     },
     arg("name", "object name", ArgKind::Text),
 ];
+const HELM_RELEASE: &[Arg] = &[
+    arg("namespace", "the release's namespace", ArgKind::Namespace),
+    arg("name", "release name", ArgKind::Text),
+];
 const COLUMN: &[Arg] = &[
     arg("column", "column name, as drawn: Restarts", ArgKind::Column),
     Arg {
@@ -2228,6 +2266,38 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Show Agent Activity…",
             "See every call AI agents made to Flint's MCP server on a cluster, as they make them.",
             CLUSTER,
+        )
+        .of(C::Cluster, S::Workspace),
+        Spec::with_args::<ShowHelmReleases>(
+            "Show Helm Releases…",
+            "See a cluster's Helm releases: details, history, masked values and manifest.",
+            CLUSTER,
+        )
+        .of(C::Cluster, S::Workspace),
+        Spec::with_args::<SelectHelmRelease>(
+            "Select Helm Release…",
+            "Select a release in the Helm releases tab.",
+            HELM_RELEASE,
+        )
+        .of(C::Cluster, S::Workspace)
+        .hidden(),
+        Spec::unit::<RefreshHelmReleases>(
+            "Refresh Helm Releases",
+            "Read the releases in the Helm releases tab again.",
+        )
+        .of(C::Cluster, S::Workspace),
+        Spec::unit::<ShowHelmDetails>("Show Helm Details", "Show the selected release's details.")
+            .of(C::Cluster, S::Workspace),
+        Spec::unit::<ShowHelmHistory>("Show Helm History", "Show the selected release's history.")
+            .of(C::Cluster, S::Workspace),
+        Spec::unit::<ShowHelmValues>(
+            "Show Helm Values",
+            "Show the selected release's values, with secrets masked.",
+        )
+        .of(C::Cluster, S::Workspace),
+        Spec::unit::<ShowHelmManifest>(
+            "Show Helm Manifest",
+            "Show the selected release's manifest, with secrets masked.",
         )
         .of(C::Cluster, S::Workspace),
         Spec::unit::<ScopeAllNamespaces>(

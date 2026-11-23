@@ -37,6 +37,7 @@ use crate::watch::{ClusterWatches, EngineConfig, HubRegistry, KubeSource};
 use crate::write::WriteError;
 
 mod file_watch;
+mod helm;
 mod keep_watching;
 mod running_set;
 mod selected_retry;
@@ -944,6 +945,14 @@ impl ClusterManager {
             }
             Request::CheckMember { member, reply } => {
                 let _ = reply.send(self.member_changed(&member));
+            }
+            Request::HelmTarget {
+                cluster,
+                pin,
+                member,
+                reply,
+            } => {
+                let _ = reply.send(self.helm_target(&cluster, pin, member.as_ref()));
             }
             Request::MemberClient { member, reply } => {
                 let _ = reply.send(self.member_client(&member));
