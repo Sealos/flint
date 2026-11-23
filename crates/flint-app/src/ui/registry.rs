@@ -38,6 +38,10 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use super::compare::COMPARE_VIEW;
+pub use super::compare::{
+    CompareObject, OpenCompare, RefreshCompare, ToggleCompareSame, ToggleCompareVolatile,
+};
 use super::list::combined::{
     SelectCombinedRow, SortCombined, ToggleClusterFilter, ToggleClusterGroup, ToggleCombinedWide,
     ToggleGroupByCluster,
@@ -783,6 +787,8 @@ pub enum Scope {
     Logs,
     /// The shell tab shown in the dock.
     Terminal,
+    /// The compare tab shown in the dock.
+    Compare,
     /// The open command palette.
     Palette,
     /// The focused text field (gpui-component's own actions: Cut, Copy, Paste, Select All).
@@ -1799,6 +1805,17 @@ const fn arg(name: &'static str, description: &'static str, kind: ArgKind) -> Ar
 }
 
 const CLUSTER: &[Arg] = &[arg("cluster", "kubeconfig context name", ArgKind::Cluster)];
+const COMPARE_OBJECT: &[Arg] = &[
+    arg("cluster", "kubeconfig context name", ArgKind::Cluster),
+    arg("kind", "the kind, as plural or plural.group", ArgKind::Text),
+    Arg {
+        name: "namespace",
+        description: "the object's namespace",
+        required: false,
+        kind: ArgKind::Namespace,
+    },
+    arg("name", "the object's name", ArgKind::Text),
+];
 const SET_NAME: &[Arg] = &[arg("name", "the cluster set's name", ArgKind::Text)];
 const COMBINED_ROW: &[Arg] = &[
     arg("cluster", "kubeconfig context name", ArgKind::Cluster),
@@ -2593,6 +2610,28 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Open what the latest drain did, also when it stopped early.",
         )
         .of(C::Detail, S::Workspace),
+        Spec::unit::<OpenCompare>(
+            "Compare Across Clusters",
+            "Compare the selected object across the connected clusters. Read-only.",
+        )
+        .of(C::Detail, S::Workspace),
+        Spec::with_args::<CompareObject>(
+            "Compare Object Across Clusters…",
+            "Compare one exact object across the connected clusters. Read-only.",
+            COMPARE_OBJECT,
+        )
+        .of(C::Detail, S::Workspace)
+        .hidden(),
+        Spec::unit::<RefreshCompare>("Refresh Comparison", "Read the compared object again.")
+            .of(C::Detail, S::Compare)
+            .keys(&["secondary-r"], Some(COMPARE_VIEW)),
+        Spec::unit::<ToggleCompareSame>("Toggle Matching Fields", "Show the fields that match.")
+            .of(C::Detail, S::Compare),
+        Spec::unit::<ToggleCompareVolatile>(
+            "Toggle Cluster-Assigned Fields",
+            "Include the fields each cluster assigns for itself.",
+        )
+        .of(C::Detail, S::Compare),
         Spec::with_args::<ToggleDrainOption>(
             "Toggle Drain Option…",
             "In the drain dialog, turn an option on or off.",

@@ -892,7 +892,64 @@ impl ClusterManager {
                     }
                 });
             }
+            Request::FetchPinnedObject {
+                cluster,
+                pin,
+                kind,
+                namespace,
+                name,
+                reply,
+            } => {
+                // In one step with taking the client, which a paused cluster doesn't give.
+                if let Some(why) = self.read_pin_changed(&cluster, &pin) {
+                    let _ = reply.send(Err(why));
+                    return;
+                }
+                let Some(client) = self.client(&cluster) else {
+                    let _ = reply.send(Err(format!("\"{cluster}\" is not connected")));
+                    return;
+                };
+                let info = self
+                    .cluster(&cluster)
+                    .and_then(|c| c.discovery.as_ref())
+                    .and_then(|d| d.kind(&kind).cloned());
+                let Some(info) = info else {
+                    let _ = reply.send(Err(format!("\"{cluster}\" does not serve {kind}")));
+                    return;
+                };
+                let target = cluster::Target::of(&self.kubeconfig.merged, &cluster);
+                tokio::spawn(async move {
+                    let mut reply = reply;
+                    let read = read::object_only(
+                        &client,
+                        &info,
+                        namespace.as_deref(),
+                        &name,
+                        read::DETAIL_TIMEOUT,
+                    );
+                    // Whoever asked is gone: stop the request, and start none if it is already.
+                    tokio::select! {
+                        biased;
+                        () = reply.closed() => {}
+                        result = read => {
+                            let result = result
+                                .map(Arc::new)
+                                .map_err(|e| e.for_target(&target).summary().to_string());
+                            let _ = reply.send(result);
+                        }
+                    }
+                });
+            }
         }
+    }
+
+    /// Why `cluster` is no longer what `pin` was taken from, if so.
+    fn read_pin_changed(&self, cluster: &str, pin: &crate::handle::ReadPin) -> Option<String> {
+        let slot = self.cluster(cluster)?;
+        let server = slot.info.server.as_deref();
+        let same = server == pin.server.as_deref()
+            && self.contexts.shown(cluster, server).definition == pin.definition;
+        (!same).then(|| format!("\"{cluster}\" changed since this view opened."))
     }
 
     fn watched_kinds(&self, cluster: &str) -> Vec<(KindId, crate::store::Feed)> {

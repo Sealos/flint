@@ -465,6 +465,132 @@ fn press(cx: &mut TestAppContext, t: &TestWorkspace, key: &str) {
     cx.run_until_parked();
 }
 
+/// Marks every cluster connected, as the compare entry needs another one.
+fn connect_all(cx: &mut TestAppContext, t: &TestWorkspace) {
+    t.workspace.update(cx, |ws, cx| {
+        ws.model.update(cx, |model, cx| {
+            for cluster in &mut model.clusters {
+                cluster.state = flint_core::ConnectionState::Connected(flint_core::ServerVersion {
+                    git_version: "v1".into(),
+                    platform: "linux/arm64".into(),
+                });
+            }
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+}
+
+async fn right_click_row(cx: &mut TestAppContext, t: &TestWorkspace, name: &str) {
+    let row = gpui_kit::SharedString::from(format!("row-uid-{name}"));
+    cx.update_window(t.window, |_, window, cx| {
+        window.render_frame(cx);
+        window.right_click(row, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+fn click_compare_entry(cx: &mut TestAppContext, t: &TestWorkspace) {
+    cx.update_window(t.window, |_, window, cx| {
+        window.render_frame(cx);
+        let mut menu = window.within("popup-menu");
+        let entry = (0usize..)
+            .map_while(|ix| {
+                menu.try_find(ix)
+                    .map(|item| (ix, item.label().map(str::to_owned)))
+            })
+            .find(|(_, label)| label.as_deref() == Some("Compare Across Clusters"))
+            .map(|(ix, _)| ix)
+            .expect("the Compare entry");
+        menu.click(entry, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+// covers #449: the menu compares the row it opened on, even if the selection moved since.
+#[gpui_kit::test]
+async fn a_row_menu_compares_its_own_row(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0), ("demo", "web", 1)])
+        .await;
+    connect_all(cx, &t);
+    right_click_row(cx, &t, "web").await;
+    t.dispatch(
+        cx,
+        "resource_list::SelectRow",
+        json!({"namespace": "demo", "name": "api"}),
+    )
+    .unwrap();
+    cx.run_until_parked();
+    click_compare_entry(cx, &t);
+    let key = t.workspace.read_with(cx, |ws, cx| {
+        let dock = ws.dock.read(cx);
+        dock.active_compare().unwrap().read(cx).tab_key()
+    });
+    let crate::ui::dock::TabKey::Compare(_, target) = key else {
+        panic!("not a compare tab");
+    };
+    assert_eq!(target.name, "web");
+}
+
+// covers #449: a read-only kind gets the entry when there is a cluster to compare with, and no
+// menu at all (keeping the focus) when there is none.
+#[gpui_kit::test]
+async fn a_read_only_kind_is_offered_compare_alone(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 1)]).await;
+    let entry = flint_core::NavEntry {
+        id: flint_core::KindId::new("metrics.k8s.io", "pods"),
+        label: "Pod Metrics".into(),
+        kind: "PodMetrics".into(),
+        api_version: "metrics.k8s.io/v1beta1".into(),
+        namespaced: true,
+        listable: true,
+        watchable: false,
+    };
+    let workspace = t.workspace.clone();
+    cx.update_window(t.window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| {
+            ws.open_kind(&entry, window, cx);
+            let list = ws.list.clone().unwrap();
+            list.update(cx, |list, cx| {
+                list.stop_watching();
+                list.set_snapshot(crate::ui::support_tests::pods(&[("demo", "web", 1)]), cx);
+            });
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    right_click_row(cx, &t, "web").await;
+    let shown = cx
+        .update_window(t.window, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find("popup-menu").is_some()
+        })
+        .unwrap();
+    assert!(!shown, "nothing to offer with no other cluster");
+    let workspace = t.workspace.clone();
+    let state = cx
+        .update_window(t.window, |_, window, cx| {
+            workspace.update(cx, |ws, cx| ws.view_state(window, cx))
+        })
+        .unwrap();
+    assert_eq!(state.focus, Focus::List);
+
+    connect_all(cx, &t);
+    right_click_row(cx, &t, "web").await;
+    click_compare_entry(cx, &t);
+    let compared = t
+        .workspace
+        .read_with(cx, |ws, cx| ws.dock.read(cx).active_compare().is_some());
+    assert!(compared);
+}
+
 // covers UP-40, UP-42: Logs in the detail pane opens a tab in the dock (or shows the open one),
 // the tab keeps running across a cluster switch, and Cmd-W in the dock closes tabs, not the
 // window.
@@ -512,7 +638,7 @@ async fn logs_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCont
         let dock = ws.dock.read(cx);
         match dock.tab(dock.tab_ids()[0]).unwrap() {
             DockTab::Logs(view) => view.downgrade(),
-            DockTab::Shell(_) | DockTab::Activity(_) => panic!("a log tab"),
+            DockTab::Shell(_) | DockTab::Activity(_) | DockTab::Compare(_) => panic!("a log tab"),
         }
     });
 
