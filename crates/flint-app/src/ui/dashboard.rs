@@ -19,7 +19,7 @@ use flint_core::metrics::MetricsError;
 use flint_core::metrics_trend::{TrendResource, TrendScope, TrendStore};
 use flint_core::telemetry::{
     Availability, CheckFailure, FailureCause, KindCheck, MetricsCheck, TelemetrySnapshot,
-    WatchedKind,
+    UsageRead, WatchedKind,
 };
 use flint_core::thresholds::{ThresholdLevel, Thresholds};
 use gpui_kit::component::{ActiveTheme as _, v_flex};
@@ -29,10 +29,12 @@ use jiff::Timestamp;
 use k8s_openapi::api::core::v1::{Event as KubeEvent, PersistentVolumeClaim};
 use serde::{Deserialize, Deserializer, de};
 
-use super::registry::{Bind, OnView};
+use super::registry::{Bind, OnView, OpenObject, OpenView};
 
 #[path = "dashboard_feed.rs"]
 mod feed;
+#[path = "dashboard_overview.rs"]
+mod overview;
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "only tests ask a sparkline if it is empty")
@@ -43,8 +45,14 @@ mod sparkline;
 mod tiles;
 
 #[cfg(test)]
-pub(in crate::ui) use feed::{FeedId, lists_of};
+pub(in crate::ui) use feed::{FeedId, lists_of, slot_to_read};
 pub use feed::{ProblemList, ProblemLists};
+#[cfg(test)]
+pub(in crate::ui) use overview::ProblemRow;
+pub(in crate::ui) use overview::ProblemsPanel;
+use overview::{
+    CapacityPanel, InventoryPanel, OpenScope, capacity_panel, inventory_panel, problems_panel,
+};
 use sparkline::SparklineShape;
 
 /// The most Warning events listed.
@@ -177,6 +185,10 @@ pub struct DashboardInput<'a> {
     pub thresholds: &'a Thresholds,
     pub warning_events: Option<&'a [KubeEvent]>,
     pub pending_claims: Option<&'a [PersistentVolumeClaim]>,
+    /// Each node's live usage, as last polled.
+    pub node_usage: &'a UsageRead<String>,
+    /// The API server of this cluster, which a row's click must still be talking to.
+    pub server: Option<&'a str>,
     pub now: Timestamp,
 }
 
@@ -185,8 +197,11 @@ pub struct DashboardInput<'a> {
 pub struct DashboardModel {
     pub status: DashboardStatus,
     pub tiles: Vec<ProblemTile>,
-    pub metrics: MetricsPanel,
+    pub problems: ProblemsPanel,
     pub warnings: WarningsPanel,
+    pub capacity: CapacityPanel,
+    pub metrics: MetricsPanel,
+    pub inventory: InventoryPanel,
 }
 
 /// Whether the cluster could be checked.
@@ -308,15 +323,49 @@ impl WarningRow {
 impl DashboardModel {
     /// The dashboard of `input`.
     pub fn build(input: &DashboardInput<'_>) -> Self {
+        let snapshot = input.snapshot;
+        let scope = OpenScope {
+            cluster: snapshot.cluster.to_string(),
+            server: input.server.map(str::to_owned),
+        };
+        let readable = matches!(
+            snapshot.availability,
+            Availability::Checked | Availability::Partial
+        );
         Self {
-            status: status(&input.snapshot.availability, input.snapshot),
+            status: status(&snapshot.availability, snapshot),
             tiles: ProblemCategory::ALL
                 .into_iter()
                 .map(|category| tile(category, input))
                 .collect(),
-            metrics: metrics(input),
+            problems: problems_panel(
+                &snapshot.problems,
+                &snapshot.settling,
+                readable,
+                !snapshot.unchecked.is_empty(),
+                &scope,
+            ),
             warnings: warnings(input),
+            capacity: capacity_panel(snapshot.capacity.as_ref(), input.node_usage),
+            metrics: metrics(input),
+            inventory: inventory_panel(&snapshot.inventory, &snapshot.version, &scope),
         }
+    }
+}
+
+impl DashboardModel {
+    /// Whether `action` is one of the problem rows' links.
+    pub(in crate::ui) fn links_object(&self, action: &OpenObject) -> bool {
+        matches!(&self.problems, ProblemsPanel::Rows { rows, .. }
+            if rows.iter().any(|row| row.open == *action))
+    }
+
+    /// Whether `action` is one of the inventory's links. An unread count draws none.
+    pub(in crate::ui) fn links_view(&self, action: &OpenView) -> bool {
+        self.inventory
+            .counts
+            .iter()
+            .any(|count| count.count.is_some() && count.open == *action)
     }
 }
 
@@ -674,6 +723,24 @@ impl DashboardView {
         }
     }
 
+    /// A problem row's link: refused here if its feed has gone, else the workspace opens it.
+    fn guard_object_link(&mut self, action: &OpenObject, _: &mut Window, cx: &mut Context<Self>) {
+        if self.refuses_link(|model| model.links_object(action), cx) {
+            self.refresh(cx);
+        } else {
+            cx.propagate();
+        }
+    }
+
+    /// An inventory count's link, as [`Self::guard_object_link`].
+    fn guard_view_link(&mut self, action: &OpenView, _: &mut Window, cx: &mut Context<Self>) {
+        if self.refuses_link(|model| model.links_view(action), cx) {
+            self.refresh(cx);
+        } else {
+            cx.propagate();
+        }
+    }
+
     #[cfg(test)]
     pub fn model(&self) -> &DashboardModel {
         &self.model
@@ -719,12 +786,15 @@ impl Focusable for DashboardView {
 
 impl Render for DashboardView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.frame_drawn();
         let theme = cx.theme();
         v_flex()
             .id("dashboard")
             .key_context("Dashboard")
             .track_focus(&self.focus)
             .map(|el| Self::bind_actions(OnView::new(el, cx)).into_element())
+            .on_action(cx.listener(Self::guard_object_link))
+            .on_action(cx.listener(Self::guard_view_link))
             .size_full()
             .min_w_0()
             .p_4()
@@ -740,8 +810,19 @@ impl Render for DashboardView {
                 self.focus.clone(),
                 theme,
             ))
-            .child(tiles::metrics_section(&self.model.metrics, theme))
+            .child(tiles::problems_section(
+                &self.model.problems,
+                self.focus.clone(),
+                theme,
+            ))
             .child(tiles::warnings_section(&self.model.warnings, theme))
+            .child(tiles::capacity_section(&self.model.capacity, theme))
+            .child(tiles::metrics_section(&self.model.metrics, theme))
+            .child(tiles::inventory_section(
+                &self.model.inventory,
+                self.focus.clone(),
+                theme,
+            ))
     }
 }
 
