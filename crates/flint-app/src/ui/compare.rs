@@ -171,6 +171,12 @@ fn verdict_text(verdict: Verdict) -> String {
     }
 }
 
+/// A column's cluster name, wrapped rather than cut: names that differ only at the end (two ARNs)
+/// would otherwise clip to the same text in a narrow window.
+fn side_name(name: &str) -> Div {
+    div().w_full().whitespace_normal().child(name.to_owned())
+}
+
 /// `clusters` once each, in order.
 fn distinct(clusters: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
@@ -377,7 +383,7 @@ impl Render for CompareView {
                 .aria_label(format!("{}: {}", side.name, side.status))
                 .flex_1()
                 .min_w_0()
-                .child(div().truncate().child(side.name.clone()))
+                .child(side_name(&side.name))
                 .child(
                     div()
                         .truncate()
@@ -418,6 +424,7 @@ impl Render for CompareView {
             )
             .child(
                 h_flex()
+                    .items_start()
                     .px_3()
                     .pb_2()
                     .gap_3()

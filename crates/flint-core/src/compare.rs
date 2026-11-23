@@ -16,6 +16,7 @@ use crate::redact;
 /// `metadata` fields each cluster assigns for itself.
 const VOLATILE_METADATA: &[&str] = &[
     "creationTimestamp",
+    "deletionTimestamp",
     "generation",
     "managedFields",
     "resourceVersion",
@@ -32,6 +33,14 @@ const VOLATILE_ANNOTATIONS: &[&str] = &[
 /// What the server's error says for an object that does not exist, after
 /// [`crate::cluster::ClusterError::summary`] hid the quoted name.
 const HIDDEN_NAME: &str = "\"…\"";
+
+/// Why a side is unavailable when its kind has another scope there, so the read found a different
+/// object from the one compared.
+pub const OTHER_SCOPE: &str = "this kind has a different scope on this cluster";
+
+/// Ends the path of the row holding a named list's order. No other path can end like this: keys
+/// are written `.key` or `["key"]`, and items `[0]` or `[name="..."]`.
+const ORDER: &str = "[order]";
 
 /// The object compared on each cluster.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,14 +64,26 @@ pub enum SideRead {
 impl SideRead {
     /// Reads the answer of [`crate::CoreHandle::fetch_object`]. Only the API server's own "not
     /// found" for this kind counts as missing: anything else leaves the object's existence
-    /// unknown.
+    /// unknown. An object outside the target's namespace is another object: a cluster where the
+    /// kind is cluster-scoped ignores the namespace asked for.
     pub fn from_fetch(target: &CompareTarget, fetched: Result<Arc<ObjectDetail>, String>) -> Self {
         match fetched {
+            Ok(detail) if namespace_of(&detail) != target.namespace.as_deref() => {
+                Self::Unavailable(OTHER_SCOPE.to_owned())
+            }
             Ok(detail) => Self::Present(detail),
             Err(error) if says_not_found(&target.kind, &error) => Self::Missing,
             Err(error) => Self::Unavailable(error),
         }
     }
+}
+
+fn namespace_of(detail: &ObjectDetail) -> Option<&str> {
+    detail
+        .object
+        .pointer("/metadata/namespace")
+        .and_then(Value::as_str)
+        .filter(|namespace| !namespace.is_empty())
 }
 
 fn says_not_found(kind: &KindId, error: &str) -> bool {
@@ -188,13 +209,15 @@ pub fn compare(target: &CompareTarget, reads: &[SideRead], options: CompareOptio
                 .zip(&fields)
                 .map(|(read, fields)| value_at(read, fields.as_ref(), path))
                 .collect();
-            let state = row_state(reads, &values);
+            let state = row_state(path, reads, &values);
             CompareRow {
                 path: path.clone(),
                 values,
                 state,
             }
         })
+        // An order row only exists to report a reorder.
+        .filter(|row| !row.path.ends_with(ORDER) || row.state == RowState::Differs)
         .collect();
     Comparison {
         sides: reads.iter().map(side_state).collect(),
@@ -223,7 +246,7 @@ fn value_at(read: &SideRead, fields: Option<&BTreeMap<String, Field>>, path: &st
     }
 }
 
-fn row_state(reads: &[SideRead], values: &[FieldValue]) -> RowState {
+fn row_state(path: &str, reads: &[SideRead], values: &[FieldValue]) -> RowState {
     let compared: Vec<&FieldValue> = reads
         .iter()
         .zip(values)
@@ -235,6 +258,9 @@ fn row_state(reads: &[SideRead], values: &[FieldValue]) -> RowState {
     };
     if compared.len() < 2 {
         return RowState::NotCompared;
+    }
+    if path.ends_with(ORDER) {
+        return order_state(&compared);
     }
     let not_set = |value: &&FieldValue| **value == FieldValue::NotSet;
     if compared.iter().any(not_set) {
@@ -249,6 +275,37 @@ fn row_state(reads: &[SideRead], values: &[FieldValue]) -> RowState {
     } else {
         RowState::Differs
     }
+}
+
+/// Whether the names two clusters share come in a different order. An added or removed item is
+/// already a row of its own, so it does not count as a reorder.
+fn order_state(compared: &[&FieldValue]) -> RowState {
+    let lists: Vec<&[Value]> = compared
+        .iter()
+        .filter_map(|value| match value {
+            FieldValue::Value(Value::Array(names)) => Some(names.as_slice()),
+            _ => None,
+        })
+        .collect();
+    let reordered = lists.iter().enumerate().any(|(ix, first)| {
+        lists[ix + 1..]
+            .iter()
+            .any(|second| shared(first, second) != shared(second, first))
+    });
+    if reordered {
+        RowState::Differs
+    } else {
+        RowState::Same
+    }
+}
+
+/// The names of `list` that `other` also has, in `list`'s order.
+fn shared<'a>(list: &'a [Value], other: &[Value]) -> Vec<&'a str> {
+    let other: BTreeSet<&str> = other.iter().filter_map(Value::as_str).collect();
+    list.iter()
+        .filter_map(Value::as_str)
+        .filter(|name| other.contains(name))
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,52 +367,32 @@ fn strip_volatile(object: &mut Value) {
     }
 }
 
-/// Moves what a Secret hides out of `object`, recording only that each key is set. A value of an
-/// unexpected shape is hidden whole.
+/// Moves what a Secret hides out of `object`, recording only that each key is set. Every
+/// annotation is hidden, so neither what is drawn nor the verdict depends on one's value. A value
+/// of an unexpected shape is hidden whole.
 fn take_secret_values(object: &mut Value, out: &mut BTreeMap<String, Field>) {
-    redact::mask_secret(object, "");
     let Some(root) = object.as_object_mut() else {
         return;
     };
     for field in ["data", "stringData"] {
         if let Some(values) = root.remove(field) {
-            hide(field, &values, |_| false, out);
+            hide(field, &values, out);
         }
     }
-    let Some(meta) = root.get_mut("metadata").and_then(Value::as_object_mut) else {
-        return;
-    };
-    let Some(annotations) = meta.remove("annotations") else {
-        return;
-    };
-    hide(
-        "metadata.annotations",
-        &annotations,
-        redact::is_safe_secret_annotation,
-        out,
-    );
-    // The allowed ones stay readable, so they go back to be compared.
-    if let Value::Object(annotations) = annotations {
-        let safe: serde_json::Map<String, Value> = annotations
-            .into_iter()
-            .filter(|(key, _)| redact::is_safe_secret_annotation(key))
-            .collect();
-        if !safe.is_empty() {
-            meta.insert("annotations".to_owned(), Value::Object(safe));
-        }
+    let annotations = root
+        .get_mut("metadata")
+        .and_then(Value::as_object_mut)
+        .and_then(|meta| meta.remove("annotations"));
+    if let Some(annotations) = annotations {
+        hide("metadata.annotations", &annotations, out);
     }
 }
 
-/// Records each key of `values` at `path` as hidden, except those `keep` allows.
-fn hide(
-    path: &str,
-    values: &Value,
-    keep: impl Fn(&str) -> bool,
-    out: &mut BTreeMap<String, Field>,
-) {
+/// Records each key of `values` at `path` as hidden.
+fn hide(path: &str, values: &Value, out: &mut BTreeMap<String, Field>) {
     match values {
         Value::Object(map) if !map.is_empty() => {
-            for key in map.keys().filter(|key| !keep(key)) {
+            for key in map.keys() {
                 out.insert(child_path(path, key), Field::Hidden);
             }
         }
@@ -375,6 +412,8 @@ fn walk(path: &str, value: &Value, out: &mut BTreeMap<String, Field>) {
         }
         Value::Array(items) if !items.is_empty() => match item_names(items) {
             Some(names) => {
+                let order = names.iter().map(|name| Value::from(*name)).collect();
+                out.insert(format!("{path}{ORDER}"), Field::Value(Value::Array(order)));
                 for (name, item) in names.into_iter().zip(items) {
                     let quoted = Value::from(name).to_string();
                     walk(&format!("{path}[name={quoted}]"), item, out);
@@ -393,7 +432,8 @@ fn walk(path: &str, value: &Value, out: &mut BTreeMap<String, Field>) {
 }
 
 /// Each item's `name`, when all have a different one: containers, ports and env vars then match
-/// by name, whatever their order.
+/// by name, so one inserted item doesn't shift the rest. Their order can matter (init containers
+/// run in it, env vars refer to earlier ones), so it is compared as a row of its own.
 fn item_names(items: &[Value]) -> Option<Vec<&str>> {
     let names: Vec<&str> = items
         .iter()

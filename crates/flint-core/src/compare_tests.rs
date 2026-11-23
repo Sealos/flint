@@ -142,17 +142,142 @@ fn volatile_fields_are_ignored_by_default_and_kept_on_request() {
     );
 }
 
+fn pod_with_init(names: &[&str]) -> Value {
+    let items: Vec<Value> = names
+        .iter()
+        .map(|name| json!({"name": name, "image": format!("{name}:1")}))
+        .collect();
+    json!({"kind": "Pod", "apiVersion": "v1", "spec": {"initContainers": items}})
+}
+
 #[test]
-fn list_items_match_by_name_whatever_their_order() {
-    let containers = |first, second| {
-        json!({"kind": "Pod", "apiVersion": "v1", "spec": {"containers": [
-            {"name": first, "image": format!("{first}:1")},
-            {"name": second, "image": format!("{second}:1")},
-        ]}})
-    };
-    let reads = [detail(containers("a", "b")), detail(containers("b", "a"))];
+fn a_reordered_list_differs_in_one_row_with_items_still_matched_by_name() {
+    let reads = [
+        detail(pod_with_init(&["migrate", "seed"])),
+        detail(pod_with_init(&["seed", "migrate"])),
+    ];
     let result = compare(&target(KindId::pods()), &reads, CompareOptions::default());
+    assert_eq!(result.verdict(), Verdict::Differs { fields: 1 });
+    let order = row(&result, "spec.initContainers[order]");
+    assert_eq!(order.state, RowState::Differs);
+    assert_eq!(
+        order.values[0],
+        FieldValue::Value(json!(["migrate", "seed"]))
+    );
+    assert_eq!(
+        row(&result, "spec.initContainers[name=\"seed\"].image").state,
+        RowState::Same
+    );
+}
+
+#[test]
+fn an_added_item_is_not_also_called_a_reorder() {
+    let reads = [
+        detail(pod_with_init(&["migrate", "seed"])),
+        detail(pod_with_init(&["migrate", "extra", "seed"])),
+    ];
+    let result = compare(&target(KindId::pods()), &reads, CompareOptions::default());
+    assert!(result.rows.iter().all(|row| !row.path.ends_with(ORDER)));
+    assert!(
+        result
+            .rows
+            .iter()
+            .filter(|row| row.state == RowState::Differs)
+            .all(|row| row.path.contains("extra"))
+    );
+}
+
+#[test]
+fn a_deletion_timestamp_is_volatile() {
+    let mut deleting = deployment("web:1", "b");
+    deleting["metadata"]["deletionTimestamp"] = json!("2026-02-01T00:00:00Z");
+    let reads = [detail(deployment("web:1", "a")), detail(deleting)];
+    let result = compare(&deployments(), &reads, CompareOptions::default());
     assert_eq!(result.verdict(), Verdict::Same);
+    let all = compare(
+        &deployments(),
+        &reads,
+        CompareOptions {
+            include_volatile: true,
+        },
+    );
+    assert_eq!(
+        row(&all, "metadata.deletionTimestamp").state,
+        RowState::Differs
+    );
+}
+
+#[test]
+fn an_object_outside_the_target_namespace_is_unavailable() {
+    let mut cluster_scoped = deployment("web:1", "a");
+    cluster_scoped["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("namespace");
+    let mut elsewhere = deployment("web:1", "a");
+    elsewhere["metadata"]["namespace"] = json!("other");
+    for object in [cluster_scoped.clone(), elsewhere] {
+        let SideRead::Present(read) = detail(object) else {
+            unreachable!()
+        };
+        assert!(matches!(
+            SideRead::from_fetch(&deployments(), Ok(read)),
+            SideRead::Unavailable(ref why) if why == OTHER_SCOPE
+        ));
+    }
+
+    let SideRead::Present(namespaced) = detail(deployment("web:1", "a")) else {
+        unreachable!()
+    };
+    assert!(matches!(
+        SideRead::from_fetch(&deployments(), Ok(namespaced.clone())),
+        SideRead::Present(_)
+    ));
+    let cluster_target = CompareTarget {
+        namespace: None,
+        ..deployments()
+    };
+    assert!(matches!(
+        SideRead::from_fetch(&cluster_target, Ok(namespaced)),
+        SideRead::Unavailable(ref why) if why == OTHER_SCOPE
+    ));
+    let SideRead::Present(cluster_read) = detail(cluster_scoped) else {
+        unreachable!()
+    };
+    assert!(matches!(
+        SideRead::from_fetch(&cluster_target, Ok(cluster_read)),
+        SideRead::Present(_)
+    ));
+}
+
+#[test]
+fn no_secret_annotation_value_is_shown_or_compared() {
+    const HELM: &str = "metadata.annotations[\"meta.helm.sh/release-name\"]";
+    let with_release = |release: &str| {
+        let mut object = secret("b25l", "x");
+        object["metadata"]["annotations"]["meta.helm.sh/release-name"] = json!(release);
+        object
+    };
+    let different = [
+        detail(with_release("release-one")),
+        detail(with_release("release-two")),
+    ];
+    let equal = [
+        detail(with_release("release-one")),
+        detail(with_release("release-one")),
+    ];
+    let shown = compare(&secrets(), &different, CompareOptions::default());
+    assert_eq!(
+        shown,
+        compare(&secrets(), &equal, CompareOptions::default())
+    );
+    let text = format!("{shown:?}");
+    assert!(!text.contains("release-one") && !text.contains("release-two"));
+    assert_eq!(row(&shown, HELM).state, RowState::Hidden);
+    assert_eq!(
+        row(&shown, HELM).values,
+        [FieldValue::Hidden, FieldValue::Hidden]
+    );
 }
 
 #[test]
@@ -204,14 +329,6 @@ fn secret_values_are_never_kept_or_compared() {
         assert_eq!(
             row(&shown, "metadata.annotations[\"custom/copy\"]").state,
             RowState::Hidden
-        );
-        assert_eq!(
-            row(
-                &shown,
-                "metadata.annotations[\"meta.helm.sh/release-name\"]"
-            )
-            .values[0],
-            FieldValue::Value(json!("web"))
         );
         assert!(matches!(
             shown.verdict(),

@@ -70,6 +70,14 @@ fn each_side_names_its_exact_cluster() {
 }
 
 #[test]
+fn a_cluster_name_wraps_instead_of_clipping() {
+    let mut name = side_name(EU);
+    let style = name.style();
+    assert_eq!(style.text.white_space, Some(WhiteSpace::Normal));
+    assert_eq!(style.text.text_overflow, None);
+}
+
+#[test]
 fn only_differences_show_until_asked_for_the_rest() {
     let target = target(KindId::new("", "configmaps"));
     let reads = [present(config("a")), present(config("b"))];
