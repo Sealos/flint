@@ -99,12 +99,9 @@ async fn an_admin_group_install_runs_and_warns() {
     assert_eq!(found.path, real.canonicalize().unwrap());
     assert!(found.admin_writable);
     let warning = admin_writable_warning(&found.path);
-    assert!(
-        warning.contains(&*found.path.to_string_lossy()),
-        "{warning}"
-    );
-    assert!(warning.contains("administrators"), "{warning}");
-    assert!(warning.contains("credentials"), "{warning}");
+    assert!(warning.contains(&*found.path.to_string_lossy()));
+    assert!(warning.contains("administrators"));
+    assert!(warning.contains("credentials"));
     run_with(
         &found.path,
         &target(dir.path()),
