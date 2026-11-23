@@ -110,6 +110,22 @@ fn cpu_cells(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<(String, Option<
     })
 }
 
+/// Waits until the rows drawn have a CPU column. The core computes them on its own thread, so
+/// `run_until_parked` does not wait for them.
+async fn wait_for_cpu_column(cx: &mut TestAppContext, t: &TestWorkspace) {
+    let list = t.list(cx).expect("a list is open");
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        let rows = list.read(cx).view_state().rows;
+        !rows.is_empty()
+            && rows.iter().all(|row| {
+                row.cells_by_column
+                    .iter()
+                    .any(|(column, _)| column == "CPU")
+            })
+    })
+    .await;
+}
+
 #[gpui_kit::test]
 async fn usage_columns_show_sort_and_keep_unknown_last(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
@@ -117,7 +133,7 @@ async fn usage_columns_show_sort_and_keep_unknown_last(cx: &mut TestAppContext) 
     t.open_pods(cx, PODS).await;
     let list = t.list(cx).expect("a list is open");
     list.update(cx, |list, cx| list.pin_usage_source(pod_usage(), cx));
-    cx.run_until_parked();
+    wait_for_cpu_column(cx, &t).await;
 
     let unsorted = cpu_cells(cx, &t);
     let cell = |name: &str| {
@@ -158,8 +174,7 @@ async fn without_metrics_server_the_columns_hide_and_a_hint_shows(cx: &mut TestA
     t.open_pods(cx, PODS).await;
     let list = t.list(cx).expect("a list is open");
     list.update(cx, |list, cx| list.pin_usage_source(pod_usage(), cx));
-    cx.run_until_parked();
-    assert!(cpu_cells(cx, &t).iter().all(|(_, cpu)| cpu.is_some()));
+    wait_for_cpu_column(cx, &t).await;
 
     list.update(cx, |list, cx| {
         list.pin_usage_source(UsageSource::NotInstalled, cx);
@@ -208,8 +223,7 @@ async fn a_404_during_a_sort_hides_the_old_readings_at_once(cx: &mut TestAppCont
     t.open_pods(cx, PODS).await;
     let list = t.list(cx).expect("a list is open");
     list.update(cx, |list, cx| list.pin_usage_source(pod_usage(), cx));
-    cx.run_until_parked();
-    assert!(cpu_cells(cx, &t).iter().any(|(_, cpu)| cpu.is_some()));
+    wait_for_cpu_column(cx, &t).await;
 
     // A sort is computing when the poll finds the API gone.
     let permits = list.update(cx, |list, _| list.hold_computes());
@@ -224,11 +238,15 @@ async fn a_404_during_a_sort_hides_the_old_readings_at_once(cx: &mut TestAppCont
     );
 
     // Neither the sort that was running nor the one after it brings them back.
-    for _ in 0..2 {
-        let _ = permits.try_send(());
-        cx.run_until_parked();
-        assert!(cpu_cells(cx, &t).iter().all(|(_, cpu)| cpu.is_none()));
-    }
+    let done = list.read_with(cx, |list, _| list.computes_done());
+    permits.send(()).await.unwrap();
+    permits.send(()).await.unwrap();
+    let finished = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        finished.read(cx).computes_done() >= done + 2
+    })
+    .await;
+    assert!(cpu_cells(cx, &t).iter().all(|(_, cpu)| cpu.is_none()));
 }
 
 // covers UP-21
