@@ -223,6 +223,8 @@ pub enum Main {
     Failed {
         error: String,
     },
+    /// Waiting for the kubeconfig to be confirmed. Not a failure, so no Retry button.
+    AwaitingConfirmation,
     /// A resource list, and maybe the detail pane.
     List,
 }

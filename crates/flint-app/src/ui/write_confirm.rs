@@ -230,6 +230,26 @@ pub(in crate::ui) fn target_lines(target: &WriteTarget) -> Vec<String> {
     lines
 }
 
+/// What the next confirmation of a YAML edit to `target` must also say.
+struct EditNote(Option<(WriteTarget, String)>);
+
+impl Global for EditNote {}
+
+/// Sets, or with `None` clears, what the next confirmation of this edit says first.
+pub(in crate::ui) fn set_edit_note(target: &WriteTarget, note: Option<String>, cx: &mut App) {
+    cx.set_global(EditNote(note.map(|note| (target.clone(), note))));
+}
+
+/// The note for `review`: used once, and only by a YAML edit of the same object and version.
+fn take_edit_note(review: &WriteReview, cx: &mut App) -> Option<String> {
+    if !matches!(review.action(), WriteAction::ApplyYaml(_)) {
+        return None;
+    }
+    let (target, note) = cx.try_global::<EditNote>()?.0.clone()?;
+    cx.set_global(EditNote(None));
+    (target == *review.target()).then_some(note)
+}
+
 /// Asks to confirm `review`, first saying `note` (why this review was opened again), then runs it
 /// on `core` and calls `on_done` with the result. Cancelling runs nothing and does not call it.
 /// Confirming asks `begin` right before the write: `false` runs nothing and does not call
@@ -246,18 +266,19 @@ pub fn open_noted(
     on_done: impl Fn(Result<WriteOutcome, WriteError>, &mut App) + 'static,
 ) {
     let shown = names.with_real(&review.target().cluster);
-    let saying: Vec<String> = note
-        .map(str::to_owned)
+    let edit_note = take_edit_note(&review, cx);
+    // Overwriting someone's change takes the button, not Enter.
+    let worded = wording(review.action());
+    let worded = Wording {
+        deliberate: worded.deliberate || edit_note.is_some(),
+        ..worded
+    };
+    let saying: Vec<String> = edit_note
         .into_iter()
+        .chain(note.map(str::to_owned))
         .chain(action_lines(review.action()))
         .collect();
-    let text = dialog_text_saying(
-        review.target(),
-        wording(review.action()),
-        review.warnings(),
-        &saying,
-        &shown,
-    );
+    let text = dialog_text_saying(review.target(), worded, review.warnings(), &saying, &shown);
     let pinned = target_lines(review.target()).len();
     let confirmed = confirmation(core, review, begin, on_done);
     confirm::open_pinned(window, cx, text, pinned, move |_, cx| confirmed(cx));

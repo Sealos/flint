@@ -283,6 +283,14 @@ impl Dock {
         })
     }
 
+    /// Every log tab's view, shown or not.
+    pub fn log_views(&self) -> impl Iterator<Item = &Entity<LogView>> {
+        self.tabs.iter().filter_map(|t| match &t.tab {
+            DockTab::Logs(view) => Some(view),
+            DockTab::Shell(_) | DockTab::Activity(_) => None,
+        })
+    }
+
     pub fn active_terminal(&self) -> Option<&Entity<TerminalView>> {
         match self.active_tab().filter(|_| self.visible)? {
             DockTab::Shell(view) => Some(view),
