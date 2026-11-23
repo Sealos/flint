@@ -19,7 +19,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{Config, Osc52, Term};
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::vte::ansi::{self, Handler, Processor};
 
 pub use alacritty_terminal::index::Side;
 pub use alacritty_terminal::term::TermMode;
@@ -28,6 +28,14 @@ pub use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 
 /// Lines kept above the screen for scrolling back.
 pub const SCROLLBACK_LINES: usize = 10_000;
+
+/// The longest OSC payload accepted, in bytes. The parser buffers an OSC without limit until its
+/// terminator arrives. 64 KiB leaves room for long OSC 8 hyperlinks and titles.
+const MAX_OSC_PAYLOAD_BYTES: usize = 64 * 1024;
+
+/// The most zero-width characters kept on one cell. Twice the 30 that Unicode's stream-safe
+/// format allows in a combining sequence, and well above the longest emoji ZWJ sequences.
+const MAX_ZEROWIDTH_PER_CELL: usize = 60;
 
 /// A terminal's size in character cells: at least 2 columns (a wide character needs two) and
 /// 1 row.
@@ -189,10 +197,247 @@ impl EventListener for Listener {
     }
 }
 
+const BEL: u8 = 0x07;
+const CAN: u8 = 0x18;
+const SUB: u8 = 0x1a;
+const ESC: u8 = 0x1b;
+
+/// Where [`OscLimiter`] is in the byte stream. Mirrors the parser's transitions into and out of
+/// its OSC state; every other parser state is `Outside`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OscScan {
+    Outside,
+    /// After ESC, where the parser stays through C0 controls, DEL and high bytes.
+    Escape,
+    /// Inside an OSC that still fits, held back until its terminator.
+    Payload,
+    /// Inside an OSC that went over the limit, dropped up to its terminator.
+    Discarding,
+}
+
+/// Keeps OSC sequences over [`MAX_OSC_PAYLOAD_BYTES`] away from the parser. A sequence reaches
+/// the parser only once it is complete, because the parser has no way to abandon one: any
+/// terminator makes it dispatch what it has buffered.
+#[derive(Debug)]
+struct OscLimiter {
+    scan: OscScan,
+    /// The `]` and payload of the OSC being held back.
+    held: Vec<u8>,
+}
+
+impl OscLimiter {
+    fn new() -> Self {
+        Self {
+            scan: OscScan::Outside,
+            held: Vec::new(),
+        }
+    }
+
+    /// Passes `bytes` to `emit`, in order, without the oversized OSC sequences.
+    fn filter(&mut self, bytes: &[u8], mut emit: impl FnMut(&[u8])) {
+        // Start of the bytes not yet emitted.
+        let mut run = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            let byte = bytes[i];
+            match self.scan {
+                OscScan::Outside => match bytes[i..].iter().position(|&b| b == ESC) {
+                    Some(offset) => {
+                        i += offset;
+                        self.scan = OscScan::Escape;
+                    }
+                    None => break,
+                },
+                OscScan::Escape => match byte {
+                    b']' => {
+                        emit(&bytes[run..i]);
+                        run = i + 1;
+                        self.held.clear();
+                        self.held.push(byte);
+                        self.scan = OscScan::Payload;
+                    }
+                    0x00..=0x17 | 0x19 | 0x1b..=0x1f | 0x7f..=0xff => {}
+                    _ => self.scan = OscScan::Outside,
+                },
+                OscScan::Payload => {
+                    run = i + 1;
+                    match byte {
+                        BEL | CAN | SUB | ESC => {
+                            self.held.push(byte);
+                            emit(&self.held);
+                            self.held.clear();
+                            self.scan = if byte == ESC {
+                                OscScan::Escape
+                            } else {
+                                OscScan::Outside
+                            };
+                        }
+                        // The parser ignores other C0 controls inside an OSC.
+                        0x00..=0x1f => {}
+                        // `held` starts with the `]`, so this payload is already at the limit.
+                        _ if self.held.len() > MAX_OSC_PAYLOAD_BYTES => {
+                            self.held = Vec::new();
+                            // The parser is in its escape state, after the ESC; CAN takes it
+                            // back to normal parsing without doing anything else.
+                            emit(&[CAN]);
+                            self.scan = OscScan::Discarding;
+                        }
+                        _ => self.held.push(byte),
+                    }
+                }
+                OscScan::Discarding => match byte {
+                    BEL => {
+                        run = i + 1;
+                        self.scan = OscScan::Outside;
+                    }
+                    CAN | SUB => {
+                        run = i;
+                        self.scan = OscScan::Outside;
+                    }
+                    ESC => {
+                        run = i;
+                        self.scan = OscScan::Escape;
+                    }
+                    _ => run = i + 1,
+                },
+            }
+            i += 1;
+        }
+        if run < bytes.len() {
+            emit(&bytes[run..]);
+        }
+    }
+}
+
+/// The terminal as the parser drives it, with at most [`MAX_ZEROWIDTH_PER_CELL`] zero-width
+/// characters per cell. The check sits here, not on the bytes, because which cell a mark lands
+/// on depends on the cursor, and the parser replays a synchronized update in one go.
+struct MarkLimitedTerm<'a>(&'a mut Term<Listener>);
+
+impl MarkLimitedTerm<'_> {
+    /// The cell a zero-width character would land on, as `Term::input` picks it.
+    fn mark_target(&self) -> Point {
+        let grid = self.0.grid();
+        let mut point = grid.cursor.point;
+        if !grid.cursor.input_needs_wrap {
+            point.column.0 = point.column.0.saturating_sub(1);
+        }
+        if grid[point].flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+            point.column.0 = point.column.0.saturating_sub(1);
+        }
+        point
+    }
+
+    fn marks_on(&self, point: Point) -> usize {
+        self.0.grid()[point].zerowidth().map_or(0, <[char]>::len)
+    }
+}
+
+/// Forwards `Handler` methods to the terminal. The trait gives every method an empty default, so
+/// one left out here would silently stop working.
+macro_rules! forward_to_term {
+    ($($name:ident($($arg:ident: $ty:ty),*);)*) => {
+        $(fn $name(&mut self, $($arg: $ty),*) {
+            <Term<Listener> as Handler>::$name(self.0, $($arg),*)
+        })*
+    };
+}
+
+impl Handler for MarkLimitedTerm<'_> {
+    fn input(&mut self, c: char) {
+        let target = self.mark_target();
+        if self.marks_on(target) < MAX_ZEROWIDTH_PER_CELL {
+            self.0.input(c);
+            return;
+        }
+        // Full. Only the terminal knows whether `c` is zero-width, so let it write and put the
+        // cell back if it gained a mark; anything else replaces the cell or lands elsewhere.
+        let kept = self.0.grid()[target].clone();
+        self.0.input(c);
+        if self.marks_on(target) > MAX_ZEROWIDTH_PER_CELL {
+            self.0.grid_mut()[target] = kept;
+        }
+    }
+
+    forward_to_term! {
+        set_title(title: Option<String>);
+        set_cursor_style(style: Option<ansi::CursorStyle>);
+        set_cursor_shape(shape: CursorShape);
+        goto(line: i32, col: usize);
+        goto_line(line: i32);
+        goto_col(col: usize);
+        insert_blank(count: usize);
+        move_up(lines: usize);
+        move_down(lines: usize);
+        identify_terminal(intermediate: Option<char>);
+        device_status(kind: usize);
+        move_forward(cols: usize);
+        move_backward(cols: usize);
+        move_down_and_cr(rows: usize);
+        move_up_and_cr(rows: usize);
+        put_tab(count: u16);
+        backspace();
+        carriage_return();
+        linefeed();
+        bell();
+        substitute();
+        newline();
+        set_horizontal_tabstop();
+        scroll_up(lines: usize);
+        scroll_down(lines: usize);
+        insert_blank_lines(lines: usize);
+        delete_lines(lines: usize);
+        erase_chars(count: usize);
+        delete_chars(count: usize);
+        move_backward_tabs(count: u16);
+        move_forward_tabs(count: u16);
+        save_cursor_position();
+        restore_cursor_position();
+        clear_line(mode: ansi::LineClearMode);
+        clear_screen(mode: ansi::ClearMode);
+        clear_tabs(mode: ansi::TabulationClearMode);
+        set_tabs(interval: u16);
+        reset_state();
+        reverse_index();
+        terminal_attribute(attr: ansi::Attr);
+        set_mode(mode: ansi::Mode);
+        unset_mode(mode: ansi::Mode);
+        report_mode(mode: ansi::Mode);
+        set_private_mode(mode: ansi::PrivateMode);
+        unset_private_mode(mode: ansi::PrivateMode);
+        report_private_mode(mode: ansi::PrivateMode);
+        set_scrolling_region(top: usize, bottom: Option<usize>);
+        set_keypad_application_mode();
+        unset_keypad_application_mode();
+        set_active_charset(index: ansi::CharsetIndex);
+        configure_charset(index: ansi::CharsetIndex, charset: ansi::StandardCharset);
+        set_color(index: usize, color: Rgb);
+        dynamic_color_sequence(prefix: String, index: usize, terminator: &str);
+        reset_color(index: usize);
+        clipboard_store(clipboard: u8, data: &[u8]);
+        clipboard_load(clipboard: u8, terminator: &str);
+        decaln();
+        push_title();
+        pop_title();
+        text_area_size_pixels();
+        text_area_size_chars();
+        set_hyperlink(link: Option<ansi::Hyperlink>);
+        set_mouse_cursor_icon(icon: ansi::cursor_icon::CursorIcon);
+        report_keyboard_mode();
+        push_keyboard_mode(mode: ansi::KeyboardModes);
+        pop_keyboard_modes(to_pop: u16);
+        set_keyboard_mode(mode: ansi::KeyboardModes, behavior: ansi::KeyboardModesApplyBehavior);
+        set_modify_other_keys(mode: ansi::ModifyOtherKeys);
+        report_modify_other_keys();
+        set_scp(char_path: ansi::ScpCharPath, update_mode: ansi::ScpUpdateMode);
+    }
+}
+
 /// A terminal emulator without a display: bytes in, screen snapshots and replies out.
 pub struct TerminalModel {
     term: Term<Listener>,
     parser: Processor,
+    osc_limiter: OscLimiter,
     events: Listener,
     size: TerminalSize,
     title: Option<String>,
@@ -212,6 +457,7 @@ impl TerminalModel {
         Self {
             term: Term::new(config, &size, events.clone()),
             parser: Processor::new(),
+            osc_limiter: OscLimiter::new(),
             events,
             size,
             title: None,
@@ -231,7 +477,10 @@ impl TerminalModel {
     /// Feeds output from the remote program. Returns the bytes the terminal must send back, such
     /// as answers to cursor position and device attribute queries (empty almost always).
     pub fn advance(&mut self, bytes: &[u8]) -> Vec<u8> {
-        self.parser.advance(&mut self.term, bytes);
+        let mut term = MarkLimitedTerm(&mut self.term);
+        let parser = &mut self.parser;
+        self.osc_limiter
+            .filter(bytes, |run| parser.advance(&mut term, run));
         self.take_events()
     }
 
@@ -248,7 +497,7 @@ impl TerminalModel {
         if self.sync_deadline().is_none() {
             return Vec::new();
         }
-        self.parser.stop_sync(&mut self.term);
+        self.parser.stop_sync(&mut MarkLimitedTerm(&mut self.term));
         self.take_events()
     }
 
@@ -642,5 +891,156 @@ mod tests {
             term.paste_bytes("x\x1b[201~y"),
             b"\x1b[200~x[201~y\x1b[201~".to_vec()
         );
+    }
+
+    /// An OSC 2 title sequence with a payload of exactly `payload` bytes, without a terminator.
+    fn title_osc(payload: usize) -> Vec<u8> {
+        let mut bytes = b"\x1b]2;".to_vec();
+        bytes.resize(bytes.len() + payload - 2, b't');
+        bytes
+    }
+
+    fn marks_at(term: &TerminalModel, col: u16) -> usize {
+        term.snapshot().row(0)[usize::from(col)]
+            .zerowidth
+            .as_ref()
+            .map_or(0, |marks| marks.len())
+    }
+
+    #[test]
+    fn oversized_osc_is_discarded_and_output_resumes() {
+        for terminator in [&b"\x07"[..], b"\x1b\\", b"\x18", b"\x1b[0m"] {
+            let mut term = model(20, 2);
+            let mut input = title_osc(MAX_OSC_PAYLOAD_BYTES + 1);
+            input.extend_from_slice(terminator);
+            input.extend_from_slice(b"after\x1b[31mX");
+            term.advance(&input);
+            let snap = term.snapshot();
+            assert_eq!(snap.title, None, "after {terminator:?}");
+            assert_eq!(snap.row_text(0), "afterX", "after {terminator:?}");
+            assert_eq!(
+                snap.row(0)[5].fg,
+                Color::Named(NamedColor::Red),
+                "after {terminator:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unterminated_osc_holds_a_bounded_buffer() {
+        let mut term = model(20, 2);
+        term.advance(b"\x1b]2;");
+        for _ in 0..8 {
+            term.advance(&vec![b'x'; MAX_OSC_PAYLOAD_BYTES]);
+            assert!(term.osc_limiter.held.len() <= MAX_OSC_PAYLOAD_BYTES + 1);
+        }
+        assert_eq!(term.osc_limiter.scan, OscScan::Discarding);
+        assert_eq!(term.osc_limiter.held.capacity(), 0);
+        term.advance(b"\x07ok");
+        assert_eq!(term.snapshot().row_text(0), "ok");
+    }
+
+    #[test]
+    fn osc_at_the_limit_is_still_handled() {
+        let mut term = model(20, 2);
+        let mut input = title_osc(MAX_OSC_PAYLOAD_BYTES);
+        input.push(BEL);
+        term.advance(&input);
+        let title = term.snapshot().title.expect("title set");
+        assert_eq!(title.len(), MAX_OSC_PAYLOAD_BYTES - 2);
+    }
+
+    #[test]
+    fn long_hyperlink_is_kept() {
+        let mut term = model(20, 2);
+        let uri = format!("https://example.com/{}", "a".repeat(8000));
+        term.advance(format!("\x1b]8;;{uri}\x1b\\link\x1b]8;;\x1b\\ plain").as_bytes());
+        let origin = Point::new(Line(0), Column(0));
+        let link = term.term.grid()[origin].hyperlink().expect("a link");
+        assert_eq!(link.uri(), uri);
+        assert_eq!(term.snapshot().row_text(0), "link plain");
+    }
+
+    #[test]
+    fn marks_past_the_limit_are_dropped_for_that_cell() {
+        let mut term = model(10, 2);
+        let mut input = String::from("e");
+        input.extend(std::iter::repeat_n('\u{301}', MAX_ZEROWIDTH_PER_CELL + 500));
+        input.push('f');
+        input.push('\u{302}');
+        term.advance(input.as_bytes());
+        assert_eq!(marks_at(&term, 0), MAX_ZEROWIDTH_PER_CELL);
+        let snap = term.snapshot();
+        assert_eq!((snap.row(0)[0].c, snap.row(0)[1].c), ('e', 'f'));
+        assert_eq!(marks_at(&term, 1), 1, "the next cell has its own count");
+        // Writing over a full cell starts it afresh.
+        term.advance(b"\r");
+        term.advance("g\u{301}".as_bytes());
+        assert_eq!(term.snapshot().row(0)[0].c, 'g');
+        assert_eq!(marks_at(&term, 0), 1);
+    }
+
+    #[test]
+    fn marks_are_bounded_when_the_cursor_returns_or_output_is_synchronized() {
+        let mut term = model(10, 2);
+        term.advance(b"ab");
+        for _ in 0..MAX_ZEROWIDTH_PER_CELL + 10 {
+            // Back onto `a` and forward again, so no two marks arrive in a row.
+            term.advance("\x1b[D\u{301}\x1b[C".as_bytes());
+        }
+        assert_eq!(marks_at(&term, 0), MAX_ZEROWIDTH_PER_CELL);
+
+        let mut term = model(10, 2);
+        let mut input = String::from("\x1b[?2026he");
+        input.extend(std::iter::repeat_n('\u{301}', MAX_ZEROWIDTH_PER_CELL + 10));
+        input.push_str("\x1b[?2026l");
+        term.advance(input.as_bytes());
+        assert_eq!(marks_at(&term, 0), MAX_ZEROWIDTH_PER_CELL);
+    }
+
+    #[test]
+    fn real_combining_and_emoji_sequences_are_intact() {
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
+        let mut term = model(20, 2);
+        term.advance(format!("e\u{301}\u{323} {family}").as_bytes());
+        assert_eq!(marks_at(&term, 0), 2);
+        assert!(term.snapshot().row_text(0).starts_with("e\u{301}\u{323} "));
+    }
+
+    #[test]
+    fn input_split_across_chunks_parses_the_same() {
+        let mut input = b"a\x1b]2;my title\x1b\\b".to_vec();
+        input.extend_from_slice(&title_osc(MAX_OSC_PAYLOAD_BYTES + 1));
+        input.extend_from_slice(b"\x07c\x1b[32md");
+        input.extend_from_slice("e".as_bytes());
+        for _ in 0..MAX_ZEROWIDTH_PER_CELL + 5 {
+            input.extend_from_slice("\u{301}".as_bytes());
+        }
+        let mut whole = model(20, 2);
+        whole.advance(&input);
+        let expected = whole.snapshot();
+        assert_eq!(expected.title.as_deref(), Some("my title"));
+        assert_eq!(
+            expected.row_text(0).chars().take(4).collect::<String>(),
+            "abcd"
+        );
+
+        for chunk in [1, 2, 3, 7, 4096] {
+            let mut split = model(20, 2);
+            for piece in input.chunks(chunk) {
+                split.advance(piece);
+            }
+            assert_eq!(split.snapshot(), expected, "chunks of {chunk}");
+        }
+    }
+
+    #[test]
+    fn escape_sequences_that_only_look_like_osc_pass_through() {
+        // `]` after an intermediate ends that sequence; it does not start an OSC.
+        let mut limiter = OscLimiter::new();
+        let mut out = Vec::new();
+        limiter.filter(b"\x1b(]text", |run| out.extend_from_slice(run));
+        assert_eq!(out, b"\x1b(]text");
+        assert_eq!(limiter.scan, OscScan::Outside);
     }
 }
