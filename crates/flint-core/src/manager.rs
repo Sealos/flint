@@ -5160,6 +5160,37 @@ users:
         assert!(!telemetry::reads_token_file(&config, "missing"));
     }
 
+    // covers UP-25: On view watches only open views, so the feed follows the cluster's mode.
+    #[tokio::test]
+    async fn a_feed_runs_only_in_watch_mode_all() {
+        use crate::settings::WatchMode;
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager =
+            manager_reading(dir.path(), &kubeconfig_with("https://127.0.0.1:1")).await;
+        land_connection(&mut manager).await;
+        manager.active = Some("dev".to_owned());
+        assert!(dev_has_feed(&mut manager), "the default mode");
+
+        manager.settings = Arc::new(Settings {
+            watch_mode: WatchMode::OnView,
+            ..Settings::default()
+        });
+        assert!(!dev_has_feed(&mut manager), "on view by default");
+
+        manager.settings = Arc::new(Settings {
+            watch_mode: WatchMode::OnView,
+            cluster_watch_mode: [("dev".to_owned(), WatchMode::All)].into(),
+            ..Settings::default()
+        });
+        assert!(dev_has_feed(&mut manager), "all for this cluster");
+
+        manager.settings = Arc::new(Settings {
+            cluster_watch_mode: [("dev".to_owned(), WatchMode::OnView)].into(),
+            ..Settings::default()
+        });
+        assert!(!dev_has_feed(&mut manager), "on view for this cluster");
+    }
+
     #[tokio::test]
     async fn a_feed_runs_only_for_a_wanted_connected_cluster() {
         let dir = tempfile::tempdir().unwrap();

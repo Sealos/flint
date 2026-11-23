@@ -111,10 +111,7 @@ async fn a_failing_and_a_hung_member_leave_another_live() {
         .await
         .expect("the hung member's request should reach its server");
     until_status(&core.handle, "b", |s| *s == MemberStatus::Live).await;
-    // Pods have the view's watch and the feed's; nodes, with no view open, only the feed's.
-    let nodes = Gvr::core("nodes");
-    live.wait_for_watches(&pods(), 2, WAIT).await.unwrap();
-    live.wait_for_watches(&nodes, 1, WAIT).await.unwrap();
+    live.wait_for_watches(&pods(), 1, WAIT).await.unwrap();
     until_status(&core.handle, "c", |s| {
         matches!(s, MemberStatus::Failed { .. })
     })
@@ -122,13 +119,7 @@ async fn a_failing_and_a_hung_member_leave_another_live() {
     let reports = core.handle.running_set().await;
     let d = reports.iter().find(|r| r.cluster == "d").unwrap();
     assert_eq!(d.status, MemberStatus::Connecting, "still hanging");
-    let feed_watches = live.open_watches(&nodes);
-    assert_eq!(feed_watches, 1, "the feed watches each kind once");
-    assert_eq!(
-        live.open_watches(&pods()) - feed_watches,
-        1,
-        "the live member goes on"
-    );
+    assert_eq!(live.open_watches(&pods()), 1, "the live member goes on");
     hold.release();
 }
 

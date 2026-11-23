@@ -11,7 +11,7 @@ use flint_core::write::{
     WriteWarning,
 };
 use flint_core::{KindId, Settings, WatchMode, WatchTiming};
-use flint_e2e::fake_api::{CONTEXT, FakeApiServer, FakePod, Fault, Gvr, RequestRecord, Verb};
+use flint_e2e::fake_api::{CONTEXT, FakeApiServer, FakePod, Fault, Gvr, Verb};
 use serde_json::{Value, json};
 
 const WAIT: Duration = Duration::from_secs(30);
@@ -750,7 +750,7 @@ async fn a_failed_node_check_reports_the_listed_pods_as_not_tried() {
     let seen = server.arrivals();
     let order: Vec<_> = seen[from..]
         .iter()
-        .filter(|r| !is_feed_read(r) && (r.path == node_path || r.path == "/api/v1/pods"))
+        .filter(|r| r.path == node_path || r.path == "/api/v1/pods")
         .map(|r| (r.method.clone(), r.path.as_str()))
         .collect();
     assert_eq!(
@@ -856,35 +856,11 @@ fn set_labels(
     server.set_object(gvr, object);
 }
 
-/// The cluster-wide collections the connected cluster's telemetry feed lists and watches.
-const FEED_COLLECTIONS: [&str; 11] = [
-    "/api/v1/pods",
-    "/api/v1/nodes",
-    "/api/v1/events",
-    "/api/v1/persistentvolumeclaims",
-    "/apis/batch/v1/jobs",
-    "/apis/apps/v1/deployments",
-    "/apis/apps/v1/statefulsets",
-    "/apis/apps/v1/daemonsets",
-    "/apis/apps/v1/replicasets",
-    "/apis/metrics.k8s.io/v1beta1/pods",
-    "/apis/metrics.k8s.io/v1beta1/nodes",
-];
-
-/// Whether `request` is the telemetry feed's own read. The feed runs beside every write on the
-/// same server, so its reads land at any point of a recorded order. A drain's pod list is on one
-/// of these paths too, and stays in: only it selects by node.
-fn is_feed_read(request: &RequestRecord) -> bool {
-    request.method == http::Method::GET
-        && FEED_COLLECTIONS.contains(&request.path.as_str())
-        && !request.query.contains("fieldSelector=spec.nodeName")
-}
-
-/// The requests since the first `from`, without the telemetry feed's reads.
+/// The requests since the first `from`. These tests run in On view, which has no telemetry feed,
+/// so nothing but the action under test reads these objects.
 fn since(server: &FakeApiServer, from: usize) -> Vec<(http::Method, String)> {
     server.requests()[from..]
         .iter()
-        .filter(|r| !is_feed_read(r))
         .map(|r| (r.method.clone(), r.path.clone()))
         .collect()
 }

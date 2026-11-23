@@ -54,7 +54,7 @@ pub enum WatchMode {
     /// Watch every listable, watchable kind on the active cluster.
     #[default]
     All,
-    /// Watch a kind only while a view for it is open.
+    /// Watch a kind only while a view for it is open. The cluster has no telemetry feed.
     OnView,
 }
 

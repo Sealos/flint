@@ -1936,9 +1936,8 @@ async fn the_app_reads_logs_and_events_as_written() {
     );
 }
 
-/// Events about objects never get an answer: the server accepts the list and stalls. Only in the
-/// detail reads' namespace: the telemetry feed lists Warning events across all namespaces, and a
-/// stalled list of its own would hold a request these tests count until the feed's timeout.
+/// Events about objects never get an answer: the server accepts the list and stalls. Only the
+/// detail reads' own requests, in their namespace, so a cluster-wide list can't take the stall.
 fn stall_events(server: &FakeApiServer) {
     server.inject(
         Fault::delay(Duration::from_secs(3600))
@@ -1961,8 +1960,7 @@ async fn until_in_flight(server: &FakeApiServer, count: usize, within: Duration,
     });
 }
 
-/// How many detail reads' events requests have reached the fake server. The feed's cluster-wide
-/// list is not one of them.
+/// How many detail reads' events requests have reached the fake server.
 fn events_requests(server: &FakeApiServer) -> usize {
     server
         .arrivals()

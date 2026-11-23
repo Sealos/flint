@@ -17,6 +17,7 @@ use crate::connection::policy::Role;
 use crate::credential::CredentialSource;
 use crate::handle::ConnectionState;
 use crate::metrics_trend::TrendStore;
+use crate::settings::WatchMode;
 use crate::telemetry::Telemetry;
 
 /// A running feed and the connection attempt it follows.
@@ -27,11 +28,14 @@ pub(super) struct SlotFeed {
 }
 
 impl ClusterManager {
-    /// Whether `id` should have a feed now: it is selected or in the running set, its connection
-    /// is up and not paused, and that connection's credential can go on being used in its role.
-    /// A credential that runs a program is used only in the foreground.
+    /// Whether `id` should have a feed now: it is selected or in the running set, in watch mode
+    /// All, its connection is up and not paused, and that connection's credential can go on being
+    /// used in its role. A credential that runs a program is used only in the foreground.
+    ///
+    /// On view promises no watch of a kind without an open view, and a feed watches seven kinds
+    /// whatever is open, so that mode has no feed.
     fn wants_telemetry(&self, id: &str) -> bool {
-        if !self.wants_watches(id) {
+        if !self.wants_watches(id) || self.settings.watch_mode_for(id) != WatchMode::All {
             return false;
         }
         let Some(slot) = self.cluster(id) else {
