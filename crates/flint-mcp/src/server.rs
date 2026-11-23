@@ -2588,3 +2588,7 @@ mod tests {
 #[cfg(test)]
 #[path = "server_limits_tests.rs"]
 mod limits_tests;
+
+#[cfg(all(test, unix))]
+#[path = "server_confirmed_tests.rs"]
+mod confirmed_tests;
