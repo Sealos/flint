@@ -186,6 +186,29 @@ async fn an_unreadable_file_refuses_the_launch_and_keeps_consent() {
     assert!(manager.keep.consents.contains_key("dev"));
 }
 
+// A slot that started over with the same definition gets a connection of its own: a feed of the
+// earlier slot would be refused by every alert pass and never replaced.
+#[tokio::test]
+async fn a_new_slot_generation_replaces_the_kept_connection() {
+    let plugin = FakePlugin::new("exit 1\n");
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _path) = manager_with(&plugin, config.path().to_owned());
+    allow(&mut manager).await;
+    manager.sync_keep_watching();
+    let first = manager.keep.feeds["dev"].attempt;
+
+    manager.sync_keep_watching();
+    assert_eq!(manager.keep.feeds["dev"].attempt, first, "nothing changed");
+
+    manager.clusters[0].generation += 1;
+    manager.sync_keep_watching();
+    assert_ne!(manager.keep.feeds["dev"].attempt, first);
+    assert_eq!(
+        manager.keep.feeds["dev"].generation,
+        Some(manager.clusters[0].generation)
+    );
+}
+
 // No path brings consent back: an entry removed by hand and put back has none.
 #[tokio::test]
 async fn consent_is_not_restored_with_its_entry() {
