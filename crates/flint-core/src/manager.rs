@@ -191,7 +191,7 @@ impl Cluster {
         self.watches.set_scope(scope);
     }
 
-    fn summary(&self, history: &ContextHistory) -> ClusterSummary {
+    fn summary(&self, history: &ContextHistory, provisional: bool) -> ClusterSummary {
         let shown = history.shown(&self.info.name, self.info.server.as_deref());
         ClusterSummary {
             info: self.info.clone(),
@@ -200,13 +200,10 @@ impl Cluster {
             definition: shown.definition,
             endpoint: shown.endpoint,
             confirmed: shown.confirmed,
+            provisional,
         }
     }
 }
-
-/// What a slot shows while a kubeconfig file that can't be read may still change its definition.
-const AWAITING_CONFIRMATION: &str =
-    "waiting for confirmation: a kubeconfig file that may define this cluster can't be read";
 
 /// The pause before reading again files that were still changing when a read gave up.
 const READ_AGAIN_AFTER: Duration = Duration::from_millis(250);
@@ -1630,6 +1627,9 @@ impl ClusterManager {
             ConnectionState::Failed(error) => Err(LogError::retry(format!(
                 "\"{cluster}\" is not connected: {error}"
             ))),
+            ConnectionState::AwaitingConfirmation => Err(LogError::retry(format!(
+                "\"{cluster}\" is waiting for its kubeconfig to be confirmed"
+            ))),
             ConnectionState::Disconnected => {
                 self.ensure_connected(cluster);
                 Err(LogError::retry(format!("connecting to \"{cluster}\"")))
@@ -1934,6 +1934,15 @@ impl ClusterManager {
         self.held(id) || (self.cluster(id).is_some() && self.contexts.provisional(id))
     }
 
+    /// Every slot as front ends see it. `provisional` is [`Self::unsettled`], so it covers each
+    /// reason the write gate refuses an uncertain definition, a held slot included.
+    fn summaries(&self) -> Vec<ClusterSummary> {
+        self.clusters
+            .iter()
+            .map(|c| c.summary(&self.contexts, self.unsettled(&c.info.name)))
+            .collect()
+    }
+
     /// Whether nothing new may start for `id`: a held slot, or an entry that may be a later file's
     /// fallback and differs from the definition a load last confirmed. A provisional entry that
     /// matches it connects as usual, and so does one no load ever confirmed, unless connecting
@@ -1971,7 +1980,7 @@ impl ClusterManager {
                 && matches!(slot.state, ConnectionState::Disconnected)
             {
                 slot.awaiting_confirmation = true;
-                ConnectionState::Failed(cluster::SafeErrorText::reduced(AWAITING_CONFIRMATION))
+                ConnectionState::AwaitingConfirmation
             } else if !waiting && slot.awaiting_confirmation {
                 slot.awaiting_confirmation = false;
                 ConnectionState::Disconnected
@@ -2525,11 +2534,7 @@ impl ClusterManager {
         }
 
         let snapshot = ClustersSnapshot {
-            clusters: self
-                .clusters
-                .iter()
-                .map(|c| c.summary(&self.contexts))
-                .collect(),
+            clusters: self.summaries(),
             errors: loaded.errors.clone(),
             paths: path_exist,
         };
@@ -6561,16 +6566,48 @@ mod tests {
             assert_eq!(manager.next_attempt, next, "{user}: nothing started");
             let slot = manager.cluster("dev").unwrap();
             assert!(slot.client.is_none());
-            let ConnectionState::Failed(reason) = &slot.state else {
-                panic!("{user}: the state says it waits");
-            };
-            assert!(reason.as_str().contains("waiting for confirmation"));
+            assert_eq!(
+                slot.state,
+                ConnectionState::AwaitingConfirmation,
+                "{user}: the state says it waits, not that it failed"
+            );
 
             rewrite_file(&mut manager, &dir.path().join("first"), NO_CONTEXTS).await;
             assert!(!manager.contexts.provisional("dev"));
             let slot = manager.cluster("dev").unwrap();
             assert!(matches!(slot.state, ConnectionState::Connecting));
             assert_eq!(manager.next_attempt, next + 1, "{user}: connects once");
+        }
+    }
+
+    // What a summary says about writes is what the gate does, held slots and fallbacks alike.
+    #[tokio::test]
+    async fn a_summary_is_provisional_exactly_while_the_gate_refuses_for_it() {
+        // With a pin taken now, so only the definition's state can refuse it.
+        let refused = |manager: &ClusterManager| {
+            let pin = manager.session_pin("dev");
+            manager.write_pin_gate("dev", &pin).is_err()
+        };
+        let provisional = |manager: &ClusterManager| {
+            let summaries = manager.summaries();
+            summaries
+                .iter()
+                .find(|c| c.info.name == "dev")
+                .unwrap()
+                .provisional
+        };
+        for second in pauses() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut manager, yaml, first) = pausable(dir.path(), &second).await;
+            // Unlocked, so protection is not what refuses it below.
+            manager.unlocks.unlock("dev", "https://127.0.0.1:1");
+            assert!(!provisional(&manager) && !refused(&manager));
+
+            rewrite_file(&mut manager, &first, UNREADABLE).await;
+            assert!(provisional(&manager) && refused(&manager));
+
+            rewrite_file(&mut manager, &first, &yaml).await;
+            assert!(!provisional(&manager) && !refused(&manager));
         }
     }
 

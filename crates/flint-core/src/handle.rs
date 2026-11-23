@@ -296,6 +296,9 @@ pub enum ConnectionState {
     Connected(ServerVersion),
     /// Why it failed, as safe to show ([`crate::cluster::ClusterError::summary`]).
     Failed(crate::SafeErrorText),
+    /// Not connecting until a kubeconfig file that may define this cluster can be read. Nothing
+    /// went wrong with the connection, and the load that settles the definition connects it.
+    AwaitingConfirmation,
 }
 
 /// A cluster as the sidebar shows it.
@@ -317,6 +320,10 @@ pub struct ClusterSummary {
     /// A load confirmed the server shown. Otherwise it may be a fallback, showing only while a
     /// kubeconfig file before it can't be read.
     pub confirmed: bool,
+    /// A kubeconfig file that can't be read could still change this definition, so the write gate
+    /// refuses every write. Not the opposite of `confirmed`: a confirmed server can be provisional
+    /// again while a file is unreadable.
+    pub provisional: bool,
 }
 
 /// What the core's answer to a reload means: `None` when it stopped without answering.

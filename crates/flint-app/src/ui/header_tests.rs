@@ -277,6 +277,58 @@ async fn the_header_names_the_access_mode(cx: &mut TestAppContext) {
     t.wait_for_label(cx, "access-mode", "Read-only").await;
 }
 
+// The header never says writable while the core refuses writes on a provisional definition.
+#[gpui_kit::test]
+async fn the_header_says_writes_are_paused(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    let before = t.label(cx, "access-mode").unwrap();
+    assert_ne!(before, "Writes paused");
+
+    let set_provisional = |provisional, cx: &mut TestAppContext| {
+        t.model.update(cx, |model, cx| {
+            let alpha = model
+                .clusters
+                .iter_mut()
+                .find(|c| c.info.name == "kind-alpha")
+                .unwrap();
+            alpha.provisional = provisional;
+            cx.notify();
+        });
+    };
+    set_provisional(true, cx);
+    t.wait_for_label(cx, "access-mode", "Writes paused").await;
+    set_provisional(false, cx);
+    t.wait_for_label(cx, "access-mode", &before).await;
+}
+
+// Waiting for the kubeconfig is not a failed connection: it says so and offers no Retry.
+#[gpui_kit::test]
+async fn waiting_for_confirmation_is_not_a_failure(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    t.model.update(cx, |model, cx| {
+        let alpha = model
+            .clusters
+            .iter_mut()
+            .find(|c| c.info.name == "kind-alpha")
+            .unwrap();
+        alpha.state = ConnectionState::AwaitingConfirmation;
+        cx.notify();
+    });
+    t.wait_for_label(
+        cx,
+        "connection-waiting",
+        "Waiting for kubeconfig to be confirmed",
+    )
+    .await;
+    assert!(t.find(cx, "connection-retry").is_none());
+    assert!(t.find(cx, "nav-retry").is_none());
+    assert!(!t.available(cx).contains(&"workspace::RetryConnection"));
+}
+
 // #431: when the active context is re-pointed, the main area names both servers, without what a
 // kubeconfig URL may hold besides the address. Choosing another context clears it.
 #[gpui_kit::test]

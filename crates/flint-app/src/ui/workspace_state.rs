@@ -106,6 +106,7 @@ impl Workspace {
             Some(ConnectionState::Failed(e)) => Main::Failed {
                 error: connection_error_text(e),
             },
+            Some(ConnectionState::AwaitingConfirmation) => Main::AwaitingConfirmation,
             Some(_) if list.is_some() => Main::List,
             Some(ConnectionState::Connected(v)) => Main::Connected {
                 version: v.git_version.clone(),

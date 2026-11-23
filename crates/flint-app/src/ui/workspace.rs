@@ -30,7 +30,9 @@ use gpui_kit::*;
 
 use super::closing;
 use super::cluster_tag;
-use super::clusters::{ClustersModel, Presence, cluster_details, cluster_tooltip};
+use super::clusters::{
+    ClustersModel, Presence, cluster_details, cluster_tooltip, connection_stopped, state_label,
+};
 use super::confirm::{self, DialogText};
 use super::detail::{
     DetailEvent, DetailTab, DetailView, ObjectRef, Opening, TakeFocus, protected_reason, refused,
@@ -941,6 +943,9 @@ impl Workspace {
         let failed = model
             .active_cluster()
             .is_some_and(|c| matches!(c.state, ConnectionState::Failed(_)));
+        let waiting = model
+            .active_cluster()
+            .is_some_and(|c| c.state == ConnectionState::AwaitingConfirmation);
         let discovered = active
             .as_ref()
             .and_then(|c| model.discovered(c))
@@ -985,6 +990,7 @@ impl Workspace {
         }
         self.nav.update(cx, |nav, cx| {
             nav.set_connection_failed(failed, cx);
+            nav.set_awaiting_confirmation(waiting, cx);
             nav.set_cluster(
                 active.clone(),
                 discovered.discovery.clone(),
@@ -1836,9 +1842,25 @@ impl Workspace {
     ) -> impl IntoElement {
         let model = self.model.read(cx);
         let protection = model.protection(cluster);
-        let tip = protection_text(protection, &model.trust(cluster));
-        let text = access_mode_text(protection);
+        // Checked first: whatever the protection, the core refuses writes on this definition.
+        let paused = cluster.provisional;
+        let tip = if paused {
+            WRITES_PAUSED_TIP.to_owned()
+        } else {
+            protection_text(protection, &model.trust(cluster))
+        };
+        let text = if paused {
+            WRITES_PAUSED
+        } else {
+            access_mode_text(protection)
+        };
+        let short = if paused {
+            WRITES_PAUSED
+        } else {
+            access_mode_short_text(protection)
+        };
         let (icon, writable) = match protection {
+            _ if paused => (FlintIcon::Lock, false),
             Protection::Protected => (FlintIcon::Lock, false),
             Protection::Local | Protection::Unlocked => (FlintIcon::LockOpen, true),
             Protection::Trusted => (FlintIcon::ShieldCheck, true),
@@ -1863,11 +1885,7 @@ impl Workspace {
             .text_xs()
             .text_color(color)
             .child(Icon::new(icon).xsmall())
-            .child(if compact {
-                access_mode_short_text(protection)
-            } else {
-                text
-            })
+            .child(if compact { short } else { text })
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
     }
 
@@ -2159,11 +2177,12 @@ impl Workspace {
     /// What the main area shows of the list and the open detail. A failed connection shows
     /// neither, so there is nothing to go Back from.
     fn main_panes(&self, cx: &App) -> MainPanes {
-        let failed = matches!(
-            self.model.read(cx).active_cluster().map(|c| &c.state),
-            Some(ConnectionState::Failed(_))
-        );
-        if !self.narrow || self.detail.is_none() || self.list.is_none() || failed {
+        let stopped = self
+            .model
+            .read(cx)
+            .active_cluster()
+            .is_some_and(|c| connection_stopped(&c.state));
+        if !self.narrow || self.detail.is_none() || self.list.is_none() || stopped {
             MainPanes::Split
         } else if self.list_in_front {
             MainPanes::ListAlone
@@ -2286,8 +2305,7 @@ impl Workspace {
         let content: AnyElement = match (&self.list, &cluster.state) {
             // A failed connection stops the watches; say why instead of an endless "Loading".
             (Some(_), state)
-                if !matches!(state, ConnectionState::Failed(_))
-                    && self.main_panes(cx) == MainPanes::DetailAlone =>
+                if !connection_stopped(state) && self.main_panes(cx) == MainPanes::DetailAlone =>
             {
                 h_flex()
                     .id("detail-alone-pane")
@@ -2305,7 +2323,7 @@ impl Workspace {
                     .test_support()
                     .into_any_element()
             }
-            (Some(list), state) if !matches!(state, ConnectionState::Failed(_)) => h_flex()
+            (Some(list), state) if !connection_stopped(state) => h_flex()
                 .flex_1()
                 .min_h_0()
                 .child(div().flex_1().min_w_0().h_full().child(list.clone()))
@@ -2347,6 +2365,19 @@ impl Workspace {
                             .text_color(theme.muted_foreground)
                             .child("Pick a kind in the navigation."),
                     ),
+            ),
+            (_, ConnectionState::AwaitingConfirmation) => centered(
+                v_flex()
+                    .id("connection-waiting")
+                    .aria_label(state_label(&ConnectionState::AwaitingConfirmation))
+                    .test_support()
+                    .gap_1()
+                    .max_w(px(640.))
+                    .child(div().child(state_label(&ConnectionState::AwaitingConfirmation)))
+                    .child(div().text_sm().text_color(theme.muted_foreground).child(
+                        "A kubeconfig file that may define this cluster can't be read. \
+                                 Flint connects once it can.",
+                    )),
             ),
             (_, ConnectionState::Failed(message)) => centered(
                 v_flex()
@@ -2451,6 +2482,12 @@ fn access_mode_text(protection: Protection) -> &'static str {
         Protection::Trusted => "Trusted: writable",
     }
 }
+
+/// The access mode while the core refuses writes on a definition it can't confirm yet.
+const WRITES_PAUSED: &str = "Writes paused";
+
+const WRITES_PAUSED_TIP: &str =
+    "Writes are paused until Flint can read your kubeconfig files and confirm this cluster";
 
 /// The access mode on a narrow header's second row: still tells every mode apart.
 fn access_mode_short_text(protection: Protection) -> &'static str {
@@ -3042,10 +3079,10 @@ fn header_controls(
     cluster: &ClusterSummary,
     list: Option<&super::list::ResourceList>,
 ) -> HeaderControls {
-    let failed = matches!(cluster.state, ConnectionState::Failed(_));
+    let stopped = connection_stopped(&cluster.state);
     HeaderControls {
-        namespaces: !failed && list.is_none_or(|l| l.namespaced()),
-        watch_mode: !failed,
+        namespaces: !stopped && list.is_none_or(|l| l.namespaced()),
+        watch_mode: !stopped,
     }
 }
 

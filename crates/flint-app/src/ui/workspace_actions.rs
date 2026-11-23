@@ -952,6 +952,9 @@ impl Workspace {
             Some(ConnectionState::Failed(error)) => {
                 Some(format!("{cluster} is not connected: {error}"))
             }
+            Some(ConnectionState::AwaitingConfirmation) => Some(format!(
+                "{cluster} is waiting for its kubeconfig to be confirmed"
+            )),
             Some(ConnectionState::Disconnected) => Some(format!("{cluster} is not connected")),
             None => Some(format!("no kubeconfig context named {cluster}")),
         }

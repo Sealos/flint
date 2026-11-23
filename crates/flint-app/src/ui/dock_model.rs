@@ -340,6 +340,7 @@ mod tests {
             definition: 1,
             endpoint: 1,
             confirmed,
+            provisional: !confirmed,
         };
         let servers = confirmed_servers(&[summary("sure", true), summary("fallback", false)]);
         assert_eq!(
