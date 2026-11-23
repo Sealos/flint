@@ -1455,33 +1455,36 @@ async fn a_row_menu_stays_open_when_the_list_reorders(cx: &mut TestAppContext) {
     );
 }
 
+/// Pod `web` with a restarted sidecar, as fetched with `uid`.
+fn web_with_sidecar(uid: &str) -> ObjectDetail {
+    detail(json!({
+        "kind": "Pod",
+        "metadata": {"name": "web", "namespace": "demo", "uid": uid},
+        "spec": {"containers": [{"name": "app"}, {"name": "sidecar"}]},
+        "status": {"containerStatuses": [
+            {"name": "app", "restartCount": 0, "state": {"running": {}}},
+            {"name": "sidecar", "restartCount": 3,
+             "state": {"waiting": {"reason": "CrashLoopBackOff"}}}
+        ]}
+    }))
+}
+
 // A refresh can find that the pod's name now belongs to a replacement before the list drops the
-// old row. Logs go by pod name, so the old pod's cached containers must not be offered.
+// old row. Logs go by pod name, so a menu already open drops its picker and says why.
 #[gpui_kit::test]
-async fn a_replaced_pods_menu_offers_no_logs(cx: &mut TestAppContext) {
+async fn a_replaced_pods_open_menu_offers_no_logs(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
     select_row(cx, &t, "web");
-    let pod = |uid: &str| {
-        detail(json!({
-            "kind": "Pod",
-            "metadata": {"name": "web", "namespace": "demo", "uid": uid},
-            "spec": {"containers": [{"name": "app"}, {"name": "sidecar"}]},
-            "status": {"containerStatuses": [
-                {"name": "app", "restartCount": 0, "state": {"running": {}}},
-                {"name": "sidecar", "restartCount": 3,
-                 "state": {"waiting": {"reason": "CrashLoopBackOff"}}}
-            ]}
-        }))
-    };
-    show_fetched(cx, &t, pod("uid-web"));
-    show_fetched(cx, &t, pod("uid-replacement"));
-
-    let rows = open_menu(cx, &t, "web").await;
+    show_fetched(cx, &t, web_with_sidecar("uid-web"));
+    right_click(cx, &t, "web").await;
+    click_entry(cx, &t, 1);
+    assert_eq!(submenu(cx, &t), ["sidecar"]);
+    show_fetched(cx, &t, web_with_sidecar("uid-replacement"));
     assert_eq!(
-        rows[..4],
+        menu(cx, &t)[..4],
         [
             "Logs",
             "web was deleted",
@@ -1490,6 +1493,39 @@ async fn a_replaced_pods_menu_offers_no_logs(cx: &mut TestAppContext) {
         ]
     );
     click_entry(cx, &t, 2);
+    assert_eq!(dock_tabs(cx, &t).0, Vec::<String>::new());
+}
+
+// The same replaced pod from the keys, the pane's state and the registry: nothing opens, and
+// each says why.
+#[gpui_kit::test]
+async fn a_replaced_pod_refuses_logs_from_the_keys(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "kind-alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    show_fetched(cx, &t, web_with_sidecar("uid-web"));
+    show_fetched(cx, &t, web_with_sidecar("uid-replacement"));
+    focus_list(cx, &t);
+    press(cx, &t, "secondary-l");
+    assert_eq!(dock_tabs(cx, &t).0, Vec::<String>::new());
+    let logs = actions(cx, &t).remove(0);
+    assert_eq!(
+        (logs.enabled, logs.reason.as_deref()),
+        (false, Some("web was deleted"))
+    );
+    let refused = dispatch(
+        cx,
+        &t,
+        "detail::OpenContainerLogs",
+        json!({"container": "sidecar", "previous": true}),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{refused:?}").contains("web was deleted"),
+        "{refused:?}"
+    );
     assert_eq!(dock_tabs(cx, &t).0, Vec::<String>::new());
 }
 

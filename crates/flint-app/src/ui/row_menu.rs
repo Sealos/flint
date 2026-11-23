@@ -260,18 +260,10 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
         Some(why) => Err(why.clone()),
         None => checked.map_err(|e| first_line(&reason(&e), MAX_REASON)),
     };
-    // Logs are asked for by pod name, which a replacement pod may already have: a deleted pod's
-    // cached containers offer nothing.
-    let deleted = (subject == Subject::Pod && detail.is_gone())
-        .then(|| format!("{} was deleted", detail.object().name));
-    let log_gate = |checked: Result<(), registry::ActionError>| match &deleted {
-        Some(why) if blocked.is_none() => Err(why.clone()),
-        _ => gate(checked),
-    };
     Some(RowActions {
-        logs: log_gate(detail.log_plan::<OpenLogs>(None, false).map(drop)),
+        logs: gate(detail.log_plan::<OpenLogs>(None, false).map(drop)),
         previous: (subject == Subject::Pod)
-            .then(|| log_gate(detail.log_plan::<OpenPreviousLogs>(None, true).map(drop))),
+            .then(|| gate(detail.log_plan::<OpenPreviousLogs>(None, true).map(drop))),
         shell: gate(detail.shell_check::<OpenShell>(None)),
         shell_protected: blocked.is_none() && detail.shell_protected(),
         shell_pod: detail.shell_pod(),
