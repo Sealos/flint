@@ -22,7 +22,9 @@ use crate::connection::member::{
 use crate::connection::policy::Role;
 use crate::connection::schedule::{AttemptId, Jitter};
 use crate::credential::{CredentialSource, WriteCredential};
-use crate::handle::{ConnectionState, Event, MemberReport, MemberStatus};
+use crate::handle::{AdmittedMember, ConnectionState, Event, MemberReport, MemberStatus};
+use crate::recheck::Pinned;
+use crate::settings::ClusterPin;
 use crate::store::SyncState;
 
 /// The sizes a running set may have; an empty list clears it.
@@ -105,6 +107,104 @@ impl ClusterManager {
         self.sync_roles();
         self.arm_set_ticker();
         self.pump_members(now);
+    }
+
+    /// Makes the running set exactly `pins`, each bound to its exact server. Every pin is checked
+    /// before any member joins or leaves, so a refusal changes nothing.
+    pub(super) fn admit_running_set(
+        &mut self,
+        pins: Vec<ClusterPin>,
+    ) -> Result<Vec<AdmittedMember>, String> {
+        let mut ids: Vec<ClusterId> = Vec::with_capacity(pins.len());
+        for pin in &pins {
+            if ids.contains(&pin.context) {
+                return Err(format!("\"{}\" is in the set twice.", pin.context));
+            }
+            ids.push(pin.context.clone());
+        }
+        if !ids.is_empty() && !SET_SIZES.contains(&ids.len()) {
+            return Err(format!(
+                "A running set holds {} to {} clusters.",
+                SET_SIZES.start(),
+                SET_SIZES.end()
+            ));
+        }
+        if let Some(problem) = self.set_problem(&ids) {
+            return Err(problem);
+        }
+        let admitted = pins
+            .into_iter()
+            .map(|pin| self.admit_member(pin))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.set_running_set(ids);
+        Ok(admitted)
+    }
+
+    /// `pin` as an admitted member, if its context shows exactly that server, confirmed.
+    fn admit_member(&self, pin: ClusterPin) -> Result<AdmittedMember, String> {
+        let id = pin.context.as_str();
+        let shown = self.cluster(id).and_then(|c| c.info.server.as_deref());
+        if shown != Some(pin.server.as_str()) {
+            return Err(format!("\"{id}\" now points at another server."));
+        }
+        if self.unsettled(id) {
+            return Err(format!(
+                "\"{id}\" can't join while a kubeconfig file defining it is unreadable."
+            ));
+        }
+        let identity = ServerIdentity::new(pin.server.as_str());
+        if self
+            .members
+            .get(id)
+            .is_some_and(|member| *member.server() != identity)
+        {
+            return Err(format!("\"{id}\" is running on another server."));
+        }
+        let at = self.contexts.pin(id, Some(&pin.server));
+        if let Some(why) = self.contexts.check(Pinned::Logs, id, &at) {
+            return Err(why);
+        }
+        let endpoint = self.contexts.shown(id, Some(&pin.server)).endpoint;
+        Ok(AdmittedMember { pin, at, endpoint })
+    }
+
+    /// Why `member` no longer stands for its context, if so: it was removed, or moved, even if
+    /// it has moved back, or now shows another server (a fallback included).
+    pub(super) fn member_changed(&self, member: &AdmittedMember) -> Option<String> {
+        let id = member.context();
+        let changed = || format!("\"{id}\" changed since this set opened. Open the set again.");
+        if self.contexts.check(Pinned::Logs, id, &member.at).is_some() {
+            return Some(changed());
+        }
+        let shown = self.cluster(id).and_then(|c| c.info.server.as_deref());
+        let on_pin = shown.is_some_and(|server| member.pin.matches(id, server));
+        (!on_pin).then(changed)
+    }
+
+    /// Subscribes to `kind` on `member`, in one step with checking it still holds: a member that
+    /// changed starts no LIST or watch. Its subscription just never gets rows.
+    pub(super) fn subscribe_member(
+        &mut self,
+        id: u64,
+        member: AdmittedMember,
+        kind: crate::KindId,
+    ) {
+        if self.member_changed(&member).is_some() {
+            return;
+        }
+        let cluster = member.pin.context.clone();
+        self.subscriptions.insert(id, (cluster.clone(), kind));
+        self.reconcile(&cluster);
+    }
+
+    /// The read client of `member`, checked in the same step as it is taken.
+    pub(super) fn member_client(&self, member: &AdmittedMember) -> Result<kube::Client, String> {
+        if let Some(why) = self.member_changed(member) {
+            return Err(why);
+        }
+        let id = member.context();
+        self.client(id)
+            .ok_or_else(|| format!("\"{id}\" is not connected"))
     }
 
     fn set_problem(&self, wanted: &[ClusterId]) -> Option<String> {

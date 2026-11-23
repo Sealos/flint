@@ -108,6 +108,7 @@ async fn run(command: Command, target: &Target, cx: &mut AsyncApp) -> Result<Val
         }
         Command::State => state(target, cx),
         Command::Actions => actions(target, cx),
+        Command::QuitUnlessDialog => quit_unless_dialog(target, cx),
         Command::WaitFor {
             predicate,
             timeout_ms,
@@ -350,6 +351,19 @@ fn state(target: &Target, cx: &mut AsyncApp) -> Result<Value, Error> {
     serde_json::to_value(state).map_err(|e| failed("could not serialize the state", &e.to_string()))
 }
 
+/// Reads the open dialog and, with none open, dispatches Quit. Nothing awaits between the two, so
+/// no other command or task can open or close a dialog in between. A Quit that cannot be
+/// dispatched is not an error here: the caller still ends the app another way.
+fn quit_unless_dialog(target: &Target, cx: &mut AsyncApp) -> Result<Value, Error> {
+    let title = state(target, cx)?["dialog"]["title"].clone();
+    if title.is_null() {
+        in_window(target, cx, |window, cx| {
+            let _ = registry::dispatch("flint::Quit", Value::Null, window, cx);
+        })?;
+    }
+    Ok(json!({ "dialog": title }))
+}
+
 fn in_window<R>(
     target: &Target,
     cx: &mut AsyncApp,
@@ -407,6 +421,47 @@ mod tests {
         let line = handle_line(&request.to_string(), target, &mut async_cx).await;
         assert!(!line.contains('\n'));
         serde_json::from_str(&line).unwrap()
+    }
+
+    // An open dialog is reported and nothing quits; with none open the same command quits.
+    #[gpui_kit::test]
+    async fn quit_unless_dialog_leaves_an_open_dialog_alone(cx: &mut TestAppContext) {
+        use crate::ui::closing::Quits;
+        use gpui_kit::AppContext as _;
+        use gpui_kit::component::WindowExt as _;
+
+        let quits =
+            |cx: &mut TestAppContext| cx.update(|cx| cx.try_global::<Quits>().map_or(0, |q| q.0));
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        let target = target(&t, dir.path());
+        let quit = json!({"id": 1, "cmd": "quit_unless_dialog"});
+
+        let opened = ask(
+            cx,
+            &target,
+            json!({"id": 2, "cmd": "dispatch_action", "args": {
+                "name": "workspace::ExposeToAi", "args": {"cluster": "kind-alpha"},
+            }}),
+        )
+        .await;
+        assert_eq!(opened["ok"], true, "{opened}");
+        cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
+            .await;
+        let refused = ask(cx, &target, quit.clone()).await;
+        assert!(refused["result"]["dialog"].is_string(), "{refused}");
+        cx.run_until_parked();
+        assert_eq!(quits(cx), 0, "a dialog is open");
+
+        cx.update_window(t.window, |_, window, cx| {
+            window.dispatch_action(Box::new(gpui_kit::component::dialog::Cancel), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let quitting = ask(cx, &target, quit).await;
+        assert_eq!(quitting["result"]["dialog"], Value::Null, "{quitting}");
+        cx.run_until_parked();
+        assert_eq!(quits(cx), 1);
     }
 
     // Commands drive the window the way a user does, and `state` shows the result.
