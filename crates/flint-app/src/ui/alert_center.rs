@@ -546,6 +546,17 @@ impl AlertTracker {
                 sent.push(self.record(event, input));
             }
         }
+        if let Some(event) = self.engine.take_fleet_summary(now) {
+            let first = match &event {
+                AlertEvent::FleetSummary(summary) => Some(&summary.first),
+                AlertEvent::Summary(summary) => Some(&summary.cluster),
+                _ => None,
+            };
+            let input = first.and_then(|first| inputs.iter().find(|i| i.cluster == *first));
+            if let Some(input) = input {
+                sent.push(self.record(event, input));
+            }
+        }
         sent
     }
 

@@ -362,6 +362,7 @@ impl Workspace {
         let observe = cx.observe_in(&model, window, |this, _, window, cx| {
             this.show_appearance(window, cx);
             this.sync(window, cx);
+            this.follow_problem_connections(cx);
             cx.notify();
         });
         let nav = cx.new(NavPanel::new);

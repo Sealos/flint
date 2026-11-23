@@ -154,6 +154,7 @@ impl ResourceList {
 
     fn toggle_problems(&mut self, _: &ToggleProblemsOnly, _: &mut Window, cx: &mut Context<Self>) {
         self.problems.toggle();
+        self.reconcile_problem_selection(cx);
         self.recompute(cx);
         cx.notify();
     }
@@ -171,6 +172,7 @@ impl ResourceList {
     ) {
         if self.problems.update(values) {
             if self.problems.is_on() {
+                self.reconcile_problem_selection(cx);
                 self.recompute(cx);
             }
             cx.notify();
@@ -181,7 +183,14 @@ impl ResourceList {
     pub(super) fn problems_note(&self) -> Option<String> {
         let cluster = self.cluster.as_str();
         self.problems
-            .unchecked_note(&self.kind, &self.label, std::iter::once((cluster, cluster)))
+            .hidden_pick_note()
+            .or_else(|| {
+                self.problems.unchecked_note(
+                    &self.kind,
+                    &self.label,
+                    std::iter::once((cluster, cluster)),
+                )
+            })
             .or_else(|| self.problems.awaiting_note())
     }
 

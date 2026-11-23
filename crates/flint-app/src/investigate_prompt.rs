@@ -39,6 +39,8 @@ pub enum DisabledReason {
     PartialScope,
     /// The alert reports that something ended, so nothing is left to investigate.
     NothingOpen,
+    /// The alert counts problems on several clusters, and a prompt is about one.
+    SeveralClusters,
 }
 
 impl DisabledReason {
@@ -56,6 +58,7 @@ impl DisabledReason {
                 "This alert covers the whole cluster, and agents may read only part of it."
             }
             Self::NothingOpen => "This alert reports no open problem to investigate.",
+            Self::SeveralClusters => "This alert covers several clusters. Open one to investigate.",
         }
     }
 }
@@ -186,6 +189,7 @@ pub fn event_prompt(
                 render_unavailable(cluster, *open)
             })
         }
+        AlertEvent::FleetSummary(_) => InvestigatePrompt::Disabled(DisabledReason::SeveralClusters),
         AlertEvent::Resolved(_) | AlertEvent::Summary(_) | AlertEvent::ClusterAvailable { .. } => {
             InvestigatePrompt::Disabled(DisabledReason::NothingOpen)
         }

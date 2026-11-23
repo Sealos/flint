@@ -146,6 +146,50 @@ fn raised(tracker: &mut AlertTracker, cluster: &ClusterSummary, name: &str) -> N
 }
 
 #[test]
+fn a_change_across_many_clusters_sends_one_combined_notification() {
+    let clusters: Vec<ClusterSummary> = (0..8).map(|n| connected(&format!("c{n}"))).collect();
+    let discovery = complete();
+    let pass = |tracker: &mut AlertTracker, nodes: usize, now: Timestamp| {
+        let snapshots: Vec<TelemetrySnapshot> = clusters
+            .iter()
+            .map(|cluster| {
+                let id = &cluster.info.name;
+                let problems = (0..nodes)
+                    .map(|n| bad_node(id, &format!("node-{n}")))
+                    .collect();
+                snapshot(id, problems, now)
+            })
+            .collect();
+        let inputs: Vec<TrackerInput<'_>> = clusters
+            .iter()
+            .zip(&snapshots)
+            .map(|(cluster, snapshot)| {
+                input(
+                    cluster,
+                    Reading::Feed {
+                        snapshot,
+                        discovery: Some(&discovery),
+                    },
+                )
+            })
+            .collect();
+        tracker.observe(&inputs, now)
+    };
+    let mut tracker = tracker();
+    assert!(pass(&mut tracker, 0, at(0)).is_empty());
+    let sent = pass(&mut tracker, 8, at(600));
+    assert!(sent.len() <= 12, "{} notifications", sent.len());
+    let combined: Vec<&Notification> = sent
+        .iter()
+        .filter(|n| n.title.ends_with(" clusters"))
+        .collect();
+    assert_eq!(combined.len(), 1, "{sent:?}");
+    assert!(combined[0].body.contains("across"), "{}", combined[0].body);
+    let recent = tracker.find(&combined[0].tag).expect("listed");
+    assert!(matches!(recent.event, AlertEvent::FleetSummary(_)));
+}
+
+#[test]
 fn a_new_problem_notifies_once_and_names_the_cluster() {
     let prod = connected(PROD);
     let mut tracker = tracker();

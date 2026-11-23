@@ -417,6 +417,7 @@ impl CombinedResourceList {
         restart: bool,
         cx: &mut Context<Self>,
     ) -> Option<AnyWindowHandle> {
+        self.reconcile_problem_selection(cx);
         self.computing = false;
         self.view_ready = true;
         self.widths
@@ -435,7 +436,7 @@ impl CombinedResourceList {
             });
             self.selected_line = tracked.line;
             self.selected_seen = tracked.seen;
-            if tracked.gone || computed.selected_filtered_out {
+            if tracked.gone {
                 self.selected = None;
                 self.selected_line = None;
                 self.selected_seen = None;
@@ -487,6 +488,10 @@ impl CombinedResourceList {
         let Some(id) = self.shown.list.row_id(at) else {
             return;
         };
+        // Drawn from an earlier filter, with the new view still being computed.
+        if self.problems_hide(&id) {
+            return;
+        }
         window.focus(&self.focus, cx);
         self.selected_line = Some(line);
         self.selected_seen = model::row_seen(&self.shown, at);
@@ -649,8 +654,33 @@ impl CombinedResourceList {
             return;
         }
         self.problems.toggle();
+        self.reconcile_problem_selection(cx);
         self.recompute(cx);
         cx.notify();
+    }
+
+    /// Whether the Problems filter, as it is now, hides the row `id`. Judged on the newest
+    /// source, then on the one drawn.
+    fn problems_hide(&self, id: &CombinedRowId) -> bool {
+        [&self.latest, &self.shown].into_iter().any(|source| {
+            self.problems
+                .member_filter(
+                    source.kind.as_ref(),
+                    source.list.members().iter().map(|m| m.cluster()),
+                )
+                .is_some_and(|keep| problems_hide(source, &keep, id))
+        })
+    }
+
+    /// Ends a selection the filter hides, so its detail closes and it is no action's target.
+    fn reconcile_problem_selection(&mut self, cx: &mut Context<Self>) {
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|id| self.problems_hide(id))
+        {
+            self.clear_selection(cx);
+        }
     }
 
     /// Whether the Problems toggle applies to the kind shown.
@@ -674,6 +704,7 @@ impl CombinedResourceList {
     ) {
         if self.problems.update(values) {
             if self.problems.is_on() {
+                self.reconcile_problem_selection(cx);
                 self.recompute(cx);
             }
             cx.notify();
@@ -1171,8 +1202,6 @@ struct Computed {
     tracked: Option<TrackedRow>,
     /// Rows shown only because the feed has not judged them yet.
     awaiting: usize,
-    /// The Problems toggle hides the selected row, so its detail must close.
-    selected_filtered_out: bool,
 }
 
 fn compute_view(
@@ -1198,20 +1227,12 @@ fn compute_view(
     let tracked = selected
         .as_ref()
         .map(|id| model::track_selection(source, &view, id, seen.as_ref(), now));
-    let hidden = tracked
-        .as_ref()
-        .is_some_and(|t| t.line.is_none() && !t.gone);
-    let selected_filtered_out = hidden
-        && keep
-            .zip(selected.as_ref())
-            .is_some_and(|(keep, id)| problems_hide(source, keep, id));
     Computed {
         view,
         measured,
         selected,
         tracked,
         awaiting: awaiting.into_inner(),
-        selected_filtered_out,
     }
 }
 

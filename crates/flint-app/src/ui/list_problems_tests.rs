@@ -227,21 +227,69 @@ fn a_repointed_context_drops_values_and_refuses_an_earlier_read() {
     let values = || HashMap::from([("c".to_owned(), checked_with_pod("web", "uid-web", &[]))]);
     let mut feed = ProblemFeed::default();
     feed.follow(vec![identity(1)]);
-    feed.finish(&[identity(1)], values());
+    let read = feed.begin_read();
+    feed.finish(vec![identity(1)], &read, values());
     assert!(feed.value("c").is_some());
 
+    let old_read = feed.begin_read();
     feed.follow(vec![identity(2)]);
     assert!(
         feed.value("c").is_none(),
         "the old server's values are gone"
     );
-    feed.finish(&[identity(1)], values());
+    feed.finish(vec![identity(2)], &old_read, values());
     assert!(
         feed.value("c").is_none(),
         "a read of the old server is dropped"
     );
-    feed.finish(&[identity(2)], values());
+    let read = feed.begin_read();
+    feed.finish(vec![identity(2)], &read, values());
     assert!(feed.value("c").is_some());
+}
+
+#[test]
+fn a_read_is_checked_against_the_live_connection_not_the_last_tick() {
+    let values = || HashMap::from([("c".to_owned(), checked_with_pod("web", "uid-web", &[]))]);
+    let mut feed = ProblemFeed::default();
+    feed.follow(vec![identity(1)]);
+    let read = feed.begin_read();
+    // The context moved during the read, and no tick has noted it yet.
+    feed.finish(vec![identity(2)], &read, values());
+    assert!(feed.value("c").is_none());
+}
+
+#[test]
+fn a_read_that_outlived_a_move_and_back_is_refused() {
+    let values = || HashMap::from([("c".to_owned(), checked_with_pod("web", "uid-web", &[]))]);
+    let mut feed = ProblemFeed::default();
+    feed.follow(vec![identity(1)]);
+    let read = feed.begin_read();
+    feed.follow(vec![identity(2)]);
+    feed.follow(vec![identity(1)]);
+    feed.finish(vec![identity(1)], &read, values());
+    assert!(
+        feed.value("c").is_none(),
+        "A to B to A is not the same read"
+    );
+
+    let read = feed.begin_read();
+    feed.finish(vec![identity(1)], &read, values());
+    assert!(feed.value("c").is_some());
+}
+
+#[test]
+fn namespaces_arriving_in_reverse_are_collected_in_order() {
+    let mut objects = super::CountedObjects::default();
+    let started = Instant::now();
+    for n in (0..200_000).rev() {
+        let namespace = format!("ns-{n:06}");
+        objects.insert(Some(&namespace), "pod", Some(&format!("uid-{n}")));
+        objects.insert(Some(&namespace), "other", Some(&format!("uid-other-{n}")));
+    }
+    let namespaces = objects.namespaces();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(namespaces.len(), 200_000);
+    assert!(namespaces.windows(2).all(|pair| pair[0] < pair[1]));
 }
 
 #[test]
@@ -445,6 +493,93 @@ async fn the_toggle_on_the_fake_api_shows_exactly_the_failing_pods(cx: &mut Test
         list.view_state().rows.into_iter().map(|r| r.name).collect()
     });
     assert_eq!(names, ["broken-image", "crash-loop"]);
+}
+
+#[gpui_kit::test]
+async fn a_hidden_row_cannot_become_the_target(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let server = FakeApiServer::start_blocking(Options::default()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace_with(cx, dir.path(), |dir, _| {
+        let path = dir.join("kubeconfig");
+        server.write_kubeconfig(&path, Some("demo")).unwrap();
+        vec![path]
+    })
+    .await;
+    t.activate(cx, CONTEXT).await;
+    t.wait_for_state(cx, CONTEXT, |s| matches!(s, ConnectionState::Connected(_)))
+        .await;
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model
+            .read(cx)
+            .discovered(CONTEXT)
+            .is_some_and(|d| d.discovery.is_some())
+    })
+    .await;
+    t.dispatch(
+        cx,
+        "workspace::OpenView",
+        serde_json::json!({ "kind": "pods" }),
+    )
+    .unwrap();
+    let list = t.list(cx).expect("a list is open");
+    let toggle = serde_json::json!({});
+    t.dispatch(cx, "resource_list::ToggleProblemsOnly", toggle.clone())
+        .unwrap();
+    let watched = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        let view = watched.read(cx).view_state();
+        view.banners.is_empty() && view.rows.len() == 2
+    })
+    .await;
+    let (namespace, name) = list.read_with(cx, |list, _| {
+        let healthy = list
+            .latest
+            .rows
+            .iter()
+            .find(|row| !["broken-image", "crash-loop"].contains(&&*row.name))
+            .expect("a healthy pod");
+        (
+            healthy.namespace.as_deref().map(str::to_owned),
+            healthy.name.to_string(),
+        )
+    });
+
+    // Asked for by name, as the resource switcher does.
+    list.update(cx, |list, cx| {
+        list.select_listed(namespace.clone(), name.clone(), None, cx);
+        assert!(list.selected.is_none(), "a row the filter hides");
+        let note = list.problems_note().expect("the list says why");
+        assert!(note.contains(&name) && note.contains("Problems"), "{note}");
+    });
+
+    t.dispatch(cx, "resource_list::ToggleProblemsOnly", toggle.clone())
+        .unwrap();
+    let watched = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        watched.read(cx).view_state().rows.len() > 2
+    })
+    .await;
+    let select = serde_json::json!({ "namespace": namespace, "name": name });
+    t.dispatch(cx, "resource_list::SelectRow", select.clone())
+        .unwrap();
+    assert!(list.read_with(cx, |list, _| list.selected.is_some()));
+
+    // While the filtered rows are still being computed.
+    let permits = list.update(cx, |list, _| list.hold_computes());
+    t.dispatch(cx, "resource_list::ToggleProblemsOnly", toggle)
+        .unwrap();
+    assert!(
+        list.read_with(cx, |list, _| list.selected.is_none()),
+        "cleared before the new rows are published"
+    );
+    t.dispatch(cx, "resource_list::SelectRow", select).unwrap();
+    assert!(
+        list.read_with(cx, |list, _| list.selected.is_none()),
+        "a row still drawn but already filtered out"
+    );
+    drop(permits);
 }
 
 #[gpui_kit::test]

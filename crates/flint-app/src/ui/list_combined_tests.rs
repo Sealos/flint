@@ -188,6 +188,40 @@ async fn problems_only_closes_a_selected_row_it_hides(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+async fn problems_only_reconciles_the_selection_before_new_rows_land(cx: &mut TestAppContext) {
+    use super::super::problems_tests::checked_with_pod;
+
+    let (window, list) = open(cx, fixture());
+    click(cx, window, "row-ctx-prod/uid-api");
+    list.update(cx, |list, cx| {
+        list.problems.toggle();
+        list.set_problems(
+            std::collections::HashMap::from([(
+                "ctx-prod".to_owned(),
+                checked_with_pod("web", "uid-web", &["uid-api"]),
+            )]),
+            cx,
+        );
+        assert_eq!(list.selected, None, "cleared before the new view lands");
+    });
+    // The hidden row is still drawn until the view lands, and cannot be chosen again.
+    window
+        .update(cx, |_, window, cx| {
+            list.update(cx, |list, cx| {
+                let id = CombinedRowId {
+                    cluster: "ctx-prod".into(),
+                    uid: "uid-api".into(),
+                };
+                let line =
+                    super::model::line_of(&list.shown.list, &list.view, &id).expect("still drawn");
+                list.select_line(line, window, cx);
+                assert_eq!(list.selected, None);
+            });
+        })
+        .unwrap();
+}
+
+#[gpui_kit::test]
 async fn the_problems_toggle_does_nothing_for_a_kind_it_cannot_judge(cx: &mut TestAppContext) {
     let configmaps = |cluster: &str| {
         let mut shown = (*snapshot(cluster, "Data", &[("a", "1")], SyncState::Synced)).clone();

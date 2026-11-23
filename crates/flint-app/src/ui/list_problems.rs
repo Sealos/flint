@@ -348,6 +348,8 @@ pub struct ProblemFilter {
     clusters: HashMap<ClusterId, ClusterProblems>,
     /// Rows shown only because the feed has not judged them yet.
     awaiting: usize,
+    /// An object asked for by name that the toggle hides.
+    hidden_pick: Option<String>,
 }
 
 impl ProblemFilter {
@@ -358,6 +360,30 @@ impl ProblemFilter {
     pub fn toggle(&mut self) {
         self.on = !self.on;
         self.awaiting = 0;
+        self.hidden_pick = None;
+    }
+
+    /// Whether the toggle, with what is known now, hides `row` of `kind` on `cluster`.
+    pub fn hides(&self, kind: &KindId, cluster: &str, row: &Row) -> bool {
+        self.row_filter(kind, cluster)
+            .is_some_and(|filter| !filter.keeps(row))
+    }
+
+    /// Remembers that the object `name` was asked for and the toggle hides it.
+    pub fn note_hidden_pick(&mut self, name: &str) {
+        self.hidden_pick = Some(name.to_owned());
+    }
+
+    pub fn clear_hidden_pick(&mut self) {
+        self.hidden_pick = None;
+    }
+
+    /// With the toggle on, says that the object asked for is hidden.
+    pub fn hidden_pick_note(&self) -> Option<String> {
+        let name = self.hidden_pick.as_ref().filter(|_| self.on)?;
+        Some(format!(
+            "{name} has no problems, so it is hidden. Turn off Problems to open it."
+        ))
     }
 
     /// Records how many shown rows the feed has not judged yet.

@@ -96,14 +96,26 @@ pub struct ObjectFilter {
 
 /// The objects a count was made of. An object is matched by UID, so one replaced under the same
 /// name is not it; only an object that reported no UID is matched by name.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct CountedObjects {
     uids: std::collections::HashSet<String>,
     /// `namespace/name`, or `name` when cluster-scoped. A Kubernetes name holds no `/`.
     without_uid: std::collections::HashSet<String>,
-    /// Sorted. Empty when no object is namespaced.
-    namespaces: Vec<String>,
+    /// Empty when no object is namespaced.
+    namespaces: std::collections::HashSet<String>,
+    /// `namespaces` in order, sorted once when first asked for after a change.
+    sorted_namespaces: std::sync::OnceLock<Vec<String>>,
 }
+
+impl PartialEq for CountedObjects {
+    fn eq(&self, other: &Self) -> bool {
+        self.uids == other.uids
+            && self.without_uid == other.without_uid
+            && self.namespaces == other.namespaces
+    }
+}
+
+impl Eq for CountedObjects {}
 
 impl CountedObjects {
     pub fn insert(&mut self, namespace: Option<&str>, name: &str, uid: Option<&str>) {
@@ -116,11 +128,10 @@ impl CountedObjects {
             }
         }
         if let Some(namespace) = namespace
-            && let Err(at) = self
-                .namespaces
-                .binary_search_by(|n| n.as_str().cmp(namespace))
+            && !self.namespaces.contains(namespace)
         {
-            self.namespaces.insert(at, namespace.to_owned());
+            self.namespaces.insert(namespace.to_owned());
+            self.sorted_namespaces.take();
         }
     }
 
@@ -130,6 +141,15 @@ impl CountedObjects {
 
     fn matches(&self, namespace: Option<&str>, name: &str, uid: &str) -> bool {
         self.uids.contains(uid) || self.without_uid.contains(&Self::key(namespace, name))
+    }
+
+    /// The namespaces of the objects, sorted.
+    pub fn namespaces(&self) -> &[String] {
+        self.sorted_namespaces.get_or_init(|| {
+            let mut sorted: Vec<String> = self.namespaces.iter().cloned().collect();
+            sorted.sort_unstable();
+            sorted
+        })
     }
 
     fn key(namespace: Option<&str>, name: &str) -> String {
@@ -484,7 +504,7 @@ impl ResourceList {
     /// The namespaces shown: a narrowed list covers its objects, whatever the picker holds.
     fn scope(&self) -> &[String] {
         match &self.query.only {
-            Some(only) => &only.objects.namespaces,
+            Some(only) => only.objects.namespaces(),
             None => &self.query.namespaces,
         }
     }
@@ -621,7 +641,15 @@ impl ResourceList {
         };
         self.missing = None;
         self.selected_seen = rows_revision(&self.latest, namespace);
-        let row = &self.latest.rows[row];
+        let row = Arc::clone(&self.latest.rows[row]);
+        if self.problems.hides(&self.kind, &self.cluster, &row) {
+            // Named from outside the list: a row the filter hides is not a target.
+            self.clear_selection(cx);
+            self.problems.note_hidden_pick(&row.name);
+            cx.notify();
+            return;
+        }
+        self.problems.clear_hidden_pick();
         self.selected = Some(Selected {
             uid: row.uid.clone(),
             name: row.name.to_string(),
@@ -769,6 +797,7 @@ impl ResourceList {
         position: Option<usize>,
         cx: &mut Context<Self>,
     ) {
+        self.reconcile_problem_selection(cx);
         self.shown = snapshot;
         self.rows = rows;
         // `drawn` indexes into the snapshot's columns, and the automation state and `SortBy` read
@@ -820,30 +849,44 @@ impl ResourceList {
             // The selection changed while this ran: find it again.
             Some(_) => self.dirty = true,
         }
+        self.reconcile_problem_selection(cx);
+        cx.notify();
+    }
+
+    /// Whether the Problems filter, as it is now, hides the selected object. Judged on the
+    /// newest rows, then on those drawn, whichever job last computed them.
+    fn problems_hide_selected(&self) -> bool {
+        let Some(selected) = &self.selected else {
+            return false;
+        };
+        [&self.latest, &self.shown]
+            .into_iter()
+            .find_map(|rows| {
+                find_row(rows, selected.namespace.as_deref(), &selected.name)
+                    .map(|i| &rows.rows[i])
+                    .filter(|row| row.uid == selected.uid)
+            })
+            .is_some_and(|row| self.problems.hides(&self.kind, &self.cluster, row))
+    }
+
+    /// Ends a selection the filter hides, so its detail closes and it is no action's target.
+    pub(super) fn reconcile_problem_selection(&mut self, cx: &mut Context<Self>) {
         if self.problems_hide_selected() {
             self.hidden_selected = None;
             self.clear_selection(cx);
         }
-        cx.notify();
-    }
-
-    /// Whether the Problems toggle is what hides the selected row, so its detail must close.
-    fn problems_hide_selected(&self) -> bool {
-        let (Some(selected), Some(hidden)) = (&self.selected, &self.hidden_selected) else {
-            return false;
-        };
-        let Some(filter) = self.problems.row_filter(&self.kind, &self.cluster) else {
-            return false;
-        };
-        find_row(&self.shown, selected.namespace.as_deref(), &selected.name)
-            .map(|i| &self.shown.rows[i])
-            .is_some_and(|row| row.uid == *hidden && !filter.keeps(row))
     }
 
     fn select_index(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(&row_ix) = self.rows.get(ix) else {
             return;
         };
+        let row = &self.shown.rows[row_ix as usize];
+        // Drawn from an earlier filter, with the new rows still being computed.
+        if self.problems.hides(&self.kind, &self.cluster, row) {
+            return;
+        }
+        self.problems.clear_hidden_pick();
         let row = &self.shown.rows[row_ix as usize];
         let selected = Selected {
             uid: row.uid.clone(),

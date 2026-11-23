@@ -23,10 +23,19 @@ pub(in crate::ui) struct FeedIdentity {
     pub(in crate::ui) endpoint: u64,
 }
 
+/// Which connections a read was started for.
+pub(in crate::ui) struct ProblemRead {
+    identities: Vec<FeedIdentity>,
+    changes: u64,
+}
+
 /// The last values read, and the read under way.
 #[derive(Default)]
 pub(in crate::ui) struct ProblemFeed {
     identities: Vec<FeedIdentity>,
+    /// Counts every change of `identities`, so a read that outlived one is refused even when
+    /// the connections have come back to what they were.
+    changes: u64,
     seen: Feeds,
     values: HashMap<ClusterId, ClusterProblems>,
     building: bool,
@@ -34,23 +43,38 @@ pub(in crate::ui) struct ProblemFeed {
 }
 
 impl ProblemFeed {
-    /// Notes the connections on screen. Values read from any other are dropped.
-    pub(in crate::ui) fn follow(&mut self, identities: Vec<FeedIdentity>) {
-        if self.identities != identities {
-            self.identities = identities;
-            self.values.clear();
-            self.seen.clear();
+    /// Notes the connections on screen. Values read from any other are dropped. Returns whether
+    /// they changed.
+    pub(in crate::ui) fn follow(&mut self, identities: Vec<FeedIdentity>) -> bool {
+        if self.identities == identities {
+            return false;
+        }
+        self.identities = identities;
+        self.changes += 1;
+        self.values.clear();
+        self.seen.clear();
+        true
+    }
+
+    /// Marks a read of the connections followed now as under way.
+    pub(in crate::ui) fn begin_read(&mut self) -> ProblemRead {
+        self.building = true;
+        ProblemRead {
+            identities: self.identities.clone(),
+            changes: self.changes,
         }
     }
 
     /// Takes a finished read, unless the connections changed while it ran.
     pub(in crate::ui) fn finish(
         &mut self,
-        read_for: &[FeedIdentity],
+        live: Vec<FeedIdentity>,
+        read: &ProblemRead,
         values: HashMap<ClusterId, ClusterProblems>,
     ) {
         self.building = false;
-        if self.identities == read_for {
+        self.follow(live);
+        if self.changes == read.changes && self.identities == read.identities {
             self.values = values;
         } else {
             self.seen.clear();
@@ -143,7 +167,7 @@ impl Workspace {
             return;
         }
         self.problem_feed.seen = feeds.clone();
-        self.problem_feed.building = true;
+        let read = self.problem_feed.begin_read();
         let job = cx.background_spawn(async move {
             feeds
                 .into_iter()
@@ -153,10 +177,20 @@ impl Workspace {
         self.problem_feed._build = Some(cx.spawn(async move |this, cx| {
             let values = job.await;
             let _ = this.update(cx, |ws, cx| {
-                ws.problem_feed.finish(&identities, values);
+                let live = ws.problem_identities(cx);
+                ws.problem_feed.finish(live, &read, values);
                 ws.show_problems(cx);
             });
         }));
+    }
+
+    /// Drops what was read from a connection the moment the model says it changed, so no badge
+    /// of the old server stays up until the next tick.
+    pub(super) fn follow_problem_connections(&mut self, cx: &mut Context<Self>) {
+        let identities = self.problem_identities(cx);
+        if self.problem_feed.follow(identities) {
+            self.show_problems(cx);
+        }
     }
 
     /// Gives the open list and the navigation the values of the clusters on screen. A cluster
