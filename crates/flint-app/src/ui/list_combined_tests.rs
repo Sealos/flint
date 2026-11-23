@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use flint_core::combined::{CLUSTER_COLUMN_KEY, ColumnKey, CombinedMember, CombinedRowId};
+use flint_core::combined::{
+    CLUSTER_COLUMN_KEY, ColumnKey, CombinedMember, CombinedObjects, CombinedQuery, CombinedRowId,
+};
 use flint_core::settings::ClusterTag;
 use flint_core::{Cell, Column, ColumnRole, ColumnType, KindId, KindSnapshot, Row, SyncState};
 use gpui_kit::test::TestWindowExt as _;
@@ -11,9 +13,9 @@ use gpui_kit::{
     WindowOptions, px, size,
 };
 
-use super::super::super::list_model::combined::CombinedSource;
+use super::super::super::list_model::combined::{CombinedSource, EmptyState};
 use super::super::super::view_state::ListState;
-use super::{CombinedListEvent, CombinedResourceList, row_id};
+use super::{CombinedListEvent, CombinedResourceList, ShowAllCombinedRows, compute_view, row_id};
 
 fn column(name: &str, role: ColumnRole) -> Column {
     Column {
@@ -693,4 +695,80 @@ async fn a_member_that_is_not_current_gets_a_note(cx: &mut TestAppContext) {
     assert_eq!(shown.banners.len(), 1);
     assert_eq!(shown.banners[0].id, "list-member-ctx-staging");
     assert!(shown.banners[0].text.starts_with("staging:"));
+}
+
+fn only(cluster: &str, uid: &str) -> Arc<CombinedObjects> {
+    let mut objects = CombinedObjects::default();
+    objects.extend(cluster, [uid.to_owned()], []);
+    Arc::new(objects)
+}
+
+#[gpui_kit::test]
+async fn an_opening_filter_hides_the_earlier_rows_at_once(cx: &mut TestAppContext) {
+    let (_window, list) = open(cx, fixture());
+    assert_eq!(state(cx, &list).rows.len(), 4);
+    list.update(cx, |list, cx| {
+        list.show_objects("failing pods".into(), only("ctx-prod", "uid-web"), cx);
+        assert_eq!(list.view.line_count(), 0);
+        assert_eq!(list.empty_state(), Some(EmptyState::Loading));
+    });
+    assert_eq!(order(&state(cx, &list)), [pair("prod", "web")]);
+}
+
+#[gpui_kit::test]
+async fn a_result_for_an_earlier_filter_or_membership_is_discarded(cx: &mut TestAppContext) {
+    let (_window, list) = open(cx, fixture());
+    cx.run_until_parked();
+    let stale = |list: &CombinedResourceList| {
+        let source = list.latest.clone();
+        let query = CombinedQuery::default();
+        (
+            compute_view(&source, &query, None, None, None, 0),
+            source,
+            list.filter_revision,
+        )
+    };
+    let (computed, source, revision) = list.read_with(cx, |list, _| stale(list));
+    list.update(cx, |list, cx| {
+        list.show_objects("failing pods".into(), only("ctx-prod", "uid-web"), cx);
+        list.install_at(revision, computed, source, None, false, cx);
+        assert_eq!(list.view.line_count(), 0, "an earlier filter's rows");
+    });
+    assert_eq!(order(&state(cx, &list)), [pair("prod", "web")]);
+
+    let (computed, source, revision) = list.read_with(cx, |list, _| stale(list));
+    list.update(cx, |list, cx| {
+        list.set_source(one(prod(&[("web", "Pending")])), cx);
+        assert_ne!(list.filter_revision, revision);
+        list.install_at(revision, computed, source, None, false, cx);
+        assert!(list.view.line_count() <= 1, "an earlier membership's rows");
+    });
+    assert_eq!(order(&state(cx, &list)), [pair("prod", "web")]);
+}
+
+#[gpui_kit::test]
+async fn a_dashboard_filter_suspends_the_search_and_collapsed_groups(cx: &mut TestAppContext) {
+    let (window, list) = open(cx, fixture());
+    list.update(cx, |list, cx| {
+        list.query.text = "db".to_owned();
+        list.set_group_by_cluster(true, cx);
+        list.toggle_group("ctx-prod", cx);
+    });
+    cx.run_until_parked();
+    list.update(cx, |list, cx| {
+        list.show_objects("failing pods".into(), only("ctx-prod", "uid-web"), cx);
+    });
+    assert_eq!(order(&state(cx, &list)), [pair("prod", "web")]);
+    cx.update_window(window, |_, window, cx| {
+        list.update(cx, |list, cx| {
+            list.on_show_all(&ShowAllCombinedRows, window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    list.read_with(cx, |list, _| {
+        assert_eq!(list.query.collapsed, ["ctx-prod"]);
+        assert_eq!(list.query.text, "db");
+        assert_eq!(list.view.matched(), 1);
+    });
 }
