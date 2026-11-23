@@ -257,17 +257,21 @@ impl ProblemSummariser {
         let mut held = HashSet::new();
         for problem in snapshot.problems {
             let category = ProblemCategory::of_kind(problem.kind());
-            let Some(count) = &mut counts[category.index()] else {
-                continue;
-            };
+            // The wait runs even while the category's total is unknown: another kind in it may be
+            // unreadable, and that says nothing about how long this problem has lasted.
+            let mut waiting = false;
             if let Some(hold_down) = problem.hold_down() {
                 held.insert(&problem.id);
                 let first = self.first_seen.entry(problem.id.clone()).or_insert(now);
                 // A clock that moved back must not leave the wait longer than it should be.
                 *first = (*first).min(now);
-                if now.duration_since(*first) < hold_down {
-                    continue;
-                }
+                waiting = now.duration_since(*first) < hold_down;
+            }
+            let Some(count) = &mut counts[category.index()] else {
+                continue;
+            };
+            if waiting {
+                continue;
             }
             if counted.insert(CountedObject::of(category, &problem.id.subject)) {
                 *count = count.saturating_add(1);
@@ -276,6 +280,16 @@ impl ProblemSummariser {
         self.first_seen
             .retain(|id, _| held.contains(id) || unchecked(ProblemCategory::of_kind(id.kind)));
         ProblemCounts { counts }
+    }
+
+    /// Whether `problem`, from the pass just summarised, is not counted yet because its hold-down
+    /// has not passed. One this summariser has no start time for has not been held at all.
+    pub fn is_settling(&self, problem: &Problem, now: Timestamp) -> bool {
+        problem.hold_down().is_some_and(|hold_down| {
+            self.first_seen
+                .get(&problem.id)
+                .is_none_or(|first| now.duration_since(*first) < hold_down)
+        })
     }
 }
 

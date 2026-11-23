@@ -158,7 +158,7 @@ impl KindFeed {
         &self,
         api: &Api<K>,
         recover_by: Option<Instant>,
-    ) -> Result<(Vec<K>, String), ListEnd> {
+    ) -> Result<(Vec<(K, K::Extra)>, String), ListEnd> {
         let mut list = pin!(self.list(api));
         let Some(deadline) = recover_by else {
             return list.await;
@@ -177,7 +177,10 @@ impl KindFeed {
     }
 
     /// Every object of `K`, trimmed, and the version to watch from.
-    async fn list<K: Tracked>(&self, api: &Api<K>) -> Result<(Vec<K>, String), ListEnd> {
+    async fn list<K: Tracked>(
+        &self,
+        api: &Api<K>,
+    ) -> Result<(Vec<(K, K::Extra)>, String), ListEnd> {
         let _slot = self.limiter.acquire().await.map_err(|_| {
             ListEnd::Failed(CheckFailure {
                 cause: FailureCause::Failed,
@@ -193,8 +196,8 @@ impl KindFeed {
                 .map_err(|_| ListEnd::Failed(timed_out()))?
                 .map_err(|err| self.list_end(&err))?;
             for mut item in page.items {
-                item.trim();
-                items.push(item);
+                let extra = item.trim();
+                items.push((item, extra));
             }
             if items.len() > MAX_OBJECTS_PER_KIND {
                 return Err(ListEnd::TooLarge);
@@ -256,8 +259,8 @@ impl KindFeed {
                 WatchEvent::Added(item) | WatchEvent::Modified(item) => {
                     advance(version, item.meta().resource_version.as_deref());
                     let mut item = item;
-                    item.trim();
-                    if !K::store(&mut self.shared.stores()).upsert(item) {
+                    let extra = item.trim();
+                    if !K::store(&mut self.shared.stores()).upsert(item, extra) {
                         return WatchEnd::TooLarge;
                     }
                 }

@@ -93,8 +93,12 @@ fn snapshot(cluster: &str, problems: Vec<Problem>, now: Timestamp) -> TelemetryS
         kinds: WatchedKind::ALL.map(|kind| (kind, KindCheck::Current)),
         problems: problems.into(),
         unchecked: Vec::new(),
+        settling: Vec::new(),
         counts,
         metrics: MetricsCheck::Waiting,
+        capacity: None,
+        inventory: Default::default(),
+        version: Default::default(),
     }
 }
 

@@ -14,6 +14,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Resource;
 use serde::de::DeserializeOwned;
 
+use super::capacity::{ALLOCATABLE_KEYS, PodClaim, PodTally};
 use super::{KindCheck, WatchedKind};
 
 /// The most objects of one kind a feed holds.
@@ -31,17 +32,20 @@ fn key_of(meta: &ObjectMeta) -> Option<Key> {
 
 /// The objects of one kind, in a slice as the classifier takes them.
 #[derive(Debug)]
-pub(super) struct KindStore<K> {
+pub(super) struct KindStore<K: Tracked> {
     pub(super) check: KindCheck,
     items: Vec<K>,
+    /// What the items add up to.
+    totals: K::Totals,
     index: HashMap<Key, usize>,
 }
 
-impl<K> Default for KindStore<K> {
+impl<K: Tracked> Default for KindStore<K> {
     fn default() -> Self {
         Self {
             check: KindCheck::Starting,
             items: Vec::new(),
+            totals: K::Totals::default(),
             index: HashMap::new(),
         }
     }
@@ -53,29 +57,37 @@ impl<K: Tracked> KindStore<K> {
         (self.check == KindCheck::Current).then_some(self.items.as_slice())
     }
 
+    /// What the objects add up to, if they can be relied on.
+    pub(super) fn current_totals(&self) -> Option<&K::Totals> {
+        (self.check == KindCheck::Current).then_some(&self.totals)
+    }
+
     /// Replaces the objects with a fresh list. The check is unchanged: a kind becomes current
     /// only when its watch opens.
-    pub(super) fn replace(&mut self, items: Vec<K>) {
+    pub(super) fn replace(&mut self, items: Vec<(K, K::Extra)>) {
         self.items.clear();
+        self.totals = K::Totals::default();
         self.index.clear();
-        for item in items {
+        for (item, extra) in items {
             // A fresh list is already within the limit.
-            let _ = self.upsert(item);
+            let _ = self.upsert(item, extra);
         }
     }
 
     /// Adds or replaces an object. `false` if that would pass [`MAX_OBJECTS_PER_KIND`].
-    pub(super) fn upsert(&mut self, item: K) -> bool {
+    pub(super) fn upsert(&mut self, mut item: K, extra: K::Extra) -> bool {
         let Some(key) = key_of(item.meta()) else {
             return true;
         };
         if let Some(&at) = self.index.get(&key) {
-            self.items[at] = item;
+            item.count(extra, &mut self.totals);
+            std::mem::replace(&mut self.items[at], item).uncount(&mut self.totals);
             return true;
         }
         if self.items.len() >= MAX_OBJECTS_PER_KIND {
             return false;
         }
+        item.count(extra, &mut self.totals);
         self.index.insert(key, self.items.len());
         self.items.push(item);
         true
@@ -85,7 +97,7 @@ impl<K: Tracked> KindStore<K> {
         let Some(at) = key_of(item.meta()).and_then(|key| self.index.remove(&key)) else {
             return;
         };
-        self.items.swap_remove(at);
+        self.items.swap_remove(at).uncount(&mut self.totals);
         if let Some(moved) = self.items.get(at).and_then(|m| key_of(m.meta())) {
             self.index.insert(moved, at);
         }
@@ -95,6 +107,7 @@ impl<K: Tracked> KindStore<K> {
     pub(super) fn invalidate(&mut self, check: KindCheck) {
         self.check = check;
         self.items = Vec::new();
+        self.totals = K::Totals::default();
         self.index = HashMap::new();
     }
 }
@@ -133,11 +146,23 @@ impl Stores {
 pub(super) trait Tracked:
     Resource<DynamicType = ()> + Clone + DeserializeOwned + Debug + Send + Sync + 'static
 {
+    /// What trimming reads for [`Self::Totals`]. Handed to the store and not kept.
+    type Extra: Clone + Debug + Send + Sync + 'static;
+
+    /// What a store adds up over its objects.
+    type Totals: Default + Debug + Send + Sync + 'static;
+
     /// This kind's store.
     fn store(stores: &mut Stores) -> &mut KindStore<Self>;
 
-    /// Drops everything classification does not read.
-    fn trim(&mut self);
+    /// Drops everything the feed does not read, and returns [`Self::Extra`].
+    fn trim(&mut self) -> Self::Extra;
+
+    /// Adds this object to `totals`.
+    fn count(&mut self, _extra: Self::Extra, _totals: &mut Self::Totals) {}
+
+    /// Takes this object out of `totals`.
+    fn uncount(&self, _totals: &mut Self::Totals) {}
 }
 
 fn trim_meta(meta: &mut ObjectMeta) {
@@ -188,11 +213,15 @@ fn trim_container_status(status: &mut ContainerStatus) {
 }
 
 impl Tracked for Pod {
+    type Extra = Option<PodClaim>;
+    type Totals = PodTally;
+
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.pods
     }
 
-    fn trim(&mut self) {
+    fn trim(&mut self) -> Option<PodClaim> {
+        let claim = PodClaim::of(self);
         trim_meta(&mut self.metadata);
         self.spec = self.spec.take().map(|mut spec| {
             spec.containers.iter_mut().for_each(trim_container);
@@ -222,10 +251,27 @@ impl Tracked for Pod {
             }
             trimmed
         });
+        claim
+    }
+
+    /// Keeps the tally's slot in a field trimming has emptied, so a pod costs no extra memory.
+    fn count(&mut self, claim: Option<PodClaim>, totals: &mut PodTally) {
+        if let (Some(spec), Some(claim)) = (&mut self.spec, claim) {
+            spec.active_deadline_seconds = Some(totals.add(&claim));
+        }
+    }
+
+    fn uncount(&self, totals: &mut PodTally) {
+        if let Some(slot) = self.spec.as_ref().and_then(|s| s.active_deadline_seconds) {
+            totals.remove(slot);
+        }
     }
 }
 
 impl Tracked for Node {
+    type Extra = ();
+    type Totals = ();
+
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.nodes
     }
@@ -238,8 +284,14 @@ impl Tracked for Node {
             for condition in conditions.iter_mut().flatten() {
                 condition.message = None;
             }
+            let allocatable = status.allocatable.map(|list| {
+                list.into_iter()
+                    .filter(|(name, _)| ALLOCATABLE_KEYS.contains(&name.as_str()))
+                    .collect()
+            });
             NodeStatus {
                 conditions,
+                allocatable,
                 ..NodeStatus::default()
             }
         });
@@ -247,6 +299,9 @@ impl Tracked for Node {
 }
 
 impl Tracked for Job {
+    type Extra = ();
+    type Totals = ();
+
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.jobs
     }
@@ -268,6 +323,9 @@ impl Tracked for Job {
 }
 
 impl Tracked for Deployment {
+    type Extra = ();
+    type Totals = ();
+
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.deployments
     }
@@ -285,6 +343,9 @@ impl Tracked for Deployment {
 }
 
 impl Tracked for StatefulSet {
+    type Extra = ();
+    type Totals = ();
+
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.stateful_sets
     }
@@ -301,6 +362,9 @@ impl Tracked for StatefulSet {
 }
 
 impl Tracked for DaemonSet {
+    type Extra = ();
+    type Totals = ();
+
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.daemon_sets
     }
@@ -316,6 +380,9 @@ impl Tracked for DaemonSet {
 }
 
 impl Tracked for ReplicaSet {
+    type Extra = ();
+    type Totals = ();
+
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.replica_sets
     }
@@ -354,7 +421,7 @@ mod tests {
     #[test]
     fn a_trimmed_pod_keeps_what_classification_reads_and_no_template_values() {
         let mut trimmed = pod("a");
-        trimmed.trim();
+        let _ = trimmed.trim();
         let text = serde_json::to_string(&trimmed).unwrap();
         for gone in ["hunter2", "TOKEN", "secret-looking", "server text", "app:1"] {
             assert!(!text.contains(gone), "{gone} was kept: {text}");
@@ -372,9 +439,9 @@ mod tests {
     #[test]
     fn the_store_replaces_removes_and_keeps_its_index() {
         let mut store = KindStore::<Pod>::default();
-        store.replace(vec![pod("a"), pod("b"), pod("c")]);
+        store.replace(vec![(pod("a"), None), (pod("b"), None), (pod("c"), None)]);
         store.remove(&pod("a"));
-        assert!(store.upsert(pod("b")));
+        assert!(store.upsert(pod("b"), None));
         store.remove(&pod("c"));
         store.check = KindCheck::Current;
         let names: Vec<_> = store
@@ -398,16 +465,16 @@ mod tests {
             ..ReplicaSet::default()
         };
         for i in 0..MAX_OBJECTS_PER_KIND {
-            assert!(store.upsert(set(i)));
+            assert!(store.upsert(set(i), ()));
         }
-        assert!(!store.upsert(set(MAX_OBJECTS_PER_KIND)));
-        assert!(store.upsert(set(0)));
+        assert!(!store.upsert(set(MAX_OBJECTS_PER_KIND), ()));
+        assert!(store.upsert(set(0), ()));
     }
 
     #[test]
     fn objects_held_are_not_current_until_the_check_says_so() {
         let mut store = KindStore::<Pod>::default();
-        store.replace(vec![pod("a")]);
+        store.replace(vec![(pod("a"), None)]);
         assert!(store.current().is_none());
         store.check = KindCheck::Current;
         assert_eq!(store.current().map(<[Pod]>::len), Some(1));
