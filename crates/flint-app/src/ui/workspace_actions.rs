@@ -1449,19 +1449,22 @@ fn detail<'a>(ws: &Workspace, cx: &'a App) -> Option<&'a DetailView> {
     ws.detail.as_ref().map(|d| d.read(cx))
 }
 
-/// The shell tab the dock shows, if it is visible and shows one.
-/// Whether the dock's shown tab can start its log (`logs`) or shell session again, on a cluster
-/// that takes new sessions now.
+/// Whether the dock's shown tab can start its log (`logs`) or shell session again. Not while its
+/// cluster is paused; one that is only disconnected stays available, and running it says why.
 fn restartable_here(ws: &Workspace, logs: bool, cx: &App) -> bool {
     let dock = ws.dock.read(cx);
     dock.restartable(logs, cx)
         .and_then(|id| dock.tab(id))
         .is_some_and(|tab| {
-            ws.sessions_blocked(tab.item(cx).tab_key().context(), cx)
-                .is_none()
+            let key = tab.item(cx).tab_key();
+            !ws.cluster_summary(key.context(), cx).is_some_and(|c| {
+                c.state == ConnectionState::AwaitingConfirmation
+                    || ws.model.read(cx).sessions_paused(c)
+            })
         })
 }
 
+/// The shell tab the dock shows, if it is visible and shows one.
 fn shell<'a>(ws: &Workspace, cx: &'a App) -> Option<&'a TerminalView> {
     ws.dock.read(cx).active_terminal().map(|t| t.read(cx))
 }
