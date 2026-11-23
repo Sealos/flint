@@ -343,6 +343,10 @@ pub(in crate::ui) fn check(
     if let Some(why) = ws.sessions_blocked(&object.cluster, cx) {
         return Err(why.into());
     }
+    // Checked before protection, as the access mode is: no unlock would allow this write.
+    if let Some(why) = ws.member_writes_paused(&object.cluster, cx) {
+        return Err(why.into());
+    }
     if ws.is_protected(&object.cluster, cx) {
         return Err(Refusal {
             why: protected_reason(&ws.cluster_names(cx).exact(&object.cluster)),
@@ -509,7 +513,8 @@ fn confirm_review(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let core = ws.core(cx).clone();
+    // The handle it was reviewed through: a set's row runs bound to its member too.
+    let core = request.core.clone();
     let names = ws.cluster_names(cx);
     let this = cx.weak_entity();
     let handle = window.window_handle();

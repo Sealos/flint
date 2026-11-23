@@ -401,6 +401,9 @@ impl DetailView {
         if let Some(why) = &self.sessions_blocked {
             return Some(why.clone());
         }
+        if let Some(why) = self.row_writes_paused() {
+            return Some(why.to_owned());
+        }
         if self.protected {
             return Some(protected_reason(&self.cluster_label));
         }

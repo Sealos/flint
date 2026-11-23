@@ -517,6 +517,71 @@ async fn a_protected_members_row_refuses_its_actions(cx: &mut TestAppContext) {
     assert!(why.contains("kind-beta"), "{why}");
 }
 
+// A member whose definition can't be confirmed keeps its row to read, says writes are paused,
+// and offers none of them, however it is unlocked. They come back once it is confirmed.
+#[gpui_kit::test]
+async fn a_member_with_paused_writes_keeps_its_row_and_offers_no_write(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    connect(cx, &t, "kind-alpha");
+    connect(cx, &t, "kind-beta");
+    open_both(cx, &t).await;
+    select_row(cx, &t, "kind-beta");
+    let detail = t.detail(cx).expect("the row's detail");
+    let set_provisional = |provisional, cx: &mut TestAppContext| {
+        t.model.update(cx, |model, cx| {
+            let beta = model
+                .clusters
+                .iter_mut()
+                .find(|c| c.info.name == "kind-beta")
+                .unwrap();
+            beta.provisional = provisional;
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    set_provisional(true, cx);
+    t.wait_for_label(cx, "set-member-kind-beta", "kind-beta: Writes paused")
+        .await;
+    assert_eq!(detail_cluster(cx, &t).as_deref(), Some("kind-beta"));
+    t.workspace.read_with(cx, |ws, cx| {
+        let why = available(ws, ResourceAction::Delete, cx).unwrap_err();
+        assert!(why.contains("paused"), "{why}");
+        let edit = detail.read(cx).edit_blocked().unwrap();
+        assert!(edit.contains("paused"), "{edit}");
+        assert!(ws.session_member("kind-beta", cx).is_ok(), "reads go on");
+    });
+    let request = crate::ui::terminal_model::ShellRequest {
+        cluster: "kind-beta".into(),
+        namespace: "default".into(),
+        pod: "web".into(),
+        container: None,
+    };
+    let (workspace, window) = (t.workspace.clone(), t.window);
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| ws.open_shell(request, true, window, cx))
+    })
+    .unwrap();
+    t.workspace.read_with(cx, |ws, cx| {
+        assert!(ws.dock.read(cx).tab_ids().is_empty(), "no shell opened");
+        let why = ws.action_error().unwrap();
+        assert!(why.contains("paused"), "{why}");
+    });
+
+    set_provisional(false, cx);
+    t.wait_for_label(cx, "set-member-kind-beta", "kind-beta")
+        .await;
+    t.workspace.read_with(cx, |ws, cx| {
+        assert_eq!(ws.member_writes_paused("kind-beta", cx), None);
+        assert!(
+            !detail
+                .read(cx)
+                .edit_blocked()
+                .is_some_and(|w| w.contains("paused"))
+        );
+    });
+}
+
 #[gpui_kit::test]
 async fn a_member_needing_sign_in_is_shown_and_its_row_closes(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
@@ -717,6 +782,8 @@ fn a_member_is_refused_unless_it_is_the_pinned_confirmed_cluster() {
         definition: 1,
         endpoint: 1,
         confirmed,
+        provisional: !confirmed,
+        paused: false,
     };
     let report = |paused, status| MemberReport {
         cluster: "prod".into(),
@@ -730,6 +797,23 @@ fn a_member_is_refused_unless_it_is_the_pinned_confirmed_cluster() {
         member_refusal(&pin, Some(&current), Some(&live), "prod"),
         None
     );
+    // Unchanged while a file is unreadable: it keeps reading, and only its writes are paused.
+    let writes_paused = ClusterSummary {
+        provisional: true,
+        ..current.clone()
+    };
+    assert_eq!(
+        member_refusal(&pin, Some(&writes_paused), Some(&live), "prod"),
+        None
+    );
+    // The summary says so before the next member report does.
+    let paused = ClusterSummary {
+        provisional: true,
+        paused: true,
+        ..current.clone()
+    };
+    let why = member_refusal(&pin, Some(&paused), None, "prod").unwrap();
+    assert!(why.contains("paused"), "{why}");
     for (summary, report, says) in [
         (None, None, "no longer"),
         (

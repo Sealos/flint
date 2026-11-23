@@ -835,6 +835,10 @@ impl Workspace {
                 return;
             }
         };
+        if let Some(why) = self.member_writes_paused(&request.cluster, cx) {
+            self.refuse(refused(Opening::Shell, &why), cx);
+            return;
+        }
         let core = self.session_core(member.as_ref(), cx);
         let key = TabKey::Shell(request.clone());
         let cluster = self.tab_cluster(&key, cx);
@@ -912,6 +916,7 @@ impl Workspace {
         let cluster = detail.read(cx).object().cluster.clone();
         let why = self.sessions_blocked(&cluster, cx);
         let protected = self.is_protected(&cluster, cx);
+        let writes_paused = self.member_writes_paused(&cluster, cx);
         let label = self.cluster_names(cx).exact(&cluster);
         // A set's row stays on its admitted server, which the write gate then holds it to.
         let server = match self.sets.member(&cluster) {
@@ -923,6 +928,7 @@ impl Workspace {
         detail.update(cx, |d, cx| {
             d.set_sessions_blocked(why, cx);
             d.set_protected(protected, label, cx);
+            d.set_row_writes_paused(writes_paused, cx);
             d.set_server(server);
         });
     }
@@ -934,10 +940,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(detail) = self.detail.as_ref().map(Entity::downgrade) else {
+        let Some(detail) = self.detail.as_ref() else {
             return;
         };
-        let core = self.model.read(cx).core().clone();
+        // The handle it was reviewed through: a set's row runs bound to its member too.
+        let core = detail.read(cx).write_core().clone();
+        let detail = detail.downgrade();
         let names = self.cluster_names(cx);
         let handle = window.window_handle();
         // The same claim as the row actions: one write at a time per object.

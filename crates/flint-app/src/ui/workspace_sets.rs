@@ -35,7 +35,7 @@ use super::super::registry::{
     OpenClusterSet, OpenPickedClusters, OpenSelectedRow, SaveClusterSet, SelectFirst, SelectLast,
     SelectNext, SelectPrev, ToggleClusterPicking, TogglePickedCluster,
 };
-use super::{Workspace, takes_focus};
+use super::{WRITES_PAUSED, Workspace, takes_focus, writes_paused_reason};
 
 /// How often the running set's members are asked for what the connection state leaves out.
 const REPORT_EVERY: Duration = Duration::from_secs(1);
@@ -162,18 +162,19 @@ pub(super) fn member_refusal(
     if !on_pin {
         return Some(format!("{shown} now points at another server"));
     }
-    let report = report?;
-    if report.paused {
-        return Some(format!(
-            "{shown} is paused: a kubeconfig file defining it can't be read"
-        ));
+    if summary.paused || report.is_some_and(|r| r.paused) {
+        return Some(paused_text(shown));
     }
-    match &report.status {
+    match &report?.status {
         MemberStatus::SignInNeeded { .. } => {
             Some(format!("{shown} needs sign-in: select it in the sidebar"))
         }
         _ => None,
     }
+}
+
+fn paused_text(shown: &str) -> String {
+    format!("{shown} is paused: a kubeconfig file defining it can't be read")
 }
 
 /// `snapshot` holding no rows, in `state`: what a member shows before its rows are confirmed as
@@ -187,16 +188,27 @@ fn without_rows(snapshot: &KindSnapshot, state: SyncState) -> Arc<KindSnapshot> 
     })
 }
 
-/// What a member's status note says, when it has something to say.
-fn status_note(report: &MemberReport) -> Option<&'static str> {
-    if report.paused {
-        return Some("Paused");
+/// What a member's status note says, when it has something to say. A paused member starts
+/// nothing, so that says it all; otherwise paused writes never hide the connection's state.
+fn member_note(
+    report: Option<&MemberReport>,
+    sessions_paused: bool,
+    writes_paused: bool,
+) -> Option<String> {
+    if sessions_paused || report.is_some_and(|r| r.paused) {
+        return Some("Paused".to_owned());
     }
-    match report.status {
+    let status = report.and_then(|r| match r.status {
         MemberStatus::SignInNeeded { .. } => Some("Sign-in needed"),
         MemberStatus::Reconnecting { .. } => Some("Reconnecting"),
         MemberStatus::Failed { .. } => Some("Failed"),
         _ => None,
+    });
+    match (status, writes_paused) {
+        (Some(status), true) => Some(format!("{status}, writes paused")),
+        (Some(status), false) => Some(status.to_owned()),
+        (None, true) => Some(WRITES_PAUSED.to_owned()),
+        (None, false) => None,
     }
 }
 
@@ -722,12 +734,24 @@ impl Workspace {
             ));
         }
         let report = run.reports.iter().find(|r| r.cluster == cluster);
-        member_refusal(
-            member.pin(),
-            self.cluster_summary(cluster, cx),
-            report,
-            &shown,
-        )
+        let summary = self.cluster_summary(cluster, cx);
+        member_refusal(member.pin(), summary, report, &shown).or_else(|| {
+            // The core's published state: never behind what the gate decides.
+            summary
+                .is_some_and(|c| self.model.read(cx).sessions_paused(c))
+                .then(|| paused_text(&shown))
+        })
+    }
+
+    /// Why a set member's row may read but not write now: the core refuses writes on its
+    /// definition. `None` for a cluster outside the open set.
+    pub(in crate::ui) fn member_writes_paused(&self, cluster: &str, cx: &App) -> Option<String> {
+        self.sets.member(cluster)?;
+        let summary = self.cluster_summary(cluster, cx)?;
+        self.model
+            .read(cx)
+            .writes_paused(summary)
+            .then(|| writes_paused_reason(&self.cluster_names(cx).exact(cluster)))
     }
 
     /// The member a new session on `cluster` is bound to while a set has it, or why none may
@@ -1010,13 +1034,16 @@ impl Workspace {
                 let context = member.context();
                 let shown = names.exact(context);
                 let note = if run.changed.contains(context) {
-                    Some("Changed")
+                    Some("Changed".to_owned())
                 } else {
-                    run.reports
-                        .iter()
-                        .find(|r| r.cluster == context)
-                        .and_then(status_note)
+                    let summary = self.cluster_summary(context, cx);
+                    member_note(
+                        run.reports.iter().find(|r| r.cluster == context),
+                        summary.is_some_and(|c| self.model.read(cx).sessions_paused(c)),
+                        self.member_writes_paused(context, cx).is_some(),
+                    )
                 };
+                let noted = note.is_some();
                 let text = match note {
                     Some(note) => format!("{shown}: {note}"),
                     None => shown,
@@ -1024,7 +1051,7 @@ impl Workspace {
                 div()
                     .id(SharedString::from(format!("set-member-{context}")))
                     .aria_label(text.clone())
-                    .when(note.is_some(), |el| el.text_color(theme.warning))
+                    .when(noted, |el| el.text_color(theme.warning))
                     .child(text)
                     .test_support()
             }))

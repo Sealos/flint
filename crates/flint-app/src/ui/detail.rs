@@ -226,6 +226,8 @@ pub struct DetailView {
     row_cluster: Option<String>,
     /// For a row of a cluster set: the server it was admitted on. Never changes.
     row_server: Option<String>,
+    /// For a row of a cluster set: why the core refuses writes on its member now, if it does.
+    row_writes_paused: Option<String>,
     /// The server the object's cluster shows, as the workspace says it: what an edit is for.
     server: Option<String>,
     /// What RBAC says about this object's actions, for showing them ([`access`]).
@@ -320,6 +322,7 @@ impl DetailView {
             cluster_label,
             row_cluster: None,
             row_server: None,
+            row_writes_paused: None,
             server: None,
             access: object_access,
             edit: None,
@@ -377,6 +380,23 @@ impl DetailView {
         self.server = Some(server.clone());
         self.row_server = Some(server);
         cx.notify();
+    }
+
+    /// Says why a set's row cannot write now, or `None` once it can.
+    pub(in crate::ui) fn set_row_writes_paused(
+        &mut self,
+        why: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.row_writes_paused != why {
+            self.row_writes_paused = why;
+            cx.notify();
+        }
+    }
+
+    /// Why a set's row cannot write now.
+    pub(in crate::ui) fn row_writes_paused(&self) -> Option<&str> {
+        self.row_writes_paused.as_deref()
     }
 
     /// Says which server the object's cluster points at now. A set's row keeps its pin.
