@@ -2,11 +2,15 @@
 //!
 //! Secret objects are masked whole ([`crate::redact::mask_secret`]). Elsewhere masking goes by
 //! key name and by the shape of the value ([`crate::redact::redact_credentials`]), so it errs
-//! towards hiding and a credential in an unusual format can still get through. A manifest document
-//! that cannot be parsed is withheld, since nothing could be said of what it holds.
+//! towards hiding and a credential in an unusual format can still get through. What Values hides
+//! is also hidden wherever a template copied it into the manifest ([`HiddenValues`]). A manifest
+//! document that cannot be parsed, or that still shows a hidden value, is withheld.
 
 // module-tests: ../helm_tests.rs
 
+use std::collections::HashSet;
+
+use base64::Engine as _;
 use serde_json::Value;
 
 use super::HelmError;
@@ -16,6 +20,9 @@ use crate::redact::{is_secret_object, mask_secret, redact_credentials};
 pub const MASK: &str = "••••••";
 /// Stands in for a manifest document that could not be parsed.
 const WITHHELD: &str = "# Withheld: Flint could not parse this document to mask its secrets.\n";
+/// The shortest hidden value searched for inside longer text. A shorter one is only hidden where
+/// it is a whole value: inside text it would match by chance.
+const MIN_NEEDLE: usize = 4;
 
 /// Parts of a normalized key that say its value is a credential.
 const SENSITIVE: &[&str] = &[
@@ -109,6 +116,136 @@ pub fn mask_values(mut values: Value) -> Result<String, HelmError> {
     serde_saphyr::to_string(&values).map_err(|_| HelmError::BadOutput)
 }
 
+/// The values `helm get values` hides, to hide again where a manifest repeats them.
+#[derive(Debug, Default)]
+pub(super) struct HiddenValues {
+    whole: HashSet<String>,
+    /// As written and in base64, longest first.
+    needles: Vec<String>,
+}
+
+impl HiddenValues {
+    /// From `helm get values --output=json`.
+    pub(super) fn from_output(out: &[u8]) -> Result<Self, HelmError> {
+        let values: Value = serde_json::from_slice(out).map_err(|_| HelmError::BadOutput)?;
+        let mut hidden = Self::default();
+        hidden.collect(&values);
+        hidden.needles.sort_by_key(|n| std::cmp::Reverse(n.len()));
+        hidden.needles.dedup();
+        Ok(hidden)
+    }
+
+    fn add(&mut self, text: String) {
+        if text.len() >= MIN_NEEDLE {
+            self.needles
+                .push(base64::engine::general_purpose::STANDARD.encode(&text));
+            self.needles.push(text.clone());
+        }
+        if !text.is_empty() {
+            self.whole.insert(text);
+        }
+    }
+
+    /// Every scalar at or below `value`.
+    fn add_all(&mut self, value: &Value) {
+        match value {
+            Value::String(text) => self.add(text.clone()),
+            Value::Number(number) => self.add(number.to_string()),
+            Value::Array(items) => items.iter().for_each(|item| self.add_all(item)),
+            Value::Object(map) => map.values().for_each(|item| self.add_all(item)),
+            Value::Null | Value::Bool(_) => {}
+        }
+    }
+
+    /// What [`mask_tree`] hides by key. A field naming another object is left out: the same
+    /// name in a manifest is that object's name.
+    fn collect(&mut self, value: &Value) {
+        match value {
+            Value::Array(items) => items.iter().for_each(|item| self.collect(item)),
+            Value::Object(map) => {
+                if env_style_is_sensitive(map)
+                    && let Some(item) = map.get("value")
+                {
+                    self.add_all(item);
+                }
+                for (key, item) in map {
+                    match (is_sensitive(key), names_another_object(key)) {
+                        (true, true) => {}
+                        (true, false) => self.add_all(item),
+                        (false, _) => self.collect(item),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn scrub(&self, value: &mut Value) {
+        match value {
+            Value::String(text) => {
+                if self.whole.contains(text.as_str()) {
+                    MASK.clone_into(text);
+                    return;
+                }
+                for needle in &self.needles {
+                    if text.contains(needle.as_str()) {
+                        *text = text.replace(needle.as_str(), MASK);
+                    }
+                }
+            }
+            Value::Number(number) => {
+                if self.whole.contains(&number.to_string()) {
+                    *value = Value::String(MASK.to_owned());
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(|item| self.scrub(item)),
+            Value::Object(map) => map.values_mut().for_each(|item| self.scrub(item)),
+            Value::Null | Value::Bool(_) => {}
+        }
+    }
+
+    /// Whether `text` still shows a hidden value, in a key or a comment, say.
+    fn shows(&self, text: &str) -> bool {
+        self.needles.iter().any(|n| text.contains(n.as_str()))
+    }
+
+    /// `helm get manifest` output with its secrets and these values masked, document by document.
+    pub(super) fn mask_manifest(&self, manifest: &str) -> String {
+        split_documents(manifest)
+            .iter()
+            .filter(|d| !d.trim().is_empty())
+            .map(|d| format!("---\n{}", self.mask_document(d)))
+            .collect()
+    }
+
+    /// One document of a manifest, masked, with its `# Source:` line kept.
+    fn mask_document(&self, document: &str) -> String {
+        let source: String = document
+            .lines()
+            .take_while(|line| line.starts_with('#') || line.trim().is_empty())
+            .filter(|line| line.starts_with("# Source:"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let masked = match serde_saphyr::from_str::<Value>(document) {
+            Err(_) => format!("{source}{WITHHELD}"),
+            Ok(object) if object.is_null() => source,
+            Ok(mut object) => {
+                mask_object(&mut object);
+                self.scrub(&mut object);
+                match serde_saphyr::to_string(&object) {
+                    Ok(yaml) => format!("{source}{yaml}"),
+                    Err(_) => format!("{source}{WITHHELD}"),
+                }
+            }
+        };
+        if self.shows(&masked) {
+            WITHHELD.to_owned()
+        } else {
+            masked
+        }
+    }
+}
+
 /// Masks one object of a manifest. A `List` is masked item by item.
 fn mask_object(object: &mut Value) {
     if let Some(items) = object.get_mut("items").and_then(Value::as_array_mut) {
@@ -162,6 +299,15 @@ fn mask_fields(value: &mut Value) {
                     {
                         hide(item);
                     }
+                    (field, item @ (Value::Object(_) | Value::Array(_)))
+                        if is_sensitive(field) && !names_another_object(field) =>
+                    {
+                        let field = normalized(field);
+                        hide_subtree(
+                            item,
+                            field.ends_with("secret") || field.ends_with("secrets"),
+                        );
+                    }
                     (_, item) => mask_fields(item),
                 }
             }
@@ -170,29 +316,41 @@ fn mask_fields(value: &mut Value) {
     }
 }
 
-/// One document of a manifest, masked, with its `# Source:` line kept.
-fn mask_document(document: &str) -> String {
-    let source: String = document
-        .lines()
-        .take_while(|line| line.starts_with('#') || line.trim().is_empty())
-        .filter(|line| line.starts_with("# Source:"))
-        .map(|line| format!("{line}\n"))
-        .collect();
-    let Ok(mut object) = serde_saphyr::from_str::<Value>(document) else {
-        return format!("{source}{WITHHELD}");
-    };
-    if object.is_null() {
-        return source;
-    }
-    mask_object(&mut object);
-    match serde_saphyr::to_string(&object) {
-        Ok(yaml) => format!("{source}{yaml}"),
-        Err(_) => format!("{source}{WITHHELD}"),
+/// Hides a whole subtree under a credential field. References to a Secret stay readable:
+/// `secretName`, anything under a `...Ref`, and, when the field itself holds Secrets
+/// (`imagePullSecrets`, a volume's `secret`), their `name` and `namespace`.
+fn hide_subtree(value: &mut Value, names_secrets: bool) {
+    match value {
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| hide_subtree(item, names_secrets)),
+        Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                let field = normalized(key);
+                let reference = field == "secretname"
+                    || (names_secrets && matches!(field.as_str(), "name" | "namespace"));
+                if reference && matches!(item, Value::String(_)) {
+                    continue;
+                }
+                if field.ends_with("ref") && item.is_object() {
+                    mask_fields(item);
+                } else {
+                    hide_subtree(item, names_secrets);
+                }
+            }
+        }
+        Value::String(_) | Value::Number(_) => *value = Value::String(MASK.to_owned()),
+        Value::Null | Value::Bool(_) => {}
     }
 }
 
 /// `helm get manifest` output with its secrets masked, document by document.
 pub fn mask_manifest(manifest: &str) -> String {
+    HiddenValues::default().mask_manifest(manifest)
+}
+
+/// The documents of a manifest, split at its `---` lines.
+fn split_documents(manifest: &str) -> Vec<String> {
     let mut documents = Vec::new();
     let mut current = String::new();
     for line in manifest.lines() {
@@ -213,8 +371,4 @@ pub fn mask_manifest(manifest: &str) -> String {
     }
     documents.push(current);
     documents
-        .iter()
-        .filter(|d| !d.trim().is_empty())
-        .map(|d| format!("---\n{}", mask_document(d)))
-        .collect()
 }

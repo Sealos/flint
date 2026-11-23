@@ -5,8 +5,11 @@
 //! connection Flint admitted:
 //!
 //! - It gets a kubeconfig of its own, written for this run from the definition the connection was
-//!   built from, holding that one context. The person's files are never given to it, so editing
-//!   them cannot move a run to another server or user.
+//!   built from, holding that one context and only the credential the connection uses. The
+//!   person's files are never given to it, so editing them cannot move a run to another server
+//!   or user.
+//! - The binary and every folder on the way to it must be safe from other accounts, and the
+//!   run's files stay in a private directory.
 //! - Certificate files go in as the bytes the connection was built from, and a file that no longer
 //!   holds them refuses the run.
 //! - A credential that runs a program (an exec plugin or auth provider) is refused: `helm` would
@@ -30,16 +33,22 @@ use secrecy::SecretString;
 use serde::{Deserialize, Deserializer};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
-use crate::credential::WriteCredential;
+use crate::credential::{CredentialSource, WriteCredential};
 use crate::read::{is_dns1123_label, is_dns1123_subdomain};
 use crate::recheck::ContextPin;
 
 mod mask;
+mod run_dir;
 
+use mask::HiddenValues;
 pub use mask::{MASK, mask_manifest, mask_values};
+use run_dir::{RunDir, resolve_trusted};
+pub(crate) use run_dir::{reap_stale, runs_root};
 
 /// How long one `helm` command may take.
 const RUN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often a running query checks that its connection still holds.
+pub(crate) const RECHECK_EVERY: Duration = Duration::from_millis(250);
 /// The most of `helm`'s output kept: a release's manifest is stored in a Secret, so about 1 MiB
 /// compressed, which this leaves room for once expanded.
 const STDOUT_CAP: usize = 32 * 1024 * 1024;
@@ -59,6 +68,10 @@ pub enum HelmError {
     NotInstalled,
     #[error("The helm set in settings.toml is not an executable file at an absolute path.")]
     BadConfiguredPath,
+    #[error("helm is in a folder other accounts can change, so Flint did not run it.")]
+    UntrustedLocation,
+    #[error("Flint's folder for helm can be changed by other accounts, so helm did not run.")]
+    UnsafeRunDirectory,
     #[error("Helm is not available for clusters that sign in with a credential plugin yet.")]
     CredentialRunsCommand,
     #[error("This cluster is not connected.")]
@@ -252,12 +265,13 @@ fn number_or_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::
 /// Everything one `helm` run needs, taken in one step with checking the connection.
 #[derive(Clone)]
 pub(crate) struct HelmTarget {
-    pub(crate) pin: ContextPin,
     context: String,
     /// Only this context, its cluster and its user.
     kubeconfig: Kubeconfig,
     credential: WriteCredential,
     configured_helm: Option<PathBuf>,
+    /// Where the run's private directory goes ([`runs_root`]).
+    runs_root: PathBuf,
 }
 
 impl HelmTarget {
@@ -270,6 +284,7 @@ impl HelmTarget {
         pin: ContextPin,
         credential: WriteCredential,
         configured_helm: Option<PathBuf>,
+        runs_root: PathBuf,
     ) -> Result<Self, HelmError> {
         let named = merged
             .contexts
@@ -313,11 +328,11 @@ impl HelmTarget {
             ..Kubeconfig::default()
         };
         Ok(Self {
-            pin,
             context: context.to_owned(),
             kubeconfig,
             credential,
             configured_helm,
+            runs_root,
         })
     }
 
@@ -368,14 +383,42 @@ impl HelmTarget {
         {
             auth.client_key_data = Some(SecretString::from(self.held(&path)?));
         }
-        if auth
-            .token_file
-            .as_deref()
-            .is_some_and(|file| !Path::new(file).is_absolute())
-        {
+        // kube and client-go order these differently, so only the one kube uses goes in.
+        let basic = auth.username.is_some() && auth.password.is_some();
+        let token = if basic {
+            None
+        } else if auth.token.is_some() {
+            auth.token.take()
+        } else if let CredentialSource::TokenFile(path) = CredentialSource::of(auth) {
+            Some(self.token_from_file(&path)?)
+        } else {
+            None
+        };
+        if !basic {
+            auth.username = None;
+            auth.password = None;
+        }
+        auth.token = token;
+        auth.token_file = None;
+        Ok(())
+    }
+
+    /// The token the connection's own token file holds now, so `helm` never opens the file.
+    fn token_from_file(&self, path: &Path) -> Result<SecretString, HelmError> {
+        if !path.is_absolute() {
             return Err(HelmError::RelativeTokenFile);
         }
-        Ok(())
+        let bytes = self
+            .credential
+            .token_file_bytes(path)
+            .ok_or(HelmError::CredentialFileChanged)?;
+        let token = std::str::from_utf8(&bytes)
+            .map_err(|_| HelmError::CredentialFileChanged)?
+            .trim();
+        if token.is_empty() {
+            return Err(HelmError::CredentialFileChanged);
+        }
+        Ok(SecretString::from(token.to_owned()))
     }
 }
 
@@ -384,25 +427,34 @@ fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
+/// The real file to run for `candidate`, if no other account can change it or what leads to it.
+fn trusted_helm(candidate: &Path) -> Result<PathBuf, HelmError> {
+    resolve_trusted(candidate)
+        .filter(|real| is_executable(real))
+        .ok_or(HelmError::UntrustedLocation)
+}
+
 /// The `helm` to run: the one set in the settings, or the first on `path`. Only absolute paths
-/// count, so that the working directory never decides what runs.
+/// count, so that the working directory never decides what runs. A first match in an unsafe
+/// place is refused rather than skipped, so what runs is never a surprise.
 pub(crate) fn find_helm(
     configured: Option<&Path>,
     path: Option<&OsStr>,
 ) -> Result<PathBuf, HelmError> {
     if let Some(configured) = configured {
-        return if configured.is_absolute() && is_executable(configured) {
-            Ok(configured.to_owned())
-        } else {
-            Err(HelmError::BadConfiguredPath)
-        };
+        if !configured.is_absolute() || !is_executable(configured) {
+            return Err(HelmError::BadConfiguredPath);
+        }
+        return trusted_helm(configured);
     }
-    path.into_iter()
+    let found = path
+        .into_iter()
         .flat_map(std::env::split_paths)
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join("helm"))
         .find(|candidate| is_executable(candidate))
-        .ok_or(HelmError::NotInstalled)
+        .ok_or(HelmError::NotInstalled)?;
+    trusted_helm(&found)
 }
 
 /// Kills the process group of a child not reaped yet, so what `helm` started ends with it.
@@ -490,21 +542,41 @@ fn run_environment(dir: &Path, kubeconfig: &Path) -> Vec<(&'static str, OsString
     ]
 }
 
-/// Runs `query` with the `helm` at `binary`, held to `target`.
+/// Runs `query` with the `helm` at `binary`, held to `target`. A manifest is read with the
+/// release's values, so that what Values hides is hidden in it too.
 async fn run_at(
     binary: &Path,
     target: &HelmTarget,
     query: &HelmQuery,
 ) -> Result<HelmOutput, HelmError> {
+    let hidden = match query {
+        HelmQuery::Manifest(release) => {
+            let values = run_helm(binary, target, &HelmQuery::Values(release.clone())).await?;
+            tokio::task::spawn_blocking(move || HiddenValues::from_output(&values))
+                .await
+                .map_err(|_| HelmError::BadOutput)??
+        }
+        _ => HiddenValues::default(),
+    };
+    let out = run_helm(binary, target, query).await?;
+    let query = query.clone();
+    tokio::task::spawn_blocking(move || parse(&query, &out, &hidden))
+        .await
+        .map_err(|_| HelmError::BadOutput)?
+}
+
+/// One `helm` command, to its output.
+async fn run_helm(
+    binary: &Path,
+    target: &HelmTarget,
+    query: &HelmQuery,
+) -> Result<Vec<u8>, HelmError> {
     let (dir, kubeconfig) = {
         let target = target.clone();
         tokio::task::spawn_blocking(move || {
             let bytes = target.pinned_kubeconfig()?;
             // Private to this user, and removed when the run ends, however it ends.
-            let dir = tempfile::Builder::new()
-                .prefix("flint-helm-")
-                .tempdir()
-                .map_err(|_| HelmError::NotStarted)?;
+            let dir = RunDir::create(&target.runs_root)?;
             let path = write_private(dir.path(), &bytes)?;
             Ok::<_, HelmError>((dir, path))
         })
@@ -546,10 +618,7 @@ async fn run_at(
     if !status.success() {
         return Err(classify_failure(status.code().unwrap_or(-1), &err));
     }
-    let query = query.clone();
-    tokio::task::spawn_blocking(move || parse(&query, &out))
-        .await
-        .map_err(|_| HelmError::BadOutput)?
+    Ok(out)
 }
 
 /// Runs `query` on `target`, with the `helm` the settings name or the first on this process's
@@ -603,8 +672,24 @@ struct StatusOutput {
     chart: StatusChart,
 }
 
-/// `query`'s output as data, masked.
-fn parse(query: &HelmQuery, out: &[u8]) -> Result<HelmOutput, HelmError> {
+/// Fixed words for a release status. Helm's stored description can quote what a server refused,
+/// credentials included, in a form no pattern recognizes, so it is never shown.
+fn status_text(status: &str) -> &'static str {
+    match status {
+        "deployed" => "Deployed.",
+        "superseded" => "Replaced by a later revision.",
+        "failed" => "Failed. Helm's failure text is not shown.",
+        "uninstalled" => "Uninstalled.",
+        "uninstalling" => "Uninstalling.",
+        "pending-install" => "Install in progress.",
+        "pending-upgrade" => "Upgrade in progress.",
+        "pending-rollback" => "Rollback in progress.",
+        _ => "No description.",
+    }
+}
+
+/// `query`'s output as data, masked. `hidden` is what a manifest must not show.
+fn parse(query: &HelmQuery, out: &[u8], hidden: &HiddenValues) -> Result<HelmOutput, HelmError> {
     fn json<'a, T: Deserialize<'a>>(out: &'a [u8]) -> Result<T, HelmError> {
         serde_json::from_slice(out).map_err(|_| HelmError::BadOutput)
     }
@@ -631,10 +716,8 @@ fn parse(query: &HelmQuery, out: &[u8]) -> Result<HelmOutput, HelmError> {
                     status.namespace
                 },
                 revision: status.version,
+                description: status_text(&status.info.status).to_owned(),
                 status: status.info.status,
-                description: crate::redact::redact_credentials(&status.info.description)
-                    .text
-                    .into_owned(),
                 first_deployed: status.info.first_deployed,
                 last_deployed: status.info.last_deployed,
                 chart: status.chart.metadata.name,
@@ -645,10 +728,7 @@ fn parse(query: &HelmQuery, out: &[u8]) -> Result<HelmOutput, HelmError> {
         HelmQuery::History(_) => {
             let mut revisions: Vec<HelmRevision> = json(out)?;
             for revision in &mut revisions {
-                // A failed revision's description quotes what the server said.
-                revision.description = crate::redact::redact_credentials(&revision.description)
-                    .text
-                    .into_owned();
+                revision.description = status_text(&revision.status).to_owned();
             }
             // Newest first.
             revisions.sort_by_key(|r| std::cmp::Reverse(r.revision));
@@ -660,7 +740,7 @@ fn parse(query: &HelmQuery, out: &[u8]) -> Result<HelmOutput, HelmError> {
         }
         HelmQuery::Manifest(_) => {
             let text = std::str::from_utf8(out).map_err(|_| HelmError::BadOutput)?;
-            Ok(HelmOutput::Text(mask_manifest(text).into()))
+            Ok(HelmOutput::Text(hidden.mask_manifest(text).into()))
         }
     }
 }

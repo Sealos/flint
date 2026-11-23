@@ -209,9 +209,11 @@ enum Load<T> {
 pub struct HelmView {
     core: CoreHandle,
     cluster: ClusterId,
-    /// Taken once. A run refused because the context changed stays refused: only a new tab pins
-    /// the new definition.
-    pin: Option<HelmPin>,
+    /// Taken once, as the tab opens, even if it can't run yet. A run refused because the context
+    /// changed stays refused: only a new tab pins the new definition. `None` until the core
+    /// answers.
+    pin: Option<Result<HelmPin, HelmError>>,
+    _pinning: Task<()>,
     focus: FocusHandle,
     releases: Load<Arc<[HelmRelease]>>,
     truncated: bool,
@@ -230,10 +232,20 @@ pub struct HelmView {
 
 impl HelmView {
     pub fn new(core: CoreHandle, cluster: ClusterId, cx: &mut Context<Self>) -> Self {
-        let mut view = Self {
+        // Asked here, not in the task, so the pin is of the definition the tab opened on.
+        let pinning = core.helm_pin(&cluster);
+        let _pinning = cx.spawn(async move |this, cx| {
+            let pin = pinning.await;
+            let _ = this.update(cx, |view, cx| {
+                view.pin = Some(pin);
+                view.refresh(cx);
+            });
+        });
+        Self {
             core,
             cluster,
             pin: None,
+            _pinning,
             focus: cx.focus_handle(),
             releases: Load::Loading,
             truncated: false,
@@ -246,9 +258,7 @@ impl HelmView {
             pane_line: 0,
             list_task: None,
             pane_task: None,
-        };
-        view.refresh(cx);
-        view
+        }
     }
 
     fn selected_release(&self) -> Option<&HelmRelease> {
@@ -260,27 +270,20 @@ impl HelmView {
 
     /// Reads the list again, then the pane shown.
     pub(in crate::ui) fn refresh(&mut self, cx: &mut Context<Self>) {
+        // Before the pin is back there is nothing to read with: its arrival starts the read.
+        let Some(pin) = self.pin.clone() else {
+            return;
+        };
         self.pane_task = None;
         self.releases = Load::Loading;
         let core = self.core.clone();
         let cluster = self.cluster.clone();
-        let pin = self.pin.clone();
         self.list_task = Some(cx.spawn(async move |this, cx| {
-            let pin = match pin {
-                Some(pin) => Ok(pin),
-                None => core.helm_pin(&cluster).await,
+            let result = match pin {
+                Ok(pin) => core.helm_read(&cluster, &pin, HelmQuery::List).await,
+                Err(refused) => Err(refused),
             };
-            let (pin, result) = match pin {
-                Ok(pin) => {
-                    let result = core.helm_read(&cluster, &pin, HelmQuery::List).await;
-                    (Some(pin), result)
-                }
-                Err(refused) => (None, Err(refused)),
-            };
-            let _ = this.update(cx, |view, cx| {
-                view.pin = view.pin.take().or(pin);
-                view.list_loaded(result, cx);
-            });
+            let _ = this.update(cx, |view, cx| view.list_loaded(result, cx));
         }));
         cx.notify();
     }
@@ -321,7 +324,7 @@ impl HelmView {
     fn load_pane(&mut self, cx: &mut Context<Self>) {
         self.pane_line = 0;
         self.pane_scroll.scroll_to_item(0, ScrollStrategy::Top);
-        let Some(pin) = self.pin.clone() else {
+        let Some(Ok(pin)) = self.pin.clone() else {
             self.pane_task = None;
             return;
         };
@@ -777,6 +780,68 @@ mod tests {
             t.label(cx, "helm-error")
                 .is_some_and(|text| !text.is_empty())
         );
+    }
+
+    // A tab that could not run at first stays on the definition it opened on: a refresh after
+    // the context moved to another server is refused and starts nothing.
+    #[gpui_kit::test]
+    async fn a_refresh_does_not_adopt_a_new_server(cx: &mut gpui_kit::TestAppContext) {
+        use crate::ui::support_tests::{WAIT, kubeconfig_yaml, open_workspace_with};
+        use flint_core::ConnectionState;
+        use flint_core::helm::HelmError;
+        use flint_e2e::fake_api::{CONTEXT, FakeApiServer, Options};
+        use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
+        use serde_json::json;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let server = FakeApiServer::start_blocking(Options::default()).unwrap();
+        let scripts = tempfile::tempdir().unwrap();
+        let ran = scripts.path().join("ran");
+        let helm = scripts.path().join("fake-helm");
+        std::fs::write(
+            &helm,
+            format!("#!/bin/sh\nprintf x >> '{}'\nprintf '[]'\n", ran.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.toml"),
+            format!("helm = \"{}\"\n", helm.display()),
+        )
+        .unwrap();
+        let file = dir.path().join("kubeconfig");
+        let path = file.clone();
+        let t = open_workspace_with(cx, dir.path(), move |_, servers| {
+            std::fs::write(&path, kubeconfig_yaml(&[(CONTEXT, &servers.refused)])).unwrap();
+            vec![path]
+        })
+        .await;
+        t.dispatch(
+            cx,
+            "workspace::ShowHelmReleases",
+            json!({ "cluster": CONTEXT }),
+        )
+        .unwrap();
+        t.wait_for_element(cx, "helm-error").await;
+
+        server.write_kubeconfig(&file, Some("demo")).unwrap();
+        let core = t.model.read_with(cx, |model, _| model.core().clone());
+        core.reload_kubeconfig().await.unwrap();
+        t.activate(cx, CONTEXT).await;
+        t.wait_for_state(cx, CONTEXT, |s| matches!(s, ConnectionState::Connected(_)))
+            .await;
+
+        t.dispatch(cx, "workspace::RefreshHelmReleases", json!({}))
+            .unwrap();
+        let changed = HelmError::Changed.to_string();
+        cx.wait_for(t.window, WAIT, move |window, _| {
+            window
+                .try_find("helm-error")
+                .is_some_and(|e| e.label() == Some(changed.as_str()))
+        })
+        .await;
+        assert!(!ran.exists(), "helm never started on the new server");
     }
 
     #[test]

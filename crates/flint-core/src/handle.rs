@@ -425,11 +425,15 @@ pub(crate) enum Request {
         pin: ContextPin,
         reply: oneshot::Sender<Option<String>>,
     },
-    /// What a `helm` run on `cluster` is held to, if it may run: at `pin`, or at the context's
-    /// definition now for a view opening.
+    /// The pin of a Helm view opening on `cluster` now, whether or not it can run yet.
+    HelmPin {
+        cluster: ClusterId,
+        reply: oneshot::Sender<ContextPin>,
+    },
+    /// What a `helm` run on `cluster` at `pin` is held to, if it may run.
     HelmTarget {
         cluster: ClusterId,
-        pin: Option<ContextPin>,
+        pin: ContextPin,
         member: Option<AdmittedMember>,
         reply: oneshot::Sender<Result<HelmTarget, HelmError>>,
     },
@@ -666,6 +670,8 @@ impl CoreHandle {
         let (event_tx, event_rx) = crate::events::queue();
         let hubs = HubRegistry::default();
         let unlocks = SessionUnlocks::default();
+        let helm_runs = crate::helm::runs_root(&config.config_dir);
+        runtime.spawn_blocking(move || crate::helm::reap_stale(&helm_runs));
         let manager = ClusterManager::new(config, event_tx, hubs.clone(), unlocks.clone());
         let log_budget = manager.log_budget();
         let telemetry = manager.telemetry_board();
@@ -1246,7 +1252,7 @@ impl CoreHandle {
     fn helm_target(
         &self,
         cluster: &str,
-        pin: Option<ContextPin>,
+        pin: ContextPin,
     ) -> impl Future<Output = Result<HelmTarget, HelmError>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
         let sent = self.requests.try_send(Request::HelmTarget {
@@ -1263,36 +1269,59 @@ impl CoreHandle {
         }
     }
 
-    /// Pins a Helm view to `cluster`'s definition now: refused unless it is connected, settled
-    /// and its credential runs no program.
+    /// Pins a Helm view to `cluster`'s definition as of this call. It holds even if the cluster
+    /// can't run `helm` yet: every read is checked against it, so a view never moves to a
+    /// definition that came later.
     pub fn helm_pin(
         &self,
         cluster: &str,
     ) -> impl Future<Output = Result<HelmPin, HelmError>> + Send + 'static {
-        let target = self.helm_target(cluster, None);
-        async move { target.await.map(|target| HelmPin(target.pin)) }
+        let (reply, rx) = oneshot::channel();
+        let sent = self.requests.try_send(Request::HelmPin {
+            cluster: cluster.to_owned(),
+            reply,
+        });
+        async move {
+            if sent.is_err() {
+                return Err(HelmError::Stopped);
+            }
+            rx.await.map(HelmPin).map_err(|_| HelmError::Stopped)
+        }
     }
 
     /// Runs one read-only `helm` query on `cluster`, only while it is still the definition `pin`
-    /// was taken on, checked before the run and again before its answer is given. Dropping the
-    /// future ends the run. Works on any executor.
+    /// was taken on: checked before the run, throughout it, and before its answer is given. A
+    /// change ends the run, and so does dropping the future. Works on any executor.
     pub fn helm_read(
         &self,
         cluster: &str,
         pin: &HelmPin,
         query: HelmQuery,
     ) -> impl Future<Output = Result<HelmOutput, HelmError>> + Send + 'static {
-        let target = self.helm_target(cluster, Some(pin.0.clone()));
+        let target = self.helm_target(cluster, pin.0.clone());
         let after = self.clone();
         let cluster = cluster.to_owned();
         let pin = pin.0.clone();
         let run = spawn_aborting(&self.runtime, async move {
             let target = target.await?;
-            let output = crate::helm::run(&target, &query).await?;
-            after.helm_target(&cluster, Some(pin)).await?;
+            let output = tokio::select! {
+                output = crate::helm::run(&target, &query) => output?,
+                refused = after.helm_refused(&cluster, &pin) => return Err(refused),
+            };
+            after.helm_target(&cluster, pin).await?;
             Ok(output)
         });
         async move { run.await.unwrap_or(Err(HelmError::Stopped)) }
+    }
+
+    /// Resolves once a `helm` run on `cluster` at `pin` may no longer go on.
+    async fn helm_refused(&self, cluster: &str, pin: &ContextPin) -> HelmError {
+        loop {
+            tokio::time::sleep(crate::helm::RECHECK_EVERY).await;
+            if let Err(refused) = self.helm_target(cluster, pin.clone()).await {
+                return refused;
+            }
+        }
     }
 
     /// The client for an action that changes `cluster` or runs code in it, with the context's

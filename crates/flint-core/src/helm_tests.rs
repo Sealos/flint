@@ -37,7 +37,13 @@ fn pin_for(kubeconfig: &Kubeconfig) -> ContextPin {
     history.pin("dev", Some("https://pinned:6443"))
 }
 
-fn target() -> HelmTarget {
+/// For a target whose run never starts.
+fn unused_root() -> PathBuf {
+    PathBuf::from("/nonexistent/helm-runs")
+}
+
+/// A target whose runs keep their files under `dir`.
+fn target(dir: &Path) -> HelmTarget {
     let merged = config(CONFIG);
     let pin = pin_for(&merged);
     HelmTarget::new(
@@ -46,8 +52,14 @@ fn target() -> HelmTarget {
         pin,
         credential(CredentialSource::Definition),
         None,
+        runs_root(dir),
     )
     .unwrap()
+}
+
+/// Output parsed with no values to hide.
+fn parse(query: &HelmQuery, out: &[u8]) -> Result<HelmOutput, HelmError> {
+    super::parse(query, out, &HiddenValues::default())
 }
 
 /// A fake `helm` that records its arguments, environment and kubeconfig under `dir`, then runs
@@ -77,7 +89,9 @@ async fn a_run_is_pinned_and_gets_a_minimal_environment() {
         dir.path(),
         "printf '[{\"name\":\"web\",\"namespace\":\"apps\",\"revision\":\"3\",\"status\":\"deployed\",\"chart\":\"web-1.0\",\"app_version\":\"2\",\"updated\":\"now\"}]'",
     );
-    let output = run_at(&helm, &target(), &HelmQuery::List).await.unwrap();
+    let output = run_at(&helm, &target(dir.path()), &HelmQuery::List)
+        .await
+        .unwrap();
     let HelmOutput::Releases {
         releases,
         truncated,
@@ -161,6 +175,7 @@ fn a_credential_that_runs_a_program_is_refused() {
         pin_for(&merged),
         credential(CredentialSource::Definition),
         None,
+        unused_root(),
     );
     assert_eq!(refused.err(), Some(HelmError::CredentialRunsCommand));
 
@@ -171,6 +186,7 @@ fn a_credential_that_runs_a_program_is_refused() {
         pin_for(&merged),
         credential(CredentialSource::Plugin),
         None,
+        unused_root(),
     );
     assert_eq!(refused.err(), Some(HelmError::CredentialRunsCommand));
 }
@@ -187,6 +203,7 @@ fn a_repointed_context_is_refused() {
         pin,
         credential(CredentialSource::Definition),
         None,
+        unused_root(),
     );
     assert_eq!(refused.err(), Some(HelmError::Changed));
 }
@@ -208,7 +225,8 @@ async fn a_replaced_certificate_file_refuses_the_run() {
     let mut for_client = merged.clone();
     let files = hold_credential_files(&mut for_client, "dev");
     let held = WriteCredential::new(files, CredentialSource::Definition, None, None);
-    let target = HelmTarget::new(&merged, "dev", pin_for(&merged), held, None).unwrap();
+    let target =
+        HelmTarget::new(&merged, "dev", pin_for(&merged), held, None, unused_root()).unwrap();
 
     let bytes = target.pinned_kubeconfig().unwrap();
     let written: Kubeconfig = serde_json::from_slice(&bytes).unwrap();
@@ -239,8 +257,9 @@ fn a_missing_helm_says_so_and_only_absolute_paths_count() {
     assert!(HelmError::NotInstalled.to_string().contains("Install"));
 
     let helm = fake_helm(dir.path(), "");
-    assert_eq!(find_helm(None, Some(&empty)).unwrap(), helm);
-    assert_eq!(find_helm(Some(&helm), None).unwrap(), helm);
+    let real = helm.canonicalize().unwrap();
+    assert_eq!(find_helm(None, Some(&empty)).unwrap(), real);
+    assert_eq!(find_helm(Some(&helm), None).unwrap(), real);
     assert_eq!(
         find_helm(Some(Path::new("helm")), None),
         Err(HelmError::BadConfiguredPath)
@@ -259,7 +278,7 @@ async fn a_failure_is_classified_and_never_quotes_helm() {
         dir.path(),
         "printf 'Error: secrets is forbidden: leaked-value' >&2; exit 1",
     );
-    let error = run_at(&helm, &target(), &HelmQuery::History(release()))
+    let error = run_at(&helm, &target(dir.path()), &HelmQuery::History(release()))
         .await
         .unwrap_err();
     assert_eq!(error, HelmError::Forbidden);
@@ -289,7 +308,7 @@ async fn dropping_a_run_kills_it_and_removes_the_kubeconfig() {
             d = dir.path().display()
         ),
     );
-    let target = target();
+    let target = target(dir.path());
     let run = run_at(&helm, &target, &HelmQuery::List);
     let pid_file = dir.path().join("child");
     let waited = tokio::time::timeout(Duration::from_secs(5), run);
@@ -486,6 +505,242 @@ fn a_custom_resource_hides_credential_fields_and_keeps_references() {
     for kept in ["db-auth", "db-token", "automountServiceAccountToken: true"] {
         assert!(masked.contains(kept), "{kept} in {masked}");
     }
+}
+
+fn token_config(user: &str) -> Kubeconfig {
+    config(&CONFIG.replace("token: sekret-token", user))
+}
+
+fn written_user(target: &HelmTarget) -> serde_json::Value {
+    let bytes = target.pinned_kubeconfig().unwrap();
+    let written: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    written["users"][0]["user"].clone()
+}
+
+// With a token and a token file, kube uses the token and client-go the file.
+#[test]
+fn only_the_admitted_token_reaches_helm() {
+    let merged = token_config("token: admitted\n    tokenFile: /other/identity");
+    let target = HelmTarget::new(
+        &merged,
+        "dev",
+        pin_for(&merged),
+        credential(CredentialSource::Definition),
+        None,
+        unused_root(),
+    )
+    .unwrap();
+    let user = written_user(&target);
+    assert_eq!(user["token"], "admitted");
+    assert!(user.get("tokenFile").is_none(), "{user}");
+}
+
+// Basic auth comes first in kube's order, so a token beside it is not the admitted credential.
+#[test]
+fn basic_auth_drops_a_token_beside_it() {
+    let merged = token_config("username: me\n    password: pw\n    token: other");
+    let target = HelmTarget::new(
+        &merged,
+        "dev",
+        pin_for(&merged),
+        credential(CredentialSource::Definition),
+        None,
+        unused_root(),
+    )
+    .unwrap();
+    let user = written_user(&target);
+    assert_eq!(user["username"], "me");
+    assert!(user.get("token").is_none(), "{user}");
+}
+
+// A file-only token goes in as the bytes read for this run: helm never opens the file.
+#[test]
+fn a_token_file_goes_in_as_its_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("token");
+    std::fs::write(&file, "from-file\n").unwrap();
+    let merged = token_config(&format!("tokenFile: {}", file.display()));
+    let target = HelmTarget::new(
+        &merged,
+        "dev",
+        pin_for(&merged),
+        credential(CredentialSource::TokenFile(file)),
+        None,
+        unused_root(),
+    )
+    .unwrap();
+    let user = written_user(&target);
+    assert_eq!(user["token"], "from-file");
+    assert!(user.get("tokenFile").is_none(), "{user}");
+}
+
+// The run's directory is the owner's alone, whatever the umask.
+#[tokio::test]
+async fn the_run_directory_is_private() {
+    let dir = tempfile::tempdir().unwrap();
+    let helm = fake_helm(
+        dir.path(),
+        &format!(
+            "/bin/ls -ld \"$PWD\" > '{}/mode'\nprintf '[]'",
+            dir.path().display()
+        ),
+    );
+    run_at(&helm, &target(dir.path()), &HelmQuery::List)
+        .await
+        .unwrap();
+    let mode = std::fs::read_to_string(dir.path().join("mode")).unwrap();
+    assert!(mode.starts_with("drwx------"), "{mode}");
+}
+
+#[test]
+fn helm_in_a_folder_others_can_write_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let helm = fake_helm(dir.path(), "");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let path = std::env::join_paths([dir.path()]).unwrap();
+    assert_eq!(
+        find_helm(None, Some(&path)),
+        Err(HelmError::UntrustedLocation)
+    );
+    assert_eq!(
+        find_helm(Some(&helm), None),
+        Err(HelmError::UntrustedLocation)
+    );
+}
+
+// A link in a writable folder chooses what runs, even when its target is safe.
+#[test]
+fn a_link_in_a_folder_others_can_write_is_refused() {
+    let safe = tempfile::tempdir().unwrap();
+    let helm = fake_helm(safe.path(), "");
+    let open = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(&helm, open.path().join("helm")).unwrap();
+    std::fs::set_permissions(open.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let path = std::env::join_paths([open.path()]).unwrap();
+    assert_eq!(
+        find_helm(None, Some(&path)),
+        Err(HelmError::UntrustedLocation)
+    );
+}
+
+#[test]
+fn a_writable_helm_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let helm = fake_helm(dir.path(), "");
+    std::fs::set_permissions(&helm, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert_eq!(
+        find_helm(Some(&helm), None),
+        Err(HelmError::UntrustedLocation)
+    );
+}
+
+// Whatever sits under a credential field is hidden, and a reference to a Secret stays readable.
+#[test]
+fn a_sensitive_subtree_is_hidden_whole() {
+    let masked = mask_manifest(
+        "apiVersion: example.com/v1\nkind: Database\nmetadata:\n  name: d\nspec:\n  credentials:\n    \
+         primary: hunter11\n    nested:\n    - deep: hunter12\n  imagePullSecrets:\n  - name: \
+         pull-secret\n  volumes:\n  - secret:\n      secretName: web-tls\n",
+    );
+    for leaked in ["hunter11", "hunter12"] {
+        assert!(!masked.contains(leaked), "{leaked} in {masked}");
+    }
+    for kept in ["pull-secret", "web-tls"] {
+        assert!(masked.contains(kept), "{kept} in {masked}");
+    }
+}
+
+// A value hidden in Values stays hidden where a template copied it into the manifest.
+#[tokio::test]
+async fn a_masked_value_does_not_reappear_in_the_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode("hunter-cross");
+    let helm = fake_helm(
+        dir.path(),
+        &format!(
+            "case \"$2\" in\nvalues) printf '{{\"auth\":{{\"password\":\"hunter-cross\"}}}}' ;;\n\
+             *) printf 'apiVersion: v1\\nkind: Pod\\nmetadata:\\n  name: p\\n  labels:\\n    \
+             hunter-cross: x\\nspec:\\n  args: [\"--login=hunter-cross\", \"{encoded}\"]\\n' ;;\nesac"
+        ),
+    );
+    let output = run_at(&helm, &target(dir.path()), &HelmQuery::Manifest(release()))
+        .await
+        .unwrap();
+    let HelmOutput::Text(text) = output else {
+        panic!("text");
+    };
+    assert!(!text.contains("hunter-cross"), "{text}");
+    assert!(!text.contains(&encoded), "{text}");
+}
+
+// A stored failure can quote a credential in any format, so its text is never shown.
+#[test]
+fn details_and_history_show_fixed_status_text() {
+    let opaque = "Upgrade failed: admission denied value q9-opaque-credential";
+    let out = json!({"name": "web", "info": {"status": "failed", "description": opaque}});
+    let HelmOutput::Details(details) =
+        parse(&HelmQuery::Details(release()), out.to_string().as_bytes()).unwrap()
+    else {
+        panic!("details");
+    };
+    assert!(!details.description.contains("q9-opaque"), "{details:?}");
+    assert!(!details.description.is_empty());
+
+    let out = json!([{"revision": 1, "status": "failed", "description": opaque}]);
+    let HelmOutput::History(history) =
+        parse(&HelmQuery::History(release()), out.to_string().as_bytes()).unwrap()
+    else {
+        panic!("history");
+    };
+    assert!(!history[0].description.contains("q9-opaque"), "{history:?}");
+}
+
+// What a crash left is removed; a run still going is not.
+#[test]
+fn a_new_start_reaps_only_dead_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = runs_root(dir.path());
+    let live = RunDir::create(&root).unwrap();
+    // A crash: the directory stays, and its lock ended with the process.
+    let dead = root.canonicalize().unwrap().join("run-crashed");
+    std::fs::create_dir(&dead).unwrap();
+    std::fs::write(dead.join(".lock"), "").unwrap();
+    std::fs::write(dead.join("kubeconfig"), "credential").unwrap();
+
+    reap_stale(&root);
+
+    assert!(!dead.exists(), "a dead run is removed");
+    assert!(
+        live.path().join(".lock").exists(),
+        "a live run is left alone"
+    );
+    let live_path = live.path().to_owned();
+    drop(live);
+    assert!(!live_path.exists(), "a run removes its own directory");
+}
+
+#[test]
+fn a_run_root_others_can_enter_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = runs_root(dir.path());
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770)).unwrap();
+    assert_eq!(
+        RunDir::create(&root).err().map(|e| e.to_string()),
+        Some(HelmError::UnsafeRunDirectory.to_string())
+    );
+}
+
+#[test]
+fn a_run_root_that_is_a_link_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let root = runs_root(dir.path());
+    std::os::unix::fs::symlink(elsewhere.path(), &root).unwrap();
+    assert_eq!(
+        RunDir::create(&root).err().map(|e| e.to_string()),
+        Some(HelmError::UnsafeRunDirectory.to_string())
+    );
 }
 
 #[test]

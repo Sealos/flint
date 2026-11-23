@@ -378,6 +378,15 @@ impl WriteCredential {
         (digest_of(&now)?.0 == held.0.0).then_some(now)
     }
 
+    /// What this connection's token file holds now, if `path` is that file. Blocks on the file
+    /// system.
+    pub(crate) fn token_file_bytes(&self, path: &Path) -> Option<Vec<u8>> {
+        match &self.0.token {
+            TokenSource::File(file) if file == path => read_file(path).ok(),
+            _ => None,
+        }
+    }
+
     /// Whether this connection's credential can start a program, whatever the kubeconfig says now.
     pub(crate) fn runs_a_command(&self) -> bool {
         self.0.grant.runs_a_command()

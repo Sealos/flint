@@ -1,0 +1,205 @@
+//! Where a `helm` run keeps its private files, and which `helm` may be given them.
+//!
+//! A run's kubeconfig has to be a path: `helm` reads it more than once, and on macOS rereading
+//! `/dev/fd/N` continues from the shared offset and finds nothing. So each run gets a `0700`
+//! directory under an app-owned `0700` root, removed when the run ends. A run holds a lock on its
+//! directory for as long as it lives, so the next start can remove what a crash left behind
+//! without touching a run still going in another process.
+
+// module-tests: ../helm_tests.rs
+
+use std::ffi::OsString;
+use std::fs::{DirBuilder, File, Metadata, OpenOptions, Permissions};
+use std::io;
+use std::os::fd::AsRawFd as _;
+use std::os::unix::fs::{
+    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+};
+use std::path::{Component, Path, PathBuf};
+
+use super::HelmError;
+
+/// The most symbolic links followed in one path, as the kernel limits them.
+const MAX_LINKS: usize = 40;
+const LOCK: &str = ".lock";
+const RUN_PREFIX: &str = "run-";
+
+/// The root of the run directories, under the app's config directory.
+pub(crate) fn runs_root(config_dir: &Path) -> PathBuf {
+    config_dir.join("helm-runs")
+}
+
+fn this_user() -> u32 {
+    // SAFETY: takes nothing and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+fn owned_by_us_or_root(meta: &Metadata) -> bool {
+    meta.uid() == 0 || meta.uid() == this_user()
+}
+
+/// Whether only this account and root can change the entry. In a sticky directory others can
+/// add entries but not replace ours, and each entry below it is checked in turn.
+fn safe_entry(meta: &Metadata) -> bool {
+    let mode = meta.permissions().mode();
+    owned_by_us_or_root(meta) && (mode & 0o022 == 0 || (meta.is_dir() && mode & 0o1000 != 0))
+}
+
+fn parts(path: &Path) -> Vec<OsString> {
+    path.components()
+        .filter_map(|part| match part {
+            Component::Normal(name) => Some(name.to_owned()),
+            Component::ParentDir => Some("..".into()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The real path of `path`, if nothing on the way to it, links included, can be changed by
+/// another account.
+pub(super) fn resolve_trusted(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut at = PathBuf::from("/");
+    if !safe_entry(&std::fs::symlink_metadata(&at).ok()?) {
+        return None;
+    }
+    let mut pending: Vec<OsString> = parts(path).into_iter().rev().collect();
+    let mut links = 0;
+    while let Some(part) = pending.pop() {
+        if part == ".." {
+            at.pop();
+            continue;
+        }
+        let next = at.join(&part);
+        let meta = std::fs::symlink_metadata(&next).ok()?;
+        if meta.file_type().is_symlink() {
+            links += 1;
+            if links > MAX_LINKS || !owned_by_us_or_root(&meta) {
+                return None;
+            }
+            let target = std::fs::read_link(&next).ok()?;
+            if target.is_absolute() {
+                at = PathBuf::from("/");
+            }
+            pending.extend(parts(&target).into_iter().rev());
+            continue;
+        }
+        if !safe_entry(&meta) {
+            return None;
+        }
+        at = next;
+    }
+    Some(at)
+}
+
+fn flock(file: &File, operation: libc::c_int) -> io::Result<()> {
+    loop {
+        // SAFETY: the descriptor is open for as long as `file` is borrowed.
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn open_lock(path: &Path, create: bool) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// The app-owned root, made if needed. Refused unless it is a real directory of this account's
+/// alone, under a parent no other account can change.
+fn private_root(root: &Path) -> Result<PathBuf, HelmError> {
+    let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
+        return Err(HelmError::UnsafeRunDirectory);
+    };
+    std::fs::create_dir_all(parent).map_err(|_| HelmError::NotStarted)?;
+    let parent = resolve_trusted(parent).ok_or(HelmError::UnsafeRunDirectory)?;
+    let root = parent.join(name);
+    match DirBuilder::new().mode(0o700).create(&root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(_) => return Err(HelmError::NotStarted),
+    }
+    let meta = std::fs::symlink_metadata(&root).map_err(|_| HelmError::NotStarted)?;
+    if !meta.is_dir() || meta.uid() != this_user() || meta.permissions().mode() & 0o077 != 0 {
+        return Err(HelmError::UnsafeRunDirectory);
+    }
+    Ok(root)
+}
+
+/// One run's private directory. Dropping it removes the directory, then releases its lock.
+pub(super) struct RunDir {
+    dir: tempfile::TempDir,
+    _lock: File,
+}
+
+impl RunDir {
+    /// Blocks on the file system.
+    pub(super) fn create(root: &Path) -> Result<Self, HelmError> {
+        let root = private_root(root)?;
+        // Shared while the directory is made and locked, so a reaper never sees it unlocked.
+        let root_lock = open_lock(&root.join(LOCK), true).map_err(|_| HelmError::NotStarted)?;
+        flock(&root_lock, libc::LOCK_SH).map_err(|_| HelmError::NotStarted)?;
+        let dir = tempfile::Builder::new()
+            .prefix(RUN_PREFIX)
+            .permissions(Permissions::from_mode(0o700))
+            .tempdir_in(&root)
+            .map_err(|_| HelmError::NotStarted)?;
+        let lock = open_lock(&dir.path().join(LOCK), true).map_err(|_| HelmError::NotStarted)?;
+        flock(&lock, libc::LOCK_EX | libc::LOCK_NB).map_err(|_| HelmError::NotStarted)?;
+        Ok(Self { dir, _lock: lock })
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+/// Removes the run directories under `root` that no live run holds. Blocks on the file system.
+pub(crate) fn reap_stale(root: &Path) {
+    if std::fs::symlink_metadata(root).is_err() {
+        return;
+    }
+    let Ok(root) = private_root(root) else {
+        return;
+    };
+    let Ok(root_lock) = open_lock(&root.join(LOCK), true) else {
+        return;
+    };
+    if flock(&root_lock, libc::LOCK_EX).is_err() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let is_run = entry.file_name().to_string_lossy().starts_with(RUN_PREFIX)
+            && entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if !is_run {
+            continue;
+        }
+        let path = entry.path();
+        // Without a lock file the run died before taking it: creating one needs the root lock.
+        let held = match open_lock(&path.join(LOCK), false) {
+            Ok(lock) => match flock(&lock, libc::LOCK_EX | libc::LOCK_NB) {
+                Ok(()) => Some(lock),
+                Err(_) => continue,
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(_) => continue,
+        };
+        let _ = std::fs::remove_dir_all(&path);
+        drop(held);
+    }
+}

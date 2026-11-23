@@ -5,19 +5,19 @@
 use super::ClusterManager;
 use crate::cluster;
 use crate::handle::AdmittedMember;
-use crate::helm::{HelmError, HelmTarget};
+use crate::helm::{HelmError, HelmTarget, runs_root};
 use crate::recheck::{ContextPin, Pinned};
 use crate::settings::expand_tilde;
 
 impl ClusterManager {
-    /// The target of a `helm` run on `id` at `pin` (at the definition now when `None`), in one
-    /// step with every check: the set member it is bound to, a settled and unpaused context, a
-    /// live connection built from exactly the pinned definition, and no credential that runs a
-    /// program. Protection is not asked: these runs only read.
+    /// The target of a `helm` run on `id` at `pin`, in one step with every check: the set member
+    /// it is bound to, a settled and unpaused context, a live connection built from exactly the
+    /// pinned definition, and no credential that runs a program. Protection is not asked: these
+    /// runs only read.
     pub(super) fn helm_target(
         &self,
         id: &str,
-        pin: Option<ContextPin>,
+        pin: ContextPin,
         member: Option<&AdmittedMember>,
     ) -> Result<HelmTarget, HelmError> {
         if member.is_some_and(|m| m.context() != id || self.member_changed(m).is_some()) {
@@ -27,7 +27,6 @@ impl ClusterManager {
             return Err(HelmError::Unsettled);
         }
         // Before the connection: a changed context often has none, and this is why it is refused.
-        let pin = pin.unwrap_or_else(|| self.session_pin(id));
         let definition = pin.definition();
         let holds = definition.is_some()
             && self.contexts.check(Pinned::Shell, id, &pin).is_none()
@@ -55,6 +54,13 @@ impl ClusterManager {
             .helm
             .as_deref()
             .map(|path| expand_tilde(path, home.as_deref()));
-        HelmTarget::new(&self.kubeconfig.merged, id, pin, credential, configured)
+        HelmTarget::new(
+            &self.kubeconfig.merged,
+            id,
+            pin,
+            credential,
+            configured,
+            runs_root(&self.config.config_dir),
+        )
     }
 }

@@ -89,6 +89,60 @@ async fn a_repointed_context_starts_no_run() {
     assert_eq!(runs(scripts.path()), 0, "helm never started");
 }
 
+// A query already running on the old server ends when the context moves.
+#[tokio::test]
+async fn a_repoint_ends_a_running_query() {
+    let server = FakeApiServer::start().await.unwrap();
+    let elsewhere = FakeApiServer::start().await.unwrap();
+    let scripts = tempfile::tempdir().unwrap();
+    let helm = scripts.path().join("slow-helm");
+    let pid_file = scripts.path().join("pid");
+    std::fs::write(
+        &helm,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}.new'\n/bin/mv '{0}.new' '{0}'\nexec /bin/sleep 25\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helm, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let settings = Settings {
+        helm: Some(helm),
+        ..Settings::default()
+    };
+    let core = Core::start_with(&server, Some("demo"), settings).await;
+    let file = core.dir.path().join("kubeconfig");
+    let pin = core.handle.helm_pin(CONTEXT).await.unwrap();
+    let read = tokio::spawn(core.handle.helm_read(CONTEXT, &pin, HelmQuery::List));
+    while !pid_file.exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+
+    elsewhere.write_kubeconfig(&file, Some("demo")).unwrap();
+    core.handle.reload_kubeconfig().await.unwrap();
+
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(5), read)
+        .await
+        .expect("the run ends with the re-point")
+        .unwrap();
+    assert_eq!(ended, Err(HelmError::Changed));
+    let mut alive = true;
+    for _ in 0..200 {
+        alive = std::process::Command::new("/bin/kill")
+            .args(["-0", &pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if !alive {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!alive, "helm was stopped");
+}
+
 #[tokio::test]
 async fn another_user_on_the_same_server_starts_no_run() {
     let server = FakeApiServer::start().await.unwrap();
@@ -137,8 +191,9 @@ async fn an_exec_plugin_credential_is_refused_and_never_runs() {
     let core = Core::start_on(dir, vec![file], settings).await;
     let plugin_runs = std::fs::read(&ran).map_or(0, |b| b.len());
 
+    let pin = core.handle.helm_pin(CONTEXT).await.unwrap();
     assert_eq!(
-        core.handle.helm_pin(CONTEXT).await,
+        core.handle.helm_read(CONTEXT, &pin, HelmQuery::List).await,
         Err(HelmError::CredentialRunsCommand)
     );
     assert_eq!(runs(scripts.path()), 0, "helm never started");
