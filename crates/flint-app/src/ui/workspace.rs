@@ -1251,7 +1251,7 @@ impl Workspace {
 
     /// Shows the active cluster's overview in place of its list. Go Back returns to the list.
     fn open_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(cluster) = self.cluster.clone() else {
+        let (Some(cluster), Some(generation)) = (self.cluster.clone(), self.generation) else {
             return;
         };
         if let Some((view, _)) = &self.dashboard {
@@ -1268,7 +1268,7 @@ impl Workspace {
         self.remember_place(&overview, cx);
         self.close_list(cx);
         let model = self.model.clone();
-        let view = cx.new(|cx| DashboardView::following(model, cluster, cx));
+        let view = cx.new(|cx| DashboardView::following(model, cluster, generation, cx));
         let events = cx.subscribe_in(&view, window, Self::on_dashboard_event);
         let focus = view.read(cx).focus_handle(cx);
         window.focus(&focus, cx);

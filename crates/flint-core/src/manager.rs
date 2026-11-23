@@ -491,7 +491,7 @@ pub(crate) struct ClusterManager {
     /// Open subscriptions by id.
     subscriptions: HashMap<u64, (ClusterId, KindId)>,
     /// Open overviews by id, with the slot generation each was opened on.
-    overviews: HashMap<u64, (ClusterId, u64)>,
+    overviews: HashMap<u64, telemetry::OpenOverview>,
     /// Running log sessions by id. They belong to no cluster slot, so they outlive cluster
     /// switches and kubeconfig reloads (UP-42).
     log_sessions: HashMap<u64, JoinHandle<()>>,
@@ -757,6 +757,12 @@ impl ClusterManager {
                 }
             }
             Request::OpenOverview { id, cluster } => self.open_overview(id, cluster),
+            Request::OpenOverviewOn {
+                id,
+                cluster,
+                generation,
+                live,
+            } => self.open_overview_on(id, cluster, generation, live),
             Request::CloseOverview { id } => self.close_overview(id),
             Request::Discovery { cluster, reply } => {
                 let discovery = self
