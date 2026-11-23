@@ -997,7 +997,11 @@ async fn deleting_a_set_stops_its_open_on_the_way(cx: &mut TestAppContext) {
     cx.update_window(window, |_, window, cx| {
         workspace.update(cx, |ws, cx| {
             let set = ws.sets.saved[0].clone();
-            ws.open_set(set.name, set.members, Some(set.id), window, cx);
+            let saved = super::SavedOpening {
+                name: set.name,
+                id: set.id,
+            };
+            ws.open_set(set.members, Some(saved), window, cx);
             assert!(ws.sets.opening.is_some(), "still on its way");
             ws.close_deleted_set(&id, window, cx);
             assert!(ws.sets.opening.is_none(), "no longer wanted");
@@ -1059,7 +1063,7 @@ async fn a_choice_stays_on_the_server_it_was_made_on(cx: &mut TestAppContext) {
 
     t.dispatch(cx, "cluster_sets::OpenPickedClusters", Value::Null)
         .unwrap();
-    cx.run_until_parked();
+    wait_until_answered(cx, &t).await;
     let (open, error) = t
         .workspace
         .read_with(cx, |ws, _| (ws.sets.is_open(), ws.sets.error.clone()));
@@ -1184,7 +1188,7 @@ async fn a_set_left_with_one_member_does_not_open(cx: &mut TestAppContext) {
         json!({ "name": "pair" }),
     )
     .unwrap();
-    cx.run_until_parked();
+    wait_until_answered(cx, &t).await;
     let (open, error) = t
         .workspace
         .read_with(cx, |ws, _| (ws.sets.is_open(), ws.sets.error.clone()));
@@ -1195,6 +1199,16 @@ async fn a_set_left_with_one_member_does_not_open(cx: &mut TestAppContext) {
         "{error}"
     );
     assert!(!t.server_was_contacted(), "nothing started");
+}
+
+/// Waits for the core's answer to the open on its way, which arrives from its own thread.
+async fn wait_until_answered(cx: &mut TestAppContext, t: &TestWorkspace) {
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace.read(cx).sets.opening.is_none()
+    })
+    .await;
+    cx.run_until_parked();
 }
 
 /// A saved set whose last member, `kind-gamma`, is defined in a file after one that can break.
@@ -1342,6 +1356,109 @@ async fn a_paused_member_is_left_out(cx: &mut TestAppContext) {
     assert_eq!(elsewhere_connections.load(Ordering::SeqCst), 0);
 }
 
+impl SavedSet {
+    fn shown_clusters(&self, cx: &mut TestAppContext) -> Vec<ClusterSummary> {
+        self.t
+            .workspace
+            .read_with(cx, |ws, cx| ws.model.read(cx).clusters.clone())
+    }
+
+    /// Puts the workspace's view of the clusters back to `shown`, while the core has moved on.
+    fn show_stale_clusters(&self, cx: &mut TestAppContext, shown: Vec<ClusterSummary>) {
+        self.t.workspace.update(cx, |ws, cx| {
+            ws.model.update(cx, |model, _| model.clusters = shown);
+        });
+    }
+}
+
+#[gpui_kit::test]
+async fn a_member_turning_provisional_after_the_view_looked_is_left_out(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let set = saved_set(cx, dir.path(), &THREE).await;
+    let before = set.shown_clusters(cx);
+    set.break_middle_file();
+    set.reload(cx).await;
+    set.show_stale_clusters(cx, before);
+    set.opens_without_gamma(cx, "Provisional").await;
+}
+
+#[gpui_kit::test]
+async fn a_member_back_after_the_view_looked_joins(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let set = saved_set(cx, dir.path(), &THREE).await;
+    std::fs::write(&set.last, kubeconfig_yaml(&[SPARE])).unwrap();
+    set.reload(cx).await;
+    let without_gamma = set.shown_clusters(cx);
+    let back = kubeconfig_yaml(&[("kind-gamma", &set.gamma_url)]);
+    std::fs::write(&set.last, back).unwrap();
+    set.reload(cx).await;
+    set.show_stale_clusters(cx, without_gamma);
+    set.open(cx);
+    set.t.wait_for_element(cx, "cluster-set-view").await;
+    cx.run_until_parked();
+    assert_eq!(set.members(cx), THREE);
+}
+
+#[gpui_kit::test]
+async fn an_unsaved_set_is_titled_by_the_members_admitted(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let set = saved_set(cx, dir.path(), &THREE).await;
+    set.t.workspace.update(cx, |ws, _| {
+        ws.sets.picked = ws.sets.saved[0].members.clone();
+    });
+    std::fs::write(&set.last, kubeconfig_yaml(&[SPARE])).unwrap();
+    set.reload(cx).await;
+    set.t
+        .dispatch(cx, "cluster_sets::OpenPickedClusters", Value::Null)
+        .unwrap();
+    set.t.wait_for_element(cx, "cluster-set-view").await;
+    let label = set
+        .t
+        .workspace
+        .read_with(cx, |ws, _| ws.sets.running.as_ref().unwrap().label.clone());
+    assert_eq!(label, "2 clusters");
+}
+
+#[gpui_kit::test]
+async fn a_refused_open_stops_the_open_it_replaced(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let set = saved_set(cx, dir.path(), &["kind-alpha", "kind-beta"]).await;
+    let window = set.t.window;
+    let workspace = set.t.workspace.clone();
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| {
+            let saved = ws.sets.saved[0].clone();
+            let mut stale = saved.members.clone();
+            stale[1] = ClusterPin::new("kind-beta".to_owned(), "https://old.invalid".to_owned());
+            ws.open_set(saved.members, None, window, cx);
+            ws.open_set(stale, None, window, cx);
+        })
+    })
+    .unwrap();
+    let core = set.t.workspace.read_with(cx, |ws, cx| ws.core(cx).clone());
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        cx.run_until_parked();
+        let settled = set
+            .t
+            .workspace
+            .read_with(cx, |ws, _| ws.sets.opening.is_none());
+        if settled && core.running_set().await.is_empty() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the core kept a set");
+        cx.background_executor
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    let (open, error) = set
+        .t
+        .workspace
+        .read_with(cx, |ws, _| (ws.sets.is_open(), ws.sets.error.clone()));
+    assert!(!open, "no view is left over a set nobody asked for");
+    assert!(error.expect("says why").contains("too few"));
+}
+
 #[gpui_kit::test]
 async fn too_few_current_members_refuse_the_set_and_name_why(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
@@ -1349,7 +1466,7 @@ async fn too_few_current_members_refuse_the_set_and_name_why(cx: &mut TestAppCon
     set.break_middle_file();
     set.reload(cx).await;
     set.open(cx);
-    cx.run_until_parked();
+    wait_until_answered(cx, &set.t).await;
     let (open, error) = set
         .t
         .workspace
