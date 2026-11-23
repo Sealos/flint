@@ -680,7 +680,8 @@ impl Workspace {
             return;
         }
         if matches!(key, TabKey::Shell(_)) && self.is_protected(key.context(), cx) {
-            self.refuse(refused(opening, &protected_reason(key.context())), cx);
+            let shown = self.cluster_names(cx).exact(key.context());
+            self.refuse(refused(opening, &protected_reason(&shown)), cx);
             return;
         }
         self.clear_action_error(cx);
@@ -751,10 +752,8 @@ impl Workspace {
         }
         // The core refuses too; this says so without opening a tab that fails at once.
         if self.is_protected(&request.cluster, cx) {
-            self.refuse(
-                refused(Opening::Shell, &protected_reason(&request.cluster)),
-                cx,
-            );
+            let shown = self.cluster_names(cx).exact(&request.cluster);
+            self.refuse(refused(Opening::Shell, &protected_reason(&shown)), cx);
             return;
         }
         let core = self.model.read(cx).core().clone();
@@ -830,12 +829,13 @@ impl Workspace {
         let cluster = detail.read(cx).object().cluster.clone();
         let why = self.sessions_blocked(&cluster, cx);
         let protected = self.is_protected(&cluster, cx);
+        let label = self.cluster_names(cx).exact(&cluster);
         let server = self
             .cluster_summary(&cluster, cx)
             .and_then(|c| c.info.server.clone());
         detail.update(cx, |d, cx| {
             d.set_sessions_blocked(why, cx);
-            d.set_protected(protected, cx);
+            d.set_protected(protected, label, cx);
             d.set_server(server);
         });
     }
@@ -921,7 +921,10 @@ impl Workspace {
             Some(c) if c.info.server.is_none() => {
                 blocked(format!("{cluster} has no API server in kubeconfig"), false)
             }
-            Some(_) if self.is_protected(cluster, cx) => blocked(protected_reason(cluster), true),
+            Some(_) if self.is_protected(cluster, cx) => blocked(
+                protected_reason(&self.cluster_names(cx).exact(cluster)),
+                true,
+            ),
             Some(_) => None,
         }
     }
@@ -3186,7 +3189,11 @@ impl Render for Workspace {
                         theme,
                         cx,
                     )))
-                    .children(resource_actions::drain_strips(theme, cx))
+                    .children(resource_actions::drain_strips(
+                        || self.cluster_names(cx),
+                        theme,
+                        cx,
+                    ))
                     .when_some(self.action_error.clone(), |el, why| {
                         el.child(refusal_strip(why, theme))
                     })
