@@ -30,6 +30,7 @@ pub enum Command {
     PressKey { key: String },
     /// Right-click the drawn element named `id` (a row's `row-<uid>`), as the mouse does: for
     /// opening a context menu.
+    Click { id: String },
     RightClick { id: String },
     /// Resize the window to `width` by `height` points, to check narrow and short layouts.
     ResizeWindow { width: f32, height: f32 },
@@ -261,6 +262,10 @@ fn command(cmd: &str, args: Value) -> Result<Command, Error> {
         "press_key" => {
             let a: KeyArgs = args_of(cmd, args)?;
             Command::PressKey { key: a.key }
+        }
+        "click" => {
+            let a: ElementArgs = args_of(cmd, args)?;
+            Command::Click { id: a.id }
         }
         "right_click" => {
             let a: ElementArgs = args_of(cmd, args)?;

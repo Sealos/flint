@@ -14,6 +14,8 @@ use gpui_kit::component::{ActiveTheme as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::write_binding::ConnectionGuard;
+
 /// What a confirmation says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogText {
@@ -92,23 +94,34 @@ pub fn open_pinned(
     pinned: usize,
     on_ok: impl Fn(&mut Window, &mut App) + 'static,
 ) {
-    open_dialog(window, cx, dialog, pinned, None, None, move |window, cx| {
+    let on_ok = move |window: &mut Window, cx: &mut App| {
         on_ok(window, cx);
         true
-    });
+    };
+    open_dialog(window, cx, dialog, pinned, None, None, None, on_ok);
 }
 
-/// [`open_pinned`] with `content` under the text, and an `on_ok` that may keep the dialog open, as
-/// in [`open_with`].
-pub fn open_pinned_with(
+/// [`open_pinned`] for a write: it can be answered only while `guard` holds. Once it does not,
+/// OK runs nothing and closes the dialog, and [`close_stale`] closes it unanswered.
+pub(in crate::ui) fn open_pinned_guarded(
     window: &mut Window,
     cx: &mut App,
     dialog: DialogText,
     pinned: usize,
-    content: AnyView,
+    content: Option<AnyView>,
+    guard: ConnectionGuard,
     on_ok: impl Fn(&mut Window, &mut App) -> bool + 'static,
 ) {
-    open_dialog(window, cx, dialog, pinned, Some(content), None, on_ok);
+    open_dialog(
+        window,
+        cx,
+        dialog,
+        pinned,
+        content,
+        None,
+        Some(guard),
+        on_ok,
+    );
 }
 
 /// [`open`], with `content` (a view of its own, such as pickers) drawn under the text, and an
@@ -121,7 +134,7 @@ pub fn open_with(
     content: Option<AnyView>,
     on_ok: impl Fn(&mut Window, &mut App) -> bool + 'static,
 ) {
-    open_dialog(window, cx, dialog, 0, content, None, on_ok);
+    open_dialog(window, cx, dialog, 0, content, None, None, on_ok);
 }
 
 /// [`open_with`], with `state` read from the content: its note is drawn beside the buttons, and
@@ -137,9 +150,10 @@ pub fn open_gated(
 ) {
     debug_assert!(!dialog.default_cancel);
     let gate: Gate = Rc::new(state);
-    open_dialog(window, cx, dialog, 0, Some(content), Some(gate), on_ok);
+    open_dialog(window, cx, dialog, 0, Some(content), Some(gate), None, on_ok);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn open_dialog(
     window: &mut Window,
     cx: &mut App,
@@ -147,6 +161,7 @@ fn open_dialog(
     pinned: usize,
     content: Option<AnyView>,
     gate: Option<Gate>,
+    guard: Option<ConnectionGuard>,
     on_ok: impl Fn(&mut Window, &mut App) -> bool + 'static,
 ) {
     #[cfg(any(test, feature = "automation"))]
@@ -168,7 +183,7 @@ fn open_dialog(
     let target_height = Rc::new(Cell::new(px(0.)));
     // What a gated footer's buttons answer from: opening the dialog does not focus it.
     let gate_focus = gate.as_ref().map(|_| cx.focus_handle());
-    let live = LiveDialog::open(window, cx);
+    let live = LiveDialog::open(window, guard, cx);
     window.open_alert_dialog(cx, move |alert, window, cx| {
         let on_ok = on_ok.clone();
         let gate = gate.clone();
@@ -265,6 +280,13 @@ fn open_dialog(
                     return false;
                 }
                 let before = window.focused(cx);
+                // Its connection changed: whatever asks, this runs nothing and only closes it.
+                if live_ok.is_stale(cx) {
+                    if live_ok.retire(window, cx) {
+                        close_returning_focus(before, window, cx);
+                    }
+                    return false;
+                }
                 if on_ok(window, cx) && live_ok.retire(window, cx) {
                     close_returning_focus(before, window, cx);
                 }
@@ -285,17 +307,18 @@ fn open_dialog(
 /// The confirmations not yet answered, per window, oldest first. A dialog's controls stay on
 /// screen until the next frame, so a press can reach one that was already answered.
 #[derive(Default)]
-struct LiveDialogs(std::collections::HashMap<WindowId, Vec<Weak<()>>>);
+struct LiveDialogs(std::collections::HashMap<WindowId, Vec<Weak<Option<ConnectionGuard>>>>);
 
 impl Global for LiveDialogs {}
 
-/// One confirmation's place in [`LiveDialogs`], for as long as the dialog holds it.
+/// One confirmation's place in [`LiveDialogs`], for as long as the dialog holds it, with the
+/// connection it can be answered on, if it is about one.
 #[derive(Clone)]
-struct LiveDialog(Rc<()>);
+struct LiveDialog(Rc<Option<ConnectionGuard>>);
 
 impl LiveDialog {
-    fn open(window: &Window, cx: &mut App) -> Self {
-        let dialog = Self(Rc::new(()));
+    fn open(window: &Window, guard: Option<ConnectionGuard>, cx: &mut App) -> Self {
+        let dialog = Self(Rc::new(guard));
         let live = cx.default_global::<LiveDialogs>();
         live.0.retain(|_, stack| {
             stack.retain(|d| d.strong_count() > 0);
@@ -320,6 +343,11 @@ impl LiveDialog {
             .and_then(|live| live.0.get(&id))
             .and_then(|stack| stack.iter().rev().find(|d| d.strong_count() > 0))
             .is_some_and(|newest| newest.ptr_eq(&Rc::downgrade(&self.0)))
+    }
+
+    /// Whether the connection this dialog is about has changed since it opened.
+    fn is_stale(&self, cx: &App) -> bool {
+        self.0.as_ref().as_ref().is_some_and(|g| !g.holds(cx))
     }
 
     /// Marks this dialog answered, if it is the newest one: whether it was.
@@ -347,6 +375,27 @@ pub fn close_newest(window: &mut Window, cx: &mut App) {
         stack.pop();
     }
     window.close_dialog(cx);
+}
+
+/// Whether the newest confirmation open in `window` is about a connection that has changed.
+pub(in crate::ui) fn newest_is_stale(window: &mut Window, cx: &mut App) -> bool {
+    if !window.has_active_dialog(cx) {
+        return false;
+    }
+    cx.try_global::<LiveDialogs>()
+        .and_then(|live| live.0.get(&window.window_handle().window_id()))
+        .and_then(|stack| stack.iter().rev().find_map(Weak::upgrade))
+        .is_some_and(|newest| LiveDialog(newest).is_stale(cx))
+}
+
+/// Closes, unanswered, each newest confirmation whose connection has changed: whether any closed.
+pub(in crate::ui) fn close_stale(window: &mut Window, cx: &mut App) -> bool {
+    let mut closed = false;
+    while newest_is_stale(window, cx) {
+        close_newest(window, cx);
+        closed = true;
+    }
+    closed
 }
 
 /// Closes the newest dialog and returns focus to what held it before the dialog, in this update.

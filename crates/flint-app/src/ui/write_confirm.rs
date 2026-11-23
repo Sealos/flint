@@ -13,6 +13,7 @@ use flint_core::write::{
 use gpui_kit::*;
 
 use super::confirm::{self, DialogText};
+use super::write_binding::ConnectionGuard;
 
 /// How a confirmation words its action, and whether only its button may confirm it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +263,7 @@ pub fn open_noted(
     review: WriteReview,
     names: &ClusterNames,
     note: Option<&str>,
+    guard: ConnectionGuard,
     begin: impl Fn(&mut App) -> bool + 'static,
     on_done: impl Fn(Result<WriteOutcome, WriteError>, &mut App) + 'static,
 ) {
@@ -281,7 +283,10 @@ pub fn open_noted(
     let text = dialog_text_saying(review.target(), worded, review.warnings(), &saying, &shown);
     let pinned = target_lines(review.target()).len();
     let confirmed = confirmation(core, review, begin, on_done);
-    confirm::open_pinned(window, cx, text, pinned, move |_, cx| confirmed(cx));
+    confirm::open_pinned_guarded(window, cx, text, pinned, None, guard, move |_, cx| {
+        confirmed(cx);
+        true
+    });
 }
 
 /// What confirming `review` does. A confirmation runs once, whatever `begin` or the write answers:

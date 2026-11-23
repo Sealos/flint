@@ -65,6 +65,7 @@ mod ui_state;
 #[cfg(any(test, feature = "automation"))]
 mod view_state;
 mod workspace;
+mod write_binding;
 mod write_confirm;
 
 use std::cell::Cell;
