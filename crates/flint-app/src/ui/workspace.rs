@@ -675,7 +675,7 @@ impl Workspace {
             TabKey::Logs(_) => Opening::ReconnectLogs,
             TabKey::Shell(_) => Opening::RestartShell,
             // Runs no session to start again.
-            TabKey::Activity(_) => return,
+            TabKey::Activity(_) | TabKey::Compare(..) => return,
         };
         if let Some(reason) = self.sessions_blocked(key.context(), cx) {
             self.refuse(refused(opening, &reason), cx);
@@ -712,7 +712,9 @@ impl Workspace {
                         DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
                     }
                     // It returned above: an activity tab has no session to start again.
-                    TabKey::Activity(_) => unreachable!("activity tabs do not restart"),
+                    TabKey::Activity(_) | TabKey::Compare(..) => {
+                        unreachable!("these tabs do not restart")
+                    }
                 },
                 window,
                 cx,
@@ -792,7 +794,7 @@ impl Workspace {
             // the endpoint changes. Agent activity depends on neither.
             TabKey::Shell(_) => summary.map_or(0, |c| c.definition),
             TabKey::Logs(_) => summary.map_or(0, |c| c.endpoint),
-            TabKey::Activity(_) => 0,
+            TabKey::Activity(_) | TabKey::Compare(..) => 0,
         };
         TabCluster::new(context, self.shown_server(context, cx).as_deref()).defined_by(definition)
     }

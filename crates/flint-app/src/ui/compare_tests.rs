@@ -162,3 +162,134 @@ fn a_cluster_listed_twice_gets_one_column() {
     let clusters = distinct(vec![EU.to_owned(), US.to_owned(), EU.to_owned()]);
     assert_eq!(clusters, [EU, US]);
 }
+
+fn summary(name: &str, state: ConnectionState, paused: bool) -> ClusterSummary {
+    ClusterSummary {
+        info: flint_core::kubeconfig::ContextInfo {
+            name: name.into(),
+            cluster: None,
+            user: None,
+            namespace: None,
+            server: None,
+            proxy_url: None,
+            source: "/k".into(),
+        },
+        state,
+        generation: 1,
+        definition: 1,
+        endpoint: 1,
+        confirmed: true,
+        provisional: false,
+        paused,
+    }
+}
+
+fn connected(name: &str) -> ClusterSummary {
+    let version = flint_core::ServerVersion {
+        git_version: "v1".into(),
+        platform: "linux/arm64".into(),
+    };
+    summary(name, ConnectionState::Connected(version), false)
+}
+
+fn paused(name: &str) -> ClusterSummary {
+    summary(name, ConnectionState::AwaitingConfirmation, true)
+}
+
+#[test]
+fn columns_are_the_origin_then_connected_and_paused_clusters() {
+    let clusters = [
+        summary("idle", ConnectionState::Disconnected, false),
+        connected("other"),
+        paused("held"),
+        connected("origin"),
+    ];
+    assert_eq!(
+        compare_clusters("origin", &clusters),
+        ["origin", "other", "held"]
+    );
+}
+
+#[test]
+fn a_comparison_needs_another_readable_cluster() {
+    let alone = [connected("origin"), paused("held")];
+    assert_eq!(can_compare("origin", &alone).unwrap_err(), NO_OTHER_CLUSTER);
+    let two = [connected("origin"), connected("other")];
+    assert_eq!(can_compare("origin", &two), Ok(()));
+    let origin_paused = [paused("origin"), connected("other")];
+    assert!(
+        can_compare("origin", &origin_paused)
+            .unwrap_err()
+            .contains(PAUSED)
+    );
+}
+
+#[test]
+fn paused_and_removed_clusters_are_held_back() {
+    let clusters = [connected("live"), paused("held")];
+    assert_eq!(held_back("live", &clusters), None);
+    assert_eq!(held_back("held", &clusters), Some(PAUSED));
+    assert_eq!(held_back("gone", &clusters), Some(REMOVED));
+}
+
+#[test]
+fn a_refusal_is_one_sentence() {
+    assert_eq!(
+        refused("alpha is not connected."),
+        "Can't compare this object: alpha is not connected."
+    );
+}
+
+#[test]
+fn every_compare_action_is_bound() {
+    use crate::ui::registry::{Scope, tests::assert_binds_scope};
+    assert_binds_scope(Scope::Compare, CompareView::bind_actions);
+}
+
+// The core would answer "not connected" for this cluster, so the paused reason shows no request
+// was made. The toggles change what is shown without reading again.
+#[gpui_kit::test]
+fn a_paused_cluster_is_not_read_and_the_controls_work(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = tempfile::tempdir().unwrap();
+    let core = flint_core::CoreHandle::start(flint_core::CoreConfig {
+        config_dir: dir.path().to_owned(),
+        settings: flint_core::Settings::default(),
+        settings_error: None,
+        kubeconfig_base: Vec::new(),
+        home: None,
+        watch_files: false,
+        watch_timing: Default::default(),
+    })
+    .unwrap();
+    let source = cx.new(|cx| ClustersModel::new(core, flint_core::Settings::default(), None, cx));
+    let view = cx.new(|cx| {
+        source.update(cx, |model, _| {
+            model.clusters = vec![connected(EU), paused(US)];
+        });
+        CompareView::new(
+            source.clone(),
+            EU.to_owned(),
+            target(KindId::new("", "configmaps")),
+            vec![EU.to_owned(), US.to_owned()],
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    let held = format!("{UNAVAILABLE}: {PAUSED}");
+    view.read_with(cx, |view, _| {
+        let side = &view.model().headers[1];
+        assert_eq!(side.status, held);
+        assert!(side.problem);
+        assert!(!view.show_same() && !view.include_volatile());
+    });
+    view.update(cx, |view, cx| {
+        view.set_show_same(true, cx);
+        view.set_include_volatile(true, cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |view, _| {
+        assert!(view.show_same() && view.include_volatile());
+        assert_eq!(view.model().headers[1].status, held);
+    });
+}

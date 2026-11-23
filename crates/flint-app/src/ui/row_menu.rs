@@ -32,6 +32,7 @@ use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
+use super::compare;
 use super::detail::{
     Opening, PROTECTED_NOTE, ShellPod, Subject, log_item, reason, refused, shell_item,
 };
@@ -41,7 +42,7 @@ use super::menu_fit::{
 };
 use super::object::PodContainer;
 use super::registry::{
-    self, OpenContainerLogs, OpenLogs, OpenPreviousLogs, OpenShell, UnlockCluster,
+    self, OpenCompare, OpenContainerLogs, OpenLogs, OpenPreviousLogs, OpenShell, UnlockCluster,
 };
 use super::resource_actions::{self, ResourceAction, has_sessions};
 #[cfg(any(test, feature = "automation"))]
@@ -206,6 +207,8 @@ pub struct RowActions {
     /// The row's cluster, when it is protected (ADR-0015): Shell is disabled, saying so, and
     /// an Unlock entry follows it, so the unlock is offered in place.
     pub unlock: Option<UnlockEntry>,
+    /// Compare Across Clusters, when there is another cluster to compare with.
+    pub compare: Option<Availability>,
     /// The resource actions the row's kind has, in menu order, and whether each can run now.
     pub writes: Vec<WriteEntry>,
 }
@@ -255,6 +258,11 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
         return None;
     }
     let blocked = ws.sessions_blocked(&detail.object().cluster, cx);
+    // Offered only when there is something to compare with.
+    let compare = ws
+        .compare_check(cx)
+        .is_ok()
+        .then(|| blocked.clone().map_or(Ok(()), Err));
     // An action's own reason can quote a server's error (a pod list refused): one short line.
     let gate = |checked: Result<(), registry::ActionError>| match &blocked {
         Some(why) => Err(why.clone()),
@@ -283,6 +291,7 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
                 ),
             }
         }),
+        compare,
         blocked,
         subject,
         writes,
@@ -392,8 +401,21 @@ fn fill(
     if has_sessions(a.subject) {
         menu = session_entries(menu, &a, once, &workspace, window, cx);
     }
-    if !a.writes.is_empty() {
+    if let Some(can) = &a.compare {
         if has_sessions(a.subject) {
+            menu = menu.separator();
+        }
+        menu = entry(
+            menu,
+            registry::label::<OpenCompare>().into(),
+            Box::new(OpenCompare),
+            can,
+            says_why,
+            &workspace,
+        );
+    }
+    if !a.writes.is_empty() {
+        if has_sessions(a.subject) || a.compare.is_some() {
             menu = menu.separator();
         }
         for write in &a.writes {
@@ -632,6 +654,13 @@ pub(in crate::ui) fn refusal(
             why.as_deref().unwrap_or("it cannot run now"),
         );
     }
+    if action.as_any().is::<OpenCompare>() {
+        let why = match error {
+            registry::ActionError::NotAvailable(_) => ws.compare_check(cx).err(),
+            other => Some(reason(other)),
+        };
+        return compare::refused(why.as_deref().unwrap_or("it cannot run now"));
+    }
     let any = action.as_any();
     let opening = if any.is::<OpenLogs>() {
         Opening::Logs
@@ -727,6 +756,9 @@ pub fn menu_state(a: &RowActions) -> (Option<String>, Vec<MenuEntryState>) {
             _ => entry(label, &shell_in_menu(a)),
         });
     }
+    if let Some(can) = &a.compare {
+        entries.push(entry(registry::label::<OpenCompare>().to_owned(), can));
+    }
     for write in &a.writes {
         entries.push(entry(
             write.action.label().to_owned(),
@@ -782,6 +814,7 @@ pub(in crate::ui) mod tests {
             shell_picker: false,
             log_containers: vec![container("app", true, false)],
             unlock: None,
+            compare: None,
             writes: Vec::new(),
         }
     }
@@ -889,6 +922,32 @@ pub(in crate::ui) mod tests {
                 json!({"label": "Shell", "enabled": false, "reason": why, "checked": null, "submenu": []}),
                 json!({"label": "Unlock alpha…", "enabled": true, "reason": null, "checked": null, "submenu": []}),
             ]
+        );
+    }
+
+    // covers #449: Compare follows the session entries, and says why when it can't run.
+    #[test]
+    fn compare_is_listed_only_when_there_is_a_cluster_to_compare_with() {
+        let label = "Compare Across Clusters";
+        let labels = |a: &RowActions| -> Vec<String> {
+            menu_state(a).1.into_iter().map(|e| e.label).collect()
+        };
+        assert!(!labels(&pod_actions()).iter().any(|l| l == label));
+
+        let offered = RowActions {
+            compare: Some(Ok(())),
+            ..pod_actions()
+        };
+        assert_eq!(labels(&offered).last().map(String::as_str), Some(label));
+
+        let why = "alpha is not connected.".to_owned();
+        let blocked = RowActions {
+            compare: Some(Err(why.clone())),
+            ..pod_actions()
+        };
+        assert_eq!(
+            state(&blocked)["entries"][3],
+            json!({"label": label, "enabled": false, "reason": why, "checked": null, "submenu": []})
         );
     }
 

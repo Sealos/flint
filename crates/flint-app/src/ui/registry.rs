@@ -38,6 +38,9 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use super::compare::COMPARE_VIEW;
+pub use super::compare::{OpenCompare, RefreshCompare, ToggleCompareSame, ToggleCompareVolatile};
+
 actions!(
     flint,
     [
@@ -738,6 +741,8 @@ pub enum Scope {
     Logs,
     /// The shell tab shown in the dock.
     Terminal,
+    /// The compare tab shown in the dock.
+    Compare,
     /// The open command palette.
     Palette,
     /// The focused text field (gpui-component's own actions: Cut, Copy, Paste, Select All).
@@ -2461,6 +2466,21 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Open what the latest drain did, also when it stopped early.",
         )
         .of(C::Detail, S::Workspace),
+        Spec::unit::<OpenCompare>(
+            "Compare Across Clusters",
+            "Compare the selected object across the connected clusters. Read-only.",
+        )
+        .of(C::Detail, S::Workspace),
+        Spec::unit::<RefreshCompare>("Refresh Comparison", "Read the compared object again.")
+            .of(C::Detail, S::Compare)
+            .keys(&["secondary-r"], Some(COMPARE_VIEW)),
+        Spec::unit::<ToggleCompareSame>("Toggle Matching Fields", "Show the fields that match.")
+            .of(C::Detail, S::Compare),
+        Spec::unit::<ToggleCompareVolatile>(
+            "Toggle Cluster-Assigned Fields",
+            "Include the fields each cluster assigns for itself.",
+        )
+        .of(C::Detail, S::Compare),
         Spec::with_args::<ToggleDrainOption>(
             "Toggle Drain Option…",
             "In the drain dialog, turn an option on or off.",
