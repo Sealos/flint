@@ -857,9 +857,7 @@ fn build_observed_client(
         )
         .option_layer(observer.cloned().map(|grant| {
             tower::util::MapResponseLayer::new(move |response: http::Response<_>| {
-                if response.status() == http::StatusCode::UNAUTHORIZED {
-                    grant.note_refused();
-                }
+                grant.note_response(response.status());
                 response
             })
         }))
@@ -1088,7 +1086,7 @@ pub(crate) fn find_auth_error<'a>(
 }
 
 /// A message for an auth error that never includes the plugin's command, environment, or output.
-fn auth_error_message(err: &kube::client::AuthError) -> String {
+pub(crate) fn auth_error_message(err: &kube::client::AuthError) -> String {
     use kube::client::AuthError as A;
     match err {
         A::AuthExecRun { out, .. } => format!(
@@ -1097,7 +1095,13 @@ fn auth_error_message(err: &kube::client::AuthError) -> String {
             out.status
         ),
         A::AuthExecParse(_) => {
-            "authentication failed: the exec auth plugin's output could not be parsed".to_owned()
+            format!(
+                "authentication failed: {}",
+                crate::auth_plugin::UNREADABLE_OUTPUT
+            )
+        }
+        A::AuthExec(text) if text == crate::auth_plugin::UNREADABLE_OUTPUT => {
+            format!("authentication failed: {text}")
         }
         A::AuthExec(text) => match crate::auth_plugin::problem(text) {
             Some((command, problem)) => plugin_problem_message(command.as_deref(), &problem),

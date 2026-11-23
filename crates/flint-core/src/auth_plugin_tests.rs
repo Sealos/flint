@@ -427,14 +427,37 @@ fn credentials_parse_from_json_or_yaml() {
         Credential::None
     ));
     assert!(matches!(parsed("{}"), Err(AuthError::ExecPluginFailed)));
-    assert!(matches!(
-        parsed(r#"{"status":{"token":"a","expirationTimestamp":"soon"}}"#),
-        Err(AuthError::MalformedTokenExpirationDate(_))
-    ));
-    assert!(matches!(
-        parsed("[not: a credential"),
-        Err(AuthError::AuthExecParse(_))
-    ));
+    for unreadable in [
+        r#"{"status":{"token":"a","expirationTimestamp":"soon"}}"#,
+        "[not: a credential",
+    ] {
+        assert!(matches!(
+            parsed(unreadable),
+            Err(AuthError::AuthExec(text)) if text == UNREADABLE_OUTPUT
+        ));
+    }
+}
+
+// Neither a parser's error nor a timestamp's quotes what the plugin printed.
+#[test]
+fn an_unreadable_credential_keeps_none_of_the_output() {
+    const SECRET: &str = "s3cr3t-output";
+    for output in [
+        format!("status: [{SECRET}"),
+        format!("{{\"status\": {SECRET}: x}}"),
+        format!(
+            "{{\"status\":{{\"token\":\"a\",\"expirationTimestamp\":\"2026-01-01{SECRET}\"}}}}"
+        ),
+    ] {
+        let error = parse(output.as_bytes()).expect_err("unreadable");
+        for said in [
+            error.to_string(),
+            format!("{error:?}"),
+            crate::cluster::auth_error_message(&error),
+        ] {
+            assert!(!said.contains(SECRET), "{said}");
+        }
+    }
 }
 
 // Debug output never shows a credential.

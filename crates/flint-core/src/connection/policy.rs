@@ -105,7 +105,7 @@ impl Default for PluginRuns {
 }
 
 impl PluginRuns {
-    fn track(&self) -> PluginRun {
+    pub(crate) fn track(&self) -> PluginRun {
         self.0.send_modify(|count| *count += 1);
         PluginRun(Arc::clone(&self.0))
     }
@@ -126,12 +126,20 @@ impl Drop for PluginRun {
     }
 }
 
+/// What a connection's server has answered since its plugin last ran.
+#[derive(Default)]
+struct ServerAnswers {
+    served: AtomicBool,
+    unavailable: AtomicBool,
+}
+
 /// A policy and the current role of one connection. Clones share the role, so whoever holds one
 /// can change it while the connection is being made or used.
 #[derive(Clone)]
 pub(crate) struct CredentialAccess {
     policy: Arc<dyn CredentialPolicy>,
     role: Arc<watch::Sender<RoleState>>,
+    answers: Arc<ServerAnswers>,
     /// Asked right before a credential's program starts, for a caller whose answer takes a wait.
     launch_check: Option<SendCheck>,
     /// Set for a kept connection: its first failure ends this access, so nothing retries.
@@ -146,6 +154,7 @@ impl CredentialAccess {
         CredentialAccess {
             policy,
             role: Arc::new(role),
+            answers: Arc::default(),
             launch_check: None,
             on_failure: None,
             plugin_runs: None,
@@ -258,6 +267,34 @@ impl CredentialGrant {
     /// A run of the credential's program failed.
     pub(crate) fn note_failed(&self) {
         self.access.credential_failed();
+    }
+
+    /// Records how the server answered a request.
+    pub(crate) fn note_response(&self, status: http::StatusCode) {
+        let answers = &self.access.answers;
+        if status == http::StatusCode::UNAUTHORIZED {
+            self.note_refused();
+        } else if status == http::StatusCode::SERVICE_UNAVAILABLE {
+            answers.unavailable.store(true, Ordering::Relaxed);
+        } else if status.is_success() {
+            answers.served.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a kept connection's server has answered only 503 since its plugin last ran. One
+    /// API that is down, as a missing metrics server is, does not count: others still answer.
+    pub(crate) fn server_down(&self) -> bool {
+        let answers = &self.access.answers;
+        self.unattended()
+            && answers.unavailable.load(Ordering::Relaxed)
+            && !answers.served.load(Ordering::Relaxed)
+    }
+
+    /// The plugin is about to run again: only answers from now on say anything of its token.
+    pub(crate) fn refresh_starting(&self) {
+        let answers = &self.access.answers;
+        answers.served.store(false, Ordering::Relaxed);
+        answers.unavailable.store(false, Ordering::Relaxed);
     }
 
     /// Whether nobody is looking at this connection: a kept one. Its program gets no stdin, and

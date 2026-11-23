@@ -90,6 +90,102 @@ async fn a_detected_edit_ends_a_running_plugin_without_calling_it_a_failure() {
     assert_ne!(manager.keep_status("dev"), KeepWatching::SignInNeeded);
 }
 
+/// An empty kubeconfig file next to the plugin.
+fn extra_file(plugin: &FakePlugin) -> PathBuf {
+    let extra = plugin.dir.path().join("extra");
+    std::fs::write(&extra, "apiVersion: v1\nkind: Config\n").unwrap();
+    extra
+}
+
+// Another file list can define the context differently: the grant ends with the old list.
+#[tokio::test]
+async fn a_changed_file_list_retires_the_grant() {
+    let plugin = FakePlugin::new("exit 1\n");
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _path) = manager_with(&plugin, config.path().to_owned());
+    allow(&mut manager).await;
+    let shown = manager.keep_watching_views()["dev"].shown_sign_in.unwrap();
+    let pending = manager.offer_keep_watching("dev", shown).unwrap().approve();
+
+    let settings = Settings {
+        kubeconfig_paths: vec![extra_file(&plugin)],
+        ..(*manager.settings).clone()
+    };
+    manager.apply_settings(Ok(settings)).await;
+    manager.approve_keep_watching(pending).await;
+    manager.sync_keep_watching();
+
+    assert!(!manager.keep.consents.contains_key("dev"));
+    assert_eq!(manager.keep_status("dev"), KeepWatching::NeedsConfirming);
+}
+
+// A saved list the manager has not read yet already decides what a launch may trust.
+#[tokio::test]
+async fn a_file_list_changed_on_disk_refuses_the_launch() {
+    let plugin = FakePlugin::new("exit 1\n");
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _path) = manager_with(&plugin, config.path().to_owned());
+    allow(&mut manager).await;
+    let consent = Arc::clone(&manager.keep.consents["dev"]);
+    let check = manager.launch_check("dev", Arc::clone(&consent));
+    assert!(check.refusal().await.is_ok(), "the same list launches");
+
+    let extra = extra_file(&plugin);
+    crate::settings::edit_settings(config.path(), |table, _| {
+        let path = toml::Value::String(extra.display().to_string());
+        table.insert("kubeconfig_paths".into(), toml::Value::Array(vec![path]));
+        Ok(())
+    })
+    .unwrap();
+
+    assert!(check.refusal().await.is_err());
+}
+
+// Undoing an edit a launch already caught brings back neither the consent nor an open approval.
+#[tokio::test]
+async fn a_mismatch_at_launch_ends_consent_and_pending_approvals() {
+    let plugin = FakePlugin::new("exit 1\n");
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, path) = manager_with(&plugin, config.path().to_owned());
+    allow(&mut manager).await;
+    let shown = manager.keep_watching_views()["dev"].shown_sign_in.unwrap();
+    let pending = manager.offer_keep_watching("dev", shown).unwrap().approve();
+    let consent = Arc::clone(&manager.keep.consents["dev"]);
+    let check = manager.launch_check("dev", consent);
+
+    let original = std::fs::read_to_string(&path).unwrap();
+    let edited = original.replace("user: u\n", "user: u\n    namespace: elsewhere\n");
+    assert_ne!(original, edited);
+    std::fs::write(&path, edited).unwrap();
+    assert!(check.refusal().await.is_err());
+    std::fs::write(&path, original).unwrap();
+
+    assert!(check.refusal().await.is_err(), "undoing it changes nothing");
+    manager.approve_keep_watching(pending).await;
+    manager.sync_keep_watching();
+    assert!(!manager.keep.consents.contains_key("dev"));
+    assert_eq!(manager.keep_status("dev"), KeepWatching::NeedsConfirming);
+}
+
+// A file that can't be read confirms no change: the launch waits, and the consent stands.
+#[tokio::test]
+async fn an_unreadable_file_refuses_the_launch_and_keeps_consent() {
+    let plugin = FakePlugin::new("exit 1\n");
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, path) = manager_with(&plugin, config.path().to_owned());
+    allow(&mut manager).await;
+    let check = manager.launch_check("dev", Arc::clone(&manager.keep.consents["dev"]));
+
+    let original = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, "not: [valid").unwrap();
+    assert!(check.refusal().await.is_err());
+    std::fs::write(&path, original).unwrap();
+
+    assert!(check.refusal().await.is_ok());
+    manager.sync_keep_watching();
+    assert!(manager.keep.consents.contains_key("dev"));
+}
+
 // No path brings consent back: an entry removed by hand and put back has none.
 #[tokio::test]
 async fn consent_is_not_restored_with_its_entry() {

@@ -12,7 +12,7 @@ use flint_core::keep_watching::{
 };
 use flint_core::telemetry::Availability;
 use flint_core::{Settings, settings};
-use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, WatchStep};
+use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, Verb, WatchStep};
 
 #[allow(dead_code)]
 mod core_support;
@@ -670,12 +670,28 @@ async fn an_approval_works_once() {
 async fn a_refused_offer_gives_nothing_to_approve_once_the_refusal_clears() {
     let f = fixture(TOKEN, Settings::default()).await;
     f.keep().await;
+    let earlier_approval = f.offer().await.unwrap().approve();
     std::fs::write(&f.earlier, "not: [valid").unwrap();
     f.core.handle.reload_kubeconfig().await.unwrap();
     assert!(f.offer().await.is_err());
 
     std::fs::write(&f.earlier, "apiVersion: v1\nkind: Config\n").unwrap();
     f.core.handle.reload_kubeconfig().await.unwrap();
+    let events = f.core.handle.events();
+    f.core
+        .handle
+        .send(Command::ApproveKeepWatching(earlier_approval));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(Event::Error(text)) = events.recv().await
+                && text.contains("turn its background sign-in on again")
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the approval from before the refusal is rejected");
     settle().await;
     let view = f.core.handle.keep_watching().await["b"].clone();
     assert_eq!(view.sign_in, BackgroundSignIn::Off);
@@ -706,6 +722,132 @@ async fn quitting_kills_a_running_plugin_and_starts_nothing() {
     .expect("the plugin should be gone");
     settle().await;
     assert_eq!(run_lines(&f.runs).len(), 1, "nothing started after");
+}
+
+/// Holds the settings file's save lock until dropped, and starts a save that waits for it, so the
+/// manager's queue is stuck behind a contended write.
+async fn stall_the_manager_on_a_save(f: &Fixture) -> std::fs::File {
+    use std::os::fd::AsRawFd as _;
+    let config_dir = f.core.dir.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let lock = std::fs::File::create(config_dir.join("settings.toml.lock")).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let definition = f.core.handle.keep_watching().await["a"].definition;
+    f.core.handle.send(Command::SetKeepWatching {
+        cluster: "a".to_owned(),
+        definition,
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    lock
+}
+
+fn first_pid(runs: &Path) -> i32 {
+    run_lines(runs)[0]
+        .split(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+async fn until_gone(pid: i32, within: Duration) {
+    tokio::time::timeout(within, async {
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the plugin should be gone");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turning_the_sign_in_off_does_not_wait_for_a_settings_save() {
+    let f = fixture("sleep 60\n", Settings::default()).await;
+    f.turn_on().await;
+    f.until_runs(1).await;
+    let pid = first_pid(&f.runs);
+    let _lock = stall_the_manager_on_a_save(&f).await;
+
+    f.core
+        .handle
+        .send(Command::RevokeBackgroundSignIn("b".to_owned()));
+    until_gone(pid, Duration::from_secs(1)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopping_the_watch_does_not_wait_for_a_settings_save() {
+    let f = fixture("sleep 60\n", Settings::default()).await;
+    f.turn_on().await;
+    f.until_runs(1).await;
+    let pid = first_pid(&f.runs);
+    let _lock = stall_the_manager_on_a_save(&f).await;
+
+    f.core.handle.send(Command::SetKeepWatching {
+        cluster: "b".to_owned(),
+        definition: None,
+    });
+    until_gone(pid, Duration::from_secs(1)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quitting_does_not_wait_for_a_settings_save() {
+    let f = fixture("sleep 60\n", Settings::default()).await;
+    f.turn_on().await;
+    f.until_runs(1).await;
+    let pid = first_pid(&f.runs);
+    let _lock = stall_the_manager_on_a_save(&f).await;
+
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        f.core.handle.stop_keep_watching(),
+    )
+    .await
+    .expect("the wait is bounded with the manager busy");
+    until_gone(pid, Duration::from_secs(1)).await;
+}
+
+/// How many times the plugin has run, once that has stopped changing.
+async fn runs_once_settled(f: &Fixture) -> usize {
+    let mut runs = run_lines(&f.runs).len();
+    loop {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let now = run_lines(&f.runs).len();
+        if now == runs {
+            return runs;
+        }
+        runs = now;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lasting_503s_after_the_version_check_stop_the_plugin() {
+    let f = fixture(EXPIRED, Settings::default()).await;
+    f.b.inject(Fault::status(503).verb(Verb::List).verb(Verb::Watch));
+    f.turn_on().await;
+    f.until_status(KeepWatching::SignInNeeded).await;
+    let runs = runs_once_settled(&f).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(run_lines(&f.runs).len(), runs, "no further launches");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lasting_503s_on_an_established_feed_stop_the_plugin() {
+    let f = fixture(EXPIRED, Settings::default()).await;
+    f.turn_on().await;
+    f.until_feed().await;
+    f.b.wait_for_watches(&Gvr::core("pods"), 1, WAIT)
+        .await
+        .unwrap();
+    f.b.inject(Fault::status(503));
+    f.b.send_watch(&Gvr::core("pods"), WatchStep::End);
+    f.until_status(KeepWatching::SignInNeeded).await;
+    let runs = runs_once_settled(&f).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(run_lines(&f.runs).len(), runs, "no further launches");
+    assert!(f.core.handle.telemetry("b").is_some(), "last values stay");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -10,6 +10,8 @@
 //! the core makes for the definition the toggle showed. Approving it gives a [`PluginApproval`]
 //! the core accepts once.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use kube::config::{AuthInfo, Kubeconfig};
 use ring::hmac;
 use ring::rand::{SecureRandom as _, SystemRandom};
@@ -58,6 +60,8 @@ pub(crate) fn watched_entries(value: toml::Value) -> Vec<WatchedCluster> {
 pub(crate) struct PluginConsent {
     salt: [u8; SALT_BYTES],
     seal: Vec<u8>,
+    /// Ended for good, by a confirmed change or by the person, whatever the files say later.
+    void: AtomicBool,
 }
 
 impl std::fmt::Debug for PluginConsent {
@@ -73,13 +77,29 @@ impl PluginConsent {
         SystemRandom::new().fill(&mut salt).ok()?;
         let key = hmac::Key::new(hmac::HMAC_SHA256, &salt);
         let seal = hmac::sign(&key, &definition.canonical).as_ref().to_vec();
-        Some(PluginConsent { salt, seal })
+        Some(PluginConsent {
+            salt,
+            seal,
+            void: AtomicBool::new(false),
+        })
     }
 
-    /// Whether this seal was made over exactly `definition`.
+    /// Whether this is still in force and was sealed over exactly `definition`.
     pub(crate) fn holds(&self, definition: &PluginDefinition) -> bool {
+        if self.is_void() {
+            return false;
+        }
         let key = hmac::Key::new(hmac::HMAC_SHA256, &self.salt);
         hmac::verify(&key, &definition.canonical, &self.seal).is_ok()
+    }
+
+    /// Ends this for good. Takes effect at once, from any thread.
+    pub(crate) fn void(&self) {
+        self.void.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_void(&self) -> bool {
+        self.void.load(Ordering::SeqCst)
     }
 }
 
@@ -372,6 +392,7 @@ mod tests {
         let broken = PluginConsent {
             salt: consent.salt,
             seal: vec![0; consent.seal.len()],
+            void: AtomicBool::new(false),
         };
         assert!(!broken.holds(&found));
     }

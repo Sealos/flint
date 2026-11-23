@@ -8,6 +8,7 @@
 //! message of the manager's loop, so no path that changes a definition has to remember it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -34,7 +35,7 @@ const RETRY_AFTER: Duration = Duration::from_secs(60);
 /// How many background connections are made at once, so a launch starts no burst of plugins.
 const CONCURRENT_CONNECTS: usize = 4;
 /// How long a quit waits for plugins to be killed: inside GPUI's 200 ms for quit hooks.
-const QUIT_WAIT: Duration = Duration::from_millis(100);
+pub(crate) const QUIT_WAIT: Duration = Duration::from_millis(100);
 
 /// An offer a confirmation is showing, until it is approved or replaced.
 struct PendingOffer {
@@ -44,8 +45,146 @@ struct PendingOffer {
     server: String,
 }
 
+/// The grants in force, shared with [`crate::CoreHandle`] so that ending one never waits for the
+/// manager's queue, which a contended settings save can hold up.
+#[derive(Clone, Default)]
+pub(crate) struct KeptGrants(Arc<GrantsShared>);
+
+#[derive(Default)]
+struct GrantsShared {
+    runs: PluginRuns,
+    live: Mutex<LiveGrants>,
+}
+
+#[derive(Default)]
+struct LiveGrants {
+    quitting: bool,
+    consents: HashMap<ClusterId, Arc<PluginConsent>>,
+    /// Each running feed's access, by the attempt that made it.
+    feeds: HashMap<ClusterId, (u64, CredentialAccess)>,
+    /// How many times each cluster's grant was ended, so a save under way can't bring it back.
+    revocations: HashMap<ClusterId, u64>,
+}
+
+impl KeptGrants {
+    fn live(&self) -> std::sync::MutexGuard<'_, LiveGrants> {
+        self.0.live.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Ends `id`'s consent and kills its plugin, now.
+    pub(crate) fn revoke(&self, id: &str) {
+        let mut live = self.live();
+        *live.revocations.entry(id.to_owned()).or_default() += 1;
+        if let Some(consent) = live.consents.get(id) {
+            consent.void();
+        }
+        if let Some((_, access)) = live.feeds.get(id) {
+            access.revoke();
+        }
+    }
+
+    /// Ends every grant now. The future resolves once their plugins are gone, or after
+    /// [`QUIT_WAIT`], and needs a tokio runtime.
+    pub(crate) fn quit(&self) -> impl Future<Output = ()> + Send + 'static {
+        {
+            let mut live = self.live();
+            live.quitting = true;
+            live.consents.values().for_each(|consent| consent.void());
+            live.feeds.values().for_each(|(_, access)| access.revoke());
+        }
+        let runs = self.0.runs.clone();
+        async move {
+            let _ = tokio::time::timeout(QUIT_WAIT, runs.ended()).await;
+        }
+    }
+
+    fn quitting(&self) -> bool {
+        self.live().quitting
+    }
+
+    fn revocations(&self, id: &str) -> u64 {
+        self.live().revocations.get(id).copied().unwrap_or_default()
+    }
+
+    fn hold(&self, id: &str, consent: &Arc<PluginConsent>) {
+        let mut live = self.live();
+        if live.quitting {
+            consent.void();
+        }
+        live.consents.insert(id.to_owned(), Arc::clone(consent));
+    }
+
+    /// Forgets every consent but those the manager still has.
+    fn keep_only(&self, held: &HashMap<ClusterId, Arc<PluginConsent>>) {
+        self.live()
+            .consents
+            .retain(|id, consent| held.get(id).is_some_and(|kept| Arc::ptr_eq(kept, consent)));
+    }
+
+    fn admit(&self, id: &str, attempt: u64, access: &CredentialAccess) {
+        let mut live = self.live();
+        if live.quitting {
+            access.revoke();
+        }
+        live.feeds.insert(id.to_owned(), (attempt, access.clone()));
+    }
+
+    fn release(&self, id: &str, attempt: u64) {
+        let mut live = self.live();
+        if live.feeds.get(id).is_some_and(|(at, _)| *at == attempt) {
+            live.feeds.remove(id);
+        }
+    }
+
+    /// One more plugin running, until the result is dropped.
+    #[cfg(test)]
+    pub(crate) fn track_for_tests(&self) -> crate::connection::policy::PluginRun {
+        self.0.runs.track()
+    }
+}
+
+/// What a launch found in the files as they are now.
+enum LaunchVerdict {
+    Same,
+    /// The files were read, and do not define what was agreed to.
+    Changed,
+    /// Something could not be read, which confirms nothing.
+    Unconfirmed,
+}
+
+/// Compares the file list the saved settings name, then the definition those files give.
+fn launch_verdict(config: &LaunchFiles, context: &str, consent: &PluginConsent) -> LaunchVerdict {
+    let Ok(settings) = crate::settings::load_settings(&config.settings_dir) else {
+        return LaunchVerdict::Unconfirmed;
+    };
+    let listed =
+        crate::kubeconfig::paths_for_settings(&config.base, &settings, config.home.as_deref());
+    if listed != config.paths {
+        return LaunchVerdict::Changed;
+    }
+    let loaded = crate::kubeconfig::load(&config.paths);
+    if !loaded.errors.is_empty() {
+        return LaunchVerdict::Unconfirmed;
+    }
+    match &sign_in_of(&loaded.merged, context) {
+        SignIn::Plugin(definition) if consent.holds(definition) => LaunchVerdict::Same,
+        _ => LaunchVerdict::Changed,
+    }
+}
+
+/// Where a launch check reads the current definition from.
+#[derive(Clone)]
+struct LaunchFiles {
+    paths: Vec<PathBuf>,
+    base: Vec<PathBuf>,
+    home: Option<PathBuf>,
+    settings_dir: PathBuf,
+}
+
 /// One watched cluster's connection and feed. Dropping it ends both, and kills its plugin.
 struct KeptFeed {
+    id: ClusterId,
+    grants: KeptGrants,
     attempt: u64,
     fingerprint: Option<u64>,
     runs_plugin: bool,
@@ -59,6 +198,7 @@ struct KeptFeed {
 impl Drop for KeptFeed {
     fn drop(&mut self) {
         self.access.revoke();
+        self.grants.release(&self.id, self.attempt);
         if let Some(task) = self.connecting.take() {
             task.abort();
         }
@@ -81,9 +221,7 @@ pub(super) struct KeepWatch {
     voided: HashSet<ClusterId>,
     /// Stopped by the person while the settings still list them, because the write failed.
     turned_off: HashSet<ClusterId>,
-    /// The app is quitting: nothing starts any more.
-    quitting: bool,
-    plugin_runs: PluginRuns,
+    grants: KeptGrants,
     retry_at: HashMap<ClusterId, Instant>,
     next_attempt: u64,
     connects: Arc<Semaphore>,
@@ -106,8 +244,7 @@ impl Default for KeepWatch {
             view_key: ViewKey::new(),
             voided: HashSet::new(),
             turned_off: HashSet::new(),
-            quitting: false,
-            plugin_runs: PluginRuns::default(),
+            grants: KeptGrants::default(),
             retry_at: HashMap::new(),
             next_attempt: 1,
             connects: Arc::new(Semaphore::new(CONCURRENT_CONNECTS)),
@@ -125,6 +262,22 @@ impl KeepWatch {
 }
 
 impl ClusterManager {
+    /// The grants, for [`crate::CoreHandle`] to end without going through the queue.
+    pub(crate) fn kept_grants(&self) -> KeptGrants {
+        self.keep.grants.clone()
+    }
+
+    /// The kubeconfig file list changed: what was agreed to was read from the old one. Ends every
+    /// plugin grant and open approval before the new files are read.
+    pub(super) fn retire_plugin_grants(&mut self) {
+        for consent in self.keep.consents.values() {
+            consent.void();
+        }
+        self.keep.offers.clear();
+        self.keep.feeds.retain(|_, kept| !kept.runs_plugin);
+        self.void_broken_consents();
+    }
+
     /// How `id` signs in on the current load. An answer read from an older load is never used.
     fn sign_in(&self, id: &str) -> Arc<SignIn> {
         self.keep
@@ -205,7 +358,7 @@ impl ClusterManager {
 
     /// Whether `id` needs a feed of its own: its slot has none and can't have one.
     fn wants_kept_feed(&self, id: &str) -> bool {
-        !self.keep.quitting
+        !self.keep.grants.quitting()
             && self.active.as_deref() != Some(id)
             && self.keep_watching(id)
             && !self.wants_telemetry(id)
@@ -288,40 +441,50 @@ impl ClusterManager {
         let broken: Vec<ClusterId> = self
             .keep
             .consents
-            .keys()
-            .filter(|id| self.keep_status(id) == KeepWatching::NeedsConfirming)
-            .cloned()
+            .iter()
+            .filter(|(id, consent)| {
+                consent.is_void() || self.keep_status(id) == KeepWatching::NeedsConfirming
+            })
+            .map(|(id, _)| id.clone())
             .collect();
         for id in broken {
             self.keep.consents.remove(&id);
             self.keep.offers.remove(&id);
             self.keep.voided.insert(id);
         }
+        self.keep.grants.keep_only(&self.keep.consents);
     }
 
-    /// Asked right before each start of `id`'s plugin: the files as they are now must still
-    /// define what was agreed to, whether or not a change has been noticed yet.
+    /// Asked right before each start of `id`'s plugin: the saved file list and the files as they
+    /// are now must still define what was agreed to, whether or not a change has been noticed.
+    /// A confirmed difference ends the consent at once, so undoing it later brings nothing back.
     fn launch_check(&self, id: &str, consent: Arc<PluginConsent>) -> cluster::SendCheck {
-        let paths = self.kubeconfig_paths.clone();
+        let files = LaunchFiles {
+            paths: self.kubeconfig_paths.clone(),
+            base: self.config.kubeconfig_base.clone(),
+            home: self.config.home.clone(),
+            settings_dir: self.config.config_dir.clone(),
+        };
         let context = id.to_owned();
+        let wake = self.internal_tx.clone();
         cluster::SendCheck::new(move || {
-            let (paths, context, consent) = (paths.clone(), context.clone(), consent.clone());
+            let (files, context, consent) = (files.clone(), context.clone(), consent.clone());
+            let wake = wake.clone();
             Box::pin(async move {
-                let same = tokio::task::spawn_blocking(move || {
-                    let loaded = crate::kubeconfig::load(&paths);
-                    loaded.errors.is_empty()
-                        && matches!(
-                            &sign_in_of(&loaded.merged, &context),
-                            SignIn::Plugin(definition) if consent.holds(definition)
-                        )
-                })
-                .await
-                .unwrap_or(false);
-                if same {
-                    Ok(())
-                } else {
-                    Err("its definition is no longer the one confirmed".to_owned())
+                let judged = Arc::clone(&consent);
+                let verdict =
+                    tokio::task::spawn_blocking(move || launch_verdict(&files, &context, &judged))
+                        .await
+                        .unwrap_or(LaunchVerdict::Unconfirmed);
+                match verdict {
+                    LaunchVerdict::Same => return Ok(()),
+                    LaunchVerdict::Changed => {
+                        consent.void();
+                        let _ = wake.send(Internal::KeepWatchRetry);
+                    }
+                    LaunchVerdict::Unconfirmed => {}
                 }
+                Err("its definition is no longer the one confirmed".to_owned())
             })
         })
     }
@@ -346,8 +509,9 @@ impl ClusterManager {
                 });
             }),
             check,
-            self.keep.plugin_runs.clone(),
+            self.keep.grants.0.runs.clone(),
         );
+        self.keep.grants.admit(id, attempt, &access);
         let mut kubeconfig = self.kubeconfig.merged.clone();
         cluster::disable_interactive_exec(&mut kubeconfig);
         let (name, task_access) = (id.to_owned(), access.clone());
@@ -375,6 +539,8 @@ impl ClusterManager {
         self.keep.feeds.insert(
             id.to_owned(),
             KeptFeed {
+                id: id.to_owned(),
+                grants: self.keep.grants.clone(),
                 attempt,
                 fingerprint,
                 runs_plugin,
@@ -503,6 +669,7 @@ impl ClusterManager {
         self.keep.turned_off.remove(&id);
         let server = entry.server.clone();
         let name = id.clone();
+        let revocations = self.keep.grants.revocations(&id);
         self.write_settings("keep watching", move |dir| {
             crate::settings::set_watched_cluster(dir, &name, Some(entry))
         })
@@ -511,8 +678,12 @@ impl ClusterManager {
             .settings
             .watched_cluster(&id)
             .is_some_and(|entry| entry.server == server);
-        if let (true, Some(consent)) = (saved, consent) {
-            self.keep.consents.insert(id, Arc::new(consent));
+        // Turned off while this was being saved: the later choice wins.
+        let current = self.keep.grants.revocations(&id) == revocations;
+        if let (true, true, Some(consent)) = (saved, current, consent) {
+            let consent = Arc::new(consent);
+            self.keep.grants.hold(&id, &consent);
+            self.keep.consents.insert(id, consent);
         }
     }
 
@@ -537,6 +708,7 @@ impl ClusterManager {
         id: &str,
         shown: u64,
     ) -> Result<PluginOffer, String> {
+        self.void_broken_consents();
         self.keep.offers.remove(id);
         let Some(slot) = self.cluster(id) else {
             return Err(format!("cluster \"{id}\" no longer exists"));
@@ -581,6 +753,7 @@ impl ClusterManager {
 
     /// The person turned the toggle on. The offer is used up here, whether or not it still holds.
     pub(super) async fn approve_keep_watching(&mut self, approval: PluginApproval) {
+        self.void_broken_consents();
         let PluginApproval { context, ticket } = approval;
         if self
             .keep
@@ -628,20 +801,6 @@ impl ClusterManager {
             }),
             _ => Err(changed()),
         }
-    }
-
-    /// The app is quitting: ends every grant, and answers once their plugins are gone, or after
-    /// [`QUIT_WAIT`]. The wait runs apart from the manager's loop.
-    pub(super) fn stop_keep_watching(&mut self, reply: tokio::sync::oneshot::Sender<()>) {
-        self.keep.quitting = true;
-        self.keep.consents.clear();
-        self.keep.offers.clear();
-        self.keep.feeds.clear();
-        let runs = self.keep.plugin_runs.clone();
-        tokio::spawn(async move {
-            let _ = tokio::time::timeout(QUIT_WAIT, runs.ended()).await;
-            let _ = reply.send(());
-        });
     }
 
     /// The entry for watching `id`, if the definition is still the one the request was made on.

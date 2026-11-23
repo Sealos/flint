@@ -287,6 +287,11 @@ impl ClustersModel {
             self.send(Command::RevokeBackgroundSignIn(cluster));
             return;
         };
+        if let Some(why) = super::keep_watching::SIGN_IN_BLOCKED {
+            self.last_error = Some(why.to_owned());
+            cx.notify();
+            return;
+        }
         let offer = self.core.offer_keep_watching(&cluster, shown);
         cx.spawn(async move |this, cx| {
             let offer = offer.await;

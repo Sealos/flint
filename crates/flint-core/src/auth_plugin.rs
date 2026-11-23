@@ -631,17 +631,20 @@ struct ExecCredentialStatus {
     client_key_data: Option<String>,
 }
 
+/// The whole error for output that is no credential. A parser's own error quotes its input.
+pub(crate) const UNREADABLE_OUTPUT: &str = "the exec auth plugin's output could not be parsed";
+
 /// Reads a plugin's output. client-go decodes it with a YAML-tolerant codec, so some plugins
 /// print YAML; YAML 1.2 includes JSON.
 fn parse(stdout: &[u8]) -> Result<Credential, AuthError> {
-    let creds: ExecCredential =
-        serde_saphyr::from_slice(stdout).map_err(|e| AuthError::AuthExecParse(Box::new(e)))?;
+    let unreadable = || AuthError::AuthExec(UNREADABLE_OUTPUT.to_owned());
+    let creds: ExecCredential = serde_saphyr::from_slice(stdout).map_err(|_| unreadable())?;
     let status = creds.status.ok_or(AuthError::ExecPluginFailed)?;
     let expires = status
         .expiration_timestamp
         .map(|t| t.parse::<Timestamp>())
         .transpose()
-        .map_err(AuthError::MalformedTokenExpirationDate)?;
+        .map_err(|_| unreadable())?;
     Ok(
         match (
             status.client_certificate_data,
@@ -820,6 +823,12 @@ impl RefreshingToken {
                 match &state.refreshing {
                     Some(refresh) => refresh.clone(),
                     None => {
+                        // A new token would meet the same answer, so the plugin is not run for it.
+                        if self.0.grant.server_down() {
+                            self.0.grant.note_failed();
+                            return Err(not_allowed().into());
+                        }
+                        self.0.grant.refresh_starting();
                         let terminal = Terminal::acquire(
                             state.exec.interactive_mode == Some(ExecInteractiveMode::Always),
                         );

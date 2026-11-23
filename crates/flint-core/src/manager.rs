@@ -41,6 +41,10 @@ mod keep_watching;
 mod running_set;
 mod telemetry;
 
+pub(crate) use keep_watching::KeptGrants;
+#[cfg(test)]
+pub(crate) use keep_watching::QUIT_WAIT;
+
 use crate::connection::member::{AttemptOutcome, MemberEvent};
 use crate::connection::policy::{CredentialAccess, CredentialLease, ForegroundOnly, Role};
 use crate::connection::schedule::{AttemptId, Schedule};
@@ -763,7 +767,6 @@ impl ClusterManager {
             } => {
                 let _ = reply.send(self.offer_keep_watching(&cluster, shown));
             }
-            Request::StopKeepWatching { reply } => self.stop_keep_watching(reply),
             // Requests are handled without waiting: the reload runs as an internal message.
             Request::ReloadKubeconfig { reply } => {
                 let _ = self.internal_tx.send(Internal::ReloadKubeconfig { reply });
@@ -1372,6 +1375,7 @@ impl ClusterManager {
             self.config.home.as_deref(),
         );
         if paths != self.kubeconfig_paths {
+            self.retire_plugin_grants();
             self.kubeconfig_paths = paths;
             self.arm_watcher();
             self.reload_kubeconfig().await;

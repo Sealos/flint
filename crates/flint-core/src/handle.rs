@@ -271,10 +271,6 @@ pub(crate) enum Request {
         shown: u64,
         reply: oneshot::Sender<Result<crate::keep_watching::PluginOffer, String>>,
     },
-    /// The app is quitting: ends every grant, answering once their plugins are gone.
-    StopKeepWatching {
-        reply: oneshot::Sender<()>,
-    },
     /// Each member of the running set and its state.
     RunningSet {
         reply: oneshot::Sender<Vec<MemberReport>>,
@@ -615,6 +611,7 @@ pub struct CoreHandle {
     holds: crate::recheck::DefinitionHolds,
     log_budget: Arc<crate::logs::LogBudget>,
     telemetry: crate::telemetry::TelemetryBoard,
+    kept: crate::manager::KeptGrants,
     access: Arc<crate::access::AccessCache>,
     /// Set by [`Self::bound_to`]: one-off reads go only to this member.
     bound: Option<Arc<AdmittedMember>>,
@@ -644,6 +641,7 @@ impl CoreHandle {
         let log_budget = manager.log_budget();
         let telemetry = manager.telemetry_board();
         let holds = manager.definition_holds();
+        let kept = manager.kept_grants();
         runtime.spawn(manager.run(cmd_rx, req_rx));
         Ok(Self {
             commands: cmd_tx,
@@ -655,6 +653,7 @@ impl CoreHandle {
             holds,
             log_budget,
             telemetry,
+            kept,
             access: Arc::default(),
             bound: None,
             runtime: runtime.handle().clone(),
@@ -703,13 +702,13 @@ impl CoreHandle {
         }
     }
 
-    /// Ends every keep-watching grant for the quit under way. Resolves once their plugins are
-    /// killed, after a short bounded wait at most, or at once if the core stopped.
+    /// Ends every keep-watching grant for the quit under way, before this returns and without
+    /// the manager's queue. Resolves once their plugins are killed, after a short bounded wait
+    /// at most, or at once if the core stopped.
     pub fn stop_keep_watching(&self) -> impl Future<Output = ()> + Send + use<> {
-        let (reply, rx) = oneshot::channel();
-        let _ = self.requests.try_send(Request::StopKeepWatching { reply });
+        let wait = self.runtime.spawn(self.kept.quit());
         async move {
-            let _ = rx.await;
+            let _ = wait.await;
         }
     }
 
@@ -1405,6 +1404,15 @@ impl CoreHandle {
 
     /// Sends a command. Never blocks. Commands sent after the core stopped are dropped.
     pub fn send(&self, command: Command) {
+        // Ending a grant does not wait its turn behind a save the queue may be stuck on.
+        if let Command::RevokeBackgroundSignIn(cluster)
+        | Command::SetKeepWatching {
+            cluster,
+            definition: None,
+        } = &command
+        {
+            self.kept.revoke(cluster);
+        }
         if self.commands.try_send(command).is_err() {
             tracing::warn!("core is not running; command dropped");
         }
@@ -1751,6 +1759,19 @@ mod tests {
             watch_timing: Default::default(),
         })
         .unwrap()
+    }
+
+    // Quit returns only after waiting for a plugin still running, and no longer than its bound.
+    #[tokio::test]
+    async fn quitting_waits_for_a_running_plugin_within_its_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = start(dir.path());
+        let _running = core.kept.track_for_tests();
+        let began = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(2), core.stop_keep_watching())
+            .await
+            .expect("the wait is bounded");
+        assert!(began.elapsed() >= crate::manager::QUIT_WAIT);
     }
 
     #[tokio::test]
