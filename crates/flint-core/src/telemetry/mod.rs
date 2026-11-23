@@ -33,6 +33,7 @@ mod board;
 mod capacity;
 mod checked;
 mod feed;
+mod kept_discovery;
 mod metrics;
 mod objects;
 mod problems;
@@ -60,9 +61,11 @@ use crate::metrics_trend::TrendStore;
 use crate::problems::{Problem, ProblemId, ProblemKind};
 
 pub(crate) use board::TelemetryBoard;
-pub use board::{ClusterTelemetry, TelemetryUpdates};
+pub use board::{ClusterTelemetry, FeedDiscovery, TelemetryUpdates};
 pub use capacity::{Allocatable, ClusterCapacity, Inventory, NodeCapacity, Reserved};
 use feed::KindFeed;
+pub use kept_discovery::KeptCoverage;
+pub(crate) use kept_discovery::{DiscoveryPace, KeptDiscovery};
 pub use objects::MAX_OBJECTS_PER_KIND;
 use objects::Stores;
 use side::SideFeed;
@@ -90,7 +93,7 @@ impl RequestGate {
     }
 
     /// Runs `request` once there is room. Time spent waiting counts against a caller's timeout.
-    async fn run<F: Future>(&self, request: F) -> F::Output {
+    pub(crate) async fn run<F: Future>(&self, request: F) -> F::Output {
         let _permit = match &self.0 {
             Some(limit) => limit.acquire().await.ok(),
             None => None,
@@ -459,6 +462,16 @@ impl Telemetry {
     /// Warning events, claims and usage as last read.
     pub fn side_reads(&self) -> SideReads {
         self.side.borrow().clone()
+    }
+
+    /// Runs `discovery` for as long as this feed runs.
+    fn follow_discovery(
+        &mut self,
+        discovery: KeptDiscovery,
+        found: watch::Sender<KeptCoverage>,
+        version: watch::Sender<u64>,
+    ) {
+        self.tasks.spawn(discovery.follow(found, version));
     }
 
     /// Counts each change of this feed on `version`, for as long as the feed runs.

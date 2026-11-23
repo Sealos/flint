@@ -123,6 +123,27 @@ pub enum ProblemKind {
 }
 
 impl ProblemKind {
+    /// Every kind of problem.
+    pub const ALL: [Self; 7] = [
+        Self::CrashLoop,
+        Self::OomKilled,
+        Self::ImagePull,
+        Self::PodPending,
+        Self::NodeNotReady,
+        Self::JobFailed,
+        Self::WorkloadShort,
+    ];
+
+    /// The API groups this kind is read from. A pod's owner is read through its ReplicaSet.
+    pub const fn api_groups(self) -> &'static [&'static str] {
+        match self {
+            Self::CrashLoop | Self::OomKilled | Self::ImagePull | Self::PodPending => &["", "apps"],
+            Self::NodeNotReady => &[""],
+            Self::JobFailed => &["batch"],
+            Self::WorkloadShort => &["apps"],
+        }
+    }
+
     /// How urgent this kind of problem is.
     pub const fn severity(self) -> ProblemSeverity {
         match self {

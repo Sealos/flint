@@ -208,6 +208,7 @@ impl ClusterManager {
             .telemetry
             .request_gate(reads_token_file(&self.kubeconfig.merged, id));
         let slot: &mut Cluster = &mut self.clusters[index];
+        let generation = slot.generation;
         let Some(client) = slot.client.as_ref().map(|clients| clients.read.clone()) else {
             return;
         };
@@ -223,7 +224,7 @@ impl ClusterManager {
             requests,
             pending_after,
         );
-        self.telemetry.publish(id, &mut feed, trends);
+        self.telemetry.publish(id, generation, &mut feed, trends);
         slot.telemetry = Some(SlotFeed {
             attempt: slot.attempt,
             feed,
