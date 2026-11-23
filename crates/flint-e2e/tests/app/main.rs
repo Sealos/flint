@@ -13,6 +13,7 @@
 
 mod access;
 mod activity;
+mod cluster_sets;
 mod compare;
 mod exec_plugins;
 mod harness;
