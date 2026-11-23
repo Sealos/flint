@@ -1,4 +1,5 @@
-//! A cluster's problems and node metrics, kept current with no view open (#448, #20).
+//! A cluster's problems and node metrics, kept current with no view open (#448, #20). Only in
+//! watch mode All: On view promises no watch of a kind without an open view.
 //!
 //! [`Telemetry`] runs typed watches of the seven kinds in [`WatchedKind`], classifies them with
 //! [`Classifier`](crate::problems::Classifier), counts them with
@@ -17,7 +18,8 @@
 //! A kind is usable only once its list has loaded and its watch has opened. Until then, and
 //! after a failure, its categories are unknown in [`TelemetrySnapshot::counts`] and its problem
 //! kinds are in [`TelemetrySnapshot::unchecked`]. Warning events and pending claims are not
-//! watched here, so those two categories are always unknown.
+//! watched: they are polled into [`SideReads`], each with its own state, and those two categories
+//! of the snapshot stay unknown.
 //!
 //! # Bounds
 //!
@@ -25,11 +27,15 @@
 //! A kind over that limit is reported as [`KindCheck::TooLarge`] rather than counted in part.
 //! Retries back off up to [`TelemetryTiming::backoff_max`], and lists run a few at a time.
 
+mod board;
 mod feed;
 mod metrics;
 mod objects;
 mod problems;
+mod side;
+mod usage;
 
+use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -37,22 +43,55 @@ use jiff::Timestamp;
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{Node, Pod};
-use tokio::sync::{Notify, Semaphore, mpsc, watch};
+use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinSet;
 
 use crate::alerts::ClusterSnapshot;
-use crate::cluster::{GatedConnection, SafeErrorText, Target};
+use crate::cluster::{SafeErrorText, Target};
 use crate::dashboard::{ProblemCounts, ProblemSnapshot, ProblemSummariser};
 use crate::metrics::MetricsError;
 use crate::metrics_trend::TrendStore;
 use crate::problems::{Problem, ProblemKind};
+use crate::protection::ClusterClients;
 
+pub(crate) use board::TelemetryBoard;
+pub use board::{ClusterTelemetry, TelemetryUpdates};
 use feed::KindFeed;
 pub use objects::MAX_OBJECTS_PER_KIND;
 use objects::Stores;
+use side::SideFeed;
+pub use side::{PodKey, SideRead, SideReads, UsageRead};
 
 /// Lists running at once per cluster, so that starting stays polite to the API server.
 const CONCURRENT_LISTS: usize = 3;
+
+/// Telemetry requests running at once across clusters whose credential is a token file. The
+/// client rereads that file synchronously, so a stalled mount blocks the worker running the
+/// request, and this leaves the core's other workers free.
+const CONCURRENT_TOKEN_FILE_REQUESTS: usize = 2;
+
+/// Limits the requests of feeds whose client can block a worker. Open for any other feed, so that
+/// a slow cluster does not hold up the rest.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RequestGate(Option<Arc<Semaphore>>);
+
+impl RequestGate {
+    /// The limit that the token-file feeds of one runtime share.
+    pub(crate) fn token_file_limit() -> Self {
+        Self(Some(Arc::new(Semaphore::new(
+            CONCURRENT_TOKEN_FILE_REQUESTS,
+        ))))
+    }
+
+    /// Runs `request` once there is room. Time spent waiting counts against a caller's timeout.
+    async fn run<F: Future>(&self, request: F) -> F::Output {
+        let _permit = match &self.0 {
+            Some(limit) => limit.acquire().await.ok(),
+            None => None,
+        };
+        request.await
+    }
+}
 
 /// A kind of object the feed watches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -206,8 +245,10 @@ pub struct TelemetryTiming {
     pub evaluate_every: Duration,
     /// The shortest time between two passes, so a burst of events is one pass.
     pub evaluate_gap: Duration,
-    /// How often node metrics are read.
+    /// How often node and pod metrics are read.
     pub metrics_every: Duration,
+    /// How often Warning events and claims are listed.
+    pub lists_every: Duration,
     /// The first delay after a failure.
     pub backoff_min: Duration,
     /// The longest delay after a failure.
@@ -226,6 +267,7 @@ impl Default for TelemetryTiming {
             evaluate_every: Duration::from_secs(15),
             evaluate_gap: Duration::from_secs(1),
             metrics_every: crate::metrics::POLL_INTERVAL,
+            lists_every: Duration::from_secs(30),
             backoff_min: Duration::from_secs(1),
             backoff_max: Duration::from_secs(60),
             list_timeout: Duration::from_secs(30),
@@ -266,30 +308,24 @@ impl Shared {
 #[derive(Debug)]
 pub struct Telemetry {
     latest: watch::Receiver<Arc<TelemetrySnapshot>>,
+    side: watch::Receiver<SideReads>,
     tasks: JoinSet<()>,
-    /// Closes once the metrics poll, which runs in a task of its own, has ended.
-    poll_ended: mpsc::Receiver<()>,
 }
 
 impl Telemetry {
-    /// Starts the feed of `cluster` on `connection`'s read client. Must run inside a tokio
-    /// runtime. `trends` may be shared between clusters; this cluster's series are removed when
-    /// the feed stops.
-    #[cfg_attr(
-        not(any(test, feature = "test-support")),
-        expect(
-            dead_code,
-            reason = "the cluster manager starts this in a later change"
-        )
-    )]
+    /// Starts the feed of `cluster` on the read client of a gated connection's `clients`. Must
+    /// run inside a tokio runtime. This cluster's series are removed from `trends` when the feed
+    /// stops, so a feed that replaces this one needs a store of its own. Every request goes
+    /// through `requests`.
     pub(crate) fn start(
         cluster: Arc<str>,
-        connection: &GatedConnection,
+        clients: &ClusterClients,
         target: Target,
         trends: Arc<Mutex<TrendStore>>,
         timing: TelemetryTiming,
+        requests: RequestGate,
     ) -> Self {
-        let client = connection.clients.read.clone();
+        let client = clients.read.clone();
         let shared = Arc::new(Shared {
             stores: Mutex::default(),
             metrics: Mutex::default(),
@@ -300,13 +336,26 @@ impl Telemetry {
             Timestamp::now(),
         ));
         let (sender, latest) = watch::channel(first);
-        let (poll_running, poll_ended) = mpsc::channel(1);
+        let (reads, side) = watch::channel(SideReads::default());
+        let limiter = Arc::new(Semaphore::new(CONCURRENT_LISTS));
 
         let mut tasks = JoinSet::new();
+        let polls = SideFeed {
+            client: client.clone(),
+            limiter: Arc::clone(&limiter),
+            requests: requests.clone(),
+            target: target.clone(),
+            timing,
+            reads: reads.clone(),
+        };
+        tasks.spawn(polls.clone().run_warning_events());
+        tasks.spawn(polls.clone().run_pending_claims());
+        tasks.spawn(polls.run_pod_usage());
         let kind = KindFeed {
             client: client.clone(),
             shared: Arc::clone(&shared),
-            limiter: Arc::new(Semaphore::new(CONCURRENT_LISTS)),
+            limiter,
+            requests: requests.clone(),
             target,
             timing,
         };
@@ -320,22 +369,45 @@ impl Telemetry {
         tasks.spawn(metrics::run(
             Arc::clone(&cluster),
             client,
+            requests,
             trends,
             Arc::clone(&shared),
             timing.metrics_every,
-            poll_running,
+            reads,
         ));
         tasks.spawn(problems::run(cluster, shared, sender, timing));
         Self {
             latest,
+            side,
             tasks,
-            poll_ended,
         }
     }
 
     /// The most recent snapshot.
     pub fn latest(&self) -> Arc<TelemetrySnapshot> {
         self.latest.borrow().clone()
+    }
+
+    /// Warning events, claims and usage as last read.
+    pub fn side_reads(&self) -> SideReads {
+        self.side.borrow().clone()
+    }
+
+    /// Counts each change of this feed on `version`, for as long as the feed runs.
+    fn notify_changes(&mut self, version: watch::Sender<u64>) {
+        let (mut latest, mut side) = (self.latest.clone(), self.side.clone());
+        self.tasks.spawn(async move {
+            loop {
+                let changed = tokio::select! {
+                    changed = latest.changed() => changed,
+                    changed = side.changed() => changed,
+                };
+                if changed.is_err() {
+                    return;
+                }
+                version.send_modify(|count| *count += 1);
+            }
+        });
     }
 
     /// Waits for a snapshot that differs from the last one seen. `false` if the feed has ended.
@@ -346,8 +418,6 @@ impl Telemetry {
     /// Stops every task and waits until they have ended.
     pub async fn stop(mut self) {
         self.tasks.shutdown().await;
-        // Nothing is ever sent: this returns when the last holder has gone.
-        let _ = self.poll_ended.recv().await;
     }
 }
 
@@ -365,9 +435,10 @@ pub async fn start_for_tests(
     let target = Target::of(kubeconfig, context);
     Ok(Telemetry::start(
         context.into(),
-        &connection,
+        &connection.clients,
         target,
         trends,
         timing,
+        RequestGate::default(),
     ))
 }

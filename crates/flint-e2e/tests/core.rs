@@ -1987,11 +1987,13 @@ async fn the_app_reads_logs_and_events_as_written() {
     );
 }
 
-/// Events about objects never get an answer: the server accepts the list and stalls.
+/// Events about objects never get an answer: the server accepts the list and stalls. Only the
+/// detail reads' own requests, in their namespace, so a cluster-wide list can't take the stall.
 fn stall_events(server: &FakeApiServer) {
     server.inject(
         Fault::delay(Duration::from_secs(3600))
             .on(&Gvr::core("events"))
+            .in_namespace("demo")
             .verb(Verb::List),
     );
 }
@@ -2009,12 +2011,12 @@ async fn until_in_flight(server: &FakeApiServer, count: usize, within: Duration,
     });
 }
 
-/// How many events requests have reached the fake server.
+/// How many detail reads' events requests have reached the fake server.
 fn events_requests(server: &FakeApiServer) -> usize {
     server
         .arrivals()
         .iter()
-        .filter(|r| r.is_about(&Gvr::core("events")))
+        .filter(|r| r.path == "/api/v1/namespaces/demo/events")
         .count()
 }
 

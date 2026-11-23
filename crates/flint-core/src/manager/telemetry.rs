@@ -1,0 +1,138 @@
+//! Runs a telemetry feed for each wanted cluster, on the connection it already has.
+//!
+//! [`ClusterManager::sync_telemetry`] compares what should run with what does after every message
+//! of the manager's loop, so no path that pauses, drops or replaces a connection has to remember
+//! the feed. A feed never connects: it starts only from a slot's live connection, and its client
+//! is that connection's read client, so it is bound by the same credential grant.
+
+// module-tests: ../manager.rs
+
+use std::sync::{Arc, Mutex};
+
+use kube::config::Kubeconfig;
+
+use super::{Cluster, ClusterManager};
+use crate::cluster;
+use crate::connection::policy::Role;
+use crate::credential::CredentialSource;
+use crate::handle::ConnectionState;
+use crate::metrics_trend::TrendStore;
+use crate::settings::WatchMode;
+use crate::telemetry::Telemetry;
+
+/// A running feed and the connection attempt it follows.
+pub(super) struct SlotFeed {
+    attempt: u64,
+    /// Held to keep it running: dropping it stops its tasks.
+    _feed: Telemetry,
+}
+
+impl ClusterManager {
+    /// Whether `id` should have a feed now: it is selected or in the running set, in watch mode
+    /// All, its connection is up and not paused, and that connection's credential can go on being
+    /// used in its role. A credential that runs a program is used only in the foreground.
+    ///
+    /// On view promises no watch of a kind without an open view, and a feed watches seven kinds
+    /// whatever is open, so that mode has no feed.
+    fn wants_telemetry(&self, id: &str) -> bool {
+        if !self.wants_watches(id) || self.settings.watch_mode_for(id) != WatchMode::All {
+            return false;
+        }
+        let Some(slot) = self.cluster(id) else {
+            return false;
+        };
+        let Some(credential) = slot.write_credential.as_ref() else {
+            return false;
+        };
+        if slot.client.is_none()
+            || !matches!(slot.state, ConnectionState::Connected(_))
+            || credential.spent()
+        {
+            return false;
+        }
+        // The slot's access answers for a revoked grant, which the role computed here can't show.
+        if credential.runs_a_command() && !slot.access.grant(CredentialSource::Plugin).allowed() {
+            return false;
+        }
+        match self.connection_role(id) {
+            Role::Foreground => true,
+            Role::Background => !credential.runs_a_command(),
+            Role::Paused | Role::Retired => false,
+        }
+    }
+
+    /// Stops every feed no longer wanted or on an older connection, and starts those missing.
+    pub(super) fn sync_telemetry(&mut self) {
+        self.stop_unwanted_telemetry();
+        for index in 0..self.clusters.len() {
+            let id = self.clusters[index].info.name.clone();
+            if self.clusters[index].telemetry.is_none() && self.wants_telemetry(&id) {
+                self.start_telemetry(index, &id);
+            }
+        }
+    }
+
+    /// Stops every feed no longer wanted or on an older connection and takes it off the board.
+    /// Starts nothing, so a load can call it before saying what changed.
+    pub(super) fn stop_unwanted_telemetry(&mut self) {
+        for index in 0..self.clusters.len() {
+            let id = self.clusters[index].info.name.clone();
+            let wanted = self.wants_telemetry(&id);
+            let slot = &mut self.clusters[index];
+            if slot
+                .telemetry
+                .as_ref()
+                .is_some_and(|feed| !wanted || feed.attempt != slot.attempt)
+            {
+                slot.telemetry = None;
+            }
+        }
+        let running: Vec<&str> = self
+            .clusters
+            .iter()
+            .filter(|slot| slot.telemetry.is_some())
+            .map(|slot| slot.info.name.as_str())
+            .collect();
+        self.telemetry.retain(|cluster| running.contains(&cluster));
+    }
+
+    fn start_telemetry(&mut self, index: usize, id: &str) {
+        let target = cluster::Target::of(&self.kubeconfig.merged, id);
+        let timing = self.telemetry_timing;
+        let requests = self
+            .telemetry
+            .request_gate(reads_token_file(&self.kubeconfig.merged, id));
+        let slot: &mut Cluster = &mut self.clusters[index];
+        let Some(clients) = slot.client.as_ref() else {
+            return;
+        };
+        // Its own store, so a stopping feed clearing its series can't touch its successor's.
+        let trends = Arc::new(Mutex::new(TrendStore::new()));
+        let store = Arc::clone(&trends);
+        let mut feed = Telemetry::start(id.into(), clients, target, store, timing, requests);
+        self.telemetry.publish(id, &mut feed, trends);
+        slot.telemetry = Some(SlotFeed {
+            attempt: slot.attempt,
+            _feed: feed,
+        });
+    }
+}
+
+/// Whether `context`'s user names a token file, which the client rereads as it expires.
+pub(super) fn reads_token_file(config: &Kubeconfig, context: &str) -> bool {
+    let user = config
+        .contexts
+        .iter()
+        .find(|named| named.name == context)
+        .and_then(|named| named.context.as_ref())
+        .and_then(|context| context.user.as_deref());
+    user.is_some_and(|user| {
+        config.auth_infos.iter().any(|named| {
+            named.name == user
+                && named
+                    .auth_info
+                    .as_ref()
+                    .is_some_and(|auth| auth.token_file.is_some())
+        })
+    })
+}
