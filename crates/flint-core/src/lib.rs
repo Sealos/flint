@@ -14,6 +14,7 @@ pub mod cache;
 pub mod cluster;
 pub mod cluster_sets;
 pub mod combined;
+pub mod compare;
 mod connection;
 mod credential;
 pub mod dashboard;
