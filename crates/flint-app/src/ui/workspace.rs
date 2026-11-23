@@ -1697,10 +1697,9 @@ impl Workspace {
         let controls = header_controls(cluster, list);
         let ns_summary = namespace_button_text(&filter, list.and_then(|l| l.limited_to()));
         // Only a namespace's own name can be long; the limited text must stay whole.
-        let ns_label = if filter.is_empty() {
-            ns_summary.clone()
-        } else {
-            ellipsize(&ns_summary, NAMESPACE_LABEL_MAX_CHARS)
+        let ns_label = match filter.as_slice() {
+            [one] if *one == ns_summary => ellipsize(&ns_summary, NAMESPACE_LABEL_MAX_CHARS),
+            _ => ns_summary.clone(),
         };
 
         let mut crumbs: Vec<(SharedString, String)> = vec![(
@@ -3111,16 +3110,24 @@ pub fn namespace_summary(filter: &[String]) -> String {
     }
 }
 
-/// The namespace button's text: [`namespace_summary`], or, with no filter on a list that fell
-/// back to the namespaces the account can read, how many it really covers.
+/// The namespace button's text: [`namespace_summary`], or, on a list that fell back to the
+/// namespaces the account can read and does not cover the whole selection, what it really covers.
 fn namespace_button_text(filter: &[String], limit: Option<&flint_core::NamespaceLimit>) -> String {
-    match (filter, limit) {
-        ([], Some(limit)) => match limit.listed.len() {
+    let Some(limit) = limit else {
+        return namespace_summary(filter);
+    };
+    if filter.is_empty() {
+        return match limit.listed.len() {
             0 => "No namespaces (limited)".to_owned(),
             1 => "1 namespace (limited)".to_owned(),
             n => format!("{n} namespaces (limited)"),
-        },
-        _ => namespace_summary(filter),
+        };
+    }
+    let covered = filter.iter().filter(|n| limit.listed.contains(n)).count();
+    match filter.len() {
+        selected if covered == selected => namespace_summary(filter),
+        1 => "0 of 1 namespace (limited)".to_owned(),
+        selected => format!("{covered} of {selected} namespaces (limited)"),
     }
 }
 

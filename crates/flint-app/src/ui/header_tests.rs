@@ -314,7 +314,7 @@ async fn a_re_pointed_context_names_both_servers(cx: &mut TestAppContext) {
 }
 
 // #412: with no filter, a list that fell back to the namespaces the account can read says so on
-// the button, whole. A chosen filter keeps its own text.
+// the button, whole. A chosen filter it fully covers keeps its own text.
 #[gpui_kit::test]
 async fn the_namespace_button_says_when_the_list_is_limited(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
@@ -351,6 +351,78 @@ async fn the_namespace_button_says_when_the_list_is_limited(cx: &mut TestAppCont
     )
     .unwrap();
     t.wait_for_label(cx, "namespace-filter-button", "demo")
+        .await;
+}
+
+/// The workspace on a pods list that fell back to `listed`.
+async fn open_limited_to(
+    cx: &mut TestAppContext,
+    dir: &std::path::Path,
+    listed: &[&str],
+) -> TestWorkspace {
+    let t = open_workspace(cx, dir).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    t.open_kind(cx, "pods", pods(ROWS)).await;
+    let mut limited = (*pods(&[("demo", "api", 0)])).clone();
+    limited.limited_to = Some(std::sync::Arc::new(flint_core::NamespaceLimit {
+        listed: listed.iter().map(|n| (*n).to_owned()).collect(),
+        denied: Vec::new(),
+        reason: "pods is forbidden".into(),
+        revisions: vec![1; listed.len()],
+    }));
+    let list = t.list(cx).unwrap();
+    list.update(cx, |list, cx| {
+        list.set_snapshot(std::sync::Arc::new(limited), cx)
+    });
+    t
+}
+
+fn toggle_namespace(cx: &mut TestAppContext, t: &TestWorkspace, namespace: &str) {
+    t.dispatch(
+        cx,
+        "workspace::ToggleNamespace",
+        json!({"namespace": namespace}),
+    )
+    .unwrap();
+}
+
+// #412: a selection the fallback list only partly covers says how much, whole, for one selected
+// namespace as well as for several.
+#[gpui_kit::test]
+async fn the_namespace_button_counts_a_partly_covered_selection(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_limited_to(cx, dir.path(), &["demo"]).await;
+    toggle_namespace(cx, &t, "demo");
+    t.wait_for_label(cx, "namespace-filter-button", "demo")
+        .await;
+    toggle_namespace(cx, &t, "prod");
+    t.wait_for_label(cx, "namespace-filter-button", "1 of 2 namespaces (limited)")
+        .await;
+    let drawn = cx
+        .update_window(t.window, |_, window, _| {
+            window.find("namespace-filter-button").bounds().size.width
+        })
+        .unwrap();
+    assert!(
+        drawn > gpui_kit::px(150.),
+        "the text is not cut short: {drawn:?}"
+    );
+
+    toggle_namespace(cx, &t, "demo");
+    t.wait_for_label(cx, "namespace-filter-button", "0 of 1 namespace (limited)")
+        .await;
+}
+
+// #412: a selection the fallback list fully covers keeps its normal text.
+#[gpui_kit::test]
+async fn the_namespace_button_keeps_a_fully_covered_selection(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_limited_to(cx, dir.path(), &["demo", "prod", "team-a"]).await;
+    toggle_namespace(cx, &t, "demo");
+    t.wait_for_label(cx, "namespace-filter-button", "demo")
+        .await;
+    toggle_namespace(cx, &t, "prod");
+    t.wait_for_label(cx, "namespace-filter-button", "2 namespaces")
         .await;
 }
 

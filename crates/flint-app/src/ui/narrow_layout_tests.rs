@@ -151,6 +151,23 @@ async fn the_limited_namespace_label_fits_the_minimum_width(cx: &mut TestAppCont
         .await;
     resize(cx, &t, 760., 480.);
     assert_header_on_screen(cx, &t);
+
+    // The longest form: a selection the list only partly covers.
+    for i in 0..13 {
+        t.dispatch(
+            cx,
+            "workspace::ToggleNamespace",
+            serde_json::json!({"namespace": format!("team-{i:02}")}),
+        )
+        .unwrap();
+    }
+    t.wait_for_label(
+        cx,
+        "namespace-filter-button",
+        "12 of 13 namespaces (limited)",
+    )
+    .await;
+    assert_header_on_screen(cx, &t);
 }
 
 // #421: below the breakpoint the detail replaces the list, and Back (a click) returns to the
