@@ -153,11 +153,13 @@ Flint is in early development.
 - Your kubeconfig contexts in a sidebar; Flint connects to the one you select and checks its health.
 - Every kind the cluster serves, CRDs included, from the cluster's own discovery: live lists with the `kubectl get`
   columns, a namespace and text filter, and a detail view with metadata, conditions, events and YAML.
+- A watch mode for the active cluster: watch all kinds or only open views, with a default and per-cluster overrides.
 - YAML editing with a server dry-run and diff, plus delete, scale, rollout restart, cordon and drain, all behind the
   cluster protection.
 - A bottom dock with pod and workload logs (follow, search, timestamps, previous logs, save to a file) and shells into
-  containers. Open them from a row's context menu, the detail pane or the keyboard. Log tabs have matching-lines-only
-  and errors-only (warnings and errors) filters, with adjustable context lines.
+  containers. Open them from a row's context menu, the detail pane or the keyboard.
+- Log filters: Matching Lines Only (M) keeps lines that match your search, and Errors Only (E) keeps warnings and
+  errors. Use either filter or both, with adjustable context before and after each match.
 - Protected clusters: every cluster not on your machine is read-only in Flint until you unlock it for the session
   or trust it (the lock button in the sidebar, or the palette). That covers shells, edits and resource actions.
 - GitOps markers: list rows with Argo CD or Flux tracking metadata show an `Argo` or `Flux` marker, and the detail
@@ -170,9 +172,10 @@ Flint is in early development.
 - Cluster colour tags: six colours, set from a cluster's row menu or the palette, shown as a dot in the sidebar and a
   strip over the detail pane. A tag belongs to a context at one server and changes nothing about access.
 - A command palette (⇧⌘P) that runs any action by name and shows its shortcut (see [Keys](#keys)).
-- A resource switcher (⌘P) for the active cluster's kinds and cached objects, ranked by relevance, Go Back (⌘[) to
-  return to the previous kind and object, and Tab and Shift-Tab to move focus between panes outside text fields and
-  shells. Enter opens the selected list row.
+- A resource switcher (⌘P) that ranks matches for the active cluster's kinds and objects already in memory. Open a
+  kind's list or jump straight to an object's details.
+- Go Back (⌘[) returns to the previous kind and object on the active cluster and restores the list's text filter.
+  Tab and Shift-Tab cycle through panes outside text fields and shells. Enter opens the selected list row.
 - Light and dark themes that follow the system (View > Appearance, or the `appearance` setting, overrides it).
 - A read-only MCP server, `flint mcp`, for AI agents, limited to the clusters you expose.
 - Builds for macOS (Apple Silicon and Intel) and, best effort, Linux (x86_64 and arm64). From 0.5.0, the 24
@@ -180,9 +183,8 @@ Flint is in early development.
 
 **Coming next:**
 
-- **v0.6, see and watch many clusters:** multi-cluster management and watching. None of this is in 0.5.0: it has no
-  combined views, alerts, dashboards, thresholds or CPU and memory columns.
-- **v0.7, know what's wrong:** alerting and health signals across clusters. Not in 0.5.0.
+- **v0.6, see and watch many clusters:** cluster sets, combined views and watching across clusters.
+- **v0.7, know what's wrong:** alerting and health signals across clusters.
 - **v0.8, change many clusters:** guarded fleet actions with explicit targets, a dry run per cluster, one cluster at a
   time, and a stop at the first failure.
 - **1.0, first public release:** a signed and notarized app with a Homebrew cask, port-forwarding, and read-only Helm
@@ -354,8 +356,8 @@ press Enter to open the kind's list, or the object selected with its details; it
 holds in memory, so it never asks the cluster. These are the default keys on macOS; on Linux, Cmd is Ctrl, except
 where the table says otherwise and in a focused shell, which keeps Ctrl with a letter or symbol.
 
-With a log tab focused, run **Set Context Lines…** from the command palette to choose how many lines appear before
-and after each filtered match.
+With a log tab focused, run **Set Context Lines…** from the command palette to show 0 to 100 lines before and after
+each filtered match.
 
 | Key | Action | Where |
 |---|---|---|
