@@ -8,6 +8,7 @@ use flint_core::problems::{
     Problem, ProblemId, ProblemKind, ProblemSeverity, ProblemSubject, WORKLOAD_HOLD_DOWN,
     WorkloadKind,
 };
+use gpui_kit::test::TestAppContextExt as _;
 use gpui_kit::{Entity, TestAppContext};
 use jiff::Timestamp;
 use serde_json::{Value, json};
@@ -396,14 +397,16 @@ async fn a_problem_tile_opens_its_objects_and_the_kind_shows_all_again(cx: &mut 
     assert_eq!(t.row_count(cx), 1);
     t.dispatch(cx, "workspace::OpenView", json!({"kind": "pods"}))
         .unwrap();
-    cx.run_until_parked();
     assert!(list.read_with(cx, |list, _| list.only().is_none()));
+    // The rows are computed on a core thread, which `run_until_parked` does not wait for.
+    let widened = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| widened.read(cx).shown().1 != 1)
+        .await;
+    cx.run_until_parked();
     // The list filters off the UI thread, so the wider result lands a moment later.
     let shown = list.clone();
-    gpui_kit::test::TestAppContextExt::wait_for(cx, t.window, WAIT, move |_, cx| {
-        shown.read(cx).shown().1 == 2
-    })
-    .await;
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 2)
+        .await;
     assert_eq!(t.row_count(cx), 2);
 }
 

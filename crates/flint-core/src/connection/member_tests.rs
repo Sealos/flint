@@ -148,6 +148,30 @@ fn join_while_paused_starts_nothing_until_resumed() {
 }
 
 #[test]
+fn a_canceled_member_waits_for_the_next_activation() {
+    let now = Instant::now();
+    let (mut member, _) = attempting();
+    let canceled = MemberEvent::Canceled {
+        reason: text("connection canceled"),
+    };
+    assert_eq!(
+        member.apply(canceled, now, &mut NoJitter),
+        MemberAction::Dequeue
+    );
+    let later = now + BACKOFF_MAX;
+    assert_eq!(
+        member.apply(MemberEvent::Tick, later, &mut NoJitter),
+        MemberAction::None
+    );
+    assert!(matches!(member.state(), MemberState::Failed { .. }));
+    assert_eq!(
+        member.apply(MemberEvent::Activated, later, &mut NoJitter),
+        MemberAction::StartNow
+    );
+    assert_eq!(*member.state(), MemberState::Connecting);
+}
+
+#[test]
 fn connecting_goes_live_on_success() {
     let now = Instant::now();
     assert_eq!(live(now).state(), &MemberState::Live);

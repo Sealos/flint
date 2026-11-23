@@ -84,10 +84,10 @@ impl NavPanel {
 
     /// Opens (`Some(false)`), closes (`Some(true)`) or toggles (`None`) the section `title`.
     fn set_collapsed(&mut self, title: &str, collapsed: Option<bool>, cx: &mut Context<Self>) {
-        let (Some(cluster), Some(section)) = (self.cluster.clone(), self.section(title)) else {
+        let (Some((cluster, _)), Some(section)) = (self.tree(), self.section(title)) else {
             return;
         };
-        let section = section.clone();
+        let (cluster, section) = (cluster.clone(), section.clone());
         let sections = self.collapsed.entry(cluster).or_default();
         if collapsed.is_none_or(|c| c != sections.is_collapsed(&section)) {
             sections.toggle(&section);
@@ -96,22 +96,22 @@ impl NavPanel {
     }
 
     fn section_of(&self, kind: &flint_core::KindId) -> Option<&NavSection> {
-        self.discovery
-            .as_ref()?
+        self.tree()?
+            .1
             .navigation
             .sections
             .iter()
             .find(|s| s.entries.iter().any(|e| e.id == *kind))
     }
 
-    /// Whether the navigation shows sections (a cluster's discovery arrived).
+    /// Whether the navigation shows sections (a discovery arrived).
     pub(in crate::ui) fn has_sections(&self) -> bool {
-        self.cluster.is_some() && self.discovery.is_some()
+        self.tree().is_some()
     }
 
     fn section(&self, title: &str) -> Option<&NavSection> {
-        self.discovery
-            .as_ref()?
+        self.tree()?
+            .1
             .navigation
             .sections
             .iter()
@@ -139,7 +139,7 @@ impl NavPanel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (Some(cluster), Some(section)) = (self.cluster.clone(), self.section(&action.section))
+        let (Some((cluster, _)), Some(section)) = (self.tree(), self.section(&action.section))
         else {
             tracing::warn!(
                 section = action.section,
@@ -147,7 +147,7 @@ impl NavPanel {
             );
             return;
         };
-        let section = section.clone();
+        let (cluster, section) = (cluster.clone(), section.clone());
         self.collapsed.entry(cluster).or_default().toggle(&section);
         cx.notify();
     }
@@ -155,7 +155,7 @@ impl NavPanel {
     /// Whether the section titled `title` is collapsed, for tests.
     #[cfg(test)]
     pub(in crate::ui) fn is_collapsed(&self, title: &str) -> Option<bool> {
-        let cluster = self.cluster.as_ref()?;
+        let (cluster, _) = self.tree()?;
         let section = self.section(title)?;
         Some(
             self.collapsed
