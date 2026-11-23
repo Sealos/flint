@@ -9,7 +9,9 @@ impl NavPanel {
         let cluster = self.cluster.as_ref()?;
         let error = self.error.as_deref().map(error_text);
         let Some(discovery) = &self.discovery else {
-            let status = if self.connection_failed || self.error.is_some() {
+            let status = if self.awaiting_confirmation {
+                "waiting"
+            } else if self.connection_failed || self.error.is_some() {
                 "failed"
             } else {
                 "discovering"
