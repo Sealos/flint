@@ -720,6 +720,30 @@ async fn the_lock_buttons_name_says_the_protection(cx: &mut TestAppContext) {
     ));
 }
 
+// While writes are paused, an unlocked cluster's lock says so instead of unlocked.
+#[gpui_kit::test]
+async fn the_lock_button_says_writes_are_paused(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_settings(cx, dir.path(), PROTECT_LOCAL).await;
+    let server = t.server.clone();
+    t.model
+        .update(cx, |m, cx| m.unlock("kind-alpha", &server, cx));
+    wait_for_protection(cx, &t, "kind-alpha", Protection::Unlocked).await;
+    t.model.update(cx, |model, cx| {
+        let alpha = model
+            .clusters
+            .iter_mut()
+            .find(|c| c.info.name == "kind-alpha")
+            .unwrap();
+        alpha.provisional = true;
+        cx.notify();
+    });
+    t.wait_for_label(cx, "lock-kind-alpha", "Lock for kind-alpha: writes paused")
+        .await;
+    let tip = t.description(cx, "lock-kind-alpha").unwrap();
+    assert!(tip.starts_with("Writes paused") && !tip.contains("Unlocked"));
+}
+
 /// Two EKS contexts in different accounts, both titled `prod`.
 const PROD_A: &str = "arn:aws:eks:us-east-1:000000000000:cluster/prod";
 const PROD_B: &str = "arn:aws:eks:us-east-1:000000000001:cluster/prod";

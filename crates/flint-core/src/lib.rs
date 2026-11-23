@@ -77,6 +77,7 @@ pub use problems::{
 };
 pub use protection::{Protection, SessionUnlocks, WriteRefusal};
 pub use read::{KindId, KindInfo, ObjectDetail};
+pub use recheck::DefinitionHolds;
 pub use settings::{Appearance, Settings, WatchMode};
 pub use store::{Feed, KindSnapshot, NamespaceLimit, RefusalCause, SyncState};
 pub use table::{Cell, Column, ColumnRole, ColumnType, ListFormat, Row};

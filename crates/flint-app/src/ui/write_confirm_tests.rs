@@ -607,6 +607,41 @@ async fn a_marked_object_is_warned_about_in_the_dialog(cx: &mut TestAppContext) 
     assert!(server.writes().is_empty());
 }
 
+// A reloaded edit's note is in its drawn confirmation, once, and the default button cancels it.
+#[gpui_kit::test]
+async fn a_reloaded_edit_says_what_it_overwrites(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let server = fake_api();
+    let t = connected_to_fake(cx, dir.path(), &server).await;
+    let target = act(&server);
+    let live = server.object(&deployments(), Some("demo"), "act").unwrap();
+    let edit = || WriteProposal::ApplyYaml {
+        yaml: serde_saphyr::to_string(&live).unwrap(),
+    };
+    let note = "1 field changed on the cluster: spec.replicas.";
+    cx.update(|cx| write_confirm::set_edit_note(&target, Some(note.to_owned()), cx));
+
+    let flow = open_on(cx, &t, target.clone(), edit(), true).await;
+    let text = shown_confirmation(cx, &t);
+    assert!(text.starts_with(note), "{text}");
+    let default_cancels = cx
+        .update_window(t.window, |_, window, cx| {
+            crate::ui::confirm::shown(window, cx).map(|dialog| dialog.default_cancel)
+        })
+        .unwrap();
+    assert_eq!(default_cancels, Some(true));
+    t.click(cx, "cancel");
+    draw(cx, &t);
+    assert_eq!(flow.begun.get(), 0);
+
+    let again = open_on(cx, &t, target, edit(), true).await;
+    let text = shown_confirmation(cx, &t);
+    assert!(!text.contains("spec.replicas"), "{text}");
+    t.click(cx, "cancel");
+    draw(cx, &t);
+    assert_eq!(again.begun.get(), 0);
+}
+
 // covers UP-51: a Secret marked by an annotation is warned about in the drawn confirmation,
 // without the annotation's value.
 #[gpui_kit::test]

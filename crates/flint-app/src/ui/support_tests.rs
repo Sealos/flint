@@ -770,6 +770,7 @@ pub fn discovery(sections: Vec<NavSection>) -> ClusterDiscovery {
     ClusterDiscovery {
         kinds,
         navigation: Navigation { sections },
+        incomplete_groups: Vec::new(),
     }
 }
 
