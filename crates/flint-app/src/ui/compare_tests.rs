@@ -162,3 +162,182 @@ fn a_cluster_listed_twice_gets_one_column() {
     let clusters = distinct(vec![EU.to_owned(), US.to_owned(), EU.to_owned()]);
     assert_eq!(clusters, [EU, US]);
 }
+
+fn summary(name: &str, state: ConnectionState, paused: bool) -> ClusterSummary {
+    ClusterSummary {
+        info: flint_core::kubeconfig::ContextInfo {
+            name: name.into(),
+            cluster: None,
+            user: None,
+            namespace: None,
+            server: None,
+            proxy_url: None,
+            source: "/k".into(),
+        },
+        state,
+        generation: 1,
+        definition: 1,
+        endpoint: 1,
+        confirmed: true,
+        provisional: false,
+        paused,
+    }
+}
+
+fn connected(name: &str) -> ClusterSummary {
+    let version = flint_core::ServerVersion {
+        git_version: "v1".into(),
+        platform: "linux/arm64".into(),
+    };
+    summary(name, ConnectionState::Connected(version), false)
+}
+
+fn paused(name: &str) -> ClusterSummary {
+    summary(name, ConnectionState::AwaitingConfirmation, true)
+}
+
+#[test]
+fn columns_are_the_origin_then_connected_and_paused_clusters() {
+    let clusters = [
+        summary("idle", ConnectionState::Disconnected, false),
+        connected("other"),
+        paused("held"),
+        connected("origin"),
+    ];
+    assert_eq!(
+        compare_clusters("origin", &clusters),
+        ["origin", "other", "held"]
+    );
+}
+
+#[test]
+fn a_comparison_needs_another_readable_cluster() {
+    let alone = [connected("origin"), paused("held")];
+    assert_eq!(can_compare("origin", &alone).unwrap_err(), NO_OTHER_CLUSTER);
+    let two = [connected("origin"), connected("other")];
+    assert_eq!(can_compare("origin", &two), Ok(()));
+    let origin_paused = [paused("origin"), connected("other")];
+    assert!(
+        can_compare("origin", &origin_paused)
+            .unwrap_err()
+            .contains(PAUSED)
+    );
+}
+
+#[test]
+fn paused_and_removed_clusters_are_held_back() {
+    let clusters = [connected("live"), paused("held")];
+    assert_eq!(held_back("live", &clusters), None);
+    assert_eq!(held_back("held", &clusters), Some(PAUSED));
+    assert_eq!(held_back("gone", &clusters), Some(REMOVED));
+}
+
+#[test]
+fn a_refusal_is_one_sentence() {
+    assert_eq!(
+        refused("alpha is not connected."),
+        "Can't compare this object: alpha is not connected."
+    );
+}
+
+#[test]
+fn every_compare_action_is_bound() {
+    use crate::ui::registry::{Scope, tests::assert_binds_scope};
+    assert_binds_scope(Scope::Compare, CompareView::bind_actions);
+}
+
+fn at(mut cluster: ClusterSummary, server: &str, definition: u64) -> ClusterSummary {
+    cluster.info.server = Some(server.to_owned());
+    cluster.definition = definition;
+    cluster
+}
+
+// covers #449: a column stays on the definition it opened on, also through a move back.
+#[test]
+fn a_column_is_held_once_its_cluster_changes() {
+    let opened = at(connected(EU), "https://a.example", 1);
+    let pin = opened.read_pin();
+    assert_eq!(
+        column_held(EU, Some(&pin), std::slice::from_ref(&opened)),
+        None
+    );
+    for moved in [
+        at(connected(EU), "https://b.example", 2),
+        at(connected(EU), "https://a.example", 2),
+    ] {
+        assert_eq!(column_held(EU, Some(&pin), &[moved]), Some(CHANGED));
+    }
+    let mut held = at(connected(EU), "https://b.example", 2);
+    held.paused = true;
+    assert_eq!(column_held(EU, Some(&pin), &[held]), Some(PAUSED));
+    assert_eq!(column_held(EU, Some(&pin), &[]), Some(REMOVED));
+}
+
+// covers #449: removing `team` must not leave two columns both called `team`.
+#[test]
+fn retained_columns_keep_names_told_apart() {
+    const PLAIN: &str = "team";
+    const ARN: &str = "arn:aws:eks:eu-west-1:123456789012:cluster/team";
+    let columns = [PLAIN.to_owned(), ARN.to_owned()];
+    let names = column_names(&columns, &[connected(ARN)], &BTreeMap::new());
+    assert_ne!(names.exact(PLAIN), names.exact(ARN));
+}
+
+#[test]
+fn a_menu_object_names_its_kind_exactly() {
+    let object = CompareObject {
+        cluster: EU.to_owned(),
+        kind: "deployments.apps".to_owned(),
+        namespace: Some("demo".to_owned()),
+        name: "web".to_owned(),
+    };
+    assert_eq!(object.target().kind, KindId::new("apps", "deployments"));
+}
+
+// The core would answer "not connected" for this cluster, so the paused reason shows no request
+// was made. The toggles change what is shown without reading again.
+#[gpui_kit::test]
+fn a_paused_cluster_is_not_read_and_the_controls_work(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = tempfile::tempdir().unwrap();
+    let core = flint_core::CoreHandle::start(flint_core::CoreConfig {
+        config_dir: dir.path().to_owned(),
+        settings: flint_core::Settings::default(),
+        settings_error: None,
+        kubeconfig_base: Vec::new(),
+        home: None,
+        watch_files: false,
+        watch_timing: Default::default(),
+    })
+    .unwrap();
+    let source = cx.new(|cx| ClustersModel::new(core, flint_core::Settings::default(), None, cx));
+    let view = cx.new(|cx| {
+        source.update(cx, |model, _| {
+            model.clusters = vec![connected(EU), paused(US)];
+        });
+        CompareView::new(
+            source.clone(),
+            EU.to_owned(),
+            target(KindId::new("", "configmaps")),
+            vec![EU.to_owned(), US.to_owned()],
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    let held = format!("{UNAVAILABLE}: {PAUSED}");
+    view.read_with(cx, |view, _| {
+        let side = &view.model().headers[1];
+        assert_eq!(side.status, held);
+        assert!(side.problem);
+        assert!(!view.show_same() && !view.include_volatile());
+    });
+    view.update(cx, |view, cx| {
+        view.set_show_same(true, cx);
+        view.set_include_volatile(true, cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |view, _| {
+        assert!(view.show_same() && view.include_volatile());
+        assert_eq!(view.model().headers[1].status, held);
+    });
+}

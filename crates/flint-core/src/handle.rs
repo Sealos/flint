@@ -280,6 +280,15 @@ pub(crate) enum Request {
         member: Option<AdmittedMember>,
         reply: oneshot::Sender<Result<Arc<ObjectDetail>, String>>,
     },
+    /// One object, no events, refused unless the context still matches `pin`.
+    FetchPinnedObject {
+        cluster: ClusterId,
+        pin: ReadPin,
+        kind: KindId,
+        namespace: Option<String>,
+        name: String,
+        reply: oneshot::Sender<Result<Arc<ObjectDetail>, String>>,
+    },
     Discovery {
         cluster: ClusterId,
         reply: oneshot::Sender<Option<Arc<ClusterDiscovery>>>,
@@ -398,6 +407,25 @@ pub struct ClusterSummary {
     /// The core starts nothing new on this context: its definition differs from the confirmed
     /// one, or only an unreadable file still defines it. A first-seen context is never paused.
     pub paused: bool,
+}
+
+impl ClusterSummary {
+    /// What a read opened on this cluster now stays pinned to.
+    pub fn read_pin(&self) -> ReadPin {
+        ReadPin {
+            definition: self.definition,
+            server: self.info.server.clone(),
+        }
+    }
+}
+
+/// A context's identity when a read-only view opened on it: its confirmed definition and exact
+/// server. A move changes the definition even if a later reload puts the server back. Grants
+/// nothing on the write path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadPin {
+    pub definition: u64,
+    pub server: Option<String>,
 }
 
 /// What the core's answer to a reload means: `None` when it stopped without answering.
@@ -691,6 +719,35 @@ impl CoreHandle {
             if let Some(refused) = refused {
                 return Err(refused);
             }
+            if sent.is_err() {
+                return Err("the core is not running".to_owned());
+            }
+            rx.await
+                .unwrap_or_else(|_| Err("the core stopped before answering".to_owned()))
+        }
+    }
+
+    /// Fetches one object and nothing else (no events), only while `cluster` is not paused and is
+    /// still the definition `pin` was taken from. The core checks that as it takes the client, so
+    /// a refused read sends no request. Starts no connection. Works on any executor.
+    pub fn fetch_pinned_object(
+        &self,
+        cluster: &str,
+        pin: &ReadPin,
+        kind: &KindId,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> impl Future<Output = Result<Arc<ObjectDetail>, String>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let sent = self.requests.try_send(Request::FetchPinnedObject {
+            cluster: cluster.to_owned(),
+            pin: pin.clone(),
+            kind: kind.clone(),
+            namespace: namespace.map(str::to_owned),
+            name: name.to_owned(),
+            reply,
+        });
+        async move {
             if sent.is_err() {
                 return Err("the core is not running".to_owned());
             }

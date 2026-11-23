@@ -43,7 +43,7 @@ pub const OTHER_SCOPE: &str = "this kind has a different scope on this cluster";
 const ORDER: &str = "[order]";
 
 /// The object compared on each cluster.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CompareTarget {
     pub kind: KindId,
     pub namespace: Option<String>,
