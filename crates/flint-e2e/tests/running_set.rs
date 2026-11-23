@@ -5,10 +5,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use flint_core::handle::{Command, CoreHandle, MemberStatus};
+use flint_core::handle::{Command, CoreHandle, MemberStatus, Subscription};
 use flint_core::settings::ClusterPin;
-use flint_core::{KindId, Settings};
-use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, WatchStep, write_kubeconfigs};
+use flint_core::{KindId, Settings, SyncState};
+use flint_e2e::fake_api::{FakeApiServer, FakeRow, Fault, Gvr, WatchStep, write_kubeconfigs};
 
 #[allow(dead_code)]
 mod core_support;
@@ -219,4 +219,50 @@ async fn a_combined_view_sends_nothing_to_the_server_its_active_member_moved_to(
         .map(|r| r.path)
         .collect();
     assert!(reached.is_empty(), "{reached:?}");
+}
+
+fn pod_row(name: &str) -> FakeRow {
+    FakeRow::build(Some("default"), name, vec![serde_json::json!(name)])
+}
+
+async fn until_row(view: &mut Subscription, name: &str) {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if view.latest().names().contains(&name) {
+                return;
+            }
+            view.changed().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{name} did not arrive"));
+}
+
+#[tokio::test]
+async fn a_member_view_never_shows_the_server_its_context_moved_to() {
+    let [a, b, elsewhere] = servers().await;
+    a.set_row(&pods(), pod_row("admitted-pod"));
+    elsewhere.set_row(&pods(), pod_row("replacement-pod"));
+    let (core, path) = core_on(&[&a, &b]).await;
+    let pins = vec![ClusterPin::new("a", a.url()), ClusterPin::new("b", b.url())];
+    let admitted = core.handle.admit_running_set(pins).await.unwrap();
+    let member = admitted.into_iter().find(|m| m.context() == "a").unwrap();
+    let combined = core.handle.bound_to(member);
+    let mut member_view = combined.subscribe("a", &pod_kind());
+    until_row(&mut member_view, "admitted-pod").await;
+
+    write_config(&path, &[&elsewhere, &b]);
+    core.handle.reload_kubeconfig().await.unwrap();
+    let mut plain_view = core.handle.subscribe("a", &pod_kind());
+    until_row(&mut plain_view, "replacement-pod").await;
+
+    let mut refused = combined.subscribe("a", &pod_kind());
+    assert!(refused.changed().await, "the first read");
+    // Answered after the refused subscription was handled.
+    core.handle.running_set().await;
+    for snapshot in [member_view.latest(), refused.latest()] {
+        assert!(snapshot.rows.is_empty(), "{:?}", snapshot.names());
+        assert_eq!(snapshot.state, SyncState::Idle);
+    }
+    assert!(plain_view.latest().names().contains(&"replacement-pod"));
 }

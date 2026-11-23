@@ -26,7 +26,7 @@ use crate::settings::WatchMode;
 use crate::store::{Feed, KindSnapshot, SyncState};
 
 pub(crate) use engine::EngineConfig;
-pub(crate) use hub::{Hub, HubRegistry};
+pub(crate) use hub::{Hub, HubRegistry, MemberFeed};
 #[cfg(test)]
 pub(crate) use source::WatchRequest;
 pub(crate) use source::{KubeSource, Source};

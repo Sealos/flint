@@ -182,20 +182,36 @@ impl ClusterManager {
     }
 
     /// Subscribes to `kind` on `member`, in one step with checking it still holds: a member that
-    /// changed starts no LIST or watch. Its subscription just never gets rows.
+    /// changed, or a handle bound to another context, starts no LIST or watch and gets no rows.
     pub(super) fn subscribe_member(
         &mut self,
         id: u64,
+        cluster: &str,
         member: AdmittedMember,
         kind: crate::KindId,
+        feed: crate::watch::MemberFeed,
     ) {
-        if self.member_changed(&member).is_some() {
+        self.member_feeds.insert(id, feed.clone());
+        if member.context() != cluster || self.member_changed(&member).is_some() {
             return;
         }
-        let cluster = member.pin.context.clone();
+        self.hubs.attach_member(cluster, &kind, id, feed);
         self.subscriptions
-            .insert(id, (cluster.clone(), kind, Some(member)));
-        self.reconcile(&cluster);
+            .insert(id, (cluster.to_owned(), kind, Some(member)));
+        self.reconcile(cluster);
+    }
+
+    /// Cuts the subscriptions of `cluster` whose member changed off from its hubs for good.
+    pub(super) fn cut_off_changed_members(&self, cluster: &str) {
+        for (id, (context, kind, member)) in &self.subscriptions {
+            if context == cluster
+                && member
+                    .as_ref()
+                    .is_some_and(|m| self.member_changed(m).is_some())
+            {
+                self.hubs.detach_member(cluster, kind, *id);
+            }
+        }
     }
 
     /// The read client of `member`, checked in the same step as it is taken.

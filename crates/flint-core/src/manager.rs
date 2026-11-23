@@ -490,6 +490,9 @@ pub(crate) struct ClusterManager {
     engine_config: Arc<EngineConfig>,
     /// Open subscriptions by id, each with the member it was admitted on if a set opened it.
     subscriptions: HashMap<u64, (ClusterId, KindId, Option<crate::handle::AdmittedMember>)>,
+    /// Keeps each member subscription's channel open after it is cut off or refused, so it
+    /// reads as empty rather than as a stopped core.
+    member_feeds: HashMap<u64, crate::watch::MemberFeed>,
     /// Open overviews by id, with the slot generation each was opened on.
     overviews: HashMap<u64, (ClusterId, u64)>,
     /// Running log sessions by id. They belong to no cluster slot, so they outlive cluster
@@ -565,6 +568,7 @@ impl ClusterManager {
             hubs,
             engine_config,
             subscriptions: HashMap::new(),
+            member_feeds: HashMap::new(),
             overviews: HashMap::new(),
             log_sessions: HashMap::new(),
             log_budget,
@@ -730,10 +734,17 @@ impl ClusterManager {
                 self.subscriptions.insert(id, (cluster.clone(), kind, None));
                 self.reconcile(&cluster);
             }
-            Request::SubscribeMember { id, member, kind } => {
-                self.subscribe_member(id, member, kind);
+            Request::SubscribeMember {
+                id,
+                cluster,
+                member,
+                kind,
+                feed,
+            } => {
+                self.subscribe_member(id, &cluster, member, kind, feed);
             }
             Request::Unsubscribe { id } => {
+                self.member_feeds.remove(&id);
                 if let Some((cluster, kind, _)) = self.subscriptions.remove(&id) {
                     self.reconcile(&cluster);
                     let running = self
@@ -1005,6 +1016,8 @@ impl ClusterManager {
     /// Brings a cluster's watches in line with whether it wants them, its watch mode, and the
     /// open subscriptions, and follows its CRDs while it wants them.
     fn reconcile(&mut self, id: &str) {
+        // Before anything below can start a watch on the context's current server.
+        self.cut_off_changed_members(id);
         let wanted = self.wants_watches(id);
         let mode = self.settings.watch_mode_for(id);
         let subscribed: HashSet<KindId> = self
@@ -6071,7 +6084,8 @@ users:
             ])
             .unwrap();
         let kind = KindId::pods();
-        manager.subscribe_member(1, admitted[0].clone(), kind.clone());
+        let feed = || tokio::sync::watch::Sender::new(Arc::default());
+        manager.subscribe_member(1, "dev", admitted[0].clone(), kind.clone(), feed());
         assert!(manager.subscriptions.contains_key(&1), "still admitted");
 
         rewrite(
@@ -6080,9 +6094,9 @@ users:
             &kubeconfig_with("https://replacement"),
         )
         .await;
-        manager.subscribe_member(2, admitted[0].clone(), kind.clone());
+        manager.subscribe_member(2, "dev", admitted[0].clone(), kind.clone(), feed());
         rewrite(&mut manager, dir.path(), &original).await;
-        manager.subscribe_member(3, admitted[0].clone(), kind);
+        manager.subscribe_member(3, "dev", admitted[0].clone(), kind, feed());
         assert!(!manager.subscriptions.contains_key(&2), "moved");
         assert!(!manager.subscriptions.contains_key(&3), "moved back");
     }
