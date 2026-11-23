@@ -431,6 +431,17 @@ impl CombinedList {
     /// namespace, name, then cluster. Blank cells sort last in both directions, so one cluster
     /// lacking a column never pushes the others' rows down.
     pub fn compute(&self, query: &CombinedQuery, now: i64) -> CombinedView {
+        self.compute_where(query, now, |_, _| true)
+    }
+
+    /// [`Self::compute`] over the rows `keep` accepts, by member index. Counts and groups cover
+    /// only those rows.
+    pub fn compute_where(
+        &self,
+        query: &CombinedQuery,
+        now: i64,
+        keep: impl Fn(usize, &Row) -> bool,
+    ) -> CombinedView {
         let sort = self.resolve_sort(query);
         let mut picked: Vec<(usize, Vec<u32>)> = (0..self.members.len())
             .filter(|&m| {
@@ -440,7 +451,12 @@ impl CombinedList {
                         .iter()
                         .any(|c| c.as_str() == &*self.members[m].cluster)
             })
-            .map(|m| (m, self.filter_member(m, query, now)))
+            .map(|m| {
+                let mut rows = self.filter_member(m, query, now);
+                let snapshot = &self.members[m].snapshot;
+                rows.retain(|&row| keep(m, &snapshot.rows[row as usize]));
+                (m, rows)
+            })
             .collect();
         let matched = picked.iter().map(|(_, rows)| rows.len()).sum();
 

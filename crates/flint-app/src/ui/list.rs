@@ -36,7 +36,7 @@ use super::row_menu::{OpenRowMenu, RowMenu};
 
 use super::registry::{
     self, CloseDetail, SelectFirst, SelectLast, SelectNext, SelectPrev, SelectRow,
-    ShowAllNamespaces, SortBy, ToggleWide,
+    ShowAllNamespaces, SortBy, ToggleProblemsOnly, ToggleWide,
 };
 
 /// The list's key context; the registry binds the list's keys in it.
@@ -154,6 +154,7 @@ pub struct ResourceList {
     shown: Arc<KindSnapshot>,
     rows: Arc<[u32]>,
     query: Query,
+    problems: problems::ProblemFilter,
     show_wide: bool,
     widths: ColumnWidths,
     selected: Option<Selected>,
@@ -309,6 +310,7 @@ impl ResourceList {
                 sort,
                 ..Default::default()
             },
+            problems: Default::default(),
             show_wide: false,
             widths: ColumnWidths::default(),
             selected: None,
@@ -663,6 +665,7 @@ impl ResourceList {
         let job_snapshot = snapshot.clone();
         let only = self.query.only.as_ref().map(|only| only.objects.clone());
         let job_only = only.clone();
+        let job_problems = self.problems.row_filter(&self.kind, &self.cluster);
         #[cfg(test)]
         let gate = self.compute_gate.clone();
         let job = cx.background_spawn(async move {
@@ -679,6 +682,14 @@ impl ResourceList {
                         let row = &job_snapshot.rows[i as usize];
                         objects.matches(row.namespace.as_deref(), &row.name, &row.uid)
                     })
+                    .collect(),
+                None => rows,
+            };
+            let rows: Arc<[u32]> = match &job_problems {
+                Some(filter) => rows
+                    .iter()
+                    .copied()
+                    .filter(|&i| filter.keeps(&job_snapshot.rows[i as usize]))
                     .collect(),
                 None => rows,
             };
@@ -1229,6 +1240,12 @@ impl ResourceList {
             )
             .child(state_chip(&self.latest.state, self.latest.feed, theme))
             .child(div().flex_1())
+            .when(problems::ProblemListKind::of(&self.kind).is_some(), |el| {
+                el.child(
+                    problems::toggle_button(self.problems.is_on())
+                        .on_click(registry::on_click(ToggleProblemsOnly)),
+                )
+            })
             .when(wide, |el| {
                 el.child(
                     Button::new("toggle-wide")
@@ -1389,6 +1406,16 @@ impl ResourceList {
                     theme.muted_foreground,
                 ))
             }
+            _ if self.rows.is_empty()
+                && !snapshot.rows.is_empty()
+                && self.problems.is_checked(&self.kind, &self.cluster) =>
+            {
+                Some(message(
+                    format!("No problems found in {label}"),
+                    Some("Turn off Problems to see every row.".to_owned()),
+                    theme.muted_foreground,
+                ))
+            }
             _ if self.rows.is_empty() => {
                 let filtered = !self.query.text.trim().is_empty()
                     || (self.namespaced && !self.query.namespaces.is_empty());
@@ -1503,6 +1530,14 @@ impl ResourceList {
             );
             banners.push(
                 notice("list-problem-filter", text.clone(), theme.info)
+                    .aria_label(text)
+                    .test_support()
+                    .into_any_element(),
+            );
+        }
+        if let Some(text) = self.problems_note() {
+            banners.push(
+                notice(problems::UNCHECKED_BANNER, text.clone(), theme.warning)
                     .aria_label(text)
                     .test_support()
                     .into_any_element(),
@@ -1848,6 +1883,13 @@ mod managed;
 pub mod combined;
 
 #[cfg(any(test, feature = "automation"))]
+#[path = "list_problems.rs"]
+pub(in crate::ui) mod problems;
+
+#[cfg(test)]
+#[path = "list_problems_tests.rs"]
+mod problems_tests;
+
 #[path = "list_state.rs"]
 mod state;
 

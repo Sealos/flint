@@ -11,6 +11,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
+use flint_core::ClusterId;
 use flint_core::combined::{
     CLUSTER_COLUMN, ColumnKey, CombinedCell, CombinedGroup, CombinedLine, CombinedQuery,
     CombinedRowId, CombinedSort, CombinedView, RowRef,
@@ -38,7 +39,8 @@ use super::super::registry::{
     self, CloseDetail, FocusFilter, FocusRows, OpenSelectedRow, SelectFirst, SelectFromFilter,
     SelectLast, SelectNext, SelectPrev,
 };
-use super::{CONTEXT, ROW_HEIGHT, limited_text, state_chip, tabular_figures};
+use super::problems::{self, ClusterProblems, MemberFilter, ProblemFilter, ProblemListKind};
+use super::{CONTEXT, ROW_HEIGHT, limited_text, notice, state_chip, tabular_figures};
 
 /// Selects a row by its cluster and uid, as clicking it does.
 #[derive(Debug, Clone, Default, PartialEq, serde::Deserialize, Action)]
@@ -84,6 +86,11 @@ pub struct ToggleGroupByCluster;
 #[action(namespace = combined_list, no_json)]
 pub struct ToggleCombinedWide;
 
+/// Shows only the rows with problems.
+#[derive(Debug, Clone, Default, PartialEq, Action)]
+#[action(namespace = combined_list, no_json)]
+pub struct ToggleCombinedProblems;
+
 /// The object a selected combined row names, in the row's own cluster.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CombinedObject {
@@ -116,6 +123,7 @@ pub struct CombinedResourceList {
     /// The sort `view` was computed with, which the header's arrow shows.
     pub(in super::super) applied_sort: Option<CombinedSort>,
     pub(in super::super) show_wide: bool,
+    pub(in super::super) problems: ProblemFilter,
     widths: ColumnWidths,
     pub(in super::super) selected: Option<CombinedRowId>,
     selected_line: Option<usize>,
@@ -187,6 +195,7 @@ impl CombinedResourceList {
             },
             applied_sort: None,
             show_wide: false,
+            problems: ProblemFilter::default(),
             widths: ColumnWidths::default(),
             selected: None,
             selected_line: None,
@@ -229,6 +238,7 @@ impl CombinedResourceList {
             .bind::<ToggleClusterGroup>(Self::on_toggle_group)
             .bind::<ToggleGroupByCluster>(Self::on_group_by)
             .bind::<ToggleCombinedWide>(Self::on_wide)
+            .bind::<ToggleCombinedProblems>(Self::on_problems)
     }
 
     /// The list actions it shares with a single-cluster list, forwarded the same way.
@@ -363,8 +373,20 @@ impl CombinedResourceList {
         let cached = self.measured.clone();
         let restart = std::mem::take(&mut self.remeasure);
         let job_source = source.clone();
+        let keep = self.problems.member_filter(
+            source.kind.as_ref(),
+            source.list.members().iter().map(|m| m.cluster()),
+        );
         let job = cx.background_spawn(async move {
-            compute_view(&job_source, &query, selected, seen, cached, unix_now())
+            compute_view(
+                &job_source,
+                &query,
+                keep.as_ref(),
+                selected,
+                seen,
+                cached,
+                unix_now(),
+            )
         });
         self._compute = cx.spawn(async move |this, cx| {
             let computed = job.await;
@@ -618,6 +640,37 @@ impl CombinedResourceList {
         self.drawn = self.layout(self.laid_out_width);
         self.recompute(cx);
         cx.notify();
+    }
+
+    fn on_problems(&mut self, _: &ToggleCombinedProblems, _: &mut Window, cx: &mut Context<Self>) {
+        self.problems.toggle();
+        self.recompute(cx);
+        cx.notify();
+    }
+
+    /// Takes the newest problems of the members.
+    pub fn set_problems(
+        &mut self,
+        values: std::collections::HashMap<ClusterId, ClusterProblems>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.problems.update(values) {
+            if self.problems.is_on() {
+                self.recompute(cx);
+            }
+            cx.notify();
+        }
+    }
+
+    /// Names the members whose problems could not be checked, with the toggle on.
+    pub(in super::super) fn problems_note(&self) -> Option<String> {
+        let kind = self.shown.kind.as_ref()?;
+        let members = self.shown.list.members();
+        self.problems.unchecked_note(
+            kind,
+            &self.label,
+            members.iter().map(|m| (m.cluster(), m.display_name())),
+        )
     }
 
     fn render_lines(
@@ -910,6 +963,17 @@ impl CombinedResourceList {
                         ToggleGroupByCluster,
                     )),
             )
+            .when(
+                self.shown
+                    .kind
+                    .as_ref()
+                    .is_some_and(|kind| ProblemListKind::of(kind).is_some()),
+                |el| {
+                    el.child(problems::toggle_button(self.problems.is_on()).on_click(
+                        registry::on_click_in(self.focus.clone(), ToggleCombinedProblems),
+                    ))
+                },
+            )
             .when(wide, |el| {
                 el.child(
                     Button::new("toggle-wide")
@@ -1096,12 +1160,15 @@ struct Computed {
 fn compute_view(
     source: &CombinedSource,
     query: &CombinedQuery,
+    keep: Option<&MemberFilter>,
     selected: Option<CombinedRowId>,
     seen: Option<RowSeen>,
     cached: Option<MeasuredWidths>,
     now: i64,
 ) -> Computed {
-    let view = source.list.compute(query, now);
+    let view = source.list.compute_where(query, now, |member, row| {
+        keep.is_none_or(|keep| keep.keeps(member, row))
+    });
     // Widths follow the namespaces only, so typing or sorting moves no column.
     let measured = model::measure_scope(source, query, &view, cached, now);
     let tracked = selected
@@ -1212,6 +1279,11 @@ impl Render for CombinedResourceList {
             .child(self.render_toolbar(theme))
             .child(self.render_members(theme))
             .children(self.render_kind_note(theme))
+            .children(self.problems_note().map(|text| {
+                notice(problems::UNCHECKED_BANNER, text.clone(), theme.warning)
+                    .aria_label(text)
+                    .test_support()
+            }))
             .child(body)
     }
 }

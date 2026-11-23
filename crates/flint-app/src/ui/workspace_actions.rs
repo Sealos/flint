@@ -46,9 +46,9 @@ use super::super::registry::{
     SelectNextLine, SelectPrev, SelectPrevLine, SelectRow, SelectText, SetDockHeight,
     SetNamespaces, SetPaneWidth, ShowAll, ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml,
     SortBy, ToggleAnnotations, ToggleCommandPalette, ToggleLabels, ToggleManagedFields,
-    ToggleNamespace, ToggleNavSection, TogglePause, ToggleResourceSwitcher, ToggleSecretValue,
-    ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
-    WatchOpenViewsOnly,
+    ToggleNamespace, ToggleNavSection, TogglePause, ToggleProblemsOnly, ToggleResourceSwitcher,
+    ToggleSecretValue, ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap,
+    UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::super::registry::{
     BackToList, EditAiScope, Handler, ShowAgentActivity, ToggleKeepWatching,
@@ -326,6 +326,11 @@ impl Workspace {
             .when::<OpenSelectedRow>(view_open!(list_wide))
             .when::<FocusFilter>(view_open!(list_wide))
             .when::<ToggleWide>(|ws, cx| list_wide(ws, cx) == Some(true))
+            .when::<ToggleProblemsOnly>(|ws, cx| {
+                ws.list
+                    .as_ref()
+                    .is_some_and(|list| list.read(cx).has_problem_filter())
+            })
             .add::<SelectRow>(view_open!(list_wide), |ws, a, cx| match &ws.list {
                 Some(l) => l.read(cx).check_select_row(a),
                 None => Err(ActionError::unavailable::<SelectRow>()),

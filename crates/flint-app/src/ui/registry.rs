@@ -46,8 +46,8 @@ pub use super::compare::{
     CompareObject, OpenCompare, RefreshCompare, ToggleCompareSame, ToggleCompareVolatile,
 };
 use super::list::combined::{
-    SelectCombinedRow, SortCombined, ToggleClusterFilter, ToggleClusterGroup, ToggleCombinedWide,
-    ToggleGroupByCluster,
+    SelectCombinedRow, SortCombined, ToggleClusterFilter, ToggleClusterGroup,
+    ToggleCombinedProblems, ToggleCombinedWide, ToggleGroupByCluster,
 };
 
 actions!(
@@ -181,6 +181,8 @@ actions!(
         CloseDetail,
         /// Show or hide the extra `-o wide` columns.
         ToggleWide,
+        /// Show only the rows with problems.
+        ToggleProblemsOnly,
         /// Move focus to the list's text filter.
         FocusFilter,
         /// Move focus from the list's text filter back to its rows (Esc or Enter there).
@@ -2520,6 +2522,11 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Show or hide the extra columns of kubectl get -o wide.",
         )
         .of(C::List, S::List),
+        Spec::unit::<ToggleProblemsOnly>(
+            "Toggle Problems Only",
+            "Show only the rows with problems, in a list of pods, workloads or nodes.",
+        )
+        .of(C::List, S::List),
         Spec::unit::<CloseDetail>(
             "Clear Selection",
             "Clear the selection, which closes the detail pane.",
@@ -2631,6 +2638,11 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<ToggleCombinedWide>(
             "Toggle Wide Combined Columns",
             "Show or hide the combined list's extra columns.",
+        )
+        .of(C::List, S::CombinedList),
+        Spec::unit::<ToggleCombinedProblems>(
+            "Toggle Combined Problems Only",
+            "Show only the combined list's rows with problems.",
         )
         .of(C::List, S::CombinedList),
         // Detail pane.

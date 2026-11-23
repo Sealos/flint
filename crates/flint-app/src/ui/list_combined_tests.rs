@@ -167,6 +167,39 @@ fn key(key: &str) -> ColumnKey {
 }
 
 #[gpui_kit::test]
+async fn problems_only_hides_checked_rows_and_keeps_an_unchecked_member(cx: &mut TestAppContext) {
+    use super::super::problems::ClusterProblems;
+    use super::super::problems_tests::checked_with_pod;
+
+    let (_window, list) = open(cx, fixture());
+    list.update(cx, |list, cx| {
+        list.problems.toggle();
+        list.set_problems(
+            std::collections::HashMap::from([
+                ("ctx-prod".to_owned(), checked_with_pod("web", "uid-web")),
+                ("ctx-staging".to_owned(), ClusterProblems::unchecked()),
+            ]),
+            cx,
+        );
+    });
+    let shown = state(cx, &list);
+    assert_eq!(
+        order(&shown),
+        [
+            pair("staging", "api"),
+            pair("staging", "db"),
+            pair("prod", "web"),
+        ]
+    );
+    let note = shown
+        .banners
+        .iter()
+        .find(|banner| banner.id == super::super::problems::UNCHECKED_BANNER)
+        .expect("the unchecked member is named");
+    assert!(note.text.contains("staging") && !note.text.contains("prod"));
+}
+
+#[gpui_kit::test]
 async fn columns_are_the_union_with_blanks(cx: &mut TestAppContext) {
     let (window, list) = open(cx, fixture());
     let shown = state(cx, &list);
@@ -547,7 +580,7 @@ async fn a_key_steps_from_the_selection_in_the_new_view(cx: &mut TestAppContext)
     ])
     .unwrap();
     let query = list.read_with(cx, |list, _| list.query.clone());
-    let computed = super::compute_view(&reordered, &query, None, None, None, 0);
+    let computed = super::compute_view(&reordered, &query, None, None, None, None, 0);
     click(cx, window, "row-ctx-prod/uid-web");
 
     let expected = CombinedRowId {
