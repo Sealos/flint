@@ -1,28 +1,32 @@
 //! The alert decisions over real telemetry snapshots, with time passed in.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use flint_core::alerts::AlertEvent;
+use flint_core::alerts::{AlertEvent, AlertSummary};
 use flint_core::dashboard::{ProblemSnapshot, ProblemSummariser};
 use flint_core::discovery::ClusterDiscovery;
 use flint_core::handle::{ClusterSummary, ConnectionState};
 use flint_core::kubeconfig::ContextInfo;
-use flint_core::problems::{Classifier, Problem, ProblemKind};
-use flint_core::settings::WatchMode;
+use flint_core::problems::{Classifier, Problem, ProblemKind, ProblemSeverity};
+use flint_core::settings::{AiScope, WatchMode, set_ai_exposed, set_ai_scope};
 use flint_core::telemetry::{
     Availability, KindCheck, MetricsCheck, TelemetrySnapshot, WatchedKind,
 };
+use gpui_kit::{AppContext as _, ClipboardItem, TestAppContext};
 use jiff::Timestamp;
 use k8s_openapi::api::core::v1::{Node, NodeCondition, NodeStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
+use super::super::support_tests::{open_workspace, standard_sections};
 use super::{
-    ALL_KINDS, AlertOrigin, AlertTracker, Delivery, Discovered, MAX_RECENT, Reading, TrackerInput,
-    check_origin, menu_row, out_of_scope_kinds, reading, send_batch, verified_discovery,
+    ALL_KINDS, AlertCenter, AlertOrigin, AlertTracker, Delivery, Discovered, MAX_RECENT,
+    MutedClusters, Reading, SettingsDir, TrackerInput, check_origin, menu_row, out_of_scope_kinds,
+    reading, send_batch, verified_discovery,
 };
-use crate::notifications::{DeliveryError, Notification, NotificationSender};
+use crate::notifications::{DeliveryError, FreedesktopSender, Notification, NotificationSender};
 
 const PROD: &str = "prod";
 const SERVER: &str = "https://prod.example:6443";
@@ -503,6 +507,76 @@ fn a_cancelled_batch_stops_before_its_next_submission() {
     );
     assert_eq!(answers.len(), 1);
     assert_eq!(sender.sent.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_cluster_turned_off_and_on_keeps_its_batch_cancelled() {
+    let prod = connected(PROD);
+    let mut tracker = tracker();
+    let batch = vec![raised(&mut tracker, &prod, "n1")];
+    let mut muted = MutedClusters::default();
+    let since = muted.turned_off.clone();
+
+    let (off, back_on) = muted.set(HashSet::from([PROD.to_owned()]));
+    assert_eq!((off, back_on), (vec![PROD.to_owned()], false));
+    let (off, back_on) = muted.set(HashSet::new());
+    assert!(off.is_empty() && back_on);
+
+    let sender = CountingSender::default();
+    let answers = send_batch(&sender, &batch, || true, |c| muted.blocks(c, &since));
+    assert!(answers.is_empty());
+    assert_eq!(sender.sent.load(Ordering::SeqCst), 0);
+
+    // A batch started after it came back on sends.
+    let since = muted.turned_off.clone();
+    let answers = send_batch(&sender, &batch, || true, |c| muted.blocks(c, &since));
+    assert_eq!(answers.len(), 1);
+}
+
+#[gpui_kit::test]
+async fn a_scope_narrowed_during_activation_stops_the_prompt(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    cx.run_until_parked();
+    let whole = AiScope::default();
+    let exposed = set_ai_exposed(&t.dir, "kind-alpha", Some(&t.server), &whole).unwrap();
+    let model = t.model.clone();
+    let center = cx.update(|cx| {
+        cx.set_global(SettingsDir(t.dir.clone()));
+        cx.write_to_clipboard(ClipboardItem::new_string("before".to_owned()));
+        cx.new(|cx| AlertCenter::new(model, Arc::new(FreedesktopSender), cx))
+    });
+    t.model
+        .update(cx, |model, _| model.settings = Arc::new(exposed));
+    let tag = center.update(cx, |center, cx| {
+        let summary = center.model.read(cx).active_cluster().unwrap().clone();
+        let event = AlertEvent::Summary(AlertSummary {
+            cluster: Arc::from("kind-alpha"),
+            new: 2,
+            resolved: 0,
+            untracked: 0,
+            highest: Some(ProblemSeverity::Critical),
+        });
+        let input = TrackerInput {
+            cluster: Arc::from("kind-alpha"),
+            origin: AlertOrigin::of(&summary),
+            label: "kind-alpha".to_owned(),
+            reading: Reading::Muted,
+        };
+        center.tracker.record(event, &input).tag
+    });
+
+    center.update(cx, |center, cx| center.investigate(&tag, cx));
+    let narrowed = AiScope {
+        namespaces: vec!["shop".to_owned()],
+        ..AiScope::default()
+    };
+    set_ai_scope(&t.dir, "kind-alpha", &t.server, &whole, &narrowed).unwrap();
+    cx.run_until_parked();
+
+    let copied = cx.read_from_clipboard().and_then(|item| item.text());
+    assert_eq!(copied.as_deref(), Some("before"));
 }
 
 #[test]

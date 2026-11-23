@@ -7,7 +7,7 @@
 //! a sentence, so the prompt labels every value as data.
 
 use flint_core::alerts::{Alert, AlertEvent, AlertSubject, AlertSummary};
-use flint_core::problems::ProblemSeverity;
+use flint_core::problems::{ProblemKind, ProblemSeverity};
 use flint_core::read::{DiscoveredKinds, KindInfo};
 use flint_core::settings::{AiExposureState, AiScope, Settings};
 use flint_mcp::policy;
@@ -131,6 +131,17 @@ impl<'a> Target<'a> {
         }
         let resolved = policy::resolve_scope_kinds(scope, kinds, incomplete);
         !policy::kinds_in_scope(&resolved.scope, std::slice::from_ref(kind)).is_empty()
+    }
+
+    /// Whether `scope` also lets agents read this object's Pods, in its namespace.
+    fn pods_in_scope(&self, scope: &AiScope, kinds: &[KindInfo], incomplete: &[String]) -> bool {
+        let pods = Target {
+            group: "",
+            kind: "Pod",
+            ..*self
+        };
+        pods.resolve(kinds, incomplete)
+            .is_some_and(|kind| pods.in_scope(scope, kind, kinds, incomplete))
     }
 
     fn is_quotable(&self) -> bool {
@@ -287,10 +298,24 @@ pub fn investigate_prompt(
     if !target.in_scope(&scope, kind, &discovered.kinds, &incomplete) {
         return InvestigatePrompt::Disabled(DisabledReason::OutOfScope);
     }
+    if comes_from_pods(alert.key.kind)
+        && !target.pods_in_scope(&scope, &discovered.kinds, &incomplete)
+    {
+        return InvestigatePrompt::Disabled(DisabledReason::OutOfScope);
+    }
     if !is_identifier(&alert.cluster) || !target.is_quotable() {
         return InvestigatePrompt::Disabled(DisabledReason::UnsafeName);
     }
     InvestigatePrompt::Ready(render(alert, &target))
+}
+
+/// Whether this kind of problem is read from Pods, so that its summary and count are facts about
+/// Pods even when the alert names their owner.
+fn comes_from_pods(kind: ProblemKind) -> bool {
+    match kind {
+        ProblemKind::CrashLoop | ProblemKind::OomKilled | ProblemKind::ImagePull => true,
+        ProblemKind::NodeNotReady | ProblemKind::JobFailed | ProblemKind::WorkloadShort => false,
+    }
 }
 
 fn render(alert: &Alert, target: &Target<'_>) -> String {
@@ -329,7 +354,7 @@ mod tests {
     use std::sync::Arc;
 
     use flint_core::alerts::AlertKey;
-    use flint_core::problems::{ProblemKind, ProblemOwner};
+    use flint_core::problems::ProblemOwner;
     use flint_core::settings::AiExposure;
 
     use super::*;
@@ -346,6 +371,13 @@ mod tests {
             affected: 2,
             summary: "Container keeps crashing",
         }
+    }
+
+    /// An alert read from the workload itself, not from its Pods.
+    fn short_on(cluster: &str, subject: AlertSubject) -> Alert {
+        let mut alert = alert_on(cluster, subject);
+        alert.key.kind = ProblemKind::WorkloadShort;
+        alert
     }
 
     fn deployment(namespace: &str, name: &str) -> AlertSubject {
@@ -598,12 +630,46 @@ mod tests {
     fn objects_inside_the_scope_are_ready() {
         let alert = alert_on("prod", deployment("shop", "api"));
         ready(&alert, &exposed("prod", &["shop"], &[]));
-        ready(&alert, &exposed("prod", &["shop"], &["deployments.apps"]));
+        ready(
+            &alert,
+            &exposed("prod", &["shop"], &["deployments.apps", "pods"]),
+        );
+        let short = short_on("prod", deployment("shop", "api"));
+        ready(&short, &exposed("prod", &["shop"], &["deployments.apps"]));
+    }
+
+    #[test]
+    fn pod_facts_need_pods_in_scope_even_through_their_owner() {
+        for kind in [
+            ProblemKind::CrashLoop,
+            ProblemKind::OomKilled,
+            ProblemKind::ImagePull,
+        ] {
+            for subject in [deployment("shop", "api"), widget()] {
+                let mut alert = alert_on("prod", subject);
+                alert.key.kind = kind;
+                let owner_only = exposed("prod", &[], &["deployments.apps", "widgets.example.com"]);
+                assert_eq!(
+                    reason(&alert, &owner_only, Some(SERVER)),
+                    DisabledReason::OutOfScope,
+                    "{kind:?}"
+                );
+                ready(
+                    &alert,
+                    &exposed(
+                        "prod",
+                        &[],
+                        &["deployments.apps", "widgets.example.com", "pods"],
+                    ),
+                );
+            }
+        }
     }
 
     #[test]
     fn a_node_needs_naming_under_a_namespace_scope() {
-        let alert = alert_on("prod", AlertSubject::Node { name: "n1".into() });
+        let mut alert = alert_on("prod", AlertSubject::Node { name: "n1".into() });
+        alert.key.kind = ProblemKind::NodeNotReady;
         assert_eq!(
             reason(&alert, &exposed("prod", &["shop"], &[]), Some(SERVER)),
             DisabledReason::OutOfScope
@@ -613,7 +679,7 @@ mod tests {
 
     #[test]
     fn hand_written_kinds_resolve_as_the_mcp_server_resolves_them() {
-        let alert = alert_on("prod", deployment("shop", "api"));
+        let alert = short_on("prod", deployment("shop", "api"));
         for written in ["deploy", "Deployment", "deployments.apps"] {
             ready(&alert, &exposed("prod", &["shop"], &[written]));
         }
@@ -625,7 +691,7 @@ mod tests {
 
     #[test]
     fn a_custom_controller_follows_the_scope() {
-        let alert = alert_on("prod", widget());
+        let alert = short_on("prod", widget());
         ready(&alert, &exposed("prod", &["shop"], &[]));
         ready(&alert, &exposed("prod", &[], &["widgets.example.com"]));
         assert_eq!(
