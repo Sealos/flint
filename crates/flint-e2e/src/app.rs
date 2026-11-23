@@ -64,6 +64,13 @@ const ANSWER: Duration = Duration::from_secs(60);
 const QUIT_ANSWER: Duration = Duration::from_secs(2);
 /// The title of the question Quit asks while a session would end (#177).
 const QUIT_DIALOG: &str = "Quit Flint?";
+/// How long a stalled app has to answer the teardown's quit check before the check fails.
+const QUIT_CHECK: Duration = Duration::from_secs(15);
+/// How long the app has to exit once it took the quit.
+const QUIT_EXIT: Duration = Duration::from_secs(5);
+/// How long an app that failed the check has to shut down: its own limit after stdin closes
+/// (three seconds) and a margin.
+const SHUT_DOWN: Duration = Duration::from_secs(4);
 
 /// The exit code of a test build whose automation channel refused to start.
 pub const REFUSED_EXIT_CODE: i32 = 3;
@@ -568,8 +575,7 @@ impl App {
     fn abandon(&mut self) {
         self.stdin.take();
         if let Some(mut child) = self.child.take() {
-            kill_group(&child);
-            let _ = child.kill();
+            force_kill(&mut child, &[]);
             let _ = child.wait();
         }
     }
@@ -728,72 +734,240 @@ impl App {
         let Some(mut child) = self.child.take() else {
             bail!("the app was already stopped");
         };
-        if child.try_wait()?.is_none() {
-            // The app may quit before it answers.
-            let _ = self.request_within(
-                "dispatch_action",
-                json!({"name": "flint::Quit"}),
-                QUIT_ANSWER,
-            );
-            // Quit asks first while a shell runs or a log tab follows (#177). Confirm only that
-            // question, read off the open dialog's title: any other dialog is a bug to report,
-            // not one to click through.
-            let mut unexpected = None;
-            let mut confirmed = false;
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while child.try_wait()?.is_none() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(50));
-                if confirmed {
-                    continue;
-                }
-                // The app may quit while it answers.
-                let Ok(state) = self.request_within("state", Value::Null, QUIT_ANSWER) else {
-                    continue;
-                };
-                match state["dialog"]["title"].as_str() {
-                    None => {}
-                    Some(QUIT_DIALOG) => {
-                        let _ = self.request_within(
-                            "dispatch_action",
-                            json!({"name": "ui::Confirm"}),
-                            QUIT_ANSWER,
-                        );
-                        confirmed = true;
-                    }
-                    Some(other) => {
-                        eprintln!("App::stop: Quit left an unexpected dialog open: {other:?}");
-                        unexpected = Some(other.to_owned());
-                        break;
-                    }
-                }
-            }
-            if let Some(title) = unexpected {
-                self.stdin.take();
-                kill_group(&child);
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("quitting left an unexpected dialog open: {title:?}");
-            }
+        if is_running(&mut child)
+            && let Err(problem) = self.quit_checked(&mut child)
+        {
+            self.shut_down(&mut child);
+            bail!("{problem}");
         }
         // Closing stdin also tells the app to go.
         self.stdin.take();
-        if child.try_wait()?.is_none() {
-            kill_group(&child);
-            let _ = child.kill();
+        if is_running(&mut child) {
+            force_kill(&mut child, &[]);
         }
         Ok(child.wait()?)
     }
+
+    /// Quits through [`quit_unless_dialog`](Self::quit_unless_dialog) and waits for the app to
+    /// exit. Fails on a dialog the test left open, or if the app never answered and is still
+    /// running: an app that could not be inspected does not count as clear.
+    fn quit_checked(&self, child: &mut Child) -> Result<(), String> {
+        let mut deadline = Instant::now() + QUIT_CHECK;
+        let mut no_answer = None;
+        let mut asked = false;
+        let mut confirmed = false;
+        while is_running(child) && Instant::now() < deadline {
+            // Quit asks first while a shell runs or a log tab follows (#177). Confirm only that
+            // question, read off the open dialog's title: any other dialog is a bug to report,
+            // not one to click through.
+            let dialog = if !asked {
+                // A request that timed out may still run. That is safe: it quits only with no
+                // dialog open, so the app exiting afterwards means there was none.
+                match self.quit_unless_dialog() {
+                    Ok(dialog) => {
+                        asked = true;
+                        no_answer = None;
+                        deadline = Instant::now() + QUIT_EXIT;
+                        dialog
+                    }
+                    Err(error) => {
+                        no_answer = Some(format!("{}: {}", error.code, error.message));
+                        None
+                    }
+                }
+            } else if confirmed {
+                None
+            } else {
+                // The app may quit while it answers.
+                self.request_within("state", Value::Null, QUIT_ANSWER)
+                    .ok()
+                    .and_then(|state| state["dialog"]["title"].as_str().map(str::to_owned))
+            };
+            match dialog.as_deref() {
+                None => {}
+                Some(QUIT_DIALOG) => {
+                    let _ = self.request_within(
+                        "dispatch_action",
+                        json!({"name": "ui::Confirm"}),
+                        QUIT_ANSWER,
+                    );
+                    confirmed = true;
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "the teardown found an unexpected dialog open: {other:?}"
+                    ));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        match no_answer {
+            Some(error) if is_running(child) => Err(format!(
+                "the teardown could not check the app for open dialogs: {error}"
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Has the app quit unless a dialog is open, in one step on its side. Answers with the open
+    /// dialog's title.
+    fn quit_unless_dialog(&self) -> Result<Option<String>, AppError> {
+        const CMD: &str = "quit_unless_dialog";
+        let line = self.request_line(CMD, &Value::Null);
+        let answer = exchange_by(&self.socket, &line, QUIT_ANSWER)
+            .map_err(|e| self.error("transport", format!("{CMD}: {e}"), None))?;
+        let result = self.response(CMD, &answer)?;
+        Ok(result["dialog"].as_str().map(str::to_owned))
+    }
+
+    /// Ends an app that failed the quit check: closing stdin lets it cancel its work, for at most
+    /// [`SHUT_DOWN`]. Whatever it started that is still running is then killed.
+    fn shut_down(&mut self, child: &mut Child) {
+        let groups = child_groups(child.id());
+        self.stdin.take();
+        let deadline = Instant::now() + SHUT_DOWN;
+        while is_running(child) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if is_running(child) {
+            force_kill(child, &groups);
+        } else {
+            kill_groups(&groups);
+        }
+        let _ = child.wait();
+    }
 }
 
-/// SIGKILLs the child's process group (the child leads it: `process_group(0)`).
-fn kill_group(child: &Child) {
+/// Whether the child has not exited. A child that cannot be polled counts as gone: `wait` then
+/// reports the error.
+fn is_running(child: &mut Child) -> bool {
+    matches!(child.try_wait(), Ok(None))
+}
+
+/// A process group the app started, such as an exec credential plugin's: those run outside the
+/// app's own group, so killing that one misses them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChildGroup {
+    id: libc::pid_t,
+    /// When its leader started, to tell it from a later process given the same id.
+    started: String,
+}
+
+/// One line of `ps`.
+#[derive(Debug, PartialEq, Eq)]
+struct Process {
+    pid: libc::pid_t,
+    ppid: libc::pid_t,
+    pgid: libc::pid_t,
+    started: String,
+}
+
+/// Every process, or none if `ps` fails: this runs during cleanup, which must carry on.
+fn processes() -> Vec<Process> {
+    // One `-o` each: in `-o a=,b=` the first column's header would be the rest of the argument.
+    let listed = Command::new("ps")
+        .args([
+            "-A", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "lstart=",
+        ])
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    listed.map_or_else(
+        |_| Vec::new(),
+        |ps| parse_processes(&String::from_utf8_lossy(&ps.stdout)),
+    )
+}
+
+fn parse_processes(listing: &str) -> Vec<Process> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid = fields.next()?.parse().ok()?;
+            let pgid = fields.next()?.parse().ok()?;
+            let started = fields.collect::<Vec<_>>().join(" ");
+            Some(Process {
+                pid,
+                ppid,
+                pgid,
+                started,
+            })
+        })
+        .collect()
+}
+
+/// The groups led by a direct child of `app`.
+fn groups_of(processes: &[Process], app: libc::pid_t) -> Vec<ChildGroup> {
+    processes
+        .iter()
+        .filter(|p| p.ppid == app && p.pid == p.pgid && p.pid > 1 && p.pid != app)
+        .map(|p| ChildGroup {
+            id: p.pid,
+            started: p.started.clone(),
+        })
+        .collect()
+}
+
+fn child_groups(app: u32) -> Vec<ChildGroup> {
+    libc::pid_t::try_from(app).map_or_else(|_| Vec::new(), |app| groups_of(&processes(), app))
+}
+
+/// The groups still safe to signal: a process now leading the id with another start time is not
+/// the one recorded. A group whose leader is gone keeps its id while any member lives.
+fn still_ours<'a>(groups: &'a [ChildGroup], processes: &[Process]) -> Vec<&'a ChildGroup> {
+    groups
+        .iter()
+        .filter(|group| {
+            processes
+                .iter()
+                .find(|p| p.pid == group.id)
+                .is_none_or(|leader| leader.started == group.started)
+        })
+        .collect()
+}
+
+/// SIGKILLs `groups`, skipping any whose id now belongs to something else.
+fn kill_groups(groups: &[ChildGroup]) {
+    if groups.is_empty() {
+        return;
+    }
+    for group in still_ours(groups, &processes()) {
+        // SAFETY: killpg only sends a signal, to a group the app started.
+        unsafe {
+            libc::killpg(group.id, libc::SIGKILL);
+        }
+    }
+}
+
+/// SIGKILLs the app's process group (the child leads it: `process_group(0)`) and the groups it
+/// started, `known` included. The app is stopped first: it cannot start or reap a plugin while
+/// they are listed, so each id listed is still that plugin's.
+fn force_kill(child: &mut Child, known: &[ChildGroup]) {
     let Ok(pid) = libc::pid_t::try_from(child.id()) else {
+        let _ = child.kill();
         return;
     };
-    // SAFETY: killpg only sends a signal; the group is the child's own.
-    unsafe {
-        libc::killpg(pid, libc::SIGKILL);
+    // Only while it is unreaped is the id still the app's group.
+    if is_running(child) {
+        // SAFETY: killpg only sends a signal; the group is the child's own.
+        unsafe {
+            libc::killpg(pid, libc::SIGSTOP);
+        }
+        let mut groups = known.to_vec();
+        for group in child_groups(child.id()) {
+            if !groups.contains(&group) {
+                groups.push(group);
+            }
+        }
+        kill_groups(&groups);
+        // SAFETY: as above. SIGKILL also ends a stopped process.
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL);
+        }
     }
+    let _ = child.kill();
 }
 
 /// The teardown's violations, as a failure says them.
@@ -1018,6 +1192,41 @@ mod tests {
         let answer = exchange_by(&path, "second", ANSWER).unwrap();
         assert_eq!(answer, "answer\n");
         peer.join().unwrap();
+    }
+
+    #[test]
+    fn only_groups_led_by_the_apps_children_are_killed() {
+        let listing = "\
+            1 0 1 Mon Nov 23 10:00:00 2026\n\
+            100 1 100 Mon Nov 23 10:00:01 2026\n\
+            200 100 200 Mon Nov 23 10:00:02 2026\n\
+            201 200 200 Mon Nov 23 10:00:03 2026\n\
+            300 100 100 Mon Nov 23 10:00:04 2026\n\
+            400 1 400 Mon Nov 23 10:00:05 2026\n\
+            not a process\n";
+        let processes = parse_processes(listing);
+        assert_eq!(processes.len(), 6);
+        let groups = groups_of(&processes, 100);
+        assert_eq!(
+            groups,
+            [ChildGroup {
+                id: 200,
+                started: "Mon Nov 23 10:00:02 2026".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_group_id_given_to_another_process_is_left_alone() {
+        let group = |id, started: &str| ChildGroup {
+            id,
+            started: started.into(),
+        };
+        let groups = [group(200, "then"), group(201, "then"), group(202, "then")];
+        // 200 is still the plugin, 201 is another process now, and 202's leader is gone.
+        let now = parse_processes("200 1 200 then\n201 1 201 later\n203 1 202 then\n");
+        let kept: Vec<_> = still_ours(&groups, &now).iter().map(|g| g.id).collect();
+        assert_eq!(kept, [200, 202]);
     }
 
     #[test]
