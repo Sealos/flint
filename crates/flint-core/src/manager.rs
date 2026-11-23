@@ -15,7 +15,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 use crate::activity;
 use crate::cluster::{self, CONNECT_TIMEOUT, ClusterId, ServerVersion};
 use crate::connection::member::{Member, ServerIdentity};
-use crate::credential::WriteCredential;
+use crate::credential::{CredentialSource, WriteCredential};
 use crate::discovery::ClusterDiscovery;
 use crate::handle::{
     ClusterSummary, ClustersSnapshot, Command, ConnectionState, CoreConfig, Event, Request,
@@ -39,7 +39,7 @@ mod file_watch;
 mod running_set;
 
 use crate::connection::member::{AttemptOutcome, MemberEvent};
-use crate::connection::policy::{CredentialAccess, ForegroundOnly, Role};
+use crate::connection::policy::{CredentialAccess, CredentialLease, ForegroundOnly, Role};
 use crate::connection::schedule::{AttemptId, Schedule};
 use file_watch::{FileWatcher, WatchScope};
 #[cfg(test)]
@@ -73,6 +73,9 @@ pub(crate) struct Cluster {
     /// The command permission of the latest connection or attempt. Each attempt gets its own,
     /// and the one it replaces is revoked, so a client outliving its slot can't regain it.
     access: CredentialAccess,
+    /// The latest attempt's use of a credential that runs a command, if it began allowed to. Once
+    /// ended, that attempt's result says nothing about the cluster, success or error.
+    attempt_lease: Option<CredentialLease>,
     /// The running set's attempt that the connection in progress answers.
     member_attempt: Option<AttemptId>,
     /// The latest attempt whose credential was refused, so its failure means signing in.
@@ -142,6 +145,7 @@ impl Cluster {
             attempt: 0,
             connect_task: None,
             access: CredentialAccess::new(Arc::new(ForegroundOnly), Role::Foreground),
+            attempt_lease: None,
             member_attempt: None,
             rejected_attempt: None,
             reconnect: false,
@@ -1299,6 +1303,10 @@ impl ClusterManager {
                 slot.connect_task = None;
                 let member_attempt = slot.member_attempt.take();
                 let rejected = slot.rejected_attempt.take() == Some(attempt);
+                let lease_ended = slot
+                    .attempt_lease
+                    .take()
+                    .is_some_and(|lease| !lease.holds());
                 // Dropped either way: the load that ends the pause connects again.
                 if paused {
                     slot.access.revoke();
@@ -1313,11 +1321,13 @@ impl ClusterManager {
                     self.finish_member_attempt(&cluster, member_attempt, outcome, Instant::now());
                     return;
                 }
-                // Its lease ended while it was being made (switched away and back): it could
-                // never authenticate. It is dropped, and the current selection connects anew.
-                if result
-                    .as_ref()
-                    .is_ok_and(|(connection, _)| connection.credential.spent())
+                // Its lease ended while it was being made (switched away and back), so what it
+                // returned, an error included, is no answer about the cluster. It is dropped, and
+                // the current selection connects anew under a new grant.
+                if lease_ended
+                    || result
+                        .as_ref()
+                        .is_ok_and(|(connection, _)| connection.credential.spent())
                 {
                     slot.clear_connection();
                     slot.attempt = 0;
@@ -2124,6 +2134,7 @@ impl ClusterManager {
         let attempt = self.next_attempt;
         let paused = self.paused(id);
         let role = self.connection_role(id);
+        let runs_a_command = self.definition_runs_a_command(id);
         let unbound = self.members.contains_key(id)
             && self.cluster(id).is_some_and(|slot| {
                 slot.member_attempt.is_none()
@@ -2158,11 +2169,17 @@ impl ClusterManager {
         };
         slot.attempt = attempt;
         slot.reconnect = false;
+        // This attempt answers the wait, so the load that ended it must not reset the state.
+        slot.awaiting_confirmation = false;
         slot.state = ConnectionState::Connecting;
         slot.client = None;
         slot.write_credential = None;
         slot.access.revoke();
         slot.access = CredentialAccess::new(Arc::new(ForegroundOnly), role);
+        // One denied from the start reports that denial, which is a real answer.
+        slot.attempt_lease = runs_a_command
+            .then(|| slot.access.grant(CredentialSource::Plugin).lease())
+            .filter(CredentialLease::holds);
         let access = slot.access.clone();
         let cluster = id.to_owned();
         self.emit(Event::ConnectionChanged {
@@ -2740,7 +2757,6 @@ fn keep_skipped_groups(
 mod tests {
     use super::*;
     use crate::connection::member::MemberState;
-    use crate::credential::CredentialSource;
 
     // covers UP-20, UP-22
     #[test]
@@ -6623,6 +6639,104 @@ mod tests {
         assert!(matches!(slot.state, ConnectionState::Connecting));
         assert_ne!(slot.attempt, attempt, "a new attempt");
         assert_eq!(manager.next_attempt, attempt + 2, "exactly one");
+    }
+
+    // A selected member waiting on a same-server fallback with another credential: the load that
+    // confirms the fallback starts its attempt, and nothing resets it into a second one.
+    #[tokio::test]
+    async fn confirming_a_fallback_starts_one_attempt_for_a_selected_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = kubeconfig_with("https://127.0.0.1:1")
+            .replace("user: {}", "user:\n    token: fallback");
+        let (mut manager, _, first) = pausable(dir.path(), &fallback).await;
+        join_dev(&mut manager);
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(manager.paused("dev"));
+        manager.activate("dev".to_owned());
+        assert!(manager.cluster("dev").unwrap().awaiting_confirmation);
+        let next = manager.next_attempt;
+
+        rewrite_file(&mut manager, &first, NO_CONTEXTS).await;
+
+        assert!(!manager.paused("dev") && manager.members.contains_key("dev"));
+        assert_eq!(manager.next_attempt, next + 1, "exactly one attempt");
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Connecting));
+        assert_eq!(slot.attempt, next, "the first attempt still runs");
+        assert!(slot.member_attempt.is_some() && !slot.awaiting_confirmation);
+    }
+
+    /// Starts `dev`'s attempt, then switches away and back before it reports. Returns the attempt.
+    async fn switched_away_and_back_while_connecting(manager: &mut ClusterManager) -> u64 {
+        manager.active = Some("dev".to_owned());
+        manager.sync_roles();
+        manager.ensure_connected("dev");
+        let attempt = manager.cluster("dev").unwrap().attempt;
+        manager.select("other");
+        manager.activate("dev".to_owned());
+        let slot = manager.cluster("dev").unwrap();
+        assert_eq!(slot.attempt, attempt, "reselecting starts nothing yet");
+        assert!(matches!(slot.state, ConnectionState::Connecting));
+        attempt
+    }
+
+    // An attempt whose lease ended fails because of that, which says nothing about the cluster:
+    // the error is dropped and the selection connects by itself under a new grant.
+    #[tokio::test]
+    async fn an_error_from_a_revoked_attempt_reconnects_the_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("provider.sh");
+        std::fs::write(
+            &script,
+            "printf '{\"token\":\"t\",\"expiry\":\"2020-01-01T00:00:00Z\"}'\n",
+        )
+        .unwrap();
+        let provider = format!(
+            "user:\n    auth-provider:\n      name: gcp\n      config:\n        cmd-path: /bin/sh\n        \
+             cmd-args: {}\n        token-key: '{{.token}}'\n        expiry-key: '{{.expiry}}'\n",
+            script.display()
+        );
+        let yaml = kubeconfig_with("https://127.0.0.1:1").replace("user: {}\n", &provider);
+        let mut manager = manager_reading_two(dir.path(), &yaml, NO_CONTEXTS).await;
+        let attempt = switched_away_and_back_while_connecting(&mut manager).await;
+        let old_access = manager.cluster("dev").unwrap().access.clone();
+
+        manager
+            .handle_internal(Internal::Connected {
+                cluster: "dev".into(),
+                attempt,
+                result: Err(cluster::SafeErrorText::fixed("not allowed")),
+            })
+            .await;
+
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Connecting));
+        assert_ne!(slot.attempt, attempt, "a new attempt");
+        assert_eq!(manager.next_attempt, attempt + 2, "exactly one");
+        let fresh = slot.access.grant(CredentialSource::AuthProvider);
+        assert!(fresh.allowed(), "the new attempt has a new grant");
+        assert!(!old_access.grant(CredentialSource::AuthProvider).allowed());
+    }
+
+    // A credential that runs nothing has no lease to lose, so its error is the cluster's.
+    #[tokio::test]
+    async fn an_error_without_a_command_credential_stays_after_a_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://127.0.0.1:1");
+        let mut manager = manager_reading_two(dir.path(), &yaml, NO_CONTEXTS).await;
+        let attempt = switched_away_and_back_while_connecting(&mut manager).await;
+
+        manager
+            .handle_internal(Internal::Connected {
+                cluster: "dev".into(),
+                attempt,
+                result: Err(cluster::SafeErrorText::fixed("refused")),
+            })
+            .await;
+
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Failed(_)));
+        assert_eq!(manager.next_attempt, attempt + 1, "no retry");
     }
 
     // covers UP-06: once the broken file is valid without the context, it is gone.
