@@ -952,6 +952,9 @@ impl ClusterManager {
             Request::AdmitRunningSet { pins, reply } => {
                 let _ = reply.send(self.admit_running_set(pins));
             }
+            Request::OpenRunningSet { pins, reply } => {
+                let _ = reply.send(self.open_running_set(pins));
+            }
             Request::CheckMember { member, reply } => {
                 let _ = reply.send(self.member_changed(&member));
             }
@@ -6174,6 +6177,101 @@ users:
         assert_eq!(manager.members.len(), 2);
         assert_eq!(admitted[0].server(), "https://remote-a");
         assert_eq!(manager.member_changed(&admitted[0]), None);
+    }
+
+    /// `dev` and `other` in a first file, then a file that can break, then `third`.
+    async fn manager_with_a_late_member(dir: &Path) -> (ClusterManager, PathBuf) {
+        let paths = [dir.join("first"), dir.join("middle"), dir.join("last")];
+        let third = "apiVersion: v1\nkind: Config\nclusters:\n- name: t\n  cluster:\n    server: \
+                     https://third\nusers:\n- name: v\n  user: {}\ncontexts:\n- name: third\n  \
+                     context:\n    cluster: t\n    user: v\n";
+        std::fs::write(&paths[0], kubeconfig_with("https://remote-a")).unwrap();
+        std::fs::write(&paths[1], "apiVersion: v1\nkind: Config\n").unwrap();
+        std::fs::write(&paths[2], third).unwrap();
+        let (events, _rx) = crate::events::channel();
+        let config = CoreConfig {
+            config_dir: PathBuf::from("/nonexistent"),
+            settings: Settings::default(),
+            settings_error: None,
+            kubeconfig_base: paths.to_vec(),
+            home: None,
+            watch_files: false,
+            watch_timing: Default::default(),
+        };
+        let mut manager = ClusterManager::new(
+            config,
+            events,
+            HubRegistry::default(),
+            SessionUnlocks::default(),
+        );
+        manager.reload_kubeconfig().await;
+        let [_, middle, _] = paths;
+        (manager, middle)
+    }
+
+    fn late_member_pins() -> Vec<crate::settings::ClusterPin> {
+        use crate::settings::ClusterPin;
+        vec![
+            ClusterPin::new("dev", "https://remote-a"),
+            ClusterPin::new("other", "https://other"),
+            ClusterPin::new("third", "https://third"),
+        ]
+    }
+
+    // A member turning provisional after a front end looked costs only that member.
+    #[tokio::test]
+    async fn opening_a_set_leaves_out_a_provisional_member_and_sends_it_nothing() {
+        use crate::handle::{LeftOutMember, LeftOutReason};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, middle) = manager_with_a_late_member(dir.path()).await;
+        rewrite_file(&mut manager, &middle, UNREADABLE).await;
+        assert!(manager.unsettled("third") && !manager.paused("third"));
+
+        let opened = manager.open_running_set(late_member_pins()).unwrap();
+        let admitted: Vec<&str> = opened.members.iter().map(|m| m.context()).collect();
+        assert_eq!(admitted, ["dev", "other"]);
+        assert_eq!(
+            opened.left_out,
+            [LeftOutMember {
+                context: "third".to_owned(),
+                reason: LeftOutReason::Provisional,
+            }]
+        );
+        assert!(!manager.members.contains_key("third"));
+        let third = manager.cluster("third").unwrap();
+        assert!(third.connect_task.is_none() && third.client.is_none());
+        assert!(matches!(third.state, ConnectionState::Disconnected));
+    }
+
+    // The minimum counts members admitted, and the exact-server check still applies.
+    #[tokio::test]
+    async fn opening_a_set_with_too_few_eligible_members_changes_nothing() {
+        use crate::handle::LeftOutReason;
+        use crate::settings::ClusterPin;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, middle) = manager_with_a_late_member(dir.path()).await;
+        let running = vec![
+            ClusterPin::new("dev", "https://remote-a"),
+            ClusterPin::new("other", "https://other"),
+        ];
+        manager.admit_running_set(running).unwrap();
+        rewrite_file(&mut manager, &middle, UNREADABLE).await;
+
+        let opened = manager
+            .open_running_set(vec![
+                ClusterPin::new("dev", "https://replacement"),
+                ClusterPin::new("other", "https://other"),
+                ClusterPin::new("third", "https://third"),
+            ])
+            .unwrap();
+        assert!(opened.members.is_empty());
+        let reasons: Vec<_> = opened.left_out.iter().map(|m| m.reason).collect();
+        assert_eq!(
+            reasons,
+            [LeftOutReason::Changed, LeftOutReason::Provisional]
+        );
+        assert_eq!(manager.members.len(), 2, "the running set stays");
+        assert!(manager.members.contains_key("dev"));
     }
 
     // Moved and put back, a member's reads stay refused: it is not the connection admitted.
