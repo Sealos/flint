@@ -12,6 +12,7 @@
 #![cfg(target_os = "macos")]
 
 mod access;
+mod activity;
 mod exec_plugins;
 mod harness;
 mod load;

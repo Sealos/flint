@@ -152,10 +152,47 @@ pub enum Command {
     /// Set the MiB each log session's lines may take and write it to `settings.toml`. Sessions
     /// opened afterwards use it. The change arrives back as `Event::SettingsChanged`.
     SetLogBufferMib(u32),
+    /// Keep exactly these clusters (2 to 5, or none to clear) connected and watched beside the
+    /// active one. Each reports its connection as [`Event::ConnectionChanged`], and
+    /// [`CoreHandle::running_set`] says more. Removed members' watches stop. A list that cannot
+    /// be a set changes nothing and is reported as [`Event::Error`]. Grants no write access.
+    SetRunningSet(Vec<ClusterId>),
+}
+
+/// What a member of the running set is doing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberStatus {
+    Connecting,
+    Live,
+    /// Its watches lost contact and none has synced again.
+    Reconnecting {
+        error: crate::SafeErrorText,
+    },
+    /// Not retried until the cluster is selected.
+    SignInNeeded {
+        reason: crate::SafeErrorText,
+    },
+    /// Retried after a backoff.
+    Failed {
+        error: crate::SafeErrorText,
+    },
+}
+
+/// One member of the running set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberReport {
+    pub cluster: ClusterId,
+    pub status: MemberStatus,
+    /// A kubeconfig file that defines it can't be read: what runs goes on and nothing new starts.
+    pub paused: bool,
 }
 
 /// Requests that carry a reply channel or come from a [`Subscription`].
 pub(crate) enum Request {
+    /// Each member of the running set and its state.
+    RunningSet {
+        reply: oneshot::Sender<Vec<MemberReport>>,
+    },
     /// Reload the kubeconfig files, and say when that is done.
     ReloadKubeconfig {
         reply: oneshot::Sender<bool>,
@@ -259,6 +296,10 @@ pub enum ConnectionState {
     Connected(ServerVersion),
     /// Why it failed, as safe to show ([`crate::cluster::ClusterError::summary`]).
     Failed(crate::SafeErrorText),
+    /// Paused with no connection: the core starts none until a kubeconfig file that may define
+    /// this cluster can be read. Nothing went wrong with the connection, and the load that ends
+    /// the pause clears this. A context that is not paused never shows it.
+    AwaitingConfirmation,
 }
 
 /// A cluster as the sidebar shows it.
@@ -280,6 +321,13 @@ pub struct ClusterSummary {
     /// A load confirmed the server shown. Otherwise it may be a fallback, showing only while a
     /// kubeconfig file before it can't be read.
     pub confirmed: bool,
+    /// A kubeconfig file that can't be read could still change this definition, so the write gate
+    /// refuses every write. Not the opposite of `confirmed`: a confirmed server can be provisional
+    /// again while a file is unreadable.
+    pub provisional: bool,
+    /// The core starts nothing new on this context: its definition differs from the confirmed
+    /// one, or only an unreadable file still defines it. A first-seen context is never paused.
+    pub paused: bool,
 }
 
 /// What the core's answer to a reload means: `None` when it stopped without answering.
@@ -383,6 +431,7 @@ pub struct CoreHandle {
     hubs: HubRegistry,
     next_subscription: Arc<AtomicU64>,
     unlocks: SessionUnlocks,
+    holds: crate::recheck::DefinitionHolds,
     log_budget: Arc<crate::logs::LogBudget>,
     access: Arc<crate::access::AccessCache>,
     runtime: tokio::runtime::Handle,
@@ -409,6 +458,7 @@ impl CoreHandle {
         let unlocks = SessionUnlocks::default();
         let manager = ClusterManager::new(config, event_tx, hubs.clone(), unlocks.clone());
         let log_budget = manager.log_budget();
+        let holds = manager.definition_holds();
         runtime.spawn(manager.run(cmd_rx, req_rx));
         Ok(Self {
             commands: cmd_tx,
@@ -417,11 +467,20 @@ impl CoreHandle {
             hubs,
             next_subscription: Arc::new(AtomicU64::new(1)),
             unlocks,
+            holds,
             log_budget,
             access: Arc::default(),
             runtime: runtime.handle().clone(),
             _runtime: Arc::new(RuntimeGuard(Some(runtime))),
         })
+    }
+
+    /// Each member of the running set and its state, in kubeconfig order. Empty if the core
+    /// stopped.
+    pub fn running_set(&self) -> impl Future<Output = Vec<MemberReport>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.requests.try_send(Request::RunningSet { reply });
+        async move { rx.await.unwrap_or_default() }
     }
 
     /// Opens a live list of `kind` on `cluster`. While the subscription lives, the kind is
@@ -824,6 +883,11 @@ impl CoreHandle {
     /// The session's unlocks, for showing each cluster's [`crate::Protection`].
     pub fn unlocks(&self) -> &SessionUnlocks {
         &self.unlocks
+    }
+
+    /// Which contexts the core holds now, for showing. The write gate does not read this.
+    pub fn definition_holds(&self) -> &crate::recheck::DefinitionHolds {
+        &self.holds
     }
 
     /// Lists the pods of a workload (or a label selector) in `namespace` on a connected

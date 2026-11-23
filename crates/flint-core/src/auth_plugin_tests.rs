@@ -1101,6 +1101,33 @@ fn a_retry_ends_the_rest_of_its_own_cluster_only() {
 
 // covers UP-03: a refresh's own result is used, even a token that already expires within the
 // refresh margin (as kube does): the margin only decides when to refresh.
+// The last check is the one made at the spawn itself, past every earlier wait.
+#[tokio::test]
+async fn a_lease_ended_before_the_spawn_starts_no_plugin() {
+    let plugin = FakePlugin::new("echo run >> \"$0.runs\"\n");
+    let exec = ExecConfig {
+        command: Some(plugin.path().display().to_string()),
+        interactive_mode: Some(ExecInteractiveMode::Never),
+        ..ExecConfig::default()
+    };
+    let access = CredentialAccess::new(
+        std::sync::Arc::new(crate::connection::policy::ForegroundOnly),
+        crate::connection::policy::Role::Foreground,
+    );
+    let lease = access.grant(CredentialSource::Plugin).lease();
+    access.set_role(crate::connection::policy::Role::Background);
+
+    let mut started = false;
+    let result = run(&exec, &lease, std::future::ready(Acquired::None), || {
+        started = true
+    })
+    .await;
+
+    assert!(matches!(result, Err(ref error) if is_not_allowed(error)));
+    assert!(!started);
+    assert!(!plugin.dir.path().join("plugin.runs").exists());
+}
+
 #[tokio::test]
 async fn a_refreshed_token_is_used_even_when_it_expires_soon() {
     let plugin = FakePlugin::new(

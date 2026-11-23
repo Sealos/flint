@@ -146,6 +146,12 @@ impl<K: Eq> Schedule<K> {
         Some(now.max(stagger.unwrap_or(now)).max(slot.unwrap_or(now)))
     }
 
+    /// How many admission slots are held.
+    #[cfg(test)]
+    pub fn slots_in_use(&self) -> usize {
+        self.slots.len()
+    }
+
     fn new_attempt(&mut self) -> AttemptId {
         let attempt = AttemptId(self.next_attempt);
         self.next_attempt += 1;

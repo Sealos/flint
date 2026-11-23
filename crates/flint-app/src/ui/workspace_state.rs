@@ -17,7 +17,7 @@ use super::super::view_state::{
     KubeconfigPath, KubeconfigState, Level, Main, MenuEntryState, MenuState, connection_error_text,
     error_text,
 };
-use super::{Workspace, header_controls, namespace_summary, watch_mode_label};
+use super::{Workspace, header_controls, namespace_button_text, watch_mode_label};
 
 impl Workspace {
     /// What the window shows now, as data.
@@ -106,6 +106,7 @@ impl Workspace {
             Some(ConnectionState::Failed(e)) => Main::Failed {
                 error: connection_error_text(e),
             },
+            Some(ConnectionState::AwaitingConfirmation) => Main::AwaitingConfirmation,
             Some(_) if list.is_some() => Main::List,
             Some(ConnectionState::Connected(v)) => Main::Connected {
                 version: v.git_version.clone(),
@@ -125,7 +126,9 @@ impl Workspace {
             }
             HeaderState {
                 breadcrumb,
-                namespace_button: controls.namespaces.then(|| namespace_summary(&filter)),
+                namespace_button: controls
+                    .namespaces
+                    .then(|| namespace_button_text(&filter, list.and_then(|l| l.limited_to()))),
                 namespaces: filter,
                 watch_mode: controls
                     .watch_mode

@@ -1135,19 +1135,18 @@ impl DetailView {
     fn render_edit_message(&self, theme: &Theme) -> Option<AnyElement> {
         let edit = self.edit.as_ref()?;
         let conflict = matches!(edit.phase, edit::Phase::Conflict);
+        let competing = edit.competing_warning();
+        let warned = conflict || competing.is_some();
         let text = match (&edit.error, conflict) {
             (Some(error), _) => error.clone(),
+            (None, false) if competing.is_some() => competing?,
             (None, true) => "This object changed since you opened it, so nothing was applied. Reload keeps your \
              edit and shows its diff against the current object, including any change it would \
              undo."
                 .to_owned(),
             (None, false) => return None,
         };
-        let color = if conflict {
-            theme.warning
-        } else {
-            theme.danger
-        };
+        let color = if warned { theme.warning } else { theme.danger };
         // Wrapped, not a one-line notice: it can be a server's whole rejection.
         Some(
             div()
@@ -1160,6 +1159,9 @@ impl DetailView {
                 .border_color(color)
                 .text_xs()
                 .text_color(theme.foreground)
+                // Every overwritten path stays reachable, and the editor keeps its room.
+                .max_h(px(120.))
+                .overflow_y_scroll()
                 .child(text)
                 .into_any_element(),
         )

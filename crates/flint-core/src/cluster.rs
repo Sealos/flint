@@ -526,12 +526,13 @@ pub(crate) async fn connect_gated_with_policy(
             .as_ref()
             .and_then(|layer| credential::GuardedProvider::guarding(layer, &lease));
         still_held()?;
-        let read = build_client(
+        let read = build_observed_client(
             &config,
             token.clone(),
             auth.as_deref(),
             guarded.as_ref(),
             Access::ReadOnly,
+            Some(&grant),
         )?;
         still_held()?;
         let write = build_client(
@@ -714,16 +715,28 @@ fn http_connector() -> hyper_util::client::legacy::connect::HttpConnector {
 /// supported, as before. `token` is the refreshing token of an exec auth plugin
 /// ([`crate::auth_plugin::resolve_with_grant`]), set after kube's auth layer. `guarded`, if any,
 /// stands in for `auth` on requests, because `auth` could run a command a role may forbid.
-#[expect(
-    clippy::disallowed_types,
-    reason = "the one place that assembles a client"
-)]
 fn build_client(
     config: &kube::Config,
     token: Option<crate::auth_plugin::RefreshingToken>,
     auth: Option<&kube::client::middleware::AuthLayer>,
     guarded: Option<&credential::GuardedProvider>,
     access: Access,
+) -> Result<Client, kube::Error> {
+    build_observed_client(config, token, auth, guarded, access, None)
+}
+
+/// [`build_client`], telling `observer` of each 401 the server answers.
+#[expect(
+    clippy::disallowed_types,
+    reason = "the one place that assembles a client"
+)]
+fn build_observed_client(
+    config: &kube::Config,
+    token: Option<crate::auth_plugin::RefreshingToken>,
+    auth: Option<&kube::client::middleware::AuthLayer>,
+    guarded: Option<&credential::GuardedProvider>,
+    access: Access,
+    observer: Option<&CredentialGrant>,
 ) -> Result<Client, kube::Error> {
     use kube::client::ConfigExt;
     use kube::client::retry::RetryPolicy;
@@ -757,6 +770,14 @@ fn build_client(
                 .default_retry
                 .then(|| RetryLayer::new(ReadRetry(RetryPolicy::server_retry()))),
         )
+        .option_layer(observer.cloned().map(|grant| {
+            tower::util::MapResponseLayer::new(move |response: http::Response<_>| {
+                if response.status() == http::StatusCode::UNAUTHORIZED {
+                    grant.note_refused();
+                }
+                response
+            })
+        }))
         // A write's checked credential goes out as it is, with no auth layer resolving another.
         .service(credential::AuthUnlessBound {
             authed,
@@ -820,6 +841,7 @@ pub async fn connect_and_check(
 
 /// As [`connect_and_check`], for a cluster the app manages: with the client that can write,
 /// closed behind the write gate.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn connect_gated_and_check(
     kubeconfig: &Kubeconfig,
     context: &str,
@@ -829,7 +851,8 @@ pub(crate) async fn connect_gated_and_check(
     connect_gated_and_check_with_policy(kubeconfig, context, timeout, &access).await
 }
 
-/// As [`connect_gated_and_check`], with `access` deciding whether the credential may run.
+/// As [`connect_and_check`], for a cluster the app manages: with the client that can write, closed
+/// behind the write gate, and `access` deciding whether the credential may run.
 pub(crate) async fn connect_gated_and_check_with_policy(
     kubeconfig: &Kubeconfig,
     context: &str,
