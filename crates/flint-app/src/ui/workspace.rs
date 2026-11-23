@@ -703,7 +703,7 @@ impl Workspace {
         let opening = match &key {
             TabKey::Logs(_) => Opening::ReconnectLogs,
             TabKey::Shell(_) => Opening::RestartShell,
-            TabKey::Activity(_) => return,
+            TabKey::Activity(_) | TabKey::Compare(..) => return,
         };
         let check = self.model.read(cx).core().check_member(&member);
         self.sets.restart = cx.spawn_in(window, async move |this, cx| {
@@ -731,7 +731,7 @@ impl Workspace {
             TabKey::Logs(_) => Opening::ReconnectLogs,
             TabKey::Shell(_) => Opening::RestartShell,
             // Runs no session to start again.
-            TabKey::Activity(_) => return,
+            TabKey::Activity(_) | TabKey::Compare(..) => return,
         };
         if let Some(reason) = self.sessions_blocked(key.context(), cx) {
             self.refuse(refused(opening, &reason), cx);
@@ -771,7 +771,9 @@ impl Workspace {
                         DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
                     }
                     // It returned above: an activity tab has no session to start again.
-                    TabKey::Activity(_) => unreachable!("activity tabs do not restart"),
+                    TabKey::Activity(_) | TabKey::Compare(..) => {
+                        unreachable!("these tabs do not restart")
+                    }
                 },
                 window,
                 cx,
@@ -869,7 +871,7 @@ impl Workspace {
             // the endpoint changes. Agent activity depends on neither.
             TabKey::Shell(_) => summary.map_or(0, |c| c.definition),
             TabKey::Logs(_) => summary.map_or(0, |c| c.endpoint),
-            TabKey::Activity(_) => 0,
+            TabKey::Activity(_) | TabKey::Compare(..) => 0,
         };
         TabCluster::new(context, self.shown_server(context, cx).as_deref()).defined_by(definition)
     }
@@ -1261,11 +1263,9 @@ impl Workspace {
         let list = cx.new(|cx| {
             ResourceList::new(core, cluster.clone(), entry, namespaces, sort, window, cx)
         });
-        let deletable = self.kind_deletable(&cluster, &entry.id, cx);
-        if row_menu::has_row_actions(&entry.id, deletable) {
-            let menu = row_menu::row_menu(cx.weak_entity());
-            list.update(cx, |list, _| list.set_row_menu(menu));
-        }
+        // Every kind: any object can be compared, and a menu with no entries never shows.
+        let menu = row_menu::row_menu(cx.weak_entity());
+        list.update(cx, |list, _| list.set_row_menu(menu));
         self._list_subscriptions = vec![cx.subscribe_in(&list, window, Self::on_list_event)];
         if take_focus {
             let focus = list.read(cx).focus_handle().clone();

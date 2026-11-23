@@ -131,17 +131,21 @@ async fn the_active_cluster_shows_reconnecting_until_a_watch_recovers(cx: &mut T
     .await;
     t.activate(cx, "kind-alpha").await;
 
+    // The three listed kinds, and the telemetry feed's own typed watch of each kind it follows.
+    const VIEW_WATCHES: usize = 3;
+    let expected_watches = VIEW_WATCHES + flint_core::telemetry::WatchedKind::ALL.len();
     let model = t.model.clone();
     cx.wait_for(t.window, WAIT, |_, cx| {
         let states = model.read(cx).core().sync_states("kind-alpha");
-        api.open_watches() == 3
+        api.open_watches() >= expected_watches
             && states
                 .iter()
                 .filter(|(_, state)| state.is_current())
                 .count()
-                == 3
+                == VIEW_WATCHES
     })
     .await;
+    assert_eq!(api.open_watches(), expected_watches, "no extra watch");
     assert_eq!(presence(&state(cx, &t), "kind-alpha"), "live");
 
     for (down, status, tooltip) in [

@@ -8,8 +8,8 @@ use flint_core::dashboard::ProblemCategory;
 use flint_core::metrics::MetricsError;
 use flint_core::metrics_trend::{TrendResource, TrendScope, TrendStore};
 use flint_core::telemetry::{
-    Availability, FailureCause, KindCheck, MetricsCheck, Telemetry, TelemetrySnapshot,
-    TelemetryTiming, WatchedKind, start_for_tests,
+    Availability, FailureCause, KindCheck, MetricsCheck, SideReads, Telemetry, TelemetrySnapshot,
+    TelemetryTiming, UsageRead, WatchedKind, start_for_tests,
 };
 use flint_core::{ProblemKind, ProblemSubject};
 use flint_e2e::fake_api::{CONTEXT, FakeApiServer, FakePod, Fault, Gvr, Options, Verb, WatchStep};
@@ -131,24 +131,55 @@ async fn it_reads_only_the_watched_kinds_and_metrics() {
         checked(s) && matches!(s.metrics, MetricsCheck::Current { .. })
     })
     .await;
+    tokio::time::timeout(WAIT, async {
+        while !polls_answered(&feed.side_reads()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("every poll answers");
     feed.stop().await;
 
-    let allowed: Vec<String> = watched_gvrs()
+    let events = Gvr::core("events").collection_path(None);
+    let polled = [
+        Gvr::core("persistentvolumeclaims").collection_path(None),
+        "/apis/metrics.k8s.io/v1beta1/pods".to_owned(),
+        "/apis/metrics.k8s.io/v1beta1/nodes".to_owned(),
+    ];
+    let watched: Vec<String> = watched_gvrs()
         .iter()
         .map(|gvr| gvr.collection_path(None))
-        .chain([
-            "/version".to_owned(),
-            "/apis/metrics.k8s.io/v1beta1/nodes".to_owned(),
-        ])
+        .chain(["/version".to_owned()])
         .collect();
-    for request in server.requests() {
+    let requests = server.requests();
+    for request in &requests {
         assert_eq!(request.method, "GET", "{}", request.path);
-        assert!(
-            allowed.contains(&request.path),
-            "unexpected read of {}",
-            request.path
-        );
+        if request.path == events {
+            assert_eq!(request.verb, Verb::List, "{request}");
+            assert_eq!(
+                request.parsed_query().field_selector.as_deref(),
+                Some("type=Warning"),
+                "{request}"
+            );
+        } else if polled.contains(&request.path) {
+            assert_eq!(request.verb, Verb::List, "{request}");
+        } else {
+            assert!(
+                watched.contains(&request.path),
+                "unexpected read of {}",
+                request.path
+            );
+        }
     }
+    assert!(requests.iter().any(|r| r.path == events));
+}
+
+/// Whether the polled reads have each succeeded once.
+fn polls_answered(reads: &SideReads) -> bool {
+    reads.warning_events.current().is_some()
+        && reads.pending_claims.current().is_some()
+        && matches!(reads.pod_usage, UsageRead::Current(_))
+        && matches!(reads.node_usage, UsageRead::Current(_))
 }
 
 #[tokio::test]

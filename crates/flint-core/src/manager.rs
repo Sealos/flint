@@ -37,6 +37,7 @@ use crate::write::WriteError;
 
 mod file_watch;
 mod running_set;
+mod telemetry;
 
 use crate::connection::member::{AttemptOutcome, MemberEvent};
 use crate::connection::policy::{CredentialAccess, CredentialLease, ForegroundOnly, Role};
@@ -101,6 +102,8 @@ pub(crate) struct Cluster {
     /// Discoveries that failed in a row, for the retry backoff.
     discovery_failures: u32,
     watches: ClusterWatches,
+    /// The telemetry feed on this slot's connection ([`ClusterManager::sync_telemetry`]).
+    telemetry: Option<telemetry::SlotFeed>,
     /// Follows the CRD list while the cluster is active.
     crd_task: Option<JoinHandle<()>>,
     /// Follows the namespace list while the cluster is active, for namespace-limited lists.
@@ -157,6 +160,7 @@ impl Cluster {
             discovery_retries: 0,
             discovery_failures: 0,
             watches,
+            telemetry: None,
             crd_task: None,
             namespaces_task: None,
             namespace_filter: Vec::new(),
@@ -166,6 +170,7 @@ impl Cluster {
 
     /// Ends the slot's connection and its permission to run a credential command.
     fn clear_connection(&mut self) {
+        self.telemetry = None;
         self.watches.set_source(None);
         self.client = None;
         self.write_credential = None;
@@ -489,6 +494,9 @@ pub(crate) struct ClusterManager {
     log_sessions: HashMap<u64, JoinHandle<()>>,
     /// The memory budget all log sessions share (`log_total_mib`).
     log_budget: Arc<logs::LogBudget>,
+    /// The running telemetry feeds, as the front end reads them.
+    telemetry: crate::telemetry::TelemetryBoard,
+    telemetry_timing: crate::telemetry::TelemetryTiming,
     /// The clusters the user unlocked for this session, shared with the front end (ADR-0015).
     unlocks: SessionUnlocks,
     /// Contexts the last load did not show, listed only because a file that defined them can't
@@ -506,6 +514,11 @@ impl ClusterManager {
     /// The log sessions' shared budget, for [`crate::LogSession::set_shown`].
     pub(crate) fn log_budget(&self) -> Arc<logs::LogBudget> {
         self.log_budget.clone()
+    }
+
+    /// The running telemetry feeds, for [`crate::CoreHandle::telemetry`].
+    pub(crate) fn telemetry_board(&self) -> crate::telemetry::TelemetryBoard {
+        self.telemetry.clone()
     }
 
     /// The published holds, for [`crate::CoreHandle::definition_holds`].
@@ -551,6 +564,8 @@ impl ClusterManager {
             subscriptions: HashMap::new(),
             log_sessions: HashMap::new(),
             log_budget,
+            telemetry: Default::default(),
+            telemetry_timing: Default::default(),
             unlocks,
             held: HashSet::new(),
             settled: SettledDefinitions::default(),
@@ -591,6 +606,7 @@ impl ClusterManager {
                 Ok(request) = requests.recv() => self.handle_request(request),
                 Some(msg) = internal_rx.recv() => self.handle_internal(msg).await,
             }
+            self.sync_telemetry();
         }
     }
 
@@ -876,7 +892,64 @@ impl ClusterManager {
                     }
                 });
             }
+            Request::FetchPinnedObject {
+                cluster,
+                pin,
+                kind,
+                namespace,
+                name,
+                reply,
+            } => {
+                // In one step with taking the client, which a paused cluster doesn't give.
+                if let Some(why) = self.read_pin_changed(&cluster, &pin) {
+                    let _ = reply.send(Err(why));
+                    return;
+                }
+                let Some(client) = self.client(&cluster) else {
+                    let _ = reply.send(Err(format!("\"{cluster}\" is not connected")));
+                    return;
+                };
+                let info = self
+                    .cluster(&cluster)
+                    .and_then(|c| c.discovery.as_ref())
+                    .and_then(|d| d.kind(&kind).cloned());
+                let Some(info) = info else {
+                    let _ = reply.send(Err(format!("\"{cluster}\" does not serve {kind}")));
+                    return;
+                };
+                let target = cluster::Target::of(&self.kubeconfig.merged, &cluster);
+                tokio::spawn(async move {
+                    let mut reply = reply;
+                    let read = read::object_only(
+                        &client,
+                        &info,
+                        namespace.as_deref(),
+                        &name,
+                        read::DETAIL_TIMEOUT,
+                    );
+                    // Whoever asked is gone: stop the request, and start none if it is already.
+                    tokio::select! {
+                        biased;
+                        () = reply.closed() => {}
+                        result = read => {
+                            let result = result
+                                .map(Arc::new)
+                                .map_err(|e| e.for_target(&target).summary().to_string());
+                            let _ = reply.send(result);
+                        }
+                    }
+                });
+            }
         }
+    }
+
+    /// Why `cluster` is no longer what `pin` was taken from, if so.
+    fn read_pin_changed(&self, cluster: &str, pin: &crate::handle::ReadPin) -> Option<String> {
+        let slot = self.cluster(cluster)?;
+        let server = slot.info.server.as_deref();
+        let same = server == pin.server.as_deref()
+            && self.contexts.shown(cluster, server).definition == pin.definition;
+        (!same).then(|| format!("\"{cluster}\" changed since this view opened."))
     }
 
     fn watched_kinds(&self, cluster: &str) -> Vec<(KindId, crate::store::Feed)> {
@@ -2239,6 +2312,7 @@ impl ClusterManager {
         slot.attempt = attempt;
         slot.reconnect = false;
         slot.state = ConnectionState::Connecting;
+        slot.telemetry = None;
         slot.client = None;
         slot.write_credential = None;
         slot.access.revoke();
@@ -2567,7 +2641,8 @@ impl ClusterManager {
         }
         discarded.extend(old.values().filter_map(|slot| slot.member_attempt));
         // Dropped only when this load ends, and their clients must stop before anything else.
-        for slot in old.values() {
+        for slot in old.values_mut() {
+            slot.telemetry = None;
             slot.access.revoke();
         }
         for attempt in discarded {
@@ -2585,6 +2660,8 @@ impl ClusterManager {
             self.members.remove(id);
             self.schedule.dequeue(id);
         }
+        // Before anything reports this load, so no context is shown paused with a feed running.
+        self.stop_unwanted_telemetry();
         self.arm_set_ticker();
         self.sync_roles();
         self.drop_spent_connections();
@@ -5125,6 +5202,163 @@ mod tests {
             git_version: "v1.30.0".into(),
             platform: "linux/arm64".into(),
         }
+    }
+
+    /// Brings the feeds in line, as the manager's loop does after each message, and says whether
+    /// `dev` has one.
+    fn dev_has_feed(manager: &mut ClusterManager) -> bool {
+        manager.sync_telemetry();
+        let feed = manager.cluster("dev").unwrap().telemetry.is_some();
+        assert_eq!(manager.telemetry.get("dev").is_some(), feed);
+        feed
+    }
+
+    #[test]
+    fn only_a_user_with_a_token_file_counts_as_reading_one() {
+        let config = kube::config::Kubeconfig::from_yaml(
+            "
+apiVersion: v1
+kind: Config
+contexts:
+- name: file
+  context: {cluster: c, user: with-file}
+- name: inline
+  context: {cluster: c, user: with-token}
+users:
+- name: with-file
+  user: {tokenFile: /nonexistent/token}
+- name: with-token
+  user: {token: abc}
+",
+        )
+        .unwrap();
+        assert!(telemetry::reads_token_file(&config, "file"));
+        assert!(!telemetry::reads_token_file(&config, "inline"));
+        assert!(!telemetry::reads_token_file(&config, "missing"));
+    }
+
+    // covers UP-25: On view watches only open views, so the feed follows the cluster's mode.
+    #[tokio::test]
+    async fn a_feed_runs_only_in_watch_mode_all() {
+        use crate::settings::WatchMode;
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager =
+            manager_reading(dir.path(), &kubeconfig_with("https://127.0.0.1:1")).await;
+        land_connection(&mut manager).await;
+        manager.active = Some("dev".to_owned());
+        assert!(dev_has_feed(&mut manager), "the default mode");
+
+        manager.settings = Arc::new(Settings {
+            watch_mode: WatchMode::OnView,
+            ..Settings::default()
+        });
+        assert!(!dev_has_feed(&mut manager), "on view by default");
+
+        manager.settings = Arc::new(Settings {
+            watch_mode: WatchMode::OnView,
+            cluster_watch_mode: [("dev".to_owned(), WatchMode::All)].into(),
+            ..Settings::default()
+        });
+        assert!(dev_has_feed(&mut manager), "all for this cluster");
+
+        manager.settings = Arc::new(Settings {
+            cluster_watch_mode: [("dev".to_owned(), WatchMode::OnView)].into(),
+            ..Settings::default()
+        });
+        assert!(!dev_has_feed(&mut manager), "on view for this cluster");
+    }
+
+    #[tokio::test]
+    async fn a_feed_runs_only_for_a_wanted_connected_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager =
+            manager_reading(dir.path(), &kubeconfig_with("https://127.0.0.1:1")).await;
+        assert!(!dev_has_feed(&mut manager), "not connected");
+
+        land_connection(&mut manager).await;
+        assert!(!dev_has_feed(&mut manager), "connected but not wanted");
+
+        manager.active = Some("dev".to_owned());
+        assert!(dev_has_feed(&mut manager), "selected");
+        let first = manager.cluster("dev").unwrap().attempt;
+
+        manager.active = Some("other".to_owned());
+        assert!(!dev_has_feed(&mut manager), "switched away");
+
+        join_dev(&mut manager);
+        assert!(dev_has_feed(&mut manager), "a running-set member");
+
+        land_connection(&mut manager).await;
+        assert_ne!(manager.cluster("dev").unwrap().attempt, first);
+        assert!(dev_has_feed(&mut manager), "follows the new connection");
+
+        manager.cluster_mut("dev").unwrap().clear_connection();
+        assert!(manager.cluster("dev").unwrap().telemetry.is_none());
+        manager.cluster_mut("dev").unwrap().state = ConnectionState::Disconnected;
+        assert!(!dev_has_feed(&mut manager), "disconnected");
+    }
+
+    #[tokio::test]
+    async fn a_pause_stops_the_feed() {
+        for second in pauses() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut manager, _, first) = pausable(dir.path(), &second).await;
+            manager.active = Some("dev".to_owned());
+            land_connection(&mut manager).await;
+            assert!(dev_has_feed(&mut manager));
+
+            rewrite_file(&mut manager, &first, UNREADABLE).await;
+            assert!(manager.paused("dev"));
+            // The load itself stopped it, ahead of the loop's next sync.
+            assert!(manager.cluster("dev").unwrap().telemetry.is_none());
+            assert!(manager.telemetry.get("dev").is_none());
+            assert!(!dev_has_feed(&mut manager));
+        }
+    }
+
+    #[tokio::test]
+    async fn no_feed_is_left_after_a_context_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager =
+            manager_reading(dir.path(), &kubeconfig_with("https://127.0.0.1:1")).await;
+        manager.active = Some("dev".to_owned());
+        land_connection(&mut manager).await;
+        assert!(dev_has_feed(&mut manager));
+
+        rewrite(&mut manager, dir.path(), NO_CONTEXTS).await;
+        assert!(manager.cluster("dev").is_none());
+        assert!(manager.telemetry.get("dev").is_none());
+        assert!(manager.telemetry.all().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_background_member_whose_sign_in_runs_a_program_has_no_feed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager =
+            manager_reading(dir.path(), &kubeconfig_with("https://127.0.0.1:1")).await;
+        manager.active = Some("other".to_owned());
+        join_dev(&mut manager);
+        manager.sync_roles();
+        land_connection(&mut manager).await;
+        assert!(dev_has_feed(&mut manager), "a static credential may run");
+
+        command_credential(&mut manager);
+        assert!(!dev_has_feed(&mut manager));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_command_credential_has_no_feed_even_when_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager =
+            manager_reading(dir.path(), &kubeconfig_with("https://127.0.0.1:1")).await;
+        manager.active = Some("dev".to_owned());
+        manager.sync_roles();
+        land_connection(&mut manager).await;
+        command_credential(&mut manager);
+        assert!(dev_has_feed(&mut manager));
+
+        manager.cluster("dev").unwrap().access.revoke();
+        assert!(!dev_has_feed(&mut manager));
     }
 
     /// Makes `dev` a member of the running set, joined for the server it has now.

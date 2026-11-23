@@ -280,6 +280,15 @@ pub(crate) enum Request {
         member: Option<AdmittedMember>,
         reply: oneshot::Sender<Result<Arc<ObjectDetail>, String>>,
     },
+    /// One object, no events, refused unless the context still matches `pin`.
+    FetchPinnedObject {
+        cluster: ClusterId,
+        pin: ReadPin,
+        kind: KindId,
+        namespace: Option<String>,
+        name: String,
+        reply: oneshot::Sender<Result<Arc<ObjectDetail>, String>>,
+    },
     Discovery {
         cluster: ClusterId,
         reply: oneshot::Sender<Option<Arc<ClusterDiscovery>>>,
@@ -400,6 +409,25 @@ pub struct ClusterSummary {
     pub paused: bool,
 }
 
+impl ClusterSummary {
+    /// What a read opened on this cluster now stays pinned to.
+    pub fn read_pin(&self) -> ReadPin {
+        ReadPin {
+            definition: self.definition,
+            server: self.info.server.clone(),
+        }
+    }
+}
+
+/// A context's identity when a read-only view opened on it: its confirmed definition and exact
+/// server. A move changes the definition even if a later reload puts the server back. Grants
+/// nothing on the write path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadPin {
+    pub definition: u64,
+    pub server: Option<String>,
+}
+
 /// What the core's answer to a reload means: `None` when it stopped without answering.
 fn reload_outcome(applied: Option<bool>) -> Result<(), ReloadError> {
     match applied {
@@ -503,6 +531,7 @@ pub struct CoreHandle {
     unlocks: SessionUnlocks,
     holds: crate::recheck::DefinitionHolds,
     log_budget: Arc<crate::logs::LogBudget>,
+    telemetry: crate::telemetry::TelemetryBoard,
     access: Arc<crate::access::AccessCache>,
     /// Set by [`Self::bound_to`]: one-off reads go only to this member.
     bound: Option<Arc<AdmittedMember>>,
@@ -530,6 +559,7 @@ impl CoreHandle {
         let unlocks = SessionUnlocks::default();
         let manager = ClusterManager::new(config, event_tx, hubs.clone(), unlocks.clone());
         let log_budget = manager.log_budget();
+        let telemetry = manager.telemetry_board();
         let holds = manager.definition_holds();
         runtime.spawn(manager.run(cmd_rx, req_rx));
         Ok(Self {
@@ -541,6 +571,7 @@ impl CoreHandle {
             unlocks,
             holds,
             log_budget,
+            telemetry,
             access: Arc::default(),
             bound: None,
             runtime: runtime.handle().clone(),
@@ -554,6 +585,23 @@ impl CoreHandle {
         let (reply, rx) = oneshot::channel();
         let _ = self.requests.try_send(Request::RunningSet { reply });
         async move { rx.await.unwrap_or_default() }
+    }
+
+    /// What the running feed of `cluster` knows. `None` while it has no feed: it is neither
+    /// selected nor in the running set, is not connected, is paused, or its sign-in runs a program
+    /// and it is in the background. Never blocks.
+    pub fn telemetry(&self, cluster: &str) -> Option<crate::telemetry::ClusterTelemetry> {
+        self.telemetry.get(cluster)
+    }
+
+    /// [`Self::telemetry`] of every cluster with a running feed, by cluster name.
+    pub fn all_telemetry(&self) -> Vec<crate::telemetry::ClusterTelemetry> {
+        self.telemetry.all()
+    }
+
+    /// Wakes when any cluster's telemetry changes, or a feed starts or stops.
+    pub fn telemetry_updates(&self) -> crate::telemetry::TelemetryUpdates {
+        self.telemetry.updates()
     }
 
     /// Opens a live list of `kind` on `cluster`. While the subscription lives, the kind is
@@ -691,6 +739,35 @@ impl CoreHandle {
             if let Some(refused) = refused {
                 return Err(refused);
             }
+            if sent.is_err() {
+                return Err("the core is not running".to_owned());
+            }
+            rx.await
+                .unwrap_or_else(|_| Err("the core stopped before answering".to_owned()))
+        }
+    }
+
+    /// Fetches one object and nothing else (no events), only while `cluster` is not paused and is
+    /// still the definition `pin` was taken from. The core checks that as it takes the client, so
+    /// a refused read sends no request. Starts no connection. Works on any executor.
+    pub fn fetch_pinned_object(
+        &self,
+        cluster: &str,
+        pin: &ReadPin,
+        kind: &KindId,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> impl Future<Output = Result<Arc<ObjectDetail>, String>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let sent = self.requests.try_send(Request::FetchPinnedObject {
+            cluster: cluster.to_owned(),
+            pin: pin.clone(),
+            kind: kind.clone(),
+            namespace: namespace.map(str::to_owned),
+            name: name.to_owned(),
+            reply,
+        });
+        async move {
             if sent.is_err() {
                 return Err("the core is not running".to_owned());
             }
