@@ -255,7 +255,17 @@ fn open_dialog(
                 |this, (focus, state)| this.footer(gated_footer(&dialog, state, focus, cx)),
             )
             .on_ok(move |_, window, cx| {
-                !gate.as_ref().is_some_and(|gate| gate(cx).blocked) && on_ok(window, cx)
+                if gate.as_ref().is_some_and(|gate| gate(cx).blocked) {
+                    return false;
+                }
+                let before = window.focused(cx);
+                if on_ok(window, cx) {
+                    close_returning_focus(before, window, cx);
+                }
+                // Closed above, or kept open. Answering `true` would close it through the
+                // dialog's deferred path, which puts focus back after the exit animation, over
+                // whatever received it meanwhile.
+                false
             })
     });
     // The dialog took focus as it opened: hand it on to the description.
@@ -264,6 +274,18 @@ fn open_dialog(
     }
     // Whether the text overflows is known once it is laid out.
     window.on_next_frame(|window, _| window.refresh());
+}
+
+/// Closes the newest dialog and returns focus to what held it before the dialog, in this update.
+/// If its OK handler moved focus away from `before`, focus stays on that new target.
+fn close_returning_focus(before: Option<FocusHandle>, window: &mut Window, cx: &mut App) {
+    let moved = window
+        .focused(cx)
+        .filter(|now| Some(now) != before.as_ref());
+    window.close_dialog(cx);
+    if let Some(moved) = moved {
+        window.focus(&moved, cx);
+    }
 }
 
 /// `text` split into what scrolls and its last `pinned` lines, without the blank line between.
@@ -819,11 +841,12 @@ pub(in crate::ui) fn assert_full_text_reachable(window: &mut Window, cx: &mut Ap
 mod tests {
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{
-        AnyWindowHandle, AppContext as _, Bounds, Point, TestAppContext, WindowBounds,
+        AnyWindowHandle, AppContext as _, Bounds, FocusHandle, Point, TestAppContext, WindowBounds,
         WindowOptions, px, size,
     };
     use std::cell::Cell;
     use std::rc::Rc;
+    use std::time::Duration;
 
     use super::{
         DialogText, escaped_parts, fit_line, open, scrolled_to, shown, split_pinned, title_name,
@@ -1212,6 +1235,72 @@ mod tests {
         .unwrap();
         cx.run_until_parked();
         assert!(confirmed.get());
+    }
+
+    fn focused(cx: &mut TestAppContext, window: AnyWindowHandle) -> Option<FocusHandle> {
+        cx.update_window(window, |_, window, cx| window.focused(cx))
+            .unwrap()
+    }
+
+    fn confirm_dialog(cx: &mut TestAppContext, window: AnyWindowHandle) {
+        cx.update_window(window, |_, window, cx| {
+            registry::dispatch("ui::Confirm", serde_json::Value::Null, window, cx)
+        })
+        .unwrap()
+        .unwrap();
+    }
+
+    // Confirming returns focus at once, and nothing puts it back later over a newer target.
+    #[gpui_kit::test]
+    async fn focus_moved_after_a_confirmation_stays(cx: &mut TestAppContext) {
+        let window = window(cx);
+        let (earlier, newer) = cx.update(|cx| (cx.focus_handle(), cx.focus_handle()));
+        cx.update_window(window, |_, window, cx| window.focus(&earlier, cx))
+            .unwrap();
+        open_text(cx, window, "Question");
+        confirm_dialog(cx, window);
+        cx.run_until_parked();
+        assert_eq!(focused(cx, window), Some(earlier));
+
+        cx.update_window(window, |_, window, cx| window.focus(&newer, cx))
+            .unwrap();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(focused(cx, window), Some(newer));
+    }
+
+    // With nothing newly focused, focus is still where it was before the dialog later on.
+    #[gpui_kit::test]
+    async fn a_confirmation_returns_focus_when_nothing_took_it(cx: &mut TestAppContext) {
+        let window = window(cx);
+        let earlier = cx.update(|cx| cx.focus_handle());
+        cx.update_window(window, |_, window, cx| window.focus(&earlier, cx))
+            .unwrap();
+        open_text(cx, window, "Question");
+        confirm_dialog(cx, window);
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(focused(cx, window), Some(earlier));
+    }
+
+    // An OK handler that moves focus keeps it there as the dialog closes.
+    #[gpui_kit::test]
+    async fn focus_moved_by_the_ok_handler_stays(cx: &mut TestAppContext) {
+        let window = window(cx);
+        let (earlier, target) = cx.update(|cx| (cx.focus_handle(), cx.focus_handle()));
+        let moved_to = target.clone();
+        cx.update_window(window, |_, window, cx| {
+            window.focus(&earlier, cx);
+            open(window, cx, text("Question"), move |window, cx| {
+                window.focus(&moved_to, cx)
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        confirm_dialog(cx, window);
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(focused(cx, window), Some(target));
     }
 
     // GPUI stacks dialogs: one opened over another is shown, and closing it shows the one
