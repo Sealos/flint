@@ -4,8 +4,8 @@
 //! sorting and measuring run on GPUI's background executor. Every row is addressed by
 //! [`RowRef`] and reported by [`CombinedRowId`], so two clusters' objects of one name stay apart.
 //!
-//! The entry point for later wiring is [`CombinedResourceList::new`] with a [`CombinedSource`],
-//! then [`CombinedResourceList::set_source`] for each update.
+//! The workspace opens it with [`CombinedResourceList::new`] and a [`CombinedSource`], then calls
+//! [`CombinedResourceList::set_source`] for each update.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -35,37 +35,41 @@ use super::super::list_model::combined::{
 };
 use super::super::list_model::{self, CELL_PADDING, CHAR_WIDTH, ColumnWidths};
 use super::super::registry::{
-    self, CloseDetail, FocusFilter, FocusRows, SelectFirst, SelectFromFilter, SelectLast,
-    SelectNext, SelectPrev,
+    self, CloseDetail, FocusFilter, FocusRows, OpenSelectedRow, SelectFirst, SelectFromFilter,
+    SelectLast, SelectNext, SelectPrev,
 };
 use super::{CONTEXT, ROW_HEIGHT, limited_text, state_chip, tabular_figures};
 
 /// Selects a row by its cluster and uid, as clicking it does.
-#[derive(Debug, Clone, Default, PartialEq, Action)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize, Action)]
 #[action(namespace = combined_list, no_json)]
+#[serde(deny_unknown_fields)]
 pub struct SelectCombinedRow {
     pub cluster: String,
     pub uid: String,
 }
 
 /// Sorts by a column, as clicking its header does.
-#[derive(Debug, Clone, Default, PartialEq, Action)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize, Action)]
 #[action(namespace = combined_list, no_json)]
+#[serde(deny_unknown_fields)]
 pub struct SortCombined {
     pub key: String,
     pub occurrence: u32,
 }
 
 /// Adds a cluster to the filter or takes it out, as clicking its note does.
-#[derive(Debug, Clone, Default, PartialEq, Action)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize, Action)]
 #[action(namespace = combined_list, no_json)]
+#[serde(deny_unknown_fields)]
 pub struct ToggleClusterFilter {
     pub cluster: String,
 }
 
 /// Collapses or expands a cluster's group, as clicking its header does.
-#[derive(Debug, Clone, Default, PartialEq, Action)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize, Action)]
 #[action(namespace = combined_list, no_json)]
+#[serde(deny_unknown_fields)]
 pub struct ToggleClusterGroup {
     pub cluster: String,
 }
@@ -80,9 +84,20 @@ pub struct ToggleGroupByCluster;
 #[action(namespace = combined_list, no_json)]
 pub struct ToggleCombinedWide;
 
+/// The object a selected combined row names, in the row's own cluster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CombinedObject {
+    pub cluster: String,
+    pub namespace: Option<String>,
+    pub name: String,
+    pub uid: Box<str>,
+}
+
 pub enum CombinedListEvent {
     /// A row was selected, with its own cluster, or the selection was cleared.
     Selected(Option<CombinedRowId>),
+    /// The selected row was asked for again (Enter, or another click): show its detail.
+    Reopened(CombinedRowId),
 }
 
 impl EventEmitter<CombinedListEvent> for CombinedResourceList {}
@@ -200,6 +215,60 @@ impl CombinedResourceList {
     /// The selected row, with the cluster it belongs to.
     pub fn selected(&self) -> Option<&CombinedRowId> {
         self.selected.as_ref()
+    }
+
+    /// The handlers only this list has. The workspace forwards them, so they work wherever
+    /// focus is in the window.
+    pub fn bind_actions<B: registry::Bind<Self>>(bind: B) -> B {
+        bind.bind::<SelectCombinedRow>(Self::on_select_row)
+            .bind::<SortCombined>(Self::on_sort)
+            .bind::<ToggleClusterFilter>(Self::on_filter_cluster)
+            .bind::<ToggleClusterGroup>(Self::on_toggle_group)
+            .bind::<ToggleGroupByCluster>(Self::on_group_by)
+            .bind::<ToggleCombinedWide>(Self::on_wide)
+    }
+
+    /// The list actions it shares with a single-cluster list, forwarded the same way.
+    pub fn bind_list_actions<B: registry::Bind<Self>>(bind: B) -> B {
+        bind.bind::<SelectPrev>(Self::on_prev)
+            .bind::<SelectNext>(Self::on_next)
+            .bind::<SelectFirst>(Self::on_first)
+            .bind::<SelectLast>(Self::on_last)
+            .bind::<CloseDetail>(Self::on_close)
+            .bind::<OpenSelectedRow>(Self::on_open_selected)
+            .bind::<FocusFilter>(Self::on_focus_filter)
+    }
+
+    /// The filter field's focus.
+    #[cfg(test)]
+    pub(in super::super) fn filter_handle(&self, cx: &App) -> FocusHandle {
+        self.filter.focus_handle(cx)
+    }
+
+    /// The selected row's object, while the row is listed.
+    pub fn selected_object(&self) -> Option<CombinedObject> {
+        let id = self.selected.as_ref()?;
+        let line = model::line_of(&self.shown.list, &self.view, id)?;
+        let Some(CombinedLine::Row(at)) = self.view.line(line) else {
+            return None;
+        };
+        let info = self.shown.list.row_info(at)?;
+        Some(CombinedObject {
+            cluster: id.cluster.to_string(),
+            namespace: info.namespace.map(str::to_owned),
+            name: info.name.to_owned(),
+            uid: info.uid.into(),
+        })
+    }
+
+    /// Clears the selection, as Esc does.
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.selected_line = None;
+        self.selected_seen = None;
+        if self.selected.take().is_some() {
+            cx.emit(CombinedListEvent::Selected(None));
+            cx.notify();
+        }
     }
 
     /// Replaces what the list shows. Filters on clusters that left the list are dropped.
@@ -412,8 +481,36 @@ impl CombinedResourceList {
             cluster: action.cluster.as_str().into(),
             uid: action.uid.as_str().into(),
         };
-        if let Some(line) = model::line_of(&self.shown.list, &self.view, &id) {
+        let Some(line) = model::line_of(&self.shown.list, &self.view, &id) else {
+            return;
+        };
+        if self.selected.as_ref() == Some(&id) {
+            window.focus(&self.focus, cx);
+            cx.emit(CombinedListEvent::Reopened(id));
+        } else {
             self.select_line(line, window, cx);
+        }
+    }
+
+    /// Enter on the rows: asks for the selected row again, by its cluster and uid. The key stays
+    /// with a control or dialog that has focus.
+    fn on_open_selected(
+        &mut self,
+        _: &OpenSelectedRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.focus.is_focused(window)
+            || gpui_kit::component::WindowExt::has_active_dialog(window, cx)
+        {
+            cx.propagate();
+            return;
+        }
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        if model::line_of(&self.shown.list, &self.view, &id).is_some() {
+            cx.emit(CombinedListEvent::Reopened(id));
         }
     }
 
@@ -480,12 +577,7 @@ impl CombinedResourceList {
     }
 
     fn on_close(&mut self, _: &CloseDetail, _: &mut Window, cx: &mut Context<Self>) {
-        self.selected_line = None;
-        self.selected_seen = None;
-        if self.selected.take().is_some() {
-            cx.emit(CombinedListEvent::Selected(None));
-            cx.notify();
-        }
+        self.clear_selection(cx);
     }
 
     fn on_sort(&mut self, action: &SortCombined, _: &mut Window, cx: &mut Context<Self>) {

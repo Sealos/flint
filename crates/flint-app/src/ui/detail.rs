@@ -222,6 +222,12 @@ pub struct DetailView {
     protected: bool,
     /// What the protected reason calls the object's cluster, as the workspace says it.
     cluster_label: String,
+    /// For a row of a cluster set: the exact context, always shown as what the actions apply to.
+    row_cluster: Option<String>,
+    /// For a row of a cluster set: the server it was admitted on. Never changes.
+    row_server: Option<String>,
+    /// For a row of a cluster set: why the core refuses writes on its member now, if it does.
+    row_writes_paused: Option<String>,
     /// The server the object's cluster shows, as the workspace says it: what an edit is for.
     server: Option<String>,
     /// What RBAC says about this object's actions, for showing them ([`access`]).
@@ -314,6 +320,9 @@ impl DetailView {
             sessions_blocked: None,
             protected: false,
             cluster_label,
+            row_cluster: None,
+            row_server: None,
+            row_writes_paused: None,
             server: None,
             access: object_access,
             edit: None,
@@ -359,9 +368,53 @@ impl DetailView {
         }
     }
 
-    /// Says which server the object's cluster points at now.
+    /// Makes this the detail of a cluster set's row: names its exact context in the header,
+    /// whatever the window's width, and pins every write from here to its admitted `server`.
+    pub(in crate::ui) fn set_row_cluster(
+        &mut self,
+        cluster: String,
+        server: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.row_cluster = Some(cluster);
+        self.server = Some(server.clone());
+        self.row_server = Some(server);
+        cx.notify();
+    }
+
+    /// Says why a set's row cannot write now, or `None` once it can.
+    pub(in crate::ui) fn set_row_writes_paused(
+        &mut self,
+        why: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.row_writes_paused != why {
+            self.row_writes_paused = why;
+            cx.notify();
+        }
+    }
+
+    /// Why a set's row cannot write now.
+    pub(in crate::ui) fn row_writes_paused(&self) -> Option<&str> {
+        self.row_writes_paused.as_deref()
+    }
+
+    /// Says which server the object's cluster points at now. A set's row keeps its pin.
     pub(in crate::ui) fn set_server(&mut self, server: Option<String>) {
-        self.server = server;
+        if self.row_server.is_none() {
+            self.server = server;
+        }
+    }
+
+    /// The admitted server of a cluster set's row: its writes go there or nowhere.
+    pub(in crate::ui) fn row_server(&self) -> Option<&str> {
+        self.row_server.as_deref()
+    }
+
+    /// The server a YAML edit started now would be for.
+    #[cfg(test)]
+    pub(in crate::ui) fn edit_server(&self) -> Option<&str> {
+        self.server.as_deref()
     }
 
     pub fn object(&self) -> &ObjectRef {
@@ -720,6 +773,21 @@ impl DetailView {
                             .on_click(registry::on_click(Close)),
                     ),
             )
+            .when_some(self.row_cluster.clone(), |el, cluster| {
+                // Wrapped, never cut: near-identical contexts must read apart.
+                let text = format!("Logs, Shell and actions apply to {cluster}");
+                el.child(
+                    div()
+                        .id("detail-cluster")
+                        .px_3()
+                        .pb_1()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .aria_label(text.clone())
+                        .child(text)
+                        .test_support(),
+                )
+            })
             .children(self.render_managed_by(theme))
             .children(self.render_captions(theme))
             .child(

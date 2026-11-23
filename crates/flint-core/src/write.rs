@@ -348,6 +348,8 @@ impl RequestGate {
             .core
             .bound_write_client(&self.cluster, Some(self.server.clone()))
             .await?;
+        // A set's row stays on the definition admitted, from before its credential is touched.
+        self.core.check_admitted(&self.cluster, &pin)?;
         // A pin can be stale from the start: a fallback showing while a higher file is unreadable.
         self.core
             .check_write_pin(&self.cluster, pin.clone())
@@ -429,6 +431,14 @@ async fn kind_of(core: &CoreHandle, target: &WriteTarget) -> Result<KindInfo, Wr
     let discovery = core.discovery(&target.cluster).await;
     if let Some(kind) = discovery.as_ref().and_then(|d| d.kind(&target.kind)) {
         return Ok(kind.clone());
+    }
+    // A set's row: the replacement server's kinds say nothing about the server it was shown on.
+    if core.is_bound()
+        && let Err(moved @ WriteRefusal::Moved { .. }) = core
+            .write_client(&target.cluster, Some(target.server.clone()))
+            .await
+    {
+        return Err(moved.into());
     }
     // Refused either way: a paused context has no discovery, so this only picks the words.
     let refusal = match core.bound_write_client(&target.cluster, None).await {

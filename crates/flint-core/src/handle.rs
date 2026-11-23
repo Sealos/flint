@@ -27,7 +27,7 @@ use crate::manager::ClusterManager;
 use crate::protection::{GatedClient, SessionUnlocks, WriteRefusal};
 use crate::read::{KindId, ObjectDetail};
 use crate::recheck::{ContextPin, RECHECK_EVERY};
-use crate::settings::{Appearance, Settings, WatchMode};
+use crate::settings::{Appearance, ClusterPin, Settings, WatchMode};
 use crate::store::{Feed, KindSnapshot, SyncState};
 use crate::view::{self, ViewQuery};
 use crate::watch::HubRegistry;
@@ -187,11 +187,71 @@ pub struct MemberReport {
     pub paused: bool,
 }
 
+/// A running-set member as the core admitted it: its context, at the exact server it was checked
+/// on. Whatever comes from a set carries this, and is refused once the context has left that
+/// server, even if it later comes back. Grants nothing on the write path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedMember {
+    pub(crate) pin: ClusterPin,
+    pub(crate) at: ContextPin,
+    /// [`ClusterSummary::endpoint`] when admitted.
+    pub(crate) endpoint: u64,
+}
+
+impl AdmittedMember {
+    pub fn context(&self) -> &str {
+        &self.pin.context
+    }
+
+    pub fn server(&self) -> &str {
+        &self.pin.server
+    }
+
+    pub fn pin(&self) -> &ClusterPin {
+        &self.pin
+    }
+
+    /// Whether `summary`, if confirmed, still shows the endpoint this member was admitted on. A
+    /// context moved and put back has the same URL but another endpoint number.
+    pub fn same_endpoint(&self, summary: &ClusterSummary) -> bool {
+        !summary.confirmed || summary.endpoint == self.endpoint
+    }
+
+    /// What a log session on `cluster` is pinned to: stale for any context but this member's.
+    pub(crate) fn log_pin(&self, cluster: &str) -> ContextPin {
+        if self.context() == cluster {
+            self.at.clone()
+        } else {
+            ContextPin::stale()
+        }
+    }
+
+    /// Whether `pin`, read with a client of `cluster`, is the exact definition admitted.
+    pub(crate) fn holds(&self, cluster: &str, pin: &ContextPin) -> bool {
+        self.context() == cluster && self.at == *pin
+    }
+}
+
 /// Requests that carry a reply channel or come from a [`Subscription`].
 pub(crate) enum Request {
     /// Each member of the running set and its state.
     RunningSet {
         reply: oneshot::Sender<Vec<MemberReport>>,
+    },
+    /// Makes the running set exactly these pins, or changes nothing if any does not hold.
+    AdmitRunningSet {
+        pins: Vec<ClusterPin>,
+        reply: oneshot::Sender<Result<Vec<AdmittedMember>, String>>,
+    },
+    /// Why `member` no longer stands for its context, or `None`. Never contacts the server.
+    CheckMember {
+        member: AdmittedMember,
+        reply: oneshot::Sender<Option<String>>,
+    },
+    /// The read client of `member`, checked in the same step.
+    MemberClient {
+        member: AdmittedMember,
+        reply: oneshot::Sender<Result<kube::Client, String>>,
     },
     /// Reload the kubeconfig files, and say when that is done.
     ReloadKubeconfig {
@@ -202,6 +262,12 @@ pub(crate) enum Request {
         cluster: ClusterId,
         kind: KindId,
     },
+    /// [`Self::Subscribe`] for a running-set member: nothing starts unless it still holds.
+    SubscribeMember {
+        id: u64,
+        member: AdmittedMember,
+        kind: KindId,
+    },
     Unsubscribe {
         id: u64,
     },
@@ -210,6 +276,8 @@ pub(crate) enum Request {
         kind: KindId,
         namespace: Option<String>,
         name: String,
+        /// Set for a row of a running set: checked before a client is taken.
+        member: Option<AdmittedMember>,
         reply: oneshot::Sender<Result<Arc<ObjectDetail>, String>>,
     },
     Discovery {
@@ -226,6 +294,8 @@ pub(crate) enum Request {
         /// The server the session is for, as the context showed it when the tab opened (its
         /// label); `None` for whatever the context shows when the core takes the request.
         server: Option<Option<String>>,
+        /// Set for a running set's tab: the session is pinned to what was admitted.
+        member: Option<AdmittedMember>,
         subject: LogSubject,
         options: LogOptions,
         snapshots: watch::Sender<Arc<LogSnapshot>>,
@@ -434,6 +504,8 @@ pub struct CoreHandle {
     holds: crate::recheck::DefinitionHolds,
     log_budget: Arc<crate::logs::LogBudget>,
     access: Arc<crate::access::AccessCache>,
+    /// Set by [`Self::bound_to`]: one-off reads go only to this member.
+    bound: Option<Arc<AdmittedMember>>,
     runtime: tokio::runtime::Handle,
     _runtime: Arc<RuntimeGuard>,
 }
@@ -470,6 +542,7 @@ impl CoreHandle {
             holds,
             log_budget,
             access: Arc::default(),
+            bound: None,
             runtime: runtime.handle().clone(),
             _runtime: Arc::new(RuntimeGuard(Some(runtime))),
         })
@@ -493,17 +566,97 @@ impl CoreHandle {
         // A running watch publishes what it held back while nobody listened.
         hub.wake.notify_one();
         let id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
-        let _ = self.requests.try_send(Request::Subscribe {
-            id,
-            cluster: cluster.to_owned(),
-            kind: kind.clone(),
-        });
+        // A handle bound to another context starts nothing.
+        let _ = match self.read_binding(cluster) {
+            Ok(Some(member)) => self.requests.try_send(Request::SubscribeMember {
+                id,
+                member,
+                kind: kind.clone(),
+            }),
+            Ok(None) => self.requests.try_send(Request::Subscribe {
+                id,
+                cluster: cluster.to_owned(),
+                kind: kind.clone(),
+            }),
+            Err(_) => Ok(()),
+        };
         Subscription {
             id,
             cluster: cluster.to_owned(),
             kind: kind.clone(),
             rx: Some(rx),
             requests: self.requests.clone(),
+        }
+    }
+
+    /// Makes the running set exactly `pins`; none clears it. Every pin is checked against the
+    /// context's confirmed server first: if any fails, no member joins or leaves and the error
+    /// says which. Taken in the order sent, whether or not the future is awaited.
+    pub fn admit_running_set(
+        &self,
+        pins: Vec<ClusterPin>,
+    ) -> impl Future<Output = Result<Vec<AdmittedMember>, String>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let sent = self
+            .requests
+            .try_send(Request::AdmitRunningSet { pins, reply });
+        async move {
+            if sent.is_err() {
+                return Err("the core is not running".to_owned());
+            }
+            rx.await
+                .unwrap_or_else(|_| Err("the core stopped before answering".to_owned()))
+        }
+    }
+
+    /// Why `member` no longer stands for its context, or `None`. A stopped core counts as changed.
+    pub fn check_member(
+        &self,
+        member: &AdmittedMember,
+    ) -> impl Future<Output = Option<String>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let sent = self.requests.try_send(Request::CheckMember {
+            member: member.clone(),
+            reply,
+        });
+        async move {
+            if sent.is_err() {
+                return Some("the core is not running".to_owned());
+            }
+            rx.await
+                .unwrap_or_else(|_| Some("the core stopped before answering".to_owned()))
+        }
+    }
+
+    /// This handle with what it starts bound to `member`: one-off reads, subscriptions, sessions
+    /// and reviewed writes are refused if the context is no longer the definition admitted.
+    pub fn bound_to(&self, member: AdmittedMember) -> Self {
+        Self {
+            bound: Some(Arc::new(member)),
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn is_bound(&self) -> bool {
+        self.bound.is_some()
+    }
+
+    /// Refuses a write whose client, read at `pin`, is not on the definition this handle's
+    /// member was admitted on. Asked before the credential is used.
+    pub(crate) fn check_admitted(&self, cluster: &str, pin: &ContextPin) -> Result<(), WriteError> {
+        match self.bound.as_deref() {
+            Some(member) if !member.holds(cluster, pin) => Err(WriteError::ConnectionChanged),
+            _ => Ok(()),
+        }
+    }
+
+    /// The member a read of `cluster` is bound to; an error if this handle is bound to another.
+    fn read_binding(&self, cluster: &str) -> Result<Option<AdmittedMember>, String> {
+        match self.bound.as_deref() {
+            Some(member) if member.context() != cluster => Err(format!(
+                "\"{cluster}\" is not the cluster this view belongs to"
+            )),
+            bound => Ok(bound.cloned()),
         }
     }
 
@@ -518,14 +671,26 @@ impl CoreHandle {
         name: &str,
     ) -> impl Future<Output = Result<Arc<ObjectDetail>, String>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let sent = self.requests.try_send(Request::FetchObject {
-            cluster: cluster.to_owned(),
-            kind: kind.clone(),
-            namespace: namespace.map(str::to_owned),
-            name: name.to_owned(),
-            reply,
-        });
+        let binding = self.read_binding(cluster);
+        let refused = binding.as_ref().err().cloned();
+        let sent = match binding {
+            Ok(member) => self
+                .requests
+                .try_send(Request::FetchObject {
+                    cluster: cluster.to_owned(),
+                    kind: kind.clone(),
+                    namespace: namespace.map(str::to_owned),
+                    name: name.to_owned(),
+                    member,
+                    reply,
+                })
+                .map_err(drop),
+            Err(_) => Err(()),
+        };
         async move {
+            if let Some(refused) = refused {
+                return Err(refused);
+            }
             if sent.is_err() {
                 return Err("the core is not running".to_owned());
             }
@@ -682,6 +847,7 @@ impl CoreHandle {
             id,
             cluster: cluster.to_owned(),
             server,
+            member: self.bound.as_deref().cloned(),
             subject: subject.clone(),
             options: options.clone(),
             snapshots,
@@ -752,8 +918,15 @@ impl CoreHandle {
         let client = self.write_client(&request.cluster, request.server.clone());
         let requests = self.requests.clone();
         let cluster = request.cluster.clone();
+        let admitted = self.bound.clone();
         self.runtime.spawn(async move {
-            let client = client.await.map(|(client, pin)| {
+            let client = client.await.and_then(|(client, pin)| match &admitted {
+                Some(member) if !member.holds(&cluster, &pin) => Err(WriteRefusal::Stale {
+                    cluster: cluster.to_string(),
+                }),
+                _ => Ok((client, pin)),
+            });
+            let client = client.map(|(client, pin)| {
                 let launch = launch_check(requests.clone(), cluster.clone(), pin.clone());
                 let check = context_check(requests, cluster, pin);
                 (client, ContextWatch::new(check, launch, RECHECK_EVERY))
@@ -903,30 +1076,52 @@ impl CoreHandle {
         pods: PodSet,
         freshness: Freshness,
     ) -> impl Future<Output = Result<Vec<WorkloadPod>, String>> + Send + 'static {
-        let (reply, rx) = oneshot::channel();
-        let sent = self.requests.try_send(Request::Client {
-            cluster: cluster.to_owned(),
-            reply,
-        });
-        let (cluster, namespace) = (cluster.to_owned(), namespace.to_owned());
+        let client = self.read_client(cluster);
+        let namespace = namespace.to_owned();
         let listed = spawn_aborting(&self.runtime, async move {
-            match sent {
-                Ok(()) => match rx.await {
-                    Ok(Some(client)) => {
-                        crate::logs::list_workload_pods(client, &namespace, &pods, freshness)
-                            .await
-                            .map_err(|e| e.message)
-                    }
-                    Ok(None) => Err(format!("\"{cluster}\" is not connected")),
-                    Err(_) => Err("the core stopped before answering".to_owned()),
-                },
-                Err(_) => Err("the core is not running".to_owned()),
-            }
+            crate::logs::list_workload_pods(client.await?, &namespace, &pods, freshness)
+                .await
+                .map_err(|e| e.message)
         });
         async move {
             listed
                 .await
                 .unwrap_or_else(|| Err("the core stopped before answering".to_owned()))
+        }
+    }
+
+    /// The client for a one-off read of `cluster`, through the member this handle is bound to.
+    fn read_client(
+        &self,
+        cluster: &str,
+    ) -> impl Future<Output = Result<kube::Client, String>> + Send + 'static {
+        let requests = self.requests.clone();
+        let binding = self.read_binding(cluster);
+        let cluster = cluster.to_owned();
+        async move {
+            const STOPPED: &str = "the core stopped before answering";
+            const NOT_RUNNING: &str = "the core is not running";
+            match binding? {
+                Some(member) => {
+                    let (reply, rx) = oneshot::channel();
+                    requests
+                        .try_send(Request::MemberClient { member, reply })
+                        .map_err(|_| NOT_RUNNING.to_owned())?;
+                    rx.await.unwrap_or_else(|_| Err(STOPPED.to_owned()))
+                }
+                None => {
+                    let (reply, rx) = oneshot::channel();
+                    requests
+                        .try_send(Request::Client {
+                            cluster: cluster.clone(),
+                            reply,
+                        })
+                        .map_err(|_| NOT_RUNNING.to_owned())?;
+                    rx.await
+                        .map_err(|_| STOPPED.to_owned())?
+                        .ok_or_else(|| format!("\"{cluster}\" is not connected"))
+                }
+            }
         }
     }
 
