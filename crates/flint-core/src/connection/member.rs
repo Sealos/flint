@@ -107,6 +107,11 @@ pub(crate) enum MemberEvent {
     /// The slot's connection is gone and a new one is due (its definition changed, or a pause
     /// dropped it). Any earlier failure or sign-in was for the old connection.
     ConnectionLost,
+    /// The person canceled this member's connection: it stays failed, with no retry, until it
+    /// is activated or its connection is replaced.
+    Canceled {
+        reason: SafeErrorText,
+    },
     /// Time passed: checks the reconnect timeout and the retry time.
     Tick,
 }
@@ -139,6 +144,8 @@ pub(crate) struct Member {
     activation_pending: bool,
     failures: u32,
     attempt: Option<AttemptId>,
+    /// Canceled: a failure waits for the person instead of its retry time.
+    retries_stopped: bool,
 }
 
 impl Member {
@@ -162,6 +169,7 @@ impl Member {
             activation_pending: false,
             failures: 0,
             attempt: None,
+            retries_stopped: false,
         };
         (member, action)
     }
@@ -232,13 +240,34 @@ impl Member {
             MemberEvent::Paused(pause) => self.pause(pause),
             MemberEvent::Resumed(pause) => self.resume(pause),
             MemberEvent::ConnectionLost => self.connection_lost(),
+            MemberEvent::Canceled { reason } => self.canceled(reason, now),
             MemberEvent::Tick => self.tick(now, jitter),
+        }
+    }
+
+    fn canceled(&mut self, reason: SafeErrorText, now: Instant) -> MemberAction {
+        match self.state {
+            MemberState::Connecting => {
+                self.attempt = None;
+                self.retries_stopped = true;
+                self.state = MemberState::Failed {
+                    error: reason,
+                    retry_at: now,
+                };
+                MemberAction::Dequeue
+            }
+            MemberState::Failed { .. } => {
+                self.retries_stopped = true;
+                MemberAction::None
+            }
+            _ => MemberAction::None,
         }
     }
 
     fn connection_lost(&mut self) -> MemberAction {
         self.attempt = None;
         self.failures = 0;
+        self.retries_stopped = false;
         self.state = MemberState::Connecting;
         if self.paused().is_some() {
             MemberAction::None
@@ -318,6 +347,7 @@ impl Member {
         match self.state {
             MemberState::SignInNeeded { .. } | MemberState::Failed { .. } => {
                 self.failures = 0;
+                self.retries_stopped = false;
                 self.state = MemberState::Connecting;
                 MemberAction::StartNow
             }
@@ -380,7 +410,9 @@ impl Member {
                 self.fail(error, now, jitter);
                 MemberAction::StopWatches
             }
-            MemberState::Failed { retry_at, .. } if now >= *retry_at && self.paused().is_none() => {
+            MemberState::Failed { retry_at, .. }
+                if now >= *retry_at && self.paused().is_none() && !self.retries_stopped =>
+            {
                 self.state = MemberState::Connecting;
                 MemberAction::Enqueue
             }

@@ -80,6 +80,9 @@ pub enum Command {
     /// Make a cluster the active one, connecting it if it is not connected. Selecting a cluster
     /// whose connection failed retries it.
     Activate(ClusterId),
+    /// Ends the selected cluster's connection attempt and its automatic retries, if it is still
+    /// the slot `generation`. It stays failed until selected or retried.
+    CancelConnection { cluster: ClusterId, generation: u64 },
     /// Expose a cluster to AI agents at `server` (`Some`), limited to `scope` (ADR-0013), or hide
     /// it (`None`), in `settings.toml`. `server` is the URL the user confirmed; if the context
     /// no longer points there, nothing is written and an error is reported. Exposing an exposed
@@ -416,6 +419,20 @@ pub enum ConnectionState {
     AwaitingConfirmation,
 }
 
+/// How the selected cluster's connection has been going since it was selected or last retried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionProgress {
+    pub cluster: ClusterId,
+    /// The slot it is for ([`ClusterSummary::generation`]).
+    pub generation: u64,
+    /// When the first attempt started.
+    pub since: std::time::Instant,
+    /// Automatic retries scheduled so far.
+    pub retries: u32,
+    /// When the next automatic retry starts, if one is waiting.
+    pub next_retry: Option<std::time::Instant>,
+}
+
 /// A cluster as the sidebar shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterSummary {
@@ -522,6 +539,9 @@ pub enum Event {
         cluster: ClusterId,
         state: ConnectionState,
     },
+    /// The selected cluster's connection attempts, while it is not connected. `None` once there
+    /// is nothing to show.
+    ConnectionProgress(Option<ConnectionProgress>),
     /// Settings were loaded, reloaded, or written. When `settings.toml` cannot be read, `error`
     /// says why and `settings` are the defaults (nothing exposed), as the MCP server also treats
     /// an unreadable file as nothing exposed.

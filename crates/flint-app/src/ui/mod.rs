@@ -20,6 +20,7 @@ mod cluster_tag;
 mod clusters;
 mod compare;
 mod confirm;
+mod connection_progress;
 mod dashboard;
 #[cfg(test)]
 #[path = "dashboard_wiring_tests.rs"]
