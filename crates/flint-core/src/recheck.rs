@@ -547,6 +547,45 @@ impl EmptiedFiles {
     }
 }
 
+/// Which contexts the core holds now, published by the manager in the step that changes them, so
+/// a front end reads the current answer instead of waiting for an event. For showing only: the
+/// write gate decides from the manager's own state and never reads this.
+#[derive(Debug, Clone, Default)]
+pub struct DefinitionHolds(std::sync::Arc<std::sync::Mutex<HeldContexts>>);
+
+#[derive(Debug, Default)]
+struct HeldContexts {
+    writes: HashSet<String>,
+    sessions: HashSet<String>,
+}
+
+impl DefinitionHolds {
+    /// Whether the core refuses writes on `context` because its definition is uncertain.
+    pub fn writes_paused(&self, context: &str) -> bool {
+        self.held().writes.contains(context)
+    }
+
+    /// Whether nothing new may start on `context`: no connection, log stream or shell.
+    pub fn sessions_paused(&self, context: &str) -> bool {
+        self.held().sessions.contains(context)
+    }
+
+    pub(crate) fn publish(&self, writes: HashSet<String>, sessions: HashSet<String>) {
+        *self.held() = HeldContexts { writes, sessions };
+    }
+
+    /// Shows writes on `context` as paused until the next [`Self::publish`].
+    pub(crate) fn hold_writes(&self, context: &str) {
+        self.held().writes.insert(context.to_owned());
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, HeldContexts> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// Each context's definition when a load last showed it with no unreadable file that could
 /// change it.
 #[derive(Debug, Default)]

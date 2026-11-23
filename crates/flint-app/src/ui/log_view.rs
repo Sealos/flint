@@ -122,6 +122,8 @@ pub struct LogView {
     session: LogSession,
     /// The snapshot drawn. The list has exactly one item per line in it.
     snapshot: Arc<LogSnapshot>,
+    /// Why Reconnect cannot run now (`Workspace::sessions_blocked`): disabled, saying so.
+    reconnect_blocked: Option<String>,
     list: ListState,
     timestamps: bool,
     /// Show workload lines' `[pod/container]` prefix (on by default; pod sessions have none).
@@ -210,6 +212,32 @@ pub struct LogView {
 }
 
 impl LogView {
+    /// Says why Reconnect cannot run, or `None` once it can.
+    pub(super) fn set_reconnect_blocked(&mut self, why: Option<String>, cx: &mut Context<Self>) {
+        if self.reconnect_blocked != why {
+            self.reconnect_blocked = why;
+            cx.notify();
+        }
+    }
+
+    /// Reconnect Logs, in an ended or failed tab's banner. Disabled, saying why, while the
+    /// tab's cluster takes no new sessions.
+    fn reconnect_button(&self) -> Button {
+        let button = Button::new("log-reconnect")
+            .xsmall()
+            .label("Reconnect")
+            .tab_stop(false);
+        match &self.reconnect_blocked {
+            Some(why) => button.disabled(true).tooltip(why.clone()),
+            None => button
+                .tooltip(format!(
+                    "Open the logs again in a new tab beside this one ({})",
+                    registry::key_hint("secondary-r")
+                ))
+                .on_click(registry::on_click(ReconnectLogs)),
+        }
+    }
+
     /// The tab for `request`, on the server its context shows when the core takes it.
     #[cfg(test)]
     pub fn new(
@@ -276,6 +304,7 @@ impl LogView {
         let snapshot = session.peek();
         let (tz, tz_name) = log_model::system_zone();
         LogView {
+            reconnect_blocked: None,
             request,
             core,
             session,
@@ -1653,7 +1682,7 @@ impl LogView {
                         }),
                 )
                 .when(self.can_restart(), |el| {
-                    el.child(div().flex_none().child(reconnect_button()))
+                    el.child(div().flex_none().child(self.reconnect_button()))
                 })
                 .test_support()
                 .into_any_element(),
@@ -1776,7 +1805,7 @@ impl LogView {
                         .test_support(),
                 )
             })
-            .when(self.can_restart(), |el| el.child(reconnect_button()))
+            .when(self.can_restart(), |el| el.child(self.reconnect_button()))
             .test_support()
             .into_any_element()
     }
@@ -1821,19 +1850,6 @@ impl LogView {
             .test_support()
             .into_any_element()
     }
-}
-
-/// Reconnect Logs, in an ended or failed tab's banner.
-fn reconnect_button() -> Button {
-    Button::new("log-reconnect")
-        .xsmall()
-        .label("Reconnect")
-        .tab_stop(false)
-        .tooltip(format!(
-            "Open the logs again in a new tab beside this one ({})",
-            registry::key_hint("secondary-r")
-        ))
-        .on_click(registry::on_click(ReconnectLogs))
 }
 
 /// A toolbar menu with `rows`, each entry performing its registered action, opened from the
