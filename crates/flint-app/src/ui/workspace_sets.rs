@@ -120,6 +120,11 @@ impl ClusterSets {
         self.running.is_some()
     }
 
+    /// Whether a set is waiting for the core to admit it.
+    pub(super) fn is_opening(&self) -> bool {
+        self.opening.is_some()
+    }
+
     /// The open set's member for `cluster`, as the core admitted it.
     pub(super) fn member(&self, cluster: &str) -> Option<&AdmittedMember> {
         self.running

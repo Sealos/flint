@@ -657,7 +657,7 @@ async fn clicking_a_tile_asks_for_its_filtered_list(cx: &mut TestAppContext) {
     let record = seen.clone();
     let _subscription = cx.update(|cx| {
         cx.subscribe(&view, move |_, event: &DashboardEvent, _| {
-            record.borrow_mut().push(*event);
+            record.borrow_mut().push(event.clone());
         })
     });
     cx.update_window(window, |_, window, cx| {
@@ -681,7 +681,7 @@ async fn a_stale_click_on_an_unknown_tile_opens_nothing(cx: &mut TestAppContext)
     let record = seen.clone();
     let _subscription = cx.update(|cx| {
         cx.subscribe(&view, move |_, event: &DashboardEvent, _| {
-            record.borrow_mut().push(*event);
+            record.borrow_mut().push(event.clone());
         })
     });
     cx.update_window(window, |_, window, cx| {
@@ -761,6 +761,35 @@ async fn draws_capacity_and_inventory_with_usage_unavailable(cx: &mut TestAppCon
         label(cx, window, ("dashboard-count-unknown", 1usize)).as_deref(),
         Some("Pods: unknown")
     );
+}
+
+#[test]
+fn a_warning_links_only_to_an_object_it_names_exactly() {
+    let scope = OpenScope {
+        cluster: CLUSTER.to_owned(),
+        server: Some("https://one".to_owned()),
+    };
+    let target = |kind: Option<&str>, api_version: Option<&str>, name: Option<&str>| {
+        let mut event = warning("web-0", ago(10));
+        event.involved_object.kind = kind.map(str::to_owned);
+        event.involved_object.api_version = api_version.map(str::to_owned);
+        event.involved_object.name = name.map(str::to_owned);
+        warning_target(&event, &scope)
+    };
+    let core = target(Some("Pod"), Some("v1"), Some("web-0")).expect("a core object");
+    assert_eq!(core.kind, "Pod.v1");
+    assert_eq!(core.namespace.as_deref(), Some("shop"));
+    assert_eq!(core.name, "web-0");
+    assert_eq!(core.cluster.as_deref(), Some(CLUSTER));
+    assert_eq!(core.server.as_deref(), Some("https://one"));
+    let grouped = target(Some("Widget"), Some("example.io/v1beta1"), Some("w")).unwrap();
+    assert_eq!(grouped.kind, "Widget.example.io");
+
+    assert_eq!(target(None, Some("v1"), Some("web-0")), None);
+    assert_eq!(target(Some("Pod"), None, Some("web-0")), None);
+    assert_eq!(target(Some("Pod"), Some("v1"), None), None);
+    assert_eq!(target(Some("Pod"), Some("v1"), Some("  ")), None);
+    assert_eq!(target(Some("Pod.apps"), Some("v1"), Some("web-0")), None);
 }
 
 #[gpui_kit::test]

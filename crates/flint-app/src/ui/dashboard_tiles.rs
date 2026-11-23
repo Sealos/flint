@@ -15,9 +15,10 @@ use super::overview::{
 };
 use super::sparkline::sparkline;
 use super::{
-    CANNOT_BE_CHECKED, DashboardStatus, INSTALL_COMMAND, INSTALL_HINT, MAX_WARNING_ROWS,
-    METRICS_WAITING, MetricTile, MetricsPanel, NO_WARNINGS, OpenProblemList, OpenShortWorkloads,
-    ProblemList, ProblemLists, ProblemTile, WARNINGS_UNAVAILABLE, WarningRow, WarningsPanel,
+    CANNOT_BE_CHECKED, DashboardEvent, DashboardStatus, DashboardView, INSTALL_COMMAND,
+    INSTALL_HINT, MAX_WARNING_ROWS, METRICS_WAITING, MetricTile, MetricsPanel, NO_WARNINGS,
+    OpenProblemList, OpenShortWorkloads, ProblemList, ProblemLists, ProblemTile,
+    WARNINGS_UNAVAILABLE, WarningRow, WarningsPanel,
 };
 use crate::ui::registry;
 use flint_core::problems::ProblemSeverity;
@@ -609,7 +610,12 @@ fn inventory_count(
     }
 }
 
-pub fn warnings_section(panel: &WarningsPanel, theme: &Theme) -> impl IntoElement {
+pub fn warnings_section(
+    panel: &WarningsPanel,
+    focus: FocusHandle,
+    view: WeakEntity<DashboardView>,
+    theme: &Theme,
+) -> impl IntoElement {
     let body = match panel {
         WarningsPanel::Unavailable => note(
             "dashboard-warnings-unavailable",
@@ -629,7 +635,7 @@ pub fn warnings_section(panel: &WarningsPanel, theme: &Theme) -> impl IntoElemen
             .children(
                 rows.iter()
                     .enumerate()
-                    .map(|(index, row)| warning_row(index, row, theme)),
+                    .map(|(index, row)| warning_row(index, row, &focus, &view, theme)),
             )
             .when(*total > MAX_WARNING_ROWS, |el| {
                 el.child(note(
@@ -643,10 +649,39 @@ pub fn warnings_section(panel: &WarningsPanel, theme: &Theme) -> impl IntoElemen
     section("Recent Warning events", theme).child(body)
 }
 
-fn warning_row(index: usize, row: &WarningRow, theme: &Theme) -> impl IntoElement {
+/// A row that opens its object, or plain text when the event names none exactly.
+fn warning_row(
+    index: usize,
+    row: &WarningRow,
+    focus: &FocusHandle,
+    view: &WeakEntity<DashboardView>,
+    theme: &Theme,
+) -> AnyElement {
+    let Some(open) = row.open.clone() else {
+        return warning_cells(row, theme)
+            .id(("dashboard-warning", index))
+            .aria_label(row.label())
+            .test_support()
+            .into_any_element();
+    };
+    let (focus, view, object) = (focus.clone(), view.clone(), row.object.clone());
+    Button::new(("dashboard-warning", index))
+        .accessibility_label(format!("Open {}", row.label()))
+        .ghost()
+        .small()
+        .w_full()
+        .child(warning_cells(row, theme))
+        .on_click(move |_, window, cx| {
+            if registry::dispatch_in(&focus, &open, window, cx).is_err() {
+                let object = object.clone();
+                let _ = view.update(cx, |_, cx| cx.emit(DashboardEvent::CannotOpen(object)));
+            }
+        })
+        .into_any_element()
+}
+
+fn warning_cells(row: &WarningRow, theme: &Theme) -> Div {
     h_flex()
-        .id(("dashboard-warning", index))
-        .aria_label(row.label())
         .w_full()
         .min_w_0()
         .h(px(24.))
@@ -691,5 +726,4 @@ fn warning_row(index: usize, row: &WarningRow, theme: &Theme) -> impl IntoElemen
                     .child(format!("x{}", row.occurrences)),
             )
         })
-        .test_support()
 }

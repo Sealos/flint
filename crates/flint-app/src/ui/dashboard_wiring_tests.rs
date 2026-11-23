@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use super::dashboard::{
     DashboardModel, DashboardView, FeedId, ProblemList, ProblemLists, ProblemRow, ProblemTile,
-    ProblemsPanel, lists_of, slot_to_read,
+    ProblemsPanel, WarningRow, WarningsPanel, lists_of, slot_to_read,
 };
 use super::list::{CountedObjects, ObjectFilter};
 use super::registry::{OpenObject, Scope, tests::assert_binds_scope};
@@ -192,6 +192,14 @@ async fn an_opened_alert_shows_the_overview_only_on_its_own_cluster(cx: &mut Tes
         cx.set_global(Alerts(center.clone()));
         center
     });
+    // On a list, so that only the alert can bring the overview back.
+    t.dispatch(cx, "workspace::OpenView", json!({"kind": "pods"}))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        dashboard(cx, &t).is_none(),
+        "the list replaced the overview"
+    );
     let generation = t.model.read_with(cx, |model, _| {
         model.active_cluster().expect("alpha is active").generation
     });
@@ -551,6 +559,147 @@ async fn a_problem_row_from_another_server_opens_nothing(cx: &mut TestAppContext
     t.click(cx, ("dashboard-problem", 0usize));
     cx.run_until_parked();
     assert!(dashboard(cx, &t).is_some(), "the overview stays");
+    assert!(t.list(cx).is_none());
+}
+
+fn show_warning_row(
+    cx: &mut TestAppContext,
+    view: &Entity<DashboardView>,
+    server: Option<String>,
+) -> OpenObject {
+    let open = OpenObject {
+        kind: "Pod.v1".to_owned(),
+        namespace: Some("demo".to_owned()),
+        name: "web-0".to_owned(),
+        cluster: Some("kind-alpha".to_owned()),
+        server,
+    };
+    let row = WarningRow {
+        age: "1m".to_owned(),
+        reason: "BackOff".to_owned(),
+        object: "Pod demo/web-0".to_owned(),
+        message: "Back-off restarting failed container".to_owned(),
+        occurrences: 1,
+        open: Some(open.clone()),
+    };
+    view.update(cx, |view, cx| {
+        let mut model = view.model().clone();
+        model.warnings = WarningsPanel::Rows {
+            rows: vec![row],
+            total: 1,
+        };
+        view.set_model(model, cx);
+    });
+    cx.run_until_parked();
+    open
+}
+
+fn alpha_server(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<String> {
+    t.workspace.read_with(cx, |ws, cx| {
+        ws.cluster_summary("kind-alpha", cx)
+            .and_then(|summary| summary.info.server.clone())
+    })
+}
+
+#[gpui_kit::test]
+async fn a_connected_cluster_opens_on_its_overview(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    cx.run_until_parked();
+    assert!(dashboard(cx, &t).is_some());
+    assert!(t.list(cx).is_none());
+    let nav = t.workspace.read_with(cx, |ws, _| ws.nav_view());
+    assert!(nav.read_with(cx, |nav, _| nav.overview_open()));
+}
+
+#[gpui_kit::test]
+async fn a_paused_cluster_does_not_open_an_overview(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.model.update(cx, |model, cx| {
+        let alpha = model
+            .clusters
+            .iter_mut()
+            .find(|c| c.info.name == "kind-alpha")
+            .unwrap();
+        alpha.paused = true;
+        cx.notify();
+    });
+    t.connect_alpha(cx, standard_sections()).await;
+    cx.run_until_parked();
+    assert!(dashboard(cx, &t).is_none(), "no overview, so no feed");
+}
+
+#[gpui_kit::test]
+async fn a_warning_row_opens_its_exact_object(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let view = open_held(cx, &t).await;
+    let server = alpha_server(cx, &t);
+    show_warning_row(cx, &view, server);
+    t.click(cx, ("dashboard-warning", 0usize));
+    cx.run_until_parked();
+    assert!(dashboard(cx, &t).is_none(), "the overview gave way");
+    t.feed_list(cx, pods(&[("demo", "web-0", 0), ("demo", "web-1", 0)]))
+        .await;
+    assert_eq!(t.selected(cx).as_deref(), Some("web-0"));
+}
+
+// The waiting overview has no other link, so the first Down lands on the row.
+#[gpui_kit::test]
+async fn a_warning_row_opens_from_the_keyboard(cx: &mut TestAppContext) {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::test::TestWindowExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let view = open_held(cx, &t).await;
+    let server = alpha_server(cx, &t);
+    show_warning_row(cx, &view, server);
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    t.press(cx, "down");
+    t.press(cx, "enter");
+    assert!(dashboard(cx, &t).is_none(), "the overview gave way");
+    t.feed_list(cx, pods(&[("demo", "web-0", 0), ("demo", "web-1", 0)]))
+        .await;
+    assert_eq!(t.selected(cx).as_deref(), Some("web-0"));
+}
+
+#[gpui_kit::test]
+async fn a_warning_row_from_another_server_opens_nothing_and_says_so(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let view = open_held(cx, &t).await;
+    show_warning_row(cx, &view, Some("https://replaced.invalid".to_owned()));
+    t.click(cx, ("dashboard-warning", 0usize));
+    cx.run_until_parked();
+    assert!(dashboard(cx, &t).is_some(), "the overview stays");
+    assert!(t.list(cx).is_none());
+    let error = t
+        .workspace
+        .read_with(cx, |ws, _| ws.action_error().map(str::to_owned));
+    assert_eq!(
+        error.as_deref(),
+        Some("Cannot open Pod demo/web-0 on this cluster.")
+    );
+}
+
+#[gpui_kit::test]
+async fn a_warning_row_of_a_gone_feed_opens_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let view = open_held(cx, &t).await;
+    let server = alpha_server(cx, &t);
+    let link = show_warning_row(cx, &view, server);
+    view.update(cx, |view, cx| {
+        view.set_running_feed_for_test(Some(FeedId::for_test("kind-alpha")));
+        assert!(view.refuses_link(|model| model.links_object(&link), cx));
+    });
+    t.click(cx, ("dashboard-warning", 0usize));
+    cx.run_until_parked();
+    assert!(dashboard(cx, &t).is_some(), "the stale row opened nothing");
     assert!(t.list(cx).is_none());
 }
 

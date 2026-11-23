@@ -1713,6 +1713,8 @@ impl<E: InteractiveElement, W: 'static, V: 'static> Bind<V> for ForwardCurrent<E
 pub const WORKSPACE: &str = "Workspace";
 /// Plain keys (arrows, Esc) work in the window, but not while typing in a field.
 const PLAIN: &str = "Workspace && !Input";
+/// On the cluster overview, outside a text field.
+const DASHBOARD_PLAIN: &str = "Dashboard && !Input";
 /// The same, for the list: deeper than the workspace, so it wins there.
 const LIST_ALONE: &str = "ResourceList && !Input";
 /// The list's text filter.
@@ -2374,6 +2376,21 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             SHORT_WORKLOAD_KIND,
         )
         .of(C::View, S::Dashboard)
+        .hidden(),
+        // Tab moves between panes, so the arrows move between the overview's links.
+        Spec::unit::<super::dashboard::FocusNextLink>(
+            "Focus Next Overview Link",
+            "Move focus to the next link on the cluster overview.",
+        )
+        .of(C::View, S::Dashboard)
+        .keys(&["down"], Some(DASHBOARD_PLAIN))
+        .hidden(),
+        Spec::unit::<super::dashboard::FocusPreviousLink>(
+            "Focus Previous Overview Link",
+            "Move focus to the previous link on the cluster overview.",
+        )
+        .of(C::View, S::Dashboard)
+        .keys(&["up"], Some(DASHBOARD_PLAIN))
         .hidden(),
         Spec::with_args::<ToggleNavSection>(
             "Toggle Navigation Section…",

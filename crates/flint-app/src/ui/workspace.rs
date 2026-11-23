@@ -1183,6 +1183,9 @@ impl Workspace {
             // The kind last open on this cluster, also after a restart.
             self.restore_kind(&entry, window, cx);
         }
+        if self.list.is_none() {
+            self.open_default_overview(window, cx);
+        }
     }
 
     /// Keeps `self.namespaces` in step with the cluster's namespaces, for the filter.
@@ -1259,14 +1262,33 @@ impl Workspace {
         }
     }
 
+    /// Opens a connected cluster on its overview when nothing else was asked for. A paused
+    /// cluster stays as it is, so no feed starts, and a set being admitted is not cancelled.
+    fn open_default_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let model = self.model.read(cx);
+        let ready = model.active_cluster().is_some_and(|cluster| {
+            matches!(cluster.state, ConnectionState::Connected(_))
+                && !model.sessions_paused(cluster)
+        });
+        if ready && !self.sets.is_opening() {
+            self.show_dashboard(self.palette.is_none(), window, cx);
+        }
+    }
+
     /// Shows the active cluster's overview in place of its list. Go Back returns to the list.
     fn open_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_dashboard(true, window, cx);
+    }
+
+    fn show_dashboard(&mut self, take_focus: bool, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(cluster), Some(generation)) = (self.cluster.clone(), self.generation) else {
             return;
         };
         if let Some((view, _)) = &self.dashboard {
-            let focus = view.read(cx).focus_handle(cx);
-            window.focus(&focus, cx);
+            if take_focus {
+                let focus = view.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+            }
             return;
         }
         // Any place other than the list shown: the overview is not one Go Back returns to.
@@ -1280,8 +1302,10 @@ impl Workspace {
         let model = self.model.clone();
         let view = cx.new(|cx| DashboardView::following(model, cluster, generation, cx));
         let events = cx.subscribe_in(&view, window, Self::on_dashboard_event);
-        let focus = view.read(cx).focus_handle(cx);
-        window.focus(&focus, cx);
+        if take_focus {
+            let focus = view.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        }
         release_unfocused_input(window, cx);
         self.dashboard = Some((view, events));
         self.nav.update(cx, |nav, cx| nav.set_overview(true, cx));
@@ -1296,9 +1320,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let problems = match *event {
-            DashboardEvent::OpenFilteredList(category) => view.read(cx).problem_list(category),
+        let problems = match event {
+            DashboardEvent::OpenFilteredList(category) => view.read(cx).problem_list(*category),
             DashboardEvent::OpenShortWorkloads(kind) => view.read(cx).short_workloads(kind),
+            DashboardEvent::CannotOpen(object) => {
+                self.refuse(format!("Cannot open {object} on this cluster."), cx);
+                return;
+            }
         };
         let Some(problems) = problems.cloned() else {
             return;
@@ -2704,7 +2732,7 @@ impl Workspace {
         let dashboard = self
             .dashboard
             .as_ref()
-            .filter(|_| !matches!(cluster.state, ConnectionState::Failed(_)));
+            .filter(|_| !connection_stopped(&cluster.state));
         let overview_notice = dashboard
             .filter(|_| matches!(cluster.state, ConnectionState::Connecting))
             .and_then(|_| {
