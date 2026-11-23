@@ -629,6 +629,7 @@ The version lives in the workspace `Cargo.toml` (marked `x-release-please-versio
 
 - [Website](https://sealos.github.io/flint/): the static site in `site/`, published by `.github/workflows/pages.yml`
 - [Architecture](docs/ARCHITECTURE.md)
+- [Run `flint-mcp` in a Kubernetes pod](docs/FLINT-MCP-IN-POD.md)
 - [Release checklist](docs/RELEASING.md)
 - [Architecture decision records](docs/adr/)
 
