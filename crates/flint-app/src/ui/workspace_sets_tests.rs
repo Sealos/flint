@@ -935,10 +935,137 @@ fn a_rename_refuses_another_sets_name_but_keeps_its_own() {
         ClusterSet::new("prod-eu", pins()).unwrap(),
         ClusterSet::new("staging", pins()).unwrap(),
     ];
-    assert_eq!(rename_problem(&saved, "prod-eu", "PROD_EU"), None);
-    assert_eq!(rename_problem(&saved, "prod-eu", "other"), None);
-    assert!(rename_problem(&saved, "prod-eu", "Staging").is_some());
-    assert!(rename_problem(&saved, "prod-eu", "   ").is_some());
+    let id = saved[0].id.clone();
+    assert_eq!(rename_problem(&saved, &id, "PROD_EU"), None);
+    assert_eq!(rename_problem(&saved, &id, "other"), None);
+    assert!(rename_problem(&saved, &id, "Staging").is_some());
+    assert!(rename_problem(&saved, &id, "   ").is_some());
+}
+
+fn server_of(cx: &mut TestAppContext, t: &TestWorkspace, cluster: &str) -> String {
+    t.workspace.read_with(cx, |ws, cx| {
+        let summary = ws.cluster_summary(cluster, cx).unwrap();
+        summary.info.server.clone().unwrap()
+    })
+}
+
+#[gpui_kit::test]
+async fn deleting_the_open_set_closes_it_and_stops_the_core(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    cx.update(|cx| cx.set_global(SettingsDir(dir.path().to_owned())));
+    save_both(cx, &t).await;
+    t.dispatch(
+        cx,
+        "cluster_sets::OpenClusterSet",
+        json!({ "name": "both" }),
+    )
+    .unwrap();
+    t.wait_for_element(cx, "cluster-set-view").await;
+    let id = t
+        .workspace
+        .read_with(cx, |ws, _| ws.sets.saved[0].id.clone());
+    let window = t.window;
+    let workspace = t.workspace.clone();
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| ws.delete_set(id, window, cx))
+    })
+    .unwrap();
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        !workspace.read(cx).sets.is_open()
+    })
+    .await;
+    let core = t
+        .workspace
+        .read_with(cx, |ws, cx| ws.model.read(cx).core().clone());
+    let members = core.running_set().await;
+    assert!(members.is_empty(), "the core runs nothing: {members:?}");
+}
+
+#[gpui_kit::test]
+async fn deleting_a_set_stops_its_open_on_the_way(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    cx.update(|cx| cx.set_global(SettingsDir(dir.path().to_owned())));
+    save_both(cx, &t).await;
+    let id = t
+        .workspace
+        .read_with(cx, |ws, _| ws.sets.saved[0].id.clone());
+    let window = t.window;
+    let workspace = t.workspace.clone();
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| {
+            let set = ws.sets.saved[0].clone();
+            ws.open_set(set.name, set.members, Some(set.id), window, cx);
+            assert!(ws.sets.opening.is_some(), "still on its way");
+            ws.close_deleted_set(&id, window, cx);
+            assert!(ws.sets.opening.is_none(), "no longer wanted");
+        })
+    })
+    .unwrap();
+    let core = t
+        .workspace
+        .read_with(cx, |ws, cx| ws.model.read(cx).core().clone());
+    // The core answers on its own thread, and only that answer can stop what it admitted.
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        cx.run_until_parked();
+        let members = core.running_set().await;
+        if members.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the core runs nothing: {members:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(t.workspace.read_with(cx, |ws, _| !ws.sets.is_open()));
+}
+
+// Chosen on one server, the context moves: neither saving nor opening pins the new server.
+#[gpui_kit::test]
+async fn a_choice_stays_on_the_server_it_was_made_on(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    cx.update(|cx| cx.set_global(SettingsDir(dir.path().to_owned())));
+    let alpha = server_of(cx, &t, "kind-alpha");
+    pick(cx, &t, "kind-alpha");
+    pick(cx, &t, "kind-beta");
+    let held = t.workspace.read_with(cx, |ws, _| ws.sets.picked.clone());
+    assert_eq!(held[0], ClusterPin::new("kind-alpha", alpha));
+
+    // The choice as it would stand had the context moved since it was made.
+    t.workspace.update(cx, |ws, _| {
+        ws.sets.picked[1].server = "https://chosen-before.invalid".to_owned();
+    });
+    let pinned = t.workspace.read_with(cx, |ws, cx| ws.picked_pins(cx));
+    assert_eq!(pinned[1].server, "https://chosen-before.invalid");
+
+    t.dispatch(
+        cx,
+        "cluster_sets::SaveClusterSet",
+        json!({ "name": "moved" }),
+    )
+    .unwrap();
+    cx.run_until_parked();
+    let (saved, error) = t.workspace.read_with(cx, |ws, _| {
+        (ws.sets.saved.is_empty(), ws.sets.error.clone())
+    });
+    assert!(saved, "nothing is saved");
+    let error = error.expect("says why");
+    assert!(error.contains("another server"), "{error}");
+
+    t.dispatch(cx, "cluster_sets::OpenPickedClusters", Value::Null)
+        .unwrap();
+    cx.run_until_parked();
+    let (open, error) = t
+        .workspace
+        .read_with(cx, |ws, _| (ws.sets.is_open(), ws.sets.error.clone()));
+    assert!(!open, "one member left is too few");
+    assert!(error.expect("says why").contains("kind-beta"));
+    assert!(!t.server_was_contacted(), "nothing started");
 }
 
 #[gpui_kit::test]
@@ -1085,7 +1212,8 @@ async fn a_cmd_click_chooses_and_a_plain_click_does_not(cx: &mut TestAppContext)
         .workspace
         .read_with(cx, |ws, _| (ws.sets.picking(), ws.sets.picked.clone()));
     assert!(picking, "the first choice starts choosing");
-    assert_eq!(picked, ["kind-beta"]);
+    assert_eq!(picked.len(), 1);
+    assert_eq!(picked[0].context, "kind-beta");
     assert!(!t.server_was_contacted(), "choosing connects to nothing");
 }
 

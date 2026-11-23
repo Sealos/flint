@@ -1212,6 +1212,34 @@ pub(crate) fn edit_settings_if_changed(
     edit_locked(&path, &lock, edit)
 }
 
+/// [`edit_settings_if_changed`] that refuses to go on without a real lock: for an edit that is no
+/// revocation, where failing is safer than overwriting a concurrent save.
+pub(crate) fn edit_settings_locked(
+    dir: &Path,
+    edit: impl FnOnce(&mut toml::Table, &Path) -> Result<bool, SettingsError>,
+) -> Result<Settings, SettingsError> {
+    edit_settings_locked_with(dir, try_flock, edit)
+}
+
+fn edit_settings_locked_with(
+    dir: &Path,
+    try_lock: TryLock,
+    edit: impl FnOnce(&mut toml::Table, &Path) -> Result<bool, SettingsError>,
+) -> Result<Settings, SettingsError> {
+    let path = dir.join(SETTINGS_FILE);
+    let lock = lock_for_save(&path, try_lock)?;
+    if lock.file.is_none() {
+        return Err(SettingsError::Write {
+            path,
+            source: io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this folder does not support file locks",
+            ),
+        });
+    }
+    edit_locked(&path, &lock, edit)
+}
+
 /// The read, edit and write of [`edit_settings_if_changed`], all on the file `lock` was taken
 /// for. If `path` has come to lead elsewhere by the time of the write, nothing is written.
 fn edit_locked(
@@ -1773,6 +1801,21 @@ mod save_lock_tests {
         assert!(matches!(result, Err(SettingsError::Write { .. })));
         assert_eq!(std::fs::read_to_string(&old).unwrap(), old_text);
         assert_eq!(std::fs::read_to_string(&new).unwrap(), new_text);
+    }
+
+    #[test]
+    fn an_edit_that_needs_a_lock_is_refused_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = edit_settings_locked_with(
+            dir.path(),
+            |_| Err(io::Error::from_raw_os_error(libc::ENOLCK)),
+            |table, _| {
+                table.insert("protect_local_clusters".into(), true.into());
+                Ok(true)
+            },
+        );
+        assert!(matches!(result, Err(SettingsError::Write { .. })));
+        assert!(!dir.path().join(SETTINGS_FILE).exists(), "nothing written");
     }
 
     #[test]
