@@ -104,6 +104,8 @@ impl EventEmitter<CombinedListEvent> for CombinedResourceList {}
 
 pub struct CombinedResourceList {
     pub(in super::super) label: String,
+    /// Which members lack this kind, or can't be confirmed to serve it.
+    kind_note: Option<String>,
     latest: CombinedSource,
     /// The source being drawn and its view. Always replaced together: a [`RowRef`] means
     /// nothing in any other list.
@@ -175,6 +177,7 @@ impl CombinedResourceList {
         });
         let mut list = Self {
             label,
+            kind_note: None,
             shown: source.clone(),
             latest: source,
             view: Arc::new(CombinedView::default()),
@@ -1000,6 +1003,37 @@ impl CombinedResourceList {
             }))
     }
 
+    /// Names the members without this kind under the member notes (`None`: all have it).
+    pub fn set_kind_note(&mut self, note: Option<String>, cx: &mut Context<Self>) {
+        if self.kind_note != note {
+            self.kind_note = note;
+            cx.notify();
+        }
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn kind_note(&self) -> Option<&str> {
+        self.kind_note.as_deref()
+    }
+
+    fn render_kind_note(&self, theme: &Theme) -> Option<impl IntoElement + use<>> {
+        let note = SharedString::from(self.kind_note.clone()?);
+        Some(
+            div()
+                .id("combined-kind-note")
+                .flex_none()
+                .px_3()
+                .py_1()
+                .border_b_1()
+                .border_color(theme.border)
+                .text_xs()
+                .text_color(theme.warning)
+                .aria_label(note.clone())
+                .child(note)
+                .test_support(),
+        )
+    }
+
     /// The toolbar's count. Until the first view lands, nothing is known to be filtered out.
     pub(super) fn count(&self) -> String {
         let total = self.shown.total_rows();
@@ -1177,6 +1211,7 @@ impl Render for CombinedResourceList {
             .relative()
             .child(self.render_toolbar(theme))
             .child(self.render_members(theme))
+            .children(self.render_kind_note(theme))
             .child(body)
     }
 }

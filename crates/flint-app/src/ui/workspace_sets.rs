@@ -79,6 +79,10 @@ pub(super) struct RunningSet {
     members: Vec<AdmittedMember>,
     /// Members that left their admitted server: their rows are gone and stay gone.
     changed: HashSet<ClusterId>,
+    /// Members not subscribed to `kind`, because their discovery can't vouch for it yet.
+    held: HashSet<ClusterId>,
+    /// The window its feeds draw in, for a held member that joins later.
+    window: AnyWindowHandle,
     /// Saved members that already pointed elsewhere when the set opened: never admitted.
     left_out: Vec<ClusterId>,
     kind: KindId,
@@ -787,6 +791,7 @@ impl Workspace {
             run.set_id = opening.set_id;
             run.left_out = opening.left_out;
         }
+        self.refresh_set_kinds(cx);
     }
 
     /// Opens the combined list of `kind` over `members`, feeding it from the core. Rows appear
@@ -801,18 +806,28 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let core = self.model.read(cx).core().clone();
-        let subscriptions: Vec<_> = members
-            .iter()
-            // Bound: the core starts no LIST or watch for a member that has changed.
-            .map(|member| {
-                core.bound_to(member.clone())
-                    .subscribe(member.context(), &kind)
-            })
-            .collect();
-        let snapshots: Vec<Arc<KindSnapshot>> = subscriptions
-            .iter()
-            .map(|s| without_rows(&s.peek(), SyncState::Loading))
-            .collect();
+        let evidence = self.member_kinds(&members, cx);
+        let mut held = HashSet::new();
+        let mut subscriptions = Vec::new();
+        let mut snapshots: Vec<Arc<KindSnapshot>> = Vec::with_capacity(members.len());
+        for (member, found) in members.iter().zip(&evidence) {
+            if found.may_subscribe(&kind) {
+                // Bound: the core starts no LIST or watch for a member that has changed.
+                let subscription = core
+                    .bound_to(member.clone())
+                    .subscribe(member.context(), &kind);
+                snapshots.push(without_rows(&subscription.peek(), SyncState::Loading));
+                subscriptions.push((subscription, member.clone()));
+            } else {
+                held.insert(member.context().to_owned());
+                snapshots.push(Arc::new(KindSnapshot {
+                    cluster: member.context().to_owned(),
+                    kind: kind.clone(),
+                    ..KindSnapshot::default()
+                }));
+            }
+        }
+        let window_handle = window.window_handle();
         let source = self.combined_source(&snapshots, cx);
         let title = format!("{kind_label} · {label}");
         let shown_kind = kind_label;
@@ -820,28 +835,8 @@ impl Workspace {
         let events = cx.subscribe_in(&list, window, Self::on_combined_event);
         let feeds = subscriptions
             .into_iter()
-            .zip(members.clone())
-            .map(|(mut subscription, member)| {
-                let core = core.clone();
-                cx.spawn_in(window, async move |this, cx| {
-                    while subscription.changed().await {
-                        let snapshot = subscription.latest();
-                        // After the read: rows of a replacement server can only exist once the
-                        // core has recorded the move, so this check sees it.
-                        if let Some(why) = core.check_member(&member).await {
-                            let _ = this.update(cx, |ws, cx| {
-                                ws.discard_member(member.context(), why, cx);
-                                ws.check_set_row(cx);
-                            });
-                            break;
-                        }
-                        let alive = this
-                            .update_in(cx, |ws, window, cx| ws.feed_member(snapshot, window, cx));
-                        if alive.is_err() {
-                            break;
-                        }
-                    }
-                })
+            .map(|(subscription, member)| {
+                Self::member_feed(core.clone(), subscription, member, window_handle, cx)
             })
             .collect();
         let reports = cx.spawn(async move |this, cx| {
@@ -859,15 +854,15 @@ impl Workspace {
         let focus = list.read(cx).focus_handle().clone();
         window.focus(&focus, cx);
         release_unfocused_input(window, cx);
-        self.nav
-            .update(cx, |nav, cx| nav.set_selected(Some(kind.clone()), cx));
         self.sets.running = Some(RunningSet {
             label,
             set_id: None,
             members,
             changed: HashSet::new(),
+            held,
+            window: window_handle,
             left_out: Vec::new(),
-            kind,
+            kind: kind.clone(),
             kind_label: shown_kind,
             list,
             snapshots,
@@ -879,6 +874,8 @@ impl Workspace {
             _reports: reports,
             _list_events: events,
         });
+        self.nav
+            .update(cx, |nav, cx| nav.set_selected(Some(kind), cx));
         cx.notify();
     }
 
@@ -915,6 +912,8 @@ impl Workspace {
             run.set_id = set_id;
             run.left_out = left_out;
         }
+        // Only now: a member that changed must not count as serving, even for a moment.
+        self.refresh_set_kinds(cx);
         true
     }
 
@@ -992,6 +991,7 @@ impl Workspace {
             run.snapshots[at] = without_rows(&run.snapshots[at], SyncState::Idle);
         }
         self.rebuild_combined(cx);
+        self.refresh_set_kinds(cx);
         self.refuse(why, cx);
     }
 
@@ -1041,6 +1041,7 @@ impl Workspace {
         if run.reports != reports {
             run.reports = reports;
             self.check_set_row(cx);
+            self.refresh_set_kinds(cx);
             cx.notify();
         }
     }
@@ -1283,6 +1284,7 @@ impl Workspace {
             // Through the same queue as admissions, so it can't overtake a later one.
             drop(self.model.read(cx).core().admit_running_set(Vec::new()));
         }
+        self.refresh_set_kinds(cx);
     }
 
     /// The running set's main area: the combined list beside the selected row's detail, or the
@@ -1501,6 +1503,9 @@ impl Workspace {
             })
     }
 }
+
+#[path = "workspace_set_kinds.rs"]
+mod kinds;
 
 #[cfg(test)]
 #[path = "workspace_sets_tests.rs"]

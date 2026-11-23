@@ -8,6 +8,7 @@ use flint_core::problems::{
     Problem, ProblemId, ProblemKind, ProblemSeverity, ProblemSubject, WORKLOAD_HOLD_DOWN,
     WorkloadKind,
 };
+use gpui_kit::test::TestAppContextExt as _;
 use gpui_kit::{Entity, TestAppContext};
 use jiff::Timestamp;
 use serde_json::{Value, json};
@@ -18,7 +19,7 @@ use super::dashboard::{
 };
 use super::list::{CountedObjects, ObjectFilter};
 use super::registry::{OpenObject, Scope, tests::assert_binds_scope};
-use super::support_tests::{TestWorkspace, open_workspace, pods, standard_sections};
+use super::support_tests::{TestWorkspace, WAIT, open_workspace, pods, standard_sections};
 use flint_core::thresholds::ThresholdLevel;
 
 const OPEN: &str = "workspace::OpenClusterOverview";
@@ -34,6 +35,18 @@ async fn open(cx: &mut TestAppContext, t: &TestWorkspace) -> Entity<DashboardVie
     cx.run_until_parked();
     t.dispatch(cx, OPEN, Value::Null).unwrap();
     dashboard(cx, t).expect("the overview is open")
+}
+
+/// The overview with its feed held, so a background read cannot replace values set by hand.
+async fn open_held(cx: &mut TestAppContext, t: &TestWorkspace) -> Entity<DashboardView> {
+    let view = open(cx, t).await;
+    let feed = FeedId::for_test("kind-alpha");
+    view.update(cx, |view, cx| {
+        view.set_running_feed_for_test(Some(feed.clone()));
+        let (model, lists) = (view.model().clone(), ProblemLists::new());
+        view.finish_read_for_test(Some(feed), model, lists, cx);
+    });
+    view
 }
 
 /// `(namespace, name, uid)` of each object. The fake lists give a row the UID `uid-<name>`.
@@ -202,7 +215,7 @@ async fn an_opened_alert_shows_the_overview_only_on_its_own_cluster(cx: &mut Tes
 async fn each_counted_kind_opens_its_own_list(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    let view = open(cx, &t).await;
+    let view = open_held(cx, &t).await;
     let lists = HashMap::from([(
         ProblemCategory::ShortWorkloads,
         vec![
@@ -283,7 +296,7 @@ async fn a_read_of_a_stopped_feed_is_not_shown_or_opened(cx: &mut TestAppContext
 async fn a_tile_opens_objects_outside_the_namespace_picker(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    let view = open(cx, &t).await;
+    let view = open_held(cx, &t).await;
     t.dispatch(
         cx,
         "workspace::ToggleNamespace",
@@ -313,7 +326,7 @@ async fn a_tile_opens_objects_outside_the_namespace_picker(cx: &mut TestAppConte
 async fn a_tile_counting_zero_opens_an_empty_list(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    let view = open(cx, &t).await;
+    let view = open_held(cx, &t).await;
     show_failing_pods(cx, &view, &[]);
     t.dispatch(cx, OPEN_LIST, json!({"category": "failing_pods"}))
         .unwrap();
@@ -325,7 +338,7 @@ async fn a_tile_counting_zero_opens_an_empty_list(cx: &mut TestAppContext) {
 async fn a_replaced_pod_of_the_same_name_is_not_listed(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    let view = open(cx, &t).await;
+    let view = open_held(cx, &t).await;
     show_failing_pods(cx, &view, &[("demo", "web-0", "uid-of-the-old-pod")]);
     t.dispatch(cx, OPEN_LIST, json!({"category": "failing_pods"}))
         .unwrap();
@@ -373,7 +386,7 @@ async fn with_no_feed_every_tile_is_unavailable_and_opens_nothing(cx: &mut TestA
 async fn a_problem_tile_opens_its_objects_and_the_kind_shows_all_again(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    let view = open(cx, &t).await;
+    let view = open_held(cx, &t).await;
     show_failing_pods(cx, &view, &[("demo", "web-0", "uid-web-0")]);
     t.dispatch(cx, OPEN_LIST, json!({"category": "failing_pods"}))
         .unwrap();
@@ -384,8 +397,16 @@ async fn a_problem_tile_opens_its_objects_and_the_kind_shows_all_again(cx: &mut 
     assert_eq!(t.row_count(cx), 1);
     t.dispatch(cx, "workspace::OpenView", json!({"kind": "pods"}))
         .unwrap();
-    cx.run_until_parked();
     assert!(list.read_with(cx, |list, _| list.only().is_none()));
+    // The rows are computed on a core thread, which `run_until_parked` does not wait for.
+    let widened = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| widened.read(cx).shown().1 != 1)
+        .await;
+    cx.run_until_parked();
+    // The list filters off the UI thread, so the wider result lands a moment later.
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 2)
+        .await;
     assert_eq!(t.row_count(cx), 2);
 }
 
@@ -502,7 +523,7 @@ async fn a_link_from_the_frame_before_a_feed_stopped_opens_nothing(cx: &mut Test
 async fn a_problem_row_opens_its_exact_object(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    let view = open(cx, &t).await;
+    let view = open_held(cx, &t).await;
     let server = t.workspace.read_with(cx, |ws, cx| {
         ws.cluster_summary("kind-alpha", cx)
             .and_then(|summary| summary.info.server.clone())
@@ -520,7 +541,7 @@ async fn a_problem_row_opens_its_exact_object(cx: &mut TestAppContext) {
 async fn a_problem_row_from_another_server_opens_nothing(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    let view = open(cx, &t).await;
+    let view = open_held(cx, &t).await;
     show_problem_row(
         cx,
         &view,
