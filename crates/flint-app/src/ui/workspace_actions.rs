@@ -942,7 +942,7 @@ impl Workspace {
 
     fn check_open_view(&self, action: &OpenView, cx: &App) -> Result<(), ActionError> {
         self.check_listed_on::<OpenView>(action.cluster.as_deref(), action.server.as_deref(), cx)?;
-        match self.nav_entry(&action.kind, cx) {
+        match self.view_entry(&action.kind, cx) {
             Some(_) => Ok(()),
             None => Err(ActionError::rejected::<OpenView>(format!(
                 "the active cluster does not serve {} (or discovery has not finished)",
@@ -1448,19 +1448,24 @@ impl Workspace {
             tracing::warn!("{e}");
             return;
         }
-        match self.nav_entry(&action.kind, cx) {
+        match self.view_entry(&action.kind, cx) {
             Some(entry) => self.open_kind(&entry, window, cx),
             None => tracing::warn!("{}", self.check_open_view(action, cx).unwrap_err()),
         }
     }
 
-    /// The navigation entry for `kind`, named as `kubectl get` takes it (Kind, plural, singular
-    /// or short name, optionally `.group`), through the core resolver: from what the open set
-    /// serves, else from the active cluster.
-    pub(in crate::ui) fn nav_entry(&self, kind: &str, cx: &App) -> Option<NavEntry> {
-        if let Some(entry) = self.nav.read(cx).set_entry(kind) {
-            return Some(entry);
+    /// The entry a view of `kind` opens: from what the open set serves, and nothing else while a
+    /// set is open, or from the active cluster.
+    pub(in crate::ui) fn view_entry(&self, kind: &str, cx: &App) -> Option<NavEntry> {
+        match self.nav.read(cx).set_kinds() {
+            Some(set) => set.entry(kind),
+            None => self.nav_entry(kind, cx),
         }
+    }
+
+    /// The active cluster's navigation entry for `kind`, named as `kubectl get` takes it (Kind,
+    /// plural, singular or short name, optionally `.group`), through the core resolver.
+    pub(in crate::ui) fn nav_entry(&self, kind: &str, cx: &App) -> Option<NavEntry> {
         let model = self.model.read(cx);
         let active = model.active.as_ref()?;
         let discovery = model.discovered(active)?.discovery.as_ref()?;

@@ -232,12 +232,6 @@ impl NavPanel {
         self.set.as_ref()
     }
 
-    /// The entry the open set has for `kind`, named as `kubectl get` takes it.
-    pub(in crate::ui) fn set_entry(&self, kind: &str) -> Option<NavEntry> {
-        let set = self.set.as_ref()?;
-        set.discovery().nav_entry(kind).ok().cloned()
-    }
-
     /// What the tree shows, and the name its open sections are kept under.
     pub(in crate::ui) fn tree(&self) -> Option<(&ClusterId, &ClusterDiscovery)> {
         shown_tree(&self.set, &self.cluster, &self.discovery)
@@ -476,14 +470,17 @@ impl NavPanel {
     }
 }
 
-/// The open set's kinds once any member has reported some, else the active cluster's. Takes the
-/// fields, so a caller can change the panel's other fields while holding the result.
+/// The open set's kinds, none until a member has reported some, else the active cluster's. Takes
+/// the fields, so a caller can change the panel's other fields while holding the result.
 fn shown_tree<'a>(
     set: &'a Option<SetKinds>,
     cluster: &'a Option<ClusterId>,
     discovery: &'a Option<Arc<ClusterDiscovery>>,
 ) -> Option<(&'a ClusterId, &'a ClusterDiscovery)> {
-    if let Some(set) = set.as_ref().filter(|s| s.has_kinds()) {
+    if let Some(set) = set {
+        if !set.has_kinds() {
+            return None;
+        }
         let key = cluster.as_ref().or_else(|| set.first_member())?;
         return Some((key, set.discovery()));
     }
@@ -525,8 +522,12 @@ impl Render for NavPanel {
             (None, true) => {
                 // A failed connection has its Retry in the main area; only a failed discovery
                 // (with a connection) offers one here.
-                let retry =
-                    !self.connection_failed && !self.awaiting_confirmation && self.error.is_some();
+                // An open set's kinds are still coming; the active cluster's state is not theirs.
+                let own = self.set.is_none();
+                let retry = own
+                    && !self.connection_failed
+                    && !self.awaiting_confirmation
+                    && self.error.is_some();
                 rows.push(
                     (v_flex()
                         .flex_none()
@@ -535,11 +536,11 @@ impl Render for NavPanel {
                         .items_start()
                         .text_sm()
                         .text_color(theme.muted_foreground)
-                        .child(if self.awaiting_confirmation {
+                        .child(if own && self.awaiting_confirmation {
                             "Waiting for kubeconfig to be confirmed."
-                        } else if self.connection_failed {
+                        } else if own && self.connection_failed {
                             "Connection failed."
-                        } else if self.error.is_some() {
+                        } else if own && self.error.is_some() {
                             "Discovery failed. Flint retries on its own."
                         } else {
                             "Discovering resources…"

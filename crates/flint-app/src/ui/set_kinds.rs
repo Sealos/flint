@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use flint_core::{ClusterDiscovery, ClusterId, KindId, KindInfo};
+use flint_core::{ClusterDiscovery, ClusterId, KindId, KindInfo, NavEntry};
 
 /// What one member contributes.
 #[derive(Debug, Clone)]
@@ -41,19 +41,32 @@ impl MemberKinds {
         let Some(discovery) = &self.discovery else {
             return Presence::Unknown;
         };
-        if discovery.kind(kind).is_some_and(KindInfo::is_listable) {
-            return Presence::Serves;
-        }
-        let provable = self.complete
+        // A failed refresh or a skipped group leaves older kinds in place: they prove nothing
+        // either way, so a cached entry is no more evidence than a missing one.
+        let current = self.complete
             && !discovery
                 .incomplete_groups
                 .iter()
                 .any(|g| g == kind.group());
-        if provable {
-            Presence::Lacks
-        } else {
+        if !current {
             Presence::Unknown
+        } else if discovery.kind(kind).is_some_and(KindInfo::is_listable) {
+            Presence::Serves
+        } else {
+            Presence::Lacks
         }
+    }
+
+    /// Whether `kind` may be subscribed to on this member. A member with a discovery that can't
+    /// vouch for the kind waits: the core would list from its cached entry, or call the kind
+    /// unavailable. With no discovery the core starts nothing until one arrives.
+    pub fn may_subscribe(&self, kind: &KindId) -> bool {
+        self.discovery.is_none() || self.presence(kind) != Presence::Unknown
+    }
+
+    /// Whether this member was held back from `kind` and its discovery now vouches for it.
+    pub fn vouches_for(&self, kind: &KindId) -> bool {
+        self.discovery.is_some() && self.may_subscribe(kind)
     }
 }
 
@@ -181,6 +194,22 @@ impl SetKinds {
         &self.discovery
     }
 
+    /// The entry for `kind`: its exact id, as the navigation sends it, else named as `kubectl
+    /// get` takes it. The exact id comes first because one member's plural can be another's
+    /// singular, which the name alone can't tell apart.
+    pub fn entry(&self, kind: &str) -> Option<NavEntry> {
+        let exact = self
+            .discovery
+            .navigation
+            .sections
+            .iter()
+            .flat_map(|s| &s.entries)
+            .find(|e| e.id.as_str() == kind);
+        exact
+            .or_else(|| self.discovery.nav_entry(kind).ok())
+            .cloned()
+    }
+
     pub fn has_kinds(&self) -> bool {
         !self.discovery.navigation.sections.is_empty()
     }
@@ -296,7 +325,38 @@ mod tests {
         let coverage = set.coverage(&widgets()).unwrap();
         assert!(coverage.lacking.is_empty());
         assert_eq!(coverage.unconfirmed, ["A"]);
-        assert_eq!(set.coverage(&KindId::pods()).unwrap().serving, 2);
+        // What it knew stays in the navigation, but no longer counts as served.
+        let pods = set.coverage(&KindId::pods()).unwrap();
+        assert_eq!(pods.serving, 1);
+        assert_eq!(pods.unconfirmed, ["A"]);
+    }
+
+    #[test]
+    fn a_kind_kept_from_a_skipped_group_is_not_confirmed() {
+        let kept = found(true);
+        let kept = ClusterDiscovery::with_incomplete_groups(kept.kinds, vec!["example.com".into()]);
+        let set = SetKinds::new(vec![member("a", kept), member("b", found(true))]);
+        let coverage = set.coverage(&widgets()).unwrap();
+        assert_eq!(coverage.serving, 1);
+        assert_eq!(coverage.unconfirmed, ["A"]);
+    }
+
+    #[test]
+    fn an_exact_kind_wins_over_another_members_singular() {
+        let of = |plural: &str, kind: &str, label: &str| {
+            let sections = vec![section(
+                "example.com",
+                SectionKind::ApiGroup,
+                vec![entry("example.com", plural, kind, label, true)],
+            )];
+            ClusterDiscovery::new(discovery(sections).kinds)
+        };
+        let set = SetKinds::new(vec![
+            member("a", of("foos", "Foo", "Foos")),
+            member("b", of("fooses", "Foos", "Fooses")),
+        ]);
+        let foos = KindId::new("example.com", "foos");
+        assert_eq!(set.entry(&foos.to_string()).map(|e| e.id), Some(foos));
     }
 
     #[test]

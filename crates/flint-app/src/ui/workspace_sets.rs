@@ -69,6 +69,10 @@ pub(super) struct RunningSet {
     members: Vec<AdmittedMember>,
     /// Members that left their admitted server: their rows are gone and stay gone.
     changed: HashSet<ClusterId>,
+    /// Members not subscribed to `kind`, because their discovery can't vouch for it yet.
+    held: HashSet<ClusterId>,
+    /// The window its feeds draw in, for a held member that joins later.
+    window: AnyWindowHandle,
     kind: KindId,
     pub(super) list: Entity<CombinedResourceList>,
     snapshots: Vec<Arc<KindSnapshot>>,
@@ -483,46 +487,36 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let core = self.model.read(cx).core().clone();
-        let subscriptions: Vec<_> = members
-            .iter()
-            // Bound: the core starts no LIST or watch for a member that has changed.
-            .map(|member| {
-                core.bound_to(member.clone())
-                    .subscribe(member.context(), &kind)
-            })
-            .collect();
-        let snapshots: Vec<Arc<KindSnapshot>> = subscriptions
-            .iter()
-            .map(|s| without_rows(&s.peek(), SyncState::Loading))
-            .collect();
+        let evidence = self.member_kinds(&members, cx);
+        let mut held = HashSet::new();
+        let mut subscriptions = Vec::new();
+        let mut snapshots: Vec<Arc<KindSnapshot>> = Vec::with_capacity(members.len());
+        for (member, found) in members.iter().zip(&evidence) {
+            if found.may_subscribe(&kind) {
+                // Bound: the core starts no LIST or watch for a member that has changed.
+                let subscription = core
+                    .bound_to(member.clone())
+                    .subscribe(member.context(), &kind);
+                snapshots.push(without_rows(&subscription.peek(), SyncState::Loading));
+                subscriptions.push((subscription, member.clone()));
+            } else {
+                held.insert(member.context().to_owned());
+                snapshots.push(Arc::new(KindSnapshot {
+                    cluster: member.context().to_owned(),
+                    kind: kind.clone(),
+                    ..KindSnapshot::default()
+                }));
+            }
+        }
+        let window_handle = window.window_handle();
         let source = self.combined_source(&snapshots, cx);
         let title = format!("{kind_label} · {label}");
         let list = cx.new(|cx| CombinedResourceList::new(title, source, Vec::new(), window, cx));
         let events = cx.subscribe_in(&list, window, Self::on_combined_event);
         let feeds = subscriptions
             .into_iter()
-            .zip(members.clone())
-            .map(|(mut subscription, member)| {
-                let core = core.clone();
-                cx.spawn_in(window, async move |this, cx| {
-                    while subscription.changed().await {
-                        let snapshot = subscription.latest();
-                        // After the read: rows of a replacement server can only exist once the
-                        // core has recorded the move, so this check sees it.
-                        if let Some(why) = core.check_member(&member).await {
-                            let _ = this.update(cx, |ws, cx| {
-                                ws.discard_member(member.context(), why, cx);
-                                ws.check_set_row(cx);
-                            });
-                            break;
-                        }
-                        let alive = this
-                            .update_in(cx, |ws, window, cx| ws.feed_member(snapshot, window, cx));
-                        if alive.is_err() {
-                            break;
-                        }
-                    }
-                })
+            .map(|(subscription, member)| {
+                Self::member_feed(core.clone(), subscription, member, window_handle, cx)
             })
             .collect();
         let reports = cx.spawn(async move |this, cx| {
@@ -544,6 +538,8 @@ impl Workspace {
             label,
             members,
             changed: HashSet::new(),
+            held,
+            window: window_handle,
             kind: kind.clone(),
             list,
             snapshots,
