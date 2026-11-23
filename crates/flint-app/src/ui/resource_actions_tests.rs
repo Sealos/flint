@@ -602,6 +602,13 @@ fn answer(method: &str, path: &str, query: &str, control: &Control) -> (u16, Val
                     json!({"apiVersion": "v1", "kind": "Node",
                            "metadata": {"name": "node-1", "uid": "uid-node-1"}, "spec": {}}),
                 ),
+                200 if path == WEB_SCALE => (
+                    200,
+                    json!({"apiVersion": "autoscaling/v1", "kind": "Scale",
+                           "metadata": {"name": "web", "namespace": "demo", "uid": "uid-web",
+                                        "resourceVersion": "7"},
+                           "spec": {"replicas": 2}}),
+                ),
                 200 => (200, deployment()),
                 code => (
                     code,
