@@ -489,6 +489,8 @@ pub(crate) struct ClusterManager {
     engine_config: Arc<EngineConfig>,
     /// Open subscriptions by id.
     subscriptions: HashMap<u64, (ClusterId, KindId)>,
+    /// Open overviews by id, with the slot generation each was opened on.
+    overviews: HashMap<u64, (ClusterId, u64)>,
     /// Running log sessions by id. They belong to no cluster slot, so they outlive cluster
     /// switches and kubeconfig reloads (UP-42).
     log_sessions: HashMap<u64, JoinHandle<()>>,
@@ -562,6 +564,7 @@ impl ClusterManager {
             hubs,
             engine_config,
             subscriptions: HashMap::new(),
+            overviews: HashMap::new(),
             log_sessions: HashMap::new(),
             log_budget,
             telemetry: Default::default(),
@@ -734,6 +737,8 @@ impl ClusterManager {
                     }
                 }
             }
+            Request::OpenOverview { id, cluster } => self.open_overview(id, cluster),
+            Request::CloseOverview { id } => self.close_overview(id),
             Request::Discovery { cluster, reply } => {
                 let discovery = self
                     .clusters
@@ -5272,6 +5277,82 @@ users:
             ..Settings::default()
         });
         assert!(!dev_has_feed(&mut manager), "on view for this cluster");
+    }
+
+    /// `dev` connected and active, in watch mode On view.
+    async fn on_view_manager(dir: &std::path::Path) -> ClusterManager {
+        let mut manager = manager_reading(dir, &kubeconfig_with("https://127.0.0.1:1")).await;
+        land_connection(&mut manager).await;
+        manager.active = Some("dev".to_owned());
+        manager.settings = Arc::new(Settings {
+            watch_mode: crate::settings::WatchMode::OnView,
+            ..Settings::default()
+        });
+        manager
+    }
+
+    fn open_dev_overview(manager: &mut ClusterManager, id: u64) {
+        manager.handle_request(Request::OpenOverview {
+            id,
+            cluster: "dev".to_owned(),
+        });
+    }
+
+    // covers UP-25: the overview is an open view of the kinds its feed watches.
+    #[tokio::test]
+    async fn in_on_view_a_feed_runs_only_while_the_overview_is_showing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = on_view_manager(dir.path()).await;
+        assert!(!dev_has_feed(&mut manager), "no overview open");
+
+        open_dev_overview(&mut manager, 1);
+        assert!(dev_has_feed(&mut manager), "opened");
+        open_dev_overview(&mut manager, 2);
+        manager.handle_request(Request::CloseOverview { id: 1 });
+        assert!(dev_has_feed(&mut manager), "another is still open");
+        manager.handle_request(Request::CloseOverview { id: 2 });
+        assert!(!dev_has_feed(&mut manager), "left");
+        assert!(manager.overviews.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_overview_feed_stops_with_the_active_cluster_and_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = on_view_manager(dir.path()).await;
+        open_dev_overview(&mut manager, 1);
+        assert!(dev_has_feed(&mut manager));
+
+        // Even a running-set member needs to be the cluster shown.
+        join_dev(&mut manager);
+        manager.active = Some("other".to_owned());
+        assert!(!dev_has_feed(&mut manager), "switched away");
+        manager.active = Some("dev".to_owned());
+        assert!(dev_has_feed(&mut manager), "back on the same generation");
+
+        manager.cluster_mut("dev").unwrap().generation += 1;
+        assert!(!dev_has_feed(&mut manager), "the context started over");
+    }
+
+    #[tokio::test]
+    async fn an_open_overview_starts_no_feed_on_a_paused_cluster() {
+        for second in pauses() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut manager, _, first) = pausable(dir.path(), &second).await;
+            manager.active = Some("dev".to_owned());
+            land_connection(&mut manager).await;
+            manager.settings = Arc::new(Settings {
+                watch_mode: crate::settings::WatchMode::OnView,
+                ..Settings::default()
+            });
+            open_dev_overview(&mut manager, 1);
+            assert!(dev_has_feed(&mut manager));
+
+            rewrite_file(&mut manager, &first, UNREADABLE).await;
+            assert!(manager.paused("dev"));
+            assert!(!dev_has_feed(&mut manager), "stopped by the pause");
+            open_dev_overview(&mut manager, 2);
+            assert!(!dev_has_feed(&mut manager), "opening starts nothing");
+        }
     }
 
     #[tokio::test]

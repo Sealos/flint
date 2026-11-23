@@ -21,6 +21,9 @@ mod clusters;
 mod compare;
 mod confirm;
 mod dashboard;
+#[cfg(test)]
+#[path = "dashboard_wiring_tests.rs"]
+mod dashboard_wiring_tests;
 mod detail;
 mod dock;
 mod dock_model;

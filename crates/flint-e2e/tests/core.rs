@@ -2218,6 +2218,53 @@ fn kubeconfig_with_user(server: &FakeApiServer, context: &str, user: serde_json:
 
 /// A core on two files giving `context` different tokens, active on the first. Broken, that file
 /// leaves the second's definition showing, which pauses the context.
+/// Waits until each of the seven kinds an overview needs has `open` watches or not.
+async fn until_overview_watches(server: &FakeApiServer, open: bool, what: &str) {
+    let kinds = [
+        Gvr::core("pods"),
+        Gvr::core("nodes"),
+        Gvr::new("batch", "v1", "jobs"),
+        Gvr::new("apps", "v1", "deployments"),
+        Gvr::new("apps", "v1", "statefulsets"),
+        Gvr::new("apps", "v1", "daemonsets"),
+        Gvr::new("apps", "v1", "replicasets"),
+    ];
+    tokio::time::timeout(WAIT, async {
+        while !kinds
+            .iter()
+            .all(|kind| (server.open_watches(kind) > 0) == open)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}: never reached"));
+}
+
+// covers UP-25: On view watches the overview's kinds only while it is showing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_on_view_the_overview_watches_its_kinds_until_it_is_left() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, None).await;
+    core.handle.discovery(CONTEXT).await.expect("connected");
+    // Past the manager's next pass, and long enough for a watch that should not exist to open.
+    core.handle.running_set().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(core.handle.telemetry(CONTEXT).is_none());
+    for kind in ["pods", "nodes"] {
+        assert_eq!(server.open_watches(&Gvr::core(kind)), 0, "{kind}");
+    }
+
+    let overview = core.handle.open_overview(CONTEXT);
+    until_overview_watches(&server, true, "watching after opening").await;
+    assert!(core.handle.telemetry(CONTEXT).is_some());
+
+    drop(overview);
+    until_overview_watches(&server, false, "no watch after leaving").await;
+    assert!(core.handle.telemetry(CONTEXT).is_none());
+    assert!(server.writes().is_empty());
+}
+
 async fn core_on_two_definitions(server: &FakeApiServer, context: &str) -> (Core, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let (first, second) = (dir.path().join("first"), dir.path().join("second"));

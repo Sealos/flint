@@ -2,7 +2,9 @@
 //! from it, the failure states that offer a retry, and what a cluster switch does to it.
 
 use flint_core::{ConnectionState, Event, KindId, SyncState};
-use gpui_kit::{AppContext as _, Entity, TestAppContext};
+use gpui_kit::accesskit::{Node, Role};
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::{AppContext as _, Element as _, Entity, IntoElement as _, TestAppContext};
 use serde_json::{Value, json};
 
 use super::NavPanel;
@@ -11,6 +13,20 @@ use crate::ui::support_tests::{TestWorkspace, objects, open_workspace, pods, sta
 
 fn nav(cx: &mut TestAppContext, t: &TestWorkspace) -> Entity<NavPanel> {
     t.workspace.read_with(cx, |ws, _| ws.nav_view())
+}
+
+#[gpui_kit::test]
+async fn the_overview_row_is_a_named_button(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let nav = nav(cx, &t);
+    nav.read_with(cx, |nav, cx| {
+        let row = nav.render_overview(cx.theme()).into_element();
+        let mut node = Node::new(row.a11y_role().expect("a node in the accessibility tree"));
+        row.write_a11y_info(&mut node);
+        assert_eq!(node.role(), Role::Button);
+        assert_eq!(node.label(), Some("Overview"));
+    });
 }
 
 fn nav_selected(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<KindId> {
