@@ -191,9 +191,17 @@ fn window_options(bounds: Bounds<Pixels>) -> WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(width), px(height))),
         titlebar: Some(TitlebarOptions {
+            // Still the window's name in Mission Control and the Window menu. On macOS the
+            // panes reach the window's top edge, the traffic lights centered on their title row
+            // ([`theme::traffic_light_inset`]).
             title: Some("Flint".into()),
-            ..Default::default()
+            appears_transparent: cfg!(target_os = "macos"),
+            traffic_light_position: cfg!(target_os = "macos")
+                .then(|| gpui_kit::point(px(12.), px(9.))),
         }),
+        // The header's controls sit where the title bar was, so AppKit must not take their
+        // clicks: the empty parts of those rows move the window ([`theme::moves_window`]).
+        app_owns_titlebar_drag: cfg!(target_os = "macos"),
         // Linux desktops match the window to `flint.desktop` (packaging/linux) by this id
         // (Wayland app_id, X11 WM_CLASS), for its icon and taskbar grouping.
         app_id: Some("flint".into()),
