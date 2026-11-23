@@ -702,12 +702,44 @@ fn basic_auth_drops_a_token_beside_it() {
     assert!(user.get("token").is_none(), "{user}");
 }
 
-// A file-only token goes in as the bytes read for this run: helm never opens the file.
-#[test]
-fn a_token_file_goes_in_as_its_bytes() {
+/// The token kube's own auth layer holds for the token file at `path`.
+async fn client_token_of(path: &Path) -> Option<SecretString> {
+    let mut config = kube::Config::new("https://pinned:6443".parse().unwrap());
+    config.auth_info.token_file = Some(path.display().to_string());
+    let layer = kube::client::ConfigExt::auth_layer(&config)
+        .unwrap()
+        .unwrap();
+    crate::credential::client_token(&layer).await
+}
+
+// Helm gets the token the client was admitted with, whatever the file holds by then.
+#[tokio::test]
+async fn a_token_file_goes_in_as_the_admitted_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("token");
-    std::fs::write(&file, "from-file\n").unwrap();
+    std::fs::write(&file, "admitted").unwrap();
+    let token = client_token_of(&file).await;
+    std::fs::write(&file, "another-identity").unwrap();
+    let merged = token_config(&format!("tokenFile: {}", file.display()));
+    let target = HelmTarget::new(
+        &merged,
+        "dev",
+        pin_for(&merged),
+        credential(CredentialSource::TokenFile(file)).with_admitted_token(token),
+        None,
+        unused_root(),
+    )
+    .unwrap();
+    let user = written_user(&target);
+    assert_eq!(user["token"], "admitted");
+    assert!(user.get("tokenFile").is_none(), "{user}");
+}
+
+#[test]
+fn a_token_file_without_a_snapshot_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("token");
+    std::fs::write(&file, "readable").unwrap();
     let merged = token_config(&format!("tokenFile: {}", file.display()));
     let target = HelmTarget::new(
         &merged,
@@ -718,9 +750,10 @@ fn a_token_file_goes_in_as_its_bytes() {
         unused_root(),
     )
     .unwrap();
-    let user = written_user(&target);
-    assert_eq!(user["token"], "from-file");
-    assert!(user.get("tokenFile").is_none(), "{user}");
+    assert_eq!(
+        target.pinned_kubeconfig().err(),
+        Some(HelmError::CredentialFileChanged)
+    );
 }
 
 // The run's directory is the owner's alone, whatever the umask.
@@ -807,7 +840,8 @@ async fn a_masked_value_does_not_reappear_in_the_manifest() {
     let helm = fake_helm(
         dir.path(),
         &format!(
-            "case \"$2\" in\nvalues) printf '{{\"auth\":{{\"password\":\"hunter-cross\"}}}}' ;;\n\
+            "case \"$2\" in\nweb) printf '{{\"name\":\"web\",\"version\":1}}' ;;\n\
+             values) printf '{{\"auth\":{{\"password\":\"hunter-cross\"}}}}' ;;\n\
              *) printf 'apiVersion: v1\\nkind: Pod\\nmetadata:\\n  name: p\\n  labels:\\n    \
              hunter-cross: x\\nspec:\\n  args: [\"--login=hunter-cross\", \"{encoded}\"]\\n' ;;\nesac"
         ),
@@ -899,4 +933,284 @@ fn a_secret_inside_a_list_is_masked() {
          name: s\n  data:\n    anything: aHVudGVyOQ==\n",
     );
     assert!(!masked.contains("aHVudGVyOQ"), "{masked}");
+}
+
+/// Writes an executable script at `path` with the first line `shebang`.
+fn script(path: &Path, shebang: &str) {
+    std::fs::write(path, format!("{shebang}\nexit 0\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn a_wrapper_runs_only_on_a_private_interpreter() {
+    let dir = tempfile::tempdir().unwrap();
+    let helm = dir.path().join("helm");
+
+    script(&helm, "#!/bin/sh");
+    assert!(locate_helm(Some(&helm), None, Some(own_group())).is_ok());
+
+    // Replaceable by the administrators' group: it would receive the kubeconfig.
+    let shared = dir.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    let interpreter = shared.join("interpreter");
+    std::fs::copy("/bin/sh", &interpreter).unwrap();
+    std::os::unix::fs::chown(&shared, None, Some(own_group())).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o775)).unwrap();
+    for refused in [
+        format!("#!{}", interpreter.display()),
+        // What `env` starts is chosen when it runs, so no check here can cover it.
+        "#!/usr/bin/env sh".to_owned(),
+        "#!relative/sh".to_owned(),
+        "#!/nonexistent/sh".to_owned(),
+        "#!".to_owned(),
+    ] {
+        script(&helm, &refused);
+        assert_eq!(
+            locate_helm(Some(&helm), None, Some(own_group())),
+            Err(HelmError::UntrustedLocation),
+            "{refused}"
+        );
+    }
+
+    // An interpreter that is itself a script.
+    let nested = dir.path().join("nested");
+    script(&nested, "#!/bin/sh");
+    script(&helm, &format!("#!{}", nested.display()));
+    assert_eq!(
+        locate_helm(Some(&helm), None, Some(own_group())),
+        Err(HelmError::UntrustedLocation)
+    );
+}
+
+// After a crash the child still holds the lock, so its kubeconfig is not reaped under it.
+#[tokio::test]
+async fn a_live_child_keeps_its_run_after_a_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = runs_root(dir.path());
+    let run = RunDir::create(&root).unwrap();
+    let mut command = tokio::process::Command::new("/bin/sleep");
+    command.arg("30").kill_on_drop(true);
+    run.hand_lock_to(&mut command);
+    let mut child = command.spawn().unwrap();
+    let path = run.crash();
+
+    reap_stale(&root);
+    assert!(path.exists(), "a live child's run stays");
+
+    child.kill().await.unwrap();
+    reap_stale(&root);
+    assert!(!path.exists(), "removed once the child has gone");
+}
+
+/// A load of `yaml` as the only kubeconfig file.
+fn record(history: &mut crate::recheck::ContextHistory, yaml: &str) {
+    let merged = config(yaml);
+    history.record(&crate::kubeconfig::LoadedKubeconfig {
+        contexts: vec![crate::kubeconfig::ContextInfo {
+            name: "dev".into(),
+            cluster: Some("c".into()),
+            user: Some("u".into()),
+            namespace: None,
+            server: Some("https://pinned:6443".into()),
+            proxy_url: None,
+            source: "/k".into(),
+        }],
+        merged,
+        ..Default::default()
+    });
+}
+
+// A credential edit on the same server, even one undone later, never gives the old pin back.
+#[test]
+fn a_definition_changed_and_put_back_is_another_revision() {
+    let mut history = crate::recheck::ContextHistory::default();
+    record(&mut history, CONFIG);
+    let opened = history.definition_revision("dev");
+
+    record(&mut history, CONFIG);
+    assert_eq!(
+        history.definition_revision("dev"),
+        opened,
+        "nothing changed"
+    );
+
+    record(&mut history, &CONFIG.replace("sekret-token", "another"));
+    let edited = history.definition_revision("dev");
+    assert_ne!(edited, opened);
+
+    record(&mut history, CONFIG);
+    let restored = history.definition_revision("dev");
+    assert_ne!(restored, opened, "A to B to A is not A");
+    assert_ne!(restored, edited);
+}
+
+/// A fake `helm` whose release moves on: only `--revision=7` gives revision 7's data.
+const MOVING_RELEASE: &str = r#"case "$1 $2" in
+"status web") printf '{"name":"web","version":7,"info":{"status":"deployed"},"chart":{"metadata":{"name":"web","version":"1.0.0","appVersion":"hunter-meta"}}}' ;;
+"get values") case "$*" in
+  *--revision=7*) printf '{"auth":{"password":"hunter-meta"},"apiTokenName":"neutral-name"}' ;;
+  *) printf '{"auth":{"password":"unrelated"}}' ;;
+  esac ;;
+"get manifest") case "$*" in
+  *--revision=7*) printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: c\ndata:\n  plain: hunter-meta\n  other: neutral-name\n' ;;
+  *) printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: c\ndata:\n  plain: from-another-revision\n' ;;
+  esac ;;
+esac"#;
+
+#[tokio::test]
+async fn values_and_manifest_come_from_one_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let helm = fake_helm(dir.path(), MOVING_RELEASE);
+    let output = run_at(&helm, &target(dir.path()), &HelmQuery::Manifest(release()))
+        .await
+        .unwrap();
+    let HelmOutput::Text(text) = output else {
+        panic!("text");
+    };
+    assert!(!text.contains("from-another-revision"), "{text}");
+    assert!(!text.contains("hunter-meta"), "{text}");
+    assert!(!text.contains("neutral-name"), "{text}");
+}
+
+// Everything Values hides is hidden elsewhere, a field that looks like a reference included.
+#[test]
+fn what_values_mask_is_what_a_manifest_hides() {
+    let out = br#"{"apiTokenName":"neutral-name","url":"postgres://me:hunter3@db:5432/app"}"#;
+    let values: serde_json::Value = serde_json::from_slice(out).unwrap();
+    let shown = mask_values(values).unwrap();
+    assert!(!shown.contains("neutral-name"), "{shown}");
+
+    let hidden = HiddenValues::from_output(out).unwrap();
+    let masked = hidden.mask_manifest(
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: c\ndata:\n  plain: neutral-name\n  \
+         copy: postgres://me:hunter3@db:5432/app\n",
+    );
+    assert!(!masked.contains("neutral-name"), "{masked}");
+    assert!(!masked.contains("hunter3"), "{masked}");
+}
+
+#[tokio::test]
+async fn details_scrub_metadata_against_their_revisions_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let helm = fake_helm(dir.path(), MOVING_RELEASE);
+    let output = run_at(&helm, &target(dir.path()), &HelmQuery::Details(release()))
+        .await
+        .unwrap();
+    let HelmOutput::Details(details) = output else {
+        panic!("details");
+    };
+    assert_eq!(details.revision, 7);
+    assert_eq!(details.app_version, MASK);
+    assert_eq!(details.chart_version, "1.0.0");
+}
+
+// A list or history has no one revision's values to scrub against, so it does not keep this.
+#[test]
+fn lists_and_history_do_not_keep_the_app_version() {
+    let row = json!({"name": "web", "namespace": "apps", "revision": 1, "status": "deployed",
+                     "app_version": "hunter-meta"});
+    let list = parse(&HelmQuery::List, json!([row]).to_string().as_bytes()).unwrap();
+    assert!(!format!("{list:?}").contains("hunter-meta"), "{list:?}");
+    let history = parse(
+        &HelmQuery::History(release()),
+        json!([row]).to_string().as_bytes(),
+    )
+    .unwrap();
+    assert!(
+        !format!("{history:?}").contains("hunter-meta"),
+        "{history:?}"
+    );
+}
+
+/// Adds the ACL entry `entry` to `path`.
+#[cfg(target_os = "macos")]
+fn add_acl(path: &Path, entry: &str) {
+    let status = std::process::Command::new("/bin/chmod")
+        .args(["+a", entry])
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "{entry}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_acl_letting_another_account_change_the_path_is_refused() {
+    for entry in [
+        "user:nobody allow add_file",
+        "user:nobody allow add_subdirectory",
+        "user:nobody allow delete_child",
+        "group:everyone allow writesecurity",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let helm = fake_helm(dir.path(), "");
+        add_acl(dir.path(), entry);
+        assert_eq!(
+            locate_helm(Some(&helm), None, Some(own_group())),
+            Err(HelmError::UntrustedLocation),
+            "{entry}"
+        );
+    }
+    for entry in ["user:nobody allow write", "user:nobody allow delete"] {
+        let dir = tempfile::tempdir().unwrap();
+        let helm = fake_helm(dir.path(), "");
+        add_acl(&helm, entry);
+        assert_eq!(
+            locate_helm(Some(&helm), None, Some(own_group())),
+            Err(HelmError::UntrustedLocation),
+            "{entry}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn ordinary_acls_on_the_path_are_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let helm = fake_helm(dir.path(), "");
+    // What macOS puts on home folders, and a grant that changes nothing.
+    add_acl(dir.path(), "group:everyone deny delete");
+    add_acl(dir.path(), "user:nobody allow list,search,readattr");
+    add_acl(&helm, "group:everyone deny write,delete");
+    assert!(locate_helm(Some(&helm), None, Some(own_group())).is_ok());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_acl_letting_another_account_read_the_run_root_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = runs_root(dir.path());
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    add_acl(&root, "user:nobody allow list,search,read");
+    assert_eq!(
+        RunDir::create(&root).err(),
+        Some(HelmError::UnsafeRunDirectory)
+    );
+}
+
+// An entry the app's folder passes down never reaches a run's directory or kubeconfig.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_run_directory_inherits_no_access() {
+    let dir = tempfile::tempdir().unwrap();
+    add_acl(
+        dir.path(),
+        "user:nobody allow list,search,read,file_inherit,directory_inherit",
+    );
+    assert_eq!(
+        RunDir::create(&runs_root(dir.path())).err(),
+        Some(HelmError::UnsafeRunDirectory)
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    std::fs::create_dir(&private).unwrap();
+    add_acl(&private, "user:nobody allow read,file_inherit");
+    assert_eq!(
+        write_private(&private, b"credential").err(),
+        Some(HelmError::UnsafeRunDirectory)
+    );
+    let written = std::fs::read(private.join("kubeconfig")).unwrap_or_default();
+    assert!(written.is_empty(), "nothing is written to a shared file");
 }

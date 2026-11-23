@@ -145,11 +145,10 @@ pub fn history_text(revisions: &[HelmRevision]) -> String {
         .iter()
         .map(|r| {
             format!(
-                "{}  {}  {}  {}  {}  {}\n",
+                "{}  {}  {}  {}  {}\n",
                 r.revision,
                 one_line(&r.status),
                 one_line(&r.chart),
-                one_line(&r.app_version),
                 one_line(&r.updated),
                 one_line(&r.description),
             )
@@ -769,7 +768,6 @@ mod tests {
             updated: "now".into(),
             status: "deployed".into(),
             chart: "web-1.0".into(),
-            app_version: "1".into(),
         }
     }
 
@@ -939,7 +937,6 @@ mod tests {
             updated: "t".into(),
             status: "failed".into(),
             chart: "c".into(),
-            app_version: "1".into(),
             description: "line\nbreak".into(),
         }]);
         assert_eq!(text.lines().count(), 1, "{text}");

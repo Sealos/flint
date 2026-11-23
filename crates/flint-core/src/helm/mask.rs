@@ -78,19 +78,30 @@ fn redact_string(text: &mut String) {
     }
 }
 
-fn mask_tree(value: &mut Value) {
+/// Masks Values, keeping in `hidden` everything it hides.
+fn mask_tree(value: &mut Value, hidden: &mut HiddenValues) {
     match value {
-        Value::String(text) => redact_string(text),
-        Value::Array(items) => items.iter_mut().for_each(mask_tree),
+        Value::String(text) => {
+            let original = text.clone();
+            redact_string(text);
+            if *text != original {
+                hidden.add(original);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|item| mask_tree(item, hidden)),
         Value::Object(map) => {
-            if env_style_is_sensitive(map) {
-                map.get_mut("value").into_iter().for_each(hide);
+            if env_style_is_sensitive(map)
+                && let Some(item) = map.get_mut("value")
+            {
+                hidden.add_all(item);
+                hide(item);
             }
             for (key, item) in map.iter_mut() {
                 if is_sensitive(key) {
+                    hidden.add_all(item);
                     hide(item);
                 } else {
-                    mask_tree(item);
+                    mask_tree(item, hidden);
                 }
             }
         }
@@ -112,7 +123,7 @@ pub fn mask_values(mut values: Value) -> Result<String, HelmError> {
     if values.is_null() {
         return Ok(String::new());
     }
-    mask_tree(&mut values);
+    mask_tree(&mut values, &mut HiddenValues::default());
     serde_saphyr::to_string(&values).map_err(|_| HelmError::BadOutput)
 }
 
@@ -127,15 +138,18 @@ pub(super) struct HiddenValues {
 impl HiddenValues {
     /// From `helm get values --output=json`.
     pub(super) fn from_output(out: &[u8]) -> Result<Self, HelmError> {
-        let values: Value = serde_json::from_slice(out).map_err(|_| HelmError::BadOutput)?;
+        let mut values: Value = serde_json::from_slice(out).map_err(|_| HelmError::BadOutput)?;
         let mut hidden = Self::default();
-        hidden.collect(&values);
+        mask_tree(&mut values, &mut hidden);
         hidden.needles.sort_by_key(|n| std::cmp::Reverse(n.len()));
         hidden.needles.dedup();
         Ok(hidden)
     }
 
     fn add(&mut self, text: String) {
+        if text == MASK {
+            return;
+        }
         if text.len() >= MIN_NEEDLE {
             self.needles
                 .push(base64::engine::general_purpose::STANDARD.encode(&text));
@@ -157,42 +171,23 @@ impl HiddenValues {
         }
     }
 
-    /// What [`mask_tree`] hides by key. A field naming another object is left out: the same
-    /// name in a manifest is that object's name.
-    fn collect(&mut self, value: &Value) {
-        match value {
-            Value::Array(items) => items.iter().for_each(|item| self.collect(item)),
-            Value::Object(map) => {
-                if env_style_is_sensitive(map)
-                    && let Some(item) = map.get("value")
-                {
-                    self.add_all(item);
-                }
-                for (key, item) in map {
-                    match (is_sensitive(key), names_another_object(key)) {
-                        (true, true) => {}
-                        (true, false) => self.add_all(item),
-                        (false, _) => self.collect(item),
-                    }
-                }
-            }
-            _ => {}
+    /// `text` with every hidden value in it masked.
+    pub(super) fn scrub_text(&self, text: &str) -> String {
+        if self.whole.contains(text) {
+            return MASK.to_owned();
         }
+        let mut scrubbed = text.to_owned();
+        for needle in &self.needles {
+            if scrubbed.contains(needle.as_str()) {
+                scrubbed = scrubbed.replace(needle.as_str(), MASK);
+            }
+        }
+        scrubbed
     }
 
     fn scrub(&self, value: &mut Value) {
         match value {
-            Value::String(text) => {
-                if self.whole.contains(text.as_str()) {
-                    MASK.clone_into(text);
-                    return;
-                }
-                for needle in &self.needles {
-                    if text.contains(needle.as_str()) {
-                        *text = text.replace(needle.as_str(), MASK);
-                    }
-                }
-            }
+            Value::String(text) => *text = self.scrub_text(text),
             Value::Number(number) => {
                 if self.whole.contains(&number.to_string()) {
                     *value = Value::String(MASK.to_owned());

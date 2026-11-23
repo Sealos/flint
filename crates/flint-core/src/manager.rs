@@ -947,7 +947,7 @@ impl ClusterManager {
                 let _ = reply.send(self.member_changed(&member));
             }
             Request::HelmPin { cluster, reply } => {
-                let _ = reply.send(self.session_pin(&cluster));
+                let _ = reply.send(self.helm_pin(&cluster));
             }
             Request::HelmTarget {
                 cluster,

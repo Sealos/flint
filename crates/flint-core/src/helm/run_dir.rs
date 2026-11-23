@@ -18,6 +18,7 @@ use std::os::unix::fs::{
 use std::path::{Component, Path, PathBuf};
 
 use super::HelmError;
+use super::acl::{self, Reach};
 
 /// The most symbolic links followed in one path, as the kernel limits them.
 const MAX_LINKS: usize = 40;
@@ -108,7 +109,7 @@ pub(super) fn resolve_trusted(path: &Path, admin: Option<u32>) -> Option<Trusted
     };
     let mut at = PathBuf::from("/");
     let root = access(&std::fs::symlink_metadata(&at).ok()?);
-    if root == Access::Refused {
+    if root == Access::Refused || acl::lets_others(&at, Reach::Change) {
         return None;
     }
     let mut admin_writable = root == Access::AdminGroup;
@@ -124,7 +125,7 @@ pub(super) fn resolve_trusted(path: &Path, admin: Option<u32>) -> Option<Trusted
         }
         let next = at.join(&part);
         let meta = std::fs::symlink_metadata(&next).ok()?;
-        if in_sticky && !meta.is_dir() {
+        if (in_sticky && !meta.is_dir()) || acl::lets_others(&next, Reach::Change) {
             return None;
         }
         if meta.file_type().is_symlink() {
@@ -194,7 +195,11 @@ fn private_root(root: &Path) -> Result<PathBuf, HelmError> {
         Err(_) => return Err(HelmError::NotStarted),
     }
     let meta = std::fs::symlink_metadata(&root).map_err(|_| HelmError::NotStarted)?;
-    if !meta.is_dir() || meta.uid() != this_user() || meta.permissions().mode() & 0o077 != 0 {
+    if !meta.is_dir()
+        || meta.uid() != this_user()
+        || meta.permissions().mode() & 0o077 != 0
+        || acl::lets_others(&root, Reach::Any)
+    {
         return Err(HelmError::UnsafeRunDirectory);
     }
     Ok(root)
@@ -203,7 +208,7 @@ fn private_root(root: &Path) -> Result<PathBuf, HelmError> {
 /// One run's private directory. Dropping it removes the directory, then releases its lock.
 pub(super) struct RunDir {
     dir: tempfile::TempDir,
-    _lock: File,
+    lock: File,
 }
 
 impl RunDir {
@@ -218,13 +223,38 @@ impl RunDir {
             .permissions(Permissions::from_mode(0o700))
             .tempdir_in(&root)
             .map_err(|_| HelmError::NotStarted)?;
+        if acl::lets_others(dir.path(), Reach::Any) {
+            return Err(HelmError::UnsafeRunDirectory);
+        }
         let lock = open_lock(&dir.path().join(LOCK), true).map_err(|_| HelmError::NotStarted)?;
         flock(&lock, libc::LOCK_EX | libc::LOCK_NB).map_err(|_| HelmError::NotStarted)?;
-        Ok(Self { dir, _lock: lock })
+        Ok(Self { dir, lock })
     }
 
     pub(super) fn path(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// Makes `command`'s process hold this run's lock too, until it and all it started exit.
+    pub(super) fn hand_lock_to(&self, command: &mut tokio::process::Command) {
+        let lock = self.lock.as_raw_fd();
+        let inherit = move || {
+            // SAFETY: async-signal-safe, on the child's own descriptor table. `lock` stays open
+            // in the parent until after the spawn, since `self` is borrowed for it.
+            if unsafe { libc::fcntl(lock, libc::F_SETFD, 0) } == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        };
+        // SAFETY: the closure only makes the call above, between fork and exec.
+        unsafe { command.pre_exec(inherit) };
+    }
+
+    /// What a crash leaves: the directory stays, and this process's hold on the lock ends.
+    #[cfg(test)]
+    pub(super) fn crash(self) -> PathBuf {
+        self.dir.keep()
     }
 }
 

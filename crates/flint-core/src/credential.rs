@@ -310,6 +310,8 @@ struct Parts {
     grant: CredentialGrant,
     /// The provider's layer behind its guard, if a role can stop a command it would run.
     guarded: Option<GuardedProvider>,
+    /// What the client read from its token file when it was admitted.
+    admitted_token: Option<SecretString>,
 }
 
 /// Which connection's credential something was learned with. Holds none of it: the credential
@@ -362,6 +364,7 @@ impl WriteCredential {
             check_identity,
             grant,
             guarded,
+            admitted_token: None,
         }))
     }
 
@@ -378,13 +381,20 @@ impl WriteCredential {
         (digest_of(&now)?.0 == held.0.0).then_some(now)
     }
 
-    /// What this connection's token file holds now, if `path` is that file. Blocks on the file
-    /// system.
-    pub(crate) fn token_file_bytes(&self, path: &Path) -> Option<Vec<u8>> {
+    /// The token this connection was admitted with, if `path` is its token file.
+    pub(crate) fn admitted_token(&self, path: &Path) -> Option<SecretString> {
         match &self.0.token {
-            TokenSource::File(file) if file == path => read_file(path).ok(),
+            TokenSource::File(file) if file == path => self.0.admitted_token.clone(),
             _ => None,
         }
+    }
+
+    /// This credential, with `token` as what its client read from its token file when admitted.
+    pub(crate) fn with_admitted_token(mut self, token: Option<SecretString>) -> Self {
+        if let Some(parts) = Arc::get_mut(&mut self.0) {
+            parts.admitted_token = token;
+        }
+        self
     }
 
     /// Whether this connection's credential can start a program, whatever the kubeconfig says now.
@@ -601,6 +611,14 @@ async fn layer_header(layer: &AuthLayer) -> Result<HeaderValue, BoxError> {
         .ok_or_else(|| BoxError::from("the auth layer set no credential"))?;
     value.set_sensitive(true);
     Ok(value)
+}
+
+/// The bearer token `layer` holds now. For a token file just loaded, that is the one kube read,
+/// without reading the file again.
+pub(crate) async fn client_token(layer: &AuthLayer) -> Option<SecretString> {
+    let header = layer_header(layer).await.ok()?;
+    let token = header.to_str().ok()?.strip_prefix("Bearer ")?;
+    (!token.is_empty()).then(|| SecretString::from(token.to_owned()))
 }
 
 /// The `Authorization` a request must go out with. Only [`sending_credential`] sets it.

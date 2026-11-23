@@ -37,9 +37,11 @@ use crate::credential::{CredentialSource, WriteCredential};
 use crate::read::{is_dns1123_label, is_dns1123_subdomain};
 use crate::recheck::ContextPin;
 
+mod acl;
 mod mask;
 mod run_dir;
 
+use acl::Reach;
 use mask::HiddenValues;
 pub use mask::{MASK, mask_manifest, mask_values};
 use run_dir::{RunDir, Trusted, admin_group, resolve_trusted};
@@ -58,6 +60,8 @@ const STDERR_CAP: usize = 64 * 1024;
 pub const MAX_ROWS: usize = 1000;
 /// Helm's longest release name.
 const MAX_RELEASE_NAME: usize = 53;
+/// The most of a script's first line read, as much as the kernel does.
+const MAX_SHEBANG: u64 = 512;
 
 /// Why Helm data could not be shown. The text is safe to show: none of it comes from `helm`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -109,7 +113,11 @@ pub enum HelmError {
 /// The definition a Helm view opened on. Runs are refused once the context no longer has it,
 /// even if a later edit puts the same values back.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HelmPin(pub(crate) ContextPin);
+pub struct HelmPin {
+    pub(crate) pin: ContextPin,
+    /// [`crate::recheck::ContextHistory::definition_revision`] when pinned.
+    pub(crate) revision: u64,
+}
 
 /// One release, by a name and namespace safe to pass as arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -197,8 +205,6 @@ pub struct HelmRelease {
     pub status: String,
     #[serde(default)]
     pub chart: String,
-    #[serde(default)]
-    pub app_version: String,
 }
 
 /// One revision of a release.
@@ -212,8 +218,6 @@ pub struct HelmRevision {
     pub status: String,
     #[serde(default)]
     pub chart: String,
-    #[serde(default)]
-    pub app_version: String,
     #[serde(default)]
     pub description: String,
 }
@@ -403,22 +407,15 @@ impl HelmTarget {
         Ok(())
     }
 
-    /// The token the connection's own token file holds now, so `helm` never opens the file.
+    /// The token the connection was admitted with. The file is not read: it may hold another
+    /// identity by now.
     fn token_from_file(&self, path: &Path) -> Result<SecretString, HelmError> {
         if !path.is_absolute() {
             return Err(HelmError::RelativeTokenFile);
         }
-        let bytes = self
-            .credential
-            .token_file_bytes(path)
-            .ok_or(HelmError::CredentialFileChanged)?;
-        let token = std::str::from_utf8(&bytes)
-            .map_err(|_| HelmError::CredentialFileChanged)?
-            .trim();
-        if token.is_empty() {
-            return Err(HelmError::CredentialFileChanged);
-        }
-        Ok(SecretString::from(token.to_owned()))
+        self.credential
+            .admitted_token(path)
+            .ok_or(HelmError::CredentialFileChanged)
     }
 }
 
@@ -427,11 +424,43 @@ fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
+/// What follows `#!` on the first line of `path`, if it is a script.
+fn shebang(path: &Path) -> std::io::Result<Option<String>> {
+    use std::io::Read as _;
+    let mut start = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_SHEBANG)
+        .read_to_end(&mut start)?;
+    let Some(line) = start.strip_prefix(b"#!") else {
+        return Ok(None);
+    };
+    let line = line.split(|byte| *byte == b'\n').next().unwrap_or_default();
+    Ok(Some(String::from_utf8_lossy(line).into_owned()))
+}
+
+/// Whether what runs `path` is `path` itself, or an interpreter only this account and root can
+/// change. `env` is refused: what it starts is chosen when it runs.
+fn interpreter_is_safe(path: &Path) -> bool {
+    let line = match shebang(path) {
+        Ok(None) => return true,
+        Ok(Some(line)) => line,
+        Err(_) => return false,
+    };
+    line.split_whitespace()
+        .next()
+        .and_then(|interpreter| resolve_trusted(Path::new(interpreter), None))
+        .is_some_and(|real| {
+            is_executable(&real.path)
+                && real.path.file_name() != Some(OsStr::new("env"))
+                && matches!(shebang(&real.path), Ok(None))
+        })
+}
+
 /// The real file to run for `candidate`, if only this account, root and the `admin` group can
-/// change it or what leads to it.
+/// change it or what leads to it, and a script's interpreter is safe too.
 fn trusted_helm(candidate: &Path, admin: Option<u32>) -> Result<Trusted, HelmError> {
     resolve_trusted(candidate, admin)
-        .filter(|real| is_executable(&real.path))
+        .filter(|real| is_executable(&real.path) && interpreter_is_safe(&real.path))
         .ok_or(HelmError::UntrustedLocation)
 }
 
@@ -551,6 +580,9 @@ fn write_private(dir: &Path, bytes: &[u8]) -> Result<PathBuf, HelmError> {
         .mode(0o600)
         .open(&path)
         .map_err(|_| HelmError::NotStarted)?;
+    if acl::lets_others(&path, Reach::Any) {
+        return Err(HelmError::UnsafeRunDirectory);
+    }
     file.write_all(bytes).map_err(|_| HelmError::NotStarted)?;
     Ok(path)
 }
@@ -568,29 +600,60 @@ fn run_environment(dir: &Path, kubeconfig: &Path) -> Vec<(&'static str, OsString
     ]
 }
 
-/// Runs `query` with the `helm` at `binary`, held to `target`. A manifest is read with the
-/// release's values, so that what Values hides is hidden in it too.
+/// `query`'s arguments, for exactly `revision` of its release.
+fn at_revision(query: &HelmQuery, revision: u64) -> Vec<String> {
+    let mut args = query.args();
+    args.push(format!("--revision={revision}"));
+    args
+}
+
+/// The revision `helm status` is about.
+fn status_revision(out: &[u8]) -> Result<u64, HelmError> {
+    let status: StatusOutput = serde_json::from_slice(out).map_err(|_| HelmError::BadOutput)?;
+    match status.version {
+        0 => Err(HelmError::BadOutput),
+        revision => Ok(revision),
+    }
+}
+
+/// Runs `query` with the `helm` at `binary`, held to `target`. Details and a manifest are read
+/// with the values of the same revision, so that what Values hides is hidden in them too.
 async fn run_with(
     binary: &Path,
     target: &HelmTarget,
     query: &HelmQuery,
     admin: Option<u32>,
 ) -> Result<HelmOutput, HelmError> {
-    let hidden = match query {
-        HelmQuery::Manifest(release) => {
-            let values =
-                run_helm(binary, target, &HelmQuery::Values(release.clone()), admin).await?;
-            tokio::task::spawn_blocking(move || HiddenValues::from_output(&values))
-                .await
-                .map_err(|_| HelmError::BadOutput)??
-        }
-        _ => HiddenValues::default(),
+    let off_thread = async |out: Vec<u8>, hidden: HiddenValues| {
+        let query = query.clone();
+        tokio::task::spawn_blocking(move || parse(&query, &out, &hidden))
+            .await
+            .map_err(|_| HelmError::BadOutput)?
     };
-    let out = run_helm(binary, target, query, admin).await?;
-    let query = query.clone();
-    tokio::task::spawn_blocking(move || parse(&query, &out, &hidden))
+    let (HelmQuery::Details(release) | HelmQuery::Manifest(release)) = query else {
+        let out = run_helm(binary, target, query.args(), admin).await?;
+        return off_thread(out, HiddenValues::default()).await;
+    };
+    let status_args = HelmQuery::Details(release.clone()).args();
+    let status = run_helm(binary, target, status_args, admin).await?;
+    let (status, revision) = tokio::task::spawn_blocking(move || {
+        let revision = status_revision(&status)?;
+        Ok::<_, HelmError>((status, revision))
+    })
+    .await
+    .map_err(|_| HelmError::BadOutput)??;
+    let values_args = at_revision(&HelmQuery::Values(release.clone()), revision);
+    let values = run_helm(binary, target, values_args, admin).await?;
+    let hidden = tokio::task::spawn_blocking(move || HiddenValues::from_output(&values))
         .await
-        .map_err(|_| HelmError::BadOutput)?
+        .map_err(|_| HelmError::BadOutput)??;
+    let out = match query {
+        HelmQuery::Manifest(_) => {
+            run_helm(binary, target, at_revision(query, revision), admin).await?
+        }
+        _ => status,
+    };
+    off_thread(out, hidden).await
 }
 
 /// One `helm` command, to its output. The binary is checked again here, last before it starts
@@ -598,7 +661,7 @@ async fn run_with(
 async fn run_helm(
     binary: &Path,
     target: &HelmTarget,
-    query: &HelmQuery,
+    args: Vec<String>,
     admin: Option<u32>,
 ) -> Result<Vec<u8>, HelmError> {
     let (binary, dir, kubeconfig) = {
@@ -617,7 +680,7 @@ async fn run_helm(
     };
     let mut command = tokio::process::Command::new(&binary);
     command
-        .args(query.args())
+        .args(args)
         .arg(format!("--kube-context={}", target.context))
         .arg(format!("--kubeconfig={}", kubeconfig.display()))
         .env_clear()
@@ -628,6 +691,7 @@ async fn run_helm(
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true);
+    dir.hand_lock_to(&mut command);
     let mut child = command.spawn().map_err(|_| HelmError::NotStarted)?;
     let mut group = GroupGuard(child.id().map(|id| id as libc::pid_t));
     let mut stdout = child.stdout.take().ok_or(HelmError::NotStarted)?;
@@ -722,7 +786,9 @@ fn status_text(status: &str) -> &'static str {
     }
 }
 
-/// `query`'s output as data, masked. `hidden` is what a manifest must not show.
+/// `query`'s output as data, masked. `hidden` is what a manifest or details must not show. A list
+/// or history spans revisions with no one set of values to scrub against, so neither keeps the
+/// free-form app version.
 fn parse(query: &HelmQuery, out: &[u8], hidden: &HiddenValues) -> Result<HelmOutput, HelmError> {
     fn json<'a, T: Deserialize<'a>>(out: &'a [u8]) -> Result<T, HelmError> {
         serde_json::from_slice(out).map_err(|_| HelmError::BadOutput)
@@ -754,9 +820,9 @@ fn parse(query: &HelmQuery, out: &[u8], hidden: &HiddenValues) -> Result<HelmOut
                 status: status.info.status,
                 first_deployed: status.info.first_deployed,
                 last_deployed: status.info.last_deployed,
-                chart: status.chart.metadata.name,
-                chart_version: status.chart.metadata.version,
-                app_version: status.chart.metadata.app_version,
+                chart: hidden.scrub_text(&status.chart.metadata.name),
+                chart_version: hidden.scrub_text(&status.chart.metadata.version),
+                app_version: hidden.scrub_text(&status.chart.metadata.app_version),
             })))
         }
         HelmQuery::History(_) => {

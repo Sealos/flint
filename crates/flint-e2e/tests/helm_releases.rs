@@ -159,6 +159,25 @@ async fn another_user_on_the_same_server_starts_no_run() {
     assert_eq!(runs(scripts.path()), 0, "helm never started");
 }
 
+// The same server and credential again is still not the binding the view opened on.
+#[tokio::test]
+async fn a_credential_edit_put_back_starts_no_run() {
+    let server = FakeApiServer::start().await.unwrap();
+    let (core, scripts, file) = started(&server).await;
+    let pin = core.handle.helm_pin(CONTEXT).await.unwrap();
+
+    let mut config = serde_json::to_value(server.kubeconfig(Some("demo"))).unwrap();
+    config["users"][0]["user"]["token"] = "another-identity".into();
+    std::fs::write(&file, config.to_string()).unwrap();
+    core.handle.reload_kubeconfig().await.unwrap();
+    server.write_kubeconfig(&file, Some("demo")).unwrap();
+    core.handle.reload_kubeconfig().await.unwrap();
+
+    let refused = core.handle.helm_read(CONTEXT, &pin, HelmQuery::List).await;
+    assert_eq!(refused, Err(HelmError::Changed));
+    assert_eq!(runs(scripts.path()), 0, "helm never started");
+}
+
 #[tokio::test]
 async fn an_exec_plugin_credential_is_refused_and_never_runs() {
     let server = FakeApiServer::start().await.unwrap();

@@ -428,12 +428,12 @@ pub(crate) enum Request {
     /// The pin of a Helm view opening on `cluster` now, whether or not it can run yet.
     HelmPin {
         cluster: ClusterId,
-        reply: oneshot::Sender<ContextPin>,
+        reply: oneshot::Sender<HelmPin>,
     },
     /// What a `helm` run on `cluster` at `pin` is held to, if it may run.
     HelmTarget {
         cluster: ClusterId,
-        pin: ContextPin,
+        pin: HelmPin,
         member: Option<AdmittedMember>,
         reply: oneshot::Sender<Result<HelmTarget, HelmError>>,
     },
@@ -1252,7 +1252,7 @@ impl CoreHandle {
     fn helm_target(
         &self,
         cluster: &str,
-        pin: ContextPin,
+        pin: HelmPin,
     ) -> impl Future<Output = Result<HelmTarget, HelmError>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
         let sent = self.requests.try_send(Request::HelmTarget {
@@ -1285,7 +1285,7 @@ impl CoreHandle {
             if sent.is_err() {
                 return Err(HelmError::Stopped);
             }
-            rx.await.map(HelmPin).map_err(|_| HelmError::Stopped)
+            rx.await.map_err(|_| HelmError::Stopped)
         }
     }
 
@@ -1298,10 +1298,10 @@ impl CoreHandle {
         pin: &HelmPin,
         query: HelmQuery,
     ) -> impl Future<Output = Result<HelmOutput, HelmError>> + Send + 'static {
-        let target = self.helm_target(cluster, pin.0.clone());
+        let target = self.helm_target(cluster, pin.clone());
         let after = self.clone();
         let cluster = cluster.to_owned();
-        let pin = pin.0.clone();
+        let pin = pin.clone();
         let run = spawn_aborting(&self.runtime, async move {
             let target = target.await?;
             let output = tokio::select! {
@@ -1320,7 +1320,7 @@ impl CoreHandle {
         cluster: &str,
         pin: &HelmPin,
     ) -> impl Future<Output = Option<String>> + Send + 'static {
-        let target = self.helm_target(cluster, pin.0.clone());
+        let target = self.helm_target(cluster, pin.clone());
         let warning = spawn_aborting(&self.runtime, async move {
             crate::helm::warning(&target.await.ok()?).await
         });
@@ -1328,7 +1328,7 @@ impl CoreHandle {
     }
 
     /// Resolves once a `helm` run on `cluster` at `pin` may no longer go on.
-    async fn helm_refused(&self, cluster: &str, pin: &ContextPin) -> HelmError {
+    async fn helm_refused(&self, cluster: &str, pin: &HelmPin) -> HelmError {
         loop {
             tokio::time::sleep(crate::helm::RECHECK_EVERY).await;
             if let Err(refused) = self.helm_target(cluster, pin.clone()).await {

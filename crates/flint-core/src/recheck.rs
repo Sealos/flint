@@ -205,6 +205,15 @@ pub(crate) struct ContextHistory {
     last: u64,
     /// The last load had a file it could not read, so a server shown may be a fallback.
     failing: bool,
+    /// Each context's confirmed definition and how often it changed.
+    revisions: HashMap<String, DefinitionRevision>,
+}
+
+/// A context's last confirmed definition, and how many confirmed changes led to it.
+#[derive(Debug, Clone, Default)]
+struct DefinitionRevision {
+    definition: Option<u64>,
+    revision: u64,
 }
 
 impl ContextHistory {
@@ -346,6 +355,7 @@ impl ContextHistory {
                 r.endpoint = self.last;
             }
         }
+        self.note_confirmed_definitions();
     }
 
     /// Whether `path` gave the merge a context, or a winning cluster or user entry, when it last
@@ -389,6 +399,28 @@ impl ContextHistory {
             gate: record.map_or(0, |r| r.gate),
             definition: record.and_then(|r| r.definition),
             server: server.map(str::to_owned),
+        }
+    }
+
+    /// How many confirmed changes `context`'s definition has had. Unlike a [`ContextPin`], it
+    /// moves on an edit that keeps the server, and never comes back when the edit is undone.
+    pub fn definition_revision(&self, context: &str) -> u64 {
+        self.revisions.get(context).map_or(0, |seen| seen.revision)
+    }
+
+    /// Counts the changes this load confirmed. A definition a failed file could still change
+    /// is not confirmed, and a removal counts as a change.
+    fn note_confirmed_definitions(&mut self) {
+        for (name, record) in &self.records {
+            if record.present && record.provisional {
+                continue;
+            }
+            let now = record.definition.filter(|_| record.present);
+            let seen = self.revisions.entry(name.clone()).or_default();
+            if seen.definition.is_some() && seen.definition != now {
+                seen.revision += 1;
+            }
+            seen.definition = now;
         }
     }
 
