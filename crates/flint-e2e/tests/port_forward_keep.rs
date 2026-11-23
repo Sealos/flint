@@ -488,6 +488,30 @@ async fn an_upgrade_answered_401_ends_every_forward_on_the_connection() {
     assert!(matches!(first.snapshot().state, ForwardState::Failed(_)));
 }
 
+// The refusal reaches the connection's other forwards with the manager stuck behind a save.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_sign_in_ends_forwards_without_waiting_for_a_save() {
+    let f = fixture().await;
+    keep_a(&f.core.handle).await;
+    let first = f.core.handle.port_forward(request());
+    let mut first_stream = echoes(listening(&first).await).await;
+    let second = f.core.handle.port_forward(request());
+    let second_port = listening(&second).await;
+
+    let (fault, hold) = Fault::hold();
+    f.a.inject(fault.subresource("portforward").times(1));
+    let _refused = TcpStream::connect((Ipv4Addr::LOCALHOST, second_port))
+        .await
+        .unwrap();
+    hold.reached().await;
+    let _lock = stall_the_manager(&f).await;
+    f.a.inject(Fault::status(401).on(&Gvr::core("pods")).named(WEB));
+    hold.release();
+
+    ended_at_once(&first, &mut first_stream).await;
+    assert!(matches!(first.snapshot().state, ForwardState::Failed(_)));
+}
+
 // The slice moves off the pod during the upgrade, and the pod itself lives on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_backend_withdrawn_during_the_upgrade_carries_nothing() {

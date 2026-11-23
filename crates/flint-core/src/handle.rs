@@ -470,10 +470,6 @@ pub(crate) enum Request {
         id: u64,
         reply: oneshot::Sender<Result<(), crate::port_forward::ForwardFailure>>,
     },
-    /// The server refused forward `id`'s sign-in: ends every forward on its connection.
-    ForwardUnauthorized {
-        id: u64,
-    },
     /// Why a session opened on `cluster` at `pin` must end (the context was re-pointed or
     /// removed since), or `None`. Never contacts the server.
     CheckContext {

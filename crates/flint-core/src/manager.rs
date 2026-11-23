@@ -950,7 +950,6 @@ impl ClusterManager {
             Request::CheckForward { id, reply } => {
                 let _ = reply.send(self.check_forward(id));
             }
-            Request::ForwardUnauthorized { id } => self.forward_unauthorized(id),
             Request::CheckContext {
                 cluster,
                 pin,
@@ -1846,6 +1845,7 @@ impl ClusterManager {
             }
             Internal::WatchesStarted(dirs) => {
                 tracing::debug!(dirs = dirs.len(), "file watches changed");
+                self.invalidate_forwards();
                 self.reload_changed(Changed {
                     kubeconfig: true,
                     settings: true,

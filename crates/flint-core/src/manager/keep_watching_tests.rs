@@ -91,6 +91,21 @@ async fn a_detected_edit_ends_a_running_plugin_without_calling_it_a_failure() {
     assert_ne!(manager.keep_status("dev"), KeepWatching::SignInNeeded);
 }
 
+// What was written before new watches started went unseen, so a forward can't vouch for it.
+#[tokio::test]
+async fn new_file_watches_end_running_forwards() {
+    let plugin = FakePlugin::new("exit 1\n");
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _path) = manager_with(&plugin, config.path().to_owned());
+    let ended = manager.forward_for_tests("dev");
+
+    manager
+        .handle_internal(Internal::WatchesStarted(Default::default()))
+        .await;
+
+    assert!(ended.borrow().is_some());
+}
+
 /// An empty kubeconfig file next to the plugin.
 fn extra_file(plugin: &FakePlugin) -> PathBuf {
     let extra = plugin.dir.path().join("extra");

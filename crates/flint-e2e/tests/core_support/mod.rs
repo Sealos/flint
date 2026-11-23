@@ -49,6 +49,7 @@ impl Core {
     }
 
     /// [`Core::start_on_context`], with the real watcher on the kubeconfig files.
+    #[allow(dead_code, reason = "not every test binary uses it")]
     pub async fn start_watching_files(
         dir: tempfile::TempDir,
         paths: Vec<PathBuf>,

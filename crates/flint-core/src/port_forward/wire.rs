@@ -36,8 +36,8 @@ const MAX_WRITE_BUFFER: usize = 128 * 1024;
 const PIPE: usize = 64 * 1024;
 /// The most read from the local connection into one message.
 const CHUNK: usize = 32 * 1024;
-/// The most one relay can have queued.
-const QUEUED_PER_RELAY: usize = MAX_MESSAGE + READ_BUFFER + MAX_WRITE_BUFFER + 2 * PIPE + CHUNK;
+/// The most one relay can have queued: a message being assembled, and its next frame unread.
+const QUEUED_PER_RELAY: usize = 2 * MAX_MESSAGE + READ_BUFFER + MAX_WRITE_BUFFER + 2 * PIPE + CHUNK;
 /// The most all relays together can have queued.
 const QUEUED_BYTES: usize = 128 * 1024 * 1024;
 const _: () = assert!(MAX_RELAYS * QUEUED_PER_RELAY <= QUEUED_BYTES);
@@ -323,6 +323,10 @@ mod tests {
         assert!((&mut tunnel.failed).await.is_ok());
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a client that reaches no server, for reading a canned body"
+    )]
     fn answering(body: Vec<u8>) -> kube::Client {
         let service = tower::service_fn(move |_: http::Request<kube::client::Body>| {
             let body = body.clone();

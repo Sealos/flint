@@ -33,6 +33,7 @@ use tokio::task::JoinSet;
 use crate::cluster::{ClusterId, SendCheck, upgrade_client};
 use crate::credential::{CredentialId, WriteCredential};
 use crate::handle::{AdmittedMember, Request};
+use crate::manager::ForwardSignals;
 use crate::protection::{GatedClient, WriteRefusal};
 use crate::recheck::ContextPin;
 use crate::write::WriteError;
@@ -569,6 +570,7 @@ pub(crate) struct ForwardGrant {
     pub(crate) pin: ContextPin,
     pub(crate) connection: CredentialId,
     pub(crate) ended: watch::Receiver<Option<ForwardState>>,
+    pub(crate) signals: ForwardSignals,
 }
 
 /// The real [`Dialer`]: every connection asks the gate and takes a fresh client.
@@ -590,6 +592,7 @@ struct Access {
     pin: ContextPin,
     connection: CredentialId,
     admitted: Option<Arc<AdmittedMember>>,
+    signals: ForwardSignals,
 }
 
 impl Access {
@@ -691,14 +694,11 @@ impl Access {
     }
 
     /// `result`, after ending every forward on this connection if its sign-in was refused.
-    async fn after<T>(&self, result: Result<T, DialError>) -> Result<T, DialError> {
+    fn after<T>(&self, result: Result<T, DialError>) -> Result<T, DialError> {
         if let Err(DialError::Fatal(failure)) = &result
             && failure.kind == ForwardFailureKind::Unauthorized
         {
-            let _ = self
-                .requests
-                .send(Request::ForwardUnauthorized { id: self.id })
-                .await;
+            self.signals.end_connection(&self.connection);
         }
         result
     }
@@ -953,7 +953,7 @@ impl Dialer for KubeDialer {
                 Ok(backend.pod)
             }
             .await;
-            access.after(probed).await
+            access.after(probed)
         }
         .boxed()
     }
@@ -964,7 +964,7 @@ impl Dialer for KubeDialer {
         let uid = Arc::clone(&self.uid);
         async move {
             let dialed = dial_once(&access, &request, &uid).await;
-            access.after(dialed).await
+            access.after(dialed)
         }
         .boxed()
     }
@@ -996,9 +996,12 @@ async fn dial_once(
             if let Some(failure) = refused.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 return Err(DialError::Fatal(failure));
             }
+            // Before the gate, which a stuck manager would hold this refusal behind.
+            if error == WireError::Status(401) {
+                return Err(DialError::Fatal(unauthorized()));
+            }
             access.check().await.map_err(DialError::Fatal)?;
             return Err(match error {
-                WireError::Status(401) => DialError::Fatal(unauthorized()),
                 WireError::Status(403) => forbidden("port-forwarding to this pod"),
                 WireError::Status(404) if matches!(request.target, ForwardTarget::Pod(_)) => {
                     gone(&request.target)
@@ -1048,6 +1051,7 @@ impl KubeDialer {
                 pin: grant.pin,
                 connection: grant.connection,
                 admitted,
+                signals: grant.signals,
             },
             request,
             ended: grant.ended,

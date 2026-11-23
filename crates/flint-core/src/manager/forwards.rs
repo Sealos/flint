@@ -39,7 +39,13 @@ pub(crate) struct ForwardSignals(Arc<Mutex<Signals>>);
 #[derive(Default)]
 struct Signals {
     quitting: bool,
-    live: HashMap<u64, (ClusterId, watch::Sender<Option<ForwardState>>)>,
+    live: HashMap<u64, Signal>,
+}
+
+struct Signal {
+    cluster: ClusterId,
+    connection: CredentialId,
+    ended: watch::Sender<Option<ForwardState>>,
 }
 
 impl ForwardSignals {
@@ -49,9 +55,20 @@ impl ForwardSignals {
 
     /// Ends every forward on `cluster`, now.
     pub(crate) fn end_cluster(&self, cluster: &str) {
-        for (on, ended) in self.lock().live.values() {
-            if on == cluster {
-                ended.send_replace(Some(ForwardState::Stopped));
+        for signal in self.lock().live.values() {
+            if signal.cluster == cluster {
+                signal.ended.send_replace(Some(ForwardState::Stopped));
+            }
+        }
+    }
+
+    /// The server refused `connection`'s sign-in: ends every forward on it, now.
+    pub(crate) fn end_connection(&self, connection: &CredentialId) {
+        for signal in self.lock().live.values() {
+            if signal.connection.is(connection) {
+                signal
+                    .ended
+                    .send_replace(Some(ForwardState::Failed(unauthorized())));
             }
         }
     }
@@ -60,18 +77,31 @@ impl ForwardSignals {
     pub(crate) fn quit(&self) {
         let mut signals = self.lock();
         signals.quitting = true;
-        for (_, ended) in signals.live.values() {
-            ended.send_replace(Some(ForwardState::Stopped));
+        for signal in signals.live.values() {
+            signal.ended.send_replace(Some(ForwardState::Stopped));
         }
     }
 
     /// Records a forward; `false` once quitting.
-    fn add(&self, id: u64, cluster: &str, ended: &watch::Sender<Option<ForwardState>>) -> bool {
+    fn add(
+        &self,
+        id: u64,
+        cluster: &str,
+        connection: &CredentialId,
+        ended: &watch::Sender<Option<ForwardState>>,
+    ) -> bool {
         let mut signals = self.lock();
         if signals.quitting {
             return false;
         }
-        signals.live.insert(id, (cluster.to_owned(), ended.clone()));
+        signals.live.insert(
+            id,
+            Signal {
+                cluster: cluster.to_owned(),
+                connection: connection.clone(),
+                ended: ended.clone(),
+            },
+        );
         true
     }
 
@@ -114,7 +144,7 @@ impl ClusterManager {
         let id = self.forwards.next;
         let connection = credential.id();
         let (ended, ended_rx) = watch::channel(None);
-        if !self.forwards.signals.add(id, &cluster, &ended) {
+        if !self.forwards.signals.add(id, &cluster, &connection, &ended) {
             return Err(WriteRefusal::Stopped.into());
         }
         let kept = self.keep_watching(&cluster);
@@ -135,7 +165,39 @@ impl ClusterManager {
             pin,
             connection,
             ended: ended_rx,
+            signals: self.forwards.signals.clone(),
         })
+    }
+
+    /// A running forward on `cluster`, without a connection, and how it hears that it ended.
+    #[cfg(test)]
+    pub(super) fn forward_for_tests(
+        &mut self,
+        cluster: &str,
+    ) -> watch::Receiver<Option<ForwardState>> {
+        let credential = crate::credential::WriteCredential::new(
+            Vec::new(),
+            crate::credential::CredentialSource::Definition,
+            None,
+            None,
+        );
+        let (ended, ended_rx) = watch::channel(None);
+        self.forwards.next += 1;
+        let id = self.forwards.next;
+        let connection = credential.id();
+        assert!(self.forwards.signals.add(id, cluster, &connection, &ended));
+        self.forwards.live.insert(
+            id,
+            LiveForward {
+                cluster: cluster.to_owned(),
+                pin: ContextPin::stale(),
+                connection,
+                kept: false,
+                in_set: false,
+                ended,
+            },
+        );
+        ended_rx
     }
 
     /// Whether forward `id` may go on. One already ended is refused.
@@ -182,23 +244,6 @@ impl ClusterManager {
         for id in ids {
             let failure = gate_failure(&WriteError::ConnectionChanged);
             self.end_forward(id, ForwardState::Failed(failure));
-        }
-    }
-
-    /// The server refused forward `id`'s sign-in: every forward on its connection ends.
-    pub(super) fn forward_unauthorized(&mut self, id: u64) {
-        let Some(connection) = self.forwards.live.get(&id).map(|l| l.connection.clone()) else {
-            return;
-        };
-        let ids: Vec<u64> = self
-            .forwards
-            .live
-            .iter()
-            .filter(|(_, live)| live.connection.is(&connection))
-            .map(|(id, _)| *id)
-            .collect();
-        for id in ids {
-            self.end_forward(id, ForwardState::Failed(unauthorized()));
         }
     }
 
