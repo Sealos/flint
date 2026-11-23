@@ -473,7 +473,9 @@ pub(crate) struct GuardedProvider(Arc<GuardedParts>);
 struct GuardedParts {
     layer: Arc<AuthLayer>,
     lease: CredentialLease,
-    turn: tokio::sync::Mutex<()>,
+    /// Held until kube's call returns, even if the request that made it has gone, so no request
+    /// passes the lease check and then waits on kube's lock.
+    turn: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl GuardedProvider {
@@ -485,7 +487,7 @@ impl GuardedProvider {
             GuardedProvider(Arc::new(GuardedParts {
                 layer: layer.clone(),
                 lease: lease.clone(),
-                turn: tokio::sync::Mutex::new(()),
+                turn: Arc::default(),
             }))
         })
     }
@@ -498,11 +500,17 @@ impl GuardedProvider {
     pub(crate) async fn header(&self) -> Result<HeaderValue, BoxError> {
         let parts = &self.0;
         let resolving = async {
-            let _turn = parts.turn.lock().await;
+            let turn = parts.turn.clone().lock_owned().await;
             if !parts.lease.holds() {
                 return Err(crate::auth_plugin::not_allowed().into());
             }
-            layer_header(&parts.layer).await
+            let layer = parts.layer.clone();
+            tokio::spawn(async move {
+                let _turn = turn;
+                layer_header(&layer).await
+            })
+            .await
+            .unwrap_or_else(|stopped| Err(stopped.into()))
         };
         let header = tokio::select! {
             biased;

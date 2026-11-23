@@ -552,6 +552,70 @@ async fn a_demoted_provider_starts_no_queued_command_and_stays_unusable() {
     assert_eq!(api.requests(), 0);
 }
 
+// A request that gave up leaves kube's command running. The next one must not get past the lease
+// check and sit on kube's lock, from where it would start the command after a demotion.
+#[tokio::test]
+async fn a_request_queued_behind_an_abandoned_command_starts_nothing_after_a_demotion() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = CountingApi::start().await;
+    let (kubeconfig, count) = held_provider_kubeconfig(&api.url, dir.path());
+    let access = foreground_only(Role::Foreground);
+    let connection = cluster::connect_gated_with_policy(&kubeconfig, "ctx", &access)
+        .await
+        .unwrap_or_else(|_| panic!("the foreground connect builds the auth layer"));
+    let ran = count_of(&count);
+    std::fs::write(dir.path().join("hold"), "").unwrap();
+
+    let read = connection.clients.read.clone();
+    let abandoned = tokio::spawn(async move { cluster::server_version(&read).await });
+    let started = dir.path().join("started");
+    for _ in 0..500 {
+        if started.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(started.exists());
+    abandoned.abort();
+    let _ = abandoned.await;
+
+    let read = connection.clients.read.clone();
+    let queued = tokio::spawn(async move { cluster::server_version(&read).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    access.set_role(Role::Background);
+    std::fs::write(dir.path().join("release"), "").unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(15), queued)
+        .await
+        .unwrap()
+        .unwrap()
+        .expect_err("a demoted connection sends nothing");
+    assert!(is_not_allowed(&error));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(count_of(&count), ran + 1, "the queued request ran nothing");
+    assert_eq!(api.requests(), 0);
+}
+
+// A role change can't land between a lease's last check and what it guards.
+#[test]
+fn a_role_change_waits_for_a_start_under_the_lease() {
+    let access = foreground_only(Role::Foreground);
+    let lease = access.grant(CredentialSource::Plugin).lease();
+    let (done, finished) = std::sync::mpsc::channel();
+    let demoting = access.clone();
+    let ran = lease.while_held(|| {
+        std::thread::spawn(move || {
+            demoting.set_role(Role::Background);
+            done.send(()).unwrap();
+        });
+        finished.recv_timeout(Duration::from_millis(150)).is_err()
+    });
+    assert_eq!(ran, Some(true), "the demotion waited for the start");
+    finished.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(!lease.holds());
+    assert_eq!(lease.while_held(|| ()), None, "nothing starts after it");
+}
+
 #[tokio::test]
 async fn always_allow_keeps_an_auth_provider_running_in_any_role() {
     let dir = tempfile::tempdir().unwrap();

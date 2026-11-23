@@ -44,7 +44,7 @@ use tower::BoxError;
 use tower::filter::{AsyncFilterLayer, AsyncPredicate};
 
 use crate::cluster::{CONNECT_TIMEOUT, PluginProblem};
-use crate::connection::policy::CredentialGrant;
+use crate::connection::policy::{CredentialGrant, CredentialLease};
 use crate::redact;
 
 /// A token this close to its expiry is refreshed first, as kube does.
@@ -124,7 +124,7 @@ pub(crate) async fn resolve_with_grant(
     let credential = tokio::select! {
         biased;
         () = lease.revoked() => return Err(not_allowed()),
-        credential = run(&exec, terminal, || {}) => credential?,
+        credential = run(&exec, &lease, terminal, || {}) => credential?,
     };
     if !lease.holds() {
         return Err(not_allowed());
@@ -171,10 +171,11 @@ pub(crate) async fn resolve_with_grant(
     })
 }
 
-/// Runs `exec` once and reads its `ExecCredential`. Dropping the future kills the plugin's
-/// process group.
+/// Runs `exec` once and reads its `ExecCredential`, unless `lease` has ended by the moment it
+/// would start. Dropping the future kills the plugin's process group.
 async fn run(
     exec: &ExecConfig,
+    lease: &CredentialLease,
     terminal: impl Future<Output = Acquired>,
     on_start: impl FnOnce(),
 ) -> Result<Credential, AuthError> {
@@ -259,7 +260,10 @@ async fn run(
         cmd.env_remove(name);
     }
     cmd.kill_on_drop(true);
-    let mut child = cmd.spawn().map_err(AuthError::AuthExecStart)?;
+    let mut child = lease
+        .while_held(|| cmd.spawn())
+        .ok_or_else(not_allowed)?
+        .map_err(AuthError::AuthExecStart)?;
     on_start();
     // Closed at once, as `Command::output()` does.
     drop(child.stdin.take());
@@ -833,7 +837,7 @@ impl RefreshingToken {
                 () = lease.revoked() => None,
                 result = tokio::time::timeout(
                     CONNECT_TIMEOUT,
-                    run(&exec, terminal, || started = true),
+                    run(&exec, &lease, terminal, || started = true),
                 ) => Some(result),
             };
             let mut state = state.lock().await;

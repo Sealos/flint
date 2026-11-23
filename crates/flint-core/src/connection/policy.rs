@@ -218,6 +218,14 @@ impl CredentialLease {
         self.holds_in(&state)
     }
 
+    /// Runs `start` if this still holds, with role changes waiting until it returns: a change
+    /// lands either before the check, and `start` does not run, or after `start`, where
+    /// [`Self::revoked`] sees it. `start` must be short and must not change this role.
+    pub(crate) fn while_held<T>(&self, start: impl FnOnce() -> T) -> Option<T> {
+        let state = self.grant.access.role.borrow();
+        self.holds_in(&state).then(start)
+    }
+
     /// Whether the credential behind this can be stopped by a role at all.
     pub(crate) fn can_be_denied(&self) -> bool {
         self.grant.can_be_denied()

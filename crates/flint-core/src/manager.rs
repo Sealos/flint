@@ -1890,12 +1890,16 @@ impl ClusterManager {
 
     /// Whether nothing new may start for `id`: a held slot, or an entry that may be a later file's
     /// fallback and differs from the definition a load last confirmed. A provisional entry that
-    /// matches it, or that no load ever confirmed, connects as usual.
+    /// matches it connects as usual, and so does one no load ever confirmed, unless connecting
+    /// would run a command from a definition that may not be the winning one.
     fn paused(&self, id: &str) -> bool {
         self.held(id)
-            || self
-                .cluster(id)
-                .is_some_and(|slot| self.settled.paused(&self.contexts, id, slot.fingerprint))
+            || self.cluster(id).is_some_and(|slot| {
+                self.settled.paused(&self.contexts, id, slot.fingerprint)
+                    || (self.contexts.provisional(id)
+                        && !self.settled.confirms(id, slot.fingerprint)
+                        && self.definition_runs_a_command(id))
+            })
     }
 
     /// Reads the kubeconfig files now, ahead of the file watcher, and says whether they still
@@ -2017,6 +2021,8 @@ impl ClusterManager {
                 // Its watches stop; its client and discovery stay (ADR-0008).
                 self.reconcile(&previous);
             }
+            // A provider's lease ended when it was switched away from: selecting it reconnects.
+            self.drop_spent_connections();
         }
         self.apply_member(&id, MemberEvent::Activated, Instant::now());
         self.ensure_connected(&id);
@@ -5531,6 +5537,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut manager, _, _) = pausable(dir.path(), NO_CONTEXTS).await;
         manager.active = Some("dev".to_owned());
+        manager.sync_roles();
         let pods = live_dev(&mut manager).await;
         let slot = manager.cluster_mut("dev").unwrap();
         let grant = slot.access.grant(CredentialSource::Definition);
@@ -5586,6 +5593,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut manager, confirmed, first) = pausable(dir.path(), NO_CONTEXTS).await;
         manager.active = Some("dev".to_owned());
+        manager.sync_roles();
         live_dev(&mut manager).await;
         let old = command_credential(&mut manager);
         let held_by_a_task = old.clone();
@@ -5642,6 +5650,7 @@ mod tests {
         let mut manager = manager_reading_two(dir.path(), &yaml, NO_CONTEXTS).await;
         let first = dir.path().join("first");
         manager.active = Some("dev".to_owned());
+        manager.sync_roles();
         join_dev(&mut manager);
         let access = manager.cluster("dev").unwrap().access.clone();
         let connection =
@@ -5675,6 +5684,115 @@ mod tests {
         let slot = manager.cluster("dev").unwrap();
         assert!(matches!(slot.state, ConnectionState::Connecting));
         assert!(slot.member_attempt.is_some(), "bound to the member");
+    }
+
+    // Outside the set too, only the selected cluster may run a command. The one switched away
+    // from keeps its connection, and selecting it allows the command again.
+    #[tokio::test]
+    async fn a_cluster_switched_away_from_may_not_run_its_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, _, _) = pausable(dir.path(), NO_CONTEXTS).await;
+        manager.active = Some("dev".to_owned());
+        land_connection(&mut manager).await;
+        let grant = command_credential(&mut manager);
+        manager.sync_roles();
+        assert!(grant.allowed());
+
+        manager.activate("other".to_owned());
+        assert_eq!(manager.connection_role("dev"), Role::Background);
+        assert!(!grant.allowed(), "no command once switched away");
+        let slot = manager.cluster("dev").unwrap();
+        assert!(slot.client.is_some() && slot.write_credential.is_some());
+        assert!(matches!(slot.state, ConnectionState::Connected(_)));
+
+        manager.activate("dev".to_owned());
+        assert!(grant.allowed(), "selecting it grants again");
+    }
+
+    // A provider's lease can't come back, so selecting its cluster again makes a new connection,
+    // while being switched away from leaves the old one to the sessions on it.
+    #[tokio::test]
+    async fn selecting_a_spent_connection_again_replaces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("provider.sh");
+        std::fs::write(
+            &script,
+            "printf '{\"token\":\"t\",\"expiry\":\"2020-01-01T00:00:00Z\"}'\n",
+        )
+        .unwrap();
+        let provider = format!(
+            "user:\n    auth-provider:\n      name: gcp\n      config:\n        cmd-path: /bin/sh\n        \
+             cmd-args: {}\n        token-key: '{{.token}}'\n        expiry-key: '{{.expiry}}'\n",
+            script.display()
+        );
+        let yaml = kubeconfig_with("https://127.0.0.1:1").replace("user: {}\n", &provider);
+        let mut manager = manager_reading_two(dir.path(), &yaml, NO_CONTEXTS).await;
+        manager.active = Some("dev".to_owned());
+        manager.sync_roles();
+        let access = manager.cluster("dev").unwrap().access.clone();
+        let connection =
+            cluster::connect_gated_with_policy(&manager.kubeconfig.merged, "dev", &access)
+                .await
+                .unwrap_or_else(|_| panic!("building a client runs nothing"));
+        let attempt = manager.next_attempt;
+        manager.next_attempt += 1;
+        let slot = manager.cluster_mut("dev").unwrap();
+        slot.attempt = attempt;
+        slot.state = ConnectionState::Connecting;
+        manager
+            .handle_internal(Internal::Connected {
+                cluster: "dev".into(),
+                attempt,
+                result: Ok((connection, test_version())),
+            })
+            .await;
+
+        manager.activate("other".to_owned());
+        let slot = manager.cluster("dev").unwrap();
+        assert!(slot.write_credential.as_ref().unwrap().spent());
+        assert!(slot.client.is_some(), "kept while switched away");
+
+        manager.activate("dev".to_owned());
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Connecting));
+        assert!(slot.client.is_none() && slot.write_credential.is_none());
+    }
+
+    // First seen behind an unreadable file, a definition with a command runs nothing: the file
+    // may hold the winning one. The load that confirms it connects once.
+    #[tokio::test]
+    async fn an_unconfirmed_command_definition_waits_for_a_load_to_confirm_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let script = dir.path().join("plugin");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\n: > {}\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        let executable = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+        std::fs::set_permissions(&script, executable).unwrap();
+        let exec = format!(
+            "user:\n    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      \
+             command: {}\n      interactiveMode: Never\n",
+            script.display()
+        );
+        let yaml = kubeconfig_with("https://127.0.0.1:1").replace("user: {}\n", &exec);
+        let mut manager = manager_reading_two(dir.path(), UNREADABLE, &yaml).await;
+        assert!(manager.contexts.provisional("dev") && manager.paused("dev"));
+        assert_eq!(manager.connection_role("dev"), Role::Paused);
+
+        let next = manager.next_attempt;
+        manager.activate("dev".to_owned());
+        assert_eq!(manager.next_attempt, next, "no attempt started");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!marker.exists(), "the command did not run");
+
+        rewrite_file(&mut manager, &dir.path().join("first"), NO_CONTEXTS).await;
+        assert!(!manager.contexts.provisional("dev") && !manager.paused("dev"));
+        assert_eq!(manager.next_attempt, next + 1, "it connects once");
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Connecting));
     }
 
     // A log session asks for a background member's connection; the queue decides when it starts.
@@ -6513,8 +6631,10 @@ mod tests {
             &hubs,
             &manager.engine_config,
         );
+        manager.contexts.record(&loaded);
         manager.kubeconfig = Arc::new(loaded);
         manager.clusters.push(slot);
+        manager.active = Some("dev".to_owned());
 
         manager.ensure_connected("dev");
         let (leader, _) = plugin.wait_started().await;

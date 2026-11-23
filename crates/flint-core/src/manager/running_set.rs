@@ -186,9 +186,11 @@ impl ClusterManager {
         if let Some(credential) = self.cluster(id).and_then(|s| s.write_credential.as_ref()) {
             return credential.runs_a_command();
         }
-        if self.unsettled(id) {
-            return true;
-        }
+        self.unsettled(id) || self.definition_runs_a_command(id)
+    }
+
+    /// Whether the definition the kubeconfig shows for `id` now would run a program.
+    pub(super) fn definition_runs_a_command(&self, id: &str) -> bool {
         let merged = &self.kubeconfig.merged;
         let Some(context) = merged
             .contexts
@@ -251,16 +253,17 @@ impl ClusterManager {
         self.ensure_connected(id);
     }
 
-    /// The role a connection of `id` has now. A pause outranks the rest, and a cluster outside
-    /// the set stays in the foreground, as its log and shell sessions run while it is not active.
+    /// The role a connection of `id` has now. A pause outranks the rest, and only the selected
+    /// cluster is in the foreground. One switched away from keeps its token and sessions, and
+    /// asks for a sign-in rather than run a command when the token is due.
     pub(super) fn connection_role(&self, id: &str) -> Role {
         let member = self.members.contains_key(id);
         if self.paused(id) || (member && !self.member_on_its_server(id)) {
             Role::Paused
-        } else if member && self.active.as_deref() != Some(id) {
-            Role::Background
-        } else {
+        } else if self.active.as_deref() == Some(id) {
             Role::Foreground
+        } else {
+            Role::Background
         }
     }
 
@@ -271,17 +274,23 @@ impl ClusterManager {
         }
     }
 
-    /// Ends connections a pause left unable to authenticate, once it is over. They count as lost,
-    /// so the usual paths connect them again.
+    /// Ends connections left unable to authenticate, once they could be replaced. They count as
+    /// lost, so the usual paths connect them again. One switched away from outside the set stays
+    /// for the sessions it still carries, until it is selected again.
     pub(super) fn drop_spent_connections(&mut self) {
         let spent: Vec<ClusterId> = self
             .clusters
             .iter()
             .filter(|slot| {
+                let id = &slot.info.name;
                 slot.write_credential
                     .as_ref()
                     .is_some_and(WriteCredential::spent)
-                    && self.connection_role(&slot.info.name) != Role::Paused
+                    && match self.connection_role(id) {
+                        Role::Foreground => true,
+                        Role::Background => self.members.contains_key(id),
+                        Role::Paused | Role::Retired => false,
+                    }
             })
             .map(|slot| slot.info.name.clone())
             .collect();
