@@ -5074,6 +5074,106 @@ mod tests {
         }
     }
 
+    /// Brings the feeds in line, as the manager's loop does after each message, and says whether
+    /// `dev` has one.
+    fn dev_has_feed(manager: &mut ClusterManager) -> bool {
+        manager.sync_telemetry();
+        let feed = manager.cluster("dev").unwrap().telemetry.is_some();
+        assert_eq!(manager.telemetry.get("dev").is_some(), feed);
+        feed
+    }
+
+    #[tokio::test]
+    async fn a_feed_runs_only_for_a_wanted_connected_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager =
+            manager_reading(dir.path(), &kubeconfig_with("https://127.0.0.1:1")).await;
+        assert!(!dev_has_feed(&mut manager), "not connected");
+
+        land_connection(&mut manager).await;
+        assert!(!dev_has_feed(&mut manager), "connected but not wanted");
+
+        manager.active = Some("dev".to_owned());
+        assert!(dev_has_feed(&mut manager), "selected");
+        let first = manager.cluster("dev").unwrap().attempt;
+
+        manager.active = Some("other".to_owned());
+        assert!(!dev_has_feed(&mut manager), "switched away");
+
+        join_dev(&mut manager);
+        assert!(dev_has_feed(&mut manager), "a running-set member");
+
+        land_connection(&mut manager).await;
+        assert_ne!(manager.cluster("dev").unwrap().attempt, first);
+        assert!(dev_has_feed(&mut manager), "follows the new connection");
+
+        manager.cluster_mut("dev").unwrap().clear_connection();
+        assert!(manager.cluster("dev").unwrap().telemetry.is_none());
+        manager.cluster_mut("dev").unwrap().state = ConnectionState::Disconnected;
+        assert!(!dev_has_feed(&mut manager), "disconnected");
+    }
+
+    #[tokio::test]
+    async fn a_pause_stops_the_feed() {
+        for second in pauses() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut manager, _, first) = pausable(dir.path(), &second).await;
+            manager.active = Some("dev".to_owned());
+            land_connection(&mut manager).await;
+            assert!(dev_has_feed(&mut manager));
+
+            rewrite_file(&mut manager, &first, UNREADABLE).await;
+            assert!(manager.paused("dev"));
+            assert!(!dev_has_feed(&mut manager));
+        }
+    }
+
+    #[tokio::test]
+    async fn no_feed_is_left_after_a_context_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager =
+            manager_reading(dir.path(), &kubeconfig_with("https://127.0.0.1:1")).await;
+        manager.active = Some("dev".to_owned());
+        land_connection(&mut manager).await;
+        assert!(dev_has_feed(&mut manager));
+
+        rewrite(&mut manager, dir.path(), NO_CONTEXTS).await;
+        assert!(manager.cluster("dev").is_none());
+        manager.sync_telemetry();
+        assert!(manager.telemetry.get("dev").is_none());
+        assert!(manager.telemetry.all().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_background_member_whose_sign_in_runs_a_program_has_no_feed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager =
+            manager_reading(dir.path(), &kubeconfig_with("https://127.0.0.1:1")).await;
+        manager.active = Some("other".to_owned());
+        join_dev(&mut manager);
+        manager.sync_roles();
+        land_connection(&mut manager).await;
+        assert!(dev_has_feed(&mut manager), "a static credential may run");
+
+        command_credential(&mut manager);
+        assert!(!dev_has_feed(&mut manager));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_command_credential_has_no_feed_even_when_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager =
+            manager_reading(dir.path(), &kubeconfig_with("https://127.0.0.1:1")).await;
+        manager.active = Some("dev".to_owned());
+        manager.sync_roles();
+        land_connection(&mut manager).await;
+        command_credential(&mut manager);
+        assert!(dev_has_feed(&mut manager));
+
+        manager.cluster("dev").unwrap().access.revoke();
+        assert!(!dev_has_feed(&mut manager));
+    }
+
     /// Makes `dev` a member of the running set, joined for the server it has now.
     fn join_dev(manager: &mut ClusterManager) {
         let server = manager.cluster("dev").unwrap().info.server.clone().unwrap();

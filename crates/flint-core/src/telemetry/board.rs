@@ -1,5 +1,7 @@
 //! The feeds running now, readable from the front end without going through the manager's loop.
 
+// module-tests: ../manager.rs
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 

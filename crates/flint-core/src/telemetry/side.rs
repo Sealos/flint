@@ -22,21 +22,16 @@ use crate::metrics::{
 };
 
 /// A list read apart from the watched kinds.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum SideRead<T> {
     /// No read has finished.
+    #[default]
     Waiting,
     Current(Arc<[T]>),
     /// It holds more than [`MAX_OBJECTS_PER_KIND`] objects, so it is not counted in part.
     TooLarge,
     /// The last read failed.
     Failed(CheckFailure),
-}
-
-impl<T> Default for SideRead<T> {
-    fn default() -> Self {
-        Self::Waiting
-    }
 }
 
 impl<T> SideRead<T> {
@@ -50,21 +45,16 @@ impl<T> SideRead<T> {
 }
 
 /// The newest usage by key, from `metrics.k8s.io`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum UsageRead<K> {
     /// No poll has finished.
+    #[default]
     Waiting,
     Current(Arc<BTreeMap<K, Usage>>),
     /// It holds more than [`MAX_OBJECTS_PER_KIND`] entries.
     TooLarge,
     /// The last poll failed. [`MetricsError::NotInstalled`] is the case for an install hint.
     Unavailable(MetricsError),
-}
-
-impl<K> Default for UsageRead<K> {
-    fn default() -> Self {
-        Self::Waiting
-    }
 }
 
 impl<K: Ord> UsageRead<K> {
@@ -91,9 +81,9 @@ pub type PodKey = (String, String);
 /// Everything a feed reads besides the watched kinds.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SideReads {
-    /// Warning events, for [`DashboardInput`](crate::dashboard::DashboardInput).
+    /// Warning events, as the dashboard's input takes them.
     pub warning_events: SideRead<Event>,
-    /// Claims of every phase, for [`DashboardInput`](crate::dashboard::DashboardInput).
+    /// Claims of every phase, as the dashboard's input takes them.
     pub pending_claims: SideRead<PersistentVolumeClaim>,
     pub pod_usage: UsageRead<PodKey>,
     /// By node name.

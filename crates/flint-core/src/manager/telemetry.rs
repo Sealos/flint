@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use super::{Cluster, ClusterManager};
 use crate::cluster;
 use crate::connection::policy::Role;
+use crate::credential::CredentialSource;
 use crate::handle::ConnectionState;
 use crate::metrics_trend::TrendStore;
 use crate::telemetry::Telemetry;
@@ -41,6 +42,10 @@ impl ClusterManager {
             || !matches!(slot.state, ConnectionState::Connected(_))
             || credential.spent()
         {
+            return false;
+        }
+        // The slot's access answers for a revoked grant, which the role computed here can't show.
+        if credential.runs_a_command() && !slot.access.grant(CredentialSource::Plugin).allowed() {
             return false;
         }
         match self.connection_role(id) {
