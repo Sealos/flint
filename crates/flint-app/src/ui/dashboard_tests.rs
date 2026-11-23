@@ -578,6 +578,10 @@ fn label(
 async fn draws_a_full_dashboard(cx: &mut TestAppContext) {
     let model = full_model();
     let first = model.tiles[2].clone();
+    let WarningsPanel::Rows { rows, .. } = &model.warnings else {
+        panic!("the full model has Warning rows");
+    };
+    let warning_id = ElementId::Name(format!("dashboard-warning-{}", rows[0].key).into());
     let (window, _) = open(cx, model);
     assert_eq!(
         label(cx, window, tile_id(&first)).as_deref(),
@@ -596,7 +600,7 @@ async fn draws_a_full_dashboard(cx: &mut TestAppContext) {
         label(cx, window, "dashboard-memory").as_deref(),
         Some("Memory: 2.0 GiB")
     );
-    let row = label(cx, window, ("dashboard-warning", 0usize)).unwrap();
+    let row = label(cx, window, warning_id).unwrap();
     assert!(row.contains("Pod shop/web-0"), "{row}");
     assert_eq!(label(cx, window, "dashboard-status"), None);
 }
@@ -608,7 +612,6 @@ async fn draws_the_empty_state(cx: &mut TestAppContext) {
         label(cx, window, "dashboard-warnings-empty").as_deref(),
         Some(NO_WARNINGS)
     );
-    assert_eq!(label(cx, window, ("dashboard-warning", 0usize)), None);
 }
 
 #[gpui_kit::test]

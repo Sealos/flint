@@ -9,6 +9,7 @@
 //! not open a list.
 
 use std::cmp::Reverse;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use flint_core::activity::is_invisible;
@@ -45,6 +46,7 @@ mod sparkline;
 #[path = "dashboard_tiles.rs"]
 mod tiles;
 
+use feed::DrawnLinks;
 #[cfg(test)]
 pub(in crate::ui) use feed::{FeedId, lists_of, slot_to_read};
 pub use feed::{ProblemList, ProblemLists};
@@ -185,7 +187,7 @@ pub enum DashboardEvent {
     OpenFilteredList(ProblemCategory),
     /// Show this kind's short workloads.
     OpenShortWorkloads(&'static str),
-    /// A row's object cannot be opened here. Holds its name as shown.
+    /// A row's object was not opened. Holds why, to show.
     CannotOpen(String),
 }
 
@@ -318,6 +320,10 @@ pub struct WarningRow {
     pub occurrences: u32,
     /// The object it happened to, unless the event does not name one exactly.
     pub open: Option<OpenObject>,
+    /// That object's UID, when the event identifies it by one.
+    pub object_uid: Option<String>,
+    /// This event among the rows: stays the same as rows above it come and go.
+    pub key: String,
 }
 
 impl WarningRow {
@@ -375,6 +381,12 @@ impl DashboardModel {
             if rows.iter().any(|row| row.open == *action))
             || matches!(&self.warnings, WarningsPanel::Rows { rows, .. }
                 if rows.iter().any(|row| row.open.as_ref() == Some(action)))
+    }
+
+    /// Whether the Warning row `key` still links to `open`.
+    pub(in crate::ui) fn links_warning(&self, key: &str, open: &OpenObject) -> bool {
+        matches!(&self.warnings, WarningsPanel::Rows { rows, .. }
+            if rows.iter().any(|row| row.key == key && row.open.as_ref() == Some(open)))
     }
 
     /// Whether `action` is one of the inventory's links. An unread count draws none.
@@ -595,10 +607,14 @@ fn warnings(input: &DashboardInput<'_>, scope: &OpenScope) -> WarningsPanel {
             event.reason.clone(),
         )
     });
+    let mut keys = HashSet::new();
     let rows = recent
         .into_iter()
         .take(MAX_WARNING_ROWS)
-        .map(|(seen, event)| warning_row(event, seen, input.now, scope))
+        .map(|(seen, event)| {
+            let key = warning_key(event, &mut keys);
+            warning_row(event, key, seen, input.now, scope)
+        })
         .collect();
     WarningsPanel::Rows { rows, total }
 }
@@ -634,8 +650,45 @@ fn warning_target(event: &KubeEvent, scope: &OpenScope) -> Option<OpenObject> {
     })
 }
 
+/// The event's UID, or what names it without one. Made unique, since rows are keyed by it.
+fn warning_key(event: &KubeEvent, taken: &mut HashSet<String>) -> String {
+    let object = &event.involved_object;
+    let base = event
+        .metadata
+        .uid
+        .clone()
+        .filter(|uid| !uid.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "{}/{}/{}/{}",
+                object.namespace.as_deref().unwrap_or_default(),
+                object.name.as_deref().unwrap_or_default(),
+                object.uid.as_deref().unwrap_or_default(),
+                event.reason.as_deref().unwrap_or_default(),
+            )
+        });
+    let mut key = base.clone();
+    let mut copy = 1;
+    while !taken.insert(key.clone()) {
+        copy += 1;
+        key = format!("{base}#{copy}");
+    }
+    key
+}
+
+/// The UID the event gives its object. The kubelet reports a Node under its name in place of a
+/// UID, which identifies nothing.
+fn warning_object_uid(event: &KubeEvent) -> Option<String> {
+    let object = &event.involved_object;
+    object.uid.clone().filter(|uid| {
+        !uid.is_empty()
+            && !(object.kind.as_deref() == Some("Node") && object.name.as_deref() == Some(uid))
+    })
+}
+
 fn warning_row(
     event: &KubeEvent,
+    key: String,
     seen: Timestamp,
     now: Timestamp,
     scope: &OpenScope,
@@ -668,6 +721,8 @@ fn warning_row(
         message: event.message.as_deref().map_or_else(String::new, cleaned),
         occurrences,
         open,
+        object_uid: warning_object_uid(event),
+        key,
     }
 }
 
@@ -848,6 +903,7 @@ impl Focusable for DashboardView {
 impl Render for DashboardView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.frame_drawn();
+        let links = self.drawn_links(cx);
         let theme = cx.theme();
         v_flex()
             .id("dashboard")
@@ -871,22 +927,13 @@ impl Render for DashboardView {
                 self.focus.clone(),
                 theme,
             ))
-            .child(tiles::problems_section(
-                &self.model.problems,
-                self.focus.clone(),
-                theme,
-            ))
-            .child(tiles::warnings_section(
-                &self.model.warnings,
-                self.focus.clone(),
-                cx.weak_entity(),
-                theme,
-            ))
+            .child(tiles::problems_section(&self.model.problems, &links, theme))
+            .child(tiles::warnings_section(&self.model.warnings, &links, theme))
             .child(tiles::capacity_section(&self.model.capacity, theme))
             .child(tiles::metrics_section(&self.model.metrics, theme))
             .child(tiles::inventory_section(
                 &self.model.inventory,
-                self.focus.clone(),
+                &links,
                 theme,
             ))
     }

@@ -430,7 +430,7 @@ impl Workspace {
         });
         let dock = cx.new(Dock::new);
         let on_dock = cx.subscribe_in(&dock, window, |this, _, event, window, cx| match event {
-            DockEvent::Blurred => this.reclaim_focus(window, cx),
+            DockEvent::Blurred => this.recover_focus(window, cx),
             DockEvent::Restart(id) => this.restart_tab(*id, window, cx),
         });
         let focus = cx.focus_handle();
@@ -438,7 +438,7 @@ impl Workspace {
         // Focus left with a closed view (a cluster switch drops the list): take it back, so keys
         // and registered actions still reach the workspace.
         let on_focus_lost =
-            cx.on_focus_lost(window, |this, window, cx| this.reclaim_focus(window, cx));
+            cx.on_focus_lost(window, |this, window, cx| this.recover_focus(window, cx));
         let guards = Self::set_guards(Self::guards(cx.entity().downgrade()))
             .when::<OpenClusterOverview>(|ws, _| ws.cluster.is_some());
         registry::install(focus.clone(), guards, cx);
@@ -1140,6 +1140,9 @@ impl Workspace {
         // An open switcher follows the active cluster and its discovery.
         self.refresh_switcher(cx);
         let (Some(cluster), Some(discovery)) = (active, discovered.discovery) else {
+            if discovered.error.is_some() {
+                self.open_overview_without_discovery(window, cx);
+            }
             return;
         };
         if self.list.is_some() || self.dashboard.is_some() || self.sets.is_open() {
@@ -1183,7 +1186,25 @@ impl Workspace {
             // The kind last open on this cluster, also after a restart.
             self.restore_kind(&entry, window, cx);
         }
-        if self.list.is_none() {
+        // A saved kind in a group discovery could not vouch for may come with its next retry.
+        let saved_may_come = self
+            .ui_state
+            .last_view(&cluster)
+            .is_some_and(|kind| may_still_be_discovered(&discovery, kind));
+        if self.list.is_none() && !saved_may_come {
+            self.open_default_overview(window, cx);
+        }
+    }
+
+    /// Discovery failed with nothing asked for, so there are no kinds to pick: the overview
+    /// needs none. An explicit or saved kind waits for discovery to work instead.
+    fn open_overview_without_discovery(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pending = self.startup_view.is_some()
+            || self
+                .cluster
+                .as_deref()
+                .is_some_and(|cluster| self.ui_state.last_view(cluster).is_some());
+        if !pending && self.list.is_none() && self.dashboard.is_none() && !self.sets.is_open() {
             self.open_default_overview(window, cx);
         }
     }
@@ -1236,6 +1257,16 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(in crate::ui) fn save_last_view_for_test(&mut self, cluster: &str, kind: &str) {
+        let _ = self.ui_state.set_last_view(cluster, kind);
+    }
+
+    #[cfg(test)]
+    pub(in crate::ui) fn sidebar_focus_for_test(&self) -> FocusHandle {
+        self.sidebar_focus.clone()
+    }
+
+    #[cfg(test)]
     pub(in crate::ui) fn saved_namespace_filter(&self, cluster: &str) -> Vec<String> {
         self.ui_state.namespace_filter(cluster).to_vec()
     }
@@ -1271,7 +1302,10 @@ impl Workspace {
                 && !model.sessions_paused(cluster)
         });
         if ready && !self.sets.is_opening() {
-            self.show_dashboard(self.palette.is_none(), window, cx);
+            // Connecting from the sidebar leaves focus there, so its arrows keep working.
+            let take_focus =
+                self.palette.is_none() && !self.sidebar_focus.contains_focused(window, cx);
+            self.show_dashboard(take_focus, window, cx);
         }
     }
 
@@ -1323,8 +1357,8 @@ impl Workspace {
         let problems = match event {
             DashboardEvent::OpenFilteredList(category) => view.read(cx).problem_list(*category),
             DashboardEvent::OpenShortWorkloads(kind) => view.read(cx).short_workloads(kind),
-            DashboardEvent::CannotOpen(object) => {
-                self.refuse(format!("Cannot open {object} on this cluster."), cx);
+            DashboardEvent::CannotOpen(why) => {
+                self.refuse(why.clone(), cx);
                 return;
             }
         };
@@ -2872,6 +2906,13 @@ impl Workspace {
 /// A side pane's title. On macOS it is the top row, as tall as the main header, and moves the
 /// window. A pane under the traffic lights (`traffic_lights` above zero) leaves the row to them
 /// and shows no title.
+/// Whether `kind` (`plural` or `plural.group`) is in a group `discovery` could not vouch for, so
+/// its absence proves nothing.
+fn may_still_be_discovered(discovery: &flint_core::ClusterDiscovery, kind: &str) -> bool {
+    let group = kind.split_once('.').map_or("", |(_, group)| group);
+    discovery.incomplete_groups.iter().any(|g| g == group)
+}
+
 fn pane_title(title: &'static str, traffic_lights: Pixels, theme: &Theme) -> impl IntoElement {
     let row = div()
         .px_3()

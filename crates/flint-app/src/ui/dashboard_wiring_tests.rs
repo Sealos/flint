@@ -3,11 +3,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use flint_core::compare::SideRead as ObjectRead;
 use flint_core::dashboard::{ProblemCategory, ProblemCounts, ProblemSnapshot, ProblemSummariser};
 use flint_core::problems::{
     Problem, ProblemId, ProblemKind, ProblemSeverity, ProblemSubject, WORKLOAD_HOLD_DOWN,
     WorkloadKind,
 };
+use flint_core::{ClusterDiscovery, ConnectionState, Event, ObjectDetail, ServerVersion};
 use gpui_kit::test::TestAppContextExt as _;
 use gpui_kit::{Entity, TestAppContext};
 use jiff::Timestamp;
@@ -19,12 +21,16 @@ use super::dashboard::{
 };
 use super::list::{CountedObjects, ObjectFilter};
 use super::registry::{OpenObject, Scope, tests::assert_binds_scope};
-use super::support_tests::{TestWorkspace, WAIT, open_workspace, pods, standard_sections};
+use super::support_tests::{
+    CURRENT_GENERATION, TestWorkspace, WAIT, discovery, open_workspace, pods, standard_sections,
+};
 use flint_core::thresholds::ThresholdLevel;
 
 const OPEN: &str = "workspace::OpenClusterOverview";
 const OPEN_LIST: &str = "dashboard::OpenProblemList";
 const OPEN_SHORT: &str = "dashboard::OpenShortWorkloads";
+/// The button of the row `show_warning_row` draws.
+const WARNING_WEB_0: &str = "dashboard-warning-event-web-0";
 
 fn dashboard(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<Entity<DashboardView>> {
     t.workspace.read_with(cx, |ws, _| ws.dashboard_view())
@@ -581,8 +587,11 @@ fn show_warning_row(
         message: "Back-off restarting failed container".to_owned(),
         occurrences: 1,
         open: Some(open.clone()),
+        object_uid: Some("uid-web-0".to_owned()),
+        key: "event-web-0".to_owned(),
     };
     view.update(cx, |view, cx| {
+        view.set_object_read_for_test(object_with_uid("web-0", "uid-web-0"));
         let mut model = view.model().clone();
         model.warnings = WarningsPanel::Rows {
             rows: vec![row],
@@ -592,6 +601,98 @@ fn show_warning_row(
     });
     cx.run_until_parked();
     open
+}
+
+/// The API server's answer: `name` in `demo`, with `uid`.
+fn object_with_uid(name: &str, uid: &str) -> ObjectRead {
+    ObjectRead::Present(Arc::new(ObjectDetail {
+        object: json!({"metadata": {"namespace": "demo", "name": name, "uid": uid}}),
+        yaml: String::new(),
+        managed_fields: None,
+        events: Vec::new(),
+        events_truncated: false,
+        events_error: None,
+    }))
+}
+
+fn warning_on(name: &str, key: &str, server: Option<String>) -> WarningRow {
+    WarningRow {
+        age: "1m".to_owned(),
+        reason: "BackOff".to_owned(),
+        object: format!("Pod demo/{name}"),
+        message: "Back-off restarting failed container".to_owned(),
+        occurrences: 1,
+        open: Some(OpenObject {
+            kind: "Pod.v1".to_owned(),
+            namespace: Some("demo".to_owned()),
+            name: name.to_owned(),
+            cluster: Some("kind-alpha".to_owned()),
+            server,
+        }),
+        object_uid: Some(format!("uid-{name}")),
+        key: key.to_owned(),
+    }
+}
+
+fn show_warnings(cx: &mut TestAppContext, view: &Entity<DashboardView>, rows: Vec<WarningRow>) {
+    view.update(cx, |view, cx| {
+        let mut model = view.model().clone();
+        let total = rows.len();
+        model.warnings = WarningsPanel::Rows { rows, total };
+        view.set_model(model, cx);
+    });
+    cx.run_until_parked();
+}
+
+fn action_error(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<String> {
+    t.workspace
+        .read_with(cx, |ws, _| ws.action_error().map(str::to_owned))
+}
+
+fn incomplete_without_widgets() -> ClusterDiscovery {
+    let sections = standard_sections()
+        .into_iter()
+        .filter(|section| section.title != "example.com")
+        .collect();
+    let mut partial = discovery(sections);
+    partial.incomplete_groups = vec!["example.com".to_owned()];
+    partial
+}
+
+fn feed_discovery(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+    found: Option<ClusterDiscovery>,
+    error: Option<&str>,
+) {
+    t.feed(
+        cx,
+        Event::DiscoveryChanged {
+            cluster: "kind-alpha".into(),
+            generation: CURRENT_GENERATION,
+            discovery: found.map(Arc::new),
+            error: error.map(str::to_owned),
+        },
+    );
+}
+
+/// `kind-alpha` connected, with no discovery reported yet.
+async fn connect_alpha_undiscovered(cx: &mut TestAppContext, t: &TestWorkspace) {
+    t.activate(cx, "kind-alpha").await;
+    t.wait_for_state(cx, "kind-alpha", |s| {
+        matches!(s, ConnectionState::Connecting)
+    })
+    .await;
+    t.feed(
+        cx,
+        Event::ConnectionChanged {
+            cluster: "kind-alpha".into(),
+            state: ConnectionState::Connected(ServerVersion {
+                git_version: "v1.33.1".into(),
+                platform: "linux/arm64".into(),
+            }),
+        },
+    );
 }
 
 fn alpha_server(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<String> {
@@ -638,7 +739,7 @@ async fn a_warning_row_opens_its_exact_object(cx: &mut TestAppContext) {
     let view = open_held(cx, &t).await;
     let server = alpha_server(cx, &t);
     show_warning_row(cx, &view, server);
-    t.click(cx, ("dashboard-warning", 0usize));
+    t.click(cx, WARNING_WEB_0);
     cx.run_until_parked();
     assert!(dashboard(cx, &t).is_none(), "the overview gave way");
     t.feed_list(cx, pods(&[("demo", "web-0", 0), ("demo", "web-1", 0)]))
@@ -673,7 +774,7 @@ async fn a_warning_row_from_another_server_opens_nothing_and_says_so(cx: &mut Te
     let t = open_workspace(cx, dir.path()).await;
     let view = open_held(cx, &t).await;
     show_warning_row(cx, &view, Some("https://replaced.invalid".to_owned()));
-    t.click(cx, ("dashboard-warning", 0usize));
+    t.click(cx, WARNING_WEB_0);
     cx.run_until_parked();
     assert!(dashboard(cx, &t).is_some(), "the overview stays");
     assert!(t.list(cx).is_none());
@@ -697,10 +798,277 @@ async fn a_warning_row_of_a_gone_feed_opens_nothing(cx: &mut TestAppContext) {
         view.set_running_feed_for_test(Some(FeedId::for_test("kind-alpha")));
         assert!(view.refuses_link(|model| model.links_object(&link), cx));
     });
-    t.click(cx, ("dashboard-warning", 0usize));
+    t.click(cx, WARNING_WEB_0);
     cx.run_until_parked();
     assert!(dashboard(cx, &t).is_some(), "the stale row opened nothing");
     assert!(t.list(cx).is_none());
+}
+
+#[gpui_kit::test]
+async fn a_warning_for_a_replaced_object_stays_on_the_overview(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let view = open_held(cx, &t).await;
+    let server = alpha_server(cx, &t);
+    show_warning_row(cx, &view, server);
+    view.update(cx, |view, _| {
+        view.set_object_read_for_test(object_with_uid("web-0", "uid-of-the-replacement"));
+    });
+    t.click(cx, WARNING_WEB_0);
+    assert!(dashboard(cx, &t).is_some(), "the overview stays");
+    assert!(t.list(cx).is_none());
+    assert_eq!(
+        action_error(cx, &t).as_deref(),
+        Some("Pod demo/web-0 was replaced by a new object with the same name.")
+    );
+}
+
+#[gpui_kit::test]
+async fn a_warning_for_a_deleted_object_stays_on_the_overview(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let view = open_held(cx, &t).await;
+    let server = alpha_server(cx, &t);
+    show_warning_row(cx, &view, server);
+    view.update(cx, |view, _| {
+        view.set_object_read_for_test(ObjectRead::Missing);
+    });
+    t.click(cx, WARNING_WEB_0);
+    assert!(dashboard(cx, &t).is_some(), "the overview stays");
+    assert!(t.list(cx).is_none());
+    assert_eq!(
+        action_error(cx, &t).as_deref(),
+        Some("Pod demo/web-0 no longer exists.")
+    );
+}
+
+#[gpui_kit::test]
+async fn a_warning_whose_object_cannot_be_checked_stays_on_the_overview(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let view = open_held(cx, &t).await;
+    let server = alpha_server(cx, &t);
+    show_warning_row(cx, &view, server);
+    view.update(cx, |view, _| {
+        view.set_object_read_for_test(ObjectRead::Unavailable("timed out".to_owned()));
+    });
+    t.click(cx, WARNING_WEB_0);
+    assert!(dashboard(cx, &t).is_some(), "the overview stays");
+    assert!(t.list(cx).is_none());
+    assert_eq!(
+        action_error(cx, &t).as_deref(),
+        Some("Could not check Pod demo/web-0, so it was not opened.")
+    );
+}
+
+// The click lands on the last frame, which still draws a row the model has dropped.
+#[gpui_kit::test]
+async fn a_warning_gone_from_the_model_opens_nothing_from_the_last_frame(cx: &mut TestAppContext) {
+    use gpui_kit::{
+        AppContext as _, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+        PlatformInput,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let view = open_held(cx, &t).await;
+    let server = alpha_server(cx, &t);
+    show_warning_row(cx, &view, server);
+    let position = t
+        .find(cx, WARNING_WEB_0)
+        .expect("the row is drawn")
+        .bounds()
+        .center();
+    let held = view.clone();
+    // Raw events: `window.click` draws the changed model first, which is the frame not yet here.
+    cx.update_window(t.window, move |_, window, cx| {
+        held.update(cx, |view, cx| {
+            let mut model = view.model().clone();
+            model.warnings = WarningsPanel::Rows {
+                rows: Vec::new(),
+                total: 0,
+            };
+            view.set_model(model, cx);
+        });
+        let (button, modifiers) = (MouseButton::Left, Modifiers::default());
+        let events = [
+            PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: None,
+                modifiers,
+            }),
+            PlatformInput::MouseDown(MouseDownEvent {
+                button,
+                position,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
+            }),
+            PlatformInput::MouseUp(MouseUpEvent {
+                button,
+                position,
+                modifiers,
+                click_count: 1,
+            }),
+        ];
+        for event in events {
+            window.dispatch_event(event, cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(
+        dashboard(cx, &t).is_some(),
+        "the removed row opened nothing"
+    );
+    assert!(t.list(cx).is_none());
+}
+
+// A newer event lands above the focused row: Enter still opens the row that had focus.
+#[gpui_kit::test]
+async fn keyboard_focus_stays_on_its_warning_when_a_newer_one_arrives(cx: &mut TestAppContext) {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::test::TestWindowExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let view = open_held(cx, &t).await;
+    let server = alpha_server(cx, &t);
+    let older = warning_on("web-0", "event-web-0", server.clone());
+    let newer = warning_on("web-1", "event-web-1", server);
+    show_warnings(cx, &view, vec![older.clone()]);
+    view.update(cx, |view, _| {
+        view.set_object_read_for_test(object_with_uid("web-0", "uid-web-0"));
+    });
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    t.press(cx, "down");
+    show_warnings(cx, &view, vec![newer, older]);
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    t.press(cx, "enter");
+    assert!(dashboard(cx, &t).is_none(), "the overview gave way");
+    t.feed_list(cx, pods(&[("demo", "web-0", 0), ("demo", "web-1", 0)]))
+        .await;
+    assert_eq!(t.selected(cx).as_deref(), Some("web-0"));
+}
+
+#[gpui_kit::test]
+async fn a_saved_kind_missing_from_partial_discovery_is_restored_on_retry(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.workspace.update(cx, |ws, _| {
+        ws.save_last_view_for_test("kind-alpha", "widgets.example.com");
+    });
+    connect_alpha_undiscovered(cx, &t).await;
+    feed_discovery(cx, &t, Some(incomplete_without_widgets()), None);
+    assert!(dashboard(cx, &t).is_none(), "the saved kind may still come");
+    feed_discovery(cx, &t, Some(discovery(standard_sections())), None);
+    assert!(dashboard(cx, &t).is_none());
+    let list = t.list(cx).expect("the saved kind is restored");
+    let kind = list.read_with(cx, |list, _| list.kind().as_str().to_owned());
+    assert_eq!(kind, "widgets.example.com");
+}
+
+#[gpui_kit::test]
+async fn a_saved_kind_the_cluster_no_longer_serves_opens_the_overview(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.workspace.update(cx, |ws, _| {
+        ws.save_last_view_for_test("kind-alpha", "gadgets.example.com");
+    });
+    t.connect_alpha(cx, standard_sections()).await;
+    cx.run_until_parked();
+    assert!(
+        dashboard(cx, &t).is_some(),
+        "complete discovery rules it out"
+    );
+}
+
+#[gpui_kit::test]
+async fn failing_discovery_opens_the_overview_when_nothing_is_pending(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    connect_alpha_undiscovered(cx, &t).await;
+    feed_discovery(cx, &t, None, Some("discovery failed"));
+    assert!(dashboard(cx, &t).is_some(), "no kinds to pick from");
+}
+
+#[gpui_kit::test]
+async fn failing_discovery_keeps_a_saved_kind_pending(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.workspace.update(cx, |ws, _| {
+        ws.save_last_view_for_test("kind-alpha", "widgets.example.com");
+    });
+    connect_alpha_undiscovered(cx, &t).await;
+    feed_discovery(cx, &t, None, Some("discovery failed"));
+    assert!(
+        dashboard(cx, &t).is_none(),
+        "the saved kind is still wanted"
+    );
+    feed_discovery(cx, &t, Some(discovery(standard_sections())), None);
+    assert!(t.list(cx).is_some(), "restored once discovery works");
+}
+
+#[gpui_kit::test]
+async fn connecting_from_the_sidebar_keeps_its_focus(cx: &mut TestAppContext) {
+    use gpui_kit::AppContext as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let sidebar = t
+        .workspace
+        .read_with(cx, |ws, _| ws.sidebar_focus_for_test());
+    let focus = sidebar.clone();
+    cx.update_window(t.window, move |_, window, cx| window.focus(&focus, cx))
+        .unwrap();
+    t.connect_alpha(cx, standard_sections()).await;
+    cx.run_until_parked();
+    assert!(dashboard(cx, &t).is_some());
+    cx.update_window(t.window, |_, window, _| {
+        assert!(sidebar.is_focused(window), "Down still moves the sidebar");
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+async fn tab_reaches_the_overview_and_a_lost_focus_returns_to_it(cx: &mut TestAppContext) {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::Focusable as _;
+    use gpui_kit::test::TestWindowExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let view = open(cx, &t).await;
+    let overview = view.read_with(cx, |view, cx| view.focus_handle(cx));
+    let sidebar = t
+        .workspace
+        .read_with(cx, |ws, _| ws.sidebar_focus_for_test());
+    let focus = sidebar.clone();
+    cx.update_window(t.window, move |_, window, cx| {
+        window.render_frame(cx);
+        window.focus(&focus, cx);
+    })
+    .unwrap();
+    // Sidebar, navigation, then the overview.
+    t.press(cx, "tab");
+    t.press(cx, "tab");
+    let held = overview.clone();
+    cx.update_window(t.window, move |_, window, _| {
+        assert!(held.is_focused(window), "Tab reaches the overview");
+    })
+    .unwrap();
+    cx.update_window(t.window, |_, window, cx| {
+        window.blur(cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(t.window, move |_, window, _| {
+        assert!(overview.is_focused(window), "recovery returns to it");
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]
