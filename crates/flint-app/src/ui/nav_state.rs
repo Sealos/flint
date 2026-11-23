@@ -55,6 +55,11 @@ impl NavPanel {
                                     .get(&entry.id)
                                     .and_then(marker)
                                     .map(marker_name),
+                                badge: self
+                                    .set
+                                    .as_ref()
+                                    .and_then(|set| set.coverage(&entry.id))
+                                    .and_then(|coverage| coverage.badge()),
                             })
                             .collect()
                     },

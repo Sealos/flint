@@ -74,7 +74,11 @@ None of these features is built yet; each issue lists its tests and is written w
 | 70–74 | K, ui | #136 (kind; the app on kind locally) |
 | 75–77 | U, ui (fake `claude`), mcp | #137 |
 | 93 | U, review | `app/activity.rs::up_93_nothing_sent_without_action` (A + a stand-in `claude` on the `PATH`: browsing, a displayed log line and agent activity never start it, checked once the app's process group has exited). The confirm step is not built yet; extend this test with it (#137) |
-| 78–79, 82–85 | U, K, ui, e2e | #138 |
+| 78–79 | U, K, ui, e2e | depend on warm clusters (#247, after 1.0) |
+| 82 | U, ui, e2e | `app/cluster_sets.rs::up_82_combine_clusters_into_one_view` (A + two fakes: rows of both clusters with the Cluster column and colour tag, crashing pods first when sorted by Status, one section per cluster with its count, collapsing, a row of the same name read only from its own cluster, no writes). Open in #138: the Cmd-click gesture (the set actions are dispatched), two kind clusters |
+| 83 | U, ui | `app/cluster_sets.rs::up_83_save_and_reopen_a_cluster_set` (A + two fakes and a replacement: members pinned to their servers in `settings.toml`, the same clusters combined after a relaunch, a member re-pointed while open marked Changed with its rows gone and the new server never contacted). Open in #138: reopening a saved set with a re-pointed member refuses the whole set instead of leaving that member out |
+| 84 | U, e2e | `app/cluster_sets.rs::up_84_columns_and_versions_that_differ` (A + two fakes on different versions: a column only one returns is blank for the other), `up_84_a_crd_on_one_member_names_the_other` (rows of the member serving it, a note naming the other), `up_84_an_unreachable_member_does_not_block_the_others`. Open in #138: the `2/3` badge is not built, and a CRD the active cluster lacks is neither listed nor openable in the set |
+| 85 | U, ui, e2e | depends on #103 |
 | 86–87 | U, K, ui, e2e | deferred with #199 |
 | 80 | Man | [release checklist](./RELEASING.md#2-install-from-the-dmg-on-a-clean-mac-up-80) (clean Mac, Apple Silicon and Intel); the DMG is mounted and checked in CI (`scripts/smoke-macos-app.sh`) |
 | 81 | Man, CI smoke | #139 |
