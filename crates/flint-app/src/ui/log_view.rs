@@ -202,6 +202,32 @@ pub struct LogView {
 }
 
 impl LogView {
+    /// Says why Reconnect cannot run, or `None` once it can.
+    pub(super) fn set_reconnect_blocked(&mut self, why: Option<String>, cx: &mut Context<Self>) {
+        if self.reconnect_blocked != why {
+            self.reconnect_blocked = why;
+            cx.notify();
+        }
+    }
+
+    /// Reconnect Logs, in an ended or failed tab's banner. Disabled, saying why, while the
+    /// tab's cluster takes no new sessions.
+    fn reconnect_button(&self) -> Button {
+        let button = Button::new("log-reconnect")
+            .xsmall()
+            .label("Reconnect")
+            .tab_stop(false);
+        match &self.reconnect_blocked {
+            Some(why) => button.disabled(true).tooltip(why.clone()),
+            None => button
+                .tooltip(format!(
+                    "Open the logs again in a new tab beside this one ({})",
+                    registry::key_hint("secondary-r")
+                ))
+                .on_click(registry::on_click(ReconnectLogs)),
+        }
+    }
+
     /// The tab for `request`, on the server its context shows when the core takes it.
     #[cfg(test)]
     pub fn new(
@@ -1824,32 +1850,6 @@ impl DockItem for LogView {
     /// Not a deleted pod's: there is nothing to reconnect to.
     fn can_restart(&self) -> bool {
         matches!(self.snapshot.state, LogState::Ended { pod_deleted, .. } if !pod_deleted)
-    }
-
-    /// Says why Reconnect cannot run, or `None` once it can.
-    pub(super) fn set_reconnect_blocked(&mut self, why: Option<String>, cx: &mut Context<Self>) {
-        if self.reconnect_blocked != why {
-            self.reconnect_blocked = why;
-            cx.notify();
-        }
-    }
-
-    /// Reconnect Logs, in an ended or failed tab's banner. Disabled, saying why, while the
-    /// tab's cluster takes no new sessions.
-    fn reconnect_button(&self) -> Button {
-        let button = Button::new("log-reconnect")
-            .xsmall()
-            .label("Reconnect")
-            .tab_stop(false);
-        match &self.reconnect_blocked {
-            Some(why) => button.disabled(true).tooltip(why.clone()),
-            None => button
-                .tooltip(format!(
-                    "Open the logs again in a new tab beside this one ({})",
-                    registry::key_hint("secondary-r")
-                ))
-                .on_click(registry::on_click(ReconnectLogs)),
-        }
     }
 }
 

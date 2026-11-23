@@ -1299,7 +1299,7 @@ impl ClusterManager {
                     self.refresh_if_idle().await;
                 }
                 // A read still running keeps the hold: its load publishes.
-                if !self.reader.busy(&paths) {
+                if !self.reader.busy(&self.kubeconfig_paths) {
                     self.publish_holds();
                 }
             }
@@ -5044,7 +5044,7 @@ mod tests {
 
         manager.activate("dev".to_owned());
         let slot = manager.cluster("dev").unwrap();
-        assert!(matches!(slot.state, ConnectionState::Disconnected));
+        assert_eq!(slot.state, ConnectionState::AwaitingConfirmation);
         let attempt = slot.attempt;
 
         rewrite_file(&mut manager, &path, &yaml).await;
@@ -5466,7 +5466,7 @@ mod tests {
             })
             .await;
         let slot = manager.cluster("dev").unwrap();
-        assert!(matches!(slot.state, ConnectionState::Disconnected));
+        assert_eq!(slot.state, ConnectionState::AwaitingConfirmation);
 
         let next = manager.next_attempt;
         rewrite_file(&mut manager, &first, &confirmed).await;
@@ -6175,7 +6175,7 @@ mod tests {
             manager.activate("dev".to_owned());
             manager.ensure_connected("dev");
             let slot = manager.cluster("dev").unwrap();
-            assert!(matches!(slot.state, ConnectionState::Disconnected));
+            assert_eq!(slot.state, ConnectionState::AwaitingConfirmation);
             assert_eq!(manager.next_attempt, next, "no attempt started");
 
             rewrite_file(&mut manager, &first, &yaml).await;
@@ -6222,7 +6222,7 @@ mod tests {
                 let slot = manager.cluster("dev").unwrap();
                 assert!(slot.client.is_none() && slot.write_credential.is_none());
                 assert!(!slot.discovering, "no discovery on a discarded result");
-                assert!(matches!(slot.state, ConnectionState::Disconnected));
+                assert_eq!(slot.state, ConnectionState::AwaitingConfirmation);
 
                 rewrite_file(&mut manager, &first, &yaml).await;
                 let slot = manager.cluster("dev").unwrap();
@@ -6633,7 +6633,7 @@ mod tests {
             ConnectionState::Failed(cluster::SafeErrorText::fixed("offline")),
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let second = pauses().remove(0);
+            let [second, _] = pauses();
             let (mut manager, yaml, first) = pausable(dir.path(), &second).await;
             manager.cluster_mut("dev").unwrap().state = before.clone();
             rewrite_file(&mut manager, &first, UNREADABLE).await;
