@@ -782,6 +782,7 @@ pub enum Toggle {
     Sources,
     Wrap,
     ErrorsOnly,
+    Regex,
     MatchingOnly,
     /// Lines of context around each row a filter shows.
     Context(usize),
@@ -817,6 +818,8 @@ pub struct MenuFacts {
     pub has_selection: bool,
     /// Only warnings and errors are shown.
     pub errors_only: bool,
+    /// The search is read as a regular expression.
+    pub regex: bool,
     /// Only the lines matching the search are shown.
     pub matching_only: bool,
     /// Lines of context, while a filter is on.
@@ -871,8 +874,9 @@ pub fn more_menu(f: &MenuFacts) -> Vec<MenuRow> {
         f.errors_only,
         Toggle::ErrorsOnly,
     ));
-    // The search's toggle, which a narrow toolbar leaves out.
+    // The search's toggles, which a narrow toolbar leaves out.
     rows.push(MenuRow::Separator);
+    rows.push(toggle("Regex Search", f.regex, Toggle::Regex));
     rows.push(toggle(
         "Matching Lines Only",
         f.matching_only,

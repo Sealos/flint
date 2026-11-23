@@ -7,11 +7,58 @@
 //! [`LogView::row_index`].
 // module-tests: log_tests.rs
 
-use flint_core::logs::MAX_CONTEXT;
-use flint_core::{FilterSpec, LineId, LogFilter};
+use flint_core::logs::{GUARD_SCAN_BYTES, GUARD_SCAN_LINES, LogLines, MAX_CONTEXT, ScanCancel};
+use flint_core::{FilterSpec, LineId, LogFilter, SearchQuery};
 use gpui_kit::*;
 
 use super::LogView;
+
+/// Stops the scan it watches when it is replaced, told to, or dropped with the tab, so that a
+/// scan nobody wants lets go of its snapshot at the next line.
+#[derive(Debug, Default)]
+pub(super) struct ScanStop(Option<ScanCancel>);
+
+impl ScanStop {
+    /// Watches a new scan, stopping the one before it.
+    pub(super) fn watch(&mut self, scan: ScanCancel) {
+        self.stop();
+        self.0 = Some(scan);
+    }
+
+    pub(super) fn stop(&mut self) {
+        if let Some(scan) = self.0.take() {
+            scan.cancel();
+        }
+    }
+
+    /// The scan landed: nothing is left to stop.
+    pub(super) fn finished(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ScanStop {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Whether testing the newest `pending` lines with `query` is short enough for the UI thread. A
+/// regex is held to a bound on text as well as lines: its lines can be long and each costs more.
+pub(super) fn catch_up_fits_ui(query: &SearchQuery, pending: u64, lines: &LogLines) -> bool {
+    if !query.regex {
+        return pending <= super::CATCH_UP_ON_UI;
+    }
+    if pending > GUARD_SCAN_LINES as u64 {
+        return false;
+    }
+    let end = lines.end_id();
+    let mut bytes = 0;
+    lines.range(end - pending, end).all(|(_, line)| {
+        bytes += line.text.len();
+        bytes <= GUARD_SCAN_BYTES
+    })
+}
 
 impl LogView {
     /// What the filter shows now: matching lines only when that is on and there is a search.
@@ -97,7 +144,8 @@ impl LogView {
     /// line again at once.
     pub(super) fn refilter(&mut self, delay: Option<std::time::Duration>, cx: &mut Context<Self>) {
         self.filter_generation += 1;
-        // A catch-up of the old filter is moot now.
+        // A scan or catch-up of the old filter is moot now.
+        self.filter_scan.stop();
         self.catching_up = false;
         self._catch_up = Task::ready(());
         let spec = self.filter_spec();
@@ -119,6 +167,8 @@ impl LogView {
         self.filtering = true;
         let generation = self.filter_generation;
         let core = self.core.clone();
+        let filter = LogFilter::new(spec);
+        self.filter_scan.watch(filter.cancel_handle());
         self._filter = cx.spawn(async move |this, cx| {
             if let Some(delay) = delay {
                 cx.background_executor().timer(delay).await;
@@ -126,11 +176,12 @@ impl LogView {
             let Ok(lines) = this.read_with(cx, |view, _| view.snapshot.lines.clone()) else {
                 return;
             };
-            let filter = core.filter_logs(LogFilter::new(spec), lines).await;
+            let filter = core.filter_logs(filter, lines).await;
             let _ = this.update(cx, |view, cx| {
                 if view.filter_generation != generation {
                     return;
                 }
+                view.filter_scan.finished();
                 let anchor = view.scroll_anchor();
                 let rows = view.install_filter(filter);
                 view.list.reset(rows);
@@ -154,7 +205,13 @@ impl LogView {
         let Some(filter) = &self.filter else {
             return;
         };
-        if filter.pending(&self.snapshot.lines) <= super::CATCH_UP_ON_UI {
+        // Budgeted by the filter installed here, not one still on its way.
+        let pending = filter.pending(&self.snapshot.lines);
+        let fits = match &filter.spec().query {
+            Some(query) => catch_up_fits_ui(query, pending, &self.snapshot.lines),
+            None => pending <= super::CATCH_UP_ON_UI,
+        };
+        if fits {
             // What the list holds now, before the update changes it.
             let shown = self.shown_rows();
             if let Some(filter) = &mut self.filter {
@@ -171,13 +228,16 @@ impl LogView {
         let generation = self.filter_generation;
         let core = self.core.clone();
         let behind = filter.clone();
+        let scan = behind.cancel_handle();
         let lines = self.snapshot.lines.clone();
+        self.filter_scan.watch(scan);
         self._catch_up = cx.spawn(async move |this, cx| {
             let caught_up = core.filter_logs(behind, lines).await;
             let _ = this.update(cx, |view, cx| {
                 if view.filter_generation != generation {
                     return;
                 }
+                view.filter_scan.finished();
                 view.catching_up = false;
                 let shown = view.shown_rows();
                 view.install_filter(caught_up);
