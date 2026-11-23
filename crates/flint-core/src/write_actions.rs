@@ -160,6 +160,26 @@ pub(crate) struct Reviewed {
     pub(crate) managed: Option<ManagedBy>,
     /// For a drain: the pods it would evict that a GitOps controller manages.
     pub(crate) pods: Vec<ManagedPod>,
+    /// The object's `spec` as reviewed.
+    pub(crate) spec: ReviewedSpec,
+    /// Whether another `spec` than [`Self::spec`] makes this review stale.
+    pub(crate) hold_spec: bool,
+}
+
+/// A live object's `spec`. Never printed: it can hold environment values.
+#[derive(Clone, Default, PartialEq)]
+pub(crate) struct ReviewedSpec(Option<Value>);
+
+impl ReviewedSpec {
+    fn of(live: &Value) -> Self {
+        Self(live.get("spec").cloned())
+    }
+}
+
+impl std::fmt::Debug for ReviewedSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReviewedSpec(..)")
+    }
 }
 
 /// What the review of `change` to the live object `live` must remember.
@@ -176,6 +196,8 @@ pub(crate) async fn reviewed(
     Ok(Reviewed {
         managed: gitops::managed_by_live_object(live),
         pods,
+        spec: ReviewedSpec::of(live),
+        hold_spec: false,
     })
 }
 
@@ -210,8 +232,47 @@ async fn recheck(
     if uid != target.uid.as_deref()
         || gitops::managed_by_live_object(&live) != reviewed.managed
         || (paused && *change == ResourceChange::RolloutRestart)
+        || (reviewed.hold_spec && ReviewedSpec::of(&live) != reviewed.spec)
     {
         return Err(WriteError::Conflict);
+    }
+    Ok(())
+}
+
+/// The object `target` names, by the uid its review read.
+fn action_object(kind: &KindInfo, target: &WriteTarget) -> Result<ActionObject, WriteError> {
+    Ok(ActionObject {
+        resource: kind.resource.clone(),
+        namespace: target.namespace.clone().filter(|_| kind.namespaced),
+        name: target.name.clone(),
+        uid: target
+            .uid
+            .clone()
+            .ok_or_else(|| WriteError::Failed("the object has no uid".to_owned()))?,
+    })
+}
+
+/// Asks the server to validate a reviewed action without storing it, once the live object still
+/// matches its review. Only the actions with a server dry run here are accepted.
+pub(crate) async fn dry_run(
+    gate: &mut impl ActionGate,
+    kind: &KindInfo,
+    target: &WriteTarget,
+    change: &ResourceChange,
+    reviewed: &Reviewed,
+) -> Result<(), WriteError> {
+    let object = action_object(kind, target)?;
+    recheck(gate, kind, target, change, reviewed).await?;
+    match change {
+        ResourceChange::Scale { from, to } => {
+            send_scale(gate, &object, *from, *to, true).await?;
+        }
+        ResourceChange::RolloutRestart => send_restart(gate, &object, true).await?,
+        _ => {
+            return Err(WriteError::Rejected(
+                "this action has no server dry run".to_owned(),
+            ));
+        }
     }
     Ok(())
 }
@@ -224,15 +285,7 @@ pub(crate) async fn run(
     change: &ResourceChange,
     reviewed: &Reviewed,
 ) -> Result<WriteOutcome, WriteError> {
-    let object = ActionObject {
-        resource: kind.resource.clone(),
-        namespace: target.namespace.clone().filter(|_| kind.namespaced),
-        name: target.name.clone(),
-        uid: target
-            .uid
-            .clone()
-            .ok_or_else(|| WriteError::Failed("the object has no uid".to_owned()))?,
-    };
+    let object = action_object(kind, target)?;
     let done = |drain| WriteOutcome {
         resource_version: None,
         drain,
@@ -411,6 +464,17 @@ pub(crate) async fn scale(
     from: u32,
     to: u32,
 ) -> Result<(), ActionError> {
+    send_scale(gate, object, from, to, false).await
+}
+
+/// [`scale`], stored only if `dry_run` is false.
+async fn send_scale(
+    gate: &mut impl ActionGate,
+    object: &ActionObject,
+    from: u32,
+    to: u32,
+    dry_run: bool,
+) -> Result<(), ActionError> {
     let resource = &object.resource;
     if !is_scalable(resource) {
         return Err(ActionError::Unsupported(format!(
@@ -434,9 +498,10 @@ pub(crate) async fn scale(
         ])
     };
     let url = format!(
-        "{}/{}/scale?fieldManager={FIELD_MANAGER}",
+        "{}/{}/scale?fieldManager={FIELD_MANAGER}{}",
         object.api(client.clone()).resource_url(),
-        object.name
+        object.name,
+        if dry_run { "&dryRun=All" } else { "" },
     );
     let request = http::Request::patch(url)
         .header(http::header::CONTENT_TYPE, "application/json-patch+json")
@@ -470,6 +535,15 @@ pub(crate) async fn rollout_restart(
     gate: &mut impl ActionGate,
     object: &ActionObject,
 ) -> Result<(), ActionError> {
+    send_restart(gate, object, false).await
+}
+
+/// [`rollout_restart`], stored only if `dry_run` is false.
+async fn send_restart(
+    gate: &mut impl ActionGate,
+    object: &ActionObject,
+    dry_run: bool,
+) -> Result<(), ActionError> {
     let resource = &object.resource;
     if !is_restartable(resource) {
         return Err(ActionError::Unsupported(format!(
@@ -483,10 +557,14 @@ pub(crate) async fn rollout_restart(
         "metadata": { "uid": object.uid },
         "spec": { "template": { "metadata": { "annotations": { RESTARTED_AT: now } } } },
     });
+    let params = PatchParams {
+        dry_run,
+        ..patch_params()
+    };
     timed(
         object
             .api(client)
-            .patch(&object.name, &patch_params(), &Patch::Merge(&patch)),
+            .patch(&object.name, &params, &Patch::Merge(&patch)),
     )
     .await
     .map(drop)
