@@ -45,6 +45,25 @@ impl Core {
         settings: Settings,
         context: &str,
     ) -> Core {
+        Core::start_configured(dir, paths, settings, context, false).await
+    }
+
+    /// [`Core::start_on_context`], with the real watcher on the kubeconfig files.
+    pub async fn start_watching_files(
+        dir: tempfile::TempDir,
+        paths: Vec<PathBuf>,
+        context: &str,
+    ) -> Core {
+        Core::start_configured(dir, paths, Settings::default(), context, true).await
+    }
+
+    async fn start_configured(
+        dir: tempfile::TempDir,
+        paths: Vec<PathBuf>,
+        settings: Settings,
+        context: &str,
+        watch_files: bool,
+    ) -> Core {
         let settings = Settings {
             watch_mode: WatchMode::OnView,
             ..settings
@@ -55,7 +74,7 @@ impl Core {
             settings_error: None,
             kubeconfig_base: paths,
             home: None,
-            watch_files: false,
+            watch_files,
             // The fake server answers at once; real waits would only slow the tests down.
             watch_timing: WatchTiming {
                 backoff_min: Duration::from_millis(10),

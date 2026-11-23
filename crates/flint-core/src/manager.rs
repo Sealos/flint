@@ -43,6 +43,7 @@ mod running_set;
 mod selected_retry;
 mod telemetry;
 
+pub(crate) use forwards::ForwardSignals;
 pub(crate) use keep_watching::KeptGrants;
 #[cfg(test)]
 pub(crate) use keep_watching::QUIT_WAIT;
@@ -469,6 +470,8 @@ struct Changed {
     /// A missing directory of a watched file was created: watch it now (UP-02: `~/.kube`
     /// created after launch).
     rearm: bool,
+    /// A kubeconfig file's content or location may have changed, not just its metadata.
+    kubeconfig_rewritten: bool,
 }
 
 pub(crate) struct ClusterManager {
@@ -947,6 +950,7 @@ impl ClusterManager {
             Request::CheckForward { id, reply } => {
                 let _ = reply.send(self.check_forward(id));
             }
+            Request::ForwardUnauthorized { id } => self.forward_unauthorized(id),
             Request::CheckContext {
                 cluster,
                 pin,
@@ -1827,6 +1831,9 @@ impl ClusterManager {
                 }
             }
             Internal::FilesChanged(changed) => {
+                if changed.kubeconfig_rewritten {
+                    self.invalidate_forwards();
+                }
                 if changed.rearm || changed.kubeconfig || changed.settings {
                     // A symlink may have moved. Anything written before the new watches start
                     // is caught by the read the watcher asks for once they have.
@@ -1841,6 +1848,7 @@ impl ClusterManager {
                     settings: true,
                     activity: true,
                     rearm: false,
+                    kubeconfig_rewritten: false,
                 })
                 .await;
             }

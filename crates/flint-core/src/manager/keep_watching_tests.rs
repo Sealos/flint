@@ -71,6 +71,7 @@ async fn a_detected_edit_ends_a_running_plugin_without_calling_it_a_failure() {
             settings: false,
             activity: false,
             rearm: false,
+            kubeconfig_rewritten: true,
         }))
         .await;
 

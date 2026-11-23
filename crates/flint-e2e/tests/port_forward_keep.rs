@@ -358,3 +358,189 @@ async fn a_kept_plugin_forward_launches_nothing_and_stops_on_revoke() {
     // The kept feed may have started before the revoke; this forward itself ran nothing more.
     assert!(plugin_runs(&f.core) <= runs + 1);
 }
+
+/// Holds the settings file's save lock until dropped, with a save waiting for it, so the
+/// manager's queue is stuck.
+async fn stall_the_manager(f: &Fixture) -> std::fs::File {
+    use std::os::fd::AsRawFd as _;
+    let config_dir = f.core.dir.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let lock = std::fs::File::create(config_dir.join("settings.toml.lock")).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let definition = f.core.handle.keep_watching().await["a"].definition;
+    f.core.handle.send(Command::SetKeepWatching {
+        cluster: "a".to_owned(),
+        definition,
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    lock
+}
+
+/// A kept forward with an open connection, on a manager stuck behind a save.
+async fn kept_forward_on_a_stuck_manager(f: &Fixture) -> (PortForward, TcpStream, std::fs::File) {
+    keep_a(&f.core.handle).await;
+    let forward = f.core.handle.port_forward(request());
+    let stream = echoes(listening(&forward).await).await;
+    let lock = stall_the_manager(f).await;
+    (forward, stream, lock)
+}
+
+async fn ended_at_once(forward: &PortForward, stream: &mut TcpStream) {
+    tokio::time::timeout(Duration::from_secs(1), ended(forward, stream))
+        .await
+        .expect("it should not wait for the manager");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keep_watching_off_ends_a_forward_without_waiting_for_a_save() {
+    let f = fixture().await;
+    let (forward, mut stream, _lock) = kept_forward_on_a_stuck_manager(&f).await;
+    f.core.handle.send(Command::SetKeepWatching {
+        cluster: "a".to_owned(),
+        definition: None,
+    });
+    ended_at_once(&forward, &mut stream).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoking_consent_ends_a_forward_without_waiting_for_a_save() {
+    let f = fixture().await;
+    let (forward, mut stream, _lock) = kept_forward_on_a_stuck_manager(&f).await;
+    f.core
+        .handle
+        .send(Command::RevokeBackgroundSignIn("a".to_owned()));
+    ended_at_once(&forward, &mut stream).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quitting_ends_a_forward_without_waiting_for_a_save() {
+    let f = fixture().await;
+    let (forward, mut stream, _lock) = kept_forward_on_a_stuck_manager(&f).await;
+    let _quit = f.core.handle.stop_keep_watching();
+    ended_at_once(&forward, &mut stream).await;
+}
+
+// A re-point while the pod is being looked up, before any reload has seen it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_re_point_during_lookup_sends_no_upgrade() {
+    let f = fixture().await;
+    let forward = f.core.handle.port_forward(request());
+    let port = listening(&forward).await;
+    let (fault, hold) = Fault::hold();
+    f.a.inject(fault.on(&Gvr::core("pods")).named(WEB).times(1));
+    let _stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    hold.reached().await;
+
+    let elsewhere = FakeApiServer::start().await.unwrap();
+    std::fs::write(&f.file, config(&elsewhere, &f.b, None)).unwrap();
+    hold.release();
+
+    until(&forward, |s| s.state.is_finished()).await;
+    assert!(f.a.forward_requests().is_empty());
+    assert!(elsewhere.forward_requests().is_empty());
+}
+
+// Both edits land inside one watcher debounce, so the read after it finds the same definition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_to_b_to_a_within_one_debounce_stops_the_forward() {
+    let a = FakeApiServer::start().await.unwrap();
+    let b = FakeApiServer::start().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("kubeconfig");
+    std::fs::write(&file, config(&a, &b, None)).unwrap();
+    let core = Core::start_watching_files(dir, vec![file.clone()], "a").await;
+    core.handle.unlock("a", &a.url());
+    // The watches start on their own thread, and report what predates them.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let forward = core.handle.port_forward(request());
+    let mut stream = echoes(listening(&forward).await).await;
+
+    let elsewhere = FakeApiServer::start().await.unwrap();
+    std::fs::write(&file, config(&elsewhere, &b, None)).unwrap();
+    std::fs::write(&file, config(&a, &b, None)).unwrap();
+
+    ended(&forward, &mut stream).await;
+    assert!(elsewhere.forward_requests().is_empty());
+}
+
+// A refused sign-in on one connection says the credential is no good for any of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upgrade_answered_401_ends_every_forward_on_the_connection() {
+    let f = fixture().await;
+    let first = f.core.handle.port_forward(request());
+    let mut first_stream = echoes(listening(&first).await).await;
+    let second = f.core.handle.port_forward(request());
+    let second_port = listening(&second).await;
+    let mut second_stream = echoes(second_port).await;
+
+    f.a.inject(Fault::status(401).subresource("portforward"));
+    let _refused = TcpStream::connect((Ipv4Addr::LOCALHOST, second_port))
+        .await
+        .unwrap();
+
+    ended(&second, &mut second_stream).await;
+    ended(&first, &mut first_stream).await;
+    assert!(matches!(first.snapshot().state, ForwardState::Failed(_)));
+}
+
+// The slice moves off the pod during the upgrade, and the pod itself lives on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backend_withdrawn_during_the_upgrade_carries_nothing() {
+    let f = fixture().await;
+    let forward = f.core.handle.port_forward(ForwardRequest {
+        target: ForwardTarget::Service("web".into()),
+        remote_port: 80,
+        ..request()
+    });
+    let port = listening(&forward).await;
+    let (fault, hold) = Fault::hold();
+    f.a.inject(fault.subresource("portforward").times(1));
+    let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    hold.reached().await;
+
+    let slices = Gvr::new("discovery.k8s.io", "v1", "endpointslices");
+    let mut slice = f.a.object(&slices, Some("demo"), "web-8wjpf").unwrap();
+    slice["endpoints"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|e| e["targetRef"]["name"] != WEB);
+    f.a.set_object(&slices, slice);
+    hold.release();
+
+    let mut buf = [0; 4];
+    let read = tokio::time::timeout(WAIT, stream.read(&mut buf))
+        .await
+        .expect("the connection ended");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+}
+
+// Closed before the forward is admitted: the member's old binding admits nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_sets_member_admits_no_forward() {
+    let f = fixture().await;
+    let pins = vec![
+        ClusterPin::new("a", f.a.url()),
+        ClusterPin::new("b", f.b.url()),
+    ];
+    let admitted = f.core.handle.admit_running_set(pins).await.unwrap();
+    let member = admitted
+        .iter()
+        .find(|m| m.context() == "a")
+        .unwrap()
+        .clone();
+    switch_to(&f.core.handle, "b").await;
+    f.core.handle.admit_running_set(Vec::new()).await.unwrap();
+
+    let forward = f.core.handle.bound_to(member).port_forward(request());
+    let shown = until(&forward, |s| s.state != ForwardState::Starting).await;
+    assert!(matches!(shown.state, ForwardState::Failed(_)), "{shown:?}");
+    assert_eq!(shown.local_port, None);
+}

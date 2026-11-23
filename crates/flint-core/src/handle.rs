@@ -430,6 +430,10 @@ pub(crate) enum Request {
         id: u64,
         reply: oneshot::Sender<Result<(), crate::port_forward::ForwardFailure>>,
     },
+    /// The server refused forward `id`'s sign-in: ends every forward on its connection.
+    ForwardUnauthorized {
+        id: u64,
+    },
     /// Why a session opened on `cluster` at `pin` must end (the context was re-pointed or
     /// removed since), or `None`. Never contacts the server.
     CheckContext {
@@ -645,6 +649,7 @@ pub struct CoreHandle {
     log_budget: Arc<crate::logs::LogBudget>,
     telemetry: crate::telemetry::TelemetryBoard,
     kept: crate::manager::KeptGrants,
+    forwards: crate::manager::ForwardSignals,
     access: Arc<crate::access::AccessCache>,
     /// Set by [`Self::bound_to`]: one-off reads go only to this member.
     bound: Option<Arc<AdmittedMember>>,
@@ -675,6 +680,7 @@ impl CoreHandle {
         let telemetry = manager.telemetry_board();
         let holds = manager.definition_holds();
         let kept = manager.kept_grants();
+        let forwards = manager.forward_signals();
         runtime.spawn(manager.run(cmd_rx, req_rx));
         Ok(Self {
             commands: cmd_tx,
@@ -687,6 +693,7 @@ impl CoreHandle {
             log_budget,
             telemetry,
             kept,
+            forwards,
             access: Arc::default(),
             bound: None,
             runtime: runtime.handle().clone(),
@@ -739,6 +746,7 @@ impl CoreHandle {
     /// the manager's queue. Resolves once their plugins are killed, after a short bounded wait
     /// at most, or at once if the core stopped.
     pub fn stop_keep_watching(&self) -> impl Future<Output = ()> + Send + use<> {
+        self.forwards.quit();
         let wait = self.runtime.spawn(self.kept.quit());
         async move {
             let _ = wait.await;
@@ -1486,6 +1494,7 @@ impl CoreHandle {
         } = &command
         {
             self.kept.revoke(cluster);
+            self.forwards.end_cluster(cluster);
         }
         if self.commands.try_send(command).is_err() {
             tracing::warn!("core is not running; command dropped");

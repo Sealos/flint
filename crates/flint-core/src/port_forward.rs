@@ -23,7 +23,7 @@ use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use k8s_openapi::api::core::v1::{Pod, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
-use kube::api::{Api, ListParams};
+use kube::api::ListParams;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
@@ -37,6 +37,10 @@ use crate::protection::{GatedClient, WriteRefusal};
 use crate::recheck::ContextPin;
 use crate::write::WriteError;
 
+mod wire;
+
+use wire::{AbortOnDrop, WireError};
+
 /// How often a running forward asks the gate. An in-memory check.
 const GATE_EVERY: Duration = Duration::from_secs(2);
 /// How often a running forward checks that its target is still there.
@@ -45,8 +49,8 @@ const HEALTH_EVERY: Duration = Duration::from_secs(15);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// The most connections one forward carries at once; further ones wait in the accept queue.
 pub const MAX_CONNECTIONS: usize = 64;
-/// The most connections all forwards carry at once. Each can buffer about 2 MiB, so this bounds
-/// their memory to about 256 MiB. Further ones wait in their listener's accept queue.
+/// The most connections all forwards carry at once, which with [`wire`]'s limits bounds what
+/// they can queue. Further ones wait in their listener's accept queue.
 const MAX_RELAYS: usize = 128;
 /// How many of a Service's pods one connection tries before it gives up.
 const MAX_BACKENDS_TRIED: usize = 8;
@@ -154,6 +158,8 @@ pub enum ForwardFailureKind {
     Bind,
     /// The write gate refused: protected, re-pointed, paused, removed or not connected.
     Refused,
+    /// The server no longer accepts the connection's sign-in.
+    Unauthorized,
     /// RBAC refused the forward.
     Forbidden,
     /// The pod is gone or has finished.
@@ -322,15 +328,6 @@ pub(crate) struct Upstream {
     pod: String,
     /// Held for the connection's life; dropping it closes the WebSocket.
     _connection: Option<AbortOnDrop>,
-}
-
-/// kube's forwarder leaves its task running when dropped: this ends it.
-struct AbortOnDrop(kube::api::Portforwarder);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
 }
 
 /// Why a connection could not be opened.
@@ -653,18 +650,76 @@ impl Access {
         }
     }
 
-    /// The gate, for the moment an upgrade is sent.
-    fn send_check(&self) -> SendCheck {
+    /// Whether the files as they are now still give the definition the forward started on.
+    async fn check_definition(&self) -> Result<(), ForwardFailure> {
+        let (reply, rx) = oneshot::channel();
+        let sent = self
+            .requests
+            .send(Request::CheckWritePin {
+                cluster: self.cluster.clone(),
+                pin: self.pin.clone(),
+                reply,
+            })
+            .await;
+        if sent.is_err() {
+            return Err(gate_failure(&WriteRefusal::Stopped.into()));
+        }
+        rx.await
+            .unwrap_or(Err(WriteRefusal::Stopped.into()))
+            .map_err(|e| gate_failure(&e))
+    }
+
+    /// The gate, for the moment an upgrade is sent: the files, then the manager's state. A
+    /// refusal is left in `refused`, since the client's error can't carry it.
+    fn send_check(&self, refused: Arc<Mutex<Option<ForwardFailure>>>) -> SendCheck {
         let access = self.clone();
         SendCheck::new(move || {
-            let access = access.clone();
-            async move { access.check().await.map_err(|f| f.to_string()) }.boxed()
+            let (access, refused) = (access.clone(), Arc::clone(&refused));
+            async move {
+                let checked = match access.check_definition().await {
+                    Ok(()) => access.check().await,
+                    Err(failure) => Err(failure),
+                };
+                checked.map_err(|failure| {
+                    let text = failure.to_string();
+                    *refused.lock().unwrap_or_else(|e| e.into_inner()) = Some(failure);
+                    text
+                })
+            }
+            .boxed()
         })
+    }
+
+    /// `result`, after ending every forward on this connection if its sign-in was refused.
+    async fn after<T>(&self, result: Result<T, DialError>) -> Result<T, DialError> {
+        if let Err(DialError::Fatal(failure)) = &result
+            && failure.kind == ForwardFailureKind::Unauthorized
+        {
+            let _ = self
+                .requests
+                .send(Request::ForwardUnauthorized { id: self.id })
+                .await;
+        }
+        result
     }
 }
 
-fn is_status(error: &kube::Error, code: u16) -> bool {
-    matches!(error, kube::Error::Api(status) if status.code == code)
+/// The failure that ends every forward on a connection whose sign-in was refused.
+pub(crate) fn unauthorized() -> ForwardFailure {
+    ForwardFailure::new(
+        ForwardFailureKind::Unauthorized,
+        "the cluster no longer accepts this sign-in; sign in and start the forward again",
+    )
+}
+
+/// A failed lookup for `target`, in Flint's words. `what` is what RBAC would have refused.
+fn lookup_failure(error: WireError, target: &ForwardTarget, what: &str) -> DialError {
+    match error {
+        WireError::Status(401) => DialError::Fatal(unauthorized()),
+        WireError::Status(403) => forbidden(what),
+        WireError::Status(404) => gone(target),
+        _ => DialError::Dropped(format!("Flint could not reach {target}")),
+    }
 }
 
 fn forbidden(what: &str) -> DialError {
@@ -717,18 +772,11 @@ async fn resolve(
     remote: u16,
     pinned: &Mutex<Option<String>>,
 ) -> Result<Backend, DialError> {
-    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
     match target {
         ForwardTarget::Pod(name) => {
-            let pod = pods.get(name).await.map_err(|e| {
-                if is_status(&e, 404) {
-                    gone(target)
-                } else if is_status(&e, 403) {
-                    forbidden("reading this pod")
-                } else {
-                    DialError::Dropped(format!("Flint could not reach {target}"))
-                }
-            })?;
+            let pod: Pod = wire::get(client, namespace, name)
+                .await
+                .map_err(|e| lookup_failure(e, target, "reading this pod"))?;
             let uid = uid_of(&pod)
                 .ok_or_else(|| DialError::Dropped(format!("Flint could not confirm {target}")))?
                 .to_owned();
@@ -751,39 +799,17 @@ async fn resolve(
             })
         }
         ForwardTarget::Service(name) => {
-            let unreachable = |e: kube::Error| {
-                if is_status(&e, 404) {
-                    gone(target)
-                } else if is_status(&e, 403) {
-                    forbidden("reading this service and its endpoints")
-                } else {
-                    DialError::Dropped(format!("Flint could not reach {target}"))
-                }
-            };
-            let services: Api<Service> = Api::namespaced(client.clone(), namespace);
-            let service = services.get(name).await.map_err(unreachable)?;
-            let slices: Api<EndpointSlice> = Api::namespaced(client.clone(), namespace);
-            let params =
-                ListParams::default().labels(&format!("kubernetes.io/service-name={name}"));
-            let slices = slices.list(&params).await.map_err(unreachable)?;
-            for backend in pick_backends(&service, &slices.items, remote)
+            for backend in service_backends(client, namespace, target, name, remote)
+                .await?
                 .into_iter()
                 .take(MAX_BACKENDS_TRIED)
             {
-                match pods.get(&backend.pod).await {
+                match wire::get::<Pod>(client, namespace, &backend.pod).await {
                     Ok(pod) if uid_of(&pod) == Some(&backend.uid) && !has_finished(&pod) => {
                         return Ok(backend);
                     }
-                    Ok(_) => {}
-                    Err(e) if is_status(&e, 404) => {}
-                    Err(e) if is_status(&e, 403) => {
-                        return Err(forbidden("reading this service's pods"));
-                    }
-                    Err(_) => {
-                        return Err(DialError::Dropped(format!(
-                            "Flint could not reach {target}"
-                        )));
-                    }
+                    Ok(_) | Err(WireError::Status(404)) => {}
+                    Err(e) => return Err(lookup_failure(e, target, "reading this service's pods")),
                 }
             }
             Err(DialError::Dropped(format!(
@@ -793,23 +819,53 @@ async fn resolve(
     }
 }
 
-/// Whether `backend` is still the pod there, read after its channel opened.
+/// The ready pods behind Service `name`'s port `remote`, as the server has them now.
+async fn service_backends(
+    client: &kube::Client,
+    namespace: &str,
+    target: &ForwardTarget,
+    name: &str,
+    remote: u16,
+) -> Result<Vec<Backend>, DialError> {
+    let unreachable = |e| lookup_failure(e, target, "reading this service and its endpoints");
+    let service: Service = wire::get(client, namespace, name)
+        .await
+        .map_err(unreachable)?;
+    let params = ListParams::default().labels(&format!("kubernetes.io/service-name={name}"));
+    let slices: Vec<EndpointSlice> = wire::list(client, namespace, &params)
+        .await
+        .map_err(unreachable)?;
+    Ok(pick_backends(&service, &slices, remote))
+}
+
+/// Whether `backend` is still the pod there and, for a Service, still its ready endpoint at that
+/// port, read after its channel opened.
 async fn confirm(
     client: &kube::Client,
     namespace: &str,
     target: &ForwardTarget,
+    remote: u16,
     backend: &Backend,
 ) -> Result<(), DialError> {
-    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
-    match pods.get(&backend.pod).await {
-        Ok(pod) if uid_of(&pod) == Some(&backend.uid) && !has_finished(&pod) => Ok(()),
-        Ok(_) => Err(replaced(target)),
-        Err(e) if is_status(&e, 404) => Err(replaced(target)),
-        Err(e) if is_status(&e, 403) => Err(forbidden("reading this pod")),
-        Err(_) => Err(DialError::Dropped(format!(
-            "Flint could not confirm {target}"
-        ))),
+    match wire::get::<Pod>(client, namespace, &backend.pod).await {
+        Ok(pod) if uid_of(&pod) == Some(&backend.uid) && !has_finished(&pod) => {}
+        Ok(_) | Err(WireError::Status(404)) => return Err(replaced(target)),
+        Err(WireError::Status(401)) => return Err(DialError::Fatal(unauthorized())),
+        Err(WireError::Status(403)) => return Err(forbidden("reading this pod")),
+        Err(_) => {
+            return Err(DialError::Dropped(format!(
+                "Flint could not confirm {target}"
+            )));
+        }
     }
+    if let ForwardTarget::Service(name) = target
+        && !service_backends(client, namespace, target, name, remote)
+            .await?
+            .contains(backend)
+    {
+        return Err(replaced(target));
+    }
+    Ok(())
 }
 
 /// The ready pods behind `service`'s `port`, by name, each with its uid and the port it listens
@@ -883,17 +939,21 @@ impl Dialer for KubeDialer {
         let request = self.request.clone();
         let uid = Arc::clone(&self.uid);
         async move {
-            access.check().await.map_err(DialError::Fatal)?;
-            let client = access.signed_in().await?;
-            let backend = resolve(
-                &client,
-                &request.namespace,
-                &request.target,
-                request.remote_port,
-                &uid,
-            )
-            .await?;
-            Ok(backend.pod)
+            let probed = async {
+                access.check().await.map_err(DialError::Fatal)?;
+                let client = access.signed_in().await?;
+                let backend = resolve(
+                    &client,
+                    &request.namespace,
+                    &request.target,
+                    request.remote_port,
+                    &uid,
+                )
+                .await?;
+                Ok(backend.pod)
+            }
+            .await;
+            access.after(probed).await
         }
         .boxed()
     }
@@ -903,56 +963,69 @@ impl Dialer for KubeDialer {
         let request = self.request.clone();
         let uid = Arc::clone(&self.uid);
         async move {
-            access.check().await.map_err(DialError::Fatal)?;
-            let client = access.signed_in().await?;
-            let backend = resolve(
-                &client,
-                &request.namespace,
-                &request.target,
-                request.remote_port,
-                &uid,
-            )
-            .await?;
-            let port = backend.port;
-            let pods: Api<Pod> = Api::namespaced(
-                upgrade_client(client.clone(), access.send_check()),
-                &request.namespace,
-            );
-            let opened = pods.portforward(&backend.pod, &[port]).await;
-            let forwarder = match opened {
-                Ok(forwarder) => forwarder,
-                Err(e) => {
-                    // Refused by the gate at send time, or it closed meanwhile.
-                    access.check().await.map_err(DialError::Fatal)?;
-                    return Err(if is_status(&e, 403) {
-                        forbidden("port-forwarding to this pod")
-                    } else if is_status(&e, 404) && matches!(request.target, ForwardTarget::Pod(_))
-                    {
-                        gone(&request.target)
-                    } else {
-                        DialError::Dropped(format!(
-                            "Flint could not open a connection to {}",
-                            backend.pod
-                        ))
-                    });
-                }
-            };
-            let mut connection = AbortOnDrop(forwarder);
-            let missing = || DialError::Dropped(dropped_text(port));
-            let stream = connection.0.take_stream(port).ok_or_else(missing)?;
-            let errors = connection.0.take_error(port).ok_or_else(missing)?;
-            // Nothing is carried until the channel is known to be on the pod chosen.
-            confirm(&client, &request.namespace, &request.target, &backend).await?;
-            access.check().await.map_err(DialError::Fatal)?;
-            Ok(Upstream {
-                stream: Box::pin(stream),
-                failed: errors.map(|message| message.is_some()).boxed(),
-                pod: backend.pod,
-                _connection: Some(connection),
-            })
+            let dialed = dial_once(&access, &request, &uid).await;
+            access.after(dialed).await
         }
         .boxed()
     }
+}
+
+/// Opens one connection to the target, carrying nothing until it is confirmed.
+async fn dial_once(
+    access: &Access,
+    request: &ForwardRequest,
+    uid: &Mutex<Option<String>>,
+) -> Result<Upstream, DialError> {
+    access.check().await.map_err(DialError::Fatal)?;
+    let client = access.signed_in().await?;
+    let backend = resolve(
+        &client,
+        &request.namespace,
+        &request.target,
+        request.remote_port,
+        uid,
+    )
+    .await?;
+    let refused = Arc::new(Mutex::new(None));
+    let upgrade = upgrade_client(client.clone(), access.send_check(Arc::clone(&refused)));
+    let opened = wire::open(&upgrade, &request.namespace, &backend.pod, backend.port).await;
+    let tunnel = match opened {
+        Ok(tunnel) => tunnel,
+        Err(error) => {
+            // Refused by the gate at send time, or it closed meanwhile.
+            if let Some(failure) = refused.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                return Err(DialError::Fatal(failure));
+            }
+            access.check().await.map_err(DialError::Fatal)?;
+            return Err(match error {
+                WireError::Status(401) => DialError::Fatal(unauthorized()),
+                WireError::Status(403) => forbidden("port-forwarding to this pod"),
+                WireError::Status(404) if matches!(request.target, ForwardTarget::Pod(_)) => {
+                    gone(&request.target)
+                }
+                _ => DialError::Dropped(format!(
+                    "Flint could not open a connection to {}",
+                    backend.pod
+                )),
+            });
+        }
+    };
+    // Nothing is carried until the channel is known to be on the pod chosen.
+    confirm(
+        &client,
+        &request.namespace,
+        &request.target,
+        request.remote_port,
+        &backend,
+    )
+    .await?;
+    access.check().await.map_err(DialError::Fatal)?;
+    Ok(Upstream {
+        stream: Box::pin(tunnel.stream),
+        failed: tunnel.failed.map(|reported| reported.is_ok()).boxed(),
+        pod: backend.pod,
+        _connection: Some(tunnel.task),
+    })
 }
 
 impl KubeDialer {

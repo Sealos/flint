@@ -476,12 +476,19 @@ async fn a_pod_rows_menu_opens_logs_previous_logs_and_a_shell(cx: &mut TestAppCo
     });
     assert_eq!(selected.as_deref(), Some("web"), "a right-click selects");
     press(cx, &t, "escape");
-    // The pod is still loading (on a slow server): the entries wait for it.
+    // The pod is still loading (on a slow server): the entries wait for it, but a forward needs
+    // its uid first.
     show_loading(cx, &t);
     right_click(cx, &t, "web").await;
     assert_eq!(
         menu(cx, &t),
-        ["Logs", "Previous Logs", "Shell", "Forward Port"]
+        [
+            "Logs",
+            "Previous Logs",
+            "Shell",
+            "Forward Port",
+            "web is still loading"
+        ]
     );
     click_entry(cx, &t, 0);
     assert_eq!(
@@ -609,7 +616,7 @@ async fn keys_act_on_the_selected_pod_row(cx: &mut TestAppContext) {
     let api = || {
         detail(json!({
             "kind": "Pod",
-            "metadata": {"name": "api", "namespace": "demo"},
+            "metadata": {"name": "api", "namespace": "demo", "uid": "uid-api"},
             "spec": {"containers": [{"name": "app"}]},
             "status": {"containerStatuses": [{"name": "app", "restartCount": 0}]}
         }))

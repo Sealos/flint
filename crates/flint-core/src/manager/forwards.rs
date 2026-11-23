@@ -7,7 +7,7 @@
 // module-tests: ../../../flint-e2e/tests/port_forward_keep.rs
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::watch;
 
@@ -15,7 +15,7 @@ use super::ClusterManager;
 use crate::ClusterId;
 use crate::credential::CredentialId;
 use crate::handle::AdmittedMember;
-use crate::port_forward::{ForwardFailure, ForwardGrant, ForwardState, gate_failure};
+use crate::port_forward::{ForwardFailure, ForwardGrant, ForwardState, gate_failure, unauthorized};
 use crate::protection::WriteRefusal;
 use crate::recheck::ContextPin;
 use crate::write::WriteError;
@@ -31,16 +31,72 @@ struct LiveForward {
     ended: watch::Sender<Option<ForwardState>>,
 }
 
+/// How to end running forwards without the manager's queue, which a contended settings save can
+/// hold up. Shared with [`crate::CoreHandle`].
+#[derive(Clone, Default)]
+pub(crate) struct ForwardSignals(Arc<Mutex<Signals>>);
+
+#[derive(Default)]
+struct Signals {
+    quitting: bool,
+    live: HashMap<u64, (ClusterId, watch::Sender<Option<ForwardState>>)>,
+}
+
+impl ForwardSignals {
+    fn lock(&self) -> MutexGuard<'_, Signals> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Ends every forward on `cluster`, now.
+    pub(crate) fn end_cluster(&self, cluster: &str) {
+        for (on, ended) in self.lock().live.values() {
+            if on == cluster {
+                ended.send_replace(Some(ForwardState::Stopped));
+            }
+        }
+    }
+
+    /// Ends every forward, now, and admits no more.
+    pub(crate) fn quit(&self) {
+        let mut signals = self.lock();
+        signals.quitting = true;
+        for (_, ended) in signals.live.values() {
+            ended.send_replace(Some(ForwardState::Stopped));
+        }
+    }
+
+    /// Records a forward; `false` once quitting.
+    fn add(&self, id: u64, cluster: &str, ended: &watch::Sender<Option<ForwardState>>) -> bool {
+        let mut signals = self.lock();
+        if signals.quitting {
+            return false;
+        }
+        signals.live.insert(id, (cluster.to_owned(), ended.clone()));
+        true
+    }
+
+    fn remove(&self, id: u64) {
+        self.lock().live.remove(&id);
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Forwards {
     next: u64,
     /// The active cluster when last looked at.
     active: Option<ClusterId>,
     live: HashMap<u64, LiveForward>,
+    signals: ForwardSignals,
 }
 
 impl ClusterManager {
-    /// Admits a forward on `cluster`'s current connection, in one step with the gate.
+    /// How to end forwards without going through the queue.
+    pub(crate) fn forward_signals(&self) -> ForwardSignals {
+        self.forwards.signals.clone()
+    }
+
+    /// Admits a forward on `cluster`'s current connection, in one step with the gate. One bound
+    /// to a set's member needs that member to still be in the set.
     pub(super) fn admit_forward(
         &mut self,
         cluster: ClusterId,
@@ -48,7 +104,9 @@ impl ClusterManager {
         admitted: Option<&Arc<AdmittedMember>>,
     ) -> Result<ForwardGrant, WriteError> {
         let (_, pin, credential) = self.bound_write_client(&cluster, server)?;
-        if admitted.is_some_and(|member| !member.holds(&cluster, &pin)) {
+        if admitted.is_some_and(|member| {
+            !member.holds(&cluster, &pin) || !self.members.contains_key(&cluster)
+        }) {
             return Err(WriteRefusal::Stale { cluster }.into());
         }
         self.forward_gate(&cluster, &pin)?;
@@ -56,6 +114,9 @@ impl ClusterManager {
         let id = self.forwards.next;
         let connection = credential.id();
         let (ended, ended_rx) = watch::channel(None);
+        if !self.forwards.signals.add(id, &cluster, &ended) {
+            return Err(WriteRefusal::Stopped.into());
+        }
         let kept = self.keep_watching(&cluster);
         let in_set = self.members.contains_key(&cluster);
         self.forwards.live.insert(
@@ -107,6 +168,40 @@ impl ClusterManager {
             && self.active.as_deref() != Some(live.cluster.as_str())
     }
 
+    fn end_forward(&mut self, id: u64, end: ForwardState) {
+        self.forwards.signals.remove(id);
+        if let Some(live) = self.forwards.live.remove(&id) {
+            live.ended.send_replace(Some(end));
+        }
+    }
+
+    /// A kubeconfig file was rewritten. Edits can cancel out between two reads, so what the
+    /// files show now says nothing of what they defined meanwhile: every forward ends.
+    pub(super) fn invalidate_forwards(&mut self) {
+        let ids: Vec<u64> = self.forwards.live.keys().copied().collect();
+        for id in ids {
+            let failure = gate_failure(&WriteError::ConnectionChanged);
+            self.end_forward(id, ForwardState::Failed(failure));
+        }
+    }
+
+    /// The server refused forward `id`'s sign-in: every forward on its connection ends.
+    pub(super) fn forward_unauthorized(&mut self, id: u64) {
+        let Some(connection) = self.forwards.live.get(&id).map(|l| l.connection.clone()) else {
+            return;
+        };
+        let ids: Vec<u64> = self
+            .forwards
+            .live
+            .iter()
+            .filter(|(_, live)| live.connection.is(&connection))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.end_forward(id, ForwardState::Failed(unauthorized()));
+        }
+    }
+
     /// Ends the forwards that may not go on, and forgets those that are over.
     pub(super) fn sync_forwards(&mut self) {
         let switched = self.forwards.active != self.active;
@@ -138,6 +233,7 @@ impl ClusterManager {
             }
         }
         for (id, end) in over {
+            self.forwards.signals.remove(id);
             if let (Some(live), Some(end)) = (self.forwards.live.remove(&id), end) {
                 live.ended.send_replace(Some(end));
             }
