@@ -8,6 +8,7 @@ use flint_core::problems::{
     Problem, ProblemId, ProblemKind, ProblemSeverity, ProblemSubject, WORKLOAD_HOLD_DOWN,
     WorkloadKind,
 };
+use gpui_kit::test::TestAppContextExt as _;
 use gpui_kit::{Entity, TestAppContext};
 use jiff::Timestamp;
 use serde_json::{Value, json};
@@ -18,7 +19,7 @@ use super::dashboard::{
 };
 use super::list::{CountedObjects, ObjectFilter};
 use super::registry::{OpenObject, Scope, tests::assert_binds_scope};
-use super::support_tests::{TestWorkspace, open_workspace, pods, standard_sections};
+use super::support_tests::{TestWorkspace, WAIT, open_workspace, pods, standard_sections};
 use flint_core::thresholds::ThresholdLevel;
 
 const OPEN: &str = "workspace::OpenClusterOverview";
@@ -384,8 +385,12 @@ async fn a_problem_tile_opens_its_objects_and_the_kind_shows_all_again(cx: &mut 
     assert_eq!(t.row_count(cx), 1);
     t.dispatch(cx, "workspace::OpenView", json!({"kind": "pods"}))
         .unwrap();
-    cx.run_until_parked();
     assert!(list.read_with(cx, |list, _| list.only().is_none()));
+    // The rows are computed on a core thread, which `run_until_parked` does not wait for.
+    let widened = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| widened.read(cx).shown().1 != 1)
+        .await;
+    cx.run_until_parked();
     assert_eq!(t.row_count(cx), 2);
 }
 

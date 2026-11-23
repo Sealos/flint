@@ -142,7 +142,7 @@ impl Workspace {
     /// The panes shown now, in Tab order, with their focus.
     fn panes(&self, cx: &App) -> Vec<(Pane, FocusHandle)> {
         let mut panes = vec![(Pane::Sidebar, self.sidebar_focus.clone())];
-        if self.model.read(cx).active_cluster().is_some() {
+        if self.nav_shown(cx) {
             panes.push((Pane::Navigation, self.nav.read(cx).focus_handle().clone()));
         }
         if let Some(list) = &self.list {
@@ -234,7 +234,7 @@ impl Workspace {
             && self
                 .history
                 .places()
-                .any(|p| here.as_ref() != Some(p) && self.nav_entry(p.kind.as_str(), cx).is_some())
+                .any(|p| here.as_ref() != Some(p) && self.view_entry(p.kind.as_str(), cx).is_some())
     }
 
     /// Go Back: shows the kind and object shown before.
@@ -251,7 +251,7 @@ impl Workspace {
                 continue;
             }
             // A kind the cluster no longer serves is skipped.
-            let Some(entry) = self.nav_entry(place.kind.as_str(), cx) else {
+            let Some(entry) = self.view_entry(place.kind.as_str(), cx) else {
                 continue;
             };
             self.show_kind(&entry, false, true, window, cx);
