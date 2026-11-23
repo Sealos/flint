@@ -17,6 +17,7 @@ mod closing_tests;
 mod cluster_name;
 mod cluster_tag;
 mod clusters;
+mod compare;
 mod confirm;
 mod dashboard;
 mod detail;

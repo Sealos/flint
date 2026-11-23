@@ -1011,7 +1011,7 @@ async fn esc_clears_the_search_then_leaves_it_and_never_closes_the_detail(cx: &m
 // shows: a copy replaces the selection hint, and times out.
 #[gpui_kit::test]
 async fn the_toolbar_is_one_row_and_notices_replace_each_other(cx: &mut TestAppContext) {
-    for width in [1280., 860., 760., 470.] {
+    for width in [1280., 980., 860., 760., 470.] {
         let (core, _dir) = core();
         let (window, view) = open_sized(cx, core, workload_request(), width);
         let mut buffer = LogBuffer::new(1000);
@@ -2195,6 +2195,196 @@ async fn errors_only_shows_warnings_and_errors_as_they_come(cx: &mut TestAppCont
     );
     until_rows(cx, window, &view, 30).await;
     assert!(!view.read_with(cx, |v, _| v.is_filtered()));
+}
+
+// covers UP-48: a regex filters to its matching lines, combines with Errors, and clearing it
+// brings back every line of the buffer.
+#[gpui_kit::test]
+async fn regex_filter_combines_with_errors_and_clears(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(1000);
+    feed(cx, &view, lines.push(0, 20).streaming());
+    draw(cx, window);
+
+    run(cx, window, "logs::ToggleLogRegex", serde_json::Value::Null);
+    view.update(cx, |v, cx| v.set_query(r"line 1[0-4]$".into(), cx));
+    run(
+        cx,
+        window,
+        "logs::ToggleMatchingOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 5).await;
+    assert_eq!(rows(cx, &view), [10, 11, 12, 13, 14]);
+
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 1).await;
+    assert_eq!(rows(cx, &view), [14]);
+
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    run(
+        cx,
+        window,
+        "logs::ToggleMatchingOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 20).await;
+    assert!(!view.read_with(cx, |v, _| v.is_filtered()));
+    assert_eq!(rows(cx, &view), (0..20).collect::<Vec<u64>>());
+}
+
+// covers UP-48: an invalid pattern matches nothing and says why at any width; fixing it, or
+// going back to plain text, shows lines again.
+#[gpui_kit::test]
+async fn an_invalid_regex_says_why_and_recovers(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open_sized(cx, core, request(), 400.);
+    let mut lines = Feed::new(1000);
+    feed(cx, &view, lines.push(0, 20).streaming());
+    draw(cx, window);
+
+    run(cx, window, "logs::ToggleLogRegex", serde_json::Value::Null);
+    view.update(cx, |v, cx| v.set_query("(line".into(), cx));
+    run(
+        cx,
+        window,
+        "logs::ToggleMatchingOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 0).await;
+    let error = view.read_with(cx, |v, _| v.pattern_error.clone()).unwrap();
+    assert_eq!(error, "Invalid pattern: unclosed group");
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-pattern-error").is_some()
+    })
+    .await;
+
+    view.update(cx, |v, cx| v.set_query("(line 3)$".into(), cx));
+    until_rows(cx, window, &view, 1).await;
+    assert_eq!(rows(cx, &view), [3]);
+    assert_eq!(view.read_with(cx, |v, _| v.pattern_error.clone()), None);
+
+    // The same broken text is an ordinary search as plain text.
+    view.update(cx, |v, cx| v.set_query("(line".into(), cx));
+    until_rows(cx, window, &view, 0).await;
+    run(cx, window, "logs::ToggleLogRegex", serde_json::Value::Null);
+    assert_eq!(view.read_with(cx, |v, _| v.pattern_error.clone()), None);
+    view.update(cx, |v, cx| v.set_query(String::new(), cx));
+    until_rows(cx, window, &view, 20).await;
+}
+
+// covers UP-48: a regex catch-up is held to a bound on text: long lines go to the core's
+// threads even when they are few, and a plain query's budget is unchanged.
+#[test]
+fn a_regex_catch_up_is_bounded_by_text() {
+    use super::filter::UiScanBudget;
+    use flint_core::SearchQuery;
+    use flint_core::logs::{GUARD_SCAN_BYTES, GUARD_SCAN_LINES};
+    let catch_up_fits_ui = |query: &SearchQuery, pending, lines: &_| {
+        super::filter::catch_up_fits_ui(query, pending, lines, &mut UiScanBudget::default())
+    };
+
+    let mut short = LogBuffer::new(GUARD_SCAN_LINES + 10);
+    for _ in 0..GUARD_SCAN_LINES + 1 {
+        short.push(LogLine::parse("short", false));
+    }
+    let mut long = LogBuffer::new(10);
+    for _ in 0..3 {
+        long.push(LogLine::parse(&"x".repeat(GUARD_SCAN_BYTES / 2), false));
+    }
+    let regex = SearchQuery {
+        regex: true,
+        ..SearchQuery::new("x")
+    };
+    let plain = SearchQuery::new("x");
+
+    let many = GUARD_SCAN_LINES as u64;
+    assert!(catch_up_fits_ui(&regex, many, &short.view()));
+    assert!(!catch_up_fits_ui(&regex, many + 1, &short.view()));
+    assert!(catch_up_fits_ui(&plain, many + 1, &short.view()));
+    assert!(catch_up_fits_ui(&regex, 2, &long.view()));
+    assert!(!catch_up_fits_ui(&regex, 3, &long.view()));
+    assert!(catch_up_fits_ui(&plain, 3, &long.view()));
+
+    // The search and the filter of one frame share the budget; a scan that does not fit takes
+    // none of it.
+    let mut budget = UiScanBudget::default();
+    let view = long.view();
+    assert!(super::filter::catch_up_fits_ui(
+        &regex,
+        2,
+        &view,
+        &mut budget
+    ));
+    assert!(!super::filter::catch_up_fits_ui(
+        &regex,
+        1,
+        &view,
+        &mut budget
+    ));
+    let mut budget = UiScanBudget::default();
+    assert!(!super::filter::catch_up_fits_ui(
+        &regex,
+        3,
+        &view,
+        &mut budget
+    ));
+    assert!(super::filter::catch_up_fits_ui(
+        &regex,
+        2,
+        &view,
+        &mut budget
+    ));
+}
+
+// covers UP-48: a regex over sources counts their bytes toward the UI thread's budget.
+#[test]
+fn a_regex_catch_up_counts_source_bytes() {
+    use super::filter::{UiScanBudget, catch_up_fits_ui};
+    use flint_core::SearchQuery;
+    use flint_core::logs::GUARD_SCAN_BYTES;
+
+    let source = Arc::new(LineSource::new(&"p".repeat(200), "c"));
+    let count = GUARD_SCAN_BYTES / source.label().len() + 1;
+    let mut buffer = LogBuffer::new(count + 1);
+    for _ in 0..count {
+        let mut line = LogLine::parse("x", false);
+        line.source = Some(source.clone());
+        buffer.push(line);
+    }
+    let lines = buffer.view();
+    let query = SearchQuery {
+        regex: true,
+        ..SearchQuery::new("missing")
+    };
+    let with_sources = SearchQuery {
+        sources: true,
+        ..query.clone()
+    };
+    let pending = count as u64;
+    assert!(catch_up_fits_ui(
+        &query,
+        pending,
+        &lines,
+        &mut UiScanBudget::default()
+    ));
+    assert!(!catch_up_fits_ui(
+        &with_sources,
+        pending,
+        &lines,
+        &mut UiScanBudget::default()
+    ));
 }
 
 // covers UP-48: matching lines only, and context around them; a search no line matches says
