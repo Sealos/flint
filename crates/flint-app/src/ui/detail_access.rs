@@ -103,6 +103,8 @@ pub(in crate::ui) struct ObjectAccess {
     subject: Subject,
     targets: Targets,
     connection: Option<ConnectionIdentity>,
+    /// The context's definition is in doubt: the core refuses checks, so none is shown.
+    unsettled: bool,
     answers: HashMap<AccessCheck, Access>,
     followed: Option<Followed>,
     _task: Option<Task<()>>,
@@ -122,6 +124,7 @@ impl ObjectAccess {
             subject,
             targets: Targets::default(),
             connection: None,
+            unsettled: false,
             answers: HashMap::new(),
             followed: None,
             _task: None,
@@ -195,8 +198,12 @@ impl ObjectAccess {
         blocker.map(reason)
     }
 
-    /// Takes new answers; whether what is shown changed.
-    fn set(&mut self, answers: HashMap<AccessCheck, Access>) -> bool {
+    /// Takes the answers to what `asked` followed; whether what is shown changed. Answers for
+    /// anything but what is followed now are dropped.
+    fn set(&mut self, asked: &Followed, answers: HashMap<AccessCheck, Access>) -> bool {
+        if self.followed.as_ref() != Some(asked) {
+            return false;
+        }
         let changed = self.answers != answers;
         self.answers = answers;
         changed
@@ -217,24 +224,30 @@ impl ObjectAccess {
 }
 
 impl DetailView {
-    /// Says which slot and definition the object's cluster is on now.
+    /// Says which slot and definition the object's cluster is on now, and whether that definition
+    /// is in doubt, so the gate refuses it. Answers and checks of another connection end here,
+    /// not at the next draw.
     pub(in crate::ui) fn set_access_connection(
         &mut self,
         connection: Option<ConnectionIdentity>,
+        unsettled: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.access.connection != connection {
+        if self.access.connection != connection || self.access.unsettled != unsettled {
             self.access.connection = connection;
+            self.access.unsettled = unsettled;
             cx.notify();
         }
+        self.follow_access(cx);
     }
 
     /// Keeps the answers to the connection shown: none while no check can run (protected, not
-    /// connected), and new ones when it changes. Cheap when nothing did.
+    /// connected, definition in doubt), and new ones when it changes. Cheap when nothing did.
     pub(super) fn follow_access(&mut self, cx: &mut Context<Self>) {
         let targets = self.access_targets();
         self.access.targets = targets.clone();
         let followed = (!self.protected
+            && !self.access.unsettled
             && self.sessions_blocked.is_none()
             && self.server.is_some())
         .then(|| Followed {
@@ -301,7 +314,7 @@ impl DetailView {
                     .into_iter()
                     .collect();
                 let kept = this.update(cx, |view, cx| {
-                    if view.access.set(answers) {
+                    if view.access.set(&followed, answers) {
                         cx.notify();
                     }
                 });
@@ -311,6 +324,12 @@ impl DetailView {
                 cx.background_executor().timer(RECHECK).await;
             }
         })
+    }
+
+    /// Whether checks are running or waiting to, in tests.
+    #[cfg(test)]
+    pub(in crate::ui) fn access_checks_running(&self) -> bool {
+        self.access._task.is_some()
     }
 
     /// Sets the answers as a check would, in tests.
@@ -569,6 +588,21 @@ mod tests {
         assert!(access.forbidden(delete).is_some(), "new pods keep answers");
         assert!(access.follow(None));
         assert_eq!(access.forbidden(delete), None, "no connection");
+    }
+
+    #[test]
+    fn a_denial_for_a_replaced_connection_is_dropped() {
+        let delete = Gated::Write(ResourceAction::Delete);
+        let mut access = deployment();
+        let old = followed("https://a", (1, 1), &[]).unwrap();
+        access.follow(Some(old.clone()));
+        access.follow(followed("https://a", (2, 1), &[]));
+        let denial = wanted(&access, delete)
+            .into_iter()
+            .map(|check| (check, Access::Forbidden))
+            .collect();
+        assert!(!access.set(&old, denial));
+        assert_eq!(access.forbidden(delete), None);
     }
 
     #[test]
