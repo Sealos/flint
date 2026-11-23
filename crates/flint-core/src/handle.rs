@@ -271,6 +271,14 @@ pub(crate) enum Request {
     Unsubscribe {
         id: u64,
     },
+    /// An overview of `cluster` is showing.
+    OpenOverview {
+        id: u64,
+        cluster: ClusterId,
+    },
+    CloseOverview {
+        id: u64,
+    },
     FetchObject {
         cluster: ClusterId,
         kind: KindId,
@@ -588,8 +596,9 @@ impl CoreHandle {
     }
 
     /// What the running feed of `cluster` knows. `None` while it has no feed: it is neither
-    /// selected nor in the running set, is not connected, is paused, or its sign-in runs a program
-    /// and it is in the background. Never blocks.
+    /// selected nor in the running set, is in watch mode On view with no overview showing, is not
+    /// connected, is paused, or its sign-in runs a program and it is in the background. Never
+    /// blocks.
     pub fn telemetry(&self, cluster: &str) -> Option<crate::telemetry::ClusterTelemetry> {
         self.telemetry.get(cluster)
     }
@@ -633,6 +642,23 @@ impl CoreHandle {
             cluster: cluster.to_owned(),
             kind: kind.clone(),
             rx: Some(rx),
+            requests: self.requests.clone(),
+        }
+    }
+
+    /// Marks `cluster`'s overview as showing until the result is dropped, so its telemetry feed
+    /// runs in watch mode On view too, while the cluster is active and not paused. Reads only.
+    /// A handle bound to a member starts nothing. Never blocks.
+    pub fn open_overview(&self, cluster: &str) -> OverviewInterest {
+        let id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
+        if matches!(self.read_binding(cluster), Ok(None)) {
+            let _ = self.requests.try_send(Request::OpenOverview {
+                id,
+                cluster: cluster.to_owned(),
+            });
+        }
+        OverviewInterest {
+            id,
             requests: self.requests.clone(),
         }
     }
@@ -1271,6 +1297,21 @@ impl Drop for Subscription {
         // Drop the receiver first: the manager releases the hub only when nobody listens.
         self.rx = None;
         let _ = self.requests.try_send(Request::Unsubscribe { id: self.id });
+    }
+}
+
+/// An overview on show, from [`CoreHandle::open_overview`]. Dropping it ends its watches.
+#[derive(Debug)]
+pub struct OverviewInterest {
+    id: u64,
+    requests: async_channel::Sender<Request>,
+}
+
+impl Drop for OverviewInterest {
+    fn drop(&mut self) {
+        let _ = self
+            .requests
+            .try_send(Request::CloseOverview { id: self.id });
     }
 }
 

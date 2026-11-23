@@ -23,7 +23,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::registry::{self, OpenView, RetryConnection, ToggleNavSection};
+use super::registry::{self, OpenClusterOverview, OpenView, RetryConnection, ToggleNavSection};
 use super::theme::status_dot;
 
 /// Which sections are open, per cluster. Sections the user never toggled follow
@@ -124,6 +124,8 @@ pub enum NavRow {
 pub enum NavEvent {
     /// Open this kind's list, as clicking it does.
     Open(KindId),
+    /// Open the cluster overview.
+    OpenOverview,
 }
 
 pub struct NavPanel {
@@ -133,6 +135,8 @@ pub struct NavPanel {
     collapsed: HashMap<ClusterId, Collapsed>,
     states: HashMap<KindId, SyncState>,
     selected: Option<KindId>,
+    /// The cluster overview is open in the main area.
+    overview: bool,
     scroll: ScrollHandle,
     scroll_to_selected: bool,
     /// The cluster's connection failed, so no discovery is coming.
@@ -161,6 +165,7 @@ impl NavPanel {
             collapsed: HashMap::new(),
             states: HashMap::new(),
             selected: None,
+            overview: false,
             scroll: ScrollHandle::new(),
             scroll_to_selected: false,
             connection_failed: false,
@@ -179,6 +184,7 @@ impl NavPanel {
         if self.cluster != cluster {
             self.states.clear();
             self.selected = None;
+            self.overview = false;
             self.cursor = None;
         }
         let changed = self.cluster != cluster
@@ -233,9 +239,28 @@ impl NavPanel {
         // The cursor follows the open kind, however it was opened.
         if let Some(kind) = &kind {
             self.cursor = Some(NavRow::Kind(kind.clone()));
+            self.overview = false;
         }
         self.selected = kind;
         cx.notify();
+    }
+
+    /// Marks the cluster overview as open or closed in the main area.
+    pub fn set_overview(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.overview == open {
+            return;
+        }
+        self.overview = open;
+        if open {
+            self.selected = None;
+        }
+        cx.notify();
+    }
+
+    /// Whether the overview is marked as open.
+    #[cfg(test)]
+    pub fn overview_open(&self) -> bool {
+        self.overview
     }
 
     /// The navigation's own focus: Tab cycles to it, and its keys work while it has it.
@@ -280,6 +305,34 @@ impl NavPanel {
                     .filter(|c| rows.contains(c))
             })
             .or_else(|| rows.first().cloned())
+    }
+
+    /// The overview's row. The arrows move over sections and kinds; from the keyboard, the
+    /// overview opens through the command palette.
+    fn render_overview(&self, theme: &Theme) -> impl IntoElement {
+        h_flex()
+            .id("nav-overview")
+            .role(gpui_kit::accesskit::Role::Button)
+            .aria_label("Overview")
+            .flex_none()
+            .px_2()
+            .h(px(ROW_HEIGHT))
+            .rounded(theme.radius)
+            .text_sm()
+            .cursor_pointer()
+            .relative()
+            .when(self.overview, |el| {
+                el.bg(theme.list_active).child(super::theme::selection_edge(
+                    theme.list_active_border,
+                    px(4.),
+                ))
+            })
+            .when(!self.overview, |el| el.hover(|el| el.bg(theme.list_hover)))
+            .border_1()
+            .border_color(super::theme::cursor_ring(theme, false))
+            .on_click(registry::on_click(OpenClusterOverview))
+            .child("Overview")
+            .test_support()
     }
 
     fn render_entry(&self, entry: &NavEntry, theme: &Theme, cursor: bool) -> AnyElement {
@@ -432,6 +485,7 @@ impl Render for NavPanel {
             (Some(cluster), Some(discovery)) => {
                 let collapsed = self.collapsed.get(cluster).cloned().unwrap_or_default();
                 let mut first_group = true;
+                rows.push(self.render_overview(&theme).into_any_element());
                 for (i, section) in discovery.navigation.sections.iter().enumerate() {
                     if section.kind == SectionKind::ApiGroup && first_group {
                         first_group = false;

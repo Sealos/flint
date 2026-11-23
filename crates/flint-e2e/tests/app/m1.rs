@@ -378,6 +378,39 @@ fn up_25_change_the_watch_mode() -> Result<()> {
     Ok(())
 }
 
+// covers UP-25: in On view, the overview is an open view of the kinds it reads.
+#[test]
+#[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
+fn up_25_on_view_watches_for_the_overview_until_it_is_left() -> Result<()> {
+    let (cluster, app) = fake_app(Options::default())?;
+    let fake = cluster.fake_server().expect("a fake server");
+    let deployments = fake.gvr("deployments");
+    open_live(&app, "pods", 17)?;
+    app.dispatch("workspace::WatchOpenViewsOnly", Value::Null)?;
+    app.wait_for("/header/watch_mode_source", Equals("cluster".into()))?;
+    until(
+        "no overview, no watch",
+        || fake.open_watches(&deployments),
+        |n| *n == 0,
+    )?;
+
+    app.dispatch("workspace::OpenClusterOverview", Value::Null)?;
+    until(
+        "watched while the overview shows",
+        || fake.open_watches(&deployments),
+        |n| *n >= 1,
+    )?;
+
+    open_live(&app, "pods", 17)?;
+    until(
+        "unwatched after leaving it",
+        || fake.open_watches(&deployments),
+        |n| *n == 0,
+    )?;
+    assert!(fake.writes().is_empty());
+    Ok(())
+}
+
 // covers UP-27
 #[test]
 #[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
