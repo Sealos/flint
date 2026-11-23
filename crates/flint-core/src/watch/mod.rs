@@ -317,7 +317,8 @@ impl ClusterWatches {
 impl Drop for ClusterWatches {
     fn drop(&mut self) {
         self.stop_all();
-        self.hubs.forget_outage(&self.cluster);
+        // The next slot of this name may be on another server.
+        self.hubs.reset_connection(&self.cluster);
     }
 }
 

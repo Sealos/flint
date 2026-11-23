@@ -96,6 +96,14 @@ impl Hub {
         self.tx.receiver_count() + feeds.values().filter(|f| !f.is_closed()).count()
     }
 
+    #[cfg(test)]
+    pub fn member_feeds_empty(&self) -> bool {
+        self.member_feeds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
     /// Sends `snapshot` to every subscription, those bound to a member included.
     fn deliver(&self, snapshot: Arc<KindSnapshot>) {
         self.tx.send_replace(snapshot.clone());
@@ -128,6 +136,29 @@ impl Hub {
         idle.namespaced = latest.namespaced;
         idle.version = VERSION.fetch_add(1, Ordering::Relaxed) + 1;
         feed.send_replace(Arc::new(idle));
+    }
+
+    /// Forgets subscription `id`'s channel: the subscription has closed.
+    fn remove_member(&self, id: u64) {
+        let mut feeds = self.member_feeds.lock().unwrap_or_else(|e| e.into_inner());
+        feeds.remove(&id);
+    }
+
+    /// Replaces what the hub holds with nothing, for a connection that has ended. Open receivers
+    /// stay connected and read idle until the next connection's watch publishes.
+    fn reset(&self) {
+        let latest = self.latest();
+        if self.state() == SyncState::Idle
+            && latest.state == SyncState::Idle
+            && latest.rows.is_empty()
+        {
+            return;
+        }
+        self.take_over(KindSnapshot::empty(
+            latest.cluster.clone(),
+            latest.kind.clone(),
+            SyncState::Idle,
+        ));
     }
 
     pub fn subscribe(&self) -> watch::Receiver<Arc<KindSnapshot>> {
@@ -400,6 +431,28 @@ impl HubRegistry {
         }
     }
 
+    /// Removes the channel of subscription `id`, which has closed.
+    pub fn remove_member(&self, cluster: &str, kind: &KindId, id: u64) {
+        let hubs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hub) = hubs.map.get(&(cluster.to_owned(), kind.clone())) {
+            hub.remove_member(id);
+        }
+    }
+
+    /// Drops everything `cluster`'s ended connection left: its outage and each hub's snapshot,
+    /// including those of kinds no watch runs for. Open receivers stay connected.
+    pub fn reset_connection(&self, cluster: &str) {
+        let hubs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = hubs.outages.get(cluster) {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        for ((c, _), hub) in &hubs.map {
+            if c == cluster {
+                hub.reset();
+            }
+        }
+    }
+
     /// Keeps the last rows of a kind whose watch is stopping, if that watch has lost its
     /// connection. Call it before the hub's rows are replaced.
     pub fn keep_for_outage(&self, cluster: &str, kind: &KindId, hub: &Hub) {
@@ -606,6 +659,40 @@ mod tests {
         let (feed, rx) = watch::channel(Arc::new(KindSnapshot::default()));
         registry.attach_member("c1", &pods, 1, feed);
         assert_eq!(rx.borrow().state, error);
+    }
+
+    #[test]
+    fn a_closed_member_feed_leaves_the_hub_without_a_publish() {
+        let registry = HubRegistry::default();
+        let pods = KindId::pods();
+        let hub = registry.get_or_create("c1", &pods);
+        let (feed, rx) = watch::channel(Arc::new(KindSnapshot::default()));
+        registry.attach_member("c1", &pods, 1, feed);
+        drop(rx);
+
+        registry.remove_member("c1", &pods, 1);
+        assert!(hub.member_feeds_empty());
+    }
+
+    #[test]
+    fn a_connection_reset_clears_a_kind_no_watch_runs_and_keeps_its_receivers() {
+        let registry = HubRegistry::default();
+        let pods = KindId::pods();
+        let hub = registry.get_or_create("c1", &pods);
+        let mut plain = hub.subscribe();
+        hub.take_over(KindSnapshot::empty(
+            "c1".into(),
+            pods.clone(),
+            SyncState::Unavailable,
+        ));
+        plain.borrow_and_update();
+
+        registry.reset_connection("c1");
+        assert!(plain.has_changed().unwrap(), "the receiver stays connected");
+        assert_eq!(plain.borrow_and_update().state, SyncState::Idle);
+        let (feed, rx) = watch::channel(Arc::new(KindSnapshot::default()));
+        registry.attach_member("c1", &pods, 1, feed);
+        assert_eq!(rx.borrow().state, SyncState::Idle);
     }
 
     // covers UP-27

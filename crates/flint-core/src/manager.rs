@@ -745,16 +745,12 @@ impl ClusterManager {
             }
             Request::Unsubscribe { id } => {
                 self.member_feeds.remove(&id);
-                if let Some((cluster, kind, _)) = self.subscriptions.remove(&id) {
-                    self.reconcile(&cluster);
-                    let running = self
-                        .clusters
-                        .iter()
-                        .find(|c| c.info.name == cluster)
-                        .is_some_and(|c| c.watches.running().contains_key(&kind));
-                    if !running {
-                        self.hubs.release(&cluster, &kind);
+                if let Some((cluster, kind, member)) = self.subscriptions.remove(&id) {
+                    if member.is_some() {
+                        self.hubs.remove_member(&cluster, &kind, id);
                     }
+                    self.reconcile(&cluster);
+                    self.release_hub_if_unwatched(&cluster, &kind);
                 }
             }
             Request::OpenOverview { id, cluster } => self.open_overview(id, cluster),
@@ -1017,7 +1013,7 @@ impl ClusterManager {
     /// open subscriptions, and follows its CRDs while it wants them.
     fn reconcile(&mut self, id: &str) {
         // Before anything below can start a watch on the context's current server.
-        self.cut_off_changed_members(id);
+        self.cut_off_changed_members(Some(id));
         let wanted = self.wants_watches(id);
         let mode = self.settings.watch_mode_for(id);
         let subscribed: HashSet<KindId> = self
@@ -2720,6 +2716,13 @@ impl ClusterManager {
             self.members.remove(id);
             self.schedule.dequeue(id);
         }
+        // On every load: a context on a fallback now may be back on its server by the next one.
+        let mut to_reconcile = self.cut_off_changed_members(None);
+        for id in &ended {
+            if !to_reconcile.contains(id) {
+                to_reconcile.push(id.clone());
+            }
+        }
         // Before anything reports this load, so no context is shown paused with a feed running.
         self.stop_unwanted_telemetry();
         self.arm_set_ticker();
@@ -2758,7 +2761,7 @@ impl ClusterManager {
         {
             self.resume(&name);
         }
-        for id in ended {
+        for id in to_reconcile {
             self.reconcile(&id);
         }
         // A paused context starts nothing, and the flag then waits for a later load. The rest go
@@ -6099,6 +6102,98 @@ users:
         manager.subscribe_member(3, "dev", admitted[0].clone(), kind, feed());
         assert!(!manager.subscriptions.contains_key(&2), "moved");
         assert!(!manager.subscriptions.contains_key(&3), "moved back");
+    }
+
+    // Seen on a fallback by a load, a member's subscription has ended, even if the next load puts
+    // the context back before anything else reconciles it.
+    #[tokio::test]
+    async fn a_member_subscription_cut_on_a_fallback_stays_cut_once_restored() {
+        use crate::settings::ClusterPin;
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = kubeconfig_with("https://127.0.0.1:2");
+        let (mut manager, confirmed, first) = pausable(dir.path(), &fallback).await;
+        let admitted = manager
+            .admit_running_set(vec![
+                ClusterPin::new("dev", "https://127.0.0.1:1"),
+                ClusterPin::new("other", "https://other"),
+            ])
+            .unwrap();
+        let pods = KindId::pods();
+        let (feed, rows) = tokio::sync::watch::channel(Arc::default());
+        manager.subscribe_member(1, "dev", admitted[0].clone(), pods.clone(), feed);
+
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(!manager.subscriptions.contains_key(&1), "cut by the load");
+        rewrite_file(&mut manager, &first, &confirmed).await;
+        assert!(!manager.subscriptions.contains_key(&1), "stays cut");
+
+        let hub = manager.hubs.get_or_create("dev", &pods);
+        let epoch = hub.take_over(KindSnapshot::empty(
+            "dev".into(),
+            pods.clone(),
+            SyncState::Loading,
+        ));
+        assert!(hub.publish(
+            epoch,
+            KindSnapshot::empty("dev".into(), pods, SyncState::Synced)
+        ));
+        assert_eq!(rows.borrow().state, SyncState::Idle);
+    }
+
+    // Opening and closing member views leaves no channel in a hub a plain view keeps open, and
+    // a cut-off view leaves no hub behind.
+    #[tokio::test]
+    async fn closed_and_cut_off_member_views_leave_nothing_in_the_hubs() {
+        use crate::settings::ClusterPin;
+        let dir = tempfile::tempdir().unwrap();
+        let original = kubeconfig_with("https://remote-a");
+        let mut manager = manager_reading(dir.path(), &original).await;
+        let admitted = manager
+            .admit_running_set(vec![
+                ClusterPin::new("dev", "https://remote-a"),
+                ClusterPin::new("other", "https://other"),
+            ])
+            .unwrap();
+        let pods = KindId::pods();
+        let (hub, _plain) = manager.hubs.subscribe("dev", &pods);
+        for id in 1..=3 {
+            let (feed, rows) = tokio::sync::watch::channel(Arc::default());
+            manager.handle_request(Request::SubscribeMember {
+                id,
+                cluster: "dev".into(),
+                member: admitted[0].clone(),
+                kind: pods.clone(),
+                feed,
+            });
+            drop(rows);
+            manager.handle_request(Request::Unsubscribe { id });
+        }
+        assert!(hub.member_feeds_empty(), "closed channels stay behind");
+
+        let services = KindId::new("", "services");
+        let (feed, _rows) = tokio::sync::watch::channel(Arc::default());
+        manager.subscribe_member(4, "dev", admitted[0].clone(), services.clone(), feed);
+        assert!(
+            manager
+                .hubs
+                .states("dev")
+                .iter()
+                .any(|(k, _)| *k == services)
+        );
+        rewrite(
+            &mut manager,
+            dir.path(),
+            &kubeconfig_with("https://replacement"),
+        )
+        .await;
+        assert!(
+            !manager
+                .hubs
+                .states("dev")
+                .iter()
+                .any(|(k, _)| *k == services),
+            "no watch and no listener left"
+        );
     }
 
     // A reload that replaces the active member's credential on the same server binds the new

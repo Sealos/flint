@@ -201,16 +201,42 @@ impl ClusterManager {
         self.reconcile(cluster);
     }
 
-    /// Cuts the subscriptions of `cluster` whose member changed off from its hubs for good.
-    pub(super) fn cut_off_changed_members(&self, cluster: &str) {
-        for (id, (context, kind, member)) in &self.subscriptions {
-            if context == cluster
-                && member
-                    .as_ref()
-                    .is_some_and(|m| self.member_changed(m).is_some())
-            {
-                self.hubs.detach_member(cluster, kind, *id);
+    /// Cuts the subscriptions whose member changed off from their hubs for good, on `only` or on
+    /// every context, and ends their interest in the kind: a member that moves back does not
+    /// bring them back. Returns the contexts that lost one, whose watches need reconciling.
+    pub(super) fn cut_off_changed_members(&mut self, only: Option<&str>) -> Vec<ClusterId> {
+        let changed: Vec<u64> = self
+            .subscriptions
+            .iter()
+            .filter(|(_, (context, _, member))| {
+                only.is_none_or(|c| c == context)
+                    && member
+                        .as_ref()
+                        .is_some_and(|m| self.member_changed(m).is_some())
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let mut contexts = Vec::new();
+        for id in changed {
+            let Some((context, kind, _)) = self.subscriptions.remove(&id) else {
+                continue;
+            };
+            self.hubs.detach_member(&context, &kind, id);
+            self.release_hub_if_unwatched(&context, &kind);
+            if !contexts.contains(&context) {
+                contexts.push(context);
             }
+        }
+        contexts
+    }
+
+    /// Forgets the hub of `kind` if no watch runs for it and nobody reads it.
+    pub(super) fn release_hub_if_unwatched(&self, cluster: &str, kind: &crate::KindId) {
+        let running = self
+            .cluster(cluster)
+            .is_some_and(|slot| slot.watches.is_running(kind));
+        if !running {
+            self.hubs.release(cluster, kind);
         }
     }
 
