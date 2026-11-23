@@ -696,6 +696,9 @@ impl ClusterManager {
                 self.subscriptions.insert(id, (cluster.clone(), kind));
                 self.reconcile(&cluster);
             }
+            Request::SubscribeMember { id, member, kind } => {
+                self.subscribe_member(id, member, kind);
+            }
             Request::Unsubscribe { id } => {
                 if let Some((cluster, kind)) = self.subscriptions.remove(&id) {
                     self.reconcile(&cluster);
@@ -724,6 +727,7 @@ impl ClusterManager {
                 id,
                 cluster,
                 server,
+                member,
                 subject,
                 options,
                 snapshots,
@@ -737,9 +741,10 @@ impl ClusterManager {
                 // context's confirmed definition names once its file loads again.
                 // Given the tab's server, pinned to exactly that: a request taken after the
                 // context moved (its fallback gone, say) is not pinned to where it is now.
-                let pin = match &server {
-                    Some(server) => self.contexts.pin(&cluster, server.as_deref()),
-                    None => self.session_pin(&cluster),
+                let pin = match (&member, &server) {
+                    (Some(member), _) => member.log_pin(&cluster),
+                    (None, Some(server)) => self.contexts.pin(&cluster, server.as_deref()),
+                    (None, None) => self.session_pin(&cluster),
                 };
                 let lookup: logs::ClientLookup = Arc::new(move || {
                     let (reply, rx) = oneshot::channel();
@@ -811,13 +816,28 @@ impl ClusterManager {
             } => {
                 let _ = reply.send(self.contexts.check(Pinned::Shell, &cluster, &pin));
             }
+            Request::AdmitRunningSet { pins, reply } => {
+                let _ = reply.send(self.admit_running_set(pins));
+            }
+            Request::CheckMember { member, reply } => {
+                let _ = reply.send(self.member_changed(&member));
+            }
+            Request::MemberClient { member, reply } => {
+                let _ = reply.send(self.member_client(&member));
+            }
             Request::FetchObject {
                 cluster,
                 kind,
                 namespace,
                 name,
+                member,
                 reply,
             } => {
+                // Before any client is taken: a row's read never reaches a replacement server.
+                if let Some(why) = member.as_ref().and_then(|m| self.member_changed(m)) {
+                    let _ = reply.send(Err(why));
+                    return;
+                }
                 let Some(client) = self.client(&cluster) else {
                     let _ = reply.send(Err(format!("\"{cluster}\" is not connected")));
                     return;
@@ -856,7 +876,64 @@ impl ClusterManager {
                     }
                 });
             }
+            Request::FetchPinnedObject {
+                cluster,
+                pin,
+                kind,
+                namespace,
+                name,
+                reply,
+            } => {
+                // In one step with taking the client, which a paused cluster doesn't give.
+                if let Some(why) = self.read_pin_changed(&cluster, &pin) {
+                    let _ = reply.send(Err(why));
+                    return;
+                }
+                let Some(client) = self.client(&cluster) else {
+                    let _ = reply.send(Err(format!("\"{cluster}\" is not connected")));
+                    return;
+                };
+                let info = self
+                    .cluster(&cluster)
+                    .and_then(|c| c.discovery.as_ref())
+                    .and_then(|d| d.kind(&kind).cloned());
+                let Some(info) = info else {
+                    let _ = reply.send(Err(format!("\"{cluster}\" does not serve {kind}")));
+                    return;
+                };
+                let target = cluster::Target::of(&self.kubeconfig.merged, &cluster);
+                tokio::spawn(async move {
+                    let mut reply = reply;
+                    let read = read::object_only(
+                        &client,
+                        &info,
+                        namespace.as_deref(),
+                        &name,
+                        read::DETAIL_TIMEOUT,
+                    );
+                    // Whoever asked is gone: stop the request, and start none if it is already.
+                    tokio::select! {
+                        biased;
+                        () = reply.closed() => {}
+                        result = read => {
+                            let result = result
+                                .map(Arc::new)
+                                .map_err(|e| e.for_target(&target).summary().to_string());
+                            let _ = reply.send(result);
+                        }
+                    }
+                });
+            }
         }
+    }
+
+    /// Why `cluster` is no longer what `pin` was taken from, if so.
+    fn read_pin_changed(&self, cluster: &str, pin: &crate::handle::ReadPin) -> Option<String> {
+        let slot = self.cluster(cluster)?;
+        let server = slot.info.server.as_deref();
+        let same = server == pin.server.as_deref()
+            && self.contexts.shown(cluster, server).definition == pin.definition;
+        (!same).then(|| format!("\"{cluster}\" changed since this view opened."))
     }
 
     fn watched_kinds(&self, cluster: &str) -> Vec<(KindId, crate::store::Feed)> {
@@ -5621,6 +5698,95 @@ mod tests {
         assert!(!ran.exists(), "the command never started");
     }
 
+    // A set is admitted whole or not at all, on the exact servers it was checked on.
+    #[tokio::test]
+    async fn a_stale_pin_admits_no_member_of_the_set() {
+        use crate::settings::ClusterPin;
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://remote-a")).await;
+        let other = ClusterPin::new("other", "https://other");
+        let refused = manager
+            .admit_running_set(vec![
+                other.clone(),
+                ClusterPin::new("dev", "https://replacement"),
+            ])
+            .unwrap_err();
+        assert!(refused.contains("another server"), "{refused}");
+        assert!(manager.members.is_empty(), "nobody joined");
+
+        let admitted = manager
+            .admit_running_set(vec![ClusterPin::new("dev", "https://remote-a"), other])
+            .unwrap();
+        assert_eq!(manager.members.len(), 2);
+        assert_eq!(admitted[0].server(), "https://remote-a");
+        assert_eq!(manager.member_changed(&admitted[0]), None);
+    }
+
+    // Moved and put back, a member's reads stay refused: it is not the connection admitted.
+    #[tokio::test]
+    async fn a_moved_member_is_refused_before_a_client_even_once_moved_back() {
+        use crate::settings::ClusterPin;
+        let dir = tempfile::tempdir().unwrap();
+        let original = kubeconfig_with("https://remote-a");
+        let mut manager = manager_reading(dir.path(), &original).await;
+        let admitted = manager
+            .admit_running_set(vec![
+                ClusterPin::new("dev", "https://remote-a"),
+                ClusterPin::new("other", "https://other"),
+            ])
+            .unwrap();
+        let dev = &admitted[0];
+        assert!(manager.member_client(dev).is_err(), "not connected yet");
+
+        rewrite(
+            &mut manager,
+            dir.path(),
+            &kubeconfig_with("https://replacement"),
+        )
+        .await;
+        let why = manager.member_changed(dev).expect("moved");
+        assert!(why.contains("changed"), "{why}");
+        assert_eq!(manager.member_client(dev).err(), Some(why));
+
+        rewrite(&mut manager, dir.path(), &original).await;
+        assert!(manager.member_changed(dev).is_some(), "moved back");
+        assert_eq!(
+            manager.member_changed(&admitted[1]),
+            None,
+            "other is intact"
+        );
+    }
+
+    // A member that left its server, even if it came back, gets no watch from a new subscription.
+    #[tokio::test]
+    async fn a_changed_member_starts_no_subscription() {
+        use crate::settings::ClusterPin;
+        let dir = tempfile::tempdir().unwrap();
+        let original = kubeconfig_with("https://remote-a");
+        let mut manager = manager_reading(dir.path(), &original).await;
+        let admitted = manager
+            .admit_running_set(vec![
+                ClusterPin::new("dev", "https://remote-a"),
+                ClusterPin::new("other", "https://other"),
+            ])
+            .unwrap();
+        let kind = KindId::pods();
+        manager.subscribe_member(1, admitted[0].clone(), kind.clone());
+        assert!(manager.subscriptions.contains_key(&1), "still admitted");
+
+        rewrite(
+            &mut manager,
+            dir.path(),
+            &kubeconfig_with("https://replacement"),
+        )
+        .await;
+        manager.subscribe_member(2, admitted[0].clone(), kind.clone());
+        rewrite(&mut manager, dir.path(), &original).await;
+        manager.subscribe_member(3, admitted[0].clone(), kind);
+        assert!(!manager.subscriptions.contains_key(&2), "moved");
+        assert!(!manager.subscriptions.contains_key(&3), "moved back");
+    }
+
     // A reload that replaces the active member's credential on the same server binds the new
     // connection to the member, so its failure is not reported as the old live state.
     #[tokio::test]
@@ -7106,6 +7272,7 @@ mod tests {
             id: 1,
             cluster: "dev".into(),
             server: taken_late.then_some(shown),
+            member: None,
             subject: LogSubject::Pod(target),
             options: LogOptions::default(),
             snapshots,

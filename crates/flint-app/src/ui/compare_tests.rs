@@ -246,6 +246,54 @@ fn every_compare_action_is_bound() {
     assert_binds_scope(Scope::Compare, CompareView::bind_actions);
 }
 
+fn at(mut cluster: ClusterSummary, server: &str, definition: u64) -> ClusterSummary {
+    cluster.info.server = Some(server.to_owned());
+    cluster.definition = definition;
+    cluster
+}
+
+// covers #449: a column stays on the definition it opened on, also through a move back.
+#[test]
+fn a_column_is_held_once_its_cluster_changes() {
+    let opened = at(connected(EU), "https://a.example", 1);
+    let pin = opened.read_pin();
+    assert_eq!(
+        column_held(EU, Some(&pin), std::slice::from_ref(&opened)),
+        None
+    );
+    for moved in [
+        at(connected(EU), "https://b.example", 2),
+        at(connected(EU), "https://a.example", 2),
+    ] {
+        assert_eq!(column_held(EU, Some(&pin), &[moved]), Some(CHANGED));
+    }
+    let mut held = at(connected(EU), "https://b.example", 2);
+    held.paused = true;
+    assert_eq!(column_held(EU, Some(&pin), &[held]), Some(PAUSED));
+    assert_eq!(column_held(EU, Some(&pin), &[]), Some(REMOVED));
+}
+
+// covers #449: removing `team` must not leave two columns both called `team`.
+#[test]
+fn retained_columns_keep_names_told_apart() {
+    const PLAIN: &str = "team";
+    const ARN: &str = "arn:aws:eks:eu-west-1:123456789012:cluster/team";
+    let columns = [PLAIN.to_owned(), ARN.to_owned()];
+    let names = column_names(&columns, &[connected(ARN)], &BTreeMap::new());
+    assert_ne!(names.exact(PLAIN), names.exact(ARN));
+}
+
+#[test]
+fn a_menu_object_names_its_kind_exactly() {
+    let object = CompareObject {
+        cluster: EU.to_owned(),
+        kind: "deployments.apps".to_owned(),
+        namespace: Some("demo".to_owned()),
+        name: "web".to_owned(),
+    };
+    assert_eq!(object.target().kind, KindId::new("apps", "deployments"));
+}
+
 // The core would answer "not connected" for this cluster, so the paused reason shows no request
 // was made. The toggles change what is shown without reading again.
 #[gpui_kit::test]

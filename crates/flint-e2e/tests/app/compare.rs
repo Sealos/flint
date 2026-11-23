@@ -85,7 +85,7 @@ fn compare_an_object_from_its_row_menu() -> Result<()> {
     app.dispatch("compare::RefreshCompare", Value::Null)?;
     app.wait_for(
         "/dock/tabs/0/compare/rows",
-        Any(json!("data.mode: blue, red")),
+        Contains(json!("data.mode: blue, red")),
     )?;
     assert!(reads(&two.b) > before, "Refresh read the cluster again");
 

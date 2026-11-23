@@ -55,11 +55,11 @@ use super::super::registry::{
     UntrustCluster,
 };
 use super::super::registry::{
-    CordonNode, DeleteObject, DrainNode, NamespacePickerNext, NamespacePickerPrevious,
-    OpenNamespaceFilter, RestartObject, ScaleObject, ShowDrainReport, UncordonNode,
+    CompareObject, OpenCompare, RefreshCompare, ToggleCompareSame, ToggleCompareVolatile,
 };
 use super::super::registry::{
-    OpenCompare, RefreshCompare, ToggleCompareSame, ToggleCompareVolatile,
+    CordonNode, DeleteObject, DrainNode, NamespacePickerNext, NamespacePickerPrevious,
+    OpenNamespaceFilter, RestartObject, ScaleObject, ShowDrainReport, UncordonNode,
 };
 use super::super::resource_actions::{self, ResourceAction};
 use super::super::scope_picker::ScopePicker;
@@ -115,6 +115,7 @@ impl Workspace {
         .bind::<EditAiScope>(Self::edit_ai_scope)
         .bind::<ShowAgentActivity>(Self::show_agent_activity)
         .bind::<OpenCompare>(Self::open_compare)
+        .bind::<CompareObject>(Self::compare_object)
         .bind::<UnlockCluster>(Self::unlock_cluster)
         .bind::<RenameCluster>(Self::rename_cluster)
         .bind::<SetClusterTag>(|this, action, _, cx| {
@@ -402,6 +403,13 @@ impl Workspace {
             })
             .when::<ShowDrainReport>(|_, cx| resource_actions::has_drain_result(cx))
             .when::<OpenCompare>(|ws, cx| ws.compare_check(cx).is_ok())
+            .add::<CompareObject>(
+                |_, _| true,
+                |ws, a, cx| {
+                    compare::can_compare(&a.cluster, ws.known_clusters(cx))
+                        .map_err(ActionError::rejected::<CompareObject>)
+                },
+            )
             .when::<RefreshCompare>(|ws, cx| ws.dock.read(cx).active_compare().is_some())
             .when::<ToggleCompareSame>(|ws, cx| ws.dock.read(cx).active_compare().is_some())
             .when::<ToggleCompareVolatile>(|ws, cx| ws.dock.read(cx).active_compare().is_some())
@@ -1136,21 +1144,50 @@ impl Workspace {
             namespace: object.namespace,
             name: object.name,
         };
-        let origin = object.cluster;
-        let clusters = compare::compare_clusters(&origin, &self.model.read(cx).clusters);
+        self.open_compare_of(object.cluster, target, window, cx);
+    }
+
+    /// Opens (or shows) the compare tab of the exact object a row's menu was opened on.
+    fn compare_object(&mut self, a: &CompareObject, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(why) = compare::can_compare(&a.cluster, self.known_clusters(cx)) {
+            self.refuse(compare::refused(&why), cx);
+            return;
+        }
+        self.open_compare_of(a.cluster.clone(), a.target(), window, cx);
+    }
+
+    fn open_compare_of(
+        &mut self,
+        origin: String,
+        target: CompareTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let clusters = compare::compare_clusters(&origin, self.known_clusters(cx));
         let key = TabKey::Compare(origin.clone(), target.clone());
         let tab_cluster = self.tab_cluster(&key, cx);
         let model = self.model.clone();
-        self.open_tab(
+        let columns = clusters.clone();
+        let id = self.open_tab(
             key,
             tab_cluster,
             move |_, cx| {
-                DockTab::Compare(cx.new(|cx| CompareView::new(model, origin, target, clusters, cx)))
+                DockTab::Compare(cx.new(|cx| CompareView::new(model, origin, target, columns, cx)))
             },
             true,
             window,
             cx,
         );
+        // A tab already open may hold a column whose cluster has changed since.
+        if let Some(DockTab::Compare(view)) = self.dock.read(cx).tab(id) {
+            let view = view.clone();
+            view.update(cx, |view, cx| view.reopen(clusters, cx));
+        }
+    }
+
+    /// Every cluster in kubeconfig, as last reported.
+    pub(in crate::ui) fn known_clusters<'a>(&self, cx: &'a App) -> &'a [ClusterSummary] {
+        &self.model.read(cx).clusters
     }
 
     /// Opens the scope dialog of an exposed cluster; saving rewrites its entry with the new

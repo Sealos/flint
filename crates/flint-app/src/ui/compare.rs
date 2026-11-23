@@ -1,9 +1,10 @@
 //! Compare an object across clusters (#449): one column per cluster, named exactly, with the
 //! fields that differ. Strictly read-only.
 //!
-//! Reads go through [`CoreHandle::fetch_object`], which uses a connection that already exists and
-//! never starts one, so a cluster in the background can't launch a credential command from here:
-//! it shows as unavailable. A paused cluster is not asked at all ([`held_back`]).
+//! Reads go through [`CoreHandle::fetch_pinned_object`]: one GET on a connection that already
+//! exists, so a cluster in the background can't launch a credential command from here (it shows
+//! as unavailable). Each column stays on the definition it opened on ([`ReadPin`]): a paused or
+//! re-pointed cluster is not asked, and what a re-pointed one answered is dropped.
 //! The comparison itself is [`flint_core::compare`].
 
 use std::sync::Arc;
@@ -13,11 +14,14 @@ use flint_core::compare::{
     SideState, Verdict, compare,
 };
 use flint_core::display::{ClusterNames, single_line};
+use flint_core::handle::ReadPin;
+use flint_core::read::KindId;
 use flint_core::{ClusterSummary, ConnectionState, CoreHandle};
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::*;
+use serde::Deserialize;
 
 use super::clusters::ClustersModel;
 use super::dock::{DockItem, TabKey};
@@ -39,12 +43,39 @@ actions!(
     ]
 );
 
+/// Compare one exact object across the connected clusters: what a row's menu opens, so it stays
+/// that row's object whatever gets selected while the menu is open.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Action)]
+#[action(namespace = compare, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct CompareObject {
+    pub cluster: String,
+    /// `plural`, or `plural.group`.
+    pub kind: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    pub name: String,
+}
+
+impl CompareObject {
+    pub fn target(&self) -> CompareTarget {
+        let (plural, group) = self.kind.split_once('.').unwrap_or((&self.kind, ""));
+        CompareTarget {
+            kind: KindId::new(group, plural),
+            namespace: self.namespace.clone(),
+            name: self.name.clone(),
+        }
+    }
+}
+
 /// The key context of the compare view.
 pub const COMPARE_VIEW: &str = "Compare";
 /// Why a paused cluster is not read.
 pub const PAUSED: &str = "paused while its kubeconfig can't be confirmed";
 /// Why a cluster that left kubeconfig is not read.
 const REMOVED: &str = "no longer in kubeconfig";
+/// Why a column's cluster is not read, and what it read is dropped.
+pub const CHANGED: &str = "its connection changed since this comparison opened; open it again";
 /// Why there is nothing to compare with.
 pub const NO_OTHER_CLUSTER: &str = "no other cluster is connected";
 
@@ -238,14 +269,18 @@ pub fn can_compare(origin: &str, clusters: &[ClusterSummary]) -> Result<(), Stri
     {
         return Err("this cluster is not connected".to_owned());
     }
-    let other = clusters
-        .iter()
-        .any(|c| c.info.name != origin && !c.paused && is_connected(c));
-    if other {
+    if has_other_cluster(origin, clusters) {
         Ok(())
     } else {
         Err(NO_OTHER_CLUSTER.to_owned())
     }
+}
+
+/// Whether a cluster other than `origin` could be compared with now.
+pub fn has_other_cluster(origin: &str, clusters: &[ClusterSummary]) -> bool {
+    clusters
+        .iter()
+        .any(|c| c.info.name != origin && !c.paused && is_connected(c))
 }
 
 /// `why` a comparison did not open, as one sentence.
@@ -266,6 +301,48 @@ pub fn held_back(cluster: &str, clusters: &[ClusterSummary]) -> Option<&'static 
     }
 }
 
+/// Why column `cluster`, opened at `pin`, must not be read now. A pause comes first: while the
+/// server shown may be a fallback, it says nothing yet about the context having moved.
+fn column_held(
+    cluster: &str,
+    pin: Option<&ReadPin>,
+    clusters: &[ClusterSummary],
+) -> Option<&'static str> {
+    held_back(cluster, clusters).or_else(|| {
+        let now = clusters.iter().find(|c| c.info.name == cluster)?;
+        (pin != Some(&now.read_pin())).then_some(CHANGED)
+    })
+}
+
+/// Each of `columns` as its cluster is now.
+fn column_pins(columns: &[String], clusters: &[ClusterSummary]) -> Vec<Option<ReadPin>> {
+    columns
+        .iter()
+        .map(|column| {
+            clusters
+                .iter()
+                .find(|c| c.info.name == *column)
+                .map(ClusterSummary::read_pin)
+        })
+        .collect()
+}
+
+/// Names told from the current contexts and from `columns`, which may have left kubeconfig.
+fn column_names(
+    columns: &[String],
+    clusters: &[ClusterSummary],
+    custom: &std::collections::BTreeMap<String, String>,
+) -> ClusterNames {
+    let all = distinct(
+        clusters
+            .iter()
+            .map(|c| c.info.name.clone())
+            .chain(columns.iter().cloned())
+            .collect(),
+    );
+    ClusterNames::new(all.iter().map(String::as_str), custom)
+}
+
 /// Compares `target` on `clusters`. Open it with [`CompareView::new`].
 pub struct CompareView {
     core: CoreHandle,
@@ -274,6 +351,8 @@ pub struct CompareView {
     origin: String,
     target: CompareTarget,
     clusters: Vec<String>,
+    /// What each column's cluster was when it opened. `None`: it was not in kubeconfig.
+    pins: Vec<Option<ReadPin>>,
     names: ClusterNames,
     reads: Vec<SideRead>,
     options: CompareOptions,
@@ -299,9 +378,13 @@ impl CompareView {
         cx: &mut Context<Self>,
     ) -> Self {
         let clusters = distinct(clusters);
-        let (core, names) = {
+        let (core, names, pins) = {
             let model = source.read(cx);
-            (model.core().clone(), model.names())
+            (
+                model.core().clone(),
+                column_names(&clusters, &model.clusters, &model.settings.cluster_names),
+                column_pins(&clusters, &model.clusters),
+            )
         };
         let observed = cx.observe(&source, |view, _, cx| view.clusters_changed(cx));
         let mut view = Self {
@@ -312,6 +395,7 @@ impl CompareView {
             target,
             reads: vec![SideRead::Reading; clusters.len()],
             clusters,
+            pins,
             names,
             options: CompareOptions::default(),
             show_same: false,
@@ -345,7 +429,8 @@ impl CompareView {
             let known = &self.source.read(cx).clusters;
             self.clusters
                 .iter()
-                .map(|cluster| held_back(cluster, known))
+                .zip(&self.pins)
+                .map(|(cluster, pin)| column_held(cluster, pin.as_ref(), known))
                 .collect()
         };
         self.reads = held
@@ -361,11 +446,12 @@ impl CompareView {
             .iter()
             .enumerate()
             .map(|(side, cluster)| {
-                if held[side].is_some() {
+                let Some(pin) = self.pins[side].as_ref().filter(|_| held[side].is_none()) else {
                     return Task::ready(());
-                }
-                let fetch = self.core.fetch_object(
+                };
+                let fetch = self.core.fetch_pinned_object(
                     cluster,
+                    pin,
                     &self.target.kind,
                     self.target.namespace.as_deref(),
                     &self.target.name,
@@ -381,6 +467,37 @@ impl CompareView {
             .collect();
         self.fetches = fetches;
         self.recompare(cx);
+    }
+
+    /// Opened again on this object: if a column's cluster has changed, every column takes the
+    /// clusters as they are now. A tab whose columns all still hold is left as it is.
+    pub fn reopen(&mut self, clusters: Vec<String>, cx: &mut Context<Self>) {
+        let stale = {
+            let known = &self.source.read(cx).clusters;
+            self.clusters
+                .iter()
+                .zip(&self.pins)
+                .any(|(c, pin)| column_held(c, pin.as_ref(), known) == Some(CHANGED))
+        };
+        if !stale {
+            return;
+        }
+        self.clusters = distinct(clusters);
+        self.pins = column_pins(&self.clusters, &self.source.read(cx).clusters);
+        self.follow_names(cx);
+        self.refresh(cx);
+    }
+
+    fn follow_names(&mut self, cx: &mut Context<Self>) {
+        let names = {
+            let model = self.source.read(cx);
+            column_names(
+                &self.clusters,
+                &model.clusters,
+                &model.settings.cluster_names,
+            )
+        };
+        self.set_names(names, cx);
     }
 
     /// Shows or hides the fields that match.
@@ -407,6 +524,7 @@ impl CompareView {
         }
     }
 
+    #[cfg(any(test, feature = "automation"))]
     pub fn model(&self) -> &CompareModel {
         &self.model
     }
@@ -421,24 +539,27 @@ impl CompareView {
         self.options.include_volatile
     }
 
-    /// The cluster list changed: follows renames, and stops a read still running on a cluster
-    /// that was paused or removed.
+    /// The cluster list changed: follows renames, stops a read still running on a cluster that
+    /// was paused or removed, and drops whatever a re-pointed cluster's column holds.
     fn clusters_changed(&mut self, cx: &mut Context<Self>) {
-        let (names, held) = {
-            let model = self.source.read(cx);
-            let held: Vec<Option<&'static str>> = self
-                .clusters
+        self.follow_names(cx);
+        let held: Vec<Option<&'static str>> = {
+            let known = &self.source.read(cx).clusters;
+            self.clusters
                 .iter()
-                .map(|cluster| held_back(cluster, &model.clusters))
-                .collect();
-            (model.names(), held)
+                .zip(&self.pins)
+                .map(|(cluster, pin)| column_held(cluster, pin.as_ref(), known))
+                .collect()
         };
-        self.set_names(names, cx);
         let mut stopped = false;
         for (side, why) in held.into_iter().enumerate() {
-            if let Some(why) = why
-                && matches!(self.reads[side], SideRead::Reading)
-            {
+            let Some(why) = why else { continue };
+            let stop = match &self.reads[side] {
+                SideRead::Reading => true,
+                SideRead::Unavailable(said) => why == CHANGED && said != CHANGED,
+                _ => why == CHANGED,
+            };
+            if stop {
                 self.fetches[side] = Task::ready(());
                 self.reads[side] = SideRead::Unavailable(why.to_owned());
                 stopped = true;

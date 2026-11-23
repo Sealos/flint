@@ -245,6 +245,57 @@ async fn lists_tables_with_columns_and_pages() {
     );
 }
 
+// covers #449: a pinned read is the object's GET alone, and one whose pin no longer holds sends
+// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pinned_read_is_one_get_and_a_changed_pin_sends_nothing() {
+    const OBJECT: &str = "/apis/apps/v1/namespaces/demo/deployments/web";
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, None).await;
+    let events = core.handle.events();
+    core.handle.send(Command::ReloadKubeconfig);
+    let pin = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Event::ClustersChanged(snapshot) = events.recv().await.expect("core running")
+                && let Some(cluster) = snapshot.clusters.iter().find(|c| c.info.name == CONTEXT)
+            {
+                break cluster.read_pin();
+            }
+        }
+    })
+    .await
+    .expect("the cluster list");
+    let kind = KindId::new("apps", "deployments");
+    let count = |wanted: &dyn Fn(&str) -> bool| {
+        server.requests().iter().filter(|r| wanted(&r.path)).count()
+    };
+    let is_events = |path: &str| path.ends_with("/events");
+    let is_object = |path: &str| path == OBJECT;
+    let events_before = count(&is_events);
+
+    let detail = core
+        .handle
+        .fetch_pinned_object(CONTEXT, &pin, &kind, Some("demo"), "web")
+        .await
+        .unwrap();
+    assert_eq!(detail.object["kind"], "Deployment");
+    assert!(detail.events.is_empty());
+    assert_eq!(count(&is_object), 1);
+    assert_eq!(count(&is_events), events_before, "no follow-up Events read");
+
+    let moved = flint_core::handle::ReadPin {
+        definition: pin.definition + 1,
+        server: pin.server.clone(),
+    };
+    let refused = core
+        .handle
+        .fetch_pinned_object(CONTEXT, &moved, &kind, Some("demo"), "web")
+        .await
+        .unwrap_err();
+    assert!(refused.contains("changed"), "{refused}");
+    assert_eq!(count(&is_object), 1, "a changed pin sends no request");
+}
+
 // covers UP-20
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_lists_follow_watch_events() {
