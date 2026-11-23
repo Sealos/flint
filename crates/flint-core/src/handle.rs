@@ -741,6 +741,15 @@ impl CoreHandle {
         self.telemetry.get(cluster)
     }
 
+    /// [`Self::telemetry`] of `member`, only from a feed that started on the endpoint it was
+    /// admitted on. Starts nothing and never blocks.
+    pub fn member_telemetry(
+        &self,
+        member: &AdmittedMember,
+    ) -> Option<crate::telemetry::ClusterTelemetry> {
+        self.telemetry.get_on(member.context(), &member.at)
+    }
+
     /// [`Self::telemetry`] of every cluster with a running feed, by cluster name.
     pub fn all_telemetry(&self) -> Vec<crate::telemetry::ClusterTelemetry> {
         self.telemetry.all()

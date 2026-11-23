@@ -13,6 +13,7 @@ use super::{
 };
 use crate::cluster::{ClusterId, SafeErrorText};
 use crate::metrics_trend::TrendStore;
+use crate::recheck::ContextPin;
 
 /// `good` as last values: readable, its age said in the status, and worth no alert change, since
 /// a pass that could not check the cluster clears nothing and raises nothing.
@@ -68,6 +69,8 @@ struct Entry {
     last_good: Arc<Mutex<Option<Arc<TelemetrySnapshot>>>>,
     /// The feed has stopped: its last values stay, in memory only, until the entry is removed.
     held: Option<SideReads>,
+    /// The definition the feed's connection was on when it started.
+    pin: ContextPin,
 }
 
 impl Entry {
@@ -139,6 +142,7 @@ impl TelemetryBoard {
     pub(crate) fn publish(
         &self,
         cluster: &str,
+        pin: ContextPin,
         feed: &mut Telemetry,
         trends: Arc<Mutex<TrendStore>>,
     ) {
@@ -150,6 +154,7 @@ impl TelemetryBoard {
             trends,
             last_good,
             held: None,
+            pin,
         };
         self.feeds().insert(cluster.to_owned(), entry);
         self.bump();
@@ -193,6 +198,14 @@ impl TelemetryBoard {
 
     pub(crate) fn get(&self, cluster: &str) -> Option<ClusterTelemetry> {
         self.feeds().get(cluster).and_then(Entry::read)
+    }
+
+    /// [`Self::get`], only if the feed started on the endpoint of `pin`.
+    pub(crate) fn get_on(&self, cluster: &str, pin: &ContextPin) -> Option<ClusterTelemetry> {
+        self.feeds()
+            .get(cluster)
+            .filter(|entry| entry.pin.same_endpoint_as(pin))
+            .and_then(Entry::read)
     }
 
     pub(crate) fn all(&self) -> Vec<ClusterTelemetry> {

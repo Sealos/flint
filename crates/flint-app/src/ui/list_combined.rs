@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flint_core::combined::{
-    CLUSTER_COLUMN, ColumnKey, CombinedCell, CombinedGroup, CombinedLine, CombinedQuery,
-    CombinedRowId, CombinedSort, CombinedView, RowRef,
+    CLUSTER_COLUMN, ColumnKey, CombinedCell, CombinedGroup, CombinedLine, CombinedObjects,
+    CombinedQuery, CombinedRowId, CombinedSort, CombinedView, RowRef,
 };
 use flint_core::table::unix_now;
 use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
@@ -84,6 +84,11 @@ pub struct ToggleGroupByCluster;
 #[action(namespace = combined_list, no_json)]
 pub struct ToggleCombinedWide;
 
+/// Shows every row again after a dashboard narrowed the list to the objects it counted.
+#[derive(Debug, Clone, Default, PartialEq, Action)]
+#[action(namespace = combined_list, no_json)]
+pub struct ShowAllCombinedRows;
+
 /// The object a selected combined row names, in the row's own cluster.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CombinedObject {
@@ -113,6 +118,8 @@ pub struct CombinedResourceList {
     pub(in super::super) view: Arc<CombinedView>,
     /// The filters, and the sort asked for.
     pub(in super::super) query: CombinedQuery,
+    /// What `query.objects` holds, for the notice above the rows.
+    objects_label: Option<String>,
     /// The sort `view` was computed with, which the header's arrow shows.
     pub(in super::super) applied_sort: Option<CombinedSort>,
     pub(in super::super) show_wide: bool,
@@ -185,6 +192,7 @@ impl CombinedResourceList {
                 namespaces,
                 ..CombinedQuery::default()
             },
+            objects_label: None,
             applied_sort: None,
             show_wide: false,
             widths: ColumnWidths::default(),
@@ -229,6 +237,7 @@ impl CombinedResourceList {
             .bind::<ToggleClusterGroup>(Self::on_toggle_group)
             .bind::<ToggleGroupByCluster>(Self::on_group_by)
             .bind::<ToggleCombinedWide>(Self::on_wide)
+            .bind::<ShowAllCombinedRows>(Self::on_show_all)
     }
 
     /// The list actions it shares with a single-cluster list, forwarded the same way.
@@ -308,6 +317,47 @@ impl CombinedResourceList {
             .any(|m| m.cluster() == cluster)
     }
 
+    /// Narrows the list to `objects`, called `label` in its notice, in every namespace.
+    pub fn show_objects(
+        &mut self,
+        label: String,
+        objects: Arc<CombinedObjects>,
+        cx: &mut Context<Self>,
+    ) {
+        self.objects_label = Some(label);
+        self.query.objects = Some(objects);
+        self.query.clusters.clear();
+        self.remeasure = true;
+        self.recompute(cx);
+        cx.notify();
+    }
+
+    /// Shows only `cluster`'s rows, and every object of them.
+    pub fn show_cluster(&mut self, cluster: &str, cx: &mut Context<Self>) {
+        if self.is_member(cluster) {
+            self.objects_label = None;
+            self.query.objects = None;
+            self.query.clusters = vec![cluster.to_owned()];
+            self.remeasure = true;
+            self.recompute(cx);
+            cx.notify();
+        }
+    }
+
+    /// What a dashboard narrowed the list to, if anything.
+    pub fn objects_label(&self) -> Option<&str> {
+        self.objects_label.as_deref()
+    }
+
+    fn on_show_all(&mut self, _: &ShowAllCombinedRows, _: &mut Window, cx: &mut Context<Self>) {
+        if self.query.objects.take().is_some() {
+            self.objects_label = None;
+            self.remeasure = true;
+            self.recompute(cx);
+            cx.notify();
+        }
+    }
+
     pub fn toggle_cluster_filter(&mut self, cluster: &str, cx: &mut Context<Self>) {
         if !self.is_member(cluster) {
             return;
@@ -354,10 +404,14 @@ impl CombinedResourceList {
         self.dirty = false;
         let source = self.latest.clone();
         let sort = model::effective_sort(&source, self.query.sort.as_ref(), self.show_wide);
-        let query = CombinedQuery {
+        let mut query = CombinedQuery {
             sort: sort.clone(),
             ..self.query.clone()
         };
+        // A count covers every namespace, whatever the picker holds.
+        if query.objects.is_some() {
+            query.namespaces.clear();
+        }
         let selected = self.selected.clone();
         let seen = self.selected_seen.clone();
         let cached = self.measured.clone();
@@ -1206,12 +1260,37 @@ impl Render for CombinedResourceList {
             .on_action(cx.listener(Self::on_toggle_group))
             .on_action(cx.listener(Self::on_group_by))
             .on_action(cx.listener(Self::on_wide))
+            .on_action(cx.listener(Self::on_show_all))
             .size_full()
             .min_w_0()
             .relative()
             .child(self.render_toolbar(theme))
             .child(self.render_members(theme))
             .children(self.render_kind_note(theme))
+            .children(self.objects_label.clone().map(|label| {
+                h_flex()
+                    .id("combined-objects-note")
+                    .flex_none()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .aria_label(format!("Showing only {label}"))
+                    .child(format!("Showing only {label}"))
+                    .child(
+                        Button::new("combined-show-all")
+                            .xsmall()
+                            .ghost()
+                            .label("Show All")
+                            .on_click(registry::on_click_in(
+                                self.focus.clone(),
+                                ShowAllCombinedRows,
+                            )),
+                    )
+                    .test_support()
+            }))
             .child(body)
     }
 }

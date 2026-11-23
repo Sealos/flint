@@ -193,6 +193,8 @@ struct KeptFeed {
     access: CredentialAccess,
     connecting: Option<AbortHandle>,
     feed: Option<Telemetry>,
+    /// The definition its connection was started from, which labels the feed it leads to.
+    pin: crate::recheck::ContextPin,
 }
 
 impl Drop for KeptFeed {
@@ -514,6 +516,9 @@ impl ClusterManager {
         self.keep.grants.admit(id, attempt, &access);
         let mut kubeconfig = self.kubeconfig.merged.clone();
         cluster::disable_interactive_exec(&mut kubeconfig);
+        // Read with the config it connects from: the connection may finish after a reload.
+        let shown = self.cluster(id).and_then(|slot| slot.info.server.clone());
+        let pin = self.contexts.pin(id, shown.as_deref());
         let (name, task_access) = (id.to_owned(), access.clone());
         let connects = Arc::clone(&self.keep.connects);
         let internal = self.internal_tx.clone();
@@ -548,6 +553,7 @@ impl ClusterManager {
                 access,
                 connecting: Some(task.abort_handle()),
                 feed: None,
+                pin,
             },
         );
     }
@@ -581,7 +587,8 @@ impl ClusterManager {
                     self.telemetry_timing,
                     requests,
                 );
-                self.telemetry.publish(id, &mut feed, trends);
+                self.telemetry
+                    .publish(id, kept.pin.clone(), &mut feed, trends);
                 kept.feed = Some(feed);
             }
             Err(sign_in) if !kept.interrupted && (sign_in || kept.runs_plugin) => {

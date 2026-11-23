@@ -1,0 +1,391 @@
+//! The set dashboard: worst-first order, honest totals, and links bound to the member's feed.
+
+use std::sync::Arc;
+
+use flint_core::dashboard::{ProblemCategory, ProblemCounts};
+use flint_core::thresholds::{ThresholdLevel, Thresholds};
+use flint_core::{KindId, KindSnapshot, SyncState};
+use gpui_kit::{AppContext as _, Entity, TestAppContext};
+use jiff::Timestamp;
+use serde_json::{Value, json};
+
+use super::super::super::list::{CountedObjects, ObjectFilter};
+use super::super::super::support_tests::{TestWorkspace, objects, open_workspace};
+use super::super::feed::{FeedId, ProblemList, ProblemLists};
+use super::super::{NO_VALUE, ProblemTile, category_label};
+use super::{
+    CardState, MemberRead, SetCard, SetDashboardModel, SetDashboardView, TestFeeds, TotalTile,
+    assemble, card, kind_entry,
+};
+
+fn tiles(count: impl Fn(ProblemCategory) -> Option<u32>) -> Vec<ProblemTile> {
+    ProblemCategory::ALL
+        .into_iter()
+        .map(|category| ProblemTile {
+            category,
+            label: category_label(category),
+            count: count(category),
+            level: ThresholdLevel::Healthy,
+        })
+        .collect()
+}
+
+fn card_with(cluster: &str, state: CardState, failing: Option<u32>, feed: &str) -> SetCard {
+    let counting = state.counts();
+    let count = move |category| {
+        if !counting {
+            None
+        } else if category == ProblemCategory::FailingPods {
+            failing
+        } else {
+            Some(0)
+        }
+    };
+    SetCard {
+        cluster: cluster.to_owned(),
+        shown: cluster.to_owned(),
+        tag: None,
+        tiles: tiles(count),
+        counts: ProblemCounts::from_fn(count),
+        level: ThresholdLevel::Healthy,
+        cpu: None,
+        memory: None,
+        short_kinds: vec!["deployments"],
+        feed: counting.then(|| FeedId::for_test(feed)),
+        state,
+    }
+}
+
+fn order(model: &SetDashboardModel) -> Vec<&str> {
+    model.cards.iter().map(|c| c.cluster.as_str()).collect()
+}
+
+fn total(model: &SetDashboardModel, category: ProblemCategory) -> &TotalTile {
+    model
+        .totals
+        .iter()
+        .find(|t| t.category == category)
+        .expect("every category has a total")
+}
+
+#[test]
+fn cards_run_worst_first_and_missing_data_is_never_healthiest() {
+    let model = assemble(vec![
+        card_with("healthy", CardState::Live, Some(0), "a"),
+        card_with("paused", CardState::Blocked("Paused".into()), None, "b"),
+        card_with("broken", CardState::Live, Some(4), "c"),
+    ]);
+    assert_eq!(order(&model), ["broken", "paused", "healthy"]);
+}
+
+#[test]
+fn equal_cards_keep_a_stable_order_by_name() {
+    let model = assemble(vec![
+        card_with("b", CardState::Live, Some(1), "b"),
+        card_with("a", CardState::Live, Some(1), "a"),
+    ]);
+    assert_eq!(order(&model), ["a", "b"]);
+}
+
+#[test]
+fn a_total_lacking_a_member_says_it_is_partial() {
+    for state in [
+        CardState::Blocked("Paused".into()),
+        CardState::Blocked("Changed, left out of this set.".into()),
+        CardState::Unavailable("This cluster cannot be checked.".into()),
+        CardState::NotWatched,
+        CardState::Waiting,
+    ] {
+        let model = assemble(vec![
+            card_with("a", CardState::Live, Some(2), "a"),
+            card_with("b", state, None, "b"),
+        ]);
+        let failing = total(&model, ProblemCategory::FailingPods);
+        assert_eq!(failing.value(2), "2+");
+        assert!(failing.description(2).contains("1 of 2 clusters"));
+        assert!(model.partial.as_deref().unwrap().contains('b'));
+    }
+}
+
+#[test]
+fn a_full_total_is_exact_and_one_with_no_member_shows_no_number() {
+    let full = assemble(vec![
+        card_with("a", CardState::Live, Some(2), "a"),
+        card_with("b", CardState::Live, Some(3), "b"),
+    ]);
+    assert_eq!(total(&full, ProblemCategory::FailingPods).value(2), "5");
+    assert_eq!(full.partial, None);
+    let none = assemble(vec![
+        card_with("a", CardState::NotWatched, None, "a"),
+        card_with("b", CardState::Waiting, None, "b"),
+    ]);
+    let failing = total(&none, ProblemCategory::FailingPods);
+    assert_eq!(failing.value(2), NO_VALUE);
+    assert!(!failing.opens);
+}
+
+#[test]
+fn a_total_of_several_short_kinds_opens_no_single_list() {
+    let short = |cluster: &str, kind: &'static str| {
+        let count = |category| Some(u32::from(category == ProblemCategory::ShortWorkloads));
+        SetCard {
+            short_kinds: vec![kind],
+            tiles: tiles(count),
+            counts: ProblemCounts::from_fn(count),
+            ..card_with(cluster, CardState::Live, Some(0), cluster)
+        }
+    };
+    let mixed = assemble(vec![short("a", "deployments"), short("b", "daemonsets")]);
+    assert!(!total(&mixed, ProblemCategory::ShortWorkloads).opens);
+    let same = assemble(vec![short("a", "deployments"), short("b", "deployments")]);
+    assert!(total(&same, ProblemCategory::ShortWorkloads).opens);
+}
+
+#[test]
+fn a_blocked_member_shows_no_values_even_with_a_feed_on_the_board() {
+    let member = MemberRead {
+        cluster: "a".into(),
+        shown: "a".into(),
+        tag: None,
+        blocked: Some("a now points at another server".into()),
+        telemetry: None,
+        server: "https://a".into(),
+        thresholds: Thresholds::default(),
+        watched: true,
+    };
+    let card = card_with_read(member);
+    assert!(matches!(card.state, CardState::Blocked(_)));
+    assert!(card.tiles.iter().all(|tile| tile.count.is_none()));
+    assert_eq!(card.feed, None);
+    assert_eq!(card.level, ThresholdLevel::Unknown);
+}
+
+#[test]
+fn a_member_without_a_feed_says_whether_it_is_watched() {
+    let member = |watched| MemberRead {
+        cluster: "a".into(),
+        shown: "a".into(),
+        tag: None,
+        blocked: None,
+        telemetry: None,
+        server: "https://a".into(),
+        thresholds: Thresholds::default(),
+        watched,
+    };
+    assert_eq!(card_with_read(member(true)).state, CardState::Waiting);
+    assert_eq!(card_with_read(member(false)).state, CardState::NotWatched);
+}
+
+fn card_with_read(member: MemberRead) -> SetCard {
+    card(member, Timestamp::now())
+}
+
+#[test]
+fn every_problem_list_kind_has_an_entry() {
+    for kind in [
+        "pods",
+        "nodes",
+        "events",
+        "persistentvolumeclaims",
+        "jobs",
+        "deployments",
+        "statefulsets",
+        "daemonsets",
+    ] {
+        assert!(kind_entry(kind).is_some(), "{kind}");
+    }
+    assert!(kind_entry("configmaps").is_none());
+}
+
+// View tests.
+
+const OPEN: &str = "cluster_sets::OpenClusterSetDashboard";
+const OPEN_PROBLEM: &str = "cluster_sets::OpenSetProblem";
+const OPEN_MEMBER: &str = "cluster_sets::OpenSetMember";
+
+fn pods_of(cluster: &str, rows: &[(&str, &str, i64)]) -> Arc<KindSnapshot> {
+    let mut snapshot = (*objects(KindId::pods(), rows, SyncState::Synced, 1)).clone();
+    snapshot.cluster = cluster.into();
+    Arc::new(snapshot)
+}
+
+fn failing_lists(uid: &str) -> ProblemLists {
+    let mut counted = CountedObjects::default();
+    counted.insert(Some("default"), "web", Some(uid));
+    ProblemLists::from([(
+        ProblemCategory::FailingPods,
+        vec![ProblemList {
+            kind: "pods",
+            filter: ObjectFilter {
+                label: "failing pods".to_owned(),
+                objects: Arc::new(counted),
+            },
+        }],
+    )])
+}
+
+/// A set of both test clusters with a pod `web` and a pod `api` in each, its dashboard open on
+/// hand-fed values: `kind-beta` has one failing pod.
+async fn open_set(
+    cx: &mut TestAppContext,
+    dir: &std::path::Path,
+) -> (TestWorkspace, Entity<SetDashboardView>) {
+    let t = open_workspace(cx, dir).await;
+    t.dispatch(cx, "cluster_sets::ToggleClusterPicking", Value::Null)
+        .unwrap();
+    for cluster in ["kind-alpha", "kind-beta"] {
+        t.dispatch(
+            cx,
+            "cluster_sets::TogglePickedCluster",
+            json!({ "cluster": cluster }),
+        )
+        .unwrap();
+    }
+    t.dispatch(cx, "cluster_sets::OpenPickedClusters", Value::Null)
+        .unwrap();
+    t.wait_for_element(cx, "cluster-set-view").await;
+    let (window, workspace) = (t.window, t.workspace.clone());
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| {
+            let rows = [("default", "web", 1), ("default", "api", 2)];
+            let snapshots = ["kind-alpha", "kind-beta"].map(|cluster| pods_of(cluster, &rows));
+            ws.feed_set_rows_for_test(snapshots.into(), window, cx);
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    t.dispatch(cx, OPEN, Value::Null).unwrap();
+    let view = t
+        .workspace
+        .read_with(cx, |ws, _| ws.set_dashboard())
+        .expect("the dashboard is open");
+    let (alpha, beta) = (FeedId::for_test("alpha"), FeedId::for_test("beta"));
+    view.update(cx, |view, cx| {
+        view.test_feeds = Some(TestFeeds {
+            feeds: [
+                ("kind-alpha".to_owned(), alpha.clone()),
+                ("kind-beta".to_owned(), beta.clone()),
+            ]
+            .into(),
+            lists: [
+                ("kind-alpha".to_owned(), failing_lists("no-such-uid")),
+                ("kind-beta".to_owned(), failing_lists("uid-web")),
+            ]
+            .into(),
+        });
+        let mut quiet = card_with("kind-alpha", CardState::Live, Some(0), "alpha");
+        quiet.feed = Some(alpha);
+        let mut failing = card_with("kind-beta", CardState::Live, Some(1), "beta");
+        failing.feed = Some(beta);
+        view.set_model(assemble(vec![quiet, failing]), cx);
+    });
+    cx.run_until_parked();
+    (t, view)
+}
+
+fn shown_label(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<String> {
+    t.workspace.read_with(cx, |ws, cx| {
+        let list = ws.set_list_for_test()?;
+        list.read(cx).objects_label().map(str::to_owned)
+    })
+}
+
+fn dashboard_open(cx: &mut TestAppContext, t: &TestWorkspace) -> bool {
+    t.workspace
+        .read_with(cx, |ws, _| ws.set_dashboard().is_some())
+}
+
+fn matched(cx: &mut TestAppContext, t: &TestWorkspace) -> usize {
+    t.workspace.read_with(cx, |ws, cx| {
+        ws.set_list_for_test()
+            .map_or(0, |list| list.read(cx).view.matched())
+    })
+}
+
+#[gpui_kit::test]
+async fn a_count_opens_the_combined_list_of_exactly_what_it_counted(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, _view) = open_set(cx, dir.path()).await;
+    t.dispatch(
+        cx,
+        OPEN_PROBLEM,
+        json!({ "category": "failing_pods", "cluster": "kind-beta" }),
+    )
+    .unwrap();
+    cx.run_until_parked();
+    assert!(!dashboard_open(cx, &t));
+    assert!(shown_label(cx, &t).unwrap().contains("kind-beta"));
+    assert_eq!(matched(cx, &t), 1);
+}
+
+#[gpui_kit::test]
+async fn a_card_opens_the_list_of_its_member(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, _view) = open_set(cx, dir.path()).await;
+    t.dispatch(cx, OPEN_MEMBER, json!({ "cluster": "kind-beta" }))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(!dashboard_open(cx, &t));
+    assert_eq!(matched(cx, &t), 2);
+}
+
+#[gpui_kit::test]
+async fn a_card_of_a_replaced_feed_opens_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, view) = open_set(cx, dir.path()).await;
+    view.update(cx, |view, _| {
+        let test = view.test_feeds.as_mut().unwrap();
+        test.feeds
+            .insert("kind-beta".to_owned(), FeedId::for_test("beta"));
+    });
+    for (action, args) in [
+        (
+            OPEN_PROBLEM,
+            json!({ "category": "failing_pods", "cluster": "kind-beta" }),
+        ),
+        (OPEN_MEMBER, json!({ "cluster": "kind-beta" })),
+        (OPEN_PROBLEM, json!({ "category": "failing_pods" })),
+    ] {
+        t.dispatch(cx, action, args).unwrap();
+        cx.run_until_parked();
+        assert!(dashboard_open(cx, &t), "{action} left the dashboard");
+        assert_eq!(shown_label(cx, &t), None);
+    }
+}
+
+#[gpui_kit::test]
+async fn a_read_of_a_gone_feed_is_not_shown(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, view) = open_set(cx, dir.path()).await;
+    let before = view.read_with(cx, |view, _| view.model.clone());
+    let mut late = before.clone();
+    late.cards[0].feed = Some(FeedId::for_test("older"));
+    late.cards[0].shown = "from an older feed".to_owned();
+    let (workspace, shown) = (t.workspace.clone(), view.clone());
+    workspace.update(cx, |ws, cx| ws.finish_set_read(&shown, late, cx));
+    assert_eq!(view.read_with(cx, |view, _| view.model.clone()), before);
+}
+
+#[gpui_kit::test]
+async fn the_navigation_overview_opens_the_set_dashboard(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, _view) = open_set(cx, dir.path()).await;
+    t.dispatch(cx, "cluster_sets::ShowClusterSetList", Value::Null)
+        .unwrap();
+    assert!(!dashboard_open(cx, &t));
+    t.dispatch(cx, "workspace::OpenClusterOverview", Value::Null)
+        .unwrap();
+    assert!(dashboard_open(cx, &t));
+    assert!(t.workspace.read_with(cx, |ws, _| ws.set_is_open_for_test()));
+}
+
+#[gpui_kit::test]
+async fn closing_the_set_closes_its_dashboard(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, _view) = open_set(cx, dir.path()).await;
+    t.dispatch(cx, "cluster_sets::CloseClusterSet", Value::Null)
+        .unwrap();
+    cx.run_until_parked();
+    assert!(!dashboard_open(cx, &t));
+    assert!(!t.workspace.read_with(cx, |ws, _| ws.set_is_open_for_test()));
+}
