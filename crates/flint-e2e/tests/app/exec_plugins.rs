@@ -203,9 +203,10 @@ fn up_04_missing_exec_plugin_is_named_and_retries() -> Result<()> {
     Ok(())
 }
 
-// covers UP-04: a plugin that never answers fails at the connect timeout and is killed with the
-// child it started; the other cluster connects and the UI answers meanwhile, and Retry runs the
-// plugin again.
+// covers UP-04: switching away from a cluster whose plugin hangs ends the attempt and kills the
+// plugin with the child it started, and the other cluster connects and lists. Selected again, the
+// plugin runs anew, fails at the connect timeout while the UI answers, and is killed the same way;
+// Retry runs it once more.
 #[test]
 #[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
 fn up_04_hanging_exec_plugin_times_out_and_retries() -> Result<()> {
@@ -215,28 +216,47 @@ fn up_04_hanging_exec_plugin_times_out_and_retries() -> Result<()> {
     let app = App::launch(AppOptions::new(two.kubeconfig()))?;
     app.wait_for("/kubeconfig/loaded", Equals(true.into()))?;
 
-    let started = Instant::now();
     app.select_cluster(TwoClusters::A)?;
     app.wait_for("/main/view", Equals("connecting".into()))?;
     let starts = until("the plugin to start", || plugin.starts(), |s| s.len() == 1)?;
-    let hung = starts[0];
+    let abandoned = starts[0];
     let children = until("its child to start", || plugin.children(), |c| c.len() == 1)?;
-    let child = children[0];
+    let abandoned_child = children[0];
+    assert!(exists(abandoned), "the plugin is waiting");
+    assert!(exists(abandoned_child), "its child is waiting");
 
-    // The other cluster connects and lists while the plugin hangs, and the UI keeps answering.
+    // A credential that runs a program does not go on in the background.
     connect(&app, TwoClusters::B)?;
     open_live(&app, "pods", 17)?;
-    assert!(app.actions()?["actions"].as_array().is_some());
     let state = app.state()?;
-    assert_eq!(sidebar(&state, TwoClusters::A)["connection"], "connecting");
-    assert!(exists(hung), "the plugin is still waiting");
-    assert!(exists(child), "its child is still waiting");
+    assert_ne!(sidebar(&state, TwoClusters::A)["connection"], "connecting");
+    until(
+        "the plugin to be killed",
+        || exists(abandoned),
+        |alive| !alive,
+    )?;
+    until(
+        "its child to be killed",
+        || exists(abandoned_child),
+        |alive| !alive,
+    )?;
     assert!(two.a.requests().is_empty(), "{:?}", two.a.requests());
 
-    // Back on the hanging cluster: the same attempt runs out.
+    // Back on the hanging cluster: a new attempt, which stays selected until it runs out.
+    let started = Instant::now();
     app.select_cluster(TwoClusters::A)?;
+    let starts = until(
+        "the plugin to run again",
+        || plugin.starts(),
+        |s| s.len() == 2,
+    )?;
+    let hung = starts[1];
+    let children = until("its new child", || plugin.children(), |c| c.len() == 2)?;
+    let child = children[1];
+    assert!(app.actions()?["actions"].as_array().is_some());
     let left = HANG_REPORTED.saturating_sub(started.elapsed());
     let state = app.wait_for_within("/main/view", Equals("failed".into()), left)?;
+    assert!(two.a.requests().is_empty(), "{:?}", two.a.requests());
     let error = main_error(&state);
     assert!(error.contains("1m0s"), "{error}");
     assert!(
@@ -249,11 +269,15 @@ fn up_04_hanging_exec_plugin_times_out_and_retries() -> Result<()> {
     );
     until("the plugin to be killed", || exists(hung), |alive| !alive)?;
     until("its child to be killed", || exists(child), |alive| !alive)?;
-    assert_eq!(plugin.starts(), [hung], "no second run without a retry");
+    assert_eq!(
+        plugin.starts(),
+        [abandoned, hung],
+        "no further run without a retry"
+    );
 
     plugin.answer()?;
     retry_connects(&app)?;
-    assert_eq!(plugin.starts().len(), 2, "Retry ran the plugin again");
+    assert_eq!(plugin.starts().len(), 3, "Retry ran the plugin again");
     assert!(!two.a.requests().is_empty());
     Ok(())
 }
