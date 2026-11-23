@@ -166,5 +166,4 @@ Call `list_resource_kinds` with `cluster: "pod-api"` to see the scoped kinds. Us
 pod, `get_pod_logs` for its logs, and `get_events` with `object_kind: "Pod"` for pod events. A pod read in a
 different namespace should return an out-of-scope error.
 
-The kubeconfig loading, mounted-file authentication, read-only client, and scope checks were verified in source.
-Deployment and authentication in a running pod remain unverified.
+This setup has not yet been tested in a running pod.
