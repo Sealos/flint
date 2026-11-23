@@ -83,8 +83,8 @@ pub(super) struct RunningSet {
     held: HashSet<ClusterId>,
     /// The window its feeds draw in, for a held member that joins later.
     window: AnyWindowHandle,
-    /// Saved members that already pointed elsewhere when the set opened: never admitted.
-    left_out: Vec<ClusterId>,
+    /// Saved members that could not join when the set opened, and why: never admitted.
+    left_out: Vec<(ClusterId, LeftOutReason)>,
     kind: KindId,
     kind_label: String,
     pub(super) list: Entity<CombinedResourceList>,
@@ -167,7 +167,7 @@ struct Opening {
     label: String,
     /// The saved set it opens; `None` for the sidebar's choice, which it then clears.
     set_id: Option<String>,
-    left_out: Vec<ClusterId>,
+    left_out: Vec<(ClusterId, LeftOutReason)>,
 }
 
 /// The name field of the Rename Cluster Set dialog.
@@ -216,15 +216,42 @@ fn rename_problem(saved: &[ClusterSet], id: &str, typed: &str) -> Option<String>
         .then(|| "Another cluster set already goes by this name.".to_owned())
 }
 
-/// Whether `pin`'s context is confirmed to point at another server now. A context that is gone,
-/// has no server or is provisional is not known to have moved, and still refuses the set.
-fn repointed(pin: &ClusterPin, summary: Option<&ClusterSummary>) -> bool {
-    summary.is_some_and(|c| {
-        c.confirmed
-            && c.info.server.as_deref().is_some_and(|server| {
-                !server.trim().is_empty() && !pin.matches(&pin.context, server)
-            })
-    })
+/// Why a member stays out of a set being opened. It never reaches the core, so it gets no
+/// request, watch or plugin, and the saved set keeps it for the next open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeftOutReason {
+    Removed,
+    Paused,
+    Provisional,
+    Changed,
+}
+
+impl LeftOutReason {
+    /// Why the core would not admit `pin` now, if so. Any provisional context counts, even one
+    /// whose reads go on, and the server must be exactly the pinned one, as admission requires.
+    fn of(pin: &ClusterPin, summary: Option<&ClusterSummary>) -> Option<Self> {
+        let Some(summary) = summary else {
+            return Some(Self::Removed);
+        };
+        if summary.paused {
+            Some(Self::Paused)
+        } else if summary.provisional || !summary.confirmed {
+            Some(Self::Provisional)
+        } else if summary.info.server.as_deref() != Some(pin.server.as_str()) {
+            Some(Self::Changed)
+        } else {
+            None
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Removed => "Removed",
+            Self::Paused => "Paused",
+            Self::Provisional => "Provisional",
+            Self::Changed => "Changed",
+        }
+    }
 }
 
 /// Why a row of `pin`'s cluster cannot be opened or acted on, if so. Protection is not here: a
@@ -695,9 +722,9 @@ impl Workspace {
     }
 
     /// Asks the core to run `pins` as the set, and opens their combined list once it has checked
-    /// every one. A member now pointing at another server is left out and marked, and never
-    /// reaches the core. Any other refusal, or too few members left, starts nothing: whatever is
-    /// open stays, and the sidebar says why.
+    /// every one. A member the core would not admit now is left out and marked, and never
+    /// reaches the core. Too few members left starts nothing: whatever is open stays, and the
+    /// sidebar says why.
     fn open_set(
         &mut self,
         label: String,
@@ -707,23 +734,31 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let names = self.cluster_names(cx);
-        let (moved, pins): (Vec<_>, Vec<_>) = pins
-            .into_iter()
-            .partition(|pin| repointed(pin, self.cluster_summary(&pin.context, cx)));
-        let refused = pins.iter().find_map(|pin| {
-            let summary = self.cluster_summary(&pin.context, cx);
-            member_refusal(pin, summary, None, &names.exact(&pin.context))
-        });
-        let too_few = (!moved.is_empty() && pins.len() < MIN_CLUSTER_SET_MEMBERS).then(|| {
-            let shown: Vec<String> = moved.iter().map(|p| names.exact(&p.context)).collect();
-            format!(
-                "{} now points at another server, which leaves too few clusters to open: a set \
-                 runs at least {MIN_CLUSTER_SET_MEMBERS}",
+        let mut left_out = Vec::new();
+        let mut current = Vec::with_capacity(pins.len());
+        for pin in pins {
+            match LeftOutReason::of(&pin, self.cluster_summary(&pin.context, cx)) {
+                Some(reason) => left_out.push((pin.context, reason)),
+                None => current.push(pin),
+            }
+        }
+        let pins = current;
+        if !left_out.is_empty() && pins.len() < MIN_CLUSTER_SET_MEMBERS {
+            let shown: Vec<String> = left_out
+                .iter()
+                .map(|(context, reason)| {
+                    format!(
+                        "{} ({})",
+                        names.exact(context),
+                        reason.label().to_lowercase()
+                    )
+                })
+                .collect();
+            self.sets.error = Some(format!(
+                "{} can't join, which leaves too few clusters to open: a set runs at least \
+                 {MIN_CLUSTER_SET_MEMBERS}",
                 shown.join(", ")
-            )
-        });
-        if let Some(why) = refused.or(too_few) {
-            self.sets.error = Some(why);
+            ));
             cx.notify();
             return;
         }
@@ -737,7 +772,7 @@ impl Workspace {
         let opening = Opening {
             label,
             set_id,
-            left_out: moved.into_iter().map(|pin| pin.context).collect(),
+            left_out,
         };
         let admit = self.model.read(cx).core().admit_running_set(pins);
         self.sets._admit = cx.spawn_in(window, async move |this, cx| {
@@ -1382,8 +1417,8 @@ impl Workspace {
                     .child(text)
                     .test_support()
             }))
-            .children(run.left_out.iter().map(|context| {
-                let text = format!("{}: Changed, left out", names.exact(context));
+            .children(run.left_out.iter().map(|(context, reason)| {
+                let text = format!("{}: {}, left out", names.exact(context), reason.label());
                 div()
                     .id(SharedString::from(format!("set-member-{context}")))
                     .aria_label(text.clone())
