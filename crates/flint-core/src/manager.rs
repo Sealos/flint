@@ -2509,7 +2509,8 @@ impl ClusterManager {
         }
         discarded.extend(old.values().filter_map(|slot| slot.member_attempt));
         // Dropped only when this load ends, and their clients must stop before anything else.
-        for slot in old.values() {
+        for slot in old.values_mut() {
+            slot.telemetry = None;
             slot.access.revoke();
         }
         for attempt in discarded {
@@ -2527,6 +2528,8 @@ impl ClusterManager {
             self.members.remove(id);
             self.schedule.dequeue(id);
         }
+        // Before anything reports this load, so no context is shown paused with a feed running.
+        self.stop_unwanted_telemetry();
         self.arm_set_ticker();
         self.sync_roles();
         self.drop_spent_connections();
@@ -5083,6 +5086,30 @@ mod tests {
         feed
     }
 
+    #[test]
+    fn only_a_user_with_a_token_file_counts_as_reading_one() {
+        let config = kube::config::Kubeconfig::from_yaml(
+            "
+apiVersion: v1
+kind: Config
+contexts:
+- name: file
+  context: {cluster: c, user: with-file}
+- name: inline
+  context: {cluster: c, user: with-token}
+users:
+- name: with-file
+  user: {tokenFile: /nonexistent/token}
+- name: with-token
+  user: {token: abc}
+",
+        )
+        .unwrap();
+        assert!(telemetry::reads_token_file(&config, "file"));
+        assert!(!telemetry::reads_token_file(&config, "inline"));
+        assert!(!telemetry::reads_token_file(&config, "missing"));
+    }
+
     #[tokio::test]
     async fn a_feed_runs_only_for_a_wanted_connected_cluster() {
         let dir = tempfile::tempdir().unwrap();
@@ -5124,6 +5151,9 @@ mod tests {
 
             rewrite_file(&mut manager, &first, UNREADABLE).await;
             assert!(manager.paused("dev"));
+            // The load itself stopped it, ahead of the loop's next sync.
+            assert!(manager.cluster("dev").unwrap().telemetry.is_none());
+            assert!(manager.telemetry.get("dev").is_none());
             assert!(!dev_has_feed(&mut manager));
         }
     }
@@ -5139,7 +5169,6 @@ mod tests {
 
         rewrite(&mut manager, dir.path(), NO_CONTEXTS).await;
         assert!(manager.cluster("dev").is_none());
-        manager.sync_telemetry();
         assert!(manager.telemetry.get("dev").is_none());
         assert!(manager.telemetry.all().is_empty());
     }

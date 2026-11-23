@@ -15,11 +15,14 @@ use tokio::sync::{Semaphore, watch};
 
 use super::feed::{PAGE_SIZE, failure_of, timed_out};
 use super::objects::MAX_OBJECTS_PER_KIND;
-use super::{CheckFailure, FailureCause, TelemetryTiming};
+use super::usage::{Bounded, read_pods};
+use super::{CheckFailure, FailureCause, RequestGate, TelemetryTiming};
 use crate::cluster::{SafeErrorText, Target};
-use crate::metrics::{
-    MetricsError, MetricsResult, NodeMetrics, PodMetrics, Usage, fetch_pod_metrics,
-};
+use crate::metrics::{MetricsError, MetricsResult, NodeMetrics, PodMetrics, Usage};
+
+/// One poll of a list may take this many times [`TelemetryTiming::list_timeout`], waiting for its
+/// turn included, however many pages the server answers with.
+const POLL_BUDGET_PAGES: u32 = 4;
 
 /// A list read apart from the watched kinds.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -127,6 +130,7 @@ fn trim_claim(claim: &mut PersistentVolumeClaim) {
 pub(super) struct SideFeed {
     pub(super) client: Client,
     pub(super) limiter: Arc<Semaphore>,
+    pub(super) requests: RequestGate,
     pub(super) target: Target,
     pub(super) timing: TelemetryTiming,
     pub(super) reads: watch::Sender<SideReads>,
@@ -151,8 +155,10 @@ impl SideFeed {
 
     pub(super) async fn run_pod_usage(self) {
         loop {
-            let result = fetch_pod_metrics(&self.client, None).await;
-            let next = SideReads::pod_usage_of(&result);
+            let next = match read_pods(&self.client, &self.requests).await {
+                Bounded::Listed(result) => SideReads::pod_usage_of(&result),
+                Bounded::TooLarge => UsageRead::TooLarge,
+            };
             publish(&self.reads, |reads| &mut reads.pod_usage, next);
             tokio::time::sleep(self.timing.metrics_every).await;
         }
@@ -174,8 +180,24 @@ impl SideFeed {
         }
     }
 
+    /// [`Self::read_pages`] within the poll's budget, which also covers waiting for a slot.
+    async fn read<K>(&self, api: &Api<K>, params: ListParams, trim: fn(&mut K)) -> SideRead<K>
+    where
+        K: Clone + DeserializeOwned + std::fmt::Debug,
+    {
+        let budget = self.timing.list_timeout.saturating_mul(POLL_BUDGET_PAGES);
+        tokio::time::timeout(budget, self.read_pages(api, params, trim))
+            .await
+            .unwrap_or_else(|_| SideRead::Failed(timed_out()))
+    }
+
     /// Every page of a list, trimmed. All or nothing: a list cut short is no answer.
-    async fn read<K>(&self, api: &Api<K>, mut params: ListParams, trim: fn(&mut K)) -> SideRead<K>
+    async fn read_pages<K>(
+        &self,
+        api: &Api<K>,
+        mut params: ListParams,
+        trim: fn(&mut K),
+    ) -> SideRead<K>
     where
         K: Clone + DeserializeOwned + std::fmt::Debug,
     {
@@ -187,8 +209,8 @@ impl SideFeed {
         };
         let mut items = Vec::new();
         loop {
-            let page = match tokio::time::timeout(self.timing.list_timeout, api.list(&params)).await
-            {
+            let listing = self.requests.run(api.list(&params));
+            let page = match tokio::time::timeout(self.timing.list_timeout, listing).await {
                 Ok(Ok(page)) => page,
                 Ok(Err(err)) => return SideRead::Failed(failure_of(&err, &self.target)),
                 Err(_) => return SideRead::Failed(timed_out()),
@@ -224,6 +246,8 @@ fn publish<T: PartialEq>(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::metrics::MetricsList;
 
@@ -232,6 +256,52 @@ mod tests {
             cause: FailureCause::Forbidden,
             detail: SafeErrorText::reduced("forbidden"),
         }
+    }
+
+    /// A feed on a server that answers every list with an empty page and another token.
+    #[allow(clippy::disallowed_methods)] // No cluster and no credentials: a stub transport.
+    fn feed_on_endless_pages(list_timeout: Duration) -> (SideFeed, watch::Receiver<SideReads>) {
+        let service = tower::service_fn(|_: http::Request<kube::client::Body>| async {
+            let page = r#"{"apiVersion":"v1","kind":"EventList",
+                "metadata":{"continue":"more"},"items":[]}"#;
+            Ok::<_, std::convert::Infallible>(
+                http::Response::builder()
+                    .header("content-type", "application/json")
+                    .body(kube::client::Body::from(page.as_bytes().to_vec()))
+                    .unwrap(),
+            )
+        });
+        let (reads, seen) = watch::channel(SideReads::default());
+        let feed = SideFeed {
+            client: Client::new(service, "default"),
+            limiter: Arc::new(Semaphore::new(1)),
+            requests: RequestGate::default(),
+            target: Target::default(),
+            timing: TelemetryTiming {
+                list_timeout,
+                ..TelemetryTiming::default()
+            },
+            reads,
+        };
+        (feed, seen)
+    }
+
+    #[tokio::test]
+    async fn endless_empty_pages_end_in_a_failure_and_free_the_slot() {
+        let (feed, _seen) = feed_on_endless_pages(Duration::from_millis(10));
+        let api = Api::<Event>::all(feed.client.clone());
+        let read = feed.read(&api, ListParams::default(), trim_event).await;
+        assert_eq!(read, SideRead::Failed(timed_out()));
+        assert_eq!(feed.limiter.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_slot_counts_against_the_budget() {
+        let (feed, _seen) = feed_on_endless_pages(Duration::from_millis(5));
+        let _held = feed.limiter.clone().acquire_owned().await.unwrap();
+        let api = Api::<Event>::all(feed.client.clone());
+        let read = feed.read(&api, ListParams::default(), trim_event).await;
+        assert_eq!(read, SideRead::Failed(timed_out()));
     }
 
     #[test]

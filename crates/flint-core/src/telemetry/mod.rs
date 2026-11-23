@@ -32,7 +32,9 @@ mod metrics;
 mod objects;
 mod problems;
 mod side;
+mod usage;
 
+use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -40,7 +42,7 @@ use jiff::Timestamp;
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{Node, Pod};
-use tokio::sync::{Notify, Semaphore, mpsc, watch};
+use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinSet;
 
 use crate::alerts::ClusterSnapshot;
@@ -61,6 +63,34 @@ pub use side::{PodKey, SideRead, SideReads, UsageRead};
 
 /// Lists running at once per cluster, so that starting stays polite to the API server.
 const CONCURRENT_LISTS: usize = 3;
+
+/// Telemetry requests running at once across clusters whose credential is a token file. The
+/// client rereads that file synchronously, so a stalled mount blocks the worker running the
+/// request, and this leaves the core's other workers free.
+const CONCURRENT_TOKEN_FILE_REQUESTS: usize = 2;
+
+/// Limits the requests of feeds whose client can block a worker. Open for any other feed, so that
+/// a slow cluster does not hold up the rest.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RequestGate(Option<Arc<Semaphore>>);
+
+impl RequestGate {
+    /// The limit that the token-file feeds of one runtime share.
+    pub(crate) fn token_file_limit() -> Self {
+        Self(Some(Arc::new(Semaphore::new(
+            CONCURRENT_TOKEN_FILE_REQUESTS,
+        ))))
+    }
+
+    /// Runs `request` once there is room. Time spent waiting counts against a caller's timeout.
+    async fn run<F: Future>(&self, request: F) -> F::Output {
+        let _permit = match &self.0 {
+            Some(limit) => limit.acquire().await.ok(),
+            None => None,
+        };
+        request.await
+    }
+}
 
 /// A kind of object the feed watches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -279,20 +309,20 @@ pub struct Telemetry {
     latest: watch::Receiver<Arc<TelemetrySnapshot>>,
     side: watch::Receiver<SideReads>,
     tasks: JoinSet<()>,
-    /// Closes once the metrics poll, which runs in a task of its own, has ended.
-    poll_ended: mpsc::Receiver<()>,
 }
 
 impl Telemetry {
     /// Starts the feed of `cluster` on the read client of a gated connection's `clients`. Must
     /// run inside a tokio runtime. This cluster's series are removed from `trends` when the feed
-    /// stops, so a feed that replaces this one needs a store of its own.
+    /// stops, so a feed that replaces this one needs a store of its own. Every request goes
+    /// through `requests`.
     pub(crate) fn start(
         cluster: Arc<str>,
         clients: &ClusterClients,
         target: Target,
         trends: Arc<Mutex<TrendStore>>,
         timing: TelemetryTiming,
+        requests: RequestGate,
     ) -> Self {
         let client = clients.read.clone();
         let shared = Arc::new(Shared {
@@ -305,7 +335,6 @@ impl Telemetry {
             Timestamp::now(),
         ));
         let (sender, latest) = watch::channel(first);
-        let (poll_running, poll_ended) = mpsc::channel(1);
         let (reads, side) = watch::channel(SideReads::default());
         let limiter = Arc::new(Semaphore::new(CONCURRENT_LISTS));
 
@@ -313,6 +342,7 @@ impl Telemetry {
         let polls = SideFeed {
             client: client.clone(),
             limiter: Arc::clone(&limiter),
+            requests: requests.clone(),
             target: target.clone(),
             timing,
             reads: reads.clone(),
@@ -324,6 +354,7 @@ impl Telemetry {
             client: client.clone(),
             shared: Arc::clone(&shared),
             limiter,
+            requests: requests.clone(),
             target,
             timing,
         };
@@ -337,10 +368,10 @@ impl Telemetry {
         tasks.spawn(metrics::run(
             Arc::clone(&cluster),
             client,
+            requests,
             trends,
             Arc::clone(&shared),
             timing.metrics_every,
-            poll_running,
             reads,
         ));
         tasks.spawn(problems::run(cluster, shared, sender, timing));
@@ -348,7 +379,6 @@ impl Telemetry {
             latest,
             side,
             tasks,
-            poll_ended,
         }
     }
 
@@ -387,8 +417,6 @@ impl Telemetry {
     /// Stops every task and waits until they have ended.
     pub async fn stop(mut self) {
         self.tasks.shutdown().await;
-        // Nothing is ever sent: this returns when the last holder has gone.
-        let _ = self.poll_ended.recv().await;
     }
 }
 
@@ -410,5 +438,6 @@ pub async fn start_for_tests(
         target,
         trends,
         timing,
+        RequestGate::default(),
     ))
 }

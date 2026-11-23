@@ -9,6 +9,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use kube::config::Kubeconfig;
+
 use super::{Cluster, ClusterManager};
 use crate::cluster;
 use crate::connection::policy::Role;
@@ -57,6 +59,18 @@ impl ClusterManager {
 
     /// Stops every feed no longer wanted or on an older connection, and starts those missing.
     pub(super) fn sync_telemetry(&mut self) {
+        self.stop_unwanted_telemetry();
+        for index in 0..self.clusters.len() {
+            let id = self.clusters[index].info.name.clone();
+            if self.clusters[index].telemetry.is_none() && self.wants_telemetry(&id) {
+                self.start_telemetry(index, &id);
+            }
+        }
+    }
+
+    /// Stops every feed no longer wanted or on an older connection and takes it off the board.
+    /// Starts nothing, so a load can call it before saying what changed.
+    pub(super) fn stop_unwanted_telemetry(&mut self) {
         for index in 0..self.clusters.len() {
             let id = self.clusters[index].info.name.clone();
             let wanted = self.wants_telemetry(&id);
@@ -67,9 +81,6 @@ impl ClusterManager {
                 .is_some_and(|feed| !wanted || feed.attempt != slot.attempt)
             {
                 slot.telemetry = None;
-            }
-            if wanted && slot.telemetry.is_none() {
-                self.start_telemetry(index, &id);
             }
         }
         let running: Vec<&str> = self
@@ -84,17 +95,40 @@ impl ClusterManager {
     fn start_telemetry(&mut self, index: usize, id: &str) {
         let target = cluster::Target::of(&self.kubeconfig.merged, id);
         let timing = self.telemetry_timing;
+        let requests = self
+            .telemetry
+            .request_gate(reads_token_file(&self.kubeconfig.merged, id));
         let slot: &mut Cluster = &mut self.clusters[index];
         let Some(clients) = slot.client.as_ref() else {
             return;
         };
         // Its own store, so a stopping feed clearing its series can't touch its successor's.
         let trends = Arc::new(Mutex::new(TrendStore::new()));
-        let mut feed = Telemetry::start(id.into(), clients, target, Arc::clone(&trends), timing);
+        let store = Arc::clone(&trends);
+        let mut feed = Telemetry::start(id.into(), clients, target, store, timing, requests);
         self.telemetry.publish(id, &mut feed, trends);
         slot.telemetry = Some(SlotFeed {
             attempt: slot.attempt,
             _feed: feed,
         });
     }
+}
+
+/// Whether `context`'s user names a token file, which the client rereads as it expires.
+pub(super) fn reads_token_file(config: &Kubeconfig, context: &str) -> bool {
+    let user = config
+        .contexts
+        .iter()
+        .find(|named| named.name == context)
+        .and_then(|named| named.context.as_ref())
+        .and_then(|context| context.user.as_deref());
+    user.is_some_and(|user| {
+        config.auth_infos.iter().any(|named| {
+            named.name == user
+                && named
+                    .auth_info
+                    .as_ref()
+                    .is_some_and(|auth| auth.token_file.is_some())
+        })
+    })
 }
