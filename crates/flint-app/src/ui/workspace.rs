@@ -951,11 +951,20 @@ impl Workspace {
                 .cluster_summary(&cluster, cx)
                 .and_then(|c| c.info.server.clone()),
         };
+        let (connection, unsettled) =
+            self.cluster_summary(&cluster, cx)
+                .map_or((None, false), |c| {
+                    (
+                        Some((c.generation, c.definition)),
+                        c.provisional || c.paused,
+                    )
+                });
         detail.update(cx, |d, cx| {
             d.set_sessions_blocked(why, cx);
             d.set_protected(protected, label, cx);
             d.set_row_writes_paused(writes_paused, cx);
             d.set_server(server);
+            d.set_access_connection(connection, unsettled, cx);
         });
     }
 
