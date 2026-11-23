@@ -30,7 +30,7 @@ use flint_core::handle::{ActivationRefused, ClusterSummary, ConnectionState, Rea
 use flint_core::problems::ProblemKind;
 use flint_core::read::DiscoveredKinds;
 use flint_core::settings::{Settings, WatchMode, load_settings};
-use flint_core::telemetry::TelemetrySnapshot;
+use flint_core::telemetry::{ClusterTelemetry, FeedDiscovery, KeptCoverage, TelemetrySnapshot};
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -67,11 +67,10 @@ const NOTE_TIME: Duration = Duration::from_secs(4);
 
 /// What the setting promises, shown beside it.
 pub const COVERAGE: &str =
-    "Clusters on Live: all kinds or Keep Watching are checked in the background.";
+    "Checks connected clusters with active watches and clusters actively kept watching.";
 
 /// What it does not cover.
-pub const NOT_COVERED: &str =
-    "Other clusters on Live: open views only have no background detection.";
+pub const NOT_COVERED: &str = "Other clusters have no background detection.";
 
 /// Every kind of problem.
 const ALL_KINDS: [ProblemKind; 6] = ProblemKind::ALL;
@@ -232,6 +231,11 @@ pub enum Reading<'a> {
         snapshot: &'a TelemetrySnapshot,
         discovery: Option<&'a ClusterDiscovery>,
     },
+    /// Its feed runs on a kept-watching connection, whose own discovery vouches for its kinds.
+    Kept {
+        snapshot: &'a TelemetrySnapshot,
+        coverage: KeptCoverage,
+    },
     /// It should be readable and is not: its connection failed or it is paused.
     Lost,
     /// Flint is not keeping it watched.
@@ -264,6 +268,32 @@ pub fn reading<'a>(
         | ConnectionState::Failed(_)
         | ConnectionState::AwaitingConfirmation => Reading::Lost,
         ConnectionState::Connected(_) | ConnectionState::Disconnected => Reading::NotWatched,
+    }
+}
+
+/// [`reading`] of `summary` from `feed`, if that feed was started for the slot `summary` describes.
+/// A feed of an earlier slot can still be listed when a new summary arrives, and what it read is
+/// about another server.
+fn feed_reading<'a>(
+    summary: &ClusterSummary,
+    mode: WatchMode,
+    feed: Option<&'a ClusterTelemetry>,
+    slot: Option<&'a ClusterDiscovery>,
+) -> Reading<'a> {
+    let feed = feed.filter(|feed| feed.generation == summary.generation);
+    let snapshot = feed.map(|feed| &*feed.snapshot);
+    match (reading(summary, mode, snapshot, slot), feed) {
+        (
+            Reading::Feed { snapshot, .. },
+            Some(ClusterTelemetry {
+                discovery: FeedDiscovery::Kept(coverage),
+                ..
+            }),
+        ) => Reading::Kept {
+            snapshot,
+            coverage: *coverage,
+        },
+        (reading, _) => reading,
     }
 }
 
@@ -482,13 +512,15 @@ impl AlertTracker {
                     self.engine
                         .observe(&input.cluster, now, ClusterSnapshot::Unavailable)
                 }
-                Reading::Feed {
-                    snapshot,
-                    discovery,
-                } => {
+                Reading::Feed { snapshot, .. } | Reading::Kept { snapshot, .. } => {
                     self.unwatched_since.remove(&input.cluster);
+                    let out_of_scope = match input.reading {
+                        Reading::Kept { coverage, .. } => coverage.unchecked(),
+                        Reading::Feed { discovery, .. } => out_of_scope_kinds(discovery),
+                        _ => ALL_KINDS.to_vec(),
+                    };
                     let mut unchecked = snapshot.unchecked.clone();
-                    for kind in out_of_scope_kinds(discovery) {
+                    for kind in out_of_scope {
                         if !unchecked.contains(&kind) {
                             unchecked.push(kind);
                         }
@@ -836,19 +868,17 @@ impl AlertCenter {
             .map(|((summary, feed), label)| {
                 let id = summary.info.name.as_str();
                 let slot = verified_discovery(model.discovery.get(id), summary.generation);
-                let discovery = feed.as_ref().map_or(slot, |f| f.discovery.or_slot(slot));
-                let snapshot = feed.as_ref().map(|feed| &*feed.snapshot);
                 let on = model.settings.alerts_on(id, summary.info.server.as_deref());
                 TrackerInput {
                     cluster: Arc::from(id),
                     origin: AlertOrigin::of(summary),
                     label,
                     reading: if on {
-                        reading(
+                        feed_reading(
                             summary,
                             model.settings.alert_mode_for(id),
-                            snapshot,
-                            discovery,
+                            feed.as_ref(),
+                            slot,
                         )
                     } else {
                         Reading::Muted

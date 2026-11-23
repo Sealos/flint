@@ -559,6 +559,63 @@ fn pass_until(
 
 // covers #210
 #[gpui_kit::test]
+async fn a_feed_of_an_earlier_slot_is_not_read_for_the_new_one(cx: &mut TestAppContext) {
+    let a = FakeApiServer::start_blocking(Options::default()).unwrap();
+    let b = FakeApiServer::start_blocking(Options::default()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace_with(cx, dir.path(), |dir, _| {
+        let path = dir.join("kubeconfig");
+        let servers = [(&a, "a", Some("demo")), (&b, "b", Some("demo"))];
+        write_kubeconfigs(&path, &servers).unwrap();
+        let settings = format!(
+            "desktop_notifications = true\n\n[[watched_clusters]]\ncontext = \"b\"\n\
+             server = \"{}\"\n",
+            b.url()
+        );
+        std::fs::write(dir.join(SETTINGS_FILE), settings).unwrap();
+        vec![path]
+    })
+    .await;
+    let deadline = std::time::Instant::now() + WAIT;
+    let feed = loop {
+        cx.run_until_parked();
+        if let Some(feed) = t
+            .model
+            .read_with(cx, |model, _| model.core().telemetry("b"))
+        {
+            break feed;
+        }
+        assert!(std::time::Instant::now() < deadline, "no feed");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let mut summary = t.model.read_with(cx, |model, _| {
+        model
+            .clusters
+            .iter()
+            .find(|cluster| cluster.info.name == "b")
+            .unwrap()
+            .clone()
+    });
+    assert_eq!(feed.generation, summary.generation);
+    assert!(matches!(
+        super::feed_reading(&summary, WatchMode::All, Some(&feed), None),
+        Reading::Kept { .. }
+    ));
+
+    summary.generation += 1;
+    let reading = super::feed_reading(&summary, WatchMode::All, Some(&feed), None);
+    assert!(matches!(reading, Reading::NotWatched), "{reading:?}");
+    let mut tracker = tracker();
+    assert!(
+        tracker
+            .observe(&[input(&summary, reading)], at(0))
+            .is_empty()
+    );
+    assert!(!tracker.checked.contains("b"), "it took a baseline");
+}
+
+// covers #210
+#[gpui_kit::test]
 async fn a_cluster_kept_watching_from_launch_alerts_before_it_is_selected(cx: &mut TestAppContext) {
     let a = FakeApiServer::start_blocking(Options::default()).unwrap();
     let b = FakeApiServer::start_blocking(Options::default()).unwrap();

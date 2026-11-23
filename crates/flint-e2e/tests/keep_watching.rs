@@ -10,6 +10,7 @@ use flint_core::handle::{Command, Event};
 use flint_core::keep_watching::{
     BackgroundSignIn, KeepWatching, MAX_WATCHED_CLUSTERS, PluginOffer, WatchedCluster,
 };
+use flint_core::problems::ProblemKind;
 use flint_core::telemetry::{Availability, FeedDiscovery};
 use flint_core::{Settings, settings};
 use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, Verb, WatchStep};
@@ -558,6 +559,20 @@ fn kept_discovery(f: &Fixture) -> Option<FeedDiscovery> {
     f.core.handle.telemetry("b").map(|feed| feed.discovery)
 }
 
+fn vouches_for_all(f: &Fixture) -> bool {
+    matches!(
+        kept_discovery(f),
+        Some(FeedDiscovery::Kept(found)) if found.unchecked().is_empty()
+    )
+}
+
+fn vouches_for_none(f: &Fixture) -> bool {
+    matches!(
+        kept_discovery(f),
+        Some(FeedDiscovery::Kept(found)) if found.unchecked().len() == ProblemKind::ALL.len()
+    )
+}
+
 fn discovery_requests(server: &FakeApiServer) -> usize {
     server
         .requests()
@@ -573,17 +588,12 @@ async fn a_kept_connection_discovers_on_the_token_it_holds() {
     f.turn_on().await;
     f.until_feed().await;
     tokio::time::timeout(WAIT, async {
-        while !matches!(kept_discovery(&f), Some(FeedDiscovery::Kept(Some(_)))) {
+        while !vouches_for_all(&f) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("discovery should have confirmed its groups");
-    let Some(FeedDiscovery::Kept(Some(found))) = kept_discovery(&f) else {
-        panic!("no discovery");
-    };
-    assert!(found.kinds.is_empty(), "only what alerts need is retained");
-    assert!(found.incomplete_groups.is_empty());
+    .expect("discovery should have confirmed its resources");
     settle().await;
     assert_eq!(run_lines(&f.runs).len(), 1, "discovery ran no plugin");
     assert!(f.b.writes().is_empty(), "{:?}", f.b.writes());
@@ -607,10 +617,7 @@ async fn a_token_that_is_due_is_not_refreshed_for_discovery() {
         0,
         "nothing was sent without a token"
     );
-    assert!(matches!(
-        kept_discovery(&f),
-        Some(FeedDiscovery::Kept(None))
-    ));
+    assert!(vouches_for_none(&f));
     assert_eq!(
         f.status().await,
         KeepWatching::Watching,
@@ -633,10 +640,7 @@ async fn turning_it_off_ends_kept_discovery() {
     })
     .await
     .expect("discovery should have started");
-    assert!(matches!(
-        kept_discovery(&f),
-        Some(FeedDiscovery::Kept(None))
-    ));
+    assert!(vouches_for_none(&f));
     f.core
         .handle
         .send(Command::RevokeBackgroundSignIn("b".to_owned()));

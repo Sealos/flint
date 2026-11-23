@@ -61,7 +61,8 @@ pub(crate) use board::TelemetryBoard;
 pub use board::{ClusterTelemetry, FeedDiscovery, TelemetryUpdates};
 pub use capacity::{Allocatable, ClusterCapacity, Inventory, NodeCapacity, Reserved};
 use feed::KindFeed;
-pub(crate) use kept_discovery::KeptDiscovery;
+pub use kept_discovery::KeptCoverage;
+pub(crate) use kept_discovery::{DiscoveryPace, KeptDiscovery};
 pub use objects::MAX_OBJECTS_PER_KIND;
 use objects::Stores;
 use side::SideFeed;
@@ -446,7 +447,7 @@ impl Telemetry {
     fn follow_discovery(
         &mut self,
         discovery: KeptDiscovery,
-        found: watch::Sender<Option<Arc<crate::discovery::ClusterDiscovery>>>,
+        found: watch::Sender<KeptCoverage>,
         version: watch::Sender<u64>,
     ) {
         self.tasks.spawn(discovery.follow(found, version));

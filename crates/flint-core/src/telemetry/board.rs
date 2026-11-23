@@ -9,11 +9,10 @@ use jiff::Timestamp;
 use tokio::sync::watch;
 
 use super::{
-    Availability, CheckFailure, FailureCause, KeptDiscovery, RequestGate, SideReads, Telemetry,
-    TelemetrySnapshot,
+    Availability, CheckFailure, FailureCause, KeptCoverage, KeptDiscovery, RequestGate, SideReads,
+    Telemetry, TelemetrySnapshot,
 };
 use crate::cluster::{ClusterId, SafeErrorText};
-use crate::discovery::ClusterDiscovery;
 use crate::metrics_trend::TrendStore;
 
 /// `good` as last values: readable, its age said in the status, and worth no alert change, since
@@ -41,30 +40,18 @@ pub struct ClusterTelemetry {
     pub reads: SideReads,
     /// Where the catalog that may vouch for this feed's kinds comes from.
     pub discovery: FeedDiscovery,
+    /// The slot this feed was started for. A summary of any other slot is not about this feed.
+    pub generation: u64,
     trends: Arc<Mutex<TrendStore>>,
 }
 
 /// The discovery that belongs with a feed.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum FeedDiscovery {
     /// The feed runs on the cluster's slot, whose discovery applies.
     Slot,
     /// The feed runs on a kept-watching connection, and only that connection's discovery applies.
-    /// Its `kinds` are empty: it says only which groups problems are read from are incomplete.
-    Kept(Option<Arc<ClusterDiscovery>>),
-}
-
-impl FeedDiscovery {
-    /// The catalog for this feed, given what the cluster's slot has.
-    pub fn or_slot<'a>(
-        &'a self,
-        slot: Option<&'a ClusterDiscovery>,
-    ) -> Option<&'a ClusterDiscovery> {
-        match self {
-            Self::Slot => slot,
-            Self::Kept(found) => found.as_deref(),
-        }
-    }
+    Kept(KeptCoverage),
 }
 
 impl ClusterTelemetry {
@@ -96,7 +83,9 @@ struct Entry {
     /// The feed has stopped: its last values stay, in memory only, until the entry is removed.
     held: Option<SideReads>,
     /// A kept feed's own discovery. `None` for a feed on a slot.
-    kept: Option<watch::Receiver<Option<Arc<ClusterDiscovery>>>>,
+    kept: Option<watch::Receiver<KeptCoverage>>,
+    /// The slot this feed was started for.
+    generation: u64,
 }
 
 impl Entry {
@@ -104,8 +93,8 @@ impl Entry {
     fn discovery(&self) -> FeedDiscovery {
         match &self.kept {
             None => FeedDiscovery::Slot,
-            Some(_) if self.held.is_some() => FeedDiscovery::Kept(None),
-            Some(found) => FeedDiscovery::Kept(found.borrow().clone()),
+            Some(_) if self.held.is_some() => FeedDiscovery::Kept(KeptCoverage::NONE),
+            Some(found) => FeedDiscovery::Kept(*found.borrow()),
         }
     }
 
@@ -122,6 +111,7 @@ impl Entry {
             snapshot,
             reads,
             discovery: self.discovery(),
+            generation: self.generation,
             trends: Arc::clone(&self.trends),
         };
         if let Some(reads) = &self.held {
@@ -178,32 +168,35 @@ impl TelemetryBoard {
     pub(crate) fn publish(
         &self,
         cluster: &str,
+        generation: u64,
         feed: &mut Telemetry,
         trends: Arc<Mutex<TrendStore>>,
     ) {
-        self.list(cluster, feed, trends, None);
+        self.list(cluster, generation, feed, trends, None);
     }
 
     /// Lists a kept connection's `feed`, which runs `discovery` for as long as it runs.
     pub(crate) fn publish_kept(
         &self,
         cluster: &str,
+        generation: u64,
         feed: &mut Telemetry,
         trends: Arc<Mutex<TrendStore>>,
         discovery: KeptDiscovery,
     ) {
         // A channel per feed: a result of an earlier connection has nowhere to land.
-        let (found, kept) = watch::channel(None);
+        let (found, kept) = watch::channel(KeptCoverage::NONE);
         feed.follow_discovery(discovery, found, self.version.clone());
-        self.list(cluster, feed, trends, Some(kept));
+        self.list(cluster, generation, feed, trends, Some(kept));
     }
 
     fn list(
         &self,
         cluster: &str,
+        generation: u64,
         feed: &mut Telemetry,
         trends: Arc<Mutex<TrendStore>>,
-        kept: Option<watch::Receiver<Option<Arc<ClusterDiscovery>>>>,
+        kept: Option<watch::Receiver<KeptCoverage>>,
     ) {
         let last_good = Arc::default();
         feed.notify_changes(self.version.clone(), Arc::clone(&last_good));
@@ -214,6 +207,7 @@ impl TelemetryBoard {
             last_good,
             held: None,
             kept,
+            generation,
         };
         self.feeds().insert(cluster.to_owned(), entry);
         self.bump();
