@@ -46,6 +46,9 @@ pub enum Command {
     /// The registered actions, with whether each is available now: for finding out why a
     /// dispatch says `not_available`.
     Actions,
+    /// Quit, unless a dialog is open: answers with the open dialog's title (`null` when none),
+    /// read in the same step that quits, so no dialog can close unseen between the two.
+    QuitUnlessDialog,
 }
 
 /// How long `wait_for` waits by default, and at most.
@@ -284,6 +287,10 @@ fn command(cmd: &str, args: Value) -> Result<Command, Error> {
         "actions" => {
             no_args(cmd, &args)?;
             Command::Actions
+        }
+        "quit_unless_dialog" => {
+            no_args(cmd, &args)?;
+            Command::QuitUnlessDialog
         }
         "wait_for" => {
             let (predicate, timeout_ms) = wait_args(args)?;
