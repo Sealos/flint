@@ -349,8 +349,8 @@ pub struct ExposeToAi {
     pub cluster: String,
 }
 
-/// Turn keeping a cluster watched in the background on or off. Turning it on for a cluster whose
-/// sign-in runs a command opens a confirmation naming that command.
+/// Turn keeping a cluster watched in the background on or off. This never lets a sign-in command
+/// run: that is the cluster's own toggle, which is deliberately not a registered action.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
 #[action(namespace = workspace, no_json)]
 #[serde(deny_unknown_fields)]

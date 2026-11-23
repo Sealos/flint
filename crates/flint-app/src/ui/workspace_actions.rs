@@ -1049,41 +1049,25 @@ impl Workspace {
         }
     }
 
-    /// Turns keeping a cluster watched off, or on. A sign-in that runs a command is confirmed
-    /// first, naming it, and the confirmation is bound to the definition it showed. The core
-    /// words any refusal, the limit on watched clusters included.
+    /// Turns keeping a cluster watched off, or on. This never lets a sign-in command run, which
+    /// takes the cluster's background sign-in toggle. The core words any refusal.
     fn toggle_keep_watching(
         &mut self,
         action: &ToggleKeepWatching,
-        window: &mut Window,
+        _: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let cluster = action.cluster.clone();
         let Some(view) = self.model.read(cx).keep_watching(&cluster).cloned() else {
             return;
         };
-        if !keep_watching::turns_on(view.status) {
+        if !keep_watching::turns_on(view.status, view.sign_in) {
             self.model
                 .update(cx, |m, _| m.set_keep_watching(cluster, None));
-            return;
-        }
-        let Some(definition) = view.definition else {
-            return;
-        };
-        let server = self
-            .cluster_summary(&cluster, cx)
-            .and_then(|summary| summary.info.server.clone());
-        let (Some(command), Some(server), None) = (&view.command, server, &view.refusal) else {
+        } else if let Some(definition) = view.definition {
             self.model
                 .update(cx, |m, _| m.set_keep_watching(cluster, Some(definition)));
-            return;
-        };
-        let dialog = keep_watching::plugin_dialog(&cluster, &server, command);
-        let model = self.model.clone();
-        confirm::open(window, cx, dialog, move |_, cx| {
-            let cluster = cluster.clone();
-            model.update(cx, |m, _| m.set_keep_watching(cluster, Some(definition)));
-        });
+        }
     }
 
     /// Opens the confirmation naming the context and its server (and the previous server, when

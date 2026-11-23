@@ -19,6 +19,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::resizable::{HandleEdge, resize_handle};
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
@@ -65,7 +66,7 @@ use super::theme;
 use super::ui_state::{self, UiState};
 use super::write_confirm;
 use flint_core::display::{self, ClusterNames};
-use flint_core::keep_watching::KeepWatching;
+use flint_core::keep_watching::{BackgroundSignIn, KeepWatching};
 use flint_core::settings::ClusterTag;
 
 /// The height of the main area's header and the list's toolbar.
@@ -1544,7 +1545,9 @@ impl Workspace {
             let ring = cursor.as_deref() == Some(cluster.info.name.as_str());
             let keep = model
                 .keep_watching(&cluster.info.name)
-                .map_or(KeepWatching::Off, |view| view.status);
+                .map_or((KeepWatching::Off, BackgroundSignIn::NotNeeded), |view| {
+                    (view.status, view.sign_in)
+                });
             list = list.child(self.render_cluster_row(
                 cluster,
                 (
@@ -1622,7 +1625,12 @@ impl Workspace {
         (is_active, ring, presence, tooltip): (bool, bool, Presence<'_>, String),
         (exposure, ai_scope): (AiExposureState, Option<AiScope>),
         (protection, trust, writes_paused): (Protection, TrustState, bool),
-        (settings_ok, names, tag, keep): (bool, &ClusterNames, Option<ClusterTag>, KeepWatching),
+        (settings_ok, names, tag, (keep, keep_sign_in)): (
+            bool,
+            &ClusterNames,
+            Option<ClusterTag>,
+            (KeepWatching, BackgroundSignIn),
+        ),
         theme: &Theme,
     ) -> AnyElement {
         let name = cluster.info.name.clone();
@@ -1806,11 +1814,11 @@ impl Workspace {
                 return menu;
             }
             let menu = menu.item(
-                PopupMenuItem::new(keep_watching::toggle_label(keep)).on_click(registry::on_click(
-                    ToggleKeepWatching {
+                PopupMenuItem::new(keep_watching::toggle_label(keep, keep_sign_in)).on_click(
+                    registry::on_click(ToggleKeepWatching {
                         cluster: rename.clone(),
-                    },
-                )),
+                    }),
+                ),
             );
             cluster_tag::tag_submenu(menu, rename.clone(), endpoint, tag, window, cx)
         })
@@ -2084,19 +2092,84 @@ impl Workspace {
     /// The overview's keep-watching toggle, saying what it would do and any state to act on.
     fn render_keep_watching(&self, cluster: &str, cx: &Context<Self>) -> impl IntoElement {
         let model = self.model.read(cx);
-        let status = model
+        let (status, sign_in) = model
             .keep_watching(cluster)
-            .map_or(KeepWatching::Off, |view| view.status);
+            .map_or((KeepWatching::Off, BackgroundSignIn::NotNeeded), |view| {
+                (view.status, view.sign_in)
+            });
         let settings_ok = model.settings_error.is_none();
         Button::new("keep-watching")
             .xsmall()
             .ghost()
-            .label(keep_watching::toggle_label(status))
+            .label(keep_watching::toggle_label(status, sign_in))
             .tooltip(keep_watching::toggle_tip(status))
             .disabled(!settings_ok)
             .on_click(registry::on_click(ToggleKeepWatching {
                 cluster: cluster.to_owned(),
             }))
+    }
+
+    /// The overview's toggle for running this cluster's sign-in command in the background, naming
+    /// the command. None for a credential that runs nothing.
+    fn render_background_sign_in(
+        &self,
+        cluster: &str,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        self.dashboard.as_ref()?;
+        let view = self.model.read(cx).keep_watching(cluster)?.clone();
+        if view.sign_in == BackgroundSignIn::NotNeeded {
+            return None;
+        }
+        let enabled =
+            keep_watching::sign_in_enabled(view.status, view.sign_in, view.refusal.is_some());
+        let model = self.model.clone();
+        let name = cluster.to_owned();
+        let shown = view.shown_sign_in;
+        let toggle = Switch::new("background-sign-in")
+            .small()
+            .checked(view.sign_in == BackgroundSignIn::On)
+            .disabled(!enabled)
+            .label(keep_watching::SIGN_IN_LABEL)
+            .tooltip(keep_watching::sign_in_tip(view.status, view.sign_in))
+            // Deliberately not a registered action: consent comes from this control alone, never
+            // from the command palette, a key binding or automation.
+            .on_change(move |wanted, _, cx| {
+                if *wanted && shown.is_none() {
+                    return;
+                }
+                let shown = shown.filter(|_| *wanted);
+                model.update(cx, |m, cx| {
+                    m.turn_background_sign_in(name.clone(), shown, cx);
+                });
+            });
+        let command = view.command.map(|command| {
+            div()
+                .id("background-sign-in-command")
+                .min_w_0()
+                .truncate()
+                .text_xs()
+                .font_family(theme.mono_font_family.clone())
+                .text_color(theme.muted_foreground)
+                .child(display::single_line(&command).to_string())
+                .test_support()
+        });
+        Some(
+            h_flex()
+                .id("background-sign-in-row")
+                .w_full()
+                .flex_none()
+                .px_3()
+                .py_1()
+                .gap_3()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(div().flex_none().child(toggle))
+                .children(command)
+                .test_support()
+                .into_any_element(),
+        )
     }
 
     /// The active cluster's access mode, in words, from the same check the sidebar's lock shows.
@@ -2698,6 +2771,7 @@ impl Workspace {
             .min_w_0()
             .h_full()
             .child(self.render_header(&cluster, window_width, theme, cx))
+            .children(self.render_background_sign_in(&cluster.info.name, theme, cx))
             .children(self.server_moves.moved().map(|moved| {
                 let text = repointed_text(&model.names().with_real(&cluster.info.name), moved);
                 notice("context-repointed", text.clone(), theme.warning)

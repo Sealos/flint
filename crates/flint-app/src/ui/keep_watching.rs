@@ -1,9 +1,11 @@
-//! The words of the keep-watching toggle (ADR-0012): the sidebar's badge, the menu entry and the
-//! confirmation that names the command a cluster's sign-in will run in the background.
+//! The words of the keep-watching controls (ADR-0012): the sidebar's badge, the menu entry, and
+//! the toggle that lets a cluster's sign-in command run in the background.
 
-use flint_core::keep_watching::KeepWatching;
+use flint_core::keep_watching::{BackgroundSignIn, KeepWatching};
 
-use super::confirm::DialogText;
+/// What the background sign-in toggle says it does.
+pub(super) const SIGN_IN_LABEL: &str =
+    "Let Flint run this cluster's sign-in command in the background";
 
 /// The sidebar's word for `status`. Health badges are not part of it.
 pub(super) fn badge(status: KeepWatching) -> Option<&'static str> {
@@ -14,18 +16,19 @@ pub(super) fn badge(status: KeepWatching) -> Option<&'static str> {
     }
 }
 
-/// The toggle's label for `status`.
-pub(super) fn toggle_label(status: KeepWatching) -> &'static str {
+/// The keep-watching control's label.
+pub(super) fn toggle_label(status: KeepWatching, sign_in: BackgroundSignIn) -> &'static str {
     match status {
         KeepWatching::Off => "Keep Watching",
-        KeepWatching::NeedsConfirming => "Confirm Keep Watching…",
-        KeepWatching::Watching | KeepWatching::SignInNeeded | KeepWatching::Paused => {
-            "Stop Watching"
-        }
+        KeepWatching::NeedsConfirming if turns_on(status, sign_in) => "Confirm Keep Watching…",
+        KeepWatching::NeedsConfirming
+        | KeepWatching::Watching
+        | KeepWatching::SignInNeeded
+        | KeepWatching::Paused => "Stop Watching",
     }
 }
 
-/// What the toggle's tooltip says about `status`.
+/// What the control's tooltip says about `status`.
 pub(super) fn toggle_tip(status: KeepWatching) -> &'static str {
     match status {
         KeepWatching::Off => "Gather overview data and alerts while this cluster is not selected.",
@@ -34,7 +37,7 @@ pub(super) fn toggle_tip(status: KeepWatching) -> &'static str {
             "Its sign-in failed, so nothing runs. Select the cluster to sign in, or click to stop."
         }
         KeepWatching::NeedsConfirming => {
-            "Its user, command or server changed, so nothing runs until you confirm it again."
+            "Nothing runs until you allow its sign-in, which a change or a restart turns off."
         }
         KeepWatching::Paused => {
             "Waiting: a kubeconfig file defining this cluster can't be read. Click to stop."
@@ -42,29 +45,42 @@ pub(super) fn toggle_tip(status: KeepWatching) -> &'static str {
     }
 }
 
-/// Whether the toggle turns watching on, rather than off.
-pub(super) fn turns_on(status: KeepWatching) -> bool {
-    matches!(status, KeepWatching::Off | KeepWatching::NeedsConfirming)
+/// Whether the control turns watching on, rather than off. A cluster waiting for its sign-in
+/// toggle is already on: only that toggle can let it run.
+pub(super) fn turns_on(status: KeepWatching, sign_in: BackgroundSignIn) -> bool {
+    match status {
+        KeepWatching::Off => true,
+        KeepWatching::NeedsConfirming => {
+            !matches!(sign_in, BackgroundSignIn::Off | BackgroundSignIn::On)
+        }
+        _ => false,
+    }
 }
 
-/// The confirmation before a cluster's exec plugin may run in the background, naming the command.
-pub(super) fn plugin_dialog(context: &str, server: &str, command: &str) -> DialogText {
-    let context = flint_core::display::single_line(context);
-    let server = flint_core::redact::server_url(server);
-    let command = flint_core::display::single_line(command);
-    DialogText {
-        title: "Run this sign-in in the background?".into(),
-        text: format!(
-            "To keep watching this cluster, Flint will run its sign-in command without asking, \
-             at launch and whenever its token is due, while you work elsewhere. It cannot prompt \
-             you. If it fails, Flint stops and shows that a sign-in is needed. If the command or \
-             this context changes, Flint asks again.\n\n\
-             Command: {command}\nContext: {context}\nServer: {server}"
-        ),
-        ok: "Keep Watching".into(),
-        cancel: "Cancel".into(),
-        id: "keep-watching-description",
-        default_cancel: true,
+/// Whether the sign-in toggle can be used now. Turning it off always can.
+pub(super) fn sign_in_enabled(
+    status: KeepWatching,
+    sign_in: BackgroundSignIn,
+    refused: bool,
+) -> bool {
+    match sign_in {
+        BackgroundSignIn::On => true,
+        BackgroundSignIn::Off => status != KeepWatching::Off && !refused,
+        BackgroundSignIn::NotNeeded | BackgroundSignIn::Unavailable => false,
+    }
+}
+
+/// What the sign-in toggle's tooltip says.
+pub(super) fn sign_in_tip(status: KeepWatching, sign_in: BackgroundSignIn) -> &'static str {
+    match sign_in {
+        BackgroundSignIn::Unavailable => {
+            "Not available: this cluster's sign-in can't be stopped once it runs, or can't be read."
+        }
+        _ if status == KeepWatching::Off => "Turn on Keep Watching first.",
+        _ => {
+            "Runs without a terminal or input until you quit Flint. Flint cannot stop a command \
+             from opening a browser by itself. A change to this context turns it off."
+        }
     }
 }
 
@@ -82,20 +98,40 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_definition_asks_again() {
-        assert!(turns_on(KeepWatching::NeedsConfirming));
+    fn a_cluster_waiting_for_its_sign_in_toggle_can_be_stopped() {
+        let waiting = KeepWatching::NeedsConfirming;
+        assert!(!turns_on(waiting, BackgroundSignIn::Off));
         assert_eq!(
-            toggle_label(KeepWatching::NeedsConfirming),
+            toggle_label(waiting, BackgroundSignIn::Off),
+            "Stop Watching"
+        );
+        assert!(turns_on(waiting, BackgroundSignIn::NotNeeded));
+        assert_eq!(
+            toggle_label(waiting, BackgroundSignIn::NotNeeded),
             "Confirm Keep Watching…"
         );
-        assert!(!turns_on(KeepWatching::SignInNeeded));
+        assert!(!turns_on(KeepWatching::SignInNeeded, BackgroundSignIn::On));
     }
 
     #[test]
-    fn the_confirmation_names_the_command_and_defaults_to_cancel() {
-        let dialog = plugin_dialog("prod", "https://a.example", "/usr/bin/aws eks get-token");
-        assert!(dialog.text.contains("Command: /usr/bin/aws eks get-token"));
-        assert!(dialog.text.contains("Context: prod"));
-        assert!(dialog.default_cancel);
+    fn the_sign_in_toggle_is_disabled_when_it_cannot_be_turned_on() {
+        let waiting = KeepWatching::NeedsConfirming;
+        assert!(sign_in_enabled(waiting, BackgroundSignIn::Off, false));
+        assert!(!sign_in_enabled(waiting, BackgroundSignIn::Off, true));
+        assert!(!sign_in_enabled(
+            KeepWatching::Off,
+            BackgroundSignIn::Off,
+            false
+        ));
+        assert!(!sign_in_enabled(
+            waiting,
+            BackgroundSignIn::Unavailable,
+            false
+        ));
+        assert!(sign_in_enabled(
+            KeepWatching::Paused,
+            BackgroundSignIn::On,
+            true
+        ));
     }
 }

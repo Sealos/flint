@@ -1,11 +1,14 @@
 //! Which clusters are kept watched in the background, and what running their sign-in was agreed
 //! to (ADR-0012).
 //!
-//! An entry names a context at its exact server. When the context's credential is an exec plugin,
-//! the entry also holds a [`PluginConsent`]: a keyed seal over the whole definition the person
-//! confirmed. Any change to its user, command, arguments, environment or cluster entry breaks the
-//! seal, and the plugin does not run until it is confirmed again. The seal is one-way and salted,
-//! so `settings.toml` holds nothing of the definition.
+//! An entry in the settings names a context at its exact server. Agreement to run an exec plugin
+//! is never saved: it is a seal held in memory for the running app, over the whole
+//! definition the person confirmed. Any change to the context, its user or its cluster entry
+//! breaks it, and after a restart the plugin does not run until it is confirmed again.
+//!
+//! It is a per-cluster toggle, off by default. Turning it on starts from a [`PluginOffer`], which
+//! the core makes for the definition the toggle showed. Approving it gives a [`PluginApproval`]
+//! the core accepts once.
 
 use kube::config::{AuthInfo, Kubeconfig};
 use ring::hmac;
@@ -30,10 +33,6 @@ pub struct WatchedCluster {
     pub context: String,
     /// The exact API server it was turned on for.
     pub server: String,
-    /// Agreement to run its exec plugin in the background. `None` for a credential that runs
-    /// nothing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plugin_consent: Option<PluginConsent>,
 }
 
 /// The entries of `watched_clusters` this version can read. One it can't is left out, and never
@@ -55,11 +54,10 @@ pub(crate) fn watched_entries(value: toml::Value) -> Vec<WatchedCluster> {
         .collect()
 }
 
-/// A salted seal over a context's connection definition.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginConsent {
-    salt: String,
-    seal: String,
+/// Agreement to run one exact definition, for as long as the app runs. Neither saved nor shown.
+pub(crate) struct PluginConsent {
+    salt: [u8; SALT_BYTES],
+    seal: Vec<u8>,
 }
 
 impl std::fmt::Debug for PluginConsent {
@@ -74,35 +72,89 @@ impl PluginConsent {
         let mut salt = [0u8; SALT_BYTES];
         SystemRandom::new().fill(&mut salt).ok()?;
         let key = hmac::Key::new(hmac::HMAC_SHA256, &salt);
-        let seal = hmac::sign(&key, &definition.canonical);
-        Some(PluginConsent {
-            salt: hex(&salt),
-            seal: hex(seal.as_ref()),
-        })
+        let seal = hmac::sign(&key, &definition.canonical).as_ref().to_vec();
+        Some(PluginConsent { salt, seal })
     }
 
     /// Whether this seal was made over exactly `definition`.
     pub(crate) fn holds(&self, definition: &PluginDefinition) -> bool {
-        let (Some(salt), Some(seal)) = (unhex(&self.salt), unhex(&self.seal)) else {
-            return false;
-        };
-        let key = hmac::Key::new(hmac::HMAC_SHA256, &salt);
-        hmac::verify(&key, &definition.canonical, &seal).is_ok()
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &self.salt);
+        hmac::verify(&key, &definition.canonical, &self.seal).is_ok()
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+/// What identifies one offer. Random, so it can't be worked out from anything shown.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct OfferTicket([u8; SALT_BYTES]);
+
+impl OfferTicket {
+    /// A new ticket, or `None` if the system has no randomness to give.
+    pub(crate) fn new() -> Option<Self> {
+        let mut ticket = [0u8; SALT_BYTES];
+        SystemRandom::new().fill(&mut ticket).ok()?;
+        Some(OfferTicket(ticket))
+    }
 }
 
-fn unhex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) || !text.is_ascii() {
-        return None;
+/// A key for this run of the app, under which a view names the exact definition it shows.
+pub(crate) struct ViewKey(hmac::Key);
+
+impl ViewKey {
+    /// A new key, or `None` if the system has no randomness to give.
+    pub(crate) fn new() -> Option<Self> {
+        let mut key = [0u8; SALT_BYTES];
+        SystemRandom::new().fill(&mut key).ok()?;
+        Some(ViewKey(hmac::Key::new(hmac::HMAC_SHA256, &key)))
     }
-    (0..text.len())
-        .step_by(2)
-        .map(|at| u8::from_str_radix(&text[at..at + 2], 16).ok())
-        .collect()
+
+    /// What names `definition` in a view. Says nothing of it, and differs after any change.
+    pub(crate) fn name(&self, definition: &PluginDefinition) -> u64 {
+        let tag = hmac::sign(&self.0, &definition.canonical);
+        let mut name = [0u8; 8];
+        name.copy_from_slice(&tag.as_ref()[..8]);
+        u64::from_le_bytes(name)
+    }
+}
+
+/// One turn of a cluster's background sign-in toggle to on, for the definition it showed, from
+/// [`CoreHandle::offer_keep_watching`](crate::CoreHandle::offer_keep_watching).
+pub struct PluginOffer {
+    pub(crate) context: String,
+    pub(crate) ticket: OfferTicket,
+}
+
+impl std::fmt::Debug for PluginOffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginOffer")
+            .field("context", &self.context)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PluginOffer {
+    /// The person turned the toggle on. Call this only from that toggle's click handler.
+    pub fn approve(self) -> PluginApproval {
+        PluginApproval {
+            context: self.context,
+            ticket: self.ticket,
+        }
+    }
+}
+
+/// A confirmed [`PluginOffer`], for [`Command::ApproveKeepWatching`](crate::Command). The core
+/// accepts it once, and only while the definition is the one the offer showed.
+#[derive(Clone)]
+pub struct PluginApproval {
+    pub(crate) context: String,
+    pub(crate) ticket: OfferTicket,
+}
+
+impl std::fmt::Debug for PluginApproval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginApproval")
+            .field("context", &self.context)
+            .finish_non_exhaustive()
+    }
 }
 
 /// How a context signs in, for whether it can be watched in the background.
@@ -121,7 +173,7 @@ pub(crate) enum SignIn {
 pub(crate) struct PluginDefinition {
     /// What the confirmation names.
     pub(crate) command: String,
-    /// The user's name and entry and the cluster entry, in a stable form. Holds credentials, so
+    /// The named context and its user and cluster entries, in a stable form. Holds credentials, so
     /// it never leaves this struct except through a seal.
     canonical: Vec<u8>,
 }
@@ -162,7 +214,7 @@ pub(crate) fn sign_in_of(kubeconfig: &Kubeconfig, context: &str) -> SignIn {
                 .clusters
                 .iter()
                 .find(|named| named.name == entry.cluster);
-            let Ok(mut value) = serde_json::to_value((user, auth, cluster)) else {
+            let Ok(mut value) = serde_json::to_value((context, entry, user, auth, cluster)) else {
                 return SignIn::Unknown;
             };
             // Exec `env` items are maps, serialized in a different order at each load.
@@ -219,20 +271,37 @@ pub enum KeepWatching {
     Watching,
     /// Stopped after a failure, until the person acts.
     SignInNeeded,
-    /// Its definition changed since it was turned on: nothing runs until it is confirmed again.
+    /// Its sign-in has no agreement for this definition, because it changed or the app restarted:
+    /// nothing runs until it is confirmed again.
     NeedsConfirming,
     /// A kubeconfig file that can't be read could change its definition. It resumes by itself.
     Paused,
 }
 
-/// A cluster's toggle, and what turning it on would agree to.
+/// A cluster's background sign-in toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundSignIn {
+    /// Its credential runs nothing, so there is no toggle.
+    NotNeeded,
+    /// Shown disabled: an auth provider, or a user Flint can't read.
+    Unavailable,
+    Off,
+    On,
+}
+
+/// A cluster's toggles, and what turning them on would agree to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeepWatchView {
     pub status: KeepWatching,
-    /// The command the confirmation must name, when the credential is an exec plugin.
+    pub sign_in: BackgroundSignIn,
+    /// The command the background sign-in toggle names, when the credential is an exec plugin.
     pub command: Option<String>,
-    /// The definition this view describes. A confirmation sends it back, so one made on a
-    /// definition that has changed since is refused.
+    /// Names the exact plugin definition on show. Turning the toggle on sends it back, so a click
+    /// made on a definition that has changed since grants nothing.
+    pub shown_sign_in: Option<u64>,
+    /// The definition this view describes. Turning on a credential that runs nothing sends it
+    /// back, so a request made on a definition that has changed since is refused. It is not
+    /// consent to run a plugin, which takes a [`PluginApproval`].
     pub definition: Option<u64>,
     /// Why it cannot be turned on, if so.
     pub refusal: Option<String>,
@@ -286,6 +355,7 @@ mod tests {
         changed("AWS_PROFILE", "AWS_OTHER");
         changed("value: prod", "value: staging");
         changed("https://a.example", "https://b.example");
+        changed("user: u\n", "user: u\n    namespace: other\n");
         let renamed = original
             .replace("user: u\n", "user: v\n")
             .replace("- name: u\n", "- name: v\n");
@@ -298,14 +368,23 @@ mod tests {
         let kubeconfig = config(PLUGIN);
         let found = definition(&kubeconfig);
         let consent = PluginConsent::seal(&found).expect("a seal");
-        let text = toml::to_string(&consent).expect("toml");
-        assert!(!text.contains("aws") && !text.contains("prod"));
-        assert!(!format!("{consent:?}").contains(&consent.seal));
+        assert_eq!(format!("{consent:?}"), "PluginConsent { .. }");
         let broken = PluginConsent {
-            salt: consent.salt.clone(),
-            seal: "zz".to_owned(),
+            salt: consent.salt,
+            seal: vec![0; consent.seal.len()],
         };
         assert!(!broken.holds(&found));
+    }
+
+    #[test]
+    fn a_saved_consent_field_is_ignored() {
+        let entry: WatchedCluster = toml::from_str(
+            "context = \"dev\"\nserver = \"https://a.example\"\n\
+             [plugin_consent]\nsalt = \"00\"\nseal = \"00\"\n",
+        )
+        .expect("an entry");
+        let saved = toml::to_string(&entry).expect("toml");
+        assert!(!saved.contains("plugin_consent"), "{saved}");
     }
 
     #[test]

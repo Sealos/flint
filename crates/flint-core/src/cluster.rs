@@ -964,7 +964,10 @@ pub(crate) async fn connect_read_only_with_policy(
     bounded(kubeconfig, context, timeout, async {
         let ready = prepare(kubeconfig, context, access).await?;
         let target = ready.target;
-        let (config, token, grant) = (ready.config, ready.token, ready.grant);
+        let (mut config, token, grant) = (ready.config, ready.token, ready.grant);
+        // Each retry could run the plugin again for a short-lived token. The feed has its own
+        // backoff, so every request here is sent once.
+        config.default_retry = false;
         let client = tokio::task::spawn_blocking(move || {
             let auth = kube::client::ConfigExt::auth_layer(&config)?;
             build_observed_client(

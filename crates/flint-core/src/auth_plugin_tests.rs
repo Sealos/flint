@@ -376,6 +376,24 @@ async fn a_failing_plugin_is_reported_without_its_output() {
     );
 }
 
+// The error value itself, whose `Debug` and `Display` would quote what it holds.
+#[tokio::test]
+async fn a_failed_run_keeps_only_its_exit_status() {
+    let plugin = FakePlugin::new("echo 'sso expired s3cr3t' >&2\necho token-abc\nexit 3\n");
+    let mut config = config(&plugin.kubeconfig("https://127.0.0.1:1")).await;
+    let Err(error) = resolve(&mut config, "ctx").await else {
+        panic!("a failing plugin gives no credential");
+    };
+    let AuthError::AuthExecRun { out, .. } = &error else {
+        panic!("not a failed run: {error:?}");
+    };
+    assert_eq!(out.status.code(), Some(3));
+    assert!(out.stdout.is_empty() && out.stderr.is_empty());
+    for shown in [format!("{error}"), format!("{error:?}")] {
+        assert!(!shown.contains("s3cr3t") && !shown.contains("token-abc"));
+    }
+}
+
 /// A parsed token and its expiry, if the credential is a token.
 fn token(credential: Credential) -> Option<(String, Option<Timestamp>)> {
     match credential {

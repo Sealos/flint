@@ -162,12 +162,19 @@ pub enum Command {
     SetRunningSet(Vec<ClusterId>),
     /// Keep watching `cluster` in the background (ADR-0012), or stop (`definition: None`).
     /// `definition` is the [`KeepWatchView::definition`](crate::keep_watching::KeepWatchView)
-    /// the confirmation showed: if the context has changed since, nothing is written and an
-    /// error is reported.
+    /// the request was made on: if the context has changed since, nothing is written and an
+    /// error is reported. This never lets an exec plugin run: that takes
+    /// [`Command::ApproveKeepWatching`].
     SetKeepWatching {
         cluster: ClusterId,
         definition: Option<u64>,
     },
+    /// The person turned on `cluster`'s background sign-in toggle
+    /// ([`CoreHandle::offer_keep_watching`]): its plugin may run until the app quits. Accepted
+    /// once, for the definition the toggle showed.
+    ApproveKeepWatching(crate::keep_watching::PluginApproval),
+    /// Turns the background sign-in toggle off: no new launch, and its background watch stops.
+    RevokeBackgroundSignIn(ClusterId),
 }
 
 /// What a member of the running set is doing.
@@ -250,6 +257,16 @@ pub(crate) enum Request {
         reply: oneshot::Sender<
             std::collections::BTreeMap<ClusterId, crate::keep_watching::KeepWatchView>,
         >,
+    },
+    /// An offer to turn on `cluster`'s background sign-in, for the definition named `shown`.
+    OfferKeepWatching {
+        cluster: ClusterId,
+        shown: u64,
+        reply: oneshot::Sender<Result<crate::keep_watching::PluginOffer, String>>,
+    },
+    /// The app is quitting: ends every grant, answering once their plugins are gone.
+    StopKeepWatching {
+        reply: oneshot::Sender<()>,
     },
     /// Each member of the running set and its state.
     RunningSet {
@@ -646,6 +663,37 @@ impl CoreHandle {
         let (reply, rx) = oneshot::channel();
         let _ = self.requests.try_send(Request::KeepWatching { reply });
         async move { rx.await.unwrap_or_default() }
+    }
+
+    /// The first step of turning on `cluster`'s background sign-in toggle, for the definition the
+    /// toggle showed ([`KeepWatchView::shown_sign_in`](crate::keep_watching::KeepWatchView)). A
+    /// newer offer replaces an older one. `Err` says why it can't be turned on.
+    pub fn offer_keep_watching(
+        &self,
+        cluster: &str,
+        shown: u64,
+    ) -> impl Future<Output = Result<crate::keep_watching::PluginOffer, String>> + Send + use<>
+    {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.requests.try_send(Request::OfferKeepWatching {
+            cluster: cluster.to_owned(),
+            shown,
+            reply,
+        });
+        async move {
+            rx.await
+                .unwrap_or_else(|_| Err("Flint is shutting down.".to_owned()))
+        }
+    }
+
+    /// Ends every keep-watching grant for the quit under way. Resolves once their plugins are
+    /// killed, after a short bounded wait at most, or at once if the core stopped.
+    pub fn stop_keep_watching(&self) -> impl Future<Output = ()> + Send + use<> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.requests.try_send(Request::StopKeepWatching { reply });
+        async move {
+            let _ = rx.await;
+        }
     }
 
     /// What the feed of `cluster` knows. `None` while it has none: it is neither kept watching,

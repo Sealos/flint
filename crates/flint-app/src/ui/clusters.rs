@@ -266,12 +266,39 @@ impl ClustersModel {
         self.keep_watching.get(cluster)
     }
 
-    /// Turns keeping `cluster` watched on for the `definition` confirmed, or off (`None`).
+    /// Turns keeping `cluster` watched on, on `definition`, or off (`None`). This never lets an
+    /// exec plugin run: that is [`Self::turn_background_sign_in`].
     pub fn set_keep_watching(&mut self, cluster: ClusterId, definition: Option<u64>) {
         self.send(Command::SetKeepWatching {
             cluster,
             definition,
         });
+    }
+
+    /// For the background sign-in toggle's click handler alone: turns it on for the exact
+    /// definition `shown`, or off (`None`), which takes effect at once.
+    pub fn turn_background_sign_in(
+        &mut self,
+        cluster: ClusterId,
+        shown: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(shown) = shown else {
+            self.send(Command::RevokeBackgroundSignIn(cluster));
+            return;
+        };
+        let offer = self.core.offer_keep_watching(&cluster, shown);
+        cx.spawn(async move |this, cx| {
+            let offer = offer.await;
+            let _ = this.update(cx, |model, cx| match offer {
+                Ok(offer) => model.send(Command::ApproveKeepWatching(offer.approve())),
+                Err(why) => {
+                    model.last_error = Some(why);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// What each cluster is called on screen.

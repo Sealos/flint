@@ -51,17 +51,20 @@ launch**.
 - **Read only.** The feed has its own connection with a read client and no write client. The slot's connection,
   write credential and write gate are unchanged, so a background cluster gains no write path. `flint mcp` does not
   read this setting.
-- **Consent for exec plugins.** Turning the toggle on for a cluster whose credential is an exec plugin is explicit
-  consent to run it in the background, after a confirmation that names the command. Consent is bound to the
-  context's confirmed definition: its user entry (command, arguments, environment) and cluster entry. After any
-  confirmed change it is void, stays void if the change is undone, and the toggle asks for confirmation again.
-  `settings.toml` holds a salted seal, not the definition.
+- **Consent for exec plugins.** A cluster whose credential is an exec plugin has a second, per-cluster toggle next to
+  keep watching, which says it lets Flint run this cluster's sign-in command in the background and shows the command.
+  It is off by default, and only a click on it turns it on. It is bound to the context's whole definition: the
+  context, its user entry and its cluster entry. Any confirmed change turns it off, and undoing the change leaves it
+  off. Turning it off stops the cluster's background watch at once. It lasts until the app quits and is never saved,
+  so after a restart it reads off and runs nothing. Auth-provider clusters show it disabled. The keep-watching choice
+  itself is saved.
 - **How a plugin runs.** With `interactive: false` and a null stdin, never in a terminal. A provisional or paused
-  context runs none. Turning the toggle off or removing the context kills a plugin that is running. Auth providers
-  are not eligible, because their command cannot be stopped once it starts.
+  context runs none, and neither does one whose files changed until they are read again. Turning the toggle off,
+  removing the context or quitting the app kills a plugin that is running. Auth providers are not eligible, because
+  their command cannot be stopped once it starts.
 - **Failure.** The first failure of a plugin, or a 401, stops the feed with no retry and shows **sign-in needed**
-  until the person selects the cluster or changes the toggle. A credential that runs nothing retries a failed
-  connection after a minute.
+  until the person selects the cluster or changes the toggle. A background request is sent once, without the
+  client's retries. A credential that runs nothing retries a failed connection after a minute.
 - **Last values.** A cluster that is unreachable or signed out keeps its last values in memory, marked with their
   age. Nothing is written to disk ([ADR-0017](./0017-cluster-dashboards.md)).
 - **Sidebar.** Only "watching" or "sign-in needed". Health badges are deferred.

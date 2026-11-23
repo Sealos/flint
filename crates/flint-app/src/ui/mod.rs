@@ -159,8 +159,17 @@ pub fn run(boot: Bootstrap) {
             registry::init(cx);
             install_menus(settings.appearance, cx);
             // On macOS a quit ends the process without returning from `run`.
-            cx.on_app_quit(|cx| quit_flush::QuitFlush::join(cx).finish())
-                .detach();
+            let quitting = core.clone();
+            cx.on_app_quit(move |cx| {
+                let flush = quit_flush::QuitFlush::join(cx);
+                // Background sign-ins end first: nothing else would stop them on the way out.
+                let plugins = quitting.stop_keep_watching();
+                async move {
+                    plugins.await;
+                    flush.finish().await;
+                }
+            })
+            .detach();
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();

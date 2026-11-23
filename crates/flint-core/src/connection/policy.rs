@@ -94,6 +94,38 @@ impl CredentialPolicy for KeptInBackground {
 /// Told once when a kept connection's credential fails or is refused.
 pub(crate) type OnCredentialFailure = Arc<dyn Fn() + Send + Sync>;
 
+/// How many plugins of kept connections are running, so a quit can wait for them to be killed.
+#[derive(Clone)]
+pub(crate) struct PluginRuns(Arc<watch::Sender<usize>>);
+
+impl Default for PluginRuns {
+    fn default() -> Self {
+        PluginRuns(Arc::new(watch::channel(0).0))
+    }
+}
+
+impl PluginRuns {
+    fn track(&self) -> PluginRun {
+        self.0.send_modify(|count| *count += 1);
+        PluginRun(Arc::clone(&self.0))
+    }
+
+    /// Resolves once none is running.
+    pub(crate) async fn ended(&self) {
+        let mut count = self.0.subscribe();
+        let _ = count.wait_for(|running| *running == 0).await;
+    }
+}
+
+/// One plugin counted in [`PluginRuns`], until dropped.
+pub(crate) struct PluginRun(Arc<watch::Sender<usize>>);
+
+impl Drop for PluginRun {
+    fn drop(&mut self) {
+        self.0.send_modify(|count| *count -= 1);
+    }
+}
+
 /// A policy and the current role of one connection. Clones share the role, so whoever holds one
 /// can change it while the connection is being made or used.
 #[derive(Clone)]
@@ -104,6 +136,8 @@ pub(crate) struct CredentialAccess {
     launch_check: Option<SendCheck>,
     /// Set for a kept connection: its first failure ends this access, so nothing retries.
     on_failure: Option<OnCredentialFailure>,
+    /// Counts this connection's running plugins, for a kept connection.
+    plugin_runs: Option<PluginRuns>,
 }
 
 impl CredentialAccess {
@@ -114,14 +148,22 @@ impl CredentialAccess {
             role: Arc::new(role),
             launch_check: None,
             on_failure: None,
+            plugin_runs: None,
         }
     }
 
     /// Access for a connection kept in the background with the person's consent. The first
-    /// failure of its credential ends it and calls `on_failure`.
-    pub(crate) fn consented(on_failure: OnCredentialFailure) -> Self {
+    /// failure of its credential ends it and calls `on_failure`. `check` is asked right before
+    /// each start of its program, and `runs` counts those running.
+    pub(crate) fn consented(
+        on_failure: OnCredentialFailure,
+        check: Option<SendCheck>,
+        runs: PluginRuns,
+    ) -> Self {
         CredentialAccess {
             on_failure: Some(on_failure),
+            launch_check: check,
+            plugin_runs: Some(runs),
             ..Self::new(Arc::new(KeptInBackground), Role::Background)
         }
     }
@@ -218,8 +260,9 @@ impl CredentialGrant {
         self.access.credential_failed();
     }
 
-    /// Whether the program gets no stdin at all: a kept connection nobody is looking at.
-    pub(crate) fn null_stdin(&self) -> bool {
+    /// Whether nobody is looking at this connection: a kept one. Its program gets no stdin, and
+    /// a credential it can't use counts as a failure.
+    pub(crate) fn unattended(&self) -> bool {
         self.access.on_failure.is_some()
     }
 
@@ -297,9 +340,18 @@ impl CredentialLease {
         }
     }
 
-    /// [`CredentialGrant::null_stdin`].
-    pub(crate) fn null_stdin(&self) -> bool {
-        self.grant.null_stdin()
+    /// [`CredentialGrant::unattended`].
+    pub(crate) fn unattended(&self) -> bool {
+        self.grant.unattended()
+    }
+
+    /// Counts a plugin as running until the returned value is dropped, for a kept connection.
+    pub(crate) fn track_run(&self) -> Option<PluginRun> {
+        self.grant
+            .access
+            .plugin_runs
+            .as_ref()
+            .map(PluginRuns::track)
     }
 
     /// [`CredentialGrant::note_failed`].

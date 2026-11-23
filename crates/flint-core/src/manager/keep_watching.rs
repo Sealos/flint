@@ -7,8 +7,6 @@
 //! [`ClusterManager::sync_keep_watching`] compares what should run with what does after every
 //! message of the manager's loop, so no path that changes a definition has to remember it.
 
-// module-tests: ../manager.rs (and flint-e2e's telemetry.rs, on the fake API)
-
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -20,26 +18,39 @@ use super::telemetry::reads_token_file;
 use super::{ClusterManager, Internal};
 use crate::ClusterId;
 use crate::cluster;
-use crate::connection::policy::CredentialAccess;
+use crate::connection::policy::{CredentialAccess, PluginRuns, Role};
 use crate::handle::Event;
 use crate::keep_watching::{
-    KeepWatchView, KeepWatching, MAX_WATCHED_CLUSTERS, PluginConsent, SignIn, WatchedCluster,
-    sign_in_of, too_many_watched,
+    BackgroundSignIn, KeepWatchView, KeepWatching, MAX_WATCHED_CLUSTERS, OfferTicket,
+    PluginApproval, PluginConsent, PluginOffer, SignIn, ViewKey, WatchedCluster, sign_in_of,
+    too_many_watched,
 };
 use crate::kubeconfig::LoadedKubeconfig;
 use crate::metrics_trend::TrendStore;
 use crate::telemetry::Telemetry;
 
-/// How long a credential that runs nothing waits before connecting again.
+/// How long a connection that failed for a reason worth retrying waits before the next.
 const RETRY_AFTER: Duration = Duration::from_secs(60);
 /// How many background connections are made at once, so a launch starts no burst of plugins.
 const CONCURRENT_CONNECTS: usize = 4;
+/// How long a quit waits for plugins to be killed: inside GPUI's 200 ms for quit hooks.
+const QUIT_WAIT: Duration = Duration::from_millis(100);
+
+/// An offer a confirmation is showing, until it is approved or replaced.
+struct PendingOffer {
+    ticket: OfferTicket,
+    consent: PluginConsent,
+    fingerprint: Option<u64>,
+    server: String,
+}
 
 /// One watched cluster's connection and feed. Dropping it ends both, and kills its plugin.
 struct KeptFeed {
     attempt: u64,
     fingerprint: Option<u64>,
     runs_plugin: bool,
+    /// A detected file change ended its plugin: a failed connection says nothing of the sign-in.
+    interrupted: bool,
     access: CredentialAccess,
     connecting: Option<AbortHandle>,
     feed: Option<Telemetry>,
@@ -59,10 +70,20 @@ pub(super) struct KeepWatch {
     feeds: HashMap<ClusterId, KeptFeed>,
     /// Stopped after a failure, until the person acts.
     stopped: HashMap<ClusterId, Option<u64>>,
+    /// Agreement to run a plugin, for the running app only. Nothing restores an entry removed
+    /// from here but a new approval.
+    consents: HashMap<ClusterId, Arc<PluginConsent>>,
+    /// The newest offer of each cluster.
+    offers: HashMap<ClusterId, PendingOffer>,
+    /// Names definitions in views. Without one, no toggle can be turned on.
+    view_key: Option<ViewKey>,
     /// Consent a confirmed change broke. It stays void even if the change is undone later.
     voided: HashSet<ClusterId>,
-    /// Of those, the ones whose saved consent is still to be removed.
-    to_clear: Vec<ClusterId>,
+    /// Stopped by the person while the settings still list them, because the write failed.
+    turned_off: HashSet<ClusterId>,
+    /// The app is quitting: nothing starts any more.
+    quitting: bool,
+    plugin_runs: PluginRuns,
     retry_at: HashMap<ClusterId, Instant>,
     next_attempt: u64,
     connects: Arc<Semaphore>,
@@ -80,8 +101,13 @@ impl Default for KeepWatch {
         KeepWatch {
             feeds: HashMap::new(),
             stopped: HashMap::new(),
+            consents: HashMap::new(),
+            offers: HashMap::new(),
+            view_key: ViewKey::new(),
             voided: HashSet::new(),
-            to_clear: Vec::new(),
+            turned_off: HashSet::new(),
+            quitting: false,
+            plugin_runs: PluginRuns::default(),
             retry_at: HashMap::new(),
             next_attempt: 1,
             connects: Arc::new(Semaphore::new(CONCURRENT_CONNECTS)),
@@ -136,6 +162,9 @@ impl ClusterManager {
         let Some(entry) = self.settings.watched_cluster(id) else {
             return KeepWatching::Off;
         };
+        if self.keep.turned_off.contains(id) {
+            return KeepWatching::Off;
+        }
         let Some(slot) = self.cluster(id) else {
             // Missing from a load that could not read every file says nothing about it.
             return if self.contexts.removed(id) {
@@ -152,10 +181,11 @@ impl ClusterManager {
             return KeepWatching::NeedsConfirming;
         }
         let agreed = match &*self.sign_in(id) {
-            SignIn::Static => entry.plugin_consent.is_none(),
-            SignIn::Plugin(definition) => entry
-                .plugin_consent
-                .as_ref()
+            SignIn::Static => !self.keep.consents.contains_key(id),
+            SignIn::Plugin(definition) => self
+                .keep
+                .consents
+                .get(id)
                 .is_some_and(|consent| consent.holds(definition)),
             SignIn::Provider | SignIn::Unknown => false,
         };
@@ -175,7 +205,26 @@ impl ClusterManager {
 
     /// Whether `id` needs a feed of its own: its slot has none and can't have one.
     fn wants_kept_feed(&self, id: &str) -> bool {
-        self.active.as_deref() != Some(id) && self.keep_watching(id) && !self.wants_telemetry(id)
+        !self.keep.quitting
+            && self.active.as_deref() != Some(id)
+            && self.keep_watching(id)
+            && !self.wants_telemetry(id)
+    }
+
+    /// Whether no change of the kubeconfig files is waiting to be read.
+    fn definitions_settled(&self) -> bool {
+        !self.change_queued() && !self.reader.busy(&self.kubeconfig_paths)
+    }
+
+    /// A kubeconfig file changed: no kept plugin runs until the new definitions are read, and one
+    /// running now is killed. [`Self::sync_keep_watching`] lets those still agreed to go on.
+    pub(super) fn suspend_kept_plugins(&mut self) {
+        for kept in self.keep.feeds.values_mut() {
+            if kept.runs_plugin {
+                kept.interrupted = true;
+                kept.access.set_role(Role::Paused);
+            }
+        }
     }
 
     /// Stops the feeds no longer wanted, starts those missing, and reports any change.
@@ -194,6 +243,12 @@ impl ClusterManager {
                 self.keep.feeds.remove(&id);
             }
         }
+        let settled = self.definitions_settled();
+        if settled {
+            for kept in self.keep.feeds.values().filter(|kept| kept.runs_plugin) {
+                kept.access.set_role(Role::Background);
+            }
+        }
         // Over the cap, a file edited by hand starts only the first ones.
         let watched: Vec<ClusterId> = self
             .settings
@@ -208,7 +263,7 @@ impl ClusterManager {
         let now = Instant::now();
         for id in &watched {
             let due = self.keep.retry_at.get(id).is_none_or(|at| now >= *at);
-            if due && !self.keep.feeds.contains_key(id) && self.wants_kept_feed(id) {
+            if settled && due && !self.keep.feeds.contains_key(id) && self.wants_kept_feed(id) {
                 self.keep.retry_at.remove(id);
                 self.start_kept(id);
             }
@@ -216,55 +271,83 @@ impl ClusterManager {
         self.publish_keep_watching();
     }
 
-    /// Records consent that a confirmed definition no longer matches. A paused context is not
-    /// judged: what it shows may only be a fallback.
+    /// Removes consent a confirmed definition no longer matches, or whose entry is gone, for
+    /// good. A paused context is not judged: what it shows may only be a fallback.
     fn void_broken_consents(&mut self) {
+        let settings = &self.settings;
+        self.keep
+            .consents
+            .retain(|id, _| settings.watched_cluster(id).is_some());
+        self.keep
+            .turned_off
+            .retain(|id| settings.watched_cluster(id).is_some());
+        let clusters = &self.clusters;
+        self.keep
+            .offers
+            .retain(|id, _| clusters.iter().any(|slot| slot.info.name == *id));
         let broken: Vec<ClusterId> = self
-            .settings
-            .watched_clusters
-            .iter()
-            .filter(|entry| entry.plugin_consent.is_some())
-            .map(|entry| entry.context.clone())
-            .filter(|id| {
-                !self.keep.voided.contains(id)
-                    && self.keep_status(id) == KeepWatching::NeedsConfirming
-            })
+            .keep
+            .consents
+            .keys()
+            .filter(|id| self.keep_status(id) == KeepWatching::NeedsConfirming)
+            .cloned()
             .collect();
         for id in broken {
-            self.keep.voided.insert(id.clone());
-            self.keep.to_clear.push(id);
+            self.keep.consents.remove(&id);
+            self.keep.offers.remove(&id);
+            self.keep.voided.insert(id);
         }
     }
 
-    /// Removes voided consent from `settings.toml`, so it stays void across a restart.
-    pub(super) async fn clear_voided_consents(&mut self) {
-        for id in std::mem::take(&mut self.keep.to_clear) {
-            let Some(entry) = self.settings.watched_cluster(&id).cloned() else {
-                continue;
-            };
-            let entry = WatchedCluster {
-                plugin_consent: None,
-                ..entry
-            };
-            self.write_settings("keep watching", move |dir| {
-                crate::settings::set_watched_cluster(dir, &id, Some(entry))
+    /// Asked right before each start of `id`'s plugin: the files as they are now must still
+    /// define what was agreed to, whether or not a change has been noticed yet.
+    fn launch_check(&self, id: &str, consent: Arc<PluginConsent>) -> cluster::SendCheck {
+        let paths = self.kubeconfig_paths.clone();
+        let context = id.to_owned();
+        cluster::SendCheck::new(move || {
+            let (paths, context, consent) = (paths.clone(), context.clone(), consent.clone());
+            Box::pin(async move {
+                let same = tokio::task::spawn_blocking(move || {
+                    let loaded = crate::kubeconfig::load(&paths);
+                    loaded.errors.is_empty()
+                        && matches!(
+                            &sign_in_of(&loaded.merged, &context),
+                            SignIn::Plugin(definition) if consent.holds(definition)
+                        )
+                })
+                .await
+                .unwrap_or(false);
+                if same {
+                    Ok(())
+                } else {
+                    Err("its definition is no longer the one confirmed".to_owned())
+                }
             })
-            .await;
-        }
+        })
     }
 
     fn start_kept(&mut self, id: &str) {
         let attempt = self.keep.next_attempt;
         self.keep.next_attempt += 1;
         let runs_plugin = matches!(&*self.sign_in(id), SignIn::Plugin(_));
+        let check = self
+            .keep
+            .consents
+            .get(id)
+            .filter(|_| runs_plugin)
+            .map(|consent| self.launch_check(id, Arc::clone(consent)));
         let failed = self.internal_tx.clone();
         let cluster_name = id.to_owned();
-        let access = CredentialAccess::consented(Arc::new(move || {
-            let _ = failed.send(Internal::KeepWatchFailed {
-                cluster: cluster_name.clone(),
-                attempt,
-            });
-        }));
+        let access = CredentialAccess::consented(
+            Arc::new(move || {
+                let _ = failed.send(Internal::KeepWatchFailed {
+                    cluster: cluster_name.clone(),
+                    attempt,
+                });
+            }),
+            check,
+            self.keep.plugin_runs.clone(),
+        );
         let mut kubeconfig = self.kubeconfig.merged.clone();
         cluster::disable_interactive_exec(&mut kubeconfig);
         let (name, task_access) = (id.to_owned(), access.clone());
@@ -295,6 +378,7 @@ impl ClusterManager {
                 attempt,
                 fingerprint,
                 runs_plugin,
+                interrupted: false,
                 access,
                 connecting: Some(task.abort_handle()),
                 feed: None,
@@ -334,7 +418,9 @@ impl ClusterManager {
                 self.telemetry.publish(id, &mut feed, trends);
                 kept.feed = Some(feed);
             }
-            Err(sign_in) if sign_in || kept.runs_plugin => self.stop_kept(id),
+            Err(sign_in) if !kept.interrupted && (sign_in || kept.runs_plugin) => {
+                self.stop_kept(id);
+            }
             Err(_) => {
                 self.keep.feeds.remove(id);
                 self.keep
@@ -375,28 +461,191 @@ impl ClusterManager {
         self.keep.retry_at.remove(id);
     }
 
-    /// Turns watching off (`None`), or on for the exact definition the confirmation showed.
+    /// Turns watching off (`None`), at once and whether or not the settings can be written, or on
+    /// for a credential that runs nothing, on the definition `shown`.
     pub(super) async fn set_keep_watching(&mut self, id: ClusterId, shown: Option<u64>) {
-        let entry = match shown {
-            None => None,
-            Some(shown) => match self.watch_entry(&id, shown) {
-                Ok(entry) => Some(entry),
-                Err(why) => {
-                    self.emit(Event::Error(why));
-                    return;
-                }
-            },
+        let Some(shown) = shown else {
+            self.keep.consents.remove(&id);
+            self.keep.offers.remove(&id);
+            self.keep.feeds.remove(&id);
+            self.keep_watching_acted_on(&id);
+            self.keep.voided.remove(&id);
+            self.keep.turned_off.insert(id.clone());
+            let name = id.clone();
+            self.write_settings("keep watching", move |dir| {
+                crate::settings::set_watched_cluster(dir, &name, None)
+            })
+            .await;
+            if self.settings.watched_cluster(&id).is_none() {
+                self.keep.turned_off.remove(&id);
+            }
+            return;
         };
-        self.keep_watching_acted_on(&id);
-        self.keep.voided.remove(&id);
-        self.keep.to_clear.retain(|pending| *pending != id);
-        self.write_settings("keep watching", move |dir| {
-            crate::settings::set_watched_cluster(dir, &id, entry)
-        })
-        .await;
+        let entry = match self.watch_entry(&id, shown) {
+            Ok(entry) => entry,
+            Err(why) => {
+                self.emit(Event::Error(why));
+                return;
+            }
+        };
+        self.save_watched(id, entry, None).await;
     }
 
-    /// The entry for watching `id`, if the definition is still the one confirmed.
+    /// Writes `id`'s entry, and holds `consent` only if the entry is there afterwards.
+    async fn save_watched(
+        &mut self,
+        id: ClusterId,
+        entry: WatchedCluster,
+        consent: Option<PluginConsent>,
+    ) {
+        self.keep_watching_acted_on(&id);
+        self.keep.voided.remove(&id);
+        self.keep.turned_off.remove(&id);
+        let server = entry.server.clone();
+        let name = id.clone();
+        self.write_settings("keep watching", move |dir| {
+            crate::settings::set_watched_cluster(dir, &name, Some(entry))
+        })
+        .await;
+        let saved = self
+            .settings
+            .watched_cluster(&id)
+            .is_some_and(|entry| entry.server == server);
+        if let (true, Some(consent)) = (saved, consent) {
+            self.keep.consents.insert(id, Arc::new(consent));
+        }
+    }
+
+    /// Whether `id` is on the list of clusters to keep watching and was not turned off.
+    fn is_kept(&self, id: &str) -> bool {
+        self.settings.watched_cluster(id).is_some() && !self.keep.turned_off.contains(id)
+    }
+
+    /// The background sign-in toggle was turned off: no new launch, and the watch stops.
+    pub(super) fn revoke_background_sign_in(&mut self, id: &str) {
+        self.keep.consents.remove(id);
+        self.keep.offers.remove(id);
+        self.keep.feeds.remove(id);
+        self.keep.stopped.remove(id);
+        self.keep.retry_at.remove(id);
+    }
+
+    /// An offer to turn on `id`'s background sign-in, if `shown` still names its definition.
+    /// Replaces any earlier offer. A refused one leaves nothing that could be approved later.
+    pub(super) fn offer_keep_watching(
+        &mut self,
+        id: &str,
+        shown: u64,
+    ) -> Result<PluginOffer, String> {
+        self.keep.offers.remove(id);
+        let Some(slot) = self.cluster(id) else {
+            return Err(format!("cluster \"{id}\" no longer exists"));
+        };
+        let fingerprint = slot.fingerprint;
+        let server = slot.info.server.clone();
+        if let Some(why) = self.keep_refusal(id) {
+            return Err(why);
+        }
+        if !self.is_kept(id) {
+            return Err(format!("Turn on Keep Watching for \"{id}\" first."));
+        }
+        let Some(server) = server else {
+            return Err(format!("\"{id}\" names no server."));
+        };
+        let sign_in = self.sign_in(id);
+        let SignIn::Plugin(definition) = &*sign_in else {
+            return Err(format!("\"{id}\" does not sign in through a command."));
+        };
+        if self.keep.view_key.as_ref().map(|key| key.name(definition)) != Some(shown) {
+            return Err(format!(
+                "\"{id}\" changed. Check its sign-in and try again."
+            ));
+        }
+        let unrecorded = || "Flint could not record this choice.".to_owned();
+        let consent = PluginConsent::seal(definition).ok_or_else(unrecorded)?;
+        let ticket = OfferTicket::new().ok_or_else(unrecorded)?;
+        self.keep.offers.insert(
+            id.to_owned(),
+            PendingOffer {
+                ticket: ticket.clone(),
+                consent,
+                fingerprint,
+                server,
+            },
+        );
+        Ok(PluginOffer {
+            context: id.to_owned(),
+            ticket,
+        })
+    }
+
+    /// The person turned the toggle on. The offer is used up here, whether or not it still holds.
+    pub(super) async fn approve_keep_watching(&mut self, approval: PluginApproval) {
+        let PluginApproval { context, ticket } = approval;
+        if self
+            .keep
+            .offers
+            .get(&context)
+            .is_none_or(|offer| offer.ticket != ticket)
+        {
+            self.emit(Event::Error(format!(
+                "\"{context}\": turn its background sign-in on again."
+            )));
+            return;
+        }
+        let Some(offer) = self.keep.offers.remove(&context) else {
+            return;
+        };
+        match self.approved_entry(&context, &offer) {
+            Ok(entry) => {
+                self.save_watched(context, entry, Some(offer.consent)).await;
+            }
+            Err(why) => self.emit(Event::Error(why)),
+        }
+    }
+
+    /// The entry for `id`, if it is still exactly what `offer` showed and nothing refuses it.
+    fn approved_entry(&self, id: &str, offer: &PendingOffer) -> Result<WatchedCluster, String> {
+        let changed = || format!("\"{id}\" changed. Check its sign-in and try again.");
+        let Some(slot) = self.cluster(id) else {
+            return Err(format!("cluster \"{id}\" no longer exists"));
+        };
+        if !self.is_kept(id) {
+            return Err(format!("Turn on Keep Watching for \"{id}\" first."));
+        }
+        if slot.fingerprint != offer.fingerprint
+            || slot.info.server.as_deref() != Some(offer.server.as_str())
+        {
+            return Err(changed());
+        }
+        if let Some(why) = self.keep_refusal(id) {
+            return Err(why);
+        }
+        match &*self.sign_in(id) {
+            SignIn::Plugin(definition) if offer.consent.holds(definition) => Ok(WatchedCluster {
+                context: id.to_owned(),
+                server: offer.server.clone(),
+            }),
+            _ => Err(changed()),
+        }
+    }
+
+    /// The app is quitting: ends every grant, and answers once their plugins are gone, or after
+    /// [`QUIT_WAIT`]. The wait runs apart from the manager's loop.
+    pub(super) fn stop_keep_watching(&mut self, reply: tokio::sync::oneshot::Sender<()>) {
+        self.keep.quitting = true;
+        self.keep.consents.clear();
+        self.keep.offers.clear();
+        self.keep.feeds.clear();
+        let runs = self.keep.plugin_runs.clone();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(QUIT_WAIT, runs.ended()).await;
+            let _ = reply.send(());
+        });
+    }
+
+    /// The entry for watching `id`, if the definition is still the one the request was made on.
+    /// For an exec plugin this runs nothing until its background sign-in toggle is turned on.
     fn watch_entry(&self, id: &str, shown: u64) -> Result<WatchedCluster, String> {
         let Some(slot) = self.cluster(id) else {
             return Err(format!("cluster \"{id}\" no longer exists"));
@@ -412,17 +661,9 @@ impl ClusterManager {
         let Some(server) = slot.info.server.clone() else {
             return Err(format!("\"{id}\" names no server."));
         };
-        let plugin_consent = match &*self.sign_in(id) {
-            SignIn::Plugin(definition) => Some(
-                PluginConsent::seal(definition)
-                    .ok_or_else(|| "Flint could not record this confirmation.".to_owned())?,
-            ),
-            _ => None,
-        };
         Ok(WatchedCluster {
             context: id.to_owned(),
             server,
-            plugin_consent,
         })
     }
 
@@ -470,13 +711,34 @@ impl ClusterManager {
             .iter()
             .map(|slot| {
                 let id = slot.info.name.clone();
-                let command = match &*self.sign_in(&id) {
-                    SignIn::Plugin(definition) => Some(definition.command.clone()),
-                    _ => None,
+                let found = self.sign_in(&id);
+                let (sign_in, command, shown_sign_in) = match &*found {
+                    SignIn::Static => (BackgroundSignIn::NotNeeded, None, None),
+                    SignIn::Provider | SignIn::Unknown => {
+                        (BackgroundSignIn::Unavailable, None, None)
+                    }
+                    SignIn::Plugin(definition) => {
+                        let on = self
+                            .keep
+                            .consents
+                            .get(&id)
+                            .is_some_and(|consent| consent.holds(definition));
+                        (
+                            if on {
+                                BackgroundSignIn::On
+                            } else {
+                                BackgroundSignIn::Off
+                            },
+                            Some(definition.command.clone()),
+                            self.keep.view_key.as_ref().map(|key| key.name(definition)),
+                        )
+                    }
                 };
                 let view = KeepWatchView {
                     status: self.keep_status(&id),
+                    sign_in,
                     command,
+                    shown_sign_in,
                     definition: slot.fingerprint,
                     refusal: self.keep_refusal(&id),
                 };
@@ -493,3 +755,7 @@ impl ClusterManager {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "keep_watching_tests.rs"]
+mod tests;

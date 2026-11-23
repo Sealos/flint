@@ -629,7 +629,6 @@ impl ClusterManager {
                 Some(msg) = internal_rx.recv() => self.handle_internal(msg).await,
             }
             self.sync_keep_watching();
-            self.clear_voided_consents().await;
             self.sync_telemetry();
         }
     }
@@ -654,6 +653,8 @@ impl ClusterManager {
                 cluster,
                 definition,
             } => self.set_keep_watching(cluster, definition).await,
+            Command::ApproveKeepWatching(approval) => self.approve_keep_watching(approval).await,
+            Command::RevokeBackgroundSignIn(cluster) => self.revoke_background_sign_in(&cluster),
             Command::SetAiExposed {
                 cluster,
                 server,
@@ -741,6 +742,14 @@ impl ClusterManager {
             Request::KeepWatching { reply } => {
                 let _ = reply.send(self.keep_watching_views());
             }
+            Request::OfferKeepWatching {
+                cluster,
+                shown,
+                reply,
+            } => {
+                let _ = reply.send(self.offer_keep_watching(&cluster, shown));
+            }
+            Request::StopKeepWatching { reply } => self.stop_keep_watching(reply),
             // Requests are handled without waiting: the reload runs as an internal message.
             Request::ReloadKubeconfig { reply } => {
                 let _ = self.internal_tx.send(Internal::ReloadKubeconfig { reply });
@@ -1761,6 +1770,7 @@ impl ClusterManager {
             self.reload_settings().await;
         }
         if changed.kubeconfig {
+            self.suspend_kept_plugins();
             self.marks.changed(self.read_seq);
             self.reload_kubeconfig().await;
         }

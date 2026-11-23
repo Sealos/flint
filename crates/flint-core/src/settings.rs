@@ -380,8 +380,8 @@ pub struct Settings {
     /// Post a desktop notification when a watched cluster has a new problem (#210). Off by
     /// default. Covers only clusters with a telemetry feed, which watch mode On view never has.
     pub desktop_notifications: bool,
-    /// Clusters kept watched in the background (ADR-0012), each bound to its server and, for an
-    /// exec plugin, to the definition that was confirmed. Change them through
+    /// Clusters kept watched in the background (ADR-0012), each bound to its server. Agreement to
+    /// run an exec plugin is not here: it lasts until the app quits. Change them through
     /// [`set_watched_cluster`].
     #[serde(
         deserialize_with = "crate::keep_watching::readable_watched",
