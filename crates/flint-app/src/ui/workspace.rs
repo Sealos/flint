@@ -2534,6 +2534,11 @@ impl Workspace {
             .dashboard
             .as_ref()
             .filter(|_| !matches!(cluster.state, ConnectionState::Failed(_)));
+        let overview_notice = dashboard
+            .filter(|_| matches!(cluster.state, ConnectionState::Connecting))
+            .and_then(|_| {
+                connection_progress::connecting_notice(&cluster, model.active_progress(), theme)
+            });
         let content: AnyElement = match (&self.list, &cluster.state) {
             _ if dashboard.is_some() => div()
                 .flex_1()
@@ -2658,6 +2663,7 @@ impl Workspace {
                     .aria_label(text)
                     .test_support()
             }))
+            .children(overview_notice)
             .child(content)
             .into_any_element()
     }

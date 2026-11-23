@@ -84,6 +84,31 @@ pub(super) fn connecting(
         .into_any_element()
 }
 
+/// A line above a view that stays open while the selected cluster connects, once there is
+/// something to say.
+pub(super) fn connecting_notice(
+    cluster: &ClusterSummary,
+    progress: Option<&ConnectionProgress>,
+    theme: &Theme,
+) -> Option<AnyElement> {
+    let text = connecting_text(cluster.info.server.as_deref(), progress?.since.elapsed())?;
+    Some(
+        h_flex()
+            .px_3()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(text),
+            )
+            .child(cancel_button())
+            .into_any_element(),
+    )
+}
+
 /// The waiting retry under a failure, with its Cancel, if one is waiting.
 pub(super) fn retry_notice(
     progress: Option<&ConnectionProgress>,

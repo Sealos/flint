@@ -5,7 +5,7 @@
 //! person asked for, so it is only made for a failure that time can fix, on the definition they
 //! selected, and never with a credential that runs a program.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::schedule::{Jitter, backoff_delay};
 use crate::api_error::Transport;
@@ -15,6 +15,10 @@ use crate::handle::ConnectionProgress;
 /// How many automatic retries follow one selection or manual retry, about six minutes of backoff.
 /// After that the failure stays on screen with its Retry button.
 pub(crate) const MAX_AUTOMATIC_RETRIES: u32 = 10;
+
+/// How long a series may run from its first attempt, delays and attempts together, so a server
+/// that accepts connections and never answers cannot stretch it.
+pub(crate) const RETRY_WINDOW: Duration = Duration::from_secs(390);
 
 /// Whether the same request could succeed later with nothing changed on this side. Credentials,
 /// TLS trust, configuration and refusals by the API need a person, so anything not known to be
@@ -47,6 +51,8 @@ pub(crate) enum RetryPhase {
         transient: bool,
         may_retry: bool,
     },
+    /// Paused or disconnected: nothing runs now, and what the series used stays used.
+    Waiting,
     /// Connected, or not trying.
     Settled,
 }
@@ -70,10 +76,11 @@ pub(crate) struct SelectedRetry {
 }
 
 impl SelectedRetry {
-    /// The person selected the cluster or asked to retry it. A `failed` connection starts over.
-    pub fn selected(&mut self, failed: bool) {
+    /// The person selected the cluster or asked to retry it. With no attempt under way (`idle`),
+    /// the series starts over.
+    pub fn selected(&mut self, idle: bool) {
         self.selected = None;
-        if failed {
+        if idle {
             self.current = None;
         }
     }
@@ -115,6 +122,10 @@ impl SelectedRetry {
             self.current = None;
             return;
         }
+        if phase == RetryPhase::Waiting {
+            self.cancel();
+            return;
+        }
         let on_selected = self.selected.as_ref() == Some(&target);
         let tracked = self.current.get_or_insert(Tracked {
             target,
@@ -142,13 +153,41 @@ impl SelectedRetry {
                         tracked.stopped = true;
                     }
                     if !tracked.stopped {
-                        tracked.retries += 1;
-                        tracked.retry_at = Some(now + backoff_delay(tracked.retries, jitter));
+                        let at = now + backoff_delay(tracked.retries + 1, jitter);
+                        if at < tracked.since + RETRY_WINDOW {
+                            tracked.retries += 1;
+                            tracked.retry_at = Some(at);
+                        } else {
+                            tracked.stopped = true;
+                        }
                     }
                 }
             }
-            RetryPhase::Settled => {}
+            RetryPhase::Waiting | RetryPhase::Settled => {}
         }
+    }
+
+    /// Whether a retry is waiting for its time.
+    pub fn is_pending(&self) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|tracked| tracked.retry_at.is_some())
+    }
+
+    /// When the current series must be over.
+    pub fn deadline(&self) -> Option<Instant> {
+        let tracked = self.current.as_ref()?;
+        Some(tracked.since + RETRY_WINDOW)
+    }
+
+    /// Whether automatic retries have run on this slot, so that a change to its definition is
+    /// for the person to act on.
+    pub fn has_retried(&self, cluster: &str, generation: u64) -> bool {
+        self.current.as_ref().is_some_and(|tracked| {
+            tracked.retries > 0
+                && tracked.target.cluster == cluster
+                && tracked.target.generation == generation
+        })
     }
 
     /// Takes the pending retry, if there is one.

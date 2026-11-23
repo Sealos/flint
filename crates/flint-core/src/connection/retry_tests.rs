@@ -165,6 +165,56 @@ fn a_definition_changed_across_a_settled_state_gets_no_retry() {
 }
 
 #[test]
+fn a_pause_keeps_what_the_series_used_until_the_next_selection() {
+    let now = Instant::now();
+    let mut retry = failing(now);
+    see(&mut retry, RetryPhase::Waiting, now);
+    assert!(!retry.is_pending());
+    see(&mut retry, RetryPhase::Connecting, now);
+    see(&mut retry, failed(2), now);
+    assert_eq!(next_retry(&retry), None);
+    assert_eq!(retry.progress().unwrap().retries, 1);
+
+    retry.selected(true);
+    see(&mut retry, RetryPhase::Connecting, now);
+    see(&mut retry, failed(3), now);
+    assert!(next_retry(&retry).is_some());
+}
+
+#[test]
+fn waiting_with_no_series_shows_nothing() {
+    let now = Instant::now();
+    let mut retry = SelectedRetry::default();
+    see(&mut retry, RetryPhase::Waiting, now);
+    assert!(retry.progress().is_none());
+}
+
+#[test]
+fn a_series_ends_at_its_time_limit_however_slow_the_attempts() {
+    let start = Instant::now();
+    let mut retry = failing(start);
+    assert!(retry.take_due());
+    let late = start + RETRY_WINDOW - Duration::from_secs(1);
+    see(&mut retry, RetryPhase::Connecting, late);
+    see(&mut retry, failed(2), late);
+    assert_eq!(next_retry(&retry), None);
+    assert_eq!(retry.deadline(), Some(start + RETRY_WINDOW));
+}
+
+#[test]
+fn the_full_backoff_fits_the_time_limit() {
+    let start = Instant::now();
+    let mut retry = SelectedRetry::default();
+    let mut now = start;
+    for attempt in 1..=u64::from(MAX_AUTOMATIC_RETRIES) {
+        see(&mut retry, RetryPhase::Connecting, now);
+        see(&mut retry, failed(attempt), now);
+        now = next_retry(&retry).expect("a retry is waiting");
+        assert!(retry.take_due());
+    }
+}
+
+#[test]
 fn a_removed_or_deselected_context_stops() {
     let now = Instant::now();
     let mut retry = failing(now);
