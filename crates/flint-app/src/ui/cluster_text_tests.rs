@@ -6,11 +6,12 @@ use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AppContext as _, TestAppContext, VisualTestContext, px, size};
 use serde_json::{Value, json};
 
-use super::super::{trust_dialog, unlock_dialog, writes_paused_reason};
+use super::super::{expose_dialog, trust_dialog, unlock_dialog, writes_paused_reason};
+use super::resource_actions_tests::connect_deletable;
 use super::row_actions_tests::{
     activate, dispatch, draw, open_list, pod_detail, pods_entry, show_fetched,
 };
-use crate::ui::resource_actions::{available, offered};
+use crate::ui::resource_actions::{ResourceAction, available, offered};
 use crate::ui::support_tests::{
     TestWorkspace, kubeconfig_yaml, open_workspace, open_workspace_with, pods,
 };
@@ -46,6 +47,19 @@ fn set_provisional(cx: &mut TestAppContext, t: &TestWorkspace, provisional: bool
             .find(|c| c.info.name == "kind-alpha")
             .unwrap();
         alpha.provisional = provisional;
+        cx.notify();
+    });
+    draw(cx, t);
+}
+
+fn set_sessions_paused(cx: &mut TestAppContext, t: &TestWorkspace, paused: bool) {
+    t.model.update(cx, |model, cx| {
+        let alpha = model
+            .clusters
+            .iter_mut()
+            .find(|c| c.info.name == "kind-alpha")
+            .unwrap();
+        alpha.paused = paused;
         cx.notify();
     });
     draw(cx, t);
@@ -134,6 +148,46 @@ async fn a_changed_url_that_displays_the_same_is_explained(cx: &mut TestAppConte
         !tip.contains("hidden-value") && !tip.contains("someone"),
         "{tip}"
     );
+}
+
+// A pin's URL can hold a value in its path, on the current URL's host or on another.
+#[gpui_kit::test]
+async fn a_changed_url_shows_only_its_origin(cx: &mut TestAppContext) {
+    const VALUE: &str = "path-hidden-value";
+    let pinned = format!("https://127.0.0.1:9/k8s/{VALUE}?x=1");
+    for (server, origin) in [
+        ("https://127.0.0.2:9", "at https://127.0.0.1:9,"),
+        (
+            "https://127.0.0.1:9",
+            "at another path on https://127.0.0.1:9,",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.toml"),
+            format!(
+                "protect_local_clusters = true\n\
+                 trusted_clusters = [{{ context = \"kind-alpha\", server = \"{pinned}\" }}]\n\
+                 ai_exposed_clusters = [{{ context = \"kind-alpha\", server = \"{pinned}\" }}]\n"
+            ),
+        )
+        .unwrap();
+        let t = open_workspace_with(cx, dir.path(), |dir, _| {
+            let path = dir.join("kubeconfig");
+            std::fs::write(&path, kubeconfig_yaml(&[("kind-alpha", server)])).unwrap();
+            vec![path]
+        })
+        .await;
+        draw(cx, &t);
+
+        let tip = t.description(cx, "cluster-kind-alpha").unwrap_or_default();
+        assert!(tip.contains(origin), "{tip}");
+        let trust = trust_dialog("alpha", "kind-alpha", server, Some(&pinned)).text;
+        let expose = expose_dialog("kind-alpha", server, Some(&pinned)).text;
+        for text in [&tip, &trust, &expose] {
+            assert!(!text.contains(VALUE) && !text.contains("/k8s"), "{text}");
+        }
+    }
 }
 
 #[gpui_kit::test]
@@ -230,6 +284,7 @@ async fn an_unreadable_kubeconfig_explains_the_disabled_actions(cx: &mut TestApp
     const WHY: &str = "a kubeconfig file can't be read";
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
+    connect_deletable(cx, &t).await;
     activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
     dispatch(
@@ -244,6 +299,14 @@ async fn an_unreadable_kubeconfig_explains_the_disabled_actions(cx: &mut TestApp
     assert!(!shell_disabled(cx, &t));
     let flag = |shown: &AppState| shown.clusters[0].kubeconfig_unreadable;
     assert!(!flag(&state(cx, &t)));
+    let delete = |cx: &mut TestAppContext| {
+        let detail = t.detail(cx).unwrap();
+        t.workspace.read_with(cx, |ws, cx| {
+            assert!(offered(ws, detail.read(cx), cx).contains(&ResourceAction::Delete));
+            available(ws, ResourceAction::Delete, cx)
+        })
+    };
+    assert_eq!(delete(cx), Ok(()));
 
     set_provisional(cx, &t, true);
     let shown = state(cx, &t);
@@ -265,6 +328,13 @@ async fn an_unreadable_kubeconfig_explains_the_disabled_actions(cx: &mut TestApp
             assert!(why.contains(WHY), "{why}");
         }
     });
+    assert!(delete(cx).is_err_and(|why| why.contains(WHY)));
+
+    // The full pause is checked first, and still names the cause.
+    set_sessions_paused(cx, &t, true);
+    assert!(shell_disabled(cx, &t));
+    assert!(delete(cx).is_err_and(|why| why.contains(WHY) && why.contains("waiting")));
+    set_sessions_paused(cx, &t, false);
 
     set_provisional(cx, &t, false);
     assert!(!flag(&state(cx, &t)));
@@ -272,4 +342,5 @@ async fn an_unreadable_kubeconfig_explains_the_disabled_actions(cx: &mut TestApp
     assert!(!texts(cx, &t).iter().any(|s| s.contains(WHY)));
     let edit = detail.read_with(cx, |d, _| d.edit_blocked());
     assert!(!edit.is_some_and(|why| why.contains(WHY)));
+    assert_eq!(delete(cx), Ok(()));
 }

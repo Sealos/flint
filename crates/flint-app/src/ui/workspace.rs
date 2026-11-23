@@ -3141,19 +3141,23 @@ fn shown_host(server: &str) -> String {
 
 /// How a dialog names the server a pin was made for. Two different URLs can show as the same
 /// text, and "trusted at X, which is a different server" would then read as a contradiction.
+/// Only the old URL's origin is named: its path is not needed to tell the two apart.
 fn previous_address(server: &str, previous: &str) -> String {
-    let shown = flint_core::redact::server_url(previous);
-    if shown == flint_core::redact::server_url(server) {
+    use flint_core::redact::{server_origin, server_url};
+    let origin = server_origin(previous);
+    if server_url(previous) == server_url(server) {
         "another URL that shows the same here".to_owned()
+    } else if origin == server_origin(server) {
+        format!("another path on {origin}")
     } else {
-        shown
+        origin
     }
 }
 
 /// [`previous_address`] for a context that may have no server now, as a sidebar tooltip says it.
 pub(super) fn changed_from(server: Option<&str>, previous: &str) -> String {
     server.map_or_else(
-        || flint_core::redact::server_url(previous),
+        || flint_core::redact::server_origin(previous),
         |server| previous_address(server, previous),
     )
 }
