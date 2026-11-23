@@ -155,7 +155,10 @@ impl DetailView {
     pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
         bind.bind::<Refresh>(|view, _, window, cx| view.refresh(window, cx))
             .bind::<Close>(|_, _, _, cx| cx.emit(DetailEvent::Close))
-            .bind::<ShowOverview>(|view, _, _, cx| view.show_tab(DetailTab::Overview, cx))
+            .bind::<ShowOverview>(|view, _, window, cx| {
+                view.keep_focus_from_hidden_editor(window, cx);
+                view.show_tab(DetailTab::Overview, cx);
+            })
             .bind::<ShowYaml>(|view, _, window, cx| {
                 view.show_tab(DetailTab::Yaml, cx);
                 view.focus_shown_editor(window, cx);

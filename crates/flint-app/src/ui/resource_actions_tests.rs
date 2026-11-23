@@ -1104,6 +1104,26 @@ async fn a_yaml_apply_refused_by_a_claim_says_why(cx: &mut TestAppContext) {
     cx.update(|cx| release(&web_key(), cx));
 }
 
+// Leaving the YAML tab with the editor focused keeps focus in the detail pane.
+#[gpui_kit::test]
+async fn leaving_the_yaml_tab_keeps_focus_in_the_detail(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let api = LocalApi::start(&[]);
+    let t = connected(cx, dir.path(), &api).await;
+    let detail = edit_web(cx, &t).await;
+    cx.update_window(t.window, |_, window, cx| {
+        assert!(detail.read(cx).editor_has_focus(window, cx));
+    })
+    .unwrap();
+    t.dispatch(cx, "detail::ShowOverview", Value::Null).unwrap();
+    draw(cx, &t);
+    draw(cx, &t);
+    cx.update_window(t.window, |_, window, cx| {
+        assert!(detail.read(cx).focus_handle().is_focused(window));
+    })
+    .unwrap();
+}
+
 // In a narrow window, Tab back to a detail with an edit open puts the keys in the editor.
 #[gpui_kit::test]
 async fn tab_back_to_a_hidden_edit_focuses_the_editor(cx: &mut TestAppContext) {

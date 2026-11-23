@@ -528,6 +528,20 @@ impl DetailView {
         }
     }
 
+    /// Moves focus from the editor to this pane as the editor is about to be hidden. Left on a
+    /// control no longer drawn, focus would fall through to the list.
+    pub(super) fn keep_focus_from_hidden_editor(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(edit) = &self.edit
+            && edit.editor.read(cx).focus_handle(cx).is_focused(window)
+        {
+            self.focus.focus(window, cx);
+        }
+    }
+
     /// [`Self::focus_shown_editor`] for a result that arrives later: only while focus is still
     /// in this pane, so it never pulls focus from where it was moved since the request.
     fn return_focus_to_editor(&self, window: &mut Window, cx: &mut Context<Self>) {
