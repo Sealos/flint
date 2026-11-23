@@ -10,9 +10,45 @@ use std::rc::Rc;
 use flint_core::Appearance;
 use flint_core::settings::ClusterTag;
 use gpui_kit::component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode, ThemeSet};
-use gpui_kit::{App, Div, Hsla, Pixels, SharedString, Styled as _, WindowAppearance, div, px};
+use gpui_kit::{
+    App, Div, Hsla, InteractiveElement, MouseButton, Pixels, SharedString, Styled as _, Window,
+    WindowAppearance, div, px,
+};
 
 use super::accent::{ACCENT, Accent, Shades};
+
+/// The width of the macOS traffic lights and the space around them.
+const MAC_TRAFFIC_LIGHTS_WIDTH: f32 = 76.;
+
+/// How far the leftmost pane's title row starts from the window's edge, clear of the traffic
+/// lights. None on Linux, or in full screen, where the lights are hidden.
+pub fn traffic_light_inset(window: &Window) -> Pixels {
+    if cfg!(target_os = "macos") && !window.is_fullscreen() {
+        px(MAC_TRAFFIC_LIGHTS_WIDTH)
+    } else {
+        px(0.)
+    }
+}
+
+/// Makes the empty parts of a top row act as the macOS title bar: dragging moves the window and
+/// a double click zooms or minimizes it, as the system setting says. A control in the row keeps
+/// its press, as it prevents the default. Off in unit tests: their platform cannot move a window.
+pub fn moves_window<E: InteractiveElement>(element: E) -> E {
+    if !cfg!(target_os = "macos") || cfg!(test) {
+        return element;
+    }
+    // not-an-action: window chrome, as the native title bar would handle this press.
+    element.on_mouse_down(MouseButton::Left, |event, window, _| {
+        if window.default_prevented() {
+            return;
+        }
+        if event.click_count == 2 {
+            window.titlebar_double_click();
+        } else {
+            window.start_window_move();
+        }
+    })
+}
 
 /// Both themes, without the accent.
 pub(super) const THEMES: &str = include_str!("themes/flint.json");

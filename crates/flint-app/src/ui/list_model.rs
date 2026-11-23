@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use flint_core::redact::{is_masked_column, is_secret_list};
-use flint_core::{Column, ColumnRole, ColumnType, KindSnapshot, SortBy};
+use flint_core::{Column, ColumnRole, ColumnType, KindSnapshot, NamespaceLimit, SortBy};
 
 /// The user's sort choice, by column key ([`Column::key`]), as `state.toml` keeps it per cluster
 /// and kind. Columns can change between snapshots (an edited CRD's printer columns), so the
@@ -654,6 +654,450 @@ fn word_tone(word: &str) -> Tone {
         // `Init:0/2`: init containers still running.
         w if w.contains('/') => Tone::Warning,
         _ => Tone::Normal,
+    }
+}
+
+/// Whether a current list without an object proves it gone. A namespace-limited list proves it
+/// only once the object's own namespace was listed after `seen`, the revision of the rows it
+/// was last in: a namespace no longer covered, or republished from old rows, says nothing.
+pub fn listing_proves_gone(
+    limit: Option<&NamespaceLimit>,
+    namespace: Option<&str>,
+    seen: Option<u64>,
+) -> bool {
+    let (Some(limit), Some(namespace)) = (limit, namespace) else {
+        return true;
+    };
+    limit
+        .revision_of(namespace)
+        .is_some_and(|now| now > seen.unwrap_or(0))
+}
+
+/// The view-model of a list over several clusters ([`flint_core::combined`]).
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "opening a combined list is wired in later")
+)]
+pub mod combined {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
+    use flint_core::combined::{
+        ColumnKey, CombineError, CombinedCell, CombinedColumn, CombinedLine, CombinedList,
+        CombinedMember, CombinedQuery, CombinedRowId, CombinedSort, CombinedView, RowRef,
+    };
+    use flint_core::redact::{is_masked_column, is_secret_list};
+    use flint_core::{ClusterId, Column, ColumnRole, Feed, KindId, NamespaceLimit, SyncState};
+
+    use super::{listing_proves_gone, visible_columns};
+
+    /// What one member's rows cover, which the core keeps private to it.
+    #[derive(Debug, Clone, Default)]
+    pub struct MemberCoverage {
+        /// The revision of the member's whole list.
+        pub revision: u64,
+        /// Set when the member lists namespace by namespace.
+        pub limit: Option<Arc<NamespaceLimit>>,
+    }
+
+    /// Where a selected row was last seen, to judge a later list without it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RowSeen {
+        pub namespace: Option<Box<str>>,
+        pub revision: u64,
+    }
+
+    /// The selection judged against a new list and view.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct TrackedRow {
+        pub line: Option<usize>,
+        pub seen: Option<RowSeen>,
+        pub gone: bool,
+    }
+
+    /// Column widths measured for one list and namespace scope.
+    #[derive(Debug, Clone)]
+    pub struct MeasuredWidths {
+        pub list: Arc<CombinedList>,
+        pub namespaces: Vec<String>,
+        pub widths: Arc<[usize]>,
+    }
+
+    /// What a combined list draws from: the merged list, plus what the core keeps private to
+    /// it and the shared cell code needs. Replaced as a whole, so its parts always agree.
+    #[derive(Debug, Clone)]
+    pub struct CombinedSource {
+        pub list: Arc<CombinedList>,
+        /// One per combined column, for the code single-cluster lists draw cells with.
+        pub columns: Arc<[Column]>,
+        /// Per combined column: whether any member masks it, so it cannot be sorted.
+        pub masked: Arc<[bool]>,
+        /// Per member of [`CombinedList::members`].
+        pub feeds: Arc<[Feed]>,
+        /// Per member of [`CombinedList::members`].
+        pub coverage: Arc<[MemberCoverage]>,
+        /// `None` with no members.
+        pub kind: Option<KindId>,
+    }
+
+    impl CombinedSource {
+        /// Merges `members`. What a later caller hands the list to open or update it.
+        pub fn new(members: Vec<CombinedMember>) -> Result<Self, CombineError> {
+            let kind = members.first().map(|m| m.snapshot.kind.clone());
+            let feed_of: HashMap<ClusterId, Feed> = members
+                .iter()
+                .map(|m| (m.snapshot.cluster.clone(), m.snapshot.feed))
+                .collect();
+            let coverage_of: HashMap<ClusterId, MemberCoverage> = members
+                .iter()
+                .map(|m| {
+                    let coverage = MemberCoverage {
+                        revision: m.snapshot.revision,
+                        limit: m.snapshot.limited_to.clone(),
+                    };
+                    (m.snapshot.cluster.clone(), coverage)
+                })
+                .collect();
+            let masked_keys: HashSet<ColumnKey> = members.iter().flat_map(masked_keys).collect();
+            let list = CombinedList::new(members)?;
+            let columns: Arc<[Column]> = list.columns().iter().map(as_column).collect();
+            let masked = list
+                .columns()
+                .iter()
+                .map(|c| masked_keys.contains(&c.key))
+                .collect();
+            let feeds = list
+                .members()
+                .iter()
+                .map(|m| feed_of.get(m.cluster()).copied().unwrap_or_default())
+                .collect();
+            let coverage = list
+                .members()
+                .iter()
+                .map(|m| coverage_of.get(m.cluster()).cloned().unwrap_or_default())
+                .collect();
+            Ok(Self {
+                list: Arc::new(list),
+                columns,
+                masked,
+                feeds,
+                coverage,
+                kind,
+            })
+        }
+
+        /// Rows across all members, before any filter.
+        pub fn total_rows(&self) -> usize {
+            self.list.members().iter().map(|m| m.row_count()).sum()
+        }
+    }
+
+    /// The keys of the columns `member` masks, numbered as the core numbers repeated headers.
+    fn masked_keys(member: &CombinedMember) -> Vec<ColumnKey> {
+        let snapshot = &member.snapshot;
+        let secret = is_secret_list(snapshot.kind.as_str());
+        let mut seen: HashMap<String, u32> = HashMap::new();
+        let mut masked = Vec::new();
+        for (i, column) in snapshot.columns.iter().enumerate() {
+            let key = column.key();
+            let count = seen.entry(key.clone()).or_default();
+            let occurrence = *count;
+            *count += 1;
+            if is_masked_column(secret, &snapshot.columns, i) {
+                masked.push(ColumnKey { key, occurrence });
+            }
+        }
+        masked
+    }
+
+    fn as_column(column: &CombinedColumn) -> Column {
+        Column {
+            name: column.name.clone(),
+            ty: column.ty,
+            format: column.format.clone(),
+            description: column.description.clone(),
+            priority: column.priority,
+            role: column.role.unwrap_or(ColumnRole::Value),
+        }
+    }
+
+    /// The sort after clicking the column `clicked`: ascending, descending, then default.
+    pub fn next_sort(current: Option<&CombinedSort>, clicked: &ColumnKey) -> Option<CombinedSort> {
+        match current {
+            Some(s) if s.column == *clicked && s.descending => None,
+            Some(s) if s.column == *clicked => Some(CombinedSort {
+                column: clicked.clone(),
+                descending: true,
+            }),
+            _ => Some(CombinedSort {
+                column: clicked.clone(),
+                descending: false,
+            }),
+        }
+    }
+
+    /// The sort to apply: `None` while its column is gone, not drawn, or masked by any member.
+    pub fn effective_sort(
+        source: &CombinedSource,
+        sort: Option<&CombinedSort>,
+        show_wide: bool,
+    ) -> Option<CombinedSort> {
+        let sort = sort?;
+        let column = source.list.column_index(&sort.column)?;
+        let drawn = visible_columns(&source.columns, show_wide).contains(&column);
+        (drawn && !source.masked[column]).then(|| sort.clone())
+    }
+
+    /// The cluster filter after clicking `cluster`'s chip. Empty means every cluster: the first
+    /// click narrows to one, and choosing the last one left out goes back to every cluster.
+    pub fn toggle_cluster(chosen: &mut Vec<ClusterId>, cluster: &str, members: usize) {
+        if let Some(at) = chosen.iter().position(|c| c == cluster) {
+            chosen.remove(at);
+            return;
+        }
+        chosen.push(cluster.to_owned());
+        if chosen.len() >= members {
+            chosen.clear();
+        }
+    }
+
+    /// Each column's width in characters over the sampled `rows`, for
+    /// [`super::ColumnWidths::update`]. The Cluster column leaves room for its dot.
+    pub fn measure(source: &CombinedSource, rows: &[RowRef], now: i64) -> Vec<usize> {
+        let step = (rows.len() / super::SAMPLE_ROWS).max(1);
+        source
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(col, column)| {
+                let cells = rows
+                    .iter()
+                    .step_by(step)
+                    .map(|&at| match source.list.cell(at, col, now) {
+                        CombinedCell::Cluster { name, tag } => {
+                            name.chars().count() + if tag.is_some() { 2 } else { 0 }
+                        }
+                        CombinedCell::Value(text) => text.chars().count(),
+                        CombinedCell::Masked => crate::ui::object::MASK.chars().count(),
+                        CombinedCell::Blank => 0,
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let max = if column.role == ColumnRole::Name {
+                    super::NAME_MAX_CHARS
+                } else {
+                    super::MAX_CHARS
+                };
+                cells
+                    .max(column.name.chars().count() + 2)
+                    .clamp(super::MIN_CHARS, max)
+            })
+            .collect()
+    }
+
+    /// The line of the row `id` in `view`, if it is shown. Linear: run off the UI thread, or
+    /// for a single click.
+    pub fn line_of(list: &CombinedList, view: &CombinedView, id: &CombinedRowId) -> Option<usize> {
+        (0..view.line_count()).find(|&line| {
+            matches!(view.line(line), Some(CombinedLine::Row(at))
+                if list.members()[at.member()].cluster() == &*id.cluster
+                    && list.row_info(at).is_some_and(|row| row.uid == &*id.uid))
+        })
+    }
+
+    /// Where the row at `at` is now, by its own member's coverage.
+    pub fn row_seen(source: &CombinedSource, at: RowRef) -> Option<RowSeen> {
+        let row = source.list.row_info(at)?;
+        let coverage = source.coverage.get(at.member())?;
+        let revision = match (&coverage.limit, row.namespace) {
+            (Some(limit), Some(namespace)) => limit.revision_of(namespace).unwrap_or(0),
+            _ => coverage.revision,
+        };
+        Some(RowSeen {
+            namespace: row.namespace.map(Into::into),
+            revision,
+        })
+    }
+
+    /// Finds the selected row `id` in a new list. It is gone only if its cluster left, or a
+    /// current list of its cluster covers its namespace and no longer holds it.
+    pub fn track_selection(
+        source: &CombinedSource,
+        view: &CombinedView,
+        id: &CombinedRowId,
+        seen: Option<&RowSeen>,
+        now: i64,
+    ) -> TrackedRow {
+        let list = &source.list;
+        if let Some(line) = line_of(list, view, id)
+            && let Some(CombinedLine::Row(at)) = view.line(line)
+        {
+            return TrackedRow {
+                line: Some(line),
+                seen: row_seen(source, at),
+                gone: false,
+            };
+        }
+        let kept = |seen: Option<RowSeen>| TrackedRow {
+            line: None,
+            seen,
+            gone: false,
+        };
+        let Some(member) = list
+            .members()
+            .iter()
+            .position(|m| m.cluster() == &*id.cluster)
+        else {
+            return TrackedRow {
+                gone: true,
+                ..kept(None)
+            };
+        };
+        // Hidden by a filter or a collapsed group, it still exists.
+        let all = list.compute(
+            &CombinedQuery {
+                clusters: vec![id.cluster.to_string()],
+                ..CombinedQuery::default()
+            },
+            now,
+        );
+        let held = all
+            .rows()
+            .iter()
+            .find(|&&at| list.row_info(at).is_some_and(|row| row.uid == &*id.uid));
+        if let Some(&at) = held {
+            return kept(row_seen(source, at));
+        }
+        let limit = source.coverage[member].limit.as_deref();
+        let proven = match seen {
+            Some(seen) => {
+                listing_proves_gone(limit, seen.namespace.as_deref(), Some(seen.revision))
+            }
+            None => limit.is_none(),
+        };
+        TrackedRow {
+            gone: list.members()[member].state().is_current() && proven,
+            ..kept(seen.cloned())
+        }
+    }
+
+    /// The widths for `query`'s namespaces. Filters, sorts and collapsing keep them, so only a
+    /// new list or scope measures again, from `view` when it already holds exactly that scope.
+    pub fn measure_scope(
+        source: &CombinedSource,
+        query: &CombinedQuery,
+        view: &CombinedView,
+        cached: Option<MeasuredWidths>,
+        now: i64,
+    ) -> MeasuredWidths {
+        if let Some(cached) = cached
+            && Arc::ptr_eq(&cached.list, &source.list)
+            && cached.namespaces == query.namespaces
+        {
+            return cached;
+        }
+        let whole_scope = query.text.is_empty()
+            && query.clusters.is_empty()
+            && query.sort.is_none()
+            && !query.group_by_cluster;
+        let widths = if whole_scope {
+            measure(source, view.rows(), now)
+        } else {
+            let scope = CombinedQuery {
+                namespaces: query.namespaces.clone(),
+                ..CombinedQuery::default()
+            };
+            measure(source, source.list.compute(&scope, now).rows(), now)
+        };
+        MeasuredWidths {
+            list: source.list.clone(),
+            namespaces: query.namespaces.clone(),
+            widths: widths.into(),
+        }
+    }
+
+    /// A limited member's short note: the namespaces its rows come from.
+    pub fn limited_note(limit: &NamespaceLimit) -> String {
+        if limit.listed.is_empty() {
+            "no namespaces listed".to_owned()
+        } else {
+            format!("only {}", limit.listed.join(", "))
+        }
+    }
+
+    /// The nearest row line after (or before) `from`, skipping group headers.
+    pub fn step_row(view: &CombinedView, from: Option<usize>, forward: bool) -> Option<usize> {
+        let is_row = |line: &usize| matches!(view.line(*line), Some(CombinedLine::Row(_)));
+        let count = view.line_count();
+        match (from, forward) {
+            (None, _) => (0..count).find(is_row),
+            (Some(at), true) => (at + 1..count).find(is_row).or(Some(at)),
+            (Some(at), false) => (0..at).rev().find(is_row).or(Some(at)),
+        }
+    }
+
+    /// The first or last row line.
+    pub fn edge_row(view: &CombinedView, last: bool) -> Option<usize> {
+        let is_row = |line: &usize| matches!(view.line(*line), Some(CombinedLine::Row(_)));
+        if last {
+            (0..view.line_count()).rev().find(is_row)
+        } else {
+            (0..view.line_count()).find(is_row)
+        }
+    }
+
+    /// What replaces the rows when none pass.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum EmptyState {
+        Loading,
+        NoRows,
+        /// No rows, but a chosen cluster lists only some namespaces: others may hold some.
+        NoRowsListed,
+        NoMatch,
+        /// A chosen cluster holds no rows and is not current, so its contents are unknown.
+        Unresolved,
+    }
+
+    /// `None` while any row passes. Judged over the clusters `chosen` (empty: all); each
+    /// member's own problem stays on its note.
+    pub fn empty_state(
+        source: &CombinedSource,
+        view: &CombinedView,
+        chosen: &[ClusterId],
+    ) -> Option<EmptyState> {
+        if view.matched() > 0 {
+            return None;
+        }
+        let members: Vec<_> = source
+            .list
+            .members()
+            .iter()
+            .zip(source.coverage.iter())
+            .filter(|(m, _)| chosen.is_empty() || chosen.iter().any(|c| c == m.cluster()))
+            .collect();
+        Some(if members.iter().any(|(m, _)| m.row_count() > 0) {
+            EmptyState::NoMatch
+        } else if members
+            .iter()
+            .any(|(m, _)| matches!(m.state(), SyncState::Idle | SyncState::Loading))
+        {
+            EmptyState::Loading
+        } else if members.iter().any(|(m, _)| !m.state().is_current()) {
+            EmptyState::Unresolved
+        } else if members.iter().any(|(_, c)| c.limit.is_some()) {
+            EmptyState::NoRowsListed
+        } else {
+            EmptyState::NoRows
+        })
+    }
+
+    /// The toolbar's count: "7", or "2 of 7" when filters hide some.
+    pub fn count_text(matched: usize, total: usize) -> String {
+        if matched == total {
+            total.to_string()
+        } else {
+            format!("{matched} of {total}")
+        }
     }
 }
 

@@ -42,6 +42,7 @@ use super::icons::FlintIcon;
 use super::list::{ListEvent, ResourceList};
 use super::log_view::{LogRequest, LogView};
 use super::nav::{NavEvent, NavPanel};
+use super::notice::{ServerMove, ServerMoves, notice};
 use super::palette::CommandPalette;
 use super::registry::{
     self, AddNamespace, BackToList, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, EditYaml,
@@ -65,10 +66,11 @@ use flint_core::settings::ClusterTag;
 /// The height of the main area's header and the list's toolbar.
 pub const HEADER_HEIGHT: f32 = 32.;
 
-/// Below this main area width the detail-alone header puts its namespace and watch controls on a
-/// second row. Fixed, so the layout does not change with label lengths while resizing: it holds
-/// the padding, Back, the longest labels of both controls, and a shortened context name.
-const HEADER_ONE_ROW_MIN_WIDTH: f32 = 590.;
+/// Below this main area width the header puts its access mode, namespace and watch controls on a
+/// second row, in their short forms. Fixed, so the layout does not change with label lengths
+/// while resizing: it holds the padding, Back, the longest labels of the three, and a shortened
+/// context name.
+const HEADER_ONE_ROW_MIN_WIDTH: f32 = 640.;
 
 /// The panes the user can resize by dragging their edge, with default and limit widths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,6 +256,8 @@ pub struct Workspace {
     narrow: bool,
     /// The main header shows two rows, as of the last draw: the dock leaves it more room.
     two_row_header: bool,
+    /// The active context's last move to another API server, for the main area's notice.
+    server_moves: ServerMoves,
     /// In a narrow window, the list is in front of the open detail.
     list_in_front: bool,
     /// A right button went down since the last draw: the row it selects stays on show, as it
@@ -434,6 +438,7 @@ impl Workspace {
             detail: None,
             narrow: false,
             two_row_header: false,
+            server_moves: ServerMoves::default(),
             list_in_front: false,
             right_press: false,
             menu_row_pending: false,
@@ -938,6 +943,15 @@ impl Workspace {
             .and_then(|c| model.discovered(c))
             .cloned()
             .unwrap_or_default();
+        match model.active_cluster() {
+            Some(c) => self.server_moves.observe(
+                &c.info.name,
+                c.endpoint,
+                c.confirmed,
+                c.info.server.as_deref(),
+            ),
+            None => self.server_moves.clear(),
+        }
         let generation = model.active_cluster().map(|c| c.generation);
         let cluster_changed = active != self.cluster || generation != self.generation;
         if cluster_changed {
@@ -1272,6 +1286,7 @@ impl Workspace {
     fn render_sidebar(
         &self,
         widths: &Layout,
+        traffic_lights: Pixels,
         theme: &Theme,
         focused: bool,
         cx: &Context<Self>,
@@ -1379,16 +1394,7 @@ impl Workspace {
             .text_color(theme.sidebar_foreground)
             .border_r_1()
             .border_color(theme.sidebar_border)
-            .child(
-                div()
-                    .px_3()
-                    .pt_3()
-                    .pb_1()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(theme.muted_foreground)
-                    .child("CLUSTERS"),
-            )
+            .child(pane_title("CLUSTERS", traffic_lights, theme))
             .child(list)
             .child(pane_handle(
                 "clusters-edge",
@@ -1667,16 +1673,7 @@ impl Workspace {
             .text_color(theme.sidebar_foreground)
             .border_r_1()
             .border_color(theme.sidebar_border)
-            .child(
-                div()
-                    .px_3()
-                    .pt_3()
-                    .pb_1()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(theme.muted_foreground)
-                    .child("RESOURCES"),
-            )
+            .child(pane_title("RESOURCES", px(0.), theme))
             .child(div().flex_1().min_h_0().child(self.nav.clone()))
             .child(pane_handle(
                 "nav-edge",
@@ -1764,8 +1761,8 @@ impl Workspace {
             .then(|| self.render_namespace_filter(&ns_summary, cx));
         let watch_mode = controls
             .watch_mode
-            .then(|| self.render_watch_mode(&name, cx));
-        let first_row = h_flex()
+            .then(|| self.render_watch_mode(&name, two_rows, cx));
+        let first_row = super::theme::moves_window(h_flex())
             .h(px(HEADER_HEIGHT))
             .flex_none()
             .px_3()
@@ -1788,6 +1785,7 @@ impl Workspace {
                 )
             })
             .child(breadcrumb);
+        let access_mode = self.render_access_mode(cluster, two_rows, theme, cx);
         if two_rows {
             v_flex()
                 .id("main-header")
@@ -1805,6 +1803,7 @@ impl Workspace {
                         .px_3()
                         .gap_2()
                         .justify_end()
+                        .child(access_mode)
                         .children(namespaces)
                         .children(watch_mode)
                         .test_support(),
@@ -1815,10 +1814,58 @@ impl Workspace {
             first_row
                 .border_b_1()
                 .border_color(theme.border)
+                .child(access_mode)
                 .children(namespaces)
                 .children(watch_mode)
                 .into_any_element()
         }
+    }
+
+    /// The active cluster's access mode, in words, from the same check the sidebar's lock shows.
+    /// Modes that allow writes get a filled, bold badge. Changing the mode stays on the lock.
+    /// `compact` shortens the words drawn; the accessible name and tooltip keep the whole mode.
+    fn render_access_mode(
+        &self,
+        cluster: &ClusterSummary,
+        compact: bool,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let model = self.model.read(cx);
+        let protection = model.protection(cluster);
+        let tip = protection_text(protection, &model.trust(cluster));
+        let text = access_mode_text(protection);
+        let (icon, writable) = match protection {
+            Protection::Protected => (FlintIcon::Lock, false),
+            Protection::Local | Protection::Unlocked => (FlintIcon::LockOpen, true),
+            Protection::Trusted => (FlintIcon::ShieldCheck, true),
+        };
+        let color = if writable {
+            theme.warning
+        } else {
+            theme.muted_foreground
+        };
+        h_flex()
+            .id("access-mode")
+            .aria_label(text)
+            .test_support()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .px_1p5()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(color.opacity(if writable { 0.7 } else { 0.3 }))
+            .when(writable, |el| el.bg(color.opacity(0.12)).font_semibold())
+            .text_xs()
+            .text_color(color)
+            .child(Icon::new(icon).xsmall())
+            .child(if compact {
+                access_mode_short_text(protection)
+            } else {
+                text
+            })
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
     }
 
     fn render_namespace_filter(&self, summary: &str, cx: &Context<Self>) -> impl IntoElement {
@@ -2018,7 +2065,13 @@ impl Workspace {
     }
 
     /// The watch mode switch: this cluster's override, and the global default (ADR-0008).
-    fn render_watch_mode(&self, cluster: &str, cx: &Context<Self>) -> impl IntoElement {
+    /// `compact` draws a short label; the accessible name and tooltip keep the whole mode.
+    fn render_watch_mode(
+        &self,
+        cluster: &str,
+        compact: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let settings = self.model.read(cx).settings.clone();
         let effective = settings.watch_mode_for(cluster);
         let label = watch_mode_label(effective);
@@ -2028,10 +2081,17 @@ impl Workspace {
         Button::new("watch-mode")
             .xsmall()
             .ghost()
-            .label(label)
+            .label(if compact {
+                watch_mode_short_label(effective)
+            } else {
+                label
+            })
+            .accessibility_label(label)
             .disabled(!settings_ok)
             .tab_stop(false)
-            .tooltip("Which kinds Flint keeps live (watches) on this cluster")
+            .tooltip(format!(
+                "{label}\nWhich kinds Flint keeps live (watches) on this cluster"
+            ))
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, cx| {
                 let settings = model.read(cx).settings.clone();
                 let own = settings.cluster_watch_mode.get(&cluster).copied();
@@ -2084,9 +2144,13 @@ impl Workspace {
 
     /// Whether the main header puts its controls on a second row in a window this wide.
     fn header_has_two_rows(&self, window_width: f32, cx: &App) -> bool {
+        header_needs_two_rows(self.main_width(window_width, cx))
+    }
+
+    /// The main area's width in a window this wide.
+    fn main_width(&self, window_width: f32, cx: &App) -> f32 {
         let widths = self.layout(window_width, cx);
-        let main_width = window_width - widths.clusters - widths.navigation;
-        self.main_panes(cx) == MainPanes::DetailAlone && header_needs_two_rows(main_width)
+        window_width - widths.clusters - widths.navigation
     }
 
     /// What the main area shows of the list and the open detail. A failed connection shows
@@ -2314,8 +2378,35 @@ impl Workspace {
             .min_w_0()
             .h_full()
             .child(self.render_header(&cluster, window_width, theme, cx))
+            .children(self.server_moves.moved().map(|moved| {
+                let text = repointed_text(&model.names().with_real(&cluster.info.name), moved);
+                notice("context-repointed", text.clone(), theme.warning)
+                    .aria_label(text)
+                    .test_support()
+            }))
             .child(content)
             .into_any_element()
+    }
+}
+
+/// A side pane's title. On macOS it is the top row, as tall as the main header, and moves the
+/// window. A pane under the traffic lights (`traffic_lights` above zero) leaves the row to them
+/// and shows no title.
+fn pane_title(title: &'static str, traffic_lights: Pixels, theme: &Theme) -> impl IntoElement {
+    let row = div()
+        .px_3()
+        .text_xs()
+        .font_semibold()
+        .text_color(theme.muted_foreground)
+        .when(traffic_lights == px(0.), |el| el.child(title));
+    if cfg!(target_os = "macos") {
+        super::theme::moves_window(row)
+            .flex()
+            .flex_none()
+            .items_center()
+            .h(px(HEADER_HEIGHT))
+    } else {
+        row.pt_3().pb_1()
     }
 }
 
@@ -2345,6 +2436,26 @@ fn control_name(title: &str, context: &str) -> String {
         shown
     } else {
         format!("{shown} (context {context:?})")
+    }
+}
+
+/// The header's words for a cluster's access mode.
+fn access_mode_text(protection: Protection) -> &'static str {
+    match protection {
+        Protection::Protected => "Read-only",
+        Protection::Local => "Local: writable",
+        Protection::Unlocked => "Unlocked: writable",
+        Protection::Trusted => "Trusted: writable",
+    }
+}
+
+/// The access mode on a narrow header's second row: still tells every mode apart.
+fn access_mode_short_text(protection: Protection) -> &'static str {
+    match protection {
+        Protection::Protected => "Read-only",
+        Protection::Local => "Local",
+        Protection::Unlocked => "Unlocked",
+        Protection::Trusted => "Trusted",
     }
 }
 
@@ -2520,6 +2631,20 @@ fn render_lock_button(
 /// are compared on the exact URL, never on this text.
 pub(super) fn server_text(server: Option<&str>) -> String {
     server.map_or("no server".to_owned(), flint_core::redact::server_url)
+}
+
+/// The main area's notice that the active context moved. Servers are sanitized and kept on one
+/// line, so a kubeconfig value can neither show a credential nor pass for other text.
+fn repointed_text(cluster: &str, moved: &ServerMove) -> String {
+    let shown = |server: Option<&str>| display::single_line(&server_text(server));
+    let (old, new) = (shown(moved.old.as_deref()), shown(moved.new.as_deref()));
+    if old == new {
+        return format!(
+            "{cluster} now points at a different API server. Both show as {new}: \
+             what changed is in a part of the URL Flint hides."
+        );
+    }
+    format!("{cluster} now points at a different API server. Was {old}, now {new}.")
 }
 
 /// The host and port of a server URL as the UI shows it, for a row's compact second line.
@@ -2949,6 +3074,14 @@ fn watch_mode_label(mode: WatchMode) -> &'static str {
     }
 }
 
+/// The watch mode button's label on a narrow header's second row.
+fn watch_mode_short_label(mode: WatchMode) -> &'static str {
+    match mode {
+        WatchMode::All => "Live: all",
+        WatchMode::OnView => "Live: open",
+    }
+}
+
 /// `text` cut to `max` characters, with an ellipsis in place of the cut part.
 fn ellipsize(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
@@ -2978,6 +3111,7 @@ impl Render for Workspace {
         let theme = cx.theme();
         let has_cluster = self.model.read(cx).active_cluster().is_some();
         let widths = self.layout(window_width, cx);
+        let traffic_lights = super::theme::traffic_light_inset(window);
         h_flex()
             .id("workspace")
             .key_context(registry::WORKSPACE)
@@ -3018,7 +3152,13 @@ impl Render for Workspace {
                 let height = f32::from(bottom - e.event.position.y);
                 this.resize_dock(height, f32::from(e.bounds.size.height), cx);
             }))
-            .child(self.render_sidebar(&widths, theme, self.sidebar_focus.is_focused(window), cx))
+            .child(self.render_sidebar(
+                &widths,
+                traffic_lights,
+                theme,
+                self.sidebar_focus.is_focused(window),
+                cx,
+            ))
             .when(has_cluster, |el| {
                 el.child(self.render_nav_column(widths.navigation, theme))
             })
@@ -3028,6 +3168,19 @@ impl Render for Workspace {
                     .flex_1()
                     .min_w_0()
                     .h_full()
+                    .relative()
+                    // With no cluster there is no header, and the window still needs a top to
+                    // drag it by.
+                    .when(!has_cluster, |el| {
+                        el.child(
+                            super::theme::moves_window(div())
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .w_full()
+                                .h(px(HEADER_HEIGHT)),
+                        )
+                    })
                     .child(h_flex().flex_1().min_h_0().w_full().child(self.render_main(
                         window_width,
                         theme,
@@ -3161,11 +3314,36 @@ mod view_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        Layout, LockEntry, MIN_LIST_WIDTH, control_name, exposure_label, layout, lock_label,
-        lock_menu, mode_name, namespace_summary, no_contexts_text, watch_mode_label,
+        Layout, LockEntry, MIN_LIST_WIDTH, ServerMove, access_mode_short_text, control_name,
+        exposure_label, layout, lock_label, lock_menu, mode_name, namespace_summary,
+        no_contexts_text, repointed_text, watch_mode_label,
     };
     use flint_core::settings::{AiExposureState, PaneWidths, TrustState};
     use flint_core::{Protection, WatchMode};
+
+    #[test]
+    fn the_short_access_modes_stay_distinct() {
+        let short = [
+            Protection::Protected,
+            Protection::Local,
+            Protection::Unlocked,
+            Protection::Trusted,
+        ]
+        .map(access_mode_short_text);
+        assert_eq!(short, ["Read-only", "Local", "Unlocked", "Trusted"]);
+    }
+
+    #[test]
+    fn a_move_between_servers_that_show_alike_says_so() {
+        let moved = ServerMove {
+            old: Some("https://proxy.example.com/k8s/@old".to_owned()),
+            new: Some("https://proxy.example.com/k8s/@new".to_owned()),
+        };
+        let text = repointed_text("dev", &moved);
+        assert!(text.contains("Flint hides"), "{text}");
+        assert!(!text.contains("Was "), "{text}");
+        assert!(!text.contains("@old") && !text.contains("@new"), "{text}");
+    }
 
     // A title that is the context stays short; any other carries the context, and a context
     // written to look like another cluster's control name still gets a name of its own.
