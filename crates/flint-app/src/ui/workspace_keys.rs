@@ -170,6 +170,8 @@ impl Workspace {
             None if step > 0 => 0,
             None => panes.len() - 1,
         };
+        let revealed =
+            panes[next].0 == Pane::Detail && self.main_panes(cx) == super::MainPanes::ListAlone;
         // In a narrow window the list and the detail take turns: the one reached is shown.
         match panes[next].0 {
             Pane::List => self.list_in_front = true,
@@ -177,6 +179,10 @@ impl Workspace {
             _ => {}
         }
         window.focus(&panes[next].1, cx);
+        // An edit left behind by Back to List is typed in again as soon as it returns.
+        if revealed && let Some(detail) = &self.detail {
+            detail.update(cx, |detail, cx| detail.focus_shown_editor(window, cx));
+        }
         // A field left behind (the list's filter, a log tab's search).
         release_unfocused_input(window, cx);
         cx.notify();

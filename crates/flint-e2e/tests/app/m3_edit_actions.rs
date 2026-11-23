@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result};
 use flint_e2e::app::{App, AppOptions};
 use flint_e2e::backend::TestCluster;
 use flint_e2e::fake_api::{
-    FakeApiServer, FakePod, Fault, Gvr, Options, RequestRecord, Verb, WriteRecord,
+    FakeApiServer, FakeExec, FakePod, Fault, Gvr, Options, RequestRecord, Verb, WriteRecord,
 };
 use http::Method;
 use serde_json::{Value, json};
@@ -22,8 +22,13 @@ const EDITED: &str = "edit-me";
 const EDITED_PATH: &str = "/api/v1/namespaces/demo/configmaps/edit-me";
 const DENIED: &str = "this change is not allowed";
 const NODE: &str = "drain-node";
-const EDIT_ATTEMPTS: usize = 5;
-const FOCUS_WAIT: Duration = Duration::from_secs(2);
+/// A pod of the fixtures that takes a shell.
+const POD: &str = "web-69c6f74b8b-qv4xv";
+/// How many times the focus test opens the editor right after a dialog closes.
+const EDITOR_OPENS: usize = 20;
+/// Longer than a dialog's 250 ms exit animation. The tests type before and after it, so a focus
+/// change tied to the animation's end would show.
+const PAST_DIALOG_EXIT: Duration = Duration::from_millis(400);
 
 fn launch_unlocked(cluster: &TestCluster) -> Result<App> {
     let app = App::launch(AppOptions::new(&cluster.kubeconfig).settings(PROTECTED))?;
@@ -77,27 +82,12 @@ fn start_edit(app: &App) -> Result<()> {
     app.wait_for("/detail/fetch", Equals("loaded".into()))?;
     app.dispatch("detail::ShowYaml", Value::Null)?;
     app.wait_for("/detail/edit_blocked", Equals(Value::Null))?;
-    // The new editor can lose focus just after it opens, and keys sent then are dropped. An edit
-    // that kept focus throughout has the text; any other is discarded and opened again.
-    for _ in 0..EDIT_ATTEMPTS {
-        app.dispatch("detail::EditYaml", Value::Null)?;
-        app.wait_for("/detail/edit", Equals("editing".into()))?;
-        let focused = app
-            .wait_for_within("/focus", Equals("detail_yaml".into()), FOCUS_WAIT)
-            .is_ok();
-        if focused {
-            app.press_key("secondary-down")?;
-            if app.state()?["focus"] == "detail_yaml" {
-                app.type_text("immutable: true\n")?;
-                if app.state()?["focus"] == "detail_yaml" {
-                    return Ok(());
-                }
-            }
-        }
-        app.dispatch("detail::CancelYamlEdit", Value::Null)?;
-        app.wait_for("/detail/edit", Equals(Value::Null))?;
-    }
-    anyhow::bail!("the YAML editor did not keep focus in {EDIT_ATTEMPTS} attempts")
+    app.dispatch("detail::EditYaml", Value::Null)?;
+    app.wait_for("/detail/edit", Equals("editing".into()))?;
+    app.wait_for("/focus", Equals("detail_yaml".into()))?;
+    app.press_key("secondary-down")?;
+    app.type_text("immutable: true\n")?;
+    Ok(())
 }
 
 fn review(app: &App) -> Result<()> {
@@ -605,5 +595,213 @@ fn up_55_unlock_asks_once_and_lasts_until_quit() -> Result<()> {
     );
     app.quit()?;
     assert_eq!(fake.writes().len(), sent, "nothing after the relaunch");
+    Ok(())
+}
+
+/// Shows [`POD`]'s YAML and opens a shell in it: the session and its dock tab, with focus there.
+fn open_pod_shell(app: &App, fake: &FakeApiServer) -> Result<(FakeExec, u64)> {
+    show_pod_yaml(app)?;
+    app.dispatch("detail::OpenShell", Value::Null)?;
+    let sessions = until(
+        "an exec session",
+        || fake.exec_sessions(),
+        |s| !s.is_empty(),
+    )?;
+    let state = app.wait_for("/dock/tabs/0/status/state", Equals("running".into()))?;
+    app.wait_for("/focus", Equals("shell".into()))?;
+    let tab = state["dock"]["tabs"][0]["id"]
+        .as_u64()
+        .context("no dock tab id")?;
+    Ok((sessions[0].clone(), tab))
+}
+
+fn show_pod_yaml(app: &App) -> Result<()> {
+    open_live(app, "pods", 17)?;
+    app.select_row(Some("demo"), POD)?;
+    app.wait_for("/detail/name", Equals(POD.into()))?;
+    app.wait_for("/detail/fetch", Equals("loaded".into()))?;
+    app.dispatch("detail::ShowYaml", Value::Null)?;
+    Ok(())
+}
+
+fn focus_tab(app: &App, tab: u64) -> Result<()> {
+    app.dispatch("dock::ActivateTab", json!({"tab": tab}))?;
+    app.wait_for("/focus", Equals("shell".into()))?;
+    Ok(())
+}
+
+fn confirm_a_dialog(app: &App) -> Result<()> {
+    app.dispatch("flint::About", Value::Null)?;
+    app.wait_for("/dialog/title", Exists(true))?;
+    app.dispatch("ui::Confirm", Value::Null)?;
+    app.wait_for("/dialog", Equals(Value::Null))?;
+    Ok(())
+}
+
+/// Types into the open editor at once and again after a dialog's exit: focus stays there and the
+/// dock's session gets none of it.
+fn assert_editor_keeps_keys(app: &App, exec: &FakeExec) -> Result<()> {
+    let sent = exec.stdin().len();
+    app.wait_for("/focus", Equals("detail_yaml".into()))?;
+    // Comments, so the text stays valid however many times it is typed.
+    app.type_text("# first\n")?;
+    std::thread::sleep(PAST_DIALOG_EXIT);
+    assert_eq!(app.state()?["focus"], "detail_yaml");
+    app.type_text("# second\n")?;
+    std::thread::sleep(PAST_DIALOG_EXIT);
+    assert_eq!(app.state()?["focus"], "detail_yaml");
+    assert_eq!(exec.stdin().len(), sent, "keys left the editor");
+    Ok(())
+}
+
+// The editor opened right after a dialog closes keeps focus, every time.
+#[test]
+#[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
+fn editor_keeps_focus_after_a_dialog_closes() -> Result<()> {
+    let cluster = TestCluster::fake(Options::default())?;
+    let fake = cluster.fake_server().expect("a fake server");
+    let app = launch_unlocked(&cluster)?;
+    let (exec, tab) = open_pod_shell(&app, fake)?;
+    for _ in 0..EDITOR_OPENS {
+        focus_tab(&app, tab)?;
+        confirm_a_dialog(&app)?;
+        app.dispatch("detail::EditYaml", Value::Null)?;
+        app.wait_for("/detail/edit", Equals("editing".into()))?;
+        assert_editor_keeps_keys(&app, &exec)?;
+        app.dispatch("detail::CancelYamlEdit", Value::Null)?;
+        app.wait_for("/detail/edit", Equals(Value::Null))?;
+    }
+    Ok(())
+}
+
+// With nothing newly focused, closing a dialog gives focus back to the dock's tab.
+#[test]
+#[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
+fn closing_a_dialog_returns_focus_to_the_dock() -> Result<()> {
+    let cluster = TestCluster::fake(Options::default())?;
+    let fake = cluster.fake_server().expect("a fake server");
+    let app = launch_unlocked(&cluster)?;
+    let (exec, _) = open_pod_shell(&app, fake)?;
+    confirm_a_dialog(&app)?;
+    app.wait_for("/focus", Equals("shell".into()))?;
+    std::thread::sleep(PAST_DIALOG_EXIT);
+    assert_eq!(app.state()?["focus"], "shell");
+    app.type_text("back")?;
+    until(
+        "the keys in the dock's tab",
+        || exec.stdin(),
+        |stdin| stdin.windows(4).any(|w| w == b"back"),
+    )?;
+    Ok(())
+}
+
+// Tab in the editor opened right after a dialog closes does not move focus to another pane.
+#[test]
+#[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
+fn tab_stays_in_the_editor_after_a_dialog_closes() -> Result<()> {
+    let cluster = TestCluster::fake(Options::default())?;
+    let fake = cluster.fake_server().expect("a fake server");
+    let app = launch_unlocked(&cluster)?;
+    let (exec, _) = open_pod_shell(&app, fake)?;
+    confirm_a_dialog(&app)?;
+    app.dispatch("detail::EditYaml", Value::Null)?;
+    app.wait_for("/detail/edit", Equals("editing".into()))?;
+    app.wait_for("/focus", Equals("detail_yaml".into()))?;
+    app.press_key("tab")?;
+    assert_editor_keeps_keys(&app, &exec)?;
+    Ok(())
+}
+
+// The same through the command palette, opened right after the dialog closes.
+#[test]
+#[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
+fn editor_opened_from_the_palette_keeps_focus() -> Result<()> {
+    let cluster = TestCluster::fake(Options::default())?;
+    let fake = cluster.fake_server().expect("a fake server");
+    let app = launch_unlocked(&cluster)?;
+    let (exec, _) = open_pod_shell(&app, fake)?;
+    confirm_a_dialog(&app)?;
+    app.press_key("secondary-shift-p")?;
+    app.wait_for("/focus", Equals("palette".into()))?;
+    app.type_text("edit yaml")?;
+    app.wait_for("/palette/rows/0/action", Equals("detail::EditYaml".into()))?;
+    app.press_key("enter")?;
+    app.wait_for("/palette", Equals(Value::Null))?;
+    app.wait_for("/detail/edit", Equals("editing".into()))?;
+    assert_editor_keeps_keys(&app, &exec)?;
+    Ok(())
+}
+
+// Every way back to an editable editor gives it focus, wherever focus was.
+#[test]
+#[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
+fn every_return_to_the_editor_takes_focus() -> Result<()> {
+    let refused = || {
+        Fault::admission_denied("policy.example.com", DENIED)
+            .on(&Gvr::core("pods"))
+            .verb(Verb::Other)
+            .times(1)
+    };
+    let cluster = TestCluster::fake(Options::default())?;
+    let fake = cluster.fake_server().expect("a fake server");
+    let app = launch_unlocked(&cluster)?;
+    let (exec, tab) = open_pod_shell(&app, fake)?;
+    app.dispatch("detail::EditYaml", Value::Null)?;
+    app.wait_for("/focus", Equals("detail_yaml".into()))?;
+    app.press_key("secondary-down")?;
+    app.type_text("immutable: true\n")?;
+
+    // Back from the review.
+    review(&app)?;
+    focus_tab(&app, tab)?;
+    app.dispatch("detail::BackToYamlEdit", Value::Null)?;
+    app.wait_for("/detail/edit", Equals("editing".into()))?;
+    assert_editor_keeps_keys(&app, &exec)?;
+
+    // The YAML tab shown again, with the edit kept.
+    app.dispatch("detail::ShowOverview", Value::Null)?;
+    // The hidden editor gives up focus as the next frame draws.
+    app.wait_for("/focus", Equals("detail".into()))?;
+    focus_tab(&app, tab)?;
+    app.dispatch("detail::ShowYaml", Value::Null)?;
+    assert_editor_keeps_keys(&app, &exec)?;
+
+    // A review that is refused.
+    focus_tab(&app, tab)?;
+    fake.inject(refused());
+    app.dispatch("detail::ReviewYamlEdit", Value::Null)?;
+    app.wait_for("/detail/edit", Equals("editing".into()))?;
+    assert_editor_keeps_keys(&app, &exec)?;
+
+    // An apply that is refused.
+    review(&app)?;
+    focus_tab(&app, tab)?;
+    fake.inject(refused());
+    confirm_apply(&app)?;
+    app.wait_for("/detail/edit", Equals("editing".into()))?;
+    assert_editor_keeps_keys(&app, &exec)?;
+    Ok(())
+}
+
+// A dock tab on one cluster keeps none of the keys typed into an editor on another.
+#[test]
+#[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
+fn editor_on_another_cluster_keeps_focus() -> Result<()> {
+    let clusters = TwoClusters::start()?;
+    let app = App::launch(AppOptions::new(clusters.kubeconfig()).settings(PROTECTED))?;
+    connect(&app, TwoClusters::A)?;
+    unlock(&app, TwoClusters::A)?;
+    let (exec, tab) = open_pod_shell(&app, &clusters.a)?;
+
+    connect(&app, TwoClusters::B)?;
+    show_pod_yaml(&app)?;
+    focus_tab(&app, tab)?;
+    // Unlocking B is the dialog that closes just before the edit.
+    unlock(&app, TwoClusters::B)?;
+    app.wait_for("/detail/edit_blocked", Equals(Value::Null))?;
+    app.dispatch("detail::EditYaml", Value::Null)?;
+    app.wait_for("/detail/edit", Equals("editing".into()))?;
+    assert_eq!(app.state()?["active_cluster"], TwoClusters::B);
+    assert_editor_keeps_keys(&app, &exec)?;
     Ok(())
 }

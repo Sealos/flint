@@ -423,6 +423,69 @@ fn activate(cx: &mut TestAppContext, window: AnyWindowHandle, id: u64) {
     draw(cx, window);
 }
 
+// A Paste button still on screen after the dock moved to another tab pastes nowhere and leaves
+// focus on the tab now shown.
+#[gpui_kit::test]
+async fn a_stale_paste_button_does_nothing(cx: &mut TestAppContext) {
+    use gpui_kit::PlatformInput;
+
+    let (window, dock) = open_dock(cx);
+    let (first, mut first_fake) = open_shell_in(cx, window, &dock, "web-1");
+    let (second, mut second_fake) = open_shell_in(cx, window, &dock, "web-2");
+    activate(cx, window, second);
+    first_fake.clear_written();
+    second_fake.clear_written();
+    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("pasted".to_owned()));
+    let shown = match dock.read_with(cx, |dock, _| dock.tab(first).cloned()) {
+        Some(DockTab::Shell(view)) => view,
+        _ => panic!("a shell tab"),
+    };
+    cx.update_window(window, |_, window, cx| {
+        use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
+
+        window.render_frame(cx);
+        let position = window.find("terminal-paste").bounds().center();
+        let modifiers = Modifiers::default();
+        window.dispatch_event(
+            PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: None,
+                modifiers,
+            }),
+            cx,
+        );
+        window.render_frame(cx);
+        registry::dispatch("dock::ActivateTab", json!({ "tab": first }), window, cx).unwrap();
+        // No frame since: the button drawn is still the second tab's.
+        window.dispatch_event(
+            PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers,
+                click_count: 1,
+            }),
+            cx,
+        );
+        assert!(shown.read(cx).holds_focus(window, cx));
+    })
+    .unwrap();
+    draw(cx, window);
+    first_fake.pump();
+    second_fake.pump();
+    assert_eq!(first_fake.written(), b"");
+    assert_eq!(second_fake.written(), b"");
+}
+
 // covers UP-42: the log tab shown tells its session, so the shared log memory budget trims
 // the others first (#254).
 #[gpui_kit::test]

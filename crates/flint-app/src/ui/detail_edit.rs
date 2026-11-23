@@ -518,7 +518,51 @@ impl DetailView {
         }
     }
 
-    pub(super) fn review_edit(&mut self, cx: &mut Context<Self>) {
+    /// Focuses the editor if it is on show and can be typed in.
+    pub(in crate::ui) fn focus_shown_editor(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab == DetailTab::Yaml
+            && let Some(edit) = &self.edit
+            && matches!(edit.phase, Phase::Editing | Phase::Conflict)
+        {
+            edit.editor.read(cx).focus_handle(cx).focus(window, cx);
+        }
+    }
+
+    /// Moves focus from the editor to this pane as the editor is about to be hidden. Left on a
+    /// control no longer drawn, focus would fall through to the list.
+    pub(super) fn keep_focus_from_hidden_editor(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(edit) = &self.edit
+            && edit.editor.read(cx).focus_handle(cx).is_focused(window)
+        {
+            self.focus.focus(window, cx);
+        }
+    }
+
+    /// [`Self::focus_shown_editor`] for a result that arrives later: only while focus is still
+    /// in this pane, so it never pulls focus from where it was moved since the request.
+    fn return_focus_to_editor(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus.contains_focused(window, cx) {
+            self.focus_shown_editor(window, cx);
+        }
+    }
+
+    pub(super) fn review_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_review_edit() {
+            return;
+        }
+        // The pane holds focus while the review runs, and gives it back to the editor after.
+        self.focus.focus(window, cx);
+        self.run_review(window, cx);
+        // Refused at once: the editor is still on show.
+        self.focus_shown_editor(window, cx);
+    }
+
+    /// Starts a review. A caller decides where focus goes if it is refused at once.
+    fn run_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.can_review_edit() {
             return;
         }
@@ -541,7 +585,7 @@ impl DetailView {
             .map(|latest| (edit.seen.clone(), latest, yaml.clone()));
         let run = core.review_write(edit.target.clone(), WriteProposal::ApplyYaml { yaml });
         let name = self.object.name.clone();
-        edit._task = cx.spawn(async move |this, cx| {
+        edit._task = cx.spawn_in(window, async move |this, cx| {
             let result = run.await;
             let shown = result
                 .as_ref()
@@ -558,8 +602,8 @@ impl DetailView {
                     (patch, competing)
                 })
                 .await;
-            let _ = this.update(cx, |view, cx| {
-                view.edit_reviewed(result, patch, competing, cx)
+            let _ = this.update_in(cx, |view, window, cx| {
+                view.edit_reviewed(result, patch, competing, window, cx)
             });
         });
         cx.notify();
@@ -570,6 +614,7 @@ impl DetailView {
         result: Result<WriteReview, WriteError>,
         patch: Option<String>,
         competing: Vec<String>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(edit) = &mut self.edit else {
@@ -592,6 +637,7 @@ impl DetailView {
             }
             Err(error) => Self::edit_failed(edit, error),
         }
+        self.return_focus_to_editor(window, cx);
         cx.notify();
     }
 
@@ -606,10 +652,13 @@ impl DetailView {
     }
 
     /// Asks the window to confirm the reviewed change.
-    pub(super) fn apply_edit(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn apply_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.can_apply_edit() {
             return;
         }
+        // The confirmation hands focus back to the pane, which gives it to the editor on a
+        // refusal.
+        self.focus.focus(window, cx);
         if let Some(edit) = &self.edit
             && let Phase::Reviewed(review) = &edit.phase
         {
@@ -643,6 +692,10 @@ impl DetailView {
                 if let Some(edit) = &mut self.edit {
                     Self::edit_failed(edit, error);
                 }
+                // After the update under way, which may still be closing the confirmation.
+                cx.defer_in(window, |view, window, cx| {
+                    view.return_focus_to_editor(window, cx)
+                });
             }
         }
         cx.notify();
@@ -653,6 +706,7 @@ impl DetailView {
         if !self.can_reload_edit() {
             return;
         }
+        self.focus.focus(window, cx);
         let o = &self.object;
         let fetch = self
             .core
@@ -685,6 +739,7 @@ impl DetailView {
             Err(why) => {
                 edit.phase = Phase::Conflict;
                 edit.error = Some(format!("Could not reload the object: {why}"));
+                self.return_focus_to_editor(window, cx);
                 cx.notify();
                 return;
             }
@@ -693,6 +748,7 @@ impl DetailView {
         if text("/metadata/uid") != edit.target.uid.as_deref() {
             edit.phase = Phase::Editing;
             edit.error = Some(WriteError::Replaced.to_string());
+            self.return_focus_to_editor(window, cx);
             cx.notify();
             return;
         }
@@ -708,14 +764,19 @@ impl DetailView {
             edit.target.resource_version = Some(version.to_owned());
         }
         edit.phase = Phase::Editing;
-        self.review_edit(cx);
+        self.run_review(window, cx);
+        // Not reviewed (the cluster was locked meanwhile): the editor is back on show.
+        if matches!(self.edit.as_ref().map(|e| &e.phase), Some(Phase::Editing)) {
+            self.return_focus_to_editor(window, cx);
+        }
     }
 
-    pub(super) fn back_to_edit(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn back_to_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.can_go_back_to_edit()
             && let Some(edit) = &mut self.edit
         {
             edit.phase = Phase::Editing;
+            self.focus_shown_editor(window, cx);
             cx.notify();
         }
     }
@@ -725,6 +786,33 @@ impl DetailView {
             self.edit = None;
             cx.notify();
         }
+    }
+}
+
+#[cfg(test)]
+impl DetailView {
+    /// Replaces `from` with `to` in the text being edited.
+    pub(in crate::ui) fn replace_in_edit(
+        &self,
+        from: &str,
+        to: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let edit = self.edit.as_ref().expect("an edit is open");
+        let text = edit.editor.read(cx).value().replace(from, to);
+        edit.editor
+            .update(cx, |state, cx| state.set_value(text, window, cx));
+    }
+
+    pub(in crate::ui) fn edit_error(&self) -> Option<&str> {
+        self.edit.as_ref()?.error.as_deref()
+    }
+
+    pub(in crate::ui) fn editor_has_focus(&self, window: &Window, cx: &App) -> bool {
+        self.edit
+            .as_ref()
+            .is_some_and(|e| e.editor.read(cx).focus_handle(cx).is_focused(window))
     }
 }
 
@@ -995,6 +1083,74 @@ mod tests {
     }
 
     // A refused apply keeps the typed text, back at the editing step, with the editor's wording.
+    // A reload's follow-up review, refused at once, leaves focus where it moved meanwhile.
+    #[gpui_kit::test]
+    async fn a_refusal_after_a_reload_keeps_focus_moved_away(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        let kind = KindId::pods();
+        t.connect_alpha(cx, standard_sections()).await;
+        t.open_kind(
+            cx,
+            kind.plural(),
+            objects(kind.clone(), &[("demo", "api", 0)], SyncState::Synced, 1),
+        )
+        .await;
+        t.dispatch(
+            cx,
+            "resource_list::SelectRow",
+            json!({"namespace": "demo", "name": "api"}),
+        )
+        .unwrap();
+        let view = t.detail(cx).expect("the detail pane is open");
+        let failed = view.clone();
+        cx.wait_for(t.window, WAIT, move |_, cx| {
+            matches!(&failed.read(cx).fetch, Fetch::Failed(_))
+        })
+        .await;
+        let object = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "api", "namespace": "demo", "uid": "uid-api", "resourceVersion": "1"
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+        });
+        let detail = ObjectDetail {
+            yaml: serde_saphyr::to_string(&object).unwrap(),
+            object,
+            managed_fields: None,
+            events: Vec::new(),
+            events_truncated: false,
+            events_error: None,
+        };
+        let moved_to = cx.update(|cx| cx.focus_handle());
+        cx.update_window(t.window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.show_fetched(detail.clone(), window, cx);
+                v.start_edit(window, cx);
+                let edit = v.edit.as_mut().expect("the edit started");
+                edit.editor.update(cx, |state, cx| {
+                    state.set_value("kind: Pod\nstatus: {}\n", window, cx)
+                });
+                edit.phase = Phase::Reviewing;
+                window.focus(&moved_to, cx);
+                v.edit_reloaded(Ok(std::sync::Arc::new(detail)), window, cx);
+                // Read here: this handle is in no drawn view, so a frame would reclaim focus.
+                assert_eq!(window.focused(cx).as_ref(), Some(&moved_to));
+            })
+        })
+        .unwrap();
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| {
+            let (error, blocked) = (v.edit_error(), v.edit_blocked());
+            assert!(
+                error.is_some_and(|e| e.contains("status")),
+                "{error:?} {blocked:?}"
+            );
+        });
+    }
+
     #[gpui_kit::test]
     async fn a_refused_apply_keeps_the_edit_and_says_to_reopen(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();

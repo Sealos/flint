@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use super::row_actions_tests::{draw, menu, right_click, show_fetched};
 use crate::ui::confirm;
-use crate::ui::detail::TestPodLister;
+use crate::ui::detail::{DetailView, TestPodLister};
 use crate::ui::registry;
 use crate::ui::resource_actions::{
     ResourceAction, RunningWrite, WriteKey, claim, release, request, running_on,
@@ -1042,6 +1042,108 @@ async fn a_drain_shows_in_a_strip_then_offers_its_report(cx: &mut TestAppContext
         wait_for_no_dialog(cx, &t).await;
         assert!(t.find(cx, "drain-result").is_none(), "viewed");
     }
+}
+
+/// Opens `web`'s YAML for editing, its replicas changed.
+async fn edit_web(cx: &mut TestAppContext, t: &TestWorkspace) -> gpui_kit::Entity<DetailView> {
+    open_deployments(cx, t).await;
+    select_loaded(cx, t, "web").await;
+    t.dispatch(cx, "detail::EditYaml", Value::Null).unwrap();
+    draw(cx, t);
+    let detail = t.detail(cx).unwrap();
+    cx.update_window(t.window, |_, window, cx| {
+        detail.update(cx, |d, cx| {
+            d.replace_in_edit("replicas: 2", "replicas: 3", window, cx)
+        })
+    })
+    .unwrap();
+    detail
+}
+
+// A write claimed elsewhere between the review and the confirmation is refused in the editor.
+#[gpui_kit::test]
+async fn a_yaml_apply_refused_by_a_claim_says_why(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let api = LocalApi::start(&[]);
+    let t = connected(cx, dir.path(), &api).await;
+    let detail = edit_web(cx, &t).await;
+    let core = detail.read_with(cx, |d, _| d.write_core().clone());
+    let target = flint_core::write::WriteTarget {
+        cluster: "kind-alpha".into(),
+        server: Some(api.url.clone()),
+        kind: KindId::new("apps", "deployments"),
+        namespace: Some("demo".to_owned()),
+        name: "web".to_owned(),
+        uid: Some("uid-web".to_owned()),
+        resource_version: Some("7".to_owned()),
+    };
+    let review = core
+        .review_write(target, flint_core::write::WriteProposal::Scale { to: 3 })
+        .await
+        .expect("the review");
+    let workspace = t.workspace.clone();
+    cx.update_window(t.window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| ws.confirm_detail_write(&review, window, cx))
+    })
+    .unwrap();
+    t.wait_for_element(cx, "write-confirm-description").await;
+    draw(cx, &t);
+    cx.update(|cx| claim(&web_key(), ResourceAction::Scale, cx))
+        .unwrap();
+
+    confirm_top(cx, &t);
+    let refused = detail.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        refused
+            .read(cx)
+            .edit_error()
+            .is_some_and(|e| e.contains("web is being scaled"))
+    })
+    .await;
+    assert_eq!(api.patches(), 0);
+    cx.update(|cx| release(&web_key(), cx));
+}
+
+// Leaving the YAML tab with the editor focused keeps focus in the detail pane.
+#[gpui_kit::test]
+async fn leaving_the_yaml_tab_keeps_focus_in_the_detail(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let api = LocalApi::start(&[]);
+    let t = connected(cx, dir.path(), &api).await;
+    let detail = edit_web(cx, &t).await;
+    cx.update_window(t.window, |_, window, cx| {
+        assert!(detail.read(cx).editor_has_focus(window, cx));
+    })
+    .unwrap();
+    t.dispatch(cx, "detail::ShowOverview", Value::Null).unwrap();
+    draw(cx, &t);
+    draw(cx, &t);
+    cx.update_window(t.window, |_, window, cx| {
+        assert!(detail.read(cx).focus_handle().is_focused(window));
+    })
+    .unwrap();
+}
+
+// In a narrow window, Tab back to a detail with an edit open puts the keys in the editor.
+#[gpui_kit::test]
+async fn tab_back_to_a_hidden_edit_focuses_the_editor(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let api = LocalApi::start(&[]);
+    let t = connected(cx, dir.path(), &api).await;
+    let detail = edit_web(cx, &t).await;
+    gpui_kit::VisualTestContext::from_window(t.window, cx)
+        .simulate_resize(gpui_kit::size(gpui_kit::px(760.), gpui_kit::px(480.)));
+    draw(cx, &t);
+    t.dispatch(cx, "workspace::BackToList", Value::Null)
+        .unwrap();
+    draw(cx, &t);
+    t.dispatch(cx, "workspace::FocusNextPane", Value::Null)
+        .unwrap();
+    draw(cx, &t);
+    cx.update_window(t.window, |_, window, cx| {
+        assert!(detail.read(cx).editor_has_focus(window, cx));
+    })
+    .unwrap();
 }
 
 // covers UP-53: a YAML edit and a row action share one claim per object.
