@@ -514,7 +514,7 @@ impl Workspace {
             })
             .add::<DragSelection>(
                 // A filter can hide every selected row mid-drag; the drag goes on to a row shown.
-                view_open!(log, LogView::is_selecting),
+                view_open!(log, LogView::can_drag_selection),
                 |ws, a, cx| match log(ws, cx) {
                     Some(l) => l.check_line::<DragSelection>(a.line),
                     None => Err(ActionError::unavailable::<DragSelection>()),

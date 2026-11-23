@@ -186,6 +186,12 @@ impl LogView {
         self.selection.is_some()
     }
 
+    /// [`DragSelection`] applies: some selected line is shown, or a drag is under way (a filter
+    /// can hide every selected row mid-drag, and the drag goes on to a row shown).
+    pub(in crate::ui) fn can_drag_selection(&self) -> bool {
+        self.has_selection() || (self.drag_selecting && self.is_selecting())
+    }
+
     /// Lines are selected, and some of them shown (a filter can hide them all).
     pub(in crate::ui) fn has_selection(&self) -> bool {
         self.selected_rows() > 0
@@ -295,9 +301,10 @@ impl LogView {
         rows.min(matches)
     }
 
-    /// Whether a line shown matches the search, counting lines that arrived since the last
-    /// scan and not evicted ones: what Next and Previous Match, and Save Matching Lines, need.
-    /// `false` while a scan runs on the core's threads, whose matches are not known yet.
+    /// Whether a match found so far is among the lines shown: what Next and Previous Match, and
+    /// Save Matching Lines, need. Tests no line, so a state poll stays cheap; lines that arrived
+    /// since the last scan count once it reaches them. `false` while a scan runs on the core's
+    /// threads, whose matches are not known yet.
     pub(in crate::ui) fn has_matches(&self) -> bool {
         if self.searching {
             return false;
@@ -362,6 +369,11 @@ impl LogView {
             _ if !self.has_lines() => Some("no lines are shown"),
             SaveScope::All => None,
             SaveScope::Matches if self.searching => Some("still searching…"),
+            SaveScope::Matches
+                if !self.has_matches() && self.search.pending(&self.snapshot.lines) > 0 =>
+            {
+                Some("still searching…")
+            }
             SaveScope::Matches if !self.has_matches() => Some("no lines match the search"),
             SaveScope::Matches => None,
             SaveScope::Selection if self.selection.is_none() => Some("no lines are selected"),

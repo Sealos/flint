@@ -41,8 +41,19 @@ const HIGHLIGHT_LOOKAHEAD: usize = 256;
 const HIGHLIGHT_TIME: Duration = Duration::from_millis(2);
 /// Most matches highlighted in one line.
 const HIGHLIGHT_MATCHES: usize = 256;
+/// Most searches one line's highlighting runs, counting the empty matches it skips: each can
+/// read the rest of the line.
+const HIGHLIGHT_STEPS: usize = 2_048;
 /// How long highlighting one whole line may take off the UI thread.
 const WHOLE_LINE_TIME: Duration = Duration::from_millis(50);
+
+/// The matches found in a line for highlighting.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LineRanges {
+    pub ranges: Vec<Range<usize>>,
+    /// `false` when a limit stopped the search first: the line may hold more matches.
+    pub complete: bool,
+}
 
 /// Why a pattern cannot be used, in words for the search field.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,47 +137,57 @@ fn syntax_reason(text: &str) -> String {
 /// The non-empty matches of `regex` in `text` to highlight, within the limits above. The matcher
 /// reads a little past the cut, so `$`, `\b` or a longer alternative see the real line there; a
 /// match that crosses the cut is left out.
-pub(super) fn bounded_ranges(regex: &Regex, text: &str) -> Vec<Range<usize>> {
-    ranges_within(regex, text, HIGHLIGHT_TIME)
+pub(super) fn bounded_ranges(regex: &Regex, text: &str) -> LineRanges {
+    bounded_within(regex, text, HIGHLIGHT_TIME)
 }
 
+#[cfg(test)]
 pub(super) fn ranges_within(regex: &Regex, text: &str, time: Duration) -> Vec<Range<usize>> {
+    bounded_within(regex, text, time).ranges
+}
+
+fn bounded_within(regex: &Regex, text: &str, time: Duration) -> LineRanges {
     let cut = char_floor(text, HIGHLIGHT_BYTES);
     let hay = &text[..char_floor(text, HIGHLIGHT_BYTES + HIGHLIGHT_LOOKAHEAD)];
+    limited_ranges(regex, hay, cut, time)
+}
+
+/// The non-empty matches of `regex` anywhere in `text`, for a long line drawn whole. For a
+/// background thread: the text is not cut, and the time, match and step limits still apply.
+pub(super) fn whole_line_ranges(regex: &Regex, text: &str) -> LineRanges {
+    whole_line_ranges_within(regex, text, WHOLE_LINE_TIME)
+}
+
+fn whole_line_ranges_within(regex: &Regex, text: &str, time: Duration) -> LineRanges {
+    limited_ranges(regex, text, text.len(), time)
+}
+
+/// The matches in `hay` that end by `cut`, until a limit is reached. Matches found before a
+/// limit are kept, and [`LineRanges::complete`] says whether the search reached `cut`.
+fn limited_ranges(regex: &Regex, hay: &str, cut: usize, time: Duration) -> LineRanges {
     let started = Instant::now();
-    let mut out = Vec::new();
-    for found in regex.find_iter(hay) {
+    let mut ranges = Vec::new();
+    for (step, found) in regex.find_iter(hay).enumerate() {
         if found.end() > cut {
             break;
         }
         if !found.range().is_empty() {
-            out.push(found.range());
+            ranges.push(found.range());
         }
-        if out.len() == HIGHLIGHT_MATCHES || started.elapsed() >= time {
-            break;
-        }
-    }
-    out
-}
-
-/// The non-empty matches of `regex` anywhere in `text`, for a long line drawn whole. For a
-/// background thread: the text is not cut, and the time and match limits still apply.
-pub(super) fn whole_line_ranges(regex: &Regex, text: &str) -> Vec<Range<usize>> {
-    whole_line_ranges_within(regex, text, WHOLE_LINE_TIME)
-}
-
-fn whole_line_ranges_within(regex: &Regex, text: &str, time: Duration) -> Vec<Range<usize>> {
-    let started = Instant::now();
-    let mut out = Vec::new();
-    for found in regex.find_iter(text) {
-        if !found.range().is_empty() {
-            out.push(found.range());
-        }
-        if out.len() == HIGHLIGHT_MATCHES || started.elapsed() >= time {
-            break;
+        if ranges.len() == HIGHLIGHT_MATCHES
+            || step + 1 == HIGHLIGHT_STEPS
+            || started.elapsed() >= time
+        {
+            return LineRanges {
+                ranges,
+                complete: found.end() >= cut,
+            };
         }
     }
-    out
+    LineRanges {
+        ranges,
+        complete: true,
+    }
 }
 
 /// The largest char boundary of `text` at or below `at`.
@@ -268,6 +289,38 @@ mod tests {
         );
     }
 
+    // An empty match costs a search too, so empty matches end the line at the step limit.
+    #[test]
+    fn empty_matches_count_toward_the_step_limit() {
+        let regex = compile("x*", true).unwrap();
+        let text = format!("{}x", "a".repeat(HIGHLIGHT_STEPS));
+        assert!(ranges_within(&regex, &text, UNHURRIED).is_empty());
+        let stopped = whole_line_ranges_within(&regex, &text, UNHURRIED);
+        assert!(stopped.ranges.is_empty() && !stopped.complete);
+        assert!(!bounded_within(&regex, &text, UNHURRIED).complete);
+        // The last step is still taken.
+        let text = format!("{}x", "a".repeat(HIGHLIGHT_STEPS - 1));
+        let last = HIGHLIGHT_STEPS - 1..HIGHLIGHT_STEPS;
+        assert_eq!(
+            ranges_within(&regex, &text, UNHURRIED),
+            std::slice::from_ref(&last)
+        );
+        let found = whole_line_ranges_within(&regex, &text, UNHURRIED);
+        assert_eq!(found.ranges, std::slice::from_ref(&last));
+        assert!(found.complete, "the last step reached the end");
+    }
+
+    // What was found before a limit is kept, and reported as partial.
+    #[test]
+    fn a_limit_keeps_the_matches_found_and_says_so() {
+        let regex = compile("b|x*", true).unwrap();
+        let text = format!("b{}x", "a".repeat(HIGHLIGHT_STEPS));
+        let found = bounded_within(&regex, &text, UNHURRIED);
+        assert_eq!(found.ranges, std::slice::from_ref(&(0..1)));
+        assert!(!found.complete);
+        assert!(bounded_within(&regex, "b a", UNHURRIED).complete);
+    }
+
     // However cheap each match looks, the time limit ends the line.
     #[test]
     fn highlighting_stops_when_its_time_is_up() {
@@ -319,20 +372,22 @@ mod tests {
         let regex = compile("needle", true).unwrap();
         let at = HIGHLIGHT_BYTES * 3;
         let text = format!("{}needle", "x".repeat(at));
-        assert!(bounded_ranges(&regex, &text).is_empty());
+        assert!(bounded_ranges(&regex, &text).ranges.is_empty());
         assert_eq!(
-            whole_line_ranges(&regex, &text),
+            whole_line_ranges(&regex, &text).ranges,
             std::slice::from_ref(&(at..at + 6))
         );
 
         let regex = compile("a", true).unwrap();
         let many = "a".repeat(HIGHLIGHT_MATCHES * 2);
         assert_eq!(
-            whole_line_ranges_within(&regex, &many, UNHURRIED).len(),
+            whole_line_ranges_within(&regex, &many, UNHURRIED)
+                .ranges
+                .len(),
             HIGHLIGHT_MATCHES
         );
         assert_eq!(
-            whole_line_ranges_within(&regex, &many, Duration::ZERO),
+            whole_line_ranges_within(&regex, &many, Duration::ZERO).ranges,
             std::slice::from_ref(&(0..1))
         );
     }
@@ -340,11 +395,11 @@ mod tests {
     #[test]
     fn highlighting_stops_at_its_limits() {
         let regex = compile("a", true).unwrap();
-        let found = bounded_ranges(&regex, &"a".repeat(HIGHLIGHT_BYTES));
+        let found = bounded_ranges(&regex, &"a".repeat(HIGHLIGHT_BYTES)).ranges;
         assert!(!found.is_empty() && found.len() <= HIGHLIGHT_MATCHES);
         // Every match costs a scan to the end of the text here.
         let regex = compile("a*b|a", true).unwrap();
-        let found = bounded_ranges(&regex, &"a".repeat(HIGHLIGHT_BYTES));
+        let found = bounded_ranges(&regex, &"a".repeat(HIGHLIGHT_BYTES)).ranges;
         assert!(found.len() < HIGHLIGHT_BYTES / 4, "{}", found.len());
     }
 }

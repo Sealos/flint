@@ -388,11 +388,13 @@ impl LogView {
         });
     }
 
-    /// Drops a whole-line scan of a query that is no longer searched.
+    /// Drops a whole-line scan of a query that is no longer searched, and what was asked of it:
+    /// its lines are asked for again if the query comes back.
     pub(super) fn stop_whole_line_scan(&mut self) {
         self.whole_line_scan.stop();
         self.whole_line_scanning = false;
         self._whole_lines = Task::ready(());
+        self.highlights.borrow_mut().forget();
     }
 
     /// The line at the top of the list, unless it follows the tail: where the list goes back

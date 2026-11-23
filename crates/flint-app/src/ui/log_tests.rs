@@ -1994,9 +1994,10 @@ async fn a_large_selection_is_counted_and_copied(cx: &mut TestAppContext) {
     assert_eq!(note, "Copied 20,000 lines as shown, not redacted.");
 }
 
-// covers UP-43: between a snapshot and the next frame (here, a tab not drawn), Next Match and
-// Save Matching Lines see the lines shown: not matches evicted meanwhile, and new ones. While
-// a catch-up runs on the core's threads, they are refused.
+// covers UP-43: between a snapshot and the next frame (here, a tab not drawn), the guards of Next
+// Match and Save Matching Lines read the matches found, without evicted ones and testing no line.
+// Next Match itself catches up first. While a catch-up runs on the core's threads, they are
+// refused.
 #[gpui_kit::test]
 async fn match_actions_see_the_lines_shown_and_wait_for_a_scan(cx: &mut TestAppContext) {
     use super::CATCH_UP_ON_UI;
@@ -2028,10 +2029,11 @@ async fn match_actions_see_the_lines_shown_and_wait_for_a_scan(cx: &mut TestAppC
     // Line 14 matches, not scanned yet.
     feed(cx, &view, lines.push(14, 15).streaming());
     view.read_with(cx, |v, _| {
-        assert!(v.has_matches());
-        assert!(v.check_save(SaveScope::Matches).is_ok());
+        assert!(!v.has_matches(), "a line not scanned yet is not tested");
+        let refused = v.check_save(SaveScope::Matches).unwrap_err();
+        assert!(refused.to_string().contains("still searching"), "{refused}");
         let search = v.view_state().search;
-        assert_eq!((search.matches, search.searching), (1, false));
+        assert_eq!((search.matches, search.searching), (0, false));
     });
     let next = |cx: &mut TestAppContext| {
         cx.update_window(window, |_, window, cx| {
@@ -2041,6 +2043,12 @@ async fn match_actions_see_the_lines_shown_and_wait_for_a_scan(cx: &mut TestAppC
         view.read_with(cx, |v, _| v.current_match)
     };
     assert_eq!(next(cx), Some(14));
+    view.read_with(cx, |v, _| {
+        assert!(v.has_matches());
+        assert!(v.check_save(SaveScope::Matches).is_ok());
+        let search = v.view_state().search;
+        assert_eq!((search.matches, search.searching), (1, false));
+    });
 
     // Far behind: shown, it scans on the core's threads, and the actions wait for it.
     let mut lines = Feed::new(CATCH_UP_ON_UI as usize * 2);
@@ -2473,6 +2481,35 @@ async fn context_lines_over_the_limit_are_refused(cx: &mut TestAppContext) {
     .unwrap();
     cx.run_until_parked();
     view.read_with(cx, |v, _| assert_eq!(v.context, 0));
+}
+
+// #309: clearing a regex while its long lines are being scanned, then restoring it, asks for
+// those lines again: the cancelled scan's results never landed.
+#[gpui_kit::test]
+async fn a_restored_regex_scans_its_long_lines_again(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (_window, view) = open(cx, core);
+    let text = format!(
+        "{}needle",
+        "x".repeat(flint_core::logs::HIGHLIGHT_BYTES * 2)
+    );
+    let line = LogLine::parse(&text, false);
+    view.update(cx, |v, cx| {
+        v.regex = true;
+        v.set_query("needle".into(), cx);
+        let query = v.query.clone();
+        v.highlights
+            .borrow_mut()
+            .matches(1, &line, &query, None, None);
+        assert_eq!(v.highlights.borrow_mut().take_wanted(), [1]);
+
+        v.set_query(String::new(), cx);
+        v.set_query("needle".into(), cx);
+        v.highlights
+            .borrow_mut()
+            .matches(1, &line, &query, None, None);
+        assert_eq!(v.highlights.borrow_mut().take_wanted(), [1]);
+    });
 }
 
 // covers UP-48: a regex over sources counts their bytes toward the UI thread's budget.

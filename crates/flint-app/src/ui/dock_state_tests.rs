@@ -140,6 +140,23 @@ async fn log_filter_actions_are_guarded(cx: &mut TestAppContext) {
     assert!(view.read_with(cx, |v, _| v.has_selection()));
     assert!(dispatch(cx, &t, "logs::DragSelection", json!({"line": 2})).is_err());
 
+    // After mouse-up, a selection the filter hides takes no drag: the handler would ignore it.
+    dispatch(cx, &t, "logs::ToggleErrorsOnly", Value::Null).unwrap();
+    cx.wait_for(t.window, WAIT, |_, cx| !view.read(cx).is_filtered())
+        .await;
+    dispatch(cx, &t, "logs::SelectLine", json!({"line": 0})).unwrap();
+    dispatch(cx, &t, "logs::ToggleErrorsOnly", Value::Null).unwrap();
+    cx.wait_for(t.window, WAIT, |_, cx| {
+        let v = view.read(cx);
+        v.is_filtered() && !v.has_selection()
+    })
+    .await;
+    view.update(cx, |v, _| v.drag_selecting = false);
+    assert!(dispatch(cx, &t, "logs::DragSelection", json!({"line": 1})).is_err());
+    dispatch(cx, &t, "logs::ToggleErrorsOnly", Value::Null).unwrap();
+    cx.wait_for(t.window, WAIT, |_, cx| !view.read(cx).is_filtered())
+        .await;
+
     dispatch(cx, &t, "logs::SetLogContext", json!({"lines": 100})).unwrap();
     let refused = dispatch(cx, &t, "logs::SetLogContext", json!({"lines": 101})).unwrap_err();
     assert!(refused.to_string().contains("0 to 100"), "{refused}");

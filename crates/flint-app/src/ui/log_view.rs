@@ -135,7 +135,7 @@ pub struct LogView {
     selection_paused: bool,
     selection: Option<LineSelection>,
     /// A mouse selection is being dragged.
-    drag_selecting: bool,
+    pub(in crate::ui) drag_selecting: bool,
     query: SearchQuery,
     search: LogSearch,
     /// The matches among the rows shown in a filtered tab, kept until the search or the rows
@@ -1110,6 +1110,20 @@ impl LogView {
                     .when(!self.wrap, |el| el.truncate())
                     .child(StyledText::new(body).with_highlights(body_runs)),
             )
+            .when(shown.limited, |el| {
+                el.child(
+                    div()
+                        .id(("log-limited", id as usize))
+                        .flex_none()
+                        .pl_1()
+                        .text_color(theme.muted_foreground)
+                        .child("partial")
+                        .tooltip(|window, cx| {
+                            Tooltip::new("Only some of this line's matches are highlighted.")
+                                .build(window, cx)
+                        }),
+                )
+            })
             .when(shown.cut, |el| {
                 el.child(
                     div()

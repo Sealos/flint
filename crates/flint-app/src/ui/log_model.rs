@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
-use flint_core::logs::{ContainerWait, FailedHop, NETWORK_FAILURES};
+use flint_core::logs::{ContainerWait, FailedHop, LineRanges, NETWORK_FAILURES};
 use flint_core::{
     LineFormat, LineId, LineSelection, LineSource, LogLine, LogLines, LogState, LogSubject, PodSet,
     PodSetStatus, SearchQuery, WorkloadTarget,
@@ -306,6 +306,8 @@ pub struct ShownLine {
     pub cut: bool,
     /// The prefix's colour, as [`SourceLabels::color`].
     pub color: Option<usize>,
+    /// The line may hold matches that are not highlighted.
+    pub limited: bool,
 }
 
 /// `line` as shown with `view`: its search matches (in the prefix too, when the query searches
@@ -321,6 +323,7 @@ pub fn shown_line(
     shown_line_with(line, view, max_bytes, |short| LineMatches {
         source: short.map_or_else(Vec::new, |short| source_matches(query, short, line)),
         body: query.match_ranges(&line.text),
+        limited: false,
     })
 }
 
@@ -331,6 +334,8 @@ pub struct LineMatches {
     pub source: Vec<Range<usize>>,
     /// In the whole message, so that `$` and `\b` see its real end when it is drawn clipped.
     pub body: Vec<Range<usize>>,
+    /// A limit, or a scan still to come, may have left matches out of `body`.
+    pub limited: bool,
 }
 
 /// Where `query` matches the short label `short` of `line`'s source. A match only in the part
@@ -365,6 +370,10 @@ struct CachedMatches {
     body: Option<Vec<Range<usize>>>,
     /// Its whole-line matches were asked for (or have landed), so it is not asked for again.
     whole: bool,
+    /// Its whole-line matches have landed.
+    landed: bool,
+    /// A limit stopped the search that found `body`.
+    limited: bool,
 }
 
 /// The search's matches in the lines drawn: found once per line and query, and for at most
@@ -451,17 +460,26 @@ impl LineHighlights {
     pub fn store_whole(
         &mut self,
         query: &SearchQuery,
-        found: Vec<(flint_core::LineId, Vec<Range<usize>>)>,
+        found: Vec<(flint_core::LineId, flint_core::logs::LineRanges)>,
     ) {
         if self.query != *query || self.drawn.is_some() {
             return;
         }
-        for (id, ranges) in found {
+        for (id, found) in found {
             if let Some(entry) = self.lines.get_mut(&id) {
-                entry.body = Some(ranges);
+                entry.body = Some(found.ranges);
+                entry.limited = !found.complete;
                 entry.whole = true;
+                entry.landed = true;
             }
         }
+    }
+
+    /// Forgets every line's matches and what was asked of the background scan.
+    pub fn forget(&mut self) {
+        self.lines.clear();
+        self.wanted.clear();
+        self.wanted_new = false;
     }
 
     /// What `query` found in line `id`, as far as this frame's budget reaches. `max` is how many
@@ -497,9 +515,9 @@ impl LineHighlights {
             ..
         } = self;
         let entry = lines.entry(id).or_default();
-        if query.regex
-            && max.is_none()
-            && line.text.len() > flint_core::logs::HIGHLIGHT_BYTES
+        let drawn_past_cut =
+            query.regex && max.is_none() && line.text.len() > flint_core::logs::HIGHLIGHT_BYTES;
+        if drawn_past_cut
             && !entry.whole
             && wanted.len() < WHOLE_LINE_BATCH
             && !wanted.contains(&id)
@@ -507,7 +525,7 @@ impl LineHighlights {
             wanted.push(id);
             *wanted_new = true;
         }
-        let mut find = |search: &dyn Fn() -> Vec<Range<usize>>| {
+        let mut find = |search: &dyn Fn() -> LineRanges| {
             if *spent >= *budget {
                 *deferred = true;
                 return None;
@@ -517,14 +535,21 @@ impl LineHighlights {
             *spent += started.elapsed();
             Some(found)
         };
-        if entry.body.is_none() {
-            entry.body = find(&|| query.match_ranges(drawn_window(&line.text, query, max)));
+        if entry.body.is_none()
+            && let Some(found) =
+                find(&|| query.highlight_ranges(drawn_window(&line.text, query, max)))
+        {
+            entry.limited = !found.complete;
+            entry.body = Some(found.ranges);
         }
         let source = match short.filter(|_| query.sources) {
             Some(short) => {
                 if entry.source.as_ref().is_none_or(|(s, _)| s != short) {
-                    entry.source = find(&|| source_matches(query, short, line))
-                        .map(|found| (short.to_owned(), found));
+                    entry.source = find(&|| LineRanges {
+                        ranges: source_matches(query, short, line),
+                        complete: true,
+                    })
+                    .map(|found| (short.to_owned(), found.ranges));
                 }
                 entry
                     .source
@@ -535,6 +560,7 @@ impl LineHighlights {
         };
         LineMatches {
             source,
+            limited: entry.limited || entry.body.is_none() || (drawn_past_cut && !entry.landed),
             body: entry.body.clone().unwrap_or_default(),
         }
     }
@@ -585,6 +611,7 @@ pub fn shown_line_with(
         cut = true;
     }
     text.push_str(body);
+    let limited = found.limited;
     matches.extend(
         found
             .body
@@ -599,6 +626,7 @@ pub fn shown_line_with(
         matches,
         cut,
         color,
+        limited,
     }
 }
 
@@ -1948,22 +1976,54 @@ mod tests {
             regex: true,
             ..SearchQuery::new("other")
         };
-        highlights.store_whole(&other, vec![(1, std::iter::once(0..1).collect())]);
+        let whole = |range: Range<usize>, complete| flint_core::logs::LineRanges {
+            ranges: vec![range],
+            complete,
+        };
+        highlights.store_whole(&other, vec![(1, whole(0..1, true))]);
         assert!(
             highlights
                 .matches(1, &line, &query, None, None)
                 .body
                 .is_empty()
         );
-        highlights.store_whole(&query, vec![(1, std::iter::once(at..at + 6).collect())]);
-        assert_eq!(
-            highlights.matches(1, &line, &query, None, None).body,
-            std::slice::from_ref(&(at..at + 6))
+        assert!(
+            highlights.matches(1, &line, &query, None, None).limited,
+            "partial until the whole line is scanned"
         );
+        highlights.store_whole(&query, vec![(1, whole(at..at + 6, true))]);
+        let found = highlights.matches(1, &line, &query, None, None);
+        assert_eq!(found.body, std::slice::from_ref(&(at..at + 6)));
+        assert!(!found.limited);
+
+        // A whole-line scan a limit stopped keeps what it found and stays marked.
+        highlights.store_whole(&query, vec![(1, whole(at..at + 6, false))]);
+        let found = highlights.matches(1, &line, &query, None, None);
+        assert_eq!(found.body, std::slice::from_ref(&(at..at + 6)));
+        assert!(found.limited);
 
         // Cut to the drawn part, nothing goes off the UI thread.
         highlights.matches(2, &line, &query, None, Some(UNWRAPPED_MAX_BYTES));
         assert!(highlights.take_wanted().is_empty());
+    }
+
+    // #309: a line a highlight limit stopped keeps the matches found and is shown as partial.
+    #[test]
+    fn a_limited_highlight_is_shown_as_partial() {
+        let query = SearchQuery {
+            regex: true,
+            ..SearchQuery::new("b|x*")
+        };
+        let line = LogLine::parse(&format!("b{}x", "a".repeat(3_000)), false);
+        let mut highlights = LineHighlights {
+            budget: std::time::Duration::from_secs(60),
+            ..Default::default()
+        };
+        let found = highlights.matches(1, &line, &query, None, None);
+        assert_eq!(found.body, std::slice::from_ref(&(0..1)));
+        assert!(found.limited);
+        let short = LogLine::parse("b a", false);
+        assert!(!highlights.matches(2, &short, &query, None, None).limited);
     }
 
     // covers UP-40: the toolbar stays one row, giving up parts as the tab narrows.
