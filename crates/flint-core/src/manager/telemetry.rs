@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use kube::config::Kubeconfig;
 
 use super::{Cluster, ClusterManager};
+use crate::ClusterId;
 use crate::cluster;
 use crate::connection::policy::Role;
 use crate::credential::CredentialSource;
@@ -28,14 +29,40 @@ pub(super) struct SlotFeed {
 }
 
 impl ClusterManager {
+    /// Records an overview open on `cluster`'s current connection generation. A context that
+    /// starts over needs a new one, so an overview of its old definition starts nothing.
+    pub(super) fn open_overview(&mut self, id: u64, cluster: ClusterId) {
+        if let Some(generation) = self.cluster(&cluster).map(|slot| slot.generation) {
+            self.overviews.insert(id, (cluster, generation));
+        }
+    }
+
+    pub(super) fn close_overview(&mut self, id: u64) {
+        self.overviews.remove(&id);
+    }
+
+    /// Whether the overview of `id` is showing: it is the active cluster, on the generation the
+    /// overview was opened for.
+    fn overview_showing(&self, id: &str) -> bool {
+        self.active.as_deref() == Some(id)
+            && self.cluster(id).is_some_and(|slot| {
+                self.overviews
+                    .values()
+                    .any(|(cluster, generation)| cluster == id && *generation == slot.generation)
+            })
+    }
+
     /// Whether `id` should have a feed now: it is selected or in the running set, in watch mode
-    /// All, its connection is up and not paused, and that connection's credential can go on being
-    /// used in its role. A credential that runs a program is used only in the foreground.
+    /// All or showing its overview, its connection is up and not paused, and that connection's
+    /// credential can go on being used in its role. A credential that runs a program is used
+    /// only in the foreground.
     ///
-    /// On view promises no watch of a kind without an open view, and a feed watches seven kinds
-    /// whatever is open, so that mode has no feed.
+    /// On view promises no watch of a kind without an open view. A feed watches seven kinds
+    /// whatever is open, so in that mode it runs only for the overview, which is a view of them.
     fn wants_telemetry(&self, id: &str) -> bool {
-        if !self.wants_watches(id) || self.settings.watch_mode_for(id) != WatchMode::All {
+        if !self.wants_watches(id)
+            || (self.settings.watch_mode_for(id) != WatchMode::All && !self.overview_showing(id))
+        {
             return false;
         }
         let Some(slot) = self.cluster(id) else {

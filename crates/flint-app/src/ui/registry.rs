@@ -71,6 +71,13 @@ actions!(
     ]
 );
 actions!(
+    workspace,
+    [
+        /// Open the active cluster's overview.
+        OpenClusterOverview
+    ]
+);
+actions!(
     palette,
     [
         /// Open the command palette, or close it when it is open.
@@ -779,6 +786,8 @@ pub enum Scope {
     CombinedList,
     /// The detail pane.
     Detail,
+    /// The open cluster overview.
+    Dashboard,
     /// An open dialog (the Expose to AI confirmation).
     Dialog,
     /// The bottom dock and its tabs.
@@ -1854,6 +1863,16 @@ const KIND: &[Arg] = &[arg(
     "plural or plural.group: pods, deployments.apps",
     ArgKind::Kind,
 )];
+const PROBLEM_CATEGORY: &[Arg] = &[arg(
+    "category",
+    "which problem tile",
+    ArgKind::Choice(&super::dashboard::CATEGORY_NAMES),
+)];
+const SHORT_WORKLOAD_KIND: &[Arg] = &[arg(
+    "kind",
+    "which kind of short workload",
+    ArgKind::Choice(&super::dashboard::SHORT_WORKLOAD_KINDS),
+)];
 const SECTION: &[Arg] = &[arg(
     "section",
     "section title, as shown: Workloads",
@@ -2246,6 +2265,25 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             KIND,
         )
         .of(C::View, S::Workspace),
+        Spec::unit::<OpenClusterOverview>(
+            "Open Cluster Overview",
+            "Show what needs attention on the active cluster.",
+        )
+        .of(C::View, S::Navigation),
+        Spec::with_args::<super::dashboard::OpenProblemList>(
+            "Open Problem List…",
+            "Open the objects behind a problem tile of the cluster overview.",
+            PROBLEM_CATEGORY,
+        )
+        .of(C::View, S::Dashboard)
+        .hidden(),
+        Spec::with_args::<super::dashboard::OpenShortWorkloads>(
+            "Open Short Workloads…",
+            "Open one kind of the workloads the cluster overview counts as short.",
+            SHORT_WORKLOAD_KIND,
+        )
+        .of(C::View, S::Dashboard)
+        .hidden(),
         Spec::with_args::<ToggleNavSection>(
             "Toggle Navigation Section…",
             "Open or close a section of the resource navigation.",

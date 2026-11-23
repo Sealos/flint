@@ -34,6 +34,7 @@ use super::clusters::{
     ClustersModel, Presence, cluster_details, cluster_tooltip, connection_stopped, state_label,
 };
 use super::confirm::{self, DialogText};
+use super::dashboard::{DashboardEvent, DashboardView};
 use super::detail::{
     DetailEvent, DetailTab, DetailView, ObjectRef, Opening, TakeFocus, protected_reason, refused,
 };
@@ -48,10 +49,10 @@ use super::notice::{ServerMove, ServerMoves, notice};
 use super::palette::CommandPalette;
 use super::registry::{
     self, AddNamespace, BackToList, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, EditYaml,
-    ExposeToAi, FocusFilter, HideFromAi, LockCluster, OnView, OpenObject, OpenView, RenameCluster,
-    RetryConnection, SelectCluster, SelectRow, ShowAgentActivity, ShowAllNamespaces,
-    ToggleNamespace, TrustCluster, UnlockCluster, UntrustCluster, UseDefaultWatchMode,
-    WatchAllKinds, WatchOpenViewsOnly,
+    ExposeToAi, FocusFilter, HideFromAi, LockCluster, OnView, OpenClusterOverview, OpenObject,
+    OpenView, RenameCluster, RetryConnection, SelectCluster, SelectRow, ShowAgentActivity,
+    ShowAllNamespaces, ToggleNamespace, TrustCluster, UnlockCluster, UntrustCluster,
+    UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::resource_actions;
 use super::row_menu;
@@ -256,6 +257,8 @@ pub struct Workspace {
     generation: Option<u64>,
     list: Option<Entity<ResourceList>>,
     detail: Option<Entity<DetailView>>,
+    /// The active cluster's overview, in place of a list.
+    dashboard: Option<(Entity<DashboardView>, Subscription)>,
     /// The sidebar's choice of clusters, saved sets and the running set's combined list.
     sets: sets::ClusterSets,
     /// The window is too narrow for the list and the detail side by side, as of the last draw.
@@ -366,6 +369,7 @@ impl Workspace {
                 };
                 this.open_view(&open, window, cx);
             }
+            NavEvent::OpenOverview => this.open_dashboard(window, cx),
         });
         // Quitting right after a drag (or another change) still saves state.toml.
         let on_quit = cx.on_app_quit(|this: &mut Self, cx| {
@@ -427,7 +431,8 @@ impl Workspace {
         // and registered actions still reach the workspace.
         let on_focus_lost =
             cx.on_focus_lost(window, |this, window, cx| this.reclaim_focus(window, cx));
-        let guards = Self::set_guards(Self::guards(cx.entity().downgrade()));
+        let guards = Self::set_guards(Self::guards(cx.entity().downgrade()))
+            .when::<OpenClusterOverview>(|ws, _| ws.cluster.is_some());
         registry::install(focus.clone(), guards, cx);
         let cluster_sets = sets::ClusterSets::new(window, cx);
         // The window's close button asks first while a session would end, as Close Window does.
@@ -444,6 +449,7 @@ impl Workspace {
             generation: None,
             list: None,
             detail: None,
+            dashboard: None,
             sets: cluster_sets,
             narrow: false,
             two_row_header: false,
@@ -1114,7 +1120,7 @@ impl Workspace {
         let (Some(cluster), Some(discovery)) = (active, discovered.discovery) else {
             return;
         };
-        if self.list.is_some() || self.sets.is_open() {
+        if self.list.is_some() || self.dashboard.is_some() || self.sets.is_open() {
             return;
         }
         let entries = || {
@@ -1194,6 +1200,76 @@ impl Workspace {
         self.detail = None;
         self._list_subscriptions.clear();
         self._detail_subscriptions.clear();
+        if self.dashboard.take().is_some() {
+            self.nav.update(cx, |nav, cx| nav.set_overview(false, cx));
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::ui) fn dashboard_view(&self) -> Option<Entity<DashboardView>> {
+        self.dashboard.as_ref().map(|(view, _)| view.clone())
+    }
+
+    #[cfg(test)]
+    pub(in crate::ui) fn saved_namespace_filter(&self, cluster: &str) -> Vec<String> {
+        self.ui_state.namespace_filter(cluster).to_vec()
+    }
+
+    /// Shows the active cluster's overview in place of its list. Go Back returns to the list.
+    fn open_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cluster) = self.cluster.clone() else {
+            return;
+        };
+        if let Some((view, _)) = &self.dashboard {
+            let focus = view.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+            return;
+        }
+        // Any place other than the list shown: the overview is not one Go Back returns to.
+        let overview = keys::Place {
+            kind: KindId::new("flint.overview", "overview"),
+            object: None,
+            seen: None,
+        };
+        self.remember_place(&overview, cx);
+        self.close_list(cx);
+        let model = self.model.clone();
+        let view = cx.new(|cx| DashboardView::following(model, cluster, cx));
+        let events = cx.subscribe_in(&view, window, Self::on_dashboard_event);
+        let focus = view.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        release_unfocused_input(window, cx);
+        self.dashboard = Some((view, events));
+        self.nav.update(cx, |nav, cx| nav.set_overview(true, cx));
+        cx.notify();
+    }
+
+    /// A problem tile opens its kind's list, narrowed to the objects it counted.
+    fn on_dashboard_event(
+        &mut self,
+        view: &Entity<DashboardView>,
+        event: &DashboardEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let problems = match *event {
+            DashboardEvent::OpenFilteredList(category) => view.read(cx).problem_list(category),
+            DashboardEvent::OpenShortWorkloads(kind) => view.read(cx).short_workloads(kind),
+        };
+        let Some(problems) = problems.cloned() else {
+            return;
+        };
+        let Some(entry) = self.nav_entry(problems.kind, cx) else {
+            self.refuse(
+                format!("This cluster does not list {}.", problems.filter.label),
+                cx,
+            );
+            return;
+        };
+        self.open_kind(&entry, window, cx);
+        if let Some(list) = &self.list {
+            list.update(cx, |list, cx| list.show_only(Some(problems.filter), cx));
+        }
     }
 
     /// Opens `entry`'s list at the user's asking, in front of any detail in a narrow window.
@@ -1238,6 +1314,8 @@ impl Workspace {
                 let focus = list.read(cx).focus_handle().clone();
                 window.focus(&focus, cx);
                 release_unfocused_input(window, cx);
+                // Asking for the kind again shows all of it.
+                list.update(cx, |list, cx| list.show_only(None, cx));
             }
             return;
         }
@@ -2440,7 +2518,16 @@ impl Workspace {
                     ),
             );
         };
+        let dashboard = self
+            .dashboard
+            .as_ref()
+            .filter(|_| !matches!(cluster.state, ConnectionState::Failed(_)));
         let content: AnyElement = match (&self.list, &cluster.state) {
+            _ if dashboard.is_some() => div()
+                .flex_1()
+                .min_h_0()
+                .children(dashboard.map(|(view, _)| view.clone()))
+                .into_any_element(),
             // A failed connection stops the watches; say why instead of an endless "Loading".
             (Some(_), state)
                 if !connection_stopped(state) && self.main_panes(cx) == MainPanes::DetailAlone =>

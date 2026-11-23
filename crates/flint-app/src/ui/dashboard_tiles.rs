@@ -4,18 +4,21 @@
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::Button;
-use gpui_kit::component::{Theme, h_flex, v_flex};
+use gpui_kit::component::{Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::sparkline::sparkline;
 use super::{
     CANNOT_BE_CHECKED, DashboardStatus, INSTALL_COMMAND, INSTALL_HINT, MAX_WARNING_ROWS,
-    METRICS_WAITING, MetricTile, MetricsPanel, NO_WARNINGS, OpenProblemList, ProblemTile,
-    WARNINGS_UNAVAILABLE, WarningRow, WarningsPanel,
+    METRICS_WAITING, MetricTile, MetricsPanel, NO_WARNINGS, OpenProblemList, OpenShortWorkloads,
+    ProblemList, ProblemLists, ProblemTile, WARNINGS_UNAVAILABLE, WarningRow, WarningsPanel,
 };
 use crate::ui::registry;
 use flint_core::thresholds::ThresholdLevel;
+
+/// On a tile whose count includes objects still in their grace period.
+const STILL_SETTLING: &str = "Some are still settling";
 
 /// The narrowest a tile gets before the row wraps.
 const TILE_MIN_WIDTH: f32 = 132.;
@@ -73,18 +76,59 @@ fn level_color(level: ThresholdLevel, theme: &Theme) -> Hsla {
     }
 }
 
-pub fn problem_tiles(tiles: &[ProblemTile], focus: FocusHandle, theme: &Theme) -> impl IntoElement {
+pub fn problem_tiles(
+    tiles: &[ProblemTile],
+    lists: &ProblemLists,
+    focus: FocusHandle,
+    theme: &Theme,
+) -> impl IntoElement {
     let mut row = h_flex().flex_wrap().gap_2().w_full();
+    let mut by_kind: &[ProblemList] = &[];
     for tile in tiles {
-        row = row.child(problem_tile(tile, focus.clone(), theme));
+        let drill = lists.get(&tile.category).map(Vec::as_slice);
+        if let Some(several @ [_, _, ..]) = drill.filter(|_| tile.opens_list()) {
+            by_kind = several;
+        }
+        row = row.child(problem_tile(tile, drill, focus.clone(), theme));
     }
-    section("Problems now", theme).child(row)
+    section("Problems now", theme)
+        .child(row)
+        .when(!by_kind.is_empty(), |el| {
+            el.child(short_kind_buttons(by_kind, focus))
+        })
 }
 
-fn problem_tile(tile: &ProblemTile, focus: FocusHandle, theme: &Theme) -> AnyElement {
+/// One button per kind, for a tile whose objects no single list can show.
+fn short_kind_buttons(lists: &[ProblemList], focus: FocusHandle) -> impl IntoElement {
+    h_flex()
+        .flex_wrap()
+        .gap_2()
+        .children(lists.iter().enumerate().map(|(index, list)| {
+            let text = format!("{} {}", list.filter.objects.len(), list.filter.label);
+            Button::new(("dashboard-short-kind", index))
+                .accessibility_label(format!("Open {text}"))
+                .outline()
+                .small()
+                .label(text)
+                .on_click(registry::on_click_in(
+                    focus.clone(),
+                    OpenShortWorkloads { kind: list.kind },
+                ))
+        }))
+}
+
+/// `drill` is the tile's lists, when they have been read.
+fn problem_tile(
+    tile: &ProblemTile,
+    drill: Option<&[ProblemList]>,
+    focus: FocusHandle,
+    theme: &Theme,
+) -> AnyElement {
+    let is_button = tile.opens_list() && drill.is_none_or(|lists| lists.len() == 1);
+    let settling = tile.opens_list() && drill.is_some_and(<[ProblemList]>::is_empty);
     let body = v_flex()
         .id(tile_content_id(tile))
-        .when(!tile.opens_list(), |el| el.aria_label(tile.description()))
+        .when(!is_button, |el| el.aria_label(tile.description()))
         .items_start()
         .w_full()
         .gap_0p5()
@@ -109,8 +153,16 @@ fn problem_tile(tile: &ProblemTile, focus: FocusHandle, theme: &Theme) -> AnyEle
                     .child(CANNOT_BE_CHECKED),
             )
         })
+        .when(settling, |el| {
+            el.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(STILL_SETTLING),
+            )
+        })
         .test_support();
-    if tile.opens_list() {
+    if is_button {
         Button::new(tile_id(tile))
             .accessibility_label(tile.description())
             .outline()

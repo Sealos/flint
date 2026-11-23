@@ -1,5 +1,5 @@
-//! A cluster's problems and node metrics, kept current with no view open (#448, #20). Only in
-//! watch mode All: On view promises no watch of a kind without an open view.
+//! A cluster's problems and node metrics, kept current with no view open (#448, #20). In watch
+//! mode On view it runs only while the cluster's overview is showing, which is a view of its kinds.
 //!
 //! [`Telemetry`] runs typed watches of the seven kinds in [`WatchedKind`], classifies them with
 //! [`Classifier`](crate::problems::Classifier), counts them with
