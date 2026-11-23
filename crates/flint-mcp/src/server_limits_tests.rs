@@ -840,10 +840,10 @@ async fn cluster_row(server: &FlintMcp) -> Value {
 #[tokio::test]
 async fn a_cluster_row_tidies_the_proxy_field() {
     let dir = tempfile::tempdir().unwrap();
-    let url = forbidding_server("denied").await;
+    let url = "https://127.0.0.1:1";
     let proxy = "    proxy-url: http://proxyuser:proxy-pass-123@127.0.0.1:9\n";
-    let server = server_with(dir.path(), Some(&url), proxy, Limits::default());
-    expose_through(dir.path(), &url, "http://127.0.0.1:9");
+    let server = server_with(dir.path(), Some(url), proxy, Limits::default());
+    expose_through(dir.path(), url, "http://127.0.0.1:9");
     let row = cluster_row(&server).await;
     let error = row["error"].as_str().expect("the probe failed");
     assert!(error.contains("could not reach the proxy"), "{row}");
@@ -889,7 +889,23 @@ async fn counting_proxy(upstream: String) -> (String, Arc<std::sync::atomic::Ato
 }
 
 #[tokio::test]
-async fn an_exposed_cluster_is_read_through_its_proxy() {
+async fn an_exposed_cluster_connects_through_its_proxy() {
+    let dir = tempfile::tempdir().unwrap();
+    // Not TLS, so the handshake inside the tunnel fails: what counts here is the tunnel.
+    let upstream = forbidding_server("denied").await;
+    let upstream = upstream.trim_start_matches("http://").to_owned();
+    let (proxy, tunnels) = counting_proxy(upstream).await;
+    let url = "https://127.0.0.1:1";
+    let extra = format!("    proxy-url: {proxy}\n");
+    let server = server_with(dir.path(), Some(url), &extra, Limits::default());
+    expose_through(dir.path(), url, &proxy);
+    let row = cluster_row(&server).await;
+    assert!(row["error"].is_string(), "{row}");
+    assert!(tunnels.load(std::sync::atomic::Ordering::SeqCst) > 0);
+}
+
+#[tokio::test]
+async fn a_plain_http_server_is_not_read_through_a_proxy() {
     let dir = tempfile::tempdir().unwrap();
     let url = forbidding_server("denied").await;
     let upstream = url.trim_start_matches("http://").to_owned();
@@ -898,8 +914,10 @@ async fn an_exposed_cluster_is_read_through_its_proxy() {
     let server = server_with(dir.path(), Some(&url), &extra, Limits::default());
     expose_through(dir.path(), &url, &proxy);
     let row = cluster_row(&server).await;
-    assert!(row.to_string().contains("denied"), "{row}");
-    assert!(tunnels.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    let error = row["error"].as_str().expect("the connection was refused");
+    assert!(error.contains("did not connect"), "{row}");
+    assert!(!row.to_string().contains("denied"), "{row}");
+    assert_eq!(tunnels.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

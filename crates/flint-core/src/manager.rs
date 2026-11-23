@@ -866,7 +866,12 @@ impl ClusterManager {
                 // context moved (its fallback gone, say) is not pinned to where it is now.
                 let pin = match (&member, &server) {
                     (Some(member), _) => member.log_pin(&cluster),
-                    (None, Some(server)) => self.contexts.pin(&cluster, server.as_deref()),
+                    (None, Some(server)) => self.contexts.pin_through(
+                        &cluster,
+                        server.as_deref(),
+                        self.cluster(&cluster)
+                            .and_then(|slot| slot.info.proxy_url.as_deref()),
+                    ),
                     (None, None) => self.session_pin(&cluster),
                 };
                 let lookup: logs::ClientLookup = Arc::new(move || {
@@ -1864,6 +1869,7 @@ impl ClusterManager {
             let shown = s.info.server.as_deref();
             // Streams already open go on; this is asked only for a new one.
             !self.paused(cluster)
+                && s.info.proxy_url.as_deref() == pin.proxy()
                 // The endpoint alone is enough only for a confirmed server: a fallback at the
                 // same URL can come with other credentials.
                 && (shown == pin.server()
@@ -1967,7 +1973,11 @@ impl ClusterManager {
     /// is labelled with), stale if that is not the confirmed one ([`ContextHistory::pin`]).
     fn session_pin(&self, cluster: &str) -> ContextPin {
         match self.cluster(cluster) {
-            Some(slot) => self.contexts.pin(cluster, slot.info.server.as_deref()),
+            Some(slot) => self.contexts.pin_through(
+                cluster,
+                slot.info.server.as_deref(),
+                slot.info.proxy_url.as_deref(),
+            ),
             None => self.contexts.pin_confirmed(cluster),
         }
     }
@@ -1994,10 +2004,10 @@ impl ClusterManager {
 
     /// The cluster's protection now, if it allows changes.
     fn write_gate(&self, cluster: &str) -> Result<crate::Protection, WriteRefusal> {
-        let server = self
-            .cluster(cluster)
-            .and_then(|slot| slot.info.server.as_deref());
-        self.gate_for_server(cluster, server)
+        let info = self.cluster(cluster).map(|slot| &slot.info);
+        let server = info.and_then(|info| info.server.as_deref());
+        let proxy = info.and_then(|info| info.proxy_url.as_deref());
+        self.gate_for_route(cluster, server, proxy)
     }
 
     /// The gate for a session about to run a command with the client it was given at `pin`: for
@@ -2028,7 +2038,8 @@ impl ClusterManager {
                 WriteRefusal::Moved { cluster }
             });
         }
-        self.gate_for_server(cluster, pin.server()).map(drop)
+        self.gate_for_route(cluster, pin.server(), pin.proxy())
+            .map(drop)
     }
 
     /// [`Self::launch_gate`] for a write, in one step with checking the definition it is pinned
@@ -2154,20 +2165,19 @@ impl ClusterManager {
     }
 
     /// `cluster`'s protection for `server`, if it allows changes.
-    fn gate_for_server(
+    fn gate_for_route(
         &self,
         cluster: &str,
         server: Option<&str>,
+        proxy: Option<&str>,
     ) -> Result<crate::Protection, WriteRefusal> {
         // A context Flint does not know has no client either: say that, not "protected". A held
         // slot counts as unknown here: no load shows its definition, so nothing new starts on it.
-        let slot = self
-            .cluster(cluster)
-            .filter(|_| !self.held(cluster))
-            .ok_or_else(|| WriteRefusal::NotConnected {
+        if self.cluster(cluster).is_none() || self.held(cluster) {
+            return Err(WriteRefusal::NotConnected {
                 cluster: cluster.to_owned(),
-            })?;
-        let proxy = slot.info.proxy_url.as_deref();
+            });
+        }
         let protection = protection(&self.settings, &self.unlocks, cluster, server, proxy);
         if protection.allows_changes() {
             Ok(protection)
@@ -3232,6 +3242,37 @@ mod tests {
                 cluster: "dev".into()
             }),
             "no tab named a server"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shell_pinned_through_one_proxy_cannot_launch_through_another() {
+        let at = |proxy: &str| kubeconfig_with(&format!("https://dev\n    proxy-url: {proxy}"));
+        let (one, two) = ("http://one.example:3128", "http://two.example:3128");
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &at(one)).await;
+        manager.unlocks.unlock(
+            "dev",
+            &crate::connection::proxy::grant_endpoint("https://dev", Some(one)),
+        );
+        let pin = manager.session_pin("dev");
+        assert_eq!(manager.launch_gate("dev", &pin), Ok(()));
+
+        rewrite(&mut manager, dir.path(), &at(two)).await;
+        manager.unlocks.unlock(
+            "dev",
+            &crate::connection::proxy::grant_endpoint("https://dev", Some(two)),
+        );
+
+        assert_eq!(
+            manager.launch_gate("dev", &pin),
+            Err(WriteRefusal::Moved {
+                cluster: "dev".into()
+            })
+        );
+        assert!(
+            manager.log_client("dev", &pin).is_err(),
+            "a log stream through the old proxy ends too"
         );
     }
 

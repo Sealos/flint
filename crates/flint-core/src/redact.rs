@@ -346,8 +346,20 @@ pub const HIDDEN_SERVER_URL: &str = "<server URL not shown>";
 /// fragment are dropped, since a hand-written kubeconfig could put a credential there. A URL that
 /// does not parse, or that still holds an `@` after that (a password with a `/` or `?` in it),
 /// becomes [`HIDDEN_SERVER_URL`]. The rest is what kubeconfig, `settings.toml` (ADR-0009) and the
-/// app's sidebar already show.
+/// app's sidebar already show. A grant's `server via proxy` shows each part sanitized on its own.
 pub fn server_url(url: &str) -> String {
+    match url.rsplit_once(" via ") {
+        Some((server, proxy)) => format!(
+            "{} via {}",
+            plain_server_url(server),
+            crate::connection::proxy::shown(proxy)
+        ),
+        None => plain_server_url(url),
+    }
+}
+
+/// [`server_url`] of one URL.
+pub(crate) fn plain_server_url(url: &str) -> String {
     let Ok(uri) = url.trim().parse::<http::Uri>() else {
         return HIDDEN_SERVER_URL.to_owned();
     };
@@ -806,6 +818,30 @@ mod tests {
             "",
         ] {
             assert_eq!(server_url(url), HIDDEN_SERVER_URL, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_grant_shows_its_server_and_proxy_apart() {
+        for (grant, shown) in [
+            (
+                "https://u:p@api.example:6443/k8s via http://proxy.example:3128",
+                "https://api.example:6443/k8s via http://proxy.example:3128",
+            ),
+            (
+                "https://api.example:6443 via http://user:s3cret@proxy.example:3128",
+                "https://api.example:6443 via http://proxy.example:3128",
+            ),
+            (
+                "https://api.example:6443 via http://user:s3/cret@proxy.example:3128",
+                "https://api.example:6443 via an unreadable proxy URL",
+            ),
+            (
+                "https://u:pa/ss@api.example via http://proxy.example:3128",
+                "<server URL not shown> via http://proxy.example:3128",
+            ),
+        ] {
+            assert_eq!(server_url(grant), shown, "{grant}");
         }
     }
 

@@ -191,6 +191,13 @@ async fn run(
     if let Some(args) = &exec.args {
         cmd.args(args);
     }
+    // Before the kubeconfig's own `env`, which may set these on purpose.
+    for (name, address) in crate::connection::proxy::plugin_environment() {
+        match address {
+            Some(address) => cmd.env(name, address),
+            None => cmd.env_remove(name),
+        };
+    }
     if let Some(env) = &exec.env {
         cmd.envs(
             env.iter()

@@ -485,6 +485,95 @@ async fn an_unsupported_proxy_is_refused_before_the_plugin_runs() {
     assert_eq!(runs(&plugin), 0);
 }
 
+#[tokio::test]
+async fn no_plugin_runs_for_a_proxied_server_without_verified_tls() {
+    let plain = printing(r#"{"token":"t"}"#);
+    let mut kubeconfig = plain.kubeconfig("http://127.0.0.1:1");
+    kubeconfig.clusters[0].cluster.as_mut().unwrap().proxy_url =
+        Some("http://127.0.0.1:3128".into());
+    assert!(cluster::connect(&kubeconfig, "ctx").await.is_err());
+    assert_eq!(runs(&plain), 0, "plain HTTP");
+
+    let unverified = printing(r#"{"token":"t"}"#);
+    let mut kubeconfig = unverified.kubeconfig("https://127.0.0.1:1");
+    let entry = kubeconfig.clusters[0].cluster.as_mut().unwrap();
+    entry.proxy_url = Some("http://127.0.0.1:3128".into());
+    entry.insecure_skip_tls_verify = Some(true);
+    assert!(cluster::connect(&kubeconfig, "ctx").await.is_err());
+    assert_eq!(runs(&unverified), 0, "unverified TLS");
+}
+
+#[tokio::test]
+async fn the_plugin_is_not_given_the_proxy_credentials() {
+    let plugin = FakePlugin::new(
+        "printf '%s' \"$KUBERNETES_EXEC_INFO\" > \"$PLUGIN_DIR/seen\"\n\
+         printf '{\"status\":{\"token\":\"t\"}}'\n",
+    );
+    let mut kubeconfig = plugin.kubeconfig("https://127.0.0.1:1");
+    kubeconfig.clusters[0].cluster.as_mut().unwrap().proxy_url =
+        Some("http://user:proxy-secret@127.0.0.1:3128".into());
+    let exec = kubeconfig.auth_infos[0]
+        .auth_info
+        .as_mut()
+        .unwrap()
+        .exec
+        .as_mut()
+        .unwrap();
+    exec.provide_cluster_info = true;
+    let _ = cluster::connect(&kubeconfig, "ctx").await;
+    let seen = std::fs::read_to_string(plugin.dir.path().join("seen")).unwrap();
+    assert!(
+        !seen.contains("proxy-secret") && !seen.contains("user:"),
+        "{seen}"
+    );
+    let info: serde_json::Value = serde_json::from_str(&seen).unwrap();
+    assert_eq!(
+        info["spec"]["cluster"]["proxy-url"], "http://127.0.0.1:3128",
+        "{seen}"
+    );
+}
+
+/// Set for the child process of [`a_plugin_inherits_proxy_variables_without_credentials`].
+const PROXY_ENV_CHILD: &str = "FLINT_TEST_PLUGIN_PROXY_ENV_CHILD";
+
+// The proxy variables belong to the whole process, so this runs in a child of its own.
+#[test]
+fn a_plugin_inherits_proxy_variables_without_credentials() {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "auth_plugin::tests::plugin_proxy_env_child",
+            "--exact",
+            "--nocapture",
+        ])
+        .env(PROXY_ENV_CHILD, "1")
+        .env("HTTPS_PROXY", "http://user:proxy-secret@127.0.0.1:3128")
+        .env("http_proxy", "http://user:proxy/secret@127.0.0.1:3128")
+        .env("ALL_PROXY", "http://127.0.0.1:3129/kept")
+        .env("NO_PROXY", "example.test")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[tokio::test]
+async fn plugin_proxy_env_child() {
+    if std::env::var_os(PROXY_ENV_CHILD).is_none() {
+        return;
+    }
+    let plugin = FakePlugin::new(
+        "printf '%s|%s|%s|%s' \"$HTTPS_PROXY\" \"${http_proxy-unset}\" \"$ALL_PROXY\" \
+         \"$NO_PROXY\" > \"$PLUGIN_DIR/seen\"\n\
+         printf '{\"status\":{\"token\":\"t\"}}'\n",
+    );
+    let mut config = config(&plugin.kubeconfig("https://127.0.0.1:1")).await;
+    resolve(&mut config, "ctx").await.unwrap();
+    let seen = std::fs::read_to_string(plugin.dir.path().join("seen")).unwrap();
+    assert_eq!(
+        seen,
+        "http://127.0.0.1:3128|unset|http://127.0.0.1:3129/kept|example.test"
+    );
+}
+
 // covers UP-04: a plugin that prints more than a credential takes is killed and said so.
 #[tokio::test]
 async fn output_past_the_cap_is_refused() {

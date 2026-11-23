@@ -195,6 +195,61 @@ async fn an_unsupported_scheme_is_refused_and_sends_nothing() {
 }
 
 #[tokio::test]
+async fn nothing_goes_through_a_proxy_to_a_server_without_verified_tls() {
+    let api = FakeApiServer::start().await.unwrap();
+    let (proxy, seen) = fake_proxy(api.addr()).await;
+    let (mut unverified, context) = through(api.kubeconfig(None), &format!("http://{proxy}"));
+    let mut plain = unverified.clone();
+    unverified.clusters[0]
+        .cluster
+        .as_mut()
+        .unwrap()
+        .insecure_skip_tls_verify = Some(true);
+    plain.clusters[0].cluster.as_mut().unwrap().server = Some(format!("http://{}", api.addr()));
+
+    for kubeconfig in [unverified, plain] {
+        let Err(error) = cluster::connect(&kubeconfig, &context).await else {
+            panic!("connected through the proxy");
+        };
+        assert!(error.to_string().contains("did not connect"), "{error}");
+    }
+
+    assert!(seen.lock().unwrap().heads.is_empty(), "the proxy was used");
+    assert_eq!(arrivals(&api), 0, "it connected directly");
+}
+
+/// Set for the child process of [`an_exempt_server_ignores_a_malformed_environment_proxy`].
+const EXEMPT_CHILD: &str = "FLINT_TEST_EXEMPT_PROXY_CHILD";
+
+// The proxy variables belong to the whole process, so this runs in a child of its own.
+#[test]
+fn an_exempt_server_ignores_a_malformed_environment_proxy() {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["exempt_server_child", "--exact", "--nocapture"])
+        .env(EXEMPT_CHILD, "1")
+        .env("HTTPS_PROXY", "http://not a url:1")
+        .env_remove("https_proxy")
+        .env("NO_PROXY", "127.0.0.1")
+        .env_remove("no_proxy")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[tokio::test]
+async fn exempt_server_child() {
+    if std::env::var_os(EXEMPT_CHILD).is_none() {
+        return;
+    }
+    let api = FakeApiServer::start().await.unwrap();
+    let kubeconfig = api.kubeconfig(None);
+    let context = kubeconfig.contexts[0].name.clone();
+    let client = cluster::connect(&kubeconfig, &context).await.unwrap();
+    cluster::server_version(&client).await.unwrap();
+    assert!(arrivals(&api) > 0);
+}
+
+#[tokio::test]
 async fn a_client_through_a_proxy_keeps_the_read_only_rule() {
     let api = FakeApiServer::start().await.unwrap();
     let (proxy, _) = fake_proxy(api.addr()).await;
