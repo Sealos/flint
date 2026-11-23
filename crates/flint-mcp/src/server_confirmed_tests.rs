@@ -15,7 +15,7 @@ use super::{FlintMcp, ToolError};
 const VERSION: &str = r#"{"major":"1","minor":"31","gitVersion":"v1.31.0","gitCommit":"x","gitTreeState":"clean","buildDate":"2026-01-01T00:00:00Z","goVersion":"go1.23","compiler":"gc","platform":"linux/amd64"}"#;
 
 /// A fake API server answering `/version`, keeping the head of every request it gets.
-fn fake_api() -> (String, Arc<Mutex<Vec<String>>>) {
+pub(super) fn fake_api() -> (String, Arc<Mutex<Vec<String>>>) {
     serve_api(false)
 }
 
@@ -58,7 +58,7 @@ fn serve_api(mut busy: bool) -> (String, Arc<Mutex<Vec<String>>>) {
     (url, requests)
 }
 
-fn config(server: &str, user: &str) -> String {
+pub(super) fn config(server: &str, user: &str) -> String {
     format!(
         "apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: {server}\n\
          contexts:\n- name: dev\n  context:\n    cluster: c\n    user: u\n\
@@ -106,7 +106,7 @@ fn assert_waiting(result: Result<String, ToolError>, secret: &str, dir: &Path) {
 }
 
 /// Calls every tool that connects and asserts each one waits.
-async fn assert_every_tool_waits(server: &FlintMcp, secret: &str, dir: &Path) {
+pub(super) async fn assert_every_tool_waits(server: &FlintMcp, secret: &str, dir: &Path) {
     let listed = server.do_list_clusters().await.unwrap();
     let listed: Value = serde_json::from_str(&listed).unwrap();
     let row = &listed["clusters"][0];
@@ -137,7 +137,7 @@ async fn assert_every_tool_waits(server: &FlintMcp, secret: &str, dir: &Path) {
     assert_waiting(server.do_get_pod_logs(params(logs)).await, secret, dir);
 }
 
-async fn assert_reachable(server: &FlintMcp) {
+pub(super) async fn assert_reachable(server: &FlintMcp) {
     let listed = server.do_list_clusters().await.unwrap();
     let listed: Value = serde_json::from_str(&listed).unwrap();
     assert_eq!(listed["clusters"][0]["reachable"], json!(true), "{listed}");
@@ -195,7 +195,12 @@ async fn an_unchanged_definition_keeps_connecting() {
 }
 
 /// A server exposing `dev` from two files, in order.
-fn two_files(dir: &Path, server: &str, first: &str, second: &str) -> (FlintMcp, PathBuf) {
+pub(super) fn two_files(
+    dir: &Path,
+    server: &str,
+    first: &str,
+    second: &str,
+) -> (FlintMcp, PathBuf) {
     let (first_path, second_path) = (dir.join("first"), dir.join("second"));
     std::fs::write(&first_path, first).unwrap();
     std::fs::write(&second_path, second).unwrap();
@@ -210,7 +215,7 @@ fn two_files(dir: &Path, server: &str, first: &str, second: &str) -> (FlintMcp, 
     )
 }
 
-fn sent(requests: &Mutex<Vec<String>>, token: &str) -> usize {
+pub(super) fn sent(requests: &Mutex<Vec<String>>, token: &str) -> usize {
     let needle = format!("authorization: bearer {token}");
     let requests = requests.lock().unwrap();
     requests
