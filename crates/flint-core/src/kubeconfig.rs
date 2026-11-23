@@ -139,15 +139,69 @@ pub fn error_summary(error: &str) -> String {
 }
 
 /// What [`load`] depends on: each file's modification time and size, or `None` if it does not
-/// exist. When the stamps of two loads are equal, so are the
-/// results, which lets callers that load often (the MCP server) skip re-parsing.
+/// exist, and whether it can be read now. When the stamps of two loads are equal, so are the
+/// results, which lets callers that load often (the MCP server) skip re-parsing. Losing read
+/// access changes neither the time nor the size, so it is checked on its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileStamps(Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>);
+pub struct FileStamps(Vec<(PathBuf, Option<ModifiedAndSize>, SourceAccess)>);
+
+/// A file's modification time and size.
+type ModifiedAndSize = (std::time::SystemTime, u64);
 
 impl FileStamps {
     pub fn of(paths: &[PathBuf]) -> Self {
-        FileStamps(paths.iter().map(|p| (p.clone(), file_stamp(p))).collect())
+        FileStamps(
+            paths
+                .iter()
+                .map(|p| (p.clone(), file_stamp(p), SourceAccess::of(p)))
+                .collect(),
+        )
     }
+}
+
+/// Whether a kubeconfig path can be read at this moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceAccess {
+    Absent,
+    /// A symbolic link on the way to it points at nothing.
+    Dangling,
+    /// Not a regular file, so it is not opened: opening one can block or have effects.
+    Special,
+    Readable,
+    Failed(std::io::ErrorKind),
+}
+
+impl SourceAccess {
+    fn of(path: &Path) -> Self {
+        use std::io::{ErrorKind, Read};
+        if std::fs::metadata(path).is_ok_and(|meta| !meta.is_file()) {
+            return SourceAccess::Special;
+        }
+        match open_nonblocking(path) {
+            Ok(mut file) => match file.read(&mut [0; 1]) {
+                Ok(_) => SourceAccess::Readable,
+                Err(e) => SourceAccess::Failed(e.kind()),
+            },
+            // Asked after the open failed, so a link that appeared before that failure is seen.
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                if dangling_link(path) {
+                    SourceAccess::Dangling
+                } else {
+                    SourceAccess::Absent
+                }
+            }
+            Err(e) => SourceAccess::Failed(e.kind()),
+        }
+    }
+}
+
+/// Whether `path`, or a directory on the way to it, is a symbolic link whose target can't be
+/// reached. Its target may only be unmounted for now, so the file is unknown rather than absent.
+fn dangling_link(path: &Path) -> bool {
+    path.ancestors().any(|part| {
+        std::fs::symlink_metadata(part).is_ok_and(|meta| meta.file_type().is_symlink())
+            && std::fs::metadata(part).is_err()
+    })
 }
 
 /// A file's modification time and size, or `None` if it can't be checked.
@@ -261,6 +315,23 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
         user_sources,
         blank,
     }
+}
+
+/// [`load`] for a process that judges definitions across reads: a path behind a symbolic link
+/// with no target counts as failed rather than absent, since the target may only be unmounted.
+/// A link that breaks after this check changes the input files, so the read that saw it is not
+/// consistent ([`FileRead::consistent`]).
+fn load_counting_dangling_links(paths: &[PathBuf]) -> LoadedKubeconfig {
+    let (dangling, present): (Vec<PathBuf>, Vec<PathBuf>) =
+        paths.iter().cloned().partition(|p| dangling_link(p));
+    let mut loaded = load(&present);
+    loaded.paths = paths.to_vec();
+    loaded.errors.extend(
+        dangling
+            .into_iter()
+            .map(|path| (path, "its symbolic link has no target".to_owned())),
+    );
+    loaded
 }
 
 /// Parses the file at `path`, as [`Kubeconfig::read_from`] does, from one handle. A path that is
@@ -410,6 +481,8 @@ fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
 #[derive(PartialEq, Eq)]
 enum InputFile {
     Absent,
+    /// A symbolic link on the way to it points at nothing.
+    Dangling,
     /// It could not be opened or read, for this reason.
     Failed(std::io::ErrorKind),
     /// Not a regular file, so its content is not read: opening one can block.
@@ -454,8 +527,13 @@ impl InputFile {
         }
         match open_nonblocking(path) {
             Ok(file) => Self::from_open(path, file),
+            // Asked after the open failed, so a link that appeared before that failure is seen.
             Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
-                InputFile::Absent
+                if dangling_link(path) {
+                    InputFile::Dangling
+                } else {
+                    InputFile::Absent
+                }
             }
             Err(e) => InputFile::Failed(e.kind()),
         }
@@ -515,6 +593,9 @@ pub(crate) struct FileRead {
     /// Whether every input file was the same when the read ended as when it began. If not, the
     /// merged result may mix versions that never existed together.
     pub consistent: bool,
+    /// How many files, from the first, held still through the read. The first file to define an
+    /// entry wins, so what these give is exact even if a file after them changed.
+    pub held_still: usize,
     /// Where this read started among all reads: a higher number started later. The reader's lock
     /// makes reads of one list of files run one after another, but their results can still
     /// arrive in another order.
@@ -535,6 +616,7 @@ impl FileRead {
             exist: paths.iter().map(|p| (p.clone(), true)).collect(),
             blank: Vec::new(),
             consistent: false,
+            held_still: 0,
             order: 0,
         }
     }
@@ -586,12 +668,17 @@ impl FileRead {
             })
             .collect();
         let after = InputFile::all(paths);
-        let consistent = before == after && after.iter().all(InputFile::held_still);
+        let held_still = before
+            .iter()
+            .zip(&after)
+            .take_while(|(before, after)| before == after && after.held_still())
+            .count();
         FileRead {
             loaded,
             exist,
             blank,
-            consistent,
+            consistent: held_still == paths.len(),
+            held_still,
             order,
         }
     }
@@ -607,7 +694,11 @@ impl KubeconfigRead {
     /// blocks, so hold no lock across it.
     pub fn settled(paths: &[PathBuf]) -> Self {
         let deadline = std::time::Instant::now() + READ_TIMEOUT;
-        KubeconfigRead(FileRead::settled(paths, load, deadline))
+        KubeconfigRead(FileRead::settled(
+            paths,
+            load_counting_dangling_links,
+            deadline,
+        ))
     }
 
     /// What was read, to adjust before it is judged.
@@ -1538,6 +1629,76 @@ mod tests {
         assert_eq!(one, FileStamps::of(&paths));
         std::fs::write(&path, "abc").unwrap();
         assert_ne!(one, FileStamps::of(&paths));
+    }
+
+    // covers UP-54: losing read access changes the stamps, though not the time or the size.
+    #[cfg(unix)]
+    #[test]
+    fn file_stamps_change_when_a_file_stops_being_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k");
+        std::fs::write(&path, "a").unwrap();
+        let paths = vec![path.clone()];
+        let readable = FileStamps::of(&paths);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            return; // Running as a user that permissions don't apply to.
+        }
+        assert_ne!(readable, FileStamps::of(&paths));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(readable, FileStamps::of(&paths));
+    }
+
+    // covers UP-54: a link to a target that is gone, directly or through a directory, is a file
+    // that failed to load and not an absent one, and its stamps differ from an absent file's.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_counts_as_a_failed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("unmounted");
+        let (link, linked_dir) = (dir.path().join("link"), dir.path().join("linked"));
+        let through_dir = linked_dir.join("config");
+        let absent = vec![link.clone()];
+        let before = FileStamps::of(&absent);
+        std::os::unix::fs::symlink(&gone, &link).unwrap();
+        std::os::unix::fs::symlink(&gone, &linked_dir).unwrap();
+        assert_ne!(before, FileStamps::of(&absent));
+
+        let shown = write(
+            dir.path(),
+            "b",
+            &config(&[("dev", "c1", "u1")], &[("c1", "https://one")]),
+        );
+        let paths = [link.clone(), through_dir.clone(), shown];
+        let loaded = load_counting_dangling_links(&paths);
+        let failed: Vec<_> = loaded.errors.iter().map(|(p, _)| p).collect();
+        assert_eq!(failed, [&link, &through_dir]);
+        assert_eq!(loaded.paths, paths, "failed files keep their rank");
+        assert!(loaded.context("dev").is_some());
+    }
+
+    // covers UP-54: a link with no target that appears while the files are read makes the read
+    // inconsistent, though the path was absent when the read began.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_breaking_during_a_read_is_not_consistent() {
+        thread_local! {
+            static LINK: std::cell::RefCell<Option<(PathBuf, PathBuf)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        fn load_then_link(paths: &[PathBuf]) -> LoadedKubeconfig {
+            let loaded = load_counting_dangling_links(paths);
+            LINK.with(|link| {
+                let (target, path) = link.borrow_mut().take().unwrap();
+                std::os::unix::fs::symlink(target, path).unwrap();
+            });
+            loaded
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        LINK.with(|link| *link.borrow_mut() = Some((dir.path().join("gone"), path.clone())));
+        assert!(!FileRead::of(&[path], load_then_link).consistent);
     }
 
     // covers UP-02

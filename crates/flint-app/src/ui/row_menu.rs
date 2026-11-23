@@ -462,31 +462,23 @@ fn session_entries(
         plain(menu, "Logs".into(), Box::new(OpenLogs), &a.logs, says_why)
     };
     if let Some(previous) = &a.previous {
-        // Only the containers that ran before have a previous instance.
-        let restarted: Vec<PodContainer> = a
-            .log_containers
-            .iter()
-            .filter(|c| c.has_previous)
-            .cloned()
-            .collect();
-        menu = if several && !restarted.is_empty() && a.blocked.is_none() {
-            log_picker(
+        menu = match previous_picker(a) {
+            Some(restarted) => log_picker(
                 menu,
                 "Previous Logs",
-                restarted,
+                restarted.into_iter().cloned().collect(),
                 true,
                 workspace,
                 window,
                 cx,
-            )
-        } else {
-            plain(
+            ),
+            None => plain(
                 menu,
                 "Previous Logs".into(),
                 Box::new(OpenPreviousLogs),
                 previous,
                 says_why,
-            )
+            ),
         };
     }
     let label = shell_entry_label_within(a, pod_name_chars(SHELL_POD_NAME, window));
@@ -517,6 +509,18 @@ fn session_entries(
             says_shell,
         ),
     }
+}
+
+/// The containers Previous Logs picks from, when it is a picker: a pod with several containers
+/// whose logs can be read, and only those that ran before. The default container need not be one
+/// of them, so Previous Logs' own refusal (about the default) does not count here.
+fn previous_picker(a: &RowActions) -> Option<Vec<&PodContainer>> {
+    if a.log_containers.len() < 2 || a.logs.is_err() {
+        return None;
+    }
+    let restarted: Vec<&PodContainer> =
+        a.log_containers.iter().filter(|c| c.has_previous).collect();
+    (!restarted.is_empty()).then_some(restarted)
 }
 
 /// Adds `text` to the menu as a note that wraps: a menu's labels neither wrap nor shrink, and a
@@ -697,18 +701,12 @@ pub fn menu_state(a: &RowActions) -> (Option<String>, Vec<MenuEntryState>) {
             entry("Logs".into(), &a.logs)
         });
         if let Some(previous) = &a.previous {
-            let mut restarted = a
-                .log_containers
-                .iter()
-                .filter(|c| c.has_previous)
-                .peekable();
-            entries.push(
-                if several && restarted.peek().is_some() && a.blocked.is_none() {
-                    picker("Previous Logs".into(), logs_of(&mut restarted))
-                } else {
-                    entry("Previous Logs".into(), previous)
-                },
-            );
+            entries.push(match previous_picker(a) {
+                Some(restarted) => {
+                    picker("Previous Logs".into(), logs_of(&mut restarted.into_iter()))
+                }
+                None => entry("Previous Logs".into(), previous),
+            });
         }
         let label = shell_entry_label_within(a, SHELL_POD_NAME);
         entries.push(match &a.shell_pod {
@@ -891,6 +889,37 @@ pub(in crate::ui) mod tests {
                 json!({"label": "Shell", "enabled": false, "reason": why, "checked": null, "submenu": []}),
                 json!({"label": "Unlock alpha…", "enabled": true, "reason": null, "checked": null, "submenu": []}),
             ]
+        );
+    }
+
+    // covers #251: a sidecar that restarted is offered while the default container never did,
+    // but not when the pod's logs cannot be read at all.
+    #[test]
+    fn previous_logs_picks_a_restarted_sidecar_only_when_logs_can_be_read() {
+        let why = "you may not read this pod's logs".to_owned();
+        let sidecar = RowActions {
+            previous: Some(Err("container app has not restarted".into())),
+            log_containers: vec![
+                container("app", true, false),
+                container("sidecar", false, true),
+            ],
+            ..pod_actions()
+        };
+        assert_eq!(
+            state(&sidecar)["entries"][1],
+            json!({"label": "Previous Logs", "enabled": true, "reason": null, "checked": null,
+                   "submenu": [{"label": "sidecar", "enabled": true}]})
+        );
+
+        let forbidden = RowActions {
+            logs: Err(why.clone()),
+            previous: Some(Err(why.clone())),
+            ..sidecar
+        };
+        assert_eq!(
+            state(&forbidden)["entries"][1],
+            json!({"label": "Previous Logs", "enabled": false, "reason": why, "checked": null,
+                   "submenu": []})
         );
     }
 

@@ -2454,6 +2454,7 @@ impl ClusterManager {
             exist: path_exist,
             blank,
             consistent: _,
+            held_still: _,
             order: _,
         } = read;
         let settling = self.still_settling(&blank);

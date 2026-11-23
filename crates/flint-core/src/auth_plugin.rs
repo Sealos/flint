@@ -260,6 +260,11 @@ async fn run(
         cmd.env_remove(name);
     }
     cmd.kill_on_drop(true);
+    // Its own error and not `not_allowed`, which a waiting request answers by trying again while
+    // the role allows it.
+    if let Some(refusal) = lease.launch_refusal().await {
+        return Err(AuthError::AuthExec(refusal));
+    }
     let mut child = lease
         .start_if_held(|| cmd.spawn())
         .ok_or_else(not_allowed)?

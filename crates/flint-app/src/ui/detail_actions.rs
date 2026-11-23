@@ -655,6 +655,13 @@ impl DetailView {
             }
             Subject::Pod => {}
         }
+        // Logs go by pod name, which a replacement pod may already have.
+        if self.gone {
+            return Err(ActionError::rejected::<A>(format!(
+                "{} was deleted",
+                self.object.name
+            )));
+        }
         match &self.fetch {
             Fetch::Loading if container.is_none() => return Ok(Plan::Wait),
             Fetch::Loading => {
