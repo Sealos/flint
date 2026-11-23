@@ -282,8 +282,10 @@ pub(crate) enum Request {
     /// [`Self::Subscribe`] for a running-set member: nothing starts unless it still holds.
     SubscribeMember {
         id: u64,
+        cluster: ClusterId,
         member: AdmittedMember,
         kind: KindId,
+        feed: crate::watch::MemberFeed,
     },
     Unsubscribe {
         id: u64,
@@ -656,25 +658,36 @@ impl CoreHandle {
     /// [`Subscription::changed`] resolves at once; later ones at most about every 100 ms, however
     /// fast the cluster changes. Dropping the subscription closes it. Never blocks.
     pub fn subscribe(&self, cluster: &str, kind: &KindId) -> Subscription {
-        let (hub, mut rx) = self.hubs.subscribe(cluster, kind);
-        rx.mark_changed();
-        // A running watch publishes what it held back while nobody listened.
-        hub.wake.notify_one();
         let id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
-        // A handle bound to another context starts nothing.
-        let _ = match self.read_binding(cluster) {
-            Ok(Some(member)) => self.requests.try_send(Request::SubscribeMember {
-                id,
-                member,
-                kind: kind.clone(),
-            }),
-            Ok(None) => self.requests.try_send(Request::Subscribe {
-                id,
-                cluster: cluster.to_owned(),
-                kind: kind.clone(),
-            }),
-            Err(_) => Ok(()),
+        let (mut rx, request) = match self.bound.as_deref() {
+            // Bound to a member: its own channel, which the core connects only while the member
+            // holds, so it can't read what a watch of a replacement server publishes.
+            Some(member) => {
+                let empty = KindSnapshot::empty(cluster.to_owned(), kind.clone(), SyncState::Idle);
+                let (feed, rx) = watch::channel(Arc::new(empty));
+                let request = Request::SubscribeMember {
+                    id,
+                    cluster: cluster.to_owned(),
+                    member: member.clone(),
+                    kind: kind.clone(),
+                    feed,
+                };
+                (rx, request)
+            }
+            None => {
+                let (hub, rx) = self.hubs.subscribe(cluster, kind);
+                // A running watch publishes what it held back while nobody listened.
+                hub.wake.notify_one();
+                let request = Request::Subscribe {
+                    id,
+                    cluster: cluster.to_owned(),
+                    kind: kind.clone(),
+                };
+                (rx, request)
+            }
         };
+        rx.mark_changed();
+        let _ = self.requests.try_send(request);
         Subscription {
             id,
             cluster: cluster.to_owned(),

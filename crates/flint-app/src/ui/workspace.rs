@@ -1692,15 +1692,22 @@ impl Workspace {
             .border_color(super::theme::cursor_ring(theme, ring))
             .tooltip(move |_, cx| cluster_tooltip(tip.0.clone(), &tip.1, &tip.2, cx))
             // While choosing clusters a click chooses: it must not connect to this one.
-            .when(self.sets.picking(), |row| {
-                row.on_click(registry::on_click(registry::TogglePickedCluster {
+            // So does a Cmd-click, which starts choosing.
+            .on_click({
+                let choose = registry::on_click(registry::TogglePickedCluster {
                     cluster: name.clone(),
-                }))
-            })
-            .when(!self.sets.picking(), |row| {
-                row.on_click(registry::on_click(SelectCluster {
+                });
+                let select = registry::on_click(SelectCluster {
                     cluster: name.clone(),
-                }))
+                });
+                let picking = self.sets.picking();
+                move |event: &ClickEvent, window, cx| {
+                    if sets::click_chooses(picking, event.modifiers(), cx) {
+                        choose(event, window, cx);
+                    } else {
+                        select(event, window, cx);
+                    }
+                }
             })
             .children(self.render_pick_box(&name))
             .child(dot)

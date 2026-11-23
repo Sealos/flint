@@ -611,6 +611,22 @@ pub struct OpenClusterSet {
     pub name: String,
 }
 
+/// Ask for a new name for a saved set.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = cluster_sets, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct RenameClusterSet {
+    pub name: String,
+}
+
+/// Ask to delete a saved set.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = cluster_sets, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteClusterSet {
+    pub name: String,
+}
+
 /// Select the row of an object in the open list, as clicking it does.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
 #[action(namespace = resource_list, no_json)]
@@ -2517,6 +2533,18 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::with_args::<OpenClusterSet>(
             "Open Cluster Set…",
             "Run a saved set and open its combined list.",
+            SET_NAME,
+        )
+        .of(C::Cluster, S::ClusterSets),
+        Spec::with_args::<RenameClusterSet>(
+            "Rename Cluster Set…",
+            "Give a saved set a new name.",
+            SET_NAME,
+        )
+        .of(C::Cluster, S::ClusterSets),
+        Spec::with_args::<DeleteClusterSet>(
+            "Delete Cluster Set…",
+            "Delete a saved set, after confirming. Its clusters are not changed.",
             SET_NAME,
         )
         .of(C::Cluster, S::ClusterSets),

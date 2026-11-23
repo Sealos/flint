@@ -6,14 +6,13 @@
 //! file. Every change goes through the settings save path and its cross-process lock.
 
 use std::collections::BTreeSet;
+use std::hash::{BuildHasher, RandomState};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::display::{MAX_CUSTOM_NAME_CHARS, clean_custom_name, cluster_name_key};
-use crate::settings::{
-    ClusterPin, Settings, SettingsError, edit_settings_if_changed, load_settings,
-};
+use crate::settings::{ClusterPin, Settings, SettingsError, edit_settings_locked, load_settings};
 
 /// The key of the setting in `settings.toml`.
 pub(crate) const SECTION_KEY: &str = "cluster_sets";
@@ -25,6 +24,9 @@ pub const MAX_CLUSTER_SET_MEMBERS: usize = 5;
 /// A saved selection of clusters. Build one with [`ClusterSet::new`], which enforces the limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterSet {
+    /// Stays the same through renames, so a change aimed at this set can't reach another that
+    /// took its name.
+    pub id: String,
     pub name: String,
     pub members: Vec<ClusterPin>,
 }
@@ -44,29 +46,12 @@ impl ClusterSet {
     /// A set of `members` under `name` (trimmed), or why it cannot be one. The reason never
     /// quotes a server, which may hold credentials.
     pub fn new(name: &str, members: Vec<ClusterPin>) -> Result<Self, String> {
-        let name = clean_custom_name(name).ok_or_else(|| {
-            format!(
-                "a cluster set name has 1 to {MAX_CUSTOM_NAME_CHARS} letters, digits or any of {}",
-                crate::display::CUSTOM_NAME_PUNCTUATION
-            )
-        })?;
-        if !(MIN_CLUSTER_SET_MEMBERS..=MAX_CLUSTER_SET_MEMBERS).contains(&members.len()) {
-            return Err(format!(
-                "a cluster set has {MIN_CLUSTER_SET_MEMBERS} to {MAX_CLUSTER_SET_MEMBERS} clusters"
-            ));
-        }
-        if members
-            .iter()
-            .any(|m| m.context.trim().is_empty() || m.server.trim().is_empty())
-        {
-            return Err("each cluster in a set needs a context and a server".to_owned());
-        }
-        // A context points at one server, so a second pin for it could never be current.
-        let contexts: BTreeSet<&str> = members.iter().map(|m| m.context.as_str()).collect();
-        if contexts.len() != members.len() {
-            return Err("a cluster set lists each context once".to_owned());
-        }
-        Ok(Self { name, members })
+        let name = checked_name(name, &members)?;
+        Ok(Self {
+            id: new_set_id(),
+            name,
+            members,
+        })
     }
 
     /// Each member with its status, in order. `current_server` gives the server a context points
@@ -95,6 +80,39 @@ impl ClusterSet {
     }
 }
 
+/// `name` cleaned, if it and `members` can make a set, or why not.
+fn checked_name(name: &str, members: &[ClusterPin]) -> Result<String, String> {
+    let name = clean_custom_name(name).ok_or_else(|| {
+        format!(
+            "a cluster set name has 1 to {MAX_CUSTOM_NAME_CHARS} letters, digits or any of {}",
+            crate::display::CUSTOM_NAME_PUNCTUATION
+        )
+    })?;
+    if !(MIN_CLUSTER_SET_MEMBERS..=MAX_CLUSTER_SET_MEMBERS).contains(&members.len()) {
+        return Err(format!(
+            "a cluster set has {MIN_CLUSTER_SET_MEMBERS} to {MAX_CLUSTER_SET_MEMBERS} clusters"
+        ));
+    }
+    if members
+        .iter()
+        .any(|m| m.context.trim().is_empty() || m.server.trim().is_empty())
+    {
+        return Err("each cluster in a set needs a context and a server".to_owned());
+    }
+    // A context points at one server, so a second pin for it could never be current.
+    let contexts: BTreeSet<&str> = members.iter().map(|m| m.context.as_str()).collect();
+    if contexts.len() != members.len() {
+        return Err("a cluster set lists each context once".to_owned());
+    }
+    Ok(name)
+}
+
+/// A new set id: 128 bits from the standard library's per-instance random keys.
+fn new_set_id() -> String {
+    let half = || RandomState::new().hash_one(0u8);
+    format!("{:016x}{:016x}", half(), half())
+}
+
 /// The saved sets in `settings.toml`, without the entries this version cannot use.
 pub fn load_cluster_sets(dir: &Path) -> Result<Vec<ClusterSet>, SettingsError> {
     load_settings(dir).map(|settings| settings.cluster_sets)
@@ -109,7 +127,7 @@ pub fn create_cluster_set(
 ) -> Result<Settings, SettingsError> {
     edit_entries(dir, |entries, path| {
         let set = ClusterSet::new(name, members.to_vec()).map_err(|r| invalid(path, r))?;
-        if position(entries, &set.key()).is_some() {
+        if name_held(entries, &set.key(), None) {
             return Err(name_taken(path, &set.name));
         }
         entries.push(toml::Value::try_from(&set)?);
@@ -117,14 +135,9 @@ pub fn create_cluster_set(
     })
 }
 
-/// Renames the set called `name`, dropping any hidden copy the file holds under that name. It may
-/// change the case of its own name, but not take another set's. Entries this version cannot use
-/// stay. Returns the settings as written.
-pub fn rename_cluster_set(
-    dir: &Path,
-    name: &str,
-    new_name: &str,
-) -> Result<Settings, SettingsError> {
+/// Renames the set with this `id`. It may change the case of its own name, but not take a name
+/// any other entry holds, shown or not. Every other entry stays. Returns the settings as written.
+pub fn rename_cluster_set(dir: &Path, id: &str, new_name: &str) -> Result<Settings, SettingsError> {
     edit_entries(dir, |entries, path| {
         let cleaned = clean_custom_name(new_name).ok_or_else(|| {
             invalid(
@@ -132,50 +145,33 @@ pub fn rename_cluster_set(
                 format!("a cluster set name has 1 to {MAX_CUSTOM_NAME_CHARS} allowed characters"),
             )
         })?;
-        let old_key = clean_custom_name(name).map(|old| cluster_name_key(&old));
-        let index = old_key
-            .as_deref()
-            .and_then(|key| position(entries, key))
-            .ok_or_else(|| invalid(path, "there is no cluster set with that name".to_owned()))?;
+        let (index, set) = shown_entries(entries)
+            .into_iter()
+            .find(|(_, set)| set.id == id)
+            .ok_or_else(|| invalid(path, "that cluster set no longer exists".to_owned()))?;
         let new_key = cluster_name_key(&cleaned);
-        if position(entries, &new_key).is_some_and(|other| other != index) {
+        if new_key != set.key() && name_held(entries, &new_key, Some(index)) {
             return Err(name_taken(path, &cleaned));
         }
-        // Hidden copies under the old name go, or one would appear as a set once this one moves.
-        // `index` is the first readable holder of the name, so removing later ones keeps it valid.
-        let mut at = 0;
-        entries.retain(|entry| {
-            let keep = at == index || readable(entry).is_none_or(|s| Some(s.key()) != old_key);
-            at += 1;
-            keep
-        });
         let table = entries[index].as_table_mut().expect("a readable entry");
         table.insert("name".into(), toml::Value::String(cleaned));
         Ok(true)
     })
 }
 
-/// Deletes the set called `name`, with any copy of it the file holds under the same name, so
-/// that a copy does not take its place. Entries this version cannot use stay. Deleting a set
-/// that is not there writes nothing. Returns the settings as written.
-pub fn delete_cluster_set(dir: &Path, name: &str) -> Result<Settings, SettingsError> {
-    let Some(key) = clean_custom_name(name).map(|name| cluster_name_key(&name)) else {
-        return load_settings(dir);
-    };
-    let settings = load_settings(dir)?;
-    if !settings.cluster_sets.iter().any(|set| set.key() == key) {
-        return Ok(settings);
-    }
-    remove_entries(dir, &key)
-}
-
-/// Removes the sets under `key` while holding the save lock. If another save got there first,
-/// nothing is removed and the file is not written.
-fn remove_entries(dir: &Path, key: &str) -> Result<Settings, SettingsError> {
+/// Deletes the set with this `id`, and only that entry: another that shares its name is a
+/// distinct set and takes its place. Deleting a set that is not there writes nothing. Returns the
+/// settings as written.
+pub fn delete_cluster_set(dir: &Path, id: &str) -> Result<Settings, SettingsError> {
     edit_entries(dir, |entries, _| {
-        let before = entries.len();
-        entries.retain(|entry| readable(entry).is_none_or(|set| set.key() != key));
-        Ok(entries.len() != before)
+        let found = shown_entries(entries)
+            .into_iter()
+            .find(|(_, set)| set.id == id);
+        let Some((index, _)) = found else {
+            return Ok(false);
+        };
+        entries.remove(index);
+        Ok(true)
     })
 }
 
@@ -186,7 +182,7 @@ fn edit_entries(
     dir: &Path,
     edit: impl FnOnce(&mut Vec<toml::Value>, &Path) -> Result<bool, SettingsError>,
 ) -> Result<Settings, SettingsError> {
-    edit_settings_if_changed(dir, |table, path| {
+    edit_settings_locked(dir, |table, path| {
         let mut entries = match table.remove(SECTION_KEY) {
             Some(toml::Value::Array(entries)) => entries,
             None => Vec::new(),
@@ -202,29 +198,50 @@ fn edit_entries(
     })
 }
 
-/// The index of the entry that holds `key`: the first readable one, as loading keeps.
-fn position(entries: &[toml::Value], key: &str) -> Option<usize> {
-    entries
-        .iter()
-        .position(|entry| readable(entry).is_some_and(|set| set.key() == key))
+/// Whether a readable entry other than the one at `except` goes by `key`.
+fn name_held(entries: &[toml::Value], key: &str, except: Option<usize>) -> bool {
+    entries.iter().enumerate().any(|(at, entry)| {
+        Some(at) != except && readable(entry).is_some_and(|set| set.key() == key)
+    })
 }
 
 /// `entry` as a set, if it is a valid one.
 fn readable(entry: &toml::Value) -> Option<ClusterSet> {
     let set: ClusterSet = entry.clone().try_into().ok()?;
-    ClusterSet::new(&set.name, set.members).ok()
+    if set.id.trim().is_empty() {
+        return None;
+    }
+    let name = checked_name(&set.name, &set.members).ok()?;
+    Some(ClusterSet { name, ..set })
 }
 
-/// The sets `value` holds: valid entries, the first of any that share a name.
+/// The entries loading shows, with their indexes: valid ones, the first of any that share a name
+/// or an id.
+fn shown_entries(entries: &[toml::Value]) -> Vec<(usize, ClusterSet)> {
+    let (mut names, mut ids) = (BTreeSet::new(), BTreeSet::new());
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(at, entry)| Some((at, readable(entry)?)))
+        .filter(|(_, set)| {
+            let shown = !names.contains(&set.key()) && !ids.contains(&set.id);
+            if shown {
+                names.insert(set.key());
+                ids.insert(set.id.clone());
+            }
+            shown
+        })
+        .collect()
+}
+
+/// The sets `value` holds, as loading shows them.
 fn visible_sets(value: &toml::Value) -> Vec<ClusterSet> {
     let Some(entries) = value.as_array() else {
         return Vec::new();
     };
-    let mut names = BTreeSet::new();
-    entries
-        .iter()
-        .filter_map(readable)
-        .filter(|set| names.insert(set.key()))
+    shown_entries(entries)
+        .into_iter()
+        .map(|(_, set)| set)
         .collect()
 }
 
@@ -337,7 +354,8 @@ mod tests {
 
         let error = create_cluster_set(dir.path(), "prod-eu", &pins(3)).unwrap_err();
         assert!(reason(error).contains("already"));
-        let error = rename_cluster_set(dir.path(), "staging", "PROD eu").unwrap_err();
+        let staging = load_cluster_sets(dir.path()).unwrap()[1].id.clone();
+        let error = rename_cluster_set(dir.path(), &staging, "PROD eu").unwrap_err();
         assert!(reason(error).contains("already"));
 
         let settings = load_settings(dir.path()).unwrap();
@@ -348,41 +366,62 @@ mod tests {
     fn rename_keeps_members_and_may_recase_its_own_name() {
         let dir = tempfile::tempdir().unwrap();
         create_cluster_set(dir.path(), "prod", &pins(4)).unwrap();
-        let settings = rename_cluster_set(dir.path(), "PROD", "Prod").unwrap();
+        let id = settings_id(dir.path());
+        let settings = rename_cluster_set(dir.path(), &id, "Prod").unwrap();
         assert_eq!(names(&settings), ["Prod"]);
-        let settings = rename_cluster_set(dir.path(), "prod", "live").unwrap();
+        let settings = rename_cluster_set(dir.path(), &id, "live").unwrap();
         assert_eq!(names(&settings), ["live"]);
+        assert_eq!(settings.cluster_sets[0].id, id, "a rename keeps the id");
         assert_eq!(settings.cluster_sets[0].members, pins(4));
 
         let error = rename_cluster_set(dir.path(), "gone", "other").unwrap_err();
-        assert!(reason(error).contains("no cluster set"));
+        assert!(reason(error).contains("no longer exists"));
     }
 
+    fn settings_id(dir: &Path) -> String {
+        load_cluster_sets(dir).unwrap()[0].id.clone()
+    }
+
+    // The set a dialog was opened on was renamed and its name reused: the change reaches neither.
     #[test]
-    fn delete_removes_the_set_and_its_copies_only() {
+    fn a_stale_id_changes_no_set_that_took_the_name() {
         let dir = tempfile::tempdir().unwrap();
-        write(
-            dir.path(),
-            r#"
+        create_cluster_set(dir.path(), "prod", &pins(2)).unwrap();
+        let stale = settings_id(dir.path());
+        delete_cluster_set(dir.path(), &stale).unwrap();
+        create_cluster_set(dir.path(), "prod", &pins(3)).unwrap();
+
+        let settings = delete_cluster_set(dir.path(), &stale).unwrap();
+        assert_eq!(names(&settings), ["prod"]);
+        assert_eq!(settings.cluster_sets[0].members, pins(3));
+        assert!(rename_cluster_set(dir.path(), &stale, "other").is_err());
+        assert_eq!(names(&load_settings(dir.path()).unwrap()), ["prod"]);
+    }
+
+    const SHADOWED: &str = r#"
 [[cluster_sets]]
+id = "first"
 name = "prod"
 members = [{ context = "a", server = "https://a" }, { context = "b", server = "https://b" }]
 
 [[cluster_sets]]
+id = "second"
 name = "PROD"
 members = [{ context = "c", server = "https://c" }, { context = "d", server = "https://d" }]
 
 [[cluster_sets]]
+id = "third"
 name = "prod"
 members = [{ context = "only-one", server = "https://e" }]
+"#;
 
-[[cluster_sets]]
-name = "keep"
-members = [{ context = "a", server = "https://a" }, { context = "c", server = "https://c" }]
-"#,
-        );
-        let settings = delete_cluster_set(dir.path(), "Prod").unwrap();
-        assert_eq!(names(&settings), ["keep"]);
+    #[test]
+    fn delete_keeps_a_distinct_set_under_the_same_name() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), SHADOWED);
+        let settings = delete_cluster_set(dir.path(), "first").unwrap();
+        assert_eq!(names(&settings), ["PROD"]);
+        assert_eq!(settings.cluster_sets[0].id, "second");
         assert!(
             read(dir.path()).contains("only-one"),
             "unusable entry stays"
@@ -390,31 +429,31 @@ members = [{ context = "a", server = "https://a" }, { context = "c", server = "h
     }
 
     #[test]
-    fn rename_does_not_bring_a_hidden_copy_into_view() {
+    fn rename_keeps_a_distinct_set_under_the_old_name() {
         let dir = tempfile::tempdir().unwrap();
-        write(
-            dir.path(),
-            r#"
-[[cluster_sets]]
-name = "prod"
-members = [{ context = "a", server = "https://a" }, { context = "b", server = "https://b" }]
-
-[[cluster_sets]]
-name = "PROD"
-members = [{ context = "c", server = "https://c" }, { context = "d", server = "https://d" }]
-
-[[cluster_sets]]
-name = "prod"
-members = [{ context = "only-one", server = "https://e" }]
-"#,
-        );
-        let settings = rename_cluster_set(dir.path(), "prod", "live").unwrap();
-        assert_eq!(names(&settings), ["live"]);
+        write(dir.path(), SHADOWED);
+        let settings = rename_cluster_set(dir.path(), "first", "live").unwrap();
+        assert_eq!(names(&settings), ["live", "PROD"]);
         assert_eq!(settings.cluster_sets[0].members[0].context, "a");
+        assert_eq!(settings.cluster_sets[1].members[0].context, "c");
         assert!(
             read(dir.path()).contains("only-one"),
             "unusable entry stays"
         );
+    }
+
+    #[test]
+    fn rename_refuses_a_name_only_a_hidden_entry_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!(
+            "{SHADOWED}\n[[cluster_sets]]\nid = \"other\"\nname = \"keep\"\nmembers = [{{ context = \"a\", server = \"https://a\" }}, {{ context = \"c\", server = \"https://c\" }}]\n"
+        );
+        write(dir.path(), &text);
+        let error = rename_cluster_set(dir.path(), "other", "PROD").unwrap_err();
+        assert!(reason(error).contains("already"));
+        // Its own name in another case is fine, with a hidden entry under it.
+        let settings = rename_cluster_set(dir.path(), "first", "Prod").unwrap();
+        assert_eq!(names(&settings), ["Prod", "keep"]);
     }
 
     #[test]
@@ -430,18 +469,17 @@ members = [{ context = "only-one", server = "https://e" }]
     #[test]
     fn a_delete_that_loses_the_race_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let key = cluster_name_key("gone");
 
-        let settings = remove_entries(dir.path(), &key).unwrap();
+        let settings = delete_cluster_set(dir.path(), "gone").unwrap();
         assert!(settings.cluster_sets.is_empty());
         assert!(
             !dir.path().join(SETTINGS_FILE).exists(),
             "a removed file is not recreated"
         );
 
-        let text = "# a comment\nprotect_local_clusters = true\n\n[[cluster_sets]]\nname = \"keep\"\nmembers = [{ context = \"a\", server = \"https://a\" }, { context = \"b\", server = \"https://b\" }]\n";
+        let text = "# a comment\nprotect_local_clusters = true\n\n[[cluster_sets]]\nid = \"keep\"\nname = \"keep\"\nmembers = [{ context = \"a\", server = \"https://a\" }, { context = \"b\", server = \"https://b\" }]\n";
         write(dir.path(), text);
-        let settings = remove_entries(dir.path(), &key).unwrap();
+        let settings = delete_cluster_set(dir.path(), "gone").unwrap();
         assert_eq!(names(&settings), ["keep"]);
         assert!(settings.protect_local_clusters);
         assert_eq!(read(dir.path()), text);
@@ -507,10 +545,11 @@ members = [{ context = "only-one", server = "https://e" }]
 appearance = "dark"
 protect_local_clusters = true
 cluster_sets = [
-    { name = "good", members = [{ context = "a", server = "https://a" }, { context = "b", server = "https://b" }] },
-    { name = "one member", members = [{ context = "a", server = "https://a" }] },
-    { name = "no members" },
-    { members = [{ context = "a", server = "https://a" }, { context = "b", server = "https://b" }] },
+    { id = "good", name = "good", members = [{ context = "a", server = "https://a" }, { context = "b", server = "https://b" }] },
+    { id = "one", name = "one member", members = [{ context = "a", server = "https://a" }] },
+    { id = "none", name = "no members" },
+    { id = "unnamed", members = [{ context = "a", server = "https://a" }, { context = "b", server = "https://b" }] },
+    { name = "no id", members = [{ context = "a", server = "https://a" }, { context = "b", server = "https://b" }] },
     "not a table",
 ]
 "#,
@@ -549,9 +588,10 @@ cluster_sets = [
         set_trusted(dir.path(), "trusted", Some("https://trusted")).unwrap();
 
         create_cluster_set(dir.path(), "first", &pins(2)).unwrap();
-        rename_cluster_set(dir.path(), "first", "second").unwrap();
+        let id = settings_id(dir.path());
+        rename_cluster_set(dir.path(), &id, "second").unwrap();
         create_cluster_set(dir.path(), "third", &pins(3)).unwrap();
-        let settings = delete_cluster_set(dir.path(), "second").unwrap();
+        let settings = delete_cluster_set(dir.path(), &id).unwrap();
 
         assert_eq!(names(&settings), ["third"]);
         assert!(settings.protect_local_clusters);
