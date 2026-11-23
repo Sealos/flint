@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use super::super::Workspace;
 use super::super::actions::resource_actions_tests::LocalApi;
-use super::{SettingsDir, member_refusal};
+use super::{ClusterSet, SettingsDir, click_chooses, member_refusal, rename_problem};
 use crate::ui::confirm;
 use crate::ui::list::combined::row_id;
 use crate::ui::resource_actions::{ResourceAction, available, request, target_of};
@@ -845,6 +845,248 @@ fn a_member_is_refused_unless_it_is_the_pinned_confirmed_cluster() {
         let why = member_refusal(&pin, summary.as_ref(), report.as_ref(), "prod").unwrap();
         assert!(why.contains(says), "{why}");
     }
+}
+
+/// Saves `kind-alpha` and `kind-beta` as the set `both`.
+async fn save_both(cx: &mut TestAppContext, t: &TestWorkspace) {
+    t.dispatch(cx, "cluster_sets::ToggleClusterPicking", Value::Null)
+        .unwrap();
+    pick(cx, t, "kind-alpha");
+    pick(cx, t, "kind-beta");
+    t.dispatch(
+        cx,
+        "cluster_sets::SaveClusterSet",
+        json!({ "name": "both" }),
+    )
+    .unwrap();
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        !workspace.read(cx).sets.saved.is_empty()
+    })
+    .await;
+    t.dispatch(cx, "cluster_sets::ToggleClusterPicking", Value::Null)
+        .unwrap();
+}
+
+fn saved_names(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<String> {
+    t.workspace.read_with(cx, |ws, _| {
+        ws.sets.saved.iter().map(|s| s.name.clone()).collect()
+    })
+}
+
+#[gpui_kit::test]
+async fn a_saved_set_is_renamed_and_its_open_view_follows(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    cx.update(|cx| cx.set_global(SettingsDir(dir.path().to_owned())));
+    save_both(cx, &t).await;
+    t.dispatch(
+        cx,
+        "cluster_sets::OpenClusterSet",
+        json!({ "name": "both" }),
+    )
+    .unwrap();
+    t.wait_for_element(cx, "cluster-set-view").await;
+    t.dispatch(
+        cx,
+        "cluster_sets::RenameClusterSet",
+        json!({ "name": "both" }),
+    )
+    .unwrap();
+    cx.run_until_parked();
+    t.press(
+        cx,
+        if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        },
+    );
+    t.type_text(cx, "pair");
+    t.click(cx, "ok");
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace
+            .read(cx)
+            .sets
+            .saved
+            .iter()
+            .any(|s| s.name == "pair")
+    })
+    .await;
+    assert_eq!(saved_names(cx, &t), ["pair"]);
+    assert!(t.settings_toml().contains("pair"));
+    let (label, title) = t.workspace.read_with(cx, |ws, cx| {
+        let run = ws.sets.running.as_ref().unwrap();
+        (run.label.clone(), run.list.read(cx).label.clone())
+    });
+    assert_eq!((label.as_str(), title.as_str()), ("pair", "Pods · pair"));
+}
+
+#[test]
+fn a_rename_refuses_another_sets_name_but_keeps_its_own() {
+    let pins = || {
+        vec![
+            ClusterPin::new("a".to_owned(), "https://a.example".to_owned()),
+            ClusterPin::new("b".to_owned(), "https://b.example".to_owned()),
+        ]
+    };
+    let saved = [
+        ClusterSet::new("prod-eu", pins()).unwrap(),
+        ClusterSet::new("staging", pins()).unwrap(),
+    ];
+    assert_eq!(rename_problem(&saved, "prod-eu", "PROD_EU"), None);
+    assert_eq!(rename_problem(&saved, "prod-eu", "other"), None);
+    assert!(rename_problem(&saved, "prod-eu", "Staging").is_some());
+    assert!(rename_problem(&saved, "prod-eu", "   ").is_some());
+}
+
+#[gpui_kit::test]
+async fn deleting_a_set_waits_for_the_confirmation(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    cx.update(|cx| cx.set_global(SettingsDir(dir.path().to_owned())));
+    save_both(cx, &t).await;
+    t.dispatch(
+        cx,
+        "cluster_sets::DeleteClusterSet",
+        json!({ "name": "both" }),
+    )
+    .unwrap();
+    cx.wait_for(t.window, WAIT, |window, _| window.find_all("ok").len() == 1)
+        .await;
+    let shown = cx
+        .update_window(t.window, |_, window, cx| {
+            window.render_frame(cx);
+            confirm::shown(window, cx)
+        })
+        .unwrap()
+        .expect("the confirmation");
+    assert_eq!(shown.title, "Delete both?");
+    assert_eq!(saved_names(cx, &t), ["both"], "nothing is deleted yet");
+    assert!(t.settings_toml().contains("both"));
+    t.click(cx, "ok");
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace.read(cx).sets.saved.is_empty()
+    })
+    .await;
+    assert!(!t.settings_toml().contains("both"));
+}
+
+/// A listener that counts the connections made to it.
+fn counting_listener() -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let connections = Arc::new(AtomicUsize::new(0));
+    let counted = connections.clone();
+    std::thread::spawn(move || {
+        for _ in listener.incoming() {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    (url, connections)
+}
+
+#[gpui_kit::test]
+async fn a_repointed_member_is_left_out_and_never_contacted(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (alpha, beta) = (LocalApi::start(&[]), LocalApi::start(&[]));
+    let (moved_to, connections) = counting_listener();
+    let urls = (alpha.url.clone(), beta.url.clone(), moved_to);
+    let t = open_workspace_with(cx, dir.path(), move |dir, _| {
+        let path = dir.join("kubeconfig");
+        let contexts = [
+            ("kind-alpha", &*urls.0),
+            ("kind-beta", &*urls.1),
+            ("kind-gamma", &*urls.2),
+        ];
+        std::fs::write(&path, kubeconfig_yaml(&contexts)).unwrap();
+        vec![path]
+    })
+    .await;
+    let pins = vec![
+        ClusterPin::new("kind-alpha".to_owned(), alpha.url.clone()),
+        ClusterPin::new("kind-beta".to_owned(), beta.url.clone()),
+        ClusterPin::new("kind-gamma".to_owned(), "https://old.invalid".to_owned()),
+    ];
+    t.workspace.update(cx, |ws, _| {
+        ws.sets.saved = vec![ClusterSet::new("three", pins).unwrap()];
+    });
+    t.dispatch(
+        cx,
+        "cluster_sets::OpenClusterSet",
+        json!({ "name": "three" }),
+    )
+    .unwrap();
+    t.wait_for_element(cx, "cluster-set-view").await;
+    cx.run_until_parked();
+    let (members, refused) = t.workspace.read_with(cx, |ws, cx| {
+        let run = ws.sets.running.as_ref().unwrap();
+        let members: Vec<String> = run.members.iter().map(|m| m.context().to_owned()).collect();
+        (members, ws.session_member("kind-gamma", cx))
+    });
+    assert_eq!(members, ["kind-alpha", "kind-beta"]);
+    assert!(
+        matches!(refused, Ok(None)),
+        "it is no member to act through"
+    );
+    let label = t.label(cx, "set-member-kind-gamma").unwrap();
+    assert!(label.ends_with("Changed, left out"), "{label}");
+    assert_eq!(connections.load(Ordering::SeqCst), 0, "never contacted");
+}
+
+#[gpui_kit::test]
+async fn a_set_left_with_one_member_does_not_open(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let alpha = t.workspace.read_with(cx, |ws, cx| {
+        let summary = ws.cluster_summary("kind-alpha", cx).unwrap();
+        summary.info.server.clone().unwrap()
+    });
+    let pins = vec![
+        ClusterPin::new("kind-alpha".to_owned(), alpha),
+        ClusterPin::new("kind-beta".to_owned(), "https://old.invalid".to_owned()),
+    ];
+    t.workspace.update(cx, |ws, _| {
+        ws.sets.saved = vec![ClusterSet::new("pair", pins).unwrap()];
+    });
+    t.dispatch(
+        cx,
+        "cluster_sets::OpenClusterSet",
+        json!({ "name": "pair" }),
+    )
+    .unwrap();
+    cx.run_until_parked();
+    let (open, error) = t
+        .workspace
+        .read_with(cx, |ws, _| (ws.sets.is_open(), ws.sets.error.clone()));
+    assert!(!open);
+    let error = error.expect("says why");
+    assert!(
+        error.contains("kind-beta") && error.contains("too few"),
+        "{error}"
+    );
+    assert!(!t.server_was_contacted(), "nothing started");
+}
+
+#[gpui_kit::test]
+async fn a_cmd_click_chooses_and_a_plain_click_does_not(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    cx.update(|cx| {
+        let cmd = gpui_kit::Modifiers::secondary_key(cx);
+        assert!(click_chooses(false, cmd, cx));
+        assert!(click_chooses(true, gpui_kit::Modifiers::default(), cx));
+        assert!(!click_chooses(false, gpui_kit::Modifiers::default(), cx));
+    });
+    pick(cx, &t, "kind-beta");
+    let (picking, picked) = t
+        .workspace
+        .read_with(cx, |ws, _| (ws.sets.picking(), ws.sets.picked.clone()));
+    assert!(picking, "the first choice starts choosing");
+    assert_eq!(picked, ["kind-beta"]);
+    assert!(!t.server_was_contacted(), "choosing connects to nothing");
 }
 
 #[test]

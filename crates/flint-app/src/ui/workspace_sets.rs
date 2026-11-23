@@ -12,28 +12,35 @@ use std::time::Duration;
 
 use flint_core::cluster_sets::{
     ClusterSet, MAX_CLUSTER_SET_MEMBERS, MIN_CLUSTER_SET_MEMBERS, create_cluster_set,
-    load_cluster_sets,
+    delete_cluster_set, load_cluster_sets, rename_cluster_set,
 };
 use flint_core::combined::CombinedMember;
+use flint_core::display::{
+    CUSTOM_NAME_PUNCTUATION, MAX_CUSTOM_NAME_CHARS, clean_custom_name, cluster_name_key,
+};
 use flint_core::handle::{AdmittedMember, MemberReport, MemberStatus};
-use flint_core::settings::ClusterPin;
+use flint_core::settings::{ClusterPin, Settings, SettingsError};
 use flint_core::{ClusterId, ClusterSummary, KindId, KindSnapshot, NavEntry, SyncState};
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::{Disableable as _, Sizable as _, Theme, h_flex, v_flex};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Sizable as _, Theme, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::super::confirm::{self, DialogText};
 use super::super::detail::{DetailEvent, DetailTab, DetailView, ObjectRef};
 use super::super::focus::release_unfocused_input;
 use super::super::list::combined::{CombinedListEvent, CombinedResourceList};
 use super::super::list_model::combined::CombinedSource;
 use super::super::registry::{
-    self, ActionError, Bind, CloseClusterSet, CloseDetail, FocusFilter, Forward, Guards,
-    OpenClusterSet, OpenPickedClusters, OpenSelectedRow, SaveClusterSet, SelectFirst, SelectLast,
-    SelectNext, SelectPrev, ToggleClusterPicking, TogglePickedCluster,
+    self, ActionError, Bind, CloseClusterSet, CloseDetail, DeleteClusterSet, FocusFilter, Forward,
+    Guards, OpenClusterSet, OpenPickedClusters, OpenSelectedRow, RenameClusterSet, SaveClusterSet,
+    SelectFirst, SelectLast, SelectNext, SelectPrev, ToggleClusterPicking, TogglePickedCluster,
 };
 use super::{WRITES_PAUSED, Workspace, takes_focus, writes_paused_reason};
 
@@ -66,10 +73,15 @@ pub(super) struct ClusterSets {
 /// The running set and its open combined list.
 pub(super) struct RunningSet {
     label: String,
+    /// Whether `label` is the name of a saved set, which a rename carries over to this view.
+    saved: bool,
     members: Vec<AdmittedMember>,
     /// Members that left their admitted server: their rows are gone and stay gone.
     changed: HashSet<ClusterId>,
+    /// Saved members that already pointed elsewhere when the set opened: never admitted.
+    left_out: Vec<ClusterId>,
     kind: KindId,
+    kind_label: String,
     pub(super) list: Entity<CombinedResourceList>,
     snapshots: Vec<Arc<KindSnapshot>>,
     reports: Vec<MemberReport>,
@@ -136,6 +148,71 @@ impl ClusterSets {
     fn is_picked(&self, cluster: &str) -> bool {
         self.picked.iter().any(|c| c == cluster)
     }
+}
+
+/// What opening a set needs besides its members: how it is called and where it came from.
+struct Opening {
+    label: String,
+    /// Opened from the sidebar's choice, which it then clears; otherwise a saved set.
+    picked: bool,
+    left_out: Vec<ClusterId>,
+}
+
+/// The name field of the Rename Cluster Set dialog.
+struct SetNameField {
+    input: Entity<InputState>,
+    error: Option<String>,
+}
+
+impl Render for SetNameField {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let danger = cx.theme().danger;
+        v_flex()
+            .gap_1()
+            .child(Input::new(&self.input).id("rename-set-input").small())
+            .when_some(self.error.clone(), |el, error| {
+                el.child(
+                    div()
+                        .id("rename-set-error")
+                        .aria_label(error.clone())
+                        .text_xs()
+                        .text_color(danger)
+                        .child(error)
+                        .test_support(),
+                )
+            })
+    }
+}
+
+/// Whether a click on a cluster row chooses it rather than connecting to it.
+pub(super) fn click_chooses(picking: bool, modifiers: Modifiers, cx: &App) -> bool {
+    picking || modifiers.secondary(cx)
+}
+
+/// Why the set `name` cannot be called `typed`. It may change the case of its own name.
+fn rename_problem(saved: &[ClusterSet], name: &str, typed: &str) -> Option<String> {
+    let Some(cleaned) = clean_custom_name(typed) else {
+        return Some(format!(
+            "A set name has 1 to {MAX_CUSTOM_NAME_CHARS} letters, digits or any of \
+             {CUSTOM_NAME_PUNCTUATION}"
+        ));
+    };
+    let key = cluster_name_key(&cleaned);
+    saved
+        .iter()
+        .any(|set| set.name != name && cluster_name_key(&set.name) == key)
+        .then(|| "Another cluster set already goes by this name.".to_owned())
+}
+
+/// Whether `pin`'s context is confirmed to point at another server now. A context that is gone,
+/// has no server or is provisional is not known to have moved, and still refuses the set.
+fn repointed(pin: &ClusterPin, summary: Option<&ClusterSummary>) -> bool {
+    summary.is_some_and(|c| {
+        c.confirmed
+            && c.info.server.as_deref().is_some_and(|server| {
+                !server.trim().is_empty() && !pin.matches(&pin.context, server)
+            })
+    })
 }
 
 /// Why a row of `pin`'s cluster cannot be opened or acted on, if so. Protection is not here: a
@@ -243,14 +320,25 @@ impl Workspace {
             )
             .add::<OpenClusterSet>(
                 |_, _| true,
-                |ws, a, _| match ws.sets.saved.iter().any(|s| s.name == a.name) {
-                    true => Ok(()),
-                    false => Err(ActionError::rejected::<OpenClusterSet>(format!(
-                        "no cluster set named {}",
-                        a.name
-                    ))),
-                },
+                |ws, a, _| ws.check_saved::<OpenClusterSet>(&a.name),
             )
+            .add::<RenameClusterSet>(
+                |ws, _| !ws.sets.saved.is_empty(),
+                |ws, a, _| ws.check_saved::<RenameClusterSet>(&a.name),
+            )
+            .add::<DeleteClusterSet>(
+                |ws, _| !ws.sets.saved.is_empty(),
+                |ws, a, _| ws.check_saved::<DeleteClusterSet>(&a.name),
+            )
+    }
+
+    fn check_saved<A: Action>(&self, name: &str) -> Result<(), ActionError> {
+        match self.sets.saved.iter().any(|s| s.name == name) {
+            true => Ok(()),
+            false => Err(ActionError::rejected::<A>(format!(
+                "no cluster set named {name}"
+            ))),
+        }
     }
 
     pub(super) fn bind_set_actions<B: Bind<Self>>(bind: B) -> B {
@@ -259,6 +347,8 @@ impl Workspace {
             .bind::<OpenPickedClusters>(Self::open_picked)
             .bind::<SaveClusterSet>(Self::save_set)
             .bind::<OpenClusterSet>(Self::open_saved)
+            .bind::<RenameClusterSet>(Self::ask_rename_set)
+            .bind::<DeleteClusterSet>(Self::ask_delete_set)
             .bind::<CloseClusterSet>(Self::close_set)
     }
 
@@ -329,6 +419,8 @@ impl Workspace {
             return;
         }
         self.sets.error = None;
+        // A Cmd-click starts choosing from outside the choosing mode.
+        self.sets.picking = true;
         match self.sets.picked.iter().position(|c| *c == action.cluster) {
             Some(at) => {
                 self.sets.picked.remove(at);
@@ -358,6 +450,162 @@ impl Workspace {
         self.open_set(label, pins, true, window, cx);
     }
 
+    /// Runs `write` on the settings file after any earlier one, then `done` with what it wrote.
+    /// Chained so that a later change neither cancels an earlier one nor lands before it.
+    fn write_sets(
+        &mut self,
+        write: impl FnOnce(&std::path::Path) -> Result<Settings, SettingsError> + Send + 'static,
+        done: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dir) = cx.try_global::<SettingsDir>().map(|d| d.0.clone()) else {
+            self.sets.error = Some("Can't save: no settings folder".to_owned());
+            cx.notify();
+            return;
+        };
+        let earlier = std::mem::replace(&mut self.sets._io, Task::ready(()));
+        self.sets._io = cx.spawn_in(window, async move |this, cx| {
+            earlier.await;
+            let result = cx.background_spawn(async move { write(&dir) }).await;
+            let _ = this.update_in(cx, |ws, window, cx| {
+                match result {
+                    Ok(settings) => {
+                        ws.sets.saved = settings.cluster_sets;
+                        ws.sets.error = None;
+                        done(ws, window, cx);
+                    }
+                    Err(e) => ws.sets.error = Some(e.to_string()),
+                }
+                cx.notify();
+            });
+        });
+    }
+
+    fn ask_rename_set(
+        &mut self,
+        action: &RenameClusterSet,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(e) = self.check_saved::<RenameClusterSet>(&action.name) {
+            tracing::warn!("{e}");
+            return;
+        }
+        let name = action.name.clone();
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(name.clone()));
+        let field = cx.new(|_| SetNameField {
+            input: input.clone(),
+            error: None,
+        });
+        let dialog = DialogText {
+            title: format!("Rename {name}"),
+            text: "A new name for this saved set. Its clusters stay the same.".to_owned(),
+            ok: "Rename".into(),
+            cancel: "Cancel".into(),
+            id: "rename-set-description",
+            default_cancel: false,
+        };
+        let view = cx.weak_entity();
+        let content = field.clone().into();
+        confirm::open_with(window, cx, dialog, Some(content), move |window, cx| {
+            let typed = field.read(cx).input.read(cx).value().trim().to_owned();
+            let Ok(problem) =
+                view.read_with(cx, |ws, _| rename_problem(&ws.sets.saved, &name, &typed))
+            else {
+                return true;
+            };
+            if let Some(error) = problem {
+                field.update(cx, |field, cx| {
+                    field.error = Some(error);
+                    cx.notify();
+                });
+                return false;
+            }
+            let name = name.clone();
+            let _ = view.update(cx, |ws, cx| ws.rename_set(name, typed, window, cx));
+            true
+        });
+        input.update(cx, |input, cx| input.focus(window, cx));
+    }
+
+    fn rename_set(
+        &mut self,
+        name: String,
+        new_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (old, new) = (name.clone(), new_name.clone());
+        self.write_sets(
+            move |dir| rename_cluster_set(dir, &name, &new_name),
+            move |ws, _, cx| ws.relabel_running(&old, &new, cx),
+            window,
+            cx,
+        );
+    }
+
+    /// Carries a saved set's new name to its open view.
+    fn relabel_running(&mut self, old: &str, new: &str, cx: &mut Context<Self>) {
+        let Some(run) = self
+            .sets
+            .running
+            .as_mut()
+            .filter(|r| r.saved && r.label == old)
+        else {
+            return;
+        };
+        run.label = new.to_owned();
+        let title = format!("{} · {new}", run.kind_label);
+        run.list.update(cx, |list, cx| {
+            list.label = title;
+            cx.notify();
+        });
+    }
+
+    fn ask_delete_set(
+        &mut self,
+        action: &DeleteClusterSet,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(e) = self.check_saved::<DeleteClusterSet>(&action.name) {
+            tracing::warn!("{e}");
+            return;
+        }
+        let name = action.name.clone();
+        let dialog = DialogText {
+            title: format!("Delete {name}?"),
+            text: "This removes the saved set. Its clusters and kubeconfig are not changed, and \
+                   the set stays open if it is running."
+                .to_owned(),
+            ok: "Delete".into(),
+            cancel: "Cancel".into(),
+            id: "delete-set-description",
+            default_cancel: true,
+        };
+        let view = cx.weak_entity();
+        confirm::open(window, cx, dialog, move |window, cx| {
+            let name = name.clone();
+            let _ = view.update(cx, |ws, cx| ws.delete_set(name, window, cx));
+        });
+    }
+
+    fn delete_set(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let deleted = name.clone();
+        self.write_sets(
+            move |dir| delete_cluster_set(dir, &name),
+            move |ws, _, _| {
+                // What stays open no longer has a saved name for a later rename to follow.
+                if let Some(run) = ws.sets.running.as_mut().filter(|r| r.label == deleted) {
+                    run.saved = false;
+                }
+            },
+            window,
+            cx,
+        );
+    }
+
     fn open_saved(&mut self, action: &OpenClusterSet, window: &mut Window, cx: &mut Context<Self>) {
         let Some(set) = self.sets.saved.iter().find(|s| s.name == action.name) else {
             return;
@@ -367,37 +615,21 @@ impl Workspace {
     }
 
     fn save_set(&mut self, action: &SaveClusterSet, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(dir) = cx.try_global::<SettingsDir>().map(|d| d.0.clone()) else {
-            self.sets.error = Some("Can't save: no settings folder".to_owned());
-            cx.notify();
-            return;
-        };
         let pins = self.picked_pins(cx);
         let name = action.name.clone();
-        let write = cx.background_spawn(async move { create_cluster_set(&dir, &name, &pins) });
         let input = self.sets.name_input.clone();
-        let handle = window.window_handle();
-        self.sets._io = cx.spawn(async move |this, cx| {
-            let result = write.await;
-            let _ = cx.update_window(handle, |_, window, cx| {
-                let _ = this.update(cx, |ws, cx| {
-                    match result {
-                        Ok(settings) => {
-                            ws.sets.saved = settings.cluster_sets;
-                            ws.sets.error = None;
-                            input.update(cx, |input, cx| input.set_value("", window, cx));
-                        }
-                        Err(e) => ws.sets.error = Some(e.to_string()),
-                    }
-                    cx.notify();
-                });
-            });
-        });
+        self.write_sets(
+            move |dir| create_cluster_set(dir, &name, &pins),
+            move |_, window, cx| input.update(cx, |input, cx| input.set_value("", window, cx)),
+            window,
+            cx,
+        );
     }
 
     /// Asks the core to run `pins` as the set, and opens their combined list once it has checked
-    /// every one. If any is no longer the cluster it was pinned to, nothing starts, whatever is
-    /// open stays, and the sidebar says which.
+    /// every one. A member now pointing at another server is left out and marked, and never
+    /// reaches the core. Any other refusal, or too few members left, starts nothing: whatever is
+    /// open stays, and the sidebar says why.
     fn open_set(
         &mut self,
         label: String,
@@ -407,11 +639,22 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let names = self.cluster_names(cx);
+        let (moved, pins): (Vec<_>, Vec<_>) = pins
+            .into_iter()
+            .partition(|pin| repointed(pin, self.cluster_summary(&pin.context, cx)));
         let refused = pins.iter().find_map(|pin| {
             let summary = self.cluster_summary(&pin.context, cx);
             member_refusal(pin, summary, None, &names.exact(&pin.context))
         });
-        if let Some(why) = refused {
+        let too_few = (!moved.is_empty() && pins.len() < MIN_CLUSTER_SET_MEMBERS).then(|| {
+            let shown: Vec<String> = moved.iter().map(|p| names.exact(&p.context)).collect();
+            format!(
+                "{} now points at another server, which leaves too few clusters to open: a set \
+                 runs at least {MIN_CLUSTER_SET_MEMBERS}",
+                shown.join(", ")
+            )
+        });
+        if let Some(why) = refused.or(too_few) {
             self.sets.error = Some(why);
             cx.notify();
             return;
@@ -420,11 +663,16 @@ impl Workspace {
         let token = self.sets.next_opening;
         self.sets.next_opening += 1;
         self.sets.opening = Some(token);
+        let opening = Opening {
+            label,
+            picked,
+            left_out: moved.into_iter().map(|pin| pin.context).collect(),
+        };
         let admit = self.model.read(cx).core().admit_running_set(pins);
         self.sets._admit = cx.spawn_in(window, async move |this, cx| {
             let admitted = admit.await;
             let _ = this.update_in(cx, |ws, window, cx| {
-                ws.finish_open(token, label, picked, admitted, window, cx)
+                ws.finish_open(token, opening, admitted, window, cx)
             });
         });
     }
@@ -432,8 +680,7 @@ impl Workspace {
     fn finish_open(
         &mut self,
         token: u64,
-        label: String,
-        picked: bool,
+        opening: Opening,
         admitted: Result<Vec<AdmittedMember>, String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -454,7 +701,7 @@ impl Workspace {
                 return;
             }
         };
-        if picked {
+        if opening.picked {
             self.sets.picking = false;
             self.sets.picked.clear();
         }
@@ -462,13 +709,17 @@ impl Workspace {
         self.sets.running = None;
         self.close_list(cx);
         self.show_set(
-            label,
+            opening.label,
             members,
             KindId::pods(),
             "Pods".to_owned(),
             window,
             cx,
         );
+        if let Some(run) = &mut self.sets.running {
+            run.saved = !opening.picked;
+            run.left_out = opening.left_out;
+        }
     }
 
     /// Opens the combined list of `kind` over `members`, feeding it from the core. Rows appear
@@ -497,6 +748,7 @@ impl Workspace {
             .collect();
         let source = self.combined_source(&snapshots, cx);
         let title = format!("{kind_label} · {label}");
+        let shown_kind = kind_label;
         let list = cx.new(|cx| CombinedResourceList::new(title, source, Vec::new(), window, cx));
         let events = cx.subscribe_in(&list, window, Self::on_combined_event);
         let feeds = subscriptions
@@ -544,9 +796,12 @@ impl Workspace {
             .update(cx, |nav, cx| nav.set_selected(Some(kind.clone()), cx));
         self.sets.running = Some(RunningSet {
             label,
+            saved: false,
             members,
             changed: HashSet::new(),
+            left_out: Vec::new(),
             kind,
+            kind_label: shown_kind,
             list,
             snapshots,
             reports: Vec::new(),
@@ -578,6 +833,7 @@ impl Workspace {
         }
         let (label, members, changed) =
             (run.label.clone(), run.members.clone(), run.changed.clone());
+        let (saved, left_out) = (run.saved, run.left_out.clone());
         self.close_set_detail(cx);
         self.show_set(
             label,
@@ -589,6 +845,8 @@ impl Workspace {
         );
         if let Some(run) = &mut self.sets.running {
             run.changed = changed;
+            run.saved = saved;
+            run.left_out = left_out;
         }
         true
     }
@@ -1055,6 +1313,15 @@ impl Workspace {
                     .child(text)
                     .test_support()
             }))
+            .children(run.left_out.iter().map(|context| {
+                let text = format!("{}: Changed, left out", names.exact(context));
+                div()
+                    .id(SharedString::from(format!("set-member-{context}")))
+                    .aria_label(text.clone())
+                    .text_color(theme.warning)
+                    .child(text)
+                    .test_support()
+            }))
             .child(div().flex_1())
             .child(
                 Button::new("close-cluster-set")
@@ -1092,14 +1359,26 @@ impl Workspace {
             .border_color(theme.sidebar_border)
             .text_xs()
             .children(sets.saved.iter().map(|set| {
-                Button::new(SharedString::from(format!("open-set-{}", set.name)))
-                    .xsmall()
-                    .ghost()
+                let name = set.name.clone();
+                div()
+                    .id(SharedString::from(format!("set-menu-{name}")))
                     .w_full()
-                    .label(set.name.clone())
-                    .on_click(registry::on_click(OpenClusterSet {
-                        name: set.name.clone(),
-                    }))
+                    .child(
+                        Button::new(SharedString::from(format!("open-set-{name}")))
+                            .xsmall()
+                            .ghost()
+                            .w_full()
+                            .label(name.clone())
+                            .on_click(registry::on_click(OpenClusterSet { name: name.clone() })),
+                    )
+                    .context_menu(move |menu, _, _| {
+                        menu.item(PopupMenuItem::new("Rename…").on_click(registry::on_click(
+                            RenameClusterSet { name: name.clone() },
+                        )))
+                        .item(PopupMenuItem::new("Delete…").on_click(registry::on_click(
+                            DeleteClusterSet { name: name.clone() },
+                        )))
+                    })
             }))
             .child(
                 Button::new("toggle-cluster-picking")
