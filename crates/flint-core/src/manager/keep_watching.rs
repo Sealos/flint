@@ -28,12 +28,14 @@ use crate::keep_watching::{
 };
 use crate::kubeconfig::LoadedKubeconfig;
 use crate::metrics_trend::TrendStore;
-use crate::telemetry::Telemetry;
+use crate::telemetry::{KeptDiscovery, Telemetry};
 
 /// How long a connection that failed for a reason worth retrying waits before the next.
 const RETRY_AFTER: Duration = Duration::from_secs(60);
 /// How many background connections are made at once, so a launch starts no burst of plugins.
 const CONCURRENT_CONNECTS: usize = 4;
+/// How many kept connections run discovery at once.
+const CONCURRENT_DISCOVERIES: usize = 4;
 /// How long a quit waits for plugins to be killed: inside GPUI's 200 ms for quit hooks.
 pub(crate) const QUIT_WAIT: Duration = Duration::from_millis(100);
 
@@ -225,6 +227,7 @@ pub(super) struct KeepWatch {
     retry_at: HashMap<ClusterId, Instant>,
     next_attempt: u64,
     connects: Arc<Semaphore>,
+    discoveries: Arc<Semaphore>,
     shown: BTreeMap<ClusterId, KeepWatchView>,
     /// How each context signs in, for the load it was read from: this is asked on every message
     /// of the manager's loop, and working it out serializes the context's entries.
@@ -248,6 +251,7 @@ impl Default for KeepWatch {
             retry_at: HashMap::new(),
             next_attempt: 1,
             connects: Arc::new(Semaphore::new(CONCURRENT_CONNECTS)),
+            discoveries: Arc::new(Semaphore::new(CONCURRENT_DISCOVERIES)),
             shown: BTreeMap::new(),
             sign_ins: None,
         }
@@ -573,6 +577,11 @@ impl ClusterManager {
                     .telemetry
                     .request_gate(reads_token_file(&self.kubeconfig.merged, id));
                 let trends = Arc::new(Mutex::new(TrendStore::new()));
+                let discovery = KeptDiscovery {
+                    client: client.clone(),
+                    requests: requests.clone(),
+                    turns: Arc::clone(&self.keep.discoveries),
+                };
                 let mut feed = Telemetry::start(
                     id.into(),
                     client,
@@ -581,7 +590,8 @@ impl ClusterManager {
                     self.telemetry_timing,
                     requests,
                 );
-                self.telemetry.publish(id, &mut feed, trends);
+                self.telemetry
+                    .publish_kept(id, &mut feed, trends, discovery);
                 kept.feed = Some(feed);
             }
             Err(sign_in) if !kept.interrupted && (sign_in || kept.runs_plugin) => {

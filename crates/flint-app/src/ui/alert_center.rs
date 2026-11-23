@@ -66,20 +66,15 @@ const UNWATCHED_GRACE: SignedDuration = SignedDuration::from_secs(30);
 const NOTE_TIME: Duration = Duration::from_secs(4);
 
 /// What the setting promises, shown beside it.
-pub const COVERAGE: &str = "Only clusters on Live: all kinds are checked in the background.";
+pub const COVERAGE: &str =
+    "Clusters on Live: all kinds or Keep Watching are checked in the background.";
 
 /// What it does not cover.
-pub const NOT_COVERED: &str = "Clusters on Live: open views only have no background detection.";
+pub const NOT_COVERED: &str =
+    "Other clusters on Live: open views only have no background detection.";
 
 /// Every kind of problem.
-const ALL_KINDS: [ProblemKind; 6] = [
-    ProblemKind::CrashLoop,
-    ProblemKind::OomKilled,
-    ProblemKind::ImagePull,
-    ProblemKind::NodeNotReady,
-    ProblemKind::JobFailed,
-    ProblemKind::WorkloadShort,
-];
+const ALL_KINDS: [ProblemKind; 6] = ProblemKind::ALL;
 
 /// Turn desktop notifications on or off.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
@@ -272,16 +267,6 @@ pub fn reading<'a>(
     }
 }
 
-/// The API groups a kind of problem is read from. A pod's owner is read through its ReplicaSet.
-fn groups_of(kind: ProblemKind) -> &'static [&'static str] {
-    match kind {
-        ProblemKind::CrashLoop | ProblemKind::OomKilled | ProblemKind::ImagePull => &["", "apps"],
-        ProblemKind::NodeNotReady => &[""],
-        ProblemKind::JobFailed => &["batch"],
-        ProblemKind::WorkloadShort => &["apps"],
-    }
-}
-
 /// The kinds of problem discovery cannot vouch for: all of them until it has run.
 pub fn out_of_scope_kinds(discovery: Option<&ClusterDiscovery>) -> Vec<ProblemKind> {
     let Some(discovery) = discovery else {
@@ -295,7 +280,7 @@ pub fn out_of_scope_kinds(discovery: Option<&ClusterDiscovery>) -> Vec<ProblemKi
     };
     ALL_KINDS
         .into_iter()
-        .filter(|kind| groups_of(*kind).iter().any(|group| incomplete(group)))
+        .filter(|kind| kind.api_groups().iter().any(|group| incomplete(group)))
         .collect()
 }
 
@@ -850,7 +835,8 @@ impl AlertCenter {
             .zip(labels)
             .map(|((summary, feed), label)| {
                 let id = summary.info.name.as_str();
-                let discovery = verified_discovery(model.discovery.get(id), summary.generation);
+                let slot = verified_discovery(model.discovery.get(id), summary.generation);
+                let discovery = feed.as_ref().map_or(slot, |f| f.discovery.or_slot(slot));
                 let snapshot = feed.as_ref().map(|feed| &*feed.snapshot);
                 let on = model.settings.alerts_on(id, summary.info.server.as_deref());
                 TrackerInput {

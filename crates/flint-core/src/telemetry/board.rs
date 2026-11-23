@@ -9,9 +9,11 @@ use jiff::Timestamp;
 use tokio::sync::watch;
 
 use super::{
-    Availability, CheckFailure, FailureCause, RequestGate, SideReads, Telemetry, TelemetrySnapshot,
+    Availability, CheckFailure, FailureCause, KeptDiscovery, RequestGate, SideReads, Telemetry,
+    TelemetrySnapshot,
 };
 use crate::cluster::{ClusterId, SafeErrorText};
+use crate::discovery::ClusterDiscovery;
 use crate::metrics_trend::TrendStore;
 
 /// `good` as last values: readable, its age said in the status, and worth no alert change, since
@@ -37,7 +39,32 @@ pub struct ClusterTelemetry {
     pub snapshot: Arc<TelemetrySnapshot>,
     /// Warning events, claims and usage, each with its own state.
     pub reads: SideReads,
+    /// Where the catalog that may vouch for this feed's kinds comes from.
+    pub discovery: FeedDiscovery,
     trends: Arc<Mutex<TrendStore>>,
+}
+
+/// The discovery that belongs with a feed.
+#[derive(Clone, Debug)]
+pub enum FeedDiscovery {
+    /// The feed runs on the cluster's slot, whose discovery applies.
+    Slot,
+    /// The feed runs on a kept-watching connection, and only that connection's discovery applies.
+    /// Its `kinds` are empty: it says only which groups problems are read from are incomplete.
+    Kept(Option<Arc<ClusterDiscovery>>),
+}
+
+impl FeedDiscovery {
+    /// The catalog for this feed, given what the cluster's slot has.
+    pub fn or_slot<'a>(
+        &'a self,
+        slot: Option<&'a ClusterDiscovery>,
+    ) -> Option<&'a ClusterDiscovery> {
+        match self {
+            Self::Slot => slot,
+            Self::Kept(found) => found.as_deref(),
+        }
+    }
 }
 
 impl ClusterTelemetry {
@@ -68,9 +95,20 @@ struct Entry {
     last_good: Arc<Mutex<Option<Arc<TelemetrySnapshot>>>>,
     /// The feed has stopped: its last values stay, in memory only, until the entry is removed.
     held: Option<SideReads>,
+    /// A kept feed's own discovery. `None` for a feed on a slot.
+    kept: Option<watch::Receiver<Option<Arc<ClusterDiscovery>>>>,
 }
 
 impl Entry {
+    /// What may vouch for this feed's kinds. A stopped feed's connection vouches for nothing.
+    fn discovery(&self) -> FeedDiscovery {
+        match &self.kept {
+            None => FeedDiscovery::Slot,
+            Some(_) if self.held.is_some() => FeedDiscovery::Kept(None),
+            Some(found) => FeedDiscovery::Kept(found.borrow().clone()),
+        }
+    }
+
     /// `None` once the feed's tasks have ended, so a stopped feed is never read as live. A feed
     /// that can no longer read its cluster shows what it last read, with its age.
     fn read(&self) -> Option<ClusterTelemetry> {
@@ -83,6 +121,7 @@ impl Entry {
         let telemetry = |snapshot, reads| ClusterTelemetry {
             snapshot,
             reads,
+            discovery: self.discovery(),
             trends: Arc::clone(&self.trends),
         };
         if let Some(reads) = &self.held {
@@ -142,6 +181,30 @@ impl TelemetryBoard {
         feed: &mut Telemetry,
         trends: Arc<Mutex<TrendStore>>,
     ) {
+        self.list(cluster, feed, trends, None);
+    }
+
+    /// Lists a kept connection's `feed`, which runs `discovery` for as long as it runs.
+    pub(crate) fn publish_kept(
+        &self,
+        cluster: &str,
+        feed: &mut Telemetry,
+        trends: Arc<Mutex<TrendStore>>,
+        discovery: KeptDiscovery,
+    ) {
+        // A channel per feed: a result of an earlier connection has nowhere to land.
+        let (found, kept) = watch::channel(None);
+        feed.follow_discovery(discovery, found, self.version.clone());
+        self.list(cluster, feed, trends, Some(kept));
+    }
+
+    fn list(
+        &self,
+        cluster: &str,
+        feed: &mut Telemetry,
+        trends: Arc<Mutex<TrendStore>>,
+        kept: Option<watch::Receiver<Option<Arc<ClusterDiscovery>>>>,
+    ) {
         let last_good = Arc::default();
         feed.notify_changes(self.version.clone(), Arc::clone(&last_good));
         let entry = Entry {
@@ -150,6 +213,7 @@ impl TelemetryBoard {
             trends,
             last_good,
             held: None,
+            kept,
         };
         self.feeds().insert(cluster.to_owned(), entry);
         self.bump();
