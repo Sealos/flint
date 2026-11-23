@@ -1439,12 +1439,58 @@ async fn a_row_menu_stays_open_when_the_list_reorders(cx: &mut TestAppContext) {
             cx,
         )
     });
-    cx.run_until_parked();
+    cx.wait_for(t.window, WAIT, |window, _| {
+        let tops: Vec<_> = ["aaa", "api", "web"]
+            .iter()
+            .filter_map(|name| window.try_find(format!("row-uid-{name}")))
+            .map(|row| f32::from(row.bounds().origin.y))
+            .collect();
+        tops.len() == 3 && tops.is_sorted_by(|a, b| a < b)
+    })
+    .await;
     assert!(menu_open(cx, &t));
     assert_eq!(
         app_state(cx, &t).menu.unwrap().owner.as_deref(),
         Some("row-menu-uid-web")
     );
+}
+
+// A refresh can find that the pod's name now belongs to a replacement before the list drops the
+// old row. Logs go by pod name, so the old pod's cached containers must not be offered.
+#[gpui_kit::test]
+async fn a_replaced_pods_menu_offers_no_logs(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "kind-alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    let pod = |uid: &str| {
+        detail(json!({
+            "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "demo", "uid": uid},
+            "spec": {"containers": [{"name": "app"}, {"name": "sidecar"}]},
+            "status": {"containerStatuses": [
+                {"name": "app", "restartCount": 0, "state": {"running": {}}},
+                {"name": "sidecar", "restartCount": 3,
+                 "state": {"waiting": {"reason": "CrashLoopBackOff"}}}
+            ]}
+        }))
+    };
+    show_fetched(cx, &t, pod("uid-web"));
+    show_fetched(cx, &t, pod("uid-replacement"));
+
+    let rows = open_menu(cx, &t, "web").await;
+    assert_eq!(
+        rows[..4],
+        [
+            "Logs",
+            "web was deleted",
+            "Previous Logs",
+            "web was deleted"
+        ]
+    );
+    click_entry(cx, &t, 2);
+    assert_eq!(dock_tabs(cx, &t).0, Vec::<String>::new());
 }
 
 // covers #251: a crash-looping sidecar's previous logs open from the row menu although the
@@ -1476,7 +1522,28 @@ async fn previous_logs_open_for_a_restarted_sidecar(cx: &mut TestAppContext) {
     click_submenu(cx, &t, 1);
     let (tabs, _) = dock_tabs(cx, &t);
     assert_eq!(tabs.len(), 1, "{tabs:?}");
-    assert!(tabs[0].contains("sidecar"), "{tabs:?}");
+    let request = t.workspace.read_with(cx, |ws, cx| {
+        ws.dock
+            .read(cx)
+            .active_log()
+            .unwrap()
+            .read(cx)
+            .request()
+            .clone()
+    });
+    assert!(request.previous, "the picker opens the previous instance");
+    assert_eq!(request.cluster.to_string(), "kind-alpha");
+    let flint_core::LogSubject::Pod(target) = request.subject else {
+        panic!("a pod's logs: {:?}", request.subject);
+    };
+    assert_eq!(
+        (
+            target.namespace.as_str(),
+            target.pod.as_str(),
+            target.container.as_deref()
+        ),
+        ("demo", "web", Some("sidecar"))
+    );
 }
 
 // covers #496: a window that gets smaller dismisses the menu, whose limits were worked out for
