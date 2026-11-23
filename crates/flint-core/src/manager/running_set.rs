@@ -193,7 +193,8 @@ impl ClusterManager {
             return;
         }
         let cluster = member.pin.context.clone();
-        self.subscriptions.insert(id, (cluster.clone(), kind));
+        self.subscriptions
+            .insert(id, (cluster.clone(), kind, Some(member)));
         self.reconcile(&cluster);
     }
 

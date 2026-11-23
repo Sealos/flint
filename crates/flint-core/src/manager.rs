@@ -488,8 +488,8 @@ pub(crate) struct ClusterManager {
     watcher: Option<FileWatcher>,
     hubs: HubRegistry,
     engine_config: Arc<EngineConfig>,
-    /// Open subscriptions by id.
-    subscriptions: HashMap<u64, (ClusterId, KindId)>,
+    /// Open subscriptions by id, each with the member it was admitted on if a set opened it.
+    subscriptions: HashMap<u64, (ClusterId, KindId, Option<crate::handle::AdmittedMember>)>,
     /// Open overviews by id, with the slot generation each was opened on.
     overviews: HashMap<u64, (ClusterId, u64)>,
     /// Running log sessions by id. They belong to no cluster slot, so they outlive cluster
@@ -727,14 +727,14 @@ impl ClusterManager {
                 let _ = reply.send(self.activate_pinned(cluster, &pin, generation));
             }
             Request::Subscribe { id, cluster, kind } => {
-                self.subscriptions.insert(id, (cluster.clone(), kind));
+                self.subscriptions.insert(id, (cluster.clone(), kind, None));
                 self.reconcile(&cluster);
             }
             Request::SubscribeMember { id, member, kind } => {
                 self.subscribe_member(id, member, kind);
             }
             Request::Unsubscribe { id } => {
-                if let Some((cluster, kind)) = self.subscriptions.remove(&id) {
+                if let Some((cluster, kind, _)) = self.subscriptions.remove(&id) {
                     self.reconcile(&cluster);
                     let running = self
                         .clusters
@@ -1010,8 +1010,14 @@ impl ClusterManager {
         let subscribed: HashSet<KindId> = self
             .subscriptions
             .values()
-            .filter(|(c, _)| c == id)
-            .map(|(_, k)| k.clone())
+            .filter(|(c, _, member)| {
+                // A member's subscription asks for nothing once its context left that server.
+                c == id
+                    && member
+                        .as_ref()
+                        .is_none_or(|m| self.member_changed(m).is_none())
+            })
+            .map(|(_, k, _)| k.clone())
             .collect();
         let hubs = self.hubs.clone();
         let internal = self.internal_tx.clone();

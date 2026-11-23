@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use flint_core::handle::{Command, CoreHandle, MemberStatus};
+use flint_core::settings::ClusterPin;
 use flint_core::{KindId, Settings};
 use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, WatchStep, write_kubeconfigs};
 
@@ -187,4 +188,35 @@ async fn a_repointed_member_leaves_and_never_reaches_the_new_server() {
         elsewhere.requests().is_empty(),
         "nothing connects to the new server"
     );
+}
+
+#[tokio::test]
+async fn a_combined_view_sends_nothing_to_the_server_its_active_member_moved_to() {
+    let [a, b, elsewhere] = servers().await;
+    let (core, path) = core_on(&[&a, &b]).await;
+    let pins = vec![ClusterPin::new("a", a.url()), ClusterPin::new("b", b.url())];
+    let admitted = core.handle.admit_running_set(pins).await.unwrap();
+    let member = admitted.into_iter().find(|m| m.context() == "a").unwrap();
+    let combined = core.handle.bound_to(member);
+    let _view = combined.subscribe("a", &pod_kind());
+    a.wait_for_watches(&pods(), 1, WAIT).await.unwrap();
+
+    write_config(&path, &[&elsewhere, &b]);
+    core.handle.reload_kubeconfig().await.unwrap();
+
+    // The active cluster's own view does reach the new server, so its watches have been decided.
+    let services = elsewhere.gvr("services");
+    let _own_view = core.handle.subscribe("a", &KindId::new("", "services"));
+    elsewhere
+        .wait_for_watches(&services, 1, WAIT)
+        .await
+        .unwrap();
+    until_no_watches(&a).await;
+    let reached: Vec<_> = elsewhere
+        .requests()
+        .into_iter()
+        .filter(|r| r.is_about(&pods()))
+        .map(|r| r.path)
+        .collect();
+    assert!(reached.is_empty(), "{reached:?}");
 }
