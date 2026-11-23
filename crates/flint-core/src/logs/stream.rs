@@ -108,17 +108,60 @@ const RESUME_GROUP: usize = 64;
 ///
 /// Held lines sit outside the ring buffer's budget, so holding is bounded: by
 /// [`RESUME_HELD_LINES`], by [`RESUME_HELD_BYTES`], and by [`RESUME_HELD_IDLE`] without a new
-/// line. A read that ends, or a stream that ends, stops holding too. See [`Stream::release_held`]
-/// for what happens to the lines then.
+/// line. A read that ends or breaks, or a stream that ends, stops holding too. See
+/// [`Stream::release_held`] for what happens to the lines then.
 #[derive(Debug)]
 struct Resume {
     last: Timestamp,
     shown: Vec<u64>,
     held: Vec<LogLine>,
-    /// [`LogLine::heap_bytes`] of `held`.
-    held_bytes: usize,
+    /// What the held lines take besides their slots in `held`.
+    held_text_bytes: usize,
     /// Runs out [`RESUME_HELD_IDLE`] after the last held line. Only polled while reading.
     idle: Option<Pin<Box<Sleep>>>,
+}
+
+impl Resume {
+    /// Whether `line`, after the held lines, ends the replay of the shown lines in order.
+    fn completes_overlap(&self, line: &LogLine) -> bool {
+        let Some((last, before)) = self.shown.split_last() else {
+            return false;
+        };
+        *last == fingerprint(&line.text)
+            && self.held.len() >= before.len()
+            && self.held[self.held.len() - before.len()..]
+                .iter()
+                .zip(before)
+                .all(|(l, s)| fingerprint(&l.text) == *s)
+    }
+
+    /// Holds `line` if it and the slots it needs fit in [`RESUME_HELD_BYTES`]; gives it back if
+    /// not. Slots are reserved here so that spare capacity counts too.
+    fn hold(&mut self, line: LogLine) -> Result<(), LogLine> {
+        let slot = std::mem::size_of::<LogLine>();
+        let text = line.heap_bytes() - slot;
+        let slots = if self.held.len() < self.held.capacity() {
+            self.held.capacity()
+        } else {
+            (self.held.capacity() * 2).clamp(16, RESUME_HELD_LINES)
+        };
+        if self.held_text_bytes + text + slots * slot > RESUME_HELD_BYTES {
+            return Err(line);
+        }
+        self.held.reserve_exact(slots - self.held.len());
+        self.held_text_bytes += text;
+        self.held.push(line);
+        Ok(())
+    }
+
+    /// A line was held: the read has [`RESUME_HELD_IDLE`] again to send the next one.
+    fn restart_idle(&mut self) {
+        let until = tokio::time::Instant::now() + RESUME_HELD_IDLE;
+        match &mut self.idle {
+            Some(idle) => idle.as_mut().reset(until),
+            idle => *idle = Some(Box::pin(tokio::time::sleep_until(until))),
+        }
+    }
 }
 
 /// Most lines held while looking for the overlap of a reconnect.
@@ -138,6 +181,19 @@ const RESUME_HELD_IDLE: Duration = Duration::from_secs(5);
 /// before the reconnect, since only the newest [`RESUME_GROUP`] are remembered.
 const RESUME_GAP_NOTICE: &str =
     "[flint] Reconnected without finding where the log left off: lines below may repeat";
+
+/// `text` cut to [`MAX_LINE_BYTES`] on a character boundary, and whether it was cut. The source
+/// cuts raw bytes, but replacing invalid UTF-8 can then triple them.
+fn within_line_limit(text: &str) -> (&str, bool) {
+    if text.len() <= MAX_LINE_BYTES {
+        return (text, false);
+    }
+    let mut end = MAX_LINE_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
+}
 
 /// A line text's fingerprint, what resuming compares. Keeping fingerprints instead of the texts
 /// means a stream never keeps lines alive after the buffer evicted them: an ended stream that may
@@ -309,7 +365,7 @@ impl Stream {
                 last,
                 shown: self.last_group.clone(),
                 held: Vec::new(),
-                held_bytes: 0,
+                held_text_bytes: 0,
                 idle: None,
             });
         }
@@ -346,10 +402,16 @@ impl Stream {
     /// changed.
     pub fn handle(&mut self, step: Step, out: &mut dyn FnMut(LogLine)) -> bool {
         self.changed = false;
-        // The read is complete and the overlap was not in it: waiting longer finds nothing. A
-        // read that broke (`Step::Line(Err)`) keeps its lines: the reopen replays them.
+        // The read is complete and the overlap was not in it: waiting longer finds nothing.
         if matches!(step, Step::Eof) {
             self.release_held(out);
+        }
+        // A broken read's lines may be gone from the log by the reopen, so they go out now. What
+        // was shown before stays the resume point: the reopen can still find the overlap.
+        if matches!(step, Step::Line(Err(_))) {
+            let shown = self.last_group.clone();
+            self.release_held(out);
+            self.last_group = shown;
         }
         let starting = if matches!(step, Step::AfterEnd(_)) {
             self.starting.take()
@@ -538,31 +600,23 @@ impl Stream {
     /// the backoff; repeats do not, so a crash-looping container that only replays its last
     /// lines is polled less and less often.
     fn push(&mut self, raw: RawLine, out: &mut dyn FnMut(LogLine)) {
-        let line = LogLine::parse(&raw.text, raw.truncated);
+        let (text, cut) = within_line_limit(&raw.text);
+        let line = LogLine::parse(text, raw.truncated || cut);
         if let Some(resume) = &mut self.resume {
             match line.timestamp {
                 Some(ts) if ts < resume.last => return,
                 Some(ts) if ts == resume.last => {
-                    resume.held_bytes += line.heap_bytes();
-                    resume.held.push(line);
-                    let held = &resume.held;
-                    if held.len() >= resume.shown.len()
-                        && held[held.len() - resume.shown.len()..]
-                            .iter()
-                            .zip(&resume.shown)
-                            .all(|(l, s)| fingerprint(&l.text) == *s)
-                    {
+                    if resume.completes_overlap(&line) {
                         // The shown lines are replayed: the rest is new.
                         self.resume = None;
-                    } else if held.len() >= RESUME_HELD_LINES
-                        || resume.held_bytes >= RESUME_HELD_BYTES
-                    {
-                        self.release_held(out);
-                    } else {
-                        let until = tokio::time::Instant::now() + RESUME_HELD_IDLE;
-                        match &mut resume.idle {
-                            Some(idle) => idle.as_mut().reset(until),
-                            idle => *idle = Some(Box::pin(tokio::time::sleep_until(until))),
+                        return;
+                    }
+                    match resume.hold(line) {
+                        Ok(()) if resume.held.len() >= RESUME_HELD_LINES => self.release_held(out),
+                        Ok(()) => resume.restart_idle(),
+                        Err(line) => {
+                            self.release_held(out);
+                            self.append(line, out);
                         }
                     }
                     return;
@@ -575,34 +629,38 @@ impl Stream {
         self.append(line, out);
     }
 
-    /// Stops looking for the overlap and passes on the held lines that were not shown, through
-    /// the normal path, so they count against the buffer's budget like any other line.
+    /// Stops looking for the overlap and passes on every held line, through the normal path, so
+    /// they count against the buffer's budget like any other line.
     ///
-    /// Without the overlap, a held line cannot be told apart from an older line of the same
-    /// timestamp that was shown but is no longer remembered. Dropping it could lose a line, so it
-    /// is kept, and [`RESUME_GAP_NOTICE`] goes first to say that what follows may repeat. Lines
-    /// the replay still sends after this point are not compared either. No notice when no line
-    /// is released.
-    fn release_held(&mut self, out: &mut dyn FnMut(LogLine)) {
+    /// Without the overlap in order, a held line cannot be told apart from a new line with the
+    /// same text and timestamp. Dropping it could lose a line, so it is kept, and
+    /// [`RESUME_GAP_NOTICE`] goes first to say that what follows may repeat. Lines the replay
+    /// still sends after this point are not compared either. No notice when no line is held.
+    /// Possible repeats are not progress, so the backoff is left alone.
+    pub(crate) fn release_held(&mut self, out: &mut dyn FnMut(LogLine)) {
         let Some(resume) = self.resume.take() else {
             return;
         };
-        let mut lines = resume
-            .held
-            .into_iter()
-            .filter(|l| !resume.shown.contains(&fingerprint(&l.text)))
-            .peekable();
-        if lines.peek().is_some() {
-            let mut notice = LogLine::parse(RESUME_GAP_NOTICE, false);
-            notice.severity = Severity::Warning;
-            self.append(notice, out);
+        if resume.held.is_empty() {
+            return;
         }
-        for line in lines {
-            self.append(line, out);
+        let mut notice = LogLine::parse(RESUME_GAP_NOTICE, false);
+        notice.severity = Severity::Warning;
+        self.emit(notice, out);
+        for line in resume.held {
+            self.emit(line, out);
         }
     }
 
-    fn append(&mut self, mut line: LogLine, out: &mut dyn FnMut(LogLine)) {
+    /// Passes on a new line: progress, so the next failure is the first again.
+    fn append(&mut self, line: LogLine, out: &mut dyn FnMut(LogLine)) {
+        self.retry.reset();
+        self.start_wait.reset();
+        self.emit(line, out);
+    }
+
+    /// Remembers `line` as shown, tags it and passes it on.
+    fn emit(&mut self, mut line: LogLine, out: &mut dyn FnMut(LogLine)) {
         if let Some(ts) = line.timestamp {
             if self.last_ts != Some(ts) {
                 self.last_ts = Some(ts);
@@ -614,8 +672,6 @@ impl Stream {
             self.last_group.push(fingerprint(&line.text));
         }
         line.source = self.tag().cloned();
-        self.retry.reset();
-        self.start_wait.reset();
         out(line);
     }
 
@@ -877,22 +933,32 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_replay_at_the_byte_cap_is_released_with_a_notice() {
         let mut s = resuming("shown").await;
-        let long = "x".repeat(MAX_LINE_BYTES);
+        let long = "x".repeat(MAX_LINE_BYTES - REPLAY_TS.len() - 1);
         let line = format!("{REPLAY_TS} {long}");
-        let size = LogLine::parse(&line, false).heap_bytes();
-        let cap_lines = RESUME_HELD_BYTES.div_ceil(size);
-        assert!(cap_lines < RESUME_HELD_LINES, "the bytes cap comes first");
 
         let mut out = Vec::new();
-        for _ in 0..cap_lines - 1 {
+        let mut pushed = 0;
+        while out.is_empty() {
             s.push(raw(&line), &mut |l| out.push(l));
+            pushed += 1;
         }
-        assert!(out.is_empty(), "below the cap everything is held");
-
-        s.push(raw(&line), &mut |l| out.push(l));
+        assert!(pushed < RESUME_HELD_LINES, "the bytes cap comes first");
         assert!(s.resume.is_none());
-        assert_eq!(out.len(), cap_lines + 1);
+        assert_eq!(out.len(), pushed + 1, "the notice, then every line");
         assert_eq!(&*out[0].text, RESUME_GAP_NOTICE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_line_that_would_pass_the_byte_cap_is_not_held() {
+        let mut s = resuming("shown").await;
+        let long = "x".repeat(MAX_LINE_BYTES - REPLAY_TS.len() - 1);
+        let line = LogLine::parse(&format!("{REPLAY_TS} {long}"), false);
+        let resume = s.resume.as_mut().unwrap();
+        while resume.hold(line.clone()).is_ok() {}
+        let slots = resume.held.capacity() * std::mem::size_of::<LogLine>();
+        assert!(resume.held_text_bytes + slots <= RESUME_HELD_BYTES);
+        let next = line.heap_bytes() - std::mem::size_of::<LogLine>();
+        assert!(resume.held_text_bytes + next + slots > RESUME_HELD_BYTES);
     }
 
     #[tokio::test(start_paused = true)]
@@ -929,13 +995,38 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_silent_read_holding_only_shown_lines_adds_no_notice() {
+    async fn a_silent_read_with_part_of_the_overlap_warns_and_keeps_it() {
         let mut s = resuming("shown").await;
         s.resume.as_mut().unwrap().shown.push(fingerprint("second"));
         s.push(raw(&format!("{REPLAY_TS} shown")), &mut |_| {});
         tokio::time::advance(RESUME_HELD_IDLE).await;
-        assert!(drain(&mut s).await.is_empty());
+        assert_eq!(
+            texts(&drain(&mut s).await),
+            [RESUME_GAP_NOTICE, "shown"],
+            "without the whole overlap it may be a new line"
+        );
         assert!(s.resume.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_confirmed_overlap_shows_only_what_follows_it() {
+        let mut s = resuming_all(&["a", "b"]).await;
+        let mut out = Vec::new();
+        for text in ["older", "a", "b", "new"] {
+            s.push(raw(&format!("{REPLAY_TS} {text}")), &mut |l| out.push(l));
+        }
+        assert_eq!(texts(&out), ["new"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn released_replay_lines_do_not_reset_the_backoff() {
+        let mut s = resuming("shown").await;
+        s.handle(Step::Opened(Err(LogError::retry("down"))), &mut |_| {});
+        s.handle(Step::Opened(Ok(stream::pending().boxed())), &mut |_| {});
+        s.resume_request();
+        s.push(raw(&format!("{REPLAY_TS} maybe seen")), &mut |_| {});
+        s.handle(Step::Line(Err(LogError::retry("reset"))), &mut |_| {});
+        assert_eq!(attempt(&s), 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -957,6 +1048,113 @@ mod tests {
         assert_eq!(texts(&released), [RESUME_GAP_NOTICE, "new"]);
         assert!(s.is_done());
         assert!(s.resume.is_none());
+    }
+
+    /// A stream reconnected after showing `shown`, in order, at [`REPLAY_TS`].
+    async fn resuming_all(shown: &[&str]) -> Stream {
+        let mut s = stream(&[], None);
+        drain(&mut s).await;
+        for text in shown {
+            s.push(raw(&format!("{REPLAY_TS} {text}")), &mut |_| {});
+        }
+        s.resume_request();
+        s
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_broken_read_releases_held_lines_before_the_reopen() {
+        let mut s = resuming("shown").await;
+        s.push(raw(&format!("{REPLAY_TS} new")), &mut |_| {});
+        let mut out = Vec::new();
+        s.handle(Step::Line(Err(LogError::retry("reset"))), &mut |l| {
+            out.push(l)
+        });
+        assert_eq!(texts(&out), [RESUME_GAP_NOTICE, "new"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_broken_read_still_finds_the_overlap_on_the_next_replay() {
+        let mut s = resuming_all(&["a", "b"]).await;
+        s.push(raw(&format!("{REPLAY_TS} a")), &mut |_| {});
+        s.handle(Step::Line(Err(LogError::retry("reset"))), &mut |_| {});
+
+        s.resume_request();
+        let mut out = Vec::new();
+        for text in ["a", "b", "next"] {
+            s.push(raw(&format!("{REPLAY_TS} {text}")), &mut |l| out.push(l));
+        }
+        assert_eq!(texts(&out), ["next"], "the replay is recognised again");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_repeated_text_without_the_overlap_is_not_dropped() {
+        let mut s = resuming_all(&["a", "b"]).await;
+        for _ in 0..2 {
+            s.push(raw(&format!("{REPLAY_TS} a")), &mut |_| {});
+        }
+        tokio::time::advance(RESUME_HELD_IDLE).await;
+        let released = drain(&mut s).await;
+        assert_eq!(texts(&released), [RESUME_GAP_NOTICE, "a", "a"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_replay_that_pauses_warns_before_it_goes_on() {
+        let mut s = resuming_all(&["a", "b"]).await;
+        s.push(raw(&format!("{REPLAY_TS} a")), &mut |_| {});
+        tokio::time::advance(RESUME_HELD_IDLE).await;
+        let mut out = drain(&mut s).await;
+        s.push(raw(&format!("{REPLAY_TS} b")), &mut |l| out.push(l));
+        assert_eq!(texts(&out), [RESUME_GAP_NOTICE, "a", "b"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn held_storage_never_passes_the_byte_cap() {
+        let mut s = resuming("shown").await;
+        let long = "x".repeat(MAX_LINE_BYTES - REPLAY_TS.len() - 1);
+        let line = format!("{REPLAY_TS} {long}");
+        let mut out = Vec::new();
+        while out.is_empty() {
+            s.push(raw(&line), &mut |l| out.push(l));
+            if let Some(resume) = &s.resume {
+                let lines: usize = resume.held.iter().map(LogLine::heap_bytes).sum();
+                let spare = resume.held.capacity() - resume.held.len();
+                let stored = lines + spare * std::mem::size_of::<LogLine>();
+                assert!(stored <= RESUME_HELD_BYTES, "{stored} bytes held");
+            }
+        }
+        assert_eq!(&*out[0].text, RESUME_GAP_NOTICE);
+        assert!(s.resume.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_line_that_grew_when_decoded_is_cut_to_the_line_limit() {
+        let text = "\u{FFFD}".repeat(MAX_LINE_BYTES / 2);
+        let mut out = Vec::new();
+        let mut s = stream(&[], None);
+        drain(&mut s).await;
+        s.push(raw(&format!("{REPLAY_TS} {text}")), &mut |l| out.push(l));
+        assert!(out[0].text.len() <= MAX_LINE_BYTES);
+        assert!(out[0].truncated);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_group_of_lines_that_grew_when_decoded_is_recognised() {
+        let line = |i: usize| {
+            let text = "\u{FFFD}".repeat(MAX_LINE_BYTES);
+            format!("{REPLAY_TS} {i} {text}")
+        };
+        let mut s = stream(&[], None);
+        drain(&mut s).await;
+        for i in 0..RESUME_GROUP {
+            s.push(raw(&line(i)), &mut |_| {});
+        }
+        s.resume_request();
+        let mut out = Vec::new();
+        for i in 0..RESUME_GROUP {
+            s.push(raw(&line(i)), &mut |l| out.push(l));
+        }
+        assert!(s.resume.is_none(), "the overlap was found");
+        assert!(out.is_empty(), "nothing repeats");
     }
 
     #[test]

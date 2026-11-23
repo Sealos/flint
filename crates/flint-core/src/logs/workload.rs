@@ -232,7 +232,7 @@ impl WorkloadFeed {
         self.streams.iter().filter(|e| !e.stream.is_done()).count()
     }
 
-    fn handle_watch(&mut self, step: WatchStep) {
+    fn handle_watch(&mut self, step: WatchStep, out: &mut Output) {
         match step {
             WatchStep::Resolved(Ok(selector)) => {
                 self.selector = Some(selector);
@@ -244,6 +244,7 @@ impl WorkloadFeed {
             | WatchStep::Opened(Err(e))
             | WatchStep::Event(Some(Err(e))) => {
                 if e.is_fatal() {
+                    self.release_held(out);
                     self.fail_at(e.message, e.hop);
                 } else {
                     self.retry_watch(Some(e));
@@ -275,8 +276,16 @@ impl WorkloadFeed {
         self.watch = Watch::Wait(next.sleep);
     }
 
+    /// Passes on what every stream holds for a reconnect, before the streams are dropped.
+    fn release_held(&mut self, out: &mut Output) {
+        for entry in &mut self.streams {
+            entry.stream.release_held(&mut |line| out.append(line));
+        }
+    }
+
     /// Ends the session: an error retrying cannot fix (the workload does not exist, access is
-    /// denied, the context now points elsewhere). Every stream stops; the lines stay.
+    /// denied, the context now points elsewhere). Every stream stops; the lines stay, so a caller
+    /// with running streams calls [`Self::release_held`] first.
     fn fail(&mut self, error: String) {
         self.fail_at(error, FailedHop::Unknown);
     }
@@ -561,13 +570,14 @@ impl Feed for WorkloadFeed {
     fn poll(&mut self, cx: &mut Context<'_>, out: &mut Output) -> Poll<()> {
         if let Poll::Ready(error) = self.poll_recheck(cx) {
             if let Some(error) = error {
+                self.release_held(out);
                 self.fail(error);
             }
             self.finish(out);
             return Poll::Ready(());
         }
         if let Poll::Ready(step) = self.watch.poll_step(cx) {
-            self.handle_watch(step);
+            self.handle_watch(step, out);
             self.finish(out);
             return Poll::Ready(());
         }
@@ -598,6 +608,7 @@ impl Feed for WorkloadFeed {
             self.cursor = (at + 1) % count;
             self.status_dirty |= changed;
             if let Some(error) = cluster_error {
+                self.release_held(out);
                 self.fail(error);
             } else if done {
                 self.after_stream_end();
@@ -1281,6 +1292,37 @@ mod tests {
             }
         );
         assert!(pods_of(&s).streams.is_empty());
+    }
+
+    // covers UP-45: lines held while a reconnect looks for its overlap survive the session ending.
+    #[tokio::test(start_paused = true)]
+    async fn a_fatal_pod_watch_error_keeps_the_lines_held_by_a_reconnect() {
+        let ts = "2026-01-01T00:00:00Z";
+        let mut run = start(32);
+        run.list(vec![pod("web-a", "a", &[("app", true)])]);
+        run.opened("web-a/app").await;
+        run.logs.send("web-a/app", &format!("{ts} shown"));
+        run.until(|s| s.lines.len() == 1).await;
+
+        let feed = run.logs.feeds.lock().unwrap()["web-a/app"].clone();
+        feed.unbounded_send(Err(LogError::retry("reset"))).unwrap();
+        let logs = run.logs.clone();
+        run.until(move |_| logs.opened().len() == 2).await;
+        run.until(|s| pods_of(s).live() == 1).await;
+        run.logs.send("web-a/app", &format!("{ts} new"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(run.rx.borrow().lines.len(), 1, "the line is held");
+
+        run.watch
+            .unbounded_send(Err(LogError::fatal("Forbidden: pods")))
+            .unwrap();
+        let s = run
+            .until(|s| matches!(s.state, LogState::Ended { .. }))
+            .await;
+        let lines = texts(&s);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[1].contains("may repeat"), "{lines:?}");
+        assert_eq!(lines[2], "[web-a/app] new");
     }
 
     // covers UP-45
