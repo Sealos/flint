@@ -17,7 +17,7 @@ use kube::api::{Api, ListParams, WatchEvent, WatchParams};
 use tokio::sync::Semaphore;
 
 use super::objects::{MAX_OBJECTS_PER_KIND, Tracked};
-use super::{CheckFailure, FailureCause, KindCheck, Shared, TelemetryTiming};
+use super::{CheckFailure, FailureCause, KindCheck, RequestGate, Shared, TelemetryTiming};
 use crate::api_error::{ApiError, ApiErrorKind};
 use crate::cluster::{ClusterError, SafeErrorText, Target, find_auth_error};
 
@@ -85,6 +85,7 @@ pub(super) struct KindFeed {
     pub(super) shared: Arc<Shared>,
     /// Shared by the kinds of a cluster.
     pub(super) limiter: Arc<Semaphore>,
+    pub(super) requests: RequestGate,
     pub(super) target: Target,
     pub(super) timing: TelemetryTiming,
 }
@@ -186,7 +187,8 @@ impl KindFeed {
         let mut items = Vec::new();
         let mut params = ListParams::default().limit(PAGE_SIZE);
         loop {
-            let page = tokio::time::timeout(self.timing.list_timeout, api.list(&params))
+            let listing = self.requests.run(api.list(&params));
+            let page = tokio::time::timeout(self.timing.list_timeout, listing)
                 .await
                 .map_err(|_| ListEnd::Failed(timed_out()))?
                 .map_err(|err| self.list_end(&err))?;
@@ -220,8 +222,8 @@ impl KindFeed {
         // Asks for bookmarks by default, which keep `version` fresh on a quiet kind.
         let params = WatchParams::default().timeout(self.timing.watch_timeout_secs);
         // Only the wait for response headers: a healthy watch may then stay quiet for long.
-        let opening = tokio::time::timeout(self.timing.list_timeout, api.watch(&params, version));
-        let stream = match opening.await {
+        let opening = self.requests.run(api.watch(&params, version));
+        let stream = match tokio::time::timeout(self.timing.list_timeout, opening).await {
             Ok(Ok(stream)) => stream,
             Ok(Err(err)) if is_expired(&err) => return WatchEnd::Expired,
             Ok(Err(err)) => return WatchEnd::Failed(failure_of(&err, &self.target)),

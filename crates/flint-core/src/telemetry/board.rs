@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::watch;
 
-use super::{SideReads, Telemetry, TelemetrySnapshot};
+use super::{RequestGate, SideReads, Telemetry, TelemetrySnapshot};
 use crate::cluster::ClusterId;
 use crate::metrics_trend::TrendStore;
 
@@ -63,6 +63,8 @@ impl Entry {
 pub(crate) struct TelemetryBoard {
     feeds: Arc<Mutex<BTreeMap<ClusterId, Entry>>>,
     version: watch::Sender<u64>,
+    /// Shared by every feed of this core whose credential is a token file.
+    token_file_requests: RequestGate,
 }
 
 impl Default for TelemetryBoard {
@@ -70,11 +72,21 @@ impl Default for TelemetryBoard {
         Self {
             feeds: Arc::default(),
             version: watch::channel(0).0,
+            token_file_requests: RequestGate::token_file_limit(),
         }
     }
 }
 
 impl TelemetryBoard {
+    /// The gate for a feed, by whether its client rereads a token file.
+    pub(crate) fn request_gate(&self, reads_token_file: bool) -> RequestGate {
+        if reads_token_file {
+            self.token_file_requests.clone()
+        } else {
+            RequestGate::default()
+        }
+    }
+
     fn feeds(&self) -> MutexGuard<'_, BTreeMap<ClusterId, Entry>> {
         self.feeds.lock().unwrap_or_else(PoisonError::into_inner)
     }
