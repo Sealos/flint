@@ -643,10 +643,11 @@ fn confirm_a_dialog(app: &App) -> Result<()> {
 fn assert_editor_keeps_keys(app: &App, exec: &FakeExec) -> Result<()> {
     let sent = exec.stdin().len();
     app.wait_for("/focus", Equals("detail_yaml".into()))?;
-    app.type_text("first: 1\n")?;
+    // Comments, so the text stays valid however many times it is typed.
+    app.type_text("# first\n")?;
     std::thread::sleep(PAST_DIALOG_EXIT);
     assert_eq!(app.state()?["focus"], "detail_yaml");
-    app.type_text("second: 2\n")?;
+    app.type_text("# second\n")?;
     std::thread::sleep(PAST_DIALOG_EXIT);
     assert_eq!(app.state()?["focus"], "detail_yaml");
     assert_eq!(exec.stdin().len(), sent, "keys left the editor");
