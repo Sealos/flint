@@ -65,6 +65,8 @@ pub struct OpenSetState {
     pub members: Vec<SetMemberState>,
     /// One per cluster while grouped by cluster, else empty.
     pub groups: Vec<SetGroupState>,
+    /// Saved members left out when the set opened, because they now point at another server.
+    pub left_out: Vec<String>,
     pub list: ListState,
 }
 
@@ -319,6 +321,8 @@ pub struct NavEntryState {
     pub cursor: bool,
     /// The watch-state marker: `loading`, `reconnecting` or `failed`.
     pub marker: Option<&'static str>,
+    /// With a cluster set open, how many members serve it (`2/3`), unless all of them do.
+    pub badge: Option<String>,
 }
 
 /// The open resource list.

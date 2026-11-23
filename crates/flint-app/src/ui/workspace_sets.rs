@@ -390,7 +390,7 @@ impl Workspace {
             let _ = this.update(cx, |ws, cx| {
                 match result {
                     Ok(saved) => ws.sets.saved = saved,
-                    Err(e) => ws.sets.error = Some(e.to_string()),
+                    Err(e) => ws.sets.error = Some(e.safe_reason()),
                 }
                 cx.notify();
             });
@@ -504,7 +504,7 @@ impl Workspace {
                         ws.sets.error = None;
                         done(ws, window, cx);
                     }
-                    Err(e) => ws.sets.error = Some(e.to_string()),
+                    Err(e) => ws.sets.error = Some(e.safe_reason()),
                 }
                 cx.notify();
             });
@@ -1389,12 +1389,13 @@ impl Workspace {
                         collapsed: group.collapsed,
                     })
                     .collect(),
+                left_out: run.left_out.clone(),
                 list: list.view_state(),
             }
         });
         ClusterSetsState {
             picking: sets.picking,
-            picked: sets.picked.clone(),
+            picked: sets.picked.iter().map(|p| p.context.clone()).collect(),
             saved: sets.saved.iter().map(|s| s.name.clone()).collect(),
             error: sets.error.clone(),
             open,
