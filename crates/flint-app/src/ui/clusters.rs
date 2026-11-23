@@ -300,6 +300,21 @@ impl ClustersModel {
         self.send(Command::SetDesktopNotifications(enabled));
     }
 
+    /// Sets whether `cluster` at `server` posts desktop alerts (`None` follows the global
+    /// setting). Written to `settings.toml`; the change comes back as a settings event.
+    pub fn set_cluster_alerts(
+        &mut self,
+        cluster: ClusterId,
+        server: String,
+        enabled: Option<bool>,
+    ) {
+        self.send(Command::SetClusterAlerts {
+            cluster,
+            server,
+            enabled,
+        });
+    }
+
     /// Tells the core which namespaces the user filters `cluster` on, for kinds the user may not
     /// list in all namespaces.
     pub fn set_namespace_filter(&mut self, cluster: ClusterId, namespaces: Vec<String>) {

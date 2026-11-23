@@ -141,6 +141,13 @@ pub enum Command {
     /// Turn desktop notifications on or off and write it to `settings.toml`. The change arrives
     /// back as `Event::SettingsChanged`.
     SetDesktopNotifications(bool),
+    /// Set whether `cluster` at `server` posts desktop alerts (`None` follows the global setting)
+    /// and write it to `settings.toml`. The change arrives back as `Event::SettingsChanged`.
+    SetClusterAlerts {
+        cluster: ClusterId,
+        server: String,
+        enabled: Option<bool>,
+    },
     /// The namespaces the user filters `cluster` on (empty: all). When the user may not list a
     /// kind in all namespaces, it is listed in these one by one; without a filter, in the
     /// context's default namespace, else in every namespace the user can list. The filter
@@ -285,6 +292,14 @@ pub(crate) enum Request {
     OpenOverview {
         id: u64,
         cluster: ClusterId,
+    },
+    /// [`Self::OpenOverview`] only if `cluster` is still the slot `generation`.
+    OpenOverviewOn {
+        id: u64,
+        cluster: ClusterId,
+        generation: u64,
+        /// True while the overview is registered on that slot.
+        live: watch::Sender<bool>,
     },
     CloseOverview {
         id: u64,
@@ -683,6 +698,32 @@ impl CoreHandle {
         OverviewInterest {
             id,
             requests: self.requests.clone(),
+            bound: None,
+        }
+    }
+
+    /// [`Self::open_overview`] for the slot `generation` of `cluster`. The core compares them as
+    /// it registers, so a context re-pointed meanwhile registers nothing, and
+    /// [`OverviewInterest::telemetry`] never reads the feed of a later slot.
+    pub fn open_overview_on(&self, cluster: &str, generation: u64) -> OverviewInterest {
+        let id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
+        let (live, seen) = watch::channel(false);
+        if matches!(self.read_binding(cluster), Ok(None)) {
+            let _ = self.requests.try_send(Request::OpenOverviewOn {
+                id,
+                cluster: cluster.to_owned(),
+                generation,
+                live,
+            });
+        }
+        OverviewInterest {
+            id,
+            requests: self.requests.clone(),
+            bound: Some(BoundOverview {
+                cluster: cluster.to_owned(),
+                board: self.telemetry.clone(),
+                live: seen,
+            }),
         }
     }
 
@@ -1347,6 +1388,37 @@ impl Drop for Subscription {
 pub struct OverviewInterest {
     id: u64,
     requests: async_channel::Sender<Request>,
+    /// Set by [`CoreHandle::open_overview_on`].
+    bound: Option<BoundOverview>,
+}
+
+/// Where an overview opened on one slot reads its feed.
+#[derive(Debug)]
+struct BoundOverview {
+    cluster: ClusterId,
+    board: crate::telemetry::TelemetryBoard,
+    live: watch::Receiver<bool>,
+}
+
+impl OverviewInterest {
+    /// The feed of the slot this overview was opened on. `None` until the core registers it, and
+    /// for good once that slot is replaced. The core clears the mark before it lists a later
+    /// slot's feed, so the mark is read after the feed.
+    pub fn telemetry(&self) -> Option<crate::telemetry::ClusterTelemetry> {
+        let bound = self.bound.as_ref()?;
+        let telemetry = bound.board.get(&bound.cluster);
+        (*bound.live.borrow()).then_some(telemetry).flatten()
+    }
+
+    /// Resolves once the core has registered this overview, or will never do so.
+    pub fn registered(&self) -> impl Future<Output = ()> + Send + 'static + use<> {
+        let live = self.bound.as_ref().map(|bound| bound.live.clone());
+        async move {
+            if let Some(mut live) = live {
+                let _ = live.wait_for(|registered| *registered).await;
+            }
+        }
+    }
 }
 
 impl Drop for OverviewInterest {
