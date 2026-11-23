@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use flint_core::handle::{MemberReport, MemberStatus};
+use flint_core::protection::WriteRefusal;
 use flint_core::settings::ClusterPin;
+use flint_core::write::{WriteError, WriteProposal, WriteReview};
 use flint_core::{
     ClusterSummary, ConnectionState, Event, KindId, KindSnapshot, NavEntry, SafeErrorText,
     ServerVersion, SyncState,
@@ -21,7 +23,7 @@ use super::super::actions::resource_actions_tests::LocalApi;
 use super::{SettingsDir, member_refusal};
 use crate::ui::confirm;
 use crate::ui::list::combined::row_id;
-use crate::ui::resource_actions::{ResourceAction, available, request};
+use crate::ui::resource_actions::{ResourceAction, available, request, target_of};
 use crate::ui::support_tests::{
     CURRENT_GENERATION, TestWorkspace, WAIT, discovery, kubeconfig_yaml, objects, open_workspace,
     open_workspace_with, standard_sections,
@@ -166,7 +168,7 @@ async fn a_saved_set_opens_its_combined_list(cx: &mut TestAppContext) {
     assert!(t.find(cx, "cluster-set-view").is_none());
 }
 
-/// Forwards to `upstream`, counting the PATCH requests that pass.
+/// Forwards to `upstream`, counting the PATCH, PUT and DELETE requests that pass.
 fn counting_proxy(upstream: &str) -> (String, Arc<AtomicUsize>) {
     let upstream = upstream.trim_start_matches("http://").to_owned();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -184,7 +186,11 @@ fn counting_proxy(upstream: &str) -> (String, Arc<AtomicUsize>) {
             std::thread::spawn(move || {
                 let mut buffer = [0; 16 * 1024];
                 while let Ok(read @ 1..) = from_client.read(&mut buffer) {
-                    if buffer[..read].starts_with(b"PATCH ") {
+                    let sent = &buffer[..read];
+                    if [&b"PATCH "[..], b"PUT ", b"DELETE "]
+                        .iter()
+                        .any(|verb| sent.starts_with(verb))
+                    {
                         counted.fetch_add(1, Ordering::SeqCst);
                     }
                     if to_server.write_all(&buffer[..read]).is_err() {
@@ -214,16 +220,24 @@ fn deployments_entry() -> NavEntry {
     }
 }
 
-// Two clusters each hold a Deployment `web` with one uid: the write reaches only the row's.
-#[gpui_kit::test]
-async fn a_rows_action_writes_only_to_its_cluster(cx: &mut TestAppContext) {
-    let dir = tempfile::tempdir().unwrap();
+/// A set of two fake API servers, each with a Deployment `web`, and `kind-beta`'s row open.
+struct OpenRow {
+    t: TestWorkspace,
+    alpha_url: String,
+    beta_url: String,
+    alpha_writes: Arc<AtomicUsize>,
+    beta_writes: Arc<AtomicUsize>,
+    _apis: (LocalApi, LocalApi),
+}
+
+async fn open_beta_row(cx: &mut TestAppContext, dir: &std::path::Path) -> OpenRow {
     let (alpha_api, beta_api) = (LocalApi::start(&[]), LocalApi::start(&[]));
-    let (alpha_url, alpha_patches) = counting_proxy(&alpha_api.url);
-    let (beta_url, beta_patches) = counting_proxy(&beta_api.url);
-    let t = open_workspace_with(cx, dir.path(), move |dir, _| {
+    let (alpha_url, alpha_writes) = counting_proxy(&alpha_api.url);
+    let (beta_url, beta_writes) = counting_proxy(&beta_api.url);
+    let urls = (alpha_url.clone(), beta_url.clone());
+    let t = open_workspace_with(cx, dir, move |dir, _| {
         let path = dir.join("kubeconfig");
-        let contexts = [("kind-alpha", &*alpha_url), ("kind-beta", &*beta_url)];
+        let contexts = [("kind-alpha", &*urls.0), ("kind-beta", &*urls.1)];
         std::fs::write(&path, kubeconfig_yaml(&contexts)).unwrap();
         vec![path]
     })
@@ -274,8 +288,19 @@ async fn a_rows_action_writes_only_to_its_cluster(cx: &mut TestAppContext) {
         detail.read(cx).replicas() == Some(2)
     })
     .await;
+    OpenRow {
+        t,
+        alpha_url,
+        beta_url,
+        alpha_writes,
+        beta_writes,
+        _apis: (alpha_api, beta_api),
+    }
+}
 
-    let workspace = t.workspace.clone();
+/// Offers a restart of the open row and waits for its confirmation.
+async fn offer_restart(cx: &mut TestAppContext, t: &TestWorkspace) {
+    let (workspace, window) = (t.workspace.clone(), t.window);
     cx.update_window(window, |_, window, cx| {
         workspace.update(cx, |ws, cx| {
             assert_eq!(available(ws, ResourceAction::RolloutRestart, cx), Ok(()));
@@ -287,19 +312,106 @@ async fn a_rows_action_writes_only_to_its_cluster(cx: &mut TestAppContext) {
         .await;
     cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
         .unwrap();
+}
+
+/// Points `kind-beta` at a new fake API server. Returns its count of writes.
+async fn repoint_beta(
+    cx: &mut TestAppContext,
+    dir: &std::path::Path,
+    row: &OpenRow,
+) -> (String, Arc<AtomicUsize>, LocalApi) {
+    let api = LocalApi::start(&[]);
+    let (url, writes) = counting_proxy(&api.url);
+    let contexts = [("kind-alpha", &*row.alpha_url), ("kind-beta", &*url)];
+    std::fs::write(dir.join("kubeconfig"), kubeconfig_yaml(&contexts)).unwrap();
+    let core = row.t.workspace.read_with(cx, |ws, cx| ws.core(cx).clone());
+    core.reload_kubeconfig().await.unwrap();
+    cx.run_until_parked();
+    (url, writes, api)
+}
+
+fn is_moved(result: Result<WriteReview, WriteError>) -> bool {
+    matches!(result, Err(WriteError::Refused(WriteRefusal::Moved { .. })))
+}
+
+// Two clusters each hold a Deployment `web` with one uid: the write reaches only the row's.
+#[gpui_kit::test]
+async fn a_rows_action_writes_only_to_its_cluster(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let row = open_beta_row(cx, dir.path()).await;
+    let t = &row.t;
+    offer_restart(cx, t).await;
     let shown = cx
         .update_window(t.window, |_, window, cx| confirm::shown(window, cx))
         .unwrap()
         .expect("the review");
     assert_eq!(shown.title, "Restart web on kind-beta?");
-    assert_eq!(beta_patches.load(Ordering::SeqCst), 0, "nothing ran yet");
+    assert_eq!(row.beta_writes.load(Ordering::SeqCst), 0, "nothing ran yet");
     t.click(cx, "ok");
-    let written = beta_patches.clone();
+    let written = row.beta_writes.clone();
     cx.wait_for(t.window, WAIT, move |_, _| {
         written.load(Ordering::SeqCst) == 1
     })
     .await;
-    assert_eq!(alpha_patches.load(Ordering::SeqCst), 0, "the other cluster");
+    assert_eq!(
+        row.alpha_writes.load(Ordering::SeqCst),
+        0,
+        "the other cluster"
+    );
+}
+
+// Re-pointed after the confirmation opened: Confirm reaches neither server.
+#[gpui_kit::test]
+async fn a_row_repointed_before_confirm_writes_nowhere(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let row = open_beta_row(cx, dir.path()).await;
+    let t = &row.t;
+    offer_restart(cx, t).await;
+    let (_url, replacement, _api) = repoint_beta(cx, dir.path(), &row).await;
+    if cx
+        .update_window(t.window, |_, window, _| window.find_all("ok").len())
+        .unwrap()
+        == 1
+    {
+        t.click(cx, "ok");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    assert_eq!(replacement.load(Ordering::SeqCst), 0, "the replacement");
+    assert_eq!(row.beta_writes.load(Ordering::SeqCst), 0, "the old server");
+    assert_eq!(row.alpha_writes.load(Ordering::SeqCst), 0, "the other one");
+}
+
+// The row's target keeps its pin whatever the context shows, and the core refuses it, for an
+// action and for a YAML edit alike, before any request is written.
+#[gpui_kit::test]
+async fn a_rows_writes_stay_pinned_and_the_gate_refuses_them(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let row = open_beta_row(cx, dir.path()).await;
+    let t = &row.t;
+    let detail = t.detail(cx).expect("the row's detail");
+    let (url, replacement, _api) = repoint_beta(cx, dir.path(), &row).await;
+    // The row closes on the change; a write already on its way still holds this view's pin.
+    let (target, core) = t.workspace.update(cx, |ws, cx| {
+        ws.detail = Some(detail.clone());
+        detail.update(cx, |d, _| d.set_server(Some(url.clone())));
+        (target_of(ws, cx).unwrap(), ws.core(cx).clone())
+    });
+    assert_eq!(target.server.as_deref(), Some(&*row.beta_url));
+    detail.read_with(cx, |d, _| {
+        assert_eq!(d.edit_server(), Some(&*row.beta_url), "a YAML edit too");
+    });
+    let action = core.review_write(target.clone(), WriteProposal::RolloutRestart);
+    assert!(is_moved(action.await), "a resource action");
+    let edit = WriteProposal::ApplyYaml {
+        yaml: "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n".to_owned(),
+    };
+    assert!(
+        is_moved(core.review_write(target, edit).await),
+        "a YAML edit"
+    );
+    assert_eq!(replacement.load(Ordering::SeqCst), 0, "the replacement");
+    assert_eq!(row.beta_writes.load(Ordering::SeqCst), 0, "the old server");
 }
 
 #[gpui_kit::test]
@@ -432,8 +544,12 @@ async fn a_row_tab_does_not_restart_once_its_context_moved(cx: &mut TestAppConte
     .await;
     t.workspace.read_with(cx, |ws, cx| {
         assert_eq!(ws.dock.read(cx).tab_ids(), vec![id], "nothing restarted");
+        // The sweep or the restart's own check may say it first.
         let why = ws.action_error().unwrap();
-        assert!(why.contains("changed"), "{why}");
+        assert!(
+            why.contains("changed") || why.contains("another server"),
+            "{why}"
+        );
     });
 }
 

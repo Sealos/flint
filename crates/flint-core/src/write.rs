@@ -430,23 +430,22 @@ async fn kind_of(core: &CoreHandle, target: &WriteTarget) -> Result<KindInfo, Wr
     if let Some(kind) = discovery.as_ref().and_then(|d| d.kind(&target.kind)) {
         return Ok(kind.clone());
     }
-    // Refused either way: a paused context has no discovery, so this only picks the words.
-    let refusal = match core.bound_write_client(&target.cluster, None).await {
-        Err(unreadable @ WriteError::KubeconfigUnreadable) => unreadable,
-        Err(protected @ WriteError::Refused(WriteRefusal::Protected { .. }))
-            if discovery.is_none() =>
-        {
-            protected
-        }
-        _ => return Err(WriteError::NotServed(target.kind.clone())),
-    };
     // A target on a server the context no longer shows has moved, whatever else holds.
-    match core
+    if let Err(moved @ WriteRefusal::Moved { .. }) = core
         .write_client(&target.cluster, Some(target.server.clone()))
         .await
     {
-        Err(moved @ WriteRefusal::Moved { .. }) => Err(moved.into()),
-        _ => Err(refusal),
+        return Err(moved.into());
+    }
+    // Refused either way: a paused context has no discovery, so this only picks the words.
+    match core.bound_write_client(&target.cluster, None).await {
+        Err(unreadable @ WriteError::KubeconfigUnreadable) => Err(unreadable),
+        Err(protected @ WriteError::Refused(WriteRefusal::Protected { .. }))
+            if discovery.is_none() =>
+        {
+            Err(protected)
+        }
+        _ => Err(WriteError::NotServed(target.kind.clone())),
     }
 }
 

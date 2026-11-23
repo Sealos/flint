@@ -374,13 +374,17 @@ fn not_offered(action: ResourceAction, detail: &DetailView) -> String {
 }
 
 /// The change to review for the selected row: its uid (a row of an API that sends none is keyed
-/// by its name, which is no uid), and no `resourceVersion`.
-fn target_of(ws: &Workspace, cx: &App) -> Option<WriteTarget> {
-    let detail = ws.detail_view()?;
-    let object = detail.read(cx).object().clone();
-    let server = ws
-        .cluster_summary(&object.cluster, cx)
-        .and_then(|c| c.info.server.clone());
+/// by its name, which is no uid), and no `resourceVersion`. A cluster set's row names the server
+/// it was admitted on, so the gate refuses the change if its context points elsewhere now.
+pub(in crate::ui) fn target_of(ws: &Workspace, cx: &App) -> Option<WriteTarget> {
+    let detail = ws.detail_view()?.read(cx);
+    let object = detail.object().clone();
+    let server = match detail.row_server() {
+        Some(pinned) => Some(pinned.to_owned()),
+        None => ws
+            .cluster_summary(&object.cluster, cx)
+            .and_then(|c| c.info.server.clone()),
+    };
     let uid = Some(object.uid.to_string()).filter(|u| !u.contains('/') && *u != object.name);
     Some(WriteTarget {
         cluster: object.cluster,
@@ -471,9 +475,21 @@ fn reviewed(
             start_review(ws, request, Some(note), window, cx);
         }
         Err(error) => ws.refuse(
-            refused(Opening::Write(request.action), &error.to_string()),
+            refused(Opening::Write(request.action), &error_text(&error)),
             cx,
         ),
+    }
+}
+
+/// A refused action as it is said here: the core's wording for a context that moved is about a
+/// shell tab. Only the wording differs: the refusal stands.
+fn error_text(error: &WriteError) -> String {
+    match error {
+        WriteError::Refused(flint_core::protection::WriteRefusal::Moved { cluster }) => format!(
+            "\"{cluster}\" points at another server than this object was opened from, so the \
+             change was refused; open the object again"
+        ),
+        other => other.to_string(),
     }
 }
 
@@ -551,7 +567,7 @@ fn written(
             start_review(ws, request, Some(note), window, cx);
         }
         Err(error) => ws.refuse(
-            refused(Opening::Write(request.action), &error.to_string()),
+            refused(Opening::Write(request.action), &error_text(&error)),
             cx,
         ),
     }

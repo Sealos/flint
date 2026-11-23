@@ -869,11 +869,12 @@ impl Workspace {
             .map_or(DetailTab::Overview, |d| d.read(cx).tab());
         self.clear_action_error(cx);
         let shown = self.cluster_names(cx).exact(member.context());
+        let server = member.server().to_owned();
         // Every read this view makes is bound to the member, in the core.
         let core = self.model.read(cx).core().bound_to(member);
         let detail = cx.new(|cx| {
             let mut view = DetailView::new(core, object, tab, window, cx);
-            view.set_row_cluster(shown, cx);
+            view.set_row_cluster(shown, server, cx);
             view
         });
         let list = list.downgrade();
