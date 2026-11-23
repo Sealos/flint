@@ -601,16 +601,20 @@ fn draining_text(keys: &[&WriteKey], names: impl FnOnce() -> ClusterNames) -> Op
 }
 
 /// What the strip calls each cluster of `keys`: its exact label, or its whole context on one line
-/// for all of them when two labels read the same. A context that left kubeconfig is named whole,
-/// and that can read like the short label of one still there.
+/// for all of them when two labels read the same. A context that left kubeconfig is named whole
+/// and marked removed, so it cannot pass for the label of a cluster still there, draining or not.
 fn strip_cluster_labels<'a>(
     keys: &[&'a WriteKey],
     names: &ClusterNames,
 ) -> HashMap<&'a str, String> {
+    let marked = |cluster: &str, label: String| match names.is_known(cluster) {
+        true => label,
+        false => format!("{label} (removed)"),
+    };
     let clusters: BTreeSet<&str> = keys.iter().map(|key| key.cluster.as_str()).collect();
     let read: BTreeSet<String> = clusters
         .iter()
-        .map(|cluster| cluster_name_key(&names.exact(cluster)))
+        .map(|cluster| cluster_name_key(&marked(cluster, names.exact(cluster))))
         .collect();
     let distinct = read.len() == clusters.len();
     clusters
@@ -620,7 +624,7 @@ fn strip_cluster_labels<'a>(
                 true => names.exact(cluster),
                 false => single_line(cluster),
             };
-            (cluster, label)
+            (cluster, marked(cluster, label))
         })
         .collect()
 }
@@ -1388,11 +1392,11 @@ mod tests {
         assert!(text.contains(&format!("{one}/a")), "{text}");
         assert!(text.contains(&format!("{two}/a")), "{text}");
 
-        // A cluster that left kubeconfig mid-drain is named whole.
+        // A cluster that left kubeconfig mid-drain is named whole and marked.
         let names = ClusterNames::new([blue.cluster.as_str()], &Default::default());
         let text = draining_text(&[&blue, &green], || names.clone()).unwrap();
         assert!(
-            text.contains("team-platform-production-green-cluster-main/a"),
+            text.contains("team-platform-production-green-cluster-main (removed)/a"),
             "{text}"
         );
     }
@@ -1410,7 +1414,16 @@ mod tests {
         assert_eq!(names.exact(eks), names.exact("prod"));
         assert_eq!(
             draining_text(&[&kept, &gone], || names.clone()).unwrap(),
-            format!("Draining 2 nodes: {eks}/node-1, prod/node-1…")
+            "Draining 2 nodes: prod/node-1, prod (removed)/node-1…"
+        );
+
+        // The removed context matches the label of a cluster that is not draining.
+        let other = WriteKey::new("staging", &nodes, None, "node-2");
+        let names = ClusterNames::new([eks, "staging"], &Default::default());
+        assert_eq!(names.exact(eks), "prod");
+        assert_eq!(
+            draining_text(&[&gone, &other], || names.clone()).unwrap(),
+            "Draining 2 nodes: prod (removed)/node-1, staging/node-2…"
         );
     }
 

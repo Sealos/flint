@@ -720,6 +720,11 @@ impl ClusterNames {
             .unwrap_or_else(|| single_line(context))
     }
 
+    /// Whether `context` was among those these names were built for, so still in kubeconfig.
+    pub fn is_known(&self, context: &str) -> bool {
+        self.labels.contains_key(context)
+    }
+
     /// The second line of `context`'s compact row: with a custom name, the real name comes
     /// first, so the row always says which cluster it is.
     pub fn subtitle(&self, context: &str, server_host: Option<&str>) -> String {
