@@ -272,6 +272,22 @@ fn an_unchecked_pass_keeps_the_hold_down_running() {
 }
 
 #[test]
+fn a_held_problem_settles_while_its_category_is_unchecked() {
+    let problem = workload(WorkloadKind::DaemonSet, "w");
+    let problems = [problem.clone()];
+    let unchecked = [ProblemCategory::ShortWorkloads];
+    let pass = ProblemSnapshot {
+        unchecked: &unchecked,
+        ..snapshot(&problems)
+    };
+    let mut summariser = ProblemSummariser::default();
+    summariser.summarise(&pass, now());
+    let later = now() + WORKLOAD_HOLD_DOWN;
+    summariser.summarise(&pass, later);
+    assert!(!summariser.is_settling(&problem, later));
+}
+
+#[test]
 fn a_clock_moved_back_does_not_extend_the_hold_down() {
     let problems = [workload(WorkloadKind::StatefulSet, "w")];
     let mut summariser = ProblemSummariser::default();

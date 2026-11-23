@@ -334,8 +334,8 @@ Two modes, set globally with an optional per-cluster override ([ADR-0008](./adr/
 - **All (default):** while a cluster is active, Flint watches every kind it discovered that can be listed and
   watched. Moving between lists is instant.
 - **On view:** Flint watches a kind only while a list or detail view for it is open. Uses less memory on very large
-  clusters, but a list may need a moment to load when you open it. The cluster has no telemetry feed in this mode, so
-  its problem counts and node metrics from that feed are not available.
+  clusters, but a list may need a moment to load when you open it. The cluster's telemetry feed runs in this mode only
+  while its overview is open, so its problems, capacity and node metrics are not available otherwise.
 
 When the user switches to another cluster, the old one stays warm. In mode All it keeps its watches, except the
 high-churn kinds no open view needs (Events, Leases, EndpointSlices), which start again when it becomes active. In
@@ -753,12 +753,15 @@ PodDisruptionBudget are reported back to the user instead of being retried forev
 ### Dashboards
 
 Each cluster opens on a dashboard, also reachable from **Overview** at the top of the resource tree
-([ADR-0017](./adr/0017-cluster-dashboards.md)). Its fixed layout has three parts: **problems now** (failing pods,
-not-ready nodes, Warning events in the last hour, pending PVCs, failed Jobs, workloads short of replicas), each count
-opening the matching filtered list; **capacity and usage** (CPU and memory used against allocatable, requests and
-limits against capacity, per node and in total, with a sparkline of the last hour); and **recent activity** (Warning
-events and rollouts). The sparklines come from Flint's own 15-second metrics-server samples, kept in a bounded
-in-memory buffer while the cluster is connected. Thresholds are typed settings with per-cluster overrides, edited from
+([ADR-0017](./adr/0017-cluster-dashboards.md)). Its fixed layout has three parts. **What's wrong** has a count per
+problem (failing pods, not-ready nodes, Warning events in the last hour, pending PVCs, failed Jobs, workloads short of
+replicas) opening the matching filtered list, the individual problems by severity, each opening its object, and recent
+Warning events. **Capacity left** shows CPU, memory and pod slots against allocatable, with requests, limits and live
+usage, then one row per node, most allocated first, and a sparkline of the last hour. Requests come from the watched
+pods, so they show without metrics-server; usage then shows as unavailable. **What's in the cluster** has the
+Kubernetes version, read once per feed, and counts of nodes, pods and workloads that open their lists. The feed keeps
+per-node totals rather than each pod's resource lists. The sparklines come from Flint's own 15-second metrics-server
+samples, kept in a bounded in-memory buffer while the cluster is connected. Thresholds are typed settings with per-cluster overrides, edited from
 the dashboard. The dashboard counts as an open view of the kinds it needs. A cluster set's dashboard shows one card per
 member, worst first, under a totals strip. The same components,
 scoped to one namespace, make the namespace overview (see [Namespaces](#namespaces)).

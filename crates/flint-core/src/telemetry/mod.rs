@@ -10,7 +10,8 @@
 //!
 //! A feed starts only from a gated connection and uses only its read client, so it cannot write,
 //! and it can only follow a connection the manager was allowed to make: a paused context has
-//! none to give. It lists and watches the seven kinds and reads node metrics, nothing else.
+//! none to give. It lists and watches the seven kinds, reads node metrics and asks once for the
+//! server version, nothing else.
 //! The owner of a connection stops the feed when it pauses or drops that connection.
 //!
 //! # Missing data is never zero
@@ -23,11 +24,13 @@
 //!
 //! # Bounds
 //!
-//! Objects are cut down to what classification reads, at most [`MAX_OBJECTS_PER_KIND`] per kind.
+//! Objects are cut down to what classification reads, and pods' requests and limits to per-node
+//! totals, at most [`MAX_OBJECTS_PER_KIND`] per kind.
 //! A kind over that limit is reported as [`KindCheck::TooLarge`] rather than counted in part.
 //! Retries back off up to [`TelemetryTiming::backoff_max`], and lists run a few at a time.
 
 mod board;
+mod capacity;
 mod feed;
 mod metrics;
 mod objects;
@@ -51,11 +54,12 @@ use crate::cluster::{SafeErrorText, Target};
 use crate::dashboard::{ProblemCounts, ProblemSnapshot, ProblemSummariser};
 use crate::metrics::MetricsError;
 use crate::metrics_trend::TrendStore;
-use crate::problems::{Problem, ProblemKind};
+use crate::problems::{Problem, ProblemId, ProblemKind};
 use crate::protection::ClusterClients;
 
 pub(crate) use board::TelemetryBoard;
 pub use board::{ClusterTelemetry, TelemetryUpdates};
+pub use capacity::{Allocatable, ClusterCapacity, Inventory, NodeCapacity, Reserved};
 use feed::KindFeed;
 pub use objects::MAX_OBJECTS_PER_KIND;
 use objects::Stores;
@@ -177,6 +181,18 @@ pub enum MetricsCheck {
     Unavailable(MetricsError),
 }
 
+/// The cluster's Kubernetes version, read once per feed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum VersionCheck {
+    /// The request has not finished.
+    #[default]
+    Waiting,
+    /// As the server reports it.
+    Known(String),
+    /// The request failed.
+    Unknown,
+}
+
 /// What is known about one cluster at one moment.
 #[derive(Clone, Debug)]
 pub struct TelemetrySnapshot {
@@ -190,8 +206,14 @@ pub struct TelemetrySnapshot {
     pub problems: Arc<[Problem]>,
     /// Problem kinds this pass could not fully determine.
     pub unchecked: Vec<ProblemKind>,
+    /// Problems in [`Self::problems`] not counted yet, because their hold-down has not passed.
+    pub settling: Vec<ProblemId>,
     pub counts: ProblemCounts,
     pub metrics: MetricsCheck,
+    /// `None` while nodes cannot be relied on.
+    pub capacity: Option<ClusterCapacity>,
+    pub inventory: Inventory,
+    pub version: VersionCheck,
 }
 
 impl TelemetrySnapshot {
@@ -204,8 +226,12 @@ impl TelemetrySnapshot {
             kinds: WatchedKind::ALL.map(|kind| (kind, KindCheck::Starting)),
             problems: Arc::from([]),
             unchecked: problems::ALL_PROBLEM_KINDS.to_vec(),
+            settling: Vec::new(),
             counts: summariser.summarise(&ProblemSnapshot::unavailable(), at),
             metrics: MetricsCheck::Waiting,
+            capacity: None,
+            inventory: Inventory::default(),
+            version: VersionCheck::Waiting,
         }
     }
 
@@ -233,8 +259,12 @@ impl TelemetrySnapshot {
             && self.kinds == other.kinds
             && self.problems == other.problems
             && self.unchecked == other.unchecked
+            && self.settling == other.settling
             && self.counts == other.counts
             && self.metrics == other.metrics
+            && self.capacity == other.capacity
+            && self.inventory == other.inventory
+            && self.version == other.version
     }
 }
 
@@ -281,6 +311,7 @@ impl Default for TelemetryTiming {
 struct Shared {
     stores: Mutex<Stores>,
     metrics: Mutex<MetricsCheck>,
+    version: Mutex<VersionCheck>,
     /// Something changed, so the next pass should run.
     dirty: Notify,
 }
@@ -293,6 +324,18 @@ impl Shared {
     fn set_metrics(&self, check: MetricsCheck) {
         *self.metrics.lock().unwrap_or_else(PoisonError::into_inner) = check;
         self.dirty.notify_one();
+    }
+
+    fn set_version(&self, check: VersionCheck) {
+        *self.version.lock().unwrap_or_else(PoisonError::into_inner) = check;
+        self.dirty.notify_one();
+    }
+
+    fn version(&self) -> VersionCheck {
+        self.version
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn metrics(&self) -> MetricsCheck {
@@ -329,6 +372,7 @@ impl Telemetry {
         let shared = Arc::new(Shared {
             stores: Mutex::default(),
             metrics: Mutex::default(),
+            version: Mutex::default(),
             dirty: Notify::new(),
         });
         let first = Arc::new(TelemetrySnapshot::starting(
@@ -366,6 +410,12 @@ impl Telemetry {
         tasks.spawn(kind.clone().run::<StatefulSet>());
         tasks.spawn(kind.clone().run::<DaemonSet>());
         tasks.spawn(kind.run::<ReplicaSet>());
+        tasks.spawn(read_version(
+            client.clone(),
+            requests.clone(),
+            Arc::clone(&shared),
+            timing.list_timeout,
+        ));
         tasks.spawn(metrics::run(
             Arc::clone(&cluster),
             client,
@@ -419,6 +469,21 @@ impl Telemetry {
     pub async fn stop(mut self) {
         self.tasks.shutdown().await;
     }
+}
+
+/// Asks for the server's version once. A failure stays unknown until the feed starts again.
+async fn read_version(
+    client: kube::Client,
+    requests: RequestGate,
+    shared: Arc<Shared>,
+    timeout: Duration,
+) {
+    let read = requests.run(crate::cluster::server_version(&client));
+    let check = match tokio::time::timeout(timeout, read).await {
+        Ok(Ok(version)) => VersionCheck::Known(version.git_version),
+        Ok(Err(_)) | Err(_) => VersionCheck::Unknown,
+    };
+    shared.set_version(check);
 }
 
 /// Connects to `context` the way the manager does and starts a feed on that connection.
