@@ -245,6 +245,57 @@ async fn lists_tables_with_columns_and_pages() {
     );
 }
 
+// covers #449: a pinned read is the object's GET alone, and one whose pin no longer holds sends
+// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pinned_read_is_one_get_and_a_changed_pin_sends_nothing() {
+    const OBJECT: &str = "/apis/apps/v1/namespaces/demo/deployments/web";
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, None).await;
+    let events = core.handle.events();
+    core.handle.send(Command::ReloadKubeconfig);
+    let pin = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Event::ClustersChanged(snapshot) = events.recv().await.expect("core running")
+                && let Some(cluster) = snapshot.clusters.iter().find(|c| c.info.name == CONTEXT)
+            {
+                break cluster.read_pin();
+            }
+        }
+    })
+    .await
+    .expect("the cluster list");
+    let kind = KindId::new("apps", "deployments");
+    let count = |wanted: &dyn Fn(&str) -> bool| {
+        server.requests().iter().filter(|r| wanted(&r.path)).count()
+    };
+    let is_events = |path: &str| path.ends_with("/events");
+    let is_object = |path: &str| path == OBJECT;
+    let events_before = count(&is_events);
+
+    let detail = core
+        .handle
+        .fetch_pinned_object(CONTEXT, &pin, &kind, Some("demo"), "web")
+        .await
+        .unwrap();
+    assert_eq!(detail.object["kind"], "Deployment");
+    assert!(detail.events.is_empty());
+    assert_eq!(count(&is_object), 1);
+    assert_eq!(count(&is_events), events_before, "no follow-up Events read");
+
+    let moved = flint_core::handle::ReadPin {
+        definition: pin.definition + 1,
+        server: pin.server.clone(),
+    };
+    let refused = core
+        .handle
+        .fetch_pinned_object(CONTEXT, &moved, &kind, Some("demo"), "web")
+        .await
+        .unwrap_err();
+    assert!(refused.contains("changed"), "{refused}");
+    assert_eq!(count(&is_object), 1, "a changed pin sends no request");
+}
+
 // covers UP-20
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_lists_follow_watch_events() {
@@ -1936,11 +1987,13 @@ async fn the_app_reads_logs_and_events_as_written() {
     );
 }
 
-/// Events about objects never get an answer: the server accepts the list and stalls.
+/// Events about objects never get an answer: the server accepts the list and stalls. Only the
+/// detail reads' own requests, in their namespace, so a cluster-wide list can't take the stall.
 fn stall_events(server: &FakeApiServer) {
     server.inject(
         Fault::delay(Duration::from_secs(3600))
             .on(&Gvr::core("events"))
+            .in_namespace("demo")
             .verb(Verb::List),
     );
 }
@@ -1958,12 +2011,12 @@ async fn until_in_flight(server: &FakeApiServer, count: usize, within: Duration,
     });
 }
 
-/// How many events requests have reached the fake server.
+/// How many detail reads' events requests have reached the fake server.
 fn events_requests(server: &FakeApiServer) -> usize {
     server
         .arrivals()
         .iter()
-        .filter(|r| r.is_about(&Gvr::core("events")))
+        .filter(|r| r.path == "/api/v1/namespaces/demo/events")
         .count()
 }
 
@@ -2165,6 +2218,53 @@ fn kubeconfig_with_user(server: &FakeApiServer, context: &str, user: serde_json:
 
 /// A core on two files giving `context` different tokens, active on the first. Broken, that file
 /// leaves the second's definition showing, which pauses the context.
+/// Waits until each of the seven kinds an overview needs has `open` watches or not.
+async fn until_overview_watches(server: &FakeApiServer, open: bool, what: &str) {
+    let kinds = [
+        Gvr::core("pods"),
+        Gvr::core("nodes"),
+        Gvr::new("batch", "v1", "jobs"),
+        Gvr::new("apps", "v1", "deployments"),
+        Gvr::new("apps", "v1", "statefulsets"),
+        Gvr::new("apps", "v1", "daemonsets"),
+        Gvr::new("apps", "v1", "replicasets"),
+    ];
+    tokio::time::timeout(WAIT, async {
+        while !kinds
+            .iter()
+            .all(|kind| (server.open_watches(kind) > 0) == open)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}: never reached"));
+}
+
+// covers UP-25: On view watches the overview's kinds only while it is showing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_on_view_the_overview_watches_its_kinds_until_it_is_left() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, None).await;
+    core.handle.discovery(CONTEXT).await.expect("connected");
+    // Past the manager's next pass, and long enough for a watch that should not exist to open.
+    core.handle.running_set().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(core.handle.telemetry(CONTEXT).is_none());
+    for kind in ["pods", "nodes"] {
+        assert_eq!(server.open_watches(&Gvr::core(kind)), 0, "{kind}");
+    }
+
+    let overview = core.handle.open_overview(CONTEXT);
+    until_overview_watches(&server, true, "watching after opening").await;
+    assert!(core.handle.telemetry(CONTEXT).is_some());
+
+    drop(overview);
+    until_overview_watches(&server, false, "no watch after leaving").await;
+    assert!(core.handle.telemetry(CONTEXT).is_none());
+    assert!(server.writes().is_empty());
+}
+
 async fn core_on_two_definitions(server: &FakeApiServer, context: &str) -> (Core, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let (first, second) = (dir.path().join("first"), dir.path().join("second"));

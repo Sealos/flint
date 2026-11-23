@@ -27,8 +27,8 @@ use crate::logs::{self, KubeLogSource, KubePodSource, LogError, SessionConfig};
 use crate::protection::{ClusterClients, GatedClient, SessionUnlocks, WriteRefusal, protection};
 use crate::read::{self, KindId, KindInfo};
 use crate::recheck::{
-    ContextHistory, ContextPin, EMPTY_SETTLE, EmptiedFiles, FreshDefinition, Pinned,
-    SettledDefinitions,
+    ContextHistory, ContextPin, DefinitionHolds, EMPTY_SETTLE, EmptiedFiles, FreshDefinition,
+    Pinned, SettledDefinitions,
 };
 use crate::settings::{self, AiScope, Settings, server_identity};
 use crate::store::{KindSnapshot, SyncState};
@@ -193,7 +193,7 @@ impl Cluster {
         self.watches.set_scope(scope);
     }
 
-    fn summary(&self, history: &ContextHistory) -> ClusterSummary {
+    fn summary(&self, history: &ContextHistory, provisional: bool, paused: bool) -> ClusterSummary {
         let shown = history.shown(&self.info.name, self.info.server.as_deref());
         ClusterSummary {
             info: self.info.clone(),
@@ -202,6 +202,8 @@ impl Cluster {
             definition: shown.definition,
             endpoint: shown.endpoint,
             confirmed: shown.confirmed,
+            provisional,
+            paused,
         }
     }
 }
@@ -487,6 +489,8 @@ pub(crate) struct ClusterManager {
     engine_config: Arc<EngineConfig>,
     /// Open subscriptions by id.
     subscriptions: HashMap<u64, (ClusterId, KindId)>,
+    /// Open overviews by id, with the slot generation each was opened on.
+    overviews: HashMap<u64, (ClusterId, u64)>,
     /// Running log sessions by id. They belong to no cluster slot, so they outlive cluster
     /// switches and kubeconfig reloads (UP-42).
     log_sessions: HashMap<u64, JoinHandle<()>>,
@@ -503,6 +507,9 @@ pub(crate) struct ClusterManager {
     /// Each context's definition when a load last showed it with no unreadable file that could
     /// change it.
     settled: SettledDefinitions,
+    /// What `unsettled` and `paused` say now, shared with the front end. Only shown: the gate
+    /// never reads it.
+    holds: DefinitionHolds,
 }
 
 impl ClusterManager {
@@ -514,6 +521,11 @@ impl ClusterManager {
     /// The running telemetry feeds, for [`crate::CoreHandle::telemetry`].
     pub(crate) fn telemetry_board(&self) -> crate::telemetry::TelemetryBoard {
         self.telemetry.clone()
+    }
+
+    /// The published holds, for [`crate::CoreHandle::definition_holds`].
+    pub(crate) fn definition_holds(&self) -> DefinitionHolds {
+        self.holds.clone()
     }
 
     pub(crate) fn new(
@@ -552,6 +564,7 @@ impl ClusterManager {
             hubs,
             engine_config,
             subscriptions: HashMap::new(),
+            overviews: HashMap::new(),
             log_sessions: HashMap::new(),
             log_budget,
             telemetry: Default::default(),
@@ -559,6 +572,7 @@ impl ClusterManager {
             unlocks,
             held: HashSet::new(),
             settled: SettledDefinitions::default(),
+            holds: DefinitionHolds::default(),
             reader: KubeconfigReader::default(),
             stalled_on: None,
             read_seq: 0,
@@ -701,6 +715,9 @@ impl ClusterManager {
                 self.subscriptions.insert(id, (cluster.clone(), kind));
                 self.reconcile(&cluster);
             }
+            Request::SubscribeMember { id, member, kind } => {
+                self.subscribe_member(id, member, kind);
+            }
             Request::Unsubscribe { id } => {
                 if let Some((cluster, kind)) = self.subscriptions.remove(&id) {
                     self.reconcile(&cluster);
@@ -714,6 +731,8 @@ impl ClusterManager {
                     }
                 }
             }
+            Request::OpenOverview { id, cluster } => self.open_overview(id, cluster),
+            Request::CloseOverview { id } => self.close_overview(id),
             Request::Discovery { cluster, reply } => {
                 let discovery = self
                     .clusters
@@ -729,6 +748,7 @@ impl ClusterManager {
                 id,
                 cluster,
                 server,
+                member,
                 subject,
                 options,
                 snapshots,
@@ -742,9 +762,10 @@ impl ClusterManager {
                 // context's confirmed definition names once its file loads again.
                 // Given the tab's server, pinned to exactly that: a request taken after the
                 // context moved (its fallback gone, say) is not pinned to where it is now.
-                let pin = match &server {
-                    Some(server) => self.contexts.pin(&cluster, server.as_deref()),
-                    None => self.session_pin(&cluster),
+                let pin = match (&member, &server) {
+                    (Some(member), _) => member.log_pin(&cluster),
+                    (None, Some(server)) => self.contexts.pin(&cluster, server.as_deref()),
+                    (None, None) => self.session_pin(&cluster),
                 };
                 let lookup: logs::ClientLookup = Arc::new(move || {
                     let (reply, rx) = oneshot::channel();
@@ -816,13 +837,28 @@ impl ClusterManager {
             } => {
                 let _ = reply.send(self.contexts.check(Pinned::Shell, &cluster, &pin));
             }
+            Request::AdmitRunningSet { pins, reply } => {
+                let _ = reply.send(self.admit_running_set(pins));
+            }
+            Request::CheckMember { member, reply } => {
+                let _ = reply.send(self.member_changed(&member));
+            }
+            Request::MemberClient { member, reply } => {
+                let _ = reply.send(self.member_client(&member));
+            }
             Request::FetchObject {
                 cluster,
                 kind,
                 namespace,
                 name,
+                member,
                 reply,
             } => {
+                // Before any client is taken: a row's read never reaches a replacement server.
+                if let Some(why) = member.as_ref().and_then(|m| self.member_changed(m)) {
+                    let _ = reply.send(Err(why));
+                    return;
+                }
                 let Some(client) = self.client(&cluster) else {
                     let _ = reply.send(Err(format!("\"{cluster}\" is not connected")));
                     return;
@@ -861,7 +897,64 @@ impl ClusterManager {
                     }
                 });
             }
+            Request::FetchPinnedObject {
+                cluster,
+                pin,
+                kind,
+                namespace,
+                name,
+                reply,
+            } => {
+                // In one step with taking the client, which a paused cluster doesn't give.
+                if let Some(why) = self.read_pin_changed(&cluster, &pin) {
+                    let _ = reply.send(Err(why));
+                    return;
+                }
+                let Some(client) = self.client(&cluster) else {
+                    let _ = reply.send(Err(format!("\"{cluster}\" is not connected")));
+                    return;
+                };
+                let info = self
+                    .cluster(&cluster)
+                    .and_then(|c| c.discovery.as_ref())
+                    .and_then(|d| d.kind(&kind).cloned());
+                let Some(info) = info else {
+                    let _ = reply.send(Err(format!("\"{cluster}\" does not serve {kind}")));
+                    return;
+                };
+                let target = cluster::Target::of(&self.kubeconfig.merged, &cluster);
+                tokio::spawn(async move {
+                    let mut reply = reply;
+                    let read = read::object_only(
+                        &client,
+                        &info,
+                        namespace.as_deref(),
+                        &name,
+                        read::DETAIL_TIMEOUT,
+                    );
+                    // Whoever asked is gone: stop the request, and start none if it is already.
+                    tokio::select! {
+                        biased;
+                        () = reply.closed() => {}
+                        result = read => {
+                            let result = result
+                                .map(Arc::new)
+                                .map_err(|e| e.for_target(&target).summary().to_string());
+                            let _ = reply.send(result);
+                        }
+                    }
+                });
+            }
         }
+    }
+
+    /// Why `cluster` is no longer what `pin` was taken from, if so.
+    fn read_pin_changed(&self, cluster: &str, pin: &crate::handle::ReadPin) -> Option<String> {
+        let slot = self.cluster(cluster)?;
+        let server = slot.info.server.as_deref();
+        let same = server == pin.server.as_deref()
+            && self.contexts.shown(cluster, server).definition == pin.definition;
+        (!same).then(|| format!("\"{cluster}\" changed since this view opened."))
     }
 
     fn watched_kinds(&self, cluster: &str) -> Vec<(KindId, crate::store::Feed)> {
@@ -1231,6 +1324,10 @@ impl ClusterManager {
                     self.read_again_later();
                 }
                 self.refresh_if_idle().await;
+                // A hold from a refused check ends here if this read was not applied.
+                if !self.reader.busy(&self.kubeconfig_paths) {
+                    self.publish_holds();
+                }
             }
             Internal::SettleEmptied => {
                 self.settle_armed = false;
@@ -1277,6 +1374,10 @@ impl ClusterManager {
                 } else {
                     self.fresh_write_gate(&cluster, &pin, &paths, read)
                 };
+                // Not writable on screen once a check of the files refused: the load comes next.
+                if answer.is_err() && (differs || timed_out || behind_a_read) {
+                    self.holds.hold_writes(&cluster);
+                }
                 let _ = reply.send(answer);
                 if behind_a_read {
                     // The running read's result comes through this loop and runs the refresh.
@@ -1294,6 +1395,10 @@ impl ClusterManager {
                     self.read_and_apply(None, why, |_, _| {}).await;
                 } else {
                     self.refresh_if_idle().await;
+                }
+                // A read still running keeps the hold: its load publishes.
+                if !self.reader.busy(&self.kubeconfig_paths) {
+                    self.publish_holds();
                 }
             }
             Internal::Connected {
@@ -1319,11 +1424,11 @@ impl ClusterManager {
                 // Dropped either way: the load that ends the pause connects again.
                 if paused {
                     slot.access.revoke();
-                    slot.state = ConnectionState::Disconnected;
+                    slot.state = ConnectionState::AwaitingConfirmation;
                     slot.reconnect = true;
                     self.emit(Event::ConnectionChanged {
                         cluster: cluster.clone(),
-                        state: ConnectionState::Disconnected,
+                        state: ConnectionState::AwaitingConfirmation,
                     });
                     // The pause already voided the member's attempt: this frees its slot.
                     let outcome = AttemptOutcome::Failed(cluster::SafeErrorText::reduced("paused"));
@@ -1429,6 +1534,7 @@ impl ClusterManager {
                     Ok(found) => {
                         // Groups that failed this time keep the kinds (and watches) they had,
                         // and discovery is retried with backoff until they answer again.
+                        let mut incomplete_groups = found.incomplete_groups();
                         let mut kinds = found.kinds;
                         if !found.skipped_groups.is_empty() {
                             partial = true;
@@ -1444,15 +1550,27 @@ impl ClusterManager {
                             );
                         }
                         let served: HashSet<KindId> = kinds.iter().map(KindInfo::id).collect();
-                        let behind = slot.crds.iter().any(|k| !served.contains(k))
-                            || slot.removed_crds.iter().any(|k| served.contains(k));
+                        // A CRD watch can be ahead of discovery, so these groups prove nothing yet.
+                        let mismatched: Vec<&KindId> = slot
+                            .crds
+                            .iter()
+                            .filter(|k| !served.contains(*k))
+                            .chain(slot.removed_crds.iter().filter(|k| served.contains(*k)))
+                            .collect();
+                        let behind = !mismatched.is_empty();
+                        incomplete_groups.extend(mismatched.iter().map(|k| k.group().to_owned()));
+                        incomplete_groups.sort();
+                        incomplete_groups.dedup();
                         if behind && !again && slot.discovery_retries < DISCOVERY_RETRIES {
                             slot.discovery_retries += 1;
                             retry = true;
                         }
                         tracing::info!(cluster, kinds = kinds.len(), "discovery done");
                         slot.watches.set_kinds(&kinds);
-                        slot.discovery = Some(Arc::new(ClusterDiscovery::new(kinds)));
+                        slot.discovery = Some(Arc::new(ClusterDiscovery::with_incomplete_groups(
+                            kinds,
+                            incomplete_groups,
+                        )));
                         None
                     }
                     Err(e) => {
@@ -1634,6 +1752,9 @@ impl ClusterManager {
         match &slot.state {
             ConnectionState::Failed(error) => Err(LogError::retry(format!(
                 "\"{cluster}\" is not connected: {error}"
+            ))),
+            ConnectionState::AwaitingConfirmation => Err(LogError::retry(format!(
+                "\"{cluster}\" is waiting for its kubeconfig to be confirmed"
             ))),
             ConnectionState::Disconnected => {
                 self.ensure_connected(cluster);
@@ -1939,6 +2060,18 @@ impl ClusterManager {
         self.held(id) || (self.cluster(id).is_some() && self.contexts.provisional(id))
     }
 
+    /// Every slot as front ends see it. `provisional` is [`Self::unsettled`], so it covers each
+    /// reason the write gate refuses an uncertain definition, a held slot included.
+    fn summaries(&self) -> Vec<ClusterSummary> {
+        self.clusters
+            .iter()
+            .map(|c| {
+                let name = &c.info.name;
+                c.summary(&self.contexts, self.unsettled(name), self.paused(name))
+            })
+            .collect()
+    }
+
     /// Whether nothing new may start for `id`: a held slot, or an entry that may be a later file's
     /// fallback and differs from the definition a load last confirmed. A provisional entry that
     /// matches it keeps connecting. One no load ever confirmed has nothing to differ from, so it
@@ -1948,6 +2081,48 @@ impl ClusterManager {
             || self
                 .cluster(id)
                 .is_some_and(|slot| self.settled.paused(&self.contexts, id, slot.fingerprint))
+    }
+
+    /// Makes `id`'s state say what [`Self::paused`] says: a paused slot with no connection waits,
+    /// and one whose pause ended is disconnected, for the usual paths to connect it. An attempt
+    /// still running keeps `Connecting`: its result lands here as a wait.
+    fn show_pause_state(&mut self, id: &str) {
+        let paused = self.paused(id);
+        let Some(slot) = self.cluster_mut(id) else {
+            return;
+        };
+        match &slot.state {
+            ConnectionState::AwaitingConfirmation if !paused => {
+                slot.state = ConnectionState::Disconnected;
+            }
+            ConnectionState::Disconnected if paused && slot.client.is_none() => {
+                slot.state = ConnectionState::AwaitingConfirmation;
+            }
+            ConnectionState::Failed(_) if paused && slot.client.is_none() => {
+                slot.reconnect = true;
+                slot.state = ConnectionState::AwaitingConfirmation;
+            }
+            ConnectionState::Connecting
+                if paused && slot.client.is_none() && slot.connect_task.is_none() =>
+            {
+                slot.reconnect = true;
+                slot.state = ConnectionState::AwaitingConfirmation;
+            }
+            _ => {}
+        }
+    }
+
+    /// Publishes what the gate and the sessions go by now, for front ends to read directly.
+    fn publish_holds(&self) {
+        let of = |test: &dyn Fn(&str) -> bool| {
+            self.clusters
+                .iter()
+                .map(|c| c.info.name.clone())
+                .filter(|name| test(name))
+                .collect()
+        };
+        self.holds
+            .publish(of(&|id| self.unsettled(id)), of(&|id| self.paused(id)));
     }
 
     /// Reads the kubeconfig files now, ahead of the file watcher, and says whether they still
@@ -2104,6 +2279,7 @@ impl ClusterManager {
         let internal = self.internal_tx.clone();
         let attempt = self.next_attempt;
         let paused = self.paused(id);
+        self.show_pause_state(id);
         let role = self.connection_role(id);
         let runs_a_command = self.definition_runs_a_command(id);
         let unbound = self.members.contains_key(id)
@@ -2360,6 +2536,7 @@ impl ClusterManager {
             exist: path_exist,
             blank,
             consistent: _,
+            held_still: _,
             order: _,
         } = read;
         let settling = self.still_settling(&blank);
@@ -2418,8 +2595,11 @@ impl ClusterManager {
                     fresh.namespace_filter = old.namespace_filter.clone();
                     fresh.update_scope();
                     fresh.generation = self.next_generation();
-                    fresh.reconnect =
-                        old.reconnect || !matches!(old.state, ConnectionState::Disconnected);
+                    fresh.reconnect = old.reconnect
+                        || !matches!(
+                            old.state,
+                            ConnectionState::Disconnected | ConnectionState::AwaitingConfirmation
+                        );
                     fresh
                 }
                 None => {
@@ -2458,6 +2638,12 @@ impl ClusterManager {
                 self.held.insert(name.clone());
             }
         }
+        // In one step with the state the gate reads, and before anything is told of this load.
+        self.publish_holds();
+        let names: Vec<ClusterId> = self.clusters.iter().map(|c| c.info.name.clone()).collect();
+        for name in &names {
+            self.show_pause_state(name);
+        }
         discarded.extend(old.values().filter_map(|slot| slot.member_attempt));
         // Dropped only when this load ends, and their clients must stop before anything else.
         for slot in old.values_mut() {
@@ -2491,11 +2677,7 @@ impl ClusterManager {
         }
 
         let snapshot = ClustersSnapshot {
-            clusters: self
-                .clusters
-                .iter()
-                .map(|c| c.summary(&self.contexts))
-                .collect(),
+            clusters: self.summaries(),
             errors: loaded.errors.clone(),
             paths: path_exist,
         };
@@ -4965,7 +5147,7 @@ mod tests {
 
         manager.activate("dev".to_owned());
         let slot = manager.cluster("dev").unwrap();
-        assert!(matches!(slot.state, ConnectionState::Disconnected));
+        assert_eq!(slot.state, ConnectionState::AwaitingConfirmation);
         let attempt = slot.attempt;
 
         rewrite_file(&mut manager, &path, &yaml).await;
@@ -5058,6 +5240,113 @@ users:
         assert!(telemetry::reads_token_file(&config, "file"));
         assert!(!telemetry::reads_token_file(&config, "inline"));
         assert!(!telemetry::reads_token_file(&config, "missing"));
+    }
+
+    // covers UP-25: On view watches only open views, so the feed follows the cluster's mode.
+    #[tokio::test]
+    async fn a_feed_runs_only_in_watch_mode_all() {
+        use crate::settings::WatchMode;
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager =
+            manager_reading(dir.path(), &kubeconfig_with("https://127.0.0.1:1")).await;
+        land_connection(&mut manager).await;
+        manager.active = Some("dev".to_owned());
+        assert!(dev_has_feed(&mut manager), "the default mode");
+
+        manager.settings = Arc::new(Settings {
+            watch_mode: WatchMode::OnView,
+            ..Settings::default()
+        });
+        assert!(!dev_has_feed(&mut manager), "on view by default");
+
+        manager.settings = Arc::new(Settings {
+            watch_mode: WatchMode::OnView,
+            cluster_watch_mode: [("dev".to_owned(), WatchMode::All)].into(),
+            ..Settings::default()
+        });
+        assert!(dev_has_feed(&mut manager), "all for this cluster");
+
+        manager.settings = Arc::new(Settings {
+            cluster_watch_mode: [("dev".to_owned(), WatchMode::OnView)].into(),
+            ..Settings::default()
+        });
+        assert!(!dev_has_feed(&mut manager), "on view for this cluster");
+    }
+
+    /// `dev` connected and active, in watch mode On view.
+    async fn on_view_manager(dir: &std::path::Path) -> ClusterManager {
+        let mut manager = manager_reading(dir, &kubeconfig_with("https://127.0.0.1:1")).await;
+        land_connection(&mut manager).await;
+        manager.active = Some("dev".to_owned());
+        manager.settings = Arc::new(Settings {
+            watch_mode: crate::settings::WatchMode::OnView,
+            ..Settings::default()
+        });
+        manager
+    }
+
+    fn open_dev_overview(manager: &mut ClusterManager, id: u64) {
+        manager.handle_request(Request::OpenOverview {
+            id,
+            cluster: "dev".to_owned(),
+        });
+    }
+
+    // covers UP-25: the overview is an open view of the kinds its feed watches.
+    #[tokio::test]
+    async fn in_on_view_a_feed_runs_only_while_the_overview_is_showing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = on_view_manager(dir.path()).await;
+        assert!(!dev_has_feed(&mut manager), "no overview open");
+
+        open_dev_overview(&mut manager, 1);
+        assert!(dev_has_feed(&mut manager), "opened");
+        open_dev_overview(&mut manager, 2);
+        manager.handle_request(Request::CloseOverview { id: 1 });
+        assert!(dev_has_feed(&mut manager), "another is still open");
+        manager.handle_request(Request::CloseOverview { id: 2 });
+        assert!(!dev_has_feed(&mut manager), "left");
+        assert!(manager.overviews.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_overview_feed_stops_with_the_active_cluster_and_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = on_view_manager(dir.path()).await;
+        open_dev_overview(&mut manager, 1);
+        assert!(dev_has_feed(&mut manager));
+
+        // Even a running-set member needs to be the cluster shown.
+        join_dev(&mut manager);
+        manager.active = Some("other".to_owned());
+        assert!(!dev_has_feed(&mut manager), "switched away");
+        manager.active = Some("dev".to_owned());
+        assert!(dev_has_feed(&mut manager), "back on the same generation");
+
+        manager.cluster_mut("dev").unwrap().generation += 1;
+        assert!(!dev_has_feed(&mut manager), "the context started over");
+    }
+
+    #[tokio::test]
+    async fn an_open_overview_starts_no_feed_on_a_paused_cluster() {
+        for second in pauses() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut manager, _, first) = pausable(dir.path(), &second).await;
+            manager.active = Some("dev".to_owned());
+            land_connection(&mut manager).await;
+            manager.settings = Arc::new(Settings {
+                watch_mode: crate::settings::WatchMode::OnView,
+                ..Settings::default()
+            });
+            open_dev_overview(&mut manager, 1);
+            assert!(dev_has_feed(&mut manager));
+
+            rewrite_file(&mut manager, &first, UNREADABLE).await;
+            assert!(manager.paused("dev"));
+            assert!(!dev_has_feed(&mut manager), "stopped by the pause");
+            open_dev_overview(&mut manager, 2);
+            assert!(!dev_has_feed(&mut manager), "opening starts nothing");
+        }
     }
 
     #[tokio::test]
@@ -5513,7 +5802,7 @@ users:
             })
             .await;
         let slot = manager.cluster("dev").unwrap();
-        assert!(matches!(slot.state, ConnectionState::Disconnected));
+        assert_eq!(slot.state, ConnectionState::AwaitingConfirmation);
 
         let next = manager.next_attempt;
         rewrite_file(&mut manager, &first, &confirmed).await;
@@ -5665,6 +5954,95 @@ users:
         assert!(running_set::needs_sign_in(&error));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!ran.exists(), "the command never started");
+    }
+
+    // A set is admitted whole or not at all, on the exact servers it was checked on.
+    #[tokio::test]
+    async fn a_stale_pin_admits_no_member_of_the_set() {
+        use crate::settings::ClusterPin;
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://remote-a")).await;
+        let other = ClusterPin::new("other", "https://other");
+        let refused = manager
+            .admit_running_set(vec![
+                other.clone(),
+                ClusterPin::new("dev", "https://replacement"),
+            ])
+            .unwrap_err();
+        assert!(refused.contains("another server"), "{refused}");
+        assert!(manager.members.is_empty(), "nobody joined");
+
+        let admitted = manager
+            .admit_running_set(vec![ClusterPin::new("dev", "https://remote-a"), other])
+            .unwrap();
+        assert_eq!(manager.members.len(), 2);
+        assert_eq!(admitted[0].server(), "https://remote-a");
+        assert_eq!(manager.member_changed(&admitted[0]), None);
+    }
+
+    // Moved and put back, a member's reads stay refused: it is not the connection admitted.
+    #[tokio::test]
+    async fn a_moved_member_is_refused_before_a_client_even_once_moved_back() {
+        use crate::settings::ClusterPin;
+        let dir = tempfile::tempdir().unwrap();
+        let original = kubeconfig_with("https://remote-a");
+        let mut manager = manager_reading(dir.path(), &original).await;
+        let admitted = manager
+            .admit_running_set(vec![
+                ClusterPin::new("dev", "https://remote-a"),
+                ClusterPin::new("other", "https://other"),
+            ])
+            .unwrap();
+        let dev = &admitted[0];
+        assert!(manager.member_client(dev).is_err(), "not connected yet");
+
+        rewrite(
+            &mut manager,
+            dir.path(),
+            &kubeconfig_with("https://replacement"),
+        )
+        .await;
+        let why = manager.member_changed(dev).expect("moved");
+        assert!(why.contains("changed"), "{why}");
+        assert_eq!(manager.member_client(dev).err(), Some(why));
+
+        rewrite(&mut manager, dir.path(), &original).await;
+        assert!(manager.member_changed(dev).is_some(), "moved back");
+        assert_eq!(
+            manager.member_changed(&admitted[1]),
+            None,
+            "other is intact"
+        );
+    }
+
+    // A member that left its server, even if it came back, gets no watch from a new subscription.
+    #[tokio::test]
+    async fn a_changed_member_starts_no_subscription() {
+        use crate::settings::ClusterPin;
+        let dir = tempfile::tempdir().unwrap();
+        let original = kubeconfig_with("https://remote-a");
+        let mut manager = manager_reading(dir.path(), &original).await;
+        let admitted = manager
+            .admit_running_set(vec![
+                ClusterPin::new("dev", "https://remote-a"),
+                ClusterPin::new("other", "https://other"),
+            ])
+            .unwrap();
+        let kind = KindId::pods();
+        manager.subscribe_member(1, admitted[0].clone(), kind.clone());
+        assert!(manager.subscriptions.contains_key(&1), "still admitted");
+
+        rewrite(
+            &mut manager,
+            dir.path(),
+            &kubeconfig_with("https://replacement"),
+        )
+        .await;
+        manager.subscribe_member(2, admitted[0].clone(), kind.clone());
+        rewrite(&mut manager, dir.path(), &original).await;
+        manager.subscribe_member(3, admitted[0].clone(), kind);
+        assert!(!manager.subscriptions.contains_key(&2), "moved");
+        assert!(!manager.subscriptions.contains_key(&3), "moved back");
     }
 
     // A reload that replaces the active member's credential on the same server binds the new
@@ -6222,7 +6600,7 @@ users:
             manager.activate("dev".to_owned());
             manager.ensure_connected("dev");
             let slot = manager.cluster("dev").unwrap();
-            assert!(matches!(slot.state, ConnectionState::Disconnected));
+            assert_eq!(slot.state, ConnectionState::AwaitingConfirmation);
             assert_eq!(manager.next_attempt, next, "no attempt started");
 
             rewrite_file(&mut manager, &first, &yaml).await;
@@ -6269,7 +6647,7 @@ users:
                 let slot = manager.cluster("dev").unwrap();
                 assert!(slot.client.is_none() && slot.write_credential.is_none());
                 assert!(!slot.discovering, "no discovery on a discarded result");
-                assert!(matches!(slot.state, ConnectionState::Disconnected));
+                assert_eq!(slot.state, ConnectionState::AwaitingConfirmation);
 
                 rewrite_file(&mut manager, &first, &yaml).await;
                 let slot = manager.cluster("dev").unwrap();
@@ -6660,7 +7038,7 @@ users:
         assert_eq!(manager.next_attempt, next, "nothing started");
         let slot = manager.cluster("dev").unwrap();
         assert!(slot.client.is_none());
-        assert!(matches!(slot.state, ConnectionState::Disconnected));
+        assert_eq!(slot.state, ConnectionState::AwaitingConfirmation);
         manager.unlocks.unlock("dev", "https://127.0.0.1:1");
         assert_eq!(
             manager.shell_client("dev", None).err(),
@@ -6668,6 +7046,193 @@ users:
                 cluster: "dev".to_owned(),
             })
         );
+    }
+
+    // A paused slot with no connection says it waits instead of offering a Retry the core would
+    // refuse, whatever it showed before, and the load that ends the pause clears that.
+    #[tokio::test]
+    async fn a_paused_slot_without_a_connection_waits_until_the_pause_ends() {
+        for before in [
+            ConnectionState::Disconnected,
+            ConnectionState::Connecting,
+            ConnectionState::Failed(cluster::SafeErrorText::fixed("offline")),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let [second, _] = pauses();
+            let (mut manager, yaml, first) = pausable(dir.path(), &second).await;
+            manager.cluster_mut("dev").unwrap().state = before.clone();
+            rewrite_file(&mut manager, &first, UNREADABLE).await;
+            assert!(manager.paused("dev"));
+            let slot = manager.cluster("dev").unwrap();
+            assert_eq!(
+                slot.state,
+                ConnectionState::AwaitingConfirmation,
+                "{before:?}"
+            );
+
+            rewrite_file(&mut manager, &first, &yaml).await;
+            assert!(!manager.paused("dev"));
+            let slot = manager.cluster("dev").unwrap();
+            assert_ne!(
+                slot.state,
+                ConnectionState::AwaitingConfirmation,
+                "{before:?}"
+            );
+        }
+    }
+
+    // A first-seen context behind a broken file never waits: it has nothing to differ from.
+    #[tokio::test]
+    async fn a_first_seen_context_never_shows_a_wait() {
+        let with_token = kubeconfig_with("https://127.0.0.1:1")
+            .replace("user: {}", "user:\n    token: inline-secret");
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading_two(dir.path(), UNREADABLE, &with_token).await;
+        assert!(manager.contexts.provisional("dev") && !manager.paused("dev"));
+        let slot = manager.cluster("dev").unwrap();
+        assert_eq!(slot.state, ConnectionState::Disconnected);
+        assert!(manager.holds.writes_paused("dev"));
+        assert!(!manager.holds.sessions_paused("dev"));
+        manager.show_pause_state("dev");
+        let slot = manager.cluster("dev").unwrap();
+        assert_eq!(slot.state, ConnectionState::Disconnected);
+    }
+
+    // What front ends read directly is what the gate goes by, from the same step of a load.
+    #[tokio::test]
+    async fn the_published_holds_follow_the_gate() {
+        for second in pauses() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut manager, yaml, first) = pausable(dir.path(), &second).await;
+            assert!(!manager.holds.writes_paused("dev"));
+
+            rewrite_file(&mut manager, &first, UNREADABLE).await;
+            assert!(manager.unsettled("dev") && manager.holds.writes_paused("dev"));
+            assert_eq!(manager.holds.sessions_paused("dev"), manager.paused("dev"));
+
+            rewrite_file(&mut manager, &first, &yaml).await;
+            assert!(!manager.holds.writes_paused("dev"));
+            assert!(!manager.holds.sessions_paused("dev"));
+        }
+    }
+
+    // A fresh read that refuses a write shows as paused before the answer is out, and the next
+    // publish goes back to what the loaded state says.
+    #[test]
+    fn a_refused_validation_holds_until_the_next_publish() {
+        let holds = crate::recheck::DefinitionHolds::default();
+        holds.publish(HashSet::new(), HashSet::new());
+        holds.hold_writes("dev");
+        assert!(holds.writes_paused("dev") && !holds.sessions_paused("dev"));
+        holds.publish(HashSet::new(), HashSet::new());
+        assert!(!holds.writes_paused("dev"));
+    }
+
+    // A CRD the watch reported before discovery lists it, or one it removed that discovery still
+    // lists, makes its group incomplete until discovery catches up.
+    #[tokio::test]
+    async fn a_crd_mismatch_marks_its_group_incomplete() {
+        use crate::discovery::tests::kind;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, _, _) = pausable(dir.path(), NO_CONTEXTS).await;
+        manager.active = Some("dev".to_owned());
+        land_connection(&mut manager).await;
+        let attempt = manager.cluster("dev").unwrap().attempt;
+        let widgets = || kind("example.com", "Widget", "widgets", true, &["get", "list"]);
+        let gadgets = || kind("gone.example", "Gadget", "gadgets", true, &["get", "list"]);
+        let slot = manager.cluster_mut("dev").unwrap();
+        slot.crds.insert(widgets().id());
+        slot.removed_crds.insert(gadgets().id());
+
+        for (kinds, expected) in [
+            (vec![gadgets()], vec!["example.com", "gone.example"]),
+            (vec![widgets()], Vec::new()),
+        ] {
+            manager
+                .handle_internal(Internal::Discovered {
+                    cluster: "dev".into(),
+                    attempt,
+                    result: Ok(read::DiscoveredKinds {
+                        kinds,
+                        ..Default::default()
+                    }),
+                })
+                .await;
+            let slot = manager.cluster("dev").unwrap();
+            let discovery = slot.discovery.as_ref().unwrap();
+            assert_eq!(discovery.incomplete_groups, expected);
+        }
+    }
+
+    // What a summary says about writes is what the gate does, held slots and fallbacks alike.
+    #[tokio::test]
+    async fn a_summary_is_provisional_exactly_while_the_gate_refuses_for_it() {
+        // With a pin taken now, so only the definition's state can refuse it.
+        let refused = |manager: &ClusterManager| {
+            let pin = manager.session_pin("dev");
+            manager.write_pin_gate("dev", &pin).is_err()
+        };
+        let provisional = |manager: &ClusterManager| {
+            let summaries = manager.summaries();
+            summaries
+                .iter()
+                .find(|c| c.info.name == "dev")
+                .unwrap()
+                .provisional
+        };
+        for second in pauses() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut manager, yaml, first) = pausable(dir.path(), &second).await;
+            // Unlocked, so protection is not what refuses it below.
+            manager.unlocks.unlock("dev", "https://127.0.0.1:1");
+            assert!(!provisional(&manager) && !refused(&manager));
+
+            rewrite_file(&mut manager, &first, UNREADABLE).await;
+            assert!(provisional(&manager) && refused(&manager));
+
+            rewrite_file(&mut manager, &first, &yaml).await;
+            assert!(!provisional(&manager) && !refused(&manager));
+        }
+    }
+
+    // Skipped and stale groups both reach the discovery a front end gets, and a full discovery
+    // afterwards clears them.
+    #[tokio::test]
+    async fn discovery_says_which_groups_are_incomplete() {
+        use crate::discovery::tests::kind;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, _, _) = pausable(dir.path(), NO_CONTEXTS).await;
+        manager.active = Some("dev".to_owned());
+        land_connection(&mut manager).await;
+        let attempt = manager.cluster("dev").unwrap().attempt;
+        let pods = || vec![kind("", "Pod", "pods", true, &["get", "list", "watch"])];
+
+        let partial = read::DiscoveredKinds {
+            kinds: pods(),
+            skipped_groups: vec!["metrics.k8s.io".into()],
+            stale_groups: vec!["example.com".into(), "metrics.k8s.io".into()],
+        };
+        for (found, expected) in [
+            (partial, vec!["example.com", "metrics.k8s.io"]),
+            (
+                read::DiscoveredKinds {
+                    kinds: pods(),
+                    ..Default::default()
+                },
+                Vec::new(),
+            ),
+        ] {
+            manager
+                .handle_internal(Internal::Discovered {
+                    cluster: "dev".into(),
+                    attempt,
+                    result: Ok(found),
+                })
+                .await;
+            let slot = manager.cluster("dev").unwrap();
+            let discovery = slot.discovery.as_ref().unwrap();
+            assert_eq!(discovery.incomplete_groups, expected);
+        }
     }
 
     // The old connection is out of the foreground before the new selection can be seen.
@@ -6965,6 +7530,7 @@ users:
             id: 1,
             cluster: "dev".into(),
             server: taken_late.then_some(shown),
+            member: None,
             subject: LogSubject::Pod(target),
             options: LogOptions::default(),
             snapshots,

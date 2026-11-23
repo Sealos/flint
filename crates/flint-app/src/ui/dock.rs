@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use flint_core::ClusterId;
+use flint_core::compare::CompareTarget;
 
 use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -37,6 +38,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::activity_view::ActivityView;
+use super::compare::CompareView;
 pub use super::dock_model::TabStatus;
 use super::dock_model::{self, LiveSessions, TabCluster, chip_labels, chip_tooltip};
 use super::focus::release_unfocused_input;
@@ -91,6 +93,8 @@ pub enum TabKey {
     Shell(ShellRequest),
     /// A cluster's agent activity: no session, one tab per cluster.
     Activity(ClusterId),
+    /// An object compared across clusters, opened from this context: no session.
+    Compare(ClusterId, CompareTarget),
 }
 
 impl TabKey {
@@ -99,7 +103,7 @@ impl TabKey {
         match self {
             TabKey::Logs(request) => &request.cluster,
             TabKey::Shell(request) => &request.cluster,
-            TabKey::Activity(cluster) => cluster,
+            TabKey::Activity(cluster) | TabKey::Compare(cluster, _) => cluster,
         }
     }
 }
@@ -129,6 +133,7 @@ pub enum DockTab {
     Logs(Entity<LogView>),
     Shell(Entity<TerminalView>),
     Activity(Entity<ActivityView>),
+    Compare(Entity<CompareView>),
 }
 
 impl DockTab {
@@ -137,6 +142,7 @@ impl DockTab {
             DockTab::Logs(view) => view.read(cx),
             DockTab::Shell(view) => view.read(cx),
             DockTab::Activity(view) => view.read(cx),
+            DockTab::Compare(view) => view.read(cx),
         }
     }
 
@@ -145,6 +151,7 @@ impl DockTab {
             DockTab::Logs(view) => view.clone().into(),
             DockTab::Shell(view) => view.clone().into(),
             DockTab::Activity(view) => view.clone().into(),
+            DockTab::Compare(view) => view.clone().into(),
         }
     }
 }
@@ -168,6 +175,7 @@ fn observe(tab: &DockTab, id: u64, cx: &mut Context<Dock>) -> Subscription {
         DockTab::Logs(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
         DockTab::Shell(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
         DockTab::Activity(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
+        DockTab::Compare(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
     }
 }
 
@@ -270,7 +278,7 @@ impl Dock {
     pub fn active_log(&self) -> Option<&Entity<LogView>> {
         match self.active_tab().filter(|_| self.visible)? {
             DockTab::Logs(view) => Some(view),
-            DockTab::Shell(_) | DockTab::Activity(_) => None,
+            DockTab::Shell(_) | DockTab::Activity(_) | DockTab::Compare(_) => None,
         }
     }
 
@@ -279,14 +287,30 @@ impl Dock {
     pub fn terminals(&self) -> impl Iterator<Item = &Entity<TerminalView>> {
         self.tabs.iter().filter_map(|t| match &t.tab {
             DockTab::Shell(view) => Some(view),
-            DockTab::Logs(_) | DockTab::Activity(_) => None,
+            DockTab::Logs(_) | DockTab::Activity(_) | DockTab::Compare(_) => None,
         })
+    }
+
+    /// Every log tab's view, shown or not.
+    pub fn log_views(&self) -> impl Iterator<Item = &Entity<LogView>> {
+        self.tabs.iter().filter_map(|t| match &t.tab {
+            DockTab::Logs(view) => Some(view),
+            DockTab::Shell(_) | DockTab::Activity(_) | DockTab::Compare(_) => None,
+        })
+    }
+
+    /// The compare tab shown, if the dock is visible and showing one: where its actions go.
+    pub fn active_compare(&self) -> Option<&Entity<CompareView>> {
+        match self.active_tab().filter(|_| self.visible)? {
+            DockTab::Compare(view) => Some(view),
+            _ => None,
+        }
     }
 
     pub fn active_terminal(&self) -> Option<&Entity<TerminalView>> {
         match self.active_tab().filter(|_| self.visible)? {
             DockTab::Shell(view) => Some(view),
-            DockTab::Logs(_) | DockTab::Activity(_) => None,
+            DockTab::Logs(_) | DockTab::Activity(_) | DockTab::Compare(_) => None,
         }
     }
 
@@ -300,7 +324,7 @@ impl Dock {
                 TabKey::Shell(_) => (false, &mut live.shells),
                 TabKey::Logs(request) => (request.previous, &mut live.logs),
                 // Runs no session: closing it ends nothing.
-                TabKey::Activity(_) => continue,
+                TabKey::Activity(_) | TabKey::Compare(..) => continue,
             };
             if dock_model::ends_a_session(item.tab_status(), reads_to_end) {
                 *count += 1;

@@ -30,7 +30,9 @@ use gpui_kit::*;
 
 use super::closing;
 use super::cluster_tag;
-use super::clusters::{ClustersModel, Presence, cluster_details, cluster_tooltip};
+use super::clusters::{
+    ClustersModel, Presence, cluster_details, cluster_tooltip, connection_stopped, state_label,
+};
 use super::confirm::{self, DialogText};
 use super::dashboard::{DashboardEvent, DashboardView};
 use super::detail::{
@@ -236,6 +238,8 @@ enum PickerDialogFocus {
     Restoring,
 }
 
+pub(super) use sets::SettingsDir;
+
 pub struct Workspace {
     model: Entity<ClustersModel>,
     /// `FLINT_APPEARANCE`, a development aid that wins over the setting.
@@ -255,6 +259,8 @@ pub struct Workspace {
     detail: Option<Entity<DetailView>>,
     /// The active cluster's overview, in place of a list.
     dashboard: Option<(Entity<DashboardView>, Subscription)>,
+    /// The sidebar's choice of clusters, saved sets and the running set's combined list.
+    sets: sets::ClusterSets,
     /// The window is too narrow for the list and the detail side by side, as of the last draw.
     narrow: bool,
     /// The main header shows two rows, as of the last draw: the dock leaves it more room.
@@ -425,9 +431,10 @@ impl Workspace {
         // and registered actions still reach the workspace.
         let on_focus_lost =
             cx.on_focus_lost(window, |this, window, cx| this.reclaim_focus(window, cx));
-        let guards = Self::guards(cx.entity().downgrade())
+        let guards = Self::set_guards(Self::guards(cx.entity().downgrade()))
             .when::<OpenClusterOverview>(|ws, _| ws.cluster.is_some());
         registry::install(focus.clone(), guards, cx);
+        let cluster_sets = sets::ClusterSets::new(window, cx);
         // The window's close button asks first while a session would end, as Close Window does.
         closing::guard_close_button(window, cx);
         let mut this = Self {
@@ -443,6 +450,7 @@ impl Workspace {
             list: None,
             detail: None,
             dashboard: None,
+            sets: cluster_sets,
             narrow: false,
             two_row_header: false,
             server_moves: ServerMoves::default(),
@@ -491,6 +499,7 @@ impl Workspace {
             ],
         };
         this.show_appearance(window, cx);
+        this.load_saved_sets(cx);
         this
     }
 
@@ -627,11 +636,26 @@ impl Workspace {
             self.refuse(refused(opening, &reason), cx);
             return;
         }
-        let core = self.model.read(cx).core().clone();
+        let member = match self.session_member(&request.cluster, cx) {
+            Ok(member) => member,
+            Err(why) => {
+                let opening = if request.previous {
+                    Opening::PreviousLogs
+                } else {
+                    Opening::Logs
+                };
+                self.refuse(refused(opening, &why), cx);
+                return;
+            }
+        };
+        let core = self.session_core(member.as_ref(), cx);
         let key = TabKey::Logs(request.clone());
         let cluster = self.tab_cluster(&key, cx);
-        let server = self.shown_server(&request.cluster, cx);
-        self.open_tab(
+        let server = match &member {
+            Some(member) => Some(member.server().to_owned()),
+            None => self.shown_server(&request.cluster, cx),
+        };
+        let id = self.open_tab(
             key,
             cluster,
             |window, cx| DockTab::Logs(cx.new(|cx| LogView::at(core, request, server, window, cx))),
@@ -639,6 +663,7 @@ impl Workspace {
             window,
             cx,
         );
+        self.sets.keep_tab_pin(id, member);
     }
 
     /// Opens (or shows) a dock tab. With `focus` it takes focus. Without, focus stays where it
@@ -652,11 +677,11 @@ impl Workspace {
         focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> u64 {
         self.clear_action_error(cx);
         let kept = (!focus).then(|| window.focused(cx)).flatten();
         let in_dock = kept.is_some() && self.dock.read(cx).has_focus(window, cx);
-        self.dock.update(cx, |dock, cx| {
+        let id = self.dock.update(cx, |dock, cx| {
             if in_dock {
                 dock.add(key, cluster, build, window, cx)
             } else {
@@ -667,12 +692,44 @@ impl Workspace {
             window.focus(&kept, cx);
         }
         cx.notify();
+        id
     }
 
     /// Starts tab `id`'s ended session again (Reconnect Logs, Restart Shell) in a new tab beside
-    /// it, keeping the ended one's output: on the server its context points at now, refused,
-    /// saying why, while the cluster is not connected.
+    /// it, keeping the ended one's output. A tab opened from a cluster set's row goes back only
+    /// to the server it was admitted on, once the core confirms the context never left it.
     fn restart_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(member) = self.sets.tab_pin(id).cloned() else {
+            self.restart_tab_on(id, None, window, cx);
+            return;
+        };
+        let Some(key) = self.dock.read(cx).tab(id).map(|t| t.item(cx).tab_key()) else {
+            return;
+        };
+        let opening = match &key {
+            TabKey::Logs(_) => Opening::ReconnectLogs,
+            TabKey::Shell(_) => Opening::RestartShell,
+            TabKey::Activity(_) | TabKey::Compare(..) => return,
+        };
+        let check = self.model.read(cx).core().check_member(&member);
+        self.sets.restart = cx.spawn_in(window, async move |this, cx| {
+            let changed = check.await;
+            let _ = this.update_in(cx, |ws, window, cx| match changed {
+                Some(why) => ws.refuse(refused(opening, &why), cx),
+                None => ws.restart_tab_on(id, Some(member), window, cx),
+            });
+        });
+    }
+
+    /// [`Self::restart_tab`] once checked: on `member`'s server if it has one, else on the server
+    /// its context points at now. Refused, saying why, while the cluster is not connected.
+    fn restart_tab_on(
+        &mut self,
+        id: u64,
+        member: Option<flint_core::handle::AdmittedMember>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(key) = self.dock.read(cx).tab(id).map(|t| t.item(cx).tab_key()) else {
             return;
         };
@@ -680,10 +737,18 @@ impl Workspace {
             TabKey::Logs(_) => Opening::ReconnectLogs,
             TabKey::Shell(_) => Opening::RestartShell,
             // Runs no session to start again.
-            TabKey::Activity(_) => return,
+            TabKey::Activity(_) | TabKey::Compare(..) => return,
         };
         if let Some(reason) = self.sessions_blocked(key.context(), cx) {
             self.refuse(refused(opening, &reason), cx);
+            return;
+        }
+        if matches!(key, TabKey::Shell(_))
+            && self
+                .cluster_summary(key.context(), cx)
+                .is_some_and(|c| self.model.read(cx).writes_paused(c))
+        {
+            self.refuse(refused(opening, &writes_paused_reason(key.context())), cx);
             return;
         }
         if matches!(key, TabKey::Shell(_)) && self.is_protected(key.context(), cx) {
@@ -693,9 +758,12 @@ impl Workspace {
         }
         self.clear_action_error(cx);
         let cluster = self.tab_cluster(&key, cx);
-        let server = self.shown_server(key.context(), cx);
-        let core = self.model.read(cx).core().clone();
-        self.dock.update(cx, |dock, cx| {
+        let server = match &member {
+            Some(member) => Some(member.server().to_owned()),
+            None => self.shown_server(key.context(), cx),
+        };
+        let core = self.session_core(member.as_ref(), cx);
+        let opened = self.dock.update(cx, |dock, cx| {
             dock.open_beside(
                 id,
                 cluster,
@@ -709,12 +777,17 @@ impl Workspace {
                         DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
                     }
                     // It returned above: an activity tab has no session to start again.
-                    TabKey::Activity(_) => unreachable!("activity tabs do not restart"),
+                    TabKey::Activity(_) | TabKey::Compare(..) => {
+                        unreachable!("these tabs do not restart")
+                    }
                 },
                 window,
                 cx,
             )
         });
+        if let Some(opened) = opened {
+            self.sets.keep_tab_pin(opened, member);
+        }
     }
 
     /// Says why Logs or Shell did not open, over the dock, for [`ACTION_ERROR_SHOWN`].
@@ -763,11 +836,25 @@ impl Workspace {
             self.refuse(refused(Opening::Shell, &protected_reason(&shown)), cx);
             return;
         }
-        let core = self.model.read(cx).core().clone();
+        let member = match self.session_member(&request.cluster, cx) {
+            Ok(member) => member,
+            Err(why) => {
+                self.refuse(refused(Opening::Shell, &why), cx);
+                return;
+            }
+        };
+        if let Some(why) = self.member_writes_paused(&request.cluster, cx) {
+            self.refuse(refused(Opening::Shell, &why), cx);
+            return;
+        }
+        let core = self.session_core(member.as_ref(), cx);
         let key = TabKey::Shell(request.clone());
         let cluster = self.tab_cluster(&key, cx);
-        let server = self.shown_server(&request.cluster, cx);
-        self.open_tab(
+        let server = match &member {
+            Some(member) => Some(member.server().to_owned()),
+            None => self.shown_server(&request.cluster, cx),
+        };
+        let id = self.open_tab(
             key,
             cluster,
             |window, cx| {
@@ -778,6 +865,7 @@ impl Workspace {
             window,
             cx,
         );
+        self.sets.keep_tab_pin(id, member);
     }
 
     /// The cluster a session opened on `context` now runs on: the context and its server.
@@ -789,7 +877,7 @@ impl Workspace {
             // the endpoint changes. Agent activity depends on neither.
             TabKey::Shell(_) => summary.map_or(0, |c| c.definition),
             TabKey::Logs(_) => summary.map_or(0, |c| c.endpoint),
-            TabKey::Activity(_) => 0,
+            TabKey::Activity(_) | TabKey::Compare(..) => 0,
         };
         TabCluster::new(context, self.shown_server(context, cx).as_deref()).defined_by(definition)
     }
@@ -836,13 +924,19 @@ impl Workspace {
         let cluster = detail.read(cx).object().cluster.clone();
         let why = self.sessions_blocked(&cluster, cx);
         let protected = self.is_protected(&cluster, cx);
+        let writes_paused = self.member_writes_paused(&cluster, cx);
         let label = self.cluster_names(cx).exact(&cluster);
-        let server = self
-            .cluster_summary(&cluster, cx)
-            .and_then(|c| c.info.server.clone());
+        // A set's row stays on its admitted server, which the write gate then holds it to.
+        let server = match self.sets.member(&cluster) {
+            Some(member) => Some(member.server().to_owned()),
+            None => self
+                .cluster_summary(&cluster, cx)
+                .and_then(|c| c.info.server.clone()),
+        };
         detail.update(cx, |d, cx| {
             d.set_sessions_blocked(why, cx);
             d.set_protected(protected, label, cx);
+            d.set_row_writes_paused(writes_paused, cx);
             d.set_server(server);
         });
     }
@@ -854,10 +948,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(detail) = self.detail.as_ref().map(Entity::downgrade) else {
+        let Some(detail) = self.detail.as_ref() else {
             return;
         };
-        let core = self.model.read(cx).core().clone();
+        // The handle it was reviewed through: a set's row runs bound to its member too.
+        let core = detail.read(cx).write_core().clone();
+        let detail = detail.downgrade();
         let names = self.cluster_names(cx);
         let handle = window.window_handle();
         // The same claim as the row actions: one write at a time per object.
@@ -917,6 +1013,12 @@ impl Workspace {
             let blocked = self.restart_blocked(&cluster, cx);
             shell.update(cx, |s, cx| s.set_restart_blocked(blocked, cx));
         }
+        let logs: Vec<_> = self.dock.read(cx).log_views().cloned().collect();
+        for log in logs {
+            let cluster = log.read(cx).tab_key().context().to_owned();
+            let blocked = self.sessions_blocked(&cluster, cx);
+            log.update(cx, |l, cx| l.set_reconnect_blocked(blocked, cx));
+        }
     }
 
     /// Why a shell on `cluster` cannot start again, as far as the context and its protection
@@ -927,6 +1029,9 @@ impl Workspace {
             None => blocked(format!("no kubeconfig context named {cluster}"), false),
             Some(c) if c.info.server.is_none() => {
                 blocked(format!("{cluster} has no API server in kubeconfig"), false)
+            }
+            Some(c) if self.model.read(cx).writes_paused(c) => {
+                blocked(writes_paused_reason(cluster), false)
             }
             Some(_) if self.is_protected(cluster, cx) => blocked(
                 protected_reason(&self.cluster_names(cx).exact(cluster)),
@@ -942,12 +1047,16 @@ impl Workspace {
         self.check_dock_servers(cx);
         self.tell_detail_sessions_blocked(cx);
         self.tell_shells_protected(cx);
+        self.check_set_row(cx);
         let model = self.model.read(cx);
         let active = model.active.clone();
         let core = model.core().clone();
         let failed = model
             .active_cluster()
             .is_some_and(|c| matches!(c.state, ConnectionState::Failed(_)));
+        let waiting = model
+            .active_cluster()
+            .is_some_and(|c| c.state == ConnectionState::AwaitingConfirmation);
         let discovered = active
             .as_ref()
             .and_then(|c| model.discovered(c))
@@ -970,7 +1079,10 @@ impl Workspace {
             // subscription (UP-24).
             self.cluster = active.clone();
             self.forget_places();
-            self.close_list(cx);
+            // Selecting a member (to sign in to it, say) keeps the set's list open.
+            if !self.sets.has_member(active.as_deref()) {
+                self.close_list(cx);
+            }
             // Its filter or YAML, if one had focus that has moved on (to a dock tab, say): focus
             // may never come back through `reclaim_focus`, nor a list open here. One that still
             // has focus goes when the workspace takes focus back.
@@ -992,6 +1104,7 @@ impl Workspace {
         }
         self.nav.update(cx, |nav, cx| {
             nav.set_connection_failed(failed, cx);
+            nav.set_awaiting_confirmation(waiting, cx);
             nav.set_cluster(
                 active.clone(),
                 discovered.discovery.clone(),
@@ -1007,7 +1120,7 @@ impl Workspace {
         let (Some(cluster), Some(discovery)) = (active, discovered.discovery) else {
             return;
         };
-        if self.list.is_some() || self.dashboard.is_some() {
+        if self.list.is_some() || self.dashboard.is_some() || self.sets.is_open() {
             return;
         }
         let entries = || {
@@ -1082,6 +1195,7 @@ impl Workspace {
     fn close_list(&mut self, cx: &mut Context<Self>) {
         // Another kind, list or cluster: a reason given for the rows left no longer applies.
         self.clear_action_error(cx);
+        self.leave_set(cx);
         self.list = None;
         self.detail = None;
         self._list_subscriptions.clear();
@@ -1183,6 +1297,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.show_kind_in_set(entry, window, cx) {
+            return;
+        }
         let Some(cluster) = self.cluster.clone() else {
             return;
         };
@@ -1220,11 +1337,9 @@ impl Workspace {
         let list = cx.new(|cx| {
             ResourceList::new(core, cluster.clone(), entry, namespaces, sort, window, cx)
         });
-        let deletable = self.kind_deletable(&cluster, &entry.id, cx);
-        if row_menu::has_row_actions(&entry.id, deletable) {
-            let menu = row_menu::row_menu(cx.weak_entity());
-            list.update(cx, |list, _| list.set_row_menu(menu));
-        }
+        // Every kind: any object can be compared, and a menu with no entries never shows.
+        let menu = row_menu::row_menu(cx.weak_entity());
+        list.update(cx, |list, _| list.set_row_menu(menu));
         self._list_subscriptions = vec![cx.subscribe_in(&list, window, Self::on_list_event)];
         if take_focus {
             let focus = list.read(cx).focus_handle().clone();
@@ -1415,7 +1530,11 @@ impl Workspace {
             let presence = Presence::of(&cluster.state, is_active, states);
             let exposure = (model.ai_exposure(cluster), model.ai_scope(cluster));
             let settings_ok = model.settings_error.is_none();
-            let protection = (model.protection(cluster), model.trust(cluster));
+            let protection = (
+                model.protection(cluster),
+                model.trust(cluster),
+                model.writes_paused(cluster),
+            );
             let ring = cursor.as_deref() == Some(cluster.info.name.as_str());
             list = list.child(self.render_cluster_row(
                 cluster,
@@ -1478,6 +1597,7 @@ impl Workspace {
             .border_color(theme.sidebar_border)
             .child(pane_title("CLUSTERS", traffic_lights, theme))
             .child(list)
+            .child(self.render_sets_panel(theme, cx))
             .child(pane_handle(
                 "clusters-edge",
                 Pane::Clusters,
@@ -1492,7 +1612,7 @@ impl Workspace {
         // and its full description.
         (is_active, ring, presence, tooltip): (bool, bool, Presence<'_>, String),
         (exposure, ai_scope): (AiExposureState, Option<AiScope>),
-        (protection, trust): (Protection, TrustState),
+        (protection, trust, writes_paused): (Protection, TrustState, bool),
         (settings_ok, names, tag): (bool, &ClusterNames, Option<ClusterTag>),
         theme: &Theme,
     ) -> AnyElement {
@@ -1537,9 +1657,18 @@ impl Workspace {
             .border_1()
             .border_color(super::theme::cursor_ring(theme, ring))
             .tooltip(move |_, cx| cluster_tooltip(tip.0.clone(), &tip.1, &tip.2, cx))
-            .on_click(registry::on_click(SelectCluster {
-                cluster: name.clone(),
-            }))
+            // While choosing clusters a click chooses: it must not connect to this one.
+            .when(self.sets.picking(), |row| {
+                row.on_click(registry::on_click(registry::TogglePickedCluster {
+                    cluster: name.clone(),
+                }))
+            })
+            .when(!self.sets.picking(), |row| {
+                row.on_click(registry::on_click(SelectCluster {
+                    cluster: name.clone(),
+                }))
+            })
+            .children(self.render_pick_box(&name))
             .child(dot)
             .child(
                 v_flex()
@@ -1622,6 +1751,7 @@ impl Workspace {
                 protection,
                 &trust,
                 settings_ok,
+                writes_paused,
             ))
             .child(self.render_exposure_toggle(
                 &name,
@@ -1777,7 +1907,12 @@ impl Workspace {
         let filter = self.ui_state.namespace_filter(&name).to_vec();
         let list = self.list.as_ref().map(|l| l.read(cx));
         let controls = header_controls(cluster, list);
-        let ns_summary = namespace_summary(&filter);
+        let ns_summary = namespace_button_text(&filter, list.and_then(|l| l.limited_to()));
+        // Only a namespace's own name can be long; the limited text must stay whole.
+        let ns_label = match filter.as_slice() {
+            [one] if *one == ns_summary => ellipsize(&ns_summary, NAMESPACE_LABEL_MAX_CHARS),
+            _ => ns_summary.clone(),
+        };
 
         let mut crumbs: Vec<(SharedString, String)> = vec![(
             self.model.read(cx).names().of(&name).into(),
@@ -1840,7 +1975,7 @@ impl Workspace {
         let two_rows = self.header_has_two_rows(window_width, cx);
         let namespaces = controls
             .namespaces
-            .then(|| self.render_namespace_filter(&ns_summary, cx));
+            .then(|| self.render_namespace_filter(&ns_summary, ns_label, cx));
         let watch_mode = controls
             .watch_mode
             .then(|| self.render_watch_mode(&name, two_rows, cx));
@@ -1915,9 +2050,25 @@ impl Workspace {
     ) -> impl IntoElement {
         let model = self.model.read(cx);
         let protection = model.protection(cluster);
-        let tip = protection_text(protection, &model.trust(cluster));
-        let text = access_mode_text(protection);
+        // Checked first: whatever the protection, the core refuses writes on this definition.
+        let paused = model.writes_paused(cluster);
+        let tip = if paused {
+            WRITES_PAUSED_TIP.to_owned()
+        } else {
+            protection_text(protection, &model.trust(cluster))
+        };
+        let text = if paused {
+            WRITES_PAUSED
+        } else {
+            access_mode_text(protection)
+        };
+        let short = if paused {
+            WRITES_PAUSED
+        } else {
+            access_mode_short_text(protection)
+        };
         let (icon, writable) = match protection {
+            _ if paused => (FlintIcon::Lock, false),
             Protection::Protected => (FlintIcon::Lock, false),
             Protection::Local | Protection::Unlocked => (FlintIcon::LockOpen, true),
             Protection::Trusted => (FlintIcon::ShieldCheck, true),
@@ -1942,15 +2093,16 @@ impl Workspace {
             .text_xs()
             .text_color(color)
             .child(Icon::new(icon).xsmall())
-            .child(if compact {
-                access_mode_short_text(protection)
-            } else {
-                text
-            })
+            .child(if compact { short } else { text })
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
     }
 
-    fn render_namespace_filter(&self, summary: &str, cx: &Context<Self>) -> impl IntoElement {
+    fn render_namespace_filter(
+        &self,
+        summary: &str,
+        label: String,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let this = cx.weak_entity();
         let input = self.namespace_input.clone();
         let on_open = this.clone();
@@ -1978,7 +2130,7 @@ impl Workspace {
                 Button::new("namespace-filter-button")
                     .xsmall()
                     .outline()
-                    .label(ellipsize(summary, NAMESPACE_LABEL_MAX_CHARS))
+                    .label(label)
                     // The label is cut to a few characters, so the watch mode button beside it
                     // stays on screen at the minimum width (UP-33). The accessible name and the
                     // tooltip keep the whole name.
@@ -2238,11 +2390,12 @@ impl Workspace {
     /// What the main area shows of the list and the open detail. A failed connection shows
     /// neither, so there is nothing to go Back from.
     fn main_panes(&self, cx: &App) -> MainPanes {
-        let failed = matches!(
-            self.model.read(cx).active_cluster().map(|c| &c.state),
-            Some(ConnectionState::Failed(_))
-        );
-        if !self.narrow || self.detail.is_none() || self.list.is_none() || failed {
+        let stopped = self
+            .model
+            .read(cx)
+            .active_cluster()
+            .is_some_and(|c| connection_stopped(&c.state));
+        if !self.narrow || self.detail.is_none() || self.list.is_none() || stopped {
             MainPanes::Split
         } else if self.list_in_front {
             MainPanes::ListAlone
@@ -2327,6 +2480,9 @@ impl Workspace {
     }
 
     fn render_main(&self, window_width: f32, theme: &Theme, cx: &Context<Self>) -> AnyElement {
+        if let Some(set_view) = self.render_set_view(window_width, theme, cx) {
+            return set_view;
+        }
         let model = self.model.read(cx);
         if model.loaded && model.clusters.is_empty() {
             let text = no_contexts_text(
@@ -2374,8 +2530,7 @@ impl Workspace {
                 .into_any_element(),
             // A failed connection stops the watches; say why instead of an endless "Loading".
             (Some(_), state)
-                if !matches!(state, ConnectionState::Failed(_))
-                    && self.main_panes(cx) == MainPanes::DetailAlone =>
+                if !connection_stopped(state) && self.main_panes(cx) == MainPanes::DetailAlone =>
             {
                 h_flex()
                     .id("detail-alone-pane")
@@ -2393,7 +2548,7 @@ impl Workspace {
                     .test_support()
                     .into_any_element()
             }
-            (Some(list), state) if !matches!(state, ConnectionState::Failed(_)) => h_flex()
+            (Some(list), state) if !connection_stopped(state) => h_flex()
                 .flex_1()
                 .min_h_0()
                 .child(div().flex_1().min_w_0().h_full().child(list.clone()))
@@ -2435,6 +2590,19 @@ impl Workspace {
                             .text_color(theme.muted_foreground)
                             .child("Pick a kind in the navigation."),
                     ),
+            ),
+            (_, ConnectionState::AwaitingConfirmation) => centered(
+                v_flex()
+                    .id("connection-waiting")
+                    .aria_label(state_label(&ConnectionState::AwaitingConfirmation))
+                    .test_support()
+                    .gap_1()
+                    .max_w(px(640.))
+                    .child(div().child(state_label(&ConnectionState::AwaitingConfirmation)))
+                    .child(div().text_sm().text_color(theme.muted_foreground).child(
+                        "A kubeconfig file that may define this cluster can't be read. \
+                                 Flint connects once it can.",
+                    )),
             ),
             (_, ConnectionState::Failed(message)) => centered(
                 v_flex()
@@ -2538,6 +2706,17 @@ fn access_mode_text(protection: Protection) -> &'static str {
         Protection::Unlocked => "Unlocked: writable",
         Protection::Trusted => "Trusted: writable",
     }
+}
+
+/// The access mode while the core refuses writes on a definition it can't confirm yet.
+const WRITES_PAUSED: &str = "Writes paused";
+
+pub(super) const WRITES_PAUSED_TIP: &str =
+    "Writes are paused until Flint can read your kubeconfig files and confirm this cluster";
+
+/// Why a shell cannot start on a cluster whose writes are paused.
+fn writes_paused_reason(cluster: &str) -> String {
+    format!("writes to {cluster} are paused until Flint can read your kubeconfig")
 }
 
 /// The access mode on a narrow header's second row: still tells every mode apart.
@@ -2647,10 +2826,16 @@ fn render_lock_button(
     protection: Protection,
     trust: &TrustState,
     settings_ok: bool,
+    writes_paused: bool,
 ) -> Option<AnyElement> {
     let entries = lock_menu(has_server, protection, trust, settings_ok);
+    let label = if writes_paused {
+        format!("Lock for {title}: writes paused")
+    } else {
+        lock_label(title, protection)
+    };
     let button = Button::new(SharedString::from(format!("lock-{name}")))
-        .accessibility_label(lock_label(title, protection))
+        .accessibility_label(label)
         .xsmall()
         .tab_stop(false);
     let pinned = !matches!(trust, TrustState::NotTrusted);
@@ -2693,6 +2878,15 @@ fn render_lock_button(
             "Trusted: unlocked across restarts. Click to stop trusting it (shells already open \
              keep running).",
         ),
+    };
+    // The menu stays, so the lock can still be changed, but nothing here says unlocked.
+    let (button, tip) = if writes_paused {
+        (
+            button.ghost().icon(FlintIcon::Lock),
+            "Writes paused until Flint can read your kubeconfig files. Click for the lock options.",
+        )
+    } else {
+        (button, tip)
     };
     let cluster = name.to_owned();
     let menu =
@@ -3130,10 +3324,10 @@ fn header_controls(
     cluster: &ClusterSummary,
     list: Option<&super::list::ResourceList>,
 ) -> HeaderControls {
-    let failed = matches!(cluster.state, ConnectionState::Failed(_));
+    let stopped = connection_stopped(&cluster.state);
     HeaderControls {
-        namespaces: !failed && list.is_none_or(|l| l.namespaced()),
-        watch_mode: !failed,
+        namespaces: !stopped && list.is_none_or(|l| l.namespaced()),
+        watch_mode: !stopped,
     }
 }
 
@@ -3191,6 +3385,27 @@ pub fn namespace_summary(filter: &[String]) -> String {
     }
 }
 
+/// The namespace button's text: [`namespace_summary`], or, on a list that fell back to the
+/// namespaces the account can read and does not cover the whole selection, what it really covers.
+fn namespace_button_text(filter: &[String], limit: Option<&flint_core::NamespaceLimit>) -> String {
+    let Some(limit) = limit else {
+        return namespace_summary(filter);
+    };
+    if filter.is_empty() {
+        return match limit.listed.len() {
+            0 => "No namespaces (limited)".to_owned(),
+            1 => "1 namespace (limited)".to_owned(),
+            n => format!("{n} namespaces (limited)"),
+        };
+    }
+    let covered = filter.iter().filter(|n| limit.listed.contains(n)).count();
+    match filter.len() {
+        selected if covered == selected => namespace_summary(filter),
+        1 => "0 of 1 namespace (limited)".to_owned(),
+        selected => format!("{covered} of {selected} namespaces (limited)"),
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_namespace_picker_with_dialog(window, cx);
@@ -3207,6 +3422,7 @@ impl Render for Workspace {
             .id("workspace")
             .key_context(registry::WORKSPACE)
             .map(|el| self.register_actions(el, cx))
+            .map(|el| self.register_set_actions(el, cx))
             // Captured, as the list reports no change for the row already selected: asking for
             // a row or object shows the detail, and asking for the filter shows the list. A
             // right-click selects its row without leaving it: the row hosts the context menu.
@@ -3385,6 +3601,9 @@ mod actions;
 
 #[path = "workspace_keys.rs"]
 mod keys;
+
+#[path = "workspace_sets.rs"]
+mod sets;
 
 #[cfg(test)]
 #[path = "keyboard_tests.rs"]

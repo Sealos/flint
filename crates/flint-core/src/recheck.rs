@@ -19,7 +19,7 @@ use futures::future::BoxFuture;
 use tokio::time::{Instant, Sleep};
 
 use crate::cluster::context_fingerprint;
-use crate::kubeconfig::{BlankFile, FileRead, KubeconfigRead, LoadedKubeconfig};
+use crate::kubeconfig::{BlankFile, ContextInfo, FileRead, KubeconfigRead, LoadedKubeconfig};
 use crate::settings::server_identity;
 
 /// How often a running session checks its context still points at the server it opened on.
@@ -91,6 +91,17 @@ impl ContextPin {
     /// The API server the session's client was built for.
     pub fn server(&self) -> Option<&str> {
         self.server.as_deref()
+    }
+
+    /// A pin that matches no context's confirmed definition.
+    pub fn stale() -> Self {
+        ContextPin {
+            generation: 0,
+            endpoint: 0,
+            gate: 0,
+            definition: None,
+            server: None,
+        }
     }
 
     /// Whether `other` is this pin on another connection definition, and nothing else moved.
@@ -547,6 +558,45 @@ impl EmptiedFiles {
     }
 }
 
+/// Which contexts the core holds now, published by the manager in the step that changes them, so
+/// a front end reads the current answer instead of waiting for an event. For showing only: the
+/// write gate decides from the manager's own state and never reads this.
+#[derive(Debug, Clone, Default)]
+pub struct DefinitionHolds(std::sync::Arc<std::sync::Mutex<HeldContexts>>);
+
+#[derive(Debug, Default)]
+struct HeldContexts {
+    writes: HashSet<String>,
+    sessions: HashSet<String>,
+}
+
+impl DefinitionHolds {
+    /// Whether the core refuses writes on `context` because its definition is uncertain.
+    pub fn writes_paused(&self, context: &str) -> bool {
+        self.held().writes.contains(context)
+    }
+
+    /// Whether nothing new may start on `context`: no connection, log stream or shell.
+    pub fn sessions_paused(&self, context: &str) -> bool {
+        self.held().sessions.contains(context)
+    }
+
+    pub(crate) fn publish(&self, writes: HashSet<String>, sessions: HashSet<String>) {
+        *self.held() = HeldContexts { writes, sessions };
+    }
+
+    /// Shows writes on `context` as paused until the next [`Self::publish`].
+    pub(crate) fn hold_writes(&self, context: &str) {
+        self.held().writes.insert(context.to_owned());
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, HeldContexts> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// Each context's definition when a load last showed it with no unreadable file that could
 /// change it.
 #[derive(Debug, Default)]
@@ -557,16 +607,14 @@ impl SettledDefinitions {
     /// from its confirmed definition. One that matches it, or that no load ever confirmed, is
     /// not paused.
     pub fn paused(&self, history: &ContextHistory, name: &str, shown: Option<u64>) -> bool {
-        history.provisional(name)
-            && self
-                .0
-                .get(name)
-                .is_some_and(|confirmed| *confirmed != shown)
+        history.provisional(name) && self.differs(name, shown)
     }
 
-    /// Whether `shown` is exactly the definition a load last confirmed for `name`.
-    pub fn confirms(&self, name: &str, shown: Option<u64>) -> bool {
-        self.0.get(name) == Some(&shown)
+    /// Whether a load confirmed a definition for `name` other than `shown`.
+    fn differs(&self, name: &str, shown: Option<u64>) -> bool {
+        self.0
+            .get(name)
+            .is_some_and(|confirmed| *confirmed != shown)
     }
 
     /// Takes the definitions `loaded`, already recorded in `history`, confirms. Returns the
@@ -589,11 +637,15 @@ impl SettledDefinitions {
 
 /// Which contexts' definitions are confirmed across kubeconfig loads, for a process that reads
 /// the files itself. It applies the desktop app's rule: while a file can't be read, a context
-/// showing anything but its confirmed definition is paused, and one unchanged from it goes on.
+/// showing anything but its confirmed definition is paused, one unchanged from it goes on, and
+/// one no load has confirmed yet has nothing to differ from, so it goes on too.
 #[derive(Debug, Default)]
 pub struct ConfirmedDefinitions {
     history: ContextHistory,
     settled: SettledDefinitions,
+    /// Contexts a load confirmed gone and none has confirmed since: no definition matches them,
+    /// so what shows up under their name behind an unreadable file waits, even their old one.
+    gone: HashSet<String>,
     emptied: EmptiedFiles,
     /// [`FileRead::order`](crate::kubeconfig::FileRead::order) of the last read recorded.
     last_read: u64,
@@ -625,8 +677,9 @@ pub struct JudgedRead {
 impl ConfirmedDefinitions {
     /// Records `read` if it is stable and newer than the last one recorded, and says what it
     /// pauses. A file that gave something and is now empty counts as failed until it has stayed
-    /// so for a moment. A read that is not recorded can't vouch for anything, so only a context
-    /// showing exactly its confirmed definition stays unpaused in it.
+    /// so for a moment. A read that is not recorded can't vouch for anything: a context with a
+    /// confirmed definition stays unpaused in it only by showing exactly that one, and one with
+    /// none only if all it shows comes from files that held still before any that changed.
     pub fn judge(&mut self, read: KubeconfigRead) -> JudgedRead {
         self.judge_at(read, std::time::Instant::now(), EMPTY_SETTLE)
     }
@@ -641,6 +694,7 @@ impl ConfirmedDefinitions {
             mut loaded,
             blank,
             consistent,
+            held_still,
             order,
             ..
         } = read.0;
@@ -654,6 +708,15 @@ impl ConfirmedDefinitions {
             self.history.fail_emptied(&mut loaded, &waiting);
             self.history.record(&loaded);
             self.settled.update(&self.history, &loaded);
+            let history = &self.history;
+            self.gone.extend(
+                self.settled
+                    .0
+                    .keys()
+                    .filter(|n| history.removed(n))
+                    .cloned(),
+            );
+            self.gone.retain(|name| history.provisional(name));
             if loaded.errors.is_empty() {
                 ReadOutcome::Clean
             } else {
@@ -661,19 +724,27 @@ impl ConfirmedDefinitions {
             }
         };
         let recorded = matches!(outcome, ReadOutcome::Clean | ReadOutcome::Recheck);
+        // An older read says nothing of the files as they are, so none of its files count.
+        let exact = if outcome == ReadOutcome::Unstable {
+            held_still
+        } else {
+            0
+        };
         let paused = loaded
             .contexts
             .iter()
-            .map(|info| info.name.as_str())
-            .filter(|name| {
+            .filter(|info| {
+                let name = info.name.as_str();
                 let shown = context_fingerprint(&loaded.merged, name);
+                let differs = self.gone.contains(name) || self.settled.differs(name, shown);
                 if recorded {
-                    self.settled.paused(&self.history, name, shown)
+                    self.history.provisional(name) && differs
                 } else {
-                    !self.settled.confirms(name, shown)
+                    differs
+                        || (!self.settled.0.contains_key(name) && !from_first(&loaded, info, exact))
                 }
             })
-            .map(str::to_owned)
+            .map(|info| info.name.clone())
             .collect();
         JudgedRead {
             loaded,
@@ -681,6 +752,19 @@ impl ConfirmedDefinitions {
             outcome,
         }
     }
+}
+
+/// Whether the context entry of `info`, and the cluster and user entries it names, all come from
+/// the first `count` files of `loaded`. An entry no file gave could still come from a later one.
+fn from_first(loaded: &LoadedKubeconfig, info: &ContextInfo, count: usize) -> bool {
+    let within = |path: &PathBuf| loaded.paths.iter().take(count).any(|p| p == path);
+    let entry = |name: &Option<String>, sources: &HashMap<String, PathBuf>| {
+        name.as_ref()
+            .is_none_or(|name| sources.get(name).is_some_and(within))
+    };
+    within(&info.source)
+        && entry(&info.cluster, &loaded.cluster_sources)
+        && entry(&info.user, &loaded.user_sources)
 }
 
 /// What a fresh read of the kubeconfig files says of a pinned definition.
@@ -863,6 +947,88 @@ mod tests {
         )
     }
 
+    // covers UP-54: once a load confirms a context gone, its old definition vouches for nothing:
+    // the same entry showing up in a later file behind an unreadable one waits.
+    #[test]
+    fn a_confirmed_removal_forgets_the_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+        let paths = [first.clone(), second.clone()];
+        let at = std::time::Instant::now();
+        let mut confirmed = ConfirmedDefinitions::default();
+
+        std::fs::write(&first, config("one")).unwrap();
+        assert!(load_files(&mut confirmed, &paths, at).paused.is_empty());
+        std::fs::write(&first, "kind: Config\n").unwrap();
+        let removed = load_files(&mut confirmed, &paths, at);
+        assert_eq!(removed.outcome, ReadOutcome::Clean);
+        assert!(confirmed.history.removed("dev"));
+
+        std::fs::write(&first, "clusters: [not valid").unwrap();
+        std::fs::write(&second, config("one")).unwrap();
+        let back = load_files(&mut confirmed, &paths, at);
+        assert!(back.loaded.context("dev").is_some());
+        assert!(back.paused.contains("dev"), "its old definition is gone");
+
+        std::fs::write(&first, "kind: Config\n").unwrap();
+        assert!(load_files(&mut confirmed, &paths, at).paused.is_empty());
+    }
+
+    // covers UP-54: the desktop app keeps a removed context's definition, so the same entry coming
+    // back behind an unreadable file connects as it did.
+    #[test]
+    fn the_app_connects_a_removed_context_restored_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+        let paths = [first.clone(), second.clone()];
+        let (mut history, mut settled) = (ContextHistory::default(), SettledDefinitions::default());
+        let mut load = |history: &mut ContextHistory| {
+            let loaded = crate::kubeconfig::load(&paths);
+            history.record(&loaded);
+            settled.update(history, &loaded);
+            loaded
+        };
+        std::fs::write(&first, config("one")).unwrap();
+        load(&mut history);
+        std::fs::write(&first, "kind: Config\n").unwrap();
+        load(&mut history);
+        assert!(history.removed("dev"));
+
+        std::fs::write(&first, "clusters: [not valid").unwrap();
+        std::fs::write(&second, config("one")).unwrap();
+        let back = load(&mut history);
+        let shown = context_fingerprint(&back.merged, "dev");
+        assert!(history.provisional("dev"));
+        assert!(!settled.paused(&history, "dev", shown));
+    }
+
+    // covers UP-54: a file changing after every file a first-seen context comes from can't change
+    // that context, so it does not pause it. One changing at or before them does.
+    #[test]
+    fn only_a_file_that_can_change_a_first_seen_context_pauses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ["first", "second", "third"].map(|name| dir.path().join(name));
+        std::fs::write(&paths[0], "not: [valid").unwrap();
+        std::fs::write(&paths[1], config("two")).unwrap();
+        std::fs::write(&paths[2], "kind: Config\n").unwrap();
+        let judge = |held_still| {
+            let mut read = KubeconfigRead::settled(&paths);
+            read.0.consistent = false;
+            read.0.held_still = held_still;
+            ConfirmedDefinitions::default().judge_at(
+                read,
+                std::time::Instant::now(),
+                Duration::from_secs(5),
+            )
+        };
+
+        let judged = judge(2);
+        assert_eq!(judged.outcome, ReadOutcome::Unstable);
+        assert!(!judged.paused.contains("dev"), "only the third file moved");
+        assert!(judge(1).paused.contains("dev"), "its own file moved");
+        assert!(judge(0).paused.contains("dev"), "a file before it moved");
+    }
+
     // covers UP-54: with an earlier file unreadable, a context showing its confirmed definition
     // goes on, one showing another is paused, and repairing the file ends the pause.
     #[test]
@@ -906,6 +1072,7 @@ mod tests {
         let unstable = |paths: &[PathBuf]| {
             let mut read = KubeconfigRead::settled(paths);
             read.0.consistent = false;
+            read.0.held_still = 0;
             read
         };
 
@@ -953,7 +1120,8 @@ mod tests {
         );
     }
 
-    // covers UP-54: a file first seen broken gives no confirmed definition, so nothing pauses.
+    // covers UP-54: a context first seen behind a broken file has no confirmed definition to
+    // differ from, so it is not paused. Once a load confirms it, a different fallback is.
     #[test]
     fn a_context_first_seen_with_a_broken_file_is_not_paused() {
         let dir = tempfile::tempdir().unwrap();
@@ -961,9 +1129,20 @@ mod tests {
         std::fs::write(&first, "not: [valid").unwrap();
         std::fs::write(&second, config("two")).unwrap();
         let mut confirmed = ConfirmedDefinitions::default();
-        let paths = [first, second];
-        let judged = load_files(&mut confirmed, &paths, std::time::Instant::now());
-        assert!(!judged.paused.contains("dev"));
+        let paths = [first.clone(), second.clone()];
+        let now = std::time::Instant::now();
+        let judged = load_files(&mut confirmed, &paths, now);
+        assert_eq!(judged.outcome, ReadOutcome::Recheck);
+        assert!(!judged.paused.contains("dev"), "nothing to differ from");
+
+        std::fs::write(&first, config("one")).unwrap();
+        let judged = load_files(&mut confirmed, &paths, now);
+        assert_eq!(judged.outcome, ReadOutcome::Clean);
+        assert!(!judged.paused.contains("dev"), "confirmed");
+
+        std::fs::write(&first, "not: [valid").unwrap();
+        let judged = load_files(&mut confirmed, &paths, now);
+        assert!(judged.paused.contains("dev"), "differs from confirmed");
     }
 
     // covers UP-54: an emptied file counts as failed while it settles, then as really empty, the

@@ -1128,6 +1128,77 @@ async fn a_lease_ended_before_the_spawn_starts_no_plugin() {
     assert!(!plugin.dir.path().join("plugin.runs").exists());
 }
 
+/// A check that holds for its first `allowed` calls.
+fn holding_for(allowed: usize) -> cluster::SendCheck {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    cluster::SendCheck::new(move || {
+        let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(std::future::ready(if call < allowed {
+            Ok(())
+        } else {
+            Err("paused".to_owned())
+        }))
+    })
+}
+
+const EXPIRED_TOKEN: &str = r#"{"token":"t","expirationTimestamp":"2000-01-01T00:00:00Z"}"#;
+
+// covers UP-54: a check that stops holding once setup has begun keeps the plugin from starting.
+#[tokio::test]
+async fn a_failed_check_during_setup_starts_no_plugin() {
+    let plugin = printing(EXPIRED_TOKEN);
+    let kubeconfig = plugin.kubeconfig("http://127.0.0.1:1");
+    let connected = cluster::connect_checked(&kubeconfig, "ctx", holding_for(1)).await;
+    assert!(connected.is_err());
+    assert_eq!(runs(&plugin), 0);
+}
+
+// covers UP-54: a check that stops holding after a request passed it keeps the refresh that
+// request would start from running, and the request ends instead of trying again.
+#[tokio::test]
+async fn a_failed_check_before_a_refresh_starts_no_plugin() {
+    let plugin = printing(EXPIRED_TOKEN);
+    let (server, seen) = version_server(1).await;
+    let kubeconfig = plugin.kubeconfig(&server);
+    // Setup asks three times, and the request once before it reaches the token.
+    let client = cluster::connect_checked(&kubeconfig, "ctx", holding_for(4))
+        .await
+        .unwrap();
+    let sent = tokio::time::timeout(Duration::from_secs(5), cluster::server_version(&client));
+    assert!(sent.await.unwrap().is_err());
+    assert_eq!(runs(&plugin), 1, "only setup ran it");
+    assert!(!seen.is_finished(), "nothing was sent");
+    seen.abort();
+}
+
+// covers UP-54: a pause that lands while a request waits for a refresh stops that request before
+// it is sent.
+#[tokio::test]
+async fn a_failed_check_after_a_refresh_sends_nothing() {
+    let plugin = FakePlugin::new(&format!(
+        "[ -e \"$PLUGIN_DIR/ran\" ] && touch \"$PLUGIN_DIR/paused\"\n\
+         touch \"$PLUGIN_DIR/ran\"\n\
+         printf '%s' '{{\"apiVersion\":\"client.authentication.k8s.io/v1\",\
+         \"kind\":\"ExecCredential\",\"status\":{EXPIRED_TOKEN}}}'\n"
+    ));
+    let paused = plugin.dir.path().join("paused");
+    let check = cluster::SendCheck::new(move || {
+        let holds = !paused.exists();
+        Box::pin(std::future::ready(
+            holds.then_some(()).ok_or_else(|| "paused".to_owned()),
+        ))
+    });
+    let (server, seen) = version_server(1).await;
+    let kubeconfig = plugin.kubeconfig(&server);
+    let client = cluster::connect_checked(&kubeconfig, "ctx", check)
+        .await
+        .unwrap();
+    assert!(cluster::server_version(&client).await.is_err());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!seen.is_finished(), "nothing was sent");
+    seen.abort();
+}
+
 #[tokio::test]
 async fn a_refreshed_token_is_used_even_when_it_expires_soon() {
     let plugin = FakePlugin::new(

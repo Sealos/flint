@@ -18,7 +18,10 @@ use gpui_kit::*;
 use std::rc::Rc;
 
 use super::super::activity_view::ActivityView;
+use flint_core::compare::CompareTarget;
+
 use super::super::clusters::ClustersModel;
+use super::super::compare::{self, CompareView};
 use super::super::confirm::{self, DialogText};
 use super::super::detail::{DetailView, Opening, refused};
 use super::super::dock::{Dock, DockTab, TabKey};
@@ -50,6 +53,9 @@ use super::super::registry::{BackToList, EditAiScope, Handler, ShowAgentActivity
 use super::super::registry::{
     ClearClusterTag, LockCluster, RenameCluster, SetClusterTag, TrustCluster, UnlockCluster,
     UntrustCluster,
+};
+use super::super::registry::{
+    CompareObject, OpenCompare, RefreshCompare, ToggleCompareSame, ToggleCompareVolatile,
 };
 use super::super::registry::{
     CordonNode, DeleteObject, DrainNode, NamespacePickerNext, NamespacePickerPrevious,
@@ -108,6 +114,8 @@ impl Workspace {
         .bind::<HideFromAi>(Self::hide_from_ai)
         .bind::<EditAiScope>(Self::edit_ai_scope)
         .bind::<ShowAgentActivity>(Self::show_agent_activity)
+        .bind::<OpenCompare>(Self::open_compare)
+        .bind::<CompareObject>(Self::compare_object)
         .bind::<UnlockCluster>(Self::unlock_cluster)
         .bind::<RenameCluster>(Self::rename_cluster)
         .bind::<SetClusterTag>(|this, action, _, cx| {
@@ -210,6 +218,9 @@ impl Workspace {
         let shell = self.dock.read(cx).active_terminal().cloned();
         let element =
             TerminalView::bind_actions(Forward::new(element, shell.as_ref())).into_element();
+        let compare = self.dock.read(cx).active_compare().cloned();
+        let element =
+            CompareView::bind_actions(Forward::new(element, compare.as_ref())).into_element();
         NavPanel::bind_actions(Forward::new(element, Some(&self.nav))).into_element()
     }
 
@@ -391,6 +402,17 @@ impl Workspace {
                 resource_actions::available(ws, ResourceAction::Drain, cx).is_ok()
             })
             .when::<ShowDrainReport>(|_, cx| resource_actions::has_drain_result(cx))
+            .when::<OpenCompare>(|ws, cx| ws.compare_check(cx).is_ok())
+            .add::<CompareObject>(
+                |_, _| true,
+                |ws, a, cx| {
+                    compare::can_compare(&a.cluster, ws.known_clusters(cx))
+                        .map_err(ActionError::rejected::<CompareObject>)
+                },
+            )
+            .when::<RefreshCompare>(|ws, cx| ws.dock.read(cx).active_compare().is_some())
+            .when::<ToggleCompareSame>(|ws, cx| ws.dock.read(cx).active_compare().is_some())
+            .when::<ToggleCompareVolatile>(|ws, cx| ws.dock.read(cx).active_compare().is_some())
             .add::<OpenSelectorLogs>(
                 |ws, cx| ws.cluster.is_some() && ws.sessions_open_here(cx),
                 |_, a, _| check_selector(a),
@@ -409,10 +431,10 @@ impl Workspace {
                 dock.is_visible() && dock.tab_count() > 1
             })
             .when::<ShowTabList>(|ws, cx| ws.dock.read(cx).tab_count() > 0)
-            .when::<ReconnectLogs>(|ws, cx| ws.dock.read(cx).restartable(true, cx).is_some())
+            .when::<ReconnectLogs>(|ws, cx| restartable_here(ws, true, cx))
             // Not on a protected cluster: the tab says why, with Unlock… beside it.
             .when::<RestartShell>(|ws, cx| {
-                ws.dock.read(cx).restartable(false, cx).is_some()
+                restartable_here(ws, false, cx)
                     && shell(ws, cx).is_some_and(|s| s.restart_blocked().is_none())
             })
             .add::<ActivateTab>(
@@ -943,15 +965,24 @@ impl Workspace {
         Ok(())
     }
 
-    /// Why log and shell sessions cannot open on `cluster` now (it is not connected), if so.
-    /// A cluster still connecting may: the object to act on is loading too.
+    /// Why log and shell sessions cannot open on `cluster` now (it is paused or not connected),
+    /// if so. A cluster still connecting may: the object to act on is loading too.
     pub(in crate::ui) fn sessions_blocked(&self, cluster: &str, cx: &App) -> Option<String> {
-        match self.cluster_summary(cluster, cx).map(|c| &c.state) {
+        let summary = self.cluster_summary(cluster, cx);
+        if summary.is_some_and(|c| self.model.read(cx).sessions_paused(c)) {
+            return Some(format!(
+                "{cluster} is waiting for its kubeconfig to be confirmed"
+            ));
+        }
+        match summary.map(|c| &c.state) {
             Some(ConnectionState::Connected(_) | ConnectionState::Connecting) => None,
             // Already a short, safe summary (`ClusterError::summary`).
             Some(ConnectionState::Failed(error)) => {
                 Some(format!("{cluster} is not connected: {error}"))
             }
+            Some(ConnectionState::AwaitingConfirmation) => Some(format!(
+                "{cluster} is waiting for its kubeconfig to be confirmed"
+            )),
             Some(ConnectionState::Disconnected) => Some(format!("{cluster} is not connected")),
             None => Some(format!("no kubeconfig context named {cluster}")),
         }
@@ -1089,6 +1120,74 @@ impl Workspace {
             window,
             cx,
         );
+    }
+
+    /// Whether the selected object can be compared across clusters now: `Err` says why not.
+    pub(in crate::ui) fn compare_check(&self, cx: &App) -> Result<(), String> {
+        let detail = self.detail_view().ok_or("no object is selected")?;
+        let origin = &detail.read(cx).object().cluster;
+        compare::can_compare(origin, &self.model.read(cx).clusters)
+    }
+
+    /// Opens (or shows) the selected object's compare tab, focused. Strictly read-only.
+    fn open_compare(&mut self, _: &OpenCompare, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(why) = self.compare_check(cx) {
+            self.refuse(compare::refused(&why), cx);
+            return;
+        }
+        let Some(detail) = self.detail_view() else {
+            return;
+        };
+        let object = detail.read(cx).object().clone();
+        let target = CompareTarget {
+            kind: object.kind,
+            namespace: object.namespace,
+            name: object.name,
+        };
+        self.open_compare_of(object.cluster, target, window, cx);
+    }
+
+    /// Opens (or shows) the compare tab of the exact object a row's menu was opened on.
+    fn compare_object(&mut self, a: &CompareObject, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(why) = compare::can_compare(&a.cluster, self.known_clusters(cx)) {
+            self.refuse(compare::refused(&why), cx);
+            return;
+        }
+        self.open_compare_of(a.cluster.clone(), a.target(), window, cx);
+    }
+
+    fn open_compare_of(
+        &mut self,
+        origin: String,
+        target: CompareTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let clusters = compare::compare_clusters(&origin, self.known_clusters(cx));
+        let key = TabKey::Compare(origin.clone(), target.clone());
+        let tab_cluster = self.tab_cluster(&key, cx);
+        let model = self.model.clone();
+        let columns = clusters.clone();
+        let id = self.open_tab(
+            key,
+            tab_cluster,
+            move |_, cx| {
+                DockTab::Compare(cx.new(|cx| CompareView::new(model, origin, target, columns, cx)))
+            },
+            true,
+            window,
+            cx,
+        );
+        // A tab already open may hold a column whose cluster has changed since.
+        if let Some(DockTab::Compare(view)) = self.dock.read(cx).tab(id) {
+            let view = view.clone();
+            view.update(cx, |view, cx| view.reopen(clusters, cx));
+        }
+    }
+
+    /// Every cluster in kubeconfig, as last reported.
+    pub(in crate::ui) fn known_clusters<'a>(&self, cx: &'a App) -> &'a [ClusterSummary] {
+        &self.model.read(cx).clusters
     }
 
     /// Opens the scope dialog of an exposed cluster; saving rewrites its entry with the new
@@ -1438,6 +1537,21 @@ impl Workspace {
 /// The detail pane, if one is open.
 fn detail<'a>(ws: &Workspace, cx: &'a App) -> Option<&'a DetailView> {
     ws.detail.as_ref().map(|d| d.read(cx))
+}
+
+/// Whether the dock's shown tab can start its log (`logs`) or shell session again. Not while its
+/// cluster is paused; one that is only disconnected stays available, and running it says why.
+fn restartable_here(ws: &Workspace, logs: bool, cx: &App) -> bool {
+    let dock = ws.dock.read(cx);
+    dock.restartable(logs, cx)
+        .and_then(|id| dock.tab(id))
+        .is_some_and(|tab| {
+            let key = tab.item(cx).tab_key();
+            !ws.cluster_summary(key.context(), cx).is_some_and(|c| {
+                c.state == ConnectionState::AwaitingConfirmation
+                    || ws.model.read(cx).sessions_paused(c)
+            })
+        })
 }
 
 /// The shell tab the dock shows, if it is visible and shows one.

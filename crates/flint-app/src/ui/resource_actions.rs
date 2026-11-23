@@ -343,6 +343,10 @@ pub(in crate::ui) fn check(
     if let Some(why) = ws.sessions_blocked(&object.cluster, cx) {
         return Err(why.into());
     }
+    // Checked before protection, as the access mode is: no unlock would allow this write.
+    if let Some(why) = ws.member_writes_paused(&object.cluster, cx) {
+        return Err(why.into());
+    }
     if ws.is_protected(&object.cluster, cx) {
         return Err(Refusal {
             why: protected_reason(&ws.cluster_names(cx).exact(&object.cluster)),
@@ -374,13 +378,17 @@ fn not_offered(action: ResourceAction, detail: &DetailView) -> String {
 }
 
 /// The change to review for the selected row: its uid (a row of an API that sends none is keyed
-/// by its name, which is no uid), and no `resourceVersion`.
-fn target_of(ws: &Workspace, cx: &App) -> Option<WriteTarget> {
-    let detail = ws.detail_view()?;
-    let object = detail.read(cx).object().clone();
-    let server = ws
-        .cluster_summary(&object.cluster, cx)
-        .and_then(|c| c.info.server.clone());
+/// by its name, which is no uid), and no `resourceVersion`. A cluster set's row names the server
+/// it was admitted on, so the gate refuses the change if its context points elsewhere now.
+pub(in crate::ui) fn target_of(ws: &Workspace, cx: &App) -> Option<WriteTarget> {
+    let detail = ws.detail_view()?.read(cx);
+    let object = detail.object().clone();
+    let server = match detail.row_server() {
+        Some(pinned) => Some(pinned.to_owned()),
+        None => ws
+            .cluster_summary(&object.cluster, cx)
+            .and_then(|c| c.info.server.clone()),
+    };
     let uid = Some(object.uid.to_string()).filter(|u| !u.contains('/') && *u != object.name);
     Some(WriteTarget {
         cluster: object.cluster,
@@ -396,6 +404,9 @@ fn target_of(ws: &Workspace, cx: &App) -> Option<WriteTarget> {
 /// A change on its way through review and confirmation.
 #[derive(Clone)]
 struct Request {
+    /// The handle of the view the action was offered from: a set's row is bound to its member,
+    /// so a dialog left open cannot review on a definition that came later.
+    core: flint_core::CoreHandle,
     action: ResourceAction,
     target: WriteTarget,
     proposal: WriteProposal,
@@ -416,15 +427,20 @@ pub(in crate::ui) fn request(
             return;
         }
     };
+    let core = ws.detail_view().map_or_else(
+        || ws.core(cx).clone(),
+        |detail| detail.read(cx).write_core().clone(),
+    );
     let proposal = match action {
-        ResourceAction::Scale => return open_scale(ws, target, window, cx),
-        ResourceAction::Drain => return open_drain(target, window, cx),
+        ResourceAction::Scale => return open_scale(ws, core, target, window, cx),
+        ResourceAction::Drain => return open_drain(core, target, window, cx),
         ResourceAction::Delete => WriteProposal::Delete,
         ResourceAction::RolloutRestart => WriteProposal::RolloutRestart,
         ResourceAction::Cordon => WriteProposal::Cordon,
         ResourceAction::Uncordon => WriteProposal::Uncordon,
     };
     let request = Request {
+        core,
         action,
         target,
         proposal,
@@ -440,8 +456,8 @@ fn start_review(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let review = ws
-        .core(cx)
+    let review = request
+        .core
         .review_write(request.target.clone(), request.proposal.clone());
     let handle = window.window_handle();
     let task = cx.spawn(async move |this, cx| {
@@ -471,9 +487,21 @@ fn reviewed(
             start_review(ws, request, Some(note), window, cx);
         }
         Err(error) => ws.refuse(
-            refused(Opening::Write(request.action), &error.to_string()),
+            refused(Opening::Write(request.action), &error_text(&error)),
             cx,
         ),
+    }
+}
+
+/// A refused action as it is said here: the core's wording for a context that moved is about a
+/// shell tab. Only the wording differs: the refusal stands.
+fn error_text(error: &WriteError) -> String {
+    match error {
+        WriteError::Refused(flint_core::protection::WriteRefusal::Moved { cluster }) => format!(
+            "\"{cluster}\" points at another server than this object was opened from, so the \
+             change was refused; open the object again"
+        ),
+        other => other.to_string(),
     }
 }
 
@@ -485,7 +513,8 @@ fn confirm_review(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let core = ws.core(cx).clone();
+    // The handle it was reviewed through: a set's row runs bound to its member too.
+    let core = request.core.clone();
     let names = ws.cluster_names(cx);
     let this = cx.weak_entity();
     let handle = window.window_handle();
@@ -551,7 +580,7 @@ fn written(
             start_review(ws, request, Some(note), window, cx);
         }
         Err(error) => ws.refuse(
-            refused(Opening::Write(request.action), &error.to_string()),
+            refused(Opening::Write(request.action), &error_text(&error)),
             cx,
         ),
     }
@@ -760,6 +789,7 @@ impl Render for ScaleField {
 
 fn open_scale(
     ws: &mut Workspace,
+    core: flint_core::CoreHandle,
     target: WriteTarget,
     window: &mut Window,
     cx: &mut Context<Workspace>,
@@ -791,6 +821,7 @@ fn open_scale(
             }
         };
         let request = Request {
+            core: core.clone(),
             action: ResourceAction::Scale,
             target: target.clone(),
             proposal: WriteProposal::Scale { to },
@@ -900,7 +931,12 @@ impl Render for DrainChoices {
     }
 }
 
-fn open_drain(target: WriteTarget, window: &mut Window, cx: &mut Context<Workspace>) {
+fn open_drain(
+    core: flint_core::CoreHandle,
+    target: WriteTarget,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
     let choices = cx.new(DrainChoices::new);
     let text = drain_dialog(&target);
     let this = cx.weak_entity();
@@ -909,6 +945,7 @@ fn open_drain(target: WriteTarget, window: &mut Window, cx: &mut Context<Workspa
     confirm::open_pinned_with(window, cx, text, pinned, content, move |window, cx| {
         let chosen = choices.read(cx);
         let request = Request {
+            core: core.clone(),
             action: ResourceAction::Drain,
             target: target.clone(),
             proposal: WriteProposal::Drain {
@@ -1184,10 +1221,11 @@ mod tests {
             let on = target.clone();
             cx.update_window(t.window, |_, window, cx| {
                 t.workspace.update(cx, |ws, cx| {
+                    let core = ws.core(cx).clone();
                     if drain {
-                        open_drain(on, window, cx)
+                        open_drain(core, on, window, cx)
                     } else {
-                        open_scale(ws, on, window, cx)
+                        open_scale(ws, core, on, window, cx)
                     }
                 })
             })

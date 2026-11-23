@@ -6,7 +6,8 @@ use flint_core::LogSubject;
 use gpui_kit::*;
 
 use super::super::view_state::{
-    ActivityTabState, DockState, Focus, TabClusterState, TabState, TabStatusState,
+    ActivityTabState, CompareSideState, CompareTabState, DockState, Focus, TabClusterState,
+    TabState, TabStatusState,
 };
 use super::{Dock, DockTab, TabKey};
 
@@ -29,7 +30,7 @@ impl Dock {
                         let (status, text) = view.status_state();
                         (status, text, None, Some(view.view_state()))
                     }
-                    DockTab::Activity(_) => {
+                    DockTab::Activity(_) | DockTab::Compare(_) => {
                         (TabStatusState::Watching, "Live".to_owned(), None, None)
                     }
                 };
@@ -37,6 +38,32 @@ impl Dock {
                     DockTab::Activity(view) => Some(ActivityTabState {
                         rows: view.read(cx).rows().iter().map(|r| r.label()).collect(),
                     }),
+                    _ => None,
+                };
+                let compare = match &tab.tab {
+                    DockTab::Compare(view) => {
+                        let view = view.read(cx);
+                        let model = view.model();
+                        Some(CompareTabState {
+                            title: model.title.clone(),
+                            verdict: model.verdict.clone(),
+                            show_same: view.show_same(),
+                            include_volatile: view.include_volatile(),
+                            sides: model
+                                .headers
+                                .iter()
+                                .map(|side| CompareSideState {
+                                    name: side.name.clone(),
+                                    status: side.status.clone(),
+                                })
+                                .collect(),
+                            rows: model
+                                .rows
+                                .iter()
+                                .map(|row| format!("{}: {}", row.path, row.cells.join(", ")))
+                                .collect(),
+                        })
+                    }
                     _ => None,
                 };
                 TabState {
@@ -61,6 +88,7 @@ impl Dock {
                     logs,
                     shell,
                     activity,
+                    compare,
                 }
             })
             .collect();
@@ -82,7 +110,7 @@ impl Dock {
         let in_tab = self.tabs.iter().find_map(|tab| match &tab.tab {
             DockTab::Logs(view) => view.read(cx).focus_in(window, cx),
             DockTab::Shell(view) => view.read(cx).focus_in(window, cx),
-            DockTab::Activity(_) => None,
+            DockTab::Activity(_) | DockTab::Compare(_) => None,
         });
         Some(in_tab.unwrap_or(Focus::Dock))
     }
@@ -98,6 +126,7 @@ pub fn tab_kind(key: &TabKey) -> &'static str {
         },
         TabKey::Shell(_) => "shell",
         TabKey::Activity(_) => "agent_activity",
+        TabKey::Compare(..) => "compare",
     }
 }
 

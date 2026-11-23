@@ -16,7 +16,7 @@
 #   - Every kubectl call names that file and one of this run's contexts (kwok-flint-kwok-<id>-N).
 #     Any other context is refused.
 #   - `delete` removes only clusters named flint-kwok-<id>-1 to -5 of this run.
-#   - Nothing is installed; kwokctl, kubectl and docker (or the binary runtime) must exist.
+#   - Nothing is installed; kwokctl, kubectl and docker must exist.
 set -euo pipefail
 
 prefix=
@@ -116,7 +116,7 @@ cmd_create() {
     echo "creating $(name_of "$i")"
     # A node holds 110 pods by default.
     {
-      kwokctl create cluster --name "$(name_of "$i")" --kubeconfig "$scratch" --wait 120s &&
+      kwokctl create cluster --name "$(name_of "$i")" --kubeconfig "$scratch" --runtime docker --wait 120s &&
         check_context "$(context_of "$i")" &&
         kwokctl scale node --name "$(name_of "$i")" --replicas "$(( (pods + 109) / 110 ))" &&
         kwokctl scale pod fake-pod --name "$(name_of "$i")" --replicas "$pods" --namespace default

@@ -223,6 +223,8 @@ pub enum Main {
     Failed {
         error: String,
     },
+    /// Waiting for the kubeconfig to be confirmed. Not a failure, so no Retry button.
+    AwaitingConfirmation,
     /// A resource list, and maybe the detail pane.
     List,
 }
@@ -411,6 +413,27 @@ pub struct TabState {
     pub shell: Option<ShellTabState>,
     /// For agent activity tabs.
     pub activity: Option<ActivityTabState>,
+    /// For compare tabs.
+    pub compare: Option<CompareTabState>,
+}
+
+/// A compare tab: what it says of the object on each cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CompareTabState {
+    pub title: String,
+    pub verdict: String,
+    pub show_same: bool,
+    pub include_volatile: bool,
+    pub sides: Vec<CompareSideState>,
+    /// Each row shown, as `path: value, value`.
+    pub rows: Vec<String>,
+}
+
+/// One cluster's column in a compare tab.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CompareSideState {
+    pub name: String,
+    pub status: String,
 }
 
 /// An agent activity tab (UP-16).

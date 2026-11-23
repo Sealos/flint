@@ -856,7 +856,8 @@ fn set_labels(
     server.set_object(gvr, object);
 }
 
-/// The requests since the first `from`, without reads of the API's discovery.
+/// The requests since the first `from`. These tests run in On view, which has no telemetry feed,
+/// so nothing but the action under test reads these objects.
 fn since(server: &FakeApiServer, from: usize) -> Vec<(http::Method, String)> {
     server.requests()[from..]
         .iter()
@@ -1078,6 +1079,7 @@ async fn an_unchanged_object_is_read_then_written() {
     for (target, proposal, _, path) in every_action(&server) {
         workload(&server, 2);
         node(&server);
+        let drains = matches!(proposal, WriteProposal::Drain { .. });
         let review = core.handle.review_write(target, proposal).await.unwrap();
         let from = server.requests().len();
         core.handle.run_write(review.into_intent()).await.unwrap();
@@ -1090,6 +1092,14 @@ async fn an_unchanged_object_is_read_then_written() {
         assert!(write > 0, "{seen:?}");
         let reads = seen[..write].iter().filter(|(_, p)| p == path).count();
         assert_eq!(reads, 1, "{seen:?}");
+        // Between the read and the write, only a drain reads anything: the node's pods.
+        let pods = (http::Method::GET, "/api/v1/pods".to_owned());
+        assert!(
+            seen[1..write].iter().all(|r| drains && *r == pods),
+            "{seen:?}"
+        );
+        assert!(seen[write].1.starts_with(path), "{seen:?}");
+        assert_eq!(writes_in(&seen), 1, "{seen:?}");
     }
 }
 

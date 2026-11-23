@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use flint_core::ClusterId;
 use flint_core::dashboard::{
     ProblemCategory, ProblemCounts, ProblemSnapshot, ProblemSummariser, count_pending_claims,
     count_recent_warnings,
@@ -22,6 +21,7 @@ use flint_core::telemetry::{
     WatchedKind,
 };
 use flint_core::thresholds::Thresholds;
+use flint_core::{ClusterId, OverviewInterest};
 use gpui_kit::*;
 use jiff::Timestamp;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -71,6 +71,8 @@ impl PartialEq for FeedId {
 #[derive(Default)]
 pub(super) struct Feed {
     source: Option<(WeakEntity<ClustersModel>, ClusterId)>,
+    /// Keeps the cluster's feed running in watch mode On view while this view lives.
+    _interest: Option<OverviewInterest>,
     /// The feed the values on screen came from. `None` for the waiting state.
     shown: Option<FeedId>,
     /// Stands in for the core's running feed.
@@ -95,6 +97,7 @@ impl DashboardView {
         let mut view = Self::new(waiting, cx);
         view.lists = lists;
         let mut updates = model.read(cx).core().telemetry_updates();
+        view.feed._interest = Some(model.read(cx).core().open_overview(&cluster));
         view.feed.source = Some((model.downgrade(), cluster));
         view.feed._updates = Some(cx.spawn(async move |this, cx| {
             while updates.changed().await {

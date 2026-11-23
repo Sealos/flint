@@ -764,23 +764,8 @@ pub(crate) async fn object_detail_at(
     deadline: Duration,
 ) -> Result<ObjectDetail, ClusterError> {
     let started = tokio::time::Instant::now();
-    let object = tokio::time::timeout(deadline, get(client, kind, namespace, name))
-        .await
-        .map_err(|_| ClusterError::timeout(deadline, None))??;
-    let uid = object.metadata.uid.clone();
-    let mut value = serde_json::to_value(&object)
-        .map_err(|e| ClusterError::Kube(format!("cannot serialize the object: {e}")))?;
-    let managed_fields = value
-        .get_mut("metadata")
-        .and_then(|m| m.as_object_mut())
-        .and_then(|m| m.remove("managedFields"));
-    if value.get("apiVersion").is_none() {
-        value["apiVersion"] = kind.api_version().into();
-        value["kind"] = kind.kind().into();
-    }
-    let yaml = serde_saphyr::to_string(&value)
-        .map_err(|e| ClusterError::Kube(format!("cannot render YAML: {e}")))?;
-    let (events, events_truncated, events_error) = match uid {
+    let (object, mut detail) = object_alone(client, kind, namespace, name, deadline).await?;
+    let (events, events_truncated, events_error) = match object.metadata.uid.clone() {
         Some(uid) => {
             let selector = format!("involvedObject.uid={uid}");
             let query = EventQuery {
@@ -805,14 +790,58 @@ pub(crate) async fn object_detail_at(
         }
         None => (Vec::new(), false, None),
     };
-    Ok(ObjectDetail {
+    detail.events = events;
+    detail.events_truncated = events_truncated;
+    detail.events_error = events_error;
+    Ok(detail)
+}
+
+/// One object and nothing about it: exactly one GET, so a read that was allowed when it started
+/// sends nothing later.
+pub(crate) async fn object_only(
+    client: &Client,
+    kind: &KindInfo,
+    namespace: Option<&str>,
+    name: &str,
+    deadline: Duration,
+) -> Result<ObjectDetail, ClusterError> {
+    object_alone(client, kind, namespace, name, deadline)
+        .await
+        .map(|(_, detail)| detail)
+}
+
+/// The object as fetched, and as a detail without events.
+async fn object_alone(
+    client: &Client,
+    kind: &KindInfo,
+    namespace: Option<&str>,
+    name: &str,
+    deadline: Duration,
+) -> Result<(DynamicObject, ObjectDetail), ClusterError> {
+    let object = tokio::time::timeout(deadline, get(client, kind, namespace, name))
+        .await
+        .map_err(|_| ClusterError::timeout(deadline, None))??;
+    let mut value = serde_json::to_value(&object)
+        .map_err(|e| ClusterError::Kube(format!("cannot serialize the object: {e}")))?;
+    let managed_fields = value
+        .get_mut("metadata")
+        .and_then(|m| m.as_object_mut())
+        .and_then(|m| m.remove("managedFields"));
+    if value.get("apiVersion").is_none() {
+        value["apiVersion"] = kind.api_version().into();
+        value["kind"] = kind.kind().into();
+    }
+    let yaml = serde_saphyr::to_string(&value)
+        .map_err(|e| ClusterError::Kube(format!("cannot render YAML: {e}")))?;
+    let detail = ObjectDetail {
         object: value,
         yaml,
         managed_fields,
-        events,
-        events_truncated,
-        events_error,
-    })
+        events: Vec::new(),
+        events_truncated: false,
+        events_error: None,
+    };
+    Ok((object, detail))
 }
 
 /// The events of a detail read, from `request`, within `left` of its `deadline`. With no time

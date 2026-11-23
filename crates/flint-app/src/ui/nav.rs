@@ -141,6 +141,8 @@ pub struct NavPanel {
     scroll_to_selected: bool,
     /// The cluster's connection failed, so no discovery is coming.
     connection_failed: bool,
+    /// The cluster waits for its kubeconfig to be confirmed, so no discovery is coming yet.
+    awaiting_confirmation: bool,
     focus: FocusHandle,
     /// The keyboard cursor, once the arrows moved it; until then (or once its row is hidden)
     /// it is on the open kind, else the first row ([`NavPanel::cursor`]).
@@ -167,6 +169,7 @@ impl NavPanel {
             scroll: ScrollHandle::new(),
             scroll_to_selected: false,
             connection_failed: false,
+            awaiting_confirmation: false,
         }
     }
 
@@ -198,6 +201,13 @@ impl NavPanel {
     pub fn set_connection_failed(&mut self, failed: bool, cx: &mut Context<Self>) {
         if self.connection_failed != failed {
             self.connection_failed = failed;
+            cx.notify();
+        }
+    }
+
+    pub fn set_awaiting_confirmation(&mut self, waiting: bool, cx: &mut Context<Self>) {
+        if self.awaiting_confirmation != waiting {
+            self.awaiting_confirmation = waiting;
             cx.notify();
         }
     }
@@ -441,7 +451,8 @@ impl Render for NavPanel {
             (Some(_), None) => {
                 // A failed connection has its Retry in the main area; only a failed discovery
                 // (with a connection) offers one here.
-                let retry = !self.connection_failed && self.error.is_some();
+                let retry =
+                    !self.connection_failed && !self.awaiting_confirmation && self.error.is_some();
                 rows.push(
                     (v_flex()
                         .flex_none()
@@ -450,7 +461,9 @@ impl Render for NavPanel {
                         .items_start()
                         .text_sm()
                         .text_color(theme.muted_foreground)
-                        .child(if self.connection_failed {
+                        .child(if self.awaiting_confirmation {
+                            "Waiting for kubeconfig to be confirmed."
+                        } else if self.connection_failed {
                             "Connection failed."
                         } else if self.error.is_some() {
                             "Discovery failed. Flint retries on its own."

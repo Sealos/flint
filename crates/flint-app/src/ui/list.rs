@@ -431,6 +431,11 @@ impl ResourceList {
         open.element(window, cx)
     }
 
+    /// The namespaces the drawn list fell back to, when the account cannot list all of them.
+    pub fn limited_to(&self) -> Option<&flint_core::NamespaceLimit> {
+        self.shown.limited_to.as_deref()
+    }
+
     /// The snapshot being drawn and how many of its rows pass the filters, for tests.
     #[cfg(test)]
     pub fn shown(&self) -> (&Arc<KindSnapshot>, usize) {
