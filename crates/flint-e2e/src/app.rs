@@ -469,6 +469,20 @@ impl App {
         self.request_within(cmd, args, timeout)
     }
 
+    /// [`App::request`] whose whole exchange (connecting, sending, reading the answer) must fit in
+    /// `deadline`. The app may still run a request that timed out here.
+    pub fn request_by(
+        &self,
+        cmd: &str,
+        args: Value,
+        deadline: Duration,
+    ) -> Result<Value, AppError> {
+        let line = self.request_line(cmd, &args);
+        let answer = exchange_by(&self.socket, &line, deadline)
+            .map_err(|e| self.error("transport", format!("{cmd}: {e}"), None))?;
+        self.response(cmd, &answer)
+    }
+
     fn request_within(&self, cmd: &str, args: Value, timeout: Duration) -> Result<Value, AppError> {
         let line = self.request_line(cmd, &args);
         let answer = exchange(&self.socket, &line, timeout)

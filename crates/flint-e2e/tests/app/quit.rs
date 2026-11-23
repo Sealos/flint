@@ -4,10 +4,10 @@
 //! not show which of the two did it. This test sends Quit itself and watches the process end
 //! while the harness still holds stdin open.
 //!
-//! Not here (#263): **Close Window** closes `cx.active_window()`, and the app under test runs in
-//! the background with no active window, so the action does nothing. **Saving on quit**: a
-//! relaunch reads back a value that is also saved shortly after each change, so it does not show
-//! that quitting saved it.
+//! Close Window has its own test, in `window_close.rs`.
+//!
+//! Not here (#263): **saving on quit**: a relaunch reads back a value that is also saved shortly
+//! after each change, so it does not show that quitting saved it.
 
 use std::time::{Duration, Instant};
 

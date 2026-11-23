@@ -114,7 +114,17 @@ pub fn start(places: Places, window: AnyWindowHandle, workspace: Entity<Workspac
     })
     .detach();
 
+    let lifecycle = Lifecycle::start(&places.config_dir);
+    let closed = lifecycle.clone();
+    let target_id = window.window_id();
+    cx.on_window_closed(move |_, id| {
+        if id == target_id {
+            closed.record(Lifecycle::WINDOW_CLOSED);
+        }
+    })
+    .detach();
     cx.on_app_quit(move |_| {
+        lifecycle.record(Lifecycle::QUIT_HOOKS);
         socket_file.remove();
         async {}
     })
@@ -123,6 +133,38 @@ pub fn start(places: Places, window: AnyWindowHandle, workspace: Entity<Workspac
         quit_on_stdin_eof(cx);
     }
     tracing::info!(path = %places.socket.display(), "automation channel listening");
+}
+
+/// A file in the scratch config directory recording, in order, the window closing and the quit
+/// hooks running. The socket is gone by the time a test can read what happened during exit.
+#[derive(Clone)]
+struct Lifecycle(std::path::PathBuf);
+
+impl Lifecycle {
+    const FILE: &str = "automation-lifecycle.log";
+    const WINDOW_CLOSED: &str = "window-closed";
+    const QUIT_HOOKS: &str = "quit-hooks";
+
+    /// Starts an empty record, so a relaunch on the same directory reads only its own events.
+    fn start(config_dir: &std::path::Path) -> Self {
+        let path = config_dir.join(Self::FILE);
+        let _ = std::fs::remove_file(&path);
+        Self(path)
+    }
+
+    fn record(&self, event: &str) {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&self.0);
+        if let Err(e) = file.and_then(|mut file| writeln!(file, "{event}")) {
+            tracing::warn!("could not record {event}: {e}");
+        }
+    }
 }
 
 fn exit_on_stdin_eof(flag: Option<&std::ffi::OsStr>) -> bool {
@@ -196,5 +238,38 @@ mod tests {
         cx.update(|cx| cx.shutdown());
         cx.run_until_parked();
         assert!(!socket.exists());
+    }
+
+    // The record shows the window closing before the quit hooks, and only for the target window.
+    #[gpui_kit::test]
+    async fn the_lifecycle_record_orders_close_before_quit(cx: &mut TestAppContext) {
+        use super::Lifecycle;
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        let places = Places {
+            config_dir: dir.path().to_owned(),
+            socket: dir.path().join("automation.sock"),
+            screenshots: dir.path().to_owned(),
+        };
+        let (window, workspace) = (t.window, t.workspace.clone());
+        cx.update(|cx| start(places, window, workspace, cx));
+        let other = gpui_kit::VisualContext::window_handle(cx.add_empty_window());
+        other
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        let record = dir.path().join(Lifecycle::FILE);
+        assert!(!record.exists(), "another window closing is not recorded");
+
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| cx.shutdown());
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read_to_string(record).unwrap(),
+            format!("{}\n{}\n", Lifecycle::WINDOW_CLOSED, Lifecycle::QUIT_HOOKS)
+        );
     }
 }
