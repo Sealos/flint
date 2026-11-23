@@ -131,6 +131,39 @@ fn count_of(path: &Path) -> usize {
         .count()
 }
 
+// Every clone sees a revocation, and no later role undoes it. A credential that runs nothing is
+// not affected.
+#[test]
+fn a_revoked_access_stays_denied_for_every_clone() {
+    let access = foreground_only(Role::Foreground);
+    let command = access.grant(CredentialSource::Plugin);
+    let cloned = command.clone();
+    let lease = command.lease();
+    let fixed = access.clone().grant(CredentialSource::Definition);
+
+    access.revoke();
+    access.set_role(Role::Foreground);
+
+    assert!(!command.allowed() && !cloned.allowed() && !lease.holds());
+    assert!(!access.grant(CredentialSource::Plugin).lease().holds());
+    assert!(fixed.allowed());
+}
+
+// A pause denies commands, and only a use begun after it may run one.
+#[test]
+fn a_pause_ends_a_use_and_a_resume_allows_a_new_one() {
+    let access = foreground_only(Role::Foreground);
+    let grant = access.grant(CredentialSource::Plugin);
+    let before = grant.lease();
+
+    access.set_role(Role::Paused);
+    assert!(!grant.allowed());
+    access.set_role(Role::Foreground);
+
+    assert!(grant.allowed() && grant.lease().holds());
+    assert!(!before.holds());
+}
+
 #[test]
 fn always_allow_allows_every_source_in_every_role() {
     for source in [
@@ -517,6 +550,105 @@ async fn a_demoted_provider_starts_no_queued_command_and_stays_unusable() {
     assert!(matches!(write, Err(WriteError::IdentityUnverified)));
     assert_eq!(count_of(&count), ran + 1);
     assert_eq!(api.requests(), 0);
+}
+
+// A request that gave up leaves kube's command running. The next one must not get past the lease
+// check and sit on kube's lock, from where it would start the command after a demotion.
+#[tokio::test]
+async fn a_request_queued_behind_an_abandoned_command_starts_nothing_after_a_demotion() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = CountingApi::start().await;
+    let (kubeconfig, count) = held_provider_kubeconfig(&api.url, dir.path());
+    let access = foreground_only(Role::Foreground);
+    let connection = cluster::connect_gated_with_policy(&kubeconfig, "ctx", &access)
+        .await
+        .unwrap_or_else(|_| panic!("the foreground connect builds the auth layer"));
+    let ran = count_of(&count);
+    std::fs::write(dir.path().join("hold"), "").unwrap();
+
+    let read = connection.clients.read.clone();
+    let abandoned = tokio::spawn(async move { cluster::server_version(&read).await });
+    let started = dir.path().join("started");
+    for _ in 0..500 {
+        if started.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(started.exists());
+    abandoned.abort();
+    let _ = abandoned.await;
+
+    let read = connection.clients.read.clone();
+    let queued = tokio::spawn(async move { cluster::server_version(&read).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    access.set_role(Role::Background);
+    std::fs::write(dir.path().join("release"), "").unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(15), queued)
+        .await
+        .unwrap()
+        .unwrap()
+        .expect_err("a demoted connection sends nothing");
+    assert!(is_not_allowed(&error));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(count_of(&count), ran + 1, "the queued request ran nothing");
+    assert_eq!(api.requests(), 0);
+}
+
+// A start that stalls past its check holds up no role change, and nothing starts after one.
+#[test]
+fn a_role_change_does_not_wait_for_a_stalled_start() {
+    let access = foreground_only(Role::Foreground);
+    let lease = access.grant(CredentialSource::Plugin).lease();
+    let (done, finished) = std::sync::mpsc::channel();
+    let demoting = access.clone();
+    let landed = lease.start_if_held(|| {
+        std::thread::spawn(move || {
+            demoting.set_role(Role::Background);
+            done.send(()).unwrap();
+        });
+        finished.recv_timeout(Duration::from_secs(5)).is_ok()
+    });
+    assert_eq!(landed, Some(true), "the demotion landed during the start");
+    assert!(!lease.holds());
+    assert_eq!(lease.start_if_held(|| ()), None, "nothing starts after it");
+}
+
+// A revocation after the last check outside the task, before the task's first poll, still stops
+// the provider's command.
+#[tokio::test]
+async fn a_revocation_before_the_first_poll_runs_no_provider_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = CountingApi::start().await;
+    let (kubeconfig, count) = provider_kubeconfig(&api.url, dir.path());
+    let options = kube::config::KubeConfigOptions {
+        context: Some("ctx".to_owned()),
+        ..Default::default()
+    };
+    let config = kube::Config::from_custom_kubeconfig(kubeconfig, &options)
+        .await
+        .unwrap();
+    let layer = Arc::new(
+        kube::client::ConfigExt::auth_layer(&config)
+            .unwrap()
+            .expect("the provider has an auth layer"),
+    );
+    let access = foreground_only(Role::Foreground);
+    let lease = access.grant(CredentialSource::AuthProvider).lease();
+    let guarded = crate::credential::GuardedProvider::guarding(&layer, &lease)
+        .expect("a provider a role can stop is guarded");
+    let ran = count_of(&count);
+
+    // On this single-threaded runtime, one poll passes the outer check and spawns the task, which
+    // cannot run before this test yields.
+    let mut header = Box::pin(guarded.header());
+    assert!(futures::poll!(header.as_mut()).is_pending());
+    access.revoke();
+
+    assert!(header.await.is_err());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(count_of(&count), ran, "the command never started");
 }
 
 #[tokio::test]
