@@ -42,7 +42,7 @@ mod run_dir;
 
 use mask::HiddenValues;
 pub use mask::{MASK, mask_manifest, mask_values};
-use run_dir::{RunDir, resolve_trusted};
+use run_dir::{RunDir, Trusted, admin_group, resolve_trusted};
 pub(crate) use run_dir::{reap_stale, runs_root};
 
 /// How long one `helm` command may take.
@@ -427,25 +427,27 @@ fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// The real file to run for `candidate`, if no other account can change it or what leads to it.
-fn trusted_helm(candidate: &Path) -> Result<PathBuf, HelmError> {
-    resolve_trusted(candidate)
-        .filter(|real| is_executable(real))
+/// The real file to run for `candidate`, if only this account, root and the `admin` group can
+/// change it or what leads to it.
+fn trusted_helm(candidate: &Path, admin: Option<u32>) -> Result<Trusted, HelmError> {
+    resolve_trusted(candidate, admin)
+        .filter(|real| is_executable(&real.path))
         .ok_or(HelmError::UntrustedLocation)
 }
 
 /// The `helm` to run: the one set in the settings, or the first on `path`. Only absolute paths
 /// count, so that the working directory never decides what runs. A first match in an unsafe
 /// place is refused rather than skipped, so what runs is never a surprise.
-pub(crate) fn find_helm(
+fn locate_helm(
     configured: Option<&Path>,
     path: Option<&OsStr>,
-) -> Result<PathBuf, HelmError> {
+    admin: Option<u32>,
+) -> Result<Trusted, HelmError> {
     if let Some(configured) = configured {
         if !configured.is_absolute() || !is_executable(configured) {
             return Err(HelmError::BadConfiguredPath);
         }
-        return trusted_helm(configured);
+        return trusted_helm(configured, admin);
     }
     let found = path
         .into_iter()
@@ -454,7 +456,31 @@ pub(crate) fn find_helm(
         .map(|dir| dir.join("helm"))
         .find(|candidate| is_executable(candidate))
         .ok_or(HelmError::NotInstalled)?;
-    trusted_helm(&found)
+    trusted_helm(&found, admin)
+}
+
+/// What a Helm view says of a `helm` other administrators could replace.
+fn admin_writable_warning(path: &Path) -> String {
+    format!(
+        "Other administrators on this Mac could replace {}, and it would receive this cluster's \
+         credentials.",
+        path.display()
+    )
+}
+
+/// The warning for the `helm` that `target` would run now, if it needs one.
+pub(crate) async fn warning(target: &HelmTarget) -> Option<String> {
+    let configured = target.configured_helm.clone();
+    let path = std::env::var_os("PATH");
+    let found = tokio::task::spawn_blocking(move || {
+        locate_helm(configured.as_deref(), path.as_deref(), admin_group())
+    })
+    .await
+    .ok()?
+    .ok()?;
+    found
+        .admin_writable
+        .then(|| admin_writable_warning(&found.path))
 }
 
 /// Kills the process group of a child not reaped yet, so what `helm` started ends with it.
@@ -544,46 +570,52 @@ fn run_environment(dir: &Path, kubeconfig: &Path) -> Vec<(&'static str, OsString
 
 /// Runs `query` with the `helm` at `binary`, held to `target`. A manifest is read with the
 /// release's values, so that what Values hides is hidden in it too.
-async fn run_at(
+async fn run_with(
     binary: &Path,
     target: &HelmTarget,
     query: &HelmQuery,
+    admin: Option<u32>,
 ) -> Result<HelmOutput, HelmError> {
     let hidden = match query {
         HelmQuery::Manifest(release) => {
-            let values = run_helm(binary, target, &HelmQuery::Values(release.clone())).await?;
+            let values =
+                run_helm(binary, target, &HelmQuery::Values(release.clone()), admin).await?;
             tokio::task::spawn_blocking(move || HiddenValues::from_output(&values))
                 .await
                 .map_err(|_| HelmError::BadOutput)??
         }
         _ => HiddenValues::default(),
     };
-    let out = run_helm(binary, target, query).await?;
+    let out = run_helm(binary, target, query, admin).await?;
     let query = query.clone();
     tokio::task::spawn_blocking(move || parse(&query, &out, &hidden))
         .await
         .map_err(|_| HelmError::BadOutput)?
 }
 
-/// One `helm` command, to its output.
+/// One `helm` command, to its output. The binary is checked again here, last before it starts
+/// and before any credential is written for it.
 async fn run_helm(
     binary: &Path,
     target: &HelmTarget,
     query: &HelmQuery,
+    admin: Option<u32>,
 ) -> Result<Vec<u8>, HelmError> {
-    let (dir, kubeconfig) = {
+    let (binary, dir, kubeconfig) = {
         let target = target.clone();
+        let binary = binary.to_owned();
         tokio::task::spawn_blocking(move || {
+            let binary = trusted_helm(&binary, admin)?.path;
             let bytes = target.pinned_kubeconfig()?;
             // Private to this user, and removed when the run ends, however it ends.
             let dir = RunDir::create(&target.runs_root)?;
             let path = write_private(dir.path(), &bytes)?;
-            Ok::<_, HelmError>((dir, path))
+            Ok::<_, HelmError>((binary, dir, path))
         })
         .await
         .map_err(|_| HelmError::NotStarted)??
     };
-    let mut command = tokio::process::Command::new(binary);
+    let mut command = tokio::process::Command::new(&binary);
     command
         .args(query.args())
         .arg(format!("--kube-context={}", target.context))
@@ -626,11 +658,13 @@ async fn run_helm(
 pub(crate) async fn run(target: &HelmTarget, query: &HelmQuery) -> Result<HelmOutput, HelmError> {
     let configured = target.configured_helm.clone();
     let path = std::env::var_os("PATH");
-    let binary =
-        tokio::task::spawn_blocking(move || find_helm(configured.as_deref(), path.as_deref()))
-            .await
-            .map_err(|_| HelmError::NotStarted)??;
-    run_at(&binary, target, query).await
+    let admin = admin_group();
+    let found = tokio::task::spawn_blocking(move || {
+        locate_helm(configured.as_deref(), path.as_deref(), admin)
+    })
+    .await
+    .map_err(|_| HelmError::NotStarted)??;
+    run_with(&found.path, target, query, admin).await
 }
 
 #[derive(Deserialize, Default)]

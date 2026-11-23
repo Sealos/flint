@@ -214,6 +214,9 @@ pub struct HelmView {
     /// answers.
     pin: Option<Result<HelmPin, HelmError>>,
     _pinning: Task<()>,
+    /// Said of the `helm` in use when other administrators could replace it. Asked on every
+    /// read, and never remembered past this view.
+    binary_warning: Option<String>,
     focus: FocusHandle,
     releases: Load<Arc<[HelmRelease]>>,
     truncated: bool,
@@ -246,6 +249,7 @@ impl HelmView {
             cluster,
             pin: None,
             _pinning,
+            binary_warning: None,
             focus: cx.focus_handle(),
             releases: Load::Loading,
             truncated: false,
@@ -280,7 +284,14 @@ impl HelmView {
         let cluster = self.cluster.clone();
         self.list_task = Some(cx.spawn(async move |this, cx| {
             let result = match pin {
-                Ok(pin) => core.helm_read(&cluster, &pin, HelmQuery::List).await,
+                Ok(pin) => {
+                    let warning = core.helm_warning(&cluster, &pin).await;
+                    let _ = this.update(cx, |view, cx| {
+                        view.binary_warning = warning;
+                        cx.notify();
+                    });
+                    core.helm_read(&cluster, &pin, HelmQuery::List).await
+                }
                 Err(refused) => Err(refused),
             };
             let _ = this.update(cx, |view, cx| view.list_loaded(result, cx));
@@ -721,6 +732,21 @@ impl Render for HelmView {
                             .on_click(registry::on_click(RefreshHelmReleases)),
                     ),
             )
+            .when_some(self.binary_warning.clone(), |el, warning| {
+                el.child(
+                    div()
+                        .id("helm-binary-warning")
+                        .px_3()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .text_xs()
+                        .text_color(theme.warning)
+                        .aria_label(warning.clone())
+                        .child(warning)
+                        .test_support(),
+                )
+            })
             .child(body)
             .test_support()
     }
@@ -842,6 +868,37 @@ mod tests {
         })
         .await;
         assert!(!ran.exists(), "helm never started on the new server");
+    }
+
+    // The warning about the binary is on screen with an accessible name, and blocks nothing.
+    #[gpui_kit::test]
+    async fn the_view_shows_the_binary_warning(cx: &mut gpui_kit::TestAppContext) {
+        use crate::ui::support_tests::open_workspace;
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        t.dispatch(
+            cx,
+            "workspace::ShowHelmReleases",
+            json!({"cluster": "kind-beta"}),
+        )
+        .unwrap();
+        t.wait_for_element(cx, "helm-releases-view").await;
+        let view = t
+            .workspace
+            .read_with(cx, |ws, cx| ws.dock_view().read(cx).active_helm().cloned())
+            .unwrap();
+        view.update(cx, |view, cx| {
+            view.binary_warning = Some("Other administrators could replace /x/helm".into());
+            cx.notify();
+        });
+        t.wait_for_element(cx, "helm-binary-warning").await;
+        assert_eq!(
+            t.label(cx, "helm-binary-warning").as_deref(),
+            Some("Other administrators could replace /x/helm")
+        );
+        t.wait_for_element(cx, "helm-refresh").await;
     }
 
     #[test]

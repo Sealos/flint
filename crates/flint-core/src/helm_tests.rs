@@ -57,6 +57,155 @@ fn target(dir: &Path) -> HelmTarget {
     .unwrap()
 }
 
+fn find_helm(configured: Option<&Path>, path: Option<&OsStr>) -> Result<PathBuf, HelmError> {
+    locate_helm(configured, path, admin_group()).map(|found| found.path)
+}
+
+async fn run_at(
+    binary: &Path,
+    target: &HelmTarget,
+    query: &HelmQuery,
+) -> Result<HelmOutput, HelmError> {
+    run_with(binary, target, query, admin_group()).await
+}
+
+/// This process's group, standing in for the administrators' group on any machine.
+fn own_group() -> u32 {
+    // SAFETY: takes nothing and cannot fail.
+    unsafe { libc::getegid() }
+}
+
+/// A Homebrew layout under `dir`: `bin/helm` links into `Cellar`, and both are group-writable.
+fn brew_layout(dir: &Path) -> (PathBuf, PathBuf) {
+    let bin = dir.join("bin");
+    let cellar = dir.join("Cellar");
+    let keg = cellar.join("helm/1.0/bin");
+    std::fs::create_dir_all(&keg).unwrap();
+    std::fs::create_dir(&bin).unwrap();
+    let real = fake_helm(&keg, "printf '[]'");
+    std::os::unix::fs::symlink("../Cellar/helm/1.0/bin/helm", bin.join("helm")).unwrap();
+    for shared in [&bin, &cellar] {
+        std::os::unix::fs::chown(shared, None, Some(own_group())).unwrap();
+        std::fs::set_permissions(shared, std::fs::Permissions::from_mode(0o775)).unwrap();
+    }
+    (bin.join("helm"), real)
+}
+
+#[tokio::test]
+async fn an_admin_group_install_runs_and_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    let (link, real) = brew_layout(dir.path());
+    let found = locate_helm(Some(&link), None, Some(own_group())).unwrap();
+    assert_eq!(found.path, real.canonicalize().unwrap());
+    assert!(found.admin_writable);
+    let warning = admin_writable_warning(&found.path);
+    assert!(
+        warning.contains(&*found.path.to_string_lossy()),
+        "{warning}"
+    );
+    assert!(warning.contains("administrators"), "{warning}");
+    assert!(warning.contains("credentials"), "{warning}");
+    run_with(
+        &found.path,
+        &target(dir.path()),
+        &HelmQuery::List,
+        Some(own_group()),
+    )
+    .await
+    .unwrap();
+}
+
+#[test]
+fn a_private_install_does_not_warn() {
+    let dir = tempfile::tempdir().unwrap();
+    let helm = fake_helm(dir.path(), "");
+    let found = locate_helm(Some(&helm), None, Some(own_group())).unwrap();
+    assert!(!found.admin_writable);
+}
+
+#[test]
+fn another_writable_group_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (link, _) = brew_layout(dir.path());
+    assert_eq!(
+        locate_helm(Some(&link), None, Some(own_group() + 1)),
+        Err(HelmError::UntrustedLocation)
+    );
+}
+
+#[test]
+fn a_world_writable_install_is_refused_even_in_the_admin_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let (link, _) = brew_layout(dir.path());
+    std::fs::set_permissions(
+        dir.path().join("Cellar"),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+    assert_eq!(
+        locate_helm(Some(&link), None, Some(own_group())),
+        Err(HelmError::UntrustedLocation)
+    );
+}
+
+#[test]
+fn another_owner_is_refused() {
+    use run_dir::{Access, classify};
+    let (me, admin) = (501, 80);
+    assert_eq!(
+        classify((502, admin, 0o755), true, me, Some(admin)),
+        Access::Refused
+    );
+    assert_eq!(
+        classify((502, admin, 0o775), true, me, Some(admin)),
+        Access::Refused
+    );
+    assert_eq!(
+        classify((me, admin, 0o775), true, me, Some(admin)),
+        Access::AdminGroup
+    );
+    assert_eq!(
+        classify((0, admin, 0o775), false, me, Some(admin)),
+        Access::AdminGroup
+    );
+}
+
+#[test]
+fn a_link_to_an_unsafe_target_is_refused() {
+    let open = tempfile::tempdir().unwrap();
+    let helm = fake_helm(open.path(), "");
+    std::fs::set_permissions(open.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let safe = tempfile::tempdir().unwrap();
+    let link = safe.path().join("helm");
+    std::os::unix::fs::symlink(&helm, &link).unwrap();
+    assert_eq!(
+        locate_helm(Some(&link), None, Some(own_group())),
+        Err(HelmError::UntrustedLocation)
+    );
+}
+
+// A binary that became unsafe after it was found gets no credentials.
+#[tokio::test]
+async fn a_binary_that_became_unsafe_is_refused_before_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let (link, real) = brew_layout(dir.path());
+    let found = locate_helm(Some(&link), None, Some(own_group())).unwrap();
+    std::fs::set_permissions(
+        dir.path().join("Cellar"),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+    let refused = run_with(
+        &found.path,
+        &target(dir.path()),
+        &HelmQuery::List,
+        Some(own_group()),
+    )
+    .await;
+    assert_eq!(refused, Err(HelmError::UntrustedLocation));
+    assert!(!real.with_file_name("args").exists(), "helm never started");
+}
+
 /// Output parsed with no values to hide.
 fn parse(query: &HelmQuery, out: &[u8]) -> Result<HelmOutput, HelmError> {
     super::parse(query, out, &HiddenValues::default())

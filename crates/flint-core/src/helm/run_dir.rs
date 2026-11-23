@@ -38,11 +38,47 @@ fn owned_by_us_or_root(meta: &Metadata) -> bool {
     meta.uid() == 0 || meta.uid() == this_user()
 }
 
-/// Whether only this account and root can change the entry. In a sticky directory others can
-/// add entries but not replace ours, and each entry below it is checked in turn.
-fn safe_entry(meta: &Metadata) -> bool {
-    let mode = meta.permissions().mode();
-    owned_by_us_or_root(meta) && (mode & 0o022 == 0 || (meta.is_dir() && mode & 0o1000 != 0))
+/// The group macOS gives its administrators, whose write access a default Homebrew install has.
+pub(super) fn admin_group() -> Option<u32> {
+    cfg!(target_os = "macos").then_some(80)
+}
+
+/// Who besides this account and root can change an entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Access {
+    Private,
+    /// Root's sticky directory (`/tmp`): others can add entries but not replace a directory of
+    /// ours, so it may only lead to a real directory.
+    StickyRoot,
+    AdminGroup,
+    Refused,
+}
+
+/// An entry's [`Access`], for this user `me` and the administrators' group `admin`.
+pub(super) fn classify(
+    (uid, gid, mode): (u32, u32, u32),
+    is_dir: bool,
+    me: u32,
+    admin: Option<u32>,
+) -> Access {
+    if uid != 0 && uid != me {
+        Access::Refused
+    } else if mode & 0o022 == 0 {
+        Access::Private
+    } else if is_dir && uid == 0 && mode & 0o1000 != 0 {
+        Access::StickyRoot
+    } else if mode & 0o002 == 0 && admin == Some(gid) {
+        Access::AdminGroup
+    } else {
+        Access::Refused
+    }
+}
+
+/// A path with every link resolved, and whether administrators could change it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Trusted {
+    pub(super) path: PathBuf,
+    pub(super) admin_writable: bool,
 }
 
 fn parts(path: &Path) -> Vec<OsString> {
@@ -55,25 +91,42 @@ fn parts(path: &Path) -> Vec<OsString> {
         .collect()
 }
 
-/// The real path of `path`, if nothing on the way to it, links included, can be changed by
-/// another account.
-pub(super) fn resolve_trusted(path: &Path) -> Option<PathBuf> {
+/// The real path of `path`, if nothing on the way to it, links included, can be changed by an
+/// account other than this one, root and, when `admin` is given, that group.
+pub(super) fn resolve_trusted(path: &Path, admin: Option<u32>) -> Option<Trusted> {
     if !path.is_absolute() {
         return None;
     }
+    let access = |meta: &Metadata| {
+        let mode = meta.permissions().mode();
+        classify(
+            (meta.uid(), meta.gid(), mode),
+            meta.is_dir(),
+            this_user(),
+            admin,
+        )
+    };
     let mut at = PathBuf::from("/");
-    if !safe_entry(&std::fs::symlink_metadata(&at).ok()?) {
+    let root = access(&std::fs::symlink_metadata(&at).ok()?);
+    if root == Access::Refused {
         return None;
     }
+    let mut admin_writable = root == Access::AdminGroup;
+    let mut in_sticky = root == Access::StickyRoot;
     let mut pending: Vec<OsString> = parts(path).into_iter().rev().collect();
     let mut links = 0;
     while let Some(part) = pending.pop() {
         if part == ".." {
             at.pop();
+            // The directory reached was checked on the way in, but what it may hold was not.
+            in_sticky = access(&std::fs::symlink_metadata(&at).ok()?) == Access::StickyRoot;
             continue;
         }
         let next = at.join(&part);
         let meta = std::fs::symlink_metadata(&next).ok()?;
+        if in_sticky && !meta.is_dir() {
+            return None;
+        }
         if meta.file_type().is_symlink() {
             links += 1;
             if links > MAX_LINKS || !owned_by_us_or_root(&meta) {
@@ -82,16 +135,23 @@ pub(super) fn resolve_trusted(path: &Path) -> Option<PathBuf> {
             let target = std::fs::read_link(&next).ok()?;
             if target.is_absolute() {
                 at = PathBuf::from("/");
+                in_sticky = root == Access::StickyRoot;
             }
             pending.extend(parts(&target).into_iter().rev());
             continue;
         }
-        if !safe_entry(&meta) {
+        let entry = access(&meta);
+        if entry == Access::Refused {
             return None;
         }
+        admin_writable |= entry == Access::AdminGroup;
+        in_sticky = entry == Access::StickyRoot;
         at = next;
     }
-    Some(at)
+    Some(Trusted {
+        path: at,
+        admin_writable,
+    })
 }
 
 fn flock(file: &File, operation: libc::c_int) -> io::Result<()> {
@@ -124,7 +184,9 @@ fn private_root(root: &Path) -> Result<PathBuf, HelmError> {
         return Err(HelmError::UnsafeRunDirectory);
     };
     std::fs::create_dir_all(parent).map_err(|_| HelmError::NotStarted)?;
-    let parent = resolve_trusted(parent).ok_or(HelmError::UnsafeRunDirectory)?;
+    let parent = resolve_trusted(parent, None)
+        .ok_or(HelmError::UnsafeRunDirectory)?
+        .path;
     let root = parent.join(name);
     match DirBuilder::new().mode(0o700).create(&root) {
         Ok(()) => {}

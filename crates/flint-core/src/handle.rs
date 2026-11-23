@@ -1314,6 +1314,19 @@ impl CoreHandle {
         async move { run.await.unwrap_or(Err(HelmError::Stopped)) }
     }
 
+    /// What a Helm view should warn of the `helm` a run at `pin` would start, if anything.
+    pub fn helm_warning(
+        &self,
+        cluster: &str,
+        pin: &HelmPin,
+    ) -> impl Future<Output = Option<String>> + Send + 'static {
+        let target = self.helm_target(cluster, pin.0.clone());
+        let warning = spawn_aborting(&self.runtime, async move {
+            crate::helm::warning(&target.await.ok()?).await
+        });
+        async move { warning.await.flatten() }
+    }
+
     /// Resolves once a `helm` run on `cluster` at `pin` may no longer go on.
     async fn helm_refused(&self, cluster: &str, pin: &ContextPin) -> HelmError {
         loop {
