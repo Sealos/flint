@@ -2881,9 +2881,7 @@ fn confirm_expose(
             let scope = scope.clone();
             model.update(cx, |m, _| save(m, context.clone(), server.clone(), scope));
             // This question closes by itself; the pickers under it close with it.
-            window.defer(cx, |window, cx| {
-                gpui_kit::component::WindowExt::close_dialog(window, cx)
-            });
+            window.defer(cx, confirm::close_newest);
         });
         false
     });

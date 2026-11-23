@@ -510,7 +510,34 @@ impl DetailView {
         }
     }
 
-    pub(super) fn review_edit(&mut self, cx: &mut Context<Self>) {
+    /// Focuses the editor if it is on show and can be typed in.
+    pub(super) fn focus_shown_editor(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab == DetailTab::Yaml
+            && let Some(edit) = &self.edit
+            && matches!(edit.phase, Phase::Editing | Phase::Conflict)
+        {
+            edit.editor.read(cx).focus_handle(cx).focus(window, cx);
+        }
+    }
+
+    /// [`Self::focus_shown_editor`] for a result that arrives later: only while focus is still
+    /// in this pane, so it never pulls focus from where it was moved since the request.
+    fn return_focus_to_editor(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus.contains_focused(window, cx) {
+            self.focus_shown_editor(window, cx);
+        }
+    }
+
+    pub(super) fn review_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_review_edit() {
+            return;
+        }
+        // The pane holds focus while the review runs, and gives it back to the editor after.
+        self.focus.focus(window, cx);
+        self.run_review(window, cx);
+    }
+
+    fn run_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.can_review_edit() {
             return;
         }
@@ -521,6 +548,7 @@ impl DetailView {
         let yaml = edit.editor.read(cx).value().to_string();
         if sets_status(&yaml) {
             edit.error = Some("Remove status: it cannot be edited here.".to_owned());
+            self.focus_shown_editor(window, cx);
             cx.notify();
             return;
         }
@@ -533,7 +561,7 @@ impl DetailView {
             .map(|latest| (edit.seen.clone(), latest, yaml.clone()));
         let run = core.review_write(edit.target.clone(), WriteProposal::ApplyYaml { yaml });
         let name = self.object.name.clone();
-        edit._task = cx.spawn(async move |this, cx| {
+        edit._task = cx.spawn_in(window, async move |this, cx| {
             let result = run.await;
             let shown = result
                 .as_ref()
@@ -550,8 +578,8 @@ impl DetailView {
                     (patch, competing)
                 })
                 .await;
-            let _ = this.update(cx, |view, cx| {
-                view.edit_reviewed(result, patch, competing, cx)
+            let _ = this.update_in(cx, |view, window, cx| {
+                view.edit_reviewed(result, patch, competing, window, cx)
             });
         });
         cx.notify();
@@ -562,6 +590,7 @@ impl DetailView {
         result: Result<WriteReview, WriteError>,
         patch: Option<String>,
         competing: Vec<String>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(edit) = &mut self.edit else {
@@ -584,6 +613,7 @@ impl DetailView {
             }
             Err(error) => Self::edit_failed(edit, error),
         }
+        self.return_focus_to_editor(window, cx);
         cx.notify();
     }
 
@@ -598,10 +628,13 @@ impl DetailView {
     }
 
     /// Asks the window to confirm the reviewed change.
-    pub(super) fn apply_edit(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn apply_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.can_apply_edit() {
             return;
         }
+        // The confirmation hands focus back to the pane, which gives it to the editor on a
+        // refusal.
+        self.focus.focus(window, cx);
         if let Some(edit) = &self.edit
             && let Phase::Reviewed(review) = &edit.phase
         {
@@ -635,6 +668,10 @@ impl DetailView {
                 if let Some(edit) = &mut self.edit {
                     Self::edit_failed(edit, error);
                 }
+                // After the update under way, which may still be closing the confirmation.
+                cx.defer_in(window, |view, window, cx| {
+                    view.return_focus_to_editor(window, cx)
+                });
             }
         }
         cx.notify();
@@ -645,6 +682,7 @@ impl DetailView {
         if !self.can_reload_edit() {
             return;
         }
+        self.focus.focus(window, cx);
         let o = &self.object;
         let fetch = self
             .core
@@ -677,6 +715,7 @@ impl DetailView {
             Err(why) => {
                 edit.phase = Phase::Conflict;
                 edit.error = Some(format!("Could not reload the object: {why}"));
+                self.return_focus_to_editor(window, cx);
                 cx.notify();
                 return;
             }
@@ -685,6 +724,7 @@ impl DetailView {
         if text("/metadata/uid") != edit.target.uid.as_deref() {
             edit.phase = Phase::Editing;
             edit.error = Some(WriteError::Replaced.to_string());
+            self.return_focus_to_editor(window, cx);
             cx.notify();
             return;
         }
@@ -700,14 +740,19 @@ impl DetailView {
             edit.target.resource_version = Some(version.to_owned());
         }
         edit.phase = Phase::Editing;
-        self.review_edit(cx);
+        self.run_review(window, cx);
+        // Not reviewed (the cluster was locked meanwhile): the editor is back on show.
+        if matches!(self.edit.as_ref().map(|e| &e.phase), Some(Phase::Editing)) {
+            self.return_focus_to_editor(window, cx);
+        }
     }
 
-    pub(super) fn back_to_edit(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn back_to_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.can_go_back_to_edit()
             && let Some(edit) = &mut self.edit
         {
             edit.phase = Phase::Editing;
+            self.focus_shown_editor(window, cx);
             cx.notify();
         }
     }

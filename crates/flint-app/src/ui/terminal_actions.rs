@@ -159,6 +159,14 @@ impl TerminalView {
 
     /// Pastes the clipboard's text, if any, while the shell runs ([`TerminalView::paste`]).
     fn paste_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.holds_focus(window, cx) {
+            self.set_note(
+                Tone::Warning,
+                "Click the shell to paste into it.".to_owned(),
+            );
+            cx.notify();
+            return;
+        }
         let text = cx.read_from_clipboard().and_then(|item| item.text());
         match text {
             Some(text) if self.is_live() && !text.is_empty() => self.paste(text, window, cx),

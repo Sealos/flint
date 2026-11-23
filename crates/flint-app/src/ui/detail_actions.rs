@@ -156,17 +156,20 @@ impl DetailView {
         bind.bind::<Refresh>(|view, _, window, cx| view.refresh(window, cx))
             .bind::<Close>(|_, _, _, cx| cx.emit(DetailEvent::Close))
             .bind::<ShowOverview>(|view, _, _, cx| view.show_tab(DetailTab::Overview, cx))
-            .bind::<ShowYaml>(|view, _, _, cx| view.show_tab(DetailTab::Yaml, cx))
+            .bind::<ShowYaml>(|view, _, window, cx| {
+                view.show_tab(DetailTab::Yaml, cx);
+                view.focus_shown_editor(window, cx);
+            })
             .bind::<ToggleManagedFields>(|view, _, window, cx| {
                 if view.has_managed_fields() {
                     view.toggle_managed_fields(window, cx)
                 }
             })
             .bind::<EditYaml>(|view, _, window, cx| view.start_edit(window, cx))
-            .bind::<ReviewYamlEdit>(|view, _, _, cx| view.review_edit(cx))
-            .bind::<ApplyYamlEdit>(|view, _, _, cx| view.apply_edit(cx))
+            .bind::<ReviewYamlEdit>(|view, _, window, cx| view.review_edit(window, cx))
+            .bind::<ApplyYamlEdit>(|view, _, window, cx| view.apply_edit(window, cx))
             .bind::<ReloadYamlEdit>(|view, _, window, cx| view.reload_edit(window, cx))
-            .bind::<BackToYamlEdit>(|view, _, _, cx| view.back_to_edit(cx))
+            .bind::<BackToYamlEdit>(|view, _, window, cx| view.back_to_edit(window, cx))
             .bind::<CancelYamlEdit>(|view, _, _, cx| view.cancel_edit(cx))
             .bind::<ToggleLabels>(|view, _, _, cx| {
                 view.show_labels = !view.show_labels;

@@ -6,7 +6,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher as _;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::OnceLock;
 
 use gpui_kit::base::TestSupportExt as _;
@@ -168,9 +168,11 @@ fn open_dialog(
     let target_height = Rc::new(Cell::new(px(0.)));
     // What a gated footer's buttons answer from: opening the dialog does not focus it.
     let gate_focus = gate.as_ref().map(|_| cx.focus_handle());
+    let live = LiveDialog::open(window, cx);
     window.open_alert_dialog(cx, move |alert, window, cx| {
         let on_ok = on_ok.clone();
         let gate = gate.clone();
+        let (live_ok, live_cancel) = (live.clone(), live.clone());
         let gated = gate.as_ref().map(|gate| gate(cx));
         // A long text scrolls, so it cannot push the buttons or its last lines out of the dialog.
         let viewport = window.viewport_size().height;
@@ -254,12 +256,16 @@ fn open_dialog(
                 gate_focus.as_ref().zip(gated.as_ref()),
                 |this, (focus, state)| this.footer(gated_footer(&dialog, state, focus, cx)),
             )
+            // A press drawn before this dialog was answered must not close the one under it.
+            .on_cancel(move |_, window, cx| live_cancel.retire(window, cx))
             .on_ok(move |_, window, cx| {
-                if gate.as_ref().is_some_and(|gate| gate(cx).blocked) {
+                if !live_ok.is_newest(window, cx)
+                    || gate.as_ref().is_some_and(|gate| gate(cx).blocked)
+                {
                     return false;
                 }
                 let before = window.focused(cx);
-                if on_ok(window, cx) {
+                if on_ok(window, cx) && live_ok.retire(window, cx) {
                     close_returning_focus(before, window, cx);
                 }
                 // Closed above, or kept open. Answering `true` would close it through the
@@ -274,6 +280,67 @@ fn open_dialog(
     }
     // Whether the text overflows is known once it is laid out.
     window.on_next_frame(|window, _| window.refresh());
+}
+
+/// The confirmations not yet answered, per window, oldest first. A dialog's controls stay on
+/// screen until the next frame, so a press can reach one that was already answered.
+#[derive(Default)]
+struct LiveDialogs(std::collections::HashMap<WindowId, Vec<Weak<()>>>);
+
+impl Global for LiveDialogs {}
+
+/// One confirmation's place in [`LiveDialogs`], for as long as the dialog holds it.
+#[derive(Clone)]
+struct LiveDialog(Rc<()>);
+
+impl LiveDialog {
+    fn open(window: &Window, cx: &mut App) -> Self {
+        let dialog = Self(Rc::new(()));
+        let live = cx.default_global::<LiveDialogs>();
+        live.0.retain(|_, stack| {
+            stack.retain(|d| d.strong_count() > 0);
+            !stack.is_empty()
+        });
+        live.0
+            .entry(window.window_handle().window_id())
+            .or_default()
+            .push(Rc::downgrade(&dialog.0));
+        dialog
+    }
+
+    /// Whether this is the newest confirmation still unanswered in `window`.
+    fn is_newest(&self, window: &Window, cx: &App) -> bool {
+        cx.try_global::<LiveDialogs>()
+            .and_then(|live| live.0.get(&window.window_handle().window_id()))
+            .and_then(|stack| stack.iter().rev().find(|d| d.strong_count() > 0))
+            .is_some_and(|newest| newest.ptr_eq(&Rc::downgrade(&self.0)))
+    }
+
+    /// Marks this dialog answered, if it is the newest one: whether it was.
+    fn retire(&self, window: &Window, cx: &mut App) -> bool {
+        if !self.is_newest(window, cx) {
+            return false;
+        }
+        let me = Rc::downgrade(&self.0);
+        if let Some(stack) = cx
+            .global_mut::<LiveDialogs>()
+            .0
+            .get_mut(&window.window_handle().window_id())
+        {
+            stack.retain(|d| !d.ptr_eq(&me));
+        }
+        true
+    }
+}
+
+/// Closes the newest confirmation from code, keeping [`LiveDialogs`] in step.
+pub fn close_newest(window: &mut Window, cx: &mut App) {
+    let id = window.window_handle().window_id();
+    if let Some(stack) = cx.default_global::<LiveDialogs>().0.get_mut(&id) {
+        stack.retain(|d| d.strong_count() > 0);
+        stack.pop();
+    }
+    window.close_dialog(cx);
 }
 
 /// Closes the newest dialog and returns focus to what held it before the dialog, in this update.
@@ -1301,6 +1368,94 @@ mod tests {
         cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
         assert_eq!(focused(cx, window), Some(target));
+    }
+
+    /// Clicks the newest dialog's `button` twice, with no frame drawn between the clicks.
+    fn click_twice_before_repaint(
+        cx: &mut TestAppContext,
+        window: AnyWindowHandle,
+        button: &'static str,
+    ) {
+        use gpui_kit::{
+            Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput,
+        };
+
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let bounds = window
+                .find_all(button)
+                .last()
+                .expect("the button is drawn")
+                .bounds();
+            let position = bounds.center();
+            let modifiers = Modifiers::default();
+            window.dispatch_event(
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position,
+                    pressed_button: None,
+                    modifiers,
+                }),
+                cx,
+            );
+            window.render_frame(cx);
+            for _ in 0..2 {
+                window.dispatch_event(
+                    PlatformInput::MouseDown(MouseDownEvent {
+                        button: MouseButton::Left,
+                        position,
+                        modifiers,
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    cx,
+                );
+                window.dispatch_event(
+                    PlatformInput::MouseUp(MouseUpEvent {
+                        button: MouseButton::Left,
+                        position,
+                        modifiers,
+                        click_count: 1,
+                    }),
+                    cx,
+                );
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    // Two clicks on OK before the next frame run its handler once.
+    #[gpui_kit::test]
+    async fn a_second_ok_before_repaint_does_nothing(cx: &mut TestAppContext) {
+        let window = window(cx);
+        let runs = Rc::new(Cell::new(0));
+        let count = runs.clone();
+        cx.update_window(window, |_, window, cx| {
+            open(window, cx, text("Once"), move |_, _| {
+                count.set(count.get() + 1)
+            })
+        })
+        .unwrap();
+        click_twice_before_repaint(cx, window, "ok");
+        assert_eq!(runs.get(), 1);
+    }
+
+    // A stale click on a dialog already answered leaves the dialog under it open.
+    #[gpui_kit::test]
+    async fn a_stale_click_keeps_the_dialog_underneath(cx: &mut TestAppContext) {
+        for button in ["ok", "cancel"] {
+            let window = window(cx);
+            open_text(cx, window, "Under");
+            cx.update_window(window, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+            open_text(cx, window, "Over");
+            click_twice_before_repaint(cx, window, button);
+            assert_eq!(
+                shown_title(cx, window).as_deref(),
+                Some("Under"),
+                "{button}"
+            );
+        }
     }
 
     // GPUI stacks dialogs: one opened over another is shown, and closing it shows the one

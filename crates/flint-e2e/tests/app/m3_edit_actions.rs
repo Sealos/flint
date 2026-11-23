@@ -731,6 +731,55 @@ fn editor_opened_from_the_palette_keeps_focus() -> Result<()> {
     Ok(())
 }
 
+// Every way back to an editable editor gives it focus, wherever focus was.
+#[test]
+#[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
+fn every_return_to_the_editor_takes_focus() -> Result<()> {
+    let refused = || {
+        Fault::admission_denied("policy.example.com", DENIED)
+            .on(&Gvr::core("pods"))
+            .verb(Verb::Other)
+            .times(1)
+    };
+    let cluster = TestCluster::fake(Options::default())?;
+    let fake = cluster.fake_server().expect("a fake server");
+    let app = launch_unlocked(&cluster)?;
+    let (exec, tab) = open_pod_shell(&app, fake)?;
+    app.dispatch("detail::EditYaml", Value::Null)?;
+    app.wait_for("/focus", Equals("detail_yaml".into()))?;
+    app.press_key("secondary-down")?;
+    app.type_text("immutable: true\n")?;
+
+    // Back from the review.
+    review(&app)?;
+    focus_tab(&app, tab)?;
+    app.dispatch("detail::BackToYamlEdit", Value::Null)?;
+    app.wait_for("/detail/edit", Equals("editing".into()))?;
+    assert_editor_keeps_keys(&app, &exec)?;
+
+    // The YAML tab shown again, with the edit kept.
+    app.dispatch("detail::ShowOverview", Value::Null)?;
+    focus_tab(&app, tab)?;
+    app.dispatch("detail::ShowYaml", Value::Null)?;
+    assert_editor_keeps_keys(&app, &exec)?;
+
+    // A review that is refused.
+    focus_tab(&app, tab)?;
+    fake.inject(refused());
+    app.dispatch("detail::ReviewYamlEdit", Value::Null)?;
+    app.wait_for("/detail/edit", Equals("editing".into()))?;
+    assert_editor_keeps_keys(&app, &exec)?;
+
+    // An apply that is refused.
+    review(&app)?;
+    focus_tab(&app, tab)?;
+    fake.inject(refused());
+    confirm_apply(&app)?;
+    app.wait_for("/detail/edit", Equals("editing".into()))?;
+    assert_editor_keeps_keys(&app, &exec)?;
+    Ok(())
+}
+
 // A dock tab on one cluster keeps none of the keys typed into an editor on another.
 #[test]
 #[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]

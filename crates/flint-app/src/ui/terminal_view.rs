@@ -417,8 +417,14 @@ impl TerminalView {
         }
     }
 
-    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.is_live() {
+    /// Whether focus is on this tab now. The frame on screen can be older than a focus change,
+    /// so input handlers registered with it ask before they send anything.
+    pub(super) fn holds_focus(&self, window: &Window, cx: &App) -> bool {
+        self.focus.contains_focused(window, cx)
+    }
+
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_live() || !self.holds_focus(window, cx) {
             return;
         }
         let mode = self.snapshot.terminal.mode;
@@ -630,16 +636,24 @@ impl TerminalView {
                     .on_click(registry::on_click(CopyText)),
             )
             .child(
-                Button::new("terminal-paste")
-                    .xsmall()
-                    .ghost()
-                    .label("Paste")
-                    .disabled(!self.is_live())
-                    .tooltip(format!(
-                        "Paste into the shell ({})",
-                        registry::key_hint(registry::TERMINAL_PASTE[0])
-                    ))
-                    .on_click(registry::on_click(PasteText)),
+                // Pressing Paste puts focus on this tab, which paste requires.
+                div()
+                    .capture_any_mouse_down({
+                        let focus = self.focus.clone();
+                        move |_, window, cx| window.focus(&focus, cx)
+                    })
+                    .child(
+                        Button::new("terminal-paste")
+                            .xsmall()
+                            .ghost()
+                            .label("Paste")
+                            .disabled(!self.is_live())
+                            .tooltip(format!(
+                                "Paste into the shell ({})",
+                                registry::key_hint(registry::TERMINAL_PASTE[0])
+                            ))
+                            .on_click(registry::on_click(PasteText)),
+                    ),
             )
     }
 
@@ -1213,12 +1227,14 @@ impl InputHandler for TerminalInput {
         &mut self,
         _: Option<Range<usize>>,
         text: &str,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) {
         self.with(cx, |view, cx| {
             view.marked = None;
-            view.send(text.as_bytes().to_vec(), cx);
+            if view.holds_focus(window, cx) {
+                view.send(text.as_bytes().to_vec(), cx);
+            }
             cx.notify();
         });
     }
@@ -1228,11 +1244,12 @@ impl InputHandler for TerminalInput {
         _: Option<Range<usize>>,
         text: &str,
         _: Option<Range<usize>>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) {
         self.with(cx, |view, cx| {
-            view.marked = (!text.is_empty()).then(|| text.to_owned());
+            view.marked =
+                (!text.is_empty() && view.holds_focus(window, cx)).then(|| text.to_owned());
             cx.notify();
         });
     }
