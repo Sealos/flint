@@ -43,12 +43,18 @@ impl Drop for ScanStop {
     }
 }
 
-/// What regex scans may still test on the UI thread: one budget for everything a frame scans, so
-/// the search and the filter together stay within [`GUARD_SCAN_LINES`] and [`GUARD_SCAN_BYTES`].
+/// Most text a frame tests with a plain query on the UI thread: a few milliseconds of substring
+/// search, whatever the number of lines.
+pub(super) const PLAIN_CATCH_UP_BYTES: usize = 4 * 1024 * 1024;
+
+/// What scans may still test on the UI thread: one budget for everything a frame scans, so the
+/// search and the filter together stay within [`GUARD_SCAN_LINES`] and [`GUARD_SCAN_BYTES`] for a
+/// regex, and [`PLAIN_CATCH_UP_BYTES`] for plain text.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct UiScanBudget {
     lines: u64,
     bytes: usize,
+    plain_bytes: usize,
 }
 
 impl Default for UiScanBudget {
@@ -56,23 +62,26 @@ impl Default for UiScanBudget {
         UiScanBudget {
             lines: GUARD_SCAN_LINES as u64,
             bytes: GUARD_SCAN_BYTES,
+            plain_bytes: PLAIN_CATCH_UP_BYTES,
         }
     }
 }
 
-/// Whether testing the newest `pending` lines with `query` is short enough for the UI thread. A
-/// regex is held to a bound on text as well as lines, counting the sources it also tests; a scan
-/// that fits takes its share of `budget`, and one that does not takes nothing.
+/// Whether testing the newest `pending` lines with `query` is short enough for the UI thread,
+/// by lines and by text, counting the sources it also tests. A scan that fits takes its share of
+/// `budget`, and one that does not takes nothing.
 pub(super) fn catch_up_fits_ui(
     query: &SearchQuery,
     pending: u64,
     lines: &LogLines,
     budget: &mut UiScanBudget,
 ) -> bool {
-    if !query.regex {
-        return pending <= super::CATCH_UP_ON_UI;
-    }
-    if pending > budget.lines {
+    let (max_lines, max_bytes) = if query.regex {
+        (budget.lines, budget.bytes)
+    } else {
+        (super::CATCH_UP_ON_UI, budget.plain_bytes)
+    };
+    if pending > max_lines {
         return false;
     }
     let end = lines.end_id();
@@ -84,11 +93,15 @@ pub(super) fn catch_up_fits_ui(
         {
             bytes += source.label().len();
         }
-        bytes <= budget.bytes
+        bytes <= max_bytes
     });
     if fits {
-        budget.lines -= pending;
-        budget.bytes -= bytes;
+        if query.regex {
+            budget.lines -= pending;
+            budget.bytes -= bytes;
+        } else {
+            budget.plain_bytes -= bytes;
+        }
     }
     fits
 }
@@ -314,6 +327,7 @@ impl LogView {
             None => rows.len().saturating_sub(old_len),
         };
         let evicted = old_len.saturating_sub(rows.len() - appended);
+        let was_empty = old_len == evicted;
         if evicted > 0 {
             self.list.splice(0..evicted, 0);
             // The new first row may gain a day separator.
@@ -322,11 +336,63 @@ impl LogView {
             }
         }
         if appended > 0 {
-            // Rows came: the place is theirs now.
-            self.held_anchor = None;
+            let held = self.held_anchor.take();
             let end = self.list.item_count();
             self.list.splice(end..end, appended);
+            // The first rows after a filter showed none go back to the place it held, unless
+            // the list follows the tail.
+            if was_empty && !self.list.is_following_tail() {
+                self.scroll_back_to(held);
+            }
         }
+    }
+
+    /// Finds the matches of the long lines drawn whole on a background thread, one batch at a
+    /// time: the UI thread only tests the start of a line with a regex. Holds the snapshot only
+    /// while it runs.
+    pub(super) fn scan_whole_lines(&mut self, cx: &mut Context<Self>) {
+        if self.whole_line_scanning {
+            return;
+        }
+        let ids = self.highlights.borrow_mut().take_wanted();
+        if ids.is_empty() {
+            return;
+        }
+        self.whole_line_scanning = true;
+        let query = self.query.clone();
+        let lines = self.snapshot.lines.clone();
+        let stop = ScanCancel::default();
+        self.whole_line_scan.watch(stop.clone());
+        self._whole_lines = cx.spawn(async move |this, cx| {
+            let matcher = query.matcher();
+            let found = cx
+                .background_spawn(async move {
+                    let mut found = Vec::with_capacity(ids.len());
+                    for id in ids {
+                        if stop.is_cancelled() {
+                            break;
+                        }
+                        if let Some(line) = lines.get(id) {
+                            found.push((id, matcher.whole_line_ranges(&line.text)));
+                        }
+                    }
+                    found
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.whole_line_scanning = false;
+                view.whole_line_scan.finished();
+                view.highlights.borrow_mut().store_whole(&query, found);
+                cx.notify();
+            });
+        });
+    }
+
+    /// Drops a whole-line scan of a query that is no longer searched.
+    pub(super) fn stop_whole_line_scan(&mut self) {
+        self.whole_line_scan.stop();
+        self.whole_line_scanning = false;
+        self._whole_lines = Task::ready(());
     }
 
     /// The line at the top of the list, unless it follows the tail: where the list goes back

@@ -2348,6 +2348,133 @@ fn a_regex_catch_up_is_bounded_by_text() {
     ));
 }
 
+// covers UP-48: a plain catch-up of few, very long lines goes to the core's threads too.
+#[test]
+fn a_plain_catch_up_is_bounded_by_text() {
+    use super::filter::{PLAIN_CATCH_UP_BYTES, UiScanBudget, catch_up_fits_ui};
+    use flint_core::SearchQuery;
+
+    let line = "x".repeat(60 * 1024);
+    let fit = PLAIN_CATCH_UP_BYTES / line.len();
+    let mut buffer = LogBuffer::new(fit + 2);
+    for _ in 0..fit + 1 {
+        buffer.push(LogLine::parse(&line, false));
+    }
+    let view = buffer.view();
+    let plain = SearchQuery::new("needle");
+    let mut budget = UiScanBudget::default();
+    assert!(catch_up_fits_ui(&plain, fit as u64, &view, &mut budget));
+    assert!(
+        !catch_up_fits_ui(&plain, fit as u64, &view, &mut budget),
+        "the search and the filter of a frame share the budget"
+    );
+    assert!(!catch_up_fits_ui(
+        &plain,
+        fit as u64 + 1,
+        &view,
+        &mut UiScanBudget::default()
+    ));
+}
+
+// covers UP-48: the first rows after a filter showed none go back to the place it held.
+#[gpui_kit::test]
+async fn rows_after_an_empty_filter_return_to_the_held_place(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(1_000);
+    feed(cx, &view, lines.push(1000, 1024).streaming());
+    draw(cx, window);
+    view.update(cx, |v, cx| {
+        v.context = 3;
+        v.set_query("line 2".into(), cx);
+    });
+    run(
+        cx,
+        window,
+        "logs::ToggleMatchingOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 0).await;
+    view.update(cx, |v, _| {
+        v.list.pause_following_tail();
+        v.held_anchor = Some(23);
+    });
+
+    // Ids 24 on match, so ids 21 to 23 come as their context.
+    feed(cx, &view, lines.push(2000, 2100).streaming());
+    until_rows(cx, window, &view, 103).await;
+    draw(cx, window);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.row_id(v.list.logical_scroll_top().item_ix), Some(23));
+        assert_eq!(v.held_anchor, None);
+    });
+}
+
+// covers UP-48: a drag goes on after a filter hid every selected row, to a row still shown.
+#[gpui_kit::test]
+async fn a_drag_survives_a_filter_that_hides_its_rows(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    feed(cx, &view, lines.push(0, 10).streaming());
+    draw(cx, window);
+    view.update(cx, |v, _| {
+        v.selection = Some(LineSelection::line(0));
+        v.drag_selecting = true;
+    });
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 2).await;
+    view.read_with(cx, |v, _| assert!(!v.has_selection() && v.is_selecting()));
+
+    run(
+        cx,
+        window,
+        "logs::DragSelection",
+        serde_json::json!({"line": 4}),
+    );
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.selection.map(|s| s.head), Some(4));
+    });
+    // A hidden destination is not taken.
+    run(
+        cx,
+        window,
+        "logs::DragSelection",
+        serde_json::json!({"line": 5}),
+    );
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.selection.map(|s| s.head), Some(4));
+        assert!(v.check_line::<registry::DragSelection>(5).is_err());
+    });
+}
+
+// covers UP-48: Set Context Lines refuses a value over the limit and says why, so the palette
+// stays open; the view keeps its context.
+#[gpui_kit::test]
+async fn context_lines_over_the_limit_are_refused(cx: &mut TestAppContext) {
+    assert!(LogView::check_context(100).is_ok());
+    let refusal = LogView::check_context(101).unwrap_err().to_string();
+    assert!(refusal.contains("0 to 100"), "{refusal}");
+
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    feed(cx, &view, lines.push(0, 10).streaming());
+    draw(cx, window);
+    let action = crate::ui::registry::SetLogContext { lines: 101 };
+    cx.update_window(window, |_, window, cx| {
+        window.dispatch_action(Box::new(action), cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| assert_eq!(v.context, 0));
+}
+
 // covers UP-48: a regex over sources counts their bytes toward the UI thread's budget.
 #[test]
 fn a_regex_catch_up_counts_source_bytes() {

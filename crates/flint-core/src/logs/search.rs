@@ -19,7 +19,7 @@ use regex::Regex;
 
 use super::buffer::LogLines;
 use super::line::{LineId, LogLine};
-use super::pattern::{self, GUARD_SCAN_BYTES, GUARD_SCAN_LINES, PatternError, ScanCancel};
+use super::pattern::{self, PatternError, ScanCancel};
 
 /// What to look for: a plain substring of a line's text (timestamps are not searched), or a
 /// regular expression with [`SearchQuery::regex`], and optionally of its `pod/container` source.
@@ -186,6 +186,15 @@ impl SearchMatcher {
         }
     }
 
+    /// [`SearchMatcher::match_ranges`] over a whole long line, for a background thread: a regex
+    /// is not cut to what the UI thread may test.
+    pub fn whole_line_ranges(&self, text: &str) -> Vec<Range<usize>> {
+        match &self.find {
+            Find::Regex(regex) => pattern::whole_line_ranges(regex, text),
+            _ => self.match_ranges(text),
+        }
+    }
+
     /// `text` with its ASCII lowercased, in the buffer kept from line to line.
     fn lowered(&self, text: &str) -> std::cell::RefMut<'_, Vec<u8>> {
         let mut lower = self.scratch.borrow_mut();
@@ -314,22 +323,15 @@ impl LogSearch {
         self.scanned_to = self.scanned_to.max(reached);
     }
 
-    /// The lines not scanned yet that a guard tests. All of them for a plain query; for a regex,
-    /// a window of the newest, at most [`GUARD_SCAN_LINES`] lines and about [`GUARD_SCAN_BYTES`]
-    /// bytes counted from the newest line back, since guards and state polls run on the UI
-    /// thread.
+    /// The lines not scanned yet that a guard tests: all of them for a plain query, and none for
+    /// a regex, whose guards and state polls read the matches already found on the UI thread.
     fn unscanned<'a>(&self, lines: &'a LogLines) -> impl Iterator<Item = &'a LogLine> + 'a {
         let end = lines.end_id();
-        let mut from = self.scanned_to.max(lines.first_id());
-        if self.query.regex {
-            let oldest = from.max(end.saturating_sub(GUARD_SCAN_LINES as LineId));
-            let (mut at, mut budget) = (end, GUARD_SCAN_BYTES);
-            while at > oldest && budget > 0 {
-                at -= 1;
-                budget = budget.saturating_sub(lines.get(at).map_or(0, |line| line.text.len()));
-            }
-            from = at;
-        }
+        let from = if self.query.regex {
+            end
+        } else {
+            self.scanned_to.max(lines.first_id())
+        };
         lines.range(from, end).map(|(_, line)| line)
     }
 
@@ -343,8 +345,8 @@ impl LogSearch {
 
     /// Whether a line of `lines` matches, counting lines not scanned yet (tested here, without
     /// keeping the result): what an action's guard asks between two updates, which must
-    /// neither count evicted matches nor miss new ones. A regex query tests a bounded part of
-    /// the lines not scanned yet ([`LogSearch::update`] covers them all).
+    /// neither count evicted matches nor miss new ones. A regex query reads only the matches
+    /// found so far: [`LogSearch::update`] tests the rest.
     pub fn has_match_in(&self, lines: &LogLines) -> bool {
         let (first, end) = (lines.first_id(), lines.end_id());
         let present = self.matches.partition_point(|id| *id < first);
@@ -775,47 +777,30 @@ mod tests {
         );
     }
 
-    // #309: a guard between scans tests a bounded part of what was not scanned for a regex,
-    // and all of it for a plain query, as before.
+    // #309: between scans a regex guard reads cached matches and tests no line; a plain query
+    // still sees lines not scanned yet.
     #[test]
-    fn guards_test_a_bounded_part_of_the_unscanned_lines_for_a_regex() {
-        let mut buffer = LogBuffer::new(GUARD_SCAN_LINES * 3);
+    fn regex_guards_read_only_cached_matches() {
+        let mut buffer = LogBuffer::new(10);
         push(&mut buffer, "needle");
-        for _ in 0..GUARD_SCAN_LINES * 2 {
-            push(&mut buffer, "hay");
-        }
         let lines = buffer.view();
-        let bounded = LogSearch::new(regex("needle"));
-        assert!(!bounded.has_match_in(&lines), "too old for a guard to test");
-        assert_eq!(bounded.count_in(&lines), 0);
+        let mut search = LogSearch::new(regex("needle"));
+        assert!(!search.has_match_in(&lines));
+        assert_eq!(search.count_in(&lines), 0);
         let plain = LogSearch::new(SearchQuery::new("needle"));
         assert!(plain.has_match_in(&lines));
         assert_eq!(plain.count_in(&lines), 1);
-        // The scan itself covers every line.
-        let mut scanned = bounded.clone();
-        scanned.update(&lines);
-        assert_eq!(scanned.count(), 1);
 
-        // Long lines end the guard's test by bytes, well before the line limit.
-        let mut long = LogBuffer::new(100);
-        let text = "x".repeat(GUARD_SCAN_BYTES);
-        push(&mut long, "needle");
-        push(&mut long, &text);
-        assert!(!LogSearch::new(regex("needle")).has_match_in(&long.view()));
-    }
-
-    // #309: the byte budget is spent from the newest line back, so a burst of old long lines
-    // cannot hide the line that just arrived.
-    #[test]
-    fn a_guard_spends_its_bytes_on_the_newest_lines() {
-        let mut buffer = LogBuffer::new(100);
-        let long = "x".repeat(GUARD_SCAN_BYTES);
-        push(&mut buffer, &long);
-        push(&mut buffer, &long);
+        search.update(&lines);
+        assert!(search.has_match_in(&lines));
         push(&mut buffer, "needle");
-        let search = LogSearch::new(regex("needle"));
-        assert!(search.has_match_in(&buffer.view()));
-        assert_eq!(search.count_in(&buffer.view()), 1);
+        assert_eq!(
+            search.count_in(&buffer.view()),
+            1,
+            "the new line is pending"
+        );
+        search.update(&buffer.view());
+        assert_eq!(search.count_in(&buffer.view()), 2);
     }
 
     // #309: a cancelled scan stops, keeps what it found, and leaves the rest pending.

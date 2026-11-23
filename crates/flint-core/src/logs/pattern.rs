@@ -24,13 +24,13 @@ const NEST_LIMIT: u32 = 64;
 /// Compiled patterns kept per thread: highlighting asks for one for every row of every frame.
 const CACHED_PATTERNS: usize = 4;
 
-/// Most lines not scanned yet that a guard or a state poll tests for a regex query.
+/// Most lines a frame tests with a regex on the UI thread; a longer catch-up runs elsewhere.
 pub const GUARD_SCAN_LINES: usize = 2_000;
 /// Most bytes of such lines tested.
 pub const GUARD_SCAN_BYTES: usize = 256 * 1024;
 
 /// How much of a line is highlighted for a regex query.
-const HIGHLIGHT_BYTES: usize = 4 * 1024;
+pub const HIGHLIGHT_BYTES: usize = 4 * 1024;
 /// How far past [`HIGHLIGHT_BYTES`] the matcher reads, so that a match near the cut is decided
 /// by the real line. A match that would only be told apart further on than this can still be
 /// shortened: the bound on the text searched comes first.
@@ -41,6 +41,8 @@ const HIGHLIGHT_LOOKAHEAD: usize = 256;
 const HIGHLIGHT_TIME: Duration = Duration::from_millis(2);
 /// Most matches highlighted in one line.
 const HIGHLIGHT_MATCHES: usize = 256;
+/// How long highlighting one whole line may take off the UI thread.
+const WHOLE_LINE_TIME: Duration = Duration::from_millis(50);
 
 /// Why a pattern cannot be used, in words for the search field.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +139,26 @@ pub(super) fn ranges_within(regex: &Regex, text: &str, time: Duration) -> Vec<Ra
         if found.end() > cut {
             break;
         }
+        if !found.range().is_empty() {
+            out.push(found.range());
+        }
+        if out.len() == HIGHLIGHT_MATCHES || started.elapsed() >= time {
+            break;
+        }
+    }
+    out
+}
+
+/// The non-empty matches of `regex` anywhere in `text`, for a long line drawn whole. For a
+/// background thread: the text is not cut, and the time and match limits still apply.
+pub(super) fn whole_line_ranges(regex: &Regex, text: &str) -> Vec<Range<usize>> {
+    whole_line_ranges_within(regex, text, WHOLE_LINE_TIME)
+}
+
+fn whole_line_ranges_within(regex: &Regex, text: &str, time: Duration) -> Vec<Range<usize>> {
+    let started = Instant::now();
+    let mut out = Vec::new();
+    for found in regex.find_iter(text) {
         if !found.range().is_empty() {
             out.push(found.range());
         }
@@ -289,6 +311,30 @@ mod tests {
         let regex = compile("ö", true).unwrap();
         let text = format!("{}{}", "x".repeat(HIGHLIGHT_BYTES - 1), "ö".repeat(4));
         assert!(ranges_within(&regex, &text, UNHURRIED).is_empty());
+    }
+
+    // #309: a line drawn whole is highlighted past the UI thread's cut, within the same limits.
+    #[test]
+    fn whole_line_highlights_reach_past_the_cut_within_their_limits() {
+        let regex = compile("needle", true).unwrap();
+        let at = HIGHLIGHT_BYTES * 3;
+        let text = format!("{}needle", "x".repeat(at));
+        assert!(bounded_ranges(&regex, &text).is_empty());
+        assert_eq!(
+            whole_line_ranges(&regex, &text),
+            std::slice::from_ref(&(at..at + 6))
+        );
+
+        let regex = compile("a", true).unwrap();
+        let many = "a".repeat(HIGHLIGHT_MATCHES * 2);
+        assert_eq!(
+            whole_line_ranges_within(&regex, &many, UNHURRIED).len(),
+            HIGHLIGHT_MATCHES
+        );
+        assert_eq!(
+            whole_line_ranges_within(&regex, &many, Duration::ZERO),
+            std::slice::from_ref(&(0..1))
+        );
     }
 
     #[test]

@@ -355,19 +355,27 @@ fn source_matches(query: &SearchQuery, short: &str, line: &LogLine) -> Vec<Range
 const HIGHLIGHT_FRAME_TIME: std::time::Duration = std::time::Duration::from_millis(4);
 /// Most lines whose highlights are kept: several screens of rows.
 const HIGHLIGHT_CACHE_LINES: usize = 1024;
+/// Most long lines one background highlight scan covers: about a screen of rows.
+const WHOLE_LINE_BATCH: usize = 64;
 
 #[derive(Debug, Default)]
 struct CachedMatches {
     /// With the short label they were found in: labels shorten as more pods are learned.
     source: Option<(String, Vec<Range<usize>>)>,
     body: Option<Vec<Range<usize>>>,
+    /// Its whole-line matches were asked for (or have landed), so it is not asked for again.
+    whole: bool,
 }
 
 /// The search's matches in the lines drawn: found once per line and query, and for at most
 /// [`HIGHLIGHT_FRAME_TIME`] per frame. A row past that is drawn plain and asks for another frame.
+/// A regex tests only the start of a line here; a longer line drawn whole is listed for a
+/// background scan ([`LineHighlights::take_wanted`]).
 #[derive(Debug)]
 pub struct LineHighlights {
     query: SearchQuery,
+    /// How much of a line is drawn: what was found depends on it.
+    drawn: Option<usize>,
     lines: std::collections::HashMap<flint_core::LineId, CachedMatches>,
     budget: std::time::Duration,
     spent: std::time::Duration,
@@ -375,19 +383,41 @@ pub struct LineHighlights {
     deferred: bool,
     /// The next frame has been asked for.
     redraw_asked: bool,
+    /// Long lines drawn whose whole-line matches are still to be found.
+    wanted: Vec<flint_core::LineId>,
+    /// A line joined `wanted` since a frame was last asked for.
+    wanted_new: bool,
 }
 
 impl Default for LineHighlights {
     fn default() -> Self {
         LineHighlights {
             query: SearchQuery::default(),
+            drawn: None,
             lines: Default::default(),
             budget: HIGHLIGHT_FRAME_TIME,
             spent: std::time::Duration::ZERO,
             deferred: false,
             redraw_asked: false,
+            wanted: Vec::new(),
+            wanted_new: false,
         }
     }
+}
+
+/// The start of `text` that can hold a plain match reaching the first `max` bytes: one match
+/// covers at most four bytes for each char of the query, however its case folds.
+fn drawn_window<'a>(text: &'a str, query: &SearchQuery, max: Option<usize>) -> &'a str {
+    let Some(max) = max.filter(|_| !query.regex) else {
+        return text;
+    };
+    let mut end = max
+        .saturating_add(query.text.chars().count().saturating_mul(4))
+        .min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 impl LineHighlights {
@@ -397,39 +427,86 @@ impl LineHighlights {
         self.redraw_asked = false;
     }
 
-    /// Whether to ask for another frame: once per frame, when a row went without highlights.
+    /// Whether to ask for another frame: once per frame, when a row went without highlights or
+    /// a long line was newly listed for the background scan.
     pub fn take_redraw(&mut self) -> bool {
-        let ask = self.deferred && !self.redraw_asked;
+        let ask = (self.deferred || self.wanted_new) && !self.redraw_asked;
         self.redraw_asked |= ask;
+        self.wanted_new &= !ask;
         ask
     }
 
-    /// What `query` found in line `id`, as far as this frame's budget reaches.
+    /// The long lines to scan whole, at most [`WHOLE_LINE_BATCH`]; each is handed out once.
+    pub fn take_wanted(&mut self) -> Vec<flint_core::LineId> {
+        let wanted = std::mem::take(&mut self.wanted);
+        for id in &wanted {
+            if let Some(entry) = self.lines.get_mut(id) {
+                entry.whole = true;
+            }
+        }
+        wanted
+    }
+
+    /// Keeps what a background scan found for `query`, unless what is drawn has changed since.
+    pub fn store_whole(
+        &mut self,
+        query: &SearchQuery,
+        found: Vec<(flint_core::LineId, Vec<Range<usize>>)>,
+    ) {
+        if self.query != *query || self.drawn.is_some() {
+            return;
+        }
+        for (id, ranges) in found {
+            if let Some(entry) = self.lines.get_mut(&id) {
+                entry.body = Some(ranges);
+                entry.whole = true;
+            }
+        }
+    }
+
+    /// What `query` found in line `id`, as far as this frame's budget reaches. `max` is how many
+    /// bytes of the message are drawn (`None`: all of them).
     pub fn matches(
         &mut self,
         id: flint_core::LineId,
         line: &LogLine,
         query: &SearchQuery,
         short: Option<&str>,
+        max: Option<usize>,
     ) -> LineMatches {
         if query.text.is_empty() {
             return LineMatches::default();
         }
-        if self.query != *query {
+        if self.query != *query || self.drawn != max {
             self.query = query.clone();
+            self.drawn = max;
             self.lines.clear();
+            self.wanted.clear();
         }
         if self.lines.len() >= HIGHLIGHT_CACHE_LINES && !self.lines.contains_key(&id) {
             self.lines.clear();
+            self.wanted.clear();
         }
         let Self {
             lines,
             budget,
             spent,
             deferred,
+            wanted,
+            wanted_new,
             ..
         } = self;
         let entry = lines.entry(id).or_default();
+        if query.regex
+            && max.is_none()
+            && line.text.len() > flint_core::logs::HIGHLIGHT_BYTES
+            && !entry.whole
+            && wanted.len() < WHOLE_LINE_BATCH
+            && !wanted.contains(&id)
+        {
+            wanted.push(id);
+            *wanted_new = true;
+        }
         let mut find = |search: &dyn Fn() -> Vec<Range<usize>>| {
             if *spent >= *budget {
                 *deferred = true;
@@ -441,7 +518,7 @@ impl LineHighlights {
             Some(found)
         };
         if entry.body.is_none() {
-            entry.body = find(&|| query.match_ranges(&line.text));
+            entry.body = find(&|| query.match_ranges(drawn_window(&line.text, query, max)));
         }
         let source = match short.filter(|_| query.sources) {
             Some(short) => {
@@ -1042,6 +1119,11 @@ pub fn more_menu(f: &MenuFacts) -> Vec<MenuRow> {
         rows.extend(save_menu(f));
     }
     rows
+}
+
+/// How tall the "⋯" menu may be in a window `viewport` tall: it scrolls past that.
+pub fn menu_max_height(viewport: gpui_kit::Pixels) -> gpui_kit::Pixels {
+    (viewport - gpui_kit::px(48.)).max(gpui_kit::px(120.))
 }
 
 /// A workload session's streams in a few words: `3 pods · 4 live · 1 failed · 2 not read`.
@@ -1764,26 +1846,124 @@ mod tests {
             budget: std::time::Duration::ZERO,
             ..Default::default()
         };
-        assert!(highlights.matches(1, &line, &query, None).body.is_empty());
+        assert!(
+            highlights
+                .matches(1, &line, &query, None, None)
+                .body
+                .is_empty()
+        );
         assert!(highlights.take_redraw());
         assert!(!highlights.take_redraw());
 
         highlights.budget = std::time::Duration::from_secs(60);
         highlights.begin_frame();
         let found = std::slice::from_ref(&(0..4));
-        assert_eq!(highlights.matches(1, &line, &query, None).body, found);
+        assert_eq!(highlights.matches(1, &line, &query, None, None).body, found);
         assert!(!highlights.take_redraw());
 
         // Kept: no budget is needed to draw it again.
         highlights.budget = std::time::Duration::ZERO;
         highlights.begin_frame();
-        assert_eq!(highlights.matches(1, &line, &query, None).body, found);
+        assert_eq!(highlights.matches(1, &line, &query, None, None).body, found);
         assert!(!highlights.take_redraw());
 
         // Another query finds again.
         let other = SearchQuery::new("me");
-        assert!(highlights.matches(1, &line, &other, None).body.is_empty());
+        assert!(
+            highlights
+                .matches(1, &line, &other, None, None)
+                .body
+                .is_empty()
+        );
         assert!(highlights.take_redraw());
+    }
+
+    // covers UP-48: the "⋯" menu fits a short window and keeps a usable height in a tiny one.
+    #[test]
+    fn the_more_menu_fits_the_window() {
+        use gpui_kit::px;
+        assert_eq!(menu_max_height(px(400.)), px(352.));
+        assert_eq!(menu_max_height(px(100.)), px(120.));
+    }
+
+    // #309: a plain query tests only the drawn start of a line, and still sees a match that
+    // crosses the cut.
+    #[test]
+    fn plain_highlights_test_the_drawn_prefix() {
+        let query = SearchQuery::new("abc");
+        let text = format!("xxabcd{}abc", "-".repeat(100));
+        assert_eq!(drawn_window(&text, &query, Some(4)), &text[..16]);
+        assert_eq!(drawn_window(&text, &query, None), text);
+        let regex = SearchQuery {
+            regex: true,
+            ..query.clone()
+        };
+        assert_eq!(
+            drawn_window(&text, &regex, Some(4)),
+            text,
+            "cut by the core"
+        );
+        let wide = "ööööööööö";
+        assert!(wide.is_char_boundary(drawn_window(wide, &query, Some(1)).len()));
+
+        let mut highlights = LineHighlights {
+            budget: std::time::Duration::from_secs(60),
+            ..Default::default()
+        };
+        let line = LogLine::parse(&text, false);
+        let clipped = highlights.matches(1, &line, &query, None, Some(4)).body;
+        assert_eq!(clipped, std::slice::from_ref(&(2..5)));
+        // Drawn whole after Wrap: found again, not read from the clipped cache.
+        let whole = highlights.matches(1, &line, &query, None, None).body;
+        assert_eq!(whole, [2..5, 106..109]);
+    }
+
+    // #309: a long regex line drawn whole is listed once for the background scan, and what it
+    // found replaces the bounded first pass unless the query moved on.
+    #[test]
+    fn long_regex_lines_are_scanned_whole_off_the_ui_thread() {
+        let query = SearchQuery {
+            regex: true,
+            ..SearchQuery::new("needle")
+        };
+        let at = flint_core::logs::HIGHLIGHT_BYTES * 2;
+        let line = LogLine::parse(&format!("{}needle", "x".repeat(at)), false);
+        let mut highlights = LineHighlights {
+            budget: std::time::Duration::from_secs(60),
+            ..Default::default()
+        };
+        assert!(
+            highlights
+                .matches(1, &line, &query, None, None)
+                .body
+                .is_empty()
+        );
+        assert!(highlights.take_redraw(), "asks for a frame to start it");
+        assert_eq!(highlights.take_wanted(), [1]);
+        highlights.begin_frame();
+        highlights.matches(1, &line, &query, None, None);
+        assert!(highlights.take_wanted().is_empty(), "asked for once");
+
+        let other = SearchQuery {
+            regex: true,
+            ..SearchQuery::new("other")
+        };
+        highlights.store_whole(&other, vec![(1, std::iter::once(0..1).collect())]);
+        assert!(
+            highlights
+                .matches(1, &line, &query, None, None)
+                .body
+                .is_empty()
+        );
+        highlights.store_whole(&query, vec![(1, std::iter::once(at..at + 6).collect())]);
+        assert_eq!(
+            highlights.matches(1, &line, &query, None, None).body,
+            std::slice::from_ref(&(at..at + 6))
+        );
+
+        // Cut to the drawn part, nothing goes off the UI thread.
+        highlights.matches(2, &line, &query, None, Some(UNWRAPPED_MAX_BYTES));
+        assert!(highlights.take_wanted().is_empty());
     }
 
     // covers UP-40: the toolbar stays one row, giving up parts as the tab narrows.

@@ -80,6 +80,71 @@ fn tab(state: &Value, id: u64) -> &Value {
         .unwrap_or(&Value::Null)
 }
 
+// covers UP-48: the filter actions need a log tab, a drag outlives a filter that hides its rows
+// but only lands on a row shown, and context over the limit is refused with the reason.
+#[gpui_kit::test]
+async fn log_filter_actions_are_guarded(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "kind-alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    for name in [
+        "logs::ToggleErrorsOnly",
+        "logs::ToggleMatchingOnly",
+        "logs::ToggleLogRegex",
+    ] {
+        assert!(dispatch(cx, &t, name, Value::Null).is_err(), "{name}");
+    }
+    assert!(dispatch(cx, &t, "logs::SetLogContext", json!({"lines": 1})).is_err());
+
+    // The row's menu selects it, which opens the detail pane.
+    right_click(cx, &t, "web").await;
+    press(cx, &t, "escape");
+    draw(cx, &t);
+    show_fetched(cx, &t, pod_detail("web"));
+    dispatch(cx, &t, "detail::OpenLogs", Value::Null).unwrap();
+    draw(cx, &t);
+    let id = state(cx, &t)["dock"]["active"].as_u64().unwrap();
+    let view = log_view(cx, &t, id);
+    let mut buffer = LogBuffer::new(100);
+    for text in ["ready", "ERROR failed", "done"] {
+        buffer.push(LogLine::parse(
+            &format!("2024-05-01T12:00:00Z {text}"),
+            false,
+        ));
+    }
+    view.update(cx, |v, cx| {
+        v.set_snapshot(
+            Arc::new(LogSnapshot {
+                lines: buffer.view(),
+                state: LogState::Streaming,
+                paused: false,
+                held_back: 0,
+                version: 1,
+                pods: None,
+                trimmed: false,
+            }),
+            cx,
+        )
+    });
+    draw(cx, &t);
+
+    dispatch(cx, &t, "logs::SelectLine", json!({"line": 0})).unwrap();
+    dispatch(cx, &t, "logs::ToggleErrorsOnly", Value::Null).unwrap();
+    cx.wait_for(t.window, WAIT, |_, cx| {
+        let v = view.read(cx);
+        v.is_filtered() && !v.has_selection()
+    })
+    .await;
+    dispatch(cx, &t, "logs::DragSelection", json!({"line": 1})).unwrap();
+    assert!(view.read_with(cx, |v, _| v.has_selection()));
+    assert!(dispatch(cx, &t, "logs::DragSelection", json!({"line": 2})).is_err());
+
+    dispatch(cx, &t, "logs::SetLogContext", json!({"lines": 100})).unwrap();
+    let refused = dispatch(cx, &t, "logs::SetLogContext", json!({"lines": 101})).unwrap_err();
+    assert!(refused.to_string().contains("0 to 100"), "{refused}");
+}
+
 // covers UP-40, UP-41, UP-42: the state reports the dock (shown, height, focus, active tab) and
 // every tab with its kind, title, cluster and status; the tab's own state comes with it. Focus
 // in a log tab, a shell tab, the dialog and a menu is named. Closing the tabs empties the dock.

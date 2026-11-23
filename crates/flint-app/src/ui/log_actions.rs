@@ -92,7 +92,10 @@ impl LogView {
                 view.refilter(None, cx);
             })
             .bind::<SetLogContext>(|view, action, _, cx| {
-                let context = (action.lines as usize).min(flint_core::logs::MAX_CONTEXT);
+                if Self::check_context(action.lines).is_err() {
+                    return;
+                }
+                let context = action.lines as usize;
                 if context != view.context {
                     view.context = context;
                     // Also while a first scan runs: it restarts with the new context.
@@ -327,6 +330,18 @@ impl LogView {
         let matches = self.search.matches();
         let evicted = matches.partition_point(|m| *m < self.snapshot.lines.first_id());
         matches.binary_search(&id).ok().map(|ix| ix - evicted)
+    }
+
+    /// [`SetLogContext`] takes 0 to [`flint_core::logs::MAX_CONTEXT`] lines.
+    pub(in crate::ui) fn check_context(lines: u32) -> Result<(), ActionError> {
+        let max = flint_core::logs::MAX_CONTEXT;
+        if lines as usize <= max {
+            Ok(())
+        } else {
+            Err(ActionError::rejected::<SetLogContext>(format!(
+                "context is 0 to {max} lines, not {lines}"
+            )))
+        }
     }
 
     /// [`SelectLine`] and [`DragSelection`] take a line shown now.
