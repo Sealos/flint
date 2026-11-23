@@ -2,13 +2,14 @@
 //! once), recomputes the kubeconfig file list from it, reloads kubeconfig when a file changed,
 //! checks the cluster against the opt-in list, and only then touches the network.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Once};
+use std::time::{Duration, Instant};
 
 use flint_core::activity;
-use flint_core::cache::{SlotMap, slot};
+use flint_core::cache::{LiveKeys, Slot, SlotCache};
 use flint_core::cluster::{self, ClusterError, Target};
 use flint_core::kubeconfig::{
     self, ConfirmedDefinitions, ContextInfo, FileStamps, JudgedRead, KubeconfigRead,
@@ -36,6 +37,10 @@ const SCOPE_NAMESPACES_CHECKED: usize = 64;
 const TOOL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long discovery results are reused.
 const DISCOVERY_TTL: Duration = Duration::from_secs(120);
+/// How long a cached client or discovery result nobody uses is kept.
+const SLOT_IDLE: Duration = Duration::from_secs(600);
+/// How often idle slots are released while no call arrives.
+const SLOT_SWEEP: Duration = Duration::from_secs(30);
 /// Events fetched from the server before sorting by time.
 const EVENTS_FETCH: u32 = 1000;
 /// Bytes requested from the server per log fetch, so a few huge lines are not all pulled into
@@ -60,8 +65,15 @@ struct Inner {
     confirmed: Mutex<ConfirmedDefinitions>,
     /// How the files are read.
     read_files: fn(&[PathBuf]) -> KubeconfigRead,
-    clients: SlotMap<Client>,
-    discovery: SlotMap<Discovered>,
+    clients: SlotCache<Client>,
+    discovery: SlotCache<Discovered>,
+    /// Numbers each read of the settings and kubeconfig, taken before the read, so the slots
+    /// follow the newest one.
+    last_view: AtomicU64,
+    /// Fingerprints computed for one parsed kubeconfig.
+    fingerprints: Mutex<Option<KnownFingerprints>>,
+    /// Starts the idle sweep on the first call, which runs inside the runtime.
+    slot_sweep: Once,
     /// Which program this is, for advice that can be followed where it runs.
     flavour: policy::Flavour,
     /// Unmatched scopes already logged, so each is logged once.
@@ -69,6 +81,9 @@ struct Inner {
     /// How many tool calls run and wait, and the reply bytes not yet written (#252).
     admission: Admission,
 }
+
+/// A parsed kubeconfig and the context fingerprints computed from it so far.
+type KnownFingerprints = (Arc<LoadedKubeconfig>, HashMap<String, u64>);
 
 /// One parse of the kubeconfig files, and what it decided.
 struct ParsedKubeconfig {
@@ -682,8 +697,11 @@ impl FlintMcp {
                 kubeconfig: Mutex::default(),
                 confirmed: Mutex::default(),
                 read_files: KubeconfigRead::settled,
-                clients: Mutex::default(),
-                discovery: Mutex::default(),
+                clients: SlotCache::new(None, SLOT_IDLE),
+                discovery: SlotCache::new(Some(DISCOVERY_TTL), SLOT_IDLE),
+                last_view: AtomicU64::new(0),
+                fingerprints: Mutex::default(),
+                slot_sweep: Once::new(),
                 warned_scopes: std::sync::Mutex::default(),
                 admission: Admission::new(limits),
             }),
@@ -958,10 +976,14 @@ impl FlintMcp {
     /// again only when a file's modification time or size changed. If settings cannot be read,
     /// the call fails rather than guessing which clusters are exposed.
     async fn context(&self) -> Result<CallContext, ToolError> {
+        self.inner.start_slot_sweep();
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
+            let view = inner.last_view.fetch_add(1, Ordering::SeqCst) + 1;
             // The full TOML error quotes lines of settings.toml; give the agent one safe line.
             let settings = settings::load_settings(&inner.config_dir).map_err(|e| {
+                // Nothing is known to be exposed, as for a send check.
+                inner.retain_slots(view, &LiveKeys::default());
                 let setup = policy::Setup::new(inner.flavour, &inner.config_dir);
                 ToolError::new(format!(
                     "Flint's settings.toml is invalid ({}), so no cluster is exposed. {}",
@@ -975,6 +997,7 @@ impl FlintMcp {
                 inner.home.as_deref(),
             );
             let (kubeconfig, paused) = inner.load_kubeconfig(&paths);
+            inner.retain_slots(view, &inner.live_keys(&settings, &kubeconfig, &paused));
             Ok(CallContext {
                 settings,
                 kubeconfig,
@@ -1027,7 +1050,9 @@ impl FlintMcp {
         // Derived from the same kubeconfig entries as the fingerprint, so it always matches the
         // cached client.
         let target = Target::of(&ctx.kubeconfig.merged, &info.name);
-        let slot = slot(&self.inner.clients, name, fingerprint, None);
+        let slot = self.inner.clients.acquire(name, fingerprint);
+        self.check_new_slot(&self.inner.clients, name, &slot)
+            .await?;
         let client = slot
             .cell
             .get_or_try_init(|| async {
@@ -1063,14 +1088,7 @@ impl FlintMcp {
         cluster::SendCheck::new(move || {
             let (inner, name) = (inner.clone(), name.clone());
             Box::pin(async move {
-                let holds = tokio::task::spawn_blocking(move || {
-                    inner
-                        .upgrade()
-                        .is_some_and(|inner| inner.still_connectable(&name, fingerprint))
-                })
-                .await
-                .unwrap_or(false);
-                if holds {
+                if connectable_now(inner, name, fingerprint).await {
                     Ok(())
                 } else {
                     Err(policy::PAUSED_CLUSTER.to_owned())
@@ -1079,17 +1097,37 @@ impl FlintMcp {
         })
     }
 
+    /// Checks a slot not built yet against the files as they are now, after it was stored. A
+    /// context removed or revoked before this check is refused and its slot released; one
+    /// removed after it is seen in the map by the next read, which releases it.
+    async fn check_new_slot<T>(
+        &self,
+        cache: &SlotCache<T>,
+        name: &str,
+        slot: &Arc<Slot<T>>,
+    ) -> Result<(), ToolError> {
+        if slot.cell.initialized()
+            || connectable_now(
+                Arc::downgrade(&self.inner),
+                name.to_owned(),
+                slot.fingerprint,
+            )
+            .await
+        {
+            return Ok(());
+        }
+        cache.release(name, slot);
+        Err(ToolError::new(policy::PAUSED_CLUSTER))
+    }
+
     async fn kinds(&self, cluster: &str, conn: &Conn) -> Result<Kinds, ToolError> {
         Ok(self.discovered(cluster, conn).await?.kinds)
     }
 
     async fn discovered(&self, cluster: &str, conn: &Conn) -> Result<Discovered, ToolError> {
-        let slot = slot(
-            &self.inner.discovery,
-            cluster,
-            conn.fingerprint,
-            Some(DISCOVERY_TTL),
-        );
+        let slot = self.inner.discovery.acquire(cluster, conn.fingerprint);
+        self.check_new_slot(&self.inner.discovery, cluster, &slot)
+            .await?;
         // Groups skipped this time are missing until the cache expires; the agent can retry.
         let discovered = slot
             .cell
@@ -1761,6 +1799,17 @@ impl FlintMcp {
     }
 }
 
+/// [`Inner::still_connectable`] off the async threads; no once the server is gone.
+async fn connectable_now(inner: std::sync::Weak<Inner>, name: String, fingerprint: u64) -> bool {
+    tokio::task::spawn_blocking(move || {
+        inner
+            .upgrade()
+            .is_some_and(|inner| inner.still_connectable(&name, fingerprint))
+    })
+    .await
+    .unwrap_or(false)
+}
+
 impl Inner {
     /// The merged kubeconfig for `paths`, parsed again only when a file changed. Exec auth
     /// plugins are set to never prompt: stdin is the MCP stream. Also returns the contexts that
@@ -1813,6 +1862,59 @@ impl Inner {
         !paused.contains(name)
             && policy::exposed_cluster(&settings, &loaded, name).is_ok()
             && cluster::context_fingerprint(&loaded.merged, name) == Some(fingerprint)
+    }
+
+    /// The contexts that may hold a cached client: exposed and not paused, each at its
+    /// fingerprint. A paused context has none, so its client is released, while what was confirmed
+    /// about it stays in `confirmed`, which no eviction touches.
+    fn live_keys(
+        &self,
+        settings: &flint_core::Settings,
+        loaded: &Arc<LoadedKubeconfig>,
+        paused: &HashSet<String>,
+    ) -> LiveKeys {
+        let mut memo = self.fingerprints.lock().unwrap();
+        memo.take_if(|(of, _)| !Arc::ptr_eq(of, loaded));
+        let (_, known) = memo.get_or_insert_with(|| (loaded.clone(), HashMap::new()));
+        let mut live = HashMap::new();
+        for info in policy::exposed_clusters(settings, loaded) {
+            if paused.contains(&info.name) {
+                continue;
+            }
+            let fingerprint = match known.get(&info.name) {
+                Some(fingerprint) => Some(*fingerprint),
+                None => cluster::context_fingerprint(&loaded.merged, &info.name),
+            };
+            if let Some(fingerprint) = fingerprint {
+                known.insert(info.name.clone(), fingerprint);
+                live.insert(info.name.clone(), fingerprint);
+            }
+        }
+        Arc::new(live)
+    }
+
+    fn retain_slots(&self, view: u64, live: &LiveKeys) {
+        self.clients.retain_live(view, live);
+        self.discovery.retain_live(view, live);
+    }
+
+    /// Starts releasing idle slots in the background. The sweep reads no file, so it never
+    /// records anything about a kubeconfig definition, and it ends with the server.
+    fn start_slot_sweep(self: &Arc<Self>) {
+        self.slot_sweep.call_once(|| {
+            let inner = Arc::downgrade(self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(SLOT_SWEEP).await;
+                    let Some(inner) = inner.upgrade() else {
+                        return;
+                    };
+                    let now = Instant::now();
+                    inner.clients.expire(now);
+                    inner.discovery.expire(now);
+                }
+            });
+        });
     }
 
     /// The last parse, if it still stands for files stamped `stamps`.
@@ -2635,3 +2737,7 @@ mod limits_tests;
 #[cfg(all(test, unix))]
 #[path = "server_confirmed_tests.rs"]
 mod confirmed_tests;
+
+#[cfg(all(test, unix))]
+#[path = "server_slots_tests.rs"]
+mod slots_tests;
