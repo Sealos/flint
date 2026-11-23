@@ -183,6 +183,7 @@ impl Workspace {
             alerts: cx
                 .try_global::<super::super::alert_center::Alerts>()
                 .map(|alerts| alerts.0.read(cx).view_state()),
+            sets: self.sets_view_state(cx),
         }
     }
 

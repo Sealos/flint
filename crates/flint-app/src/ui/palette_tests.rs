@@ -574,7 +574,7 @@ async fn the_menus_hold_the_standard_items(cx: &mut TestAppContext) {
             .collect()
     };
     let names: Vec<String> = menus.iter().map(|m| m.name.to_string()).collect();
-    assert_eq!(names, ["Flint", "Edit", "View", "Window"]);
+    assert_eq!(names, ["Flint", "Edit", "View", "Window", "Help"]);
     assert_eq!(
         items("Flint"),
         [
@@ -585,7 +585,10 @@ async fn the_menus_hold_the_standard_items(cx: &mut TestAppContext) {
             "Quit Flint"
         ]
     );
-    assert_eq!(items("Edit"), ["Cut", "Copy", "Paste", "Select All"]);
+    assert_eq!(
+        items("Edit"),
+        ["Undo", "Redo", "Cut", "Copy", "Paste", "Select All"]
+    );
     assert_eq!(
         items("View"),
         [

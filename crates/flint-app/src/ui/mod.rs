@@ -79,7 +79,8 @@ use clusters::ClustersModel;
 use gpui_kit::component::input;
 use registry::{
     About, AppearanceDark, AppearanceLight, AppearanceSystem, CloseActiveTab, CloseWindow, GoBack,
-    Hide, HideOthers, Quit, ShowAll, ToggleCommandPalette, ToggleResourceSwitcher,
+    Hide, HideOthers, MinimizeWindow, OpenHelp, Quit, ShowAll, ToggleCommandPalette,
+    ToggleResourceSwitcher, ZoomWindow,
 };
 use ui_state::UiState;
 use workspace::Workspace;
@@ -229,25 +230,56 @@ fn window_options(bounds: Bounds<Pixels>) -> WindowOptions {
     }
 }
 
-/// The standard macOS menus, every item a registered action (their keys come from the registry):
-/// the app menu (About Flint, Hide Flint, Hide Others, Show All, Quit), Edit (Cut, Copy, Paste
-/// and Select All, for the text fields), View (the command palette, Appearance) and Window
-/// (Close Dock Tab, Close Window). Quit and Close Window ask first while a session would end
-/// ([`closing`]). GPUI shows no menu bar on Linux: there, every item is in the command palette
-/// (Ctrl-Shift-P), and Quit and Close Window have their keys too.
+/// The standard macOS menus, every item a registered action (their keys come from the registry)
+/// except Services, which the OS fills: the app menu (About Flint, Services, Hide Flint, Hide
+/// Others, Show All, Quit), Edit (Undo, Redo, Cut, Copy, Paste and Select All, for the text
+/// fields), View (the command palette, Appearance), Window (Minimize, Zoom, Close Dock Tab, Close
+/// Window) and Help. Quit and Close Window ask first while a session would end ([`closing`]).
+/// GPUI shows no menu bar on Linux: there, every item is in the command palette (Ctrl-Shift-P),
+/// and Quit and Close Window have their keys too.
 fn install_menus(appearance: Appearance, cx: &mut App) {
     closing::install(cx);
     // Hiding is the app's, not a window's.
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+    cx.on_action(|_: &OpenHelp, cx| cx.open_url(env!("CARGO_PKG_REPOSITORY")));
+    base::Root::register_plugin(cx, |_, _| WindowActions);
     set_menus(appearance, cx);
+}
+
+/// The actions that need a window. They are handled around each window's whole content, dialogs
+/// included, and not globally, so the native menu disables them while no window is active.
+struct WindowActions;
+
+impl Render for WindowActions {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+impl base::RootPlugin for WindowActions {
+    fn decorate(
+        &self,
+        surface: AnyElement,
+        _: &base::Root,
+        _: &mut Window,
+        _: &mut App,
+    ) -> impl IntoElement {
+        div()
+            .size_full()
+            .on_action(|_: &MinimizeWindow, window, _| window.minimize_window())
+            .on_action(|_: &ZoomWindow, window, _| window.zoom_window())
+            .child(surface)
+    }
 }
 
 fn set_menus(appearance: Appearance, cx: &mut App) {
     cx.set_menus([
         Menu::new("Flint").items([
             MenuItem::action(registry::label::<About>(), About),
+            MenuItem::separator(),
+            MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
             MenuItem::action(registry::label::<Hide>(), Hide),
             MenuItem::action(registry::label::<HideOthers>(), HideOthers),
@@ -258,16 +290,31 @@ fn set_menus(appearance: Appearance, cx: &mut App) {
         edit_menu(),
         view_menu(appearance),
         Menu::new("Window").items([
+            MenuItem::action(registry::label::<MinimizeWindow>(), MinimizeWindow),
+            MenuItem::action(registry::label::<ZoomWindow>(), ZoomWindow),
+            MenuItem::separator(),
             MenuItem::action(registry::label::<CloseActiveTab>(), CloseActiveTab),
             MenuItem::action(registry::label::<CloseWindow>(), CloseWindow),
         ]),
+        Menu::new("Help").items([MenuItem::action(registry::label::<OpenHelp>(), OpenHelp)]),
     ]);
 }
 
-/// Edit: Cut, Copy, Paste and Select All, which the focused text field handles. A shell tab
-/// keeps its own copy and paste: its keys reach it first, and these do nothing there.
+/// Edit: Undo, Redo, Cut, Copy, Paste and Select All, which the focused text field handles. A
+/// shell tab keeps its own copy and paste: its keys reach it first, and these do nothing there.
 fn edit_menu() -> Menu {
     Menu::new("Edit").items([
+        MenuItem::os_action(
+            registry::label::<input::Undo>(),
+            input::Undo,
+            OsAction::Undo,
+        ),
+        MenuItem::os_action(
+            registry::label::<input::Redo>(),
+            input::Redo,
+            OsAction::Redo,
+        ),
+        MenuItem::separator(),
         MenuItem::os_action(registry::label::<input::Cut>(), input::Cut, OsAction::Cut),
         MenuItem::os_action(
             registry::label::<input::Copy>(),
