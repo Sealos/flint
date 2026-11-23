@@ -150,7 +150,16 @@ pub fn open_gated(
 ) {
     debug_assert!(!dialog.default_cancel);
     let gate: Gate = Rc::new(state);
-    open_dialog(window, cx, dialog, 0, Some(content), Some(gate), None, on_ok);
+    open_dialog(
+        window,
+        cx,
+        dialog,
+        0,
+        Some(content),
+        Some(gate),
+        None,
+        on_ok,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1547,6 +1556,45 @@ mod tests {
         .unwrap();
         cx.run_until_parked();
         assert_eq!(runs.get(), 0);
+    }
+
+    // Once its connection changed, a guarded dialog runs nothing, by OK or by Enter, and closes.
+    #[gpui_kit::test]
+    async fn a_guarded_dialog_cannot_be_confirmed_once_stale(cx: &mut TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+
+        use super::{close_stale, newest_is_stale, open_pinned_guarded};
+        use crate::ui::write_binding::ConnectionGuard;
+
+        let window = window(cx);
+        for answer in ["ok", "enter", "close"] {
+            let holds = Rc::new(Cell::new(true));
+            let runs = Rc::new(Cell::new(0));
+            let (check, count) = (holds.clone(), runs.clone());
+            let guard = ConnectionGuard::from_check(move || check.get());
+            cx.update_window(window, |_, window, cx| {
+                open_pinned_guarded(window, cx, text("Bound"), 0, None, guard, move |_, _| {
+                    count.set(count.get() + 1);
+                    true
+                })
+            })
+            .unwrap();
+            assert_eq!(shown_title(cx, window).as_deref(), Some("Bound"));
+            holds.set(false);
+            cx.update_window(window, |_, window, cx| {
+                assert!(newest_is_stale(window, cx));
+                match answer {
+                    "ok" => window.click("ok", cx),
+                    "enter" => {
+                        window.press("enter", cx);
+                    }
+                    _ => assert!(close_stale(window, cx)),
+                }
+            })
+            .unwrap();
+            assert_eq!(shown_title(cx, window), None, "{answer}");
+            assert_eq!(runs.get(), 0, "{answer}");
+        }
     }
 
     // A stale click on a dialog already answered leaves the dialog under it open.

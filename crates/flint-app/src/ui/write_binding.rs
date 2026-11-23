@@ -54,8 +54,7 @@ impl ConnectionGuard {
         let (model, cluster) = (model.downgrade(), cluster.to_owned());
         Some(Self(Rc::new(move |cx| {
             model.upgrade().is_some_and(|model| {
-                ConnectionIdentity::of(&model.read(cx).clusters, &cluster).as_ref()
-                    == Some(&opened)
+                ConnectionIdentity::of(&model.read(cx).clusters, &cluster).as_ref() == Some(&opened)
             })
         })))
     }
@@ -64,6 +63,12 @@ impl ConnectionGuard {
     #[cfg(test)]
     pub(in crate::ui) fn always() -> Self {
         Self(Rc::new(|_| true))
+    }
+
+    /// A guard that answers from `check`, for a dialog test.
+    #[cfg(test)]
+    pub(in crate::ui) fn from_check(check: impl Fn() -> bool + 'static) -> Self {
+        Self(Rc::new(move |_| check()))
     }
 
     pub(in crate::ui) fn holds(&self, cx: &App) -> bool {

@@ -788,7 +788,11 @@ impl Workspace {
     }
 
     /// Says why a confirmation closed by itself, and gives focus back if what held it is gone.
-    pub(in crate::ui) fn confirmation_closed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::ui) fn confirmation_closed(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.refuse_held(super::super::write_binding::connection_changed_text(), cx);
         if window.focused(cx).is_none() {
             let focus = self

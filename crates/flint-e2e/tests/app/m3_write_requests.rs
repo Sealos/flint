@@ -4,7 +4,7 @@
 //!
 //! Inline validation (UP-50) is not built yet (#31), so it has no test here.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use flint_e2e::app::{App, AppOptions};
@@ -657,21 +657,65 @@ fn open_apply(app: &App) -> Result<()> {
     Ok(())
 }
 
-/// Points the context at `to`, and waits until the app has reached it.
-fn repoint(app: &App, kubeconfig: &std::path::Path, to: &FakeApiServer) -> Result<()> {
-    let before = to.arrivals().len();
-    app.edit_kubeconfig([kubeconfig], || to.write_kubeconfig(kubeconfig, None))?;
+/// Where each server's arrival log stood at the moment a context moved.
+#[derive(Clone, Copy)]
+struct Moved {
+    /// Requests the server it left had received. Anything later came after the move.
+    from: usize,
+    /// Requests the server it reached had received.
+    to: usize,
+}
+
+/// Points the context from `from` at `to`, and waits until the app has reached it. The marks are
+/// taken immediately before the file changes, once access reviews have settled, so a request
+/// that arrives after the move can never count as earlier.
+fn repoint(
+    app: &App,
+    kubeconfig: &std::path::Path,
+    from: &FakeApiServer,
+    to: &FakeApiServer,
+) -> Result<Moved> {
+    let mut last = (access_reviews(from, 0, None).len(), Instant::now());
+    until(
+        "the access reviews to settle",
+        || {
+            let count = access_reviews(from, 0, None).len();
+            if count != last.0 {
+                last = (count, Instant::now());
+            }
+            last.1.elapsed()
+        },
+        |still| *still >= RETRY_WINDOW,
+    )?;
+    let moved = app.edit_kubeconfig([kubeconfig], || {
+        let moved = Moved {
+            from: from.arrivals().len(),
+            to: to.arrivals().len(),
+        };
+        to.write_kubeconfig(kubeconfig, None)?;
+        Ok(moved)
+    })?;
     until(
         "a request to the new server",
         || to.arrivals().len(),
-        |count| *count > before,
+        |count| *count > moved.to,
     )?;
     std::thread::sleep(RETRY_WINDOW);
+    Ok(moved)
+}
+
+/// Answers the open dialog from the keyboard: Enter, or the action Enter is bound to when nothing
+/// in the dialog holds focus.
+fn confirm_by_key(app: &App) -> Result<()> {
+    let shown = app.state()?["dialog"].clone();
+    app.press_key("enter")?;
+    if app.state()?["dialog"] == shown {
+        let _ = app.dispatch("ui::Confirm", Value::Null);
+    }
     Ok(())
 }
 
-/// Every write after the first `from`, with what the server answered. Nothing is filtered: a
-/// permission check is a POST that changes nothing, but none may follow the move either.
+/// Every write after the first `from`, with what the server answered.
 fn writes_since(fake: &FakeApiServer, from: usize) -> Vec<String> {
     fake.writes()[from..]
         .iter()
@@ -679,17 +723,15 @@ fn writes_since(fake: &FakeApiServer, from: usize) -> Vec<String> {
         .collect()
 }
 
-/// Waits until `fake` has had no request for a while: what opening the dialog set off has landed.
-fn quiet(fake: &FakeApiServer) {
-    let mut seen = fake.arrivals().len();
-    for _ in 0..20 {
-        std::thread::sleep(Duration::from_millis(250));
-        let now = fake.arrivals().len();
-        if now == seen {
-            return;
-        }
-        seen = now;
-    }
+/// The permission checks among `fake`'s arrivals from `from` up to `to` (the end if `None`). The
+/// fake does not log them as writes.
+fn access_reviews(fake: &FakeApiServer, from: usize, to: Option<usize>) -> Vec<String> {
+    let arrivals = fake.arrivals();
+    arrivals[from..to.unwrap_or(arrivals.len())]
+        .iter()
+        .filter(|r| r.method == Method::POST && r.path.ends_with("/selfsubjectaccessreviews"))
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect()
 }
 
 // covers UP-55: whatever answers a write's dialog after its context moved, by mouse or by key,
@@ -712,30 +754,33 @@ fn up_55_answering_a_confirmation_after_a_repoint_writes_nowhere() -> Result<()>
                 let mut left_open = false;
                 reporting(&app, || {
                     open_asked(&app, asked)?;
-                    quiet(fake);
                     let (on_fake, on_other) = (fake.writes().len(), other.writes().len());
-                    repoint(&app, &cluster.kubeconfig, &other)?;
+                    let moved = repoint(&app, &cluster.kubeconfig, fake, &other)?;
                     if back {
-                        repoint(&app, &cluster.kubeconfig, fake)?;
+                        repoint(&app, &cluster.kubeconfig, &other, fake)?;
                     }
                     if !app.state()?["dialog"].is_null() {
                         reached.push(format!("{asked:?} back={back}: the dialog stayed open"));
                     }
                     // Answered if it is still there. A first step may lead to a review: that is
                     // answered too.
-                    for _ in 0..3 {
+                    for answer in 0..3 {
                         if app.state()?["dialog"].is_null() {
                             break;
                         }
-                        let _ = if key {
-                            app.press_key("enter")
+                        // Enter cancels a drain's review: only its button confirms it.
+                        let by_button = answer > 0 && matches!(asked, Asked::DrainOptions);
+                        if key && !by_button {
+                            confirm_by_key(&app)?;
                         } else {
-                            app.click("ok")
-                        };
+                            let _ = app.click("ok");
+                        }
                         std::thread::sleep(RETRY_WINDOW);
                     }
-                    let (first, second) =
-                        (writes_since(fake, on_fake), writes_since(&other, on_other));
+                    let mut first = writes_since(fake, on_fake);
+                    first.extend(access_reviews(fake, moved.from, None));
+                    let mut second = writes_since(&other, on_other);
+                    second.extend(access_reviews(&other, 0, None));
                     if !first.is_empty() || !second.is_empty() {
                         reached.push(format!(
                             "{asked:?} back={back} key={key}: original {first:?} new {second:?}"

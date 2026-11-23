@@ -31,7 +31,6 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::confirm::{self, DialogText};
-use super::write_binding::{ConnectionGuard, connection_changed_text};
 use super::detail::access::Gated;
 use super::detail::{DetailView, Opening, Subject, protected_reason, refused};
 use super::notice::{notice, notice_with};
@@ -41,6 +40,7 @@ use super::registry::{
 };
 use super::row_menu::Availability;
 use super::workspace::Workspace;
+use super::write_binding::{ConnectionGuard, connection_changed_text};
 use super::write_confirm;
 
 /// The most replicas a workload can have: the API's `int32`.
