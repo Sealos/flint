@@ -5,13 +5,16 @@
 //! request. An answer that is not clear ([`Access::Unknown`]) leaves the action enabled, so the
 //! server answers it. The reason is Flint's own words, never the server's.
 //!
-//! The core caches the checks ([`flint_core::access`]). The pane asks again when the connection
-//! it is on changes, and once the answers are due, while it stays open.
+//! The core caches the checks per connection ([`flint_core::access`]), so asking it again is free
+//! until an answer expires or the connection's credential changes. The pane drops its answers as
+//! soon as the context's identity changes, waits for a selection to settle before its first
+//! question, and then keeps asking the core while it stays open.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use flint_core::KindId;
-use flint_core::access::{ACCESS_FRESH_FOR, Access, AccessCheck};
+use flint_core::access::{Access, AccessCheck};
 use gpui_kit::*;
 
 use super::super::resource_actions::{self, ResourceAction};
@@ -31,6 +34,17 @@ pub(in crate::ui) enum Gated {
 /// The most pods of a workload whose logs are asked about one by one. Past it Logs stays enabled:
 /// a refusal of some pods would not show that all of them are refused.
 const MAX_LOG_TARGETS: usize = 16;
+
+/// How long a selection must stay before its checks go out: moving through a long list asks
+/// nothing for the rows passed over.
+const SETTLE: Duration = Duration::from_millis(150);
+
+/// How often an open pane reads the core's cache, which notices a reconnect on the same context.
+const RECHECK: Duration = Duration::from_secs(2);
+
+/// Which of a context's slots and definitions answers came from (`ClusterSummary::generation`
+/// and `definition`).
+pub(in crate::ui) type ConnectionIdentity = (u64, u64);
 
 /// What the pane of an object of `kind` may need to show.
 fn gated_for(kind: &KindId, subject: Subject) -> Vec<Gated> {
@@ -76,7 +90,14 @@ struct Targets {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Followed {
     server: Option<String>,
+    connection: Option<ConnectionIdentity>,
     targets: Targets,
+}
+
+impl Followed {
+    fn same_connection(this: Option<&Self>, other: Option<&Self>) -> bool {
+        this.map(|f| (&f.server, f.connection)) == other.map(|f| (&f.server, f.connection))
+    }
 }
 
 /// The object's checks and their answers.
@@ -86,6 +107,9 @@ pub(in crate::ui) struct ObjectAccess {
     name: String,
     subject: Subject,
     targets: Targets,
+    connection: Option<ConnectionIdentity>,
+    /// The context's definition is in doubt: the core refuses checks, so none is shown.
+    unsettled: bool,
     answers: HashMap<AccessCheck, Access>,
     followed: Option<Followed>,
     _task: Option<Task<()>>,
@@ -104,6 +128,8 @@ impl ObjectAccess {
             name: name.to_owned(),
             subject,
             targets: Targets::default(),
+            connection: None,
+            unsettled: false,
             answers: HashMap::new(),
             followed: None,
             _task: None,
@@ -182,37 +208,66 @@ impl ObjectAccess {
         blocker.map(reason)
     }
 
-    /// Takes new answers; whether what is shown changed.
-    fn set(&mut self, answers: HashMap<AccessCheck, Access>) -> bool {
+    /// Takes the answers to what `asked` followed; whether what is shown changed. Answers for
+    /// anything but what is followed now are dropped.
+    fn set(&mut self, asked: &Followed, answers: HashMap<AccessCheck, Access>) -> bool {
+        if self.followed.as_ref() != Some(asked) {
+            return false;
+        }
         let changed = self.answers != answers;
         self.answers = answers;
         changed
     }
+
+    /// Follows `next`; whether the checks must run again. Answers from another connection go.
+    fn follow(&mut self, next: Option<Followed>) -> bool {
+        if self.followed == next {
+            return false;
+        }
+        // New pods of the same connection keep the answers: they are per name.
+        if !Followed::same_connection(self.followed.as_ref(), next.as_ref()) {
+            self.answers.clear();
+        }
+        self.followed = next;
+        true
+    }
 }
 
 impl DetailView {
+    /// Says which slot and definition the object's cluster is on now, and whether that definition
+    /// is in doubt, so the gate refuses it. Answers and checks of another connection end here,
+    /// not at the next draw.
+    pub(in crate::ui) fn set_access_connection(
+        &mut self,
+        connection: Option<ConnectionIdentity>,
+        unsettled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.access.connection != connection || self.access.unsettled != unsettled {
+            self.access.connection = connection;
+            self.access.unsettled = unsettled;
+            cx.notify();
+        }
+        self.follow_access(cx);
+    }
+
     /// Keeps the answers to the connection shown: none while no check can run (protected, not
-    /// connected), and new ones when it changes. Cheap when nothing did.
+    /// connected, definition in doubt), and new ones when it changes. Cheap when nothing did.
     pub(super) fn follow_access(&mut self, cx: &mut Context<Self>) {
         let targets = self.access_targets();
         self.access.targets = targets.clone();
         let followed = (!self.protected
+            && !self.access.unsettled
             && self.sessions_blocked.is_none()
             && self.server.is_some())
         .then(|| Followed {
             server: self.server.clone(),
+            connection: self.access.connection,
             targets,
         });
-        if self.access.followed == followed {
-            return;
+        if self.access.follow(followed.clone()) {
+            self.access._task = followed.map(|followed| self.ask_access(followed, cx));
         }
-        // New pods of the same connection keep the answers: they are per name.
-        let server = |f: &Option<Followed>| f.as_ref().map(|f| f.server.clone());
-        if server(&self.access.followed) != server(&followed) {
-            self.access.answers.clear();
-        }
-        self.access.followed = followed.clone();
-        self.access._task = followed.map(|followed| self.ask_access(followed, cx));
     }
 
     /// The pods of a workload that Logs and Shell would reach, from a list still current.
@@ -261,6 +316,7 @@ impl DetailView {
         let core = self.core.clone();
         let cluster = self.object.cluster.clone();
         cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SETTLE).await;
             loop {
                 let answers = core
                     .check_access_all(&cluster, followed.server.clone(), wanted.clone())
@@ -268,16 +324,22 @@ impl DetailView {
                     .into_iter()
                     .collect();
                 let kept = this.update(cx, |view, cx| {
-                    if view.access.set(answers) {
+                    if view.access.set(&followed, answers) {
                         cx.notify();
                     }
                 });
                 if kept.is_err() {
                     return;
                 }
-                cx.background_executor().timer(ACCESS_FRESH_FOR).await;
+                cx.background_executor().timer(RECHECK).await;
             }
         })
+    }
+
+    /// Whether checks are running or waiting to, in tests.
+    #[cfg(test)]
+    pub(in crate::ui) fn access_checks_running(&self) -> bool {
+        self.access._task.is_some()
     }
 
     /// Sets the answers as a check would, in tests.
@@ -303,7 +365,7 @@ mod tests {
     use flint_core::KindId;
     use flint_core::access::{Access, AccessCheck};
 
-    use super::{Gated, ObjectAccess, ResourceAction, Subject, Targets};
+    use super::{Followed, Gated, ObjectAccess, ResourceAction, Subject, Targets};
 
     fn object(group: &str, plural: &str, namespace: Option<&str>, name: &str) -> ObjectAccess {
         let kind = KindId::new(group, plural);
@@ -519,6 +581,56 @@ mod tests {
             one(Gated::Write(ResourceAction::RolloutRestart)).verb,
             "patch"
         );
+    }
+
+    fn followed(server: &str, connection: (u64, u64), pods: &[&str]) -> Option<Followed> {
+        Some(Followed {
+            server: Some(server.into()),
+            connection: Some(connection),
+            targets: Targets {
+                logs: pods.iter().map(|p| (*p).to_owned()).collect(),
+                shell: None,
+            },
+        })
+    }
+
+    #[test]
+    fn answers_do_not_outlive_their_connection() {
+        let delete = Gated::Write(ResourceAction::Delete);
+        let refused = |server, connection| {
+            let mut access = deployment();
+            assert!(access.follow(followed("https://a", (1, 1), &[])));
+            answer(&mut access, delete, Access::Forbidden);
+            assert!(access.follow(followed(server, connection, &[])));
+            access.forbidden(delete)
+        };
+        assert_eq!(refused("https://b", (1, 1)), None, "re-pointed");
+        assert_eq!(refused("https://a", (2, 1)), None, "a new slot");
+        assert_eq!(refused("https://a", (1, 2)), None, "a changed definition");
+
+        let mut access = deployment();
+        access.follow(followed("https://a", (1, 1), &[]));
+        answer(&mut access, delete, Access::Forbidden);
+        assert!(!access.follow(followed("https://a", (1, 1), &[])), "same");
+        assert!(access.follow(followed("https://a", (1, 1), &["web-1"])));
+        assert!(access.forbidden(delete).is_some(), "new pods keep answers");
+        assert!(access.follow(None));
+        assert_eq!(access.forbidden(delete), None, "no connection");
+    }
+
+    #[test]
+    fn a_denial_for_a_replaced_connection_is_dropped() {
+        let delete = Gated::Write(ResourceAction::Delete);
+        let mut access = deployment();
+        let old = followed("https://a", (1, 1), &[]).unwrap();
+        access.follow(Some(old.clone()));
+        access.follow(followed("https://a", (2, 1), &[]));
+        let denial = wanted(&access, delete)
+            .into_iter()
+            .map(|check| (check, Access::Forbidden))
+            .collect();
+        assert!(!access.set(&old, denial));
+        assert_eq!(access.forbidden(delete), None);
     }
 
     #[test]
