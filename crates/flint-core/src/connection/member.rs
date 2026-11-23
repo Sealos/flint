@@ -104,6 +104,9 @@ pub(crate) enum MemberEvent {
     },
     Paused(Pause),
     Resumed(Pause),
+    /// The slot's connection is gone and a new one is due (its definition changed, or a pause
+    /// dropped it). Any earlier failure or sign-in was for the old connection.
+    ConnectionLost,
     /// Time passed: checks the reconnect timeout and the retry time.
     Tick,
 }
@@ -228,7 +231,19 @@ impl Member {
             MemberEvent::Repointed { server, confirmed } => self.repointed(&server, confirmed),
             MemberEvent::Paused(pause) => self.pause(pause),
             MemberEvent::Resumed(pause) => self.resume(pause),
+            MemberEvent::ConnectionLost => self.connection_lost(),
             MemberEvent::Tick => self.tick(now, jitter),
+        }
+    }
+
+    fn connection_lost(&mut self) -> MemberAction {
+        self.attempt = None;
+        self.failures = 0;
+        self.state = MemberState::Connecting;
+        if self.paused().is_some() {
+            MemberAction::None
+        } else {
+            MemberAction::Enqueue
         }
     }
 

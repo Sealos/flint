@@ -152,10 +152,47 @@ pub enum Command {
     /// Set the MiB each log session's lines may take and write it to `settings.toml`. Sessions
     /// opened afterwards use it. The change arrives back as `Event::SettingsChanged`.
     SetLogBufferMib(u32),
+    /// Keep exactly these clusters (2 to 5, or none to clear) connected and watched beside the
+    /// active one. Each reports its connection as [`Event::ConnectionChanged`], and
+    /// [`CoreHandle::running_set`] says more. Removed members' watches stop. A list that cannot
+    /// be a set changes nothing and is reported as [`Event::Error`]. Grants no write access.
+    SetRunningSet(Vec<ClusterId>),
+}
+
+/// What a member of the running set is doing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberStatus {
+    Connecting,
+    Live,
+    /// Its watches lost contact and none has synced again.
+    Reconnecting {
+        error: crate::SafeErrorText,
+    },
+    /// Not retried until the cluster is selected.
+    SignInNeeded {
+        reason: crate::SafeErrorText,
+    },
+    /// Retried after a backoff.
+    Failed {
+        error: crate::SafeErrorText,
+    },
+}
+
+/// One member of the running set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberReport {
+    pub cluster: ClusterId,
+    pub status: MemberStatus,
+    /// A kubeconfig file that defines it can't be read: what runs goes on and nothing new starts.
+    pub paused: bool,
 }
 
 /// Requests that carry a reply channel or come from a [`Subscription`].
 pub(crate) enum Request {
+    /// Each member of the running set and its state.
+    RunningSet {
+        reply: oneshot::Sender<Vec<MemberReport>>,
+    },
     /// Reload the kubeconfig files, and say when that is done.
     ReloadKubeconfig {
         reply: oneshot::Sender<bool>,
@@ -422,6 +459,14 @@ impl CoreHandle {
             runtime: runtime.handle().clone(),
             _runtime: Arc::new(RuntimeGuard(Some(runtime))),
         })
+    }
+
+    /// Each member of the running set and its state, in kubeconfig order. Empty if the core
+    /// stopped.
+    pub fn running_set(&self) -> impl Future<Output = Vec<MemberReport>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.requests.try_send(Request::RunningSet { reply });
+        async move { rx.await.unwrap_or_default() }
     }
 
     /// Opens a live list of `kind` on `cluster`. While the subscription lives, the kind is

@@ -156,6 +156,33 @@ impl CredentialSource {
             CredentialSource::Definition
         }
     }
+
+    /// Whether using this credential can start a program.
+    pub(crate) fn runs_a_command(&self) -> bool {
+        matches!(
+            self,
+            CredentialSource::Plugin | CredentialSource::AuthProvider
+        )
+    }
+}
+
+/// Whether connecting as `auth` would present anything to the server: a password, a token, a
+/// client certificate, a command's output, or an identity to act as.
+pub(crate) fn presents_a_credential(auth: &AuthInfo) -> bool {
+    auth.username.is_some()
+        || auth.password.is_some()
+        || auth.token.is_some()
+        || auth.token_file.is_some()
+        || auth.client_certificate.is_some()
+        || auth.client_certificate_data.is_some()
+        || auth.client_key.is_some()
+        || auth.client_key_data.is_some()
+        || auth.impersonate.is_some()
+        || auth.impersonate_uid.is_some()
+        || auth.impersonate_groups.is_some()
+        || auth.impersonate_user_extra.is_some()
+        || auth.auth_provider.is_some()
+        || auth.exec.is_some()
 }
 
 /// A certificate or key file, with the digest of the bytes the client was built from. `None`
@@ -341,10 +368,7 @@ impl WriteCredential {
         grant: CredentialGrant,
         guarded: Option<GuardedProvider>,
     ) -> Self {
-        let check_identity = matches!(
-            source,
-            CredentialSource::Plugin | CredentialSource::AuthProvider
-        );
+        let check_identity = source.runs_a_command();
         let token = match (source, refreshing) {
             (CredentialSource::TokenFile(path), _) => TokenSource::File(path),
             (CredentialSource::AuthProvider, _) => TokenSource::Provider(auth),
@@ -362,6 +386,22 @@ impl WriteCredential {
 
     pub(crate) fn id(&self) -> CredentialId {
         CredentialId(Arc::downgrade(&self.0))
+    }
+
+    /// Whether this connection's credential can start a program, whatever the kubeconfig says now.
+    pub(crate) fn runs_a_command(&self) -> bool {
+        self.0.grant.runs_a_command()
+    }
+
+    /// Whether a server refused this credential in the background since this was last asked.
+    pub(crate) fn take_refused(&self) -> bool {
+        self.0.grant.take_refused()
+    }
+
+    /// Whether this connection can no longer authenticate new requests: its provider's lease
+    /// ended, which no later role brings back.
+    pub(crate) fn spent(&self) -> bool {
+        self.0.guarded.as_ref().is_some_and(GuardedProvider::spent)
     }
 
     /// Reads the credential for one request, and returns `client` set to send exactly that.
@@ -452,7 +492,9 @@ pub(crate) struct GuardedProvider(Arc<GuardedParts>);
 struct GuardedParts {
     layer: Arc<AuthLayer>,
     lease: CredentialLease,
-    turn: tokio::sync::Mutex<()>,
+    /// Held until kube's call returns, even if the request that made it has gone, so no request
+    /// passes the lease check and then waits on kube's lock.
+    turn: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl GuardedProvider {
@@ -464,20 +506,34 @@ impl GuardedProvider {
             GuardedProvider(Arc::new(GuardedParts {
                 layer: layer.clone(),
                 lease: lease.clone(),
-                turn: tokio::sync::Mutex::new(()),
+                turn: Arc::default(),
             }))
         })
+    }
+
+    fn spent(&self) -> bool {
+        !self.0.lease.holds()
     }
 
     /// The `Authorization` value from kube's layer, which may run the command.
     pub(crate) async fn header(&self) -> Result<HeaderValue, BoxError> {
         let parts = &self.0;
         let resolving = async {
-            let _turn = parts.turn.lock().await;
+            let turn = parts.turn.clone().lock_owned().await;
             if !parts.lease.holds() {
                 return Err(crate::auth_plugin::not_allowed().into());
             }
-            layer_header(&parts.layer).await
+            let (layer, lease) = (parts.layer.clone(), parts.lease.clone());
+            tokio::spawn(async move {
+                let _turn = turn;
+                // The last check: nothing is awaited between it and the call into kube.
+                if !lease.holds() {
+                    return Err(crate::auth_plugin::not_allowed().into());
+                }
+                layer_header(&layer).await
+            })
+            .await
+            .unwrap_or_else(|stopped| Err(stopped.into()))
         };
         let header = tokio::select! {
             biased;
