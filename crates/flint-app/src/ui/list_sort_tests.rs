@@ -70,8 +70,9 @@ fn pod_usage() -> UsageSource {
         PodMetrics {
             namespace: String::new(),
             name: String::new(),
-            timestamp: None,
-            window: None,
+            // After the test rows' creation time.
+            timestamp: Some(jiff::Timestamp::from_second(1_000).unwrap()),
+            window: Some(jiff::SignedDuration::from_secs(15)),
             containers: vec![ContainerMetrics {
                 name: "app".into(),
                 usage: Usage {
@@ -115,7 +116,7 @@ async fn usage_columns_show_sort_and_keep_unknown_last(cx: &mut TestAppContext) 
     let t = open_workspace(cx, dir.path()).await;
     t.open_pods(cx, PODS).await;
     let list = t.list(cx).expect("a list is open");
-    list.update(cx, |list, cx| list.set_usage_source(pod_usage(), cx));
+    list.update(cx, |list, cx| list.pin_usage_source(pod_usage(), cx));
     cx.run_until_parked();
 
     let unsorted = cpu_cells(cx, &t);
@@ -156,12 +157,12 @@ async fn without_metrics_server_the_columns_hide_and_a_hint_shows(cx: &mut TestA
     let t = open_workspace(cx, dir.path()).await;
     t.open_pods(cx, PODS).await;
     let list = t.list(cx).expect("a list is open");
-    list.update(cx, |list, cx| list.set_usage_source(pod_usage(), cx));
+    list.update(cx, |list, cx| list.pin_usage_source(pod_usage(), cx));
     cx.run_until_parked();
     assert!(cpu_cells(cx, &t).iter().all(|(_, cpu)| cpu.is_some()));
 
     list.update(cx, |list, cx| {
-        list.set_usage_source(UsageSource::NotInstalled, cx);
+        list.pin_usage_source(UsageSource::NotInstalled, cx);
     });
     cx.run_until_parked();
     assert!(cpu_cells(cx, &t).iter().all(|(_, cpu)| cpu.is_none()));
@@ -172,6 +173,62 @@ async fn without_metrics_server_the_columns_hide_and_a_hint_shows(cx: &mut TestA
             .any(|banner| banner.id == "list-usage-hint")
     });
     assert!(hinted);
+}
+
+#[gpui_kit::test]
+async fn with_no_feed_the_toolbar_says_so_and_rows_keep_their_room(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, PODS).await;
+    let list = t.list(cx).expect("a list is open");
+    list.update(cx, |list, cx| {
+        list.pin_usage_source(UsageSource::NoFeed, cx);
+    });
+    cx.run_until_parked();
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert!(t.find(cx, "list-usage-no-feed").is_some());
+    assert!(t.find(cx, "list-usage-hint").is_none());
+    assert!(cpu_cells(cx, &t).iter().all(|(_, cpu)| cpu.is_none()));
+
+    list.update(cx, |list, cx| {
+        list.pin_usage_source(UsageSource::NotInstalled, cx);
+    });
+    cx.run_until_parked();
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert!(t.find(cx, "list-usage-no-feed").is_none());
+    assert!(t.find(cx, "list-usage-hint").is_some());
+}
+
+#[gpui_kit::test]
+async fn a_404_during_a_sort_hides_the_old_readings_at_once(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, PODS).await;
+    let list = t.list(cx).expect("a list is open");
+    list.update(cx, |list, cx| list.pin_usage_source(pod_usage(), cx));
+    cx.run_until_parked();
+    assert!(cpu_cells(cx, &t).iter().any(|(_, cpu)| cpu.is_some()));
+
+    // A sort is computing when the poll finds the API gone.
+    let permits = list.update(cx, |list, _| list.hold_computes());
+    t.click(cx, "sort-CPU");
+    cx.run_until_parked();
+    list.update(cx, |list, cx| {
+        list.pin_usage_source(UsageSource::NotInstalled, cx);
+    });
+    assert!(
+        cpu_cells(cx, &t).iter().all(|(_, cpu)| cpu.is_none()),
+        "the hint must not show beside old readings"
+    );
+
+    // Neither the sort that was running nor the one after it brings them back.
+    for _ in 0..2 {
+        let _ = permits.try_send(());
+        cx.run_until_parked();
+        assert!(cpu_cells(cx, &t).iter().all(|(_, cpu)| cpu.is_none()));
+    }
 }
 
 // covers UP-21

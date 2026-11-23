@@ -37,10 +37,25 @@ pub struct ClusterTelemetry {
     pub snapshot: Arc<TelemetrySnapshot>,
     /// Warning events, claims and usage, each with its own state.
     pub reads: SideReads,
+    /// The feed has stopped, so `reads` are its last values and nothing polls any more.
+    pub stopped: bool,
     trends: Arc<Mutex<TrendStore>>,
 }
 
 impl ClusterTelemetry {
+    /// A feed's state with no feed behind it, for front-end tests.
+    #[cfg(feature = "test-support")]
+    pub fn for_tests(availability: Availability, reads: SideReads, stopped: bool) -> Self {
+        let mut snapshot = TelemetrySnapshot::starting("test".into(), Timestamp::now());
+        snapshot.availability = availability;
+        Self {
+            snapshot: Arc::new(snapshot),
+            reads,
+            stopped,
+            trends: Arc::default(),
+        }
+    }
+
     /// Runs `read` on this feed's trends, whose series are under the cluster's name. Keep it
     /// short: the feed's metrics poll waits on the same lock.
     pub fn with_trends<R>(&self, read: impl FnOnce(&TrendStore) -> R) -> R {
@@ -83,6 +98,7 @@ impl Entry {
         let telemetry = |snapshot, reads| ClusterTelemetry {
             snapshot,
             reads,
+            stopped: self.held.is_some(),
             trends: Arc::clone(&self.trends),
         };
         if let Some(reads) = &self.held {

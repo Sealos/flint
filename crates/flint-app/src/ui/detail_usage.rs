@@ -8,9 +8,7 @@ use k8s_openapi::api::core::v1::PodSpec;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use serde_json::Value;
 
-use super::super::list_usage::{
-    NOT_INSTALLED_HINT, UNKNOWN_TEXT, UsageSource, UsageSubject, cpu_text, memory_text,
-};
+use super::super::list_usage::{UNKNOWN_TEXT, UsageSource, UsageSubject, cpu_text, memory_text};
 
 /// What the object's own definition gives to compare use with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,18 +29,36 @@ pub(super) enum UsagePanel {
 pub(super) struct DetailUsage {
     source: UsageSource,
     budget: Option<Budget>,
+    /// The object's `creationTimestamp`, Unix seconds: a sample from before it is another's.
+    created: Option<i64>,
+    /// The object was deleted, so a reading under its name is now another object's.
+    deleted: bool,
 }
 
 impl DetailUsage {
     /// Takes the poll's newest state. `true` if it changes what the pane shows.
     pub(super) fn set_source(&mut self, source: UsageSource) -> bool {
+        if self.deleted {
+            return false;
+        }
         let changed = self.source != source;
         self.source = source;
         changed
     }
 
+    /// The object was deleted: its usage is unknown from now on.
+    pub(super) fn mark_deleted(&mut self) {
+        self.deleted = true;
+        self.source = UsageSource::Unknown;
+    }
+
     /// Reads the budget from the fetched object. One that cannot be read stays unknown.
     pub(super) fn set_object(&mut self, subject: Option<UsageSubject>, object: &Value) {
+        self.created = object
+            .pointer("/metadata/creationTimestamp")
+            .and_then(Value::as_str)
+            .and_then(|text| text.parse::<jiff::Timestamp>().ok())
+            .map(jiff::Timestamp::as_second);
         self.budget = match subject {
             Some(UsageSubject::Pods) => object
                 .get("spec")
@@ -62,7 +78,9 @@ impl DetailUsage {
     pub(super) fn panel(&self, namespace: Option<&str>, name: &str) -> Option<UsagePanel> {
         match &self.source {
             UsageSource::Hidden => None,
-            UsageSource::NotInstalled => Some(UsagePanel::Hint(NOT_INSTALLED_HINT)),
+            UsageSource::NoFeed | UsageSource::NotInstalled => {
+                self.source.hint().map(UsagePanel::Hint)
+            }
             UsageSource::Unknown => Some(unknown_lines()),
             UsageSource::Nodes(usage) => Some(match usage.get(name) {
                 Some(&used) => {
@@ -76,7 +94,10 @@ impl DetailUsage {
             }),
             UsageSource::Pods(usage) => {
                 let key = (namespace?.to_owned(), name.to_owned());
-                Some(match usage.get(&key) {
+                let sample = usage
+                    .get(&key)
+                    .filter(|sample| sample.follows_creation(self.created));
+                Some(match sample {
                     Some(sample) => {
                         let budget = match &self.budget {
                             Some(Budget::Pod(check)) => check.for_sample(sample),
@@ -180,6 +201,7 @@ mod tests {
     use flint_core::metrics::{ContainerMetrics, PodMetrics};
     use serde_json::json;
 
+    use super::super::super::list_usage::{NO_FEED_HINT, NOT_INSTALLED_HINT};
     use super::*;
 
     const MIB: u64 = 1024 * 1024;
@@ -195,8 +217,8 @@ mod tests {
         let sample = PodMetrics {
             namespace: "ns".into(),
             name: "web".into(),
-            timestamp: None,
-            window: None,
+            timestamp: Some(jiff::Timestamp::from_second(1_000).unwrap()),
+            window: Some(jiff::SignedDuration::from_secs(15)),
             containers: containers
                 .iter()
                 .enumerate()
@@ -212,13 +234,16 @@ mod tests {
     }
 
     fn pod_object() -> Value {
-        json!({"spec": {"containers": [{
-            "name": "app",
-            "resources": {
-                "requests": {"cpu": "200m", "memory": "100Mi"},
-                "limits": {"memory": "400Mi"}
-            }
-        }]}})
+        json!({
+            "metadata": {"creationTimestamp": "1970-01-01T00:01:40Z"},
+            "spec": {"containers": [{
+                "name": "app",
+                "resources": {
+                    "requests": {"cpu": "200m", "memory": "100Mi"},
+                    "limits": {"memory": "400Mi"}
+                }
+            }]}
+        })
     }
 
     fn pod_detail(source: UsageSource) -> DetailUsage {
@@ -315,6 +340,40 @@ mod tests {
         assert_eq!(
             detail.panel(Some("ns"), "web"),
             Some(UsagePanel::Hint(NOT_INSTALLED_HINT))
+        );
+    }
+
+    #[test]
+    fn with_no_feed_the_pane_says_when_usage_appears() {
+        let mut detail = DetailUsage::default();
+        detail.set_source(UsageSource::NoFeed);
+        assert_eq!(
+            detail.panel(Some("ns"), "web"),
+            Some(UsagePanel::Hint(NO_FEED_HINT))
+        );
+    }
+
+    #[test]
+    fn a_sample_from_before_the_pod_was_created_is_unknown() {
+        let mut detail = pod_detail(pod_source(&["app"], usage(100, 200)));
+        detail.set_object(
+            Some(UsageSubject::Pods),
+            &json!({"metadata": {"creationTimestamp": "1970-01-01T00:16:40Z"}}),
+        );
+        assert_eq!(
+            detail.panel(Some("ns"), "web"),
+            lines(UNKNOWN_TEXT, UNKNOWN_TEXT)
+        );
+    }
+
+    #[test]
+    fn a_deleted_pod_takes_no_later_readings() {
+        let mut detail = pod_detail(UsageSource::Unknown);
+        detail.mark_deleted();
+        assert!(!detail.set_source(pod_source(&["app"], usage(100, 200))));
+        assert_eq!(
+            detail.panel(Some("ns"), "web"),
+            lines(UNKNOWN_TEXT, UNKNOWN_TEXT)
         );
     }
 

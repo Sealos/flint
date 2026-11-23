@@ -2,16 +2,16 @@
 //! list makes no request of its own.
 //!
 //! The columns are appended to the snapshot's definitions and rows hold no cell for them. Their
-//! values live in [`UsageValues`], two integers per row, built off the UI thread with the rows
-//! they belong to. A value the poll did not report is [`UNKNOWN_TEXT`], never zero, and sorts
-//! last in both directions.
+//! values live in [`UsageValues`], the raw amounts of each row, built off the UI thread with the
+//! rows they belong to. A value the poll did not report is [`UNKNOWN_TEXT`], never zero, and
+//! sorts last in both directions.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use flint_core::metrics::{Cpu, Memory, PodSample, Usage};
-use flint_core::telemetry::{Availability, ClusterTelemetry, PodKey, UsageRead};
-use flint_core::{Column, ColumnRole, ColumnType, KindId, KindSnapshot, MetricsError, Row};
+use flint_core::telemetry::{ClusterTelemetry, PodKey, UsageRead};
+use flint_core::{Column, ColumnRole, ColumnType, KindId, MetricsError, Row};
 
 /// What a cell or detail line says for a value the poll did not report.
 pub(in crate::ui) const UNKNOWN_TEXT: &str = "unknown";
@@ -20,11 +20,12 @@ pub(in crate::ui) const UNKNOWN_TEXT: &str = "unknown";
 pub(in crate::ui) const NOT_INSTALLED_HINT: &str = "CPU and memory columns need metrics-server, \
      which this cluster does not have. The cluster overview shows how to install it.";
 
+/// What a pod or node list says when nothing polls the cluster's metrics.
+pub(in crate::ui) const NO_FEED_HINT: &str = "CPU and memory columns appear while the cluster \
+     overview is open or the cluster is watched in the background.";
+
 /// Room for the widest usual value, such as `1048576Mi`.
 const USAGE_CHARS: usize = 9;
-
-/// A stored value the poll did not report.
-const UNKNOWN: u32 = u32::MAX;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -60,9 +61,11 @@ impl UsageSubject {
 /// What the cluster's metrics poll says for one kind.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(in crate::ui) enum UsageSource {
-    /// No feed, or its first poll has not finished: no columns yet, and nothing to explain.
+    /// The feed's first poll has not finished: no columns yet, and nothing to explain.
     #[default]
     Hidden,
+    /// No feed runs for the cluster: no columns, and a hint that says when they appear.
+    NoFeed,
     /// The cluster does not serve the metrics API: no columns, and a hint.
     NotInstalled,
     /// The API exists but gives no current values: the columns stay, every value unknown.
@@ -74,13 +77,10 @@ pub(in crate::ui) enum UsageSource {
 impl UsageSource {
     pub(in crate::ui) fn of(subject: UsageSubject, telemetry: Option<&ClusterTelemetry>) -> Self {
         let Some(telemetry) = telemetry else {
-            return Self::Hidden;
+            return Self::NoFeed;
         };
-        // Held values of a feed that can no longer read its cluster are not current.
-        let current = !matches!(
-            telemetry.snapshot.availability,
-            Availability::CannotBeChecked(_)
-        );
+        // The poll reports its own failures. Only a stopped feed's values are no longer current.
+        let current = !telemetry.stopped;
         match subject {
             UsageSubject::Pods => Self::from_read(&telemetry.reads.pod_usage, current, Self::Pods),
             UsageSubject::Nodes => {
@@ -105,13 +105,26 @@ impl UsageSource {
     }
 
     fn shows_columns(&self) -> bool {
-        !matches!(self, Self::Hidden | Self::NotInstalled)
+        !matches!(self, Self::Hidden | Self::NoFeed | Self::NotInstalled)
+    }
+
+    fn has_readings(&self) -> bool {
+        matches!(self, Self::Pods(_) | Self::Nodes(_))
+    }
+
+    /// Why the columns are missing, when that needs saying.
+    pub(in crate::ui) fn hint(&self) -> Option<&'static str> {
+        match self {
+            Self::NoFeed => Some(NO_FEED_HINT),
+            Self::NotInstalled => Some(NOT_INSTALLED_HINT),
+            Self::Hidden | Self::Unknown | Self::Pods(_) | Self::Nodes(_) => None,
+        }
     }
 
     /// Usage of each of `rows`, in their order. Reuses one key, so a row allocates nothing.
     pub(in crate::ui) fn values(&self, rows: &[Arc<Row>]) -> UsageValues {
         match self {
-            Self::Hidden | Self::NotInstalled => UsageValues::default(),
+            Self::Hidden | Self::NoFeed | Self::NotInstalled => UsageValues::default(),
             Self::Unknown => UsageValues::collect(rows.iter().map(|_| None)),
             Self::Nodes(usage) => {
                 UsageValues::collect(rows.iter().map(|row| usage.get(&*row.name).copied()))
@@ -123,37 +136,47 @@ impl UsageSource {
                     key.0.push_str(row.namespace.as_deref()?);
                     key.1.clear();
                     key.1.push_str(&row.name);
-                    usage.get(&key).map(|sample| sample.usage)
+                    usage
+                        .get(&key)
+                        .filter(|sample| sample.follows_creation(row.created))
+                        .map(|sample| sample.usage)
                 }))
             }
         }
     }
 }
 
-/// Each row's CPU in millicores and memory in MiB, rounded up, by index into the snapshot's rows.
+/// Each row's raw CPU in nanocores and memory in bytes, by index into the snapshot's rows.
+/// Rounded only for display, so that close values still sort apart.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(in crate::ui) struct UsageValues {
-    cpu: Box<[u32]>,
-    memory: Box<[u32]>,
+    /// Whether the poll reported the row. Its amounts are meaningless otherwise.
+    known: Box<[bool]>,
+    cpu: Box<[u64]>,
+    memory: Box<[u64]>,
 }
 
 impl UsageValues {
     fn collect(usage: impl ExactSizeIterator<Item = Option<Usage>>) -> Self {
-        let (mut cpu, mut memory) = (
-            Vec::with_capacity(usage.len()),
-            Vec::with_capacity(usage.len()),
+        let rows = usage.len();
+        let (mut known, mut cpu, mut memory) = (
+            Vec::with_capacity(rows),
+            Vec::with_capacity(rows),
+            Vec::with_capacity(rows),
         );
         for usage in usage {
-            cpu.push(usage.map_or(UNKNOWN, |u| stored(u.cpu.millis())));
-            memory.push(usage.map_or(UNKNOWN, |u| stored(u.memory.bytes().div_ceil(MIB))));
+            known.push(usage.is_some());
+            cpu.push(usage.map_or(0, |u| u.cpu.nanos()));
+            memory.push(usage.map_or(0, |u| u.memory.bytes()));
         }
         Self {
+            known: known.into(),
             cpu: cpu.into(),
             memory: memory.into(),
         }
     }
 
-    fn of_role(&self, role: ColumnRole) -> Option<&[u32]> {
+    fn of_role(&self, role: ColumnRole) -> Option<&[u64]> {
         match role {
             ColumnRole::CpuUsage => Some(&self.cpu),
             ColumnRole::MemoryUsage => Some(&self.memory),
@@ -161,13 +184,34 @@ impl UsageValues {
         }
     }
 
+    /// `row`'s amount in `values`, if the poll reported the row.
+    fn known_value(&self, values: &[u64], row: usize) -> Option<u64> {
+        self.known
+            .get(row)
+            .copied()
+            .unwrap_or(false)
+            .then(|| values.get(row).copied())
+            .flatten()
+    }
+
     /// The text of `row`'s cell, if `role` is a usage column.
     pub(in crate::ui) fn text(&self, role: ColumnRole, row: usize) -> Option<String> {
-        let value = self.of_role(role)?.get(row).copied().unwrap_or(UNKNOWN);
-        Some(match (value, role) {
-            (UNKNOWN, _) => UNKNOWN_TEXT.to_owned(),
-            (value, ColumnRole::CpuUsage) => format!("{value}m"),
-            (value, _) => format!("{value}Mi"),
+        let values = self.of_role(role)?;
+        Some(match self.known_value(values, row) {
+            Some(value) => display(role, value),
+            None => UNKNOWN_TEXT.to_owned(),
+        })
+    }
+
+    /// The characters the widest value of the usage column `role` needs.
+    fn chars(&self, role: ColumnRole) -> usize {
+        let widest = self.of_role(role).and_then(|values| {
+            (0..values.len())
+                .filter_map(|row| self.known_value(values, row))
+                .max()
+        });
+        widest.map_or(USAGE_CHARS, |value| {
+            display(role, value).len().max(USAGE_CHARS)
         })
     }
 
@@ -180,30 +224,32 @@ impl UsageValues {
         descending: bool,
     ) -> Option<Arc<[u32]>> {
         let values = self.of_role(role)?;
-        let value = |row: u32| values.get(row as usize).copied().unwrap_or(UNKNOWN);
+        let value = |row: u32| self.known_value(values, row as usize);
         let mut sorted = rows.to_vec();
-        sorted.sort_by(|&a, &b| {
-            let (a, b) = (value(a), value(b));
-            match (a == UNKNOWN, b == UNKNOWN) {
-                (false, false) if descending => b.cmp(&a),
-                (false, false) => a.cmp(&b),
-                (unknown_a, unknown_b) => unknown_a.cmp(&unknown_b),
-            }
+        sorted.sort_by(|&a, &b| match (value(a), value(b)) {
+            (Some(a), Some(b)) if descending => b.cmp(&a),
+            (Some(a), Some(b)) => a.cmp(&b),
+            (a, b) => a.is_none().cmp(&b.is_none()),
         });
         Some(sorted.into())
     }
 }
 
-/// Below [`UNKNOWN`], so a huge value can never read as a missing one.
-fn stored(value: u64) -> u32 {
-    u32::try_from(value).unwrap_or(UNKNOWN).min(UNKNOWN - 1)
+/// A raw amount as its column shows it.
+fn display(role: ColumnRole, value: u64) -> String {
+    match role {
+        ColumnRole::CpuUsage => cpu_text(Cpu::from_nanos(value)),
+        _ => memory_text(Memory::from_bytes(value)),
+    }
 }
 
-/// Sets the measured width of the usage columns, whose text rows do not hold.
-pub(in crate::ui) fn fit_widths(widths: &mut [usize], columns: &[Column]) {
+/// Extends the server columns' measured `widths` to `columns`, with the usage columns' widths,
+/// whose text rows do not hold.
+pub(in crate::ui) fn fit_widths(widths: &mut Vec<usize>, columns: &[Column], usage: &UsageValues) {
+    widths.resize(columns.len(), 0);
     for (width, column) in widths.iter_mut().zip(columns) {
         if matches!(column.role, ColumnRole::CpuUsage | ColumnRole::MemoryUsage) {
-            *width = USAGE_CHARS;
+            *width = usage.chars(column.role);
         }
     }
 }
@@ -230,8 +276,8 @@ pub(in crate::ui) struct ListUsage {
     source: UsageSource,
     /// The values of the snapshot drawn, replaced with it.
     values: Arc<UsageValues>,
-    /// The last snapshot given usage columns and the result, which shares its rows' contents.
-    decorated: Option<(Arc<KindSnapshot>, Arc<KindSnapshot>)>,
+    /// Moves whenever the readings stop being valid, so a job started before cannot land.
+    generation: u64,
     /// The last server columns and the same with usage columns, so that snapshots share them.
     columns: Option<ColumnPair>,
 }
@@ -245,8 +291,9 @@ impl ListUsage {
         if self.source == source {
             return false;
         }
-        if self.source.shows_columns() != source.shows_columns() {
-            self.decorated = None;
+        if !source.has_readings() {
+            self.generation += 1;
+            self.values = Arc::default();
         }
         self.source = source;
         true
@@ -256,8 +303,18 @@ impl ListUsage {
         &self.source
     }
 
-    pub(in crate::ui) fn not_installed(&self) -> bool {
-        self.source == UsageSource::NotInstalled
+    pub(in crate::ui) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(in crate::ui) fn hint(&self) -> Option<&'static str> {
+        self.source.hint()
+    }
+
+    /// Whether the columns are missing only because nothing polls the cluster. An ordinary
+    /// state in On view mode, so the list says it in its toolbar and keeps its height.
+    pub(in crate::ui) fn no_feed(&self) -> bool {
+        self.source == UsageSource::NoFeed
     }
 
     pub(in crate::ui) fn set_values(&mut self, values: Arc<UsageValues>) {
@@ -269,26 +326,12 @@ impl ListUsage {
         self.values.text(role, row)
     }
 
-    /// `snapshot` with the usage columns while they show. Its rows are shared, not copied.
-    pub(in crate::ui) fn decorate(&mut self, snapshot: &Arc<KindSnapshot>) -> Arc<KindSnapshot> {
+    /// The columns to draw for `server`'s: with the usage columns while they show. Kept apart
+    /// from the snapshot, so that a new snapshot copies no row references.
+    pub(in crate::ui) fn columns_for(&mut self, server: &Arc<[Column]>) -> Arc<[Column]> {
         if !self.source.shows_columns() {
-            return Arc::clone(snapshot);
+            return Arc::clone(server);
         }
-        if let Some((raw, decorated)) = &self.decorated
-            && Arc::ptr_eq(raw, snapshot)
-        {
-            return Arc::clone(decorated);
-        }
-        let columns = self.columns_for(&snapshot.columns);
-        let decorated = Arc::new(KindSnapshot {
-            columns,
-            ..KindSnapshot::clone(snapshot)
-        });
-        self.decorated = Some((Arc::clone(snapshot), Arc::clone(&decorated)));
-        decorated
-    }
-
-    fn columns_for(&mut self, server: &Arc<[Column]>) -> Arc<[Column]> {
         if let Some((known, with_usage)) = &self.columns
             && Arc::ptr_eq(known, server)
         {
@@ -311,6 +354,7 @@ impl ListUsage {
 mod tests {
     use super::*;
     use flint_core::metrics::{ContainerMetrics, PodMetrics};
+    use flint_core::telemetry::Availability;
 
     fn usage(millis: u64, mib: u64) -> Usage {
         Usage {
@@ -319,14 +363,22 @@ mod tests {
         }
     }
 
+    /// When [`sample`]'s window ends; it lasts [`WINDOW_SECS`].
+    const SAMPLED_AT: i64 = 1_000;
+    const WINDOW_SECS: i64 = 15;
+
     fn row(namespace: Option<&str>, name: &str) -> Arc<Row> {
+        created_row(namespace, name, Some(SAMPLED_AT - WINDOW_SECS))
+    }
+
+    fn created_row(namespace: Option<&str>, name: &str, created: Option<i64>) -> Arc<Row> {
         Arc::new(Row {
             uid: name.into(),
             name: name.into(),
             namespace: namespace.map(Into::into),
             resource_version: "1".into(),
             generation: None,
-            created: None,
+            created,
             labels: Box::new([]),
             cells: Box::new([]),
         })
@@ -336,14 +388,109 @@ mod tests {
         PodMetrics {
             namespace: "ns".into(),
             name: "pod".into(),
-            timestamp: None,
-            window: None,
+            timestamp: Some(jiff::Timestamp::from_second(SAMPLED_AT).unwrap()),
+            window: Some(jiff::SignedDuration::from_secs(WINDOW_SECS)),
             containers: vec![ContainerMetrics {
                 name: "app".into(),
                 usage: usage(millis, mib),
             }],
         }
         .sample()
+    }
+
+    fn one_pod(sample: PodSample) -> UsageSource {
+        let key = ("a".to_owned(), "web".to_owned());
+        UsageSource::Pods(Arc::new([(key, sample)].into_iter().collect()))
+    }
+
+    #[test]
+    fn a_replaced_pod_shows_no_usage_of_the_old_one() {
+        let source = one_pod(sample(5, 7));
+        let replacement = [created_row(Some("a"), "web", Some(SAMPLED_AT + 1))];
+        let values = source.values(&replacement);
+        assert_eq!(values.text(ColumnRole::CpuUsage, 0).unwrap(), UNKNOWN_TEXT);
+        assert_eq!(
+            values.text(ColumnRole::MemoryUsage, 0).unwrap(),
+            UNKNOWN_TEXT
+        );
+        // Created while the window was open: the reading may cover the pod before it.
+        let during = [created_row(Some("a"), "web", Some(SAMPLED_AT - 1))];
+        assert_eq!(
+            source
+                .values(&during)
+                .text(ColumnRole::CpuUsage, 0)
+                .unwrap(),
+            UNKNOWN_TEXT
+        );
+        let unproved = [created_row(Some("a"), "web", None)];
+        assert_eq!(
+            source
+                .values(&unproved)
+                .text(ColumnRole::CpuUsage, 0)
+                .unwrap(),
+            UNKNOWN_TEXT
+        );
+        let same_pod = [created_row(
+            Some("a"),
+            "web",
+            Some(SAMPLED_AT - WINDOW_SECS),
+        )];
+        assert_eq!(
+            source
+                .values(&same_pod)
+                .text(ColumnRole::CpuUsage, 0)
+                .unwrap(),
+            "5m"
+        );
+    }
+
+    #[test]
+    fn forbidden_watches_do_not_hide_successful_metrics() {
+        let key = ("a".to_owned(), "web".to_owned());
+        let reads = flint_core::telemetry::SideReads {
+            pod_usage: UsageRead::Current(Arc::new([(key, sample(5, 7))].into_iter().collect())),
+            ..Default::default()
+        };
+        let source = |stopped| {
+            let telemetry = ClusterTelemetry::for_tests(
+                Availability::CannotBeChecked(None),
+                reads.clone(),
+                stopped,
+            );
+            UsageSource::of(UsageSubject::Pods, Some(&telemetry))
+        };
+        let values = source(false).values(&[row(Some("a"), "web")]);
+        assert_eq!(values.text(ColumnRole::CpuUsage, 0).unwrap(), "5m");
+        assert_eq!(source(true), UsageSource::Unknown);
+    }
+
+    #[test]
+    fn sorting_keeps_full_precision_and_huge_memory_displays_exactly() {
+        let parsed = |cpu: &str, memory: &str| Usage {
+            cpu: cpu.parse().unwrap(),
+            memory: memory.parse().unwrap(),
+        };
+        let values = UsageValues::collect(
+            [
+                Some(parsed("100100000n", "5Pi")),
+                Some(parsed("100900000n", "6Pi")),
+            ]
+            .into_iter(),
+        );
+        let down = values.sorted(&[0, 1], ColumnRole::CpuUsage, true).unwrap();
+        assert_eq!(&*down, &[1, 0]);
+        let down = values
+            .sorted(&[0, 1], ColumnRole::MemoryUsage, true)
+            .unwrap();
+        assert_eq!(&*down, &[1, 0]);
+        assert_eq!(
+            values.text(ColumnRole::MemoryUsage, 0).unwrap(),
+            "5368709120Mi"
+        );
+        assert_eq!(
+            values.text(ColumnRole::MemoryUsage, 1).unwrap(),
+            "6442450944Mi"
+        );
     }
 
     fn nodes(values: &[(&str, u64, u64)]) -> UsageSource {
@@ -442,46 +589,68 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_row_takes_eight_bytes() {
+    fn a_stored_row_takes_seventeen_bytes() {
         let rows: Vec<_> = (0..4).map(|i| row(None, &i.to_string())).collect();
         let values = UsageSource::Unknown.values(&rows);
-        let bytes = std::mem::size_of_val(&*values.cpu) + std::mem::size_of_val(&*values.memory);
-        assert_eq!(bytes, 8 * rows.len());
+        let bytes = std::mem::size_of_val(&*values.known)
+            + std::mem::size_of_val(&*values.cpu)
+            + std::mem::size_of_val(&*values.memory);
+        assert_eq!(bytes, 17 * rows.len());
     }
 
     #[test]
-    fn columns_show_only_with_a_source_and_share_rows() {
-        let raw = Arc::new(KindSnapshot {
-            columns: vec![Column::synthetic(
-                "Name",
-                ColumnType::String,
-                ColumnRole::Name,
-            )]
-            .into(),
-            rows: vec![row(None, "a")],
-            ..Default::default()
-        });
+    fn columns_show_only_with_a_source_and_are_shared() {
+        let server: Arc<[Column]> = vec![Column::synthetic(
+            "Name",
+            ColumnType::String,
+            ColumnRole::Name,
+        )]
+        .into();
         let mut usage = ListUsage::default();
-        assert!(Arc::ptr_eq(&usage.decorate(&raw), &raw));
+        assert!(Arc::ptr_eq(&usage.columns_for(&server), &server));
 
         assert!(usage.set_source(UsageSource::NotInstalled));
-        assert!(usage.not_installed());
-        assert!(Arc::ptr_eq(&usage.decorate(&raw), &raw));
+        assert_eq!(usage.hint(), Some(NOT_INSTALLED_HINT));
+        assert!(Arc::ptr_eq(&usage.columns_for(&server), &server));
 
         assert!(usage.set_source(UsageSource::Unknown));
         assert!(!usage.set_source(UsageSource::Unknown));
-        let decorated = usage.decorate(&raw);
-        assert_eq!(decorated.columns.len(), 3);
-        assert_eq!(decorated.columns[1].key(), "flint:cpu-usage");
-        assert_eq!(decorated.columns[2].key(), "flint:memory-usage");
-        assert!(Arc::ptr_eq(&decorated.rows[0], &raw.rows[0]));
-        assert!(Arc::ptr_eq(&usage.decorate(&raw), &decorated));
+        let shown = usage.columns_for(&server);
+        assert_eq!(shown.len(), 3);
+        assert_eq!(shown[1].key(), "flint:cpu-usage");
+        assert_eq!(shown[2].key(), "flint:memory-usage");
+        assert!(Arc::ptr_eq(&usage.columns_for(&server), &shown));
+    }
 
-        let next = Arc::new(KindSnapshot::clone(&raw));
-        assert!(Arc::ptr_eq(
-            &usage.decorate(&next).columns,
-            &decorated.columns
-        ));
+    #[test]
+    fn no_feed_has_its_own_hint_and_no_columns() {
+        assert_eq!(
+            UsageSource::of(UsageSubject::Pods, None),
+            UsageSource::NoFeed
+        );
+        let mut usage = ListUsage::default();
+        assert_eq!(usage.hint(), None);
+        usage.set_source(UsageSource::NoFeed);
+        assert_eq!(usage.hint(), Some(NO_FEED_HINT));
+        assert_ne!(NO_FEED_HINT, NOT_INSTALLED_HINT);
+        let server: Arc<[Column]> = vec![Column::synthetic(
+            "Name",
+            ColumnType::String,
+            ColumnRole::Name,
+        )]
+        .into();
+        assert!(Arc::ptr_eq(&usage.columns_for(&server), &server));
+    }
+
+    #[test]
+    fn only_losing_the_readings_invalidates_running_jobs() {
+        let mut usage = ListUsage::default();
+        usage.set_source(one_pod(sample(1, 1)));
+        let before = usage.generation();
+        usage.set_source(one_pod(sample(2, 2)));
+        assert_eq!(usage.generation(), before);
+        usage.set_source(UsageSource::NotInstalled);
+        assert_ne!(usage.generation(), before);
     }
 
     #[test]
@@ -510,8 +679,17 @@ mod tests {
             Column::synthetic("CPU", ColumnType::Number, ColumnRole::CpuUsage),
             Column::synthetic("Memory", ColumnType::Number, ColumnRole::MemoryUsage),
         ];
-        let mut widths = [20, 5, 8];
-        fit_widths(&mut widths, &columns);
+        let mut widths = vec![20];
+        fit_widths(&mut widths, &columns, &UsageValues::default());
         assert_eq!(widths, [20, USAGE_CHARS, USAGE_CHARS]);
+
+        let huge = Usage {
+            cpu: Cpu::from_nanos(1),
+            memory: "5Pi".parse().unwrap(),
+        };
+        let values = UsageValues::collect([Some(huge)].into_iter());
+        let mut widths = vec![20];
+        fit_widths(&mut widths, &columns, &values);
+        assert_eq!(widths, [20, USAGE_CHARS, "5368709120Mi".len()]);
     }
 }

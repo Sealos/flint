@@ -234,16 +234,33 @@ impl PodMetrics {
         PodSample {
             usage: self.total(),
             containers: container_digest(self.containers.iter().map(|c| c.name.as_str())),
+            window_start: self.window_start(),
         }
+    }
+
+    /// When the sample's window opened, in Unix seconds, if the server gave a usable window.
+    fn window_start(&self) -> Option<i64> {
+        let window = self.window.filter(|window| window.is_positive())?;
+        Some(self.timestamp?.checked_sub(window).ok()?.as_second())
     }
 }
 
-/// A pod's total use and a digest of the containers it covers: a fixed size, whatever the pod's
-/// containers are called.
+/// A pod's total use, a digest of the containers it covers and when its window opened: a fixed
+/// size, whatever the pod's containers are called.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PodSample {
     pub usage: Usage,
     containers: u64,
+    window_start: Option<i64>,
+}
+
+impl PodSample {
+    /// Whether this sample can belong to a pod created at `created` (Unix seconds). The metrics
+    /// API sends no uid, so a pod recreated under the same name is told apart by its window,
+    /// which cannot open before the pod exists. Without both times nothing is proved.
+    pub fn follows_creation(&self, created: Option<i64>) -> bool {
+        matches!((self.window_start, created), (Some(start), Some(created)) if start >= created)
+    }
 }
 
 /// A pod spec's budget and the containers it applies to, kept in place of the spec.

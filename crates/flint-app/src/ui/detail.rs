@@ -615,6 +615,7 @@ impl DetailView {
     /// stays, and the other object is neither shown nor available to an edit.
     fn replaced(&mut self, cx: &mut Context<Self>) {
         self.gone = true;
+        self.usage.mark_deleted();
         self.refetch = false;
         self.error_retry_due = false;
         self._error_retry_cooldown = None;
@@ -695,6 +696,7 @@ impl DetailView {
     /// The object was deleted: keep showing the last copy, marked as gone.
     pub fn mark_gone(&mut self, cx: &mut Context<Self>) {
         self.gone = true;
+        self.usage.mark_deleted();
         cx.notify();
     }
 

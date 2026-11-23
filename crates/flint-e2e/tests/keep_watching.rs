@@ -322,6 +322,7 @@ async fn a_refused_login_keeps_the_last_values_with_their_age() {
     f.until_status(KeepWatching::SignInNeeded).await;
 
     let held = f.core.handle.telemetry("b").expect("the last values stay");
+    assert!(held.stopped, "held values must not read as polled");
     let Availability::CannotBeChecked(Some(failure)) = &held.snapshot.availability else {
         panic!("not marked: {:?}", held.snapshot.availability);
     };
