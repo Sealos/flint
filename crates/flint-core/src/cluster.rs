@@ -857,9 +857,7 @@ fn build_observed_client(
         )
         .option_layer(observer.cloned().map(|grant| {
             tower::util::MapResponseLayer::new(move |response: http::Response<_>| {
-                if response.status() == http::StatusCode::UNAUTHORIZED {
-                    grant.note_refused();
-                }
+                grant.note_response(response.status());
                 response
             })
         }))
@@ -949,6 +947,42 @@ pub(crate) async fn connect_gated_and_check_with_policy(
         let connection = connect_gated_with_policy(kubeconfig, context, access).await?;
         let version = server_version(&connection.clients.read).await?;
         Ok((connection, version))
+    })
+    .await
+}
+
+/// A read-only client for `context` with `access` deciding whether its credential may run, and
+/// no write client at all: what a background feed connects with.
+pub(crate) async fn connect_read_only_with_policy(
+    kubeconfig: &Kubeconfig,
+    context: &str,
+    timeout: Duration,
+    access: &CredentialAccess,
+) -> Result<Client, ClusterError> {
+    bounded(kubeconfig, context, timeout, async {
+        let ready = prepare(kubeconfig, context, access).await?;
+        let target = ready.target;
+        let (mut config, token, grant) = (ready.config, ready.token, ready.grant);
+        // Each retry could run the plugin again for a short-lived token. The feed has its own
+        // backoff, so every request here is sent once.
+        config.default_retry = false;
+        let client = tokio::task::spawn_blocking(move || {
+            let auth = kube::client::ConfigExt::auth_layer(&config)?;
+            build_observed_client(
+                &config,
+                token,
+                auth.as_ref(),
+                None,
+                Access::ReadOnly,
+                Some(&grant),
+                None,
+            )
+        })
+        .await
+        .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
+        .map_err(|e| ClusterError::kube(e).for_target(&target))?;
+        server_version(&client).await?;
+        Ok(client)
     })
     .await
 }
@@ -1052,7 +1086,7 @@ pub(crate) fn find_auth_error<'a>(
 }
 
 /// A message for an auth error that never includes the plugin's command, environment, or output.
-fn auth_error_message(err: &kube::client::AuthError) -> String {
+pub(crate) fn auth_error_message(err: &kube::client::AuthError) -> String {
     use kube::client::AuthError as A;
     match err {
         A::AuthExecRun { out, .. } => format!(
@@ -1061,7 +1095,13 @@ fn auth_error_message(err: &kube::client::AuthError) -> String {
             out.status
         ),
         A::AuthExecParse(_) => {
-            "authentication failed: the exec auth plugin's output could not be parsed".to_owned()
+            format!(
+                "authentication failed: {}",
+                crate::auth_plugin::UNREADABLE_OUTPUT
+            )
+        }
+        A::AuthExec(text) if text == crate::auth_plugin::UNREADABLE_OUTPUT => {
+            format!("authentication failed: {text}")
         }
         A::AuthExec(text) => match crate::auth_plugin::problem(text) {
             Some((command, problem)) => plugin_problem_message(command.as_deref(), &problem),

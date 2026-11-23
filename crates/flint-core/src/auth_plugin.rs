@@ -129,6 +129,13 @@ pub(crate) async fn resolve_with_grant(
     if !lease.holds() {
         return Err(not_allowed());
     }
+    if lease.unattended()
+        && let Credential::Token { token, .. } = &credential
+        && let Err(invalid) = bearer_value(token)
+    {
+        lease.note_failed();
+        return Err(AuthError::InvalidBearerToken(invalid));
+    }
     Ok(match credential {
         Credential::Certificate { certificate, key } => {
             // kube reads these as base64; the plugin's certificate replaces any in kubeconfig.
@@ -230,7 +237,12 @@ async fn run(
     if interactive {
         cmd.stdin(Stdio::inherit()).stderr(Stdio::inherit());
     } else {
-        cmd.stdin(Stdio::piped()).stderr(Stdio::piped());
+        let stdin = if lease.unattended() {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        };
+        cmd.stdin(stdin).stderr(Stdio::piped());
     }
     cmd.stdout(Stdio::piped());
     let cluster = if exec.provide_cluster_info {
@@ -259,12 +271,20 @@ async fn run(
     for name in exec.drop_env.iter().flatten() {
         cmd.env_remove(name);
     }
+    if lease.unattended() {
+        // Discourages a browser sign-in. It can't prevent one: macOS `open` needs none of these.
+        cmd.env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .env("BROWSER", "false");
+    }
     cmd.kill_on_drop(true);
     // Its own error and not `not_allowed`, which a waiting request answers by trying again while
     // the role allows it.
     if let Some(refusal) = lease.launch_refusal().await {
         return Err(AuthError::AuthExec(refusal));
     }
+    // Declared before `running`, so it is counted until its group has been killed.
+    let _counted = lease.track_run();
     let mut child = lease
         .start_if_held(|| cmd.spawn())
         .ok_or_else(not_allowed)?
@@ -323,19 +343,19 @@ async fn run(
             redact::command_name(program).unwrap_or_default()
         )));
     }
-    let out = std::process::Output {
-        status,
-        stdout: out,
-        stderr: err,
-    };
-    if !out.status.success() {
-        // kube puts the command's `Debug` form here, environment included; only the name is kept.
+    if !status.success() {
+        // kube puts the command's `Debug` form here, environment included, and the error prints
+        // this output: only the name and the exit status are kept.
         return Err(AuthError::AuthExecRun {
             cmd: redact::command_name(program).unwrap_or_default(),
-            out: Box::new(out),
+            out: Box::new(std::process::Output {
+                status,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            }),
         });
     }
-    parse(&out.stdout)
+    parse(&out)
 }
 
 /// Reads `pipe` to its end into `buf`, keeping at most `cap` bytes. Past them, with `fail` it
@@ -611,17 +631,20 @@ struct ExecCredentialStatus {
     client_key_data: Option<String>,
 }
 
+/// The whole error for output that is no credential. A parser's own error quotes its input.
+pub(crate) const UNREADABLE_OUTPUT: &str = "the exec auth plugin's output could not be parsed";
+
 /// Reads a plugin's output. client-go decodes it with a YAML-tolerant codec, so some plugins
 /// print YAML; YAML 1.2 includes JSON.
 fn parse(stdout: &[u8]) -> Result<Credential, AuthError> {
-    let creds: ExecCredential =
-        serde_saphyr::from_slice(stdout).map_err(|e| AuthError::AuthExecParse(Box::new(e)))?;
+    let unreadable = || AuthError::AuthExec(UNREADABLE_OUTPUT.to_owned());
+    let creds: ExecCredential = serde_saphyr::from_slice(stdout).map_err(|_| unreadable())?;
     let status = creds.status.ok_or(AuthError::ExecPluginFailed)?;
     let expires = status
         .expiration_timestamp
         .map(|t| t.parse::<Timestamp>())
         .transpose()
-        .map_err(AuthError::MalformedTokenExpirationDate)?;
+        .map_err(|_| unreadable())?;
     Ok(
         match (
             status.client_certificate_data,
@@ -800,6 +823,12 @@ impl RefreshingToken {
                 match &state.refreshing {
                     Some(refresh) => refresh.clone(),
                     None => {
+                        // A new token would meet the same answer, so the plugin is not run for it.
+                        if self.0.grant.server_down() {
+                            self.0.grant.note_failed();
+                            return Err(not_allowed().into());
+                        }
+                        self.0.grant.refresh_starting();
                         let terminal = Terminal::acquire(
                             state.exec.interactive_mode == Some(ExecInteractiveMode::Always),
                         );
@@ -856,15 +885,28 @@ impl RefreshingToken {
                     token,
                     expires: Some(expires),
                 })) => {
+                    if lease.unattended()
+                        && let Err(invalid) = bearer_value(&token)
+                    {
+                        lease.note_failed();
+                        return Err(Arc::new(AuthError::InvalidBearerToken(invalid)));
+                    }
                     state.token = token.clone();
                     state.expires = expires;
                     state.resting = None;
                     Ok(token)
                 }
                 // kube's answer when a refresh no longer returns an expiring token.
-                Ok(Ok(_)) => Err(Arc::new(AuthError::UnrefreshableTokenResponse)),
-                Ok(Err(e)) => Err(Arc::new(e)),
+                Ok(Ok(_)) => {
+                    lease.note_failed();
+                    Err(Arc::new(AuthError::UnrefreshableTokenResponse))
+                }
+                Ok(Err(e)) => {
+                    lease.note_failed();
+                    Err(Arc::new(e))
+                }
                 Err(_) => {
+                    lease.note_failed();
                     if started && exec.interactive_mode != Some(ExecInteractiveMode::Never) {
                         state.resting = Some((
                             Instant::now() + PROMPT_BACK_OFF,
@@ -897,8 +939,11 @@ fn resting(name: &str, until: Timestamp) -> AuthError {
 }
 
 fn bearer(token: &SecretString) -> Result<HeaderValue, BoxError> {
-    let mut value = HeaderValue::try_from(format!("Bearer {}", token.expose_secret()))
-        .map_err(AuthError::InvalidBearerToken)?;
+    Ok(bearer_value(token).map_err(AuthError::InvalidBearerToken)?)
+}
+
+fn bearer_value(token: &SecretString) -> Result<HeaderValue, http::header::InvalidHeaderValue> {
+    let mut value = HeaderValue::try_from(format!("Bearer {}", token.expose_secret()))?;
     value.set_sensitive(true);
     Ok(value)
 }

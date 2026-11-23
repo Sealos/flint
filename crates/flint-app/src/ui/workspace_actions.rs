@@ -26,6 +26,7 @@ use super::super::confirm::{self, DialogText};
 use super::super::detail::{DetailView, Opening, refused};
 use super::super::dock::{Dock, DockTab, TabKey};
 use super::super::focus::release_unfocused_input;
+use super::super::keep_watching;
 use super::super::list::ResourceList;
 use super::super::log_view::{LogRequest, LogView};
 use super::super::nav::NavPanel;
@@ -49,7 +50,9 @@ use super::super::registry::{
     ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
     WatchOpenViewsOnly,
 };
-use super::super::registry::{BackToList, EditAiScope, Handler, ShowAgentActivity};
+use super::super::registry::{
+    BackToList, EditAiScope, Handler, ShowAgentActivity, ToggleKeepWatching,
+};
 use super::super::registry::{
     ClearClusterTag, LockCluster, RenameCluster, SetClusterTag, TrustCluster, UnlockCluster,
     UntrustCluster,
@@ -112,6 +115,7 @@ impl Workspace {
         .bind::<SelectCluster>(Self::select_cluster)
         .bind::<ExposeToAi>(Self::expose_to_ai)
         .bind::<HideFromAi>(Self::hide_from_ai)
+        .bind::<ToggleKeepWatching>(Self::toggle_keep_watching)
         .bind::<EditAiScope>(Self::edit_ai_scope)
         .bind::<ShowAgentActivity>(Self::show_agent_activity)
         .bind::<OpenCompare>(Self::open_compare)
@@ -244,6 +248,9 @@ impl Workspace {
             )
             .add::<ExposeToAi>(Self::settings_ok, |ws, a, cx| ws.check_expose(a, cx))
             .add::<HideFromAi>(Self::settings_ok, |ws, a, cx| ws.check_hide(a, cx))
+            .add::<ToggleKeepWatching>(Self::settings_ok, |ws, a, cx| {
+                ws.check_cluster::<ToggleKeepWatching>(&a.cluster, cx)
+            })
             .add::<EditAiScope>(Self::settings_ok, |ws, a, cx| {
                 ws.scope_change(a, cx).map(drop)
             })
@@ -1045,6 +1052,27 @@ impl Workspace {
                 self.model.update(cx, |m, _| m.activate(cluster));
             }
             Err(e) => tracing::warn!("{e}"),
+        }
+    }
+
+    /// Turns keeping a cluster watched off, or on. This never lets a sign-in command run, which
+    /// takes the cluster's background sign-in toggle. The core words any refusal.
+    fn toggle_keep_watching(
+        &mut self,
+        action: &ToggleKeepWatching,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cluster = action.cluster.clone();
+        let Some(view) = self.model.read(cx).keep_watching(&cluster).cloned() else {
+            return;
+        };
+        if !keep_watching::turns_on(view.status, view.sign_in) {
+            self.model
+                .update(cx, |m, _| m.set_keep_watching(cluster, None));
+        } else if let Some(definition) = view.definition {
+            self.model
+                .update(cx, |m, _| m.set_keep_watching(cluster, Some(definition)));
         }
     }
 

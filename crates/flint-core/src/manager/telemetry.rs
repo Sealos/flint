@@ -109,9 +109,11 @@ impl ClusterManager {
     ///
     /// On view promises no watch of a kind without an open view. A feed watches seven kinds
     /// whatever is open, so in that mode it runs only for the overview, which is a view of them.
-    fn wants_telemetry(&self, id: &str) -> bool {
+    pub(super) fn wants_telemetry(&self, id: &str) -> bool {
         if !self.wants_watches(id)
-            || (self.settings.watch_mode_for(id) != WatchMode::All && !self.overview_showing(id))
+            || (self.settings.watch_mode_for(id) != WatchMode::All
+                && !self.overview_showing(id)
+                && !self.keep_watching(id))
         {
             return false;
         }
@@ -171,7 +173,9 @@ impl ClusterManager {
             .filter(|slot| slot.telemetry.is_some())
             .map(|slot| slot.info.name.as_str())
             .collect();
-        self.telemetry.retain(|cluster| running.contains(&cluster));
+        let keep = &self.keep;
+        self.telemetry
+            .retain(|cluster| running.contains(&cluster) || keep.holds_board_entry(cluster));
     }
 
     fn start_telemetry(&mut self, index: usize, id: &str) {
@@ -181,13 +185,13 @@ impl ClusterManager {
             .telemetry
             .request_gate(reads_token_file(&self.kubeconfig.merged, id));
         let slot: &mut Cluster = &mut self.clusters[index];
-        let Some(clients) = slot.client.as_ref() else {
+        let Some(client) = slot.client.as_ref().map(|clients| clients.read.clone()) else {
             return;
         };
         // Its own store, so a stopping feed clearing its series can't touch its successor's.
         let trends = Arc::new(Mutex::new(TrendStore::new()));
         let store = Arc::clone(&trends);
-        let mut feed = Telemetry::start(id.into(), clients, target, store, timing, requests);
+        let mut feed = Telemetry::start(id.into(), client, target, store, timing, requests);
         self.telemetry.publish(id, &mut feed, trends);
         slot.telemetry = Some(SlotFeed {
             attempt: slot.attempt,

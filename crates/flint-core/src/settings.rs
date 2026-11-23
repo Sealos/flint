@@ -389,6 +389,14 @@ pub struct Settings {
     /// Post a desktop notification when a watched cluster has a new problem (#210). Off by
     /// default. Covers only clusters with a telemetry feed, which watch mode On view never has.
     pub desktop_notifications: bool,
+    /// Clusters kept watched in the background (ADR-0012), each bound to its server. Agreement to
+    /// run an exec plugin is not here: it lasts until the app quits. Change them through
+    /// [`set_watched_cluster`].
+    #[serde(
+        deserialize_with = "crate::keep_watching::readable_watched",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub watched_clusters: Vec<crate::keep_watching::WatchedCluster>,
     /// Per-cluster choices that override `desktop_notifications`, per context and server. Read
     /// them through [`Settings::alerts_on`]. An entry this version cannot read counts as no
     /// choice, and stays in the file.
@@ -419,12 +427,30 @@ impl Default for Settings {
             log_buffer_mib: DEFAULT_LOG_BUFFER_MIB,
             log_total_mib: DEFAULT_LOG_TOTAL_MIB,
             desktop_notifications: false,
+            watched_clusters: Vec::new(),
             cluster_alerts: Vec::new(),
         }
     }
 }
 
 impl Settings {
+    /// `context`'s keep-watching entry, if it is among those that may run.
+    pub fn watched_cluster(&self, context: &str) -> Option<&crate::keep_watching::WatchedCluster> {
+        self.watched_clusters
+            .iter()
+            .take(crate::keep_watching::MAX_WATCHED_CLUSTERS)
+            .find(|entry| entry.context == context)
+    }
+
+    /// The mode alerts read `cluster` in: keeping it watched overrides On view.
+    pub fn alert_mode_for(&self, cluster: &str) -> WatchMode {
+        if self.watched_cluster(cluster).is_some() {
+            WatchMode::All
+        } else {
+            self.watch_mode_for(cluster)
+        }
+    }
+
     /// [`Settings::log_buffer_lines`], kept within [`LOG_BUFFER_LINES_RANGE`].
     pub fn log_buffer_limit(&self) -> usize {
         self.log_buffer_lines.clamp(
@@ -543,6 +569,7 @@ impl Settings {
             ai_exposed_clusters: Vec::new(),
             trusted_clusters: Vec::new(),
             protect_local_clusters: true,
+            watched_clusters: Vec::new(),
             ..self
         }
     }
@@ -1048,6 +1075,35 @@ pub fn set_watch_mode(
                 }
             }
         }
+        Ok(())
+    })
+}
+
+/// Replaces `context`'s keep-watching entry (`None` removes it), and writes `settings.toml`.
+/// Refuses an entry past [`crate::keep_watching::MAX_WATCHED_CLUSTERS`].
+pub fn set_watched_cluster(
+    dir: &Path,
+    context: &str,
+    entry: Option<crate::keep_watching::WatchedCluster>,
+) -> Result<Settings, SettingsError> {
+    edit_settings(dir, |table, path| {
+        let mut current = table
+            .get("watched_clusters")
+            .cloned()
+            .map(crate::keep_watching::watched_entries)
+            .unwrap_or_default();
+        current.retain(|existing| existing.context != context);
+        if let Some(entry) = entry {
+            if current.len() >= crate::keep_watching::MAX_WATCHED_CLUSTERS {
+                return Err(SettingsError::Invalid {
+                    path: path.to_owned(),
+                    reason: crate::keep_watching::too_many_watched(),
+                });
+            }
+            current.push(entry);
+        }
+        current.sort_by(|a, b| a.context.cmp(&b.context));
+        table.insert("watched_clusters".into(), toml::Value::try_from(&current)?);
         Ok(())
     })
 }
