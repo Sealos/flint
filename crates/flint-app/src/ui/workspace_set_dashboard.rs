@@ -272,14 +272,14 @@ impl Workspace {
                 watched: model.settings.watch_mode_for(cluster) == WatchMode::All,
             }
         });
-        let left_out = run.left_out.iter().map(|cluster| MemberRead {
-            cluster: cluster.clone(),
-            shown: names.exact(cluster),
-            tag: tag(cluster),
-            blocked: Some("Changed, left out of this set.".to_owned()),
+        let left_out = run.left_out.iter().map(|member| MemberRead {
+            cluster: member.context.clone(),
+            shown: names.exact(&member.context),
+            tag: tag(&member.context),
+            blocked: Some(format!("{}, left out of this set.", member.reason.label())),
             telemetry: None,
             server: String::new(),
-            thresholds: model.settings.thresholds_for(cluster, None),
+            thresholds: model.settings.thresholds_for(&member.context, None),
             watched: false,
         });
         admitted.chain(left_out).collect()

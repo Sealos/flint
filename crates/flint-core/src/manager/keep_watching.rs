@@ -20,6 +20,7 @@ use super::{ClusterManager, Internal};
 use crate::ClusterId;
 use crate::cluster;
 use crate::connection::policy::{CredentialAccess, PluginRuns, Role};
+use crate::credential::CredentialSource;
 use crate::handle::Event;
 use crate::keep_watching::{
     BackgroundSignIn, KeepWatchView, KeepWatching, MAX_WATCHED_CLUSTERS, OfferTicket,
@@ -28,7 +29,7 @@ use crate::keep_watching::{
 };
 use crate::kubeconfig::LoadedKubeconfig;
 use crate::metrics_trend::TrendStore;
-use crate::telemetry::Telemetry;
+use crate::telemetry::{DiscoveryPace, KeptDiscovery, Telemetry};
 
 /// How long a connection that failed for a reason worth retrying waits before the next.
 const RETRY_AFTER: Duration = Duration::from_secs(60);
@@ -186,6 +187,8 @@ struct KeptFeed {
     id: ClusterId,
     grants: KeptGrants,
     attempt: u64,
+    /// The slot this connection was made for.
+    generation: Option<u64>,
     fingerprint: Option<u64>,
     runs_plugin: bool,
     /// A detected file change ended its plugin: a failed connection says nothing of the sign-in.
@@ -227,6 +230,7 @@ pub(super) struct KeepWatch {
     retry_at: HashMap<ClusterId, Instant>,
     next_attempt: u64,
     connects: Arc<Semaphore>,
+    discovery_pace: Arc<DiscoveryPace>,
     shown: BTreeMap<ClusterId, KeepWatchView>,
     /// How each context signs in, for the load it was read from: this is asked on every message
     /// of the manager's loop, and working it out serializes the context's entries.
@@ -250,6 +254,7 @@ impl Default for KeepWatch {
             retry_at: HashMap::new(),
             next_attempt: 1,
             connects: Arc::new(Semaphore::new(CONCURRENT_CONNECTS)),
+            discovery_pace: Arc::default(),
             shown: BTreeMap::new(),
             sign_ins: None,
         }
@@ -388,12 +393,13 @@ impl ClusterManager {
         self.void_broken_consents();
         let running: Vec<ClusterId> = self.keep.feeds.keys().cloned().collect();
         for id in running {
-            let current = self.cluster(&id).and_then(|slot| slot.fingerprint);
-            let same = self
-                .keep
-                .feeds
-                .get(&id)
-                .is_some_and(|kept| kept.fingerprint == current);
+            let slot = self.cluster(&id);
+            let current = slot.and_then(|slot| slot.fingerprint);
+            let generation = slot.map(|slot| slot.generation);
+            let same =
+                self.keep.feeds.get(&id).is_some_and(|kept| {
+                    kept.fingerprint == current && kept.generation == generation
+                });
             if !same || !self.wants_kept_feed(&id) {
                 self.keep.feeds.remove(&id);
             }
@@ -541,12 +547,14 @@ impl ClusterManager {
             });
         });
         let fingerprint = self.cluster(id).and_then(|slot| slot.fingerprint);
+        let generation = self.cluster(id).map(|slot| slot.generation);
         self.keep.feeds.insert(
             id.to_owned(),
             KeptFeed {
                 id: id.to_owned(),
                 grants: self.keep.grants.clone(),
                 attempt,
+                generation,
                 fingerprint,
                 runs_plugin,
                 interrupted: false,
@@ -579,6 +587,12 @@ impl ClusterManager {
                     .telemetry
                     .request_gate(reads_token_file(&self.kubeconfig.merged, id));
                 let trends = Arc::new(Mutex::new(TrendStore::new()));
+                let discovery = KeptDiscovery {
+                    client: client.clone(),
+                    requests: requests.clone(),
+                    grant: kept.access.grant(CredentialSource::Plugin),
+                    pace: Arc::clone(&self.keep.discovery_pace),
+                };
                 let mut feed = Telemetry::start(
                     id.into(),
                     client,
@@ -587,8 +601,16 @@ impl ClusterManager {
                     self.telemetry_timing,
                     requests,
                 );
-                self.telemetry
-                    .publish(id, kept.pin.clone(), &mut feed, trends);
+                // A slot gone by now has no generation a summary could match.
+                let generation = kept.generation.unwrap_or(u64::MAX);
+                self.telemetry.publish_kept(
+                    id,
+                    generation,
+                    kept.pin.clone(),
+                    &mut feed,
+                    trends,
+                    discovery,
+                );
                 kept.feed = Some(feed);
             }
             Err(sign_in) if !kept.interrupted && (sign_in || kept.runs_plugin) => {

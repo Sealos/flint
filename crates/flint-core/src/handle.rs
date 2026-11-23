@@ -215,6 +215,41 @@ pub struct MemberReport {
     pub paused: bool,
 }
 
+/// Why a pin stayed out of a set being opened. It gets no request, watch or plugin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeftOutReason {
+    Removed,
+    Paused,
+    Provisional,
+    Changed,
+}
+
+impl LeftOutReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Removed => "Removed",
+            Self::Paused => "Paused",
+            Self::Provisional => "Provisional",
+            Self::Changed => "Changed",
+        }
+    }
+}
+
+/// A pin left out of a set being opened, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeftOutMember {
+    pub context: ClusterId,
+    pub reason: LeftOutReason,
+}
+
+/// The answer to opening a set. With too few eligible pins, `members` is empty and the running
+/// set did not change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenedSet {
+    pub members: Vec<AdmittedMember>,
+    pub left_out: Vec<LeftOutMember>,
+}
+
 /// A running-set member as the core admitted it: its context, at the exact server it was checked
 /// on. Whatever comes from a set carries this, and is refused once the context has left that
 /// server, even if it later comes back. Grants nothing on the write path.
@@ -282,6 +317,11 @@ pub(crate) enum Request {
     AdmitRunningSet {
         pins: Vec<ClusterPin>,
         reply: oneshot::Sender<Result<Vec<AdmittedMember>, String>>,
+    },
+    /// Makes the running set the pins that can join now, and says why the others can't.
+    OpenRunningSet {
+        pins: Vec<ClusterPin>,
+        reply: oneshot::Sender<Result<OpenedSet, String>>,
     },
     /// Why `member` no longer stands for its context, or `None`. Never contacts the server.
     CheckMember {
@@ -844,6 +884,25 @@ impl CoreHandle {
                 board: self.telemetry.clone(),
                 live: seen,
             }),
+        }
+    }
+
+    /// Classifies every pin and runs those that can join, in one step of the core. Too few
+    /// leaves the running set as it was. Taken in the order sent, whether or not awaited.
+    pub fn open_running_set(
+        &self,
+        pins: Vec<ClusterPin>,
+    ) -> impl Future<Output = Result<OpenedSet, String>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let sent = self
+            .requests
+            .try_send(Request::OpenRunningSet { pins, reply });
+        async move {
+            if sent.is_err() {
+                return Err("the core is not running".to_owned());
+            }
+            rx.await
+                .unwrap_or_else(|_| Err("the core stopped before answering".to_owned()))
         }
     }
 
