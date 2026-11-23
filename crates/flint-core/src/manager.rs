@@ -37,9 +37,14 @@ use crate::watch::{ClusterWatches, EngineConfig, HubRegistry, KubeSource};
 use crate::write::WriteError;
 
 mod file_watch;
+mod keep_watching;
 mod running_set;
 mod selected_retry;
 mod telemetry;
+
+pub(crate) use keep_watching::KeptGrants;
+#[cfg(test)]
+pub(crate) use keep_watching::QUIT_WAIT;
 
 use crate::connection::member::{AttemptOutcome, MemberEvent};
 use crate::connection::policy::{CredentialAccess, CredentialLease, ForegroundOnly, Role};
@@ -329,6 +334,19 @@ enum Internal {
     },
     /// Time to look at the running set again.
     MemberTick,
+    /// A kept cluster's background connection finished. `Err` says whether it needs a sign-in.
+    KeepWatchConnected {
+        cluster: ClusterId,
+        attempt: u64,
+        result: Result<Client, bool>,
+    },
+    /// A kept cluster's credential failed or was refused.
+    KeepWatchFailed {
+        cluster: ClusterId,
+        attempt: u64,
+    },
+    /// Time to connect kept clusters that failed for a reason worth retrying.
+    KeepWatchRetry,
     FilesChanged(Changed),
     /// The file watches changed and now cover these directories. Anything may have been written
     /// before they started, so everything is read again.
@@ -533,6 +551,8 @@ pub(crate) struct ClusterManager {
     /// What `unsettled` and `paused` say now, shared with the front end. Only shown: the gate
     /// never reads it.
     holds: DefinitionHolds,
+    /// Clusters watched in the background, on connections of their own.
+    keep: keep_watching::KeepWatch,
 }
 
 impl ClusterManager {
@@ -598,6 +618,7 @@ impl ClusterManager {
             held: HashSet::new(),
             settled: SettledDefinitions::default(),
             holds: DefinitionHolds::default(),
+            keep: Default::default(),
             reader: KubeconfigReader::default(),
             stalled_on: None,
             read_seq: 0,
@@ -624,6 +645,7 @@ impl ClusterManager {
         self.arm_watcher();
         self.reload_activity().await;
         self.reload_kubeconfig().await;
+        self.sync_keep_watching();
         loop {
             tokio::select! {
                 command = commands.recv() => match command {
@@ -634,6 +656,7 @@ impl ClusterManager {
                 Ok(request) = requests.recv() => self.handle_request(request),
                 Some(msg) = internal_rx.recv() => self.handle_internal(msg).await,
             }
+            self.sync_keep_watching();
             self.sync_selected_retry();
             self.sync_telemetry();
         }
@@ -659,6 +682,12 @@ impl ClusterManager {
                 generation,
             } => self.cancel_connection(&cluster, generation),
             Command::SetRunningSet(ids) => self.set_running_set(ids),
+            Command::SetKeepWatching {
+                cluster,
+                definition,
+            } => self.set_keep_watching(cluster, definition).await,
+            Command::ApproveKeepWatching(approval) => self.approve_keep_watching(approval).await,
+            Command::RevokeBackgroundSignIn(cluster) => self.revoke_background_sign_in(&cluster),
             Command::SetAiExposed {
                 cluster,
                 server,
@@ -752,6 +781,16 @@ impl ClusterManager {
         match request {
             Request::RunningSet { reply } => {
                 let _ = reply.send(self.member_reports());
+            }
+            Request::KeepWatching { reply } => {
+                let _ = reply.send(self.keep_watching_views());
+            }
+            Request::OfferKeepWatching {
+                cluster,
+                shown,
+                reply,
+            } => {
+                let _ = reply.send(self.offer_keep_watching(&cluster, shown));
             }
             // Requests are handled without waiting: the reload runs as an internal message.
             Request::ReloadKubeconfig { reply } => {
@@ -1361,6 +1400,7 @@ impl ClusterManager {
             self.config.home.as_deref(),
         );
         if paths != self.kubeconfig_paths {
+            self.retire_plugin_grants();
             self.kubeconfig_paths = paths;
             self.arm_watcher();
             self.reload_kubeconfig().await;
@@ -1590,6 +1630,14 @@ impl ClusterManager {
             }
             Internal::SelectedRetryDue { timer } => self.selected_retry_due(timer).await,
             Internal::MemberTick => self.tick_members(Instant::now()),
+            Internal::KeepWatchConnected {
+                cluster,
+                attempt,
+                result,
+            } => self.kept_connected(&cluster, attempt, result),
+            Internal::KeepWatchFailed { cluster, attempt } => self.kept_failed(&cluster, attempt),
+            // The loop's sync starts what is due.
+            Internal::KeepWatchRetry => {}
             Internal::Discovered {
                 cluster,
                 attempt,
@@ -1791,6 +1839,7 @@ impl ClusterManager {
             self.reload_settings().await;
         }
         if changed.kubeconfig {
+            self.suspend_kept_plugins();
             self.marks.changed(self.read_seq);
             self.reload_kubeconfig().await;
         }
@@ -2308,6 +2357,7 @@ impl ClusterManager {
         // Someone selected or retried a cluster: a prompting plugin resting after a timed-out
         // refresh may run again now.
         crate::auth_plugin::retry_now(&id);
+        self.keep_watching_acted_on(&id);
         let Some(slot) = self.cluster_mut(&id) else {
             self.emit(Event::Error(format!("cluster \"{id}\" no longer exists")));
             return;

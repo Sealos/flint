@@ -149,6 +149,29 @@ fn a_revoked_access_stays_denied_for_every_clone() {
     assert!(fixed.allowed());
 }
 
+// Only a server answering nothing but 503 since the last run counts as down: one API that is
+// missing, as a metrics server can be, does not stop a watch.
+#[test]
+fn only_503s_since_the_last_run_mean_the_server_is_down() {
+    use http::StatusCode as S;
+    let kept = CredentialAccess::consented(Arc::new(|| {}), None, PluginRuns::default())
+        .grant(CredentialSource::Plugin);
+    assert!(!kept.server_down());
+    kept.note_response(S::SERVICE_UNAVAILABLE);
+    assert!(kept.server_down());
+    kept.note_response(S::OK);
+    assert!(!kept.server_down(), "another API still answers");
+    kept.refresh_starting();
+    kept.note_response(S::SERVICE_UNAVAILABLE);
+    assert!(kept.server_down(), "an answer from before the run is gone");
+    kept.refresh_starting();
+    assert!(!kept.server_down());
+
+    let foreground = foreground_only(Role::Foreground).grant(CredentialSource::Plugin);
+    foreground.note_response(S::SERVICE_UNAVAILABLE);
+    assert!(!foreground.server_down(), "only a kept connection stops");
+}
+
 // A pause denies commands, and only a use begun after it may run one.
 #[test]
 fn a_pause_ends_a_use_and_a_resume_allows_a_new_one() {

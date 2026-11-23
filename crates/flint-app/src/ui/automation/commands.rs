@@ -423,6 +423,86 @@ mod tests {
         serde_json::from_str(&line).unwrap()
     }
 
+    /// Runs the app until `found` answers, on a core that works on its own threads.
+    fn until<T>(
+        cx: &mut TestAppContext,
+        mut found: impl FnMut(&mut TestAppContext) -> Option<T>,
+    ) -> T {
+        let deadline = std::time::Instant::now() + WAIT;
+        loop {
+            cx.run_until_parked();
+            if let Some(value) = found(cx) {
+                return value;
+            }
+            assert!(std::time::Instant::now() < deadline, "never happened");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // A build with this channel can be driven by any local process, so whatever reaches the
+    // background sign-in toggle (a key on the focused control included) grants nothing.
+    #[gpui_kit::test]
+    async fn this_build_cannot_turn_a_background_sign_in_on(cx: &mut TestAppContext) {
+        use flint_core::keep_watching::{BackgroundSignIn, KeepWatching};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ran = dir.path().join("plugin-ran");
+        let script = dir.path().join("plugin.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", ran.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let command = script.display().to_string();
+        let t =
+            crate::ui::support_tests::open_workspace_with(cx, dir.path(), move |dir, servers| {
+                let path = dir.join("kubeconfig");
+                let yaml = format!(
+                    "apiVersion: v1\nkind: Config\nclusters:\n\
+                 - {{name: a, cluster: {{server: \"{}\"}}}}\n\
+                 - {{name: b, cluster: {{server: \"{}\"}}}}\n\
+                 users:\n- {{name: u, user: {{token: t}}}}\n\
+                 - name: x\n  user:\n    exec:\n      \
+                 apiVersion: client.authentication.k8s.io/v1\n      \
+                 command: \"{command}\"\n      interactiveMode: Never\n\
+                 contexts:\n- {{name: kind-alpha, context: {{cluster: a, user: u}}}}\n\
+                 - {{name: kind-beta, context: {{cluster: b, user: x}}}}\n",
+                    servers.silent, servers.refused,
+                );
+                std::fs::write(&path, yaml).unwrap();
+                vec![path]
+            })
+            .await;
+        let beta = || "kind-beta".to_owned();
+        let view = |cx: &mut TestAppContext| {
+            t.model
+                .read_with(cx, |model, _| model.keep_watching("kind-beta").cloned())
+        };
+        let shown = until(cx, |cx| view(cx));
+        t.model.update(cx, |model, _| {
+            model.set_keep_watching(beta(), shown.definition);
+        });
+        let waiting = until(cx, |cx| {
+            view(cx).filter(|view| view.status == KeepWatching::NeedsConfirming)
+        });
+        assert!(waiting.shown_sign_in.is_some());
+
+        t.model.update(cx, |model, cx| {
+            model.turn_background_sign_in(beta(), waiting.shown_sign_in, cx);
+        });
+        let refused = until(cx, |cx| {
+            t.model.read_with(cx, |model, _| model.last_error.clone())
+        });
+        assert!(refused.contains("automation"), "{refused}");
+        for _ in 0..30 {
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(view(cx).unwrap().sign_in, BackgroundSignIn::Off);
+        assert!(!ran.exists(), "the plugin ran");
+    }
+
     // An open dialog is reported and nothing quits; with none open the same command quits.
     #[gpui_kit::test]
     async fn quit_unless_dialog_leaves_an_open_dialog_alone(cx: &mut TestAppContext) {

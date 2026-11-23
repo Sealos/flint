@@ -170,6 +170,21 @@ pub enum Command {
     /// [`CoreHandle::running_set`] says more. Removed members' watches stop. A list that cannot
     /// be a set changes nothing and is reported as [`Event::Error`]. Grants no write access.
     SetRunningSet(Vec<ClusterId>),
+    /// Keep watching `cluster` in the background (ADR-0012), or stop (`definition: None`).
+    /// `definition` is the [`KeepWatchView::definition`](crate::keep_watching::KeepWatchView)
+    /// the request was made on: if the context has changed since, nothing is written and an
+    /// error is reported. This never lets an exec plugin run: that takes
+    /// [`Command::ApproveKeepWatching`].
+    SetKeepWatching {
+        cluster: ClusterId,
+        definition: Option<u64>,
+    },
+    /// The person turned on `cluster`'s background sign-in toggle
+    /// ([`CoreHandle::offer_keep_watching`]): its plugin may run until the app quits. Accepted
+    /// once, for the definition the toggle showed.
+    ApproveKeepWatching(crate::keep_watching::PluginApproval),
+    /// Turns the background sign-in toggle off: no new launch, and its background watch stops.
+    RevokeBackgroundSignIn(ClusterId),
 }
 
 /// What a member of the running set is doing.
@@ -247,6 +262,18 @@ impl AdmittedMember {
 
 /// Requests that carry a reply channel or come from a [`Subscription`].
 pub(crate) enum Request {
+    /// Each cluster's keep-watching toggle.
+    KeepWatching {
+        reply: oneshot::Sender<
+            std::collections::BTreeMap<ClusterId, crate::keep_watching::KeepWatchView>,
+        >,
+    },
+    /// An offer to turn on `cluster`'s background sign-in, for the definition named `shown`.
+    OfferKeepWatching {
+        cluster: ClusterId,
+        shown: u64,
+        reply: oneshot::Sender<Result<crate::keep_watching::PluginOffer, String>>,
+    },
     /// Each member of the running set and its state.
     RunningSet {
         reply: oneshot::Sender<Vec<MemberReport>>,
@@ -534,6 +561,10 @@ pub struct ClustersSnapshot {
 #[derive(Debug, Clone)]
 pub enum Event {
     ClustersChanged(Arc<ClustersSnapshot>),
+    /// Each cluster's keep-watching toggle, when any of them changed.
+    KeepWatchingChanged(
+        Arc<std::collections::BTreeMap<ClusterId, crate::keep_watching::KeepWatchView>>,
+    ),
     ActiveChanged(Option<ClusterId>),
     ConnectionChanged {
         cluster: ClusterId,
@@ -600,6 +631,7 @@ pub struct CoreHandle {
     holds: crate::recheck::DefinitionHolds,
     log_budget: Arc<crate::logs::LogBudget>,
     telemetry: crate::telemetry::TelemetryBoard,
+    kept: crate::manager::KeptGrants,
     access: Arc<crate::access::AccessCache>,
     /// Set by [`Self::bound_to`]: one-off reads go only to this member.
     bound: Option<Arc<AdmittedMember>>,
@@ -629,6 +661,7 @@ impl CoreHandle {
         let log_budget = manager.log_budget();
         let telemetry = manager.telemetry_board();
         let holds = manager.definition_holds();
+        let kept = manager.kept_grants();
         runtime.spawn(manager.run(cmd_rx, req_rx));
         Ok(Self {
             commands: cmd_tx,
@@ -640,6 +673,7 @@ impl CoreHandle {
             holds,
             log_budget,
             telemetry,
+            kept,
             access: Arc::default(),
             bound: None,
             runtime: runtime.handle().clone(),
@@ -655,10 +689,54 @@ impl CoreHandle {
         async move { rx.await.unwrap_or_default() }
     }
 
-    /// What the running feed of `cluster` knows. `None` while it has no feed: it is neither
+    /// Each cluster's keep-watching toggle. Empty if the core stopped.
+    pub fn keep_watching(
+        &self,
+    ) -> impl Future<
+        Output = std::collections::BTreeMap<ClusterId, crate::keep_watching::KeepWatchView>,
+    > + Send
+    + 'static {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.requests.try_send(Request::KeepWatching { reply });
+        async move { rx.await.unwrap_or_default() }
+    }
+
+    /// The first step of turning on `cluster`'s background sign-in toggle, for the definition the
+    /// toggle showed ([`KeepWatchView::shown_sign_in`](crate::keep_watching::KeepWatchView)). A
+    /// newer offer replaces an older one. `Err` says why it can't be turned on.
+    pub fn offer_keep_watching(
+        &self,
+        cluster: &str,
+        shown: u64,
+    ) -> impl Future<Output = Result<crate::keep_watching::PluginOffer, String>> + Send + use<>
+    {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.requests.try_send(Request::OfferKeepWatching {
+            cluster: cluster.to_owned(),
+            shown,
+            reply,
+        });
+        async move {
+            rx.await
+                .unwrap_or_else(|_| Err("Flint is shutting down.".to_owned()))
+        }
+    }
+
+    /// Ends every keep-watching grant for the quit under way, before this returns and without
+    /// the manager's queue. Resolves once their plugins are killed, after a short bounded wait
+    /// at most, or at once if the core stopped.
+    pub fn stop_keep_watching(&self) -> impl Future<Output = ()> + Send + use<> {
+        let wait = self.runtime.spawn(self.kept.quit());
+        async move {
+            let _ = wait.await;
+        }
+    }
+
+    /// What the feed of `cluster` knows. `None` while it has none: it is neither kept watching,
     /// selected nor in the running set, is in watch mode On view with no overview showing, is not
-    /// connected, is paused, or its sign-in runs a program and it is in the background. Never
-    /// blocks.
+    /// connected, is paused, or its sign-in runs a program and it is in the background without
+    /// consent. A kept cluster that stopped or can't be reached shows its last values, with
+    /// their age in the status. Never blocks.
     pub fn telemetry(&self, cluster: &str) -> Option<crate::telemetry::ClusterTelemetry> {
         self.telemetry.get(cluster)
     }
@@ -1346,6 +1424,15 @@ impl CoreHandle {
 
     /// Sends a command. Never blocks. Commands sent after the core stopped are dropped.
     pub fn send(&self, command: Command) {
+        // Ending a grant does not wait its turn behind a save the queue may be stuck on.
+        if let Command::RevokeBackgroundSignIn(cluster)
+        | Command::SetKeepWatching {
+            cluster,
+            definition: None,
+        } = &command
+        {
+            self.kept.revoke(cluster);
+        }
         if self.commands.try_send(command).is_err() {
             tracing::warn!("core is not running; command dropped");
         }
@@ -1692,6 +1779,19 @@ mod tests {
             watch_timing: Default::default(),
         })
         .unwrap()
+    }
+
+    // Quit returns only after waiting for a plugin still running, and no longer than its bound.
+    #[tokio::test]
+    async fn quitting_waits_for_a_running_plugin_within_its_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = start(dir.path());
+        let _running = core.kept.track_for_tests();
+        let began = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(2), core.stop_keep_watching())
+            .await
+            .expect("the wait is bounded");
+        assert!(began.elapsed() >= crate::manager::QUIT_WAIT);
     }
 
     #[tokio::test]

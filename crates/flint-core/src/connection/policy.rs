@@ -80,14 +80,72 @@ impl CredentialPolicy for ForegroundOnly {
     }
 }
 
+/// A cluster the person chose to keep watching: its credential runs in the background role only,
+/// so ending the access ends a running plugin. An auth provider's command can't be stopped once
+/// it runs, so it never runs here.
+pub(crate) struct KeptInBackground;
+
+impl CredentialPolicy for KeptInBackground {
+    fn may_run(&self, source: &CredentialSource, role: Role) -> bool {
+        role == Role::Background && *source != CredentialSource::AuthProvider
+    }
+}
+
+/// Told once when a kept connection's credential fails or is refused.
+pub(crate) type OnCredentialFailure = Arc<dyn Fn() + Send + Sync>;
+
+/// How many plugins of kept connections are running, so a quit can wait for them to be killed.
+#[derive(Clone)]
+pub(crate) struct PluginRuns(Arc<watch::Sender<usize>>);
+
+impl Default for PluginRuns {
+    fn default() -> Self {
+        PluginRuns(Arc::new(watch::channel(0).0))
+    }
+}
+
+impl PluginRuns {
+    pub(crate) fn track(&self) -> PluginRun {
+        self.0.send_modify(|count| *count += 1);
+        PluginRun(Arc::clone(&self.0))
+    }
+
+    /// Resolves once none is running.
+    pub(crate) async fn ended(&self) {
+        let mut count = self.0.subscribe();
+        let _ = count.wait_for(|running| *running == 0).await;
+    }
+}
+
+/// One plugin counted in [`PluginRuns`], until dropped.
+pub(crate) struct PluginRun(Arc<watch::Sender<usize>>);
+
+impl Drop for PluginRun {
+    fn drop(&mut self) {
+        self.0.send_modify(|count| *count -= 1);
+    }
+}
+
+/// What a connection's server has answered since its plugin last ran.
+#[derive(Default)]
+struct ServerAnswers {
+    served: AtomicBool,
+    unavailable: AtomicBool,
+}
+
 /// A policy and the current role of one connection. Clones share the role, so whoever holds one
 /// can change it while the connection is being made or used.
 #[derive(Clone)]
 pub(crate) struct CredentialAccess {
     policy: Arc<dyn CredentialPolicy>,
     role: Arc<watch::Sender<RoleState>>,
+    answers: Arc<ServerAnswers>,
     /// Asked right before a credential's program starts, for a caller whose answer takes a wait.
     launch_check: Option<SendCheck>,
+    /// Set for a kept connection: its first failure ends this access, so nothing retries.
+    on_failure: Option<OnCredentialFailure>,
+    /// Counts this connection's running plugins, for a kept connection.
+    plugin_runs: Option<PluginRuns>,
 }
 
 impl CredentialAccess {
@@ -96,7 +154,45 @@ impl CredentialAccess {
         CredentialAccess {
             policy,
             role: Arc::new(role),
+            answers: Arc::default(),
             launch_check: None,
+            on_failure: None,
+            plugin_runs: None,
+        }
+    }
+
+    /// Access for a connection kept in the background with the person's consent. The first
+    /// failure of its credential ends it and calls `on_failure`. `check` is asked right before
+    /// each start of its program, and `runs` counts those running.
+    pub(crate) fn consented(
+        on_failure: OnCredentialFailure,
+        check: Option<SendCheck>,
+        runs: PluginRuns,
+    ) -> Self {
+        CredentialAccess {
+            on_failure: Some(on_failure),
+            launch_check: check,
+            plugin_runs: Some(runs),
+            ..Self::new(Arc::new(KeptInBackground), Role::Background)
+        }
+    }
+
+    /// Ends a kept connection's access after a failure, telling its owner the first time. Does
+    /// nothing for any other connection.
+    fn credential_failed(&self) {
+        let Some(on_failure) = &self.on_failure else {
+            return;
+        };
+        let first = self.role.send_if_modified(|state| {
+            let live = state.role != Role::Retired;
+            if live {
+                state.role = Role::Retired;
+                state.entered[Role::Retired as usize] += 1;
+            }
+            live
+        });
+        if first {
+            on_failure();
         }
     }
 
@@ -164,7 +260,47 @@ impl CredentialGrant {
     pub(crate) fn note_refused(&self) {
         if self.access.role.borrow().role != Role::Foreground {
             self.refused.store(true, Ordering::Relaxed);
+            self.access.credential_failed();
         }
+    }
+
+    /// A run of the credential's program failed.
+    pub(crate) fn note_failed(&self) {
+        self.access.credential_failed();
+    }
+
+    /// Records how the server answered a request.
+    pub(crate) fn note_response(&self, status: http::StatusCode) {
+        let answers = &self.access.answers;
+        if status == http::StatusCode::UNAUTHORIZED {
+            self.note_refused();
+        } else if status == http::StatusCode::SERVICE_UNAVAILABLE {
+            answers.unavailable.store(true, Ordering::Relaxed);
+        } else if status.is_success() {
+            answers.served.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a kept connection's server has answered only 503 since its plugin last ran. One
+    /// API that is down, as a missing metrics server is, does not count: others still answer.
+    pub(crate) fn server_down(&self) -> bool {
+        let answers = &self.access.answers;
+        self.unattended()
+            && answers.unavailable.load(Ordering::Relaxed)
+            && !answers.served.load(Ordering::Relaxed)
+    }
+
+    /// The plugin is about to run again: only answers from now on say anything of its token.
+    pub(crate) fn refresh_starting(&self) {
+        let answers = &self.access.answers;
+        answers.served.store(false, Ordering::Relaxed);
+        answers.unavailable.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether nobody is looking at this connection: a kept one. Its program gets no stdin, and
+    /// a credential it can't use counts as a failure.
+    pub(crate) fn unattended(&self) -> bool {
+        self.access.on_failure.is_some()
     }
 
     /// Whether a 401 was recorded since this was last asked.
@@ -239,6 +375,25 @@ impl CredentialLease {
             Some(check) => check.refusal().await.err(),
             None => None,
         }
+    }
+
+    /// [`CredentialGrant::unattended`].
+    pub(crate) fn unattended(&self) -> bool {
+        self.grant.unattended()
+    }
+
+    /// Counts a plugin as running until the returned value is dropped, for a kept connection.
+    pub(crate) fn track_run(&self) -> Option<PluginRun> {
+        self.grant
+            .access
+            .plugin_runs
+            .as_ref()
+            .map(PluginRuns::track)
+    }
+
+    /// [`CredentialGrant::note_failed`].
+    pub(crate) fn note_failed(&self) {
+        self.grant.note_failed();
     }
 
     /// Whether the credential behind this can be stopped by a role at all.
