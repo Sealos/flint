@@ -4,10 +4,14 @@
 //!
 //! Inline validation (UP-50) is not built yet (#31), so it has no test here.
 
+use std::time::Duration;
+
 use anyhow::{Context as _, Result};
 use flint_e2e::app::{App, AppOptions};
 use flint_e2e::backend::TestCluster;
-use flint_e2e::fake_api::{FakeApiServer, FakePod, Fault, Gvr, Options, Verb, WriteRecord};
+use flint_e2e::fake_api::{
+    FakeApiServer, FakePod, Fault, Gvr, Options, RequestRecord, Verb, WriteRecord,
+};
 use http::Method;
 use serde_json::{Value, json};
 
@@ -18,6 +22,8 @@ const EDITED: &str = "edit-me";
 const EDITED_PATH: &str = "/api/v1/namespaces/demo/configmaps/edit-me";
 const DENIED: &str = "this change is not allowed";
 const NODE: &str = "drain-node";
+const EDIT_ATTEMPTS: usize = 5;
+const FOCUS_WAIT: Duration = Duration::from_secs(2);
 
 fn launch_unlocked(cluster: &TestCluster) -> Result<App> {
     let app = App::launch(AppOptions::new(&cluster.kubeconfig).settings(PROTECTED))?;
@@ -71,12 +77,27 @@ fn start_edit(app: &App) -> Result<()> {
     app.wait_for("/detail/fetch", Equals("loaded".into()))?;
     app.dispatch("detail::ShowYaml", Value::Null)?;
     app.wait_for("/detail/edit_blocked", Equals(Value::Null))?;
-    app.dispatch("detail::EditYaml", Value::Null)?;
-    app.wait_for("/detail/edit", Equals("editing".into()))?;
-    app.wait_for("/focus", Equals("detail_yaml".into()))?;
-    app.press_key("secondary-down")?;
-    app.type_text("immutable: true\n")?;
-    Ok(())
+    // The new editor can lose focus just after it opens, and keys sent then are dropped. An edit
+    // that kept focus throughout has the text; any other is discarded and opened again.
+    for _ in 0..EDIT_ATTEMPTS {
+        app.dispatch("detail::EditYaml", Value::Null)?;
+        app.wait_for("/detail/edit", Equals("editing".into()))?;
+        let focused = app
+            .wait_for_within("/focus", Equals("detail_yaml".into()), FOCUS_WAIT)
+            .is_ok();
+        if focused {
+            app.press_key("secondary-down")?;
+            if app.state()?["focus"] == "detail_yaml" {
+                app.type_text("immutable: true\n")?;
+                if app.state()?["focus"] == "detail_yaml" {
+                    return Ok(());
+                }
+            }
+        }
+        app.dispatch("detail::CancelYamlEdit", Value::Null)?;
+        app.wait_for("/detail/edit", Equals(Value::Null))?;
+    }
+    anyhow::bail!("the YAML editor did not keep focus in {EDIT_ATTEMPTS} attempts")
 }
 
 fn review(app: &App) -> Result<()> {
@@ -110,6 +131,41 @@ fn real(fake: &FakeApiServer) -> Vec<WriteRecord> {
 
 fn statuses(writes: &[WriteRecord]) -> Vec<Option<u16>> {
     writes.iter().map(|w| w.status).collect()
+}
+
+fn succeeded(write: &WriteRecord) -> bool {
+    write.status.is_some_and(|code| (200..300).contains(&code))
+}
+
+fn dry_runs(fake: &FakeApiServer) -> usize {
+    fake.writes().iter().filter(|w| w.is_dry_run()).count()
+}
+
+fn sent_version(write: &WriteRecord) -> Result<String> {
+    let body: Value = serde_json::from_slice(&write.body).context("a write's body")?;
+    body["metadata"]["resourceVersion"]
+        .as_str()
+        .map(str::to_owned)
+        .context("no resourceVersion in the write")
+}
+
+/// Whether the object was read between the refused write and the dry run of the new review, so
+/// that review was made from the object as it is now.
+fn read_between_conflict_and_review(fake: &FakeApiServer) -> bool {
+    let requests = fake.requests();
+    let put = |r: &RequestRecord| r.method == Method::PUT && r.path == EDITED_PATH;
+    let refused = requests
+        .iter()
+        .position(|r| put(r) && r.status == Some(409));
+    let reviewed = requests
+        .iter()
+        .rposition(|r| put(r) && r.parsed_query().dry_run);
+    match (refused, reviewed) {
+        (Some(refused), Some(reviewed)) if refused < reviewed => requests[refused..reviewed]
+            .iter()
+            .any(|r| r.method == Method::GET && r.path == EDITED_PATH && r.status == Some(200)),
+        _ => false,
+    }
 }
 
 /// Waits until `count` real writes were answered.
@@ -214,6 +270,36 @@ fn evictions(fake: &FakeApiServer, pod: &str) -> usize {
         .count()
 }
 
+/// Every write to `pod` or a subresource of it, a direct DELETE included.
+fn pod_writes(fake: &FakeApiServer, pod: &str) -> Vec<WriteRecord> {
+    let path = format!("/api/v1/namespaces/demo/pods/{pod}");
+    let below = format!("{path}/");
+    fake.writes()
+        .into_iter()
+        .filter(|w| w.path == path || w.path.starts_with(&below))
+        .collect()
+}
+
+/// Waits for the finished drain's report and opens it: returns its title and text.
+fn drain_report(app: &App) -> Result<(String, String)> {
+    until(
+        "the drain's report",
+        || {
+            app.dispatch("workspace::ShowDrainReport", Value::Null)
+                .is_ok()
+        },
+        |shown| *shown,
+    )?;
+    let state = app.wait_for("/dialog/title", Exists(true))?;
+    let field = |name: &str| {
+        state["dialog"][name]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    Ok((field("title"), field("text")))
+}
+
 // covers UP-51: a webhook refusing the dry run or the write is shown in the editor, keeps the
 // edit, and is not retried; Cancel sends nothing, and the edit then applies once.
 #[test]
@@ -237,11 +323,13 @@ fn up_51_webhook_refusals_keep_the_edit() -> Result<()> {
 
     // Reviewed, then cancelled at the confirmation: still nothing real.
     review(&app)?;
+    assert_eq!(dry_runs(fake), 2, "{:?}", fake.writes());
     app.dispatch("detail::ApplyYamlEdit", Value::Null)?;
     app.wait_for("/dialog/title", Exists(true))?;
     assert!(real(fake).is_empty(), "{:?}", real(fake));
     dismiss(&app)?;
     assert!(real(fake).is_empty(), "{:?}", real(fake));
+    assert_eq!(dry_runs(fake), 2, "Cancel sends no dry run");
 
     // Refused at the write: reported, sent once, and the object is as it was.
     fake.inject(denied());
@@ -258,15 +346,13 @@ fn up_51_webhook_refusals_keep_the_edit() -> Result<()> {
     let sent = answered(fake, 2)?;
     assert_eq!(sent.len(), 2, "{sent:?}");
     assert_eq!(sent[1].path, EDITED_PATH);
-    assert!(
-        sent[1]
-            .status
-            .is_some_and(|code| (200..300).contains(&code))
-    );
+    assert!(succeeded(&sent[1]), "{sent:?}");
     assert_eq!(stored(fake)?["immutable"], true);
 
     app.quit()?;
     assert_eq!(real(fake).len(), 2, "{:?}", real(fake));
+    // The refused one, the one Cancel followed, and the new review: Cancel added none.
+    assert_eq!(dry_runs(fake), 3, "{:?}", fake.writes());
     Ok(())
 }
 
@@ -290,14 +376,42 @@ fn up_52_conflict_refused_on_the_fake() -> Result<()> {
     let object = stored(fake)?;
     assert_eq!(object["immutable"], Value::Null, "nothing overwritten");
     assert_eq!(object["data"]["b"], "2");
+    // The fake numbers versions itself, so the competing edit's is read back.
+    let latest = object["metadata"]["resourceVersion"]
+        .as_str()
+        .context("no resourceVersion")?
+        .to_owned();
+    assert_ne!(
+        sent_version(&sent[0])?,
+        latest,
+        "the refused write was stale"
+    );
 
     app.dispatch("detail::ReloadYamlEdit", Value::Null)?;
     app.wait_for("/detail/edit", Equals("reviewed".into()))?;
     assert_eq!(real(fake).len(), 1, "a review writes nothing");
+    // The diff's text is not in the app's state, so this checks what it is computed from: the
+    // object read after the conflict, and a dry run at that object's version.
+    assert!(
+        read_between_conflict_and_review(fake),
+        "{:?}",
+        fake.requests()
+    );
+    let writes = fake.writes();
+    let dry_run = writes
+        .iter()
+        .rev()
+        .find(|w| w.is_dry_run())
+        .context("no dry run")?;
+    assert_eq!(sent_version(dry_run)?, latest);
+    assert!(succeeded(dry_run), "{dry_run:?}");
+
     confirm_apply(&app)?;
     app.wait_for("/detail/edit", Equals(Value::Null))?;
     let sent = answered(fake, 2)?;
     assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent_version(&sent[1])?, latest);
+    assert!(succeeded(&sent[1]), "{sent:?}");
     assert_eq!(stored(fake)?["immutable"], true);
     app.quit()?;
     Ok(())
@@ -356,8 +470,25 @@ fn up_53_node_actions_confirm() -> Result<()> {
     assert_eq!(fake.writes().len(), before, "a cancelled drain");
     assert_eq!(unschedulable(), Some(false));
 
+    // Confirmed: the node has no pods to evict, so the cordon is the drain's one write.
+    let options = open_action(&app, "workspace::DrainNode")?;
+    past_drain_options(&app, &options)?;
+    app.dispatch("ui::Confirm", Value::Null)?;
+    app.wait_for("/dialog", Equals(Value::Null))?;
+    let (title, text) = drain_report(&app)?;
+    assert_eq!(title, format!("Drained {NODE}"), "{text}");
+    assert!(text.lines().any(|l| l == "Cordoned: yes."), "{text}");
+    assert!(text.lines().any(|l| l == "Evicted 0 pods."), "{text}");
+    app.dispatch("ui::Confirm", Value::Null)?;
+    app.wait_for("/dialog", Equals(Value::Null))?;
+    let writes = fake.writes();
+    assert_eq!(writes.len(), before + 1, "{writes:?}");
+    assert_eq!(writes[before].path, format!("/api/v1/nodes/{NODE}"));
+    assert!(succeeded(&writes[before]), "{writes:?}");
+    assert_eq!(unschedulable(), Some(true));
+
     app.quit()?;
-    assert_eq!(fake.writes().len(), before, "{:?}", fake.writes());
+    assert_eq!(fake.writes().len(), before + 1, "{:?}", fake.writes());
     Ok(())
 }
 
@@ -386,23 +517,15 @@ fn up_53_drain_reports_pdb() -> Result<()> {
     past_drain_options(&app, &options)?;
     app.dispatch("ui::Confirm", Value::Null)?;
     app.wait_for("/dialog", Equals(Value::Null))?;
-    until(
-        "the drain's report",
-        || {
-            app.dispatch("workspace::ShowDrainReport", Value::Null)
-                .is_ok()
-        },
-        |shown| *shown,
-    )?;
-    let state = app.wait_for("/dialog/title", Contains("left pods".into()))?;
-    let text = state["dialog"]["text"].as_str().unwrap_or_default();
-    for part in [
-        "PodDisruptionBudget",
-        "demo/guarded",
-        "demo/free",
-        "demo/agent",
+    let (title, text) = drain_report(&app)?;
+    assert_eq!(title, format!("Drain of {NODE} left pods"), "{text}");
+    // Whole lines: each pod is tied to its own outcome and reason.
+    for line in [
+        "Evicted 1 pod: demo/free",
+        "Blocked, 1 pod (a PodDisruptionBudget does not allow evicting them now): demo/guarded",
+        "Skipped (DaemonSet or mirror), 1 pod: demo/agent",
     ] {
-        assert!(text.contains(part), "no {part} in {text}");
+        assert!(text.lines().any(|l| l == line), "no {line:?} in {text}");
     }
     app.dispatch("ui::Confirm", Value::Null)?;
     app.wait_for("/dialog", Equals(Value::Null))?;
@@ -412,9 +535,12 @@ fn up_53_drain_reports_pdb() -> Result<()> {
         true
     );
     assert_eq!(evictions(fake, "guarded"), 1, "not retried");
+    assert_eq!(pod_writes(fake, "guarded").len(), 1, "no other write");
     assert_eq!(evictions(fake, "free"), 1);
-    assert_eq!(evictions(fake, "agent"), 0);
+    let agent = pod_writes(fake, "agent");
+    assert!(agent.is_empty(), "the DaemonSet pod is left: {agent:?}");
     let pods = Gvr::core("pods");
+    assert!(fake.object(&pods, Some("demo"), "agent").is_some());
     assert!(fake.object(&pods, Some("demo"), "guarded").is_some());
     assert!(fake.object(&pods, Some("demo"), "free").is_none());
     app.quit()?;
@@ -450,11 +576,17 @@ fn up_55_unlock_asks_once_and_lasts_until_quit() -> Result<()> {
         assert!(text.contains(name), "{text}");
         app.dispatch("ui::Confirm", Value::Null)?;
         app.wait_for("/dialog", Equals(Value::Null))?;
-        until(
+        let writes = until(
             "the write's answer",
             || fake.writes(),
             |writes| writes.len() > before && writes.iter().all(|w| w.status.is_some()),
         )?;
+        assert_eq!(writes.len(), before + 1, "{name}: {writes:?}");
+        assert_eq!(
+            writes[before].path,
+            format!("/apis/apps/v1/namespaces/demo/deployments/{name}")
+        );
+        assert!(succeeded(&writes[before]), "{name}: {writes:?}");
     }
     assert_eq!(sidebar(&app.state()?, context)["protection"], "unlocked");
     let scratch = app.quit()?;
