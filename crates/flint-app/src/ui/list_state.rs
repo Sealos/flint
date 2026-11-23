@@ -8,12 +8,13 @@ use flint_core::{Feed, ListFormat, SyncState};
 
 use gpui_kit::*;
 
+use super::super::list_usage::NOT_INSTALLED_HINT;
 use super::super::object::MASK;
 use super::super::view_state::{
     Banner, Focus, Level, ListState, RowState, SortState, error_text, sync_word,
 };
 use super::combined::{self, CombinedResourceList};
-use super::{ResourceList, cell_text, limited_text, list_model};
+use super::{ResourceList, limited_text, list_model};
 
 #[cfg_attr(
     not(test),
@@ -174,7 +175,7 @@ impl ResourceList {
                         if is_masked_column(secrets, &snapshot.columns, col) {
                             MASK.to_owned()
                         } else {
-                            cell_text(row, col, now).to_string()
+                            self.shown_cell(i as usize, col, now).to_string()
                         }
                     })
                     .collect();
@@ -264,6 +265,13 @@ impl ResourceList {
         }
         if let Some(text) = self.filtered_out_text() {
             banners.push(Banner::new("list-filtered-out", Level::Info, text));
+        }
+        if self.usage.not_installed() {
+            banners.push(Banner::new(
+                "list-usage-hint",
+                Level::Muted,
+                NOT_INSTALLED_HINT,
+            ));
         }
         if let Some(limit) = &snapshot.limited_to
             && !limit.listed.is_empty()

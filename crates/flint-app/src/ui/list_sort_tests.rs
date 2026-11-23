@@ -4,12 +4,14 @@
 
 use std::sync::Arc;
 
+use flint_core::metrics::{ContainerMetrics, Cpu, Memory, PodMetrics, Usage};
 use flint_core::settings::{ListSort, STATE_FILE};
 use flint_core::{Cell, Column, ColumnRole, ColumnType, KindId, KindSnapshot, Row, SyncState};
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
 
+use super::list_usage::UsageSource;
 use super::support_tests::{TestWorkspace, WAIT, objects, open_workspace, pods};
 use super::ui_state::UiState;
 use super::view_state::SortState;
@@ -60,6 +62,116 @@ async fn wait_for_saved(cx: &mut TestAppContext, t: &TestWorkspace, text: &'stat
         std::fs::read_to_string(&path).is_ok_and(|s| s.contains(text))
     })
     .await;
+}
+
+/// Usage for the pods of [`PODS`]: `web` and `db` report, `api` does not.
+fn pod_usage() -> UsageSource {
+    let sample = |millis: u64| {
+        PodMetrics {
+            namespace: String::new(),
+            name: String::new(),
+            timestamp: None,
+            window: None,
+            containers: vec![ContainerMetrics {
+                name: "app".into(),
+                usage: Usage {
+                    cpu: Cpu::from_nanos(millis * 1_000_000),
+                    memory: Memory::from_bytes(0),
+                },
+            }],
+        }
+        .sample()
+    };
+    UsageSource::Pods(Arc::new(
+        [
+            (("demo".to_owned(), "web".to_owned()), sample(5)),
+            (("data".to_owned(), "db".to_owned()), sample(40)),
+        ]
+        .into_iter()
+        .collect(),
+    ))
+}
+
+fn cpu_cells(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<(String, Option<String>)> {
+    let list = t.list(cx).expect("a list is open");
+    list.read_with(cx, |list, _| {
+        let rows = list.view_state().rows;
+        rows.into_iter()
+            .map(|row| {
+                let cpu = row
+                    .cells_by_column
+                    .into_iter()
+                    .find(|(column, _)| column == "CPU")
+                    .map(|(_, cell)| cell);
+                (row.name, cpu)
+            })
+            .collect()
+    })
+}
+
+#[gpui_kit::test]
+async fn usage_columns_show_sort_and_keep_unknown_last(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, PODS).await;
+    let list = t.list(cx).expect("a list is open");
+    list.update(cx, |list, cx| list.set_usage_source(pod_usage(), cx));
+    cx.run_until_parked();
+
+    let unsorted = cpu_cells(cx, &t);
+    let cell = |name: &str| {
+        unsorted
+            .iter()
+            .find(|(row, _)| row == name)
+            .and_then(|(_, cpu)| cpu.clone())
+    };
+    assert_eq!(cell("web").as_deref(), Some("5m"));
+    assert_eq!(cell("api").as_deref(), Some("unknown"));
+
+    t.click(cx, "sort-CPU");
+    expect_rows(
+        cx,
+        &t,
+        (
+            sorted("CPU", false),
+            vec!["web".into(), "db".into(), "api".into()],
+        ),
+    )
+    .await;
+    t.click(cx, "sort-CPU");
+    expect_rows(
+        cx,
+        &t,
+        (
+            sorted("CPU", true),
+            vec!["db".into(), "web".into(), "api".into()],
+        ),
+    )
+    .await;
+}
+
+#[gpui_kit::test]
+async fn without_metrics_server_the_columns_hide_and_a_hint_shows(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, PODS).await;
+    let list = t.list(cx).expect("a list is open");
+    list.update(cx, |list, cx| list.set_usage_source(pod_usage(), cx));
+    cx.run_until_parked();
+    assert!(cpu_cells(cx, &t).iter().all(|(_, cpu)| cpu.is_some()));
+
+    list.update(cx, |list, cx| {
+        list.set_usage_source(UsageSource::NotInstalled, cx);
+    });
+    cx.run_until_parked();
+    assert!(cpu_cells(cx, &t).iter().all(|(_, cpu)| cpu.is_none()));
+    let hinted = list.read_with(cx, |list, _| {
+        list.view_state()
+            .banners
+            .iter()
+            .any(|banner| banner.id == "list-usage-hint")
+    });
+    assert!(hinted);
 }
 
 // covers UP-21

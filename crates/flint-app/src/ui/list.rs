@@ -10,6 +10,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::list_usage::{self, ListUsage, NOT_INSTALLED_HINT, UsageSource, UsageSubject};
 use flint_core::redact::{is_masked_column, is_secret_list};
 use flint_core::table::unix_now;
 use flint_core::{
@@ -237,6 +238,10 @@ pub struct ResourceList {
     _watch: Task<()>,
     _compute: Task<()>,
     _tick: Task<()>,
+    /// CPU and memory columns, for pods and nodes.
+    usage: ListUsage,
+    /// Follows the cluster feed's metrics poll. Makes no request.
+    _usage: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -268,6 +273,24 @@ impl ResourceList {
                 }
             }
         });
+        let follow_usage = match UsageSubject::of(&kind) {
+            Some(subject) => {
+                let (core, cluster) = (core.clone(), cluster.clone());
+                let mut updates = core.telemetry_updates();
+                cx.spawn(async move |this, cx| {
+                    while updates.changed().await {
+                        let source = UsageSource::of(subject, core.telemetry(&cluster).as_ref());
+                        if this
+                            .update(cx, |list, cx| list.set_usage_source(source, cx))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+            }
+            None => Task::ready(()),
+        };
         // Ages keep counting: redraw the rows in view once a second, for kinds that show ages
         // or times and only while the window is in front.
         let tick = cx.spawn_in(window, async move |this, cx| {
@@ -348,6 +371,8 @@ impl ResourceList {
             _watch: watch,
             _compute: Task::ready(()),
             _tick: tick,
+            usage: ListUsage::default(),
+            _usage: follow_usage,
             _subscriptions: vec![on_filter],
         };
         list.recompute(cx);
@@ -528,6 +553,23 @@ impl ResourceList {
         }
     }
 
+    /// Takes the metrics poll's newest state, as the feed does. Tests use it to set usage.
+    pub(in crate::ui) fn set_usage_source(&mut self, source: UsageSource, cx: &mut Context<Self>) {
+        if self.usage.set_source(source) {
+            self.recompute(cx);
+            cx.notify();
+        }
+    }
+
+    /// The text of the cell at `col` for the row at `row_ix` of the snapshot drawn.
+    pub(super) fn shown_cell(&self, row_ix: usize, col: usize, now: i64) -> SharedString {
+        let role = self.shown.columns[col].role;
+        match self.usage.cell(role, row_ix) {
+            Some(text) => SharedString::from(text),
+            None => cell_text(&self.shown.rows[row_ix], col, now),
+        }
+    }
+
     /// Selects the object with `name` in `namespace` as soon as it is listed, as a click would.
     /// For `FLINT_VIEW`.
     pub fn select_when_listed(
@@ -642,7 +684,8 @@ impl ResourceList {
         }
         self.computing = true;
         self.dirty = false;
-        let snapshot = self.latest.clone();
+        let snapshot = self.usage.decorate(&self.latest);
+        let usage_source = self.usage.source().clone();
         let job_text = self.query.text.clone();
         let namespaces = self.scope().to_vec();
         let query = ViewQuery {
@@ -682,17 +725,25 @@ impl ResourceList {
                     .collect(),
                 None => rows,
             };
+            let usage = Arc::new(usage_source.values(&job_snapshot.rows));
+            let rows = job_sort
+                .and_then(|sort| {
+                    let role = job_snapshot.columns[sort.column].role;
+                    usage.sorted(&rows, role, sort.descending)
+                })
+                .unwrap_or(rows);
             let measured = list_model::rows_to_measure(&job_snapshot, &namespaces);
-            let widths = list_model::measure_columns(&job_snapshot, &measured, unix_now());
+            let mut widths = list_model::measure_columns(&job_snapshot, &measured, unix_now());
+            list_usage::fit_widths(&mut widths, &job_snapshot.columns);
             let scoped = list_model::rows_in_namespaces(&job_snapshot, &namespaces);
             let position = selected_uid.as_ref().and_then(|uid| {
                 rows.iter()
                     .position(|&i| job_snapshot.rows[i as usize].uid == *uid)
             });
-            (rows, widths, scoped, selected_uid, position)
+            (rows, widths, scoped, selected_uid, position, usage)
         });
         self._compute = cx.spawn(async move |this, cx| {
-            let (rows, widths, scoped, uid, position) = job.await;
+            let (rows, widths, scoped, uid, position, usage) = job.await;
             let select_first = this.update(cx, |list, cx| {
                 list.computing = false;
                 #[cfg(test)]
@@ -721,6 +772,7 @@ impl ResourceList {
                 list.widths.update(&snapshot.columns, &widths, restart);
                 list.scoped = scoped;
                 list.rows_in_one_namespace = one_namespace;
+                list.usage.set_values(usage);
                 list.apply(snapshot, rows, uid, position, cx);
                 if list.dirty {
                     list.recompute(cx);
@@ -956,6 +1008,9 @@ impl ResourceList {
             let name_min = width(list_model::NAME_MIN_CHARS);
             let namespace_min = width(SQUEEZED_NAMESPACE_CHARS);
             let sort = self.query.sort.as_ref();
+            list_usage::shed_usage(&mut drawn, columns, room, |i| {
+                sort.is_some_and(|s| columns[i].key() == s.column)
+            });
             let rules = list_model::ShedRules {
                 ready_repeats_status: list_model::ready_repeats_status(self.kind.as_str()),
                 one_namespace: self.rows_in_one_namespace,
@@ -1049,7 +1104,7 @@ impl ResourceList {
                     mono,
                 } = list_model::CellStyle::of(
                     column,
-                    || cell_text(row, col, now),
+                    || self.shown_cell(row_ix as usize, col, now),
                     list_model::text_width(column, row, secrets, width),
                     list_model::RowFlags {
                         masked: is_masked_column(secrets, &self.shown.columns, col),
@@ -1489,6 +1544,18 @@ impl ResourceList {
                 notice("list-filtered-out", text, theme.info)
                     .test_support()
                     .into_any_element(),
+            );
+        }
+        if self.usage.not_installed() {
+            banners.push(
+                notice(
+                    "list-usage-hint",
+                    NOT_INSTALLED_HINT,
+                    theme.muted_foreground,
+                )
+                .aria_label(NOT_INSTALLED_HINT)
+                .test_support()
+                .into_any_element(),
             );
         }
         if let Some(only) = &self.query.only {

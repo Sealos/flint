@@ -228,6 +228,55 @@ impl PodMetrics {
         expected.sort_unstable();
         (!sampled.is_empty() && sampled == expected).then(|| PodBudget::of_pod(spec))
     }
+
+    /// This sample reduced to what is kept per pod between polls.
+    pub fn sample(&self) -> PodSample {
+        PodSample {
+            usage: self.total(),
+            containers: container_digest(self.containers.iter().map(|c| c.name.as_str())),
+        }
+    }
+}
+
+/// A pod's total use and a digest of the containers it covers: a fixed size, whatever the pod's
+/// containers are called.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PodSample {
+    pub usage: Usage,
+    containers: u64,
+}
+
+/// A pod spec's budget and the containers it applies to, kept in place of the spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PodBudgetCheck {
+    budget: PodBudget,
+    containers: u64,
+}
+
+impl PodBudgetCheck {
+    pub fn of(spec: &PodSpec) -> Self {
+        Self {
+            budget: PodBudget::of_pod(spec),
+            containers: container_digest(long_running(spec).map(|c| c.name.as_str())),
+        }
+    }
+
+    /// The budget to compare `sample` with, under the rule of [`PodMetrics::budget_in`].
+    pub fn for_sample(&self, sample: &PodSample) -> Option<PodBudget> {
+        (self.containers == sample.containers).then_some(self.budget)
+    }
+}
+
+/// FNV-1a over the sorted names, each ended by a byte no container name holds.
+fn container_digest<'a>(names: impl Iterator<Item = &'a str>) -> u64 {
+    let mut names: Vec<&str> = names.collect();
+    names.sort_unstable();
+    names
+        .iter()
+        .flat_map(|name| name.bytes().chain([0xff]))
+        .fold(0xcbf2_9ce4_8422_2325, |hash: u64, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
 }
 
 /// A node's `metrics.k8s.io` NodeMetrics.

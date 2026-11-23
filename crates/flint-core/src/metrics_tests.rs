@@ -703,6 +703,27 @@ fn a_budget_needs_a_sample_of_exactly_the_long_running_containers() {
     );
 }
 
+#[test]
+fn a_kept_sample_applies_the_same_budget_rule() {
+    let mut sidecar = named("proxy", (Some("1"), None));
+    sidecar.restart_policy = Some("Always".to_owned());
+    let spec = PodSpec {
+        containers: vec![named("app", (Some("1"), None))],
+        init_containers: Some(vec![sidecar]),
+        ..Default::default()
+    };
+    let check = PodBudgetCheck::of(&spec);
+    for names in [&["proxy"][..], &[], &["app", "app"], &["app", "other"]] {
+        assert_eq!(check.for_sample(&sample(names).sample()), None, "{names:?}");
+    }
+    let whole = sample(&["proxy", "app"]);
+    assert_eq!(whole.sample().usage, whole.total());
+    assert_eq!(
+        check.for_sample(&whole.sample()),
+        Some(PodBudget::of_pod(&spec))
+    );
+}
+
 #[tokio::test]
 async fn one_unreadable_item_keeps_the_others() {
     let body = json!({"items": [
