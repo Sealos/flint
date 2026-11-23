@@ -596,24 +596,59 @@ async fn a_request_queued_behind_an_abandoned_command_starts_nothing_after_a_dem
     assert_eq!(api.requests(), 0);
 }
 
-// A role change can't land between a lease's last check and what it guards.
+// A start that stalls past its check holds up no role change, and nothing starts after one.
 #[test]
-fn a_role_change_waits_for_a_start_under_the_lease() {
+fn a_role_change_does_not_wait_for_a_stalled_start() {
     let access = foreground_only(Role::Foreground);
     let lease = access.grant(CredentialSource::Plugin).lease();
     let (done, finished) = std::sync::mpsc::channel();
     let demoting = access.clone();
-    let ran = lease.while_held(|| {
+    let landed = lease.start_if_held(|| {
         std::thread::spawn(move || {
             demoting.set_role(Role::Background);
             done.send(()).unwrap();
         });
-        finished.recv_timeout(Duration::from_millis(150)).is_err()
+        finished.recv_timeout(Duration::from_secs(5)).is_ok()
     });
-    assert_eq!(ran, Some(true), "the demotion waited for the start");
-    finished.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(landed, Some(true), "the demotion landed during the start");
     assert!(!lease.holds());
-    assert_eq!(lease.while_held(|| ()), None, "nothing starts after it");
+    assert_eq!(lease.start_if_held(|| ()), None, "nothing starts after it");
+}
+
+// A revocation after the last check outside the task, before the task's first poll, still stops
+// the provider's command.
+#[tokio::test]
+async fn a_revocation_before_the_first_poll_runs_no_provider_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = CountingApi::start().await;
+    let (kubeconfig, count) = provider_kubeconfig(&api.url, dir.path());
+    let options = kube::config::KubeConfigOptions {
+        context: Some("ctx".to_owned()),
+        ..Default::default()
+    };
+    let config = kube::Config::from_custom_kubeconfig(kubeconfig, &options)
+        .await
+        .unwrap();
+    let layer = Arc::new(
+        kube::client::ConfigExt::auth_layer(&config)
+            .unwrap()
+            .expect("the provider has an auth layer"),
+    );
+    let access = foreground_only(Role::Foreground);
+    let lease = access.grant(CredentialSource::AuthProvider).lease();
+    let guarded = crate::credential::GuardedProvider::guarding(&layer, &lease)
+        .expect("a provider a role can stop is guarded");
+    let ran = count_of(&count);
+
+    // On this single-threaded runtime, one poll passes the outer check and spawns the task, which
+    // cannot run before this test yields.
+    let mut header = Box::pin(guarded.header());
+    assert!(futures::poll!(header.as_mut()).is_pending());
+    access.revoke();
+
+    assert!(header.await.is_err());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(count_of(&count), ran, "the command never started");
 }
 
 #[tokio::test]

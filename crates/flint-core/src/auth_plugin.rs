@@ -261,7 +261,7 @@ async fn run(
     }
     cmd.kill_on_drop(true);
     let mut child = lease
-        .while_held(|| cmd.spawn())
+        .start_if_held(|| cmd.spawn())
         .ok_or_else(not_allowed)?
         .map_err(AuthError::AuthExecStart)?;
     on_start();

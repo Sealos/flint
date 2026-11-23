@@ -218,12 +218,11 @@ impl CredentialLease {
         self.holds_in(&state)
     }
 
-    /// Runs `start` if this still holds, with role changes waiting until it returns: a change
-    /// lands either before the check, and `start` does not run, or after `start`, where
-    /// [`Self::revoked`] sees it. `start` must be short and must not change this role.
-    pub(crate) fn while_held<T>(&self, start: impl FnOnce() -> T) -> Option<T> {
-        let state = self.grant.access.role.borrow();
-        self.holds_in(&state).then(start)
+    /// Runs `start` if this still holds. No lock is kept while it runs, since `start` can stall
+    /// (a spawn from a network mount) and a role change must never wait on it. A change that lands
+    /// after this check finds `start` already begun, and [`Self::revoked`] then ends what it began.
+    pub(crate) fn start_if_held<T>(&self, start: impl FnOnce() -> T) -> Option<T> {
+        self.holds().then(start)
     }
 
     /// Whether the credential behind this can be stopped by a role at all.

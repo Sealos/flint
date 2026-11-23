@@ -166,6 +166,25 @@ impl CredentialSource {
     }
 }
 
+/// Whether connecting as `auth` would present anything to the server: a password, a token, a
+/// client certificate, a command's output, or an identity to act as.
+pub(crate) fn presents_a_credential(auth: &AuthInfo) -> bool {
+    auth.username.is_some()
+        || auth.password.is_some()
+        || auth.token.is_some()
+        || auth.token_file.is_some()
+        || auth.client_certificate.is_some()
+        || auth.client_certificate_data.is_some()
+        || auth.client_key.is_some()
+        || auth.client_key_data.is_some()
+        || auth.impersonate.is_some()
+        || auth.impersonate_uid.is_some()
+        || auth.impersonate_groups.is_some()
+        || auth.impersonate_user_extra.is_some()
+        || auth.auth_provider.is_some()
+        || auth.exec.is_some()
+}
+
 /// A certificate or key file, with the digest of the bytes the client was built from. `None`
 /// if they could not be read then: no write goes out on it.
 #[derive(Debug, Clone)]
@@ -504,9 +523,13 @@ impl GuardedProvider {
             if !parts.lease.holds() {
                 return Err(crate::auth_plugin::not_allowed().into());
             }
-            let layer = parts.layer.clone();
+            let (layer, lease) = (parts.layer.clone(), parts.lease.clone());
             tokio::spawn(async move {
                 let _turn = turn;
+                // The last check: nothing is awaited between it and the call into kube.
+                if !lease.holds() {
+                    return Err(crate::auth_plugin::not_allowed().into());
+                }
                 layer_header(&layer).await
             })
             .await
