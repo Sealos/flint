@@ -146,6 +146,11 @@ pub struct TerminalView {
     note_kind: NoteKind,
     /// Asynchronous paste replies can only clear refusals already shown when they were sent.
     refusal_sequence: u64,
+    /// Counts focus leaving the tab: a paste still being checked is dropped once it has.
+    focus_stint: u64,
+    /// Whether the dock shows this tab now, which a frame on screen can be older than. A tab
+    /// outside a dock counts as shown.
+    dock_shown: Rc<StdCell<bool>>,
     /// Why the tab ended the session itself ([`TerminalView::end`]).
     ended: Option<String>,
     /// Why Restart Shell cannot run, as the workspace says it: the tab's cluster is protected
@@ -186,6 +191,7 @@ impl TerminalView {
         let subscriptions = vec![
             cx.on_focus(&focus, window, |_, _, cx| cx.notify()),
             cx.on_blur(&focus, window, |_, _, cx| cx.notify()),
+            cx.on_focus_out(&focus, window, |view, _, _, _| view.focus_stint += 1),
         ];
         let chip = (
             dock_model::chip_labels(std::slice::from_ref(&request.cluster))
@@ -211,6 +217,8 @@ impl TerminalView {
             note: None,
             note_kind: NoteKind::General,
             refusal_sequence: 0,
+            focus_stint: 0,
+            dock_shown: Rc::new(StdCell::new(true)),
             ended: None,
             protected: None,
             chip,
@@ -417,8 +425,19 @@ impl TerminalView {
         }
     }
 
-    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.is_live() {
+    /// Tells the tab whether the dock shows it.
+    pub(in crate::ui) fn set_dock_shown(&self, shown: bool) {
+        self.dock_shown.set(shown);
+    }
+
+    /// Whether focus is on this tab now. The frame on screen can be older than a focus change,
+    /// so input handlers registered with it ask before they send anything.
+    pub(super) fn holds_focus(&self, window: &Window, cx: &App) -> bool {
+        self.focus.contains_focused(window, cx)
+    }
+
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_live() || !self.holds_focus(window, cx) {
             return;
         }
         let mode = self.snapshot.terminal.mode;
@@ -630,16 +649,38 @@ impl TerminalView {
                     .on_click(registry::on_click(CopyText)),
             )
             .child(
-                Button::new("terminal-paste")
-                    .xsmall()
-                    .ghost()
-                    .label("Paste")
-                    .disabled(!self.is_live())
-                    .tooltip(format!(
-                        "Paste into the shell ({})",
-                        registry::key_hint(registry::TERMINAL_PASTE[0])
-                    ))
-                    .on_click(registry::on_click(PasteText)),
+                // Pressing Paste puts focus on this tab, which paste requires. A button still on
+                // screen after the dock moved to another tab does neither.
+                div()
+                    .capture_any_mouse_down({
+                        let focus = self.focus.clone();
+                        let shown = self.dock_shown.clone();
+                        move |_, window, cx| {
+                            if shown.get() {
+                                window.focus(&focus, cx);
+                            }
+                        }
+                    })
+                    .child(
+                        Button::new("terminal-paste")
+                            .xsmall()
+                            .ghost()
+                            .label("Paste")
+                            .disabled(!self.is_live())
+                            .tooltip(format!(
+                                "Paste into the shell ({})",
+                                registry::key_hint(registry::TERMINAL_PASTE[0])
+                            ))
+                            .on_click({
+                                let shown = self.dock_shown.clone();
+                                let paste = registry::on_click(PasteText);
+                                move |event, window, cx| {
+                                    if shown.get() {
+                                        paste(event, window, cx);
+                                    }
+                                }
+                            }),
+                    ),
             )
     }
 
@@ -1213,12 +1254,14 @@ impl InputHandler for TerminalInput {
         &mut self,
         _: Option<Range<usize>>,
         text: &str,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) {
         self.with(cx, |view, cx| {
             view.marked = None;
-            view.send(text.as_bytes().to_vec(), cx);
+            if view.holds_focus(window, cx) {
+                view.send(text.as_bytes().to_vec(), cx);
+            }
             cx.notify();
         });
     }
@@ -1228,11 +1271,12 @@ impl InputHandler for TerminalInput {
         _: Option<Range<usize>>,
         text: &str,
         _: Option<Range<usize>>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) {
         self.with(cx, |view, cx| {
-            view.marked = (!text.is_empty()).then(|| text.to_owned());
+            view.marked =
+                (!text.is_empty() && view.holds_focus(window, cx)).then(|| text.to_owned());
             cx.notify();
         });
     }

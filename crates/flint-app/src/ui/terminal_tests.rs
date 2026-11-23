@@ -716,6 +716,77 @@ async fn a_drag_past_the_grid_selects_to_its_edge(cx: &mut TestAppContext) {
     );
 }
 
+/// Moves focus off the tab with no frame drawn, so the tab's input handler is still registered.
+fn focus_elsewhere(shell: &Shell, cx: &mut TestAppContext) -> gpui_kit::FocusHandle {
+    let other = cx.update(|cx| cx.focus_handle());
+    cx.update_window(shell.window, |_, window, cx| window.focus(&other, cx))
+        .unwrap();
+    other
+}
+
+// Committed text that arrives after focus left the tab is not the tab's.
+#[gpui_kit::test]
+async fn text_committed_after_focus_left_is_not_sent(cx: &mut TestAppContext) {
+    let mut shell = open(cx);
+    let _other = focus_elsewhere(&shell, cx);
+    let weak = shell.view.downgrade();
+    cx.update_window(shell.window, |_, window, cx| {
+        let mut input = TerminalInput {
+            view: weak,
+            bounds: Bounds::default(),
+        };
+        input.replace_and_mark_text_in_range(None, "に", None, window, cx);
+        assert_eq!(input.marked_text_range(window, cx), None);
+        input.replace_text_in_range(None, "日本", window, cx);
+    })
+    .unwrap();
+    assert_eq!(shell.sent(cx), b"");
+}
+
+// A multi-line paste whose mode check answers after focus left asks nothing and sends nothing.
+#[gpui_kit::test]
+async fn a_late_paste_question_is_dropped_once_focus_left(cx: &mut TestAppContext) {
+    let mut shell = open(cx);
+    cx.write_to_clipboard(ClipboardItem::new_string("echo a\necho b".into()));
+    let other = cx.update(|cx| cx.focus_handle());
+    cx.update_window(shell.window, |_, window, cx| {
+        window.press(TERMINAL_PASTE[0], cx);
+        window.focus(&other, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    shell.fake.pump();
+    let view = shell.view.clone();
+    cx.wait_for(shell.window, WAIT, move |_, cx| {
+        view.read(cx).note_kind == NoteKind::PasteDiscarded
+    })
+    .await;
+    assert!(!shell.has_dialog(cx));
+    assert_eq!(shell.sent(cx), b"");
+}
+
+// Paste goes to the tab only while it has focus; its own button gives it focus first.
+#[gpui_kit::test]
+async fn paste_needs_the_tab_focused(cx: &mut TestAppContext) {
+    let mut shell = open(cx);
+    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("pasted".to_owned()));
+    let focus = shell.view.read_with(cx, |v, _| v.focus.clone());
+    let _other = focus_elsewhere(&shell, cx);
+    cx.update_window(shell.window, |_, window, cx| {
+        registry::dispatch_in(&focus, &registry::PasteText, window, cx).unwrap()
+    })
+    .unwrap();
+    assert_eq!(shell.sent(cx), b"");
+    assert!(shell.view.read_with(cx, |v, _| v.note.is_some()));
+
+    cx.update_window(shell.window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("terminal-paste", cx);
+    })
+    .unwrap();
+    assert_eq!(shell.sent(cx), b"pasted");
+}
+
 // covers UP-41: the automation state reports the shell's status, size, cursor and the visible
 // screen as text, whether keys reach it, and its exit code once it ends.
 #[gpui_kit::test]

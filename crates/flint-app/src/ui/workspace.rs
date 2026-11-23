@@ -971,13 +971,17 @@ impl Workspace {
                 }
                 Err(why) => {
                     let detail = detail.clone();
-                    let _ = handle.update(cx, |_, window, cx| {
-                        let _ = detail.update(cx, |d, cx| {
-                            d.edit_applied(
-                                Err(flint_core::write::WriteError::Failed(why)),
-                                window,
-                                cx,
-                            )
+                    // This runs inside the dialog's update of this window, which cannot be
+                    // updated again until that ends.
+                    cx.defer(move |cx| {
+                        let _ = handle.update(cx, |_, window, cx| {
+                            let _ = detail.update(cx, |d, cx| {
+                                d.edit_applied(
+                                    Err(flint_core::write::WriteError::Failed(why)),
+                                    window,
+                                    cx,
+                                )
+                            });
                         });
                     });
                     false
@@ -3077,9 +3081,7 @@ fn confirm_expose(
             let scope = scope.clone();
             model.update(cx, |m, _| save(m, context.clone(), server.clone(), scope));
             // This question closes by itself; the pickers under it close with it.
-            window.defer(cx, |window, cx| {
-                gpui_kit::component::WindowExt::close_dialog(window, cx)
-            });
+            window.defer(cx, confirm::close_newest);
         });
         false
     });
