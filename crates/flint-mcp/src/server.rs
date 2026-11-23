@@ -4,12 +4,11 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use flint_core::activity;
-use flint_core::cache::{LiveKeys, Slot, SlotCache};
+use flint_core::cache::{Acquired, LiveKeys, Slot, SlotCache};
 use flint_core::cluster::{self, ClusterError, Target};
 use flint_core::kubeconfig::{
     self, ConfirmedDefinitions, ContextInfo, FileStamps, JudgedRead, KubeconfigRead,
@@ -67,9 +66,6 @@ struct Inner {
     read_files: fn(&[PathBuf]) -> KubeconfigRead,
     clients: SlotCache<Client>,
     discovery: SlotCache<Discovered>,
-    /// Numbers each read of the settings and kubeconfig, taken before the read, so the slots
-    /// follow the newest one.
-    last_view: AtomicU64,
     /// Fingerprints computed for one parsed kubeconfig.
     fingerprints: Mutex<Option<KnownFingerprints>>,
     /// Starts the idle sweep on the first call, which runs inside the runtime.
@@ -214,6 +210,8 @@ impl From<policy::PolicyError> for ToolError {
 /// A connection to an exposed cluster, with what its errors may name.
 struct Conn {
     client: Client,
+    /// Held while the connection is in use, so the client does not count as idle.
+    _slot: Arc<Slot<Client>>,
     fingerprint: u64,
     target: Target,
     /// What the agent may read of the cluster (ADR-0013).
@@ -699,7 +697,6 @@ impl FlintMcp {
                 read_files: KubeconfigRead::settled,
                 clients: SlotCache::new(None, SLOT_IDLE),
                 discovery: SlotCache::new(Some(DISCOVERY_TTL), SLOT_IDLE),
-                last_view: AtomicU64::new(0),
                 fingerprints: Mutex::default(),
                 slot_sweep: Once::new(),
                 warned_scopes: std::sync::Mutex::default(),
@@ -979,11 +976,10 @@ impl FlintMcp {
         self.inner.start_slot_sweep();
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
-            let view = inner.last_view.fetch_add(1, Ordering::SeqCst) + 1;
             // The full TOML error quotes lines of settings.toml; give the agent one safe line.
             let settings = settings::load_settings(&inner.config_dir).map_err(|e| {
                 // Nothing is known to be exposed, as for a send check.
-                inner.retain_slots(view, &LiveKeys::default());
+                inner.retain_slots(&LiveKeys::default());
                 let setup = policy::Setup::new(inner.flavour, &inner.config_dir);
                 ToolError::new(format!(
                     "Flint's settings.toml is invalid ({}), so no cluster is exposed. {}",
@@ -997,7 +993,7 @@ impl FlintMcp {
                 inner.home.as_deref(),
             );
             let (kubeconfig, paused) = inner.load_kubeconfig(&paths);
-            inner.retain_slots(view, &inner.live_keys(&settings, &kubeconfig, &paused));
+            inner.retain_slots(&inner.live_keys(&settings, &kubeconfig, &paused));
             Ok(CallContext {
                 settings,
                 kubeconfig,
@@ -1050,8 +1046,8 @@ impl FlintMcp {
         // Derived from the same kubeconfig entries as the fingerprint, so it always matches the
         // cached client.
         let target = Target::of(&ctx.kubeconfig.merged, &info.name);
-        let slot = self.inner.clients.acquire(name, fingerprint);
-        self.check_new_slot(&self.inner.clients, name, &slot)
+        let slot = self
+            .checked_slot(&self.inner.clients, name, fingerprint)
             .await?;
         let client = slot
             .cell
@@ -1073,6 +1069,7 @@ impl FlintMcp {
             .clone();
         Ok(Conn {
             client,
+            _slot: slot,
             fingerprint,
             target,
             scope,
@@ -1097,27 +1094,23 @@ impl FlintMcp {
         })
     }
 
-    /// Checks a slot not built yet against the files as they are now, after it was stored. A
-    /// context removed or revoked before this check is refused and its slot released; one
-    /// removed after it is seen in the map by the next read, which releases it.
-    async fn check_new_slot<T>(
+    /// The slot for `name`. One not stored yet is stored only after a read of the files made
+    /// from here on shows the context as connectable, and only if no change was seen since.
+    async fn checked_slot<T>(
         &self,
         cache: &SlotCache<T>,
         name: &str,
-        slot: &Arc<Slot<T>>,
-    ) -> Result<(), ToolError> {
-        if slot.cell.initialized()
-            || connectable_now(
-                Arc::downgrade(&self.inner),
-                name.to_owned(),
-                slot.fingerprint,
-            )
-            .await
-        {
-            return Ok(());
+        fingerprint: u64,
+    ) -> Result<Arc<Slot<T>>, ToolError> {
+        let (slot, epoch) = match cache.acquire(name, fingerprint) {
+            Acquired::Stored(slot) => return Ok(slot),
+            Acquired::Pending { slot, epoch } => (slot, epoch),
+        };
+        if !connectable_now(Arc::downgrade(&self.inner), name.to_owned(), fingerprint).await {
+            return Err(ToolError::new(policy::PAUSED_CLUSTER));
         }
-        cache.release(name, slot);
-        Err(ToolError::new(policy::PAUSED_CLUSTER))
+        cache.publish(name, &slot, epoch);
+        Ok(slot)
     }
 
     async fn kinds(&self, cluster: &str, conn: &Conn) -> Result<Kinds, ToolError> {
@@ -1125,8 +1118,8 @@ impl FlintMcp {
     }
 
     async fn discovered(&self, cluster: &str, conn: &Conn) -> Result<Discovered, ToolError> {
-        let slot = self.inner.discovery.acquire(cluster, conn.fingerprint);
-        self.check_new_slot(&self.inner.discovery, cluster, &slot)
+        let slot = self
+            .checked_slot(&self.inner.discovery, cluster, conn.fingerprint)
             .await?;
         // Groups skipped this time are missing until the cache expires; the agent can retry.
         let discovered = slot
@@ -1854,11 +1847,13 @@ impl Inner {
     /// as they are now. Settings that can't be read count as no.
     fn still_connectable(&self, name: &str, fingerprint: u64) -> bool {
         let Ok(settings) = settings::load_settings(&self.config_dir) else {
+            self.retain_slots(&LiveKeys::default());
             return false;
         };
         let paths =
             kubeconfig::paths_for_settings(&self.kubeconfig_base, &settings, self.home.as_deref());
         let (loaded, paused) = self.load_kubeconfig(&paths);
+        self.retain_slots(&self.live_keys(&settings, &loaded, &paused));
         !paused.contains(name)
             && policy::exposed_cluster(&settings, &loaded, name).is_ok()
             && cluster::context_fingerprint(&loaded.merged, name) == Some(fingerprint)
@@ -1893,9 +1888,9 @@ impl Inner {
         Arc::new(live)
     }
 
-    fn retain_slots(&self, view: u64, live: &LiveKeys) {
-        self.clients.retain_live(view, live);
-        self.discovery.retain_live(view, live);
+    fn retain_slots(&self, live: &LiveKeys) {
+        self.clients.retain_live(live);
+        self.discovery.retain_live(live);
     }
 
     /// Starts releasing idle slots in the background. The sweep reads no file, so it never

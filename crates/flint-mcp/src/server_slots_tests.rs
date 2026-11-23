@@ -1,7 +1,7 @@
 //! Cached clients and discovery results are released when their context is removed, revoked,
 //! paused or left idle, without weakening the pause on a changed definition.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -140,6 +140,56 @@ async fn a_call_in_flight_cannot_reinsert_a_removed_context() {
     assert!(server.client(&in_flight, "dev").await.is_err());
     assert_released(&server);
     assert_eq!(requests.lock().unwrap().len(), 0, "nothing was sent");
+}
+
+#[tokio::test]
+async fn a_call_cancelled_during_its_check_stores_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _requests) = fake_api();
+    let one = config(&url, "    token: firsttoken\n");
+    let (server, _first) = two_files(dir.path(), &url, &one, NO_CONTEXTS);
+    let ctx = server.context().await.unwrap();
+
+    // Polls the call once, up to its check, and drops it there.
+    tokio::select! {
+        biased;
+        _ = server.client(&ctx, "dev") => panic!("the call was still checking"),
+        () = std::future::ready(()) => {}
+    }
+    // The check it left behind has finished, and still stores nothing.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!holds(&server));
+}
+
+#[tokio::test]
+async fn a_refused_send_check_releases_the_slots() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _requests) = fake_api();
+    let one = config(&url, "    token: firsttoken\n");
+    let (server, _first) = two_files(dir.path(), &url, &one, NO_CONTEXTS);
+    warm(&server).await;
+    let ctx = server.context().await.unwrap();
+    let conn = server.client(&ctx, "dev").await.unwrap();
+
+    std::fs::write(dir.path().join("settings.toml"), "").unwrap();
+    assert!(!server.inner.still_connectable("dev", conn.fingerprint));
+    assert_released(&server);
+}
+
+#[tokio::test]
+async fn a_client_in_use_is_not_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _requests) = fake_api();
+    let one = config(&url, "    token: firsttoken\n");
+    let (server, _first) = two_files(dir.path(), &url, &one, NO_CONTEXTS);
+    let ctx = server.context().await.unwrap();
+    let conn = server.client(&ctx, "dev").await.unwrap();
+
+    expire_idle(&server);
+    assert!(holds(&server), "a call still holds this client");
+    drop(conn);
+    expire_idle(&server);
+    assert!(!holds(&server));
 }
 
 #[tokio::test]
