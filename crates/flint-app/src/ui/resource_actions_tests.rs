@@ -32,7 +32,7 @@ use crate::ui::support_tests::{
 const WRITES: [&str; 2] = ["Scale…", "Rollout Restart…"];
 
 /// Connects `kind-alpha` with a discovery in which every kind can be deleted.
-async fn connect_deletable(cx: &mut TestAppContext, t: &TestWorkspace) {
+pub(super) async fn connect_deletable(cx: &mut TestAppContext, t: &TestWorkspace) {
     t.connect_alpha(cx, standard_sections()).await;
     let mut found = discovery(standard_sections());
     for kind in &mut found.kinds {

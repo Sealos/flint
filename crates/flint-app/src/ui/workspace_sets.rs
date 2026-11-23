@@ -1069,10 +1069,9 @@ impl Workspace {
         })
     }
 
-    /// Why a set member's row may read but not write now: the core refuses writes on its
-    /// definition. `None` for a cluster outside the open set.
-    pub(in crate::ui) fn member_writes_paused(&self, cluster: &str, cx: &App) -> Option<String> {
-        self.sets.member(cluster)?;
+    /// Why `cluster` may be read but not written now: the core refuses writes on its definition
+    /// while a kubeconfig file can't be read. Only says what the core decides.
+    pub(in crate::ui) fn writes_paused_why(&self, cluster: &str, cx: &App) -> Option<String> {
         let summary = self.cluster_summary(cluster, cx)?;
         self.model
             .read(cx)
@@ -1358,7 +1357,7 @@ impl Workspace {
         member_note(
             run.reports.iter().find(|r| r.cluster == context),
             summary.is_some_and(|c| self.model.read(cx).sessions_paused(c)),
-            self.member_writes_paused(context, cx).is_some(),
+            self.writes_paused_why(context, cx).is_some(),
         )
     }
 
