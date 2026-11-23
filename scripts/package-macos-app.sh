@@ -59,6 +59,11 @@ install -m 644 "$repo/LICENSE" "$app/Contents/Resources/LICENSE"
 # The Lucide icons compiled into the binary (crates/flint-app/src/ui/icons.rs) are ISC: their
 # notice travels with the app.
 install -m 644 "$repo/crates/flint-app/assets/icons/LICENSE-LUCIDE" "$app/Contents/Resources/LICENSE-LUCIDE"
+# Release builds set THIRD_PARTY_NOTICES to the output of scripts/generate-notices.sh.
+if [ -n "${THIRD_PARTY_NOTICES:-}" ]; then
+  [ -s "$THIRD_PARTY_NOTICES" ] || { echo "error: no notices at $THIRD_PARTY_NOTICES" >&2; exit 1; }
+  install -m 644 "$THIRD_PARTY_NOTICES" "$app/Contents/Resources/THIRD-PARTY-NOTICES.txt"
+fi
 sed "s/@VERSION@/$version/g" "$repo/packaging/macos/Info.plist" >"$app/Contents/Info.plist"
 printf 'APPL????' >"$app/Contents/PkgInfo"
 plutil -lint "$app/Contents/Info.plist"

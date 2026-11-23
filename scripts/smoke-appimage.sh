@@ -46,6 +46,15 @@ for notice in LICENSE crates/flint-app/assets/icons/LICENSE-LUCIDE; do
   fi
 done
 echo "notices: LICENSE, LICENSE-LUCIDE"
+# Release builds set THIRD_PARTY_NOTICES to the file that must be inside.
+if [ -n "${THIRD_PARTY_NOTICES:-}" ]; then
+  if [ ! -s "$THIRD_PARTY_NOTICES" ] ||
+    ! cmp -s "$scratch/squashfs-root/usr/share/doc/flint/THIRD-PARTY-NOTICES.txt" "$THIRD_PARTY_NOTICES"; then
+    echo "error: the AppImage has no matching usr/share/doc/flint/THIRD-PARTY-NOTICES.txt" >&2
+    exit 1
+  fi
+  echo "notices: THIRD-PARTY-NOTICES.txt"
+fi
 
 mkdir -p "$scratch/config"
 # A fixed PATH, so no login shell runs.

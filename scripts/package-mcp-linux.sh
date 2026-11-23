@@ -71,6 +71,11 @@ trap 'rm -rf "$stage"' EXIT
 mkdir "$stage/flint-mcp"
 cp "$binary" "$repo/LICENSE" "$repo/README.md" "$stage/flint-mcp/"
 cp "$repo/packaging/linux/musl-LICENSE" "$stage/flint-mcp/LICENSE-MUSL"
+# Release builds set THIRD_PARTY_NOTICES to the output of scripts/generate-notices.sh.
+if [ -n "${THIRD_PARTY_NOTICES:-}" ]; then
+  [ -s "$THIRD_PARTY_NOTICES" ] || { echo "error: no notices at $THIRD_PARTY_NOTICES" >&2; exit 1; }
+  cp "$THIRD_PARTY_NOTICES" "$stage/flint-mcp/THIRD-PARTY-NOTICES.txt"
+fi
 archive=flint-mcp-v$version-$target.tar.gz
 tar -czf "$out/$archive" -C "$stage" flint-mcp
 (cd "$out" && sha256sum "$archive" >"$archive.sha256")

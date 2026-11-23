@@ -5,7 +5,7 @@
 #
 # The archive must hold flint-mcp/flint-mcp with LICENSE, LICENSE-MUSL and README.md, `--version` must print
 # "flint-mcp <version>", and the server must answer `initialize`; the kubeconfig points at a port
-# that refuses connections. It needs only bash, coreutils, grep and tar, so it runs in a bare
+# that refuses connections. It needs only bash, coreutils, diffutils, grep and tar, so it runs in a bare
 # `ubuntu:22.04` container, which is how CI checks that the binary needs nothing from the host.
 set -euo pipefail
 
@@ -27,6 +27,15 @@ for file in flint-mcp LICENSE LICENSE-MUSL README.md; do
 done
 binary=$scratch/flint-mcp/flint-mcp
 echo "archive: flint-mcp, LICENSE, LICENSE-MUSL, README.md"
+# Release builds set THIRD_PARTY_NOTICES to the file that must be inside.
+if [ -n "${THIRD_PARTY_NOTICES:-}" ]; then
+  if [ ! -s "$THIRD_PARTY_NOTICES" ] ||
+    ! cmp -s "$scratch/flint-mcp/THIRD-PARTY-NOTICES.txt" "$THIRD_PARTY_NOTICES"; then
+    echo "error: the archive has no matching flint-mcp/THIRD-PARTY-NOTICES.txt" >&2
+    exit 1
+  fi
+  echo "archive: THIRD-PARTY-NOTICES.txt"
+fi
 
 got=$("$binary" --version)
 if [ "$got" != "flint-mcp $version" ]; then
