@@ -216,6 +216,10 @@ impl CoreHandle {
             let Ok((client, _pin, credential)) = client.await else {
                 return Access::Unknown;
             };
+            // Its provider's lease ended: this connection authenticates nothing more.
+            if credential.spent() {
+                return Access::Unknown;
+            }
             let asked = ask(client.into_client(), &check);
             cache.answer(&cluster, &credential, &check, asked).await
         });

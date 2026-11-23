@@ -14,7 +14,7 @@ const WAIT: Duration = Duration::from_secs(30);
 struct Core {
     handle: CoreHandle,
     server: Option<String>,
-    _kubeconfig: PathBuf,
+    kubeconfig: PathBuf,
     _dir: tempfile::TempDir,
 }
 
@@ -58,7 +58,7 @@ async fn connect(api: &FakeApiServer) -> Core {
     Core {
         handle,
         server,
-        _kubeconfig: kubeconfig,
+        kubeconfig,
         _dir: dir,
     }
 }
@@ -166,5 +166,81 @@ async fn a_check_the_gate_refuses_is_not_sent() {
         )
         .await;
     assert_eq!(answer, Access::Unknown);
+    assert_eq!(reviews(&api), before);
+}
+
+/// Asks until the reconnected context gives a clear answer.
+async fn settled(core: &Core, check: AccessCheck) -> Access {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            match core.ask(check.clone()).await {
+                Access::Unknown => tokio::time::sleep(Duration::from_millis(50)).await,
+                clear => return clear,
+            }
+        }
+    })
+    .await
+    .expect("a clear answer in time")
+}
+
+// covers #267: a context re-pointed at another server gets that server's answer, and the old
+// server is asked nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repointed_context_does_not_reuse_an_answer() {
+    let first = FakeApiServer::start().await.unwrap();
+    first.set_access(AccessPolicy::default().deny("update", "deployments"));
+    let second = FakeApiServer::start().await.unwrap();
+    let mut core = connect(&first).await;
+    let update = check(Some("demo"), "deployments", "update");
+    assert_eq!(core.ask(update.clone()).await, Access::Forbidden);
+    let asked_first = reviews(&first);
+
+    second
+        .write_kubeconfig(&core.kubeconfig, Some("demo"))
+        .unwrap();
+    core.handle.reload_kubeconfig().await.unwrap();
+    assert_eq!(core.ask(update.clone()).await, Access::Unknown, "old pin");
+
+    core.handle.send(Command::Activate(CONTEXT.to_owned()));
+    core.handle.unlock(CONTEXT, &second.url());
+    core.server = Some(second.url());
+    assert_eq!(settled(&core, update).await, Access::Allowed);
+    assert_eq!(reviews(&first), asked_first);
+    assert!(second.writes().is_empty(), "a check is not a write");
+}
+
+// covers #267: a changed definition on the same server starts with no answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_changed_definition_does_not_reuse_an_answer() {
+    let api = FakeApiServer::start().await.unwrap();
+    api.set_access(AccessPolicy::default().deny("update", "deployments"));
+    let core = connect(&api).await;
+    let update = check(Some("demo"), "deployments", "update");
+    assert_eq!(core.ask(update.clone()).await, Access::Forbidden);
+
+    api.set_access(AccessPolicy::default());
+    api.write_kubeconfig(&core.kubeconfig, Some("other"))
+        .unwrap();
+    core.handle.reload_kubeconfig().await.unwrap();
+    core.handle.send(Command::Activate(CONTEXT.to_owned()));
+    assert_eq!(settled(&core, update).await, Access::Allowed);
+}
+
+// covers #267: while a kubeconfig file cannot be read the definition is provisional, so a cached
+// answer is not shown and nothing is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_provisional_context_sends_no_check() {
+    let api = FakeApiServer::start().await.unwrap();
+    api.set_access(AccessPolicy::default().deny("update", "deployments"));
+    let core = connect(&api).await;
+    let update = check(Some("demo"), "deployments", "update");
+    assert_eq!(core.ask(update.clone()).await, Access::Forbidden);
+    let before = reviews(&api);
+
+    std::fs::write(&core.kubeconfig, "not: [valid").unwrap();
+    core.handle.reload_kubeconfig().await.unwrap();
+    assert_eq!(core.ask(update).await, Access::Unknown);
+    let other = check(Some("demo"), "deployments", "delete");
+    assert_eq!(core.ask(other).await, Access::Unknown);
     assert_eq!(reviews(&api), before);
 }
