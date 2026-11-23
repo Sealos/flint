@@ -291,6 +291,10 @@ const NARROW_NAME_CHARS: usize = 14;
 const MAX_LEAD_CHARS: usize = NARROW_NAME_CHARS;
 /// How many of an account's last digits a compact label shows at least.
 const MIN_ACCOUNT_TAIL_CHARS: usize = 4;
+/// What a compact label keeps for the region when it shows an account too.
+const MIN_REGION_ROOM_CHARS: usize = 6;
+/// The least of a region quoted for what differs in it.
+const MIN_REGION_CUT_CHARS: usize = 3;
 /// What " (" and ")" add around a real name beside a custom one.
 const BESIDE_REAL_CHARS: usize = 3;
 /// The least of a short real name a cut label keeps while a custom name gives way.
@@ -303,63 +307,151 @@ fn narrow_key(label: &str) -> String {
     cluster_name_key(&label.chars().take(NARROW_NAME_CHARS).collect::<String>())
 }
 
-/// The word of `full` from where it stops matching the closest of `rivals`.
+/// The word of `full` from where it stops matching the closest of `rivals`. A difference inside a
+/// number names the whole word, and a word that is only a number comes with the word before it,
+/// so a label never leads with a bare digit.
 fn differing_word(full: &str, rivals: &[&str]) -> String {
+    let chars: Vec<char> = full.chars().collect();
     let shared = rivals
         .iter()
         .map(|rival| {
-            full.chars()
+            chars
+                .iter()
                 .zip(rival.chars())
-                .take_while(|(a, b)| a == b)
+                .take_while(|(a, b)| **a == *b)
                 .count()
         })
         .max()
         .unwrap_or(0);
-    full.chars()
-        .skip(shared)
-        .take_while(|c| !CUSTOM_NAME_PUNCTUATION.contains(*c))
-        .take(MAX_LEAD_CHARS)
-        .collect()
+    let is_separator = |c: char| CUSTOM_NAME_PUNCTUATION.contains(c);
+    let end = chars[shared..]
+        .iter()
+        .position(|c| is_separator(*c))
+        .map_or(chars.len(), |at| shared + at);
+    let differing = &chars[shared..end];
+    if differing.is_empty() || !differing.iter().all(char::is_ascii_digit) {
+        return differing.iter().take(MAX_LEAD_CHARS).collect();
+    }
+    let word_start = |mut at: usize| {
+        while at > 0 && !is_separator(chars[at - 1]) {
+            at -= 1;
+        }
+        at
+    };
+    let mut start = word_start(shared);
+    if chars[start..end].iter().all(char::is_ascii_digit) {
+        let mut before = start;
+        while before > 0 && is_separator(chars[before - 1]) {
+            before -= 1;
+        }
+        if before > 0 {
+            start = word_start(before);
+        }
+    }
+    // Keep the end when that still holds the first digit that differs, else start at that digit.
+    let tail = start.max(end.saturating_sub(MAX_LEAD_CHARS - 1));
+    let (from, to) = match tail <= shared {
+        true => (tail, end),
+        false => (shared, shared + MAX_LEAD_CHARS - 2),
+    };
+    marked_cut(&chars, from, to, start, end)
+}
+
+/// `chars[from..to]`, with a mark on each side where it stops short of `start` or `end`.
+fn marked_cut(chars: &[char], from: usize, to: usize, start: usize, end: usize) -> String {
+    let before = if from > start { "…" } else { "" };
+    let after = if to < end { "…" } else { "" };
+    let cut: String = chars[from..to].iter().collect();
+    format!("{before}{cut}{after}")
+}
+
+/// The shortest run of `text`, of at least `least` characters and nearest its end, that differs
+/// from each of `others` at the same place, with its marks within `max`. `None` when none fits.
+fn telling_cut(text: &str, others: &BTreeSet<&str>, least: usize, max: usize) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let others: Vec<Vec<char>> = others.iter().map(|other| other.chars().collect()).collect();
+    let len = chars.len();
+    let tells = |from: usize, to: usize| {
+        others
+            .iter()
+            .all(|other| (from..to).any(|at| other.get(at) != Some(&chars[at])))
+    };
+    for width in least.min(len)..=len {
+        for to in (width..=len).rev() {
+            let from = to - width;
+            let marks = usize::from(from > 0) + usize::from(to < len);
+            if width + marks <= max && tells(from, to) {
+                return Some(marked_cut(&chars, from, to, 0, len));
+            }
+        }
+    }
+    None
+}
+
+/// The part of `account` that tells it from `others`, at least [`MIN_ACCOUNT_TAIL_CHARS`] long so
+/// it reads as an account rather than a bare digit, and within `max`.
+fn account_cut(account: &str, others: &BTreeSet<&str>, max: usize) -> String {
+    telling_cut(account, others, MIN_ACCOUNT_TAIL_CHARS, max)
+        .unwrap_or_else(|| middle_truncate(account, max))
+}
+
+/// `region` within `max`: cut in the middle, where regions usually match, unless that reads like
+/// one of `others`; then the part that differs.
+fn region_cut(region: &str, others: &BTreeSet<&str>, max: usize) -> String {
+    let cut = middle_truncate(region, max);
+    if others
+        .iter()
+        .all(|other| middle_truncate(other, max) != cut)
+    {
+        return cut;
+    }
+    telling_cut(region, others, MIN_REGION_CUT_CHARS, max).unwrap_or(cut)
 }
 
 /// What tells the EKS context `full` from every one of `rivals`: its region, else the end of its
-/// account. `None` when neither does alone, or a rival is not an EKS context.
+/// account, else both when each rival shares one of them. `None` when a rival shares both, or is
+/// not an EKS context.
 fn eks_lead(full: &str, rivals: &[&str]) -> Option<String> {
     let arn = parse_eks_arn(full)?;
     let others = rivals
         .iter()
         .map(|rival| parse_eks_arn(rival))
         .collect::<Option<Vec<_>>>()?;
-    if others.is_empty() {
+    if others.is_empty()
+        || others
+            .iter()
+            .any(|other| other.region == arn.region && other.account == arn.account)
+    {
         return None;
     }
+    // Cut in the middle: regions differ at their end.
     if others.iter().all(|other| other.region != arn.region) {
-        return Some(arn.region.chars().take(MAX_LEAD_CHARS).collect());
+        return Some(middle_truncate(arn.region, MAX_LEAD_CHARS));
     }
-    if !others.iter().all(|other| other.account != arn.account) {
-        return None;
-    }
-    let digits: Vec<char> = arn.account.chars().collect();
-    let shared = others
+    let accounts: BTreeSet<&str> = others
         .iter()
-        .map(|other| {
-            digits
-                .iter()
-                .zip(other.account.chars())
-                .take_while(|(a, b)| **a == *b)
-                .count()
-        })
-        .max()
-        .unwrap_or(0);
-    let keep = (digits.len() - shared)
-        .max(MIN_ACCOUNT_TAIL_CHARS)
-        .min(digits.len())
-        .min(MAX_LEAD_CHARS - 1);
-    let tail: String = digits[digits.len() - keep..].iter().collect();
-    Some(match keep < digits.len() {
-        true => format!("…{tail}"),
-        false => tail,
-    })
+        .map(|other| other.account)
+        .filter(|account| *account != arn.account)
+        .collect();
+    if others.iter().all(|other| other.account != arn.account) {
+        return Some(account_cut(arn.account, &accounts, MAX_LEAD_CHARS));
+    }
+    // Both are needed, and both must show within the narrowest width.
+    let account = account_cut(
+        arn.account,
+        &accounts,
+        MAX_LEAD_CHARS - 1 - MIN_REGION_ROOM_CHARS,
+    );
+    let regions: BTreeSet<&str> = others
+        .iter()
+        .map(|other| other.region)
+        .filter(|region| *region != arn.region)
+        .collect();
+    let room = MAX_LEAD_CHARS - 1 - account.chars().count();
+    Some(format!(
+        "{account} {}",
+        region_cut(arn.region, &regions, room)
+    ))
 }
 
 /// `text` led by `word`, within what a compact row shows. The cut falls on `text`.
@@ -618,6 +710,21 @@ impl ClusterNames {
             .unwrap_or_else(|| short_single_line(context))
     }
 
+    /// [`ClusterNames::with_real`] for a known context, else the whole context on one line: a
+    /// context that left kubeconfig has no label told from the others, and a short form could
+    /// read as one of them.
+    pub fn exact(&self, context: &str) -> String {
+        self.labels
+            .get(context)
+            .cloned()
+            .unwrap_or_else(|| single_line(context))
+    }
+
+    /// Whether `context` was among those these names were built for, so still in kubeconfig.
+    pub fn is_known(&self, context: &str) -> bool {
+        self.labels.contains_key(context)
+    }
+
     /// The second line of `context`'s compact row: with a custom name, the real name comes
     /// first, so the row always says which cluster it is.
     pub fn subtitle(&self, context: &str, server_host: Option<&str>) -> String {
@@ -795,6 +902,66 @@ mod tests {
         let shown = ClusterNames::new([a, b], &BTreeMap::new());
         assert_eq!(shown.of(a), "…0000 · prod");
         assert_eq!(shown.of(b), "…0001 · prod");
+    }
+
+    // covers UP-01: a last digit that differs never leads a label alone.
+    #[test]
+    fn regions_and_accounts_differing_by_a_last_digit_are_not_a_bare_digit() {
+        let eks = |region: &str, account: &str| {
+            format!("arn:aws:eks:{region}:{account}:cluster/payments-production-main")
+        };
+        // Each rival shares the region or the account, so neither alone tells them apart.
+        let grid = [
+            eks("eu-west-1", "123456789010"),
+            eks("eu-west-1", "123456789011"),
+            eks("eu-west-2", "123456789010"),
+            eks("eu-west-2", "123456789011"),
+        ];
+        let long_region = [
+            eks("us-gov-northwest-1", "123456789012"),
+            eks("us-gov-northwest-2", "123456789012"),
+        ];
+        for contexts in [&grid[..], &long_region[..]] {
+            let refs: Vec<&str> = contexts.iter().map(String::as_str).collect();
+            let shown = ClusterNames::new(refs.iter().copied(), &BTreeMap::new());
+            let visible_names: BTreeSet<String> = refs
+                .iter()
+                .map(|c| visible(&shown.of(c), NARROW_NAME_CHARS))
+                .collect();
+            assert_eq!(visible_names.len(), refs.len(), "{refs:?}");
+            for context in &refs {
+                let label = shown.of(context);
+                let lead = label.split(" · ").next().unwrap();
+                assert!(lead.chars().count() > 1, "{label}");
+                assert!(!lead.chars().all(|c| c.is_ascii_digit()), "{label}");
+            }
+            assert_told_apart(&shown, &refs);
+        }
+
+        // Outside EKS, a number comes with the word before it.
+        let one = "team-platform-production-1-main";
+        let two = "team-platform-production-2-main";
+        let shown = ClusterNames::new([one, two], &BTreeMap::new());
+        assert!(
+            shown.of(one).starts_with("production-1 · "),
+            "{}",
+            shown.of(one)
+        );
+        assert!(
+            shown.of(two).starts_with("production-2 · "),
+            "{}",
+            shown.of(two)
+        );
+    }
+
+    // covers UP-01: a context no longer listed is named whole, so it cannot read as a sibling.
+    #[test]
+    fn an_unlisted_context_is_named_whole() {
+        let listed = "arn:aws:eks:eu-west-1:123456789012:cluster/prod";
+        let gone = "arn:aws:eks:eu-west-2:123456789012:cluster/prod";
+        let shown = ClusterNames::new([listed], &BTreeMap::new());
+        assert_eq!(shown.exact(listed), shown.with_real(listed));
+        assert_eq!(shown.exact(gone), gone);
     }
 
     // covers UP-01
@@ -1100,5 +1267,38 @@ mod tests {
         );
         assert_eq!(middle_truncate("abcdef", 5), "ab…ef");
         assert_eq!(middle_truncate("é".repeat(10).as_str(), 4), "é…éé");
+    }
+
+    // covers UP-01: with the name in two regions of two accounts, both show at the narrowest.
+    #[test]
+    fn compact_labels_fit_both_account_and_region() {
+        let arn = |region, account| format!("arn:aws:eks:{region}:{account}:cluster/prod");
+        let contexts = [
+            arn("us-east-1", "123456789012"),
+            arn("us-west-2", "123456789012"),
+            arn("us-east-1", "987654321098"),
+            arn("us-west-2", "987654321098"),
+        ];
+        let names = ClusterNames::new(contexts.iter().map(String::as_str), &BTreeMap::new());
+        let shown: Vec<String> = contexts.iter().map(|c| names.of(c)).collect();
+        let narrow: BTreeSet<String> = shown.iter().map(|label| narrow_key(label)).collect();
+        assert_eq!(narrow.len(), contexts.len(), "{shown:?}");
+        for label in &shown {
+            let lead = label.split(" · ").next().unwrap_or_default();
+            assert!(lead.chars().count() <= NARROW_NAME_CHARS, "{label}");
+            assert!(lead.starts_with('…') && lead.contains(' '), "{label}");
+        }
+    }
+
+    // covers UP-01: a long number keeps the digit that differs, not an arbitrary number.
+    #[test]
+    fn compact_labels_keep_the_first_differing_digit() {
+        let a = "team-platform-production-10000000000000000001-main";
+        let b = "team-platform-production-20000000000000000001-main";
+        let names = ClusterNames::new([a, b], &BTreeMap::new());
+        let (one, two) = (names.of(a), names.of(b));
+        assert!(one.starts_with("…1000"), "{one}");
+        assert!(two.starts_with("…2000"), "{two}");
+        assert_ne!(narrow_key(&one), narrow_key(&two));
     }
 }
