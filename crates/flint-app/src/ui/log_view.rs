@@ -144,6 +144,8 @@ pub struct LogView {
             Arc<std::collections::VecDeque<LineId>>,
         )>,
     >,
+    /// The search's matches in the lines drawn, kept per line and bounded per frame.
+    highlights: std::cell::RefCell<log_model::LineHighlights>,
     /// Bumped with every query, so a slow first scan of an old query is dropped.
     search_generation: u64,
     /// A scan of `search` runs on the core's threads: the first of `query`, or a long
@@ -292,6 +294,7 @@ impl LogView {
             query: SearchQuery::default(),
             search: LogSearch::default(),
             shown_matches: Default::default(),
+            highlights: Default::default(),
             search_generation: 0,
             searching: false,
             search_scan: Default::default(),
@@ -580,22 +583,22 @@ impl LogView {
     /// it catches up at once, or on the core's threads when it is more than
     /// [`CATCH_UP_ON_UI`] lines behind. Nothing to do while a scan runs: it catches up when it
     /// lands.
-    pub fn catch_up_search(&mut self, cx: &mut Context<Self>) {
+    fn catch_up_search(&mut self, budget: &mut filter::UiScanBudget, cx: &mut Context<Self>) {
         if self.searching {
             return;
         }
-        if self.search_fits_ui() {
+        if self.search_fits_ui(budget) {
             self.search.update(&self.snapshot.lines);
         } else {
             self.scan(self.search.clone(), None, cx);
         }
     }
 
-    /// Whether the search can catch up on the UI thread.
-    fn search_fits_ui(&self) -> bool {
+    /// Whether the search can catch up on the UI thread, within `budget`.
+    fn search_fits_ui(&self, budget: &mut filter::UiScanBudget) -> bool {
         let lines = &self.snapshot.lines;
         self.query.text.is_empty()
-            || filter::catch_up_fits_ui(&self.query, self.search.pending(lines), lines)
+            || filter::catch_up_fits_ui(&self.query, self.search.pending(lines), lines, budget)
     }
 
     /// Brings the search up to the lines shown before an action uses its matches, and says
@@ -605,7 +608,7 @@ impl LogView {
         if self.searching {
             return false;
         }
-        if self.search_fits_ui() {
+        if self.search_fits_ui(&mut filter::UiScanBudget::default()) {
             self.search.update(&self.snapshot.lines);
             return true;
         }
@@ -932,7 +935,12 @@ impl LogView {
         }
     }
 
-    fn render_line(&mut self, ix: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_line(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme();
         // The item's row: a line still in the buffer.
         let Some((id, line)) = self
@@ -942,7 +950,18 @@ impl LogView {
             return div().into_any_element();
         };
         let max = (!self.wrap).then_some(log_model::UNWRAPPED_MAX_BYTES);
-        let shown = log_model::shown_line(line, self.line_view(), &self.query, max);
+        let shown = log_model::shown_line_with(line, self.line_view(), max, |short| {
+            self.highlights
+                .borrow_mut()
+                .matches(id, line, &self.query, short)
+        });
+        // Rows past this frame's highlighting budget get theirs on the next one.
+        if self.highlights.borrow_mut().take_redraw() {
+            let this = cx.weak_entity();
+            window.on_next_frame(move |_, cx| {
+                let _ = this.update(cx, |_, cx| cx.notify());
+            });
+        }
         let selected = self.selection.is_some_and(|s| s.contains(id));
         let color = match line.severity {
             Severity::Error => theme.danger,
@@ -1477,6 +1496,7 @@ impl LogView {
                                     .icon(IconName::Ellipsis)
                                     .xsmall()
                                     .ghost()
+                                    .accessibility_label("More log options")
                                     .tooltip("View options and Save")
                                     .dropdown_menu_with_anchor(
                                         Anchor::TopRight,
@@ -1506,6 +1526,7 @@ impl LogView {
                 .xsmall()
                 .ghost()
                 .disabled(!has_matches)
+                .accessibility_label("Previous match")
                 .tooltip(format!(
                     "Previous match ({})",
                     registry::key_hint("secondary-shift-g")
@@ -1516,6 +1537,7 @@ impl LogView {
                 .xsmall()
                 .ghost()
                 .disabled(!has_matches)
+                .accessibility_label("Next match")
                 .tooltip(format!(
                     "Next match ({})",
                     registry::key_hint("secondary-g")
@@ -1923,8 +1945,10 @@ fn starts_before(lines: &flint_core::logs::LogLines, cutoff: u64) -> bool {
 impl Render for LogView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.drop_trimmed_rows(cx);
-        self.catch_up_search(cx);
-        self.catch_up_filter(cx);
+        let mut scan_budget = filter::UiScanBudget::default();
+        self.catch_up_search(&mut scan_budget, cx);
+        self.catch_up_filter(&mut scan_budget, cx);
+        self.highlights.borrow_mut().begin_frame();
         let theme = cx.theme().clone();
         // The toolbar needs the tab's width, known only after layout: when it changed, draw
         // again with the new one.

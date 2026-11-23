@@ -43,21 +43,54 @@ impl Drop for ScanStop {
     }
 }
 
+/// What regex scans may still test on the UI thread: one budget for everything a frame scans, so
+/// the search and the filter together stay within [`GUARD_SCAN_LINES`] and [`GUARD_SCAN_BYTES`].
+#[derive(Debug, Clone, Copy)]
+pub(super) struct UiScanBudget {
+    lines: u64,
+    bytes: usize,
+}
+
+impl Default for UiScanBudget {
+    fn default() -> Self {
+        UiScanBudget {
+            lines: GUARD_SCAN_LINES as u64,
+            bytes: GUARD_SCAN_BYTES,
+        }
+    }
+}
+
 /// Whether testing the newest `pending` lines with `query` is short enough for the UI thread. A
-/// regex is held to a bound on text as well as lines: its lines can be long and each costs more.
-pub(super) fn catch_up_fits_ui(query: &SearchQuery, pending: u64, lines: &LogLines) -> bool {
+/// regex is held to a bound on text as well as lines, counting the sources it also tests; a scan
+/// that fits takes its share of `budget`, and one that does not takes nothing.
+pub(super) fn catch_up_fits_ui(
+    query: &SearchQuery,
+    pending: u64,
+    lines: &LogLines,
+    budget: &mut UiScanBudget,
+) -> bool {
     if !query.regex {
         return pending <= super::CATCH_UP_ON_UI;
     }
-    if pending > GUARD_SCAN_LINES as u64 {
+    if pending > budget.lines {
         return false;
     }
     let end = lines.end_id();
     let mut bytes = 0;
-    lines.range(end - pending, end).all(|(_, line)| {
+    let fits = lines.range(end - pending, end).all(|(_, line)| {
         bytes += line.text.len();
-        bytes <= GUARD_SCAN_BYTES
-    })
+        if query.sources
+            && let Some(source) = &line.source
+        {
+            bytes += source.label().len();
+        }
+        bytes <= budget.bytes
+    });
+    if fits {
+        budget.lines -= pending;
+        budget.bytes -= bytes;
+    }
+    fits
 }
 
 impl LogView {
@@ -198,7 +231,7 @@ impl LogView {
     /// hidden tab scans nothing until it is shown. A filter more than [`super::CATCH_UP_ON_UI`]
     /// lines behind (resumed after a long pause) catches up on the core's threads, keeping the
     /// rows shown until it lands.
-    pub(super) fn catch_up_filter(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn catch_up_filter(&mut self, budget: &mut UiScanBudget, cx: &mut Context<Self>) {
         if self.catching_up {
             return;
         }
@@ -208,7 +241,7 @@ impl LogView {
         // Budgeted by the filter installed here, not one still on its way.
         let pending = filter.pending(&self.snapshot.lines);
         let fits = match &filter.spec().query {
-            Some(query) => catch_up_fits_ui(query, pending, &self.snapshot.lines),
+            Some(query) => catch_up_fits_ui(query, pending, &self.snapshot.lines, budget),
             None => pending <= super::CATCH_UP_ON_UI,
         };
         if fits {

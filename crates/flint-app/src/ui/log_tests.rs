@@ -2288,9 +2288,12 @@ async fn an_invalid_regex_says_why_and_recovers(cx: &mut TestAppContext) {
 // threads even when they are few, and a plain query's budget is unchanged.
 #[test]
 fn a_regex_catch_up_is_bounded_by_text() {
-    use super::filter::catch_up_fits_ui;
+    use super::filter::UiScanBudget;
     use flint_core::SearchQuery;
     use flint_core::logs::{GUARD_SCAN_BYTES, GUARD_SCAN_LINES};
+    let catch_up_fits_ui = |query: &SearchQuery, pending, lines: &_| {
+        super::filter::catch_up_fits_ui(query, pending, lines, &mut UiScanBudget::default())
+    };
 
     let mut short = LogBuffer::new(GUARD_SCAN_LINES + 10);
     for _ in 0..GUARD_SCAN_LINES + 1 {
@@ -2313,6 +2316,75 @@ fn a_regex_catch_up_is_bounded_by_text() {
     assert!(catch_up_fits_ui(&regex, 2, &long.view()));
     assert!(!catch_up_fits_ui(&regex, 3, &long.view()));
     assert!(catch_up_fits_ui(&plain, 3, &long.view()));
+
+    // The search and the filter of one frame share the budget; a scan that does not fit takes
+    // none of it.
+    let mut budget = UiScanBudget::default();
+    let view = long.view();
+    assert!(super::filter::catch_up_fits_ui(
+        &regex,
+        2,
+        &view,
+        &mut budget
+    ));
+    assert!(!super::filter::catch_up_fits_ui(
+        &regex,
+        1,
+        &view,
+        &mut budget
+    ));
+    let mut budget = UiScanBudget::default();
+    assert!(!super::filter::catch_up_fits_ui(
+        &regex,
+        3,
+        &view,
+        &mut budget
+    ));
+    assert!(super::filter::catch_up_fits_ui(
+        &regex,
+        2,
+        &view,
+        &mut budget
+    ));
+}
+
+// covers UP-48: a regex over sources counts their bytes toward the UI thread's budget.
+#[test]
+fn a_regex_catch_up_counts_source_bytes() {
+    use super::filter::{UiScanBudget, catch_up_fits_ui};
+    use flint_core::SearchQuery;
+    use flint_core::logs::GUARD_SCAN_BYTES;
+
+    let source = Arc::new(LineSource::new(&"p".repeat(200), "c"));
+    let count = GUARD_SCAN_BYTES / source.label().len() + 1;
+    let mut buffer = LogBuffer::new(count + 1);
+    for _ in 0..count {
+        let mut line = LogLine::parse("x", false);
+        line.source = Some(source.clone());
+        buffer.push(line);
+    }
+    let lines = buffer.view();
+    let query = SearchQuery {
+        regex: true,
+        ..SearchQuery::new("missing")
+    };
+    let with_sources = SearchQuery {
+        sources: true,
+        ..query.clone()
+    };
+    let pending = count as u64;
+    assert!(catch_up_fits_ui(
+        &query,
+        pending,
+        &lines,
+        &mut UiScanBudget::default()
+    ));
+    assert!(!catch_up_fits_ui(
+        &with_sources,
+        pending,
+        &lines,
+        &mut UiScanBudget::default()
+    ));
 }
 
 // covers UP-48: matching lines only, and context around them; a search no line matches says
