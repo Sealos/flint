@@ -38,6 +38,7 @@ pub mod protection;
 pub mod read;
 mod read_only;
 mod recheck;
+pub mod recordings;
 pub mod redact;
 pub mod settings;
 pub mod store;
