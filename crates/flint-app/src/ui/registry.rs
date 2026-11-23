@@ -38,7 +38,9 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-pub use super::alert_center::{InvestigateAlert, OpenAlert, ToggleDesktopNotifications};
+pub use super::alert_center::{
+    InvestigateAlert, OpenAlert, SetClusterAlerts, ToggleDesktopNotifications,
+};
 use super::compare::COMPARE_VIEW;
 pub use super::compare::{
     CompareObject, OpenCompare, RefreshCompare, ToggleCompareSame, ToggleCompareVolatile,
@@ -608,6 +610,22 @@ pub struct SaveClusterSet {
 #[action(namespace = cluster_sets, no_json)]
 #[serde(deny_unknown_fields)]
 pub struct OpenClusterSet {
+    pub name: String,
+}
+
+/// Ask for a new name for a saved set.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = cluster_sets, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct RenameClusterSet {
+    pub name: String,
+}
+
+/// Ask to delete a saved set.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = cluster_sets, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteClusterSet {
     pub name: String,
 }
 
@@ -1818,6 +1836,14 @@ const fn arg(name: &'static str, description: &'static str, kind: ArgKind) -> Ar
 
 const CLUSTER: &[Arg] = &[arg("cluster", "kubeconfig context name", ArgKind::Cluster)];
 const ALERT: &[Arg] = &[arg("tag", "the alert's tag", ArgKind::Text)];
+const CLUSTER_ALERTS: &[Arg] = &[
+    arg("cluster", "kubeconfig context name", ArgKind::Cluster),
+    arg(
+        "choice",
+        "default, on or off",
+        ArgKind::Choice(&["default", "on", "off"]),
+    ),
+];
 const COMPARE_OBJECT: &[Arg] = &[
     arg("cluster", "kubeconfig context name", ArgKind::Cluster),
     arg("kind", "the kind, as plural or plural.group", ArgKind::Text),
@@ -2037,6 +2063,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Investigate Alert…",
             "Open an alert's cluster and copy a read-only prompt for an agent.",
             ALERT,
+        )
+        .of(C::Flint, S::App)
+        .hidden(),
+        Spec::with_args::<SetClusterAlerts>(
+            "Set Cluster Alerts…",
+            "Choose whether one cluster posts desktop notifications.",
+            CLUSTER_ALERTS,
         )
         .of(C::Flint, S::App)
         .hidden(),
@@ -2507,6 +2540,18 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::with_args::<OpenClusterSet>(
             "Open Cluster Set…",
             "Run a saved set and open its combined list.",
+            SET_NAME,
+        )
+        .of(C::Cluster, S::ClusterSets),
+        Spec::with_args::<RenameClusterSet>(
+            "Rename Cluster Set…",
+            "Give a saved set a new name.",
+            SET_NAME,
+        )
+        .of(C::Cluster, S::ClusterSets),
+        Spec::with_args::<DeleteClusterSet>(
+            "Delete Cluster Set…",
+            "Delete a saved set, after confirming. Its clusters are not changed.",
             SET_NAME,
         )
         .of(C::Cluster, S::ClusterSets),

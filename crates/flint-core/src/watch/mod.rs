@@ -26,7 +26,7 @@ use crate::settings::WatchMode;
 use crate::store::{Feed, KindSnapshot, SyncState};
 
 pub(crate) use engine::EngineConfig;
-pub(crate) use hub::{Hub, HubRegistry};
+pub(crate) use hub::{Hub, HubRegistry, MemberFeed};
 #[cfg(test)]
 pub(crate) use source::WatchRequest;
 pub(crate) use source::{KubeSource, Source};
@@ -317,7 +317,8 @@ impl ClusterWatches {
 impl Drop for ClusterWatches {
     fn drop(&mut self) {
         self.stop_all();
-        self.hubs.forget_outage(&self.cluster);
+        // The next slot of this name may be on another server.
+        self.hubs.reset_connection(&self.cluster);
     }
 }
 
