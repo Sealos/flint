@@ -49,6 +49,8 @@ pub(super) struct YamlEdit {
     pub editor: Entity<EditorState>,
     pub diff: Entity<DiffState>,
     target: WriteTarget,
+    /// The text as opened, moved to each reloaded `resourceVersion`: what counts as no change.
+    baseline: String,
     pub phase: Phase,
     /// Why the last step failed, in the server's or the core's words.
     pub error: Option<String>,
@@ -478,12 +480,14 @@ impl DetailView {
             state
         });
         editor.read(cx).focus_handle(cx).focus(window, cx);
+        let baseline = editor.read(cx).value().to_string();
         let diff = cx.new(|cx| DiffState::new(Vec::<DiffFile>::new(), cx));
         self.tab = DetailTab::Yaml;
         self.edit = Some(YamlEdit {
             editor,
             diff,
             target,
+            baseline,
             phase: Phase::Editing,
             error: None,
             seen: vec![opened],
@@ -761,6 +765,7 @@ impl DetailView {
             let yaml = with_resource_version(&edit.editor.read(cx).value(), version);
             edit.editor
                 .update(cx, |state, cx| state.set_value(yaml, window, cx));
+            edit.baseline = with_resource_version(&edit.baseline, version);
             edit.target.resource_version = Some(version.to_owned());
         }
         edit.phase = Phase::Editing;
@@ -787,6 +792,33 @@ impl DetailView {
             cx.notify();
         }
     }
+
+    /// Whether leaving this pane would lose typed text. Not while a confirmed write runs: that
+    /// text is already on its way, and discarding could not stop it.
+    pub(in crate::ui) fn has_unapplied_edit(&self, cx: &App) -> bool {
+        self.edit.as_ref().is_some_and(|edit| {
+            !matches!(edit.phase, Phase::Applying)
+                && edit.editor.read(cx).value().as_ref() != edit.baseline.as_str()
+        })
+    }
+
+    /// Shows the edit and gives it focus, so that a question about it opens over it and Keep
+    /// editing returns there.
+    pub(in crate::ui) fn reveal_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab = DetailTab::Yaml;
+        self.focus.focus(window, cx);
+        self.focus_shown_editor(window, cx);
+        cx.notify();
+    }
+
+    /// Drops the edit at the person's answer, leaving focus on this pane.
+    pub(in crate::ui) fn discard_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.can_cancel_edit() {
+            self.focus.focus(window, cx);
+            self.edit = None;
+            cx.notify();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -803,6 +835,11 @@ impl DetailView {
         let text = edit.editor.read(cx).value().replace(from, to);
         edit.editor
             .update(cx, |state, cx| state.set_value(text, window, cx));
+    }
+
+    /// The server the open edit is bound to.
+    pub(in crate::ui) fn open_edit_server(&self) -> Option<&str> {
+        self.edit.as_ref()?.target.server.as_deref()
     }
 
     pub(in crate::ui) fn edit_error(&self) -> Option<&str> {

@@ -134,6 +134,11 @@ impl ClusterSets {
         cluster.is_some_and(|cluster| self.member(cluster).is_some())
     }
 
+    /// The kind the open set lists.
+    pub(super) fn running_kind(&self) -> Option<&KindId> {
+        self.running.as_ref().map(|run| &run.kind)
+    }
+
     /// The member tab `id` was opened from, if it came from a set's row.
     pub(super) fn tab_pin(&self, id: u64) -> Option<&AdmittedMember> {
         self.tab_pins.get(&id)
@@ -727,6 +732,13 @@ impl Workspace {
             cx.notify();
             return;
         }
+        let again = (label.clone(), pins.clone(), set_id.clone());
+        if self.asks_before_leaving(window, cx, move |ws, window, cx| {
+            let (label, pins, set_id) = again.clone();
+            ws.open_set(label, pins, set_id, window, cx);
+        }) {
+            return;
+        }
         self.sets.error = None;
         let token = self.sets.next_opening;
         self.sets.next_opening += 1;
@@ -1151,6 +1163,10 @@ impl Workspace {
         let Some(detail) = &self.detail else {
             return;
         };
+        // An unapplied edit stays on show: the write gate refuses it while the member is changed.
+        if detail.read(cx).has_unapplied_edit(cx) {
+            return;
+        }
         let cluster = detail.read(cx).object().cluster.clone();
         if let Some(why) = self.set_row_refusal(&cluster, cx) {
             self.close_set_detail(cx);
@@ -1174,6 +1190,16 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let cleared = matches!(event, CombinedListEvent::Selected(None));
+        if cleared && self.unapplied_edit(cx).is_some() {
+            // A row that left the list has nothing to undo: its edit simply stays on show.
+            if list.update(cx, |list, cx| list.undo_selection(cx)) {
+                let list = list.clone();
+                self.asks_before_leaving(window, cx, move |_, _, cx| {
+                    list.update(cx, |list, cx| list.clear_selection(cx));
+                });
+            }
+            return;
+        }
         if cleared {
             self.clear_action_error(cx);
             self.detail = None;
@@ -1193,6 +1219,24 @@ impl Workspace {
         let Some(row) = list.read(cx).selected_object() else {
             return;
         };
+        if let Some(detail) = self.unapplied_edit(cx) {
+            let shown = detail.read(cx).object();
+            let same = shown.cluster == row.cluster
+                && shown.namespace == row.namespace
+                && shown.name == row.name
+                && shown.uid == row.uid;
+            if !same {
+                let wanted = list.read(cx).selected().cloned();
+                list.update(cx, |list, cx| list.undo_selection(cx));
+                let list = list.clone();
+                self.asks_before_leaving(window, cx, move |_, window, cx| {
+                    if let Some(wanted) = &wanted {
+                        list.update(cx, |list, cx| list.reselect(wanted, window, cx));
+                    }
+                });
+                return;
+            }
+        }
         if let Some(why) = self.set_row_refusal(&row.cluster, cx) {
             self.close_set_detail(cx);
             self.refuse(why, cx);
@@ -1242,14 +1286,11 @@ impl Workspace {
             view.set_row_cluster(shown, server, cx);
             view
         });
-        let list = list.downgrade();
         self._detail_subscriptions = vec![cx.subscribe_in(
             &detail,
             window,
             move |this, _, event, window, cx| match event {
-                DetailEvent::Close => {
-                    let _ = list.update(cx, |list, cx| list.clear_selection(cx));
-                }
+                DetailEvent::Close => this.close_detail(window, cx),
                 DetailEvent::OpenLogs(request, focus) => {
                     let focus = takes_focus(focus, window, cx);
                     this.open_logs(request.clone(), focus, window, cx)
@@ -1270,6 +1311,11 @@ impl Workspace {
     }
 
     fn close_set(&mut self, _: &CloseClusterSet, window: &mut Window, cx: &mut Context<Self>) {
+        if self.asks_before_leaving(window, cx, |ws, window, cx| {
+            ws.close_set(&CloseClusterSet, window, cx)
+        }) {
+            return;
+        }
         self.close_list(cx);
         let focus = self.focus.clone();
         window.focus(&focus, cx);

@@ -1041,11 +1041,22 @@ impl Workspace {
     pub(super) fn select_cluster(
         &mut self,
         action: &SelectCluster,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match self.check_cluster::<SelectCluster>(&action.cluster, cx) {
             Ok(()) => {
+                // Only a move that closes the pane: a set's member keeps it open.
+                let leaves = self.cluster.as_deref() != Some(action.cluster.as_str())
+                    && !self.sets.has_member(Some(&action.cluster));
+                let again = action.clone();
+                if leaves
+                    && self.asks_before_leaving(window, cx, move |ws, window, cx| {
+                        ws.select_cluster(&again, window, cx)
+                    })
+                {
+                    return;
+                }
                 let cluster = action.cluster.clone();
                 // The sidebar's cursor follows the cluster picked, however it was picked.
                 self.sidebar_cursor = Some(cluster.clone());
@@ -1483,7 +1494,24 @@ impl Workspace {
             return;
         }
         match self.view_entry(&action.kind, cx) {
-            Some(entry) => self.open_kind(&entry, window, cx),
+            Some(entry) => {
+                let open_already = match self.sets.running_kind() {
+                    Some(kind) => *kind == entry.id,
+                    None => self
+                        .list
+                        .as_ref()
+                        .is_some_and(|list| *list.read(cx).kind() == entry.id),
+                };
+                let again = action.clone();
+                if !open_already
+                    && self.asks_before_leaving(window, cx, move |ws, window, cx| {
+                        ws.open_view(&again, window, cx)
+                    })
+                {
+                    return;
+                }
+                self.open_kind(&entry, window, cx)
+            }
             None => tracing::warn!("{}", self.check_open_view(action, cx).unwrap_err()),
         }
     }

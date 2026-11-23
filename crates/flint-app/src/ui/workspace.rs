@@ -1100,7 +1100,9 @@ impl Workspace {
             self.forget_places();
             // Selecting a member (to sign in to it, say) keeps the set's list open.
             if !self.sets.has_member(active.as_deref()) {
+                let held = self.hold_edit_across_restart(active.as_deref(), cx);
                 self.close_list(cx);
+                self.restore_held_edit(held);
             }
             // Its filter or YAML, if one had focus that has moved on (to a dock tab, say): focus
             // may never come back through `reclaim_focus`, nor a list open here. One that still
@@ -1269,6 +1271,9 @@ impl Workspace {
             window.focus(&focus, cx);
             return;
         }
+        if self.asks_before_leaving(window, cx, |ws, window, cx| ws.open_dashboard(window, cx)) {
+            return;
+        }
         // Any place other than the list shown: the overview is not one Go Back returns to.
         let overview = keys::Place {
             kind: KindId::new("flint.overview", "overview"),
@@ -1409,6 +1414,15 @@ impl Workspace {
     ) {
         match event {
             ListEvent::Selected(None) => {
+                if self.unapplied_edit(cx).is_some()
+                    && list.update(cx, |list, cx| list.undo_selection(cx))
+                {
+                    let list = list.clone();
+                    self.asks_before_leaving(window, cx, move |_, _, cx| {
+                        list.update(cx, |list, cx| list.clear_selection(cx));
+                    });
+                    return;
+                }
                 self.menu_row_pending = false;
                 self.clear_action_error(cx);
                 self.detail = None;
@@ -1419,11 +1433,11 @@ impl Workspace {
                 release_unfocused_input(window, cx);
             }
             ListEvent::Selected(Some(selected)) => {
-                let list = list.read(cx);
+                let rows = list.read(cx);
                 let object = ObjectRef {
-                    cluster: list.cluster().to_owned(),
-                    kind: list.kind().clone(),
-                    kind_label: list.label().to_owned(),
+                    cluster: rows.cluster().to_owned(),
+                    kind: rows.kind().clone(),
+                    kind_label: rows.label().to_owned(),
                     namespace: selected.namespace.clone(),
                     name: selected.name.clone(),
                     uid: selected.uid.clone(),
@@ -1433,6 +1447,15 @@ impl Workspace {
                     .as_ref()
                     .is_some_and(|d| *d.read(cx).object() == object)
                 {
+                    return;
+                }
+                if self.unapplied_edit(cx).is_some()
+                    && list.update(cx, |list, cx| list.undo_selection(cx))
+                {
+                    let (list, wanted) = (list.clone(), selected.clone());
+                    self.asks_before_leaving(window, cx, move |_, window, cx| {
+                        list.update(cx, |list, cx| list.reselect(&wanted, window, cx));
+                    });
                     return;
                 }
                 // Moving between rows keeps the tab the user was on.
@@ -1454,16 +1477,11 @@ impl Workspace {
                     }
                     detail
                 });
-                let list = self.list.clone();
                 self._detail_subscriptions =
                     vec![
                         cx.subscribe_in(&detail, window, move |this, _, event, window, cx| {
                             match event {
-                                DetailEvent::Close => {
-                                    if let Some(list) = &list {
-                                        list.update(cx, |list, cx| list.clear_selection(cx));
-                                    }
-                                }
+                                DetailEvent::Close => this.close_detail(window, cx),
                                 DetailEvent::OpenLogs(request, focus) => {
                                     let focus = takes_focus(focus, window, cx);
                                     this.open_logs(request.clone(), focus, window, cx)
@@ -3811,6 +3829,13 @@ mod narrow_layout_tests;
 #[cfg(any(test, feature = "automation"))]
 #[path = "workspace_state.rs"]
 mod state;
+
+#[path = "workspace_unapplied.rs"]
+mod unapplied;
+
+#[cfg(test)]
+#[path = "workspace_unapplied_tests.rs"]
+mod unapplied_tests;
 
 #[cfg(test)]
 #[path = "workspace_view_tests.rs"]

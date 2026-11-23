@@ -64,6 +64,8 @@ const ANSWER: Duration = Duration::from_secs(60);
 const QUIT_ANSWER: Duration = Duration::from_secs(2);
 /// The title of the question Quit asks while a session would end (#177).
 const QUIT_DIALOG: &str = "Quit Flint?";
+/// The question Quit asks first over an unapplied YAML edit.
+const DISCARD_EDIT_DIALOG: &str = "Discard unapplied edit?";
 /// How long a stalled app has to answer the teardown's quit check before the check fails.
 const QUIT_CHECK: Duration = Duration::from_secs(15);
 /// How long the app has to exit once it took the quit.
@@ -755,11 +757,11 @@ impl App {
         let mut deadline = Instant::now() + QUIT_CHECK;
         let mut no_answer = None;
         let mut asked = false;
-        let mut confirmed = false;
+        let mut confirmed: Option<String> = None;
         while is_running(child) && Instant::now() < deadline {
-            // Quit asks first while a shell runs or a log tab follows (#177). Confirm only that
-            // question, read off the open dialog's title: any other dialog is a bug to report,
-            // not one to click through.
+            // Quit asks first over an unapplied YAML edit (#394), then while a shell runs or a
+            // log tab follows (#177). Confirm only those questions, each once, read off the open
+            // dialog's title: any other dialog is a bug to report, not one to click through.
             let dialog = if !asked {
                 // A request that timed out may still run. That is safe: it quits only with no
                 // dialog open, so the app exiting afterwards means there was none.
@@ -775,8 +777,6 @@ impl App {
                         None
                     }
                 }
-            } else if confirmed {
-                None
             } else {
                 // The app may quit while it answers.
                 self.request_within("state", Value::Null, QUIT_ANSWER)
@@ -785,13 +785,15 @@ impl App {
             };
             match dialog.as_deref() {
                 None => {}
-                Some(QUIT_DIALOG) => {
+                // Answered already: it is still closing, or the app is quitting.
+                Some(title) if confirmed.as_deref() == Some(title) => {}
+                Some(title @ (QUIT_DIALOG | DISCARD_EDIT_DIALOG)) => {
                     let _ = self.request_within(
                         "dispatch_action",
                         json!({"name": "ui::Confirm"}),
                         QUIT_ANSWER,
                     );
-                    confirmed = true;
+                    confirmed = Some(title.to_owned());
                 }
                 Some(other) => {
                     return Err(format!(

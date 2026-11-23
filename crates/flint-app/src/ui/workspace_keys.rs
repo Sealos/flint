@@ -243,6 +243,9 @@ impl Workspace {
         if !self.can_go_back(cx) {
             return;
         }
+        if self.asks_before_leaving(window, cx, |ws, window, cx| ws.go_back(&GoBack, window, cx)) {
+            return;
+        }
         // Selecting a row or clearing the selection records nothing, so the last place
         // remembered can be the one shown; a press never goes there.
         let here = self.shown_place(cx);
@@ -318,6 +321,18 @@ impl Workspace {
             .filter(|n| !n.is_empty() && entry.namespaced)
             .map(str::to_owned);
         let name = action.name.trim().to_owned();
+        let shown_here = self.detail.as_ref().is_some_and(|detail| {
+            let object = detail.read(cx).object();
+            object.kind == entry.id && object.namespace == namespace && object.name == name
+        });
+        let again = action.clone();
+        if !shown_here
+            && self.asks_before_leaving(window, cx, move |ws, window, cx| {
+                ws.open_object(&again, window, cx)
+            })
+        {
+            return;
+        }
         let target = Place {
             kind: entry.id.clone(),
             object: Some((namespace.clone(), name.clone())),

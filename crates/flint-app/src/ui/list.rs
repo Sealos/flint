@@ -62,6 +62,14 @@ pub struct Selected {
     pub resource_version: Box<str>,
 }
 
+/// A selection as it stood, to put back.
+struct SelectionBefore {
+    selected: Option<Selected>,
+    ix: Option<usize>,
+    seen: Option<u64>,
+    gone: bool,
+}
+
 pub enum ListEvent {
     /// The user selected an object (open its detail), or cleared the selection.
     Selected(Option<Selected>),
@@ -184,6 +192,8 @@ pub struct ResourceList {
     /// The revision of the newest rows the selected object was seen in ([`rows_revision`]),
     /// for Go Back.
     selected_seen: Option<u64>,
+    /// The selection the last change replaced, for [`ResourceList::undo_selection`].
+    selection_before: Option<SelectionBefore>,
     computing: bool,
     /// Something changed while a computation ran: run again when it ends.
     dirty: bool,
@@ -322,6 +332,7 @@ impl ResourceList {
             subscribed_lanes,
             pending_seen: None,
             selected_seen: None,
+            selection_before: None,
             computing: false,
             dirty: false,
             select_first_in: None,
@@ -618,6 +629,7 @@ impl ResourceList {
             return;
         };
         self.missing = None;
+        self.selection_before = Some(self.selection_now());
         self.selected_seen = rows_revision(&self.latest, namespace);
         let row = &self.latest.rows[row];
         self.selected = Some(Selected {
@@ -818,6 +830,7 @@ impl ResourceList {
             resource_version: row.resource_version.clone(),
         };
         let seen = rows_revision(&self.shown, selected.namespace.as_deref());
+        let before = self.selection_now();
         window.focus(&self.focus, cx);
         // A user's choice wins over a startup selection still waiting for its object.
         self.pending_select = None;
@@ -827,6 +840,7 @@ impl ResourceList {
         self.selected_gone = false;
         self.scroll.scroll_to_item(ix, ScrollStrategy::Top);
         if self.selected.as_ref() != Some(&selected) {
+            self.selection_before = Some(before);
             self.selected = Some(selected.clone());
             cx.emit(ListEvent::Selected(Some(selected)));
         }
@@ -845,10 +859,53 @@ impl ResourceList {
         self.pending_select = None;
         self.select_first_in = None;
         self.missing = None;
-        if self.selected.take().is_some() {
+        if self.selected.is_some() {
+            self.selection_before = Some(self.selection_now());
+            self.selected = None;
             self.selected_ix = None;
             cx.emit(ListEvent::Selected(None));
             cx.notify();
+        }
+    }
+
+    pub(in crate::ui) fn has_selection(&self) -> bool {
+        self.selected.is_some()
+    }
+
+    fn selection_now(&self) -> SelectionBefore {
+        SelectionBefore {
+            selected: self.selected.clone(),
+            ix: self.selected_ix,
+            seen: self.selected_seen,
+            gone: self.selected_gone,
+        }
+    }
+
+    /// Puts back the selection the last change replaced, saying nothing: whether there was one.
+    pub(in crate::ui) fn undo_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(before) = self.selection_before.take() else {
+            return false;
+        };
+        self.selected = before.selected;
+        self.selected_ix = before.ix;
+        self.selected_seen = before.seen;
+        self.selected_gone = before.gone;
+        self.reveal_selected = true;
+        self.recompute(cx);
+        cx.notify();
+        true
+    }
+
+    /// Selects `wanted` again, as asked for before a question about leaving the row shown.
+    pub(in crate::ui) fn reselect(
+        &mut self,
+        wanted: &Selected,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.position_of(&wanted.uid) {
+            Some(ix) => self.select_index(ix, window, cx),
+            None => self.select_listed(wanted.namespace.clone(), wanted.name.clone(), None, cx),
         }
     }
 
