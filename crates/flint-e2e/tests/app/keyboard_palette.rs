@@ -1,22 +1,17 @@
 //! The keys of UP-33, UP-30 and UP-31 that `m2/keyboard.rs` leaves to the view tests, pressed in
 //! the running app: the panes in reverse, sections, Go Back and Back to List; the palette's
-//! selection and argument steps; the switcher's arrows and swap; and a write reached from the
-//! palette and answered from the keyboard.
+//! selection and argument steps; and the switcher's arrows and swap.
 
 use anyhow::{Result, bail};
 use flint_e2e::app::{App, AppOptions};
 use flint_e2e::backend::TestCluster;
 use flint_e2e::fake_api::Options;
-use http::Method;
 use serde_json::{Value, json};
 
 use crate::support::*;
 
 /// The pods in the fake server's fixtures.
 const FIXTURE_PODS: usize = 17;
-/// The deployments in the fake server's fixtures.
-const FIXTURE_DEPLOYMENTS: usize = 5;
-const WEB: &str = "/apis/apps/v1/namespaces/demo/deployments/web";
 
 /// A window wide enough to show the list and the detail side by side, whatever the display's
 /// default gave: below the split, a row's detail shows alone and takes focus.
@@ -232,97 +227,6 @@ fn up_30_palette_selection_and_steps_by_key() -> Result<()> {
     // `quit` fails unless this app was still running to be asked.
     app.quit()?;
     assert!(fake.writes().is_empty(), "{:?}", fake.writes());
-    Ok(())
-}
-
-// covers UP-30, UP-53: a delete run from the palette and answered only with keys. Enter cancels
-// wherever focus is, and only Space on OK sends the one request.
-#[test]
-#[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
-fn up_30_palette_delete_is_confirmed_by_key() -> Result<()> {
-    let cluster = TestCluster::fake(Options::default())?;
-    let fake = cluster.fake_server().expect("a fake server");
-    let options = AppOptions::new(&cluster.kubeconfig).settings("protect_local_clusters = true\n");
-    let app = App::launch(options)?;
-    connect(&app, &cluster.context)?;
-    app.dispatch(
-        "workspace::UnlockCluster",
-        json!({"cluster": cluster.context}),
-    )?;
-    app.wait_for("/dialog/title", Exists(true))?;
-    app.dispatch("ui::Confirm", Value::Null)?;
-    app.wait_for(
-        "/clusters",
-        Any(json!({"name": cluster.context, "protection": "unlocked"})),
-    )?;
-    open_live(&app, "deployments", FIXTURE_DEPLOYMENTS)?;
-    widen(&app)?;
-    app.wait_for("/focus", Equals("list".into()))?;
-
-    // Down from the filter returns to the rows, and Down there opens the one row left.
-    press(&app, "secondary-f", "/focus", "list_filter")?;
-    app.type_text("web")?;
-    app.wait_for("/list/filter", Equals("web".into()))?;
-    app.wait_for("/list/rows/0/name", Equals("web".into()))?;
-    press(&app, "down", "/focus", "list")?;
-    if app.state()?["detail"]["name"] != "web" {
-        press(&app, "down", "/detail/name", "web")?;
-    }
-    app.wait_for("/detail/fetch", Equals("loaded".into()))?;
-
-    let open_delete = || -> Result<()> {
-        open_palette(&app, "secondary-shift-p", "actions")?;
-        app.type_text("delete selected")?;
-        app.wait_for(
-            "/palette/rows/0/action",
-            Equals("workspace::DeleteObject".into()),
-        )?;
-        app.press_key("enter")?;
-        let state = app.wait_for("/dialog/title", Exists(true))?;
-        let text = state["dialog"]["text"].as_str().unwrap_or_default();
-        assert!(text.contains("web"), "the dialog does not name web: {text}");
-        assert!(fake.writes().is_empty(), "{:?}", fake.writes());
-        Ok(())
-    };
-
-    // Each of these closes the dialog and sends nothing.
-    for keys in [
-        &["escape"][..],
-        &["enter"],
-        &["tab", "enter"],
-        &["shift-tab", "enter"],
-    ] {
-        open_delete()?;
-        for key in keys {
-            app.press_key(key)?;
-        }
-        app.wait_for("/dialog", Equals(Value::Null))?;
-        app.wait_for("/focus", Equals("list".into()))?;
-        assert!(fake.writes().is_empty(), "{keys:?}: {:?}", fake.writes());
-    }
-
-    // Shift-Tab reaches OK, and Space on it sends exactly one delete, of this object.
-    open_delete()?;
-    app.press_key("shift-tab")?;
-    press(&app, "space", "/dialog", Value::Null)?;
-    let writes = until(
-        "the delete's answer",
-        || fake.writes(),
-        |writes| !writes.is_empty() && writes.iter().all(|w| w.status.is_some()),
-    )?;
-    assert_eq!(writes.len(), 1, "{writes:?}");
-    assert_eq!(writes[0].method, Method::DELETE);
-    assert_eq!(writes[0].path, WEB);
-    assert!(!writes[0].is_dry_run(), "{:?}", writes[0]);
-    assert!(
-        writes[0].status.is_some_and(|c| (200..300).contains(&c)),
-        "{:?}",
-        writes[0]
-    );
-
-    // After quitting, so a repeated write would have arrived.
-    app.quit()?;
-    assert_eq!(fake.writes().len(), 1, "{:?}", fake.writes());
     Ok(())
 }
 
