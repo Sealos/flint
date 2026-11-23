@@ -548,7 +548,8 @@ impl EmptiedFiles {
 }
 
 /// Each context's definition when a load last showed it with no unreadable file that could
-/// change it.
+/// change it. `None` is a context a load confirmed gone: no definition matches it, so what shows
+/// up under its name behind an unreadable file waits, even with its old definition.
 #[derive(Debug, Default)]
 pub(crate) struct SettledDefinitions(HashMap<String, Option<u64>>);
 
@@ -561,17 +562,23 @@ impl SettledDefinitions {
             && self
                 .0
                 .get(name)
-                .is_some_and(|confirmed| *confirmed != shown)
+                .is_some_and(|confirmed| confirmed.is_none() || *confirmed != shown)
     }
 
     /// Whether `shown` is exactly the definition a load last confirmed for `name`.
     pub fn confirms(&self, name: &str, shown: Option<u64>) -> bool {
-        self.0.get(name) == Some(&shown)
+        shown.is_some() && self.0.get(name) == Some(&shown)
     }
 
-    /// Takes the definitions `loaded`, already recorded in `history`, confirms. Returns the
-    /// contexts whose confirmed definition this changed.
+    /// Takes the definitions `loaded`, already recorded in `history`, confirms, and forgets those
+    /// of contexts it confirmed gone. Returns the contexts whose confirmed definition this
+    /// changed.
     pub fn update(&mut self, history: &ContextHistory, loaded: &LoadedKubeconfig) -> Vec<String> {
+        for (name, definition) in &mut self.0 {
+            if history.removed(name) {
+                *definition = None;
+            }
+        }
         let mut changed = Vec::new();
         for info in &loaded.contexts {
             if history.provisional(&info.name) {
@@ -859,6 +866,35 @@ mod tests {
              contexts:\n- name: dev\n  context:\n    cluster: c\n    user: u\n\
              users:\n- name: u\n  user:\n    token: {token}\n"
         )
+    }
+
+    // covers UP-54: once a load confirms a context gone, its old definition vouches for nothing:
+    // the same entry showing up in a later file behind an unreadable one waits.
+    #[test]
+    fn a_confirmed_removal_forgets_the_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+        let paths = [first.clone(), second.clone()];
+        let at = std::time::Instant::now();
+        let mut confirmed = ConfirmedDefinitions::default();
+
+        std::fs::write(&first, config("one")).unwrap();
+        assert!(load_files(&mut confirmed, &paths, at).paused.is_empty());
+        std::fs::write(&first, "kind: Config\n").unwrap();
+        let removed = load_files(&mut confirmed, &paths, at);
+        assert_eq!(removed.outcome, ReadOutcome::Clean);
+        assert!(confirmed.history.removed("dev"));
+
+        std::fs::write(&first, "clusters: [not valid").unwrap();
+        std::fs::write(&second, config("one")).unwrap();
+        let back = load_files(&mut confirmed, &paths, at);
+        assert!(back.loaded.context("dev").is_some());
+        assert!(back.paused.contains("dev"), "its old definition is gone");
+        let shown = context_fingerprint(&back.loaded.merged, "dev");
+        assert!(confirmed.settled.paused(&confirmed.history, "dev", shown));
+
+        std::fs::write(&first, "kind: Config\n").unwrap();
+        assert!(load_files(&mut confirmed, &paths, at).paused.is_empty());
     }
 
     // covers UP-54: with an earlier file unreadable, a context showing its confirmed definition

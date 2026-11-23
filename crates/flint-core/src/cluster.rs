@@ -482,6 +482,72 @@ pub async fn connect(kubeconfig: &Kubeconfig, context: &str) -> Result<Client, C
     .map_err(|e| ClusterError::kube(e).for_target(&target))
 }
 
+/// Asked before a client's credential is prepared and before each attempt of each request,
+/// retries included. An `Err` stops the attempt before any credential is resolved or sent.
+#[derive(Clone)]
+pub struct SendCheck(
+    std::sync::Arc<
+        dyn Fn() -> futures::future::BoxFuture<'static, Result<(), String>> + Send + Sync,
+    >,
+);
+
+impl SendCheck {
+    pub fn new(
+        check: impl Fn() -> futures::future::BoxFuture<'static, Result<(), String>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        SendCheck(std::sync::Arc::new(check))
+    }
+
+    async fn holds(&self) -> Result<(), ClusterError> {
+        (self.0)().await.map_err(ClusterError::Kube)
+    }
+}
+
+impl<B: Send + 'static> tower::filter::AsyncPredicate<http::Request<B>> for SendCheck {
+    type Future = futures::future::BoxFuture<'static, Result<http::Request<B>, tower::BoxError>>;
+    type Request = http::Request<B>;
+
+    fn check(&mut self, request: http::Request<B>) -> Self::Future {
+        let check = self.0.clone();
+        Box::pin(async move {
+            check().await.map_err(tower::BoxError::from)?;
+            Ok(request)
+        })
+    }
+}
+
+/// As [`connect`], with `check` asked before the credential is prepared, before the client is
+/// built, and before each attempt of each request the client sends.
+pub async fn connect_checked(
+    kubeconfig: &Kubeconfig,
+    context: &str,
+    check: SendCheck,
+) -> Result<Client, ClusterError> {
+    check.holds().await?;
+    let ready = prepare(kubeconfig, context, &CredentialAccess::always()).await?;
+    check.holds().await?;
+    let target = ready.target;
+    let (config, token) = (ready.config, ready.token);
+    tokio::task::spawn_blocking(move || {
+        let auth = kube::client::ConfigExt::auth_layer(&config)?;
+        build_observed_client(
+            &config,
+            token,
+            auth.as_ref(),
+            None,
+            Access::ReadOnly,
+            None,
+            Some(&check),
+        )
+    })
+    .await
+    .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
+    .map_err(|e| ClusterError::kube(e).for_target(&target))
+}
+
 /// A connection's clients, and the credential its write client presents.
 pub(crate) struct GatedConnection {
     pub(crate) clients: ClusterClients,
@@ -533,6 +599,7 @@ pub(crate) async fn connect_gated_with_policy(
             guarded.as_ref(),
             Access::ReadOnly,
             Some(&grant),
+            None,
         )?;
         still_held()?;
         let write = build_client(
@@ -722,10 +789,11 @@ fn build_client(
     guarded: Option<&credential::GuardedProvider>,
     access: Access,
 ) -> Result<Client, kube::Error> {
-    build_observed_client(config, token, auth, guarded, access, None)
+    build_observed_client(config, token, auth, guarded, access, None, None)
 }
 
-/// [`build_client`], telling `observer` of each 401 the server answers.
+/// [`build_client`], telling `observer` of each 401 the server answers, and asking `check` before
+/// each attempt: inside the retries, and before anything that resolves a credential.
 #[expect(
     clippy::disallowed_types,
     reason = "the one place that assembles a client"
@@ -737,6 +805,7 @@ fn build_observed_client(
     guarded: Option<&credential::GuardedProvider>,
     access: Access,
     observer: Option<&CredentialGrant>,
+    check: Option<&SendCheck>,
 ) -> Result<Client, kube::Error> {
     use kube::client::ConfigExt;
     use kube::client::retry::RetryPolicy;
@@ -778,6 +847,7 @@ fn build_observed_client(
                 response
             })
         }))
+        .option_layer(check.cloned().map(tower::filter::AsyncFilterLayer::new))
         // A write's checked credential goes out as it is, with no auth layer resolving another.
         .service(credential::AuthUnlessBound {
             authed,

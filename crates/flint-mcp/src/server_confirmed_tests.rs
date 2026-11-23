@@ -15,6 +15,15 @@ const VERSION: &str = r#"{"major":"1","minor":"31","gitVersion":"v1.31.0","gitCo
 
 /// A fake API server answering `/version`, keeping the head of every request it gets.
 fn fake_api() -> (String, Arc<Mutex<Vec<String>>>) {
+    serve_api(false)
+}
+
+/// [`fake_api`], answering its first request 503 with a `Retry-After`.
+fn fake_api_busy_once() -> (String, Arc<Mutex<Vec<String>>>) {
+    serve_api(true)
+}
+
+fn serve_api(mut busy: bool) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -29,6 +38,14 @@ fn fake_api() -> (String, Arc<Mutex<Vec<String>>>) {
             seen.lock()
                 .unwrap()
                 .push(String::from_utf8_lossy(&head).into_owned());
+            if std::mem::take(&mut busy) {
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                continue;
+            }
             let _ = write!(
                 socket,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
@@ -146,6 +163,101 @@ async fn an_inline_token_waits_for_a_confirmed_definition() {
             .contains("authorization: bearer inlinesecret")),
         "{requests:?}"
     );
+}
+
+/// A server exposing `dev` from two files, in order.
+fn two_files(dir: &Path, server: &str, first: &str, second: &str) -> (FlintMcp, PathBuf) {
+    let (first_path, second_path) = (dir.join("first"), dir.join("second"));
+    std::fs::write(&first_path, first).unwrap();
+    std::fs::write(&second_path, second).unwrap();
+    std::fs::write(
+        dir.join("settings.toml"),
+        format!("[[ai_exposed_clusters]]\ncontext = \"dev\"\nserver = \"{server}\"\n"),
+    )
+    .unwrap();
+    (
+        FlintMcp::new(dir.to_owned(), vec![first_path.clone(), second_path], None),
+        first_path,
+    )
+}
+
+fn sent(requests: &Mutex<Vec<String>>, token: &str) -> usize {
+    let needle = format!("authorization: bearer {token}");
+    let requests = requests.lock().unwrap();
+    requests
+        .iter()
+        .filter(|r| r.to_lowercase().contains(&needle))
+        .count()
+}
+
+// covers UP-54: a warmed client stops when the first file loses read access, which changes
+// neither its time nor its size, and the fallback's token is not sent.
+#[tokio::test]
+async fn losing_read_access_stops_a_warmed_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, requests) = fake_api();
+    let (one, two) = (
+        config(&url, "    token: firsttoken\n"),
+        config(&url, "    token: secondtoken\n"),
+    );
+    let (server, first) = two_files(dir.path(), &url, &one, &two);
+    assert_reachable(&server).await;
+    assert_eq!(sent(&requests, "firsttoken"), 1);
+
+    std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&first).is_ok() {
+        return; // Running as a user that permissions don't apply to.
+    }
+    assert_every_tool_waits(&server, "secondtoken", dir.path()).await;
+    assert_eq!(requests.lock().unwrap().len(), 1, "nothing more was sent");
+}
+
+// covers UP-54: a higher-priority link whose target is gone holds back the lower file's token.
+#[tokio::test]
+async fn a_dangling_link_holds_back_the_lower_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, requests) = fake_api();
+    let two = config(&url, "    token: LOWERSECRET\n");
+    let (server, first) = two_files(dir.path(), &url, "", &two);
+    std::fs::remove_file(&first).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("unmounted"), &first).unwrap();
+
+    assert_every_tool_waits(&server, "LOWERSECRET", dir.path()).await;
+    assert!(requests.lock().unwrap().is_empty(), "nothing was sent");
+}
+
+// covers UP-54: a retry waiting out a 503 does not send a credential that stopped being the
+// confirmed one during the wait.
+#[tokio::test]
+async fn a_retry_rechecks_the_definition() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, requests) = fake_api_busy_once();
+    let (old, replacement) = (
+        config(&url, "    token: oldtoken\n"),
+        config(&url, "    token: newtoken\n"),
+    );
+    let (server, first) = two_files(dir.path(), &url, &old, &old);
+
+    let change = async {
+        while requests.lock().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        std::fs::write(&first, &replacement).unwrap();
+        assert!(server.context().await.is_ok_and(|c| c.paused.is_empty()));
+        std::fs::write(&first, "clusters: [not valid").unwrap();
+        assert!(
+            server
+                .context()
+                .await
+                .is_ok_and(|c| c.paused.contains("dev"))
+        );
+    };
+    let (listed, ()) = tokio::join!(server.do_list_clusters(), change);
+    let listed: Value = serde_json::from_str(&listed.unwrap()).unwrap();
+    assert_eq!(listed["clusters"][0]["reachable"], json!(false), "{listed}");
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert_eq!(sent(&requests, "oldtoken"), 1, "the retry was not sent");
+    assert_eq!(requests.lock().unwrap().len(), 1);
 }
 
 // covers UP-54: a credential command does not even run on a definition first seen behind an

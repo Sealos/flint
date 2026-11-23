@@ -1019,7 +1019,7 @@ impl FlintMcp {
             note.endpoint = info.server.clone();
         });
         if ctx.paused.contains(name) {
-            return Err(ToolError::new(policy::paused_cluster(name)));
+            return Err(ToolError::new(policy::PAUSED_CLUSTER));
         }
         let scope = policy::cluster_scope(&ctx.settings, info);
         let fingerprint = cluster::context_fingerprint(&ctx.kubeconfig.merged, &info.name)
@@ -1033,7 +1033,11 @@ impl FlintMcp {
             .get_or_try_init(|| async {
                 tokio::time::timeout(
                     TOOL_CONNECT_TIMEOUT,
-                    cluster::connect(&ctx.kubeconfig.merged, &info.name),
+                    cluster::connect_checked(
+                        &ctx.kubeconfig.merged,
+                        &info.name,
+                        self.send_check(name, fingerprint),
+                    ),
                 )
                 .await
                 .map_err(|_| ClusterError::timeout(TOOL_CONNECT_TIMEOUT, None))?
@@ -1047,6 +1051,31 @@ impl FlintMcp {
             fingerprint,
             target,
             scope,
+        })
+    }
+
+    /// What a client built for `name` at `fingerprint` asks before each attempt to send: a retry
+    /// can come after the definition it was built on stopped being the confirmed one. Holds the
+    /// server weakly, as the server keeps the client.
+    fn send_check(&self, name: &str, fingerprint: u64) -> cluster::SendCheck {
+        let inner = Arc::downgrade(&self.inner);
+        let name = name.to_owned();
+        cluster::SendCheck::new(move || {
+            let (inner, name) = (inner.clone(), name.clone());
+            Box::pin(async move {
+                let holds = tokio::task::spawn_blocking(move || {
+                    inner
+                        .upgrade()
+                        .is_some_and(|inner| inner.still_confirmed(&name, fingerprint))
+                })
+                .await
+                .unwrap_or(false);
+                if holds {
+                    Ok(())
+                } else {
+                    Err(policy::PAUSED_CLUSTER.to_owned())
+                }
+            })
         })
     }
 
@@ -1770,6 +1799,20 @@ impl Inner {
             });
         }
         (loaded, paused)
+    }
+
+    /// Whether `name` is still exposed, unpaused and defined as `fingerprint` says, by the files
+    /// as they are now. Anything that can't be read counts as no.
+    fn still_confirmed(&self, name: &str, fingerprint: u64) -> bool {
+        let Ok(settings) = settings::load_settings(&self.config_dir) else {
+            return false;
+        };
+        let paths =
+            kubeconfig::paths_for_settings(&self.kubeconfig_base, &settings, self.home.as_deref());
+        let (loaded, paused) = self.load_kubeconfig(&paths);
+        !paused.contains(name)
+            && policy::exposed_cluster(&settings, &loaded, name).is_ok()
+            && cluster::context_fingerprint(&loaded.merged, name) == Some(fingerprint)
     }
 
     /// The last parse, if it still stands for files stamped `stamps`.

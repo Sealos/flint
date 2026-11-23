@@ -340,14 +340,10 @@ pub fn exposed_cluster<'a>(
 }
 
 /// The refusal for a context paused while a kubeconfig file can't be read.
-pub fn paused_cluster(name: &str) -> String {
-    format!(
-        "cluster \"{name}\" is paused, waiting for its kubeconfig to be readable: one of the \
-         kubeconfig files can't be read, and this context may be defined differently until it \
-         can. Call list_clusters for kubeconfig_errors and ask the user to fix the file; the \
-         cluster comes back once it loads."
-    )
-}
+pub const PAUSED_CLUSTER: &str = "this cluster is paused, waiting for its kubeconfig to be \
+     readable: one of the kubeconfig files can't be read, and this context may be defined \
+     differently until it can. Call list_clusters for kubeconfig_errors and ask the user to fix \
+     the file; the cluster comes back once it loads.";
 
 /// Whether a caller may name a namespace or a container with `name`: a DNS-1123 label.
 pub fn is_label_name(name: &str) -> bool {
