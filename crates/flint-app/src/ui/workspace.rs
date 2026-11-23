@@ -34,6 +34,7 @@ use super::clusters::{
     ClustersModel, Presence, cluster_details, cluster_tooltip, connection_stopped, state_label,
 };
 use super::confirm::{self, DialogText};
+use super::connection_progress;
 use super::dashboard::{DashboardEvent, DashboardView};
 use super::detail::{
     DetailEvent, DetailTab, DetailView, ObjectRef, Opening, TakeFocus, protected_reason, refused,
@@ -410,6 +411,10 @@ impl Workspace {
                     let Some(cluster) = this.cluster.clone() else {
                         return;
                     };
+                    // The elapsed time and the retry countdown.
+                    if this.model.read(cx).can_cancel_connection() {
+                        cx.notify();
+                    }
                     let states = this.model.read(cx).core().sync_states(&cluster);
                     if this.nav.update(cx, |nav, cx| nav.set_states(states, cx)) {
                         cx.notify();
@@ -2573,6 +2578,11 @@ impl Workspace {
             .dashboard
             .as_ref()
             .filter(|_| !matches!(cluster.state, ConnectionState::Failed(_)));
+        let overview_notice = dashboard
+            .filter(|_| matches!(cluster.state, ConnectionState::Connecting))
+            .and_then(|_| {
+                connection_progress::connecting_notice(&cluster, model.active_progress(), theme)
+            });
         let content: AnyElement = match (&self.list, &cluster.state) {
             _ if dashboard.is_some() => div()
                 .flex_1()
@@ -2666,6 +2676,10 @@ impl Workspace {
                             .text_color(theme.muted_foreground)
                             .child(message.to_string()),
                     )
+                    .children(connection_progress::retry_notice(
+                        model.active_progress(),
+                        theme,
+                    ))
                     .child(
                         div().pt_2().child(
                             Button::new("connection-retry")
@@ -2676,12 +2690,11 @@ impl Workspace {
                         ),
                     ),
             ),
-            _ => centered(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child("Connecting…"),
-            ),
+            _ => centered(connection_progress::connecting(
+                &cluster,
+                model.active_progress(),
+                theme,
+            )),
         };
         v_flex()
             .flex_1()
@@ -2694,6 +2707,7 @@ impl Workspace {
                     .aria_label(text)
                     .test_support()
             }))
+            .children(overview_notice)
             .child(content)
             .into_any_element()
     }
