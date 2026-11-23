@@ -628,11 +628,26 @@ impl Workspace {
             self.refuse(refused(opening, &reason), cx);
             return;
         }
+        let member = match self.session_member(&request.cluster, cx) {
+            Ok(member) => member,
+            Err(why) => {
+                let opening = if request.previous {
+                    Opening::PreviousLogs
+                } else {
+                    Opening::Logs
+                };
+                self.refuse(refused(opening, &why), cx);
+                return;
+            }
+        };
         let core = self.model.read(cx).core().clone();
         let key = TabKey::Logs(request.clone());
         let cluster = self.tab_cluster(&key, cx);
-        let server = self.shown_server(&request.cluster, cx);
-        self.open_tab(
+        let server = match &member {
+            Some(member) => Some(member.server().to_owned()),
+            None => self.shown_server(&request.cluster, cx),
+        };
+        let id = self.open_tab(
             key,
             cluster,
             |window, cx| DockTab::Logs(cx.new(|cx| LogView::at(core, request, server, window, cx))),
@@ -640,6 +655,7 @@ impl Workspace {
             window,
             cx,
         );
+        self.sets.keep_tab_pin(id, member);
     }
 
     /// Opens (or shows) a dock tab. With `focus` it takes focus. Without, focus stays where it
@@ -653,11 +669,11 @@ impl Workspace {
         focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> u64 {
         self.clear_action_error(cx);
         let kept = (!focus).then(|| window.focused(cx)).flatten();
         let in_dock = kept.is_some() && self.dock.read(cx).has_focus(window, cx);
-        self.dock.update(cx, |dock, cx| {
+        let id = self.dock.update(cx, |dock, cx| {
             if in_dock {
                 dock.add(key, cluster, build, window, cx)
             } else {
@@ -668,12 +684,44 @@ impl Workspace {
             window.focus(&kept, cx);
         }
         cx.notify();
+        id
     }
 
     /// Starts tab `id`'s ended session again (Reconnect Logs, Restart Shell) in a new tab beside
-    /// it, keeping the ended one's output: on the server its context points at now, refused,
-    /// saying why, while the cluster is not connected.
+    /// it, keeping the ended one's output. A tab opened from a cluster set's row goes back only
+    /// to the server it was admitted on, once the core confirms the context never left it.
     fn restart_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(member) = self.sets.tab_pin(id).cloned() else {
+            self.restart_tab_on(id, None, window, cx);
+            return;
+        };
+        let Some(key) = self.dock.read(cx).tab(id).map(|t| t.item(cx).tab_key()) else {
+            return;
+        };
+        let opening = match &key {
+            TabKey::Logs(_) => Opening::ReconnectLogs,
+            TabKey::Shell(_) => Opening::RestartShell,
+            TabKey::Activity(_) => return,
+        };
+        let check = self.model.read(cx).core().check_member(&member);
+        self.sets.restart = cx.spawn_in(window, async move |this, cx| {
+            let changed = check.await;
+            let _ = this.update_in(cx, |ws, window, cx| match changed {
+                Some(why) => ws.refuse(refused(opening, &why), cx),
+                None => ws.restart_tab_on(id, Some(member), window, cx),
+            });
+        });
+    }
+
+    /// [`Self::restart_tab`] once checked: on `member`'s server if it has one, else on the server
+    /// its context points at now. Refused, saying why, while the cluster is not connected.
+    fn restart_tab_on(
+        &mut self,
+        id: u64,
+        member: Option<flint_core::handle::AdmittedMember>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(key) = self.dock.read(cx).tab(id).map(|t| t.item(cx).tab_key()) else {
             return;
         };
@@ -694,9 +742,12 @@ impl Workspace {
         }
         self.clear_action_error(cx);
         let cluster = self.tab_cluster(&key, cx);
-        let server = self.shown_server(key.context(), cx);
+        let server = match &member {
+            Some(member) => Some(member.server().to_owned()),
+            None => self.shown_server(key.context(), cx),
+        };
         let core = self.model.read(cx).core().clone();
-        self.dock.update(cx, |dock, cx| {
+        let opened = self.dock.update(cx, |dock, cx| {
             dock.open_beside(
                 id,
                 cluster,
@@ -716,6 +767,9 @@ impl Workspace {
                 cx,
             )
         });
+        if let Some(opened) = opened {
+            self.sets.keep_tab_pin(opened, member);
+        }
     }
 
     /// Says why Logs or Shell did not open, over the dock, for [`ACTION_ERROR_SHOWN`].
@@ -764,11 +818,21 @@ impl Workspace {
             self.refuse(refused(Opening::Shell, &protected_reason(&shown)), cx);
             return;
         }
+        let member = match self.session_member(&request.cluster, cx) {
+            Ok(member) => member,
+            Err(why) => {
+                self.refuse(refused(Opening::Shell, &why), cx);
+                return;
+            }
+        };
         let core = self.model.read(cx).core().clone();
         let key = TabKey::Shell(request.clone());
         let cluster = self.tab_cluster(&key, cx);
-        let server = self.shown_server(&request.cluster, cx);
-        self.open_tab(
+        let server = match &member {
+            Some(member) => Some(member.server().to_owned()),
+            None => self.shown_server(&request.cluster, cx),
+        };
+        let id = self.open_tab(
             key,
             cluster,
             |window, cx| {
@@ -779,6 +843,7 @@ impl Workspace {
             window,
             cx,
         );
+        self.sets.keep_tab_pin(id, member);
     }
 
     /// The cluster a session opened on `context` now runs on: the context and its server.
@@ -838,9 +903,13 @@ impl Workspace {
         let why = self.sessions_blocked(&cluster, cx);
         let protected = self.is_protected(&cluster, cx);
         let label = self.cluster_names(cx).exact(&cluster);
-        let server = self
-            .cluster_summary(&cluster, cx)
-            .and_then(|c| c.info.server.clone());
+        // A set's row stays on its admitted server, which the write gate then holds it to.
+        let server = match self.sets.member(&cluster) {
+            Some(member) => Some(member.server().to_owned()),
+            None => self
+                .cluster_summary(&cluster, cx)
+                .and_then(|c| c.info.server.clone()),
+        };
         detail.update(cx, |d, cx| {
             d.set_sessions_blocked(why, cx);
             d.set_protected(protected, label, cx);

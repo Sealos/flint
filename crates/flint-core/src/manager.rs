@@ -800,13 +800,28 @@ impl ClusterManager {
             } => {
                 let _ = reply.send(self.contexts.check(Pinned::Shell, &cluster, &pin));
             }
+            Request::AdmitRunningSet { pins, reply } => {
+                let _ = reply.send(self.admit_running_set(pins));
+            }
+            Request::CheckMember { member, reply } => {
+                let _ = reply.send(self.member_changed(&member));
+            }
+            Request::MemberClient { member, reply } => {
+                let _ = reply.send(self.member_client(&member));
+            }
             Request::FetchObject {
                 cluster,
                 kind,
                 namespace,
                 name,
+                member,
                 reply,
             } => {
+                // Before any client is taken: a row's read never reaches a replacement server.
+                if let Some(why) = member.as_ref().and_then(|m| self.member_changed(m)) {
+                    let _ = reply.send(Err(why));
+                    return;
+                }
                 let Some(client) = self.client(&cluster) else {
                     let _ = reply.send(Err(format!("\"{cluster}\" is not connected")));
                     return;
@@ -5519,6 +5534,65 @@ mod tests {
         assert!(running_set::needs_sign_in(&error));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!ran.exists(), "the command never started");
+    }
+
+    // A set is admitted whole or not at all, on the exact servers it was checked on.
+    #[tokio::test]
+    async fn a_stale_pin_admits_no_member_of_the_set() {
+        use crate::settings::ClusterPin;
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://remote-a")).await;
+        let other = ClusterPin::new("other", "https://other");
+        let refused = manager
+            .admit_running_set(vec![
+                other.clone(),
+                ClusterPin::new("dev", "https://replacement"),
+            ])
+            .unwrap_err();
+        assert!(refused.contains("another server"), "{refused}");
+        assert!(manager.members.is_empty(), "nobody joined");
+
+        let admitted = manager
+            .admit_running_set(vec![ClusterPin::new("dev", "https://remote-a"), other])
+            .unwrap();
+        assert_eq!(manager.members.len(), 2);
+        assert_eq!(admitted[0].server(), "https://remote-a");
+        assert_eq!(manager.member_changed(&admitted[0]), None);
+    }
+
+    // Moved and put back, a member's reads stay refused: it is not the connection admitted.
+    #[tokio::test]
+    async fn a_moved_member_is_refused_before_a_client_even_once_moved_back() {
+        use crate::settings::ClusterPin;
+        let dir = tempfile::tempdir().unwrap();
+        let original = kubeconfig_with("https://remote-a");
+        let mut manager = manager_reading(dir.path(), &original).await;
+        let admitted = manager
+            .admit_running_set(vec![
+                ClusterPin::new("dev", "https://remote-a"),
+                ClusterPin::new("other", "https://other"),
+            ])
+            .unwrap();
+        let dev = &admitted[0];
+        assert!(manager.member_client(dev).is_err(), "not connected yet");
+
+        rewrite(
+            &mut manager,
+            dir.path(),
+            &kubeconfig_with("https://replacement"),
+        )
+        .await;
+        let why = manager.member_changed(dev).expect("moved");
+        assert!(why.contains("changed"), "{why}");
+        assert_eq!(manager.member_client(dev).err(), Some(why));
+
+        rewrite(&mut manager, dir.path(), &original).await;
+        assert!(manager.member_changed(dev).is_some(), "moved back");
+        assert_eq!(
+            manager.member_changed(&admitted[1]),
+            None,
+            "other is intact"
+        );
     }
 
     // A reload that replaces the active member's credential on the same server binds the new

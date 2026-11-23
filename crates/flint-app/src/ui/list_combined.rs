@@ -35,8 +35,8 @@ use super::super::list_model::combined::{
 };
 use super::super::list_model::{self, CELL_PADDING, CHAR_WIDTH, ColumnWidths};
 use super::super::registry::{
-    self, CloseDetail, FocusFilter, FocusRows, SelectFirst, SelectFromFilter, SelectLast,
-    SelectNext, SelectPrev,
+    self, CloseDetail, FocusFilter, FocusRows, OpenSelectedRow, SelectFirst, SelectFromFilter,
+    SelectLast, SelectNext, SelectPrev,
 };
 use super::{CONTEXT, ROW_HEIGHT, limited_text, state_chip, tabular_figures};
 
@@ -96,6 +96,8 @@ pub struct CombinedObject {
 pub enum CombinedListEvent {
     /// A row was selected, with its own cluster, or the selection was cleared.
     Selected(Option<CombinedRowId>),
+    /// The selected row was asked for again (Enter, or another click): show its detail.
+    Reopened(CombinedRowId),
 }
 
 impl EventEmitter<CombinedListEvent> for CombinedResourceList {}
@@ -233,6 +235,7 @@ impl CombinedResourceList {
             .bind::<SelectFirst>(Self::on_first)
             .bind::<SelectLast>(Self::on_last)
             .bind::<CloseDetail>(Self::on_close)
+            .bind::<OpenSelectedRow>(Self::on_open_selected)
             .bind::<FocusFilter>(Self::on_focus_filter)
     }
 
@@ -478,8 +481,36 @@ impl CombinedResourceList {
             cluster: action.cluster.as_str().into(),
             uid: action.uid.as_str().into(),
         };
-        if let Some(line) = model::line_of(&self.shown.list, &self.view, &id) {
+        let Some(line) = model::line_of(&self.shown.list, &self.view, &id) else {
+            return;
+        };
+        if self.selected.as_ref() == Some(&id) {
+            window.focus(&self.focus, cx);
+            cx.emit(CombinedListEvent::Reopened(id));
+        } else {
             self.select_line(line, window, cx);
+        }
+    }
+
+    /// Enter on the rows: asks for the selected row again, by its cluster and uid. The key stays
+    /// with a control or dialog that has focus.
+    fn on_open_selected(
+        &mut self,
+        _: &OpenSelectedRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.focus.is_focused(window)
+            || gpui_kit::component::WindowExt::has_active_dialog(window, cx)
+        {
+            cx.propagate();
+            return;
+        }
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        if model::line_of(&self.shown.list, &self.view, &id).is_some() {
+            cx.emit(CombinedListEvent::Reopened(id));
         }
     }
 

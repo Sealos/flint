@@ -50,6 +50,7 @@ async fn open_both(cx: &mut TestAppContext, t: &TestWorkspace) {
     pick(cx, t, "kind-beta");
     t.dispatch(cx, "cluster_sets::OpenPickedClusters", Value::Null)
         .unwrap();
+    t.wait_for_element(cx, "cluster-set-view").await;
     let window = t.window;
     let workspace = t.workspace.clone();
     cx.update_window(window, |_, window, cx| {
@@ -344,6 +345,137 @@ async fn a_member_needing_sign_in_is_shown_and_its_row_closes(cx: &mut TestAppCo
     assert_eq!(detail_cluster(cx, &t), None, "no action stays on offer");
     let label = t.label(cx, "set-member-kind-beta").unwrap();
     assert!(label.ends_with("Sign-in needed"), "{label}");
+}
+
+#[gpui_kit::test]
+async fn a_member_that_changed_loses_its_rows_and_offers_no_action(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    connect(cx, &t, "kind-alpha");
+    connect(cx, &t, "kind-beta");
+    open_both(cx, &t).await;
+    select_row(cx, &t, "kind-beta");
+    assert_eq!(detail_cluster(cx, &t).as_deref(), Some("kind-beta"));
+    let header = t.label(cx, "detail-cluster").expect("the exact context");
+    assert!(header.contains("kind-beta"), "{header}");
+
+    let (workspace, window) = (t.workspace.clone(), t.window);
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| {
+            ws.discard_member("kind-beta", "kind-beta changed".into(), cx);
+            ws.check_set_row(cx);
+            // A snapshot still on its way is not taken for the member's rows.
+            ws.feed_member(pods_of("kind-beta", &[("default", "web", 3)]), window, cx);
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(detail_cluster(cx, &t), None, "its row closed");
+    let (rows, refused) = t.workspace.read_with(cx, |ws, cx| {
+        let run = ws.sets.running.as_ref().unwrap();
+        let beta = run.snapshots.iter().find(|s| s.cluster == "kind-beta");
+        (
+            beta.unwrap().rows.len(),
+            ws.session_member("kind-beta", cx).unwrap_err(),
+        )
+    });
+    assert_eq!(rows, 0);
+    assert!(refused.contains("changed"), "{refused}");
+    let label = t.label(cx, "set-member-kind-beta").unwrap();
+    assert!(label.ends_with("Changed"), "{label}");
+}
+
+#[gpui_kit::test]
+async fn a_row_tab_does_not_restart_once_its_context_moved(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    connect(cx, &t, "kind-alpha");
+    connect(cx, &t, "kind-beta");
+    open_both(cx, &t).await;
+    let (workspace, window) = (t.workspace.clone(), t.window);
+    let request = crate::ui::log_view::LogRequest {
+        cluster: "kind-beta".into(),
+        subject: flint_core::LogSubject::Pod(flint_core::LogTarget {
+            namespace: "default".into(),
+            pod: "web".into(),
+            container: None,
+        }),
+        previous: false,
+    };
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| ws.open_logs(request, true, window, cx))
+    })
+    .unwrap();
+    let (id, core) = t.workspace.read_with(cx, |ws, cx| {
+        let id = ws.dock.read(cx).tab_ids()[0];
+        assert!(ws.sets.tab_pin(id).is_some(), "the tab keeps the row's pin");
+        (id, ws.core(cx).clone())
+    });
+
+    std::fs::write(
+        dir.path().join("kubeconfig"),
+        kubeconfig_yaml(&[
+            ("kind-alpha", "https://127.0.0.1:1"),
+            ("kind-beta", "https://replacement.invalid"),
+        ]),
+    )
+    .unwrap();
+    core.reload_kubeconfig().await.unwrap();
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| ws.restart_tab(id, window, cx))
+    })
+    .unwrap();
+    let waiting = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        waiting.read(cx).action_error().is_some()
+    })
+    .await;
+    t.workspace.read_with(cx, |ws, cx| {
+        assert_eq!(ws.dock.read(cx).tab_ids(), vec![id], "nothing restarted");
+        let why = ws.action_error().unwrap();
+        assert!(why.contains("changed"), "{why}");
+    });
+}
+
+#[gpui_kit::test]
+async fn a_selected_row_comes_back_in_front_of_the_list(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    connect(cx, &t, "kind-alpha");
+    connect(cx, &t, "kind-beta");
+    open_both(cx, &t).await;
+    select_row(cx, &t, "kind-beta");
+    t.workspace.update(cx, |ws, _| ws.list_in_front = true);
+    select_row(cx, &t, "kind-beta");
+    cx.run_until_parked();
+    assert!(
+        t.workspace.read_with(cx, |ws, _| !ws.list_in_front),
+        "a repeated click reopens it"
+    );
+
+    t.workspace.update(cx, |ws, _| ws.list_in_front = true);
+    let (workspace, window) = (t.workspace.clone(), t.window);
+    cx.update_window(window, |_, window, cx| {
+        let list = workspace
+            .read(cx)
+            .sets
+            .running
+            .as_ref()
+            .unwrap()
+            .list
+            .clone();
+        let focus = list.read(cx).focus_handle().clone();
+        window.focus(&focus, cx);
+    })
+    .unwrap();
+    t.dispatch(cx, "resource_list::OpenSelectedRow", Value::Null)
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        t.workspace.read_with(cx, |ws, _| !ws.list_in_front),
+        "Enter reopens it"
+    );
+    assert_eq!(detail_cluster(cx, &t).as_deref(), Some("kind-beta"));
 }
 
 #[gpui_kit::test]

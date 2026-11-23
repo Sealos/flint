@@ -222,6 +222,8 @@ pub struct DetailView {
     protected: bool,
     /// What the protected reason calls the object's cluster, as the workspace says it.
     cluster_label: String,
+    /// For a row of a cluster set: the exact context, always shown as what the actions apply to.
+    row_cluster: Option<String>,
     /// The server the object's cluster shows, as the workspace says it: what an edit is for.
     server: Option<String>,
     /// What RBAC says about this object's actions, for showing them ([`access`]).
@@ -314,6 +316,7 @@ impl DetailView {
             sessions_blocked: None,
             protected: false,
             cluster_label,
+            row_cluster: None,
             server: None,
             access: object_access,
             edit: None,
@@ -357,6 +360,12 @@ impl DetailView {
             self.cluster_label = label;
             cx.notify();
         }
+    }
+
+    /// Names the exact context of a cluster set's row in the header, whatever the window's width.
+    pub(in crate::ui) fn set_row_cluster(&mut self, cluster: String, cx: &mut Context<Self>) {
+        self.row_cluster = Some(cluster);
+        cx.notify();
     }
 
     /// Says which server the object's cluster points at now.
@@ -720,6 +729,21 @@ impl DetailView {
                             .on_click(registry::on_click(Close)),
                     ),
             )
+            .when_some(self.row_cluster.clone(), |el, cluster| {
+                // Wrapped, never cut: near-identical contexts must read apart.
+                let text = format!("Logs, Shell and actions apply to {cluster}");
+                el.child(
+                    div()
+                        .id("detail-cluster")
+                        .px_3()
+                        .pb_1()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .aria_label(text.clone())
+                        .child(text)
+                        .test_support(),
+                )
+            })
             .children(self.render_managed_by(theme))
             .children(self.render_captions(theme))
             .child(

@@ -5,6 +5,7 @@
 //! the same path and write gate as a single-cluster row. Before a row opens, and whenever a
 //! member changes, [`member_refusal`] closes a row whose cluster cannot be acted on.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,9 +15,9 @@ use flint_core::cluster_sets::{
     load_cluster_sets,
 };
 use flint_core::combined::CombinedMember;
-use flint_core::handle::{MemberReport, MemberStatus};
+use flint_core::handle::{AdmittedMember, MemberReport, MemberStatus};
 use flint_core::settings::ClusterPin;
-use flint_core::{ClusterId, ClusterSummary, Command, KindId, KindSnapshot, NavEntry};
+use flint_core::{ClusterId, ClusterSummary, KindId, KindSnapshot, NavEntry, SyncState};
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
@@ -31,8 +32,8 @@ use super::super::list::combined::{CombinedListEvent, CombinedResourceList};
 use super::super::list_model::combined::CombinedSource;
 use super::super::registry::{
     self, ActionError, Bind, CloseClusterSet, CloseDetail, FocusFilter, Forward, Guards,
-    OpenClusterSet, OpenPickedClusters, SaveClusterSet, SelectFirst, SelectLast, SelectNext,
-    SelectPrev, ToggleClusterPicking, TogglePickedCluster,
+    OpenClusterSet, OpenPickedClusters, OpenSelectedRow, SaveClusterSet, SelectFirst, SelectLast,
+    SelectNext, SelectPrev, ToggleClusterPicking, TogglePickedCluster,
 };
 use super::{Workspace, takes_focus};
 
@@ -52,13 +53,22 @@ pub(super) struct ClusterSets {
     name_input: Entity<InputState>,
     error: Option<String>,
     pub(super) running: Option<RunningSet>,
+    /// The newest admission still waiting for the core's answer.
+    opening: Option<u64>,
+    next_opening: u64,
+    /// Tabs opened from a set's row, with the member they stay bound to after the set closes.
+    tab_pins: HashMap<u64, AdmittedMember>,
+    pub(super) restart: Task<()>,
+    _admit: Task<()>,
     _io: Task<()>,
 }
 
 /// The running set and its open combined list.
 pub(super) struct RunningSet {
     label: String,
-    pins: Vec<ClusterPin>,
+    members: Vec<AdmittedMember>,
+    /// Members that left their admitted server: their rows are gone and stay gone.
+    changed: HashSet<ClusterId>,
     kind: KindId,
     pub(super) list: Entity<CombinedResourceList>,
     snapshots: Vec<Arc<KindSnapshot>>,
@@ -80,6 +90,11 @@ impl ClusterSets {
             name_input: cx.new(|cx| InputState::new(window, cx).placeholder("Set name")),
             error: None,
             running: None,
+            opening: None,
+            next_opening: 0,
+            tab_pins: HashMap::new(),
+            restart: Task::ready(()),
+            _admit: Task::ready(()),
             _io: Task::ready(()),
         }
     }
@@ -88,14 +103,30 @@ impl ClusterSets {
         self.running.is_some()
     }
 
+    /// The open set's member for `cluster`, as the core admitted it.
+    pub(super) fn member(&self, cluster: &str) -> Option<&AdmittedMember> {
+        self.running
+            .as_ref()?
+            .members
+            .iter()
+            .find(|m| m.context() == cluster)
+    }
+
     /// Whether the open set has `cluster` as a member.
     pub(super) fn has_member(&self, cluster: Option<&str>) -> bool {
-        let Some(cluster) = cluster else {
-            return false;
-        };
-        self.running
-            .as_ref()
-            .is_some_and(|run| run.pins.iter().any(|pin| pin.context == cluster))
+        cluster.is_some_and(|cluster| self.member(cluster).is_some())
+    }
+
+    /// The member tab `id` was opened from, if it came from a set's row.
+    pub(super) fn tab_pin(&self, id: u64) -> Option<&AdmittedMember> {
+        self.tab_pins.get(&id)
+    }
+
+    /// Binds tab `id` to `member`. A tab that already has a pin keeps it.
+    pub(super) fn keep_tab_pin(&mut self, id: u64, member: Option<AdmittedMember>) {
+        if let Some(member) = member {
+            self.tab_pins.entry(id).or_insert(member);
+        }
     }
 
     pub(super) fn picking(&self) -> bool {
@@ -145,6 +176,17 @@ pub(super) fn member_refusal(
     }
 }
 
+/// `snapshot` holding no rows, in `state`: what a member shows before its rows are confirmed as
+/// its own, and after it left its server.
+fn without_rows(snapshot: &KindSnapshot, state: SyncState) -> Arc<KindSnapshot> {
+    Arc::new(KindSnapshot {
+        rows: Vec::new(),
+        state,
+        limited_to: None,
+        ..snapshot.clone()
+    })
+}
+
 /// What a member's status note says, when it has something to say.
 fn status_note(report: &MemberReport) -> Option<&'static str> {
     if report.paused {
@@ -171,6 +213,7 @@ impl Workspace {
             .when::<SelectFirst>(list_open)
             .when::<SelectLast>(list_open)
             .when::<CloseDetail>(list_open)
+            .when::<OpenSelectedRow>(list_open)
             .when::<CloseClusterSet>(|ws, _| ws.sets.is_open())
             .when::<OpenPickedClusters>(|ws, _| {
                 (MIN_CLUSTER_SET_MEMBERS..=MAX_CLUSTER_SET_MEMBERS).contains(&ws.sets.picked.len())
@@ -300,10 +343,7 @@ impl Workspace {
     fn open_picked(&mut self, _: &OpenPickedClusters, window: &mut Window, cx: &mut Context<Self>) {
         let pins = self.picked_pins(cx);
         let label = format!("{} clusters", pins.len());
-        if self.open_set(label, pins, window, cx) {
-            self.sets.picking = false;
-            self.sets.picked.clear();
-        }
+        self.open_set(label, pins, true, window, cx);
     }
 
     fn open_saved(&mut self, action: &OpenClusterSet, window: &mut Window, cx: &mut Context<Self>) {
@@ -311,7 +351,7 @@ impl Workspace {
             return;
         };
         let (label, pins) = (set.name.clone(), set.members.clone());
-        self.open_set(label, pins, window, cx);
+        self.open_set(label, pins, false, window, cx);
     }
 
     fn save_set(&mut self, action: &SaveClusterSet, window: &mut Window, cx: &mut Context<Self>) {
@@ -343,15 +383,17 @@ impl Workspace {
         });
     }
 
-    /// Runs `pins` as the set and opens their combined list. Every member must still be the
-    /// cluster it was pinned to: otherwise nothing starts and the sidebar says which.
+    /// Asks the core to run `pins` as the set, and opens their combined list once it has checked
+    /// every one. If any is no longer the cluster it was pinned to, nothing starts, whatever is
+    /// open stays, and the sidebar says which.
     fn open_set(
         &mut self,
         label: String,
         pins: Vec<ClusterPin>,
+        picked: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) {
         let names = self.cluster_names(cx);
         let refused = pins.iter().find_map(|pin| {
             let summary = self.cluster_summary(&pin.context, cx);
@@ -360,44 +402,104 @@ impl Workspace {
         if let Some(why) = refused {
             self.sets.error = Some(why);
             cx.notify();
-            return false;
+            return;
         }
         self.sets.error = None;
-        // Leaves any set or list open now.
-        self.close_list(cx);
-        let ids: Vec<ClusterId> = pins.iter().map(|p| p.context.clone()).collect();
-        self.model.read(cx).core().send(Command::SetRunningSet(ids));
-        self.show_set(label, pins, KindId::pods(), "Pods".to_owned(), window, cx);
-        true
+        let token = self.sets.next_opening;
+        self.sets.next_opening += 1;
+        self.sets.opening = Some(token);
+        let admit = self.model.read(cx).core().admit_running_set(pins);
+        self.sets._admit = cx.spawn_in(window, async move |this, cx| {
+            let admitted = admit.await;
+            let _ = this.update_in(cx, |ws, window, cx| {
+                ws.finish_open(token, label, picked, admitted, window, cx)
+            });
+        });
     }
 
-    /// Opens the combined list of `kind` over `pins`, feeding it from the core.
+    fn finish_open(
+        &mut self,
+        token: u64,
+        label: String,
+        picked: bool,
+        admitted: Result<Vec<AdmittedMember>, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sets.opening != Some(token) {
+            // Closed while the core was admitting it, and nothing newer is on its way.
+            if self.sets.opening.is_none() && !self.sets.is_open() && admitted.is_ok() {
+                drop(self.model.read(cx).core().admit_running_set(Vec::new()));
+            }
+            return;
+        }
+        self.sets.opening = None;
+        let members = match admitted {
+            Ok(members) => members,
+            Err(why) => {
+                self.sets.error = Some(why);
+                cx.notify();
+                return;
+            }
+        };
+        if picked {
+            self.sets.picking = false;
+            self.sets.picked.clear();
+        }
+        // The core already runs the new set: closing what was open must not clear it.
+        self.sets.running = None;
+        self.close_list(cx);
+        self.show_set(
+            label,
+            members,
+            KindId::pods(),
+            "Pods".to_owned(),
+            window,
+            cx,
+        );
+    }
+
+    /// Opens the combined list of `kind` over `members`, feeding it from the core. Rows appear
+    /// only once the core confirms, after they were read, that their member is still admitted.
     fn show_set(
         &mut self,
         label: String,
-        pins: Vec<ClusterPin>,
+        members: Vec<AdmittedMember>,
         kind: KindId,
         kind_label: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let core = self.model.read(cx).core().clone();
-        let mut subscriptions: Vec<_> = pins
+        let subscriptions: Vec<_> = members
             .iter()
-            .map(|pin| core.subscribe(&pin.context, &kind))
+            .map(|member| core.subscribe(member.context(), &kind))
             .collect();
-        let snapshots: Vec<Arc<KindSnapshot>> =
-            subscriptions.iter_mut().map(|s| s.latest()).collect();
+        let snapshots: Vec<Arc<KindSnapshot>> = subscriptions
+            .iter()
+            .map(|s| without_rows(&s.peek(), SyncState::Loading))
+            .collect();
         let source = self.combined_source(&snapshots, cx);
         let title = format!("{kind_label} · {label}");
         let list = cx.new(|cx| CombinedResourceList::new(title, source, Vec::new(), window, cx));
         let events = cx.subscribe_in(&list, window, Self::on_combined_event);
         let feeds = subscriptions
             .into_iter()
-            .map(|mut subscription| {
+            .zip(members.clone())
+            .map(|(mut subscription, member)| {
+                let core = core.clone();
                 cx.spawn_in(window, async move |this, cx| {
                     while subscription.changed().await {
                         let snapshot = subscription.latest();
+                        // After the read: rows of a replacement server can only exist once the
+                        // core has recorded the move, so this check sees it.
+                        if let Some(why) = core.check_member(&member).await {
+                            let _ = this.update(cx, |ws, cx| {
+                                ws.discard_member(member.context(), why, cx);
+                                ws.check_set_row(cx);
+                            });
+                            break;
+                        }
                         let alive = this
                             .update_in(cx, |ws, window, cx| ws.feed_member(snapshot, window, cx));
                         if alive.is_err() {
@@ -426,7 +528,8 @@ impl Workspace {
             .update(cx, |nav, cx| nav.set_selected(Some(kind.clone()), cx));
         self.sets.running = Some(RunningSet {
             label,
-            pins,
+            members,
+            changed: HashSet::new(),
             kind,
             list,
             snapshots,
@@ -457,16 +560,20 @@ impl Workspace {
             window.focus(&focus, cx);
             return true;
         }
-        let (label, pins) = (run.label.clone(), run.pins.clone());
+        let (label, members, changed) =
+            (run.label.clone(), run.members.clone(), run.changed.clone());
         self.close_set_detail(cx);
         self.show_set(
             label,
-            pins,
+            members,
             entry.id.clone(),
             entry.label.clone(),
             window,
             cx,
         );
+        if let Some(run) = &mut self.sets.running {
+            run.changed = changed;
+        }
         true
     }
 
@@ -501,7 +608,7 @@ impl Workspace {
         let Some(run) = &mut self.sets.running else {
             return;
         };
-        if snapshot.kind != run.kind {
+        if snapshot.kind != run.kind || run.changed.contains(&snapshot.cluster) {
             return;
         }
         let Some(at) = run
@@ -530,6 +637,21 @@ impl Workspace {
             }
         }
         self.rebuild_combined(cx);
+    }
+
+    /// Drops `cluster`'s rows for good: it left the server it was admitted on. Says why once.
+    pub(super) fn discard_member(&mut self, cluster: &str, why: String, cx: &mut Context<Self>) {
+        let Some(run) = &mut self.sets.running else {
+            return;
+        };
+        if !run.changed.insert(cluster.to_owned()) {
+            return;
+        }
+        if let Some(at) = run.snapshots.iter().position(|s| s.cluster == cluster) {
+            run.snapshots[at] = without_rows(&run.snapshots[at], SyncState::Idle);
+        }
+        self.rebuild_combined(cx);
+        self.refuse(why, cx);
     }
 
     /// Merges the members off the UI thread; changes during a merge are merged once after it.
@@ -587,11 +709,71 @@ impl Workspace {
         let names = self.cluster_names(cx);
         let shown = names.exact(cluster);
         let run = self.sets.running.as_ref()?;
-        let Some(pin) = run.pins.iter().find(|p| p.context == cluster) else {
+        let Some(member) = run.members.iter().find(|m| m.context() == cluster) else {
             return Some(format!("{shown} is not in this set"));
         };
+        if run.changed.contains(cluster) {
+            return Some(format!(
+                "{shown} changed since this set opened. Open the set again."
+            ));
+        }
         let report = run.reports.iter().find(|r| r.cluster == cluster);
-        member_refusal(pin, self.cluster_summary(cluster, cx), report, &shown)
+        member_refusal(
+            member.pin(),
+            self.cluster_summary(cluster, cx),
+            report,
+            &shown,
+        )
+    }
+
+    /// The member a new session on `cluster` is bound to while a set has it, or why none may
+    /// open. Outside a set, or for another cluster, sessions follow the context as usual.
+    pub(super) fn session_member(
+        &self,
+        cluster: &str,
+        cx: &App,
+    ) -> Result<Option<AdmittedMember>, String> {
+        let Some(member) = self.sets.member(cluster) else {
+            return Ok(None);
+        };
+        match self.set_row_refusal(cluster, cx) {
+            Some(why) => Err(why),
+            None => Ok(Some(member.clone())),
+        }
+    }
+
+    /// Discards the rows of members that no longer show their admitted server.
+    fn sweep_set_members(&mut self, cx: &mut Context<Self>) {
+        let Some(run) = &self.sets.running else {
+            return;
+        };
+        let names = self.cluster_names(cx);
+        let left: Vec<(ClusterId, String)> = run
+            .members
+            .iter()
+            .filter(|m| !run.changed.contains(m.context()))
+            .filter_map(|m| {
+                let summary = self.cluster_summary(m.context(), cx);
+                let on_pin = summary.is_some_and(|c| {
+                    m.same_endpoint(c)
+                        && c.info
+                            .server
+                            .as_deref()
+                            .is_some_and(|server| m.pin().matches(m.context(), server))
+                });
+                if on_pin {
+                    return None;
+                }
+                let shown = names.exact(m.context());
+                let why = member_refusal(m.pin(), summary, None, &shown).unwrap_or_else(|| {
+                    format!("{shown} changed since this set opened. Open the set again.")
+                });
+                Some((m.context().to_owned(), why))
+            })
+            .collect();
+        for (cluster, why) in left {
+            self.discard_member(&cluster, why, cx);
+        }
     }
 
     /// Closes the open row if its cluster can no longer be acted on, saying why. The write gate
@@ -600,6 +782,7 @@ impl Workspace {
         if !self.sets.is_open() {
             return;
         }
+        self.sweep_set_members(cx);
         let Some(detail) = &self.detail else {
             return;
         };
@@ -625,8 +808,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let CombinedListEvent::Selected(selected) = event;
-        if selected.is_none() {
+        let cleared = matches!(event, CombinedListEvent::Selected(None));
+        if cleared {
             self.clear_action_error(cx);
             self.detail = None;
             self._detail_subscriptions.clear();
@@ -634,6 +817,12 @@ impl Workspace {
             window.focus(&focus, cx);
             release_unfocused_input(window, cx);
             cx.notify();
+            return;
+        }
+        // Only the very row asked for, by cluster and uid: the selection may have moved since.
+        if let CombinedListEvent::Reopened(id) = event
+            && list.read(cx).selected() != Some(id)
+        {
             return;
         }
         let Some(row) = list.read(cx).selected_object() else {
@@ -645,6 +834,14 @@ impl Workspace {
             return;
         }
         let Some(run) = &self.sets.running else {
+            return;
+        };
+        let Some(member) = run
+            .members
+            .iter()
+            .find(|m| m.context() == row.cluster)
+            .cloned()
+        else {
             return;
         };
         let object = ObjectRef {
@@ -660,6 +857,10 @@ impl Workspace {
             .as_ref()
             .is_some_and(|d| *d.read(cx).object() == object)
         {
+            // Asked for again: a narrow window brings it back in front of the list.
+            self.list_in_front = false;
+            release_unfocused_input(window, cx);
+            cx.notify();
             return;
         }
         let tab = self
@@ -667,8 +868,14 @@ impl Workspace {
             .as_ref()
             .map_or(DetailTab::Overview, |d| d.read(cx).tab());
         self.clear_action_error(cx);
-        let core = self.model.read(cx).core().clone();
-        let detail = cx.new(|cx| DetailView::new(core, object, tab, window, cx));
+        let shown = self.cluster_names(cx).exact(member.context());
+        // Every read this view makes is bound to the member, in the core.
+        let core = self.model.read(cx).core().bound_to(member);
+        let detail = cx.new(|cx| {
+            let mut view = DetailView::new(core, object, tab, window, cx);
+            view.set_row_cluster(shown, cx);
+            view
+        });
         let list = list.downgrade();
         self._detail_subscriptions = vec![cx.subscribe_in(
             &detail,
@@ -706,11 +913,10 @@ impl Workspace {
 
     /// Stops the running set, if one is open. Called wherever the list closes.
     pub(super) fn leave_set(&mut self, cx: &mut Context<Self>) {
+        self.sets.opening = None;
         if self.sets.running.take().is_some() {
-            self.model
-                .read(cx)
-                .core()
-                .send(Command::SetRunningSet(Vec::new()));
+            // Through the same queue as admissions, so it can't overtake a later one.
+            drop(self.model.read(cx).core().admit_running_set(Vec::new()));
         }
     }
 
@@ -784,19 +990,23 @@ impl Workspace {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(run.label.clone()),
             )
-            .children(run.pins.iter().map(|pin| {
-                let shown = names.exact(&pin.context);
-                let note = run
-                    .reports
-                    .iter()
-                    .find(|r| r.cluster == pin.context)
-                    .and_then(status_note);
+            .children(run.members.iter().map(|member| {
+                let context = member.context();
+                let shown = names.exact(context);
+                let note = if run.changed.contains(context) {
+                    Some("Changed")
+                } else {
+                    run.reports
+                        .iter()
+                        .find(|r| r.cluster == context)
+                        .and_then(status_note)
+                };
                 let text = match note {
                     Some(note) => format!("{shown}: {note}"),
                     None => shown,
                 };
                 div()
-                    .id(SharedString::from(format!("set-member-{}", pin.context)))
+                    .id(SharedString::from(format!("set-member-{context}")))
                     .aria_label(text.clone())
                     .when(note.is_some(), |el| el.text_color(theme.warning))
                     .child(text)
