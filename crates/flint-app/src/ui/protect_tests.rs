@@ -274,7 +274,7 @@ async fn the_row_menu_unlock_entry_asks_before_unlocking(cx: &mut TestAppContext
     });
     assert_eq!(
         shell,
-        Err("kind-alpha is protected (read-only in Flint) until you unlock it".to_owned())
+        Err("main (kind-alpha) is protected (read-only in Flint) until you unlock it".to_owned())
     );
 
     right_click(cx, &t, "web").await;

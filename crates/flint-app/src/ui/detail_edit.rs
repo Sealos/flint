@@ -190,7 +190,7 @@ impl DetailView {
             return Some(why.clone());
         }
         if self.protected {
-            return Some(protected_reason(&self.object.cluster));
+            return Some(protected_reason(&self.cluster_label));
         }
         // An edit under way keeps its text and its buttons: the server answers its review.
         if self.edit.is_none()

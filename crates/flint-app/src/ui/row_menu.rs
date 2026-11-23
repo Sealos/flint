@@ -33,8 +33,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
 use super::detail::{
-    Opening, PROTECTED_NOTE, ShellPod, Subject, log_item, protected_reason, reason, refused,
-    shell_item,
+    Opening, PROTECTED_NOTE, ShellPod, Subject, log_item, reason, refused, shell_item,
 };
 use super::list::ResourceList;
 use super::menu_fit::{
@@ -194,6 +193,8 @@ pub struct RowActions {
     /// For pods only.
     pub previous: Option<Availability>,
     pub shell: Availability,
+    /// Shell is refused because the cluster is protected: the menu shortens its reason on this.
+    pub shell_protected: bool,
     /// The pod a shell opens in, its app containers, and the default one, as far as known.
     pub shell_pod: Option<ShellPod>,
     /// The Shell entry is a container picker: the pod has several containers and one of them
@@ -214,6 +215,8 @@ pub struct RowActions {
 pub struct WriteEntry {
     pub action: ResourceAction,
     pub can: Availability,
+    /// It is refused because the cluster is protected: the menu shortens its reason on this.
+    pub protected: bool,
 }
 
 /// The Unlock entry of a protected cluster's row menu.
@@ -239,10 +242,13 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
     let subject = detail.subject();
     let writes: Vec<WriteEntry> = resource_actions::offered(ws, detail, cx)
         .into_iter()
-        .map(|action| WriteEntry {
-            action,
-            can: resource_actions::available(ws, action, cx)
-                .map_err(|why| first_line(&why, MAX_REASON)),
+        .map(|action| {
+            let checked = resource_actions::check(ws, action, cx);
+            WriteEntry {
+                action,
+                protected: checked.as_ref().is_err_and(|refusal| refusal.protected),
+                can: checked.map_err(|refusal| first_line(&refusal.why, MAX_REASON)),
+            }
         })
         .collect();
     if subject == Subject::Other && writes.is_empty() {
@@ -259,6 +265,7 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
         previous: (subject == Subject::Pod)
             .then(|| gate(detail.log_plan::<OpenPreviousLogs>(None, true).map(drop))),
         shell: gate(detail.shell_check::<OpenShell>(None)),
+        shell_protected: blocked.is_none() && detail.shell_protected(),
         shell_pod: detail.shell_pod(),
         shell_picker: detail.shell_picker().is_some(),
         log_containers: match subject {
@@ -287,9 +294,7 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
 /// state) keeps [`RowActions::shell`], which names it.
 fn shell_in_menu(a: &RowActions) -> Availability {
     match (&a.shell, &a.unlock) {
-        (Err(why), Some(unlock)) if *why == protected_reason(&unlock.cluster) => {
-            Err(PROTECTED_NOTE.to_owned())
-        }
+        (Err(_), Some(_)) if a.shell_protected => Err(PROTECTED_NOTE.to_owned()),
         (shell, _) => shell.clone(),
     }
 }
@@ -298,9 +303,7 @@ fn shell_in_menu(a: &RowActions) -> Availability {
 /// as for Shell.
 fn write_in_menu(a: &RowActions, write: &WriteEntry) -> Availability {
     match (&write.can, &a.unlock) {
-        (Err(why), Some(unlock)) if *why == protected_reason(&unlock.cluster) => {
-            Err(PROTECTED_NOTE.to_owned())
-        }
+        (Err(_), Some(_)) if write.protected => Err(PROTECTED_NOTE.to_owned()),
         (can, _) => can.clone(),
     }
 }
@@ -754,9 +757,9 @@ pub(in crate::ui) mod tests {
 
     use super::{
         MAX_REASON, PROTECTED_NOTE, RowActions, SHELL_POD_NAME, UnlockEntry, WriteEntry,
-        menu_state, protected_once, protected_reason, shell_entry_label_within, unlock_tip,
+        menu_state, protected_once, shell_entry_label_within, unlock_tip,
     };
-    use crate::ui::detail::{ShellPod, Subject};
+    use crate::ui::detail::{ShellPod, Subject, protected_reason};
     use crate::ui::object::PodContainer;
 
     fn container(name: &str, default: bool, has_previous: bool) -> PodContainer {
@@ -776,6 +779,7 @@ pub(in crate::ui) mod tests {
             logs: Ok(()),
             previous: Some(Err("No container has restarted.".into())),
             shell: Ok(()),
+            shell_protected: false,
             shell_pod: None,
             shell_picker: false,
             log_containers: vec![container("app", true, false)],
@@ -873,6 +877,7 @@ pub(in crate::ui) mod tests {
         let why = PROTECTED_NOTE.to_owned();
         let protected = RowActions {
             shell: Err(protected_reason("alpha")),
+            shell_protected: true,
             unlock: Some(UnlockEntry {
                 cluster: "alpha".into(),
                 name: "alpha".into(),
@@ -900,11 +905,13 @@ pub(in crate::ui) mod tests {
             subject: Subject::Workload(WorkloadKind::Deployment),
             previous: None,
             shell: Err(why.clone()),
+            shell_protected: true,
             writes: [ResourceAction::Scale, ResourceAction::Delete]
                 .into_iter()
                 .map(|action| WriteEntry {
                     action,
                     can: Err(why.clone()),
+                    protected: true,
                 })
                 .collect(),
             unlock: Some(UnlockEntry {
@@ -915,6 +922,36 @@ pub(in crate::ui) mod tests {
             ..pod_actions()
         };
         assert!(protected_once(&protected));
+
+        // The decision, not the words: a label the reason was not built from still shortens,
+        // and a refusal that only reads like protection stays as it is.
+        let relabelled = RowActions {
+            shell: Err(protected_reason("eu-west-1 · alpha")),
+            writes: vec![WriteEntry {
+                action: ResourceAction::Scale,
+                can: Err(protected_reason("eu-west-1 · alpha")),
+                protected: true,
+            }],
+            ..protected.clone()
+        };
+        assert_eq!(
+            state(&relabelled)["entries"][1]["reason"],
+            json!(PROTECTED_NOTE)
+        );
+        assert!(protected_once(&relabelled));
+        let other = RowActions {
+            shell: Err(why.clone()),
+            shell_protected: false,
+            writes: vec![WriteEntry {
+                action: ResourceAction::Scale,
+                can: Err(why.clone()),
+                protected: false,
+            }],
+            ..protected.clone()
+        };
+        assert_eq!(state(&other)["entries"][1]["reason"], json!(why));
+        assert!(!protected_once(&other));
+
         let note = PROTECTED_NOTE;
         assert_eq!(
             state(&protected)["entries"].as_array().unwrap()[1..],

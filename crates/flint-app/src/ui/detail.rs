@@ -220,6 +220,8 @@ pub struct DetailView {
     /// The object's cluster is protected (ADR-0015), as the workspace says it: Shell is
     /// disabled, saying so, with Unlock beside it. Logs and browsing are not affected.
     protected: bool,
+    /// What the protected reason calls the object's cluster, as the workspace says it.
+    cluster_label: String,
     /// The server the object's cluster shows, as the workspace says it: what an edit is for.
     server: Option<String>,
     /// What RBAC says about this object's actions, for showing them ([`access`]).
@@ -279,6 +281,7 @@ impl DetailView {
             &object.name,
             subject,
         );
+        let cluster_label = flint_core::display::single_line(&object.cluster);
         let mut view = DetailView {
             core,
             object,
@@ -310,6 +313,7 @@ impl DetailView {
             pending: None,
             sessions_blocked: None,
             protected: false,
+            cluster_label,
             server: None,
             access: object_access,
             edit: None,
@@ -341,10 +345,16 @@ impl DetailView {
         }
     }
 
-    /// Says whether the object's cluster is protected (ADR-0015).
-    pub(in crate::ui) fn set_protected(&mut self, protected: bool, cx: &mut Context<Self>) {
-        if self.protected != protected {
+    /// Says whether the object's cluster is protected (ADR-0015), and what its reason calls it.
+    pub(in crate::ui) fn set_protected(
+        &mut self,
+        protected: bool,
+        label: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.protected != protected || self.cluster_label != label {
             self.protected = protected;
+            self.cluster_label = label;
             cx.notify();
         }
     }
@@ -863,7 +873,7 @@ impl DetailView {
         }
         if self.protected {
             // Disabled, saying why, with the unlock in place (UP-54).
-            let why = protected_reason(&self.object.cluster);
+            let why = protected_reason(&self.cluster_label);
             return Some(
                 h_flex()
                     .gap_1()
@@ -1009,7 +1019,7 @@ impl DetailView {
                 .map(|why| refused(Opening::Logs, &why))
                 .into_iter()
                 .chain(shell.map(|why| {
-                    if why == protected_reason(&self.object.cluster) {
+                    if self.shell_protected() {
                         actions::PROTECTED_CAPTION.to_owned()
                     } else {
                         refused(Opening::Shell, &why)

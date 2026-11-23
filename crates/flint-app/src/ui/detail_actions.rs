@@ -112,12 +112,11 @@ impl Opening {
 
 /// Why Shell (and, later, any action that changes the cluster) cannot run on a protected
 /// cluster (ADR-0015), as the refusals, tooltips and menus say it.
-pub(in crate::ui) fn protected_reason(cluster: &str) -> String {
-    // The real name, never a custom one: it says which cluster is protected.
-    format!(
-        "{} is protected (read-only in Flint) until you unlock it",
-        flint_core::display::short_name(cluster)
-    )
+/// `shown` is the cluster's [`ClusterNames::exact`](flint_core::display::ClusterNames::exact)
+/// label, which keeps its real name and tells it from its siblings. Only for display: what is
+/// protected is decided elsewhere, and nothing compares this text.
+pub(in crate::ui) fn protected_reason(shown: &str) -> String {
+    format!("{shown} is protected (read-only in Flint) until you unlock it")
 }
 
 /// [`protected_reason`] where the Unlock entry right after it names the cluster.
@@ -419,6 +418,12 @@ impl DetailView {
         }
     }
 
+    /// Whether [`Self::shell_check`] refuses because the cluster is protected: the decision the
+    /// menu and captions shorten their text on.
+    pub(in crate::ui) fn shell_protected(&self) -> bool {
+        !self.gone && self.protected && self.subject != Subject::Other
+    }
+
     /// Whether [`OpenShell`] (no container) or [`OpenContainerShell`] (a container) can be
     /// asked for now, as far as known: what the guards, the row menu and the pane's button
     /// show. Asked for while the object or a workload's pods are not known yet, it waits.
@@ -432,9 +437,9 @@ impl DetailView {
                 self.object.name
             )));
         }
-        if self.protected && self.subject != Subject::Other {
+        if self.shell_protected() {
             return Err(ActionError::rejected::<A>(protected_reason(
-                &self.object.cluster,
+                &self.cluster_label,
             )));
         }
         if self.subject != Subject::Other
