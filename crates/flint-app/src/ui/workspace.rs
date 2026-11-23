@@ -1096,6 +1096,11 @@ impl Workspace {
         self.dashboard.as_ref().map(|(view, _)| view.clone())
     }
 
+    #[cfg(test)]
+    pub(in crate::ui) fn saved_namespace_filter(&self, cluster: &str) -> Vec<String> {
+        self.ui_state.namespace_filter(cluster).to_vec()
+    }
+
     /// Shows the active cluster's overview in place of its list. Go Back returns to the list.
     fn open_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(cluster) = self.cluster.clone() else {
@@ -1133,8 +1138,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let DashboardEvent::OpenFilteredList(category) = *event;
-        let Some(problems) = view.read(cx).problem_list(category).cloned() else {
+        let problems = match *event {
+            DashboardEvent::OpenFilteredList(category) => view.read(cx).problem_list(category),
+            DashboardEvent::OpenShortWorkloads(kind) => view.read(cx).short_workloads(kind),
+        };
+        let Some(problems) = problems.cloned() else {
             return;
         };
         let Some(entry) = self.nav_entry(problems.kind, cx) else {
@@ -1145,9 +1153,7 @@ impl Workspace {
             return;
         };
         self.open_kind(&entry, window, cx);
-        if let Some(list) = &self.list
-            && !problems.filter.keys.is_empty()
-        {
+        if let Some(list) = &self.list {
             list.update(cx, |list, cx| list.show_only(Some(problems.filter), cx));
         }
     }

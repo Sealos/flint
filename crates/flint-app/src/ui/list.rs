@@ -91,15 +91,52 @@ struct Query {
 pub struct ObjectFilter {
     /// What the objects are, for the notice: `failing pods`.
     pub label: String,
-    /// By [`object_key`].
-    pub keys: Arc<std::collections::HashSet<String>>,
+    pub objects: Arc<CountedObjects>,
 }
 
-/// How an [`ObjectFilter`] names an object. A Kubernetes name holds no `/`.
-pub fn object_key(namespace: Option<&str>, name: &str) -> String {
-    match namespace {
-        Some(namespace) => format!("{namespace}/{name}"),
-        None => name.to_owned(),
+/// The objects a count was made of. An object is matched by UID, so one replaced under the same
+/// name is not it; only an object that reported no UID is matched by name.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CountedObjects {
+    uids: std::collections::HashSet<String>,
+    /// `namespace/name`, or `name` when cluster-scoped. A Kubernetes name holds no `/`.
+    without_uid: std::collections::HashSet<String>,
+    /// Sorted. Empty when no object is namespaced.
+    namespaces: Vec<String>,
+}
+
+impl CountedObjects {
+    pub fn insert(&mut self, namespace: Option<&str>, name: &str, uid: Option<&str>) {
+        match uid.filter(|uid| !uid.is_empty()) {
+            Some(uid) => {
+                self.uids.insert(uid.to_owned());
+            }
+            None => {
+                self.without_uid.insert(Self::key(namespace, name));
+            }
+        }
+        if let Some(namespace) = namespace
+            && let Err(at) = self
+                .namespaces
+                .binary_search_by(|n| n.as_str().cmp(namespace))
+        {
+            self.namespaces.insert(at, namespace.to_owned());
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.uids.len() + self.without_uid.len()
+    }
+
+    fn matches(&self, namespace: Option<&str>, name: &str, uid: &str) -> bool {
+        self.uids.contains(uid) || self.without_uid.contains(&Self::key(namespace, name))
+    }
+
+    fn key(namespace: Option<&str>, name: &str) -> String {
+        match namespace {
+            Some(namespace) => format!("{namespace}/{name}"),
+            None => name.to_owned(),
+        }
     }
 }
 
@@ -437,9 +474,19 @@ impl ResourceList {
         self.query.only.as_ref()
     }
 
+    /// The namespaces shown: a narrowed list covers its objects, whatever the picker holds.
+    fn scope(&self) -> &[String] {
+        match &self.query.only {
+            Some(only) => &only.objects.namespaces,
+            None => &self.query.namespaces,
+        }
+    }
+
     pub fn set_namespaces(&mut self, namespaces: Vec<String>, cx: &mut Context<Self>) {
         if self.query.namespaces != namespaces {
             self.query.namespaces = namespaces;
+            // Choosing namespaces asks for those, so the narrowing ends.
+            self.query.only = None;
             self.remeasure = true;
             self.recompute(cx);
         }
@@ -592,8 +639,9 @@ impl ResourceList {
         self.dirty = false;
         let snapshot = self.latest.clone();
         let job_text = self.query.text.clone();
+        let namespaces = self.scope().to_vec();
         let query = ViewQuery {
-            namespaces: self.query.namespaces.clone(),
+            namespaces: namespaces.clone(),
             text: self.query.text.clone(),
             sort: list_model::resolve_sort(
                 &snapshot.columns,
@@ -606,10 +654,9 @@ impl ResourceList {
         let view = self.core.compute_view(snapshot.clone(), query);
         let selected_uid = self.selected.as_ref().map(|s| s.uid.clone());
         let restart = std::mem::take(&mut self.remeasure);
-        let namespaces = self.query.namespaces.clone();
         let one_namespace = namespaces.len() == 1;
         let job_snapshot = snapshot.clone();
-        let only = self.query.only.as_ref().map(|only| only.keys.clone());
+        let only = self.query.only.as_ref().map(|only| only.objects.clone());
         let job_only = only.clone();
         #[cfg(test)]
         let gate = self.compute_gate.clone();
@@ -620,12 +667,12 @@ impl ResourceList {
             }
             let rows = view.await;
             let rows: Arc<[u32]> = match &job_only {
-                Some(keys) => rows
+                Some(objects) => rows
                     .iter()
                     .copied()
                     .filter(|&i| {
                         let row = &job_snapshot.rows[i as usize];
-                        keys.contains(&object_key(row.namespace.as_deref(), &row.name))
+                        objects.matches(row.namespace.as_deref(), &row.name, &row.uid)
                     })
                     .collect(),
                 None => rows,
@@ -655,7 +702,7 @@ impl ResourceList {
                     list.query.sort.as_ref(),
                     &list.sortable_in(&snapshot.columns),
                 );
-                let only_now = list.query.only.as_ref().map(|only| &only.keys);
+                let only_now = list.query.only.as_ref().map(|only| &only.objects);
                 if now != job_sort
                     || only_now != only.as_ref()
                     || (list.restoring_filter && job_text != list.query.text)
@@ -1218,7 +1265,7 @@ impl ResourceList {
     /// namespaces, with the cluster's total in its tooltip.
     pub fn row_count(&self) -> list_model::RowCount {
         let namespaces: &[String] = if self.shown.namespaced {
-            &self.query.namespaces
+            self.scope()
         } else {
             &[]
         };
@@ -1329,6 +1376,14 @@ impl ResourceList {
                     .test_support()
                     .into_any_element(),
             ),
+            _ if self.rows.is_empty() && self.query.only.is_some() => {
+                let only = self.query.only.as_ref().map_or("", |only| &only.label);
+                Some(message(
+                    format!("No {only}"),
+                    Some(format!("Open {label} in the navigation to see all.")),
+                    theme.muted_foreground,
+                ))
+            }
             _ if self.rows.is_empty() => {
                 let filtered = !self.query.text.trim().is_empty()
                     || (self.namespaced && !self.query.namespaces.is_empty());
@@ -1387,7 +1442,7 @@ impl ResourceList {
     /// or the rows computed for the current text exclude it.
     pub(in crate::ui) fn filtered_out_text(&self) -> Option<String> {
         let selected = self.selected.as_ref()?;
-        let filter = &self.query.namespaces;
+        let filter = self.scope();
         if let Some(namespace) = selected.namespace.as_deref()
             && self.namespaced
             && !filter.is_empty()
@@ -1432,8 +1487,13 @@ impl ResourceList {
             );
         }
         if let Some(only) = &self.query.only {
+            let across = if self.query.namespaces.is_empty() {
+                ""
+            } else {
+                ", in any namespace"
+            };
             let text = format!(
-                "Showing the {} the overview found. Open {} in the navigation to see all.",
+                "Showing the {} the overview found{across}. Open {} in the navigation to see all.",
                 only.label, self.label
             );
             banners.push(

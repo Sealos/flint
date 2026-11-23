@@ -1791,6 +1791,11 @@ const PROBLEM_CATEGORY: &[Arg] = &[arg(
     "which problem tile",
     ArgKind::Choice(&super::dashboard::CATEGORY_NAMES),
 )];
+const SHORT_WORKLOAD_KIND: &[Arg] = &[arg(
+    "kind",
+    "which kind of short workload",
+    ArgKind::Choice(&super::dashboard::SHORT_WORKLOAD_KINDS),
+)];
 const SECTION: &[Arg] = &[arg(
     "section",
     "section title, as shown: Workloads",
@@ -2192,6 +2197,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Open Problem List…",
             "Open the objects behind a problem tile of the cluster overview.",
             PROBLEM_CATEGORY,
+        )
+        .of(C::View, S::Dashboard)
+        .hidden(),
+        Spec::with_args::<super::dashboard::OpenShortWorkloads>(
+            "Open Short Workloads…",
+            "Open one kind of the workloads the cluster overview counts as short.",
+            SHORT_WORKLOAD_KIND,
         )
         .of(C::View, S::Dashboard)
         .hidden(),

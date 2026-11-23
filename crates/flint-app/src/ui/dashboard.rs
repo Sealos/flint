@@ -42,6 +42,8 @@ mod sparkline;
 #[path = "dashboard_tiles.rs"]
 mod tiles;
 
+#[cfg(test)]
+pub(in crate::ui) use feed::{FeedId, lists_of};
 pub use feed::{ProblemList, ProblemLists};
 use sparkline::SparklineShape;
 
@@ -101,6 +103,41 @@ impl<'de> Deserialize<'de> for OpenProblemList {
     }
 }
 
+/// The kinds the short-workloads tile counts, as `OpenView` takes them.
+pub const SHORT_WORKLOAD_KINDS: [&str; 3] = ["deployments", "statefulsets", "daemonsets"];
+
+/// Open one kind of the short workloads, when the tile counts several.
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = dashboard, no_json)]
+pub struct OpenShortWorkloads {
+    pub kind: &'static str,
+}
+
+/// The registry probes an action with its default.
+impl Default for OpenShortWorkloads {
+    fn default() -> Self {
+        Self {
+            kind: SHORT_WORKLOAD_KINDS[0],
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OpenShortWorkloads {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Args {
+            kind: String,
+        }
+        let args = Args::deserialize(deserializer)?;
+        SHORT_WORKLOAD_KINDS
+            .into_iter()
+            .find(|kind| *kind == args.kind)
+            .map(|kind| Self { kind })
+            .ok_or_else(|| de::Error::custom(format!("unknown kind {:?}", args.kind)))
+    }
+}
+
 /// Each category as [`OpenProblemList`] names it, in [`ProblemCategory::ALL`] order.
 pub const CATEGORY_NAMES: [&str; ProblemCategory::ALL.len()] = [
     category_name(ProblemCategory::ALL[0]),
@@ -127,6 +164,8 @@ const fn category_name(category: ProblemCategory) -> &'static str {
 pub enum DashboardEvent {
     /// Show the list filtered to this category.
     OpenFilteredList(ProblemCategory),
+    /// Show this kind's short workloads.
+    OpenShortWorkloads(&'static str),
 }
 
 /// What the dashboard is built from. Events and claims are read apart from the telemetry feed, so
@@ -602,11 +641,23 @@ impl DashboardView {
     /// The registered actions of an open dashboard, for [`Bind`].
     pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
         bind.bind::<OpenProblemList>(Self::open_list)
+            .bind::<OpenShortWorkloads>(Self::open_short_workloads)
     }
 
-    /// The objects behind `category`'s tile, as last read.
+    /// The objects behind `category`'s tile, as last read, when one list shows them all.
     pub fn problem_list(&self, category: ProblemCategory) -> Option<&ProblemList> {
-        self.lists.get(&category)
+        match self.lists.get(&category)?.as_slice() {
+            [list] => Some(list),
+            _ => None,
+        }
+    }
+
+    /// The short workloads of `kind`, as last read.
+    pub fn short_workloads(&self, kind: &str) -> Option<&ProblemList> {
+        self.lists
+            .get(&ProblemCategory::ShortWorkloads)?
+            .iter()
+            .find(|list| list.kind == kind)
     }
 
     /// Shows `model` and the objects behind its tiles.
@@ -630,6 +681,10 @@ impl DashboardView {
 
     /// A click may come from a frame older than the model, so the tile is checked again.
     fn open_list(&mut self, action: &OpenProblemList, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.shows_current_feed(cx) {
+            self.refresh(cx);
+            return;
+        }
         let opens = self
             .model
             .tiles
@@ -637,6 +692,21 @@ impl DashboardView {
             .any(|tile| tile.category == action.category && tile.opens_list());
         if opens {
             cx.emit(DashboardEvent::OpenFilteredList(action.category));
+        }
+    }
+
+    fn open_short_workloads(
+        &mut self,
+        action: &OpenShortWorkloads,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.shows_current_feed(cx) {
+            self.refresh(cx);
+            return;
+        }
+        if self.short_workloads(action.kind).is_some() {
+            cx.emit(DashboardEvent::OpenShortWorkloads(action.kind));
         }
     }
 }
@@ -666,6 +736,7 @@ impl Render for DashboardView {
             .children(tiles::status_banner(&self.model.status, theme))
             .child(tiles::problem_tiles(
                 &self.model.tiles,
+                &self.lists,
                 self.focus.clone(),
                 theme,
             ))

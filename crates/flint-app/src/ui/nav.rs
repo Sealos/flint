@@ -299,9 +299,10 @@ impl NavPanel {
 
     /// The overview's row. The arrows move over sections and kinds; from the keyboard, the
     /// overview opens through the command palette.
-    fn render_overview(&self, theme: &Theme) -> AnyElement {
+    fn render_overview(&self, theme: &Theme) -> impl IntoElement {
         h_flex()
             .id("nav-overview")
+            .role(gpui_kit::accesskit::Role::Button)
             .aria_label("Overview")
             .flex_none()
             .px_2()
@@ -322,7 +323,6 @@ impl NavPanel {
             .on_click(registry::on_click(OpenClusterOverview))
             .child("Overview")
             .test_support()
-            .into_any_element()
     }
 
     fn render_entry(&self, entry: &NavEntry, theme: &Theme, cursor: bool) -> AnyElement {
@@ -472,7 +472,7 @@ impl Render for NavPanel {
             (Some(cluster), Some(discovery)) => {
                 let collapsed = self.collapsed.get(cluster).cloned().unwrap_or_default();
                 let mut first_group = true;
-                rows.push(self.render_overview(&theme));
+                rows.push(self.render_overview(&theme).into_any_element());
                 for (i, section) in discovery.navigation.sections.iter().enumerate() {
                     if section.kind == SectionKind::ApiGroup && first_group {
                         first_group = false;
