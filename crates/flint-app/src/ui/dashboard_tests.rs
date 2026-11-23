@@ -54,8 +54,12 @@ fn snapshot(availability: Availability, metrics: MetricsCheck) -> TelemetrySnaps
         kinds: WatchedKind::ALL.map(|kind| (kind, check.clone())),
         problems: Arc::from([]),
         unchecked: Vec::new(),
+        settling: Vec::new(),
         counts,
         metrics,
+        capacity: None,
+        inventory: Default::default(),
+        version: Default::default(),
     }
 }
 
@@ -138,6 +142,8 @@ fn build(
         thresholds: &Thresholds::default(),
         warning_events: events,
         pending_claims: claims,
+        node_usage: &UsageRead::Waiting,
+        server: None,
         now: now(),
     })
 }
@@ -378,6 +384,8 @@ fn an_old_sample_is_not_passed_off_as_current() {
         thresholds: &Thresholds::default(),
         warning_events: Some(&[]),
         pending_claims: Some(&[]),
+        node_usage: &UsageRead::Waiting,
+        server: None,
         now: later,
     });
     let MetricsPanel::Tiles { cpu, .. } = &model.metrics else {
@@ -466,6 +474,8 @@ fn a_complete_poll_stays_current_while_the_next_is_slow() {
             thresholds: &Thresholds::default(),
             warning_events: Some(&[]),
             pending_claims: Some(&[]),
+            node_usage: &UsageRead::Waiting,
+            server: None,
             now: now()
                 .checked_add(jiff::SignedDuration::from_secs(step * steps))
                 .unwrap(),
@@ -687,6 +697,70 @@ async fn a_stale_click_on_an_unknown_tile_opens_nothing(cx: &mut TestAppContext)
     .unwrap();
     cx.run_until_parked();
     assert!(seen.borrow().is_empty());
+}
+
+#[gpui_kit::test]
+async fn draws_capacity_and_inventory_with_usage_unavailable(cx: &mut TestAppContext) {
+    use flint_core::telemetry::{
+        Allocatable, ClusterCapacity, Inventory, NodeCapacity, Reserved, VersionCheck,
+    };
+    let scope = OpenScope {
+        cluster: CLUSTER.to_owned(),
+        server: None,
+    };
+    let capacity = ClusterCapacity {
+        nodes: vec![NodeCapacity {
+            name: "node-1".to_owned(),
+            allocatable: Allocatable {
+                cpu: Some(Cpu::from_nanos(4_000_000_000)),
+                memory: Some(Memory::from_bytes(8 << 30)),
+                pods: Some(110),
+            },
+            requests: Reserved {
+                cpu: Some(Cpu::from_nanos(1_000_000_000)),
+                memory: Some(Memory::from_bytes(2 << 30)),
+            },
+            limits: Reserved::default(),
+            pods: Some(11),
+        }]
+        .into(),
+    };
+    let mut model = no_metrics_model();
+    model.capacity = capacity_panel(
+        Some(&capacity),
+        &UsageRead::Unavailable(MetricsError::NotInstalled),
+    );
+    model.inventory = inventory_panel(
+        &Inventory {
+            nodes: Some(1),
+            ..Inventory::default()
+        },
+        &VersionCheck::Known("v1.31.2".to_owned()),
+        &scope,
+    );
+    let (window, _) = open(cx, model);
+    assert_eq!(
+        label(cx, window, ("dashboard-capacity", 0usize)).as_deref(),
+        Some(
+            "CPU: 3.00 cores left of 4.00 cores, requested 1.00 cores (25%), used unavailable, \
+             limits unknown"
+        )
+    );
+    assert_eq!(
+        label(cx, window, ("dashboard-node", 0usize)).as_deref(),
+        Some(
+            "node-1: CPU requested 1.00 cores (25%), memory requested 2.0 GiB (25%), pods 11 / \
+             110, CPU used unavailable, memory used unavailable"
+        )
+    );
+    assert_eq!(
+        label(cx, window, "dashboard-version").as_deref(),
+        Some("Kubernetes v1.31.2")
+    );
+    assert_eq!(
+        label(cx, window, ("dashboard-count-unknown", 1usize)).as_deref(),
+        Some("Pods: unknown")
+    );
 }
 
 #[gpui_kit::test]

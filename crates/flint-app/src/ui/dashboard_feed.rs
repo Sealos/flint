@@ -17,8 +17,8 @@ use flint_core::dashboard::{
 use flint_core::metrics_trend::TrendStore;
 use flint_core::problems::{Problem, ProblemSubject, WorkloadKind};
 use flint_core::telemetry::{
-    Availability, ClusterTelemetry, KindCheck, MetricsCheck, SideRead, TelemetrySnapshot,
-    WatchedKind,
+    Availability, ClusterTelemetry, Inventory, KindCheck, MetricsCheck, SideRead,
+    TelemetrySnapshot, UsageRead, VersionCheck, WatchedKind,
 };
 use flint_core::thresholds::Thresholds;
 use flint_core::{ClusterId, OverviewInterest};
@@ -93,7 +93,13 @@ impl DashboardView {
         cluster: ClusterId,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (waiting, lists) = read(None, &cluster, &Thresholds::default(), Timestamp::now());
+        let (waiting, lists) = read(
+            None,
+            &cluster,
+            None,
+            &Thresholds::default(),
+            Timestamp::now(),
+        );
         let mut view = Self::new(waiting, cx);
         view.lists = lists;
         let mut updates = model.read(cx).core().telemetry_updates();
@@ -144,7 +150,13 @@ impl DashboardView {
             .source
             .as_ref()
             .map_or("", |(_, cluster)| cluster.as_str());
-        let (model, lists) = read(None, cluster, &Thresholds::default(), Timestamp::now());
+        let (model, lists) = read(
+            None,
+            cluster,
+            None,
+            &Thresholds::default(),
+            Timestamp::now(),
+        );
         self.set_data(model, lists, cx);
     }
 
@@ -192,12 +204,19 @@ impl DashboardView {
         let thresholds = model
             .settings
             .thresholds_for(&cluster, active.info.server.as_deref());
+        let server = active.info.server.clone();
         let telemetry = model.core().telemetry(&cluster);
         let feed = telemetry.as_ref().map(FeedId::of);
         self.feed.reading = true;
         self.feed.dirty = false;
         let job = cx.background_spawn(async move {
-            read(telemetry.as_ref(), &cluster, &thresholds, Timestamp::now())
+            read(
+                telemetry.as_ref(),
+                &cluster,
+                server.as_deref(),
+                &thresholds,
+                Timestamp::now(),
+            )
         });
         self.feed._read = Some(cx.spawn(async move |this, cx| {
             let (model, lists) = job.await;
@@ -235,6 +254,7 @@ impl DashboardView {
 pub(super) fn read(
     telemetry: Option<&ClusterTelemetry>,
     cluster: &str,
+    server: Option<&str>,
     thresholds: &Thresholds,
     now: Timestamp,
 ) -> (DashboardModel, ProblemLists) {
@@ -247,6 +267,8 @@ pub(super) fn read(
             thresholds,
             warning_events: None,
             pending_claims: None,
+            node_usage: &UsageRead::Waiting,
+            server,
             now,
         });
         return (model, ProblemLists::new());
@@ -260,6 +282,8 @@ pub(super) fn read(
         thresholds,
         warning_events: reads.warning_events.current(),
         pending_claims: reads.pending_claims.current(),
+        node_usage: &reads.node_usage,
+        server,
         now,
     };
     let mut model = DashboardModel::build(&input);
@@ -275,8 +299,12 @@ fn waiting_snapshot(cluster: &str, now: Timestamp) -> TelemetrySnapshot {
         kinds: WatchedKind::ALL.map(|kind| (kind, KindCheck::Starting)),
         problems: Arc::from([]),
         unchecked: Vec::new(),
+        settling: Vec::new(),
         counts: ProblemSummariser::default().summarise(&ProblemSnapshot::unavailable(), now),
         metrics: MetricsCheck::Waiting,
+        capacity: None,
+        inventory: Inventory::default(),
+        version: VersionCheck::Waiting,
     }
 }
 

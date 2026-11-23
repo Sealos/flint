@@ -14,6 +14,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Resource;
 use serde::de::DeserializeOwned;
 
+use super::capacity::{ALLOCATABLE_KEYS, PodLoad};
 use super::{KindCheck, WatchedKind};
 
 /// The most objects of one kind a feed holds.
@@ -31,17 +32,20 @@ fn key_of(meta: &ObjectMeta) -> Option<Key> {
 
 /// The objects of one kind, in a slice as the classifier takes them.
 #[derive(Debug)]
-pub(super) struct KindStore<K> {
+pub(super) struct KindStore<K: Tracked> {
     pub(super) check: KindCheck,
     items: Vec<K>,
+    /// What trimming kept of each item apart from it, at the same positions.
+    extras: Vec<K::Extra>,
     index: HashMap<Key, usize>,
 }
 
-impl<K> Default for KindStore<K> {
+impl<K: Tracked> Default for KindStore<K> {
     fn default() -> Self {
         Self {
             check: KindCheck::Starting,
             items: Vec::new(),
+            extras: Vec::new(),
             index: HashMap::new(),
         }
     }
@@ -53,24 +57,32 @@ impl<K: Tracked> KindStore<K> {
         (self.check == KindCheck::Current).then_some(self.items.as_slice())
     }
 
+    /// The objects with what trimming kept of each, if they can be relied on.
+    pub(super) fn current_with_extras(&self) -> Option<impl Iterator<Item = (&K, &K::Extra)>> {
+        self.current()
+            .map(|items| items.iter().zip(self.extras.iter()))
+    }
+
     /// Replaces the objects with a fresh list. The check is unchanged: a kind becomes current
     /// only when its watch opens.
-    pub(super) fn replace(&mut self, items: Vec<K>) {
+    pub(super) fn replace(&mut self, items: Vec<(K, K::Extra)>) {
         self.items.clear();
+        self.extras.clear();
         self.index.clear();
-        for item in items {
+        for (item, extra) in items {
             // A fresh list is already within the limit.
-            let _ = self.upsert(item);
+            let _ = self.upsert(item, extra);
         }
     }
 
     /// Adds or replaces an object. `false` if that would pass [`MAX_OBJECTS_PER_KIND`].
-    pub(super) fn upsert(&mut self, item: K) -> bool {
+    pub(super) fn upsert(&mut self, item: K, extra: K::Extra) -> bool {
         let Some(key) = key_of(item.meta()) else {
             return true;
         };
         if let Some(&at) = self.index.get(&key) {
             self.items[at] = item;
+            self.extras[at] = extra;
             return true;
         }
         if self.items.len() >= MAX_OBJECTS_PER_KIND {
@@ -78,6 +90,7 @@ impl<K: Tracked> KindStore<K> {
         }
         self.index.insert(key, self.items.len());
         self.items.push(item);
+        self.extras.push(extra);
         true
     }
 
@@ -86,6 +99,7 @@ impl<K: Tracked> KindStore<K> {
             return;
         };
         self.items.swap_remove(at);
+        self.extras.swap_remove(at);
         if let Some(moved) = self.items.get(at).and_then(|m| key_of(m.meta())) {
             self.index.insert(moved, at);
         }
@@ -95,6 +109,7 @@ impl<K: Tracked> KindStore<K> {
     pub(super) fn invalidate(&mut self, check: KindCheck) {
         self.check = check;
         self.items = Vec::new();
+        self.extras = Vec::new();
         self.index = HashMap::new();
     }
 }
@@ -133,11 +148,14 @@ impl Stores {
 pub(super) trait Tracked:
     Resource<DynamicType = ()> + Clone + DeserializeOwned + Debug + Send + Sync + 'static
 {
+    /// What is kept of an object in a smaller form than the object's own fields.
+    type Extra: Clone + Debug + Send + Sync + 'static;
+
     /// This kind's store.
     fn store(stores: &mut Stores) -> &mut KindStore<Self>;
 
-    /// Drops everything classification does not read.
-    fn trim(&mut self);
+    /// Drops everything the feed does not read, and returns [`Self::Extra`].
+    fn trim(&mut self) -> Self::Extra;
 }
 
 fn trim_meta(meta: &mut ObjectMeta) {
@@ -188,12 +206,15 @@ fn trim_container_status(status: &mut ContainerStatus) {
 }
 
 impl Tracked for Pod {
+    type Extra = PodLoad;
+
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.pods
     }
 
-    fn trim(&mut self) {
+    fn trim(&mut self) -> PodLoad {
         trim_meta(&mut self.metadata);
+        let load = self.spec.as_ref().map(PodLoad::of).unwrap_or_default();
         self.spec = self.spec.take().map(|mut spec| {
             spec.containers.iter_mut().for_each(trim_container);
             let mut init = spec.init_containers.take();
@@ -202,6 +223,7 @@ impl Tracked for Pod {
                 containers: spec.containers,
                 init_containers: init,
                 restart_policy: spec.restart_policy,
+                node_name: spec.node_name,
                 ..PodSpec::default()
             }
         });
@@ -222,10 +244,13 @@ impl Tracked for Pod {
             }
             trimmed
         });
+        load
     }
 }
 
 impl Tracked for Node {
+    type Extra = ();
+
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.nodes
     }
@@ -238,8 +263,14 @@ impl Tracked for Node {
             for condition in conditions.iter_mut().flatten() {
                 condition.message = None;
             }
+            let allocatable = status.allocatable.map(|list| {
+                list.into_iter()
+                    .filter(|(name, _)| ALLOCATABLE_KEYS.contains(&name.as_str()))
+                    .collect()
+            });
             NodeStatus {
                 conditions,
+                allocatable,
                 ..NodeStatus::default()
             }
         });
@@ -247,6 +278,8 @@ impl Tracked for Node {
 }
 
 impl Tracked for Job {
+    type Extra = ();
+
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.jobs
     }
@@ -268,6 +301,8 @@ impl Tracked for Job {
 }
 
 impl Tracked for Deployment {
+    type Extra = ();
+
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.deployments
     }
@@ -285,6 +320,8 @@ impl Tracked for Deployment {
 }
 
 impl Tracked for StatefulSet {
+    type Extra = ();
+
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.stateful_sets
     }
@@ -301,6 +338,8 @@ impl Tracked for StatefulSet {
 }
 
 impl Tracked for DaemonSet {
+    type Extra = ();
+
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.daemon_sets
     }
@@ -316,6 +355,8 @@ impl Tracked for DaemonSet {
 }
 
 impl Tracked for ReplicaSet {
+    type Extra = ();
+
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.replica_sets
     }
@@ -354,7 +395,7 @@ mod tests {
     #[test]
     fn a_trimmed_pod_keeps_what_classification_reads_and_no_template_values() {
         let mut trimmed = pod("a");
-        trimmed.trim();
+        let _ = trimmed.trim();
         let text = serde_json::to_string(&trimmed).unwrap();
         for gone in ["hunter2", "TOKEN", "secret-looking", "server text", "app:1"] {
             assert!(!text.contains(gone), "{gone} was kept: {text}");
@@ -372,9 +413,10 @@ mod tests {
     #[test]
     fn the_store_replaces_removes_and_keeps_its_index() {
         let mut store = KindStore::<Pod>::default();
-        store.replace(vec![pod("a"), pod("b"), pod("c")]);
+        let load = PodLoad::default();
+        store.replace(vec![(pod("a"), load), (pod("b"), load), (pod("c"), load)]);
         store.remove(&pod("a"));
-        assert!(store.upsert(pod("b")));
+        assert!(store.upsert(pod("b"), load));
         store.remove(&pod("c"));
         store.check = KindCheck::Current;
         let names: Vec<_> = store
@@ -398,16 +440,16 @@ mod tests {
             ..ReplicaSet::default()
         };
         for i in 0..MAX_OBJECTS_PER_KIND {
-            assert!(store.upsert(set(i)));
+            assert!(store.upsert(set(i), ()));
         }
-        assert!(!store.upsert(set(MAX_OBJECTS_PER_KIND)));
-        assert!(store.upsert(set(0)));
+        assert!(!store.upsert(set(MAX_OBJECTS_PER_KIND), ()));
+        assert!(store.upsert(set(0), ()));
     }
 
     #[test]
     fn objects_held_are_not_current_until_the_check_says_so() {
         let mut store = KindStore::<Pod>::default();
-        store.replace(vec![pod("a")]);
+        store.replace(vec![(pod("a"), PodLoad::default())]);
         assert!(store.current().is_none());
         store.check = KindCheck::Current;
         assert_eq!(store.current().map(<[Pod]>::len), Some(1));

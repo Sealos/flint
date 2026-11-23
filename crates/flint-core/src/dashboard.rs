@@ -277,6 +277,16 @@ impl ProblemSummariser {
             .retain(|id, _| held.contains(id) || unchecked(ProblemCategory::of_kind(id.kind)));
         ProblemCounts { counts }
     }
+
+    /// Whether `problem`, from the pass just summarised, is not counted yet because its hold-down
+    /// has not passed. One this summariser has no start time for has not been held at all.
+    pub fn is_settling(&self, problem: &Problem, now: Timestamp) -> bool {
+        problem.hold_down().is_some_and(|hold_down| {
+            self.first_seen
+                .get(&problem.id)
+                .is_none_or(|first| now.duration_since(*first) < hold_down)
+        })
+    }
 }
 
 /// The object a problem is counted against, so several problems of one object count once.

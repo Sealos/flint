@@ -9,7 +9,7 @@ use flint_core::metrics::MetricsError;
 use flint_core::metrics_trend::{TrendResource, TrendScope, TrendStore};
 use flint_core::telemetry::{
     Availability, FailureCause, KindCheck, MetricsCheck, SideReads, Telemetry, TelemetrySnapshot,
-    TelemetryTiming, UsageRead, WatchedKind, start_for_tests,
+    TelemetryTiming, UsageRead, VersionCheck, WatchedKind, start_for_tests,
 };
 use flint_core::{ProblemKind, ProblemSubject};
 use flint_e2e::fake_api::{CONTEXT, FakeApiServer, FakePod, Fault, Gvr, Options, Verb, WatchStep};
@@ -295,6 +295,34 @@ async fn a_kind_it_may_not_read_is_unknown_while_others_are_counted() {
     assert!(partial.counts.get(ProblemCategory::FailingPods).is_some());
     assert!(partial.unchecked.contains(&ProblemKind::NodeNotReady));
     feed.stop().await;
+}
+
+#[tokio::test]
+async fn capacity_needs_no_metrics_server_and_the_version_is_read_once() {
+    let server = FakeApiServer::start_with(Options {
+        no_metrics: true,
+        ..Options::default()
+    })
+    .await
+    .unwrap();
+    let store = trends();
+    let mut feed = start(&server, &store).await;
+    let snapshot = until(&mut feed, "capacity and the version", |s| {
+        checked(s) && s.version != VersionCheck::Waiting && s.capacity.is_some()
+    })
+    .await;
+    assert!(matches!(snapshot.version, VersionCheck::Known(_)));
+    let capacity = snapshot.capacity.as_ref().unwrap();
+    assert_eq!(Some(capacity.nodes.len()), snapshot.inventory.nodes);
+    assert!(capacity.requests().cpu.is_some());
+    assert!(capacity.pods().is_some());
+    assert!(snapshot.inventory.pods.is_some());
+    feed.stop().await;
+
+    let requests = server.requests();
+    let versions = requests.iter().filter(|r| r.path == "/version").count();
+    assert_eq!(versions, 2, "the connection check and the feed's one read");
+    assert!(server.writes().is_empty());
 }
 
 #[tokio::test]

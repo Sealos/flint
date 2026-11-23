@@ -5,17 +5,19 @@ use std::sync::Arc;
 
 use flint_core::dashboard::{ProblemCategory, ProblemCounts, ProblemSnapshot, ProblemSummariser};
 use flint_core::problems::{
-    Problem, ProblemId, ProblemKind, ProblemSubject, WORKLOAD_HOLD_DOWN, WorkloadKind,
+    Problem, ProblemId, ProblemKind, ProblemSeverity, ProblemSubject, WORKLOAD_HOLD_DOWN,
+    WorkloadKind,
 };
 use gpui_kit::{Entity, TestAppContext};
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use super::dashboard::{
-    DashboardModel, DashboardView, FeedId, ProblemList, ProblemLists, ProblemTile, lists_of,
+    DashboardModel, DashboardView, FeedId, ProblemList, ProblemLists, ProblemRow, ProblemTile,
+    ProblemsPanel, lists_of,
 };
 use super::list::{CountedObjects, ObjectFilter};
-use super::registry::{Scope, tests::assert_binds_scope};
+use super::registry::{OpenObject, Scope, tests::assert_binds_scope};
 use super::support_tests::{TestWorkspace, open_workspace, pods, standard_sections};
 use flint_core::thresholds::ThresholdLevel;
 
@@ -350,6 +352,73 @@ async fn a_problem_tile_opens_its_objects_and_the_kind_shows_all_again(cx: &mut 
     cx.run_until_parked();
     assert!(list.read_with(cx, |list, _| list.only().is_none()));
     assert_eq!(t.row_count(cx), 2);
+}
+
+/// The overview showing one problem row that opens `web-0`, for `cluster` on `server`.
+fn show_problem_row(
+    cx: &mut TestAppContext,
+    view: &Entity<DashboardView>,
+    cluster: &str,
+    server: Option<String>,
+) {
+    let row = ProblemRow {
+        severity: ProblemSeverity::Critical,
+        summary: "Container keeps crashing and restarting",
+        object: "Pod demo/web-0 (app)".to_owned(),
+        open: OpenObject {
+            kind: "pods".to_owned(),
+            namespace: Some("demo".to_owned()),
+            name: "web-0".to_owned(),
+            cluster: Some(cluster.to_owned()),
+            server,
+        },
+    };
+    view.update(cx, |view, cx| {
+        let mut model = view.model().clone();
+        model.problems = ProblemsPanel::Rows {
+            rows: vec![row],
+            total: 1,
+            settling: 0,
+            incomplete: false,
+        };
+        view.set_model(model, cx);
+    });
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+async fn a_problem_row_opens_its_exact_object(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let view = open(cx, &t).await;
+    let server = t.workspace.read_with(cx, |ws, cx| {
+        ws.cluster_summary("kind-alpha", cx)
+            .and_then(|summary| summary.info.server.clone())
+    });
+    show_problem_row(cx, &view, "kind-alpha", server);
+    t.click(cx, ("dashboard-problem", 0usize));
+    cx.run_until_parked();
+    assert!(dashboard(cx, &t).is_none(), "the overview gave way");
+    t.feed_list(cx, pods(&[("demo", "web-0", 0), ("demo", "web-1", 0)]))
+        .await;
+    assert_eq!(t.selected(cx).as_deref(), Some("web-0"));
+}
+
+#[gpui_kit::test]
+async fn a_problem_row_from_another_server_opens_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let view = open(cx, &t).await;
+    show_problem_row(
+        cx,
+        &view,
+        "kind-alpha",
+        Some("https://replaced.invalid".to_owned()),
+    );
+    t.click(cx, ("dashboard-problem", 0usize));
+    cx.run_until_parked();
+    assert!(dashboard(cx, &t).is_some(), "the overview stays");
+    assert!(t.list(cx).is_none());
 }
 
 #[gpui_kit::test]

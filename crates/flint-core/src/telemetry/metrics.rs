@@ -170,6 +170,7 @@ mod tests {
         Arc::new(Shared {
             stores: Mutex::default(),
             metrics: Mutex::default(),
+            version: Mutex::default(),
             dirty: Notify::new(),
         })
     }
