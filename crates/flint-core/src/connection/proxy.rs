@@ -5,9 +5,11 @@
 //! supported, through `CONNECT`: TLS to the API server runs inside the tunnel, so the proxy sees
 //! neither the credentials nor the requests. Any other proxy is refused, never skipped.
 //!
-//! A proxy URL can hold a password. Only [`shown`] leaves this module as text.
+//! A proxy URL can hold a password. Only [`shown`], and [`route_identity`] with its one-way
+//! digest, leave this module as text.
 
 use std::borrow::Cow;
+use std::ffi::{OsStr, OsString};
 
 use http::{HeaderValue, Uri};
 use hyper_util::client::legacy::connect::proxy::Tunnel;
@@ -30,11 +32,16 @@ pub(crate) struct ProxyEnvironment {
 
 impl ProxyEnvironment {
     /// The variables of this process, in the order kube and kubectl read them.
+    ///
+    /// A value that is not UTF-8 stays set, lossily: as a proxy it then can't be read and is
+    /// refused, and as `NO_PROXY` it exempts nothing. It never counts as unset.
     pub(crate) fn current() -> Self {
         let first = |names: [&str; 2]| {
-            names
-                .iter()
-                .find_map(|name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()))
+            names.iter().find_map(|name| {
+                let value = std::env::var_os(name)?;
+                let value = value.to_string_lossy();
+                (!value.trim().is_empty()).then(|| value.into_owned())
+            })
         };
         ProxyEnvironment {
             https_proxy: first(["HTTPS_PROXY", "https_proxy"]),
@@ -55,9 +62,10 @@ impl ProxyEnvironment {
             Some("http") => 80,
             _ => return false,
         };
-        if uri.host().is_none() {
+        let Some(server_host) = uri.host().filter(|_| authority_is_valid(&uri)) else {
             return false;
-        }
+        };
+        let server_host = server_host.to_ascii_lowercase();
         let port = uri.port_u16().unwrap_or(default_port);
         let mut hosts = Vec::new();
         for entry in no_proxy.split(',').map(str::trim) {
@@ -65,8 +73,17 @@ impl ProxyEnvironment {
                 return true;
             }
             let (host, only_port) = no_proxy_entry(entry);
-            if only_port.is_none_or(|only| only == port) {
-                hosts.push(host);
+            if only_port.is_some_and(|only| only != port) {
+                continue;
+            }
+            match host.strip_prefix("*.") {
+                Some(suffix) => {
+                    let suffix = format!(".{}", suffix.to_ascii_lowercase());
+                    if server_host.len() > suffix.len() && server_host.ends_with(&suffix) {
+                        return true;
+                    }
+                }
+                None => hosts.push(host),
             }
         }
         Matcher::builder()
@@ -76,6 +93,39 @@ impl ProxyEnvironment {
             .intercept(&uri)
             .is_none()
     }
+}
+
+/// Whether `uri`'s host and port are exactly a DNS name or IP address and a port. `http::Uri`
+/// accepts more (`[::1]junk:3128`, port `65536`) and then dials something else than was written.
+fn authority_is_valid(uri: &Uri) -> bool {
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    let host_port = authority.as_str().rsplit('@').next().unwrap_or_default();
+    let port = if let Some(rest) = host_port.strip_prefix('[') {
+        let Some((address, after)) = rest.split_once(']') else {
+            return false;
+        };
+        if address.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        match after.strip_prefix(':') {
+            Some(port) => Some(port),
+            None if after.is_empty() => None,
+            None => return false,
+        }
+    } else {
+        let (host, port) = match host_port.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (host_port, None),
+        };
+        let name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_');
+        if host.is_empty() || !host.chars().all(name_char) {
+            return false;
+        }
+        port
+    };
+    port.is_none_or(|p| p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok())
 }
 
 /// A `NO_PROXY` entry's host, and the one port it is limited to. An entry whose port can't be
@@ -123,6 +173,9 @@ pub(crate) fn shown(proxy: &str) -> String {
     let (Some(scheme), Some(host)) = (uri.scheme_str(), uri.host()) else {
         return UNREADABLE.to_owned();
     };
+    if !authority_is_valid(&uri) {
+        return UNREADABLE.to_owned();
+    }
     let (scheme, host) = (scheme.to_ascii_lowercase(), host.to_ascii_lowercase());
     match uri.port_u16() {
         Some(port) => format!("{scheme}://{host}:{port}"),
@@ -130,27 +183,60 @@ pub(crate) fn shown(proxy: &str) -> String {
     }
 }
 
-/// The changes that keep this process's proxy credentials from an exec plugin it starts: each
-/// proxy variable holding user info, with its address alone, or `None` to unset one that can't
-/// be read. Variables without user info are left as they are.
-pub(crate) fn plugin_environment() -> Vec<(&'static str, Option<String>)> {
-    const VARIABLES: [&str; 6] = [
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ];
-    VARIABLES
+/// Rounds of the account digest. Grants are saved in `settings.toml`, so a guess at a proxy
+/// password from one should cost real work.
+const ACCOUNT_ROUNDS: u32 = 100_000;
+
+/// `proxy` as pins and grants compare it: [`shown`], plus an opaque digest of its user info when
+/// it has any, so another account at one address is another route. The digest follows a `#`,
+/// which [`shown`] drops, and the credential itself is never kept.
+pub(crate) fn route_identity(proxy: &str) -> String {
+    let address = shown(proxy);
+    let user_info = proxy
+        .trim()
+        .parse::<Uri>()
+        .ok()
+        .and_then(|uri| Some(uri.authority()?.as_str().rsplit_once('@')?.0.to_owned()));
+    match user_info {
+        Some(user_info) if address != UNREADABLE => {
+            let mut digest = [0u8; 16];
+            ring::pbkdf2::derive(
+                ring::pbkdf2::PBKDF2_HMAC_SHA256,
+                std::num::NonZeroU32::new(ACCOUNT_ROUNDS).expect("not zero"),
+                format!("flint-proxy-account:{address}").as_bytes(),
+                user_info.as_bytes(),
+                &mut digest,
+            );
+            let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            format!("{address}#{hex}")
+        }
+        _ => address,
+    }
+}
+
+/// The changes that keep proxy credentials from an exec plugin, given the variables it would
+/// inherit and the ones set or removed for it (`None`): each proxy variable, in any case, whose
+/// final value holds user info, with its address alone, or `None` to unset one that can't be
+/// read. Variables without user info are left as they are.
+pub(crate) fn plugin_environment(
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+    explicit: &[(OsString, Option<OsString>)],
+) -> Vec<(OsString, Option<String>)> {
+    let is_proxy = |name: &OsStr| {
+        let name = name.to_string_lossy().to_ascii_lowercase();
+        name.ends_with("_proxy") && name != "no_proxy"
+    };
+    let kept = inherited
         .into_iter()
-        .filter_map(|name| {
-            let value = std::env::var_os(name)?;
-            if !value.as_encoded_bytes().contains(&b'@') {
-                return None;
-            }
+        .filter(|(name, _)| !explicit.iter().any(|(set, _)| set == name));
+    let set = explicit
+        .iter()
+        .filter_map(|(name, value)| Some((name.clone(), value.clone()?)));
+    kept.chain(set)
+        .filter(|(name, value)| is_proxy(name) && value.as_encoded_bytes().contains(&b'@'))
+        .map(|(name, value)| {
             let address = value.to_str().map(shown).filter(|s| s != UNREADABLE);
-            Some((name, address))
+            (name, address)
         })
         .collect()
 }
@@ -184,10 +270,20 @@ pub(crate) enum ProxyRefused {
          could pose as it; remove that setting. Flint did not connect"
     )]
     UnverifiedTls,
+    #[error("the API server's address can't be read. Flint did not connect")]
+    UnreadableServer,
 }
 
-/// Refuses a tunnel to `server` unless verified TLS keeps its credentials from the proxy.
-pub(crate) fn check_route(server: &Uri, skips_verify: bool) -> Result<(), ProxyRefused> {
+/// Refuses a tunnel to `server` unless its address is exact and verified TLS keeps its
+/// credentials from the proxy.
+pub(crate) fn check_route(server: &str, skips_verify: bool) -> Result<(), ProxyRefused> {
+    let server = server
+        .trim()
+        .parse::<Uri>()
+        .map_err(|_| ProxyRefused::UnreadableServer)?;
+    if !authority_is_valid(&server) {
+        return Err(ProxyRefused::UnreadableServer);
+    }
     if !server
         .scheme_str()
         .is_some_and(|s| s.eq_ignore_ascii_case("https"))

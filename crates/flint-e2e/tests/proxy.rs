@@ -218,6 +218,61 @@ async fn nothing_goes_through_a_proxy_to_a_server_without_verified_tls() {
     assert_eq!(arrivals(&api), 0, "it connected directly");
 }
 
+#[tokio::test]
+async fn a_server_with_a_bad_port_is_refused_before_the_proxy() {
+    let api = FakeApiServer::start().await.unwrap();
+    let (proxy, seen) = fake_proxy(api.addr()).await;
+    let (mut kubeconfig, context) = through(api.kubeconfig(None), &format!("http://{proxy}"));
+    kubeconfig.clusters[0].cluster.as_mut().unwrap().server =
+        Some("https://127.0.0.1:65536".to_owned());
+
+    let error = match cluster::connect(&kubeconfig, &context).await {
+        Ok(client) => cluster::server_version(&client).await.unwrap_err(),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("did not connect"), "{error}");
+    assert!(seen.lock().unwrap().heads.is_empty(), "the proxy was used");
+    assert_eq!(arrivals(&api), 0);
+}
+
+/// Set for the child process of [`an_undecodable_environment_proxy_is_refused`].
+const UNDECODABLE_CHILD: &str = "FLINT_TEST_UNDECODABLE_PROXY_CHILD";
+
+// The proxy variables belong to the whole process, so this runs in a child of its own.
+#[test]
+fn an_undecodable_environment_proxy_is_refused() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["undecodable_proxy_child", "--exact", "--nocapture"])
+        .env(UNDECODABLE_CHILD, "1")
+        .env(
+            "HTTPS_PROXY",
+            std::ffi::OsStr::from_bytes(b"http://proxy\xff:3128"),
+        )
+        .env_remove("https_proxy")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[tokio::test]
+async fn undecodable_proxy_child() {
+    if std::env::var_os(UNDECODABLE_CHILD).is_none() {
+        return;
+    }
+    let api = FakeApiServer::start().await.unwrap();
+    let kubeconfig = api.kubeconfig(None);
+    let context = kubeconfig.contexts[0].name.clone();
+    let Err(error) = cluster::connect(&kubeconfig, &context).await else {
+        panic!("connected without the proxy");
+    };
+    assert!(error.to_string().contains("can't be read"), "{error}");
+    assert_eq!(arrivals(&api), 0, "it connected directly");
+}
+
 /// Set for the child process of [`an_exempt_server_ignores_a_malformed_environment_proxy`].
 const EXEMPT_CHILD: &str = "FLINT_TEST_EXEMPT_PROXY_CHILD";
 

@@ -343,6 +343,14 @@ impl Stream {
         self.cluster_error
     }
 
+    /// Stops an open stream on `error`, about its cluster. Drops the read, and any lines held
+    /// for a resume go to `out` first.
+    pub fn cancel(&mut self, error: LogError, out: &mut dyn FnMut(LogLine)) {
+        self.release_held(out);
+        self.cluster_error = true;
+        self.phase = self.end_with(error);
+    }
+
     /// The first request: as asked, with the tail as given.
     fn first_request(&self) -> LogRequest {
         LogRequest {

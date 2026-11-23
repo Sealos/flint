@@ -146,6 +146,59 @@ fn an_authority_that_cannot_be_trusted_is_refused_and_not_shown() {
 }
 
 #[test]
+fn a_malformed_authority_is_refused_whole() {
+    for proxy in [
+        "http://user:s3cret@[::1]junk:3128",
+        "http://[::1]junk:3128",
+        "http://[not-an-address]:3128",
+        "http://user:s3cret@pro xy:3128",
+        "http://proxy:+3128",
+    ] {
+        assert_eq!(shown(proxy), UNREADABLE, "{proxy}");
+        assert!(ProxyTarget::parse(proxy).is_err(), "{proxy}");
+    }
+    assert_eq!(shown("http://[::1]:3128"), "http://[::1]:3128");
+}
+
+#[test]
+fn a_no_proxy_wildcard_suffix_honors_its_port() {
+    let env = environment(Some("http://env:1"), Some("*.example.test:6443"));
+    assert_eq!(chosen(None, Some(SERVER), &env), None);
+    for server in [
+        "https://api.example.test:7443",
+        "https://example.test:6443",
+        "https://apiexample.test:6443",
+    ] {
+        assert_eq!(
+            chosen(None, Some(server), &env),
+            Some("http://env:1"),
+            "{server}"
+        );
+    }
+    let any_port = environment(Some("http://env:1"), Some("*.EXAMPLE.test"));
+    assert_eq!(chosen(None, Some(SERVER), &any_port), None);
+}
+
+#[test]
+fn a_route_identity_tells_accounts_apart_without_holding_them() {
+    let one = route_identity("http://alice:s3cret@proxy:3128");
+    let two = route_identity("http://bob:s3cret@proxy:3128");
+    let three = route_identity("http://alice:other@proxy:3128");
+    assert_ne!(one, two);
+    assert_ne!(one, three);
+    assert_eq!(one, route_identity("http://alice:s3cret@proxy:3128"));
+    assert_ne!(one, route_identity("http://proxy:3128"));
+    assert_eq!(route_identity("http://proxy:3128"), "http://proxy:3128");
+    for text in [&one, &two, &three] {
+        assert!(
+            !text.contains("alice") && !text.contains("s3cret"),
+            "{text}"
+        );
+        assert_eq!(shown(text), "http://proxy:3128", "shown without its digest");
+    }
+}
+
+#[test]
 fn a_grant_differs_for_each_route() {
     assert_eq!(grant_endpoint(SERVER, None), SERVER);
     let one = grant_endpoint(SERVER, Some("http://one:1"));

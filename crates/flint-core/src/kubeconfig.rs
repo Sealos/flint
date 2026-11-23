@@ -31,8 +31,9 @@ pub struct ContextInfo {
     /// The API server URL, if the referenced cluster entry exists.
     pub server: Option<String>,
     /// The proxy requests go through, from the cluster entry's `proxy-url` or the environment,
-    /// so the server's address alone does not say where they lead. Scheme, host and port only:
-    /// never its credentials.
+    /// so the server's address alone does not say where they lead. Scheme, host and port, plus
+    /// after a `#` an opaque digest of its account if it has one, so pins and grants tell
+    /// accounts apart: never its credentials. Show it through [`crate::redact::server_url`].
     pub proxy_url: Option<String>,
     /// The file whose definition of this context won the merge.
     pub source: PathBuf,
@@ -305,6 +306,8 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
         }
     }
     let environment = crate::connection::proxy::ProxyEnvironment::current();
+    // The digest is slow on purpose: once per distinct proxy URL in a load.
+    let mut identities: HashMap<String, String> = HashMap::new();
     for info in &mut contexts {
         let entry = info.cluster.as_ref().and_then(|cluster| {
             merged
@@ -319,7 +322,12 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
             info.server.as_deref(),
             &environment,
         )
-        .map(crate::connection::proxy::shown);
+        .map(|proxy| {
+            identities
+                .entry(proxy.to_owned())
+                .or_insert_with(|| crate::connection::proxy::route_identity(proxy))
+                .clone()
+        });
     }
     LoadedKubeconfig {
         merged,

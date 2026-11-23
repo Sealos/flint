@@ -1294,6 +1294,53 @@ mod tests {
         assert!(pods_of(&s).streams.is_empty());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn an_open_pod_stream_ends_when_its_route_changes() {
+        let pods = Arc::new(FakePods::default());
+        let logs = Arc::new(FakeLogs::default());
+        let (tx, mut rx) = watch::channel(Arc::new(LogSnapshot::connecting()));
+        let (_paused, paused_rx) = watch::channel(false);
+        let config = config(100, 32);
+        let subject = crate::logs::LogSubject::Pod(crate::logs::LogTarget {
+            namespace: "ns".into(),
+            pod: "web-a".into(),
+            container: Some("app".into()),
+        });
+        let feed = crate::logs::session::feed(
+            subject,
+            LogOptions::default(),
+            &config,
+            logs.clone(),
+            pods.clone(),
+        );
+        tokio::spawn(run(feed, config, tx, paused_rx, None));
+        rx.wait_for(|s| s.state == LogState::Streaming)
+            .await
+            .unwrap();
+
+        // A check that only finds the cluster reconnecting leaves the stream open.
+        *pods.check.lock().unwrap() = Some(LogError::retry("connecting to \"dev\""));
+        tokio::time::sleep(RECHECK_EVERY + Duration::from_secs(1)).await;
+        assert_eq!(rx.borrow().state, LogState::Streaming);
+
+        let why = "\"dev\" now points to a different API server";
+        *pods.check.lock().unwrap() = Some(LogError::cluster(why));
+        let ended = tokio::time::timeout(
+            RECHECK_EVERY * 2,
+            rx.wait_for(|s| matches!(s.state, LogState::Ended { .. })),
+        )
+        .await
+        .expect("the stream stayed open")
+        .unwrap()
+        .clone();
+        assert!(
+            matches!(&ended.state, LogState::Ended { error: Some(e), .. } if e == why),
+            "{:?}",
+            ended.state
+        );
+        assert_eq!(logs.requests.lock().unwrap().len(), 1, "it did not reopen");
+    }
+
     // covers UP-45: lines held while a reconnect looks for its overlap survive the session ending.
     #[tokio::test(start_paused = true)]
     async fn a_fatal_pod_watch_error_keeps_the_lines_held_by_a_reconnect() {

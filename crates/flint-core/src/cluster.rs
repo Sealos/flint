@@ -577,6 +577,7 @@ pub(crate) async fn connect_gated_with_policy(
     context: &str,
     access: &CredentialAccess,
 ) -> Result<GatedConnection, ClusterError> {
+    route_preflight(kubeconfig, context)?;
     let mut held = kubeconfig.clone();
     let name = context.to_owned();
     let (held, files) = tokio::task::spawn_blocking(move || {
@@ -680,6 +681,8 @@ async fn prepare(
     if !kubeconfig.contexts.iter().any(|c| c.name == context) {
         return Err(ClusterError::UnknownContext(context.to_owned()));
     }
+    // kube's loader reads certificate and key files.
+    route_preflight(kubeconfig, context)?;
     let options = KubeConfigOptions {
         context: Some(context.to_owned()),
         cluster: None,
@@ -693,10 +696,10 @@ async fn prepare(
             context: context.to_owned(),
             message: error_chain(&e),
         })?;
-    // Before anything reads or runs a credential, so a route Flint refuses opens no login.
+    // Before anything runs a credential, so a route Flint refuses opens no login.
     config.proxy_url = proxy_of(
         entry.as_deref(),
-        &config.cluster_url,
+        &config.cluster_url.to_string(),
         config.accept_invalid_certs,
     )
     .map_err(|refused| ClusterError::Config {
@@ -735,6 +738,28 @@ async fn prepare(
     })
 }
 
+/// Refuses `context`'s route from the kubeconfig's own values, before any credential file is
+/// opened. A context or server that is missing is left for kube's loader to report.
+fn route_preflight(kubeconfig: &Kubeconfig, context: &str) -> Result<(), ClusterError> {
+    let cluster = kubeconfig
+        .contexts
+        .iter()
+        .find(|c| c.name == context)
+        .and_then(|c| c.context.as_ref())
+        .and_then(|c| kubeconfig.clusters.iter().find(|n| n.name == c.cluster))
+        .and_then(|n| n.cluster.as_ref());
+    let Some((cluster, server)) = cluster.and_then(|c| Some((c, c.server.as_deref()?))) else {
+        return Ok(());
+    };
+    let skips_verify = cluster.insecure_skip_tls_verify == Some(true);
+    proxy_of(cluster.proxy_url.as_deref(), server, skips_verify)
+        .map(drop)
+        .map_err(|refused| ClusterError::Config {
+            context: context.to_owned(),
+            message: refused.to_string(),
+        })
+}
+
 /// Gives `context`'s cluster entry [`proxy::LOADER_PLACEHOLDER`] as its proxy, and returns the
 /// `proxy-url` it had.
 fn swap_proxy_entry(kubeconfig: &mut Kubeconfig, context: &str) -> Option<String> {
@@ -759,12 +784,11 @@ fn swap_proxy_entry(kubeconfig: &mut Kubeconfig, context: &str) -> Option<String
 /// all without its proxy features, so the choice is made here ([`proxy::chosen`]).
 fn proxy_of(
     entry: Option<&str>,
-    server: &http::Uri,
+    server: &str,
     skips_verify: bool,
 ) -> Result<Option<http::Uri>, proxy::ProxyRefused> {
     let environment = proxy::ProxyEnvironment::current();
-    let server_text = server.to_string();
-    let Some(chosen) = proxy::chosen(entry, Some(&server_text), &environment) else {
+    let Some(chosen) = proxy::chosen(entry, Some(server), &environment) else {
         return Ok(None);
     };
     proxy::ProxyTarget::parse(chosen)?;
@@ -879,7 +903,8 @@ fn build_observed_client(
     // Refused again rather than connecting directly, whatever set the URL.
     let target = proxy::ProxyTarget::parse(&proxy_url.to_string())
         .and_then(|target| {
-            proxy::check_route(&config.cluster_url, config.accept_invalid_certs).map(|()| target)
+            proxy::check_route(&config.cluster_url.to_string(), config.accept_invalid_certs)
+                .map(|()| target)
         })
         .map_err(|refused| kube::Error::Service(refused.to_string().into()))?;
     let connector = target.tunnel(http_connector());

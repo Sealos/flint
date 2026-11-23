@@ -263,8 +263,14 @@ fn hold(files: &mut Vec<HeldFile>, path: &str, role: FileRole) -> Option<Vec<u8>
     bytes.filter(|_| held.is_some())
 }
 
+/// Every path [`read_file`] was asked for, so a test can see a credential file left unopened.
+#[cfg(test)]
+pub(crate) static READ_PATHS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 /// Reads a regular file of at most [`FILE_CAP`] bytes.
 fn read_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(test)]
+    READ_PATHS.lock().unwrap().push(path.to_owned());
     // Follows a symlink, as projected tokens are. A pipe would block the read for good.
     if !std::fs::metadata(path)?.is_file() {
         return Err(std::io::ErrorKind::InvalidInput.into());

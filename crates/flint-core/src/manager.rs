@@ -3276,6 +3276,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_shell_pinned_to_one_proxy_account_cannot_launch_on_another() {
+        let at = |proxy: &str| kubeconfig_with(&format!("https://dev\n    proxy-url: {proxy}"));
+        let (one, two) = (
+            "http://alice:first@proxy.example:3128",
+            "http://bob:second@proxy.example:3128",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &at(one)).await;
+        let grant = |manager: &ClusterManager| manager.cluster("dev").unwrap().info.grant_server();
+        let first = grant(&manager).unwrap();
+        assert!(
+            !first.contains("alice") && !first.contains("first"),
+            "{first}"
+        );
+        manager.unlocks.unlock("dev", &first);
+        let pin = manager.session_pin("dev");
+        assert_eq!(manager.launch_gate("dev", &pin), Ok(()));
+
+        rewrite(&mut manager, dir.path(), &at(two)).await;
+
+        assert_ne!(grant(&manager).unwrap(), first, "the grant is per account");
+        assert!(manager.launch_gate("dev", &pin).is_err());
+        assert!(manager.log_client("dev", &pin).is_err());
+        assert_eq!(
+            manager.write_gate("dev").err(),
+            Some(WriteRefusal::Protected {
+                cluster: "dev".into()
+            }),
+            "the unlock was for the other account"
+        );
+    }
+
     /// A manager reading one kubeconfig file, `kubeconfig` in `dir`, loaded once.
     async fn manager_reading(dir: &Path, yaml: &str) -> ClusterManager {
         let path = dir.join("kubeconfig");

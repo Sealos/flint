@@ -21,9 +21,10 @@ use super::budget::LogBudget;
 use super::buffer::{LogBuffer, LogLines};
 use super::line::LogLine;
 use super::pods::{PodSource, WorkloadTarget};
-use super::source::LogSource;
+use super::source::{LogError, LogSource};
 use super::stream::{Backoff, Stream};
 use super::workload::{PodSetStatus, WorkloadFeed};
+use crate::recheck::{RECHECK_EVERY, Recheck};
 use crate::redact;
 
 /// Which container's logs to read.
@@ -288,7 +289,9 @@ pub(crate) fn feed(
     pods: Arc<dyn PodSource>,
 ) -> Box<dyn Feed> {
     match subject {
-        LogSubject::Pod(target) => Box::new(PodFeed::new(logs, target, options, config)),
+        LogSubject::Pod(target) => {
+            Box::new(PodFeed::new(logs, target, options, config).rechecking(pods))
+        }
         LogSubject::Workload(target) => {
             Box::new(WorkloadFeed::new(logs, pods, target, options, *config))
         }
@@ -298,7 +301,13 @@ pub(crate) fn feed(
 /// One pod's container.
 pub(crate) struct PodFeed {
     stream: Stream,
+    /// Asks every [`RECHECK_EVERY`] whether the context is still what the stream opened on: an
+    /// open read keeps its connection, so it would not notice otherwise.
+    check: Option<RouteCheck>,
 }
+
+/// Where a [`PodFeed`] asks about its context, and the timer of the next check.
+type RouteCheck = (Arc<dyn PodSource>, Recheck<Result<(), LogError>>);
 
 impl PodFeed {
     pub fn new(
@@ -310,12 +319,30 @@ impl PodFeed {
         let tail = config.tail(options.tail_lines);
         PodFeed {
             stream: Stream::new(source, target, options, tail, config.backoff, None),
+            check: None,
         }
+    }
+
+    /// Ends the stream when `pods` says its cluster is no longer the one it opened on.
+    pub fn rechecking(mut self, pods: Arc<dyn PodSource>) -> Self {
+        self.check = Some((pods, Recheck::new(RECHECK_EVERY)));
+        self
     }
 }
 
 impl Feed for PodFeed {
     fn poll(&mut self, cx: &mut Context<'_>, out: &mut Output) -> Poll<()> {
+        if !self.stream.is_done()
+            && let Some((pods, recheck)) = &mut self.check
+            && let Poll::Ready(result) = recheck.poll_check(cx, || pods.check())
+        {
+            // Only a cluster error is about the session; one reconnecting is the stream's.
+            if let Some(error) = result.err().filter(LogError::is_cluster) {
+                self.stream.cancel(error, &mut |line| out.append(line));
+                out.set_state(self.stream.state());
+            }
+            return Poll::Ready(());
+        }
         let step = ready!(self.stream.poll_step(cx));
         self.stream.handle(step, &mut |line| out.append(line));
         out.set_state(self.stream.state());
