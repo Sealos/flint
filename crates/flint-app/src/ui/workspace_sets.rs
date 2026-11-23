@@ -18,7 +18,7 @@ use flint_core::combined::CombinedMember;
 use flint_core::display::{
     CUSTOM_NAME_PUNCTUATION, MAX_CUSTOM_NAME_CHARS, clean_custom_name, cluster_name_key,
 };
-use flint_core::handle::{AdmittedMember, MemberReport, MemberStatus};
+use flint_core::handle::{AdmittedMember, LeftOutMember, MemberReport, MemberStatus, OpenedSet};
 use flint_core::settings::{ClusterPin, Settings, SettingsError};
 use flint_core::{ClusterId, ClusterSummary, KindId, KindSnapshot, NavEntry, SyncState};
 use gpui_kit::base::TestSupportExt as _;
@@ -85,8 +85,8 @@ pub(super) struct RunningSet {
     held: HashSet<ClusterId>,
     /// The window its feeds draw in, for a held member that joins later.
     window: AnyWindowHandle,
-    /// Saved members that already pointed elsewhere when the set opened: never admitted.
-    left_out: Vec<ClusterId>,
+    /// Saved members the core did not admit when the set opened, and why.
+    left_out: Vec<LeftOutMember>,
     kind: KindId,
     kind_label: String,
     pub(super) list: Entity<CombinedResourceList>,
@@ -169,12 +169,10 @@ struct PendingOpen {
     set_id: Option<String>,
 }
 
-/// What opening a set needs besides its members: how it is called and where it came from.
-struct Opening {
-    label: String,
-    /// The saved set it opens; `None` for the sidebar's choice, which it then clears.
-    set_id: Option<String>,
-    left_out: Vec<ClusterId>,
+/// A saved set being opened.
+struct SavedOpening {
+    name: String,
+    id: String,
 }
 
 /// The name field of the Rename Cluster Set dialog.
@@ -221,17 +219,6 @@ fn rename_problem(saved: &[ClusterSet], id: &str, typed: &str) -> Option<String>
         .iter()
         .any(|set| set.id != id && cluster_name_key(&set.name) == key)
         .then(|| "Another cluster set already goes by this name.".to_owned())
-}
-
-/// Whether `pin`'s context is confirmed to point at another server now. A context that is gone,
-/// has no server or is provisional is not known to have moved, and still refuses the set.
-fn repointed(pin: &ClusterPin, summary: Option<&ClusterSummary>) -> bool {
-    summary.is_some_and(|c| {
-        c.confirmed
-            && c.info.server.as_deref().is_some_and(|server| {
-                !server.trim().is_empty() && !pin.matches(&pin.context, server)
-            })
-    })
 }
 
 /// Why a row of `pin`'s cluster cannot be opened or acted on, if so. Protection is not here: a
@@ -480,8 +467,7 @@ impl Workspace {
 
     fn open_picked(&mut self, _: &OpenPickedClusters, window: &mut Window, cx: &mut Context<Self>) {
         let pins = self.picked_pins(cx);
-        let label = format!("{} clusters", pins.len());
-        self.open_set(label, pins, None, window, cx);
+        self.open_set(pins, None, window, cx);
     }
 
     /// Runs `write` on the settings file after any earlier one, then `done` with what it wrote.
@@ -674,8 +660,12 @@ impl Workspace {
         let Some(set) = self.sets.saved.iter().find(|s| s.name == action.name) else {
             return;
         };
-        let (label, pins, id) = (set.name.clone(), set.members.clone(), set.id.clone());
-        self.open_set(label, pins, Some(id), window, cx);
+        let pins = set.members.clone();
+        let saved = SavedOpening {
+            name: set.name.clone(),
+            id: set.id.clone(),
+        };
+        self.open_set(pins, Some(saved), window, cx);
     }
 
     fn save_set(&mut self, action: &SaveClusterSet, window: &mut Window, cx: &mut Context<Self>) {
@@ -701,85 +691,96 @@ impl Workspace {
         );
     }
 
-    /// Asks the core to run `pins` as the set, and opens their combined list once it has checked
-    /// every one. A member now pointing at another server is left out and marked, and never
-    /// reaches the core. Any other refusal, or too few members left, starts nothing: whatever is
-    /// open stays, and the sidebar says why.
+    /// Asks the core to run `pins` as the set, and opens their combined list with the members it
+    /// admitted. The core decides who joins and why others can't, in one step. Too few starts
+    /// nothing: whatever is open stays, and the sidebar says why.
     fn open_set(
         &mut self,
-        label: String,
         pins: Vec<ClusterPin>,
-        set_id: Option<String>,
+        saved: Option<SavedOpening>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let names = self.cluster_names(cx);
-        let (moved, pins): (Vec<_>, Vec<_>) = pins
-            .into_iter()
-            .partition(|pin| repointed(pin, self.cluster_summary(&pin.context, cx)));
-        let refused = pins.iter().find_map(|pin| {
-            let summary = self.cluster_summary(&pin.context, cx);
-            member_refusal(pin, summary, None, &names.exact(&pin.context))
-        });
-        let too_few = (!moved.is_empty() && pins.len() < MIN_CLUSTER_SET_MEMBERS).then(|| {
-            let shown: Vec<String> = moved.iter().map(|p| names.exact(&p.context)).collect();
-            format!(
-                "{} now points at another server, which leaves too few clusters to open: a set \
-                 runs at least {MIN_CLUSTER_SET_MEMBERS}",
-                shown.join(", ")
-            )
-        });
-        if let Some(why) = refused.or(too_few) {
-            self.sets.error = Some(why);
-            cx.notify();
-            return;
-        }
         self.sets.error = None;
         let token = self.sets.next_opening;
         self.sets.next_opening += 1;
         self.sets.opening = Some(PendingOpen {
             token,
-            set_id: set_id.clone(),
+            set_id: saved.as_ref().map(|s| s.id.clone()),
         });
-        let opening = Opening {
-            label,
-            set_id,
-            left_out: moved.into_iter().map(|pin| pin.context).collect(),
-        };
-        let admit = self.model.read(cx).core().admit_running_set(pins);
+        let open = self.model.read(cx).core().open_running_set(pins);
         self.sets._admit = cx.spawn_in(window, async move |this, cx| {
-            let admitted = admit.await;
+            let opened = open.await;
             let _ = this.update_in(cx, |ws, window, cx| {
-                ws.finish_open(token, opening, admitted, window, cx)
+                ws.finish_open(token, saved, opened, window, cx)
             });
         });
+    }
+
+    /// Puts the core back on what the view shows, after a refused open that replaced one the
+    /// core may already have admitted. Admission checks every member again.
+    fn restore_core_set(&self, cx: &App) {
+        let pins = self.sets.running.as_ref().map_or_else(Vec::new, |run| {
+            run.members.iter().map(|m| m.pin().clone()).collect()
+        });
+        drop(self.model.read(cx).core().admit_running_set(pins));
+    }
+
+    fn too_few_text(&self, left_out: &[LeftOutMember], cx: &App) -> String {
+        let names = self.cluster_names(cx);
+        let shown: Vec<String> = left_out
+            .iter()
+            .map(|m| {
+                format!(
+                    "{} ({})",
+                    names.exact(&m.context),
+                    m.reason.label().to_lowercase()
+                )
+            })
+            .collect();
+        format!(
+            "{} can't join, which leaves too few clusters to open: a set runs at least \
+             {MIN_CLUSTER_SET_MEMBERS}",
+            shown.join(", ")
+        )
     }
 
     fn finish_open(
         &mut self,
         token: u64,
-        opening: Opening,
-        admitted: Result<Vec<AdmittedMember>, String>,
+        saved: Option<SavedOpening>,
+        opened: Result<OpenedSet, String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.sets.opening.as_ref().map(|o| o.token) != Some(token) {
             // Closed while the core was admitting it, and nothing newer is on its way.
-            if self.sets.opening.is_none() && !self.sets.is_open() && admitted.is_ok() {
+            let admitted = opened.is_ok_and(|set| !set.members.is_empty());
+            if self.sets.opening.is_none() && !self.sets.is_open() && admitted {
                 drop(self.model.read(cx).core().admit_running_set(Vec::new()));
             }
             return;
         }
         self.sets.opening = None;
-        let members = match admitted {
-            Ok(members) => members,
-            Err(why) => {
-                self.sets.error = Some(why);
-                cx.notify();
-                return;
-            }
+        let refusal = match &opened {
+            Ok(set) if set.members.is_empty() => Some(self.too_few_text(&set.left_out, cx)),
+            Ok(_) => None,
+            Err(why) => Some(why.clone()),
         };
-        if opening.set_id.is_none() {
+        if let Some(why) = refusal {
+            self.sets.error = Some(why);
+            self.restore_core_set(cx);
+            cx.notify();
+            return;
+        }
+        let Ok(OpenedSet { members, left_out }) = opened else {
+            return;
+        };
+        let (label, set_id) = match saved {
+            Some(saved) => (saved.name, Some(saved.id)),
+            None => (format!("{} clusters", members.len()), None),
+        };
+        if set_id.is_none() {
             self.sets.picking = false;
             self.sets.picked.clear();
         }
@@ -787,7 +788,7 @@ impl Workspace {
         self.sets.running = None;
         self.close_list(cx);
         self.show_set(
-            opening.label,
+            label,
             members,
             KindId::pods(),
             "Pods".to_owned(),
@@ -795,8 +796,8 @@ impl Workspace {
             cx,
         );
         if let Some(run) = &mut self.sets.running {
-            run.set_id = opening.set_id;
-            run.left_out = opening.left_out;
+            run.set_id = set_id;
+            run.left_out = left_out;
         }
         self.refresh_set_kinds(cx);
     }
@@ -1394,7 +1395,7 @@ impl Workspace {
                         collapsed: group.collapsed,
                     })
                     .collect(),
-                left_out: run.left_out.clone(),
+                left_out: run.left_out.iter().map(|m| m.context.clone()).collect(),
                 list: list.view_state(),
             }
         });
@@ -1440,15 +1441,20 @@ impl Workspace {
                     .child(text)
                     .test_support()
             }))
-            .children(run.left_out.iter().map(|context| {
-                let text = format!("{}: Changed, left out", names.exact(context));
-                div()
-                    .id(SharedString::from(format!("set-member-{context}")))
-                    .aria_label(text.clone())
-                    .text_color(theme.warning)
-                    .child(text)
-                    .test_support()
-            }))
+            .children(
+                run.left_out
+                    .iter()
+                    .map(|LeftOutMember { context, reason }| {
+                        let text =
+                            format!("{}: {}, left out", names.exact(context), reason.label());
+                        div()
+                            .id(SharedString::from(format!("set-member-{context}")))
+                            .aria_label(text.clone())
+                            .text_color(theme.warning)
+                            .child(text)
+                            .test_support()
+                    }),
+            )
             .child(div().flex_1())
             .child(
                 Button::new("close-cluster-set")
