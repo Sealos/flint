@@ -176,7 +176,8 @@ fn another_process_sees_a_lock(path: &str) -> bool {
         lock.l_start = 0x4000_0002;
         lock.l_len = 510;
         assert_eq!(libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock), 0);
-        lock.l_type as i32 != libc::F_UNLCK as i32
+        let unlocked: libc::c_short = libc::F_UNLCK as _;
+        lock.l_type != unlocked
     }
 }
 
