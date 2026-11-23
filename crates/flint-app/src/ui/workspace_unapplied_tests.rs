@@ -1,7 +1,7 @@
 //! View tests for asking before an unapplied YAML edit is lost (#394).
 
 use flint_core::{KindId, ObjectDetail};
-use gpui_kit::test::TestAppContextExt as _;
+use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext as _, Entity, TestAppContext, VisualTestContext};
 use serde_json::{Value, json};
 
@@ -28,12 +28,25 @@ async fn editing(
     .unwrap();
     cx.run_until_parked();
     let detail = t.detail(cx).expect("web is open");
+    type_edit(cx, &t, &detail, "demo", "web");
+    (t, detail)
+}
+
+/// Loads `name` into the open pane and types an edit into its YAML.
+pub(super) fn type_edit(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+    detail: &Entity<DetailView>,
+    namespace: &str,
+    name: &str,
+) {
     let object = ObjectDetail {
         object: json!({
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {
-                "name": "web", "namespace": "demo", "uid": "uid-web", "resourceVersion": "1",
+                "name": name, "namespace": namespace, "uid": format!("uid-{name}"),
+                "resourceVersion": "1",
             },
         }),
         yaml: String::new(),
@@ -49,17 +62,15 @@ async fn editing(
     cx.run_until_parked();
     t.dispatch(cx, "detail::EditYaml", Value::Null).unwrap();
     cx.run_until_parked();
+    let (from, to) = (format!("name: {name}"), format!("name: {name} # typed"));
     cx.update_window(t.window, |_, window, cx| {
-        detail.update(cx, |d, cx| {
-            d.replace_in_edit("name: web", "name: web # typed", window, cx)
-        })
+        detail.update(cx, |d, cx| d.replace_in_edit(&from, &to, window, cx))
     })
     .unwrap();
     cx.run_until_parked();
-    (t, detail)
 }
 
-fn has_edit(cx: &mut TestAppContext, detail: &Entity<DetailView>) -> bool {
+pub(super) fn has_edit(cx: &mut TestAppContext, detail: &Entity<DetailView>) -> bool {
     detail.read_with(cx, |d, cx| d.has_unapplied_edit(cx))
 }
 
@@ -68,7 +79,7 @@ fn shown_name(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<String> {
         .map(|d| d.read_with(cx, |d, _| d.object().name.clone()))
 }
 
-async fn asked(cx: &mut TestAppContext, t: &TestWorkspace) {
+pub(super) async fn asked(cx: &mut TestAppContext, t: &TestWorkspace) {
     cx.wait_for(t.window, WAIT, |window, cx| {
         gpui_kit::component::WindowExt::has_active_dialog(window, cx)
     })
@@ -84,7 +95,7 @@ async fn asked(cx: &mut TestAppContext, t: &TestWorkspace) {
     assert_eq!(shown.buttons, ["Discard", "Keep editing"]);
 }
 
-async fn answered(cx: &mut TestAppContext, t: &TestWorkspace) {
+pub(super) async fn answered(cx: &mut TestAppContext, t: &TestWorkspace) {
     cx.wait_for(t.window, WAIT, |window, cx| {
         !gpui_kit::component::WindowExt::has_active_dialog(window, cx)
     })
@@ -293,6 +304,166 @@ async fn an_edit_typed_back_is_not_asked_about(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(!t.has_dialog(cx));
     assert!(t.detail(cx).is_none());
+}
+
+fn quits(cx: &mut TestAppContext) -> usize {
+    cx.update(|cx| cx.try_global::<Quits>().map_or(0, |q| q.0))
+}
+
+fn close_the_list(cx: &mut TestAppContext, t: &TestWorkspace) {
+    let (workspace, window) = (t.workspace.clone(), t.window);
+    cx.update_window(window, |_, _, cx| {
+        workspace.update(cx, |ws, cx| ws.close_list(cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+fn move_endpoint(cx: &mut TestAppContext, t: &TestWorkspace, server: &str) {
+    let server = server.to_owned();
+    t.model.update(cx, |model, cx| {
+        let cluster = model
+            .clusters
+            .iter_mut()
+            .find(|c| c.info.name == "kind-alpha")
+            .unwrap();
+        cluster.generation += 1;
+        cluster.endpoint += 1;
+        cluster.confirmed = true;
+        cluster.info.server = Some(server);
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+
+// A list rebuilt under an edit (a re-point, then rediscovery) keeps the pane on show.
+#[gpui_kit::test]
+async fn a_rebuilt_list_keeps_the_edit_on_show(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, detail) = editing(cx, dir.path()).await;
+    close_the_list(cx, &t);
+    assert_eq!(t.detail(cx).as_ref(), Some(&detail), "the same pane");
+    assert!(has_edit(cx, &detail));
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    let drawn = cx
+        .update_window(t.window, |_, window, _| {
+            window.try_find("held-edit-pane").is_some()
+        })
+        .unwrap();
+    assert!(drawn, "with no list, the edit is still drawn");
+}
+
+// A context moved to another server and put back has the old URL but another endpoint: the
+// kept edit stays refused until it is opened again.
+#[gpui_kit::test]
+async fn a_context_moved_and_put_back_stays_refused(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, detail) = editing(cx, dir.path()).await;
+    let server = detail
+        .read_with(cx, |d, _| d.open_edit_server().map(str::to_owned))
+        .expect("bound to a server");
+    assert!(detail.read_with(cx, |d, _| d.can_review_edit()));
+    move_endpoint(cx, &t, "https://10.0.0.9:6443");
+    move_endpoint(cx, &t, &server);
+    assert!(has_edit(cx, &detail), "the text is kept");
+    assert!(
+        !detail.read_with(cx, |d, _| d.can_review_edit()),
+        "no review after A to B to A"
+    );
+    assert!(detail.read_with(cx, |d, _| d.edit_moved()));
+}
+
+// Discard goes on with what was asked for even if the pane changed under the question.
+#[gpui_kit::test]
+async fn discard_goes_on_to_quit_after_the_list_closed(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, _detail) = editing(cx, dir.path()).await;
+    t.press_key_of(cx, "flint::Quit");
+    asked(cx, &t).await;
+    close_the_list(cx, &t);
+    t.click(cx, "ok");
+    answered(cx, &t).await;
+    assert_eq!(quits(cx), 1);
+}
+
+// Leaving during a confirmed write asks, and a rejection keeps the text. Discard cannot stall
+// Quit: it drops the edit while the write runs on.
+#[gpui_kit::test]
+async fn an_edit_being_applied_is_asked_about(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, detail) = editing(cx, dir.path()).await;
+    detail.update(cx, |d, cx| d.edit_applying(cx));
+    t.dispatch(cx, "detail::Close", Value::Null).unwrap();
+    asked(cx, &t).await;
+    t.press(cx, "escape");
+    answered(cx, &t).await;
+    cx.update_window(t.window, |_, window, cx| {
+        detail.update(cx, |d, cx| {
+            d.edit_applied(
+                Err(flint_core::write::WriteError::Failed("rejected".into())),
+                window,
+                cx,
+            )
+        })
+    })
+    .unwrap();
+    assert!(has_edit(cx, &detail), "the rejected text is still there");
+
+    detail.update(cx, |d, cx| d.edit_applying(cx));
+    t.press_key_of(cx, "flint::Quit");
+    asked(cx, &t).await;
+    t.click(cx, "ok");
+    answered(cx, &t).await;
+    assert_eq!(quits(cx), 1, "Quit is not held up by the running write");
+}
+
+// A right-click on another row asks about the edit and opens no menu over the question.
+#[gpui_kit::test]
+async fn a_right_click_on_another_row_opens_no_menu(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, _detail) = editing(cx, dir.path()).await;
+    let list = t.workspace.read_with(cx, |ws, _| ws.list.clone().unwrap());
+    t.dispatch(
+        cx,
+        "resource_list::SelectRow",
+        json!({"namespace": "demo", "name": "api"}),
+    )
+    .unwrap();
+    cx.update_window(t.window, |_, window, cx| {
+        list.update(cx, |list, cx| list.press_row_menu("uid-api", window, cx))
+    })
+    .unwrap();
+    asked(cx, &t).await;
+    cx.run_until_parked();
+    assert!(!list.read_with(cx, |list, _| list.has_open_row_menu()));
+}
+
+// A review that fails while the question is open: Keep editing returns to the editor.
+#[gpui_kit::test]
+async fn keep_editing_after_a_failed_review_focuses_the_editor(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, detail) = editing(cx, dir.path()).await;
+    detail.update(cx, |d, cx| d.set_edit_reviewing(cx));
+    t.dispatch(cx, "detail::Close", Value::Null).unwrap();
+    asked(cx, &t).await;
+    cx.update_window(t.window, |_, window, cx| {
+        detail.update(cx, |d, cx| {
+            d.edit_applied(
+                Err(flint_core::write::WriteError::Failed("refused".into())),
+                window,
+                cx,
+            )
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    t.press(cx, "escape");
+    answered(cx, &t).await;
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(editor_focused(cx, &t, &detail));
 }
 
 // The question names the object and its cluster on one line each, and Enter cannot discard.

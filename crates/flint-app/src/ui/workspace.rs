@@ -279,6 +279,8 @@ pub struct Workspace {
     /// A right-click selected a row whose detail has not opened yet: the list stays in front
     /// when it does.
     menu_row_pending: bool,
+    /// The detail pane, when it outlived its list to keep an edit.
+    held_edit: Option<unapplied::HeldEdit>,
     /// What last had focus in the list or the detail with no dialog open, and the layout that
     /// hides it: a dialog gives focus back to it, though it may have been hidden meanwhile.
     pane_focus: Option<(WeakFocusHandle, MainPanes)>,
@@ -465,6 +467,7 @@ impl Workspace {
             list_in_front: false,
             right_press: false,
             menu_row_pending: false,
+            held_edit: None,
             pane_focus: None,
             dock,
             palette: None,
@@ -948,11 +951,20 @@ impl Workspace {
                 .cluster_summary(&cluster, cx)
                 .and_then(|c| c.info.server.clone()),
         };
+        // `None` for a context that is gone; an unconfirmed one says nothing yet.
+        let endpoint = self
+            .cluster_summary(&cluster, cx)
+            .map(|c| c.confirmed.then_some(c.endpoint));
         detail.update(cx, |d, cx| {
             d.set_sessions_blocked(why, cx);
             d.set_protected(protected, label, cx);
             d.set_row_writes_paused(writes_paused, cx);
             d.set_server(server);
+            match endpoint {
+                Some(Some(endpoint)) => d.note_endpoint(endpoint, cx),
+                Some(None) => {}
+                None => d.note_context_gone(cx),
+            }
         });
     }
 
@@ -975,11 +987,15 @@ impl Workspace {
         let key = resource_actions::WriteKey::of(review.target());
         let begin = {
             let (key, detail) = (key.clone(), detail.clone());
-            move |cx: &mut App| match resource_actions::claim(
-                &key,
-                resource_actions::RunningWrite::YamlEdit,
-                cx,
-            ) {
+            // A context moved under the open confirmation stays refused even if it came back.
+            move |cx: &mut App| match match detail
+                .read_with(cx, |d, _| d.edit_moved_refusal())
+                .ok()
+                .flatten()
+            {
+                Some(why) => Err(why),
+                None => resource_actions::claim(&key, resource_actions::RunningWrite::YamlEdit, cx),
+            } {
                 Ok(()) => {
                     let _ = detail.update(cx, |d, cx| d.edit_applying(cx));
                     true
@@ -1100,9 +1116,7 @@ impl Workspace {
             self.forget_places();
             // Selecting a member (to sign in to it, say) keeps the set's list open.
             if !self.sets.has_member(active.as_deref()) {
-                let held = self.hold_edit_across_restart(active.as_deref(), cx);
                 self.close_list(cx);
-                self.restore_held_edit(held);
             }
             // Its filter or YAML, if one had focus that has moved on (to a dock tab, say): focus
             // may never come back through `reclaim_focus`, nor a list open here. One that still
@@ -1221,9 +1235,8 @@ impl Workspace {
         self.clear_action_error(cx);
         self.leave_set(cx);
         self.list = None;
-        self.detail = None;
+        self.drop_pane_unless_edited(cx);
         self._list_subscriptions.clear();
-        self._detail_subscriptions.clear();
         if self.dashboard.take().is_some() {
             self.nav.update(cx, |nav, cx| nav.set_overview(false, cx));
         }
@@ -1414,13 +1427,13 @@ impl Workspace {
     ) {
         match event {
             ListEvent::Selected(None) => {
-                if self.unapplied_edit(cx).is_some()
-                    && list.update(cx, |list, cx| list.undo_selection(cx))
-                {
-                    let list = list.clone();
-                    self.asks_before_leaving(window, cx, move |_, _, cx| {
-                        list.update(cx, |list, cx| list.clear_selection(cx));
-                    });
+                if self.unapplied_edit(cx).is_some() {
+                    if list.update(cx, |list, cx| list.undo_selection(cx)) {
+                        let list = list.clone();
+                        self.asks_before_leaving(window, cx, move |_, _, cx| {
+                            list.update(cx, |list, cx| list.clear_selection(cx));
+                        });
+                    }
                     return;
                 }
                 self.menu_row_pending = false;
@@ -1449,13 +1462,13 @@ impl Workspace {
                 {
                     return;
                 }
-                if self.unapplied_edit(cx).is_some()
-                    && list.update(cx, |list, cx| list.undo_selection(cx))
-                {
-                    let (list, wanted) = (list.clone(), selected.clone());
-                    self.asks_before_leaving(window, cx, move |_, window, cx| {
-                        list.update(cx, |list, cx| list.reselect(&wanted, window, cx));
-                    });
+                if self.unapplied_edit(cx).is_some() {
+                    if list.update(cx, |list, cx| list.undo_selection(cx)) {
+                        let (list, wanted) = (list.clone(), selected.clone());
+                        self.asks_before_leaving(window, cx, move |_, window, cx| {
+                            list.update(cx, |list, cx| list.reselect(&wanted, window, cx));
+                        });
+                    }
                     return;
                 }
                 // Moving between rows keeps the tab the user was on.
@@ -2684,6 +2697,18 @@ impl Workspace {
         if let Some(set_view) = self.render_set_view(window_width, theme, cx) {
             return set_view;
         }
+        if let Some(detail) = self.edit_shown_alone(cx) {
+            return div()
+                .id("held-edit-pane")
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .relative()
+                .child(detail)
+                .children(self.detail_tag_strip(theme, cx))
+                .test_support()
+                .into_any_element();
+        }
         let model = self.model.read(cx);
         if model.loaded && model.clusters.is_empty() {
             let text = no_contexts_text(
@@ -3618,6 +3643,7 @@ fn namespace_button_text(filter: &[String], limit: Option<&flint_core::Namespace
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_namespace_picker_with_dialog(window, cx);
+        self.close_finished_held_edit(window, cx);
         let window_width = f32::from(window.viewport_size().width);
         let window_height = f32::from(window.viewport_size().height);
         self.sync_narrow_layout(window_width, window, cx);

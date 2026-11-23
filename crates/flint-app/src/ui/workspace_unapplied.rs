@@ -10,9 +10,20 @@ use flint_core::display::single_line;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::*;
 
-use super::Workspace;
+use super::{Workspace, connection_stopped};
 use crate::ui::confirm::{self, DialogText};
 use crate::ui::detail::{DetailView, ObjectRef};
+
+/// The question while the edit's confirmed write is running.
+const APPLYING: &str = "This edit is being applied, and discarding will not stop it. If the \
+     server rejects it, your text will be lost.";
+
+/// A pane kept after its list closed, because it holds an edit.
+pub(super) struct HeldEdit {
+    detail: Entity<DetailView>,
+    /// Redraws the workspace when the edit ends, to close the pane.
+    _notify: Subscription,
+}
 
 /// The question for an edit of `object`.
 pub(super) fn dialog(object: &ObjectRef) -> DialogText {
@@ -59,22 +70,82 @@ impl Workspace {
         }
         self.list_in_front = false;
         detail.update(cx, |detail, cx| detail.reveal_edit(window, cx));
-        let text = dialog(detail.read(cx).object());
+        let mut text = dialog(detail.read(cx).object());
+        if detail.read(cx).is_applying_edit() {
+            text.text = APPLYING.to_owned();
+        }
         let workspace = cx.weak_entity();
         let then = Rc::new(then);
         confirm::open(window, cx, text, move |window, cx| {
             let (detail, then) = (detail.clone(), then.clone());
             let _ = workspace.update(cx, |ws, cx| {
-                // The pane may have been replaced while the question was open.
-                if ws.detail.as_ref() != Some(&detail) {
-                    return;
+                // The pane may have been replaced while the question was open. What was asked
+                // for still goes on, and asks again about any other edit it would lose.
+                if ws.detail.as_ref() == Some(&detail) {
+                    detail.update(cx, |detail, cx| detail.discard_edit(window, cx));
                 }
-                detail.update(cx, |detail, cx| detail.discard_edit(window, cx));
                 cx.defer_in(window, move |ws, window, cx| then(ws, window, cx));
             });
         });
         cx.notify();
         true
+    }
+
+    /// Whether `cluster` is the one the open edit was made on.
+    pub(in crate::ui) fn edit_is_on(&self, cluster: &str, cx: &App) -> bool {
+        self.unapplied_edit(cx)
+            .is_some_and(|detail| detail.read(cx).object().cluster == cluster)
+    }
+
+    /// Drops the detail pane with the list, unless that would lose an edit: then it stays, bound
+    /// to what it was opened on, until the edit ends.
+    pub(in crate::ui) fn drop_pane_unless_edited(&mut self, cx: &mut Context<Self>) {
+        if let Some(detail) = self.unapplied_edit(cx) {
+            if self.held_edit.as_ref().map(|held| &held.detail) != Some(&detail) {
+                let notify = cx.observe(&detail, |_, _, cx| cx.notify());
+                self.held_edit = Some(HeldEdit {
+                    detail,
+                    _notify: notify,
+                });
+            }
+            return;
+        }
+        self.held_edit = None;
+        self.detail = None;
+        self._detail_subscriptions.clear();
+    }
+
+    /// Closes a pane that was kept only for its edit, once that edit has ended.
+    pub(in crate::ui) fn close_finished_held_edit(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(held) = &self.held_edit else {
+            return;
+        };
+        if self.detail.as_ref() != Some(&held.detail) {
+            self.held_edit = None;
+        } else if !held.detail.read(cx).has_open_edit() {
+            self.held_edit = None;
+            self.detail = None;
+            self._detail_subscriptions.clear();
+            cx.defer_in(window, |ws, window, cx| ws.reclaim_focus(window, cx));
+        }
+    }
+
+    /// The pane to draw on its own: its edit is open and nothing else would show it.
+    pub(in crate::ui) fn edit_shown_alone(&self, cx: &App) -> Option<Entity<DetailView>> {
+        let detail = self
+            .detail
+            .clone()
+            .filter(|detail| detail.read(cx).has_open_edit())?;
+        let stopped = self
+            .model
+            .read(cx)
+            .active_cluster()
+            .is_none_or(|c| connection_stopped(&c.state));
+        (self.list.is_none() || stopped).then_some(detail)
     }
 
     /// Closes the detail pane (its close button, Esc), asking first.
@@ -99,32 +170,6 @@ impl Workspace {
             self._detail_subscriptions.clear();
             self.reclaim_focus(window, cx);
             cx.notify();
-        }
-    }
-
-    /// Takes the pane out of the way of a list that restarts on `cluster`, when it holds an
-    /// unapplied edit of that cluster. The edit stays bound to what it was opened on, so the
-    /// write gate refuses it if the context now points elsewhere.
-    pub(in crate::ui) fn hold_edit_across_restart(
-        &mut self,
-        cluster: Option<&str>,
-        cx: &App,
-    ) -> Option<(Entity<DetailView>, Vec<Subscription>)> {
-        let detail = self.unapplied_edit(cx)?;
-        if Some(detail.read(cx).object().cluster.as_str()) != cluster {
-            return None;
-        }
-        self.detail = None;
-        Some((detail, std::mem::take(&mut self._detail_subscriptions)))
-    }
-
-    pub(in crate::ui) fn restore_held_edit(
-        &mut self,
-        held: Option<(Entity<DetailView>, Vec<Subscription>)>,
-    ) {
-        if let Some((detail, subscriptions)) = held {
-            self.detail = Some(detail);
-            self._detail_subscriptions = subscriptions;
         }
     }
 }

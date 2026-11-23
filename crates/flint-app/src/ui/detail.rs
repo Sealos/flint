@@ -230,6 +230,8 @@ pub struct DetailView {
     row_writes_paused: Option<String>,
     /// The server the object's cluster shows, as the workspace says it: what an edit is for.
     server: Option<String>,
+    /// The confirmed endpoint number of the object's cluster, for binding an edit to it.
+    endpoint: Option<u64>,
     /// What RBAC says about this object's actions, for showing them ([`access`]).
     access: access::ObjectAccess,
     /// The YAML edit under way, in its own editor: a list update never touches its text.
@@ -324,6 +326,7 @@ impl DetailView {
             row_server: None,
             row_writes_paused: None,
             server: None,
+            endpoint: None,
             access: object_access,
             edit: None,
             focus: cx.focus_handle(),
@@ -1892,6 +1895,7 @@ fn timestamp_age(text: &str, now: i64) -> Option<String> {
 impl Render for DetailView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.follow_access(cx);
+        self.finish_focus_return(window, cx);
         let theme = cx.theme().clone();
         // The pane itself has focus (Tab between panes, UP-33): ringed.
         let focused = self.focus.is_focused(window);

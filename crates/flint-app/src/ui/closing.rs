@@ -3,8 +3,8 @@
 //! Window (its key, the Window menu, Cmd-W with no dock tab shown), the window's own close button
 //! and Quit all take this path; with nothing at work they close or quit at once.
 //!
-//! Quitting from outside the app (the Dock icon's Quit, logging out) is not asked about: GPUI
-//! offers no hook that can cancel it.
+//! Quitting from outside the app (the Dock icon's Quit, logging out) is not asked about, and
+//! loses an unapplied YAML edit: GPUI offers no hook that can cancel it.
 
 // module-tests: closing_tests.rs
 

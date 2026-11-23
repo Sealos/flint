@@ -412,10 +412,31 @@ impl ResourceList {
         let back_to = OpenRowMenu::focus_before(self.open_row_menu.take(), window, cx)
             .unwrap_or_else(|| self.focus.clone());
         cx.defer_in(window, move |list, window, cx| {
+            // The selection did not move there (a question about an unapplied edit is open):
+            // the menu's actions would be another row's.
+            if list.selected.as_ref().map(|s| &*s.uid) != Some(uid.as_str()) {
+                return;
+            }
             let open = OpenRowMenu::open(&build, uid, position, back_to, window, cx);
             list.open_row_menu = Some(open);
             cx.notify();
         });
+    }
+
+    /// A right-press on the row `uid`, after its selection was asked for.
+    #[cfg(test)]
+    pub(in crate::ui) fn press_row_menu(
+        &mut self,
+        uid: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_row_menu(uid.to_owned(), Point::default(), window, cx);
+    }
+
+    #[cfg(test)]
+    pub(in crate::ui) fn has_open_row_menu(&self) -> bool {
+        self.open_row_menu.is_some()
     }
 
     /// Called by the open menu when it is dismissed.

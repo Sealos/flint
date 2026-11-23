@@ -1048,7 +1048,8 @@ impl Workspace {
             Ok(()) => {
                 // Only a move that closes the pane: a set's member keeps it open.
                 let leaves = self.cluster.as_deref() != Some(action.cluster.as_str())
-                    && !self.sets.has_member(Some(&action.cluster));
+                    && !self.sets.has_member(Some(&action.cluster))
+                    && !self.edit_is_on(&action.cluster, cx);
                 let again = action.clone();
                 if leaves
                     && self.asks_before_leaving(window, cx, move |ws, window, cx| {

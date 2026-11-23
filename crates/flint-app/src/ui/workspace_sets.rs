@@ -712,6 +712,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let names = self.cluster_names(cx);
+        // As asked for: opening again after a question must mark the same members left out.
+        let again = (label.clone(), pins.clone(), set_id.clone());
         let (moved, pins): (Vec<_>, Vec<_>) = pins
             .into_iter()
             .partition(|pin| repointed(pin, self.cluster_summary(&pin.context, cx)));
@@ -732,7 +734,6 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let again = (label.clone(), pins.clone(), set_id.clone());
         if self.asks_before_leaving(window, cx, move |ws, window, cx| {
             let (label, pins, set_id) = again.clone();
             ws.open_set(label, pins, set_id, window, cx);
@@ -1175,6 +1176,10 @@ impl Workspace {
     }
 
     fn close_set_detail(&mut self, cx: &mut Context<Self>) {
+        // The write gate refuses what can no longer be sent; the text stays.
+        if self.unapplied_edit(cx).is_some() {
+            return;
+        }
         self.detail = None;
         self._detail_subscriptions.clear();
         if let Some(run) = &self.sets.running {
@@ -1236,6 +1241,12 @@ impl Workspace {
                 });
                 return;
             }
+            // The edited object itself, whatever its label says now or however its member
+            // stands: it comes back in front, and the write gate still judges the edit.
+            self.list_in_front = false;
+            release_unfocused_input(window, cx);
+            cx.notify();
+            return;
         }
         if let Some(why) = self.set_row_refusal(&row.cluster, cx) {
             self.close_set_detail(cx);

@@ -20,7 +20,11 @@ use serde_json::{Value, json};
 
 use super::super::Workspace;
 use super::super::actions::resource_actions_tests::LocalApi;
-use super::{ClusterSet, SettingsDir, click_chooses, member_refusal, rename_problem};
+use super::super::unapplied_tests::{answered, asked, has_edit, type_edit};
+use super::{
+    ClusterSet, CombinedListEvent, Opening, PendingOpen, SettingsDir, click_chooses,
+    member_refusal, rename_problem,
+};
 use crate::ui::confirm;
 use crate::ui::list::combined::row_id;
 use crate::ui::resource_actions::{ResourceAction, available, request, target_of};
@@ -921,6 +925,151 @@ async fn a_saved_set_is_renamed_and_its_open_view_follows(cx: &mut TestAppContex
         (run.label.clone(), run.list.read(cx).label.clone())
     });
     assert_eq!((label.as_str(), title.as_str()), ("pair", "Pods · pair"));
+}
+
+/// Both clusters as a set with `kind-beta`'s `web` open and an edit typed.
+async fn editing_a_row(
+    cx: &mut TestAppContext,
+    dir: &std::path::Path,
+) -> (
+    TestWorkspace,
+    gpui_kit::Entity<crate::ui::detail::DetailView>,
+) {
+    let t = open_workspace(cx, dir).await;
+    connect(cx, &t, "kind-alpha");
+    connect(cx, &t, "kind-beta");
+    open_both(cx, &t).await;
+    cx.update_window(t.window, |_, window, _| window.activate_window())
+        .unwrap();
+    select_row(cx, &t, "kind-beta");
+    cx.run_until_parked();
+    let detail = t.detail(cx).expect("the row's detail");
+    type_edit(cx, &t, &detail, "default", "web");
+    assert!(has_edit(cx, &detail));
+    (t, detail)
+}
+
+// An edit typed while a set is being admitted survives the set opening.
+#[gpui_kit::test]
+async fn an_edit_typed_during_admission_is_kept(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, detail) = editing_a_row(cx, dir.path()).await;
+    let (workspace, window) = (t.workspace.clone(), t.window);
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| {
+            let members = ws.sets.running.as_ref().unwrap().members.clone();
+            ws.sets.opening = Some(PendingOpen {
+                token: 99,
+                set_id: None,
+            });
+            let opening = Opening {
+                label: "again".into(),
+                set_id: None,
+                left_out: Vec::new(),
+            };
+            ws.finish_open(99, opening, Ok(members), window, cx);
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(t.detail(cx).as_ref(), Some(&detail), "the same pane");
+    assert!(has_edit(cx, &detail));
+}
+
+// Reopening the edited row after its label changed, or once it needs a sign-in, keeps the pane.
+#[gpui_kit::test]
+async fn reopening_the_edited_row_keeps_it(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, detail) = editing_a_row(cx, dir.path()).await;
+    t.workspace.update(cx, |ws, cx| {
+        let list = ws.sets.running.as_ref().unwrap().list.clone();
+        list.update(cx, |list, _| list.label = "Pods · renamed".into());
+    });
+    cx.run_until_parked();
+    let (workspace, window) = (t.workspace.clone(), t.window);
+    let reopen = |cx: &mut TestAppContext| {
+        let workspace = workspace.clone();
+        cx.update_window(window, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                let list = ws.sets.running.as_ref().unwrap().list.clone();
+                let id = list.read(cx).selected().cloned().expect("the row");
+                ws.on_combined_event(&list, &CombinedListEvent::Reopened(id), window, cx);
+            })
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    reopen(cx);
+    assert_eq!(t.detail(cx).as_ref(), Some(&detail), "after a rename");
+    assert!(!t.has_dialog(cx), "the same object: nothing to ask");
+
+    let report = MemberReport {
+        cluster: "kind-beta".into(),
+        status: MemberStatus::SignInNeeded {
+            reason: SafeErrorText::reduced("expired"),
+        },
+        paused: false,
+    };
+    t.workspace.update(cx, |ws, cx| {
+        ws.set_member_reports(vec![report], cx);
+    });
+    cx.run_until_parked();
+    reopen(cx);
+    assert_eq!(t.detail(cx).as_ref(), Some(&detail), "needing a sign-in");
+    assert!(has_edit(cx, &detail));
+}
+
+// Discard replays a saved set with its original members: the moved one is still marked.
+#[gpui_kit::test]
+async fn discarding_keeps_the_left_out_notice(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let row = open_beta_row(cx, dir.path()).await;
+    let t = &row.t;
+    let detail = t.detail(cx).expect("the row's detail");
+    cx.update_window(t.window, |_, window, _| window.activate_window())
+        .unwrap();
+    type_edit(cx, t, &detail, "demo", "web");
+    let (moved_to, _connections) = counting_listener();
+    let contexts = [
+        ("kind-alpha", &*row.alpha_url),
+        ("kind-beta", &*row.beta_url),
+        ("kind-gamma", &*moved_to),
+    ];
+    std::fs::write(dir.path().join("kubeconfig"), kubeconfig_yaml(&contexts)).unwrap();
+    let core = t.workspace.read_with(cx, |ws, cx| ws.core(cx).clone());
+    core.reload_kubeconfig().await.unwrap();
+    cx.run_until_parked();
+    let pins = vec![
+        ClusterPin::new("kind-alpha".to_owned(), row.alpha_url.clone()),
+        ClusterPin::new("kind-beta".to_owned(), row.beta_url.clone()),
+        ClusterPin::new("kind-gamma".to_owned(), "https://old.invalid".to_owned()),
+    ];
+    t.workspace.update(cx, |ws, _| {
+        ws.sets.saved = vec![ClusterSet::new("three", pins).unwrap()];
+    });
+    t.dispatch(
+        cx,
+        "cluster_sets::OpenClusterSet",
+        json!({ "name": "three" }),
+    )
+    .unwrap();
+    asked(cx, t).await;
+    t.click(cx, "ok");
+    answered(cx, t).await;
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace
+            .read(cx)
+            .sets
+            .running
+            .as_ref()
+            .is_some_and(|run| run.set_id.is_some())
+    })
+    .await;
+    let left_out = t.workspace.read_with(cx, |ws, _| {
+        ws.sets.running.as_ref().unwrap().left_out.clone()
+    });
+    assert_eq!(left_out, ["kind-gamma"]);
 }
 
 #[test]
