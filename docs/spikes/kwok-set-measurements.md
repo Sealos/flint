@@ -72,3 +72,4 @@ Both are left out of the table.
 - Real clusters, where rows carry more labels and cell text and event rates differ.
 - Pod creation and deletion churn, relists, member failure and reconnects: the churn here is label updates only.
 - A quiet machine: no run was made without other builds running.
+- Set runtime changes after `8713495b`: these numbers were not repeated on later commits.
