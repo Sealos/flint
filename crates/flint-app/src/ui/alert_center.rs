@@ -11,14 +11,17 @@
 //! - **Pinned.** An alert keeps the identity of the cluster that raised it. Opening it after that
 //!   context was removed or re-pointed is refused, whichever cluster is active now.
 //! - **Investigate** only copies a prompt, through the exposure and scope checks in
-//!   [`investigate_prompt`]. It writes nothing and starts no agent. It is offered in the app's
-//!   menu for every alert kept, because a banner has no action button without a signed app.
+//!   [`event_prompt`]. It writes nothing and starts no agent. It is in the app's menu for every
+//!   alert kept, because a banner has no action button without a signed app, and is disabled
+//!   there with its reason when no prompt can be made.
+//! - **Per cluster.** A cluster's own choice overrides the global setting. A cluster with alerts
+//!   off is not fed to the engine, and what it had on the way is not sent.
 
 // module-tests: alert_center_tests.rs
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flint_core::alerts::{AlertConfig, AlertEngine, AlertEvent, ClusterSnapshot};
@@ -26,7 +29,7 @@ use flint_core::discovery::ClusterDiscovery;
 use flint_core::handle::{ActivationRefused, ClusterSummary, ConnectionState, ReadPin};
 use flint_core::problems::ProblemKind;
 use flint_core::read::DiscoveredKinds;
-use flint_core::settings::WatchMode;
+use flint_core::settings::{Settings, WatchMode, load_settings};
 use flint_core::telemetry::TelemetrySnapshot;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -38,8 +41,9 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::clusters::{ClustersModel, Discovered};
+use super::workspace::SettingsDir;
 use super::{menu_fit, registry};
-use crate::notifications::investigate_prompt::{InvestigatePrompt, investigate_prompt};
+use crate::notifications::investigate_prompt::{InvestigatePrompt, event_prompt};
 use crate::notifications::{
     ACCEPTED_TEXT, DeliveryError, Notification, NotificationSender, clean, distinct_labels,
     platform_sender,
@@ -97,6 +101,43 @@ pub struct OpenAlert {
 #[serde(deny_unknown_fields)]
 pub struct InvestigateAlert {
     pub tag: String,
+}
+
+/// What a cluster does about alerts, whatever the global setting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterAlertChoice {
+    #[default]
+    Default,
+    On,
+    Off,
+}
+
+impl ClusterAlertChoice {
+    fn stored(self) -> Option<bool> {
+        match self {
+            Self::Default => None,
+            Self::On => Some(true),
+            Self::Off => Some(false),
+        }
+    }
+
+    fn of(stored: Option<bool>) -> Self {
+        match stored {
+            None => Self::Default,
+            Some(true) => Self::On,
+            Some(false) => Self::Off,
+        }
+    }
+}
+
+/// Choose whether one cluster posts desktop notifications.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = workspace, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct SetClusterAlerts {
+    pub cluster: String,
+    pub choice: ClusterAlertChoice,
 }
 
 /// The identity of the cluster that raised an alert.
@@ -167,16 +208,21 @@ fn verified_discovery(found: Option<&Discovered>, generation: u64) -> Option<&Cl
         .and_then(|d| d.discovery.as_deref())
 }
 
-/// Sends `notifications` in order, stopping as soon as `live` says they were cancelled.
+/// Sends `notifications` in order, stopping as soon as `live` says they were cancelled and
+/// skipping those of a cluster `muted` says has alerts off now.
 fn send_batch(
     sender: &dyn NotificationSender,
     notifications: &[Notification],
     live: impl Fn() -> bool,
+    muted: impl Fn(&str) -> bool,
 ) -> Vec<(String, Result<(), DeliveryError>)> {
     let mut answers = Vec::with_capacity(notifications.len());
     for notification in notifications {
         if !live() {
             break;
+        }
+        if muted(&notification.cluster) {
+            continue;
         }
         answers.push((notification.tag.clone(), sender.send(notification)));
     }
@@ -195,6 +241,8 @@ pub enum Reading<'a> {
     Lost,
     /// Flint is not keeping it watched.
     NotWatched,
+    /// Its alerts are turned off.
+    Muted,
 }
 
 /// What `summary`'s state and feed say about it.
@@ -249,6 +297,33 @@ pub fn out_of_scope_kinds(discovery: Option<&ClusterDiscovery>) -> Vec<ProblemKi
         .into_iter()
         .filter(|kind| groups_of(*kind).iter().any(|group| incomplete(group)))
         .collect()
+}
+
+/// Clusters with alerts off now, and how often each was turned off, shared with batches being
+/// sent. A batch stays cancelled for a cluster turned off since it started, even if back on.
+#[derive(Debug, Default)]
+struct MutedClusters {
+    now: HashSet<String>,
+    turned_off: HashMap<String, u64>,
+}
+
+impl MutedClusters {
+    /// Makes `muted` the clusters with alerts off. Returns those just turned off, and whether
+    /// any came back on.
+    fn set(&mut self, muted: HashSet<String>) -> (Vec<String>, bool) {
+        let newly: Vec<String> = muted.difference(&self.now).cloned().collect();
+        let back_on = self.now.difference(&muted).next().is_some();
+        for cluster in &newly {
+            *self.turned_off.entry(cluster.clone()).or_default() += 1;
+        }
+        self.now = muted;
+        (newly, back_on)
+    }
+
+    /// Whether a batch that started at `since` must not send for `cluster`.
+    fn blocks(&self, cluster: &str, since: &HashMap<String, u64>) -> bool {
+        self.now.contains(cluster) || self.turned_off.get(cluster) != since.get(cluster)
+    }
 }
 
 /// One cluster's input to a pass.
@@ -369,6 +444,22 @@ impl AlertTracker {
         self.recent.len() != before
     }
 
+    /// Stops following `cluster`, so turning it on again starts from a new baseline. Its alerts
+    /// stay listed, and what was still on its way is cancelled.
+    fn mute(&mut self, cluster: &str) {
+        self.forget(cluster);
+        for recent in &mut self.recent {
+            if &*recent.notification.cluster == cluster
+                && matches!(
+                    recent.delivery,
+                    Delivery::Sending | Delivery::AwaitingPermission
+                )
+            {
+                recent.delivery = Delivery::Cancelled;
+            }
+        }
+    }
+
     /// Applies one pass and returns what to send.
     pub fn observe(&mut self, inputs: &[TrackerInput<'_>], now: Timestamp) -> Vec<Notification> {
         let gone: Vec<Arc<str>> = self
@@ -392,6 +483,10 @@ impl AlertTracker {
                 self.forget(&input.cluster);
             }
             let events = match input.reading {
+                Reading::Muted => {
+                    self.mute(&input.cluster);
+                    continue;
+                }
                 Reading::NotWatched => {
                     self.note_unwatched(&input.cluster, now);
                     continue;
@@ -511,6 +606,8 @@ impl AlertTracker {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AlertsState {
     pub enabled: bool,
+    /// Clusters whose own choice or the global setting has alerts off.
+    pub muted: Vec<String>,
     /// What the OS last answered: `none`, `sending`, `awaiting_permission`, `accepted`,
     /// `cancelled`, `not_permitted`, `needs_app_bundle`, `unknown` or `failed`.
     pub delivery: &'static str,
@@ -535,7 +632,14 @@ pub struct AlertCenter {
     model: Entity<ClustersModel>,
     sender: Arc<dyn NotificationSender>,
     tracker: AlertTracker,
+    /// Whether any cluster may alert.
     enabled: bool,
+    /// The global setting, which a cluster's own choice overrides.
+    global: bool,
+    /// Clusters with alerts off, shared with a batch being sent.
+    muted: Arc<Mutex<MutedClusters>>,
+    /// An overview to show once the workspace is on this cluster.
+    overview: Option<AlertOverview>,
     /// What the OS last answered, from turning on or from a notification.
     delivery: Option<Delivery>,
     /// Changes at each toggle: work started under an older value is cancelled.
@@ -548,6 +652,20 @@ pub struct AlertCenter {
     _note: Task<()>,
     _tasks: Vec<Task<()>>,
     _observe: Subscription,
+}
+
+/// The overview an opened alert asks for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlertOverview {
+    pub context: String,
+    pub generation: u64,
+}
+
+/// What follows a successful activation.
+enum AfterActivation {
+    ShowOverview,
+    /// The prompt is built only then, from the settings as saved by that time.
+    CopyPrompt(Box<RecentAlert>),
 }
 
 /// The app's [`AlertCenter`].
@@ -599,6 +717,9 @@ impl AlertCenter {
             sender,
             tracker: AlertTracker::new(run),
             enabled: false,
+            global: false,
+            muted: Arc::default(),
+            overview: None,
             delivery: None,
             session: Arc::new(AtomicU64::new(0)),
             awaiting_permission: false,
@@ -615,8 +736,37 @@ impl AlertCenter {
     /// Follows the setting. Turning on asks the OS for permission and reports its answer.
     fn sync_enabled(&mut self, cx: &mut Context<Self>) {
         let model = self.model.read(cx);
-        let enabled = model.settings.desktop_notifications && model.settings_error.is_none();
+        let readable = model.settings_error.is_none();
+        let global = model.settings.desktop_notifications && readable;
+        let muted: HashSet<String> = model
+            .clusters
+            .iter()
+            .filter(|c| {
+                !readable
+                    || !model
+                        .settings
+                        .alerts_on(&c.info.name, c.info.server.as_deref())
+            })
+            .map(|c| c.info.name.clone())
+            .collect();
+        let enabled = global || (readable && muted.len() < model.clusters.len());
+        if global != self.global {
+            self.global = global;
+            cx.notify();
+        }
+        let (newly_muted, back_on) = self.muted.lock().expect("the muted set").set(muted);
+        if back_on || !newly_muted.is_empty() {
+            cx.notify();
+        }
+        for cluster in &newly_muted {
+            self.tracker.mute(cluster);
+            self.held.retain(|n| &*n.cluster != cluster.as_str());
+        }
         if enabled == self.enabled {
+            // Its baseline is what it shows now, so a failure after this still alerts.
+            if back_on {
+                self.pass(cx);
+            }
             return;
         }
         self.enabled = enabled;
@@ -702,16 +852,21 @@ impl AlertCenter {
                 let id = summary.info.name.as_str();
                 let discovery = verified_discovery(model.discovery.get(id), summary.generation);
                 let snapshot = feed.as_ref().map(|feed| &*feed.snapshot);
+                let on = model.settings.alerts_on(id, summary.info.server.as_deref());
                 TrackerInput {
                     cluster: Arc::from(id),
                     origin: AlertOrigin::of(summary),
                     label,
-                    reading: reading(
-                        summary,
-                        model.settings.watch_mode_for(id),
-                        snapshot,
-                        discovery,
-                    ),
+                    reading: if on {
+                        reading(
+                            summary,
+                            model.settings.watch_mode_for(id),
+                            snapshot,
+                            discovery,
+                        )
+                    } else {
+                        Reading::Muted
+                    },
                 }
             })
             .collect();
@@ -744,17 +899,25 @@ impl AlertCenter {
         let sender = Arc::clone(&self.sender);
         let session = Arc::clone(&self.session);
         let started = session.load(Ordering::SeqCst);
+        let muted = Arc::clone(&self.muted);
+        let since = muted.lock().expect("the muted set").turned_off.clone();
         cx.spawn(async move |this, cx| {
             let answers = cx
                 .background_spawn(async move {
-                    send_batch(&*sender, &notifications, || {
-                        session.load(Ordering::SeqCst) == started
-                    })
+                    send_batch(
+                        &*sender,
+                        &notifications,
+                        || session.load(Ordering::SeqCst) == started,
+                        |cluster| muted.lock().expect("the muted set").blocks(cluster, &since),
+                    )
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.session.load(Ordering::SeqCst) != started {
                     return;
+                }
+                if answers.is_empty() && this.delivery == Some(Delivery::Sending) {
+                    this.delivery = None;
                 }
                 for (tag, answer) in answers {
                     let delivery = match answer {
@@ -795,38 +958,128 @@ impl AlertCenter {
         });
     }
 
-    /// Opens the cluster that raised the alert, by its exact context.
+    /// Opens the overview of the cluster that raised the alert, by its exact context.
     pub fn open(&mut self, tag: &str, cx: &mut Context<Self>) {
         if let Some((recent, context)) = self.checked_cluster(tag, cx) {
-            self.activate(&recent.origin, context, None, cx);
+            self.activate(&recent.origin, context, AfterActivation::ShowOverview, cx);
         }
     }
 
-    /// Has the core activate `context` if it still is `origin`, and only then copies `prompt`.
+    /// The overview waiting for the workspace, if any.
+    pub fn wanted_overview(&self) -> Option<&AlertOverview> {
+        self.overview.as_ref()
+    }
+
+    /// The workspace showed the overview, or moved to another cluster first.
+    pub fn clear_overview(&mut self) {
+        self.overview = None;
+    }
+
+    #[cfg(test)]
+    pub(in crate::ui) fn want_overview(&mut self, context: &str, generation: u64) {
+        self.overview = Some(AlertOverview {
+            context: context.to_owned(),
+            generation,
+        });
+    }
+
+    /// Has the core activate `context` if it still is `origin`, and only then does `after`.
     fn activate(
         &mut self,
         origin: &AlertOrigin,
         context: String,
-        prompt: Option<String>,
+        after: AfterActivation,
         cx: &mut Context<Self>,
     ) {
+        self.overview = None;
         let label = self.model.read(cx).names().exact(&context);
+        let overview = AlertOverview {
+            context: context.clone(),
+            generation: origin.generation,
+        };
         let answer = self.model.update(cx, |model, _| {
             model.activate_pinned(&context, origin.pin.clone(), origin.generation)
         });
         cx.spawn(async move |this, cx| {
             let answer = answer.await;
             let _ = this.update(cx, |this, cx| match answer {
-                Ok(()) => {
-                    if let Some(prompt) = prompt {
-                        cx.write_to_clipboard(ClipboardItem::new_string(prompt));
-                        this.show_note("Prompt copied", cx);
+                Ok(()) => match after {
+                    AfterActivation::ShowOverview => {
+                        this.overview = Some(overview);
+                        cx.notify();
                     }
-                }
+                    AfterActivation::CopyPrompt(recent) => this.copy_prompt(*recent, cx),
+                },
                 Err(refused) => this.refuse(refusal_text(refused, &label), cx),
             });
         })
         .detach();
+    }
+
+    /// The prompt for `recent`, or why Investigate is unavailable. Checks the alert's identity,
+    /// exposure and scope as they are now, so the menu and the click cannot disagree.
+    fn investigation(&self, recent: &RecentAlert, cx: &App) -> Result<String, String> {
+        self.prompt_under(recent, &self.model.read(cx).settings, cx)
+    }
+
+    /// Copies `recent`'s prompt if the alert's identity and both the settings the app holds and
+    /// those saved on disk still allow it. A scope narrowed meanwhile may not have reached the
+    /// app yet, so what is saved decides too, and a file that cannot be read allows nothing.
+    fn copy_prompt(&mut self, recent: RecentAlert, cx: &mut Context<Self>) {
+        const UNCONFIRMED: &str = "Flint could not confirm this cluster's AI access scope.";
+        let Some(dir) = cx.try_global::<SettingsDir>().map(|dir| dir.0.clone()) else {
+            self.refuse(UNCONFIRMED.to_owned(), cx);
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let saved = cx
+                .background_spawn(async move { load_settings(&dir) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let prompt = match saved {
+                    Ok(saved) => this
+                        .investigation(&recent, cx)
+                        .and_then(|_| this.prompt_under(&recent, &saved, cx)),
+                    Err(_) => Err(UNCONFIRMED.to_owned()),
+                };
+                match prompt {
+                    Ok(prompt) => {
+                        cx.write_to_clipboard(ClipboardItem::new_string(prompt));
+                        this.show_note("Prompt copied", cx);
+                    }
+                    Err(why) => this.refuse(why, cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The prompt for `recent` under `settings`, or why there is none.
+    fn prompt_under(
+        &self,
+        recent: &RecentAlert,
+        settings: &Settings,
+        cx: &App,
+    ) -> Result<String, String> {
+        let context = &*recent.notification.cluster;
+        let model = self.model.read(cx);
+        let label = model.names().exact(context);
+        check_origin(context, &recent.origin, &model.clusters, &label)?;
+        let discovered = verified_discovery(model.discovery.get(context), recent.origin.generation)
+            .map(|d| DiscoveredKinds {
+                kinds: d.kinds.clone(),
+                skipped_groups: d.incomplete_groups.clone(),
+                stale_groups: Vec::new(),
+            });
+        match event_prompt(
+            &recent.event,
+            settings,
+            recent.origin.pin.server.as_deref(),
+            discovered.as_ref(),
+        ) {
+            InvestigatePrompt::Ready(prompt) => Ok(prompt),
+            InvestigatePrompt::Disabled(reason) => Err(reason.message().to_owned()),
+        }
     }
 
     /// Opens the alert's cluster and copies a read-only prompt, when its exposure allows one.
@@ -834,35 +1087,41 @@ impl AlertCenter {
         let Some((recent, context)) = self.checked_cluster(tag, cx) else {
             return;
         };
-        let AlertEvent::Raised(alert) = &recent.event else {
+        match self.investigation(&recent, cx) {
+            Ok(_) => {
+                let after = AfterActivation::CopyPrompt(Box::new(recent.clone()));
+                self.activate(&recent.origin, context, after, cx);
+            }
+            Err(why) => self.refuse(why, cx),
+        }
+    }
+
+    /// Saves `cluster`'s own alert choice, for the server it points at now.
+    fn set_cluster_choice(
+        &mut self,
+        cluster: &str,
+        choice: ClusterAlertChoice,
+        cx: &mut Context<Self>,
+    ) {
+        let server = self
+            .model
+            .read(cx)
+            .clusters
+            .iter()
+            .find(|c| c.info.name == cluster)
+            .and_then(|c| c.info.server.clone());
+        let Some(server) = server else {
             self.refuse(
-                "Only a single raised alert can be investigated. Open the cluster instead."
+                "This cluster has no API server, so it cannot have its own alert setting."
                     .to_owned(),
                 cx,
             );
             return;
         };
-        let model = self.model.read(cx);
-        let discovered =
-            verified_discovery(model.discovery.get(&context), recent.origin.generation).map(|d| {
-                DiscoveredKinds {
-                    kinds: d.kinds.clone(),
-                    skipped_groups: d.incomplete_groups.clone(),
-                    stale_groups: Vec::new(),
-                }
-            });
-        let prompt = investigate_prompt(
-            alert,
-            &model.settings,
-            recent.origin.pin.server.as_deref(),
-            discovered.as_ref(),
-        );
-        match prompt {
-            InvestigatePrompt::Ready(prompt) => {
-                self.activate(&recent.origin, context, Some(prompt), cx);
-            }
-            InvestigatePrompt::Disabled(reason) => self.refuse(reason.message().to_owned(), cx),
-        }
+        let cluster = cluster.to_owned();
+        self.model.update(cx, |model, _| {
+            model.set_cluster_alerts(cluster, server, choice.stored());
+        });
     }
 
     fn show_note(&mut self, note: &'static str, cx: &mut Context<Self>) {
@@ -881,6 +1140,12 @@ impl AlertCenter {
     pub fn view_state(&self) -> AlertsState {
         AlertsState {
             enabled: self.enabled,
+            muted: {
+                let shared = self.muted.lock().expect("the muted set");
+                let mut muted: Vec<String> = shared.now.iter().cloned().collect();
+                muted.sort();
+                muted
+            },
             delivery: self.delivery.as_ref().map_or("none", Delivery::state),
             checked: self.tracker.checked.iter().map(|c| c.to_string()).collect(),
             recent: self
@@ -917,6 +1182,12 @@ pub fn install(model: &Entity<ClustersModel>, cx: &mut App) {
     cx.on_action(move |action: &InvestigateAlert, cx| {
         c.update(cx, |center, cx| center.investigate(&action.tag, cx));
     });
+    let c = center.clone();
+    cx.on_action(move |action: &SetClusterAlerts, cx| {
+        c.update(cx, |center, cx| {
+            center.set_cluster_choice(&action.cluster, action.choice, cx);
+        });
+    });
     cx.on_system_notification_response(move |response, cx| {
         cx.activate(true);
         center.update(cx, |center, cx| center.open(&response.tag, cx));
@@ -951,11 +1222,38 @@ pub fn render_button(cx: &App) -> Option<impl IntoElement + use<>> {
                 let mut menu = menu_fit::fit_menu(menu, window)
                     .item(
                         PopupMenuItem::new("Desktop notifications")
-                            .checked(state.enabled)
+                            .checked(state.global)
                             .on_click(registry::on_click(ToggleDesktopNotifications)),
                     )
                     .label(COVERAGE)
                     .label(NOT_COVERED);
+                let model = state.model.read(cx);
+                if let Some(active) = model.active_cluster() {
+                    let id = active.info.name.clone();
+                    let server = active.info.server.as_deref();
+                    let own =
+                        ClusterAlertChoice::of(model.settings.cluster_alerts_choice(&id, server));
+                    let default = if state.global { "on" } else { "off" };
+                    menu = menu.separator().label("This cluster");
+                    for (text, choice) in [
+                        (
+                            format!("Use the default ({default})"),
+                            ClusterAlertChoice::Default,
+                        ),
+                        ("Alerts on".to_owned(), ClusterAlertChoice::On),
+                        ("Alerts off".to_owned(), ClusterAlertChoice::Off),
+                    ] {
+                        menu = menu.item(
+                            PopupMenuItem::new(text)
+                                .checked(own == choice)
+                                .disabled(server.is_none())
+                                .on_click(registry::on_click(SetClusterAlerts {
+                                    cluster: id.clone(),
+                                    choice,
+                                })),
+                        );
+                    }
+                }
                 if let Some(delivery) = &state.delivery {
                     menu = menu.separator().label(delivery.text());
                 }
@@ -970,12 +1268,12 @@ pub fn render_button(cx: &App) -> Option<impl IntoElement + use<>> {
                         PopupMenuItem::new(text)
                             .on_click(registry::on_click(OpenAlert { tag: tag.clone() })),
                     );
-                    if matches!(alert.event, AlertEvent::Raised(_)) {
-                        menu = menu.item(
-                            PopupMenuItem::new("Investigate with agent (copies a prompt)")
-                                .on_click(registry::on_click(InvestigateAlert { tag })),
-                        );
-                    }
+                    menu = menu.item(match state.investigation(alert, cx) {
+                        Ok(_) => PopupMenuItem::new("Investigate with agent (copies a prompt)")
+                            .on_click(registry::on_click(InvestigateAlert { tag })),
+                        Err(why) => PopupMenuItem::new(format!("Investigate unavailable: {why}"))
+                            .disabled(true),
+                    });
                 }
                 menu
             }),

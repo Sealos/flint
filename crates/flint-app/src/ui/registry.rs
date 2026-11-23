@@ -38,7 +38,9 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-pub use super::alert_center::{InvestigateAlert, OpenAlert, ToggleDesktopNotifications};
+pub use super::alert_center::{
+    InvestigateAlert, OpenAlert, SetClusterAlerts, ToggleDesktopNotifications,
+};
 use super::compare::COMPARE_VIEW;
 pub use super::compare::{
     CompareObject, OpenCompare, RefreshCompare, ToggleCompareSame, ToggleCompareVolatile,
@@ -1832,6 +1834,14 @@ const fn arg(name: &'static str, description: &'static str, kind: ArgKind) -> Ar
 
 const CLUSTER: &[Arg] = &[arg("cluster", "kubeconfig context name", ArgKind::Cluster)];
 const ALERT: &[Arg] = &[arg("tag", "the alert's tag", ArgKind::Text)];
+const CLUSTER_ALERTS: &[Arg] = &[
+    arg("cluster", "kubeconfig context name", ArgKind::Cluster),
+    arg(
+        "choice",
+        "default, on or off",
+        ArgKind::Choice(&["default", "on", "off"]),
+    ),
+];
 const COMPARE_OBJECT: &[Arg] = &[
     arg("cluster", "kubeconfig context name", ArgKind::Cluster),
     arg("kind", "the kind, as plural or plural.group", ArgKind::Text),
@@ -2051,6 +2061,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Investigate Alert…",
             "Open an alert's cluster and copy a read-only prompt for an agent.",
             ALERT,
+        )
+        .of(C::Flint, S::App)
+        .hidden(),
+        Spec::with_args::<SetClusterAlerts>(
+            "Set Cluster Alerts…",
+            "Choose whether one cluster posts desktop notifications.",
+            CLUSTER_ALERTS,
         )
         .of(C::Flint, S::App)
         .hidden(),

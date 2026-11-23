@@ -2265,6 +2265,68 @@ async fn in_on_view_the_overview_watches_its_kinds_until_it_is_left() {
     assert!(server.writes().is_empty());
 }
 
+/// Points `file`'s context at `server` and returns the slot generation of the load.
+async fn point_at(core: &Core, file: &Path, server: &FakeApiServer, namespace: &str) -> u64 {
+    let events = core.handle.events();
+    let config = serde_json::to_value(server.kubeconfig_named(CONTEXT, Some(namespace))).unwrap();
+    let url = config["clusters"][0]["cluster"]["server"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    std::fs::write(file, config.to_string()).unwrap();
+    core.handle.reload_kubeconfig().await.unwrap();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Event::ClustersChanged(snapshot) = events.recv().await.unwrap()
+                && let Some(summary) = snapshot
+                    .clusters
+                    .iter()
+                    .find(|c| c.info.name == CONTEXT && c.info.server.as_deref() == Some(&url))
+            {
+                return summary.generation;
+            }
+        }
+    })
+    .await
+    .expect("the load is reported")
+}
+
+// An overview belongs to the slot it was opened on: the context's next definition is not read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_overview_reads_nothing_from_a_replaced_context() {
+    let (first, second) = (
+        FakeApiServer::start().await.unwrap(),
+        FakeApiServer::start().await.unwrap(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("kubeconfig");
+    let config = serde_json::to_value(first.kubeconfig_named(CONTEXT, Some("demo"))).unwrap();
+    std::fs::write(&file, config.to_string()).unwrap();
+    let core = Core::start_on(dir, vec![file.clone()], Settings::default()).await;
+    let original = point_at(&core, &file, &first, "other").await;
+    let open = core.handle.open_overview_on(CONTEXT, original);
+    open.registered().await;
+    until_overview_watches(&first, true, "the first server's feed").await;
+    assert!(open.telemetry().is_some(), "its own slot");
+
+    let replacement = point_at(&core, &file, &second, "demo").await;
+    assert_ne!(replacement, original);
+    // Another view of the new slot, so the name has a live feed the old overview could reach.
+    let _other_view = core.handle.open_overview(CONTEXT);
+    until_overview_watches(&second, true, "the replacement's feed").await;
+    assert!(core.handle.telemetry(CONTEXT).is_some());
+    assert!(open.telemetry().is_none(), "opened before the move");
+
+    let late = core.handle.open_overview_on(CONTEXT, original);
+    late.registered().await;
+    assert!(late.telemetry().is_none(), "asked for after the move");
+
+    let current = core.handle.open_overview_on(CONTEXT, replacement);
+    current.registered().await;
+    assert!(current.telemetry().is_some(), "the replacement's own");
+    assert!(first.writes().is_empty() && second.writes().is_empty());
+}
+
 async fn core_on_two_definitions(server: &FakeApiServer, context: &str) -> (Core, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let (first, second) = (dir.path().join("first"), dir.path().join("second"));
