@@ -5,9 +5,11 @@
 //! step it is at. A Secret is not editable: its values are masked here, and a mask must never
 //! be written back.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use flint_core::display::single_line;
 use flint_core::write::WriteTarget;
 use flint_core::write::{WriteAction, WriteError, WriteOutcome, WriteProposal, WriteReview};
 use flint_core::{ObjectDetail, WriteRefusal};
@@ -18,6 +20,7 @@ use serde_json::Value;
 
 use super::access::Gated;
 use super::{DetailEvent, DetailTab, DetailView, Fetch, protected_reason};
+use crate::ui::write_confirm;
 
 pub(super) enum Phase {
     Editing,
@@ -50,7 +53,25 @@ pub(super) struct YamlEdit {
     pub phase: Phase,
     /// Why the last step failed, in the server's or the core's words.
     pub error: Option<String>,
+    /// The object when the edit opened. A reload does not move it: what was typed is still
+    /// relative to this.
+    base: Value,
+    /// The object at the last reload.
+    latest: Option<Arc<ObjectDetail>>,
+    /// Paths the last review would overwrite after they changed on the cluster.
+    competing: Vec<String>,
     _task: Task<()>,
+}
+
+impl YamlEdit {
+    /// The warning the review step shows, naming paths and never a value.
+    pub(super) fn competing_warning(&self) -> Option<String> {
+        if matches!(self.phase, Phase::Reviewed(_)) {
+            competing_text(&self.competing)
+        } else {
+            None
+        }
+    }
 }
 
 /// The object as the editor opens it: no `status` or `managedFields`, `resourceVersion` kept.
@@ -113,6 +134,157 @@ fn replace_version_line(yaml: &str, version: &str) -> String {
         }
     }
     out
+}
+
+/// What the server sets in `metadata`: a difference here is not someone's edit.
+const SERVER_OWNED_METADATA: [&str; 8] = [
+    "creationTimestamp",
+    "deletionGracePeriodSeconds",
+    "deletionTimestamp",
+    "generation",
+    "managedFields",
+    "resourceVersion",
+    "selfLink",
+    "uid",
+];
+
+/// How many paths a warning names before it counts the rest.
+const NAMED_PATHS: usize = 5;
+
+fn without_server_owned(object: &Value) -> Value {
+    let mut kept = object.clone();
+    if let Some(fields) = kept.as_object_mut() {
+        fields.remove("status");
+    }
+    if let Some(metadata) = kept.get_mut("metadata").and_then(Value::as_object_mut) {
+        for field in SERVER_OWNED_METADATA {
+            metadata.remove(field);
+        }
+    }
+    kept
+}
+
+/// The paths that changed from `base` to `latest` and that `yaml` would set to something other
+/// than `latest`, sorted. Text that does not parse has none: its review fails.
+fn competing_changes(base: &Value, latest: &Value, yaml: &str) -> Vec<String> {
+    let Ok(edited) = serde_saphyr::from_str::<Value>(yaml) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    collect_competing(
+        Some(&without_server_owned(base)),
+        Some(&without_server_owned(latest)),
+        Some(&without_server_owned(&edited)),
+        "",
+        &mut found,
+    );
+    found.sort();
+    found.dedup();
+    found
+}
+
+fn collect_competing(
+    base: Option<&Value>,
+    latest: Option<&Value>,
+    edited: Option<&Value>,
+    path: &str,
+    found: &mut Vec<String>,
+) {
+    if base == latest || latest == edited {
+        return;
+    }
+    match (base, latest, edited) {
+        (Some(Value::Object(b)), Some(Value::Object(l)), None | Some(Value::Object(_))) => {
+            let e = edited.and_then(Value::as_object);
+            for key in b.keys().chain(l.keys()).collect::<BTreeSet<_>>() {
+                collect_competing(
+                    b.get(key),
+                    l.get(key),
+                    e.and_then(|e| e.get(key)),
+                    &key_path(path, key),
+                    found,
+                );
+            }
+        }
+        (Some(Value::Array(b)), Some(Value::Array(l)), Some(Value::Array(e))) => {
+            let (Some(nb), Some(nl), Some(ne)) = (by_name(b), by_name(l), by_name(e)) else {
+                found.push(path.to_owned());
+                return;
+            };
+            for name in nb.keys().chain(nl.keys()).collect::<BTreeSet<_>>() {
+                collect_competing(
+                    nb.get(name).copied(),
+                    nl.get(name).copied(),
+                    ne.get(name).copied(),
+                    &format!("{path}[{name}]"),
+                    found,
+                );
+            }
+            // Items in all three, in each list's order: a remote reorder the text would undo.
+            let order = |items: &'_ [Value]| -> Vec<String> {
+                items
+                    .iter()
+                    .filter_map(item_name)
+                    .filter(|n| nb.contains_key(n) && nl.contains_key(n) && ne.contains_key(n))
+                    .map(str::to_owned)
+                    .collect()
+            };
+            if order(b) != order(l) && order(e) != order(l) {
+                found.push(path.to_owned());
+            }
+        }
+        _ => found.push(path.to_owned()),
+    }
+}
+
+fn item_name(item: &Value) -> Option<&str> {
+    item.get("name").and_then(Value::as_str)
+}
+
+/// The list's items by `name`, if every item has its own: how Kubernetes lists containers, env
+/// and volumes. Any other list is compared whole.
+fn by_name(items: &[Value]) -> Option<BTreeMap<&str, &Value>> {
+    let mut named = BTreeMap::new();
+    for item in items {
+        if named.insert(item_name(item)?, item).is_some() {
+            return None;
+        }
+    }
+    Some(named)
+}
+
+fn key_path(path: &str, key: &str) -> String {
+    let plain = !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    match (plain, path.is_empty()) {
+        (true, true) => key.to_owned(),
+        (true, false) => format!("{path}.{key}"),
+        (false, _) => format!("{path}[\"{key}\"]"),
+    }
+}
+
+/// The warning for `paths`, or `None` when nothing would be overwritten.
+fn competing_text(paths: &[String]) -> Option<String> {
+    let (count, it) = match paths.len() {
+        0 => return None,
+        1 => ("1 field".to_owned(), "it"),
+        n => (format!("{n} fields"), "them"),
+    };
+    let mut named: Vec<String> = paths
+        .iter()
+        .take(NAMED_PATHS)
+        .map(|path| single_line(path))
+        .collect();
+    if paths.len() > NAMED_PATHS {
+        named.push(format!("and {} more", paths.len() - NAMED_PATHS));
+    }
+    Some(format!(
+        "{count} changed on the cluster since you opened this edit, and Apply would overwrite \
+         {it}: {}.",
+        named.join(", ")
+    ))
 }
 
 /// Whether the text sets `status`, which a review cannot show: the editor opens without it.
@@ -244,6 +416,7 @@ impl DetailView {
             return;
         };
         let target = self.edit_target(detail);
+        let base = detail.object.clone();
         let text = match editable_yaml(&detail.object) {
             Ok(text) => text,
             Err(why) => {
@@ -270,6 +443,9 @@ impl DetailView {
             target,
             phase: Phase::Editing,
             error: None,
+            base,
+            latest: None,
+            competing: Vec::new(),
             _task: Task::ready(()),
         });
         cx.notify();
@@ -310,6 +486,11 @@ impl DetailView {
         }
         edit.phase = Phase::Reviewing;
         edit.error = None;
+        edit.competing.clear();
+        let compare = edit
+            .latest
+            .clone()
+            .map(|latest| (edit.base.clone(), latest, yaml.clone()));
         let run = core.review_write(edit.target.clone(), WriteProposal::ApplyYaml { yaml });
         let name = self.object.name.clone();
         edit._task = cx.spawn(async move |this, cx| {
@@ -319,12 +500,19 @@ impl DetailView {
                 .ok()
                 .and_then(texts)
                 .map(|(before, after)| (before.to_owned(), after.to_owned()));
-            let patch = cx
+            let compare = compare.filter(|_| result.is_ok());
+            let (patch, competing) = cx
                 .background_spawn(async move {
-                    shown.and_then(|(before, after)| patch(&name, &before, &after))
+                    let competing = compare.map_or_else(Vec::new, |(base, latest, yaml)| {
+                        competing_changes(&base, &latest.object, &yaml)
+                    });
+                    let patch = shown.and_then(|(before, after)| patch(&name, &before, &after));
+                    (patch, competing)
                 })
                 .await;
-            let _ = this.update(cx, |view, cx| view.edit_reviewed(result, patch, cx));
+            let _ = this.update(cx, |view, cx| {
+                view.edit_reviewed(result, patch, competing, cx)
+            });
         });
         cx.notify();
     }
@@ -333,6 +521,7 @@ impl DetailView {
         &mut self,
         result: Result<WriteReview, WriteError>,
         patch: Option<String>,
+        competing: Vec<String>,
         cx: &mut Context<Self>,
     ) {
         let Some(edit) = &mut self.edit else {
@@ -344,6 +533,7 @@ impl DetailView {
                 match patch.as_deref().and_then(diff_file) {
                     Some(file) => {
                         edit.diff.update(cx, |diff, cx| diff.set_files([file], cx));
+                        edit.competing = competing;
                         edit.phase = Phase::Reviewed(Box::new(review));
                     }
                     None => {
@@ -372,12 +562,11 @@ impl DetailView {
         if !self.can_apply_edit() {
             return;
         }
-        if let Some(YamlEdit {
-            phase: Phase::Reviewed(review),
-            ..
-        }) = &self.edit
+        if let Some(edit) = &self.edit
+            && let Phase::Reviewed(review) = &edit.phase
         {
             let review = review.clone();
+            write_confirm::set_edit_note(review.target(), edit.competing_warning(), cx);
             cx.emit(DetailEvent::ConfirmWrite(review));
         }
     }
@@ -459,6 +648,7 @@ impl DetailView {
             cx.notify();
             return;
         }
+        edit.latest = Some(detail.clone());
         if let Some(version) = text("/metadata/resourceVersion") {
             let yaml = with_resource_version(&edit.editor.read(cx).value(), version);
             edit.editor
@@ -495,7 +685,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Fetch, Phase, edit_error_text, editable_yaml, patch, sets_status, with_resource_version,
+        Fetch, NAMED_PATHS, Phase, competing_changes, competing_text, edit_error_text,
+        editable_yaml, patch, sets_status, with_resource_version,
     };
     use crate::ui::support_tests::{WAIT, objects, open_workspace, standard_sections};
 
@@ -526,6 +717,104 @@ mod tests {
             "kind: X\nmetadata:\n  name: a\n  resourceVersion: \"8\"\nspec:\n  resourceVersion: \
              keep\n  replicas: 3\n"
         );
+    }
+
+    fn yaml(value: &serde_json::Value) -> String {
+        serde_saphyr::to_string(value).unwrap()
+    }
+
+    // A stale value kept by a reload is named, and so is a new value over a remote change.
+    #[test]
+    fn a_competing_change_is_listed() {
+        let base = json!({"metadata": {"name": "a"}, "spec": {"replicas": 1, "paused": false}});
+        let latest = json!({"metadata": {"name": "a"}, "spec": {"replicas": 5, "paused": false}});
+        assert_eq!(
+            competing_changes(&base, &latest, &yaml(&base)),
+            ["spec.replicas"]
+        );
+        let deliberate = yaml(&json!({
+            "metadata": {"name": "a"}, "spec": {"replicas": 9, "paused": false}
+        }));
+        assert_eq!(
+            competing_changes(&base, &latest, &deliberate),
+            ["spec.replicas"]
+        );
+    }
+
+    // A key added remotely is dropped by the stale text, one removed remotely comes back.
+    #[test]
+    fn a_remote_addition_or_removal_is_listed() {
+        let base = json!({"data": {"gone": "1", "same": "2"}});
+        let latest = json!({"data": {"new": "3", "same": "2"}});
+        assert_eq!(
+            competing_changes(&base, &latest, &yaml(&base)),
+            ["data.gone", "data.new"]
+        );
+    }
+
+    // A named list is compared per item: an edit to one container does not flag another.
+    #[test]
+    fn named_list_items_are_compared_by_name() {
+        let pod = |a: &str, b: &str| {
+            json!({"spec": {"containers": [
+                {"name": "a", "image": a}, {"name": "b", "image": b},
+            ]}})
+        };
+        let (base, latest) = (pod("1", "1"), pod("2", "1"));
+        assert_eq!(
+            competing_changes(&base, &latest, &yaml(&pod("1", "9"))),
+            ["spec.containers[a].image"]
+        );
+        assert!(competing_changes(&base, &latest, &yaml(&pod("2", "9"))).is_empty());
+    }
+
+    // No warning when the text already has the remote value, or the change is the server's.
+    #[test]
+    fn a_kept_or_ignored_change_is_not_listed() {
+        let base = json!({
+            "metadata": {"name": "a", "resourceVersion": "1", "generation": 1,
+                         "managedFields": [{"manager": "x"}]},
+            "spec": {"replicas": 1, "paused": false},
+            "status": {"ready": 1},
+        });
+        let latest = json!({
+            "metadata": {"name": "a", "resourceVersion": "2", "generation": 2,
+                         "managedFields": [{"manager": "y"}]},
+            "spec": {"replicas": 5, "paused": false},
+            "status": {"ready": 5},
+        });
+        let kept = yaml(&json!({
+            "metadata": {"name": "a", "resourceVersion": "2"},
+            "spec": {"replicas": 5, "paused": true},
+        }));
+        assert!(competing_changes(&base, &latest, &kept).is_empty());
+        let only_server = json!({
+            "metadata": {"name": "a", "resourceVersion": "2", "generation": 2},
+            "spec": {"replicas": 1, "paused": false},
+            "status": {"ready": 5},
+        });
+        assert!(competing_changes(&base, &only_server, &yaml(&base)).is_empty());
+    }
+
+    #[test]
+    fn a_warning_names_paths_and_never_a_value() {
+        let base = json!({"kind": "Secret", "data": {"password": "b2xkLXNlY3JldA=="}});
+        let latest = json!({"kind": "Secret", "data": {"password": "bmV3LXNlY3JldA=="}});
+        let paths = competing_changes(&base, &latest, &yaml(&base));
+        let text = competing_text(&paths).unwrap();
+        assert!(text.contains("data.password"), "{text}");
+        assert!(!text.contains("b2xkLXNlY3JldA"), "{text}");
+        assert!(!text.contains("bmV3LXNlY3JldA"), "{text}");
+    }
+
+    #[test]
+    fn a_warning_caps_its_list_and_counts_the_rest() {
+        assert_eq!(competing_text(&[]), None);
+        let paths: Vec<String> = (0..NAMED_PATHS + 2).map(|n| format!("p{n}")).collect();
+        let text = competing_text(&paths).unwrap();
+        assert!(text.starts_with("7 fields changed"), "{text}");
+        assert!(text.contains("p4") && !text.contains("p5"), "{text}");
+        assert!(text.ends_with("and 2 more."), "{text}");
     }
 
     #[test]
