@@ -411,7 +411,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   Match, selecting, copying and saving work on the rows shown: Save writes them, Save Matching Lines the matches
   among them. Turning the toggles off shows every line again; so does "Matching" while the search is empty. A full
   buffer (100,000 lines) is filtered without the tab stalling: what was shown stays until the filter is ready, and
-  the toolbar says it is filtering. In a narrow tab the toggles move to the More menu.
+  the toolbar says it is filtering. In a narrow tab the toggles move to the More menu, which scrolls in a short
+  window. With ".*" (Alt-Cmd-R) the search is a regular expression for highlights, Next and Previous Match, Save
+  Matching Lines and "Matching"; an invalid or oversized pattern matches nothing and says why beside the search.
 - Tests: unit, ui.
 
 ---

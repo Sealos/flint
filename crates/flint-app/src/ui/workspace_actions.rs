@@ -44,10 +44,11 @@ use super::super::registry::{
     SaveMatchingLines, SaveScope, SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom,
     ScrollToTop, SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext,
     SelectNextLine, SelectPrev, SelectPrevLine, SelectRow, SelectText, SetDockHeight,
-    SetNamespaces, SetPaneWidth, ShowAll, ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml,
-    SortBy, ToggleAnnotations, ToggleCommandPalette, ToggleLabels, ToggleManagedFields,
-    ToggleNamespace, ToggleNavSection, TogglePause, ToggleResourceSwitcher, ToggleSecretValue,
-    ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
+    SetLogContext, SetNamespaces, SetPaneWidth, ShowAll, ShowAllNamespaces, ShowOverview,
+    ShowTabList, ShowYaml, SortBy, ToggleAnnotations, ToggleCommandPalette, ToggleErrorsOnly,
+    ToggleLabels, ToggleLogRegex, ToggleManagedFields, ToggleMatchingOnly, ToggleNamespace,
+    ToggleNavSection, TogglePause, ToggleResourceSwitcher, ToggleSecretValue, ToggleSources,
+    ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
     WatchOpenViewsOnly,
 };
 use super::super::registry::{
@@ -477,6 +478,10 @@ impl Workspace {
             .when::<ToggleTimestamps>(view_open!(log))
             .when::<ToggleWrap>(view_open!(log))
             .when::<ToggleSources>(view_open!(log, LogView::is_workload))
+            .when::<ToggleMatchingOnly>(view_open!(log))
+            .when::<ToggleErrorsOnly>(view_open!(log))
+            .when::<ToggleLogRegex>(view_open!(log))
+            .add::<SetLogContext>(view_open!(log), |_, a, _| LogView::check_context(a.lines))
             .when::<FocusSearch>(view_open!(log))
             .when::<NextMatch>(view_open!(log, LogView::has_matches))
             .when::<PrevMatch>(view_open!(log, LogView::has_matches))
@@ -508,7 +513,8 @@ impl Workspace {
                 }
             })
             .add::<DragSelection>(
-                view_open!(log, LogView::has_selection),
+                // A filter can hide every selected row mid-drag; the drag goes on to a row shown.
+                view_open!(log, LogView::can_drag_selection),
                 |ws, a, cx| match log(ws, cx) {
                     Some(l) => l.check_line::<DragSelection>(a.line),
                     None => Err(ActionError::unavailable::<DragSelection>()),
