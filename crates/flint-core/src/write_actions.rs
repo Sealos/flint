@@ -18,6 +18,8 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::{
     Api, ApiResource, DeleteParams, DynamicObject, EvictParams, ListParams, Preconditions,
 };
+use kube::client::Body;
+use kube::core::Status;
 use kube::{Client, ResourceExt as _};
 use serde_json::{Value, json};
 
@@ -461,37 +463,75 @@ enum PatchBody {
     Json(Value),
 }
 
-/// Sends one PATCH through the gate. A JSON Patch's failed test is a conflict.
+/// Sends one PATCH through the gate, with the body `body` makes once the gate has answered. Only
+/// a 2xx carrying the patched object is a success. A JSON Patch's failed test is a conflict.
 async fn send_patch(
     gate: &mut impl ActionGate,
     object: &ActionObject,
     subresource: Option<&str>,
-    body: PatchBody,
+    body: impl FnOnce() -> PatchBody + Send,
     dry_run: bool,
 ) -> Result<(), ActionError> {
     object.check_path_segments()?;
     let client = gate.client().await?;
     let url = object.patch_url(client.clone(), subresource, dry_run);
-    let (content_type, body, tested) = match body {
+    let (content_type, body, tested) = match body() {
         PatchBody::Merge(body) => ("application/merge-patch+json", body, false),
         PatchBody::Json(body) => ("application/json-patch+json", body, true),
     };
     let request = http::Request::patch(url)
         .header(http::header::CONTENT_TYPE, content_type)
         .header(http::header::ACCEPT, "application/json")
-        .body(body.to_string().into_bytes())
+        .body(Body::from(body.to_string().into_bytes()))
         .map_err(|e| ActionError::Failed(e.to_string()))?;
-    let sent = tokio::time::timeout(REQUEST_TIMEOUT, client.request_text(request)).await;
-    let Ok(result) = sent else {
+    let answer = async {
+        let response = client.send(request).await?;
+        let status = response.status();
+        let bytes = response.into_body().collect_bytes().await?;
+        Ok::<_, kube::Error>((status, bytes))
+    };
+    let Ok(answer) = tokio::time::timeout(REQUEST_TIMEOUT, answer).await else {
         return Err(ActionError::Failed(timed_out()));
     };
-    match result {
-        Ok(_) => Ok(()),
-        Err(error) if tested && is_failed_patch_test(&error) => Err(ActionError::Conflict(
-            "the object changed since it was reviewed".to_owned(),
-        )),
-        Err(error) => Err(ActionError::of(error)),
+    let (status, bytes) = answer.map_err(ActionError::of)?;
+    if status.is_success() && is_patched_object(&bytes, object, subresource) {
+        return Ok(());
     }
+    if !status.is_client_error() && !status.is_server_error() {
+        // The body is not shown: it is not the API server's.
+        return Err(ActionError::Failed(format!(
+            "the answer ({}) was not from the API server; the change may or may not have applied",
+            status.as_u16()
+        )));
+    }
+    let error = kube::Error::Api(api_status(status, &bytes).boxed());
+    if tested && is_failed_patch_test(&error) {
+        return Err(ActionError::Conflict(
+            "the object changed since it was reviewed".to_owned(),
+        ));
+    }
+    Err(ActionError::of(error))
+}
+
+/// Whether a PATCH's answer is the object it was sent for, or that object's `subresource`.
+fn is_patched_object(bytes: &[u8], object: &ActionObject, subresource: Option<&str>) -> bool {
+    let Ok(answer) = serde_json::from_slice::<Value>(bytes) else {
+        return false;
+    };
+    let kind = match subresource {
+        Some("scale") => "Scale",
+        _ => object.resource.kind.as_str(),
+    };
+    answer.get("kind").and_then(Value::as_str) == Some(kind)
+        && answer.pointer("/metadata/uid").and_then(Value::as_str) == Some(object.uid.as_str())
+}
+
+/// An error answer as a `Status`, which a proxy's page is not.
+fn api_status(code: http::StatusCode, bytes: &[u8]) -> Status {
+    serde_json::from_slice(bytes).unwrap_or_else(|_| {
+        let text = String::from_utf8_lossy(bytes);
+        Status::failure(text.trim(), "Failed to parse error data").with_code(code.as_u16())
+    })
 }
 
 /// Why an action did not happen.
@@ -607,9 +647,12 @@ async fn send_scale(
         operations.push(json!({ "op": "test", "path": "/spec/replicas", "value": from }));
         operations.push(json!({ "op": "replace", "path": "/spec/replicas", "value": to }));
     }
-    let body = PatchBody::Json(Value::Array(operations));
+    let body = move || PatchBody::Json(Value::Array(operations));
     send_patch(gate, object, Some("scale"), body, mode.dry_run).await
 }
+
+/// The message of the API server's generic 422, which a failed JSON Patch test gets.
+const GENERIC_INVALID: &str = "the server rejected our request due to an error in our request";
 
 /// Whether a JSON Patch failed one of its tests: the API server answers that as Invalid with no
 /// field named, where a real validation error names its field.
@@ -617,7 +660,9 @@ fn is_failed_patch_test(error: &kube::Error) -> bool {
     let kube::Error::Api(status) = error else {
         return false;
     };
-    status.code == 422 && status.details.as_ref().is_none_or(|d| d.causes.is_empty())
+    status.code == 422
+        && status.message == GENERIC_INVALID
+        && status.details.as_ref().is_none_or(|d| d.causes.is_empty())
 }
 
 /// Restarts a Deployment's, DaemonSet's or StatefulSet's pods, as `kubectl rollout restart`. A
@@ -634,13 +679,15 @@ async fn send_restart(
             resource.plural
         )));
     }
-    let now = jiff::Timestamp::now().to_string();
-    let body = match mode.held {
-        Some(held) => PatchBody::Json(held_restart(&object.uid, held, &now)),
-        None => PatchBody::Merge(json!({
-            "metadata": { "uid": object.uid },
-            "spec": { "template": { "metadata": { "annotations": { RESTARTED_AT: now } } } },
-        })),
+    let body = || {
+        let now = jiff::Timestamp::now().to_string();
+        match mode.held {
+            Some(held) => PatchBody::Json(held_restart(&object.uid, held, &now)),
+            None => PatchBody::Merge(json!({
+                "metadata": { "uid": object.uid },
+                "spec": { "template": { "metadata": { "annotations": { RESTARTED_AT: now } } } },
+            })),
+        }
     };
     send_patch(gate, object, None, body, mode.dry_run).await
 }
@@ -679,10 +726,12 @@ pub(crate) async fn set_cordoned(
     node: &ActionObject,
     cordoned: bool,
 ) -> Result<(), ActionError> {
-    let body = PatchBody::Merge(json!({
-        "metadata": { "uid": node.uid },
-        "spec": { "unschedulable": cordoned },
-    }));
+    let body = || {
+        PatchBody::Merge(json!({
+            "metadata": { "uid": node.uid },
+            "spec": { "unschedulable": cordoned },
+        }))
+    };
     send_patch(gate, node, None, body, false).await
 }
 
@@ -1153,7 +1202,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use http::{Request, Response};
-    use kube::client::Body;
     use serde_json::Value;
 
     use super::*;
@@ -1219,11 +1267,16 @@ mod tests {
                 };
                 seen.lock().unwrap().push(entry.clone());
                 let (code, value) = reply(&entry);
+                // A string is sent as it is, as a proxy's page would be.
+                let bytes = match &value {
+                    Value::String(text) => text.clone().into_bytes(),
+                    other => serde_json::to_vec(other).unwrap(),
+                };
                 Ok::<_, std::convert::Infallible>(
                     Response::builder()
                         .status(code)
                         .header("content-type", "application/json")
-                        .body(Body::from(serde_json::to_vec(&value).unwrap()))
+                        .body(Body::from(bytes))
                         .unwrap(),
                 )
             }
@@ -1289,7 +1342,22 @@ mod tests {
         }
     }
 
-    fn ok(_: &Seen) -> (u16, Value) {
+    /// What the API server answers a PATCH with: the object, or its `Scale`.
+    fn patched(seen: &Seen) -> Value {
+        let (kind, uid) = if seen.path.ends_with("/scale") {
+            ("Scale", "uid-web")
+        } else if seen.path.contains("/nodes/") {
+            ("Node", "uid-node")
+        } else {
+            ("Deployment", "uid-web")
+        };
+        json!({"apiVersion": "v1", "kind": kind, "metadata": {"name": "x", "uid": uid}})
+    }
+
+    fn ok(seen: &Seen) -> (u16, Value) {
+        if seen.method == "PATCH" {
+            return (200, patched(seen));
+        }
         (
             200,
             json!({"apiVersion": "v1", "kind": "Status", "status": "Success",
@@ -1624,6 +1692,95 @@ mod tests {
         assert!(log.lock().unwrap().is_empty());
     }
 
+    // covers UP-53: only a 2xx carrying the object patched is a success, on every PATCH.
+    #[tokio::test]
+    async fn a_patch_answer_must_be_the_object() {
+        let page = || json!("<html>Sign in</html>");
+        let answers: Vec<(u16, Value)> = vec![
+            (302, page()),
+            (302, json!("")),
+            (200, page()),
+            (200, json!("")),
+            (
+                200,
+                json!({"kind": "Status", "status": "Success", "metadata": {}}),
+            ),
+            (
+                200,
+                json!({"kind": "Deployment", "metadata": {"uid": "another"}}),
+            ),
+            (200, json!({"kind": "Node", "metadata": {"uid": "another"}})),
+            (
+                200,
+                json!({"kind": "Scale", "metadata": {"uid": "another"}}),
+            ),
+        ];
+        for (code, answer) in answers {
+            let sent = answer.clone();
+            let (client, _log) = fake(Arc::new(move |_| (code, sent.clone())));
+            let mut gated = writes(client, open());
+            for result in [
+                scale(&mut gated, &deployment(), 2, 3).await,
+                rollout_restart(&mut gated, &deployment()).await,
+                set_cordoned(&mut gated, &node(), true).await,
+            ] {
+                assert!(
+                    matches!(result, Err(ActionError::Failed(_))),
+                    "{code} {answer}: {result:?}"
+                );
+            }
+        }
+    }
+
+    // covers UP-53: a webhook's 422 without causes keeps its reason and is no stale review.
+    #[tokio::test]
+    async fn a_webhook_refusal_is_not_a_failed_patch_test() {
+        let refused = json!({"apiVersion": "v1", "kind": "Status", "status": "Failure",
+                             "code": 422, "reason": "Invalid", "details": {},
+                             "message": "admission webhook denied the request: rollout freeze"});
+        let (client, _log) = fake(Arc::new(move |_| (422, refused.clone())));
+        let result = scale(&mut writes(client, open()), &deployment(), 2, 3).await;
+        assert!(
+            matches!(&result, Err(ActionError::Failed(text)) if text.contains("rollout freeze")),
+            "{result:?}"
+        );
+    }
+
+    /// A gate that takes a moment and says when it answered.
+    struct SlowGate {
+        client: Client,
+        answered: Arc<Mutex<Option<jiff::Timestamp>>>,
+    }
+
+    impl ActionGate for SlowGate {
+        async fn client(&mut self) -> Result<Client, ActionError> {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            *self.answered.lock().unwrap() = Some(jiff::Timestamp::now());
+            Ok(self.client.clone())
+        }
+    }
+
+    // covers UP-53: a restart is stamped once the gate has answered, not before a slow check.
+    #[tokio::test]
+    async fn a_restart_is_stamped_after_the_gate() {
+        let (client, log) = fake(Arc::new(ok));
+        let answered = Arc::default();
+        let mut gate = SlowGate {
+            client,
+            answered: Arc::clone(&answered),
+        };
+        rollout_restart(&mut gate, &deployment()).await.unwrap();
+        let answered = answered.lock().unwrap().expect("the gate was asked");
+        let seen = log.lock().unwrap();
+        let stamp: jiff::Timestamp = seen[0].body["spec"]["template"]["metadata"]["annotations"]
+            [RESTARTED_AT]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(stamp >= answered, "{stamp} is before {answered}");
+    }
+
     // covers UP-53: a paused Deployment would accept a restart and restart nothing.
     #[test]
     fn a_paused_deployment_is_not_restarted() {
@@ -1640,7 +1797,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_patch_test_is_a_conflict() {
         let bare = json!({"apiVersion": "v1", "kind": "Status", "status": "Failure", "code": 422,
-                          "reason": "Invalid", "message": "rejected", "details": {}});
+                          "reason": "Invalid", "message": GENERIC_INVALID, "details": {}});
         let (client, log) = fake(Arc::new(move |_| (422, bare.clone())));
         let result = scale(&mut writes(client, open()), &deployment(), 2, 3).await;
         assert!(
@@ -1676,14 +1833,7 @@ mod tests {
     // covers UP-53
     #[tokio::test]
     async fn rollout_restart_annotates_the_pod_template() {
-        let reply: Reply = Arc::new(|_| {
-            (
-                200,
-                json!({"apiVersion": "apps/v1", "kind": "Deployment",
-                         "metadata": {"name": "web"}}),
-            )
-        });
-        let (client, log) = fake(reply);
+        let (client, log) = fake(Arc::new(ok));
         let mut gated = writes(client, open());
         rollout_restart(&mut gated, &deployment()).await.unwrap();
         {
@@ -1712,13 +1862,7 @@ mod tests {
     // covers UP-53
     #[tokio::test]
     async fn cordon_and_uncordon_set_the_node_by_uid() {
-        let reply: Reply = Arc::new(|_| {
-            (
-                200,
-                json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": "worker"}}),
-            )
-        });
-        let (client, log) = fake(reply);
+        let (client, log) = fake(Arc::new(ok));
         let mut gated = writes(client, open());
         set_cordoned(&mut gated, &node(), true).await.unwrap();
         set_cordoned(&mut gated, &node(), false).await.unwrap();
@@ -1787,11 +1931,7 @@ mod tests {
     ) -> Reply {
         let tried = Mutex::new(BTreeSet::new());
         Arc::new(move |seen| match seen.method.as_str() {
-            "PATCH" => (
-                200,
-                json!({"apiVersion": "v1", "kind": "Node",
-                                    "metadata": {"name": "worker"}}),
-            ),
+            "PATCH" => (200, node_object("uid-node")),
             "POST" => {
                 let name = evicted_pod(&seen.path).expect("an eviction");
                 tried.lock().unwrap().insert(name.to_owned());
@@ -2337,11 +2477,7 @@ mod tests {
         let counted = reads.clone();
         let replaced = Arc::new(AtomicBool::new(false));
         let reply: Reply = Arc::new(move |seen| match seen.method.as_str() {
-            "PATCH" => (
-                200,
-                json!({"apiVersion": "v1", "kind": "Node",
-                                    "metadata": {"name": "worker"}}),
-            ),
+            "PATCH" => (200, node_object("uid-node")),
             "POST" => {
                 if seen.path.ends_with("/replaced/eviction") {
                     replaced.store(true, Ordering::SeqCst);
