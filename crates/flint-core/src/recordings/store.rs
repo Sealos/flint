@@ -1,7 +1,9 @@
 //! `recordings.sqlite`: what is recorded, under which budget, and for how long.
 // module-tests: store_tests.rs
 
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
+use std::ops::Range;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -25,8 +27,6 @@ const ROW_OVERHEAD: u64 = 64;
 const MAX_TEXT_BYTES: usize = crate::logs::MAX_LINE_BYTES;
 /// The longest stored name or reason.
 const MAX_NAME_BYTES: usize = 1024;
-/// How many rows one eviction step deletes.
-const EVICT_CHUNK: i64 = 64;
 /// The most one eviction transaction frees, and how many rows one retention transaction deletes:
 /// small commits let the write-ahead log checkpoint instead of growing.
 const MAX_EVICT_TX_BYTES: u64 = 1024 * 1024;
@@ -38,6 +38,15 @@ const MAX_WAL_BYTES: u64 = 16 * 1024 * 1024;
 /// The smallest budgets a store runs with: the schema itself has to fit.
 const MIN_TOTAL_BYTES: u64 = 1024 * 1024;
 const MIN_RECORDING_BYTES: u64 = 16 * 1024;
+/// What a gap counts for against its recording's budget, and the most one recording keeps. Past
+/// that its oldest closed gaps go. At most half a recording's budget goes to gaps.
+const GAP_COST: u64 = ROW_OVERHEAD;
+const MAX_GAPS: u64 = 1024;
+/// How long SQLite waits for a lock, and how many times a write tries before giving up.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const WRITE_ATTEMPTS: u32 = 3;
+/// How many recordings can have a dropped-row count waiting to be saved.
+const MAX_DEFERRED_COUNTS: usize = 4096;
 
 /// How long recorded data is kept, and how much of it. Starred recordings are exempt from age and
 /// are never evicted: once they hold the whole budget, new rows are dropped and counted.
@@ -155,6 +164,61 @@ impl Batch {
     }
 }
 
+/// A run of one batch's rows, written in one transaction.
+#[derive(Clone, Copy, Default)]
+struct Part<'a> {
+    lines: &'a [LogRow],
+    events: &'a [EventRow],
+    samples: &'a [SampleRow],
+}
+
+impl Part<'_> {
+    fn rows(&self) -> u64 {
+        (self.lines.len() + self.events.len() + self.samples.len()) as u64
+    }
+}
+
+/// `batch` in runs that each cost at most `max`, or one row if that alone costs more.
+fn parts(batch: &Batch, max: u64) -> Vec<Part<'_>> {
+    let lines = runs(&batch.lines, max, |l| {
+        stored_cost(l.pod.len() + l.container.len() + l.text.len())
+    });
+    let events = runs(&batch.events, max, |e| {
+        let names = e.reason.len() + e.object_kind.len() + e.object_name.len();
+        stored_cost(names + e.message.len())
+    });
+    let samples = runs(&batch.samples, max, |s| stored_cost(s.pod.len()));
+    let lines = lines.into_iter().map(|r| Part {
+        lines: &batch.lines[r],
+        ..Part::default()
+    });
+    let events = events.into_iter().map(|r| Part {
+        events: &batch.events[r],
+        ..Part::default()
+    });
+    let samples = samples.into_iter().map(|r| Part {
+        samples: &batch.samples[r],
+        ..Part::default()
+    });
+    lines.chain(events).chain(samples).collect()
+}
+
+fn runs<T>(items: &[T], max: u64, cost: impl Fn(&T) -> u64) -> Vec<Range<usize>> {
+    let (mut out, mut start, mut sum) = (Vec::new(), 0, 0u64);
+    for (at, item) in items.iter().enumerate() {
+        let item = cost(item);
+        if at > start && sum + item > max {
+            out.push(start..at);
+            (start, sum) = (at, 0);
+        }
+        sum += item;
+    }
+    if start < items.len() {
+        out.push(start..items.len());
+    }
+    out
+}
+
 /// Why a recording has a hole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GapReason {
@@ -238,6 +302,15 @@ pub(super) fn now_ms() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
+/// Another connection holds the lock: trying again can work.
+fn is_busy(error: &RecordingError) -> bool {
+    matches!(
+        error,
+        RecordingError::Sqlite(rusqlite::Error::SqliteFailure(e, _))
+            if matches!(e.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
 fn is_full(error: &RecordingError) -> bool {
     matches!(
         error,
@@ -254,6 +327,12 @@ pub struct Store {
     page_size: u64,
     /// The total budget less the write-ahead log's part: what the main file may use.
     file_budget: u64,
+    wal_path: PathBuf,
+    /// The write-ahead log's part of the total budget.
+    wal_limit: u64,
+    busy_timeout: Duration,
+    /// Dropped rows not yet saved on their recordings, because the database took no writes.
+    deferred_drops: BTreeMap<i64, u64>,
 }
 
 impl Store {
@@ -271,14 +350,15 @@ impl Store {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         // Must come before the first table: it decides how the file gives pages back.
         conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         schema::ensure(&mut conn)?;
-        prepare_files(&path)?;
+        // Only by path: closing any descriptor of the open database would drop SQLite's locks.
+        check_files(&path)?;
         let page_size: i64 = conn.pragma_query_value(None, "page_size", |row| row.get(0))?;
         let retention = Retention {
             max_total_bytes: retention.max_total_bytes.max(MIN_TOTAL_BYTES),
@@ -298,6 +378,10 @@ impl Store {
             scrubber: Scrubber::default(),
             page_size: page_size as u64,
             file_budget: retention.max_total_bytes - reserve,
+            wal_path: PathBuf::from(format!("{}-wal", path.display())),
+            wal_limit: reserve,
+            busy_timeout: BUSY_TIMEOUT,
+            deferred_drops: BTreeMap::new(),
         };
         store.end_running(now_ms())?;
         while store.used_bytes()? > store.file_budget {
@@ -438,11 +522,28 @@ impl Store {
         if self.info(id)?.ended_ms.is_some() {
             return Err(RecordingError::Ended);
         }
-        self.conn.execute(
+        let keep = (self.retention.max_recording_bytes / (2 * GAP_COST)).min(MAX_GAPS) as i64;
+        let tx = self.conn.transaction()?;
+        let added = tx.execute(
             "INSERT INTO gaps (recording_id, from_ms, reason) VALUES (?1, ?2, ?3)
              ON CONFLICT (recording_id) WHERE to_ms IS NULL DO NOTHING",
             params![id.0, now_ms, reason.column()],
         )?;
+        if added > 0 {
+            let removed = tx.execute(
+                "DELETE FROM gaps WHERE id IN
+                 (SELECT id FROM gaps WHERE recording_id = ?1 AND to_ms IS NOT NULL
+                  ORDER BY from_ms, id
+                  LIMIT MAX((SELECT COUNT(*) FROM gaps WHERE recording_id = ?1) - ?2, 0))",
+                params![id.0, keep],
+            )?;
+            let charge = (added as i64 - removed as i64) * GAP_COST as i64;
+            tx.execute(
+                "UPDATE recordings SET bytes = MAX(bytes + ?2, 0) WHERE id = ?1",
+                params![id.0, charge],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -472,10 +573,12 @@ impl Store {
         self.conn
             .execute("DELETE FROM recordings WHERE id = ?1", [id.0])?;
         self.scrubber.forget(id.0);
+        self.deferred_drops.remove(&id.0);
         self.vacuum()
     }
 
     pub fn info(&self, id: RecordingId) -> Result<RecordingInfo, RecordingError> {
+        let deferred = self.deferred_drops.get(&id.0).copied().unwrap_or(0);
         self.conn
             .query_row(
                 "SELECT started_ms, ended_ms, starred, bytes, dropped_rows,
@@ -489,7 +592,7 @@ impl Store {
                         ended_ms: row.get(1)?,
                         starred: row.get(2)?,
                         bytes: row.get::<_, i64>(3)? as u64,
-                        dropped_rows: row.get::<_, i64>(4)? as u64,
+                        dropped_rows: row.get::<_, i64>(4)? as u64 + deferred,
                         paused: row.get(5)?,
                     })
                 },
@@ -508,6 +611,19 @@ impl Store {
         current: &ConnectionIdentity,
         batch: Batch,
     ) -> Result<Appended, RecordingError> {
+        match self.append_counted(id, current, batch)? {
+            (appended, None) => Ok(appended),
+            (_, Some(error)) => Err(error),
+        }
+    }
+
+    /// [`Self::append`], which also says how far it got when a later part of the batch failed.
+    pub(super) fn append_counted(
+        &mut self,
+        id: RecordingId,
+        current: &ConnectionIdentity,
+        batch: Batch,
+    ) -> Result<(Appended, Option<RecordingError>), RecordingError> {
         if let Err(refused) = self.check(id, current) {
             match refused {
                 // Not stored, but a key block opened here runs on into the lines after resuming.
@@ -515,47 +631,154 @@ impl Store {
                 RecordingError::Ended | RecordingError::UnknownRecording => {
                     self.scrubber.forget(id.0);
                 }
+                // Not stored either, and its lines still count for what comes after them.
+                ref error if error.is_storage() => drop(self.scrubbed(id, batch)),
                 // Another connection's rows say nothing about this recording's open blocks.
                 _ => {}
             }
             return Err(refused);
         }
+        self.flush_dropped_counts();
         let clean = self.scrubbed(id, batch);
-        let appended = match self.write(id, current, &clean) {
-            Err(e) if is_full(&e) => {
-                self.make_room()?;
-                match self.write(id, current, &clean) {
-                    Err(e) if is_full(&e) => {
-                        self.count_dropped(id, clean.rows())?;
-                        Appended {
-                            stored: 0,
-                            dropped: clean.rows(),
-                        }
-                    }
-                    other => other?,
+        let mut total = Appended::default();
+        let mut failure = None;
+        // Small transactions, so the write-ahead log can be checked and checkpointed between them.
+        for part in parts(&clean, (self.wal_limit / 4).max(1)) {
+            if !self.wal_has_room() {
+                self.count_dropped(id, part.rows());
+                total.dropped += part.rows();
+                continue;
+            }
+            match self.write_part(id, current, part) {
+                Ok(done) => {
+                    total.stored += done.stored;
+                    total.dropped += done.dropped;
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    break;
                 }
             }
-            other => other?,
-        };
+        }
         // The rows are stored: a failure here is not a failure of this append.
-        if self.used_bytes().is_ok_and(|used| used > self.file_budget)
+        if self.wal_has_room()
+            && self.used_bytes().is_ok_and(|used| used > self.file_budget)
             && let Err(error) = self.make_room()
         {
             tracing::warn!(%error, "cannot make room in the recordings database");
         }
-        Ok(appended)
+        Ok((total, failure))
     }
 
-    /// Adds to a recording's count of rows that were never stored.
-    pub(super) fn count_dropped(
+    /// Writes one part, making room if the file is full and trying again while another connection
+    /// holds the lock.
+    fn write_part(
         &mut self,
         id: RecordingId,
-        rows: u64,
-    ) -> Result<(), RecordingError> {
+        current: &ConnectionIdentity,
+        part: Part<'_>,
+    ) -> Result<Appended, RecordingError> {
+        let mut attempt = 1;
+        loop {
+            let result = match self.write(id, current, part) {
+                Err(e) if is_full(&e) => {
+                    self.make_room()?;
+                    match self.write(id, current, part) {
+                        Err(e) if is_full(&e) => {
+                            self.count_dropped(id, part.rows());
+                            Ok(Appended {
+                                stored: 0,
+                                dropped: part.rows(),
+                            })
+                        }
+                        other => other,
+                    }
+                }
+                other => other,
+            };
+            match result {
+                Err(e) if is_busy(&e) && attempt < WRITE_ATTEMPTS => attempt += 1,
+                other => return other,
+            }
+        }
+    }
+
+    /// Whether the write-ahead log has room for more. Past its limit it is checkpointed without
+    /// waiting; while a reader keeps that from reclaiming it, writes are suspended.
+    fn wal_has_room(&mut self) -> bool {
+        if self.wal_bytes() <= self.wal_limit {
+            return true;
+        }
+        if self.conn.busy_timeout(Duration::ZERO).is_err() {
+            return false;
+        }
+        let blocked = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                row.get::<_, i64>(0)
+            });
+        if let Err(error) = self.conn.busy_timeout(self.busy_timeout) {
+            tracing::warn!(%error, "cannot restore the recordings lock timeout");
+        }
+        matches!(blocked, Ok(0)) && self.wal_bytes() <= self.wal_limit
+    }
+
+    fn wal_bytes(&self) -> u64 {
+        std::fs::metadata(&self.wal_path).map_or(0, |meta| meta.len())
+    }
+
+    /// Adds to a recording's count of rows that were never stored, now or once the database takes
+    /// writes again.
+    pub(super) fn count_dropped(&mut self, id: RecordingId, rows: u64) {
+        if !self.wal_has_room() || self.save_dropped(id.0, rows).is_err() {
+            self.defer_dropped(id.0, rows);
+        }
+    }
+
+    fn save_dropped(&self, id: i64, rows: u64) -> Result<(), RecordingError> {
         self.conn.execute(
             "UPDATE recordings SET dropped_rows = dropped_rows + ?2 WHERE id = ?1",
-            params![id.0, rows as i64],
+            params![id, rows as i64],
         )?;
+        Ok(())
+    }
+
+    fn defer_dropped(&mut self, id: i64, rows: u64) {
+        if self.deferred_drops.len() >= MAX_DEFERRED_COUNTS
+            && !self.deferred_drops.contains_key(&id)
+        {
+            tracing::warn!(rows, "cannot keep count of dropped recording rows");
+            return;
+        }
+        *self.deferred_drops.entry(id).or_default() += rows;
+    }
+
+    /// Saves the dropped-row counts that had to wait, if the database takes writes.
+    pub(super) fn flush_dropped_counts(&mut self) {
+        if self.deferred_drops.is_empty() || !self.wal_has_room() {
+            return;
+        }
+        for (id, rows) in std::mem::take(&mut self.deferred_drops) {
+            if self.save_dropped(id, rows).is_err() {
+                self.defer_dropped(id, rows);
+            }
+        }
+    }
+
+    /// A loss could not be placed in the queue: withholds every running recording until it ends,
+    /// and counts `rows` on each, since any of them may be the one that lost them.
+    pub(super) fn seal_running(&mut self, rows: u64) -> Result<(), RecordingError> {
+        let ids: Vec<i64> = self
+            .conn
+            .prepare("SELECT id FROM recordings WHERE ended_ms IS NULL")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        for id in ids {
+            self.scrubber.seal(id);
+            if rows > 0 {
+                self.count_dropped(RecordingId(id), rows);
+            }
+        }
         Ok(())
     }
 
@@ -571,6 +794,9 @@ impl Store {
 
     /// Removes what is past its age, then whatever is over the total budget.
     pub fn apply_retention(&mut self, now_ms: i64) -> Result<(), RecordingError> {
+        if !self.wal_has_room() {
+            return Ok(());
+        }
         let age = i64::try_from(self.retention.max_age.as_millis()).unwrap_or(i64::MAX);
         let cutoff = now_ms.saturating_sub(age);
         let ids: Vec<i64> = self
@@ -580,8 +806,11 @@ impl Store {
             .collect::<Result<_, _>>()?;
         for id in ids {
             for table in ROW_TABLES {
-                while self.expire_chunk(table, id, cutoff)? == RETENTION_CHUNK {}
+                while self.wal_has_room()
+                    && self.expire_chunk(table, id, cutoff)? == RETENTION_CHUNK
+                {}
             }
+            while self.wal_has_room() && self.expire_gaps(id, cutoff)? == RETENTION_CHUNK {}
         }
         self.conn.execute(
             "DELETE FROM recordings WHERE starred = 0 AND ended_ms IS NOT NULL AND ended_ms < ?1
@@ -622,6 +851,23 @@ impl Store {
         Ok(deleted)
     }
 
+    /// Deletes up to [`RETENTION_CHUNK`] closed gaps that ended before `cutoff`; how many.
+    fn expire_gaps(&mut self, id: i64, cutoff: i64) -> Result<i64, RecordingError> {
+        let tx = self.conn.transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM gaps WHERE id IN
+             (SELECT id FROM gaps WHERE recording_id = ?1 AND to_ms IS NOT NULL AND to_ms < ?2
+              ORDER BY from_ms, id LIMIT ?3)",
+            params![id, cutoff, RETENTION_CHUNK],
+        )? as i64;
+        tx.execute(
+            "UPDATE recordings SET bytes = MAX(bytes - ?2, 0) WHERE id = ?1",
+            params![id, removed * GAP_COST as i64],
+        )?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
     /// The bytes of the file in use, free pages aside.
     pub fn used_bytes(&self) -> Result<u64, RecordingError> {
         let pages: i64 = self
@@ -646,9 +892,13 @@ impl Store {
         let lines = lines
             .into_iter()
             .map(|line| {
-                let text = self
-                    .scrubber
-                    .line(id.0, &line.pod, &line.container, &line.text);
+                let text = if line.truncated {
+                    self.scrubber
+                        .cut_line(id.0, &line.pod, &line.container, &line.text)
+                } else {
+                    self.scrubber
+                        .line(id.0, &line.pod, &line.container, &line.text)
+                };
                 let (text, cut) = clipped(text, MAX_TEXT_BYTES);
                 LogRow {
                     at_ms: line.at_ms,
@@ -689,7 +939,7 @@ impl Store {
         &mut self,
         id: RecordingId,
         current: &ConnectionIdentity,
-        batch: &Batch,
+        batch: Part<'_>,
     ) -> Result<Appended, RecordingError> {
         let budget = self.retention.max_recording_bytes;
         let tx = self
@@ -721,7 +971,7 @@ impl Store {
                 "INSERT INTO log_lines (recording_id, at_ms, pod, container, text, truncated, bytes)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
-            for l in &batch.lines {
+            for l in batch.lines {
                 let cost = stored_cost(l.pod.len() + l.container.len() + l.text.len());
                 if admit(cost) {
                     insert.execute(params![
@@ -740,7 +990,7 @@ impl Store {
                  (recording_id, at_ms, kind, reason, object_kind, object_name, message, count, bytes)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
-            for e in &batch.events {
+            for e in batch.events {
                 let text = e.reason.len() + e.object_kind.len() + e.object_name.len();
                 let cost = stored_cost(text + e.message.len());
                 if admit(cost) {
@@ -762,7 +1012,7 @@ impl Store {
                  (recording_id, at_ms, pod, cpu_millicores, memory_bytes, bytes)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
-            for s in &batch.samples {
+            for s in batch.samples {
                 let cost = stored_cost(s.pod.len());
                 if admit(cost) {
                     insert.execute(params![
@@ -798,7 +1048,7 @@ impl Store {
             return Ok(());
         }
         let mut left = (used - target).clamp(MIN_EVICT_BYTES, self.file_budget / 10);
-        while left > 0 {
+        while left > 0 && self.wal_has_room() {
             let oldest: Option<i64> = self
                 .conn
                 .query_row(
@@ -831,6 +1081,12 @@ impl Store {
         let mut rows = statement.query([])?;
         while rows.next()?.is_some() {}
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_busy_timeout(&mut self, timeout: Duration) {
+        self.busy_timeout = timeout;
+        self.conn.busy_timeout(timeout).unwrap();
     }
 
     #[cfg(test)]
@@ -882,38 +1138,58 @@ fn check_on(
     Ok((starred, bytes as u64))
 }
 
-/// Deletes the oldest rows of a recording until `want` bytes are gone or it has none, and returns
-/// the bytes freed. The caller updates the recording's byte count.
+/// The next thing to evict: when, its table's place, its row and what it frees.
+type Evictable = (i64, usize, i64, u64);
+
+/// Deletes a recording's oldest rows and closed gaps, one at a time across all tables, until
+/// `want` bytes are gone or it has none left, and returns the bytes freed. The caller updates the
+/// recording's byte count.
 fn evict_oldest(conn: &Connection, recording: i64, want: u64) -> Result<u64, RecordingError> {
     let mut freed = 0u64;
     while freed < want {
-        let mut oldest: Option<(i64, &str)> = None;
-        for table in ROW_TABLES {
-            let at: Option<i64> = conn
+        let mut oldest: Option<Evictable> = None;
+        for (index, table) in ROW_TABLES.iter().enumerate() {
+            let row = conn
                 .prepare_cached(&format!(
-                    "SELECT MIN(at_ms) FROM {table} WHERE recording_id = ?1"
+                    "SELECT at_ms, id, bytes FROM {table} WHERE recording_id = ?1
+                     ORDER BY at_ms, id LIMIT 1"
                 ))?
-                .query_row([recording], |row| row.get(0))?;
-            if let Some(at) = at
-                && oldest.is_none_or(|(best, _)| at < best)
-            {
-                oldest = Some((at, table));
-            }
+                .query_row([recording], |row| {
+                    Ok((
+                        row.get(0)?,
+                        index,
+                        row.get(1)?,
+                        row.get::<_, i64>(2)? as u64,
+                    ))
+                })
+                .optional()?;
+            oldest = earliest(oldest, row);
         }
-        let Some((_, table)) = oldest else {
+        let gap = conn
+            .prepare_cached(
+                "SELECT from_ms, id FROM gaps WHERE recording_id = ?1 AND to_ms IS NOT NULL
+                 ORDER BY from_ms, id LIMIT 1",
+            )?
+            .query_row([recording], |row| {
+                Ok((row.get(0)?, ROW_TABLES.len(), row.get(1)?, GAP_COST))
+            })
+            .optional()?;
+        let Some((_, index, id, bytes)) = earliest(oldest, gap) else {
             break;
         };
-        let mut delete = conn.prepare_cached(&format!(
-            "DELETE FROM {table} WHERE id IN
-             (SELECT id FROM {table} WHERE recording_id = ?1 ORDER BY at_ms, id LIMIT ?2)
-             RETURNING bytes"
-        ))?;
-        let mut rows = delete.query(params![recording, EVICT_CHUNK])?;
-        while let Some(row) = rows.next()? {
-            freed += row.get::<_, i64>(0)? as u64;
-        }
+        let table = ROW_TABLES.get(index).copied().unwrap_or("gaps");
+        conn.prepare_cached(&format!("DELETE FROM {table} WHERE id = ?1"))?
+            .execute([id])?;
+        freed += bytes;
     }
     Ok(freed)
+}
+
+fn earliest(a: Option<Evictable>, b: Option<Evictable>) -> Option<Evictable> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if (b.0, b.1) < (a.0, a.1) { b } else { a }),
+        (a, b) => a.or(b),
+    }
 }
 
 /// `text` cut to at most `max` bytes at a character boundary, and whether it was cut.
@@ -930,9 +1206,26 @@ fn clipped(mut text: String, max: usize) -> (String, bool) {
 }
 
 /// Makes the database and its side files owner-only before SQLite opens them, creating the
-/// database if needed. SQLite gives new side files the database's mode. A link or anything else
-/// that is not a regular file is refused.
+/// database if needed. SQLite gives new side files the database's mode. Never call it once SQLite
+/// has the file open: use [`check_files`].
 fn prepare_files(path: &Path) -> Result<(), RecordingError> {
+    check_files(path)?;
+    let created = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(OWNER_ONLY)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path);
+    match created {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Keeps the database and its side files owner-only, by path alone. A link or anything else that
+/// is not a regular file is refused.
+fn check_files(path: &Path) -> Result<(), RecordingError> {
     for suffix in ["", "-wal", "-shm"] {
         let mut name = path.as_os_str().to_owned();
         name.push(suffix);
@@ -947,12 +1240,5 @@ fn prepare_files(path: &Path) -> Result<(), RecordingError> {
             Err(e) => return Err(e.into()),
         }
     }
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(OWNER_ONLY)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
     Ok(())
 }

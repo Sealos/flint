@@ -82,6 +82,7 @@ CREATE TABLE gaps (
     reason TEXT NOT NULL CHECK (reason IN ('sign_in_needed', 'disconnected'))
 ) STRICT;
 CREATE UNIQUE INDEX gaps_open ON gaps (recording_id) WHERE to_ms IS NULL;
+CREATE INDEX gaps_by_time ON gaps (recording_id, from_ms);
 ";
 
 /// Creates the tables in a new database. A database of any other version is refused and left as

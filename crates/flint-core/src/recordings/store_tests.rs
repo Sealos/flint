@@ -157,6 +157,276 @@ fn a_refused_connection_does_not_end_an_open_key_block() {
     );
 }
 
+/// Whether another process sees a lock on SQLite's shared-lock bytes of `path`.
+fn another_process_sees_a_lock(path: &str) -> bool {
+    use std::os::fd::AsRawFd as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    // SAFETY: `flock` is plain data, and `F_GETLK` only fills it in.
+    unsafe {
+        let mut lock: libc::flock = std::mem::zeroed();
+        lock.l_type = libc::F_WRLCK as _;
+        lock.l_whence = libc::SEEK_SET as _;
+        lock.l_start = 0x4000_0002;
+        lock.l_len = 510;
+        assert_eq!(libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock), 0);
+        lock.l_type as i32 != libc::F_UNLCK as i32
+    }
+}
+
+#[test]
+fn opening_keeps_sqlite_s_lock_on_the_database() {
+    const PROBE: &str = "FLINT_RECORDINGS_LOCK_PROBE";
+    if let Ok(path) = std::env::var(PROBE) {
+        assert!(another_process_sees_a_lock(&path));
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "recordings::store_tests::opening_keeps_sqlite_s_lock_on_the_database",
+        ])
+        .env(PROBE, dir.path().join(DATABASE_FILE))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    drop(store);
+    assert!(status.success());
+}
+
+fn cut(at_ms: i64, text: &str) -> LogRow {
+    LogRow {
+        truncated: true,
+        ..line(at_ms, text)
+    }
+}
+
+fn append_each(store: &mut Store, id: RecordingId, rows: Vec<LogRow>) {
+    for row in rows {
+        store.append(id, &identity(), lines(vec![row])).unwrap();
+    }
+}
+
+#[test]
+fn a_cut_line_that_lost_a_key_header_withholds_the_key_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(dir.path());
+    let id = running(&mut store, "a");
+    let rows = vec![cut(1, "noise -----BEGIN PRIV"), line(2, "MIIEsecretbody")];
+    append_each(&mut store, id, rows);
+    assert!(
+        stored_lines(&store, id)
+            .iter()
+            .all(|l| !l.contains("MIIEsecretbody"))
+    );
+}
+
+#[test]
+fn a_cut_line_with_no_visible_header_withholds_what_follows() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(dir.path());
+    let id = running(&mut store, "a");
+    let rows = vec![cut(1, "plain prefix"), line(2, "MIIEsecretbody")];
+    append_each(&mut store, id, rows);
+    assert!(
+        stored_lines(&store, id)
+            .iter()
+            .all(|l| !l.contains("MIIEsecretbody"))
+    );
+}
+
+#[test]
+fn a_token_key_cut_before_its_value_does_not_store_the_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(dir.path());
+    let id = running(&mut store, "a");
+    let rows = vec![cut(1, r#"{"token":"#), line(2, r#""tokenvaluesecret"}"#)];
+    append_each(&mut store, id, rows);
+    assert!(
+        stored_lines(&store, id)
+            .iter()
+            .all(|l| !l.contains("tokenvaluesecret"))
+    );
+}
+
+#[test]
+fn a_value_cut_in_the_middle_is_not_stored() {
+    for text in [
+        r#"{"password":"my partial secret"#,
+        r#"{"token":"partialsecretvalue"#,
+        "connect https://admin:partialsecret",
+        "auth eyJhbGciOiJIUzI1NiJ9.partialsecret",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path());
+        let id = running(&mut store, "a");
+        append_each(&mut store, id, vec![cut(1, text)]);
+        let stored = stored_lines(&store, id).join("\n");
+        assert!(!stored.contains("partial"), "stored {stored:?}");
+    }
+}
+
+#[test]
+fn a_full_line_longer_than_the_limit_is_scrubbed_before_it_is_clipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(dir.path());
+    let id = running(&mut store, "a");
+    let pad = "x ".repeat(crate::logs::MAX_LINE_BYTES / 2 - 8);
+    let rows = vec![
+        line(1, &format!("{pad}-----BEGIN PRIVATE KEY-----")),
+        line(2, "MIIEsecretbody"),
+    ];
+    append_each(&mut store, id, rows);
+    assert!(
+        stored_lines(&store, id)
+            .iter()
+            .all(|l| !l.contains("MIIEsecretbody"))
+    );
+}
+
+#[test]
+fn a_cookie_array_does_not_end_the_quarantine_of_a_cut_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(dir.path());
+    let id = running(&mut store, "a");
+    let rows = vec![
+        cut(1, "noise"),
+        line(2, r#""cookie": ["#),
+        line(3, "]"),
+        line(4, "MIIEsecretbody"),
+    ];
+    append_each(&mut store, id, rows);
+    assert!(
+        stored_lines(&store, id)
+            .iter()
+            .all(|l| !l.contains("MIIEsecretbody"))
+    );
+}
+
+#[test]
+fn a_write_is_retried_while_another_connection_holds_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(dir.path());
+    let id = running(&mut store, "a");
+    store.set_busy_timeout(Duration::from_millis(100));
+    let path = dir.path().join(DATABASE_FILE);
+    let (locked, wait) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let blocker = rusqlite::Connection::open(path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        blocker.execute_batch("ROLLBACK").unwrap();
+    });
+    wait.recv().unwrap();
+    let appended = store
+        .append(id, &identity(), lines(vec![line(1, "kept")]))
+        .unwrap();
+    holder.join().unwrap();
+    assert_eq!(appended.stored, 1);
+    assert_eq!(stored_lines(&store, id), ["kept"]);
+}
+
+#[test]
+fn sqlite_is_built_without_extension_loading() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    let options: Vec<String> = store
+        .connection()
+        .prepare("PRAGMA compile_options")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(options.iter().any(|o| o == "OMIT_LOAD_EXTENSION"));
+}
+
+#[test]
+fn a_second_line_does_not_evict_itself_under_a_small_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let retention = Retention {
+        max_recording_bytes: 16 * 1024,
+        ..Retention::default()
+    };
+    let mut store = Store::open(dir.path(), retention).unwrap();
+    let id = running(&mut store, "a");
+    let (first, second) = ("a".repeat(8 * 1024), "b".repeat(8 * 1024));
+    append_each(&mut store, id, vec![line(1, &first), line(2, &second)]);
+    assert_eq!(stored_lines(&store, id), [second]);
+}
+
+#[test]
+fn closed_gaps_are_charged_capped_and_expire() {
+    let dir = tempfile::tempdir().unwrap();
+    let retention = Retention {
+        max_age: Duration::from_millis(DAY_MS as u64),
+        max_recording_bytes: 16 * 1024,
+        ..Retention::default()
+    };
+    let mut store = Store::open(dir.path(), retention).unwrap();
+    let id = running(&mut store, "a");
+    for at in 0..2000 {
+        store.pause(id, GapReason::Disconnected, at).unwrap();
+        store.resume(id, at).unwrap();
+    }
+    let gaps = |store: &Store| -> i64 {
+        store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM gaps", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert!(gaps(&store) < 2000);
+    assert!(store.info(id).unwrap().bytes > 0);
+    assert!(store.info(id).unwrap().bytes <= 16 * 1024);
+    store.apply_retention(3 * DAY_MS).unwrap();
+    assert_eq!(gaps(&store), 0);
+    assert_eq!(store.info(id).unwrap().bytes, 0);
+}
+
+#[test]
+fn a_pinned_reader_cannot_grow_the_log_past_its_reserve() {
+    let dir = tempfile::tempdir().unwrap();
+    let budget = 2 * 1024 * 1024;
+    let retention = Retention {
+        max_total_bytes: budget,
+        ..Retention::default()
+    };
+    let mut store = Store::open(dir.path(), retention).unwrap();
+    let id = running(&mut store, "a");
+    let text = "w".repeat(1000);
+    store
+        .append(id, &identity(), lines(vec![line(0, &text)]))
+        .unwrap();
+    let reader = rusqlite::Connection::open(dir.path().join(DATABASE_FILE)).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT COUNT(*) FROM log_lines", [], |r| r.get(0))
+        .unwrap();
+    for at in 1..3000 {
+        store
+            .append(id, &identity(), lines(vec![line(at, &text)]))
+            .unwrap();
+    }
+    let wal = dir.path().join(format!("{DATABASE_FILE}-wal"));
+    let size = std::fs::metadata(&wal).unwrap().len();
+    assert!(size <= budget / 8 + 128 * 1024, "log is {size} bytes");
+    reader.execute_batch("COMMIT").unwrap();
+    drop(reader);
+    let before = store.info(id).unwrap().dropped_rows;
+    assert!(before > 0);
+    let appended = store
+        .append(id, &identity(), lines(vec![line(4000, "after")]))
+        .unwrap();
+    assert_eq!(appended.stored, 1);
+}
+
 fn pod(name: &str) -> RecordingTarget {
     RecordingTarget::Pod { name: name.into() }
 }

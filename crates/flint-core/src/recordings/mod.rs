@@ -23,4 +23,4 @@ pub use store::{
     Appended, Batch, DATABASE_FILE, EventKind, EventRow, GapReason, LogRow, RecordingError,
     RecordingId, RecordingInfo, RecordingTarget, Retention, SampleRow, Store,
 };
-pub use writer::{Recorder, RecorderClosed, Submitted};
+pub use writer::{FlushError, Recorder, RecorderError, Submitted};

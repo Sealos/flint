@@ -14,6 +14,7 @@ use crate::redact::redact_credentials;
 
 const KEY_MARKER: &str = "[REDACTED:private-key]";
 const COOKIE_MARKER: &str = "[REDACTED:cookie]";
+const CUT_MARKER: &str = "[REDACTED:cut-off]";
 
 /// How many lines an unterminated block withholds. A 16384-bit PEM key is about 65 lines.
 const MAX_BLOCK_LINES: u16 = 512;
@@ -38,6 +39,34 @@ pub(super) fn may_open_block(text: &str) -> bool {
 /// Text with its credentials replaced.
 pub(super) fn scrub(text: &str) -> String {
     redact_credentials(text).text.into_owned()
+}
+
+/// Where the last complete field of `text` ends: after the last space or comma outside a quoted
+/// value. One forward scan.
+fn complete_prefix(text: &str) -> usize {
+    let (mut end, mut quote, mut escaped, mut before) = (0, None, false, b' ');
+    for (at, &byte) in text.as_bytes().iter().enumerate() {
+        match quote {
+            Some(open) => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == open {
+                    quote = None;
+                }
+            }
+            None if byte == b'"' => quote = Some(byte),
+            // An apostrophe in prose opens nothing; one right after a key does.
+            None if byte == b'\'' && matches!(before, b'=' | b':') => quote = Some(byte),
+            None if byte.is_ascii_whitespace() || byte == b',' => end = at + 1,
+            None => {}
+        }
+        if !byte.is_ascii_whitespace() {
+            before = byte;
+        }
+    }
+    end
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +124,8 @@ impl Scrubber {
                     None => format!("{}{KEY_MARKER}", scrub(&text[..begin.start()])),
                 };
             }
-            if COOKIE_ARRAY.is_match(text) {
+            // A quarantine knows nothing of what it covers, so a cookie array cannot end it.
+            if current != Some(Block::Lost) && COOKIE_ARRAY.is_match(text) {
                 self.begin(source, Block::Cookies);
                 return match current {
                     Some(_) => COOKIE_MARKER.to_owned(),
@@ -123,6 +153,23 @@ impl Scrubber {
                 KEY_MARKER.to_owned()
             }
         }
+    }
+
+    /// The stored form of a line whose end was cut off before it got here. Only its complete
+    /// fields are kept, since the last one may be part of a value. What was cut may have opened a
+    /// block, so the lines after it are withheld as after a lost line.
+    pub(super) fn cut_line(
+        &mut self,
+        recording: i64,
+        pod: &str,
+        container: &str,
+        text: &str,
+    ) -> String {
+        let kept = &text[..complete_prefix(text)];
+        let mut out = self.line(recording, pod, container, kept);
+        out.push_str(CUT_MARKER);
+        self.lost_line(recording, pod, container);
+        out
     }
 
     /// A line of this source that may have opened a block was lost.

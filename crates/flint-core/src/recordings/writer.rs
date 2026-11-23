@@ -1,11 +1,15 @@
 //! Runs a [`Store`] on its own thread, so disk work never lands on a caller's path.
+//!
+//! Everything a caller hands over goes through one bounded queue, in order, and no caller ever
+//! waits on it. What the queue has no room for is lost and said so: as a marker in the same queue
+//! when there is room for one, so the store learns of the loss at the place it happened.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
@@ -18,13 +22,23 @@ use super::store::{Batch, RecordingError, RecordingId, Retention, Store, now_ms}
 const MAX_QUEUED_BYTES: u64 = 16 * 1024 * 1024;
 /// What a queued batch counts for beyond its rows, so empty batches cannot queue without limit.
 const BATCH_OVERHEAD: u64 = 128;
-/// How many sources of one recording are remembered as having lost a block's first line. Past
-/// it the whole recording is withheld.
-const MAX_MISSED_SOURCES: usize = 256;
+/// How many batches, calls and loss markers may wait. Each has its own share of the queue, so a
+/// flood of batches cannot take the room a marker needs.
+const MAX_QUEUED_BATCHES: usize = 4096;
+const MAX_QUEUED_CALLS: usize = 256;
+const MAX_QUEUED_MARKERS: usize = 256;
+/// One stop from [`Recorder::shutdown`] and one from dropping it.
+const STOP_SLOTS: usize = 2;
+const QUEUE_SLOTS: usize = MAX_QUEUED_BATCHES + MAX_QUEUED_CALLS + MAX_QUEUED_MARKERS + STOP_SLOTS;
+/// How many sources one marker names, and the longest name it keeps. Past either, the whole
+/// recording is withheld instead.
+const MAX_MARKER_SOURCES: usize = 32;
+const MAX_SOURCE_NAME_BYTES: usize = 1024;
 /// How often retention runs.
 const RETENTION_EVERY: Duration = Duration::from_secs(60);
 
 type StoreCall = Box<dyn FnOnce(&mut Store) + Send>;
+type Stopped = oneshot::Sender<Result<(), FlushError>>;
 
 enum Message {
     Append {
@@ -33,30 +47,80 @@ enum Message {
         batch: Batch,
         cost: u64,
     },
+    /// A batch submitted at this point in the queue was lost.
+    Lost(Loss),
     Call(StoreCall),
     /// Finish what is queued and stop, answering once the database is closed.
-    Stop(Option<oneshot::Sender<()>>),
+    Stop(Option<Stopped>),
 }
 
-/// What was lost for one recording while the queue was full.
-#[derive(Default)]
-struct Missed {
+/// What one lost batch held.
+struct Loss {
+    id: RecordingId,
     rows: u64,
     /// Pod and container of each lost line that may have opened a block.
     sources: BTreeSet<(String, String)>,
-    too_many_sources: bool,
+    /// Too many sources, or names too long, to keep: withhold the whole recording.
+    seal: bool,
 }
 
+impl Loss {
+    fn of(id: RecordingId, batch: &Batch) -> Self {
+        let mut loss = Loss {
+            id,
+            rows: batch.rows(),
+            sources: BTreeSet::new(),
+            seal: false,
+        };
+        // A cut line may have lost an opening that nothing left in it shows.
+        for line in batch
+            .lines
+            .iter()
+            .filter(|line| line.truncated || may_open_block(&line.text))
+        {
+            if line.pod.len() > MAX_SOURCE_NAME_BYTES
+                || line.container.len() > MAX_SOURCE_NAME_BYTES
+                || loss.sources.len() >= MAX_MARKER_SOURCES
+            {
+                loss.seal = true;
+                loss.sources.clear();
+                break;
+            }
+            loss.sources
+                .insert((line.pod.clone(), line.container.clone()));
+        }
+        loss
+    }
+}
+
+/// The queue's accounting. Only atomics, so a caller never waits for the writer.
 #[derive(Default)]
 struct Shared {
     queued_bytes: AtomicU64,
-    missed: Mutex<BTreeMap<RecordingId, Missed>>,
+    queued_batches: AtomicUsize,
+    queued_calls: AtomicUsize,
+    queued_markers: AtomicUsize,
+    /// A loss had no room for a marker, so its place in the queue is unknown: every running
+    /// recording is withheld. Being permanent, that holds wherever the loss really was.
+    seal_all: AtomicBool,
+    /// The rows of those losses.
+    unnamed_rows: AtomicU64,
 }
 
-impl Shared {
-    fn missed(&self) -> std::sync::MutexGuard<'_, BTreeMap<RecordingId, Missed>> {
-        self.missed.lock().unwrap_or_else(|e| e.into_inner())
+/// Takes one of `max` slots.
+fn reserve(slots: &AtomicUsize, max: usize) -> bool {
+    let mut taken = slots.load(Ordering::Acquire);
+    while taken < max {
+        match slots.compare_exchange_weak(taken, taken + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => taken = now,
+        }
     }
+    false
+}
+
+fn release(slots: &AtomicUsize) {
+    slots.fetch_sub(1, Ordering::AcqRel);
 }
 
 /// Whether a batch was queued.
@@ -67,15 +131,28 @@ pub enum Submitted {
     Dropped,
 }
 
-/// The writer thread has stopped.
+/// Why a call did not run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("the recordings writer has stopped")]
-pub struct RecorderClosed;
+pub enum RecorderError {
+    #[error("the recordings writer has stopped")]
+    Closed,
+    #[error("the recordings writer is busy")]
+    Busy,
+}
+
+/// The queue was not fully saved when the writer stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum FlushError {
+    #[error("{0} recorded rows could not be saved")]
+    Unsaved(u64),
+    #[error("the recordings writer stopped before finishing")]
+    WriterStopped,
+}
 
 /// The running writer. Dropping it never waits: the thread finishes the queue by itself. Use
 /// [`Self::shutdown`] to wait for that.
 pub struct Recorder {
-    tx: Sender<Message>,
+    tx: SyncSender<Message>,
     shared: Arc<Shared>,
 }
 
@@ -85,7 +162,7 @@ impl Recorder {
         dir: PathBuf,
         retention: Retention,
     ) -> impl Future<Output = Result<Self, RecordingError>> + Send + 'static {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(QUEUE_SLOTS);
         let shared = Arc::new(Shared::default());
         let (ready, opened) = oneshot::channel();
         let spawned = std::thread::Builder::new()
@@ -103,10 +180,21 @@ impl Recorder {
                             return;
                         }
                     };
-                    let stopped = run(&mut store, &rx, &shared);
+                    let (stopped, unsaved) = run(&mut store, &rx, &shared);
+                    store.flush_dropped_counts();
                     drop(store);
-                    if let Some(stopped) = stopped {
-                        let _ = stopped.send(());
+                    let result = match unsaved {
+                        0 => Ok(()),
+                        rows => Err(FlushError::Unsaved(rows)),
+                    };
+                    match stopped {
+                        Some(stopped) => {
+                            let _ = stopped.send(result);
+                        }
+                        None if unsaved > 0 => {
+                            tracing::warn!(unsaved, "recorded rows could not be saved");
+                        }
+                        None => {}
                     }
                 }
             })
@@ -123,10 +211,8 @@ impl Recorder {
     /// Queues rows for a recording. Never blocks and never touches the disk.
     pub fn submit(&self, id: RecordingId, current: &ConnectionIdentity, batch: Batch) -> Submitted {
         let cost = batch.queued_bytes() + BATCH_OVERHEAD;
-        let queued = self.shared.queued_bytes.fetch_add(cost, Ordering::AcqRel);
-        if queued + cost > MAX_QUEUED_BYTES {
-            self.shared.queued_bytes.fetch_sub(cost, Ordering::AcqRel);
-            self.note_missed(id, &batch);
+        if !self.reserve_batch(cost) {
+            self.note_lost(id, &batch);
             return Submitted::Dropped;
         }
         let message = Message::Append {
@@ -135,73 +221,97 @@ impl Recorder {
             batch,
             cost,
         };
-        match self.tx.send(message) {
+        match self.tx.try_send(message) {
             Ok(()) => Submitted::Queued,
-            Err(_) => Submitted::Dropped,
+            Err(TrySendError::Full(message) | TrySendError::Disconnected(message)) => {
+                self.shared.queued_bytes.fetch_sub(cost, Ordering::AcqRel);
+                release(&self.shared.queued_batches);
+                if let Message::Append { batch, .. } = message {
+                    self.note_lost(id, &batch);
+                }
+                Submitted::Dropped
+            }
         }
     }
 
-    /// Runs `call` on the writer thread, after everything queued before it.
+    /// Runs `call` on the writer thread, after everything queued before it. Refused, without
+    /// waiting, while too many calls are queued.
     pub fn call<R: Send + 'static>(
         &self,
         call: impl FnOnce(&mut Store) -> R + Send + 'static,
-    ) -> impl Future<Output = Result<R, RecorderClosed>> + Send + 'static {
+    ) -> impl Future<Output = Result<R, RecorderError>> + Send + 'static {
         let (reply, answer) = oneshot::channel();
-        let sent = self.tx.send(Message::Call(Box::new(move |store| {
-            let _ = reply.send(call(store));
-        })));
+        let sent = if reserve(&self.shared.queued_calls, MAX_QUEUED_CALLS) {
+            let message = Message::Call(Box::new(move |store| {
+                let _ = reply.send(call(store));
+            }));
+            self.tx.try_send(message).map_err(|_| {
+                release(&self.shared.queued_calls);
+                RecorderError::Closed
+            })
+        } else {
+            Err(RecorderError::Busy)
+        };
         async move {
-            sent.map_err(|_| RecorderClosed)?;
-            answer.await.map_err(|_| RecorderClosed)
+            sent?;
+            answer.await.map_err(|_| RecorderError::Closed)
         }
     }
 
-    /// Finishes the queue and closes the database.
-    pub fn shutdown(self) -> impl Future<Output = ()> + Send + 'static {
+    /// Finishes the queue and closes the database. Reports rows it accepted but could not save.
+    pub fn shutdown(self) -> impl Future<Output = Result<(), FlushError>> + Send + 'static {
         let (stopped, done) = oneshot::channel();
-        let _ = self.tx.send(Message::Stop(Some(stopped)));
+        let sent = self.tx.try_send(Message::Stop(Some(stopped)));
         async move {
-            let _ = done.await;
+            sent.map_err(|_| FlushError::WriterStopped)?;
+            done.await.unwrap_or(Err(FlushError::WriterStopped))
         }
     }
 
-    fn note_missed(&self, id: RecordingId, batch: &Batch) {
-        let opening: Vec<_> = batch
-            .lines
-            .iter()
-            .filter(|line| may_open_block(&line.text))
-            .collect();
-        let mut missed = self.shared.missed();
-        let entry = missed.entry(id).or_default();
-        entry.rows += batch.rows();
-        for line in opening {
-            if entry.sources.len() >= MAX_MISSED_SOURCES {
-                entry.too_many_sources = true;
-                break;
-            }
-            entry
-                .sources
-                .insert((line.pod.clone(), line.container.clone()));
+    fn reserve_batch(&self, cost: u64) -> bool {
+        let shared = &self.shared;
+        if !reserve(&shared.queued_batches, MAX_QUEUED_BATCHES) {
+            return false;
         }
+        let queued = shared.queued_bytes.fetch_add(cost, Ordering::AcqRel);
+        if queued + cost > MAX_QUEUED_BYTES {
+            shared.queued_bytes.fetch_sub(cost, Ordering::AcqRel);
+            release(&shared.queued_batches);
+            return false;
+        }
+        true
+    }
+
+    /// Says a batch was lost: at this place in the queue, or for every running recording.
+    fn note_lost(&self, id: RecordingId, batch: &Batch) {
+        let shared = &self.shared;
+        if reserve(&shared.queued_markers, MAX_QUEUED_MARKERS) {
+            match self.tx.try_send(Message::Lost(Loss::of(id, batch))) {
+                Ok(()) => return,
+                Err(_) => release(&shared.queued_markers),
+            }
+        }
+        shared
+            .unnamed_rows
+            .fetch_add(batch.rows(), Ordering::AcqRel);
+        shared.seal_all.store(true, Ordering::Release);
     }
 }
 
 impl Drop for Recorder {
     fn drop(&mut self) {
-        let _ = self.tx.send(Message::Stop(None));
+        let _ = self.tx.try_send(Message::Stop(None));
     }
 }
 
-fn run(
-    store: &mut Store,
-    rx: &mpsc::Receiver<Message>,
-    shared: &Shared,
-) -> Option<oneshot::Sender<()>> {
+/// Runs until stopped: who to answer, and how many accepted rows could not be saved.
+fn run(store: &mut Store, rx: &mpsc::Receiver<Message>, shared: &Shared) -> (Option<Stopped>, u64) {
     let mut last_retention = Instant::now();
+    let mut unsaved = 0u64;
     loop {
         let wait = RETENTION_EVERY.saturating_sub(last_retention.elapsed());
         let message = rx.recv_timeout(wait);
-        settle_missed(store, shared);
+        let settled = settle_unnamed(store, shared);
         match message {
             Ok(Message::Append {
                 id,
@@ -210,17 +320,19 @@ fn run(
                 cost,
             }) => {
                 shared.queued_bytes.fetch_sub(cost, Ordering::AcqRel);
-                let rows = batch.rows();
-                if let Err(error) = store.append(id, &current, batch) {
-                    tracing::debug!(%error, "recording rows not stored");
-                    if error.is_storage() {
-                        shared.missed().entry(id).or_default().rows += rows;
-                    }
-                }
+                release(&shared.queued_batches);
+                unsaved += append(store, id, &current, batch, settled);
             }
-            Ok(Message::Call(call)) => call(store),
-            Ok(Message::Stop(stopped)) => return stopped,
-            Err(RecvTimeoutError::Disconnected) => return None,
+            Ok(Message::Lost(loss)) => {
+                release(&shared.queued_markers);
+                apply_loss(store, &loss);
+            }
+            Ok(Message::Call(call)) => {
+                release(&shared.queued_calls);
+                call(store);
+            }
+            Ok(Message::Stop(stopped)) => return (stopped, unsaved),
+            Err(RecvTimeoutError::Disconnected) => return (None, unsaved),
             Err(RecvTimeoutError::Timeout) => {}
         }
         if last_retention.elapsed() >= RETENTION_EVERY {
@@ -232,29 +344,74 @@ fn run(
     }
 }
 
-/// Records what was lost, before any later batch of the same recording is scrubbed. A count that
-/// cannot be saved stays for the next round.
-fn settle_missed(store: &mut Store, shared: &Shared) {
-    let missed = std::mem::take(&mut *shared.missed());
-    for (id, missed) in missed {
-        for (pod, container) in &missed.sources {
-            store.line_lost(id, pod, container);
+/// Stores one batch; how many of its rows could not be saved. Until an unnamed loss is settled
+/// nothing can say which lines are safe, so none are stored.
+fn append(
+    store: &mut Store,
+    id: RecordingId,
+    current: &ConnectionIdentity,
+    batch: Batch,
+    settled: bool,
+) -> u64 {
+    let rows = batch.rows();
+    if !settled {
+        store.count_dropped(id, rows);
+        return rows;
+    }
+    let unsaved = match store.append_counted(id, current, batch) {
+        Ok((_, None)) => 0,
+        Ok((done, Some(error))) => {
+            tracing::debug!(%error, "recording rows not stored");
+            if error.is_storage() {
+                rows.saturating_sub(done.stored + done.dropped)
+            } else {
+                0
+            }
         }
-        if missed.too_many_sources {
-            store.seal_lines(id);
+        Err(error) => {
+            tracing::debug!(%error, "recording rows not stored");
+            if error.is_storage() { rows } else { 0 }
         }
-        if missed.rows > 0
-            && let Err(error) = store.count_dropped(id, missed.rows)
-        {
-            tracing::debug!(%error, "cannot count dropped recording rows");
-            shared.missed().entry(id).or_default().rows += missed.rows;
+    };
+    if unsaved > 0 {
+        store.count_dropped(id, unsaved);
+    }
+    unsaved
+}
+
+fn apply_loss(store: &mut Store, loss: &Loss) {
+    for (pod, container) in &loss.sources {
+        store.line_lost(loss.id, pod, container);
+    }
+    if loss.seal {
+        store.seal_lines(loss.id);
+    }
+    if loss.rows > 0 {
+        store.count_dropped(loss.id, loss.rows);
+    }
+}
+
+/// Withholds every running recording if a loss could not be placed in the queue. False while
+/// that could not be done.
+fn settle_unnamed(store: &mut Store, shared: &Shared) -> bool {
+    if !shared.seal_all.swap(false, Ordering::AcqRel) {
+        return true;
+    }
+    let rows = shared.unnamed_rows.swap(0, Ordering::AcqRel);
+    match store.seal_running(rows) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, "cannot withhold running recordings");
+            shared.unnamed_rows.fetch_add(rows, Ordering::AcqRel);
+            shared.seal_all.store(true, Ordering::Release);
+            false
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::store::{LogRow, RecordingTarget};
+    use super::super::store::{DATABASE_FILE, LogRow, RecordingTarget};
     use super::*;
 
     fn line(text: &str) -> LogRow {
@@ -363,6 +520,107 @@ mod tests {
         assert_eq!(stored, ["from another pod", "[REDACTED:private-key]"]);
     }
 
+    /// Holds the writer until the returned sender is dropped.
+    async fn stalled(recorder: &Recorder) -> std::sync::mpsc::Sender<()> {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (entered, running) = oneshot::channel();
+        drop(recorder.call(move |_| {
+            let _ = entered.send(());
+            let _ = wait.recv();
+        }));
+        running.await.unwrap();
+        release
+    }
+
+    #[tokio::test]
+    async fn an_older_key_end_does_not_clear_a_newer_lost_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, id, identity) = started(dir.path()).await;
+        let release = stalled(&recorder).await;
+        recorder.submit(id, &identity, batch("-----BEGIN PRIVATE KEY-----"));
+        recorder.submit(id, &identity, batch("-----END PRIVATE KEY-----"));
+        let mut dropped = "x".repeat(MAX_QUEUED_BYTES as usize);
+        dropped.push_str("-----BEGIN PRIVATE KEY-----");
+        assert_eq!(
+            recorder.submit(id, &identity, batch(&dropped)),
+            Submitted::Dropped
+        );
+        recorder.submit(id, &identity, batch("MIIEnewerkeybody"));
+        drop(release);
+        let stored = recorder.call(|store| texts(store)).await.unwrap();
+        assert!(stored.iter().all(|l| !l.contains("MIIEnewerkeybody")));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_cut_line_withholds_what_follows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, id, identity) = started(dir.path()).await;
+        let mut dropped = batch(&"x".repeat(MAX_QUEUED_BYTES as usize + 1));
+        dropped.lines[0].truncated = true;
+        assert_eq!(recorder.submit(id, &identity, dropped), Submitted::Dropped);
+        recorder.submit(id, &identity, batch("MIIEkeybody"));
+        let stored = recorder.call(|store| texts(store)).await.unwrap();
+        assert!(stored.iter().all(|l| !l.contains("MIIEkeybody")));
+    }
+
+    #[tokio::test]
+    async fn a_loss_with_no_room_for_its_marker_withholds_running_recordings() {
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, id, identity) = started(dir.path()).await;
+        let release = stalled(&recorder).await;
+        let huge = "x".repeat(MAX_QUEUED_BYTES as usize + 1);
+        for _ in 0..=MAX_QUEUED_MARKERS {
+            recorder.submit(id, &identity, batch(&huge));
+        }
+        assert!(recorder.shared.seal_all.load(Ordering::Acquire));
+        recorder.submit(id, &identity, batch("MIIEkeybody"));
+        drop(release);
+        let stored = recorder.call(|store| texts(store)).await.unwrap();
+        assert!(stored.iter().all(|l| !l.contains("MIIEkeybody")));
+        let info = recorder.call(move |s| s.info(id).unwrap()).await.unwrap();
+        assert!(info.dropped_rows > MAX_QUEUED_MARKERS as u64);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_writer_keeps_every_queue_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, id, identity) = started(dir.path()).await;
+        let release = stalled(&recorder).await;
+        for _ in 0..MAX_QUEUED_BATCHES {
+            assert_eq!(
+                recorder.submit(id, &identity, batch("x")),
+                Submitted::Queued
+            );
+        }
+        assert_eq!(
+            recorder.submit(id, &identity, batch("x")),
+            Submitted::Dropped
+        );
+        let calls: Vec<_> = (0..MAX_QUEUED_CALLS)
+            .map(|_| recorder.call(|_| ()))
+            .collect();
+        assert_eq!(recorder.call(|_| ()).await, Err(RecorderError::Busy));
+        drop(release);
+        for call in calls {
+            call.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_final_batch_that_cannot_be_written_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, id, identity) = started(dir.path()).await;
+        recorder
+            .call(|store| store.set_busy_timeout(Duration::from_millis(1)))
+            .await
+            .unwrap();
+        let blocker = rusqlite::Connection::open(dir.path().join(DATABASE_FILE)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        recorder.submit(id, &identity, batch("last"));
+        assert_eq!(recorder.shutdown().await, Err(FlushError::Unsaved(1)));
+        blocker.execute_batch("ROLLBACK").unwrap();
+    }
+
     #[tokio::test]
     async fn the_queue_budget_is_released_after_writing() {
         let dir = tempfile::tempdir().unwrap();
@@ -370,6 +628,7 @@ mod tests {
         recorder.submit(id, &identity, batch("hello"));
         recorder.call(|_| ()).await.unwrap();
         assert_eq!(recorder.shared.queued_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(recorder.shared.queued_batches.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
@@ -377,7 +636,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (recorder, id, identity) = started(dir.path()).await;
         recorder.submit(id, &identity, batch("last"));
-        recorder.shutdown().await;
+        recorder.shutdown().await.unwrap();
         let store = Store::open(dir.path(), Retention::default()).unwrap();
         assert_eq!(texts(&store), ["last"]);
     }
