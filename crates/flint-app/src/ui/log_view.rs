@@ -864,11 +864,15 @@ impl LogView {
             };
             let written = cx
                 .background_spawn(async move {
-                    let (text, count) =
-                        log_model::save_text(&lines, scope, &matches, selection, format)
-                            .ok_or_else(|| "there are no such lines".to_owned())?;
-                    std::fs::write(&path, text)
-                        .map(|()| (path, count))
+                    // Checked first, so a save of nothing leaves an existing file alone.
+                    if log_model::save_count(&lines, scope, &matches, selection) == 0 {
+                        return Err("there are no such lines".to_owned());
+                    }
+                    std::fs::File::create(&path)
+                        .and_then(|file| {
+                            log_model::write_saved(file, &lines, scope, &matches, selection, format)
+                        })
+                        .map(|count| (path, count))
                         .map_err(|e| e.to_string())
                 })
                 .await;
