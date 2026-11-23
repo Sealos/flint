@@ -10,6 +10,7 @@
 //! allow, and a later return to an allowed role does not bring it back, however quickly it came.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::watch;
 
@@ -22,9 +23,19 @@ pub(crate) enum Role {
     Foreground,
     /// A cluster kept connected while another one is in front.
     Background,
+    /// Its definition can't be confirmed for now. Reads already running go on, and the connection
+    /// may return to another role when the pause ends.
+    Paused,
+    /// The connection was replaced or dropped. Final: no later role applies to it.
+    Retired,
 }
 
-const ROLES: [Role; 2] = [Role::Foreground, Role::Background];
+const ROLES: [Role; 4] = [
+    Role::Foreground,
+    Role::Background,
+    Role::Paused,
+    Role::Retired,
+];
 
 /// The current role, and how many times each role has been entered. The counts survive a change
 /// a watcher did not get to see, which the role alone does not.
@@ -60,18 +71,11 @@ impl CredentialPolicy for AlwaysAllow {
 
 /// Credentials that run a program do so only for the foreground connection. Static credentials
 /// and token files run nothing, so they are allowed in either role.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "not wired into a connection yet")
-)]
 pub(crate) struct ForegroundOnly;
 
 impl CredentialPolicy for ForegroundOnly {
     fn may_run(&self, source: &CredentialSource, role: Role) -> bool {
-        match source {
-            CredentialSource::Definition | CredentialSource::TokenFile(_) => true,
-            CredentialSource::Plugin | CredentialSource::AuthProvider => role == Role::Foreground,
-        }
+        !source.runs_a_command() || role == Role::Foreground
     }
 }
 
@@ -84,10 +88,6 @@ pub(crate) struct CredentialAccess {
 }
 
 impl CredentialAccess {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "not wired into a connection yet")
-    )]
     pub(crate) fn new(policy: Arc<dyn CredentialPolicy>, role: Role) -> Self {
         let (role, _) = watch::channel(RoleState::new(role));
         CredentialAccess {
@@ -105,11 +105,11 @@ impl CredentialAccess {
         }
     }
 
-    /// Changes the role. A refresh the new role does not allow is ended.
-    #[cfg_attr(not(test), expect(dead_code, reason = "no connection is demoted yet"))]
+    /// Changes the role, unless this access is retired. A refresh the new role does not allow is
+    /// ended.
     pub(crate) fn set_role(&self, role: Role) {
         self.role.send_if_modified(|state| {
-            let changed = state.role != role;
+            let changed = state.role != role && state.role != Role::Retired;
             if changed {
                 state.role = role;
                 state.entered[role as usize] += 1;
@@ -118,11 +118,17 @@ impl CredentialAccess {
         });
     }
 
+    /// Ends this access for good, for every clone of every client made under it.
+    pub(crate) fn revoke(&self) {
+        self.set_role(Role::Retired);
+    }
+
     /// This access, for a connection whose credential comes from `source`.
     pub(crate) fn grant(&self, source: CredentialSource) -> CredentialGrant {
         CredentialGrant {
             access: self.clone(),
             source,
+            refused: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -132,11 +138,30 @@ impl CredentialAccess {
 pub(crate) struct CredentialGrant {
     access: CredentialAccess,
     source: CredentialSource,
+    /// A server answered 401 while this connection was in the background.
+    refused: Arc<AtomicBool>,
 }
 
 impl CredentialGrant {
     fn allows(&self, role: Role) -> bool {
         self.access.policy.may_run(&self.source, role)
+    }
+
+    /// Whether this connection's credential can start a program.
+    pub(crate) fn runs_a_command(&self) -> bool {
+        self.source.runs_a_command()
+    }
+
+    /// Records a 401. The foreground has its own sign-in path, so only one outside it counts.
+    pub(crate) fn note_refused(&self) {
+        if self.access.role.borrow().role != Role::Foreground {
+            self.refused.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a 401 was recorded since this was last asked.
+    pub(crate) fn take_refused(&self) -> bool {
+        self.refused.swap(false, Ordering::Relaxed)
     }
 
     /// Whether the credential may run now.
@@ -191,6 +216,13 @@ impl CredentialLease {
     pub(crate) fn holds(&self) -> bool {
         let state = *self.grant.access.role.borrow();
         self.holds_in(&state)
+    }
+
+    /// Runs `start` if this still holds. No lock is kept while it runs, since `start` can stall
+    /// (a spawn from a network mount) and a role change must never wait on it. A change that lands
+    /// after this check finds `start` already begun, and [`Self::revoked`] then ends what it began.
+    pub(crate) fn start_if_held<T>(&self, start: impl FnOnce() -> T) -> Option<T> {
+        self.holds().then(start)
     }
 
     /// Whether the credential behind this can be stopped by a role at all.
