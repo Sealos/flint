@@ -13,7 +13,7 @@ use super::super::registry::{
     ExtendSelectionUp, FocusSearch, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, OnView,
     PrevMatch, SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines,
     SelectAllLines, SelectLine, SelectNextLine, SelectPrevLine, SetLogContext, ToggleErrorsOnly,
-    ToggleMatchingOnly, TogglePause, ToggleSources, ToggleTimestamps, ToggleWrap,
+    ToggleLogRegex, ToggleMatchingOnly, TogglePause, ToggleSources, ToggleTimestamps, ToggleWrap,
 };
 use super::{LogView, log_model};
 use crate::ui::log_model::Tone;
@@ -72,10 +72,11 @@ impl LogView {
                     view.list.remeasure();
                 }
                 // The search covers sources only while they are shown.
-                let text = std::mem::take(&mut view.query.text);
-                view.query = Default::default();
-                view.set_query(text, cx);
-                cx.notify();
+                view.requery(cx);
+            })
+            .bind::<ToggleLogRegex>(|view, _, _, cx| {
+                view.regex = !view.regex;
+                view.requery(cx);
             })
             .bind::<ToggleWrap>(|view, _, _, cx| {
                 view.wrap = !view.wrap;
@@ -392,20 +393,18 @@ impl LogView {
     /// Goes to the next match, wrapping around. Nothing while a scan runs on the core's threads
     /// (the guard refuses it then).
     pub(super) fn next_match(&mut self, _: &NextMatch, _: &mut Window, cx: &mut Context<Self>) {
-        if self.searching {
+        if !self.catch_up_now(cx) {
             return;
         }
-        self.catch_up_now();
         let next = self.shown_match(self.current_match, true);
         self.go_to_match(next, cx);
     }
 
     /// Goes to the previous match, wrapping around; see [`LogView::next_match`].
     pub(super) fn prev_match(&mut self, _: &PrevMatch, _: &mut Window, cx: &mut Context<Self>) {
-        if self.searching {
+        if !self.catch_up_now(cx) {
             return;
         }
-        self.catch_up_now();
         let prev = self.shown_match(self.current_match, false);
         self.go_to_match(prev, cx);
     }
