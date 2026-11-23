@@ -11,12 +11,24 @@ pub struct ClusterDiscovery {
     /// Every kind at its group's preferred version, core kinds first.
     pub kinds: Vec<KindInfo>,
     pub navigation: Navigation,
+    /// API groups whose kinds may be missing or out of date, sorted. Not empty means `kinds` is
+    /// partial, so a kind's absence from it proves nothing.
+    pub incomplete_groups: Vec<String>,
 }
 
 impl ClusterDiscovery {
     pub fn new(kinds: Vec<KindInfo>) -> Self {
+        Self::with_incomplete_groups(kinds, Vec::new())
+    }
+
+    /// Discovery that could not vouch for `incomplete_groups`.
+    pub fn with_incomplete_groups(kinds: Vec<KindInfo>, incomplete_groups: Vec<String>) -> Self {
         let navigation = Navigation::build(&kinds);
-        ClusterDiscovery { kinds, navigation }
+        ClusterDiscovery {
+            kinds,
+            navigation,
+            incomplete_groups,
+        }
     }
 
     pub fn kind(&self, id: &KindId) -> Option<&KindInfo> {

@@ -199,6 +199,7 @@ mod tests {
                 ],
             },
             kinds: Vec::new(),
+            incomplete_groups: Vec::new(),
         };
         let nav = cx.new(NavPanel::new);
         nav.update(cx, |nav, cx| {
@@ -256,6 +257,7 @@ mod tests {
         let discovery = Arc::new(ClusterDiscovery {
             navigation: Navigation { sections },
             kinds: Vec::new(),
+            incomplete_groups: Vec::new(),
         });
         cx.update(|cx| {
             gpui_kit::open_window(

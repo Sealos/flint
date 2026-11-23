@@ -1420,6 +1420,7 @@ impl ClusterManager {
                     Ok(found) => {
                         // Groups that failed this time keep the kinds (and watches) they had,
                         // and discovery is retried with backoff until they answer again.
+                        let incomplete_groups = found.incomplete_groups();
                         let mut kinds = found.kinds;
                         if !found.skipped_groups.is_empty() {
                             partial = true;
@@ -1443,7 +1444,10 @@ impl ClusterManager {
                         }
                         tracing::info!(cluster, kinds = kinds.len(), "discovery done");
                         slot.watches.set_kinds(&kinds);
-                        slot.discovery = Some(Arc::new(ClusterDiscovery::new(kinds)));
+                        slot.discovery = Some(Arc::new(ClusterDiscovery::with_incomplete_groups(
+                            kinds,
+                            incomplete_groups,
+                        )));
                         None
                     }
                     Err(e) => {
@@ -6567,6 +6571,46 @@ mod tests {
             let slot = manager.cluster("dev").unwrap();
             assert!(matches!(slot.state, ConnectionState::Connecting));
             assert_eq!(manager.next_attempt, next + 1, "{user}: connects once");
+        }
+    }
+
+    // Skipped and stale groups both reach the discovery a front end gets, and a full discovery
+    // afterwards clears them.
+    #[tokio::test]
+    async fn discovery_says_which_groups_are_incomplete() {
+        use crate::discovery::tests::kind;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, _, _) = pausable(dir.path(), NO_CONTEXTS).await;
+        manager.active = Some("dev".to_owned());
+        land_connection(&mut manager).await;
+        let attempt = manager.cluster("dev").unwrap().attempt;
+        let pods = || vec![kind("", "Pod", "pods", true, &["get", "list", "watch"])];
+
+        let partial = read::DiscoveredKinds {
+            kinds: pods(),
+            skipped_groups: vec!["metrics.k8s.io".into()],
+            stale_groups: vec!["example.com".into(), "metrics.k8s.io".into()],
+        };
+        for (found, expected) in [
+            (partial, vec!["example.com", "metrics.k8s.io"]),
+            (
+                read::DiscoveredKinds {
+                    kinds: pods(),
+                    ..Default::default()
+                },
+                Vec::new(),
+            ),
+        ] {
+            manager
+                .handle_internal(Internal::Discovered {
+                    cluster: "dev".into(),
+                    attempt,
+                    result: Ok(found),
+                })
+                .await;
+            let slot = manager.cluster("dev").unwrap();
+            let discovery = slot.discovery.as_ref().unwrap();
+            assert_eq!(discovery.incomplete_groups, expected);
         }
     }
 
