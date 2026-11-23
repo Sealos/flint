@@ -85,6 +85,19 @@ pub(super) fn open_forward(
         .expect("a valid response")
 }
 
+/// A 503 whose body goes on until the client hangs up.
+pub(super) fn endless_error() -> Response<Body> {
+    let chunks = futures::stream::unfold((), |()| async {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let chunk = hyper::body::Frame::data(bytes::Bytes::from_static(&[b'x'; 4096]));
+        Some((Ok::<_, std::io::Error>(chunk), ()))
+    });
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .body(http_body_util::StreamBody::new(Box::pin(chunks)).boxed_unsync())
+        .expect("a valid response")
+}
+
 /// Names the port on its data and error channels, as the API server does, then echoes data.
 async fn echo(mut ws: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>, port: u16) {
     let [low, high] = port.to_le_bytes();

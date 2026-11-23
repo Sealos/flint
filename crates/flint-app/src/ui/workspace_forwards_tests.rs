@@ -61,6 +61,7 @@ fn request() -> ForwardRequest {
         remote_port: 8080,
         local_port: None,
         server: None,
+        uid: None,
     }
 }
 
@@ -116,9 +117,10 @@ async fn forward_port_is_refused_when_rbac_forbids_it(cx: &mut TestAppContext) {
     assert!(panel(cx, &t).is_none());
 }
 
-// Switching the active cluster stops every forward; the row stays until dismissed.
+// The core decides which forwards a switch ends (`port_forward_keep` in flint-e2e): the window
+// stops none itself, so one on a cluster kept watching goes on, and its row and address stay.
 #[gpui_kit::test]
-async fn changing_cluster_stops_forwards(cx: &mut TestAppContext) {
+async fn changing_cluster_leaves_the_decision_to_the_core(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     show_web(cx, &t).await;
@@ -130,7 +132,7 @@ async fn changing_cluster_stops_forwards(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(
         view.read_with(cx, |v, _| v.url(id)).as_deref(),
-        Some("http://localhost:18080")
+        Some("http://127.0.0.1:18080")
     );
     assert!(!fake.is_stopped());
 
@@ -146,12 +148,62 @@ async fn changing_cluster_stops_forwards(cx: &mut TestAppContext) {
     })
     .await;
     cx.run_until_parked();
-    assert!(fake.is_stopped(), "stopped on the change of cluster");
+    assert!(!fake.is_stopped(), "not stopped by the window");
     assert!(view.read_with(cx, |v, _| v.has_row(id)), "the row stays");
+    assert_eq!(
+        view.read_with(cx, |v, _| v.url(id)).as_deref(),
+        Some("http://127.0.0.1:18080")
+    );
 
     t.dispatch(cx, "port_forward::StopPortForward", json!({"id": id}))
         .unwrap();
     assert!(!view.read_with(cx, |v, _| v.has_row(id)));
+}
+
+// A target selected outside a set does not start through the set's admitted connection.
+#[gpui_kit::test]
+async fn a_form_from_before_a_set_is_not_started_in_it(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    show_web(cx, &t).await;
+    t.dispatch(cx, "detail::ForwardPort", Value::Null).unwrap();
+    let view = panel(cx, &t).unwrap();
+    assert!(view.read_with(cx, |v, _| v.form_target().is_some()));
+
+    t.dispatch(cx, "cluster_sets::ToggleClusterPicking", Value::Null)
+        .unwrap();
+    for cluster in ["kind-alpha", "kind-beta"] {
+        t.dispatch(
+            cx,
+            "cluster_sets::TogglePickedCluster",
+            json!({ "cluster": cluster }),
+        )
+        .unwrap();
+    }
+    t.dispatch(cx, "cluster_sets::OpenPickedClusters", Value::Null)
+        .unwrap();
+    t.wait_for_element(cx, "cluster-set-view").await;
+    let shown = t
+        .workspace
+        .read_with(cx, |ws, _| ws.sets.member("kind-alpha").is_some());
+    assert!(shown, "kind-alpha is a member now");
+    let member = t
+        .workspace
+        .read_with(cx, |ws, cx| ws.session_member("kind-alpha", cx));
+    assert!(matches!(member, Ok(Some(_))), "{member:?}");
+
+    let window = t.window;
+    let workspace = t.workspace.clone();
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| {
+            ws.start_port_forward(&crate::ui::registry::StartPortForward, window, cx);
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let (rows, form) = view.read_with(cx, |v, _| (v.row_labels(), v.form_target()));
+    assert!(rows.is_empty(), "{rows:?}");
+    assert_eq!(form, None, "it has to be selected again");
 }
 
 // Stopping one forward from its row leaves the others.

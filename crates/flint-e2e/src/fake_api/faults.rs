@@ -28,6 +28,8 @@ pub enum Effect {
     Hold(HoldPoint),
     /// The connection is closed without a response.
     DropConnection,
+    /// A 503 whose body never ends, as a misbehaving proxy may send.
+    EndlessError,
     /// A WebSocket upgrade (an exec) is answered with a plain 200 instead of a 101, as a proxy
     /// that does not pass upgrades on answers it. Other requests pass the fault by, and do not
     /// count against [`Fault::times`].
@@ -177,6 +179,11 @@ impl Fault {
 
     pub fn drop_connection() -> Self {
         Fault::new(Effect::DropConnection)
+    }
+
+    /// Answers with a 503 whose body never ends ([`Effect::EndlessError`]).
+    pub fn endless_error() -> Self {
+        Fault::new(Effect::EndlessError)
     }
 
     /// Answers WebSocket upgrades with a plain 200 ([`Effect::RefuseUpgrade`]).

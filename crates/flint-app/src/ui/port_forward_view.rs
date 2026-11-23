@@ -3,11 +3,12 @@
 //! Stop and Open in Browser buttons.
 //!
 //! The core owns the forwarding and its gate ([`flint_core::port_forward`]). A row holds its
-//! forward, so closing the tab or the window, or quitting, stops it. Changing the active cluster
-//! stops every forward too, and leaves its row saying so.
+//! forward, so closing the tab or the window, or quitting, stops it. The core ends a forward
+//! when a change of cluster, connection or keep watching calls for it, and its row says so.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use flint_core::handle::AdmittedMember;
 use flint_core::port_forward::{
     DeclaredPort, ForwardRequest, ForwardSnapshot, ForwardState, ForwardTarget, PortForward,
     browser_url,
@@ -62,6 +63,7 @@ pub fn state_text(snapshot: &ForwardSnapshot) -> String {
                 None => "Listening".to_owned(),
             },
         },
+        ForwardState::Stopping => "Stopping".to_owned(),
         ForwardState::Failed(failure) => format!("Failed: {failure}"),
         ForwardState::Stopped => "Stopped".to_owned(),
     }
@@ -72,7 +74,17 @@ pub fn state_text(snapshot: &ForwardSnapshot) -> String {
 pub struct FormTarget {
     pub namespace: String,
     pub target: ForwardTarget,
+    /// For a pod, the uid of the one selected.
+    pub uid: Option<String>,
     pub ports: Vec<DeclaredPort>,
+}
+
+/// The connection a form's target was selected on: what its forward starts through.
+#[derive(Clone)]
+pub struct FormBinding {
+    pub core: CoreHandle,
+    pub server: Option<String>,
+    pub member: Option<AdmittedMember>,
 }
 
 /// The ports a target declares, as the form's hint says them.
@@ -101,12 +113,14 @@ struct Row {
 
 impl Row {
     fn url(&self) -> Option<String> {
-        if self.shown.state != ForwardState::Listening {
+        // The live state, not the row's copy: the port may be on its way to being released.
+        let now = self.forward.snapshot();
+        if now.state != ForwardState::Listening {
             return None;
         }
         let declared = self.declared.as_ref();
         Some(browser_url(
-            self.shown.local_port?,
+            now.local_port?,
             declared.and_then(|p| p.name.as_deref()),
             declared.and_then(|p| p.app_protocol.as_deref()),
         ))
@@ -130,11 +144,11 @@ impl Row {
 }
 
 pub struct PortForwardsView {
-    core: CoreHandle,
     cluster: ClusterId,
-    server: Option<String>,
     focus: FocusHandle,
     form: Option<FormTarget>,
+    /// Set and cleared with `form`.
+    binding: Option<FormBinding>,
     remote: Entity<InputState>,
     local: Entity<InputState>,
     error: Option<String>,
@@ -143,22 +157,17 @@ pub struct PortForwardsView {
 }
 
 impl PortForwardsView {
-    pub fn new(
-        core: CoreHandle,
-        cluster: ClusterId,
-        server: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(cluster: ClusterId, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let remote = cx.new(|cx| InputState::new(window, cx).placeholder("Port"));
         let local = cx.new(|cx| InputState::new(window, cx).placeholder("Any free port"));
-        let on_enter = |this: &mut Self,
+        // Through the action, so Enter takes the workspace's checks as the button does.
+        let on_enter = |_: &mut Self,
                         _: &Entity<InputState>,
                         event: &InputEvent,
-                        _: &mut Window,
+                        window: &mut Window,
                         cx: &mut Context<Self>| {
             if matches!(event, InputEvent::PressEnter { .. }) {
-                this.start(cx);
+                window.dispatch_action(Box::new(StartPortForward), cx);
             }
         };
         let inputs = [
@@ -166,11 +175,10 @@ impl PortForwardsView {
             cx.subscribe_in(&local, window, on_enter),
         ];
         PortForwardsView {
-            core,
             cluster,
-            server,
             focus: cx.focus_handle(),
             form: None,
+            binding: None,
             remote,
             local,
             error: None,
@@ -179,8 +187,15 @@ impl PortForwardsView {
         }
     }
 
-    /// Points the form at `target`, with its first declared port filled in, and focuses it.
-    pub fn set_target(&mut self, target: FormTarget, window: &mut Window, cx: &mut Context<Self>) {
+    /// Points the form at `target`, selected on `binding`, with its first declared port filled
+    /// in, and focuses it.
+    pub fn set_target(
+        &mut self,
+        target: FormTarget,
+        binding: FormBinding,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let first = target.ports.first().map(|p| p.port.to_string());
         self.remote.update(cx, |input, cx| {
             input.set_value(first.unwrap_or_default(), window, cx);
@@ -189,7 +204,22 @@ impl PortForwardsView {
         self.local
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.form = Some(target);
+        self.binding = Some(binding);
         self.error = None;
+        cx.notify();
+    }
+
+    /// Whether the form's target was selected on `member` (`None`: outside a set).
+    pub fn form_bound_to(&self, member: Option<&AdmittedMember>) -> bool {
+        self.binding
+            .as_ref()
+            .is_some_and(|binding| binding.member.as_ref() == member)
+    }
+
+    /// Forgets the form's target: it has to be selected again.
+    pub fn clear_form(&mut self, cx: &mut Context<Self>) {
+        self.form = None;
+        self.binding = None;
         cx.notify();
     }
 
@@ -204,7 +234,7 @@ impl PortForwardsView {
 
     /// Starts a forward from the form. A wrong port stays in the form, saying why.
     pub fn start(&mut self, cx: &mut Context<Self>) {
-        let Some(form) = self.form.clone() else {
+        let (Some(form), Some(binding)) = (self.form.clone(), self.binding.clone()) else {
             return;
         };
         let typed = parse_port(&self.remote.read(cx).value()).and_then(|remote| {
@@ -226,13 +256,14 @@ impl PortForwardsView {
         }
         self.error = None;
         let declared = form.ports.iter().find(|p| p.port == remote_port).cloned();
-        let forward = self.core.port_forward(ForwardRequest {
+        let forward = binding.core.port_forward(ForwardRequest {
             cluster: self.cluster.clone(),
             namespace: form.namespace,
             target: form.target,
             remote_port,
             local_port,
-            server: Some(self.server.clone()),
+            server: Some(binding.server),
+            uid: form.uid,
         });
         self.add_row(forward, declared, cx);
     }

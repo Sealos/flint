@@ -2,18 +2,21 @@
 //! a pod's port over the API server's WebSocket `portforward` endpoint.
 //!
 //! A forward opens a channel into the cluster, so it takes the same gate as exec (ADR-0015). The
-//! client is asked for again for every connection, bound to the pin the forward started on, and
-//! is never kept. The gate is also asked every two seconds while the forward runs: when it
-//! refuses (protected, re-pointed, paused, removed), the listener closes and every connection
-//! ends.
+//! client is asked for again for every connection, bound to the pin and the connection the
+//! forward started on, and is never kept. The manager ends a forward as soon as the gate
+//! refuses (protected, re-pointed, paused, removed), its connection goes, or a change of cluster
+//! or of keep watching leaves it without a reason to run. The listener closes and every
+//! connection ends.
 //!
-//! A Service forward picks a ready pod for each new connection, so it moves to another pod when
+//! A forward to a pod reaches that pod only, by uid: one recreated under its name ends it. A
+//! Service forward picks a ready pod for each new connection, so it moves to another pod when
 //! its pod goes away. Reasons shown are Flint's own words, never a server's or a plugin's text.
 
+use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use futures::FutureExt as _;
@@ -24,10 +27,11 @@ use kube::api::{Api, ListParams};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio::task::JoinSet;
 
-use crate::cluster::ClusterId;
+use crate::cluster::{ClusterId, SendCheck, upgrade_client};
+use crate::credential::{CredentialId, WriteCredential};
 use crate::handle::{AdmittedMember, Request};
 use crate::protection::{GatedClient, WriteRefusal};
 use crate::recheck::ContextPin;
@@ -41,6 +45,11 @@ const HEALTH_EVERY: Duration = Duration::from_secs(15);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// The most connections one forward carries at once; further ones wait in the accept queue.
 pub const MAX_CONNECTIONS: usize = 64;
+/// The most connections all forwards carry at once. Each can buffer about 2 MiB, so this bounds
+/// their memory to about 256 MiB. Further ones wait in their listener's accept queue.
+const MAX_RELAYS: usize = 128;
+/// How many of a Service's pods one connection tries before it gives up.
+const MAX_BACKENDS_TRIED: usize = 8;
 /// The wait after a failed `accept` (out of file descriptors, say), so it does not spin.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 const LISTEN_BACKLOG: u32 = 128;
@@ -82,6 +91,8 @@ pub struct ForwardRequest {
     /// The server the forward is for, as the cluster list gave it. `None` for whatever the
     /// context shows when the core takes the request.
     pub server: Option<Option<String>>,
+    /// For a pod, the uid selected. `None` pins the uid its first connection finds.
+    pub uid: Option<String>,
 }
 
 impl std::fmt::Debug for ForwardRequest {
@@ -101,6 +112,8 @@ impl std::fmt::Debug for ForwardRequest {
 pub enum ForwardState {
     Starting,
     Listening,
+    /// Its port is about to be released: nothing should be sent to it any more.
+    Stopping,
     Failed(ForwardFailure),
     Stopped,
 }
@@ -119,7 +132,7 @@ pub struct ForwardFailure {
 }
 
 impl ForwardFailure {
-    fn new(kind: ForwardFailureKind, message: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: ForwardFailureKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -180,10 +193,37 @@ impl std::fmt::Debug for PortForward {
 pub(crate) struct ForwardChannels {
     stop: watch::Receiver<bool>,
     out: Arc<watch::Sender<ForwardSnapshot>>,
+    relays: Arc<Semaphore>,
+}
+
+impl ForwardChannels {
+    /// `work`, unless the forward is stopped or its handle dropped first.
+    pub(crate) async fn unless_stopped<T>(&self, work: impl Future<Output = T>) -> Option<T> {
+        let mut stop = self.stop.clone();
+        tokio::select! {
+            biased;
+            _ = stop.wait_for(|stopped| *stopped) => None,
+            value = work => Some(value),
+        }
+    }
+
+    pub(crate) fn say_stopped(&self) {
+        self.out.send_modify(|s| s.state = ForwardState::Stopped);
+    }
+}
+
+/// What every forward's connections share.
+fn shared_relays() -> Arc<Semaphore> {
+    static RELAYS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(RELAYS.get_or_init(|| Arc::new(Semaphore::new(MAX_RELAYS))))
 }
 
 impl PortForward {
     pub(crate) fn new(request: ForwardRequest) -> (Self, ForwardChannels) {
+        Self::with_relays(request, shared_relays())
+    }
+
+    fn with_relays(request: ForwardRequest, relays: Arc<Semaphore>) -> (Self, ForwardChannels) {
         let (out, rx) = watch::channel(ForwardSnapshot {
             state: ForwardState::Starting,
             local_port: None,
@@ -201,6 +241,7 @@ impl PortForward {
             ForwardChannels {
                 stop,
                 out: Arc::new(out),
+                relays,
             },
         )
     }
@@ -305,6 +346,8 @@ pub(crate) enum DialError {
 pub(crate) trait Dialer: Send + Sync + 'static {
     /// Whether the gate still allows this forward.
     fn check(&self) -> BoxFuture<'static, Result<(), ForwardFailure>>;
+    /// Resolves with how the forward ends, once the core ends it.
+    fn ended(&self) -> BoxFuture<'static, ForwardState>;
     /// The pod a connection would reach now.
     fn probe(&self) -> BoxFuture<'static, Result<String, DialError>>;
     fn dial(&self) -> BoxFuture<'static, Result<Upstream, DialError>>;
@@ -327,6 +370,7 @@ async fn relay<D: Dialer>(
     dialer: Arc<D>,
     out: Arc<watch::Sender<ForwardSnapshot>>,
     remote: u16,
+    _relay: OwnedSemaphorePermit,
 ) -> Option<ForwardFailure> {
     let dialed = tokio::time::timeout(DIAL_TIMEOUT, dialer.dial()).await;
     let mut upstream = match dialed {
@@ -403,18 +447,26 @@ pub(crate) async fn serve<D: Dialer>(
     channels: ForwardChannels,
     remote: u16,
 ) {
-    let ForwardChannels { mut stop, out } = channels;
+    let ForwardChannels {
+        mut stop,
+        out,
+        relays,
+    } = channels;
     // Also resolves, with an error, once the handle is dropped.
     let mut stopped = Box::pin(async move {
         let _ = stop.wait_for(|stopped| *stopped).await;
     });
     let mut conns: JoinSet<Option<ForwardFailure>> = JoinSet::new();
+    let mut ended = dialer.ended();
     let mut gate = Box::pin(watch_gate(dialer.clone()));
     let mut target = Box::pin(watch_target(dialer.clone(), out.clone()));
+    // Accepted, and waiting for room in the budget all forwards share.
+    let mut waiting: Option<TcpStream> = None;
     let end = loop {
         tokio::select! {
             biased;
             () = &mut stopped => break ForwardState::Stopped,
+            state = &mut ended => break state,
             failure = &mut gate => break ForwardState::Failed(failure),
             failure = &mut target => break ForwardState::Failed(failure),
             Some(done) = conns.join_next(), if !conns.is_empty() => {
@@ -424,17 +476,26 @@ pub(crate) async fn serve<D: Dialer>(
                 let count = conns.len();
                 out.send_modify(|s| s.connections = count);
             }
-            accepted = listener.accept(), if conns.len() < MAX_CONNECTIONS => match accepted {
-                Ok((stream, _)) => {
-                    let _ = stream.set_nodelay(true);
-                    conns.spawn(relay(stream, dialer.clone(), out.clone(), remote));
+            permit = relays.clone().acquire_owned(), if waiting.is_some() => {
+                if let (Ok(permit), Some(stream)) = (permit, waiting.take()) {
+                    conns.spawn(relay(stream, dialer.clone(), out.clone(), remote, permit));
                     let count = conns.len();
                     out.send_modify(|s| s.connections = count);
+                }
+            }
+            accepted = listener.accept(),
+                if waiting.is_none() && conns.len() < MAX_CONNECTIONS => match accepted {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nodelay(true);
+                    waiting = Some(stream);
                 }
                 Err(_) => tokio::time::sleep(ACCEPT_BACKOFF).await,
             },
         }
     };
+    // Said first, so nothing offers the address once another program could take the port.
+    out.send_modify(|s| s.state = ForwardState::Stopping);
+    drop(waiting);
     drop(listener);
     conns.shutdown().await;
     out.send_modify(|s| {
@@ -450,7 +511,11 @@ pub(crate) async fn run<D: Dialer>(
     request: ForwardRequest,
     channels: ForwardChannels,
 ) {
-    if let Err(failure) = dialer.check().await {
+    let Some(checked) = channels.unless_stopped(dialer.check()).await else {
+        channels.say_stopped();
+        return;
+    };
+    if let Err(failure) = checked {
         channels
             .out
             .send_modify(|s| s.state = ForwardState::Failed(failure));
@@ -500,21 +565,33 @@ pub(crate) fn gate_failure(refusal: &WriteError) -> ForwardFailure {
     ForwardFailure::new(ForwardFailureKind::Refused, message)
 }
 
+/// What the core admitted a forward on: the definition, the connection, and how it hears that it
+/// must end.
+pub(crate) struct ForwardGrant {
+    pub(crate) id: u64,
+    pub(crate) pin: ContextPin,
+    pub(crate) connection: CredentialId,
+    pub(crate) ended: watch::Receiver<Option<ForwardState>>,
+}
+
 /// The real [`Dialer`]: every connection asks the gate and takes a fresh client.
 pub(crate) struct KubeDialer {
-    pub requests: async_channel::Sender<Request>,
-    pub request: ForwardRequest,
-    pub pin: ContextPin,
-    pub admitted: Option<Arc<AdmittedMember>>,
+    access: Access,
+    request: ForwardRequest,
+    ended: watch::Receiver<Option<ForwardState>>,
+    /// The uid a pod target must have.
+    uid: Arc<Mutex<Option<String>>>,
 }
 
 /// What a dial needs, without borrowing the dialer into its future.
 #[derive(Clone)]
 struct Access {
     requests: async_channel::Sender<Request>,
+    id: u64,
     cluster: ClusterId,
     server: Option<Option<String>>,
     pin: ContextPin,
+    connection: CredentialId,
     admitted: Option<Arc<AdmittedMember>>,
 }
 
@@ -528,23 +605,18 @@ impl Access {
         let (reply, rx) = oneshot::channel();
         let sent = self
             .requests
-            .send(Request::CheckForward {
-                cluster: self.cluster.clone(),
-                pin: self.pin.clone(),
-                reply,
-            })
+            .send(Request::CheckForward { id: self.id, reply })
             .await;
         if sent.is_err() {
             return Err(gate_failure(&WriteRefusal::Stopped.into()));
         }
         rx.await
-            .unwrap_or(Err(WriteRefusal::Stopped.into()))
-            .map_err(|e| gate_failure(&e))
+            .unwrap_or_else(|_| Err(gate_failure(&WriteRefusal::Stopped.into())))
     }
 
     /// A client for one request, read in one step with the pin: refused unless it is the
-    /// definition the forward started on.
-    async fn client(&self) -> Result<GatedClient, ForwardFailure> {
+    /// definition and the connection the forward started on.
+    async fn client(&self) -> Result<(GatedClient, WriteCredential), ForwardFailure> {
         let (reply, rx) = oneshot::channel();
         let sent = self
             .requests
@@ -557,14 +629,37 @@ impl Access {
         if sent.is_err() {
             return Err(gate_failure(&WriteRefusal::Stopped.into()));
         }
-        let (client, pin, _) = rx
+        let (client, pin, credential) = rx
             .await
             .unwrap_or(Err(WriteRefusal::Stopped.into()))
             .map_err(|e| gate_failure(&e))?;
-        if pin != self.pin {
+        if pin != self.pin || !credential.id().is(&self.connection) {
             return Err(gate_failure(&WriteError::ConnectionChanged));
         }
-        Ok(client)
+        Ok((client, credential))
+    }
+
+    /// The client with its credential already resolved, under the connection's own grant: what
+    /// is sent with it runs nothing and waits for no refresh.
+    async fn signed_in(&self) -> Result<kube::Client, DialError> {
+        let (client, credential) = self.client().await.map_err(DialError::Fatal)?;
+        match credential.resolved(client.into_client()).await {
+            Ok(client) => Ok(client),
+            Err(WriteError::IdentityUnverified) => Err(DialError::Dropped(format!(
+                "{} must be selected to sign in again",
+                self.cluster
+            ))),
+            Err(refusal) => Err(DialError::Fatal(gate_failure(&refusal))),
+        }
+    }
+
+    /// The gate, for the moment an upgrade is sent.
+    fn send_check(&self) -> SendCheck {
+        let access = self.clone();
+        SendCheck::new(move || {
+            let access = access.clone();
+            async move { access.check().await.map_err(|f| f.to_string()) }.boxed()
+        })
     }
 }
 
@@ -586,16 +681,45 @@ fn gone(target: &ForwardTarget) -> DialError {
     ))
 }
 
-/// The pod and the pod's port a connection goes to.
+/// The pod behind a connection is no longer the one chosen.
+fn replaced(target: &ForwardTarget) -> DialError {
+    match target {
+        ForwardTarget::Pod(_) => DialError::Fatal(ForwardFailure::new(
+            ForwardFailureKind::TargetGone,
+            format!("{target} was replaced by another pod of that name"),
+        )),
+        ForwardTarget::Service(_) => DialError::Dropped(format!("the pod behind {target} changed")),
+    }
+}
+
+/// A pod a connection may go to.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Backend {
+    pod: String,
+    uid: String,
+    port: u16,
+}
+
+fn uid_of(pod: &Pod) -> Option<&str> {
+    pod.metadata.uid.as_deref()
+}
+
+fn has_finished(pod: &Pod) -> bool {
+    let phase = pod.status.as_ref().and_then(|s| s.phase.as_deref());
+    matches!(phase, Some("Succeeded" | "Failed"))
+}
+
+/// The pod and the pod's port a connection goes to. A pod target must have the pinned uid.
 async fn resolve(
     client: &kube::Client,
     namespace: &str,
     target: &ForwardTarget,
     remote: u16,
-) -> Result<(String, u16), DialError> {
+    pinned: &Mutex<Option<String>>,
+) -> Result<Backend, DialError> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
     match target {
         ForwardTarget::Pod(name) => {
-            let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
             let pod = pods.get(name).await.map_err(|e| {
                 if is_status(&e, 404) {
                     gone(target)
@@ -605,14 +729,26 @@ async fn resolve(
                     DialError::Dropped(format!("Flint could not reach {target}"))
                 }
             })?;
-            let phase = pod.status.as_ref().and_then(|s| s.phase.as_deref());
-            if matches!(phase, Some("Succeeded" | "Failed")) {
+            let uid = uid_of(&pod)
+                .ok_or_else(|| DialError::Dropped(format!("Flint could not confirm {target}")))?
+                .to_owned();
+            {
+                let mut pinned = pinned.lock().unwrap_or_else(|e| e.into_inner());
+                if pinned.get_or_insert_with(|| uid.clone()) != &uid {
+                    return Err(replaced(target));
+                }
+            }
+            if has_finished(&pod) {
                 return Err(DialError::Fatal(ForwardFailure::new(
                     ForwardFailureKind::TargetGone,
                     format!("{target} has finished"),
                 )));
             }
-            Ok((name.clone(), remote))
+            Ok(Backend {
+                pod: name.clone(),
+                uid,
+                port: remote,
+            })
         }
         ForwardTarget::Service(name) => {
             let unreachable = |e: kube::Error| {
@@ -630,24 +766,65 @@ async fn resolve(
             let params =
                 ListParams::default().labels(&format!("kubernetes.io/service-name={name}"));
             let slices = slices.list(&params).await.map_err(unreachable)?;
-            pick_backend(&service, &slices.items, remote).ok_or_else(|| {
-                DialError::Dropped(format!("{target} has no ready pod for port {remote}"))
-            })
+            for backend in pick_backends(&service, &slices.items, remote)
+                .into_iter()
+                .take(MAX_BACKENDS_TRIED)
+            {
+                match pods.get(&backend.pod).await {
+                    Ok(pod) if uid_of(&pod) == Some(&backend.uid) && !has_finished(&pod) => {
+                        return Ok(backend);
+                    }
+                    Ok(_) => {}
+                    Err(e) if is_status(&e, 404) => {}
+                    Err(e) if is_status(&e, 403) => {
+                        return Err(forbidden("reading this service's pods"));
+                    }
+                    Err(_) => {
+                        return Err(DialError::Dropped(format!(
+                            "Flint could not reach {target}"
+                        )));
+                    }
+                }
+            }
+            Err(DialError::Dropped(format!(
+                "{target} has no ready pod for port {remote}"
+            )))
         }
     }
 }
 
-/// The first ready pod behind `service`'s `port`, by name, with the port it listens on there.
-fn pick_backend(service: &Service, slices: &[EndpointSlice], port: u16) -> Option<(String, u16)> {
+/// Whether `backend` is still the pod there, read after its channel opened.
+async fn confirm(
+    client: &kube::Client,
+    namespace: &str,
+    target: &ForwardTarget,
+    backend: &Backend,
+) -> Result<(), DialError> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    match pods.get(&backend.pod).await {
+        Ok(pod) if uid_of(&pod) == Some(&backend.uid) && !has_finished(&pod) => Ok(()),
+        Ok(_) => Err(replaced(target)),
+        Err(e) if is_status(&e, 404) => Err(replaced(target)),
+        Err(e) if is_status(&e, 403) => Err(forbidden("reading this pod")),
+        Err(_) => Err(DialError::Dropped(format!(
+            "Flint could not confirm {target}"
+        ))),
+    }
+}
+
+/// The ready pods behind `service`'s `port`, by name, each with its uid and the port it listens
+/// on there. An endpoint that names no uid can't be checked, so it is left out.
+fn pick_backends(service: &Service, slices: &[EndpointSlice], port: u16) -> Vec<Backend> {
     let declared = service
         .spec
-        .as_ref()?
-        .ports
-        .as_ref()?
-        .iter()
-        .find(|p| p.port == i32::from(port))?;
+        .as_ref()
+        .and_then(|spec| spec.ports.as_ref())
+        .and_then(|ports| ports.iter().find(|p| p.port == i32::from(port)));
+    let Some(declared) = declared else {
+        return Vec::new();
+    };
     let wanted = declared.name.as_deref().unwrap_or("");
-    let mut ready: Vec<(String, u16)> = Vec::new();
+    let mut ready: Vec<Backend> = Vec::new();
     for slice in slices {
         let Some(number) = slice
             .ports
@@ -669,80 +846,109 @@ fn pick_backend(service: &Service, slices: &[EndpointSlice], port: u16) -> Optio
                 .target_ref
                 .as_ref()
                 .filter(|r| r.kind.as_deref() == Some("Pod"))
-                .and_then(|r| r.name.clone());
-            if let (true, Some(pod)) = (is_ready, pod) {
-                ready.push((pod, number));
+                .and_then(|r| Some((r.name.clone()?, r.uid.clone()?)));
+            if let (true, Some((pod, uid))) = (is_ready, pod) {
+                ready.push(Backend {
+                    pod,
+                    uid,
+                    port: number,
+                });
             }
         }
     }
-    ready.into_iter().min()
+    ready.sort();
+    ready.dedup();
+    ready
 }
 
 impl Dialer for KubeDialer {
     fn check(&self) -> BoxFuture<'static, Result<(), ForwardFailure>> {
-        let access = self.access();
+        let access = self.access.clone();
         async move { access.check().await }.boxed()
     }
 
+    fn ended(&self) -> BoxFuture<'static, ForwardState> {
+        let mut ended = self.ended.clone();
+        async move {
+            match ended.wait_for(Option::is_some).await {
+                Ok(state) => state.clone().unwrap_or(ForwardState::Stopped),
+                Err(_) => ForwardState::Failed(gate_failure(&WriteRefusal::Stopped.into())),
+            }
+        }
+        .boxed()
+    }
+
     fn probe(&self) -> BoxFuture<'static, Result<String, DialError>> {
-        let access = self.access();
+        let access = self.access.clone();
         let request = self.request.clone();
+        let uid = Arc::clone(&self.uid);
         async move {
             access.check().await.map_err(DialError::Fatal)?;
-            let client = access
-                .client()
-                .await
-                .map_err(DialError::Fatal)?
-                .into_client();
-            let (pod, _) = resolve(
+            let client = access.signed_in().await?;
+            let backend = resolve(
                 &client,
                 &request.namespace,
                 &request.target,
                 request.remote_port,
+                &uid,
             )
             .await?;
-            Ok(pod)
+            Ok(backend.pod)
         }
         .boxed()
     }
 
     fn dial(&self) -> BoxFuture<'static, Result<Upstream, DialError>> {
-        let access = self.access();
+        let access = self.access.clone();
         let request = self.request.clone();
+        let uid = Arc::clone(&self.uid);
         async move {
             access.check().await.map_err(DialError::Fatal)?;
-            let client = access
-                .client()
-                .await
-                .map_err(DialError::Fatal)?
-                .into_client();
-            let (pod, port) = resolve(
+            let client = access.signed_in().await?;
+            let backend = resolve(
                 &client,
                 &request.namespace,
                 &request.target,
                 request.remote_port,
+                &uid,
             )
             .await?;
-            // The reads took a moment: asked again immediately before the channel opens.
-            access.check().await.map_err(DialError::Fatal)?;
-            let pods: Api<Pod> = Api::namespaced(client, &request.namespace);
-            let mut forwarder = pods.portforward(&pod, &[port]).await.map_err(|e| {
-                if is_status(&e, 403) {
-                    forbidden("port-forwarding to this pod")
-                } else if is_status(&e, 404) && matches!(request.target, ForwardTarget::Pod(_)) {
-                    gone(&request.target)
-                } else {
-                    DialError::Dropped(format!("Flint could not open a connection to {pod}"))
+            let port = backend.port;
+            let pods: Api<Pod> = Api::namespaced(
+                upgrade_client(client.clone(), access.send_check()),
+                &request.namespace,
+            );
+            let opened = pods.portforward(&backend.pod, &[port]).await;
+            let forwarder = match opened {
+                Ok(forwarder) => forwarder,
+                Err(e) => {
+                    // Refused by the gate at send time, or it closed meanwhile.
+                    access.check().await.map_err(DialError::Fatal)?;
+                    return Err(if is_status(&e, 403) {
+                        forbidden("port-forwarding to this pod")
+                    } else if is_status(&e, 404) && matches!(request.target, ForwardTarget::Pod(_))
+                    {
+                        gone(&request.target)
+                    } else {
+                        DialError::Dropped(format!(
+                            "Flint could not open a connection to {}",
+                            backend.pod
+                        ))
+                    });
                 }
-            })?;
+            };
+            let mut connection = AbortOnDrop(forwarder);
             let missing = || DialError::Dropped(dropped_text(port));
-            let stream = forwarder.take_stream(port).ok_or_else(missing)?;
-            let errors = forwarder.take_error(port).ok_or_else(missing)?;
+            let stream = connection.0.take_stream(port).ok_or_else(missing)?;
+            let errors = connection.0.take_error(port).ok_or_else(missing)?;
+            // Nothing is carried until the channel is known to be on the pod chosen.
+            confirm(&client, &request.namespace, &request.target, &backend).await?;
+            access.check().await.map_err(DialError::Fatal)?;
             Ok(Upstream {
                 stream: Box::pin(stream),
                 failed: errors.map(|message| message.is_some()).boxed(),
-                pod,
-                _connection: Some(AbortOnDrop(forwarder)),
+                pod: backend.pod,
+                _connection: Some(connection),
             })
         }
         .boxed()
@@ -750,13 +956,29 @@ impl Dialer for KubeDialer {
 }
 
 impl KubeDialer {
-    fn access(&self) -> Access {
-        Access {
-            requests: self.requests.clone(),
-            cluster: self.request.cluster.clone(),
-            server: self.request.server.clone(),
-            pin: self.pin.clone(),
-            admitted: self.admitted.clone(),
+    pub(crate) fn new(
+        requests: async_channel::Sender<Request>,
+        request: ForwardRequest,
+        grant: ForwardGrant,
+        admitted: Option<Arc<AdmittedMember>>,
+    ) -> Self {
+        let uid = match request.target {
+            ForwardTarget::Pod(_) => request.uid.clone(),
+            ForwardTarget::Service(_) => None,
+        };
+        Self {
+            access: Access {
+                requests,
+                id: grant.id,
+                cluster: request.cluster.clone(),
+                server: request.server.clone(),
+                pin: grant.pin,
+                connection: grant.connection,
+                admitted,
+            },
+            request,
+            ended: grant.ended,
+            uid: Arc::new(Mutex::new(uid)),
         }
     }
 }
@@ -822,7 +1044,7 @@ pub fn browser_url(local_port: u16, name: Option<&str>, app_protocol: Option<&st
     } else {
         "http"
     };
-    format!("{scheme}://localhost:{local_port}")
+    format!("{scheme}://127.0.0.1:{local_port}")
 }
 
 /// The core's side of a forward no task runs, for a front end's tests.
@@ -883,6 +1105,16 @@ mod tests {
         fail: Mutex<Option<DialError>>,
         probe: Mutex<Option<DialError>>,
         report_error: AtomicBool,
+        slow_close: AtomicBool,
+    }
+
+    /// Takes a moment to drop, as a connection slow to close does.
+    struct SlowDrop;
+
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 
     fn echo(mut side: DuplexStream) {
@@ -914,6 +1146,10 @@ mod tests {
             .boxed()
         }
 
+        fn ended(&self) -> BoxFuture<'static, ForwardState> {
+            futures::future::pending().boxed()
+        }
+
         fn probe(&self) -> BoxFuture<'static, Result<String, DialError>> {
             let answer = self.probe.lock().unwrap().clone();
             async move { answer.map_or(Ok("web-1".to_owned()), Err) }.boxed()
@@ -923,6 +1159,7 @@ mod tests {
             self.dials.fetch_add(1, Ordering::SeqCst);
             let failure = self.fail.lock().unwrap().clone();
             let report = self.report_error.load(Ordering::SeqCst);
+            let slow = self.slow_close.load(Ordering::SeqCst);
             async move {
                 if let Some(failure) = failure {
                     return Err(failure);
@@ -933,6 +1170,12 @@ mod tests {
                     stream: Box::pin(near),
                     failed: if report {
                         async { true }.boxed()
+                    } else if slow {
+                        async {
+                            let _closing = SlowDrop;
+                            futures::future::pending::<bool>().await
+                        }
+                        .boxed()
                     } else {
                         futures::future::pending().boxed()
                     },
@@ -952,6 +1195,7 @@ mod tests {
             remote_port: 8080,
             local_port,
             server: None,
+            uid: None,
         }
     }
 
@@ -1170,7 +1414,7 @@ mod tests {
         json!({
             "addresses": ["10.0.0.1"],
             "conditions": {"ready": ready},
-            "targetRef": {"kind": "Pod", "name": pod},
+            "targetRef": {"kind": "Pod", "name": pod, "uid": format!("uid-{pod}")},
         })
     }
 
@@ -1189,15 +1433,15 @@ mod tests {
                 endpoint("web-1", true)
             ]),
         )];
-        assert_eq!(
-            pick_backend(&svc, &slices, 80),
-            Some(("web-1".to_owned(), 8080))
-        );
-        assert_eq!(
-            pick_backend(&svc, &slices, 9090),
-            Some(("web-1".to_owned(), 9100))
-        );
-        assert_eq!(pick_backend(&svc, &slices, 81), None, "not a Service port");
+        let first = |port| pick_backends(&svc, &slices, port).into_iter().next();
+        let web_1 = |port| Backend {
+            pod: "web-1".to_owned(),
+            uid: "uid-web-1".to_owned(),
+            port,
+        };
+        assert_eq!(first(80), Some(web_1(8080)));
+        assert_eq!(first(9090), Some(web_1(9100)));
+        assert_eq!(first(81), None, "not a Service port");
     }
 
     #[test]
@@ -1207,8 +1451,8 @@ mod tests {
             json!([{"port": 8080}]),
             json!([endpoint("web-0", false)]),
         )];
-        assert_eq!(pick_backend(&svc, &slices, 80), None);
-        assert_eq!(pick_backend(&svc, &[], 80), None);
+        assert!(pick_backends(&svc, &slices, 80).is_empty());
+        assert!(pick_backends(&svc, &[], 80).is_empty());
     }
 
     #[test]
@@ -1237,17 +1481,126 @@ mod tests {
     fn the_browser_address_follows_the_port() {
         assert_eq!(
             browser_url(8080, Some("http"), None),
-            "http://localhost:8080"
+            "http://127.0.0.1:8080"
         );
-        assert_eq!(browser_url(8080, None, None), "http://localhost:8080");
+        assert_eq!(browser_url(8080, None, None), "http://127.0.0.1:8080");
         assert_eq!(
             browser_url(8443, Some("https"), None),
-            "https://localhost:8443"
+            "https://127.0.0.1:8443"
         );
         assert_eq!(
             browser_url(8443, Some("web"), Some("HTTPS")),
-            "https://localhost:8443"
+            "https://127.0.0.1:8443"
         );
+    }
+
+    // An endpoint without a uid can't be checked against the pod it names.
+    #[test]
+    fn an_endpoint_without_a_uid_is_left_out() {
+        let svc = service(json!([{"port": 80}]));
+        let slices = [slice(
+            json!([{"port": 8080}]),
+            json!([{"conditions": {"ready": true}, "addresses": ["10.0.0.1"],
+                    "targetRef": {"kind": "Pod", "name": "web-0"}}]),
+        )];
+        assert!(pick_backends(&svc, &slices, 80).is_empty());
+    }
+
+    /// A gate that answers only once released.
+    #[derive(Default)]
+    struct SlowGate {
+        release: tokio::sync::Notify,
+    }
+
+    impl Dialer for Arc<SlowGate> {
+        fn check(&self) -> BoxFuture<'static, Result<(), ForwardFailure>> {
+            let gate = Arc::clone(self);
+            async move {
+                gate.release.notified().await;
+                Ok(())
+            }
+            .boxed()
+        }
+
+        fn ended(&self) -> BoxFuture<'static, ForwardState> {
+            futures::future::pending().boxed()
+        }
+
+        fn probe(&self) -> BoxFuture<'static, Result<String, DialError>> {
+            futures::future::pending().boxed()
+        }
+
+        fn dial(&self) -> BoxFuture<'static, Result<Upstream, DialError>> {
+            futures::future::pending().boxed()
+        }
+    }
+
+    // Closed while its admission is pending, it never takes the port.
+    #[tokio::test]
+    async fn a_forward_stopped_while_starting_never_binds() {
+        let spare = bind_loopback(None).unwrap();
+        let port = spare.local_addr().unwrap().port();
+        drop(spare);
+        let gate = Arc::new(SlowGate::default());
+        let request = request(Some(port));
+        let (forward, channels) = PortForward::new(request.clone());
+        let task = tokio::spawn(run(Arc::new(gate.clone()), request, channels));
+        tokio::task::yield_now().await;
+        forward.stop();
+        gate.release.notify_one();
+        task.await.unwrap();
+        assert_eq!(forward.snapshot().state, ForwardState::Stopped);
+        assert_eq!(forward.snapshot().local_port, None);
+        assert!(bind_loopback(Some(port)).is_ok(), "the port stayed free");
+    }
+
+    // The budget is shared: a second forward's connection waits for the first to end.
+    #[tokio::test]
+    async fn connections_of_all_forwards_share_one_budget() {
+        let dialer = Arc::new(FakeDialer::default());
+        let relays = Arc::new(Semaphore::new(1));
+        let mut ports = Vec::new();
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let request = request(None);
+            let (forward, channels) = PortForward::with_relays(request.clone(), relays.clone());
+            tokio::spawn(run(Arc::new(dialer.clone()), request, channels));
+            let mut updates = forward.updates();
+            let shown = wait_for(&mut updates, |s| s.local_port.is_some()).await;
+            ports.push(shown.local_port.unwrap());
+            handles.push(forward);
+        }
+        let first = round_trip(ports[0]).await;
+        let mut second = TcpStream::connect((Ipv4Addr::LOCALHOST, ports[1]))
+            .await
+            .unwrap();
+        second.write_all(b"ping").await.unwrap();
+        let mut back = [0; 4];
+        let early =
+            tokio::time::timeout(Duration::from_millis(200), second.read_exact(&mut back)).await;
+        assert!(early.is_err(), "over the budget");
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 1);
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(5), second.read_exact(&mut back))
+            .await
+            .expect("carried once there was room")
+            .unwrap();
+    }
+
+    // Nothing offers the address once the port can be taken by another program.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn it_says_stopping_before_it_releases_the_port() {
+        let dialer = Arc::new(FakeDialer::default());
+        dialer.slow_close.store(true, Ordering::SeqCst);
+        let (forward, mut updates, port) = started(&dialer, None).await;
+        // A connection slow to close holds it between the two states, to be seen there.
+        let _stream = round_trip(port).await;
+        wait_for(&mut updates, |s| s.connections == 1 && s.pod.is_some()).await;
+        forward.stop();
+        let first = wait_for(&mut updates, |s| s.state != ForwardState::Listening).await;
+        assert_eq!(first.state, ForwardState::Stopping);
+        wait_for(&mut updates, |s| s.state == ForwardState::Stopped).await;
+        closed(port).await;
     }
 
     #[test]

@@ -314,6 +314,7 @@ struct Parts {
 
 /// Which connection's credential something was learned with. Holds none of it: the credential
 /// is dropped with its connection, and an id never matches a later one.
+#[derive(Clone)]
 pub(crate) struct CredentialId(Weak<Parts>);
 
 impl CredentialId {
@@ -391,7 +392,38 @@ impl WriteCredential {
     pub(crate) async fn present(&self, client: Client) -> Result<Presented, WriteError> {
         let parts = &self.0;
         let lease = parts.grant.lease();
+        let (client, material) = self.resolve(client, &lease).await?;
+        let identity = if parts.check_identity {
+            Some(authenticated_identity(&client).await?)
+        } else {
+            None
+        };
         still_held(&lease)?;
+        Ok(Presented {
+            client,
+            binding: CredentialBinding {
+                material: material.finish().ok_or(WriteError::CredentialUnreadable)?,
+                identity,
+            },
+        })
+    }
+
+    /// `client`, set to send this credential as it is now, without asking the server who it is.
+    /// Refused as [`Self::present`] is, with nothing run or sent.
+    pub(crate) async fn resolved(&self, client: Client) -> Result<Client, WriteError> {
+        let lease = self.0.grant.lease();
+        let (client, _) = self.resolve(client, &lease).await?;
+        Ok(client)
+    }
+
+    /// Ends with the lease still held, and refuses otherwise.
+    async fn resolve(
+        &self,
+        client: Client,
+        lease: &CredentialLease,
+    ) -> Result<(Client, Digester), WriteError> {
+        let parts = &self.0;
+        still_held(lease)?;
         let mut material = Digester::new().ok_or(WriteError::CredentialUnreadable)?;
         for file in &parts.files {
             let held = file.held.ok_or(WriteError::CredentialUnreadable)?;
@@ -431,24 +463,12 @@ impl WriteCredential {
                 }
             }
         };
-        still_held(&lease)?;
+        still_held(lease)?;
         let client = match header {
             Some(header) => crate::cluster::sending_credential(client, BoundHeader(header)),
             None => client,
         };
-        let identity = if parts.check_identity {
-            Some(authenticated_identity(&client).await?)
-        } else {
-            None
-        };
-        still_held(&lease)?;
-        Ok(Presented {
-            client,
-            binding: CredentialBinding {
-                material: material.finish().ok_or(WriteError::CredentialUnreadable)?,
-                identity,
-            },
-        })
+        Ok((client, material))
     }
 }
 

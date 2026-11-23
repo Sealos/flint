@@ -9,7 +9,7 @@ use flint_core::port_forward::{
     ForwardFailureKind, ForwardRequest, ForwardSnapshot, ForwardState, ForwardTarget, PortForward,
     wait_for,
 };
-use flint_e2e::fake_api::{CONTEXT, FakeApiServer};
+use flint_e2e::fake_api::{CONTEXT, FakeApiServer, Fault};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
@@ -29,6 +29,7 @@ fn request(target: ForwardTarget, remote_port: u16) -> ForwardRequest {
         remote_port,
         local_port: None,
         server: None,
+        uid: None,
     }
 }
 
@@ -165,6 +166,151 @@ async fn a_re_pointed_context_ends_the_forward() {
         "{shown:?}"
     );
     assert!(other.forward_requests().is_empty());
+}
+
+/// `WEB` deleted and created again under its name, with another uid.
+fn recreate_web(server: &FakeApiServer) {
+    let again = server.pod("demo", WEB).unwrap().sibling(WEB);
+    server.replace_pod("demo", WEB, again);
+}
+
+fn ended_as(shown: &ForwardSnapshot, kind: ForwardFailureKind) -> bool {
+    matches!(&shown.state, ForwardState::Failed(f) if f.kind == kind)
+}
+
+// A pod recreated under its name is another pod: no new connection reaches it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pod_recreated_under_its_name_ends_the_forward() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start_with(&server, Some("demo"), Settings::default()).await;
+    let forward = core
+        .handle
+        .port_forward(request(ForwardTarget::Pod(WEB.into()), 8080));
+    let port = listening(&forward).await;
+    let _first = echoes(port).await;
+    let opened = server.forward_requests().len();
+
+    recreate_web(&server);
+    let _second = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    let shown = until(&forward, |s| s.state.is_finished()).await;
+    assert!(
+        ended_as(&shown, ForwardFailureKind::TargetGone),
+        "{shown:?}"
+    );
+    assert_eq!(
+        server.forward_requests().len(),
+        opened,
+        "nothing was opened"
+    );
+}
+
+// The pod is replaced while its upgrade is on the way: the tunnel carries nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pod_replaced_during_the_upgrade_gets_no_bytes() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start_with(&server, Some("demo"), Settings::default()).await;
+    let forward = core
+        .handle
+        .port_forward(request(ForwardTarget::Pod(WEB.into()), 8080));
+    let port = listening(&forward).await;
+    let _first = echoes(port).await;
+
+    let (fault, hold) = Fault::hold();
+    server.inject(fault.subresource("portforward").times(1));
+    let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    tokio::time::timeout(WAIT, hold.reached())
+        .await
+        .expect("the upgrade reached the server");
+    recreate_web(&server);
+    hold.release();
+    let shown = until(&forward, |s| s.state.is_finished()).await;
+    assert!(
+        ended_as(&shown, ForwardFailureKind::TargetGone),
+        "{shown:?}"
+    );
+    let mut buf = [0; 4];
+    let read = tokio::time::timeout(WAIT, stream.read(&mut buf))
+        .await
+        .expect("the connection ended");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+}
+
+// A slice that still names a replaced pod's uid: the Service forward takes the pod that matches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_service_forward_skips_an_endpoint_of_a_replaced_pod() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start_with(&server, Some("demo"), Settings::default()).await;
+    recreate_web(&server);
+    let forward = core
+        .handle
+        .port_forward(request(ForwardTarget::Service("web".into()), 80));
+    let port = listening(&forward).await;
+    let _stream = echoes(port).await;
+    let requests = server.forward_requests();
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0].path.contains(WEB), "{:?}", requests[0].path);
+}
+
+// A refused upgrade is sent once, whatever the status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_upgrade_is_not_sent_again() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start_with(&server, Some("demo"), Settings::default()).await;
+    server.inject(Fault::status(503).subresource("portforward"));
+    let forward = core
+        .handle
+        .port_forward(request(ForwardTarget::Pod(WEB.into()), 8080));
+    let port = listening(&forward).await;
+    let _stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    until(&forward, |s| s.warning.is_some()).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(server.forward_requests().len(), 1);
+}
+
+// An error body that never ends is not read: the connection fails at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_endless_error_body_is_not_read() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start_with(&server, Some("demo"), Settings::default()).await;
+    server.inject(Fault::endless_error().subresource("portforward"));
+    let forward = core
+        .handle
+        .port_forward(request(ForwardTarget::Pod(WEB.into()), 8080));
+    let port = listening(&forward).await;
+    let _stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    let mut updates = forward.updates();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        wait_for(&mut updates, |s| s.warning.is_some()),
+    )
+    .await
+    .expect("the refusal was seen without reading its body");
+}
+
+// A role without `create` on a server enforcing it: the forward says so and ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_requiring_create_ends_the_forward_as_forbidden() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start_with(&server, Some("demo"), Settings::default()).await;
+    server.inject(Fault::forbidden_as("create").subresource("portforward"));
+    let forward = core
+        .handle
+        .port_forward(request(ForwardTarget::Pod(WEB.into()), 8080));
+    let port = listening(&forward).await;
+    let _stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    let shown = until(&forward, |s| s.state.is_finished()).await;
+    assert!(ended_as(&shown, ForwardFailureKind::Forbidden), "{shown:?}");
 }
 
 // A pod that is gone ends the forward, saying so.

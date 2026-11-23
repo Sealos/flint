@@ -735,6 +735,12 @@ enum Access {
 #[derive(Clone)]
 struct ReadRetry(kube::client::retry::RetryPolicy);
 
+/// A plain `GET`. A WebSocket upgrade is a `GET` too, but it opens a channel into the cluster, so
+/// it is sent once.
+fn retryable<B>(request: &http::Request<B>) -> bool {
+    request.method() == http::Method::GET && !request.headers().contains_key(http::header::UPGRADE)
+}
+
 impl<Res>
     tower::retry::Policy<http::Request<kube::client::Body>, http::Response<Res>, tower::BoxError>
     for ReadRetry
@@ -746,7 +752,7 @@ impl<Res>
         request: &mut http::Request<kube::client::Body>,
         result: &mut Result<http::Response<Res>, tower::BoxError>,
     ) -> Option<Self::Future> {
-        if request.method() != http::Method::GET {
+        if !retryable(request) {
             return None;
         }
         tower::retry::Policy::retry(&mut self.0, request, result)
@@ -756,7 +762,7 @@ impl<Res>
         &mut self,
         request: &http::Request<kube::client::Body>,
     ) -> Option<http::Request<kube::client::Body>> {
-        if request.method() != http::Method::GET {
+        if !retryable(request) {
             return None;
         }
         <kube::client::retry::RetryPolicy as tower::retry::Policy<
@@ -882,6 +888,35 @@ pub(crate) fn sending_credential(client: Client, credential: credential::BoundHe
         let client = client.clone();
         request.extensions_mut().insert(credential.clone());
         async move { client.send(request).await }
+    });
+    Client::new(service, namespace)
+}
+
+/// `client`, for one WebSocket upgrade: `check` is asked right before it is sent, and a refusal's
+/// body is dropped unread, so its size costs nothing. The status is all that is used of it.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "wraps a client build_client made, for one upgrade"
+)]
+pub(crate) fn upgrade_client(client: Client, check: SendCheck) -> Client {
+    let namespace = client.default_namespace().to_owned();
+    let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+        let (client, check) = (client.clone(), check.clone());
+        async move {
+            check
+                .refusal()
+                .await
+                .map_err(|why| kube::Error::Service(why.into()))?;
+            let response = client.send(request).await?;
+            if response.status() == http::StatusCode::SWITCHING_PROTOCOLS {
+                return Ok::<_, kube::Error>(response);
+            }
+            let (parts, _unread) = response.into_parts();
+            Ok(http::Response::from_parts(
+                parts,
+                kube::client::Body::empty(),
+            ))
+        }
     });
     Client::new(service, namespace)
 }

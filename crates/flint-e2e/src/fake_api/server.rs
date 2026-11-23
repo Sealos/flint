@@ -894,6 +894,7 @@ async fn handle(
             lock(&inner.requests).push(record);
             return Err(io::Error::other("fault: connection dropped"));
         }
+        Some(Effect::EndlessError) => forwards::endless_error(),
         Some(Effect::RefuseUpgrade) => execs::refused_upgrade(),
         Some(Effect::Forbidden) => error(&ApiError::new(
             403,

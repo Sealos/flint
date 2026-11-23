@@ -238,7 +238,8 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   so. Stop Trusting also locks the cluster, even if it was unlocked for the session. A trusted context whose
   cluster entry is gone (no server) cannot be unlocked or trusted, but its lock menu still removes the old trust.
 - Sessions the user started (log streams, exec terminals) keep running when the user switches to
-  another cluster, warm or cold. They end only when the user closes them or quits Flint.
+  another cluster, warm or cold. They end only when the user closes them or quits Flint. A port-forward keeps running
+  across a switch only if its cluster has keep watching on (see Port-forward).
 
 ## Resources
 
@@ -790,13 +791,16 @@ it, and picks another one if that pod goes away. The user picks the local port, 
 can forward several ports of one target at once.
 
 A panel lists the active forwards: target, local and remote port, and state, with stop buttons. Ports named `http`
-or `web`, or with `appProtocol` `http`, get an **Open in browser** action for `http://localhost:<port>`. Ports named
-`https`, or with `appProtocol` `https`, open `https://localhost:<port>`. Unnamed ports offer Open in browser from the
+or `web`, or with `appProtocol` `http`, get an **Open in browser** action for `http://127.0.0.1:<port>`. Ports named
+`https`, or with `appProtocol` `https`, open `https://127.0.0.1:<port>`. Unnamed ports offer Open in browser from the
 row's context menu. Forwards bind to `127.0.0.1` only.
 
 A forward takes the same gate as exec. Every connection asks the gate and takes a fresh client pinned to the definition
-the forward started on, and a running forward asks again every two seconds. A forward ends when its cluster is
-protected again, re-pointed, paused or removed, when the active cluster changes, and when the app quits.
+and the connection the forward started on. An upgrade is sent once, and a pod target must keep the uid selected. A
+forward ends when its cluster is protected again, re-pointed or redefined (even if put back), paused, removed,
+disconnected or signed out, when keep watching or its exec consent is turned off, and when the app quits. On a switch
+it keeps running only if its cluster has keep watching on. A kept forward uses its existing connection: it never
+reconnects, and new connections on a cluster signing in through a plugin wait until that cluster is selected.
 
 ### Helm
 

@@ -37,6 +37,7 @@ use crate::watch::{ClusterWatches, EngineConfig, HubRegistry, KubeSource};
 use crate::write::WriteError;
 
 mod file_watch;
+mod forwards;
 mod keep_watching;
 mod running_set;
 mod selected_retry;
@@ -553,6 +554,7 @@ pub(crate) struct ClusterManager {
     holds: DefinitionHolds,
     /// Clusters watched in the background, on connections of their own.
     keep: keep_watching::KeepWatch,
+    forwards: forwards::Forwards,
 }
 
 impl ClusterManager {
@@ -619,6 +621,7 @@ impl ClusterManager {
             settled: SettledDefinitions::default(),
             holds: DefinitionHolds::default(),
             keep: Default::default(),
+            forwards: Default::default(),
             reader: KubeconfigReader::default(),
             stalled_on: None,
             read_seq: 0,
@@ -657,6 +660,7 @@ impl ClusterManager {
                 Some(msg) = internal_rx.recv() => self.handle_internal(msg).await,
             }
             self.sync_keep_watching();
+            self.sync_forwards();
             self.sync_selected_retry();
             self.sync_telemetry();
         }
@@ -932,12 +936,16 @@ impl ClusterManager {
             } => {
                 self.check_write_pin(cluster, pin, reply);
             }
-            Request::CheckForward {
+            Request::AdmitForward {
                 cluster,
-                pin,
+                server,
+                admitted,
                 reply,
             } => {
-                let _ = reply.send(self.forward_gate(&cluster, &pin));
+                let _ = reply.send(self.admit_forward(cluster, server, admitted.as_ref()));
+            }
+            Request::CheckForward { id, reply } => {
+                let _ = reply.send(self.check_forward(id));
             }
             Request::CheckContext {
                 cluster,

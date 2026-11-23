@@ -418,12 +418,17 @@ pub(crate) enum Request {
         pin: ContextPin,
         reply: oneshot::Sender<Result<(), WriteError>>,
     },
-    /// Whether a port-forward pinned at `pin` may carry on: the write gate for a pinned write,
-    /// and the context is not paused. Answered from memory.
-    CheckForward {
+    /// Admits a port-forward on the cluster's current connection.
+    AdmitForward {
         cluster: ClusterId,
-        pin: ContextPin,
-        reply: oneshot::Sender<Result<(), WriteError>>,
+        server: Option<Option<String>>,
+        admitted: Option<Arc<AdmittedMember>>,
+        reply: oneshot::Sender<Result<crate::port_forward::ForwardGrant, WriteError>>,
+    },
+    /// Whether admitted forward `id` may carry on. Answered from memory.
+    CheckForward {
+        id: u64,
+        reply: oneshot::Sender<Result<(), crate::port_forward::ForwardFailure>>,
     },
     /// Why a session opened on `cluster` at `pin` must end (the context was re-pointed or
     /// removed since), or `None`. Never contacts the server.
@@ -1246,25 +1251,34 @@ impl CoreHandle {
     /// Never blocks.
     pub fn port_forward(&self, request: ForwardRequest) -> PortForward {
         let (forward, channels) = PortForward::new(request.clone());
-        let client = self.bound_write_client(&request.cluster, request.server.clone());
         let requests = self.requests.clone();
         let admitted = self.bound.clone();
         self.runtime.spawn(async move {
-            let pin = client.await.and_then(|(_, pin, _)| match &admitted {
-                Some(member) if !member.holds(&request.cluster, &pin) => Err(WriteRefusal::Stale {
-                    cluster: request.cluster.to_string(),
-                }
-                .into()),
-                _ => Ok(pin),
+            let (reply, answer) = oneshot::channel();
+            let asked = requests.send(Request::AdmitForward {
+                cluster: request.cluster.clone(),
+                server: request.server.clone(),
+                admitted: admitted.clone(),
+                reply,
             });
-            match pin {
-                Ok(pin) => {
-                    let dialer = Arc::new(crate::port_forward::KubeDialer {
+            let admission = async {
+                asked
+                    .await
+                    .map_err(|_| WriteError::from(WriteRefusal::Stopped))?;
+                answer.await.unwrap_or(Err(WriteRefusal::Stopped.into()))
+            };
+            let Some(admission) = channels.unless_stopped(admission).await else {
+                channels.say_stopped();
+                return;
+            };
+            match admission {
+                Ok(grant) => {
+                    let dialer = Arc::new(crate::port_forward::KubeDialer::new(
                         requests,
-                        request: request.clone(),
-                        pin,
+                        request.clone(),
+                        grant,
                         admitted,
-                    });
+                    ));
                     crate::port_forward::run(dialer, request, channels).await;
                 }
                 Err(refusal) => crate::port_forward::refuse(&channels, &refusal),

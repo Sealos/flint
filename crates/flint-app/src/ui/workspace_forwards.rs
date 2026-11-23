@@ -6,7 +6,7 @@ use flint_core::ClusterId;
 use gpui_kit::*;
 
 use super::super::dock::{DockTab, TabKey};
-use super::super::port_forward_view::{self, FormTarget, PortForwardsView};
+use super::super::port_forward_view::{self, FormBinding, FormTarget, PortForwardsView};
 use super::super::registry::{
     ForwardPort, OpenForwardedPort, ShowPortForwards, StartPortForward, StopAllPortForwards,
     StopPortForward,
@@ -26,7 +26,7 @@ impl Workspace {
             .find(|view| view.read(cx).has_row(id))
     }
 
-    /// Stops every forward in this window: the active cluster changed.
+    /// Stops every forward in this window.
     pub(super) fn stop_forwards(&mut self, cx: &mut Context<Self>) {
         for view in self.forward_views(cx) {
             view.update(cx, |view, cx| view.stop_all(cx));
@@ -79,20 +79,13 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<Entity<PortForwardsView>> {
         let member = self.session_member(&cluster, cx).ok()?;
-        let core = self.session_core(member.as_ref(), cx);
         let key = TabKey::Forwards(cluster.clone());
         let tab_cluster = self.tab_cluster(&key, cx);
-        let server = match &member {
-            Some(member) => Some(member.server().to_owned()),
-            None => self.shown_server(&cluster, cx),
-        };
         let id = self.open_tab(
             key,
             tab_cluster,
             move |window, cx| {
-                DockTab::Forwards(
-                    cx.new(|cx| PortForwardsView::new(core, cluster, server, window, cx)),
-                )
+                DockTab::Forwards(cx.new(|cx| PortForwardsView::new(cluster, window, cx)))
             },
             focus,
             window,
@@ -115,11 +108,12 @@ impl Workspace {
         let Some(detail) = self.detail_view() else {
             return;
         };
-        let (cluster, target, checked) = {
+        let (cluster, target, uid, checked) = {
             let detail = detail.read(cx);
             (
                 detail.object().cluster.clone(),
                 detail.forward_target(),
+                detail.forward_uid(),
                 detail.forward_check::<ForwardPort>(),
             )
         };
@@ -135,13 +129,29 @@ impl Workspace {
         let Some((namespace, target, ports)) = target else {
             return;
         };
+        let member = match self.session_member(&cluster, cx) {
+            Ok(member) => member,
+            Err(why) => {
+                self.refuse(port_forward_view::refused(&why), cx);
+                return;
+            }
+        };
+        let binding = FormBinding {
+            core: self.session_core(member.as_ref(), cx),
+            server: match &member {
+                Some(member) => Some(member.server().to_owned()),
+                None => self.shown_server(&cluster, cx),
+            },
+            member,
+        };
         if let Some(view) = self.open_forwards(cluster, true, window, cx) {
             let form = FormTarget {
                 namespace,
                 target,
+                uid,
                 ports,
             };
-            view.update(cx, |view, cx| view.set_target(form, window, cx));
+            view.update(cx, |view, cx| view.set_target(form, binding, window, cx));
         }
     }
 
@@ -169,6 +179,14 @@ impl Workspace {
         let cluster = view.read(cx).tab_cluster().clone();
         if let Some(why) = self.forward_blocked(&cluster, cx) {
             self.refuse(port_forward_view::refused(&why), cx);
+            return;
+        }
+        // The set around this cluster changed since its target was selected.
+        let member = self.session_member(&cluster, cx).ok().flatten();
+        if !view.read(cx).form_bound_to(member.as_ref()) {
+            view.update(cx, |view, cx| view.clear_form(cx));
+            let why = "its cluster's connection changed; select the target again";
+            self.refuse(port_forward_view::refused(why), cx);
             return;
         }
         view.update(cx, |view, cx| view.start(cx));

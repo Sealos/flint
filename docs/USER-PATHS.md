@@ -211,7 +211,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **When** I switch to another cluster and back, and the old cluster is not kept warm (`warm_clusters = 1`, or it went
   cold).
 - **Then** the old cluster's watches stop. Switching back loads fresh data. Log and exec sessions keep running across
-  the switch; port-forwards stop. (Before M5.5 every cluster behaves this way. Warm clusters are UP-78.)
+  the switch; a port-forward keeps running only if its cluster has keep watching on. (Before M5.5 every cluster behaves this way. Warm clusters are UP-78.)
 - Tests: cluster, ui (from M5.5 with `warm_clusters = 1`).
 
 ### UP-25 Change the watch mode
@@ -644,7 +644,7 @@ M4 used every number in the 6x block, so its later paths continue at UP-120.
 ### UP-74 Open a forwarded HTTP port
 - **Given** a forward to a port named `http`, `https` or `web`, or with `appProtocol` `http` or `https`.
 - **Then** the forwards panel shows its target, local and remote port and state, and an Open in browser action that
-  opens `http://localhost:<port>`, or `https://` for an `https` port. An unnamed port offers Open in browser from
+  opens `http://127.0.0.1:<port>`, or `https://` for an `https` port. An unnamed port offers Open in browser from
   its context menu. A forward to a service survives the loss of the pod behind it if another pod is ready.
 - Tests: cluster, ui.
 

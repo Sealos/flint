@@ -445,6 +445,21 @@ impl DetailView {
         Some((self.object.namespace.clone()?, target, ports))
     }
 
+    /// The uid of the pod shown, once loaded: a forward reaches that pod and no other.
+    pub(in crate::ui) fn forward_uid(&self) -> Option<String> {
+        if self.object.kind != KindId::pods() {
+            return None;
+        }
+        match &self.fetch {
+            Fetch::Loaded { detail, .. } => detail
+                .object
+                .pointer("/metadata/uid")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            _ => None,
+        }
+    }
+
     /// Whether Forward Port can be asked for now, as far as known. It opens a channel into the
     /// cluster, so it is refused as a shell is.
     pub(in crate::ui) fn forward_check<A: Action>(&self) -> Result<(), ActionError> {
@@ -452,6 +467,15 @@ impl DetailView {
             return Err(ActionError::rejected::<A>(
                 "a port-forward reaches a pod or a service",
             ));
+        }
+        if self.object.kind == KindId::pods()
+            && matches!(self.fetch, Fetch::Loading | Fetch::Loaded { .. })
+            && self.forward_uid().is_none()
+        {
+            return Err(ActionError::rejected::<A>(format!(
+                "{} is still loading",
+                self.object.name
+            )));
         }
         if self.gone {
             return Err(ActionError::rejected::<A>(format!(

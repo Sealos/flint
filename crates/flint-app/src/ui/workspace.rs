@@ -1096,8 +1096,6 @@ impl Workspace {
         let cluster_changed = active != self.cluster || generation != self.generation;
         if cluster_changed {
             self.generation = generation;
-            // A forward is a channel into the cluster: it never outlives the connection shown.
-            self.stop_forwards(cx);
             // Switching clusters closes the old cluster's views; dropping the list drops its
             // subscription (UP-24).
             self.cluster = active.clone();
