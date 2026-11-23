@@ -86,6 +86,40 @@ fn drop_panics(app: App) -> String {
     panic.downcast_ref::<String>().cloned().unwrap_or_default()
 }
 
+// With no session running Quit would end the app and close the dialog unnoticed.
+#[test]
+#[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
+fn teardown_fails_a_test_that_left_a_dialog_open() -> Result<()> {
+    let two = TwoClusters::start()?;
+    let leave_dialog = || -> Result<App> {
+        let app = App::launch(AppOptions::new(two.kubeconfig()))?;
+        app.wait_for("/kubeconfig/loaded", Equals(true.into()))?;
+        app.dispatch(
+            "workspace::ExposeToAi",
+            serde_json::json!({"cluster": TwoClusters::A}),
+        )?;
+        app.wait_for("/dialog/title", Exists(true))?;
+        Ok(app)
+    };
+
+    let error = format!(
+        "{:#}",
+        leave_dialog()?
+            .quit()
+            .expect_err("the teardown checks to fail")
+    );
+    assert!(error.contains("unexpected dialog open"), "{error}");
+
+    let message = drop_panics(leave_dialog()?);
+    assert!(message.contains("unexpected dialog open"), "{message}");
+
+    // A test already failing keeps its own error: dropping the app does not panic over it.
+    let app = leave_dialog()?;
+    app.mark_failing();
+    drop(app);
+    Ok(())
+}
+
 // covers UP-91: a request is counted when it arrives, not when a delayed answer leaves.
 #[test]
 #[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]

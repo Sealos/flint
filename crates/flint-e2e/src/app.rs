@@ -729,19 +729,27 @@ impl App {
             bail!("the app was already stopped");
         };
         if child.try_wait()?.is_none() {
-            // The app may quit before it answers.
-            let _ = self.request_within(
-                "dispatch_action",
-                json!({"name": "flint::Quit"}),
-                QUIT_ANSWER,
-            );
+            // Without a running session Quit ends the app whatever dialog is open, so a dialog
+            // the test left behind has to be read before Quit is sent.
+            let mut unexpected = self
+                .request_within("state", Value::Null, QUIT_ANSWER)
+                .ok()
+                .and_then(|state| state["dialog"]["title"].as_str().map(str::to_owned))
+                .filter(|title| title != QUIT_DIALOG);
+            if unexpected.is_none() {
+                // The app may quit before it answers.
+                let _ = self.request_within(
+                    "dispatch_action",
+                    json!({"name": "flint::Quit"}),
+                    QUIT_ANSWER,
+                );
+            }
             // Quit asks first while a shell runs or a log tab follows (#177). Confirm only that
             // question, read off the open dialog's title: any other dialog is a bug to report,
             // not one to click through.
-            let mut unexpected = None;
             let mut confirmed = false;
             let deadline = Instant::now() + Duration::from_secs(5);
-            while child.try_wait()?.is_none() && Instant::now() < deadline {
+            while unexpected.is_none() && child.try_wait()?.is_none() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(50));
                 if confirmed {
                     continue;
@@ -761,9 +769,7 @@ impl App {
                         confirmed = true;
                     }
                     Some(other) => {
-                        eprintln!("App::stop: Quit left an unexpected dialog open: {other:?}");
                         unexpected = Some(other.to_owned());
-                        break;
                     }
                 }
             }
@@ -772,7 +778,7 @@ impl App {
                 kill_group(&child);
                 let _ = child.kill();
                 let _ = child.wait();
-                bail!("quitting left an unexpected dialog open: {title:?}");
+                bail!("the teardown found an unexpected dialog open: {title:?}");
             }
         }
         // Closing stdin also tells the app to go.
