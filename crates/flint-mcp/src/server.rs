@@ -1055,8 +1055,8 @@ impl FlintMcp {
     }
 
     /// What a client built for `name` at `fingerprint` asks before each attempt to send: a retry
-    /// can come after the definition it was built on stopped being the confirmed one. Holds the
-    /// server weakly, as the server keeps the client.
+    /// can come after the context was paused or its definition changed. Holds the server weakly,
+    /// as the server keeps the client.
     fn send_check(&self, name: &str, fingerprint: u64) -> cluster::SendCheck {
         let inner = Arc::downgrade(&self.inner);
         let name = name.to_owned();
@@ -1066,7 +1066,7 @@ impl FlintMcp {
                 let holds = tokio::task::spawn_blocking(move || {
                     inner
                         .upgrade()
-                        .is_some_and(|inner| inner.still_confirmed(&name, fingerprint))
+                        .is_some_and(|inner| inner.still_connectable(&name, fingerprint))
                 })
                 .await
                 .unwrap_or(false);
@@ -1802,8 +1802,8 @@ impl Inner {
     }
 
     /// Whether `name` is still exposed, unpaused and defined as `fingerprint` says, by the files
-    /// as they are now. Anything that can't be read counts as no.
-    fn still_confirmed(&self, name: &str, fingerprint: u64) -> bool {
+    /// as they are now. Settings that can't be read count as no.
+    fn still_connectable(&self, name: &str, fingerprint: u64) -> bool {
         let Ok(settings) = settings::load_settings(&self.config_dir) else {
             return false;
         };

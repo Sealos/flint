@@ -1,4 +1,5 @@
-//! Every tool waits for a confirmed definition while a kubeconfig file before it can't be read.
+//! While a kubeconfig file can't be read, every tool waits on a context whose confirmed definition
+//! differs from the one shown. One unchanged from it, or never confirmed, keeps connecting.
 
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
@@ -87,7 +88,7 @@ fn params<T: DeserializeOwned>(value: Value) -> T {
 
 fn assert_waiting(result: Result<String, ToolError>, secret: &str, dir: &Path) {
     let Err(error) = result else {
-        panic!("a call went through on an unconfirmed definition");
+        panic!("a call went through on a definition that differs from the confirmed one");
     };
     assert!(
         error
@@ -142,27 +143,55 @@ async fn assert_reachable(server: &FlintMcp) {
     assert_eq!(listed["clusters"][0]["reachable"], json!(true), "{listed}");
 }
 
-// covers UP-54: an inline token is not sent on a definition first seen behind an unreadable file,
-// by any tool, and is sent once the file reads and confirms it.
+// covers UP-54: a context first seen behind an unreadable file has no confirmed definition, so
+// its fallback connects.
 #[tokio::test]
-async fn an_inline_token_waits_for_a_confirmed_definition() {
+async fn a_first_seen_fallback_connects() {
     let dir = tempfile::tempdir().unwrap();
     let (url, requests) = fake_api();
-    let user = "    token: INLINESECRET\n";
-    let (server, first) = behind_broken_file(dir.path(), &url, user);
+    let (server, _first) = behind_broken_file(dir.path(), &url, "    token: fallbacktoken\n");
 
-    assert_every_tool_waits(&server, "INLINESECRET", dir.path()).await;
-    assert!(requests.lock().unwrap().is_empty(), "nothing was sent");
-
-    std::fs::write(&first, config(&url, user)).unwrap();
     assert_reachable(&server).await;
-    let requests = requests.lock().unwrap();
-    assert!(
-        requests.iter().any(|r| r
-            .to_lowercase()
-            .contains("authorization: bearer inlinesecret")),
-        "{requests:?}"
+    assert_eq!(sent(&requests, "fallbacktoken"), 1);
+}
+
+// covers UP-54: with the first file unreadable, a context whose confirmed definition changed to
+// the later file's credential waits and sends nothing, and goes on once the file is back.
+#[tokio::test]
+async fn a_changed_definition_waits_for_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, requests) = fake_api();
+    let (one, two) = (
+        config(&url, "    token: firsttoken\n"),
+        config(&url, "    token: secondtoken\n"),
     );
+    let (server, first) = two_files(dir.path(), &url, &one, &two);
+    assert_reachable(&server).await;
+    assert_eq!(sent(&requests, "firsttoken"), 1);
+
+    std::fs::write(&first, "clusters: [not valid").unwrap();
+    assert_every_tool_waits(&server, "secondtoken", dir.path()).await;
+    assert_eq!(requests.lock().unwrap().len(), 1, "nothing more was sent");
+
+    std::fs::write(&first, &one).unwrap();
+    assert_reachable(&server).await;
+    assert_eq!(sent(&requests, "firsttoken"), 2);
+    assert_eq!(sent(&requests, "secondtoken"), 0);
+}
+
+// covers UP-54: a context unchanged from its confirmed definition keeps connecting while the
+// first file can't be read.
+#[tokio::test]
+async fn an_unchanged_definition_keeps_connecting() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, requests) = fake_api();
+    let same = config(&url, "    token: sametoken\n");
+    let (server, first) = two_files(dir.path(), &url, &same, &same);
+    assert_reachable(&server).await;
+
+    std::fs::write(&first, "clusters: [not valid").unwrap();
+    assert_reachable(&server).await;
+    assert_eq!(sent(&requests, "sametoken"), 2);
 }
 
 /// A server exposing `dev` from two files, in order.
@@ -212,18 +241,21 @@ async fn losing_read_access_stops_a_warmed_client() {
     assert_eq!(requests.lock().unwrap().len(), 1, "nothing more was sent");
 }
 
-// covers UP-54: a higher-priority link whose target is gone holds back the lower file's token.
+// covers UP-54: a higher-priority link whose target is gone counts as a read failure, so a context
+// confirmed from it does not switch to the lower file's token.
 #[tokio::test]
 async fn a_dangling_link_holds_back_the_lower_file() {
     let dir = tempfile::tempdir().unwrap();
     let (url, requests) = fake_api();
+    let one = config(&url, "    token: firsttoken\n");
     let two = config(&url, "    token: LOWERSECRET\n");
-    let (server, first) = two_files(dir.path(), &url, "", &two);
+    let (server, first) = two_files(dir.path(), &url, &one, &two);
+    assert_reachable(&server).await;
     std::fs::remove_file(&first).unwrap();
     std::os::unix::fs::symlink(dir.path().join("unmounted"), &first).unwrap();
 
     assert_every_tool_waits(&server, "LOWERSECRET", dir.path()).await;
-    assert!(requests.lock().unwrap().is_empty(), "nothing was sent");
+    assert_eq!(requests.lock().unwrap().len(), 1, "nothing more was sent");
 }
 
 // covers UP-54: a retry waiting out a 503 does not send a credential that stopped being the
@@ -260,14 +292,10 @@ async fn a_retry_rechecks_the_definition() {
     assert_eq!(requests.lock().unwrap().len(), 1);
 }
 
-// covers UP-54: a credential command does not even run on a definition first seen behind an
-// unreadable file, and runs once the file reads and confirms it.
-#[tokio::test]
-async fn a_credential_command_waits_for_a_confirmed_definition() {
-    let dir = tempfile::tempdir().unwrap();
-    let (url, requests) = fake_api();
-    let ran = dir.path().join("ran");
-    let plugin = dir.path().join("plugin");
+/// A user entry running a credential command that touches `dir/ran` and prints a token.
+fn command_user(dir: &Path) -> (String, PathBuf) {
+    let ran = dir.join("ran");
+    let plugin = dir.join("plugin");
     std::fs::write(
         &plugin,
         format!(
@@ -284,20 +312,36 @@ async fn a_credential_command_waits_for_a_confirmed_definition() {
          interactiveMode: Never\n",
         plugin.display()
     );
-    let (server, first) = behind_broken_file(dir.path(), &url, &user);
+    (user, ran)
+}
 
-    assert_every_tool_waits(&server, "COMMANDSECRET", dir.path()).await;
-    assert!(!ran.exists(), "the command never ran");
-    assert!(requests.lock().unwrap().is_empty(), "nothing was sent");
+// covers UP-54: a context first seen behind an unreadable file may use a fallback credential
+// command.
+#[tokio::test]
+async fn a_first_seen_fallback_command_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, requests) = fake_api();
+    let (user, ran) = command_user(dir.path());
+    let (server, _first) = behind_broken_file(dir.path(), &url, &user);
 
-    std::fs::write(&first, config(&url, &user)).unwrap();
     assert_reachable(&server).await;
     assert!(ran.exists());
-    let requests = requests.lock().unwrap();
-    assert!(
-        requests.iter().any(|r| r
-            .to_lowercase()
-            .contains("authorization: bearer commandsecret")),
-        "{requests:?}"
-    );
+    assert_eq!(sent(&requests, "commandsecret"), 1);
+}
+
+// covers UP-54: a broken earlier file does not switch a working context to a later file's
+// credential command at the same URL: it never runs.
+#[tokio::test]
+async fn a_later_files_command_does_not_replace_a_confirmed_user() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, requests) = fake_api();
+    let (user, ran) = command_user(dir.path());
+    let one = config(&url, "    token: firsttoken\n");
+    let (server, first) = two_files(dir.path(), &url, &one, &config(&url, &user));
+    assert_reachable(&server).await;
+
+    std::fs::write(&first, "clusters: [not valid").unwrap();
+    assert_every_tool_waits(&server, "COMMANDSECRET", dir.path()).await;
+    assert!(!ran.exists(), "the command never ran");
+    assert_eq!(requests.lock().unwrap().len(), 1, "nothing more was sent");
 }

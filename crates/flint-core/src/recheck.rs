@@ -595,9 +595,9 @@ impl SettledDefinitions {
 }
 
 /// Which contexts' definitions are confirmed across kubeconfig loads, for a process that reads
-/// the files itself. While a file that could change a context can't be read, the context is
-/// paused unless it shows exactly its confirmed definition. One that no load has confirmed yet
-/// is paused too, which is stricter than the desktop app's rule.
+/// the files itself. It applies the desktop app's rule: while a file can't be read, a context
+/// showing anything but its confirmed definition is paused, one unchanged from it goes on, and
+/// one no load has confirmed yet has nothing to differ from, so it goes on too.
 #[derive(Debug, Default)]
 pub struct ConfirmedDefinitions {
     history: ContextHistory,
@@ -675,8 +675,11 @@ impl ConfirmedDefinitions {
             .map(|info| info.name.as_str())
             .filter(|name| {
                 let shown = context_fingerprint(&loaded.merged, name);
-                // Nothing goes out on a definition no load confirmed, even one first seen now.
-                (!recorded || self.history.provisional(name)) && !self.settled.confirms(name, shown)
+                if recorded {
+                    self.settled.paused(&self.history, name, shown)
+                } else {
+                    !self.settled.confirms(name, shown)
+                }
             })
             .map(str::to_owned)
             .collect();
@@ -987,11 +990,10 @@ mod tests {
         );
     }
 
-    // covers UP-54: a context first seen behind a broken file has no confirmed definition, so it
-    // waits, and the load that can read every file confirms it. A broken file ranked after it
-    // can't change it, so it does not wait.
+    // covers UP-54: a context first seen behind a broken file has no confirmed definition to
+    // differ from, so it is not paused. Once a load confirms it, a different fallback is.
     #[test]
-    fn a_context_first_seen_behind_a_broken_file_waits_until_confirmed() {
+    fn a_context_first_seen_with_a_broken_file_is_not_paused() {
         let dir = tempfile::tempdir().unwrap();
         let (first, second) = (dir.path().join("first"), dir.path().join("second"));
         std::fs::write(&first, "not: [valid").unwrap();
@@ -1001,18 +1003,16 @@ mod tests {
         let now = std::time::Instant::now();
         let judged = load_files(&mut confirmed, &paths, now);
         assert_eq!(judged.outcome, ReadOutcome::Recheck);
-        assert!(judged.paused.contains("dev"), "never confirmed");
+        assert!(!judged.paused.contains("dev"), "nothing to differ from");
 
-        std::fs::write(&first, config("two")).unwrap();
+        std::fs::write(&first, config("one")).unwrap();
         let judged = load_files(&mut confirmed, &paths, now);
         assert_eq!(judged.outcome, ReadOutcome::Clean);
         assert!(!judged.paused.contains("dev"), "confirmed");
 
-        let mut later_broken = ConfirmedDefinitions::default();
-        std::fs::write(&second, "not: [valid").unwrap();
-        let judged = load_files(&mut later_broken, &paths, now);
-        assert_eq!(judged.outcome, ReadOutcome::Recheck);
-        assert!(!judged.paused.contains("dev"), "nothing ranks above it");
+        std::fs::write(&first, "not: [valid").unwrap();
+        let judged = load_files(&mut confirmed, &paths, now);
+        assert!(judged.paused.contains("dev"), "differs from confirmed");
     }
 
     // covers UP-54: an emptied file counts as failed while it settles, then as really empty, the

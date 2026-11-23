@@ -315,10 +315,10 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
     }
 }
 
-/// [`load`] for a process that sends credentials only on a confirmed definition: a path behind a
-/// symbolic link with no target counts as failed rather than absent, since the target may only
-/// be unmounted. A link that breaks after this check changes the input files, so the read that
-/// saw it is not consistent ([`FileRead::consistent`]).
+/// [`load`] for a process that judges definitions across reads: a path behind a symbolic link
+/// with no target counts as failed rather than absent, since the target may only be unmounted.
+/// A link that breaks after this check changes the input files, so the read that saw it is not
+/// consistent ([`FileRead::consistent`]).
 fn load_counting_dangling_links(paths: &[PathBuf]) -> LoadedKubeconfig {
     let (dangling, present): (Vec<PathBuf>, Vec<PathBuf>) =
         paths.iter().cloned().partition(|p| dangling_link(p));
