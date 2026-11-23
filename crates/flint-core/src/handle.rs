@@ -83,6 +83,10 @@ pub enum Command {
     /// Ends the selected cluster's connection attempt and its automatic retries, if it is still
     /// the slot `generation`. It stays failed until selected or retried.
     CancelConnection { cluster: ClusterId, generation: u64 },
+    /// Stops everything Flint runs for a cluster (watches, feeds, retries, log streams, clients)
+    /// and ends its keep-watching consent. Nothing connects it again until it is selected or a
+    /// set with it is opened. Shells are the front end's to end.
+    DisconnectCluster(ClusterId),
     /// Expose a cluster to AI agents at `server` (`Some`), limited to `scope` (ADR-0013), or hide
     /// it (`None`), in `settings.toml`. `server` is the URL the user confirmed; if the context
     /// no longer points there, nothing is written and an error is reported. Exposing an exposed
@@ -1426,6 +1430,7 @@ impl CoreHandle {
     pub fn send(&self, command: Command) {
         // Ending a grant does not wait its turn behind a save the queue may be stuck on.
         if let Command::RevokeBackgroundSignIn(cluster)
+        | Command::DisconnectCluster(cluster)
         | Command::SetKeepWatching {
             cluster,
             definition: None,

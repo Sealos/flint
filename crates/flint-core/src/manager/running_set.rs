@@ -273,6 +273,8 @@ impl ClusterManager {
     }
 
     fn join_set(&mut self, id: &str, now: Instant) {
+        // Opening a set with it is choosing it again.
+        self.disconnects.lift(id);
         let Some(server) = self.cluster(id).and_then(|c| c.info.server.clone()) else {
             return;
         };
@@ -293,7 +295,7 @@ impl ClusterManager {
 
     /// Ends `id`'s membership. Its watches stop unless it is active; a connection already up stays,
     /// as it does for a cluster switched away from, and one still being made is dropped.
-    fn leave_set(&mut self, id: &str) {
+    pub(super) fn leave_set(&mut self, id: &str) {
         self.members.remove(id);
         self.schedule.dequeue(&id.to_owned());
         let active = self.active.as_deref() == Some(id);

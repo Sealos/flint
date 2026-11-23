@@ -317,8 +317,29 @@ impl Dock {
     /// The sessions closing the dock would end: its shells and following log tabs still at
     /// work, shown or not ([`dock_model::ends_a_session`]).
     pub fn live_sessions(&self, cx: &App) -> LiveSessions {
+        self.live_sessions_where(|_| true, cx)
+    }
+
+    /// [`Self::live_sessions`] of the tabs on `context`.
+    pub fn live_sessions_on(&self, context: &str, cx: &App) -> LiveSessions {
+        self.live_sessions_where(|tab| tab.cluster.context == context, cx)
+    }
+
+    /// Ends the shells on `context`, saying why in each. Their output stays in the tab.
+    pub fn end_shells_on(&mut self, context: &str, why: &str, cx: &mut Context<Self>) {
+        for tab in self.tabs.iter().filter(|t| t.cluster.context == context) {
+            if let DockTab::Shell(view) = &tab.tab
+                && view.read(cx).is_live()
+            {
+                view.update(cx, |view, cx| view.end(why.to_owned(), cx));
+            }
+        }
+        cx.notify();
+    }
+
+    fn live_sessions_where(&self, of: impl Fn(&Tab) -> bool, cx: &App) -> LiveSessions {
         let mut live = LiveSessions::default();
-        for t in &self.tabs {
+        for t in self.tabs.iter().filter(|t| of(t)) {
             let item = t.tab.item(cx);
             let (reads_to_end, count) = match item.tab_key() {
                 TabKey::Shell(_) => (false, &mut live.shells),

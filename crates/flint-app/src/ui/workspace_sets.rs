@@ -81,6 +81,8 @@ pub(super) struct RunningSet {
     members: Vec<AdmittedMember>,
     /// Members that left their admitted server: their rows are gone and stay gone.
     changed: HashSet<ClusterId>,
+    /// Of those, the ones the person disconnected.
+    disconnected: HashSet<ClusterId>,
     /// Members not subscribed to `kind`, because their discovery can't vouch for it yet.
     held: HashSet<ClusterId>,
     /// The window its feeds draw in, for a held member that joins later.
@@ -129,6 +131,27 @@ impl ClusterSets {
             .members
             .iter()
             .find(|m| m.context() == cluster)
+    }
+
+    /// Whether a set is on its way to the core, which would connect its members.
+    pub(super) fn is_opening(&self) -> bool {
+        self.opening.is_some()
+    }
+
+    /// Whether the person disconnected `cluster`, a member of the open set.
+    pub(super) fn member_disconnected(&self, cluster: &str) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|run| run.disconnected.contains(cluster))
+    }
+
+    /// Records that the person disconnected `cluster`, if the open set has it.
+    pub(super) fn mark_disconnected(&mut self, cluster: &str) {
+        if let Some(run) = &mut self.running
+            && run.members.iter().any(|m| m.context() == cluster)
+        {
+            run.disconnected.insert(cluster.to_owned());
+        }
     }
 
     /// Whether the open set has `cluster` as a member.
@@ -861,6 +884,7 @@ impl Workspace {
             set_id: None,
             members,
             changed: HashSet::new(),
+            disconnected: HashSet::new(),
             held,
             window: window_handle,
             left_out: Vec::new(),
@@ -899,6 +923,7 @@ impl Workspace {
         }
         let (label, members, changed) =
             (run.label.clone(), run.members.clone(), run.changed.clone());
+        let disconnected = run.disconnected.clone();
         let (set_id, left_out) = (run.set_id.clone(), run.left_out.clone());
         self.close_set_detail(cx);
         self.show_set(
@@ -911,6 +936,7 @@ impl Workspace {
         );
         if let Some(run) = &mut self.sets.running {
             run.changed = changed;
+            run.disconnected = disconnected;
             run.set_id = set_id;
             run.left_out = left_out;
         }
@@ -1056,6 +1082,9 @@ impl Workspace {
         let Some(member) = run.members.iter().find(|m| m.context() == cluster) else {
             return Some(format!("{shown} is not in this set"));
         };
+        if run.disconnected.contains(cluster) {
+            return Some(format!("{shown} was disconnected. Open the set again."));
+        }
         if run.changed.contains(cluster) {
             return Some(format!(
                 "{shown} changed since this set opened. Open the set again."
@@ -1344,6 +1373,9 @@ impl Workspace {
 
     /// What the set's bar says about `context`, when something is wrong with it.
     fn set_member_note(&self, run: &RunningSet, context: &str, cx: &App) -> Option<String> {
+        if run.disconnected.contains(context) {
+            return Some("Disconnected".to_owned());
+        }
         if run.changed.contains(context) {
             return Some("Changed".to_owned());
         }

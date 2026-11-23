@@ -36,6 +36,7 @@ use crate::store::{KindSnapshot, SyncState};
 use crate::watch::{ClusterWatches, EngineConfig, HubRegistry, KubeSource};
 use crate::write::WriteError;
 
+mod disconnect;
 mod file_watch;
 mod keep_watching;
 mod running_set;
@@ -518,6 +519,7 @@ pub(crate) struct ClusterManager {
     schedule: Schedule<ClusterId>,
     /// Automatic retries of the selected cluster.
     retries: selected_retry::RetryDriver,
+    disconnects: disconnect::Disconnects,
     /// Runs while the set has members.
     set_ticker: Option<JoinHandle<()>>,
     /// Source of connection attempt ids; never reused.
@@ -602,6 +604,7 @@ impl ClusterManager {
             members: HashMap::new(),
             schedule: Schedule::default(),
             retries: Default::default(),
+            disconnects: Default::default(),
             set_ticker: None,
             next_attempt: 1,
             watcher: None,
@@ -681,6 +684,7 @@ impl ClusterManager {
                 cluster,
                 generation,
             } => self.cancel_connection(&cluster, generation),
+            Command::DisconnectCluster(cluster) => self.disconnect_cluster(cluster).await,
             Command::SetRunningSet(ids) => self.set_running_set(ids),
             Command::SetKeepWatching {
                 cluster,
@@ -858,6 +862,7 @@ impl ClusterManager {
                 budget,
             } => {
                 let internal = self.internal_tx.clone();
+                let context = cluster.clone();
                 // Pinned now, to the server shown (the tab's): a reconnect must never read logs
                 // from another server (UP-06). Opened on a fallback, the pin is stale and the
                 // first client lookup ends the session, rather than read from the server the
@@ -892,11 +897,17 @@ impl ClusterManager {
                     Arc::new(KubeLogSource::new(lookup.clone())),
                     Arc::new(KubePodSource::new(lookup)),
                 );
+                let sessions = &self.log_sessions;
+                let stop = self.disconnects.track_logs(id, &context, |session| {
+                    sessions.get(session).is_some_and(|t| !t.is_finished())
+                });
+                let feed = logs::until_stopped(feed, stop, disconnect::LOGS_ENDED.to_owned());
                 let task = tokio::spawn(logs::run(feed, config, snapshots, paused, Some(budget)));
                 self.log_sessions.retain(|_, t| !t.is_finished());
                 self.log_sessions.insert(id, task);
             }
             Request::CloseLogs { id } => {
+                self.disconnects.forget_logs(id);
                 if let Some(task) = self.log_sessions.remove(&id) {
                     task.abort();
                 }
@@ -1854,6 +1865,9 @@ impl ClusterManager {
     /// context re-pointed or removed since `pin` (when the session opened) ends the session
     /// ([`ContextHistory::check`]).
     fn log_client(&mut self, cluster: &str, pin: &ContextPin) -> Result<Client, LogError> {
+        if let Some(ended) = self.disconnected_logs(cluster) {
+            return Err(ended);
+        }
         if let Some(reason) = self.contexts.check(Pinned::Logs, cluster, pin) {
             return Err(LogError::cluster(reason));
         }
@@ -2357,6 +2371,7 @@ impl ClusterManager {
         // Someone selected or retried a cluster: a prompting plugin resting after a timed-out
         // refresh may run again now.
         crate::auth_plugin::retry_now(&id);
+        self.disconnects.lift(&id);
         self.keep_watching_acted_on(&id);
         let Some(slot) = self.cluster_mut(&id) else {
             self.emit(Event::Error(format!("cluster \"{id}\" no longer exists")));
@@ -2434,6 +2449,9 @@ impl ClusterManager {
     /// that ends the pause starts the attempt. A member connects only through its own attempt,
     /// so a request without one asks for it instead.
     fn ensure_connected(&mut self, id: &str) {
+        if self.disconnects.holds(id) {
+            return;
+        }
         let kubeconfig = self.kubeconfig.clone();
         let internal = self.internal_tx.clone();
         let attempt = self.next_attempt;

@@ -255,6 +255,11 @@ impl Default for KeepWatch {
 }
 
 impl KeepWatch {
+    /// Ends `id`'s consent and kills its plugin, now.
+    pub(super) fn grants_revoke(&self, id: &str) {
+        self.grants.revoke(id);
+    }
+
     /// Whether `id`'s board entry belongs to a feed here, or to its last values.
     pub(super) fn holds_board_entry(&self, id: &str) -> bool {
         self.stopped.contains_key(id) || self.feeds.get(id).is_some_and(|kept| kept.feed.is_some())
@@ -359,6 +364,7 @@ impl ClusterManager {
     /// Whether `id` needs a feed of its own: its slot has none and can't have one.
     fn wants_kept_feed(&self, id: &str) -> bool {
         !self.keep.grants.quitting()
+            && !self.disconnects.holds(id)
             && self.active.as_deref() != Some(id)
             && self.keep_watching(id)
             && !self.wants_telemetry(id)
@@ -831,6 +837,11 @@ impl ClusterManager {
         let slot = self.cluster(id)?;
         if slot.info.server.is_none() {
             return Some(format!("\"{id}\" names no server."));
+        }
+        if self.disconnects.holds(id) {
+            return Some(format!(
+                "\"{id}\" is disconnected. Select it to connect first."
+            ));
         }
         if self.paused(id)
             || self.unsettled(id)

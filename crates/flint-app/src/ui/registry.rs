@@ -368,6 +368,15 @@ pub struct ToggleKeepWatching {
     pub cluster: String,
 }
 
+/// Stop everything Flint runs for a cluster until it is selected again. Asks first while it would
+/// end a live shell.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = workspace, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct DisconnectCluster {
+    pub cluster: String,
+}
+
 /// Hide a cluster from AI agents, or remove a stale exposure.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
 #[action(namespace = workspace, no_json)]
@@ -2209,6 +2218,12 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::with_args::<ToggleKeepWatching>(
             "Keep Watching Cluster…",
             "Gather overview data and alerts for a cluster while it is not selected, or stop.",
+            CLUSTER,
+        )
+        .of(C::Cluster, S::Workspace),
+        Spec::with_args::<DisconnectCluster>(
+            "Disconnect Cluster…",
+            "Stop a cluster's watches, log streams and background watching until it is selected.",
             CLUSTER,
         )
         .of(C::Cluster, S::Workspace),

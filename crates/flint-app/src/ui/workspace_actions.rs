@@ -51,7 +51,7 @@ use super::super::registry::{
     WatchOpenViewsOnly,
 };
 use super::super::registry::{
-    BackToList, EditAiScope, Handler, ShowAgentActivity, ToggleKeepWatching,
+    BackToList, DisconnectCluster, EditAiScope, Handler, ShowAgentActivity, ToggleKeepWatching,
 };
 use super::super::registry::{
     ClearClusterTag, LockCluster, RenameCluster, SetClusterTag, TrustCluster, UnlockCluster,
@@ -116,6 +116,7 @@ impl Workspace {
         .bind::<ExposeToAi>(Self::expose_to_ai)
         .bind::<HideFromAi>(Self::hide_from_ai)
         .bind::<ToggleKeepWatching>(Self::toggle_keep_watching)
+        .bind::<DisconnectCluster>(Self::ask_disconnect)
         .bind::<EditAiScope>(Self::edit_ai_scope)
         .bind::<ShowAgentActivity>(Self::show_agent_activity)
         .bind::<OpenCompare>(Self::open_compare)
@@ -251,6 +252,7 @@ impl Workspace {
             .add::<ToggleKeepWatching>(Self::settings_ok, |ws, a, cx| {
                 ws.check_cluster::<ToggleKeepWatching>(&a.cluster, cx)
             })
+            .add::<DisconnectCluster>(|_, _| true, |ws, a, cx| ws.check_disconnect(&a.cluster, cx))
             .add::<EditAiScope>(Self::settings_ok, |ws, a, cx| {
                 ws.scope_change(a, cx).map(drop)
             })

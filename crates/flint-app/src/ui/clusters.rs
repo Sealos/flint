@@ -308,6 +308,11 @@ impl ClustersModel {
         });
     }
 
+    /// Stops everything the core runs for `cluster` until it is selected again.
+    pub(in crate::ui) fn disconnect(&mut self, cluster: ClusterId) {
+        self.send(Command::DisconnectCluster(cluster));
+    }
+
     /// For the background sign-in toggle's click handler alone: turns it on for the exact
     /// definition `shown`, or off (`None`), which takes effect at once.
     pub fn turn_background_sign_in(

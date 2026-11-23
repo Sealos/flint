@@ -17,6 +17,7 @@ mod search;
 mod selection;
 mod session;
 mod source;
+mod stop;
 mod stream;
 mod workload;
 
@@ -41,3 +42,4 @@ pub use workload::{PodSetStatus, StreamStatus};
 pub(crate) use pods::{KubePodSource, list_workload_pods};
 pub(crate) use session::{Budgeted, SessionConfig, feed, run};
 pub(crate) use source::{ClientLookup, KubeLogSource, LogError};
+pub(crate) use stop::until_stopped;

@@ -51,11 +51,12 @@ use super::nav::{NavEvent, NavPanel};
 use super::notice::{ServerMove, ServerMoves, notice};
 use super::palette::CommandPalette;
 use super::registry::{
-    self, AddNamespace, BackToList, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, EditYaml,
-    ExposeToAi, FocusFilter, HideFromAi, LockCluster, OnView, OpenClusterOverview, OpenObject,
-    OpenView, RenameCluster, RetryConnection, SelectCluster, SelectRow, ShowAgentActivity,
-    ShowAllNamespaces, ToggleKeepWatching, ToggleNamespace, TrustCluster, UnlockCluster,
-    UntrustCluster, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
+    self, AddNamespace, BackToList, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly,
+    DisconnectCluster, EditYaml, ExposeToAi, FocusFilter, HideFromAi, LockCluster, OnView,
+    OpenClusterOverview, OpenObject, OpenView, RenameCluster, RetryConnection, SelectCluster,
+    SelectRow, ShowAgentActivity, ShowAllNamespaces, ToggleKeepWatching, ToggleNamespace,
+    TrustCluster, UnlockCluster, UntrustCluster, UseDefaultWatchMode, WatchAllKinds,
+    WatchOpenViewsOnly,
 };
 use super::resource_actions;
 use super::row_menu;
@@ -1096,10 +1097,15 @@ impl Workspace {
             self.generation = generation;
             // Switching clusters closes the old cluster's views; dropping the list drops its
             // subscription (UP-24).
-            self.cluster = active.clone();
+            let previous_cluster = std::mem::replace(&mut self.cluster, active.clone());
             self.forget_places();
             // Selecting a member (to sign in to it, say) keeps the set's list open.
-            if !self.sets.has_member(active.as_deref()) {
+            // So does disconnecting the member that was selected.
+            let member_left = active.is_none()
+                && previous_cluster
+                    .as_deref()
+                    .is_some_and(|c| self.sets.member_disconnected(c));
+            if !self.sets.has_member(active.as_deref()) && !member_left {
                 self.close_list(cx);
             }
             // Its filter or YAML, if one had focus that has moved on (to a dock tab, say): focus
@@ -1595,7 +1601,13 @@ impl Workspace {
                 ),
                 exposure,
                 protection,
-                (settings_ok, &names, model.cluster_tag(cluster), keep),
+                (
+                    settings_ok,
+                    &names,
+                    model.cluster_tag(cluster),
+                    keep,
+                    self.can_disconnect(&cluster.info.name, cx),
+                ),
                 theme,
             ));
         }
@@ -1662,11 +1674,12 @@ impl Workspace {
         (is_active, ring, presence, tooltip): (bool, bool, Presence<'_>, String),
         (exposure, ai_scope): (AiExposureState, Option<AiScope>),
         (protection, trust, writes_paused): (Protection, TrustState, bool),
-        (settings_ok, names, tag, (keep, keep_sign_in)): (
+        (settings_ok, names, tag, (keep, keep_sign_in), can_disconnect): (
             bool,
             &ClusterNames,
             Option<ClusterTag>,
             (KeepWatching, BackgroundSignIn),
+            bool,
         ),
         theme: &Theme,
     ) -> AnyElement {
@@ -1864,6 +1877,15 @@ impl Workspace {
                     }),
                 ),
             );
+            let menu = menu.when(can_disconnect, |menu| {
+                menu.item(
+                    PopupMenuItem::new("Disconnect").on_click(registry::on_click(
+                        DisconnectCluster {
+                            cluster: rename.clone(),
+                        },
+                    )),
+                )
+            });
             cluster_tag::tag_submenu(menu, rename.clone(), endpoint, tag, window, cx)
         })
         .into_any_element()
@@ -3789,6 +3811,9 @@ fn takes_focus(focus: &TakeFocus, window: &Window, cx: &App) -> bool {
 
 #[path = "workspace_actions.rs"]
 mod actions;
+
+#[path = "workspace_disconnect.rs"]
+mod disconnect;
 
 #[path = "workspace_keys.rs"]
 mod keys;

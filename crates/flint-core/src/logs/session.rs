@@ -401,6 +401,11 @@ impl Output {
         }
     }
 
+    /// Whether the session already ended.
+    pub(super) fn has_ended(&self) -> bool {
+        matches!(self.state, LogState::Ended { .. })
+    }
+
     pub fn set_state(&mut self, state: &LogState) {
         if self.state != *state {
             self.state = state.clone();
