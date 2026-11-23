@@ -12,6 +12,7 @@
 #![cfg(target_os = "macos")]
 
 mod access;
+mod activity;
 mod exec_plugins;
 mod harness;
 mod load;
@@ -20,6 +21,7 @@ mod m1;
 mod m2;
 mod m2_shell;
 mod m3;
+mod m3_edit_actions;
 mod m3_writes;
 mod quit;
 mod support;
