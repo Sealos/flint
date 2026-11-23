@@ -759,6 +759,8 @@ fn every_return_to_the_editor_takes_focus() -> Result<()> {
 
     // The YAML tab shown again, with the edit kept.
     app.dispatch("detail::ShowOverview", Value::Null)?;
+    // The hidden editor gives up focus as the next frame draws.
+    app.wait_for("/focus", Equals("detail".into()))?;
     focus_tab(&app, tab)?;
     app.dispatch("detail::ShowYaml", Value::Null)?;
     assert_editor_keeps_keys(&app, &exec)?;
