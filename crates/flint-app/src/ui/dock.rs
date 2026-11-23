@@ -589,6 +589,12 @@ impl Dock {
     /// or the dock's visibility changes, and on every render for anything else (a hidden dock
     /// is not drawn, so hiding it cannot rely on the render).
     fn sync_shown_log(&mut self, cx: &App) {
+        let shown = self.shown_tab();
+        for tab in &self.tabs {
+            if let DockTab::Shell(view) = &tab.tab {
+                view.read(cx).set_dock_shown(shown == Some(tab.id));
+            }
+        }
         let now = self
             .active
             .filter(|_| self.visible)

@@ -519,7 +519,7 @@ impl DetailView {
     }
 
     /// Focuses the editor if it is on show and can be typed in.
-    pub(super) fn focus_shown_editor(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::ui) fn focus_shown_editor(&self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tab == DetailTab::Yaml
             && let Some(edit) = &self.edit
             && matches!(edit.phase, Phase::Editing | Phase::Conflict)
@@ -543,8 +543,11 @@ impl DetailView {
         // The pane holds focus while the review runs, and gives it back to the editor after.
         self.focus.focus(window, cx);
         self.run_review(window, cx);
+        // Refused at once: the editor is still on show.
+        self.focus_shown_editor(window, cx);
     }
 
+    /// Starts a review. A caller decides where focus goes if it is refused at once.
     fn run_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.can_review_edit() {
             return;
@@ -556,7 +559,6 @@ impl DetailView {
         let yaml = edit.editor.read(cx).value().to_string();
         if sets_status(&yaml) {
             edit.error = Some("Remove status: it cannot be edited here.".to_owned());
-            self.focus_shown_editor(window, cx);
             cx.notify();
             return;
         }
@@ -770,6 +772,33 @@ impl DetailView {
             self.edit = None;
             cx.notify();
         }
+    }
+}
+
+#[cfg(test)]
+impl DetailView {
+    /// Replaces `from` with `to` in the text being edited.
+    pub(in crate::ui) fn replace_in_edit(
+        &self,
+        from: &str,
+        to: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let edit = self.edit.as_ref().expect("an edit is open");
+        let text = edit.editor.read(cx).value().replace(from, to);
+        edit.editor
+            .update(cx, |state, cx| state.set_value(text, window, cx));
+    }
+
+    pub(in crate::ui) fn edit_error(&self) -> Option<&str> {
+        self.edit.as_ref()?.error.as_deref()
+    }
+
+    pub(in crate::ui) fn editor_has_focus(&self, window: &Window, cx: &App) -> bool {
+        self.edit
+            .as_ref()
+            .is_some_and(|e| e.editor.read(cx).focus_handle(cx).is_focused(window))
     }
 }
 
@@ -1040,6 +1069,74 @@ mod tests {
     }
 
     // A refused apply keeps the typed text, back at the editing step, with the editor's wording.
+    // A reload's follow-up review, refused at once, leaves focus where it moved meanwhile.
+    #[gpui_kit::test]
+    async fn a_refusal_after_a_reload_keeps_focus_moved_away(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        let kind = KindId::pods();
+        t.connect_alpha(cx, standard_sections()).await;
+        t.open_kind(
+            cx,
+            kind.plural(),
+            objects(kind.clone(), &[("demo", "api", 0)], SyncState::Synced, 1),
+        )
+        .await;
+        t.dispatch(
+            cx,
+            "resource_list::SelectRow",
+            json!({"namespace": "demo", "name": "api"}),
+        )
+        .unwrap();
+        let view = t.detail(cx).expect("the detail pane is open");
+        let failed = view.clone();
+        cx.wait_for(t.window, WAIT, move |_, cx| {
+            matches!(&failed.read(cx).fetch, Fetch::Failed(_))
+        })
+        .await;
+        let object = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "api", "namespace": "demo", "uid": "uid-api", "resourceVersion": "1"
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+        });
+        let detail = ObjectDetail {
+            yaml: serde_saphyr::to_string(&object).unwrap(),
+            object,
+            managed_fields: None,
+            events: Vec::new(),
+            events_truncated: false,
+            events_error: None,
+        };
+        let moved_to = cx.update(|cx| cx.focus_handle());
+        cx.update_window(t.window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.show_fetched(detail.clone(), window, cx);
+                v.start_edit(window, cx);
+                let edit = v.edit.as_mut().expect("the edit started");
+                edit.editor.update(cx, |state, cx| {
+                    state.set_value("kind: Pod\nstatus: {}\n", window, cx)
+                });
+                edit.phase = Phase::Reviewing;
+                window.focus(&moved_to, cx);
+                v.edit_reloaded(Ok(std::sync::Arc::new(detail)), window, cx);
+                // Read here: this handle is in no drawn view, so a frame would reclaim focus.
+                assert_eq!(window.focused(cx).as_ref(), Some(&moved_to));
+            })
+        })
+        .unwrap();
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| {
+            let (error, blocked) = (v.edit_error(), v.edit_blocked());
+            assert!(
+                error.is_some_and(|e| e.contains("status")),
+                "{error:?} {blocked:?}"
+            );
+        });
+    }
+
     #[gpui_kit::test]
     async fn a_refused_apply_keeps_the_edit_and_says_to_reopen(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();

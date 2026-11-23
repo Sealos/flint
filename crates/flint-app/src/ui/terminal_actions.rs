@@ -62,6 +62,7 @@ impl TerminalView {
             }
             PasteCheck::Lines { lines } => {
                 let refusal_sequence = self.refusal_sequence;
+                let focus_stint = self.focus_stint;
                 let pasted = match self.session.paste_if_bracketed(text.clone()) {
                     Ok(pasted) => pasted,
                     Err(refused) => {
@@ -78,7 +79,17 @@ impl TerminalView {
                     }
                     BracketedPaste::Unbracketed(attempt) => {
                         let _ = this.update_in(cx, |view, window, cx| {
-                            view.ask_to_paste(text, lines, attempt, window, cx);
+                            if view.focus_stint == focus_stint && view.holds_focus(window, cx) {
+                                view.ask_to_paste(text, lines, attempt, window, cx);
+                            } else if view.is_live() {
+                                view.set_shell_input_note(
+                                    NoteKind::PasteDiscarded,
+                                    "Focus left the shell and your paste was not sent. Paste it \
+                                     again."
+                                        .into(),
+                                );
+                                cx.notify();
+                            }
                         });
                     }
                     BracketedPaste::Discarded => {}
@@ -120,6 +131,15 @@ impl TerminalView {
 
     fn paste_confirmed(&mut self, text: String, attempt: ShellAttempt, cx: &mut Context<Self>) {
         if !self.is_live() {
+            return;
+        }
+        // The question holds focus, so what can be checked here is that the tab is still shown.
+        if !self.dock_shown.get() {
+            self.set_shell_input_note(
+                NoteKind::PasteDiscarded,
+                "The shell is no longer shown and your paste was not sent. Paste it again.".into(),
+            );
+            cx.notify();
             return;
         }
         let refusal_sequence = self.refusal_sequence;

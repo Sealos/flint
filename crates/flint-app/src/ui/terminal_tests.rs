@@ -743,6 +743,28 @@ async fn text_committed_after_focus_left_is_not_sent(cx: &mut TestAppContext) {
     assert_eq!(shell.sent(cx), b"");
 }
 
+// A multi-line paste whose mode check answers after focus left asks nothing and sends nothing.
+#[gpui_kit::test]
+async fn a_late_paste_question_is_dropped_once_focus_left(cx: &mut TestAppContext) {
+    let mut shell = open(cx);
+    cx.write_to_clipboard(ClipboardItem::new_string("echo a\necho b".into()));
+    let other = cx.update(|cx| cx.focus_handle());
+    cx.update_window(shell.window, |_, window, cx| {
+        window.press(TERMINAL_PASTE[0], cx);
+        window.focus(&other, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    shell.fake.pump();
+    let view = shell.view.clone();
+    cx.wait_for(shell.window, WAIT, move |_, cx| {
+        view.read(cx).note_kind == NoteKind::PasteDiscarded
+    })
+    .await;
+    assert!(!shell.has_dialog(cx));
+    assert_eq!(shell.sent(cx), b"");
+}
+
 // Paste goes to the tab only while it has focus; its own button gives it focus first.
 #[gpui_kit::test]
 async fn paste_needs_the_tab_focused(cx: &mut TestAppContext) {

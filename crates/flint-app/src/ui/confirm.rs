@@ -308,16 +308,22 @@ impl LiveDialog {
         dialog
     }
 
-    /// Whether this is the newest confirmation still unanswered in `window`.
-    fn is_newest(&self, window: &Window, cx: &App) -> bool {
+    /// Whether this is the newest confirmation still unanswered in `window`. With no dialog open
+    /// there, none is, however it was closed.
+    fn is_newest(&self, window: &mut Window, cx: &mut App) -> bool {
+        let id = window.window_handle().window_id();
+        if !window.has_active_dialog(cx) {
+            cx.default_global::<LiveDialogs>().0.remove(&id);
+            return false;
+        }
         cx.try_global::<LiveDialogs>()
-            .and_then(|live| live.0.get(&window.window_handle().window_id()))
+            .and_then(|live| live.0.get(&id))
             .and_then(|stack| stack.iter().rev().find(|d| d.strong_count() > 0))
             .is_some_and(|newest| newest.ptr_eq(&Rc::downgrade(&self.0)))
     }
 
     /// Marks this dialog answered, if it is the newest one: whether it was.
-    fn retire(&self, window: &Window, cx: &mut App) -> bool {
+    fn retire(&self, window: &mut Window, cx: &mut App) -> bool {
         if !self.is_newest(window, cx) {
             return false;
         }
@@ -1438,6 +1444,60 @@ mod tests {
         .unwrap();
         click_twice_before_repaint(cx, window, "ok");
         assert_eq!(runs.get(), 1);
+    }
+
+    // An OK still on screen after the dialog was closed from code does nothing.
+    #[gpui_kit::test]
+    async fn an_ok_after_a_close_from_code_does_nothing(cx: &mut TestAppContext) {
+        use gpui_kit::component::WindowExt as _;
+        use gpui_kit::{
+            Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput,
+        };
+
+        let window = window(cx);
+        let runs = Rc::new(Cell::new(0));
+        let count = runs.clone();
+        cx.update_window(window, |_, window, cx| {
+            open(window, cx, text("Once"), move |_, _| {
+                count.set(count.get() + 1)
+            });
+            window.render_frame(cx);
+            window.render_frame(cx);
+            let position = window.find("ok").bounds().center();
+            let modifiers = Modifiers::default();
+            window.dispatch_event(
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position,
+                    pressed_button: None,
+                    modifiers,
+                }),
+                cx,
+            );
+            window.render_frame(cx);
+            window.close_dialog(cx);
+            window.dispatch_event(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position,
+                    modifiers,
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+            window.dispatch_event(
+                PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position,
+                    modifiers,
+                    click_count: 1,
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(runs.get(), 0);
     }
 
     // A stale click on a dialog already answered leaves the dialog under it open.

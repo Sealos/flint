@@ -963,13 +963,17 @@ impl Workspace {
                 }
                 Err(why) => {
                     let detail = detail.clone();
-                    let _ = handle.update(cx, |_, window, cx| {
-                        let _ = detail.update(cx, |d, cx| {
-                            d.edit_applied(
-                                Err(flint_core::write::WriteError::Failed(why)),
-                                window,
-                                cx,
-                            )
+                    // This runs inside the dialog's update of this window, which cannot be
+                    // updated again until that ends.
+                    cx.defer(move |cx| {
+                        let _ = handle.update(cx, |_, window, cx| {
+                            let _ = detail.update(cx, |d, cx| {
+                                d.edit_applied(
+                                    Err(flint_core::write::WriteError::Failed(why)),
+                                    window,
+                                    cx,
+                                )
+                            });
                         });
                     });
                     false
