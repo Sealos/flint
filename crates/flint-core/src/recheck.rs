@@ -93,6 +93,17 @@ impl ContextPin {
         self.server.as_deref()
     }
 
+    /// A pin that matches no context's confirmed definition.
+    pub fn stale() -> Self {
+        ContextPin {
+            generation: 0,
+            endpoint: 0,
+            gate: 0,
+            definition: None,
+            server: None,
+        }
+    }
+
     /// Whether `other` is this pin on another connection definition, and nothing else moved.
     pub fn only_definition_differs(&self, other: &ContextPin) -> bool {
         self.definition != other.definition

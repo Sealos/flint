@@ -216,6 +216,20 @@ impl AdmittedMember {
     pub fn same_endpoint(&self, summary: &ClusterSummary) -> bool {
         !summary.confirmed || summary.endpoint == self.endpoint
     }
+
+    /// What a log session on `cluster` is pinned to: stale for any context but this member's.
+    pub(crate) fn log_pin(&self, cluster: &str) -> ContextPin {
+        if self.context() == cluster {
+            self.at.clone()
+        } else {
+            ContextPin::stale()
+        }
+    }
+
+    /// Whether `pin`, read with a client of `cluster`, is the exact definition admitted.
+    pub(crate) fn holds(&self, cluster: &str, pin: &ContextPin) -> bool {
+        self.context() == cluster && self.at == *pin
+    }
 }
 
 /// Requests that carry a reply channel or come from a [`Subscription`].
@@ -248,6 +262,12 @@ pub(crate) enum Request {
         cluster: ClusterId,
         kind: KindId,
     },
+    /// [`Self::Subscribe`] for a running-set member: nothing starts unless it still holds.
+    SubscribeMember {
+        id: u64,
+        member: AdmittedMember,
+        kind: KindId,
+    },
     Unsubscribe {
         id: u64,
     },
@@ -274,6 +294,8 @@ pub(crate) enum Request {
         /// The server the session is for, as the context showed it when the tab opened (its
         /// label); `None` for whatever the context shows when the core takes the request.
         server: Option<Option<String>>,
+        /// Set for a running set's tab: the session is pinned to what was admitted.
+        member: Option<AdmittedMember>,
         subject: LogSubject,
         options: LogOptions,
         snapshots: watch::Sender<Arc<LogSnapshot>>,
@@ -530,11 +552,20 @@ impl CoreHandle {
         // A running watch publishes what it held back while nobody listened.
         hub.wake.notify_one();
         let id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
-        let _ = self.requests.try_send(Request::Subscribe {
-            id,
-            cluster: cluster.to_owned(),
-            kind: kind.clone(),
-        });
+        // A handle bound to another context starts nothing.
+        let _ = match self.read_binding(cluster) {
+            Ok(Some(member)) => self.requests.try_send(Request::SubscribeMember {
+                id,
+                member,
+                kind: kind.clone(),
+            }),
+            Ok(None) => self.requests.try_send(Request::Subscribe {
+                id,
+                cluster: cluster.to_owned(),
+                kind: kind.clone(),
+            }),
+            Err(_) => Ok(()),
+        };
         Subscription {
             id,
             cluster: cluster.to_owned(),
@@ -583,12 +614,25 @@ impl CoreHandle {
         }
     }
 
-    /// This handle with its one-off reads ([`Self::fetch_object`], [`Self::workload_pods`]) bound
-    /// to `member`: refused if the context has left the admitted server, or names another.
+    /// This handle with what it starts bound to `member`: one-off reads, subscriptions, sessions
+    /// and reviewed writes are refused if the context is no longer the definition admitted.
     pub fn bound_to(&self, member: AdmittedMember) -> Self {
         Self {
             bound: Some(Arc::new(member)),
             ..self.clone()
+        }
+    }
+
+    pub(crate) fn is_bound(&self) -> bool {
+        self.bound.is_some()
+    }
+
+    /// Refuses a write whose client, read at `pin`, is not on the definition this handle's
+    /// member was admitted on. Asked before the credential is used.
+    pub(crate) fn check_admitted(&self, cluster: &str, pin: &ContextPin) -> Result<(), WriteError> {
+        match self.bound.as_deref() {
+            Some(member) if !member.holds(cluster, pin) => Err(WriteError::ConnectionChanged),
+            _ => Ok(()),
         }
     }
 
@@ -789,6 +833,7 @@ impl CoreHandle {
             id,
             cluster: cluster.to_owned(),
             server,
+            member: self.bound.as_deref().cloned(),
             subject: subject.clone(),
             options: options.clone(),
             snapshots,
@@ -859,8 +904,15 @@ impl CoreHandle {
         let client = self.write_client(&request.cluster, request.server.clone());
         let requests = self.requests.clone();
         let cluster = request.cluster.clone();
+        let admitted = self.bound.clone();
         self.runtime.spawn(async move {
-            let client = client.await.map(|(client, pin)| {
+            let client = client.await.and_then(|(client, pin)| match &admitted {
+                Some(member) if !member.holds(&cluster, &pin) => Err(WriteRefusal::Stale {
+                    cluster: cluster.to_string(),
+                }),
+                _ => Ok((client, pin)),
+            });
+            let client = client.map(|(client, pin)| {
                 let launch = launch_check(requests.clone(), cluster.clone(), pin.clone());
                 let check = context_check(requests, cluster, pin);
                 (client, ContextWatch::new(check, launch, RECHECK_EVERY))

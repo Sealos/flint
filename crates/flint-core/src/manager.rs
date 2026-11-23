@@ -685,6 +685,9 @@ impl ClusterManager {
                 self.subscriptions.insert(id, (cluster.clone(), kind));
                 self.reconcile(&cluster);
             }
+            Request::SubscribeMember { id, member, kind } => {
+                self.subscribe_member(id, member, kind);
+            }
             Request::Unsubscribe { id } => {
                 if let Some((cluster, kind)) = self.subscriptions.remove(&id) {
                     self.reconcile(&cluster);
@@ -713,6 +716,7 @@ impl ClusterManager {
                 id,
                 cluster,
                 server,
+                member,
                 subject,
                 options,
                 snapshots,
@@ -726,9 +730,10 @@ impl ClusterManager {
                 // context's confirmed definition names once its file loads again.
                 // Given the tab's server, pinned to exactly that: a request taken after the
                 // context moved (its fallback gone, say) is not pinned to where it is now.
-                let pin = match &server {
-                    Some(server) => self.contexts.pin(&cluster, server.as_deref()),
-                    None => self.session_pin(&cluster),
+                let pin = match (&member, &server) {
+                    (Some(member), _) => member.log_pin(&cluster),
+                    (None, Some(server)) => self.contexts.pin(&cluster, server.as_deref()),
+                    (None, None) => self.session_pin(&cluster),
                 };
                 let lookup: logs::ClientLookup = Arc::new(move || {
                     let (reply, rx) = oneshot::channel();
@@ -5595,6 +5600,36 @@ mod tests {
         );
     }
 
+    // A member that left its server, even if it came back, gets no watch from a new subscription.
+    #[tokio::test]
+    async fn a_changed_member_starts_no_subscription() {
+        use crate::settings::ClusterPin;
+        let dir = tempfile::tempdir().unwrap();
+        let original = kubeconfig_with("https://remote-a");
+        let mut manager = manager_reading(dir.path(), &original).await;
+        let admitted = manager
+            .admit_running_set(vec![
+                ClusterPin::new("dev", "https://remote-a"),
+                ClusterPin::new("other", "https://other"),
+            ])
+            .unwrap();
+        let kind = KindId::pods();
+        manager.subscribe_member(1, admitted[0].clone(), kind.clone());
+        assert!(manager.subscriptions.contains_key(&1), "still admitted");
+
+        rewrite(
+            &mut manager,
+            dir.path(),
+            &kubeconfig_with("https://replacement"),
+        )
+        .await;
+        manager.subscribe_member(2, admitted[0].clone(), kind.clone());
+        rewrite(&mut manager, dir.path(), &original).await;
+        manager.subscribe_member(3, admitted[0].clone(), kind);
+        assert!(!manager.subscriptions.contains_key(&2), "moved");
+        assert!(!manager.subscriptions.contains_key(&3), "moved back");
+    }
+
     // A reload that replaces the active member's credential on the same server binds the new
     // connection to the member, so its failure is not reported as the old live state.
     #[tokio::test]
@@ -6893,6 +6928,7 @@ mod tests {
             id: 1,
             cluster: "dev".into(),
             server: taken_late.then_some(shown),
+            member: None,
             subject: LogSubject::Pod(target),
             options: LogOptions::default(),
             snapshots,

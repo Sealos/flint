@@ -395,7 +395,10 @@ async fn a_rows_writes_stay_pinned_and_the_gate_refuses_them(cx: &mut TestAppCon
     let (target, core) = t.workspace.update(cx, |ws, cx| {
         ws.detail = Some(detail.clone());
         detail.update(cx, |d, _| d.set_server(Some(url.clone())));
-        (target_of(ws, cx).unwrap(), ws.core(cx).clone())
+        (
+            target_of(ws, cx).unwrap(),
+            detail.read(cx).write_core().clone(),
+        )
     });
     assert_eq!(target.server.as_deref(), Some(&*row.beta_url));
     detail.read_with(cx, |d, _| {
@@ -412,6 +415,86 @@ async fn a_rows_writes_stay_pinned_and_the_gate_refuses_them(cx: &mut TestAppCon
     );
     assert_eq!(replacement.load(Ordering::SeqCst), 0, "the replacement");
     assert_eq!(row.beta_writes.load(Ordering::SeqCst), 0, "the old server");
+}
+
+// A Scale dialog left open while the context goes away and comes back on the same URL with
+// another user: confirming reaches no server, and the core refuses the row's handle.
+#[gpui_kit::test]
+async fn a_stale_dialog_writes_nothing_after_away_and_back_with_another_user(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let row = open_beta_row(cx, dir.path()).await;
+    let t = &row.t;
+    let detail = t.detail(cx).expect("the row's detail");
+    let (target, bound) = t.workspace.read_with(cx, |ws, cx| {
+        (
+            target_of(ws, cx).unwrap(),
+            detail.read(cx).write_core().clone(),
+        )
+    });
+    let (workspace, window) = (t.workspace.clone(), t.window);
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| {
+            request(ws, ResourceAction::Scale, window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(t.window, WAIT, |window, _| window.find_all("ok").len() == 1)
+        .await;
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+
+    let (_url, replacement, _api) = repoint_beta(cx, dir.path(), &row).await;
+    let contexts = [
+        ("kind-alpha", &*row.alpha_url),
+        ("kind-beta", &*row.beta_url),
+    ];
+    let other_user = kubeconfig_yaml(&contexts).replace("token: t", "token: other");
+    std::fs::write(dir.path().join("kubeconfig"), other_user).unwrap();
+    let core = t.workspace.read_with(cx, |ws, cx| ws.core(cx).clone());
+    core.reload_kubeconfig().await.unwrap();
+    cx.run_until_parked();
+    // Back and connected with the new user, so only the admitted definition can refuse it.
+    t.model
+        .update(cx, |model, _| model.activate("kind-beta".into()));
+    t.wait_for_state(cx, "kind-beta", |s| {
+        matches!(s, ConnectionState::Connected(_))
+    })
+    .await;
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model
+            .read(cx)
+            .discovered("kind-beta")
+            .is_some_and(|d| d.discovery.is_some())
+    })
+    .await;
+
+    if cx
+        .update_window(t.window, |_, window, _| window.find_all("ok").len())
+        .unwrap()
+        == 1
+    {
+        t.click(cx, "ok");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    let refused = bound
+        .review_write(target, WriteProposal::Scale { to: 7 })
+        .await;
+    assert!(
+        matches!(refused, Err(WriteError::ConnectionChanged)),
+        "{:?}",
+        refused.map(|_| ())
+    );
+    assert_eq!(
+        row.beta_writes.load(Ordering::SeqCst),
+        0,
+        "the row's server"
+    );
+    assert_eq!(replacement.load(Ordering::SeqCst), 0, "the replacement");
+    assert_eq!(row.alpha_writes.load(Ordering::SeqCst), 0, "the other one");
 }
 
 #[gpui_kit::test]

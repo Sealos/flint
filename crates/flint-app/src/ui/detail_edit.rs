@@ -275,6 +275,11 @@ impl DetailView {
         cx.notify();
     }
 
+    /// The handle this view's writes are reviewed through: bound to its member for a set's row.
+    pub(in crate::ui) fn write_core(&self) -> &flint_core::CoreHandle {
+        &self.core
+    }
+
     fn edit_target(&self, detail: &ObjectDetail) -> WriteTarget {
         let text = |pointer: &str| {
             detail

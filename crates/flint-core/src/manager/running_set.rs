@@ -181,6 +181,22 @@ impl ClusterManager {
         (!on_pin).then(changed)
     }
 
+    /// Subscribes to `kind` on `member`, in one step with checking it still holds: a member that
+    /// changed starts no LIST or watch. Its subscription just never gets rows.
+    pub(super) fn subscribe_member(
+        &mut self,
+        id: u64,
+        member: AdmittedMember,
+        kind: crate::KindId,
+    ) {
+        if self.member_changed(&member).is_some() {
+            return;
+        }
+        let cluster = member.pin.context.clone();
+        self.subscriptions.insert(id, (cluster.clone(), kind));
+        self.reconcile(&cluster);
+    }
+
     /// The read client of `member`, checked in the same step as it is taken.
     pub(super) fn member_client(&self, member: &AdmittedMember) -> Result<kube::Client, String> {
         if let Some(why) = self.member_changed(member) {

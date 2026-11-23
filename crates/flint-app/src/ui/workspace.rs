@@ -640,7 +640,7 @@ impl Workspace {
                 return;
             }
         };
-        let core = self.model.read(cx).core().clone();
+        let core = self.session_core(member.as_ref(), cx);
         let key = TabKey::Logs(request.clone());
         let cluster = self.tab_cluster(&key, cx);
         let server = match &member {
@@ -746,7 +746,7 @@ impl Workspace {
             Some(member) => Some(member.server().to_owned()),
             None => self.shown_server(key.context(), cx),
         };
-        let core = self.model.read(cx).core().clone();
+        let core = self.session_core(member.as_ref(), cx);
         let opened = self.dock.update(cx, |dock, cx| {
             dock.open_beside(
                 id,
@@ -825,7 +825,7 @@ impl Workspace {
                 return;
             }
         };
-        let core = self.model.read(cx).core().clone();
+        let core = self.session_core(member.as_ref(), cx);
         let key = TabKey::Shell(request.clone());
         let cluster = self.tab_cluster(&key, cx);
         let server = match &member {

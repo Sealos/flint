@@ -400,6 +400,9 @@ pub(in crate::ui) fn target_of(ws: &Workspace, cx: &App) -> Option<WriteTarget> 
 /// A change on its way through review and confirmation.
 #[derive(Clone)]
 struct Request {
+    /// The handle of the view the action was offered from: a set's row is bound to its member,
+    /// so a dialog left open cannot review on a definition that came later.
+    core: flint_core::CoreHandle,
     action: ResourceAction,
     target: WriteTarget,
     proposal: WriteProposal,
@@ -420,15 +423,20 @@ pub(in crate::ui) fn request(
             return;
         }
     };
+    let core = ws.detail_view().map_or_else(
+        || ws.core(cx).clone(),
+        |detail| detail.read(cx).write_core().clone(),
+    );
     let proposal = match action {
-        ResourceAction::Scale => return open_scale(ws, target, window, cx),
-        ResourceAction::Drain => return open_drain(target, window, cx),
+        ResourceAction::Scale => return open_scale(ws, core, target, window, cx),
+        ResourceAction::Drain => return open_drain(core, target, window, cx),
         ResourceAction::Delete => WriteProposal::Delete,
         ResourceAction::RolloutRestart => WriteProposal::RolloutRestart,
         ResourceAction::Cordon => WriteProposal::Cordon,
         ResourceAction::Uncordon => WriteProposal::Uncordon,
     };
     let request = Request {
+        core,
         action,
         target,
         proposal,
@@ -444,8 +452,8 @@ fn start_review(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let review = ws
-        .core(cx)
+    let review = request
+        .core
         .review_write(request.target.clone(), request.proposal.clone());
     let handle = window.window_handle();
     let task = cx.spawn(async move |this, cx| {
@@ -776,6 +784,7 @@ impl Render for ScaleField {
 
 fn open_scale(
     ws: &mut Workspace,
+    core: flint_core::CoreHandle,
     target: WriteTarget,
     window: &mut Window,
     cx: &mut Context<Workspace>,
@@ -807,6 +816,7 @@ fn open_scale(
             }
         };
         let request = Request {
+            core: core.clone(),
             action: ResourceAction::Scale,
             target: target.clone(),
             proposal: WriteProposal::Scale { to },
@@ -916,7 +926,12 @@ impl Render for DrainChoices {
     }
 }
 
-fn open_drain(target: WriteTarget, window: &mut Window, cx: &mut Context<Workspace>) {
+fn open_drain(
+    core: flint_core::CoreHandle,
+    target: WriteTarget,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
     let choices = cx.new(DrainChoices::new);
     let text = drain_dialog(&target);
     let this = cx.weak_entity();
@@ -925,6 +940,7 @@ fn open_drain(target: WriteTarget, window: &mut Window, cx: &mut Context<Workspa
     confirm::open_pinned_with(window, cx, text, pinned, content, move |window, cx| {
         let chosen = choices.read(cx);
         let request = Request {
+            core: core.clone(),
             action: ResourceAction::Drain,
             target: target.clone(),
             proposal: WriteProposal::Drain {
@@ -1200,10 +1216,11 @@ mod tests {
             let on = target.clone();
             cx.update_window(t.window, |_, window, cx| {
                 t.workspace.update(cx, |ws, cx| {
+                    let core = ws.core(cx).clone();
                     if drain {
-                        open_drain(on, window, cx)
+                        open_drain(core, on, window, cx)
                     } else {
-                        open_scale(ws, on, window, cx)
+                        open_scale(ws, core, on, window, cx)
                     }
                 })
             })

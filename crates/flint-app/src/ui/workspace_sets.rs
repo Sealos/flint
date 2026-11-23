@@ -473,7 +473,11 @@ impl Workspace {
         let core = self.model.read(cx).core().clone();
         let subscriptions: Vec<_> = members
             .iter()
-            .map(|member| core.subscribe(member.context(), &kind))
+            // Bound: the core starts no LIST or watch for a member that has changed.
+            .map(|member| {
+                core.bound_to(member.clone())
+                    .subscribe(member.context(), &kind)
+            })
             .collect();
         let snapshots: Vec<Arc<KindSnapshot>> = subscriptions
             .iter()
@@ -740,6 +744,17 @@ impl Workspace {
             Some(why) => Err(why),
             None => Ok(Some(member.clone())),
         }
+    }
+
+    /// The core a session for `member` launches through: bound to it, so the launch itself
+    /// refuses a context that is no longer the definition admitted.
+    pub(super) fn session_core(
+        &self,
+        member: Option<&AdmittedMember>,
+        cx: &App,
+    ) -> flint_core::CoreHandle {
+        let core = self.model.read(cx).core();
+        member.map_or_else(|| core.clone(), |member| core.bound_to(member.clone()))
     }
 
     /// Discards the rows of members that no longer show their admitted server.
