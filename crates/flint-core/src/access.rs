@@ -209,15 +209,30 @@ impl CoreHandle {
         server: Option<String>,
         check: AccessCheck,
     ) -> impl Future<Output = Access> + Send + 'static {
-        let client = self.bound_write_client(cluster, Some(server));
+        let client = self.bound_write_client(cluster, Some(server.clone()));
         let cache = self.access_cache();
+        let core = self.clone();
         let cluster = cluster.to_owned();
         let run = self.on_runtime(async move {
-            let Ok((client, _pin, credential)) = client.await else {
+            let Ok((client, pin, credential)) = client.await else {
                 return Access::Unknown;
             };
+            // A set's row stays on the definition admitted, from before its credential is touched.
+            // A spent lease means this connection authenticates nothing more.
+            if core.check_admitted(&cluster, &pin).is_err() || credential.spent() {
+                return Access::Unknown;
+            }
             let asked = ask(client.into_client(), &check);
-            cache.answer(&cluster, &credential, &check, asked).await
+            let access = cache.answer(&cluster, &credential, &check, asked).await;
+            // The answer speaks only for the connection it was asked on.
+            match core.bound_write_client(&cluster, Some(server)).await {
+                Ok((_, now, current))
+                    if now == pin && current.id().is(&credential.id()) && !current.spent() =>
+                {
+                    access
+                }
+                _ => Access::Unknown,
+            }
         });
         async move { run.await.unwrap_or(Access::Unknown) }
     }
