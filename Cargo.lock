@@ -1973,6 +1973,7 @@ name = "flint-app"
 version = "0.5.0"
 dependencies = [
  "async-channel",
+ "block2 0.6.2",
  "flint-core",
  "flint-e2e",
  "flint-mcp",
@@ -1982,6 +1983,9 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "libc",
+ "objc2 0.6.5",
+ "objc2-foundation 0.3.2",
+ "objc2-user-notifications",
  "serde",
  "serde-saphyr 2.2.0",
  "serde_json",

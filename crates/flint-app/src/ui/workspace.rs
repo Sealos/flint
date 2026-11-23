@@ -1901,6 +1901,7 @@ impl Workspace {
         let watch_mode = controls
             .watch_mode
             .then(|| self.render_watch_mode(&name, two_rows, cx));
+        let alerts = super::alert_center::render_button(cx);
         let first_row = super::theme::moves_window(h_flex())
             .h(px(HEADER_HEIGHT))
             .flex_none()
@@ -1945,6 +1946,7 @@ impl Workspace {
                         .child(access_mode)
                         .children(namespaces)
                         .children(watch_mode)
+                        .children(alerts)
                         .test_support(),
                 )
                 .test_support()
@@ -1956,6 +1958,7 @@ impl Workspace {
                 .child(access_mode)
                 .children(namespaces)
                 .children(watch_mode)
+                .children(alerts)
                 .into_any_element()
         }
     }

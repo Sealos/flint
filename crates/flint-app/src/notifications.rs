@@ -5,16 +5,17 @@
 //! Names come from the cluster and are hostile. Shown text goes through [`clean`], which bounds
 //! it and removes control, invisible and markup characters, because freedesktop servers may
 //! render a body as markup. Senders pass text as separate arguments, never inside a script.
-
-#![cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by the alert delivery work")
-)]
+//!
+//! A sender reports what the OS answered ([`DeliveryError`]). Success means the OS accepted the
+//! notification: Focus modes and per-app settings can still keep it off the screen.
 
 #[path = "investigate_prompt.rs"]
 pub mod investigate_prompt;
+#[cfg(target_os = "macos")]
+#[path = "notifications_macos.rs"]
+mod macos;
 
-use std::io;
+#[cfg(any(test, not(target_os = "macos")))]
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
@@ -40,6 +41,8 @@ pub struct Notification {
     pub body: String,
     /// The exact cluster to open. An identity for lookups, never for display.
     pub cluster: Arc<str>,
+    /// Identifies this notification when the OS reports a click on it.
+    pub tag: String,
 }
 
 impl Notification {
@@ -73,7 +76,14 @@ impl Notification {
             title: format!("{heading}: {}", clean(cluster_label)),
             body,
             cluster: Arc::clone(cluster),
+            tag: String::new(),
         }
+    }
+
+    /// This notification, identified by `tag`.
+    pub fn tagged(mut self, tag: String) -> Self {
+        self.tag = tag;
+        self
     }
 }
 
@@ -107,7 +117,7 @@ fn subject_label(subject: &AlertSubject) -> String {
 
 /// `text` safe to show on one line: whitespace becomes a space, control, invisible and markup
 /// characters are removed, and a long value keeps both ends around an ellipsis.
-fn clean(text: &str) -> String {
+pub(crate) fn clean(text: &str) -> String {
     let kept: Vec<char> = text
         .chars()
         .take(MAX_SCANNED_CHARS)
@@ -152,45 +162,63 @@ fn is_shown(c: char) -> bool {
     single_line(text) == *text
 }
 
-/// Delivers a notification.
-pub trait NotificationSender {
-    /// Sends `notification`. May block briefly, so call it off the UI thread.
-    fn send(&self, notification: &Notification) -> io::Result<()>;
+/// Why the OS did not take a notification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeliveryError {
+    /// The OS has not granted Flint permission to notify, or it was turned off.
+    NotPermitted,
+    /// macOS only notifies from an app bundle, and this process is not running from one.
+    NeedsAppBundle,
+    /// The notifier is missing, or it failed.
+    Failed(String),
 }
 
-/// Sends through `osascript`.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct MacosSender;
-
-impl MacosSender {
-    /// The title and body are script arguments, so they are never parsed as AppleScript. `--`
-    /// ends the options, so they are never read as flags either.
-    fn command(notification: &Notification) -> Command {
-        let mut command = Command::new("/usr/bin/osascript");
-        command
-            .args(["-e", "on run argv"])
-            .args([
-                "-e",
-                "display notification (item 2 of argv) with title (item 1 of argv)",
-            ])
-            .args(["-e", "end run"])
-            .arg("--")
-            .arg(&notification.title)
-            .arg(&notification.body);
-        command
+impl DeliveryError {
+    /// What to tell the person. Never claims a notification was shown.
+    pub fn message(&self) -> String {
+        match self {
+            Self::NotPermitted => {
+                "Not delivered: the system has not allowed Flint to post notifications. Allow \
+                 them in the system's notification settings."
+                    .to_owned()
+            }
+            Self::NeedsAppBundle => {
+                "Not delivered: macOS only posts notifications for Flint.app.".to_owned()
+            }
+            Self::Failed(why) => format!("Not delivered: {why}."),
+        }
     }
 }
 
-impl NotificationSender for MacosSender {
-    fn send(&self, notification: &Notification) -> io::Result<()> {
-        run(Self::command(notification))
+/// Delivers a notification.
+pub trait NotificationSender: Send + Sync {
+    /// Gets ready to send, asking the OS for permission if it has not been asked. Call it when
+    /// notifications are turned on, off the UI thread.
+    fn prepare(&self) -> Result<(), DeliveryError>;
+
+    /// Sends `notification`, returning what the OS answered. May block briefly, so call it off
+    /// the UI thread.
+    fn send(&self, notification: &Notification) -> Result<(), DeliveryError>;
+}
+
+/// The sender for this platform.
+pub fn platform_sender() -> Arc<dyn NotificationSender> {
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(macos::MacosSender)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Arc::new(FreedesktopSender)
     }
 }
 
 /// Sends through `notify-send`.
+#[cfg(any(test, not(target_os = "macos")))]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FreedesktopSender;
 
+#[cfg(any(test, not(target_os = "macos")))]
 impl FreedesktopSender {
     /// `--` ends the options, so the title and body are never read as flags.
     fn command(notification: &Notification) -> Command {
@@ -204,30 +232,41 @@ impl FreedesktopSender {
     }
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 impl NotificationSender for FreedesktopSender {
-    fn send(&self, notification: &Notification) -> io::Result<()> {
+    fn prepare(&self) -> Result<(), DeliveryError> {
+        let mut command = Command::new("notify-send");
+        command.arg("--version");
+        run(command)
+    }
+
+    fn send(&self, notification: &Notification) -> Result<(), DeliveryError> {
         run(Self::command(notification))
     }
 }
 
-fn run(mut command: Command) -> io::Result<()> {
+#[cfg(any(test, not(target_os = "macos")))]
+fn run(mut command: Command) -> Result<(), DeliveryError> {
     let status = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()?;
+        .status()
+        .map_err(|e| DeliveryError::Failed(format!("could not run the notifier ({e})")))?;
     if status.success() {
         Ok(())
     } else {
-        Err(io::Error::other(format!("notifier exited with {status}")))
+        Err(DeliveryError::Failed(format!(
+            "the notifier exited with {status}"
+        )))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
+    use std::sync::Mutex;
 
     use flint_core::alerts::{AlertKey, AlertSummary};
     use flint_core::display::ClusterNames;
@@ -262,12 +301,16 @@ mod tests {
 
     #[derive(Default)]
     struct FakeSender {
-        sent: RefCell<Vec<Notification>>,
+        sent: Mutex<Vec<Notification>>,
     }
 
     impl NotificationSender for FakeSender {
-        fn send(&self, notification: &Notification) -> io::Result<()> {
-            self.sent.borrow_mut().push(notification.clone());
+        fn prepare(&self) -> Result<(), DeliveryError> {
+            Ok(())
+        }
+
+        fn send(&self, notification: &Notification) -> Result<(), DeliveryError> {
+            self.sent.lock().unwrap().push(notification.clone());
             Ok(())
         }
     }
@@ -395,18 +438,8 @@ mod tests {
             title: "--title\" & do shell script \"id".into(),
             body: "-body".into(),
             cluster: Arc::from("prod"),
+            tag: String::new(),
         };
-        let mac = MacosSender::command(&notification);
-        let args: Vec<&OsStr> = mac.get_args().collect();
-        assert_eq!(args[args.len() - 3], OsStr::new("--"));
-        assert_eq!(args[args.len() - 2], OsStr::new(&notification.title));
-        assert_eq!(args[args.len() - 1], OsStr::new("-body"));
-        assert!(
-            args[..args.len() - 2]
-                .iter()
-                .all(|arg| !arg.to_string_lossy().contains("shell script"))
-        );
-
         let linux = FreedesktopSender::command(&notification);
         let args: Vec<&OsStr> = linux.get_args().collect();
         assert_eq!(args[args.len() - 3], OsStr::new("--"));
@@ -416,8 +449,26 @@ mod tests {
 
     #[test]
     fn a_failing_notifier_is_an_error() {
-        assert!(run(Command::new("false")).is_err());
+        assert!(matches!(
+            run(Command::new("false")),
+            Err(DeliveryError::Failed(_))
+        ));
+        assert!(matches!(
+            run(Command::new("/nonexistent/notifier")),
+            Err(DeliveryError::Failed(_))
+        ));
         assert!(run(Command::new("true")).is_ok());
+    }
+
+    #[test]
+    fn a_refusal_never_reads_as_delivered() {
+        for error in [
+            DeliveryError::NotPermitted,
+            DeliveryError::NeedsAppBundle,
+            DeliveryError::Failed("x".into()),
+        ] {
+            assert!(error.message().starts_with("Not delivered"), "{error:?}");
+        }
     }
 
     #[test]
@@ -427,6 +478,6 @@ mod tests {
             Notification::from_event(&AlertEvent::Raised(alert("prod", pod("api-0"))), "prod");
         let dyn_sender: &dyn NotificationSender = &sender;
         dyn_sender.send(&notification).unwrap();
-        assert_eq!(*sender.sent.borrow(), vec![notification]);
+        assert_eq!(*sender.sent.lock().unwrap(), vec![notification]);
     }
 }

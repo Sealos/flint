@@ -7,6 +7,7 @@
 
 mod accent;
 mod activity_view;
+mod alert_center;
 #[cfg(test)]
 mod appearance_tests;
 #[cfg(feature = "automation")]
@@ -165,6 +166,7 @@ pub fn run(boot: Bootstrap) {
 
             let model = cx.new(|cx| ClustersModel::new(core, settings, startup_cluster, cx));
             handle_appearance_menu(&model, cx);
+            alert_center::install(&model, cx);
             let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
             match gpui_kit::open_window(window_options(bounds), cx, |window, cx| {
                 cx.new(|cx| {

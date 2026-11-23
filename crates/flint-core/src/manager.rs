@@ -675,6 +675,12 @@ impl ClusterManager {
                 })
                 .await
             }
+            Command::SetDesktopNotifications(enabled) => {
+                self.write_settings("desktop notifications", move |dir| {
+                    settings::set_desktop_notifications(dir, enabled)
+                })
+                .await
+            }
             Command::SetNamespaceFilter {
                 cluster,
                 namespaces,

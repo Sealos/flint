@@ -33,6 +33,14 @@ async-channel = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 
+# Asks macOS for the notification permission and reports what it answers. GPUI's own call
+# does not say whether a notification was refused.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSError", "NSString"] }
+objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "block2", "UNNotificationContent", "UNNotificationRequest", "UNNotificationSettings", "UNNotificationTrigger", "UNUserNotificationCenter"] }
+
 [features]
 # The test-only automation channel (docs/TESTING.md). Never in release builds. GPUI's test
 # support renders the window to an image for screenshots.
