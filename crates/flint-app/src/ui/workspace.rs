@@ -235,6 +235,8 @@ enum PickerDialogFocus {
     Restoring,
 }
 
+pub(super) use sets::SettingsDir;
+
 pub struct Workspace {
     model: Entity<ClustersModel>,
     /// `FLINT_APPEARANCE`, a development aid that wins over the setting.
@@ -252,6 +254,8 @@ pub struct Workspace {
     generation: Option<u64>,
     list: Option<Entity<ResourceList>>,
     detail: Option<Entity<DetailView>>,
+    /// The sidebar's choice of clusters, saved sets and the running set's combined list.
+    sets: sets::ClusterSets,
     /// The window is too narrow for the list and the detail side by side, as of the last draw.
     narrow: bool,
     /// The main header shows two rows, as of the last draw: the dock leaves it more room.
@@ -421,7 +425,9 @@ impl Workspace {
         // and registered actions still reach the workspace.
         let on_focus_lost =
             cx.on_focus_lost(window, |this, window, cx| this.reclaim_focus(window, cx));
-        registry::install(focus.clone(), Self::guards(cx.entity().downgrade()), cx);
+        let guards = Self::set_guards(Self::guards(cx.entity().downgrade()));
+        registry::install(focus.clone(), guards, cx);
+        let cluster_sets = sets::ClusterSets::new(window, cx);
         // The window's close button asks first while a session would end, as Close Window does.
         closing::guard_close_button(window, cx);
         let mut this = Self {
@@ -436,6 +442,7 @@ impl Workspace {
             generation: None,
             list: None,
             detail: None,
+            sets: cluster_sets,
             narrow: false,
             two_row_header: false,
             server_moves: ServerMoves::default(),
@@ -484,6 +491,7 @@ impl Workspace {
             ],
         };
         this.show_appearance(window, cx);
+        this.load_saved_sets(cx);
         this
     }
 
@@ -935,6 +943,7 @@ impl Workspace {
         self.check_dock_servers(cx);
         self.tell_detail_sessions_blocked(cx);
         self.tell_shells_protected(cx);
+        self.check_set_row(cx);
         let model = self.model.read(cx);
         let active = model.active.clone();
         let core = model.core().clone();
@@ -963,7 +972,10 @@ impl Workspace {
             // subscription (UP-24).
             self.cluster = active.clone();
             self.forget_places();
-            self.close_list(cx);
+            // Selecting a member (to sign in to it, say) keeps the set's list open.
+            if !self.sets.has_member(active.as_deref()) {
+                self.close_list(cx);
+            }
             // Its filter or YAML, if one had focus that has moved on (to a dock tab, say): focus
             // may never come back through `reclaim_focus`, nor a list open here. One that still
             // has focus goes when the workspace takes focus back.
@@ -1000,7 +1012,7 @@ impl Workspace {
         let (Some(cluster), Some(discovery)) = (active, discovered.discovery) else {
             return;
         };
-        if self.list.is_some() {
+        if self.list.is_some() || self.sets.is_open() {
             return;
         }
         let entries = || {
@@ -1075,6 +1087,7 @@ impl Workspace {
     fn close_list(&mut self, cx: &mut Context<Self>) {
         // Another kind, list or cluster: a reason given for the rows left no longer applies.
         self.clear_action_error(cx);
+        self.leave_set(cx);
         self.list = None;
         self.detail = None;
         self._list_subscriptions.clear();
@@ -1106,6 +1119,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.show_kind_in_set(entry, window, cx) {
+            return;
+        }
         let Some(cluster) = self.cluster.clone() else {
             return;
         };
@@ -1399,6 +1415,7 @@ impl Workspace {
             .border_color(theme.sidebar_border)
             .child(pane_title("CLUSTERS", traffic_lights, theme))
             .child(list)
+            .child(self.render_sets_panel(theme, cx))
             .child(pane_handle(
                 "clusters-edge",
                 Pane::Clusters,
@@ -1458,9 +1475,18 @@ impl Workspace {
             .border_1()
             .border_color(super::theme::cursor_ring(theme, ring))
             .tooltip(move |_, cx| cluster_tooltip(tip.0.clone(), &tip.1, &tip.2, cx))
-            .on_click(registry::on_click(SelectCluster {
-                cluster: name.clone(),
-            }))
+            // While choosing clusters a click chooses: it must not connect to this one.
+            .when(self.sets.picking(), |row| {
+                row.on_click(registry::on_click(registry::TogglePickedCluster {
+                    cluster: name.clone(),
+                }))
+            })
+            .when(!self.sets.picking(), |row| {
+                row.on_click(registry::on_click(SelectCluster {
+                    cluster: name.clone(),
+                }))
+            })
+            .children(self.render_pick_box(&name))
             .child(dot)
             .child(
                 v_flex()
@@ -2248,6 +2274,9 @@ impl Workspace {
     }
 
     fn render_main(&self, window_width: f32, theme: &Theme, cx: &Context<Self>) -> AnyElement {
+        if let Some(set_view) = self.render_set_view(window_width, theme, cx) {
+            return set_view;
+        }
         let model = self.model.read(cx);
         if model.loaded && model.clusters.is_empty() {
             let text = no_contexts_text(
@@ -3119,6 +3148,7 @@ impl Render for Workspace {
             .id("workspace")
             .key_context(registry::WORKSPACE)
             .map(|el| self.register_actions(el, cx))
+            .map(|el| self.register_set_actions(el, cx))
             // Captured, as the list reports no change for the row already selected: asking for
             // a row or object shows the detail, and asking for the filter shows the list. A
             // right-click selects its row without leaving it: the row hosts the context menu.
@@ -3297,6 +3327,9 @@ mod actions;
 
 #[path = "workspace_keys.rs"]
 mod keys;
+
+#[path = "workspace_sets.rs"]
+mod sets;
 
 #[cfg(test)]
 #[path = "keyboard_tests.rs"]
