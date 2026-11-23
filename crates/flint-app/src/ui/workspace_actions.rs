@@ -1740,6 +1740,10 @@ mod scope_tests;
 mod protect_tests;
 
 #[cfg(test)]
+#[path = "cluster_text_tests.rs"]
+mod cluster_text_tests;
+
+#[cfg(test)]
 #[path = "row_actions_tests.rs"]
 mod row_actions_tests;
 

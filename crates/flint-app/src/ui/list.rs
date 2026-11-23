@@ -195,6 +195,8 @@ pub struct ResourceList {
     restoring_filter: bool,
     /// The text the rows drawn were computed for; `query.text` runs ahead of it while typing.
     rows_text: String,
+    /// The namespaces the rows drawn were computed for; the selection runs ahead of it.
+    rows_namespaces: Vec<String>,
     /// The selected object, when the rows drawn exist without it: the filters exclude it.
     hidden_selected: Option<Box<str>>,
     /// The namespace or text filter changed: the next measurement starts the column widths
@@ -327,6 +329,7 @@ impl ResourceList {
             select_first_in: None,
             restoring_filter: false,
             rows_text: String::new(),
+            rows_namespaces: Vec::new(),
             hidden_selected: None,
             remeasure: false,
             scoped: 0,
@@ -660,6 +663,7 @@ impl ResourceList {
         let selected_uid = self.selected.as_ref().map(|s| s.uid.clone());
         let restart = std::mem::take(&mut self.remeasure);
         let one_namespace = namespaces.len() == 1;
+        let job_namespaces = namespaces.clone();
         let job_snapshot = snapshot.clone();
         let only = self.query.only.as_ref().map(|only| only.objects.clone());
         let job_only = only.clone();
@@ -718,6 +722,7 @@ impl ResourceList {
                 }
                 list.restoring_filter = false;
                 list.rows_text = job_text;
+                list.rows_namespaces = job_namespaces;
                 list.widths.update(&snapshot.columns, &widths, restart);
                 list.scoped = scoped;
                 list.rows_in_one_namespace = one_namespace;
@@ -1362,25 +1367,30 @@ impl ResourceList {
                 Some(error.clone()),
                 theme.warning,
             )),
-            _ if self.restoring_filter => Some(
-                h_flex()
-                    .id("list-placeholder")
-                    .size_full()
-                    .justify_center()
-                    .items_center()
-                    .gap_2()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(Spinner::new().small())
-                    .child(
-                        div()
-                            .id("list-filtering")
-                            .child(format!("Filtering {label}…"))
-                            .test_support(),
-                    )
-                    .test_support()
-                    .into_any_element(),
-            ),
+            // No rows yet for the namespaces selected now: nothing can be said about them.
+            _ if self.restoring_filter
+                || (self.rows.is_empty() && self.rows_namespaces != self.scope()) =>
+            {
+                Some(
+                    h_flex()
+                        .id("list-placeholder")
+                        .size_full()
+                        .justify_center()
+                        .items_center()
+                        .gap_2()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child(Spinner::new().small())
+                        .child(
+                            div()
+                                .id("list-filtering")
+                                .child(format!("Filtering {label}…"))
+                                .test_support(),
+                        )
+                        .test_support()
+                        .into_any_element(),
+                )
+            }
             _ if self.rows.is_empty() && self.query.only.is_some() => {
                 let only = self.query.only.as_ref().map_or("", |only| &only.label);
                 Some(message(
@@ -1397,31 +1407,49 @@ impl ResourceList {
                 } else if self.namespaced && !self.query.namespaces.is_empty() && self.scoped == 0 {
                     // The namespace filter names nothing the cluster has rows in (a typed
                     // name that does not exist): say which, and offer the way out.
-                    let names = self.query.namespaces.join(", ");
+                    let title = format!(
+                        "No {label} in {}",
+                        list_model::missing_namespaces_text(&self.query.namespaces)
+                    );
+                    // The words give way in a short or narrow pane; the button keeps its space.
                     v_flex()
                         .id("list-placeholder")
                         .size_full()
+                        .overflow_hidden()
                         .items_center()
                         .justify_center()
                         .gap_2()
-                        .p_6()
+                        .p_2()
                         .child(
                             div()
+                                .id("missing-namespace-text")
+                                .max_w_full()
+                                .min_h_0()
+                                .flex_shrink(1.)
+                                .truncate()
                                 .text_sm()
                                 .text_color(theme.muted_foreground)
-                                .child(format!("No {label} in namespace {names}")),
+                                .aria_label(title.clone())
+                                .child(title)
+                                .test_support(),
                         )
                         .child(
                             div()
+                                .max_w_full()
+                                .min_h_0()
+                                .flex_shrink(1.)
+                                .truncate()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
                                 .child(format!("{} in other namespaces.", snapshot.rows.len())),
                         )
                         .child(
-                            Button::new("show-all-namespaces")
-                                .small()
-                                .label("Show All Namespaces")
-                                .on_click(registry::on_click(ShowAllNamespaces)),
+                            div().flex_none().child(
+                                Button::new("show-all-namespaces")
+                                    .small()
+                                    .label("Show All Namespaces")
+                                    .on_click(registry::on_click(ShowAllNamespaces)),
+                            ),
                         )
                         .test_support()
                         .into_any_element()
