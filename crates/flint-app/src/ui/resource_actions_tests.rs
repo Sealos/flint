@@ -133,6 +133,56 @@ fn list_one_pod(cx: &mut TestAppContext) {
     });
 }
 
+// covers #267: a context whose kubeconfig is in doubt, or whose connection was replaced, stops
+// showing a refusal at once, before the pane next draws.
+#[gpui_kit::test]
+async fn a_refusal_ends_with_its_connection(cx: &mut TestAppContext) {
+    use flint_core::access::Access;
+
+    use crate::ui::detail::access::Gated;
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_alpha(cx, dir.path(), "").await;
+    connect_deletable(cx, &t).await;
+    open_deployments(cx, &t).await;
+    list_one_pod(cx);
+    right_click(cx, &t, "web").await;
+    cx.run_until_parked();
+    let detail = t.workspace.read_with(cx, |ws, _| ws.detail_view().unwrap());
+    let delete = Gated::Write(ResourceAction::Delete);
+    let enabled = |cx: &mut TestAppContext| {
+        let actions = t
+            .workspace
+            .read_with(cx, |ws, cx| row_menu::row_actions(ws, cx).unwrap());
+        let (_, entries) = row_menu::menu_state(&actions);
+        entries
+            .into_iter()
+            .find(|e| e.label.starts_with("Delete…"))
+            .unwrap()
+            .enabled
+    };
+    let connection = Some((1, 1));
+
+    detail.update(cx, |d, cx| {
+        d.set_access_connection(connection, false, cx);
+        d.set_access_for_tests(delete, Access::Forbidden, cx);
+    });
+    assert!(!enabled(cx));
+    detail.update(cx, |d, cx| d.set_access_connection(connection, true, cx));
+    assert!(enabled(cx), "a provisional context shows no refusal");
+    assert!(detail.read_with(cx, |d, _| !d.access_checks_running()));
+
+    detail.update(cx, |d, cx| {
+        d.set_access_connection(connection, false, cx);
+        d.set_access_for_tests(delete, Access::Forbidden, cx);
+    });
+    assert!(!enabled(cx));
+    detail.update(cx, |d, cx| {
+        d.set_access_connection(Some((2, 1)), false, cx);
+    });
+    assert!(enabled(cx), "a replaced connection shows no refusal");
+}
+
 // covers #267: what RBAC forbids is disabled with its reason, what it allows stays enabled, and an
 // answer that is not clear leaves the action to the server.
 #[gpui_kit::test]

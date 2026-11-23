@@ -373,7 +373,7 @@ impl Workspace {
                 };
                 this.open_view(&open, window, cx);
             }
-            NavEvent::OpenOverview => this.open_dashboard(window, cx),
+            NavEvent::OpenOverview => this.open_overview(window, cx),
         });
         // Quitting right after a drag (or another change) still saves state.toml.
         let on_quit = cx.on_app_quit(|this: &mut Self, cx| {
@@ -440,7 +440,7 @@ impl Workspace {
         let on_focus_lost =
             cx.on_focus_lost(window, |this, window, cx| this.reclaim_focus(window, cx));
         let guards = Self::set_guards(Self::guards(cx.entity().downgrade()))
-            .when::<OpenClusterOverview>(|ws, _| ws.cluster.is_some());
+            .when::<OpenClusterOverview>(|ws, _| ws.cluster.is_some() || ws.sets.is_open());
         registry::install(focus.clone(), guards, cx);
         let cluster_sets = sets::ClusterSets::new(window, cx);
         // The window's close button asks first while a session would end, as Close Window does.
@@ -946,11 +946,20 @@ impl Workspace {
                 .cluster_summary(&cluster, cx)
                 .and_then(|c| c.info.server.clone()),
         };
+        let (connection, unsettled) =
+            self.cluster_summary(&cluster, cx)
+                .map_or((None, false), |c| {
+                    (
+                        Some((c.generation, c.definition)),
+                        c.provisional || c.paused,
+                    )
+                });
         detail.update(cx, |d, cx| {
             d.set_sessions_blocked(why, cx);
             d.set_protected(protected, label, cx);
             d.set_row_writes_paused(writes_paused, cx);
             d.set_server(server);
+            d.set_access_connection(connection, unsettled, cx);
         });
     }
 

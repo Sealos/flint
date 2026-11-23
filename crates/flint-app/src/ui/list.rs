@@ -128,6 +128,15 @@ impl CountedObjects {
         self.uids.len() + self.without_uid.len()
     }
 
+    /// Adds these objects, as `cluster`'s, to a filter over a cluster set.
+    pub fn add_to(&self, cluster: &str, objects: &mut flint_core::combined::CombinedObjects) {
+        objects.extend(
+            cluster,
+            self.uids.iter().cloned(),
+            self.without_uid.iter().cloned(),
+        );
+    }
+
     fn matches(&self, namespace: Option<&str>, name: &str, uid: &str) -> bool {
         self.uids.contains(uid) || self.without_uid.contains(&Self::key(namespace, name))
     }

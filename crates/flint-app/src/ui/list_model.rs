@@ -1023,6 +1023,7 @@ pub mod combined {
         }
         let whole_scope = query.text.is_empty()
             && query.clusters.is_empty()
+            && query.objects.is_none()
             && query.sort.is_none()
             && !query.group_by_cluster;
         let widths = if whole_scope {

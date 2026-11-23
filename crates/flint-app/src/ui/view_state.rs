@@ -65,7 +65,7 @@ pub struct OpenSetState {
     pub members: Vec<SetMemberState>,
     /// One per cluster while grouped by cluster, else empty.
     pub groups: Vec<SetGroupState>,
-    /// Saved members left out when the set opened, because they now point at another server.
+    /// Saved members the core left out when the set opened.
     pub left_out: Vec<String>,
     pub list: ListState,
 }

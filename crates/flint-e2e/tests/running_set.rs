@@ -282,6 +282,44 @@ async fn until_state(view: &mut Subscription, state: SyncState) {
 }
 
 #[tokio::test]
+async fn member_telemetry_never_reads_the_feed_of_the_server_its_context_moved_to() {
+    let [a, b, elsewhere] = servers().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kubeconfig");
+    write_config(&path, &[&a, &b]);
+    // The harness defaults to On view, where a member runs no feed.
+    let settings = Settings {
+        cluster_watch_mode: [("a".to_owned(), flint_core::settings::WatchMode::All)].into(),
+        ..Settings::default()
+    };
+    let core = Core::start_on_context(dir, vec![path.clone()], settings, "a").await;
+    let pins = vec![ClusterPin::new("a", a.url()), ClusterPin::new("b", b.url())];
+    let admitted = core.handle.admit_running_set(pins).await.unwrap();
+    let member = admitted.into_iter().find(|m| m.context() == "a").unwrap();
+    tokio::time::timeout(WAIT, async {
+        while core.handle.member_telemetry(&member).is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the member's own feed is readable");
+
+    write_config(&path, &[&elsewhere, &b]);
+    core.handle.reload_kubeconfig().await.unwrap();
+    // The context's new feed is on the board under the same name, and is not the member's.
+    tokio::time::timeout(WAIT, async {
+        while core.handle.telemetry("a").is_none()
+            || core.handle.member_telemetry(&member).is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the replacement feed runs and the member does not read it");
+    assert!(core.handle.member_telemetry(&member).is_none());
+}
+
+#[tokio::test]
 async fn a_member_view_inherits_nothing_from_the_previous_server() {
     let [a, b, replacement] = servers().await;
     let (core, path) = core_on(&[&a, &b]).await;
