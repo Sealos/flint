@@ -142,7 +142,7 @@ impl Workspace {
     /// The panes shown now, in Tab order, with their focus.
     fn panes(&self, cx: &App) -> Vec<(Pane, FocusHandle)> {
         let mut panes = vec![(Pane::Sidebar, self.sidebar_focus.clone())];
-        if self.model.read(cx).active_cluster().is_some() {
+        if self.nav_shown(cx) {
             panes.push((Pane::Navigation, self.nav.read(cx).focus_handle().clone()));
         }
         if let Some(list) = &self.list {

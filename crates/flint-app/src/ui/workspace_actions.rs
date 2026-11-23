@@ -270,7 +270,7 @@ impl Workspace {
             .when::<DefaultWatchAllKinds>(Self::settings_ok)
             .when::<DefaultWatchOpenViewsOnly>(Self::settings_ok)
             .add::<OpenView>(
-                |ws, _| ws.cluster.is_some(),
+                |ws, _| ws.cluster.is_some() || ws.sets.is_open(),
                 |ws, a, cx| ws.check_open_view(a, cx),
             )
             .add::<OpenObject>(
@@ -1454,9 +1454,13 @@ impl Workspace {
         }
     }
 
-    /// The active cluster's navigation entry for `kind`, named as `kubectl get` takes it (Kind,
-    /// plural, singular or short name, optionally `.group`), through the core resolver.
+    /// The navigation entry for `kind`, named as `kubectl get` takes it (Kind, plural, singular
+    /// or short name, optionally `.group`), through the core resolver: from what the open set
+    /// serves, else from the active cluster.
     pub(in crate::ui) fn nav_entry(&self, kind: &str, cx: &App) -> Option<NavEntry> {
+        if let Some(entry) = self.nav.read(cx).set_entry(kind) {
+            return Some(entry);
+        }
         let model = self.model.read(cx);
         let active = model.active.as_ref()?;
         let discovery = model.discovered(active)?.discovery.as_ref()?;

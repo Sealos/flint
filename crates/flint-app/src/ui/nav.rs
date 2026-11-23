@@ -24,6 +24,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::registry::{self, OpenClusterOverview, OpenView, RetryConnection, ToggleNavSection};
+use super::set_kinds::{MemberKinds, SetKinds};
 use super::theme::status_dot;
 
 /// Which sections are open, per cluster. Sections the user never toggled follow
@@ -131,6 +132,8 @@ pub enum NavEvent {
 pub struct NavPanel {
     cluster: Option<ClusterId>,
     discovery: Option<Arc<ClusterDiscovery>>,
+    /// While a cluster set is open: what its members serve, shown instead of `discovery`.
+    set: Option<SetKinds>,
     error: Option<String>,
     collapsed: HashMap<ClusterId, Collapsed>,
     states: HashMap<KindId, SyncState>,
@@ -161,6 +164,7 @@ impl NavPanel {
             scroll_to_cursor: false,
             cluster: None,
             discovery: None,
+            set: None,
             error: None,
             collapsed: HashMap::new(),
             states: HashMap::new(),
@@ -198,6 +202,47 @@ impl NavPanel {
         }
     }
 
+    /// Shows what the open set's `members` serve (`None`: no set is open), with `selected`
+    /// marked: switching the active cluster inside a set keeps the set's kind open.
+    pub fn set_cluster_set(
+        &mut self,
+        members: Option<Vec<MemberKinds>>,
+        selected: Option<KindId>,
+        cx: &mut Context<Self>,
+    ) {
+        match (members, &self.set) {
+            (None, None) => {}
+            (None, Some(_)) => {
+                self.set = None;
+                cx.notify();
+            }
+            (Some(members), Some(set)) if set.built_from(&members) => {}
+            (Some(members), _) => {
+                self.set = Some(SetKinds::new(members));
+                cx.notify();
+            }
+        }
+        if selected.is_some() && self.selected != selected {
+            self.set_selected(selected, cx);
+        }
+    }
+
+    /// The open set's kinds, if a set is open.
+    pub(in crate::ui) fn set_kinds(&self) -> Option<&SetKinds> {
+        self.set.as_ref()
+    }
+
+    /// The entry the open set has for `kind`, named as `kubectl get` takes it.
+    pub(in crate::ui) fn set_entry(&self, kind: &str) -> Option<NavEntry> {
+        let set = self.set.as_ref()?;
+        set.discovery().nav_entry(kind).ok().cloned()
+    }
+
+    /// What the tree shows, and the name its open sections are kept under.
+    pub(in crate::ui) fn tree(&self) -> Option<(&ClusterId, &ClusterDiscovery)> {
+        shown_tree(&self.set, &self.cluster, &self.discovery)
+    }
+
     pub fn set_connection_failed(&mut self, failed: bool, cx: &mut Context<Self>) {
         if self.connection_failed != failed {
             self.connection_failed = failed;
@@ -227,8 +272,8 @@ impl NavPanel {
     }
 
     pub fn set_selected(&mut self, kind: Option<KindId>, cx: &mut Context<Self>) {
-        if let (Some(kind), Some(cluster), Some(discovery)) =
-            (&kind, &self.cluster, &self.discovery)
+        if let (Some(kind), Some((cluster, discovery))) =
+            (&kind, shown_tree(&self.set, &self.cluster, &self.discovery))
         {
             self.collapsed
                 .entry(cluster.clone())
@@ -271,7 +316,7 @@ impl NavPanel {
     /// The rows the cursor can be on, top to bottom: every section header, and the listable
     /// kinds of the open sections.
     pub(in crate::ui) fn rows(&self) -> Vec<NavRow> {
-        let (Some(cluster), Some(discovery)) = (&self.cluster, &self.discovery) else {
+        let Some((cluster, discovery)) = self.tree() else {
             return Vec::new();
         };
         let collapsed = self.collapsed.get(cluster).cloned().unwrap_or_default();
@@ -341,8 +386,10 @@ impl NavPanel {
         let mark = state.and_then(marker);
         let state_text = state_text(state);
         let listable = entry.listable;
+        let coverage = self.set.as_ref().and_then(|s| s.coverage(&entry.id));
+        let badge = coverage.and_then(|c| c.badge());
         let tip = format!(
-            "{}\n{} {}{}\n{}",
+            "{}\n{} {}{}\n{}{}",
             entry.label,
             entry.api_version,
             entry.kind,
@@ -355,7 +402,10 @@ impl NavPanel {
                 state_text
             } else {
                 "cannot be listed".to_owned()
-            }
+            },
+            coverage
+                .filter(|c| c.badge().is_some())
+                .map_or_else(String::new, |c| format!("\n{}", c.detail())),
         );
         let open = entry.id.to_string();
         h_flex()
@@ -403,6 +453,16 @@ impl NavPanel {
                     .child(entry.label.clone())
                     .test_support(),
             )
+            .children(badge.map(|badge| {
+                div()
+                    .id(SharedString::from(format!("nav-coverage-{}", entry.id)))
+                    .flex_none()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .font_features(super::list::tabular_figures())
+                    .child(badge)
+                    .test_support()
+            }))
             .children(mark.map(|m| match m {
                 // Static, not a spinner: dozens of kinds load at once after activation, and
                 // animating them all would keep the window redrawing.
@@ -414,6 +474,20 @@ impl NavPanel {
             .test_support()
             .into_any_element()
     }
+}
+
+/// The open set's kinds once any member has reported some, else the active cluster's. Takes the
+/// fields, so a caller can change the panel's other fields while holding the result.
+fn shown_tree<'a>(
+    set: &'a Option<SetKinds>,
+    cluster: &'a Option<ClusterId>,
+    discovery: &'a Option<Arc<ClusterDiscovery>>,
+) -> Option<(&'a ClusterId, &'a ClusterDiscovery)> {
+    if let Some(set) = set.as_ref().filter(|s| s.has_kinds()) {
+        let key = cluster.as_ref().or_else(|| set.first_member())?;
+        return Some((key, set.discovery()));
+    }
+    Some((cluster.as_ref()?, discovery.as_deref()?))
 }
 
 fn same_discovery(a: &Option<Arc<ClusterDiscovery>>, b: &Option<Arc<ClusterDiscovery>>) -> bool {
@@ -446,9 +520,9 @@ impl Render for NavPanel {
         let mut cursor_row = None;
         let focused = self.focus.is_focused(window);
         let cursor = if focused { self.cursor() } else { None };
-        match (&self.cluster, &self.discovery) {
-            (None, _) => {}
-            (Some(_), None) => {
+        match (self.tree(), self.cluster.is_some() || self.set.is_some()) {
+            (None, false) => {}
+            (None, true) => {
                 // A failed connection has its Retry in the main area; only a failed discovery
                 // (with a connection) offers one here.
                 let retry =
@@ -482,10 +556,13 @@ impl Render for NavPanel {
                     .into_any_element(),
                 );
             }
-            (Some(cluster), Some(discovery)) => {
+            (Some((cluster, discovery)), _) => {
                 let collapsed = self.collapsed.get(cluster).cloned().unwrap_or_default();
                 let mut first_group = true;
-                rows.push(self.render_overview(&theme).into_any_element());
+                // The overview is of the active cluster.
+                if self.cluster.is_some() {
+                    rows.push(self.render_overview(&theme).into_any_element());
+                }
                 for (i, section) in discovery.navigation.sections.iter().enumerate() {
                     if section.kind == SectionKind::ApiGroup && first_group {
                         first_group = false;

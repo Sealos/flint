@@ -540,13 +540,11 @@ impl Workspace {
         let focus = list.read(cx).focus_handle().clone();
         window.focus(&focus, cx);
         release_unfocused_input(window, cx);
-        self.nav
-            .update(cx, |nav, cx| nav.set_selected(Some(kind.clone()), cx));
         self.sets.running = Some(RunningSet {
             label,
             members,
             changed: HashSet::new(),
-            kind,
+            kind: kind.clone(),
             list,
             snapshots,
             reports: Vec::new(),
@@ -557,6 +555,9 @@ impl Workspace {
             _reports: reports,
             _list_events: events,
         });
+        self.refresh_set_kinds(cx);
+        self.nav
+            .update(cx, |nav, cx| nav.set_selected(Some(kind), cx));
         cx.notify();
     }
 
@@ -667,6 +668,7 @@ impl Workspace {
             run.snapshots[at] = without_rows(&run.snapshots[at], SyncState::Idle);
         }
         self.rebuild_combined(cx);
+        self.refresh_set_kinds(cx);
         self.refuse(why, cx);
     }
 
@@ -716,6 +718,7 @@ impl Workspace {
         if run.reports != reports {
             run.reports = reports;
             self.check_set_row(cx);
+            self.refresh_set_kinds(cx);
             cx.notify();
         }
     }
@@ -958,6 +961,7 @@ impl Workspace {
             // Through the same queue as admissions, so it can't overtake a later one.
             drop(self.model.read(cx).core().admit_running_set(Vec::new()));
         }
+        self.refresh_set_kinds(cx);
     }
 
     /// The running set's main area: the combined list beside the selected row's detail, or the
@@ -1155,6 +1159,9 @@ impl Workspace {
             })
     }
 }
+
+#[path = "workspace_set_kinds.rs"]
+mod kinds;
 
 #[cfg(test)]
 #[path = "workspace_sets_tests.rs"]

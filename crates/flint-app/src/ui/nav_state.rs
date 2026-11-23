@@ -6,9 +6,9 @@ use super::{Marker, NavPanel, NavRow, marker};
 impl NavPanel {
     /// The sections, and the entries of the open ones. `None` with no cluster active.
     pub fn view_state(&self) -> Option<NavState> {
-        let cluster = self.cluster.as_ref()?;
         let error = self.error.as_deref().map(error_text);
-        let Some(discovery) = &self.discovery else {
+        let Some((cluster, discovery)) = self.tree() else {
+            self.cluster.as_ref()?;
             let status = if self.awaiting_confirmation {
                 "waiting"
             } else if self.connection_failed || self.error.is_some() {
