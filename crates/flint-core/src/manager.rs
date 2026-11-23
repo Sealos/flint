@@ -480,6 +480,8 @@ pub(crate) struct ClusterManager {
     generation: u64,
     /// Every context's history across kubeconfig loads, which sessions are pinned to.
     contexts: ContextHistory,
+    /// Moves after each load is recorded, so open log sessions recheck their route at once.
+    route_changes: watch::Sender<u64>,
     /// The kubeconfig files for the current settings: the base files plus `kubeconfig_paths`.
     kubeconfig_paths: Vec<PathBuf>,
     /// Reads those files without letting a stuck one hold up this loop.
@@ -596,6 +598,7 @@ impl ClusterManager {
             kubeconfig: Arc::default(),
             generation: 0,
             contexts: ContextHistory::default(),
+            route_changes: watch::Sender::new(0),
             kubeconfig_paths,
             clusters: Vec::new(),
             active: None,
@@ -896,6 +899,7 @@ impl ClusterManager {
                     &config,
                     Arc::new(KubeLogSource::new(lookup.clone())),
                     Arc::new(KubePodSource::new(lookup)),
+                    self.route_changes.subscribe(),
                 );
                 let task = tokio::spawn(logs::run(feed, config, snapshots, paused, Some(budget)));
                 self.log_sessions.retain(|_, t| !t.is_finished());
@@ -1283,7 +1287,11 @@ impl ClusterManager {
     /// `cluster`'s API server address, if `grant` is the server and proxy it shows now.
     fn address_of_grant(&self, cluster: &str, grant: &str) -> Option<String> {
         let info = &self.clusters.iter().find(|c| c.info.name == cluster)?.info;
-        (info.grant_server().as_deref() == Some(grant))
+        let stable = info
+            .proxy_url
+            .as_deref()
+            .is_none_or(crate::connection::proxy::is_stable_identity);
+        (stable && info.grant_server().as_deref() == Some(grant))
             .then(|| info.server.clone())
             .flatten()
     }
@@ -2805,6 +2813,7 @@ impl ClusterManager {
             .collect();
         // A file that failed to load masks the changes it could have made (UP-06).
         self.contexts.record(&loaded);
+        self.route_changes.send_modify(|at| *at += 1);
         // An unlock names only the server. A context that comes out of an uncertain spell on
         // another definition may hold another user or token there, so it is locked again.
         for name in self.settled.update(&self.contexts, &loaded) {
@@ -3294,9 +3303,14 @@ mod tests {
         manager.unlocks.unlock("dev", &first);
         let pin = manager.session_pin("dev");
         assert_eq!(manager.launch_gate("dev", &pin), Ok(()));
+        let route_changes = manager.route_changes.subscribe();
 
         rewrite(&mut manager, dir.path(), &at(two)).await;
 
+        assert!(
+            route_changes.has_changed().unwrap(),
+            "open log sessions are told to recheck"
+        );
         assert_ne!(grant(&manager).unwrap(), first, "the grant is per account");
         assert!(manager.launch_gate("dev", &pin).is_err());
         assert!(manager.log_client("dev", &pin).is_err());

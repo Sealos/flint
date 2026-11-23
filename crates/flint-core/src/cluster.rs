@@ -793,6 +793,7 @@ fn proxy_of(
     };
     proxy::ProxyTarget::parse(chosen)?;
     proxy::check_route(server, skips_verify)?;
+    proxy::check_account_key(chosen)?;
     chosen
         .trim()
         .parse()

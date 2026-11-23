@@ -241,7 +241,7 @@ impl ServerKeys {
     /// place, which fails if another got there first. A key file that cannot be read or made is
     /// logged, and there are no server keys.
     pub fn open(config_dir: &Path) -> Self {
-        match load_or_make_key(config_dir) {
+        match load_or_make_key(config_dir, KEY_FILE) {
             Ok(secret) => ServerKeys::with_secret(&secret),
             Err(e) => {
                 tracing::warn!(error = %e, "cannot read or make the agent activity log's key");
@@ -284,10 +284,11 @@ impl ServerKeys {
     }
 }
 
-/// The 32 bytes in `config_dir`'s [`KEY_FILE`], made first if it is missing.
-fn load_or_make_key(config_dir: &Path) -> std::io::Result<[u8; 32]> {
+/// The 32 bytes in `config_dir`'s key file `key_file`, made first if it is missing. Each purpose
+/// has a file of its own, so no key serves two.
+pub(crate) fn load_or_make_key(config_dir: &Path, key_file: &str) -> std::io::Result<[u8; 32]> {
     use ring::rand::SecureRandom as _;
-    let path = config_dir.join(KEY_FILE);
+    let path = config_dir.join(key_file);
     match read_key(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         read => return read,
@@ -300,7 +301,7 @@ fn load_or_make_key(config_dir: &Path) -> std::io::Result<[u8; 32]> {
     // A random name: a draft a crashed process left behind can never be taken for this one.
     let mut name = [0u8; 16];
     rng.fill(&mut name).map_err(no_random)?;
-    let draft = config_dir.join(format!(".{KEY_FILE}.{:032x}", u128::from_ne_bytes(name)));
+    let draft = config_dir.join(format!(".{key_file}.{:032x}", u128::from_ne_bytes(name)));
     if link_key(&draft, &path, &secret)? {
         Ok(secret)
     } else {
@@ -336,7 +337,7 @@ fn read_key(path: &Path) -> std::io::Result<[u8; 32]> {
     let secret = <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("{KEY_FILE} is not 32 bytes"),
+            "a key file is not 32 bytes",
         )
     })?;
     owner_only(path)?;

@@ -14,8 +14,10 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use futures::FutureExt;
 use futures::future::BoxFuture;
+use futures::stream::BoxStream;
+use futures::{FutureExt, StreamExt};
+use tokio::sync::watch;
 use tokio::time::{Instant, Sleep};
 
 use crate::cluster::context_fingerprint;
@@ -32,6 +34,8 @@ pub(crate) struct Recheck<T> {
     every: Duration,
     next: Pin<Box<Sleep>>,
     checking: Option<BoxFuture<'static, T>>,
+    /// Makes a check due at once when it yields. The timer stays as the backstop.
+    woken: Option<BoxStream<'static, ()>>,
 }
 
 impl<T> Recheck<T> {
@@ -41,6 +45,33 @@ impl<T> Recheck<T> {
             every,
             next: Box::pin(tokio::time::sleep(every)),
             checking: None,
+            woken: None,
+        }
+    }
+
+    /// Also checks as soon as `changes` moves.
+    pub fn waking_on(mut self, changes: watch::Receiver<u64>) -> Self {
+        let stream = futures::stream::unfold(changes, |mut changes| async move {
+            changes.changed().await.ok()?;
+            Some(((), changes))
+        });
+        self.woken = Some(stream.boxed());
+        self
+    }
+
+    /// Whether a change arrived since the last poll. Registers `cx` for the next one.
+    fn poll_woken(&mut self, cx: &mut Context<'_>) -> bool {
+        let Some(woken) = &mut self.woken else {
+            return false;
+        };
+        match woken.poll_next_unpin(cx) {
+            Poll::Ready(Some(())) => true,
+            // The manager is gone: only the timer is left.
+            Poll::Ready(None) => {
+                self.woken = None;
+                false
+            }
+            Poll::Pending => false,
         }
     }
 
@@ -52,7 +83,9 @@ impl<T> Recheck<T> {
         start: impl FnOnce() -> BoxFuture<'static, T>,
     ) -> Poll<T> {
         if self.checking.is_none() {
-            std::task::ready!(self.next.as_mut().poll(cx));
+            if !self.poll_woken(cx) {
+                std::task::ready!(self.next.as_mut().poll(cx));
+            }
             self.next.as_mut().reset(Instant::now() + self.every);
             self.checking = Some(start());
         }

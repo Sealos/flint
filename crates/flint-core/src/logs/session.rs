@@ -287,14 +287,15 @@ pub(crate) fn feed(
     config: &SessionConfig,
     logs: Arc<dyn LogSource>,
     pods: Arc<dyn PodSource>,
+    route_changes: watch::Receiver<u64>,
 ) -> Box<dyn Feed> {
     match subject {
         LogSubject::Pod(target) => {
-            Box::new(PodFeed::new(logs, target, options, config).rechecking(pods))
+            Box::new(PodFeed::new(logs, target, options, config).rechecking(pods, route_changes))
         }
-        LogSubject::Workload(target) => {
-            Box::new(WorkloadFeed::new(logs, pods, target, options, *config))
-        }
+        LogSubject::Workload(target) => Box::new(
+            WorkloadFeed::new(logs, pods, target, options, *config).rechecking_on(route_changes),
+        ),
     }
 }
 
@@ -323,9 +324,14 @@ impl PodFeed {
         }
     }
 
-    /// Ends the stream when `pods` says its cluster is no longer the one it opened on.
-    pub fn rechecking(mut self, pods: Arc<dyn PodSource>) -> Self {
-        self.check = Some((pods, Recheck::new(RECHECK_EVERY)));
+    /// Ends the stream when `pods` says its cluster is no longer the one it opened on, asked
+    /// every [`RECHECK_EVERY`] and whenever `route_changes` moves.
+    pub fn rechecking(
+        mut self,
+        pods: Arc<dyn PodSource>,
+        route_changes: watch::Receiver<u64>,
+    ) -> Self {
+        self.check = Some((pods, Recheck::new(RECHECK_EVERY).waking_on(route_changes)));
         self
     }
 }

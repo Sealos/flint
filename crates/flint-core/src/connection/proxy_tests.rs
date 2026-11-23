@@ -198,6 +198,162 @@ fn a_route_identity_tells_accounts_apart_without_holding_them() {
     }
 }
 
+const ACCOUNT: &str = "http://alice:s3cret@proxy:3128";
+
+#[test]
+fn installs_with_different_keys_have_different_digests() {
+    let (one, two) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let at = |dir: &tempfile::TempDir| route_identity_with(ACCOUNT, || open_route_key(dir.path()));
+    assert_ne!(at(&one), at(&two));
+    assert!(is_stable_identity(&at(&one)));
+}
+
+#[test]
+fn one_install_keeps_its_identity_across_processes() {
+    let dir = tempfile::tempdir().unwrap();
+    // A restart, or the other of the app and `flint mcp`: each opens the file afresh.
+    let first = route_identity_with(ACCOUNT, || open_route_key(dir.path()));
+    let second = route_identity_with(ACCOUNT, || open_route_key(dir.path()));
+    assert_eq!(first, second);
+    let path = dir.path().join(ROUTE_KEY_FILE);
+    let meta = std::fs::metadata(path).unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    assert_eq!((meta.len(), meta.permissions().mode() & 0o777), (32, 0o600));
+}
+
+#[test]
+fn an_unreadable_key_gives_no_stable_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let saved = route_identity_with(ACCOUNT, || open_route_key(dir.path()));
+    std::fs::write(dir.path().join(ROUTE_KEY_FILE), b"short").unwrap();
+
+    let now = route_identity_with(ACCOUNT, || open_route_key(dir.path()));
+
+    assert_ne!(now, saved);
+    assert_ne!(now, shown(ACCOUNT), "never the address alone");
+    assert!(!is_stable_identity(&now));
+    let other = route_identity_with("http://bob:s3cret@proxy:3128", || None);
+    assert_ne!(now, other, "accounts stay apart");
+    assert_eq!(
+        now,
+        route_identity_with(ACCOUNT, || None),
+        "same across reloads"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join(ROUTE_KEY_FILE)).unwrap(),
+        b"short",
+        "a damaged key is not replaced"
+    );
+
+    let mut settings = crate::settings::Settings::default();
+    let granted = grant_endpoint(SERVER, Some(&saved)).into_owned();
+    settings
+        .trusted_clusters
+        .push(crate::settings::ClusterPin::new("prod", granted));
+    let unlocks = crate::protection::SessionUnlocks::default();
+    unlocks.unlock("prod", &grant_endpoint(SERVER, Some(&now)));
+    assert_eq!(
+        crate::protection::protection(&settings, &unlocks, "prod", Some(SERVER), Some(&now)),
+        crate::protection::Protection::Protected,
+        "neither the saved grant nor an unlock on this route opens writes"
+    );
+}
+
+#[test]
+fn a_saved_grant_holds_no_part_of_the_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let identity = route_identity_with(ACCOUNT, || open_route_key(dir.path()));
+    let mut settings = crate::settings::Settings::default();
+    settings
+        .trusted_clusters
+        .push(crate::settings::ClusterPin::new(
+            "prod",
+            grant_endpoint(SERVER, Some(&identity)),
+        ));
+    let saved = toml::to_string(&settings).unwrap();
+    assert!(saved.contains("http://proxy:3128#"), "{saved}");
+    assert!(
+        !saved.contains("alice") && !saved.contains("s3cret"),
+        "{saved}"
+    );
+}
+
+#[test]
+fn only_a_proxy_account_needs_the_route_key() {
+    let refused = check_account_key_with(ACCOUNT, || None).unwrap_err();
+    let text = refused.to_string();
+    assert!(text.contains("did not connect"), "{text}");
+    assert!(
+        !text.contains("alice") && !text.contains("s3cret"),
+        "{text}"
+    );
+    check_account_key_with("http://proxy:3128", || panic!("no account, no key")).unwrap();
+    let key = || Some(hmac::Key::new(hmac::HMAC_SHA256, &[1; 32]));
+    check_account_key_with(ACCOUNT, key).unwrap();
+}
+
+#[test]
+fn a_key_file_left_open_is_made_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(ROUTE_KEY_FILE);
+    std::fs::write(&path, [3; 32]).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert!(open_route_key(dir.path()).is_some());
+
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+}
+
+#[tokio::test]
+async fn without_the_route_key_a_proxy_account_connects_to_nothing() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (plugin, mark) = (dir.path().join("plugin"), dir.path().join("launched"));
+    std::fs::write(
+        &plugin,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nprintf '{{\"status\":{{\"token\":\"t\"}}}}'\n",
+            mark.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let yaml = format!(
+        "apiVersion: v1\nkind: Config\ncurrent-context: c\nclusters:\n- name: c\n  cluster:\n    \
+         server: https://127.0.0.1:1\n    proxy-url: http://alice:s3cret@127.0.0.1:{port}\n\
+         contexts:\n- name: c\n  context:\n    cluster: c\n    user: u\nusers:\n- name: u\n  \
+         user:\n    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      \
+         command: {}\n      interactiveMode: Never\n",
+        plugin.display()
+    );
+    let kubeconfig = kube::config::Kubeconfig::from_yaml(&yaml).unwrap();
+
+    ROUTE_KEY_FAILS.set(true);
+    let outcome = crate::cluster::connect(&kubeconfig, "c").await;
+    ROUTE_KEY_FAILS.set(false);
+
+    let error = outcome
+        .err()
+        .expect("the connection was refused")
+        .to_string();
+    assert!(error.contains("did not connect"), "{error}");
+    assert!(
+        !error.contains("alice") && !error.contains("s3cret"),
+        "{error}"
+    );
+    assert!(!mark.exists(), "the plugin was launched");
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "reached the proxy"
+    );
+}
+
 #[test]
 fn a_grant_differs_for_each_route() {
     assert_eq!(grant_endpoint(SERVER, None), SERVER);

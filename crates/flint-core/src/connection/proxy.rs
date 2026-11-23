@@ -10,10 +10,15 @@
 
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use http::{HeaderValue, Uri};
 use hyper_util::client::legacy::connect::proxy::Tunnel;
 use hyper_util::client::proxy::matcher::Matcher;
+use ring::hmac;
+use ring::rand::SystemRandom;
 
 /// What [`shown`] says of a proxy URL it can't read, which may be a mistyped secret.
 const UNREADABLE: &str = "an unreadable proxy URL";
@@ -183,33 +188,123 @@ pub(crate) fn shown(proxy: &str) -> String {
     }
 }
 
-/// Rounds of the account digest. Grants are saved in `settings.toml`, so a guess at a proxy
-/// password from one should cost real work.
-const ACCOUNT_ROUNDS: u32 = 100_000;
+/// The private key of account digests, in the config directory.
+const ROUTE_KEY_FILE: &str = "proxy-route.key";
 
-/// `proxy` as pins and grants compare it: [`shown`], plus an opaque digest of its user info when
-/// it has any, so another account at one address is another route. The digest follows a `#`,
-/// which [`shown`] drops, and the credential itself is never kept.
-pub(crate) fn route_identity(proxy: &str) -> String {
-    let address = shown(proxy);
-    let user_info = proxy
-        .trim()
-        .parse::<Uri>()
-        .ok()
-        .and_then(|uri| Some(uri.authority()?.as_str().rsplit_once('@')?.0.to_owned()));
-    match user_info {
-        Some(user_info) if address != UNREADABLE => {
-            let mut digest = [0u8; 16];
-            ring::pbkdf2::derive(
-                ring::pbkdf2::PBKDF2_HMAC_SHA256,
-                std::num::NonZeroU32::new(ACCOUNT_ROUNDS).expect("not zero"),
-                format!("flint-proxy-account:{address}").as_bytes(),
-                user_info.as_bytes(),
-                &mut digest,
-            );
-            let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-            format!("{address}#{hex}")
+/// Marks an identity made without [`ROUTE_KEY_FILE`]: it holds for this process only.
+const UNKEYED: &str = "#unkeyed-";
+
+/// The config directory whose route key this process uses. Both the app and `flint mcp` set it
+/// at startup, so a grant made in one holds in the other.
+static ROUTE_KEY_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Uses the route key in `config_dir` from now on. The first call wins.
+pub(crate) fn use_route_key_in(config_dir: &Path) {
+    let _ = ROUTE_KEY_DIR.set(config_dir.to_owned());
+}
+
+/// The key in `config_dir`, made if it is missing. None if it can't be read or made.
+fn open_route_key(config_dir: &Path) -> Option<hmac::Key> {
+    match crate::activity::load_or_make_key(config_dir, ROUTE_KEY_FILE) {
+        Ok(secret) => Some(hmac::Key::new(hmac::HMAC_SHA256, &secret)),
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot read or make the proxy route key");
+            None
         }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`route_key`] fail on this thread, as an unreadable key file does.
+    static ROUTE_KEY_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// This process's route key, or None if it can't be had. Only test builds, which never run
+/// [`crate::bootstrap::bootstrap`], have a fixed one, and only while no directory is set.
+fn route_key() -> Option<hmac::Key> {
+    #[cfg(test)]
+    if ROUTE_KEY_FAILS.get() {
+        return None;
+    }
+    match ROUTE_KEY_DIR.get() {
+        Some(dir) => open_route_key(dir),
+        #[cfg(any(test, feature = "test-support"))]
+        None => Some(hmac::Key::new(hmac::HMAC_SHA256, &[7; 32])),
+        #[cfg(not(any(test, feature = "test-support")))]
+        None => None,
+    }
+}
+
+/// Refuses a proxy with an account while the route key can't be had: its route could not be told
+/// from another account's, so nothing is sent through it.
+pub(crate) fn check_account_key(proxy: &str) -> Result<(), ProxyRefused> {
+    check_account_key_with(proxy, route_key)
+}
+
+/// [`check_account_key`] under the key `key` gives, asked for only when `proxy` has an account.
+fn check_account_key_with(
+    proxy: &str,
+    key: impl FnOnce() -> Option<hmac::Key>,
+) -> Result<(), ProxyRefused> {
+    if account_of(proxy).is_some() && key().is_none() {
+        return Err(ProxyRefused::NoRouteKey);
+    }
+    Ok(())
+}
+
+/// The user info of `proxy`, if it has any.
+fn account_of(proxy: &str) -> Option<String> {
+    let uri = proxy.trim().parse::<Uri>().ok()?;
+    Some(uri.authority()?.as_str().rsplit_once('@')?.0.to_owned())
+}
+
+/// The first 128 bits of the keyed digest of an account at `address`, in hex.
+fn account_digest(key: &hmac::Key, address: &str, user_info: &str) -> String {
+    let message = format!("{address}\0{user_info}");
+    hmac::sign(key, message.as_bytes()).as_ref()[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// An identity for an account whose route key is unavailable: it tells accounts apart in this
+/// process, is the same across its reloads, and matches nothing saved or any other process.
+fn unkeyed_identity(address: &str, user_info: &str) -> String {
+    static PROCESS_KEY: OnceLock<Option<hmac::Key>> = OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let key = PROCESS_KEY
+        .get_or_init(|| hmac::Key::generate(hmac::HMAC_SHA256, &SystemRandom::new()).ok());
+    match key {
+        Some(key) => format!(
+            "{address}{UNKEYED}{}",
+            account_digest(key, address, user_info)
+        ),
+        // No random bytes: a new identity each time, so it can never compare equal.
+        None => format!("{address}{UNKEYED}{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+    }
+}
+
+/// Whether `identity`, from [`route_identity`], can hold a saved or granted route.
+pub(crate) fn is_stable_identity(identity: &str) -> bool {
+    !identity.contains(UNKEYED)
+}
+
+/// `proxy` as pins and grants compare it: [`shown`], plus an opaque keyed digest of its user info
+/// when it has any, so another account at one address is another route. The digest follows a
+/// `#`, which [`shown`] drops, and the credential itself is never kept.
+pub(crate) fn route_identity(proxy: &str) -> String {
+    route_identity_with(proxy, route_key)
+}
+
+/// [`route_identity`] under the key `key` gives, asked for only when `proxy` has an account.
+fn route_identity_with(proxy: &str, key: impl FnOnce() -> Option<hmac::Key>) -> String {
+    let address = shown(proxy);
+    match account_of(proxy) {
+        Some(user_info) if address != UNREADABLE => match key() {
+            Some(key) => format!("{address}#{}", account_digest(&key, &address, &user_info)),
+            None => unkeyed_identity(&address, &user_info),
+        },
         _ => address,
     }
 }
@@ -272,6 +367,11 @@ pub(crate) enum ProxyRefused {
     UnverifiedTls,
     #[error("the API server's address can't be read. Flint did not connect")]
     UnreadableServer,
+    #[error(
+        "Flint can't read or create its proxy key file, which a proxy with a user name needs. \
+         Check the permissions of Flint's config folder. Flint did not connect"
+    )]
+    NoRouteKey,
 }
 
 /// Refuses a tunnel to `server` unless its address is exact and verified TLS keeps its

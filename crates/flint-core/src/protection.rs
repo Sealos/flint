@@ -71,6 +71,10 @@ pub fn protection(
     let Some(server) = server else {
         return Protection::Protected;
     };
+    // A route with no stable identity can't be told from another: nothing holds for it.
+    if proxy_url.is_some_and(|proxy| !crate::connection::proxy::is_stable_identity(proxy)) {
+        return Protection::Protected;
+    }
     // Trust and unlocks hold for the route they were given on: another proxy voids them.
     let granted = crate::connection::proxy::grant_endpoint(server, proxy_url);
     if settings.trust(context, Some(&granted)).is_trusted() && !unlocks.trust_revoked(context) {

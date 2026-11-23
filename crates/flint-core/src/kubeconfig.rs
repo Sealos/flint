@@ -306,7 +306,7 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
         }
     }
     let environment = crate::connection::proxy::ProxyEnvironment::current();
-    // The digest is slow on purpose: once per distinct proxy URL in a load.
+    // Once per distinct proxy URL in a load, since each one with an account reads the route key.
     let mut identities: HashMap<String, String> = HashMap::new();
     for info in &mut contexts {
         let entry = info.cluster.as_ref().and_then(|cluster| {
