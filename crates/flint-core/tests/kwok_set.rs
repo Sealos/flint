@@ -7,15 +7,17 @@
 //!   cargo test --release -p flint-core --test kwok_set -- --ignored --nocapture
 //! ```
 //!
-//! It refuses any kubeconfig outside a `kwok-set` path, any context `kwok-set.sh` did not name, and
-//! any server that is not on loopback. Churn labels fixture pods through `kubectl` in child
-//! processes, so its cost is not counted as Flint's.
+//! It refuses any kubeconfig outside a `kwok-set` path or that is the default one, any context
+//! `kwok-set.sh` did not name, and any server that is not the loopback endpoint kwokctl records
+//! for that cluster. Churn labels fixture pods through `kubectl` in child processes, so its cost
+//! is not counted as Flint's.
 
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 use std::time::{Duration, Instant};
 
 use flint_core::handle::{Command, CoreConfig, CoreHandle, MemberStatus, Subscription};
+use flint_core::telemetry::KindCheck;
 use flint_core::{KindId, KindSnapshot, Settings, SyncState, WatchMode, kubeconfig};
 
 const FIXTURE_LABEL: &str = "kwok.x-k8s.io/kwokctl-scale";
@@ -30,6 +32,16 @@ fn env_number(name: &str, default: usize) -> usize {
         .map_or(default, |v| v.parse().unwrap_or_else(|_| panic!("{name}")))
 }
 
+/// `FLINT_KWOK_WATCH_MODE`: `all`, the default and the only mode that runs the telemetry feeds
+/// without an overview, or `on-view`.
+fn watch_mode() -> WatchMode {
+    match std::env::var("FLINT_KWOK_WATCH_MODE").as_deref() {
+        Err(_) | Ok("all") => WatchMode::All,
+        Ok("on-view") => WatchMode::OnView,
+        Ok(other) => panic!("FLINT_KWOK_WATCH_MODE: {other}"),
+    }
+}
+
 /// The scratch kubeconfig, refused unless it is plainly not a real one.
 fn scratch_kubeconfig() -> Option<PathBuf> {
     let raw = std::env::var_os("FLINT_KWOK_KUBECONFIG")?;
@@ -40,13 +52,38 @@ fn scratch_kubeconfig() -> Option<PathBuf> {
     );
     if let Some(home) = std::env::var_os("HOME") {
         let default = Path::new(&home).join(".kube/config");
-        assert_ne!(
-            Some(&path),
-            std::fs::canonicalize(default).ok().as_ref(),
+        assert!(
+            !same_file(&path, &default),
             "refusing the default kubeconfig"
         );
     }
     Some(path)
+}
+
+/// Whether both paths are one file, through symlinks and hard links. Reads metadata only. A
+/// missing `other` is a different file; any other failure refuses rather than guesses.
+fn same_file(path: &Path, other: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::fs::metadata(path).expect("the scratch kubeconfig is readable");
+    match std::fs::metadata(other) {
+        Ok(other) => path.dev() == other.dev() && path.ino() == other.ino(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => panic!("cannot compare with the default kubeconfig: {error}"),
+    }
+}
+
+#[test]
+fn a_hard_link_is_the_same_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("original");
+    let link = dir.path().join("link");
+    let different = dir.path().join("different");
+    std::fs::write(&original, "a").unwrap();
+    std::fs::write(&different, "a").unwrap();
+    std::fs::hard_link(&original, &link).unwrap();
+    assert!(same_file(&link, &original));
+    assert!(!same_file(&different, &original));
+    assert!(!same_file(&original, &dir.path().join("missing")));
 }
 
 fn is_kwok_context(name: &str) -> bool {
@@ -59,6 +96,66 @@ fn is_kwok_context(name: &str) -> bool {
     !id.is_empty()
         && id.bytes().all(|b| b.is_ascii_digit())
         && matches!(member, "1" | "2" | "3" | "4" | "5")
+}
+
+/// Whether `server` is a bare `http(s)://127.0.0.1:<port>` URL, with nothing else in it.
+fn is_loopback_server(server: &str) -> bool {
+    let Ok(uri) = server.parse::<http::Uri>() else {
+        return false;
+    };
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    matches!(uri.scheme_str(), Some("http" | "https"))
+        && !authority.as_str().contains('@')
+        && authority.host() == "127.0.0.1"
+        && authority.port_u16().is_some()
+        && uri.path() == "/"
+        && uri.query().is_none()
+}
+
+/// The API server kwokctl itself records for `cluster`. Its output holds credentials, so neither
+/// the output nor a parse error is ever printed.
+fn kwokctl_server(cluster: &str) -> String {
+    let out = Process::new("kwokctl")
+        .env_remove("KUBECONFIG")
+        .args(["--name", cluster, "get", "kubeconfig"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .expect("kwokctl starts");
+    assert!(out.status.success(), "kwokctl does not know {cluster}");
+    let config = std::str::from_utf8(&out.stdout)
+        .ok()
+        .and_then(|yaml| kube::config::Kubeconfig::from_yaml(yaml).ok())
+        .expect("kwokctl prints a kubeconfig");
+    let [entry] = config.clusters.as_slice() else {
+        panic!("kwokctl names one cluster for {cluster}");
+    };
+    entry
+        .cluster
+        .as_ref()
+        .and_then(|c| c.server.clone())
+        .expect("kwokctl names a server")
+}
+
+#[test]
+fn only_a_plain_loopback_url_is_a_loopback_server() {
+    for local in ["https://127.0.0.1:32766", "http://127.0.0.1:8080/"] {
+        assert!(is_loopback_server(local), "{local}");
+    }
+    for refused in [
+        "https://127.0.0.1:1@remote.example:6443",
+        "https://user@127.0.0.1:6443",
+        "https://127.0.0.1.remote.example:6443",
+        "https://127.0.0.1",
+        "https://127.0.0.1:6443/proxy",
+        "https://127.0.0.1:6443/?target=remote",
+        "ftp://127.0.0.1:6443",
+        "https://remote.example:6443",
+        "not a url",
+    ] {
+        assert!(!is_loopback_server(refused), "{refused}");
+    }
 }
 
 /// The first `count` contexts, all checked to be local kwok clusters.
@@ -76,17 +173,23 @@ fn member_contexts(path: &Path, count: usize) -> Vec<String> {
             .as_ref()
             .map(|c| c.cluster.as_str())
             .expect("a context names a cluster");
-        let server = loaded
+        let entry = loaded
             .merged
             .clusters
             .iter()
             .find(|c| c.name == cluster)
             .and_then(|c| c.cluster.as_ref())
-            .and_then(|c| c.server.as_deref())
-            .expect("a cluster has a server");
+            .expect("a context's cluster exists");
+        let server = entry.server.as_deref().expect("a cluster has a server");
         assert!(
-            server.starts_with("https://127.0.0.1:") || server.starts_with("http://127.0.0.1:"),
+            is_loopback_server(server),
             "refusing a server that is not on loopback"
+        );
+        assert!(entry.proxy_url.is_none(), "refusing a proxied server");
+        let kwok_name = named.name.strip_prefix("kwok-").expect("a kwok context");
+        assert!(
+            kwokctl_server(kwok_name) == server,
+            "refusing a server kwokctl does not record for {kwok_name}"
         );
         names.push(named.name.clone());
     }
@@ -188,6 +291,26 @@ async fn until(subscription: &mut Subscription, done: impl Fn(&KindSnapshot) -> 
     .expect("the member reached the state in time");
 }
 
+/// Waits until every member's feed has loaded and is watching all of its kinds.
+async fn until_feeds_current(core: &CoreHandle, contexts: &[String]) {
+    let current = |context: &String| {
+        core.telemetry(context).is_some_and(|feed| {
+            feed.snapshot
+                .kinds
+                .iter()
+                .all(|(_, check)| *check == KindCheck::Current)
+        })
+    };
+    let mut updates = core.telemetry_updates();
+    tokio::time::timeout(WAIT, async {
+        while !contexts.iter().all(current) {
+            assert!(updates.changed().await, "core stopped");
+        }
+    })
+    .await
+    .expect("every feed became current in time");
+}
+
 /// Labels `churn` fixture pods of one member with `value`, from child processes.
 fn start_churn(
     path: &Path,
@@ -232,6 +355,7 @@ async fn measure_running_set() {
     let member_count = env_number("FLINT_KWOK_MEMBERS", 5);
     let pods = env_number("FLINT_KWOK_PODS", 10_000);
     let churn = env_number("FLINT_KWOK_CHURN", 1000);
+    let mode = watch_mode();
     let contexts = member_contexts(&path, member_count);
     let dir = tempfile::tempdir().unwrap();
 
@@ -239,7 +363,7 @@ async fn measure_running_set() {
     let core = CoreHandle::start(CoreConfig {
         config_dir: dir.path().join("config"),
         settings: Settings {
-            watch_mode: WatchMode::OnView,
+            watch_mode: mode,
             ..Settings::default()
         },
         settings_error: None,
@@ -268,6 +392,15 @@ async fn measure_running_set() {
             s.state == SyncState::Synced && fixture_rows(s) >= pods
         })
         .await;
+        assert_eq!(
+            fixture_rows(&list.latest()),
+            pods,
+            "the fixture holds exactly FLINT_KWOK_PODS pods"
+        );
+    }
+    let lists_synced_after = started.elapsed();
+    if mode == WatchMode::All {
+        until_feeds_current(&core, &contexts).await;
     }
     let synced_after = started.elapsed();
     let cpu_sync = cpu_time() - cpu_start;
@@ -295,6 +428,8 @@ async fn measure_running_set() {
     for (context, list) in contexts.iter().zip(&mut lists) {
         children.extend(start_churn(&path, context, &list.latest(), churn, &value));
     }
+    // The cutoff is the pod lists. The feed's separate pod watch exposes no label or revision to
+    // wait on, so its remaining work can fall after this CPU sample.
     for list in &mut lists {
         until(list, |s| labelled(s, &value) >= churn).await;
     }
@@ -310,6 +445,8 @@ async fn measure_running_set() {
     eprintln!("--- kwok running set ---");
     eprintln!("members: {member_count}");
     eprintln!("fixture pods per member: {pods}; rows held: {rows}");
+    eprintln!("watch mode: {mode:?}");
+    eprintln!("pod lists synced after: {lists_synced_after:.2?}");
     eprintln!("all members synced after: {synced_after:.2?}");
     eprintln!("CPU for activation and initial lists: {cpu_sync:.2?}");
     eprintln!("RSS before start: {rss_idle:.0} MiB");
@@ -317,10 +454,10 @@ async fn measure_running_set() {
     eprintln!("RSS after {IDLE_WINDOW:?} idle: {rss_settled:.0} MiB");
     eprintln!("CPU over {IDLE_WINDOW:?} idle: {cpu_idle:.2?}");
     eprintln!(
-        "churn: {} label updates seen after {churn_seen:.2?}",
+        "churn: {} label updates seen by the pod lists after {churn_seen:.2?}",
         churn * member_count
     );
-    eprintln!("CPU during churn: {cpu_churn:.2?}");
+    eprintln!("CPU until the pod lists saw the churn: {cpu_churn:.2?}");
     eprintln!("RSS after churn: {rss_after_churn:.0} MiB");
     eprintln!("peak RSS of the process: {:.0} MiB", peak_rss_mib());
     eprintln!(
