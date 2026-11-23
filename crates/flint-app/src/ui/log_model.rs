@@ -311,28 +311,176 @@ pub struct ShownLine {
 /// `line` as shown with `view`: its search matches (in the prefix too, when the query searches
 /// sources and the prefix is shown), and at most `max_bytes` of its text (on a character
 /// boundary). A line without a timestamp gets blanks in its place, so the text lines up.
+#[cfg(test)]
 pub fn shown_line(
     line: &LogLine,
     view: LineView<'_>,
     query: &SearchQuery,
     max_bytes: Option<usize>,
 ) -> ShownLine {
+    shown_line_with(line, view, max_bytes, |short| LineMatches {
+        source: short.map_or_else(Vec::new, |short| source_matches(query, short, line)),
+        body: query.match_ranges(&line.text),
+    })
+}
+
+/// What a search found in one line, before it is laid out.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LineMatches {
+    /// In the short source label.
+    pub source: Vec<Range<usize>>,
+    /// In the whole message, so that `$` and `\b` see its real end when it is drawn clipped.
+    pub body: Vec<Range<usize>>,
+}
+
+/// Where `query` matches the short label `short` of `line`'s source. A match only in the part
+/// of the name the label leaves out marks the whole label.
+fn source_matches(query: &SearchQuery, short: &str, line: &LogLine) -> Vec<Range<usize>> {
+    if !query.sources {
+        return Vec::new();
+    }
+    let found = query.match_ranges(short);
+    if !found.is_empty() {
+        return found;
+    }
+    match &line.source {
+        Some(source) if !query.match_ranges(source.label()).is_empty() => {
+            std::iter::once(0..short.len()).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Most time a frame spends finding highlights, on top of the one search that crosses it.
+const HIGHLIGHT_FRAME_TIME: std::time::Duration = std::time::Duration::from_millis(4);
+/// Most lines whose highlights are kept: several screens of rows.
+const HIGHLIGHT_CACHE_LINES: usize = 1024;
+
+#[derive(Debug, Default)]
+struct CachedMatches {
+    /// With the short label they were found in: labels shorten as more pods are learned.
+    source: Option<(String, Vec<Range<usize>>)>,
+    body: Option<Vec<Range<usize>>>,
+}
+
+/// The search's matches in the lines drawn: found once per line and query, and for at most
+/// [`HIGHLIGHT_FRAME_TIME`] per frame. A row past that is drawn plain and asks for another frame.
+#[derive(Debug)]
+pub struct LineHighlights {
+    query: SearchQuery,
+    lines: std::collections::HashMap<flint_core::LineId, CachedMatches>,
+    budget: std::time::Duration,
+    spent: std::time::Duration,
+    /// A row went without its highlights this frame.
+    deferred: bool,
+    /// The next frame has been asked for.
+    redraw_asked: bool,
+}
+
+impl Default for LineHighlights {
+    fn default() -> Self {
+        LineHighlights {
+            query: SearchQuery::default(),
+            lines: Default::default(),
+            budget: HIGHLIGHT_FRAME_TIME,
+            spent: std::time::Duration::ZERO,
+            deferred: false,
+            redraw_asked: false,
+        }
+    }
+}
+
+impl LineHighlights {
+    pub fn begin_frame(&mut self) {
+        self.spent = std::time::Duration::ZERO;
+        self.deferred = false;
+        self.redraw_asked = false;
+    }
+
+    /// Whether to ask for another frame: once per frame, when a row went without highlights.
+    pub fn take_redraw(&mut self) -> bool {
+        let ask = self.deferred && !self.redraw_asked;
+        self.redraw_asked |= ask;
+        ask
+    }
+
+    /// What `query` found in line `id`, as far as this frame's budget reaches.
+    pub fn matches(
+        &mut self,
+        id: flint_core::LineId,
+        line: &LogLine,
+        query: &SearchQuery,
+        short: Option<&str>,
+    ) -> LineMatches {
+        if query.text.is_empty() {
+            return LineMatches::default();
+        }
+        if self.query != *query {
+            self.query = query.clone();
+            self.lines.clear();
+        }
+        if self.lines.len() >= HIGHLIGHT_CACHE_LINES && !self.lines.contains_key(&id) {
+            self.lines.clear();
+        }
+        let Self {
+            lines,
+            budget,
+            spent,
+            deferred,
+            ..
+        } = self;
+        let entry = lines.entry(id).or_default();
+        let mut find = |search: &dyn Fn() -> Vec<Range<usize>>| {
+            if *spent >= *budget {
+                *deferred = true;
+                return None;
+            }
+            let started = std::time::Instant::now();
+            let found = search();
+            *spent += started.elapsed();
+            Some(found)
+        };
+        if entry.body.is_none() {
+            entry.body = find(&|| query.match_ranges(&line.text));
+        }
+        let source = match short.filter(|_| query.sources) {
+            Some(short) => {
+                if entry.source.as_ref().is_none_or(|(s, _)| s != short) {
+                    entry.source = find(&|| source_matches(query, short, line))
+                        .map(|found| (short.to_owned(), found));
+                }
+                entry
+                    .source
+                    .as_ref()
+                    .map_or_else(Vec::new, |(_, found)| found.clone())
+            }
+            None => Vec::new(),
+        };
+        LineMatches {
+            source,
+            body: entry.body.clone().unwrap_or_default(),
+        }
+    }
+}
+
+/// `shown_line` with the matches from `find`, which is given the short source label when it is
+/// shown. Matches in the message are clipped to the part of it drawn.
+pub fn shown_line_with(
+    line: &LogLine,
+    view: LineView<'_>,
+    max_bytes: Option<usize>,
+    find: impl FnOnce(Option<&str>) -> LineMatches,
+) -> ShownLine {
+    let shown_source = line.source.as_ref().filter(|_| view.format.source);
+    let short = shown_source.map(|source| view.labels.short(source));
+    let found = find(short.as_deref());
     let mut text = String::new();
     let mut matches = Vec::new();
     let mut color = None;
-    if let Some(source) = line.source.as_ref().filter(|_| view.format.source) {
-        let short = view.labels.short(source);
+    if let (Some(source), Some(short)) = (shown_source, &short) {
         text.push('[');
-        if query.sources {
-            let found = query.match_ranges(&short);
-            if !found.is_empty() {
-                matches.extend(found.into_iter().map(|r| r.start + 1..r.end + 1));
-            } else if !query.match_ranges(source.label()).is_empty() {
-                // The match is in the part of the name the label leaves out: mark the label.
-                matches.push(1..1 + short.len());
-            }
-        }
-        text.push_str(&short);
+        matches.extend(found.source.iter().map(|r| r.start + 1..r.end + 1));
+        text.push_str(short);
         text.push(']');
         let pad = view.labels.width().saturating_sub(short.chars().count());
         text.extend(std::iter::repeat_n(' ', pad + 1));
@@ -361,10 +509,11 @@ pub fn shown_line(
     }
     text.push_str(body);
     matches.extend(
-        query
-            .match_ranges(body)
+        found
+            .body
             .into_iter()
-            .map(|r| r.start + prefix..r.end + prefix),
+            .filter(|r| r.start < body.len())
+            .map(|r| r.start + prefix..r.end.min(body.len()) + prefix),
     );
     ShownLine {
         text,
@@ -782,6 +931,7 @@ pub enum Toggle {
     Sources,
     Wrap,
     ErrorsOnly,
+    Regex,
     MatchingOnly,
     /// Lines of context around each row a filter shows.
     Context(usize),
@@ -817,6 +967,8 @@ pub struct MenuFacts {
     pub has_selection: bool,
     /// Only warnings and errors are shown.
     pub errors_only: bool,
+    /// The search is read as a regular expression.
+    pub regex: bool,
     /// Only the lines matching the search are shown.
     pub matching_only: bool,
     /// Lines of context, while a filter is on.
@@ -871,8 +1023,9 @@ pub fn more_menu(f: &MenuFacts) -> Vec<MenuRow> {
         f.errors_only,
         Toggle::ErrorsOnly,
     ));
-    // The search's toggle, which a narrow toolbar leaves out.
+    // The search's toggles, which a narrow toolbar leaves out.
     rows.push(MenuRow::Separator);
+    rows.push(toggle("Regex Search", f.regex, Toggle::Regex));
     rows.push(toggle(
         "Matching Lines Only",
         f.matching_only,
@@ -1574,6 +1727,63 @@ mod tests {
             ]
         );
         assert!(parts_in(&line_parts(&shown), shown.prefix..shown.text.len()).is_empty());
+    }
+
+    // covers UP-48: matches are found in the whole message, then clipped to what is drawn.
+    #[test]
+    fn highlights_of_a_clipped_line_come_from_the_whole_message() {
+        let format = LineFormat {
+            timestamps: false,
+            source: false,
+        };
+        let anchored = SearchQuery {
+            regex: true,
+            ..SearchQuery::new("Z$")
+        };
+        let clipped = LogLine::parse(&format!("{}Ztail", "a".repeat(9)), false);
+        assert!(
+            show(&clipped, format, &anchored, Some(10))
+                .matches
+                .is_empty()
+        );
+        let whole = LogLine::parse(&format!("{}Z", "a".repeat(9)), false);
+        let shown = show(&whole, format, &anchored, Some(10));
+        assert_eq!(shown.matches.as_slice(), std::slice::from_ref(&(9..10)));
+        let crossing = LogLine::parse("xxabcd", false);
+        let shown = show(&crossing, format, &SearchQuery::new("abc"), Some(4));
+        assert_eq!(shown.matches.as_slice(), std::slice::from_ref(&(2..4)));
+    }
+
+    // covers UP-48: a frame out of highlighting time draws the row plain and asks for another;
+    // what was found stays, per line and query.
+    #[test]
+    fn highlights_are_bounded_per_frame_and_kept_per_line() {
+        let line = LogLine::parse("find me", false);
+        let query = SearchQuery::new("find");
+        let mut highlights = LineHighlights {
+            budget: std::time::Duration::ZERO,
+            ..Default::default()
+        };
+        assert!(highlights.matches(1, &line, &query, None).body.is_empty());
+        assert!(highlights.take_redraw());
+        assert!(!highlights.take_redraw());
+
+        highlights.budget = std::time::Duration::from_secs(60);
+        highlights.begin_frame();
+        let found = std::slice::from_ref(&(0..4));
+        assert_eq!(highlights.matches(1, &line, &query, None).body, found);
+        assert!(!highlights.take_redraw());
+
+        // Kept: no budget is needed to draw it again.
+        highlights.budget = std::time::Duration::ZERO;
+        highlights.begin_frame();
+        assert_eq!(highlights.matches(1, &line, &query, None).body, found);
+        assert!(!highlights.take_redraw());
+
+        // Another query finds again.
+        let other = SearchQuery::new("me");
+        assert!(highlights.matches(1, &line, &other, None).body.is_empty());
+        assert!(highlights.take_redraw());
     }
 
     // covers UP-40: the toolbar stays one row, giving up parts as the tab narrows.
