@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use flint_core::activity::ActivityRecord;
 use flint_core::handle::{ActivationRefused, ReadPin};
+use flint_core::keep_watching::KeepWatchView;
 use flint_core::settings::{AiExposureState, AiScope, ClusterTag, TrustState};
 use flint_core::{
     Appearance, ClusterDiscovery, ClusterId, ClusterSummary, Command, ConnectionState, CoreHandle,
@@ -56,6 +57,8 @@ pub struct ClustersModel {
     pub agent_activity: Arc<Vec<ActivityRecord>>,
     /// The keys the log's servers are keyed by: none until the log is first read.
     pub activity_keys: flint_core::activity::ServerKeys,
+    /// Each cluster's keep-watching toggle, as the core last reported it.
+    keep_watching: Arc<std::collections::BTreeMap<ClusterId, KeepWatchView>>,
     /// The cluster to activate once kubeconfig is loaded (`FLINT_CLUSTER`). Taken on first load.
     startup_cluster: Option<String>,
     _events: Task<()>,
@@ -94,6 +97,7 @@ impl ClustersModel {
             ahead: HashMap::new(),
             agent_activity: Arc::default(),
             activity_keys: Default::default(),
+            keep_watching: Arc::default(),
             startup_cluster,
             _events: task,
         }
@@ -125,6 +129,7 @@ impl ClustersModel {
                     }
                 }
             }
+            Event::KeepWatchingChanged(views) => self.keep_watching = views,
             Event::ActiveChanged(active) => self.active = active,
             Event::ConnectionChanged { cluster, state } => {
                 if let Some(c) = self.clusters.iter_mut().find(|c| c.info.name == cluster) {
@@ -254,6 +259,19 @@ impl ClustersModel {
     /// removes it). Written to `settings.toml`; the change comes back as a settings event.
     pub fn set_watch_mode(&mut self, cluster: Option<ClusterId>, mode: Option<WatchMode>) {
         self.send(Command::SetWatchMode { cluster, mode });
+    }
+
+    /// `cluster`'s keep-watching toggle, once the core has reported it.
+    pub fn keep_watching(&self, cluster: &str) -> Option<&KeepWatchView> {
+        self.keep_watching.get(cluster)
+    }
+
+    /// Turns keeping `cluster` watched on for the `definition` confirmed, or off (`None`).
+    pub fn set_keep_watching(&mut self, cluster: ClusterId, definition: Option<u64>) {
+        self.send(Command::SetKeepWatching {
+            cluster,
+            definition,
+        });
     }
 
     /// What each cluster is called on screen.

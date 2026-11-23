@@ -46,6 +46,7 @@ enum Key {
     Settings,
     Discovery(ClusterId),
     Activity,
+    KeepWatching,
     /// Errors are not replaced: each has its own number.
     Error(u64),
 }
@@ -64,6 +65,7 @@ fn key(event: &Event, next_error: &mut u64) -> Key {
         Event::SettingsChanged { .. } => Key::Settings,
         Event::DiscoveryChanged { cluster, .. } => Key::Discovery(cluster.clone()),
         Event::AgentActivity(..) => Key::Activity,
+        Event::KeepWatchingChanged(_) => Key::KeepWatching,
         Event::Error(_) => {
             *next_error += 1;
             Key::Error(*next_error)

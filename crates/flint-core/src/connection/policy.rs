@@ -80,6 +80,20 @@ impl CredentialPolicy for ForegroundOnly {
     }
 }
 
+/// A cluster the person chose to keep watching: its credential runs in the background role only,
+/// so ending the access ends a running plugin. An auth provider's command can't be stopped once
+/// it runs, so it never runs here.
+pub(crate) struct KeptInBackground;
+
+impl CredentialPolicy for KeptInBackground {
+    fn may_run(&self, source: &CredentialSource, role: Role) -> bool {
+        role == Role::Background && *source != CredentialSource::AuthProvider
+    }
+}
+
+/// Told once when a kept connection's credential fails or is refused.
+pub(crate) type OnCredentialFailure = Arc<dyn Fn() + Send + Sync>;
+
 /// A policy and the current role of one connection. Clones share the role, so whoever holds one
 /// can change it while the connection is being made or used.
 #[derive(Clone)]
@@ -88,6 +102,8 @@ pub(crate) struct CredentialAccess {
     role: Arc<watch::Sender<RoleState>>,
     /// Asked right before a credential's program starts, for a caller whose answer takes a wait.
     launch_check: Option<SendCheck>,
+    /// Set for a kept connection: its first failure ends this access, so nothing retries.
+    on_failure: Option<OnCredentialFailure>,
 }
 
 impl CredentialAccess {
@@ -97,6 +113,35 @@ impl CredentialAccess {
             policy,
             role: Arc::new(role),
             launch_check: None,
+            on_failure: None,
+        }
+    }
+
+    /// Access for a connection kept in the background with the person's consent. The first
+    /// failure of its credential ends it and calls `on_failure`.
+    pub(crate) fn consented(on_failure: OnCredentialFailure) -> Self {
+        CredentialAccess {
+            on_failure: Some(on_failure),
+            ..Self::new(Arc::new(KeptInBackground), Role::Background)
+        }
+    }
+
+    /// Ends a kept connection's access after a failure, telling its owner the first time. Does
+    /// nothing for any other connection.
+    fn credential_failed(&self) {
+        let Some(on_failure) = &self.on_failure else {
+            return;
+        };
+        let first = self.role.send_if_modified(|state| {
+            let live = state.role != Role::Retired;
+            if live {
+                state.role = Role::Retired;
+                state.entered[Role::Retired as usize] += 1;
+            }
+            live
+        });
+        if first {
+            on_failure();
         }
     }
 
@@ -164,7 +209,18 @@ impl CredentialGrant {
     pub(crate) fn note_refused(&self) {
         if self.access.role.borrow().role != Role::Foreground {
             self.refused.store(true, Ordering::Relaxed);
+            self.access.credential_failed();
         }
+    }
+
+    /// A run of the credential's program failed.
+    pub(crate) fn note_failed(&self) {
+        self.access.credential_failed();
+    }
+
+    /// Whether the program gets no stdin at all: a kept connection nobody is looking at.
+    pub(crate) fn null_stdin(&self) -> bool {
+        self.access.on_failure.is_some()
     }
 
     /// Whether a 401 was recorded since this was last asked.
@@ -239,6 +295,16 @@ impl CredentialLease {
             Some(check) => check.refusal().await.err(),
             None => None,
         }
+    }
+
+    /// [`CredentialGrant::null_stdin`].
+    pub(crate) fn null_stdin(&self) -> bool {
+        self.grant.null_stdin()
+    }
+
+    /// [`CredentialGrant::note_failed`].
+    pub(crate) fn note_failed(&self) {
+        self.grant.note_failed();
     }
 
     /// Whether the credential behind this can be stopped by a role at all.

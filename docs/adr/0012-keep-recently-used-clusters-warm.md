@@ -38,6 +38,34 @@ time.
 - **MCP is not affected.** `flint mcp` is a separate process with its own connections. Warm stores in the app do not
   widen what an agent can read.
 
+## Amendment: keep watching a cluster (v0.6, #101)
+
+A cluster can be marked **keep watching**, from its sidebar menu or its overview. This is separate from the warm set
+above and replaces two of its rules for that cluster only: **No exec plugins in the background** and **Nothing on
+launch**.
+
+- **What it does.** A watched cluster runs one telemetry feed while it is not selected, so its overview data and
+  alerts stay current. Watched clusters start at launch; all others still load when opened. The toggle overrides
+  On view for that cluster. Alerts go through the existing alert center.
+- **Limit.** At most 32 clusters, the capacity of `TrendStore`. The 33rd is refused with a message.
+- **Read only.** The feed has its own connection with a read client and no write client. The slot's connection,
+  write credential and write gate are unchanged, so a background cluster gains no write path. `flint mcp` does not
+  read this setting.
+- **Consent for exec plugins.** Turning the toggle on for a cluster whose credential is an exec plugin is explicit
+  consent to run it in the background, after a confirmation that names the command. Consent is bound to the
+  context's confirmed definition: its user entry (command, arguments, environment) and cluster entry. After any
+  confirmed change it is void, stays void if the change is undone, and the toggle asks for confirmation again.
+  `settings.toml` holds a salted seal, not the definition.
+- **How a plugin runs.** With `interactive: false` and a null stdin, never in a terminal. A provisional or paused
+  context runs none. Turning the toggle off or removing the context kills a plugin that is running. Auth providers
+  are not eligible, because their command cannot be stopped once it starts.
+- **Failure.** The first failure of a plugin, or a 401, stops the feed with no retry and shows **sign-in needed**
+  until the person selects the cluster or changes the toggle. A credential that runs nothing retries a failed
+  connection after a minute.
+- **Last values.** A cluster that is unreachable or signed out keeps its last values in memory, marked with their
+  age. Nothing is written to disk ([ADR-0017](./0017-cluster-dashboards.md)).
+- **Sidebar.** Only "watching" or "sign-in needed". Health badges are deferred.
+
 ## Sidebar
 
 Each cluster is **active**, **warm** or **cold**. A badge adds **reconnecting**, **sign-in needed** or **error**

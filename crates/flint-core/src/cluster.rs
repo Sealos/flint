@@ -953,6 +953,39 @@ pub(crate) async fn connect_gated_and_check_with_policy(
     .await
 }
 
+/// A read-only client for `context` with `access` deciding whether its credential may run, and
+/// no write client at all: what a background feed connects with.
+pub(crate) async fn connect_read_only_with_policy(
+    kubeconfig: &Kubeconfig,
+    context: &str,
+    timeout: Duration,
+    access: &CredentialAccess,
+) -> Result<Client, ClusterError> {
+    bounded(kubeconfig, context, timeout, async {
+        let ready = prepare(kubeconfig, context, access).await?;
+        let target = ready.target;
+        let (config, token, grant) = (ready.config, ready.token, ready.grant);
+        let client = tokio::task::spawn_blocking(move || {
+            let auth = kube::client::ConfigExt::auth_layer(&config)?;
+            build_observed_client(
+                &config,
+                token,
+                auth.as_ref(),
+                None,
+                Access::ReadOnly,
+                Some(&grant),
+                None,
+            )
+        })
+        .await
+        .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
+        .map_err(|e| ClusterError::kube(e).for_target(&target))?;
+        server_version(&client).await?;
+        Ok(client)
+    })
+    .await
+}
+
 /// `attempt`, bounded by `timeout`, its error naming `context`'s server.
 async fn bounded<T>(
     kubeconfig: &Kubeconfig,

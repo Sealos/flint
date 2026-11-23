@@ -349,6 +349,15 @@ pub struct ExposeToAi {
     pub cluster: String,
 }
 
+/// Turn keeping a cluster watched in the background on or off. Turning it on for a cluster whose
+/// sign-in runs a command opens a confirmation naming that command.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = workspace, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct ToggleKeepWatching {
+    pub cluster: String,
+}
+
 /// Hide a cluster from AI agents, or remove a stale exposure.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
 #[action(namespace = workspace, no_json)]
@@ -2140,6 +2149,12 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::with_args::<ExposeToAi>(
             "Expose Cluster to AI…",
             "Let Flint's MCP server read a cluster, after a confirmation naming its server.",
+            CLUSTER,
+        )
+        .of(C::Cluster, S::Workspace),
+        Spec::with_args::<ToggleKeepWatching>(
+            "Keep Watching Cluster…",
+            "Gather overview data and alerts for a cluster while it is not selected, or stop.",
             CLUSTER,
         )
         .of(C::Cluster, S::Workspace),

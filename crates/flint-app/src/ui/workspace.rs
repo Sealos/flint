@@ -42,6 +42,7 @@ use super::dock::{self, Dock, DockEvent, DockItem as _, DockTab, TabKey};
 use super::dock_model::{LiveSessions, TabCluster, confirmed_servers};
 use super::focus::{cycle_focus_within, release_unfocused_input};
 use super::icons::FlintIcon;
+use super::keep_watching;
 use super::list::{ListEvent, ResourceList};
 use super::log_view::{LogRequest, LogView};
 use super::nav::{NavEvent, NavPanel};
@@ -51,8 +52,8 @@ use super::registry::{
     self, AddNamespace, BackToList, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, EditYaml,
     ExposeToAi, FocusFilter, HideFromAi, LockCluster, OnView, OpenClusterOverview, OpenObject,
     OpenView, RenameCluster, RetryConnection, SelectCluster, SelectRow, ShowAgentActivity,
-    ShowAllNamespaces, ToggleNamespace, TrustCluster, UnlockCluster, UntrustCluster,
-    UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
+    ShowAllNamespaces, ToggleKeepWatching, ToggleNamespace, TrustCluster, UnlockCluster,
+    UntrustCluster, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::resource_actions;
 use super::row_menu;
@@ -64,6 +65,7 @@ use super::theme;
 use super::ui_state::{self, UiState};
 use super::write_confirm;
 use flint_core::display::{self, ClusterNames};
+use flint_core::keep_watching::KeepWatching;
 use flint_core::settings::ClusterTag;
 
 /// The height of the main area's header and the list's toolbar.
@@ -1540,6 +1542,9 @@ impl Workspace {
                 model.writes_paused(cluster),
             );
             let ring = cursor.as_deref() == Some(cluster.info.name.as_str());
+            let keep = model
+                .keep_watching(&cluster.info.name)
+                .map_or(KeepWatching::Off, |view| view.status);
             list = list.child(self.render_cluster_row(
                 cluster,
                 (
@@ -1550,7 +1555,7 @@ impl Workspace {
                 ),
                 exposure,
                 protection,
-                (settings_ok, &names, model.cluster_tag(cluster)),
+                (settings_ok, &names, model.cluster_tag(cluster), keep),
                 theme,
             ));
         }
@@ -1617,7 +1622,7 @@ impl Workspace {
         (is_active, ring, presence, tooltip): (bool, bool, Presence<'_>, String),
         (exposure, ai_scope): (AiExposureState, Option<AiScope>),
         (protection, trust, writes_paused): (Protection, TrustState, bool),
-        (settings_ok, names, tag): (bool, &ClusterNames, Option<ClusterTag>),
+        (settings_ok, names, tag, keep): (bool, &ClusterNames, Option<ClusterTag>, KeepWatching),
         theme: &Theme,
     ) -> AnyElement {
         let name = cluster.info.name.clone();
@@ -1705,6 +1710,24 @@ impl Workspace {
                             .child(subtitle)
                             .test_support(),
                     )
+                    .when_some(keep_watching::badge(keep), |col, badge| {
+                        col.child(
+                            div()
+                                .id(SharedString::from(format!("cluster-watching-{name}")))
+                                .aria_label(badge)
+                                .pt_0p5()
+                                .flex()
+                                .child(if keep == KeepWatching::Watching {
+                                    Tag::secondary().outline().xsmall().child(badge)
+                                } else {
+                                    Tag::warning().outline().xsmall().child(badge)
+                                })
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(keep_watching::toggle_tip(keep)).build(window, cx)
+                                })
+                                .test_support(),
+                        )
+                    })
                     // On a line of its own, so it never takes the server's room.
                     .when(changed, |col| {
                         col.child(
@@ -1782,6 +1805,13 @@ impl Workspace {
             if !has_server {
                 return menu;
             }
+            let menu = menu.item(
+                PopupMenuItem::new(keep_watching::toggle_label(keep)).on_click(registry::on_click(
+                    ToggleKeepWatching {
+                        cluster: rename.clone(),
+                    },
+                )),
+            );
             cluster_tag::tag_submenu(menu, rename.clone(), endpoint, tag, window, cx)
         })
         .into_any_element()
@@ -1983,6 +2013,10 @@ impl Workspace {
         let watch_mode = controls
             .watch_mode
             .then(|| self.render_watch_mode(&name, two_rows, cx));
+        let keep_watching = self
+            .dashboard
+            .is_some()
+            .then(|| self.render_keep_watching(&name, cx));
         let alerts = super::alert_center::render_button(cx);
         let first_row = super::theme::moves_window(h_flex())
             .h(px(HEADER_HEIGHT))
@@ -2027,6 +2061,7 @@ impl Workspace {
                         .justify_end()
                         .child(access_mode)
                         .children(namespaces)
+                        .children(keep_watching)
                         .children(watch_mode)
                         .children(alerts)
                         .test_support(),
@@ -2039,10 +2074,29 @@ impl Workspace {
                 .border_color(theme.border)
                 .child(access_mode)
                 .children(namespaces)
+                .children(keep_watching)
                 .children(watch_mode)
                 .children(alerts)
                 .into_any_element()
         }
+    }
+
+    /// The overview's keep-watching toggle, saying what it would do and any state to act on.
+    fn render_keep_watching(&self, cluster: &str, cx: &Context<Self>) -> impl IntoElement {
+        let model = self.model.read(cx);
+        let status = model
+            .keep_watching(cluster)
+            .map_or(KeepWatching::Off, |view| view.status);
+        let settings_ok = model.settings_error.is_none();
+        Button::new("keep-watching")
+            .xsmall()
+            .ghost()
+            .label(keep_watching::toggle_label(status))
+            .tooltip(keep_watching::toggle_tip(status))
+            .disabled(!settings_ok)
+            .on_click(registry::on_click(ToggleKeepWatching {
+                cluster: cluster.to_owned(),
+            }))
     }
 
     /// The active cluster's access mode, in words, from the same check the sidebar's lock shows.

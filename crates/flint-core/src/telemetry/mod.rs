@@ -52,7 +52,6 @@ use crate::dashboard::{ProblemCounts, ProblemSnapshot, ProblemSummariser};
 use crate::metrics::MetricsError;
 use crate::metrics_trend::TrendStore;
 use crate::problems::{Problem, ProblemKind};
-use crate::protection::ClusterClients;
 
 pub(crate) use board::TelemetryBoard;
 pub use board::{ClusterTelemetry, TelemetryUpdates};
@@ -313,19 +312,17 @@ pub struct Telemetry {
 }
 
 impl Telemetry {
-    /// Starts the feed of `cluster` on the read client of a gated connection's `clients`. Must
-    /// run inside a tokio runtime. This cluster's series are removed from `trends` when the feed
-    /// stops, so a feed that replaces this one needs a store of its own. Every request goes
-    /// through `requests`.
+    /// Starts the feed of `cluster` on `client`, a read client. Must run inside a tokio runtime.
+    /// This cluster's series are removed from `trends` when the feed stops, so a feed that
+    /// replaces this one needs a store of its own. Every request goes through `requests`.
     pub(crate) fn start(
         cluster: Arc<str>,
-        clients: &ClusterClients,
+        client: kube::Client,
         target: Target,
         trends: Arc<Mutex<TrendStore>>,
         timing: TelemetryTiming,
         requests: RequestGate,
     ) -> Self {
-        let client = clients.read.clone();
         let shared = Arc::new(Shared {
             stores: Mutex::default(),
             metrics: Mutex::default(),
@@ -394,7 +391,11 @@ impl Telemetry {
     }
 
     /// Counts each change of this feed on `version`, for as long as the feed runs.
-    fn notify_changes(&mut self, version: watch::Sender<u64>) {
+    fn notify_changes(
+        &mut self,
+        version: watch::Sender<u64>,
+        last_good: Arc<Mutex<Option<Arc<TelemetrySnapshot>>>>,
+    ) {
         let (mut latest, mut side) = (self.latest.clone(), self.side.clone());
         self.tasks.spawn(async move {
             loop {
@@ -404,6 +405,15 @@ impl Telemetry {
                 };
                 if changed.is_err() {
                     return;
+                }
+                let snapshot = latest.borrow().clone();
+                if matches!(
+                    snapshot.availability,
+                    Availability::Checked | Availability::Partial
+                ) {
+                    *last_good
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
                 }
                 version.send_modify(|count| *count += 1);
             }
@@ -435,7 +445,7 @@ pub async fn start_for_tests(
     let target = Target::of(kubeconfig, context);
     Ok(Telemetry::start(
         context.into(),
-        &connection.clients,
+        connection.clients.read.clone(),
         target,
         trends,
         timing,

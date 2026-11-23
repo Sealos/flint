@@ -5,11 +5,31 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use jiff::Timestamp;
 use tokio::sync::watch;
 
-use super::{RequestGate, SideReads, Telemetry, TelemetrySnapshot};
-use crate::cluster::ClusterId;
+use super::{
+    Availability, CheckFailure, FailureCause, RequestGate, SideReads, Telemetry, TelemetrySnapshot,
+};
+use crate::cluster::{ClusterId, SafeErrorText};
 use crate::metrics_trend::TrendStore;
+
+/// `good` as last values: readable, its age said in the status, and worth no alert change, since
+/// a pass that could not check the cluster clears nothing and raises nothing.
+fn aged(good: &TelemetrySnapshot, reason: &str, now: Timestamp) -> Arc<TelemetrySnapshot> {
+    let minutes = now.duration_since(good.at).as_secs().max(0) / 60;
+    let age = match minutes {
+        0 => "under a minute old".to_owned(),
+        1 => "1 minute old".to_owned(),
+        minutes => format!("{minutes} minutes old"),
+    };
+    let mut snapshot = good.clone();
+    snapshot.availability = Availability::CannotBeChecked(Some(CheckFailure {
+        cause: FailureCause::Failed,
+        detail: SafeErrorText::reduced(&format!("{reason}; showing last values, {age}")),
+    }));
+    Arc::new(snapshot)
+}
 
 /// What is known about one cluster with a running feed.
 #[derive(Clone, Debug)]
@@ -44,17 +64,41 @@ struct Entry {
     latest: watch::Receiver<Arc<TelemetrySnapshot>>,
     side: watch::Receiver<SideReads>,
     trends: Arc<Mutex<TrendStore>>,
+    /// The newest pass that could read the cluster, for showing it with its age.
+    last_good: Arc<Mutex<Option<Arc<TelemetrySnapshot>>>>,
+    /// The feed has stopped: its last values stay, in memory only, until the entry is removed.
+    held: Option<SideReads>,
 }
 
 impl Entry {
-    /// `None` once the feed's tasks have ended, so a stopped feed is never read as live.
+    /// `None` once the feed's tasks have ended, so a stopped feed is never read as live. A feed
+    /// that can no longer read its cluster shows what it last read, with its age.
     fn read(&self) -> Option<ClusterTelemetry> {
-        self.latest.has_changed().ok()?;
-        Some(ClusterTelemetry {
-            snapshot: self.latest.borrow().clone(),
-            reads: self.side.borrow().clone(),
+        let last_good = || {
+            self.last_good
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        };
+        let telemetry = |snapshot, reads| ClusterTelemetry {
+            snapshot,
+            reads,
             trends: Arc::clone(&self.trends),
-        })
+        };
+        if let Some(reads) = &self.held {
+            let good = last_good()?;
+            let snapshot = aged(&good, "sign-in needed", Timestamp::now());
+            return Some(telemetry(snapshot, reads.clone()));
+        }
+        self.latest.has_changed().ok()?;
+        let latest = self.latest.borrow().clone();
+        let snapshot = match (&latest.availability, last_good()) {
+            (Availability::CannotBeChecked(_), Some(good)) => {
+                aged(&good, "cluster unreachable", Timestamp::now())
+            }
+            _ => latest,
+        };
+        Some(telemetry(snapshot, self.side.borrow().clone()))
     }
 }
 
@@ -98,13 +142,35 @@ impl TelemetryBoard {
         feed: &mut Telemetry,
         trends: Arc<Mutex<TrendStore>>,
     ) {
-        feed.notify_changes(self.version.clone());
+        let last_good = Arc::default();
+        feed.notify_changes(self.version.clone(), Arc::clone(&last_good));
         let entry = Entry {
             latest: feed.latest.clone(),
             side: feed.side.clone(),
             trends,
+            last_good,
+            held: None,
         };
         self.feeds().insert(cluster.to_owned(), entry);
+        self.bump();
+    }
+
+    /// Keeps `cluster`'s last values after its feed stops, or removes it if it read nothing yet.
+    pub(crate) fn hold(&self, cluster: &str) {
+        {
+            let mut feeds = self.feeds();
+            if let Some(entry) = feeds.get_mut(cluster) {
+                entry.held = Some(entry.side.borrow().clone());
+                let empty = entry
+                    .last_good
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_none();
+                if empty {
+                    feeds.remove(cluster);
+                }
+            }
+        }
         self.bump();
     }
 

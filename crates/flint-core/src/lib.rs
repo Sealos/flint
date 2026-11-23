@@ -25,6 +25,7 @@ pub mod events;
 pub mod exec;
 pub mod gitops;
 pub mod handle;
+pub mod keep_watching;
 pub mod kubeconfig;
 mod logging;
 pub mod logs;

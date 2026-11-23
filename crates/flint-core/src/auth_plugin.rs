@@ -230,7 +230,12 @@ async fn run(
     if interactive {
         cmd.stdin(Stdio::inherit()).stderr(Stdio::inherit());
     } else {
-        cmd.stdin(Stdio::piped()).stderr(Stdio::piped());
+        let stdin = if lease.null_stdin() {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        };
+        cmd.stdin(stdin).stderr(Stdio::piped());
     }
     cmd.stdout(Stdio::piped());
     let cluster = if exec.provide_cluster_info {
@@ -862,9 +867,16 @@ impl RefreshingToken {
                     Ok(token)
                 }
                 // kube's answer when a refresh no longer returns an expiring token.
-                Ok(Ok(_)) => Err(Arc::new(AuthError::UnrefreshableTokenResponse)),
-                Ok(Err(e)) => Err(Arc::new(e)),
+                Ok(Ok(_)) => {
+                    lease.note_failed();
+                    Err(Arc::new(AuthError::UnrefreshableTokenResponse))
+                }
+                Ok(Err(e)) => {
+                    lease.note_failed();
+                    Err(Arc::new(e))
+                }
                 Err(_) => {
+                    lease.note_failed();
                     if started && exec.interactive_mode != Some(ExecInteractiveMode::Never) {
                         state.resting = Some((
                             Instant::now() + PROMPT_BACK_OFF,

@@ -160,6 +160,14 @@ pub enum Command {
     /// [`CoreHandle::running_set`] says more. Removed members' watches stop. A list that cannot
     /// be a set changes nothing and is reported as [`Event::Error`]. Grants no write access.
     SetRunningSet(Vec<ClusterId>),
+    /// Keep watching `cluster` in the background (ADR-0012), or stop (`definition: None`).
+    /// `definition` is the [`KeepWatchView::definition`](crate::keep_watching::KeepWatchView)
+    /// the confirmation showed: if the context has changed since, nothing is written and an
+    /// error is reported.
+    SetKeepWatching {
+        cluster: ClusterId,
+        definition: Option<u64>,
+    },
 }
 
 /// What a member of the running set is doing.
@@ -237,6 +245,12 @@ impl AdmittedMember {
 
 /// Requests that carry a reply channel or come from a [`Subscription`].
 pub(crate) enum Request {
+    /// Each cluster's keep-watching toggle.
+    KeepWatching {
+        reply: oneshot::Sender<
+            std::collections::BTreeMap<ClusterId, crate::keep_watching::KeepWatchView>,
+        >,
+    },
     /// Each member of the running set and its state.
     RunningSet {
         reply: oneshot::Sender<Vec<MemberReport>>,
@@ -500,6 +514,10 @@ pub struct ClustersSnapshot {
 #[derive(Debug, Clone)]
 pub enum Event {
     ClustersChanged(Arc<ClustersSnapshot>),
+    /// Each cluster's keep-watching toggle, when any of them changed.
+    KeepWatchingChanged(
+        Arc<std::collections::BTreeMap<ClusterId, crate::keep_watching::KeepWatchView>>,
+    ),
     ActiveChanged(Option<ClusterId>),
     ConnectionChanged {
         cluster: ClusterId,
@@ -618,10 +636,23 @@ impl CoreHandle {
         async move { rx.await.unwrap_or_default() }
     }
 
-    /// What the running feed of `cluster` knows. `None` while it has no feed: it is neither
+    /// Each cluster's keep-watching toggle. Empty if the core stopped.
+    pub fn keep_watching(
+        &self,
+    ) -> impl Future<
+        Output = std::collections::BTreeMap<ClusterId, crate::keep_watching::KeepWatchView>,
+    > + Send
+    + 'static {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.requests.try_send(Request::KeepWatching { reply });
+        async move { rx.await.unwrap_or_default() }
+    }
+
+    /// What the feed of `cluster` knows. `None` while it has none: it is neither kept watching,
     /// selected nor in the running set, is in watch mode On view with no overview showing, is not
-    /// connected, is paused, or its sign-in runs a program and it is in the background. Never
-    /// blocks.
+    /// connected, is paused, or its sign-in runs a program and it is in the background without
+    /// consent. A kept cluster that stopped or can't be reached shows its last values, with
+    /// their age in the status. Never blocks.
     pub fn telemetry(&self, cluster: &str) -> Option<crate::telemetry::ClusterTelemetry> {
         self.telemetry.get(cluster)
     }

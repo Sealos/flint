@@ -708,7 +708,7 @@ impl AlertCenter {
                     label,
                     reading: reading(
                         summary,
-                        model.settings.watch_mode_for(id),
+                        model.settings.alert_mode_for(id),
                         snapshot,
                         discovery,
                     ),
