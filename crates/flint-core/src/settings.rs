@@ -142,6 +142,15 @@ pub struct TaggedCluster {
     pub tag: ClusterTag,
 }
 
+/// Whether a context at one API server posts desktop alerts, whatever the global setting. A
+/// context re-pointed elsewhere follows the global setting, and this applies again back here.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ClusterAlerts {
+    pub context: String,
+    pub server: String,
+    pub enabled: bool,
+}
+
 /// One cluster the user exposed to AI agents (ADR-0009), pinned to its server like a
 /// [`ClusterPin`], and what agents may read of it (ADR-0013). An entry written before scopes
 /// existed has neither list, and exposes the whole cluster as it did.
@@ -380,6 +389,14 @@ pub struct Settings {
     /// Post a desktop notification when a watched cluster has a new problem (#210). Off by
     /// default. Covers only clusters with a telemetry feed, which watch mode On view never has.
     pub desktop_notifications: bool,
+    /// Per-cluster choices that override `desktop_notifications`, per context and server. Read
+    /// them through [`Settings::alerts_on`]. An entry this version cannot read counts as no
+    /// choice, and stays in the file.
+    #[serde(
+        deserialize_with = "readable_cluster_alerts",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub cluster_alerts: Vec<ClusterAlerts>,
 }
 
 impl Default for Settings {
@@ -402,6 +419,7 @@ impl Default for Settings {
             log_buffer_mib: DEFAULT_LOG_BUFFER_MIB,
             log_total_mib: DEFAULT_LOG_TOTAL_MIB,
             desktop_notifications: false,
+            cluster_alerts: Vec::new(),
         }
     }
 }
@@ -494,6 +512,21 @@ impl Settings {
             .map(|e| e.tag)
     }
 
+    /// This cluster's own alert choice, if it has one at `server`.
+    pub fn cluster_alerts_choice(&self, context: &str, server: Option<&str>) -> Option<bool> {
+        let server = server?;
+        self.cluster_alerts
+            .iter()
+            .find(|e| e.context == context && same_server(&e.server, server))
+            .map(|e| e.enabled)
+    }
+
+    /// Whether `context` at `server` posts desktop alerts: its own choice, else the global one.
+    pub fn alerts_on(&self, context: &str, server: Option<&str>) -> bool {
+        self.cluster_alerts_choice(context, server)
+            .unwrap_or(self.desktop_notifications)
+    }
+
     /// The dashboard thresholds in force for `context` at `server`. A context with no server gets
     /// the global values.
     pub fn thresholds_for(&self, context: &str, server: Option<&str>) -> Thresholds {
@@ -528,6 +561,20 @@ impl Settings {
 fn readable_cluster_tags<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<TaggedCluster>, D::Error> {
+    let toml::Value::Array(entries) = toml::Value::deserialize(deserializer)? else {
+        return Ok(Vec::new());
+    };
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| entry.try_into().ok())
+        .collect())
+}
+
+/// The entries of `cluster_alerts` this version can read. A malformed entry is no choice, and
+/// never makes the settings file unreadable.
+fn readable_cluster_alerts<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<ClusterAlerts>, D::Error> {
     let toml::Value::Array(entries) = toml::Value::deserialize(deserializer)? else {
         return Ok(Vec::new());
     };
@@ -723,6 +770,7 @@ const SETTINGS_KEYS: &[&str] = &[
     "log_buffer_mib",
     "log_total_mib",
     "desktop_notifications",
+    "cluster_alerts",
 ];
 
 /// The keys of `table` that are not settings but look like a misspelt one (at most two edits
@@ -1165,6 +1213,49 @@ pub fn set_desktop_notifications(dir: &Path, enabled: bool) -> Result<Settings, 
     })
 }
 
+/// Sets whether `context` at `server` posts desktop alerts (`None` follows the global setting)
+/// and writes `settings.toml`. Clearing what is not set writes nothing. Returns the settings as
+/// written.
+pub fn set_cluster_alerts(
+    dir: &Path,
+    context: &str,
+    server: &str,
+    enabled: Option<bool>,
+) -> Result<Settings, SettingsError> {
+    let is_this = |entry: &toml::Value| {
+        let field = |key| entry.get(key).and_then(toml::Value::as_str);
+        field("context") == Some(context) && field("server").is_some_and(|s| same_server(s, server))
+    };
+    if enabled.is_none() {
+        let table: toml::Table = load_toml(&dir.join(SETTINGS_FILE))?;
+        let chosen = table
+            .get("cluster_alerts")
+            .and_then(toml::Value::as_array)
+            .is_some_and(|entries| entries.iter().any(is_this));
+        if !chosen {
+            return load_settings(dir);
+        }
+    }
+    edit_settings(dir, |table, _| {
+        let mut entries = match table.remove("cluster_alerts") {
+            Some(toml::Value::Array(entries)) => entries,
+            _ => Vec::new(),
+        };
+        entries.retain(|entry| !is_this(entry));
+        if let Some(enabled) = enabled {
+            entries.push(toml::Value::try_from(ClusterAlerts {
+                context: context.to_owned(),
+                server: server.to_owned(),
+                enabled,
+            })?);
+        }
+        if !entries.is_empty() {
+            table.insert("cluster_alerts".into(), toml::Value::Array(entries));
+        }
+        Ok(())
+    })
+}
+
 /// Sets the lines each log session keeps and writes `settings.toml`. Returns the settings as
 /// written.
 pub fn set_log_buffer_lines(dir: &Path, lines: u32) -> Result<Settings, SettingsError> {
@@ -1209,6 +1300,34 @@ pub(crate) fn edit_settings_if_changed(
 ) -> Result<Settings, SettingsError> {
     let path = dir.join(SETTINGS_FILE);
     let lock = lock_for_save(&path, try_flock)?;
+    edit_locked(&path, &lock, edit)
+}
+
+/// [`edit_settings_if_changed`] that refuses to go on without a real lock: for an edit that is no
+/// revocation, where failing is safer than overwriting a concurrent save.
+pub(crate) fn edit_settings_locked(
+    dir: &Path,
+    edit: impl FnOnce(&mut toml::Table, &Path) -> Result<bool, SettingsError>,
+) -> Result<Settings, SettingsError> {
+    edit_settings_locked_with(dir, try_flock, edit)
+}
+
+fn edit_settings_locked_with(
+    dir: &Path,
+    try_lock: TryLock,
+    edit: impl FnOnce(&mut toml::Table, &Path) -> Result<bool, SettingsError>,
+) -> Result<Settings, SettingsError> {
+    let path = dir.join(SETTINGS_FILE);
+    let lock = lock_for_save(&path, try_lock)?;
+    if lock.file.is_none() {
+        return Err(SettingsError::Write {
+            path,
+            source: io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this folder does not support file locks",
+            ),
+        });
+    }
     edit_locked(&path, &lock, edit)
 }
 
@@ -1773,6 +1892,21 @@ mod save_lock_tests {
         assert!(matches!(result, Err(SettingsError::Write { .. })));
         assert_eq!(std::fs::read_to_string(&old).unwrap(), old_text);
         assert_eq!(std::fs::read_to_string(&new).unwrap(), new_text);
+    }
+
+    #[test]
+    fn an_edit_that_needs_a_lock_is_refused_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = edit_settings_locked_with(
+            dir.path(),
+            |_| Err(io::Error::from_raw_os_error(libc::ENOLCK)),
+            |table, _| {
+                table.insert("protect_local_clusters".into(), true.into());
+                Ok(true)
+            },
+        );
+        assert!(matches!(result, Err(SettingsError::Write { .. })));
+        assert!(!dir.path().join(SETTINGS_FILE).exists(), "nothing written");
     }
 
     #[test]
@@ -3146,6 +3280,42 @@ mod tests {
 
     // covers UP-25
     #[test]
+    fn a_cluster_alert_choice_overrides_the_global_one_at_its_server() {
+        const SERVER: &str = "https://prod.example:6443";
+        let dir = tempfile::tempdir().unwrap();
+        let on = set_cluster_alerts(dir.path(), "prod", SERVER, Some(true)).unwrap();
+        assert!(on.alerts_on("prod", Some("https://prod.example:6443/")));
+        assert!(!on.alerts_on("prod", Some("https://other.example:6443")));
+        assert!(!on.alerts_on("prod", None));
+        assert!(!on.alerts_on("dev", Some(SERVER)));
+
+        set_desktop_notifications(dir.path(), true).unwrap();
+        let off = set_cluster_alerts(dir.path(), "prod", SERVER, Some(false)).unwrap();
+        assert_eq!(off.cluster_alerts.len(), 1);
+        assert!(!off.alerts_on("prod", Some(SERVER)));
+        assert!(off.alerts_on("prod", Some("https://other.example:6443")));
+        assert!(off.alerts_on("dev", Some(SERVER)));
+        assert_eq!(load_settings(dir.path()).unwrap(), off);
+
+        let cleared = set_cluster_alerts(dir.path(), "prod", SERVER, None).unwrap();
+        assert!(cleared.cluster_alerts.is_empty());
+        assert!(cleared.alerts_on("prod", Some(SERVER)));
+    }
+
+    #[test]
+    fn malformed_cluster_alerts_are_no_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "desktop_notifications = true\n[[cluster_alerts]]\ncontext = \"prod\"\n",
+        )
+        .unwrap();
+        let settings = load_settings(dir.path()).unwrap();
+        assert!(settings.cluster_alerts.is_empty());
+        assert!(settings.alerts_on("prod", Some("https://prod.example:6443")));
+    }
+
+    #[test]
     fn desktop_notifications_are_off_until_turned_on() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!Settings::default().desktop_notifications);
@@ -3271,6 +3441,10 @@ server = "https://staging.example:6443"
             (
                 "set_cluster_tag",
                 set_cluster_tag(dir, "staging", server, Some(ClusterTag::Blue)).is_err(),
+            ),
+            (
+                "set_cluster_alerts",
+                set_cluster_alerts(dir, "staging", server, Some(true)).is_err(),
             ),
             (
                 "set_appearance",

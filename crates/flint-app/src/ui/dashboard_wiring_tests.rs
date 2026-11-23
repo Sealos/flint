@@ -163,6 +163,41 @@ fn short_workloads_list_only_what_the_tile_counted() {
 }
 
 #[gpui_kit::test]
+async fn an_opened_alert_shows_the_overview_only_on_its_own_cluster(cx: &mut TestAppContext) {
+    use super::alert_center::{AlertCenter, Alerts};
+    use crate::notifications::FreedesktopSender;
+    use gpui_kit::AppContext as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    cx.run_until_parked();
+    let model = t.model.clone();
+    let center = cx.update(|cx| {
+        let center = cx.new(|cx| AlertCenter::new(model, Arc::new(FreedesktopSender), cx));
+        cx.set_global(Alerts(center.clone()));
+        center
+    });
+    let generation = t.model.read_with(cx, |model, _| {
+        model.active_cluster().expect("alpha is active").generation
+    });
+    let ask = |cx: &mut TestAppContext, context: &'static str, generation: u64| {
+        center.update(cx, |center, _| center.want_overview(context, generation));
+        t.model.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+    };
+
+    ask(cx, "kind-beta", generation);
+    assert!(dashboard(cx, &t).is_none(), "another cluster's alert");
+    ask(cx, "kind-alpha", generation + 1);
+    assert!(dashboard(cx, &t).is_none(), "a re-pointed cluster's alert");
+
+    ask(cx, "kind-alpha", generation);
+    assert!(dashboard(cx, &t).is_some(), "the active cluster's alert");
+    assert!(center.read_with(cx, |center, _| center.wanted_overview().is_none()));
+}
+
+#[gpui_kit::test]
 async fn each_counted_kind_opens_its_own_list(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;

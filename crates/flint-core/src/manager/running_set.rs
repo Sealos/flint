@@ -182,19 +182,62 @@ impl ClusterManager {
     }
 
     /// Subscribes to `kind` on `member`, in one step with checking it still holds: a member that
-    /// changed starts no LIST or watch. Its subscription just never gets rows.
+    /// changed, or a handle bound to another context, starts no LIST or watch and gets no rows.
     pub(super) fn subscribe_member(
         &mut self,
         id: u64,
+        cluster: &str,
         member: AdmittedMember,
         kind: crate::KindId,
+        feed: crate::watch::MemberFeed,
     ) {
-        if self.member_changed(&member).is_some() {
+        self.member_feeds.insert(id, feed.clone());
+        if member.context() != cluster || self.member_changed(&member).is_some() {
             return;
         }
-        let cluster = member.pin.context.clone();
-        self.subscriptions.insert(id, (cluster.clone(), kind));
-        self.reconcile(&cluster);
+        self.hubs.attach_member(cluster, &kind, id, feed);
+        self.subscriptions
+            .insert(id, (cluster.to_owned(), kind, Some(member)));
+        self.reconcile(cluster);
+    }
+
+    /// Cuts the subscriptions whose member changed off from their hubs for good, on `only` or on
+    /// every context, and ends their interest in the kind: a member that moves back does not
+    /// bring them back. Returns the contexts that lost one, whose watches need reconciling.
+    pub(super) fn cut_off_changed_members(&mut self, only: Option<&str>) -> Vec<ClusterId> {
+        let changed: Vec<u64> = self
+            .subscriptions
+            .iter()
+            .filter(|(_, (context, _, member))| {
+                only.is_none_or(|c| c == context)
+                    && member
+                        .as_ref()
+                        .is_some_and(|m| self.member_changed(m).is_some())
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let mut contexts = Vec::new();
+        for id in changed {
+            let Some((context, kind, _)) = self.subscriptions.remove(&id) else {
+                continue;
+            };
+            self.hubs.detach_member(&context, &kind, id);
+            self.release_hub_if_unwatched(&context, &kind);
+            if !contexts.contains(&context) {
+                contexts.push(context);
+            }
+        }
+        contexts
+    }
+
+    /// Forgets the hub of `kind` if no watch runs for it and nobody reads it.
+    pub(super) fn release_hub_if_unwatched(&self, cluster: &str, kind: &crate::KindId) {
+        let running = self
+            .cluster(cluster)
+            .is_some_and(|slot| slot.watches.is_running(kind));
+        if !running {
+            self.hubs.release(cluster, kind);
+        }
     }
 
     /// The read client of `member`, checked in the same step as it is taken.
