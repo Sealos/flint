@@ -2014,6 +2014,7 @@ dependencies = [
  "alacritty_terminal",
  "async-channel",
  "base64 0.22.1",
+ "crossbeam-queue",
  "flint-core",
  "futures",
  "http",

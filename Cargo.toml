@@ -27,6 +27,8 @@ futures = { version = "0.3.34", default-features = false, features = ["std"] }
 libc = "0.2.191"
 # Already in the tree (through kube, tokio and GPUI); finds search matches in log lines.
 memchr = "2.8.3"
+# Already in the tree; the recordings writer's bounded lock-free queue.
+crossbeam-queue = "0.3.14"
 # Already in the tree (through kube and GPUI); credential redaction for text served to agents.
 regex = "1.13.2"
 aho-corasick = "1.1.5"

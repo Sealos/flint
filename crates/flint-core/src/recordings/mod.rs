@@ -8,7 +8,8 @@
 //! [`ConnectionIdentity`], which covers the whole connection definition. A context that is
 //! re-pointed has a new identity, so it is off again and can never add to the old recording.
 //!
-//! Credentials are replaced before a row is written, in [`Store::append`], the one way in.
+//! Credentials are replaced before a row is written, in [`Store::append`], the one way in. After
+//! any loss in a log stream, that [`LogSource`] stores only a gap marker until the stream restarts.
 
 mod identity;
 mod schema;
@@ -19,6 +20,7 @@ mod store_tests;
 mod writer;
 
 pub use identity::ConnectionIdentity;
+pub use scrub::LogSource;
 pub use store::{
     Appended, Batch, DATABASE_FILE, EventKind, EventRow, GapReason, LogRow, RecordingError,
     RecordingId, RecordingInfo, RecordingTarget, Retention, SampleRow, Store,

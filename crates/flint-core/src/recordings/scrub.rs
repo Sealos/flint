@@ -1,213 +1,258 @@
-//! Replaces credentials in text before it is stored.
+//! Replaces credentials in text before it is stored, and stops storing a log stream after a loss.
 //!
 //! [`redact_credentials`] sees one log line at a time here, so what spans lines looks like
-//! nothing on its own: the body of a private key, or the items of a pretty-printed cookie array.
-//! The scrubber remembers, per source, that such a block is open and withholds its lines until
-//! the block ends.
+//! nothing on its own: a PEM body, the items of a pretty-printed cookie array, or a value on the
+//! line after its key. A [`LogSource`] remembers that for one run of one container's stream.
+//!
+//! Recordings fail closed (ADR-0018). Once a row of a run is cut, clipped, dropped or arrives out
+//! of order, nothing can say what the following lines are, so the run stores no more text. Only a
+//! new [`LogSource`], made when the stream really restarts, stores text again. Nothing in a line
+//! can end that state.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use regex::Regex;
 
+use super::store::{LogRow, MAX_NAME_BYTES, clipped};
 use crate::redact::redact_credentials;
 
-const KEY_MARKER: &str = "[REDACTED:private-key]";
+const PEM_MARKER: &str = "[REDACTED:private-key]";
 const COOKIE_MARKER: &str = "[REDACTED:cookie]";
-const CUT_MARKER: &str = "[REDACTED:cut-off]";
+const VALUE_MARKER: &str = "[REDACTED:value]";
+/// What is stored in place of a record that was cut.
+pub(super) const CUT_MARKER: &str = "[REDACTED:cut-off]";
+/// No sequence number has been lost.
+const NO_LOSS: u64 = u64::MAX;
+/// Stands for a value when asking the redaction rules whether a word is a credential's key.
+const PROBE_VALUE: &str = "flintprobevalue0123456789";
 
-/// How many lines an unterminated block withholds. A 16384-bit PEM key is about 65 lines.
-const MAX_BLOCK_LINES: u16 = 512;
-
-/// How many sources can have a block open. A block past it withholds its whole recording, so a
-/// flood of key headers costs lines rather than memory or a leak.
-const MAX_OPEN_BLOCKS: usize = 4096;
-
-static BLOCK_BEGIN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----").unwrap());
-static BLOCK_END: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----").unwrap());
+static PEM_BEGIN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"-----BEGIN ([A-Z0-9 ]+)-----").unwrap());
+static PEM_END: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"-----END ([A-Z0-9 ]+)-----").unwrap());
 static COOKIE_ARRAY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)"(?:set-)?cookie"[ \t]*:[ \t]*\[[ \t]*\r?$"#).unwrap());
-
-/// Whether `text` may open a block: cheap enough for a caller's own thread.
-pub(super) fn may_open_block(text: &str) -> bool {
-    memchr::memmem::find(text.as_bytes(), b"PRIVATE KEY").is_some()
-        || text.trim_end().ends_with('[')
-}
 
 /// Text with its credentials replaced.
 pub(super) fn scrub(text: &str) -> String {
     redact_credentials(text).text.into_owned()
 }
 
-/// Where the last complete field of `text` ends: after the last space or comma outside a quoted
-/// value. One forward scan.
-fn complete_prefix(text: &str) -> usize {
-    let (mut end, mut quote, mut escaped, mut before) = (0, None, false, b' ');
-    for (at, &byte) in text.as_bytes().iter().enumerate() {
-        match quote {
-            Some(open) => {
-                if escaped {
-                    escaped = false;
-                } else if byte == b'\\' {
-                    escaped = true;
-                } else if byte == open {
-                    quote = None;
-                }
-            }
-            None if byte == b'"' => quote = Some(byte),
-            // An apostrophe in prose opens nothing; one right after a key does.
-            None if byte == b'\'' && matches!(before, b'=' | b':') => quote = Some(byte),
-            None if byte.is_ascii_whitespace() || byte == b',' => end = at + 1,
-            None => {}
-        }
-        if !byte.is_ascii_whitespace() {
-            before = byte;
-        }
+/// Where the footer of a PEM block labelled `label` ends in `text`.
+fn pem_end(text: &str, label: &str) -> Option<usize> {
+    PEM_END
+        .captures_iter(text)
+        .find(|end| &end[1] == label)
+        .and_then(|end| end.get(0))
+        .map(|end| end.end())
+}
+
+/// Whether `line` ends in a credential's key, so that its value is on the next line.
+fn ends_in_credential_key(line: &str) -> bool {
+    let Some(word) = line.split_whitespace().next_back() else {
+        return false;
+    };
+    if !(word.ends_with([':', '=']) || word.starts_with('-')) {
+        return false;
     }
-    end
+    !redact_credentials(&format!("{word} {PROBE_VALUE}"))
+        .text
+        .contains(PROBE_VALUE)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Block {
-    Key,
+    /// A PEM body, up to the footer with this label.
+    Pem(String),
     Cookies,
-    /// A line that may have opened a block was lost: nothing here can say where it ends.
-    Lost,
+    /// The next line holds a credential's value.
+    Value,
 }
 
-struct Open {
-    block: Block,
-    left: u16,
-}
-
-type Source = (i64, String, String);
-
+/// What only the writer touches.
 #[derive(Default)]
-pub(super) struct Scrubber {
-    open: HashMap<Source, Open>,
-    /// Recordings past [`MAX_OPEN_BLOCKS`]: all their lines are withheld until they end.
-    sealed: HashSet<i64>,
+struct RunState {
+    expected: u64,
+    block: Option<Block>,
+    /// The gap marker's row, and the count it shows.
+    marker: Option<i64>,
+    marked: u64,
 }
 
-impl Scrubber {
-    /// The stored form of one log line of `pod`/`container`.
-    pub(super) fn line(
-        &mut self,
-        recording: i64,
-        pod: &str,
-        container: &str,
-        text: &str,
-    ) -> String {
-        if self.sealed.contains(&recording) {
-            return KEY_MARKER.to_owned();
-        }
-        let source = (recording, pod.to_owned(), container.to_owned());
-        let current = self.open.get(&source).map(|open| open.block);
-        if current == Some(Block::Key) {
-            if let Some(end) = BLOCK_END.find(text) {
-                self.open.remove(&source);
-                let rest = self.line(recording, pod, container, &text[end.end()..]);
-                return format!("{KEY_MARKER}{rest}");
-            }
-            self.tick(&source);
-            return KEY_MARKER.to_owned();
-        }
-        if may_open_block(text) {
-            if let Some(begin) = BLOCK_BEGIN.find_iter(text).last()
-                && !BLOCK_END.is_match(&text[begin.end()..])
-            {
-                self.begin(source, Block::Key);
-                return match current {
-                    Some(_) => KEY_MARKER.to_owned(),
-                    None => format!("{}{KEY_MARKER}", scrub(&text[..begin.start()])),
-                };
-            }
-            // A quarantine knows nothing of what it covers, so a cookie array cannot end it.
-            if current != Some(Block::Lost) && COOKIE_ARRAY.is_match(text) {
-                self.begin(source, Block::Cookies);
-                return match current {
-                    Some(_) => COOKIE_MARKER.to_owned(),
-                    None => scrub(text),
-                };
-            }
-        }
-        match current {
-            None => scrub(text),
+impl RunState {
+    fn text(&mut self, text: &str) -> String {
+        match self.block.take() {
+            None => self.outside_block(text),
+            Some(Block::Pem(label)) => match pem_end(text, &label) {
+                Some(end) => format!("{PEM_MARKER}{}", self.outside_block(&text[end..])),
+                None => {
+                    self.block = Some(Block::Pem(label));
+                    PEM_MARKER.to_owned()
+                }
+            },
             Some(Block::Cookies) => {
                 let line = text.trim();
                 if line.starts_with(']') {
-                    self.open.remove(&source);
                     return scrub(text);
                 }
-                if line.ends_with(']') || line.ends_with("],") {
-                    self.open.remove(&source);
-                } else {
-                    self.tick(&source);
+                if !(line.ends_with(']') || line.ends_with("],")) {
+                    self.block = Some(Block::Cookies);
                 }
                 COOKIE_MARKER.to_owned()
             }
-            Some(_) => {
-                self.tick(&source);
-                KEY_MARKER.to_owned()
+            Some(Block::Value) if text.trim().is_empty() => {
+                self.block = Some(Block::Value);
+                text.to_owned()
             }
+            Some(Block::Value) => VALUE_MARKER.to_owned(),
         }
     }
 
-    /// The stored form of a line whose end was cut off before it got here. Only its complete
-    /// fields are kept, since the last one may be part of a value. What was cut may have opened a
-    /// block, so the lines after it are withheld as after a lost line.
-    pub(super) fn cut_line(
-        &mut self,
-        recording: i64,
-        pod: &str,
-        container: &str,
-        text: &str,
-    ) -> String {
-        let kept = &text[..complete_prefix(text)];
-        let mut out = self.line(recording, pod, container, kept);
-        out.push_str(CUT_MARKER);
-        self.lost_line(recording, pod, container);
+    fn outside_block(&mut self, text: &str) -> String {
+        let (mut out, mut rest) = (String::new(), text);
+        while let Some(begin) = PEM_BEGIN.captures(rest) {
+            let (Some(whole), Some(label)) = (begin.get(0), begin.get(1)) else {
+                break;
+            };
+            out.push_str(&scrub(&rest[..whole.start()]));
+            out.push_str(PEM_MARKER);
+            let after = &rest[whole.end()..];
+            let Some(end) = pem_end(after, label.as_str()) else {
+                self.block = Some(Block::Pem(label.as_str().to_owned()));
+                return out;
+            };
+            rest = &after[end..];
+        }
+        if COOKIE_ARRAY.is_match(rest) {
+            self.block = Some(Block::Cookies);
+        } else if ends_in_credential_key(rest) {
+            self.block = Some(Block::Value);
+        }
+        out.push_str(&scrub(rest));
         out
     }
+}
 
-    /// A line of this source that may have opened a block was lost.
-    pub(super) fn lost_line(&mut self, recording: i64, pod: &str, container: &str) {
-        let source = (recording, pod.to_owned(), container.to_owned());
-        if self.open.get(&source).map(|open| open.block) != Some(Block::Key) {
-            self.begin(source, Block::Lost);
+struct Run {
+    pod: String,
+    container: String,
+    next: AtomicU64,
+    /// The first sequence number known to be lost. It only goes down.
+    lost_from: AtomicU64,
+    /// Rows lost and not yet counted on the gap marker.
+    lost: AtomicU64,
+    state: Mutex<RunState>,
+}
+
+/// One run of one container's log stream. Make a new one each time the stream really restarts:
+/// that is the only thing that ends a loss. Clones are the same run.
+#[derive(Clone)]
+pub struct LogSource(Arc<Run>);
+
+impl LogSource {
+    pub fn new(pod: impl Into<String>, container: impl Into<String>) -> Self {
+        LogSource(Arc::new(Run {
+            pod: clipped(pod.into(), MAX_NAME_BYTES).0,
+            container: clipped(container.into(), MAX_NAME_BYTES).0,
+            next: AtomicU64::new(0),
+            lost_from: AtomicU64::new(NO_LOSS),
+            lost: AtomicU64::new(0),
+            state: Mutex::default(),
+        }))
+    }
+
+    /// The next row of this stream. Rows must reach the store in the order they were made here:
+    /// one that does not counts as a loss.
+    pub fn row(&self, at_ms: i64, text: String, truncated: bool) -> LogRow {
+        LogRow {
+            at_ms,
+            text,
+            truncated,
+            seq: self.0.next.fetch_add(1, Ordering::AcqRel),
+            source: self.clone(),
         }
     }
 
-    /// Withholds everything of `recording` until it ends.
-    pub(super) fn seal(&mut self, recording: i64) {
-        self.sealed.insert(recording);
+    pub(super) fn pod(&self) -> &str {
+        &self.0.pod
     }
 
-    /// `recording` takes no more lines.
-    pub(super) fn forget(&mut self, recording: i64) {
-        self.open.retain(|(id, _, _), _| *id != recording);
-        self.sealed.remove(&recording);
+    pub(super) fn container(&self) -> &str {
+        &self.0.container
     }
 
-    fn begin(&mut self, source: Source, block: Block) {
-        if self.open.len() >= MAX_OPEN_BLOCKS && !self.open.contains_key(&source) {
-            self.sealed.insert(source.0);
-            return;
+    /// Identifies the run, to tell sources apart.
+    pub(super) fn key(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
+    /// Whether the row numbered `seq` is at or after a loss.
+    pub(super) fn is_closed_at(&self, seq: u64) -> bool {
+        seq >= self.0.lost_from.load(Ordering::Acquire)
+    }
+
+    pub(super) fn has_loss(&self) -> bool {
+        self.0.lost_from.load(Ordering::Acquire) != NO_LOSS
+    }
+
+    /// The row numbered `seq` was lost: from it on, this run stores no text.
+    pub(super) fn close_at(&self, seq: u64) {
+        self.0.lost_from.fetch_min(seq, Ordering::AcqRel);
+    }
+
+    /// Adds to the count the gap marker will show.
+    pub(super) fn count_lost(&self, rows: u64) {
+        self.0.lost.fetch_add(rows, Ordering::AcqRel);
+    }
+
+    /// The stored form of a row, or `None` if the run stores no text from it on.
+    pub(super) fn admit(&self, row: &LogRow, max: usize) -> Option<String> {
+        let mut state = self.state();
+        let in_order = row.seq == state.expected;
+        state.expected = state.expected.max(row.seq.saturating_add(1));
+        if !in_order || row.truncated || row.text.len() > max {
+            self.close_at(row.seq);
         }
-        let left = MAX_BLOCK_LINES;
-        self.open.insert(source, Open { block, left });
+        if self.is_closed_at(row.seq) {
+            self.count_lost(1);
+            return None;
+        }
+        let text = state.text(&row.text);
+        if text.len() > max {
+            self.close_at(row.seq);
+            self.count_lost(1);
+            return None;
+        }
+        Some(text)
     }
 
-    fn tick(&mut self, source: &Source) {
-        if let Some(open) = self.open.get_mut(source) {
-            open.left -= 1;
-            if open.left == 0 {
-                self.open.remove(source);
-            }
-        }
+    /// Takes the rows to add to the gap marker: its row, if any, and the count it will show.
+    pub(super) fn take_for_marker(&self) -> Option<(Option<i64>, u64, u64)> {
+        let state = self.state();
+        let pending = self.0.lost.swap(0, Ordering::AcqRel);
+        (pending > 0).then_some((state.marker, state.marked + pending, pending))
     }
+
+    pub(super) fn marker_written(&self, row: i64, total: u64) {
+        let mut state = self.state();
+        state.marker = Some(row);
+        state.marked = total;
+    }
+
+    /// The marker could not be written: its rows wait for the next one.
+    pub(super) fn marker_failed(&self, pending: u64) {
+        self.count_lost(pending);
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, RunState> {
+        self.0.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The text of a gap marker.
+pub(super) fn gap_text(rows: u64) -> String {
+    format!("{CUT_MARKER} {rows} lines not recorded until this log stream restarts")
 }
 
 #[cfg(test)]
@@ -216,107 +261,174 @@ mod tests {
 
     const BEGIN: &str = "-----BEGIN RSA PRIVATE KEY-----";
     const END: &str = "-----END RSA PRIVATE KEY-----";
+    const MAX: usize = 1024;
+
+    fn pass(source: &LogSource, text: &str) -> Option<String> {
+        let row = source.row(1, text.to_owned(), false);
+        source.admit(&row, MAX)
+    }
+
+    fn source() -> LogSource {
+        LogSource::new("p", "c")
+    }
 
     #[test]
     fn a_token_in_a_line_is_replaced_and_the_rest_kept() {
-        let out = Scrubber::default().line(1, "p", "c", "login password=hunter2 ok");
+        let out = pass(&source(), "login password=hunter2 ok").unwrap();
         assert!(!out.contains("hunter2"));
         assert!(out.starts_with("login password="));
     }
 
     #[test]
     fn a_key_over_many_lines_is_withheld_until_it_ends() {
-        let mut s = Scrubber::default();
-        let first = s.line(1, "p", "c", &format!("dump {BEGIN}"));
-        assert_eq!(first, format!("dump {KEY_MARKER}"));
-        assert_eq!(s.line(1, "p", "c", "MIIEbodybody"), KEY_MARKER);
+        let s = source();
         assert_eq!(
-            s.line(1, "p", "c", &format!("tail {END} after")),
-            format!("{KEY_MARKER} after")
+            pass(&s, &format!("dump {BEGIN}")).unwrap(),
+            format!("dump {PEM_MARKER}")
         );
-        assert_eq!(s.line(1, "p", "c", "plain"), "plain");
+        assert_eq!(pass(&s, "MIIEbodybody").unwrap(), PEM_MARKER);
+        assert_eq!(
+            pass(&s, &format!("tail {END} after")).unwrap(),
+            format!("{PEM_MARKER} after")
+        );
+        assert_eq!(pass(&s, "plain").unwrap(), "plain");
+    }
+
+    #[test]
+    fn every_pem_label_is_handled_the_same() {
+        for label in ["CERTIFICATE", "PRIVATE KEY", "EC PARAMETERS", "X509 CRL"] {
+            let s = source();
+            pass(&s, &format!("-----BEGIN {label}-----")).unwrap();
+            assert_eq!(pass(&s, "MIIEbody").unwrap(), PEM_MARKER, "{label}");
+            pass(&s, &format!("-----END {label}-----")).unwrap();
+            assert_eq!(pass(&s, "plain").unwrap(), "plain", "{label}");
+            let one_line = format!("a -----BEGIN {label}-----MIIE-----END {label}----- b");
+            let out = pass(&s, &one_line).unwrap();
+            assert!(!out.contains("MIIE"), "{label}");
+            assert!(out.ends_with(" b"), "{label}");
+        }
+    }
+
+    #[test]
+    fn a_footer_of_another_label_does_not_end_a_block() {
+        let s = source();
+        pass(&s, "-----BEGIN CERTIFICATE-----").unwrap();
+        pass(&s, END).unwrap();
+        assert_eq!(pass(&s, "MIIEbody").unwrap(), PEM_MARKER);
+    }
+
+    #[test]
+    fn a_block_with_no_footer_stays_withheld_however_long() {
+        let s = source();
+        pass(&s, BEGIN).unwrap();
+        for _ in 0..2000 {
+            assert_eq!(pass(&s, "body").unwrap(), PEM_MARKER);
+        }
     }
 
     #[test]
     fn a_block_in_one_source_leaves_the_others_alone() {
-        let mut s = Scrubber::default();
-        s.line(1, "p", "c", BEGIN);
-        assert_eq!(s.line(1, "p", "other", "plain"), "plain");
-        assert_eq!(s.line(2, "p", "c", "plain"), "plain");
-        assert_eq!(s.line(1, "p", "c", "MIIE"), KEY_MARKER);
-    }
-
-    #[test]
-    fn an_unterminated_block_ends_after_its_limit() {
-        let mut s = Scrubber::default();
-        s.line(1, "p", "c", BEGIN);
-        for _ in 0..MAX_BLOCK_LINES {
-            assert_eq!(s.line(1, "p", "c", "body"), KEY_MARKER);
-        }
-        assert_eq!(s.line(1, "p", "c", "plain"), "plain");
+        let (s, other) = (source(), LogSource::new("p", "other"));
+        pass(&s, BEGIN).unwrap();
+        assert_eq!(pass(&other, "plain").unwrap(), "plain");
+        assert_eq!(pass(&s, "MIIE").unwrap(), PEM_MARKER);
     }
 
     #[test]
     fn a_cookie_array_over_many_lines_is_masked_until_it_closes() {
-        let mut s = Scrubber::default();
+        let s = source();
         assert_eq!(
-            s.line(1, "p", "c", r#"  "set-cookie": ["#),
+            pass(&s, r#"  "set-cookie": ["#).unwrap(),
             r#"  "set-cookie": ["#
         );
         assert_eq!(
-            s.line(1, "p", "c", r#"    "sessionid=abc123","#),
+            pass(&s, r#"    "sessionid=abc123","#).unwrap(),
             COOKIE_MARKER
         );
-        assert_eq!(s.line(1, "p", "c", r#"    "other=def456""#), COOKIE_MARKER);
-        assert_eq!(s.line(1, "p", "c", "  ],"), "  ],");
-        assert_eq!(s.line(1, "p", "c", "plain"), "plain");
+        assert_eq!(pass(&s, r#"    "other=def456""#).unwrap(), COOKIE_MARKER);
+        assert_eq!(pass(&s, "  ],").unwrap(), "  ],");
+        assert_eq!(pass(&s, "plain").unwrap(), "plain");
     }
 
     #[test]
     fn a_cookie_item_holding_a_bracket_does_not_close_the_array() {
-        let mut s = Scrubber::default();
-        s.line(1, "p", "c", r#""cookie": ["#);
-        assert_eq!(s.line(1, "p", "c", r#""a=x]","#), COOKIE_MARKER);
-        assert_eq!(s.line(1, "p", "c", r#""b=secret""#), COOKIE_MARKER);
+        let s = source();
+        pass(&s, r#""cookie": ["#).unwrap();
+        assert_eq!(pass(&s, r#""a=x]","#).unwrap(), COOKIE_MARKER);
+        assert_eq!(pass(&s, r#""b=secret""#).unwrap(), COOKIE_MARKER);
     }
 
     #[test]
-    fn a_block_past_the_limit_seals_its_recording() {
-        let mut s = Scrubber::default();
-        for i in 0..MAX_OPEN_BLOCKS {
-            s.line(1, &format!("p{i}"), "c", BEGIN);
+    fn a_value_on_the_line_after_its_key_is_replaced() {
+        for key in [
+            r#""token":"#,
+            r#"{"a":1,"password":"#,
+            "--token",
+            "password=",
+        ] {
+            let s = source();
+            pass(&s, key).unwrap();
+            assert_eq!(pass(&s, "").unwrap(), "", "{key}");
+            assert_eq!(pass(&s, r#""SECRETVALUE""#).unwrap(), VALUE_MARKER, "{key}");
+            assert_eq!(pass(&s, "plain").unwrap(), "plain", "{key}");
         }
-        assert_eq!(s.line(2, "plain", "c", "plain"), "plain");
-        s.line(2, "new", "c", BEGIN);
-        assert_eq!(s.open.len(), MAX_OPEN_BLOCKS);
-        s.forget(1);
-        assert_eq!(s.line(2, "new", "c", "MIIE"), KEY_MARKER);
-        assert_eq!(s.line(2, "other", "c", "MIIE"), KEY_MARKER);
-        s.forget(2);
-        assert_eq!(s.line(2, "new", "c", "plain"), "plain");
     }
 
     #[test]
-    fn a_lost_line_withholds_only_its_source_whatever_others_log() {
-        let mut s = Scrubber::default();
-        s.lost_line(1, "p", "c");
-        for _ in 0..2 * MAX_BLOCK_LINES {
-            assert_eq!(s.line(1, "q", "c", "plain"), "plain");
-        }
-        assert_eq!(s.line(1, "p", "c", "MIIE"), KEY_MARKER);
+    fn a_line_ending_in_an_ordinary_key_keeps_the_next_line() {
+        let s = source();
+        pass(&s, r#""name":"#).unwrap();
+        assert_eq!(pass(&s, r#""web""#).unwrap(), r#""web""#);
     }
 
     #[test]
-    fn a_key_header_during_a_lost_block_opens_its_own_block() {
-        let mut s = Scrubber::default();
-        s.lost_line(1, "p", "c");
-        assert_eq!(s.line(1, "p", "c", BEGIN), KEY_MARKER);
-        for _ in 0..MAX_BLOCK_LINES - 1 {
-            assert_eq!(s.line(1, "p", "c", "body"), KEY_MARKER);
+    fn no_line_content_ends_a_loss() {
+        let s = source();
+        let cut = s.row(1, "noise".to_owned(), true);
+        assert_eq!(s.admit(&cut, MAX), None);
+        for text in [BEGIN, END, "", "]", "plain", "-----END CERTIFICATE-----"] {
+            assert_eq!(pass(&s, text), None, "{text:?}");
         }
-        assert_eq!(
-            s.line(1, "p", "c", &format!("{END} done")),
-            format!("{KEY_MARKER} done")
+    }
+
+    #[test]
+    fn a_new_run_stores_text_again_and_the_old_one_never_does() {
+        let old = source();
+        let cut = old.row(1, "noise".to_owned(), true);
+        assert_eq!(old.admit(&cut, MAX), None);
+        let new = source();
+        assert_eq!(pass(&new, "plain").unwrap(), "plain");
+        assert_eq!(pass(&old, "late"), None);
+    }
+
+    #[test]
+    fn a_row_out_of_order_is_a_loss() {
+        let s = source();
+        let (first, second) = (
+            s.row(1, "first".to_owned(), false),
+            s.row(2, "second".to_owned(), false),
         );
+        assert_eq!(s.admit(&second, MAX), None);
+        assert_eq!(s.admit(&first, MAX), None);
+        assert_eq!(pass(&s, "third"), None);
+    }
+
+    #[test]
+    fn a_row_before_a_loss_is_still_stored() {
+        let s = source();
+        let (kept, lost) = (
+            s.row(1, "kept".to_owned(), false),
+            s.row(2, "lost".to_owned(), false),
+        );
+        s.close_at(lost.seq);
+        assert_eq!(s.admit(&kept, MAX).as_deref(), Some("kept"));
+        assert_eq!(pass(&s, "after"), None);
+    }
+
+    #[test]
+    fn text_past_the_limit_is_a_loss() {
+        let s = source();
+        assert_eq!(pass(&s, &"x".repeat(MAX + 1)), None);
+        assert_eq!(pass(&s, "plain"), None);
     }
 }

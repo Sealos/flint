@@ -2,10 +2,12 @@
 // module-tests: store_tests.rs
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::ops::Range;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use rusqlite::{
@@ -14,7 +16,7 @@ use rusqlite::{
 
 use super::identity::ConnectionIdentity;
 use super::schema::{self, ROW_TABLES};
-use super::scrub::{Scrubber, scrub};
+use super::scrub::{CUT_MARKER, LogSource, gap_text, scrub};
 
 /// The database, in Flint's data directory.
 pub const DATABASE_FILE: &str = "recordings.sqlite";
@@ -23,10 +25,17 @@ const OWNER_ONLY: u32 = 0o600;
 
 /// What a row costs beyond its text, for the per-recording budget.
 const ROW_OVERHEAD: u64 = 64;
-/// The longest stored line or event message. Longer text is cut after it is redacted.
+/// The longest stored line or event message. A longer one is stored as a cut marker only.
 const MAX_TEXT_BYTES: usize = crate::logs::MAX_LINE_BYTES;
 /// The longest stored name or reason.
-const MAX_NAME_BYTES: usize = 1024;
+pub(super) const MAX_NAME_BYTES: usize = 1024;
+/// What a small write may add to the write-ahead log, in frames.
+const SMALL_WRITE_FRAMES: u64 = 32;
+/// What SQLite adds to each page in the write-ahead log.
+const WAL_FRAME_HEADER: u64 = 24;
+/// Held while creating the database and until SQLite has it open. Closing any descriptor of a
+/// file drops every POSIX lock this process holds on it, SQLite's included.
+pub(super) static OPEN_LOCK: Mutex<()> = Mutex::new(());
 /// The most one eviction transaction frees, and how many rows one retention transaction deletes:
 /// small commits let the write-ahead log checkpoint instead of growing.
 const MAX_EVICT_TX_BYTES: u64 = 1024 * 1024;
@@ -89,13 +98,14 @@ impl RecordingTarget {
     }
 }
 
-/// A log line to record. Holds raw text, so it has no `Debug`.
+/// A log line to record, made by [`LogSource::row`]. Holds raw text, so it has no `Debug`.
 pub struct LogRow {
     pub at_ms: i64,
-    pub pod: String,
-    pub container: String,
     pub text: String,
     pub truncated: bool,
+    pub(super) source: LogSource,
+    /// Its place in its stream.
+    pub(super) seq: u64,
 }
 
 /// A Kubernetes event's type.
@@ -147,20 +157,24 @@ impl Batch {
         (self.lines.len() + self.events.len() + self.samples.len()) as u64
     }
 
-    /// Roughly what this batch holds in memory while queued.
+    /// What this batch holds in memory while queued: the capacity of everything it owns.
     pub(super) fn queued_bytes(&self) -> u64 {
-        let lines: usize = self
-            .lines
-            .iter()
-            .map(|l| l.pod.len() + l.container.len() + l.text.len())
-            .sum();
+        let lines: usize = self.lines.iter().map(|l| l.text.capacity()).sum();
         let events: usize = self
             .events
             .iter()
-            .map(|e| e.reason.len() + e.object_kind.len() + e.object_name.len() + e.message.len())
+            .map(|e| {
+                e.reason.capacity()
+                    + e.object_kind.capacity()
+                    + e.object_name.capacity()
+                    + e.message.capacity()
+            })
             .sum();
-        let samples: usize = self.samples.iter().map(|s| s.pod.len()).sum();
-        (lines + events + samples) as u64 + self.rows() * ROW_OVERHEAD
+        let samples: usize = self.samples.iter().map(|s| s.pod.capacity()).sum();
+        let slots = self.lines.capacity() * size_of::<LogRow>()
+            + self.events.capacity() * size_of::<EventRow>()
+            + self.samples.capacity() * size_of::<SampleRow>();
+        (lines + events + samples + slots) as u64
     }
 }
 
@@ -180,14 +194,9 @@ impl Part<'_> {
 
 /// `batch` in runs that each cost at most `max`, or one row if that alone costs more.
 fn parts(batch: &Batch, max: u64) -> Vec<Part<'_>> {
-    let lines = runs(&batch.lines, max, |l| {
-        stored_cost(l.pod.len() + l.container.len() + l.text.len())
-    });
-    let events = runs(&batch.events, max, |e| {
-        let names = e.reason.len() + e.object_kind.len() + e.object_name.len();
-        stored_cost(names + e.message.len())
-    });
-    let samples = runs(&batch.samples, max, |s| stored_cost(s.pod.len()));
+    let lines = runs(&batch.lines, max, line_cost);
+    let events = runs(&batch.events, max, event_cost);
+    let samples = runs(&batch.samples, max, sample_cost);
     let lines = lines.into_iter().map(|r| Part {
         lines: &batch.lines[r],
         ..Part::default()
@@ -239,8 +248,10 @@ impl GapReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Appended {
     pub stored: u64,
-    /// Rows the budget had no room for.
+    /// Rows the budget had no room for, or withheld after a loss in their log stream.
     pub dropped: u64,
+    /// Rows the database could not take.
+    pub unsaved: u64,
 }
 
 /// A recording's state.
@@ -271,6 +282,8 @@ pub enum RecordingError {
     UnknownSchema(i64),
     #[error("the recordings database is not a regular file")]
     NotAFile,
+    #[error("the recordings write-ahead log is full")]
+    LogFull,
     #[error("recordings database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("recordings file error: {0}")]
@@ -280,8 +293,31 @@ pub enum RecordingError {
 impl RecordingError {
     /// The database failed, as opposed to refusing the rows.
     pub(super) fn is_storage(&self) -> bool {
-        matches!(self, RecordingError::Sqlite(_) | RecordingError::Io(_))
+        matches!(
+            self,
+            RecordingError::Sqlite(_) | RecordingError::Io(_) | RecordingError::LogFull
+        )
     }
+}
+
+fn line_cost(line: &LogRow) -> u64 {
+    stored_cost(line.source.pod().len() + line.source.container().len() + line.text.len())
+}
+
+fn event_cost(event: &EventRow) -> u64 {
+    let names = event.reason.len() + event.object_kind.len() + event.object_name.len();
+    stored_cost(names + event.message.len())
+}
+
+fn sample_cost(sample: &SampleRow) -> u64 {
+    stored_cost(sample.pod.len())
+}
+
+/// `path` with `suffix` added to its name, keeping its exact bytes.
+pub(super) fn side_file(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = OsString::from(path);
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 /// What a stored row counts for against the per-recording budget: its text plus what pages and
@@ -323,7 +359,6 @@ fn is_full(error: &RecordingError) -> bool {
 pub struct Store {
     conn: Connection,
     retention: Retention,
-    scrubber: Scrubber,
     page_size: u64,
     /// The total budget less the write-ahead log's part: what the main file may use.
     file_budget: u64,
@@ -333,6 +368,8 @@ pub struct Store {
     busy_timeout: Duration,
     /// Dropped rows not yet saved on their recordings, because the database took no writes.
     deferred_drops: BTreeMap<i64, u64>,
+    /// Dropped rows there was no room to keep a count for.
+    lost_counts: u64,
 }
 
 impl Store {
@@ -343,13 +380,16 @@ impl Store {
         // SQLite's no-follow flag refuses a link anywhere in the path, and a data directory may
         // legitimately sit under one (`/var` on macOS). The file itself still may not be a link.
         let path = std::fs::canonicalize(dir)?.join(DATABASE_FILE);
-        prepare_files(&path)?;
-        let mut conn = Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
+        let mut conn = {
+            let _creating = OPEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            prepare_files(&path)?;
+            Connection::open_with_flags(
+                &path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?
+        };
         conn.busy_timeout(BUSY_TIMEOUT)?;
         // Must come before the first table: it decides how the file gives pages back.
         conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
@@ -375,13 +415,13 @@ impl Store {
         let mut store = Store {
             conn,
             retention,
-            scrubber: Scrubber::default(),
             page_size: page_size as u64,
             file_budget: retention.max_total_bytes - reserve,
-            wal_path: PathBuf::from(format!("{}-wal", path.display())),
+            wal_path: side_file(&path, "-wal"),
             wal_limit: reserve,
             busy_timeout: BUSY_TIMEOUT,
             deferred_drops: BTreeMap::new(),
+            lost_counts: 0,
         };
         store.end_running(now_ms())?;
         while store.used_bytes()? > store.file_budget {
@@ -402,9 +442,10 @@ impl Store {
         Ok(store)
     }
 
-    /// Ends what a previous run left running. Its streams are gone, and so is what the scrubber
-    /// knew about them, so a stream must not continue the same recording mid-block.
+    /// Ends what a previous run left running. Its streams are gone, and so is what was known
+    /// about them, so a stream must not continue the same recording mid-block.
     fn end_running(&mut self, now_ms: i64) -> Result<(), RecordingError> {
+        self.ensure_wal_room()?;
         let tx = self.conn.transaction()?;
         tx.execute("UPDATE gaps SET to_ms = ?1 WHERE to_ms IS NULL", [now_ms])?;
         tx.execute(
@@ -423,6 +464,7 @@ impl Store {
         enabled: bool,
         now_ms: i64,
     ) -> Result<(), RecordingError> {
+        self.ensure_wal_room()?;
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO clusters (identity, context, enabled) VALUES (?1, ?2, ?3)
@@ -479,6 +521,7 @@ impl Store {
         let Some((cluster, true)) = cluster else {
             return Err(RecordingError::Disabled);
         };
+        self.ensure_wal_room()?;
         let (kind, workload_kind, name) = target.columns();
         let id = self.conn.query_row(
             "INSERT INTO recordings (cluster_id, namespace, target_kind, workload_kind, target, started_ms)
@@ -495,6 +538,7 @@ impl Store {
 
     /// Ends a recording. It keeps its rows until retention removes them.
     pub fn stop(&mut self, id: RecordingId, now_ms: i64) -> Result<(), RecordingError> {
+        self.ensure_wal_room()?;
         let tx = self.conn.transaction()?;
         tx.execute(
             "UPDATE gaps SET to_ms = ?2 WHERE recording_id = ?1 AND to_ms IS NULL",
@@ -505,7 +549,6 @@ impl Store {
             params![id.0, now_ms],
         )?;
         tx.commit()?;
-        self.scrubber.forget(id.0);
         if changed == 0 {
             self.info(id)?;
         }
@@ -522,6 +565,7 @@ impl Store {
         if self.info(id)?.ended_ms.is_some() {
             return Err(RecordingError::Ended);
         }
+        self.ensure_wal_room()?;
         let keep = (self.retention.max_recording_bytes / (2 * GAP_COST)).min(MAX_GAPS) as i64;
         let tx = self.conn.transaction()?;
         let added = tx.execute(
@@ -549,6 +593,7 @@ impl Store {
 
     /// Closes the open gap, if any.
     pub fn resume(&mut self, id: RecordingId, now_ms: i64) -> Result<(), RecordingError> {
+        self.ensure_wal_room()?;
         self.conn.execute(
             "UPDATE gaps SET to_ms = ?2 WHERE recording_id = ?1 AND to_ms IS NULL",
             params![id.0, now_ms],
@@ -558,6 +603,7 @@ impl Store {
 
     /// Stars a recording, keeping it past retention, or unstars it.
     pub fn set_starred(&mut self, id: RecordingId, starred: bool) -> Result<(), RecordingError> {
+        self.ensure_wal_room()?;
         let changed = self.conn.execute(
             "UPDATE recordings SET starred = ?2 WHERE id = ?1",
             params![id.0, starred],
@@ -570,9 +616,18 @@ impl Store {
 
     /// Deletes a recording and its rows.
     pub fn delete(&mut self, id: RecordingId) -> Result<(), RecordingError> {
+        // In chunks: one cascade over a large recording would not fit the write-ahead log.
+        for table in ROW_TABLES {
+            loop {
+                self.ensure_wal_room()?;
+                if self.expire_chunk(table, id.0, i64::MAX)? < RETENTION_CHUNK {
+                    break;
+                }
+            }
+        }
+        self.ensure_wal_room()?;
         self.conn
             .execute("DELETE FROM recordings WHERE id = ?1", [id.0])?;
-        self.scrubber.forget(id.0);
         self.deferred_drops.remove(&id.0);
         self.vacuum()
     }
@@ -625,43 +680,51 @@ impl Store {
         batch: Batch,
     ) -> Result<(Appended, Option<RecordingError>), RecordingError> {
         if let Err(refused) = self.check(id, current) {
-            match refused {
-                // Not stored, but a key block opened here runs on into the lines after resuming.
-                RecordingError::Paused => drop(self.scrubbed(id, batch)),
-                RecordingError::Ended | RecordingError::UnknownRecording => {
-                    self.scrubber.forget(id.0);
-                }
-                // Not stored either, and its lines still count for what comes after them.
-                ref error if error.is_storage() => drop(self.scrubbed(id, batch)),
-                // Another connection's rows say nothing about this recording's open blocks.
-                _ => {}
-            }
+            // Rows that are not stored are a loss in their streams, whatever the reason.
+            close_lines(&batch.lines);
             return Err(refused);
         }
         self.flush_dropped_counts();
-        let clean = self.scrubbed(id, batch);
-        let mut total = Appended::default();
+        let at_ms = batch.lines.iter().map(|l| l.at_ms).max().unwrap_or(0);
+        let (clean, sources, withheld) = self.scrubbed(batch);
+        let mut total = Appended {
+            dropped: withheld,
+            ..Appended::default()
+        };
+        if withheld > 0 {
+            self.count_dropped(id, withheld);
+        }
         let mut failure = None;
         // Small transactions, so the write-ahead log can be checked and checkpointed between them.
-        for part in parts(&clean, (self.wal_limit / 4).max(1)) {
-            if !self.wal_has_room() {
+        let parts = parts(&clean, (self.wal_limit / 4).max(1));
+        for (at, part) in parts.iter().enumerate() {
+            if !self.wal_has_room(self.part_frames_bytes(part)) {
+                close_lines(part.lines);
                 self.count_dropped(id, part.rows());
-                total.dropped += part.rows();
+                total.unsaved += part.rows();
                 continue;
             }
-            match self.write_part(id, current, part) {
+            match self.write_part(id, current, *part) {
                 Ok(done) => {
                     total.stored += done.stored;
                     total.dropped += done.dropped;
                 }
                 Err(error) => {
+                    let rest = &parts[at..];
+                    let lost: u64 = rest.iter().map(Part::rows).sum();
+                    rest.iter().for_each(|part| close_lines(part.lines));
+                    self.count_dropped(id, lost);
+                    total.unsaved += lost;
                     failure = Some(error);
                     break;
                 }
             }
         }
+        for source in sources.iter().filter(|source| source.has_loss()) {
+            self.write_marker(id, source, at_ms);
+        }
         // The rows are stored: a failure here is not a failure of this append.
-        if self.wal_has_room()
+        if self.wal_has_room(self.small_write_bytes())
             && self.used_bytes().is_ok_and(|used| used > self.file_budget)
             && let Err(error) = self.make_room()
         {
@@ -685,10 +748,11 @@ impl Store {
                     self.make_room()?;
                     match self.write(id, current, part) {
                         Err(e) if is_full(&e) => {
+                            close_lines(part.lines);
                             self.count_dropped(id, part.rows());
                             Ok(Appended {
-                                stored: 0,
                                 dropped: part.rows(),
+                                ..Appended::default()
                             })
                         }
                         other => other,
@@ -703,10 +767,35 @@ impl Store {
         }
     }
 
-    /// Whether the write-ahead log has room for more. Past its limit it is checkpointed without
-    /// waiting; while a reader keeps that from reclaiming it, writes are suspended.
-    fn wal_has_room(&mut self) -> bool {
-        if self.wal_bytes() <= self.wal_limit {
+    /// What a small write can add to the write-ahead log.
+    fn small_write_bytes(&self) -> u64 {
+        SMALL_WRITE_FRAMES * (self.page_size + WAL_FRAME_HEADER)
+    }
+
+    /// What writing `part` can add to the write-ahead log: its data, about twice over for its
+    /// index and overflow pages, and the pages any write touches.
+    fn part_frames_bytes(&self, part: &Part<'_>) -> u64 {
+        let lines: u64 = part.lines.iter().map(line_cost).sum();
+        let events: u64 = part.events.iter().map(event_cost).sum();
+        let samples: u64 = part.samples.iter().map(sample_cost).sum();
+        2 * (lines + events + samples) + self.small_write_bytes()
+    }
+
+    /// [`Self::wal_has_room`] for a small write, as an error.
+    fn ensure_wal_room(&mut self) -> Result<(), RecordingError> {
+        if self.wal_has_room(self.small_write_bytes()) {
+            Ok(())
+        } else {
+            Err(RecordingError::LogFull)
+        }
+    }
+
+    /// Whether the write-ahead log can take `needed` more bytes and stay within its limit. If not
+    /// it is checkpointed without waiting; while a reader keeps that from reclaiming it, writes
+    /// are suspended. A write bigger than the whole limit needs an empty log.
+    fn wal_has_room(&mut self, needed: u64) -> bool {
+        let needed = needed.min(self.wal_limit);
+        if self.wal_bytes() + needed <= self.wal_limit {
             return true;
         }
         if self.conn.busy_timeout(Duration::ZERO).is_err() {
@@ -720,7 +809,7 @@ impl Store {
         if let Err(error) = self.conn.busy_timeout(self.busy_timeout) {
             tracing::warn!(%error, "cannot restore the recordings lock timeout");
         }
-        matches!(blocked, Ok(0)) && self.wal_bytes() <= self.wal_limit
+        matches!(blocked, Ok(0)) && self.wal_bytes() + needed <= self.wal_limit
     }
 
     fn wal_bytes(&self) -> u64 {
@@ -730,9 +819,14 @@ impl Store {
     /// Adds to a recording's count of rows that were never stored, now or once the database takes
     /// writes again.
     pub(super) fn count_dropped(&mut self, id: RecordingId, rows: u64) {
-        if !self.wal_has_room() || self.save_dropped(id.0, rows).is_err() {
+        if !self.wal_has_room(self.small_write_bytes()) || self.save_dropped(id.0, rows).is_err() {
             self.defer_dropped(id.0, rows);
         }
+    }
+
+    /// Dropped rows that are in no saved count.
+    pub(super) fn uncounted_drops(&self) -> u64 {
+        self.lost_counts + self.deferred_drops.values().sum::<u64>()
     }
 
     fn save_dropped(&self, id: i64, rows: u64) -> Result<(), RecordingError> {
@@ -748,6 +842,7 @@ impl Store {
             && !self.deferred_drops.contains_key(&id)
         {
             tracing::warn!(rows, "cannot keep count of dropped recording rows");
+            self.lost_counts += rows;
             return;
         }
         *self.deferred_drops.entry(id).or_default() += rows;
@@ -755,7 +850,7 @@ impl Store {
 
     /// Saves the dropped-row counts that had to wait, if the database takes writes.
     pub(super) fn flush_dropped_counts(&mut self) {
-        if self.deferred_drops.is_empty() || !self.wal_has_room() {
+        if self.deferred_drops.is_empty() || !self.wal_has_room(self.small_write_bytes()) {
             return;
         }
         for (id, rows) in std::mem::take(&mut self.deferred_drops) {
@@ -765,36 +860,107 @@ impl Store {
         }
     }
 
-    /// A loss could not be placed in the queue: withholds every running recording until it ends,
-    /// and counts `rows` on each, since any of them may be the one that lost them.
-    pub(super) fn seal_running(&mut self, rows: u64) -> Result<(), RecordingError> {
+    /// Counts `rows` whose recording is not known on every running one, since any of them may be
+    /// the one that lost them.
+    pub(super) fn count_on_running(&mut self, rows: u64) -> Result<(), RecordingError> {
         let ids: Vec<i64> = self
             .conn
             .prepare("SELECT id FROM recordings WHERE ended_ms IS NULL")?
             .query_map([], |row| row.get(0))?
             .collect::<Result<_, _>>()?;
         for id in ids {
-            self.scrubber.seal(id);
-            if rows > 0 {
-                self.count_dropped(RecordingId(id), rows);
-            }
+            self.count_dropped(RecordingId(id), rows);
         }
         Ok(())
     }
 
-    /// A line of this source was lost before reaching the store and may have opened a block.
-    pub(super) fn line_lost(&mut self, id: RecordingId, pod: &str, container: &str) {
-        self.scrubber.lost_line(id.0, pod, container);
+    /// `rows` of `id` were lost before reaching the store, from these already closed sources.
+    pub(super) fn record_loss(&mut self, id: RecordingId, rows: u64, sources: &[LogSource]) {
+        if rows > 0 {
+            self.count_dropped(id, rows);
+        }
+        for source in sources {
+            self.write_marker(id, source, now_ms());
+        }
     }
 
-    /// Too many sources lost such a line to name them: withhold all of `id` until it ends.
-    pub(super) fn seal_lines(&mut self, id: RecordingId) {
-        self.scrubber.seal(id.0);
+    /// Writes what a closed source has lost so far on its one gap marker. A marker that cannot be
+    /// written keeps its count for the next try: the rows are in `dropped_rows` either way.
+    fn write_marker(&mut self, id: RecordingId, source: &LogSource, at_ms: i64) {
+        let Some((row, total, pending)) = source.take_for_marker() else {
+            return;
+        };
+        if !self.wal_has_room(self.small_write_bytes()) {
+            source.marker_failed(pending);
+            return;
+        }
+        match self.save_marker(id, source, row, total, at_ms) {
+            Ok(Some(row)) => source.marker_written(row, total),
+            Ok(None) => source.marker_failed(pending),
+            Err(error) => {
+                tracing::debug!(%error, "cannot write a recording gap marker");
+                source.marker_failed(pending);
+            }
+        }
+    }
+
+    /// Updates the marker at `row`, or adds one if it was evicted and the budget has room.
+    fn save_marker(
+        &mut self,
+        id: RecordingId,
+        source: &LogSource,
+        row: Option<i64>,
+        total: u64,
+        at_ms: i64,
+    ) -> Result<Option<i64>, RecordingError> {
+        let text = gap_text(total);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(row) = row {
+            let updated = tx.execute(
+                "UPDATE log_lines SET text = ?3 WHERE id = ?1 AND recording_id = ?2",
+                params![row, id.0, text],
+            )?;
+            if updated > 0 {
+                tx.commit()?;
+                return Ok(Some(row));
+            }
+        }
+        let cost = stored_cost(source.pod().len() + source.container().len() + text.len());
+        let (bytes, starred): (i64, bool) = tx.query_row(
+            "SELECT bytes, starred FROM recordings WHERE id = ?1",
+            [id.0],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if starred && bytes as u64 + cost > self.retention.max_recording_bytes {
+            return Ok(None);
+        }
+        let row = tx.query_row(
+            "INSERT INTO log_lines (recording_id, at_ms, pod, container, text, truncated, bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6) RETURNING id",
+            params![
+                id.0,
+                at_ms,
+                source.pod(),
+                source.container(),
+                text,
+                cost as i64
+            ],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "UPDATE recordings SET bytes = bytes + ?2 WHERE id = ?1",
+            params![id.0, cost as i64],
+        )?;
+        tx.commit()?;
+        Ok(Some(row))
     }
 
     /// Removes what is past its age, then whatever is over the total budget.
     pub fn apply_retention(&mut self, now_ms: i64) -> Result<(), RecordingError> {
-        if !self.wal_has_room() {
+        let small = self.small_write_bytes();
+        if !self.wal_has_room(small) {
             return Ok(());
         }
         let age = i64::try_from(self.retention.max_age.as_millis()).unwrap_or(i64::MAX);
@@ -806,11 +972,14 @@ impl Store {
             .collect::<Result<_, _>>()?;
         for id in ids {
             for table in ROW_TABLES {
-                while self.wal_has_room()
+                while self.wal_has_room(small)
                     && self.expire_chunk(table, id, cutoff)? == RETENTION_CHUNK
                 {}
             }
-            while self.wal_has_room() && self.expire_gaps(id, cutoff)? == RETENTION_CHUNK {}
+            while self.wal_has_room(small) && self.expire_gaps(id, cutoff)? == RETENTION_CHUNK {}
+        }
+        if !self.wal_has_room(small) {
+            return Ok(());
         }
         self.conn.execute(
             "DELETE FROM recordings WHERE starred = 0 AND ended_ms IS NOT NULL AND ended_ms < ?1
@@ -883,41 +1052,38 @@ impl Store {
         check_on(&self.conn, id, current).map(|_| ())
     }
 
-    fn scrubbed(&mut self, id: RecordingId, batch: Batch) -> Batch {
+    /// The batch as it may be stored, the log sources it touched, and how many lines were
+    /// withheld because their stream had a loss.
+    fn scrubbed(&mut self, batch: Batch) -> (Batch, Vec<LogSource>, u64) {
         let Batch {
             lines,
             events,
             samples,
         } = batch;
+        let mut sources: Vec<LogSource> = Vec::new();
+        let mut withheld = 0;
         let lines = lines
             .into_iter()
-            .map(|line| {
-                let text = if line.truncated {
-                    self.scrubber
-                        .cut_line(id.0, &line.pod, &line.container, &line.text)
-                } else {
-                    self.scrubber
-                        .line(id.0, &line.pod, &line.container, &line.text)
+            .filter_map(|line| {
+                sources.push(line.source.clone());
+                let Some(text) = line.source.admit(&line, MAX_TEXT_BYTES) else {
+                    withheld += 1;
+                    return None;
                 };
-                let (text, cut) = clipped(text, MAX_TEXT_BYTES);
-                LogRow {
-                    at_ms: line.at_ms,
-                    pod: clipped(line.pod, MAX_NAME_BYTES).0,
-                    container: clipped(line.container, MAX_NAME_BYTES).0,
-                    text,
-                    truncated: line.truncated || cut,
-                }
+                Some(LogRow { text, ..line })
             })
             .collect();
+        sources.sort_unstable_by_key(LogSource::key);
+        sources.dedup_by_key(|source| source.key());
         let events = events
             .into_iter()
             .map(|event| EventRow {
                 at_ms: event.at_ms,
                 kind: event.kind,
-                reason: clipped(scrub(&event.reason), MAX_NAME_BYTES).0,
+                reason: whole_or_cut(scrub(&event.reason), MAX_NAME_BYTES),
                 object_kind: clipped(event.object_kind, MAX_NAME_BYTES).0,
                 object_name: clipped(event.object_name, MAX_NAME_BYTES).0,
-                message: clipped(scrub(&event.message), MAX_TEXT_BYTES).0,
+                message: whole_or_cut(scrub(&event.message), MAX_TEXT_BYTES),
                 count: event.count,
             })
             .collect();
@@ -928,11 +1094,12 @@ impl Store {
                 ..sample
             })
             .collect();
-        Batch {
+        let clean = Batch {
             lines,
             events,
             samples,
-        }
+        };
+        (clean, sources, withheld)
     }
 
     fn write(
@@ -954,6 +1121,7 @@ impl Store {
         };
         let mut added = 0u64;
         let mut outcome = Appended::default();
+        let mut refused: Vec<&LogSource> = Vec::new();
         let mut admit = |cost: u64| {
             if cost > room {
                 outcome.dropped += 1;
@@ -972,17 +1140,21 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for l in batch.lines {
-                let cost = stored_cost(l.pod.len() + l.container.len() + l.text.len());
-                if admit(cost) {
+                let cost = line_cost(l);
+                // A row refused here closes its stream, so nothing after it may be stored.
+                if !l.source.is_closed_at(l.seq) && admit(cost) {
                     insert.execute(params![
                         id.0,
                         l.at_ms,
-                        l.pod,
-                        l.container,
+                        l.source.pod(),
+                        l.source.container(),
                         l.text,
                         l.truncated,
                         cost as i64
                     ])?;
+                } else {
+                    l.source.close_at(l.seq);
+                    refused.push(&l.source);
                 }
             }
             let mut insert = tx.prepare_cached(
@@ -991,8 +1163,7 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for e in batch.events {
-                let text = e.reason.len() + e.object_kind.len() + e.object_name.len();
-                let cost = stored_cost(text + e.message.len());
+                let cost = event_cost(e);
                 if admit(cost) {
                     insert.execute(params![
                         id.0,
@@ -1013,7 +1184,7 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
             for s in batch.samples {
-                let cost = stored_cost(s.pod.len());
+                let cost = sample_cost(s);
                 if admit(cost) {
                     insert.execute(params![
                         id.0,
@@ -1030,11 +1201,15 @@ impl Store {
         if !starred && total > budget {
             total = total.saturating_sub(evict_oldest(&tx, id.0, total - budget)?);
         }
+        // Lines skipped for an earlier refusal in this part are dropped rows too.
+        let dropped = outcome.stored + outcome.dropped;
+        outcome.dropped += batch.rows().saturating_sub(dropped);
         tx.execute(
             "UPDATE recordings SET bytes = ?2, dropped_rows = dropped_rows + ?3 WHERE id = ?1",
             params![id.0, total as i64, outcome.dropped as i64],
         )?;
         tx.commit()?;
+        refused.iter().for_each(|source| source.count_lost(1));
         Ok(outcome)
     }
 
@@ -1048,7 +1223,8 @@ impl Store {
             return Ok(());
         }
         let mut left = (used - target).clamp(MIN_EVICT_BYTES, self.file_budget / 10);
-        while left > 0 && self.wal_has_room() {
+        let step = MAX_EVICT_TX_BYTES.min((self.wal_limit / 4).max(1));
+        while left > 0 && self.wal_has_room(2 * step) {
             let oldest: Option<i64> = self
                 .conn
                 .query_row(
@@ -1062,7 +1238,7 @@ impl Store {
                 break;
             };
             let tx = self.conn.transaction()?;
-            let freed = evict_oldest(&tx, id, left.min(MAX_EVICT_TX_BYTES))?;
+            let freed = evict_oldest(&tx, id, left.min(step))?;
             // Nothing left to free means the count was off: it must not pick this one again.
             tx.execute(
                 "UPDATE recordings SET bytes = CASE WHEN ?2 = 0 THEN 0 ELSE MAX(bytes - ?2, 0) END
@@ -1075,9 +1251,16 @@ impl Store {
         self.vacuum()
     }
 
-    /// Gives free pages back to the file system.
+    /// Gives free pages back to the file system, as many as the write-ahead log has room to move.
     fn vacuum(&mut self) -> Result<(), RecordingError> {
-        let mut statement = self.conn.prepare("PRAGMA incremental_vacuum")?;
+        let step = (self.wal_limit / 4).max(self.page_size);
+        if !self.wal_has_room(step) {
+            return Ok(());
+        }
+        let pages = step / (self.page_size + WAL_FRAME_HEADER);
+        let mut statement = self
+            .conn
+            .prepare(&format!("PRAGMA incremental_vacuum({})", pages.max(1)))?;
         let mut rows = statement.query([])?;
         while rows.next()?.is_some() {}
         Ok(())
@@ -1192,8 +1375,26 @@ fn earliest(a: Option<Evictable>, b: Option<Evictable>) -> Option<Evictable> {
     }
 }
 
-/// `text` cut to at most `max` bytes at a character boundary, and whether it was cut.
-fn clipped(mut text: String, max: usize) -> (String, bool) {
+/// Marks each line's stream as having lost it.
+fn close_lines(lines: &[LogRow]) {
+    for line in lines {
+        line.source.close_at(line.seq);
+        line.source.count_lost(1);
+    }
+}
+
+/// `text` if it fits in `max` bytes, or only the cut marker: part of a value is still a secret.
+fn whole_or_cut(text: String, max: usize) -> String {
+    if text.len() <= max {
+        text
+    } else {
+        CUT_MARKER.to_owned()
+    }
+}
+
+/// `text` cut to at most `max` bytes at a character boundary, and whether it was cut. For names
+/// only: log and event text goes through [`whole_or_cut`].
+pub(super) fn clipped(mut text: String, max: usize) -> (String, bool) {
     if text.len() <= max {
         return (text, false);
     }
@@ -1227,9 +1428,7 @@ fn prepare_files(path: &Path) -> Result<(), RecordingError> {
 /// is not a regular file is refused.
 fn check_files(path: &Path) -> Result<(), RecordingError> {
     for suffix in ["", "-wal", "-shm"] {
-        let mut name = path.as_os_str().to_owned();
-        name.push(suffix);
-        let file = PathBuf::from(name);
+        let file = side_file(path, suffix);
         match std::fs::symlink_metadata(&file) {
             Ok(meta) if !meta.file_type().is_file() => return Err(RecordingError::NotAFile),
             Ok(meta) if meta.permissions().mode() & 0o777 != OWNER_ONLY => {

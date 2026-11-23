@@ -3,6 +3,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::identity::ConnectionIdentity;
+use super::scrub::LogSource;
 use super::store::*;
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
@@ -135,7 +136,9 @@ fn a_key_header_seen_while_paused_still_withholds_its_body() {
     store
         .append(id, &identity(), lines(vec![line(4, "MIIEsecretbody")]))
         .unwrap();
-    assert_eq!(stored_lines(&store, id), ["[REDACTED:private-key]"]);
+    let stored = stored_lines(&store, id);
+    assert_eq!(stored.len(), 1);
+    assert!(stored[0].starts_with("[REDACTED:cut-off] 2 lines"));
 }
 
 #[test]
@@ -201,10 +204,7 @@ fn opening_keeps_sqlite_s_lock_on_the_database() {
 }
 
 fn cut(at_ms: i64, text: &str) -> LogRow {
-    LogRow {
-        truncated: true,
-        ..line(at_ms, text)
-    }
+    STREAM.with(|s| s.borrow().row(at_ms, text.into(), true))
 }
 
 fn append_each(store: &mut Store, id: RecordingId, rows: Vec<LogRow>) {
@@ -421,6 +421,7 @@ fn a_pinned_reader_cannot_grow_the_log_past_its_reserve() {
     drop(reader);
     let before = store.info(id).unwrap().dropped_rows;
     assert!(before > 0);
+    restart_stream();
     let appended = store
         .append(id, &identity(), lines(vec![line(4000, "after")]))
         .unwrap();
@@ -431,14 +432,18 @@ fn pod(name: &str) -> RecordingTarget {
     RecordingTarget::Pod { name: name.into() }
 }
 
+thread_local! {
+    /// The log stream [`line`] and [`cut`] belong to.
+    static STREAM: std::cell::RefCell<LogSource> = std::cell::RefCell::new(LogSource::new("p", "c"));
+}
+
+/// The stream really restarted.
+fn restart_stream() {
+    STREAM.with(|s| *s.borrow_mut() = LogSource::new("p", "c"));
+}
+
 fn line(at_ms: i64, text: &str) -> LogRow {
-    LogRow {
-        at_ms,
-        pod: "p".into(),
-        container: "c".into(),
-        text: text.into(),
-        truncated: false,
-    }
+    STREAM.with(|s| s.borrow().row(at_ms, text.into(), false))
 }
 
 fn lines(rows: Vec<LogRow>) -> Batch {
@@ -453,6 +458,7 @@ fn open(dir: &Path) -> Store {
 }
 
 fn running(store: &mut Store, name: &str) -> RecordingId {
+    restart_stream();
     store.set_enabled(&identity(), "dev", true, 0).unwrap();
     store.start(&identity(), "ns", &pod(name), 0).unwrap()
 }
@@ -767,6 +773,7 @@ fn the_total_budget_holds_and_takes_the_oldest_recording_first() {
         ..Retention::default()
     };
     let mut store = Store::open(dir.path(), retention).unwrap();
+    restart_stream();
     store.set_enabled(&identity(), "dev", true, 0).unwrap();
     let old = store.start(&identity(), "ns", &pod("old"), 1).unwrap();
     let new = store.start(&identity(), "ns", &pod("new"), 2).unwrap();
@@ -899,7 +906,7 @@ fn a_paused_recording_refuses_rows_and_marks_the_gap() {
 }
 
 #[test]
-fn an_overlong_line_is_cut_at_a_character_and_marked() {
+fn an_overlong_line_is_stored_only_as_a_cut_marker() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = open(dir.path());
     let id = running(&mut store, "a");
@@ -913,8 +920,184 @@ fn an_overlong_line_is_cut_at_a_character_and_marked() {
             Ok((r.get(0)?, r.get(1)?))
         })
         .unwrap();
-    assert!(stored.len() <= crate::logs::MAX_LINE_BYTES);
+    assert!(stored.starts_with("[REDACTED:cut-off] 1 lines"));
+    assert!(!stored.contains('é'));
     assert!(cut);
+}
+
+#[test]
+fn an_overlong_event_message_is_stored_only_as_a_cut_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(dir.path());
+    let id = running(&mut store, "a");
+    let batch = Batch {
+        events: vec![EventRow {
+            at_ms: 1,
+            kind: EventKind::Warning,
+            reason: "Failed".into(),
+            object_kind: "Pod".into(),
+            object_name: "p".into(),
+            message: format!("token 'SECRET{}", "x".repeat(crate::logs::MAX_LINE_BYTES)),
+            count: 1,
+        }],
+        ..Batch::default()
+    };
+    store.append(id, &identity(), batch).unwrap();
+    let message: String = store
+        .connection()
+        .query_row("SELECT message FROM events", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(message, "[REDACTED:cut-off]");
+}
+
+#[test]
+fn a_forged_pem_footer_after_a_cut_does_not_resume_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(dir.path());
+    let id = running(&mut store, "a");
+    let rows = vec![
+        cut(1, "noise"),
+        line(2, "-----BEGIN PRIVATE KEY-----"),
+        line(3, "-----END PRIVATE KEY-----"),
+        line(4, "SECRETBODY"),
+    ];
+    append_each(&mut store, id, rows);
+    let stored = stored_lines(&store, id);
+    assert_eq!(stored.len(), 1);
+    assert!(stored[0].contains("4 lines not recorded"));
+}
+
+#[test]
+fn a_600_line_pem_after_a_cut_stores_none_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(dir.path());
+    let id = running(&mut store, "a");
+    let mut rows = vec![cut(1, "noise")];
+    rows.extend((0..600).map(|at| line(at + 2, &format!("SECRETBODY{at}"))));
+    append_each(&mut store, id, rows);
+    let stored = stored_lines(&store, id);
+    assert_eq!(stored.len(), 1);
+    assert!(stored[0].contains("601 lines not recorded"));
+    assert_eq!(store.info(id).unwrap().dropped_rows, 601);
+}
+
+#[test]
+fn a_cut_record_stores_no_part_of_a_quoted_value() {
+    for text in [
+        "--token 'opaque,continued",
+        r#"{"token":"opaque,continued"#,
+        r#"{"a":"opaque"#,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path());
+        let id = running(&mut store, "a");
+        append_each(&mut store, id, vec![cut(1, text)]);
+        let stored = stored_lines(&store, id).join("\n");
+        assert!(!stored.contains("opaque"), "stored {stored:?}");
+    }
+}
+
+#[test]
+fn a_token_value_on_the_row_after_its_key_is_not_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(dir.path());
+    let id = running(&mut store, "a");
+    let rows = vec![line(1, r#""token":"#), line(2, r#""SECRETVALUE""#)];
+    append_each(&mut store, id, rows);
+    assert!(
+        stored_lines(&store, id)
+            .iter()
+            .all(|l| !l.contains("SECRETVALUE"))
+    );
+}
+
+#[test]
+fn a_starred_recording_stores_nothing_of_a_stream_after_its_budget_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let retention = Retention {
+        max_recording_bytes: 16 * 1024,
+        ..Retention::default()
+    };
+    let mut store = Store::open(dir.path(), retention).unwrap();
+    let id = running(&mut store, "a");
+    store.set_starred(id, true).unwrap();
+    let big = "x".repeat(32 * 1024);
+    let batch = lines(vec![line(1, &big), line(2, "SECRETBODY")]);
+    store.append(id, &identity(), batch).unwrap();
+    append_each(&mut store, id, vec![line(3, "SECRETBODY")]);
+    assert!(
+        stored_lines(&store, id)
+            .iter()
+            .all(|l| !l.contains("SECRETBODY"))
+    );
+    assert_eq!(store.info(id).unwrap().dropped_rows, 3);
+}
+
+/// A store whose write-ahead log a reader keeps from being reclaimed, already past its limit.
+fn pinned(dir: &Path) -> (Store, RecordingId, rusqlite::Connection) {
+    let retention = Retention {
+        max_total_bytes: 1024 * 1024,
+        ..Retention::default()
+    };
+    let mut store = Store::open(dir, retention).unwrap();
+    let id = running(&mut store, "a");
+    append_each(&mut store, id, vec![line(0, "first")]);
+    let reader = rusqlite::Connection::open(dir.join(DATABASE_FILE)).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT COUNT(*) FROM log_lines", [], |r| r.get(0))
+        .unwrap();
+    let text = "w".repeat(1000);
+    for at in 1..1000 {
+        let _ = store.append(id, &identity(), lines(vec![line(at, &text)]));
+    }
+    (store, id, reader)
+}
+
+#[test]
+fn every_write_respects_a_pinned_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, id, reader) = pinned(dir.path());
+    let wal = dir.path().join(format!("{DATABASE_FILE}-wal"));
+    let before = std::fs::metadata(&wal).unwrap().len();
+    for _ in 0..200 {
+        assert!(matches!(
+            store.set_starred(id, true),
+            Err(RecordingError::LogFull)
+        ));
+    }
+    assert!(matches!(store.resume(id, 1), Err(RecordingError::LogFull)));
+    assert!(matches!(store.stop(id, 1), Err(RecordingError::LogFull)));
+    assert!(matches!(store.delete(id), Err(RecordingError::LogFull)));
+    assert_eq!(std::fs::metadata(&wal).unwrap().len(), before);
+    drop(reader);
+    store.set_starred(id, true).unwrap();
+}
+
+#[test]
+fn side_files_keep_a_path_that_is_not_utf8() {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+    let raw = std::ffi::OsString::from_vec(b"/tmp/rec\xff/recordings.sqlite".to_vec());
+    let wal = side_file(Path::new(&raw), "-wal");
+    assert_eq!(
+        wal.as_os_str().as_bytes(),
+        b"/tmp/rec\xff/recordings.sqlite-wal"
+    );
+}
+
+#[test]
+fn first_opens_wait_for_each_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let held = OPEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = dir.path().to_owned();
+    let opening = std::thread::spawn(move || {
+        Store::open(&path, Retention::default()).unwrap();
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!dir.path().join(DATABASE_FILE).exists());
+    drop(held);
+    opening.join().unwrap();
+    assert!(dir.path().join(DATABASE_FILE).exists());
 }
 
 #[test]
