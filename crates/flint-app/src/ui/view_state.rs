@@ -40,6 +40,8 @@ pub struct AppState {
     pub menu: Option<MenuState>,
     /// The command palette, while it is open.
     pub palette: Option<PaletteState>,
+    /// Desktop notifications: the setting, what the OS answered and the latest alerts.
+    pub alerts: Option<super::alert_center::AlertsState>,
 }
 
 /// Where keyboard focus is.

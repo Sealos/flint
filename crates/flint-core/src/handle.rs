@@ -138,6 +138,9 @@ pub enum Command {
     /// Set the appearance (light, dark, or following macOS) and write it to `settings.toml`. The
     /// change arrives back as `Event::SettingsChanged`.
     SetAppearance(Appearance),
+    /// Turn desktop notifications on or off and write it to `settings.toml`. The change arrives
+    /// back as `Event::SettingsChanged`.
+    SetDesktopNotifications(bool),
     /// The namespaces the user filters `cluster` on (empty: all). When the user may not list a
     /// kind in all namespaces, it is listed in these one by one; without a filter, in the
     /// context's default namespace, else in every namespace the user can list. The filter
@@ -256,6 +259,13 @@ pub(crate) enum Request {
     /// Reload the kubeconfig files, and say when that is done.
     ReloadKubeconfig {
         reply: oneshot::Sender<bool>,
+    },
+    /// Activates `cluster` only if it is still the slot and definition given, in the same step.
+    ActivatePinned {
+        cluster: ClusterId,
+        pin: ReadPin,
+        generation: u64,
+        reply: oneshot::Sender<Result<(), ActivationRefused>>,
     },
     Subscribe {
         id: u64,
@@ -434,6 +444,19 @@ impl ClusterSummary {
 pub struct ReadPin {
     pub definition: u64,
     pub server: Option<String>,
+}
+
+/// Why a pinned activation did not happen. The active cluster is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationRefused {
+    /// The context is no longer in kubeconfig.
+    Removed,
+    /// The context now has another slot, definition or server.
+    Changed,
+    /// The context is paused until its kubeconfig is confirmed.
+    Paused,
+    /// The core stopped without answering.
+    Stopped,
 }
 
 /// What the core's answer to a reload means: `None` when it stopped without answering.
@@ -815,6 +838,25 @@ impl CoreHandle {
             reply,
         });
         async move { rx.await.ok().flatten() }
+    }
+
+    /// Activates `cluster` if it is still the slot `generation` with identity `pin`. The core
+    /// compares them in the step that activates, so a reload cannot repoint the context between
+    /// the check and the switch. Works on any executor.
+    pub fn activate_pinned(
+        &self,
+        cluster: &str,
+        pin: ReadPin,
+        generation: u64,
+    ) -> impl Future<Output = Result<(), ActivationRefused>> + Send + 'static + use<> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.requests.try_send(Request::ActivatePinned {
+            cluster: cluster.to_owned(),
+            pin,
+            generation,
+            reply,
+        });
+        async move { rx.await.unwrap_or(Err(ActivationRefused::Stopped)) }
     }
 
     /// Reloads the kubeconfig files now, and resolves once the reload is applied, or with why it

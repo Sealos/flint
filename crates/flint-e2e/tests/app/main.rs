@@ -24,5 +24,6 @@ mod m2_shell;
 mod m3;
 mod m3_edit_actions;
 mod m3_writes;
+mod notifications;
 mod quit;
 mod support;

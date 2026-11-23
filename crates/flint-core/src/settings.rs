@@ -377,6 +377,9 @@ pub struct Settings {
     /// their oldest lines first (never the tab shown, beyond its own `log_buffer_mib`), and say
     /// so. Applies at once. Read it through [`Settings::log_total_bytes`].
     pub log_total_mib: u32,
+    /// Post a desktop notification when a watched cluster has a new problem (#210). Off by
+    /// default. Covers only clusters with a telemetry feed, which watch mode On view never has.
+    pub desktop_notifications: bool,
 }
 
 impl Default for Settings {
@@ -398,6 +401,7 @@ impl Default for Settings {
             log_buffer_lines: DEFAULT_LOG_BUFFER_LINES,
             log_buffer_mib: DEFAULT_LOG_BUFFER_MIB,
             log_total_mib: DEFAULT_LOG_TOTAL_MIB,
+            desktop_notifications: false,
         }
     }
 }
@@ -718,6 +722,7 @@ const SETTINGS_KEYS: &[&str] = &[
     "log_buffer_lines",
     "log_buffer_mib",
     "log_total_mib",
+    "desktop_notifications",
 ];
 
 /// The keys of `table` that are not settings but look like a misspelt one (at most two edits
@@ -1144,6 +1149,18 @@ pub fn set_threshold(
 pub fn set_appearance(dir: &Path, appearance: Appearance) -> Result<Settings, SettingsError> {
     edit_settings(dir, |table, _| {
         table.insert("appearance".into(), toml::Value::try_from(appearance)?);
+        Ok(())
+    })
+}
+
+/// Turns desktop notifications on or off and writes `settings.toml`. Returns the settings as
+/// written.
+pub fn set_desktop_notifications(dir: &Path, enabled: bool) -> Result<Settings, SettingsError> {
+    edit_settings(dir, |table, _| {
+        table.insert(
+            "desktop_notifications".into(),
+            toml::Value::Boolean(enabled),
+        );
         Ok(())
     })
 }
@@ -3128,6 +3145,23 @@ mod tests {
     }
 
     // covers UP-25
+    #[test]
+    fn desktop_notifications_are_off_until_turned_on() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!Settings::default().desktop_notifications);
+        assert!(
+            set_desktop_notifications(dir.path(), true)
+                .unwrap()
+                .desktop_notifications
+        );
+        assert!(load_settings(dir.path()).unwrap().desktop_notifications);
+        assert!(
+            !set_desktop_notifications(dir.path(), false)
+                .unwrap()
+                .desktop_notifications
+        );
+    }
+
     #[test]
     fn watch_mode_is_written_globally_and_per_cluster() {
         let dir = tempfile::tempdir().unwrap();

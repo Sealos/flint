@@ -180,6 +180,9 @@ impl Workspace {
             dock,
             menu,
             palette: self.palette.as_ref().map(|(p, _)| p.read(cx).view_state()),
+            alerts: cx
+                .try_global::<super::super::alert_center::Alerts>()
+                .map(|alerts| alerts.0.read(cx).view_state()),
         }
     }
 

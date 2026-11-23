@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flint_core::activity::ActivityRecord;
+use flint_core::handle::{ActivationRefused, ReadPin};
 use flint_core::settings::{AiExposureState, AiScope, ClusterTag, TrustState};
 use flint_core::{
     Appearance, ClusterDiscovery, ClusterId, ClusterSummary, Command, ConnectionState, CoreHandle,
@@ -197,6 +198,17 @@ impl ClustersModel {
         self.send(Command::Activate(cluster));
     }
 
+    /// Activates `cluster` only if the core still holds it as this slot and identity.
+    pub fn activate_pinned(
+        &mut self,
+        cluster: &str,
+        pin: ReadPin,
+        generation: u64,
+    ) -> impl Future<Output = Result<(), ActivationRefused>> + use<> {
+        self.last_error = None;
+        self.core.activate_pinned(cluster, pin, generation)
+    }
+
     /// Sends a command and clears the previous command's error. The core reports a failure as an
     /// `Event::Error`, which arrives after this (both channels are FIFO).
     fn send(&mut self, command: Command) {
@@ -280,6 +292,12 @@ impl ClustersModel {
         // Not `send`: changing the theme is not an answer to the last error (a removed cluster,
         // a failed write), so its notice stays.
         self.core.send(Command::SetAppearance(appearance));
+    }
+
+    /// Turns desktop notifications on or off. Written to `settings.toml`; the change comes back
+    /// as a settings event.
+    pub fn set_desktop_notifications(&mut self, enabled: bool) {
+        self.send(Command::SetDesktopNotifications(enabled));
     }
 
     /// Tells the core which namespaces the user filters `cluster` on, for kinds the user may not

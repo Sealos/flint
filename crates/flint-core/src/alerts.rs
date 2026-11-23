@@ -20,6 +20,9 @@
 //!   checked, its groups are [`OpenAlertState::Unknown`], and the cooldown restarts once it can.
 //! - The first check of each kind of problem is a baseline and raises nothing, unless
 //!   [`AlertConfig::alert_on_existing`] is set.
+//! - Availability changes are rate-limited: a cluster reports unavailable at most once per
+//!   [`AlertConfig::burst_window`], all clusters share [`AlertConfig::burst_limit`] changes per
+//!   window, and recovery is reported only by a pass that checked every kind.
 //!
 //! # Hold-down
 //!
@@ -449,8 +452,36 @@ struct ClusterState {
     window: RateWindow,
     unavailable_since: Option<Timestamp>,
     unavailable_reported: bool,
+    /// When it was last reported unavailable, so a flapping cluster reports once per window.
+    unavailable_announced: Option<Timestamp>,
     /// How many groups did not fit in the last pass, so only growth is reported.
     last_untracked: u32,
+}
+
+/// Availability changes sent across all clusters in the current window. A change held back here
+/// is not lost: the cluster's state still differs from what was reported, so a later pass sends
+/// it, and one that reverts first sends nothing.
+#[derive(Clone, Copy, Debug, Default)]
+struct AvailabilityBudget {
+    start: Option<Timestamp>,
+    sent: u32,
+}
+
+impl AvailabilityBudget {
+    fn take(&mut self, now: Timestamp, config: &AlertConfig) -> bool {
+        let expired = self
+            .start
+            .is_none_or(|start| start > now || now.duration_since(start) >= config.burst_window);
+        if expired {
+            self.start = Some(now);
+            self.sent = 0;
+        }
+        if self.sent >= config.burst_limit {
+            return false;
+        }
+        self.sent += 1;
+        true
+    }
 }
 
 impl ClusterState {
@@ -462,6 +493,7 @@ impl ClusterState {
             window: RateWindow::new(now),
             unavailable_since: None,
             unavailable_reported: false,
+            unavailable_announced: None,
             last_untracked: 0,
         }
     }
@@ -470,6 +502,7 @@ impl ClusterState {
     fn clamp_times(&mut self, now: Timestamp) {
         self.window.start = self.window.start.min(now);
         self.unavailable_since = self.unavailable_since.map(|since| since.min(now));
+        self.unavailable_announced = self.unavailable_announced.map(|at| at.min(now));
         for first in self.first_seen.values_mut() {
             *first = (*first).min(now);
         }
@@ -492,6 +525,7 @@ struct Seen {
 pub struct AlertEngine {
     config: AlertConfig,
     clusters: HashMap<Arc<str>, ClusterState>,
+    availability: AvailabilityBudget,
 }
 
 impl AlertEngine {
@@ -500,6 +534,22 @@ impl AlertEngine {
         Self {
             config,
             clusters: HashMap::new(),
+            availability: AvailabilityBudget::default(),
+        }
+    }
+
+    /// Whether `cluster` has history here.
+    pub fn tracks(&self, cluster: &str) -> bool {
+        self.clusters.contains_key(cluster)
+    }
+
+    /// Marks every group of `cluster` unknown because its data cannot be read for a moment. Sends
+    /// nothing and starts no outage, but a cooldown in progress restarts on the next real check.
+    pub fn mark_unknown(&mut self, cluster: &str) {
+        if let Some(state) = self.clusters.get_mut(cluster) {
+            for entry in state.tracked.values_mut() {
+                entry.status = Status::Unknown;
+            }
         }
     }
 
@@ -569,9 +619,16 @@ impl AlertEngine {
         }
         let since = *state.unavailable_since.get_or_insert(now);
         let mut events = Vec::new();
-        if !state.unavailable_reported && now.duration_since(since) >= self.config.unavailable_after
+        let spaced = state
+            .unavailable_announced
+            .is_none_or(|at| now.duration_since(at) >= self.config.burst_window);
+        if !state.unavailable_reported
+            && spaced
+            && now.duration_since(since) >= self.config.unavailable_after
+            && self.availability.take(now, &self.config)
         {
             state.unavailable_reported = true;
+            state.unavailable_announced = Some(now);
             events.push(AlertEvent::ClusterUnavailable {
                 cluster: Arc::clone(cluster),
                 open: saturating_u32(state.tracked.len()),
@@ -596,15 +653,23 @@ impl AlertEngine {
         state.window.roll(now, config.burst_window);
 
         let mut events = Vec::new();
-        state.unavailable_since = None;
-        if std::mem::take(&mut state.unavailable_reported) {
+        let unchecked = unchecked_kinds(cluster, problems, unchecked);
+        let unchecked = unchecked.as_slice();
+        // A pass that verified no kind says nothing about the cluster being readable, and only
+        // one that verified every kind is reported as recovery.
+        if ALL_KINDS.iter().any(|kind| !unchecked.contains(kind)) {
+            state.unavailable_since = None;
+        }
+        if state.unavailable_reported
+            && unchecked.is_empty()
+            && self.availability.take(now, &config)
+        {
+            state.unavailable_reported = false;
             events.push(AlertEvent::ClusterAvailable {
                 cluster: Arc::clone(cluster),
             });
         }
 
-        let unchecked = unchecked_kinds(cluster, problems, unchecked);
-        let unchecked = unchecked.as_slice();
         let waiting = update_hold_downs(state, cluster, problems, unchecked, now, &config);
         let (mut seen, mut untracked) = group(cluster, problems, unchecked, &waiting);
         let resolved = update_tracked(state, &mut seen, unchecked, now, config.cooldown);

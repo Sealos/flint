@@ -38,6 +38,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+pub use super::alert_center::{InvestigateAlert, OpenAlert, ToggleDesktopNotifications};
 use super::compare::COMPARE_VIEW;
 pub use super::compare::{
     CompareObject, OpenCompare, RefreshCompare, ToggleCompareSame, ToggleCompareVolatile,
@@ -1814,6 +1815,7 @@ const fn arg(name: &'static str, description: &'static str, kind: ArgKind) -> Ar
 }
 
 const CLUSTER: &[Arg] = &[arg("cluster", "kubeconfig context name", ArgKind::Cluster)];
+const ALERT: &[Arg] = &[arg("tag", "the alert's tag", ArgKind::Text)];
 const COMPARE_OBJECT: &[Arg] = &[
     arg("cluster", "kubeconfig context name", ArgKind::Cluster),
     arg("kind", "the kind, as plural or plural.group", ArgKind::Text),
@@ -2021,6 +2023,21 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             .of(C::Flint, S::App),
         Spec::unit::<AppearanceDark>("Use Dark Appearance", "Always use Flint Dark.")
             .of(C::Flint, S::App),
+        Spec::unit::<ToggleDesktopNotifications>(
+            "Toggle Desktop Notifications",
+            "Notify about new problems on clusters watching all kinds.",
+        )
+        .of(C::Flint, S::App),
+        Spec::with_args::<OpenAlert>("Open Alert…", "Open the cluster that raised an alert.", ALERT)
+            .of(C::Flint, S::App)
+            .hidden(),
+        Spec::with_args::<InvestigateAlert>(
+            "Investigate Alert…",
+            "Open an alert's cluster and copy a read-only prompt for an agent.",
+            ALERT,
+        )
+        .of(C::Flint, S::App)
+        .hidden(),
         Spec::unit::<About>("About Flint", "Show Flint's version.").of(C::Flint, S::Workspace),
         Spec::unit::<ToggleCommandPalette>(
             "Show Command Palette",
