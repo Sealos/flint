@@ -288,6 +288,8 @@ actions!(
         ToggleMatchingOnly,
         /// Show only warnings and errors, or every line.
         ToggleErrorsOnly,
+        /// Read the log search as a regular expression, or as plain text.
+        ToggleLogRegex,
         /// Move focus to the log search field.
         FocusSearch,
         /// Go to the next line matching the search.
@@ -2698,6 +2700,12 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         )
         .of(C::Logs, S::Logs)
         .keys(&["e"], Some(LOG_PLAIN)),
+        Spec::unit::<ToggleLogRegex>(
+            "Toggle Regex Search",
+            "Read the log search as a regular expression, or as plain text.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["secondary-alt-r"], Some(LOG_VIEW)),
         Spec::with_args::<SetLogContext>(
             "Set Context Lines…",
             "How many lines to show around each line a filtered log tab shows.",

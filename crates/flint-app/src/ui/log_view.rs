@@ -59,8 +59,8 @@ use super::menu_record;
 use super::notice::notice;
 use super::registry::{
     self, DragSelection, JumpToEnd, NextMatch, PrevMatch, ReconnectLogs, SaveLines, SaveScope,
-    SelectLine, SetLogContext, ToggleErrorsOnly, ToggleMatchingOnly, TogglePause, ToggleSources,
-    ToggleTimestamps, ToggleWrap,
+    SelectLine, SetLogContext, ToggleErrorsOnly, ToggleLogRegex, ToggleMatchingOnly, TogglePause,
+    ToggleSources, ToggleTimestamps, ToggleWrap,
 };
 use super::theme;
 
@@ -146,11 +146,19 @@ pub struct LogView {
             Arc<std::collections::VecDeque<LineId>>,
         )>,
     >,
+    /// The search's matches in the lines drawn, kept per line and bounded per frame.
+    highlights: std::cell::RefCell<log_model::LineHighlights>,
     /// Bumped with every query, so a slow first scan of an old query is dropped.
     search_generation: u64,
     /// A scan of `search` runs on the core's threads: the first of `query`, or a long
     /// catch-up.
     searching: bool,
+    /// Stops the scan of `search` on the core's threads once it is superseded or the tab closes.
+    search_scan: filter::ScanStop,
+    /// Read the search as a regular expression.
+    regex: bool,
+    /// Why the search's pattern cannot be used, in words for the toolbar.
+    pattern_error: Option<String>,
     current_match: Option<LineId>,
     /// Show only the lines matching the search, with `context` lines around each (UP-48).
     matching_only: bool,
@@ -168,6 +176,8 @@ pub struct LogView {
     /// threads; the rows shown stay until it lands.
     catching_up: bool,
     _catch_up: Task<()>,
+    /// Stops the filter's scan on the core's threads once it is superseded or the tab closes.
+    filter_scan: filter::ScanStop,
     /// Bumped with every new filter, so a slow scan of an old one is dropped.
     filter_generation: u64,
     /// Bumped whenever `filter` is replaced (a scan or catch-up landing, the filter turned
@@ -313,8 +323,12 @@ impl LogView {
             query: SearchQuery::default(),
             search: LogSearch::default(),
             shown_matches: Default::default(),
+            highlights: Default::default(),
             search_generation: 0,
             searching: false,
+            search_scan: Default::default(),
+            regex: false,
+            pattern_error: None,
             current_match: None,
             matching_only: false,
             errors_only: false,
@@ -323,6 +337,7 @@ impl LogView {
             filtering: false,
             catching_up: false,
             _catch_up: Task::ready(()),
+            filter_scan: Default::default(),
             filter_generation: 0,
             rows_generation: 0,
             held_anchor: None,
@@ -523,14 +538,17 @@ impl LogView {
     fn set_query(&mut self, text: String, cx: &mut Context<Self>) {
         let query = SearchQuery {
             sources: self.format().source,
+            regex: self.regex,
             ..SearchQuery::new(text)
         };
         if query == self.query {
             return;
         }
+        self.pattern_error = query.pattern_error().map(|e| e.to_string());
         self.query = query.clone();
         self.current_match = None;
         self.search_generation += 1;
+        self.search_scan.stop();
         self.search = LogSearch::new(query.clone());
         // The matching lines shown follow the search, once it has stayed for a moment; a filter
         // of the old query on its way is dropped, and what is shown stays until the new one
@@ -549,6 +567,14 @@ impl LogView {
         cx.notify();
     }
 
+    /// Searches again for the same text, after something about how it is read changed.
+    fn requery(&mut self, cx: &mut Context<Self>) {
+        let text = std::mem::take(&mut self.query.text);
+        self.query = SearchQuery::default();
+        self.set_query(text, cx);
+        cx.notify();
+    }
+
     /// Brings `search` up to the lines shown on the core's threads, after `delay`. Its result
     /// is dropped if the query changed meanwhile; lines that arrived meanwhile are caught up
     /// with when the tab is drawn next.
@@ -559,6 +585,7 @@ impl LogView {
         cx: &mut Context<Self>,
     ) {
         self.searching = true;
+        self.search_scan.watch(search.cancel_handle());
         let generation = self.search_generation;
         let core = self.core.clone();
         self._search = cx.spawn(async move |this, cx| {
@@ -573,6 +600,7 @@ impl LogView {
                 if view.search_generation == generation {
                     view.search = search;
                     view.searching = false;
+                    view.search_scan.finished();
                     cx.notify();
                 }
             });
@@ -584,26 +612,38 @@ impl LogView {
     /// it catches up at once, or on the core's threads when it is more than
     /// [`CATCH_UP_ON_UI`] lines behind. Nothing to do while a scan runs: it catches up when it
     /// lands.
-    pub fn catch_up_search(&mut self, cx: &mut Context<Self>) {
+    fn catch_up_search(&mut self, budget: &mut filter::UiScanBudget, cx: &mut Context<Self>) {
         if self.searching {
             return;
         }
-        let lines = &self.snapshot.lines;
-        if self.search.pending(lines) > CATCH_UP_ON_UI && !self.query.text.is_empty() {
-            self.scan(self.search.clone(), None, cx);
+        if self.search_fits_ui(budget) {
+            self.search.update(&self.snapshot.lines);
         } else {
-            self.search.update(lines);
+            self.scan(self.search.clone(), None, cx);
         }
     }
 
-    /// Brings the search up to the lines shown at once, before an action uses its matches, if
-    /// no scan runs on the core's threads (those actions are refused meanwhile:
-    /// [`LogView::has_matches`]). A tab on screen is at most a frame behind, so this scans few
-    /// lines.
-    fn catch_up_now(&mut self) {
-        if !self.searching {
-            self.search.update(&self.snapshot.lines);
+    /// Whether the search can catch up on the UI thread, within `budget`.
+    fn search_fits_ui(&self, budget: &mut filter::UiScanBudget) -> bool {
+        let lines = &self.snapshot.lines;
+        self.query.text.is_empty()
+            || filter::catch_up_fits_ui(&self.query, self.search.pending(lines), lines, budget)
+    }
+
+    /// Brings the search up to the lines shown before an action uses its matches, and says
+    /// whether it did. A catch-up too long for the UI thread goes to the core's threads, and
+    /// the action is refused until it lands ([`LogView::has_matches`]).
+    fn catch_up_now(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.searching {
+            return false;
         }
+        if self.search_fits_ui(&mut filter::UiScanBudget::default()) {
+            self.search.update(&self.snapshot.lines);
+            return true;
+        }
+        self.scan(self.search.clone(), None, cx);
+        cx.notify();
+        false
     }
 
     /// Pauses delivery while the user paused or is selecting.
@@ -641,6 +681,7 @@ impl LogView {
             has_matches: self.has_matches(),
             has_selection: self.has_selection(),
             errors_only: self.errors_only,
+            regex: self.regex,
             matching_only: self.matching_only,
             context: self.filter_spec().is_active().then_some(self.context),
         }
@@ -730,7 +771,11 @@ impl LogView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.catch_up_now();
+        // Only the matches depend on the search: Save All and Save Selection do not wait for it.
+        if scope == SaveScope::Matches && !self.catch_up_now(cx) {
+            self.set_note(Tone::Muted, "Still searching…".to_owned(), cx);
+            return;
+        }
         // A filtered tab writes the rows it shows: all of them, the selected ones, or the
         // matches among them, as a list of lines.
         let (scope, matches) = match (self.filter_rows(), scope) {
@@ -919,7 +964,12 @@ impl LogView {
         }
     }
 
-    fn render_line(&mut self, ix: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_line(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme();
         // The item's row: a line still in the buffer.
         let Some((id, line)) = self
@@ -929,7 +979,18 @@ impl LogView {
             return div().into_any_element();
         };
         let max = (!self.wrap).then_some(log_model::UNWRAPPED_MAX_BYTES);
-        let shown = log_model::shown_line(line, self.line_view(), &self.query, max);
+        let shown = log_model::shown_line_with(line, self.line_view(), max, |short| {
+            self.highlights
+                .borrow_mut()
+                .matches(id, line, &self.query, short)
+        });
+        // Rows past this frame's highlighting budget get theirs on the next one.
+        if self.highlights.borrow_mut().take_redraw() {
+            let this = cx.weak_entity();
+            window.on_next_frame(move |_, cx| {
+                let _ = this.update(cx, |_, cx| cx.notify());
+            });
+        }
         let selected = self.selection.is_some_and(|s| s.contains(id));
         let color = match line.severity {
             Severity::Error => theme.danger,
@@ -1268,8 +1329,14 @@ impl LogView {
                                     .id("log-matches")
                                     .flex_none()
                                     .font_features(super::list::tabular_figures())
-                                    .text_color(theme.muted_foreground)
-                                    .child(if self.searching {
+                                    .text_color(if self.pattern_error.is_some() {
+                                        theme.danger
+                                    } else {
+                                        theme.muted_foreground
+                                    })
+                                    .child(if self.pattern_error.is_some() {
+                                        "Invalid pattern".to_owned()
+                                    } else if self.searching {
                                         "Searching…".to_owned()
                                     } else {
                                         let (count, at) = self.shown_match_count();
@@ -1296,6 +1363,18 @@ impl LogView {
                     // menu when the tab is too narrow.
                     .when(fit.toggles, |el| {
                         el.child(
+                            Button::new("log-regex")
+                                .xsmall()
+                                .ghost()
+                                .label("Regex")
+                                .selected(self.regex)
+                                .tooltip(format!(
+                                    "Read the search as a regular expression ({})",
+                                    registry::key_hint("secondary-alt-r")
+                                ))
+                                .on_click(registry::on_click(ToggleLogRegex)),
+                        )
+                        .child(
                             Button::new("log-matching-only")
                                 .xsmall()
                                 .ghost()
@@ -1446,6 +1525,7 @@ impl LogView {
                                     .icon(IconName::Ellipsis)
                                     .xsmall()
                                     .ghost()
+                                    .accessibility_label("More log options")
                                     .tooltip("View options and Save")
                                     .dropdown_menu_with_anchor(
                                         Anchor::TopRight,
@@ -1475,6 +1555,7 @@ impl LogView {
                 .xsmall()
                 .ghost()
                 .disabled(!has_matches)
+                .accessibility_label("Previous match")
                 .tooltip(format!(
                     "Previous match ({})",
                     registry::key_hint("secondary-shift-g")
@@ -1485,12 +1566,24 @@ impl LogView {
                 .xsmall()
                 .ghost()
                 .disabled(!has_matches)
+                .accessibility_label("Next match")
                 .tooltip(format!(
                     "Next match ({})",
                     registry::key_hint("secondary-g")
                 ))
                 .on_click(registry::on_click(NextMatch)),
         ]
+    }
+
+    /// Why the search's pattern cannot be used, in full: at any width, since a narrow toolbar
+    /// has no match count.
+    fn render_pattern_error(&self, theme: &Theme) -> Option<AnyElement> {
+        let text = self.pattern_error.clone()?;
+        Some(
+            notice("log-pattern-error", text, theme.danger)
+                .test_support()
+                .into_any_element(),
+        )
     }
 
     /// The strip under the toolbar: the last transient thing said (a copy or save note, else
@@ -1723,7 +1816,12 @@ impl LogView {
         let (spinner, text) = if self.filtering || self.catching_up {
             (true, "Filtering…".to_owned())
         } else {
-            (false, log_model::filter_empty_text(&self.filter_spec()))
+            let spec = self.filter_spec();
+            let text = match &self.pattern_error {
+                Some(error) if spec.query.is_some() => error.clone(),
+                _ => log_model::filter_empty_text(&spec),
+            };
+            (false, text)
         };
         v_flex()
             .id("log-filter-empty")
@@ -1776,6 +1874,7 @@ fn fill_menu(
                 Toggle::Sources => item.on_click(registry::on_click(ToggleSources)),
                 Toggle::Wrap => item.on_click(registry::on_click(ToggleWrap)),
                 Toggle::ErrorsOnly => item.on_click(registry::on_click(ToggleErrorsOnly)),
+                Toggle::Regex => item.on_click(registry::on_click(ToggleLogRegex)),
                 Toggle::MatchingOnly => item.on_click(registry::on_click(ToggleMatchingOnly)),
                 Toggle::Context(lines) => item.on_click(registry::on_click(SetLogContext {
                     lines: lines as u32,
@@ -1862,8 +1961,10 @@ fn starts_before(lines: &flint_core::logs::LogLines, cutoff: u64) -> bool {
 impl Render for LogView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.drop_trimmed_rows(cx);
-        self.catch_up_search(cx);
-        self.catch_up_filter(cx);
+        let mut scan_budget = filter::UiScanBudget::default();
+        self.catch_up_search(&mut scan_budget, cx);
+        self.catch_up_filter(&mut scan_budget, cx);
+        self.highlights.borrow_mut().begin_frame();
         let theme = cx.theme().clone();
         // The toolbar needs the tab's width, known only after layout: when it changed, draw
         // again with the new one.
@@ -1923,6 +2024,7 @@ impl Render for LogView {
             .bg(theme.background)
             .track_scroll(&self.bounds)
             .child(self.render_toolbar(&theme))
+            .children(self.render_pattern_error(&theme))
             .children(self.render_banner(&theme))
             .children(self.render_notice(&theme))
             .child(body)
