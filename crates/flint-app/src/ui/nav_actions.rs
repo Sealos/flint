@@ -7,8 +7,8 @@ use flint_core::NavSection;
 use gpui_kit::*;
 
 use super::super::registry::{
-    ActionError, Bind, CollapseSection, ExpandSection, OnView, OpenSelectedKind, SelectNextKind,
-    SelectPreviousKind, ToggleNavSection,
+    ActionError, Bind, CollapseSection, ExpandSection, OnView, OpenClusterOverview,
+    OpenSelectedKind, SelectNextKind, SelectPreviousKind, ToggleNavSection,
 };
 use super::{NavEvent, NavPanel, NavRow};
 
@@ -17,6 +17,7 @@ impl NavPanel {
     /// [`Bind`]: the workspace forwards these.
     pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
         bind.bind::<ToggleNavSection>(Self::toggle_section)
+            .bind::<OpenClusterOverview>(|_, _, _, cx| cx.emit(NavEvent::OpenOverview))
     }
 
     /// The keyboard cursor's actions: only while the navigation has focus, so they are bound

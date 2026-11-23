@@ -8,8 +8,6 @@
 //! Missing data is never shown as zero: a count that could not be read says so, and its tile does
 //! not open a list.
 
-#![allow(dead_code, reason = "navigation opens this view in a later change")]
-
 use std::cmp::Reverse;
 use std::sync::Arc;
 
@@ -25,15 +23,26 @@ use flint_core::telemetry::{
 };
 use flint_core::thresholds::{ThresholdLevel, Thresholds};
 use gpui_kit::component::{ActiveTheme as _, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use jiff::Timestamp;
 use k8s_openapi::api::core::v1::{Event as KubeEvent, PersistentVolumeClaim};
+use serde::{Deserialize, Deserializer, de};
 
+use super::registry::{Bind, OnView};
+
+#[path = "dashboard_feed.rs"]
+mod feed;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "only tests ask a sparkline if it is empty")
+)]
 #[path = "sparkline.rs"]
 mod sparkline;
 #[path = "dashboard_tiles.rs"]
 mod tiles;
 
+pub use feed::{ProblemList, ProblemLists};
 use sparkline::SparklineShape;
 
 /// The most Warning events listed.
@@ -65,6 +74,52 @@ pub const METRICS_WAITING: &str = "Waiting for the first metrics sample.";
 #[action(namespace = dashboard, no_json)]
 pub struct OpenProblemList {
     pub category: ProblemCategory,
+}
+
+/// The registry probes an action with its default.
+impl Default for OpenProblemList {
+    fn default() -> Self {
+        Self {
+            category: ProblemCategory::ALL[0],
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OpenProblemList {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Args {
+            category: String,
+        }
+        let args = Args::deserialize(deserializer)?;
+        ProblemCategory::ALL
+            .into_iter()
+            .find(|category| category_name(*category) == args.category)
+            .map(|category| Self { category })
+            .ok_or_else(|| de::Error::custom(format!("unknown category {:?}", args.category)))
+    }
+}
+
+/// Each category as [`OpenProblemList`] names it, in [`ProblemCategory::ALL`] order.
+pub const CATEGORY_NAMES: [&str; ProblemCategory::ALL.len()] = [
+    category_name(ProblemCategory::ALL[0]),
+    category_name(ProblemCategory::ALL[1]),
+    category_name(ProblemCategory::ALL[2]),
+    category_name(ProblemCategory::ALL[3]),
+    category_name(ProblemCategory::ALL[4]),
+    category_name(ProblemCategory::ALL[5]),
+];
+
+const fn category_name(category: ProblemCategory) -> &'static str {
+    match category {
+        ProblemCategory::FailingPods => "failing_pods",
+        ProblemCategory::NotReadyNodes => "not_ready_nodes",
+        ProblemCategory::WarningEvents => "warning_events",
+        ProblemCategory::PendingClaims => "pending_claims",
+        ProblemCategory::FailedJobs => "failed_jobs",
+        ProblemCategory::ShortWorkloads => "short_workloads",
+    }
 }
 
 /// What the dashboard asks of whoever hosts it.
@@ -523,8 +578,12 @@ fn cleaned(text: &str) -> String {
 /// Draws a [`DashboardModel`].
 pub struct DashboardView {
     model: DashboardModel,
+    /// The objects behind each tile, read together with `model`.
+    lists: ProblemLists,
     focus: FocusHandle,
     scroll: ScrollHandle,
+    /// Keeps the model current while the view is open.
+    feed: feed::Feed,
 }
 
 impl EventEmitter<DashboardEvent> for DashboardView {}
@@ -533,9 +592,27 @@ impl DashboardView {
     pub fn new(model: DashboardModel, cx: &mut Context<Self>) -> Self {
         Self {
             model,
+            lists: ProblemLists::new(),
             focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
+            feed: feed::Feed::default(),
         }
+    }
+
+    /// The registered actions of an open dashboard, for [`Bind`].
+    pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
+        bind.bind::<OpenProblemList>(Self::open_list)
+    }
+
+    /// The objects behind `category`'s tile, as last read.
+    pub fn problem_list(&self, category: ProblemCategory) -> Option<&ProblemList> {
+        self.lists.get(&category)
+    }
+
+    /// Shows `model` and the objects behind its tiles.
+    pub fn set_data(&mut self, model: DashboardModel, lists: ProblemLists, cx: &mut Context<Self>) {
+        self.lists = lists;
+        self.set_model(model, cx);
     }
 
     /// Shows `model`, redrawing only if it differs.
@@ -546,6 +623,7 @@ impl DashboardView {
         }
     }
 
+    #[cfg(test)]
     pub fn model(&self) -> &DashboardModel {
         &self.model
     }
@@ -576,7 +654,7 @@ impl Render for DashboardView {
             .id("dashboard")
             .key_context("Dashboard")
             .track_focus(&self.focus)
-            .on_action(cx.listener(Self::open_list))
+            .map(|el| Self::bind_actions(OnView::new(el, cx)).into_element())
             .size_full()
             .min_w_0()
             .p_4()

@@ -82,6 +82,25 @@ struct Query {
     namespaces: Vec<String>,
     text: String,
     sort: Option<SortSpec>,
+    /// Only these objects, when the list was opened from a dashboard problem tile.
+    only: Option<ObjectFilter>,
+}
+
+/// A fixed set of objects a list is narrowed to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectFilter {
+    /// What the objects are, for the notice: `failing pods`.
+    pub label: String,
+    /// By [`object_key`].
+    pub keys: Arc<std::collections::HashSet<String>>,
+}
+
+/// How an [`ObjectFilter`] names an object. A Kubernetes name holds no `/`.
+pub fn object_key(namespace: Option<&str>, name: &str) -> String {
+    match namespace {
+        Some(namespace) => format!("{namespace}/{name}"),
+        None => name.to_owned(),
+    }
 }
 
 pub struct ResourceList {
@@ -402,6 +421,22 @@ impl ResourceList {
         self._watch = Task::ready(());
     }
 
+    /// Narrows the list to `only`, or shows every object again with `None`.
+    pub fn show_only(&mut self, only: Option<ObjectFilter>, cx: &mut Context<Self>) {
+        if self.query.only != only {
+            self.query.only = only;
+            self.remeasure = true;
+            self.recompute(cx);
+            cx.notify();
+        }
+    }
+
+    /// What the list is narrowed to, if anything.
+    #[cfg(test)]
+    pub fn only(&self) -> Option<&ObjectFilter> {
+        self.query.only.as_ref()
+    }
+
     pub fn set_namespaces(&mut self, namespaces: Vec<String>, cx: &mut Context<Self>) {
         if self.query.namespaces != namespaces {
             self.query.namespaces = namespaces;
@@ -574,6 +609,8 @@ impl ResourceList {
         let namespaces = self.query.namespaces.clone();
         let one_namespace = namespaces.len() == 1;
         let job_snapshot = snapshot.clone();
+        let only = self.query.only.as_ref().map(|only| only.keys.clone());
+        let job_only = only.clone();
         #[cfg(test)]
         let gate = self.compute_gate.clone();
         let job = cx.background_spawn(async move {
@@ -582,6 +619,17 @@ impl ResourceList {
                 let _ = gate.recv().await;
             }
             let rows = view.await;
+            let rows: Arc<[u32]> = match &job_only {
+                Some(keys) => rows
+                    .iter()
+                    .copied()
+                    .filter(|&i| {
+                        let row = &job_snapshot.rows[i as usize];
+                        keys.contains(&object_key(row.namespace.as_deref(), &row.name))
+                    })
+                    .collect(),
+                None => rows,
+            };
             let measured = list_model::rows_to_measure(&job_snapshot, &namespaces);
             let widths = list_model::measure_columns(&job_snapshot, &measured, unix_now());
             let scoped = list_model::rows_in_namespaces(&job_snapshot, &namespaces);
@@ -607,7 +655,11 @@ impl ResourceList {
                     list.query.sort.as_ref(),
                     &list.sortable_in(&snapshot.columns),
                 );
-                if now != job_sort || (list.restoring_filter && job_text != list.query.text) {
+                let only_now = list.query.only.as_ref().map(|only| &only.keys);
+                if now != job_sort
+                    || only_now != only.as_ref()
+                    || (list.restoring_filter && job_text != list.query.text)
+                {
                     list.remeasure |= restart;
                     list.recompute(cx);
                     return None;
@@ -1375,6 +1427,18 @@ impl ResourceList {
         if let Some(text) = self.filtered_out_text() {
             banners.push(
                 notice("list-filtered-out", text, theme.info)
+                    .test_support()
+                    .into_any_element(),
+            );
+        }
+        if let Some(only) = &self.query.only {
+            let text = format!(
+                "Showing the {} the overview found. Open {} in the navigation to see all.",
+                only.label, self.label
+            );
+            banners.push(
+                notice("list-problem-filter", text.clone(), theme.info)
+                    .aria_label(text)
                     .test_support()
                     .into_any_element(),
             );
