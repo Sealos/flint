@@ -982,10 +982,16 @@ impl Workspace {
     /// if so. A cluster still connecting may: the object to act on is loading too.
     pub(in crate::ui) fn sessions_blocked(&self, cluster: &str, cx: &App) -> Option<String> {
         let summary = self.cluster_summary(cluster, cx);
+        // Only the words depend on the cause: whether this blocks is decided around it.
+        let waiting = || {
+            let cause = match summary.is_some_and(|c| self.model.read(cx).writes_paused(c)) {
+                true => "a kubeconfig file can't be read, so ",
+                false => "",
+            };
+            format!("{cause}{cluster} is waiting for its kubeconfig to be confirmed")
+        };
         if summary.is_some_and(|c| self.model.read(cx).sessions_paused(c)) {
-            return Some(format!(
-                "{cluster} is waiting for its kubeconfig to be confirmed"
-            ));
+            return Some(waiting());
         }
         match summary.map(|c| &c.state) {
             Some(ConnectionState::Connected(_) | ConnectionState::Connecting) => None,
@@ -993,9 +999,7 @@ impl Workspace {
             Some(ConnectionState::Failed(error)) => {
                 Some(format!("{cluster} is not connected: {error}"))
             }
-            Some(ConnectionState::AwaitingConfirmation) => Some(format!(
-                "{cluster} is waiting for its kubeconfig to be confirmed"
-            )),
+            Some(ConnectionState::AwaitingConfirmation) => Some(waiting()),
             Some(ConnectionState::Disconnected) => Some(format!("{cluster} is not connected")),
             None => Some(format!("no kubeconfig context named {cluster}")),
         }
@@ -1738,6 +1742,10 @@ mod scope_tests;
 #[cfg(test)]
 #[path = "protect_tests.rs"]
 mod protect_tests;
+
+#[cfg(test)]
+#[path = "cluster_text_tests.rs"]
+mod cluster_text_tests;
 
 #[cfg(test)]
 #[path = "row_actions_tests.rs"]

@@ -45,9 +45,10 @@ use super::compare::COMPARE_VIEW;
 pub use super::compare::{
     CompareObject, OpenCompare, RefreshCompare, ToggleCompareSame, ToggleCompareVolatile,
 };
+pub use super::dashboard::set::{OpenSetMember, OpenSetProblem};
 use super::list::combined::{
-    SelectCombinedRow, SortCombined, ToggleClusterFilter, ToggleClusterGroup, ToggleCombinedWide,
-    ToggleGroupByCluster,
+    SelectCombinedRow, ShowAllCombinedRows, SortCombined, ToggleClusterFilter, ToggleClusterGroup,
+    ToggleCombinedWide, ToggleGroupByCluster,
 };
 
 actions!(
@@ -70,7 +71,13 @@ actions!(
         /// Hide every other app's windows (macOS).
         HideOthers,
         /// Show every app's windows again (macOS).
-        ShowAll
+        ShowAll,
+        /// Minimize the front window.
+        MinimizeWindow,
+        /// Zoom the front window, or return it to its earlier size.
+        ZoomWindow,
+        /// Open Flint's project page in the browser.
+        OpenHelp
     ]
 );
 actions!(
@@ -594,7 +601,11 @@ actions!(
         /// Run the clusters chosen in the sidebar as a set and open their combined list.
         OpenPickedClusters,
         /// Stop the running set and close its combined list.
-        CloseClusterSet
+        CloseClusterSet,
+        /// Show a card per cluster of the running set, worst first.
+        OpenClusterSetDashboard,
+        /// Go back from the set's dashboard to its combined list.
+        ShowClusterSetList
     ]
 );
 
@@ -1865,6 +1876,25 @@ const COMPARE_OBJECT: &[Arg] = &[
     arg("name", "the object's name", ArgKind::Text),
 ];
 const SET_NAME: &[Arg] = &[arg("name", "the cluster set's name", ArgKind::Text)];
+const SET_PROBLEM: &[Arg] = &[
+    arg(
+        "category",
+        "which problem count",
+        ArgKind::Choice(&super::dashboard::CATEGORY_NAMES),
+    ),
+    Arg {
+        name: "cluster",
+        description: "the member; every member when left out",
+        required: false,
+        kind: ArgKind::Cluster,
+    },
+    Arg {
+        name: "kind",
+        description: "which kind of short workload",
+        required: false,
+        kind: ArgKind::Choice(&super::dashboard::SHORT_WORKLOAD_KINDS),
+    },
+];
 const COMBINED_ROW: &[Arg] = &[
     arg("cluster", "kubeconfig context name", ArgKind::Cluster),
     arg("uid", "the object's uid", ArgKind::Text),
@@ -2105,8 +2135,21 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             .keys(HIDE_OTHERS, None),
         Spec::unit::<ShowAll>("Show All", "Show the windows of every app again.")
             .of(C::Flint, S::App),
+        Spec::unit::<MinimizeWindow>("Minimize", "Minimize the front window.")
+            .of(C::Flint, S::Workspace)
+            .keys(MINIMIZE, None),
+        Spec::unit::<ZoomWindow>("Zoom", "Zoom the front window, or return it to its earlier size.")
+            .of(C::Flint, S::Workspace),
+        Spec::unit::<OpenHelp>("Flint Help", "Open Flint's project page in the browser.")
+            .of(C::Flint, S::App),
         // The Edit menu, for the text fields (the list filter, the namespace field, dialogs):
         // gpui-component's own actions, which a focused field handles.
+        Spec::unit::<input::Undo>("Undo", "Undo the last change in the focused field.")
+            .of(C::Flint, S::TextField)
+            .keys(&["secondary-z"], Some(TEXT_FIELD)),
+        Spec::unit::<input::Redo>("Redo", "Redo the last undone change in the focused field.")
+            .of(C::Flint, S::TextField)
+            .keys(REDO, Some(TEXT_FIELD)),
         Spec::unit::<input::Cut>("Cut", "Cut the selected text of the focused field.")
             .of(C::Flint, S::TextField)
             .keys(&["secondary-x"], Some(TEXT_FIELD)),
@@ -2575,6 +2618,30 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Stop the running set and close its combined list.",
         )
         .of(C::Cluster, S::ClusterSets),
+        Spec::unit::<OpenClusterSetDashboard>(
+            "Open Cluster Set Dashboard",
+            "Show a card per cluster of the running set, worst first.",
+        )
+        .of(C::Cluster, S::ClusterSets),
+        Spec::unit::<ShowClusterSetList>(
+            "Show Cluster Set List",
+            "Go back from the set's dashboard to its combined list.",
+        )
+        .of(C::Cluster, S::ClusterSets),
+        Spec::with_args::<OpenSetMember>(
+            "Open Set Member…",
+            "Open the combined list filtered to one member.",
+            CLUSTER,
+        )
+        .of(C::Cluster, S::ClusterSets)
+        .hidden(),
+        Spec::with_args::<OpenSetProblem>(
+            "Open Set Problem…",
+            "Open the combined list filtered to what a dashboard count counted.",
+            SET_PROBLEM,
+        )
+        .of(C::Cluster, S::ClusterSets)
+        .hidden(),
         // The combined list.
         Spec::with_args::<SelectCombinedRow>(
             "Select Combined Row…",
@@ -2612,6 +2679,11 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<ToggleCombinedWide>(
             "Toggle Wide Combined Columns",
             "Show or hide the combined list's extra columns.",
+        )
+        .of(C::List, S::CombinedList),
+        Spec::unit::<ShowAllCombinedRows>(
+            "Show All Combined Rows",
+            "Show every row again after a dashboard narrowed the combined list.",
         )
         .of(C::List, S::CombinedList),
         // Detail pane.
@@ -3042,6 +3114,18 @@ const HIDE_OTHERS: &[&str] = if cfg!(target_os = "macos") {
 } else {
     &[]
 };
+/// Minimize: Cmd-M on macOS. Nothing elsewhere: Ctrl-M is Enter in a shell.
+const MINIMIZE: &[&str] = if cfg!(target_os = "macos") {
+    &["secondary-m"]
+} else {
+    &[]
+};
+/// Redo in a text field: Shift-Cmd-Z on macOS, Ctrl-Y elsewhere.
+const REDO: &[&str] = if cfg!(target_os = "macos") {
+    &["secondary-shift-z"]
+} else {
+    &["secondary-y"]
+};
 
 /// Copy in a shell tab: Cmd-C on macOS; Ctrl-Shift-C elsewhere, where Ctrl-C interrupts the
 /// program.
@@ -3156,12 +3240,17 @@ pub mod tests {
         }
     }
 
-    /// Asserts that `bind_actions` binds exactly the registry's actions of `scope`.
+    /// Window-level actions the root handles, not the view that owns their scope: they are
+    /// `Scope::Workspace` so the native menu disables them without a window.
+    const HANDLED_BY_ROOT: [&str; 2] = ["flint::MinimizeWindow", "flint::ZoomWindow"];
+
+    /// Asserts that `bind_actions` binds exactly the registry's actions of `scope`, apart from
+    /// those the root handles.
     pub fn assert_binds_scope(scope: Scope, bind_actions: fn(Names) -> Names) {
         let mut bound = bind_actions(Names(Vec::new())).0;
         let mut wanted: Vec<&str> = actions()
             .iter()
-            .filter(|s| s.scope == scope)
+            .filter(|s| s.scope == scope && !HANDLED_BY_ROOT.contains(&s.name))
             .map(|s| s.name)
             .collect();
         bound.sort_unstable();
@@ -3312,6 +3401,11 @@ pub mod tests {
             ("flint::Hide", "Hide Flint"),
             ("flint::HideOthers", "Hide Others"),
             ("flint::ShowAll", "Show All"),
+            ("flint::MinimizeWindow", "Minimize"),
+            ("flint::ZoomWindow", "Zoom"),
+            ("flint::OpenHelp", "Flint Help"),
+            ("input::Undo", "Undo"),
+            ("input::Redo", "Redo"),
             ("input::Cut", "Cut"),
             ("input::Copy", "Copy"),
             ("input::Paste", "Paste"),
@@ -3327,7 +3421,24 @@ pub mod tests {
         let hide_others: &[&str] = if mac { &["secondary-alt-h"] } else { &[] };
         assert_eq!(find("flint::Hide").unwrap().keys, hide);
         assert_eq!(find("flint::HideOthers").unwrap().keys, hide_others);
+        // Ctrl-M is Enter in a shell, so only macOS has a key for Minimize.
+        let minimize: &[&str] = if mac { &["secondary-m"] } else { &[] };
+        assert_eq!(find("flint::MinimizeWindow").unwrap().keys, minimize);
+        assert!(find("flint::ZoomWindow").unwrap().keys.is_empty());
+        assert!(find("flint::OpenHelp").unwrap().keys.is_empty());
+        // These two need a window, so that the native menu disables them without one.
+        for name in ["flint::MinimizeWindow", "flint::ZoomWindow"] {
+            assert_eq!(find(name).unwrap().scope, Scope::Workspace, "{name}");
+        }
+        assert_eq!(find("flint::OpenHelp").unwrap().scope, Scope::App);
+        let redo = if mac {
+            "secondary-shift-z"
+        } else {
+            "secondary-y"
+        };
         for (name, key) in [
+            ("input::Undo", "secondary-z"),
+            ("input::Redo", redo),
             ("input::Cut", "secondary-x"),
             ("input::Copy", "secondary-c"),
             ("input::Paste", "secondary-v"),

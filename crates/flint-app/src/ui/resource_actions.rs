@@ -344,7 +344,7 @@ pub(in crate::ui) fn check(
         return Err(why.into());
     }
     // Checked before protection, as the access mode is: no unlock would allow this write.
-    if let Some(why) = ws.member_writes_paused(&object.cluster, cx) {
+    if let Some(why) = ws.writes_paused_why(&object.cluster, cx) {
         return Err(why.into());
     }
     if ws.is_protected(&object.cluster, cx) {

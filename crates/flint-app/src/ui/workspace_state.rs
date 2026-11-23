@@ -66,6 +66,7 @@ impl Workspace {
                         AiExposureState::ServerChanged { .. } => "server_changed",
                     },
                     protection: model.protection(cluster).name(),
+                    kubeconfig_unreadable: model.writes_paused(cluster),
                     cursor: cursor.as_deref() == Some(cluster.info.name.as_str()),
                 }
             })
@@ -183,6 +184,7 @@ impl Workspace {
             alerts: cx
                 .try_global::<super::super::alert_center::Alerts>()
                 .map(|alerts| alerts.0.read(cx).view_state()),
+            sets: self.sets_view_state(cx),
         }
     }
 

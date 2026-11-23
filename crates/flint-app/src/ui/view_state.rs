@@ -42,6 +42,49 @@ pub struct AppState {
     pub palette: Option<PaletteState>,
     /// Desktop notifications: the setting, what the OS answered and the latest alerts.
     pub alerts: Option<super::alert_center::AlertsState>,
+    /// Cluster sets: the sidebar's choice, the saved sets and the running set.
+    pub sets: ClusterSetsState,
+}
+
+/// Cluster sets, as the sidebar and the set's view show them.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterSetsState {
+    pub picking: bool,
+    /// The chosen contexts, in the order they were chosen.
+    pub picked: Vec<String>,
+    /// The names of the saved sets.
+    pub saved: Vec<String>,
+    pub error: Option<String>,
+    pub open: Option<OpenSetState>,
+}
+
+/// The running set and its combined list.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenSetState {
+    pub label: String,
+    pub members: Vec<SetMemberState>,
+    /// One per cluster while grouped by cluster, else empty.
+    pub groups: Vec<SetGroupState>,
+    /// Saved members the core left out when the set opened.
+    pub left_out: Vec<String>,
+    pub list: ListState,
+}
+
+/// A member of the running set.
+#[derive(Debug, Clone, Serialize)]
+pub struct SetMemberState {
+    pub cluster: String,
+    /// What the set's bar says is wrong with it (`Changed`, `Failed`, ...).
+    pub note: Option<String>,
+    pub tag: Option<flint_core::settings::ClusterTag>,
+}
+
+/// One cluster's section of a grouped combined list.
+#[derive(Debug, Clone, Serialize)]
+pub struct SetGroupState {
+    pub cluster: String,
+    pub count: usize,
+    pub collapsed: bool,
 }
 
 /// Where keyboard focus is.
@@ -203,6 +246,9 @@ pub struct ClusterState {
     /// `protected`, `local` (a known local cluster), `unlocked` (for this session) or `trusted`
     /// (ADR-0015).
     pub protection: &'static str,
+    /// A kubeconfig file can't be read, so writes and new shells are paused. Apart from
+    /// `connection`: the cluster can stay connected and readable meanwhile.
+    pub kubeconfig_unreadable: bool,
     /// The sidebar's keyboard cursor is on it (shown with the focus ring while the sidebar
     /// has focus).
     pub cursor: bool,
@@ -278,6 +324,8 @@ pub struct NavEntryState {
     pub cursor: bool,
     /// The watch-state marker: `loading`, `reconnecting` or `failed`.
     pub marker: Option<&'static str>,
+    /// With a cluster set open, how many members serve it (`2/3`), unless all of them do.
+    pub badge: Option<String>,
 }
 
 /// The open resource list.
