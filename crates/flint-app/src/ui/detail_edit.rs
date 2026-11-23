@@ -9,7 +9,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use flint_core::display::single_line;
 use flint_core::write::WriteTarget;
 use flint_core::write::{WriteAction, WriteError, WriteOutcome, WriteProposal, WriteReview};
 use flint_core::{ObjectDetail, WriteRefusal};
@@ -53,9 +52,9 @@ pub(super) struct YamlEdit {
     pub phase: Phase,
     /// Why the last step failed, in the server's or the core's words.
     pub error: Option<String>,
-    /// The object when the edit opened. A reload does not move it: what was typed is still
-    /// relative to this.
-    base: Value,
+    /// Each distinct state this edit has seen, without server-owned fields, from the one it
+    /// opened on. A value that left and came back is still someone's change.
+    seen: Vec<Value>,
     /// The object at the last reload.
     latest: Option<Arc<ObjectDetail>>,
     /// Paths the last review would overwrite after they changed on the cluster.
@@ -148,8 +147,14 @@ const SERVER_OWNED_METADATA: [&str; 8] = [
     "uid",
 ];
 
-/// How many paths a warning names before it counts the rest.
-const NAMED_PATHS: usize = 5;
+/// One step of a path into an object. Kept structured so that two different paths stay two,
+/// whatever their keys contain.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Step<'a> {
+    Key(&'a str),
+    /// A list item, by its `name`.
+    Item(&'a str),
+}
 
 fn without_server_owned(object: &Value) -> Value {
     let mut kept = object.clone();
@@ -164,31 +169,33 @@ fn without_server_owned(object: &Value) -> Value {
     kept
 }
 
-/// The paths that changed from `base` to `latest` and that `yaml` would set to something other
-/// than `latest`, sorted. Text that does not parse has none: its review fails.
-fn competing_changes(base: &Value, latest: &Value, yaml: &str) -> Vec<String> {
+/// The paths that differ between any state in `seen` and `latest` and that `yaml` would set to
+/// something other than `latest`, sorted. Text that does not parse has none: its review fails.
+fn competing_changes(seen: &[Value], latest: &Value, yaml: &str) -> Vec<String> {
     let Ok(edited) = serde_saphyr::from_str::<Value>(yaml) else {
         return Vec::new();
     };
-    let mut found = Vec::new();
-    collect_competing(
-        Some(&without_server_owned(base)),
-        Some(&without_server_owned(latest)),
-        Some(&without_server_owned(&edited)),
-        "",
-        &mut found,
-    );
-    found.sort();
-    found.dedup();
-    found
+    let latest = without_server_owned(latest);
+    let edited = without_server_owned(&edited);
+    let mut found = BTreeSet::new();
+    for earlier in seen {
+        collect_competing(
+            Some(earlier),
+            Some(&latest),
+            Some(&edited),
+            &mut Vec::new(),
+            &mut found,
+        );
+    }
+    found.iter().map(|path| path_text(path)).collect()
 }
 
-fn collect_competing(
-    base: Option<&Value>,
-    latest: Option<&Value>,
-    edited: Option<&Value>,
-    path: &str,
-    found: &mut Vec<String>,
+fn collect_competing<'a>(
+    base: Option<&'a Value>,
+    latest: Option<&'a Value>,
+    edited: Option<&'a Value>,
+    path: &mut Vec<Step<'a>>,
+    found: &mut BTreeSet<Vec<Step<'a>>>,
 ) {
     if base == latest || latest == edited {
         return;
@@ -197,44 +204,70 @@ fn collect_competing(
         (Some(Value::Object(b)), Some(Value::Object(l)), None | Some(Value::Object(_))) => {
             let e = edited.and_then(Value::as_object);
             for key in b.keys().chain(l.keys()).collect::<BTreeSet<_>>() {
+                path.push(Step::Key(key));
                 collect_competing(
                     b.get(key),
                     l.get(key),
                     e.and_then(|e| e.get(key)),
-                    &key_path(path, key),
+                    path,
                     found,
                 );
+                path.pop();
             }
         }
         (Some(Value::Array(b)), Some(Value::Array(l)), Some(Value::Array(e))) => {
             let (Some(nb), Some(nl), Some(ne)) = (by_name(b), by_name(l), by_name(e)) else {
-                found.push(path.to_owned());
+                found.insert(path.clone());
                 return;
             };
-            for name in nb.keys().chain(nl.keys()).collect::<BTreeSet<_>>() {
+            for name in nb.keys().chain(nl.keys()).copied().collect::<BTreeSet<_>>() {
+                path.push(Step::Item(name));
                 collect_competing(
                     nb.get(name).copied(),
                     nl.get(name).copied(),
                     ne.get(name).copied(),
-                    &format!("{path}[{name}]"),
+                    path,
                     found,
                 );
+                path.pop();
             }
-            // Items in all three, in each list's order: a remote reorder the text would undo.
-            let order = |items: &'_ [Value]| -> Vec<String> {
-                items
-                    .iter()
-                    .filter_map(item_name)
-                    .filter(|n| nb.contains_key(n) && nl.contains_key(n) && ne.contains_key(n))
-                    .map(str::to_owned)
-                    .collect()
-            };
-            if order(b) != order(l) && order(e) != order(l) {
-                found.push(path.to_owned());
+            if undoes_remote_order(b, l, e) {
+                found.insert(path.clone());
             }
         }
-        _ => found.push(path.to_owned()),
+        _ => {
+            found.insert(path.clone());
+        }
     }
+}
+
+/// Whether `edited` puts two of `latest`'s items in the other order when that order came from the
+/// cluster: they were swapped there, or one of them is new there and so was placed there.
+/// Every item must have a unique name.
+fn undoes_remote_order(base: &[Value], latest: &[Value], edited: &[Value]) -> bool {
+    let positions = |items: &[Value]| -> BTreeMap<String, usize> {
+        items
+            .iter()
+            .enumerate()
+            .filter_map(|(at, item)| Some((item_name(item)?.to_owned(), at)))
+            .collect()
+    };
+    let (in_base, in_edited) = (positions(base), positions(edited));
+    // In `latest`'s order: where the text has each item, and where it was in `base`.
+    let kept: Vec<(usize, Option<usize>)> = latest
+        .iter()
+        .filter_map(item_name)
+        .filter_map(|name| Some((*in_edited.get(name)?, in_base.get(name).copied())))
+        .collect();
+    kept.iter().enumerate().any(|(at, (edited_x, base_x))| {
+        kept[at + 1..].iter().any(|(edited_y, base_y)| {
+            edited_x > edited_y
+                && match (base_x, base_y) {
+                    (Some(x), Some(y)) => x > y,
+                    _ => true,
+                }
+        })
+    })
 }
 
 fn item_name(item: &Value) -> Option<&str> {
@@ -253,37 +286,44 @@ fn by_name(items: &[Value]) -> Option<BTreeMap<&str, &Value>> {
     Some(named)
 }
 
-fn key_path(path: &str, key: &str) -> String {
-    let plain = !key.is_empty()
-        && key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    match (plain, path.is_empty()) {
-        (true, true) => key.to_owned(),
-        (true, false) => format!("{path}.{key}"),
-        (false, _) => format!("{path}[\"{key}\"]"),
+/// `path` on one line. Anything but a plain key or name is quoted and escaped, so a key cannot
+/// read as a nested path or break the line.
+fn path_text(path: &[Step]) -> String {
+    let plain = |text: &str, also: &[char]| {
+        !text.is_empty()
+            && text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || also.contains(&c))
+    };
+    let mut out = String::new();
+    for step in path {
+        match step {
+            Step::Key(key) if plain(key, &[]) => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(key);
+            }
+            Step::Key(key) => out.push_str(&format!("[\"{}\"]", key.escape_debug())),
+            Step::Item(name) if plain(name, &['.']) => out.push_str(&format!("[{name}]")),
+            Step::Item(name) => out.push_str(&format!("[name=\"{}\"]", name.escape_debug())),
+        }
     }
+    out
 }
 
-/// The warning for `paths`, or `None` when nothing would be overwritten.
+/// The warning for `paths`, or `None` when nothing would be overwritten: the count, then every
+/// path on its own line. Where it is shown, it scrolls.
 fn competing_text(paths: &[String]) -> Option<String> {
     let (count, it) = match paths.len() {
         0 => return None,
         1 => ("1 field".to_owned(), "it"),
         n => (format!("{n} fields"), "them"),
     };
-    let mut named: Vec<String> = paths
-        .iter()
-        .take(NAMED_PATHS)
-        .map(|path| single_line(path))
-        .collect();
-    if paths.len() > NAMED_PATHS {
-        named.push(format!("and {} more", paths.len() - NAMED_PATHS));
-    }
     Some(format!(
         "{count} changed on the cluster since you opened this edit, and Apply would overwrite \
-         {it}: {}.",
-        named.join(", ")
+         {it}:\n{}",
+        paths.join("\n")
     ))
 }
 
@@ -416,7 +456,7 @@ impl DetailView {
             return;
         };
         let target = self.edit_target(detail);
-        let base = detail.object.clone();
+        let opened = without_server_owned(&detail.object);
         let text = match editable_yaml(&detail.object) {
             Ok(text) => text,
             Err(why) => {
@@ -443,7 +483,7 @@ impl DetailView {
             target,
             phase: Phase::Editing,
             error: None,
-            base,
+            seen: vec![opened],
             latest: None,
             competing: Vec::new(),
             _task: Task::ready(()),
@@ -490,7 +530,7 @@ impl DetailView {
         let compare = edit
             .latest
             .clone()
-            .map(|latest| (edit.base.clone(), latest, yaml.clone()));
+            .map(|latest| (edit.seen.clone(), latest, yaml.clone()));
         let run = core.review_write(edit.target.clone(), WriteProposal::ApplyYaml { yaml });
         let name = self.object.name.clone();
         edit._task = cx.spawn(async move |this, cx| {
@@ -503,8 +543,8 @@ impl DetailView {
             let compare = compare.filter(|_| result.is_ok());
             let (patch, competing) = cx
                 .background_spawn(async move {
-                    let competing = compare.map_or_else(Vec::new, |(base, latest, yaml)| {
-                        competing_changes(&base, &latest.object, &yaml)
+                    let competing = compare.map_or_else(Vec::new, |(seen, latest, yaml)| {
+                        competing_changes(&seen, &latest.object, &yaml)
                     });
                     let patch = shown.and_then(|(before, after)| patch(&name, &before, &after));
                     (patch, competing)
@@ -648,6 +688,10 @@ impl DetailView {
             cx.notify();
             return;
         }
+        let state = without_server_owned(&detail.object);
+        if !edit.seen.contains(&state) {
+            edit.seen.push(state);
+        }
         edit.latest = Some(detail.clone());
         if let Some(version) = text("/metadata/resourceVersion") {
             let yaml = with_resource_version(&edit.editor.read(cx).value(), version);
@@ -685,10 +729,18 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Fetch, NAMED_PATHS, Phase, competing_changes, competing_text, edit_error_text,
-        editable_yaml, patch, sets_status, with_resource_version,
+        Fetch, Phase, Step, competing_text, edit_error_text, editable_yaml, patch, path_text,
+        sets_status, with_resource_version, without_server_owned,
     };
     use crate::ui::support_tests::{WAIT, objects, open_workspace, standard_sections};
+
+    fn competing_changes(
+        base: &serde_json::Value,
+        latest: &serde_json::Value,
+        yaml: &str,
+    ) -> Vec<String> {
+        super::competing_changes(&[without_server_owned(base)], latest, yaml)
+    }
 
     // covers UP-51: the editor opens without status or managedFields, at its version.
     #[test]
@@ -807,14 +859,67 @@ mod tests {
         assert!(!text.contains("bmV3LXNlY3JldA"), "{text}");
     }
 
+    // Apply is never available with a path left out of the warning.
     #[test]
-    fn a_warning_caps_its_list_and_counts_the_rest() {
+    fn a_warning_counts_and_names_every_path() {
         assert_eq!(competing_text(&[]), None);
-        let paths: Vec<String> = (0..NAMED_PATHS + 2).map(|n| format!("p{n}")).collect();
+        let paths: Vec<String> = (0..40).map(|n| format!("p{n}")).collect();
         let text = competing_text(&paths).unwrap();
-        assert!(text.starts_with("7 fields changed"), "{text}");
-        assert!(text.contains("p4") && !text.contains("p5"), "{text}");
-        assert!(text.ends_with("and 2 more."), "{text}");
+        assert!(text.starts_with("40 fields changed"), "{text}");
+        let lines: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(lines, paths);
+    }
+
+    // Open at 1, a teammate scales to 5, the draft takes 5, they scale back to 1.
+    #[test]
+    fn a_change_away_and_back_across_reloads_is_listed() {
+        let at = |n: u32| json!({"metadata": {"name": "a"}, "spec": {"replicas": n}});
+        let seen = [without_server_owned(&at(1)), without_server_owned(&at(5))];
+        assert_eq!(
+            super::competing_changes(&seen, &at(1), &yaml(&at(5))),
+            ["spec.replicas"]
+        );
+        assert!(super::competing_changes(&seen, &at(1), &yaml(&at(1))).is_empty());
+    }
+
+    fn init(names: &[&str]) -> serde_json::Value {
+        let items: Vec<_> = names.iter().map(|name| json!({"name": name})).collect();
+        json!({"spec": {"initContainers": items}})
+    }
+
+    // A teammate's insertion keeps its place only if the text keeps it there.
+    #[test]
+    fn moving_a_remotely_added_item_is_listed() {
+        let (base, latest) = (init(&["a", "b"]), init(&["a", "setup", "b"]));
+        assert_eq!(
+            competing_changes(&base, &latest, &yaml(&init(&["a", "b", "setup"]))),
+            ["spec.initContainers"]
+        );
+        assert!(competing_changes(&base, &latest, &yaml(&latest)).is_empty());
+    }
+
+    // Reordering only what the cluster left alone is the edit's own change.
+    #[test]
+    fn an_own_reorder_of_unmoved_items_is_not_listed() {
+        let (base, latest) = (init(&["a", "b"]), init(&["a", "b", "new"]));
+        assert!(competing_changes(&base, &latest, &yaml(&init(&["b", "a", "new"]))).is_empty());
+    }
+
+    // A key that looks like nested keys is its own path, and cannot break the warning's lines.
+    #[test]
+    fn keys_that_look_like_paths_stay_distinct() {
+        let base = json!({"data": {"a": {"b": "1"}, "a\"][\"b": "1"}});
+        let latest = json!({"data": {"a": {"b": "2"}, "a\"][\"b": "2"}});
+        let paths = competing_changes(&base, &latest, &yaml(&base));
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert_ne!(paths[0], paths[1]);
+        let forged = path_text(&[Step::Key("x\ny\u{202e}")]);
+        assert!(
+            !forged.contains('\n') && !forged.contains('\u{202e}'),
+            "{forged}"
+        );
+        assert_eq!(path_text(&[Step::Key("a"), Step::Item("b.c")]), "a[b.c]");
+        assert_eq!(path_text(&[Step::Item("b]")]), "[name=\"b]\"]");
     }
 
     #[test]

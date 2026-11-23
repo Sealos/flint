@@ -1159,6 +1159,9 @@ impl DetailView {
                 .border_color(color)
                 .text_xs()
                 .text_color(theme.foreground)
+                // Every overwritten path stays reachable, and the editor keeps its room.
+                .max_h(px(120.))
+                .overflow_y_scroll()
                 .child(text)
                 .into_any_element(),
         )
