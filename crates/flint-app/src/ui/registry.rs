@@ -107,6 +107,8 @@ actions!(
     [
         /// Connect (and discover) the active cluster again after a failure.
         RetryConnection,
+        /// Stop the active cluster's connection attempt and its automatic retries.
+        CancelConnection,
         /// Clear the namespace filter.
         ShowAllNamespaces,
         /// Open the namespace filter's picker, with focus inside it.
@@ -2301,6 +2303,11 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         )
         .of(C::Cluster, S::Workspace)
         .keys(&["secondary-r"], Some(WORKSPACE)),
+        Spec::unit::<CancelConnection>(
+            "Cancel Connection",
+            "Stop connecting to the active cluster and stop retrying it.",
+        )
+        .of(C::Cluster, S::Workspace),
         Spec::unit::<WatchAllKinds>("Watch All Kinds", "Watch every kind on the active cluster.")
             .of(C::Cluster, S::Workspace),
         Spec::unit::<WatchOpenViewsOnly>(

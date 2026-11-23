@@ -59,6 +59,8 @@ pub struct ClustersModel {
     pub activity_keys: flint_core::activity::ServerKeys,
     /// Each cluster's keep-watching toggle, as the core last reported it.
     keep_watching: Arc<std::collections::BTreeMap<ClusterId, KeepWatchView>>,
+    /// The selected cluster's connection attempts, while it is not connected.
+    connection_progress: Option<flint_core::ConnectionProgress>,
     /// The cluster to activate once kubeconfig is loaded (`FLINT_CLUSTER`). Taken on first load.
     startup_cluster: Option<String>,
     _events: Task<()>,
@@ -96,6 +98,7 @@ impl ClustersModel {
             discovery: HashMap::new(),
             ahead: HashMap::new(),
             agent_activity: Arc::default(),
+            connection_progress: None,
             activity_keys: Default::default(),
             keep_watching: Arc::default(),
             startup_cluster,
@@ -136,6 +139,7 @@ impl ClustersModel {
                     c.state = state;
                 }
             }
+            Event::ConnectionProgress(progress) => self.connection_progress = progress,
             Event::SettingsChanged {
                 settings,
                 error,
@@ -201,6 +205,35 @@ impl ClustersModel {
 
     pub fn activate(&mut self, cluster: ClusterId) {
         self.send(Command::Activate(cluster));
+    }
+
+    /// The selected cluster's connection attempts, unless they are an older slot's.
+    pub(in crate::ui) fn active_progress(&self) -> Option<&flint_core::ConnectionProgress> {
+        let active = self.active_cluster()?;
+        self.connection_progress
+            .as_ref()
+            .filter(|p| p.cluster == active.info.name && p.generation == active.generation)
+    }
+
+    /// Whether the selected cluster has an attempt under way or a retry waiting.
+    pub(in crate::ui) fn can_cancel_connection(&self) -> bool {
+        self.active_cluster()
+            .is_some_and(|c| matches!(c.state, ConnectionState::Connecting))
+            || self
+                .active_progress()
+                .is_some_and(|p| p.next_retry.is_some())
+    }
+
+    /// Stops the selected cluster's attempt and its automatic retries.
+    pub(in crate::ui) fn cancel_connection(&mut self) {
+        let Some(active) = self.active_cluster() else {
+            return;
+        };
+        let command = Command::CancelConnection {
+            cluster: active.info.name.clone(),
+            generation: active.generation,
+        };
+        self.send(command);
     }
 
     /// Activates `cluster` only if the core still holds it as this slot and identity.

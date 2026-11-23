@@ -43,6 +43,7 @@ enum Key {
     /// apart, so a front end sees each attempt start even when it fails before being read (a
     /// refused server); the last of the two is still the current state.
     Connection(ClusterId, Phase),
+    Progress,
     Settings,
     Discovery(ClusterId),
     Activity,
@@ -62,6 +63,7 @@ fn key(event: &Event, next_error: &mut u64) -> Key {
             };
             Key::Connection(cluster.clone(), phase)
         }
+        Event::ConnectionProgress(_) => Key::Progress,
         Event::SettingsChanged { .. } => Key::Settings,
         Event::DiscoveryChanged { cluster, .. } => Key::Discovery(cluster.clone()),
         Event::AgentActivity(..) => Key::Activity,
