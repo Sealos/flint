@@ -1,5 +1,6 @@
 //! The `flint` binary: the desktop app, or `flint mcp` for the read-only MCP server.
 
+mod notifications;
 mod ui;
 
 use std::ffi::OsStr;
