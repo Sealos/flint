@@ -35,6 +35,8 @@ use super::super::registry::{
     OpenClusterSet, OpenPickedClusters, OpenSelectedRow, SaveClusterSet, SelectFirst, SelectLast,
     SelectNext, SelectPrev, ToggleClusterPicking, TogglePickedCluster,
 };
+#[cfg(any(test, feature = "automation"))]
+use super::super::view_state::{ClusterSetsState, OpenSetState, SetGroupState, SetMemberState};
 use super::{WRITES_PAUSED, Workspace, takes_focus, writes_paused_reason};
 
 /// How often the running set's members are asked for what the connection state leaves out.
@@ -1013,6 +1015,65 @@ impl Workspace {
         )
     }
 
+    /// What the set's bar says about `context`, when something is wrong with it.
+    fn set_member_note(&self, run: &RunningSet, context: &str, cx: &App) -> Option<String> {
+        if run.changed.contains(context) {
+            return Some("Changed".to_owned());
+        }
+        let summary = self.cluster_summary(context, cx);
+        member_note(
+            run.reports.iter().find(|r| r.cluster == context),
+            summary.is_some_and(|c| self.model.read(cx).sessions_paused(c)),
+            self.member_writes_paused(context, cx).is_some(),
+        )
+    }
+
+    /// The sidebar's choice, the saved sets and the running set, as data.
+    #[cfg(any(test, feature = "automation"))]
+    pub(super) fn sets_view_state(&self, cx: &App) -> ClusterSetsState {
+        let sets = &self.sets;
+        let open = sets.running.as_ref().map(|run| {
+            let list = run.list.read(cx);
+            let shown = list.shown.list.members();
+            OpenSetState {
+                label: run.label.clone(),
+                members: run
+                    .members
+                    .iter()
+                    .map(|member| {
+                        let cluster = member.context();
+                        SetMemberState {
+                            cluster: cluster.to_owned(),
+                            note: self.set_member_note(run, cluster, cx),
+                            tag: shown
+                                .iter()
+                                .find(|m| m.cluster() == cluster)
+                                .and_then(|m| m.tag()),
+                        }
+                    })
+                    .collect(),
+                groups: list
+                    .view
+                    .groups()
+                    .iter()
+                    .map(|group| SetGroupState {
+                        cluster: shown[group.member].cluster().to_owned(),
+                        count: group.count,
+                        collapsed: group.collapsed,
+                    })
+                    .collect(),
+                list: list.view_state(),
+            }
+        });
+        ClusterSetsState {
+            picking: sets.picking,
+            picked: sets.picked.clone(),
+            saved: sets.saved.iter().map(|s| s.name.clone()).collect(),
+            error: sets.error.clone(),
+            open,
+        }
+    }
+
     /// The set's name, each member's exact name with anything wrong with it, and Close.
     fn render_set_bar(&self, run: &RunningSet, theme: &Theme, cx: &App) -> impl IntoElement {
         let names = self.cluster_names(cx);
@@ -1033,16 +1094,7 @@ impl Workspace {
             .children(run.members.iter().map(|member| {
                 let context = member.context();
                 let shown = names.exact(context);
-                let note = if run.changed.contains(context) {
-                    Some("Changed".to_owned())
-                } else {
-                    let summary = self.cluster_summary(context, cx);
-                    member_note(
-                        run.reports.iter().find(|r| r.cluster == context),
-                        summary.is_some_and(|c| self.model.read(cx).sessions_paused(c)),
-                        self.member_writes_paused(context, cx).is_some(),
-                    )
-                };
+                let note = self.set_member_note(run, context, cx);
                 let noted = note.is_some();
                 let text = match note {
                     Some(note) => format!("{shown}: {note}"),

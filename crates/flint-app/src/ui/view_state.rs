@@ -42,6 +42,47 @@ pub struct AppState {
     pub palette: Option<PaletteState>,
     /// Desktop notifications: the setting, what the OS answered and the latest alerts.
     pub alerts: Option<super::alert_center::AlertsState>,
+    /// Cluster sets: the sidebar's choice, the saved sets and the running set.
+    pub sets: ClusterSetsState,
+}
+
+/// Cluster sets, as the sidebar and the set's view show them.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterSetsState {
+    pub picking: bool,
+    /// The chosen contexts, in the order they were chosen.
+    pub picked: Vec<String>,
+    /// The names of the saved sets.
+    pub saved: Vec<String>,
+    pub error: Option<String>,
+    pub open: Option<OpenSetState>,
+}
+
+/// The running set and its combined list.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenSetState {
+    pub label: String,
+    pub members: Vec<SetMemberState>,
+    /// One per cluster while grouped by cluster, else empty.
+    pub groups: Vec<SetGroupState>,
+    pub list: ListState,
+}
+
+/// A member of the running set.
+#[derive(Debug, Clone, Serialize)]
+pub struct SetMemberState {
+    pub cluster: String,
+    /// What the set's bar says is wrong with it (`Changed`, `Failed`, ...).
+    pub note: Option<String>,
+    pub tag: Option<flint_core::settings::ClusterTag>,
+}
+
+/// One cluster's section of a grouped combined list.
+#[derive(Debug, Clone, Serialize)]
+pub struct SetGroupState {
+    pub cluster: String,
+    pub count: usize,
+    pub collapsed: bool,
 }
 
 /// Where keyboard focus is.
