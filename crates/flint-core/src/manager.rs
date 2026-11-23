@@ -1255,19 +1255,14 @@ impl ClusterManager {
             )));
             return;
         }
-        let current = self
-            .clusters
-            .iter()
-            .find(|c| c.info.name == cluster)
-            .and_then(|c| c.info.server.as_deref());
-        if current != Some(server.as_str()) {
+        let Some(address) = self.address_of_grant(&cluster, &server) else {
             self.emit(Event::Error(format!(
                 "\"{cluster}\" now points to a different server; its AI scope was not changed. \
                  Review it and try again."
             )));
             return;
-        }
-        if scope_widens(&from, &scope) && !self.files_still_show(&cluster, &server).await {
+        };
+        if scope_widens(&from, &scope) && !self.files_still_show(&cluster, &address).await {
             self.emit(Event::Error(format!(
                 "The AI scope of \"{cluster}\" was not widened: its kubeconfig files can't be \
                  read or no longer match what is shown. Check them and try again."
@@ -1280,9 +1275,18 @@ impl ClusterManager {
         .await;
     }
 
+    /// `cluster`'s API server address, if `grant` is the server and proxy it shows now.
+    fn address_of_grant(&self, cluster: &str, grant: &str) -> Option<String> {
+        let info = &self.clusters.iter().find(|c| c.info.name == cluster)?.info;
+        (info.grant_server().as_deref() == Some(grant))
+            .then(|| info.server.clone())
+            .flatten()
+    }
+
     /// Pins `cluster` at `server` in a list of pins (`Some`), or removes it (`None`), in
     /// `settings.toml`. Returns whether the change was saved.
     async fn set_pin(&mut self, pins: Pins, cluster: ClusterId, server: Option<String>) -> bool {
+        let mut address = None;
         if let Some(server) = &server {
             // No load shows a settled definition, so there is nothing to pin yet.
             if self.unsettled(&cluster) {
@@ -1293,14 +1297,10 @@ impl ClusterManager {
                 )));
                 return false;
             }
-            // The user confirmed this server. If the context moved since, do not pin the new
-            // one on the strength of that confirmation.
-            let current = self
-                .clusters
-                .iter()
-                .find(|c| c.info.name == cluster)
-                .and_then(|c| c.info.server.as_deref());
-            if current != Some(server.as_str()) {
+            // The user confirmed this server and proxy. If the context moved since, do not pin
+            // the new route on the strength of that confirmation.
+            address = self.address_of_grant(&cluster, server);
+            if address.is_none() {
                 self.emit(Event::Error(format!(
                     "\"{cluster}\" now points to a different server; it was not {}. Review it and try again.",
                     pins.done()
@@ -1317,7 +1317,7 @@ impl ClusterManager {
             )));
             return false;
         }
-        if let Some(at) = &server
+        if let Some(at) = &address
             && !self.files_still_show(&cluster, at).await
         {
             self.emit(Event::Error(format!(

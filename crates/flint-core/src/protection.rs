@@ -71,7 +71,9 @@ pub fn protection(
     let Some(server) = server else {
         return Protection::Protected;
     };
-    if settings.trust(context, Some(server)).is_trusted() && !unlocks.trust_revoked(context) {
+    // Trust and unlocks hold for the route they were given on: another proxy voids them.
+    let granted = crate::connection::proxy::grant_endpoint(server, proxy_url);
+    if settings.trust(context, Some(&granted)).is_trusted() && !unlocks.trust_revoked(context) {
         Protection::Trusted
     } else if !settings.protect_local_clusters
         && proxy_url.is_none()
@@ -79,10 +81,68 @@ pub fn protection(
         && is_local_server(server)
     {
         Protection::Local
-    } else if unlocks.is_unlocked(context, server) {
+    } else if unlocks.is_unlocked(context, &granted) {
         Protection::Unlocked
     } else {
         Protection::Protected
+    }
+}
+
+#[cfg(test)]
+mod proxy_route_tests {
+    use super::*;
+    use crate::connection::proxy::grant_endpoint;
+
+    const SERVER: &str = "https://prod.example:6443";
+    const PROXY: &str = "http://proxy.example:3128";
+    const OTHER: &str = "http://other.example:3128";
+
+    #[test]
+    fn trust_holds_only_for_the_proxy_it_was_given_on() {
+        let mut settings = Settings::default();
+        let granted = grant_endpoint(SERVER, Some(PROXY)).into_owned();
+        settings
+            .trusted_clusters
+            .push(ClusterPin::new("prod", granted));
+        let unlocks = SessionUnlocks::default();
+        let at = |proxy| protection(&settings, &unlocks, "prod", Some(SERVER), proxy);
+        assert_eq!(at(Some(PROXY)), Protection::Trusted);
+        assert_eq!(at(Some(OTHER)), Protection::Protected);
+        assert_eq!(at(None), Protection::Protected);
+    }
+
+    #[test]
+    fn a_direct_trust_does_not_cover_a_new_proxy() {
+        let mut settings = Settings::default();
+        settings
+            .trusted_clusters
+            .push(ClusterPin::new("prod", SERVER));
+        let unlocks = SessionUnlocks::default();
+        let at = |proxy| protection(&settings, &unlocks, "prod", Some(SERVER), proxy);
+        assert_eq!(at(None), Protection::Trusted);
+        assert_eq!(at(Some(PROXY)), Protection::Protected);
+    }
+
+    #[test]
+    fn an_unlock_holds_only_for_the_proxy_it_was_given_on() {
+        let settings = Settings::default();
+        let unlocks = SessionUnlocks::default();
+        unlocks.unlock("prod", &grant_endpoint(SERVER, Some(PROXY)));
+        let at = |proxy| protection(&settings, &unlocks, "prod", Some(SERVER), proxy);
+        assert_eq!(at(Some(PROXY)), Protection::Unlocked);
+        assert_eq!(at(Some(OTHER)), Protection::Protected);
+        assert_eq!(at(None), Protection::Protected);
+    }
+
+    #[test]
+    fn a_loopback_server_behind_a_proxy_is_not_local() {
+        let settings = Settings::default();
+        let unlocks = SessionUnlocks::default();
+        let server = Some("https://127.0.0.1:6443");
+        assert_eq!(
+            protection(&settings, &unlocks, "kind-dev", server, Some(PROXY)),
+            Protection::Protected
+        );
     }
 }
 
@@ -569,15 +629,17 @@ mod tests {
             ),
             Protection::Protected
         );
+        let proxy = Some("http://127.0.0.1:3128");
+        // An unlock of the direct route says nothing of the one through a proxy.
         unlocks.unlock("kind", "https://127.0.0.1:6443");
         assert_eq!(
-            protection(
-                &settings,
-                &unlocks,
-                "kind",
-                kind,
-                Some("http://127.0.0.1:3128")
-            ),
+            protection(&settings, &unlocks, "kind", kind, proxy),
+            Protection::Protected
+        );
+        let through = crate::connection::proxy::grant_endpoint("https://127.0.0.1:6443", proxy);
+        unlocks.unlock("kind", &through);
+        assert_eq!(
+            protection(&settings, &unlocks, "kind", kind, proxy),
             Protection::Unlocked
         );
     }

@@ -330,7 +330,9 @@ impl ClusterManager {
         if self.paused(id) || self.unsettled(id) || !self.contexts.shown(id, shown).confirmed {
             return KeepWatching::Paused;
         }
-        if self.keep.voided.contains(id) || shown != Some(entry.server.as_str()) {
+        if self.keep.voided.contains(id)
+            || slot.info.grant_server().as_deref() != Some(entry.server.as_str())
+        {
             return KeepWatching::NeedsConfirming;
         }
         let agreed = match &*self.sign_in(id) {
@@ -714,7 +716,7 @@ impl ClusterManager {
             return Err(format!("cluster \"{id}\" no longer exists"));
         };
         let fingerprint = slot.fingerprint;
-        let server = slot.info.server.clone();
+        let server = slot.info.grant_server();
         if let Some(why) = self.keep_refusal(id) {
             return Err(why);
         }
@@ -787,7 +789,7 @@ impl ClusterManager {
             return Err(format!("Turn on Keep Watching for \"{id}\" first."));
         }
         if slot.fingerprint != offer.fingerprint
-            || slot.info.server.as_deref() != Some(offer.server.as_str())
+            || slot.info.grant_server().as_deref() != Some(offer.server.as_str())
         {
             return Err(changed());
         }
@@ -817,7 +819,7 @@ impl ClusterManager {
         if let Some(why) = self.keep_refusal(id) {
             return Err(why);
         }
-        let Some(server) = slot.info.server.clone() else {
+        let Some(server) = slot.info.grant_server() else {
             return Err(format!("\"{id}\" names no server."));
         };
         Ok(WatchedCluster {

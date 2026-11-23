@@ -150,6 +150,21 @@ pub enum Transport {
     Dropped,
     /// No route to the server's network or host.
     Unreachable,
+    /// The proxy in front of the server could not be used.
+    Proxy(ProxyFailure),
+}
+
+/// Why a tunnel through the proxy was not made. Only Flint's own words: never the proxy's URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyFailure {
+    /// Nothing answered at the proxy's address.
+    Unreachable,
+    /// The proxy answered 407.
+    AuthRequired,
+    /// The proxy answered, but would not open the tunnel.
+    Denied,
+    /// The proxy closed the connection or sent something unreadable.
+    Broken,
 }
 
 impl Transport {
@@ -184,6 +199,19 @@ impl Transport {
             ),
             Transport::Dropped => format!("the connection to {s} dropped"),
             Transport::Unreachable => format!("{s} is unreachable (no route to host)"),
+            Transport::Proxy(ProxyFailure::Unreachable) => format!(
+                "could not reach the proxy for {s}; check its address. Flint did not connect \
+                 without it"
+            ),
+            Transport::Proxy(ProxyFailure::AuthRequired) => format!(
+                "the proxy for {s} asks for credentials (407); check the ones in its proxy URL"
+            ),
+            Transport::Proxy(ProxyFailure::Denied) => {
+                format!("the proxy refused to open a tunnel to {s}")
+            }
+            Transport::Proxy(ProxyFailure::Broken) => {
+                format!("the proxy for {s} closed the tunnel")
+            }
         }
     }
 }
@@ -284,6 +312,18 @@ fn classify_one(e: &(dyn StdError + 'static)) -> Option<Transport> {
     match e.to_string().as_str() {
         "dns error" => Some(Transport::Unresolved),
         "connection closed before message completed" => Some(Transport::Dropped),
+        "tunnel error: failed to create underlying connection" => {
+            Some(Transport::Proxy(ProxyFailure::Unreachable))
+        }
+        "tunnel error: proxy authorization required" => {
+            Some(Transport::Proxy(ProxyFailure::AuthRequired))
+        }
+        "tunnel error: unsuccessful" => Some(Transport::Proxy(ProxyFailure::Denied)),
+        "tunnel error: unexpected end of file"
+        | "tunnel error: io error establishing tunnel"
+        | "tunnel error: proxy response headers too long" => {
+            Some(Transport::Proxy(ProxyFailure::Broken))
+        }
         _ => None,
     }
 }

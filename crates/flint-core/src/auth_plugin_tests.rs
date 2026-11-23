@@ -470,16 +470,16 @@ fn credentials_do_not_print_their_secrets() {
     assert!(!format!("{parsed:?}").contains("k-secret-2"));
 }
 
-// covers UP-04: a proxy is refused before the plugin runs, as kube's builder did, so no login
-// opens for a client that cannot be built.
+// covers UP-04: an unsupported proxy is refused before the plugin runs, so no login opens for a
+// client that cannot be built.
 #[tokio::test]
-async fn a_proxy_is_refused_before_the_plugin_runs() {
+async fn an_unsupported_proxy_is_refused_before_the_plugin_runs() {
     let plugin = printing(r#"{"token":"t"}"#);
     let mut kubeconfig = plugin.kubeconfig("https://127.0.0.1:1");
     kubeconfig.clusters[0].cluster.as_mut().unwrap().proxy_url =
-        Some("http://127.0.0.1:3128".into());
+        Some("socks5://127.0.0.1:1080".into());
     let Err(err) = cluster::connect(&kubeconfig, "ctx").await else {
-        panic!("a proxy is not supported");
+        panic!("a SOCKS proxy is not supported");
     };
     assert!(err.to_string().contains("proxy"), "{err}");
     assert_eq!(runs(&plugin), 0);

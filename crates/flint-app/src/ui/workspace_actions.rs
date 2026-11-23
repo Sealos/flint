@@ -813,7 +813,7 @@ impl Workspace {
         }
         self.check_cluster::<ExposeToAi>(&action.cluster, cx)?;
         let cluster = self.cluster_summary(&action.cluster, cx).expect("checked");
-        let Some(server) = cluster.info.server.clone() else {
+        let Some(server) = cluster.info.grant_server() else {
             return Err(ActionError::rejected::<ExposeToAi>(
                 "the context has no API server",
             ));
@@ -860,8 +860,7 @@ impl Workspace {
         let summary = self.cluster_summary(cluster, cx).expect("checked");
         summary
             .info
-            .server
-            .clone()
+            .grant_server()
             .ok_or_else(|| ActionError::rejected::<A>("the context has no API server"))
     }
 
@@ -1119,7 +1118,7 @@ impl Workspace {
         self.check_cluster::<EditAiScope>(&action.cluster, cx)?;
         let cluster = self.cluster_summary(&action.cluster, cx).expect("checked");
         let model = self.model.read(cx);
-        match (model.ai_scope(cluster), cluster.info.server.clone()) {
+        match (model.ai_scope(cluster), cluster.info.grant_server()) {
             (Some(scope), Some(server)) => Ok((server, scope)),
             _ => Err(ActionError::rejected::<EditAiScope>(
                 "the cluster is not exposed to AI agents",

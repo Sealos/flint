@@ -285,7 +285,7 @@ impl ClustersModel {
     /// What AI agents may read of `cluster`, if it is exposed at the server it points at now.
     pub fn ai_scope(&self, cluster: &ClusterSummary) -> Option<AiScope> {
         self.settings
-            .ai_scope(&cluster.info.name, cluster.info.server.as_deref())
+            .ai_scope(&cluster.info.name, cluster.info.grant_server().as_deref())
     }
 
     /// Sets the global watch mode (`cluster: None`), or a cluster's override (`mode: None`
@@ -426,7 +426,7 @@ impl ClustersModel {
 
     pub fn ai_exposure(&self, cluster: &ClusterSummary) -> AiExposureState {
         self.settings
-            .ai_exposure(&cluster.info.name, cluster.info.server.as_deref())
+            .ai_exposure(&cluster.info.name, cluster.info.grant_server().as_deref())
     }
 
     /// Whether Flint may change `cluster` now (ADR-0015). The core keeps the same check for
@@ -480,7 +480,7 @@ impl ClustersModel {
 
     pub fn trust(&self, cluster: &ClusterSummary) -> TrustState {
         self.settings
-            .trust(&cluster.info.name, cluster.info.server.as_deref())
+            .trust(&cluster.info.name, cluster.info.grant_server().as_deref())
     }
 
     /// Unlocks `cluster` at `server`, the URL the user confirmed, until Flint quits or Lock

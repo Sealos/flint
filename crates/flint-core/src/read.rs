@@ -423,6 +423,7 @@ impl GroupFailure {
                 Transport::Reset => "connection reset",
                 Transport::Dropped => "connection dropped",
                 Transport::Unreachable => "network unreachable",
+                Transport::Proxy(_) => "proxy failure",
             },
             ClusterError::ExecPlugin { .. } | ClusterError::ExecPluginNotFound { .. } => {
                 "auth plugin failure"
