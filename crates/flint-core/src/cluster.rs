@@ -1058,13 +1058,14 @@ pub(crate) fn upgrade_client(client: Client, check: SendCheck) -> Client {
     clippy::disallowed_methods,
     reason = "wraps a client build_client made, adding only a marker to each request"
 )]
-pub(crate) fn reusing_held_token(client: Client) -> Client {
+pub(crate) fn reusing_held_token(
+    client: Client,
+    held: crate::auth_plugin::HeldTokenOnly,
+) -> Client {
     let namespace = client.default_namespace().to_owned();
     let service = tower::service_fn(move |mut request: http::Request<kube::client::Body>| {
         let client = client.clone();
-        request
-            .extensions_mut()
-            .insert(crate::auth_plugin::HeldTokenOnly);
+        request.extensions_mut().insert(held.clone());
         async move { client.send(request).await }
     });
     Client::new(service, namespace)
