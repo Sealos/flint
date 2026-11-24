@@ -612,10 +612,7 @@ fn a_socks_account_is_decoded_and_never_shown() {
         shown(proxy),
         route_identity(proxy),
     ] {
-        assert!(
-            !text.contains("alice") && !text.contains("pa%40ss"),
-            "{text}"
-        );
+        assert!(!text.contains("alice") && !text.contains("pa%40ss"));
     }
 }
 
@@ -648,7 +645,7 @@ fn each_proxy_kind_is_its_own_route() {
             assert!(one != two, "two routes share an identity");
         }
     }
-    assert_eq!(identities[2], "socks5h://bastion:1080");
+    assert!(identities[2] == "socks5h://bastion:1080");
     assert!(identities[3].starts_with("socks5h://bastion:1080#"));
 }
 
@@ -689,7 +686,7 @@ fn an_unreadable_settings_file_refuses_routes_that_would_take_it() {
     );
     // Its route is named plainly and holds nothing of the file.
     assert_eq!(shown(chosen_proxy), SETTINGS_UNREADABLE_SHOWN);
-    assert_eq!(route_identity(chosen_proxy), SETTINGS_UNREADABLE_SHOWN);
+    assert!(route_identity(chosen_proxy) == SETTINGS_UNREADABLE_SHOWN);
 }
 
 #[test]
