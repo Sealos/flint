@@ -691,7 +691,13 @@ actions!(
         RestartAcrossSet,
         /// Ask for a replica count, then scale the selected workload on every member of the
         /// running set, one at a time, after a per-member plan and one confirmation.
-        ScaleAcrossSet
+        ScaleAcrossSet,
+        /// Edit a manifest of the selected object, then apply it on every member of the running
+        /// set, one at a time, after a per-member dry run and one confirmation.
+        ApplyAcrossSet,
+        /// Delete the selected object on every member of the running set, one at a time, after
+        /// a per-member dry run and one confirmation.
+        DeleteAcrossSet
     ]
 );
 
@@ -2810,6 +2816,18 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Scale Selected Workload Across Set",
             "Ask for a replica count, then scale the selected workload on every member of the \
              running set, one at a time, after a per-member plan and one confirmation.",
+        )
+        .of(C::Detail, S::Workspace),
+        Spec::unit::<ApplyAcrossSet>(
+            "Apply YAML to Selected Object Across Set",
+            "Edit a manifest of the selected object, then apply it on every member of the \
+             running set, one at a time, after a per-member dry run and one confirmation.",
+        )
+        .of(C::Detail, S::Workspace),
+        Spec::unit::<DeleteAcrossSet>(
+            "Delete Selected Object Across Set",
+            "Delete the selected object on every member of the running set, one at a time, \
+             after a per-member dry run and one confirmation.",
         )
         .of(C::Detail, S::Workspace),
         Spec::with_args::<OpenSetMember>(

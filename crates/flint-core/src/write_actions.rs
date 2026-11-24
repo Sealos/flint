@@ -269,11 +269,19 @@ async fn recheck(
     let client = gate.client().await?;
     let live = read_live(&client, kind, target).await?;
     let uid = live.pointer("/metadata/uid").and_then(Value::as_str);
+    let version = live
+        .pointer("/metadata/resourceVersion")
+        .and_then(Value::as_str);
     let paused = live.pointer("/spec/paused").and_then(Value::as_bool) == Some(true);
+    // A held delete is for the object exactly as reviewed: any change since stops it.
+    let changed_before_delete = reviewed.hold_spec
+        && *change == ResourceChange::Delete
+        && version != target.resource_version.as_deref();
     if uid != target.uid.as_deref()
         || gitops::managed_by_live_object(&live) != reviewed.managed
         || (paused && *change == ResourceChange::RolloutRestart)
         || (reviewed.hold_spec && ReviewedSpec::of(&live) != reviewed.spec)
+        || changed_before_delete
     {
         return Err(WriteError::Conflict);
     }
@@ -313,6 +321,7 @@ pub(crate) async fn dry_run(
             send_scale(gate, &object, *from, *to, mode).await?;
         }
         ResourceChange::RolloutRestart => send_restart(gate, &object, mode).await?,
+        ResourceChange::Delete => send_delete(gate, &object, mode).await?,
         _ => {
             return Err(WriteError::Rejected(
                 "this action has no server dry run".to_owned(),
@@ -341,7 +350,7 @@ pub(crate) async fn run(
         held: held.as_ref(),
     };
     match change {
-        ResourceChange::Delete => delete(gate, &object).await?,
+        ResourceChange::Delete => send_delete(gate, &object, mode).await?,
         ResourceChange::Scale { from, to } => send_scale(gate, &object, *from, *to, mode).await?,
         ResourceChange::RolloutRestart => send_restart(gate, &object, mode).await?,
         ResourceChange::Cordon => set_cordoned(gate, &object, true).await?,
@@ -593,15 +602,29 @@ fn uid_precondition(uid: &str) -> Preconditions {
 }
 
 /// Deletes `object`, if it is still the one with its uid.
+#[cfg(test)]
 pub(crate) async fn delete(
     gate: &mut impl ActionGate,
     object: &ActionObject,
 ) -> Result<(), ActionError> {
+    send_delete(gate, object, PatchMode::default()).await
+}
+
+/// Deletes `object`, if it is still the one with its uid, and for a held delete still at the
+/// version its recheck read.
+async fn send_delete(
+    gate: &mut impl ActionGate,
+    object: &ActionObject,
+    mode: PatchMode<'_>,
+) -> Result<(), ActionError> {
     // Refuse an unsafe name before the gate runs any credential check.
     object.check_path_segments()?;
     let client = gate.client().await?;
+    let mut preconditions = uid_precondition(&object.uid);
+    preconditions.resource_version = mode.held.map(|held| held.resource_version.clone());
     let params = DeleteParams {
-        preconditions: Some(uid_precondition(&object.uid)),
+        preconditions: Some(preconditions),
+        dry_run: mode.dry_run,
         ..Default::default()
     };
     timed(object.api(client)?.delete(&object.name, &params))

@@ -11,6 +11,14 @@
 //! grants nothing: a member that is locked, changed or provisional at its turn is refused there
 //! and stops the run.
 //!
+//! Apply YAML sends one manifest to every member: each member's review is a server dry run of
+//! replacing its object, or of creating it where it does not exist. Delete is reviewed and
+//! dry-run per member, bound to that member's uid and `resourceVersion`: a member whose object
+//! changed or went away since stops the run at its turn.
+//!
+//! A preview whose refused members are not all dropped does not run at all
+//! ([`FleetPreview::is_ready`]).
+//!
 //! To add an action: a [`FleetAction`] variant and its [`WriteProposal`]. The run loop does not
 //! change.
 
@@ -23,23 +31,55 @@ use crate::api_path::validate_names;
 use crate::handle::{AdmittedMember, CoreHandle};
 use crate::read::KindId;
 use crate::write::{
-    ResourceChange, WriteAction, WriteError, WriteIntent, WriteProposal, WriteTarget, WriteWarning,
+    ResourceChange, ReviewedEdit, WriteAction, WriteError, WriteIntent, WriteProposal, WriteTarget,
+    WriteWarning,
 };
 
 /// What a fleet action does to the object on each cluster.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FleetAction {
     RolloutRestart,
-    Scale { to: u32 },
+    Scale {
+        to: u32,
+    },
+    /// Replace the object with this manifest on each cluster, or create it where it is missing.
+    ApplyYaml {
+        manifest: FleetManifest,
+    },
+    Delete,
 }
 
 impl FleetAction {
-    fn proposal(self) -> WriteProposal {
+    fn proposal(&self) -> WriteProposal {
         match self {
             FleetAction::RolloutRestart => WriteProposal::RolloutRestart,
-            FleetAction::Scale { to } => WriteProposal::Scale { to },
+            FleetAction::Scale { to } => WriteProposal::Scale { to: *to },
+            FleetAction::ApplyYaml { manifest } => WriteProposal::ApplyManifest {
+                yaml: manifest.0.to_string(),
+            },
+            FleetAction::Delete => WriteProposal::Delete,
         }
+    }
+}
+
+/// The YAML an apply sends to every member. Never printed: it can hold anything.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FleetManifest(Arc<str>);
+
+impl FleetManifest {
+    pub fn new(yaml: impl Into<Arc<str>>) -> Self {
+        Self(yaml.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for FleetManifest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FleetManifest(..)")
     }
 }
 
@@ -101,8 +141,8 @@ impl FleetPlan {
         })
     }
 
-    pub fn action(&self) -> FleetAction {
-        self.action
+    pub fn action(&self) -> &FleetAction {
+        &self.action
     }
 
     pub fn object(&self) -> &FleetObject {
@@ -154,6 +194,15 @@ impl FleetPreviewEntry {
         }
     }
 
+    /// What an apply does on this cluster, if its review was accepted: whether it creates the
+    /// object, and the object before and after, as its server dry run answered.
+    pub fn edit(&self) -> Option<&ReviewedEdit> {
+        match &self.review.as_ref().ok()?.intent.action {
+            WriteAction::ApplyYaml(edit) => Some(edit),
+            _ => None,
+        }
+    }
+
     pub fn is_dropped(&self) -> bool {
         self.dropped
     }
@@ -175,8 +224,8 @@ pub struct FleetPreview {
 }
 
 impl FleetPreview {
-    pub fn action(&self) -> FleetAction {
-        self.action
+    pub fn action(&self) -> &FleetAction {
+        &self.action
     }
 
     pub fn object(&self) -> &FleetObject {
@@ -199,6 +248,21 @@ impl FleetPreview {
                 entry.cluster().to_owned()
             })
             .collect()
+    }
+
+    /// The clusters whose review or dry run was refused and that are still in the run, in run
+    /// order. While there is one, the preview does not run.
+    pub fn unresolved(&self) -> Vec<ClusterId> {
+        self.entries
+            .iter()
+            .filter(|entry| !entry.dropped && entry.review.is_err())
+            .map(|entry| entry.cluster().to_owned())
+            .collect()
+    }
+
+    /// Whether a run would start: every refused cluster is dropped, and one is left to run.
+    pub fn is_ready(&self) -> bool {
+        self.unresolved().is_empty() && self.entries.iter().any(FleetPreviewEntry::will_run)
     }
 
     /// Takes `cluster` out of the run, or puts it back. Returns whether the preview has it.
@@ -241,6 +305,8 @@ pub enum FleetSkip {
     AfterFailure,
     /// The run was cancelled before its turn.
     Cancelled,
+    /// The run did not start: a cluster refused in the preview was not dropped.
+    NotStarted,
 }
 
 /// How one cluster of a run ended.
@@ -281,7 +347,7 @@ impl CoreHandle {
             } = plan;
             let mut entries = Vec::with_capacity(members.len());
             for member in members {
-                let review = review_member(&core, &member, action, &object).await;
+                let review = review_member(&core, &member, &action, &object).await;
                 entries.push(FleetPreviewEntry {
                     member,
                     review,
@@ -297,8 +363,9 @@ impl CoreHandle {
     }
 
     /// Runs `preview` one cluster at a time, stopping at the first failure. `on_result` hears
-    /// each cluster as it ends. A cluster refused in the preview and not dropped fails at its
-    /// turn, with no request. Writes are never retried.
+    /// each cluster as it ends. While a cluster refused in the preview is not dropped, nothing
+    /// runs: that cluster fails with its refusal and every other is not started. Writes are
+    /// never retried.
     pub fn run_fleet(
         &self,
         preview: FleetPreview,
@@ -306,12 +373,14 @@ impl CoreHandle {
         on_result: impl FnMut(&FleetResult) + Send + 'static,
     ) -> impl Future<Output = FleetReport> + Send + 'static {
         let core = self.clone();
+        let blocked = !preview.unresolved().is_empty();
         let steps = preview
             .entries
             .into_iter()
             .map(|entry| Step {
                 cluster: entry.member.context().to_owned(),
                 dropped: entry.dropped,
+                blocked: blocked && entry.review.is_ok(),
                 work: (entry.member, entry.review),
             })
             .collect();
@@ -332,7 +401,7 @@ impl CoreHandle {
 async fn review_member(
     core: &CoreHandle,
     member: &AdmittedMember,
-    action: FleetAction,
+    action: &FleetAction,
     object: &FleetObject,
 ) -> Result<ReviewedMember, WriteError> {
     let bound = core.bound_to(member.clone());
@@ -346,6 +415,7 @@ async fn review_member(
         resource_version: None,
     };
     let review = bound.review_write(target, action.proposal()).await?;
+    // An edit's review was its server dry run; an action's comes next, holding its object.
     let warnings = review.warnings().to_vec();
     let intent = review.into_intent().holding_spec();
     bound.dry_run_write(intent.clone()).await?;
@@ -356,6 +426,8 @@ async fn review_member(
 struct Step<W> {
     cluster: ClusterId,
     dropped: bool,
+    /// The run does not start: another cluster's refusal was not dropped.
+    blocked: bool,
     work: W,
 }
 
@@ -375,6 +447,8 @@ where
     for step in steps {
         let status = if step.dropped {
             FleetStatus::Skipped(FleetSkip::Dropped)
+        } else if step.blocked {
+            FleetStatus::Skipped(FleetSkip::NotStarted)
         } else if failed {
             FleetStatus::Skipped(FleetSkip::AfterFailure)
         } else if cancel.is_cancelled() {

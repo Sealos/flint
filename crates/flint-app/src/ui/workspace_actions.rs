@@ -58,6 +58,7 @@ use super::super::registry::{
     ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
     WatchOpenViewsOnly,
 };
+use super::super::registry::{ApplyAcrossSet, DeleteAcrossSet, RestartAcrossSet, ScaleAcrossSet};
 use super::super::registry::{
     BackToList, DisconnectCluster, EditAiScope, Handler, ShowAgentActivity, ShowHelmReleases,
     ToggleKeepWatching,
@@ -77,7 +78,6 @@ use super::super::registry::{
     ForwardPort, OpenForwardedPort, ShowPortForwards, StartPortForward, StopAllPortForwards,
     StopPortForward,
 };
-use super::super::registry::{RestartAcrossSet, ScaleAcrossSet};
 use super::super::resource_actions::{self, ResourceAction};
 use super::super::scope_picker::ScopePicker;
 use super::super::terminal_view::TerminalView;
@@ -188,6 +188,12 @@ impl Workspace {
         })
         .bind::<ScaleAcrossSet>(|this, _, window, cx| {
             fleet_view::request(this, FleetChoice::Scale, window, cx)
+        })
+        .bind::<ApplyAcrossSet>(|this, _, window, cx| {
+            fleet_view::request(this, FleetChoice::ApplyYaml, window, cx)
+        })
+        .bind::<DeleteAcrossSet>(|this, _, window, cx| {
+            fleet_view::request(this, FleetChoice::Delete, window, cx)
         })
         .bind::<CordonNode>(|this, _, window, cx| {
             resource_actions::request(this, ResourceAction::Cordon, window, cx)
@@ -493,6 +499,12 @@ impl Workspace {
             })
             .when::<ScaleAcrossSet>(|ws, cx| {
                 fleet_view::available(ws, FleetChoice::Scale, cx).is_ok()
+            })
+            .when::<ApplyAcrossSet>(|ws, cx| {
+                fleet_view::available(ws, FleetChoice::ApplyYaml, cx).is_ok()
+            })
+            .when::<DeleteAcrossSet>(|ws, cx| {
+                fleet_view::available(ws, FleetChoice::Delete, cx).is_ok()
             })
             .when::<CordonNode>(|ws, cx| {
                 resource_actions::available(ws, ResourceAction::Cordon, cx).is_ok()

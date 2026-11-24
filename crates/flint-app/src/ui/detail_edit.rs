@@ -503,6 +503,22 @@ impl DetailView {
         (!matches!(self.fetch, Fetch::Loaded { .. })).then(|| "The object is not loaded".to_owned())
     }
 
+    /// The loaded object as a manifest for other clusters: as the editor opens it, without
+    /// what one cluster's copy carries (uid, version and the like). `None` until it is loaded.
+    pub(in crate::ui) fn manifest_yaml(&self) -> Option<Result<String, String>> {
+        let Fetch::Loaded { detail, .. } = &self.fetch else {
+            return None;
+        };
+        Some(editable_yaml(&detail.object).and_then(|yaml| {
+            flint_core::write::portable_manifest(&yaml).map_err(|e| e.to_string())
+        }))
+    }
+
+    /// Whether [`Self::manifest_yaml`] has an object to read.
+    pub(in crate::ui) fn has_loaded_object(&self) -> bool {
+        matches!(self.fetch, Fetch::Loaded { .. })
+    }
+
     pub(in crate::ui) fn can_start_edit(&self) -> bool {
         self.edit.is_none() && self.edit_blocked().is_none()
     }

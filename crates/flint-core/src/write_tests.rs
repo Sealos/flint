@@ -110,6 +110,7 @@ fn reviewed() -> ReviewedEdit {
         pin: crate::recheck::ContextHistory::default().pin("dev", None),
         credential: crate::credential::CredentialBinding::for_tests(),
         body: json!({"data": {"password": "aHVudGVyMg=="}}),
+        creates: false,
         before: String::new(),
         after: String::new(),
     }
@@ -292,4 +293,41 @@ async fn a_disconnect_asked_for_stops_the_next_request_before_the_core_runs_it()
     // A write started now waits for the core to run the disconnect, too.
     let later = RequestGate::new(core.clone(), &target());
     assert_eq!(later.check_disconnects(), Err(refused));
+}
+
+#[test]
+fn a_manifest_leaves_out_what_one_cluster_owns() {
+    let yaml = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web\n  namespace: demo\n  uid: uid-a\n  resourceVersion: '7'\n  generation: 2\n  ownerReferences:\n  - uid: owner-a\n  labels:\n    app: web\ndata:\n  key: value\nstatus:\n  x: 1\n";
+    let portable: Value = serde_saphyr::from_str(&portable_manifest(yaml).unwrap()).unwrap();
+    assert_eq!(
+        portable,
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "web", "namespace": "demo", "labels": {"app": "web"}},
+            "data": {"key": "value"},
+        })
+    );
+    // Not YAML: left for the review to refuse in its own words.
+    assert_eq!(portable_manifest("a: [").unwrap(), "a: [");
+}
+
+#[test]
+fn only_a_manifest_for_an_unshown_object_creates() {
+    let manifest = WriteProposal::ApplyManifest {
+        yaml: String::new(),
+    };
+    let unshown = WriteTarget {
+        uid: None,
+        resource_version: None,
+        ..target()
+    };
+    assert!(creates_when_absent(&unshown, &manifest));
+    // An object that was shown and went away is gone, not created again.
+    assert!(!creates_when_absent(&target(), &manifest));
+    let edit = WriteProposal::ApplyYaml {
+        yaml: String::new(),
+    };
+    assert!(!creates_when_absent(&unshown, &edit));
+    assert!(!creates_when_absent(&unshown, &WriteProposal::Delete));
 }

@@ -5,14 +5,16 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use flint_core::fleet::{
-    FleetAction, FleetCancel, FleetObject, FleetPlan, FleetPreview, FleetReport, FleetSkip,
-    FleetStatus,
+    FleetAction, FleetCancel, FleetManifest, FleetObject, FleetPlan, FleetPreview, FleetReport,
+    FleetSkip, FleetStatus,
 };
 use flint_core::handle::{AdmittedMember, Command, MemberStatus};
 use flint_core::settings::ClusterPin;
-use flint_core::write::{WriteError, WriteWarning};
+use flint_core::write::{ResourceChange, WriteError, WriteWarning};
 use flint_core::{KindId, Settings, WriteRefusal};
-use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, RequestHold, Verb, write_kubeconfigs};
+use flint_e2e::fake_api::{
+    FakeApiServer, Fault, Gvr, Options, RequestHold, Verb, write_kubeconfigs,
+};
 use serde_json::{Value, json};
 
 #[allow(dead_code)]
@@ -74,7 +76,7 @@ fn stored_writes(server: &FakeApiServer) -> usize {
 }
 
 /// Holds the next PATCH that `action` sends to `server`, after its recheck has read the object.
-fn hold_patch(server: &FakeApiServer, action: FleetAction) -> RequestHold {
+fn hold_patch(server: &FakeApiServer, action: &FleetAction) -> RequestHold {
     let (fault, hold) = Fault::hold();
     let fault = fault.on(&deployments()).verb(Verb::Other).times(1);
     server.inject(match action {
@@ -114,10 +116,23 @@ struct Fleet {
 impl Fleet {
     /// Three connected members, each with the object, unlocked except for `locked`.
     async fn start(locked: &[&str]) -> Fleet {
+        Self::start_with(locked, Options::default()).await
+    }
+
+    /// [`Self::start`], on servers that also create objects.
+    async fn start_creating(locked: &[&str]) -> Fleet {
+        let options = Options {
+            accept_creates: true,
+            ..Options::default()
+        };
+        Self::start_with(locked, options).await
+    }
+
+    async fn start_with(locked: &[&str], options: Options) -> Fleet {
         let servers = [
-            FakeApiServer::start().await.unwrap(),
-            FakeApiServer::start().await.unwrap(),
-            FakeApiServer::start().await.unwrap(),
+            FakeApiServer::start_with(options.clone()).await.unwrap(),
+            FakeApiServer::start_with(options.clone()).await.unwrap(),
+            FakeApiServer::start_with(options).await.unwrap(),
         ];
         for (index, server) in servers.iter().enumerate() {
             server.set_object(&deployments(), deployment(&format!("uid-{index}"), 2));
@@ -220,6 +235,7 @@ fn statuses(report: &FleetReport) -> Vec<FleetStatus> {
 }
 
 const AFTER_FAILURE: FleetStatus = FleetStatus::Skipped(FleetSkip::AfterFailure);
+const NOT_STARTED: FleetStatus = FleetStatus::Skipped(FleetSkip::NotStarted);
 
 // covers UP-100: the dry run stores nothing on any cluster, and the run changes each in order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -372,10 +388,10 @@ async fn a_provisional_definition_is_refused_and_stops_the_run() {
     assert!(fleet.servers.iter().all(|s| real_writes(s) == 0));
 }
 
-// covers UP-100, UP-54: a locked member is refused by the dry run, gets no request, and stops the
-// run if it is left in.
+// covers UP-100, UP-54: a locked member is refused by the dry run and gets no request; left in,
+// it keeps the run from starting anywhere.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_protected_member_gets_no_write_and_stops_the_run() {
+async fn a_protected_member_gets_no_write_and_keeps_the_run_from_starting() {
     let fleet = Fleet::start(&["b"]).await;
     let preview = fleet.preview(FleetAction::Scale { to: 5 }).await;
     assert!(matches!(
@@ -383,17 +399,18 @@ async fn a_protected_member_gets_no_write_and_stops_the_run() {
         Some(WriteError::Refused(WriteRefusal::Protected { .. }))
     ));
     assert_eq!(all_writes(fleet.server("b")), 0, "not even a dry run");
+    assert!(!preview.is_ready());
 
     let report = fleet.run(preview).await;
     let results = statuses(&report);
-    assert_eq!(results[0], FleetStatus::Done);
+    assert_eq!(results[0], NOT_STARTED);
     assert!(matches!(
         &results[1],
         FleetStatus::Failed(WriteError::Refused(WriteRefusal::Protected { .. }))
     ));
-    assert_eq!(results[2], AFTER_FAILURE);
+    assert_eq!(results[2], NOT_STARTED);
+    assert!(fleet.servers.iter().all(|s| real_writes(s) == 0));
     assert_eq!(all_writes(fleet.server("b")), 0);
-    assert_eq!(real_writes(fleet.server("c")), 0);
 }
 
 // covers UP-100, UP-54: a cluster locked after its dry run is refused: the preview grants nothing.
@@ -513,9 +530,9 @@ async fn a_dropped_cluster_and_a_cancelled_run_send_nothing() {
 async fn a_change_just_before_the_patch_stops_the_run() {
     for action in ACTIONS {
         let fleet = Fleet::start(&[]).await;
-        let preview = fleet.preview(action).await;
+        let preview = fleet.preview(action.clone()).await;
         let (b, c) = (fleet.server("b"), fleet.server("c"));
-        let hold = hold_patch(b, action);
+        let hold = hold_patch(b, &action);
         let run = tokio::spawn(
             fleet
                 .core
@@ -548,8 +565,8 @@ async fn a_change_just_before_the_dry_run_is_refused() {
     for action in ACTIONS {
         let fleet = Fleet::start(&[]).await;
         let b = fleet.server("b");
-        let hold = hold_patch(b, action);
-        let plan = FleetPlan::new(action, object(), fleet.members.clone()).unwrap();
+        let hold = hold_patch(b, &action);
+        let plan = FleetPlan::new(action.clone(), object(), fleet.members.clone()).unwrap();
         let preview = tokio::spawn(fleet.core.handle.preview_fleet(plan));
         tokio::time::timeout(WAIT, hold.reached()).await.unwrap();
         let changed = change_image(b);
@@ -595,7 +612,7 @@ async fn a_name_that_is_not_a_path_segment_sends_nothing() {
     );
     for action in ACTIONS {
         for object in &objects {
-            let plan = FleetPlan::new(action, object.clone(), fleet.members.clone());
+            let plan = FleetPlan::new(action.clone(), object.clone(), fleet.members.clone());
             let refused = plan.is_err();
             if let Ok(plan) = plan {
                 fleet.core.handle.preview_fleet(plan).await;
@@ -617,7 +634,7 @@ async fn a_preview_only_sends_dry_runs() {
     for action in ACTIONS {
         let fleet = Fleet::start(&[]).await;
         let before: Vec<_> = fleet.servers.iter().map(live).collect();
-        let preview = fleet.preview(action).await;
+        let preview = fleet.preview(action.clone()).await;
         assert!(preview.entries().iter().all(|e| e.refusal().is_none()));
         for (server, before) in fleet.servers.iter().zip(&before) {
             let writes = server.writes();
@@ -687,4 +704,327 @@ async fn a_partial_failure_after_a_refusal_reports_each_member() {
     assert_eq!(all_writes(fleet.server("a")), 0);
     assert_eq!(stored_writes(b), 0);
     assert_eq!(real_writes(fleet.server("c")), 0);
+}
+
+/// A manifest for `web` with `replicas` and a label, as one cluster's copy would carry it: with
+/// that cluster's uid, version and status, which the others must not get.
+fn manifest(replicas: u32) -> FleetAction {
+    let yaml = format!(
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: {NAME}\n  namespace: demo\n  \
+         uid: uid-elsewhere\n  resourceVersion: '999'\n  labels:\n    release: next\nspec:\n  \
+         replicas: {replicas}\n  template:\n    metadata: {{}}\nstatus:\n  replicas: 7\n"
+    );
+    FleetAction::ApplyYaml {
+        manifest: FleetManifest::new(yaml),
+    }
+}
+
+// covers UP-101: one manifest is dry-run on every cluster, replacing the object where it exists
+// and creating it where it does not, then applied on each in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_apply_is_dry_run_per_cluster_then_creates_or_replaces_on_each() {
+    let fleet = Fleet::start_creating(&[]).await;
+    let c = fleet.server("c");
+    assert!(c.remove_object(&deployments(), Some("demo"), NAME));
+
+    let preview = fleet.preview(manifest(4)).await;
+    let creates: Vec<Option<bool>> = preview
+        .entries()
+        .iter()
+        .map(|e| e.edit().map(|edit| edit.creates()))
+        .collect();
+    assert_eq!(creates, [Some(false), Some(false), Some(true)]);
+    let a = &preview.entries()[0];
+    assert!(a.edit().unwrap().after().contains("release: next"));
+    assert!(a.edit().unwrap().before().contains("uid-0"));
+    assert!(preview.is_ready());
+    for server in &fleet.servers {
+        assert_eq!(real_writes(server), 0, "a dry run stores nothing");
+        assert_eq!(all_writes(server), 1);
+    }
+    assert!(c.object(&deployments(), Some("demo"), NAME).is_none());
+
+    let report = fleet.run(preview).await;
+    assert_eq!(statuses(&report), [const { FleetStatus::Done }; 3]);
+    for (index, server) in fleet.servers.iter().enumerate() {
+        let object = live(server);
+        assert_eq!(object["spec"]["replicas"], 4);
+        assert_eq!(object["metadata"]["labels"]["release"], "next");
+        assert_ne!(object["metadata"]["uid"], "uid-elsewhere");
+        if index < 2 {
+            assert_eq!(
+                object["metadata"]["uid"],
+                format!("uid-{index}"),
+                "replaced"
+            );
+        }
+        assert_eq!(real_writes(server), 1, "sent once");
+    }
+}
+
+// covers UP-101: a cluster whose dry run failed keeps the run from starting until it is left
+// out; left out, it gets nothing and the others run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_apply_dry_run_blocks_the_run_until_it_is_left_out() {
+    let fleet = Fleet::start_creating(&[]).await;
+    let b = fleet.server("b");
+    b.inject(
+        Fault::status(422)
+            .on(&deployments())
+            .verb(Verb::Other)
+            .times(1),
+    );
+    let preview = fleet.preview(manifest(4)).await;
+    assert!(matches!(
+        preview.entries()[1].refusal(),
+        Some(WriteError::Rejected(_))
+    ));
+    assert_eq!(preview.unresolved(), ["b"]);
+    assert!(!preview.is_ready());
+
+    let report = fleet.run(preview).await;
+    let results = statuses(&report);
+    assert_eq!(results[0], NOT_STARTED);
+    assert!(matches!(results[1], FleetStatus::Failed(_)), "{results:?}");
+    assert_eq!(results[2], NOT_STARTED);
+    assert!(fleet.servers.iter().all(|s| real_writes(s) == 0));
+
+    b.inject(
+        Fault::status(422)
+            .on(&deployments())
+            .verb(Verb::Other)
+            .times(1),
+    );
+    let mut preview = fleet.preview(manifest(4)).await;
+    assert_eq!(preview.drop_refused(), ["b"]);
+    let writes_at_b = all_writes(b);
+    let report = fleet.run(preview).await;
+    assert_eq!(
+        statuses(&report),
+        [
+            FleetStatus::Done,
+            FleetStatus::Skipped(FleetSkip::Dropped),
+            FleetStatus::Done,
+        ]
+    );
+    assert_eq!(
+        all_writes(b),
+        writes_at_b,
+        "nothing reached the cluster left out"
+    );
+    assert_eq!(replicas(b), 2);
+    assert_eq!(replicas(fleet.server("c")), 4);
+}
+
+// covers UP-101, UP-54: a locked member is refused an apply and a delete before any request,
+// even a dry run, and the others run once it is left out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_protected_member_is_refused_an_apply_and_a_delete() {
+    for action in [manifest(4), FleetAction::Delete] {
+        let fleet = Fleet::start_creating(&["b"]).await;
+        let b = fleet.server("b");
+        let mut preview = fleet.preview(action.clone()).await;
+        assert!(
+            matches!(
+                preview.entries()[1].refusal(),
+                Some(WriteError::Refused(WriteRefusal::Protected { .. }))
+            ),
+            "{action:?}"
+        );
+        assert_eq!(all_writes(b), 0, "not even a dry run: {action:?}");
+        assert_eq!(preview.drop_refused(), ["b"]);
+        let report = fleet.run(preview).await;
+        assert_eq!(
+            statuses(&report),
+            [
+                FleetStatus::Done,
+                FleetStatus::Skipped(FleetSkip::Dropped),
+                FleetStatus::Done,
+            ],
+            "{action:?}"
+        );
+        assert_eq!(all_writes(b), 0, "{action:?}");
+        assert_eq!(replicas(b), 2, "{action:?}");
+        assert_eq!(live(b)["metadata"]["uid"], "uid-1", "{action:?}");
+    }
+}
+
+// covers UP-101: the first failure of an apply stops the run, and the clusters after it are not
+// tried and get no request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_failed_apply_stops_the_run() {
+    let fleet = Fleet::start_creating(&[]).await;
+    let preview = fleet.preview(manifest(4)).await;
+    let (b, c) = (fleet.server("b"), fleet.server("c"));
+    b.inject(
+        Fault::status(500)
+            .on(&deployments())
+            .verb(Verb::Other)
+            .times(1),
+    );
+    let arrivals_at_c = c.arrivals().len();
+    let writes_at_b = all_writes(b);
+
+    let report = fleet.run(preview).await;
+    let results = statuses(&report);
+    assert_eq!(results[0], FleetStatus::Done);
+    assert!(matches!(results[1], FleetStatus::Failed(_)), "{results:?}");
+    assert_eq!(results[2], AFTER_FAILURE);
+    assert_eq!(replicas(fleet.server("a")), 4);
+    assert_eq!(replicas(b), 2);
+    assert_eq!(all_writes(b), writes_at_b + 1, "not retried");
+    assert_eq!(c.arrivals().len(), arrivals_at_c, "nothing reached c");
+    assert_eq!(replicas(c), 2);
+}
+
+// covers UP-101: an object created on a cluster after its review (where the apply was to create
+// it) is a conflict: the create is refused and stops the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_object_created_after_the_review_stops_the_apply() {
+    let fleet = Fleet::start_creating(&[]).await;
+    let a = fleet.server("a");
+    assert!(a.remove_object(&deployments(), Some("demo"), NAME));
+    let preview = fleet.preview(manifest(4)).await;
+    assert!(preview.entries()[0].edit().unwrap().creates());
+    a.set_object(&deployments(), deployment("uid-new", 3));
+
+    let report = fleet.run(preview).await;
+    assert_eq!(
+        statuses(&report),
+        [
+            FleetStatus::Failed(WriteError::Conflict),
+            AFTER_FAILURE,
+            AFTER_FAILURE,
+        ]
+    );
+    assert_eq!(replicas(a), 3, "the object someone else made stays");
+    assert!(fleet.servers.iter().all(|s| stored_writes(s) == 0));
+}
+
+// covers UP-101: an object changed after its apply review is a conflict at its turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_object_changed_after_the_review_stops_the_apply() {
+    let fleet = Fleet::start_creating(&[]).await;
+    let preview = fleet.preview(manifest(4)).await;
+    let b = fleet.server("b");
+    let changed = change_image(b);
+
+    let report = fleet.run(preview).await;
+    assert_eq!(
+        statuses(&report),
+        [
+            FleetStatus::Done,
+            FleetStatus::Failed(WriteError::Conflict),
+            AFTER_FAILURE,
+        ]
+    );
+    assert_eq!(live(b), changed);
+    assert_eq!(replicas(fleet.server("c")), 2);
+}
+
+// covers UP-101: a delete is dry-run on every cluster, bound to each one's uid, then deletes
+// each in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_is_dry_run_per_cluster_then_deletes_each() {
+    let fleet = Fleet::start(&[]).await;
+    let preview = fleet.preview(FleetAction::Delete).await;
+    for entry in preview.entries() {
+        assert_eq!(entry.refusal(), None, "{}", entry.cluster());
+        assert_eq!(entry.change(), Some(&ResourceChange::Delete));
+    }
+    for server in &fleet.servers {
+        let writes = server.writes();
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0].is_dry_run(), "{:?}", writes[0].query);
+        assert!(server.object(&deployments(), Some("demo"), NAME).is_some());
+    }
+
+    let report = fleet.run(preview).await;
+    assert_eq!(statuses(&report), [const { FleetStatus::Done }; 3]);
+    for server in &fleet.servers {
+        assert!(server.object(&deployments(), Some("demo"), NAME).is_none());
+        assert_eq!(real_writes(server), 1, "sent once");
+    }
+}
+
+/// A change made to a member's object between its review and the run.
+type Change = fn(&FakeApiServer);
+
+// covers UP-101: a member whose object changed (its spec or only its status), went away, or was
+// deleted and made again since the review stops the delete there, and nothing is deleted after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_stops_where_the_object_changed_or_vanished_since_the_review() {
+    let changes: [(&str, Change); 4] = [
+        ("spec", |server| {
+            change_image(server);
+        }),
+        ("status", |server| {
+            let mut updated = live(server);
+            updated["metadata"]["resourceVersion"] = json!("102");
+            updated["status"] = json!({"observedGeneration": 2});
+            server.set_object(&deployments(), updated);
+        }),
+        ("vanished", |server| {
+            assert!(server.remove_object(&deployments(), Some("demo"), NAME));
+        }),
+        ("replaced", |server| {
+            server.set_object(&deployments(), deployment("uid-again", 2));
+        }),
+    ];
+    for (what, change) in changes {
+        let fleet = Fleet::start(&[]).await;
+        let preview = fleet.preview(FleetAction::Delete).await;
+        let (b, c) = (fleet.server("b"), fleet.server("c"));
+        change(b);
+        let report = fleet.run(preview).await;
+        let results = statuses(&report);
+        assert_eq!(results[0], FleetStatus::Done, "{what}");
+        assert!(
+            matches!(
+                results[1],
+                FleetStatus::Failed(WriteError::Conflict | WriteError::Gone)
+            ),
+            "{what}: {results:?}"
+        );
+        assert_eq!(results[2], AFTER_FAILURE, "{what}");
+        assert_eq!(real_writes(b), 0, "{what}");
+        assert_eq!(real_writes(c), 0, "{what}");
+        assert!(
+            c.object(&deployments(), Some("demo"), NAME).is_some(),
+            "{what}"
+        );
+    }
+}
+
+// covers UP-101: a change that lands between a delete's last read and its request is refused by
+// the server: the request names the uid and version reviewed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_just_before_the_delete_stops_the_run() {
+    let fleet = Fleet::start(&[]).await;
+    let preview = fleet.preview(FleetAction::Delete).await;
+    let (b, c) = (fleet.server("b"), fleet.server("c"));
+    let (fault, hold) = Fault::hold();
+    b.inject(fault.on(&deployments()).verb(Verb::Other).times(1));
+    let run = tokio::spawn(
+        fleet
+            .core
+            .handle
+            .run_fleet(preview, FleetCancel::new(), |_| {}),
+    );
+    tokio::time::timeout(WAIT, hold.reached()).await.unwrap();
+    let changed = change_image(b);
+    hold.release();
+
+    let report = tokio::time::timeout(WAIT, run).await.unwrap().unwrap();
+    assert_eq!(
+        statuses(&report),
+        [
+            FleetStatus::Done,
+            FleetStatus::Failed(WriteError::Conflict),
+            AFTER_FAILURE,
+        ]
+    );
+    assert_eq!(live(b), changed);
+    assert_eq!(stored_writes(b), 0);
+    assert_eq!(real_writes(c), 0);
 }
