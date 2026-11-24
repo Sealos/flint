@@ -19,10 +19,10 @@ const PROTECTED: &str = "protect_local_clusters = true\n";
 const MERGE_PATCH: &str = "application/merge-patch+json";
 const JSON_PATCH: &str = "application/json-patch+json";
 const JSON: &str = "application/json";
-/// The query of a write built by the Kubernetes client, which starts it with `&`.
-const FIELD_MANAGER: &str = "&fieldManager=flint";
-/// The query of the scale request, whose URL Flint builds itself.
-const SCALE_QUERY: &str = "fieldManager=flint";
+/// The query of a PATCH, whose URL Flint builds itself.
+const FIELD_MANAGER: &str = "fieldManager=flint";
+/// The query of a PUT built by the Kubernetes client, which starts it with `&`.
+const CLIENT_FIELD_MANAGER: &str = "&fieldManager=flint";
 const WEB: &str = "/apis/apps/v1/namespaces/demo/deployments/web";
 const RESTARTED_AT: &str = "kubectl.kubernetes.io/restartedAt";
 const NODE: &str = "requests-node";
@@ -290,7 +290,7 @@ fn up_53_each_action_sends_its_exact_request() -> Result<()> {
         &writes[1],
         Method::PATCH,
         &format!("{WEB}/scale"),
-        SCALE_QUERY,
+        FIELD_MANAGER,
         JSON_PATCH,
         &json!([
             {"op": "test", "path": "/metadata/uid", "value": web_uid},
@@ -371,7 +371,10 @@ fn up_53_each_action_sends_its_exact_request() -> Result<()> {
     let reviewed = body(&writes[7]);
     assert_eq!(writes[7].method, Method::PUT);
     assert_eq!(writes[7].path, EDITED_PATH);
-    assert_eq!(writes[7].query, format!("&dryRun=All{FIELD_MANAGER}"));
+    assert_eq!(
+        writes[7].query,
+        format!("&dryRun=All{CLIENT_FIELD_MANAGER}")
+    );
     assert_eq!(writes[7].content_type, JSON);
     assert_eq!(reviewed["immutable"], true, "{reviewed}");
     assert_eq!(reviewed["data"], json!({"a": "1"}), "{reviewed}");
@@ -395,7 +398,7 @@ fn up_53_each_action_sends_its_exact_request() -> Result<()> {
         &writes[8],
         Method::PUT,
         EDITED_PATH,
-        FIELD_MANAGER,
+        CLIENT_FIELD_MANAGER,
         JSON,
         &reviewed,
     );
