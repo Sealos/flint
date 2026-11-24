@@ -699,6 +699,22 @@ fn the_settings_error_says_the_proxy_setting_was_not_applied() {
         noted.contains("proxy setting could not be applied"),
         "{noted}"
     );
+    // A parse error's later lines quote the file: the note takes their place, on the first line.
+    let parse_error =
+        "could not parse /cfg/settings.toml: TOML parse error at line 2, column 9\n  \
+                       |\n2 | server = \"https://flint:s3cret@bad host\n  |         ^\n"
+            .to_owned();
+    let noted = with_proxy_note(parse_error, true);
+    assert_eq!(noted.lines().count(), 1, "{noted}");
+    assert!(
+        noted.starts_with("could not parse /cfg/settings.toml: TOML parse error at line 2"),
+        "{noted}"
+    );
+    assert!(
+        noted.contains("proxy setting could not be applied"),
+        "{noted}"
+    );
+    assert!(!noted.contains("s3cret"), "{noted}");
 }
 
 #[test]

@@ -38,6 +38,11 @@ pub enum ClusterError {
     UnknownContext(String),
     #[error("invalid kubeconfig for context \"{context}\": {message}")]
     Config { context: String, message: String },
+    /// The cluster would take the proxy setting, but `settings.toml` could not be read when
+    /// Flint started, so the route is refused rather than sent without that proxy.
+    /// Says so without quoting the file.
+    #[error("{}", proxy::ProxyRefused::SettingsUnreadable)]
+    ProxySettingUnknown,
     /// Text from kube or below it (an error chain, a client error), which can quote anything.
     #[error("{0}")]
     Kube(String),
@@ -711,10 +716,7 @@ pub(crate) async fn prepare(
         &config.cluster_url.to_string(),
         config.accept_invalid_certs,
     )
-    .map_err(|refused| ClusterError::Config {
-        context: context.to_owned(),
-        message: refused.to_string(),
-    })?;
+    .map_err(|refused| refused_route(context, refused))?;
     // What a plugin is told of the cluster holds the proxy's address, never its credentials.
     if let Some(cluster) = config
         .auth_info
@@ -763,10 +765,19 @@ fn route_preflight(kubeconfig: &Kubeconfig, context: &str) -> Result<(), Cluster
     let skips_verify = cluster.insecure_skip_tls_verify == Some(true);
     proxy_of(cluster.proxy_url.as_deref(), server, skips_verify)
         .map(drop)
-        .map_err(|refused| ClusterError::Config {
+        .map_err(|refused| refused_route(context, refused))
+}
+
+/// Why `context`'s route was refused: the kubeconfig's values, or, for a route that would take
+/// the proxy setting, a `settings.toml` that could not be read.
+fn refused_route(context: &str, refused: proxy::ProxyRefused) -> ClusterError {
+    match refused {
+        proxy::ProxyRefused::SettingsUnreadable => ClusterError::ProxySettingUnknown,
+        refused => ClusterError::Config {
             context: context.to_owned(),
             message: refused.to_string(),
-        })
+        },
+    }
 }
 
 /// Gives `context`'s cluster entry [`proxy::LOADER_PLACEHOLDER`] as its proxy, and returns the
@@ -1765,6 +1776,34 @@ mod tests {
                          `path` in Flint's settings.toml";
         assert_eq!(ClusterError::kube(exec_not_found()).to_string(), anonymous);
         assert_eq!(error_chain(&exec_not_found()), anonymous);
+    }
+
+    #[test]
+    fn a_route_refused_for_an_unreadable_settings_file_says_so() {
+        let refused = refused_route("ctx", proxy::ProxyRefused::SettingsUnreadable);
+        assert!(matches!(refused, ClusterError::ProxySettingUnknown));
+        let shown = refused.summary();
+        assert!(
+            shown
+                .as_str()
+                .starts_with("settings.toml could not be read"),
+            "{shown:?}"
+        );
+        assert!(!shown.as_str().contains("invalid kubeconfig"), "{shown:?}");
+        assert!(
+            refused
+                .for_agent()
+                .starts_with("settings.toml could not be read")
+        );
+        // A refusal from the kubeconfig's own values still names the context.
+        let config = refused_route("ctx", proxy::ProxyRefused::PlainHttp);
+        assert!(
+            config.summary().as_str().starts_with(
+                "invalid kubeconfig for context \"ctx\": the API server uses plain HTTP"
+            ),
+            "{:?}",
+            config.summary()
+        );
     }
 
     // covers UP-04
