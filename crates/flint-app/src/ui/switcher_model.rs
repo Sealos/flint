@@ -514,7 +514,7 @@ impl Search {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use flint_core::{KindId, KindSnapshot, NavEntry, Row, SyncState};
 
@@ -968,29 +968,45 @@ mod tests {
         assert!(!finder.found_in(&"a".repeat(69)));
     }
 
-    // #418: a long repeated prefix that never completes a run costs one pass per name, not one
-    // per occurrence of the query's first letter. These names are over twice as long as the
-    // ones below and every one matches, so the linear passes alone take a few hundred ms in
-    // this unoptimized build. Rescanning the prefix took over 3 s, which the limit still fails.
+    // #418: a long repeated prefix that never completes a run costs one pass per name. Compare
+    // equally long names and queries where only the repeated prefix invites rescanning.
     #[test]
-    fn a_repeated_prefix_over_fifty_thousand_objects_fits_in_a_frame() {
-        let prefix = "a".repeat(60);
-        let names: Vec<String> = (0..50_000).map(|i| format!("{prefix}x-b-{i}")).collect();
-        let rows: Vec<(Option<&str>, &str)> =
-            names.iter().map(|n| (Some("demo"), n.as_str())).collect();
-        let index = Index::new(
-            &[entry("", "pods", "Pod", "Pods")],
-            &[snapshot(KindId::pods(), &rows)],
-        );
-        let query = format!("{prefix}b");
-        let mut spent = Duration::MAX;
-        for _ in 0..3 {
-            let start = Instant::now();
-            let found = Search::default().run(&index, &query);
-            spent = spent.min(start.elapsed());
-            assert_eq!(found.matched, 50_000);
+    fn a_repeated_prefix_over_fifty_thousand_objects_costs_one_pass() {
+        fn case(fill: &str) -> (Index, String) {
+            let query = format!("a{}b", fill.repeat(59));
+            let prefix = format!("a{}", fill.repeat(179));
+            let names: Vec<String> = (0..50_000).map(|i| format!("{prefix}x-b-{i}")).collect();
+            let rows: Vec<(Option<&str>, &str)> =
+                names.iter().map(|n| (Some("demo"), n.as_str())).collect();
+            let index = Index::new(
+                &[entry("", "pods", "Pod", "Pods")],
+                &[snapshot(KindId::pods(), &rows)],
+            );
+            (index, query)
         }
-        assert!(spent < Duration::from_secs(1), "{spent:?}");
+
+        fn search_cpu_time((index, query): &(Index, String)) -> Duration {
+            let start = thread_cpu_time();
+            let found = Search::default().run(index, query);
+            let spent = thread_cpu_time() - start;
+            assert_eq!(found.matched, 50_000);
+            spent
+        }
+
+        let single_start = case("c");
+        let repeated = case("a");
+        let mut baseline = [Duration::ZERO; 3];
+        let mut repeated_prefix = [Duration::ZERO; 3];
+        for (baseline_sample, repeated_sample) in baseline.iter_mut().zip(&mut repeated_prefix) {
+            *baseline_sample = search_cpu_time(&single_start);
+            *repeated_sample = search_cpu_time(&repeated);
+        }
+        baseline.sort_unstable();
+        repeated_prefix.sort_unstable();
+        assert!(
+            repeated_prefix[1] < baseline[1] * 2,
+            "search CPU times: single start {baseline:?}, repeated prefix {repeated_prefix:?}"
+        );
     }
 
     /// `objects` objects across 40 kinds and 200 namespaces, named as real clusters name them.
