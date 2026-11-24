@@ -18,6 +18,7 @@ use flint_core::dashboard::{
 };
 use flint_core::metrics::MetricsError;
 use flint_core::metrics_trend::{TrendResource, TrendScope, TrendStore};
+use flint_core::rollout::{COMPLETE_WINDOW, Rollout, RolloutState};
 use flint_core::telemetry::{
     Availability, CheckFailure, FailureCause, KindCheck, MetricsCheck, TelemetrySnapshot,
     UsageRead, WatchedKind,
@@ -79,7 +80,7 @@ pub const INSTALL_COMMAND: &str = "kubectl apply -f https://github.com/kubernete
 pub const INSTALL_HINT: &str = "CPU and memory need metrics-server, which this cluster does not \
                                 have. To install it:";
 /// What the Warning events list says when there are none.
-pub const NO_WARNINGS: &str = "No Warning events in the last hour.";
+pub const NO_WARNINGS: &str = "No Warning events or rollouts in the last hour.";
 /// What the Warning events list says when events could not be read.
 pub const WARNINGS_UNAVAILABLE: &str = "Warning events cannot be checked.";
 /// What the metrics section says before the first poll has finished.
@@ -300,7 +301,7 @@ impl MetricTile {
     }
 }
 
-/// The recent Warning events section.
+/// The recent activity section: Warning events and Deployment rollouts.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WarningsPanel {
     Unavailable,
@@ -311,7 +312,8 @@ pub enum WarningsPanel {
     },
 }
 
-/// One Warning event. All text from the cluster is cleaned for display.
+/// One Warning event, or one Deployment's rollout. All text from the cluster is cleaned for
+/// display.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WarningRow {
     pub age: String,
@@ -327,6 +329,9 @@ pub struct WarningRow {
     pub object_uid: Option<String>,
     /// This event among the rows: stays the same as rows above it come and go.
     pub key: String,
+    /// Set when the row is a Deployment's rollout rather than a Warning event. A rollout is one
+    /// row that changes state, and its key is its Deployment's.
+    pub rollout: Option<RolloutState>,
 }
 
 impl WarningRow {
@@ -595,31 +600,123 @@ fn warnings(input: &DashboardInput<'_>, scope: &OpenScope) -> WarningsPanel {
     let Some(events) = input.warning_events else {
         return WarningsPanel::Unavailable;
     };
-    let mut recent: Vec<(Timestamp, &KubeEvent)> = events
+    let recent: Vec<(Timestamp, &KubeEvent)> = events
         .iter()
         .filter(|event| event.type_.as_deref() == Some("Warning"))
         .filter_map(|event| Some((last_seen(event)?, event)))
         .filter(|(seen, _)| input.now.duration_since(*seen) < WARNING_EVENT_WINDOW)
         .collect();
-    let total = recent.len();
-    recent.sort_by_key(|(seen, event)| {
-        (
-            Reverse(*seen),
-            event.involved_object.namespace.clone(),
-            event.involved_object.name.clone(),
-            event.reason.clone(),
+    let rollouts: Vec<(Timestamp, &Rollout)> = input
+        .snapshot
+        .rollouts
+        .iter()
+        .map(|rollout| (rollout.at.unwrap_or(input.now), rollout))
+        .filter(|(at, rollout)| {
+            rollout.state != RolloutState::Complete
+                || input.now.duration_since(*at) < COMPLETE_WINDOW
+        })
+        .collect();
+    let total = recent.len() + rollouts.len();
+    let mut entries: Vec<Entry<'_>> = recent
+        .into_iter()
+        .map(|(seen, event)| Entry::Event(seen, event))
+        .chain(
+            rollouts
+                .into_iter()
+                .map(|(at, rollout)| Entry::Rollout(at, rollout)),
         )
-    });
+        .collect();
+    // Newest first; entries at the same time keep a stable order by what they name.
+    entries.sort_by_cached_key(Entry::order);
     let mut keys = HashSet::new();
-    let rows = recent
+    let rows = entries
         .into_iter()
         .take(MAX_WARNING_ROWS)
-        .map(|(seen, event)| {
-            let key = warning_key(event, &mut keys);
-            warning_row(event, key, seen, input.now, scope)
+        .map(|entry| match entry {
+            Entry::Event(seen, event) => {
+                let key = warning_key(event, &mut keys);
+                warning_row(event, key, seen, input.now, scope)
+            }
+            Entry::Rollout(at, rollout) => {
+                let key = unique_key(rollout_key(rollout), &mut keys);
+                rollout_row(rollout, key, at, input.now, scope)
+            }
         })
         .collect();
     WarningsPanel::Rows { rows, total }
+}
+
+/// The sort key of an [`Entry`]: newest first, then by namespace, name and reason or state.
+type EntryOrder = (
+    Reverse<Timestamp>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// One line of the activity feed, before it is drawn.
+enum Entry<'a> {
+    Event(Timestamp, &'a KubeEvent),
+    Rollout(Timestamp, &'a Rollout),
+}
+
+impl Entry<'_> {
+    fn order(&self) -> EntryOrder {
+        match self {
+            Entry::Event(seen, event) => (
+                Reverse(*seen),
+                event.involved_object.namespace.clone(),
+                event.involved_object.name.clone(),
+                event.reason.clone(),
+            ),
+            Entry::Rollout(at, rollout) => (
+                Reverse(*at),
+                Some(rollout.namespace.clone()),
+                Some(rollout.name.clone()),
+                Some(rollout.state.label().to_owned()),
+            ),
+        }
+    }
+}
+
+/// What names `rollout` among the rows: its Deployment, not its state, so one rollout stays one
+/// row as it moves on.
+fn rollout_key(rollout: &Rollout) -> String {
+    match &rollout.uid {
+        Some(uid) => format!("rollout-{uid}"),
+        None => format!("rollout-{}/{}", rollout.namespace, rollout.name),
+    }
+}
+
+fn rollout_row(
+    rollout: &Rollout,
+    key: String,
+    at: Timestamp,
+    now: Timestamp,
+    scope: &OpenScope,
+) -> WarningRow {
+    let name = if rollout.namespace.is_empty() {
+        cleaned(&rollout.name)
+    } else {
+        format!("{}/{}", cleaned(&rollout.namespace), cleaned(&rollout.name))
+    };
+    WarningRow {
+        age: age(now, at),
+        reason: rollout.state.label().to_owned(),
+        object: format!("Deployment {name}"),
+        message: cleaned(&rollout.summary()),
+        occurrences: 1,
+        open: Some(OpenObject {
+            kind: "Deployment.apps".to_owned(),
+            namespace: Some(rollout.namespace.clone()).filter(|n| !n.is_empty()),
+            name: rollout.name.clone(),
+            cluster: Some(scope.cluster.clone()),
+            server: scope.server.clone(),
+        }),
+        object_uid: rollout.uid.clone(),
+        key,
+        rollout: Some(rollout.state),
+    }
 }
 
 /// The link to the object `event` names. The kind is pinned to the event's API group, so a
@@ -670,6 +767,11 @@ fn warning_key(event: &KubeEvent, taken: &mut HashSet<String>) -> String {
                 event.reason.as_deref().unwrap_or_default(),
             )
         });
+    unique_key(base, taken)
+}
+
+/// `base`, or `base` with a copy number if a row has it already: rows are keyed by it.
+fn unique_key(base: String, taken: &mut HashSet<String>) -> String {
     let mut key = base.clone();
     let mut copy = 1;
     while !taken.insert(key.clone()) {
@@ -726,6 +828,7 @@ fn warning_row(
         open,
         object_uid: warning_object_uid(event),
         key,
+        rollout: None,
     }
 }
 

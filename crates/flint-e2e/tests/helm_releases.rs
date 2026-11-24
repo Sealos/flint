@@ -1,17 +1,21 @@
 //! Helm releases through a fake `helm` on a real core and a fake API server: every run is held to
-//! the connection admitted, and a plugin credential never reaches `helm`.
+//! the connection admitted, and `helm` never gets a plugin to run: Flint runs it, only under the
+//! cluster's background sign-in consent, and hands `helm` the token.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use flint_core::Settings;
+use flint_core::handle::Command;
 use flint_core::helm::{HelmError, HelmOutput, HelmQuery};
+use flint_core::keep_watching::{BackgroundSignIn, KeepWatching};
 use flint_e2e::fake_api::{CONTEXT, FakeApiServer};
 
 #[allow(dead_code)]
 mod core_support;
 
-use core_support::Core;
+use core_support::{Core, WAIT};
 
 const LIST: &str = "[{\"name\":\"web\",\"namespace\":\"apps\",\"revision\":\"2\",\
                     \"status\":\"deployed\",\"chart\":\"web-1.0.0\",\"app_version\":\"1\",\
@@ -178,9 +182,9 @@ async fn a_credential_edit_put_back_starts_no_run() {
     assert_eq!(runs(scripts.path()), 0, "helm never started");
 }
 
-#[tokio::test]
-async fn an_exec_plugin_credential_is_refused_and_never_runs() {
-    let server = FakeApiServer::start().await.unwrap();
+/// A core whose only cluster signs in with an exec plugin printing the token `t`, with a fake
+/// `helm` in the returned directory, and where the plugin counts its runs.
+async fn plugin_core(server: &FakeApiServer) -> (Core, tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let plugin = dir.path().join("plugin");
     let ran = dir.path().join("plugin-ran");
@@ -203,12 +207,64 @@ async fn an_exec_plugin_credential_is_refused_and_never_runs() {
     let file = dir.path().join("kubeconfig");
     std::fs::write(&file, config.to_string()).unwrap();
     let scripts = tempfile::tempdir().unwrap();
+    let helm = fake_helm(scripts.path());
+    // Turning on keep watching saves the settings file and reads it back.
+    let config_dir = dir.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("settings.toml"),
+        format!("helm = {:?}\n", helm.display().to_string()),
+    )
+    .unwrap();
     let settings = Settings {
-        helm: Some(fake_helm(scripts.path())),
+        helm: Some(helm),
         ..Settings::default()
     };
     let core = Core::start_on(dir, vec![file], settings).await;
-    let plugin_runs = std::fs::read(&ran).map_or(0, |b| b.len());
+    (core, scripts, ran)
+}
+
+fn plugin_runs(ran: &Path) -> usize {
+    std::fs::read(ran).map_or(0, |b| b.len())
+}
+
+/// Turns on keep watching and its background sign-in for [`CONTEXT`], as the toggles do.
+async fn consent(core: &Core) {
+    let handle = &core.handle;
+    let definition = handle.keep_watching().await[CONTEXT].definition;
+    handle.send(Command::SetKeepWatching {
+        cluster: CONTEXT.to_owned(),
+        definition,
+    });
+    let shown = tokio::time::timeout(WAIT, async {
+        loop {
+            let view = handle.keep_watching().await[CONTEXT].clone();
+            if view.status != KeepWatching::Off
+                && let Some(shown) = view.shown_sign_in
+            {
+                return shown;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the sign-in toggle");
+    let offer = handle.offer_keep_watching(CONTEXT, shown).await.unwrap();
+    handle.send(Command::ApproveKeepWatching(offer.approve()));
+    tokio::time::timeout(WAIT, async {
+        while handle.keep_watching().await[CONTEXT].sign_in != BackgroundSignIn::On {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background sign-in on");
+}
+
+#[tokio::test]
+async fn an_exec_plugin_without_consent_is_refused_and_never_runs() {
+    let server = FakeApiServer::start().await.unwrap();
+    let (core, scripts, ran) = plugin_core(&server).await;
+    let before = plugin_runs(&ran);
 
     let pin = core.handle.helm_pin(CONTEXT).await.unwrap();
     assert_eq!(
@@ -216,11 +272,51 @@ async fn an_exec_plugin_credential_is_refused_and_never_runs() {
         Err(HelmError::CredentialRunsCommand)
     );
     assert_eq!(runs(scripts.path()), 0, "helm never started");
+    assert_eq!(plugin_runs(&ran), before, "asking started no plugin");
+}
+
+// With background sign-in consent, Flint runs the plugin and `helm` gets only its token. Turning
+// the consent off refuses the next run before anything starts.
+#[tokio::test]
+async fn a_consented_plugin_signs_in_until_revoked() {
+    let server = FakeApiServer::start().await.unwrap();
+    let (core, scripts, ran) = plugin_core(&server).await;
+    consent(&core).await;
+    let before = plugin_runs(&ran);
+
+    let pin = core.handle.helm_pin(CONTEXT).await.unwrap();
+    let output = core
+        .handle
+        .helm_read(CONTEXT, &pin, HelmQuery::List)
+        .await
+        .unwrap();
+    assert!(matches!(output, HelmOutput::Releases { .. }));
+    assert_eq!(runs(scripts.path()), 1);
+    assert!(plugin_runs(&ran) > before, "Flint ran the plugin");
+    let seen: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(scripts.path().join("seen")).unwrap()).unwrap();
+    let user = &seen["users"][0]["user"];
+    assert_eq!(user["token"], "t");
+    assert!(user.get("exec").is_none(), "{user}");
+
+    core.handle
+        .send(Command::RevokeBackgroundSignIn(CONTEXT.to_owned()));
+    tokio::time::timeout(WAIT, async {
+        loop {
+            match core.handle.helm_read(CONTEXT, &pin, HelmQuery::List).await {
+                Err(HelmError::CredentialRunsCommand) => return,
+                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("refused once revoked");
+    let helm_runs = runs(scripts.path());
     assert_eq!(
-        std::fs::read(&ran).map_or(0, |b| b.len()),
-        plugin_runs,
-        "asking started no plugin"
+        core.handle.helm_read(CONTEXT, &pin, HelmQuery::List).await,
+        Err(HelmError::CredentialRunsCommand)
     );
+    assert_eq!(runs(scripts.path()), helm_runs, "helm never started");
 }
 
 #[tokio::test]

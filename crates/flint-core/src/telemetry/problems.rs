@@ -16,6 +16,7 @@ use super::{
 };
 use crate::dashboard::{ProblemCategory, ProblemSnapshot, ProblemSummariser};
 use crate::problems::{Classifier, Problem, ProblemKind, ReplicaSetIndex, ReplicaSetRead};
+use crate::rollout::rollouts_of;
 
 /// Every kind of problem.
 pub(super) const ALL_PROBLEM_KINDS: [ProblemKind; 7] = [
@@ -145,6 +146,11 @@ fn evaluate(
         metrics,
         capacity: capacity_of(stores),
         inventory: Inventory::of(stores),
+        rollouts: stores
+            .deployments
+            .current()
+            .map_or_else(Vec::new, |deployments| rollouts_of(deployments, now))
+            .into(),
         version,
     }
 }

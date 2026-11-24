@@ -60,6 +60,7 @@ fn snapshot(availability: Availability, metrics: MetricsCheck) -> TelemetrySnaps
         metrics,
         capacity: None,
         inventory: Default::default(),
+        rollouts: Default::default(),
         version: Default::default(),
     }
 }
@@ -806,4 +807,104 @@ async fn a_new_model_redraws(cx: &mut TestAppContext) {
         label(cx, window, "dashboard-warnings-empty").as_deref(),
         Some(NO_WARNINGS)
     );
+}
+
+fn rollout(name: &str, state: RolloutState, at: Option<Timestamp>) -> Rollout {
+    Rollout {
+        namespace: "shop".into(),
+        name: name.into(),
+        uid: Some(format!("uid-{name}")),
+        state,
+        at,
+        desired: 3,
+        updated: 1,
+        available: 2,
+        message: None,
+    }
+}
+
+fn with_rollouts(rollouts: Vec<Rollout>) -> TelemetrySnapshot {
+    TelemetrySnapshot {
+        rollouts: rollouts.into(),
+        ..checked()
+    }
+}
+
+fn rows_of(model: &DashboardModel) -> (&[WarningRow], usize) {
+    let WarningsPanel::Rows { rows, total } = &model.warnings else {
+        panic!("{:?}", model.warnings);
+    };
+    (rows, *total)
+}
+
+#[test]
+fn rollouts_share_the_feed_with_warnings_newest_first() {
+    let snapshot = with_rollouts(vec![
+        rollout("web", RolloutState::Progressing, Some(ago(60))),
+        rollout("api", RolloutState::Stalled, Some(ago(600))),
+    ]);
+    let events = [warning("web-0", ago(300))];
+    let model = build(&snapshot, &TrendStore::new(), Some(&events), None);
+    let (rows, total) = rows_of(&model);
+    assert_eq!(total, 3);
+    let reasons: Vec<&str> = rows.iter().map(|row| row.reason.as_str()).collect();
+    assert_eq!(
+        reasons,
+        ["Rollout progressing", "BackOff", "Rollout stalled"]
+    );
+    assert_eq!(rows[0].object, "Deployment shop/web");
+    assert_eq!(rows[0].message, "1 of 3 updated, 2 available");
+    assert_eq!(rows[0].rollout, Some(RolloutState::Progressing));
+    assert_eq!(rows[1].rollout, None);
+}
+
+#[test]
+fn a_rollout_row_opens_its_deployment() {
+    let snapshot = with_rollouts(vec![rollout("web", RolloutState::Started, None)]);
+    let model = build(&snapshot, &TrendStore::new(), Some(&[]), None);
+    let (rows, _) = rows_of(&model);
+    assert_eq!(rows[0].age, "now");
+    assert_eq!(rows[0].object_uid.as_deref(), Some("uid-web"));
+    let open = rows[0].open.clone().unwrap();
+    assert_eq!(
+        (
+            open.kind.as_str(),
+            open.namespace.as_deref(),
+            open.name.as_str()
+        ),
+        ("Deployment.apps", Some("shop"), "web")
+    );
+    assert_eq!(open.cluster.as_deref(), Some(CLUSTER));
+}
+
+#[test]
+fn one_rollout_is_one_row_with_one_key_as_it_changes_state() {
+    let key_in = |state| {
+        let snapshot = with_rollouts(vec![rollout("web", state, Some(ago(30)))]);
+        let model = build(&snapshot, &TrendStore::new(), Some(&[]), None);
+        let (rows, total) = rows_of(&model);
+        assert_eq!((rows.len(), total), (1, 1));
+        rows[0].key.clone()
+    };
+    let keys = [
+        RolloutState::Started,
+        RolloutState::Progressing,
+        RolloutState::Complete,
+    ]
+    .map(key_in);
+    assert!(keys.iter().all(|key| *key == keys[0]), "{keys:?}");
+}
+
+#[test]
+fn a_finished_rollout_leaves_the_feed_after_an_hour() {
+    let snapshot = with_rollouts(vec![
+        rollout("new", RolloutState::Complete, Some(ago(60))),
+        rollout("old", RolloutState::Complete, Some(ago(3_700))),
+        rollout("stuck", RolloutState::Stalled, Some(ago(7_200))),
+    ]);
+    let model = build(&snapshot, &TrendStore::new(), Some(&[]), None);
+    let (rows, total) = rows_of(&model);
+    let objects: Vec<&str> = rows.iter().map(|row| row.object.as_str()).collect();
+    assert_eq!(objects, ["Deployment shop/new", "Deployment shop/stuck"]);
+    assert_eq!(total, 2);
 }
