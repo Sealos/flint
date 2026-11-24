@@ -597,6 +597,8 @@ pub(crate) async fn delete(
     gate: &mut impl ActionGate,
     object: &ActionObject,
 ) -> Result<(), ActionError> {
+    // Refuse an unsafe name before the gate runs any credential check.
+    object.check_path_segments()?;
     let client = gate.client().await?;
     let params = DeleteParams {
         preconditions: Some(uid_precondition(&object.uid)),
