@@ -136,7 +136,11 @@ impl Workspace {
                         .iter()
                         .find(|summary| summary.info.name == id)
                         .is_some_and(|s| s.confirmed && member.same_endpoint(s));
-                    let feed = holds.then(|| snapshot(&id)).flatten();
+                    // The feed bound to the admitted server, the one the set's dashboard counts,
+                    // so both judge the member by its own thresholds.
+                    let feed = holds
+                        .then(|| core.member_telemetry(member).map(|feed| feed.snapshot))
+                        .flatten();
                     (id, feed)
                 })
                 .collect();

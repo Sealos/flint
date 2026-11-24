@@ -279,17 +279,31 @@ fn a_read_that_outlived_a_move_and_back_is_refused() {
 
 #[test]
 fn namespaces_arriving_in_reverse_are_collected_in_order() {
+    // Keeping the namespaces ordered on every insert shifts the whole list when they arrive in
+    // reverse, which is quadratic. Inserting must build no order, and reading sorts once.
+    let sorts = || super::NAMESPACE_SORTS.with(std::cell::Cell::get);
+    let before = sorts();
     let mut objects = super::CountedObjects::default();
-    let started = Instant::now();
-    for n in (0..200_000).rev() {
-        let namespace = format!("ns-{n:06}");
+    for n in (0..20_000).rev() {
+        let namespace = format!("ns-{n:05}");
         objects.insert(Some(&namespace), "pod", Some(&format!("uid-{n}")));
         objects.insert(Some(&namespace), "other", Some(&format!("uid-other-{n}")));
     }
+    assert_eq!(sorts(), before, "inserting sorts nothing");
+    let first = objects.namespaces().as_ptr();
+    assert_eq!(
+        objects.namespaces().as_ptr(),
+        first,
+        "read again from the cache"
+    );
+    assert_eq!(sorts(), before + 1, "sorted once for any number of inserts");
     let namespaces = objects.namespaces();
-    assert!(started.elapsed() < Duration::from_secs(10));
-    assert_eq!(namespaces.len(), 200_000);
+    assert_eq!(namespaces.len(), 20_000);
     assert!(namespaces.windows(2).all(|pair| pair[0] < pair[1]));
+
+    objects.insert(Some("ns-new"), "pod", Some("uid-new"));
+    assert_eq!(objects.namespaces().len(), 20_001);
+    assert_eq!(sorts(), before + 2, "a new namespace sorts again once");
 }
 
 #[test]
@@ -355,6 +369,50 @@ fn a_checked_kind_with_no_problem_has_no_badge() {
         KindCheck::Current,
     )));
     assert!(!nav_badges(&[clean], &[]).contains_key(&KindId::pods()));
+}
+
+/// What a member's feed found for the pod `stuck`, Pending for 90 seconds: a problem past a
+/// 60-second threshold, nothing under a 300-second one. Either way the pass judged it.
+fn pending_member(threshold_passed: bool) -> ClusterProblems {
+    let problem = Problem {
+        id: ProblemId {
+            cluster: "c".into(),
+            kind: ProblemKind::PodPending,
+            subject: ProblemSubject::Pod {
+                namespace: "default".to_owned(),
+                name: "stuck".to_owned(),
+                uid: Some("uid-stuck".to_owned()),
+            },
+        },
+        owner: None,
+        owner_known: true,
+        reason: None,
+        since: None,
+    };
+    ClusterProblems::read(Some(&snapshot_judging(
+        threshold_passed.then_some(problem).into_iter().collect(),
+        Availability::Checked,
+        KindCheck::Current,
+        vec!["uid-stuck".to_owned()],
+    )))
+}
+
+#[test]
+fn each_member_of_a_set_is_filtered_by_its_own_pending_threshold() {
+    let mut filter = ProblemFilter::default();
+    filter.toggle();
+    filter.update(HashMap::from([
+        ("short".to_owned(), pending_member(true)),
+        ("long".to_owned(), pending_member(false)),
+    ]));
+    let keep = filter
+        .member_filter(Some(&KindId::pods()), ["short", "long"].into_iter())
+        .unwrap();
+    let stuck = row("stuck", "uid-stuck");
+    assert!(keep.keeps(0, &stuck), "past the member's 60 seconds");
+    assert!(!keep.keeps(1, &stuck), "under the member's 300 seconds");
+    let badges = nav_badges(&[pending_member(true), pending_member(false)], &[]);
+    assert_eq!(badges[&KindId::pods()].text, "1");
 }
 
 #[test]

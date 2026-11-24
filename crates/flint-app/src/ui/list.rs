@@ -94,6 +94,12 @@ pub struct ObjectFilter {
     pub objects: Arc<CountedObjects>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread sorted a [`CountedObjects`]' namespaces.
+    static NAMESPACE_SORTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The objects a count was made of. An object is matched by UID, so one replaced under the same
 /// name is not it; only an object that reported no UID is matched by name.
 #[derive(Debug, Default)]
@@ -155,6 +161,8 @@ impl CountedObjects {
     /// The namespaces of the objects, sorted.
     pub fn namespaces(&self) -> &[String] {
         self.sorted_namespaces.get_or_init(|| {
+            #[cfg(test)]
+            NAMESPACE_SORTS.with(|sorts| sorts.set(sorts.get() + 1));
             let mut sorted: Vec<String> = self.namespaces.iter().cloned().collect();
             sorted.sort_unstable();
             sorted
