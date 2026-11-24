@@ -159,6 +159,19 @@ As their documentation describes them in November 2026:
 | Writes | None: no tools for them | Its `kubectl` tool refuses writes; editors and Helm dialogs it fills in apply changes after you confirm; some tools change Lens itself (port forwards, settings) | Writes allowed, including delete and pod exec, unless its `read_only` or `disable_destructive` setting is on |
 | Credential redaction in results | Secret values, and credentials in logs, events, messages and container arguments | Not described | Not for tool results (only its own log notifications); Secrets can be denied by configuration |
 
+## Compared with other desktop apps
+
+As their pages describe them in November 2026. Flint is early; the gaps are listed on purpose.
+
+| | Flint | [Lens](https://lenshq.io/pricing) | [Freelens](https://github.com/freelensapp/freelens) |
+|---|---|---|---|
+| Price and license | Free, Apache-2.0 | Free for personal use and small organizations; organizations above $10 million in annual revenue or funding need a paid plan (from $25 per month) | Free, MIT |
+| Install | DMG or command-line archive on macOS, AppImage on Linux (best effort); unsigned until 1.0, no Homebrew cask yet | Not checked | DMG or PKG, Homebrew, deb, rpm, AppImage, Flathub, Snap and more; Windows installers |
+| Platforms | macOS, and Linux on a best-effort basis; no Windows | Not checked | macOS, Linux, Windows |
+| Remote or team use | None: a desktop app on your machine, with no hosted or shared deployment | Not checked | Not described |
+| Metrics | CPU and memory columns from metrics-server; no history or charts | Metrics in its free tier | Not checked |
+| Record of AI agent calls | A local metadata log of every `flint mcp` call, best effort | Not described | Not described |
+
 ## Status
 
 Flint is in early development.
@@ -168,7 +181,7 @@ Flint is in early development.
 - Your kubeconfig contexts in a sidebar; Flint connects to the one you select and checks its health.
 - Every kind the cluster serves, CRDs included, from the cluster's own discovery: live lists with the `kubectl get`
   columns, a namespace and text filter, and a detail view with metadata, conditions, events and YAML.
-- A watch mode for the active cluster: watch all kinds, or the kinds of open views plus the problem kinds (On view), with a default and per-cluster overrides.
+- A watch mode for the active cluster: watch all kinds, or the kinds of open views plus the problem kinds (On view), with a default and per-cluster overrides. On view still detects problems on the selected cluster and on open set members, and a kept-watching cluster keeps its recent lists warm across switches (at most 8 kinds on at most 3 clusters), so reopening it shows rows at once.
 - YAML editing with a server dry-run and diff, plus delete, scale, rollout restart, cordon and drain, all behind the
   cluster protection.
 - A bottom dock with pod and workload logs (follow, search, timestamps, previous logs, save to a file) and shells into
@@ -211,19 +224,25 @@ Flint is in early development.
 - **Show Helm Releases…**: read-only Helm releases with details, history, masked values and manifest. On a
   cluster that signs in through an exec plugin (EKS, GKE, Azure with kubelogin), turn on **Keep Watching** and its
   background sign-in first: Flint then runs the plugin itself, with no prompt, and hands `helm` only the token.
-  Clusters that sign in through an auth provider are not supported.
-- Connections through an HTTPS proxy: a kubeconfig cluster's `proxy-url` is used for reads, with TLS to the API server
-  itself.
+  Clusters that sign in through an auth provider are not supported. A failed release shows Helm's stored failure
+  reason, with credential-like values masked.
+- Connections through an HTTP CONNECT or SOCKS5 proxy: a kubeconfig cluster's `proxy-url`, the `[proxy]` setting or
+  `HTTPS_PROXY` can be `http://`, `socks5://` or `socks5h://`, with TLS to the API server itself. Helm cannot use a
+  SOCKS proxy yet.
 - Regex search in logs: **Toggle Regex Search** (⌥⌘R) reads the search and the Matching Lines Only filter as a regular
   expression, and says why when it is invalid.
+- **Rollout Restart Across Set…** and **Scale Across Set…**, from a cluster set's Deployment, StatefulSet or
+  DaemonSet row (in the next release): Flint dry-runs every member, shows one confirmation that lists each member's
+  change or why it is left out, then runs one member at a time and stops at the first failure. Protected, paused and
+  disconnected members are left out, and nothing here unlocks a cluster.
+- A cluster overview's Recent activity lists Deployment rollouts (started, progressing, complete, stalled) next to
+  Warning events. Quit and Close Window ask first while port forwards are running.
 - A read-only MCP server, `flint mcp`, for AI agents, limited to the clusters you expose.
 - Builds for macOS (Apple Silicon and Intel) and, best effort, Linux (x86_64 and arm64). From 0.5.0, the 24
   uploaded release files have [build provenance](#verify-a-download); GitHub's source archives do not.
 
 **Coming next:**
 
-- **v0.7, change many clusters:** guarded fleet actions with explicit targets, a dry run per cluster, one cluster at a
-  time, and a stop at the first failure.
 - **1.0, first public release:** a signed and notarized app with a Homebrew cask, and a check on real cloud clusters.
 - **Later:** curated views for core kinds and [log time ranges](https://github.com/Sealos/flint/issues/265).
 
@@ -455,6 +474,12 @@ watch_mode = "all"                # or "on_view"
 # log_buffer_mib = 64             # MiB each log session keeps
 # log_total_mib = 512             # MiB all log sessions keep together
 
+# Proxy for cluster connections, for an app opened from Finder or the Dock, which sees no HTTPS_PROXY from your
+# shell. A cluster's own proxy-url wins. Read at startup. url is http://, socks5:// or socks5h://.
+# [proxy]
+# url = "http://proxy.example.com:3128"
+# no_proxy = ["localhost", "10.0.0.0/8"]
+
 [cluster_watch_mode]
 # big-prod-cluster = "on_view"
 
@@ -480,7 +505,7 @@ watch_mode = "all"                # or "on_view"
 # kinds = ["pods", "deployments.apps"]  # optional: only these kinds (empty or missing: all)
 
 # Warning thresholds of the cluster overview, also written by Set Pending Pod Threshold…: percent of allocatable
-# (1 to 100), counts per hour (1 to 10000) and seconds (1 to 86400). Defaults: 90, 90, 5, 10 and 60. A
+# (1 to 100), counts per hour (1 to 10000) and seconds (1 to 86400). Defaults: 90, 90, 5, 10 and 300. A
 # [[thresholds.clusters]] entry (context and server, then any of the same keys) overrides them for one cluster.
 # [thresholds]
 # cpu_percent = 90
