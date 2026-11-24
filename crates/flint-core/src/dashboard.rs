@@ -124,6 +124,13 @@ pub struct ProblemCounts {
 }
 
 impl ProblemCounts {
+    /// The counts `count` gives each category, `None` for one that could not be read.
+    pub fn from_fn(count: impl Fn(ProblemCategory) -> Option<u32>) -> Self {
+        Self {
+            counts: ProblemCategory::ALL.map(count),
+        }
+    }
+
     /// The count of `category`, if it could be read.
     pub fn get(&self, category: ProblemCategory) -> Option<u32> {
         self.counts[category.index()]

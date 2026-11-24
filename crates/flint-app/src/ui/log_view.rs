@@ -135,7 +135,7 @@ pub struct LogView {
     selection_paused: bool,
     selection: Option<LineSelection>,
     /// A mouse selection is being dragged.
-    drag_selecting: bool,
+    pub(in crate::ui) drag_selecting: bool,
     query: SearchQuery,
     search: LogSearch,
     /// The matches among the rows shown in a filtered tab, kept until the search or the rows
@@ -148,6 +148,10 @@ pub struct LogView {
     >,
     /// The search's matches in the lines drawn, kept per line and bounded per frame.
     highlights: std::cell::RefCell<log_model::LineHighlights>,
+    /// The background scan of long lines drawn whole, for their regex highlights.
+    whole_line_scan: filter::ScanStop,
+    whole_line_scanning: bool,
+    _whole_lines: Task<()>,
     /// Bumped with every query, so a slow first scan of an old query is dropped.
     search_generation: u64,
     /// A scan of `search` runs on the core's threads: the first of `query`, or a long
@@ -324,6 +328,9 @@ impl LogView {
             search: LogSearch::default(),
             shown_matches: Default::default(),
             highlights: Default::default(),
+            whole_line_scan: Default::default(),
+            whole_line_scanning: false,
+            _whole_lines: Task::ready(()),
             search_generation: 0,
             searching: false,
             search_scan: Default::default(),
@@ -549,6 +556,7 @@ impl LogView {
         self.current_match = None;
         self.search_generation += 1;
         self.search_scan.stop();
+        self.stop_whole_line_scan();
         self.search = LogSearch::new(query.clone());
         // The matching lines shown follow the search, once it has stayed for a moment; a filter
         // of the old query on its way is dropped, and what is shown stays until the new one
@@ -982,7 +990,7 @@ impl LogView {
         let shown = log_model::shown_line_with(line, self.line_view(), max, |short| {
             self.highlights
                 .borrow_mut()
-                .matches(id, line, &self.query, short)
+                .matches(id, line, &self.query, short, max)
         });
         // Rows past this frame's highlighting budget get theirs on the next one.
         if self.highlights.borrow_mut().take_redraw() {
@@ -1102,6 +1110,20 @@ impl LogView {
                     .when(!self.wrap, |el| el.truncate())
                     .child(StyledText::new(body).with_highlights(body_runs)),
             )
+            .when(shown.limited, |el| {
+                el.child(
+                    div()
+                        .id(("log-limited", id as usize))
+                        .flex_none()
+                        .pl_1()
+                        .text_color(theme.muted_foreground)
+                        .child("partial")
+                        .tooltip(|window, cx| {
+                            Tooltip::new("Only some of this line's matches are highlighted.")
+                                .build(window, cx)
+                        }),
+                )
+            })
             .when(shown.cut, |el| {
                 el.child(
                     div()
@@ -1529,13 +1551,20 @@ impl LogView {
                                     .tooltip("View options and Save")
                                     .dropdown_menu_with_anchor(
                                         Anchor::TopRight,
-                                        move |menu, _, cx| {
+                                        move |menu, window, cx| {
                                             fill_menu(
                                                 menu,
                                                 log_model::more_menu(&facts),
                                                 facts.timestamps,
                                                 "log-more",
                                                 cx,
+                                            )
+                                            // Every entry stays reachable in a short window.
+                                            .scrollable(true)
+                                            .max_h(
+                                                log_model::menu_max_height(
+                                                    window.viewport_size().height,
+                                                ),
                                             )
                                         },
                                     ),
@@ -1964,6 +1993,7 @@ impl Render for LogView {
         let mut scan_budget = filter::UiScanBudget::default();
         self.catch_up_search(&mut scan_budget, cx);
         self.catch_up_filter(&mut scan_budget, cx);
+        self.scan_whole_lines(cx);
         self.highlights.borrow_mut().begin_frame();
         let theme = cx.theme().clone();
         // The toolbar needs the tab's width, known only after layout: when it changed, draw
