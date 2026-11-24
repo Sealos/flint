@@ -48,6 +48,16 @@ fn open_palette(app: &App, key: &str, mode: &str) -> Result<()> {
     Ok(())
 }
 
+/// Moves the palette's selection from the first row to the second, and returns the second's label.
+fn press_down_to_second(app: &App) -> Result<String> {
+    press(app, "down", "/palette/selected", 1)?;
+    let state = app.state()?;
+    let label = state["palette"]["rows"][1]["label"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("no second row: {}", state["palette"]))?;
+    Ok(label.to_string())
+}
+
 /// The navigation section holding `kind`.
 fn section_of<'a>(state: &'a Value, kind: &str) -> Option<&'a Value> {
     state["nav"]["sections"].as_array()?.iter().find(|s| {
@@ -145,9 +155,18 @@ fn up_33_panes_sections_and_go_back_by_key() -> Result<()> {
         app.press_key("backspace")?;
     }
     app.wait_for("/list/filter", Equals("".into()))?;
+    // The rows are computed off the key's thread: wait for the whole list, with the selected row
+    // back in it, before anything else is pressed.
+    app.wait_for("/list/shown", Equals(FIXTURE_PODS.into()))?;
+    app.wait_for(
+        "/list/rows",
+        Any(json!({"name": first.as_str(), "selected": true})),
+    )?;
     press(&app, "escape", "/focus", "list")?;
     app.wait_for("/detail/name", Equals(first.as_str().into()))?;
 
+    // The automation state does not say which panes are drawn (the detail's name is reported even
+    // while its pane is hidden), so the panes before and after Back to List are not asserted here.
     // In a narrow window Cmd-Shift-B returns to the list, and Enter brings the detail back.
     app.request("resize_window", json!({"width": 500, "height": 600}))?;
     press(&app, "secondary-shift-b", "/focus", "list")?;
@@ -213,6 +232,20 @@ fn up_30_palette_selection_and_steps_by_key() -> Result<()> {
     app.wait_for("/list/kind", Equals("services".into()))?;
     app.wait_for("/focus", Equals("list".into()))?;
 
+    // A choice that is not the first row: the arrow moves to it and Enter opens that kind.
+    open_palette(&app, "secondary-shift-p", "actions")?;
+    app.type_text("open kind")?;
+    app.wait_for("/palette/rows/0/label", Equals("Open Kind…".into()))?;
+    press(&app, "enter", "/palette/argument", "kind")?;
+    app.type_text("s")?;
+    app.wait_for("/palette/query", Equals("s".into()))?;
+    app.wait_for("/palette/rows/1/label", Exists(true))?;
+    let second = press_down_to_second(&app)?;
+    app.press_key("enter")?;
+    app.wait_for("/palette", Equals(Value::Null))?;
+    app.wait_for("/list/label", Equals(second.as_str().into()))?;
+    app.wait_for("/focus", Equals("list".into()))?;
+
     // A scattered query listing only Quit selects nothing, so Enter leaves the app running.
     open_palette(&app, "secondary-shift-p", "actions")?;
     app.type_text("qtf")?;
@@ -247,6 +280,14 @@ fn up_31_switcher_keys_and_a_filtered_object() -> Result<()> {
     press(&app, "down", "/palette/selected", 1)?;
     press(&app, "up", "/palette/selected", 0)?;
 
+    // A choice that is not the first row: Enter on the second opens that kind.
+    let second = press_down_to_second(&app)?;
+    app.press_key("enter")?;
+    app.wait_for("/palette", Equals(Value::Null))?;
+    app.wait_for("/list/label", Equals(second.as_str().into()))?;
+    app.wait_for("/focus", Equals("list".into()))?;
+    open_palette(&app, "secondary-p", "resources")?;
+
     // Cmd-Shift-P swaps it for the palette, Cmd-P swaps back, and Esc returns focus.
     press(&app, "secondary-shift-p", "/palette/mode", "actions")?;
     press(&app, "secondary-p", "/palette/mode", "resources")?;
@@ -263,6 +304,8 @@ fn up_31_switcher_keys_and_a_filtered_object() -> Result<()> {
     app.type_text("crash-loop")?;
     app.wait_for("/palette/rows/0/label", Equals("demo/crash-loop".into()))?;
     press(&app, "enter", "/palette", Value::Null)?;
+    // The object is selected and its detail open, though the namespace filter hides its row.
+    app.wait_for("/detail/name", Equals("crash-loop".into()))?;
     let state = app.wait_for("/list/banners", Any(json!({"id": "list-filtered-out"})))?;
     let banners = state["list"]["banners"].as_array().expect("banners");
     let banner = banners
@@ -272,6 +315,12 @@ fn up_31_switcher_keys_and_a_filtered_object() -> Result<()> {
     let text = banner["text"].as_str().unwrap_or_default();
     assert!(text.contains("crash-loop"), "{text}");
     assert_eq!(state["header"]["namespaces"], json!(["kube-system"]));
+    assert_eq!(state["detail"]["name"], "crash-loop");
+    assert_eq!(state["detail"]["namespace"], "demo");
+    assert!(
+        !row_names(&state).iter().any(|n| n == "crash-loop"),
+        "the filtered rows show the pod"
+    );
 
     app.quit()?;
     assert!(fake.writes().is_empty(), "{:?}", fake.writes());
