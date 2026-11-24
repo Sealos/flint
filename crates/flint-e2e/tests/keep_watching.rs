@@ -1076,6 +1076,68 @@ async fn a_consented_set_member_writes_only_once_unlocked() {
     }
 }
 
+/// How many lists of pods `server` has answered.
+fn pod_lists(server: &FakeApiServer) -> usize {
+    server
+        .requests()
+        .iter()
+        .filter(|request| request.verb == Verb::List && request.path.ends_with("/pods"))
+        .count()
+}
+
+/// Selects `context` and waits until its slot is connected.
+async fn switch_to(f: &Fixture, context: &str) {
+    let events = f.core.handle.events();
+    f.core.handle.send(Command::Activate(context.to_owned()));
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Ok(Event::ConnectionChanged { cluster, state }) = events.recv().await
+                && cluster == context
+                && matches!(state, flint_core::handle::ConnectionState::Connected(_))
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the switch should connect");
+}
+
+/// Whether `b`'s overview reads the kept connection's feed.
+fn kept_feed_serves(f: &Fixture) -> bool {
+    matches!(kept_discovery(f), Some(FeedDiscovery::Kept(_)))
+}
+
+// Switching to a watched cluster hands its warm feed over, so its overview shows at once and its
+// pods are not listed again; switching away keeps the same feed running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_switch_hands_the_warm_feed_over_and_back() {
+    let f = fixture(LASTING, Settings::default()).await;
+    f.turn_on().await;
+    f.until_feed().await;
+    tokio::time::timeout(WAIT, async {
+        while pod_lists(&f.b) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the kept feed should list pods");
+    settle().await;
+    let listed = pod_lists(&f.b);
+
+    switch_to(&f, "b").await;
+    assert!(kept_feed_serves(&f), "the overview reads the warm feed");
+    settle().await;
+    assert!(kept_feed_serves(&f), "the slot started no feed of its own");
+    assert_eq!(pod_lists(&f.b), listed, "nothing listed again");
+
+    switch_to(&f, "a").await;
+    settle().await;
+    assert!(kept_feed_serves(&f), "the feed stays warm");
+    assert_eq!(pod_lists(&f.b), listed, "nothing listed on leaving");
+    assert!(f.b.writes().is_empty(), "{:?}", f.b.writes());
+}
+
 #[test]
 fn the_setting_is_typed_and_capped_on_write() {
     let dir = tempfile::tempdir().unwrap();
