@@ -337,6 +337,7 @@ fn waiting_snapshot(cluster: &str, now: Timestamp) -> TelemetrySnapshot {
         problems: Arc::from([]),
         unchecked: Vec::new(),
         settling: Vec::new(),
+        checked: Arc::default(),
         counts: ProblemSummariser::default().summarise(&ProblemSnapshot::unavailable(), now),
         metrics: MetricsCheck::Waiting,
         capacity: None,
@@ -412,6 +413,11 @@ pub(in crate::ui) fn lists_of(
                 pod_uid,
                 ..
             } => pods.insert(Some(namespace), pod, pod_uid.as_deref()),
+            ProblemSubject::Pod {
+                namespace,
+                name,
+                uid,
+            } => pods.insert(Some(namespace), name, uid.as_deref()),
             ProblemSubject::Node { name, uid } => nodes.insert(None, name, uid.as_deref()),
             ProblemSubject::Job {
                 namespace,

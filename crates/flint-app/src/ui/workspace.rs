@@ -260,6 +260,7 @@ pub struct Workspace {
     /// nothing is restored from the old catalog (#255).
     generation: Option<u64>,
     list: Option<Entity<ResourceList>>,
+    problem_feed: problems::ProblemFeed,
     detail: Option<Entity<DetailView>>,
     /// The active cluster's overview, in place of a list.
     dashboard: Option<(Entity<DashboardView>, Subscription)>,
@@ -361,6 +362,7 @@ impl Workspace {
         let observe = cx.observe_in(&model, window, |this, _, window, cx| {
             this.show_appearance(window, cx);
             this.sync(window, cx);
+            this.follow_problem_connections(cx);
             cx.notify();
         });
         let nav = cx.new(NavPanel::new);
@@ -411,6 +413,7 @@ impl Workspace {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let alive = this.update(cx, |this, cx| {
+                    this.refresh_problems(cx);
                     let Some(cluster) = this.cluster.clone() else {
                         return;
                     };
@@ -456,6 +459,7 @@ impl Workspace {
             cluster: None,
             generation: None,
             list: None,
+            problem_feed: Default::default(),
             detail: None,
             dashboard: None,
             sets: cluster_sets,
@@ -724,7 +728,7 @@ impl Workspace {
         let opening = match &key {
             TabKey::Logs(_) => Opening::ReconnectLogs,
             TabKey::Shell(_) => Opening::RestartShell,
-            TabKey::Activity(_) | TabKey::Compare(..) => return,
+            TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Helm(_) => return,
         };
         let check = self.model.read(cx).core().check_member(&member);
         self.sets.restart = cx.spawn_in(window, async move |this, cx| {
@@ -752,7 +756,7 @@ impl Workspace {
             TabKey::Logs(_) => Opening::ReconnectLogs,
             TabKey::Shell(_) => Opening::RestartShell,
             // Runs no session to start again.
-            TabKey::Activity(_) | TabKey::Compare(..) => return,
+            TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Helm(_) => return,
         };
         if let Some(reason) = self.sessions_blocked(key.context(), cx) {
             self.refuse(refused(opening, &reason), cx);
@@ -790,7 +794,7 @@ impl Workspace {
                         DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
                     }
                     // It returned above: an activity tab has no session to start again.
-                    TabKey::Activity(_) | TabKey::Compare(..) => {
+                    TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Helm(_) => {
                         unreachable!("these tabs do not restart")
                     }
                 },
@@ -888,7 +892,7 @@ impl Workspace {
         let definition = match key {
             // The core ends a shell on any change of the exact URL, and a log session only when
             // the endpoint changes. Agent activity depends on neither.
-            TabKey::Shell(_) => summary.map_or(0, |c| c.definition),
+            TabKey::Shell(_) | TabKey::Helm(_) => summary.map_or(0, |c| c.definition),
             TabKey::Logs(_) => summary.map_or(0, |c| c.endpoint),
             TabKey::Activity(_) | TabKey::Compare(..) => 0,
         };
@@ -3820,6 +3824,9 @@ mod actions;
 
 #[path = "workspace_keys.rs"]
 mod keys;
+
+#[path = "workspace_problems.rs"]
+pub(in crate::ui) mod problems;
 
 #[path = "workspace_sets.rs"]
 mod sets;

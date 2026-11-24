@@ -55,6 +55,7 @@ fn snapshot(availability: Availability, metrics: MetricsCheck) -> TelemetrySnaps
         problems: Arc::from([]),
         unchecked: Vec::new(),
         settling: Vec::new(),
+        checked: Arc::default(),
         counts,
         metrics,
         capacity: None,

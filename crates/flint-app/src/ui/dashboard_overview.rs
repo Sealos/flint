@@ -80,6 +80,9 @@ impl ProblemRow {
 fn subject_parts(subject: &ProblemSubject) -> (&'static str, &'static str, &str, &str) {
     match subject {
         ProblemSubject::Container { namespace, pod, .. } => ("pods", "Pod", namespace, pod),
+        ProblemSubject::Pod {
+            namespace, name, ..
+        } => ("pods", "Pod", namespace, name),
         ProblemSubject::Node { name, .. } => ("nodes", "Node", "", name),
         ProblemSubject::Job {
             namespace, name, ..

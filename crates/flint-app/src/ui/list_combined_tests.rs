@@ -169,6 +169,121 @@ fn key(key: &str) -> ColumnKey {
 }
 
 #[gpui_kit::test]
+async fn problems_only_closes_a_selected_row_it_hides(cx: &mut TestAppContext) {
+    use super::super::problems_tests::checked_with_pod;
+
+    let (window, list) = open(cx, fixture());
+    click(cx, window, "row-ctx-prod/uid-api");
+    assert!(list.read_with(cx, |list, _| list.selected.is_some()));
+    list.update(cx, |list, cx| {
+        list.problems.toggle();
+        list.set_problems(
+            std::collections::HashMap::from([(
+                "ctx-prod".to_owned(),
+                checked_with_pod("web", "uid-web", &["uid-api"]),
+            )]),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert_eq!(list.read_with(cx, |list, _| list.selected.clone()), None);
+}
+
+#[gpui_kit::test]
+async fn problems_only_reconciles_the_selection_before_new_rows_land(cx: &mut TestAppContext) {
+    use super::super::problems_tests::checked_with_pod;
+
+    let (window, list) = open(cx, fixture());
+    click(cx, window, "row-ctx-prod/uid-api");
+    list.update(cx, |list, cx| {
+        list.problems.toggle();
+        list.set_problems(
+            std::collections::HashMap::from([(
+                "ctx-prod".to_owned(),
+                checked_with_pod("web", "uid-web", &["uid-api"]),
+            )]),
+            cx,
+        );
+        assert_eq!(list.selected, None, "cleared before the new view lands");
+    });
+    // The hidden row is still drawn until the view lands, and cannot be chosen again.
+    window
+        .update(cx, |_, window, cx| {
+            list.update(cx, |list, cx| {
+                let id = CombinedRowId {
+                    cluster: "ctx-prod".into(),
+                    uid: "uid-api".into(),
+                };
+                let line =
+                    super::model::line_of(&list.shown.list, &list.view, &id).expect("still drawn");
+                list.select_line(line, window, cx);
+                assert_eq!(list.selected, None);
+            });
+        })
+        .unwrap();
+}
+
+#[gpui_kit::test]
+async fn the_problems_toggle_does_nothing_for_a_kind_it_cannot_judge(cx: &mut TestAppContext) {
+    let configmaps = |cluster: &str| {
+        let mut shown = (*snapshot(cluster, "Data", &[("a", "1")], SyncState::Synced)).clone();
+        shown.kind = KindId::new("", "configmaps");
+        Arc::new(shown)
+    };
+    let source = CombinedSource::new(vec![
+        member(configmaps("ctx-prod"), "prod", None),
+        member(configmaps("ctx-staging"), "staging", None),
+    ])
+    .unwrap();
+    let (window, list) = open(cx, source);
+    assert!(!list.read_with(cx, |list, _| list.has_problem_filter()));
+    window
+        .update(cx, |_, window, cx| {
+            list.update(cx, |list, cx| {
+                list.on_problems(&super::ToggleCombinedProblems, window, cx);
+            });
+        })
+        .unwrap();
+    assert!(!list.read_with(cx, |list, _| list.problems.is_on()));
+}
+
+#[gpui_kit::test]
+async fn problems_only_hides_checked_rows_and_keeps_an_unchecked_member(cx: &mut TestAppContext) {
+    use super::super::problems::ClusterProblems;
+    use super::super::problems_tests::checked_with_pod;
+
+    let (_window, list) = open(cx, fixture());
+    list.update(cx, |list, cx| {
+        list.problems.toggle();
+        list.set_problems(
+            std::collections::HashMap::from([
+                (
+                    "ctx-prod".to_owned(),
+                    checked_with_pod("web", "uid-web", &["uid-api"]),
+                ),
+                ("ctx-staging".to_owned(), ClusterProblems::unchecked()),
+            ]),
+            cx,
+        );
+    });
+    let shown = state(cx, &list);
+    assert_eq!(
+        order(&shown),
+        [
+            pair("staging", "api"),
+            pair("staging", "db"),
+            pair("prod", "web"),
+        ]
+    );
+    let note = shown
+        .banners
+        .iter()
+        .find(|banner| banner.id == super::super::problems::UNCHECKED_BANNER)
+        .expect("the unchecked member is named");
+    assert!(note.text.contains("staging") && !note.text.contains("prod"));
+}
+
+#[gpui_kit::test]
 async fn columns_are_the_union_with_blanks(cx: &mut TestAppContext) {
     let (window, list) = open(cx, fixture());
     let shown = state(cx, &list);
@@ -549,7 +664,7 @@ async fn a_key_steps_from_the_selection_in_the_new_view(cx: &mut TestAppContext)
     ])
     .unwrap();
     let query = list.read_with(cx, |list, _| list.query.clone());
-    let computed = super::compute_view(&reordered, &query, None, None, None, 0);
+    let computed = super::compute_view(&reordered, &query, None, None, None, None, 0);
     click(cx, window, "row-ctx-prod/uid-web");
 
     let expected = CombinedRowId {
@@ -723,7 +838,7 @@ async fn a_result_for_an_earlier_filter_or_membership_is_discarded(cx: &mut Test
         let source = list.latest.clone();
         let query = CombinedQuery::default();
         (
-            compute_view(&source, &query, None, None, None, 0),
+            compute_view(&source, &query, None, None, None, None, 0),
             source,
             list.filter_revision,
         )
