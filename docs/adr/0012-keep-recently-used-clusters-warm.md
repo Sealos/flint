@@ -51,6 +51,11 @@ launch**.
 - **Read only.** The feed has its own connection with a read client and no write client. The slot's connection,
   write credential and write gate are unchanged, so a background cluster gains no write path. `flint mcp` does not
   read this setting.
+- **Switching.** Selecting a watched cluster hands its running feed over: the overview reads it, and the slot
+  starts no feed of its own, so nothing is listed again. Leaving the cluster keeps the same feed running. Only a
+  feed that is up, on the slot and whole definition it was started for, is handed over; a changed definition or
+  ended consent drops it, and the slot's own connection starts a feed. Writes still go through the slot and its
+  gate. A feed still connecting is dropped on selection, as before.
 - **Members of a cluster set** ([ADR-0014](./0014-cluster-sets-and-combined-views.md)). The consent below also lets a
   set member that is not selected connect its own slot under the same rules: no prompt, a null stdin, bound to the
   whole definition, never saved, and no auth providers. That connection stays when the member is selected and when
