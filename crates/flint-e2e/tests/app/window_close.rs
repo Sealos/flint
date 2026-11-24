@@ -38,12 +38,18 @@ fn budget(app: &App, deadline: Instant, doing: &str) -> Result<Duration> {
 /// Brings the window to the front from inside the app, until GPUI reports it active: Close Window
 /// acts on the active window, and does nothing without one.
 fn activate(app: &App, deadline: Instant) -> Result<()> {
+    let mut last = Value::Null;
     loop {
-        let wait = budget(app, deadline, "waiting for the window to become active")?;
-        if let Ok(answer) = app.request_by("activate_window", Value::Null, wait)
-            && answer["active"] == true
-        {
-            return Ok(());
+        let wait = budget(
+            app,
+            deadline,
+            &format!("waiting for the window to become active (the app last said {last})"),
+        )?;
+        if let Ok(answer) = app.request_by("activate_window", Value::Null, wait) {
+            if answer["active"] == true {
+                return Ok(());
+            }
+            last = answer;
         }
         std::thread::sleep(POLL);
     }

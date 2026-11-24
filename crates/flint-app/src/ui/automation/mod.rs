@@ -18,6 +18,8 @@ compile_error!(
      --features automation"
 );
 
+#[cfg(target_os = "macos")]
+mod activation;
 mod commands;
 mod keys;
 mod predicate;
