@@ -101,6 +101,7 @@ fn snapshot(cluster: &str, problems: Vec<Problem>, now: Timestamp) -> TelemetryS
         metrics: MetricsCheck::Waiting,
         capacity: None,
         inventory: Default::default(),
+        rollouts: Default::default(),
         version: Default::default(),
     }
 }
