@@ -531,20 +531,10 @@ fn confirm_review(
     let begin = {
         let (key, this, action, object) =
             (key.clone(), this.clone(), request.action, object.clone());
-        let request = request.clone();
         move |cx: &mut App| {
-            // Changed since its review, as this window last fetched it: reviewed again instead.
-            if object.changed(cx).is_some() {
-                let (this, request) = (this.clone(), request.clone());
-                let note = changed_note(&request.target.name);
-                // This runs inside the dialog's update of the window.
-                cx.defer(move |cx| {
-                    let _ = handle.update(cx, |_, window, cx| {
-                        let _ = this.update(cx, |ws, cx| {
-                            start_review(ws, request, Some(note), window, cx)
-                        });
-                    });
-                });
+            // Changed since its review, as this window last fetched it: nothing runs.
+            if let Some(why) = object.changed(cx) {
+                let _ = this.update(cx, |ws, cx| ws.refuse(why, cx));
                 return false;
             }
             match claim(&key, action, cx) {
@@ -605,6 +595,10 @@ struct ReviewedObject {
     /// For a scale: the count reviewed, and where it is read (none: the kind lost Scale).
     count: Option<(u32, Option<action_kinds::ScalePaths>)>,
     at: jiff::Timestamp,
+    /// Whether the pane showed this very object when the review came back. One that did not (a
+    /// review of an object created again under the name) cannot say it changed: the server's
+    /// checks of the uid and the count still hold.
+    watched: bool,
 }
 
 impl ReviewedObject {
@@ -620,30 +614,35 @@ impl ReviewedObject {
             },
             _ => None,
         };
+        let key = WriteKey::of(target);
+        let watched = ws.detail_view().is_some_and(|detail| {
+            let detail = detail.read(cx);
+            let shown = detail.object();
+            shown_key(detail) == key
+                && !detail.is_gone()
+                && target.uid.as_deref() == Some(&*shown.uid)
+        });
         ReviewedObject {
-            key: WriteKey::of(target),
+            key,
             name: target.name.clone(),
             uid: target.uid.clone(),
             count,
             at: jiff::Timestamp::now(),
+            watched,
         }
     }
 
     /// Why `detail` says the object changed since the review, if it does. A pane that no longer
     /// shows the object says so too.
     fn changed(&self, detail: Option<&DetailView>) -> Option<String> {
+        if !self.watched {
+            return None;
+        }
         let changed = || Some(object_changed_text(&self.name));
         let Some(detail) = detail else {
             return changed();
         };
-        let shown = detail.object();
-        let key = WriteKey::new(
-            &shown.cluster,
-            &shown.kind,
-            shown.namespace.as_deref(),
-            &shown.name,
-        );
-        if key != self.key || detail.is_gone() {
+        if shown_key(detail) != self.key || detail.is_gone() {
             return changed();
         }
         // A copy from before the review says nothing about what changed since.
@@ -671,7 +670,18 @@ impl ReviewedObject {
     }
 }
 
-/// Why a confirmation closed by itself.
+/// The object `detail` shows, as a write names it.
+fn shown_key(detail: &DetailView) -> WriteKey {
+    let shown = detail.object();
+    WriteKey::new(
+        &shown.cluster,
+        &shown.kind,
+        shown.namespace.as_deref(),
+        &shown.name,
+    )
+}
+
+/// Why a confirmation closed by itself, or did not run.
 fn object_changed_text(name: &str) -> String {
     format!(
         "{name} changed since it was reviewed, so its confirmation was closed. Nothing was applied."

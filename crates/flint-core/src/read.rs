@@ -175,19 +175,22 @@ async fn discover_kinds_within(
     overall: Duration,
 ) -> Result<DiscoveredKinds, ClusterError> {
     let discover = async {
-        let mut found = match discover_aggregated(client, per_request).await? {
-            Some(found) => found,
+        match discover_aggregated(client, per_request).await? {
+            Some(found) => Ok(found),
             None => {
                 tracing::debug!("no aggregated discovery, discovering each group");
-                discover_per_group(client, per_request).await?
+                discover_per_group(client, per_request).await
             }
-        };
-        action_kinds::read_scale_paths(client, &mut found.kinds, per_request).await;
-        Ok(found)
+        }
     };
     let mut found = tokio::time::timeout(overall, discover)
         .await
         .unwrap_or_else(|_| Err(ClusterError::timeout(overall, None)))?;
+    // Bounded on its own: a slow definition leaves its kind without Scale, never fails discovery.
+    let scale = action_kinds::read_scale_paths(client, &mut found.kinds, per_request);
+    if tokio::time::timeout(per_request, scale).await.is_err() {
+        tracing::debug!("reading scale paths timed out; those kinds have no Scale");
+    }
     // Put the core group first, then sort by group and kind.
     found.kinds.sort_by(|a, b| {
         (!a.group().is_empty(), a.group(), a.kind()).cmp(&(
