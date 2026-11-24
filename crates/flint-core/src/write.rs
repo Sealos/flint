@@ -37,7 +37,7 @@ use crate::read::{self, KindId, KindInfo};
 use crate::recheck::ContextPin;
 use crate::redact;
 use crate::write_actions;
-pub use crate::write_actions::{BlockedReason, DrainReport, ManagedPod, PodName};
+pub use crate::write_actions::{BlockedReason, DrainProgress, DrainReport, ManagedPod, PodName};
 
 /// How long one request of a write may take.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -445,6 +445,17 @@ impl CoreHandle {
         &self,
         intent: WriteIntent,
     ) -> impl Future<Output = Result<WriteOutcome, WriteError>> + Send + 'static {
+        self.run_write_telling(intent, None)
+    }
+
+    /// [`CoreHandle::run_write`], telling a drain's progress to `progress` as it runs. The
+    /// progress only reports: it changes nothing the drain does. `progress` is dropped once the
+    /// write has ended, so its receiver ends before the write's result is ready.
+    pub fn run_write_telling(
+        &self,
+        intent: WriteIntent,
+        progress: Option<async_channel::Sender<DrainProgress>>,
+    ) -> impl Future<Output = Result<WriteOutcome, WriteError>> + Send + 'static {
         let core = self.clone();
         let task = self.on_runtime(async move {
             check_bound(&intent)?;
@@ -452,7 +463,7 @@ impl CoreHandle {
             gate.pin = Some(intent.action.pin().clone());
             gate.credential = Some(intent.action.credential().clone());
             let kind = kind_of(&core, &intent.target).await?;
-            execute(&mut gate, &kind, intent).await
+            execute(&mut gate, &kind, intent, progress).await
         });
         async move { task.await.unwrap_or(Err(WriteRefusal::Stopped.into())) }
     }
@@ -640,6 +651,7 @@ async fn execute(
     gate: &mut RequestGate,
     kind: &KindInfo,
     intent: WriteIntent,
+    progress: Option<async_channel::Sender<DrainProgress>>,
 ) -> Result<WriteOutcome, WriteError> {
     match &intent.action {
         WriteAction::ApplyYaml(edit) => {
@@ -657,6 +669,7 @@ async fn execute(
                 &intent.target,
                 action.change(),
                 &action.reviewed,
+                progress,
             )
             .await
         }

@@ -21,7 +21,7 @@ use crate::ui::confirm;
 use crate::ui::detail::{DetailView, TestPodLister};
 use crate::ui::registry;
 use crate::ui::resource_actions::{
-    ResourceAction, RunningWrite, WriteKey, claim, release, request, running_on,
+    ResourceAction, RunningWrite, WriteKey, claim, record_progress, release, request, running_on,
 };
 use crate::ui::row_menu;
 use crate::ui::support_tests::{
@@ -1145,6 +1145,46 @@ async fn a_draining_node_blocks_every_action_on_it_only(cx: &mut TestAppContext)
     );
 }
 
+// covers UP-53: the strip shows where a running drain is, and progress told after it ended, or
+// for an object no drain runs on, shows nowhere.
+#[gpui_kit::test]
+async fn the_strip_shows_a_running_drains_progress(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_alpha(cx, dir.path(), "").await;
+    let key = node_key("node-1");
+    let mut progress = flint_core::write::DrainProgress::default();
+    progress.to_evict = 2;
+    progress.tried = 1;
+    progress.evicted = 1;
+    progress.current = Some(flint_core::write::PodName {
+        namespace: "demo".into(),
+        name: "web".into(),
+    });
+    cx.update(|cx| record_progress(&key, progress.clone(), cx));
+    draw(cx, &t);
+    assert!(t.find(cx, "drain-status").is_none(), "no drain runs");
+
+    cx.update(|cx| claim(&key, ResourceAction::Drain, cx))
+        .unwrap();
+    cx.update(|cx| record_progress(&key, progress.clone(), cx));
+    draw(cx, &t);
+    assert_eq!(
+        t.label(cx, "drain-status").as_deref(),
+        Some("Draining node-1: evicting demo/web, 2 of 2 (1 evicted, 0 blocked)…")
+    );
+
+    cx.update(|cx| release(&key, cx));
+    cx.update(|cx| claim(&key, ResourceAction::Drain, cx))
+        .unwrap();
+    draw(cx, &t);
+    assert_eq!(
+        t.label(cx, "drain-status").as_deref(),
+        Some("Draining node-1…"),
+        "a new drain starts without the last one's progress"
+    );
+    cx.update(|cx| release(&key, cx));
+}
+
 // covers UP-53: two confirmations open for one object run one write: the second is refused at
 // the moment it is confirmed, saying what runs.
 #[gpui_kit::test]
@@ -1263,8 +1303,16 @@ async fn a_drain_shows_in_a_strip_then_offers_its_report(cx: &mut TestAppContext
     select_loaded(cx, &t, "node-1").await;
 
     for (fails, ends, says) in [
-        (false, "Drain of node-1 finished", "Drained node-1"),
-        (true, "Drain of node-1 stopped", "Drain of node-1 stopped"),
+        (
+            false,
+            "Drain of node-1 on kind-alpha finished",
+            "Drained node-1 on kind-alpha",
+        ),
+        (
+            true,
+            "Drain of node-1 on kind-alpha stopped",
+            "Drain of node-1 on kind-alpha stopped",
+        ),
     ] {
         api.control.fail_pods.store(fails, Ordering::SeqCst);
         api.hold(true);
