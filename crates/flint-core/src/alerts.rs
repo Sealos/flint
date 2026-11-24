@@ -60,7 +60,7 @@
 // module-tests: alerts_tests.rs
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -99,13 +99,14 @@ pub const CRITICAL_RESERVED_PER_CLUSTER: usize = 64;
 pub const MAX_NAME_BYTES: usize = 253;
 
 /// Every kind of problem, for tracking which have had their first check.
-const ALL_KINDS: [ProblemKind; 6] = [
+const ALL_KINDS: [ProblemKind; 7] = [
     ProblemKind::CrashLoop,
     ProblemKind::OomKilled,
     ProblemKind::NodeNotReady,
     ProblemKind::JobFailed,
     ProblemKind::ImagePull,
     ProblemKind::WorkloadShort,
+    ProblemKind::PodPending,
 ];
 
 /// Tuning for an [`AlertEngine`].
@@ -180,7 +181,9 @@ fn key_of(problem: &Problem) -> AlertKey {
     let subject = match (&problem.id.subject, &problem.owner) {
         (ProblemSubject::Node { name, .. }, _) => AlertSubject::Node { name: name.clone() },
         (
-            ProblemSubject::Container { namespace, .. } | ProblemSubject::Job { namespace, .. },
+            ProblemSubject::Container { namespace, .. }
+            | ProblemSubject::Pod { namespace, .. }
+            | ProblemSubject::Job { namespace, .. },
             Some(owner),
         ) => AlertSubject::Workload {
             namespace: namespace.clone(),
@@ -198,7 +201,15 @@ fn key_of(problem: &Problem) -> AlertKey {
             namespace: namespace.clone(),
             owner: ProblemOwner::workload(*kind, name),
         },
-        (ProblemSubject::Container { namespace, pod, .. }, None) => AlertSubject::Pod {
+        (ProblemSubject::Container { namespace, pod, .. }, None)
+        | (
+            ProblemSubject::Pod {
+                namespace,
+                name: pod,
+                ..
+            },
+            None,
+        ) => AlertSubject::Pod {
             namespace: namespace.clone(),
             name: pod.clone(),
         },
@@ -273,6 +284,19 @@ pub struct AlertSummary {
     pub highest: Option<ProblemSeverity>,
 }
 
+/// Alerts of several clusters held back by the app-wide budget, reported together.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FleetSummary {
+    /// The first of the clusters by name, which opening the notification shows.
+    pub first: Arc<str>,
+    /// How many clusters it covers, always more than one.
+    pub clusters: u32,
+    pub new: u32,
+    pub resolved: u32,
+    pub untracked: u32,
+    pub highest: Option<ProblemSeverity>,
+}
+
 /// What a caller should deliver.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AlertEvent {
@@ -282,6 +306,8 @@ pub enum AlertEvent {
     Resolved(Alert),
     /// Several alerts in one message.
     Summary(AlertSummary),
+    /// Several alerts of several clusters in one message.
+    FleetSummary(FleetSummary),
     /// The cluster has stayed unavailable; `open` groups are now unknown.
     ClusterUnavailable { cluster: Arc<str>, open: u32 },
     /// A cluster reported as unavailable can be read again.
@@ -297,7 +323,14 @@ impl AlertEvent {
             }
             Self::Raised(alert) => alert.summary.to_owned(),
             Self::Resolved(alert) => resolved_text(alert.key.kind).to_owned(),
-            Self::Summary(summary) => summary_text(summary),
+            Self::Summary(summary) => {
+                summary_text(summary.new, summary.resolved, summary.untracked)
+            }
+            Self::FleetSummary(summary) => format!(
+                "{} across {} clusters",
+                summary_text(summary.new, summary.resolved, summary.untracked),
+                summary.clusters
+            ),
             Self::ClusterUnavailable { open: 0, .. } => "Cluster can no longer be checked".into(),
             Self::ClusterUnavailable { open, .. } => format!(
                 "Cluster can no longer be checked; {} now unknown",
@@ -316,14 +349,15 @@ fn resolved_text(kind: ProblemKind) -> &'static str {
         ProblemKind::JobFailed => "Job failure no longer reported",
         ProblemKind::ImagePull => "Image pull failure no longer reported",
         ProblemKind::WorkloadShort => "Missing replicas no longer reported",
+        ProblemKind::PodPending => "Pod no longer reported as stuck Pending",
     }
 }
 
-fn summary_text(summary: &AlertSummary) -> String {
+fn summary_text(new: u32, resolved: u32, untracked: u32) -> String {
     let parts = [
-        (summary.new, "new problem"),
-        (summary.resolved, "resolved problem"),
-        (summary.untracked, "further problem"),
+        (new, "new problem"),
+        (resolved, "resolved problem"),
+        (untracked, "further problem"),
     ];
     let parts: Vec<String> = parts
         .into_iter()
@@ -454,8 +488,9 @@ struct ClusterState {
     unavailable_reported: bool,
     /// When it was last reported unavailable, so a flapping cluster reports once per window.
     unavailable_announced: Option<Timestamp>,
-    /// How many groups did not fit in the last pass, so only growth is reported.
-    last_untracked: u32,
+    /// How many groups of each kind did not fit when it was last checked, so only growth is
+    /// reported. A kind that cannot be checked keeps its count.
+    last_untracked: HashMap<ProblemKind, u32>,
 }
 
 /// Availability changes sent across all clusters in the current window. A change held back here
@@ -484,6 +519,117 @@ impl AvailabilityBudget {
     }
 }
 
+/// What the app-wide budget held back for one cluster.
+#[derive(Clone, Copy, Debug, Default)]
+struct HeldCounts {
+    new: u32,
+    resolved: u32,
+    untracked: u32,
+    highest: Option<ProblemSeverity>,
+}
+
+/// What all clusters together may deliver per window, so one change that touches many clusters,
+/// such as a lower threshold, cannot flood the desktop. Individual alerts stop at twice a
+/// cluster's limit, and warnings at half of that, so critical alerts always keep a share. One
+/// cluster's summary goes out as usual; the rest wait here and leave as one message.
+#[derive(Debug, Default)]
+struct FleetBudget {
+    start: Option<Timestamp>,
+    raised: u32,
+    resolved: u32,
+    summaries: u32,
+    combined_sent: bool,
+    held: BTreeMap<Arc<str>, HeldCounts>,
+}
+
+impl FleetBudget {
+    const DIRECT_SUMMARIES: u32 = 1;
+
+    fn roll(&mut self, now: Timestamp, config: &AlertConfig) {
+        let expired = self
+            .start
+            .is_none_or(|start| start > now || now.duration_since(start) >= config.burst_window);
+        if expired {
+            self.start = Some(now);
+            self.raised = 0;
+            self.resolved = 0;
+            self.summaries = 0;
+            self.combined_sent = false;
+        }
+    }
+
+    fn take_raised(&mut self, severity: ProblemSeverity, config: &AlertConfig) -> bool {
+        let limit = match severity {
+            ProblemSeverity::Critical => config.burst_limit.saturating_mul(2),
+            ProblemSeverity::Warning => config.burst_limit,
+        };
+        let free = self.raised < limit;
+        self.raised += u32::from(free);
+        free
+    }
+
+    fn take_resolved(&mut self, config: &AlertConfig) -> bool {
+        let free = self.resolved < config.burst_limit.saturating_mul(2);
+        self.resolved += u32::from(free);
+        free
+    }
+
+    /// Passes a cluster's summary on, or holds it for the combined one.
+    fn route(&mut self, event: Option<AlertEvent>) -> Option<AlertEvent> {
+        let event = event?;
+        if self.summaries < Self::DIRECT_SUMMARIES {
+            self.summaries += 1;
+            return Some(event);
+        }
+        if let AlertEvent::Summary(summary) = &event {
+            let held = self.held.entry(Arc::clone(&summary.cluster)).or_default();
+            held.new = held.new.saturating_add(summary.new);
+            held.resolved = held.resolved.saturating_add(summary.resolved);
+            held.untracked = held.untracked.saturating_add(summary.untracked);
+            held.highest = held.highest.max(summary.highest);
+            return None;
+        }
+        Some(event)
+    }
+
+    /// Everything held, at most once per window: a single cluster's as its own summary.
+    fn take_combined(&mut self) -> Option<AlertEvent> {
+        if self.combined_sent || self.held.is_empty() {
+            return None;
+        }
+        self.combined_sent = true;
+        let held = std::mem::take(&mut self.held);
+        let clusters = saturating_u32(held.len());
+        let first = held.keys().next().map(Arc::clone)?;
+        let total = held
+            .values()
+            .fold(HeldCounts::default(), |sum, one| HeldCounts {
+                new: sum.new.saturating_add(one.new),
+                resolved: sum.resolved.saturating_add(one.resolved),
+                untracked: sum.untracked.saturating_add(one.untracked),
+                highest: sum.highest.max(one.highest),
+            });
+        Some(if clusters == 1 {
+            AlertEvent::Summary(AlertSummary {
+                cluster: first,
+                new: total.new,
+                resolved: total.resolved,
+                untracked: total.untracked,
+                highest: total.highest,
+            })
+        } else {
+            AlertEvent::FleetSummary(FleetSummary {
+                first,
+                clusters,
+                new: total.new,
+                resolved: total.resolved,
+                untracked: total.untracked,
+                highest: total.highest,
+            })
+        })
+    }
+}
+
 impl ClusterState {
     fn new(now: Timestamp) -> Self {
         Self {
@@ -494,7 +640,7 @@ impl ClusterState {
             unavailable_since: None,
             unavailable_reported: false,
             unavailable_announced: None,
-            last_untracked: 0,
+            last_untracked: HashMap::new(),
         }
     }
 
@@ -526,6 +672,7 @@ pub struct AlertEngine {
     config: AlertConfig,
     clusters: HashMap<Arc<str>, ClusterState>,
     availability: AvailabilityBudget,
+    fleet: FleetBudget,
 }
 
 impl AlertEngine {
@@ -535,6 +682,7 @@ impl AlertEngine {
             config,
             clusters: HashMap::new(),
             availability: AvailabilityBudget::default(),
+            fleet: FleetBudget::default(),
         }
     }
 
@@ -584,6 +732,13 @@ impl AlertEngine {
     /// Drops all history for a cluster, so its next check is a baseline again.
     pub fn forget(&mut self, cluster: &str) {
         self.clusters.remove(cluster);
+        self.fleet.held.remove(cluster);
+    }
+
+    /// What the app-wide budget held back, at most once per window. Call after each full pass.
+    pub fn take_fleet_summary(&mut self, now: Timestamp) -> Option<AlertEvent> {
+        self.fleet.roll(now, &self.config);
+        self.fleet.take_combined()
     }
 
     /// The groups tracked for a cluster, most urgent first.
@@ -614,6 +769,7 @@ impl AlertEngine {
         };
         state.clamp_times(now);
         state.window.roll(now, self.config.burst_window);
+        self.fleet.roll(now, &self.config);
         for entry in state.tracked.values_mut() {
             entry.status = Status::Unknown;
         }
@@ -634,7 +790,7 @@ impl AlertEngine {
                 open: saturating_u32(state.tracked.len()),
             });
         }
-        events.extend(state.window.take_summary(cluster));
+        events.extend(self.fleet.route(state.window.take_summary(cluster)));
         events
     }
 
@@ -651,6 +807,7 @@ impl AlertEngine {
         };
         state.clamp_times(now);
         state.window.roll(now, config.burst_window);
+        self.fleet.roll(now, &config);
 
         let mut events = Vec::new();
         let unchecked = unchecked_kinds(cluster, problems, unchecked);
@@ -677,7 +834,7 @@ impl AlertEngine {
             if !entry.raised {
                 continue;
             }
-            if state.window.resolved < config.burst_limit {
+            if state.window.resolved < config.burst_limit && self.fleet.take_resolved(&config) {
                 state.window.resolved += 1;
                 events.push(AlertEvent::Resolved(alert(cluster, key, &entry)));
             } else {
@@ -687,17 +844,19 @@ impl AlertEngine {
 
         let mut new: Vec<(AlertKey, Seen)> = seen.into_iter().collect();
         new.sort_by(|(a, _), (b, _)| alert_order(a).cmp(&alert_order(b)));
-        let mut untracked_highest = None;
+        let mut over_capacity = HashSet::new();
         for (key, group) in new {
             if state.tracked.len() >= tracking_limit(key.kind.severity()) {
-                untracked += 1;
-                untracked_highest = untracked_highest.max(Some(key.kind.severity()));
+                *untracked.entry(key.kind).or_default() += 1;
+                over_capacity.insert(key.kind);
                 continue;
             }
             let baseline = !config.alert_on_existing && !state.baselined.contains(&key.kind);
             let mut raised = false;
             if !baseline {
-                if state.window.raised < config.burst_limit {
+                if state.window.raised < config.burst_limit
+                    && self.fleet.take_raised(key.kind.severity(), &config)
+                {
                     state.window.raised += 1;
                     raised = true;
                 } else {
@@ -723,13 +882,18 @@ impl AlertEngine {
                 state.baselined.insert(kind);
             }
         }
-        let growth = untracked.saturating_sub(state.last_untracked);
-        if growth > 0 {
-            state.window.pending_untracked += growth;
-            state.window.pending_highest = state.window.pending_highest.max(untracked_highest);
+        for kind in ALL_KINDS.into_iter().filter(|k| !unchecked.contains(k)) {
+            let count = untracked.get(&kind).copied().unwrap_or(0);
+            let last = state.last_untracked.insert(kind, count).unwrap_or(0);
+            if count > last {
+                state.window.pending_untracked += count - last;
+                if over_capacity.contains(&kind) {
+                    state.window.pending_highest =
+                        state.window.pending_highest.max(Some(kind.severity()));
+                }
+            }
         }
-        state.last_untracked = untracked;
-        events.extend(state.window.take_summary(cluster));
+        events.extend(self.fleet.route(state.window.take_summary(cluster)));
         events
     }
 }
@@ -804,16 +968,16 @@ fn update_hold_downs<'a>(
     waiting
 }
 
-/// Groups a pass by key, returning the groups and how many problems cannot be kept. Problems in
-/// `waiting` are left out, as if not yet seen.
+/// Groups a pass by key, returning the groups and how many problems of each kind cannot be kept.
+/// Problems in `waiting` are left out, as if not yet seen.
 fn group(
     cluster: &Arc<str>,
     problems: &[Problem],
     unchecked: &[ProblemKind],
     waiting: &HashSet<&ProblemId>,
-) -> (HashMap<AlertKey, Seen>, u32) {
+) -> (HashMap<AlertKey, Seen>, HashMap<ProblemKind, u32>) {
     let mut seen: HashMap<AlertKey, Seen> = HashMap::new();
-    let mut oversized = 0;
+    let mut oversized: HashMap<ProblemKind, u32> = HashMap::new();
     for problem in problems {
         if *problem.id.cluster != **cluster
             || unchecked.contains(&problem.kind())
@@ -823,7 +987,7 @@ fn group(
         }
         let key = key_of(problem);
         if !key.subject.is_bounded() {
-            oversized += 1;
+            *oversized.entry(key.kind).or_default() += 1;
             continue;
         }
         let summary = problem.summary();

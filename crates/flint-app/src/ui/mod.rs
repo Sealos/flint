@@ -31,6 +31,7 @@ mod dock_model;
 #[cfg(test)]
 mod dock_tests;
 mod focus;
+mod helm_view;
 mod icons;
 mod keep_watching;
 mod list;
@@ -46,6 +47,7 @@ mod notice;
 mod object;
 mod palette;
 mod palette_model;
+mod pending_threshold;
 mod port_forward_view;
 mod quit_flush;
 mod registry;
