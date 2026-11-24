@@ -19,7 +19,7 @@ use regex::Regex;
 
 use super::buffer::LogLines;
 use super::line::{LineId, LogLine};
-use super::pattern::{self, GUARD_SCAN_BYTES, GUARD_SCAN_LINES, PatternError, ScanCancel};
+use super::pattern::{self, LineRanges, PatternError, ScanCancel};
 
 /// What to look for: a plain substring of a line's text (timestamps are not searched), or a
 /// regular expression with [`SearchQuery::regex`], and optionally of its `pod/container` source.
@@ -72,6 +72,11 @@ impl SearchQuery {
         self.matcher().match_ranges(text)
     }
 
+    /// [`SearchQuery::match_ranges`], saying whether a limit left matches out.
+    pub fn highlight_ranges(&self, text: &str) -> LineRanges {
+        self.matcher().highlight_ranges(text)
+    }
+
     /// Whether `text` contains the query. An empty query matches nothing.
     pub fn is_match(&self, text: &str) -> bool {
         self.matcher().is_match(text)
@@ -79,14 +84,14 @@ impl SearchQuery {
 }
 
 /// A [`SearchQuery`] made ready to test many lines: the pattern is prepared once, and testing a
-/// line allocates nothing (the lowercased text goes into a buffer kept from line to line).
+/// line allocates nothing (what it needs goes into buffers kept from line to line).
 ///
 /// - **Case-sensitive**, or ASCII with no letters: a substring search ([`memmem`]).
 /// - **ASCII, either case**: the same search in the text with its ASCII lowercased, which keeps
 ///   byte offsets.
-/// - **Other text, either case**: a substring search in the text lowercased char by char rules
-///   out most lines; where it finds the pattern, chars are compared with simple lowercase
-///   folding at each char boundary, so offsets stay those of the text.
+/// - **Other text, either case**: a linear (Knuth-Morris-Pratt) search over the text's chars
+///   with simple lowercase folding, reading the text in place, so offsets stay those of the
+///   text and no copy of it is made.
 /// - **Regex**: a linear-time engine with a compiled size limit (see `pattern`); highlighting
 ///   stops at a fixed amount of work per line.
 #[derive(Debug, Clone, Default)]
@@ -105,11 +110,7 @@ enum Find {
     Exact(memmem::Finder<'static>),
     /// The pattern in lowercase ASCII.
     AsciiFolded(memmem::Finder<'static>),
-    /// The pattern lowercased, as text and as chars.
-    Folded {
-        lower: memmem::Finder<'static>,
-        chars: Vec<char>,
-    },
+    Folded(FoldedPattern),
     Regex(Regex),
 }
 
@@ -127,12 +128,7 @@ impl SearchMatcher {
         } else if text.is_ascii() {
             Find::AsciiFolded(memmem::Finder::new(&text.to_ascii_lowercase()).into_owned())
         } else {
-            let chars: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
-            let lower: String = chars.iter().collect();
-            Find::Folded {
-                lower: memmem::Finder::new(&lower).into_owned(),
-                chars,
-            }
+            Find::Folded(FoldedPattern::new(text))
         };
         SearchMatcher {
             find,
@@ -157,8 +153,13 @@ impl SearchMatcher {
             Find::Nothing => false,
             Find::Exact(finder) => finder.find(text.as_bytes()).is_some(),
             Find::AsciiFolded(finder) => finder.find(&self.lowered(text)).is_some(),
-            Find::Folded { chars, .. } => {
-                self.might_fold_match(text) && folded_matches(text, chars).next().is_some()
+            Find::Folded(pattern) => {
+                let mut found = false;
+                pattern.scan(text, |_| {
+                    found = true;
+                    false
+                });
+                found
             }
             Find::Regex(regex) => regex.is_match(text),
         }
@@ -167,22 +168,43 @@ impl SearchMatcher {
     /// Byte ranges of every non-overlapping match in `text`. The text is lowercased once,
     /// however many matches it has: a long wrapped line is highlighted in every frame.
     pub fn match_ranges(&self, text: &str) -> Vec<Range<usize>> {
+        self.highlight_ranges(text).ranges
+    }
+
+    /// [`SearchMatcher::match_ranges`], saying whether a limit left matches out. Only a regex
+    /// has limits.
+    pub fn highlight_ranges(&self, text: &str) -> LineRanges {
         let ranges = |finder: &memmem::Finder<'_>, hay: &[u8]| {
             let len = finder.needle().len();
             finder.find_iter(hay).map(|at| at..at + len).collect()
         };
-        match &self.find {
+        let ranges = match &self.find {
             Find::Nothing => Vec::new(),
             Find::Exact(finder) => ranges(finder, text.as_bytes()),
             // Lowercasing ASCII keeps byte offsets, so ranges map back onto `text`.
             Find::AsciiFolded(finder) => ranges(finder, &self.lowered(text)),
-            Find::Folded { chars, .. } => {
-                if !self.might_fold_match(text) {
-                    return Vec::new();
-                }
-                folded_matches(text, chars).collect()
+            Find::Folded(pattern) => {
+                let mut out = Vec::new();
+                pattern.scan(text, |found| {
+                    out.push(found);
+                    true
+                });
+                out
             }
-            Find::Regex(regex) => pattern::bounded_ranges(regex, text),
+            Find::Regex(regex) => return pattern::bounded_ranges(regex, text),
+        };
+        LineRanges {
+            ranges,
+            complete: true,
+        }
+    }
+
+    /// [`SearchMatcher::highlight_ranges`] over a whole long line, for a background thread: a
+    /// regex is not cut to what the UI thread may test.
+    pub fn whole_line_ranges(&self, text: &str) -> LineRanges {
+        match &self.find {
+            Find::Regex(regex) => pattern::whole_line_ranges(regex, text),
+            _ => self.highlight_ranges(text),
         }
     }
 
@@ -193,67 +215,79 @@ impl SearchMatcher {
         lower.extend(text.bytes().map(|b| b.to_ascii_lowercase()));
         lower
     }
-
-    /// Whether `text`, lowercased char by char, holds the lowercased pattern: a match at a
-    /// char boundary is also one there, so `false` rules a line out without comparing chars.
-    fn might_fold_match(&self, text: &str) -> bool {
-        let Find::Folded { lower, .. } = &self.find else {
-            return true;
-        };
-        let mut text_lower = self.scratch.borrow_mut();
-        text_lower.clear();
-        let (bytes, mut i, mut utf8) = (text.as_bytes(), 0, [0; 4]);
-        while let Some(&b) = bytes.get(i) {
-            // Log text is mostly ASCII: only other chars are decoded.
-            if b.is_ascii() {
-                text_lower.push(b.to_ascii_lowercase());
-                i += 1;
-                continue;
-            }
-            let c = text[i..].chars().next().unwrap_or_default();
-            for lc in c.to_lowercase() {
-                text_lower.extend_from_slice(lc.encode_utf8(&mut utf8).as_bytes());
-            }
-            i += c.len_utf8();
-        }
-        lower.find(&text_lower).is_some()
-    }
 }
 
-/// The non-overlapping matches of `pat` (lowercased chars) in `text`, comparing chars with
-/// simple lowercase folding at each char boundary, as byte ranges of `text`.
-fn folded_matches<'a>(text: &'a str, pat: &'a [char]) -> impl Iterator<Item = Range<usize>> + 'a {
-    let mut at = 0;
-    std::iter::from_fn(move || {
-        while at < text.len() {
-            let rest = &text[at..];
-            if let Some(len) = folded_prefix_len(rest, pat) {
-                let found = at..at + len;
-                // A pattern is never empty, so a match moves on by at least one char.
-                at += len.max(rest.chars().next().map_or(1, char::len_utf8));
-                return Some(found);
-            }
-            at += rest.chars().next().map_or(1, char::len_utf8);
-        }
-        None
-    })
+/// Marks a lowercased char that does not start a char of the text.
+const INSIDE_A_CHAR: usize = usize::MAX;
+
+/// A non-empty pattern, lowercased, ready for a Knuth-Morris-Pratt search over a text's chars as
+/// they lowercase: time linear in the text, whatever the two hold.
+#[derive(Debug, Clone)]
+struct FoldedPattern {
+    chars: Vec<char>,
+    /// For each prefix of `chars`, the length of its longest proper prefix that is also a suffix.
+    borders: Vec<usize>,
+    /// Where the last `chars.len()` lowercased chars began in the text, as a ring.
+    starts: RefCell<Vec<usize>>,
 }
 
-/// How many bytes at the start of `text` match `pat` (already lowercased), if they all do.
-fn folded_prefix_len(text: &str, pat: &[char]) -> Option<usize> {
-    let mut p = 0;
-    for (at, c) in text.char_indices() {
-        if p == pat.len() {
-            return Some(at);
-        }
-        for lc in c.to_lowercase() {
-            if pat.get(p) != Some(&lc) {
-                return None;
+impl FoldedPattern {
+    fn new(text: &str) -> Self {
+        let chars: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
+        let mut borders = vec![0; chars.len()];
+        let mut k = 0;
+        for i in 1..chars.len() {
+            while k > 0 && chars[i] != chars[k] {
+                k = borders[k - 1];
             }
-            p += 1;
+            if chars[i] == chars[k] {
+                k += 1;
+            }
+            borders[i] = k;
+        }
+        FoldedPattern {
+            starts: RefCell::new(vec![INSIDE_A_CHAR; chars.len()]),
+            chars,
+            borders,
         }
     }
-    (p == pat.len()).then_some(text.len())
+
+    /// Calls `found` with the byte range of each non-overlapping match, leftmost first, until it
+    /// returns `false`. A match starts and ends on a char of the text: a char that lowercases to
+    /// several must match all of them.
+    fn scan(&self, text: &str, mut found: impl FnMut(Range<usize>) -> bool) {
+        let len = self.chars.len();
+        let mut starts = self.starts.borrow_mut();
+        starts.fill(INSIDE_A_CHAR);
+        let (mut k, mut seen, mut free) = (0, 0, 0);
+        for (at, c) in text.char_indices() {
+            let mut lower = c.to_lowercase();
+            let mut start = at;
+            while let Some(lc) = lower.next() {
+                starts[seen % len] = start;
+                start = INSIDE_A_CHAR;
+                seen += 1;
+                while k > 0 && self.chars[k] != lc {
+                    k = self.borders[k - 1];
+                }
+                if self.chars[k] == lc {
+                    k += 1;
+                }
+                if k < len {
+                    continue;
+                }
+                k = self.borders[len - 1];
+                // The ring's oldest entry is where this match began.
+                let from = starts[seen % len];
+                if lower.len() == 0 && from != INSIDE_A_CHAR && from >= free {
+                    free = at + c.len_utf8();
+                    if !found(from..free) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The lines of one session that match a query, kept up to date snapshot by snapshot.
@@ -314,25 +348,6 @@ impl LogSearch {
         self.scanned_to = self.scanned_to.max(reached);
     }
 
-    /// The lines not scanned yet that a guard tests. All of them for a plain query; for a regex,
-    /// a window of the newest, at most [`GUARD_SCAN_LINES`] lines and about [`GUARD_SCAN_BYTES`]
-    /// bytes counted from the newest line back, since guards and state polls run on the UI
-    /// thread.
-    fn unscanned<'a>(&self, lines: &'a LogLines) -> impl Iterator<Item = &'a LogLine> + 'a {
-        let end = lines.end_id();
-        let mut from = self.scanned_to.max(lines.first_id());
-        if self.query.regex {
-            let oldest = from.max(end.saturating_sub(GUARD_SCAN_LINES as LineId));
-            let (mut at, mut budget) = (end, GUARD_SCAN_BYTES);
-            while at > oldest && budget > 0 {
-                at -= 1;
-                budget = budget.saturating_sub(lines.get(at).map_or(0, |line| line.text.len()));
-            }
-            from = at;
-        }
-        lines.range(from, end).map(|(_, line)| line)
-    }
-
     /// How many lines of `lines` the next [`LogSearch::update`] would scan: a front end that
     /// put off scanning (for a hidden tab) can tell a short catch-up from a long one.
     pub fn pending(&self, lines: &LogLines) -> u64 {
@@ -341,30 +356,21 @@ impl LogSearch {
             .saturating_sub(self.scanned_to.max(lines.first_id()))
     }
 
-    /// Whether a line of `lines` matches, counting lines not scanned yet (tested here, without
-    /// keeping the result): what an action's guard asks between two updates, which must
-    /// neither count evicted matches nor miss new ones. A regex query tests a bounded part of
-    /// the lines not scanned yet ([`LogSearch::update`] covers them all).
+    /// Whether a match found so far is still in `lines`: what an action's guard asks between two
+    /// updates. It tests no line, so polling it costs nothing however far behind the search is;
+    /// [`LogSearch::update`] tests the rest, and [`LogSearch::pending`] says how many are left.
     pub fn has_match_in(&self, lines: &LogLines) -> bool {
         let (first, end) = (lines.first_id(), lines.end_id());
         let present = self.matches.partition_point(|id| *id < first);
         self.matches.get(present).is_some_and(|id| *id < end)
-            || self
-                .unscanned(lines)
-                .any(|line| self.matcher.matches_line(line))
     }
 
-    /// How many lines of `lines` match, counting lines not scanned yet and not evicted matches,
-    /// as [`LogSearch::has_match_in`] sees them (for a regex query, a lower bound until the
-    /// next update).
+    /// How many matches found so far are still in `lines`, as [`LogSearch::has_match_in`] sees
+    /// them: a lower bound until the next update.
     pub fn count_in(&self, lines: &LogLines) -> usize {
         let first = lines.first_id();
         let present = self.matches.partition_point(|id| *id < first);
         self.matches.len() - present
-            + self
-                .unscanned(lines)
-                .filter(|line| self.matcher.matches_line(line))
-                .count()
     }
 
     /// Matching line ids, oldest first.
@@ -511,10 +517,10 @@ mod tests {
         assert_eq!(search.matches(), &[23, 24, 25, 26, 27]);
     }
 
-    // covers UP-43: between updates, whether a line matches counts neither evicted matches
-    // nor misses new ones.
+    // covers UP-43: between updates, guards read the matches found: evicted ones do not count,
+    // and new lines wait for the budgeted update.
     #[test]
-    fn has_match_in_sees_new_lines_and_forgets_evicted_ones() {
+    fn has_match_in_reads_found_matches_and_forgets_evicted_ones() {
         let mut buffer = LogBuffer::new(3);
         push(&mut buffer, "error a");
         let mut search = LogSearch::new(SearchQuery::new("error"));
@@ -530,14 +536,16 @@ mod tests {
         );
         push(&mut buffer, "ERROR b");
         assert!(
-            search.has_match_in(&buffer.view()),
-            "a line not scanned yet matches"
+            !search.has_match_in(&buffer.view()),
+            "a line not scanned yet is left to the update"
         );
-        assert_eq!(search.count_in(&buffer.view()), 1);
-        push(&mut buffer, "error c");
-        assert_eq!(search.count_in(&buffer.view()), 2);
+        assert_eq!(search.count_in(&buffer.view()), 0);
         search.update(&buffer.view());
-        assert_eq!(search.count_in(&buffer.view()), search.count());
+        assert!(search.has_match_in(&buffer.view()));
+        push(&mut buffer, "error c");
+        assert_eq!(search.count_in(&buffer.view()), 1);
+        search.update(&buffer.view());
+        assert_eq!(search.count_in(&buffer.view()), 2);
         assert!(!LogSearch::default().has_match_in(&buffer.view()));
     }
 
@@ -710,6 +718,25 @@ mod tests {
         }
     }
 
+    // A folded search is linear: a long run of a repeated char that almost matches at every
+    // position would otherwise cost the pattern's length at each of them. The limit is far above
+    // the linear time and far below the quadratic one.
+    #[test]
+    fn a_folded_search_is_linear_in_the_text() {
+        let needle = format!("{}x", "\u{e9}".repeat(8_000));
+        let text = format!("{}x", "\u{e9}".repeat(32_000));
+        let query = SearchQuery::new(needle);
+        let started = std::time::Instant::now();
+        assert!(query.is_match(&text));
+        let expected = 48_000..text.len();
+        assert_eq!(query.match_ranges(&text), std::slice::from_ref(&expected));
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "took {took:?}"
+        );
+    }
+
     // #309
     #[test]
     fn a_regex_query_matches_highlights_and_follows_case() {
@@ -775,47 +802,29 @@ mod tests {
         );
     }
 
-    // #309: a guard between scans tests a bounded part of what was not scanned for a regex,
-    // and all of it for a plain query, as before.
+    // #309: between scans a guard reads cached matches and tests no line, for any kind of query.
     #[test]
-    fn guards_test_a_bounded_part_of_the_unscanned_lines_for_a_regex() {
-        let mut buffer = LogBuffer::new(GUARD_SCAN_LINES * 3);
+    fn guards_read_only_cached_matches() {
+        let mut buffer = LogBuffer::new(10);
         push(&mut buffer, "needle");
-        for _ in 0..GUARD_SCAN_LINES * 2 {
-            push(&mut buffer, "hay");
-        }
         let lines = buffer.view();
-        let bounded = LogSearch::new(regex("needle"));
-        assert!(!bounded.has_match_in(&lines), "too old for a guard to test");
-        assert_eq!(bounded.count_in(&lines), 0);
+        let mut search = LogSearch::new(regex("needle"));
+        assert!(!search.has_match_in(&lines));
+        assert_eq!(search.count_in(&lines), 0);
         let plain = LogSearch::new(SearchQuery::new("needle"));
-        assert!(plain.has_match_in(&lines));
-        assert_eq!(plain.count_in(&lines), 1);
-        // The scan itself covers every line.
-        let mut scanned = bounded.clone();
-        scanned.update(&lines);
-        assert_eq!(scanned.count(), 1);
+        assert!(!plain.has_match_in(&lines));
+        assert_eq!(plain.count_in(&lines), 0);
 
-        // Long lines end the guard's test by bytes, well before the line limit.
-        let mut long = LogBuffer::new(100);
-        let text = "x".repeat(GUARD_SCAN_BYTES);
-        push(&mut long, "needle");
-        push(&mut long, &text);
-        assert!(!LogSearch::new(regex("needle")).has_match_in(&long.view()));
-    }
-
-    // #309: the byte budget is spent from the newest line back, so a burst of old long lines
-    // cannot hide the line that just arrived.
-    #[test]
-    fn a_guard_spends_its_bytes_on_the_newest_lines() {
-        let mut buffer = LogBuffer::new(100);
-        let long = "x".repeat(GUARD_SCAN_BYTES);
-        push(&mut buffer, &long);
-        push(&mut buffer, &long);
+        search.update(&lines);
+        assert!(search.has_match_in(&lines));
         push(&mut buffer, "needle");
-        let search = LogSearch::new(regex("needle"));
-        assert!(search.has_match_in(&buffer.view()));
-        assert_eq!(search.count_in(&buffer.view()), 1);
+        assert_eq!(
+            search.count_in(&buffer.view()),
+            1,
+            "the new line is pending"
+        );
+        search.update(&buffer.view());
+        assert_eq!(search.count_in(&buffer.view()), 2);
     }
 
     // #309: a cancelled scan stops, keeps what it found, and leaves the rest pending.

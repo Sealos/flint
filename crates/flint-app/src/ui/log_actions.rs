@@ -92,7 +92,10 @@ impl LogView {
                 view.refilter(None, cx);
             })
             .bind::<SetLogContext>(|view, action, _, cx| {
-                let context = (action.lines as usize).min(flint_core::logs::MAX_CONTEXT);
+                if Self::check_context(action.lines).is_err() {
+                    return;
+                }
+                let context = action.lines as usize;
                 if context != view.context {
                     view.context = context;
                     // Also while a first scan runs: it restarts with the new context.
@@ -181,6 +184,12 @@ impl LogView {
     /// started.
     pub(in crate::ui) fn is_selecting(&self) -> bool {
         self.selection.is_some()
+    }
+
+    /// [`DragSelection`] applies: some selected line is shown, or a drag is under way (a filter
+    /// can hide every selected row mid-drag, and the drag goes on to a row shown).
+    pub(in crate::ui) fn can_drag_selection(&self) -> bool {
+        self.has_selection() || (self.drag_selecting && self.is_selecting())
     }
 
     /// Lines are selected, and some of them shown (a filter can hide them all).
@@ -292,9 +301,10 @@ impl LogView {
         rows.min(matches)
     }
 
-    /// Whether a line shown matches the search, counting lines that arrived since the last
-    /// scan and not evicted ones: what Next and Previous Match, and Save Matching Lines, need.
-    /// `false` while a scan runs on the core's threads, whose matches are not known yet.
+    /// Whether a match found so far is among the lines shown: what Next and Previous Match, and
+    /// Save Matching Lines, need. Tests no line, so a state poll stays cheap; lines that arrived
+    /// since the last scan count once it reaches them. `false` while a scan runs on the core's
+    /// threads, whose matches are not known yet.
     pub(in crate::ui) fn has_matches(&self) -> bool {
         if self.searching {
             return false;
@@ -329,6 +339,18 @@ impl LogView {
         matches.binary_search(&id).ok().map(|ix| ix - evicted)
     }
 
+    /// [`SetLogContext`] takes 0 to [`flint_core::logs::MAX_CONTEXT`] lines.
+    pub(in crate::ui) fn check_context(lines: u32) -> Result<(), ActionError> {
+        let max = flint_core::logs::MAX_CONTEXT;
+        if lines as usize <= max {
+            Ok(())
+        } else {
+            Err(ActionError::rejected::<SetLogContext>(format!(
+                "context is 0 to {max} lines, not {lines}"
+            )))
+        }
+    }
+
     /// [`SelectLine`] and [`DragSelection`] take a line shown now.
     pub(in crate::ui) fn check_line<A: Action>(&self, line: LineId) -> Result<(), ActionError> {
         if self.row_index(line).is_some() {
@@ -347,6 +369,11 @@ impl LogView {
             _ if !self.has_lines() => Some("no lines are shown"),
             SaveScope::All => None,
             SaveScope::Matches if self.searching => Some("still searching…"),
+            SaveScope::Matches
+                if !self.has_matches() && self.search.pending(&self.snapshot.lines) > 0 =>
+            {
+                Some("still searching…")
+            }
             SaveScope::Matches if !self.has_matches() => Some("no lines match the search"),
             SaveScope::Matches => None,
             SaveScope::Selection if self.selection.is_none() => Some("no lines are selected"),

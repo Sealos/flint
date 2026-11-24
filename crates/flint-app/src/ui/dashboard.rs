@@ -35,6 +35,8 @@ use super::registry::{Bind, OnView, OpenObject, OpenView};
 mod feed;
 #[path = "dashboard_overview.rs"]
 mod overview;
+#[path = "set_dashboard.rs"]
+pub(in crate::ui) mod set;
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "only tests ask a sparkline if it is empty")
@@ -44,9 +46,10 @@ mod sparkline;
 #[path = "dashboard_tiles.rs"]
 mod tiles;
 
-#[cfg(test)]
-pub(in crate::ui) use feed::{FeedId, lists_of, slot_to_read};
+pub(in crate::ui) use feed::FeedId;
 pub use feed::{ProblemList, ProblemLists};
+#[cfg(test)]
+pub(in crate::ui) use feed::{lists_of, slot_to_read};
 #[cfg(test)]
 pub(in crate::ui) use overview::ProblemRow;
 pub(in crate::ui) use overview::ProblemsPanel;

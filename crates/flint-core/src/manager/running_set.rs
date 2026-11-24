@@ -22,7 +22,10 @@ use crate::connection::member::{
 use crate::connection::policy::Role;
 use crate::connection::schedule::{AttemptId, Jitter};
 use crate::credential::{CredentialSource, WriteCredential};
-use crate::handle::{AdmittedMember, ConnectionState, Event, MemberReport, MemberStatus};
+use crate::handle::{
+    AdmittedMember, ConnectionState, Event, LeftOutMember, LeftOutReason, MemberReport,
+    MemberStatus, OpenedSet,
+};
 use crate::recheck::Pinned;
 use crate::settings::ClusterPin;
 use crate::store::SyncState;
@@ -138,6 +141,74 @@ impl ClusterManager {
             .collect::<Result<Vec<_>, _>>()?;
         self.set_running_set(ids);
         Ok(admitted)
+    }
+
+    /// Classifies every pin and makes the running set those that can join, in one step, so no
+    /// change can land between the two. Fewer than a set's minimum changes nothing and admits
+    /// nobody. A malformed list is refused whole.
+    pub(super) fn open_running_set(&mut self, pins: Vec<ClusterPin>) -> Result<OpenedSet, String> {
+        let mut seen: Vec<&str> = Vec::with_capacity(pins.len());
+        for pin in &pins {
+            if seen.contains(&pin.context.as_str()) {
+                return Err(format!("\"{}\" is in the set twice.", pin.context));
+            }
+            seen.push(&pin.context);
+        }
+        if !SET_SIZES.contains(&pins.len()) {
+            return Err(format!(
+                "A running set holds {} to {} clusters.",
+                SET_SIZES.start(),
+                SET_SIZES.end()
+            ));
+        }
+        let mut members = Vec::with_capacity(pins.len());
+        let mut left_out = Vec::new();
+        for pin in pins {
+            match self.classify_member(pin) {
+                Ok(member) => members.push(member),
+                Err(member) => left_out.push(member),
+            }
+        }
+        if members.len() < *SET_SIZES.start() {
+            return Ok(OpenedSet {
+                members: Vec::new(),
+                left_out,
+            });
+        }
+        let ids: Vec<ClusterId> = members.iter().map(|m| m.context().to_owned()).collect();
+        if let Some(problem) = self.set_problem(&ids) {
+            return Err(problem);
+        }
+        self.set_running_set(ids);
+        Ok(OpenedSet { members, left_out })
+    }
+
+    /// `pin` as an admitted member, or why it stays out. Anything [`Self::admit_member`] refuses
+    /// stays out, so this is never less strict than admitting the pin alone.
+    fn classify_member(&self, pin: ClusterPin) -> Result<AdmittedMember, LeftOutMember> {
+        let id = pin.context.as_str();
+        let reason = match self.cluster(id) {
+            None => Some(LeftOutReason::Removed),
+            Some(_) if self.paused(id) => Some(LeftOutReason::Paused),
+            Some(slot)
+                if self.unsettled(id)
+                    || !self
+                        .contexts
+                        .shown(id, slot.info.server.as_deref())
+                        .confirmed =>
+            {
+                Some(LeftOutReason::Provisional)
+            }
+            Some(_) => None,
+        };
+        let context = pin.context.clone();
+        match reason {
+            Some(reason) => Err(LeftOutMember { context, reason }),
+            None => self.admit_member(pin).map_err(|_| LeftOutMember {
+                context,
+                reason: LeftOutReason::Changed,
+            }),
+        }
     }
 
     /// `pin` as an admitted member, if its context shows exactly that server, confirmed.
