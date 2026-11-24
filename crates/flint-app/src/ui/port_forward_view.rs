@@ -26,7 +26,7 @@ use super::registry::{self, OpenForwardedPort, StartPortForward, StopPortForward
 
 /// What the panel says before anything is forwarded.
 pub const EMPTY: &str =
-    "No port-forwards. Select a pod or service and choose Forward Port from its menu.";
+    "No port forwards. Select a pod or service and choose Forward Port from its menu.";
 /// The most rows a panel keeps, so a long session's ended forwards stay bounded.
 const MAX_ROWS: usize = 32;
 
@@ -494,12 +494,12 @@ impl DockItem for PortForwardsView {
     }
 
     fn tab_title(&self) -> SharedString {
-        "Port forwards".into()
+        "Port Forwards".into()
     }
 
     fn tab_tooltip(&self) -> SharedString {
         format!(
-            "Port-forwards on {}. They listen on 127.0.0.1 only. Closing this tab stops them.",
+            "Port forwards on {}. They listen on 127.0.0.1 only. Closing this tab stops them.",
             self.cluster
         )
         .into()

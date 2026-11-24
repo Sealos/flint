@@ -2941,30 +2941,30 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         .of(C::Detail, S::Workspace),
         Spec::unit::<ShowPortForwards>(
             "Show Port Forwards",
-            "Show the active cluster's port-forwards in the dock.",
+            "Show the active cluster's port forwards in the dock.",
         )
         .of(C::View, S::Workspace),
         Spec::unit::<StopAllPortForwards>(
             "Stop All Port Forwards",
-            "Stop every port-forward in this window.",
+            "Stop every port forward in this window.",
         )
         .of(C::View, S::Workspace),
         Spec::unit::<StartPortForward>(
             "Start Port Forward",
-            "Start the forward the port-forward panel's form describes.",
+            "Start the forward the port forward panel's form describes.",
         )
         .of(C::View, S::Workspace)
         .hidden(),
         Spec::with_args::<StopPortForward>(
             "Stop Port Forward…",
-            "Stop one port-forward, or dismiss its row once it has ended.",
+            "Stop one port forward, or dismiss its row once it has ended.",
             FORWARD_ID,
         )
         .of(C::View, S::Workspace)
         .hidden(),
         Spec::with_args::<OpenForwardedPort>(
             "Open Forwarded Port…",
-            "Open a running port-forward's local address in the browser.",
+            "Open a running port forward's local address in the browser.",
             FORWARD_ID,
         )
         .of(C::View, S::Workspace)

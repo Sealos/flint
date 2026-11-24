@@ -1122,6 +1122,20 @@ impl Workspace {
         }
     }
 
+    /// The feed of `member`, bound to the server it was admitted on, or none while it `may_read`
+    /// no feed. The one lookup behind the problems toggle and the set's dashboard, so both read a
+    /// member from the same feed.
+    pub(super) fn admitted_feed(
+        &self,
+        member: &AdmittedMember,
+        may_read: bool,
+        cx: &App,
+    ) -> Option<flint_core::telemetry::ClusterTelemetry> {
+        may_read
+            .then(|| self.model.read(cx).core().member_telemetry(member))
+            .flatten()
+    }
+
     /// Why a row of `cluster` cannot be opened or acted on now, if so.
     fn set_row_refusal(&self, cluster: &str, cx: &App) -> Option<String> {
         let names = self.cluster_names(cx);
@@ -1359,9 +1373,11 @@ impl Workspace {
         let server = member.server().to_owned();
         // Every read this view makes is bound to the member, in the core.
         let core = self.model.read(cx).core().bound_to(member);
+        let guards = crate::ui::write_binding::ConnectionGuards::new(&self.model);
         let detail = cx.new(|cx| {
             let mut view = DetailView::new(core, object, tab, window, cx);
             view.set_row_cluster(shown, server, cx);
+            view.set_connection_guards(guards);
             view
         });
         self._detail_subscriptions = vec![cx.subscribe_in(
@@ -1378,7 +1394,9 @@ impl Workspace {
                     this.open_shell(request.clone(), focus, window, cx)
                 }
                 DetailEvent::Refused(why) => this.refuse(why.clone(), cx),
-                DetailEvent::ConfirmWrite(review) => this.confirm_detail_write(review, window, cx),
+                DetailEvent::ConfirmWrite(review, reviewed_on) => {
+                    this.confirm_detail_write(review, reviewed_on.clone(), window, cx)
+                }
             },
         )];
         self.detail = Some(detail);

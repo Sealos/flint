@@ -10,15 +10,15 @@
 //! can end that state.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
-
-use regex::Regex;
+use std::sync::{Arc, Mutex};
 
 use super::store::{LogRow, MAX_NAME_BYTES, clipped};
+use crate::redact::patterns::{
+    COOKIE_MARKER, PRIVATE_KEY_MARKER as PEM_MARKER, ends_in_cookie_array_opener, pem_begin,
+    pem_end,
+};
 use crate::redact::redact_credentials;
 
-const PEM_MARKER: &str = "[REDACTED:private-key]";
-const COOKIE_MARKER: &str = "[REDACTED:cookie]";
 const VALUE_MARKER: &str = "[REDACTED:value]";
 /// What is stored in place of a record that was cut.
 pub(super) const CUT_MARKER: &str = "[REDACTED:cut-off]";
@@ -27,25 +27,9 @@ const NO_LOSS: u64 = u64::MAX;
 /// Stands for a value when asking the redaction rules whether a word is a credential's key.
 const PROBE_VALUE: &str = "flintprobevalue0123456789";
 
-static PEM_BEGIN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"-----BEGIN ([A-Z0-9 ]+)-----").unwrap());
-static PEM_END: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"-----END ([A-Z0-9 ]+)-----").unwrap());
-static COOKIE_ARRAY: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(?i)"(?:set-)?cookie"[ \t]*:[ \t]*\[[ \t]*\r?$"#).unwrap());
-
 /// Text with its credentials replaced.
 pub(super) fn scrub(text: &str) -> String {
     redact_credentials(text).text.into_owned()
-}
-
-/// Where the footer of a PEM block labelled `label` ends in `text`.
-fn pem_end(text: &str, label: &str) -> Option<usize> {
-    PEM_END
-        .captures_iter(text)
-        .find(|end| &end[1] == label)
-        .and_then(|end| end.get(0))
-        .map(|end| end.end())
 }
 
 /// Whether `line` ends in a credential's key, so that its value is on the next line.
@@ -111,20 +95,17 @@ impl RunState {
 
     fn outside_block(&mut self, text: &str) -> String {
         let (mut out, mut rest) = (String::new(), text);
-        while let Some(begin) = PEM_BEGIN.captures(rest) {
-            let (Some(whole), Some(label)) = (begin.get(0), begin.get(1)) else {
-                break;
-            };
-            out.push_str(&scrub(&rest[..whole.start()]));
+        while let Some((span, label)) = pem_begin(rest) {
+            out.push_str(&scrub(&rest[..span.start]));
             out.push_str(PEM_MARKER);
-            let after = &rest[whole.end()..];
-            let Some(end) = pem_end(after, label.as_str()) else {
-                self.block = Some(Block::Pem(label.as_str().to_owned()));
+            let after = &rest[span.end..];
+            let Some(end) = pem_end(after, label) else {
+                self.block = Some(Block::Pem(label.to_owned()));
                 return out;
             };
             rest = &after[end..];
         }
-        if COOKIE_ARRAY.is_match(rest) {
+        if ends_in_cookie_array_opener(rest) {
             self.block = Some(Block::Cookies);
         } else if ends_in_credential_key(rest) {
             self.block = Some(Block::Value);

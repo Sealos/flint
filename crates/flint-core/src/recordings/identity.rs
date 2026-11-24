@@ -4,6 +4,7 @@ use kube::config::Kubeconfig;
 use secrecy::ExposeSecret as _;
 
 use crate::activity::ServerKeys;
+use crate::kubeconfig::definition::ContextDefinition;
 
 /// Keeps these digests apart from any other made with the same key.
 const LABEL: &[u8] = b"flint-recording-identity\0";
@@ -39,30 +40,17 @@ impl ConnectionIdentity {
         context: &str,
         prepared: &kube::Config,
     ) -> Option<Self> {
-        let named = kubeconfig.contexts.iter().find(|c| c.name == context)?;
-        let entry = named.context.as_ref()?;
-        let cluster = kubeconfig
-            .clusters
-            .iter()
-            .find(|c| c.name == entry.cluster)?;
-        cluster.cluster.as_ref()?.server.as_ref()?;
-        let user = entry
-            .user
-            .as_ref()
-            .and_then(|u| kubeconfig.auth_infos.iter().find(|n| &n.name == u));
+        let definition = ContextDefinition::find(kubeconfig, context)?;
         let auth = &prepared.auth_info;
-        if prepared.root_cert_file.is_some()
+        if !definition.has_server()
+            || prepared.root_cert_file.is_some()
             || (auth.client_certificate.is_some() && auth.client_certificate_data.is_none())
             || (auth.client_key.is_some() && auth.client_key_data.is_none())
         {
             return None;
         }
-        // Sorted because exec `env` items serialize in a different order at each load. The text
-        // holds credentials, so it is digested right away and never kept.
-        let mut value = serde_json::to_value((named, cluster, user)).ok()?;
-        value.sort_all_objects();
         let mut message = LABEL.to_vec();
-        push_part(&mut message, value.to_string().as_bytes());
+        push_part(&mut message, definition.canonical_json()?.as_bytes());
         let roots = prepared.root_cert.as_deref().unwrap_or_default();
         message.extend_from_slice(&(roots.len() as u64).to_be_bytes());
         for root in roots {
@@ -127,6 +115,32 @@ mod tests {
         let a = identity(&kubeconfig("https://a:6443", "t"), &plain());
         let b = identity(&kubeconfig("https://a:6443", "t"), &plain());
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn existing_recording_identity_keeps_its_digest() {
+        let id = identity(&kubeconfig("https://a:6443", "t"), &plain());
+        assert_eq!(
+            id.0,
+            [
+                0x21, 0xce, 0x4b, 0xda, 0xfd, 0x61, 0x91, 0x78, 0xbf, 0x30, 0xa8, 0x0e, 0x5d, 0xf4,
+                0x3b, 0x4c, 0x3b, 0x70, 0xa7, 0x69, 0xb6, 0x47, 0x3d, 0x42, 0xef, 0x69, 0xc4, 0x31,
+                0xc4, 0x49, 0x3b, 0x91,
+            ]
+        );
+    }
+
+    #[test]
+    fn an_incomplete_cluster_has_no_identity() {
+        let mut config = kubeconfig("https://a:6443", "t");
+        config.clusters[0].cluster.as_mut().unwrap().server = None;
+        assert!(ConnectionIdentity::of(&keys(), &config, "dev", &plain()).is_none());
+        config.clusters[0].cluster = None;
+        assert!(ConnectionIdentity::of(&keys(), &config, "dev", &plain()).is_none());
+        config.clusters.clear();
+        assert!(ConnectionIdentity::of(&keys(), &config, "dev", &plain()).is_none());
+        config.contexts[0].context = None;
+        assert!(ConnectionIdentity::of(&keys(), &config, "dev", &plain()).is_none());
     }
 
     #[test]

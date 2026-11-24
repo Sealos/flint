@@ -138,9 +138,9 @@ impl Workspace {
                         .is_some_and(|s| s.confirmed && member.same_endpoint(s));
                     // The feed bound to the admitted server, the one the set's dashboard counts,
                     // so both judge the member by its own thresholds.
-                    let feed = holds
-                        .then(|| core.member_telemetry(member).map(|feed| feed.snapshot))
-                        .flatten();
+                    let feed = self
+                        .admitted_feed(member, holds, cx)
+                        .map(|feed| feed.snapshot);
                     (id, feed)
                 })
                 .collect();
