@@ -58,9 +58,10 @@ launch**.
   ended consent drops it, and the slot's own connection starts a feed. Writes still go through the slot and its
   gate. A feed still connecting is dropped on selection, as before.
 - **Warm lists.** While a watched cluster is selected and its feed's connection is up, its resource watches read
-  through that connection's read client too. Leaving the cluster keeps them running, except Events, Leases and
-  EndpointSlices, so selecting it again lists nothing anew even when the slot signs in again. At most 3 clusters
-  keep warm lists in the background, the most recently left. Whatever drops the feed's connection (a changed
+  through that connection's read client too. Leaving the cluster keeps up to 8 kinds running: those its views
+  showed last, then Pods, Deployments, Services and Nodes, never Events, Leases or EndpointSlices. Selecting it
+  again lists none of those anew, even when the slot signs in again. At most 3 clusters keep warm lists in the
+  background, the most recently left. Whatever drops the feed's connection (a changed
   definition or credential, a pause, ended consent, a failure) drops the warm lists with it: the selected cluster
   lists again on the slot's own connection, and a background one stops its watches.
 - **A handed-over feed that fails.** If the feed's credential fails while its cluster is selected, the feed ends
@@ -75,8 +76,14 @@ launch**.
 - **Consent for exec plugins.** A cluster whose credential is an exec plugin has a second, per-cluster toggle next to
   keep watching, which says it lets Flint run this cluster's sign-in command in the background and shows the command.
   It is off by default, and only a click on it turns it on. It is bound to the context's whole definition: the
-  context, its user entry and its cluster entry. Any confirmed change turns it off, and undoing the change leaves it
-  off. Turning it off stops the cluster's background watch at once. It lasts until the app quits and is never saved,
+  context, its user entry and its cluster entry. It is also bound to the program the command runs: the absolute path
+  that resolving the command gives when the toggle is shown (through the `PATH` in the plugin's `env`, else the app's
+  own), and a SHA-256 digest of that file. Before each unattended start the command is resolved and the file checked
+  again; another path, changed contents or a missing file turns it off, and it must be confirmed again. The digest is
+  read again only when the file's size, modification time or inode changes, and never on the app's event loop: the
+  toggle looks at the file at most every two seconds and may show a change late, while a start always checks it in
+  full. A command searched for in `PATH` is not bound when the plugin's `dropEnv` removes `PATH`. Any confirmed change turns it off, and
+  undoing the change leaves it off. Turning it off stops the cluster's background watch at once. It lasts until the app quits and is never saved,
   so after a restart it reads off and runs nothing. Auth-provider clusters show it disabled. The keep-watching choice
   itself is saved.
 - **How a plugin runs.** With `interactive: false` and a null stdin, never in a terminal. A provisional or paused
