@@ -119,10 +119,10 @@ impl CardState {
         match self {
             Self::Live => None,
             Self::Partial(why) | Self::Unavailable(why) | Self::Blocked(why) => Some(why.clone()),
-            Self::Waiting => Some("Waiting for telemetry.".to_owned()),
-            Self::NotWatched => {
-                Some("Not watched in the background: its watch mode is On view.".to_owned())
-            }
+            Self::Waiting => Some("Waiting for the first metrics.".to_owned()),
+            Self::NotWatched => Some(
+                "Not watched in the background: its watch mode is \"open views only\".".to_owned(),
+            ),
         }
     }
 }
