@@ -57,7 +57,7 @@ pub struct SettingsState {
     /// Whether edits wait for Save (the sidebar entry's dot).
     pub dirty: bool,
     /// The `settings.toml` keys of the edited fields.
-    pub edited: Vec<&'static str>,
+    pub edited: Vec<String>,
     /// The values shown: the file with the edits on top.
     pub appearance: &'static str,
     pub desktop_notifications: bool,

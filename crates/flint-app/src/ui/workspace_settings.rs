@@ -184,11 +184,7 @@ impl Workspace {
             return;
         }
         let writes = self.settings_page.draft.edits();
-        let reply = self
-            .model
-            .read(cx)
-            .core()
-            .write_settings(writes.iter().map(|c| c.to_write()).collect());
+        let reply = self.model.read(cx).core().write_settings(writes.clone());
         let written = writes.clone();
         let answer = cx.spawn_in(window, async move |this, cx| {
             let result = reply.await;

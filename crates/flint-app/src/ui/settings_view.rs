@@ -488,7 +488,7 @@ fn section_list(page: &SettingsPage, theme: &Theme) -> impl IntoElement {
         .border_r_1()
         .border_color(theme.border)
         .children(Section::ALL.map(|section| {
-            let edited = section.fields().iter().any(|f| page.draft.is_edited(*f));
+            let edited = section.fields().iter().any(|f| page.draft.is_edited(f));
             h_flex()
                 .w_full()
                 .gap_1()
@@ -520,7 +520,7 @@ fn section_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> AnyElem
             "Appearance",
             "Flint Light, Flint Dark, or whichever the system uses. View > Appearance changes it at \
              once; here it changes on Save.",
-            draft.is_edited(Field::Appearance),
+            draft.is_edited(&Field::Appearance),
             theme,
         )
         .child(
@@ -550,7 +550,7 @@ fn section_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> AnyElem
             "Desktop notifications",
             "Post a notification when a watched cluster has a new problem. Only clusters that \
              watch all kinds are covered. Per-cluster choices stay in the Alerts menu.",
-            draft.is_edited(Field::DesktopNotifications),
+            draft.is_edited(&Field::DesktopNotifications),
             theme,
         )
         .child(
@@ -572,7 +572,7 @@ fn section_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> AnyElem
             "Which kinds are watched on the active cluster. All kinds keeps the overview, \
              problems and alerts live; Open views only watches a kind while a view shows it. A \
              cluster's own choice, made from its header, overrides this.",
-            draft.is_edited(Field::WatchMode),
+            draft.is_edited(&Field::WatchMode),
             theme,
         )
         .child(

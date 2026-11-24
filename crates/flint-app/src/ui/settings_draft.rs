@@ -9,79 +9,15 @@
 //! when the file changes under a pending draft ([`SettingsDraft::changed_on_disk`]), the view
 //! says so and offers Reload or Save anyway.
 //!
-//! A slice that adds a setting adds a [`Field`] and a [`Change`] variant; nothing else here
-//! changes.
+//! An edit is the core's own [`SettingsWrite`] (here [`Change`]), keyed by its
+//! [`SettingsField`] (here [`Field`]): a slice that adds a setting extends those in
+//! `flint_core::settings`, and nothing here changes.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use flint_core::settings::SettingsWrite;
-use flint_core::{Appearance, Settings, WatchMode};
-
-/// A setting the Settings view edits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Field {
-    Appearance,
-    DesktopNotifications,
-    WatchMode,
-}
-
-impl Field {
-    /// The `settings.toml` key it is stored under.
-    #[cfg(any(test, feature = "automation"))]
-    pub fn key(self) -> &'static str {
-        match self {
-            Field::Appearance => "appearance",
-            Field::DesktopNotifications => "desktop_notifications",
-            Field::WatchMode => "watch_mode",
-        }
-    }
-}
-
-/// One edit: a field and the value it gets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Change {
-    Appearance(Appearance),
-    DesktopNotifications(bool),
-    /// The global watch mode. A cluster's own override is not this.
-    WatchMode(WatchMode),
-}
-
-impl Change {
-    pub fn field(&self) -> Field {
-        match self {
-            Change::Appearance(_) => Field::Appearance,
-            Change::DesktopNotifications(_) => Field::DesktopNotifications,
-            Change::WatchMode(_) => Field::WatchMode,
-        }
-    }
-
-    /// Whether `settings` already have this value.
-    pub fn holds_in(&self, settings: &Settings) -> bool {
-        match *self {
-            Change::Appearance(a) => settings.appearance == a,
-            Change::DesktopNotifications(on) => settings.desktop_notifications == on,
-            Change::WatchMode(m) => settings.watch_mode == m,
-        }
-    }
-
-    /// The core's write for it.
-    pub fn to_write(self) -> SettingsWrite {
-        match self {
-            Change::Appearance(a) => SettingsWrite::Appearance(a),
-            Change::DesktopNotifications(on) => SettingsWrite::DesktopNotifications(on),
-            Change::WatchMode(m) => SettingsWrite::WatchMode(m),
-        }
-    }
-
-    fn apply(&self, settings: &mut Settings) {
-        match *self {
-            Change::Appearance(a) => settings.appearance = a,
-            Change::DesktopNotifications(on) => settings.desktop_notifications = on,
-            Change::WatchMode(m) => settings.watch_mode = m,
-        }
-    }
-}
+use flint_core::Settings;
+pub use flint_core::settings::{SettingsField as Field, SettingsWrite as Change};
 
 /// The edits not saved yet, and the file they were made over.
 #[derive(Debug, Clone, Default)]
@@ -115,14 +51,14 @@ impl SettingsDraft {
     }
 
     /// Whether `field` has an edit.
-    pub fn is_edited(&self, field: Field) -> bool {
-        self.edits.contains_key(&field)
+    pub fn is_edited(&self, field: &Field) -> bool {
+        self.edits.contains_key(field)
     }
 
     /// The edited fields, in a stable order.
     #[cfg(any(test, feature = "automation"))]
-    pub fn edited(&self) -> impl Iterator<Item = Field> + '_ {
-        self.edits.keys().copied()
+    pub fn edited(&self) -> impl Iterator<Item = &Field> + '_ {
+        self.edits.keys()
     }
 
     /// What the view shows: `file` with the edits on top.
@@ -148,7 +84,7 @@ impl SettingsDraft {
 
     /// The edits to write (Save, Save anyway), in a stable order.
     pub fn edits(&self) -> Vec<Change> {
-        self.edits.values().copied().collect()
+        self.edits.values().cloned().collect()
     }
 
     /// Drops `written`, now in the file, from the draft. An edit changed since is kept.

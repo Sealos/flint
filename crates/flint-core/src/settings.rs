@@ -1324,9 +1324,31 @@ pub fn set_desktop_notifications(dir: &Path, enabled: bool) -> Result<Settings, 
     })
 }
 
-/// One global setting, written on its own through its setter: what the app's Settings view
-/// saves ([`crate::CoreHandle::write_settings`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a [`SettingsWrite`] changes. Two writes of one field replace each other, so the app's
+/// Settings draft keeps one edit per field.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SettingsField {
+    Appearance,
+    DesktopNotifications,
+    WatchMode,
+}
+
+impl SettingsField {
+    /// Where it is stored in `settings.toml`.
+    pub fn key(&self) -> String {
+        match self {
+            SettingsField::Appearance => "appearance".to_owned(),
+            SettingsField::DesktopNotifications => "desktop_notifications".to_owned(),
+            SettingsField::WatchMode => "watch_mode".to_owned(),
+        }
+    }
+}
+
+/// One setting, written on its own through its setter: what the app's Settings view holds in
+/// its draft and saves ([`crate::CoreHandle::write_settings`]).
+///
+/// A new setting adds a variant with its arm in each method, and a [`SettingsField`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsWrite {
     Appearance(Appearance),
     DesktopNotifications(bool),
@@ -1335,8 +1357,17 @@ pub enum SettingsWrite {
 }
 
 impl SettingsWrite {
+    /// The field it changes.
+    pub fn field(&self) -> SettingsField {
+        match self {
+            SettingsWrite::Appearance(_) => SettingsField::Appearance,
+            SettingsWrite::DesktopNotifications(_) => SettingsField::DesktopNotifications,
+            SettingsWrite::WatchMode(_) => SettingsField::WatchMode,
+        }
+    }
+
     /// What it changes, for an error message.
-    pub fn what(self) -> &'static str {
+    pub fn what(&self) -> &'static str {
         match self {
             SettingsWrite::Appearance(_) => "the appearance",
             SettingsWrite::DesktopNotifications(_) => "desktop notifications",
@@ -1344,12 +1375,30 @@ impl SettingsWrite {
         }
     }
 
-    /// Writes it to `settings.toml` in `dir`, through the same setter the other controls use.
-    pub fn write(self, dir: &Path) -> Result<Settings, SettingsError> {
+    /// Whether `settings` already hold it, so writing it would change nothing.
+    pub fn holds_in(&self, settings: &Settings) -> bool {
         match self {
-            SettingsWrite::Appearance(a) => set_appearance(dir, a),
-            SettingsWrite::DesktopNotifications(on) => set_desktop_notifications(dir, on),
-            SettingsWrite::WatchMode(m) => set_watch_mode(dir, None, Some(m)),
+            SettingsWrite::Appearance(a) => settings.appearance == *a,
+            SettingsWrite::DesktopNotifications(on) => settings.desktop_notifications == *on,
+            SettingsWrite::WatchMode(m) => settings.watch_mode == *m,
+        }
+    }
+
+    /// Applies it to `settings` in memory, as [`SettingsWrite::write`] does to the file.
+    pub fn apply(&self, settings: &mut Settings) {
+        match self {
+            SettingsWrite::Appearance(a) => settings.appearance = *a,
+            SettingsWrite::DesktopNotifications(on) => settings.desktop_notifications = *on,
+            SettingsWrite::WatchMode(m) => settings.watch_mode = *m,
+        }
+    }
+
+    /// Writes it to `settings.toml` in `dir`, through the same setter the other controls use.
+    pub fn write(&self, dir: &Path) -> Result<Settings, SettingsError> {
+        match self {
+            SettingsWrite::Appearance(a) => set_appearance(dir, *a),
+            SettingsWrite::DesktopNotifications(on) => set_desktop_notifications(dir, *on),
+            SettingsWrite::WatchMode(m) => set_watch_mode(dir, None, Some(*m)),
         }
     }
 }
@@ -2868,6 +2917,38 @@ mod tests {
         assert!(!text.contains("appearance"), "{text}");
         assert!(text.contains("future_key"), "{text}");
         assert!(!text.contains("cluster_watch_mode"), "{text}");
+    }
+
+    /// Every write, applied in memory, gives the settings it writes to the file, which then
+    /// hold it.
+    fn assert_apply_matches_write(file: &str, writes: &[SettingsWrite]) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SETTINGS_FILE), file).unwrap();
+        let mut in_memory = load_settings(dir.path()).unwrap();
+        for write in writes {
+            write.apply(&mut in_memory);
+            let written = write.write(dir.path()).unwrap();
+            assert_eq!(in_memory, written, "{write:?}");
+            assert!(write.holds_in(&written), "{write:?}");
+        }
+    }
+
+    #[test]
+    fn a_settings_write_applies_in_memory_as_it_writes() {
+        assert_apply_matches_write(
+            "future_key = 1\n",
+            &[
+                SettingsWrite::Appearance(Appearance::Dark),
+                SettingsWrite::DesktopNotifications(true),
+                SettingsWrite::WatchMode(WatchMode::OnView),
+                SettingsWrite::WatchMode(WatchMode::All),
+            ],
+        );
+        assert!(!SettingsWrite::Appearance(Appearance::Dark).holds_in(&Settings::default()));
+        assert_eq!(
+            SettingsWrite::WatchMode(WatchMode::OnView).field().key(),
+            "watch_mode"
+        );
     }
 
     // covers UP-32
