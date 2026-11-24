@@ -46,13 +46,15 @@ fn unused_root() -> PathBuf {
 fn target(dir: &Path) -> HelmTarget {
     let merged = config(CONFIG);
     let pin = pin_for(&merged);
-    HelmTarget::new(
+    // No proxy, whatever this process's environment holds.
+    HelmTarget::new_in(
         &merged,
         "dev",
         pin,
         credential(CredentialSource::Definition),
         None,
         runs_root(dir),
+        &ProxyEnvironment::default(),
     )
     .unwrap()
 }
@@ -226,6 +228,83 @@ fn release() -> ReleaseRef {
     ReleaseRef::new("web", "apps").unwrap()
 }
 
+// A list asks for pending releases too, which Helm 3 leaves out unless told to, and keeps their
+// status.
+#[tokio::test]
+async fn the_list_includes_pending_releases() {
+    let dir = tempfile::tempdir().unwrap();
+    let helm = fake_helm(
+        dir.path(),
+        "printf '[{\"name\":\"web\",\"namespace\":\"apps\",\"revision\":\"2\",\"status\":\"pending-upgrade\",\"chart\":\"web-1.0\"}]'",
+    );
+    let output = run_at(&helm, &target(dir.path()), &HelmQuery::List)
+        .await
+        .unwrap();
+    let HelmOutput::Releases { releases, .. } = output else {
+        panic!("a list");
+    };
+    assert_eq!(releases[0].status, "pending-upgrade");
+    let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
+    assert!(args.lines().any(|a| a == "--pending"));
+}
+
+// The proxy Flint's own connection takes is the proxy `helm` gets.
+#[tokio::test]
+async fn a_run_gets_the_connections_proxy() {
+    let dir = tempfile::tempdir().unwrap();
+    let helm = fake_helm(dir.path(), "printf '[]'");
+    let merged = config(CONFIG);
+    let environment = ProxyEnvironment {
+        https_proxy: Some("http://proxy.example:3128".into()),
+        no_proxy: Some("other".into()),
+    };
+    let target = HelmTarget::new_in(
+        &merged,
+        "dev",
+        pin_for(&merged),
+        credential(CredentialSource::Definition),
+        None,
+        runs_root(dir.path()),
+        &environment,
+    )
+    .unwrap();
+    run_at(&helm, &target, &HelmQuery::List).await.unwrap();
+    let env = std::fs::read_to_string(dir.path().join("env")).unwrap();
+    assert!(
+        env.lines()
+            .any(|l| l == "HTTPS_PROXY=http://proxy.example:3128")
+    );
+    assert!(env.lines().any(|l| l == "NO_PROXY=other"));
+}
+
+// A cluster's own `proxy-url` wins over the environment's, as for Flint's connection.
+#[test]
+fn a_cluster_proxy_url_wins_over_the_environment() {
+    let yaml = CONFIG.replace(
+        "server: https://pinned:6443",
+        "server: https://pinned:6443\n    proxy-url: http://cluster-proxy:3128",
+    );
+    let merged = config(&yaml);
+    let environment = ProxyEnvironment {
+        https_proxy: Some("http://env-proxy:3128".into()),
+        no_proxy: None,
+    };
+    let target = HelmTarget::new_in(
+        &merged,
+        "dev",
+        pin_for(&merged),
+        credential(CredentialSource::Definition),
+        None,
+        unused_root(),
+        &environment,
+    )
+    .unwrap();
+    assert_eq!(
+        target.proxy,
+        [("HTTPS_PROXY", "http://cluster-proxy:3128".to_owned())]
+    );
+}
+
 // A run gets a list of arguments, nothing of Flint's environment, and a kubeconfig holding only
 // the pinned context, whatever the person's current context is.
 #[tokio::test]
@@ -251,11 +330,19 @@ async fn a_run_is_pinned_and_gets_a_minimal_environment() {
     let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
     let args: Vec<&str> = args.lines().collect();
     assert_eq!(
-        args[..4],
-        ["list", "--all-namespaces", "--max=1000", "--output=json"]
+        args[..7],
+        [
+            "list",
+            "--all-namespaces",
+            "--deployed",
+            "--failed",
+            "--pending",
+            "--max=1000",
+            "--output=json"
+        ]
     );
-    assert_eq!(args[4], "--kube-context=dev");
-    assert!(args[5].starts_with("--kubeconfig="));
+    assert_eq!(args[7], "--kube-context=dev");
+    assert!(args[8].starts_with("--kubeconfig="));
 
     let env = std::fs::read_to_string(dir.path().join("env")).unwrap();
     let names: std::collections::BTreeSet<&str> =

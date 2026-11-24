@@ -54,8 +54,8 @@ use super::registry::{
     self, AddNamespace, BackToList, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, EditYaml,
     ExposeToAi, FocusFilter, HideFromAi, LockCluster, OnView, OpenClusterOverview, OpenObject,
     OpenView, RenameCluster, RetryConnection, SelectCluster, SelectRow, ShowAgentActivity,
-    ShowAllNamespaces, ToggleKeepWatching, ToggleNamespace, TrustCluster, UnlockCluster,
-    UntrustCluster, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
+    ShowAllNamespaces, ShowHelmReleases, ToggleKeepWatching, ToggleNamespace, TrustCluster,
+    UnlockCluster, UntrustCluster, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::resource_actions;
 use super::row_menu;
@@ -2010,6 +2010,11 @@ impl Workspace {
             if !has_server {
                 return menu;
             }
+            let menu = menu.item(PopupMenuItem::new("Helm Releases…").on_click(
+                registry::on_click(ShowHelmReleases {
+                    cluster: rename.clone(),
+                }),
+            ));
             let menu = menu.item(
                 PopupMenuItem::new(keep_watching::toggle_label(keep, keep_sign_in)).on_click(
                     registry::on_click(ToggleKeepWatching {
