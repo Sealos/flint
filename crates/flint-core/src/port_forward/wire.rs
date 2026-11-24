@@ -38,6 +38,8 @@ const PIPE: usize = 64 * 1024;
 const CHUNK: usize = 32 * 1024;
 /// The most one relay can have queued: a message being assembled, and its next frame unread.
 const QUEUED_PER_RELAY: usize = 2 * MAX_MESSAGE + READ_BUFFER + MAX_WRITE_BUFFER + 2 * PIPE + CHUNK;
+/// How long the pod's side may keep answering after the local side has stopped sending.
+const HALF_CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 /// The most all relays together can have queued.
 const QUEUED_BYTES: usize = 128 * 1024 * 1024;
 const _: () = assert!(MAX_RELAYS * QUEUED_PER_RELAY <= QUEUED_BYTES);
@@ -211,7 +213,9 @@ where
 }
 
 /// Moves bytes between the WebSocket and `pipe` until the server ends it, or the local side has
-/// closed and the server has answered. Each direction waits for its reader, so nothing queues.
+/// closed and the server has answered or [`HALF_CLOSE_WAIT`] has passed. A local half-close keeps
+/// the pod's direction open, since a WebSocket close would cut off a reply still in flight. Each
+/// direction waits for its reader, so nothing queues.
 async fn pump<S>(ws: WebSocketStream<S>, pipe: DuplexStream, port: u16, failed: oneshot::Sender<()>)
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -264,15 +268,20 @@ where
                 .await
                 .is_err()
             {
-                return;
+                return None;
             }
         }
-        let _ = sink.send(Message::Close(None)).await;
+        Some(sink)
     };
     tokio::pin!(from_pod, to_pod);
     tokio::select! {
         () = &mut from_pod => {}
-        () = &mut to_pod => from_pod.await,
+        sink = &mut to_pod => {
+            let Some(mut sink) = sink else { return from_pod.await };
+            // The local side is done sending; let the pod finish its reply, then close.
+            let _ = tokio::time::timeout(HALF_CLOSE_WAIT, &mut from_pod).await;
+            let _ = sink.send(Message::Close(None)).await;
+        }
     }
 }
 
@@ -303,6 +312,38 @@ mod tests {
         let mut back = [0; 4];
         tunnel.stream.read_exact(&mut back).await.unwrap();
         assert_eq!(&back, b"pong");
+    }
+
+    #[tokio::test]
+    async fn a_reply_after_the_local_side_stops_sending_is_carried() {
+        let (mut server, mut tunnel) = server_and_tunnel().await;
+        tunnel.stream.write_all(b"ping").await.unwrap();
+        tunnel.stream.shutdown().await.unwrap();
+        let got = server.next().await.unwrap().unwrap();
+        assert_eq!(got.into_data().as_ref(), b"\0ping");
+        // The server sees no close yet, so it can still answer.
+        let waiting = tokio::time::timeout(std::time::Duration::from_millis(200), server.next());
+        assert!(waiting.await.is_err(), "no close is sent while it may answer");
+        let mut frame = vec![0];
+        frame.extend_from_slice(b"pong");
+        server.send(Message::binary(frame)).await.unwrap();
+        server.send(Message::Close(None)).await.unwrap();
+        let mut back = Vec::new();
+        tunnel.stream.read_to_end(&mut back).await.unwrap();
+        assert_eq!(back, b"pong");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_server_is_closed_after_the_wait() {
+        let (mut server, mut tunnel) = server_and_tunnel().await;
+        tunnel.stream.shutdown().await.unwrap();
+        let closed = loop {
+            match server.next().await {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break true,
+                Some(Ok(_)) => {}
+            }
+        };
+        assert!(closed);
     }
 
     #[tokio::test]
