@@ -213,6 +213,14 @@ impl Workspace {
         if self.nav.read(cx).focus_handle().is_focused(window) {
             return Focus::Navigation;
         }
+        if let Some((overview, _)) = &self.dashboard
+            && overview
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+        {
+            return Focus::Overview;
+        }
         if self
             .palette
             .as_ref()

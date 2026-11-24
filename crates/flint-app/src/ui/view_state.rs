@@ -101,6 +101,8 @@ pub enum Focus {
     Navigation,
     /// The detail pane, outside its YAML editor.
     Detail,
+    /// The cluster overview: its panel or one of its links.
+    Overview,
     /// The resource list's rows.
     List,
     /// The list's text filter.
@@ -328,6 +330,9 @@ pub struct NavEntryState {
     pub marker: Option<&'static str>,
     /// With a cluster set open, how many members serve it (`2/3`), unless all of them do.
     pub badge: Option<String>,
+    /// Objects with problems (`3`), `3+` with clusters unchecked, or `?` when none could be
+    /// checked. Absent when every cluster was checked and has none.
+    pub problems: Option<String>,
 }
 
 /// The open resource list.
@@ -350,6 +355,8 @@ pub struct ListState {
     pub filter: String,
     pub sort: Option<SortState>,
     pub wide: bool,
+    /// The Problems toggle is on.
+    pub problems_only: bool,
     /// What replaces the rows, if anything: `loading`, `unavailable`, `failed`,
     /// `reconnecting`, `empty` or `no_match`.
     pub placeholder: Option<&'static str>,

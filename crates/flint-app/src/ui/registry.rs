@@ -48,8 +48,9 @@ pub use super::compare::{
 pub use super::dashboard::set::{OpenSetMember, OpenSetProblem};
 use super::list::combined::{
     SelectCombinedRow, ShowAllCombinedRows, SortCombined, ToggleClusterFilter, ToggleClusterGroup,
-    ToggleCombinedWide, ToggleGroupByCluster,
+    ToggleCombinedProblems, ToggleCombinedWide, ToggleGroupByCluster,
 };
+pub use super::pending_threshold::SetPendingThreshold;
 
 actions!(
     flint,
@@ -182,6 +183,8 @@ actions!(
         CloseDetail,
         /// Show or hide the extra `-o wide` columns.
         ToggleWide,
+        /// Show only the rows with problems.
+        ToggleProblemsOnly,
         /// Move focus to the list's text filter.
         FocusFilter,
         /// Move focus from the list's text filter back to its rows (Esc or Enter there).
@@ -394,6 +397,40 @@ pub struct EditAiScope {
 pub struct ShowAgentActivity {
     pub cluster: String,
 }
+
+/// Show a cluster's Helm releases, read-only, in a dock tab: details, history, values with
+/// secrets masked, and the manifest.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = workspace, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct ShowHelmReleases {
+    pub cluster: String,
+}
+
+/// Select a release in the Helm releases tab shown, as clicking it does.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = workspace, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct SelectHelmRelease {
+    pub namespace: String,
+    pub name: String,
+}
+
+actions!(
+    workspace,
+    [
+        /// Read the releases in the Helm releases tab again.
+        RefreshHelmReleases,
+        /// Show the selected Helm release's details.
+        ShowHelmDetails,
+        /// Show the selected Helm release's history.
+        ShowHelmHistory,
+        /// Show the selected Helm release's values, with secrets masked.
+        ShowHelmValues,
+        /// Show the selected Helm release's manifest, with secrets masked.
+        ShowHelmManifest,
+    ]
+);
 
 actions!(
     ai_scope,
@@ -1718,6 +1755,8 @@ impl<E: InteractiveElement, W: 'static, V: 'static> Bind<V> for ForwardCurrent<E
 pub const WORKSPACE: &str = "Workspace";
 /// Plain keys (arrows, Esc) work in the window, but not while typing in a field.
 const PLAIN: &str = "Workspace && !Input";
+/// On the cluster overview, outside a text field.
+const DASHBOARD_PLAIN: &str = "Dashboard && !Input";
 /// The same, for the list: deeper than the workspace, so it wins there.
 const LIST_ALONE: &str = "ResourceList && !Input";
 /// The list's text filter.
@@ -1864,6 +1903,20 @@ const CLUSTER_ALERTS: &[Arg] = &[
         ArgKind::Choice(&["default", "on", "off"]),
     ),
 ];
+const PENDING_THRESHOLD: &[Arg] = &[
+    Arg {
+        name: "cluster",
+        description: "kubeconfig context name; all clusters when left out",
+        required: false,
+        kind: ArgKind::Cluster,
+    },
+    Arg {
+        name: "seconds",
+        description: "seconds from 1 to 86400; clears the value when left out",
+        required: false,
+        kind: ArgKind::Number,
+    },
+];
 const COMPARE_OBJECT: &[Arg] = &[
     arg("cluster", "kubeconfig context name", ArgKind::Cluster),
     arg("kind", "the kind, as plural or plural.group", ArgKind::Text),
@@ -1982,6 +2035,10 @@ const ROW: &[Arg] = &[
         kind: ArgKind::Namespace,
     },
     arg("name", "object name", ArgKind::Text),
+];
+const HELM_RELEASE: &[Arg] = &[
+    arg("namespace", "the release's namespace", ArgKind::Namespace),
+    arg("name", "release name", ArgKind::Text),
 ];
 const COLUMN: &[Arg] = &[
     arg("column", "column name, as drawn: Restarts", ArgKind::Column),
@@ -2109,6 +2166,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Set Cluster Alerts…",
             "Choose whether one cluster posts desktop notifications.",
             CLUSTER_ALERTS,
+        )
+        .of(C::Flint, S::App)
+        .hidden(),
+        Spec::with_args::<SetPendingThreshold>(
+            "Set Pending Pod Threshold…",
+            "Choose how long a pod may stay Pending before it counts as a problem.",
+            PENDING_THRESHOLD,
         )
         .of(C::Flint, S::App)
         .hidden(),
@@ -2252,6 +2316,38 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Show Agent Activity…",
             "See every call AI agents made to Flint's MCP server on a cluster, as they make them.",
             CLUSTER,
+        )
+        .of(C::Cluster, S::Workspace),
+        Spec::with_args::<ShowHelmReleases>(
+            "Show Helm Releases…",
+            "See a cluster's Helm releases: details, history, masked values and manifest.",
+            CLUSTER,
+        )
+        .of(C::Cluster, S::Workspace),
+        Spec::with_args::<SelectHelmRelease>(
+            "Select Helm Release…",
+            "Select a release in the Helm releases tab.",
+            HELM_RELEASE,
+        )
+        .of(C::Cluster, S::Workspace)
+        .hidden(),
+        Spec::unit::<RefreshHelmReleases>(
+            "Refresh Helm Releases",
+            "Read the releases in the Helm releases tab again.",
+        )
+        .of(C::Cluster, S::Workspace),
+        Spec::unit::<ShowHelmDetails>("Show Helm Details", "Show the selected release's details.")
+            .of(C::Cluster, S::Workspace),
+        Spec::unit::<ShowHelmHistory>("Show Helm History", "Show the selected release's history.")
+            .of(C::Cluster, S::Workspace),
+        Spec::unit::<ShowHelmValues>(
+            "Show Helm Values",
+            "Show the selected release's values, with secrets masked.",
+        )
+        .of(C::Cluster, S::Workspace),
+        Spec::unit::<ShowHelmManifest>(
+            "Show Helm Manifest",
+            "Show the selected release's manifest, with secrets masked.",
         )
         .of(C::Cluster, S::Workspace),
         Spec::unit::<ScopeAllNamespaces>(
@@ -2399,6 +2495,21 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         )
         .of(C::View, S::Dashboard)
         .hidden(),
+        // Tab moves between panes, so the arrows move between the overview's links.
+        Spec::unit::<super::dashboard::FocusNextLink>(
+            "Focus Next Overview Link",
+            "Move focus to the next link on the cluster overview.",
+        )
+        .of(C::View, S::Dashboard)
+        .keys(&["down"], Some(DASHBOARD_PLAIN))
+        .hidden(),
+        Spec::unit::<super::dashboard::FocusPreviousLink>(
+            "Focus Previous Overview Link",
+            "Move focus to the previous link on the cluster overview.",
+        )
+        .of(C::View, S::Dashboard)
+        .keys(&["up"], Some(DASHBOARD_PLAIN))
+        .hidden(),
         Spec::with_args::<ToggleNavSection>(
             "Toggle Navigation Section…",
             "Open or close a section of the resource navigation.",
@@ -2544,6 +2655,11 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Show or hide the extra columns of kubectl get -o wide.",
         )
         .of(C::List, S::List),
+        Spec::unit::<ToggleProblemsOnly>(
+            "Toggle Problems Only",
+            "Show only the rows with problems, in a list of pods, workloads or nodes.",
+        )
+        .of(C::List, S::List),
         Spec::unit::<CloseDetail>(
             "Clear Selection",
             "Clear the selection, which closes the detail pane.",
@@ -2679,6 +2795,11 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<ToggleCombinedWide>(
             "Toggle Wide Combined Columns",
             "Show or hide the combined list's extra columns.",
+        )
+        .of(C::List, S::CombinedList),
+        Spec::unit::<ToggleCombinedProblems>(
+            "Toggle Combined Problems Only",
+            "Show only the combined list's rows with problems.",
         )
         .of(C::List, S::CombinedList),
         Spec::unit::<ShowAllCombinedRows>(

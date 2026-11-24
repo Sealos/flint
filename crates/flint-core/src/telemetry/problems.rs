@@ -2,11 +2,13 @@
 //! summariser, on every change and on a timer as grace periods pass.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use jiff::Timestamp;
 use tokio::sync::watch;
 
 use super::capacity::{Inventory, capacity_of};
+use super::checked::CheckedObjects;
 use super::objects::Stores;
 use super::{
     Availability, CheckFailure, KindCheck, MetricsCheck, Shared, TelemetrySnapshot,
@@ -16,13 +18,14 @@ use crate::dashboard::{ProblemCategory, ProblemSnapshot, ProblemSummariser};
 use crate::problems::{Classifier, Problem, ProblemKind, ReplicaSetIndex, ReplicaSetRead};
 
 /// Every kind of problem.
-pub(super) const ALL_PROBLEM_KINDS: [ProblemKind; 6] = [
+pub(super) const ALL_PROBLEM_KINDS: [ProblemKind; 7] = [
     ProblemKind::CrashLoop,
     ProblemKind::OomKilled,
     ProblemKind::NodeNotReady,
     ProblemKind::JobFailed,
     ProblemKind::ImagePull,
     ProblemKind::WorkloadShort,
+    ProblemKind::PodPending,
 ];
 
 /// Publishes a snapshot after each change, at most once per [`TelemetryTiming::evaluate_gap`].
@@ -51,6 +54,7 @@ pub(super) async fn run(
                 metrics,
                 version,
                 Timestamp::now(),
+                shared.pending_after.load(Ordering::Relaxed),
             )
         };
         sender.send_if_modified(|current| {
@@ -70,8 +74,9 @@ fn evaluate(
     metrics: MetricsCheck,
     version: VersionCheck,
     now: Timestamp,
+    pending_after: u32,
 ) -> TelemetrySnapshot {
-    let classifier = Classifier::new(Arc::clone(cluster), now);
+    let classifier = Classifier::new(Arc::clone(cluster), now).with_pending_after(pending_after);
     let read = stores
         .replica_sets
         .current()
@@ -117,6 +122,13 @@ fn evaluate(
         .filter(|problem| summariser.is_settling(problem, now))
         .map(|problem| problem.id.clone())
         .collect();
+    let mut checked = CheckedObjects::default();
+    checked.record(WatchedKind::Pods, stores.pods.current());
+    checked.record(WatchedKind::Nodes, stores.nodes.current());
+    checked.record(WatchedKind::Jobs, stores.jobs.current());
+    checked.record(WatchedKind::Deployments, stores.deployments.current());
+    checked.record(WatchedKind::StatefulSets, stores.stateful_sets.current());
+    checked.record(WatchedKind::DaemonSets, stores.daemon_sets.current());
     TelemetrySnapshot {
         cluster: Arc::clone(cluster),
         at: now,
@@ -125,6 +137,7 @@ fn evaluate(
         problems: problems.into(),
         unchecked,
         settling,
+        checked: Arc::new(checked),
         counts,
         metrics,
         capacity: capacity_of(stores),
@@ -224,7 +237,120 @@ mod tests {
             MetricsCheck::Waiting,
             VersionCheck::Waiting,
             now(),
+            60,
         )
+    }
+
+    fn pending_pod(created: Timestamp) -> k8s_openapi::api::core::v1::Pod {
+        serde_json::from_value(serde_json::json!({
+            "metadata": {
+                "name": "stuck", "namespace": "ns", "uid": "stuck-uid",
+                "creationTimestamp": created.to_string(),
+            },
+            "spec": {"containers": []},
+            "status": {"phase": "Pending"},
+        }))
+        .unwrap()
+    }
+
+    fn shared_with(stores: Stores, pending_after: u32) -> Arc<Shared> {
+        Arc::new(Shared {
+            stores: std::sync::Mutex::new(stores),
+            metrics: std::sync::Mutex::default(),
+            version: std::sync::Mutex::default(),
+            dirty: tokio::sync::Notify::new(),
+            pending_after: std::sync::atomic::AtomicU32::new(pending_after),
+        })
+    }
+
+    async fn wait_for_pending(latest: &mut watch::Receiver<Arc<TelemetrySnapshot>>, wanted: bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let found = latest
+                    .borrow_and_update()
+                    .problems
+                    .iter()
+                    .any(|p| p.kind() == ProblemKind::PodPending);
+                if found == wanted {
+                    return;
+                }
+                latest.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the pod's state to be picked up");
+    }
+
+    #[tokio::test]
+    async fn the_shared_timer_moves_a_pod_in_and_out_with_no_event() {
+        let created = Timestamp::now() - jiff::SignedDuration::from_secs(1);
+        let mut stores = all_current();
+        stores.pods.replace(vec![(pending_pod(created), None)]);
+        let shared = shared_with(stores, 2);
+        let first = Arc::new(TelemetrySnapshot::starting("one".into(), Timestamp::now()));
+        let (sender, mut latest) = watch::channel(first);
+        let timing = TelemetryTiming {
+            evaluate_every: std::time::Duration::from_millis(50),
+            evaluate_gap: std::time::Duration::from_millis(1),
+            ..TelemetryTiming::default()
+        };
+        let task = tokio::spawn(run("one".into(), Arc::clone(&shared), sender, timing));
+        wait_for_pending(&mut latest, true).await;
+
+        // Stops being Pending, and nothing says so but the next tick.
+        let mut running = pending_pod(created);
+        running.status.as_mut().unwrap().phase = Some("Running".to_owned());
+        shared.stores().pods.replace(vec![(running, None)]);
+        wait_for_pending(&mut latest, false).await;
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_changed_threshold_applies_to_a_running_feed() {
+        let created = Timestamp::now() - jiff::SignedDuration::from_secs(30);
+        let mut stores = all_current();
+        stores.pods.replace(vec![(pending_pod(created), None)]);
+        let shared = shared_with(stores, 60);
+        let first = Arc::new(TelemetrySnapshot::starting("one".into(), Timestamp::now()));
+        let (sender, mut latest) = watch::channel(first);
+        // The timer is out of reach, so only the change can wake the pass.
+        let timing = TelemetryTiming {
+            evaluate_every: std::time::Duration::from_secs(3600),
+            evaluate_gap: std::time::Duration::from_millis(1),
+            ..TelemetryTiming::default()
+        };
+        let task = tokio::spawn(run("one".into(), Arc::clone(&shared), sender, timing));
+        wait_for_pending(&mut latest, false).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        shared.pending_after.store(10, Ordering::Relaxed);
+        shared.dirty.notify_one();
+        wait_for_pending(&mut latest, true).await;
+
+        shared.pending_after.store(120, Ordering::Relaxed);
+        shared.dirty.notify_one();
+        wait_for_pending(&mut latest, false).await;
+        task.abort();
+    }
+
+    #[test]
+    fn ten_thousand_pending_pods_are_judged_in_one_bounded_pass() {
+        let created = now() - jiff::SignedDuration::from_secs(120);
+        let pods = (0..10_000)
+            .map(|i| {
+                let mut pod = pending_pod(created);
+                pod.metadata.name = Some(format!("pod-{i}"));
+                pod.metadata.uid = Some(format!("uid-{i}"));
+                (pod, None)
+            })
+            .collect();
+        let mut stores = all_current();
+        stores.pods.replace(pods);
+        let started = std::time::Instant::now();
+        let snapshot = pass(&stores);
+        assert_eq!(snapshot.problems.len(), 10_000);
+        assert!(snapshot.checked.contains(WatchedKind::Pods, "uid-9999"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     fn not_ready_node() -> Node {
