@@ -19,7 +19,7 @@ use crate::credential::{CredentialSource, WriteCredential};
 use crate::discovery::ClusterDiscovery;
 use crate::handle::{
     ActivationRefused, ClusterSummary, ClustersSnapshot, Command, ConnectionState, CoreConfig,
-    Event, ReadPin, Request,
+    Event, ReadPin, Request, SlotBinding,
 };
 use crate::kubeconfig::{
     self, BlankFile, ContextInfo, FileRead, KubeconfigReader, LoadedKubeconfig, ReadBusy,
@@ -975,9 +975,10 @@ impl ClusterManager {
             Request::BoundWriteClient {
                 cluster,
                 server,
+                on,
                 reply,
             } => {
-                let _ = reply.send(self.bound_write_client(&cluster, server));
+                let _ = reply.send(self.bound_write_client(&cluster, server, on));
             }
             Request::CheckWriteGate {
                 cluster,
@@ -2064,14 +2065,21 @@ impl ClusterManager {
     }
 
     /// [`Self::shell_client`] for one request of a reviewed write, with the credential of the
-    /// connection the client belongs to.
+    /// connection the client belongs to. With `on`, for a view's request: refused before any
+    /// client is built unless the context is still on that slot and definition.
     fn bound_write_client(
         &self,
         cluster: &str,
         server: Option<Option<String>>,
+        on: Option<SlotBinding>,
     ) -> Result<crate::handle::BoundWriteClient, WriteError> {
         if self.held(cluster) {
             return Err(WriteError::KubeconfigUnreadable);
+        }
+        if let Some(on) = on
+            && self.slot_binding(cluster) != Some(on)
+        {
+            return Err(WriteError::ConnectionChanged);
         }
         let (client, pin) =
             self.shell_client(cluster, server)
@@ -2086,6 +2094,17 @@ impl ClusterManager {
                 cluster: cluster.to_owned(),
             })?;
         Ok((client, pin, credential))
+    }
+
+    /// The slot and definition of `cluster` as a view shows them now
+    /// ([`ClusterSummary::slot_binding`]).
+    fn slot_binding(&self, cluster: &str) -> Option<SlotBinding> {
+        let slot = self.cluster(cluster)?;
+        let shown = self.contexts.shown(cluster, slot.info.server.as_deref());
+        Some(SlotBinding {
+            generation: slot.generation,
+            definition: shown.definition,
+        })
     }
 
     /// The pin for a session opened on `cluster` now: to the server its slot shows (what a tab
@@ -5039,7 +5058,7 @@ mod tests {
         connect(&mut manager);
         assert_eq!(manager.shell_client("dev", None).err(), Some(unsettled));
         assert_eq!(
-            manager.bound_write_client("dev", None).err(),
+            manager.bound_write_client("dev", None, None).err(),
             Some(WriteError::KubeconfigUnreadable)
         );
 
@@ -5278,7 +5297,7 @@ mod tests {
         );
         assert_eq!(manager.launch_gate("dev", pin).err(), Some(not_connected));
         assert_eq!(
-            manager.bound_write_client("dev", None).err(),
+            manager.bound_write_client("dev", None, None).err(),
             Some(WriteError::KubeconfigUnreadable)
         );
         assert_eq!(
@@ -7941,7 +7960,7 @@ users:
             Some(not_connected.clone())
         );
         assert!(matches!(
-            manager.bound_write_client("dev", None).err(),
+            manager.bound_write_client("dev", None, None).err(),
             Some(WriteError::Refused(WriteRefusal::NotConnected { .. }))
         ));
 
@@ -7958,7 +7977,7 @@ users:
             })
         );
         assert!(matches!(
-            manager.bound_write_client("dev", None).err(),
+            manager.bound_write_client("dev", None, None).err(),
             Some(WriteError::KubeconfigUnreadable)
         ));
     }
@@ -8045,7 +8064,7 @@ users:
             })
         );
         assert!(matches!(
-            manager.bound_write_client("dev", None).err(),
+            manager.bound_write_client("dev", None, None).err(),
             Some(WriteError::KubeconfigUnreadable)
         ));
 

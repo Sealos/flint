@@ -19,7 +19,7 @@ Behaviour that is accepted for now. Each entry says what happens and what stays 
 
 ## Alerts and confirmations
 
-- **Alerts can fire for Pending pods.** A pod that stays Pending for over a minute counts as a problem, like in the
+- **Alerts can fire for Pending pods.** A pod that stays Pending for over five minutes counts as a problem, like in the
   dashboard.
 - **On view still watches the seven problem kinds.** The selected cluster and open set members run the problem feed
   in either watch mode, under the same per-kind cap of 50,000 objects. A member whose sign-in runs a program runs it
