@@ -22,6 +22,7 @@ use super::{
 };
 use crate::ui::registry;
 use flint_core::problems::ProblemSeverity;
+use flint_core::rollout::RolloutState;
 use flint_core::thresholds::ThresholdLevel;
 
 /// On a tile whose count includes objects still in their grace period.
@@ -649,7 +650,7 @@ pub fn warnings_section(
             })
             .into_any_element(),
     };
-    section("Recent Warning events", theme).child(body)
+    section("Recent activity", theme).child(body)
 }
 
 /// A row that opens its object, or plain text when the event names none exactly. Its id follows
@@ -692,7 +693,11 @@ fn warning_cells(row: &WarningRow, theme: &Theme) -> Div {
                 .w(px(128.))
                 .flex_none()
                 .truncate()
-                .text_color(theme.warning)
+                .text_color(match row.rollout {
+                    None | Some(RolloutState::Started | RolloutState::Progressing) => theme.warning,
+                    Some(RolloutState::Complete) => theme.success,
+                    Some(RolloutState::Stalled) => theme.danger,
+                })
                 .child(row.reason.clone()),
         )
         .child(

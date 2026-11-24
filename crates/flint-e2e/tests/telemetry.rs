@@ -392,3 +392,65 @@ async fn stopping_closes_every_watch_and_sends_nothing_more() {
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(server.requests().len(), after);
 }
+
+fn deployment_object(name: &str, status: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "apps/v1", "kind": "Deployment",
+        "metadata": {"name": name, "namespace": "demo", "uid": format!("uid-{name}"), "generation": 2},
+        "spec": {"replicas": 3, "selector": {}, "template": {}},
+        "status": status,
+    })
+}
+
+fn progressing(status: &str, reason: &str, minutes_ago: i64) -> serde_json::Value {
+    // The fake server shifts fixture times to its start, so write them relative to the fixtures.
+    let fixture_now = flint_e2e::fake_api::clock::FIXTURE_NOW_SECONDS;
+    let at = k8s_openapi::jiff::Timestamp::from_second(fixture_now - minutes_ago * 60).unwrap();
+    serde_json::json!({
+        "type": "Progressing", "status": status, "reason": reason,
+        "message": "deadline passed", "lastUpdateTime": at.to_string(),
+        "lastTransitionTime": at.to_string(),
+    })
+}
+
+#[tokio::test]
+async fn deployment_rollouts_come_from_the_watch_already_kept() {
+    use flint_core::rollout::RolloutState;
+    let server = FakeApiServer::start().await.unwrap();
+    let deployments = Gvr::new("apps", "v1", "deployments");
+    let status = |updated: i32, available: i32, condition: serde_json::Value| {
+        serde_json::json!({"observedGeneration": 2, "replicas": 3, "updatedReplicas": updated,
+                           "availableReplicas": available, "conditions": [condition]})
+    };
+    let rolling = status(1, 3, progressing("True", "ReplicaSetUpdated", 1));
+    let stuck = status(1, 2, progressing("False", "ProgressDeadlineExceeded", 5));
+    let done = status(3, 3, progressing("True", "NewReplicaSetAvailable", 2));
+    let old = status(3, 3, progressing("True", "NewReplicaSetAvailable", 600));
+    server.set_object(&deployments, deployment_object("rolling", rolling));
+    server.set_object(&deployments, deployment_object("stuck", stuck));
+    server.set_object(&deployments, deployment_object("done", done));
+    server.set_object(&deployments, deployment_object("long-ago", old));
+    let store = trends();
+    let mut feed = start(&server, &store).await;
+
+    let snapshot = until(&mut feed, "the rollouts", |s| {
+        let has = |name: &str| s.rollouts.iter().any(|r| r.name == name);
+        checked(s) && has("rolling") && has("stuck") && has("done")
+    })
+    .await;
+    let state_of = |name: &str| {
+        let matching: Vec<_> = snapshot
+            .rollouts
+            .iter()
+            .filter(|r| r.name == name)
+            .collect();
+        assert!(matching.len() <= 1, "{name} is one entry");
+        matching.first().map(|r| r.state)
+    };
+    assert_eq!(state_of("rolling"), Some(RolloutState::Progressing));
+    assert_eq!(state_of("stuck"), Some(RolloutState::Stalled));
+    assert_eq!(state_of("done"), Some(RolloutState::Complete));
+    assert_eq!(state_of("long-ago"), None, "{:#?}", snapshot.rollouts);
+    feed.stop().await;
+    assert!(server.writes().is_empty());
+}
