@@ -14,7 +14,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Resource;
 use serde::de::DeserializeOwned;
 
-use super::capacity::{ALLOCATABLE_KEYS, PodClaim, PodTally};
+use super::capacity::{ALLOCATABLE_KEYS, PodClaim, PodTally, PodTallySlot};
 use super::{KindCheck, WatchedKind};
 
 /// The most objects of one kind a feed holds.
@@ -30,6 +30,12 @@ fn key_of(meta: &ObjectMeta) -> Option<Key> {
     ))
 }
 
+#[derive(Debug)]
+struct StoreEntry<S> {
+    at: usize,
+    tally_slot: S,
+}
+
 /// The objects of one kind, in a slice as the classifier takes them.
 #[derive(Debug)]
 pub(super) struct KindStore<K: Tracked> {
@@ -37,7 +43,7 @@ pub(super) struct KindStore<K: Tracked> {
     items: Vec<K>,
     /// What the items add up to.
     totals: K::Totals,
-    index: HashMap<Key, usize>,
+    index: HashMap<Key, StoreEntry<K::TallySlot>>,
 }
 
 impl<K: Tracked> Default for KindStore<K> {
@@ -75,31 +81,45 @@ impl<K: Tracked> KindStore<K> {
     }
 
     /// Adds or replaces an object. `false` if that would pass [`MAX_OBJECTS_PER_KIND`].
-    pub(super) fn upsert(&mut self, mut item: K, extra: K::Extra) -> bool {
+    pub(super) fn upsert(&mut self, item: K, extra: K::Extra) -> bool {
         let Some(key) = key_of(item.meta()) else {
             return true;
         };
-        if let Some(&at) = self.index.get(&key) {
-            item.count(extra, &mut self.totals);
-            std::mem::replace(&mut self.items[at], item).uncount(&mut self.totals);
+        if let Some(entry) = self.index.get_mut(&key) {
+            let tally_slot = item.count(extra, &mut self.totals);
+            let old_slot = std::mem::replace(&mut entry.tally_slot, tally_slot);
+            self.items[entry.at] = item;
+            K::uncount(old_slot, &mut self.totals);
             return true;
         }
         if self.items.len() >= MAX_OBJECTS_PER_KIND {
             return false;
         }
-        item.count(extra, &mut self.totals);
-        self.index.insert(key, self.items.len());
+        let tally_slot = item.count(extra, &mut self.totals);
+        self.index.insert(
+            key,
+            StoreEntry {
+                at: self.items.len(),
+                tally_slot,
+            },
+        );
         self.items.push(item);
         true
     }
 
     pub(super) fn remove(&mut self, item: &K) {
-        let Some(at) = key_of(item.meta()).and_then(|key| self.index.remove(&key)) else {
+        let Some(StoreEntry { at, tally_slot }) =
+            key_of(item.meta()).and_then(|key| self.index.remove(&key))
+        else {
             return;
         };
-        self.items.swap_remove(at).uncount(&mut self.totals);
+        self.items.swap_remove(at);
+        K::uncount(tally_slot, &mut self.totals);
         if let Some(moved) = self.items.get(at).and_then(|m| key_of(m.meta())) {
-            self.index.insert(moved, at);
+            self.index
+                .get_mut(&moved)
+                .expect("moved item is indexed")
+                .at = at;
         }
     }
 
@@ -152,17 +172,22 @@ pub(super) trait Tracked:
     /// What a store adds up over its objects.
     type Totals: Default + Debug + Send + Sync + 'static;
 
+    /// What the index keeps to take this object back out of the totals.
+    type TallySlot: Default + Debug + Send + Sync + 'static;
+
     /// This kind's store.
     fn store(stores: &mut Stores) -> &mut KindStore<Self>;
 
     /// Drops everything the feed does not read, and returns [`Self::Extra`].
     fn trim(&mut self) -> Self::Extra;
 
-    /// Adds this object to `totals`.
-    fn count(&mut self, _extra: Self::Extra, _totals: &mut Self::Totals) {}
+    /// Adds this object to `totals` and returns its tally slot.
+    fn count(&self, _extra: Self::Extra, _totals: &mut Self::Totals) -> Self::TallySlot {
+        Self::TallySlot::default()
+    }
 
-    /// Takes this object out of `totals`.
-    fn uncount(&self, _totals: &mut Self::Totals) {}
+    /// Takes this object out of `totals` using the slot returned by [`Self::count`].
+    fn uncount(_slot: Self::TallySlot, _totals: &mut Self::Totals) {}
 }
 
 fn trim_meta(meta: &mut ObjectMeta) {
@@ -215,6 +240,7 @@ fn trim_container_status(status: &mut ContainerStatus) {
 impl Tracked for Pod {
     type Extra = Option<PodClaim>;
     type Totals = PodTally;
+    type TallySlot = Option<PodTallySlot>;
 
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.pods
@@ -254,15 +280,13 @@ impl Tracked for Pod {
         claim
     }
 
-    /// Keeps the tally's slot in a field trimming has emptied, so a pod costs no extra memory.
-    fn count(&mut self, claim: Option<PodClaim>, totals: &mut PodTally) {
-        if let (Some(spec), Some(claim)) = (&mut self.spec, claim) {
-            spec.active_deadline_seconds = Some(totals.add(&claim));
-        }
+    fn count(&self, claim: Option<PodClaim>, totals: &mut PodTally) -> Option<PodTallySlot> {
+        self.spec.as_ref()?;
+        claim.map(|claim| totals.add(&claim))
     }
 
-    fn uncount(&self, totals: &mut PodTally) {
-        if let Some(slot) = self.spec.as_ref().and_then(|s| s.active_deadline_seconds) {
+    fn uncount(slot: Option<PodTallySlot>, totals: &mut PodTally) {
+        if let Some(slot) = slot {
             totals.remove(slot);
         }
     }
@@ -271,6 +295,7 @@ impl Tracked for Pod {
 impl Tracked for Node {
     type Extra = ();
     type Totals = ();
+    type TallySlot = ();
 
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.nodes
@@ -301,6 +326,7 @@ impl Tracked for Node {
 impl Tracked for Job {
     type Extra = ();
     type Totals = ();
+    type TallySlot = ();
 
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.jobs
@@ -325,6 +351,7 @@ impl Tracked for Job {
 impl Tracked for Deployment {
     type Extra = ();
     type Totals = ();
+    type TallySlot = ();
 
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.deployments
@@ -345,6 +372,7 @@ impl Tracked for Deployment {
 impl Tracked for StatefulSet {
     type Extra = ();
     type Totals = ();
+    type TallySlot = ();
 
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.stateful_sets
@@ -364,6 +392,7 @@ impl Tracked for StatefulSet {
 impl Tracked for DaemonSet {
     type Extra = ();
     type Totals = ();
+    type TallySlot = ();
 
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.daemon_sets
@@ -382,6 +411,7 @@ impl Tracked for DaemonSet {
 impl Tracked for ReplicaSet {
     type Extra = ();
     type Totals = ();
+    type TallySlot = ();
 
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.replica_sets
