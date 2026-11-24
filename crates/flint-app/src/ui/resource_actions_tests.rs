@@ -453,7 +453,7 @@ struct Control {
     watches: Mutex<WatchConnections>,
     /// PATCH requests received.
     patches: AtomicUsize,
-    /// The status of the next PATCH requests; 200 once empty.
+    /// The status of the next PATCH and DELETE requests; 200 once empty.
     statuses: Mutex<VecDeque<u16>>,
     /// PATCH requests wait while this is set, so a write stays running.
     hold: AtomicBool,
@@ -510,6 +510,11 @@ impl LocalApi {
                 let _ = stream.shutdown(Shutdown::Both);
             }
         }
+    }
+
+    /// Each PUT of `web`: whether it was a dry run, and the object sent.
+    pub(in crate::ui::workspace) fn puts(&self) -> Vec<(bool, Value)> {
+        self.control.puts.lock().unwrap().clone()
     }
 
     pub(super) fn patches(&self) -> usize {
@@ -662,6 +667,14 @@ fn answer(method: &str, path: &str, query: &str, body: &[u8], control: &Control)
             }
             (200, sent)
         }
+        ("DELETE", WEB) => match control.statuses.lock().unwrap().pop_front().unwrap_or(200) {
+            200 => (200, deployment()),
+            code => (
+                code,
+                json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                       "reason": "Invalid", "code": code, "message": "refused"}),
+            ),
+        },
         ("PATCH", WEB | WEB_SCALE | NODE) => {
             control
                 .patch_bodies
