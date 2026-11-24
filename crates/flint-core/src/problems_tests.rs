@@ -973,7 +973,7 @@ fn image_pull_failures_are_classified() {
         (
             "a pull still running is not a failure",
             "Pending",
-            600,
+            30,
             status(0, waiting("ContainerCreating"), none()),
             None,
         ),
@@ -1005,6 +1005,17 @@ fn image_pull_failures_are_classified() {
             .collect();
         assert_eq!(got, want, "{name}");
     }
+}
+
+#[test]
+fn a_pull_running_past_the_threshold_is_stuck_pending_not_a_pull_failure() {
+    let pod = aged_pod(
+        "Pending",
+        600,
+        status(0, waiting("ContainerCreating"), none()),
+    );
+    let kinds: Vec<_> = pod_problems(&pod).iter().map(Problem::kind).collect();
+    assert_eq!(kinds, [ProblemKind::PodPending]);
 }
 
 #[test]
@@ -2068,4 +2079,81 @@ fn only_a_replica_set_owner_can_be_unknown() {
     for pod in [&stateful, &bare] {
         assert!(outage_problems([pod])[0].owner_known);
     }
+}
+
+/// A Pending pod created `seconds` before [`NOW`].
+fn pending_for(seconds: i64) -> Pod {
+    let created = (now() - SignedDuration::from_secs(seconds)).to_string();
+    pod_with(
+        "Pending",
+        json!([]),
+        json!([]),
+        json!({"creationTimestamp": created}),
+    )
+}
+
+fn pending_kinds(classifier: &Classifier, pod: &Pod) -> Vec<ProblemKind> {
+    classifier.pods([pod]).iter().map(Problem::kind).collect()
+}
+
+#[test]
+fn a_pod_is_a_problem_only_past_the_default_pending_threshold() {
+    assert!(pending_kinds(&classifier(), &pending_for(59)).is_empty());
+    assert!(
+        pending_kinds(&classifier(), &pending_for(60)).is_empty(),
+        "exactly at the threshold is not longer than it"
+    );
+    assert_eq!(
+        pending_kinds(&classifier(), &pending_for(61)),
+        [ProblemKind::PodPending]
+    );
+}
+
+#[test]
+fn a_changed_threshold_moves_a_pod_in_and_out_of_problems() {
+    let pod = pending_for(90);
+    assert_eq!(
+        pending_kinds(&classifier().with_pending_after(30), &pod),
+        [ProblemKind::PodPending]
+    );
+    assert!(pending_kinds(&classifier().with_pending_after(120), &pod).is_empty());
+}
+
+#[test]
+fn a_pending_pod_without_a_creation_time_is_not_over_the_threshold() {
+    let pod = pod_with("Pending", json!([]), json!([]), json!({}));
+    assert!(pending_kinds(&classifier().with_pending_after(1), &pod).is_empty());
+}
+
+#[test]
+fn a_pending_pod_created_ahead_of_the_clock_is_not_over_the_threshold() {
+    assert!(pending_kinds(&classifier().with_pending_after(1), &pending_for(-600)).is_empty());
+}
+
+#[test]
+fn a_terminating_pending_pod_is_not_a_problem() {
+    let mut pod = pending_for(600);
+    pod.metadata.deletion_timestamp = Some(Time(now()));
+    assert!(pending_kinds(&classifier(), &pod).is_empty());
+}
+
+#[test]
+fn only_the_pending_phase_counts() {
+    for phase in ["Running", "Succeeded", "Failed", "Unknown"] {
+        let mut pod = pending_for(600);
+        pod.status.as_mut().unwrap().phase = Some(phase.to_owned());
+        assert!(pending_kinds(&classifier(), &pod).is_empty(), "{phase}");
+    }
+}
+
+#[test]
+fn a_container_problem_is_reported_instead_of_pending() {
+    let created = (now() - SignedDuration::from_secs(600)).to_string();
+    let pod = pod_with(
+        "Pending",
+        json!([]),
+        json!([status(0, waiting("ImagePullBackOff"), json!({}))]),
+        json!({"creationTimestamp": created}),
+    );
+    assert_eq!(pending_kinds(&classifier(), &pod), [ProblemKind::ImagePull]);
 }

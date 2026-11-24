@@ -104,6 +104,15 @@ pub(super) struct RunningSet {
     _list_events: Subscription,
 }
 
+impl RunningSet {
+    /// The members still on the server they were admitted on.
+    pub(super) fn current_members(&self) -> impl Iterator<Item = &AdmittedMember> {
+        self.members
+            .iter()
+            .filter(|member| !self.changed.contains(member.context()))
+    }
+}
+
 impl ClusterSets {
     pub(super) fn new(window: &mut Window, cx: &mut Context<Workspace>) -> Self {
         Self {
@@ -124,6 +133,11 @@ impl ClusterSets {
 
     pub(super) fn is_open(&self) -> bool {
         self.running.is_some()
+    }
+
+    /// Whether a set is waiting for the core to admit it.
+    pub(super) fn is_opening(&self) -> bool {
+        self.opening.is_some()
     }
 
     /// The open set's member for `cluster`, as the core admitted it.

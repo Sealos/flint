@@ -37,6 +37,7 @@ use crate::watch::{ClusterWatches, EngineConfig, HubRegistry, KubeSource};
 use crate::write::WriteError;
 
 mod file_watch;
+mod helm;
 mod keep_watching;
 mod running_set;
 mod selected_retry;
@@ -347,6 +348,12 @@ enum Internal {
     },
     /// Time to connect kept clusters that failed for a reason worth retrying.
     KeepWatchRetry,
+    /// The credential of a member's connection made under consent, attempt `attempt`, failed
+    /// or was refused.
+    MemberCredentialFailed {
+        cluster: ClusterId,
+        attempt: u64,
+    },
     FilesChanged(Changed),
     /// The file watches changed and now cover these directories. Anything may have been written
     /// before they started, so everything is read again.
@@ -762,6 +769,16 @@ impl ClusterManager {
                 }
                 self.apply_scope(&cluster);
             }
+            Command::SetThreshold {
+                cluster,
+                metric,
+                value,
+            } => {
+                self.write_settings("the threshold", move |dir| {
+                    settings::set_threshold(dir, cluster.as_ref(), metric, value)
+                })
+                .await
+            }
             Command::SetLogBufferLines(lines) => {
                 self.write_settings("the log buffer size", move |dir| {
                     settings::set_log_buffer_lines(dir, lines)
@@ -947,6 +964,17 @@ impl ClusterManager {
             }
             Request::CheckMember { member, reply } => {
                 let _ = reply.send(self.member_changed(&member));
+            }
+            Request::HelmPin { cluster, reply } => {
+                let _ = reply.send(self.helm_pin(&cluster));
+            }
+            Request::HelmTarget {
+                cluster,
+                pin,
+                member,
+                reply,
+            } => {
+                let _ = reply.send(self.helm_target(&cluster, pin, member.as_ref()));
             }
             Request::MemberClient { member, reply } => {
                 let _ = reply.send(self.member_client(&member));
@@ -1392,6 +1420,7 @@ impl ClusterManager {
         self.settings = Arc::new(settings);
         self.settings_error = error;
         self.log_budget.set_limit(self.settings.log_total_bytes());
+        self.apply_pending_thresholds();
         // The watch mode may have changed: start and stop the watches first, so a front end
         // that reads the stores when it hears of the change (the resource switcher) finds
         // them as the new settings have them.
@@ -1523,6 +1552,7 @@ impl ClusterManager {
                 self.end_invalid_retry();
                 let target = cluster::Target::of(&self.kubeconfig.merged, &cluster);
                 let paused = self.paused(&cluster);
+                let active = self.active.as_deref() == Some(cluster.as_str());
                 let Some(slot) = self.cluster_mut(&cluster) else {
                     return;
                 };
@@ -1536,6 +1566,9 @@ impl ClusterManager {
                     .attempt_lease
                     .take()
                     .is_some_and(|lease| !lease.holds());
+                // Made under consent in the background: like a kept feed, its first failure
+                // waits for a sign-in, with no retry.
+                let unattended = slot.access.unattended() && !active;
                 // Dropped either way: the load that ends the pause connects again.
                 if paused {
                     slot.access.revoke();
@@ -1553,7 +1586,7 @@ impl ClusterManager {
                 // Its lease ended while it was being made (switched away and back), so what it
                 // returned, an error included, is no answer about the cluster. It is dropped, and
                 // the current selection connects anew under a new grant.
-                if lease_ended
+                if (lease_ended && !unattended)
                     || result
                         .as_ref()
                         .is_ok_and(|(connection, _)| connection.credential.spent())
@@ -1577,10 +1610,16 @@ impl ClusterManager {
                     self.pump_members(now);
                     return;
                 }
+                let result = match result {
+                    Ok(_) if lease_ended => Err(running_set::consent_ended()),
+                    result => result,
+                };
                 let connected = result.is_ok();
                 let outcome = match &result {
                     Ok(_) => AttemptOutcome::Connected,
-                    Err(error) if rejected => AttemptOutcome::AuthRejected(error.clone()),
+                    Err(error) if rejected || unattended => {
+                        AttemptOutcome::AuthRejected(error.clone())
+                    }
                     Err(error) => AttemptOutcome::Failed(error.clone()),
                 };
                 match result {
@@ -1641,6 +1680,9 @@ impl ClusterManager {
             Internal::KeepWatchFailed { cluster, attempt } => self.kept_failed(&cluster, attempt),
             // The loop's sync starts what is due.
             Internal::KeepWatchRetry => {}
+            Internal::MemberCredentialFailed { cluster, attempt } => {
+                self.member_credential_failed(&cluster, attempt);
+            }
             Internal::Discovered {
                 cluster,
                 attempt,
@@ -2473,6 +2515,20 @@ impl ClusterManager {
             return;
         }
         self.next_attempt += 1;
+        // A member in the background signs in under its keep-watching consent, if it has one,
+        // and never with a prompt.
+        let consent = (role == Role::Background && self.members.contains_key(id))
+            .then(|| self.member_consent(id))
+            .flatten();
+        let access = match consent {
+            Some(consent) => self.member_access(id, attempt, consent),
+            None => CredentialAccess::new(Arc::new(ForegroundOnly), role),
+        };
+        let no_prompt = access.unattended().then(|| {
+            let mut merged = kubeconfig.merged.clone();
+            cluster::disable_interactive_exec(&mut merged);
+            merged
+        });
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
@@ -2483,7 +2539,7 @@ impl ClusterManager {
         slot.client = None;
         slot.write_credential = None;
         slot.access.revoke();
-        slot.access = CredentialAccess::new(Arc::new(ForegroundOnly), role);
+        slot.access = access;
         // One denied from the start reports that denial, which is a real answer.
         slot.attempt_lease = runs_a_command
             .then(|| slot.access.grant(CredentialSource::Plugin).lease())
@@ -2500,7 +2556,7 @@ impl ClusterManager {
         let name = cluster.clone();
         let rejections = internal.clone();
         let attempt_task = tokio::spawn(async move {
-            let merged = &kubeconfig.merged;
+            let merged = no_prompt.as_ref().unwrap_or(&kubeconfig.merged);
             let result = cluster::connect_gated_and_check_with_policy(
                 merged,
                 &name,

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use flint_core::compare::{CompareTarget, SideRead as ObjectRead};
 use flint_core::dashboard::{
     ProblemCategory, ProblemCounts, ProblemSnapshot, ProblemSummariser, count_pending_claims,
     count_recent_warnings,
@@ -28,7 +29,8 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
 use super::super::clusters::ClustersModel;
 use super::super::list::{CountedObjects, ObjectFilter};
-use super::{DashboardInput, DashboardModel, DashboardView, metrics};
+use super::super::registry::{self, OpenObject};
+use super::{DashboardEvent, DashboardInput, DashboardModel, DashboardView, WarningRow, metrics};
 
 /// How often an open dashboard reads again with no change from the feed.
 const AGE_OUT_INTERVAL: Duration = Duration::from_secs(15);
@@ -83,9 +85,14 @@ pub(super) struct Feed {
     /// Stands in for the core's running feed.
     #[cfg(test)]
     test_current: Option<Option<FeedId>>,
+    /// Stands in for the API server's answer about a Warning's object.
+    #[cfg(test)]
+    test_object: Option<ObjectRead>,
     reading: bool,
     /// Something changed during a read: read again when it ends.
     dirty: bool,
+    /// The check of the Warning row last opened. A newer one replaces it.
+    _object_check: Option<Task<()>>,
     _read: Option<Task<()>>,
     _updates: Option<Task<()>>,
     _registered: Option<Task<()>>,
@@ -259,6 +266,225 @@ impl DashboardView {
     }
 }
 
+/// The links of one drawn frame, bound to the feed its values came from. A click can land after
+/// the model moved on and before the next frame, so each is checked against the model then.
+#[derive(Clone)]
+pub(super) struct DrawnLinks {
+    view: WeakEntity<DashboardView>,
+    feed: Option<FeedId>,
+    pub(super) focus: FocusHandle,
+}
+
+/// How a confirmed link is performed: [`registry::dispatch_in`].
+type Dispatch =
+    fn(&FocusHandle, &dyn Action, &mut Window, &mut App) -> Result<(), registry::ActionError>;
+
+impl DrawnLinks {
+    /// Whether the link `holds` in the values on screen, from the feed it was drawn from. If
+    /// not, what is shown is read again.
+    fn hold(&self, holds: impl Fn(&DashboardModel) -> bool, cx: &mut App) -> bool {
+        self.view
+            .update(cx, |view, cx| {
+                let current = view.feed.shown == self.feed
+                    && view.shows_current_feed(cx)
+                    && holds(&view.model);
+                if !current {
+                    view.refresh(cx);
+                }
+                current
+            })
+            .unwrap_or(false)
+    }
+
+    /// Dispatches `action` while `holds` says the model still links to it.
+    pub(super) fn on_click<E: ?Sized, A: 'static>(
+        &self,
+        action: A,
+        holds: fn(&DashboardModel, &A) -> bool,
+        perform: impl Fn(&E, &mut Window, &mut App) + 'static,
+    ) -> impl Fn(&E, &mut Window, &mut App) + 'static {
+        let links = self.clone();
+        move |event, window, cx| {
+            if links.hold(|model| holds(model, &action), cx) {
+                perform(event, window, cx);
+            }
+        }
+    }
+
+    /// Opens a Warning's object through `dispatch` once the API server confirms it is the one
+    /// the event is about.
+    pub(super) fn on_warning_click<E: ?Sized>(
+        &self,
+        row: &WarningRow,
+        open: OpenObject,
+        dispatch: Dispatch,
+    ) -> impl Fn(&E, &mut Window, &mut App) + 'static {
+        let links = self.clone();
+        let (key, object, uid) = (row.key.clone(), row.object.clone(), row.object_uid.clone());
+        move |_, window, cx| {
+            if !links.hold(|model| model.links_warning(&key, &open), cx) {
+                return;
+            }
+            let target = WarningTarget {
+                open: open.clone(),
+                object: object.clone(),
+                uid: uid.clone(),
+            };
+            // A link this cluster refuses sends no request.
+            if registry::check_in(&links.focus, &open, window, cx).is_err() {
+                let why = target.cannot_open();
+                let _ = links
+                    .view
+                    .update(cx, |_, cx| cx.emit(DashboardEvent::CannotOpen(why)));
+                return;
+            }
+            let focus = links.focus.clone();
+            let _ = links.view.update(cx, |view, cx| {
+                view.check_warning_object(target, focus, dispatch, window, cx);
+            });
+        }
+    }
+}
+
+/// The object a clicked Warning row is about.
+struct WarningTarget {
+    open: OpenObject,
+    /// Its name as shown.
+    object: String,
+    uid: Option<String>,
+}
+
+impl WarningTarget {
+    fn cannot_open(&self) -> String {
+        format!("Cannot open {} on this cluster.", self.object)
+    }
+
+    /// Why `read` does not show this very object. With no UID, only that it exists is known.
+    fn refusal(&self, read: &ObjectRead) -> Option<String> {
+        let object = &self.object;
+        match read {
+            ObjectRead::Present(detail) => {
+                let now = detail
+                    .object
+                    .pointer("/metadata/uid")
+                    .and_then(|uid| uid.as_str());
+                let replaced = self.uid.as_deref().is_some_and(|uid| now != Some(uid));
+                replaced
+                    .then(|| format!("{object} was replaced by a new object with the same name."))
+            }
+            ObjectRead::Missing => Some(format!("{object} no longer exists.")),
+            ObjectRead::Reading | ObjectRead::Unavailable(_) => {
+                Some(format!("Could not check {object}, so it was not opened."))
+            }
+        }
+    }
+}
+
+impl DashboardView {
+    pub(super) fn drawn_links(&self, cx: &Context<Self>) -> DrawnLinks {
+        DrawnLinks {
+            view: cx.weak_entity(),
+            feed: self.feed.shown.clone(),
+            focus: self.focus.clone(),
+        }
+    }
+
+    /// Whether this view's slot is still the active cluster's.
+    fn follows_active_slot(&self, cx: &App) -> bool {
+        let Some((model, cluster)) = &self.feed.source else {
+            return false;
+        };
+        model.upgrade().is_some_and(|model| {
+            slot_to_read(
+                model.read(cx).active_cluster(),
+                cluster,
+                self.feed.generation,
+            )
+            .is_some()
+        })
+    }
+
+    /// One GET of `open`, on the definition this view follows. `None`: it cannot be asked.
+    fn read_warning_object(
+        &self,
+        open: &OpenObject,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<ObjectRead>> {
+        #[cfg(test)]
+        if let Some(read) = &self.feed.test_object {
+            return Some(Task::ready(read.clone()));
+        }
+        let (model, cluster) = self.feed.source.as_ref()?;
+        let model = model.upgrade()?;
+        let model = model.read(cx);
+        let slot = slot_to_read(model.active_cluster(), cluster, self.feed.generation)?;
+        let entry = model
+            .discovered(cluster)?
+            .discovery
+            .as_ref()?
+            .nav_entry(&open.kind)
+            .ok()?;
+        let target = CompareTarget {
+            kind: entry.id.clone(),
+            namespace: open.namespace.clone().filter(|_| entry.namespaced),
+            name: open.name.clone(),
+        };
+        let fetch = model.core().fetch_pinned_object(
+            cluster,
+            &slot.read_pin(),
+            &target.kind,
+            target.namespace.as_deref(),
+            &target.name,
+        );
+        Some(cx.background_spawn(async move { ObjectRead::from_fetch(&target, fetch.await) }))
+    }
+
+    /// Asks for the object, then opens it if it is the event's and this view's feed still runs.
+    /// Until then the overview stays.
+    fn check_warning_object(
+        &mut self,
+        target: WarningTarget,
+        focus: FocusHandle,
+        dispatch: Dispatch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(read) = self.read_warning_object(&target.open, cx) else {
+            cx.emit(DashboardEvent::CannotOpen(target.cannot_open()));
+            return;
+        };
+        let feed = self.feed.shown.clone();
+        self.feed._object_check = Some(cx.spawn_in(window, async move |this, cx| {
+            let read = read.await;
+            let confirmed = this.update(cx, |view, cx| {
+                if view.feed.shown != feed
+                    || !view.shows_current_feed(cx)
+                    || !view.follows_active_slot(cx)
+                {
+                    view.refresh(cx);
+                    return false;
+                }
+                match target.refusal(&read) {
+                    Some(why) => {
+                        cx.emit(DashboardEvent::CannotOpen(why));
+                        false
+                    }
+                    None => true,
+                }
+            });
+            if !confirmed.unwrap_or(false) {
+                return;
+            }
+            // Outside the view's update: the workspace closes this view as it opens the object.
+            let opened = cx.update(|window, cx| dispatch(&focus, &target.open, window, cx).is_ok());
+            if matches!(opened, Ok(false)) {
+                let why = target.cannot_open();
+                let _ = this.update(cx, |_, cx| cx.emit(DashboardEvent::CannotOpen(why)));
+            }
+        }));
+    }
+}
+
 /// The active cluster's summary, if it describes the slot this view follows.
 pub(in crate::ui) fn slot_to_read<'a>(
     active: Option<&'a ClusterSummary>,
@@ -273,6 +499,11 @@ impl DashboardView {
     /// Pretends `feed` is the one running now.
     pub fn set_running_feed_for_test(&mut self, feed: Option<FeedId>) {
         self.feed.test_current = Some(feed);
+    }
+
+    /// Answers the check of a Warning's object with `read`.
+    pub fn set_object_read_for_test(&mut self, read: ObjectRead) {
+        self.feed.test_object = Some(read);
     }
 
     /// A read of `feed` finishing now.
@@ -337,6 +568,7 @@ fn waiting_snapshot(cluster: &str, now: Timestamp) -> TelemetrySnapshot {
         problems: Arc::from([]),
         unchecked: Vec::new(),
         settling: Vec::new(),
+        checked: Arc::default(),
         counts: ProblemSummariser::default().summarise(&ProblemSnapshot::unavailable(), now),
         metrics: MetricsCheck::Waiting,
         capacity: None,
@@ -412,6 +644,11 @@ pub(in crate::ui) fn lists_of(
                 pod_uid,
                 ..
             } => pods.insert(Some(namespace), pod, pod_uid.as_deref()),
+            ProblemSubject::Pod {
+                namespace,
+                name,
+                uid,
+            } => pods.insert(Some(namespace), name, uid.as_deref()),
             ProblemSubject::Node { name, uid } => nodes.insert(None, name, uid.as_deref()),
             ProblemSubject::Job {
                 namespace,

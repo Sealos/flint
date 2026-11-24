@@ -358,7 +358,8 @@ fn up_07_expose_a_cluster_to_ai() -> Result<()> {
     connect(&app, &cluster.context)?;
     let state = app.state()?;
     assert_eq!(sidebar(&state, &cluster.context)["active"], true);
-    assert_eq!(state["focus"], "workspace", "{}", state["focus"]);
+    // The overview panel holds focus, not a link or a row: the keys below have nothing to press.
+    assert_eq!(state["focus"], "overview", "{}", state["focus"]);
     for key in ["space", "enter", "a"] {
         app.press_key(key)?;
     }

@@ -83,6 +83,7 @@ impl History {
 enum Pane {
     Sidebar,
     Navigation,
+    Overview,
     List,
     Detail,
     Dock,
@@ -145,6 +146,9 @@ impl Workspace {
         if self.nav_shown(cx) {
             panes.push((Pane::Navigation, self.nav.read(cx).focus_handle().clone()));
         }
+        if let Some((overview, _)) = &self.dashboard {
+            panes.push((Pane::Overview, overview.read(cx).focus_handle(cx)));
+        }
         if let Some(list) = &self.list {
             panes.push((Pane::List, list.read(cx).focus_handle().clone()));
         }
@@ -186,6 +190,21 @@ impl Workspace {
         // A field left behind (the list's filter, a log tab's search).
         release_unfocused_input(window, cx);
         cx.notify();
+    }
+
+    /// Takes focus back after it was lost: to the overview when that is what the main area
+    /// shows.
+    pub(super) fn recover_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.list.is_none()
+            && !self.namespace_popover_open
+            && let Some((overview, _)) = &self.dashboard
+        {
+            let focus = overview.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+            release_unfocused_input(window, cx);
+            return;
+        }
+        self.reclaim_focus(window, cx);
     }
 
     /// Where the main area is: the open kind and its selected object.

@@ -18,6 +18,7 @@ use crate::cluster::{ClusterId, ServerVersion};
 use crate::credential::WriteCredential;
 use crate::discovery::ClusterDiscovery;
 use crate::exec::{ContextCheck, ContextWatch, ExecRequest, ExecSession, LaunchCheck};
+use crate::helm::{HelmError, HelmOutput, HelmPin, HelmQuery, HelmTarget};
 use crate::kubeconfig::ContextInfo;
 use crate::logs::{
     Freshness, LogFilter, LogLines, LogOptions, LogSearch, LogSnapshot, LogSubject, LogTarget,
@@ -158,6 +159,14 @@ pub enum Command {
     SetNamespaceFilter {
         cluster: ClusterId,
         namespaces: Vec<String>,
+    },
+    /// Set one threshold, for every cluster (`cluster: None`) or one context at one server, and
+    /// write it to `settings.toml`. `value: None` clears it. A value out of range is reported as
+    /// [`Event::Error`] and changes nothing. The change arrives back as `Event::SettingsChanged`.
+    SetThreshold {
+        cluster: Option<ClusterPin>,
+        metric: crate::thresholds::ThresholdMetric,
+        value: Option<u32>,
     },
     /// Set the lines each log session keeps and write it to `settings.toml`. Sessions opened
     /// afterwards use it. The change arrives back as `Event::SettingsChanged`.
@@ -464,6 +473,18 @@ pub(crate) enum Request {
         pin: ContextPin,
         reply: oneshot::Sender<Option<String>>,
     },
+    /// The pin of a Helm view opening on `cluster` now, whether or not it can run yet.
+    HelmPin {
+        cluster: ClusterId,
+        reply: oneshot::Sender<HelmPin>,
+    },
+    /// What a `helm` run on `cluster` at `pin` is held to, if it may run.
+    HelmTarget {
+        cluster: ClusterId,
+        pin: HelmPin,
+        member: Option<AdmittedMember>,
+        reply: oneshot::Sender<Result<HelmTarget, HelmError>>,
+    },
 }
 
 /// The client for one request of a reviewed write, its context's pin, and its connection's
@@ -697,6 +718,8 @@ impl CoreHandle {
         let (event_tx, event_rx) = crate::events::queue();
         let hubs = HubRegistry::default();
         let unlocks = SessionUnlocks::default();
+        let helm_runs = crate::helm::runs_root(&config.config_dir);
+        runtime.spawn_blocking(move || crate::helm::reap_stale(&helm_runs));
         let manager = ClusterManager::new(config, event_tx, hubs.clone(), unlocks.clone());
         let log_budget = manager.log_budget();
         let telemetry = manager.telemetry_board();
@@ -1299,6 +1322,95 @@ impl CoreHandle {
             crate::exec::start(client, request, channels).await;
         });
         session
+    }
+
+    /// What a `helm` run on `cluster` would be held to, in one step with checking it may run.
+    fn helm_target(
+        &self,
+        cluster: &str,
+        pin: HelmPin,
+    ) -> impl Future<Output = Result<HelmTarget, HelmError>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let sent = self.requests.try_send(Request::HelmTarget {
+            cluster: cluster.to_owned(),
+            pin,
+            member: self.bound.as_deref().cloned(),
+            reply,
+        });
+        async move {
+            if sent.is_err() {
+                return Err(HelmError::Stopped);
+            }
+            rx.await.unwrap_or(Err(HelmError::Stopped))
+        }
+    }
+
+    /// Pins a Helm view to `cluster`'s definition as of this call. It holds even if the cluster
+    /// can't run `helm` yet: every read is checked against it, so a view never moves to a
+    /// definition that came later.
+    pub fn helm_pin(
+        &self,
+        cluster: &str,
+    ) -> impl Future<Output = Result<HelmPin, HelmError>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let sent = self.requests.try_send(Request::HelmPin {
+            cluster: cluster.to_owned(),
+            reply,
+        });
+        async move {
+            if sent.is_err() {
+                return Err(HelmError::Stopped);
+            }
+            rx.await.map_err(|_| HelmError::Stopped)
+        }
+    }
+
+    /// Runs one read-only `helm` query on `cluster`, only while it is still the definition `pin`
+    /// was taken on: checked before the run, throughout it, and before its answer is given. A
+    /// change ends the run, and so does dropping the future. Works on any executor.
+    pub fn helm_read(
+        &self,
+        cluster: &str,
+        pin: &HelmPin,
+        query: HelmQuery,
+    ) -> impl Future<Output = Result<HelmOutput, HelmError>> + Send + 'static {
+        let target = self.helm_target(cluster, pin.clone());
+        let after = self.clone();
+        let cluster = cluster.to_owned();
+        let pin = pin.clone();
+        let run = spawn_aborting(&self.runtime, async move {
+            let target = target.await?;
+            let output = tokio::select! {
+                output = crate::helm::run(&target, &query) => output?,
+                refused = after.helm_refused(&cluster, &pin) => return Err(refused),
+            };
+            after.helm_target(&cluster, pin).await?;
+            Ok(output)
+        });
+        async move { run.await.unwrap_or(Err(HelmError::Stopped)) }
+    }
+
+    /// What a Helm view should warn of the `helm` a run at `pin` would start, if anything.
+    pub fn helm_warning(
+        &self,
+        cluster: &str,
+        pin: &HelmPin,
+    ) -> impl Future<Output = Option<String>> + Send + 'static {
+        let target = self.helm_target(cluster, pin.clone());
+        let warning = spawn_aborting(&self.runtime, async move {
+            crate::helm::warning(&target.await.ok()?).await
+        });
+        async move { warning.await.flatten() }
+    }
+
+    /// Resolves once a `helm` run on `cluster` at `pin` may no longer go on.
+    async fn helm_refused(&self, cluster: &str, pin: &HelmPin) -> HelmError {
+        loop {
+            tokio::time::sleep(crate::helm::RECHECK_EVERY).await;
+            if let Err(refused) = self.helm_target(cluster, pin.clone()).await {
+                return refused;
+            }
+        }
     }
 
     /// The client for an action that changes `cluster` or runs code in it, with the context's

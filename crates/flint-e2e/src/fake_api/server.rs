@@ -195,6 +195,9 @@ struct Inner {
     faults: Mutex<Faults>,
     /// What `SelfSubjectAccessReview`s answer.
     access: Mutex<AccessPolicy>,
+    /// Who `SelfSubjectReview`s say the caller is. Unset, they get a 404, as on a server older
+    /// than Kubernetes 1.28.
+    identity: Mutex<Option<String>>,
     scripts: Mutex<Scripts>,
     watchers: Mutex<HashMap<Gvr, Vec<Watcher>>>,
     requests: Mutex<Vec<RequestRecord>>,
@@ -387,6 +390,7 @@ impl FakeApiServer {
             options,
             faults: Mutex::default(),
             access: Mutex::default(),
+            identity: Mutex::default(),
             scripts: Mutex::default(),
             watchers: Mutex::default(),
             requests: Mutex::default(),
@@ -711,6 +715,12 @@ impl FakeApiServer {
         *lock(&self.inner.access) = policy;
     }
 
+    /// Makes `SelfSubjectReview`s answer that the caller is `username`, as Kubernetes 1.28 and
+    /// later do. Each is still recorded as a write.
+    pub fn set_identity(&self, username: &str) {
+        *lock(&self.inner.identity) = Some(username.to_owned());
+    }
+
     /// Every request answered (or dropped) so far, oldest first.
     pub fn requests(&self) -> Vec<RequestRecord> {
         lock(&self.inner.requests).clone()
@@ -993,6 +1003,12 @@ fn answer(
             match access::answer(&lock(&inner.access), &write.body) {
                 Ok(review) => json_with(201, "application/json", &review),
                 Err(e) => error(&e),
+            }
+        }
+        Call::Write(Ok(write)) if access::is_identity_review(&write.method, route) => {
+            match lock(&inner.identity).as_deref() {
+                Some(username) => json_with(201, "application/json", &access::identity(username)),
+                None => respond(inner, &write.method, route, verb, query, accept),
             }
         }
         Call::Write(Ok(write)) if writes::handles(inner, &write.method, route) => {
