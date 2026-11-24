@@ -9,6 +9,7 @@
 //! not open a list.
 
 use std::cmp::Reverse;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use flint_core::activity::is_invisible;
@@ -29,6 +30,7 @@ use jiff::Timestamp;
 use k8s_openapi::api::core::v1::{Event as KubeEvent, PersistentVolumeClaim};
 use serde::{Deserialize, Deserializer, de};
 
+use super::focus::cycle_focus_within;
 use super::registry::{Bind, OnView, OpenObject, OpenView};
 
 #[path = "dashboard_feed.rs"]
@@ -46,6 +48,7 @@ mod sparkline;
 #[path = "dashboard_tiles.rs"]
 mod tiles;
 
+use feed::DrawnLinks;
 pub(in crate::ui) use feed::FeedId;
 pub use feed::{ProblemList, ProblemLists};
 #[cfg(test)]
@@ -170,13 +173,25 @@ const fn category_name(category: ProblemCategory) -> &'static str {
     }
 }
 
+actions!(
+    dashboard,
+    [
+        /// Move focus to the next link on the cluster overview.
+        FocusNextLink,
+        /// Move focus to the previous link on the cluster overview.
+        FocusPreviousLink
+    ]
+);
+
 /// What the dashboard asks of whoever hosts it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DashboardEvent {
     /// Show the list filtered to this category.
     OpenFilteredList(ProblemCategory),
     /// Show this kind's short workloads.
     OpenShortWorkloads(&'static str),
+    /// A row's object was not opened. Holds why, to show.
+    CannotOpen(String),
 }
 
 /// What the dashboard is built from. Events and claims are read apart from the telemetry feed, so
@@ -286,7 +301,7 @@ impl MetricTile {
 }
 
 /// The recent Warning events section.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum WarningsPanel {
     Unavailable,
     /// Newest first, at most [`MAX_WARNING_ROWS`], out of `total`.
@@ -297,7 +312,7 @@ pub enum WarningsPanel {
 }
 
 /// One Warning event. All text from the cluster is cleaned for display.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WarningRow {
     pub age: String,
     pub reason: String,
@@ -306,6 +321,12 @@ pub struct WarningRow {
     pub message: String,
     /// How many times it happened.
     pub occurrences: u32,
+    /// The object it happened to, unless the event does not name one exactly.
+    pub open: Option<OpenObject>,
+    /// That object's UID, when the event identifies it by one.
+    pub object_uid: Option<String>,
+    /// This event among the rows: stays the same as rows above it come and go.
+    pub key: String,
 }
 
 impl WarningRow {
@@ -348,7 +369,7 @@ impl DashboardModel {
                 !snapshot.unchecked.is_empty(),
                 &scope,
             ),
-            warnings: warnings(input),
+            warnings: warnings(input, &scope),
             capacity: capacity_panel(snapshot.capacity.as_ref(), input.node_usage),
             metrics: metrics(input),
             inventory: inventory_panel(&snapshot.inventory, &snapshot.version, &scope),
@@ -357,10 +378,18 @@ impl DashboardModel {
 }
 
 impl DashboardModel {
-    /// Whether `action` is one of the problem rows' links.
+    /// Whether `action` is one of the problem or Warning rows' links.
     pub(in crate::ui) fn links_object(&self, action: &OpenObject) -> bool {
         matches!(&self.problems, ProblemsPanel::Rows { rows, .. }
             if rows.iter().any(|row| row.open == *action))
+            || matches!(&self.warnings, WarningsPanel::Rows { rows, .. }
+                if rows.iter().any(|row| row.open.as_ref() == Some(action)))
+    }
+
+    /// Whether the Warning row `key` still links to `open`.
+    pub(in crate::ui) fn links_warning(&self, key: &str, open: &OpenObject) -> bool {
+        matches!(&self.warnings, WarningsPanel::Rows { rows, .. }
+            if rows.iter().any(|row| row.key == key && row.open.as_ref() == Some(open)))
     }
 
     /// Whether `action` is one of the inventory's links. An unread count draws none.
@@ -562,7 +591,7 @@ fn format_memory(bytes: u64) -> String {
     }
 }
 
-fn warnings(input: &DashboardInput<'_>) -> WarningsPanel {
+fn warnings(input: &DashboardInput<'_>, scope: &OpenScope) -> WarningsPanel {
     let Some(events) = input.warning_events else {
         return WarningsPanel::Unavailable;
     };
@@ -581,15 +610,93 @@ fn warnings(input: &DashboardInput<'_>) -> WarningsPanel {
             event.reason.clone(),
         )
     });
+    let mut keys = HashSet::new();
     let rows = recent
         .into_iter()
         .take(MAX_WARNING_ROWS)
-        .map(|(seen, event)| warning_row(event, seen, input.now))
+        .map(|(seen, event)| {
+            let key = warning_key(event, &mut keys);
+            warning_row(event, key, seen, input.now, scope)
+        })
         .collect();
     WarningsPanel::Rows { rows, total }
 }
 
-fn warning_row(event: &KubeEvent, seen: Timestamp, now: Timestamp) -> WarningRow {
+/// The link to the object `event` names. The kind is pinned to the event's API group, so a
+/// same-named kind of another group never opens in its place.
+fn warning_target(event: &KubeEvent, scope: &OpenScope) -> Option<OpenObject> {
+    let object = &event.involved_object;
+    let kind = object
+        .kind
+        .as_deref()
+        .filter(|kind| !kind.is_empty() && kind.chars().all(|c| c.is_ascii_alphanumeric()))?;
+    let name = object
+        .name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())?;
+    let api_version = object.api_version.as_deref().filter(|version| {
+        !version.is_empty()
+            && version
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '/'))
+    })?;
+    // `Pod.v1` is the core kind, `Deployment.apps` a group's at whichever version it serves.
+    let qualifier = api_version
+        .split_once('/')
+        .map_or(api_version, |(group, _)| group);
+    Some(OpenObject {
+        kind: format!("{kind}.{qualifier}"),
+        namespace: object.namespace.clone().filter(|n| !n.is_empty()),
+        name: name.to_owned(),
+        cluster: Some(scope.cluster.clone()),
+        server: scope.server.clone(),
+    })
+}
+
+/// The event's UID, or what names it without one. Made unique, since rows are keyed by it.
+fn warning_key(event: &KubeEvent, taken: &mut HashSet<String>) -> String {
+    let object = &event.involved_object;
+    let base = event
+        .metadata
+        .uid
+        .clone()
+        .filter(|uid| !uid.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "{}/{}/{}/{}",
+                object.namespace.as_deref().unwrap_or_default(),
+                object.name.as_deref().unwrap_or_default(),
+                object.uid.as_deref().unwrap_or_default(),
+                event.reason.as_deref().unwrap_or_default(),
+            )
+        });
+    let mut key = base.clone();
+    let mut copy = 1;
+    while !taken.insert(key.clone()) {
+        copy += 1;
+        key = format!("{base}#{copy}");
+    }
+    key
+}
+
+/// The UID the event gives its object. The kubelet reports a Node under its name in place of a
+/// UID, which identifies nothing.
+fn warning_object_uid(event: &KubeEvent) -> Option<String> {
+    let object = &event.involved_object;
+    object.uid.clone().filter(|uid| {
+        !uid.is_empty()
+            && !(object.kind.as_deref() == Some("Node") && object.name.as_deref() == Some(uid))
+    })
+}
+
+fn warning_row(
+    event: &KubeEvent,
+    key: String,
+    seen: Timestamp,
+    now: Timestamp,
+    scope: &OpenScope,
+) -> WarningRow {
+    let open = warning_target(event, scope);
     let object = &event.involved_object;
     let name = match (&object.namespace, &object.name) {
         (Some(namespace), Some(name)) if !namespace.is_empty() => {
@@ -616,6 +723,9 @@ fn warning_row(event: &KubeEvent, seen: Timestamp, now: Timestamp) -> WarningRow
         object,
         message: event.message.as_deref().map_or_else(String::new, cleaned),
         occurrences,
+        open,
+        object_uid: warning_object_uid(event),
+        key,
     }
 }
 
@@ -694,6 +804,12 @@ impl DashboardView {
     pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
         bind.bind::<OpenProblemList>(Self::open_list)
             .bind::<OpenShortWorkloads>(Self::open_short_workloads)
+            .bind::<FocusNextLink>(|this, _, window, cx| {
+                cycle_focus_within(&this.focus, true, window, cx);
+            })
+            .bind::<FocusPreviousLink>(|this, _, window, cx| {
+                cycle_focus_within(&this.focus, false, window, cx);
+            })
     }
 
     /// The objects behind `category`'s tile, as last read, when one list shows them all.
@@ -790,6 +906,7 @@ impl Focusable for DashboardView {
 impl Render for DashboardView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.frame_drawn();
+        let links = self.drawn_links(cx);
         let theme = cx.theme();
         v_flex()
             .id("dashboard")
@@ -813,17 +930,13 @@ impl Render for DashboardView {
                 self.focus.clone(),
                 theme,
             ))
-            .child(tiles::problems_section(
-                &self.model.problems,
-                self.focus.clone(),
-                theme,
-            ))
-            .child(tiles::warnings_section(&self.model.warnings, theme))
+            .child(tiles::problems_section(&self.model.problems, &links, theme))
+            .child(tiles::warnings_section(&self.model.warnings, &links, theme))
             .child(tiles::capacity_section(&self.model.capacity, theme))
             .child(tiles::metrics_section(&self.model.metrics, theme))
             .child(tiles::inventory_section(
                 &self.model.inventory,
-                self.focus.clone(),
+                &links,
                 theme,
             ))
     }

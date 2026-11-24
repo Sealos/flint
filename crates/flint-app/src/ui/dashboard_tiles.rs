@@ -15,9 +15,10 @@ use super::overview::{
 };
 use super::sparkline::sparkline;
 use super::{
-    CANNOT_BE_CHECKED, DashboardStatus, INSTALL_COMMAND, INSTALL_HINT, MAX_WARNING_ROWS,
-    METRICS_WAITING, MetricTile, MetricsPanel, NO_WARNINGS, OpenProblemList, OpenShortWorkloads,
-    ProblemList, ProblemLists, ProblemTile, WARNINGS_UNAVAILABLE, WarningRow, WarningsPanel,
+    CANNOT_BE_CHECKED, DashboardModel, DashboardStatus, DrawnLinks, INSTALL_COMMAND, INSTALL_HINT,
+    MAX_WARNING_ROWS, METRICS_WAITING, MetricTile, MetricsPanel, NO_WARNINGS, OpenProblemList,
+    OpenShortWorkloads, ProblemList, ProblemLists, ProblemTile, WARNINGS_UNAVAILABLE, WarningRow,
+    WarningsPanel,
 };
 use crate::ui::registry;
 use flint_core::problems::ProblemSeverity;
@@ -288,7 +289,7 @@ fn metric_tile(id: &'static str, tile: &MetricTile, theme: &Theme) -> impl IntoE
 /// The individual problems, each opening its object on this cluster.
 pub fn problems_section(
     panel: &ProblemsPanel,
-    focus: FocusHandle,
+    links: &DrawnLinks,
     theme: &Theme,
 ) -> impl IntoElement {
     let muted = theme.muted_foreground;
@@ -315,7 +316,7 @@ pub fn problems_section(
                 .children(
                     rows.iter()
                         .enumerate()
-                        .map(|(index, row)| problem_row(index, row, focus.clone(), theme)),
+                        .map(|(index, row)| problem_row(index, row, links, theme)),
                 )
                 .when(*total > MAX_PROBLEM_ROWS, |el| {
                     el.child(note(
@@ -355,7 +356,7 @@ const fn incomplete_or_clear(incomplete: bool) -> &'static str {
 fn problem_row(
     index: usize,
     row: &ProblemRow,
-    focus: FocusHandle,
+    links: &DrawnLinks,
     theme: &Theme,
 ) -> impl IntoElement {
     let color = match row.severity {
@@ -401,7 +402,11 @@ fn problem_row(
                         .child(row.summary),
                 ),
         )
-        .on_click(registry::on_click_in(focus, row.open.clone()))
+        .on_click(links.on_click(
+            row.open.clone(),
+            DashboardModel::links_object,
+            registry::on_click_in(links.focus.clone(), row.open.clone()),
+        ))
 }
 
 /// What is left of each resource, then the nodes, most allocated first.
@@ -564,7 +569,7 @@ fn allocation_table(rows: &[NodeRow], theme: &Theme) -> impl IntoElement {
 /// The version, and a count per kind that opens its list.
 pub fn inventory_section(
     panel: &InventoryPanel,
-    focus: FocusHandle,
+    links: &DrawnLinks,
     theme: &Theme,
 ) -> impl IntoElement {
     let version = format!("Kubernetes {}", panel.version);
@@ -576,7 +581,7 @@ pub fn inventory_section(
                     .counts
                     .iter()
                     .enumerate()
-                    .map(|(index, count)| inventory_count(index, count, focus.clone(), theme)),
+                    .map(|(index, count)| inventory_count(index, count, links, theme)),
             ),
         )
 }
@@ -584,7 +589,7 @@ pub fn inventory_section(
 fn inventory_count(
     index: usize,
     count: &InventoryCount,
-    focus: FocusHandle,
+    links: &DrawnLinks,
     theme: &Theme,
 ) -> AnyElement {
     let text = format!("{} {}", count.value(), count.label);
@@ -594,7 +599,11 @@ fn inventory_count(
             .outline()
             .small()
             .label(text)
-            .on_click(registry::on_click_in(focus, count.open.clone()))
+            .on_click(links.on_click(
+                count.open.clone(),
+                DashboardModel::links_view,
+                registry::on_click_in(links.focus.clone(), count.open.clone()),
+            ))
             .into_any_element()
     } else {
         div()
@@ -609,7 +618,11 @@ fn inventory_count(
     }
 }
 
-pub fn warnings_section(panel: &WarningsPanel, theme: &Theme) -> impl IntoElement {
+pub fn warnings_section(
+    panel: &WarningsPanel,
+    links: &DrawnLinks,
+    theme: &Theme,
+) -> impl IntoElement {
     let body = match panel {
         WarningsPanel::Unavailable => note(
             "dashboard-warnings-unavailable",
@@ -626,11 +639,7 @@ pub fn warnings_section(panel: &WarningsPanel, theme: &Theme) -> impl IntoElemen
         WarningsPanel::Rows { rows, total } => v_flex()
             .w_full()
             .min_w_0()
-            .children(
-                rows.iter()
-                    .enumerate()
-                    .map(|(index, row)| warning_row(index, row, theme)),
-            )
+            .children(rows.iter().map(|row| warning_row(row, links, theme)))
             .when(*total > MAX_WARNING_ROWS, |el| {
                 el.child(note(
                     "dashboard-warnings-more",
@@ -643,10 +652,29 @@ pub fn warnings_section(panel: &WarningsPanel, theme: &Theme) -> impl IntoElemen
     section("Recent Warning events", theme).child(body)
 }
 
-fn warning_row(index: usize, row: &WarningRow, theme: &Theme) -> impl IntoElement {
+/// A row that opens its object, or plain text when the event names none exactly. Its id follows
+/// the event, so keyboard focus stays on it as rows above come and go.
+fn warning_row(row: &WarningRow, links: &DrawnLinks, theme: &Theme) -> AnyElement {
+    let id = ElementId::Name(format!("dashboard-warning-{}", row.key).into());
+    let Some(open) = row.open.clone() else {
+        return warning_cells(row, theme)
+            .id(id)
+            .aria_label(row.label())
+            .test_support()
+            .into_any_element();
+    };
+    Button::new(id)
+        .accessibility_label(format!("Open {}", row.label()))
+        .ghost()
+        .small()
+        .w_full()
+        .child(warning_cells(row, theme))
+        .on_click(links.on_warning_click(row, open, registry::dispatch_in))
+        .into_any_element()
+}
+
+fn warning_cells(row: &WarningRow, theme: &Theme) -> Div {
     h_flex()
-        .id(("dashboard-warning", index))
-        .aria_label(row.label())
         .w_full()
         .min_w_0()
         .h(px(24.))
@@ -691,5 +719,4 @@ fn warning_row(index: usize, row: &WarningRow, theme: &Theme) -> impl IntoElemen
                     .child(format!("x{}", row.occurrences)),
             )
         })
-        .test_support()
 }

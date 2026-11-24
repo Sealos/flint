@@ -17,6 +17,7 @@ mod cluster_sets;
 mod compare;
 mod exec_plugins;
 mod harness;
+mod keyboard_palette;
 mod load;
 mod m0;
 mod m1;

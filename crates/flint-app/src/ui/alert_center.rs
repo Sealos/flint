@@ -42,7 +42,7 @@ use serde::Serialize;
 
 use super::clusters::{ClustersModel, Discovered};
 use super::workspace::SettingsDir;
-use super::{menu_fit, registry};
+use super::{menu_fit, pending_threshold, registry};
 use crate::notifications::investigate_prompt::{InvestigatePrompt, event_prompt};
 use crate::notifications::{
     ACCEPTED_TEXT, DeliveryError, Notification, NotificationSender, clean, distinct_labels,
@@ -73,7 +73,7 @@ pub const COVERAGE: &str =
 pub const NOT_COVERED: &str = "Other clusters have no background detection.";
 
 /// Every kind of problem.
-const ALL_KINDS: [ProblemKind; 6] = ProblemKind::ALL;
+const ALL_KINDS: [ProblemKind; 7] = ProblemKind::ALL;
 
 /// Turn desktop notifications on or off.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
@@ -556,6 +556,17 @@ impl AlertTracker {
                     .insert(Arc::clone(&input.cluster), input.origin.clone());
             }
             for event in events {
+                sent.push(self.record(event, input));
+            }
+        }
+        if let Some(event) = self.engine.take_fleet_summary(now) {
+            let first = match &event {
+                AlertEvent::FleetSummary(summary) => Some(&summary.first),
+                AlertEvent::Summary(summary) => Some(&summary.cluster),
+                _ => None,
+            };
+            let input = first.and_then(|first| inputs.iter().find(|i| i.cluster == *first));
+            if let Some(input) = input {
                 sent.push(self.record(event, input));
             }
         }
@@ -1183,6 +1194,7 @@ impl AlertCenter {
 pub fn install(model: &Entity<ClustersModel>, cx: &mut App) {
     let center = cx.new(|cx| AlertCenter::new(model.clone(), platform_sender(), cx));
     cx.set_global(Alerts(center.clone()));
+    pending_threshold::install(model, cx);
     let toggle_model = model.clone();
     cx.on_action(move |_: &ToggleDesktopNotifications, cx| {
         toggle_model.update(cx, |model, _| {
@@ -1235,7 +1247,8 @@ pub fn render_button(cx: &App) -> Option<impl IntoElement + use<>> {
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
                 menu_fit::dismiss_when_shrunk(window, cx);
                 let state = center.read(cx);
-                let mut menu = menu_fit::fit_menu(menu, window)
+                let pending = pending_threshold::PendingChoices::of(state.model.read(cx));
+                let menu = menu_fit::fit_menu(menu, window)
                     .item(
                         PopupMenuItem::new("Desktop notifications")
                             .checked(state.global)
@@ -1243,6 +1256,8 @@ pub fn render_button(cx: &App) -> Option<impl IntoElement + use<>> {
                     )
                     .label(COVERAGE)
                     .label(NOT_COVERED);
+                let mut menu = pending_threshold::submenu(menu, pending, window, cx);
+                let state = center.read(cx);
                 let model = state.model.read(cx);
                 if let Some(active) = model.active_cluster() {
                     let id = active.info.name.clone();
