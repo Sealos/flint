@@ -2076,7 +2076,7 @@ impl Workspace {
         let keep_watching = self
             .dashboard
             .is_some()
-            .then(|| self.render_keep_watching(&name, cx));
+            .then(|| self.render_keep_watching(&name, None, cx));
         let alerts = super::alert_center::render_button(cx);
         let first_row = super::theme::moves_window(h_flex())
             .h(px(HEADER_HEIGHT))
@@ -2142,7 +2142,13 @@ impl Workspace {
     }
 
     /// The overview's keep-watching toggle, saying what it would do and any state to act on.
-    fn render_keep_watching(&self, cluster: &str, cx: &Context<Self>) -> impl IntoElement {
+    /// `member` names a set member's copy of it, which needs ids of its own.
+    pub(super) fn render_keep_watching(
+        &self,
+        cluster: &str,
+        member: Option<&str>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let model = self.model.read(cx);
         let (status, sign_in) = model
             .keep_watching(cluster)
@@ -2150,7 +2156,7 @@ impl Workspace {
                 (view.status, view.sign_in)
             });
         let settings_ok = model.settings_error.is_none();
-        Button::new("keep-watching")
+        Button::new(member_id("keep-watching", member))
             .xsmall()
             .ghost()
             .label(keep_watching::toggle_label(status, sign_in))
@@ -2170,6 +2176,20 @@ impl Workspace {
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
         self.dashboard.as_ref()?;
+        self.background_sign_in_row(cluster, None, None, theme, cx)
+    }
+
+    /// The background sign-in toggle of `cluster` and the command it names, after `lead`.
+    /// `member` names a set member's copy of it, which needs ids of its own. None for a
+    /// credential that runs nothing.
+    pub(super) fn background_sign_in_row(
+        &self,
+        cluster: &str,
+        member: Option<&str>,
+        lead: Option<AnyElement>,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
         let view = self.model.read(cx).keep_watching(cluster)?.clone();
         if view.sign_in == BackgroundSignIn::NotNeeded {
             return None;
@@ -2179,7 +2199,7 @@ impl Workspace {
         let model = self.model.clone();
         let name = cluster.to_owned();
         let shown = view.shown_sign_in;
-        let toggle = Switch::new("background-sign-in")
+        let toggle = Switch::new(member_id("background-sign-in", member))
             .small()
             .checked(view.sign_in == BackgroundSignIn::On)
             .disabled(!enabled)
@@ -2198,7 +2218,7 @@ impl Workspace {
             });
         let command = view.command.map(|command| {
             div()
-                .id("background-sign-in-command")
+                .id(member_id("background-sign-in-command", member))
                 .min_w_0()
                 .truncate()
                 .text_xs()
@@ -2209,7 +2229,7 @@ impl Workspace {
         });
         Some(
             h_flex()
-                .id("background-sign-in-row")
+                .id(member_id("background-sign-in-row", member))
                 .w_full()
                 .flex_none()
                 .px_3()
@@ -2217,6 +2237,7 @@ impl Workspace {
                 .gap_3()
                 .border_b_1()
                 .border_color(theme.border)
+                .children(lead)
                 .child(div().flex_none().child(toggle))
                 .children(command)
                 .test_support()
@@ -2898,6 +2919,14 @@ pub(super) fn protection_text(
 /// A cluster as its row's controls name it: the title, then the full context when the title is
 /// not the context, since two contexts can share a title. The context is quoted and escaped, so
 /// no context or title can be written to read as another cluster's name.
+/// `base`, or for a set member's copy of a control, `base-<member>`.
+fn member_id(base: &'static str, member: Option<&str>) -> SharedString {
+    match member {
+        Some(member) => format!("{base}-{member}").into(),
+        None => base.into(),
+    }
+}
+
 fn control_name(title: &str, context: &str) -> String {
     let shown = flint_core::display::single_line(title);
     if title == context && !context.contains('"') {
