@@ -627,3 +627,64 @@ async fn a_preview_only_sends_dry_runs() {
         }
     }
 }
+
+// covers UP-100: the plan the app confirms leaves a locked member out, so it gets no request and
+// the others still run, each heard as it ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_locked_member_left_out_of_the_plan_lets_the_others_run() {
+    let fleet = Fleet::start(&["b"]).await;
+    let mut preview = fleet.preview(FleetAction::Scale { to: 5 }).await;
+    let will_run: Vec<bool> = preview.entries().iter().map(|e| e.will_run()).collect();
+    assert_eq!(will_run, [true, false, true]);
+    assert_eq!(preview.drop_refused(), ["b"]);
+
+    let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let report = {
+        let heard = heard.clone();
+        fleet
+            .core
+            .handle
+            .run_fleet(preview, FleetCancel::new(), move |result| {
+                heard.lock().unwrap().push(result.clone())
+            })
+            .await
+    };
+    assert_eq!(
+        statuses(&report),
+        [
+            FleetStatus::Done,
+            FleetStatus::Skipped(FleetSkip::Dropped),
+            FleetStatus::Done,
+        ]
+    );
+    assert_eq!(*heard.lock().unwrap(), report.results);
+    assert_eq!(all_writes(fleet.server("b")), 0, "not even a dry run");
+    assert_eq!(replicas(fleet.server("b")), 2);
+    assert_eq!(replicas(fleet.server("a")), 5);
+    assert_eq!(replicas(fleet.server("c")), 5);
+}
+
+// covers UP-100: with a locked member left out and a failure on the next, the result says which
+// member was refused, which failed and which was not tried, and nothing reaches the last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partial_failure_after_a_refusal_reports_each_member() {
+    let fleet = Fleet::start(&["a"]).await;
+    let mut preview = fleet.preview(FleetAction::RolloutRestart).await;
+    assert_eq!(preview.drop_refused(), ["a"]);
+    let b = fleet.server("b");
+    b.inject(
+        Fault::status(500)
+            .on(&deployments())
+            .verb(Verb::Other)
+            .times(1),
+    );
+
+    let report = fleet.run(preview).await;
+    let results = statuses(&report);
+    assert_eq!(results[0], FleetStatus::Skipped(FleetSkip::Dropped));
+    assert!(matches!(results[1], FleetStatus::Failed(_)), "{results:?}");
+    assert_eq!(results[2], AFTER_FAILURE);
+    assert_eq!(all_writes(fleet.server("a")), 0);
+    assert_eq!(stored_writes(b), 0);
+    assert_eq!(real_writes(fleet.server("c")), 0);
+}

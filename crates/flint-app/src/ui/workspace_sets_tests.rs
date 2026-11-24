@@ -26,6 +26,8 @@ use super::{
     rename_problem,
 };
 use crate::ui::confirm;
+use crate::ui::fleet_plan::FleetChoice;
+use crate::ui::fleet_view;
 use crate::ui::list::combined::row_id;
 use crate::ui::resource_actions::{ResourceAction, available, request, target_of};
 use crate::ui::support_tests::{
@@ -235,7 +237,16 @@ struct OpenRow {
 }
 
 async fn open_beta_row(cx: &mut TestAppContext, dir: &std::path::Path) -> OpenRow {
-    let (alpha_api, beta_api) = (LocalApi::start(&[]), LocalApi::start(&[]));
+    open_beta_row_answering(cx, dir, &[]).await
+}
+
+/// [`open_beta_row`], with `kind-alpha` answering its writes with `alpha_statuses` in turn.
+async fn open_beta_row_answering(
+    cx: &mut TestAppContext,
+    dir: &std::path::Path,
+    alpha_statuses: &[u16],
+) -> OpenRow {
+    let (alpha_api, beta_api) = (LocalApi::start(alpha_statuses), LocalApi::start(&[]));
     let (alpha_url, alpha_writes) = counting_proxy(&alpha_api.url);
     let (beta_url, beta_writes) = counting_proxy(&beta_api.url);
     let urls = (alpha_url.clone(), beta_url.clone());
@@ -1694,4 +1705,103 @@ fn every_set_and_combined_action_is_bound() {
     use crate::ui::registry::{Scope, tests::assert_binds_scope};
     assert_binds_scope(Scope::ClusterSets, Workspace::bind_set_actions);
     assert_binds_scope(Scope::CombinedList, CombinedResourceList::bind_actions);
+}
+
+/// Asks for a fleet restart of the open row and waits for its one confirmation.
+async fn offer_fleet_restart(cx: &mut TestAppContext, t: &TestWorkspace) -> confirm::DialogText {
+    let (workspace, window) = (t.workspace.clone(), t.window);
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| {
+            assert_eq!(
+                fleet_view::available(ws, FleetChoice::RolloutRestart, cx),
+                Ok(())
+            );
+            fleet_view::request(ws, FleetChoice::RolloutRestart, window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(t.window, WAIT, |window, _| window.find_all("ok").len() == 1)
+        .await;
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    cx.update_window(t.window, |_, window, cx| confirm::shown(window, cx))
+        .unwrap()
+        .expect("the plan")
+}
+
+// covers UP-100: one confirmation names both members after a dry run on each, and the run
+// restarts each once, reporting each.
+#[gpui_kit::test]
+async fn a_fleet_restart_runs_on_each_member_after_one_confirmation(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let row = open_beta_row(cx, dir.path()).await;
+    let t = &row.t;
+    let plan = offer_fleet_restart(cx, t).await;
+    assert_eq!(plan.title, "Restart web on 2 of 2 clusters?");
+    assert!(
+        plan.text.contains("Runs on: kind-alpha, kind-beta"),
+        "{}",
+        plan.text
+    );
+    assert_eq!(row.alpha_writes.load(Ordering::SeqCst), 1, "its dry run");
+    assert_eq!(row.beta_writes.load(Ordering::SeqCst), 1, "its dry run");
+    t.click(cx, "ok");
+    t.wait_for_label(cx, "fleet-summary", "Finished: 2 done.")
+        .await;
+    assert_eq!(row.alpha_writes.load(Ordering::SeqCst), 2);
+    assert_eq!(row.beta_writes.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        t.label(cx, ("fleet-result", 0usize)).as_deref(),
+        Some("kind-alpha: done")
+    );
+}
+
+// covers UP-100: the first member's failure stops the run: the next gets its dry run and nothing
+// else, and the results say which failed and which was not tried.
+#[gpui_kit::test]
+async fn a_fleet_failure_stops_the_run_and_says_so(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    // Alpha's dry run passes; its restart is refused.
+    let row = open_beta_row_answering(cx, dir.path(), &[200, 422]).await;
+    let t = &row.t;
+    offer_fleet_restart(cx, t).await;
+    t.click(cx, "ok");
+    t.wait_for_label(cx, "fleet-summary", "Finished: 1 failed, 1 not tried.")
+        .await;
+    assert_eq!(
+        row.alpha_writes.load(Ordering::SeqCst),
+        2,
+        "sent once, not retried"
+    );
+    assert_eq!(
+        row.beta_writes.load(Ordering::SeqCst),
+        1,
+        "its dry run only"
+    );
+    assert_eq!(
+        t.label(cx, ("fleet-result", 1usize)).as_deref(),
+        Some("kind-beta: not tried: an earlier cluster failed")
+    );
+}
+
+// covers UP-100, UP-54: protected members are left out before any request; with every member
+// protected there is nothing to confirm.
+#[gpui_kit::test]
+async fn a_fleet_action_leaves_protected_members_out(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("settings.toml"),
+        "protect_local_clusters = true\n",
+    )
+    .unwrap();
+    let row = open_beta_row(cx, dir.path()).await;
+    let t = &row.t;
+    let plan = offer_fleet_restart(cx, t).await;
+    assert_eq!(plan.title, "Nothing to run for web");
+    assert!(plan.cancel.is_empty());
+    assert!(plan.text.contains("kind-beta: left out: "), "{}", plan.text);
+    t.click(cx, "ok");
+    cx.run_until_parked();
+    assert_eq!(row.alpha_writes.load(Ordering::SeqCst), 0);
+    assert_eq!(row.beta_writes.load(Ordering::SeqCst), 0);
 }

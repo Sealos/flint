@@ -74,6 +74,14 @@ impl ConnectionGuard {
         Self(Rc::new(move |_| check()))
     }
 
+    /// A guard that holds only while every one of `guards` does, for a dialog about several
+    /// connections (a fleet action's). With none, it never holds.
+    pub(in crate::ui) fn all(guards: Vec<ConnectionGuard>) -> Self {
+        Self(Rc::new(move |cx| {
+            !guards.is_empty() && guards.iter().all(|guard| guard.holds(cx))
+        }))
+    }
+
     pub(in crate::ui) fn holds(&self, cx: &App) -> bool {
         (self.0)(cx)
     }
