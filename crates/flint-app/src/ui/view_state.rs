@@ -99,6 +99,8 @@ pub enum Focus {
     Navigation,
     /// The detail pane, outside its YAML editor.
     Detail,
+    /// The cluster overview: its panel or one of its links.
+    Overview,
     /// The resource list's rows.
     List,
     /// The list's text filter.
