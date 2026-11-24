@@ -184,17 +184,27 @@ fn a_route_identity_tells_accounts_apart_without_holding_them() {
     let one = route_identity("http://alice:s3cret@proxy:3128");
     let two = route_identity("http://bob:s3cret@proxy:3128");
     let three = route_identity("http://alice:other@proxy:3128");
-    assert_ne!(one, two);
-    assert_ne!(one, three);
-    assert_eq!(one, route_identity("http://alice:s3cret@proxy:3128"));
-    assert_ne!(one, route_identity("http://proxy:3128"));
+    // Identities are compared without formatting them into a failure message.
+    assert!(one != two, "different users differ");
+    assert!(one != three, "different passwords differ");
+    assert!(
+        one == route_identity("http://alice:s3cret@proxy:3128"),
+        "the same account is stable"
+    );
+    assert!(
+        one != route_identity("http://proxy:3128"),
+        "an account differs from no account"
+    );
     assert_eq!(route_identity("http://proxy:3128"), "http://proxy:3128");
     for text in [&one, &two, &three] {
         assert!(
             !text.contains("alice") && !text.contains("s3cret"),
-            "{text}"
+            "an identity holds no credential"
         );
-        assert_eq!(shown(text), "http://proxy:3128", "shown without its digest");
+        assert!(
+            shown(text) == "http://proxy:3128",
+            "shown without its digest"
+        );
     }
 }
 
@@ -204,7 +214,7 @@ const ACCOUNT: &str = "http://alice:s3cret@proxy:3128";
 fn installs_with_different_keys_have_different_digests() {
     let (one, two) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let at = |dir: &tempfile::TempDir| route_identity_with(ACCOUNT, || open_route_key(dir.path()));
-    assert_ne!(at(&one), at(&two));
+    assert!(at(&one) != at(&two), "each install has its own key");
     assert!(is_stable_identity(&at(&one)));
 }
 
@@ -214,7 +224,7 @@ fn one_install_keeps_its_identity_across_processes() {
     // A restart, or the other of the app and `flint mcp`: each opens the file afresh.
     let first = route_identity_with(ACCOUNT, || open_route_key(dir.path()));
     let second = route_identity_with(ACCOUNT, || open_route_key(dir.path()));
-    assert_eq!(first, second);
+    assert!(first == second, "the identity survives a restart");
     let path = dir.path().join(ROUTE_KEY_FILE);
     let meta = std::fs::metadata(path).unwrap();
     use std::os::unix::fs::PermissionsExt as _;
@@ -229,14 +239,13 @@ fn an_unreadable_key_gives_no_stable_identity() {
 
     let now = route_identity_with(ACCOUNT, || open_route_key(dir.path()));
 
-    assert_ne!(now, saved);
-    assert_ne!(now, shown(ACCOUNT), "never the address alone");
+    assert!(now != saved, "a damaged key changes the identity");
+    assert!(now != shown(ACCOUNT), "never the address alone");
     assert!(!is_stable_identity(&now));
     let other = route_identity_with("http://bob:s3cret@proxy:3128", || None);
-    assert_ne!(now, other, "accounts stay apart");
-    assert_eq!(
-        now,
-        route_identity_with(ACCOUNT, || None),
+    assert!(now != other, "accounts stay apart");
+    assert!(
+        now == route_identity_with(ACCOUNT, || None),
         "same across reloads"
     );
     assert_eq!(
@@ -271,10 +280,13 @@ fn a_saved_grant_holds_no_part_of_the_credential() {
             grant_endpoint(SERVER, Some(&identity)),
         ));
     let saved = toml::to_string(&settings).unwrap();
-    assert!(saved.contains("http://proxy:3128#"), "{saved}");
+    assert!(
+        saved.contains("http://proxy:3128#"),
+        "the grant keeps the proxy and a digest"
+    );
     assert!(
         !saved.contains("alice") && !saved.contains("s3cret"),
-        "{saved}"
+        "the grant holds no credential"
     );
 }
 
