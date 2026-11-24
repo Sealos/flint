@@ -19,6 +19,7 @@ use super::telemetry::reads_token_file;
 use super::{ClusterManager, Internal};
 use crate::ClusterId;
 use crate::cluster;
+use crate::connection::member::MemberState;
 use crate::connection::policy::{CredentialAccess, PluginRuns, Role};
 use crate::credential::CredentialSource;
 use crate::handle::{ConnectionState, Event};
@@ -403,6 +404,20 @@ impl ClusterManager {
             && self.active.as_deref() != Some(id)
             && self.keep_watching(id)
             && !self.wants_telemetry(id)
+            && !self.member_serves_keep(id)
+    }
+
+    /// Whether `id` is a member of the open set with background sign-in consent that is up or
+    /// still connecting. Its slot then connects under that consent and its feed serves keep
+    /// watching, so its plugin runs once. A member waiting for a sign-in makes no connection, and
+    /// leaving the set ends it: the kept feed takes over in both cases.
+    fn member_serves_keep(&self, id: &str) -> bool {
+        self.member_on_its_server(id)
+            && self.member_consent(id).is_some()
+            && self
+                .members
+                .get(id)
+                .is_some_and(|member| !matches!(member.state(), MemberState::SignInNeeded { .. }))
     }
 
     /// Whether no change of the kubeconfig files is waiting to be read.

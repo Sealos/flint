@@ -227,6 +227,132 @@ async fn leaving_the_set_drops_a_consented_connection() {
     assert!(slot.connect_task.is_none());
 }
 
+/// A plugin that notes each start in `starts` and answers with a token.
+fn token_plugin() -> FakePlugin {
+    FakePlugin::new(
+        "echo $$ >> \"$PLUGIN_DIR/starts\"\n\
+         printf '{\"apiVersion\":\"client.authentication.k8s.io/v1\",\
+         \"kind\":\"ExecCredential\",\"status\":{\"token\":\"t\"}}'\n",
+    )
+}
+
+/// Waits for `plugin`'s first start.
+async fn wait_for_a_start(plugin: &FakePlugin) {
+    for _ in 0..250 {
+        if !plugin.starts().is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the plugin did not start");
+}
+
+/// Lands `dev`'s attempt in flight as connected, on a client that contacts nothing until used.
+/// The slot keeps the access the attempt was made under; the client itself is built without it.
+async fn land_dev(manager: &mut ClusterManager) {
+    let slot = manager.cluster_mut("dev").unwrap();
+    if let Some(task) = slot.connect_task.take() {
+        task.abort();
+    }
+    let attempt = slot.attempt;
+    let access = CredentialAccess::always();
+    let connection = cluster::connect_gated_with_policy(&manager.kubeconfig.merged, "dev", &access)
+        .await
+        .expect("building a client contacts nothing");
+    let version = cluster::ServerVersion {
+        git_version: "v1.30.0".into(),
+        platform: "linux/arm64".into(),
+    };
+    manager
+        .handle_internal(Internal::Connected {
+            cluster: "dev".into(),
+            attempt,
+            result: Ok((connection, version)),
+        })
+        .await;
+}
+
+// A consented member of the open set runs its plugin once: its slot's connection, made under the
+// consent, also serves keep watching, so no kept connection runs the plugin a second time.
+#[tokio::test]
+async fn one_plugin_run_serves_the_member_and_keep_watching() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    open_set(&mut manager);
+    manager.sync_keep_watching();
+    wait_for_a_start(&plugin).await;
+
+    assert!(
+        !manager.keep.feeds.contains_key("dev"),
+        "no kept connection"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(plugin.starts().len(), 1, "only the member's run");
+
+    land_dev(&mut manager).await;
+    manager.sync_telemetry();
+    manager.sync_keep_watching();
+    assert!(manager.cluster("dev").unwrap().access.unattended());
+    assert!(
+        manager.cluster("dev").unwrap().telemetry.is_some(),
+        "the slot's feed serves keep watching"
+    );
+    assert!(!manager.keep.feeds.contains_key("dev"));
+    assert_eq!(manager.keep_status("dev"), KeepWatching::Watching);
+}
+
+// A member that waits for a sign-in makes no connection, so consent given later starts the kept
+// feed rather than leave the cluster unwatched.
+#[tokio::test]
+async fn a_member_waiting_for_a_sign_in_leaves_keep_watching_to_the_kept_feed() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    open_set(&mut manager);
+    assert!(matches!(
+        dev_state(&manager),
+        MemberState::SignInNeeded { .. }
+    ));
+
+    allow(&mut manager).await;
+    manager.sync_keep_watching();
+
+    assert!(matches!(
+        dev_state(&manager),
+        MemberState::SignInNeeded { .. }
+    ));
+    assert!(manager.keep.feeds.contains_key("dev"), "the kept feed runs");
+}
+
+// When the member leaves the set, its connection ends and the kept feed takes over.
+#[tokio::test]
+async fn the_kept_feed_resumes_when_the_member_leaves_the_set() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    open_set(&mut manager);
+    land_dev(&mut manager).await;
+    manager.sync_telemetry();
+    manager.sync_keep_watching();
+    assert!(manager.cluster("dev").unwrap().telemetry.is_some());
+    assert!(!manager.keep.feeds.contains_key("dev"));
+
+    manager.set_running_set(Vec::new());
+    manager.sync_telemetry();
+    manager.sync_keep_watching();
+
+    assert!(manager.cluster("dev").unwrap().telemetry.is_none());
+    let kept = &manager.keep.feeds["dev"];
+    assert!(
+        kept.runs_plugin,
+        "the kept feed runs the plugin under the consent"
+    );
+    assert!(kept.access.unattended());
+}
+
 // A kubeconfig file change ends a member's sign-in still running, so a token from before the new
 // definitions are read never brings its connection up.
 #[tokio::test]
