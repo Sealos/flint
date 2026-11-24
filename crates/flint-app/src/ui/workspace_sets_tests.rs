@@ -791,10 +791,13 @@ fn a_member_is_refused_unless_it_is_the_pinned_confirmed_cluster() {
         paused,
     };
     let current = summary("https://a.example", true);
-    assert_eq!(member_refusal(&pin, Some(&current), None, "prod"), None);
+    assert_eq!(
+        member_refusal(&pin, Some(&current), None, "prod", false),
+        None
+    );
     let live = report(false, MemberStatus::Live);
     assert_eq!(
-        member_refusal(&pin, Some(&current), Some(&live), "prod"),
+        member_refusal(&pin, Some(&current), Some(&live), "prod", false),
         None
     );
     // Unchanged while a file is unreadable: it keeps reading, and only its writes are paused.
@@ -803,7 +806,7 @@ fn a_member_is_refused_unless_it_is_the_pinned_confirmed_cluster() {
         ..current.clone()
     };
     assert_eq!(
-        member_refusal(&pin, Some(&writes_paused), Some(&live), "prod"),
+        member_refusal(&pin, Some(&writes_paused), Some(&live), "prod", false),
         None
     );
     // The summary says so before the next member report does.
@@ -812,7 +815,7 @@ fn a_member_is_refused_unless_it_is_the_pinned_confirmed_cluster() {
         paused: true,
         ..current.clone()
     };
-    let why = member_refusal(&pin, Some(&paused), None, "prod").unwrap();
+    let why = member_refusal(&pin, Some(&paused), None, "prod", false).unwrap();
     assert!(why.contains("paused"), "{why}");
     for (summary, report, says) in [
         (None, None, "no longer"),
@@ -842,9 +845,19 @@ fn a_member_is_refused_unless_it_is_the_pinned_confirmed_cluster() {
             "sign-in",
         ),
     ] {
-        let why = member_refusal(&pin, summary.as_ref(), report.as_ref(), "prod").unwrap();
+        let why = member_refusal(&pin, summary.as_ref(), report.as_ref(), "prod", false).unwrap();
         assert!(why.contains(says), "{why}");
     }
+    // A member whose background sign-in the set bar offers points there, not at the sidebar.
+    let signing = report(
+        false,
+        MemberStatus::SignInNeeded {
+            reason: SafeErrorText::reduced("expired"),
+        },
+    );
+    let why = member_refusal(&pin, Some(&current), Some(&signing), "prod", true).unwrap();
+    assert!(why.contains("background sign-in"), "{why}");
+    assert!(!why.contains("sidebar"), "{why}");
 }
 
 /// Saves `kind-alpha` and `kind-beta` as the set `both`.

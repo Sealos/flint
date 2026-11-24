@@ -19,6 +19,7 @@ use flint_core::display::{
     CUSTOM_NAME_PUNCTUATION, MAX_CUSTOM_NAME_CHARS, clean_custom_name, cluster_name_key,
 };
 use flint_core::handle::{AdmittedMember, LeftOutMember, MemberReport, MemberStatus, OpenedSet};
+use flint_core::keep_watching::BackgroundSignIn;
 use flint_core::settings::{ClusterPin, Settings, SettingsError};
 use flint_core::{ClusterId, ClusterSummary, KindId, KindSnapshot, NavEntry, SyncState};
 use gpui_kit::base::TestSupportExt as _;
@@ -236,11 +237,13 @@ fn rename_problem(saved: &[ClusterSet], id: &str, typed: &str) -> Option<String>
 
 /// Why a row of `pin`'s cluster cannot be opened or acted on, if so. Protection is not here: a
 /// protected cluster's rows open read-only and the write path refuses their actions.
+/// `sign_in_offered` is whether the set bar offers the member's background sign-in.
 pub(super) fn member_refusal(
     pin: &ClusterPin,
     summary: Option<&ClusterSummary>,
     report: Option<&MemberReport>,
     shown: &str,
+    sign_in_offered: bool,
 ) -> Option<String> {
     let Some(summary) = summary else {
         return Some(format!("{shown} is no longer in kubeconfig"));
@@ -262,6 +265,9 @@ pub(super) fn member_refusal(
         return Some(paused_text(shown));
     }
     match &report?.status {
+        MemberStatus::SignInNeeded { .. } if sign_in_offered => Some(format!(
+            "{shown} needs sign-in: allow its background sign-in above the list"
+        )),
         MemberStatus::SignInNeeded { .. } => {
             Some(format!("{shown} needs sign-in: select it in the sidebar"))
         }
@@ -702,7 +708,7 @@ impl Workspace {
         let names = self.cluster_names(cx);
         let refused = pins.iter().find_map(|pin| {
             let summary = self.cluster_summary(&pin.context, cx);
-            member_refusal(pin, summary, None, &names.exact(&pin.context))
+            member_refusal(pin, summary, None, &names.exact(&pin.context), false)
         });
         if let Some(why) = refused {
             self.sets.error = Some(why);
@@ -1075,7 +1081,8 @@ impl Workspace {
         }
         let report = run.reports.iter().find(|r| r.cluster == cluster);
         let summary = self.cluster_summary(cluster, cx);
-        member_refusal(member.pin(), summary, report, &shown).or_else(|| {
+        let offered = self.offers_member_sign_in(run, cluster, cx);
+        member_refusal(member.pin(), summary, report, &shown, offered).or_else(|| {
             // The core's published state: never behind what the gate decides.
             summary
                 .is_some_and(|c| self.model.read(cx).sessions_paused(c))
@@ -1126,29 +1133,29 @@ impl Workspace {
             return;
         };
         let names = self.cluster_names(cx);
-        let left: Vec<(ClusterId, String)> = run
-            .members
-            .iter()
-            .filter(|m| !run.changed.contains(m.context()))
-            .filter_map(|m| {
-                let summary = self.cluster_summary(m.context(), cx);
-                let on_pin = summary.is_some_and(|c| {
-                    m.same_endpoint(c)
-                        && c.info
-                            .server
-                            .as_deref()
-                            .is_some_and(|server| m.pin().matches(m.context(), server))
-                });
-                if on_pin {
-                    return None;
-                }
-                let shown = names.exact(m.context());
-                let why = member_refusal(m.pin(), summary, None, &shown).unwrap_or_else(|| {
-                    format!("{shown} changed since this set opened. Open the set again.")
-                });
-                Some((m.context().to_owned(), why))
-            })
-            .collect();
+        let left: Vec<(ClusterId, String)> =
+            run.members
+                .iter()
+                .filter(|m| !run.changed.contains(m.context()))
+                .filter_map(|m| {
+                    let summary = self.cluster_summary(m.context(), cx);
+                    let on_pin = summary.is_some_and(|c| {
+                        m.same_endpoint(c)
+                            && c.info
+                                .server
+                                .as_deref()
+                                .is_some_and(|server| m.pin().matches(m.context(), server))
+                    });
+                    if on_pin {
+                        return None;
+                    }
+                    let shown = names.exact(m.context());
+                    let why = member_refusal(m.pin(), summary, None, &shown, false).unwrap_or_else(
+                        || format!("{shown} changed since this set opened. Open the set again."),
+                    );
+                    Some((m.context().to_owned(), why))
+                })
+                .collect();
         for (cluster, why) in left {
             self.discard_member(&cluster, why, cx);
         }
@@ -1356,6 +1363,7 @@ impl Workspace {
                 .min_w_0()
                 .h_full()
                 .child(self.render_set_bar(run, theme, cx))
+                .children(self.render_member_sign_ins(run, theme, cx))
                 .child(body)
                 .test_support()
                 .into_any_element(),
@@ -1375,6 +1383,49 @@ impl Workspace {
         )
     }
 
+    /// Whether the set bar offers `context`'s background sign-in: it needs sign-in, runs a
+    /// command to get it, and has no consent to run it in the background. An auth provider's
+    /// sign-in is never offered.
+    fn offers_member_sign_in(&self, run: &RunningSet, context: &str, cx: &App) -> bool {
+        let needs = run.reports.iter().any(|r| {
+            r.cluster == context
+                && !r.paused
+                && matches!(r.status, MemberStatus::SignInNeeded { .. })
+        });
+        needs
+            && self
+                .model
+                .read(cx)
+                .keep_watching(context)
+                .is_some_and(|view| view.sign_in == BackgroundSignIn::Off)
+    }
+
+    /// The background sign-in of each member the set bar offers it for, with its keep-watching
+    /// toggle: the overview's controls, giving the same consent.
+    fn render_member_sign_ins(
+        &self,
+        run: &RunningSet,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> Vec<AnyElement> {
+        let names = self.cluster_names(cx);
+        run.members
+            .iter()
+            .map(|member| member.context())
+            .filter(|context| self.offers_member_sign_in(run, context, cx))
+            .filter_map(|context| {
+                let lead = h_flex()
+                    .flex_none()
+                    .gap_2()
+                    .text_xs()
+                    .child(div().child(names.exact(context)))
+                    .child(self.render_keep_watching(context, Some(context), cx))
+                    .into_any_element();
+                self.background_sign_in_row(context, Some(context), Some(lead), theme, cx)
+            })
+            .collect()
+    }
+
     /// The sidebar's choice, the saved sets and the running set, as data.
     #[cfg(any(test, feature = "automation"))]
     pub(super) fn sets_view_state(&self, cx: &App) -> ClusterSetsState {
@@ -1392,6 +1443,14 @@ impl Workspace {
                         SetMemberState {
                             cluster: cluster.to_owned(),
                             note: self.set_member_note(run, cluster, cx),
+                            background_sign_in: self.offers_member_sign_in(run, cluster, cx).then(
+                                || {
+                                    self.model
+                                        .read(cx)
+                                        .keep_watching(cluster)
+                                        .is_some_and(|view| view.sign_in == BackgroundSignIn::On)
+                                },
+                            ),
                             tag: shown
                                 .iter()
                                 .find(|m| m.cluster() == cluster)
