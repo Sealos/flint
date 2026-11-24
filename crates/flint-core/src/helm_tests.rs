@@ -305,6 +305,36 @@ fn a_cluster_proxy_url_wins_over_the_environment() {
     );
 }
 
+// client-go takes `socks5` names to the proxy and refuses `socks5h`, so neither reaches `helm`;
+// nor does a proxy Flint itself would refuse.
+#[test]
+fn a_socks_or_refused_proxy_is_not_handed_to_helm() {
+    let merged = config(CONFIG);
+    for (proxy, expected) in [
+        ("socks5://alice:s3cret@bastion:1080", HelmError::SocksProxy),
+        ("socks5h://bastion", HelmError::SocksProxy),
+        ("socks4://bastion:1080", HelmError::ProxyRefused),
+    ] {
+        let environment = ProxyEnvironment {
+            https_proxy: Some(proxy.into()),
+            no_proxy: None,
+        };
+        let refused = HelmTarget::new_in(
+            &merged,
+            "dev",
+            pin_for(&merged),
+            credential(CredentialSource::Definition),
+            None,
+            unused_root(),
+            &environment,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(refused, expected, "{proxy}");
+        assert!(!refused.to_string().contains("s3cret"));
+    }
+}
+
 // A run gets a list of arguments, nothing of Flint's environment, and a kubeconfig holding only
 // the pinned context, whatever the person's current context is.
 #[tokio::test]

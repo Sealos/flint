@@ -51,7 +51,7 @@ fn shown_never_holds_credentials() {
 #[test]
 fn unsupported_schemes_are_refused_without_credentials() {
     for url in [
-        "socks5://user:s3cret@bastion:1080",
+        "socks4://user:s3cret@bastion:1080",
         "https://user:s3cret@proxy:3128",
     ] {
         let refused = ProxyTarget::parse(url).unwrap_err();
@@ -70,11 +70,11 @@ fn unsupported_schemes_are_refused_without_credentials() {
 fn a_target_keeps_credentials_out_of_its_address_and_debug() {
     let target = ProxyTarget::parse("http://user:pa%40ss@proxy:3128").unwrap();
     assert_eq!(target.uri.to_string(), "http://proxy:3128/");
+    let Kind::Connect { authorization } = &target.kind else {
+        panic!("not a CONNECT proxy");
+    };
     // base64 of `user:pa@ss`: percent escapes are decoded first.
-    assert_eq!(
-        target.authorization.as_ref().unwrap(),
-        "Basic dXNlcjpwYUBzcw=="
-    );
+    assert_eq!(authorization.as_ref().unwrap(), "Basic dXNlcjpwYUBzcw==");
     let debug = format!("{target:?}");
     assert!(
         !debug.contains("dXNlcjpwYUBzcw") && !debug.contains("user"),
@@ -513,12 +513,12 @@ fn a_proxy_setting_never_shows_its_credentials() {
 #[test]
 fn an_unsupported_setting_is_refused_without_its_credentials() {
     let merged = environment(None, None).under(Some(&setting(
-        Some("socks5://alice:s3cret@proxy:1080"),
+        Some("socks4://alice:s3cret@proxy:1080"),
         &[],
     )));
     let chosen = chosen(None, Some(SERVER), &merged).unwrap();
     let text = ProxyTarget::parse(chosen).unwrap_err().to_string();
-    assert!(text.contains("socks5://proxy:1080"), "{text}");
+    assert!(text.contains("socks4://proxy:1080"), "{text}");
     assert!(
         !text.contains("s3cret") && !text.contains("alice"),
         "{text}"
@@ -562,4 +562,197 @@ fn a_settings_error_near_the_proxy_does_not_quote_its_credentials() {
     );
     let summary = crate::redact::safe_error_summary(&error.to_string());
     assert!(!summary.contains("s3cret"), "{summary}");
+}
+
+/// The SOCKS5 parts of `target`.
+fn socks(target: &ProxyTarget) -> (SocksResolution, Option<(String, String)>) {
+    match &target.kind {
+        Kind::Socks {
+            resolution,
+            account,
+        } => (*resolution, account.clone()),
+        Kind::Connect { .. } => panic!("not a SOCKS proxy"),
+    }
+}
+
+#[test]
+fn socks5_resolves_names_here_and_socks5h_at_the_proxy() {
+    let local = ProxyTarget::parse("socks5://bastion:1081").unwrap();
+    assert!(local.is_socks());
+    assert_eq!(socks(&local), (SocksResolution::Local, None));
+    assert_eq!(local.uri.to_string(), "socks5://bastion:1081/");
+    let remote = ProxyTarget::parse(" SOCKS5H://Bastion:1081 ").unwrap();
+    assert_eq!(socks(&remote), (SocksResolution::Proxy, None));
+    assert_eq!(remote.uri.to_string(), "socks5h://bastion:1081/");
+    assert!(!ProxyTarget::parse("http://proxy:3128").unwrap().is_socks());
+}
+
+#[test]
+fn a_socks_proxy_without_a_port_uses_1080() {
+    for (proxy, address) in [
+        ("socks5://bastion", "socks5://bastion:1080/"),
+        ("socks5h://alice:s3cret@[::1]", "socks5h://[::1]:1080/"),
+    ] {
+        let target = ProxyTarget::parse(proxy).unwrap();
+        assert_eq!(target.uri.to_string(), address, "{proxy}");
+    }
+}
+
+#[test]
+fn a_socks_account_is_decoded_and_never_shown() {
+    let proxy = "socks5h://alice:pa%40ss@bastion:1080";
+    let target = ProxyTarget::parse(proxy).unwrap();
+    assert_eq!(
+        socks(&target).1,
+        Some(("alice".to_owned(), "pa@ss".to_owned()))
+    );
+    for text in [
+        format!("{target:?}"),
+        target.uri.to_string(),
+        shown(proxy),
+        route_identity(proxy),
+    ] {
+        assert!(
+            !text.contains("alice") && !text.contains("pa%40ss"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn a_socks_account_longer_than_socks5_allows_is_refused() {
+    let long = "a".repeat(256);
+    for proxy in [
+        format!("socks5://{long}:s3cret@bastion:1080"),
+        format!("socks5h://alice:{long}@bastion:1080"),
+    ] {
+        let refused = ProxyTarget::parse(&proxy).unwrap_err();
+        assert_eq!(refused, ProxyRefused::SocksCredentialTooLong);
+        assert!(!refused.to_string().contains("s3cret"));
+    }
+    let limit = "a".repeat(255);
+    assert!(ProxyTarget::parse(&format!("socks5://{limit}:{limit}@bastion:1080")).is_ok());
+}
+
+#[test]
+fn each_proxy_kind_is_its_own_route() {
+    let identities = [
+        route_identity("http://bastion:1080"),
+        route_identity("socks5://bastion:1080"),
+        route_identity("socks5h://bastion:1080"),
+        route_identity("socks5h://alice:s3cret@bastion:1080"),
+        route_identity("socks5h://bob:s3cret@bastion:1080"),
+    ];
+    for (i, one) in identities.iter().enumerate() {
+        for two in &identities[i + 1..] {
+            assert!(one != two, "two routes share an identity");
+        }
+    }
+    assert_eq!(identities[2], "socks5h://bastion:1080");
+    assert!(identities[3].starts_with("socks5h://bastion:1080#"));
+}
+
+#[test]
+fn a_socks_proxy_follows_the_same_precedence_and_no_proxy() {
+    let env = environment(Some("socks5://env:1080"), Some(".example.test"));
+    assert_eq!(chosen(None, Some(SERVER), &env), None);
+    assert_eq!(
+        chosen(None, Some("https://other.test"), &env),
+        Some("socks5://env:1080")
+    );
+    let set = setting(Some("socks5h://setting:1080"), &["other.test"]);
+    let merged = env.under(Some(&set));
+    assert_eq!(
+        chosen(None, Some(SERVER), &merged),
+        Some("socks5h://setting:1080")
+    );
+    assert_eq!(chosen(None, Some("https://other.test"), &merged), None);
+    assert_eq!(
+        chosen(Some("http://entry:3128"), Some(SERVER), &merged),
+        Some("http://entry:3128")
+    );
+}
+
+#[test]
+fn an_unreadable_settings_file_refuses_routes_that_would_take_it() {
+    let env = ProxyEnvironment::unreadable_setting();
+    // Nothing is exempt: the setting's no-proxy list is unknown too.
+    let chosen_proxy = chosen(None, Some(SERVER), &env).unwrap();
+    let refused = ProxyTarget::parse(chosen_proxy).unwrap_err();
+    assert_eq!(refused, ProxyRefused::SettingsUnreadable);
+    assert!(refused.to_string().contains("settings.toml"), "{refused}");
+    assert!(refused.to_string().contains("did not connect"), "{refused}");
+    // A cluster's own proxy-url is still used.
+    assert_eq!(
+        chosen(Some("socks5://entry:1080"), Some(SERVER), &env),
+        Some("socks5://entry:1080")
+    );
+    // Its route is named plainly and holds nothing of the file.
+    assert_eq!(shown(chosen_proxy), SETTINGS_UNREADABLE_SHOWN);
+    assert_eq!(route_identity(chosen_proxy), SETTINGS_UNREADABLE_SHOWN);
+}
+
+#[test]
+fn the_settings_error_says_the_proxy_setting_was_not_applied() {
+    let reason = "invalid TOML at line 1, column 2 in /cfg/settings.toml".to_owned();
+    assert_eq!(with_proxy_note(reason.clone(), false), reason);
+    let noted = with_proxy_note(reason.clone(), true);
+    assert!(noted.starts_with(&reason), "{noted}");
+    assert!(
+        noted.contains("proxy setting could not be applied"),
+        "{noted}"
+    );
+}
+
+#[test]
+fn a_plugin_gets_the_settings_proxy_and_no_proxy_list() {
+    let variables = setting_variables(&setting(Some(" http://proxy:3128 "), &["10.0.0.0/8"]));
+    assert_eq!(
+        variables,
+        [
+            ("HTTPS_PROXY", Some("http://proxy:3128".to_owned())),
+            ("https_proxy", Some("http://proxy:3128".to_owned())),
+            ("NO_PROXY", Some("10.0.0.0/8".to_owned())),
+            ("no_proxy", Some("10.0.0.0/8".to_owned())),
+        ]
+    );
+    // A URL without a list removes the environment's, which belongs to its own proxy.
+    let socks = setting_variables(&setting(Some("socks5h://bastion:1080"), &[]));
+    let url = Some("socks5h://bastion:1080".to_owned());
+    assert_eq!(
+        socks,
+        [
+            ("HTTPS_PROXY", url.clone()),
+            ("https_proxy", url.clone()),
+            ("ALL_PROXY", url.clone()),
+            ("all_proxy", url),
+            ("NO_PROXY", None),
+            ("no_proxy", None),
+        ]
+    );
+    // A list alone replaces NO_PROXY only.
+    assert_eq!(
+        setting_variables(&setting(None, &["other.test"])),
+        [
+            ("NO_PROXY", Some("other.test".to_owned())),
+            ("no_proxy", Some("other.test".to_owned())),
+        ]
+    );
+    assert!(setting_variables(&ProxySetting::default()).is_empty());
+}
+
+#[test]
+fn a_plugin_never_gets_the_settings_proxy_credentials() {
+    let explicit: Vec<(OsString, Option<OsString>)> =
+        setting_variables(&setting(Some("socks5://alice:s3cret@bastion:1080"), &[]))
+            .into_iter()
+            .map(|(name, value)| (OsString::from(name), value.map(OsString::from)))
+            .collect();
+    let changes = plugin_environment(Vec::new(), &explicit);
+    let proxies = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"];
+    assert_eq!(changes.len(), proxies.len());
+    for (name, address) in changes {
+        assert!(proxies.iter().any(|p| name == *p), "{name:?}");
+        assert_eq!(address.as_deref(), Some("socks5://bastion:1080"));
+    }
 }

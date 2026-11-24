@@ -923,10 +923,14 @@ fn build_observed_client(
                 .map(|()| target)
         })
         .map_err(|refused| kube::Error::Service(refused.to_string().into()))?;
-    let connector = target.tunnel(http_connector());
-    assemble_client(
-        connector, config, token, auth, guarded, access, observer, check,
-    )
+    match target.tunnel(http_connector()) {
+        proxy::ProxyConnector::Connect(connector) => assemble_client(
+            connector, config, token, auth, guarded, access, observer, check,
+        ),
+        proxy::ProxyConnector::Socks(connector) => assemble_client(
+            connector, config, token, auth, guarded, access, observer, check,
+        ),
+    }
 }
 
 /// The client stack of [`build_client`], over `connector`.
