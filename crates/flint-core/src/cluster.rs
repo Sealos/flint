@@ -1009,6 +1009,24 @@ pub(crate) fn sending_credential(client: Client, credential: credential::BoundHe
     Client::new(service, namespace)
 }
 
+/// `client`, whose requests use the exec token it holds now and never run the plugin for another.
+/// Each request still passes through the whole stack of `client`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "wraps a client build_client made, adding only a marker to each request"
+)]
+pub(crate) fn reusing_held_token(client: Client) -> Client {
+    let namespace = client.default_namespace().to_owned();
+    let service = tower::service_fn(move |mut request: http::Request<kube::client::Body>| {
+        let client = client.clone();
+        request
+            .extensions_mut()
+            .insert(crate::auth_plugin::HeldTokenOnly);
+        async move { client.send(request).await }
+    });
+    Client::new(service, namespace)
+}
+
 /// Stops exec auth plugins from prompting: they get no stdin and cannot ask for input. Used when
 /// stdin is not a terminal the user is watching, such as the MCP server, whose stdin is the
 /// protocol stream.

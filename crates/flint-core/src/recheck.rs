@@ -145,6 +145,13 @@ impl ContextPin {
         }
     }
 
+    /// Whether both pins are on one confirmed endpoint. A stale pin matches nothing.
+    pub fn same_endpoint_as(&self, other: &ContextPin) -> bool {
+        self.endpoint != 0
+            && self.endpoint == other.endpoint
+            && same_endpoint(self.server.as_deref(), other.server.as_deref())
+    }
+
     /// Whether `other` is this pin on another connection definition, and nothing else moved.
     pub fn only_definition_differs(&self, other: &ContextPin) -> bool {
         self.definition != other.definition

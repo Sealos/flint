@@ -22,7 +22,7 @@ use gpui_kit::*;
 use super::cluster_tag;
 use super::nav::NavPanel;
 use super::scope_picker;
-use super::workspace::{WRITES_PAUSED_TIP, protection_text, server_text};
+use super::workspace::{WRITES_PAUSED_TIP, changed_from, protection_text, server_text};
 
 pub struct ClustersModel {
     core: CoreHandle,
@@ -733,7 +733,7 @@ pub fn cluster_details(
         AiExposureState::ServerChanged { exposed_server } => format!(
             "Cluster changed: exposed at {}, now points elsewhere. Hidden from AI agents \
              until you expose it again.",
-            flint_core::redact::server_url(&exposed_server)
+            changed_from(cluster.info.server.as_deref(), &exposed_server)
         ),
     };
     let tag_line = model
@@ -745,7 +745,11 @@ pub fn cluster_details(
         if model.writes_paused(cluster) {
             WRITES_PAUSED_TIP.to_owned()
         } else {
-            protection_text(model.protection(cluster), &model.trust(cluster))
+            protection_text(
+                model.protection(cluster),
+                &model.trust(cluster),
+                cluster.info.server.as_deref(),
+            )
         },
         cluster.info.source.display()
     )

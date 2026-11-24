@@ -66,6 +66,7 @@ impl Workspace {
                         AiExposureState::ServerChanged { .. } => "server_changed",
                     },
                     protection: model.protection(cluster).name(),
+                    kubeconfig_unreadable: model.writes_paused(cluster),
                     cursor: cursor.as_deref() == Some(cluster.info.name.as_str()),
                 }
             })

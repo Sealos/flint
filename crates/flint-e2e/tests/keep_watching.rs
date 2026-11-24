@@ -10,7 +10,8 @@ use flint_core::handle::{Command, Event};
 use flint_core::keep_watching::{
     BackgroundSignIn, KeepWatching, MAX_WATCHED_CLUSTERS, PluginOffer, WatchedCluster,
 };
-use flint_core::telemetry::Availability;
+use flint_core::problems::ProblemKind;
+use flint_core::telemetry::{Availability, FeedDiscovery};
 use flint_core::{Settings, settings};
 use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, Verb, WatchStep};
 
@@ -547,6 +548,108 @@ async fn a_namespace_change_voids_consent() {
     f.until_status(KeepWatching::NeedsConfirming).await;
     settle().await;
     assert_eq!(run_lines(&f.runs).len(), runs);
+}
+
+/// A token good for years: nothing needs to run the plugin again.
+const LASTING: &str = "printf '{\"apiVersion\":\"client.authentication.k8s.io/v1\",\
+                       \"kind\":\"ExecCredential\",\"status\":{\"token\":\"t\",\
+                       \"expirationTimestamp\":\"2099-01-01T00:00:00Z\"}}'\n";
+
+fn kept_discovery(f: &Fixture) -> Option<FeedDiscovery> {
+    f.core.handle.telemetry("b").map(|feed| feed.discovery)
+}
+
+fn vouches_for_all(f: &Fixture) -> bool {
+    matches!(
+        kept_discovery(f),
+        Some(FeedDiscovery::Kept(found)) if found.unchecked().is_empty()
+    )
+}
+
+fn vouches_for_none(f: &Fixture) -> bool {
+    matches!(
+        kept_discovery(f),
+        Some(FeedDiscovery::Kept(found)) if found.unchecked().len() == ProblemKind::ALL.len()
+    )
+}
+
+fn discovery_requests(server: &FakeApiServer) -> usize {
+    server
+        .requests()
+        .iter()
+        .filter(|request| matches!(request.path.as_str(), "/api" | "/apis"))
+        .count()
+}
+
+// covers #210
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kept_connection_discovers_on_the_token_it_holds() {
+    let f = fixture(LASTING, Settings::default()).await;
+    f.turn_on().await;
+    f.until_feed().await;
+    tokio::time::timeout(WAIT, async {
+        while !vouches_for_all(&f) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("discovery should have confirmed its resources");
+    settle().await;
+    assert_eq!(run_lines(&f.runs).len(), 1, "discovery ran no plugin");
+    assert!(f.b.writes().is_empty(), "{:?}", f.b.writes());
+}
+
+// covers #210
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_that_is_due_is_not_refreshed_for_discovery() {
+    let f = fixture(EXPIRED, Settings::default()).await;
+    f.turn_on().await;
+    f.until_feed().await;
+    f.b.wait_for_watches(&Gvr::core("pods"), 1, WAIT)
+        .await
+        .unwrap();
+    let runs = runs_once_settled(&f).await;
+    // Past discovery's first retries: each would need a new token.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(run_lines(&f.runs).len(), runs, "discovery ran the plugin");
+    assert_eq!(
+        discovery_requests(&f.b),
+        0,
+        "nothing was sent without a token"
+    );
+    assert!(vouches_for_none(&f));
+    assert_eq!(
+        f.status().await,
+        KeepWatching::Watching,
+        "not a sign-in failure"
+    );
+}
+
+// covers #210
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turning_it_off_ends_kept_discovery() {
+    let f = fixture(LASTING, Settings::default()).await;
+    // Every discovery fails, so it keeps retrying until its feed ends.
+    f.b.inject(Fault::status(500).verb(Verb::Discovery));
+    f.turn_on().await;
+    f.until_feed().await;
+    tokio::time::timeout(WAIT, async {
+        while discovery_requests(&f.b) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("discovery should have started");
+    assert!(vouches_for_none(&f));
+    f.core
+        .handle
+        .send(Command::RevokeBackgroundSignIn("b".to_owned()));
+    f.until_status(KeepWatching::NeedsConfirming).await;
+    settle().await;
+    let sent = discovery_requests(&f.b);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(discovery_requests(&f.b), sent, "discovery went on");
+    assert!(f.core.handle.telemetry("b").is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
