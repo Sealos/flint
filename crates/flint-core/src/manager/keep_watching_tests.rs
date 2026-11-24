@@ -183,6 +183,50 @@ async fn a_switch_demotes_a_member_without_consent() {
     assert_eq!(plugin.starts().len(), 1, "only the foreground run");
 }
 
+// Selected, a member's connection made under consent connects again in the foreground when the
+// consent ends, rather than stay signed out.
+#[tokio::test]
+async fn a_selected_member_reconnects_when_its_consent_ends() {
+    let plugin = FakePlugin::hanging();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    open_set(&mut manager);
+    manager.activate("dev".to_owned());
+    assert!(manager.cluster("dev").unwrap().access.unattended());
+
+    manager.kept_grants().revoke("dev");
+    manager.set_keep_watching("dev".to_owned(), None).await;
+    manager.sync_keep_watching();
+
+    let slot = manager.cluster("dev").unwrap();
+    assert!(!slot.access.unattended());
+    assert!(matches!(slot.state, ConnectionState::Connecting));
+    assert!(dev_may_run(&manager), "in the foreground");
+}
+
+// Leaving the set drops a connection made under consent: it covers members only.
+#[tokio::test]
+async fn leaving_the_set_drops_a_consented_connection() {
+    let plugin = FakePlugin::hanging();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    open_set(&mut manager);
+    let consented = manager
+        .cluster("dev")
+        .unwrap()
+        .access
+        .grant(CredentialSource::Plugin);
+
+    manager.set_running_set(Vec::new());
+
+    assert!(!consented.allowed());
+    let slot = manager.cluster("dev").unwrap();
+    assert!(matches!(slot.state, ConnectionState::Disconnected));
+    assert!(slot.connect_task.is_none());
+}
+
 // Turning the consent off ends a member's connection made under it, and kills its plugin.
 #[tokio::test]
 async fn turning_consent_off_ends_a_members_connection() {

@@ -146,6 +146,14 @@ impl KeptGrants {
         live.members.insert(id.to_owned(), access.clone());
     }
 
+    /// Ends every member connection's access made under consent, and kills their plugins.
+    fn revoke_members(&self) {
+        self.live()
+            .members
+            .values()
+            .for_each(CredentialAccess::revoke);
+    }
+
     fn release(&self, id: &str, attempt: u64) {
         let mut live = self.live();
         if live.feeds.get(id).is_some_and(|(at, _)| *at == attempt) {
@@ -298,6 +306,7 @@ impl ClusterManager {
         }
         self.keep.offers.clear();
         self.keep.feeds.retain(|_, kept| !kept.runs_plugin);
+        self.keep.grants.revoke_members();
         self.void_broken_consents();
     }
 
@@ -401,6 +410,30 @@ impl ClusterManager {
                 kept.access.set_role(Role::Paused);
             }
         }
+        // A member's refresh too; one still connecting answers through its result.
+        for id in self.consented_members(false) {
+            if let Some(slot) = self.cluster(&id) {
+                slot.access.set_role(Role::Paused);
+            }
+        }
+    }
+
+    /// Members whose connection was made under consent: up, and also those still connecting
+    /// with `connecting`.
+    fn consented_members(&self, connecting: bool) -> Vec<ClusterId> {
+        self.clusters
+            .iter()
+            .filter(|slot| {
+                slot.access.unattended()
+                    && self.members.contains_key(&slot.info.name)
+                    && match slot.state {
+                        ConnectionState::Connected(_) => true,
+                        ConnectionState::Connecting => connecting,
+                        _ => false,
+                    }
+            })
+            .map(|slot| slot.info.name.clone())
+            .collect()
     }
 
     /// Stops the feeds no longer wanted, starts those missing, and reports any change.
@@ -425,6 +458,11 @@ impl ClusterManager {
         if settled {
             for kept in self.keep.feeds.values().filter(|kept| kept.runs_plugin) {
                 kept.access.set_role(Role::Background);
+            }
+            for id in self.consented_members(false) {
+                if let Some(slot) = self.cluster(&id) {
+                    slot.access.set_role(self.connection_role(&id));
+                }
             }
         }
         // Over the cap, a file edited by hand starts only the first ones.
@@ -552,24 +590,15 @@ impl ClusterManager {
     /// Ends the connections members made under a consent that no longer holds: turned off,
     /// voided by a change, or gone with its entry.
     fn end_unconsented_members(&mut self) {
-        let ended: Vec<ClusterId> = self
-            .clusters
-            .iter()
-            .filter(|slot| {
-                let id = &slot.info.name;
-                slot.access.unattended()
-                    && matches!(
-                        slot.state,
-                        ConnectionState::Connecting | ConnectionState::Connected(_)
-                    )
-                    && self.members.contains_key(id)
-                    && self.member_consent(id).is_none()
-            })
-            .map(|slot| slot.info.name.clone())
-            .collect();
+        let mut ended = self.consented_members(true);
+        ended.retain(|id| self.member_consent(id).is_none());
         let now = Instant::now();
         for id in ended {
-            self.demote_member(&id, now);
+            if self.active.as_deref() == Some(id.as_str()) {
+                self.reconnect_selected(&id);
+            } else {
+                self.demote_member(&id, now);
+            }
         }
     }
 

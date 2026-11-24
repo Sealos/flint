@@ -372,7 +372,8 @@ impl ClusterManager {
     }
 
     /// Ends `id`'s membership. Its watches stop unless it is active; a connection already up stays,
-    /// as it does for a cluster switched away from, and one still being made is dropped.
+    /// as it does for a cluster switched away from, and one still being made is dropped. One made
+    /// under consent is dropped either way, and the selected cluster connects again.
     fn leave_set(&mut self, id: &str) {
         self.members.remove(id);
         self.schedule.dequeue(&id.to_owned());
@@ -380,12 +381,17 @@ impl ClusterManager {
         let mut dropped = false;
         if let Some(slot) = self.cluster_mut(id) {
             let attempt = slot.member_attempt.take();
-            if !active && matches!(slot.state, ConnectionState::Connecting) {
+            let connecting = matches!(slot.state, ConnectionState::Connecting);
+            // Consent covers members only: a connection made under it never outlives membership.
+            let consented = slot.access.unattended()
+                && (connecting || matches!(slot.state, ConnectionState::Connected(_)));
+            if (!active && connecting) || consented {
                 if let Some(task) = slot.connect_task.take() {
                     task.abort();
                 }
-                slot.access.revoke();
+                slot.clear_connection();
                 slot.attempt = 0;
+                slot.discovering = false;
                 slot.state = ConnectionState::Disconnected;
                 dropped = true;
             }
@@ -398,6 +404,9 @@ impl ClusterManager {
                 cluster: id.to_owned(),
                 state: ConnectionState::Disconnected,
             });
+            if active {
+                self.ensure_connected(id);
+            }
         }
         self.reconcile(id);
     }
@@ -713,6 +722,23 @@ impl ClusterManager {
             self.apply_member(id, MemberEvent::CredentialLost { reason }, now);
             return;
         }
+        self.reconnect_selected(id);
+    }
+
+    /// Replaces the selected cluster's connection with a new one in the foreground.
+    pub(super) fn reconnect_selected(&mut self, id: &str) {
+        let Some(slot) = self.cluster_mut(id) else {
+            return;
+        };
+        if let Some(task) = slot.connect_task.take() {
+            task.abort();
+        }
+        if let Some(attempt) = slot.member_attempt.take() {
+            self.schedule.finish(attempt);
+        }
+        let Some(slot) = self.cluster_mut(id) else {
+            return;
+        };
         slot.clear_connection();
         // No attempt has id 0, so a discovery still running is ignored.
         slot.attempt = 0;
