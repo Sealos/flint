@@ -183,8 +183,7 @@ async fn the_watch_mode_follows_the_menu_and_persists(cx: &mut TestAppContext) {
 
     t.dispatch(cx, "workspace::WatchOpenViewsOnly", Value::Null)
         .unwrap();
-    t.wait_for_label(cx, "watch-mode", "Live: on view")
-        .await;
+    t.wait_for_label(cx, "watch-mode", "Live: on view").await;
     let settings = t.model.read_with(cx, |m, _| m.settings.clone());
     assert_eq!(
         settings.cluster_watch_mode.get("kind-alpha"),
@@ -206,8 +205,7 @@ async fn the_watch_mode_follows_the_menu_and_persists(cx: &mut TestAppContext) {
     assert_eq!(own, Some(WatchMode::All));
     t.dispatch(cx, "workspace::WatchOpenViewsOnly", Value::Null)
         .unwrap();
-    t.wait_for_label(cx, "watch-mode", "Live: on view")
-        .await;
+    t.wait_for_label(cx, "watch-mode", "Live: on view").await;
 
     // On a failed cluster nothing is watched, so its header has no switch; the default can still
     // be changed from there.
