@@ -45,6 +45,8 @@ const SERVER_KEY: &str = "server";
 
 const PERCENT_RANGE: RangeInclusive<u32> = 1..=100;
 const COUNT_RANGE: RangeInclusive<u32> = 1..=10_000;
+/// One second to one day.
+const PENDING_SECONDS_RANGE: RangeInclusive<u32> = 1..=86_400;
 
 /// Something the dashboard warns about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -57,6 +59,8 @@ pub enum ThresholdMetric {
     RestartsLastHour,
     /// Warning events in the last hour.
     WarningEventsLastHour,
+    /// Seconds a pod may stay Pending before it counts as a problem.
+    PendingPodSeconds,
 }
 
 /// A metric's TOML key, default and accepted range.
@@ -68,11 +72,12 @@ struct MetricSpec {
 
 impl ThresholdMetric {
     /// Every metric, in display order.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::CpuPercent,
         Self::MemoryPercent,
         Self::RestartsLastHour,
         Self::WarningEventsLastHour,
+        Self::PendingPodSeconds,
     ];
 
     const fn spec(self) -> MetricSpec {
@@ -96,6 +101,11 @@ impl ThresholdMetric {
                 key: "warning_events_last_hour",
                 default: 10,
                 range: COUNT_RANGE,
+            },
+            Self::PendingPodSeconds => MetricSpec {
+                key: "pending_pod_seconds",
+                default: 60,
+                range: PENDING_SECONDS_RANGE,
             },
         }
     }

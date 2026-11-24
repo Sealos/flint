@@ -260,6 +260,7 @@ pub struct Workspace {
     /// nothing is restored from the old catalog (#255).
     generation: Option<u64>,
     list: Option<Entity<ResourceList>>,
+    problem_feed: problems::ProblemFeed,
     detail: Option<Entity<DetailView>>,
     /// The active cluster's overview, in place of a list.
     dashboard: Option<(Entity<DashboardView>, Subscription)>,
@@ -361,6 +362,7 @@ impl Workspace {
         let observe = cx.observe_in(&model, window, |this, _, window, cx| {
             this.show_appearance(window, cx);
             this.sync(window, cx);
+            this.follow_problem_connections(cx);
             cx.notify();
         });
         let nav = cx.new(NavPanel::new);
@@ -411,6 +413,7 @@ impl Workspace {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let alive = this.update(cx, |this, cx| {
+                    this.refresh_problems(cx);
                     let Some(cluster) = this.cluster.clone() else {
                         return;
                     };
@@ -456,6 +459,7 @@ impl Workspace {
             cluster: None,
             generation: None,
             list: None,
+            problem_feed: Default::default(),
             detail: None,
             dashboard: None,
             sets: cluster_sets,
@@ -3820,6 +3824,9 @@ mod actions;
 
 #[path = "workspace_keys.rs"]
 mod keys;
+
+#[path = "workspace_problems.rs"]
+pub(in crate::ui) mod problems;
 
 #[path = "workspace_sets.rs"]
 mod sets;

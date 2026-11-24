@@ -66,9 +66,10 @@ impl ProblemCategory {
     /// The category a classified problem counts under.
     pub const fn of_kind(kind: ProblemKind) -> Self {
         match kind {
-            ProblemKind::CrashLoop | ProblemKind::OomKilled | ProblemKind::ImagePull => {
-                Self::FailingPods
-            }
+            ProblemKind::CrashLoop
+            | ProblemKind::OomKilled
+            | ProblemKind::ImagePull
+            | ProblemKind::PodPending => Self::FailingPods,
             ProblemKind::NodeNotReady => Self::NotReadyNodes,
             ProblemKind::JobFailed => Self::FailedJobs,
             ProblemKind::WorkloadShort => Self::ShortWorkloads,
@@ -319,6 +320,11 @@ impl<'a> CountedObject<'a> {
                 pod_uid,
                 ..
             } => (None, namespace.as_str(), pod, pod_uid),
+            ProblemSubject::Pod {
+                namespace,
+                name,
+                uid,
+            } => (None, namespace.as_str(), name, uid),
             ProblemSubject::Node { name, uid } => (None, "", name, uid),
             ProblemSubject::Job {
                 namespace,

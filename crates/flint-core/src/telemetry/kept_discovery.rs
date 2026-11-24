@@ -77,9 +77,10 @@ const VERSION: &str = "v1";
 /// The resources `kind` is read from. A pod's owner is read through its ReplicaSet.
 const fn needs(kind: ProblemKind) -> u8 {
     match kind {
-        ProblemKind::CrashLoop | ProblemKind::OomKilled | ProblemKind::ImagePull => {
-            PODS | REPLICA_SETS
-        }
+        ProblemKind::CrashLoop
+        | ProblemKind::OomKilled
+        | ProblemKind::ImagePull
+        | ProblemKind::PodPending => PODS | REPLICA_SETS,
         ProblemKind::NodeNotReady => NODES,
         ProblemKind::JobFailed => JOBS,
         ProblemKind::WorkloadShort => DEPLOYMENTS | STATEFUL_SETS | DAEMON_SETS,

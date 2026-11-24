@@ -68,6 +68,18 @@ impl Notification {
                 };
                 (heading, text, &summary.cluster)
             }
+            AlertEvent::FleetSummary(summary) => {
+                let heading = match summary.highest {
+                    Some(ProblemSeverity::Critical) => "Critical alerts",
+                    _ => "Alerts",
+                };
+                return Self {
+                    title: format!("{heading}: {} clusters", summary.clusters),
+                    body: text,
+                    cluster: Arc::clone(&summary.first),
+                    tag: String::new(),
+                };
+            }
             AlertEvent::ClusterUnavailable { cluster, .. } => {
                 ("Cluster unavailable", text, cluster)
             }

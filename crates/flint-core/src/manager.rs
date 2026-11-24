@@ -763,6 +763,16 @@ impl ClusterManager {
                 }
                 self.apply_scope(&cluster);
             }
+            Command::SetThreshold {
+                cluster,
+                metric,
+                value,
+            } => {
+                self.write_settings("the threshold", move |dir| {
+                    settings::set_threshold(dir, cluster.as_ref(), metric, value)
+                })
+                .await
+            }
             Command::SetLogBufferLines(lines) => {
                 self.write_settings("the log buffer size", move |dir| {
                     settings::set_log_buffer_lines(dir, lines)
@@ -1404,6 +1414,7 @@ impl ClusterManager {
         self.settings = Arc::new(settings);
         self.settings_error = error;
         self.log_budget.set_limit(self.settings.log_total_bytes());
+        self.apply_pending_thresholds();
         // The watch mode may have changed: start and stop the watches first, so a front end
         // that reads the stores when it hears of the change (the resource switcher) finds
         // them as the new settings have them.

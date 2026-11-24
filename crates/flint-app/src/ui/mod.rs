@@ -47,6 +47,7 @@ mod notice;
 mod object;
 mod palette;
 mod palette_model;
+mod pending_threshold;
 mod quit_flush;
 mod registry;
 mod resource_actions;

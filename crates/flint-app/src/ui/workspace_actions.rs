@@ -52,8 +52,8 @@ use super::super::registry::{
     SetLogContext, SetNamespaces, SetPaneWidth, ShowAll, ShowAllNamespaces, ShowOverview,
     ShowTabList, ShowYaml, SortBy, ToggleAnnotations, ToggleCommandPalette, ToggleErrorsOnly,
     ToggleLabels, ToggleLogRegex, ToggleManagedFields, ToggleMatchingOnly, ToggleNamespace,
-    ToggleNavSection, TogglePause, ToggleResourceSwitcher, ToggleSecretValue, ToggleSources,
-    ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
+    ToggleNavSection, TogglePause, ToggleProblemsOnly, ToggleResourceSwitcher, ToggleSecretValue,
+    ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
     WatchOpenViewsOnly,
 };
 use super::super::registry::{
@@ -353,6 +353,17 @@ impl Workspace {
             .when::<OpenSelectedRow>(view_open!(list_wide))
             .when::<FocusFilter>(view_open!(list_wide))
             .when::<ToggleWide>(|ws, cx| list_wide(ws, cx) == Some(true))
+            .when::<ToggleProblemsOnly>(|ws, cx| {
+                ws.list
+                    .as_ref()
+                    .is_some_and(|list| list.read(cx).has_problem_filter())
+            })
+            .when::<super::super::list::combined::ToggleCombinedProblems>(|ws, cx| {
+                ws.sets
+                    .running
+                    .as_ref()
+                    .is_some_and(|run| run.list.read(cx).has_problem_filter())
+            })
             .add::<SelectRow>(view_open!(list_wide), |ws, a, cx| match &ws.list {
                 Some(l) => l.read(cx).check_select_row(a),
                 None => Err(ActionError::unavailable::<SelectRow>()),
