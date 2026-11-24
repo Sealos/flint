@@ -1324,6 +1324,36 @@ pub fn set_desktop_notifications(dir: &Path, enabled: bool) -> Result<Settings, 
     })
 }
 
+/// One global setting, written on its own through its setter: what the app's Settings view
+/// saves ([`crate::CoreHandle::write_settings`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsWrite {
+    Appearance(Appearance),
+    DesktopNotifications(bool),
+    /// The global watch mode, not a cluster's override.
+    WatchMode(WatchMode),
+}
+
+impl SettingsWrite {
+    /// What it changes, for an error message.
+    pub fn what(self) -> &'static str {
+        match self {
+            SettingsWrite::Appearance(_) => "the appearance",
+            SettingsWrite::DesktopNotifications(_) => "desktop notifications",
+            SettingsWrite::WatchMode(_) => "the watch mode",
+        }
+    }
+
+    /// Writes it to `settings.toml` in `dir`, through the same setter the other controls use.
+    pub fn write(self, dir: &Path) -> Result<Settings, SettingsError> {
+        match self {
+            SettingsWrite::Appearance(a) => set_appearance(dir, a),
+            SettingsWrite::DesktopNotifications(on) => set_desktop_notifications(dir, on),
+            SettingsWrite::WatchMode(m) => set_watch_mode(dir, None, Some(m)),
+        }
+    }
+}
+
 /// Sets whether `context` at `server` posts desktop alerts (`None` follows the global setting)
 /// and writes `settings.toml`. Clearing what is not set writes nothing. Returns the settings as
 /// written.
@@ -2818,6 +2848,26 @@ mod tests {
     fn rejects_unknown_appearance() {
         assert!(toml::from_str::<Settings>("appearance = \"sepia\"").is_err());
         assert!(toml::from_str::<Settings>("appearance = \"Dark\"").is_err());
+    }
+
+    // covers UP-126
+    #[test]
+    fn a_settings_write_changes_its_own_key_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SETTINGS_FILE), "future_key = 1\n").unwrap();
+        let s = SettingsWrite::WatchMode(WatchMode::OnView)
+            .write(dir.path())
+            .unwrap();
+        assert_eq!(s.watch_mode, WatchMode::OnView);
+        let s = SettingsWrite::DesktopNotifications(true)
+            .write(dir.path())
+            .unwrap();
+        assert!(s.desktop_notifications);
+        assert_eq!(s.watch_mode, WatchMode::OnView);
+        let text = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
+        assert!(!text.contains("appearance"), "{text}");
+        assert!(text.contains("future_key"), "{text}");
+        assert!(!text.contains("cluster_watch_mode"), "{text}");
     }
 
     // covers UP-32

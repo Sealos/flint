@@ -331,6 +331,11 @@ enum Internal {
     ReloadKubeconfig {
         reply: tokio::sync::oneshot::Sender<bool>,
     },
+    /// Write settings, then say how ([`crate::CoreHandle::write_settings`]).
+    WriteSettings {
+        writes: Vec<settings::SettingsWrite>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     Connected {
         cluster: ClusterId,
         attempt: u64,
@@ -842,6 +847,11 @@ impl ClusterManager {
             Request::ReloadKubeconfig { reply } => {
                 let _ = self.internal_tx.send(Internal::ReloadKubeconfig { reply });
             }
+            Request::WriteSettings { writes, reply } => {
+                let _ = self
+                    .internal_tx
+                    .send(Internal::WriteSettings { writes, reply });
+            }
             Request::ActivatePinned {
                 cluster,
                 pin,
@@ -1299,23 +1309,36 @@ impl ClusterManager {
         what: &str,
         write: impl FnOnce(&Path) -> Result<Settings, settings::SettingsError> + Send + 'static,
     ) {
+        let _ = self.try_write_settings(what, write).await;
+    }
+
+    /// [`Self::write_settings`], saying why it failed (as also emitted).
+    async fn try_write_settings(
+        &mut self,
+        what: &str,
+        write: impl FnOnce(&Path) -> Result<Settings, settings::SettingsError> + Send + 'static,
+    ) -> Result<(), String> {
         if let Some(error) = &self.settings_error {
-            self.emit(Event::Error(format!(
+            let why = format!(
                 "settings.toml must be fixed before {what} can change: {}",
                 crate::redact::safe_error_summary(error)
-            )));
-            return;
+            );
+            self.emit(Event::Error(why.clone()));
+            return Err(why);
         }
         let dir = self.config.config_dir.clone();
         let result = tokio::task::spawn_blocking(move || write(&dir)).await;
-        match result {
-            Ok(Ok(settings)) => self.apply_settings(Ok(settings)).await,
+        let why = match result {
+            Ok(Ok(settings)) => {
+                self.apply_settings(Ok(settings)).await;
+                return Ok(());
+            }
             // A settings write error can quote the file: one sanitized line.
-            Ok(Err(e)) => self.emit(Event::Error(crate::redact::safe_error_summary(
-                &e.to_string(),
-            ))),
-            Err(e) => self.emit(Event::Error(format!("settings write failed: {e}"))),
-        }
+            Ok(Err(e)) => crate::redact::safe_error_summary(&e.to_string()),
+            Err(e) => format!("settings write failed: {e}"),
+        };
+        self.emit(Event::Error(why.clone()));
+        Err(why)
     }
 
     /// Trusts `cluster` at `server` (`Some`) or stops trusting it (`None`): request `request`,
@@ -1520,6 +1543,18 @@ impl ClusterManager {
                 self.marks.changed(self.read_seq);
                 let applied = self.reload_kubeconfig().await;
                 let _ = reply.send(applied);
+            }
+            Internal::WriteSettings { writes, reply } => {
+                let mut result = Ok(());
+                for write in writes {
+                    result = self
+                        .try_write_settings(write.what(), move |dir| write.write(dir))
+                        .await;
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                let _ = reply.send(result);
             }
             Internal::LateRead { paths, seq, read } => {
                 let in_order = self.saw_read(&paths, Some(&read));

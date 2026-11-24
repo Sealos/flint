@@ -3,7 +3,8 @@
 //! ask first, naming how many end. Close Window (its key, the Window menu, Cmd-W with no dock tab
 //! shown), the window's own close button and Quit all take this path; with nothing at work they
 //! close or quit at once. An unapplied YAML edit on top of that joins the same question, so it is
-//! one prompt, never two.
+//! one prompt, never two. Unsaved edits in Settings are asked about first, on their own: Save,
+//! Discard or Cancel; Save and Discard go on to close or quit, asking the rest then.
 //!
 //! Quitting from outside the app (the Dock icon's Quit, logging out) is not asked about, and
 //! loses an unapplied YAML edit: GPUI offers no hook that can cancel it.
@@ -58,6 +59,9 @@ fn close_window(window: &mut Window, cx: &mut App) {
 
 /// Whether `window` may close now. If not, a question is open over it (or one already was).
 fn closes_now(window: &mut Window, cx: &mut App) -> bool {
+    if asks_about_settings(window, cx, Ending::Window, close_window_after) {
+        return false;
+    }
     let losses = Losses::of(window, cx);
     if losses.edits > 0 && losses.ends_more() {
         ask(window, cx, Ending::Window, losses);
@@ -75,6 +79,19 @@ fn closes_now(window: &mut Window, cx: &mut App) -> bool {
 
 /// Quits, asking first (over the front window) while a session in any window would end.
 fn quit(cx: &mut App) {
+    // Unsaved settings first, over the window that holds them: Save or Discard come back here.
+    for handle in cx.windows() {
+        let asked = handle.update(cx, |_, window, cx| {
+            let held = workspace(window, cx).is_some_and(|ws| ws.read(cx).has_settings_draft());
+            if held {
+                window.activate_window();
+            }
+            held && asks_about_settings(window, cx, Ending::App, |_, cx| cx.defer(quit))
+        });
+        if matches!(asked, Ok(true)) {
+            return;
+        }
+    }
     let mut losses = Losses::default();
     for handle in cx.windows() {
         if let Ok(more) = handle.update(cx, |_, window, cx| Losses::of(window, cx)) {
@@ -148,6 +165,24 @@ fn asks_about_edit(
     workspace.update(cx, |ws, cx| {
         ws.asks_before_leaving(window, cx, move |_, window, cx| then(window, cx))
     })
+}
+
+/// Asks Save / Discard / Cancel about unsaved settings in `window`, if it holds any; Save (once
+/// written) and Discard run `then`. Whether the caller must stop.
+fn asks_about_settings(
+    window: &mut Window,
+    cx: &mut App,
+    ending: Ending,
+    then: impl Fn(&mut Window, &mut App) + 'static,
+) -> bool {
+    let Some(workspace) = workspace(window, cx) else {
+        return false;
+    };
+    let doing = match ending {
+        Ending::Window => "Closing the window",
+        Ending::App => "Quitting",
+    };
+    workspace.update(cx, |ws, cx| ws.asks_about_settings(window, cx, doing, then))
 }
 
 /// Runs Close Window again once the update under way has ended.
