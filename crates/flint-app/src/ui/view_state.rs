@@ -68,6 +68,62 @@ pub struct OpenSetState {
     /// Saved members the core left out when the set opened.
     pub left_out: Vec<String>,
     pub list: ListState,
+    /// The set's dashboard, while it is open in place of the list.
+    pub dashboard: Option<SetDashboardState>,
+}
+
+/// The open dashboard of a cluster set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SetDashboardState {
+    /// A card per member, worst first.
+    pub cards: Vec<SetCardState>,
+    /// One count per problem category across the set.
+    pub totals: Vec<SetTotalState>,
+    /// Names the members a total lacks, when one does.
+    pub partial: Option<String>,
+}
+
+/// One member's card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SetCardState {
+    pub cluster: String,
+    /// The name the card shows.
+    pub shown: String,
+    pub tag: Option<flint_core::settings::ClusterTag>,
+    /// `live`, `partial`, `waiting`, `not_watched`, `unavailable` or `blocked`.
+    pub state: &'static str,
+    /// What the card says about its state, if anything.
+    pub note: Option<String>,
+    /// `healthy`, `warning` or `unknown`, from the member's counts, CPU and memory.
+    pub level: &'static str,
+    /// One per problem category, as the card's counts show them.
+    pub counts: Vec<SetCountState>,
+}
+
+/// One problem count on a card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SetCountState {
+    /// As the count's link names it (`failing_pods`).
+    pub category: &'static str,
+    pub label: &'static str,
+    /// `None` when it could not be read.
+    pub count: Option<u32>,
+    /// Whether clicking it opens a list.
+    pub opens: bool,
+}
+
+/// One total across the set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SetTotalState {
+    pub category: &'static str,
+    pub label: &'static str,
+    /// The number as shown (`3`, `2+`, or a dash).
+    pub value: String,
+    pub known: u32,
+    /// Members the total could not include.
+    pub missing: u32,
+    /// Whether one list can show everything it counted.
+    pub opens: bool,
 }
 
 /// A member of the running set.
