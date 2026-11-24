@@ -42,3 +42,18 @@ fn a_log_request_made_before_a_disconnect_starts_ended() {
     let now = marks.count.of("a");
     assert!(!*marks.track_logs(2, "a", now, |_| true).borrow());
 }
+
+#[test]
+fn a_write_stops_from_the_ask_until_the_core_has_run_the_disconnect() {
+    let count = DisconnectCount::default();
+    let stamp = count.of("a");
+    assert!(!count.ends_write("a", stamp));
+    count.bump("a");
+    assert!(count.ends_write("a", stamp));
+    // Stamped after the ask, it still waits for the core.
+    assert!(count.ends_write("a", count.of("a")));
+    count.ran("a");
+    assert!(count.ends_write("a", stamp));
+    assert!(!count.ends_write("a", count.of("a")));
+    assert!(!count.ends_write("b", 0));
+}

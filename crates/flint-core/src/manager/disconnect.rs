@@ -22,18 +22,41 @@ pub(super) const LOGS_ENDED: &str = "disconnected from this cluster; select it t
 /// core takes the command. A request stamped with an older count was made before a disconnect
 /// the core may not have run yet, so it starts nothing.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct DisconnectCount(Arc<Mutex<HashMap<ClusterId, u64>>>);
+pub(crate) struct DisconnectCount(Arc<Mutex<HashMap<ClusterId, Counted>>>);
+
+/// Disconnects asked for, and how many of them the core has run.
+#[derive(Debug, Clone, Copy, Default)]
+struct Counted {
+    asked: u64,
+    run: u64,
+}
 
 impl DisconnectCount {
     pub(crate) fn of(&self, cluster: &str) -> u64 {
-        self.counts().get(cluster).copied().unwrap_or(0)
+        self.counts().get(cluster).map_or(0, |c| c.asked)
     }
 
     pub(crate) fn bump(&self, cluster: &str) {
-        *self.counts().entry(cluster.to_owned()).or_default() += 1;
+        self.counts().entry(cluster.to_owned()).or_default().asked += 1;
     }
 
-    fn counts(&self) -> std::sync::MutexGuard<'_, HashMap<ClusterId, u64>> {
+    /// The core took one disconnect of `cluster`.
+    fn ran(&self, cluster: &str) {
+        let mut counts = self.counts();
+        let counted = counts.entry(cluster.to_owned()).or_default();
+        counted.run += 1;
+        // A command sent another way than the handle counts as asked too.
+        counted.asked = counted.asked.max(counted.run);
+    }
+
+    /// Whether a write stamped with `asked` must stop: `cluster` was disconnected since, or a
+    /// disconnect is asked for that the core has not run yet.
+    pub(crate) fn ends_write(&self, cluster: &str, asked: u64) -> bool {
+        let counted = self.counts().get(cluster).copied().unwrap_or_default();
+        counted.asked != asked || counted.run < counted.asked
+    }
+
+    fn counts(&self) -> std::sync::MutexGuard<'_, HashMap<ClusterId, Counted>> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -103,6 +126,7 @@ impl ClusterManager {
     /// Stops `id`'s watches, feeds, retries, log streams and clients, and ends its keep-watching
     /// consent. The settings are written last, so a slow or failed save holds up none of this.
     pub(super) async fn disconnect_cluster(&mut self, id: ClusterId) {
+        self.disconnects.count.ran(&id);
         if self.cluster(&id).is_none() {
             self.emit(Event::Error(format!("cluster \"{id}\" no longer exists")));
             return;

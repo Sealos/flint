@@ -995,6 +995,22 @@ impl CoreHandle {
         }
     }
 
+    /// How many times `cluster` was asked to disconnect, for a write to stamp when it starts.
+    pub(crate) fn disconnects_of(&self, cluster: &str) -> u64 {
+        self.disconnects.of(cluster)
+    }
+
+    /// Whether a write stamped with `asked` must stop ([`Self::disconnects_of`]).
+    pub(crate) fn disconnect_ends_write(&self, cluster: &str, asked: u64) -> bool {
+        self.disconnects.ends_write(cluster, asked)
+    }
+
+    /// Counts a disconnect of `cluster` as asked for, without sending it to the core.
+    #[cfg(test)]
+    pub(crate) fn ask_disconnect_for_test(&self, cluster: &str) {
+        self.disconnects.bump(cluster);
+    }
+
     pub(crate) fn is_bound(&self) -> bool {
         self.bound.is_some()
     }

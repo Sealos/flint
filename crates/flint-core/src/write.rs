@@ -329,17 +329,36 @@ pub(crate) struct RequestGate {
     pin: Option<ContextPin>,
     /// The credential every request of this review goes out with.
     credential: Option<CredentialBinding>,
+    /// How many disconnects of the cluster were asked for when this gate was made: one asked
+    /// for since stops it, even before the core runs it.
+    disconnects: u64,
 }
 
 impl RequestGate {
     fn new(core: CoreHandle, target: &WriteTarget) -> Self {
+        let disconnects = core.disconnects_of(&target.cluster);
         RequestGate {
             core,
             cluster: target.cluster.clone(),
             server: target.server.clone(),
             pin: None,
             credential: None,
+            disconnects,
         }
+    }
+
+    /// Refuses once a disconnect of the cluster was asked for since this gate was made.
+    fn check_disconnects(&self) -> Result<(), WriteError> {
+        if self
+            .core
+            .disconnect_ends_write(&self.cluster, self.disconnects)
+        {
+            return Err(WriteRefusal::NotConnected {
+                cluster: self.cluster.to_string(),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     /// The pin every request of this review went out on.
@@ -354,6 +373,7 @@ impl RequestGate {
 
     /// A client for the next request. Call it again for every request: never keep the client.
     pub(crate) async fn client(&mut self) -> Result<Client, WriteError> {
+        self.check_disconnects()?;
         let (client, pin, credential) = self
             .core
             .bound_write_client(&self.cluster, Some(self.server.clone()))
@@ -381,6 +401,7 @@ impl RequestGate {
         }
         // Reading the credential can take a while: the gate has the last word.
         self.core.check_write_pin(&self.cluster, pin).await?;
+        self.check_disconnects()?;
         self.credential = Some(presented.binding);
         Ok(presented.client)
     }

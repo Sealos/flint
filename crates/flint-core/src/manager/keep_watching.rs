@@ -782,12 +782,12 @@ impl ClusterManager {
         self.keep.feeds.remove(id);
     }
 
-    /// The person selected `id`, which is acting on a stopped watch.
     /// Keeps `id` off while unreadable settings hide its entry, as if the entry were removed.
     pub(super) fn hold_keep_watching_off(&mut self, id: &str) {
         self.keep.turned_off.insert(id.to_owned());
     }
 
+    /// The person selected `id`, which is acting on a stopped watch.
     pub(super) fn keep_watching_acted_on(&mut self, id: &str) {
         self.keep.stopped.remove(id);
         self.keep.retry_at.remove(id);
