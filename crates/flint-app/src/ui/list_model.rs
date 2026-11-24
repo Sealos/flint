@@ -214,6 +214,31 @@ pub fn rows_in_namespaces(snapshot: &KindSnapshot, namespaces: &[String]) -> usi
     }
 }
 
+/// The most of one namespace's name the missing-namespace message quotes.
+const MISSING_NAMESPACE_CHARS: usize = 40;
+
+/// The selection as the missing-namespace message names it: at most two names, each bounded and
+/// on one line, then how many more.
+pub fn missing_namespaces_text(namespaces: &[String]) -> String {
+    let shown = |name: &String| {
+        flint_core::display::middle_truncate(
+            &flint_core::display::single_line(name),
+            MISSING_NAMESPACE_CHARS,
+        )
+    };
+    match namespaces {
+        [one] => format!("namespace {}", shown(one)),
+        [one, two] => format!("namespaces {}, {}", shown(one), shown(two)),
+        [one, two, rest @ ..] => format!(
+            "namespaces {}, {} and {} more",
+            shown(one),
+            shown(two),
+            rest.len()
+        ),
+        [] => "the selected namespaces".to_owned(),
+    }
+}
+
 /// The toolbar's row count and its tooltip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowCount {
@@ -998,6 +1023,7 @@ pub mod combined {
         }
         let whole_scope = query.text.is_empty()
             && query.clusters.is_empty()
+            && query.objects.is_none()
             && query.sort.is_none()
             && !query.group_by_cluster;
         let widths = if whole_scope {

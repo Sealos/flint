@@ -24,6 +24,7 @@ libc.workspace = true
 memchr.workspace = true
 regex.workspace = true
 aho-corasick.workspace = true
+unicode-normalization.workspace = true
 # `redact::text`: docker config `auth` values; already in the tree through kube.
 base64.workspace = true
 http.workspace = true

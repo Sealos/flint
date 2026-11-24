@@ -572,7 +572,7 @@ async fn a_member_with_paused_writes_keeps_its_row_and_offers_no_write(cx: &mut 
     t.wait_for_label(cx, "set-member-kind-beta", "kind-beta")
         .await;
     t.workspace.read_with(cx, |ws, cx| {
-        assert_eq!(ws.member_writes_paused("kind-beta", cx), None);
+        assert_eq!(ws.writes_paused_why("kind-beta", cx), None);
         assert!(
             !detail
                 .read(cx)

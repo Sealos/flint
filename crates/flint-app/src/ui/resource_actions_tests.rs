@@ -32,7 +32,7 @@ use crate::ui::support_tests::{
 const WRITES: [&str; 2] = ["Scale…", "Rollout Restart…"];
 
 /// Connects `kind-alpha` with a discovery in which every kind can be deleted.
-async fn connect_deletable(cx: &mut TestAppContext, t: &TestWorkspace) {
+pub(super) async fn connect_deletable(cx: &mut TestAppContext, t: &TestWorkspace) {
     t.connect_alpha(cx, standard_sections()).await;
     let mut found = discovery(standard_sections());
     for kind in &mut found.kinds {
@@ -681,6 +681,13 @@ fn answer(method: &str, path: &str, query: &str, body: &[u8], control: &Control)
                     200,
                     json!({"apiVersion": "v1", "kind": "Node",
                            "metadata": {"name": "node-1", "uid": "uid-node-1"}, "spec": {}}),
+                ),
+                200 if path == WEB_SCALE => (
+                    200,
+                    json!({"apiVersion": "autoscaling/v1", "kind": "Scale",
+                           "metadata": {"name": "web", "namespace": "demo", "uid": "uid-web",
+                                        "resourceVersion": "7"},
+                           "spec": {"replicas": 2}}),
                 ),
                 200 => (200, deployment()),
                 code => (
