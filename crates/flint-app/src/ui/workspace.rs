@@ -1083,6 +1083,7 @@ impl Workspace {
             None,
             guard,
             begin,
+            |_, _| {},
             move |result, cx| {
                 // First, and outside the window: a closed one must not keep the object claimed.
                 resource_actions::release(&key, cx);

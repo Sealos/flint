@@ -439,7 +439,7 @@ fn up_53_drain_reports_pdb() -> Result<()> {
     fake.add_pod(pod_on_node("guarded", NODE, "ReplicaSet"));
     fake.add_pod(pod_on_node("free", NODE, "ReplicaSet"));
     fake.inject(
-        Fault::disruption_budget()
+        Fault::disruption_budget_named("guarded-pdb")
             .on(&Gvr::core("pods"))
             .named("guarded")
             .subresource("eviction"),
@@ -453,11 +453,16 @@ fn up_53_drain_reports_pdb() -> Result<()> {
     app.dispatch("ui::Confirm", Value::Null)?;
     app.wait_for("/dialog", Equals(Value::Null))?;
     let (title, text) = drain_report(&app)?;
-    assert_eq!(title, format!("Drain of {NODE} left pods"), "{text}");
+    // The cluster is named too: two clusters can have a node of one name.
+    assert!(
+        title.starts_with(&format!("Drain of {NODE} on ")) && title.ends_with(" left pods"),
+        "{title}: {text}"
+    );
     // Whole lines: each pod is tied to its own outcome and reason.
     for line in [
         "Evicted 1 pod: demo/free",
-        "Blocked, 1 pod (a PodDisruptionBudget does not allow evicting them now): demo/guarded",
+        "Blocked, 1 pod (the PodDisruptionBudget guarded-pdb does not allow evicting them now): \
+         demo/guarded",
         "Skipped (DaemonSet or mirror), 1 pod: demo/agent",
     ] {
         assert!(text.lines().any(|l| l == line), "no {line:?} in {text}");

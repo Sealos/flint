@@ -19,8 +19,8 @@ use flint_core::KindId;
 use flint_core::display::{ClusterNames, cluster_name_key, single_line};
 use flint_core::redact::first_line;
 use flint_core::write::{
-    BlockedReason, DrainReport, PodName, WriteError, WriteOutcome, WriteProposal, WriteReview,
-    WriteTarget,
+    BlockedReason, DrainProgress, DrainReport, PodName, WriteError, WriteOutcome, WriteProposal,
+    WriteReview, WriteTarget,
 };
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::Button;
@@ -197,14 +197,18 @@ impl WriteKey {
 
 /// A drain that ended, until its report is viewed or a newer one replaces it.
 struct FinishedDrain {
+    /// The cluster, as named when the drain ended: two clusters can have a node of one name.
+    cluster: String,
     node: String,
     report: DrainReport,
 }
 
-/// The writes running now, in every window, and the latest drain's result.
+/// The writes running now, in every window, where each running drain is, and the latest drain's
+/// result.
 #[derive(Default)]
 pub(in crate::ui) struct RunningWrites {
     running: BTreeMap<WriteKey, RunningWrite>,
+    progress: BTreeMap<WriteKey, DrainProgress>,
     finished: Option<FinishedDrain>,
 }
 
@@ -230,10 +234,21 @@ pub(in crate::ui) fn claim(
     Ok(())
 }
 
-/// Ends the claim on `key`.
+/// Ends the claim on `key`, and with it any progress told for it.
 pub(in crate::ui) fn release(key: &WriteKey, cx: &mut App) {
     cx.update_default_global::<RunningWrites, _>(|writes, _| {
         writes.running.remove(key);
+        writes.progress.remove(key);
+    });
+}
+
+/// Keeps where the drain of `key` is, for its strip, while that drain runs.
+pub(in crate::ui) fn record_progress(key: &WriteKey, progress: DrainProgress, cx: &mut App) {
+    if running_on(key, cx) != Some(RunningWrite::Action(ResourceAction::Drain)) {
+        return;
+    }
+    cx.update_default_global::<RunningWrites, _>(|writes, _| {
+        writes.progress.insert(key.clone(), progress);
     });
 }
 
@@ -532,6 +547,7 @@ fn confirm_review(
     // The handle it was reviewed through: a set's row runs bound to its member too.
     let core = request.core.clone();
     let names = ws.cluster_names(cx);
+    let cluster = names.with_real(&request.target.cluster);
     let this = cx.weak_entity();
     let handle = window.window_handle();
     let key = WriteKey::of(&request.target);
@@ -556,6 +572,10 @@ fn confirm_review(
         note.as_deref(),
         request.guard.clone(),
         begin,
+        {
+            let key = key.clone();
+            move |progress, cx| record_progress(&key, progress, cx)
+        },
         move |result, cx| {
             // First, and outside the window: a closed one must not keep the object claimed.
             release(&key, cx);
@@ -565,6 +585,7 @@ fn confirm_review(
             }) = &result
             {
                 let finished = FinishedDrain {
+                    cluster: cluster.clone(),
                     node: request.target.name.clone(),
                     report: report.clone(),
                 };
@@ -613,15 +634,20 @@ pub(in crate::ui) fn has_drain_result(cx: &App) -> bool {
 pub(in crate::ui) fn show_drain_report(window: &mut Window, cx: &mut App) {
     let finished = cx.update_default_global::<RunningWrites, _>(|writes, _| writes.finished.take());
     if let Some(finished) = finished {
-        let text = drain_report(&finished.node, &finished.report);
+        let text = drain_report(&finished.cluster, &finished.node, &finished.report);
         confirm::open(window, cx, text, |_, _| {});
     }
 }
 
-/// The strip's line for the drains running: each is named, up to [`STRIP_NAMES`], then counted.
-/// Across clusters a name says which, by [`strip_cluster_labels`]. `names` is called only then:
-/// building the labels costs too much for a strip that does not show them.
-fn draining_text(keys: &[&WriteKey], names: impl FnOnce() -> ClusterNames) -> Option<String> {
+/// The strip's line for the drains running: each is named, up to [`STRIP_NAMES`], then counted,
+/// with where it is once it has told (`progress`). Across clusters a name says which, by
+/// [`strip_cluster_labels`]. `names` is called only then: building the labels costs too much for
+/// a strip that does not show them.
+fn draining_text<'a>(
+    keys: &[&WriteKey],
+    progress: impl Fn(&WriteKey) -> Option<&'a DrainProgress>,
+    names: impl FnOnce() -> ClusterNames,
+) -> Option<String> {
     let across = keys.windows(2).any(|w| w[0].cluster != w[1].cluster);
     let labels = across.then(|| strip_cluster_labels(keys, &names()));
     let name = |key: &&WriteKey| match &labels {
@@ -630,8 +656,15 @@ fn draining_text(keys: &[&WriteKey], names: impl FnOnce() -> ClusterNames) -> Op
     };
     match keys {
         [] => None,
-        [one] => Some(format!("Draining {}…", name(one))),
+        [one] => Some(match progress(one) {
+            Some(told) => format!("Draining {}: {}…", name(one), progress_text(told)),
+            None => format!("Draining {}…", name(one)),
+        }),
         many => {
+            let name = |key: &&WriteKey| match progress(key) {
+                Some(told) => format!("{} ({})", name(key), progress_count(told)),
+                None => name(key),
+            };
             let names: Vec<String> = many.iter().take(STRIP_NAMES).map(name).collect();
             let more = match many.len().saturating_sub(STRIP_NAMES) {
                 0 => String::new(),
@@ -643,6 +676,30 @@ fn draining_text(keys: &[&WriteKey], names: impl FnOnce() -> ClusterNames) -> Op
                 names.join(", ")
             ))
         }
+    }
+}
+
+/// Where one running drain is, in words.
+fn progress_text(told: &DrainProgress) -> String {
+    let so_far = format!("{} evicted, {} blocked", told.evicted, told.blocked);
+    match (told.terminating, &told.current) {
+        (Some(left), _) => format!("waiting for {} to terminate ({so_far})", pods(left)),
+        (None, Some(pod)) => format!(
+            "evicting {}/{}, {} of {} ({so_far})",
+            pod.namespace,
+            pod.name,
+            told.tried + 1,
+            told.to_evict
+        ),
+        (None, None) => format!("{} to evict ({so_far})", pods(told.to_evict)),
+    }
+}
+
+/// Where one of several running drains is, in short.
+fn progress_count(told: &DrainProgress) -> String {
+    match told.terminating {
+        Some(left) => format!("{left} terminating"),
+        None => format!("{}/{}", told.tried, told.to_evict),
     }
 }
 
@@ -681,7 +738,7 @@ fn finished_text(finished: &FinishedDrain) -> String {
         Some(_) => "stopped",
         None => "finished",
     };
-    format!("Drain of {} {how}", finished.node)
+    format!("Drain of {} on {} {how}", finished.node, finished.cluster)
 }
 
 /// The workspace's strips for drains: those running, and the latest result with its button.
@@ -700,7 +757,7 @@ pub(in crate::ui) fn drain_strips(
         .filter(|(_, write)| **write == RunningWrite::Action(ResourceAction::Drain))
         .map(|(key, _)| key)
         .collect();
-    if let Some(text) = draining_text(&draining, names) {
+    if let Some(text) = draining_text(&draining, |key| writes.progress.get(key), names) {
         strips.push(
             notice("drain-status", text.clone(), theme.info)
                 .aria_label(text)
@@ -1009,7 +1066,11 @@ fn pods(count: usize) -> String {
 /// Why a drain left a pod, in words.
 fn blocked_reason(reason: &BlockedReason) -> String {
     match reason {
-        BlockedReason::DisruptionBudget => {
+        BlockedReason::DisruptionBudget(Some(budget)) => format!(
+            "the PodDisruptionBudget {} does not allow evicting them now",
+            single_line(budget)
+        ),
+        BlockedReason::DisruptionBudget(None) => {
             "a PodDisruptionBudget does not allow evicting them now".to_owned()
         }
         BlockedReason::Unmanaged => "no controller would recreate them".to_owned(),
@@ -1061,17 +1122,17 @@ fn blocked_lines(blocked: &[(PodName, BlockedReason)]) -> Vec<String> {
     lines
 }
 
-/// What a drain did, also when it stopped early: a notice with only OK.
-fn drain_report(node: &str, report: &DrainReport) -> DialogText {
+/// What a drain of `node` on `cluster` did, also when it stopped early: a notice with only OK.
+fn drain_report(cluster: &str, node: &str, report: &DrainReport) -> DialogText {
     let left = !report.blocked.is_empty()
         || !report.remaining.is_empty()
         || !report.terminating.is_empty();
     let title = if report.stopped.is_some() {
-        format!("Drain of {node} stopped")
+        format!("Drain of {node} on {cluster} stopped")
     } else if left {
-        format!("Drain of {node} left pods")
+        format!("Drain of {node} on {cluster} left pods")
     } else {
-        format!("Drained {node}")
+        format!("Drained {node} on {cluster}")
     };
     let mut lines = Vec::new();
     if let Some(why) = &report.stopped {
@@ -1123,7 +1184,7 @@ pub(in crate::ui) fn has_sessions(subject: Subject) -> bool {
 mod tests {
     use flint_core::KindId;
     use flint_core::display::ClusterNames;
-    use flint_core::write::{BlockedReason, DrainReport, PodName, WriteError};
+    use flint_core::write::{BlockedReason, DrainProgress, DrainReport, PodName, WriteError};
 
     use super::{
         REPORT_NAMES, ResourceAction as A, WriteKey, changed_note, drain_report, draining_text,
@@ -1289,15 +1350,19 @@ mod tests {
         report.cordoned = true;
         report.evicted = vec![pod("a"), pod("b")];
         report.blocked = vec![
-            (pod("c"), BlockedReason::DisruptionBudget),
+            (pod("c"), BlockedReason::DisruptionBudget(None)),
             (pod("d"), BlockedReason::Unmanaged),
             (pod("e"), BlockedReason::LocalStorage),
-            (pod("f"), BlockedReason::DisruptionBudget),
+            (pod("f"), BlockedReason::DisruptionBudget(None)),
+            (
+                pod("g"),
+                BlockedReason::DisruptionBudget(Some("web-pdb".into())),
+            ),
         ];
         report.skipped = vec![pod("ds")];
         report.terminating = vec![pod("a")];
-        let shown = drain_report("node-1", &report);
-        assert_eq!(shown.title, "Drain of node-1 left pods");
+        let shown = drain_report("alpha", "node-1", &report);
+        assert_eq!(shown.title, "Drain of node-1 on alpha left pods");
         assert_eq!(shown.cancel, "", "a notice, with only OK");
         for line in [
             "Cordoned: yes.",
@@ -1306,6 +1371,8 @@ mod tests {
              demo/f",
             "Blocked, 1 pod (no controller would recreate them): demo/d",
             "Blocked, 1 pod (their emptyDir data would be lost): demo/e",
+            "Blocked, 1 pod (the PodDisruptionBudget web-pdb does not allow evicting them now): \
+             demo/g",
             "Skipped (DaemonSet or mirror), 1 pod: demo/ds",
             "May still be terminating, 1 pod: demo/a",
         ] {
@@ -1344,8 +1411,8 @@ mod tests {
         report.evicted = vec![pod("a")];
         report.remaining = vec![pod("b"), pod("c")];
         report.stopped = Some(WriteError::Failed("the API server went away".into()));
-        let shown = drain_report("node-1", &report);
-        assert_eq!(shown.title, "Drain of node-1 stopped");
+        let shown = drain_report("alpha", "node-1", &report);
+        assert_eq!(shown.title, "Drain of node-1 on alpha stopped");
         assert!(
             shown
                 .text
@@ -1373,10 +1440,63 @@ mod tests {
         report.evicted = (0..REPORT_NAMES + 3)
             .map(|i| pod(&format!("p{i}")))
             .collect();
-        let shown = drain_report("node-1", &report);
-        assert_eq!(shown.title, "Drained node-1");
+        let shown = drain_report("alpha", "node-1", &report);
+        assert_eq!(shown.title, "Drained node-1 on alpha");
         assert!(shown.text.contains("and 3 more"), "{}", shown.text);
         assert!(!shown.text.contains("p7"), "{}", shown.text);
+    }
+
+    fn untold(_: &WriteKey) -> Option<&'static DrainProgress> {
+        None
+    }
+
+    // covers UP-53: a running drain's strip says where it is, pod by pod, once it has told.
+    #[test]
+    fn the_strip_shows_a_drains_progress() {
+        let nodes = KindId::new("", "nodes");
+        let (a, b) = (
+            WriteKey::new("x", &nodes, None, "a"),
+            WriteKey::new("x", &nodes, None, "b"),
+        );
+        let mut listed = DrainProgress::default();
+        listed.to_evict = 3;
+        listed.blocked = 1;
+        let mut evicting = listed.clone();
+        evicting.tried = 1;
+        evicting.evicted = 1;
+        evicting.current = Some(pod("web"));
+        let mut waiting = evicting.clone();
+        waiting.tried = 3;
+        waiting.evicted = 2;
+        waiting.current = None;
+        waiting.terminating = Some(2);
+        let unused = || -> ClusterNames { panic!("one cluster") };
+        for (told, says) in [
+            (
+                &listed,
+                "Draining a: 3 pods to evict (0 evicted, 1 blocked)…",
+            ),
+            (
+                &evicting,
+                "Draining a: evicting demo/web, 2 of 3 (1 evicted, 1 blocked)…",
+            ),
+            (
+                &waiting,
+                "Draining a: waiting for 2 pods to terminate (2 evicted, 1 blocked)…",
+            ),
+        ] {
+            assert_eq!(draining_text(&[&a], |_| Some(told), unused).unwrap(), says);
+        }
+        let only_a = |key: &WriteKey| (key == &a).then_some(&evicting);
+        assert_eq!(
+            draining_text(&[&a, &b], only_a, unused).unwrap(),
+            "Draining 2 nodes: a (1/3), b…"
+        );
+        let waits = |key: &WriteKey| (key == &b).then_some(&waiting);
+        assert_eq!(
+            draining_text(&[&a, &b], waits, unused).unwrap(),
+            "Draining 2 nodes: a, b (2 terminating)…"
+        );
     }
 
     // covers UP-53: every running drain is named or counted, and clusters are told apart.
@@ -1386,22 +1506,22 @@ mod tests {
         let key = |cluster, name| WriteKey::new(cluster, &nodes, None, name);
         let (a, b, c, d) = (key("x", "a"), key("x", "b"), key("x", "c"), key("x", "d"));
         let names = ClusterNames::new(["x", "y"], &Default::default());
-        assert_eq!(draining_text(&[], || names.clone()), None);
+        assert_eq!(draining_text(&[], untold, || names.clone()), None);
         assert_eq!(
-            draining_text(&[&a], || names.clone()).unwrap(),
+            draining_text(&[&a], untold, || names.clone()).unwrap(),
             "Draining a…"
         );
         assert_eq!(
-            draining_text(&[&a, &b], || names.clone()).unwrap(),
+            draining_text(&[&a, &b], untold, || names.clone()).unwrap(),
             "Draining 2 nodes: a, b…"
         );
         assert_eq!(
-            draining_text(&[&a, &b, &c, &d], || names.clone()).unwrap(),
+            draining_text(&[&a, &b, &c, &d], untold, || names.clone()).unwrap(),
             "Draining 4 nodes: a, b, c and 1 more…"
         );
         let other = key("y", "a");
         assert_eq!(
-            draining_text(&[&a, &other], || names.clone()).unwrap(),
+            draining_text(&[&a, &other], untold, || names.clone()).unwrap(),
             "Draining 2 nodes: x/a, y/a…"
         );
     }
@@ -1417,7 +1537,7 @@ mod tests {
             WriteKey::new(two, &nodes, None, "node-1"),
         );
         let names = ClusterNames::new([one, two], &Default::default());
-        let text = draining_text(&[&a, &b], || names.clone()).unwrap();
+        let text = draining_text(&[&a, &b], untold, || names.clone()).unwrap();
         assert!(
             text.contains(&format!("{}/node-1", names.with_real(one))),
             "{text}"
@@ -1452,7 +1572,7 @@ mod tests {
             [blue.cluster.as_str(), green.cluster.as_str()],
             &Default::default(),
         );
-        let text = draining_text(&[&blue, &green], || names.clone()).unwrap();
+        let text = draining_text(&[&blue, &green], untold, || names.clone()).unwrap();
         let (one, two) = (names.exact(&blue.cluster), names.exact(&green.cluster));
         assert_ne!(one, two);
         assert!(text.contains(&format!("{one}/a")), "{text}");
@@ -1460,7 +1580,7 @@ mod tests {
 
         // A cluster that left kubeconfig mid-drain is named whole and marked.
         let names = ClusterNames::new([blue.cluster.as_str()], &Default::default());
-        let text = draining_text(&[&blue, &green], || names.clone()).unwrap();
+        let text = draining_text(&[&blue, &green], untold, || names.clone()).unwrap();
         assert!(
             text.contains("team-platform-production-green-cluster-main (removed)/a"),
             "{text}"
@@ -1479,7 +1599,7 @@ mod tests {
         let names = ClusterNames::new([eks], &Default::default());
         assert_eq!(names.exact(eks), names.exact("prod"));
         assert_eq!(
-            draining_text(&[&kept, &gone], || names.clone()).unwrap(),
+            draining_text(&[&kept, &gone], untold, || names.clone()).unwrap(),
             "Draining 2 nodes: prod/node-1, prod (removed)/node-1…"
         );
 
@@ -1488,7 +1608,7 @@ mod tests {
         let names = ClusterNames::new([eks, "staging"], &Default::default());
         assert_eq!(names.exact(eks), "prod");
         assert_eq!(
-            draining_text(&[&gone, &other], || names.clone()).unwrap(),
+            draining_text(&[&gone, &other], untold, || names.clone()).unwrap(),
             "Draining 2 nodes: prod (removed)/node-1, staging/node-2…"
         );
     }
@@ -1500,10 +1620,10 @@ mod tests {
         let key = |cluster, name| WriteKey::new(cluster, &nodes, None, name);
         let (a, b) = (key("x", "a"), key("x", "b"));
         let unused = || -> ClusterNames { panic!("labels built for one cluster") };
-        assert_eq!(draining_text(&[], unused), None);
-        assert_eq!(draining_text(&[&a], unused).unwrap(), "Draining a…");
+        assert_eq!(draining_text(&[], untold, unused), None);
+        assert_eq!(draining_text(&[&a], untold, unused).unwrap(), "Draining a…");
         assert_eq!(
-            draining_text(&[&a, &b], unused).unwrap(),
+            draining_text(&[&a, &b], untold, unused).unwrap(),
             "Draining 2 nodes: a, b…"
         );
     }

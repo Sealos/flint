@@ -925,15 +925,22 @@ async fn handle(
         Some(Effect::AdmissionDenied { webhook, message }) => {
             error(&faults::admission_denied(&webhook, &message))
         }
-        Some(Effect::DisruptionBudget) => {
+        Some(Effect::DisruptionBudget(name)) => {
             let mut refused = ApiError::new(
                 429,
                 reason(429),
                 "Cannot evict pod as it would violate the pod's disruption budget.",
             );
+            // As the API server words it, when it has the budget at hand.
+            let message = match name {
+                Some(name) => {
+                    format!("The disruption budget {name} needs 2 healthy pods and has 1 currently")
+                }
+                None => "The disruption budget needs more healthy pods.".to_owned(),
+            };
             refused.body["details"] = serde_json::json!({"causes": [{
                 "reason": "DisruptionBudget",
-                "message": "The disruption budget needs more healthy pods.",
+                "message": message,
             }]});
             error(&refused)
         }
