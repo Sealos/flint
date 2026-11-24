@@ -20,7 +20,7 @@ use flint_core::{
 };
 use flint_e2e::fake_api::{
     CONTEXT, ContainerLog, ExecEnd, FakeApiServer, FakePod, Fault, Gvr, Options, REMOTE_CONTEXT,
-    TtySize, Verb, WatchStep,
+    RequestRecord, TtySize, Verb, WatchStep,
 };
 
 mod core_support;
@@ -266,11 +266,18 @@ async fn a_pinned_read_is_one_get_and_a_changed_pin_sends_nothing() {
     .await
     .expect("the cluster list");
     let kind = KindId::new("apps", "deployments");
-    let count = |wanted: &dyn Fn(&str) -> bool| {
-        server.requests().iter().filter(|r| wanted(&r.path)).count()
+    let count = |wanted: &dyn Fn(&RequestRecord) -> bool| {
+        server.requests().iter().filter(|r| wanted(r)).count()
     };
-    let is_events = |path: &str| path.ends_with("/events");
-    let is_object = |path: &str| path == OBJECT;
+    // A detail's Events read names the object it is about. Problem detection runs in On view too
+    // (#715), and its feed lists Warning events across the cluster: that is not a detail's read.
+    let is_events = |r: &RequestRecord| {
+        r.path.ends_with("/events")
+            && r.parsed_query()
+                .field_selector
+                .is_some_and(|fields| fields.contains("involvedObject."))
+    };
+    let is_object = |r: &RequestRecord| r.path == OBJECT;
     let events_before = count(&is_events);
 
     let detail = core
@@ -2324,8 +2331,17 @@ async fn an_overview_reads_nothing_from_a_replaced_context() {
     let original = point_at(&core, &file, &first, "other").await;
     let open = core.handle.open_overview_on(CONTEXT, original);
     open.registered().await;
+    // Problem detection runs in On view (#715), so the context's first definition had a feed of
+    // its own on this server. Its watches can still be closing when the new slot has not yet
+    // connected, so they don't show the overview's feed is up: wait for the overview to read it.
     until_overview_watches(&first, true, "the first server's feed").await;
-    assert!(open.telemetry().is_some(), "its own slot");
+    tokio::time::timeout(WAIT, async {
+        while open.telemetry().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("its own slot");
 
     let replacement = point_at(&core, &file, &second, "demo").await;
     assert_ne!(replacement, original);
