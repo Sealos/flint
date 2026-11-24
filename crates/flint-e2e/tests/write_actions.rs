@@ -665,7 +665,9 @@ async fn a_drain_tells_its_progress_while_it_runs() {
     })
     .await
     .expect("progress for pod-b");
-    hold.reached().await;
+    tokio::time::timeout(WAIT, hold.reached())
+        .await
+        .expect("pod-b's eviction held");
     let now = seen.last().unwrap();
     assert_eq!(
         (now.to_evict, now.tried, now.evicted),
@@ -719,7 +721,9 @@ async fn a_replaced_node_reports_the_listed_pods_as_not_tried() {
     let (held, hold) = Fault::hold();
     server.inject(held.on(&Gvr::core("pods")).verb(Verb::List).times(1));
     let running = tokio::spawn(core.handle.run_write(review.into_intent()));
-    hold.reached().await;
+    tokio::time::timeout(WAIT, hold.reached())
+        .await
+        .expect("the drain's pod list held");
     server.set_object(
         &nodes(),
         json!({

@@ -49,8 +49,13 @@ const MAX_REPLICAS: u32 = i32::MAX as u32;
 /// How many pods a line of a drain's report names; the rest are counted.
 const REPORT_NAMES: usize = 5;
 
-/// How many reasons a drain's report lists for blocked pods; the rest are counted.
-const REPORT_REASONS: usize = 6;
+/// How many named PodDisruptionBudgets a drain's report lists for blocked pods; the pods of the
+/// rest are counted.
+const REPORT_BUDGETS: usize = 3;
+
+/// How many eviction failures, each with the server's reason, a drain's report lists; the pods of
+/// the rest are counted.
+const REPORT_FAILURES: usize = 3;
 
 /// The longest reason from the server a drain's report quotes.
 const REPORT_REASON_LEN: usize = 120;
@@ -197,8 +202,8 @@ impl WriteKey {
 
 /// A drain that ended, until its report is viewed or a newer one replaces it.
 struct FinishedDrain {
-    /// The cluster, as named when the drain was confirmed (told from every other context then):
-    /// two clusters can have a node of one name.
+    /// The cluster's context: two clusters can have a node of one name. Its label is made when
+    /// the result is shown, by [`cluster_shown`].
     cluster: String,
     node: String,
     report: DrainReport,
@@ -548,7 +553,6 @@ fn confirm_review(
     // The handle it was reviewed through: a set's row runs bound to its member too.
     let core = request.core.clone();
     let names = ws.cluster_names(cx);
-    let cluster = names.with_real(&request.target.cluster);
     let this = cx.weak_entity();
     let handle = window.window_handle();
     let key = WriteKey::of(&request.target);
@@ -586,7 +590,7 @@ fn confirm_review(
             }) = &result
             {
                 let finished = FinishedDrain {
-                    cluster: cluster.clone(),
+                    cluster: request.target.cluster.clone(),
                     node: request.target.name.clone(),
                     report: report.clone(),
                 };
@@ -631,11 +635,13 @@ pub(in crate::ui) fn has_drain_result(cx: &App) -> bool {
         .is_some_and(|w| w.finished.is_some())
 }
 
-/// Opens the latest drain's report; viewing it takes it off the strip.
-pub(in crate::ui) fn show_drain_report(window: &mut Window, cx: &mut App) {
+/// Opens the latest drain's report, its cluster called as `names` do now; viewing it takes it off
+/// the strip.
+pub(in crate::ui) fn show_drain_report(names: &ClusterNames, window: &mut Window, cx: &mut App) {
     let finished = cx.update_default_global::<RunningWrites, _>(|writes, _| writes.finished.take());
     if let Some(finished) = finished {
-        let text = drain_report(&finished.cluster, &finished.node, &finished.report);
+        let cluster = cluster_shown(&finished.cluster, names);
+        let text = drain_report(&cluster, &finished.node, &finished.report);
         confirm::open(window, cx, text, |_, _| {});
     }
 }
@@ -696,14 +702,35 @@ fn progress_text(told: &DrainProgress) -> String {
     }
 }
 
-/// Where one of several running drains is, in short: the pod it is at, as [`progress_text`]
-/// counts it.
+/// Where one of several running drains is, in short: the pod it is at, counted as
+/// [`progress_text`] counts it.
 fn progress_count(told: &DrainProgress) -> String {
     match (told.terminating, &told.current) {
         (Some(left), _) => format!("{left} terminating"),
-        (None, Some(_)) => format!("{}/{}", told.tried + 1, told.to_evict),
+        (None, Some(pod)) => format!(
+            "{}/{}, {}/{}",
+            pod.namespace,
+            pod.name,
+            told.tried + 1,
+            told.to_evict
+        ),
         (None, None) => format!("{}/{}", told.tried, told.to_evict),
     }
+}
+
+/// `label` for `cluster`, marked removed for a context that left kubeconfig: it cannot pass for
+/// the label of a cluster still there.
+fn marked(cluster: &str, label: String, names: &ClusterNames) -> String {
+    match names.is_known(cluster) {
+        true => label,
+        false => format!("{label} (removed)"),
+    }
+}
+
+/// What a drain's result calls its cluster now: its exact label, or its whole context marked
+/// removed once it left kubeconfig.
+fn cluster_shown(cluster: &str, names: &ClusterNames) -> String {
+    marked(cluster, names.exact(cluster), names)
 }
 
 /// What the strip calls each cluster of `keys`: its exact label, or its whole context on one line
@@ -713,14 +740,10 @@ fn strip_cluster_labels<'a>(
     keys: &[&'a WriteKey],
     names: &ClusterNames,
 ) -> HashMap<&'a str, String> {
-    let marked = |cluster: &str, label: String| match names.is_known(cluster) {
-        true => label,
-        false => format!("{label} (removed)"),
-    };
     let clusters: BTreeSet<&str> = keys.iter().map(|key| key.cluster.as_str()).collect();
     let read: BTreeSet<String> = clusters
         .iter()
-        .map(|cluster| cluster_name_key(&marked(cluster, names.exact(cluster))))
+        .map(|cluster| cluster_name_key(&cluster_shown(cluster, names)))
         .collect();
     let distinct = read.len() == clusters.len();
     clusters
@@ -730,18 +753,19 @@ fn strip_cluster_labels<'a>(
                 true => names.exact(cluster),
                 false => single_line(cluster),
             };
-            (cluster, marked(cluster, label))
+            (cluster, marked(cluster, label, names))
         })
         .collect()
 }
 
-/// What the strip says of a drain that ended.
-fn finished_text(finished: &FinishedDrain) -> String {
+/// What the strip says of a drain that ended, its cluster called as `names` do now.
+fn finished_text(finished: &FinishedDrain, names: &ClusterNames) -> String {
     let how = match finished.report.stopped {
         Some(_) => "stopped",
         None => "finished",
     };
-    format!("Drain of {} on {} {how}", finished.node, finished.cluster)
+    let cluster = cluster_shown(&finished.cluster, names);
+    format!("Drain of {} on {cluster} {how}", finished.node)
 }
 
 /// The workspace's strips for drains: those running, and the latest result with its button.
@@ -753,6 +777,14 @@ pub(in crate::ui) fn drain_strips(
     let Some(writes) = cx.try_global::<RunningWrites>() else {
         return Vec::new();
     };
+    // Built once, and only for a strip that names a cluster.
+    let mut make = Some(names);
+    let mut built: Option<ClusterNames> = None;
+    let mut names = || {
+        built
+            .get_or_insert_with(|| make.take().map(|make| make()).unwrap_or_default())
+            .clone()
+    };
     let mut strips = Vec::new();
     let draining: Vec<&WriteKey> = writes
         .running
@@ -760,7 +792,7 @@ pub(in crate::ui) fn drain_strips(
         .filter(|(_, write)| **write == RunningWrite::Action(ResourceAction::Drain))
         .map(|(key, _)| key)
         .collect();
-    if let Some(text) = draining_text(&draining, |key| writes.progress.get(key), names) {
+    if let Some(text) = draining_text(&draining, |key| writes.progress.get(key), &mut names) {
         strips.push(
             notice("drain-status", text.clone(), theme.info)
                 .aria_label(text)
@@ -769,7 +801,7 @@ pub(in crate::ui) fn drain_strips(
         );
     }
     if let Some(finished) = &writes.finished {
-        let text = finished_text(finished);
+        let text = finished_text(finished, &names());
         let color = match finished.report.stopped {
             Some(_) => theme.warning,
             None => theme.info,
@@ -1093,34 +1125,70 @@ fn blocked_reason(reason: &BlockedReason) -> String {
     }
 }
 
-/// The blocked pods, a line per reason, in the order first met.
+/// The kinds of reason a report bounds apart, so many of one kind cannot hide another.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReasonKind {
+    /// A budget the server named: one line per budget, up to [`REPORT_BUDGETS`].
+    NamedBudget,
+    /// The server's reason for a failure: one line per reason, up to [`REPORT_FAILURES`].
+    Failure,
+    /// A reason in Flint's own words, of which there are few: always shown.
+    Fixed,
+}
+
+fn reason_kind(reason: &BlockedReason) -> ReasonKind {
+    match reason {
+        BlockedReason::DisruptionBudget(Some(_)) => ReasonKind::NamedBudget,
+        BlockedReason::Failed(_) => ReasonKind::Failure,
+        _ => ReasonKind::Fixed,
+    }
+}
+
+/// The blocked pods, a line per reason, in the order first met. Named budgets and failures are
+/// each bounded, and the pods of the rest of each are counted on a line of their own.
 fn blocked_lines(blocked: &[(PodName, BlockedReason)]) -> Vec<String> {
-    let mut groups: Vec<(String, Vec<&PodName>)> = Vec::new();
+    let mut groups: Vec<(ReasonKind, String, Vec<&PodName>)> = Vec::new();
     for (pod, reason) in blocked {
-        let reason = blocked_reason(reason);
-        match groups.iter_mut().find(|(r, _)| *r == reason) {
-            Some((_, pods)) => pods.push(pod),
-            None => groups.push((reason, vec![pod])),
+        let (kind, reason) = (reason_kind(reason), blocked_reason(reason));
+        match groups.iter_mut().find(|(_, r, _)| *r == reason) {
+            Some((_, _, pods)) => pods.push(pod),
+            None => groups.push((kind, reason, vec![pod])),
         }
     }
-    let hidden: usize = groups
-        .iter()
-        .skip(REPORT_REASONS)
-        .map(|(_, pods)| pods.len())
-        .sum();
-    let mut lines: Vec<String> = groups
-        .iter()
-        .take(REPORT_REASONS)
-        .map(|(reason, group)| {
-            format!(
-                "Blocked, {} ({reason}): {}",
-                pods(group.len()),
-                pod_names(group.iter().copied())
-            )
-        })
-        .collect();
-    if hidden > 0 {
-        lines.push(format!("Blocked for other reasons: {}.", pods(hidden)));
+    let mut lines = Vec::new();
+    // Per bounded kind: the lines shown, and the pods counted instead.
+    let mut budgets = (0, 0);
+    let mut failures = (0, 0);
+    for (kind, reason, group) in &groups {
+        let bound = match kind {
+            ReasonKind::NamedBudget => Some((&mut budgets, REPORT_BUDGETS)),
+            ReasonKind::Failure => Some((&mut failures, REPORT_FAILURES)),
+            ReasonKind::Fixed => None,
+        };
+        if let Some(((shown, hidden), limit)) = bound {
+            if *shown >= limit {
+                *hidden += group.len();
+                continue;
+            }
+            *shown += 1;
+        }
+        lines.push(format!(
+            "Blocked, {} ({reason}): {}",
+            pods(group.len()),
+            pod_names(group.iter().copied())
+        ));
+    }
+    if budgets.1 > 0 {
+        lines.push(format!(
+            "Blocked by other PodDisruptionBudgets: {}.",
+            pods(budgets.1)
+        ));
+    }
+    if failures.1 > 0 {
+        lines.push(format!(
+            "Blocked by other eviction failures: {}.",
+            pods(failures.1)
+        ));
     }
     lines
 }
@@ -1453,6 +1521,70 @@ mod tests {
         None
     }
 
+    // covers UP-53: many named budgets or failures cannot hide another reason: each kind is
+    // bounded on its own, and its other pods are counted.
+    #[test]
+    fn a_report_bounds_budgets_and_failures_apart() {
+        let mut blocked: Vec<(PodName, BlockedReason)> = (0..super::REPORT_BUDGETS + 2)
+            .map(|i| {
+                let budget = BlockedReason::DisruptionBudget(Some(format!("pdb-{i}")));
+                (pod(&format!("b{i}")), budget)
+            })
+            .collect();
+        blocked.extend((0..super::REPORT_FAILURES + 1).map(|i| {
+            let failed = BlockedReason::Failed(format!("reason {i}"));
+            (pod(&format!("f{i}")), failed)
+        }));
+        blocked.push((pod("limited"), BlockedReason::Throttled));
+        blocked.push((pod("bare"), BlockedReason::Unmanaged));
+        let lines = super::blocked_lines(&blocked);
+        for line in [
+            "Blocked, 1 pod (the API server is limiting requests): demo/limited",
+            "Blocked, 1 pod (no controller would recreate them): demo/bare",
+            "Blocked by other PodDisruptionBudgets: 2 pods.",
+            "Blocked by other eviction failures: 1 pod.",
+        ] {
+            assert!(lines.iter().any(|l| l == line), "{line} in {lines:#?}");
+        }
+        let budget_lines = lines.iter().filter(|l| l.contains("pdb-")).count();
+        assert_eq!(budget_lines, super::REPORT_BUDGETS, "{lines:#?}");
+        let failure_lines = lines.iter().filter(|l| l.contains("reason ")).count();
+        assert_eq!(failure_lines, super::REPORT_FAILURES, "{lines:#?}");
+    }
+
+    // covers UP-53: a drain's result names its cluster as the names are when it is shown, and a
+    // cluster that left kubeconfig whole and marked removed.
+    #[test]
+    fn a_drain_result_names_its_cluster_when_shown() {
+        let eks = "arn:aws:eks:eu-west-1:123456789012:cluster/prod";
+        let finished = super::FinishedDrain {
+            cluster: "prod".into(),
+            node: "node-1".into(),
+            report: DrainReport::default(),
+        };
+        let kept = ClusterNames::new(["prod"], &Default::default());
+        assert_eq!(
+            super::finished_text(&finished, &kept),
+            "Drain of node-1 on prod finished"
+        );
+        // The context is gone, and another cluster's label reads "prod".
+        let gone = ClusterNames::new([eks], &Default::default());
+        assert_eq!(gone.exact(eks), "prod");
+        assert_eq!(
+            super::finished_text(&finished, &gone),
+            "Drain of node-1 on prod (removed) finished"
+        );
+        assert_eq!(
+            drain_report(
+                &super::cluster_shown("prod", &gone),
+                "node-1",
+                &finished.report
+            )
+            .title,
+            "Drained node-1 on prod (removed)"
+        );
+    }
+
     // covers UP-53: a running drain's strip says where it is, pod by pod, once it has told.
     #[test]
     fn the_strip_shows_a_drains_progress() {
@@ -1493,7 +1625,7 @@ mod tests {
         let only_a = |key: &WriteKey| (key == &a).then_some(&evicting);
         assert_eq!(
             draining_text(&[&a, &b], only_a, unused).unwrap(),
-            "Draining 2 nodes: a (2/3), b…"
+            "Draining 2 nodes: a (demo/web, 2/3), b…"
         );
         let waits = |key: &WriteKey| (key == &b).then_some(&waiting);
         assert_eq!(

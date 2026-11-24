@@ -1174,8 +1174,9 @@ fn disruption_budget(error: &kube::Error) -> Option<Option<String>> {
 }
 
 /// The budget a cause's message names, as the Eviction API words it: "The disruption budget
-/// NAME needs ..." or "... NAME is still being processed ...". Only a valid object name counts,
-/// so a reworded message names none rather than a wrong one.
+/// NAME needs ...", "... NAME is still being processed ..." or, when the budget failed to sync,
+/// "... NAME does not allow evicting pods currently ...". Only a valid object name counts, so a
+/// reworded message names none rather than a wrong one.
 fn budget_name(message: &str) -> Option<String> {
     let rest = message.strip_prefix("The disruption budget ")?;
     let (name, after) = rest.split_once(' ')?;
@@ -1186,7 +1187,13 @@ fn budget_name(message: &str) -> Option<String> {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
         && name.starts_with(|c: char| c.is_ascii_alphanumeric())
         && name.ends_with(|c: char| c.is_ascii_alphanumeric());
-    let worded = after.starts_with("needs ") || after.starts_with("is still being processed");
+    let worded = [
+        "needs ",
+        "is still being processed",
+        "does not allow evicting pods",
+    ]
+    .iter()
+    .any(|wording| after.starts_with(wording));
     (valid && worded).then(|| name.to_owned())
 }
 
@@ -2224,6 +2231,7 @@ mod tests {
         let pods = vec![
             pod("named", Some("ReplicaSet"), json!({})),
             pod("pending", Some("ReplicaSet"), json!({})),
+            pod("unsynced", Some("ReplicaSet"), json!({})),
             pod("odd", Some("ReplicaSet"), json!({})),
         ];
         let (client, _log) = fake(drain_server(pods, |name| {
@@ -2231,6 +2239,10 @@ mod tests {
                 "named" => "The disruption budget web-pdb needs 2 healthy pods and has 1 currently",
                 "pending" => {
                     "The disruption budget db.budget is still being processed by the server."
+                }
+                "unsynced" => {
+                    "The disruption budget cache-pdb does not allow evicting pods currently \
+                     because it failed sync: no matching pods"
                 }
                 _ => "The disruption budget Not A Name needs more healthy pods.",
             };
@@ -2250,6 +2262,10 @@ mod tests {
                 (
                     named("pending"),
                     BlockedReason::DisruptionBudget(Some("db.budget".into()))
+                ),
+                (
+                    named("unsynced"),
+                    BlockedReason::DisruptionBudget(Some("cache-pdb".into()))
                 ),
                 (named("odd"), BlockedReason::DisruptionBudget(None)),
             ]

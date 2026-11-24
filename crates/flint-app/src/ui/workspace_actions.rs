@@ -198,7 +198,10 @@ impl Workspace {
         .bind::<DrainNode>(|this, _, window, cx| {
             resource_actions::request(this, ResourceAction::Drain, window, cx)
         })
-        .bind::<ShowDrainReport>(|_, _, window, cx| resource_actions::show_drain_report(window, cx))
+        .bind::<ShowDrainReport>(|this, _, window, cx| {
+            let names = this.cluster_names(cx);
+            resource_actions::show_drain_report(&names, window, cx)
+        })
         .bind::<RetryConnection>(Self::retry_connection)
         .bind::<CancelConnection>(|this, _, _, cx| {
             if this.model.read(cx).can_cancel_connection() {

@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result};
 use flint_e2e::app::{App, AppOptions};
 use flint_e2e::backend::TestCluster;
 use flint_e2e::fake_api::{
-    FakeApiServer, FakeExec, Fault, Gvr, Options, RequestRecord, Verb, WriteRecord,
+    CONTEXT, FakeApiServer, FakeExec, Fault, Gvr, Options, RequestRecord, Verb, WriteRecord,
 };
 use http::Method;
 use serde_json::{Value, json};
@@ -411,7 +411,7 @@ fn up_53_node_actions_confirm() -> Result<()> {
     app.dispatch("ui::Confirm", Value::Null)?;
     app.wait_for("/dialog", Equals(Value::Null))?;
     let (title, text) = drain_report(&app)?;
-    assert_eq!(title, format!("Drained {NODE}"), "{text}");
+    assert_eq!(title, format!("Drained {NODE} on {CONTEXT}"), "{text}");
     assert!(text.lines().any(|l| l == "Cordoned: yes."), "{text}");
     assert!(text.lines().any(|l| l == "Evicted 0 pods."), "{text}");
     app.dispatch("ui::Confirm", Value::Null)?;
@@ -454,9 +454,10 @@ fn up_53_drain_reports_pdb() -> Result<()> {
     app.wait_for("/dialog", Equals(Value::Null))?;
     let (title, text) = drain_report(&app)?;
     // The cluster is named too: two clusters can have a node of one name.
-    assert!(
-        title.starts_with(&format!("Drain of {NODE} on ")) && title.ends_with(" left pods"),
-        "{title}: {text}"
+    assert_eq!(
+        title,
+        format!("Drain of {NODE} on {CONTEXT} left pods"),
+        "{text}"
     );
     // Whole lines: each pod is tied to its own outcome and reason.
     for line in [
