@@ -1435,6 +1435,10 @@ mod tests {
                                 serde_json::json!({"kind": "Status", "code": 404}).to_string(),
                             )
                         });
+                    // Code 0: a server that never answers this path.
+                    if code == 0 {
+                        std::future::pending::<()>().await;
+                    }
                     let response = format!(
                         "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
@@ -1570,6 +1574,42 @@ mod tests {
             scale("replicationcontrollers").1,
             Some(action_kinds::ScalePaths::built_in())
         );
+    }
+
+    // covers UP-53: a definition that never answers costs only its own kind's Scale: what the
+    // others answered before the deadline is kept.
+    #[tokio::test]
+    async fn a_stalled_definition_keeps_the_paths_already_read() {
+        use serde_json::json;
+        let crd = json!({"spec": {"group": "example.dev", "names": {"plural": "widgets"},
+            "versions": [{"name": "v1", "served": true, "subresources": {"scale":
+                {"specReplicasPath": ".spec.size", "statusReplicasPath": ".status.n"}}}]}});
+        let (client, _) = fake_api(vec![
+            (
+                "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/widgets.example.dev",
+                200,
+                crd,
+            ),
+            (
+                "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/gizmos.example.dev",
+                0,
+                json!({}),
+            ),
+        ])
+        .await;
+        let kind = |plural: &str| KindInfo {
+            scale: ScaleSubresource::Unread,
+            ..kind("example.dev", "v1", "Widget", plural)
+        };
+        let mut kinds = vec![kind("widgets"), kind("gizmos")];
+        let read = action_kinds::read_scale_paths(&client, &mut kinds, Duration::from_secs(60));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), read)
+                .await
+                .is_err()
+        );
+        assert!(kinds[0].scale_paths().is_some());
+        assert_eq!(kinds[1].scale, ScaleSubresource::Unread);
     }
 
     // covers UP-10

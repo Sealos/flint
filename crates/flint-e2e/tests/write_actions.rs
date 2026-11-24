@@ -621,6 +621,33 @@ async fn a_custom_resource_scales_through_its_scale_subresource() {
     assert_eq!(gadget_size(&server), 7);
 }
 
+// covers UP-53: a definition whose replica path changed after the review stops the scale before
+// its patch, even when both fields hold the reviewed count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_custom_resource_scale_stops_when_its_replica_path_changes() {
+    let server = scaled_gadgets().await;
+    let core = Core::start(&server, Settings::default()).await;
+    let review = core
+        .handle
+        .review_write(gadget_target(&server), WriteProposal::Scale { to: 5 })
+        .await
+        .unwrap();
+    let crds = Gvr::new("apiextensions.k8s.io", "v1", "customresourcedefinitions");
+    let mut crd = server
+        .object(&crds, None, "gadgets.fixtures.flint.dev")
+        .unwrap();
+    crd["spec"]["versions"][0]["subresources"]["scale"]["specReplicasPath"] = json!(".spec.other");
+    server.set_object(&crds, crd);
+    let mut gadget = server.object(&gadgets(), Some("demo"), "gadget-1").unwrap();
+    gadget["spec"]["other"] = json!(3);
+    server.set_object(&gadgets(), gadget);
+    let before = server.requests().len();
+    let result = core.handle.run_write(review.into_intent()).await;
+    assert_eq!(result.unwrap_err(), WriteError::Conflict);
+    assert_eq!(writes_in(&since(&server, before)), 0);
+    assert_eq!(gadget_size(&server), 3);
+}
+
 // covers UP-53: a custom resource has no Scale without a scale subresource, or while its
 // definition cannot be read; nothing is written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

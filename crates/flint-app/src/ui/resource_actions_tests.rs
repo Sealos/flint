@@ -946,6 +946,29 @@ async fn a_confirmation_closes_when_its_object_changes(cx: &mut TestAppContext) 
     assert_eq!(api.patches(), 0);
 }
 
+// covers UP-53: a restart's confirmation left open closes once a copy shows that a restart ran
+// since its review (another `restartedAt`); a status update leaves it open.
+#[gpui_kit::test]
+async fn a_restart_confirmation_closes_after_another_restart(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, api) = confirm_scaling_web(cx, dir.path(), &[]).await;
+    t.press(cx, "escape");
+    wait_for_no_dialog(cx, &t).await;
+    t.dispatch(cx, "workspace::RestartObject", Value::Null)
+        .unwrap();
+    wait_for_confirmation(cx, &t, "Replaces its pods").await;
+    let mut web = deployment();
+    web["status"] = json!({"observedGeneration": 4});
+    show_fetched(cx, &t, fetched(web.clone()));
+    draw(cx, &t);
+    assert!(t.has_dialog(cx), "a status update keeps it open");
+    web["spec"]["template"] =
+        json!({"metadata": {"annotations": {"kubectl.kubernetes.io/restartedAt": "t1"}}});
+    show_fetched(cx, &t, fetched(web));
+    wait_for_no_dialog(cx, &t).await;
+    assert_eq!(api.patches(), 0);
+}
+
 /// The text field that has focus.
 fn focused_text(cx: &mut TestAppContext, t: &TestWorkspace) -> String {
     cx.update_window(t.window, |_, window, cx| {

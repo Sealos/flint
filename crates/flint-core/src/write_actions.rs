@@ -23,7 +23,7 @@ use kube::core::Status;
 use kube::{Client, Resource, ResourceExt as _};
 use serde_json::{Value, json};
 
-use crate::action_kinds;
+use crate::action_kinds::{self, ScalePaths};
 use crate::api_path::{self, PathError};
 use crate::cluster::ClusterError;
 use crate::gitops::{self, Identity, ManagedBy};
@@ -155,6 +155,42 @@ pub(crate) struct Reviewed {
     pub(crate) spec: ReviewedSpec,
     /// Whether another `spec` than [`Self::spec`] makes this review stale.
     pub(crate) hold_spec: bool,
+    /// For a scale: where the count was read, which its definition must still say.
+    pub(crate) scale: Option<ScalePaths>,
+    /// For a restart: the pod template's `restartedAt` as reviewed (`Some(None)`: none). Another
+    /// one means a restart ran since, and this one would be a second.
+    pub(crate) restarted_at: Option<Option<String>>,
+}
+
+/// The `restartedAt` annotation of a workload's pod template.
+pub(crate) fn restarted_at(live: &Value) -> Option<String> {
+    live.pointer("/spec/template/metadata/annotations")
+        .and_then(|a| a.get(RESTARTED_AT))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The replica paths a scale of `kind` may use now: what discovery says, and for a custom
+/// resource what its definition says when read again. Another definition is a conflict, and one
+/// that cannot be read refuses the scale.
+async fn current_scale_paths(
+    gate: &mut impl ActionGate,
+    kind: &KindInfo,
+) -> Result<ScalePaths, WriteError> {
+    let refuse = || WriteError::Rejected(format!("{} cannot be scaled", kind.plural()));
+    let known = kind.scale_paths().ok_or_else(refuse)?;
+    if action_kinds::scales_built_in(&kind.id()) {
+        return Ok(known);
+    }
+    let client = gate.client().await?;
+    match action_kinds::definition_scale_paths(&client, &kind.resource, REQUEST_TIMEOUT).await {
+        Some(read) if read == known => Ok(read),
+        Some(_) => Err(WriteError::Conflict),
+        None => Err(WriteError::Failed(format!(
+            "the definition of {} could not be read to confirm where it keeps its replica count",
+            kind.plural()
+        ))),
+    }
 }
 
 /// A live object's `spec`. Never printed: it can hold environment values.
@@ -173,9 +209,12 @@ impl std::fmt::Debug for ReviewedSpec {
     }
 }
 
-/// What the review of `change` to the live object `live` must remember.
+/// What the review of `change` to the live object `live` of `kind` must remember. A scale's
+/// paths are read from the definition again, so the count reviewed is at the path the
+/// `scale` subresource uses.
 pub(crate) async fn reviewed(
     gate: &mut impl ActionGate,
+    kind: &KindInfo,
     name: &str,
     live: &Value,
     change: &ResourceChange,
@@ -184,11 +223,17 @@ pub(crate) async fn reviewed(
         Some(options) => managed_pods(gate, name, &options).await?,
         None => Vec::new(),
     };
+    let scale = match change {
+        ResourceChange::Scale { .. } => Some(current_scale_paths(gate, kind).await?),
+        _ => None,
+    };
     Ok(Reviewed {
         managed: gitops::managed_by_live_object(live),
         pods,
         spec: ReviewedSpec::of(live),
         hold_spec: false,
+        scale,
+        restarted_at: (*change == ResourceChange::RolloutRestart).then(|| restarted_at(live)),
     })
 }
 
@@ -261,8 +306,18 @@ async fn recheck(
         || gitops::managed_by_live_object(&live) != reviewed.managed
         || (paused && *change == ResourceChange::RolloutRestart)
         || (reviewed.hold_spec && ReviewedSpec::of(&live) != reviewed.spec)
+        || reviewed
+            .restarted_at
+            .as_ref()
+            .is_some_and(|at| *at != restarted_at(&live))
     {
         return Err(WriteError::Conflict);
+    }
+    if let ResourceChange::Scale { .. } = change {
+        // Kubernetes scales at the path its definition names when the write arrives.
+        if Some(current_scale_paths(gate, kind).await?) != reviewed.scale {
+            return Err(WriteError::Conflict);
+        }
     }
     reviewed.hold_spec.then(|| Held::of(&live)).transpose()
 }
@@ -1721,12 +1776,138 @@ mod tests {
         })
     }
 
+    // covers UP-53: a restart reviewed before another restart ran is a conflict, and sends no
+    // patch; a status update does not change the mark.
+    #[tokio::test]
+    async fn a_restart_after_another_restart_is_a_conflict() {
+        let mut live = held_live();
+        live["spec"]["template"]["metadata"]["annotations"][RESTARTED_AT] = json!("t1");
+        let reviewed = Reviewed {
+            restarted_at: Some(restarted_at(&live)),
+            ..Default::default()
+        };
+        let run_on = |live: Value| {
+            let reviewed = reviewed.clone();
+            async move {
+                let reply: Reply = Arc::new(move |seen| {
+                    if seen.method == "GET" {
+                        (200, live.clone())
+                    } else {
+                        ok(seen)
+                    }
+                });
+                let (client, log) = fake(reply);
+                let kind = kind_info(resource("apps", "v1", "Deployment", "deployments"));
+                let target = held_target();
+                let change = ResourceChange::RolloutRestart;
+                let result = run(
+                    &mut writes(client, open()),
+                    &kind,
+                    &target,
+                    &change,
+                    &reviewed,
+                )
+                .await
+                .map(drop);
+                let patches = log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| s.method == "PATCH")
+                    .count();
+                (result, patches)
+            }
+        };
+        let mut status = live.clone();
+        status["status"] = json!({"observedGeneration": 3});
+        assert_eq!(run_on(status).await, (Ok(()), 1));
+        let mut restarted = live.clone();
+        restarted["spec"]["template"]["metadata"]["annotations"][RESTARTED_AT] = json!("t2");
+        assert_eq!(run_on(restarted).await, (Err(WriteError::Conflict), 0));
+    }
+
+    // covers UP-53: a custom resource's scale reads its definition again before the patch: other
+    // replica paths are a conflict, and a definition that cannot be read refuses it.
+    #[tokio::test]
+    async fn a_custom_scale_is_bound_to_the_reviewed_replica_paths() {
+        use crate::action_kinds::ScaleSubresource;
+        let reviewed_paths = ScalePaths::from_crd(".spec.size", ".status.size").unwrap();
+        let kind = KindInfo {
+            scale: ScaleSubresource::Paths(reviewed_paths.clone()),
+            ..kind_info(resource("example.dev", "v1", "Widget", "widgets"))
+        };
+        let reviewed = Reviewed {
+            scale: Some(reviewed_paths),
+            ..Default::default()
+        };
+        let crd = |path: &str| {
+            json!({"apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+                   "metadata": {"name": "widgets.example.dev"},
+                   "spec": {"group": "example.dev", "names": {"plural": "widgets"},
+                            "versions": [{"name": "v1", "served": true, "subresources": {"scale":
+                                {"specReplicasPath": path, "statusReplicasPath": ".status.size"}}}]}})
+        };
+        let run_with = |definition: Option<Value>| {
+            let (kind, reviewed) = (kind.clone(), reviewed.clone());
+            async move {
+                let reply: Reply = Arc::new(move |seen| {
+                    if seen.method != "GET" {
+                        return ok(seen);
+                    }
+                    if seen.path.contains("customresourcedefinitions") {
+                        return match &definition {
+                            Some(crd) => (200, crd.clone()),
+                            None => (403, status(403, "Forbidden")),
+                        };
+                    }
+                    (
+                        200,
+                        json!({"apiVersion": "example.dev/v1", "kind": "Widget",
+                               "metadata": {"name": "web", "namespace": "demo", "uid": "uid-web"},
+                               "spec": {"size": 2, "other": 2}}),
+                    )
+                });
+                let (client, log) = fake(reply);
+                let change = ResourceChange::Scale { from: 2, to: 3 };
+                let result = run(
+                    &mut writes(client, open()),
+                    &kind,
+                    &held_target(),
+                    &change,
+                    &reviewed,
+                )
+                .await
+                .map(drop);
+                let patches: Vec<String> = log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| s.method == "PATCH")
+                    .map(|s| s.path.clone())
+                    .collect();
+                (result, patches)
+            }
+        };
+        let (result, patches) = run_with(Some(crd(".spec.size"))).await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            patches,
+            ["/apis/example.dev/v1/namespaces/demo/widgets/web/scale"]
+        );
+        let (result, patches) = run_with(Some(crd(".spec.other"))).await;
+        assert_eq!((result, patches.len()), (Err(WriteError::Conflict), 0));
+        let (result, patches) = run_with(None).await;
+        assert!(matches!(result, Err(WriteError::Failed(_))), "{result:?}");
+        assert!(patches.is_empty());
+    }
+
     /// The PATCH a dry run of `change` sends, with the object at [`held_live`].
     async fn dry_run_patch(change: ResourceChange) -> Seen {
         let live = held_live();
         let reviewed = Reviewed {
             spec: ReviewedSpec::of(&live),
             hold_spec: true,
+            scale: matches!(change, ResourceChange::Scale { .. }).then(ScalePaths::built_in),
             ..Default::default()
         };
         let reply: Reply = Arc::new(move |seen| {

@@ -694,6 +694,14 @@ impl DetailView {
         }
     }
 
+    /// Fetches the object once more after the fetch running now, if one is: what that one
+    /// returns may predate something that happened while it ran.
+    pub(in crate::ui) fn fetch_again_after_running(&mut self) {
+        if self.fetching {
+            self.refetch = true;
+        }
+    }
+
     /// The fetched object, if its fetch began after `at`: a copy at least that recent.
     pub(in crate::ui) fn fetched_since(&self, at: jiff::Timestamp) -> Option<&Value> {
         match &self.fetch {

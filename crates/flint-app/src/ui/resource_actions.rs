@@ -528,6 +528,10 @@ fn confirm_review(
     let handle = window.window_handle();
     let key = WriteKey::of(&request.target);
     let object = ReviewedObject::of(ws, &review, cx).guard(this.clone());
+    // A fetch running now began before the review and cannot speak for it: fetch once more.
+    if let Some(detail) = ws.detail_view() {
+        detail.update(cx, |detail, _| detail.fetch_again_after_running());
+    }
     let begin = {
         let (key, this, action, object) =
             (key.clone(), this.clone(), request.action, object.clone());
@@ -595,6 +599,9 @@ struct ReviewedObject {
     /// For a scale: the count reviewed, and where it is read (none: the kind lost Scale).
     count: Option<(u32, Option<action_kinds::ScalePaths>)>,
     at: jiff::Timestamp,
+    /// For a restart: the pod template's `restartedAt` as reviewed. Another one shows a restart
+    /// ran since, which this one would repeat.
+    restarted_at: Option<Option<String>>,
     /// Whether the pane showed this very object when the review came back. One that did not (a
     /// review of an object created again under the name) cannot say it changed: the server's
     /// checks of the uid and the count still hold.
@@ -604,15 +611,19 @@ struct ReviewedObject {
 impl ReviewedObject {
     fn of(ws: &Workspace, review: &WriteReview, cx: &App) -> Self {
         let target = review.target();
-        let count = match review.action() {
-            WriteAction::Resource(action) => match action.change() {
-                ResourceChange::Scale { from, .. } => Some((
-                    *from,
-                    ws.kind_scale_paths(&target.cluster, &target.kind, cx),
-                )),
-                _ => None,
-            },
-            _ => None,
+        let (count, restarted_at) = match review.action() {
+            WriteAction::Resource(action) => {
+                let count = match action.change() {
+                    ResourceChange::Scale { from, .. } => Some((
+                        *from,
+                        ws.kind_scale_paths(&target.cluster, &target.kind, cx),
+                    )),
+                    _ => None,
+                };
+                let restarted = action.restarted_at().map(|at| at.map(str::to_owned));
+                (count, restarted)
+            }
+            _ => (None, None),
         };
         let key = WriteKey::of(target);
         let watched = ws.detail_view().is_some_and(|detail| {
@@ -628,6 +639,7 @@ impl ReviewedObject {
             uid: target.uid.clone(),
             count,
             at: jiff::Timestamp::now(),
+            restarted_at,
             watched,
         }
     }
@@ -651,6 +663,17 @@ impl ReviewedObject {
             .pointer("/metadata/uid")
             .and_then(serde_json::Value::as_str);
         if self.uid.is_some() && uid != self.uid.as_deref() {
+            return changed();
+        }
+        let restarted = object
+            .pointer("/spec/template/metadata/annotations")
+            .and_then(|a| a.get("kubectl.kubernetes.io/restartedAt"))
+            .and_then(serde_json::Value::as_str);
+        if self
+            .restarted_at
+            .as_ref()
+            .is_some_and(|at| at.as_deref() != restarted)
+        {
             return changed();
         }
         match &self.count {

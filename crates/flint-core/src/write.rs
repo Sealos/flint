@@ -134,6 +134,12 @@ impl ReviewedAction {
     pub fn change(&self) -> &ResourceChange {
         &self.change
     }
+
+    /// For a restart: the pod template's `restartedAt` as reviewed (`Some(None)`: none). A copy
+    /// with another one shows a restart ran since the review.
+    pub fn restarted_at(&self) -> Option<Option<&str>> {
+        self.reviewed.restarted_at.as_ref().map(Option::as_deref)
+    }
 }
 
 /// What a reviewed resource action does.
@@ -624,7 +630,7 @@ async fn prepare(
         }
         proposal => {
             let change = write_actions::review(kind, live, proposal)?;
-            let reviewed = write_actions::reviewed(gate, &target.name, live, &change).await?;
+            let reviewed = write_actions::reviewed(gate, kind, &target.name, live, &change).await?;
             Ok(WriteAction::Resource(ReviewedAction {
                 bound: target.clone(),
                 pin: gate.reviewed_pin()?,

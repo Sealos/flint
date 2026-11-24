@@ -77,19 +77,26 @@ fn count_at(object: &Value, pointer: &str) -> Option<u32> {
         .and_then(|n| u32::try_from(n).ok())
 }
 
-/// `.spec.a.b` as `/spec/a/b`, if it is a plain field path whose first field is `root`.
+/// `.spec.a.b` as `/spec/a/b`, if it is a plain field path whose first field is `root`. A field
+/// name is taken literally, with `~` and `/` escaped for the pointer; array indexes, quoting,
+/// wildcards and filters are not plain.
 fn pointer(path: &str, root: &str) -> Option<String> {
     let fields: Vec<&str> = path.strip_prefix('.')?.split('.').collect();
     let plain = |field: &&str| {
         !field.is_empty()
-            && field
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            && !field
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || "[]'\"*@$()?,:\\{}".contains(c))
     };
     if fields.len() < 2 || fields[0] != root || !fields.iter().all(plain) {
         return None;
     }
-    Some(fields.iter().map(|f| format!("/{f}")).collect())
+    Some(
+        fields
+            .iter()
+            .map(|f| format!("/{}", f.replace('~', "~0").replace('/', "~1")))
+            .collect(),
+    )
 }
 
 /// What discovery and its definition say of a kind's `scale` subresource.
@@ -133,43 +140,45 @@ pub(crate) async fn read_scale_paths(client: &Client, kinds: &mut [KindInfo], li
     if wanted.is_empty() {
         return;
     }
-    let api: Api<DynamicObject> = Api::all_with(client.clone(), &definitions());
-    let found: Vec<(usize, Option<ScalePaths>)> = futures::stream::iter(wanted)
-        .map(|index| {
-            let kind = &kinds[index];
-            let name = format!("{}.{}", kind.plural(), kind.group());
-            let (group, version, plural) = (
-                kind.group().to_owned(),
-                kind.resource.version.clone(),
-                kind.plural().to_owned(),
-            );
-            let api = api.clone();
-            async move {
-                let read = tokio::time::timeout(limit, api.get(&name)).await;
-                let paths = match read {
-                    Ok(Ok(crd)) => {
-                        let crd = serde_json::to_value(&crd).unwrap_or_default();
-                        crd_scale_paths(&crd, &group, &version, &plural)
-                    }
-                    _ => None,
-                };
-                if paths.is_none() {
-                    tracing::debug!(
-                        kind = name,
-                        "the scale paths of a custom resource could not be read; no Scale"
-                    );
-                }
-                (index, paths)
+    let reads: Vec<(usize, ApiResource)> = wanted
+        .into_iter()
+        .map(|index| (index, kinds[index].resource.clone()))
+        .collect();
+    let mut found = futures::stream::iter(reads)
+        .map(|(index, resource)| async move {
+            let paths = definition_scale_paths(client, &resource, limit).await;
+            if paths.is_none() {
+                tracing::debug!(
+                    kind = format!("{}.{}", resource.plural, resource.group),
+                    "the scale paths of a custom resource could not be read; no Scale"
+                );
             }
+            (index, paths)
         })
-        .buffer_unordered(DEFINITIONS_AT_ONCE)
-        .collect()
-        .await;
-    for (index, paths) in found {
+        .buffer_unordered(DEFINITIONS_AT_ONCE);
+    // Kept as each answers: a caller's deadline keeps what came before it.
+    while let Some((index, paths)) = found.next().await {
         if let Some(paths) = paths {
             kinds[index].scale = ScaleSubresource::Paths(paths);
         }
     }
+}
+
+/// The replica paths the CustomResourceDefinition of `resource` declares now for its version,
+/// read within `limit`; `None` if it cannot be read or declares none Flint can read.
+pub(crate) async fn definition_scale_paths(
+    client: &Client,
+    resource: &ApiResource,
+    limit: Duration,
+) -> Option<ScalePaths> {
+    let api: Api<DynamicObject> = Api::all_with(client.clone(), &definitions());
+    let name = format!("{}.{}", resource.plural, resource.group);
+    let crd = tokio::time::timeout(limit, api.get(&name))
+        .await
+        .ok()?
+        .ok()?;
+    let crd = serde_json::to_value(&crd).ok()?;
+    crd_scale_paths(&crd, &resource.group, &resource.version, &resource.plural)
 }
 
 fn definitions() -> ApiResource {
@@ -235,6 +244,12 @@ mod tests {
             None
         );
         assert_eq!(paths.replicas(&json!({"spec": {}})), None);
+        // A literal `/` or `~` in a field name is that field, not a deeper path.
+        let odd = ScalePaths::from_crd(".spec.west/east.a~b", ".status.n").unwrap();
+        assert_eq!(
+            odd.replicas(&json!({"spec": {"west/east": {"a~b": 5}, "west": {"east": 1}}})),
+            Some(5)
+        );
         for (spec, status) in [
             ("spec.size", ".status.n"),
             (".spec", ".status.n"),
@@ -243,8 +258,9 @@ mod tests {
             (".spec.sizes[0]", ".status.n"),
             (".spec['size']", ".status.n"),
             (".metadata.size", ".status.n"),
-            (".spec.a/b", ".status.n"),
-            (".spec.a~b", ".status.n"),
+            (".spec.*", ".status.n"),
+            (".spec.a b", ".status.n"),
+            (".spec.a:b", ".status.n"),
             (".spec.size", ".spec.n"),
             (".spec.size", ""),
         ] {

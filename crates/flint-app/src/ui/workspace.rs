@@ -1134,6 +1134,26 @@ impl Workspace {
         }
     }
 
+    /// Closes a confirmation whose object a copy fetched by `detail` shows changed. Every detail
+    /// pane of the window has it, a cluster set's included.
+    pub(in crate::ui) fn close_confirmations_on_change(
+        detail: &Entity<DetailView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.observe_in(detail, window, |_, _, window, cx| {
+            if !gpui_kit::component::WindowExt::has_active_dialog(window, cx) {
+                return;
+            }
+            let this = cx.weak_entity();
+            window.defer(cx, move |window, cx| {
+                if let Some(why) = confirm::close_changed(window, cx) {
+                    let _ = this.update(cx, |ws, cx| ws.confirmation_closed(why, window, cx));
+                }
+            });
+        })
+    }
+
     /// Brings the navigation and main area in line with the model: the active cluster and its
     /// discovery.
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1629,20 +1649,7 @@ impl Workspace {
                 });
                 self._detail_subscriptions =
                     vec![
-                        // A fetched copy can show that a confirmation's object changed.
-                        cx.observe_in(&detail, window, |_, _, window, cx| {
-                            if !gpui_kit::component::WindowExt::has_active_dialog(window, cx) {
-                                return;
-                            }
-                            let this = cx.weak_entity();
-                            window.defer(cx, move |window, cx| {
-                                if let Some(why) = confirm::close_changed(window, cx) {
-                                    let _ = this.update(cx, |ws, cx| {
-                                        ws.confirmation_closed(why, window, cx)
-                                    });
-                                }
-                            });
-                        }),
+                        Self::close_confirmations_on_change(&detail, window, cx),
                         cx.subscribe_in(&detail, window, move |this, _, event, window, cx| {
                             match event {
                                 DetailEvent::Close => this.close_detail(window, cx),

@@ -1399,25 +1399,29 @@ impl Workspace {
             view.set_connection_guards(guards);
             view
         });
-        self._detail_subscriptions = vec![cx.subscribe_in(
-            &detail,
-            window,
-            move |this, _, event, window, cx| match event {
-                DetailEvent::Close => this.close_detail(window, cx),
-                DetailEvent::OpenLogs(request, focus) => {
-                    let focus = takes_focus(focus, window, cx);
-                    this.open_logs(request.clone(), focus, window, cx)
-                }
-                DetailEvent::OpenShell(request, focus) => {
-                    let focus = takes_focus(focus, window, cx);
-                    this.open_shell(request.clone(), focus, window, cx)
-                }
-                DetailEvent::Refused(why) => this.refuse(why.clone(), cx),
-                DetailEvent::ConfirmWrite(review, reviewed_on) => {
-                    this.confirm_detail_write(review, reviewed_on.clone(), window, cx)
-                }
-            },
-        )];
+        let on_change = Self::close_confirmations_on_change(&detail, window, cx);
+        self._detail_subscriptions = vec![
+            on_change,
+            cx.subscribe_in(
+                &detail,
+                window,
+                move |this, _, event, window, cx| match event {
+                    DetailEvent::Close => this.close_detail(window, cx),
+                    DetailEvent::OpenLogs(request, focus) => {
+                        let focus = takes_focus(focus, window, cx);
+                        this.open_logs(request.clone(), focus, window, cx)
+                    }
+                    DetailEvent::OpenShell(request, focus) => {
+                        let focus = takes_focus(focus, window, cx);
+                        this.open_shell(request.clone(), focus, window, cx)
+                    }
+                    DetailEvent::Refused(why) => this.refuse(why.clone(), cx),
+                    DetailEvent::ConfirmWrite(review, reviewed_on) => {
+                        this.confirm_detail_write(review, reviewed_on.clone(), window, cx)
+                    }
+                },
+            ),
+        ];
         self.detail = Some(detail);
         self.list_in_front = false;
         release_unfocused_input(window, cx);
