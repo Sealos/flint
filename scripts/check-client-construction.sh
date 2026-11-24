@@ -2,13 +2,12 @@
 # Every Kubernetes client is assembled in `cluster::build_client`, which puts the read-only rule on
 # it. crates/flint-core/clippy.toml (linked from flint-mcp) enforces that for what clippy can name.
 # `Client::try_from` is one type's trait method, so this counts its uses instead. The counts below
-# are exact: the proxy refusal in `cluster.rs`, and tests against a local listener. A new use, or
-# a conversion that does not name its target type, fails here.
+# are exact: tests against a local listener. A new use, or a conversion that does not name its
+# target type, fails here.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-expected='crates/flint-core/src/cluster.rs 1
-crates/flint-core/src/logs/pods.rs 1
+expected='crates/flint-core/src/logs/pods.rs 1
 crates/flint-core/src/protection.rs 1
 crates/flint-core/src/read.rs 2'
 

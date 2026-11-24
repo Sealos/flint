@@ -4,13 +4,36 @@ use std::fmt::Debug;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use flint_e2e::app::{App, WAIT};
 use flint_e2e::fake_api::{FakeApiServer, Options, write_kubeconfigs};
 use flint_e2e::scratch::Scratch;
 use serde_json::Value;
 
 pub use flint_e2e::app::Test::{self, Any, Contains, Equals, Exists};
+
+/// The exit code of child `pid` if it has ended. Leaves it unreaped, for `App::quit` to collect
+/// and check.
+pub fn exit_code(pid: u32) -> Result<Option<i32>> {
+    let id = libc::id_t::from(pid);
+    // SAFETY: an all-zero siginfo_t is valid, and waitid only writes to it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` outlives the call; WNOWAIT leaves the child for the harness to reap.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            id,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("waitid on the app");
+    }
+    // SAFETY: waitid filled it in; with WNOHANG and no exit, si_pid stays 0.
+    let (ended, status) = unsafe { (info.si_pid(), info.si_status()) };
+    Ok((ended != 0).then_some(status))
+}
 
 /// Selects `cluster` and waits until it is connected and its kinds are discovered.
 pub fn connect(app: &App, cluster: &str) -> Result<Value> {

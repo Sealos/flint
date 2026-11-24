@@ -23,6 +23,8 @@ struct ConnectionIdentity {
     generation: u64,
     definition: u64,
     endpoint: u64,
+    /// Moves on a disconnect: a dialog opened before it is never answered after it.
+    write_epoch: u64,
     server: Option<String>,
 }
 
@@ -34,6 +36,7 @@ impl ConnectionIdentity {
             generation: summary.generation,
             definition: summary.definition,
             endpoint: summary.endpoint,
+            write_epoch: summary.write_epoch,
             server: summary.info.server.clone(),
         })
     }
@@ -115,6 +118,7 @@ mod tests {
             generation,
             definition,
             endpoint: 1,
+            write_epoch: 0,
             confirmed: true,
             provisional: false,
             paused: false,
@@ -138,6 +142,15 @@ mod tests {
         ] {
             assert_ne!(opened, identity(&[changed]));
         }
+    }
+
+    // Disconnected since, even if connected again on the same definition.
+    #[test]
+    fn a_disconnect_is_another_identity() {
+        let opened = identity(&[summary(1, 1, "https://a.invalid")]);
+        let mut reconnected = summary(1, 1, "https://a.invalid");
+        reconnected.write_epoch += 1;
+        assert_ne!(opened, identity(&[reconnected]));
     }
 
     // A context that left, is paused, or may be redefined by an unreadable file has none.

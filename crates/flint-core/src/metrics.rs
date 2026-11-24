@@ -25,6 +25,7 @@ use tokio::sync::watch;
 use tokio::task::AbortHandle;
 
 use crate::api_error::{ApiError, ApiErrorKind};
+use crate::api_path;
 use crate::cluster::{ClusterError, SafeErrorText};
 
 /// How long a [`MetricsPoll`] from [`poll_pod_metrics`] or [`poll_node_metrics`] waits between
@@ -228,6 +229,72 @@ impl PodMetrics {
         expected.sort_unstable();
         (!sampled.is_empty() && sampled == expected).then(|| PodBudget::of_pod(spec))
     }
+
+    /// This sample reduced to what is kept per pod between polls.
+    pub fn sample(&self) -> PodSample {
+        PodSample {
+            usage: self.total(),
+            containers: container_digest(self.containers.iter().map(|c| c.name.as_str())),
+            window_start: self.window_start(),
+        }
+    }
+
+    /// When the sample's window opened, in Unix seconds, if the server gave a usable window.
+    fn window_start(&self) -> Option<i64> {
+        let window = self.window.filter(|window| window.is_positive())?;
+        Some(self.timestamp?.checked_sub(window).ok()?.as_second())
+    }
+}
+
+/// A pod's total use, a digest of the containers it covers and when its window opened: a fixed
+/// size, whatever the pod's containers are called.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PodSample {
+    pub usage: Usage,
+    containers: u64,
+    window_start: Option<i64>,
+}
+
+impl PodSample {
+    /// Whether this sample can belong to a pod created at `created` (Unix seconds). The metrics
+    /// API sends no uid, so a pod recreated under the same name is told apart by its window,
+    /// which cannot open before the pod exists. Without both times nothing is proved.
+    pub fn follows_creation(&self, created: Option<i64>) -> bool {
+        matches!((self.window_start, created), (Some(start), Some(created)) if start >= created)
+    }
+}
+
+/// A pod spec's budget and the containers it applies to, kept in place of the spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PodBudgetCheck {
+    budget: PodBudget,
+    containers: u64,
+}
+
+impl PodBudgetCheck {
+    pub fn of(spec: &PodSpec) -> Self {
+        Self {
+            budget: PodBudget::of_pod(spec),
+            containers: container_digest(long_running(spec).map(|c| c.name.as_str())),
+        }
+    }
+
+    /// The budget to compare `sample` with, under the rule of [`PodMetrics::budget_in`].
+    pub fn for_sample(&self, sample: &PodSample) -> Option<PodBudget> {
+        (self.containers == sample.containers).then_some(self.budget)
+    }
+}
+
+/// FNV-1a over the sorted names, each ended by a byte no container name holds.
+fn container_digest<'a>(names: impl Iterator<Item = &'a str>) -> u64 {
+    let mut names: Vec<&str> = names.collect();
+    names.sort_unstable();
+    names
+        .iter()
+        .flat_map(|name| name.bytes().chain([0xff]))
+        .fold(0xcbf2_9ce4_8422_2325, |hash: u64, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
 }
 
 /// A node's `metrics.k8s.io` NodeMetrics.
@@ -375,12 +442,10 @@ async fn fetch_pod_metrics_within(
 }
 
 async fn read_pod_metrics(client: &Client, namespace: Option<&str>) -> MetricsResult<PodMetrics> {
+    api_path::validate_names(namespace, None).map_err(|error| failed(&error.to_string()))?;
     let path = match namespace {
         None => format!("{API_PATH}/pods"),
-        Some(namespace) if is_dns_label(namespace) => {
-            format!("{API_PATH}/namespaces/{namespace}/pods")
-        }
-        Some(_) => return Err(failed("not a valid namespace name")),
+        Some(namespace) => format!("{API_PATH}/namespaces/{namespace}/pods"),
     };
     match list(client, path).await {
         Ok(items) => Ok(collect(items, WirePod::parse)),
@@ -481,16 +546,6 @@ async fn namespaced_not_found(client: &Client, err: &ListError) -> MetricsError 
 
 fn failed(text: &str) -> MetricsError {
     MetricsError::Failed(SafeErrorText::reduced(text))
-}
-
-/// Whether `name` is a valid namespace name, so it cannot change the request's path.
-fn is_dns_label(name: &str) -> bool {
-    (1..=63).contains(&name.len())
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        && !name.starts_with('-')
-        && !name.ends_with('-')
 }
 
 // ---------------------------------------------------------------------------------------------

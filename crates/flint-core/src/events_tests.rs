@@ -170,6 +170,7 @@ fn snapshot(contexts: &[String]) -> Event {
             generation: 1,
             definition: 1,
             endpoint: 1,
+            write_epoch: 0,
             confirmed: true,
             provisional: false,
             paused: false,

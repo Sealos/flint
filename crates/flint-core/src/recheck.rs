@@ -14,8 +14,10 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use futures::FutureExt;
 use futures::future::BoxFuture;
+use futures::stream::BoxStream;
+use futures::{FutureExt, StreamExt};
+use tokio::sync::watch;
 use tokio::time::{Instant, Sleep};
 
 use crate::cluster::context_fingerprint;
@@ -32,6 +34,8 @@ pub(crate) struct Recheck<T> {
     every: Duration,
     next: Pin<Box<Sleep>>,
     checking: Option<BoxFuture<'static, T>>,
+    /// Makes a check due at once when it yields. The timer stays as the backstop.
+    woken: Option<BoxStream<'static, ()>>,
 }
 
 impl<T> Recheck<T> {
@@ -41,6 +45,33 @@ impl<T> Recheck<T> {
             every,
             next: Box::pin(tokio::time::sleep(every)),
             checking: None,
+            woken: None,
+        }
+    }
+
+    /// Also checks as soon as `changes` moves.
+    pub fn waking_on(mut self, changes: watch::Receiver<u64>) -> Self {
+        let stream = futures::stream::unfold(changes, |mut changes| async move {
+            changes.changed().await.ok()?;
+            Some(((), changes))
+        });
+        self.woken = Some(stream.boxed());
+        self
+    }
+
+    /// Whether a change arrived since the last poll. Registers `cx` for the next one.
+    fn poll_woken(&mut self, cx: &mut Context<'_>) -> bool {
+        let Some(woken) = &mut self.woken else {
+            return false;
+        };
+        match woken.poll_next_unpin(cx) {
+            Poll::Ready(Some(())) => true,
+            // The manager is gone: only the timer is left.
+            Poll::Ready(None) => {
+                self.woken = None;
+                false
+            }
+            Poll::Pending => false,
         }
     }
 
@@ -52,7 +83,9 @@ impl<T> Recheck<T> {
         start: impl FnOnce() -> BoxFuture<'static, T>,
     ) -> Poll<T> {
         if self.checking.is_none() {
-            std::task::ready!(self.next.as_mut().poll(cx));
+            if !self.poll_woken(cx) {
+                std::task::ready!(self.next.as_mut().poll(cx));
+            }
             self.next.as_mut().reset(Instant::now() + self.every);
             self.checking = Some(start());
         }
@@ -85,12 +118,19 @@ pub(crate) struct ContextPin {
     /// [`Record::definition`] when pinned. A write compares it with the one it was reviewed on.
     definition: Option<u64>,
     server: Option<String>,
+    /// The proxy the client goes through, as [`ContextInfo::proxy_url`] shows it.
+    proxy: Option<String>,
 }
 
 impl ContextPin {
     /// The API server the session's client was built for.
     pub fn server(&self) -> Option<&str> {
         self.server.as_deref()
+    }
+
+    /// The proxy the session's client goes through.
+    pub fn proxy(&self) -> Option<&str> {
+        self.proxy.as_deref()
     }
 
     /// The hash of the whole definition when pinned ([`crate::cluster::context_fingerprint`]).
@@ -106,6 +146,7 @@ impl ContextPin {
             gate: 0,
             definition: None,
             server: None,
+            proxy: None,
         }
     }
 
@@ -123,6 +164,7 @@ impl ContextPin {
             && self.endpoint == other.endpoint
             && self.gate == other.gate
             && self.server == other.server
+            && self.proxy == other.proxy
     }
 }
 
@@ -130,6 +172,9 @@ impl ContextPin {
 #[derive(Debug, Clone)]
 struct Record {
     server: Option<String>,
+    /// The proxy it is reached through. Another one is another route to the server, so it moves
+    /// the generations as another server does.
+    proxy: Option<String>,
     /// The file that defined it.
     source: PathBuf,
     present: bool,
@@ -167,6 +212,8 @@ pub(crate) struct Shown {
     /// [`Self::definition`] for the endpoint: an edit that only adds or drops a trailing slash
     /// keeps it, as it keeps a log session running.
     pub endpoint: u64,
+    /// [`Record::gate`]: what a write is held to.
+    pub gate: u64,
     /// A load confirmed the server shown. Otherwise it may be a fallback, showing only while a
     /// kubeconfig file before it can't be read.
     pub confirmed: bool,
@@ -265,6 +312,7 @@ impl ContextHistory {
         let mut seen = HashSet::new();
         for info in &loaded.contexts {
             let (name, server) = (info.name.as_str(), info.server.as_deref());
+            let proxy = info.proxy_url.as_deref();
             if !seen.insert(name) {
                 continue;
             }
@@ -292,7 +340,9 @@ impl ContextHistory {
                 // A confirmed definition stays until a load confirms a change: a fallback never
                 // replaces it, nor its file.
                 Some(r) if r.present && r.confirmed && provisional => {
-                    if cluster_masked && r.server.as_deref() != server {
+                    if cluster_masked
+                        && (r.server.as_deref() != server || r.proxy.as_deref() != proxy)
+                    {
                         self.last += 1;
                         r.gate = self.last;
                     }
@@ -303,19 +353,27 @@ impl ContextHistory {
                 }
                 // Same server: the file it now comes from is the one whose rank masks its
                 // removal, confirmed or not (an unconfirmed record follows its fallback).
-                Some(r) if r.present && r.server.as_deref() == server => {
+                Some(r)
+                    if r.present
+                        && r.server.as_deref() == server
+                        && r.proxy.as_deref() == proxy =>
+                {
                     r.source = info.source.clone();
                     r.confirmed |= !provisional;
                 }
                 Some(r) => {
                     self.last += 1;
-                    let endpoint = if r.present && same_endpoint(r.server.as_deref(), server) {
+                    let endpoint = if r.present
+                        && r.proxy.as_deref() == proxy
+                        && same_endpoint(r.server.as_deref(), server)
+                    {
                         r.endpoint
                     } else {
                         self.last
                     };
                     *r = Record {
                         server: server.map(str::to_owned),
+                        proxy: proxy.map(str::to_owned),
                         source: info.source.clone(),
                         present: true,
                         confirmed: !provisional,
@@ -332,6 +390,7 @@ impl ContextHistory {
                         name.to_owned(),
                         Record {
                             server: server.map(str::to_owned),
+                            proxy: proxy.map(str::to_owned),
                             source: info.source.clone(),
                             present: true,
                             confirmed: !provisional,
@@ -390,14 +449,31 @@ impl ContextHistory {
         }
     }
 
-    /// The pin for a session on `context` whose client was built for `server`: stale unless
-    /// that is the context's confirmed server.
+    /// The pin for a session on `context` whose client was built for `server`, through the
+    /// recorded proxy: stale unless that is the context's confirmed server.
     pub fn pin(&self, context: &str, server: Option<&str>) -> ContextPin {
+        let proxy = self
+            .records
+            .get(context)
+            .filter(|r| r.present)
+            .and_then(|r| r.proxy.as_deref());
+        self.pin_through(context, server, proxy)
+    }
+
+    /// The pin for a session whose client was built for `server` through `proxy`: stale unless
+    /// that is the context's confirmed route.
+    pub fn pin_through(
+        &self,
+        context: &str,
+        server: Option<&str>,
+        proxy: Option<&str>,
+    ) -> ContextPin {
         let record = self.records.get(context).filter(|r| r.present);
-        let generation = record
+        let on_route = record.filter(|r| r.proxy.as_deref() == proxy);
+        let generation = on_route
             .filter(|r| r.server.as_deref() == server)
             .map_or(0, |r| r.generation);
-        let endpoint = record
+        let endpoint = on_route
             .filter(|r| same_endpoint(r.server.as_deref(), server))
             .map_or(0, |r| r.endpoint);
         ContextPin {
@@ -406,6 +482,7 @@ impl ContextHistory {
             gate: record.map_or(0, |r| r.gate),
             definition: record.and_then(|r| r.definition),
             server: server.map(str::to_owned),
+            proxy: proxy.map(str::to_owned),
         }
     }
 
@@ -428,6 +505,15 @@ impl ContextHistory {
                 seen.revision += 1;
             }
             seen.definition = now;
+        }
+    }
+
+    /// Ends every write reviewed or confirmed on `context` so far: the write gate refuses a pin
+    /// from before this, as after a fallback ([`Self::gate_moved`]). Sessions keep running.
+    pub fn end_writes(&mut self, context: &str) {
+        if let Some(r) = self.records.get_mut(context) {
+            self.last += 1;
+            r.gate = self.last;
         }
     }
 
@@ -489,7 +575,7 @@ impl ContextHistory {
     pub fn on_pinned_server(&self, context: &str, pin: &ContextPin) -> bool {
         self.records
             .get(context)
-            .is_some_and(|r| r.present && r.server == pin.server)
+            .is_some_and(|r| r.present && r.server == pin.server && r.proxy == pin.proxy)
     }
 
     /// Whether one of the files that failed in this load defined `context` when it last loaded.
@@ -512,11 +598,13 @@ impl ContextHistory {
             Some(r) => Shown {
                 definition: r.generation,
                 endpoint: r.endpoint,
+                gate: r.gate,
                 confirmed: r.confirmed && r.server.as_deref() == server,
             },
             None => Shown {
                 definition: 0,
                 endpoint: 0,
+                gate: 0,
                 confirmed: false,
             },
         }
@@ -538,9 +626,12 @@ impl ContextHistory {
             Pinned::Shell => (|r| r.generation, pin.generation),
             Pinned::Logs => (|r| r.endpoint, pin.endpoint),
         };
-        let moved = |r: &Record| match session {
-            Pinned::Shell => r.server != pin.server,
-            Pinned::Logs => !same_endpoint(r.server.as_deref(), pin.server.as_deref()),
+        let moved = |r: &Record| {
+            r.proxy != pin.proxy
+                || match session {
+                    Pinned::Shell => r.server != pin.server,
+                    Pinned::Logs => !same_endpoint(r.server.as_deref(), pin.server.as_deref()),
+                }
         };
         let change = match self.records.get(context) {
             Some(r) if r.present && current(r) == pinned => return None,
@@ -1221,6 +1312,59 @@ mod tests {
 
     const STAGING: Option<&str> = Some("https://staging");
     const PROD: Option<&str> = Some("https://prod");
+
+    /// [`load`] of `dev` at [`STAGING`] through `proxy`.
+    fn through(proxy: Option<&str>) -> LoadedKubeconfig {
+        let mut loaded = load(&[("dev", STAGING, "a")], &[]);
+        loaded.contexts[0].proxy_url = proxy.map(str::to_owned);
+        loaded
+    }
+
+    #[test]
+    fn another_proxy_at_the_same_server_ends_pinned_sessions() {
+        let (one, two) = (Some("http://one:3128"), Some("http://two:3128"));
+        for (from, to) in [(one, two), (one, None), (None, one)] {
+            let mut h = ContextHistory::default();
+            h.record(&through(from));
+            let pin = h.pin("dev", STAGING);
+            assert_eq!(h.check(Pinned::Shell, "dev", &pin), None);
+            h.record(&through(to));
+            assert!(h.check(Pinned::Shell, "dev", &pin).is_some());
+            assert!(h.check(Pinned::Logs, "dev", &pin).is_some());
+            assert!(!h.on_pinned_server("dev", &pin));
+            // Put back, the pin stays stale: the route changed while it was held.
+            h.record(&through(from));
+            assert!(h.check(Pinned::Shell, "dev", &pin).is_some());
+            assert!(h.check(Pinned::Logs, "dev", &pin).is_some());
+        }
+    }
+
+    #[test]
+    fn a_fallback_through_another_proxy_moves_the_launch_gate() {
+        let (one, two) = (Some("http://one:3128"), Some("http://two:3128"));
+        let shared = |proxy: Option<&str>, failed: &[&str]| {
+            let mut loaded = on_cluster(load(&[("dev", STAGING, "b")], failed), "b");
+            loaded.contexts[0].proxy_url = proxy.map(str::to_owned);
+            loaded
+        };
+        let mut h = ContextHistory::default();
+        h.record(&shared(one, &[]));
+        let pin = h.pin("dev", STAGING);
+        h.record(&shared(two, &["a"]));
+        assert!(h.gate_moved("dev", &pin));
+    }
+
+    #[test]
+    fn a_pin_for_another_proxy_than_the_recorded_one_is_stale() {
+        let (one, two) = (Some("http://one:3128"), Some("http://two:3128"));
+        let mut h = ContextHistory::default();
+        h.record(&through(one));
+        let pin = h.pin_through("dev", STAGING, two);
+        assert!(h.check(Pinned::Shell, "dev", &pin).is_some());
+        assert!(h.check(Pinned::Logs, "dev", &pin).is_some());
+        let held = h.pin_through("dev", STAGING, one);
+        assert_eq!(h.check(Pinned::Shell, "dev", &held), None);
+    }
 
     /// A load of the files `a`, `b` and `c`, in that order: each context with its server and
     /// the file that won it, and the files that failed to load.

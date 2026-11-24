@@ -26,7 +26,8 @@ one view, which this document calls a **cluster set**, and the UI calls super mo
   that cluster only (and obeys [ADR-0015](./0015-clusters-are-protected-by-default.md)).
 - **Connections:** every member of an open set is connected and watched as an active cluster is, under the watch
   mode rules of ADR-0008. Closing the set treats every member that is not the active cluster as cold under ADR-0008: the watches stop, the
-  client and discovery cache stay, and logs, exec and port-forward sessions the user started keep running. Warm
+  client and discovery cache stay, and logs and exec sessions the user started keep running. A port-forward on such a
+  member keeps running only if the cluster has keep watching on (ADR-0008). Warm
   clusters ([ADR-0012](./0012-keep-recently-used-clusters-warm.md), #247) are not scheduled before cluster sets. If
   warm clusters ship later, members don't count against `warm_clusters`, and closing the set returns them to the
   warm rules. Each member's errors show in its sidebar row and as a one-line note in the combined list, and never block

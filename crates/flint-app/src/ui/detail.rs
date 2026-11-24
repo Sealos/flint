@@ -28,6 +28,7 @@ use gpui_kit::*;
 
 use super::icons::FlintIcon;
 use super::list::tabular_figures;
+use super::list_usage::{UsageSource, UsageSubject};
 use super::log_view::LogRequest;
 use super::menu_fit::{fit_picker, picker_item};
 use super::menu_record;
@@ -234,6 +235,8 @@ pub struct DetailView {
     row_writes_paused: Option<String>,
     /// The server the object's cluster shows, as the workspace says it: what an edit is for.
     server: Option<String>,
+    /// The confirmed endpoint number of the object's cluster, for binding an edit to it.
+    endpoint: Option<u64>,
     /// What RBAC says about this object's actions, for showing them ([`access`]).
     access: access::ObjectAccess,
     /// Guards a YAML edit's review on its connection; `None` until the workspace gives it, when
@@ -249,6 +252,10 @@ pub struct DetailView {
     _sync: Task<()>,
     _show_pods: Task<()>,
     _yaml: Task<()>,
+    /// A pod's or node's use against its budget, from the cluster feed's metrics poll.
+    usage: usage::DetailUsage,
+    /// Follows that poll. Makes no request.
+    _usage: Task<()>,
 }
 
 impl DetailView {
@@ -295,6 +302,26 @@ impl DetailView {
             subject,
         );
         let cluster_label = flint_core::display::single_line(&object.cluster);
+        let follow_usage = match UsageSubject::of(&object.kind) {
+            Some(subject) => {
+                let (core, cluster) = (core.clone(), object.cluster.clone());
+                let mut updates = core.telemetry_updates();
+                cx.spawn(async move |this, cx| {
+                    while updates.changed().await {
+                        let source = UsageSource::of(subject, core.telemetry(&cluster).as_ref());
+                        let followed = this.update(cx, |view, cx| {
+                            if view.usage.set_source(source) {
+                                cx.notify();
+                            }
+                        });
+                        if followed.is_err() {
+                            break;
+                        }
+                    }
+                })
+            }
+            None => Task::ready(()),
+        };
         let mut view = DetailView {
             core,
             object,
@@ -331,6 +358,7 @@ impl DetailView {
             row_server: None,
             row_writes_paused: None,
             server: None,
+            endpoint: None,
             access: object_access,
             connection_guards: None,
             edit: None,
@@ -339,6 +367,8 @@ impl DetailView {
             _sync: follow_sync,
             _show_pods: Task::ready(()),
             _yaml: Task::ready(()),
+            usage: usage::DetailUsage::default(),
+            _usage: follow_usage,
         };
         view.refresh(window, cx);
         view.list_pods_soon(cx);
@@ -604,6 +634,7 @@ impl DetailView {
     /// stays, and the other object is neither shown nor available to an edit.
     fn replaced(&mut self, cx: &mut Context<Self>) {
         self.gone = true;
+        self.usage.mark_deleted();
         self.refetch = false;
         self.error_retry_due = false;
         self._error_retry_cooldown = None;
@@ -635,6 +666,8 @@ impl DetailView {
         self.freshness.fetched(self.refetch);
         // A re-render of the previous copy must not land after this one.
         self._yaml = Task::ready(());
+        self.usage
+            .set_object(UsageSubject::of(&self.object.kind), &detail.object);
         self.fetch = Fetch::Loaded { detail, overview };
         self.run_pending(cx);
         if self.show_managed_fields == managed {
@@ -682,6 +715,7 @@ impl DetailView {
     /// The object was deleted: keep showing the last copy, marked as gone.
     pub fn mark_gone(&mut self, cx: &mut Context<Self>) {
         self.gone = true;
+        self.usage.mark_deleted();
         cx.notify();
     }
 
@@ -1432,6 +1466,31 @@ impl DetailView {
             theme,
         ));
 
+        match self.usage.panel(o.namespace.as_deref(), &o.name) {
+            Some(usage::UsagePanel::Hint(hint)) => {
+                body = body.child(section(
+                    "Usage",
+                    None,
+                    div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child(hint),
+                    theme,
+                ));
+            }
+            Some(usage::UsagePanel::Lines { cpu, memory }) => {
+                body = body.child(section(
+                    "Usage",
+                    None,
+                    v_flex()
+                        .child(key_value(("usage", 0), "CPU", cpu, false, theme))
+                        .child(key_value(("usage", 1), "Memory", memory, false, theme)),
+                    theme,
+                ));
+            }
+            None => {}
+        }
+
         // Labels and annotations, collapsible.
         body = body.child(self.render_pairs(
             "Labels",
@@ -1912,6 +1971,7 @@ fn timestamp_age(text: &str, now: i64) -> Option<String> {
 impl Render for DetailView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.follow_access(cx);
+        self.finish_focus_return(window, cx);
         let theme = cx.theme().clone();
         // The pane itself has focus (Tab between panes, UP-33): ringed.
         let focused = self.focus.is_focused(window);
@@ -2019,6 +2079,9 @@ mod pods;
 
 #[path = "detail_sync.rs"]
 mod sync;
+
+#[path = "detail_usage.rs"]
+mod usage;
 
 pub(in crate::ui) use actions::{
     Opening, PROTECTED_NOTE, ShellPod, protected_reason, reason, refused,

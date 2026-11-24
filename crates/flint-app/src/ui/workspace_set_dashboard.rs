@@ -480,13 +480,15 @@ impl Workspace {
             window.focus(&focus, cx);
             return;
         }
-        let (label, members, changed) =
-            (run.label.clone(), run.members.clone(), run.changed.clone());
+        let (label, members) = (run.label.clone(), run.members.clone());
+        let gone = super::Gone {
+            changed: run.changed.clone(),
+            disconnected: run.disconnected.clone(),
+        };
         let (set_id, left_out) = (run.set_id.clone(), run.left_out.clone());
         self.close_set_detail(cx);
-        self.show_set(label, members, kind, kind_label, window, cx);
+        self.show_set(label, members, (kind, kind_label), gone, window, cx);
         if let Some(run) = &mut self.sets.running {
-            run.changed = changed;
             run.set_id = set_id;
             run.left_out = left_out;
         }

@@ -125,6 +125,7 @@ impl Source for KubeSource {
         };
         let target = self.target.clone();
         async move {
+            let path = path.map_err(|error| FetchError::Invalid(error.to_string()))?;
             table::fetch_page(&client, &path, &query.to_params())
                 .await
                 .map_err(|e| e.into_fetch(&target))
@@ -142,6 +143,7 @@ impl Source for KubeSource {
         let target = self.target.clone();
         let path = table::collection_path(kind, namespace);
         async move {
+            let path = path.map_err(|error| FetchError::Invalid(error.to_string()))?;
             let mut params = WatchParams::default().timeout(request.timeout_secs);
             if request.initial_events {
                 params = params.initial_events();

@@ -140,6 +140,14 @@ impl ClustersModel {
                 }
             }
             Event::ConnectionProgress(progress) => self.connection_progress = progress,
+            Event::WritesEnded {
+                cluster,
+                write_epoch,
+            } => {
+                if let Some(c) = self.clusters.iter_mut().find(|c| c.info.name == cluster) {
+                    c.write_epoch = c.write_epoch.max(write_epoch);
+                }
+            }
             Event::SettingsChanged {
                 settings,
                 error,
@@ -285,7 +293,7 @@ impl ClustersModel {
     /// What AI agents may read of `cluster`, if it is exposed at the server it points at now.
     pub fn ai_scope(&self, cluster: &ClusterSummary) -> Option<AiScope> {
         self.settings
-            .ai_scope(&cluster.info.name, cluster.info.server.as_deref())
+            .ai_scope(&cluster.info.name, cluster.info.grant_server().as_deref())
     }
 
     /// Sets the global watch mode (`cluster: None`), or a cluster's override (`mode: None`
@@ -306,6 +314,11 @@ impl ClustersModel {
             cluster,
             definition,
         });
+    }
+
+    /// Stops everything the core runs for `cluster` until it is selected again.
+    pub(in crate::ui) fn disconnect(&mut self, cluster: ClusterId) {
+        self.send(Command::DisconnectCluster(cluster));
     }
 
     /// For the background sign-in toggle's click handler alone: turns it on for the exact
@@ -441,7 +454,7 @@ impl ClustersModel {
 
     pub fn ai_exposure(&self, cluster: &ClusterSummary) -> AiExposureState {
         self.settings
-            .ai_exposure(&cluster.info.name, cluster.info.server.as_deref())
+            .ai_exposure(&cluster.info.name, cluster.info.grant_server().as_deref())
     }
 
     /// Whether Flint may change `cluster` now (ADR-0015). The core keeps the same check for
@@ -495,7 +508,7 @@ impl ClustersModel {
 
     pub fn trust(&self, cluster: &ClusterSummary) -> TrustState {
         self.settings
-            .trust(&cluster.info.name, cluster.info.server.as_deref())
+            .trust(&cluster.info.name, cluster.info.grant_server().as_deref())
     }
 
     /// Unlocks `cluster` at `server`, the URL the user confirmed, until Flint quits or Lock
@@ -877,6 +890,7 @@ mod tests {
             generation: 1,
             definition: 1,
             endpoint: 1,
+            write_epoch: 0,
             confirmed: true,
             provisional: false,
             paused: false,

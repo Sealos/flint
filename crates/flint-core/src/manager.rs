@@ -36,13 +36,17 @@ use crate::store::{KindSnapshot, SyncState};
 use crate::watch::{ClusterWatches, EngineConfig, HubRegistry, KubeSource};
 use crate::write::WriteError;
 
+mod disconnect;
 mod file_watch;
+mod forwards;
 mod helm;
 mod keep_watching;
 mod running_set;
 mod selected_retry;
 mod telemetry;
 
+pub(crate) use disconnect::DisconnectCount;
+pub(crate) use forwards::ForwardSignals;
 pub(crate) use keep_watching::KeptGrants;
 #[cfg(test)]
 pub(crate) use keep_watching::QUIT_WAIT;
@@ -103,6 +107,8 @@ pub(crate) struct Cluster {
     /// Kept while the cluster is not active (ADR-0008).
     discovery: Option<Arc<ClusterDiscovery>>,
     discovering: bool,
+    /// The discovery running on this slot's connection, ended with it on a disconnect.
+    discovery_task: Option<AbortHandle>,
     /// The CRDs changed while discovery ran: run it again when it finishes.
     rediscover: bool,
     /// The CRD list as last seen, so a changed list triggers a refresh.
@@ -135,8 +141,11 @@ impl Drop for Cluster {
         {
             task.abort();
         }
-        if let Some(attempt) = self.connect_task.take() {
-            attempt.abort();
+        for task in [self.connect_task.take(), self.discovery_task.take()]
+            .into_iter()
+            .flatten()
+        {
+            task.abort();
         }
     }
 }
@@ -167,6 +176,7 @@ impl Cluster {
             generation: 0,
             discovery: None,
             discovering: false,
+            discovery_task: None,
             rediscover: false,
             crd_fingerprint: None,
             crds: HashSet::new(),
@@ -215,6 +225,7 @@ impl Cluster {
             generation: self.generation,
             definition: shown.definition,
             endpoint: shown.endpoint,
+            write_epoch: shown.gate,
             confirmed: shown.confirmed,
             provisional,
             paused,
@@ -475,6 +486,8 @@ struct Changed {
     /// A missing directory of a watched file was created: watch it now (UP-02: `~/.kube`
     /// created after launch).
     rearm: bool,
+    /// A kubeconfig file's content or location may have changed, not just its metadata.
+    kubeconfig_rewritten: bool,
 }
 
 pub(crate) struct ClusterManager {
@@ -487,6 +500,8 @@ pub(crate) struct ClusterManager {
     generation: u64,
     /// Every context's history across kubeconfig loads, which sessions are pinned to.
     contexts: ContextHistory,
+    /// Moves after each load is recorded, so open log sessions recheck their route at once.
+    route_changes: watch::Sender<u64>,
     /// The kubeconfig files for the current settings: the base files plus `kubeconfig_paths`.
     kubeconfig_paths: Vec<PathBuf>,
     /// Reads those files without letting a stuck one hold up this loop.
@@ -525,6 +540,7 @@ pub(crate) struct ClusterManager {
     schedule: Schedule<ClusterId>,
     /// Automatic retries of the selected cluster.
     retries: selected_retry::RetryDriver,
+    disconnects: disconnect::Disconnects,
     /// Runs while the set has members.
     set_ticker: Option<JoinHandle<()>>,
     /// Source of connection attempt ids; never reused.
@@ -560,6 +576,7 @@ pub(crate) struct ClusterManager {
     holds: DefinitionHolds,
     /// Clusters watched in the background, on connections of their own.
     keep: keep_watching::KeepWatch,
+    forwards: forwards::Forwards,
 }
 
 impl ClusterManager {
@@ -603,12 +620,14 @@ impl ClusterManager {
             kubeconfig: Arc::default(),
             generation: 0,
             contexts: ContextHistory::default(),
+            route_changes: watch::Sender::new(0),
             kubeconfig_paths,
             clusters: Vec::new(),
             active: None,
             members: HashMap::new(),
             schedule: Schedule::default(),
             retries: Default::default(),
+            disconnects: Default::default(),
             set_ticker: None,
             next_attempt: 1,
             watcher: None,
@@ -626,6 +645,7 @@ impl ClusterManager {
             settled: SettledDefinitions::default(),
             holds: DefinitionHolds::default(),
             keep: Default::default(),
+            forwards: Default::default(),
             reader: KubeconfigReader::default(),
             stalled_on: None,
             read_seq: 0,
@@ -664,6 +684,7 @@ impl ClusterManager {
                 Some(msg) = internal_rx.recv() => self.handle_internal(msg).await,
             }
             self.sync_keep_watching();
+            self.sync_forwards();
             self.sync_selected_retry();
             self.sync_telemetry();
         }
@@ -688,6 +709,7 @@ impl ClusterManager {
                 cluster,
                 generation,
             } => self.cancel_connection(&cluster, generation),
+            Command::DisconnectCluster(cluster) => self.disconnect_cluster(cluster).await,
             Command::SetRunningSet(ids) => self.set_running_set(ids),
             Command::SetKeepWatching {
                 cluster,
@@ -868,6 +890,7 @@ impl ClusterManager {
                 cluster,
                 server,
                 member,
+                disconnects,
                 subject,
                 options,
                 snapshots,
@@ -875,6 +898,7 @@ impl ClusterManager {
                 budget,
             } => {
                 let internal = self.internal_tx.clone();
+                let context = cluster.clone();
                 // Pinned now, to the server shown (the tab's): a reconnect must never read logs
                 // from another server (UP-06). Opened on a fallback, the pin is stale and the
                 // first client lookup ends the session, rather than read from the server the
@@ -883,7 +907,12 @@ impl ClusterManager {
                 // context moved (its fallback gone, say) is not pinned to where it is now.
                 let pin = match (&member, &server) {
                     (Some(member), _) => member.log_pin(&cluster),
-                    (None, Some(server)) => self.contexts.pin(&cluster, server.as_deref()),
+                    (None, Some(server)) => self.contexts.pin_through(
+                        &cluster,
+                        server.as_deref(),
+                        self.cluster(&cluster)
+                            .and_then(|slot| slot.info.proxy_url.as_deref()),
+                    ),
                     (None, None) => self.session_pin(&cluster),
                 };
                 let lookup: logs::ClientLookup = Arc::new(move || {
@@ -908,12 +937,21 @@ impl ClusterManager {
                     &config,
                     Arc::new(KubeLogSource::new(lookup.clone())),
                     Arc::new(KubePodSource::new(lookup)),
+                    self.route_changes.subscribe(),
                 );
+                let sessions = &self.log_sessions;
+                let stop = self
+                    .disconnects
+                    .track_logs(id, &context, disconnects, |session| {
+                        sessions.get(session).is_some_and(|t| !t.is_finished())
+                    });
+                let feed = logs::until_stopped(feed, stop, disconnect::LOGS_ENDED.to_owned());
                 let task = tokio::spawn(logs::run(feed, config, snapshots, paused, Some(budget)));
                 self.log_sessions.retain(|_, t| !t.is_finished());
                 self.log_sessions.insert(id, task);
             }
             Request::CloseLogs { id } => {
+                self.disconnects.forget_logs(id);
                 if let Some(task) = self.log_sessions.remove(&id) {
                     task.abort();
                 }
@@ -948,6 +986,17 @@ impl ClusterManager {
                 reply,
             } => {
                 self.check_write_pin(cluster, pin, reply);
+            }
+            Request::AdmitForward {
+                cluster,
+                server,
+                admitted,
+                reply,
+            } => {
+                let _ = reply.send(self.admit_forward(cluster, server, admitted.as_ref()));
+            }
+            Request::CheckForward { id, reply } => {
+                let _ = reply.send(self.check_forward(id));
             }
             Request::CheckContext {
                 cluster,
@@ -1213,7 +1262,7 @@ impl ClusterManager {
         slot.rediscover = false;
         let attempt = slot.attempt;
         let cluster = id.to_owned();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let result = read::discover_kinds(&client)
                 .await
                 .map_err(|e| e.for_target(&target).summary().to_string());
@@ -1223,6 +1272,7 @@ impl ClusterManager {
                 result,
             });
         });
+        slot.discovery_task = Some(task.abort_handle());
     }
 
     /// Writes one change to `settings.toml` (`what` names it in errors) and applies the result.
@@ -1286,19 +1336,14 @@ impl ClusterManager {
             )));
             return;
         }
-        let current = self
-            .clusters
-            .iter()
-            .find(|c| c.info.name == cluster)
-            .and_then(|c| c.info.server.as_deref());
-        if current != Some(server.as_str()) {
+        let Some(address) = self.address_of_grant(&cluster, &server) else {
             self.emit(Event::Error(format!(
                 "\"{cluster}\" now points to a different server; its AI scope was not changed. \
                  Review it and try again."
             )));
             return;
-        }
-        if scope_widens(&from, &scope) && !self.files_still_show(&cluster, &server).await {
+        };
+        if scope_widens(&from, &scope) && !self.files_still_show(&cluster, &address).await {
             self.emit(Event::Error(format!(
                 "The AI scope of \"{cluster}\" was not widened: its kubeconfig files can't be \
                  read or no longer match what is shown. Check them and try again."
@@ -1311,9 +1356,22 @@ impl ClusterManager {
         .await;
     }
 
+    /// `cluster`'s API server address, if `grant` is the server and proxy it shows now.
+    fn address_of_grant(&self, cluster: &str, grant: &str) -> Option<String> {
+        let info = &self.clusters.iter().find(|c| c.info.name == cluster)?.info;
+        let stable = info
+            .proxy_url
+            .as_deref()
+            .is_none_or(crate::connection::proxy::is_stable_identity);
+        (stable && info.grant_server().as_deref() == Some(grant))
+            .then(|| info.server.clone())
+            .flatten()
+    }
+
     /// Pins `cluster` at `server` in a list of pins (`Some`), or removes it (`None`), in
     /// `settings.toml`. Returns whether the change was saved.
     async fn set_pin(&mut self, pins: Pins, cluster: ClusterId, server: Option<String>) -> bool {
+        let mut address = None;
         if let Some(server) = &server {
             // No load shows a settled definition, so there is nothing to pin yet.
             if self.unsettled(&cluster) {
@@ -1324,14 +1382,10 @@ impl ClusterManager {
                 )));
                 return false;
             }
-            // The user confirmed this server. If the context moved since, do not pin the new
-            // one on the strength of that confirmation.
-            let current = self
-                .clusters
-                .iter()
-                .find(|c| c.info.name == cluster)
-                .and_then(|c| c.info.server.as_deref());
-            if current != Some(server.as_str()) {
+            // The user confirmed this server and proxy. If the context moved since, do not pin
+            // the new route on the strength of that confirmation.
+            address = self.address_of_grant(&cluster, server);
+            if address.is_none() {
                 self.emit(Event::Error(format!(
                     "\"{cluster}\" now points to a different server; it was not {}. Review it and try again.",
                     pins.done()
@@ -1348,7 +1402,7 @@ impl ClusterManager {
             )));
             return false;
         }
-        if let Some(at) = &server
+        if let Some(at) = &address
             && !self.files_still_show(&cluster, at).await
         {
             self.emit(Event::Error(format!(
@@ -1857,6 +1911,9 @@ impl ClusterManager {
                 }
             }
             Internal::FilesChanged(changed) => {
+                if changed.kubeconfig_rewritten {
+                    self.invalidate_forwards();
+                }
                 if changed.rearm || changed.kubeconfig || changed.settings {
                     // A symlink may have moved. Anything written before the new watches start
                     // is caught by the read the watcher asks for once they have.
@@ -1866,11 +1923,13 @@ impl ClusterManager {
             }
             Internal::WatchesStarted(dirs) => {
                 tracing::debug!(dirs = dirs.len(), "file watches changed");
+                self.invalidate_forwards();
                 self.reload_changed(Changed {
                     kubeconfig: true,
                     settings: true,
                     activity: true,
                     rearm: false,
+                    kubeconfig_rewritten: false,
                 })
                 .await;
             }
@@ -1899,6 +1958,9 @@ impl ClusterManager {
     /// context re-pointed or removed since `pin` (when the session opened) ends the session
     /// ([`ContextHistory::check`]).
     fn log_client(&mut self, cluster: &str, pin: &ContextPin) -> Result<Client, LogError> {
+        if let Some(ended) = self.disconnected_logs(cluster) {
+            return Err(ended);
+        }
         if let Some(reason) = self.contexts.check(Pinned::Logs, cluster, pin) {
             return Err(LogError::cluster(reason));
         }
@@ -1909,6 +1971,7 @@ impl ClusterManager {
             let shown = s.info.server.as_deref();
             // Streams already open go on; this is asked only for a new one.
             !self.paused(cluster)
+                && s.info.proxy_url.as_deref() == pin.proxy()
                 // The endpoint alone is enough only for a confirmed server: a fallback at the
                 // same URL can come with other credentials.
                 && (shown == pin.server()
@@ -2012,7 +2075,11 @@ impl ClusterManager {
     /// is labelled with), stale if that is not the confirmed one ([`ContextHistory::pin`]).
     fn session_pin(&self, cluster: &str) -> ContextPin {
         match self.cluster(cluster) {
-            Some(slot) => self.contexts.pin(cluster, slot.info.server.as_deref()),
+            Some(slot) => self.contexts.pin_through(
+                cluster,
+                slot.info.server.as_deref(),
+                slot.info.proxy_url.as_deref(),
+            ),
             None => self.contexts.pin_confirmed(cluster),
         }
     }
@@ -2039,10 +2106,10 @@ impl ClusterManager {
 
     /// The cluster's protection now, if it allows changes.
     fn write_gate(&self, cluster: &str) -> Result<crate::Protection, WriteRefusal> {
-        let server = self
-            .cluster(cluster)
-            .and_then(|slot| slot.info.server.as_deref());
-        self.gate_for_server(cluster, server)
+        let info = self.cluster(cluster).map(|slot| &slot.info);
+        let server = info.and_then(|info| info.server.as_deref());
+        let proxy = info.and_then(|info| info.proxy_url.as_deref());
+        self.gate_for_route(cluster, server, proxy)
     }
 
     /// The gate for a session about to run a command with the client it was given at `pin`: for
@@ -2073,7 +2140,8 @@ impl ClusterManager {
                 WriteRefusal::Moved { cluster }
             });
         }
-        self.gate_for_server(cluster, pin.server()).map(drop)
+        self.gate_for_route(cluster, pin.server(), pin.proxy())
+            .map(drop)
     }
 
     /// [`Self::launch_gate`] for a write, in one step with checking the definition it is pinned
@@ -2090,6 +2158,19 @@ impl ClusterManager {
         } else {
             Err(WriteError::ConnectionChanged)
         }
+    }
+
+    /// Whether a port-forward on `pin` may carry on: as for a write, and not while the context
+    /// is paused. From memory, so a running forward can ask often.
+    fn forward_gate(&self, cluster: &str, pin: &ContextPin) -> Result<(), WriteError> {
+        self.write_pin_gate(cluster, pin)?;
+        if self.paused(cluster) {
+            return Err(WriteRefusal::Unsettled {
+                cluster: cluster.to_owned(),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     /// Answers whether a write may go out on `pin`, from a read of the files that starts after
@@ -2199,20 +2280,19 @@ impl ClusterManager {
     }
 
     /// `cluster`'s protection for `server`, if it allows changes.
-    fn gate_for_server(
+    fn gate_for_route(
         &self,
         cluster: &str,
         server: Option<&str>,
+        proxy: Option<&str>,
     ) -> Result<crate::Protection, WriteRefusal> {
         // A context Flint does not know has no client either: say that, not "protected". A held
         // slot counts as unknown here: no load shows its definition, so nothing new starts on it.
-        let slot = self
-            .cluster(cluster)
-            .filter(|_| !self.held(cluster))
-            .ok_or_else(|| WriteRefusal::NotConnected {
+        if self.cluster(cluster).is_none() || self.held(cluster) {
+            return Err(WriteRefusal::NotConnected {
                 cluster: cluster.to_owned(),
-            })?;
-        let proxy = slot.info.proxy_url.as_deref();
+            });
+        }
         let protection = protection(&self.settings, &self.unlocks, cluster, server, proxy);
         if protection.allows_changes() {
             Ok(protection)
@@ -2402,6 +2482,7 @@ impl ClusterManager {
         // Someone selected or retried a cluster: a prompting plugin resting after a timed-out
         // refresh may run again now.
         crate::auth_plugin::retry_now(&id);
+        self.disconnects.lift(&id);
         self.keep_watching_acted_on(&id);
         let Some(slot) = self.cluster_mut(&id) else {
             self.emit(Event::Error(format!("cluster \"{id}\" no longer exists")));
@@ -2479,6 +2560,9 @@ impl ClusterManager {
     /// that ends the pause starts the attempt. A member connects only through its own attempt,
     /// so a request without one asks for it instead.
     fn ensure_connected(&mut self, id: &str) {
+        if self.disconnects.holds(id) {
+            return;
+        }
         let kubeconfig = self.kubeconfig.clone();
         let internal = self.internal_tx.clone();
         let attempt = self.next_attempt;
@@ -2854,6 +2938,7 @@ impl ClusterManager {
             .collect();
         // A file that failed to load masks the changes it could have made (UP-06).
         self.contexts.record(&loaded);
+        self.route_changes.send_modify(|at| *at += 1);
         // An unlock names only the server. A context that comes out of an uncertain spell on
         // another definition may hold another user or token there, so it is locked again.
         for name in self.settled.update(&self.contexts, &loaded) {
@@ -3294,6 +3379,75 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_shell_pinned_through_one_proxy_cannot_launch_through_another() {
+        let at = |proxy: &str| kubeconfig_with(&format!("https://dev\n    proxy-url: {proxy}"));
+        let (one, two) = ("http://one.example:3128", "http://two.example:3128");
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &at(one)).await;
+        manager.unlocks.unlock(
+            "dev",
+            &crate::connection::proxy::grant_endpoint("https://dev", Some(one)),
+        );
+        let pin = manager.session_pin("dev");
+        assert_eq!(manager.launch_gate("dev", &pin), Ok(()));
+
+        rewrite(&mut manager, dir.path(), &at(two)).await;
+        manager.unlocks.unlock(
+            "dev",
+            &crate::connection::proxy::grant_endpoint("https://dev", Some(two)),
+        );
+
+        assert_eq!(
+            manager.launch_gate("dev", &pin),
+            Err(WriteRefusal::Moved {
+                cluster: "dev".into()
+            })
+        );
+        assert!(
+            manager.log_client("dev", &pin).is_err(),
+            "a log stream through the old proxy ends too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shell_pinned_to_one_proxy_account_cannot_launch_on_another() {
+        let at = |proxy: &str| kubeconfig_with(&format!("https://dev\n    proxy-url: {proxy}"));
+        let (one, two) = (
+            "http://alice:first@proxy.example:3128",
+            "http://bob:second@proxy.example:3128",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &at(one)).await;
+        let grant = |manager: &ClusterManager| manager.cluster("dev").unwrap().info.grant_server();
+        let first = grant(&manager).unwrap();
+        assert!(
+            !first.contains("alice") && !first.contains("first"),
+            "{first}"
+        );
+        manager.unlocks.unlock("dev", &first);
+        let pin = manager.session_pin("dev");
+        assert_eq!(manager.launch_gate("dev", &pin), Ok(()));
+        let route_changes = manager.route_changes.subscribe();
+
+        rewrite(&mut manager, dir.path(), &at(two)).await;
+
+        assert!(
+            route_changes.has_changed().unwrap(),
+            "open log sessions are told to recheck"
+        );
+        assert_ne!(grant(&manager).unwrap(), first, "the grant is per account");
+        assert!(manager.launch_gate("dev", &pin).is_err());
+        assert!(manager.log_client("dev", &pin).is_err());
+        assert_eq!(
+            manager.write_gate("dev").err(),
+            Some(WriteRefusal::Protected {
+                cluster: "dev".into()
+            }),
+            "the unlock was for the other account"
+        );
+    }
+
     /// A manager reading one kubeconfig file, `kubeconfig` in `dir`, loaded once.
     async fn manager_reading(dir: &Path, yaml: &str) -> ClusterManager {
         let path = dir.join("kubeconfig");
@@ -3410,6 +3564,26 @@ mod tests {
         assert_eq!(manager.write_gate("dev").err(), protected);
         manager.reload_settings().await;
         assert_eq!(manager.write_gate("dev").err(), protected);
+    }
+
+    // covers UP-54: a running port-forward stops being allowed once its context is held
+    // (paused behind a kubeconfig file that can't be read) or re-pointed.
+    #[tokio::test]
+    async fn a_forward_is_refused_while_held_or_re_pointed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://dev")).await;
+        let pin = manager.contexts.pin_confirmed("dev");
+        manager.held.insert("dev".into());
+        assert!(matches!(
+            manager.forward_gate("dev", &pin),
+            Err(WriteError::KubeconfigUnreadable)
+        ));
+        manager.held.remove("dev");
+        rewrite(&mut manager, dir.path(), &kubeconfig_with("https://old")).await;
+        assert!(matches!(
+            manager.forward_gate("dev", &pin),
+            Err(WriteError::Refused(WriteRefusal::Moved { .. }))
+        ));
     }
 
     // covers UP-06, UP-41: a shell's check (`Request::CheckContext`) compares the context with
@@ -5102,6 +5276,34 @@ mod tests {
         rewrite_file(&mut manager, &path, &yaml).await;
         assert!(manager.unlocks.is_unlocked("dev", "https://dev"));
         assert_eq!(manager.write_pin_gate("dev", &pin), Ok(()));
+    }
+
+    // A disconnect ends every review and confirmation pinned before it, after a reconnect too,
+    // and the front end sees the write epoch move.
+    #[tokio::test]
+    async fn a_disconnect_ends_every_write_pinned_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://dev");
+        let mut manager = manager_reading_two(dir.path(), &yaml, NO_CONTEXTS).await;
+        manager.unlocks.unlock("dev", "https://dev");
+        let before = manager.contexts.pin_confirmed("dev");
+        let epoch = |m: &ClusterManager| {
+            m.summaries()
+                .into_iter()
+                .find(|c| c.info.name == "dev")
+                .map(|c| c.write_epoch)
+        };
+        let opened = epoch(&manager);
+        assert_eq!(manager.write_pin_gate("dev", &before), Ok(()));
+
+        manager.disconnect_cluster("dev".into()).await;
+        assert!(manager.write_pin_gate("dev", &before).is_err());
+        assert_ne!(epoch(&manager), opened);
+
+        manager.activate("dev".into());
+        assert!(manager.write_pin_gate("dev", &before).is_err());
+        let after = manager.contexts.pin_confirmed("dev");
+        assert_eq!(manager.write_pin_gate("dev", &after), Ok(()));
     }
 
     // covers UP-06, UP-54: a file that comes back with another server, user or token carries
@@ -8303,6 +8505,7 @@ users:
             cluster: "dev".into(),
             server: taken_late.then_some(shown),
             member: None,
+            disconnects: 0,
             subject: LogSubject::Pod(target),
             options: LogOptions::default(),
             snapshots,

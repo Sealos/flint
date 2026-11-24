@@ -237,9 +237,38 @@ actions!(
     [
         /// Open a shell in the default container of the selected pod, or of the selected
         /// workload's first ready pod, in the dock.
-        OpenShell
+        OpenShell,
+        /// Forward a local port to the selected pod or service, from the port-forward panel.
+        ForwardPort
     ]
 );
+actions!(
+    port_forward,
+    [
+        /// Show the active cluster's port-forward panel.
+        ShowPortForwards,
+        /// Start the forward the panel's form describes.
+        StartPortForward,
+        /// Stop every port-forward in this window.
+        StopAllPortForwards
+    ]
+);
+
+/// Stop one port-forward, or dismiss its row once it has ended.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = port_forward, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct StopPortForward {
+    pub id: u64,
+}
+
+/// Open a running port-forward's local address in the browser.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = port_forward, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct OpenForwardedPort {
+    pub id: u64,
+}
 actions!(
     workspace,
     [
@@ -369,6 +398,15 @@ pub struct ExposeToAi {
 #[action(namespace = workspace, no_json)]
 #[serde(deny_unknown_fields)]
 pub struct ToggleKeepWatching {
+    pub cluster: String,
+}
+
+/// Stop everything Flint runs for a cluster until it is selected again. Asks first while it would
+/// end a live shell.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = workspace, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct DisconnectCluster {
     pub cluster: String,
 }
 
@@ -2083,6 +2121,7 @@ const SELECTOR: &[Arg] = &[
     ),
 ];
 const SHELL_CONTAINER: &[Arg] = &[arg("container", "container name", ArgKind::Container)];
+const FORWARD_ID: &[Arg] = &[arg("id", "the port-forward's id", ArgKind::Number)];
 const CELLS: &[Arg] = &[
     arg(
         "start_row",
@@ -2297,6 +2336,12 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::with_args::<ToggleKeepWatching>(
             "Keep Watching Cluster…",
             "Gather overview data and alerts for a cluster while it is not selected, or stop.",
+            CLUSTER,
+        )
+        .of(C::Cluster, S::Workspace),
+        Spec::with_args::<DisconnectCluster>(
+            "Disconnect Cluster…",
+            "Stop a cluster's watches, log streams and background watching until it is selected.",
             CLUSTER,
         )
         .of(C::Cluster, S::Workspace),
@@ -2889,6 +2934,41 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             SHELL_CONTAINER,
         )
         .of(C::Terminal, S::Detail),
+        Spec::unit::<ForwardPort>(
+            "Forward Port",
+            "Forward a local port to the selected pod or service. It listens on 127.0.0.1 only.",
+        )
+        .of(C::Detail, S::Workspace),
+        Spec::unit::<ShowPortForwards>(
+            "Show Port Forwards",
+            "Show the active cluster's port-forwards in the dock.",
+        )
+        .of(C::View, S::Workspace),
+        Spec::unit::<StopAllPortForwards>(
+            "Stop All Port Forwards",
+            "Stop every port-forward in this window.",
+        )
+        .of(C::View, S::Workspace),
+        Spec::unit::<StartPortForward>(
+            "Start Port Forward",
+            "Start the forward the port-forward panel's form describes.",
+        )
+        .of(C::View, S::Workspace)
+        .hidden(),
+        Spec::with_args::<StopPortForward>(
+            "Stop Port Forward…",
+            "Stop one port-forward, or dismiss its row once it has ended.",
+            FORWARD_ID,
+        )
+        .of(C::View, S::Workspace)
+        .hidden(),
+        Spec::with_args::<OpenForwardedPort>(
+            "Open Forwarded Port…",
+            "Open a running port-forward's local address in the browser.",
+            FORWARD_ID,
+        )
+        .of(C::View, S::Workspace)
+        .hidden(),
         Spec::unit::<DeleteObject>(
             "Delete Selected Object",
             "Delete the selected object, after a review and a confirmation naming it.",

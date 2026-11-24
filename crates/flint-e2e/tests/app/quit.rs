@@ -4,14 +4,14 @@
 //! not show which of the two did it. This test sends Quit itself and watches the process end
 //! while the harness still holds stdin open.
 //!
-//! Not here (#263): **Close Window** closes `cx.active_window()`, and the app under test runs in
-//! the background with no active window, so the action does nothing. **Saving on quit**: a
-//! relaunch reads back a value that is also saved shortly after each change, so it does not show
-//! that quitting saved it.
+//! Close Window has its own test, in `window_close.rs`.
+//!
+//! Not here (#263): **saving on quit**: a relaunch reads back a value that is also saved shortly
+//! after each change, so it does not show that quitting saved it.
 
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
 use flint_e2e::app::{App, AppOptions};
 use serde_json::Value;
 
@@ -21,29 +21,6 @@ use crate::support::*;
 /// fallback never runs in this time: it starts only when the test calls `App::quit` or drops the
 /// app.
 const EXIT: Duration = Duration::from_secs(5);
-
-/// The exit code of child `pid` if it has ended. Leaves it unreaped, for `App::quit` to collect
-/// and check.
-fn exit_code(pid: u32) -> Result<Option<i32>> {
-    let id = libc::id_t::from(pid);
-    // SAFETY: an all-zero siginfo_t is valid, and waitid only writes to it.
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` outlives the call; WNOWAIT leaves the child for the harness to reap.
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            id,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error()).context("waitid on the app");
-    }
-    // SAFETY: waitid filled it in; with WNOHANG and no exit, si_pid stays 0.
-    let (ended, status) = unsafe { (info.si_pid(), info.si_status()) };
-    Ok((ended != 0).then_some(status))
-}
 
 /// Sends Quit, which may end the app before it answers, and waits for the process to end with
 /// stdin still open. Returns its exit code.

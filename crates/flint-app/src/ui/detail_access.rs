@@ -26,6 +26,8 @@ pub(in crate::ui) enum Gated {
     Edit,
     Logs,
     Shell,
+    /// A pod's port-forward. A Service's pod is picked per connection, so the server answers.
+    PortForward,
     Write(ResourceAction),
 }
 
@@ -49,6 +51,9 @@ fn gated_for(kind: &KindId, subject: Subject) -> Vec<Gated> {
     let mut gated = vec![Gated::Edit];
     if subject != Subject::Other {
         gated.extend([Gated::Logs, Gated::Shell]);
+    }
+    if subject == Subject::Pod {
+        gated.push(Gated::PortForward);
     }
     gated.extend(
         resource_actions::offered_for(kind, true, None)
@@ -164,6 +169,11 @@ impl ObjectAccess {
                 Subject::Workload(_) => self.targets.shell.iter().map(|p| pod("exec", p)).collect(),
                 Subject::Other => Vec::new(),
             },
+            // A GET WebSocket upgrade, like a shell: `get` is what it always needs.
+            Gated::PortForward => match self.subject {
+                Subject::Pod => vec![pod("portforward", &self.name)],
+                _ => Vec::new(),
+            },
             Gated::Write(ResourceAction::Delete) => vec![object("delete")],
             Gated::Write(ResourceAction::Scale) => {
                 vec![on(group, plural, Some("scale"), Some(&self.name), "patch")]
@@ -226,13 +236,23 @@ impl ObjectAccess {
 impl DetailView {
     /// Says which slot and definition the object's cluster is on now, and whether that definition
     /// is in doubt, so the gate refuses it. Answers and checks of another connection end here,
-    /// not at the next draw.
+    /// not at the next draw. A pane kept for its edit stays bound to the connection it was
+    /// opened on: once that is replaced, it asks nothing more, of either server.
     pub(in crate::ui) fn set_access_connection(
         &mut self,
-        connection: Option<ConnectionIdentity>,
-        unsettled: bool,
+        mut connection: Option<ConnectionIdentity>,
+        mut unsettled: bool,
         cx: &mut Context<Self>,
     ) {
+        if self.has_open_edit()
+            && self
+                .access
+                .connection
+                .is_some_and(|opened| Some(opened) != connection)
+        {
+            connection = self.access.connection;
+            unsettled = true;
+        }
         if self.access.connection != connection || self.access.unsettled != unsettled {
             self.access.connection = connection;
             self.access.unsettled = unsettled;
@@ -498,6 +518,24 @@ mod tests {
             pod.forbidden(Gated::Shell).as_deref(),
             Some("your access does not allow get on pods/exec in demo")
         );
+    }
+
+    // A forward sends a GET upgrade; a Service's pod is not known until a connection picks it.
+    #[test]
+    fn a_pods_port_forward_is_refused_by_get_on_portforward() {
+        let mut pod = object("", "pods", Some("demo"), "web-1");
+        let get = on_pods("portforward", "get", Some("web-1"));
+        assert_eq!(wanted(&pod, Gated::PortForward), std::slice::from_ref(&get));
+        assert_eq!(pod.forbidden(Gated::PortForward), None, "not asked yet");
+        pod.answers.insert(get.clone(), Access::Unknown);
+        assert_eq!(pod.forbidden(Gated::PortForward), None, "not known");
+        pod.answers.insert(get, Access::Forbidden);
+        assert_eq!(
+            pod.forbidden(Gated::PortForward).as_deref(),
+            Some("your access does not allow get on pods/portforward in demo")
+        );
+        let service = object("", "services", Some("demo"), "web");
+        assert!(wanted(&service, Gated::PortForward).is_empty());
     }
 
     #[test]

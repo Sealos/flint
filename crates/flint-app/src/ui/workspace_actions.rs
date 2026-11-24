@@ -57,7 +57,8 @@ use super::super::registry::{
     WatchOpenViewsOnly,
 };
 use super::super::registry::{
-    BackToList, EditAiScope, Handler, ShowAgentActivity, ShowHelmReleases, ToggleKeepWatching,
+    BackToList, DisconnectCluster, EditAiScope, Handler, ShowAgentActivity, ShowHelmReleases,
+    ToggleKeepWatching,
 };
 use super::super::registry::{
     ClearClusterTag, LockCluster, RenameCluster, SetClusterTag, TrustCluster, UnlockCluster,
@@ -69,6 +70,10 @@ use super::super::registry::{
 use super::super::registry::{
     CordonNode, DeleteObject, DrainNode, NamespacePickerNext, NamespacePickerPrevious,
     OpenNamespaceFilter, RestartObject, ScaleObject, ShowDrainReport, UncordonNode,
+};
+use super::super::registry::{
+    ForwardPort, OpenForwardedPort, ShowPortForwards, StartPortForward, StopAllPortForwards,
+    StopPortForward,
 };
 use super::super::resource_actions::{self, ResourceAction};
 use super::super::scope_picker::ScopePicker;
@@ -122,6 +127,7 @@ impl Workspace {
         .bind::<ExposeToAi>(Self::expose_to_ai)
         .bind::<HideFromAi>(Self::hide_from_ai)
         .bind::<ToggleKeepWatching>(Self::toggle_keep_watching)
+        .bind::<DisconnectCluster>(Self::ask_disconnect)
         .bind::<EditAiScope>(Self::edit_ai_scope)
         .bind::<ShowAgentActivity>(Self::show_agent_activity)
         .bind::<ShowHelmReleases>(Self::show_helm_releases)
@@ -143,6 +149,12 @@ impl Workspace {
         })
         .bind::<OpenCompare>(Self::open_compare)
         .bind::<CompareObject>(Self::compare_object)
+        .bind::<ForwardPort>(Self::forward_port)
+        .bind::<ShowPortForwards>(Self::show_port_forwards)
+        .bind::<StartPortForward>(Self::start_port_forward)
+        .bind::<StopPortForward>(Self::stop_port_forward)
+        .bind::<StopAllPortForwards>(Self::stop_all_port_forwards)
+        .bind::<OpenForwardedPort>(Self::open_forwarded_port)
         .bind::<UnlockCluster>(Self::unlock_cluster)
         .bind::<RenameCluster>(Self::rename_cluster)
         .bind::<SetClusterTag>(|this, action, _, cx| {
@@ -274,6 +286,7 @@ impl Workspace {
             .add::<ToggleKeepWatching>(Self::settings_ok, |ws, a, cx| {
                 ws.check_cluster::<ToggleKeepWatching>(&a.cluster, cx)
             })
+            .add::<DisconnectCluster>(|_, _| true, |ws, a, cx| ws.check_disconnect(&a.cluster, cx))
             .add::<EditAiScope>(Self::settings_ok, |ws, a, cx| {
                 ws.scope_change(a, cx).map(drop)
             })
@@ -431,6 +444,29 @@ impl Workspace {
                 |ws, a, cx| match detail(ws, cx) {
                     Some(d) => d.shell_check::<OpenContainerShell>(Some(&a.container)),
                     None => Err(ActionError::unavailable::<OpenContainerShell>()),
+                },
+            )
+            .when::<ForwardPort>(|ws, cx| {
+                ws.sessions_open_here(cx)
+                    && detail(ws, cx).is_some_and(|d| d.forward_check::<ForwardPort>().is_ok())
+            })
+            .when::<ShowPortForwards>(|ws, _| ws.cluster.is_some())
+            .when::<StartPortForward>(Self::can_start_forward)
+            .when::<StopAllPortForwards>(Self::any_forward_running)
+            .add::<StopPortForward>(
+                |_, _| true,
+                |ws, a, cx| {
+                    ws.has_forward(a.id, cx)
+                        .then_some(())
+                        .ok_or_else(ActionError::unavailable::<StopPortForward>)
+                },
+            )
+            .add::<OpenForwardedPort>(
+                |_, _| true,
+                |ws, a, cx| {
+                    ws.forward_url(a.id, cx)
+                        .map(drop)
+                        .ok_or_else(ActionError::unavailable::<OpenForwardedPort>)
                 },
             )
             // The resource actions act on the selected row, with the row menu's checks.
@@ -887,7 +923,7 @@ impl Workspace {
         }
         self.check_cluster::<ExposeToAi>(&action.cluster, cx)?;
         let cluster = self.cluster_summary(&action.cluster, cx).expect("checked");
-        let Some(server) = cluster.info.server.clone() else {
+        let Some(server) = cluster.info.grant_server() else {
             return Err(ActionError::rejected::<ExposeToAi>(
                 "the context has no API server",
             ));
@@ -934,8 +970,7 @@ impl Workspace {
         let summary = self.cluster_summary(cluster, cx).expect("checked");
         summary
             .info
-            .server
-            .clone()
+            .grant_server()
             .ok_or_else(|| ActionError::rejected::<A>("the context has no API server"))
     }
 
@@ -1119,11 +1154,23 @@ impl Workspace {
     pub(super) fn select_cluster(
         &mut self,
         action: &SelectCluster,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match self.check_cluster::<SelectCluster>(&action.cluster, cx) {
             Ok(()) => {
+                // Only a move that closes the pane: a set's member keeps it open.
+                let leaves = self.cluster.as_deref() != Some(action.cluster.as_str())
+                    && !self.sets.has_member(Some(&action.cluster))
+                    && !self.edit_is_on(&action.cluster, cx);
+                let again = action.clone();
+                if leaves
+                    && self.asks_before_leaving(window, cx, move |ws, window, cx| {
+                        ws.select_cluster(&again, window, cx)
+                    })
+                {
+                    return;
+                }
                 let cluster = action.cluster.clone();
                 // The sidebar's cursor follows the cluster picked, however it was picked.
                 self.sidebar_cursor = Some(cluster.clone());
@@ -1197,7 +1244,7 @@ impl Workspace {
         self.check_cluster::<EditAiScope>(&action.cluster, cx)?;
         let cluster = self.cluster_summary(&action.cluster, cx).expect("checked");
         let model = self.model.read(cx);
-        match (model.ai_scope(cluster), cluster.info.server.clone()) {
+        match (model.ai_scope(cluster), cluster.info.grant_server()) {
             (Some(scope), Some(server)) => Ok((server, scope)),
             _ => Err(ActionError::rejected::<EditAiScope>(
                 "the cluster is not exposed to AI agents",
@@ -1597,7 +1644,24 @@ impl Workspace {
             return;
         }
         match self.view_entry(&action.kind, cx) {
-            Some(entry) => self.open_kind(&entry, window, cx),
+            Some(entry) => {
+                let open_already = match self.sets.running_kind() {
+                    Some(kind) => *kind == entry.id,
+                    None => self
+                        .list
+                        .as_ref()
+                        .is_some_and(|list| *list.read(cx).kind() == entry.id),
+                };
+                let again = action.clone();
+                if !open_already
+                    && self.asks_before_leaving(window, cx, move |ws, window, cx| {
+                        ws.open_view(&again, window, cx)
+                    })
+                {
+                    return;
+                }
+                self.open_kind(&entry, window, cx)
+            }
             None => tracing::warn!("{}", self.check_open_view(action, cx).unwrap_err()),
         }
     }

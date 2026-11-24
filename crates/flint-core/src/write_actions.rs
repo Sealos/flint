@@ -20,9 +20,10 @@ use kube::api::{
 };
 use kube::client::Body;
 use kube::core::Status;
-use kube::{Client, ResourceExt as _};
+use kube::{Client, Resource, ResourceExt as _};
 use serde_json::{Value, json};
 
+use crate::api_path::{self, PathError};
 use crate::cluster::ClusterError;
 use crate::gitops::{self, Identity, ManagedBy};
 use crate::protection::WriteRefusal;
@@ -403,29 +404,30 @@ pub(crate) struct ActionObject {
 }
 
 impl ActionObject {
-    fn api(&self, client: Client) -> Api<DynamicObject> {
-        match &self.namespace {
+    fn api(&self, client: Client) -> Result<Api<DynamicObject>, ActionError> {
+        self.check_path_segments()?;
+        Ok(match &self.namespace {
             Some(namespace) => Api::namespaced_with(client, namespace, &self.resource),
             None => Api::all_with(client, &self.resource),
-        }
+        })
     }
 
-    /// Refuses a name or namespace that would not be exactly one segment of a URL's path.
-    fn check_path_segments(&self) -> Result<(), ActionError> {
-        let namespace_ok = self.namespace.as_deref().is_none_or(is_namespace_name);
-        if namespace_ok && is_object_name(&self.name) {
-            Ok(())
-        } else {
-            Err(ActionError::Unsupported(
-                "the object's name or namespace is not valid".to_owned(),
-            ))
-        }
+    fn check_path_segments(&self) -> Result<(), PathError> {
+        api_path::validate_resource_path(
+            &self.resource,
+            self.namespace.as_deref(),
+            Some(&self.name),
+        )
     }
 
-    /// The URL of a PATCH of this object, or of its `subresource`, once
-    /// [`Self::check_path_segments`] has accepted it.
-    fn patch_url(&self, client: Client, subresource: Option<&str>, dry_run: bool) -> String {
-        let mut url = format!("{}/{}", self.api(client).resource_url(), self.name);
+    /// The URL of a PATCH of this object, or of its `subresource`.
+    fn patch_url(&self, subresource: Option<&str>, dry_run: bool) -> Result<String, ActionError> {
+        self.check_path_segments()?;
+        if let Some(subresource) = subresource {
+            api_path::validate_resource_plural(subresource)?;
+        }
+        let collection = DynamicObject::url_path(&self.resource, self.namespace.as_deref());
+        let mut url = format!("{collection}/{}", self.name);
         if let Some(subresource) = subresource {
             url.push('/');
             url.push_str(subresource);
@@ -435,26 +437,8 @@ impl ActionObject {
         if dry_run {
             url.push_str("&dryRun=All");
         }
-        url
+        Ok(url)
     }
-}
-
-/// Whether `name` is a DNS subdomain, as the name of every kind with a PATCH action here must be.
-pub(crate) fn is_object_name(name: &str) -> bool {
-    name.len() <= 253 && name.split('.').all(is_dns_label)
-}
-
-/// Whether `namespace` is a DNS label, as the API server requires of a namespace.
-pub(crate) fn is_namespace_name(namespace: &str) -> bool {
-    namespace.len() <= 63 && is_dns_label(namespace)
-}
-
-fn is_dns_label(label: &str) -> bool {
-    let alphanumeric = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
-    let bytes = label.as_bytes();
-    bytes.first().is_some_and(|b| alphanumeric(*b))
-        && bytes.last().is_some_and(|b| alphanumeric(*b))
-        && bytes.iter().all(|b| alphanumeric(*b) || *b == b'-')
 }
 
 /// A PATCH body, by the content type it is sent as.
@@ -472,9 +456,8 @@ async fn send_patch(
     body: impl FnOnce() -> PatchBody + Send,
     dry_run: bool,
 ) -> Result<(), ActionError> {
-    object.check_path_segments()?;
+    let url = object.patch_url(subresource, dry_run)?;
     let client = gate.client().await?;
-    let url = object.patch_url(client.clone(), subresource, dry_run);
     let (content_type, body, tested) = match body() {
         PatchBody::Merge(body) => ("application/merge-patch+json", body, false),
         PatchBody::Json(body) => ("application/json-patch+json", body, true),
@@ -568,6 +551,12 @@ impl ActionError {
     }
 }
 
+impl From<PathError> for ActionError {
+    fn from(error: PathError) -> Self {
+        Self::Unsupported(error.to_string())
+    }
+}
+
 /// What may be shown of `error`: text from the server goes through
 /// [`redact::safe_server_error`] whole, before anything shortens it.
 fn error_text(error: kube::Error) -> String {
@@ -608,12 +597,14 @@ pub(crate) async fn delete(
     gate: &mut impl ActionGate,
     object: &ActionObject,
 ) -> Result<(), ActionError> {
+    // Refuse an unsafe name before the gate runs any credential check.
+    object.check_path_segments()?;
     let client = gate.client().await?;
     let params = DeleteParams {
         preconditions: Some(uid_precondition(&object.uid)),
         ..Default::default()
     };
-    timed(object.api(client).delete(&object.name, &params))
+    timed(object.api(client)?.delete(&object.name, &params))
         .await
         .map(drop)
 }
@@ -913,8 +904,7 @@ async fn still_evictable(
     pod: &Pod,
     options: &DrainOptions,
 ) -> Result<bool, BlockedReason> {
-    let api = Api::<Pod>::namespaced(client, &pod.namespace().unwrap_or_default());
-    match timed(api.get_opt(&pod.name_any())).await {
+    match timed(read_pod(client, pod)).await {
         Ok(None) => Ok(false),
         Ok(Some(now)) if now.uid() != pod.uid() => Err(BlockedReason::Changed),
         Ok(Some(now)) => match plan(&now, options) {
@@ -1003,7 +993,11 @@ pub(crate) async fn drain(
         }
     };
     // The list goes by the node's name: it is of the node reviewed only if that still has it.
-    match timed(node.api(client).get(&node.name)).await {
+    let recheck = async {
+        let api = node.api(client)?;
+        timed(api.get(&node.name)).await
+    };
+    match recheck.await {
         Ok(now) if now.metadata.uid.as_deref() == Some(node.uid.as_str()) => {}
         Ok(_) => {
             report.stopped = Some(WriteError::Replaced);
@@ -1117,8 +1111,7 @@ fn is_disruption_budget(error: &kube::Error) -> bool {
 
 /// Whether `pod` is confirmed gone: no pod has its name, or another one does.
 async fn is_gone(client: Client, pod: &Pod) -> bool {
-    let api = Api::<Pod>::namespaced(client, &pod.namespace().unwrap_or_default());
-    match timed(api.get_opt(&pod.name_any())).await {
+    match timed(read_pod(client, pod)).await {
         Ok(Some(now)) => now.uid() != pod.uid(),
         Ok(None) => true,
         Err(_) => false,
@@ -1130,8 +1123,22 @@ fn sorted_names(pods: &[Pod]) -> Vec<PodName> {
     names.into_iter().collect()
 }
 
+fn pod_api(client: Client, pod: &Pod) -> Result<(Api<Pod>, String), kube::Error> {
+    let namespace = pod.metadata.namespace.as_deref().unwrap_or_default();
+    let name = pod.name_any();
+    api_path::validate_names(Some(namespace), Some(&name)).map_err(|error| {
+        kube::Error::BuildRequest(kube::core::request::Error::Validation(error.to_string()))
+    })?;
+    Ok((Api::namespaced(client, namespace), name))
+}
+
+async fn read_pod(client: Client, pod: &Pod) -> Result<Option<Pod>, kube::Error> {
+    let (api, name) = pod_api(client, pod)?;
+    api.get_opt(&name).await
+}
+
 async fn evict(client: Client, pod: &Pod) -> Result<(), kube::Error> {
-    let namespace = pod.namespace().unwrap_or_default();
+    let (api, name) = pod_api(client, pod)?;
     let params = EvictParams {
         delete_options: Some(DeleteParams {
             preconditions: pod.uid().map(|uid| uid_precondition(&uid)),
@@ -1139,10 +1146,7 @@ async fn evict(client: Client, pod: &Pod) -> Result<(), kube::Error> {
         }),
         ..Default::default()
     };
-    Api::<Pod>::namespaced(client, &namespace)
-        .evict(&pod.name_any(), &params)
-        .await
-        .map(drop)
+    api.evict(&name, &params).await.map(drop)
 }
 
 /// Waits for `pods` to go, or for their name to be someone else's. Returns those still there,
@@ -1172,8 +1176,7 @@ async fn wait_until_gone(
             }
             let read = tokio::time::timeout(budget, async {
                 let client = gate.client().await?;
-                let api = Api::<Pod>::namespaced(client, &pod.namespace().unwrap_or_default());
-                Ok::<_, ActionError>(api.get_opt(&pod.name_any()).await)
+                Ok::<_, ActionError>(read_pod(client, &pod).await)
             })
             .await;
             match read {
@@ -1450,6 +1453,76 @@ mod tests {
         assert_eq!(seen[0].body["preconditions"]["uid"], "uid-web");
     }
 
+    #[tokio::test]
+    async fn api_path_allows_rbac_names_in_reads_and_deletes() {
+        let name = "system:controller:job-controller";
+        let resource = resource(
+            "rbac.authorization.k8s.io",
+            "v1",
+            "ClusterRole",
+            "clusterroles",
+        );
+        let kind = KindInfo {
+            namespaced: false,
+            ..kind_info(resource.clone())
+        };
+        let object = ActionObject {
+            resource,
+            namespace: None,
+            name: name.into(),
+            uid: "uid-role".into(),
+        };
+        let (client, log) = fake(Arc::new(move |seen| {
+            if seen.method == "GET" {
+                return (
+                    200,
+                    json!({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
+                           "metadata": {"name": name, "uid": "uid-role"}}),
+                );
+            }
+            ok(seen)
+        }));
+
+        let role = crate::read::get(&client, &kind, None, name).await.unwrap();
+        assert_eq!(role.name_any(), name);
+        delete(&mut writes(client, open()), &object).await.unwrap();
+
+        let seen = log.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].method, "GET");
+        assert_eq!(seen[1].method, "DELETE");
+        let path = format!("/apis/rbac.authorization.k8s.io/v1/clusterroles/{name}");
+        assert_eq!(seen[0].path, path);
+        assert_eq!(seen[1].path, path);
+    }
+
+    #[tokio::test]
+    async fn api_path_rejects_hostile_deletes_before_sending_a_request() {
+        let (client, log) = fake(Arc::new(ok));
+        let mut gate = writes(client, open());
+        for name in ["a/b", "..", "x?y", "x#y", "%2F"] {
+            let mut object = deployment();
+            object.name = name.to_owned();
+            assert!(matches!(
+                delete(&mut gate, &object).await,
+                Err(ActionError::Unsupported(_))
+            ));
+        }
+        let mut object = deployment();
+        object.namespace = Some("demo/deployments".into());
+        assert!(matches!(
+            delete(&mut gate, &object).await,
+            Err(ActionError::Unsupported(_))
+        ));
+        object.namespace = Some("demo".into());
+        object.resource.plural = "Deployments".into();
+        assert!(matches!(
+            delete(&mut gate, &object).await,
+            Err(ActionError::Unsupported(_))
+        ));
+        assert!(log.lock().unwrap().is_empty());
+    }
+
     // covers UP-52, UP-53: a conflict is said once, for a new review: nothing retries.
     #[tokio::test]
     async fn a_conflict_comes_back_without_a_retry() {
@@ -1654,15 +1727,7 @@ mod tests {
     async fn a_patch_needs_plain_path_segments() {
         let (client, log) = fake(Arc::new(ok));
         let mut gated = writes(client, open());
-        let names = [
-            "web#x",
-            "web?dryRun=All",
-            "web/x",
-            "web%23",
-            "..",
-            "Web",
-            "",
-        ];
+        let names = ["web#x", "web?dryRun=All", "web/x", "web%23", "..", ""];
         let objects = names
             .iter()
             .map(|name| ActionObject {

@@ -282,7 +282,7 @@ fn differing_parts(names: &[&str]) -> Vec<String> {
 /// What a chip's tooltip says: the full context and its API server.
 pub fn chip_tooltip(cluster: &TabCluster) -> String {
     let server = match &cluster.server {
-        Some(server) => flint_core::redact::server_url(server),
+        Some(server) => flint_core::redact::server_origin(server),
         None => "no API server".to_owned(),
     };
     format!("Context {}\nAPI server {server}", cluster.context)
@@ -339,6 +339,7 @@ mod tests {
             generation: 1,
             definition: 1,
             endpoint: 1,
+            write_epoch: 0,
             confirmed,
             provisional: !confirmed,
             paused: false,
@@ -488,6 +489,13 @@ mod tests {
         assert_ne!(same[2], same[3]);
         assert_eq!(
             chip_tooltip(&TabCluster::new("prod", Some("https://u:p@10.0.0.1:6443"))),
+            "Context prod\nAPI server https://10.0.0.1:6443"
+        );
+        assert_eq!(
+            chip_tooltip(&TabCluster::new(
+                "prod",
+                Some("https://10.0.0.1:6443/k8s/c-1?x=1")
+            )),
             "Context prod\nAPI server https://10.0.0.1:6443"
         );
     }

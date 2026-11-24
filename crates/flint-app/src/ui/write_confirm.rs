@@ -216,7 +216,7 @@ pub(in crate::ui) fn target_lines(target: &WriteTarget) -> Vec<String> {
     let server = target
         .server
         .as_deref()
-        .map_or("no server".to_owned(), flint_core::redact::server_url);
+        .map_or("no server".to_owned(), flint_core::redact::server_origin);
     let mut lines = vec![
         format!("Context: {}", single_line(&target.cluster)),
         format!("Server: {}", single_line(&server)),
@@ -351,6 +351,16 @@ mod tests {
             uid: Some("uid-1".to_owned()),
             resource_version: Some("10".to_owned()),
         }
+    }
+
+    #[test]
+    fn the_target_shows_only_the_server_origin() {
+        let on = WriteTarget {
+            server: Some("https://proxy.example:6443/k8s/clusters/token-abc?x=1".to_owned()),
+            ..target()
+        };
+        let lines = super::target_lines(&on);
+        assert_eq!(lines[1], "Server: https://proxy.example:6443");
     }
 
     // covers UP-55: two clusters that share a short name get different titles.

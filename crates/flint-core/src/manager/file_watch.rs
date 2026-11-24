@@ -150,7 +150,10 @@ impl Classes {
             let gone = event.paths.iter().filter(|p| watched.dirs.contains(*p));
             lock(&self.lost).extend(gone.cloned());
         }
-        let changed = classify(&event.paths, dir_left, &watched);
+        let mut changed = classify(&event.paths, dir_left, &watched);
+        changed.kubeconfig_rewritten = changed.rearm
+            || (changed.kubeconfig
+                && !matches!(event.kind, EventKind::Modify(ModifyKind::Metadata(_))));
         (changed.kubeconfig || changed.settings || changed.activity).then_some(changed)
     }
 }
@@ -374,6 +377,7 @@ pub(super) fn classify(paths: &[PathBuf], dir_left: bool, watched: &Watched) -> 
         settings: any(&watched.settings),
         activity: any(&watched.activity),
         rearm,
+        kubeconfig_rewritten: false,
     }
 }
 
@@ -445,6 +449,7 @@ async fn debounce(mut raw: mpsc::UnboundedReceiver<Changed>, out: mpsc::Unbounde
             changed.settings |= more.settings;
             changed.activity |= more.activity;
             changed.rearm |= more.rearm;
+            changed.kubeconfig_rewritten |= more.kubeconfig_rewritten;
         }
         if out.send(Internal::FilesChanged(changed)).is_err() {
             break;

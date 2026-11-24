@@ -4,12 +4,14 @@
 
 use std::sync::Arc;
 
+use flint_core::metrics::{ContainerMetrics, Cpu, Memory, PodMetrics, Usage};
 use flint_core::settings::{ListSort, STATE_FILE};
 use flint_core::{Cell, Column, ColumnRole, ColumnType, KindId, KindSnapshot, Row, SyncState};
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
 
+use super::list_usage::UsageSource;
 use super::support_tests::{TestWorkspace, WAIT, objects, open_workspace, pods};
 use super::ui_state::UiState;
 use super::view_state::SortState;
@@ -60,6 +62,191 @@ async fn wait_for_saved(cx: &mut TestAppContext, t: &TestWorkspace, text: &'stat
         std::fs::read_to_string(&path).is_ok_and(|s| s.contains(text))
     })
     .await;
+}
+
+/// Usage for the pods of [`PODS`]: `web` and `db` report, `api` does not.
+fn pod_usage() -> UsageSource {
+    let sample = |millis: u64| {
+        PodMetrics {
+            namespace: String::new(),
+            name: String::new(),
+            // After the test rows' creation time.
+            timestamp: Some(jiff::Timestamp::from_second(1_000).unwrap()),
+            window: Some(jiff::SignedDuration::from_secs(15)),
+            containers: vec![ContainerMetrics {
+                name: "app".into(),
+                usage: Usage {
+                    cpu: Cpu::from_nanos(millis * 1_000_000),
+                    memory: Memory::from_bytes(0),
+                },
+            }],
+        }
+        .sample()
+    };
+    UsageSource::Pods(Arc::new(
+        [
+            (("demo".to_owned(), "web".to_owned()), sample(5)),
+            (("data".to_owned(), "db".to_owned()), sample(40)),
+        ]
+        .into_iter()
+        .collect(),
+    ))
+}
+
+fn cpu_cells(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<(String, Option<String>)> {
+    let list = t.list(cx).expect("a list is open");
+    list.read_with(cx, |list, _| {
+        let rows = list.view_state().rows;
+        rows.into_iter()
+            .map(|row| {
+                let cpu = row
+                    .cells_by_column
+                    .into_iter()
+                    .find(|(column, _)| column == "CPU")
+                    .map(|(_, cell)| cell);
+                (row.name, cpu)
+            })
+            .collect()
+    })
+}
+
+/// Waits until the rows drawn have a CPU column. The core computes them on its own thread, so
+/// `run_until_parked` does not wait for them.
+async fn wait_for_cpu_column(cx: &mut TestAppContext, t: &TestWorkspace) {
+    let list = t.list(cx).expect("a list is open");
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        let rows = list.read(cx).view_state().rows;
+        !rows.is_empty()
+            && rows.iter().all(|row| {
+                row.cells_by_column
+                    .iter()
+                    .any(|(column, _)| column == "CPU")
+            })
+    })
+    .await;
+}
+
+#[gpui_kit::test]
+async fn usage_columns_show_sort_and_keep_unknown_last(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, PODS).await;
+    let list = t.list(cx).expect("a list is open");
+    list.update(cx, |list, cx| list.pin_usage_source(pod_usage(), cx));
+    wait_for_cpu_column(cx, &t).await;
+
+    let unsorted = cpu_cells(cx, &t);
+    let cell = |name: &str| {
+        unsorted
+            .iter()
+            .find(|(row, _)| row == name)
+            .and_then(|(_, cpu)| cpu.clone())
+    };
+    assert_eq!(cell("web").as_deref(), Some("5m"));
+    assert_eq!(cell("api").as_deref(), Some("unknown"));
+
+    t.click(cx, "sort-CPU");
+    expect_rows(
+        cx,
+        &t,
+        (
+            sorted("CPU", false),
+            vec!["web".into(), "db".into(), "api".into()],
+        ),
+    )
+    .await;
+    t.click(cx, "sort-CPU");
+    expect_rows(
+        cx,
+        &t,
+        (
+            sorted("CPU", true),
+            vec!["db".into(), "web".into(), "api".into()],
+        ),
+    )
+    .await;
+}
+
+#[gpui_kit::test]
+async fn without_metrics_server_the_columns_hide_and_a_hint_shows(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, PODS).await;
+    let list = t.list(cx).expect("a list is open");
+    list.update(cx, |list, cx| list.pin_usage_source(pod_usage(), cx));
+    wait_for_cpu_column(cx, &t).await;
+
+    list.update(cx, |list, cx| {
+        list.pin_usage_source(UsageSource::NotInstalled, cx);
+    });
+    cx.run_until_parked();
+    assert!(cpu_cells(cx, &t).iter().all(|(_, cpu)| cpu.is_none()));
+    let hinted = list.read_with(cx, |list, _| {
+        list.view_state()
+            .banners
+            .iter()
+            .any(|banner| banner.id == "list-usage-hint")
+    });
+    assert!(hinted);
+}
+
+#[gpui_kit::test]
+async fn with_no_feed_the_toolbar_says_so_and_rows_keep_their_room(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, PODS).await;
+    let list = t.list(cx).expect("a list is open");
+    list.update(cx, |list, cx| {
+        list.pin_usage_source(UsageSource::NoFeed, cx);
+    });
+    cx.run_until_parked();
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert!(t.find(cx, "list-usage-no-feed").is_some());
+    assert!(t.find(cx, "list-usage-hint").is_none());
+    assert!(cpu_cells(cx, &t).iter().all(|(_, cpu)| cpu.is_none()));
+
+    list.update(cx, |list, cx| {
+        list.pin_usage_source(UsageSource::NotInstalled, cx);
+    });
+    cx.run_until_parked();
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert!(t.find(cx, "list-usage-no-feed").is_none());
+    assert!(t.find(cx, "list-usage-hint").is_some());
+}
+
+#[gpui_kit::test]
+async fn a_404_during_a_sort_hides_the_old_readings_at_once(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, PODS).await;
+    let list = t.list(cx).expect("a list is open");
+    list.update(cx, |list, cx| list.pin_usage_source(pod_usage(), cx));
+    wait_for_cpu_column(cx, &t).await;
+
+    // A sort is computing when the poll finds the API gone.
+    let permits = list.update(cx, |list, _| list.hold_computes());
+    t.click(cx, "sort-CPU");
+    cx.run_until_parked();
+    list.update(cx, |list, cx| {
+        list.pin_usage_source(UsageSource::NotInstalled, cx);
+    });
+    assert!(
+        cpu_cells(cx, &t).iter().all(|(_, cpu)| cpu.is_none()),
+        "the hint must not show beside old readings"
+    );
+
+    // Neither the sort that was running nor the one after it brings them back.
+    let done = list.read_with(cx, |list, _| list.computes_done());
+    permits.send(()).await.unwrap();
+    permits.send(()).await.unwrap();
+    let finished = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        finished.read(cx).computes_done() >= done + 2
+    })
+    .await;
+    assert!(cpu_cells(cx, &t).iter().all(|(_, cpu)| cpu.is_none()));
 }
 
 // covers UP-21

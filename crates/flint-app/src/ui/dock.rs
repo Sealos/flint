@@ -46,6 +46,7 @@ use super::helm_view::HelmView;
 use super::log_view::{LogRequest, LogView};
 use super::menu_fit;
 use super::menu_record;
+use super::port_forward_view::PortForwardsView;
 use super::registry::{
     self, ActionError, ActivateTab, Bind, CloseActiveTab, CloseTab, NextTab, OnView, PrevTab,
     ReconnectLogs, RestartShell, ShowTabList, ToggleDock,
@@ -96,6 +97,8 @@ pub enum TabKey {
     Activity(ClusterId),
     /// An object compared across clusters, opened from this context: no session.
     Compare(ClusterId, CompareTarget),
+    /// A cluster's port-forward panel: one tab per cluster.
+    Forwards(ClusterId),
     /// A cluster's Helm releases: one tab per cluster and definition.
     Helm(ClusterId),
 }
@@ -106,9 +109,10 @@ impl TabKey {
         match self {
             TabKey::Logs(request) => &request.cluster,
             TabKey::Shell(request) => &request.cluster,
-            TabKey::Activity(cluster) | TabKey::Compare(cluster, _) | TabKey::Helm(cluster) => {
-                cluster
-            }
+            TabKey::Activity(cluster)
+            | TabKey::Compare(cluster, _)
+            | TabKey::Forwards(cluster)
+            | TabKey::Helm(cluster) => cluster,
         }
     }
 }
@@ -139,6 +143,7 @@ pub enum DockTab {
     Shell(Entity<TerminalView>),
     Activity(Entity<ActivityView>),
     Compare(Entity<CompareView>),
+    Forwards(Entity<PortForwardsView>),
     Helm(Entity<HelmView>),
 }
 
@@ -149,6 +154,7 @@ impl DockTab {
             DockTab::Shell(view) => view.read(cx),
             DockTab::Activity(view) => view.read(cx),
             DockTab::Compare(view) => view.read(cx),
+            DockTab::Forwards(view) => view.read(cx),
             DockTab::Helm(view) => view.read(cx),
         }
     }
@@ -159,6 +165,7 @@ impl DockTab {
             DockTab::Shell(view) => view.clone().into(),
             DockTab::Activity(view) => view.clone().into(),
             DockTab::Compare(view) => view.clone().into(),
+            DockTab::Forwards(view) => view.clone().into(),
             DockTab::Helm(view) => view.clone().into(),
         }
     }
@@ -184,6 +191,7 @@ fn observe(tab: &DockTab, id: u64, cx: &mut Context<Dock>) -> Subscription {
         DockTab::Shell(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
         DockTab::Activity(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
         DockTab::Compare(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
+        DockTab::Forwards(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
         DockTab::Helm(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
     }
 }
@@ -287,10 +295,24 @@ impl Dock {
     pub fn active_log(&self) -> Option<&Entity<LogView>> {
         match self.active_tab().filter(|_| self.visible)? {
             DockTab::Logs(view) => Some(view),
-            DockTab::Shell(_) | DockTab::Activity(_) | DockTab::Compare(_) | DockTab::Helm(_) => {
-                None
-            }
+            _ => None,
         }
+    }
+
+    /// The forwards tab shown, if the dock is visible and showing one.
+    pub fn active_forwards(&self) -> Option<&Entity<PortForwardsView>> {
+        match self.active_tab().filter(|_| self.visible)? {
+            DockTab::Forwards(view) => Some(view),
+            _ => None,
+        }
+    }
+
+    /// Every forwards tab's view, shown or not.
+    pub fn forward_views(&self) -> impl Iterator<Item = &Entity<PortForwardsView>> {
+        self.tabs.iter().filter_map(|t| match &t.tab {
+            DockTab::Forwards(view) => Some(view),
+            _ => None,
+        })
     }
 
     /// The shell tab shown, if the dock is visible and showing one: where terminal actions go.
@@ -298,9 +320,7 @@ impl Dock {
     pub fn terminals(&self) -> impl Iterator<Item = &Entity<TerminalView>> {
         self.tabs.iter().filter_map(|t| match &t.tab {
             DockTab::Shell(view) => Some(view),
-            DockTab::Logs(_) | DockTab::Activity(_) | DockTab::Compare(_) | DockTab::Helm(_) => {
-                None
-            }
+            _ => None,
         })
     }
 
@@ -308,9 +328,7 @@ impl Dock {
     pub fn log_views(&self) -> impl Iterator<Item = &Entity<LogView>> {
         self.tabs.iter().filter_map(|t| match &t.tab {
             DockTab::Logs(view) => Some(view),
-            DockTab::Shell(_) | DockTab::Activity(_) | DockTab::Compare(_) | DockTab::Helm(_) => {
-                None
-            }
+            _ => None,
         })
     }
 
@@ -333,23 +351,45 @@ impl Dock {
     pub fn active_terminal(&self) -> Option<&Entity<TerminalView>> {
         match self.active_tab().filter(|_| self.visible)? {
             DockTab::Shell(view) => Some(view),
-            DockTab::Logs(_) | DockTab::Activity(_) | DockTab::Compare(_) | DockTab::Helm(_) => {
-                None
-            }
+            _ => None,
         }
     }
 
     /// The sessions closing the dock would end: its shells and following log tabs still at
     /// work, shown or not ([`dock_model::ends_a_session`]).
     pub fn live_sessions(&self, cx: &App) -> LiveSessions {
+        self.live_sessions_where(|_| true, cx)
+    }
+
+    /// [`Self::live_sessions`] of the tabs on `context`.
+    pub fn live_sessions_on(&self, context: &str, cx: &App) -> LiveSessions {
+        self.live_sessions_where(|tab| tab.cluster.context == context, cx)
+    }
+
+    /// Ends the shells on `context`, saying why in each. Their output stays in the tab.
+    pub fn end_shells_on(&mut self, context: &str, why: &str, cx: &mut Context<Self>) {
+        for tab in self.tabs.iter().filter(|t| t.cluster.context == context) {
+            if let DockTab::Shell(view) = &tab.tab
+                && view.read(cx).is_live()
+            {
+                view.update(cx, |view, cx| view.end(why.to_owned(), cx));
+            }
+        }
+        cx.notify();
+    }
+
+    fn live_sessions_where(&self, of: impl Fn(&Tab) -> bool, cx: &App) -> LiveSessions {
         let mut live = LiveSessions::default();
-        for t in &self.tabs {
+        for t in self.tabs.iter().filter(|t| of(t)) {
             let item = t.tab.item(cx);
             let (reads_to_end, count) = match item.tab_key() {
                 TabKey::Shell(_) => (false, &mut live.shells),
                 TabKey::Logs(request) => (request.previous, &mut live.logs),
-                // Runs no session: closing it ends nothing.
-                TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Helm(_) => continue,
+                // Runs no session: closing it ends nothing. Forwards say so in their tooltip.
+                TabKey::Activity(_)
+                | TabKey::Compare(..)
+                | TabKey::Forwards(_)
+                | TabKey::Helm(_) => continue,
             };
             if dock_model::ends_a_session(item.tab_status(), reads_to_end) {
                 *count += 1;
@@ -871,7 +911,7 @@ impl Dock {
         let label = dock_model::full_title(&title, &tab.cluster);
         let mut tooltip = item.tab_tooltip().to_string();
         if let Some(server) = &tab.cluster.server {
-            tooltip.push_str(&format!(" ({})", flint_core::redact::server_url(server)));
+            tooltip.push_str(&format!(" ({})", flint_core::redact::server_origin(server)));
         }
         if tab.repointed {
             tooltip.push_str("\nIts context now points at a different API server.");
