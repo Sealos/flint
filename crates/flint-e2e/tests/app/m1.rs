@@ -45,9 +45,19 @@ fn up_20_browse_pods_with_live_updates() -> Result<()> {
     let fake = cluster.fake_server().expect("a fake server");
     let pods = fake.gvr("pods");
     let state = open_live(&app, "pods", 17)?;
-    assert_eq!(
-        state["list"]["columns"],
-        json!(["Name", "Namespace", "Ready", "Status", "Restarts", "Age"])
+    // The CPU and Memory metrics columns arrive once metrics load, so they may
+    // or may not be present yet; only the fixed columns are asserted.
+    let columns = state["list"]["columns"].as_array().expect("columns");
+    let fixed = ["Name", "Namespace", "Ready", "Status", "Restarts", "Age"];
+    assert!(
+        columns.len() >= fixed.len() && columns[..fixed.len()] == fixed.map(|c| json!(c)),
+        "unexpected pod columns: {columns:?}"
+    );
+    assert!(
+        columns[fixed.len()..]
+            .iter()
+            .all(|c| c == "CPU" || c == "Memory"),
+        "unexpected pod columns: {columns:?}"
     );
     assert_eq!(
         state["header"]["breadcrumb"],
