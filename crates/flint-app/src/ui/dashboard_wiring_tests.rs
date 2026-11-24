@@ -1033,6 +1033,29 @@ async fn connecting_from_the_sidebar_keeps_its_focus(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+async fn opening_the_overview_focuses_the_panel_not_a_link(cx: &mut TestAppContext) {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::Focusable as _;
+    use gpui_kit::test::TestWindowExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let view = open_held(cx, &t).await;
+    // A warning row makes the overview hold a link, so the check below tells the two apart.
+    let server = alpha_server(cx, &t);
+    show_warning_row(cx, &view, server);
+    cx.run_until_parked();
+    let overview = view.read_with(cx, |view, cx| view.focus_handle(cx));
+    cx.update_window(t.window, move |_, window, cx| {
+        window.render_frame(cx);
+        assert!(overview.is_focused(window), "the overview itself has focus");
+        let on_link = window.focused(cx).is_some_and(|h| h != overview);
+        assert!(!on_link, "no link has focus");
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 async fn tab_reaches_the_overview_and_a_lost_focus_returns_to_it(cx: &mut TestAppContext) {
     use gpui_kit::AppContext as _;
     use gpui_kit::Focusable as _;

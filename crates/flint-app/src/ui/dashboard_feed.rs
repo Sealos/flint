@@ -53,7 +53,7 @@ pub type ProblemLists = HashMap<ProblemCategory, Vec<ProblemList>>;
 pub(in crate::ui) struct FeedId(Arc<str>);
 
 impl FeedId {
-    fn of(telemetry: &ClusterTelemetry) -> Self {
+    pub(in crate::ui) fn of(telemetry: &ClusterTelemetry) -> Self {
         Self(Arc::clone(&telemetry.snapshot.cluster))
     }
 
@@ -592,7 +592,7 @@ fn side_objects<T>(
 }
 
 /// The objects each tile counts.
-fn problem_lists(telemetry: &ClusterTelemetry, now: Timestamp) -> ProblemLists {
+pub(super) fn problem_lists(telemetry: &ClusterTelemetry, now: Timestamp) -> ProblemLists {
     let reads = &telemetry.reads;
     let warnings = side_objects(
         &reads.warning_events,

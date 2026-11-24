@@ -5,6 +5,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
+use unicode_normalization::UnicodeNormalization as _;
+
 use crate::kubeconfig::ContextInfo;
 
 impl ContextInfo {
@@ -304,7 +306,8 @@ const MIN_CUSTOM_NAME_CHARS: usize = 4;
 
 /// The start of `label` that stays visible at the narrowest width, in comparable form.
 fn narrow_key(label: &str) -> String {
-    cluster_name_key(&label.chars().take(NARROW_NAME_CHARS).collect::<String>())
+    // Composed first, so a combining mark does not use up the visible characters.
+    cluster_name_key(&label.nfc().take(NARROW_NAME_CHARS).collect::<String>())
 }
 
 /// The word of `full` from where it stops matching the closest of `rivals`. A difference inside a
@@ -554,9 +557,10 @@ pub fn clean_custom_name(name: &str) -> Option<String> {
 /// The form in which two cluster names count as the same name. Only for comparing, never shown
 /// or saved.
 ///
-/// Folds case, treats any run of [`CUSTOM_NAME_PUNCTUATION`] as one separator, folds fullwidth
-/// Latin letters and digits, and maps common Cyrillic and Greek look-alike letters to Latin. Other
-/// non-Latin letters stay as they are, so names in those scripts remain distinct.
+/// Composes Unicode (NFC), folds case, treats any run of [`CUSTOM_NAME_PUNCTUATION`] as one
+/// separator, folds fullwidth Latin letters and digits, and maps common Cyrillic and Greek
+/// look-alike letters to Latin. Other non-Latin letters stay as they are, so names in those
+/// scripts remain distinct.
 ///
 /// Case is folded before the look-alike map, so each letter has one Latin form in both cases.
 /// That form follows the capital where the two cases resemble different Latin letters: Greek
@@ -564,7 +568,7 @@ pub fn clean_custom_name(name: &str) -> Option<String> {
 pub fn cluster_name_key(name: &str) -> String {
     let mut key = String::with_capacity(name.len());
     let mut in_separator = false;
-    for c in name.chars() {
+    for c in name.nfc() {
         if CUSTOM_NAME_PUNCTUATION.contains(c) {
             if !in_separator {
                 key.push('-');
@@ -1047,6 +1051,23 @@ mod tests {
         for palochka in ["c\u{4cf}uster", "c\u{4c0}uster"] {
             assert_eq!(cluster_name_key(palochka), cluster_name_key("cluster"));
         }
+    }
+
+    // The same letters composed and decomposed draw alike, so their labels must differ.
+    #[test]
+    fn composed_and_decomposed_names_get_distinct_labels() {
+        let (composed, decomposed) = ("prod-\u{e9}", "prod-e\u{301}");
+        assert_eq!(cluster_name_key(composed), cluster_name_key(decomposed));
+        let names = ClusterNames::new([composed, decomposed], &BTreeMap::new());
+        for label in [
+            ClusterNames::of,
+            ClusterNames::with_real,
+            ClusterNames::exact,
+        ] {
+            let (a, b) = (label(&names, composed), label(&names, decomposed));
+            assert_ne!(cluster_name_key(&a), cluster_name_key(&b), "{a} / {b}");
+        }
+        assert!(names.is_known(composed) && names.is_known(decomposed));
     }
 
     // covers UP-01: only look-alike letters fold, so other scripts stay usable and distinct.

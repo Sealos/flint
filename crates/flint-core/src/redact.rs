@@ -387,6 +387,17 @@ pub fn server_url(url: &str) -> String {
     out
 }
 
+/// [`server_url`] without its path: `scheme://host[:port]`, for a URL that is no longer the one
+/// in use, whose path nothing on screen needs. Never for comparing pins.
+pub fn server_origin(url: &str) -> String {
+    let shown = server_url(url);
+    let host_at = shown.find("://").map_or(0, |at| at + "://".len());
+    match shown[host_at..].find('/') {
+        Some(path_at) => shown[..host_at + path_at].to_owned(),
+        None => shown,
+    }
+}
+
 /// What may be shown of an exec auth plugin's command: the program's file name (`aws`), never
 /// its directory (which can name the user's home), arguments or environment. kubeconfig's
 /// `command` is one program path, but it may have been written with arguments after it, and a
@@ -806,6 +817,21 @@ mod tests {
             "",
         ] {
             assert_eq!(server_url(url), HIDDEN_SERVER_URL, "{url}");
+        }
+    }
+
+    #[test]
+    fn server_origins_keep_scheme_host_and_port_only() {
+        for (url, shown) in [
+            ("https://127.0.0.1:6443", "https://127.0.0.1:6443"),
+            (
+                "https://admin:hunter2@api.example.com:6443/k8s/clusters/c-1?token=x#y",
+                "https://api.example.com:6443",
+            ),
+            ("https://[::1]:6443/a/b", "https://[::1]:6443"),
+            ("https://u:p/x@host", HIDDEN_SERVER_URL),
+        ] {
+            assert_eq!(server_origin(url), shown, "{url}");
         }
     }
 

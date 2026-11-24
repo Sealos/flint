@@ -427,7 +427,10 @@ impl DetailView {
     /// Whether [`Self::shell_check`] refuses because the cluster is protected: the decision the
     /// menu and captions shorten their text on.
     pub(in crate::ui) fn shell_protected(&self) -> bool {
-        !self.gone && self.protected && self.subject != Subject::Other
+        !self.gone
+            && self.protected
+            && self.row_writes_paused.is_none()
+            && self.subject != Subject::Other
     }
 
     /// Whether [`OpenShell`] (no container) or [`OpenContainerShell`] (a container) can be
@@ -442,6 +445,12 @@ impl DetailView {
                 "{} was deleted",
                 self.object.name
             )));
+        }
+        // Before protection: no unlock would allow a shell while this holds.
+        if self.subject != Subject::Other
+            && let Some(why) = &self.row_writes_paused
+        {
+            return Err(ActionError::rejected::<A>(why.clone()));
         }
         if self.shell_protected() {
             return Err(ActionError::rejected::<A>(protected_reason(

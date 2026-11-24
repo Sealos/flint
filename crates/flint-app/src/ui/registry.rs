@@ -45,9 +45,10 @@ use super::compare::COMPARE_VIEW;
 pub use super::compare::{
     CompareObject, OpenCompare, RefreshCompare, ToggleCompareSame, ToggleCompareVolatile,
 };
+pub use super::dashboard::set::{OpenSetMember, OpenSetProblem};
 use super::list::combined::{
-    SelectCombinedRow, SortCombined, ToggleClusterFilter, ToggleClusterGroup, ToggleCombinedWide,
-    ToggleGroupByCluster,
+    SelectCombinedRow, ShowAllCombinedRows, SortCombined, ToggleClusterFilter, ToggleClusterGroup,
+    ToggleCombinedWide, ToggleGroupByCluster,
 };
 
 actions!(
@@ -600,7 +601,11 @@ actions!(
         /// Run the clusters chosen in the sidebar as a set and open their combined list.
         OpenPickedClusters,
         /// Stop the running set and close its combined list.
-        CloseClusterSet
+        CloseClusterSet,
+        /// Show a card per cluster of the running set, worst first.
+        OpenClusterSetDashboard,
+        /// Go back from the set's dashboard to its combined list.
+        ShowClusterSetList
     ]
 );
 
@@ -1873,6 +1878,25 @@ const COMPARE_OBJECT: &[Arg] = &[
     arg("name", "the object's name", ArgKind::Text),
 ];
 const SET_NAME: &[Arg] = &[arg("name", "the cluster set's name", ArgKind::Text)];
+const SET_PROBLEM: &[Arg] = &[
+    arg(
+        "category",
+        "which problem count",
+        ArgKind::Choice(&super::dashboard::CATEGORY_NAMES),
+    ),
+    Arg {
+        name: "cluster",
+        description: "the member; every member when left out",
+        required: false,
+        kind: ArgKind::Cluster,
+    },
+    Arg {
+        name: "kind",
+        description: "which kind of short workload",
+        required: false,
+        kind: ArgKind::Choice(&super::dashboard::SHORT_WORKLOAD_KINDS),
+    },
+];
 const COMBINED_ROW: &[Arg] = &[
     arg("cluster", "kubeconfig context name", ArgKind::Cluster),
     arg("uid", "the object's uid", ArgKind::Text),
@@ -2611,6 +2635,30 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Stop the running set and close its combined list.",
         )
         .of(C::Cluster, S::ClusterSets),
+        Spec::unit::<OpenClusterSetDashboard>(
+            "Open Cluster Set Dashboard",
+            "Show a card per cluster of the running set, worst first.",
+        )
+        .of(C::Cluster, S::ClusterSets),
+        Spec::unit::<ShowClusterSetList>(
+            "Show Cluster Set List",
+            "Go back from the set's dashboard to its combined list.",
+        )
+        .of(C::Cluster, S::ClusterSets),
+        Spec::with_args::<OpenSetMember>(
+            "Open Set Member…",
+            "Open the combined list filtered to one member.",
+            CLUSTER,
+        )
+        .of(C::Cluster, S::ClusterSets)
+        .hidden(),
+        Spec::with_args::<OpenSetProblem>(
+            "Open Set Problem…",
+            "Open the combined list filtered to what a dashboard count counted.",
+            SET_PROBLEM,
+        )
+        .of(C::Cluster, S::ClusterSets)
+        .hidden(),
         // The combined list.
         Spec::with_args::<SelectCombinedRow>(
             "Select Combined Row…",
@@ -2648,6 +2696,11 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<ToggleCombinedWide>(
             "Toggle Wide Combined Columns",
             "Show or hide the combined list's extra columns.",
+        )
+        .of(C::List, S::CombinedList),
+        Spec::unit::<ShowAllCombinedRows>(
+            "Show All Combined Rows",
+            "Show every row again after a dashboard narrowed the combined list.",
         )
         .of(C::List, S::CombinedList),
         // Detail pane.

@@ -594,15 +594,19 @@ fn up_84_an_unreachable_member_does_not_block_the_others() -> Result<()> {
     connect(&app, A)?;
     open_together(&app, &[A, B])?;
 
+    // A's list loads independently of B's failure, so wait for both rather than
+    // reading A's rows at the instant B's note appears.
     let state = until(
-        "a failure or reconnecting note on b after an attempt",
+        "a failure or reconnecting note on b after an attempt, and a's pods shown",
         || {
             let attempted = !b.arrivals().is_empty();
             (attempted, app.state().unwrap_or(Value::Null))
         },
         |(attempted, state)| {
             let note = text(&member(state, B)["note"]);
-            *attempted && (note.starts_with("Failed") || note.starts_with("Reconnecting"))
+            *attempted
+                && (note.starts_with("Failed") || note.starts_with("Reconnecting"))
+                && shown(state) == pairs(&[(A, "still-here")])
         },
     )?
     .1;
