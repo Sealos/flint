@@ -2241,27 +2241,47 @@ async fn until_overview_watches(server: &FakeApiServer, open: bool, what: &str) 
     .unwrap_or_else(|_| panic!("{what}: never reached"));
 }
 
-// covers UP-25: On view watches the overview's kinds only while it is showing.
+// covers UP-25: in On view the selected cluster still finds problems with no overview open
+// (#715), a Pod Pending for over a minute among them, and an overview adds no second feed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn in_on_view_the_overview_watches_its_kinds_until_it_is_left() {
+async fn in_on_view_problems_are_found_with_no_overview_open() {
+    use flint_core::problems::ProblemKind;
     let server = FakeApiServer::start().await.unwrap();
+    server.add_pod(FakePod::from_json(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "stuck", "namespace": "demo", "uid": "stuck-uid",
+            "creationTimestamp": "2026-01-01T00:00:00Z",
+        },
+        "spec": {"containers": [{"name": "app", "image": "busybox:1.37.0"}]},
+        "status": {"phase": "Pending"},
+    })));
     let core = Core::start(&server, None).await;
     core.handle.discovery(CONTEXT).await.expect("connected");
-    // Past the manager's next pass, and long enough for a watch that should not exist to open.
-    core.handle.running_set().await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(core.handle.telemetry(CONTEXT).is_none());
-    for kind in ["pods", "nodes"] {
-        assert_eq!(server.open_watches(&Gvr::core(kind)), 0, "{kind}");
-    }
+    until_overview_watches(&server, true, "watching with no overview").await;
+    let pending = |core: &Core| {
+        core.handle.telemetry(CONTEXT).is_some_and(|feed| {
+            feed.snapshot
+                .problems
+                .iter()
+                .any(|problem| problem.kind() == ProblemKind::PodPending)
+        })
+    };
+    tokio::time::timeout(WAIT, async {
+        while !pending(&core) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the Pending pod is counted");
 
     let overview = core.handle.open_overview(CONTEXT);
-    until_overview_watches(&server, true, "watching after opening").await;
-    assert!(core.handle.telemetry(CONTEXT).is_some());
-
+    overview.registered().await;
+    assert_eq!(server.open_watches(&Gvr::core("pods")), 1, "one feed");
     drop(overview);
-    until_overview_watches(&server, false, "no watch after leaving").await;
-    assert!(core.handle.telemetry(CONTEXT).is_none());
+    core.handle.running_set().await;
+    assert!(pending(&core), "leaving the overview keeps the feed");
     assert!(server.writes().is_empty());
 }
 

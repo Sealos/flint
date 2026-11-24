@@ -216,7 +216,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 
 ### UP-25 Change the watch mode
 - **When** I set the watch mode to "On view", globally or for one cluster.
-- **Then** only open views are watched, and the setting persists.
+- **Then** only open views are watched, and the setting persists. Problems are still found without an open view: the
+  problem feed's seven kinds are watched while the cluster is selected or an open set member, so a Pod Pending for
+  over a minute shows in the alert center and the set dashboard.
 - Tests: unit, cluster.
 
 ### UP-26 Large cluster stays smooth

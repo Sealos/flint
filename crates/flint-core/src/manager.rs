@@ -5716,9 +5716,9 @@ users:
         assert!(!telemetry::reads_token_file(&config, "missing"));
     }
 
-    // covers UP-25: On view watches only open views, so the feed follows the cluster's mode.
+    // covers UP-25: problem detection runs in either watch mode (#715).
     #[tokio::test]
-    async fn a_feed_runs_only_in_watch_mode_all() {
+    async fn a_feed_runs_in_either_watch_mode() {
         use crate::settings::WatchMode;
         let dir = tempfile::tempdir().unwrap();
         let mut manager =
@@ -5731,20 +5731,13 @@ users:
             watch_mode: WatchMode::OnView,
             ..Settings::default()
         });
-        assert!(!dev_has_feed(&mut manager), "on view by default");
-
-        manager.settings = Arc::new(Settings {
-            watch_mode: WatchMode::OnView,
-            cluster_watch_mode: [("dev".to_owned(), WatchMode::All)].into(),
-            ..Settings::default()
-        });
-        assert!(dev_has_feed(&mut manager), "all for this cluster");
+        assert!(dev_has_feed(&mut manager), "on view by default");
 
         manager.settings = Arc::new(Settings {
             cluster_watch_mode: [("dev".to_owned(), WatchMode::OnView)].into(),
             ..Settings::default()
         });
-        assert!(!dev_has_feed(&mut manager), "on view for this cluster");
+        assert!(dev_has_feed(&mut manager), "on view for this cluster");
     }
 
     /// `dev` connected and active, in watch mode On view.
@@ -5766,39 +5759,59 @@ users:
         });
     }
 
-    // covers UP-25: the overview is an open view of the kinds its feed watches.
+    // covers UP-25: the selected cluster finds problems with no overview open (#715).
     #[tokio::test]
-    async fn in_on_view_a_feed_runs_only_while_the_overview_is_showing() {
+    async fn in_on_view_the_selected_cluster_has_a_feed_with_no_overview_open() {
         let dir = tempfile::tempdir().unwrap();
         let mut manager = on_view_manager(dir.path()).await;
-        assert!(!dev_has_feed(&mut manager), "no overview open");
+        assert!(dev_has_feed(&mut manager), "no overview open");
 
         open_dev_overview(&mut manager, 1);
-        assert!(dev_has_feed(&mut manager), "opened");
-        open_dev_overview(&mut manager, 2);
         manager.handle_request(Request::CloseOverview { id: 1 });
-        assert!(dev_has_feed(&mut manager), "another is still open");
-        manager.handle_request(Request::CloseOverview { id: 2 });
-        assert!(!dev_has_feed(&mut manager), "left");
+        assert!(dev_has_feed(&mut manager), "an overview came and went");
         assert!(manager.overviews.is_empty());
+
+        manager.active = Some("other".to_owned());
+        assert!(!dev_has_feed(&mut manager), "switched away, not in the set");
+        manager.active = Some("dev".to_owned());
+        assert!(dev_has_feed(&mut manager), "selected again");
     }
 
+    // An open set member finds problems on the connection it already has, without keep watching.
     #[tokio::test]
-    async fn an_overview_feed_stops_with_the_active_cluster_and_generation() {
+    async fn in_on_view_a_set_member_has_a_feed_until_it_leaves_the_set() {
         let dir = tempfile::tempdir().unwrap();
         let mut manager = on_view_manager(dir.path()).await;
-        open_dev_overview(&mut manager, 1);
-        assert!(dev_has_feed(&mut manager));
-
-        // Even a running-set member needs to be the cluster shown.
         join_dev(&mut manager);
         manager.active = Some("other".to_owned());
-        assert!(!dev_has_feed(&mut manager), "switched away");
-        manager.active = Some("dev".to_owned());
-        assert!(dev_has_feed(&mut manager), "back on the same generation");
+        manager.sync_roles();
+        assert!(dev_has_feed(&mut manager), "a member in the background");
 
-        manager.cluster_mut("dev").unwrap().generation += 1;
-        assert!(!dev_has_feed(&mut manager), "the context started over");
+        manager.members.remove("dev");
+        manager.sync_roles();
+        assert!(!dev_has_feed(&mut manager), "left the set");
+    }
+
+    // On view starts no background sign-in: a member whose credential runs a program has a feed
+    // only while it is selected, as in mode All.
+    #[tokio::test]
+    async fn in_on_view_a_command_credential_has_a_feed_only_in_the_foreground() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = on_view_manager(dir.path()).await;
+        join_dev(&mut manager);
+        manager.active = Some("other".to_owned());
+        manager.sync_roles();
+        land_connection(&mut manager).await;
+        command_credential(&mut manager);
+        assert!(!dev_has_feed(&mut manager), "in the background");
+        assert!(!manager.cluster("dev").unwrap().access.unattended());
+
+        manager.active = Some("dev".to_owned());
+        manager.sync_roles();
+        assert!(dev_has_feed(&mut manager), "selected");
+        manager.active = Some("other".to_owned());
+        manager.sync_roles();
+        assert!(!dev_has_feed(&mut manager), "back in the background");
     }
 
     #[tokio::test]

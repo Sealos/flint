@@ -287,7 +287,6 @@ async fn member_telemetry_never_reads_the_feed_of_the_server_its_context_moved_t
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("kubeconfig");
     write_config(&path, &[&a, &b]);
-    // The harness defaults to On view, where a member runs no feed.
     let settings = Settings {
         cluster_watch_mode: [("a".to_owned(), flint_core::settings::WatchMode::All)].into(),
         ..Settings::default()

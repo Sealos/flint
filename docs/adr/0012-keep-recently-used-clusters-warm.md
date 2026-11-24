@@ -45,8 +45,9 @@ above and replaces two of its rules for that cluster only: **No exec plugins in 
 launch**.
 
 - **What it does.** A watched cluster runs one telemetry feed while it is not selected, so its overview data and
-  alerts stay current. Watched clusters start at launch; all others still load when opened. The toggle overrides
-  On view for that cluster. Alerts go through the existing alert center.
+  alerts stay current. Watched clusters start at launch; all others still load when opened. In either watch mode,
+  a cluster that is selected or an open set member finds problems on its own connection (#715); keep watching adds
+  the feed while it is neither. Alerts go through the existing alert center.
 - **Limit.** At most 32 clusters, the capacity of `TrendStore`. The 33rd is refused with a message.
 - **Read only.** The feed has its own connection with a read client and no write client. The slot's connection,
   write credential and write gate are unchanged, so a background cluster gains no write path. `flint mcp` does not

@@ -19,7 +19,6 @@ use crate::connection::policy::Role;
 use crate::credential::CredentialSource;
 use crate::handle::ConnectionState;
 use crate::metrics_trend::TrendStore;
-use crate::settings::WatchMode;
 use crate::telemetry::Telemetry;
 
 /// A running feed and the connection attempt it follows.
@@ -91,31 +90,16 @@ impl ClusterManager {
         self.overviews.remove(&id);
     }
 
-    /// Whether the overview of `id` is showing: it is the active cluster, on the generation the
-    /// overview was opened for.
-    fn overview_showing(&self, id: &str) -> bool {
-        self.active.as_deref() == Some(id)
-            && self.cluster(id).is_some_and(|slot| {
-                self.overviews
-                    .values()
-                    .any(|open| open.cluster == id && open.generation == slot.generation)
-            })
-    }
-
-    /// Whether `id` should have a feed now: it is selected or in the running set, in watch mode
-    /// All or showing its overview, its connection is up and not paused, and that connection's
-    /// credential can go on being used in its role. A credential that runs a program is used
-    /// only in the foreground. A selected cluster whose kept feed was handed over needs none.
+    /// Whether `id` should have a feed now: it is selected or in the running set, its connection
+    /// is up and not paused, and that connection's credential can go on being used in its role.
+    /// A credential that runs a program is used only in the foreground, unless background sign-in
+    /// was consented to. A selected cluster whose kept feed was handed over needs none.
     ///
-    /// On view promises no watch of a kind without an open view. A feed watches seven kinds
-    /// whatever is open, so in that mode it runs only for the overview, which is a view of them.
+    /// The watch mode does not matter: problem detection runs in On view too (#715), on the
+    /// connection the cluster already has. It never connects, so a cluster neither selected nor
+    /// in the running set gets a feed only by keep watching.
     pub(super) fn wants_telemetry(&self, id: &str) -> bool {
-        if !self.wants_watches(id)
-            || self.kept_feed_handed_over(id)
-            || (self.settings.watch_mode_for(id) != WatchMode::All
-                && !self.overview_showing(id)
-                && !self.keep_watching(id))
-        {
+        if !self.wants_watches(id) || self.kept_feed_handed_over(id) {
             return false;
         }
         let Some(slot) = self.cluster(id) else {

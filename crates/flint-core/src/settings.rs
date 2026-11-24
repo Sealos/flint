@@ -54,7 +54,8 @@ pub enum WatchMode {
     /// Watch every listable, watchable kind on the active cluster.
     #[default]
     All,
-    /// Watch a kind only while a view for it is open. The cluster has no telemetry feed.
+    /// Watch a kind only while a view for it is open. The telemetry feed that finds problems
+    /// still runs while the cluster is connected as the selected cluster or a set member.
     OnView,
 }
 
@@ -440,15 +441,6 @@ impl Settings {
             .iter()
             .take(crate::keep_watching::MAX_WATCHED_CLUSTERS)
             .find(|entry| entry.context == context)
-    }
-
-    /// The mode alerts read `cluster` in: keeping it watched overrides On view.
-    pub fn alert_mode_for(&self, cluster: &str) -> WatchMode {
-        if self.watched_cluster(cluster).is_some() {
-            WatchMode::All
-        } else {
-            self.watch_mode_for(cluster)
-        }
     }
 
     /// [`Settings::log_buffer_lines`], kept within [`LOG_BUFFER_LINES_RANGE`].

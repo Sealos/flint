@@ -11,7 +11,6 @@ use std::sync::Arc;
 use flint_core::KindId;
 use flint_core::combined::CombinedObjects;
 use flint_core::dashboard::ProblemCategory;
-use flint_core::settings::WatchMode;
 use flint_core::telemetry::Availability;
 use gpui_kit::*;
 use jiff::Timestamp;
@@ -265,7 +264,6 @@ impl Workspace {
                 thresholds: model
                     .settings
                     .thresholds_for(cluster, Some(member.server())),
-                watched: model.settings.watch_mode_for(cluster) == WatchMode::All,
             }
         });
         let left_out = run.left_out.iter().map(|member| MemberRead {
@@ -276,7 +274,6 @@ impl Workspace {
             telemetry: None,
             server: String::new(),
             thresholds: model.settings.thresholds_for(&member.context, None),
-            watched: false,
         });
         admitted.chain(left_out).collect()
     }

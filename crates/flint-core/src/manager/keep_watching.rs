@@ -395,7 +395,7 @@ impl ClusterManager {
         }
     }
 
-    /// Whether `id` is watched and may be read now. It overrides On view.
+    /// Whether `id` is watched and may be read now, selected or not.
     pub(super) fn keep_watching(&self, id: &str) -> bool {
         self.keep_status(id) == KeepWatching::Watching
     }

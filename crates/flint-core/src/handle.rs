@@ -831,8 +831,7 @@ impl CoreHandle {
     }
 
     /// What the feed of `cluster` knows. `None` while it has none: it is neither kept watching,
-    /// selected nor in the running set, is in watch mode On view with no overview showing, is not
-    /// connected, is paused, or its sign-in runs a program and it is in the background without
+    /// selected nor in the running set, is not connected, is paused, or its sign-in runs a program and it is in the background without
     /// consent. A kept cluster that stopped or can't be reached shows its last values, with
     /// their age in the status. Never blocks.
     pub fn telemetry(&self, cluster: &str) -> Option<crate::telemetry::ClusterTelemetry> {
@@ -902,9 +901,9 @@ impl CoreHandle {
         }
     }
 
-    /// Marks `cluster`'s overview as showing until the result is dropped, so its telemetry feed
-    /// runs in watch mode On view too, while the cluster is active and not paused. Reads only.
-    /// A handle bound to a member starts nothing. Never blocks.
+    /// Marks `cluster`'s overview as showing until the result is dropped. The cluster's feed runs
+    /// whether or not one is showing, in either watch mode (#715). Reads only. A handle bound to
+    /// a member starts nothing. Never blocks.
     pub fn open_overview(&self, cluster: &str) -> OverviewInterest {
         let id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
         if matches!(self.read_binding(cluster), Ok(None)) {
@@ -1781,7 +1780,7 @@ impl Drop for Subscription {
     }
 }
 
-/// An overview on show, from [`CoreHandle::open_overview`]. Dropping it ends its watches.
+/// An overview on show, from [`CoreHandle::open_overview`]. Dropping it ends its binding.
 #[derive(Debug)]
 pub struct OverviewInterest {
     id: u64,
