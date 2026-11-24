@@ -133,7 +133,7 @@ impl ClusterManager {
         server: Option<Option<String>>,
         admitted: Option<&Arc<AdmittedMember>>,
     ) -> Result<ForwardGrant, WriteError> {
-        let (_, pin, credential) = self.bound_write_client(&cluster, server)?;
+        let (_, pin, credential) = self.bound_write_client(&cluster, server, None)?;
         if admitted.is_some_and(|member| {
             !member.holds(&cluster, &pin) || !self.members.contains_key(&cluster)
         }) {
