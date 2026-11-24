@@ -994,9 +994,19 @@ async fn a_live_child_keeps_its_run_after_a_crash() {
     reap_stale(&root);
     assert!(path.exists(), "a live child's run stays");
 
-    child.kill().await.unwrap();
-    reap_stale(&root);
-    assert!(!path.exists(), "removed once the child has gone");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        child.kill().await.unwrap();
+        // Waiting for the child can finish before the inherited lock is available to reap.
+        loop {
+            reap_stale(&root);
+            if !path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("removed once the child has gone");
 }
 
 /// A load of `yaml` as the only kubeconfig file.

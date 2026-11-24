@@ -105,10 +105,23 @@ async fn lists_recover_after_the_api_server_restarts() {
         .unwrap_or_else(|_| "flint-dev-control-plane".to_owned());
     let kube = admin(&path, Duration::from_secs(10)).await;
     let namespaces: Api<Namespace> = Api::all(kube.clone());
-    let _ = namespaces.delete(NAMESPACE, &DeleteParams::default()).await;
-    while namespaces.get_opt(NAMESPACE).await.unwrap().is_some() {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let Some(previous) = namespaces.get_opt(NAMESPACE).await.unwrap() else {
+            return;
+        };
+        if previous.metadata.deletion_timestamp.is_none() {
+            match namespaces.delete(NAMESPACE, &DeleteParams::default()).await {
+                Ok(_) => {}
+                Err(kube::Error::Api(error)) if error.code == 404 => return,
+                Err(error) => panic!("deleting the previous namespace {NAMESPACE}: {error}"),
+            }
+        }
+        while namespaces.get_opt(NAMESPACE).await.unwrap().is_some() {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("the previous m1fix-recovery namespace finished deleting");
     namespaces
         .create(
             &PostParams::default(),
