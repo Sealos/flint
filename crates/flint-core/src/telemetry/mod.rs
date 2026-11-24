@@ -59,6 +59,7 @@ use crate::dashboard::{ProblemCounts, ProblemSnapshot, ProblemSummariser};
 use crate::metrics::MetricsError;
 use crate::metrics_trend::TrendStore;
 use crate::problems::{Problem, ProblemId, ProblemKind};
+use crate::rollout::Rollout;
 
 pub(crate) use board::TelemetryBoard;
 pub use board::{ClusterTelemetry, FeedDiscovery, TelemetryUpdates};
@@ -220,6 +221,9 @@ pub struct TelemetrySnapshot {
     /// `None` while nodes cannot be relied on.
     pub capacity: Option<ClusterCapacity>,
     pub inventory: Inventory,
+    /// The Deployments mid-rollout, stalled or just finished, one per Deployment. Empty while
+    /// Deployments cannot be read.
+    pub rollouts: Arc<[Rollout]>,
     pub version: VersionCheck,
 }
 
@@ -239,6 +243,7 @@ impl TelemetrySnapshot {
             metrics: MetricsCheck::Waiting,
             capacity: None,
             inventory: Inventory::default(),
+            rollouts: Arc::from([]),
             version: VersionCheck::Waiting,
         }
     }
@@ -273,6 +278,7 @@ impl TelemetrySnapshot {
             && self.metrics == other.metrics
             && self.capacity == other.capacity
             && self.inventory == other.inventory
+            && self.rollouts == other.rollouts
             && self.version == other.version
     }
 }

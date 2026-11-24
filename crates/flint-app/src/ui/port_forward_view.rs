@@ -354,7 +354,15 @@ impl PortForwardsView {
     }
 
     pub fn has_running(&self) -> bool {
-        self.rows.iter().any(|r| !r.shown.state.is_finished())
+        self.running() > 0
+    }
+
+    /// How many forwards have not ended.
+    pub fn running(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| !r.shown.state.is_finished())
+            .count()
     }
 
     /// The address of forward `id`, while it listens.

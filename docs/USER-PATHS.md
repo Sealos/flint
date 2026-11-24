@@ -335,10 +335,12 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **Then** log and shell tabs keep running when I change views or clusters, and end only when I close them (the tab's
   close button, or Cmd-W wherever focus is while the dock shows a tab; with no tab shown, Cmd-W closes the window,
   and Shift-Cmd-W always does). A closed tab frees everything it held. Closing the window (Shift-Cmd-W, its close
-  button, or Cmd-W with no tab shown) or quitting (Cmd-Q) while a shell runs or a log tab follows asks first, naming
-  how many sessions end. Enter and Escape cancel; confirming needs the Quit or Close Window button (a click, or Space
-  when it has focus). With none running, nothing is asked. Quitting from outside Flint (the Dock icon's Quit, or
-  logging out of macOS) is not asked about, and loses any unapplied YAML edit. Cmd-J shows and hides the
+  button, or Cmd-W with no tab shown) or quitting (Cmd-Q) while a shell runs, a log tab follows or a port forward
+  runs asks first, naming how many sessions end and how many forwards stop. An unapplied YAML edit joins the same
+  question, so it is one prompt, never two. Enter and Escape cancel, and Cancel keeps everything running; confirming
+  needs the Quit or Close Window button (a click, or Space when it has focus). With none running, nothing is asked.
+  Quitting from outside Flint (the Dock icon's Quit, or logging out of macOS) is not asked about, stops the forwards
+  and loses any unapplied YAML edit. Cmd-J shows and hides the
   dock, and its height is remembered. Every tab names its cluster beside its title, and two clusters never read the
   same. With many tabs, the tab I open or show stays in view, also when the window is resized, and the tab list
   (Shift-Cmd-J, or the button at the strip's end) shows every tab with its cluster and status. Opening the same logs
@@ -594,7 +596,9 @@ M3 used every number in the 5x block, so its later paths continue at UP-121.
 ### UP-68 Follow recent activity
 - **Status:** planned (#101, not in 0.5.0), not built yet.
 - **When** a rollout starts or a Warning event fires while the dashboard is open.
-- **Then** it appears at the top of the activity feed within seconds, and clicking it opens the object.
+- **Then** it appears at the top of the activity feed within seconds, and clicking it opens the object. A
+  Deployment's rollout is one row that moves from started to progressing to complete (or stalled, once the progress
+  deadline passes) instead of a row per update, and a complete rollout leaves the feed after an hour.
 - Tests: ui, e2e.
 
 ### UP-69 Find the namespace that is broken or full
