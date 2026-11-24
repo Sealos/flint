@@ -36,12 +36,14 @@ use secrecy::SecretString;
 use serde::{Deserialize, Deserializer};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
-use crate::connection::policy::{CredentialAccess, PluginRuns};
+use crate::connection::policy::CredentialAccess;
 use crate::connection::proxy::{self, ProxyEnvironment};
 use crate::credential::{CredentialSource, WriteCredential};
 use crate::keep_watching::{PluginConsent, SignIn, sign_in_of};
+use crate::manager::KeptGrants;
 use crate::read::{is_dns1123_label, is_dns1123_subdomain};
 use crate::recheck::ContextPin;
+use crate::redact;
 
 mod acl;
 mod mask;
@@ -87,6 +89,10 @@ pub enum HelmError {
          Flint run its sign-in command in the background."
     )]
     CredentialRunsCommand,
+    #[error("Helm can't use this cluster's SOCKS proxy yet, so it did not run.")]
+    SocksProxy,
+    #[error("This cluster's proxy can't be used, so Helm did not run.")]
+    ProxyRefused,
     #[error(
         "Helm is not available for clusters that sign in with an auth provider, or with a command \
          beside another credential."
@@ -292,6 +298,21 @@ fn number_or_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::
     }
 }
 
+/// What an exec plugin runs under for `helm`, held as a kept cluster's plugin is (ADR-0012).
+#[derive(Clone)]
+pub(crate) struct PluginLaunch {
+    /// The background sign-in consent, which held over exactly this definition when the target
+    /// was made.
+    pub(crate) consent: Arc<PluginConsent>,
+    /// Asked right before the plugin starts, off the async threads: the kubeconfig files as they
+    /// are now must still define what was agreed to, with the same program contents, and a
+    /// confirmed change voids the consent ([`PluginConsent::verify`]).
+    pub(crate) check: crate::cluster::SendCheck,
+    /// The keep-watching grants: turning the sign-in off or quitting kills the plugin, and a quit
+    /// waits for it.
+    pub(crate) grants: KeptGrants,
+}
+
 /// Everything one `helm` run needs, taken in one step with checking the connection.
 #[derive(Clone)]
 pub(crate) struct HelmTarget {
@@ -299,9 +320,8 @@ pub(crate) struct HelmTarget {
     /// Only this context, its cluster and its user.
     kubeconfig: Kubeconfig,
     credential: WriteCredential,
-    /// For an exec plugin: the background sign-in consent it runs under, which held over exactly
-    /// this definition when the target was made. `None` once the plugin's output replaced it.
-    consent: Option<Arc<PluginConsent>>,
+    /// For an exec plugin: what it runs under. `None` once the plugin's output replaced it.
+    plugin: Option<PluginLaunch>,
     configured_helm: Option<PathBuf>,
     /// Where the run's private directory goes ([`runs_root`]).
     runs_root: PathBuf,
@@ -312,7 +332,7 @@ pub(crate) struct HelmTarget {
 
 impl HelmTarget {
     /// The target for `context` of `merged`, the definition `pin` was taken on. An exec plugin is
-    /// accepted only with `consent` holding over exactly this definition. Refuses an auth
+    /// accepted only with `plugin`'s consent holding over exactly this definition. Refuses an auth
     /// provider, and a user entry naming a program beside another credential: client-go's order
     /// is not kube's, so `helm` could still run it.
     pub(crate) fn new(
@@ -320,7 +340,7 @@ impl HelmTarget {
         context: &str,
         pin: ContextPin,
         credential: WriteCredential,
-        consent: Option<Arc<PluginConsent>>,
+        plugin: Option<PluginLaunch>,
         configured_helm: Option<PathBuf>,
         runs_root: PathBuf,
     ) -> Result<Self, HelmError> {
@@ -329,7 +349,7 @@ impl HelmTarget {
             context,
             pin,
             credential,
-            consent,
+            plugin,
             configured_helm,
             runs_root,
             &ProxyEnvironment::current(),
@@ -343,7 +363,7 @@ impl HelmTarget {
         context: &str,
         pin: ContextPin,
         credential: WriteCredential,
-        consent: Option<Arc<PluginConsent>>,
+        plugin: Option<PluginLaunch>,
         configured_helm: Option<PathBuf>,
         runs_root: PathBuf,
         environment: &ProxyEnvironment,
@@ -374,9 +394,9 @@ impl HelmTarget {
             None => None,
         };
         let auth = user.and_then(|u| u.auth_info.as_ref());
-        let plugin = auth.map(CredentialSource::of) == Some(CredentialSource::Plugin);
-        if plugin != credential.runs_a_command()
-            || (!plugin && auth.is_some_and(|a| a.exec.is_some() || a.auth_provider.is_some()))
+        let runs_plugin = auth.map(CredentialSource::of) == Some(CredentialSource::Plugin);
+        if runs_plugin != credential.runs_a_command()
+            || (!runs_plugin && auth.is_some_and(|a| a.exec.is_some() || a.auth_provider.is_some()))
         {
             return Err(HelmError::SignInNotSupported);
         }
@@ -390,6 +410,11 @@ impl HelmTarget {
             server,
             environment,
         ) {
+            // Only a proxy Flint itself would connect through, and never a SOCKS one.
+            let target = proxy::ProxyTarget::parse(chosen).map_err(|_| HelmError::ProxyRefused)?;
+            if target.is_socks() {
+                return Err(HelmError::SocksProxy);
+            }
             proxy.push(("HTTPS_PROXY", chosen.to_owned()));
         }
         if let Some(no_proxy) = &environment.no_proxy {
@@ -404,10 +429,10 @@ impl HelmTarget {
             current_context: Some(context.to_owned()),
             ..Kubeconfig::default()
         };
-        let consent = if plugin {
-            let consent = consent.ok_or(HelmError::CredentialRunsCommand)?;
+        let plugin = if runs_plugin {
+            let launch = plugin.ok_or(HelmError::CredentialRunsCommand)?;
             match sign_in_of(&kubeconfig, context) {
-                SignIn::Plugin(definition) if consent.holds(&definition) => Some(consent),
+                SignIn::Plugin(definition) if launch.consent.holds(&definition) => Some(launch),
                 _ => return Err(HelmError::CredentialRunsCommand),
             }
         } else {
@@ -417,7 +442,7 @@ impl HelmTarget {
             context: context.to_owned(),
             kubeconfig,
             credential,
-            consent,
+            plugin,
             configured_helm,
             runs_root,
             proxy,
@@ -453,38 +478,30 @@ impl HelmTarget {
     }
 
     /// This target with its exec plugin's credential in place of the plugin, so `helm` starts no
-    /// program. The plugin runs as a kept cluster's does: unattended, with no stdin, and only while
-    /// the consent still holds over this definition, checked right before it starts. Dropping the
-    /// future kills it. A target with no plugin is returned as it is.
+    /// program. The plugin runs as a kept cluster's does: unattended, with no stdin, and only after
+    /// [`PluginLaunch::check`] passes right before it starts. It is counted and held with the
+    /// keep-watching grants, so turning the sign-in off or quitting kills it, and dropping the
+    /// future does too. A target with no plugin is returned as it is.
     async fn signed_in(&self) -> Result<Self, HelmError> {
-        let Some(consent) = self.consent.clone() else {
+        let Some(PluginLaunch {
+            consent,
+            check,
+            grants,
+        }) = self.plugin.clone()
+        else {
             return Ok(self.clone());
         };
         let SignIn::Plugin(definition) = sign_in_of(&self.kubeconfig, &self.context) else {
             return Err(HelmError::Changed);
         };
-        let definition = Arc::new(definition);
         let pinned = {
             let target = self.clone();
             tokio::task::spawn_blocking(move || target.pinned_config())
                 .await
                 .map_err(|_| HelmError::NotStarted)??
         };
-        let check = {
-            let (consent, definition) = (Arc::clone(&consent), Arc::clone(&definition));
-            crate::cluster::SendCheck::new(move || {
-                let verdict = if consent.holds(&definition) {
-                    Ok(())
-                } else {
-                    Err("the background sign-in consent ended".to_owned())
-                };
-                let verdict: futures::future::BoxFuture<'static, _> =
-                    Box::pin(std::future::ready(verdict));
-                verdict
-            })
-        };
-        let access =
-            CredentialAccess::consented(Arc::new(|| {}), Some(check), PluginRuns::default());
+        let access = CredentialAccess::consented(Arc::new(|| {}), Some(check), grants.runs());
+        let _held = grants.hold_access(&self.context, &access);
         // Why it failed: the consent ended, or the plugin did.
         let failed = || {
             if consent.holds(&definition) {
@@ -532,7 +549,7 @@ impl HelmTarget {
             auth.client_certificate_data = resolved.client_certificate_data.clone();
             auth.client_key_data = resolved.client_key_data.clone();
         }
-        signed.consent = None;
+        signed.plugin = None;
         Ok(signed)
     }
 
@@ -963,25 +980,56 @@ struct StatusOutput {
     chart: StatusChart,
 }
 
-/// Fixed words for a release status. Helm's stored description can quote what a server refused,
-/// credentials included, in a form no pattern recognizes, so it is never shown.
-fn status_text(status: &str) -> &'static str {
-    match status {
+/// The most of a failure reason shown, after redaction.
+const REASON_CHARS: usize = 300;
+/// Follows a failure reason that redaction changed.
+pub const REASON_MASKED: &str = "(some values masked)";
+
+/// Stands for a failed revision's reason where that revision's values are not loaded.
+pub const REASON_IN_DETAILS: &str = "Failed. Details show the reason for the current revision.";
+
+/// A release status in words. A failed one gives Helm's stored reason ([`failure_reason`]) only
+/// with its revision's values (`hidden`) to scrub against, and [`REASON_IN_DETAILS`] without
+/// them; any other status gets fixed words.
+fn status_text(status: &str, description: &str, hidden: Option<&HiddenValues>) -> String {
+    let fixed = match status {
         "deployed" => "Deployed.",
         "superseded" => "Replaced by a later revision.",
-        "failed" => "Failed. Helm's failure text is not shown.",
+        "failed" => {
+            return hidden.map_or_else(
+                || REASON_IN_DETAILS.to_owned(),
+                |hidden| failure_reason(description, hidden),
+            );
+        }
         "uninstalled" => "Uninstalled.",
         "uninstalling" => "Uninstalling.",
         "pending-install" => "Install in progress.",
         "pending-upgrade" => "Upgrade in progress.",
         "pending-rollback" => "Rollback in progress.",
         _ => "No description.",
+    };
+    fixed.to_owned()
+}
+
+/// Helm's stored reason for a failed release, on one line and held to the rules for a server's
+/// error text ([`redact::hide_server_values`]): credentials, bearer values and every quoted value
+/// are hidden, then the revision's own values (`hidden`), and only then is the line
+/// cut. A reason redaction changed ends with [`REASON_MASKED`].
+fn failure_reason(description: &str, hidden: &HiddenValues) -> String {
+    let shown = hidden.scrub_text(&redact::hide_server_values(description));
+    let line = redact::first_line(&shown, REASON_CHARS);
+    if line.is_empty() {
+        "Failed. Helm stored no reason.".to_owned()
+    } else if shown == description {
+        format!("Failed: {line}")
+    } else {
+        format!("Failed: {line} {REASON_MASKED}")
     }
 }
 
 /// `query`'s output as data, masked. `hidden` is what a manifest or details must not show. A list
 /// or history spans revisions with no one set of values to scrub against, so neither keeps the
-/// free-form app version.
+/// free-form app version, and history shows no failure reason.
 fn parse(query: &HelmQuery, out: &[u8], hidden: &HiddenValues) -> Result<HelmOutput, HelmError> {
     fn json<'a, T: Deserialize<'a>>(out: &'a [u8]) -> Result<T, HelmError> {
         serde_json::from_slice(out).map_err(|_| HelmError::BadOutput)
@@ -1009,7 +1057,11 @@ fn parse(query: &HelmQuery, out: &[u8], hidden: &HiddenValues) -> Result<HelmOut
                     status.namespace
                 },
                 revision: status.version,
-                description: status_text(&status.info.status).to_owned(),
+                description: status_text(
+                    &status.info.status,
+                    &status.info.description,
+                    Some(hidden),
+                ),
                 status: status.info.status,
                 first_deployed: status.info.first_deployed,
                 last_deployed: status.info.last_deployed,
@@ -1021,7 +1073,7 @@ fn parse(query: &HelmQuery, out: &[u8], hidden: &HiddenValues) -> Result<HelmOut
         HelmQuery::History(_) => {
             let mut revisions: Vec<HelmRevision> = json(out)?;
             for revision in &mut revisions {
-                revision.description = status_text(&revision.status).to_owned();
+                revision.description = status_text(&revision.status, &revision.description, None);
             }
             // Newest first.
             revisions.sort_by_key(|r| std::cmp::Reverse(r.revision));

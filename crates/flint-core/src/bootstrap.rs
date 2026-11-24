@@ -122,7 +122,21 @@ pub unsafe fn bootstrap() -> Result<Bootstrap, SettingsError> {
     // An unreadable file opens nothing up (`Settings::unreadable_fallback`).
     let (settings, settings_error) = settings::load_settings_or_fallback(&config_dir);
     // Before any kubeconfig loads, so every context is pinned to the route it connects through.
-    settings.proxy.use_for_this_process();
+    // A file that exists but can't be read may have named a proxy for every cluster: those that
+    // would take it are refused rather than sent direct or through the environment's proxy. A
+    // missing file is no error, and leaves the environment to decide.
+    let settings_error = match settings_error {
+        None => {
+            settings.proxy.use_for_this_process();
+            None
+        }
+        Some(reason) => {
+            crate::connection::proxy::use_unreadable_setting();
+            Some(crate::connection::proxy::settings_error_with_proxy_note(
+                reason,
+            ))
+        }
+    };
     // SAFETY: forwarded to the caller.
     let path = unsafe { env_path::apply_process_path(settings.path.as_deref()) };
     Ok(Bootstrap {

@@ -1105,6 +1105,17 @@ impl Workspace {
     /// Why log and shell sessions cannot open on `cluster` now (it is paused or not connected),
     /// if so. A cluster still connecting may: the object to act on is loading too.
     pub(in crate::ui) fn sessions_blocked(&self, cluster: &str, cx: &App) -> Option<String> {
+        self.cluster_sessions_blocked(cluster, cx).or_else(|| {
+            // A set's row also waits on what the set says of its member (a paused one, say):
+            // the refusal `session_member` gives when the session is asked for.
+            self.sets
+                .member(cluster)
+                .and_then(|_| self.set_row_refusal(cluster, cx))
+        })
+    }
+
+    /// [`Self::sessions_blocked`] as the cluster's own connection says.
+    fn cluster_sessions_blocked(&self, cluster: &str, cx: &App) -> Option<String> {
         let summary = self.cluster_summary(cluster, cx);
         // Only the words depend on the cause: whether this blocks is decided around it.
         let waiting = || {

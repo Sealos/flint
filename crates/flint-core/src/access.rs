@@ -27,7 +27,7 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio::time::Instant;
 
 use crate::credential::{CredentialId, WriteCredential};
-use crate::handle::CoreHandle;
+use crate::handle::{CoreHandle, SlotBinding};
 
 /// How long an answer from the server is kept.
 pub const ACCESS_FRESH_FOR: Duration = Duration::from_secs(60);
@@ -203,13 +203,21 @@ impl CoreHandle {
     /// What RBAC says about `check` on `cluster` at `server`, for showing an action. Never
     /// permission to write. Anything but a clear answer is [`Access::Unknown`]. Never blocks;
     /// the future works on any executor, and dropping it stops the check.
+    ///
+    /// `on` is the slot and definition the asking view shows: unless the context is still on
+    /// them, nothing is sent, even to the same URL (another user there is another definition).
+    /// Without one, nothing is sent either.
     pub fn check_access(
         &self,
         cluster: &str,
         server: Option<String>,
+        on: Option<SlotBinding>,
         check: AccessCheck,
     ) -> impl Future<Output = Access> + Send + 'static {
-        let client = self.bound_write_client(cluster, Some(server.clone()));
+        let Some(on) = on else {
+            return futures::future::Either::Left(std::future::ready(Access::Unknown));
+        };
+        let client = self.bound_write_client(cluster, Some(server.clone()), Some(on));
         let cache = self.access_cache();
         let core = self.clone();
         let cluster = cluster.to_owned();
@@ -225,7 +233,10 @@ impl CoreHandle {
             let asked = ask(client.into_client(), &check);
             let access = cache.answer(&cluster, &credential, &check, asked).await;
             // The answer speaks only for the connection it was asked on.
-            match core.bound_write_client(&cluster, Some(server)).await {
+            match core
+                .bound_write_client(&cluster, Some(server), Some(on))
+                .await
+            {
                 Ok((_, now, current))
                     if now == pin && current.id().is(&credential.id()) && !current.spent() =>
                 {
@@ -234,7 +245,7 @@ impl CoreHandle {
                 _ => Access::Unknown,
             }
         });
-        async move { run.await.unwrap_or(Access::Unknown) }
+        futures::future::Either::Right(async move { run.await.unwrap_or(Access::Unknown) })
     }
 
     /// [`Self::check_access`] for each of `checks`, each with its answer.
@@ -242,11 +253,12 @@ impl CoreHandle {
         &self,
         cluster: &str,
         server: Option<String>,
+        on: Option<SlotBinding>,
         checks: Vec<AccessCheck>,
     ) -> impl Future<Output = Vec<(AccessCheck, Access)>> + Send + 'static {
         let asked: Vec<_> = checks
             .iter()
-            .map(|check| self.check_access(cluster, server.clone(), check.clone()))
+            .map(|check| self.check_access(cluster, server.clone(), on, check.clone()))
             .collect();
         async move {
             let answers = futures::future::join_all(asked).await;

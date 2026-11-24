@@ -477,9 +477,9 @@ async fn an_unsupported_proxy_is_refused_before_the_plugin_runs() {
     let plugin = printing(r#"{"token":"t"}"#);
     let mut kubeconfig = plugin.kubeconfig("https://127.0.0.1:1");
     kubeconfig.clusters[0].cluster.as_mut().unwrap().proxy_url =
-        Some("socks5://127.0.0.1:1080".into());
+        Some("socks4://127.0.0.1:1080".into());
     let Err(err) = cluster::connect(&kubeconfig, "ctx").await else {
-        panic!("a SOCKS proxy is not supported");
+        panic!("a SOCKS4 proxy is not supported");
     };
     assert!(err.to_string().contains("proxy"), "{err}");
     assert_eq!(runs(&plugin), 0);

@@ -459,6 +459,8 @@ pub(crate) enum Request {
     BoundWriteClient {
         cluster: ClusterId,
         server: Option<Option<String>>,
+        /// Set for a request on behalf of a view: refused unless the context is still on it.
+        on: Option<SlotBinding>,
         reply: oneshot::Sender<Result<BoundWriteClient, WriteError>>,
     },
     /// What the write gate says now about `cluster` as pinned at `pin`, for a session about to
@@ -580,6 +582,24 @@ impl ClusterSummary {
             server: self.info.server.clone(),
         }
     }
+
+    /// The slot and definition a view of this cluster shows now.
+    pub fn slot_binding(&self) -> SlotBinding {
+        SlotBinding {
+            generation: self.generation,
+            definition: self.definition,
+        }
+    }
+}
+
+/// The slot and definition of a context a view shows ([`ClusterSummary::generation`] and
+/// [`ClusterSummary::definition`]). A request sent on the view's behalf is refused, before any
+/// client is built, unless the context is still on both: the same URL under another user is
+/// another definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SlotBinding {
+    pub generation: u64,
+    pub definition: u64,
 }
 
 /// A context's identity when a read-only view opened on it: its confirmed definition and exact
@@ -1528,15 +1548,18 @@ impl CoreHandle {
 
     /// [`Self::write_client`] for one request of a reviewed write, with the credential of the
     /// connection that client belongs to, read in the same step.
+    /// With `on`, refused unless the context is still on that slot and definition.
     pub(crate) fn bound_write_client(
         &self,
         cluster: &str,
         server: Option<Option<String>>,
+        on: Option<SlotBinding>,
     ) -> impl Future<Output = Result<BoundWriteClient, WriteError>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
         let sent = self.requests.push(Request::BoundWriteClient {
             cluster: cluster.to_owned(),
             server,
+            on,
             reply,
         });
         async move {

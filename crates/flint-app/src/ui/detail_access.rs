@@ -13,8 +13,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use flint_core::KindId;
 use flint_core::access::{Access, AccessCheck};
+use flint_core::{KindId, SlotBinding};
 use gpui_kit::*;
 
 use super::super::resource_actions::{self, ResourceAction};
@@ -325,11 +325,18 @@ impl DetailView {
         wanted.dedup();
         let core = self.core.clone();
         let cluster = self.object.cluster.clone();
+        // Bound to the connection shown: a tick before the pane hears of a change sends nothing.
+        let on = followed
+            .connection
+            .map(|(generation, definition)| SlotBinding {
+                generation,
+                definition,
+            });
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SETTLE).await;
             loop {
                 let answers = core
-                    .check_access_all(&cluster, followed.server.clone(), wanted.clone())
+                    .check_access_all(&cluster, followed.server.clone(), on, wanted.clone())
                     .await
                     .into_iter()
                     .collect();

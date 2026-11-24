@@ -227,6 +227,195 @@ async fn leaving_the_set_drops_a_consented_connection() {
     assert!(slot.connect_task.is_none());
 }
 
+/// A plugin that notes each start in `starts` and answers with a token.
+fn token_plugin() -> FakePlugin {
+    FakePlugin::new(
+        "echo $$ >> \"$PLUGIN_DIR/starts\"\n\
+         printf '{\"apiVersion\":\"client.authentication.k8s.io/v1\",\
+         \"kind\":\"ExecCredential\",\"status\":{\"token\":\"t\"}}'\n",
+    )
+}
+
+/// Waits for `plugin`'s first start.
+async fn wait_for_a_start(plugin: &FakePlugin) {
+    for _ in 0..250 {
+        if !plugin.starts().is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the plugin did not start");
+}
+
+/// Lands `dev`'s attempt in flight as connected, on a client that contacts nothing until used.
+/// The slot keeps the access the attempt was made under; the client itself is built without it.
+async fn land_dev(manager: &mut ClusterManager) {
+    land(manager, "dev").await;
+}
+
+/// [`land_dev`] for `id`.
+async fn land(manager: &mut ClusterManager, id: &str) {
+    let slot = manager.cluster_mut(id).unwrap();
+    if let Some(task) = slot.connect_task.take() {
+        task.abort();
+    }
+    let attempt = slot.attempt;
+    let access = CredentialAccess::always();
+    let connection = cluster::connect_gated_with_policy(&manager.kubeconfig.merged, id, &access)
+        .await
+        .expect("building a client contacts nothing");
+    let version = cluster::ServerVersion {
+        git_version: "v1.30.0".into(),
+        platform: "linux/arm64".into(),
+    };
+    manager
+        .handle_internal(Internal::Connected {
+            cluster: id.into(),
+            attempt,
+            result: Ok((connection, version)),
+        })
+        .await;
+}
+
+// A consented member of the open set runs its plugin once: its slot's connection, made under the
+// consent, also serves keep watching, so no kept connection runs the plugin a second time.
+#[tokio::test]
+async fn one_plugin_run_serves_the_member_and_keep_watching() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    open_set(&mut manager);
+    manager.sync_keep_watching();
+    wait_for_a_start(&plugin).await;
+
+    assert!(
+        !manager.keep.feeds.contains_key("dev"),
+        "no kept connection"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(plugin.starts().len(), 1, "only the member's run");
+
+    land_dev(&mut manager).await;
+    manager.sync_telemetry();
+    manager.sync_keep_watching();
+    assert!(manager.cluster("dev").unwrap().access.unattended());
+    assert!(
+        manager.cluster("dev").unwrap().telemetry.is_some(),
+        "the slot's feed serves keep watching"
+    );
+    assert!(!manager.keep.feeds.contains_key("dev"));
+    assert_eq!(manager.keep_status("dev"), KeepWatching::Watching);
+}
+
+// A member that waits for a sign-in makes no connection, so consent given later starts the kept
+// feed rather than leave the cluster unwatched.
+#[tokio::test]
+async fn a_member_waiting_for_a_sign_in_leaves_keep_watching_to_the_kept_feed() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    open_set(&mut manager);
+    assert!(matches!(
+        dev_state(&manager),
+        MemberState::SignInNeeded { .. }
+    ));
+
+    allow(&mut manager).await;
+    manager.sync_keep_watching();
+
+    assert!(matches!(
+        dev_state(&manager),
+        MemberState::SignInNeeded { .. }
+    ));
+    assert!(manager.keep.feeds.contains_key("dev"), "the kept feed runs");
+}
+
+// A consented member's credential failing in the background waits for a sign-in, and keep
+// watching with it: no kept feed runs the plugin again until the person acts.
+#[tokio::test]
+async fn a_members_failed_credential_stops_keep_watching_too() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    open_set(&mut manager);
+    land_dev(&mut manager).await;
+    let attempt = manager.cluster("dev").unwrap().attempt;
+
+    manager.member_credential_failed("dev", attempt);
+    manager.sync_keep_watching();
+
+    assert!(matches!(
+        dev_state(&manager),
+        MemberState::SignInNeeded { .. }
+    ));
+    assert_eq!(manager.keep_status("dev"), KeepWatching::SignInNeeded);
+    assert!(!manager.keep.feeds.contains_key("dev"), "no second run");
+
+    manager.set_running_set(Vec::new());
+    manager.sync_keep_watching();
+    assert!(!manager.keep.feeds.contains_key("dev"), "nor after leaving");
+}
+
+// The same for a background attempt under consent that fails to connect.
+#[tokio::test]
+async fn a_members_failed_attempt_stops_keep_watching_too() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    open_set(&mut manager);
+    let slot = manager.cluster_mut("dev").unwrap();
+    if let Some(task) = slot.connect_task.take() {
+        task.abort();
+    }
+    let attempt = slot.attempt;
+
+    manager
+        .handle_internal(Internal::Connected {
+            cluster: "dev".into(),
+            attempt,
+            result: Err(cluster::SafeErrorText::reduced("sign-in failed")),
+        })
+        .await;
+    manager.sync_keep_watching();
+
+    assert!(matches!(
+        dev_state(&manager),
+        MemberState::SignInNeeded { .. }
+    ));
+    assert_eq!(manager.keep_status("dev"), KeepWatching::SignInNeeded);
+    assert!(!manager.keep.feeds.contains_key("dev"), "no second run");
+}
+
+// When the member leaves the set, its connection ends and the kept feed takes over.
+#[tokio::test]
+async fn the_kept_feed_resumes_when_the_member_leaves_the_set() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    open_set(&mut manager);
+    land_dev(&mut manager).await;
+    manager.sync_telemetry();
+    manager.sync_keep_watching();
+    assert!(manager.cluster("dev").unwrap().telemetry.is_some());
+    assert!(!manager.keep.feeds.contains_key("dev"));
+
+    manager.set_running_set(Vec::new());
+    manager.sync_telemetry();
+    manager.sync_keep_watching();
+
+    assert!(manager.cluster("dev").unwrap().telemetry.is_none());
+    let kept = &manager.keep.feeds["dev"];
+    assert!(
+        kept.runs_plugin,
+        "the kept feed runs the plugin under the consent"
+    );
+    assert!(kept.access.unattended());
+}
+
 // A kubeconfig file change ends a member's sign-in still running, so a token from before the new
 // definitions are read never brings its connection up.
 #[tokio::test]
@@ -557,4 +746,152 @@ async fn consent_is_not_restored_with_its_entry() {
     manager.settings = with_entry;
     manager.sync_keep_watching();
     assert_eq!(manager.keep_status("dev"), KeepWatching::NeedsConfirming);
+}
+
+/// Lands `id`'s kept connection in flight, on a client that contacts nothing until used, and
+/// returns the attempt it was made by.
+async fn land_kept(manager: &mut ClusterManager, id: &str) -> u64 {
+    let kept = manager.keep.feeds.get_mut(id).expect("a kept feed");
+    if let Some(task) = kept.connecting.take() {
+        task.abort();
+    }
+    let attempt = kept.attempt;
+    let access = CredentialAccess::always();
+    let client = cluster::connect_gated_with_policy(&manager.kubeconfig.merged, id, &access)
+        .await
+        .expect("building a client contacts nothing")
+        .clients
+        .read;
+    manager.kept_connected(id, attempt, Ok(client));
+    assert!(manager.keep.feeds[id].feed.is_some(), "the kept feed runs");
+    attempt
+}
+
+/// The loop's syncs after a message.
+fn sync(manager: &mut ClusterManager) {
+    manager.sync_keep_watching();
+    manager.sync_telemetry();
+}
+
+/// Turns on keep watching for `other`, whose credential runs nothing, and lands its kept feed.
+/// Returns the feed's attempt.
+async fn watched_other(manager: &mut ClusterManager) -> u64 {
+    let definition = manager.keep_watching_views()["other"].definition;
+    manager
+        .set_keep_watching("other".to_owned(), definition)
+        .await;
+    sync(manager);
+    assert_eq!(manager.keep_status("other"), KeepWatching::Watching);
+    land_kept(manager, "other").await
+}
+
+/// Selects `id` and lands its slot's connection, as the loop would.
+async fn select_and_land(manager: &mut ClusterManager, id: &str) {
+    manager.activate(id.to_owned());
+    sync(manager);
+    land(manager, id).await;
+    sync(manager);
+}
+
+// Selecting a watched cluster hands its warm feed over: the slot starts no feed of its own, so
+// nothing is listed again.
+#[tokio::test]
+async fn selecting_a_watched_cluster_hands_its_feed_over() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "dev");
+    let attempt = watched_other(&mut manager).await;
+
+    select_and_land(&mut manager, "other").await;
+
+    assert!(manager.kept_feed_handed_over("other"));
+    let kept = &manager.keep.feeds["other"];
+    assert_eq!(kept.attempt, attempt, "the same feed");
+    assert!(kept.feed.is_some());
+    let slot = manager.cluster("other").unwrap();
+    assert!(matches!(slot.state, ConnectionState::Connected(_)));
+    assert!(slot.telemetry.is_none(), "no second feed on the slot");
+    assert!(
+        slot.write_credential.is_some(),
+        "writes still go through the slot"
+    );
+}
+
+// Leaving it again keeps the same feed running in the background.
+#[tokio::test]
+async fn leaving_a_handed_over_cluster_keeps_its_feed_warm() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "dev");
+    let attempt = watched_other(&mut manager).await;
+    select_and_land(&mut manager, "other").await;
+
+    manager.activate("dev".to_owned());
+    sync(&mut manager);
+
+    assert!(!manager.kept_feed_handed_over("other"));
+    let kept = &manager.keep.feeds["other"];
+    assert_eq!(kept.attempt, attempt, "no new connection");
+    assert!(kept.feed.is_some());
+    assert!(manager.cluster("other").unwrap().telemetry.is_none());
+}
+
+// A changed definition drops the handed-over feed, and the slot starts a feed of its own.
+#[tokio::test]
+async fn a_definition_change_drops_a_handed_over_feed() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "dev");
+    watched_other(&mut manager).await;
+    select_and_land(&mut manager, "other").await;
+    assert!(manager.kept_feed_handed_over("other"));
+
+    let slot = manager.cluster_mut("other").unwrap();
+    slot.fingerprint = slot.fingerprint.map(|print| print.wrapping_add(1));
+    assert!(
+        !manager.kept_feed_handed_over("other"),
+        "never handed over on another definition"
+    );
+    sync(&mut manager);
+
+    assert!(
+        !manager.keep.feeds.contains_key("other"),
+        "the feed is dropped"
+    );
+    assert!(
+        manager.cluster("other").unwrap().telemetry.is_some(),
+        "the slot's own feed takes over"
+    );
+}
+
+// Ending a plugin's background sign-in consent drops the handed-over feed, and none starts in
+// the background without it.
+#[tokio::test]
+async fn ending_consent_drops_a_handed_over_feed() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    sync(&mut manager);
+    let attempt = land_kept(&mut manager, "dev").await;
+    select_and_land(&mut manager, "dev").await;
+    assert!(manager.kept_feed_handed_over("dev"));
+    assert_eq!(manager.keep.feeds["dev"].attempt, attempt);
+    assert!(manager.cluster("dev").unwrap().telemetry.is_none());
+
+    manager.kept_grants().revoke("dev");
+    manager.revoke_background_sign_in("dev");
+    sync(&mut manager);
+
+    assert!(!manager.kept_feed_handed_over("dev"));
+    assert!(
+        !manager.keep.feeds.contains_key("dev"),
+        "the feed is dropped"
+    );
+    manager.activate("other".to_owned());
+    sync(&mut manager);
+    assert!(
+        !manager.keep.feeds.contains_key("dev"),
+        "no background feed without consent"
+    );
 }
