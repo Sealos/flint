@@ -589,6 +589,7 @@ fn show_warning_row(
         open: Some(open.clone()),
         object_uid: Some("uid-web-0".to_owned()),
         key: "event-web-0".to_owned(),
+        rollout: None,
     };
     view.update(cx, |view, cx| {
         view.set_object_read_for_test(object_with_uid("web-0", "uid-web-0"));
@@ -631,6 +632,7 @@ fn warning_on(name: &str, key: &str, server: Option<String>) -> WarningRow {
         }),
         object_uid: Some(format!("uid-{name}")),
         key: key.to_owned(),
+        rollout: None,
     }
 }
 

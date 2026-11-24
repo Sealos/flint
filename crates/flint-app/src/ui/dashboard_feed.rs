@@ -573,6 +573,7 @@ fn waiting_snapshot(cluster: &str, now: Timestamp) -> TelemetrySnapshot {
         metrics: MetricsCheck::Waiting,
         capacity: None,
         inventory: Inventory::default(),
+        rollouts: Arc::default(),
         version: VersionCheck::Waiting,
     }
 }

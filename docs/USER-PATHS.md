@@ -596,7 +596,9 @@ M3 used every number in the 5x block, so its later paths continue at UP-121.
 ### UP-68 Follow recent activity
 - **Status:** planned (#101, not in 0.5.0), not built yet.
 - **When** a rollout starts or a Warning event fires while the dashboard is open.
-- **Then** it appears at the top of the activity feed within seconds, and clicking it opens the object.
+- **Then** it appears at the top of the activity feed within seconds, and clicking it opens the object. A
+  Deployment's rollout is one row that moves from started to progressing to complete (or stalled, once the progress
+  deadline passes) instead of a row per update, and a complete rollout leaves the feed after an hour.
 - Tests: ui, e2e.
 
 ### UP-69 Find the namespace that is broken or full
