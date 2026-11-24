@@ -23,6 +23,7 @@ pub mod display;
 pub mod env_path;
 pub mod events;
 pub mod exec;
+pub mod fleet;
 pub mod gitops;
 pub mod handle;
 pub mod helm;
