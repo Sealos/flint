@@ -4,6 +4,8 @@
 //! Files are merged in order and the first file to define a name wins (`Kubeconfig::merge`).
 //! Every context becomes a Flint cluster, and Flint records which file each one came from.
 
+pub(crate) mod definition;
+
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};

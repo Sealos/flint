@@ -10,6 +10,7 @@
 //! messages). The MCP server applies it to cluster text, and logging applies it to every line
 //! written to stderr or the log file; the app shows a cluster's logs and events as they are.
 
+pub(crate) mod patterns;
 mod text;
 
 pub use text::{Redacted, credential_flag, redact_credentials};

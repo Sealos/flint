@@ -327,6 +327,17 @@ fn private_key_blocks() {
 }
 
 #[test]
+fn private_key_markers_can_share_dashes_with_other_pem_markers() {
+    assert_eq!(
+        redacted(
+            "<<begin>> CERTIFICATE-----BEGIN PGP PRIVATE KEY BLOCK-----body-----END PRIVATE KEY-----end",
+            1
+        ),
+        "<<begin>> CERTIFICATE<<begin>> PGP PRIVATE KEY BLOCK-----[REDACTED:private-key]-----END PRIVATE KEY-----end"
+    );
+}
+
+#[test]
 fn key_value_pairs_hide_only_the_value() {
     for (line, want) in [
         ("password=hunter2", "password=[REDACTED:password]"),

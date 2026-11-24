@@ -11,6 +11,7 @@ use crate::api_error::{self, ApiError, Transport};
 use crate::connection::policy::{CredentialAccess, CredentialGrant};
 use crate::connection::proxy;
 use crate::credential::{self, CredentialSource, WriteCredential};
+use crate::kubeconfig::definition::ContextDefinition;
 use crate::protection::{ClusterClients, WriteAccess};
 use crate::redact;
 
@@ -1190,20 +1191,7 @@ async fn bounded<T>(
 /// its user entry. When it changes after a kubeconfig reload, the cached client is stale.
 /// Returns `None` if the context does not exist.
 pub fn context_fingerprint(kubeconfig: &Kubeconfig, context: &str) -> Option<u64> {
-    let named = kubeconfig.contexts.iter().find(|c| c.name == context)?;
-    let ctx = named.context.as_ref();
-    let cluster = ctx.and_then(|c| kubeconfig.clusters.iter().find(|n| n.name == c.cluster));
-    let user = ctx
-        .and_then(|c| c.user.as_ref())
-        .and_then(|u| kubeconfig.auth_infos.iter().find(|n| &n.name == u));
-    // The kube types are not `Hash`; their serialized form is a stable stand-in, with object keys
-    // sorted: exec `env` items are `HashMap`s, serialized in a different order at each load, which
-    // would make every load look like a change (and the MCP server connect again, and run the
-    // plugin again, at every call). The sort is explicit because the app builds serde_json with
-    // `preserve_order`. The string holds credentials, so it is hashed right away and never stored.
-    let mut value = serde_json::to_value((named, cluster, user)).ok()?;
-    value.sort_all_objects();
-    let text = value.to_string();
+    let text = ContextDefinition::find(kubeconfig, context)?.canonical_json()?;
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
     Some(hasher.finish())
@@ -1457,6 +1445,18 @@ mod tests {
         assert_eq!(a, a2);
         assert_ne!(a, b);
         assert_eq!(context_fingerprint(&kubeconfig("https://a"), "nope"), None);
+    }
+
+    #[test]
+    fn fingerprint_includes_existing_entries_in_an_incomplete_definition() {
+        let mut config = kubeconfig("https://a");
+        config.clusters.clear();
+        let missing_cluster = context_fingerprint(&config, "ctx").unwrap();
+        config.auth_infos.clear();
+        let missing_user = context_fingerprint(&config, "ctx").unwrap();
+        assert_ne!(missing_cluster, missing_user);
+        config.contexts[0].context = None;
+        assert_ne!(context_fingerprint(&config, "ctx").unwrap(), missing_user);
     }
 
     // covers UP-06: exec `env` items are maps, read in a different order at each load; the
