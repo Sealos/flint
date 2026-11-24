@@ -636,6 +636,17 @@ fn repoint(
     from: &FakeApiServer,
     to: &FakeApiServer,
 ) -> Result<Moved> {
+    repoint_as(app, kubeconfig, from, to, &to.kubeconfig(None))
+}
+
+/// [`repoint`], writing `config` for `to`: the same server under other credentials, say.
+fn repoint_as(
+    app: &App,
+    kubeconfig: &std::path::Path,
+    from: &FakeApiServer,
+    to: &FakeApiServer,
+    config: &kube::config::Kubeconfig,
+) -> Result<Moved> {
     let mut last = (access_reviews(from, 0, None).len(), Instant::now());
     until(
         "the access reviews to settle",
@@ -653,7 +664,7 @@ fn repoint(
             from: from.arrivals().len(),
             to: to.arrivals().len(),
         };
-        to.write_kubeconfig(kubeconfig, None)?;
+        flint_e2e::fake_api::kubeconfig::write(kubeconfig, config)?;
         Ok(moved)
     })?;
     until(
@@ -757,6 +768,66 @@ fn up_55_answering_a_confirmation_after_a_repoint_writes_nowhere() -> Result<()>
                     app.quit()?;
                 }
             }
+        }
+    }
+    assert!(reached.is_empty(), "{reached:#?}");
+    Ok(())
+}
+
+/// `fake`'s kubeconfig with a user of its own: the same server under another credential.
+fn with_token(fake: &FakeApiServer, token: &str) -> Result<kube::config::Kubeconfig> {
+    let mut config = serde_json::to_value(fake.kubeconfig(None))?;
+    config["users"][0]["user"] = json!({ "token": token });
+    Ok(serde_json::from_value(config)?)
+}
+
+// covers UP-55: a context moved away and back to the same server under another user closes the
+// dialog open on it, and whatever answers it after, nothing reaches either server.
+#[test]
+#[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
+fn up_55_a_move_back_under_another_user_writes_nowhere() -> Result<()> {
+    let mut reached = Vec::new();
+    for asked in ASKED {
+        let cluster = TestCluster::fake(Options::default())?;
+        let fake = cluster.fake_server().expect("a fake server");
+        let other = FakeApiServer::start_blocking(Options::default())?;
+        seed_targets(fake, asked)?;
+        seed_targets(&other, asked)?;
+        // Unprotected: the gate is open for both servers, so only the binding refuses.
+        let app = App::launch(AppOptions::new(&cluster.kubeconfig))?;
+        connect(&app, &cluster.context)?;
+        let mut left_open = false;
+        reporting(&app, || {
+            open_asked(&app, asked)?;
+            let (on_fake, on_other) = (fake.writes().len(), other.writes().len());
+            let moved = repoint(&app, &cluster.kubeconfig, fake, &other)?;
+            let back = with_token(fake, "another-user")?;
+            repoint_as(&app, &cluster.kubeconfig, &other, fake, &back)?;
+            if !app.state()?["dialog"].is_null() {
+                reached.push(format!("{asked:?}: the dialog stayed open"));
+            }
+            for _ in 0..3 {
+                if app.state()?["dialog"].is_null() {
+                    break;
+                }
+                let _ = app.click("ok");
+                std::thread::sleep(RETRY_WINDOW);
+            }
+            let mut first = writes_since(fake, on_fake);
+            first.extend(access_reviews(fake, moved.from, None));
+            let mut second = writes_since(&other, on_other);
+            second.extend(access_reviews(&other, 0, None));
+            if !first.is_empty() || !second.is_empty() {
+                reached.push(format!("{asked:?}: original {first:?} new {second:?}"));
+            }
+            left_open = !app.state()?["dialog"].is_null();
+            Ok(())
+        })?;
+        if left_open {
+            app.mark_failing();
+            drop(app);
+        } else {
+            app.quit()?;
         }
     }
     assert!(reached.is_empty(), "{reached:#?}");

@@ -110,7 +110,11 @@ pub enum DetailEvent {
     /// sentence saying what and why ([`refused`]), for the window to say.
     Refused(String),
     /// Apply was pressed on a reviewed edit: the window asks to confirm it, naming the cluster.
-    ConfirmWrite(Box<flint_core::write::WriteReview>),
+    /// The guard is on the connection the review started on; `None` if it had none settled.
+    ConfirmWrite(
+        Box<flint_core::write::WriteReview>,
+        Option<super::write_binding::ConnectionGuard>,
+    ),
 }
 
 /// Whether the tab an action opens takes keyboard focus.
@@ -235,6 +239,9 @@ pub struct DetailView {
     endpoint: Option<u64>,
     /// What RBAC says about this object's actions, for showing them ([`access`]).
     access: access::ObjectAccess,
+    /// Guards a YAML edit's review on its connection; `None` until the workspace gives it, when
+    /// no edit can be confirmed.
+    connection_guards: Option<super::write_binding::ConnectionGuards>,
     /// The YAML edit under way, in its own editor: a list update never touches its text.
     edit: Option<edit::YamlEdit>,
     /// The pane's own focus, for Tab and Shift-Tab between panes (UP-33).
@@ -353,6 +360,7 @@ impl DetailView {
             server: None,
             endpoint: None,
             access: object_access,
+            connection_guards: None,
             edit: None,
             focus: cx.focus_handle(),
             _fetch: Task::ready(()),
@@ -430,6 +438,14 @@ impl DetailView {
     }
 
     /// Says which server the object's cluster points at now. A set's row keeps its pin.
+    /// Where a YAML edit's review takes the guard its confirmation is bound to.
+    pub(in crate::ui) fn set_connection_guards(
+        &mut self,
+        guards: super::write_binding::ConnectionGuards,
+    ) {
+        self.connection_guards = Some(guards);
+    }
+
     pub(in crate::ui) fn set_server(&mut self, server: Option<String>) {
         if self.row_server.is_none() {
             self.server = server;
