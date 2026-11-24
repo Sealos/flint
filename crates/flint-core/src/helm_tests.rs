@@ -328,6 +328,7 @@ fn a_socks_or_refused_proxy_is_not_handed_to_helm() {
             pin_for(&merged),
             credential(CredentialSource::Definition),
             None,
+            None,
             unused_root(),
             &environment,
         )
