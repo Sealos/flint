@@ -67,3 +67,7 @@ impl SetDashboardModel {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "set_dashboard_state_tests.rs"]
+mod tests;
