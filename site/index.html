@@ -3,11 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Flint — read-only Kubernetes access for AI agents, in a native Mac app</title>
-  <meta name="description" content="Flint is a fast, native Kubernetes app for your Mac that lets Claude Code and other AI agents read the clusters you choose, and nothing else.">
+  <title>Flint — many Kubernetes clusters, one native Mac app</title>
+  <meta name="description" content="Flint is a fast, native Kubernetes app for your Mac that keeps many clusters in one window: cluster sets, background watching and desktop alerts. It also ships a read-only MCP server for AI agents.">
   <meta name="color-scheme" content="light dark">
-  <meta property="og:title" content="Flint — read-only Kubernetes access for AI agents, in a native Mac app">
-  <meta property="og:description" content="A read-only MCP server for the clusters you choose, with values that look like credentials redacted, and a fast native Kubernetes app written in Rust with GPUI. Open source under Apache-2.0.">
+  <meta property="og:title" content="Flint — many Kubernetes clusters, one native Mac app">
+  <meta property="og:description" content="Open clusters together, save cluster sets, keep clusters watching and get alerts. A fast native app written in Rust with GPUI, with a read-only MCP server for AI agents. Open source under Apache-2.0.">
   <meta property="og:type" content="website">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
@@ -20,8 +20,8 @@
         <span>Flint</span>
       </a>
       <nav class="topnav" aria-label="Sections">
-        <a href="#mcp">MCP</a>
         <a href="#features">Features</a>
+        <a href="#mcp">MCP</a>
         <a href="#roadmap">Roadmap</a>
         <a href="https://github.com/Sealos/flint">GitHub</a>
       </nav>
@@ -31,19 +31,17 @@
   <main>
     <section class="hero wrap">
       <p class="eyebrow"><span class="dot" aria-hidden="true"></span> Early development · open source</p>
-      <h1>Let AI agents read the clusters you choose, and nothing else.</h1>
+      <h1>Many Kubernetes clusters, one native window.</h1>
       <p class="lede">
-        Flint is a fast, native Kubernetes app for your Mac. Its <code>flint mcp</code> server gives Claude Code
-        and other AI agents read-only access to the clusters you expose one by one, and redacts values that look
-        like credentials before an agent sees them.
+        Flint is a fast, native Kubernetes app for your Mac. Open several clusters together, save them as a cluster
+        set with a dashboard that shows the unhealthiest first, keep them watched in the background, and get a
+        desktop alert when one gets a new problem.
       </p>
       <div class="cta">
         <a class="btn btn-primary" href="https://github.com/Sealos/flint/releases/latest">Latest release</a>
         <a class="btn" href="https://github.com/Sealos/flint">View on GitHub</a>
       </div>
-      <pre class="code hero-code" role="region" aria-label="Command to register flint mcp with Claude Code" tabindex="0"><code><span class="c"># read-only access to the clusters you expose</span>
-claude mcp add flint -- /usr/local/bin/flint mcp</code></pre>
-      <p class="fineprint">Install Flint, link its binary to <code>/usr/local/bin/flint</code>, mark a cluster <b>Expose to AI</b> in the sidebar, then register it with the command above (<a href="https://github.com/Sealos/flint#add-it-to-an-agent">MCP setup</a>).</p>
+      <p class="fineprint">Prefer to let an AI agent read your clusters? Flint also ships a <a href="#mcp">read-only MCP server</a>.</p>
       <p class="fineprint">The latest release includes Flint.app in a universal macOS DMG for Apple Silicon and Intel
         and best-effort Linux AppImages (x86_64 and arm64). The Mac app uses an ad-hoc signature, so macOS asks you
         to allow it on first launch after a browser download
@@ -88,45 +86,6 @@ claude mcp add flint -- /usr/local/bin/flint mcp</code></pre>
       </figure>
       <p class="caption">An illustration of the window, not a screenshot.</p>
     </div>
-
-    <section id="mcp" class="wrap section split">
-      <div>
-        <h2>Read-only MCP server</h2>
-        <p><code>flint mcp</code> is a read-only <a href="https://modelcontextprotocol.io/">Model Context Protocol</a>
-          server. Agents can list clusters, kinds, objects, events and pod logs, and nothing else.</p>
-        <ul class="ticks">
-          <li><b>Per-cluster opt-in.</b> Nothing is exposed by default. You choose each cluster with <b>Expose to AI</b> in the sidebar. An exposure is tied to the API server URL, so a re-pointed context is hidden again.</li>
-          <li><b>Read-only.</b> No tool creates, changes or deletes anything, and there is no exec or port-forward.</li>
-          <li><b>Credentials redacted.</b> Secret values are always redacted. In pod logs, events, resource messages and container args, values that look like credentials become markers such as <code>[REDACTED:password]</code>. Flint's own log view is unchanged.</li>
-          <li><b>Bounded.</b> Large outputs are cut short, and the result says so.</li>
-        </ul>
-        <p>Redaction is pattern matching and can miss a credential in an unusual format, and ConfigMaps and <code>env</code> values are sent as the cluster returns them. Expose only clusters you are willing to send to your AI provider.</p>
-      </div>
-      <pre class="code" role="region" aria-label="Commands to register flint mcp" tabindex="0"><code><span class="c"># link the app's binary once (DMG install)</span>
-sudo mkdir -p /usr/local/bin
-sudo ln -sf /Applications/Flint.app/Contents/MacOS/flint /usr/local/bin/flint
-
-<span class="c"># register it with Claude Code</span>
-claude mcp add flint -- /usr/local/bin/flint mcp
-
-<span class="c"># other MCP clients need the absolute path</span>
-/usr/local/bin/flint mcp</code></pre>
-    </section>
-
-    <section id="compare" class="wrap section">
-      <h2>Compared with other Kubernetes MCP servers</h2>
-      <div class="compare-wrap" role="region" aria-label="Comparison of Kubernetes MCP servers" tabindex="0">
-        <table class="compare">
-          <thead><tr><td></td><th scope="col">Flint</th><th scope="col"><a href="https://docs.lenshq.io/k8slens/mcp-server/">Lens MCP Server</a></th><th scope="col"><a href="https://github.com/containers/kubernetes-mcp-server">kubernetes-mcp-server</a></th></tr></thead>
-          <tbody>
-            <tr><th scope="row">Which clusters</th><td>Only those you expose, one by one, each tied to its API server URL</td><td>Every cluster Lens knows</td><td>The contexts in its kubeconfig</td></tr>
-            <tr><th scope="row">Writes</th><td>None: no tools for them</td><td>Its <code>kubectl</code> tool refuses writes; editors and Helm dialogs it fills in apply changes after you confirm; some tools change Lens itself (port forwards, settings)</td><td>Writes allowed, including delete and pod exec, unless its <code>read_only</code> or <code>disable_destructive</code> setting is on</td></tr>
-            <tr><th scope="row">Credential redaction in results</th><td>Secret values, and credentials in logs, events, messages and container arguments</td><td>Not described</td><td>Not for tool results (only its own log notifications); Secrets can be denied by configuration</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <p class="caption">As their documentation describes them in November 2026.</p>
-    </section>
 
     <section id="features" class="wrap section">
       <h2>What it does today</h2>
@@ -203,6 +162,45 @@ claude mcp add flint -- /usr/local/bin/flint mcp
             (⇧⌘P) runs any action by name.</p>
         </article>
       </div>
+    </section>
+
+    <section id="mcp" class="wrap section split">
+      <div>
+        <h2>For AI agents: a read-only MCP server</h2>
+        <p>Flint also ships <code>flint mcp</code>, a read-only <a href="https://modelcontextprotocol.io/">Model Context Protocol</a>
+          server. Agents can list clusters, kinds, objects, events and pod logs, and nothing else.</p>
+        <ul class="ticks">
+          <li><b>Per-cluster opt-in.</b> Nothing is exposed by default. You choose each cluster with <b>Expose to AI</b> in the sidebar. An exposure is tied to the API server URL, so a re-pointed context is hidden again.</li>
+          <li><b>Read-only.</b> No tool creates, changes or deletes anything, and there is no exec or port-forward.</li>
+          <li><b>Credentials redacted.</b> Secret values are always redacted. In pod logs, events, resource messages and container args, values that look like credentials become markers such as <code>[REDACTED:password]</code>. Flint's own log view is unchanged.</li>
+          <li><b>Bounded.</b> Large outputs are cut short, and the result says so.</li>
+        </ul>
+        <p>Redaction is pattern matching and can miss a credential in an unusual format, and ConfigMaps and <code>env</code> values are sent as the cluster returns them. Expose only clusters you are willing to send to your AI provider.</p>
+      </div>
+      <pre class="code" role="region" aria-label="Commands to register flint mcp" tabindex="0"><code><span class="c"># link the app's binary once (DMG install)</span>
+sudo mkdir -p /usr/local/bin
+sudo ln -sf /Applications/Flint.app/Contents/MacOS/flint /usr/local/bin/flint
+
+<span class="c"># register it with Claude Code</span>
+claude mcp add flint -- /usr/local/bin/flint mcp
+
+<span class="c"># other MCP clients need the absolute path</span>
+/usr/local/bin/flint mcp</code></pre>
+    </section>
+
+    <section id="compare" class="wrap section">
+      <h2>Compared with other Kubernetes MCP servers</h2>
+      <div class="compare-wrap" role="region" aria-label="Comparison of Kubernetes MCP servers" tabindex="0">
+        <table class="compare">
+          <thead><tr><td></td><th scope="col">Flint</th><th scope="col"><a href="https://docs.lenshq.io/k8slens/mcp-server/">Lens MCP Server</a></th><th scope="col"><a href="https://github.com/containers/kubernetes-mcp-server">kubernetes-mcp-server</a></th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Which clusters</th><td>Only those you expose, one by one, each tied to its API server URL</td><td>Every cluster Lens knows</td><td>The contexts in its kubeconfig</td></tr>
+            <tr><th scope="row">Writes</th><td>None: no tools for them</td><td>Its <code>kubectl</code> tool refuses writes; editors and Helm dialogs it fills in apply changes after you confirm; some tools change Lens itself (port forwards, settings)</td><td>Writes allowed, including delete and pod exec, unless its <code>read_only</code> or <code>disable_destructive</code> setting is on</td></tr>
+            <tr><th scope="row">Credential redaction in results</th><td>Secret values, and credentials in logs, events, messages and container arguments</td><td>Not described</td><td>Not for tool results (only its own log notifications); Secrets can be denied by configuration</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="caption">As their documentation describes them in November 2026.</p>
     </section>
 
     <section id="roadmap" class="wrap section">

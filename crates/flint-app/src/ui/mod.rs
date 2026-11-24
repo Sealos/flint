@@ -30,6 +30,8 @@ mod dock;
 mod dock_model;
 #[cfg(test)]
 mod dock_tests;
+mod fleet_plan;
+mod fleet_view;
 mod focus;
 mod helm_view;
 mod icons;

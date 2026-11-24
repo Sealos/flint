@@ -1648,15 +1648,7 @@ impl ClusterManager {
                         .as_ref()
                         .is_ok_and(|(connection, _)| connection.credential.spent())
                 {
-                    slot.clear_connection();
-                    slot.attempt = 0;
-                    slot.discovering = false;
-                    slot.reconnect = true;
-                    slot.state = ConnectionState::Disconnected;
-                    self.emit(Event::ConnectionChanged {
-                        cluster: cluster.clone(),
-                        state: ConnectionState::Disconnected,
-                    });
+                    self.drop_to_reconnect(&cluster);
                     let now = Instant::now();
                     let outcome =
                         AttemptOutcome::Failed(cluster::SafeErrorText::reduced("superseded"));
