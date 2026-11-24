@@ -411,7 +411,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   Match, selecting, copying and saving work on the rows shown: Save writes them, Save Matching Lines the matches
   among them. Turning the toggles off shows every line again; so does "Matching" while the search is empty. A full
   buffer (100,000 lines) is filtered without the tab stalling: what was shown stays until the filter is ready, and
-  the toolbar says it is filtering. In a narrow tab the toggles move to the More menu.
+  the toolbar says it is filtering. In a narrow tab the toggles move to the More menu, which scrolls in a short
+  window. With ".*" (Alt-Cmd-R) the search is a regular expression for highlights, Next and Previous Match, Save
+  Matching Lines and "Matching"; an invalid or oversized pattern matches nothing and says why beside the search.
 - Tests: unit, ui.
 
 ---
@@ -525,9 +527,12 @@ M3 used every number in the 5x block, so its later paths continue at UP-121.
 - **Then** each action the cluster clearly forbids (Edit, Delete, Scale, Rollout Restart, Cordon, Uncordon, Drain, Logs,
   Shell) is disabled and names the missing permission, for example "your access does not allow delete on deployments
   in demo". A check that fails or times out does not disable an action by itself, and the API server decides
-  any action left enabled.
-- Tests: e2e (fake API server, `a_namespace_limited_identity_sees_what_it_may_do`,
-  `a_namespace_limited_user_sees_forbidden_actions_disabled`).
+  any action left enabled. An answer never outlives the connection it came from: after a re-pointed context or a
+  changed definition the actions are enabled until the cluster answers again. Port-forward joins this list when it is
+  built (UP-70).
+- Tests: unit, e2e (fake API server, `a_namespace_limited_identity_sees_what_it_may_do`,
+  `a_repointed_context_does_not_reuse_an_answer`, `a_changed_definition_does_not_reuse_an_answer`,
+  `a_provisional_context_sends_no_check`, `a_namespace_limited_user_sees_forbidden_actions_disabled`).
 
 ## M4: Curated views, metrics and the resource diagram
 

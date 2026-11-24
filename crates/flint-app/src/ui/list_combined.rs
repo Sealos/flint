@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flint_core::combined::{
-    CLUSTER_COLUMN, ColumnKey, CombinedCell, CombinedGroup, CombinedLine, CombinedQuery,
-    CombinedRowId, CombinedSort, CombinedView, RowRef,
+    CLUSTER_COLUMN, ColumnKey, CombinedCell, CombinedGroup, CombinedLine, CombinedObjects,
+    CombinedQuery, CombinedRowId, CombinedSort, CombinedView, RowRef,
 };
 use flint_core::table::unix_now;
 use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
@@ -84,6 +84,11 @@ pub struct ToggleGroupByCluster;
 #[action(namespace = combined_list, no_json)]
 pub struct ToggleCombinedWide;
 
+/// Shows every row again after a dashboard narrowed the list to the objects it counted.
+#[derive(Debug, Clone, Default, PartialEq, Action)]
+#[action(namespace = combined_list, no_json)]
+pub struct ShowAllCombinedRows;
+
 /// The object a selected combined row names, in the row's own cluster.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CombinedObject {
@@ -120,6 +125,15 @@ pub struct CombinedResourceList {
     pub(in super::super) view: Arc<CombinedView>,
     /// The filters, and the sort asked for.
     pub(in super::super) query: CombinedQuery,
+    /// What `query.objects` holds, for the notice above the rows.
+    objects_label: Option<String>,
+    /// Moves when the narrowing or the members change: a result of an earlier one is discarded.
+    filter_revision: u64,
+    /// The search text left in the field when a dashboard narrowed the list. It does not apply
+    /// until it is edited or the narrowing ends.
+    suspended_text: Option<String>,
+    /// The collapsed groups to restore when the narrowing ends.
+    suspended_collapsed: Vec<String>,
     /// The sort `view` was computed with, which the header's arrow shows.
     pub(in super::super) applied_sort: Option<CombinedSort>,
     pub(in super::super) show_wide: bool,
@@ -163,6 +177,7 @@ impl CombinedResourceList {
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter by name, cluster…"));
         let on_filter = cx.subscribe_in(&filter, window, |this, input, event, _, cx| {
             if let InputEvent::Change = event {
+                this.suspended_text = None;
                 this.query.text = input.read(cx).value().to_string();
                 this.recompute(cx);
             }
@@ -194,6 +209,10 @@ impl CombinedResourceList {
                 namespaces,
                 ..CombinedQuery::default()
             },
+            objects_label: None,
+            filter_revision: 0,
+            suspended_text: None,
+            suspended_collapsed: Vec::new(),
             applied_sort: None,
             show_wide: false,
             widths: ColumnWidths::default(),
@@ -239,6 +258,7 @@ impl CombinedResourceList {
             .bind::<ToggleClusterGroup>(Self::on_toggle_group)
             .bind::<ToggleGroupByCluster>(Self::on_group_by)
             .bind::<ToggleCombinedWide>(Self::on_wide)
+            .bind::<ShowAllCombinedRows>(Self::on_show_all)
     }
 
     /// The list actions it shares with a single-cluster list, forwarded the same way.
@@ -324,6 +344,17 @@ impl CombinedResourceList {
         let known = |id: &String| source.list.members().iter().any(|m| m.cluster() == id);
         self.query.clusters.retain(known);
         self.query.collapsed.retain(known);
+        self.suspended_collapsed.retain(known);
+        let same_members = self
+            .latest
+            .list
+            .members()
+            .iter()
+            .map(|m| m.cluster())
+            .eq(source.list.members().iter().map(|m| m.cluster()));
+        if self.query.objects.is_some() && !same_members {
+            self.filter_revision += 1;
+        }
         self.latest = source;
         self.recompute(cx);
     }
@@ -351,6 +382,74 @@ impl CombinedResourceList {
             .members()
             .iter()
             .any(|m| m.cluster() == cluster)
+    }
+
+    /// Narrows the list to `objects`, called `label` in its notice, in every namespace.
+    pub fn show_objects(
+        &mut self,
+        label: String,
+        objects: Arc<CombinedObjects>,
+        cx: &mut Context<Self>,
+    ) {
+        // A search or a collapsed group must not hide what was counted.
+        if self.query.objects.is_none() {
+            self.suspended_collapsed = std::mem::take(&mut self.query.collapsed);
+        } else {
+            self.query.collapsed.clear();
+        }
+        self.suspended_text = Some(self.query.text.clone());
+        self.objects_label = Some(label);
+        self.query.objects = Some(objects);
+        self.query.clusters.clear();
+        self.hide_rows(cx);
+        self.remeasure = true;
+        self.recompute(cx);
+        cx.notify();
+    }
+
+    /// Shows only `cluster`'s rows, and every object of them.
+    pub fn show_cluster(&mut self, cluster: &str, cx: &mut Context<Self>) {
+        if self.is_member(cluster) {
+            self.end_objects();
+            self.query.clusters = vec![cluster.to_owned()];
+            self.hide_rows(cx);
+            self.remeasure = true;
+            self.recompute(cx);
+            cx.notify();
+        }
+    }
+
+    /// Until the new narrowing's rows land, none of the earlier ones can be seen or selected.
+    fn hide_rows(&mut self, cx: &mut Context<Self>) {
+        self.filter_revision += 1;
+        self.clear_selection(cx);
+        self.view = Arc::new(CombinedView::default());
+        self.view_ready = false;
+    }
+
+    /// Ends a dashboard's narrowing and restores what it suspended. Whether there was one.
+    fn end_objects(&mut self) -> bool {
+        if self.query.objects.take().is_none() {
+            return false;
+        }
+        self.objects_label = None;
+        self.suspended_text = None;
+        self.query.collapsed = std::mem::take(&mut self.suspended_collapsed);
+        self.filter_revision += 1;
+        true
+    }
+
+    /// What a dashboard narrowed the list to, if anything.
+    pub fn objects_label(&self) -> Option<&str> {
+        self.objects_label.as_deref()
+    }
+
+    fn on_show_all(&mut self, _: &ShowAllCombinedRows, _: &mut Window, cx: &mut Context<Self>) {
+        if self.end_objects() {
+            self.remeasure = true;
+            self.recompute(cx);
+            cx.notify();
+        }
     }
 
     pub fn toggle_cluster_filter(&mut self, cluster: &str, cx: &mut Context<Self>) {
@@ -399,14 +498,22 @@ impl CombinedResourceList {
         self.dirty = false;
         let source = self.latest.clone();
         let sort = model::effective_sort(&source, self.query.sort.as_ref(), self.show_wide);
-        let query = CombinedQuery {
+        let mut query = CombinedQuery {
             sort: sort.clone(),
             ..self.query.clone()
         };
+        // A count covers every namespace, whatever the picker holds.
+        if query.objects.is_some() {
+            query.namespaces.clear();
+            if self.suspended_text.as_ref() == Some(&query.text) {
+                query.text.clear();
+            }
+        }
         let selected = self.selected.clone();
         let seen = self.selected_seen.clone();
         let cached = self.measured.clone();
         let restart = std::mem::take(&mut self.remeasure);
+        let revision = self.filter_revision;
         let job_source = source.clone();
         let job = cx.background_spawn(async move {
             compute_view(&job_source, &query, selected, seen, cached, unix_now())
@@ -414,7 +521,7 @@ impl CombinedResourceList {
         self._compute = cx.spawn(async move |this, cx| {
             let computed = job.await;
             let select_first = this.update(cx, |list, cx| {
-                list.install(computed, source, sort, restart, cx)
+                list.install_at(revision, computed, source, sort, restart, cx)
             });
             if let Ok(Some(window)) = select_first {
                 let _ = window.update(cx, |_, window, cx| {
@@ -426,6 +533,25 @@ impl CombinedResourceList {
                 });
             }
         });
+    }
+
+    /// Publishes a computation started at filter `revision`.
+    fn install_at(
+        &mut self,
+        revision: u64,
+        computed: Computed,
+        source: CombinedSource,
+        sort: Option<CombinedSort>,
+        restart: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyWindowHandle> {
+        if revision != self.filter_revision {
+            self.computing = false;
+            self.remeasure |= restart;
+            self.recompute(cx);
+            return None;
+        }
+        self.install(computed, source, sort, restart, cx)
     }
 
     /// Publishes a finished computation: the source, its view and the selection's line
@@ -1254,12 +1380,37 @@ impl Render for CombinedResourceList {
             .on_action(cx.listener(Self::on_toggle_group))
             .on_action(cx.listener(Self::on_group_by))
             .on_action(cx.listener(Self::on_wide))
+            .on_action(cx.listener(Self::on_show_all))
             .size_full()
             .min_w_0()
             .relative()
             .child(self.render_toolbar(theme))
             .child(self.render_members(theme))
             .children(self.render_kind_note(theme))
+            .children(self.objects_label.clone().map(|label| {
+                h_flex()
+                    .id("combined-objects-note")
+                    .flex_none()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .aria_label(format!("Showing only {label}"))
+                    .child(format!("Showing only {label}"))
+                    .child(
+                        Button::new("combined-show-all")
+                            .xsmall()
+                            .ghost()
+                            .label("Show All")
+                            .on_click(registry::on_click_in(
+                                self.focus.clone(),
+                                ShowAllCombinedRows,
+                            )),
+                    )
+                    .test_support()
+            }))
             .child(body)
     }
 }
