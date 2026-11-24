@@ -221,6 +221,9 @@ struct KeptFeed {
     access: CredentialAccess,
     connecting: Option<AbortHandle>,
     feed: Option<Telemetry>,
+    /// The connection's read client, once up. The slot's resource watches may read through it
+    /// ([`ClusterManager::sync_warm_lists`]); it has no write client.
+    client: Option<kube::Client>,
     /// The definition its connection was started from, which labels the feed it leads to.
     pin: crate::recheck::ContextPin,
 }
@@ -419,15 +422,28 @@ impl ClusterManager {
     /// is not handed over, and a changed definition or ended consent drops the feed, so the slot
     /// starts one of its own. The feed has only a read client: writes still go through the slot.
     pub(super) fn kept_feed_handed_over(&self, id: &str) -> bool {
-        if self.active.as_deref() != Some(id) || !self.kept_feed_allowed(id) {
-            return false;
+        self.active.as_deref() == Some(id) && self.live_kept_feed(id).is_some()
+    }
+
+    /// `id`'s kept feed, if it is up on the slot and whole definition it was started for and may
+    /// run now.
+    fn live_kept_feed(&self, id: &str) -> Option<&KeptFeed> {
+        if !self.kept_feed_allowed(id) {
+            return None;
         }
         let slot = self.cluster(id);
         let fingerprint = slot.and_then(|slot| slot.fingerprint);
         let generation = slot.map(|slot| slot.generation);
-        self.keep.feeds.get(id).is_some_and(|kept| {
+        self.keep.feeds.get(id).filter(|kept| {
             kept.feed.is_some() && kept.fingerprint == fingerprint && kept.generation == generation
         })
+    }
+
+    /// The read client of `id`'s live kept feed ([`Self::live_kept_feed`]), with the attempt that
+    /// made it. Reads only: the kept connection has no write client.
+    pub(super) fn kept_read_client(&self, id: &str) -> Option<(u64, kube::Client)> {
+        let kept = self.live_kept_feed(id)?;
+        Some((kept.attempt, kept.client.clone()?))
     }
 
     /// Whether `id` is a member of the open set with background sign-in consent that is up or
@@ -541,6 +557,7 @@ impl ClusterManager {
                 self.start_kept(id);
             }
         }
+        self.sync_warm_lists();
         self.publish_keep_watching();
     }
 
@@ -731,6 +748,7 @@ impl ClusterManager {
                 access,
                 connecting: Some(task.abort_handle()),
                 feed: None,
+                client: None,
                 pin,
             },
         );
@@ -773,6 +791,7 @@ impl ClusterManager {
                     grant: kept.access.grant(CredentialSource::Plugin),
                     pace: Arc::clone(&self.keep.discovery_pace),
                 };
+                kept.client = Some(client.clone());
                 let mut feed = Telemetry::start(
                     id.into(),
                     client,
@@ -811,14 +830,22 @@ impl ClusterManager {
         }
     }
 
-    /// The credential of attempt `attempt` failed or was refused.
+    /// The credential of attempt `attempt` failed or was refused. A feed handed over to the
+    /// selected cluster only ends: the slot's foreground connection, which works on its own,
+    /// starts a feed in its place, so alerts go on and keep watching stays on. Leaving the
+    /// cluster starts a kept feed again, and a failure then waits for a sign-in as usual.
     pub(super) fn kept_failed(&mut self, id: &str, attempt: u64) {
         if self
             .keep
             .feeds
             .get(id)
-            .is_some_and(|kept| kept.attempt == attempt)
+            .is_none_or(|kept| kept.attempt != attempt)
         {
+            return;
+        }
+        if self.kept_feed_handed_over(id) {
+            self.keep.feeds.remove(id);
+        } else {
             self.stop_kept(id);
         }
     }

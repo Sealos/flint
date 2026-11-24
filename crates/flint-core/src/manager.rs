@@ -41,6 +41,7 @@ mod file_watch;
 mod forwards;
 mod helm;
 mod keep_watching;
+mod keep_watching_lists;
 mod running_set;
 mod selected_retry;
 mod telemetry;
@@ -120,6 +121,9 @@ pub(crate) struct Cluster {
     /// Discoveries that failed in a row, for the retry backoff.
     discovery_failures: u32,
     watches: ClusterWatches,
+    /// Set while `watches` read through the cluster's kept connection rather than this slot's
+    /// ([`ClusterManager::sync_warm_lists`]): the slot's connection coming and going leaves them.
+    warm: Option<keep_watching_lists::WarmLists>,
     /// The telemetry feed on this slot's connection ([`ClusterManager::sync_telemetry`]).
     telemetry: Option<telemetry::SlotFeed>,
     /// Follows the CRD list while the cluster is active.
@@ -184,6 +188,7 @@ impl Cluster {
             discovery_retries: 0,
             discovery_failures: 0,
             watches,
+            warm: None,
             telemetry: None,
             crd_task: None,
             namespaces_task: None,
@@ -195,7 +200,9 @@ impl Cluster {
     /// Ends the slot's connection and its permission to run a credential command.
     fn clear_connection(&mut self) {
         self.telemetry = None;
-        self.watches.set_source(None);
+        if self.warm.is_none() {
+            self.watches.set_source(None);
+        }
         self.client = None;
         self.write_credential = None;
         self.access.revoke();
@@ -1175,8 +1182,9 @@ impl ClusterManager {
         // Before anything below can start a watch on the context's current server.
         self.cut_off_changed_members(Some(id));
         let wanted = self.wants_watches(id);
-        let mode = self.settings.watch_mode_for(id);
-        let subscribed: HashSet<KindId> = self
+        let warm_kinds = self.warm_background_kinds(id);
+        let mut mode = self.settings.watch_mode_for(id);
+        let mut subscribed: HashSet<KindId> = self
             .subscriptions
             .values()
             .filter(|(c, _, member)| {
@@ -1188,6 +1196,12 @@ impl ClusterManager {
             })
             .map(|(_, k, _)| k.clone())
             .collect();
+        // Warm lists in the background keep the kinds they had, whatever the mode.
+        let watching = wanted || warm_kinds.is_some();
+        if let Some(kinds) = warm_kinds {
+            mode = crate::settings::WatchMode::OnView;
+            subscribed.extend(kinds);
+        }
         let hubs = self.hubs.clone();
         let internal = self.internal_tx.clone();
         let paused = self.paused(id);
@@ -1209,10 +1223,10 @@ impl ClusterManager {
         }
         // Paused, what runs goes on and nothing new starts; the load that ends it catches up.
         if paused {
-            slot.watches.stop_unwanted(wanted, mode, &subscribed);
+            slot.watches.stop_unwanted(watching, mode, &subscribed);
             return;
         }
-        slot.watches.reconcile(wanted, mode, &subscribed);
+        slot.watches.reconcile(watching, mode, &subscribed);
         if follow && slot.crd_task.is_none() {
             let follower =
                 Follower::new(&hubs, id, KindId::custom_resource_definitions(), &internal);
@@ -1670,11 +1684,14 @@ impl ClusterManager {
                 };
                 match result {
                     Ok((connection, version)) => {
-                        slot.watches.set_source(Some(KubeSource::new(
-                            connection.clients.read.clone(),
-                            Some(&version),
-                            target,
-                        )));
+                        // Warm lists go on reading through the kept connection.
+                        if slot.warm.is_none() {
+                            slot.watches.set_source(Some(KubeSource::new(
+                                connection.clients.read.clone(),
+                                Some(&version),
+                                target,
+                            )));
+                        }
                         slot.client = Some(connection.clients);
                         slot.write_credential = Some(connection.credential);
                         slot.state = ConnectionState::Connected(version);

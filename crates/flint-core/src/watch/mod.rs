@@ -312,6 +312,15 @@ impl ClusterWatches {
     pub fn is_running(&self, kind: &KindId) -> bool {
         self.running.contains_key(kind)
     }
+
+    /// The task running each kind, so a test can tell a watch kept from one started over.
+    #[cfg(test)]
+    pub fn tasks(&self) -> HashMap<KindId, tokio::task::Id> {
+        self.running
+            .iter()
+            .map(|(id, r)| (id.clone(), r.task.id()))
+            .collect()
+    }
 }
 
 impl Drop for ClusterWatches {

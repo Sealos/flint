@@ -56,6 +56,15 @@ launch**.
   feed that is up, on the slot and whole definition it was started for, is handed over; a changed definition or
   ended consent drops it, and the slot's own connection starts a feed. Writes still go through the slot and its
   gate. A feed still connecting is dropped on selection, as before.
+- **Warm lists.** While a watched cluster is selected and its feed's connection is up, its resource watches read
+  through that connection's read client too. Leaving the cluster keeps them running, except Events, Leases and
+  EndpointSlices, so selecting it again lists nothing anew even when the slot signs in again. At most 3 clusters
+  keep warm lists in the background, the most recently left. Whatever drops the feed's connection (a changed
+  definition or credential, a pause, ended consent, a failure) drops the warm lists with it: the selected cluster
+  lists again on the slot's own connection, and a background one stops its watches.
+- **A handed-over feed that fails.** If the feed's credential fails while its cluster is selected, the feed ends
+  without stopping keep watching: the slot's working connection starts a feed in its place, so alerts go on, and
+  leaving the cluster starts a background feed again. A failure in the background still waits for a sign-in.
 - **Members of a cluster set** ([ADR-0014](./0014-cluster-sets-and-combined-views.md)). The consent below also lets a
   set member that is not selected connect its own slot under the same rules: no prompt, a null stdin, bound to the
   whole definition, never saved, and no auth providers. That connection stays when the member is selected and when
