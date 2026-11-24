@@ -227,6 +227,93 @@ async fn leaving_the_set_drops_a_consented_connection() {
     assert!(slot.connect_task.is_none());
 }
 
+// A kubeconfig file change ends a member's sign-in still running, so a token from before the new
+// definitions are read never brings its connection up.
+#[tokio::test]
+async fn a_file_change_ends_a_members_sign_in_in_progress() {
+    let plugin = FakePlugin::hanging();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    open_set(&mut manager);
+    let consented = manager
+        .cluster("dev")
+        .unwrap()
+        .access
+        .grant(CredentialSource::Plugin);
+    let (leader, _) = plugin.wait_started().await;
+    let sign_in = consented.lease();
+
+    manager
+        .handle_internal(Internal::FilesChanged(Changed {
+            kubeconfig: true,
+            settings: false,
+            activity: false,
+            rearm: false,
+        }))
+        .await;
+
+    assert!(!sign_in.holds(), "the sign-in under way ended");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while live(leader) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the plugin should have been killed");
+    // Whatever the attempt reports, the member does not come up on it.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while matches!(
+            manager.cluster("dev").unwrap().state,
+            ConnectionState::Connecting
+        ) {
+            let internal = manager.internal_rx.as_mut().unwrap();
+            if let Ok(Some(message)) =
+                tokio::time::timeout(Duration::from_millis(50), internal.recv()).await
+            {
+                manager.handle_internal(message).await;
+            }
+        }
+    })
+    .await
+    .expect("the attempt should have ended");
+    assert!(!matches!(
+        manager.cluster("dev").unwrap().state,
+        ConnectionState::Connected(_)
+    ));
+    assert_ne!(dev_state(&manager), MemberState::Live);
+}
+
+// A definition that no longer runs a command still ends the access of a connection made under
+// consent: nothing demotes it, so the access must not stay live.
+#[tokio::test]
+async fn a_member_whose_credential_stops_running_a_command_loses_its_consent_access() {
+    let plugin = FakePlugin::hanging();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    open_set(&mut manager);
+    let consented = manager
+        .cluster("dev")
+        .unwrap()
+        .access
+        .grant(CredentialSource::Plugin);
+    assert!(consented.allowed());
+
+    // The definition now shows a static token, read without replacing the slot.
+    let path = plugin.dir.path().join("kubeconfig");
+    let yaml = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace(&plugin.user_yaml(), "    token: t\n");
+    std::fs::write(&path, yaml).unwrap();
+    manager.kubeconfig = Arc::new(crate::kubeconfig::load(std::slice::from_ref(&path)));
+    assert!(!manager.runs_a_command("dev"));
+    manager.sync_keep_watching();
+
+    assert!(!consented.allowed());
+    assert!(!manager.cluster("dev").unwrap().access.unattended() || !dev_may_run(&manager));
+}
+
 // Turning the consent off ends a member's connection made under it, and kills its plugin.
 #[tokio::test]
 async fn turning_consent_off_ends_a_members_connection() {

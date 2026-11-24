@@ -410,8 +410,9 @@ impl ClusterManager {
                 kept.access.set_role(Role::Paused);
             }
         }
-        // A member's refresh too; one still connecting answers through its result.
-        for id in self.consented_members(false) {
+        // A member's too. One still connecting ends: its result reports the ended consent, so
+        // no token from before the read brings it up.
+        for id in self.consented_members(true) {
             if let Some(slot) = self.cluster(&id) {
                 slot.access.set_role(Role::Paused);
             }
@@ -594,6 +595,11 @@ impl ClusterManager {
         ended.retain(|id| self.member_consent(id).is_none());
         let now = Instant::now();
         for id in ended {
+            // Ended here whatever the credential shows now: one that no longer runs a command
+            // is not demoted below, and its access would otherwise go on.
+            if let Some(slot) = self.cluster(&id) {
+                slot.access.revoke();
+            }
             if self.active.as_deref() == Some(id.as_str()) {
                 self.reconnect_selected(&id);
             } else {
