@@ -106,6 +106,13 @@ pub struct CombinedObject {
     pub uid: Box<str>,
 }
 
+/// A selection as it stood, to put back.
+struct CombinedSelectionBefore {
+    selected: Option<CombinedRowId>,
+    line: Option<usize>,
+    seen: Option<RowSeen>,
+}
+
 pub enum CombinedListEvent {
     /// A row was selected, with its own cluster, or the selection was cleared.
     Selected(Option<CombinedRowId>),
@@ -144,6 +151,8 @@ pub struct CombinedResourceList {
     selected_line: Option<usize>,
     /// Where the selected row was last listed, to tell it gone from no longer covered.
     selected_seen: Option<RowSeen>,
+    /// The selection the last change replaced, for [`Self::undo_selection`].
+    selection_before: Option<CombinedSelectionBefore>,
     /// Whether `view` is a finished computation, not the empty one the list opens with.
     view_ready: bool,
     /// Down in the filter while rows were computing: select the first row once they land.
@@ -220,6 +229,7 @@ impl CombinedResourceList {
             selected: None,
             selected_line: None,
             selected_seen: None,
+            selection_before: None,
             view_ready: false,
             select_first_in: None,
             measured: None,
@@ -297,11 +307,46 @@ impl CombinedResourceList {
 
     /// Clears the selection, as Esc does.
     pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        let before = self.selection_now();
         self.selected_line = None;
         self.selected_seen = None;
         if self.selected.take().is_some() {
+            self.selection_before = Some(before);
             cx.emit(CombinedListEvent::Selected(None));
             cx.notify();
+        }
+    }
+
+    fn selection_now(&self) -> CombinedSelectionBefore {
+        CombinedSelectionBefore {
+            selected: self.selected.clone(),
+            line: self.selected_line,
+            seen: self.selected_seen.clone(),
+        }
+    }
+
+    /// Puts back the selection the last change replaced, saying nothing: whether there was one.
+    /// A row that left the list has none to go back to.
+    pub(in crate::ui) fn undo_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(before) = self.selection_before.take() else {
+            return false;
+        };
+        self.selected = before.selected;
+        self.selected_line = before.line;
+        self.selected_seen = before.seen;
+        cx.notify();
+        true
+    }
+
+    /// Selects `wanted` again, as asked for before a question about leaving the row shown.
+    pub(in crate::ui) fn reselect(
+        &mut self,
+        wanted: &CombinedRowId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(line) = model::line_of(&self.shown.list, &self.view, wanted) {
+            self.select_line(line, window, cx);
         }
     }
 
@@ -563,6 +608,7 @@ impl CombinedResourceList {
             self.selected_line = tracked.line;
             self.selected_seen = tracked.seen;
             if tracked.gone {
+                self.selection_before = None;
                 self.selected = None;
                 self.selected_line = None;
                 self.selected_seen = None;
@@ -618,11 +664,13 @@ impl CombinedResourceList {
         if self.problems_hide(&id) {
             return;
         }
+        let before = self.selection_now();
         window.focus(&self.focus, cx);
         self.selected_line = Some(line);
         self.selected_seen = model::row_seen(&self.shown, at);
         self.scroll.scroll_to_item(line, ScrollStrategy::Top);
         if self.selected.as_ref() != Some(&id) {
+            self.selection_before = Some(before);
             self.selected = Some(id.clone());
             cx.emit(CombinedListEvent::Selected(Some(id)));
         }

@@ -552,10 +552,17 @@ impl WorkloadFeed {
 }
 
 impl WorkloadFeed {
-    /// Checks the context every [`RECHECK_EVERY`] while the pod watch is open. Ready with the
-    /// error that ends the session, or `None` when a check finished without one.
+    /// Also checks the context as soon as `route_changes` moves.
+    pub fn rechecking_on(mut self, route_changes: tokio::sync::watch::Receiver<u64>) -> Self {
+        self.recheck = Recheck::new(RECHECK_EVERY).waking_on(route_changes);
+        self
+    }
+
+    /// Checks the context every [`RECHECK_EVERY`] while the pod watch is open or a log stream is
+    /// live, since streams outlast a broken watch. Ready with the error that ends the session, or
+    /// `None` when a check finished without one.
     fn poll_recheck(&mut self, cx: &mut Context<'_>) -> Poll<Option<String>> {
-        if !matches!(self.watch, Watch::Events(_)) {
+        if !matches!(self.watch, Watch::Events(_)) && self.live() == 0 {
             return Poll::Pending;
         }
         let pods = &self.pods;
@@ -1292,6 +1299,190 @@ mod tests {
             }
         );
         assert!(pods_of(&s).streams.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_route_change_ends_a_pod_stream_at_once() {
+        let subject = crate::logs::LogSubject::Pod(crate::logs::LogTarget {
+            namespace: "ns".into(),
+            pod: "web-a".into(),
+            container: Some("app".into()),
+        });
+        let pods = Arc::new(FakePods::default());
+        let logs = Arc::new(FakeLogs::default());
+        let (tx, mut rx) = watch::channel(Arc::new(LogSnapshot::connecting()));
+        let (_paused, paused_rx) = watch::channel(false);
+        let (route_tx, route_rx) = tokio::sync::watch::channel(0);
+        let config = config(100, 32);
+        let feed = crate::logs::session::feed(
+            subject,
+            LogOptions::default(),
+            &config,
+            logs,
+            pods.clone(),
+            route_rx,
+        );
+        tokio::spawn(run(feed, config, tx, paused_rx, None));
+        rx.wait_for(|s| s.state == LogState::Streaming)
+            .await
+            .unwrap();
+
+        *pods.check.lock().unwrap() = Some(LogError::cluster("moved"));
+        route_tx.send_modify(|at| *at += 1);
+
+        tokio::time::timeout(
+            RECHECK_EVERY / 2,
+            rx.wait_for(|s| matches!(s.state, LogState::Ended { .. })),
+        )
+        .await
+        .expect("it waited for the timed recheck")
+        .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_route_change_ends_a_workload_stream_at_once() {
+        let pods = Arc::new(FakePods::default());
+        let logs = Arc::new(FakeLogs::default());
+        let (events_tx, events) = mpsc::unbounded();
+        pods.watches.lock().unwrap().push_back(events);
+        let (tx, rx) = watch::channel(Arc::new(LogSnapshot::connecting()));
+        let (paused, paused_rx) = watch::channel(false);
+        let (route_tx, route_rx) = watch::channel(0);
+        let config = config(1000, 32);
+        let feed = WorkloadFeed::new(
+            logs.clone(),
+            pods.clone(),
+            target(deployment(), None),
+            LogOptions::default(),
+            config,
+        )
+        .rechecking_on(route_rx);
+        tokio::spawn(run(Box::new(feed), config, tx, paused_rx, None));
+        let mut running = Running {
+            rx,
+            _paused: paused,
+            pods,
+            logs,
+            watch: events_tx,
+        };
+        running.list(vec![pod("web-a", "a", &[("app", true)])]);
+        running.opened("web-a/app").await;
+
+        *running.pods.check.lock().unwrap() = Some(LogError::cluster("moved"));
+        route_tx.send_modify(|at| *at += 1);
+
+        tokio::time::timeout(
+            RECHECK_EVERY / 2,
+            running.until(|s| matches!(s.state, LogState::Ended { .. })),
+        )
+        .await
+        .expect("it waited for the timed recheck");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_route_change_ends_streams_while_the_watch_is_down() {
+        let pods = Arc::new(FakePods::default());
+        let logs = Arc::new(FakeLogs::default());
+        let (events_tx, events) = mpsc::unbounded();
+        pods.watches.lock().unwrap().push_back(events);
+        let (tx, rx) = watch::channel(Arc::new(LogSnapshot::connecting()));
+        let (paused, paused_rx) = watch::channel(false);
+        let (route_tx, route_rx) = watch::channel(0);
+        let config = config(1000, 32);
+        let feed = WorkloadFeed::new(
+            logs.clone(),
+            pods.clone(),
+            target(deployment(), None),
+            LogOptions::default(),
+            config,
+        )
+        .rechecking_on(route_rx);
+        tokio::spawn(run(Box::new(feed), config, tx, paused_rx, None));
+        let mut running = Running {
+            rx,
+            _paused: paused,
+            pods,
+            logs,
+            watch: events_tx,
+        };
+        running.list(vec![pod("web-a", "a", &[("app", true)])]);
+        running.opened("web-a/app").await;
+        running
+            .watch
+            .unbounded_send(Err(LogError::retry("the watch broke")))
+            .unwrap();
+        // Yielding keeps the paused clock still, so the watch stays in its backoff.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        let before = *running.pods.checks.lock().unwrap();
+
+        *running.pods.check.lock().unwrap() = Some(LogError::cluster("moved"));
+        route_tx.send_modify(|at| *at += 1);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            *running.pods.checks.lock().unwrap() > before,
+            "the route was not checked while the watch was down"
+        );
+        // Snapshots go out on a tick, so this one needs the clock.
+        tokio::time::timeout(
+            RECHECK_EVERY / 2,
+            running.until(|s| matches!(s.state, LogState::Ended { .. })),
+        )
+        .await
+        .expect("the stream outlived its route");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_open_pod_stream_ends_when_its_route_changes() {
+        let pods = Arc::new(FakePods::default());
+        let logs = Arc::new(FakeLogs::default());
+        let (tx, mut rx) = watch::channel(Arc::new(LogSnapshot::connecting()));
+        let (_paused, paused_rx) = watch::channel(false);
+        let config = config(100, 32);
+        let subject = crate::logs::LogSubject::Pod(crate::logs::LogTarget {
+            namespace: "ns".into(),
+            pod: "web-a".into(),
+            container: Some("app".into()),
+        });
+        let feed = crate::logs::session::feed(
+            subject,
+            LogOptions::default(),
+            &config,
+            logs.clone(),
+            pods.clone(),
+            tokio::sync::watch::channel(0).1,
+        );
+        tokio::spawn(run(feed, config, tx, paused_rx, None));
+        rx.wait_for(|s| s.state == LogState::Streaming)
+            .await
+            .unwrap();
+
+        // A check that only finds the cluster reconnecting leaves the stream open.
+        *pods.check.lock().unwrap() = Some(LogError::retry("connecting to \"dev\""));
+        tokio::time::sleep(RECHECK_EVERY + Duration::from_secs(1)).await;
+        assert_eq!(rx.borrow().state, LogState::Streaming);
+
+        let why = "\"dev\" now points to a different API server";
+        *pods.check.lock().unwrap() = Some(LogError::cluster(why));
+        let ended = tokio::time::timeout(
+            RECHECK_EVERY * 2,
+            rx.wait_for(|s| matches!(s.state, LogState::Ended { .. })),
+        )
+        .await
+        .expect("the stream stayed open")
+        .unwrap()
+        .clone();
+        assert!(
+            matches!(&ended.state, LogState::Ended { error: Some(e), .. } if e == why),
+            "{:?}",
+            ended.state
+        );
+        assert_eq!(logs.requests.lock().unwrap().len(), 1, "it did not reopen");
     }
 
     // covers UP-45: lines held while a reconnect looks for its overlap survive the session ending.

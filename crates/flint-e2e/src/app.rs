@@ -64,6 +64,39 @@ const ANSWER: Duration = Duration::from_secs(60);
 const QUIT_ANSWER: Duration = Duration::from_secs(2);
 /// The title of the question Quit asks while a session would end (#177).
 const QUIT_DIALOG: &str = "Quit Flint?";
+/// The question Quit asks first over an unapplied YAML edit.
+const DISCARD_EDIT_DIALOG: &str = "Discard unapplied edit?";
+/// What the teardown does about the dialog it sees.
+#[derive(Debug, PartialEq, Eq)]
+enum QuitDialogStep {
+    Wait,
+    Confirm,
+    Unexpected(String),
+}
+
+/// Decides on `dialog`. `before_quit` says it was already open when Quit was asked for, so Quit
+/// did not create it. `answered` is the question last confirmed, until it has closed.
+fn quit_dialog_step(
+    dialog: Option<&str>,
+    before_quit: bool,
+    answered: &mut Option<String>,
+) -> QuitDialogStep {
+    match dialog {
+        None => {
+            *answered = None;
+            QuitDialogStep::Wait
+        }
+        Some(title) if before_quit => QuitDialogStep::Unexpected(title.to_owned()),
+        // Answered already: it is still closing, or the app is quitting.
+        Some(title) if answered.as_deref() == Some(title) => QuitDialogStep::Wait,
+        Some(title @ (QUIT_DIALOG | DISCARD_EDIT_DIALOG)) => {
+            *answered = Some(title.to_owned());
+            QuitDialogStep::Confirm
+        }
+        Some(other) => QuitDialogStep::Unexpected(other.to_owned()),
+    }
+}
+
 /// How long a stalled app has to answer the teardown's quit check before the check fails.
 const QUIT_CHECK: Duration = Duration::from_secs(15);
 /// How long the app has to exit once it took the quit.
@@ -469,6 +502,20 @@ impl App {
         self.request_within(cmd, args, timeout)
     }
 
+    /// [`App::request`] whose whole exchange (connecting, sending, reading the answer) must fit in
+    /// `deadline`. The app may still run a request that timed out here.
+    pub fn request_by(
+        &self,
+        cmd: &str,
+        args: Value,
+        deadline: Duration,
+    ) -> Result<Value, AppError> {
+        let line = self.request_line(cmd, &args);
+        let answer = exchange_by(&self.socket, &line, deadline)
+            .map_err(|e| self.error("transport", format!("{cmd}: {e}"), None))?;
+        self.response(cmd, &answer)
+    }
+
     fn request_within(&self, cmd: &str, args: Value, timeout: Duration) -> Result<Value, AppError> {
         let line = self.request_line(cmd, &args);
         let answer = exchange(&self.socket, &line, timeout)
@@ -654,6 +701,12 @@ impl App {
         self.request("press_key", json!({ "key": key }))
     }
 
+    /// Left-clicks the drawn element `id` (a dialog's `ok`), as the mouse does, whatever holds
+    /// focus.
+    pub fn click(&self, id: &str) -> Result<Value, AppError> {
+        self.request("click", json!({ "id": id }))
+    }
+
     /// Right-clicks the drawn element `id` (a row's `row-<uid>`, from the state's
     /// `list.rows[].id`), as the mouse does: opens its context menu (`state.menu`).
     pub fn right_click(&self, id: &str) -> Result<Value, AppError> {
@@ -755,51 +808,61 @@ impl App {
         let mut deadline = Instant::now() + QUIT_CHECK;
         let mut no_answer = None;
         let mut asked = false;
-        let mut confirmed = false;
+        let mut confirmed: Option<String> = None;
+        let mut still_open = None;
         while is_running(child) && Instant::now() < deadline {
-            // Quit asks first while a shell runs or a log tab follows (#177). Confirm only that
-            // question, read off the open dialog's title: any other dialog is a bug to report,
-            // not one to click through.
-            let dialog = if !asked {
+            // Quit asks first over an unapplied YAML edit (#394), then while a shell runs or a
+            // log tab follows (#177). Confirm only those questions, each once, read off the open
+            // dialog's title. A dialog open before Quit was asked for, or any other one, is a bug
+            // to report, not one to click through.
+            let (dialog, before_quit) = if !asked {
                 // A request that timed out may still run. That is safe: it quits only with no
-                // dialog open, so the app exiting afterwards means there was none.
+                // dialog open, so the app exiting afterwards means there was none. A question it
+                // raised then reads as open before Quit, and fails the teardown: never a pass.
                 match self.quit_unless_dialog() {
                     Ok(dialog) => {
                         asked = true;
                         no_answer = None;
                         deadline = Instant::now() + QUIT_EXIT;
-                        dialog
+                        (dialog, true)
                     }
                     Err(error) => {
                         no_answer = Some(format!("{}: {}", error.code, error.message));
-                        None
+                        (None, false)
                     }
                 }
-            } else if confirmed {
-                None
             } else {
-                // The app may quit while it answers.
-                self.request_within("state", Value::Null, QUIT_ANSWER)
-                    .ok()
-                    .and_then(|state| state["dialog"]["title"].as_str().map(str::to_owned))
+                // The app may quit while it answers: no answer says nothing about the dialog.
+                match self.request_within("state", Value::Null, QUIT_ANSWER) {
+                    Ok(state) => (state["dialog"]["title"].as_str().map(str::to_owned), false),
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
+                }
             };
-            match dialog.as_deref() {
-                None => {}
-                Some(QUIT_DIALOG) => {
+            still_open.clone_from(&dialog);
+            match quit_dialog_step(dialog.as_deref(), before_quit, &mut confirmed) {
+                QuitDialogStep::Wait => {}
+                QuitDialogStep::Confirm => {
                     let _ = self.request_within(
                         "dispatch_action",
                         json!({"name": "ui::Confirm"}),
                         QUIT_ANSWER,
                     );
-                    confirmed = true;
                 }
-                Some(other) => {
+                QuitDialogStep::Unexpected(other) => {
                     return Err(format!(
                         "the teardown found an unexpected dialog open: {other:?}"
                     ));
                 }
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+        if let Some(title) = still_open.filter(|_| is_running(child)) {
+            return Err(format!(
+                "the teardown confirmed a dialog that did not end the app: {title:?}"
+            ));
         }
         match no_answer {
             Some(error) if is_running(child) => Err(format!(
@@ -1120,6 +1183,42 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     use super::*;
+
+    // A question open before Quit was asked for is the test's, however it is worded.
+    #[test]
+    fn the_teardown_rejects_a_dialog_open_before_quit() {
+        for title in [DISCARD_EDIT_DIALOG, QUIT_DIALOG, "Delete web?"] {
+            assert_eq!(
+                quit_dialog_step(Some(title), true, &mut None),
+                QuitDialogStep::Unexpected(title.to_owned()),
+            );
+        }
+    }
+
+    // Quit's own questions are confirmed once each, and a second of the same title (another
+    // window's edit) once the first has closed.
+    #[test]
+    fn the_teardown_confirms_only_what_quit_asked() {
+        let mut answered = None;
+        let step = |title, answered: &mut _| quit_dialog_step(title, false, answered);
+        assert_eq!(
+            step(Some(DISCARD_EDIT_DIALOG), &mut answered),
+            QuitDialogStep::Confirm
+        );
+        assert_eq!(
+            step(Some(DISCARD_EDIT_DIALOG), &mut answered),
+            QuitDialogStep::Wait
+        );
+        assert_eq!(step(None, &mut answered), QuitDialogStep::Wait);
+        assert_eq!(
+            step(Some(DISCARD_EDIT_DIALOG), &mut answered),
+            QuitDialogStep::Confirm
+        );
+        assert_eq!(
+            step(Some("Delete web?"), &mut answered),
+            QuitDialogStep::Unexpected("Delete web?".to_owned())
+        );
+    }
 
     /// Reads one line from a connection.
     fn read_request(stream: &UnixStream) -> String {

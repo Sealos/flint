@@ -30,8 +30,10 @@ pub struct ContextInfo {
     pub namespace: Option<String>,
     /// The API server URL, if the referenced cluster entry exists.
     pub server: Option<String>,
-    /// The cluster entry's `proxy-url`, if it has one: requests go through it, so the server's
-    /// address alone does not say where they lead.
+    /// The proxy requests go through, from the cluster entry's `proxy-url` or the environment,
+    /// so the server's address alone does not say where they lead. Scheme, host and port, plus
+    /// after a `#` an opaque digest of its account if it has one, so pins and grants tell
+    /// accounts apart: never its credentials. Show it through [`crate::redact::server_url`].
     pub proxy_url: Option<String>,
     /// The file whose definition of this context won the merge.
     pub source: PathBuf,
@@ -43,6 +45,15 @@ impl ContextInfo {
         let server = self.server.as_deref()?;
         let rest = server.split_once("://").map_or(server, |(_, r)| r);
         Some(rest.split('/').next().unwrap_or(rest))
+    }
+
+    /// What a grant on this context is pinned to: its server and the proxy it is reached through.
+    pub fn grant_server(&self) -> Option<String> {
+        let server = self.server.as_deref()?;
+        Some(
+            crate::connection::proxy::grant_endpoint(server, self.proxy_url.as_deref())
+                .into_owned(),
+        )
     }
 }
 
@@ -294,6 +305,9 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
             });
         }
     }
+    let environment = crate::connection::proxy::ProxyEnvironment::current();
+    // Once per distinct proxy URL in a load, since each one with an account reads the route key.
+    let mut identities: HashMap<String, String> = HashMap::new();
     for info in &mut contexts {
         let entry = info.cluster.as_ref().and_then(|cluster| {
             merged
@@ -303,7 +317,17 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
                 .and_then(|c| c.cluster.as_ref())
         });
         info.server = entry.and_then(|c| c.server.clone());
-        info.proxy_url = entry.and_then(|c| c.proxy_url.clone());
+        info.proxy_url = crate::connection::proxy::chosen(
+            entry.and_then(|c| c.proxy_url.as_deref()),
+            info.server.as_deref(),
+            &environment,
+        )
+        .map(|proxy| {
+            identities
+                .entry(proxy.to_owned())
+                .or_insert_with(|| crate::connection::proxy::route_identity(proxy))
+                .clone()
+        });
     }
     LoadedKubeconfig {
         merged,

@@ -76,6 +76,26 @@ pub(super) fn is_review(method: &Method, route: &Route) -> bool {
         )
 }
 
+/// Whether this request creates a `SelfSubjectReview`: who the credential is.
+pub(super) fn is_identity_review(method: &Method, route: &Route) -> bool {
+    method == Method::POST
+        && matches!(
+            route,
+            Route::Collection { gvr, namespace: None }
+                if *gvr == Gvr::new("authentication.k8s.io", "v1", "selfsubjectreviews")
+        )
+}
+
+/// A `SelfSubjectReview` naming `username`.
+pub(super) fn identity(username: &str) -> Value {
+    json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "SelfSubjectReview",
+        "metadata": {},
+        "status": {"userInfo": {"username": username}},
+    })
+}
+
 /// The review `body` asks for, with its status.
 pub(super) fn answer(policy: &AccessPolicy, body: &[u8]) -> Result<Value, ApiError> {
     let mut review: Value = serde_json::from_slice(body)

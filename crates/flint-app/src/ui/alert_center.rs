@@ -1098,10 +1098,16 @@ impl AlertCenter {
                 skipped_groups: d.incomplete_groups.clone(),
                 stale_groups: Vec::new(),
             });
+        // Exposure is pinned to the server and its proxy, as the context shows them now.
+        let granted = model
+            .clusters
+            .iter()
+            .find(|c| c.info.name == context && c.info.server == recent.origin.pin.server)
+            .and_then(|c| c.info.grant_server());
         match event_prompt(
             &recent.event,
             settings,
-            recent.origin.pin.server.as_deref(),
+            granted.as_deref(),
             discovered.as_ref(),
         ) {
             InvestigatePrompt::Ready(prompt) => Ok(prompt),

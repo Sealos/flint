@@ -76,7 +76,7 @@ impl std::error::Error for PolicyError {}
 /// API server URL.
 fn is_exposed(settings: &Settings, info: &ContextInfo) -> bool {
     settings
-        .ai_exposure(&info.name, info.server.as_deref())
+        .ai_exposure(&info.name, info.grant_server().as_deref())
         .is_exposed()
 }
 
@@ -100,7 +100,7 @@ pub fn changed_exposures(settings: &Settings, kubeconfig: &LoadedKubeconfig) -> 
         .iter()
         .filter(|c| {
             matches!(
-                settings.ai_exposure(&c.name, c.server.as_deref()),
+                settings.ai_exposure(&c.name, c.grant_server().as_deref()),
                 AiExposureState::ServerChanged { .. }
             )
         })
@@ -372,7 +372,7 @@ pub fn is_object_name(name: &str) -> bool {
 /// `settings.toml` names, or everything for an entry without one.
 pub fn cluster_scope(settings: &Settings, info: &ContextInfo) -> AiScope {
     settings
-        .ai_scope(&info.name, info.server.as_deref())
+        .ai_scope(&info.name, info.grant_server().as_deref())
         .unwrap_or_default()
 }
 

@@ -216,6 +216,23 @@ fn foreground_only_stops_what_runs_a_program_in_the_background() {
     }
 }
 
+// A consented member's plugin runs selected or not, never paused or retired, and an auth
+// provider never runs under it.
+#[test]
+fn a_kept_member_runs_its_plugin_in_either_role_and_never_a_provider() {
+    let policy = KeptMember;
+    for role in [Role::Foreground, Role::Background] {
+        assert!(policy.may_run(&CredentialSource::Plugin, role));
+        assert!(!policy.may_run(&CredentialSource::AuthProvider, role));
+    }
+    for role in [Role::Paused, Role::Retired] {
+        assert!(!policy.may_run(&CredentialSource::Plugin, role));
+    }
+    let access = CredentialAccess::consented_member(Arc::new(|| {}), None, PluginRuns::default());
+    assert!(access.unattended());
+    assert!(!foreground_only(Role::Background).unattended());
+}
+
 #[tokio::test]
 async fn a_grant_follows_the_role() {
     let access = foreground_only(Role::Foreground);

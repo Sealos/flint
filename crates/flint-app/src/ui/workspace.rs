@@ -280,6 +280,8 @@ pub struct Workspace {
     /// A right-click selected a row whose detail has not opened yet: the list stays in front
     /// when it does.
     menu_row_pending: bool,
+    /// The detail pane, when it outlived its list to keep an edit.
+    held_edit: Option<unapplied::HeldEdit>,
     /// What last had focus in the list or the detail with no dialog open, and the layout that
     /// hides it: a dialog gives focus back to it, though it may have been hidden meanwhile.
     pane_focus: Option<(WeakFocusHandle, MainPanes)>,
@@ -328,6 +330,9 @@ pub struct Workspace {
     /// Why the last Logs or Shell did not open, shown over the dock until the next one does,
     /// the selection, list or cluster changes, or [`ACTION_ERROR_SHOWN`] has passed.
     action_error: Option<String>,
+    /// The reason stays for all of [`ACTION_ERROR_SHOWN`]: it is about the cluster changing, so
+    /// that change, and the list reopening after it, must not take it away.
+    action_error_held: bool,
     _action_error: Task<()>,
     /// The review a resource action is waiting for.
     _write_review: Task<()>,
@@ -469,6 +474,7 @@ impl Workspace {
             list_in_front: false,
             right_press: false,
             menu_row_pending: false,
+            held_edit: None,
             pane_focus: None,
             dock,
             palette: None,
@@ -489,6 +495,7 @@ impl Workspace {
             startup_yaml: startup_view.as_ref().is_some_and(|v| v.yaml),
             startup_logs: startup_view.as_ref().is_some_and(|v| v.logs),
             action_error: None,
+            action_error_held: false,
             _action_error: Task::ready(()),
             _write_review: Task::ready(()),
             startup_view,
@@ -816,18 +823,34 @@ impl Workspace {
 
     /// Says why Logs or Shell did not open, over the dock, for [`ACTION_ERROR_SHOWN`].
     pub(in crate::ui) fn refuse(&mut self, why: String, cx: &mut Context<Self>) {
+        self.show_action_error(why, false, cx);
+    }
+
+    /// [`Self::refuse`] for a reason that is about the cluster changing: it outlasts that change.
+    pub(in crate::ui) fn refuse_held(&mut self, why: String, cx: &mut Context<Self>) {
+        self.show_action_error(why, true, cx);
+    }
+
+    fn show_action_error(&mut self, why: String, held: bool, cx: &mut Context<Self>) {
         tracing::warn!("{why}");
         self.action_error = Some(why);
+        self.action_error_held = held;
         let timer = cx.background_executor().timer(ACTION_ERROR_SHOWN);
         self._action_error = cx.spawn(async move |this, cx| {
             timer.await;
-            let _ = this.update(cx, |ws, cx| ws.clear_action_error(cx));
+            let _ = this.update(cx, |ws, cx| {
+                ws.action_error_held = false;
+                ws.clear_action_error(cx);
+            });
         });
         cx.notify();
     }
 
     /// Takes the reason a Logs or Shell did not open away: it no longer applies.
     fn clear_action_error(&mut self, cx: &mut Context<Self>) {
+        if self.action_error_held {
+            return;
+        }
         if self.action_error.take().is_some() {
             self._action_error = Task::ready(());
             cx.notify();
@@ -959,6 +982,10 @@ impl Workspace {
                 .cluster_summary(&cluster, cx)
                 .and_then(|c| c.info.server.clone()),
         };
+        // `None` for a context that is gone; an unconfirmed one says nothing yet.
+        let endpoint = self
+            .cluster_summary(&cluster, cx)
+            .map(|c| c.confirmed.then_some(c.endpoint));
         let (connection, unsettled) =
             self.cluster_summary(&cluster, cx)
                 .map_or((None, false), |c| {
@@ -972,6 +999,11 @@ impl Workspace {
             d.set_protected(protected, label, cx);
             d.set_row_writes_paused(writes_paused, cx);
             d.set_server(server);
+            match endpoint {
+                Some(Some(endpoint)) => d.note_endpoint(endpoint, cx),
+                Some(None) => {}
+                None => d.note_context_gone(cx),
+            }
             d.set_access_connection(connection, unsettled, cx);
         });
     }
@@ -993,13 +1025,26 @@ impl Workspace {
         let handle = window.window_handle();
         // The same claim as the row actions: one write at a time per object.
         let key = resource_actions::WriteKey::of(review.target());
+        // Only for the server the review named: otherwise it is already about another connection.
+        let guard = self
+            .cluster_summary(&review.target().cluster, cx)
+            .filter(|c| c.info.server == review.target().server)
+            .and_then(|_| self.connection_guard(&review.target().cluster, cx));
+        let Some(guard) = guard else {
+            self.refuse(super::write_binding::connection_changed_text(), cx);
+            return;
+        };
         let begin = {
             let (key, detail) = (key.clone(), detail.clone());
-            move |cx: &mut App| match resource_actions::claim(
-                &key,
-                resource_actions::RunningWrite::YamlEdit,
-                cx,
-            ) {
+            // A context moved under the open confirmation stays refused even if it came back.
+            move |cx: &mut App| match match detail
+                .read_with(cx, |d, _| d.edit_moved_refusal())
+                .ok()
+                .flatten()
+            {
+                Some(why) => Err(why),
+                None => resource_actions::claim(&key, resource_actions::RunningWrite::YamlEdit, cx),
+            } {
                 Ok(()) => {
                     let _ = detail.update(cx, |d, cx| d.edit_applying(cx));
                     true
@@ -1030,6 +1075,7 @@ impl Workspace {
             review.clone(),
             &names,
             None,
+            guard,
             begin,
             move |result, cx| {
                 // First, and outside the window: a closed one must not keep the object claimed.
@@ -1084,6 +1130,14 @@ impl Workspace {
     /// Brings the navigation and main area in line with the model: the active cluster and its
     /// discovery.
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if confirm::newest_is_stale(window, cx) {
+            let this = cx.weak_entity();
+            window.defer(cx, move |window, cx| {
+                if confirm::close_stale(window, cx) {
+                    let _ = this.update(cx, |ws, cx| ws.confirmation_closed(window, cx));
+                }
+            });
+        }
         self.check_dock_servers(cx);
         self.tell_detail_sessions_blocked(cx);
         self.tell_shells_protected(cx);
@@ -1264,9 +1318,8 @@ impl Workspace {
         self.clear_action_error(cx);
         self.leave_set(cx);
         self.list = None;
-        self.detail = None;
+        self.drop_pane_unless_edited(cx);
         self._list_subscriptions.clear();
-        self._detail_subscriptions.clear();
         if self.dashboard.take().is_some() {
             self.nav.update(cx, |nav, cx| nav.set_overview(false, cx));
         }
@@ -1346,6 +1399,9 @@ impl Workspace {
             }
             return;
         }
+        if self.asks_before_leaving(window, cx, |ws, window, cx| ws.open_dashboard(window, cx)) {
+            return;
+        }
         // Any place other than the list shown: the overview is not one Go Back returns to.
         let overview = keys::Place {
             kind: KindId::new("flint.overview", "overview"),
@@ -1407,10 +1463,11 @@ impl Workspace {
     }
 
     /// Opens `entry`'s list on its own (the view last open on the cluster, `FLINT_VIEW`), not
-    /// at the user's asking: it takes focus only if the palette or the switcher is not open,
-    /// so they stay open with what was typed.
+    /// at the user's asking: it takes focus only if the palette, the switcher or a dialog is not
+    /// open, so they stay open with what was typed and keep their keys.
     fn restore_kind(&mut self, entry: &NavEntry, window: &mut Window, cx: &mut Context<Self>) {
-        let take_focus = self.palette.is_none();
+        let dialog = gpui_kit::component::WindowExt::has_active_dialog(window, cx);
+        let take_focus = self.palette.is_none() && !dialog;
         self.show_kind(entry, true, take_focus, window, cx);
     }
 
@@ -1492,6 +1549,15 @@ impl Workspace {
     ) {
         match event {
             ListEvent::Selected(None) => {
+                if self.unapplied_edit(cx).is_some() {
+                    if list.update(cx, |list, cx| list.undo_selection(cx)) {
+                        let list = list.clone();
+                        self.asks_before_leaving(window, cx, move |_, _, cx| {
+                            list.update(cx, |list, cx| list.clear_selection(cx));
+                        });
+                    }
+                    return;
+                }
                 self.menu_row_pending = false;
                 self.clear_action_error(cx);
                 self.detail = None;
@@ -1502,11 +1568,11 @@ impl Workspace {
                 release_unfocused_input(window, cx);
             }
             ListEvent::Selected(Some(selected)) => {
-                let list = list.read(cx);
+                let rows = list.read(cx);
                 let object = ObjectRef {
-                    cluster: list.cluster().to_owned(),
-                    kind: list.kind().clone(),
-                    kind_label: list.label().to_owned(),
+                    cluster: rows.cluster().to_owned(),
+                    kind: rows.kind().clone(),
+                    kind_label: rows.label().to_owned(),
                     namespace: selected.namespace.clone(),
                     name: selected.name.clone(),
                     uid: selected.uid.clone(),
@@ -1516,6 +1582,15 @@ impl Workspace {
                     .as_ref()
                     .is_some_and(|d| *d.read(cx).object() == object)
                 {
+                    return;
+                }
+                if self.unapplied_edit(cx).is_some() {
+                    if list.update(cx, |list, cx| list.undo_selection(cx)) {
+                        let (list, wanted) = (list.clone(), selected.clone());
+                        self.asks_before_leaving(window, cx, move |_, window, cx| {
+                            list.update(cx, |list, cx| list.reselect(&wanted, window, cx));
+                        });
+                    }
                     return;
                 }
                 // Moving between rows keeps the tab the user was on.
@@ -1537,16 +1612,11 @@ impl Workspace {
                     }
                     detail
                 });
-                let list = self.list.clone();
                 self._detail_subscriptions =
                     vec![
                         cx.subscribe_in(&detail, window, move |this, _, event, window, cx| {
                             match event {
-                                DetailEvent::Close => {
-                                    if let Some(list) = &list {
-                                        list.update(cx, |list, cx| list.clear_selection(cx));
-                                    }
-                                }
+                                DetailEvent::Close => this.close_detail(window, cx),
                                 DetailEvent::OpenLogs(request, focus) => {
                                     let focus = takes_focus(focus, window, cx);
                                     this.open_logs(request.clone(), focus, window, cx)
@@ -2151,7 +2221,7 @@ impl Workspace {
         let keep_watching = self
             .dashboard
             .is_some()
-            .then(|| self.render_keep_watching(&name, cx));
+            .then(|| self.render_keep_watching(&name, None, cx));
         let alerts = super::alert_center::render_button(cx);
         let first_row = super::theme::moves_window(h_flex())
             .h(px(HEADER_HEIGHT))
@@ -2217,7 +2287,13 @@ impl Workspace {
     }
 
     /// The overview's keep-watching toggle, saying what it would do and any state to act on.
-    fn render_keep_watching(&self, cluster: &str, cx: &Context<Self>) -> impl IntoElement {
+    /// `member` names a set member's copy of it, which needs ids of its own.
+    pub(super) fn render_keep_watching(
+        &self,
+        cluster: &str,
+        member: Option<&str>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let model = self.model.read(cx);
         let (status, sign_in) = model
             .keep_watching(cluster)
@@ -2225,7 +2301,7 @@ impl Workspace {
                 (view.status, view.sign_in)
             });
         let settings_ok = model.settings_error.is_none();
-        Button::new("keep-watching")
+        Button::new(member_id("keep-watching", member))
             .xsmall()
             .ghost()
             .label(keep_watching::toggle_label(status, sign_in))
@@ -2245,6 +2321,20 @@ impl Workspace {
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
         self.dashboard.as_ref()?;
+        self.background_sign_in_row(cluster, None, None, theme, cx)
+    }
+
+    /// The background sign-in toggle of `cluster` and the command it names, after `lead`.
+    /// `member` names a set member's copy of it, which needs ids of its own. None for a
+    /// credential that runs nothing.
+    pub(super) fn background_sign_in_row(
+        &self,
+        cluster: &str,
+        member: Option<&str>,
+        lead: Option<AnyElement>,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
         let view = self.model.read(cx).keep_watching(cluster)?.clone();
         if view.sign_in == BackgroundSignIn::NotNeeded {
             return None;
@@ -2254,7 +2344,7 @@ impl Workspace {
         let model = self.model.clone();
         let name = cluster.to_owned();
         let shown = view.shown_sign_in;
-        let toggle = Switch::new("background-sign-in")
+        let toggle = Switch::new(member_id("background-sign-in", member))
             .small()
             .checked(view.sign_in == BackgroundSignIn::On)
             .disabled(!enabled)
@@ -2273,7 +2363,7 @@ impl Workspace {
             });
         let command = view.command.map(|command| {
             div()
-                .id("background-sign-in-command")
+                .id(member_id("background-sign-in-command", member))
                 .min_w_0()
                 .truncate()
                 .text_xs()
@@ -2284,7 +2374,7 @@ impl Workspace {
         });
         Some(
             h_flex()
-                .id("background-sign-in-row")
+                .id(member_id("background-sign-in-row", member))
                 .w_full()
                 .flex_none()
                 .px_3()
@@ -2292,6 +2382,7 @@ impl Workspace {
                 .gap_3()
                 .border_b_1()
                 .border_color(theme.border)
+                .children(lead)
                 .child(div().flex_none().child(toggle))
                 .children(command)
                 .test_support()
@@ -2753,6 +2844,18 @@ impl Workspace {
         if let Some(set_view) = self.render_set_view(window_width, theme, cx) {
             return set_view;
         }
+        if let Some(detail) = self.edit_shown_alone(cx) {
+            return div()
+                .id("held-edit-pane")
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .relative()
+                .child(detail)
+                .children(self.detail_tag_strip(theme, cx))
+                .test_support()
+                .into_any_element();
+        }
         let model = self.model.read(cx);
         if model.loaded && model.clusters.is_empty() {
             let text = no_contexts_text(
@@ -2980,6 +3083,14 @@ pub(super) fn protection_text(
 /// A cluster as its row's controls name it: the title, then the full context when the title is
 /// not the context, since two contexts can share a title. The context is quoted and escaped, so
 /// no context or title can be written to read as another cluster's name.
+/// `base`, or for a set member's copy of a control, `base-<member>`.
+fn member_id(base: &'static str, member: Option<&str>) -> SharedString {
+    match member {
+        Some(member) => format!("{base}-{member}").into(),
+        None => base.into(),
+    }
+}
+
 fn control_name(title: &str, context: &str) -> String {
     let shown = flint_core::display::single_line(title);
     if title == context && !context.contains('"') {
@@ -3710,6 +3821,7 @@ fn namespace_button_text(filter: &[String], limit: Option<&flint_core::Namespace
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_namespace_picker_with_dialog(window, cx);
+        self.close_finished_held_edit(window, cx);
         let window_width = f32::from(window.viewport_size().width);
         let window_height = f32::from(window.viewport_size().height);
         self.sync_narrow_layout(window_width, window, cx);
@@ -3927,6 +4039,13 @@ mod narrow_layout_tests;
 #[cfg(any(test, feature = "automation"))]
 #[path = "workspace_state.rs"]
 mod state;
+
+#[path = "workspace_unapplied.rs"]
+mod unapplied;
+
+#[cfg(test)]
+#[path = "workspace_unapplied_tests.rs"]
+mod unapplied_tests;
 
 #[cfg(test)]
 #[path = "workspace_view_tests.rs"]
@@ -4150,6 +4269,19 @@ mod tests {
                 text.contains("Context: staging\\u{a}Server: https://staging.example\n"),
                 "{text}"
             );
+        }
+    }
+
+    #[test]
+    fn dialogs_show_the_server_and_its_proxy() {
+        let grant = "https://prod.example:6443 via http://proxy.example:3128";
+        for text in [
+            super::unlock_dialog("prod", "prod", grant).text,
+            super::trust_dialog("prod", "prod", grant, None).text,
+            super::expose_dialog("prod", grant, None).text,
+        ] {
+            let line = format!("Server: {grant}");
+            assert!(text.lines().any(|l| l == line), "{text}");
         }
     }
 

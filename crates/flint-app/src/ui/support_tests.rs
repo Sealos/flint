@@ -212,7 +212,7 @@ pub async fn open_workspace_with(
 
 /// The main window over the kubeconfig files `kubeconfig_base` (which may not exist or hold no
 /// contexts), with the settings in `dir/settings.toml` read as the app reads them at launch.
-fn open_window_over(
+pub(super) fn open_window_over(
     cx: &mut TestAppContext,
     dir: &Path,
     kubeconfig_base: Vec<PathBuf>,

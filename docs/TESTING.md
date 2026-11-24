@@ -137,6 +137,8 @@ A test-only control socket lets e2e tests and agents drive the real app. The cod
     (`row-<uid>`); right-clicking it selects the row and opens its menu, which `state.menu` then lists. `rejected`
     when no element, or more than one, is drawn with that id, or it is out of view (rows are virtualized).
   - `resize_window {width, height}`: resizes the window, in points (100 to 8000), to check narrow and short layouts.
+  - The app also appends `window-closed` and `quit-hooks` to `automation-lifecycle.log` in its config directory, so a
+    test can read the order of its exit after the socket is gone.
   - `state`: the visible view tree: `focus` (`workspace`, `sidebar`, `navigation`, `list`, `list_filter`,
     `namespace_input`, `detail`, `detail_yaml`,
     `dock`, `log`, `log_search`, `shell`, `dialog`, `menu`, `palette`, `other` or `none`), `dialog` (`{title, text,
@@ -667,9 +669,8 @@ milestone T; feature tests are in their feature's milestone.
   nightly memory soak test (#126).
 - **Gaps in M0 to M2:** missing and hanging exec plugins (UP-04, #130); a kubeconfig held half-written past the
   debounce (UP-06, #131); keyboard-only use, palette and switcher (UP-33, UP-30, UP-31, #132); the whole app under
-  10,000 pods, nightly (UP-26, #133); Close Window in the app (UP-42: the app under test has no active window, so
-  the action does nothing there; view tests cover it) and saving on quit (a relaunch does not prove quit saved the
-  value, #263).
+  10,000 pods, nightly (UP-26, #133); saving on quit (a relaunch does not prove quit saved the value, #263). Close
+  Window in the app is covered by `up_42_close_window_from_the_list_closes_the_window`.
 - **Later milestones:** M3 editing, actions and protection (#134); M4 views, metrics, diagram and dashboard
   (#135); M5 port-forward and Helm on kind (#136); M5.5 MCP scope, redaction, activity log
   (#137) and cluster sets (#138), with warm clusters and Claude analysis not scheduled; M6 Homebrew cask smoke (#139).

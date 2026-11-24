@@ -2435,6 +2435,29 @@ mod threshold_settings_tests {
     // covers UP-67: a value that is ignored is reported in the log, by key and without its value.
     #[test]
     fn an_ignored_threshold_is_logged() {
+        // Other settings tests reach this same callsite without a subscriber. Isolate the
+        // tracing registry so they cannot cache disabled interest for the warning.
+        const CHILD: &str = "FLINT_TEST_IGNORED_THRESHOLD_LOG_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let (_, module) = module_path!().split_once("::").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    &format!("{module}::an_ignored_threshold_is_logged"),
+                    "--exact",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            assert!(
+                stdout.contains("1 passed"),
+                "the child ran no test: {stdout}"
+            );
+            return;
+        }
+
         #[derive(Clone, Default)]
         struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl io::Write for Log {
@@ -2453,8 +2476,10 @@ mod threshold_settings_tests {
         let subscriber = tracing_subscriber::fmt()
             .with_writer(move || writer.clone())
             .with_ansi(false)
+            .without_time()
             .finish();
-        tracing::subscriber::with_default(subscriber, || load_settings(dir.path()).unwrap());
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+        load_settings(dir.path()).unwrap();
         let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
         assert!(logged.contains("cpu_percent"), "{logged}");
         assert!(!logged.contains("500"), "{logged}");

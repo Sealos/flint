@@ -1,5 +1,6 @@
 //! The [`Limits`] end to end: the server served over an in-memory pipe, the test as its client.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use rmcp::ServiceExt as _;
@@ -839,13 +840,143 @@ async fn cluster_row(server: &FlintMcp) -> Value {
 #[tokio::test]
 async fn a_cluster_row_tidies_the_proxy_field() {
     let dir = tempfile::tempdir().unwrap();
-    let url = forbidding_server("denied").await;
+    let url = "https://127.0.0.1:1";
     let proxy = "    proxy-url: http://proxyuser:proxy-pass-123@127.0.0.1:9\n";
-    let server = server_with(dir.path(), Some(&url), proxy, Limits::default());
+    let server = server_with(dir.path(), Some(url), proxy, Limits::default());
+    // Exposed at the route as loaded, which is bound to the proxy account.
+    let loaded = flint_core::kubeconfig::load(&[dir.path().join("kubeconfig")]);
+    let grant = loaded.context("silent").unwrap().grant_server().unwrap();
+    assert!(!grant.contains("proxy-pass-123"), "{grant}");
+    let (at, via) = grant.split_once(" via ").unwrap();
+    expose_through(dir.path(), at, via);
     let row = cluster_row(&server).await;
     let error = row["error"].as_str().expect("the probe failed");
-    assert!(error.contains("[REDACTED:password]"), "{row}");
+    assert!(error.contains("could not reach the proxy"), "{row}");
     assert!(!row.to_string().contains("proxy-pass-123"), "{row}");
+    assert!(!row.to_string().contains("proxyuser"), "{row}");
+}
+
+/// Exposes the test's context at `url` through `proxy`.
+fn expose_through(dir: &std::path::Path, url: &str, proxy: &str) {
+    let settings =
+        format!("[[ai_exposed_clusters]]\ncontext = \"silent\"\nserver = \"{url} via {proxy}\"\n");
+    std::fs::write(dir.join("settings.toml"), settings).unwrap();
+}
+
+/// A `CONNECT` proxy to `upstream`, and how many tunnels it opened.
+async fn counting_proxy(upstream: String) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let tunnels = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = Arc::clone(&tunnels);
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            let (upstream, count) = (upstream.clone(), Arc::clone(&count));
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if client.read_exact(&mut byte).await.is_err() {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                let Ok(mut server) = tokio::net::TcpStream::connect(&upstream).await else {
+                    return;
+                };
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = client.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await;
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+            });
+        }
+    });
+    (url, tunnels)
+}
+
+#[tokio::test]
+async fn an_exposed_cluster_connects_through_its_proxy() {
+    let dir = tempfile::tempdir().unwrap();
+    // Not TLS, so the handshake inside the tunnel fails: what counts here is the tunnel.
+    let upstream = forbidding_server("denied").await;
+    let upstream = upstream.trim_start_matches("http://").to_owned();
+    let (proxy, tunnels) = counting_proxy(upstream).await;
+    let url = "https://127.0.0.1:1";
+    let extra = format!("    proxy-url: {proxy}\n");
+    let server = server_with(dir.path(), Some(url), &extra, Limits::default());
+    expose_through(dir.path(), url, &proxy);
+    let row = cluster_row(&server).await;
+    assert!(row["error"].is_string(), "{row}");
+    assert!(tunnels.load(std::sync::atomic::Ordering::SeqCst) > 0);
+}
+
+#[tokio::test]
+async fn a_plain_http_server_is_not_read_through_a_proxy() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (url, api_accepts) = counting_listener().await;
+    let (proxy, proxy_accepts) = counting_listener().await;
+    let extra = format!("    proxy-url: {proxy}\n");
+    let server = server_with(dir.path(), Some(&url), &extra, Limits::default());
+    expose_through(dir.path(), &url, &proxy);
+    // The same context, signing in with a plugin that leaves a mark if it ever starts.
+    let (plugin, mark) = (dir.path().join("plugin"), dir.path().join("launched"));
+    std::fs::write(
+        &plugin,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nprintf '{{\"status\":{{\"token\":\"t\"}}}}'\n",
+            mark.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let kubeconfig = std::fs::read_to_string(dir.path().join("kubeconfig")).unwrap();
+    let exec = format!(
+        "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: {}\n      \
+         interactiveMode: Never\n",
+        plugin.display()
+    );
+    let kubeconfig = kubeconfig.replace("    token: not-a-real-token\n", &exec);
+    std::fs::write(dir.path().join("kubeconfig"), kubeconfig).unwrap();
+
+    let row = cluster_row(&server).await;
+
+    let error = row["error"].as_str().expect("the connection was refused");
+    assert!(error.contains("uses plain HTTP"), "{row}");
+    assert!(error.contains("Flint did not connect"), "{row}");
+    assert!(!mark.exists(), "the plugin was launched");
+    // Anything already on its way to a listener has had time to be accepted.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(api_accepts.load(Ordering::SeqCst), 0, "reached the API");
+    assert_eq!(proxy_accepts.load(Ordering::SeqCst), 0, "reached the proxy");
+}
+
+/// A listener that counts the connections it accepts.
+async fn counting_listener() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = Arc::clone(&accepts);
+    tokio::spawn(async move {
+        while listener.accept().await.is_ok() {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    (url, accepts)
+}
+
+#[tokio::test]
+async fn an_exposure_does_not_cover_another_proxy() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = forbidding_server("denied").await;
+    let extra = "    proxy-url: http://127.0.0.1:9\n";
+    // Exposed for the direct route, by `server_with`.
+    let direct = server_with(dir.path(), Some(&url), extra, Limits::default());
+    assert_eq!(cluster_row(&direct).await, Value::Null);
+    // Exposed through another proxy.
+    expose_through(dir.path(), &url, "http://127.0.0.1:10");
+    assert_eq!(cluster_row(&direct).await, Value::Null);
 }
 
 #[tokio::test]

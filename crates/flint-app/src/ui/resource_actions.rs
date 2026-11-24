@@ -40,6 +40,7 @@ use super::registry::{
 };
 use super::row_menu::Availability;
 use super::workspace::Workspace;
+use super::write_binding::{ConnectionGuard, connection_changed_text};
 use super::write_confirm;
 
 /// The most replicas a workload can have: the API's `int32`.
@@ -410,6 +411,8 @@ struct Request {
     action: ResourceAction,
     target: WriteTarget,
     proposal: WriteProposal,
+    /// The connection the action was asked for on: every step after it needs this one.
+    guard: ConnectionGuard,
 }
 
 /// Runs `action` on the selected row: its dialog if it has one, then the review.
@@ -431,9 +434,16 @@ pub(in crate::ui) fn request(
         || ws.core(cx).clone(),
         |detail| detail.read(cx).write_core().clone(),
     );
+    let Some(guard) = ws.connection_guard(&target.cluster, cx) else {
+        ws.refuse(
+            refused(Opening::Write(action), &connection_changed_text()),
+            cx,
+        );
+        return;
+    };
     let proposal = match action {
-        ResourceAction::Scale => return open_scale(ws, core, target, window, cx),
-        ResourceAction::Drain => return open_drain(core, target, window, cx),
+        ResourceAction::Scale => return open_scale(ws, core, target, guard, window, cx),
+        ResourceAction::Drain => return open_drain(core, target, guard, window, cx),
         ResourceAction::Delete => WriteProposal::Delete,
         ResourceAction::RolloutRestart => WriteProposal::RolloutRestart,
         ResourceAction::Cordon => WriteProposal::Cordon,
@@ -444,6 +454,7 @@ pub(in crate::ui) fn request(
         action,
         target,
         proposal,
+        guard,
     };
     start_review(ws, request, None, window, cx);
 }
@@ -477,6 +488,11 @@ fn reviewed(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    // A review that comes back from another connection is not offered, whatever it says.
+    if !request.guard.holds(cx) {
+        ws.refuse_held(connection_changed_text(), cx);
+        return;
+    }
     match result {
         Ok(review) => confirm_review(ws, request, review, note, window, cx),
         // Another object has the name now: this review is of that one, and says so.
@@ -538,6 +554,7 @@ fn confirm_review(
         review,
         &names,
         note.as_deref(),
+        request.guard.clone(),
         begin,
         move |result, cx| {
             // First, and outside the window: a closed one must not keep the object claimed.
@@ -791,6 +808,7 @@ fn open_scale(
     ws: &mut Workspace,
     core: flint_core::CoreHandle,
     target: WriteTarget,
+    guard: ConnectionGuard,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -808,7 +826,9 @@ fn open_scale(
     let this = cx.weak_entity();
     let content = field.clone().into();
     let pinned = write_confirm::target_lines(&target).len();
-    confirm::open_pinned_with(window, cx, text, pinned, content, move |window, cx| {
+    let held = guard.clone();
+    let on_ok = move |window: &mut Window, cx: &mut App| {
+        let guard = held.clone();
         let typed = field.read(cx).input.read(cx).value().to_string();
         let to = match parse_replicas(&typed) {
             Ok(to) => to,
@@ -825,10 +845,12 @@ fn open_scale(
             action: ResourceAction::Scale,
             target: target.clone(),
             proposal: WriteProposal::Scale { to },
+            guard,
         };
         let _ = this.update(cx, |ws, cx| start_review(ws, request, None, window, cx));
         true
-    });
+    };
+    confirm::open_pinned_guarded(window, cx, text, pinned, Some(content), guard, on_ok);
     input.update(cx, |input, cx| input.focus(window, cx));
 }
 
@@ -934,6 +956,7 @@ impl Render for DrainChoices {
 fn open_drain(
     core: flint_core::CoreHandle,
     target: WriteTarget,
+    guard: ConnectionGuard,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -942,7 +965,9 @@ fn open_drain(
     let this = cx.weak_entity();
     let content = choices.clone().into();
     let pinned = write_confirm::target_lines(&target).len();
-    confirm::open_pinned_with(window, cx, text, pinned, content, move |window, cx| {
+    let held = guard.clone();
+    let on_ok = move |window: &mut Window, cx: &mut App| {
+        let guard = held.clone();
         let chosen = choices.read(cx);
         let request = Request {
             core: core.clone(),
@@ -952,10 +977,12 @@ fn open_drain(
                 delete_emptydir_data: chosen.delete_emptydir_data,
                 force: chosen.force,
             },
+            guard,
         };
         let _ = this.update(cx, |ws, cx| start_review(ws, request, None, window, cx));
         true
-    });
+    };
+    confirm::open_pinned_guarded(window, cx, text, pinned, Some(content), guard, on_ok);
 }
 
 /// Pods as a report names them: the first few, and how many more.
@@ -1200,7 +1227,7 @@ mod tests {
         use gpui_kit::test::TestWindowExt as _;
         use gpui_kit::{AppContext as _, VisualTestContext, px, size};
 
-        use super::{WriteTarget, confirm, open_drain, open_scale};
+        use super::{ConnectionGuard, WriteTarget, confirm, open_drain, open_scale};
         use crate::ui::support_tests::open_workspace;
         use crate::ui::workspace::MIN_WINDOW_SIZE;
 
@@ -1222,10 +1249,11 @@ mod tests {
             cx.update_window(t.window, |_, window, cx| {
                 t.workspace.update(cx, |ws, cx| {
                     let core = ws.core(cx).clone();
+                    let guard = ConnectionGuard::always();
                     if drain {
-                        open_drain(core, on, window, cx)
+                        open_drain(core, on, guard, window, cx)
                     } else {
-                        open_scale(ws, core, on, window, cx)
+                        open_scale(ws, core, on, guard, window, cx)
                     }
                 })
             })

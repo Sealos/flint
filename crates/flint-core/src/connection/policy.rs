@@ -91,6 +91,17 @@ impl CredentialPolicy for KeptInBackground {
     }
 }
 
+/// A running-set member the person chose to keep watching: as [`KeptInBackground`], and also
+/// while it is selected, so a switch neither ends nor replaces its connection.
+pub(crate) struct KeptMember;
+
+impl CredentialPolicy for KeptMember {
+    fn may_run(&self, source: &CredentialSource, role: Role) -> bool {
+        matches!(role, Role::Foreground | Role::Background)
+            && *source != CredentialSource::AuthProvider
+    }
+}
+
 /// Told once when a kept connection's credential fails or is refused.
 pub(crate) type OnCredentialFailure = Arc<dyn Fn() + Send + Sync>;
 
@@ -169,12 +180,35 @@ impl CredentialAccess {
         check: Option<SendCheck>,
         runs: PluginRuns,
     ) -> Self {
+        Self::kept(Arc::new(KeptInBackground), on_failure, check, runs)
+    }
+
+    /// [`Self::consented`], for a running-set member's own connection ([`KeptMember`]).
+    pub(crate) fn consented_member(
+        on_failure: OnCredentialFailure,
+        check: Option<SendCheck>,
+        runs: PluginRuns,
+    ) -> Self {
+        Self::kept(Arc::new(KeptMember), on_failure, check, runs)
+    }
+
+    fn kept(
+        policy: Arc<dyn CredentialPolicy>,
+        on_failure: OnCredentialFailure,
+        check: Option<SendCheck>,
+        runs: PluginRuns,
+    ) -> Self {
         CredentialAccess {
             on_failure: Some(on_failure),
             launch_check: check,
             plugin_runs: Some(runs),
-            ..Self::new(Arc::new(KeptInBackground), Role::Background)
+            ..Self::new(policy, Role::Background)
         }
+    }
+
+    /// Whether this is a kept connection's access: nobody answers its program's prompts.
+    pub(crate) fn unattended(&self) -> bool {
+        self.on_failure.is_some()
     }
 
     /// Ends a kept connection's access after a failure, telling its owner the first time. Does

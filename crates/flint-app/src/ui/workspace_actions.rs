@@ -860,6 +860,31 @@ impl Workspace {
         self.model.read(cx).settings_error.is_none()
     }
 
+    /// A guard on the connection `cluster` has now, for a write's dialogs.
+    pub(in crate::ui) fn connection_guard(
+        &self,
+        cluster: &str,
+        cx: &App,
+    ) -> Option<super::super::write_binding::ConnectionGuard> {
+        super::super::write_binding::ConnectionGuard::of(&self.model, cluster, cx)
+    }
+
+    /// Says why a confirmation closed by itself, and gives focus back if what held it is gone.
+    pub(in crate::ui) fn confirmation_closed(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refuse_held(super::super::write_binding::connection_changed_text(), cx);
+        if window.focused(cx).is_none() {
+            let focus = self
+                .list
+                .as_ref()
+                .map_or_else(|| self.focus.clone(), |l| l.read(cx).focus_handle().clone());
+            window.focus(&focus, cx);
+        }
+    }
+
     pub(in crate::ui) fn cluster_summary<'a>(
         &self,
         name: &str,
@@ -895,7 +920,7 @@ impl Workspace {
         }
         self.check_cluster::<ExposeToAi>(&action.cluster, cx)?;
         let cluster = self.cluster_summary(&action.cluster, cx).expect("checked");
-        let Some(server) = cluster.info.server.clone() else {
+        let Some(server) = cluster.info.grant_server() else {
             return Err(ActionError::rejected::<ExposeToAi>(
                 "the context has no API server",
             ));
@@ -942,8 +967,7 @@ impl Workspace {
         let summary = self.cluster_summary(cluster, cx).expect("checked");
         summary
             .info
-            .server
-            .clone()
+            .grant_server()
             .ok_or_else(|| ActionError::rejected::<A>("the context has no API server"))
     }
 
@@ -1127,11 +1151,23 @@ impl Workspace {
     pub(super) fn select_cluster(
         &mut self,
         action: &SelectCluster,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match self.check_cluster::<SelectCluster>(&action.cluster, cx) {
             Ok(()) => {
+                // Only a move that closes the pane: a set's member keeps it open.
+                let leaves = self.cluster.as_deref() != Some(action.cluster.as_str())
+                    && !self.sets.has_member(Some(&action.cluster))
+                    && !self.edit_is_on(&action.cluster, cx);
+                let again = action.clone();
+                if leaves
+                    && self.asks_before_leaving(window, cx, move |ws, window, cx| {
+                        ws.select_cluster(&again, window, cx)
+                    })
+                {
+                    return;
+                }
                 let cluster = action.cluster.clone();
                 // The sidebar's cursor follows the cluster picked, however it was picked.
                 self.sidebar_cursor = Some(cluster.clone());
@@ -1205,7 +1241,7 @@ impl Workspace {
         self.check_cluster::<EditAiScope>(&action.cluster, cx)?;
         let cluster = self.cluster_summary(&action.cluster, cx).expect("checked");
         let model = self.model.read(cx);
-        match (model.ai_scope(cluster), cluster.info.server.clone()) {
+        match (model.ai_scope(cluster), cluster.info.grant_server()) {
             (Some(scope), Some(server)) => Ok((server, scope)),
             _ => Err(ActionError::rejected::<EditAiScope>(
                 "the cluster is not exposed to AI agents",
@@ -1605,7 +1641,24 @@ impl Workspace {
             return;
         }
         match self.view_entry(&action.kind, cx) {
-            Some(entry) => self.open_kind(&entry, window, cx),
+            Some(entry) => {
+                let open_already = match self.sets.running_kind() {
+                    Some(kind) => *kind == entry.id,
+                    None => self
+                        .list
+                        .as_ref()
+                        .is_some_and(|list| *list.read(cx).kind() == entry.id),
+                };
+                let again = action.clone();
+                if !open_already
+                    && self.asks_before_leaving(window, cx, move |ws, window, cx| {
+                        ws.open_view(&again, window, cx)
+                    })
+                {
+                    return;
+                }
+                self.open_kind(&entry, window, cx)
+            }
             None => tracing::warn!("{}", self.check_open_view(action, cx).unwrap_err()),
         }
     }
