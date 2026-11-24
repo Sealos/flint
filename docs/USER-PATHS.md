@@ -434,6 +434,10 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **When** I press Review, then Apply.
 - **Then** I see a diff from the server dry-run, then the change is applied. Webhook or policy rejections are shown
   before anything is applied.
+- A Secret opens with its values masked. A value I leave masked keeps what the cluster has; only the keys I add,
+  change or remove are sent, and the diff names those keys without showing any value. A changed `data` value must
+  be base64; plain text goes under `stringData`. A mask under a key the cluster does not have is refused, and so is
+  an Apply after someone else changed the Secret since my review.
 - An edit I have not applied is kept only while Flint runs. Leaving the view or closing the window asks first, but
   quitting from the Dock menu or logging out does not, and the edit is lost; Flint does not save drafts.
 - Tests: cluster.

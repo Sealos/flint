@@ -110,6 +110,7 @@ fn reviewed() -> ReviewedEdit {
         pin: crate::recheck::ContextHistory::default().pin("dev", None),
         credential: crate::credential::CredentialBinding::for_tests(),
         body: json!({"data": {"password": "aHVudGVyMg=="}}),
+        secret: true,
         before: String::new(),
         after: String::new(),
     }

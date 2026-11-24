@@ -24,7 +24,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use kube::Client;
-use kube::api::{DynamicObject, PostParams};
+use kube::api::{DynamicObject, Patch, PatchParams, PostParams};
 use serde_json::Value;
 
 use crate::ClusterId;
@@ -36,6 +36,7 @@ use crate::protection::WriteRefusal;
 use crate::read::{self, KindId, KindInfo};
 use crate::recheck::ContextPin;
 use crate::redact;
+use crate::secret_edit;
 use crate::write_actions;
 pub use crate::write_actions::{BlockedReason, DrainReport, ManagedPod, PodName};
 
@@ -46,9 +47,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const FIELD_MANAGER: &str = "flint";
 
 /// What a Secret's values read as in a review's diff.
-const HIDDEN_VALUE: &str = "<hidden>";
+pub(crate) const HIDDEN_VALUE: &str = "<hidden>";
 /// A hidden value the change replaces.
-const HIDDEN_CHANGED: &str = "<hidden, changed>";
+pub(crate) const HIDDEN_CHANGED: &str = "<hidden, changed>";
 
 /// The object a change is for, as the front end showed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,7 +223,11 @@ pub struct ReviewedEdit {
     pin: ContextPin,
     /// The credential it was reviewed with.
     credential: CredentialBinding,
+    /// The object to `PUT`. For a Secret, the edit as typed, masks and all: the merge patch is
+    /// built from it against the live object at each request ([`secret_edit`]).
     body: Value,
+    /// A Secret, whose masked values are kept: written as a merge patch of what changed.
+    secret: bool,
     before: String,
     after: String,
 }
@@ -607,9 +612,16 @@ async fn prepare(
     match proposal {
         WriteProposal::ApplyYaml { yaml } => {
             let mut body = edit_body(&yaml, kind, target)?;
-            keep_live_status(&mut body, live);
-            let client = gate.client().await?;
-            let result = replace(&client, kind, target, &body, true).await?;
+            let secret = redact::is_secret_object(live);
+            let result = if secret {
+                let patch = secret_edit::patch(&body, live, target)?;
+                let client = gate.client().await?;
+                patch_object(&client, kind, target, &patch, true).await?
+            } else {
+                keep_live_status(&mut body, live);
+                let client = gate.client().await?;
+                replace(&client, kind, target, &body, true).await?
+            };
             let result = serde_json::to_value(&result)
                 .map_err(|e| WriteError::Failed(format!("cannot read the dry run: {e}")))?;
             let result = with_type_of(result, &body);
@@ -620,6 +632,7 @@ async fn prepare(
                 before: shown_yaml(live)?,
                 after: shown_after(live, &result)?,
                 body,
+                secret,
             }))
         }
         proposal => {
@@ -642,6 +655,23 @@ async fn execute(
     intent: WriteIntent,
 ) -> Result<WriteOutcome, WriteError> {
     match &intent.action {
+        WriteAction::ApplyYaml(edit) if edit.secret => {
+            // The patch is built from the Secret as it is now, which must still be the one
+            // reviewed: a mask keeps that object's value, not whatever is there later.
+            let client = gate.client().await?;
+            let live = read_live(&client, kind, &intent.target).await?;
+            let bound = bound_to_live(intent.target.clone(), &live)?;
+            if bound != intent.target || !redact::is_secret_object(&live) {
+                return Err(WriteError::Conflict);
+            }
+            let patch = secret_edit::patch(&edit.body, &live, &intent.target)?;
+            let client = gate.client().await?;
+            let written = patch_object(&client, kind, &intent.target, &patch, false).await?;
+            Ok(WriteOutcome {
+                resource_version: written.metadata.resource_version,
+                drain: None,
+            })
+        }
         WriteAction::ApplyYaml(edit) => {
             let client = gate.client().await?;
             let written = replace(&client, kind, &intent.target, &edit.body, false).await?;
@@ -687,6 +717,36 @@ async fn replace(
         .await
         .map_err(|_| timed_out())?
         .map_err(write_error)
+}
+
+/// Sends a JSON Merge Patch of the object. Its `uid` and `resourceVersion` are preconditions:
+/// a different object or version is a conflict.
+async fn patch_object(
+    client: &Client,
+    kind: &KindInfo,
+    target: &WriteTarget,
+    patch: &Value,
+    dry_run: bool,
+) -> Result<DynamicObject, WriteError> {
+    let params = PatchParams {
+        dry_run,
+        field_manager: Some(FIELD_MANAGER.to_owned()),
+        ..PatchParams::default()
+    };
+    let api = read::dynamic_api(
+        client,
+        kind,
+        target.namespace.as_deref(),
+        Some(&target.name),
+    )
+    .map_err(write_actions::ActionError::from)?;
+    tokio::time::timeout(
+        WRITE_TIMEOUT,
+        api.patch(&target.name, &params, &Patch::Merge(patch)),
+    )
+    .await
+    .map_err(|_| timed_out())?
+    .map_err(write_error)
 }
 
 /// The body to `PUT` for `yaml`: the same object as `target`, at the version reviewed. An edit
