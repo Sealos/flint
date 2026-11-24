@@ -57,9 +57,10 @@ launch**.
   ended consent drops it, and the slot's own connection starts a feed. Writes still go through the slot and its
   gate. A feed still connecting is dropped on selection, as before.
 - **Warm lists.** While a watched cluster is selected and its feed's connection is up, its resource watches read
-  through that connection's read client too. Leaving the cluster keeps them running, except Events, Leases and
-  EndpointSlices, so selecting it again lists nothing anew even when the slot signs in again. At most 3 clusters
-  keep warm lists in the background, the most recently left. Whatever drops the feed's connection (a changed
+  through that connection's read client too. Leaving the cluster keeps up to 8 kinds running: those its views
+  showed last, then Pods, Deployments, Services and Nodes, never Events, Leases or EndpointSlices. Selecting it
+  again lists none of those anew, even when the slot signs in again. At most 3 clusters keep warm lists in the
+  background, the most recently left. Whatever drops the feed's connection (a changed
   definition or credential, a pause, ended consent, a failure) drops the warm lists with it: the selected cluster
   lists again on the slot's own connection, and a background one stops its watches.
 - **A handed-over feed that fails.** If the feed's credential fails while its cluster is selected, the feed ends

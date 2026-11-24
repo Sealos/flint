@@ -856,6 +856,7 @@ impl ClusterManager {
         let fingerprint = self.cluster(id).and_then(|slot| slot.fingerprint);
         self.keep.stopped.insert(id.to_owned(), fingerprint);
         self.keep.feeds.remove(id);
+        self.drop_stale_warm_lists(id);
     }
 
     /// Keeps `id` off while unreadable settings hide its entry, as if the entry were removed.
@@ -876,6 +877,8 @@ impl ClusterManager {
             self.keep.consents.remove(&id);
             self.keep.offers.remove(&id);
             self.keep.feeds.remove(&id);
+            // Before the settings write below: nothing reads through the kept connection after.
+            self.drop_stale_warm_lists(&id);
             self.keep_watching_acted_on(&id);
             self.keep.voided.remove(&id);
             self.keep.turned_off.insert(id.clone());
@@ -939,6 +942,7 @@ impl ClusterManager {
         self.keep.consents.remove(id);
         self.keep.offers.remove(id);
         self.keep.feeds.remove(id);
+        self.drop_stale_warm_lists(id);
         self.keep.stopped.remove(id);
         self.keep.retry_at.remove(id);
     }

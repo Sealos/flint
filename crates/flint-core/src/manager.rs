@@ -1176,16 +1176,9 @@ impl ClusterManager {
             })
     }
 
-    /// Brings a cluster's watches in line with whether it wants them, its watch mode, and the
-    /// open subscriptions, and follows its CRDs while it wants them.
-    fn reconcile(&mut self, id: &str) {
-        // Before anything below can start a watch on the context's current server.
-        self.cut_off_changed_members(Some(id));
-        let wanted = self.wants_watches(id);
-        let warm_kinds = self.warm_background_kinds(id);
-        let mut mode = self.settings.watch_mode_for(id);
-        let mut subscribed: HashSet<KindId> = self
-            .subscriptions
+    /// The kinds `id`'s open subscriptions ask for.
+    fn open_view_kinds(&self, id: &str) -> HashSet<KindId> {
+        self.subscriptions
             .values()
             .filter(|(c, _, member)| {
                 // A member's subscription asks for nothing once its context left that server.
@@ -1195,7 +1188,18 @@ impl ClusterManager {
                         .is_none_or(|m| self.member_changed(m).is_none())
             })
             .map(|(_, k, _)| k.clone())
-            .collect();
+            .collect()
+    }
+
+    /// Brings a cluster's watches in line with whether it wants them, its watch mode, and the
+    /// open subscriptions, and follows its CRDs while it wants them.
+    fn reconcile(&mut self, id: &str) {
+        // Before anything below can start a watch on the context's current server.
+        self.cut_off_changed_members(Some(id));
+        let wanted = self.wants_watches(id);
+        let warm_kinds = self.warm_background_kinds(id);
+        let mut mode = self.settings.watch_mode_for(id);
+        let mut subscribed = self.open_view_kinds(id);
         // Warm lists in the background keep the kinds they had, whatever the mode.
         let watching = wanted || warm_kinds.is_some();
         if let Some(kinds) = warm_kinds {
