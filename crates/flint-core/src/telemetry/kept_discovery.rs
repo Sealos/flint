@@ -12,11 +12,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kube::core::discovery::v2::{APIGroupDiscovery, APIGroupDiscoveryList};
+use kube::core::discovery::v2::{
+    ACCEPT_AGGREGATED_DISCOVERY_V2, APIGroupDiscovery, APIGroupDiscoveryList,
+};
+use ring::digest::{self, Digest};
 use tokio::sync::{Mutex, watch};
 use tokio::time::Instant;
 
 use super::RequestGate;
+use crate::auth_plugin::HeldTokenOnly;
 use crate::cluster;
 use crate::connection::policy::{CredentialGrant, CredentialLease};
 use crate::problems::ProblemKind;
@@ -24,10 +28,9 @@ use crate::read::DISCOVERY_REQUEST_TIMEOUT;
 
 const RETRY_MIN: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(60);
-/// How long after a complete round the next one starts.
-const REVALIDATE_EVERY: Duration = Duration::from_secs(30);
-/// How long a round's answer counts, from when the round started. It is shorter than the margin
-/// a held token must have left to be sent, so coverage never outlives the token that read it.
+const REVALIDATE_MIN: Duration = Duration::from_secs(30);
+const REVALIDATE_MAX: Duration = Duration::from_secs(300);
+/// How long a partial round's answer counts, from when the round started.
 const COVERAGE_LIFETIME: Duration = Duration::from_secs(55);
 /// The longest one round may take, waiting for its turns included.
 const ROUND_TIMEOUT: Duration = Duration::from_secs(25);
@@ -115,10 +118,10 @@ impl KeptCoverage {
             .collect()
     }
 
-    fn complete(&self) -> bool {
+    fn complete(served: u8) -> bool {
         ProblemKind::ALL
             .iter()
-            .all(|kind| self.served & needs(*kind) == needs(*kind))
+            .all(|kind| served & needs(*kind) == needs(*kind))
     }
 }
 
@@ -152,6 +155,40 @@ impl DiscoveryPace {
     }
 }
 
+/// A fingerprint and resource bits for each endpoint, kept only for the life of the feed.
+#[derive(Default)]
+struct DiscoveryCache {
+    core: CachedDiscovery,
+    apis: CachedDiscovery,
+}
+
+#[derive(Default)]
+struct CachedDiscovery(Option<(Digest, Option<u8>)>);
+
+enum AggregatedError {
+    Unsupported,
+    Unavailable,
+}
+
+impl CachedDiscovery {
+    /// Returns the served bits (or no aggregated core groups) and whether the body was unchanged.
+    fn read(
+        &mut self,
+        body: &str,
+        decode: impl FnOnce(&str) -> Result<Option<u8>, serde_json::Error>,
+    ) -> Result<(Option<u8>, bool), serde_json::Error> {
+        let fingerprint = digest::digest(&digest::SHA256, body.as_bytes());
+        if let Some((last, served)) = &self.0
+            && last.as_ref() == fingerprint.as_ref()
+        {
+            return Ok((*served, true));
+        }
+        let served = decode(body)?;
+        self.0 = Some((fingerprint, served));
+        Ok((served, false))
+    }
+}
+
 /// What a kept feed needs to run discovery.
 pub(crate) struct KeptDiscovery {
     pub(crate) client: kube::Client,
@@ -178,34 +215,57 @@ impl KeptDiscovery {
             }
         };
         let mut wait = RETRY_MIN;
+        let mut revalidate: Option<Duration> = None;
+        let mut cache = DiscoveryCache::default();
         loop {
             let lease = self.grant.lease();
             let started = Instant::now();
-            let client = granted(cluster::reusing_held_token(self.client.clone()), &lease);
+            let held = HeldTokenOnly::default();
+            let client = granted(
+                cluster::reusing_held_token(self.client.clone(), held.clone()),
+                &lease,
+            );
             let served = tokio::select! {
                 biased;
                 () = lease.revoked() => None,
-                served = tokio::time::timeout(ROUND_TIMEOUT, self.served(&client)) => {
+                served = tokio::time::timeout(ROUND_TIMEOUT, self.served(&client, &mut cache)) => {
                     served.ok().flatten()
                 }
             };
-            let coverage = served
-                .filter(|_| lease.holds())
-                .map_or(KeptCoverage::NONE, |served| KeptCoverage {
-                    served,
-                    until: Some(started + COVERAGE_LIFETIME),
-                });
-            publish(coverage);
-            let pause = if coverage.complete() {
-                wait = RETRY_MIN;
-                REVALIDATE_EVERY
-            } else {
-                let pause = wait;
-                wait = wait.saturating_mul(2).min(RETRY_MAX);
-                pause
+            let served = served.filter(|_| lease.holds());
+            let expires = held.expires_at();
+            let finished = Instant::now();
+            let (pause, until) = match served {
+                Some((bits, unchanged)) if KeptCoverage::complete(bits) => {
+                    wait = RETRY_MIN;
+                    let pause = revalidate
+                        .filter(|_| unchanged)
+                        .map_or(REVALIDATE_MIN, |last| (last * 2).min(REVALIDATE_MAX));
+                    // Keep the original cadence as a held token approaches expiry.
+                    let pause = expires.map_or(pause, |at| {
+                        let remaining = at.saturating_duration_since(finished + COVERAGE_LIFETIME);
+                        pause.min(remaining.max(REVALIDATE_MIN))
+                    });
+                    revalidate = Some(pause);
+                    (pause, finished + pause + ROUND_TIMEOUT)
+                }
+                _ => {
+                    revalidate = None;
+                    let pause = wait;
+                    wait = wait.saturating_mul(2).min(RETRY_MAX);
+                    (pause, started + COVERAGE_LIFETIME)
+                }
             };
+            publish(
+                served.map_or(KeptCoverage::NONE, |(served, _)| KeptCoverage {
+                    served,
+                    until: Some(expires.map_or(until, |at| until.min(at))),
+                }),
+            );
             if tokio::time::timeout(pause, lease.revoked()).await.is_ok() {
                 publish(KeptCoverage::NONE);
+                revalidate = None;
+                cache = DiscoveryCache::default();
                 tokio::time::sleep(wait).await;
             }
         }
@@ -223,25 +283,71 @@ impl KeptDiscovery {
             .ok()
     }
 
-    /// The resources served now, or `None` if that could not be read.
-    async fn served(&self, client: &kube::Client) -> Option<u8> {
-        let core = match self.ask(client.list_core_api_versions_aggregated()).await? {
-            Ok(core) if core.items.is_empty() => return self.served_by_group(client).await,
-            Ok(core) => core,
-            Err(error) if not_aggregated(&error) => return self.served_by_group(client).await,
-            Err(_) => return None,
-        };
-        let apis = match self.ask(client.list_api_groups_aggregated()).await? {
-            Ok(apis) => apis,
-            Err(error) if not_aggregated(&error) => return self.served_by_group(client).await,
-            Err(_) => return None,
-        };
-        Some(served_in(&core, &apis))
+    /// The resources served now and whether both aggregated responses were unchanged.
+    async fn served(
+        &self,
+        client: &kube::Client,
+        cache: &mut DiscoveryCache,
+    ) -> Option<(u8, bool)> {
+        match self.served_aggregated(client, cache).await {
+            Ok(coverage) => Some(coverage),
+            Err(AggregatedError::Unsupported) => {
+                cache.apis = CachedDiscovery::default();
+                Some((self.served_by_group(client).await, false))
+            }
+            Err(AggregatedError::Unavailable) => None,
+        }
+    }
+
+    /// An empty core list or an unsupported response calls for per-group discovery.
+    async fn served_aggregated(
+        &self,
+        client: &kube::Client,
+        cache: &mut DiscoveryCache,
+    ) -> Result<(u8, bool), AggregatedError> {
+        let (core, core_unchanged) = self
+            .aggregated(client, "/api", &mut cache.core, served_in_core)
+            .await?;
+        let (apis, apis_unchanged) = self
+            .aggregated(client, "/apis", &mut cache.apis, |list| {
+                Some(served_in_apis(list))
+            })
+            .await?;
+        Ok((core | apis, core_unchanged && apis_unchanged))
+    }
+
+    async fn aggregated(
+        &self,
+        client: &kube::Client,
+        path: &str,
+        cache: &mut CachedDiscovery,
+        project: impl FnOnce(&APIGroupDiscoveryList) -> Option<u8>,
+    ) -> Result<(u8, bool), AggregatedError> {
+        let request = http::Request::get(path)
+            .header(http::header::ACCEPT, ACCEPT_AGGREGATED_DISCOVERY_V2)
+            .body(Vec::new())
+            .expect("valid aggregated discovery request");
+        let answer = self
+            .ask(async {
+                let body = client.request_text(request).await?;
+                cache
+                    .read(&body, |body| {
+                        serde_json::from_str(body).map(|list| project(&list))
+                    })
+                    .map_err(kube::Error::SerdeError)
+            })
+            .await;
+        match answer {
+            Some(Ok((Some(served), unchanged))) => Ok((served, unchanged)),
+            Some(Ok((None, _))) => Err(AggregatedError::Unsupported),
+            Some(Err(error)) if not_aggregated(&error) => Err(AggregatedError::Unsupported),
+            _ => Err(AggregatedError::Unavailable),
+        }
     }
 
     /// For a server without aggregated discovery: one request per group problems are read from,
     /// however many groups it has. A group that cannot be read vouches for none of its resources.
-    async fn served_by_group(&self, client: &kube::Client) -> Option<u8> {
+    async fn served_by_group(&self, client: &kube::Client) -> u8 {
         let mut served = 0;
         for group in &GROUPS {
             let answer = if group.name.is_empty() {
@@ -258,7 +364,7 @@ impl KeptDiscovery {
                 }
             }
         }
-        Some(served)
+        served
     }
 }
 
@@ -291,21 +397,18 @@ fn not_aggregated(error: &kube::Error) -> bool {
     }
 }
 
-/// The resources aggregated discovery lists as current, at the version the feed reads.
-fn served_in(core: &APIGroupDiscoveryList, apis: &APIGroupDiscoveryList) -> u8 {
-    let named = |name: &str| {
-        apis.items
-            .iter()
-            .find(|group| group.metadata.as_ref().and_then(|m| m.name.as_deref()) == Some(name))
-    };
+fn served_in_core(core: &APIGroupDiscoveryList) -> Option<u8> {
+    core.items
+        .first()
+        .map(|listed| served_of(listed, &GROUPS[0]))
+}
+
+fn served_in_apis(apis: &APIGroupDiscoveryList) -> u8 {
     let mut served = 0;
-    for group in &GROUPS {
-        let listed = if group.name.is_empty() {
-            core.items.first()
-        } else {
-            named(group.name)
-        };
-        if let Some(listed) = listed {
+    for group in &GROUPS[1..] {
+        if let Some(listed) = apis.items.iter().find(|listed| {
+            listed.metadata.as_ref().and_then(|m| m.name.as_deref()) == Some(group.name)
+        }) {
             served |= served_of(listed, group);
         }
     }
@@ -535,6 +638,69 @@ mod tests {
         assert!(running.found.borrow().unchecked().is_empty());
     }
 
+    #[test]
+    fn unchanged_aggregated_body_is_not_decoded_again() {
+        let mut cache = CachedDiscovery::default();
+        let decode =
+            |body: &str| serde_json::from_str(body).map(|list| Some(served_in_apis(&list)));
+        let original = apis(&["jobs"]).to_string();
+        let changed = apis(&["cronjobs"]).to_string();
+        let expected = REPLICA_SETS | DEPLOYMENTS | STATEFUL_SETS | DAEMON_SETS;
+        assert_eq!(
+            cache.read(&original, decode).unwrap(),
+            (Some(expected | JOBS), false)
+        );
+        assert_eq!(
+            cache
+                .read(&original, |_| panic!("unchanged body was decoded"))
+                .unwrap(),
+            (Some(expected | JOBS), true)
+        );
+        assert_eq!(
+            cache.read(&changed, decode).unwrap(),
+            (Some(expected), false)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unchanged_rounds_back_off_and_a_changed_body_resets_the_interval() {
+        let fake = Fake::aggregated(&["jobs"]);
+        let mut running = follow(&fake, &access(), &Arc::default());
+        running.found.changed().await.unwrap();
+
+        for (seconds, change) in [
+            (30, false),
+            (60, false),
+            (120, false),
+            (240, false),
+            (300, false),
+            (300, true),
+            (30, false),
+        ] {
+            let found = &mut running.found;
+            let early = Duration::from_secs(seconds - 1);
+            assert!(tokio::time::timeout(early, found.changed()).await.is_err());
+            assert!(
+                found.borrow().unchecked().is_empty(),
+                "coverage lapsed between rounds"
+            );
+            if change {
+                // Change the document without changing consumer coverage.
+                let mut changed = apis(&["jobs"]);
+                changed["items"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(group("metrics.k8s.io", &["pods"]));
+                fake.answer("/apis", 200, changed);
+            }
+            tokio::time::timeout(Duration::from_secs(2), found.changed())
+                .await
+                .expect("round ran at the expected interval")
+                .unwrap();
+            assert!(found.borrow().unchecked().is_empty());
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_token_no_longer_held_withdraws_coverage_when_it_is_next_read() {
         let fake = Fake::aggregated(&["jobs"]);
@@ -656,14 +822,14 @@ mod tests {
     #[test]
     fn only_the_groups_problems_are_read_from_count() {
         let all = PODS | NODES | REPLICA_SETS | DEPLOYMENTS | STATEFUL_SETS | DAEMON_SETS | JOBS;
-        let core = list(core());
+        let core = served_in_core(&list(core())).unwrap();
         let mut reported = apis(&["jobs"]);
         let items = reported["items"].as_array_mut().unwrap();
         items.extend((0..10_000).map(|at| group(&format!("g{at}.example"), &["things"])));
         let mut metrics = group("metrics.k8s.io", &["pods"]);
         metrics["versions"][0]["freshness"] = "Stale".into();
         items.push(metrics);
-        assert_eq!(served_in(&core, &list(reported.clone())), all);
+        assert_eq!(core | served_in_apis(&list(reported.clone())), all);
 
         let batch = reported["items"]
             .as_array_mut()
@@ -672,10 +838,10 @@ mod tests {
             .find(|group| group["metadata"]["name"] == "batch")
             .unwrap();
         batch["versions"][0]["freshness"] = "Stale".into();
-        assert_eq!(served_in(&core, &list(reported)), all & !JOBS);
+        assert_eq!(core | served_in_apis(&list(reported)), all & !JOBS);
 
         let renamed = json!({"items": [group("APPS", &["deployments"])]});
-        assert_eq!(served_in(&core, &list(renamed)) & DEPLOYMENTS, 0);
+        assert_eq!(served_in_apis(&list(renamed)) & DEPLOYMENTS, 0);
     }
 
     #[test]

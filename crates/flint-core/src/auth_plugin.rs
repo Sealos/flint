@@ -790,8 +790,32 @@ impl TokenState {
 }
 
 /// On a request that may use the token held now, and must not run the plugin for a new one.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct HeldTokenOnly;
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HeldTokenOnly(Arc<std::sync::Mutex<Option<tokio::time::Instant>>>);
+
+impl HeldTokenOnly {
+    /// The earliest expiry of any token used by this round of requests.
+    pub(crate) fn expires_at(&self) -> Option<tokio::time::Instant> {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn note_expiry(&self, expires: Timestamp) {
+        let now = tokio::time::Instant::now();
+        let remaining =
+            Duration::try_from(Timestamp::now().duration_until(expires)).unwrap_or_default();
+        let Some(expires) = now.checked_add(remaining) else {
+            return;
+        };
+        let mut earliest = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *earliest = Some(earliest.map_or(expires, |before| before.min(expires)));
+    }
+}
 
 /// What a refresh got, for every request that waited for it.
 type Refreshed = Result<SecretString, Arc<AuthError>>;
@@ -869,13 +893,15 @@ impl RefreshingToken {
 
     /// The `Authorization` value of the token held now. Never runs the plugin: a token that is due
     /// is refused, without counting as a failure of the credential.
-    async fn held_header(&self) -> Result<HeaderValue, BoxError> {
+    async fn held_header(&self, held: &HeldTokenOnly) -> Result<HeaderValue, BoxError> {
         if !self.0.grant.allowed() {
             return Err(not_allowed().into());
         }
         let state = self.0.state.lock().await;
         if state.fresh() {
-            bearer(&state.token)
+            let header = bearer(&state.token)?;
+            held.note_expiry(state.expires);
+            Ok(header)
         } else {
             Err(not_allowed().into())
         }
@@ -987,8 +1013,8 @@ impl<B: Send + 'static> AsyncPredicate<Request<B>> for RefreshingToken {
     fn check(&mut self, mut request: Request<B>) -> Self::Future {
         let token = self.clone();
         Box::pin(async move {
-            let value = if request.extensions().get::<HeldTokenOnly>().is_some() {
-                token.held_header().await?
+            let value = if let Some(held) = request.extensions().get::<HeldTokenOnly>() {
+                token.held_header(held).await?
             } else {
                 token.header().await?
             };
