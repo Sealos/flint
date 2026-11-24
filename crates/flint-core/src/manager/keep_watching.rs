@@ -192,7 +192,7 @@ fn launch_verdict(config: &LaunchFiles, context: &str, consent: &PluginConsent) 
         return LaunchVerdict::Unconfirmed;
     }
     match &sign_in_of(&loaded.merged, context) {
-        SignIn::Plugin(definition) if consent.holds(definition) => LaunchVerdict::Same,
+        SignIn::Plugin(definition) if consent.verify(definition) => LaunchVerdict::Same,
         _ => LaunchVerdict::Changed,
     }
 }
