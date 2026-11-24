@@ -785,6 +785,7 @@ fn a_member_is_refused_unless_it_is_the_pinned_confirmed_cluster() {
         generation: 1,
         definition: 1,
         endpoint: 1,
+        write_epoch: 0,
         confirmed,
         provisional: !confirmed,
         paused: false,

@@ -36,6 +36,7 @@ use crate::store::{KindSnapshot, SyncState};
 use crate::watch::{ClusterWatches, EngineConfig, HubRegistry, KubeSource};
 use crate::write::WriteError;
 
+mod disconnect;
 mod file_watch;
 mod forwards;
 mod helm;
@@ -44,6 +45,7 @@ mod running_set;
 mod selected_retry;
 mod telemetry;
 
+pub(crate) use disconnect::DisconnectCount;
 pub(crate) use forwards::ForwardSignals;
 pub(crate) use keep_watching::KeptGrants;
 #[cfg(test)]
@@ -105,6 +107,8 @@ pub(crate) struct Cluster {
     /// Kept while the cluster is not active (ADR-0008).
     discovery: Option<Arc<ClusterDiscovery>>,
     discovering: bool,
+    /// The discovery running on this slot's connection, ended with it on a disconnect.
+    discovery_task: Option<AbortHandle>,
     /// The CRDs changed while discovery ran: run it again when it finishes.
     rediscover: bool,
     /// The CRD list as last seen, so a changed list triggers a refresh.
@@ -137,8 +141,11 @@ impl Drop for Cluster {
         {
             task.abort();
         }
-        if let Some(attempt) = self.connect_task.take() {
-            attempt.abort();
+        for task in [self.connect_task.take(), self.discovery_task.take()]
+            .into_iter()
+            .flatten()
+        {
+            task.abort();
         }
     }
 }
@@ -169,6 +176,7 @@ impl Cluster {
             generation: 0,
             discovery: None,
             discovering: false,
+            discovery_task: None,
             rediscover: false,
             crd_fingerprint: None,
             crds: HashSet::new(),
@@ -217,6 +225,7 @@ impl Cluster {
             generation: self.generation,
             definition: shown.definition,
             endpoint: shown.endpoint,
+            write_epoch: shown.gate,
             confirmed: shown.confirmed,
             provisional,
             paused,
@@ -531,6 +540,7 @@ pub(crate) struct ClusterManager {
     schedule: Schedule<ClusterId>,
     /// Automatic retries of the selected cluster.
     retries: selected_retry::RetryDriver,
+    disconnects: disconnect::Disconnects,
     /// Runs while the set has members.
     set_ticker: Option<JoinHandle<()>>,
     /// Source of connection attempt ids; never reused.
@@ -617,6 +627,7 @@ impl ClusterManager {
             members: HashMap::new(),
             schedule: Schedule::default(),
             retries: Default::default(),
+            disconnects: Default::default(),
             set_ticker: None,
             next_attempt: 1,
             watcher: None,
@@ -698,6 +709,7 @@ impl ClusterManager {
                 cluster,
                 generation,
             } => self.cancel_connection(&cluster, generation),
+            Command::DisconnectCluster(cluster) => self.disconnect_cluster(cluster).await,
             Command::SetRunningSet(ids) => self.set_running_set(ids),
             Command::SetKeepWatching {
                 cluster,
@@ -878,6 +890,7 @@ impl ClusterManager {
                 cluster,
                 server,
                 member,
+                disconnects,
                 subject,
                 options,
                 snapshots,
@@ -885,6 +898,7 @@ impl ClusterManager {
                 budget,
             } => {
                 let internal = self.internal_tx.clone();
+                let context = cluster.clone();
                 // Pinned now, to the server shown (the tab's): a reconnect must never read logs
                 // from another server (UP-06). Opened on a fallback, the pin is stale and the
                 // first client lookup ends the session, rather than read from the server the
@@ -925,11 +939,19 @@ impl ClusterManager {
                     Arc::new(KubePodSource::new(lookup)),
                     self.route_changes.subscribe(),
                 );
+                let sessions = &self.log_sessions;
+                let stop = self
+                    .disconnects
+                    .track_logs(id, &context, disconnects, |session| {
+                        sessions.get(session).is_some_and(|t| !t.is_finished())
+                    });
+                let feed = logs::until_stopped(feed, stop, disconnect::LOGS_ENDED.to_owned());
                 let task = tokio::spawn(logs::run(feed, config, snapshots, paused, Some(budget)));
                 self.log_sessions.retain(|_, t| !t.is_finished());
                 self.log_sessions.insert(id, task);
             }
             Request::CloseLogs { id } => {
+                self.disconnects.forget_logs(id);
                 if let Some(task) = self.log_sessions.remove(&id) {
                     task.abort();
                 }
@@ -1240,7 +1262,7 @@ impl ClusterManager {
         slot.rediscover = false;
         let attempt = slot.attempt;
         let cluster = id.to_owned();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let result = read::discover_kinds(&client)
                 .await
                 .map_err(|e| e.for_target(&target).summary().to_string());
@@ -1250,6 +1272,7 @@ impl ClusterManager {
                 result,
             });
         });
+        slot.discovery_task = Some(task.abort_handle());
     }
 
     /// Writes one change to `settings.toml` (`what` names it in errors) and applies the result.
@@ -1935,6 +1958,9 @@ impl ClusterManager {
     /// context re-pointed or removed since `pin` (when the session opened) ends the session
     /// ([`ContextHistory::check`]).
     fn log_client(&mut self, cluster: &str, pin: &ContextPin) -> Result<Client, LogError> {
+        if let Some(ended) = self.disconnected_logs(cluster) {
+            return Err(ended);
+        }
         if let Some(reason) = self.contexts.check(Pinned::Logs, cluster, pin) {
             return Err(LogError::cluster(reason));
         }
@@ -2456,6 +2482,7 @@ impl ClusterManager {
         // Someone selected or retried a cluster: a prompting plugin resting after a timed-out
         // refresh may run again now.
         crate::auth_plugin::retry_now(&id);
+        self.disconnects.lift(&id);
         self.keep_watching_acted_on(&id);
         let Some(slot) = self.cluster_mut(&id) else {
             self.emit(Event::Error(format!("cluster \"{id}\" no longer exists")));
@@ -2533,6 +2560,9 @@ impl ClusterManager {
     /// that ends the pause starts the attempt. A member connects only through its own attempt,
     /// so a request without one asks for it instead.
     fn ensure_connected(&mut self, id: &str) {
+        if self.disconnects.holds(id) {
+            return;
+        }
         let kubeconfig = self.kubeconfig.clone();
         let internal = self.internal_tx.clone();
         let attempt = self.next_attempt;
@@ -5246,6 +5276,34 @@ mod tests {
         rewrite_file(&mut manager, &path, &yaml).await;
         assert!(manager.unlocks.is_unlocked("dev", "https://dev"));
         assert_eq!(manager.write_pin_gate("dev", &pin), Ok(()));
+    }
+
+    // A disconnect ends every review and confirmation pinned before it, after a reconnect too,
+    // and the front end sees the write epoch move.
+    #[tokio::test]
+    async fn a_disconnect_ends_every_write_pinned_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://dev");
+        let mut manager = manager_reading_two(dir.path(), &yaml, NO_CONTEXTS).await;
+        manager.unlocks.unlock("dev", "https://dev");
+        let before = manager.contexts.pin_confirmed("dev");
+        let epoch = |m: &ClusterManager| {
+            m.summaries()
+                .into_iter()
+                .find(|c| c.info.name == "dev")
+                .map(|c| c.write_epoch)
+        };
+        let opened = epoch(&manager);
+        assert_eq!(manager.write_pin_gate("dev", &before), Ok(()));
+
+        manager.disconnect_cluster("dev".into()).await;
+        assert!(manager.write_pin_gate("dev", &before).is_err());
+        assert_ne!(epoch(&manager), opened);
+
+        manager.activate("dev".into());
+        assert!(manager.write_pin_gate("dev", &before).is_err());
+        let after = manager.contexts.pin_confirmed("dev");
+        assert_eq!(manager.write_pin_gate("dev", &after), Ok(()));
     }
 
     // covers UP-06, UP-54: a file that comes back with another server, user or token carries
@@ -8447,6 +8505,7 @@ users:
             cluster: "dev".into(),
             server: taken_late.then_some(shown),
             member: None,
+            disconnects: 0,
             subject: LogSubject::Pod(target),
             options: LogOptions::default(),
             snapshots,

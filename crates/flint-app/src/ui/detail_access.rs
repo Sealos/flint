@@ -236,13 +236,23 @@ impl ObjectAccess {
 impl DetailView {
     /// Says which slot and definition the object's cluster is on now, and whether that definition
     /// is in doubt, so the gate refuses it. Answers and checks of another connection end here,
-    /// not at the next draw.
+    /// not at the next draw. A pane kept for its edit stays bound to the connection it was
+    /// opened on: once that is replaced, it asks nothing more, of either server.
     pub(in crate::ui) fn set_access_connection(
         &mut self,
-        connection: Option<ConnectionIdentity>,
-        unsettled: bool,
+        mut connection: Option<ConnectionIdentity>,
+        mut unsettled: bool,
         cx: &mut Context<Self>,
     ) {
+        if self.has_open_edit()
+            && self
+                .access
+                .connection
+                .is_some_and(|opened| Some(opened) != connection)
+        {
+            connection = self.access.connection;
+            unsettled = true;
+        }
         if self.access.connection != connection || self.access.unsettled != unsettled {
             self.access.connection = connection;
             self.access.unsettled = unsettled;

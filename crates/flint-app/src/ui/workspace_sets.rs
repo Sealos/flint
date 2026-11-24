@@ -76,6 +76,20 @@ pub(super) struct ClusterSets {
     _io: Task<()>,
 }
 
+/// The members of an open set that left it: their rows are gone and stay gone.
+#[derive(Default)]
+pub(super) struct Gone {
+    pub(super) changed: HashSet<ClusterId>,
+    /// Of those, the ones the person disconnected.
+    pub(super) disconnected: HashSet<ClusterId>,
+}
+
+impl Gone {
+    fn contains(&self, cluster: &str) -> bool {
+        self.changed.contains(cluster) || self.disconnected.contains(cluster)
+    }
+}
+
 /// The running set and its open combined list.
 pub(super) struct RunningSet {
     label: String,
@@ -84,6 +98,8 @@ pub(super) struct RunningSet {
     members: Vec<AdmittedMember>,
     /// Members that left their admitted server: their rows are gone and stay gone.
     changed: HashSet<ClusterId>,
+    /// Of those, the ones the person disconnected.
+    disconnected: HashSet<ClusterId>,
     /// Members not subscribed to `kind`, because their discovery can't vouch for it yet.
     held: HashSet<ClusterId>,
     /// The window its feeds draw in, for a held member that joins later.
@@ -148,6 +164,22 @@ impl ClusterSets {
             .members
             .iter()
             .find(|m| m.context() == cluster)
+    }
+
+    /// Whether the person disconnected `cluster`, a member of the open set.
+    pub(super) fn member_disconnected(&self, cluster: &str) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|run| run.disconnected.contains(cluster))
+    }
+
+    /// Records that the person disconnected `cluster`, if the open set has it.
+    pub(super) fn mark_disconnected(&mut self, cluster: &str) {
+        if let Some(run) = &mut self.running
+            && run.members.iter().any(|m| m.context() == cluster)
+        {
+            run.disconnected.insert(cluster.to_owned());
+        }
     }
 
     /// Whether the open set has `cluster` as a member.
@@ -838,8 +870,8 @@ impl Workspace {
         self.show_set(
             label,
             members,
-            KindId::pods(),
-            "Pods".to_owned(),
+            (KindId::pods(), "Pods".to_owned()),
+            Gone::default(),
             window,
             cx,
         );
@@ -850,14 +882,16 @@ impl Workspace {
         self.refresh_set_kinds(cx);
     }
 
-    /// Opens the combined list of `kind` over `members`, feeding it from the core. Rows appear
+    /// Opens the combined list of `kind` (with its label) over `members`, feeding it from the core. Rows appear
     /// only once the core confirms, after they were read, that their member is still admitted.
-    fn show_set(
+    /// Members in `gone` (changed or disconnected) are not subscribed again: their rows stay
+    /// empty and they keep their state.
+    pub(super) fn show_set(
         &mut self,
         label: String,
         members: Vec<AdmittedMember>,
-        kind: KindId,
-        kind_label: String,
+        (kind, kind_label): (KindId, String),
+        gone: Gone,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -867,7 +901,14 @@ impl Workspace {
         let mut subscriptions = Vec::new();
         let mut snapshots: Vec<Arc<KindSnapshot>> = Vec::with_capacity(members.len());
         for (member, found) in members.iter().zip(&evidence) {
-            if found.may_subscribe(&kind) {
+            if gone.contains(member.context()) {
+                snapshots.push(Arc::new(KindSnapshot {
+                    cluster: member.context().to_owned(),
+                    kind: kind.clone(),
+                    state: SyncState::Idle,
+                    ..KindSnapshot::default()
+                }));
+            } else if found.may_subscribe(&kind) {
                 // Bound: the core starts no LIST or watch for a member that has changed.
                 let subscription = core
                     .bound_to(member.clone())
@@ -914,7 +955,8 @@ impl Workspace {
             label,
             set_id: None,
             members,
-            changed: HashSet::new(),
+            changed: gone.changed,
+            disconnected: gone.disconnected,
             held,
             window: window_handle,
             left_out: Vec::new(),
@@ -1088,6 +1130,9 @@ impl Workspace {
         let Some(member) = run.members.iter().find(|m| m.context() == cluster) else {
             return Some(format!("{shown} is not in this set"));
         };
+        if run.disconnected.contains(cluster) {
+            return Some(format!("{shown} was disconnected. Open the set again."));
+        }
         if run.changed.contains(cluster) {
             return Some(format!(
                 "{shown} changed since this set opened. Open the set again."
@@ -1430,6 +1475,9 @@ impl Workspace {
 
     /// What the set's bar says about `context`, when something is wrong with it.
     fn set_member_note(&self, run: &RunningSet, context: &str, cx: &App) -> Option<String> {
+        if run.disconnected.contains(context) {
+            return Some("Disconnected".to_owned());
+        }
         if run.changed.contains(context) {
             return Some("Changed".to_owned());
         }

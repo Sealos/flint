@@ -140,6 +140,14 @@ impl ClustersModel {
                 }
             }
             Event::ConnectionProgress(progress) => self.connection_progress = progress,
+            Event::WritesEnded {
+                cluster,
+                write_epoch,
+            } => {
+                if let Some(c) = self.clusters.iter_mut().find(|c| c.info.name == cluster) {
+                    c.write_epoch = c.write_epoch.max(write_epoch);
+                }
+            }
             Event::SettingsChanged {
                 settings,
                 error,
@@ -306,6 +314,11 @@ impl ClustersModel {
             cluster,
             definition,
         });
+    }
+
+    /// Stops everything the core runs for `cluster` until it is selected again.
+    pub(in crate::ui) fn disconnect(&mut self, cluster: ClusterId) {
+        self.send(Command::DisconnectCluster(cluster));
     }
 
     /// For the background sign-in toggle's click handler alone: turns it on for the exact
@@ -877,6 +890,7 @@ mod tests {
             generation: 1,
             definition: 1,
             endpoint: 1,
+            write_epoch: 0,
             confirmed: true,
             provisional: false,
             paused: false,

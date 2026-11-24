@@ -44,6 +44,7 @@ enum Key {
     /// refused server); the last of the two is still the current state.
     Connection(ClusterId, Phase),
     Progress,
+    WritesEnded(ClusterId),
     Settings,
     Discovery(ClusterId),
     Activity,
@@ -64,6 +65,7 @@ fn key(event: &Event, next_error: &mut u64) -> Key {
             Key::Connection(cluster.clone(), phase)
         }
         Event::ConnectionProgress(_) => Key::Progress,
+        Event::WritesEnded { cluster, .. } => Key::WritesEnded(cluster.clone()),
         Event::SettingsChanged { .. } => Key::Settings,
         Event::DiscoveryChanged { cluster, .. } => Key::Discovery(cluster.clone()),
         Event::AgentActivity(..) => Key::Activity,

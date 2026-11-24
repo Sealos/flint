@@ -180,6 +180,12 @@ impl ClusterManager {
         });
     }
 
+    /// The selected cluster was disconnected: no attempt or timer of its retries goes on.
+    pub(super) fn end_selected_retry(&mut self) {
+        self.retries.under_way = None;
+        self.retries.retry.cancel();
+    }
+
     /// Ends the automatic retry under way if what it was started for no longer holds. Its result,
     /// even one already queued, is then ignored.
     pub(super) fn end_invalid_retry(&mut self) {
