@@ -719,8 +719,9 @@ async fn replace(
         .map_err(write_error)
 }
 
-/// Sends a JSON Merge Patch of the object. Its `uid` and `resourceVersion` are preconditions:
-/// a different object or version is a conflict.
+/// Sends a Secret's JSON Merge Patch. Its `uid` and `resourceVersion` are preconditions: a
+/// different object or version is a conflict. A refusal is worded without the server's message,
+/// which may quote a value ([`secret_edit::write_error`]).
 async fn patch_object(
     client: &Client,
     kind: &KindInfo,
@@ -746,7 +747,7 @@ async fn patch_object(
     )
     .await
     .map_err(|_| timed_out())?
-    .map_err(write_error)
+    .map_err(|error| secret_edit::write_error(error, patch))
 }
 
 /// The body to `PUT` for `yaml`: the same object as `target`, at the version reviewed. An edit

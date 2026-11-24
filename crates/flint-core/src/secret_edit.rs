@@ -12,7 +12,13 @@
 //! - A changed `data` value must be base64, as Kubernetes stores it. Plain text goes under
 //!   `stringData`, which the server encodes into `data`.
 //! - A patch that would still carry a mask, or a review's hidden-value placeholder, is refused.
-//! - No error names a value. Keys are named, as the review's diff shows them.
+//! - No error names a value. Keys are named, as the review's diff shows them. A refusal from the
+//!   server (validation, an admission webhook or policy) is reported by its code, a known reason,
+//!   the webhook's name and the fields it names that the patch has, never by its message: a
+//!   webhook can echo a value as bare text, which no redaction can tell from words.
+//! - Kubernetes writes `stringData` over `data`: [`effective_data`] is what a Secret holds after.
+
+use std::collections::BTreeSet;
 
 use serde_json::{Map, Value};
 
@@ -225,6 +231,145 @@ fn holds_hidden(value: &Value) -> bool {
             .any(|(key, value)| hidden(key) || holds_hidden(value)),
         _ => false,
     }
+}
+
+/// `object` as the API server stores it: each `stringData` value encoded into `data` under its
+/// key, over any `data` value there, and `stringData` gone. A value that is not a string stays
+/// under `stringData`, which the server refuses.
+pub fn effective_data(object: &Value) -> Value {
+    use base64::Engine as _;
+    let mut stored = object.clone();
+    let Some(fields) = stored.as_object_mut() else {
+        return stored;
+    };
+    let Some(Value::Object(plain)) = fields.remove("stringData") else {
+        return stored;
+    };
+    let mut left = Map::new();
+    for (key, value) in plain {
+        match value.as_str() {
+            Some(text) => {
+                let data = fields
+                    .entry("data")
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if !data.is_object() {
+                    *data = Value::Object(Map::new());
+                }
+                let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+                data[key.as_str()] = encoded.into();
+            }
+            None => {
+                left.insert(key, value);
+            }
+        }
+    }
+    if !left.is_empty() {
+        fields.insert("stringData".to_owned(), Value::Object(left));
+    }
+    stored
+}
+
+/// The reasons the API server sends: any other is the webhook's or a proxy's own text.
+const KNOWN_REASONS: [&str; 18] = [
+    "AlreadyExists",
+    "BadRequest",
+    "Conflict",
+    "Expired",
+    "Forbidden",
+    "Gone",
+    "InternalError",
+    "Invalid",
+    "MethodNotAllowed",
+    "NotAcceptable",
+    "NotFound",
+    "RequestEntityTooLarge",
+    "ServerTimeout",
+    "ServiceUnavailable",
+    "Timeout",
+    "TooManyRequests",
+    "Unauthorized",
+    "UnsupportedMediaType",
+];
+
+/// A failed request of a Secret's write, from what cannot hold a value: the status code, a
+/// reason the API server defines, the admission webhook's name, and the fields named that are
+/// the patch's own keys. The server's message is never shown.
+pub(crate) fn write_error(error: kube::Error, patch: &Value) -> WriteError {
+    let kube::Error::Api(status) = error else {
+        // Its text can carry a body that was not the API server's.
+        return WriteError::Failed(
+            "the request for this Secret failed, and its details are not shown because they may \
+             quote a value; the change may or may not have applied"
+                .to_owned(),
+        );
+    };
+    match status.code {
+        404 => return WriteError::Gone,
+        409 => return WriteError::Conflict,
+        _ => {}
+    }
+    let mut what = crate::api_error::status_meaning(status.code, None);
+    if KNOWN_REASONS.contains(&status.reason.as_str()) {
+        what.push_str(&format!(" [{}]", status.reason));
+    }
+    if let Some(webhook) = webhook_name(&status.message) {
+        what.push_str(&format!("; admission webhook \"{webhook}\" denied it"));
+    }
+    let known = patch_fields(patch);
+    let fields: BTreeSet<&str> = status
+        .details
+        .iter()
+        .flat_map(|details| &details.causes)
+        .map(|cause| cause.field.as_str())
+        .filter(|field| known.contains(*field))
+        .collect();
+    if !fields.is_empty() {
+        let named: Vec<&str> = fields.into_iter().collect();
+        what.push_str(&format!("; fields: {}", named.join(", ")));
+    }
+    WriteError::Rejected(format!(
+        "{what}. The server's message is not shown, because it may quote a Secret value"
+    ))
+}
+
+/// The name in `admission webhook "<name>" denied the request`, if it is a DNS name, as a
+/// webhook's must be.
+fn webhook_name(message: &str) -> Option<&str> {
+    let rest = message.strip_prefix("admission webhook \"")?;
+    let (name, rest) = rest.split_once('"')?;
+    let dns = !name.is_empty()
+        && name.len() <= 253
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.');
+    (dns && rest.starts_with(" denied the request")).then_some(name)
+}
+
+/// The field paths a server can name for what `patch` sets: its masked maps, each of their keys
+/// in both of the API server's spellings, and its other top-level fields.
+fn patch_fields(patch: &Value) -> BTreeSet<String> {
+    let mut fields = BTreeSet::new();
+    let Some(top) = patch.as_object() else {
+        return fields;
+    };
+    for key in top.keys().filter(|key| *key != "metadata") {
+        fields.insert(key.clone());
+    }
+    for (path, pointer) in [
+        ("data", "/data"),
+        ("stringData", "/stringData"),
+        ("metadata.annotations", "/metadata/annotations"),
+    ] {
+        let Some(map) = patch.pointer(pointer).and_then(Value::as_object) else {
+            continue;
+        };
+        fields.insert(path.to_owned());
+        for key in map.keys() {
+            fields.insert(format!("{path}[{key}]"));
+            fields.insert(format!("{path}.{key}"));
+        }
+    }
+    fields
 }
 
 #[cfg(test)]

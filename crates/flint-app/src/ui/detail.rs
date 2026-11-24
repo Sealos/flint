@@ -1212,7 +1212,8 @@ impl DetailView {
         if self.is_secret && self.tab == DetailTab::Yaml {
             notices.push(notice(
                 "detail-secret-yaml",
-                "Secret values are hidden here. Reveal them one by one in Overview.",
+                "Secret values are hidden here. Reveal them one by one in Overview. In an edit, \
+                 a value left hidden keeps what the cluster has.",
                 theme.muted_foreground,
             ));
         }
@@ -1367,9 +1368,7 @@ impl DetailView {
             .gap_1()
             .flex_none()
             .child(button)
-            .when(self.protected && !self.is_secret, |el| {
-                el.child(self.render_edit_unlock())
-            })
+            .when(self.protected, |el| el.child(self.render_edit_unlock()))
     }
 
     /// The YAML tab's bar: the managedFields toggle, and Edit or the edit's buttons.

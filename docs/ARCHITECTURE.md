@@ -750,7 +750,9 @@ opens in a tab in the bottom dock.
    mask under a key the cluster does not have there is refused, as is a review's placeholder or any mask left in
    the patch. A changed `data` value must be base64; plain text goes under `stringData`, which the server encodes.
    The review's diff names the keys added, changed (`<hidden, changed>`) and removed, never a value, and no error
-   quotes one. A mask stands for the value under its own key: a masked line renamed onto another key keeps that
+   quotes one: a server refusal shows its code, a known reason, the admission webhook's name and the fields it names
+   that the patch has, never its message, which a webhook could use to echo a value. Edit on a Secret is offered
+   when access allows `patch`, not `update`. The overwrite warning compares `stringData` as the `data` it becomes. A mask stands for the value under its own key: a masked line renamed onto another key keeps that
    key's value, which the review shows as unchanged.
 
 Delete, scale, rollout restart, cordon, and drain are typed actions in `flint-core`, each with a confirmation in the

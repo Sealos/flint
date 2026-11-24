@@ -233,3 +233,90 @@ fn removing_the_whole_data_map_removes_every_key() {
     assert_eq!(patch["data"], Value::Null);
     assert!(patch.as_object().unwrap().contains_key("data"));
 }
+
+fn rejection(code: u16, reason: &str, message: &str, fields: &[&str]) -> kube::Error {
+    let status: kube::core::Status = serde_json::from_value(json!({
+        "status": "Failure",
+        "code": code,
+        "reason": reason,
+        "message": message,
+        "details": {"causes": fields.iter().map(|f| json!({
+            "reason": "FieldValueInvalid", "message": message, "field": f,
+        })).collect::<Vec<_>>()},
+    }))
+    .unwrap();
+    kube::Error::Api(status.boxed())
+}
+
+#[test]
+fn a_refusal_never_shows_the_servers_message() {
+    let patch = json!({
+        "metadata": {"uid": "uid-1", "resourceVersion": "10"},
+        "data": {"password": NEW},
+        "stringData": {"url": "plain-secret-value"},
+    });
+    let echoed = "admission webhook \"policy.example.com\" denied the request: password \
+                  plain-secret-value is too weak";
+    let error = write_error(
+        rejection(
+            403,
+            "Forbidden",
+            echoed,
+            &["stringData[url]", "plain-secret-value", "data"],
+        ),
+        &patch,
+    );
+    let WriteError::Rejected(text) = &error else {
+        panic!("not a rejection: {error:?}");
+    };
+    assert!(!text.contains("plain-secret-value"), "{text}");
+    assert!(!text.contains("too weak"), "{text}");
+    assert!(text.contains("403"), "{text}");
+    assert!(text.contains("[Forbidden]"), "{text}");
+    assert!(text.contains("\"policy.example.com\""), "{text}");
+    assert!(text.contains("fields: data, stringData[url]"), "{text}");
+    // A reason that is not the API server's is the webhook's own text.
+    let error = write_error(rejection(422, "plain-secret-value", "x", &[]), &patch);
+    assert!(!error.to_string().contains("plain-secret-value"), "{error}");
+    // A webhook name that is not a DNS name is not shown.
+    let error = write_error(
+        rejection(
+            400,
+            "BadRequest",
+            "admission webhook \"Plain Secret\" denied the request: x",
+            &[],
+        ),
+        &patch,
+    );
+    assert!(!error.to_string().contains("Plain"), "{error}");
+}
+
+#[test]
+fn a_refusal_keeps_conflict_and_gone() {
+    let patch = json!({});
+    assert_eq!(
+        write_error(rejection(409, "Conflict", "x", &[]), &patch),
+        WriteError::Conflict
+    );
+    assert_eq!(
+        write_error(rejection(404, "NotFound", "x", &[]), &patch),
+        WriteError::Gone
+    );
+}
+
+#[test]
+fn string_data_lands_in_data() {
+    use base64::Engine as _;
+    let edited = json!({
+        "kind": "Secret",
+        "data": {"password": OLD, "user": KEEP},
+        "stringData": {"password": "typed", "port": 5432},
+    });
+    let stored = effective_data(&edited);
+    let typed = base64::engine::general_purpose::STANDARD.encode("typed");
+    assert_eq!(stored["data"], json!({"password": typed, "user": KEEP}));
+    assert_eq!(stored["stringData"], json!({"port": 5432}));
+    let plain = effective_data(&json!({"stringData": {"a": "b"}}));
+    assert!(plain.get("stringData").is_none());
+    assert!(plain["data"]["a"].is_string());
+}

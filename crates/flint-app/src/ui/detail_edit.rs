@@ -201,8 +201,11 @@ fn competing_changes(seen: &[Value], latest: &Value, yaml: &str) -> Vec<String> 
         return Vec::new();
     };
     if flint_core::redact::is_secret_object(latest) {
-        // A mask left in place keeps the latest value: it overwrites nothing.
-        edited = flint_core::secret_edit::with_live_values(&edited, latest);
+        // A mask left in place keeps the latest value: it overwrites nothing. A `stringData`
+        // value lands in `data` under its key, so it is compared there.
+        edited = flint_core::secret_edit::effective_data(
+            &flint_core::secret_edit::with_live_values(&edited, latest),
+        );
     }
     let latest = without_server_owned(latest);
     let edited = without_server_owned(&edited);
@@ -971,13 +974,13 @@ impl DetailView {
 mod tests {
     use flint_core::write::WriteError;
     use flint_core::{KindId, ObjectDetail, SyncState, WriteRefusal};
-    use gpui_kit::test::TestAppContextExt as _;
+    use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
     use gpui_kit::{AppContext as _, TestAppContext};
     use serde_json::json;
 
     use super::{
-        Fetch, Phase, Step, competing_text, edit_error_text, editable_yaml, patch, path_text,
-        sets_status, shown_for_edit, with_resource_version, without_server_owned,
+        DetailTab, Fetch, Phase, Step, competing_text, edit_error_text, editable_yaml, patch,
+        path_text, sets_status, shown_for_edit, with_resource_version, without_server_owned,
     };
     use crate::ui::support_tests::{WAIT, objects, open_workspace, standard_sections};
 
@@ -1061,6 +1064,23 @@ mod tests {
         for value in ["b2xk", "cm90YXRlZA", "dHlwZWQ"] {
             assert!(!text.contains(value), "{text}");
         }
+    }
+
+    // Kubernetes writes stringData over data: a stringData value typed over a key rotated on the
+    // cluster is named, though its data line was left masked.
+    #[test]
+    fn string_data_over_a_rotated_key_is_named() {
+        let base = secret("b2xk", "dXNlcg==");
+        let latest = secret("cm90YXRlZA==", "dXNlcg==");
+        let opened = editable_yaml(&shown_for_edit(&base, true)).unwrap();
+        let typed = format!("{opened}stringData:\n  password: typed-plain\n");
+        let paths = competing_changes(&base, &latest, &typed);
+        assert_eq!(paths, vec!["data.password"]);
+        let text = competing_text(&paths).unwrap();
+        assert!(!text.contains("typed-plain"), "{text}");
+        // On a key nobody changed, it competes with nothing.
+        let quiet = format!("{opened}stringData:\n  user: typed-plain\n");
+        assert!(competing_changes(&base, &latest, &quiet).is_empty());
     }
 
     // A stale value kept by a reload is named, and so is a new value over a remote change.
@@ -1348,6 +1368,52 @@ mod tests {
     async fn a_secret_edit_starts_masked(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let t = open_workspace(cx, dir.path()).await;
+        let view = show_secret(cx, &t).await;
+        cx.update_window(t.window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                assert_eq!(v.edit_blocked(), None);
+                v.start_edit(window, cx);
+            })
+        })
+        .unwrap();
+        view.read_with(cx, |v, cx| {
+            let edit = v.edit.as_ref().expect("the edit started");
+            let text = edit.editor.read(cx).value().to_string();
+            assert!(text.contains(flint_core::secret_edit::MASK), "{text}");
+            assert!(!text.contains("aHVudGVyMg"), "{text}");
+        });
+    }
+
+    // covers UP-54: on a protected cluster, a Secret's Edit is disabled with Unlock beside it.
+    #[gpui_kit::test]
+    async fn a_protected_secret_offers_unlock_beside_edit(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.toml"),
+            "protect_local_clusters = true\n",
+        )
+        .unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        let view = show_secret(cx, &t).await;
+        view.update(cx, |v, _| v.tab = DetailTab::Yaml);
+        cx.run_until_parked();
+        cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.run_until_parked();
+        let drawn = cx
+            .update_window(t.window, |_, window, _| {
+                let state = |id| window.try_find(id).map(|b| b.disabled() == Some(true));
+                (state("yaml-edit"), state("yaml-edit-unlock"))
+            })
+            .unwrap();
+        assert_eq!(drawn, (Some(true), Some(false)));
+    }
+
+    /// Opens Secret `demo/db` in the detail pane, its fetch answered by hand.
+    async fn show_secret(
+        cx: &mut TestAppContext,
+        t: &crate::ui::support_tests::TestWorkspace,
+    ) -> gpui_kit::Entity<super::DetailView> {
         let kind = KindId::new("", "secrets");
         t.connect_alpha(cx, standard_sections()).await;
         t.open_kind(
@@ -1385,19 +1451,11 @@ mod tests {
             events_error: None,
         };
         cx.update_window(t.window, |_, window, cx| {
-            view.update(cx, |v, cx| {
-                v.show_fetched(detail, window, cx);
-                assert_eq!(v.edit_blocked(), None);
-                v.start_edit(window, cx);
-            })
+            view.update(cx, |v, cx| v.show_fetched(detail, window, cx))
         })
         .unwrap();
-        view.read_with(cx, |v, cx| {
-            let edit = v.edit.as_ref().expect("the edit started");
-            let text = edit.editor.read(cx).value().to_string();
-            assert!(text.contains(flint_core::secret_edit::MASK), "{text}");
-            assert!(!text.contains("aHVudGVyMg"), "{text}");
-        });
+        cx.run_until_parked();
+        view
     }
 
     #[gpui_kit::test]

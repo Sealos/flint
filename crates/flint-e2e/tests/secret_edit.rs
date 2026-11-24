@@ -11,7 +11,7 @@ use flint_core::WatchTiming;
 use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event};
 use flint_core::secret_edit::MASK;
 use flint_core::write::{WriteAction, WriteError, WriteProposal, WriteTarget};
-use flint_e2e::fake_api::{CONTEXT, FakeApiServer, Gvr, WriteRecord};
+use flint_e2e::fake_api::{CONTEXT, FakeApiServer, Fault, Gvr, Verb, WriteRecord};
 use serde_json::{Value, json};
 
 const WAIT: Duration = Duration::from_secs(30);
@@ -288,4 +288,35 @@ async fn a_rejected_value_is_never_quoted() {
     assert!(text.contains("base64"), "{text}");
     assert!(!text.contains("plain-text-secret"), "{text}");
     assert!(secret_writes(&server).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_webhook_echoing_a_value_is_reported_without_its_message() {
+    let server = FakeApiServer::start().await.unwrap();
+    server.set_object(&secrets(), live());
+    let core = Core::start(&server).await;
+    server.inject(
+        Fault::admission_denied(
+            "policy.example.com",
+            "password new-secret and token-value are not allowed",
+        )
+        .on(&secrets())
+        .verb(Verb::Other)
+        .times(1),
+    );
+
+    let error = core
+        .handle
+        .review_write(target(&server), WriteProposal::ApplyYaml { yaml: edited() })
+        .await
+        .unwrap_err();
+
+    let text = error.to_string();
+    assert!(matches!(error, WriteError::Rejected(_)), "{error:?}");
+    assert!(text.contains("\"policy.example.com\""), "{text}");
+    for value in ["new-secret", "token-value", "not allowed", NEW, TOKEN] {
+        assert!(!text.contains(value), "{value} in {text}");
+    }
+    assert!(secret_writes(&server).iter().all(WriteRecord::is_dry_run));
+    assert_eq!(stored(&server)["data"], live()["data"]);
 }
