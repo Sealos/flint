@@ -196,7 +196,9 @@ mod tests {
             metrics: Mutex::default(),
             version: Mutex::default(),
             dirty: Notify::new(),
-            pending_after: 60.into(),
+            pending_after: crate::thresholds::ThresholdMetric::PendingPodSeconds
+                .default_value()
+                .into(),
         })
     }
 

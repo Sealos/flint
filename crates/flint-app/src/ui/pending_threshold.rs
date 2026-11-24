@@ -203,6 +203,6 @@ mod tests {
         let elsewhere = PendingChoices::of_settings(&settings, Some(("dev", SERVER)));
         assert_eq!(elsewhere.title(), "Pending Pods: after 2 minutes");
         let none = PendingChoices::of_settings(&Settings::default(), None);
-        assert_eq!(none.title(), "Pending Pods: after 1 minute");
+        assert_eq!(none.title(), "Pending Pods: after 5 minutes");
     }
 }
