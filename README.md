@@ -177,20 +177,39 @@ Flint is in early development.
 - Go Back (⌘[) returns to the previous kind and object on the active cluster and restores the list's text filter.
   Tab and Shift-Tab cycle through panes outside text fields and shells. Enter opens the selected list row.
 - Light and dark themes that follow the system (View > Appearance, or the `appearance` setting, overrides it).
+- Cluster sets: **Choose Clusters** in the sidebar, then **Open Together** to see two to five clusters in one combined
+  list (a Cluster column, or one section per cluster), **Save Cluster Set…** to name the choice, and **Open Cluster Set
+  Dashboard** for a card per cluster, the unhealthiest first. A member whose context now points at another server is
+  left out.
+- **Keep Watching Cluster…**, in a cluster's row menu, gathers overview data and alerts for that cluster while it is
+  not selected. For a cluster whose credentials run a plugin (`aws`, `kubelogin`), it asks for consent to sign in in
+  the background first.
+- Alerts: a new problem on a watched cluster can post a desktop notification, and clicking it opens that cluster.
+  **Toggle Desktop Notifications** turns them on (off by default; they need `Flint.app`), and **Set Cluster Alerts…**
+  overrides that for one cluster.
+- **Toggle Problems Only** in pod, workload and node lists shows only rows with problems, by the same rules as the
+  overview and the alerts.
+- CPU and memory usage columns in pod and node lists, from metrics-server. Without it the columns are hidden and a
+  hint says why.
+- **Forward Port** on a pod or service, and **Show Port Forwards** for the panel that lists, opens and stops them.
+  Forwards listen on `127.0.0.1` only.
+- **Show Helm Releases…**: read-only Helm releases with details, history, masked values and manifest. It needs a
+  static credential (a token or a client certificate); clusters that sign in through an exec plugin or an auth
+  provider are not supported yet.
+- Connections through an HTTPS proxy: a kubeconfig cluster's `proxy-url` is used for reads, with TLS to the API server
+  itself.
+- Regex search in logs: **Toggle Regex Search** (⌥⌘R) reads the search and the Matching Lines Only filter as a regular
+  expression, and says why when it is invalid.
 - A read-only MCP server, `flint mcp`, for AI agents, limited to the clusters you expose.
 - Builds for macOS (Apple Silicon and Intel) and, best effort, Linux (x86_64 and arm64). From 0.5.0, the 24
   uploaded release files have [build provenance](#verify-a-download); GitHub's source archives do not.
 
 **Coming next:**
 
-- **v0.6, see and watch many clusters:** cluster sets, combined views and watching across clusters.
-- **v0.7, know what's wrong:** alerting and health signals across clusters.
-- **v0.8, change many clusters:** guarded fleet actions with explicit targets, a dry run per cluster, one cluster at a
+- **v0.7, change many clusters:** guarded fleet actions with explicit targets, a dry run per cluster, one cluster at a
   time, and a stop at the first failure.
-- **1.0, first public release:** a signed and notarized app with a Homebrew cask, port-forwarding, and read-only Helm
-  releases.
-- **Later:** curated views for core kinds, [regex search](https://github.com/Sealos/flint/issues/309) and
-  [log time ranges](https://github.com/Sealos/flint/issues/265).
+- **1.0, first public release:** a signed and notarized app with a Homebrew cask, and a check on real cloud clusters.
+- **Later:** curated views for core kinds and [log time ranges](https://github.com/Sealos/flint/issues/265).
 
 ## Install from a release
 
@@ -381,6 +400,7 @@ each filtered match.
 | ⌘W, ⇧⌘W | Close Dock Tab (the window when no tab is shown), Close Window | anywhere |
 | ␣, T, P, W, M, E | Toggle Pause, Timestamps, Pod Prefix, Line Wrap, Matching Lines Only, Errors Only | a log tab outside the search field |
 | ⌘F, ⌘G, ⇧⌘G | Search Logs, Next Match, Previous Match | a log tab |
+| ⌥⌘R | Toggle Regex Search | a log tab |
 | ⌘S, ⇧⌘S, ⌥⌘S | Save Logs, Save Matching Lines, Save Selected Lines | a log tab |
 | ↑ ↓, ⇧↑ ⇧↓, ⌘A, ⌘C, ⎋ | Select a line, extend the selection, select all, copy, clear | a log tab |
 | ⇧⇞ ⇧⇟, ⇧↖ ⇧↘ | Scroll a page, to the top or bottom | a shell tab |
@@ -412,6 +432,10 @@ kubeconfig_paths = ["~/work/kubeconfig"]
 # helm = "/opt/homebrew/bin/helm"
 watch_mode = "all"                # or "on_view"
 # protect_local_clusters = false  # true protects known local clusters too (see trusted_clusters)
+# desktop_notifications = false   # true posts a notification for a new problem on a watched cluster (Flint.app)
+# log_buffer_lines = 100000       # lines each log session keeps
+# log_buffer_mib = 64             # MiB each log session keeps
+# log_total_mib = 512             # MiB all log sessions keep together
 
 [cluster_watch_mode]
 # big-prod-cluster = "on_view"
@@ -436,6 +460,34 @@ watch_mode = "all"                # or "on_view"
 # server = "https://127.0.0.1:6443"
 # namespaces = ["shop"]          # optional: only these namespaces (empty or missing: all)
 # kinds = ["pods", "deployments.apps"]  # optional: only these kinds (empty or missing: all)
+
+# Warning thresholds of the cluster overview, also written by Set Pending Pod Threshold…: percent of allocatable
+# (1 to 100), counts per hour (1 to 10000) and seconds (1 to 86400). Defaults: 90, 90, 5, 10 and 60. A
+# [[thresholds.clusters]] entry (context and server, then any of the same keys) overrides them for one cluster.
+# [thresholds]
+# cpu_percent = 90
+# memory_percent = 90
+# restarts_last_hour = 5
+# warning_events_last_hour = 10
+# pending_pod_seconds = 60       # a pod Pending longer counts as a problem
+
+# Named cluster sets of 2 to 5 clusters, written by Save Cluster Set…. Each member is pinned to its server.
+# [[cluster_sets]]
+# id = "set-1"
+# name = "staging"
+# members = [{ context = "staging-eu", server = "https://eu.example.com:6443" }]
+
+# Clusters kept watched in the background (Keep Watching Cluster…), pinned to the server. Agreement to run an
+# exec plugin is not stored: it lasts until the app quits.
+# [[watched_clusters]]
+# context = "staging"
+# server = "https://staging.example.com:6443"
+
+# Per-cluster choice that overrides desktop_notifications (Set Cluster Alerts…).
+# [[cluster_alerts]]
+# context = "staging"
+# server = "https://staging.example.com:6443"
+# enabled = false
 
 # Clusters Flint may change (and open shells in) without asking, written by Trust This Cluster in
 # the sidebar's lock menu. Pinned to the server like exposure: a re-pointed context is protected
