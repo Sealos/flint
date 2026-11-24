@@ -4,6 +4,8 @@ How Flint is tested, from single functions up to the running app. [`USER-PATHS.m
 must keep working. This document covers *how* it is tested. The choices behind it are in
 [ADR-0010](./adr/0010-testing-layers.md).
 
+Behaviour that is accepted for now is in [`LIMITS.md`](./LIMITS.md).
+
 ## Layers
 
 | Layer | What it proves | Runs where | Gating |

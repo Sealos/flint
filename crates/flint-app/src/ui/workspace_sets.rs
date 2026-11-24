@@ -1163,6 +1163,24 @@ impl Workspace {
         })
     }
 
+    /// Every member of the open set, as admitted, with why a row of it cannot be acted on now, if
+    /// so; `None` when no set is open. What a fleet action plans from.
+    pub(in crate::ui) fn set_members_to_act_on(
+        &self,
+        cx: &App,
+    ) -> Option<Vec<(AdmittedMember, Option<String>)>> {
+        let run = self.sets.running.as_ref()?;
+        Some(
+            run.members
+                .iter()
+                .map(|member| {
+                    let why = self.set_row_refusal(member.context(), cx);
+                    (member.clone(), why)
+                })
+                .collect(),
+        )
+    }
+
     /// Why `cluster` may be read but not written now: the core refuses writes on its definition
     /// while a kubeconfig file can't be read. Only says what the core decides.
     pub(in crate::ui) fn writes_paused_why(&self, cluster: &str, cx: &App) -> Option<String> {
