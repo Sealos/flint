@@ -248,7 +248,6 @@ impl Workspace {
         };
         let names = self.cluster_names(cx);
         let model = self.model.read(cx);
-        let core = model.core();
         let tag = |cluster: &str| {
             self.cluster_summary(cluster, cx)
                 .and_then(|c| model.cluster_tag(c))
@@ -260,10 +259,7 @@ impl Workspace {
                 cluster: cluster.to_owned(),
                 shown: names.exact(cluster),
                 tag: tag(cluster),
-                telemetry: blocked
-                    .is_none()
-                    .then(|| core.member_telemetry(member))
-                    .flatten(),
+                telemetry: self.admitted_feed(member, blocked.is_none(), cx),
                 blocked,
                 server: member.server().to_owned(),
                 thresholds: model
