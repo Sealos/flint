@@ -931,7 +931,11 @@ impl DetailView {
             return None;
         }
         let button = Button::new("detail-shell").xsmall().ghost().label("Shell");
-        if let Some(why) = &self.sessions_blocked {
+        if let Some(why) = self
+            .sessions_blocked
+            .as_ref()
+            .or(self.row_writes_paused.as_ref())
+        {
             return Some(
                 button
                     .disabled(true)

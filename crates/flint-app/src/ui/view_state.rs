@@ -246,6 +246,9 @@ pub struct ClusterState {
     /// `protected`, `local` (a known local cluster), `unlocked` (for this session) or `trusted`
     /// (ADR-0015).
     pub protection: &'static str,
+    /// A kubeconfig file can't be read, so writes and new shells are paused. Apart from
+    /// `connection`: the cluster can stay connected and readable meanwhile.
+    pub kubeconfig_unreadable: bool,
     /// The sidebar's keyboard cursor is on it (shown with the focus ring while the sidebar
     /// has focus).
     pub cursor: bool,

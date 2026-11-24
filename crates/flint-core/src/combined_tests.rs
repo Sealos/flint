@@ -95,6 +95,34 @@ fn two_clusters() -> CombinedList {
     ])
 }
 
+#[test]
+fn an_object_filter_matches_a_uid_only_in_its_own_cluster() {
+    let list = two_clusters();
+    let mut objects = CombinedObjects::default();
+    objects.extend("dev", ["uid-1".to_owned()], []);
+    let query = CombinedQuery {
+        objects: Some(Arc::new(objects)),
+        ..CombinedQuery::default()
+    };
+    let view = list.compute(&query, NOW);
+    let shown: Vec<_> = view
+        .rows()
+        .iter()
+        .map(|&at| list.row_id(at).unwrap().cluster.to_string())
+        .collect();
+    assert_eq!(shown, ["dev"]);
+}
+
+#[test]
+fn an_object_filter_of_nothing_shows_no_rows() {
+    let list = two_clusters();
+    let query = CombinedQuery {
+        objects: Some(Arc::default()),
+        ..CombinedQuery::default()
+    };
+    assert_eq!(list.compute(&query, NOW).matched(), 0);
+}
+
 fn key(name: &str) -> ColumnKey {
     ColumnKey {
         key: format!("server:{name}"),

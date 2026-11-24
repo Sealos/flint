@@ -33,14 +33,16 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::super::confirm::{self, DialogText};
+use super::super::dashboard::set::{OpenSetMember, OpenSetProblem, SetDashboardView};
 use super::super::detail::{DetailEvent, DetailTab, DetailView, ObjectRef};
 use super::super::focus::release_unfocused_input;
 use super::super::list::combined::{CombinedListEvent, CombinedResourceList};
 use super::super::list_model::combined::CombinedSource;
 use super::super::registry::{
     self, ActionError, Bind, CloseClusterSet, CloseDetail, DeleteClusterSet, FocusFilter, Forward,
-    Guards, OpenClusterSet, OpenPickedClusters, OpenSelectedRow, RenameClusterSet, SaveClusterSet,
-    SelectFirst, SelectLast, SelectNext, SelectPrev, ToggleClusterPicking, TogglePickedCluster,
+    Guards, OpenClusterSet, OpenClusterSetDashboard, OpenPickedClusters, OpenSelectedRow,
+    RenameClusterSet, SaveClusterSet, SelectFirst, SelectLast, SelectNext, SelectPrev,
+    ShowClusterSetList, ToggleClusterPicking, TogglePickedCluster,
 };
 #[cfg(any(test, feature = "automation"))]
 use super::super::view_state::{ClusterSetsState, OpenSetState, SetGroupState, SetMemberState};
@@ -90,6 +92,8 @@ pub(super) struct RunningSet {
     kind: KindId,
     kind_label: String,
     pub(super) list: Entity<CombinedResourceList>,
+    /// The set's dashboard, shown in place of the list while open.
+    dashboard: Option<Entity<SetDashboardView>>,
     snapshots: Vec<Arc<KindSnapshot>>,
     reports: Vec<MemberReport>,
     building: bool,
@@ -302,10 +306,23 @@ fn member_note(
 impl Workspace {
     /// The set actions' checks, and the list actions' while a combined list is open.
     pub(super) fn set_guards(guards: Guards<Self>) -> Guards<Self> {
+        // The combined list kept behind the dashboard takes no keys.
         fn list_open(ws: &Workspace, _: &App) -> bool {
-            ws.list.is_some() || ws.sets.is_open()
+            ws.list.is_some()
+                || ws
+                    .sets
+                    .running
+                    .as_ref()
+                    .is_some_and(|r| r.dashboard.is_none())
+        }
+        fn dashboard_open(ws: &Workspace, _: &App) -> bool {
+            ws.set_dashboard().is_some()
         }
         guards
+            .when::<OpenClusterSetDashboard>(|ws, _| ws.sets.is_open())
+            .when::<ShowClusterSetList>(dashboard_open)
+            .when::<OpenSetMember>(dashboard_open)
+            .when::<OpenSetProblem>(dashboard_open)
             .when::<FocusFilter>(list_open)
             .when::<SelectPrev>(list_open)
             .when::<SelectNext>(list_open)
@@ -352,14 +369,16 @@ impl Workspace {
     }
 
     pub(super) fn bind_set_actions<B: Bind<Self>>(bind: B) -> B {
-        bind.bind::<ToggleClusterPicking>(Self::toggle_picking)
-            .bind::<TogglePickedCluster>(Self::toggle_picked)
-            .bind::<OpenPickedClusters>(Self::open_picked)
-            .bind::<SaveClusterSet>(Self::save_set)
-            .bind::<OpenClusterSet>(Self::open_saved)
-            .bind::<RenameClusterSet>(Self::ask_rename_set)
-            .bind::<DeleteClusterSet>(Self::ask_delete_set)
-            .bind::<CloseClusterSet>(Self::close_set)
+        Self::bind_set_dashboard_actions(
+            bind.bind::<ToggleClusterPicking>(Self::toggle_picking)
+                .bind::<TogglePickedCluster>(Self::toggle_picked)
+                .bind::<OpenPickedClusters>(Self::open_picked)
+                .bind::<SaveClusterSet>(Self::save_set)
+                .bind::<OpenClusterSet>(Self::open_saved)
+                .bind::<RenameClusterSet>(Self::ask_rename_set)
+                .bind::<DeleteClusterSet>(Self::ask_delete_set)
+                .bind::<CloseClusterSet>(Self::close_set),
+        )
     }
 
     /// Registers the set actions and forwards the open combined list's.
@@ -877,6 +896,7 @@ impl Workspace {
             kind: kind.clone(),
             kind_label: shown_kind,
             list,
+            dashboard: None,
             snapshots,
             reports: Vec::new(),
             building: false,
@@ -899,33 +919,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(run) = &self.sets.running else {
+        if !self.sets.is_open() {
             return false;
-        };
-        if run.kind == entry.id {
-            let focus = run.list.read(cx).focus_handle().clone();
-            window.focus(&focus, cx);
-            return true;
         }
-        let (label, members, changed) =
-            (run.label.clone(), run.members.clone(), run.changed.clone());
-        let (set_id, left_out) = (run.set_id.clone(), run.left_out.clone());
-        self.close_set_detail(cx);
-        self.show_set(
-            label,
-            members,
-            entry.id.clone(),
-            entry.label.clone(),
-            window,
-            cx,
-        );
-        if let Some(run) = &mut self.sets.running {
-            run.changed = changed;
-            run.set_id = set_id;
-            run.left_out = left_out;
-        }
-        // Only now: a member that changed must not count as serving, even for a moment.
-        self.refresh_set_kinds(cx);
+        self.show_set_kind(entry.id.clone(), entry.label.clone(), window, cx);
         true
     }
 
@@ -1081,10 +1078,9 @@ impl Workspace {
         })
     }
 
-    /// Why a set member's row may read but not write now: the core refuses writes on its
-    /// definition. `None` for a cluster outside the open set.
-    pub(in crate::ui) fn member_writes_paused(&self, cluster: &str, cx: &App) -> Option<String> {
-        self.sets.member(cluster)?;
+    /// Why `cluster` may be read but not written now: the core refuses writes on its definition
+    /// while a kubeconfig file can't be read. Only says what the core decides.
+    pub(in crate::ui) fn writes_paused_why(&self, cluster: &str, cx: &App) -> Option<String> {
         let summary = self.cluster_summary(cluster, cx)?;
         self.model
             .read(cx)
@@ -1160,6 +1156,7 @@ impl Workspace {
             return;
         }
         self.sweep_set_members(cx);
+        self.refresh_set_dashboard(cx);
         let Some(detail) = &self.detail else {
             return;
         };
@@ -1292,7 +1289,10 @@ impl Workspace {
     /// Stops the running set, if one is open. Called wherever the list closes.
     pub(super) fn leave_set(&mut self, cx: &mut Context<Self>) {
         self.sets.opening = None;
-        if self.sets.running.take().is_some() {
+        if let Some(run) = self.sets.running.take() {
+            if run.dashboard.is_some() {
+                self.nav.update(cx, |nav, cx| nav.set_overview(false, cx));
+            }
             // Through the same queue as admissions, so it can't overtake a later one.
             drop(self.model.read(cx).core().admit_running_set(Vec::new()));
         }
@@ -1313,6 +1313,11 @@ impl Workspace {
             .clone()
             .filter(|_| !self.narrow || !self.list_in_front);
         let body = match shown {
+            _ if run.dashboard.is_some() => div()
+                .flex_1()
+                .min_h_0()
+                .children(run.dashboard.clone())
+                .into_any_element(),
             Some(detail) if self.narrow => div()
                 .flex_1()
                 .min_h_0()
@@ -1361,7 +1366,7 @@ impl Workspace {
         member_note(
             run.reports.iter().find(|r| r.cluster == context),
             summary.is_some_and(|c| self.model.read(cx).sessions_paused(c)),
-            self.member_writes_paused(context, cx).is_some(),
+            self.writes_paused_why(context, cx).is_some(),
         )
     }
 
@@ -1460,6 +1465,19 @@ impl Workspace {
                     }),
             )
             .child(div().flex_1())
+            .child(if run.dashboard.is_some() {
+                Button::new("show-set-list")
+                    .xsmall()
+                    .ghost()
+                    .label("Show List")
+                    .on_click(registry::on_click(ShowClusterSetList))
+            } else {
+                Button::new("open-set-dashboard")
+                    .xsmall()
+                    .ghost()
+                    .label("Dashboard")
+                    .on_click(registry::on_click(OpenClusterSetDashboard))
+            })
             .child(
                 Button::new("close-cluster-set")
                     .xsmall()
@@ -1572,6 +1590,8 @@ impl Workspace {
     }
 }
 
+#[path = "workspace_set_dashboard.rs"]
+mod dashboard;
 #[path = "workspace_set_kinds.rs"]
 mod kinds;
 
