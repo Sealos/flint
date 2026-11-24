@@ -121,7 +121,8 @@
         <article class="card">
           <h3>Live lists</h3>
           <p>Lists update as the cluster changes, with a namespace and text filter. Watch every kind on the active
-            cluster, or only the ones you are looking at.</p>
+            cluster, or only the ones you are looking at. Even then, the selected cluster and open set members still get
+            problem detection, and a pod Pending for five minutes counts as a problem.</p>
         </article>
         <article class="card">
           <h3>Detail and YAML</h3>
@@ -153,8 +154,8 @@
           <h3>Port-forward, Helm and regex search</h3>
           <p>Forward Port opens a local port to a pod or service, and Show Port Forwards lists them. Show Helm
             Releases reads releases for clusters with a static credential (exec-plugin and auth-provider clusters are
-            not supported yet). Log search can be a regular expression (⌥⌘R). Clusters behind an HTTPS proxy
-            connect through it.</p>
+            not supported yet), and a failed release shows Helm's reason. Log search can be a regular expression
+            (⌥⌘R). Clusters behind an HTTP or SOCKS5 proxy connect through it.</p>
         </article>
         <article class="card">
           <h3>Follows macOS light and dark</h3>
@@ -212,8 +213,8 @@ claude mcp add flint -- /usr/local/bin/flint mcp
         <li class="done"><b>v0.3.0</b><span>Resource switcher, Go Back and pane navigation keys, plus matching-lines-only and errors-only log filters with adjustable context lines</span></li>
         <li class="done"><b>v0.4.0</b><span>YAML editing with inline validation, dry-run and diff; delete, scale, restart, cordon, drain</span></li>
         <li class="done"><b>v0.6.0</b><span>Cluster sets with a dashboard, Keep Watching and desktop alerts, problems-only lists, CPU and memory columns, port-forward panel, read-only Helm releases, regex log search</span></li>
-        <li class="next"><b>Next</b><span>Guarded fleet actions: explicit targets, a dry run per cluster, one cluster at a time, stop at the first failure</span></li>
-        <li><b></b><span>Signed and notarized universal build, Homebrew cask, first signed release</span></li>
+        <li class="done"><b>Next release</b><span>Guarded fleet actions across a cluster set (restart and scale: a dry run per cluster, one cluster at a time, stop at the first failure), deployment rollouts in recent activity, SOCKS5 proxies, warm lists for kept-watching clusters</span></li>
+        <li class="next"><b>Next</b><span>Signed and notarized universal build, Homebrew cask, first signed release</span></li>
         <li><b></b><span>Curated views for core kinds and <a href="https://github.com/Sealos/flint/issues/265">log time ranges</a></span></li>
       </ol>
     </section>
