@@ -1038,12 +1038,26 @@ async fn a_consented_set_member_writes_only_once_unlocked() {
     assert!(f.b.writes().is_empty(), "{:?}", f.b.writes());
 
     f.core.handle.unlock("b", &f.b.url());
-    let review = f
-        .core
-        .handle
-        .review_write(target, WriteProposal::Scale { to: 5 })
-        .await
-        .expect("an unlocked member can be reviewed");
+    // The member is live before its discovery is back, and a kind it has not served yet is
+    // refused before anything is sent.
+    let review = tokio::time::timeout(WAIT, async {
+        loop {
+            match f
+                .core
+                .handle
+                .review_write(target.clone(), WriteProposal::Scale { to: 5 })
+                .await
+            {
+                Err(WriteError::NotServed(_)) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => return other,
+            }
+        }
+    })
+    .await
+    .expect("b's discovery should come back")
+    .expect("an unlocked member can be reviewed");
     f.core
         .handle
         .run_write(review.into_intent())
