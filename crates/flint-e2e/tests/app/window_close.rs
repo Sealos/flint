@@ -1,8 +1,9 @@
 //! UP-42: Close Window from the list closes the real window.
 //!
-//! Close Window acts on the active window, and the app under test can start in the background
-//! with none. This test asks the app to activate its window, waits until GPUI reports it active,
-//! then sends the action once. Closing the last window is what ends the app; the app's lifecycle
+//! The app under test can start in the background, where macOS may refuse to bring it forward
+//! (from macOS 14 an app cannot activate itself over another), so Close Window acts on the front
+//! window or, with none in front, the first. This test sends the action once.
+//! Closing the last window is what ends the app; the app's lifecycle
 //! record shows the window closed before the quit hooks ran, so a direct quit does not pass.
 
 use std::time::{Duration, Instant};
@@ -35,26 +36,6 @@ fn budget(app: &App, deadline: Instant, doing: &str) -> Result<Duration> {
     Ok(left.min(ANSWER))
 }
 
-/// Brings the window to the front from inside the app, until GPUI reports it active: Close Window
-/// acts on the active window, and does nothing without one.
-fn activate(app: &App, deadline: Instant) -> Result<()> {
-    let mut last = Value::Null;
-    loop {
-        let wait = budget(
-            app,
-            deadline,
-            &format!("waiting for the window to become active (the app last said {last})"),
-        )?;
-        if let Ok(answer) = app.request_by("activate_window", Value::Null, wait) {
-            if answer["active"] == true {
-                return Ok(());
-            }
-            last = answer;
-        }
-        std::thread::sleep(POLL);
-    }
-}
-
 /// The exit code of child `pid` if it has ended. Leaves it unreaped, for `App::quit` to collect
 /// and check.
 fn exit_code(pid: u32) -> Result<Option<i32>> {
@@ -78,11 +59,10 @@ fn exit_code(pid: u32) -> Result<Option<i32>> {
     Ok((ended != 0).then_some(status))
 }
 
-/// Activates the window, sends Close Window once, and waits for the process to end with stdin
+/// Sends Close Window once, and waits for the process to end with stdin
 /// still open. Fails on any dialog that opens instead. Returns the exit code.
 fn close_window_and_wait(app: &App) -> Result<i32> {
     let deadline = Instant::now() + CLOSE;
-    activate(app, deadline)?;
     let wait = budget(app, deadline, "sending Close Window")?;
     // The app may end before it answers, so an error here is not a failure by itself.
     let answer = app.dispatch_within("flint::CloseWindow", Value::Null, wait);

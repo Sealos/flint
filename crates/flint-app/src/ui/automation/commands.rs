@@ -109,7 +109,6 @@ async fn run(command: Command, target: &Target, cx: &mut AsyncApp) -> Result<Val
         Command::State => state(target, cx),
         Command::Actions => actions(target, cx),
         Command::QuitUnlessDialog => quit_unless_dialog(target, cx),
-        Command::ActivateWindow => activate_window(target, cx),
         Command::WaitFor {
             predicate,
             timeout_ms,
@@ -363,25 +362,6 @@ fn quit_unless_dialog(target: &Target, cx: &mut AsyncApp) -> Result<Value, Error
         })?;
     }
     Ok(json!({ "dialog": title }))
-}
-
-/// Asks the platform to bring the app and the window to the front, from inside the app, and
-/// answers whether GPUI reports the window as active, with what the platform says about the
-/// request (macOS may refuse it). The request completes later, so callers repeat this until it
-/// answers `true`.
-fn activate_window(target: &Target, cx: &mut AsyncApp) -> Result<Value, Error> {
-    in_window(target, cx, |window, cx| {
-        if cx.active_window() == Some(target.window) {
-            return json!({ "active": true });
-        }
-        cx.activate(true);
-        window.activate_window();
-        #[cfg(target_os = "macos")]
-        let platform = super::activation::activate();
-        #[cfg(not(target_os = "macos"))]
-        let platform = Value::Null;
-        json!({ "active": false, "platform": platform })
-    })
 }
 
 fn in_window<R>(

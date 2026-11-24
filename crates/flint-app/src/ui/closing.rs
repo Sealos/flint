@@ -32,7 +32,9 @@ pub fn install(cx: &mut App) {
     // dispatch ends: act right after.
     cx.on_action(|_: &Quit, cx| cx.defer(quit));
     cx.on_action(|_: &CloseWindow, cx| {
-        if let Some(window) = cx.active_window() {
+        // The front window, or the first one while the app is not in front (macOS may refuse to
+        // bring it forward, and a menu item or key reaches the app only once it is).
+        if let Some(window) = cx.active_window().or_else(|| cx.windows().first().copied()) {
             cx.defer(move |cx| {
                 let _ = window.update(cx, |_, window, cx| close_window(window, cx));
             });

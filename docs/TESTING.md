@@ -137,9 +137,7 @@ A test-only control socket lets e2e tests and agents drive the real app. The cod
     (`row-<uid>`); right-clicking it selects the row and opens its menu, which `state.menu` then lists. `rejected`
     when no element, or more than one, is drawn with that id, or it is out of view (rows are virtualized).
   - `resize_window {width, height}`: resizes the window, in points (100 to 8000), to check narrow and short layouts.
-  - `activate_window`: asks the platform to bring the window to the front and answers `{active}`, whether GPUI reports
-    it as the active window yet. Activation is asynchronous and macOS may refuse it, so repeat until `active` is true.
-    The app also appends `window-closed` and `quit-hooks` to `automation-lifecycle.log` in its config directory, so a
+  - The app also appends `window-closed` and `quit-hooks` to `automation-lifecycle.log` in its config directory, so a
     test can read the order of its exit after the socket is gone.
   - `state`: the visible view tree: `focus` (`workspace`, `sidebar`, `navigation`, `list`, `list_filter`,
     `namespace_input`, `detail`, `detail_yaml`,

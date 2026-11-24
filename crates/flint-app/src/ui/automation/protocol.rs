@@ -49,9 +49,6 @@ pub enum Command {
     /// Quit, unless a dialog is open: answers with the open dialog's title (`null` when none),
     /// read in the same step that quits, so no dialog can close unseen between the two.
     QuitUnlessDialog,
-    /// Ask the platform to bring the window to the front, and report whether GPUI sees it as the
-    /// active window yet. Activation is asynchronous and the system may refuse it.
-    ActivateWindow,
 }
 
 /// How long `wait_for` waits by default, and at most.
@@ -295,10 +292,6 @@ fn command(cmd: &str, args: Value) -> Result<Command, Error> {
             no_args(cmd, &args)?;
             Command::QuitUnlessDialog
         }
-        "activate_window" => {
-            no_args(cmd, &args)?;
-            Command::ActivateWindow
-        }
         "wait_for" => {
             let (predicate, timeout_ms) = wait_args(args)?;
             Command::WaitFor {
@@ -434,10 +427,6 @@ mod tests {
             }
         );
         assert_eq!(ok(r#"{"id":"s","cmd":"state"}"#), Command::State);
-        assert_eq!(
-            ok(r#"{"id":"w","cmd":"activate_window"}"#),
-            Command::ActivateWindow
-        );
         assert_eq!(ok(r#"{"cmd":"actions"}"#), Command::Actions);
         assert_eq!(
             ok(r#"{"cmd":"wait_for","args":{"pointer":"/list/shown","at_least":2}}"#),
