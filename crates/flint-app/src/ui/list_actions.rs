@@ -66,7 +66,7 @@ impl ResourceList {
     /// The key of the drawn, unmasked column `action` names: the one with its `key` when given,
     /// else the first one headed `column`.
     pub(in crate::ui) fn sort_key(&self, action: &SortBy) -> Option<String> {
-        let columns = &self.shown.columns;
+        let columns = &self.shown_columns;
         let mut drawn = self
             .drawn
             .iter()
@@ -83,14 +83,14 @@ impl ResourceList {
     pub(in crate::ui) fn drawn_column_names(&self) -> Vec<String> {
         self.drawn
             .iter()
-            .filter(|&&(col, _)| !self.is_masked(&self.shown.columns, col))
-            .map(|&(col, _)| self.shown.columns[col].name.to_string())
+            .filter(|&&(col, _)| !self.is_masked(&self.shown_columns, col))
+            .map(|&(col, _)| self.shown_columns[col].name.to_string())
             .collect()
     }
 
     /// [`ToggleWide`] does something only when the kind has `-o wide` columns.
     pub(in crate::ui) fn has_wide_columns(&self) -> bool {
-        list_model::has_wide_columns(&self.shown.columns)
+        list_model::has_wide_columns(&self.shown_columns)
     }
 
     /// The selected object's name, for tests.

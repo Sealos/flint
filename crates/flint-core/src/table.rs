@@ -65,6 +65,10 @@ pub enum ColumnRole {
     /// Computed from `creationTimestamp`; never stored as the server's frozen text.
     Age,
     Value,
+    /// CPU in use, added by a list view from the metrics poll. Rows hold no cell for it.
+    CpuUsage,
+    /// Memory in use, added by a list view from the metrics poll. Rows hold no cell for it.
+    MemoryUsage,
 }
 
 /// One column. A kind's columns are shared (`Arc<[Column]>`) by every snapshot until the
@@ -93,10 +97,13 @@ impl Column {
             ColumnRole::Namespace => "flint:namespace".to_owned(),
             ColumnRole::Age => "flint:age".to_owned(),
             ColumnRole::Value => format!("server:{}", self.name),
+            ColumnRole::CpuUsage => "flint:cpu-usage".to_owned(),
+            ColumnRole::MemoryUsage => "flint:memory-usage".to_owned(),
         }
     }
 
-    fn synthetic(name: &str, ty: ColumnType, role: ColumnRole) -> Self {
+    /// A column Flint fills in itself, with no server definition behind it.
+    pub fn synthetic(name: &str, ty: ColumnType, role: ColumnRole) -> Self {
         Column {
             name: name.into(),
             ty,

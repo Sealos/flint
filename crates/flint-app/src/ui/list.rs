@@ -10,6 +10,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::list_usage::{self, ListUsage, UsageSource, UsageSubject};
 use flint_core::redact::{is_masked_column, is_secret_list};
 use flint_core::table::unix_now;
 use flint_core::{
@@ -189,6 +190,8 @@ pub struct ResourceList {
     /// The snapshot being drawn, and its rows in display order (indexes into `shown.rows`).
     /// Always replaced together, so an index never points into the wrong snapshot.
     shown: Arc<KindSnapshot>,
+    /// The columns drawn: `shown`'s, then the usage columns while they show.
+    shown_columns: Arc<[flint_core::Column]>,
     rows: Arc<[u32]>,
     query: Query,
     problems: problems::ProblemFilter,
@@ -277,6 +280,10 @@ pub struct ResourceList {
     _watch: Task<()>,
     _compute: Task<()>,
     _tick: Task<()>,
+    /// CPU and memory columns, for pods and nodes.
+    usage: ListUsage,
+    /// Follows the cluster feed's metrics poll. Makes no request.
+    _usage: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -308,6 +315,24 @@ impl ResourceList {
                 }
             }
         });
+        let follow_usage = match UsageSubject::of(&kind) {
+            Some(subject) => {
+                let (core, cluster) = (core.clone(), cluster.clone());
+                let mut updates = core.telemetry_updates();
+                cx.spawn(async move |this, cx| {
+                    while updates.changed().await {
+                        let source = UsageSource::of(subject, core.telemetry(&cluster).as_ref());
+                        if this
+                            .update(cx, |list, cx| list.set_usage_source(source, cx))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+            }
+            None => Task::ready(()),
+        };
         // Ages keep counting: redraw the rows in view once a second, for kinds that show ages
         // or times and only while the window is in front.
         let tick = cx.spawn_in(window, async move |this, cx| {
@@ -316,7 +341,7 @@ impl ResourceList {
                 let alive = this.update_in(cx, |list, window, cx| {
                     if window.is_window_active()
                         && !list.rows.is_empty()
-                        && list_model::has_ticking_columns(&list.shown.columns)
+                        && list_model::has_ticking_columns(&list.shown_columns)
                     {
                         cx.notify();
                     }
@@ -341,6 +366,7 @@ impl ResourceList {
             kind,
             label: entry.label.clone(),
             namespaced: entry.namespaced,
+            shown_columns: latest.columns.clone(),
             shown: latest.clone(),
             latest,
             rows: Arc::from(Vec::new()),
@@ -390,6 +416,8 @@ impl ResourceList {
             _watch: watch,
             _compute: Task::ready(()),
             _tick: tick,
+            usage: ListUsage::default(),
+            _usage: follow_usage,
             _subscriptions: vec![on_filter],
         };
         list.recompute(cx);
@@ -570,6 +598,39 @@ impl ResourceList {
         }
     }
 
+    /// Sets usage for a test, and stops following the feed so that it cannot replace it.
+    #[cfg(test)]
+    pub(in crate::ui) fn pin_usage_source(&mut self, source: UsageSource, cx: &mut Context<Self>) {
+        self._usage = Task::ready(());
+        self.set_usage_source(source, cx);
+    }
+
+    /// Takes the metrics poll's newest state.
+    fn set_usage_source(&mut self, source: UsageSource, cx: &mut Context<Self>) {
+        let generation = self.usage.generation();
+        if !self.usage.set_source(source) {
+            return;
+        }
+        // The readings are no longer valid: they go now, not when the next compute lands.
+        if self.usage.generation() != generation {
+            self.shown_columns = self.usage.columns_for(&self.shown.columns);
+            let (drawn, dropped) = self.layout(self.laid_out_width);
+            self.drawn = drawn;
+            self.dropped_wide = dropped;
+        }
+        self.recompute(cx);
+        cx.notify();
+    }
+
+    /// The text of the cell at `col` for the row at `row_ix` of the snapshot drawn.
+    pub(super) fn shown_cell(&self, row_ix: usize, col: usize, now: i64) -> SharedString {
+        let role = self.shown_columns[col].role;
+        match self.usage.cell(role, row_ix) {
+            Some(text) => SharedString::from(text),
+            None => cell_text(&self.shown.rows[row_ix], col, now),
+        }
+    }
+
     /// Selects the object with `name` in `namespace` as soon as it is listed, as a click would.
     /// For `FLINT_VIEW`.
     pub fn select_when_listed(
@@ -693,19 +754,24 @@ impl ResourceList {
         self.computing = true;
         self.dirty = false;
         let snapshot = self.latest.clone();
+        let columns = self.usage.columns_for(&snapshot.columns);
+        let usage_source = self.usage.source().clone();
+        let usage_generation = self.usage.generation();
         let job_text = self.query.text.clone();
         let namespaces = self.scope().to_vec();
+        let job_sort = list_model::resolve_sort(
+            &columns,
+            self.query.sort.as_ref(),
+            &self.sortable_in(&columns),
+        );
+        // The core sorts by the cells rows hold. The usage columns are sorted below.
         let query = ViewQuery {
             namespaces: namespaces.clone(),
             text: self.query.text.clone(),
-            sort: list_model::resolve_sort(
-                &snapshot.columns,
-                self.query.sort.as_ref(),
-                &self.sortable_in(&snapshot.columns),
-            ),
+            sort: job_sort.filter(|sort| sort.column < snapshot.columns.len()),
         };
-        self.sort_drawn = query.sort.is_some();
-        let job_sort = query.sort;
+        self.sort_drawn = job_sort.is_some();
+        let job_columns = columns.clone();
         let view = self.core.compute_view(snapshot.clone(), query);
         let selected_uid = self.selected.as_ref().map(|s| s.uid.clone());
         let restart = std::mem::take(&mut self.remeasure);
@@ -747,17 +813,33 @@ impl ResourceList {
                     .filter(|&&i| filter.awaits_check(&job_snapshot.rows[i as usize]))
                     .count()
             });
+            let usage = Arc::new(usage_source.values(&job_snapshot.rows));
+            let rows = job_sort
+                .and_then(|sort| {
+                    let role = job_columns[sort.column].role;
+                    usage.sorted(&rows, role, sort.descending)
+                })
+                .unwrap_or(rows);
             let measured = list_model::rows_to_measure(&job_snapshot, &namespaces);
-            let widths = list_model::measure_columns(&job_snapshot, &measured, unix_now());
+            let mut widths = list_model::measure_columns(&job_snapshot, &measured, unix_now());
+            list_usage::fit_widths(&mut widths, &job_columns, &usage);
             let scoped = list_model::rows_in_namespaces(&job_snapshot, &namespaces);
             let position = selected_uid.as_ref().and_then(|uid| {
                 rows.iter()
                     .position(|&i| job_snapshot.rows[i as usize].uid == *uid)
             });
-            (rows, widths, scoped, selected_uid, position, awaiting)
+            (
+                rows,
+                widths,
+                scoped,
+                selected_uid,
+                position,
+                usage,
+                awaiting,
+            )
         });
         self._compute = cx.spawn(async move |this, cx| {
-            let (rows, widths, scoped, uid, position, awaiting) = job.await;
+            let (rows, widths, scoped, uid, position, usage, awaiting) = job.await;
             let select_first = this.update(cx, |list, cx| {
                 list.computing = false;
                 #[cfg(test)]
@@ -768,12 +850,13 @@ impl ResourceList {
                 // sort clicked): drawing these rows under the new header would show one order
                 // with the other's arrow. Sort again for the layout now.
                 let now = list_model::resolve_sort(
-                    &snapshot.columns,
+                    &columns,
                     list.query.sort.as_ref(),
-                    &list.sortable_in(&snapshot.columns),
+                    &list.sortable_in(&columns),
                 );
                 let only_now = list.query.only.as_ref().map(|only| &only.objects);
                 if now != job_sort
+                    || usage_generation != list.usage.generation()
                     || only_now != only.as_ref()
                     || (list.restoring_filter && job_text != list.query.text)
                 {
@@ -784,9 +867,10 @@ impl ResourceList {
                 list.restoring_filter = false;
                 list.rows_text = job_text;
                 list.rows_namespaces = job_namespaces;
-                list.widths.update(&snapshot.columns, &widths, restart);
+                list.widths.update(&columns, &widths, restart);
                 list.scoped = scoped;
                 list.rows_in_one_namespace = one_namespace;
+                list.usage.set_values(usage);
                 list.problems.set_awaiting(awaiting);
                 list.apply(snapshot, rows, uid, position, cx);
                 if list.dirty {
@@ -819,6 +903,7 @@ impl ResourceList {
         position: Option<usize>,
         cx: &mut Context<Self>,
     ) {
+        self.shown_columns = self.usage.columns_for(&snapshot.columns);
         self.reconcile_problem_selection(cx);
         self.shown = snapshot;
         self.rows = rows;
@@ -1000,7 +1085,7 @@ impl ResourceList {
             return list_model::visible_columns(columns, self.show_wide);
         }
         let drawn: Vec<usize> = self.drawn.iter().map(|&(col, _)| col).collect();
-        list_model::map_drawn(&self.shown.columns, &drawn, columns)
+        list_model::map_drawn(&self.shown_columns, &drawn, columns)
     }
 
     /// Whether this list hides the values of the column at `index`, so nothing may be derived
@@ -1023,9 +1108,9 @@ impl ResourceList {
             .drawn
             .iter()
             .map(|&(col, _)| col)
-            .filter(|&col| !self.is_masked(&self.shown.columns, col))
+            .filter(|&col| !self.is_masked(&self.shown_columns, col))
             .collect();
-        list_model::sort_column(&self.shown.columns, self.query.sort.as_ref(), &drawn)
+        list_model::sort_column(&self.shown_columns, self.query.sort.as_ref(), &drawn)
     }
 
     /// Sorts again when the sort's column came into view or left it with the layout, so a
@@ -1043,7 +1128,7 @@ impl ResourceList {
     /// before the first layout). Wide columns that do not fit are left out, then Ready and
     /// Namespace as [`list_model::shed_columns`] allows; spare width goes to the Name column.
     fn layout(&self, available: Option<f32>) -> (Vec<(usize, f32)>, usize) {
-        let columns = &self.shown.columns;
+        let columns = &self.shown_columns;
         let width = |chars: usize| chars as f32 * CHAR_WIDTH + CELL_PADDING;
         let (mut drawn, dropped) = list_model::fit_columns(
             columns,
@@ -1055,6 +1140,9 @@ impl ResourceList {
             let name_min = width(list_model::NAME_MIN_CHARS);
             let namespace_min = width(SQUEEZED_NAMESPACE_CHARS);
             let sort = self.query.sort.as_ref();
+            list_usage::shed_usage(&mut drawn, columns, room, |i| {
+                sort.is_some_and(|s| columns[i].key() == s.column)
+            });
             let rules = list_model::ShedRules {
                 ready_repeats_status: list_model::ready_repeats_status(self.kind.as_str()),
                 one_namespace: self.rows_in_one_namespace,
@@ -1092,11 +1180,11 @@ impl ResourceList {
         let secrets = is_secret_list(self.kind.as_str());
         let health = list_model::has_health_columns(self.kind.as_str());
         let selected_uid = self.selected.as_ref().map(|s| &*s.uid);
-        let ncols = self.shown.columns.len().max(1);
+        let ncols = self.shown_columns.len().max(1);
         let namespace_hidden = !self
             .drawn
             .iter()
-            .any(|&(col, _)| self.shown.columns[col].role == ColumnRole::Namespace);
+            .any(|&(col, _)| self.shown_columns[col].role == ColumnRole::Namespace);
         let mut elements = Vec::with_capacity(range.len());
         for ix in range {
             let Some(&row_ix) = self.rows.get(ix) else {
@@ -1129,7 +1217,7 @@ impl ResourceList {
                 // is handled.
                 .on_click(registry::on_click(select.clone()));
             let finished = health
-                && list_model::row_finished(&self.shown.columns, |i| {
+                && list_model::row_finished(&self.shown_columns, |i| {
                     cell_text(row, i, now).to_string()
                 });
             let flags = list_model::RowFlags {
@@ -1139,7 +1227,7 @@ impl ResourceList {
                 masked: false,
             };
             for &(col, width) in &self.drawn {
-                let column = &self.shown.columns[col];
+                let column = &self.shown_columns[col];
                 let list_model::CellStyle {
                     shown,
                     tooltip,
@@ -1148,10 +1236,10 @@ impl ResourceList {
                     mono,
                 } = list_model::CellStyle::of(
                     column,
-                    || cell_text(row, col, now),
+                    || self.shown_cell(row_ix as usize, col, now),
                     list_model::text_width(column, row, secrets, width),
                     list_model::RowFlags {
-                        masked: is_masked_column(secrets, &self.shown.columns, col),
+                        masked: is_masked_column(secrets, &self.shown_columns, col),
                         ..flags
                     },
                 );
@@ -1239,13 +1327,13 @@ impl ResourceList {
             .font_semibold();
         let sorted_col = self.drawn_sort_column();
         for &(col, width) in &self.drawn {
-            let column = &self.shown.columns[col];
+            let column = &self.shown_columns[col];
             let name = column.name.to_string();
             let sorted = (sorted_col == Some(col))
                 .then(|| self.query.sort.as_ref().map(|s| s.descending))
                 .flatten();
             let numeric = list_model::is_numeric(column);
-            let sortable = !self.is_masked(&self.shown.columns, col);
+            let sortable = !self.is_masked(&self.shown_columns, col);
             let tip = if column.description.is_empty() {
                 name.clone()
             } else {
@@ -1258,7 +1346,7 @@ impl ResourceList {
             };
             header = header.child(
                 h_flex()
-                    .id(SharedString::from(header_id(&self.shown.columns, col)))
+                    .id(SharedString::from(header_id(&self.shown_columns, col)))
                     .h_full()
                     .px_2()
                     .gap_1()
@@ -1327,6 +1415,21 @@ impl ResourceList {
                     .tooltip(move |window, cx| Tooltip::new(count.tip.clone()).build(window, cx)),
             )
             .child(state_chip(&self.latest.state, self.latest.feed, theme))
+            .when(self.usage.no_feed(), |el| {
+                el.child(
+                    div()
+                        .id("list-usage-no-feed")
+                        .text_xs()
+                        .flex_none()
+                        .text_color(theme.muted_foreground)
+                        .child("No usage")
+                        .aria_label(list_usage::NO_FEED_HINT)
+                        .test_support()
+                        .tooltip(|window, cx| {
+                            Tooltip::new(list_usage::NO_FEED_HINT).build(window, cx)
+                        }),
+                )
+            })
             .child(div().flex_1())
             .when(problems::ProblemListKind::of(&self.kind).is_some(), |el| {
                 el.child(
@@ -1625,6 +1728,14 @@ impl ResourceList {
         if let Some(text) = self.filtered_out_text() {
             banners.push(
                 notice("list-filtered-out", text, theme.info)
+                    .test_support()
+                    .into_any_element(),
+            );
+        }
+        if let Some(hint) = self.usage.hint().filter(|_| !self.usage.no_feed()) {
+            banners.push(
+                notice("list-usage-hint", hint, theme.muted_foreground)
+                    .aria_label(hint)
                     .test_support()
                     .into_any_element(),
             );
