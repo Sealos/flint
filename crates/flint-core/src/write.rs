@@ -376,7 +376,7 @@ impl RequestGate {
         self.check_disconnects()?;
         let (client, pin, credential) = self
             .core
-            .bound_write_client(&self.cluster, Some(self.server.clone()))
+            .bound_write_client(&self.cluster, Some(self.server.clone()), None)
             .await?;
         // A set's row stays on the definition admitted, from before its credential is touched.
         self.core.check_admitted(&self.cluster, &pin)?;
@@ -500,7 +500,7 @@ async fn kind_of(core: &CoreHandle, target: &WriteTarget) -> Result<KindInfo, Wr
         return Err(moved.into());
     }
     // Refused either way: a paused context has no discovery, so this only picks the words.
-    let refusal = match core.bound_write_client(&target.cluster, None).await {
+    let refusal = match core.bound_write_client(&target.cluster, None, None).await {
         Err(unreadable @ WriteError::KubeconfigUnreadable) => unreadable,
         Err(protected @ WriteError::Refused(WriteRefusal::Protected { .. }))
             if discovery.is_none() =>

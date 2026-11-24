@@ -485,7 +485,7 @@ watch_mode = "all"                # or "on_view"
 # memory_percent = 90
 # restarts_last_hour = 5
 # warning_events_last_hour = 10
-# pending_pod_seconds = 60       # a pod Pending longer counts as a problem
+# pending_pod_seconds = 300      # a pod Pending longer counts as a problem
 
 # Named cluster sets of 2 to 5 clusters, written by Save Cluster Set…. Each member is pinned to its server.
 # [[cluster_sets]]

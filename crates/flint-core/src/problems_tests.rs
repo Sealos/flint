@@ -2098,13 +2098,13 @@ fn pending_kinds(classifier: &Classifier, pod: &Pod) -> Vec<ProblemKind> {
 
 #[test]
 fn a_pod_is_a_problem_only_past_the_default_pending_threshold() {
-    assert!(pending_kinds(&classifier(), &pending_for(59)).is_empty());
+    assert!(pending_kinds(&classifier(), &pending_for(299)).is_empty());
     assert!(
-        pending_kinds(&classifier(), &pending_for(60)).is_empty(),
+        pending_kinds(&classifier(), &pending_for(300)).is_empty(),
         "exactly at the threshold is not longer than it"
     );
     assert_eq!(
-        pending_kinds(&classifier(), &pending_for(61)),
+        pending_kinds(&classifier(), &pending_for(301)),
         [ProblemKind::PodPending]
     );
 }

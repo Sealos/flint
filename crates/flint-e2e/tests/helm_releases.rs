@@ -183,7 +183,8 @@ async fn a_credential_edit_put_back_starts_no_run() {
 }
 
 /// A core whose only cluster signs in with an exec plugin printing the token `t`, with a fake
-/// `helm` in the returned directory, and where the plugin counts its runs.
+/// `helm` in the returned directory, and where the plugin counts its runs. While a `stuck` file
+/// is beside the count, the plugin writes its pid to `pid` there and never answers.
 async fn plugin_core(server: &FakeApiServer) -> (Core, tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let plugin = dir.path().join("plugin");
@@ -191,9 +192,12 @@ async fn plugin_core(server: &FakeApiServer) -> (Core, tempfile::TempDir, PathBu
     std::fs::write(
         &plugin,
         format!(
-            "#!/bin/sh\nprintf x >> '{}'\nprintf '{{\"apiVersion\":\"client.authentication.k8s.io/\
-             v1\",\"kind\":\"ExecCredential\",\"status\":{{\"token\":\"t\"}}}}'\n",
-            ran.display()
+            "#!/bin/sh\nprintf x >> '{ran}'\nif [ -e '{d}/stuck' ]; then printf '%s' \"$$\" > \
+             '{d}/pid.new'; /bin/mv '{d}/pid.new' '{d}/pid'; exec /bin/sleep 60; fi\nprintf \
+             '{{\"apiVersion\":\"client.authentication.k8s.io/v1\",\"kind\":\"ExecCredential\",\
+             \"status\":{{\"token\":\"t\"}}}}'\n",
+            ran = ran.display(),
+            d = dir.path().display(),
         ),
     )
     .unwrap();
@@ -226,6 +230,19 @@ async fn plugin_core(server: &FakeApiServer) -> (Core, tempfile::TempDir, PathBu
 
 fn plugin_runs(ran: &Path) -> usize {
     std::fs::read(ran).map_or(0, |b| b.len())
+}
+
+/// Waits until the plugin's runs stop changing, so connections the consent let start are done.
+async fn plugin_settled(ran: &Path) {
+    let mut seen = plugin_runs(ran);
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let now = plugin_runs(ran);
+        if now == seen {
+            return;
+        }
+        seen = now;
+    }
 }
 
 /// Turns on keep watching and its background sign-in for [`CONTEXT`], as the toggles do.
@@ -317,6 +334,83 @@ async fn a_consented_plugin_signs_in_until_revoked() {
         Err(HelmError::CredentialRunsCommand)
     );
     assert_eq!(runs(scripts.path()), helm_runs, "helm never started");
+}
+
+// The plugin's launch check reads the files again: a definition changed on disk and not yet
+// reloaded starts no plugin, and ends the consent for good.
+#[tokio::test]
+async fn a_definition_changed_before_launch_starts_no_plugin() {
+    let server = FakeApiServer::start().await.unwrap();
+    let (core, scripts, ran) = plugin_core(&server).await;
+    consent(&core).await;
+    plugin_settled(&ran).await;
+    let pin = core.handle.helm_pin(CONTEXT).await.unwrap();
+    let file = core.dir.path().join("kubeconfig");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    config["users"][0]["user"]["exec"]["args"] = serde_json::json!(["--another"]);
+    std::fs::write(&file, config.to_string()).unwrap();
+    let before = plugin_runs(&ran);
+
+    assert_eq!(
+        core.handle.helm_read(CONTEXT, &pin, HelmQuery::List).await,
+        Err(HelmError::CredentialRunsCommand)
+    );
+    assert_eq!(runs(scripts.path()), 0, "helm never started");
+    assert_eq!(plugin_runs(&ran), before, "the plugin never started");
+    tokio::time::timeout(WAIT, async {
+        while core.handle.keep_watching().await[CONTEXT].sign_in == BackgroundSignIn::On {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the consent ended");
+}
+
+// A Helm run's plugin still signing in is killed by a quit, which ends the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quitting_ends_a_helm_plugin_still_signing_in() {
+    let server = FakeApiServer::start().await.unwrap();
+    let (core, scripts, ran) = plugin_core(&server).await;
+    consent(&core).await;
+    plugin_settled(&ran).await;
+    let pin = core.handle.helm_pin(CONTEXT).await.unwrap();
+    // From now on the plugin never answers, with the same program, so the consent still holds.
+    std::fs::write(ran.with_file_name("stuck"), "").unwrap();
+    let pid_file = ran.with_file_name("pid");
+    let read = tokio::spawn(core.handle.helm_read(CONTEXT, &pin, HelmQuery::List));
+    tokio::time::timeout(WAIT, async {
+        while !pid_file.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the plugin started");
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), core.handle.stop_keep_watching())
+        .await
+        .expect("the quit wait is bounded");
+    let ended = tokio::time::timeout(Duration::from_secs(5), read)
+        .await
+        .expect("the run ends with the quit")
+        .unwrap();
+    assert_eq!(ended, Err(HelmError::CredentialRunsCommand));
+    assert_eq!(runs(scripts.path()), 0, "helm never started");
+    let mut alive = true;
+    for _ in 0..200 {
+        alive = std::process::Command::new("/bin/kill")
+            .args(["-0", &pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if !alive {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!alive, "the plugin was killed");
 }
 
 #[tokio::test]
