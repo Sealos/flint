@@ -250,6 +250,7 @@ async fn a_file_change_ends_a_members_sign_in_in_progress() {
             settings: false,
             activity: false,
             rearm: false,
+            kubeconfig_rewritten: true,
         }))
         .await;
 
@@ -373,6 +374,7 @@ async fn a_detected_edit_ends_a_running_plugin_without_calling_it_a_failure() {
             settings: false,
             activity: false,
             rearm: false,
+            kubeconfig_rewritten: true,
         }))
         .await;
 
@@ -390,6 +392,21 @@ async fn a_detected_edit_ends_a_running_plugin_without_calling_it_a_failure() {
         .expect("a message");
     manager.handle_internal(message).await;
     assert_ne!(manager.keep_status("dev"), KeepWatching::SignInNeeded);
+}
+
+// What was written before new watches started went unseen, so a forward can't vouch for it.
+#[tokio::test]
+async fn new_file_watches_end_running_forwards() {
+    let plugin = FakePlugin::new("exit 1\n");
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _path) = manager_with(&plugin, config.path().to_owned());
+    let ended = manager.forward_for_tests("dev");
+
+    manager
+        .handle_internal(Internal::WatchesStarted(Default::default()))
+        .await;
+
+    assert!(ended.borrow().is_some());
 }
 
 // A saved entry holds for the route it was turned on for: another proxy needs confirming.

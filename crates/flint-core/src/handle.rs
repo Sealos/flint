@@ -25,6 +25,7 @@ use crate::logs::{
     PodSet, WorkloadPod,
 };
 use crate::manager::ClusterManager;
+use crate::port_forward::{ForwardRequest, PortForward};
 use crate::protection::{GatedClient, SessionUnlocks, WriteRefusal};
 use crate::read::{KindId, ObjectDetail};
 use crate::recheck::{ContextPin, RECHECK_EVERY};
@@ -466,6 +467,18 @@ pub(crate) enum Request {
         pin: ContextPin,
         reply: oneshot::Sender<Result<(), WriteError>>,
     },
+    /// Admits a port-forward on the cluster's current connection.
+    AdmitForward {
+        cluster: ClusterId,
+        server: Option<Option<String>>,
+        admitted: Option<Arc<AdmittedMember>>,
+        reply: oneshot::Sender<Result<crate::port_forward::ForwardGrant, WriteError>>,
+    },
+    /// Whether admitted forward `id` may carry on. Answered from memory.
+    CheckForward {
+        id: u64,
+        reply: oneshot::Sender<Result<(), crate::port_forward::ForwardFailure>>,
+    },
     /// Why a session opened on `cluster` at `pin` must end (the context was re-pointed or
     /// removed since), or `None`. Never contacts the server.
     CheckContext {
@@ -693,6 +706,7 @@ pub struct CoreHandle {
     log_budget: Arc<crate::logs::LogBudget>,
     telemetry: crate::telemetry::TelemetryBoard,
     kept: crate::manager::KeptGrants,
+    forwards: crate::manager::ForwardSignals,
     access: Arc<crate::access::AccessCache>,
     /// Set by [`Self::bound_to`]: one-off reads go only to this member.
     bound: Option<Arc<AdmittedMember>>,
@@ -725,6 +739,7 @@ impl CoreHandle {
         let telemetry = manager.telemetry_board();
         let holds = manager.definition_holds();
         let kept = manager.kept_grants();
+        let forwards = manager.forward_signals();
         runtime.spawn(manager.run(cmd_rx, req_rx));
         Ok(Self {
             commands: cmd_tx,
@@ -737,6 +752,7 @@ impl CoreHandle {
             log_budget,
             telemetry,
             kept,
+            forwards,
             access: Arc::default(),
             bound: None,
             runtime: runtime.handle().clone(),
@@ -789,6 +805,7 @@ impl CoreHandle {
     /// the manager's queue. Resolves once their plugins are killed, after a short bounded wait
     /// at most, or at once if the core stopped.
     pub fn stop_keep_watching(&self) -> impl Future<Output = ()> + Send + use<> {
+        self.forwards.quit();
         let wait = self.runtime.spawn(self.kept.quit());
         async move {
             let _ = wait.await;
@@ -1324,6 +1341,47 @@ impl CoreHandle {
         session
     }
 
+    /// Starts a port-forward on a connected cluster, through the same gate as [`Self::exec`]. It
+    /// listens on `127.0.0.1` only and ends when stopped or dropped, or when the gate refuses.
+    /// Never blocks.
+    pub fn port_forward(&self, request: ForwardRequest) -> PortForward {
+        let (forward, channels) = PortForward::new(request.clone());
+        let requests = self.requests.clone();
+        let admitted = self.bound.clone();
+        self.runtime.spawn(async move {
+            let (reply, answer) = oneshot::channel();
+            let asked = requests.send(Request::AdmitForward {
+                cluster: request.cluster.clone(),
+                server: request.server.clone(),
+                admitted: admitted.clone(),
+                reply,
+            });
+            let admission = async {
+                asked
+                    .await
+                    .map_err(|_| WriteError::from(WriteRefusal::Stopped))?;
+                answer.await.unwrap_or(Err(WriteRefusal::Stopped.into()))
+            };
+            let Some(admission) = channels.unless_stopped(admission).await else {
+                channels.say_stopped();
+                return;
+            };
+            match admission {
+                Ok(grant) => {
+                    let dialer = Arc::new(crate::port_forward::KubeDialer::new(
+                        requests,
+                        request.clone(),
+                        grant,
+                        admitted,
+                    ));
+                    crate::port_forward::run(dialer, request, channels).await;
+                }
+                Err(refusal) => crate::port_forward::refuse(&channels, &refusal),
+            }
+        });
+        forward
+    }
+
     /// What a `helm` run on `cluster` would be held to, in one step with checking it may run.
     fn helm_target(
         &self,
@@ -1612,6 +1670,7 @@ impl CoreHandle {
         } = &command
         {
             self.kept.revoke(cluster);
+            self.forwards.end_cluster(cluster);
         }
         if self.commands.try_send(command).is_err() {
             tracing::warn!("core is not running; command dropped");

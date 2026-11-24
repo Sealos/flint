@@ -37,12 +37,14 @@ use crate::watch::{ClusterWatches, EngineConfig, HubRegistry, KubeSource};
 use crate::write::WriteError;
 
 mod file_watch;
+mod forwards;
 mod helm;
 mod keep_watching;
 mod running_set;
 mod selected_retry;
 mod telemetry;
 
+pub(crate) use forwards::ForwardSignals;
 pub(crate) use keep_watching::KeptGrants;
 #[cfg(test)]
 pub(crate) use keep_watching::QUIT_WAIT;
@@ -475,6 +477,8 @@ struct Changed {
     /// A missing directory of a watched file was created: watch it now (UP-02: `~/.kube`
     /// created after launch).
     rearm: bool,
+    /// A kubeconfig file's content or location may have changed, not just its metadata.
+    kubeconfig_rewritten: bool,
 }
 
 pub(crate) struct ClusterManager {
@@ -562,6 +566,7 @@ pub(crate) struct ClusterManager {
     holds: DefinitionHolds,
     /// Clusters watched in the background, on connections of their own.
     keep: keep_watching::KeepWatch,
+    forwards: forwards::Forwards,
 }
 
 impl ClusterManager {
@@ -629,6 +634,7 @@ impl ClusterManager {
             settled: SettledDefinitions::default(),
             holds: DefinitionHolds::default(),
             keep: Default::default(),
+            forwards: Default::default(),
             reader: KubeconfigReader::default(),
             stalled_on: None,
             read_seq: 0,
@@ -667,6 +673,7 @@ impl ClusterManager {
                 Some(msg) = internal_rx.recv() => self.handle_internal(msg).await,
             }
             self.sync_keep_watching();
+            self.sync_forwards();
             self.sync_selected_retry();
             self.sync_telemetry();
         }
@@ -957,6 +964,17 @@ impl ClusterManager {
                 reply,
             } => {
                 self.check_write_pin(cluster, pin, reply);
+            }
+            Request::AdmitForward {
+                cluster,
+                server,
+                admitted,
+                reply,
+            } => {
+                let _ = reply.send(self.admit_forward(cluster, server, admitted.as_ref()));
+            }
+            Request::CheckForward { id, reply } => {
+                let _ = reply.send(self.check_forward(id));
             }
             Request::CheckContext {
                 cluster,
@@ -1870,6 +1888,9 @@ impl ClusterManager {
                 }
             }
             Internal::FilesChanged(changed) => {
+                if changed.kubeconfig_rewritten {
+                    self.invalidate_forwards();
+                }
                 if changed.rearm || changed.kubeconfig || changed.settings {
                     // A symlink may have moved. Anything written before the new watches start
                     // is caught by the read the watcher asks for once they have.
@@ -1879,11 +1900,13 @@ impl ClusterManager {
             }
             Internal::WatchesStarted(dirs) => {
                 tracing::debug!(dirs = dirs.len(), "file watches changed");
+                self.invalidate_forwards();
                 self.reload_changed(Changed {
                     kubeconfig: true,
                     settings: true,
                     activity: true,
                     rearm: false,
+                    kubeconfig_rewritten: false,
                 })
                 .await;
             }
@@ -2109,6 +2132,19 @@ impl ClusterManager {
         } else {
             Err(WriteError::ConnectionChanged)
         }
+    }
+
+    /// Whether a port-forward on `pin` may carry on: as for a write, and not while the context
+    /// is paused. From memory, so a running forward can ask often.
+    fn forward_gate(&self, cluster: &str, pin: &ContextPin) -> Result<(), WriteError> {
+        self.write_pin_gate(cluster, pin)?;
+        if self.paused(cluster) {
+            return Err(WriteRefusal::Unsettled {
+                cluster: cluster.to_owned(),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     /// Answers whether a write may go out on `pin`, from a read of the files that starts after
@@ -3498,6 +3534,26 @@ mod tests {
         assert_eq!(manager.write_gate("dev").err(), protected);
         manager.reload_settings().await;
         assert_eq!(manager.write_gate("dev").err(), protected);
+    }
+
+    // covers UP-54: a running port-forward stops being allowed once its context is held
+    // (paused behind a kubeconfig file that can't be read) or re-pointed.
+    #[tokio::test]
+    async fn a_forward_is_refused_while_held_or_re_pointed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://dev")).await;
+        let pin = manager.contexts.pin_confirmed("dev");
+        manager.held.insert("dev".into());
+        assert!(matches!(
+            manager.forward_gate("dev", &pin),
+            Err(WriteError::KubeconfigUnreadable)
+        ));
+        manager.held.remove("dev");
+        rewrite(&mut manager, dir.path(), &kubeconfig_with("https://old")).await;
+        assert!(matches!(
+            manager.forward_gate("dev", &pin),
+            Err(WriteError::Refused(WriteRefusal::Moved { .. }))
+        ));
     }
 
     // covers UP-06, UP-41: a shell's check (`Request::CheckContext`) compares the context with

@@ -291,7 +291,16 @@ async fn a_deletable_kind_has_a_menu_with_delete(cx: &mut TestAppContext) {
     );
     t.open_kind(cx, "services", services).await;
     right_click(cx, &t, "api").await;
-    assert_eq!(menu(cx, &t), ["Delete…"]);
+    // The fixture's fetch fails, and Forward Port says so; Delete is reviewed later.
+    assert_eq!(
+        menu(cx, &t),
+        [
+            "Forward Port",
+            "api could not be fetched: \"kind-alpha\" is not connected",
+            "",
+            "Delete…"
+        ]
+    );
 }
 
 // covers UP-54: on a protected cluster each action is disabled, says why once, and Unlock is

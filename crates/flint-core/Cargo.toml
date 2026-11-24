@@ -11,7 +11,7 @@ publish.workspace = true
 [dependencies]
 kube.workspace = true
 k8s-openapi.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
 async-channel.workspace = true
 futures.workspace = true
 notify.workspace = true
@@ -30,10 +30,14 @@ unicode-normalization.workspace = true
 base64.workspace = true
 http.workspace = true
 # The client stack with TCP keepalive (`cluster::build_client`); all already in the tree through kube.
-hyper = { version = "1.12.0", default-features = false }
+hyper = { version = "1.12.0", default-features = false, features = ["client"] }
 hyper-util = { workspace = true, features = ["client-legacy", "client-proxy", "http1"] }
 hyper-timeout.workspace = true
 tower.workspace = true
+# The port-forward WebSocket with its own size limits (`port_forward::wire`), with `hyper` above;
+# all already in the tree through kube.
+http-body-util.workspace = true
+tokio-tungstenite.workspace = true
 # Exec auth plugins run by Flint (`auth_plugin`): kubeconfig secrets and token expiry, both
 # already in the tree through kube.
 secrecy.workspace = true

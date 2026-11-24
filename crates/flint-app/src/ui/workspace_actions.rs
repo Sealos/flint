@@ -70,6 +70,10 @@ use super::super::registry::{
     CordonNode, DeleteObject, DrainNode, NamespacePickerNext, NamespacePickerPrevious,
     OpenNamespaceFilter, RestartObject, ScaleObject, ShowDrainReport, UncordonNode,
 };
+use super::super::registry::{
+    ForwardPort, OpenForwardedPort, ShowPortForwards, StartPortForward, StopAllPortForwards,
+    StopPortForward,
+};
 use super::super::resource_actions::{self, ResourceAction};
 use super::super::scope_picker::ScopePicker;
 use super::super::terminal_view::TerminalView;
@@ -143,6 +147,12 @@ impl Workspace {
         })
         .bind::<OpenCompare>(Self::open_compare)
         .bind::<CompareObject>(Self::compare_object)
+        .bind::<ForwardPort>(Self::forward_port)
+        .bind::<ShowPortForwards>(Self::show_port_forwards)
+        .bind::<StartPortForward>(Self::start_port_forward)
+        .bind::<StopPortForward>(Self::stop_port_forward)
+        .bind::<StopAllPortForwards>(Self::stop_all_port_forwards)
+        .bind::<OpenForwardedPort>(Self::open_forwarded_port)
         .bind::<UnlockCluster>(Self::unlock_cluster)
         .bind::<RenameCluster>(Self::rename_cluster)
         .bind::<SetClusterTag>(|this, action, _, cx| {
@@ -431,6 +441,29 @@ impl Workspace {
                 |ws, a, cx| match detail(ws, cx) {
                     Some(d) => d.shell_check::<OpenContainerShell>(Some(&a.container)),
                     None => Err(ActionError::unavailable::<OpenContainerShell>()),
+                },
+            )
+            .when::<ForwardPort>(|ws, cx| {
+                ws.sessions_open_here(cx)
+                    && detail(ws, cx).is_some_and(|d| d.forward_check::<ForwardPort>().is_ok())
+            })
+            .when::<ShowPortForwards>(|ws, _| ws.cluster.is_some())
+            .when::<StartPortForward>(Self::can_start_forward)
+            .when::<StopAllPortForwards>(Self::any_forward_running)
+            .add::<StopPortForward>(
+                |_, _| true,
+                |ws, a, cx| {
+                    ws.has_forward(a.id, cx)
+                        .then_some(())
+                        .ok_or_else(ActionError::unavailable::<StopPortForward>)
+                },
+            )
+            .add::<OpenForwardedPort>(
+                |_, _| true,
+                |ws, a, cx| {
+                    ws.forward_url(a.id, cx)
+                        .map(drop)
+                        .ok_or_else(ActionError::unavailable::<OpenForwardedPort>)
                 },
             )
             // The resource actions act on the selected row, with the row menu's checks.

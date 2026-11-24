@@ -42,8 +42,8 @@ use super::menu_fit::{
 };
 use super::object::PodContainer;
 use super::registry::{
-    self, CompareObject, OpenCompare, OpenContainerLogs, OpenLogs, OpenPreviousLogs, OpenShell,
-    UnlockCluster,
+    self, CompareObject, ForwardPort, OpenCompare, OpenContainerLogs, OpenLogs, OpenPreviousLogs,
+    OpenShell, UnlockCluster,
 };
 use super::resource_actions::{self, ResourceAction, has_sessions};
 #[cfg(any(test, feature = "automation"))]
@@ -181,10 +181,12 @@ const MAX_REASON: usize = 200;
 /// The most of a pod's name the Shell entry shows, with its key, inside the menu's width.
 const SHELL_POD_NAME: usize = 28;
 
-/// Whether rows of `kind` get the menu: pods, workloads, and kinds with a resource action
-/// (`deletable`: discovery lists the `delete` verb).
+/// Whether rows of `kind` get the menu: pods, workloads, services (Forward Port), and kinds with
+/// a resource action (`deletable`: discovery lists the `delete` verb).
 pub fn has_row_actions(kind: &KindId, deletable: bool) -> bool {
-    Subject::of(kind) != Subject::Other || resource_actions::kind_has_actions(kind, deletable)
+    Subject::of(kind) != Subject::Other
+        || *kind == KindId::new("", "services")
+        || resource_actions::kind_has_actions(kind, deletable)
 }
 
 /// Whether an entry can run now: `Err` says why not.
@@ -219,6 +221,10 @@ pub struct RowActions {
     pub compare: Option<CompareEntry>,
     /// The resource actions the row's kind has, in menu order, and whether each can run now.
     pub writes: Vec<WriteEntry>,
+    /// Forward Port, on a pod or service.
+    pub forward: Option<Availability>,
+    /// Forward Port is refused because the cluster is protected.
+    pub forward_protected: bool,
 }
 
 /// A resource action's entry in a row's menu.
@@ -299,7 +305,12 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
     let object = detail.object();
     let compare = compare_entry(ws, compare_object(object), cx);
     let deletable = ws.kind_deletable(&object.cluster, &object.kind, cx);
-    if !has_row_actions(&object.kind, deletable) && writes.is_empty() && compare.is_none() {
+    let forwards = detail.forward_target().is_some();
+    if !has_row_actions(&object.kind, deletable)
+        && writes.is_empty()
+        && compare.is_none()
+        && !forwards
+    {
         return None;
     }
     let blocked = ws.sessions_blocked(&object.cluster, cx);
@@ -314,6 +325,8 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
             .then(|| gate(detail.log_plan::<OpenPreviousLogs>(None, true).map(drop))),
         shell: gate(detail.shell_check::<OpenShell>(None)),
         shell_protected: blocked.is_none() && detail.shell_protected(),
+        forward: forwards.then(|| gate(detail.forward_check::<ForwardPort>())),
+        forward_protected: blocked.is_none() && detail.forward_protected(),
         shell_pod: detail.shell_pod(),
         shell_picker: detail.shell_picker().is_some(),
         log_containers: match subject {
@@ -346,6 +359,16 @@ fn shell_in_menu(a: &RowActions) -> Availability {
         (Err(_), Some(_)) if a.shell_protected => Err(PROTECTED_NOTE.to_owned()),
         (shell, _) => shell.clone(),
     }
+}
+
+/// Forward Port's availability as the menu draws it, on a pod or service: on a protected cluster
+/// the short note, as for Shell.
+fn forward_in_menu(a: &RowActions) -> Option<Availability> {
+    let can = a.forward.as_ref()?;
+    Some(match (can, &a.unlock) {
+        (Err(_), Some(_)) if a.forward_protected => Err(PROTECTED_NOTE.to_owned()),
+        (can, _) => can.clone(),
+    })
 }
 
 /// A resource action's availability as the menu draws it: on a protected cluster the short note,
@@ -443,8 +466,20 @@ fn fill(
     if has_sessions(a.subject) {
         menu = session_entries(menu, &a, once, &workspace, window, cx);
     }
+    if let Some(can) = forward_in_menu(&a) {
+        let says =
+            says_why && !(once && can.as_ref().err().map(String::as_str) == Some(PROTECTED_NOTE));
+        menu = entry(
+            menu,
+            registry::label::<ForwardPort>().into(),
+            Box::new(ForwardPort),
+            &can,
+            says,
+            &workspace,
+        );
+    }
     if let Some(compare) = &a.compare {
-        if has_sessions(a.subject) {
+        if has_sessions(a.subject) || a.forward.is_some() {
             menu = menu.separator();
         }
         menu = entry(
@@ -457,7 +492,7 @@ fn fill(
         );
     }
     if !a.writes.is_empty() {
-        if has_sessions(a.subject) || a.compare.is_some() {
+        if has_sessions(a.subject) || a.forward.is_some() || a.compare.is_some() {
             menu = menu.separator();
         }
         for write in &a.writes {
@@ -696,6 +731,15 @@ pub(in crate::ui) fn refusal(
             why.as_deref().unwrap_or("it cannot run now"),
         );
     }
+    if action.as_any().is::<ForwardPort>() {
+        let why = match error {
+            registry::ActionError::NotAvailable(_) => {
+                row_actions(ws, cx).and_then(|a| a.forward?.err())
+            }
+            other => Some(reason(other)),
+        };
+        return super::port_forward_view::refused(why.as_deref().unwrap_or("it cannot run now"));
+    }
     if action.as_any().is::<CompareObject>() {
         return compare::refused(&reason(error));
     }
@@ -801,6 +845,9 @@ pub fn menu_state(a: &RowActions) -> (Option<String>, Vec<MenuEntryState>) {
             _ => entry(label, &shell_in_menu(a)),
         });
     }
+    if let Some(can) = forward_in_menu(a) {
+        entries.push(entry(registry::label::<ForwardPort>().to_owned(), &can));
+    }
     if let Some(compare) = &a.compare {
         entries.push(entry(
             registry::label::<OpenCompare>().to_owned(),
@@ -835,7 +882,7 @@ pub(in crate::ui) mod tests {
 
     use super::{
         MAX_REASON, PROTECTED_NOTE, RowActions, SHELL_POD_NAME, UnlockEntry, WriteEntry,
-        menu_state, protected_once, shell_entry_label_within, unlock_tip,
+        forward_in_menu, menu_state, protected_once, shell_entry_label_within, unlock_tip,
     };
     use crate::ui::detail::{ShellPod, Subject, protected_reason};
     use crate::ui::object::PodContainer;
@@ -864,7 +911,39 @@ pub(in crate::ui) mod tests {
             unlock: None,
             compare: None,
             writes: Vec::new(),
+            forward: None,
+            forward_protected: false,
         }
+    }
+
+    // covers UP-54: on a protected cluster Forward Port shows the short note beside Unlock.
+    #[test]
+    fn forward_port_says_protected_in_the_menu() {
+        let unlock = UnlockEntry {
+            cluster: "alpha".into(),
+            name: "alpha".into(),
+            tip: "alpha".into(),
+        };
+        let protected = RowActions {
+            forward: Some(Err("alpha is protected (read-only in Flint)".into())),
+            forward_protected: true,
+            unlock: Some(unlock),
+            ..pod_actions()
+        };
+        assert_eq!(
+            forward_in_menu(&protected),
+            Some(Err(PROTECTED_NOTE.to_owned()))
+        );
+        let open = RowActions {
+            forward: Some(Ok(())),
+            ..pod_actions()
+        };
+        assert_eq!(forward_in_menu(&open), Some(Ok(())));
+        assert_eq!(
+            forward_in_menu(&pod_actions()),
+            None,
+            "not a pod or service"
+        );
     }
 
     fn state(a: &RowActions) -> serde_json::Value {
