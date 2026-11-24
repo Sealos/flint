@@ -2249,13 +2249,15 @@ async fn until_overview_watches(server: &FakeApiServer, open: bool, what: &str) 
 }
 
 // covers UP-25: in On view the selected cluster still finds problems with no overview open
-// (#715), a Pod Pending for over a minute among them.
+// (#715), a Pod Pending for longer than the default threshold among them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn in_on_view_problems_are_found_with_no_overview_open() {
     use flint_core::problems::ProblemKind;
-    // The server's time runs two minutes behind, so a pod it creates now has been Pending that long.
+    // The server's time runs a minute past the default threshold behind, so a pod it creates now
+    // has been Pending that long.
+    let threshold = flint_core::ThresholdMetric::PendingPodSeconds.default_value();
     let server = FakeApiServer::start_with(Options {
-        now: std::time::SystemTime::now() - Duration::from_secs(120),
+        now: std::time::SystemTime::now() - Duration::from_secs(u64::from(threshold) + 60),
         ..Options::default()
     })
     .await
