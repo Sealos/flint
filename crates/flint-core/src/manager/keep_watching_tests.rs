@@ -4,7 +4,7 @@ use super::*;
 use crate::auth_plugin::tests::{FakePlugin, live};
 use crate::connection::member::MemberState;
 use crate::handle::CoreConfig;
-use crate::manager::keep_watching_lists::WARM_LIST_CLUSTERS;
+use crate::manager::keep_watching_lists::{WARM_KINDS, WARM_LIST_CLUSTERS};
 use crate::manager::{Changed, Cluster};
 use crate::protection::SessionUnlocks;
 use crate::read::KindId;
@@ -942,12 +942,23 @@ async fn a_switch_keeps_a_watched_clusters_lists_warm() {
     let pods_task = task(&manager, "other", &pods).expect("pods are watched");
     let maps_task = task(&manager, "other", &config_maps).expect("config maps are watched");
     assert!(task(&manager, "other", &events).is_some());
+    // A view showed config maps a moment ago.
+    open_view(&mut manager, 1, "other", &config_maps);
+    close_view(&mut manager, 1, "other");
 
     manager.activate("dev".to_owned());
     sync(&mut manager);
     assert!(manager.lists_warm("other"), "warm in the background");
-    assert_eq!(task(&manager, "other", &pods), Some(pods_task));
-    assert_eq!(task(&manager, "other", &config_maps), Some(maps_task));
+    assert_eq!(
+        task(&manager, "other", &pods),
+        Some(pods_task),
+        "a core kind"
+    );
+    assert_eq!(
+        task(&manager, "other", &config_maps),
+        Some(maps_task),
+        "shown last"
+    );
     assert!(
         task(&manager, "other", &events).is_none(),
         "high-churn kinds stop in the background"
@@ -968,6 +979,114 @@ async fn a_switch_keeps_a_watched_clusters_lists_warm() {
         slot.write_credential.is_some(),
         "writes go through the slot"
     );
+}
+
+/// Opens view `view` on `kind` of `id`, as a subscription would.
+fn open_view(manager: &mut ClusterManager, view: u64, id: &str, kind: &KindId) {
+    manager
+        .subscriptions
+        .insert(view, (id.to_owned(), kind.clone(), None));
+    manager.reconcile(id);
+}
+
+/// Closes view `view` of `id`.
+fn close_view(manager: &mut ClusterManager, view: u64, id: &str) {
+    manager.subscriptions.remove(&view);
+    manager.reconcile(id);
+}
+
+// In the background a cluster keeps at most a few kinds: those its views showed last, before
+// the core kinds, and none that no view showed.
+#[tokio::test]
+async fn a_background_cluster_keeps_only_its_last_shown_kinds() {
+    use crate::discovery::tests::kind;
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "dev");
+    watched_other(&mut manager).await;
+    select_and_land(&mut manager, "other").await;
+    let verbs = &["get", "list", "watch"];
+    let mut kinds = vec![kind("", "Pod", "pods", true, verbs)];
+    for n in 0..=WARM_KINDS + 1 {
+        let plural = format!("widgets{n}");
+        kinds.push(kind("example.com", "Widget", &plural, true, verbs));
+    }
+    let ids: Vec<KindId> = kinds.iter().map(|kind| kind.id()).collect();
+    let slot = manager.cluster_mut("other").unwrap();
+    slot.watches.set_kinds(&kinds);
+    slot.discovery = Some(Arc::new(crate::discovery::ClusterDiscovery::new(kinds)));
+    manager.reconcile("other");
+    assert_eq!(
+        manager.cluster("other").unwrap().watches.tasks().len(),
+        ids.len()
+    );
+    // Views show every widget but the last, one after another.
+    let widgets = &ids[1..ids.len() - 1];
+    for (view, widget) in widgets.iter().enumerate() {
+        open_view(&mut manager, view as u64, "other", widget);
+        close_view(&mut manager, view as u64, "other");
+    }
+
+    manager.activate("dev".to_owned());
+    sync(&mut manager);
+
+    let running = manager.cluster("other").unwrap().watches.tasks();
+    assert_eq!(running.len(), WARM_KINDS, "{running:?}");
+    for widget in &widgets[widgets.len() - WARM_KINDS..] {
+        assert!(running.contains_key(widget), "{widget} was shown last");
+    }
+    assert!(!running.contains_key(&ids[0]), "no room left for pods");
+    assert!(!running.contains_key(&ids[1]), "shown first");
+    assert!(!running.contains_key(&ids[ids.len() - 1]), "never shown");
+}
+
+// Disconnecting a watched cluster in the background stops its warm lists before the settings
+// are written: nothing reads through its kept connection once the disconnect is under way.
+#[tokio::test]
+async fn disconnect_stops_warm_lists_at_once() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "dev");
+    watched_other(&mut manager).await;
+    select_and_land(&mut manager, "other").await;
+    let [pods, ..] = discovered(&mut manager, "other");
+    manager.activate("dev".to_owned());
+    sync(&mut manager);
+    assert!(task(&manager, "other", &pods).is_some(), "warm");
+
+    manager.disconnect_cluster("other".to_owned()).await;
+
+    assert!(!manager.lists_warm("other"));
+    assert!(manager.cluster("other").unwrap().watches.tasks().is_empty());
+}
+
+// Ending background sign-in consent, or keep watching, stops warm lists in the background before
+// the loop's next sync.
+#[tokio::test]
+async fn ending_consent_or_keep_watching_stops_warm_lists_at_once() {
+    for turn_off in [false, true] {
+        let plugin = token_plugin();
+        let config = tempfile::tempdir().unwrap();
+        let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+        allow(&mut manager).await;
+        sync(&mut manager);
+        land_kept(&mut manager, "dev").await;
+        select_and_land(&mut manager, "dev").await;
+        let [pods, ..] = discovered(&mut manager, "dev");
+        manager.activate("other".to_owned());
+        sync(&mut manager);
+        assert!(task(&manager, "dev", &pods).is_some(), "warm");
+
+        if turn_off {
+            manager.set_keep_watching("dev".to_owned(), None).await;
+        } else {
+            manager.kept_grants().revoke("dev");
+            manager.revoke_background_sign_in("dev");
+        }
+
+        assert!(!manager.lists_warm("dev"), "turn_off={turn_off}");
+        assert!(manager.cluster("dev").unwrap().watches.tasks().is_empty());
+    }
 }
 
 // A cluster that is not watched drops its watches when it is left, as before.

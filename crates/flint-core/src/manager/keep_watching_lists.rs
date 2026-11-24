@@ -11,9 +11,9 @@
 //! consent, a failure) drops the warm lists with it: a selected cluster's watches move back to
 //! the slot's client and list again, and a background cluster's stop.
 //!
-//! In the background a cluster keeps only the kinds that were running when it was left, without
-//! the high-churn ones, and at most [`WARM_LIST_CLUSTERS`] clusters keep theirs, the most
-//! recently left first, on top of the per-kind object cap every watch has.
+//! In the background a cluster keeps at most [`WARM_KINDS`] kinds: those its views showed last,
+//! then a few core kinds, never the high-churn ones. At most [`WARM_LIST_CLUSTERS`] clusters keep
+//! theirs, the most recently left first, on top of the per-kind object cap every watch has.
 
 use std::collections::HashSet;
 use std::time::Instant;
@@ -27,6 +27,17 @@ use crate::watch::KubeSource;
 
 /// How many clusters keep their resource lists warm in the background.
 pub(super) const WARM_LIST_CLUSTERS: usize = 3;
+
+/// How many kinds a cluster keeps watching in the background on warm lists.
+pub(super) const WARM_KINDS: usize = 8;
+
+/// Kinds kept in the background after those the cluster's views showed last, while there is room.
+const CORE_KINDS: &[(&str, &str)] = &[
+    ("", "pods"),
+    ("apps", "deployments"),
+    ("", "services"),
+    ("", "nodes"),
+];
 
 /// Kinds a cluster stops watching in the background, because they change often and no open view
 /// needs them there: they start again when it is selected.
@@ -49,6 +60,8 @@ pub(super) struct WarmLists {
     attempt: u64,
     /// In the background: the kinds kept running, chosen when the cluster was left.
     kinds: Option<HashSet<KindId>>,
+    /// The kinds its views showed, the most recent last, at most [`WARM_KINDS`].
+    viewed: Vec<KindId>,
     /// When the cluster was last left, to keep the most recent ones under the cap.
     left: Option<Instant>,
 }
@@ -118,6 +131,7 @@ impl ClusterManager {
                 slot.warm = Some(WarmLists {
                     attempt,
                     kinds: None,
+                    viewed: Vec::new(),
                     left: None,
                 });
             }
@@ -137,13 +151,21 @@ impl ClusterManager {
     }
 
     /// For [`Self::reconcile`]: the kinds `id` keeps running in the background on warm lists,
-    /// which are those running when it was left, without the high-churn ones. `None` when its
-    /// lists are not warm in the background. A selected cluster forgets them.
+    /// chosen when it is left: those its views showed last, then [`CORE_KINDS`], of those running
+    /// and without the high-churn ones, at most [`WARM_KINDS`]. `None` when its lists are not warm
+    /// in the background. A selected cluster forgets them and notes the kinds its views show.
     pub(super) fn warm_background_kinds(&mut self, id: &str) -> Option<HashSet<KindId>> {
         let selected = self.wants_watches(id);
+        let mut open: Vec<KindId> = self.open_view_kinds(id).into_iter().collect();
+        open.sort();
         let slot = self.cluster_mut(id)?;
         let running = slot.watches.running();
         let warm = slot.warm.as_mut()?;
+        // The views open now are the most recent, whether it is selected or just left.
+        warm.viewed.retain(|kind| !open.contains(kind));
+        warm.viewed.extend(open);
+        let over = warm.viewed.len().saturating_sub(WARM_KINDS);
+        warm.viewed.drain(..over);
         if selected {
             warm.kinds = None;
             warm.left = None;
@@ -151,14 +173,32 @@ impl ClusterManager {
         }
         if warm.kinds.is_none() {
             warm.left = Some(Instant::now());
-            warm.kinds = Some(
-                running
-                    .into_keys()
-                    .filter(|kind| !high_churn(kind))
-                    .collect(),
-            );
+            let core = CORE_KINDS
+                .iter()
+                .map(|(group, plural)| KindId::new(group, plural));
+            let mut kinds = HashSet::new();
+            for kind in warm.viewed.iter().rev().cloned().chain(core) {
+                if kinds.len() == WARM_KINDS {
+                    break;
+                }
+                if running.contains_key(&kind) && !high_churn(&kind) {
+                    kinds.insert(kind);
+                }
+            }
+            warm.kinds = Some(kinds);
         }
         warm.kinds.clone()
+    }
+
+    /// Drops `id`'s warm lists at once once their kept connection is gone or may no longer serve
+    /// them, so its watches stop, or move back to the slot, before anything else runs.
+    pub(super) fn drop_stale_warm_lists(&mut self, id: &str) {
+        let current = self
+            .cluster(id)
+            .and_then(|slot| slot.warm.as_ref().map(|warm| warm.attempt));
+        if current.is_some() && self.warm_attempt(id) != current {
+            self.set_warm(id, None);
+        }
     }
 
     /// Whether `id`'s watches read through its kept connection.
