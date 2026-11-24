@@ -16,6 +16,8 @@ use kube::core::discovery::v2::APIGroupDiscovery;
 use kube::discovery::verbs;
 
 use crate::api_error::{ApiError, Transport};
+use crate::api_path::{self, PathError};
+pub use crate::api_path::{is_dns1123_label, is_dns1123_subdomain, is_path_segment};
 use crate::cluster::ClusterError;
 use crate::paging;
 
@@ -270,48 +272,19 @@ fn is_stale(group: &APIGroupDiscovery) -> bool {
         .is_some_and(|freshness| freshness != "Current")
 }
 
-/// Whether `name` can be sent as one segment of a request path, as client-go's
-/// `IsValidPathSegmentName` requires: not `.` or `..`, and no `/` or `%`. `?`, `#`, whitespace
-/// and control characters are refused as well, so a name can never end the path or add to it.
-pub fn is_path_segment(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name
-            .chars()
-            .any(|c| matches!(c, '/' | '%' | '?' | '#') || c.is_whitespace() || c.is_control())
-}
-
-/// Lowercase letters, digits and `-`, starting and ending with a letter or digit, of any
-/// non-zero length.
-fn is_dns1123_part(part: &str) -> bool {
-    let bytes = part.as_bytes();
-    let alnum = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
-    bytes.first().is_some_and(alnum)
-        && bytes.last().is_some_and(alnum)
-        && bytes.iter().all(|b| alnum(b) || *b == b'-')
-}
-
-/// A DNS-1123 label: at most 63 lowercase letters, digits and `-`, starting and ending with a
-/// letter or digit.
-pub fn is_dns1123_label(name: &str) -> bool {
-    name.len() <= 63 && is_dns1123_part(name)
-}
-
-/// A DNS-1123 subdomain as Kubernetes checks it: at most 253 characters, parts as in a label
-/// joined by `.`, with no limit on the length of one part.
-pub fn is_dns1123_subdomain(name: &str) -> bool {
-    name.len() <= 253 && name.split('.').all(is_dns1123_part)
+impl From<PathError> for ClusterError {
+    fn from(error: PathError) -> Self {
+        ClusterError::Kube(error.to_string())
+    }
 }
 
 /// Whether a discovered group, version and plural can be put into a request path as they are:
 /// a DNS-1123 subdomain group (or the empty core group), a DNS-1123 label version, and a
-/// plural that is one path segment. A server, or an extension API server, that advertises
+/// lowercase plural. A server, or an extension API server, that advertises
 /// anything else (`x/../../api/v1/secrets`) has that resource left out.
 fn is_routable(group: &str, version: &str, plural: &str) -> bool {
-    (group.is_empty() || is_dns1123_subdomain(group))
-        && is_dns1123_label(version)
-        && is_path_segment(plural)
+    api_path::validate_group_version(group, version).is_ok()
+        && api_path::validate_resource_plural(plural).is_ok()
 }
 
 /// The kinds of one group at its preferred version, which aggregated discovery lists first.
@@ -351,6 +324,7 @@ async fn discover_per_group(
     let mut kinds = Vec::new();
     let core = bounded_request(limit, client.list_core_api_versions()).await?;
     if let Some(version) = core.versions.first() {
+        api_path::validate_group_version("", version)?;
         let list = bounded_request(limit, client.list_core_api_resources(version)).await?;
         kinds.extend(kinds_from_resource_list("", version, list));
     }
@@ -365,6 +339,17 @@ async fn discover_per_group(
             Some((group.name, gv))
         }))
         .map(|(name, gv)| async move {
+            if name.is_empty()
+                || api_path::validate_api_version(&name, &gv.version, &gv.group_version).is_err()
+            {
+                return (
+                    name,
+                    Err(GroupFailure {
+                        status: None,
+                        category: "invalid group or version",
+                    }),
+                );
+            }
             let result =
                 match bounded(limit, client.list_api_group_resources(&gv.group_version)).await {
                     Ok(Ok(list)) => Ok(kinds_from_resource_list(&name, &gv.version, list)),
@@ -639,11 +624,14 @@ pub(crate) fn dynamic_api(
     client: &Client,
     kind: &KindInfo,
     namespace: Option<&str>,
-) -> Api<DynamicObject> {
-    match namespace {
-        Some(ns) if kind.namespaced => Api::namespaced_with(client.clone(), ns, &kind.resource),
+    name: Option<&str>,
+) -> Result<Api<DynamicObject>, PathError> {
+    let namespace = namespace.filter(|_| kind.namespaced);
+    api_path::validate_resource_path(&kind.resource, namespace, name)?;
+    Ok(match namespace {
+        Some(ns) => Api::namespaced_with(client.clone(), ns, &kind.resource),
         _ => Api::all_with(client.clone(), &kind.resource),
-    }
+    })
 }
 
 /// Lists objects of a kind.
@@ -652,7 +640,7 @@ pub async fn list(
     kind: &KindInfo,
     query: &ListQuery,
 ) -> Result<ListPage, ClusterError> {
-    let api = dynamic_api(client, kind, query.namespace.as_deref());
+    let api = dynamic_api(client, kind, query.namespace.as_deref(), None)?;
     let list = api
         .list(&query.to_params())
         .await
@@ -679,7 +667,7 @@ pub async fn get(
             kind.kind()
         )));
     }
-    dynamic_api(client, kind, namespace)
+    dynamic_api(client, kind, namespace, Some(name))?
         .get(name)
         .await
         .map_err(ClusterError::kube)
@@ -911,6 +899,7 @@ pub async fn events(
     client: &Client,
     query: &EventQuery,
 ) -> Result<(Vec<Event>, bool), ClusterError> {
+    api_path::validate_names(query.namespace.as_deref(), None)?;
     let api: Api<Event> = match &query.namespace {
         Some(ns) => Api::namespaced(client.clone(), ns),
         None => Api::all(client.clone()),
@@ -972,6 +961,7 @@ pub struct LogQuery {
 /// Fetches a pod's logs (not following). Bytes that are not valid UTF-8, including a character
 /// cut in half by `limit_bytes`, become U+FFFD instead of failing the whole fetch.
 pub async fn pod_logs(client: &Client, query: &LogQuery) -> Result<String, ClusterError> {
+    api_path::validate_names(Some(&query.namespace), Some(&query.pod))?;
     let api: Api<Pod> = Api::namespaced(client.clone(), &query.namespace);
     let params = LogParams {
         container: query.container.clone(),
@@ -996,6 +986,40 @@ pub async fn pod_logs(client: &Client, query: &LogQuery) -> Result<String, Clust
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test uses an in-process transport"
+    )]
+    async fn api_path_rejects_hostile_object_reads_before_contacting_the_server() {
+        use kube::client::Body;
+        use std::convert::Infallible;
+        use std::future::Ready;
+
+        let service = tower::service_fn(
+            |request: http::Request<Body>| -> Ready<Result<http::Response<Body>, Infallible>> {
+                panic!("unexpected request to {}", request.uri());
+            },
+        );
+        let client = Client::new(service, "default");
+        let mut pods = kind("", "v1", "Pod", "pods");
+        for name in ["a/b", "..", "x?y", "x#y", "%2F"] {
+            let error = get(&client, &pods, Some("demo"), name).await.unwrap_err();
+            assert_eq!(error.to_string(), PathError::Name.to_string());
+        }
+        let error = get(&client, &pods, Some("demo/pods"), "web")
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), PathError::Namespace.to_string());
+        pods.resource.plural = "pods/log".into();
+        let error = get(&client, &pods, Some("demo"), "web").await.unwrap_err();
+        assert_eq!(error.to_string(), PathError::Resource.to_string());
+        pods.resource.plural = "pods".into();
+        pods.resource.api_version = "v1/..".into();
+        let error = get(&client, &pods, Some("demo"), "web").await.unwrap_err();
+        assert_eq!(error.to_string(), PathError::GroupVersion.to_string());
+    }
 
     // covers UP-23: a detail read whose object used the whole deadline asks for no events
     // (#258).

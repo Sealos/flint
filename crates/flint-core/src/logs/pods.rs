@@ -14,6 +14,7 @@ use kube::core::Selector;
 use kube::runtime::watcher;
 
 use super::source::{ClientLookup, LogError};
+use crate::api_path;
 use crate::cluster::ClusterError;
 use crate::read::KindId;
 
@@ -261,6 +262,7 @@ where
     K::DynamicType: Default,
     S: FnOnce(K) -> Option<LabelSelector>,
 {
+    api_path::validate_names(Some(namespace), Some(name))?;
     let api: Api<K> = Api::namespaced(client, namespace);
     let object = api.get(name).await.map_err(LogError::from_kube)?;
     Ok(selector(object))
@@ -309,6 +311,7 @@ impl PodSource for KubePodSource {
         let (namespace, selector) = (namespace.to_owned(), selector.to_owned());
         async move {
             let client = client().await?;
+            api_path::validate_names(Some(&namespace), None)?;
             let api: Api<Pod> = Api::namespaced(client, &namespace);
             let events = watcher(api, watcher::Config::default().labels(&selector))
                 .filter_map(|event| async move {
@@ -408,6 +411,7 @@ pub(crate) async fn list_workload_pods(
     pods: &PodSet,
     freshness: Freshness,
 ) -> Result<Vec<WorkloadPod>, LogError> {
+    api_path::validate_names(Some(namespace), None)?;
     let selector = match pods {
         PodSet::Workload { kind, name } => {
             let lookup: ClientLookup = {

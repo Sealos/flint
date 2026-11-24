@@ -21,6 +21,7 @@ use serde::de::{self, DeserializeOwned, DeserializeSeed, IgnoredAny, MapAccess, 
 use super::RequestGate;
 use super::objects::MAX_OBJECTS_PER_KIND;
 use crate::api_error::{ApiError, ApiErrorKind};
+use crate::api_path;
 use crate::cluster::{ClusterError, SafeErrorText};
 use crate::metrics::{
     ContainerMetrics, MetricsError, MetricsList, MetricsResult, NodeMetrics, PodMetrics, Usage,
@@ -164,6 +165,7 @@ async fn within<T>(
 
 /// The body at `resource`, or `None` if it passes [`MAX_BODY_BYTES`].
 async fn fetch_body(client: &Client, resource: &str) -> Result<Option<Vec<u8>>, MetricsError> {
+    api_path::validate_resource_plural(resource).map_err(|error| failed(&error.to_string()))?;
     let request = Request::new(format!("{API_PATH}/{resource}"))
         .list(&ListParams::default())
         .map_err(|err| failed(&err.to_string()))?;

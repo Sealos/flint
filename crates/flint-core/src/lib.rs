@@ -8,6 +8,7 @@ pub mod access;
 pub mod activity;
 pub mod alerts;
 pub mod api_error;
+mod api_path;
 mod auth_plugin;
 pub mod bootstrap;
 pub mod cache;

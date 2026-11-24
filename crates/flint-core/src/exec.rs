@@ -824,6 +824,15 @@ pub(crate) async fn start(
 ) {
     match client {
         Ok((client, watch)) => {
+            if let Err(error) =
+                crate::api_path::validate_names(Some(&request.namespace), Some(&request.pod))
+            {
+                let mut session = Session::new(channels);
+                let failure = ExecFailure::new(ExecFailureKind::Other, error.to_string());
+                session.set_state(ExecState::Failed(failure));
+                session.linger().await;
+                return;
+            }
             let launcher = KubeLauncher {
                 api: Api::namespaced(client.into_client(), &request.namespace),
                 pod: request.pod.clone(),
