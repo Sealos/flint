@@ -127,13 +127,13 @@ actions!(
         NamespacePickerPrevious,
         /// Watch every kind on the active cluster.
         WatchAllKinds,
-        /// Watch only the kinds open in a view, on the active cluster.
+        /// Watch the kinds of open views and the problem kinds, on the active cluster.
         WatchOpenViewsOnly,
         /// Let the active cluster follow the default watch mode.
         UseDefaultWatchMode,
         /// Make "all kinds" the default watch mode.
         DefaultWatchAllKinds,
-        /// Make "open views only" the default watch mode.
+        /// Make "on view" the default watch mode.
         DefaultWatchOpenViewsOnly,
         /// Go back to the kind and object shown before.
         GoBack,
@@ -2506,8 +2506,8 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<WatchAllKinds>("Watch All Kinds", "Watch every kind on the active cluster.")
             .of(C::Cluster, S::Workspace),
         Spec::unit::<WatchOpenViewsOnly>(
-            "Watch Open Views Only",
-            "Watch only the kinds open in a view, on the active cluster.",
+            "Watch On View",
+            "Watch the kinds of open views and the problem kinds, on the active cluster.",
         )
         .of(C::Cluster, S::Workspace),
         Spec::unit::<UseDefaultWatchMode>(
@@ -2521,8 +2521,8 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         )
         .of(C::Cluster, S::Workspace),
         Spec::unit::<DefaultWatchOpenViewsOnly>(
-            "Watch Open Views Only by Default",
-            "Make watching only open views the default for all clusters.",
+            "Watch On View by Default",
+            "Make watching the kinds of open views and the problem kinds the default for all clusters.",
         )
         .of(C::Cluster, S::Workspace),
         // Navigation and panes.

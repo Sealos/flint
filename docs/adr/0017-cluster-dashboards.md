@@ -35,7 +35,7 @@ sorted by most problems first, under a totals strip. A count opens the combined 
 - **Current values only:** a spike two minutes ago would be invisible.
 - **Prometheus history:** real history over days, but Prometheus discovery and PromQL per kind is a feature of its
   own (ADR-0005), and many clusters have no Prometheus.
-- **Poll counts in "open views only" mode:** lighter on huge clusters, but up to 30 s stale and a second data path.
+- **Poll counts in "On view" mode:** lighter on huge clusters, but up to 30 s stale and a second data path.
 - **User-arranged tiles:** a layout model and editor to build and test for little gain over a well-ordered fixed
   layout.
 - **Fixed thresholds:** simpler, but production and dev clusters need different warning levels.

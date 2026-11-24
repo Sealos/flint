@@ -374,12 +374,7 @@ pub(crate) enum Request {
     Unsubscribe {
         id: u64,
     },
-    /// An overview of `cluster` is showing.
-    OpenOverview {
-        id: u64,
-        cluster: ClusterId,
-    },
-    /// [`Self::OpenOverview`] only if `cluster` is still the slot `generation`.
+    /// An overview of `cluster` is showing, only if `cluster` is still the slot `generation`.
     OpenOverviewOn {
         id: u64,
         cluster: ClusterId,
@@ -851,8 +846,7 @@ impl CoreHandle {
     }
 
     /// What the feed of `cluster` knows. `None` while it has none: it is neither kept watching,
-    /// selected nor in the running set, is in watch mode On view with no overview showing, is not
-    /// connected, is paused, or its sign-in runs a program and it is in the background without
+    /// selected nor in the running set, is not connected, is paused, or its sign-in runs a program and it is in the background without
     /// consent. A kept cluster that stopped or can't be reached shows its last values, with
     /// their age in the status. Never blocks.
     pub fn telemetry(&self, cluster: &str) -> Option<crate::telemetry::ClusterTelemetry> {
@@ -922,27 +916,11 @@ impl CoreHandle {
         }
     }
 
-    /// Marks `cluster`'s overview as showing until the result is dropped, so its telemetry feed
-    /// runs in watch mode On view too, while the cluster is active and not paused. Reads only.
-    /// A handle bound to a member starts nothing. Never blocks.
-    pub fn open_overview(&self, cluster: &str) -> OverviewInterest {
-        let id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
-        if matches!(self.read_binding(cluster), Ok(None)) {
-            let _ = self.requests.try_send(Request::OpenOverview {
-                id,
-                cluster: cluster.to_owned(),
-            });
-        }
-        OverviewInterest {
-            id,
-            requests: self.requests.clone(),
-            bound: None,
-        }
-    }
-
-    /// [`Self::open_overview`] for the slot `generation` of `cluster`. The core compares them as
-    /// it registers, so a context re-pointed meanwhile registers nothing, and
-    /// [`OverviewInterest::telemetry`] never reads the feed of a later slot.
+    /// Marks the overview of the slot `generation` of `cluster` as showing until the result is
+    /// dropped. The cluster's feed runs whether or not one is showing, in either watch mode
+    /// (#715). Reads only. A handle bound to a member starts nothing. Never blocks. The core
+    /// compares the generation as it registers, so a context re-pointed meanwhile registers
+    /// nothing, and [`OverviewInterest::telemetry`] never reads the feed of a later slot.
     pub fn open_overview_on(&self, cluster: &str, generation: u64) -> OverviewInterest {
         let id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
         let (live, seen) = watch::channel(false);
@@ -1804,7 +1782,7 @@ impl Drop for Subscription {
     }
 }
 
-/// An overview on show, from [`CoreHandle::open_overview`]. Dropping it ends its watches.
+/// An overview on show, from [`CoreHandle::open_overview_on`]. Dropping it ends its binding.
 #[derive(Debug)]
 pub struct OverviewInterest {
     id: u64,

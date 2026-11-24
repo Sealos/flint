@@ -11,7 +11,7 @@ use flint_core::discovery::ClusterDiscovery;
 use flint_core::handle::{ClusterSummary, ConnectionState};
 use flint_core::kubeconfig::ContextInfo;
 use flint_core::problems::{Classifier, Problem, ProblemKind, ProblemSeverity};
-use flint_core::settings::{AiScope, SETTINGS_FILE, WatchMode, set_ai_exposed, set_ai_scope};
+use flint_core::settings::{AiScope, SETTINGS_FILE, set_ai_exposed, set_ai_scope};
 use flint_core::telemetry::{
     Availability, KindCheck, MetricsCheck, TelemetrySnapshot, WatchedKind,
 };
@@ -219,7 +219,7 @@ fn a_reconnect_does_not_repeat_open_alerts() {
     raised(&mut tracker, &prod, "n1");
     let lost = summary(PROD, ConnectionState::Connecting);
     for second in [610, 620, 630] {
-        let reading = reading(&lost, WatchMode::All, None, None);
+        let reading = reading(&lost, None, None);
         assert!(matches!(reading, Reading::Lost));
         assert!(
             tracker
@@ -236,7 +236,7 @@ fn a_feed_restarting_while_connected_keeps_open_alerts() {
     let prod = connected(PROD);
     let mut tracker = tracker();
     raised(&mut tracker, &prod, "n1");
-    let gap = reading(&prod, WatchMode::All, None, None);
+    let gap = reading(&prod, None, None);
     assert!(matches!(gap, Reading::NotWatched));
     assert!(tracker.observe(&[input(&prod, gap)], at(610)).is_empty());
     let back = feed(&mut tracker, &prod, vec![bad_node(PROD, "n1")], at(620));
@@ -322,22 +322,13 @@ fn a_problem_of_an_incomplete_group_raises_nothing() {
 
 #[test]
 fn clusters_with_no_feed_of_their_own_are_never_read_as_lost() {
-    let on_view = connected("view");
-    assert!(matches!(
-        reading(&on_view, WatchMode::OnView, None, None),
-        Reading::NotWatched
-    ));
+    let no_feed = connected("view");
+    assert!(matches!(reading(&no_feed, None, None), Reading::NotWatched));
     let idle = summary("idle", ConnectionState::Disconnected);
-    assert!(matches!(
-        reading(&idle, WatchMode::All, None, None),
-        Reading::NotWatched
-    ));
+    assert!(matches!(reading(&idle, None, None), Reading::NotWatched));
     let mut paused = connected("paused");
     paused.paused = true;
-    assert!(matches!(
-        reading(&paused, WatchMode::All, None, None),
-        Reading::Lost
-    ));
+    assert!(matches!(reading(&paused, None, None), Reading::Lost));
 }
 
 #[test]
@@ -645,12 +636,12 @@ async fn a_feed_of_an_earlier_slot_is_not_read_for_the_new_one(cx: &mut TestAppC
     });
     assert_eq!(feed.generation, summary.generation);
     assert!(matches!(
-        super::feed_reading(&summary, WatchMode::All, Some(&feed), None),
+        super::feed_reading(&summary, Some(&feed), None),
         Reading::Kept { .. }
     ));
 
     summary.generation += 1;
-    let reading = super::feed_reading(&summary, WatchMode::All, Some(&feed), None);
+    let reading = super::feed_reading(&summary, Some(&feed), None);
     assert!(matches!(reading, Reading::NotWatched), "{reading:?}");
     let mut tracker = tracker();
     assert!(

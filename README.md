@@ -168,7 +168,7 @@ Flint is in early development.
 - Your kubeconfig contexts in a sidebar; Flint connects to the one you select and checks its health.
 - Every kind the cluster serves, CRDs included, from the cluster's own discovery: live lists with the `kubectl get`
   columns, a namespace and text filter, and a detail view with metadata, conditions, events and YAML.
-- A watch mode for the active cluster: watch all kinds or only open views, with a default and per-cluster overrides.
+- A watch mode for the active cluster: watch all kinds, or the kinds of open views plus the problem kinds (On view), with a default and per-cluster overrides.
 - YAML editing with a server dry-run and diff, plus delete, scale, rollout restart, cordon and drain, all behind the
   cluster protection.
 - A bottom dock with pod and workload logs (follow, search, timestamps, previous logs, save to a file) and shells into

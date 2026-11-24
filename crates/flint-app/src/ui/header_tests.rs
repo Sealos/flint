@@ -178,13 +178,12 @@ async fn the_watch_mode_follows_the_menu_and_persists(cx: &mut TestAppContext) {
         2,
         "this cluster's and the default's"
     );
-    assert_eq!(items(cx, "Open views only"), 2);
+    assert_eq!(items(cx, "On view"), 2);
     t.press(cx, "escape");
 
     t.dispatch(cx, "workspace::WatchOpenViewsOnly", Value::Null)
         .unwrap();
-    t.wait_for_label(cx, "watch-mode", "Live: open views only")
-        .await;
+    t.wait_for_label(cx, "watch-mode", "Live: on view").await;
     let settings = t.model.read_with(cx, |m, _| m.settings.clone());
     assert_eq!(
         settings.cluster_watch_mode.get("kind-alpha"),
@@ -206,8 +205,7 @@ async fn the_watch_mode_follows_the_menu_and_persists(cx: &mut TestAppContext) {
     assert_eq!(own, Some(WatchMode::All));
     t.dispatch(cx, "workspace::WatchOpenViewsOnly", Value::Null)
         .unwrap();
-    t.wait_for_label(cx, "watch-mode", "Live: open views only")
-        .await;
+    t.wait_for_label(cx, "watch-mode", "Live: on view").await;
 
     // On a failed cluster nothing is watched, so its header has no switch; the default can still
     // be changed from there.
@@ -223,7 +221,7 @@ async fn the_watch_mode_follows_the_menu_and_persists(cx: &mut TestAppContext) {
     })
     .await;
 
-    // Back on kind-alpha, drop its own mode: it follows the default (open views only), and the
+    // Back on kind-alpha, drop its own mode: it follows the default (on view), and the
     // default back to all kinds takes it along.
     t.activate(cx, "kind-alpha").await;
     t.dispatch(cx, "workspace::UseDefaultWatchMode", Value::Null)
