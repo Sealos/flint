@@ -57,9 +57,12 @@ pub(super) async fn run(
                 shared.pending_after.load(Ordering::Relaxed),
             )
         };
+        // An unchanged pass keeps the published snapshot: no new `Arc`, and nothing to wake.
         sender.send_if_modified(|current| {
             let changed = !current.same_as(&next);
-            *current = Arc::new(next);
+            if changed {
+                *current = Arc::new(next);
+            }
             changed
         });
         tokio::time::sleep(timing.evaluate_gap).await;
@@ -302,6 +305,34 @@ mod tests {
         running.status.as_mut().unwrap().phase = Some("Running".to_owned());
         shared.stores().pods.replace(vec![(running, None)]);
         wait_for_pending(&mut latest, false).await;
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_pass_keeps_the_published_snapshot() {
+        let shared = shared_with(all_current(), 60);
+        let first = Arc::new(TelemetrySnapshot::starting("one".into(), Timestamp::now()));
+        let (sender, mut latest) = watch::channel(first);
+        let timing = TelemetryTiming {
+            evaluate_every: std::time::Duration::from_millis(5),
+            evaluate_gap: std::time::Duration::from_millis(1),
+            ..TelemetryTiming::default()
+        };
+        let task = tokio::spawn(run("one".into(), Arc::clone(&shared), sender, timing));
+        tokio::time::timeout(std::time::Duration::from_secs(5), latest.changed())
+            .await
+            .expect("the first pass publishes")
+            .unwrap();
+        let published = latest.borrow_and_update().clone();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !latest.has_changed().unwrap(),
+            "nothing changed, nothing woke"
+        );
+        assert!(
+            Arc::ptr_eq(&published, &latest.borrow()),
+            "the same snapshot, not a copy"
+        );
         task.abort();
     }
 

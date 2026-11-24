@@ -33,6 +33,7 @@ use secrecy::SecretString;
 use serde::{Deserialize, Deserializer};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
+use crate::connection::proxy::{self, ProxyEnvironment};
 use crate::credential::{CredentialSource, WriteCredential};
 use crate::read::{is_dns1123_label, is_dns1123_subdomain};
 use crate::recheck::ContextPin;
@@ -171,7 +172,17 @@ impl HelmQuery {
         };
         let owned = |parts: &[&str]| parts.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>();
         match self {
-            HelmQuery::List => owned(&["list", "--all-namespaces", &max, "--output=json"]),
+            HelmQuery::List => owned(&[
+                "list",
+                "--all-namespaces",
+                // Helm 3 lists only deployed and failed releases unless asked: an install or
+                // upgrade in progress, or one that died midway, would otherwise be missing.
+                "--deployed",
+                "--failed",
+                "--pending",
+                &max,
+                "--output=json",
+            ]),
             HelmQuery::Details(release) => {
                 let (name, namespace) = on(release);
                 owned(&["status", &name, &namespace, "--output=json"])
@@ -276,6 +287,9 @@ pub(crate) struct HelmTarget {
     configured_helm: Option<PathBuf>,
     /// Where the run's private directory goes ([`runs_root`]).
     runs_root: PathBuf,
+    /// The proxy variables `helm` runs with. They may hold a password, so this never has `Debug`
+    /// and is only ever handed to the child's environment.
+    proxy: Vec<(&'static str, String)>,
 }
 
 impl HelmTarget {
@@ -289,6 +303,27 @@ impl HelmTarget {
         credential: WriteCredential,
         configured_helm: Option<PathBuf>,
         runs_root: PathBuf,
+    ) -> Result<Self, HelmError> {
+        Self::new_in(
+            merged,
+            context,
+            pin,
+            credential,
+            configured_helm,
+            runs_root,
+            &ProxyEnvironment::current(),
+        )
+    }
+
+    /// [`Self::new`] under the proxy variables `environment` holds.
+    fn new_in(
+        merged: &Kubeconfig,
+        context: &str,
+        pin: ContextPin,
+        credential: WriteCredential,
+        configured_helm: Option<PathBuf>,
+        runs_root: PathBuf,
+        environment: &ProxyEnvironment,
     ) -> Result<Self, HelmError> {
         let named = merged
             .contexts
@@ -322,6 +357,21 @@ impl HelmTarget {
         {
             return Err(HelmError::CredentialRunsCommand);
         }
+        // The proxy Flint's own connection takes, so `helm` reaches the same server the same way.
+        let mut proxy = Vec::new();
+        if let Some(chosen) = proxy::chosen(
+            cluster
+                .cluster
+                .as_ref()
+                .and_then(|c| c.proxy_url.as_deref()),
+            server,
+            environment,
+        ) {
+            proxy.push(("HTTPS_PROXY", chosen.to_owned()));
+        }
+        if let Some(no_proxy) = &environment.no_proxy {
+            proxy.push(("NO_PROXY", no_proxy.clone()));
+        }
         let kubeconfig = Kubeconfig {
             api_version: Some("v1".to_owned()),
             kind: Some("Config".to_owned()),
@@ -337,6 +387,7 @@ impl HelmTarget {
             credential,
             configured_helm,
             runs_root,
+            proxy,
         })
     }
 
@@ -588,16 +639,23 @@ fn write_private(dir: &Path, bytes: &[u8]) -> Result<PathBuf, HelmError> {
 }
 
 /// The whole environment of a `helm` run, under the run's private directory `dir`.
-fn run_environment(dir: &Path, kubeconfig: &Path) -> Vec<(&'static str, OsString)> {
+fn run_environment(
+    dir: &Path,
+    kubeconfig: &Path,
+    proxy: &[(&'static str, String)],
+) -> Vec<(&'static str, OsString)> {
     let under = |name: &str| dir.join(name).into_os_string();
-    vec![
+    let proxy = proxy.iter().map(|(name, value)| (*name, value.into()));
+    let mut environment = vec![
         ("KUBECONFIG", kubeconfig.as_os_str().to_owned()),
         ("HOME", dir.as_os_str().to_owned()),
         ("HELM_CACHE_HOME", under("cache")),
         ("HELM_CONFIG_HOME", under("config")),
         ("HELM_DATA_HOME", under("data")),
         ("HELM_DRIVER", "secret".into()),
-    ]
+    ];
+    environment.extend(proxy);
+    environment
 }
 
 /// `query`'s arguments, for exactly `revision` of its release.
@@ -664,6 +722,7 @@ async fn run_helm(
     args: Vec<String>,
     admin: Option<u32>,
 ) -> Result<Vec<u8>, HelmError> {
+    let proxy = target.proxy.clone();
     let (binary, dir, kubeconfig) = {
         let target = target.clone();
         let binary = binary.to_owned();
@@ -684,7 +743,7 @@ async fn run_helm(
         .arg(format!("--kube-context={}", target.context))
         .arg(format!("--kubeconfig={}", kubeconfig.display()))
         .env_clear()
-        .envs(run_environment(dir.path(), &kubeconfig))
+        .envs(run_environment(dir.path(), &kubeconfig, &proxy))
         .current_dir(dir.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

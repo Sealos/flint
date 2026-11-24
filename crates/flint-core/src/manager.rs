@@ -4460,9 +4460,23 @@ mod tests {
 
         assert!(!manager.reload_kubeconfig().await);
         assert!(manager.held("dev"));
+        // If the deadline won the race with the reader, its late, torn result arms the retry.
+        if !manager.marks.retry_armed {
+            let late = next_internal(&mut manager).await;
+            assert!(matches!(&late, Internal::LateRead { read, .. } if !read.consistent));
+            manager.handle_internal(late).await;
+            assert!(manager.held("dev"), "the torn read keeps the hold");
+        }
+
         std::fs::write(dir.path().join("still"), "").unwrap();
         let again = next_internal(&mut manager).await;
+        assert!(matches!(again, Internal::ReadAgain));
         manager.handle_internal(again).await;
+        if manager.held("dev") {
+            let late = next_internal(&mut manager).await;
+            assert!(matches!(&late, Internal::LateRead { read, .. } if read.consistent));
+            manager.handle_internal(late).await;
+        }
         assert!(!manager.held("dev"), "a follow-up read ended the hold");
     }
 

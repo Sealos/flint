@@ -10,14 +10,13 @@ use anyhow::{Context as _, Result};
 use flint_e2e::app::{App, AppOptions};
 use flint_e2e::backend::TestCluster;
 use flint_e2e::fake_api::{
-    FakeApiServer, FakeExec, FakePod, Fault, Gvr, Options, RequestRecord, Verb, WriteRecord,
+    FakeApiServer, FakeExec, Fault, Gvr, Options, RequestRecord, Verb, WriteRecord,
 };
 use http::Method;
 use serde_json::{Value, json};
 
 use crate::support::*;
 
-const PROTECTED: &str = "protect_local_clusters = true\n";
 const EDITED: &str = "edit-me";
 const EDITED_PATH: &str = "/api/v1/namespaces/demo/configmaps/edit-me";
 const DENIED: &str = "this change is not allowed";
@@ -33,19 +32,8 @@ const PAST_DIALOG_EXIT: Duration = Duration::from_millis(400);
 fn launch_unlocked(cluster: &TestCluster) -> Result<App> {
     let app = App::launch(AppOptions::new(&cluster.kubeconfig).settings(PROTECTED))?;
     connect(&app, &cluster.context)?;
-    unlock(&app, &cluster.context)?;
+    lift_protection(&app, &cluster.context, "UnlockCluster", "unlocked")?;
     Ok(app)
-}
-
-fn unlock(app: &App, context: &str) -> Result<()> {
-    app.dispatch("workspace::UnlockCluster", json!({"cluster": context}))?;
-    app.wait_for("/dialog/title", Exists(true))?;
-    app.dispatch("ui::Confirm", Value::Null)?;
-    app.wait_for(
-        "/clusters",
-        Any(json!({"name": context, "protection": "unlocked"})),
-    )?;
-    Ok(())
 }
 
 fn configmaps() -> Gvr {
@@ -160,72 +148,7 @@ fn read_between_conflict_and_review(fake: &FakeApiServer) -> bool {
 
 /// Waits until `count` real writes were answered.
 fn answered(fake: &FakeApiServer, count: usize) -> Result<Vec<WriteRecord>> {
-    until(
-        "the write's answer",
-        || real(fake),
-        |writes| writes.len() >= count && writes.iter().all(|w| w.status.is_some()),
-    )
-}
-
-/// Adds a schedulable node with no pods on it.
-fn add_node(fake: &FakeApiServer, unschedulable: bool) -> Result<Gvr> {
-    let nodes = fake.gvr("nodes");
-    let first = fake.rows(&nodes)[0].name().to_owned();
-    let mut node = fake.object(&nodes, None, &first).context("no node")?;
-    node["metadata"]["name"] = NODE.into();
-    node["metadata"]["uid"] = "uid-drain-node".into();
-    node["spec"]["unschedulable"] = unschedulable.into();
-    fake.set_object(&nodes, node);
-    Ok(nodes)
-}
-
-fn pod_on_node(name: &str, owner: &str) -> FakePod {
-    FakePod::from_json(json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": name, "namespace": "demo", "uid": format!("uid-{name}"),
-            "resourceVersion": "5002",
-            "creationTimestamp": "2026-01-01T00:00:00Z",
-            "labels": {},
-            "ownerReferences": [{"apiVersion": "apps/v1", "kind": owner, "name": "owner",
-                                 "uid": "uid-owner", "controller": true}],
-        },
-        "spec": {"nodeName": NODE, "containers": [{"name": "c", "image": "busybox:1.37.0"}]},
-        "status": {"phase": "Running", "containerStatuses": [{
-            "name": "c", "ready": true, "restartCount": 0, "image": "busybox:1.37.0",
-            "imageID": "", "state": {"running": {"startedAt": "2026-01-01T00:00:00Z"}},
-        }]},
-    }))
-}
-
-fn select_node(app: &App) -> Result<()> {
-    app.select_row(None, NODE)?;
-    app.wait_for("/detail/name", Equals(NODE.into()))?;
-    app.wait_for("/detail/fetch", Equals("loaded".into()))?;
-    Ok(())
-}
-
-/// Waits until the registry offers `action`, then opens its dialog: returns the dialog's text.
-fn open_action(app: &App, action: &str) -> Result<String> {
-    until(
-        action,
-        || {
-            app.actions().is_ok_and(|actions| {
-                actions["actions"].as_array().is_some_and(|all| {
-                    all.iter()
-                        .any(|a| a["name"] == action && a["enabled"] == true)
-                })
-            })
-        },
-        |offered| *offered,
-    )?;
-    app.dispatch(action, Value::Null)?;
-    let state = app.wait_for("/dialog/title", Exists(true))?;
-    Ok(state["dialog"]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned())
+    answered_by(count, || real(fake))
 }
 
 /// Confirms the drain's options and waits for the review's dialog that follows them.
@@ -244,12 +167,6 @@ fn past_drain_options(app: &App, options: &str) -> Result<String> {
         .as_str()
         .unwrap_or_default()
         .to_owned())
-}
-
-fn dismiss(app: &App) -> Result<()> {
-    app.press_key("escape")?;
-    app.wait_for("/dialog", Equals(Value::Null))?;
-    Ok(())
 }
 
 fn evictions(fake: &FakeApiServer, pod: &str) -> usize {
@@ -345,7 +262,7 @@ fn up_51_webhook_refusals_keep_the_edit() -> Result<()> {
     app.dispatch("detail::ApplyYamlEdit", Value::Null)?;
     app.wait_for("/dialog/title", Exists(true))?;
     assert!(real(fake).is_empty(), "{:?}", real(fake));
-    dismiss(&app)?;
+    dismiss(&app, "escape")?;
     assert!(real(fake).is_empty(), "{:?}", real(fake));
     assert_eq!(dry_runs(fake), 2, "Cancel sends no dry run");
 
@@ -442,10 +359,10 @@ fn up_52_conflict_refused_on_the_fake() -> Result<()> {
 fn up_53_node_actions_confirm() -> Result<()> {
     let cluster = TestCluster::fake(Options::default())?;
     let fake = cluster.fake_server().expect("a fake server");
-    let nodes = add_node(fake, false)?;
+    let nodes = add_node(fake, NODE, false)?;
     let app = launch_unlocked(&cluster)?;
     open_live(&app, "nodes", 2)?;
-    select_node(&app)?;
+    select(&app, None, NODE)?;
     let unschedulable = || {
         fake.object(&nodes, None, NODE)
             .map(|node| node["spec"]["unschedulable"] == true)
@@ -456,13 +373,13 @@ fn up_53_node_actions_confirm() -> Result<()> {
         ("workspace::UncordonNode", false),
     ] {
         let before = fake.writes().len();
-        let text = open_action(&app, action)?;
+        let text = open_dialog(&app, action)?;
         assert!(text.contains(NODE), "{action}: {text}");
         assert!(text.contains(&cluster.context), "{action}: {text}");
-        dismiss(&app)?;
+        dismiss(&app, "escape")?;
         assert_eq!(fake.writes().len(), before, "{action}: cancelled");
 
-        open_action(&app, action)?;
+        open_dialog(&app, action)?;
         app.dispatch("ui::Confirm", Value::Null)?;
         app.wait_for("/dialog", Equals(Value::Null))?;
         let writes = until(
@@ -477,19 +394,19 @@ fn up_53_node_actions_confirm() -> Result<()> {
 
     // Drain: cancelled at its options and at its review, nothing is sent.
     let before = fake.writes().len();
-    let options = open_action(&app, "workspace::DrainNode")?;
+    let options = open_dialog(&app, "workspace::DrainNode")?;
     assert!(options.contains(NODE), "{options}");
-    dismiss(&app)?;
-    let options = open_action(&app, "workspace::DrainNode")?;
+    dismiss(&app, "escape")?;
+    let options = open_dialog(&app, "workspace::DrainNode")?;
     let text = past_drain_options(&app, &options)?;
     assert!(text.contains(NODE), "{text}");
     assert!(text.contains(&cluster.context), "{text}");
-    dismiss(&app)?;
+    dismiss(&app, "escape")?;
     assert_eq!(fake.writes().len(), before, "a cancelled drain");
     assert_eq!(unschedulable(), Some(false));
 
     // Confirmed: the node has no pods to evict, so the cordon is the drain's one write.
-    let options = open_action(&app, "workspace::DrainNode")?;
+    let options = open_dialog(&app, "workspace::DrainNode")?;
     past_drain_options(&app, &options)?;
     app.dispatch("ui::Confirm", Value::Null)?;
     app.wait_for("/dialog", Equals(Value::Null))?;
@@ -517,10 +434,10 @@ fn up_53_node_actions_confirm() -> Result<()> {
 fn up_53_drain_reports_pdb() -> Result<()> {
     let cluster = TestCluster::fake(Options::default())?;
     let fake = cluster.fake_server().expect("a fake server");
-    let nodes = add_node(fake, false)?;
-    fake.add_pod(pod_on_node("agent", "DaemonSet"));
-    fake.add_pod(pod_on_node("guarded", "ReplicaSet"));
-    fake.add_pod(pod_on_node("free", "ReplicaSet"));
+    let nodes = add_node(fake, NODE, false)?;
+    fake.add_pod(pod_on_node("agent", NODE, "DaemonSet"));
+    fake.add_pod(pod_on_node("guarded", NODE, "ReplicaSet"));
+    fake.add_pod(pod_on_node("free", NODE, "ReplicaSet"));
     fake.inject(
         Fault::disruption_budget()
             .on(&Gvr::core("pods"))
@@ -529,9 +446,9 @@ fn up_53_drain_reports_pdb() -> Result<()> {
     );
     let app = launch_unlocked(&cluster)?;
     open_live(&app, "nodes", 2)?;
-    select_node(&app)?;
+    select(&app, None, NODE)?;
 
-    let options = open_action(&app, "workspace::DrainNode")?;
+    let options = open_dialog(&app, "workspace::DrainNode")?;
     past_drain_options(&app, &options)?;
     app.dispatch("ui::Confirm", Value::Null)?;
     app.wait_for("/dialog", Equals(Value::Null))?;
@@ -590,7 +507,7 @@ fn up_55_unlock_asks_once_and_lasts_until_quit() -> Result<()> {
         app.wait_for("/detail/name", Equals(name.into()))?;
         app.wait_for("/detail/fetch", Equals("loaded".into()))?;
         // The dialog is the action's own: no second unlock is asked for.
-        let text = open_action(&app, action)?;
+        let text = open_dialog(&app, action)?;
         assert!(text.contains(name), "{text}");
         app.dispatch("ui::Confirm", Value::Null)?;
         app.wait_for("/dialog", Equals(Value::Null))?;
@@ -818,14 +735,14 @@ fn editor_on_another_cluster_keeps_focus() -> Result<()> {
     let clusters = TwoClusters::start()?;
     let app = App::launch(AppOptions::new(clusters.kubeconfig()).settings(PROTECTED))?;
     connect(&app, TwoClusters::A)?;
-    unlock(&app, TwoClusters::A)?;
+    lift_protection(&app, TwoClusters::A, "UnlockCluster", "unlocked")?;
     let (exec, tab) = open_pod_shell(&app, &clusters.a)?;
 
     connect(&app, TwoClusters::B)?;
     show_pod_yaml(&app)?;
     focus_tab(&app, tab)?;
     // Unlocking B is the dialog that closes just before the edit.
-    unlock(&app, TwoClusters::B)?;
+    lift_protection(&app, TwoClusters::B, "UnlockCluster", "unlocked")?;
     app.wait_for("/detail/edit_blocked", Equals(Value::Null))?;
     app.dispatch("detail::EditYaml", Value::Null)?;
     app.wait_for("/detail/edit", Equals("editing".into()))?;

@@ -1,20 +1,35 @@
 # Flint
 
-Flint is a fast, native Kubernetes app for your Mac that lets Claude Code and other AI agents read the clusters you
-choose, and nothing else.
+Flint is a fast, native Kubernetes app for your Mac that keeps many clusters in one window: open them together, save
+them as a cluster set, keep them watched in the background, and get a desktop alert when one gets a new problem.
 
-Its `flint mcp` command is a read-only [MCP](https://modelcontextprotocol.io/) server. The desktop app, in the space of
-Lens and Freelens, is where you choose which clusters agents may read. Flint is written in Rust with
-[GPUI](https://www.gpui.rs/), so it starts fast, stays light on memory, and keeps up with large clusters. It runs on
-macOS and, best effort, Linux.
+It is in the space of Lens and Freelens. Flint is written in Rust with [GPUI](https://www.gpui.rs/), so it starts
+fast, stays light on memory, and keeps up with large clusters. It runs on macOS and, best effort, Linux. It also ships
+a read-only [MCP](https://modelcontextprotocol.io/) server, `flint mcp`, that lets Claude Code and other AI agents
+read only the clusters you choose (see [MCP server for AI agents](#mcp-server-for-ai-agents)).
+
+## Many clusters, one window
+
+- **Open clusters together.** Choose two to five clusters in the sidebar and **Open Together** for one combined list
+  with a Cluster column (or one section per cluster), problems first when you sort by status.
+- **Save a cluster set.** Name the choice, reopen it later, and open its dashboard: a card per cluster with problem
+  counts and usage, the unhealthiest first. A member whose context now points at another server is left out.
+- **Keep clusters watching.** **Keep Watching Cluster…** in a cluster's row menu gathers overview data and alerts
+  while you work in another cluster. For a cluster whose credentials run a plugin (`aws`, `kubelogin`), Flint asks
+  for consent to sign in in the background first.
+- **Get alerts.** A new problem on a watched cluster can post a desktop notification that names the cluster, and
+  clicking it opens that cluster. Notifications are off by default and need `Flint.app`.
+
+See [Status](#status) for everything else that works today.
+
+## MCP server for AI agents
+
+A supporting part of Flint: the desktop app is where you choose which clusters agents may read, and the server is one
+command.
 
 ```sh
 claude mcp add flint -- /usr/local/bin/flint mcp     # after installing Flint and exposing a cluster
 ```
-
-See [Add it to an agent](#add-it-to-an-agent) for the steps and other MCP clients.
-
-## MCP server for AI agents
 
 `flint mcp` serves the Model Context Protocol over stdio. What an agent gets:
 

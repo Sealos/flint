@@ -20,6 +20,10 @@ use std::sync::LazyLock;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use regex::{Captures, Regex};
 
+use super::patterns::{
+    COOKIE_MARKER, PRIVATE_KEY_MARKER, cookie_array_openers, private_key_delimiters,
+};
+
 /// Text with credential-shaped values replaced, and how many were replaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Redacted<'a> {
@@ -198,14 +202,6 @@ fn fully_masked(text: &str) -> bool {
     }
 }
 
-/// The marker for a cookie header value.
-const COOKIE_MARKER: &str = "[REDACTED:cookie]";
-
-/// A cookie header whose JSON array of values opens at the end of its line (pretty-printed).
-static COOKIE_ARRAY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?im)"(?:set-)?cookie"[ \t]*:[ \t]*\[[ \t]*\r?$"#).expect("cookie array builds")
-});
-
 /// The contents of each quoted item of the pretty-printed cookie arrays in `text`, so each
 /// becomes `"[REDACTED:cookie]"` and the JSON still parses. An array on one line is the line
 /// rule's. One forward scan per array.
@@ -213,7 +209,7 @@ fn cookie_array_items(text: &str) -> Vec<Range<usize>> {
     let mut items = Vec::new();
     let bytes = text.as_bytes();
     let mut scanned = 0;
-    for m in COOKIE_ARRAY.find_iter(text) {
+    for m in cookie_array_openers(text) {
         let mut i = m.end().max(scanned);
         loop {
             while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
@@ -239,14 +235,6 @@ fn cookie_array_items(text: &str) -> Vec<Range<usize>> {
 
 // --- Private key blocks ------------------------------------------------------------------------
 
-static PEM_BEGIN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----").unwrap());
-static PEM_END: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----").unwrap());
-
-/// The marker that replaces a private key's body.
-const PRIVATE_KEY_MARKER: &str = "[REDACTED:private-key]";
-
 /// The bodies of private key blocks, between the BEGIN and END lines, and what replaces each.
 /// The BEGIN and END lines are kept. A BEGIN with no END hides everything after it (a block cut
 /// off at the end). An END with no BEGIN hides only the key lines right before it (a block whose
@@ -255,10 +243,8 @@ fn private_key_spans(text: &str) -> Vec<(Range<usize>, &'static str)> {
     if memchr::memmem::find(text.as_bytes(), b"PRIVATE KEY").is_none() {
         return Vec::new();
     }
-    let mut marks: Vec<(usize, usize, bool)> = PEM_BEGIN
-        .find_iter(text)
-        .map(|m| (m.start(), m.end(), true))
-        .chain(PEM_END.find_iter(text).map(|m| (m.start(), m.end(), false)))
+    let mut marks: Vec<_> = private_key_delimiters(text)
+        .map(|(m, opening)| (m.start(), m.end(), opening))
         .collect();
     marks.sort_unstable();
     let mut spans = Vec::new();

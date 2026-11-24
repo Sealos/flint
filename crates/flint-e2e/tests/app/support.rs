@@ -5,10 +5,11 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
-use flint_e2e::app::{App, WAIT};
-use flint_e2e::fake_api::{FakeApiServer, Options, write_kubeconfigs};
+use flint_e2e::app::{App, AppOptions, WAIT};
+use flint_e2e::backend::TestCluster;
+use flint_e2e::fake_api::{FakeApiServer, FakePod, Gvr, Options, WriteRecord, write_kubeconfigs};
 use flint_e2e::scratch::Scratch;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 pub use flint_e2e::app::Test::{self, Any, Contains, Equals, Exists};
 
@@ -146,4 +147,118 @@ pub fn closed_port() -> u16 {
         .and_then(|l| l.local_addr())
         .map(|a| a.port())
         .expect("a free local port")
+}
+
+/// Settings that protect a loopback cluster, so no write test depends on the default.
+pub const PROTECTED: &str = "protect_local_clusters = true\n";
+
+/// Launches the app on `cluster`, with its protection on, and waits for the connection.
+pub fn launch_protected(cluster: &TestCluster) -> Result<App> {
+    let app = App::launch(AppOptions::new(&cluster.kubeconfig).settings(PROTECTED))?;
+    connect(&app, &cluster.context)?;
+    assert_eq!(
+        sidebar(&app.state()?, &cluster.context)["protection"],
+        "protected"
+    );
+    Ok(app)
+}
+
+/// Answers the dialog of `action` (`UnlockCluster`, `TrustCluster`) and waits for `protection`.
+pub fn lift_protection(app: &App, context: &str, action: &str, protection: &str) -> Result<()> {
+    app.dispatch(&format!("workspace::{action}"), json!({"cluster": context}))?;
+    app.wait_for("/dialog/title", Exists(true))?;
+    app.dispatch("ui::Confirm", Value::Null)?;
+    app.wait_for(
+        "/clusters",
+        Any(json!({"name": context, "protection": protection})),
+    )?;
+    app.wait_for("/dialog", Equals(Value::Null))?;
+    Ok(())
+}
+
+/// Selects `name` and waits until its object has loaded.
+pub fn select(app: &App, namespace: Option<&str>, name: &str) -> Result<()> {
+    app.select_row(namespace, name)?;
+    app.wait_for("/detail/name", Equals(name.into()))?;
+    app.wait_for("/detail/fetch", Equals("loaded".into()))?;
+    Ok(())
+}
+
+/// Whether the registry offers `action` now.
+pub fn offered(app: &App, action: &str) -> Result<bool> {
+    let actions = app.actions()?;
+    let entry = actions["actions"]
+        .as_array()
+        .and_then(|all| all.iter().find(|a| a["name"] == action))
+        .with_context(|| format!("no {action}"))?;
+    Ok(entry["enabled"] == true)
+}
+
+/// Waits until the registry offers `action`.
+pub fn wait_offered(app: &App, action: &str) -> Result<()> {
+    until(action, || offered(app, action).unwrap_or(false), |yes| *yes)?;
+    Ok(())
+}
+
+/// Waits until the registry offers `action`, then opens its dialog: returns the dialog's text.
+pub fn open_dialog(app: &App, action: &str) -> Result<String> {
+    wait_offered(app, action)?;
+    app.dispatch(action, Value::Null)?;
+    let state = app.wait_for("/dialog/title", Exists(true))?;
+    Ok(state["dialog"]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned())
+}
+
+/// Closes the open dialog with `key` and waits until it is gone.
+pub fn dismiss(app: &App, key: &str) -> Result<()> {
+    app.press_key(key)?;
+    app.wait_for("/dialog", Equals(Value::Null))?;
+    Ok(())
+}
+
+/// Waits until `count` of the writes `read` returns were answered.
+pub fn answered_by(count: usize, read: impl Fn() -> Vec<WriteRecord>) -> Result<Vec<WriteRecord>> {
+    until("the write's answer", read, |writes| {
+        writes.len() >= count && writes.iter().all(|w| w.status.is_some())
+    })
+}
+
+/// Waits until `count` writes were answered.
+pub fn answered(fake: &FakeApiServer, count: usize) -> Result<Vec<WriteRecord>> {
+    answered_by(count, || fake.writes())
+}
+
+/// Adds a node called `name`, copied from the first one, with no pods on it.
+pub fn add_node(fake: &FakeApiServer, name: &str, unschedulable: bool) -> Result<Gvr> {
+    let nodes = fake.gvr("nodes");
+    let first = fake.rows(&nodes)[0].name().to_owned();
+    let mut node = fake.object(&nodes, None, &first).context("no node")?;
+    node["metadata"]["name"] = name.into();
+    node["metadata"]["uid"] = format!("uid-{name}").into();
+    node["spec"]["unschedulable"] = unschedulable.into();
+    fake.set_object(&nodes, node);
+    Ok(nodes)
+}
+
+/// A running pod on `node`, controlled by an `owner` of that kind.
+pub fn pod_on_node(name: &str, node: &str, owner: &str) -> FakePod {
+    FakePod::from_json(json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": name, "namespace": "demo", "uid": format!("uid-{name}"),
+            "resourceVersion": "5002",
+            "creationTimestamp": "2026-01-01T00:00:00Z",
+            "labels": {},
+            "ownerReferences": [{"apiVersion": "apps/v1", "kind": owner, "name": "owner",
+                                 "uid": "uid-owner", "controller": true}],
+        },
+        "spec": {"nodeName": node, "containers": [{"name": "c", "image": "busybox:1.37.0"}]},
+        "status": {"phase": "Running", "containerStatuses": [{
+            "name": "c", "ready": true, "restartCount": 0, "image": "busybox:1.37.0",
+            "imageID": "", "state": {"running": {"startedAt": "2026-01-01T00:00:00Z"}},
+        }]},
+    }))
 }

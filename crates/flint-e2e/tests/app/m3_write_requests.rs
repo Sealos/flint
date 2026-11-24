@@ -9,13 +9,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use flint_e2e::app::{App, AppOptions};
 use flint_e2e::backend::TestCluster;
-use flint_e2e::fake_api::{FakeApiServer, FakePod, Fault, Gvr, Options, Verb, WriteRecord};
+use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, Options, Verb, WriteRecord};
 use http::Method;
 use serde_json::{Value, json};
 
 use crate::support::*;
 
-const PROTECTED: &str = "protect_local_clusters = true\n";
 const MERGE_PATCH: &str = "application/merge-patch+json";
 const JSON_PATCH: &str = "application/json-patch+json";
 const JSON: &str = "application/json";
@@ -33,28 +32,6 @@ const EDITED_PATH: &str = "/api/v1/namespaces/demo/configmaps/edit-me";
 /// Long enough for a repeated request to arrive once the action has ended.
 const RETRY_WINDOW: Duration = Duration::from_secs(1);
 
-fn launch(cluster: &TestCluster) -> Result<App> {
-    let app = App::launch(AppOptions::new(&cluster.kubeconfig).settings(PROTECTED))?;
-    connect(&app, &cluster.context)?;
-    assert_eq!(
-        sidebar(&app.state()?, &cluster.context)["protection"],
-        "protected"
-    );
-    Ok(app)
-}
-
-fn lift(app: &App, context: &str, action: &str, protection: &str) -> Result<()> {
-    app.dispatch(&format!("workspace::{action}"), json!({"cluster": context}))?;
-    app.wait_for("/dialog/title", Exists(true))?;
-    app.dispatch("ui::Confirm", Value::Null)?;
-    app.wait_for(
-        "/clusters",
-        Any(json!({"name": context, "protection": protection})),
-    )?;
-    app.wait_for("/dialog", Equals(Value::Null))?;
-    Ok(())
-}
-
 /// Runs `steps`; on an error the teardown reports a dialog left open without hiding that error.
 fn reporting(app: &App, steps: impl FnOnce() -> Result<()>) -> Result<()> {
     let result = steps();
@@ -64,41 +41,9 @@ fn reporting(app: &App, steps: impl FnOnce() -> Result<()>) -> Result<()> {
     result
 }
 
-fn select(app: &App, namespace: Option<&str>, name: &str) -> Result<()> {
-    app.select_row(namespace, name)?;
-    app.wait_for("/detail/name", Equals(name.into()))?;
-    app.wait_for("/detail/fetch", Equals("loaded".into()))?;
-    Ok(())
-}
-
-fn offered(app: &App, action: &str) -> Result<bool> {
-    let actions = app.actions()?;
-    let entry = actions["actions"]
-        .as_array()
-        .and_then(|all| all.iter().find(|a| a["name"] == action))
-        .with_context(|| format!("no {action}"))?;
-    Ok(entry["enabled"] == true)
-}
-
-fn wait_offered(app: &App, action: &str) -> Result<()> {
-    until(action, || offered(app, action).unwrap_or(false), |yes| *yes)?;
-    Ok(())
-}
-
-/// Opens `action`'s dialog on the selected object: returns its text.
-fn open(app: &App, action: &str) -> Result<String> {
-    wait_offered(app, action)?;
-    app.dispatch(action, Value::Null)?;
-    let state = app.wait_for("/dialog/title", Exists(true))?;
-    Ok(state["dialog"]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned())
-}
-
 /// Opens `action` and answers its dialogs up to, and including, the final Confirm.
 fn run(app: &App, action: &str) -> Result<()> {
-    let first = open(app, action)?;
+    let first = open_dialog(app, action)?;
     match action {
         "workspace::ScaleObject" => {
             app.press_key("secondary-a")?;
@@ -123,14 +68,6 @@ fn run(app: &App, action: &str) -> Result<()> {
     app.dispatch("ui::Confirm", Value::Null)?;
     app.wait_for("/dialog", Equals(Value::Null))?;
     Ok(())
-}
-
-fn answered(fake: &FakeApiServer, count: usize) -> Result<Vec<WriteRecord>> {
-    until(
-        "the write's answer",
-        || fake.writes(),
-        |writes| writes.len() >= count && writes.iter().all(|w| w.status.is_some()),
-    )
 }
 
 fn body(write: &WriteRecord) -> Value {
@@ -165,37 +102,6 @@ fn assert_sent(
         write.status.is_some_and(|code| (200..300).contains(&code)),
         "{write:?}"
     );
-}
-
-fn add_node(fake: &FakeApiServer) -> Result<Gvr> {
-    let nodes = fake.gvr("nodes");
-    let first = fake.rows(&nodes)[0].name().to_owned();
-    let mut node = fake.object(&nodes, None, &first).context("no node")?;
-    node["metadata"]["name"] = NODE.into();
-    node["metadata"]["uid"] = "uid-requests-node".into();
-    node["spec"]["unschedulable"] = false.into();
-    fake.set_object(&nodes, node);
-    Ok(nodes)
-}
-
-fn pod_on_node(name: &str) -> FakePod {
-    FakePod::from_json(json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": name, "namespace": "demo", "uid": format!("uid-{name}"),
-            "resourceVersion": "5002",
-            "creationTimestamp": "2026-01-01T00:00:00Z",
-            "labels": {},
-            "ownerReferences": [{"apiVersion": "apps/v1", "kind": "ReplicaSet", "name": "owner",
-                                 "uid": "uid-owner", "controller": true}],
-        },
-        "spec": {"nodeName": NODE, "containers": [{"name": "c", "image": "busybox:1.37.0"}]},
-        "status": {"phase": "Running", "containerStatuses": [{
-            "name": "c", "ready": true, "restartCount": 0, "image": "busybox:1.37.0",
-            "imageID": "", "state": {"running": {"startedAt": "2026-01-01T00:00:00Z"}},
-        }]},
-    }))
 }
 
 fn seed_configmap(fake: &FakeApiServer) {
@@ -246,12 +152,12 @@ fn up_53_each_action_sends_its_exact_request() -> Result<()> {
         .as_u64()
         .context("no replicas")?;
     assert_ne!(from, 5, "the fixture must change");
-    let nodes = add_node(fake)?;
+    let nodes = add_node(fake, NODE, false)?;
     let node_uid = uid(fake, &nodes, None, NODE)?;
-    fake.add_pod(pod_on_node("evicted"));
+    fake.add_pod(pod_on_node("evicted", NODE, "ReplicaSet"));
     seed_configmap(fake);
-    let app = launch(&cluster)?;
-    lift(&app, &cluster.context, "UnlockCluster", "unlocked")?;
+    let app = launch_protected(&cluster)?;
+    lift_protection(&app, &cluster.context, "UnlockCluster", "unlocked")?;
 
     // Rollout restart: the timestamp is the one value the test cannot know.
     open_live(&app, "deployments", 5)?;
@@ -419,8 +325,8 @@ fn up_53_a_failed_write_is_not_retried() -> Result<()> {
     let original = fake
         .object(&deployments, Some("demo"), "web")
         .context("no web")?;
-    let app = launch(&cluster)?;
-    lift(&app, &cluster.context, "UnlockCluster", "unlocked")?;
+    let app = launch_protected(&cluster)?;
+    lift_protection(&app, &cluster.context, "UnlockCluster", "unlocked")?;
     open_live(&app, "deployments", 5)?;
     select(&app, Some("demo"), "web")?;
 
@@ -466,17 +372,17 @@ fn up_54_locking_during_a_confirmation_sends_nothing() -> Result<()> {
     let fake = cluster.fake_server().expect("a fake server");
     let context = cluster.context.as_str();
     seed_configmap(fake);
-    let app = launch(&cluster)?;
+    let app = launch_protected(&cluster)?;
     reporting(&app, || {
         // Workspace actions are out of reach behind a dialog, so what protects the cluster here
         // is its trust leaving the settings file.
-        lift(&app, context, "TrustCluster", "trusted")?;
+        lift_protection(&app, context, "TrustCluster", "trusted")?;
         let trusted = std::fs::read_to_string(app.config_dir().join("settings.toml"))?;
 
         // A delete's confirmation.
         open_live(&app, "deployments", 5)?;
         select(&app, Some("demo"), "web")?;
-        open(&app, "workspace::DeleteObject")?;
+        open_dialog(&app, "workspace::DeleteObject")?;
         app.write_settings(PROTECTED)?;
         app.wait_for(
             "/clusters",
@@ -533,12 +439,12 @@ fn up_55_repointing_during_a_confirmation_closes_it() -> Result<()> {
     let cluster = TestCluster::fake(Options::default())?;
     let fake = cluster.fake_server().expect("a fake server");
     let other = FakeApiServer::start_blocking(Options::default())?;
-    let app = launch(&cluster)?;
+    let app = launch_protected(&cluster)?;
     reporting(&app, || {
-        lift(&app, &cluster.context, "UnlockCluster", "unlocked")?;
+        lift_protection(&app, &cluster.context, "UnlockCluster", "unlocked")?;
         open_live(&app, "deployments", 5)?;
         select(&app, Some("demo"), "web")?;
-        open(&app, "workspace::DeleteObject")?;
+        open_dialog(&app, "workspace::DeleteObject")?;
 
         app.edit_kubeconfig([&cluster.kubeconfig], || {
             other.write_kubeconfig(&cluster.kubeconfig, None)
@@ -650,13 +556,13 @@ const ASKED: [Asked; 9] = [
 
 /// Gives `fake` every object the dialogs act on, the same on both servers.
 fn seed_targets(fake: &FakeApiServer, asked: Asked) -> Result<()> {
-    let nodes = add_node(fake)?;
+    let nodes = add_node(fake, NODE, false)?;
     if matches!(asked, Asked::Uncordon) {
         let mut node = fake.object(&nodes, None, NODE).context("no node")?;
         node["spec"]["unschedulable"] = true.into();
         fake.set_object(&nodes, node);
     }
-    fake.add_pod(pod_on_node("evicted"));
+    fake.add_pod(pod_on_node("evicted", NODE, "ReplicaSet"));
     seed_configmap(fake);
     Ok(())
 }
@@ -673,14 +579,14 @@ fn open_asked(app: &App, asked: Asked) -> Result<()> {
     open_live(app, view, count)?;
     select(app, namespace, name)?;
     match asked {
-        Asked::Delete => open(app, "workspace::DeleteObject").map(drop),
-        Asked::Restart => open(app, "workspace::RestartObject").map(drop),
-        Asked::Cordon => open(app, "workspace::CordonNode").map(drop),
-        Asked::Uncordon => open(app, "workspace::UncordonNode").map(drop),
-        Asked::ScaleCount => open(app, "workspace::ScaleObject").map(drop),
-        Asked::DrainOptions => open(app, "workspace::DrainNode").map(drop),
+        Asked::Delete => open_dialog(app, "workspace::DeleteObject").map(drop),
+        Asked::Restart => open_dialog(app, "workspace::RestartObject").map(drop),
+        Asked::Cordon => open_dialog(app, "workspace::CordonNode").map(drop),
+        Asked::Uncordon => open_dialog(app, "workspace::UncordonNode").map(drop),
+        Asked::ScaleCount => open_dialog(app, "workspace::ScaleObject").map(drop),
+        Asked::DrainOptions => open_dialog(app, "workspace::DrainNode").map(drop),
         Asked::ScaleReview => {
-            open(app, "workspace::ScaleObject")?;
+            open_dialog(app, "workspace::ScaleObject")?;
             app.press_key("secondary-a")?;
             app.type_text("5")?;
             app.dispatch("ui::Confirm", Value::Null)?;
@@ -688,7 +594,7 @@ fn open_asked(app: &App, asked: Asked) -> Result<()> {
             Ok(())
         }
         Asked::DrainReview => {
-            let first = open(app, "workspace::DrainNode")?;
+            let first = open_dialog(app, "workspace::DrainNode")?;
             app.dispatch("ui::Confirm", Value::Null)?;
             until(
                 "the drain's review",
@@ -730,6 +636,17 @@ fn repoint(
     from: &FakeApiServer,
     to: &FakeApiServer,
 ) -> Result<Moved> {
+    repoint_as(app, kubeconfig, from, to, &to.kubeconfig(None))
+}
+
+/// [`repoint`], writing `config` for `to`: the same server under other credentials, say.
+fn repoint_as(
+    app: &App,
+    kubeconfig: &std::path::Path,
+    from: &FakeApiServer,
+    to: &FakeApiServer,
+    config: &kube::config::Kubeconfig,
+) -> Result<Moved> {
     let mut last = (access_reviews(from, 0, None).len(), Instant::now());
     until(
         "the access reviews to settle",
@@ -747,7 +664,7 @@ fn repoint(
             from: from.arrivals().len(),
             to: to.arrivals().len(),
         };
-        to.write_kubeconfig(kubeconfig, None)?;
+        flint_e2e::fake_api::kubeconfig::write(kubeconfig, config)?;
         Ok(moved)
     })?;
     until(
@@ -857,6 +774,66 @@ fn up_55_answering_a_confirmation_after_a_repoint_writes_nowhere() -> Result<()>
     Ok(())
 }
 
+/// `fake`'s kubeconfig with a user of its own: the same server under another credential.
+fn with_token(fake: &FakeApiServer, token: &str) -> Result<kube::config::Kubeconfig> {
+    let mut config = serde_json::to_value(fake.kubeconfig(None))?;
+    config["users"][0]["user"] = json!({ "token": token });
+    Ok(serde_json::from_value(config)?)
+}
+
+// covers UP-55: a context moved away and back to the same server under another user closes the
+// dialog open on it, and whatever answers it after, nothing reaches either server.
+#[test]
+#[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
+fn up_55_a_move_back_under_another_user_writes_nowhere() -> Result<()> {
+    let mut reached = Vec::new();
+    for asked in ASKED {
+        let cluster = TestCluster::fake(Options::default())?;
+        let fake = cluster.fake_server().expect("a fake server");
+        let other = FakeApiServer::start_blocking(Options::default())?;
+        seed_targets(fake, asked)?;
+        seed_targets(&other, asked)?;
+        // Unprotected: the gate is open for both servers, so only the binding refuses.
+        let app = App::launch(AppOptions::new(&cluster.kubeconfig))?;
+        connect(&app, &cluster.context)?;
+        let mut left_open = false;
+        reporting(&app, || {
+            open_asked(&app, asked)?;
+            let (on_fake, on_other) = (fake.writes().len(), other.writes().len());
+            let moved = repoint(&app, &cluster.kubeconfig, fake, &other)?;
+            let back = with_token(fake, "another-user")?;
+            repoint_as(&app, &cluster.kubeconfig, &other, fake, &back)?;
+            if !app.state()?["dialog"].is_null() {
+                reached.push(format!("{asked:?}: the dialog stayed open"));
+            }
+            for _ in 0..3 {
+                if app.state()?["dialog"].is_null() {
+                    break;
+                }
+                let _ = app.click("ok");
+                std::thread::sleep(RETRY_WINDOW);
+            }
+            let mut first = writes_since(fake, on_fake);
+            first.extend(access_reviews(fake, moved.from, None));
+            let mut second = writes_since(&other, on_other);
+            second.extend(access_reviews(&other, 0, None));
+            if !first.is_empty() || !second.is_empty() {
+                reached.push(format!("{asked:?}: original {first:?} new {second:?}"));
+            }
+            left_open = !app.state()?["dialog"].is_null();
+            Ok(())
+        })?;
+        if left_open {
+            app.mark_failing();
+            drop(app);
+        } else {
+            app.quit()?;
+        }
+    }
+    assert!(reached.is_empty(), "{reached:#?}");
+    Ok(())
+}
+
 // covers UP-54: on a protected cluster every refused action adds no request but the exact
 // read-only list and watch GETs of the feeds already open.
 #[test]
@@ -864,8 +841,8 @@ fn up_55_answering_a_confirmation_after_a_repoint_writes_nowhere() -> Result<()>
 fn up_54_refused_actions_send_no_request() -> Result<()> {
     let cluster = TestCluster::fake(Options::default())?;
     let fake = cluster.fake_server().expect("a fake server");
-    add_node(fake)?;
-    let app = launch(&cluster)?;
+    add_node(fake, NODE, false)?;
+    let app = launch_protected(&cluster)?;
     reporting(&app, || {
         open_live(&app, "nodes", 2)?;
         select(&app, None, NODE)?;
@@ -951,8 +928,8 @@ fn up_55_trust_survives_a_relaunch_and_writes_once() -> Result<()> {
     let cluster = TestCluster::fake(Options::default())?;
     let fake = cluster.fake_server().expect("a fake server");
     let context = cluster.context.as_str();
-    let app = launch(&cluster)?;
-    lift(&app, context, "TrustCluster", "trusted")?;
+    let app = launch_protected(&cluster)?;
+    lift_protection(&app, context, "TrustCluster", "trusted")?;
     let scratch = app.quit()?;
     assert!(fake.writes().is_empty(), "{:?}", fake.writes());
 

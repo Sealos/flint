@@ -20,6 +20,7 @@ use serde_json::Value;
 
 use super::access::Gated;
 use super::{DetailEvent, DetailTab, DetailView, Fetch, protected_reason};
+use crate::ui::write_binding::ConnectionGuard;
 use crate::ui::write_confirm;
 
 pub(super) enum Phase {
@@ -69,6 +70,9 @@ pub(super) struct YamlEdit {
     latest: Option<Arc<ObjectDetail>>,
     /// Paths the last review would overwrite after they changed on the cluster.
     competing: Vec<String>,
+    /// The connection the last review started on: its confirmation closes once that changes,
+    /// even if the context came back to the same server meanwhile.
+    reviewed_on: Option<ConnectionGuard>,
     _task: Task<()>,
 }
 
@@ -577,6 +581,7 @@ impl DetailView {
             seen: vec![opened],
             latest: None,
             competing: Vec::new(),
+            reviewed_on: None,
             _task: Task::ready(()),
         });
         cx.notify();
@@ -655,6 +660,7 @@ impl DetailView {
             return;
         }
         let core = self.core.clone();
+        let guards = self.connection_guards.clone();
         let Some(edit) = &mut self.edit else {
             return;
         };
@@ -667,6 +673,8 @@ impl DetailView {
         edit.phase = Phase::Reviewing;
         edit.error = None;
         edit.competing.clear();
+        // Before the review is asked for: a change while it runs is a change of connection.
+        edit.reviewed_on = guards.and_then(|g| g.guard(&edit.target.cluster, cx));
         let compare = edit
             .latest
             .clone()
@@ -752,7 +760,7 @@ impl DetailView {
         {
             let review = review.clone();
             write_confirm::set_edit_note(review.target(), edit.competing_warning(), cx);
-            cx.emit(DetailEvent::ConfirmWrite(review));
+            cx.emit(DetailEvent::ConfirmWrite(review, edit.reviewed_on.clone()));
         }
     }
 

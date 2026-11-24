@@ -54,9 +54,9 @@ use super::registry::{
     self, AddNamespace, BackToList, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly,
     DisconnectCluster, EditYaml, ExposeToAi, FocusFilter, HideFromAi, LockCluster, OnView,
     OpenClusterOverview, OpenObject, OpenView, RenameCluster, RetryConnection, SelectCluster,
-    SelectRow, ShowAgentActivity, ShowAllNamespaces, ToggleKeepWatching, ToggleNamespace,
-    TrustCluster, UnlockCluster, UntrustCluster, UseDefaultWatchMode, WatchAllKinds,
-    WatchOpenViewsOnly,
+    SelectRow, ShowAgentActivity, ShowAllNamespaces, ShowHelmReleases, ToggleKeepWatching,
+    ToggleNamespace, TrustCluster, UnlockCluster, UntrustCluster, UseDefaultWatchMode,
+    WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::resource_actions;
 use super::row_menu;
@@ -1009,10 +1009,13 @@ impl Workspace {
         });
     }
 
-    /// Confirms a reviewed edit from the detail pane, naming its cluster, and runs it.
+    /// Confirms a reviewed edit from the detail pane, naming its cluster, and runs it. `reviewed_on`
+    /// guards the connection the review started on: the confirmation is bound to that, not to the
+    /// one it opens on.
     fn confirm_detail_write(
         &mut self,
         review: &flint_core::write::WriteReview,
+        reviewed_on: Option<super::write_binding::ConnectionGuard>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1026,11 +1029,13 @@ impl Workspace {
         let handle = window.window_handle();
         // The same claim as the row actions: one write at a time per object.
         let key = resource_actions::WriteKey::of(review.target());
-        // Only for the server the review named: otherwise it is already about another connection.
+        // Only for the server the review named, on the connection the review started on:
+        // otherwise it is already about another connection.
         let guard = self
             .cluster_summary(&review.target().cluster, cx)
             .filter(|c| c.info.server == review.target().server)
-            .and_then(|_| self.connection_guard(&review.target().cluster, cx));
+            .and(reviewed_on)
+            .filter(|guard| guard.holds(cx));
         let Some(guard) = guard else {
             self.refuse(super::write_binding::connection_changed_text(), cx);
             return;
@@ -1611,8 +1616,10 @@ impl Workspace {
                 self.clear_action_error(cx);
                 let core = self.model.read(cx).core().clone();
                 let startup_logs = std::mem::take(&mut self.startup_logs);
+                let guards = super::write_binding::ConnectionGuards::new(&self.model);
                 let detail = cx.new(|cx| {
                     let mut detail = DetailView::new(core, object, tab, window, cx);
+                    detail.set_connection_guards(guards);
                     if startup_logs {
                         detail.open_logs_when_loaded(cx);
                     }
@@ -1632,9 +1639,8 @@ impl Workspace {
                                     this.open_shell(request.clone(), focus, window, cx)
                                 }
                                 DetailEvent::Refused(why) => this.refuse(why.clone(), cx),
-                                DetailEvent::ConfirmWrite(review) => {
-                                    this.confirm_detail_write(review, window, cx)
-                                }
+                                DetailEvent::ConfirmWrite(review, reviewed_on) => this
+                                    .confirm_detail_write(review, reviewed_on.clone(), window, cx),
                             }
                         }),
                     ];
@@ -2023,6 +2029,11 @@ impl Workspace {
             if !has_server {
                 return menu;
             }
+            let menu = menu.item(PopupMenuItem::new("Helm Releases…").on_click(
+                registry::on_click(ShowHelmReleases {
+                    cluster: rename.clone(),
+                }),
+            ));
             let menu = menu.item(
                 PopupMenuItem::new(keep_watching::toggle_label(keep, keep_sign_in)).on_click(
                     registry::on_click(ToggleKeepWatching {
