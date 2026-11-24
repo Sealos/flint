@@ -197,7 +197,8 @@ impl WriteKey {
 
 /// A drain that ended, until its report is viewed or a newer one replaces it.
 struct FinishedDrain {
-    /// The cluster, as named when the drain ended: two clusters can have a node of one name.
+    /// The cluster, as named when the drain was confirmed (told from every other context then):
+    /// two clusters can have a node of one name.
     cluster: String,
     node: String,
     report: DrainReport,
@@ -695,11 +696,13 @@ fn progress_text(told: &DrainProgress) -> String {
     }
 }
 
-/// Where one of several running drains is, in short.
+/// Where one of several running drains is, in short: the pod it is at, as [`progress_text`]
+/// counts it.
 fn progress_count(told: &DrainProgress) -> String {
-    match told.terminating {
-        Some(left) => format!("{left} terminating"),
-        None => format!("{}/{}", told.tried, told.to_evict),
+    match (told.terminating, &told.current) {
+        (Some(left), _) => format!("{left} terminating"),
+        (None, Some(_)) => format!("{}/{}", told.tried + 1, told.to_evict),
+        (None, None) => format!("{}/{}", told.tried, told.to_evict),
     }
 }
 
@@ -1490,7 +1493,7 @@ mod tests {
         let only_a = |key: &WriteKey| (key == &a).then_some(&evicting);
         assert_eq!(
             draining_text(&[&a, &b], only_a, unused).unwrap(),
-            "Draining 2 nodes: a (1/3), b…"
+            "Draining 2 nodes: a (2/3), b…"
         );
         let waits = |key: &WriteKey| (key == &b).then_some(&waiting);
         assert_eq!(

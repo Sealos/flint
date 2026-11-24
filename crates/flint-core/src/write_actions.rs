@@ -1148,7 +1148,9 @@ pub(crate) async fn drain(
         terminating: Some(accepted.len()),
         ..progress_of(&report, total, total, None)
     };
-    tell(options, || waiting.clone());
+    if !accepted.is_empty() {
+        tell(options, || waiting.clone());
+    }
     let (terminating, stopped) = wait_until_gone(gate, accepted, options, waiting).await;
     report.terminating = terminating;
     report.stopped = stopped.map(Into::into);
