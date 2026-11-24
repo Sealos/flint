@@ -159,19 +159,6 @@ As their documentation describes them in November 2026:
 | Writes | None: no tools for them | Its `kubectl` tool refuses writes; editors and Helm dialogs it fills in apply changes after you confirm; some tools change Lens itself (port forwards, settings) | Writes allowed, including delete and pod exec, unless its `read_only` or `disable_destructive` setting is on |
 | Credential redaction in results | Secret values, and credentials in logs, events, messages and container arguments | Not described | Not for tool results (only its own log notifications); Secrets can be denied by configuration |
 
-## Compared with other desktop apps
-
-As their pages describe them in November 2026. Flint is early; the gaps are listed on purpose.
-
-| | Flint | [Lens](https://lenshq.io/pricing) | [Freelens](https://github.com/freelensapp/freelens) |
-|---|---|---|---|
-| Price and license | Free, Apache-2.0 | Free for personal use and small organizations; organizations above $10 million in annual revenue or funding need a paid plan (from $25 per month) | Free, MIT |
-| Install | DMG or command-line archive on macOS, AppImage on Linux (best effort); unsigned until 1.0, no Homebrew cask yet | Not checked | DMG or PKG, Homebrew, deb, rpm, AppImage, Flathub, Snap and more; Windows installers |
-| Platforms | macOS, and Linux on a best-effort basis; no Windows | Not checked | macOS, Linux, Windows |
-| Remote or team use | None: a desktop app on your machine, with no hosted or shared deployment | Not checked | Not described |
-| Metrics | CPU and memory columns from metrics-server; no history or charts | Metrics in its free tier | Not checked |
-| Record of AI agent calls | A local metadata log of every `flint mcp` call, best effort | Not described | Not described |
-
 ## Status
 
 Flint is in early development.
