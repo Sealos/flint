@@ -20,7 +20,6 @@ fn state_name(card: &SetCard) -> &'static str {
         CardState::Live => "live",
         CardState::Partial(_) => "partial",
         CardState::Waiting => "waiting",
-        CardState::NotWatched => "not_watched",
         CardState::Unavailable(_) => "unavailable",
         CardState::Blocked(_) => "blocked",
     }
