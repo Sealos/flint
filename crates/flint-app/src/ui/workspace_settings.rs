@@ -1,68 +1,68 @@
 //! The workspace's side of the Settings view ([`settings_view`]): opening and leaving it, its
-//! actions and their guards, Save and Revert, its place in the main area and the sidebar, and
-//! the Save / Discard / Cancel question when the window closes or the app quits with a draft.
+//! actions and their guards, Save and Revert, its keyboard cycle, its place in the main area and
+//! the sidebar, and the Save / Discard / Cancel question when the window closes or the app quits
+//! with a draft.
 //!
-//! Save writes each edited field through the core's own command for it, the same one the View
-//! menu, the Alerts menu and the header use, so a setting written here goes through the same
-//! checks as from anywhere else and nothing about it is loosened.
+//! Save hands the edited fields to the core ([`flint_core::CoreHandle::write_settings`]), which
+//! writes each through the same setter the View menu, the Alerts menu and the header use, and
+//! answers once they are written. Nothing about a setting written here is loosened. The edits
+//! stay in the draft until that answer: a failed or unconfirmed Save keeps them.
 
 // module-tests: settings_view_tests.rs
+
+use std::rc::Rc;
 
 use gpui_kit::component::{Theme, WindowExt as _};
 use gpui_kit::*;
 
-use super::super::clusters::ClustersModel;
 use super::super::confirm::{self, DialogText};
 use super::super::registry::{Bind, Guards, OnView};
 use super::super::settings_draft::Change;
 use super::super::settings_view::{
-    self, CloseSettings, EditAppearance, EditDesktopNotifications, EditWatchMode, MainKey,
-    OpenSettings, RevertSettings, SaveSettings, ShowSettingsSection,
+    self, ActivateSettingsControl, CloseSettings, EditAppearance, EditDesktopNotifications,
+    EditWatchMode, MainKey, NextSettingsControl, OpenSettings, PreviousSettingsControl,
+    RevertSettings, SaveSettings, Saving, ShowSettingsSection, Stop, Then,
 };
 #[cfg(any(test, feature = "automation"))]
 use super::super::view_state::SettingsState;
 use super::Workspace;
 
-/// What closing or quitting does once the settings question is answered.
-type Then = std::rc::Rc<dyn Fn(&mut Window, &mut App)>;
+/// How long a Save waits for the core's answer before it says it could not be confirmed.
+const SAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long a Save waits for the core to report it written before the controls take edits
-/// again.
-const SAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Sends `change` to the core, through the command each other control uses for that setting.
-fn write(change: Change, model: &mut ClustersModel) {
-    match change {
-        Change::Appearance(appearance) => model.set_appearance(appearance),
-        Change::DesktopNotifications(enabled) => model.set_desktop_notifications(enabled),
-        Change::WatchMode(mode) => model.set_watch_mode(None, Some(mode)),
-    }
-}
+/// What the footer says when the core did not answer a Save in time.
+const UNCONFIRMED: &str =
+    "The save could not be confirmed. Your edits are kept; save again to retry.";
 
 impl Workspace {
     pub(super) fn settings_guards(guards: Guards<Self>) -> Guards<Self> {
-        // Not while a Save is being written: an edit then would be made over the old file.
         fn open(ws: &Workspace, _: &App) -> bool {
+            ws.settings_page.open
+        }
+        // Not while a Save is being written: an edit then would be made over the old file.
+        fn editable(ws: &Workspace, _: &App) -> bool {
             ws.settings_page.open && ws.settings_page.saving.is_none()
         }
         guards
             .when::<CloseSettings>(open)
             .when::<ShowSettingsSection>(open)
-            .when::<EditAppearance>(open)
-            .when::<EditDesktopNotifications>(open)
-            .when::<EditWatchMode>(open)
+            .when::<NextSettingsControl>(open)
+            .when::<PreviousSettingsControl>(open)
+            .when::<ActivateSettingsControl>(open)
+            .when::<EditAppearance>(editable)
+            .when::<EditDesktopNotifications>(editable)
+            .when::<EditWatchMode>(editable)
             .when::<SaveSettings>(|ws, cx| ws.can_save_settings(cx))
-            .when::<RevertSettings>(|ws, _| ws.settings_page.draft.is_dirty())
+            .when::<RevertSettings>(|ws, _| {
+                ws.settings_page.draft.is_dirty() && ws.settings_page.saving.is_none()
+            })
     }
 
     pub(in crate::ui) fn bind_settings_actions<B: Bind<Self>>(bind: B) -> B {
         bind.bind::<OpenSettings>(|ws, _, window, cx| ws.open_settings(window, cx))
             .bind::<CloseSettings>(|ws, _, window, cx| ws.close_settings(window, cx))
             .bind::<ShowSettingsSection>(|ws, action, _, cx| {
-                if ws.settings_page.open {
-                    ws.settings_page.section = action.section;
-                    cx.notify();
-                }
+                ws.show_settings_section(action.section, cx)
             })
             .bind::<EditAppearance>(|ws, action, _, cx| {
                 ws.edit_settings(Change::Appearance(action.appearance), cx)
@@ -73,8 +73,13 @@ impl Workspace {
             .bind::<EditWatchMode>(|ws, action, _, cx| {
                 ws.edit_settings(Change::WatchMode(action.mode), cx)
             })
-            .bind::<SaveSettings>(|ws, _, window, cx| ws.save_settings(window, cx, |_, _, _| {}))
+            .bind::<SaveSettings>(|ws, _, window, cx| ws.save_settings(None, window, cx))
             .bind::<RevertSettings>(|ws, _, _, cx| ws.revert_settings(cx))
+            .bind::<NextSettingsControl>(|ws, _, _, cx| ws.move_settings_cursor(true, cx))
+            .bind::<PreviousSettingsControl>(|ws, _, _, cx| ws.move_settings_cursor(false, cx))
+            .bind::<ActivateSettingsControl>(|ws, _, window, cx| {
+                ws.activate_settings_control(window, cx)
+            })
     }
 
     pub(super) fn register_settings_actions<E: InteractiveElement>(
@@ -89,6 +94,7 @@ impl Workspace {
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_page.open = true;
         self.settings_page.opened_over = Some(self.main_key());
+        self.settings_page.cursor = None;
         window.focus(&self.settings_page.focus, cx);
         cx.notify();
     }
@@ -98,8 +104,7 @@ impl Workspace {
         if !self.settings_page.open {
             return;
         }
-        self.settings_page.open = false;
-        self.settings_page.opened_over = None;
+        self.leave_settings_for_view();
         window.focus(&self.focus, cx);
         self.recover_focus(window, cx);
         cx.notify();
@@ -116,7 +121,7 @@ impl Workspace {
         }
     }
 
-    /// Leaves Settings when something else was opened in the main area meanwhile. Called as the
+    /// Leaves Settings when another cluster or a set was opened meanwhile. Called as the
     /// workspace draws.
     pub(super) fn settings_follow_main(&mut self) {
         if !self.settings_page.open {
@@ -132,6 +137,7 @@ impl Workspace {
     pub(super) fn leave_settings_for_view(&mut self) {
         self.settings_page.open = false;
         self.settings_page.opened_over = None;
+        self.settings_page.cursor = None;
     }
 
     fn settings_invalid(&self, cx: &App) -> bool {
@@ -143,76 +149,140 @@ impl Workspace {
             && settings_view::can_save(&self.settings_page.draft, self.settings_invalid(cx))
     }
 
+    fn show_settings_section(&mut self, section: settings_view::Section, cx: &mut Context<Self>) {
+        if self.settings_page.open {
+            self.settings_page.section = section;
+            cx.notify();
+        }
+    }
+
     fn edit_settings(&mut self, change: Change, cx: &mut Context<Self>) {
         if !self.settings_page.open || self.settings_page.saving.is_some() {
             return;
         }
         let file = self.model.read(cx).settings.clone();
         self.settings_page.draft.edit(change, &file);
+        self.settings_page.save_note = None;
         cx.notify();
     }
 
     fn revert_settings(&mut self, cx: &mut Context<Self>) {
+        if self.settings_page.saving.is_some() {
+            return;
+        }
         self.settings_page.draft.revert();
+        self.settings_page.save_note = None;
         cx.notify();
     }
 
-    /// Writes the edited fields, and only those, then runs `then` once the core reports them
-    /// written. If the core reports an error first, or nothing within [`SAVE_WAIT`], `then` does
-    /// not run and the error notice says what failed. Nothing happens without edits, while
-    /// `settings.toml` is invalid, or while an earlier Save is still being written.
-    fn save_settings(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) {
+    /// Hands the edited fields, and only those, to the core. They stay in the draft until it
+    /// answers: written, they leave it and `then` runs; refused, or unanswered within
+    /// [`SAVE_WAIT`], they stay, the footer says why, and `then` does not run. Nothing happens
+    /// without edits, while `settings.toml` is invalid, or while an earlier Save is pending.
+    fn save_settings(&mut self, then: Option<Then>, window: &mut Window, cx: &mut Context<Self>) {
         if !self.can_save_settings(cx) {
             return;
         }
-        let writes = self.settings_page.draft.take();
-        // Only an error reported after these writes were sent counts as theirs.
-        let errors_before = self.model.read(cx).errors_seen;
-        self.model.update(cx, |model, _| {
-            for change in &writes {
-                write(*change, model);
-            }
-        });
-        let landed = {
-            let file = &self.model.read(cx).settings;
-            writes.iter().all(|change| change.holds_in(file))
-        };
-        // The file has these values already: the core writes nothing new and reports nothing.
-        if landed {
-            cx.notify();
-            then(self, window, cx);
-            return;
-        }
-        let mut then = Some(then);
-        let watch = cx.observe_in(&self.model, window, move |ws, model, window, cx| {
-            let model = model.read(cx);
-            if writes.iter().all(|change| change.holds_in(&model.settings)) {
-                ws.end_saving(cx);
-                if let Some(then) = then.take() {
-                    then(ws, window, cx);
-                }
-            } else if model.errors_seen > errors_before {
-                ws.end_saving(cx);
-            }
+        let writes = self.settings_page.draft.edits();
+        let reply = self
+            .model
+            .read(cx)
+            .core()
+            .write_settings(writes.iter().map(|c| c.to_write()).collect());
+        let written = writes.clone();
+        let answer = cx.spawn_in(window, async move |this, cx| {
+            let result = reply.await;
+            let _ = this.update_in(cx, |ws, window, cx| {
+                ws.finish_save(&written, result, window, cx)
+            });
         });
         let give_up = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SAVE_WAIT).await;
-            let _ = this.update(cx, |ws, cx| ws.end_saving(cx));
+            let _ = this.update(cx, |ws, cx| {
+                if ws.settings_page.saving.take().is_some() {
+                    ws.settings_page.save_note = Some(UNCONFIRMED.to_owned());
+                    cx.notify();
+                }
+            });
         });
-        self.settings_page.saving = Some((watch, give_up));
+        self.settings_page.save_note = None;
+        self.settings_page.saving = Some(Saving {
+            after: then.into_iter().collect(),
+            _answer: answer,
+            _give_up: give_up,
+        });
         cx.notify();
     }
 
-    /// Stops waiting for a Save: the controls and Save take edits again.
-    fn end_saving(&mut self, cx: &mut Context<Self>) {
-        if self.settings_page.saving.take().is_some() {
-            cx.notify();
+    /// The core's answer to a Save of `writes`.
+    fn finish_save(
+        &mut self,
+        writes: &[Change],
+        result: Result<(), String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(saving) = self.settings_page.saving.take() else {
+            return;
+        };
+        match result {
+            Ok(()) => {
+                self.settings_page.draft.saved(writes);
+                for then in saving.after {
+                    then(window, cx);
+                }
+            }
+            Err(why) => {
+                self.settings_page.save_note = Some(format!("Not saved: {why}"));
+            }
         }
+        cx.notify();
+    }
+
+    /// Moves the keyboard cursor to the next (or previous) control, round the view.
+    fn move_settings_cursor(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if !self.settings_page.open {
+            return;
+        }
+        let banner = self.settings_banner_shown(cx);
+        let stops = settings_view::stops(self.settings_page.section, banner);
+        let at = self
+            .settings_page
+            .cursor
+            .and_then(|c| stops.iter().position(|s| *s == c));
+        let next = match (at, forward) {
+            (None, true) => 0,
+            (None, false) => stops.len() - 1,
+            (Some(i), true) => (i + 1) % stops.len(),
+            (Some(i), false) => (i + stops.len() - 1) % stops.len(),
+        };
+        self.settings_page.cursor = Some(stops[next]);
+        cx.notify();
+    }
+
+    /// Enter or Space: does what clicking the control under the cursor does.
+    fn activate_settings_control(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(stop) = self.settings_page.cursor else {
+            return;
+        };
+        match stop {
+            Stop::Done => self.close_settings(window, cx),
+            Stop::Reload | Stop::Revert => self.revert_settings(cx),
+            Stop::SaveAnyway | Stop::Save => self.save_settings(None, window, cx),
+            Stop::Section(section) => self.show_settings_section(section, cx),
+            Stop::Appearance(appearance) => self.edit_settings(Change::Appearance(appearance), cx),
+            Stop::DesktopNotifications => {
+                let file = self.model.read(cx).settings.clone();
+                let on = self.settings_page.draft.shown(&file).desktop_notifications;
+                self.edit_settings(Change::DesktopNotifications(!on), cx)
+            }
+            Stop::WatchMode(mode) => self.edit_settings(Change::WatchMode(mode), cx),
+        }
+    }
+
+    /// Whether the "modified outside Settings" banner shows.
+    fn settings_banner_shown(&self, cx: &App) -> bool {
+        settings_view::banner_shown(&self.settings_page, &self.model.read(cx).settings)
     }
 
     /// The Settings view in the main area, while it is open.
@@ -245,13 +315,14 @@ impl Workspace {
             .state(&model.settings, model.settings_error.is_some())
     }
 
-    /// Whether Settings holds unsaved edits.
+    /// Whether Settings holds edits not yet written, a Save under way included.
     pub(in crate::ui) fn has_settings_draft(&self) -> bool {
         self.settings_page.draft.is_dirty()
     }
 
     /// Asks Save / Discard / Cancel about unsaved settings, if there are any; Save (once
-    /// written) and Discard run `then`. Whether the caller must stop.
+    /// written) and Discard run `then`. While a Save is being written, `then` waits for it
+    /// instead. Whether the caller must stop.
     pub(in crate::ui) fn asks_about_settings(
         &mut self,
         window: &mut Window,
@@ -259,7 +330,7 @@ impl Workspace {
         ending: &'static str,
         then: impl Fn(&mut Window, &mut App) + 'static,
     ) -> bool {
-        self.ask_about_settings(window, cx, ending, std::rc::Rc::new(then))
+        self.ask_about_settings(window, cx, ending, Rc::new(then))
     }
 
     /// [`Self::asks_about_settings`], with `then` shared, so the question can ask again.
@@ -272,6 +343,11 @@ impl Workspace {
     ) -> bool {
         if !self.has_settings_draft() {
             return false;
+        }
+        // A Save already on its way: close or quit once it is written, never before.
+        if let Some(saving) = &mut self.settings_page.saving {
+            saving.after.push(then);
+            return true;
         }
         if window.has_active_dialog(cx) {
             return true;
@@ -288,7 +364,8 @@ impl Workspace {
                 ok: "Discard".into(),
                 cancel: "Cancel".into(),
                 id: "settings-draft-description",
-                default_cancel: false,
+                // Discarding loses the edits: only the button does it, Enter cancels.
+                default_cancel: true,
             };
             confirm::open(window, cx, text, move |window, cx| {
                 let then = then.clone();
@@ -318,11 +395,11 @@ impl Workspace {
                 let then = save_then.clone();
                 let _ = save_ws.update(cx, |ws, cx| {
                     if ws.can_save_settings(cx) {
-                        ws.save_settings(window, cx, move |_, window, cx| then(window, cx));
+                        ws.save_settings(Some(then), window, cx);
                     } else {
-                        // The file turned invalid (or a Save is under way) since the question
-                        // opened: ask again, which says why.
-                        ws.ask_about_settings(window, cx, ending, then.clone());
+                        // The file turned invalid since the question opened: ask again, which
+                        // says why.
+                        ws.ask_about_settings(window, cx, ending, then);
                     }
                 });
             },

@@ -796,8 +796,10 @@ Deferred until cluster sets are scheduled (#199).
   which writes only the settings I edited to `settings.toml`; Revert drops them. The draft stays while I switch views
   and clusters, and the sidebar's Settings entry shows a dot meanwhile. If `settings.toml` changes while the draft
   waits (from the Alerts menu, View > Appearance or an editor), a banner says so: Reload shows the file and drops the
-  draft, Save anyway writes only my edits. While `settings.toml` is invalid, Save is disabled. Quitting or closing the
-  window with a draft asks Save, Discard or Cancel.
+  draft, Save anyway writes only my edits. My edits leave the draft only once they are written: a Save that fails or
+  cannot be confirmed keeps them and says so. While `settings.toml` is invalid, Save is disabled. Quitting or closing
+  the window with a draft asks Save, Discard or Cancel, and a Save still being written is waited for. From the
+  keyboard, Tab and Shift-Tab go round the view's own controls, and Enter or Space works the one under the cursor.
 - Tests: unit (draft, revert, save of edited fields, the on-disk banner), ui (shortcut, save, banner, quit and close
   question), e2e (`flint-e2e/tests/app/settings.rs`).
 

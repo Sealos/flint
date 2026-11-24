@@ -338,3 +338,120 @@ async fn opening_the_kind_under_settings_leaves_settings(cx: &mut TestAppContext
     assert_eq!(s.main, Main::List);
     assert!(s.settings.dirty, "the draft stays");
 }
+
+// covers UP-126: a Save keeps its edits until the core says they are written, and a Quit pressed
+// meanwhile waits for that answer instead of exiting first.
+#[gpui_kit::test]
+async fn quit_while_a_save_is_pending_waits_for_it(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_settings(cx, dir.path()).await;
+    t.dispatch(cx, "settings::EditWatchMode", json!({ "mode": "on_view" }))
+        .unwrap();
+    let workspace = t.workspace.clone();
+    let pending = cx
+        .update_window(t.window, |_, window, cx| {
+            super::registry::dispatch("settings::SaveSettings", Value::Null, window, cx).unwrap();
+            let pending = workspace.read(cx).has_settings_draft();
+            super::registry::dispatch("flint::Quit", Value::Null, window, cx).unwrap();
+            pending
+        })
+        .unwrap();
+    assert!(
+        pending,
+        "the edits stay in the draft until the core answers"
+    );
+    cx.wait_for(t.window, WAIT, |_, cx| {
+        cx.try_global::<Quits>().is_some_and(|q| q.0 == 1)
+    })
+    .await;
+    assert!(
+        !cx.update_window(t.window, |_, window, cx| window.has_active_dialog(cx))
+            .unwrap()
+    );
+    let written = t.settings_toml();
+    assert!(written.contains("watch_mode = \"on_view\""), "{written}");
+}
+
+// covers UP-126: a Save the core refuses keeps the edits and says why.
+#[gpui_kit::test]
+async fn a_refused_save_keeps_the_edits(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_settings(cx, dir.path()).await;
+    edit_appearance(cx, &t, "dark");
+    // Broken behind the core's back (these tests do not watch the file): the write fails.
+    std::fs::write(dir.path().join("settings.toml"), "appearance = [\n").unwrap();
+    t.click(cx, "settings-save");
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |window, cx| {
+        !workspace
+            .update(cx, |ws, cx| ws.view_state(window, cx))
+            .settings
+            .saving
+    })
+    .await;
+    let s = state(cx, &t);
+    assert!(s.settings.dirty, "{s:?}");
+    assert_eq!(s.settings.appearance, "dark");
+    let note = s.settings.note.expect("the footer says why");
+    assert!(note.starts_with("Not saved"), "{note}");
+}
+
+// covers UP-126: Tab and Shift-Tab go round the controls of Settings, never the panes hidden
+// under it, and Enter or Space works the control under the cursor.
+#[gpui_kit::test]
+async fn the_keyboard_alone_changes_and_saves_a_setting(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_settings(cx, dir.path()).await;
+    t.press(cx, "tab");
+    assert_eq!(state(cx, &t).settings.cursor, Some("settings-close"));
+    // Done, the three sections, then System, Light and Dark.
+    for _ in 0..6 {
+        t.press(cx, "tab");
+    }
+    let s = state(cx, &t);
+    assert_eq!(s.settings.cursor, Some("settings-appearance-dark"));
+    assert_eq!(s.focus, Focus::Settings, "Tab stays in Settings");
+    t.press(cx, "enter");
+    assert_eq!(state(cx, &t).settings.edited, ["appearance"]);
+
+    // Round to the start and back: Shift-Tab from Done wraps to Save.
+    t.press(cx, "tab");
+    t.press(cx, "tab");
+    assert_eq!(state(cx, &t).settings.cursor, Some("settings-save"));
+    t.press(cx, "tab");
+    assert_eq!(state(cx, &t).settings.cursor, Some("settings-close"));
+    t.press(cx, "shift-tab");
+    assert_eq!(state(cx, &t).settings.cursor, Some("settings-save"));
+    t.press(cx, "space");
+    wait_for_file(cx, &t, |s| s.appearance == flint_core::Appearance::Dark).await;
+    assert!(!state(cx, &t).settings.dirty);
+
+    // A section, from the keyboard.
+    t.press(cx, "tab");
+    t.press(cx, "tab");
+    t.press(cx, "tab");
+    assert_eq!(
+        state(cx, &t).settings.cursor,
+        Some("settings-section-alerts")
+    );
+    t.press(cx, "enter");
+    assert!(t.find(cx, "settings-desktop-notifications").is_some());
+}
+
+// covers UP-126: with settings.toml invalid, the quit question only discards, and Enter cancels
+// it: discarding takes the button.
+#[gpui_kit::test]
+async fn enter_does_not_discard_when_the_file_is_invalid(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("settings.toml"), "appearance = [\n").unwrap();
+    let t = open_settings(cx, dir.path()).await;
+    edit_appearance(cx, &t, "dark");
+    t.press_key_of(cx, "flint::Quit");
+    let dialog = shown_dialog(cx, &t).await;
+    assert_eq!(dialog.title, "Discard unsaved settings?");
+    t.press(cx, "enter");
+    cx.wait_for(t.window, WAIT, |window, cx| !window.has_active_dialog(cx))
+        .await;
+    assert_eq!(quits(cx), 0);
+    assert!(state(cx, &t).settings.dirty);
+}

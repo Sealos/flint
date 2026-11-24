@@ -67,6 +67,12 @@ pub struct SettingsState {
     /// `settings.toml` cannot be read; Save is disabled.
     pub invalid: bool,
     pub can_save: bool,
+    /// A Save waits for the core's answer; its edits are still in the draft.
+    pub saving: bool,
+    /// Why the last Save did not go through.
+    pub note: Option<String>,
+    /// The element id of the control under the keyboard cursor.
+    pub cursor: Option<&'static str>,
 }
 
 /// Cluster sets, as the sidebar and the set's view show them.

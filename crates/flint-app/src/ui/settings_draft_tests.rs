@@ -43,7 +43,7 @@ fn changing_a_control_back_leaves_nothing_to_save() {
     draft.edit(Change::WatchMode(WatchMode::OnView), &file);
     draft.edit(Change::WatchMode(WatchMode::All), &file);
     assert!(!draft.is_dirty());
-    assert!(draft.take().is_empty());
+    assert!(draft.edits().is_empty());
 }
 
 #[test]
@@ -65,7 +65,8 @@ fn save_takes_only_the_edited_fields() {
     draft.edit(Change::Appearance(Appearance::Dark), &file);
     // Edited twice: the last value is the one saved.
     draft.edit(Change::Appearance(Appearance::Light), &file);
-    let writes = draft.take();
+    let writes = draft.edits();
+    draft.saved(&writes);
     assert_eq!(
         writes,
         [
@@ -95,7 +96,9 @@ fn a_change_on_disk_under_a_draft_raises_the_banner() {
     assert_eq!(shown.appearance, Appearance::Dark);
 
     // Save anyway writes the edited field alone, so the outside change survives.
-    assert_eq!(draft.take(), [Change::Appearance(Appearance::Dark)]);
+    let writes = draft.edits();
+    assert_eq!(writes, [Change::Appearance(Appearance::Dark)]);
+    draft.saved(&writes);
     assert!(!draft.changed_on_disk(&outside));
 }
 
@@ -117,4 +120,37 @@ fn fields_name_their_keys() {
     assert_eq!(Field::Appearance.key(), "appearance");
     assert_eq!(Field::DesktopNotifications.key(), "desktop_notifications");
     assert_eq!(Field::WatchMode.key(), "watch_mode");
+}
+
+#[test]
+fn an_edit_stays_until_the_core_says_it_is_written() {
+    let file = file();
+    let mut draft = SettingsDraft::default();
+    draft.edit(Change::Appearance(Appearance::Dark), &file);
+    draft.edit(Change::WatchMode(WatchMode::OnView), &file);
+    let writes = draft.edits();
+    assert!(draft.is_dirty(), "sent, not yet written");
+    // Only the watch mode was written; the appearance was edited again meanwhile.
+    draft.edit(Change::Appearance(Appearance::Light), &file);
+    draft.saved(&writes);
+    assert!(draft.is_edited(Field::Appearance));
+    assert!(!draft.is_edited(Field::WatchMode));
+    assert_eq!(draft.shown(&file).appearance, Appearance::Light);
+}
+
+#[test]
+fn changes_map_to_the_core_writes() {
+    use flint_core::settings::SettingsWrite;
+    assert_eq!(
+        Change::Appearance(Appearance::Dark).to_write(),
+        SettingsWrite::Appearance(Appearance::Dark)
+    );
+    assert_eq!(
+        Change::DesktopNotifications(true).to_write(),
+        SettingsWrite::DesktopNotifications(true)
+    );
+    assert_eq!(
+        Change::WatchMode(WatchMode::OnView).to_write(),
+        SettingsWrite::WatchMode(WatchMode::OnView)
+    );
 }

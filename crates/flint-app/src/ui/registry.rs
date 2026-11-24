@@ -53,8 +53,9 @@ use super::list::combined::{
 };
 pub use super::pending_threshold::SetPendingThreshold;
 pub use super::settings_view::{
-    CloseSettings, EditAppearance, EditDesktopNotifications, EditWatchMode, OpenSettings,
-    RevertSettings, SaveSettings, ShowSettingsSection,
+    ActivateSettingsControl, CloseSettings, EditAppearance, EditDesktopNotifications,
+    EditWatchMode, NextSettingsControl, OpenSettings, PreviousSettingsControl, RevertSettings,
+    SaveSettings, ShowSettingsSection,
 };
 
 actions!(
@@ -2284,21 +2285,41 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Set the appearance in the Settings draft.",
             EDIT_APPEARANCE,
         )
-        .of(C::Flint, S::Settings)
-        .hidden(),
+        .of(C::Flint, S::Settings),
         Spec::with_args::<EditDesktopNotifications>(
             "Edit Desktop Notifications…",
             "Turn desktop notifications on or off in the Settings draft.",
             EDIT_NOTIFICATIONS,
         )
-        .of(C::Flint, S::Settings)
-        .hidden(),
+        .of(C::Flint, S::Settings),
         Spec::with_args::<EditWatchMode>(
             "Edit Default Watch Mode…",
             "Set the default watch mode in the Settings draft.",
             EDIT_WATCH_MODE,
         )
+        .of(C::Flint, S::Settings),
+        // The view's own Tab cycle, so its controls work without a mouse and Tab never reaches
+        // the panes hidden under it.
+        Spec::unit::<NextSettingsControl>(
+            "Next Settings Control",
+            "Move the cursor to the next control in Settings.",
+        )
         .of(C::Flint, S::Settings)
+        .keys(&["tab", "down"], Some(super::settings_view::SETTINGS_KEYS))
+        .hidden(),
+        Spec::unit::<PreviousSettingsControl>(
+            "Previous Settings Control",
+            "Move the cursor to the previous control in Settings.",
+        )
+        .of(C::Flint, S::Settings)
+        .keys(&["shift-tab", "up"], Some(super::settings_view::SETTINGS_KEYS))
+        .hidden(),
+        Spec::unit::<ActivateSettingsControl>(
+            "Use Settings Control",
+            "Work the control under the cursor in Settings, as a click does.",
+        )
+        .of(C::Flint, S::Settings)
+        .keys(&["enter", "space"], Some(super::settings_view::SETTINGS_KEYS))
         .hidden(),
         Spec::unit::<ToggleCommandPalette>(
             "Show Command Palette",

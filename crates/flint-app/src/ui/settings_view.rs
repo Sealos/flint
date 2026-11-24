@@ -5,13 +5,17 @@
 //!
 //! Opened from Flint > Settings…, `secondary-,` and the command palette. Every control is a
 //! registered action, so the palette, keys and automation reach the same handlers
-//! ([`super::workspace`]'s `workspace_settings.rs`).
+//! ([`super::workspace`]'s `workspace_settings.rs`). From the keyboard, Tab and Shift-Tab (or the
+//! arrows) go round the view's own controls ([`stops`]), Enter or Space works the one under the
+//! cursor, and Esc leaves.
 //!
 //! Sections so far: Appearance, Alerts (desktop notifications) and Watching (the default watch
-//! mode). A slice that adds settings adds a [`Section`] (or a block to one) and its
-//! [`super::settings_draft::Change`]s.
+//! mode). A slice that adds settings adds a [`Section`] (or a block to one), its
+//! [`super::settings_draft::Change`]s and its [`Stop`]s.
 
 // module-tests: settings_view_tests.rs
+
+use std::rc::Rc;
 
 use flint_core::{Appearance, Settings, WatchMode};
 use gpui_kit::base::TestSupportExt as _;
@@ -47,7 +51,13 @@ actions!(
         /// Write the edited settings to `settings.toml`, and only those.
         SaveSettings,
         /// Drop the unsaved edits and show `settings.toml` as it is.
-        RevertSettings
+        RevertSettings,
+        /// Move the keyboard cursor to the next control in Settings, round the view.
+        NextSettingsControl,
+        /// Move the keyboard cursor to the previous control in Settings, round the view.
+        PreviousSettingsControl,
+        /// Work the control under the keyboard cursor, as a click does.
+        ActivateSettingsControl
     ]
 );
 
@@ -122,8 +132,72 @@ impl Section {
     }
 }
 
-/// What the main area would show without Settings, when it was opened: once that changes (a
-/// cluster, a kind, an object or a set opened meanwhile), Settings gives way to it.
+/// A control the keyboard cursor can stand on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    Done,
+    Reload,
+    SaveAnyway,
+    Section(Section),
+    Appearance(Appearance),
+    DesktopNotifications,
+    WatchMode(WatchMode),
+    Revert,
+    Save,
+}
+
+impl Stop {
+    /// The element id of the control.
+    pub fn id(self) -> &'static str {
+        match self {
+            Stop::Done => "settings-close",
+            Stop::Reload => "settings-reload",
+            Stop::SaveAnyway => "settings-save-anyway",
+            Stop::Section(section) => section.id(),
+            Stop::Appearance(Appearance::System) => "settings-appearance-system",
+            Stop::Appearance(Appearance::Light) => "settings-appearance-light",
+            Stop::Appearance(Appearance::Dark) => "settings-appearance-dark",
+            Stop::DesktopNotifications => "settings-desktop-notifications",
+            Stop::WatchMode(WatchMode::All) => "settings-watch-all",
+            Stop::WatchMode(WatchMode::OnView) => "settings-watch-on-view",
+            Stop::Revert => "settings-revert",
+            Stop::Save => "settings-save",
+        }
+    }
+}
+
+/// The controls in the order Tab visits them, with `section` shown and the on-disk banner
+/// shown or not.
+pub fn stops(section: Section, banner: bool) -> Vec<Stop> {
+    let mut stops = vec![Stop::Done];
+    if banner {
+        stops.extend([Stop::Reload, Stop::SaveAnyway]);
+    }
+    stops.extend(Section::ALL.map(Stop::Section));
+    match section {
+        Section::Appearance => stops.extend(
+            [Appearance::System, Appearance::Light, Appearance::Dark].map(Stop::Appearance),
+        ),
+        Section::Alerts => stops.push(Stop::DesktopNotifications),
+        Section::Watching => stops.extend([WatchMode::All, WatchMode::OnView].map(Stop::WatchMode)),
+    }
+    stops.extend([Stop::Revert, Stop::Save]);
+    stops
+}
+
+/// What closing or quitting does once the settings question is answered.
+pub type Then = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// A Save handed to the core, until it answers.
+pub struct Saving {
+    /// Closing or quitting that waits for it.
+    pub after: Vec<Then>,
+    pub _answer: Task<()>,
+    pub _give_up: Task<()>,
+}
+
+/// What the main area showed when Settings opened, as far as Settings gives way to a change of
+/// it: another cluster or a set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MainKey {
     pub cluster: Option<flint_core::ClusterId>,
@@ -141,8 +215,12 @@ pub struct SettingsPage {
     pub focus: FocusHandle,
     /// What the main area showed when Settings opened.
     pub opened_over: Option<MainKey>,
-    /// Waits for the core to report a Save written (or failed), and gives up after a while.
-    pub saving: Option<(Subscription, Task<()>)>,
+    /// A Save the core has not answered yet. Its edits stay in the draft meanwhile.
+    pub saving: Option<Saving>,
+    /// Why the last Save did not go through, until the next edit, Save or Revert.
+    pub save_note: Option<String>,
+    /// The control the keyboard cursor stands on, once Tab moved it.
+    pub cursor: Option<Stop>,
 }
 
 impl SettingsPage {
@@ -154,6 +232,8 @@ impl SettingsPage {
             focus: cx.focus_handle(),
             opened_over: None,
             saving: None,
+            save_note: None,
+            cursor: None,
         }
     }
 
@@ -169,9 +249,12 @@ impl SettingsPage {
             appearance: appearance_name(shown.appearance),
             desktop_notifications: shown.desktop_notifications,
             watch_mode: watch_mode_name(shown.watch_mode),
-            changed_on_disk: self.draft.changed_on_disk(file),
+            changed_on_disk: banner_shown(self, file),
             invalid,
             can_save: self.saving.is_none() && can_save(&self.draft, invalid),
+            saving: self.saving.is_some(),
+            note: self.save_note.clone(),
+            cursor: self.cursor.map(Stop::id),
         }
     }
 }
@@ -179,6 +262,11 @@ impl SettingsPage {
 /// Save needs edits and a readable file.
 pub fn can_save(draft: &SettingsDraft, invalid: bool) -> bool {
     draft.is_dirty() && !invalid
+}
+
+/// Whether the "modified outside Settings" banner shows: not while a Save of ours is landing.
+pub fn banner_shown(page: &SettingsPage, file: &Settings) -> bool {
+    page.saving.is_none() && page.draft.changed_on_disk(file)
 }
 
 #[cfg(any(test, feature = "automation"))]
@@ -250,11 +338,21 @@ pub fn render_entry(page: &SettingsPage, theme: &Theme) -> impl IntoElement {
 /// The key that opens Settings: Cmd-, on macOS, Ctrl-, on Linux.
 pub const OPEN_SETTINGS_KEY: &str = "secondary-,";
 
+/// `control`, with the focus ring while the keyboard cursor stands on `stop`.
+fn ring(page: &SettingsPage, stop: Stop, theme: &Theme, control: impl IntoElement) -> Div {
+    let on = page.cursor == Some(stop);
+    div()
+        .rounded_md()
+        .border_2()
+        .border_color(if on { theme.ring } else { theme.background })
+        .child(control)
+}
+
 /// The Settings view, over `file` as the core last reported it.
 pub fn render(page: &SettingsPage, file: &Settings, invalid: bool, theme: &Theme) -> AnyElement {
     let draft = &page.draft;
     let shown = draft.shown(file);
-    let changed = draft.changed_on_disk(file);
+    let changed = banner_shown(page, file);
     v_flex()
         .id("settings-view")
         .key_context("SettingsView")
@@ -262,7 +360,7 @@ pub fn render(page: &SettingsPage, file: &Settings, invalid: bool, theme: &Theme
         .flex_1()
         .min_w_0()
         .h_full()
-        .child(header(theme))
+        .child(header(page, theme))
         .when(invalid, |el| {
             el.child(banner(
                 "settings-invalid",
@@ -276,19 +374,25 @@ pub fn render(page: &SettingsPage, file: &Settings, invalid: bool, theme: &Theme
             let buttons = h_flex()
                 .flex_none()
                 .gap_1()
-                .child(
+                .child(ring(
+                    page,
+                    Stop::Reload,
+                    theme,
                     Button::new("settings-reload")
                         .xsmall()
                         .label("Reload")
                         .on_click(registry::on_click(RevertSettings)),
-                )
-                .child(
+                ))
+                .child(ring(
+                    page,
+                    Stop::SaveAnyway,
+                    theme,
                     Button::new("settings-save-anyway")
                         .xsmall()
                         .label("Save anyway")
                         .disabled(invalid)
                         .on_click(registry::on_click(SaveSettings)),
-                );
+                ));
             el.child(banner(
                 "settings-changed-on-disk",
                 CHANGED_ON_DISK,
@@ -311,15 +415,15 @@ pub fn render(page: &SettingsPage, file: &Settings, invalid: bool, theme: &Theme
                         .overflow_y_scroll()
                         .p_4()
                         .gap_3()
-                        .child(section_body(page.section, &shown, draft, theme)),
+                        .child(section_body(page, &shown, theme)),
                 ),
         )
-        .child(footer(draft, invalid, page.saving.is_some(), theme))
+        .child(footer(page, invalid, theme))
         .test_support()
         .into_any_element()
 }
 
-fn header(theme: &Theme) -> impl IntoElement {
+fn header(page: &SettingsPage, theme: &Theme) -> impl IntoElement {
     super::theme::moves_window(
         h_flex()
             .id("settings-header")
@@ -331,14 +435,17 @@ fn header(theme: &Theme) -> impl IntoElement {
             .border_color(theme.border),
     )
     .child(div().flex_1().text_sm().font_semibold().child("Settings"))
-    .child(
+    .child(ring(
+        page,
+        Stop::Done,
+        theme,
         Button::new("settings-close")
             .xsmall()
             .ghost()
             .label("Done")
             .tooltip("Leave Settings. Unsaved edits stay until you save or revert them.")
             .on_click(registry::on_click(CloseSettings)),
-    )
+    ))
 }
 
 fn banner(
@@ -386,13 +493,19 @@ fn section_list(page: &SettingsPage, theme: &Theme) -> impl IntoElement {
                 .w_full()
                 .gap_1()
                 .child(
-                    Button::new(section.id())
-                        .xsmall()
-                        .ghost()
-                        .flex_1()
-                        .label(section.label())
-                        .selected(page.section == section)
-                        .on_click(registry::on_click(ShowSettingsSection { section })),
+                    ring(
+                        page,
+                        Stop::Section(section),
+                        theme,
+                        Button::new(section.id())
+                            .xsmall()
+                            .ghost()
+                            .w_full()
+                            .label(section.label())
+                            .selected(page.section == section)
+                            .on_click(registry::on_click(ShowSettingsSection { section })),
+                    )
+                    .flex_1(),
                 )
                 .when(edited, |el| {
                     el.child(super::theme::status_dot(theme.foreground, true).flex_none())
@@ -400,13 +513,9 @@ fn section_list(page: &SettingsPage, theme: &Theme) -> impl IntoElement {
         }))
 }
 
-fn section_body(
-    section: Section,
-    shown: &Settings,
-    draft: &SettingsDraft,
-    theme: &Theme,
-) -> AnyElement {
-    match section {
+fn section_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> AnyElement {
+    let draft = &page.draft;
+    match page.section {
         Section::Appearance => group(
             "Appearance",
             "Flint Light, Flint Dark, or whichever the system uses. View > Appearance changes it at \
@@ -417,16 +526,22 @@ fn section_body(
         .child(
             h_flex().gap_1().children(
                 [
-                    (Appearance::System, "System", "settings-appearance-system"),
-                    (Appearance::Light, "Light", "settings-appearance-light"),
-                    (Appearance::Dark, "Dark", "settings-appearance-dark"),
+                    (Appearance::System, "System"),
+                    (Appearance::Light, "Light"),
+                    (Appearance::Dark, "Dark"),
                 ]
-                .map(|(appearance, label, id)| {
-                    Button::new(id)
-                        .small()
-                        .label(label)
-                        .selected(shown.appearance == appearance)
-                        .on_click(registry::on_click(EditAppearance { appearance }))
+                .map(|(appearance, label)| {
+                    let stop = Stop::Appearance(appearance);
+                    ring(
+                        page,
+                        stop,
+                        theme,
+                        Button::new(stop.id())
+                            .small()
+                            .label(label)
+                            .selected(shown.appearance == appearance)
+                            .on_click(registry::on_click(EditAppearance { appearance })),
+                    )
                 }),
             ),
         )
@@ -439,12 +554,17 @@ fn section_body(
             theme,
         )
         .child(
-            Checkbox::new("settings-desktop-notifications")
-                .label("Desktop notifications")
-                .checked(shown.desktop_notifications)
-                .on_click(registry::on_click(EditDesktopNotifications {
-                    enabled: !shown.desktop_notifications,
-                })),
+            h_flex().child(ring(
+                page,
+                Stop::DesktopNotifications,
+                theme,
+                Checkbox::new(Stop::DesktopNotifications.id())
+                    .label("Desktop notifications")
+                    .checked(shown.desktop_notifications)
+                    .on_click(registry::on_click(EditDesktopNotifications {
+                        enabled: !shown.desktop_notifications,
+                    })),
+            )),
         )
         .into_any_element(),
         Section::Watching => group(
@@ -458,15 +578,21 @@ fn section_body(
         .child(
             h_flex().gap_1().children(
                 [
-                    (WatchMode::All, "All kinds", "settings-watch-all"),
-                    (WatchMode::OnView, "Open views only", "settings-watch-on-view"),
+                    (WatchMode::All, "All kinds"),
+                    (WatchMode::OnView, "Open views only"),
                 ]
-                .map(|(mode, label, id)| {
-                    Button::new(id)
-                        .small()
-                        .label(label)
-                        .selected(shown.watch_mode == mode)
-                        .on_click(registry::on_click(EditWatchMode { mode }))
+                .map(|(mode, label)| {
+                    let stop = Stop::WatchMode(mode);
+                    ring(
+                        page,
+                        stop,
+                        theme,
+                        Button::new(stop.id())
+                            .small()
+                            .label(label)
+                            .selected(shown.watch_mode == mode)
+                            .on_click(registry::on_click(EditWatchMode { mode })),
+                    )
                 }),
             ),
         )
@@ -500,14 +626,15 @@ fn group(title: &'static str, text: &'static str, edited: bool, theme: &Theme) -
         )
 }
 
-fn footer(draft: &SettingsDraft, invalid: bool, saving: bool, theme: &Theme) -> impl IntoElement {
+fn footer(page: &SettingsPage, invalid: bool, theme: &Theme) -> impl IntoElement {
+    let draft = &page.draft;
     let dirty = draft.is_dirty();
-    let note = if saving {
-        "Saving…"
-    } else if dirty {
-        "Unsaved changes"
-    } else {
-        "No unsaved changes"
+    let saving = page.saving.is_some();
+    let (note, color): (SharedString, Hsla) = match &page.save_note {
+        _ if saving => ("Saving…".into(), theme.muted_foreground),
+        Some(why) => (why.clone().into(), theme.danger),
+        None if dirty => ("Unsaved changes".into(), theme.muted_foreground),
+        None => ("No unsaved changes".into(), theme.muted_foreground),
     };
     h_flex()
         .id("settings-footer")
@@ -521,25 +648,32 @@ fn footer(draft: &SettingsDraft, invalid: bool, saving: bool, theme: &Theme) -> 
             div()
                 .id("settings-draft-note")
                 .flex_1()
+                .min_w_0()
                 .text_xs()
-                .text_color(theme.muted_foreground)
-                .aria_label(note)
+                .text_color(color)
+                .aria_label(note.clone())
                 .child(note)
                 .test_support(),
         )
-        .child(
+        .child(ring(
+            page,
+            Stop::Revert,
+            theme,
             Button::new("settings-revert")
                 .small()
                 .label("Revert")
-                .disabled(!dirty)
+                .disabled(saving || !dirty)
                 .on_click(registry::on_click(RevertSettings)),
-        )
-        .child(
+        ))
+        .child(ring(
+            page,
+            Stop::Save,
+            theme,
             Button::new("settings-save")
                 .small()
                 .primary()
                 .label("Save")
                 .disabled(saving || !can_save(draft, invalid))
                 .on_click(registry::on_click(SaveSettings)),
-        )
+        ))
 }

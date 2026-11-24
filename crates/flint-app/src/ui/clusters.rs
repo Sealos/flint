@@ -47,9 +47,6 @@ pub struct ClustersModel {
     /// The last error not tied to a cluster connection (for example a settings write). Cleared
     /// when the user issues the next command; if that one fails, its error replaces it.
     pub last_error: Option<String>,
-    /// How many errors the core has reported, so a caller can tell one that came after it sent
-    /// a command from one that was already shown.
-    pub(in crate::ui) errors_seen: u64,
     /// The latest discovery result per cluster, and why the last discovery failed, if it did:
     /// only for the cluster's current slot ([`ClusterSummary::generation`]).
     pub discovery: HashMap<ClusterId, Discovered>,
@@ -98,7 +95,6 @@ impl ClustersModel {
             trust_settled: 0,
             settings_error: None,
             last_error: None,
-            errors_seen: 0,
             discovery: HashMap::new(),
             ahead: HashMap::new(),
             agent_activity: Arc::default(),
@@ -198,7 +194,6 @@ impl ClustersModel {
             Event::Error(message) => {
                 tracing::warn!("{message}");
                 self.last_error = Some(message);
-                self.errors_seen += 1;
             }
         }
         cx.notify();

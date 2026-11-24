@@ -3,8 +3,9 @@
 //! The draft holds only the fields the user changed, each with its new value, over the file as
 //! the core last reported it. What the view shows is the file with the edits on top
 //! ([`SettingsDraft::shown`]), so without edits it simply follows the file. Save writes the
-//! edited fields alone ([`SettingsDraft::take`]), each through its own setter, so a change made
-//! elsewhere to another field survives. The draft also remembers the file it was started over:
+//! edited fields alone ([`SettingsDraft::edits`]), each through its own setter, so a change made
+//! elsewhere to another field survives; they leave the draft only once the core says they are
+//! written ([`SettingsDraft::saved`]). The draft also remembers the file it was started over:
 //! when the file changes under a pending draft ([`SettingsDraft::changed_on_disk`]), the view
 //! says so and offers Reload or Save anyway.
 //!
@@ -14,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use flint_core::settings::SettingsWrite;
 use flint_core::{Appearance, Settings, WatchMode};
 
 /// A setting the Settings view edits.
@@ -60,6 +62,15 @@ impl Change {
             Change::Appearance(a) => settings.appearance == a,
             Change::DesktopNotifications(on) => settings.desktop_notifications == on,
             Change::WatchMode(m) => settings.watch_mode == m,
+        }
+    }
+
+    /// The core's write for it.
+    pub fn to_write(self) -> SettingsWrite {
+        match self {
+            Change::Appearance(a) => SettingsWrite::Appearance(a),
+            Change::DesktopNotifications(on) => SettingsWrite::DesktopNotifications(on),
+            Change::WatchMode(m) => SettingsWrite::WatchMode(m),
         }
     }
 
@@ -135,11 +146,21 @@ impl SettingsDraft {
         self.base = None;
     }
 
-    /// The edits to write, emptying the draft (Save, Save anyway).
-    pub fn take(&mut self) -> Vec<Change> {
-        let changes = std::mem::take(&mut self.edits).into_values().collect();
-        self.base = None;
-        changes
+    /// The edits to write (Save, Save anyway), in a stable order.
+    pub fn edits(&self) -> Vec<Change> {
+        self.edits.values().copied().collect()
+    }
+
+    /// Drops `written`, now in the file, from the draft. An edit changed since is kept.
+    pub fn saved(&mut self, written: &[Change]) {
+        for change in written {
+            if self.edits.get(&change.field()) == Some(change) {
+                self.edits.remove(&change.field());
+            }
+        }
+        if self.edits.is_empty() {
+            self.base = None;
+        }
     }
 }
 
