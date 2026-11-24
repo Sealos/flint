@@ -5,6 +5,9 @@
 //! have. So this asks in every way AppKit offers, and reports what AppKit says afterwards, so a
 //! test that still sees no active window can say why.
 
+// module-tests: protocol.rs (the command parses there; AppKit's answers need a real GUI session,
+// so `window_close.rs` in flint-e2e exercises this)
+
 use objc2::runtime::{AnyObject, Bool};
 use objc2::{class, msg_send};
 use serde_json::{Value, json};
