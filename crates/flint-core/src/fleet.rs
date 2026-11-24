@@ -77,8 +77,12 @@ impl FleetPlan {
         object: FleetObject,
         members: Vec<AdmittedMember>,
     ) -> Result<Self, FleetPlanError> {
+        // A fleet plan names one object for every member, so it keeps the stricter DNS-1123 rule.
         validate_names(object.namespace.as_deref(), Some(&object.name))
             .map_err(|_| FleetPlanError::InvalidObject)?;
+        if !crate::api_path::is_dns1123_subdomain(&object.name) {
+            return Err(FleetPlanError::InvalidObject);
+        }
         if members.is_empty() {
             return Err(FleetPlanError::NoTargets);
         }

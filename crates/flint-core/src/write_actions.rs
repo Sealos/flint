@@ -1727,15 +1727,7 @@ mod tests {
     async fn a_patch_needs_plain_path_segments() {
         let (client, log) = fake(Arc::new(ok));
         let mut gated = writes(client, open());
-        let names = [
-            "web#x",
-            "web?dryRun=All",
-            "web/x",
-            "web%23",
-            "..",
-            "Web",
-            "",
-        ];
+        let names = ["web#x", "web?dryRun=All", "web/x", "web%23", "..", ""];
         let objects = names
             .iter()
             .map(|name| ActionObject {
