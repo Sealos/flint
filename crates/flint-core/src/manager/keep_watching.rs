@@ -21,7 +21,7 @@ use crate::ClusterId;
 use crate::cluster;
 use crate::connection::policy::{CredentialAccess, PluginRuns, Role};
 use crate::credential::CredentialSource;
-use crate::handle::Event;
+use crate::handle::{ConnectionState, Event};
 use crate::keep_watching::{
     BackgroundSignIn, KeepWatchView, KeepWatching, MAX_WATCHED_CLUSTERS, OfferTicket,
     PluginApproval, PluginConsent, PluginOffer, SignIn, ViewKey, WatchedCluster, sign_in_of,
@@ -63,6 +63,8 @@ struct LiveGrants {
     consents: HashMap<ClusterId, Arc<PluginConsent>>,
     /// Each running feed's access, by the attempt that made it.
     feeds: HashMap<ClusterId, (u64, CredentialAccess)>,
+    /// The access of each running-set member's latest connection made under consent.
+    members: HashMap<ClusterId, CredentialAccess>,
     /// How many times each cluster's grant was ended, so a save under way can't bring it back.
     revocations: HashMap<ClusterId, u64>,
 }
@@ -82,6 +84,9 @@ impl KeptGrants {
         if let Some((_, access)) = live.feeds.get(id) {
             access.revoke();
         }
+        if let Some(access) = live.members.get(id) {
+            access.revoke();
+        }
     }
 
     /// Ends every grant now. The future resolves once their plugins are gone, or after
@@ -92,6 +97,7 @@ impl KeptGrants {
             live.quitting = true;
             live.consents.values().for_each(|consent| consent.void());
             live.feeds.values().for_each(|(_, access)| access.revoke());
+            live.members.values().for_each(CredentialAccess::revoke);
         }
         let runs = self.0.runs.clone();
         async move {
@@ -128,6 +134,16 @@ impl KeptGrants {
             access.revoke();
         }
         live.feeds.insert(id.to_owned(), (attempt, access.clone()));
+    }
+
+    /// Holds a member connection's `access`, in place of the one before it, so that ending the
+    /// consent or quitting ends it too.
+    fn admit_member(&self, id: &str, access: &CredentialAccess) {
+        let mut live = self.live();
+        if live.quitting {
+            access.revoke();
+        }
+        live.members.insert(id.to_owned(), access.clone());
     }
 
     fn release(&self, id: &str, attempt: u64) {
@@ -391,6 +407,7 @@ impl ClusterManager {
     pub(super) fn sync_keep_watching(&mut self) {
         self.refresh_sign_ins();
         self.void_broken_consents();
+        self.end_unconsented_members();
         let running: Vec<ClusterId> = self.keep.feeds.keys().cloned().collect();
         for id in running {
             let slot = self.cluster(&id);
@@ -495,6 +512,65 @@ impl ClusterManager {
                 Err("its definition is no longer the one confirmed".to_owned())
             })
         })
+    }
+
+    /// `id`'s background sign-in consent, if it holds for the definition shown now. A pause does
+    /// not end it: a paused connection runs nothing anyway.
+    pub(super) fn member_consent(&self, id: &str) -> Option<Arc<PluginConsent>> {
+        let consent = self.keep.consents.get(id).filter(|c| !c.is_void())?;
+        match &*self.sign_in(id) {
+            SignIn::Plugin(definition) if consent.holds(definition) => Some(Arc::clone(consent)),
+            _ => None,
+        }
+    }
+
+    /// Access for a connection of running-set member `id` made in the background under
+    /// `consent`: the keep-watching rules, with the same launch check and plugin count as a
+    /// kept feed, and ended with that consent. It stays allowed while the member is selected.
+    pub(super) fn member_access(
+        &self,
+        id: &str,
+        attempt: u64,
+        consent: Arc<PluginConsent>,
+    ) -> CredentialAccess {
+        let failed = self.internal_tx.clone();
+        let cluster = id.to_owned();
+        let access = CredentialAccess::consented_member(
+            Arc::new(move || {
+                let _ = failed.send(Internal::MemberCredentialFailed {
+                    cluster: cluster.clone(),
+                    attempt,
+                });
+            }),
+            Some(self.launch_check(id, consent)),
+            self.keep.grants.0.runs.clone(),
+        );
+        self.keep.grants.admit_member(id, &access);
+        access
+    }
+
+    /// Ends the connections members made under a consent that no longer holds: turned off,
+    /// voided by a change, or gone with its entry.
+    fn end_unconsented_members(&mut self) {
+        let ended: Vec<ClusterId> = self
+            .clusters
+            .iter()
+            .filter(|slot| {
+                let id = &slot.info.name;
+                slot.access.unattended()
+                    && matches!(
+                        slot.state,
+                        ConnectionState::Connecting | ConnectionState::Connected(_)
+                    )
+                    && self.members.contains_key(id)
+                    && self.member_consent(id).is_none()
+            })
+            .map(|slot| slot.info.name.clone())
+            .collect();
+        let now = Instant::now();
+        for id in ended {
+            self.demote_member(&id, now);
+        }
     }
 
     fn start_kept(&mut self, id: &str) {

@@ -4,8 +4,9 @@
 //! [`Schedule`](crate::connection::schedule::Schedule) when a background attempt may start; this
 //! carries out their answers on the cluster slots. Every attempt runs on its own task
 //! and only its result comes back through the manager's loop, so a member that fails, hangs or
-//! needs a sign-in holds up no other. Credentials that run a program never run for a background
-//! member: it waits as signed out until it is selected.
+//! needs a sign-in holds up no other. Credentials that run a program run for a background member
+//! only under its keep-watching consent, by that feature's rules (ADR-0012); without one it waits
+//! as signed out until it is selected.
 //!
 //! Membership grants nothing on the write path: writes ask the per-cluster gate as before.
 
@@ -39,6 +40,14 @@ const SET_TICK: Duration = Duration::from_millis(250);
 const SIGN_IN_IN_FRONT: &str = "this cluster's sign-in runs a program; select it to connect";
 
 const CREDENTIAL_REFUSED: &str = "the server refused this cluster's sign-in; select it to retry";
+
+const CONSENT_SIGN_IN_FAILED: &str =
+    "this cluster's background sign-in stopped; select it to sign in";
+
+/// Why a member's connection made under consent ended.
+pub(super) fn consent_ended() -> SafeErrorText {
+    SafeErrorText::reduced(CONSENT_SIGN_IN_FAILED)
+}
 
 /// Backoff jitter from the standard library's per-instance random keys.
 #[derive(Default)]
@@ -348,8 +357,8 @@ impl ClusterManager {
             return;
         };
         let active = self.active.as_deref() == Some(id);
-        let denied =
-            (!active && self.runs_a_command(id)).then(|| SafeErrorText::reduced(SIGN_IN_IN_FRONT));
+        let denied = (!active && self.runs_a_command(id) && self.member_consent(id).is_none())
+            .then(|| SafeErrorText::reduced(SIGN_IN_IN_FRONT));
         let signed_out = denied.is_some();
         let (member, action) = Member::join(ServerIdentity::new(server), denied, None);
         self.members.insert(id.to_owned(), member);
@@ -640,7 +649,8 @@ impl ClusterManager {
     /// connection that is up ends as signed out. One still being made, or held by a member not
     /// yet live, is replaced by a queued attempt that the policy refuses. With no connection and
     /// a definition that can't be known yet, nothing can run, and the attempt after the pause
-    /// asks the policy.
+    /// asks the policy. A member with keep-watching consent keeps a connection made under it,
+    /// and has any other replaced by a queued attempt under it.
     pub(super) fn demote_member(&mut self, id: &str, now: Instant) {
         if !self.runs_a_command(id) {
             return;
@@ -650,12 +660,17 @@ impl ClusterManager {
         };
         let member_connecting = *member.state() == MemberState::Connecting;
         let unsettled = self.unsettled(id);
+        let consented = self.member_consent(id).is_some();
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
+        if consented && slot.access.unattended() {
+            return;
+        }
         // Whatever happens to the connection below, it never runs its command again.
         slot.access.revoke();
-        if !member_connecting && !matches!(slot.state, ConnectionState::Connecting) {
+        let replace = consented && slot.client.is_some();
+        if !replace && !member_connecting && !matches!(slot.state, ConnectionState::Connecting) {
             if slot.write_credential.is_some() || !unsettled {
                 let reason = SafeErrorText::reduced(SIGN_IN_IN_FRONT);
                 self.apply_member(id, MemberEvent::CredentialLost { reason }, now);
@@ -678,6 +693,37 @@ impl ClusterManager {
             state: ConnectionState::Disconnected,
         });
         self.apply_member(id, MemberEvent::ConnectionLost, now);
+    }
+
+    /// The credential of `id`'s connection made under consent failed or was refused. In the
+    /// background it waits for a sign-in, with no retry. Selected, it connects again in the
+    /// foreground, where a prompt is expected. A connection still being made answers through
+    /// its result.
+    pub(super) fn member_credential_failed(&mut self, id: &str, attempt: u64) {
+        let now = Instant::now();
+        let active = self.active.as_deref() == Some(id);
+        let Some(slot) = self.cluster_mut(id) else {
+            return;
+        };
+        if slot.attempt != attempt || !matches!(slot.state, ConnectionState::Connected(_)) {
+            return;
+        }
+        if !active {
+            let reason = consent_ended();
+            self.apply_member(id, MemberEvent::CredentialLost { reason }, now);
+            return;
+        }
+        slot.clear_connection();
+        // No attempt has id 0, so a discovery still running is ignored.
+        slot.attempt = 0;
+        slot.discovering = false;
+        slot.reconnect = true;
+        slot.state = ConnectionState::Disconnected;
+        self.emit(Event::ConnectionChanged {
+            cluster: id.to_owned(),
+            state: ConnectionState::Disconnected,
+        });
+        self.reconnect_active(id);
     }
 
     /// A pause voids an attempt in flight: its task ends, so a result from before the pause can

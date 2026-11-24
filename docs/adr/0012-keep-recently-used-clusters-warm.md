@@ -51,6 +51,12 @@ launch**.
 - **Read only.** The feed has its own connection with a read client and no write client. The slot's connection,
   write credential and write gate are unchanged, so a background cluster gains no write path. `flint mcp` does not
   read this setting.
+- **Members of a cluster set** ([ADR-0014](./0014-cluster-sets-and-combined-views.md)). The consent below also lets a
+  set member that is not selected connect its own slot under the same rules: no prompt, a null stdin, bound to the
+  whole definition, never saved, and no auth providers. That connection stays when the member is selected and when
+  it is left, so a switch does not sign it out. Its write client presents the token the plugin got in the
+  background, behind the unchanged write gate: the member stays read-only unless it is unlocked for the session or
+  trusted ([ADR-0015](./0015-clusters-are-protected-by-default.md)). Ending the consent ends that connection too.
 - **Consent for exec plugins.** A cluster whose credential is an exec plugin has a second, per-cluster toggle next to
   keep watching, which says it lets Flint run this cluster's sign-in command in the background and shows the command.
   It is off by default, and only a click on it turns it on. It is bound to the context's whole definition: the
