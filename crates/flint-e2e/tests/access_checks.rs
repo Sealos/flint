@@ -2,12 +2,16 @@
 //! that a check is never a write, and that a check that fails says nothing.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use flint_core::access::{Access, AccessCheck};
-use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event};
+use flint_core::events::Events;
+use flint_core::handle::{
+    ClustersSnapshot, Command, ConnectionState, CoreConfig, CoreHandle, Event,
+};
 use flint_core::settings::ClusterPin;
-use flint_core::{Settings, WatchMode};
+use flint_core::{Settings, SlotBinding, WatchMode};
 use flint_e2e::fake_api::{
     AccessPolicy, CONTEXT, FakeApiServer, Fault, Gvr, Verb, write_kubeconfigs,
 };
@@ -17,6 +21,9 @@ const WAIT: Duration = Duration::from_secs(30);
 struct Core {
     handle: CoreHandle,
     server: Option<String>,
+    events: Events,
+    /// The slot and definition the cluster list showed last, as a pane follows them.
+    shown: Mutex<Option<SlotBinding>>,
     kubeconfig: PathBuf,
     _dir: tempfile::TempDir,
 }
@@ -39,10 +46,12 @@ async fn connect(api: &FakeApiServer) -> Core {
     })
     .unwrap();
     let events = handle.events();
+    let shown = Mutex::new(None);
     handle.send(Command::Activate(CONTEXT.to_owned()));
     tokio::time::timeout(WAIT, async {
         loop {
             match events.recv().await.expect("core running") {
+                Event::ClustersChanged(list) => note_shown(&shown, &list),
                 Event::ConnectionChanged {
                     state: ConnectionState::Failed(e),
                     ..
@@ -61,6 +70,8 @@ async fn connect(api: &FakeApiServer) -> Core {
     Core {
         handle,
         server,
+        events,
+        shown,
         kubeconfig,
         _dir: dir,
     }
@@ -77,10 +88,26 @@ fn check(namespace: Option<&str>, resource: &str, verb: &str) -> AccessCheck {
     }
 }
 
+fn note_shown(shown: &Mutex<Option<SlotBinding>>, list: &ClustersSnapshot) {
+    let now = list.clusters.iter().find(|c| c.info.name == CONTEXT);
+    *shown.lock().unwrap() = now.map(|c| c.slot_binding());
+}
+
 impl Core {
+    /// The slot and definition shown now, from the cluster lists the core has sent so far.
+    async fn on(&self) -> Option<SlotBinding> {
+        while !self.events.is_empty() {
+            if let Event::ClustersChanged(list) = self.events.recv().await.expect("core running") {
+                note_shown(&self.shown, &list);
+            }
+        }
+        *self.shown.lock().unwrap()
+    }
+
     async fn ask(&self, check: AccessCheck) -> Access {
+        let on = self.on().await;
         self.handle
-            .check_access(CONTEXT, self.server.clone(), check)
+            .check_access(CONTEXT, self.server.clone(), on, check)
             .await
     }
 }
@@ -165,6 +192,7 @@ async fn a_check_the_gate_refuses_is_not_sent() {
         .check_access(
             CONTEXT,
             Some("https://moved.example.invalid".into()),
+            core.on().await,
             check(Some("demo"), "deployments", "update"),
         )
         .await;
@@ -317,7 +345,8 @@ async fn a_changed_member_credential_sends_no_check() {
         .find(|m| m.context() == CONTEXT)
         .unwrap();
     let row = core.handle.bound_to(member);
-    let asked = row.check_access(CONTEXT, core.server.clone(), update.clone());
+    let on = core.on().await;
+    let asked = row.check_access(CONTEXT, core.server.clone(), on, update.clone());
     assert_eq!(asked.await, Access::Allowed);
 
     let log = write_plugin_user(&api, &second, &core);
@@ -329,9 +358,14 @@ async fn a_changed_member_credential_sends_no_check() {
     assert!(launched > 0, "the replacement is what the context uses now");
 
     let other = check(Some("demo"), "deployments", "patch");
-    let answer = row.check_access(CONTEXT, core.server.clone(), other).await;
+    let on = core.on().await;
+    let answer = row
+        .check_access(CONTEXT, core.server.clone(), on, other)
+        .await;
     assert_eq!(answer, Access::Unknown);
-    let cached = row.check_access(CONTEXT, core.server.clone(), update).await;
+    let cached = row
+        .check_access(CONTEXT, core.server.clone(), on, update)
+        .await;
     assert_eq!(cached, Access::Unknown);
     assert_eq!(reviews(&api), sent);
     assert_eq!(launches(&log), launched);
@@ -346,9 +380,10 @@ async fn a_denial_from_a_replaced_connection_is_dropped() {
     let (fault, hold) = Fault::hold();
     api.inject(fault.verb(Verb::Other).times(1));
     let update = check(Some("demo"), "deployments", "update");
+    let on = core.on().await;
     let asked = tokio::spawn(
         core.handle
-            .check_access(CONTEXT, core.server.clone(), update),
+            .check_access(CONTEXT, core.server.clone(), on, update),
     );
     hold.reached().await;
 
@@ -357,4 +392,65 @@ async fn a_denial_from_a_replaced_connection_is_dropped() {
     core.handle.reload_kubeconfig().await.unwrap();
     hold.release();
     assert_eq!(asked.await.unwrap(), Access::Unknown);
+}
+
+/// Writes the kubeconfig `api` gives, with a token for its user: the same URL under another user.
+fn write_other_user(api: &FakeApiServer, path: &std::path::Path) {
+    let mut config = api.kubeconfig(Some("demo"));
+    for user in &mut config.auth_infos {
+        let auth = user.auth_info.get_or_insert_with(Default::default);
+        auth.token = Some("another-user".to_owned().into());
+    }
+    flint_e2e::fake_api::kubeconfig::write(path, &config).unwrap();
+}
+
+// covers #735: a pane's check bound to a connection since replaced by another user at the same
+// URL sends nothing, even once the core is connected as that user; a check bound to the
+// connection shown now still asks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_check_bound_to_a_replaced_user_sends_nothing() {
+    let api = FakeApiServer::start().await.unwrap();
+    let core = connect(&api).await;
+    let update = check(Some("demo"), "deployments", "update");
+    let old = core.on().await;
+    assert!(old.is_some());
+    let answer = core
+        .handle
+        .check_access(CONTEXT, core.server.clone(), old, update.clone())
+        .await;
+    assert_eq!(answer, Access::Allowed, "a matching binding asks");
+
+    write_other_user(&api, &core.kubeconfig);
+    core.handle.reload_kubeconfig().await.unwrap();
+    core.handle.send(Command::Activate(CONTEXT.to_owned()));
+    let delete = check(Some("demo"), "deployments", "delete");
+    assert_eq!(settled(&core, delete).await, Access::Allowed);
+    let now = core.on().await;
+    assert_ne!(now, old, "another user is another definition");
+    let before = reviews(&api);
+
+    let patch = check(Some("demo"), "deployments", "patch");
+    let stale = core
+        .handle
+        .check_access_all(
+            CONTEXT,
+            core.server.clone(),
+            old,
+            vec![patch.clone(), update.clone()],
+        )
+        .await;
+    assert!(stale.iter().all(|(_, access)| *access == Access::Unknown));
+    let unbound = core
+        .handle
+        .check_access(CONTEXT, core.server.clone(), None, patch.clone())
+        .await;
+    assert_eq!(unbound, Access::Unknown);
+    assert_eq!(reviews(&api), before, "nothing went out with the new user");
+
+    let answer = core
+        .handle
+        .check_access(CONTEXT, core.server.clone(), now, patch)
+        .await;
+    assert_eq!(answer, Access::Allowed);
+    assert_eq!(reviews(&api), before + 1);
 }

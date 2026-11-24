@@ -69,8 +69,8 @@ pub use exec::{
 };
 pub use handle::{
     ClusterSummary, ClustersSnapshot, Command, ConnectionProgress, ConnectionState, CoreConfig,
-    CoreHandle, Event, LogSession, LogUpdates, OverviewInterest, ReloadError, Subscription,
-    WatchTiming,
+    CoreHandle, Event, LogSession, LogUpdates, OverviewInterest, ReloadError, SlotBinding,
+    Subscription, WatchTiming,
 };
 pub use logs::{
     FilterSpec, Freshness, LineFormat, LineId, LineSelection, LineSource, LogFilter, LogLine,
