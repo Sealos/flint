@@ -19,12 +19,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ClusterId;
+use crate::api_path::validate_names;
 use crate::handle::{AdmittedMember, CoreHandle};
 use crate::read::KindId;
 use crate::write::{
     ResourceChange, WriteAction, WriteError, WriteIntent, WriteProposal, WriteTarget, WriteWarning,
 };
-use crate::write_actions::{is_namespace_name, is_object_name};
 
 /// What a fleet action does to the object on each cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,10 +77,8 @@ impl FleetPlan {
         object: FleetObject,
         members: Vec<AdmittedMember>,
     ) -> Result<Self, FleetPlanError> {
-        let namespace_ok = object.namespace.as_deref().is_none_or(is_namespace_name);
-        if !namespace_ok || !is_object_name(&object.name) {
-            return Err(FleetPlanError::InvalidObject);
-        }
+        validate_names(object.namespace.as_deref(), Some(&object.name))
+            .map_err(|_| FleetPlanError::InvalidObject)?;
         if members.is_empty() {
             return Err(FleetPlanError::NoTargets);
         }

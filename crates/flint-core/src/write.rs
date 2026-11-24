@@ -504,13 +504,12 @@ pub(crate) async fn read_live(
     target: &WriteTarget,
 ) -> Result<Value, WriteError> {
     let namespace = target.namespace.as_deref();
-    let object = tokio::time::timeout(
-        WRITE_TIMEOUT,
-        read::dynamic_api(client, kind, namespace).get(&target.name),
-    )
-    .await
-    .map_err(|_| timed_out())?
-    .map_err(write_error)?;
+    let api = read::dynamic_api(client, kind, namespace, Some(&target.name))
+        .map_err(write_actions::ActionError::from)?;
+    let object = tokio::time::timeout(WRITE_TIMEOUT, api.get(&target.name))
+        .await
+        .map_err(|_| timed_out())?
+        .map_err(write_error)?;
     let mut value = serde_json::to_value(&object)
         .map_err(|e| WriteError::Failed(format!("cannot read the object: {e}")))?;
     if value.get("apiVersion").is_none() {
@@ -656,7 +655,13 @@ async fn replace(
         dry_run,
         field_manager: Some(FIELD_MANAGER.to_owned()),
     };
-    let api = read::dynamic_api(client, kind, target.namespace.as_deref());
+    let api = read::dynamic_api(
+        client,
+        kind,
+        target.namespace.as_deref(),
+        Some(&target.name),
+    )
+    .map_err(write_actions::ActionError::from)?;
     tokio::time::timeout(WRITE_TIMEOUT, api.replace(&target.name, &params, &object))
         .await
         .map_err(|_| timed_out())?

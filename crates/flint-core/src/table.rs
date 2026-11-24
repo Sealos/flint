@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::api_error::{ApiError, ApiErrorKind};
+use crate::api_path::{self, PathError};
 use crate::cluster::{self, ClusterError};
 use crate::gitops;
 use crate::paging;
@@ -1038,9 +1039,13 @@ impl std::fmt::Display for FetchError {
 }
 
 /// The collection URL of a kind, across all namespaces (`None`) or in one.
-pub(crate) fn collection_path(kind: &KindInfo, namespace: Option<&str>) -> String {
+pub(crate) fn collection_path(
+    kind: &KindInfo,
+    namespace: Option<&str>,
+) -> Result<String, PathError> {
     let namespace = namespace.filter(|_| kind.namespaced);
-    DynamicObject::url_path(&kind.resource, namespace)
+    api_path::validate_resource_path(&kind.resource, namespace, None)?;
+    Ok(DynamicObject::url_path(&kind.resource, namespace))
 }
 
 /// Turns a kube request into a Table request: Table Accept header and `includeObject=Metadata`.
@@ -1138,7 +1143,7 @@ pub async fn list_table(
     kind: &KindInfo,
     query: &ListQuery,
 ) -> Result<TablePage, ClusterError> {
-    let path = collection_path(kind, query.namespace.as_deref());
+    let path = collection_path(kind, query.namespace.as_deref())?;
     let mut object = fetch_page(client, &path, &query.to_params())
         .await
         .map_err(|e| e.error)?;

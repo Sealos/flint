@@ -25,6 +25,7 @@ use tokio::sync::watch;
 use tokio::task::AbortHandle;
 
 use crate::api_error::{ApiError, ApiErrorKind};
+use crate::api_path;
 use crate::cluster::{ClusterError, SafeErrorText};
 
 /// How long a [`MetricsPoll`] from [`poll_pod_metrics`] or [`poll_node_metrics`] waits between
@@ -375,12 +376,10 @@ async fn fetch_pod_metrics_within(
 }
 
 async fn read_pod_metrics(client: &Client, namespace: Option<&str>) -> MetricsResult<PodMetrics> {
+    api_path::validate_names(namespace, None).map_err(|error| failed(&error.to_string()))?;
     let path = match namespace {
         None => format!("{API_PATH}/pods"),
-        Some(namespace) if is_dns_label(namespace) => {
-            format!("{API_PATH}/namespaces/{namespace}/pods")
-        }
-        Some(_) => return Err(failed("not a valid namespace name")),
+        Some(namespace) => format!("{API_PATH}/namespaces/{namespace}/pods"),
     };
     match list(client, path).await {
         Ok(items) => Ok(collect(items, WirePod::parse)),
@@ -481,16 +480,6 @@ async fn namespaced_not_found(client: &Client, err: &ListError) -> MetricsError 
 
 fn failed(text: &str) -> MetricsError {
     MetricsError::Failed(SafeErrorText::reduced(text))
-}
-
-/// Whether `name` is a valid namespace name, so it cannot change the request's path.
-fn is_dns_label(name: &str) -> bool {
-    (1..=63).contains(&name.len())
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        && !name.starts_with('-')
-        && !name.ends_with('-')
 }
 
 // ---------------------------------------------------------------------------------------------
