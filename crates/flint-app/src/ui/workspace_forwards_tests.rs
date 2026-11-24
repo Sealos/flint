@@ -4,16 +4,19 @@
 use flint_core::ObjectDetail;
 use flint_core::access::Access;
 use flint_core::port_forward::{FakeForward, ForwardRequest, ForwardTarget};
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::TestAppContextExt as _;
 use gpui_kit::{AppContext as _, Entity, TestAppContext};
 use serde_json::{Value, json};
 
+use crate::ui::closing::Quits;
 use crate::ui::detail::access::Gated;
 use crate::ui::port_forward_view::PortForwardsView;
 use crate::ui::registry::ActionError;
 use crate::ui::support_tests::{
     TestWorkspace, WAIT, alpha_and_beta, open_workspace, open_workspace_with,
 };
+use crate::ui::view_state::DialogState;
 
 async fn show_web(cx: &mut TestAppContext, t: &TestWorkspace) {
     t.open_pods(cx, &[("demo", "web", 0)]).await;
@@ -224,4 +227,148 @@ async fn stop_ends_one_forward(cx: &mut TestAppContext) {
         .unwrap();
     assert!(first_fake.is_stopped());
     assert!(!second_fake.is_stopped());
+}
+
+/// The panel open with `count` listening forwards, each with its fake.
+fn adopt(cx: &mut TestAppContext, view: &Entity<PortForwardsView>, count: u16) -> Vec<FakeForward> {
+    (0..count)
+        .map(|n| {
+            let (forward, fake) = FakeForward::new(request());
+            fake.listen(18090 + n);
+            view.update(cx, |v, cx| v.adopt_for_tests(forward, cx));
+            fake
+        })
+        .collect()
+}
+
+async fn shown_dialog(cx: &mut TestAppContext, t: &TestWorkspace) -> DialogState {
+    cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
+        .await;
+    let workspace = t.workspace.clone();
+    cx.update_window(t.window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| ws.view_state(window, cx).dialog)
+    })
+    .unwrap()
+    .expect("a dialog is open")
+}
+
+fn quits(cx: &mut TestAppContext) -> usize {
+    cx.update(|cx| cx.try_global::<Quits>().map_or(0, |q| q.0))
+}
+
+// covers UP-42 (#701): quitting with forwards running asks once, naming how many; Cancel keeps
+// them running, confirming quits.
+#[gpui_kit::test]
+async fn quitting_with_forwards_running_asks_first(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    show_web(cx, &t).await;
+    t.dispatch(cx, "detail::ForwardPort", Value::Null).unwrap();
+    let view = panel(cx, &t).unwrap();
+    let fakes = adopt(cx, &view, 2);
+
+    t.press_key_of(cx, "flint::Quit");
+    let asked = shown_dialog(cx, &t).await;
+    assert_eq!(asked.title, "Quit Flint?");
+    assert!(
+        asked.text.contains("stops 2 running port forwards"),
+        "{}",
+        asked.text
+    );
+    assert_eq!(asked.buttons, ["Quit", "Cancel"]);
+    assert_eq!(quits(cx), 0);
+
+    t.dispatch(cx, "ui::Cancel", Value::Null).unwrap();
+    cx.run_until_parked();
+    assert_eq!(quits(cx), 0, "Cancel keeps the app");
+    assert!(fakes.iter().all(|f| !f.is_stopped()), "and the forwards");
+
+    t.press_key_of(cx, "flint::Quit");
+    shown_dialog(cx, &t).await;
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    assert_eq!(quits(cx), 1);
+}
+
+// covers UP-42 (#701): once every forward has stopped, quitting asks nothing.
+#[gpui_kit::test]
+async fn quitting_with_no_forward_running_asks_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    show_web(cx, &t).await;
+    t.dispatch(cx, "detail::ForwardPort", Value::Null).unwrap();
+    let view = panel(cx, &t).unwrap();
+    let (forward, fake) = FakeForward::new(request());
+    fake.listen(18095);
+    let id = view.update(cx, |v, cx| v.adopt_for_tests(forward, cx));
+    t.dispatch(cx, "port_forward::StopPortForward", json!({"id": id}))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(fake.is_stopped());
+    t.press_key_of(cx, "flint::Quit");
+    assert_eq!(quits(cx), 1);
+    assert!(!t.has_dialog(cx));
+}
+
+// covers UP-42 (#701): an unapplied edit and a running forward share one question.
+#[gpui_kit::test]
+async fn an_edit_and_a_forward_share_one_question(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    show_web(cx, &t).await;
+    t.dispatch(cx, "detail::ForwardPort", Value::Null).unwrap();
+    let view = panel(cx, &t).unwrap();
+    let fakes = adopt(cx, &view, 1);
+    let detail = t.detail(cx).unwrap();
+    super::super::unapplied_tests::type_edit(cx, &t, &detail, "demo", "web");
+
+    t.press_key_of(cx, "flint::Quit");
+    let asked = shown_dialog(cx, &t).await;
+    assert_eq!(asked.title, "Quit Flint?");
+    assert!(
+        asked.text.contains("stops 1 running port forward."),
+        "{}",
+        asked.text
+    );
+    assert!(
+        asked.text.contains("1 unapplied YAML edit"),
+        "{}",
+        asked.text
+    );
+
+    t.dispatch(cx, "ui::Cancel", Value::Null).unwrap();
+    cx.run_until_parked();
+    assert_eq!(quits(cx), 0);
+    assert!(
+        super::super::unapplied_tests::has_edit(cx, &detail),
+        "the edit stays"
+    );
+    assert!(!fakes[0].is_stopped());
+
+    t.press_key_of(cx, "flint::Quit");
+    shown_dialog(cx, &t).await;
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    assert_eq!(quits(cx), 1, "one answer quits");
+}
+
+// covers UP-42 (#701): Close Window asks the same, and Cancel keeps the window.
+#[gpui_kit::test]
+async fn closing_the_window_with_a_forward_running_asks_first(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    show_web(cx, &t).await;
+    t.dispatch(cx, "detail::ForwardPort", Value::Null).unwrap();
+    let view = panel(cx, &t).unwrap();
+    adopt(cx, &view, 1);
+
+    t.press_key_of(cx, "flint::CloseWindow");
+    let asked = shown_dialog(cx, &t).await;
+    assert_eq!(asked.title, "Close the window?");
+    assert!(
+        asked.text.contains("stops 1 running port forward"),
+        "{}",
+        asked.text
+    );
+    t.dispatch(cx, "ui::Cancel", Value::Null).unwrap();
+    cx.run_until_parked();
+    assert!(cx.update_window(t.window, |_, _, _| ()).is_ok());
 }
