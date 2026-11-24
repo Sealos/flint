@@ -19,6 +19,7 @@ use super::telemetry::reads_token_file;
 use super::{ClusterManager, Internal};
 use crate::ClusterId;
 use crate::cluster;
+use crate::connection::member::MemberState;
 use crate::connection::policy::{CredentialAccess, PluginRuns, Role};
 use crate::credential::CredentialSource;
 use crate::handle::{ConnectionState, Event};
@@ -192,7 +193,7 @@ fn launch_verdict(config: &LaunchFiles, context: &str, consent: &PluginConsent) 
         return LaunchVerdict::Unconfirmed;
     }
     match &sign_in_of(&loaded.merged, context) {
-        SignIn::Plugin(definition) if consent.holds(definition) => LaunchVerdict::Same,
+        SignIn::Plugin(definition) if consent.verify(definition) => LaunchVerdict::Same,
         _ => LaunchVerdict::Changed,
     }
 }
@@ -403,10 +404,33 @@ impl ClusterManager {
             && self.active.as_deref() != Some(id)
             && self.keep_watching(id)
             && !self.wants_telemetry(id)
+            && !self.member_serves_keep(id)
+    }
+
+    /// Whether `id` is a member of the open set with background sign-in consent that is up or
+    /// still connecting. Its slot then connects under that consent and its feed serves keep
+    /// watching, so its plugin runs once. A member waiting for a sign-in makes no connection, and
+    /// leaving the set ends it: the kept feed takes over in both cases.
+    fn member_serves_keep(&self, id: &str) -> bool {
+        self.member_on_its_server(id)
+            && self.member_consent(id).is_some()
+            && self
+                .members
+                .get(id)
+                .is_some_and(|member| !matches!(member.state(), MemberState::SignInNeeded { .. }))
+    }
+
+    /// Member `id`'s connection made under consent in the background failed. Like a kept feed's
+    /// first failure, keep watching then waits for a sign-in, so no kept feed runs the plugin
+    /// again until the person acts.
+    pub(super) fn member_signed_out(&mut self, id: &str) {
+        if self.keep_watching(id) && self.member_consent(id).is_some() {
+            self.stop_kept(id);
+        }
     }
 
     /// Whether no change of the kubeconfig files is waiting to be read.
-    fn definitions_settled(&self) -> bool {
+    pub(super) fn definitions_settled(&self) -> bool {
         !self.change_queued() && !self.reader.busy(&self.kubeconfig_paths)
     }
 

@@ -1805,3 +1805,44 @@ async fn a_fleet_action_leaves_protected_members_out(cx: &mut TestAppContext) {
     assert_eq!(row.alpha_writes.load(Ordering::SeqCst), 0);
     assert_eq!(row.beta_writes.load(Ordering::SeqCst), 0);
 }
+
+// A set's row whose member the set reports paused offers no Shell: the row menu says why, and
+// the action's guard agrees. It comes back once the member runs again.
+#[gpui_kit::test]
+async fn a_paused_set_member_shows_shell_disabled_with_the_reason(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    connect(cx, &t, "kind-alpha");
+    connect(cx, &t, "kind-beta");
+    open_both(cx, &t).await;
+    select_row(cx, &t, "kind-beta");
+    let set_paused = |paused, cx: &mut TestAppContext| {
+        t.workspace.update(cx, |ws, cx| {
+            // Set directly: the row stays selected, as it does while an edit is unapplied.
+            ws.sets.running.as_mut().unwrap().reports = vec![MemberReport {
+                cluster: "kind-beta".into(),
+                status: MemberStatus::Live,
+                paused,
+            }];
+            cx.notify();
+        });
+    };
+    let shell = |cx: &mut TestAppContext| {
+        t.workspace.read_with(cx, |ws, cx| {
+            let menu = crate::ui::row_menu::row_actions(ws, cx).unwrap();
+            let guard = ws.sessions_blocked("kind-beta", cx);
+            (menu.shell, guard)
+        })
+    };
+    set_paused(true, cx);
+    let (menu, guard) = shell(cx);
+    let why = menu.unwrap_err();
+    assert!(why.contains("paused"), "{why}");
+    assert_eq!(guard.as_deref(), Some(why.as_str()));
+
+    set_paused(false, cx);
+    let (menu, guard) = shell(cx);
+    // The pod itself may not be fetched in this test; the pause is no longer the reason.
+    assert!(!menu.is_err_and(|why| why.contains("paused")));
+    assert_eq!(guard, None);
+}

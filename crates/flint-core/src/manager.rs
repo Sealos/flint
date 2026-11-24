@@ -1695,6 +1695,11 @@ impl ClusterManager {
                 if let Some(slot) = self.cluster_mut(&cluster) {
                     slot.update_scope();
                 }
+                // A background attempt under consent fails once, and keep watching with it. One
+                // ended by a file change is no failure: the reload decides.
+                if unattended && !connected && self.definitions_settled() {
+                    self.member_signed_out(&cluster);
+                }
                 if connected {
                     // Discovery runs at every connect; until it is back, a cached result (from an
                     // earlier connection) keeps the navigation and watches going.
