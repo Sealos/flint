@@ -420,8 +420,17 @@ impl ClusterManager {
                 .is_some_and(|member| !matches!(member.state(), MemberState::SignInNeeded { .. }))
     }
 
+    /// Member `id`'s connection made under consent in the background failed. Like a kept feed's
+    /// first failure, keep watching then waits for a sign-in, so no kept feed runs the plugin
+    /// again until the person acts.
+    pub(super) fn member_signed_out(&mut self, id: &str) {
+        if self.keep_watching(id) && self.member_consent(id).is_some() {
+            self.stop_kept(id);
+        }
+    }
+
     /// Whether no change of the kubeconfig files is waiting to be read.
-    fn definitions_settled(&self) -> bool {
+    pub(super) fn definitions_settled(&self) -> bool {
         !self.change_queued() && !self.reader.busy(&self.kubeconfig_paths)
     }
 

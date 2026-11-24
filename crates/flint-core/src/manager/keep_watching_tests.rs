@@ -326,6 +326,64 @@ async fn a_member_waiting_for_a_sign_in_leaves_keep_watching_to_the_kept_feed() 
     assert!(manager.keep.feeds.contains_key("dev"), "the kept feed runs");
 }
 
+// A consented member's credential failing in the background waits for a sign-in, and keep
+// watching with it: no kept feed runs the plugin again until the person acts.
+#[tokio::test]
+async fn a_members_failed_credential_stops_keep_watching_too() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    open_set(&mut manager);
+    land_dev(&mut manager).await;
+    let attempt = manager.cluster("dev").unwrap().attempt;
+
+    manager.member_credential_failed("dev", attempt);
+    manager.sync_keep_watching();
+
+    assert!(matches!(
+        dev_state(&manager),
+        MemberState::SignInNeeded { .. }
+    ));
+    assert_eq!(manager.keep_status("dev"), KeepWatching::SignInNeeded);
+    assert!(!manager.keep.feeds.contains_key("dev"), "no second run");
+
+    manager.set_running_set(Vec::new());
+    manager.sync_keep_watching();
+    assert!(!manager.keep.feeds.contains_key("dev"), "nor after leaving");
+}
+
+// The same for a background attempt under consent that fails to connect.
+#[tokio::test]
+async fn a_members_failed_attempt_stops_keep_watching_too() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    open_set(&mut manager);
+    let slot = manager.cluster_mut("dev").unwrap();
+    if let Some(task) = slot.connect_task.take() {
+        task.abort();
+    }
+    let attempt = slot.attempt;
+
+    manager
+        .handle_internal(Internal::Connected {
+            cluster: "dev".into(),
+            attempt,
+            result: Err(cluster::SafeErrorText::reduced("sign-in failed")),
+        })
+        .await;
+    manager.sync_keep_watching();
+
+    assert!(matches!(
+        dev_state(&manager),
+        MemberState::SignInNeeded { .. }
+    ));
+    assert_eq!(manager.keep_status("dev"), KeepWatching::SignInNeeded);
+    assert!(!manager.keep.feeds.contains_key("dev"), "no second run");
+}
+
 // When the member leaves the set, its connection ends and the kept feed takes over.
 #[tokio::test]
 async fn the_kept_feed_resumes_when_the_member_leaves_the_set() {
