@@ -1253,6 +1253,57 @@ pub fn save_count(
     }
 }
 
+/// The most a save hands to the file at once, and so holds formatted in memory.
+const SAVE_WRITE_BYTES: usize = 64 * 1024;
+
+/// Writes the lines [`save_text`] would return to `out`, and returns how many there were.
+pub fn write_saved(
+    out: impl std::io::Write,
+    lines: &LogLines,
+    scope: SaveScope,
+    matches: &[LineId],
+    selection: Option<LineSelection>,
+    format: LineFormat,
+) -> std::io::Result<usize> {
+    use std::io::Write as _;
+    let mut out = std::io::BufWriter::with_capacity(SAVE_WRITE_BYTES, out);
+    let count = for_each_saved(lines, scope, matches, selection, |line| {
+        out.write_all(line.display_as(format).as_bytes())?;
+        out.write_all(b"\n")
+    })?;
+    out.flush()?;
+    Ok(count)
+}
+
+/// Calls `visit` with each line of `scope`, stopping at its first error, and returns how many
+/// lines it took.
+fn for_each_saved(
+    lines: &LogLines,
+    scope: SaveScope,
+    matches: &[LineId],
+    selection: Option<LineSelection>,
+    mut visit: impl FnMut(&LogLine) -> std::io::Result<()>,
+) -> std::io::Result<usize> {
+    let mut count = 0;
+    let mut step = |line: &LogLine| {
+        visit(line)?;
+        count += 1;
+        Ok::<(), std::io::Error>(())
+    };
+    match (scope, selection) {
+        (SaveScope::All, _) => lines.iter().try_for_each(|(_, line)| step(line))?,
+        (SaveScope::Matches, _) => matches
+            .iter()
+            .filter_map(|id| lines.get(*id))
+            .try_for_each(&mut step)?,
+        (SaveScope::Selection, Some(selection)) => selection
+            .lines(lines)
+            .try_for_each(|(_, line)| step(line))?,
+        (SaveScope::Selection, None) => {}
+    }
+    Ok(count)
+}
+
 /// The lines to save, as shown with `format`, one per line and ending in a newline, and how
 /// many there are. Not redacted: the file holds what the tab showed.
 /// `None` when the scope has nothing (no search, no selection).
@@ -1264,20 +1315,12 @@ pub fn save_text(
     format: LineFormat,
 ) -> Option<(String, usize)> {
     let mut out = String::new();
-    let mut count = 0;
-    let mut push = |line: &LogLine| {
+    let count = for_each_saved(lines, scope, matches, selection, |line| {
         out.push_str(&line.display_as(format));
         out.push('\n');
-        count += 1;
-    };
-    match scope {
-        SaveScope::All => lines.iter().for_each(|(_, line)| push(line)),
-        SaveScope::Matches => matches
-            .iter()
-            .filter_map(|id| lines.get(*id))
-            .for_each(&mut push),
-        SaveScope::Selection => selection?.lines(lines).for_each(|(_, line)| push(line)),
-    }
+        Ok(())
+    })
+    .ok()?;
     (count > 0).then_some((out, count))
 }
 
@@ -2135,6 +2178,69 @@ mod tests {
                 "{scope:?}"
             );
         }
+    }
+
+    /// Keeps what it is given and the largest single write.
+    #[derive(Default)]
+    struct RecordingWriter {
+        written: Vec<u8>,
+        largest: usize,
+    }
+
+    impl std::io::Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.largest = self.largest.max(bytes.len());
+            self.written.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_save_reaches_the_file_in_small_writes() {
+        // As many lines as the fixture keeps, together several times the write size.
+        let long = "x".repeat(SAVE_WRITE_BYTES / 20);
+        let text: Vec<String> = (0..100)
+            .map(|i| format!("2024-05-01T12:00:00Z {i} {long}"))
+            .collect();
+        let text: Vec<&str> = text.iter().map(String::as_str).collect();
+        let shown = lines(&text);
+        let expected = save_text(&shown, SaveScope::All, &[], None, ts(false))
+            .unwrap()
+            .0;
+        let mut out = RecordingWriter::default();
+
+        let count = write_saved(&mut out, &shown, SaveScope::All, &[], None, ts(false)).unwrap();
+
+        assert_eq!(count, 100);
+        assert_eq!(out.written, expected.as_bytes());
+        assert!(
+            out.largest <= SAVE_WRITE_BYTES,
+            "one write of {} bytes out of {}",
+            out.largest,
+            expected.len()
+        );
+    }
+
+    #[test]
+    fn a_failed_write_is_reported() {
+        struct Full;
+        impl std::io::Write for Full {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk full"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("disk full"))
+            }
+        }
+        let shown = lines(&["2024-05-01T12:00:00Z only"]);
+
+        let error = write_saved(Full, &shown, SaveScope::All, &[], None, ts(false)).unwrap_err();
+
+        assert_eq!(error.to_string(), "disk full");
     }
 
     // covers UP-40, UP-42: a failed stream keeps its explanation when its lines are dropped.
