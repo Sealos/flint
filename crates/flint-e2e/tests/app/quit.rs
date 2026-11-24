@@ -6,6 +6,9 @@
 //!
 //! Close Window has its own test, in `window_close.rs`.
 //!
+//! With a port forward running, Quit asks first (#701): Cancel keeps the app and the forward,
+//! confirming quits.
+//!
 //! Not here (#263): **saving on quit**: a relaunch reads back a value that is also saved shortly
 //! after each change, so it does not show that quitting saved it.
 
@@ -13,7 +16,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use flint_e2e::app::{App, AppOptions};
-use serde_json::Value;
+use flint_e2e::fake_api::FakePod;
+use serde_json::{Value, json};
 
 use crate::support::*;
 
@@ -57,6 +61,55 @@ fn up_42_quit_ends_the_app_with_stdin_open() -> Result<()> {
     assert!(!socket.exists(), "the quit hooks ran");
 
     // The teardown checks, on the exit already observed.
+    app.quit()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "opens a window: needs a macOS GUI session"]
+fn up_42_quit_with_a_forward_running_asks_first() -> Result<()> {
+    let two = TwoClusters::start()?;
+    two.a.add_pod(FakePod::from_json(json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "web", "namespace": "demo", "uid": "uid-web", "resourceVersion": "5001",
+            "creationTimestamp": "2026-01-01T00:00:00Z", "labels": {},
+        },
+        "spec": {"containers": [{"name": "c", "image": "busybox:1.37.0",
+                                 "ports": [{"containerPort": 8080}]}]},
+        "status": {"phase": "Running"},
+    })));
+    let app = App::launch(AppOptions::new(two.kubeconfig()))?;
+    connect(&app, TwoClusters::A)?;
+    open_live(&app, "pods", 1)?;
+    select(&app, Some("demo"), "web")?;
+    app.dispatch("detail::ForwardPort", Value::Null)?;
+    wait_offered(&app, "port_forward::StartPortForward")?;
+    app.dispatch("port_forward::StartPortForward", Value::Null)?;
+
+    let text = open_dialog(&app, "flint::Quit")?;
+    assert!(
+        text.contains("stops 1 running port forward"),
+        "the question names the forward: {text}"
+    );
+    dismiss(&app, "escape")?;
+    assert_eq!(exit_code(app.pid())?, None, "Cancel keeps the app running");
+
+    app.dispatch("flint::Quit", Value::Null)?;
+    app.wait_for("/dialog/title", flint_e2e::app::Test::Exists(true))?;
+    app.dispatch("ui::Confirm", Value::Null).ok();
+    let deadline = Instant::now() + EXIT;
+    while exit_code(app.pid())?.is_none() {
+        if Instant::now() > deadline {
+            app.mark_failing();
+            bail!(
+                "the app was still running after Quit was confirmed. App log:\n{}",
+                app.log()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     app.quit()?;
     Ok(())
 }

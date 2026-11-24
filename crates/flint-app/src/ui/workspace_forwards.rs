@@ -33,6 +33,14 @@ impl Workspace {
         }
     }
 
+    /// How many forwards in this window have not ended: what closing it would stop.
+    pub fn running_forwards(&self, cx: &App) -> usize {
+        self.forward_views(cx)
+            .iter()
+            .map(|view| view.read(cx).running())
+            .sum()
+    }
+
     pub(super) fn any_forward_running(&self, cx: &App) -> bool {
         self.forward_views(cx)
             .iter()

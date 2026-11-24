@@ -20,8 +20,10 @@ impl ClusterManager {
 
     /// The target of a `helm` run on `id` at `pin`, in one step with every check: the set member
     /// it is bound to, a settled and unpaused context, a live connection built from exactly the
-    /// pinned definition, and no credential that runs a program. Protection is not asked: these
-    /// runs only read.
+    /// pinned definition, and no credential that runs a program unless it is an exec plugin with
+    /// background sign-in consent for exactly this definition (ADR-0012). That consent is asked
+    /// at every check, so turning it off or a change that voids it ends a run. Protection is not
+    /// asked: these runs only read.
     pub(super) fn helm_target(
         &self,
         id: &str,
@@ -68,6 +70,7 @@ impl ClusterManager {
             id,
             pin,
             credential,
+            self.member_consent(id),
             configured,
             runs_root(&self.config.config_dir),
         )

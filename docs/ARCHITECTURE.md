@@ -1214,6 +1214,24 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   override, and a `helm` binary override. From M5.5 also `warm_clusters`, `warm_memory_mib`,
   `log_analysis_clusters` (context, server URL, CLI, binary path, and whether to confirm each send), the log
   analysis line limit, and a `claude` binary override.
+- `[proxy]` in `settings.toml`: the proxy for cluster connections, since Flint started from Finder or the Dock does not
+  see `HTTPS_PROXY` / `NO_PROXY` from a shell profile.
+
+  ```toml
+  [proxy]
+  url = "http://user:password@proxy.example.com:3128"  # http:// only; credentials are optional
+  no_proxy = ["10.0.0.0/8", ".corp.example.com", "kind.local:6443"]
+  ```
+
+  A cluster entry's own `proxy-url` wins. Otherwise a set `url` replaces `HTTPS_PROXY` and `NO_PROXY` (only its own
+  `no_proxy` list exempts servers from it); a `no_proxy` list without a `url` replaces `NO_PROXY` alone. `no_proxy`
+  takes `NO_PROXY` entries: names, `.domain` or `*.domain` suffixes, IP addresses and CIDR ranges, each with an
+  optional `:port`, or `*`. It is read once at startup (`bootstrap`, in the app and `flint mcp`) and applies after a
+  restart, so every context loaded in a process is pinned to the route it connects through. A proxy that can't be
+  read, uses another scheme or is down is refused, never skipped. The URL is shown, logged and saved in grants only
+  as its address, with an opaque keyed digest of its account (`connection::proxy::route_identity`), so a changed
+  proxy or account voids trust, unlocks, AI exposure and keep watching like any other route change. `ProxySetting`'s
+  `Debug` hides the credentials too.
 - `state.toml`: window layout (the widths of the cluster column, navigation and detail pane, and the dock's height,
   which the user drags), cluster order and pins in the sidebar, the last view open in each cluster, and the namespace
   filter of each cluster, and each list's sort per cluster and kind (`[list_sorts.<cluster>]`, the column's key and
