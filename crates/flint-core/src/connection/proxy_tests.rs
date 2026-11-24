@@ -506,7 +506,7 @@ fn a_proxy_setting_never_shows_its_credentials() {
     assert!(!format!("{unreadable:?}").contains("s3cret"));
     // Its route identity tells the account apart without holding it.
     let identity = route_identity(ACCOUNT);
-    assert!(identity.starts_with("http://proxy:3128#"), "{identity}");
+    assert!(identity.starts_with("http://proxy:3128#"));
     assert!(!identity.contains("alice") && !identity.contains("s3cret"));
 }
 
