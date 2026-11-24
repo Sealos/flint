@@ -47,6 +47,8 @@ const PERCENT_RANGE: RangeInclusive<u32> = 1..=100;
 const COUNT_RANGE: RangeInclusive<u32> = 1..=10_000;
 /// One second to one day.
 const PENDING_SECONDS_RANGE: RangeInclusive<u32> = 1..=86_400;
+/// How long a pod stays Pending before it counts as a problem: five minutes.
+const DEFAULT_PENDING_POD_SECONDS: u32 = 300;
 
 /// Something the dashboard warns about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -104,7 +106,7 @@ impl ThresholdMetric {
             },
             Self::PendingPodSeconds => MetricSpec {
                 key: "pending_pod_seconds",
-                default: 60,
+                default: DEFAULT_PENDING_POD_SECONDS,
                 range: PENDING_SECONDS_RANGE,
             },
         }
