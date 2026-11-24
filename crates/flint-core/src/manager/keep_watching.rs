@@ -19,6 +19,7 @@ use super::telemetry::reads_token_file;
 use super::{ClusterManager, Internal};
 use crate::ClusterId;
 use crate::cluster;
+use crate::connection::member::MemberState;
 use crate::connection::policy::{CredentialAccess, PluginRuns, Role};
 use crate::credential::CredentialSource;
 use crate::handle::{ConnectionState, Event};
@@ -396,17 +397,63 @@ impl ClusterManager {
         self.keep_status(id) == KeepWatching::Watching
     }
 
-    /// Whether `id` needs a feed of its own: its slot has none and can't have one.
+    /// Whether `id` needs a feed of its own: its slot has none and can't have one, or it was just
+    /// selected and its warm feed is handed over.
     fn wants_kept_feed(&self, id: &str) -> bool {
+        self.kept_feed_allowed(id)
+            && (self.kept_feed_handed_over(id)
+                || (self.active.as_deref() != Some(id) && !self.wants_telemetry(id)))
+    }
+
+    /// Whether a kept feed may run for `id` at all.
+    fn kept_feed_allowed(&self, id: &str) -> bool {
         !self.keep.grants.quitting()
             && !self.disconnects.holds(id)
-            && self.active.as_deref() != Some(id)
             && self.keep_watching(id)
-            && !self.wants_telemetry(id)
+            && !self.member_serves_keep(id)
+    }
+
+    /// Whether `id` is selected and its kept feed, live on the slot and definition it was started
+    /// for, serves it in place of a feed on the slot. Selecting a watched cluster then lists
+    /// nothing again, and leaving it keeps the same feed running. A connection still being made
+    /// is not handed over, and a changed definition or ended consent drops the feed, so the slot
+    /// starts one of its own. The feed has only a read client: writes still go through the slot.
+    pub(super) fn kept_feed_handed_over(&self, id: &str) -> bool {
+        if self.active.as_deref() != Some(id) || !self.kept_feed_allowed(id) {
+            return false;
+        }
+        let slot = self.cluster(id);
+        let fingerprint = slot.and_then(|slot| slot.fingerprint);
+        let generation = slot.map(|slot| slot.generation);
+        self.keep.feeds.get(id).is_some_and(|kept| {
+            kept.feed.is_some() && kept.fingerprint == fingerprint && kept.generation == generation
+        })
+    }
+
+    /// Whether `id` is a member of the open set with background sign-in consent that is up or
+    /// still connecting. Its slot then connects under that consent and its feed serves keep
+    /// watching, so its plugin runs once. A member waiting for a sign-in makes no connection, and
+    /// leaving the set ends it: the kept feed takes over in both cases.
+    fn member_serves_keep(&self, id: &str) -> bool {
+        self.member_on_its_server(id)
+            && self.member_consent(id).is_some()
+            && self
+                .members
+                .get(id)
+                .is_some_and(|member| !matches!(member.state(), MemberState::SignInNeeded { .. }))
+    }
+
+    /// Member `id`'s connection made under consent in the background failed. Like a kept feed's
+    /// first failure, keep watching then waits for a sign-in, so no kept feed runs the plugin
+    /// again until the person acts.
+    pub(super) fn member_signed_out(&mut self, id: &str) {
+        if self.keep_watching(id) && self.member_consent(id).is_some() {
+            self.stop_kept(id);
+        }
     }
 
     /// Whether no change of the kubeconfig files is waiting to be read.
-    fn definitions_settled(&self) -> bool {
+    pub(super) fn definitions_settled(&self) -> bool {
         !self.change_queued() && !self.reader.busy(&self.kubeconfig_paths)
     }
 
