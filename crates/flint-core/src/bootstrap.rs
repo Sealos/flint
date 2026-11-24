@@ -109,7 +109,8 @@ pub fn log_filter(flint_log: Option<&str>, rust_log: Option<&str>, verbose: bool
         .unwrap_or_else(|| EnvFilter::new(if verbose { "info" } else { "warn" }))
 }
 
-/// Loads settings, resolves and installs `PATH`, and computes the kubeconfig files.
+/// Loads settings, resolves and installs `PATH` and the proxy setting, and computes the
+/// kubeconfig files.
 ///
 /// # Safety
 ///
@@ -120,6 +121,8 @@ pub unsafe fn bootstrap() -> Result<Bootstrap, SettingsError> {
     crate::connection::proxy::use_route_key_in(&config_dir);
     // An unreadable file opens nothing up (`Settings::unreadable_fallback`).
     let (settings, settings_error) = settings::load_settings_or_fallback(&config_dir);
+    // Before any kubeconfig loads, so every context is pinned to the route it connects through.
+    settings.proxy.use_for_this_process();
     // SAFETY: forwarded to the caller.
     let path = unsafe { env_path::apply_process_path(settings.path.as_deref()) };
     Ok(Bootstrap {
