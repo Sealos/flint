@@ -76,6 +76,7 @@ fn snapshot_judging(
         metrics: Default::default(),
         capacity: None,
         inventory: Default::default(),
+        rollouts: Default::default(),
         version: Default::default(),
     }
 }

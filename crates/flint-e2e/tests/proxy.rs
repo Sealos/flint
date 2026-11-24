@@ -319,3 +319,164 @@ async fn a_client_through_a_proxy_keeps_the_read_only_rule() {
 
     assert_eq!(arrivals(&api), before, "the write reached the server");
 }
+
+/// Set for the child processes of the proxy setting tests: the setting is used once per process.
+const SETTING_CHILD: &str = "FLINT_TEST_PROXY_SETTING_CHILD";
+
+/// Runs the test `child` in a child process whose environment names a proxy where nothing
+/// listens, so a connection that reaches the server did not use it.
+fn run_setting_child(child: &str) {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([child, "--exact", "--nocapture"])
+        .env(SETTING_CHILD, "1")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env_remove("https_proxy")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .env("KUBECONFIG", "/dev/null")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// Writes `proxy` as the `[proxy]` of a settings.toml in `dir`, loads it as Flint does at
+/// startup, and uses it for this process.
+fn use_proxy_setting(dir: &std::path::Path, proxy: &str) -> flint_core::settings::Settings {
+    std::fs::write(dir.join("settings.toml"), format!("[proxy]\n{proxy}")).unwrap();
+    let settings = flint_core::settings::load_settings(dir).unwrap();
+    settings.proxy.use_for_this_process();
+    settings
+}
+
+// covers UP-125: the settings proxy, with credentials, is used and never shown.
+#[test]
+fn a_cluster_is_read_through_the_settings_proxy() {
+    run_setting_child("settings_proxy_child");
+}
+
+#[tokio::test]
+async fn settings_proxy_child() {
+    if std::env::var_os(SETTING_CHILD).is_none() {
+        return;
+    }
+    let api = FakeApiServer::start().await.unwrap();
+    let (proxy, seen) = fake_proxy(api.addr()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let settings = use_proxy_setting(
+        dir.path(),
+        &format!("url = \"http://user:pa%40ss@{proxy}\"\nno_proxy = [\"other.test\"]\n"),
+    );
+    assert!(!format!("{settings:?}").contains("pa%40ss"));
+
+    let kubeconfig = api.kubeconfig(None);
+    let context = kubeconfig.contexts[0].name.clone();
+    let client = cluster::connect(&kubeconfig, &context).await.unwrap();
+    cluster::server_version(&client).await.unwrap();
+
+    assert!(arrivals(&api) > 0, "the request reached the server");
+    {
+        let seen = seen.lock().unwrap();
+        let head = &seen.heads[0];
+        assert!(
+            head.starts_with(&format!("CONNECT {} HTTP/1.1", api.addr())),
+            "{head}"
+        );
+        // base64 of `user:pa@ss`.
+        assert!(head.contains("dXNlcjpwYUBzcw=="), "{head}");
+        assert_eq!(seen.first_bytes[0], 0x16, "TLS runs inside the tunnel");
+    }
+
+    // The context is pinned to the setting's route, by its address and an opaque digest.
+    let path = dir.path().join("kubeconfig");
+    api.write_kubeconfig(&path, None).unwrap();
+    let loaded = flint_core::kubeconfig::load(&[path]);
+    let route = loaded.contexts[0].proxy_url.clone().unwrap();
+    assert!(route.starts_with(&format!("http://{proxy}#")), "{route}");
+    assert!(
+        !route.contains("pa%40ss") && !route.contains("user"),
+        "{route}"
+    );
+}
+
+// covers UP-125: a cluster's own proxy-url wins over the settings proxy.
+#[test]
+fn a_cluster_proxy_url_wins_over_the_settings_proxy() {
+    run_setting_child("cluster_proxy_wins_child");
+}
+
+#[tokio::test]
+async fn cluster_proxy_wins_child() {
+    if std::env::var_os(SETTING_CHILD).is_none() {
+        return;
+    }
+    let api = FakeApiServer::start().await.unwrap();
+    let (setting_proxy, setting_seen) = fake_proxy(api.addr()).await;
+    let (cluster_proxy, cluster_seen) = fake_proxy(api.addr()).await;
+    let dir = tempfile::tempdir().unwrap();
+    use_proxy_setting(dir.path(), &format!("url = \"http://{setting_proxy}\"\n"));
+
+    let (kubeconfig, context) = through(api.kubeconfig(None), &format!("http://{cluster_proxy}"));
+    let client = cluster::connect(&kubeconfig, &context).await.unwrap();
+    cluster::server_version(&client).await.unwrap();
+
+    assert!(!cluster_seen.lock().unwrap().heads.is_empty());
+    assert!(setting_seen.lock().unwrap().heads.is_empty());
+}
+
+// covers UP-125: the setting's no-proxy list reaches a server directly.
+#[test]
+fn the_settings_no_proxy_list_reaches_a_server_directly() {
+    run_setting_child("settings_no_proxy_child");
+}
+
+#[tokio::test]
+async fn settings_no_proxy_child() {
+    if std::env::var_os(SETTING_CHILD).is_none() {
+        return;
+    }
+    let api = FakeApiServer::start().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    use_proxy_setting(
+        dir.path(),
+        "url = \"http://127.0.0.1:9\"\nno_proxy = [\"127.0.0.0/8\"]\n",
+    );
+
+    let kubeconfig = api.kubeconfig(None);
+    let context = kubeconfig.contexts[0].name.clone();
+    let client = cluster::connect(&kubeconfig, &context).await.unwrap();
+    cluster::server_version(&client).await.unwrap();
+    assert!(arrivals(&api) > 0);
+}
+
+// covers UP-125: a settings proxy that is down is no reason to connect directly.
+#[test]
+fn a_settings_proxy_that_is_down_does_not_fall_back() {
+    run_setting_child("settings_proxy_down_child");
+}
+
+#[tokio::test]
+async fn settings_proxy_down_child() {
+    if std::env::var_os(SETTING_CHILD).is_none() {
+        return;
+    }
+    let api = FakeApiServer::start().await.unwrap();
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let dir = tempfile::tempdir().unwrap();
+    use_proxy_setting(
+        dir.path(),
+        &format!("url = \"http://user:proxy-secret@127.0.0.1:{port}\"\n"),
+    );
+
+    let kubeconfig = api.kubeconfig(None);
+    let context = kubeconfig.contexts[0].name.clone();
+    let error = match cluster::connect(&kubeconfig, &context).await {
+        Ok(client) => cluster::server_version(&client).await.unwrap_err(),
+        Err(e) => e,
+    };
+    assert_eq!(arrivals(&api), 0, "it connected directly");
+    let text = error.to_string();
+    assert!(text.contains("could not reach the proxy"), "{text}");
+    assert!(!text.contains("proxy-secret"), "{text}");
+}

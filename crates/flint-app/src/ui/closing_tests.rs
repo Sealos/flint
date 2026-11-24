@@ -6,7 +6,7 @@ use gpui_kit::test::TestAppContextExt as _;
 use gpui_kit::{AppContext as _, TestAppContext, VisualTestContext};
 use serde_json::Value;
 
-use super::closing::{Ending, Quits, dialog};
+use super::closing::{Ending, Losses, Quits, dialog};
 use super::dock_model::LiveSessions;
 use super::support_tests::{TestWorkspace, WAIT, open_fake_shell_in, open_workspace};
 use super::view_state::DialogState;
@@ -417,7 +417,10 @@ async fn the_close_button_closes_an_idle_window_at_once(cx: &mut TestAppContext)
 // The confirmation names how many sessions end, and of which kinds.
 #[test]
 fn the_dialog_names_the_sessions_that_end() {
-    let live = |shells, logs| LiveSessions { shells, logs };
+    let live = |shells, logs| Losses {
+        live: LiveSessions { shells, logs },
+        ..Losses::default()
+    };
     let window = dialog(Ending::Window, live(1, 2));
     assert_eq!(window.title, "Close the window?");
     assert_eq!(
@@ -441,6 +444,35 @@ fn the_dialog_names_the_sessions_that_end() {
     assert!(
         window.default_cancel && app.default_cancel,
         "Enter cancels both"
+    );
+}
+
+// The confirmation counts port forwards, in the singular and the plural, and joins sessions and
+// an unapplied edit in one text.
+#[test]
+fn the_dialog_names_the_forwards_that_stop() {
+    let losses = |forwards, shells, edits| Losses {
+        live: LiveSessions { shells, logs: 0 },
+        forwards,
+        edits,
+    };
+    assert_eq!(
+        dialog(Ending::App, losses(1, 0, 0)).text,
+        "Quitting stops 1 running port forward."
+    );
+    assert_eq!(
+        dialog(Ending::Window, losses(3, 0, 0)).text,
+        "Closing the window stops 3 running port forwards."
+    );
+    assert_eq!(
+        dialog(Ending::App, losses(2, 1, 0)).text,
+        "Quitting ends 1 session still running in the dock: 1 shell, and stops 2 running port \
+         forwards. Its output is not kept."
+    );
+    assert_eq!(
+        dialog(Ending::App, losses(1, 0, 1)).text,
+        "Quitting stops 1 running port forward. It also discards 1 unapplied YAML edit, which \
+         cannot be undone."
     );
 }
 
