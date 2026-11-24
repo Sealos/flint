@@ -967,7 +967,7 @@ impl Workspace {
 
     /// Tells the detail pane whether sessions can open on its object's cluster, so its Logs and
     /// Shell are disabled, saying why, while the cluster is not connected.
-    fn tell_detail_sessions_blocked(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn tell_detail_sessions_blocked(&mut self, cx: &mut Context<Self>) {
         let Some(detail) = self.detail.clone() else {
             return;
         };
