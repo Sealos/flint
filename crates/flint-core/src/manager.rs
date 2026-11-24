@@ -1466,7 +1466,10 @@ impl ClusterManager {
                     crate::redact::safe_error_summary(&e)
                 );
                 let kept = (*self.settings).clone().unreadable_fallback();
-                (kept, Some(e))
+                (
+                    kept,
+                    Some(crate::connection::proxy::settings_error_with_proxy_note(e)),
+                )
             }
         };
         if *self.settings == settings && self.settings_error == error {

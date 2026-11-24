@@ -89,6 +89,10 @@ pub enum HelmError {
          Flint run its sign-in command in the background."
     )]
     CredentialRunsCommand,
+    #[error("Helm can't use this cluster's SOCKS proxy yet, so it did not run.")]
+    SocksProxy,
+    #[error("This cluster's proxy can't be used, so Helm did not run.")]
+    ProxyRefused,
     #[error(
         "Helm is not available for clusters that sign in with an auth provider, or with a command \
          beside another credential."
@@ -406,6 +410,11 @@ impl HelmTarget {
             server,
             environment,
         ) {
+            // Only a proxy Flint itself would connect through, and never a SOCKS one.
+            let target = proxy::ProxyTarget::parse(chosen).map_err(|_| HelmError::ProxyRefused)?;
+            if target.is_socks() {
+                return Err(HelmError::SocksProxy);
+            }
             proxy.push(("HTTPS_PROXY", chosen.to_owned()));
         }
         if let Some(no_proxy) = &environment.no_proxy {

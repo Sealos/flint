@@ -334,7 +334,8 @@ pub const LOG_TOTAL_MIB_RANGE: std::ops::RangeInclusive<u32> = 64..=16_384;
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProxySetting {
-    /// The proxy URL, `http://host:port` or `http://user:password@host:port`. Set, it replaces
+    /// The proxy URL, `http://host:port`, `socks5://host:port` or `socks5h://host:port`, each
+    /// with an optional `user:password@`. Set, it replaces
     /// `HTTPS_PROXY` and `NO_PROXY` from the environment.
     pub url: Option<String>,
     /// Servers reached without the proxy, as `NO_PROXY` lists them: host names, domains

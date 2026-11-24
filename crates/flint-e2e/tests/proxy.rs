@@ -1,4 +1,4 @@
-//! Connections through a local fake `CONNECT` proxy, to the fake API server only.
+//! Connections through local fake `CONNECT` and SOCKS5 proxies, to the fake API server only.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -180,7 +180,7 @@ async fn a_proxy_that_refuses_says_so_and_sends_nothing() {
 async fn an_unsupported_scheme_is_refused_and_sends_nothing() {
     let api = FakeApiServer::start().await.unwrap();
     for url in [
-        "socks5://user:proxy-secret@127.0.0.1:1080",
+        "socks4://user:proxy-secret@127.0.0.1:1080",
         "https://user:proxy-secret@127.0.0.1:3128",
     ] {
         let (kubeconfig, context) = through(api.kubeconfig(None), url);
@@ -479,4 +479,316 @@ async fn settings_proxy_down_child() {
     let text = error.to_string();
     assert!(text.contains("could not reach the proxy"), "{text}");
     assert!(!text.contains("proxy-secret"), "{text}");
+}
+
+/// What the fake SOCKS5 proxy saw.
+#[derive(Default)]
+struct SocksSeen {
+    /// Each user name and password the client signed in with.
+    accounts: Vec<(String, String)>,
+    /// Each request's destination: its address type (1 IPv4, 3 a name, 4 IPv6), host and port.
+    destinations: Vec<(u8, String, u16)>,
+    /// The first byte the client sent inside each tunnel.
+    first_bytes: Vec<u8>,
+}
+
+/// A SOCKS5 proxy tunnelling to `upstream`, wherever the client asked to go. With `account`, it
+/// takes only that user name and password.
+async fn fake_socks(
+    upstream: SocketAddr,
+    account: Option<(&'static str, &'static str)>,
+) -> (String, Arc<Mutex<SocksSeen>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(SocksSeen::default()));
+    let log = Arc::clone(&seen);
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let log = Arc::clone(&log);
+            tokio::spawn(async move {
+                let _ = socks_tunnel(client, upstream, account, log).await;
+            });
+        }
+    });
+    (format!("{}:{}", addr.ip(), addr.port()), seen)
+}
+
+/// Reads a length-prefixed field of a SOCKS5 sign-in.
+async fn read_field(client: &mut TcpStream) -> std::io::Result<String> {
+    let mut len = [0u8; 1];
+    client.read_exact(&mut len).await?;
+    let mut field = vec![0u8; usize::from(len[0])];
+    client.read_exact(&mut field).await?;
+    Ok(String::from_utf8_lossy(&field).into_owned())
+}
+
+async fn socks_tunnel(
+    mut client: TcpStream,
+    upstream: SocketAddr,
+    account: Option<(&'static str, &'static str)>,
+    seen: Arc<Mutex<SocksSeen>>,
+) -> std::io::Result<()> {
+    let mut greeting = [0u8; 2];
+    client.read_exact(&mut greeting).await?;
+    let mut methods = vec![0u8; usize::from(greeting[1])];
+    client.read_exact(&mut methods).await?;
+    match account {
+        Some((user, password)) => {
+            if !methods.contains(&2) {
+                return client.write_all(&[5, 0xff]).await;
+            }
+            client.write_all(&[5, 2]).await?;
+            let mut version = [0u8; 1];
+            client.read_exact(&mut version).await?;
+            let given = (
+                read_field(&mut client).await?,
+                read_field(&mut client).await?,
+            );
+            let accepted = given.0 == user && given.1 == password;
+            seen.lock().unwrap().accounts.push(given);
+            client.write_all(&[1, u8::from(!accepted)]).await?;
+            if !accepted {
+                return Ok(());
+            }
+        }
+        None => client.write_all(&[5, 0]).await?,
+    }
+    let mut request = [0u8; 4];
+    client.read_exact(&mut request).await?;
+    let host = match request[3] {
+        1 => {
+            let mut ip = [0u8; 4];
+            client.read_exact(&mut ip).await?;
+            std::net::Ipv4Addr::from(ip).to_string()
+        }
+        3 => read_field(&mut client).await?,
+        4 => {
+            let mut ip = [0u8; 16];
+            client.read_exact(&mut ip).await?;
+            std::net::Ipv6Addr::from(ip).to_string()
+        }
+        _ => return Ok(()),
+    };
+    let mut port = [0u8; 2];
+    client.read_exact(&mut port).await?;
+    seen.lock()
+        .unwrap()
+        .destinations
+        .push((request[3], host, u16::from_be_bytes(port)));
+    let mut server = TcpStream::connect(upstream).await?;
+    client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+    let mut byte = [0u8; 1];
+    client.read_exact(&mut byte).await?;
+    seen.lock().unwrap().first_bytes.push(byte[0]);
+    server.write_all(&byte).await?;
+    tokio::io::copy_bidirectional(&mut client, &mut server).await?;
+    Ok(())
+}
+
+/// `kubeconfig` with its server addressed as `localhost`, which its certificate names.
+fn by_name(mut kubeconfig: Kubeconfig, api: &FakeApiServer) -> Kubeconfig {
+    kubeconfig.clusters[0].cluster.as_mut().unwrap().server =
+        Some(format!("https://localhost:{}", api.addr().port()));
+    kubeconfig
+}
+
+// covers UP-125: socks5h hands the server's name to the proxy, with the URL's account.
+#[tokio::test]
+async fn a_cluster_is_read_through_a_socks5h_proxy_that_resolves_its_name() {
+    let api = FakeApiServer::start().await.unwrap();
+    let (proxy, seen) = fake_socks(api.addr(), Some(("alice", "pa@ss"))).await;
+    let url = format!("socks5h://alice:pa%40ss@{proxy}");
+    let (kubeconfig, context) = through(by_name(api.kubeconfig(None), &api), &url);
+
+    let client = cluster::connect(&kubeconfig, &context).await.unwrap();
+    cluster::server_version(&client).await.unwrap();
+
+    assert!(arrivals(&api) > 0, "the request reached the server");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.accounts[0], ("alice".to_owned(), "pa@ss".to_owned()));
+    let port = api.addr().port();
+    assert_eq!(seen.destinations[0], (3, "localhost".to_owned(), port));
+    // 0x16 opens a TLS handshake: the proxy carries TLS, not the request.
+    assert_eq!(seen.first_bytes[0], 0x16);
+}
+
+// covers UP-125: socks5 resolves the server's name here and hands the proxy an address.
+#[tokio::test]
+async fn a_socks5_proxy_is_given_an_address_resolved_here() {
+    let api = FakeApiServer::start().await.unwrap();
+    let (proxy, seen) = fake_socks(api.addr(), None).await;
+    let url = format!("socks5://{proxy}");
+    let (kubeconfig, context) = through(by_name(api.kubeconfig(None), &api), &url);
+
+    let client = cluster::connect(&kubeconfig, &context).await.unwrap();
+    cluster::server_version(&client).await.unwrap();
+
+    let seen = seen.lock().unwrap();
+    let (kind, host, port) = &seen.destinations[0];
+    assert!(
+        *kind == 1 || *kind == 4,
+        "the name went to the proxy: {host}"
+    );
+    assert!(host == "127.0.0.1" || host == "::1", "{host}");
+    assert_eq!(*port, api.addr().port());
+    assert_eq!(seen.first_bytes[0], 0x16);
+}
+
+#[tokio::test]
+async fn a_socks_proxy_that_refuses_the_account_says_so_and_sends_nothing() {
+    let api = FakeApiServer::start().await.unwrap();
+    let (proxy, seen) = fake_socks(api.addr(), Some(("alice", "right"))).await;
+    for url in [
+        format!("socks5h://alice:proxy-secret@{proxy}"),
+        format!("socks5://{proxy}"),
+    ] {
+        let (kubeconfig, context) = through(api.kubeconfig(None), &url);
+        let error = match cluster::connect(&kubeconfig, &context).await {
+            Ok(client) => cluster::server_version(&client).await.unwrap_err(),
+            Err(e) => e,
+        };
+        let text = error.to_string();
+        assert!(text.contains("asks for credentials"), "{text}");
+        assert!(!text.contains("proxy-secret"), "{text}");
+    }
+    assert!(seen.lock().unwrap().destinations.is_empty());
+    assert_eq!(arrivals(&api), 0);
+}
+
+#[tokio::test]
+async fn a_socks_proxy_that_is_down_does_not_fall_back_to_a_direct_connection() {
+    let api = FakeApiServer::start().await.unwrap();
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let url = format!("socks5h://user:proxy-secret@127.0.0.1:{port}");
+    let (kubeconfig, context) = through(api.kubeconfig(None), &url);
+
+    let error = match cluster::connect(&kubeconfig, &context).await {
+        Ok(client) => cluster::server_version(&client).await.unwrap_err(),
+        Err(e) => e,
+    };
+
+    assert_eq!(arrivals(&api), 0, "it connected directly");
+    let text = error.to_string();
+    assert!(text.contains("could not reach the proxy"), "{text}");
+    assert!(!text.contains("proxy-secret"), "{text}");
+}
+
+#[tokio::test]
+async fn nothing_goes_through_a_socks_proxy_to_a_server_without_verified_tls() {
+    let api = FakeApiServer::start().await.unwrap();
+    let (proxy, seen) = fake_socks(api.addr(), None).await;
+    let (mut kubeconfig, context) = through(api.kubeconfig(None), &format!("socks5h://{proxy}"));
+    kubeconfig.clusters[0]
+        .cluster
+        .as_mut()
+        .unwrap()
+        .insecure_skip_tls_verify = Some(true);
+
+    let Err(error) = cluster::connect(&kubeconfig, &context).await else {
+        panic!("connected through the proxy");
+    };
+
+    assert!(error.to_string().contains("did not connect"), "{error}");
+    assert!(
+        seen.lock().unwrap().destinations.is_empty(),
+        "the proxy was used"
+    );
+    assert_eq!(arrivals(&api), 0);
+}
+
+// covers UP-125: the settings proxy can be a SOCKS5 one.
+#[test]
+fn a_cluster_is_read_through_a_socks_settings_proxy() {
+    run_setting_child("socks_settings_proxy_child");
+}
+
+#[tokio::test]
+async fn socks_settings_proxy_child() {
+    if std::env::var_os(SETTING_CHILD).is_none() {
+        return;
+    }
+    let api = FakeApiServer::start().await.unwrap();
+    let (proxy, seen) = fake_socks(api.addr(), Some(("alice", "pa@ss"))).await;
+    let dir = tempfile::tempdir().unwrap();
+    use_proxy_setting(
+        dir.path(),
+        &format!("url = \"socks5h://alice:pa%40ss@{proxy}\"\n"),
+    );
+
+    let kubeconfig = by_name(api.kubeconfig(None), &api);
+    let context = kubeconfig.contexts[0].name.clone();
+    let client = cluster::connect(&kubeconfig, &context).await.unwrap();
+    cluster::server_version(&client).await.unwrap();
+
+    assert!(arrivals(&api) > 0, "the request reached the server");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.destinations[0].1, "localhost");
+    assert_eq!(seen.first_bytes[0], 0x16);
+}
+
+/// Set for the child process of [`an_unreadable_settings_file_refuses_the_settings_route`].
+const UNREADABLE_SETTINGS_CHILD: &str = "FLINT_TEST_UNREADABLE_SETTINGS_CHILD";
+
+// covers UP-125: an unreadable settings.toml sends nothing direct or through the environment.
+#[test]
+fn an_unreadable_settings_file_refuses_the_settings_route() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("settings.toml"),
+        "[proxy]\nurl = \"socks5h://alice:proxy-secret@127.0.0.1:1\" oops\n",
+    )
+    .unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["unreadable_settings_child", "--exact", "--nocapture"])
+        .env(UNREADABLE_SETTINGS_CHILD, "1")
+        .env("FLINT_CONFIG_DIR", dir.path())
+        // No environment proxy: before, a cluster without a proxy-url went direct.
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        // No login shell for `PATH`.
+        .env_remove("SHELL")
+        .env("KUBECONFIG", "/dev/null")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn unreadable_settings_child() {
+    if std::env::var_os(UNREADABLE_SETTINGS_CHILD).is_none() {
+        return;
+    }
+    // SAFETY: this child runs this one test, before any runtime starts.
+    let boot = unsafe { flint_core::bootstrap::bootstrap() }.unwrap();
+    let error = boot.settings_error.clone().unwrap();
+    assert!(
+        error.contains("proxy setting could not be applied"),
+        "{error}"
+    );
+    assert!(!error.contains("proxy-secret"), "{error}");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let api = FakeApiServer::start().await.unwrap();
+            let kubeconfig = api.kubeconfig(None);
+            let context = kubeconfig.contexts[0].name.clone();
+            let Err(refused) = cluster::connect(&kubeconfig, &context).await else {
+                panic!("connected without the proxy setting");
+            };
+            assert!(refused.to_string().contains("settings.toml"), "{refused}");
+            assert_eq!(arrivals(&api), 0, "it connected directly");
+
+            // A cluster's own proxy-url is still used.
+            let (proxy, _) = fake_socks(api.addr(), None).await;
+            let (kubeconfig, context) = through(kubeconfig, &format!("socks5h://{proxy}"));
+            let client = cluster::connect(&kubeconfig, &context).await.unwrap();
+            cluster::server_version(&client).await.unwrap();
+            assert!(arrivals(&api) > 0);
+        });
 }

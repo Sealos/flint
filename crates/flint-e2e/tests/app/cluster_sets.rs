@@ -405,8 +405,29 @@ fn up_83_a_set_error_never_quotes_the_settings_file() -> Result<()> {
     ensure!(error.starts_with("invalid TOML"), "{error}");
     ensure!(!error.contains(CANARY), "{error}");
 
+    // The file's proxy setting is unknown, so a cluster without a proxy-url of its own is
+    // refused rather than reached without it. Neither the refusal nor the banner quotes the file.
+    app.select_cluster(A)?;
+    let state = app.wait_for("/clusters", Any(json!({"name": A, "connection": "failed"})))?;
+    let refused = state["clusters"]
+        .as_array()
+        .and_then(|clusters| clusters.iter().find(|c| c["name"] == A))
+        .map(|c| text(&c["error"]))
+        .unwrap_or_default();
+    ensure!(
+        refused.starts_with("settings.toml could not be read"),
+        "{refused}"
+    );
+    ensure!(!refused.contains(CANARY), "{refused}");
+    let state = app.wait_for("/banners", Any(json!({"id": "settings-error"})))?;
+    let banners = state["banners"].to_string();
+    ensure!(
+        banners.contains("proxy setting could not be applied"),
+        "{banners}"
+    );
+    ensure!(!banners.contains(CANARY), "{banners}");
+
     // Saving over the same file.
-    connect(&app, A)?;
     pick(&app, &[A, B])?;
     app.wait_for("/sets/error", Exists(false))?;
     app.dispatch("cluster_sets::SaveClusterSet", json!({"name": "regions"}))?;
