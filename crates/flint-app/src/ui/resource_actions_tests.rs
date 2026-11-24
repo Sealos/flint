@@ -1331,7 +1331,10 @@ async fn a_yaml_apply_refused_by_a_claim_says_why(cx: &mut TestAppContext) {
         .expect("the review");
     let workspace = t.workspace.clone();
     cx.update_window(t.window, |_, window, cx| {
-        workspace.update(cx, |ws, cx| ws.confirm_detail_write(&review, window, cx))
+        workspace.update(cx, |ws, cx| {
+            let guard = ws.connection_guard("kind-alpha", cx);
+            ws.confirm_detail_write(&review, guard, window, cx)
+        })
     })
     .unwrap();
     t.wait_for_element(cx, "write-confirm-description").await;
@@ -1350,6 +1353,57 @@ async fn a_yaml_apply_refused_by_a_claim_says_why(cx: &mut TestAppContext) {
     .await;
     assert_eq!(api.patches(), 0);
     cx.update(|cx| release(&web_key(), cx));
+}
+
+// A YAML edit is bound to the connection its review started on: a move away and back while the
+// review runs keeps the server, but Apply opens no confirmation and nothing is written.
+#[gpui_kit::test]
+async fn a_yaml_review_across_a_connection_change_cannot_be_applied(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let api = LocalApi::start(&[]);
+    let t = connected(cx, dir.path(), &api).await;
+    let detail = edit_web(cx, &t).await;
+    api.hold(true);
+    t.dispatch(cx, "detail::ReviewYamlEdit", Value::Null)
+        .unwrap();
+    draw(cx, &t);
+    assert_eq!(edit_phase(cx, &t), Some("reviewing"));
+    // Moved and put back: the same server on a definition the review did not start on.
+    t.model.update(cx, |m, cx| {
+        if let Some(c) = m.clusters.iter_mut().find(|c| c.info.name == "kind-alpha") {
+            c.definition += 1;
+        }
+        cx.notify();
+    });
+    draw(cx, &t);
+    api.hold(false);
+    let reviewed = detail.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        reviewed.read(cx).view_state().edit == Some("reviewed")
+    })
+    .await;
+    draw(cx, &t);
+
+    t.dispatch(cx, "detail::ApplyYamlEdit", Value::Null)
+        .unwrap();
+    draw(cx, &t);
+    assert!(
+        !t.has_dialog(cx),
+        "no confirmation for a replaced connection"
+    );
+    let why = t
+        .workspace
+        .read_with(cx, |ws, _| ws.action_error().map(str::to_owned));
+    assert_eq!(
+        why,
+        Some(crate::ui::write_binding::connection_changed_text())
+    );
+    let puts = api.control.puts.lock().unwrap().clone();
+    assert!(
+        puts.iter().all(|(dry_run, _)| *dry_run),
+        "only the review ran"
+    );
+    assert_eq!(api.patches(), 0);
 }
 
 // Leaving the YAML tab with the editor focused keeps focus in the detail pane.

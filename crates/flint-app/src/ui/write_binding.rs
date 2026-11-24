@@ -76,6 +76,23 @@ impl ConnectionGuard {
     }
 }
 
+/// Makes guards on the window's connections, for a view whose write is reviewed before its
+/// confirmation opens: the guard is taken when the review starts, so a change during the review
+/// closes the confirmation too.
+#[derive(Clone)]
+pub(in crate::ui) struct ConnectionGuards(WeakEntity<ClustersModel>);
+
+impl ConnectionGuards {
+    pub(in crate::ui) fn new(model: &Entity<ClustersModel>) -> Self {
+        Self(model.downgrade())
+    }
+
+    /// A guard on the connection of `cluster` now; `None` if it has no settled connection.
+    pub(in crate::ui) fn guard(&self, cluster: &str, cx: &App) -> Option<ConnectionGuard> {
+        ConnectionGuard::of(&self.0.upgrade()?, cluster, cx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use flint_core::kubeconfig::ContextInfo;
