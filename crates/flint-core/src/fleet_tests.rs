@@ -155,3 +155,37 @@ fn each_action_is_its_write_proposal() {
         WriteProposal::Scale { to: 3 }
     );
 }
+
+fn refused_entry(cluster: &str, error: WriteError) -> FleetPreviewEntry {
+    FleetPreviewEntry {
+        member: AdmittedMember {
+            pin: crate::settings::ClusterPin::new(cluster, "https://example.invalid"),
+            at: crate::recheck::ContextPin::stale(),
+            endpoint: 0,
+        },
+        review: Err(error),
+        dropped: false,
+    }
+}
+
+#[test]
+fn refused_clusters_are_dropped_and_never_run() {
+    let mut preview = FleetPreview {
+        action: FleetAction::RolloutRestart,
+        object: FleetObject {
+            kind: KindId::new("apps", "deployments"),
+            namespace: Some("demo".to_owned()),
+            name: "web".to_owned(),
+        },
+        entries: vec![
+            refused_entry("a", WriteError::Conflict),
+            refused_entry("b", WriteError::Gone),
+        ],
+    };
+    assert!(preview.entries().iter().all(|e| !e.will_run()));
+    assert_eq!(preview.drop_refused(), ["a", "b"]);
+    assert!(preview.entries().iter().all(|e| e.is_dropped()));
+    // A refusal stays one when the cluster is put back: it would fail at its turn.
+    assert!(preview.set_dropped("a", false));
+    assert!(!preview.entries()[0].will_run());
+}

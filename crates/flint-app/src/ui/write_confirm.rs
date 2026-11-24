@@ -68,7 +68,7 @@ fn change_wording(change: &ResourceChange) -> Wording {
 }
 
 /// What a resource action will do, as the confirmation says it.
-fn change_lines(change: &ResourceChange) -> Vec<String> {
+pub(in crate::ui) fn change_lines(change: &ResourceChange) -> Vec<String> {
     match change {
         ResourceChange::Delete => vec!["This cannot be undone.".to_owned()],
         ResourceChange::Scale { from, to } if from == to => {
@@ -140,7 +140,7 @@ fn evicts_managed_text(pods: &[String]) -> String {
 
 /// What a warning about a change to `target` says. A review reads the live object, so for a
 /// Secret it does not name the manager: the detail view and MCP show no annotation value of one.
-fn warning_text(target: &WriteTarget, warning: &WriteWarning) -> String {
+pub(in crate::ui) fn warning_text(target: &WriteTarget, warning: &WriteWarning) -> String {
     match warning {
         WriteWarning::LikelyReverted(_)
             if flint_core::redact::is_secret_list(target.kind.as_str()) =>

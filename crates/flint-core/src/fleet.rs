@@ -157,6 +157,12 @@ impl FleetPreviewEntry {
     pub fn is_dropped(&self) -> bool {
         self.dropped
     }
+
+    /// Whether a run would ask the write gate for this cluster: it is neither dropped nor
+    /// refused. The gate still decides at its turn.
+    pub fn will_run(&self) -> bool {
+        !self.dropped && self.review.is_ok()
+    }
 }
 
 /// A plan's per-cluster review and server dry run. Only [`CoreHandle::preview_fleet`] makes one,
@@ -179,6 +185,20 @@ impl FleetPreview {
 
     pub fn entries(&self) -> &[FleetPreviewEntry] {
         &self.entries
+    }
+
+    /// Takes every cluster whose review or dry run was refused out of the run, and returns them
+    /// in run order. Left in, a refused cluster would fail at its turn and stop the run there;
+    /// dropped, it gets no request and the others still run.
+    pub fn drop_refused(&mut self) -> Vec<ClusterId> {
+        self.entries
+            .iter_mut()
+            .filter(|entry| entry.review.is_err())
+            .map(|entry| {
+                entry.dropped = true;
+                entry.cluster().to_owned()
+            })
+            .collect()
     }
 
     /// Takes `cluster` out of the run, or puts it back. Returns whether the preview has it.

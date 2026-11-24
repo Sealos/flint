@@ -27,9 +27,11 @@ serde_json.workspace = true
 # Typed arguments of registered actions.
 serde.workspace = true
 serde-saphyr.workspace = true
+# A fleet action's per-member results, from the core's run to its dialog; also the automation
+# channel.
+async-channel.workspace = true
 
 # The automation channel only (feature `automation`).
-async-channel = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 
@@ -44,11 +46,9 @@ objc2-user-notifications = { version = "0.3", default-features = false, features
 [features]
 # The test-only automation channel (docs/TESTING.md). Never in release builds. GPUI's test
 # support renders the window to an image for screenshots.
-automation = ["dep:async-channel", "dep:image", "dep:libc", "gpui-kit/test-support"]
+automation = ["dep:image", "dep:libc", "gpui-kit/test-support"]
 
 [dev-dependencies]
-# Pod lists answered by hand in the row action tests.
-async-channel.workspace = true
 # `exec::fake`: shell tab tests drive a session without a pod.
 flint-core = { workspace = true, features = ["test-support"] }
 # The fake API server: the write confirmation tests assert the exact requests it records.

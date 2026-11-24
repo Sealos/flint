@@ -36,6 +36,8 @@ use super::compare;
 use super::detail::{
     ObjectRef, Opening, PROTECTED_NOTE, ShellPod, Subject, log_item, reason, refused, shell_item,
 };
+use super::fleet_plan::FleetChoice;
+use super::fleet_view;
 use super::list::ResourceList;
 use super::menu_fit::{
     dismiss_when_shrunk, fit_menu, fit_picker, note_width, pod_name_chars, wrapped_label,
@@ -221,6 +223,8 @@ pub struct RowActions {
     pub compare: Option<CompareEntry>,
     /// The resource actions the row's kind has, in menu order, and whether each can run now.
     pub writes: Vec<WriteEntry>,
+    /// The fleet actions a cluster set's row offers: the same action on every member.
+    pub fleet: Vec<FleetChoice>,
     /// Forward Port, on a pod or service.
     pub forward: Option<Availability>,
     /// Forward Port is refused because the cluster is protected.
@@ -302,6 +306,11 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
             }
         })
         .collect();
+    // Offered only where one can run: a set's row of a kind that has the action.
+    let fleet: Vec<FleetChoice> = [FleetChoice::Scale, FleetChoice::RolloutRestart]
+        .into_iter()
+        .filter(|choice| fleet_view::available(ws, *choice, cx).is_ok())
+        .collect();
     let object = detail.object();
     let compare = compare_entry(ws, compare_object(object), cx);
     let deletable = ws.kind_deletable(&object.cluster, &object.kind, cx);
@@ -348,6 +357,7 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
         blocked,
         subject,
         writes,
+        fleet,
     })
 }
 
@@ -506,6 +516,19 @@ fn fill(
                 write.action.boxed(),
                 &can,
                 says,
+                &workspace,
+            );
+        }
+    }
+    if !a.fleet.is_empty() {
+        menu = menu.separator();
+        for choice in &a.fleet {
+            menu = entry(
+                menu,
+                choice.label().into(),
+                choice.boxed(),
+                &Ok(()),
+                says_why,
                 &workspace,
             );
         }
@@ -860,6 +883,9 @@ pub fn menu_state(a: &RowActions) -> (Option<String>, Vec<MenuEntryState>) {
             &write_in_menu(a, write),
         ));
     }
+    for choice in &a.fleet {
+        entries.push(entry(choice.label().to_owned(), &Ok(())));
+    }
     if let Some(unlock) = &a.unlock {
         entries.push(entry(unlock_label(&unlock.name), &Ok(())));
     }
@@ -911,6 +937,7 @@ pub(in crate::ui) mod tests {
             unlock: None,
             compare: None,
             writes: Vec::new(),
+            fleet: Vec::new(),
             forward: None,
             forward_protected: false,
         }
