@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use flint_core::access::{Access, AccessCheck};
+use flint_core::action_kinds;
 use flint_core::{KindId, SlotBinding};
 use gpui_kit::*;
 
@@ -56,7 +57,8 @@ fn gated_for(kind: &KindId, subject: Subject) -> Vec<Gated> {
         gated.push(Gated::PortForward);
     }
     gated.extend(
-        resource_actions::offered_for(kind, true, None)
+        // A custom resource's Scale is not asked about here: it depends on its cluster.
+        resource_actions::offered_for(kind, action_kinds::scales_built_in(kind), true, None)
             .into_iter()
             .map(Gated::Write),
     );

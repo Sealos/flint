@@ -2498,6 +2498,7 @@ mod tests {
             verbs: vec!["list".into()],
             singular: "deployment".into(),
             short_names: vec!["deploy".into()],
+            scale: Default::default(),
         };
         assert_eq!(kind_row(&deploy)["shortNames"], json!(["deploy"]));
         deploy.short_names.clear();

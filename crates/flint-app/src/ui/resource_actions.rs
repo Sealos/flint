@@ -16,6 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use flint_core::KindId;
+use flint_core::action_kinds;
 use flint_core::display::{ClusterNames, cluster_name_key, single_line};
 use flint_core::redact::first_line;
 use flint_core::write::{
@@ -237,38 +238,26 @@ pub(in crate::ui) fn release(key: &WriteKey, cx: &mut App) {
     });
 }
 
-fn is_scalable(kind: &KindId) -> bool {
-    matches!(
-        kind.as_str(),
-        "deployments.apps" | "statefulsets.apps" | "replicasets.apps" | "replicationcontrollers"
-    )
-}
-
-fn is_restartable(kind: &KindId) -> bool {
-    matches!(
-        kind.as_str(),
-        "deployments.apps" | "daemonsets.apps" | "statefulsets.apps"
-    )
-}
-
 /// Whether rows of `kind` have a resource action, whatever state the object is in. A kind that
-/// can be deleted has one (`deletable`, from discovery's verbs).
-pub(in crate::ui) fn kind_has_actions(kind: &KindId, deletable: bool) -> bool {
-    deletable || is_scalable(kind) || is_restartable(kind) || kind.as_str() == "nodes"
+/// can be deleted has one (`deletable`, from discovery's verbs), and so does one with Scale
+/// (`scalable`: [`Workspace::kind_scale_paths`]).
+pub(in crate::ui) fn kind_has_actions(kind: &KindId, scalable: bool, deletable: bool) -> bool {
+    deletable || scalable || action_kinds::restarts(kind) || kind.as_str() == "nodes"
 }
 
 /// The actions a row of `kind` offers, in menu order, the destructive one last. A node offers
 /// Uncordon when `cordoned`, else Cordon (also while that is not known yet, disabled).
 pub(in crate::ui) fn offered_for(
     kind: &KindId,
+    scalable: bool,
     deletable: bool,
     cordoned: Option<bool>,
 ) -> Vec<ResourceAction> {
     let mut actions = Vec::new();
-    if is_scalable(kind) {
+    if scalable {
         actions.push(ResourceAction::Scale);
     }
-    if is_restartable(kind) {
+    if action_kinds::restarts(kind) {
         actions.push(ResourceAction::RolloutRestart);
     }
     if kind.as_str() == "nodes" {
@@ -289,10 +278,11 @@ pub(in crate::ui) fn offered_for(
 pub(in crate::ui) fn offered(ws: &Workspace, detail: &DetailView, cx: &App) -> Vec<ResourceAction> {
     let object = detail.object();
     let deletable = ws.kind_deletable(&object.cluster, &object.kind, cx);
+    let scalable = ws.kind_scale_paths(&object.cluster, &object.kind, cx).is_some();
     let cordoned = (object.kind.as_str() == "nodes")
         .then(|| detail.node_cordoned().ok())
         .flatten();
-    offered_for(&object.kind, deletable, cordoned)
+    offered_for(&object.kind, scalable, deletable, cordoned)
 }
 
 /// Whether `action` can run on the selected row now, and why not: what the menu shows, the
@@ -763,7 +753,7 @@ fn pre_review_title_name(target: &WriteTarget) -> String {
     confirm::title_name(&flint_core::display::single_line(&target.name))
 }
 
-fn scale_dialog(target: &WriteTarget, current: Option<u64>) -> DialogText {
+fn scale_dialog(target: &WriteTarget, current: Option<u32>) -> DialogText {
     let now = current.map_or("not known yet".to_owned(), |n| n.to_string());
     DialogText {
         title: format!("Scale {}", pre_review_title_name(target)),
@@ -812,7 +802,9 @@ fn open_scale(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let current = ws.detail_view().and_then(|d| d.read(cx).replicas());
+    let current = ws
+        .kind_scale_paths(&target.cluster, &target.kind, cx)
+        .and_then(|paths| ws.detail_view()?.read(cx).replicas(&paths));
     let input = cx.new(|cx| {
         InputState::new(window, cx)
             .placeholder("Replicas")
@@ -1194,8 +1186,18 @@ mod tests {
                 &[A::Delete],
             ),
         ] {
-            assert_eq!(offered_for(&kind, deletable, cordoned), wanted, "{kind}");
+            let scalable = flint_core::action_kinds::scales_built_in(&kind);
+            assert_eq!(
+                offered_for(&kind, scalable, deletable, cordoned),
+                wanted,
+                "{kind}"
+            );
         }
+        // A custom resource has Scale where its cluster read the paths of its definition.
+        assert_eq!(
+            offered_for(&KindId::new("example.com", "widgets"), true, true, None),
+            [A::Scale, A::Delete]
+        );
     }
 
     // covers UP-53: the replica count is a non-negative whole number the API can hold.

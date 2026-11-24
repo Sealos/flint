@@ -23,11 +23,12 @@ use kube::core::Status;
 use kube::{Client, Resource, ResourceExt as _};
 use serde_json::{Value, json};
 
+use crate::action_kinds;
 use crate::api_path::{self, PathError};
 use crate::cluster::ClusterError;
 use crate::gitops::{self, Identity, ManagedBy};
 use crate::protection::WriteRefusal;
-use crate::read::KindInfo;
+use crate::read::{KindId, KindInfo};
 use crate::redact;
 use crate::write::{
     RequestGate, ResourceChange, WriteError, WriteOutcome, WriteProposal, WriteTarget, read_live,
@@ -83,23 +84,8 @@ fn timed_out() -> String {
     )
 }
 
-fn is_scalable(kind: &ApiResource) -> bool {
-    match kind.group.as_str() {
-        "apps" => matches!(
-            kind.plural.as_str(),
-            "deployments" | "statefulsets" | "replicasets"
-        ),
-        "" => kind.plural == "replicationcontrollers",
-        _ => false,
-    }
-}
-
 fn is_restartable(kind: &ApiResource) -> bool {
-    kind.group == "apps"
-        && matches!(
-            kind.plural.as_str(),
-            "deployments" | "daemonsets" | "statefulsets"
-        )
+    action_kinds::restarts(&KindId::new(&kind.group, &kind.plural))
 }
 
 fn is_node(kind: &ApiResource) -> bool {
@@ -121,12 +107,13 @@ pub(crate) fn review(
     };
     match proposal {
         WriteProposal::Delete => Ok(ResourceChange::Delete),
-        WriteProposal::Scale { .. } if !is_scalable(resource) => refuse("scaled"),
         WriteProposal::Scale { to } => {
-            let from = live
-                .pointer("/spec/replicas")
-                .and_then(Value::as_u64)
-                .and_then(|replicas| u32::try_from(replicas).ok())
+            let Some(paths) = kind.scale_paths() else {
+                return refuse("scaled");
+            };
+            // Where its `scale` subresource reads it: what the write tests.
+            let from = paths
+                .replicas(live)
                 .ok_or_else(|| WriteError::Failed("the object has no replica count".to_owned()))?;
             Ok(ResourceChange::Scale { from, to })
         }
@@ -310,7 +297,7 @@ pub(crate) async fn dry_run(
     };
     match change {
         ResourceChange::Scale { from, to } => {
-            send_scale(gate, &object, *from, *to, mode).await?;
+            send_scale(gate, kind, &object, *from, *to, mode).await?;
         }
         ResourceChange::RolloutRestart => send_restart(gate, &object, mode).await?,
         _ => {
@@ -342,7 +329,9 @@ pub(crate) async fn run(
     };
     match change {
         ResourceChange::Delete => delete(gate, &object).await?,
-        ResourceChange::Scale { from, to } => send_scale(gate, &object, *from, *to, mode).await?,
+        ResourceChange::Scale { from, to } => {
+            send_scale(gate, kind, &object, *from, *to, mode).await?;
+        }
         ResourceChange::RolloutRestart => send_restart(gate, &object, mode).await?,
         ResourceChange::Cordon => set_cordoned(gate, &object, true).await?,
         ResourceChange::Uncordon => set_cordoned(gate, &object, false).await?,
@@ -611,21 +600,22 @@ pub(crate) async fn delete(
 
 /// Changes a workload's replicas from `from`, the count reviewed, to `to`. A JSON Patch tests the
 /// uid and the count, so another change to either is a conflict and a status update is not. It
-/// goes through the `scale` subresource, which is what a scale-only role may patch. That
-/// subresource omits `replicas` at zero, so a count of zero is tested as an empty `spec`. A `Scale`
-/// carries its workload's `resourceVersion`, so a held scale tests that too.
+/// goes through the `scale` subresource, which is what a scale-only role may patch, and which
+/// shows a custom resource's own replica path as `spec.replicas`. That subresource omits
+/// `replicas` at zero, so a count of zero is tested as an empty `spec`. A `Scale` carries its
+/// workload's `resourceVersion`, so a held scale tests that too.
 async fn send_scale(
     gate: &mut impl ActionGate,
+    kind: &KindInfo,
     object: &ActionObject,
     from: u32,
     to: u32,
     mode: PatchMode<'_>,
 ) -> Result<(), ActionError> {
-    let resource = &object.resource;
-    if !is_scalable(resource) {
+    if kind.scale_paths().is_none() || kind.resource != object.resource {
         return Err(ActionError::Unsupported(format!(
             "{} cannot be scaled",
-            resource.plural
+            object.resource.plural
         )));
     }
     let mut operations =
@@ -1215,7 +1205,8 @@ mod tests {
         from: u32,
         to: u32,
     ) -> Result<(), ActionError> {
-        send_scale(gate, object, from, to, PatchMode::default()).await
+        let kind = kind_info(object.resource.clone());
+        send_scale(gate, &kind, object, from, to, PatchMode::default()).await
     }
 
     async fn rollout_restart(
@@ -1386,6 +1377,7 @@ mod tests {
             verbs: Vec::new(),
             singular: String::new(),
             short_names: Vec::new(),
+            scale: Default::default(),
         }
     }
 
@@ -1434,6 +1426,39 @@ mod tests {
             review(&deployments, &live, WriteProposal::Delete),
             Ok(ResourceChange::Delete)
         );
+    }
+
+    // covers UP-53: a custom resource is scaled from the count at its definition's path, and
+    // only once that path is known.
+    #[test]
+    fn a_custom_resource_review_reads_its_own_replica_path() {
+        use crate::action_kinds::{ScalePaths, ScaleSubresource};
+        let unread = KindInfo {
+            scale: ScaleSubresource::Unread,
+            ..kind_info(resource("example.dev", "v1", "Widget", "widgets"))
+        };
+        let paths = ScalePaths::from_crd(".spec.size", ".status.size").unwrap();
+        let widgets = KindInfo {
+            scale: ScaleSubresource::Paths(paths),
+            ..unread.clone()
+        };
+        let live = json!({"spec": {"size": 4, "replicas": 9}});
+        assert_eq!(
+            review(&widgets, &live, WriteProposal::Scale { to: 1 }),
+            Ok(ResourceChange::Scale { from: 4, to: 1 })
+        );
+        assert!(matches!(
+            review(&widgets, &json!({"spec": {"replicas": 9}}), WriteProposal::Scale { to: 1 }),
+            Err(WriteError::Failed(_))
+        ));
+        assert!(matches!(
+            review(&unread, &live, WriteProposal::Scale { to: 1 }),
+            Err(WriteError::Rejected(_))
+        ));
+        assert!(matches!(
+            review(&widgets, &live, WriteProposal::RolloutRestart),
+            Err(WriteError::Rejected(_))
+        ));
     }
 
     // covers UP-53: delete names the reviewed object by uid.
@@ -1602,6 +1627,47 @@ mod tests {
         assert_eq!(
             seen[0].path,
             "/apis/apps/v1/namespaces/demo/deployments/web/scale"
+        );
+        assert_eq!(
+            seen[0].body,
+            json!([
+                {"op": "test", "path": "/metadata/uid", "value": "uid-web"},
+                {"op": "test", "path": "/spec/replicas", "value": 2},
+                {"op": "replace", "path": "/spec/replicas", "value": 3},
+            ])
+        );
+    }
+
+    // covers UP-53: a custom resource is scaled through its `scale` subresource, as a built-in
+    // kind is, and not at all while its replica paths are not known.
+    #[tokio::test]
+    async fn a_custom_resource_scales_through_its_subresource() {
+        use crate::action_kinds::{ScalePaths, ScaleSubresource};
+        let (client, log) = fake(Arc::new(ok));
+        let mut gate = writes(client, open());
+        let widget = ActionObject {
+            resource: resource("example.dev", "v1", "Widget", "widgets"),
+            ..deployment()
+        };
+        let unread = KindInfo {
+            scale: ScaleSubresource::Unread,
+            ..kind_info(widget.resource.clone())
+        };
+        let result = send_scale(&mut gate, &unread, &widget, 2, 3, PatchMode::default()).await;
+        assert!(matches!(result, Err(ActionError::Unsupported(_))));
+        assert!(log.lock().unwrap().is_empty());
+        let paths = ScalePaths::from_crd(".spec.size", ".status.size").unwrap();
+        let widgets = KindInfo {
+            scale: ScaleSubresource::Paths(paths),
+            ..unread
+        };
+        send_scale(&mut gate, &widgets, &widget, 2, 3, PatchMode::default())
+            .await
+            .unwrap();
+        let seen = log.lock().unwrap();
+        assert_eq!(
+            seen[0].path,
+            "/apis/example.dev/v1/namespaces/demo/widgets/web/scale"
         );
         assert_eq!(
             seen[0].body,

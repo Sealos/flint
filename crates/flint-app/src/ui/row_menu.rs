@@ -184,11 +184,12 @@ const MAX_REASON: usize = 200;
 const SHELL_POD_NAME: usize = 28;
 
 /// Whether rows of `kind` get the menu: pods, workloads, services (Forward Port), and kinds with
-/// a resource action (`deletable`: discovery lists the `delete` verb).
-pub fn has_row_actions(kind: &KindId, deletable: bool) -> bool {
+/// a resource action (`deletable`: discovery lists the `delete` verb; `scalable`: the kind has
+/// Scale on its cluster).
+pub fn has_row_actions(kind: &KindId, scalable: bool, deletable: bool) -> bool {
     Subject::of(kind) != Subject::Other
         || *kind == KindId::new("", "services")
-        || resource_actions::kind_has_actions(kind, deletable)
+        || resource_actions::kind_has_actions(kind, scalable, deletable)
 }
 
 /// Whether an entry can run now: `Err` says why not.
@@ -314,8 +315,11 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
     let object = detail.object();
     let compare = compare_entry(ws, compare_object(object), cx);
     let deletable = ws.kind_deletable(&object.cluster, &object.kind, cx);
+    let scalable = ws
+        .kind_scale_paths(&object.cluster, &object.kind, cx)
+        .is_some();
     let forwards = detail.forward_target().is_some();
-    if !has_row_actions(&object.kind, deletable)
+    if !has_row_actions(&object.kind, scalable, deletable)
         && writes.is_empty()
         && compare.is_none()
         && !forwards

@@ -8,6 +8,7 @@
 //! on a workload always waits for a current list of its pods (see `detail_pods`). An action
 //! that is refused, at once or once loaded, says why ([`DetailEvent::Refused`]).
 
+use flint_core::action_kinds::ScalePaths;
 use flint_core::port_forward::{DeclaredPort, ForwardTarget, declared_ports};
 use flint_core::{KindId, LogSubject, LogTarget, PodSet, WorkloadPod, WorkloadTarget};
 use gpui_kit::*;
@@ -684,13 +685,11 @@ impl DetailView {
         }
     }
 
-    /// The replica count of the workload shown, once fetched: what the scale dialog starts from.
-    pub(in crate::ui) fn replicas(&self) -> Option<u64> {
+    /// The replica count of the workload shown at `paths`, once fetched: what the scale dialog
+    /// starts from.
+    pub(in crate::ui) fn replicas(&self, paths: &ScalePaths) -> Option<u32> {
         match &self.fetch {
-            Fetch::Loaded { detail, .. } => detail
-                .object
-                .pointer("/spec/replicas")
-                .and_then(Value::as_u64),
+            Fetch::Loaded { detail, .. } => paths.replicas(&detail.object),
             _ => None,
         }
     }

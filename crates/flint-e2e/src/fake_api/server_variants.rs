@@ -1,6 +1,8 @@
 //! How one server differs from the recording: its `/version`, the resources it lacks, and the
 //! control of its clock. Together they let a test run a set of unlike clusters.
 
+use serde_json::json;
+
 use super::*;
 
 /// Fails on a hidden resource the fixtures do not serve: a typo would hide nothing.
@@ -11,6 +13,92 @@ pub(super) fn check_hidden(fixtures: &Fixtures, hidden: &[Gvr]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Fails on a scaled resource the fixtures do not serve, or that no definition of theirs defines.
+pub(super) fn check_scaled(fixtures: &Fixtures, scaled: &[(Gvr, String)]) -> Result<()> {
+    for (gvr, _) in scaled {
+        if fixtures.resources.get(gvr).is_none() || gvr.group.is_empty() || gvr.group == "apps" {
+            bail!("Options::scaled names {gvr}, which is not a custom resource of the fixtures");
+        }
+    }
+    Ok(())
+}
+
+/// Lists a `scale` subresource for each resource of `scaled` in an aggregated discovery list.
+pub(super) fn scale_in_discovery(discovery: &mut Value, scaled: &[(Gvr, String)]) {
+    let Some(groups) = discovery.get_mut("items").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for group in groups {
+        let name = text_at(group, "/metadata/name");
+        let Some(versions) = group.get_mut("versions").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for version in versions {
+            let number = text_at(version, "/version");
+            let Some(resources) = version.get_mut("resources").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for resource in resources {
+                let gvr = Gvr::new(&name, &number, &text_at(resource, "/resource"));
+                if scaled.iter().any(|(g, _)| *g == gvr) {
+                    resource["subresources"] = json!([{
+                        "subresource": "scale",
+                        "responseKind": {"group": "autoscaling", "version": "v1", "kind": "Scale"},
+                        "verbs": ["get", "patch", "update"],
+                    }]);
+                }
+            }
+        }
+    }
+}
+
+/// Declares the `scale` subresource of each resource of `scaled` in its
+/// CustomResourceDefinition, with the definition's own fields filled in as the API server keeps
+/// them.
+pub(super) fn declare_scale(
+    state: &mut State,
+    fixtures: &Fixtures,
+    scaled: &[(Gvr, String)],
+) -> Result<()> {
+    let crds = Gvr::new("apiextensions.k8s.io", "v1", "customresourcedefinitions");
+    for (gvr, path) in scaled {
+        let name = format!("{}.{}", gvr.resource, gvr.group);
+        let Ok(mut crd) = state.object(&crds, None, &name) else {
+            bail!("Options::scaled names {gvr}, whose definition the fixtures do not have");
+        };
+        let info = fixtures
+            .resources
+            .get(gvr)
+            .context("a scaled resource is served")?;
+        crd["apiVersion"] = "apiextensions.k8s.io/v1".into();
+        crd["kind"] = "CustomResourceDefinition".into();
+        crd["spec"] = json!({
+            "group": gvr.group,
+            "names": {"plural": gvr.resource, "kind": info.kind},
+            "scope": if info.namespaced { "Namespaced" } else { "Cluster" },
+            "versions": [{
+                "name": gvr.version, "served": true, "storage": true,
+                "subresources": {"scale": {
+                    "specReplicasPath": path, "statusReplicasPath": ".status.replicas",
+                }},
+            }],
+        });
+        state
+            .set_object(&crds, crd)
+            .map_err(|e| anyhow::anyhow!("declaring the scale of {gvr}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// The JSON pointer of the replica count a `scale` of `gvr` changes: `spec.replicas`, or the
+/// path [`Options::scaled`] names.
+pub(super) fn replicas_pointer(scaled: &[(Gvr, String)], gvr: &Gvr) -> String {
+    scaled
+        .iter()
+        .find(|(g, _)| g == gvr)
+        .map_or_else(|| "/spec/replicas".to_owned(), |(_, path)| path.replace('.', "/"))
 }
 
 /// What `/version` answers. An override replaces `gitVersion`, `major` and `minor`, and drops the

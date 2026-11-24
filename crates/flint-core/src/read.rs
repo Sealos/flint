@@ -4,6 +4,7 @@
 //! These functions apply no policy. Callers decide limits, redaction, and who may see what (the
 //! MCP server does this in `flint-mcp`; the UI will use these directly).
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use kube::api::{Api, ApiResource, DynamicObject, ListParams, LogParams};
 use kube::core::discovery::v2::APIGroupDiscovery;
 use kube::discovery::verbs;
 
+use crate::action_kinds::{self, ScaleSubresource};
 use crate::api_error::{ApiError, Transport};
 use crate::api_path::{self, PathError};
 pub use crate::api_path::{is_dns1123_label, is_dns1123_subdomain, is_path_segment};
@@ -31,6 +33,8 @@ pub struct KindInfo {
     pub singular: String,
     /// The short names discovery suggests (`deploy`, `po`, `svc`), as kubectl accepts them.
     pub short_names: Vec<String>,
+    /// Its `scale` subresource; see [`KindInfo::scale_paths`].
+    pub scale: ScaleSubresource,
 }
 
 impl KindInfo {
@@ -171,13 +175,15 @@ async fn discover_kinds_within(
     overall: Duration,
 ) -> Result<DiscoveredKinds, ClusterError> {
     let discover = async {
-        match discover_aggregated(client, per_request).await? {
-            Some(found) => Ok(found),
+        let mut found = match discover_aggregated(client, per_request).await? {
+            Some(found) => found,
             None => {
                 tracing::debug!("no aggregated discovery, discovering each group");
-                discover_per_group(client, per_request).await
+                discover_per_group(client, per_request).await?
             }
-        }
+        };
+        action_kinds::read_scale_paths(client, &mut found.kinds, per_request).await;
+        Ok(found)
     };
     let mut found = tokio::time::timeout(overall, discover)
         .await
@@ -309,6 +315,15 @@ fn kinds_from_aggregated(group: APIGroupDiscovery) -> Vec<KindInfo> {
             verbs: r.verbs,
             singular: r.singular_resource.unwrap_or_default(),
             short_names: r.short_names,
+            scale: if r
+                .subresources
+                .iter()
+                .any(|s| s.subresource.as_deref() == Some("scale"))
+            {
+                ScaleSubresource::Unread
+            } else {
+                ScaleSubresource::Absent
+            },
         })
         .collect()
 }
@@ -430,11 +445,21 @@ fn loggable_group(name: &str) -> &str {
 }
 
 fn kinds_from_resource_list(group: &str, version: &str, list: APIResourceList) -> Vec<KindInfo> {
+    let scaled: HashSet<String> = list
+        .resources
+        .iter()
+        .filter_map(|r| r.name.strip_suffix("/scale").map(str::to_owned))
+        .collect();
     list.resources
         .into_iter()
         // `pods/log` and the like are subresources, not kinds.
         .filter(|r| is_routable(group, version, &r.name))
         .map(|r| KindInfo {
+            scale: if scaled.contains(&r.name) {
+                ScaleSubresource::Unread
+            } else {
+                ScaleSubresource::Absent
+            },
             resource: api_resource(group, version, r.kind, r.name),
             namespaced: r.namespaced,
             verbs: r.verbs,
@@ -1056,6 +1081,7 @@ mod tests {
             verbs: vec!["list".into()],
             singular: kind.to_ascii_lowercase(),
             short_names: Vec::new(),
+            scale: Default::default(),
         }
     }
 
@@ -1248,6 +1274,24 @@ mod tests {
         assert_eq!(kinds[0].api_version(), "v1");
         assert_eq!(kinds[0].short_names, ["po"]);
         assert_eq!(kinds[0].singular, "pod");
+        assert_eq!(kinds[0].scale, ScaleSubresource::Absent);
+    }
+
+    #[test]
+    fn resource_lists_note_a_scale_subresource() {
+        let list: APIResourceList = serde_json::from_value(serde_json::json!({
+            "groupVersion": "example.dev/v1",
+            "resources": [
+                {"name": "widgets", "singularName": "widget", "namespaced": true,
+                 "kind": "Widget", "verbs": ["list"]},
+                {"name": "widgets/scale", "singularName": "", "namespaced": true,
+                 "kind": "Scale", "verbs": ["get", "patch"]}
+            ]
+        }))
+        .unwrap();
+        let kinds = kinds_from_resource_list("example.dev", "v1", list);
+        assert_eq!(kinds.len(), 1);
+        assert_eq!(kinds[0].scale, ScaleSubresource::Unread);
     }
 
     // covers UP-10
@@ -1467,6 +1511,62 @@ mod tests {
         );
         assert_eq!(id(&found.kinds, "deploy", None), "deployments.apps");
         assert_eq!(id(&found.kinds, "po", None), "pods");
+    }
+
+    // covers UP-53: a custom resource has Scale only with replica paths read from its definition.
+    #[tokio::test]
+    async fn custom_scale_paths_come_from_the_definition() {
+        use serde_json::json;
+        let scaled = |plural: &str, kind: &str| {
+            json!({"resource": plural, "responseKind": {"kind": kind}, "scope": "Namespaced",
+                   "verbs": ["get", "list"],
+                   "subresources": [{"subresource": "scale", "verbs": ["get", "patch"]}]})
+        };
+        let crd = |plural: &str, path: &str| {
+            json!({"apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+                   "metadata": {"name": format!("{plural}.example.dev")},
+                   "spec": {"group": "example.dev", "names": {"plural": plural},
+                            "versions": [{"name": "v1", "served": true, "subresources": {"scale":
+                                {"specReplicasPath": path, "statusReplicasPath": ".status.n"}}}]}})
+        };
+        let (client, _) = fake_api(vec![
+            ("/api", 200, json!({"items": [{"metadata": {"name": ""}, "versions": [
+                {"version": "v1", "resources": [scaled("replicationcontrollers", "ReplicationController")]}]}]})),
+            ("/apis", 200, json!({"items": [{"metadata": {"name": "example.dev"}, "versions": [
+                {"version": "v1", "resources": [
+                    scaled("widgets", "Widget"), scaled("gizmos", "Gizmo"),
+                    scaled("sprockets", "Sprocket"),
+                    {"resource": "plain", "responseKind": {"kind": "Plain"}, "verbs": ["list"]},
+                ]}]}]})),
+            (
+                "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/widgets.example.dev",
+                200,
+                crd("widgets", ".spec.size"),
+            ),
+            (
+                "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/gizmos.example.dev",
+                200,
+                crd("gizmos", ".spec.sizes[0]"),
+            ),
+            // sprockets.example.dev: no definition can be read.
+        ])
+        .await;
+        let found = discover_kinds(&client).await.unwrap();
+        let scale = |plural: &str| {
+            let kind = found.kinds.iter().find(|k| k.plural() == plural).unwrap();
+            (kind.scale.clone(), kind.scale_paths())
+        };
+        assert_eq!(
+            scale("widgets").1,
+            action_kinds::ScalePaths::from_crd(".spec.size", ".status.n")
+        );
+        assert_eq!(scale("gizmos"), (ScaleSubresource::Unread, None));
+        assert_eq!(scale("sprockets"), (ScaleSubresource::Unread, None));
+        assert_eq!(scale("plain"), (ScaleSubresource::Absent, None));
+        assert_eq!(
+            scale("replicationcontrollers").1,
+            Some(action_kinds::ScalePaths::built_in())
+        );
     }
 
     // covers UP-10

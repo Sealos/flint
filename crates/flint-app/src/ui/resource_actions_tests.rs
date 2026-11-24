@@ -390,6 +390,77 @@ async fn the_scale_dialog_validates_the_count(cx: &mut TestAppContext) {
     assert!(t.has_dialog(cx), "it stays open");
 }
 
+/// Connects `kind-alpha` with Widgets deletable, and with a `scale` subresource as `scale` says.
+async fn connect_widgets(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+    scale: flint_core::action_kinds::ScaleSubresource,
+) {
+    t.connect_alpha(cx, standard_sections()).await;
+    let mut found = discovery(standard_sections());
+    for kind in &mut found.kinds {
+        kind.verbs.push("delete".into());
+        if kind.plural() == "widgets" {
+            kind.scale = scale.clone();
+        }
+    }
+    t.feed(
+        cx,
+        Event::DiscoveryChanged {
+            cluster: "kind-alpha".into(),
+            generation: CURRENT_GENERATION,
+            discovery: Some(Arc::new(found)),
+            error: None,
+        },
+    );
+    let widgets = objects(
+        KindId::new("example.com", "widgets"),
+        &[("demo", "w1", 0)],
+        SyncState::Synced,
+        1,
+    );
+    t.open_kind(cx, "widgets.example.com", widgets).await;
+    right_click(cx, &t, "w1").await;
+}
+
+// covers UP-53: a custom resource offers Scale once its definition's replica paths are read, and
+// the dialog starts from the count at that path.
+#[gpui_kit::test]
+async fn a_custom_resource_offers_scale_with_readable_paths(cx: &mut TestAppContext) {
+    use flint_core::action_kinds::{ScalePaths, ScaleSubresource};
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_alpha(cx, dir.path(), "").await;
+    connect_widgets(cx, &t, ScaleSubresource::Unread).await;
+    assert!(!menu(cx, &t).iter().any(|r| r == "Scale…"));
+    assert!(
+        t.dispatch(cx, "workspace::ScaleObject", Value::Null)
+            .is_err()
+    );
+    t.press(cx, "escape");
+
+    let paths = ScalePaths::from_crd(".spec.size", ".status.size").unwrap();
+    connect_widgets(cx, &t, ScaleSubresource::Paths(paths)).await;
+    let rows = menu(cx, &t);
+    assert!(rows.iter().any(|r| r == "Scale…"), "{rows:?}");
+    assert!(!rows.iter().any(|r| r == "Rollout Restart…"), "{rows:?}");
+    t.press(cx, "escape");
+    show_fetched(
+        cx,
+        &t,
+        fetched(json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": {"name": "w1", "namespace": "demo", "uid": "uid-w1"},
+            "spec": {"size": 4, "replicas": 9},
+        })),
+    );
+    t.dispatch(cx, "workspace::ScaleObject", Value::Null)
+        .unwrap();
+    t.wait_for_element(cx, "scale-input").await;
+    let text = t.label(cx, "scale-description").unwrap();
+    assert!(text.starts_with("Replicas now: 4."), "{text}");
+}
+
 // covers UP-53: a drain's two options start unchecked and each says what is lost.
 #[gpui_kit::test]
 async fn the_drain_dialog_says_what_each_option_loses(cx: &mut TestAppContext) {
@@ -777,7 +848,7 @@ async fn a_conflict_opens_a_new_review(cx: &mut TestAppContext) {
     right_click(cx, &t, "web").await;
     let detail = t.detail(cx).unwrap();
     cx.wait_for(t.window, WAIT, move |_, cx| {
-        detail.read(cx).replicas() == Some(2)
+        detail.read(cx).replicas(&flint_core::action_kinds::ScalePaths::built_in()) == Some(2)
     })
     .await;
 
@@ -1052,7 +1123,7 @@ async fn select_loaded(cx: &mut TestAppContext, t: &TestWorkspace, name: &str) {
     let detail = t.detail(cx).unwrap();
     cx.wait_for(t.window, WAIT, move |_, cx| {
         let d = detail.read(cx);
-        d.replicas().is_some() || d.node_cordoned().is_ok()
+        d.replicas(&flint_core::action_kinds::ScalePaths::built_in()).is_some() || d.node_cordoned().is_ok()
     })
     .await;
     draw(cx, t);

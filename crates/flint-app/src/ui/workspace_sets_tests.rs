@@ -317,7 +317,7 @@ async fn open_beta_row_answering(
     let detail = t.detail(cx).expect("the row's detail");
     assert_eq!(detail_cluster(cx, &t).as_deref(), Some("kind-beta"));
     cx.wait_for(t.window, WAIT, move |_, cx| {
-        detail.read(cx).replicas() == Some(2)
+        detail.read(cx).replicas(&flint_core::action_kinds::ScalePaths::built_in()) == Some(2)
     })
     .await;
     OpenRow {

@@ -24,6 +24,7 @@ use std::rc::Rc;
 use flint_core::fleet::{
     FleetAction, FleetCancel, FleetObject, FleetPlan, FleetPreview, FleetResult,
 };
+use flint_core::action_kinds;
 use flint_core::handle::AdmittedMember;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::input::InputState;
@@ -57,7 +58,9 @@ pub(in crate::ui) fn available(ws: &Workspace, choice: FleetChoice, cx: &App) ->
     if !members.iter().any(|(m, _)| m.context() == object.cluster) {
         return Err("the selected row is not from the open cluster set".to_owned());
     }
-    if !offered_for(&object.kind, false, None).contains(&choice.resource_action()) {
+    // A set's members may define a custom resource differently: built-in kinds only.
+    let scalable = action_kinds::scales_built_in(&object.kind);
+    if !offered_for(&object.kind, scalable, false, None).contains(&choice.resource_action()) {
         return Err(format!("{} has no such action", object.kind_label));
     }
     Ok(())
