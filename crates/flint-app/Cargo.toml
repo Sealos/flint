@@ -58,3 +58,5 @@ gpui-kit = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 # `ApiResource`, to build stub discovery (`KindInfo`) in tests.
 kube.workspace = true
+# The switcher scaling test measures thread CPU time.
+libc.workspace = true
