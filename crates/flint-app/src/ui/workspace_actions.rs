@@ -30,6 +30,8 @@ use super::super::compare::{self, CompareView};
 use super::super::confirm::{self, DialogText};
 use super::super::detail::{DetailView, Opening, refused};
 use super::super::dock::{Dock, DockTab, TabKey};
+use super::super::fleet_plan::FleetChoice;
+use super::super::fleet_view;
 use super::super::focus::release_unfocused_input;
 use super::super::keep_watching;
 use super::super::list::ResourceList;
@@ -75,6 +77,7 @@ use super::super::registry::{
     ForwardPort, OpenForwardedPort, ShowPortForwards, StartPortForward, StopAllPortForwards,
     StopPortForward,
 };
+use super::super::registry::{RestartAcrossSet, ScaleAcrossSet};
 use super::super::resource_actions::{self, ResourceAction};
 use super::super::scope_picker::ScopePicker;
 use super::super::terminal_view::TerminalView;
@@ -179,6 +182,12 @@ impl Workspace {
         })
         .bind::<RestartObject>(|this, _, window, cx| {
             resource_actions::request(this, ResourceAction::RolloutRestart, window, cx)
+        })
+        .bind::<RestartAcrossSet>(|this, _, window, cx| {
+            fleet_view::request(this, FleetChoice::RolloutRestart, window, cx)
+        })
+        .bind::<ScaleAcrossSet>(|this, _, window, cx| {
+            fleet_view::request(this, FleetChoice::Scale, window, cx)
         })
         .bind::<CordonNode>(|this, _, window, cx| {
             resource_actions::request(this, ResourceAction::Cordon, window, cx)
@@ -478,6 +487,12 @@ impl Workspace {
             })
             .when::<RestartObject>(|ws, cx| {
                 resource_actions::available(ws, ResourceAction::RolloutRestart, cx).is_ok()
+            })
+            .when::<RestartAcrossSet>(|ws, cx| {
+                fleet_view::available(ws, FleetChoice::RolloutRestart, cx).is_ok()
+            })
+            .when::<ScaleAcrossSet>(|ws, cx| {
+                fleet_view::available(ws, FleetChoice::Scale, cx).is_ok()
             })
             .when::<CordonNode>(|ws, cx| {
                 resource_actions::available(ws, ResourceAction::Cordon, cx).is_ok()

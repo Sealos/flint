@@ -511,7 +511,7 @@ fn reviewed(
 
 /// A refused action as it is said here: the core's wording for a context that moved is about a
 /// shell tab. Only the wording differs: the refusal stands.
-fn error_text(error: &WriteError) -> String {
+pub(in crate::ui) fn error_text(error: &WriteError) -> String {
     match error {
         WriteError::Refused(flint_core::protection::WriteRefusal::Moved { cluster }) => format!(
             "\"{cluster}\" points at another server than this object was opened from, so the \
@@ -739,7 +739,7 @@ fn replaced_note(name: &str) -> String {
 }
 
 /// The replica count `typed`, or why it is not one.
-fn parse_replicas(typed: &str) -> Result<u32, String> {
+pub(in crate::ui) fn parse_replicas(typed: &str) -> Result<u32, String> {
     let typed = typed.trim();
     let wrong = || "Enter a whole number of replicas, 0 or more.".to_owned();
     if typed.is_empty() || !typed.bytes().all(|b| b.is_ascii_digit()) {
@@ -779,9 +779,9 @@ fn scale_dialog(target: &WriteTarget, current: Option<u64>) -> DialogText {
 }
 
 /// The replica count field under the scale dialog's text.
-struct ScaleField {
-    input: Entity<InputState>,
-    error: Option<String>,
+pub(in crate::ui) struct ScaleField {
+    pub(in crate::ui) input: Entity<InputState>,
+    pub(in crate::ui) error: Option<String>,
 }
 
 impl Render for ScaleField {

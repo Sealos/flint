@@ -683,6 +683,17 @@ actions!(
         ShowClusterSetList
     ]
 );
+actions!(
+    cluster_sets,
+    [
+        /// Restart the selected workload on every member of the running set, one at a time,
+        /// after a per-member plan and one confirmation.
+        RestartAcrossSet,
+        /// Ask for a replica count, then scale the selected workload on every member of the
+        /// running set, one at a time, after a per-member plan and one confirmation.
+        ScaleAcrossSet
+    ]
+);
 
 /// Add a cluster to the sidebar's choice, or take it out.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
@@ -2789,6 +2800,18 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Go back from the set's dashboard to its combined list.",
         )
         .of(C::Cluster, S::ClusterSets),
+        Spec::unit::<RestartAcrossSet>(
+            "Restart Selected Workload Across Set",
+            "Restart the selected workload on every member of the running set, one at a time, \
+             after a per-member plan and one confirmation.",
+        )
+        .of(C::Detail, S::Workspace),
+        Spec::unit::<ScaleAcrossSet>(
+            "Scale Selected Workload Across Set",
+            "Ask for a replica count, then scale the selected workload on every member of the \
+             running set, one at a time, after a per-member plan and one confirmation.",
+        )
+        .of(C::Detail, S::Workspace),
         Spec::with_args::<OpenSetMember>(
             "Open Set Member…",
             "Open the combined list filtered to one member.",
