@@ -11,7 +11,7 @@ use flint_core::write::{
     WriteWarning,
 };
 use flint_core::{KindId, Settings, WatchMode, WatchTiming};
-use flint_e2e::fake_api::{CONTEXT, FakeApiServer, FakePod, Fault, Gvr, Verb};
+use flint_e2e::fake_api::{CONTEXT, FakeApiServer, FakePod, Fault, Gvr, RequestRecord, Verb};
 use serde_json::{Value, json};
 
 const WAIT: Duration = Duration::from_secs(30);
@@ -856,13 +856,37 @@ fn set_labels(
     server.set_object(gvr, object);
 }
 
-/// The requests since the first `from`. These tests run in On view, which has no telemetry feed,
-/// so nothing but the action under test reads these objects.
+/// The requests since the first `from` that the action under test could have sent. Problem
+/// detection runs in On view too (#715), so its feed's cluster-wide lists and watches, and
+/// discovery, can land while an action runs: those are left out ([`background_read`]). Every
+/// write, every read of a named object and the drain's read of a node's pods are kept.
 fn since(server: &FakeApiServer, from: usize) -> Vec<(http::Method, String)> {
     server.requests()[from..]
         .iter()
+        .filter(|r| !background_read(r))
         .map(|r| (r.method.clone(), r.path.clone()))
         .collect()
+}
+
+/// A GET of a whole collection across the cluster, or of discovery, other than a drain's read of
+/// a node's pods. An action reads only the object it acts on, the pods it evicts and, for a
+/// drain, the pods on its node, so a read like this comes from a feed, never from an action.
+fn background_read(request: &RequestRecord) -> bool {
+    if request.method != http::Method::GET {
+        return false;
+    }
+    let on_node = request
+        .parsed_query()
+        .field_selector
+        .is_some_and(|fields| fields.starts_with("spec.nodeName="));
+    let segments: Vec<&str> = request.path.trim_matches('/').split('/').collect();
+    // `/api/v1/<plural>` and `/apis/<group>/<version>/<plural>` at most: no name, no namespace.
+    let cluster_wide = match segments.first() {
+        Some(&"api") => segments.len() <= 3,
+        Some(&"apis") => segments.len() <= 4,
+        _ => false,
+    };
+    cluster_wide && !on_node
 }
 
 fn writes_in(requests: &[(http::Method, String)]) -> usize {
