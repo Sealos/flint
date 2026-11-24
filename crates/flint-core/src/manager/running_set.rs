@@ -4,8 +4,9 @@
 //! [`Schedule`](crate::connection::schedule::Schedule) when a background attempt may start; this
 //! carries out their answers on the cluster slots. Every attempt runs on its own task
 //! and only its result comes back through the manager's loop, so a member that fails, hangs or
-//! needs a sign-in holds up no other. Credentials that run a program never run for a background
-//! member: it waits as signed out until it is selected.
+//! needs a sign-in holds up no other. Credentials that run a program run for a background member
+//! only under its keep-watching consent, by that feature's rules (ADR-0012); without one it waits
+//! as signed out until it is selected.
 //!
 //! Membership grants nothing on the write path: writes ask the per-cluster gate as before.
 
@@ -22,7 +23,10 @@ use crate::connection::member::{
 use crate::connection::policy::Role;
 use crate::connection::schedule::{AttemptId, Jitter};
 use crate::credential::{CredentialSource, WriteCredential};
-use crate::handle::{AdmittedMember, ConnectionState, Event, MemberReport, MemberStatus};
+use crate::handle::{
+    AdmittedMember, ConnectionState, Event, LeftOutMember, LeftOutReason, MemberReport,
+    MemberStatus, OpenedSet,
+};
 use crate::recheck::Pinned;
 use crate::settings::ClusterPin;
 use crate::store::SyncState;
@@ -36,6 +40,14 @@ const SET_TICK: Duration = Duration::from_millis(250);
 const SIGN_IN_IN_FRONT: &str = "this cluster's sign-in runs a program; select it to connect";
 
 const CREDENTIAL_REFUSED: &str = "the server refused this cluster's sign-in; select it to retry";
+
+const CONSENT_SIGN_IN_FAILED: &str =
+    "this cluster's background sign-in stopped; select it to sign in";
+
+/// Why a member's connection made under consent ended.
+pub(super) fn consent_ended() -> SafeErrorText {
+    SafeErrorText::reduced(CONSENT_SIGN_IN_FAILED)
+}
 
 /// Backoff jitter from the standard library's per-instance random keys.
 #[derive(Default)]
@@ -140,6 +152,74 @@ impl ClusterManager {
         Ok(admitted)
     }
 
+    /// Classifies every pin and makes the running set those that can join, in one step, so no
+    /// change can land between the two. Fewer than a set's minimum changes nothing and admits
+    /// nobody. A malformed list is refused whole.
+    pub(super) fn open_running_set(&mut self, pins: Vec<ClusterPin>) -> Result<OpenedSet, String> {
+        let mut seen: Vec<&str> = Vec::with_capacity(pins.len());
+        for pin in &pins {
+            if seen.contains(&pin.context.as_str()) {
+                return Err(format!("\"{}\" is in the set twice.", pin.context));
+            }
+            seen.push(&pin.context);
+        }
+        if !SET_SIZES.contains(&pins.len()) {
+            return Err(format!(
+                "A running set holds {} to {} clusters.",
+                SET_SIZES.start(),
+                SET_SIZES.end()
+            ));
+        }
+        let mut members = Vec::with_capacity(pins.len());
+        let mut left_out = Vec::new();
+        for pin in pins {
+            match self.classify_member(pin) {
+                Ok(member) => members.push(member),
+                Err(member) => left_out.push(member),
+            }
+        }
+        if members.len() < *SET_SIZES.start() {
+            return Ok(OpenedSet {
+                members: Vec::new(),
+                left_out,
+            });
+        }
+        let ids: Vec<ClusterId> = members.iter().map(|m| m.context().to_owned()).collect();
+        if let Some(problem) = self.set_problem(&ids) {
+            return Err(problem);
+        }
+        self.set_running_set(ids);
+        Ok(OpenedSet { members, left_out })
+    }
+
+    /// `pin` as an admitted member, or why it stays out. Anything [`Self::admit_member`] refuses
+    /// stays out, so this is never less strict than admitting the pin alone.
+    fn classify_member(&self, pin: ClusterPin) -> Result<AdmittedMember, LeftOutMember> {
+        let id = pin.context.as_str();
+        let reason = match self.cluster(id) {
+            None => Some(LeftOutReason::Removed),
+            Some(_) if self.paused(id) => Some(LeftOutReason::Paused),
+            Some(slot)
+                if self.unsettled(id)
+                    || !self
+                        .contexts
+                        .shown(id, slot.info.server.as_deref())
+                        .confirmed =>
+            {
+                Some(LeftOutReason::Provisional)
+            }
+            Some(_) => None,
+        };
+        let context = pin.context.clone();
+        match reason {
+            Some(reason) => Err(LeftOutMember { context, reason }),
+            None => self.admit_member(pin).map_err(|_| LeftOutMember {
+                context,
+                reason: LeftOutReason::Changed,
+            }),
+        }
+    }
+
     /// `pin` as an admitted member, if its context shows exactly that server, confirmed.
     fn admit_member(&self, pin: ClusterPin) -> Result<AdmittedMember, String> {
         let id = pin.context.as_str();
@@ -173,7 +253,10 @@ impl ClusterManager {
     pub(super) fn member_changed(&self, member: &AdmittedMember) -> Option<String> {
         let id = member.context();
         let changed = || format!("\"{id}\" changed since this set opened. Open the set again.");
-        if self.contexts.check(Pinned::Logs, id, &member.at).is_some() {
+        // A disconnect ends the admission too (`ContextHistory::end_writes`).
+        if self.contexts.check(Pinned::Logs, id, &member.at).is_some()
+            || self.contexts.gate_moved(id, &member.at)
+        {
             return Some(changed());
         }
         let shown = self.cluster(id).and_then(|c| c.info.server.as_deref());
@@ -279,8 +362,8 @@ impl ClusterManager {
             return;
         };
         let active = self.active.as_deref() == Some(id);
-        let denied =
-            (!active && self.runs_a_command(id)).then(|| SafeErrorText::reduced(SIGN_IN_IN_FRONT));
+        let denied = (!active && self.runs_a_command(id) && self.member_consent(id).is_none())
+            .then(|| SafeErrorText::reduced(SIGN_IN_IN_FRONT));
         let signed_out = denied.is_some();
         let (member, action) = Member::join(ServerIdentity::new(server), denied, None);
         self.members.insert(id.to_owned(), member);
@@ -294,7 +377,8 @@ impl ClusterManager {
     }
 
     /// Ends `id`'s membership. Its watches stop unless it is active; a connection already up stays,
-    /// as it does for a cluster switched away from, and one still being made is dropped.
+    /// as it does for a cluster switched away from, and one still being made is dropped. One made
+    /// under consent is dropped either way, and the selected cluster connects again.
     pub(super) fn leave_set(&mut self, id: &str) {
         self.members.remove(id);
         self.schedule.dequeue(&id.to_owned());
@@ -302,12 +386,17 @@ impl ClusterManager {
         let mut dropped = false;
         if let Some(slot) = self.cluster_mut(id) {
             let attempt = slot.member_attempt.take();
-            if !active && matches!(slot.state, ConnectionState::Connecting) {
+            let connecting = matches!(slot.state, ConnectionState::Connecting);
+            // Consent covers members only: a connection made under it never outlives membership.
+            let consented = slot.access.unattended()
+                && (connecting || matches!(slot.state, ConnectionState::Connected(_)));
+            if (!active && connecting) || consented {
                 if let Some(task) = slot.connect_task.take() {
                     task.abort();
                 }
-                slot.access.revoke();
+                slot.clear_connection();
                 slot.attempt = 0;
+                slot.discovering = false;
                 slot.state = ConnectionState::Disconnected;
                 dropped = true;
             }
@@ -320,6 +409,9 @@ impl ClusterManager {
                 cluster: id.to_owned(),
                 state: ConnectionState::Disconnected,
             });
+            if active {
+                self.ensure_connected(id);
+            }
         }
         self.reconcile(id);
     }
@@ -571,7 +663,8 @@ impl ClusterManager {
     /// connection that is up ends as signed out. One still being made, or held by a member not
     /// yet live, is replaced by a queued attempt that the policy refuses. With no connection and
     /// a definition that can't be known yet, nothing can run, and the attempt after the pause
-    /// asks the policy.
+    /// asks the policy. A member with keep-watching consent keeps a connection made under it,
+    /// and has any other replaced by a queued attempt under it.
     pub(super) fn demote_member(&mut self, id: &str, now: Instant) {
         if !self.runs_a_command(id) {
             return;
@@ -581,12 +674,17 @@ impl ClusterManager {
         };
         let member_connecting = *member.state() == MemberState::Connecting;
         let unsettled = self.unsettled(id);
+        let consented = self.member_consent(id).is_some();
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
+        if consented && slot.access.unattended() {
+            return;
+        }
         // Whatever happens to the connection below, it never runs its command again.
         slot.access.revoke();
-        if !member_connecting && !matches!(slot.state, ConnectionState::Connecting) {
+        let replace = consented && slot.client.is_some();
+        if !replace && !member_connecting && !matches!(slot.state, ConnectionState::Connecting) {
             if slot.write_credential.is_some() || !unsettled {
                 let reason = SafeErrorText::reduced(SIGN_IN_IN_FRONT);
                 self.apply_member(id, MemberEvent::CredentialLost { reason }, now);
@@ -609,6 +707,54 @@ impl ClusterManager {
             state: ConnectionState::Disconnected,
         });
         self.apply_member(id, MemberEvent::ConnectionLost, now);
+    }
+
+    /// The credential of `id`'s connection made under consent failed or was refused. In the
+    /// background it waits for a sign-in, with no retry. Selected, it connects again in the
+    /// foreground, where a prompt is expected. A connection still being made answers through
+    /// its result.
+    pub(super) fn member_credential_failed(&mut self, id: &str, attempt: u64) {
+        let now = Instant::now();
+        let active = self.active.as_deref() == Some(id);
+        let Some(slot) = self.cluster_mut(id) else {
+            return;
+        };
+        if slot.attempt != attempt || !matches!(slot.state, ConnectionState::Connected(_)) {
+            return;
+        }
+        if !active {
+            let reason = consent_ended();
+            self.apply_member(id, MemberEvent::CredentialLost { reason }, now);
+            return;
+        }
+        self.reconnect_selected(id);
+    }
+
+    /// Replaces the selected cluster's connection with a new one in the foreground.
+    pub(super) fn reconnect_selected(&mut self, id: &str) {
+        let Some(slot) = self.cluster_mut(id) else {
+            return;
+        };
+        if let Some(task) = slot.connect_task.take() {
+            task.abort();
+        }
+        if let Some(attempt) = slot.member_attempt.take() {
+            self.schedule.finish(attempt);
+        }
+        let Some(slot) = self.cluster_mut(id) else {
+            return;
+        };
+        slot.clear_connection();
+        // No attempt has id 0, so a discovery still running is ignored.
+        slot.attempt = 0;
+        slot.discovering = false;
+        slot.reconnect = true;
+        slot.state = ConnectionState::Disconnected;
+        self.emit(Event::ConnectionChanged {
+            cluster: id.to_owned(),
+            state: ConnectionState::Disconnected,
+        });
+        self.reconnect_active(id);
     }
 
     /// A pause voids an attempt in flight: its task ends, so a result from before the pause can

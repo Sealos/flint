@@ -1103,37 +1103,49 @@ mod tests {
         assert!(most <= RESULTS as u64 * 4, "{most} allocations");
     }
 
-    /// The fastest of `rounds` more typings of [`TYPED`] over each index, kept in `best`.
-    fn time_typing(indexes: [&Index; 2], best: &mut [Duration; 2], rounds: usize) {
-        for _ in 0..rounds {
-            for (index, best) in indexes.into_iter().zip(best.iter_mut()) {
-                let mut search = Search::default();
-                let start = Instant::now();
-                for end in 1..=TYPED.len() {
-                    std::hint::black_box(search.run(index, &TYPED[..end]));
-                }
-                *best = (*best).min(start.elapsed());
-            }
-        }
+    /// CPU time spent on this thread, excluding time when it was descheduled.
+    fn thread_cpu_time() -> Duration {
+        let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        // SAFETY: clock_gettime initializes the writable timespec on success.
+        let time = unsafe {
+            assert_eq!(
+                libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, time.as_mut_ptr()),
+                0
+            );
+            time.assume_init()
+        };
+        Duration::new(
+            time.tv_sec.try_into().unwrap(),
+            time.tv_nsec.try_into().unwrap(),
+        )
     }
 
-    // covers UP-31: four times the objects cost at most about four times the time (3.2 here).
-    // Both sizes are timed in turn and only each one's fastest run counts, so the ratio holds on
-    // a busy machine, where a fixed limit in milliseconds does not. A search quadratic in the
-    // objects would take about 16 times as long.
+    fn typing_cpu_time(index: &Index) -> Duration {
+        let mut search = Search::default();
+        let start = thread_cpu_time();
+        for end in 1..=TYPED.len() {
+            std::hint::black_box(search.run(index, &TYPED[..end]));
+        }
+        thread_cpu_time() - start
+    }
+
+    // covers UP-31: eight times the objects should take about eight times the work, with
+    // headroom for cache effects. Quadratic work grows by a factor of 64.
     #[test]
     fn typing_time_grows_linearly_with_the_objects() {
-        const LIMIT: u32 = 6;
-        let (small, big) = (large(4_000), large(16_000));
-        let mut best = [Duration::MAX; 2];
-        time_typing([&small, &big], &mut best, 5);
-        // Pauses only ever add time, so more rounds can clear a noisy result but not a real one.
-        for _ in 0..20 {
-            if best[1] < best[0] * LIMIT {
-                break;
-            }
-            time_typing([&small, &big], &mut best, 1);
+        const LIMIT: u32 = 12;
+        let (small, big) = (large(4_000), large(32_000));
+        let mut small_samples = [Duration::ZERO; 3];
+        let mut big_samples = [Duration::ZERO; 3];
+        for (small_sample, big_sample) in small_samples.iter_mut().zip(&mut big_samples) {
+            *small_sample = typing_cpu_time(&small);
+            *big_sample = typing_cpu_time(&big);
         }
-        assert!(best[1] < best[0] * LIMIT, "{best:?}");
+        small_samples.sort_unstable();
+        big_samples.sort_unstable();
+        assert!(
+            big_samples[1] < small_samples[1] * LIMIT,
+            "typing CPU times: 4,000 objects {small_samples:?}, 32,000 objects {big_samples:?}"
+        );
     }
 }

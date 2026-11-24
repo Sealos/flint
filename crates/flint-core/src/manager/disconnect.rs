@@ -6,6 +6,7 @@
 //! them, after asking.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
 
@@ -17,11 +18,34 @@ use crate::logs::LogError;
 /// What a log tab says once its cluster was disconnected.
 pub(super) const LOGS_ENDED: &str = "disconnected from this cluster; select it to connect again";
 
+/// How many times each cluster was disconnected, counted when the front end asks, before the
+/// core takes the command. A request stamped with an older count was made before a disconnect
+/// the core may not have run yet, so it starts nothing.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DisconnectCount(Arc<Mutex<HashMap<ClusterId, u64>>>);
+
+impl DisconnectCount {
+    pub(crate) fn of(&self, cluster: &str) -> u64 {
+        self.counts().get(cluster).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn bump(&self, cluster: &str) {
+        *self.counts().entry(cluster.to_owned()).or_default() += 1;
+    }
+
+    fn counts(&self) -> std::sync::MutexGuard<'_, HashMap<ClusterId, u64>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// The clusters disconnected, and how to end each log session.
 #[derive(Default)]
 pub(super) struct Disconnects {
     clusters: HashSet<ClusterId>,
     log_stops: HashMap<u64, (ClusterId, watch::Sender<bool>)>,
+    pub(super) count: DisconnectCount,
 }
 
 impl Disconnects {
@@ -34,15 +58,17 @@ impl Disconnects {
         self.clusters.remove(id);
     }
 
-    /// The signal that ends log session `session` of `cluster`.
+    /// The signal that ends log session `session` of `cluster`, asked for when `cluster` had
+    /// been disconnected `asked` times: already given if it was disconnected since.
     pub(super) fn track_logs(
         &mut self,
         session: u64,
         cluster: &str,
+        asked: u64,
         live: impl Fn(&u64) -> bool,
     ) -> watch::Receiver<bool> {
         self.log_stops.retain(|id, _| live(id));
-        let (stop, stopped) = watch::channel(false);
+        let (stop, stopped) = watch::channel(self.count.of(cluster) != asked);
         self.log_stops.insert(session, (cluster.to_owned(), stop));
         stopped
     }
@@ -63,6 +89,10 @@ impl Disconnects {
 }
 
 impl ClusterManager {
+    pub(crate) fn disconnect_count(&self) -> DisconnectCount {
+        self.disconnects.count.clone()
+    }
+
     /// Why a new log read of `id` is refused, if it was disconnected.
     pub(super) fn disconnected_logs(&self, id: &str) -> Option<LogError> {
         self.disconnects
@@ -82,6 +112,14 @@ impl ClusterManager {
             .clusters
             .retain(|name| clusters.iter().any(|slot| slot.info.name == *name));
         self.disconnects.clusters.insert(id.clone());
+        // First: a write reviewed or confirmed before now is refused from here on, after a
+        // reconnect too, and the front end's dialogs on this connection close.
+        self.contexts.end_writes(&id);
+        let write_epoch = self.contexts.shown(&id, None).gate;
+        self.emit(Event::WritesEnded {
+            cluster: id.clone(),
+            write_epoch,
+        });
         self.keep.grants_revoke(&id);
         self.disconnects.end_logs(&id);
         if self.active.as_deref() == Some(id.as_str()) {
@@ -98,6 +136,9 @@ impl ClusterManager {
         if self.settings.watched_cluster(&id).is_some() {
             self.set_keep_watching(id, None).await;
         } else {
+            if self.settings_error.is_some() {
+                self.hold_keep_watching_off(&id);
+            }
             self.revoke_background_sign_in(&id);
         }
     }
@@ -108,7 +149,10 @@ impl ClusterManager {
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
-        if let Some(task) = slot.connect_task.take() {
+        for task in [slot.connect_task.take(), slot.discovery_task.take()]
+            .into_iter()
+            .flatten()
+        {
             task.abort();
         }
         slot.attempt_lease = None;

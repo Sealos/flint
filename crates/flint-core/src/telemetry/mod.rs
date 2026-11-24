@@ -31,7 +31,9 @@
 
 mod board;
 mod capacity;
+mod checked;
 mod feed;
+mod kept_discovery;
 mod metrics;
 mod objects;
 mod problems;
@@ -39,6 +41,7 @@ mod side;
 mod usage;
 
 use std::future::Future;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -49,6 +52,7 @@ use k8s_openapi::api::core::v1::{Node, Pod};
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinSet;
 
+pub use self::checked::CheckedObjects;
 use crate::alerts::ClusterSnapshot;
 use crate::cluster::{SafeErrorText, Target};
 use crate::dashboard::{ProblemCounts, ProblemSnapshot, ProblemSummariser};
@@ -57,9 +61,11 @@ use crate::metrics_trend::TrendStore;
 use crate::problems::{Problem, ProblemId, ProblemKind};
 
 pub(crate) use board::TelemetryBoard;
-pub use board::{ClusterTelemetry, TelemetryUpdates};
+pub use board::{ClusterTelemetry, FeedDiscovery, TelemetryUpdates};
 pub use capacity::{Allocatable, ClusterCapacity, Inventory, NodeCapacity, Reserved};
 use feed::KindFeed;
+pub use kept_discovery::KeptCoverage;
+pub(crate) use kept_discovery::{DiscoveryPace, KeptDiscovery};
 pub use objects::MAX_OBJECTS_PER_KIND;
 use objects::Stores;
 use side::SideFeed;
@@ -87,7 +93,7 @@ impl RequestGate {
     }
 
     /// Runs `request` once there is room. Time spent waiting counts against a caller's timeout.
-    async fn run<F: Future>(&self, request: F) -> F::Output {
+    pub(crate) async fn run<F: Future>(&self, request: F) -> F::Output {
         let _permit = match &self.0 {
             Some(limit) => limit.acquire().await.ok(),
             None => None,
@@ -207,6 +213,8 @@ pub struct TelemetrySnapshot {
     pub unchecked: Vec<ProblemKind>,
     /// Problems in [`Self::problems`] not counted yet, because their hold-down has not passed.
     pub settling: Vec<ProblemId>,
+    /// The objects this pass judged, so a list can tell a healthy row from one not seen yet.
+    pub checked: Arc<CheckedObjects>,
     pub counts: ProblemCounts,
     pub metrics: MetricsCheck,
     /// `None` while nodes cannot be relied on.
@@ -226,6 +234,7 @@ impl TelemetrySnapshot {
             problems: Arc::from([]),
             unchecked: problems::ALL_PROBLEM_KINDS.to_vec(),
             settling: Vec::new(),
+            checked: Arc::default(),
             counts: summariser.summarise(&ProblemSnapshot::unavailable(), at),
             metrics: MetricsCheck::Waiting,
             capacity: None,
@@ -259,6 +268,7 @@ impl TelemetrySnapshot {
             && self.problems == other.problems
             && self.unchecked == other.unchecked
             && self.settling == other.settling
+            && self.checked == other.checked
             && self.counts == other.counts
             && self.metrics == other.metrics
             && self.capacity == other.capacity
@@ -307,12 +317,15 @@ impl Default for TelemetryTiming {
 }
 
 /// What the tasks of one feed share.
+#[derive(Debug)]
 struct Shared {
     stores: Mutex<Stores>,
     metrics: Mutex<MetricsCheck>,
     version: Mutex<VersionCheck>,
     /// Something changed, so the next pass should run.
     dirty: Notify,
+    /// Seconds a pod may stay Pending before it is a problem. Read on every pass.
+    pending_after: AtomicU32,
 }
 
 impl Shared {
@@ -351,6 +364,7 @@ impl Shared {
 pub struct Telemetry {
     latest: watch::Receiver<Arc<TelemetrySnapshot>>,
     side: watch::Receiver<SideReads>,
+    shared: Arc<Shared>,
     tasks: JoinSet<()>,
 }
 
@@ -365,12 +379,14 @@ impl Telemetry {
         trends: Arc<Mutex<TrendStore>>,
         timing: TelemetryTiming,
         requests: RequestGate,
+        pending_after: u32,
     ) -> Self {
         let shared = Arc::new(Shared {
             stores: Mutex::default(),
             metrics: Mutex::default(),
             version: Mutex::default(),
             dirty: Notify::new(),
+            pending_after: AtomicU32::new(pending_after),
         });
         let first = Arc::new(TelemetrySnapshot::starting(
             Arc::clone(&cluster),
@@ -422,11 +438,19 @@ impl Telemetry {
             timing.metrics_every,
             reads,
         ));
-        tasks.spawn(problems::run(cluster, shared, sender, timing));
+        tasks.spawn(problems::run(cluster, Arc::clone(&shared), sender, timing));
         Self {
             latest,
             side,
+            shared,
             tasks,
+        }
+    }
+
+    /// Judges Pending pods against `seconds` from the next pass, which runs now if it changed.
+    pub(crate) fn set_pending_after(&self, seconds: u32) {
+        if self.shared.pending_after.swap(seconds, Ordering::Relaxed) != seconds {
+            self.shared.dirty.notify_one();
         }
     }
 
@@ -438,6 +462,16 @@ impl Telemetry {
     /// Warning events, claims and usage as last read.
     pub fn side_reads(&self) -> SideReads {
         self.side.borrow().clone()
+    }
+
+    /// Runs `discovery` for as long as this feed runs.
+    fn follow_discovery(
+        &mut self,
+        discovery: KeptDiscovery,
+        found: watch::Sender<KeptCoverage>,
+        version: watch::Sender<u64>,
+    ) {
+        self.tasks.spawn(discovery.follow(found, version));
     }
 
     /// Counts each change of this feed on `version`, for as long as the feed runs.
@@ -515,5 +549,6 @@ pub async fn start_for_tests(
         trends,
         timing,
         RequestGate::default(),
+        crate::thresholds::ThresholdMetric::PendingPodSeconds.default_value(),
     ))
 }

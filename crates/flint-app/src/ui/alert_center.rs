@@ -30,7 +30,7 @@ use flint_core::handle::{ActivationRefused, ClusterSummary, ConnectionState, Rea
 use flint_core::problems::ProblemKind;
 use flint_core::read::DiscoveredKinds;
 use flint_core::settings::{Settings, WatchMode, load_settings};
-use flint_core::telemetry::TelemetrySnapshot;
+use flint_core::telemetry::{ClusterTelemetry, FeedDiscovery, KeptCoverage, TelemetrySnapshot};
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -42,7 +42,7 @@ use serde::Serialize;
 
 use super::clusters::{ClustersModel, Discovered};
 use super::workspace::SettingsDir;
-use super::{menu_fit, registry};
+use super::{menu_fit, pending_threshold, registry};
 use crate::notifications::investigate_prompt::{InvestigatePrompt, event_prompt};
 use crate::notifications::{
     ACCEPTED_TEXT, DeliveryError, Notification, NotificationSender, clean, distinct_labels,
@@ -66,20 +66,14 @@ const UNWATCHED_GRACE: SignedDuration = SignedDuration::from_secs(30);
 const NOTE_TIME: Duration = Duration::from_secs(4);
 
 /// What the setting promises, shown beside it.
-pub const COVERAGE: &str = "Only clusters on Live: all kinds are checked in the background.";
+pub const COVERAGE: &str =
+    "Checks connected clusters with active watches and clusters actively kept watching.";
 
 /// What it does not cover.
-pub const NOT_COVERED: &str = "Clusters on Live: open views only have no background detection.";
+pub const NOT_COVERED: &str = "Other clusters have no background detection.";
 
 /// Every kind of problem.
-const ALL_KINDS: [ProblemKind; 6] = [
-    ProblemKind::CrashLoop,
-    ProblemKind::OomKilled,
-    ProblemKind::ImagePull,
-    ProblemKind::NodeNotReady,
-    ProblemKind::JobFailed,
-    ProblemKind::WorkloadShort,
-];
+const ALL_KINDS: [ProblemKind; 7] = ProblemKind::ALL;
 
 /// Turn desktop notifications on or off.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
@@ -237,6 +231,11 @@ pub enum Reading<'a> {
         snapshot: &'a TelemetrySnapshot,
         discovery: Option<&'a ClusterDiscovery>,
     },
+    /// Its feed runs on a kept-watching connection, whose own discovery vouches for its kinds.
+    Kept {
+        snapshot: &'a TelemetrySnapshot,
+        coverage: KeptCoverage,
+    },
     /// It should be readable and is not: its connection failed or it is paused.
     Lost,
     /// Flint is not keeping it watched.
@@ -272,13 +271,29 @@ pub fn reading<'a>(
     }
 }
 
-/// The API groups a kind of problem is read from. A pod's owner is read through its ReplicaSet.
-fn groups_of(kind: ProblemKind) -> &'static [&'static str] {
-    match kind {
-        ProblemKind::CrashLoop | ProblemKind::OomKilled | ProblemKind::ImagePull => &["", "apps"],
-        ProblemKind::NodeNotReady => &[""],
-        ProblemKind::JobFailed => &["batch"],
-        ProblemKind::WorkloadShort => &["apps"],
+/// [`reading`] of `summary` from `feed`, if that feed was started for the slot `summary` describes.
+/// A feed of an earlier slot can still be listed when a new summary arrives, and what it read is
+/// about another server.
+fn feed_reading<'a>(
+    summary: &ClusterSummary,
+    mode: WatchMode,
+    feed: Option<&'a ClusterTelemetry>,
+    slot: Option<&'a ClusterDiscovery>,
+) -> Reading<'a> {
+    let feed = feed.filter(|feed| feed.generation == summary.generation);
+    let snapshot = feed.map(|feed| &*feed.snapshot);
+    match (reading(summary, mode, snapshot, slot), feed) {
+        (
+            Reading::Feed { snapshot, .. },
+            Some(ClusterTelemetry {
+                discovery: FeedDiscovery::Kept(coverage),
+                ..
+            }),
+        ) => Reading::Kept {
+            snapshot,
+            coverage: *coverage,
+        },
+        (reading, _) => reading,
     }
 }
 
@@ -295,7 +310,7 @@ pub fn out_of_scope_kinds(discovery: Option<&ClusterDiscovery>) -> Vec<ProblemKi
     };
     ALL_KINDS
         .into_iter()
-        .filter(|kind| groups_of(*kind).iter().any(|group| incomplete(group)))
+        .filter(|kind| kind.api_groups().iter().any(|group| incomplete(group)))
         .collect()
 }
 
@@ -497,13 +512,15 @@ impl AlertTracker {
                     self.engine
                         .observe(&input.cluster, now, ClusterSnapshot::Unavailable)
                 }
-                Reading::Feed {
-                    snapshot,
-                    discovery,
-                } => {
+                Reading::Feed { snapshot, .. } | Reading::Kept { snapshot, .. } => {
                     self.unwatched_since.remove(&input.cluster);
+                    let out_of_scope = match input.reading {
+                        Reading::Kept { coverage, .. } => coverage.unchecked(),
+                        Reading::Feed { discovery, .. } => out_of_scope_kinds(discovery),
+                        _ => ALL_KINDS.to_vec(),
+                    };
                     let mut unchecked = snapshot.unchecked.clone();
-                    for kind in out_of_scope_kinds(discovery) {
+                    for kind in out_of_scope {
                         if !unchecked.contains(&kind) {
                             unchecked.push(kind);
                         }
@@ -539,6 +556,17 @@ impl AlertTracker {
                     .insert(Arc::clone(&input.cluster), input.origin.clone());
             }
             for event in events {
+                sent.push(self.record(event, input));
+            }
+        }
+        if let Some(event) = self.engine.take_fleet_summary(now) {
+            let first = match &event {
+                AlertEvent::FleetSummary(summary) => Some(&summary.first),
+                AlertEvent::Summary(summary) => Some(&summary.cluster),
+                _ => None,
+            };
+            let input = first.and_then(|first| inputs.iter().find(|i| i.cluster == *first));
+            if let Some(input) = input {
                 sent.push(self.record(event, input));
             }
         }
@@ -850,19 +878,18 @@ impl AlertCenter {
             .zip(labels)
             .map(|((summary, feed), label)| {
                 let id = summary.info.name.as_str();
-                let discovery = verified_discovery(model.discovery.get(id), summary.generation);
-                let snapshot = feed.as_ref().map(|feed| &*feed.snapshot);
+                let slot = verified_discovery(model.discovery.get(id), summary.generation);
                 let on = model.settings.alerts_on(id, summary.info.server.as_deref());
                 TrackerInput {
                     cluster: Arc::from(id),
                     origin: AlertOrigin::of(summary),
                     label,
                     reading: if on {
-                        reading(
+                        feed_reading(
                             summary,
                             model.settings.alert_mode_for(id),
-                            snapshot,
-                            discovery,
+                            feed.as_ref(),
+                            slot,
                         )
                     } else {
                         Reading::Muted
@@ -1167,6 +1194,7 @@ impl AlertCenter {
 pub fn install(model: &Entity<ClustersModel>, cx: &mut App) {
     let center = cx.new(|cx| AlertCenter::new(model.clone(), platform_sender(), cx));
     cx.set_global(Alerts(center.clone()));
+    pending_threshold::install(model, cx);
     let toggle_model = model.clone();
     cx.on_action(move |_: &ToggleDesktopNotifications, cx| {
         toggle_model.update(cx, |model, _| {
@@ -1219,7 +1247,8 @@ pub fn render_button(cx: &App) -> Option<impl IntoElement + use<>> {
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
                 menu_fit::dismiss_when_shrunk(window, cx);
                 let state = center.read(cx);
-                let mut menu = menu_fit::fit_menu(menu, window)
+                let pending = pending_threshold::PendingChoices::of(state.model.read(cx));
+                let menu = menu_fit::fit_menu(menu, window)
                     .item(
                         PopupMenuItem::new("Desktop notifications")
                             .checked(state.global)
@@ -1227,6 +1256,8 @@ pub fn render_button(cx: &App) -> Option<impl IntoElement + use<>> {
                     )
                     .label(COVERAGE)
                     .label(NOT_COVERED);
+                let mut menu = pending_threshold::submenu(menu, pending, window, cx);
+                let state = center.read(cx);
                 let model = state.model.read(cx);
                 if let Some(active) = model.active_cluster() {
                     let id = active.info.name.clone();

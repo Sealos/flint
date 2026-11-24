@@ -11,16 +11,17 @@ use flint_core::discovery::ClusterDiscovery;
 use flint_core::handle::{ClusterSummary, ConnectionState};
 use flint_core::kubeconfig::ContextInfo;
 use flint_core::problems::{Classifier, Problem, ProblemKind, ProblemSeverity};
-use flint_core::settings::{AiScope, WatchMode, set_ai_exposed, set_ai_scope};
+use flint_core::settings::{AiScope, SETTINGS_FILE, WatchMode, set_ai_exposed, set_ai_scope};
 use flint_core::telemetry::{
     Availability, KindCheck, MetricsCheck, TelemetrySnapshot, WatchedKind,
 };
+use flint_e2e::fake_api::{FakeApiServer, Gvr, Options, WatchStep, write_kubeconfigs};
 use gpui_kit::{AppContext as _, ClipboardItem, TestAppContext};
 use jiff::Timestamp;
 use k8s_openapi::api::core::v1::{Node, NodeCondition, NodeStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
-use super::super::support_tests::{open_workspace, standard_sections};
+use super::super::support_tests::{WAIT, open_workspace, open_workspace_with, standard_sections};
 use super::{
     ALL_KINDS, AlertCenter, AlertOrigin, AlertTracker, Delivery, Discovered, MAX_RECENT,
     MutedClusters, Reading, SettingsDir, TrackerInput, check_origin, menu_row, out_of_scope_kinds,
@@ -50,6 +51,7 @@ fn summary(name: &str, state: ConnectionState) -> ClusterSummary {
         generation: 1,
         definition: 1,
         endpoint: 1,
+        write_epoch: 0,
         confirmed: true,
         provisional: false,
         paused: false,
@@ -94,6 +96,7 @@ fn snapshot(cluster: &str, problems: Vec<Problem>, now: Timestamp) -> TelemetryS
         problems: problems.into(),
         unchecked: Vec::new(),
         settling: Vec::new(),
+        checked: Arc::default(),
         counts,
         metrics: MetricsCheck::Waiting,
         capacity: None,
@@ -142,6 +145,50 @@ fn raised(tracker: &mut AlertTracker, cluster: &ClusterSummary, name: &str) -> N
     let mut sent = feed(tracker, cluster, vec![bad_node(id, name)], at(600));
     assert_eq!(sent.len(), 1, "{sent:?}");
     sent.remove(0)
+}
+
+#[test]
+fn a_change_across_many_clusters_sends_one_combined_notification() {
+    let clusters: Vec<ClusterSummary> = (0..8).map(|n| connected(&format!("c{n}"))).collect();
+    let discovery = complete();
+    let pass = |tracker: &mut AlertTracker, nodes: usize, now: Timestamp| {
+        let snapshots: Vec<TelemetrySnapshot> = clusters
+            .iter()
+            .map(|cluster| {
+                let id = &cluster.info.name;
+                let problems = (0..nodes)
+                    .map(|n| bad_node(id, &format!("node-{n}")))
+                    .collect();
+                snapshot(id, problems, now)
+            })
+            .collect();
+        let inputs: Vec<TrackerInput<'_>> = clusters
+            .iter()
+            .zip(&snapshots)
+            .map(|(cluster, snapshot)| {
+                input(
+                    cluster,
+                    Reading::Feed {
+                        snapshot,
+                        discovery: Some(&discovery),
+                    },
+                )
+            })
+            .collect();
+        tracker.observe(&inputs, now)
+    };
+    let mut tracker = tracker();
+    assert!(pass(&mut tracker, 0, at(0)).is_empty());
+    let sent = pass(&mut tracker, 8, at(600));
+    assert!(sent.len() <= 12, "{} notifications", sent.len());
+    let combined: Vec<&Notification> = sent
+        .iter()
+        .filter(|n| n.title.ends_with(" clusters"))
+        .collect();
+    assert_eq!(combined.len(), 1, "{sent:?}");
+    assert!(combined[0].body.contains("across"), "{}", combined[0].body);
+    let recent = tracker.find(&combined[0].tag).expect("listed");
+    assert!(matches!(recent.event, AlertEvent::FleetSummary(_)));
 }
 
 #[test]
@@ -535,6 +582,137 @@ fn a_cluster_turned_off_and_on_keeps_its_batch_cancelled() {
     let since = muted.turned_off.clone();
     let answers = send_batch(&sender, &batch, || true, |c| muted.blocks(c, &since));
     assert_eq!(answers.len(), 1);
+}
+
+/// Runs passes until `done` holds, on real time: the feeds answer from a real local server.
+fn pass_until(
+    cx: &mut TestAppContext,
+    center: &gpui_kit::Entity<AlertCenter>,
+    what: &str,
+    done: impl Fn(&AlertCenter) -> bool,
+) {
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        center.update(cx, |center, cx| center.pass(cx));
+        cx.run_until_parked();
+        if center.read_with(cx, |center, _| done(center)) {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "never: {what}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+// covers #210
+#[gpui_kit::test]
+async fn a_feed_of_an_earlier_slot_is_not_read_for_the_new_one(cx: &mut TestAppContext) {
+    let a = FakeApiServer::start_blocking(Options::default()).unwrap();
+    let b = FakeApiServer::start_blocking(Options::default()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace_with(cx, dir.path(), |dir, _| {
+        let path = dir.join("kubeconfig");
+        let servers = [(&a, "a", Some("demo")), (&b, "b", Some("demo"))];
+        write_kubeconfigs(&path, &servers).unwrap();
+        let settings = format!(
+            "desktop_notifications = true\n\n[[watched_clusters]]\ncontext = \"b\"\n\
+             server = \"{}\"\n",
+            b.url()
+        );
+        std::fs::write(dir.join(SETTINGS_FILE), settings).unwrap();
+        vec![path]
+    })
+    .await;
+    let deadline = std::time::Instant::now() + WAIT;
+    let feed = loop {
+        cx.run_until_parked();
+        if let Some(feed) = t
+            .model
+            .read_with(cx, |model, _| model.core().telemetry("b"))
+        {
+            break feed;
+        }
+        assert!(std::time::Instant::now() < deadline, "no feed");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let mut summary = t.model.read_with(cx, |model, _| {
+        model
+            .clusters
+            .iter()
+            .find(|cluster| cluster.info.name == "b")
+            .unwrap()
+            .clone()
+    });
+    assert_eq!(feed.generation, summary.generation);
+    assert!(matches!(
+        super::feed_reading(&summary, WatchMode::All, Some(&feed), None),
+        Reading::Kept { .. }
+    ));
+
+    summary.generation += 1;
+    let reading = super::feed_reading(&summary, WatchMode::All, Some(&feed), None);
+    assert!(matches!(reading, Reading::NotWatched), "{reading:?}");
+    let mut tracker = tracker();
+    assert!(
+        tracker
+            .observe(&[input(&summary, reading)], at(0))
+            .is_empty()
+    );
+    assert!(!tracker.checked.contains("b"), "it took a baseline");
+}
+
+// covers #210
+#[gpui_kit::test]
+async fn a_cluster_kept_watching_from_launch_alerts_before_it_is_selected(cx: &mut TestAppContext) {
+    let a = FakeApiServer::start_blocking(Options::default()).unwrap();
+    let b = FakeApiServer::start_blocking(Options::default()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace_with(cx, dir.path(), |dir, _| {
+        let path = dir.join("kubeconfig");
+        let servers = [(&a, "a", Some("demo")), (&b, "b", Some("demo"))];
+        write_kubeconfigs(&path, &servers).unwrap();
+        let settings = format!(
+            "desktop_notifications = true\n\n[[watched_clusters]]\ncontext = \"b\"\n\
+             server = \"{}\"\n",
+            b.url()
+        );
+        std::fs::write(dir.join(SETTINGS_FILE), settings).unwrap();
+        vec![path]
+    })
+    .await;
+    let sender = Arc::new(CountingSender::default());
+    let model = t.model.clone();
+    let notifier = Arc::clone(&sender);
+    let center = cx.update(|cx| cx.new(|cx| AlertCenter::new(model, notifier, cx)));
+
+    pass_until(cx, &center, "b is checked", |center| {
+        center.tracker.checked.contains("b")
+    });
+
+    let jobs = Gvr::new("batch", "v1", "jobs");
+    b.set_object(
+        &jobs,
+        serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {"name": "nightly", "namespace": "demo", "uid": "job-1",
+                         "resourceVersion": "1"},
+            "status": {"conditions": [{"type": "Failed", "status": "True",
+                                       "reason": "BackoffLimitExceeded"}]},
+        }),
+    );
+    b.send_watch(&jobs, WatchStep::Expired);
+    pass_until(cx, &center, "b raises an alert", |center| {
+        center
+            .tracker
+            .recent()
+            .any(|r| &*r.notification.cluster == "b")
+    });
+
+    let active = t.model.read_with(cx, |model, _| {
+        model.active_cluster().map(|c| c.info.name.clone())
+    });
+    assert_ne!(active.as_deref(), Some("b"), "it was never selected");
+    assert!(b.writes().is_empty(), "{:?}", b.writes());
 }
 
 #[gpui_kit::test]

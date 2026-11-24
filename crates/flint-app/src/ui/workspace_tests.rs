@@ -1,11 +1,11 @@
 //! View tests for the workspace's actions: through the registry, through clicks and keys, and
 //! with focus on the workspace itself (the actions forwarded to the list and detail pane).
 
-use flint_core::ClusterId;
 use flint_core::settings::AiExposureState;
+use flint_core::{ClusterId, ConnectionState, Event, ServerVersion, SyncState};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
-use gpui_kit::{AppContext as _, Entity, FocusHandle, TestAppContext};
+use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, FocusHandle, TestAppContext};
 use serde_json::{Value, json};
 
 use super::Workspace;
@@ -14,7 +14,10 @@ use crate::ui::dock::{DockItem as _, DockTab, TabStatus};
 use crate::ui::list::ResourceList;
 use crate::ui::nav::NavPanel;
 use crate::ui::registry::{self, ActionError};
-use crate::ui::support_tests::{TestWorkspace, WAIT, open_fake_shell, open_workspace};
+use crate::ui::support_tests::{
+    TestWorkspace, WAIT, kubeconfig_yaml, objects, open_fake_shell, open_window_over,
+    open_workspace,
+};
 use crate::ui::view_state::Focus;
 
 /// Test hooks into the workspace's private state, for the view tests of every module
@@ -481,9 +484,14 @@ fn connect_all(cx: &mut TestAppContext, t: &TestWorkspace) {
     cx.run_until_parked();
 }
 
-async fn right_click_row(cx: &mut TestAppContext, t: &TestWorkspace, name: &str) {
+async fn right_click_row(cx: &mut TestAppContext, handle: AnyWindowHandle, name: &str) {
     let row = gpui_kit::SharedString::from(format!("row-uid-{name}"));
-    cx.update_window(t.window, |_, window, cx| {
+    // Filtering and sorting await the core's worker, which can outlast GPUI going idle.
+    cx.wait_for(handle, WAIT, |window, _| {
+        window.try_find(row.clone()).is_some()
+    })
+    .await;
+    cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         window.right_click(row, cx);
     })
@@ -517,7 +525,7 @@ async fn a_row_menu_compares_its_own_row(cx: &mut TestAppContext) {
     t.open_pods(cx, &[("demo", "api", 0), ("demo", "web", 1)])
         .await;
     connect_all(cx, &t);
-    right_click_row(cx, &t, "web").await;
+    right_click_row(cx, t.window, "web").await;
     t.dispatch(
         cx,
         "resource_list::SelectRow",
@@ -541,8 +549,44 @@ async fn a_row_menu_compares_its_own_row(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 async fn a_read_only_kind_is_offered_compare_alone(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
-    t.open_pods(cx, &[("demo", "web", 1)]).await;
+    // Trust the origin so cluster protection does not add an Unlock entry.
+    std::fs::write(
+        dir.path().join("settings.toml"),
+        "trusted_clusters = [{ context = \"kind-alpha\", server = \"https://alpha.invalid\" }]\n",
+    )
+    .unwrap();
+    let kubeconfig = dir.path().join("kubeconfig");
+    std::fs::write(
+        &kubeconfig,
+        kubeconfig_yaml(&[
+            ("kind-alpha", "https://alpha.invalid"),
+            ("kind-beta", "https://beta.invalid"),
+        ]),
+    )
+    .unwrap();
+    cx.executor().allow_parking();
+    let (handle, workspace, model) = open_window_over(cx, dir.path(), vec![kubeconfig]);
+    cx.wait_for(handle, WAIT, |_, cx| model.read(cx).loaded)
+        .await;
+    let connected = ConnectionState::Connected(ServerVersion {
+        git_version: "v1".into(),
+        platform: "linux/arm64".into(),
+    });
+    // Drive the connection states through the model so a real attempt cannot overwrite them.
+    model.update(cx, |model, cx| {
+        model.feed(Event::ActiveChanged(Some("kind-alpha".into())), cx);
+        model.feed(
+            Event::ConnectionChanged {
+                cluster: "kind-alpha".into(),
+                state: connected.clone(),
+            },
+            cx,
+        );
+    });
+    cx.wait_for(handle, WAIT, |_, cx| {
+        workspace.read(cx).shown_cluster() == Some("kind-alpha")
+    })
+    .await;
     let entry = flint_core::NavEntry {
         id: flint_core::KindId::new("metrics.k8s.io", "pods"),
         label: "Pod Metrics".into(),
@@ -552,42 +596,61 @@ async fn a_read_only_kind_is_offered_compare_alone(cx: &mut TestAppContext) {
         listable: true,
         watchable: false,
     };
-    let workspace = t.workspace.clone();
-    cx.update_window(t.window, |_, window, cx| {
+    cx.update_window(handle, |_, window, cx| {
         workspace.update(cx, |ws, cx| {
             ws.open_kind(&entry, window, cx);
             let list = ws.list.clone().unwrap();
             list.update(cx, |list, cx| {
                 list.stop_watching();
-                list.set_snapshot(crate::ui::support_tests::pods(&[("demo", "web", 1)]), cx);
+                list.set_snapshot(
+                    objects(
+                        entry.id.clone(),
+                        &[("demo", "web", 1)],
+                        SyncState::Synced,
+                        1,
+                    ),
+                    cx,
+                );
             });
         });
     })
     .unwrap();
-    cx.run_until_parked();
-
-    right_click_row(cx, &t, "web").await;
-    let shown = cx
-        .update_window(t.window, |_, window, cx| {
+    right_click_row(cx, handle, "web").await;
+    let (shown, focus) = cx
+        .update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            window.try_find("popup-menu").is_some()
+            (
+                window.try_find("popup-menu").is_some(),
+                workspace.update(cx, |ws, cx| ws.view_state(window, cx).focus),
+            )
         })
         .unwrap();
     assert!(!shown, "nothing to offer with no other cluster");
-    let workspace = t.workspace.clone();
-    let state = cx
-        .update_window(t.window, |_, window, cx| {
-            workspace.update(cx, |ws, cx| ws.view_state(window, cx))
-        })
-        .unwrap();
-    assert_eq!(state.focus, Focus::List);
+    assert_eq!(focus, Focus::List);
 
-    connect_all(cx, &t);
-    right_click_row(cx, &t, "web").await;
-    click_compare_entry(cx, &t);
-    let compared = t
-        .workspace
-        .read_with(cx, |ws, cx| ws.dock.read(cx).active_compare().is_some());
+    model.update(cx, |model, cx| {
+        model.feed(
+            Event::ConnectionChanged {
+                cluster: "kind-beta".into(),
+                state: connected,
+            },
+            cx,
+        );
+    });
+    right_click_row(cx, handle, "web").await;
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let mut menu = window.within("popup-menu");
+        let labels: Vec<_> = (0usize..)
+            .map_while(|ix| menu.try_find(ix))
+            .map(|item| item.label().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(labels, ["Compare Across Clusters"]);
+        menu.click(0usize, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let compared = workspace.read_with(cx, |ws, cx| ws.dock.read(cx).active_compare().is_some());
     assert!(compared);
 }
 
@@ -638,7 +701,9 @@ async fn logs_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCont
         let dock = ws.dock.read(cx);
         match dock.tab(dock.tab_ids()[0]).unwrap() {
             DockTab::Logs(view) => view.downgrade(),
-            DockTab::Shell(_) | DockTab::Activity(_) | DockTab::Compare(_) => panic!("a log tab"),
+            DockTab::Shell(_) | DockTab::Activity(_) | DockTab::Compare(_) | DockTab::Helm(_) => {
+                panic!("a log tab")
+            }
         }
     });
 

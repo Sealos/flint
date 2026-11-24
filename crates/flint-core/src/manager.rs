@@ -38,11 +38,13 @@ use crate::write::WriteError;
 
 mod disconnect;
 mod file_watch;
+mod helm;
 mod keep_watching;
 mod running_set;
 mod selected_retry;
 mod telemetry;
 
+pub(crate) use disconnect::DisconnectCount;
 pub(crate) use keep_watching::KeptGrants;
 #[cfg(test)]
 pub(crate) use keep_watching::QUIT_WAIT;
@@ -103,6 +105,8 @@ pub(crate) struct Cluster {
     /// Kept while the cluster is not active (ADR-0008).
     discovery: Option<Arc<ClusterDiscovery>>,
     discovering: bool,
+    /// The discovery running on this slot's connection, ended with it on a disconnect.
+    discovery_task: Option<AbortHandle>,
     /// The CRDs changed while discovery ran: run it again when it finishes.
     rediscover: bool,
     /// The CRD list as last seen, so a changed list triggers a refresh.
@@ -135,8 +139,11 @@ impl Drop for Cluster {
         {
             task.abort();
         }
-        if let Some(attempt) = self.connect_task.take() {
-            attempt.abort();
+        for task in [self.connect_task.take(), self.discovery_task.take()]
+            .into_iter()
+            .flatten()
+        {
+            task.abort();
         }
     }
 }
@@ -167,6 +174,7 @@ impl Cluster {
             generation: 0,
             discovery: None,
             discovering: false,
+            discovery_task: None,
             rediscover: false,
             crd_fingerprint: None,
             crds: HashSet::new(),
@@ -215,6 +223,7 @@ impl Cluster {
             generation: self.generation,
             definition: shown.definition,
             endpoint: shown.endpoint,
+            write_epoch: shown.gate,
             confirmed: shown.confirmed,
             provisional,
             paused,
@@ -348,6 +357,12 @@ enum Internal {
     },
     /// Time to connect kept clusters that failed for a reason worth retrying.
     KeepWatchRetry,
+    /// The credential of a member's connection made under consent, attempt `attempt`, failed
+    /// or was refused.
+    MemberCredentialFailed {
+        cluster: ClusterId,
+        attempt: u64,
+    },
     FilesChanged(Changed),
     /// The file watches changed and now cover these directories. Anything may have been written
     /// before they started, so everything is read again.
@@ -766,6 +781,16 @@ impl ClusterManager {
                 }
                 self.apply_scope(&cluster);
             }
+            Command::SetThreshold {
+                cluster,
+                metric,
+                value,
+            } => {
+                self.write_settings("the threshold", move |dir| {
+                    settings::set_threshold(dir, cluster.as_ref(), metric, value)
+                })
+                .await
+            }
             Command::SetLogBufferLines(lines) => {
                 self.write_settings("the log buffer size", move |dir| {
                     settings::set_log_buffer_lines(dir, lines)
@@ -855,6 +880,7 @@ impl ClusterManager {
                 cluster,
                 server,
                 member,
+                disconnects,
                 subject,
                 options,
                 snapshots,
@@ -898,9 +924,11 @@ impl ClusterManager {
                     Arc::new(KubePodSource::new(lookup)),
                 );
                 let sessions = &self.log_sessions;
-                let stop = self.disconnects.track_logs(id, &context, |session| {
-                    sessions.get(session).is_some_and(|t| !t.is_finished())
-                });
+                let stop = self
+                    .disconnects
+                    .track_logs(id, &context, disconnects, |session| {
+                        sessions.get(session).is_some_and(|t| !t.is_finished())
+                    });
                 let feed = logs::until_stopped(feed, stop, disconnect::LOGS_ENDED.to_owned());
                 let task = tokio::spawn(logs::run(feed, config, snapshots, paused, Some(budget)));
                 self.log_sessions.retain(|_, t| !t.is_finished());
@@ -953,8 +981,22 @@ impl ClusterManager {
             Request::AdmitRunningSet { pins, reply } => {
                 let _ = reply.send(self.admit_running_set(pins));
             }
+            Request::OpenRunningSet { pins, reply } => {
+                let _ = reply.send(self.open_running_set(pins));
+            }
             Request::CheckMember { member, reply } => {
                 let _ = reply.send(self.member_changed(&member));
+            }
+            Request::HelmPin { cluster, reply } => {
+                let _ = reply.send(self.helm_pin(&cluster));
+            }
+            Request::HelmTarget {
+                cluster,
+                pin,
+                member,
+                reply,
+            } => {
+                let _ = reply.send(self.helm_target(&cluster, pin, member.as_ref()));
             }
             Request::MemberClient { member, reply } => {
                 let _ = reply.send(self.member_client(&member));
@@ -1193,7 +1235,7 @@ impl ClusterManager {
         slot.rediscover = false;
         let attempt = slot.attempt;
         let cluster = id.to_owned();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let result = read::discover_kinds(&client)
                 .await
                 .map_err(|e| e.for_target(&target).summary().to_string());
@@ -1203,6 +1245,7 @@ impl ClusterManager {
                 result,
             });
         });
+        slot.discovery_task = Some(task.abort_handle());
     }
 
     /// Writes one change to `settings.toml` (`what` names it in errors) and applies the result.
@@ -1400,6 +1443,7 @@ impl ClusterManager {
         self.settings = Arc::new(settings);
         self.settings_error = error;
         self.log_budget.set_limit(self.settings.log_total_bytes());
+        self.apply_pending_thresholds();
         // The watch mode may have changed: start and stop the watches first, so a front end
         // that reads the stores when it hears of the change (the resource switcher) finds
         // them as the new settings have them.
@@ -1531,6 +1575,7 @@ impl ClusterManager {
                 self.end_invalid_retry();
                 let target = cluster::Target::of(&self.kubeconfig.merged, &cluster);
                 let paused = self.paused(&cluster);
+                let active = self.active.as_deref() == Some(cluster.as_str());
                 let Some(slot) = self.cluster_mut(&cluster) else {
                     return;
                 };
@@ -1544,6 +1589,9 @@ impl ClusterManager {
                     .attempt_lease
                     .take()
                     .is_some_and(|lease| !lease.holds());
+                // Made under consent in the background: like a kept feed, its first failure
+                // waits for a sign-in, with no retry.
+                let unattended = slot.access.unattended() && !active;
                 // Dropped either way: the load that ends the pause connects again.
                 if paused {
                     slot.access.revoke();
@@ -1561,7 +1609,7 @@ impl ClusterManager {
                 // Its lease ended while it was being made (switched away and back), so what it
                 // returned, an error included, is no answer about the cluster. It is dropped, and
                 // the current selection connects anew under a new grant.
-                if lease_ended
+                if (lease_ended && !unattended)
                     || result
                         .as_ref()
                         .is_ok_and(|(connection, _)| connection.credential.spent())
@@ -1585,10 +1633,16 @@ impl ClusterManager {
                     self.pump_members(now);
                     return;
                 }
+                let result = match result {
+                    Ok(_) if lease_ended => Err(running_set::consent_ended()),
+                    result => result,
+                };
                 let connected = result.is_ok();
                 let outcome = match &result {
                     Ok(_) => AttemptOutcome::Connected,
-                    Err(error) if rejected => AttemptOutcome::AuthRejected(error.clone()),
+                    Err(error) if rejected || unattended => {
+                        AttemptOutcome::AuthRejected(error.clone())
+                    }
                     Err(error) => AttemptOutcome::Failed(error.clone()),
                 };
                 match result {
@@ -1649,6 +1703,9 @@ impl ClusterManager {
             Internal::KeepWatchFailed { cluster, attempt } => self.kept_failed(&cluster, attempt),
             // The loop's sync starts what is due.
             Internal::KeepWatchRetry => {}
+            Internal::MemberCredentialFailed { cluster, attempt } => {
+                self.member_credential_failed(&cluster, attempt);
+            }
             Internal::Discovered {
                 cluster,
                 attempt,
@@ -2488,6 +2545,20 @@ impl ClusterManager {
             return;
         }
         self.next_attempt += 1;
+        // A member in the background signs in under its keep-watching consent, if it has one,
+        // and never with a prompt.
+        let consent = (role == Role::Background && self.members.contains_key(id))
+            .then(|| self.member_consent(id))
+            .flatten();
+        let access = match consent {
+            Some(consent) => self.member_access(id, attempt, consent),
+            None => CredentialAccess::new(Arc::new(ForegroundOnly), role),
+        };
+        let no_prompt = access.unattended().then(|| {
+            let mut merged = kubeconfig.merged.clone();
+            cluster::disable_interactive_exec(&mut merged);
+            merged
+        });
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
@@ -2498,7 +2569,7 @@ impl ClusterManager {
         slot.client = None;
         slot.write_credential = None;
         slot.access.revoke();
-        slot.access = CredentialAccess::new(Arc::new(ForegroundOnly), role);
+        slot.access = access;
         // One denied from the start reports that denial, which is a real answer.
         slot.attempt_lease = runs_a_command
             .then(|| slot.access.grant(CredentialSource::Plugin).lease())
@@ -2515,7 +2586,7 @@ impl ClusterManager {
         let name = cluster.clone();
         let rejections = internal.clone();
         let attempt_task = tokio::spawn(async move {
-            let merged = &kubeconfig.merged;
+            let merged = no_prompt.as_ref().unwrap_or(&kubeconfig.merged);
             let result = cluster::connect_gated_and_check_with_policy(
                 merged,
                 &name,
@@ -5063,6 +5134,34 @@ mod tests {
         assert_eq!(manager.write_pin_gate("dev", &pin), Ok(()));
     }
 
+    // A disconnect ends every review and confirmation pinned before it, after a reconnect too,
+    // and the front end sees the write epoch move.
+    #[tokio::test]
+    async fn a_disconnect_ends_every_write_pinned_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://dev");
+        let mut manager = manager_reading_two(dir.path(), &yaml, NO_CONTEXTS).await;
+        manager.unlocks.unlock("dev", "https://dev");
+        let before = manager.contexts.pin_confirmed("dev");
+        let epoch = |m: &ClusterManager| {
+            m.summaries()
+                .into_iter()
+                .find(|c| c.info.name == "dev")
+                .map(|c| c.write_epoch)
+        };
+        let opened = epoch(&manager);
+        assert_eq!(manager.write_pin_gate("dev", &before), Ok(()));
+
+        manager.disconnect_cluster("dev".into()).await;
+        assert!(manager.write_pin_gate("dev", &before).is_err());
+        assert_ne!(epoch(&manager), opened);
+
+        manager.activate("dev".into());
+        assert!(manager.write_pin_gate("dev", &before).is_err());
+        let after = manager.contexts.pin_confirmed("dev");
+        assert_eq!(manager.write_pin_gate("dev", &after), Ok(()));
+    }
+
     // covers UP-06, UP-54: a file that comes back with another server, user or token carries
     // over neither the unlock nor a review made before it broke.
     #[tokio::test]
@@ -6181,6 +6280,101 @@ users:
         assert_eq!(manager.members.len(), 2);
         assert_eq!(admitted[0].server(), "https://remote-a");
         assert_eq!(manager.member_changed(&admitted[0]), None);
+    }
+
+    /// `dev` and `other` in a first file, then a file that can break, then `third`.
+    async fn manager_with_a_late_member(dir: &Path) -> (ClusterManager, PathBuf) {
+        let paths = [dir.join("first"), dir.join("middle"), dir.join("last")];
+        let third = "apiVersion: v1\nkind: Config\nclusters:\n- name: t\n  cluster:\n    server: \
+                     https://third\nusers:\n- name: v\n  user: {}\ncontexts:\n- name: third\n  \
+                     context:\n    cluster: t\n    user: v\n";
+        std::fs::write(&paths[0], kubeconfig_with("https://remote-a")).unwrap();
+        std::fs::write(&paths[1], "apiVersion: v1\nkind: Config\n").unwrap();
+        std::fs::write(&paths[2], third).unwrap();
+        let (events, _rx) = crate::events::channel();
+        let config = CoreConfig {
+            config_dir: PathBuf::from("/nonexistent"),
+            settings: Settings::default(),
+            settings_error: None,
+            kubeconfig_base: paths.to_vec(),
+            home: None,
+            watch_files: false,
+            watch_timing: Default::default(),
+        };
+        let mut manager = ClusterManager::new(
+            config,
+            events,
+            HubRegistry::default(),
+            SessionUnlocks::default(),
+        );
+        manager.reload_kubeconfig().await;
+        let [_, middle, _] = paths;
+        (manager, middle)
+    }
+
+    fn late_member_pins() -> Vec<crate::settings::ClusterPin> {
+        use crate::settings::ClusterPin;
+        vec![
+            ClusterPin::new("dev", "https://remote-a"),
+            ClusterPin::new("other", "https://other"),
+            ClusterPin::new("third", "https://third"),
+        ]
+    }
+
+    // A member turning provisional after a front end looked costs only that member.
+    #[tokio::test]
+    async fn opening_a_set_leaves_out_a_provisional_member_and_sends_it_nothing() {
+        use crate::handle::{LeftOutMember, LeftOutReason};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, middle) = manager_with_a_late_member(dir.path()).await;
+        rewrite_file(&mut manager, &middle, UNREADABLE).await;
+        assert!(manager.unsettled("third") && !manager.paused("third"));
+
+        let opened = manager.open_running_set(late_member_pins()).unwrap();
+        let admitted: Vec<&str> = opened.members.iter().map(|m| m.context()).collect();
+        assert_eq!(admitted, ["dev", "other"]);
+        assert_eq!(
+            opened.left_out,
+            [LeftOutMember {
+                context: "third".to_owned(),
+                reason: LeftOutReason::Provisional,
+            }]
+        );
+        assert!(!manager.members.contains_key("third"));
+        let third = manager.cluster("third").unwrap();
+        assert!(third.connect_task.is_none() && third.client.is_none());
+        assert!(matches!(third.state, ConnectionState::Disconnected));
+    }
+
+    // The minimum counts members admitted, and the exact-server check still applies.
+    #[tokio::test]
+    async fn opening_a_set_with_too_few_eligible_members_changes_nothing() {
+        use crate::handle::LeftOutReason;
+        use crate::settings::ClusterPin;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, middle) = manager_with_a_late_member(dir.path()).await;
+        let running = vec![
+            ClusterPin::new("dev", "https://remote-a"),
+            ClusterPin::new("other", "https://other"),
+        ];
+        manager.admit_running_set(running).unwrap();
+        rewrite_file(&mut manager, &middle, UNREADABLE).await;
+
+        let opened = manager
+            .open_running_set(vec![
+                ClusterPin::new("dev", "https://replacement"),
+                ClusterPin::new("other", "https://other"),
+                ClusterPin::new("third", "https://third"),
+            ])
+            .unwrap();
+        assert!(opened.members.is_empty());
+        let reasons: Vec<_> = opened.left_out.iter().map(|m| m.reason).collect();
+        assert_eq!(
+            reasons,
+            [LeftOutReason::Changed, LeftOutReason::Provisional]
+        );
+        assert_eq!(manager.members.len(), 2, "the running set stays");
+        assert!(manager.members.contains_key("dev"));
     }
 
     // Moved and put back, a member's reads stay refused: it is not the connection admitted.
@@ -8167,6 +8361,7 @@ users:
             cluster: "dev".into(),
             server: taken_late.then_some(shown),
             member: None,
+            disconnects: 0,
             subject: LogSubject::Pod(target),
             options: LogOptions::default(),
             snapshots,

@@ -26,7 +26,7 @@ use crate::telemetry::Telemetry;
 pub(super) struct SlotFeed {
     attempt: u64,
     /// Held to keep it running: dropping it stops its tasks.
-    _feed: Telemetry,
+    feed: Telemetry,
 }
 
 /// An overview showing, and the slot it was opened on.
@@ -178,24 +178,60 @@ impl ClusterManager {
             .retain(|cluster| running.contains(&cluster) || keep.holds_board_entry(cluster));
     }
 
+    /// The seconds a pod on `id` may stay Pending, at the server the context points to now.
+    pub(super) fn pending_after(&self, id: &str) -> u32 {
+        let server = self
+            .cluster(id)
+            .and_then(|slot| slot.info.server.as_deref());
+        self.settings
+            .thresholds_for(id, server)
+            .get(crate::thresholds::ThresholdMetric::PendingPodSeconds)
+    }
+
+    /// Gives every running feed its Pending threshold, so a change applies without a restart.
+    pub(super) fn apply_pending_thresholds(&self) {
+        for slot in &self.clusters {
+            if let Some(running) = &slot.telemetry {
+                running
+                    .feed
+                    .set_pending_after(self.pending_after(&slot.info.name));
+            }
+        }
+        self.apply_kept_pending_thresholds();
+    }
+
     fn start_telemetry(&mut self, index: usize, id: &str) {
         let target = cluster::Target::of(&self.kubeconfig.merged, id);
         let timing = self.telemetry_timing;
+        let pending_after = self.pending_after(id);
         let requests = self
             .telemetry
             .request_gate(reads_token_file(&self.kubeconfig.merged, id));
+        let pin = self
+            .contexts
+            .pin(id, self.clusters[index].info.server.as_deref());
         let slot: &mut Cluster = &mut self.clusters[index];
+        let generation = slot.generation;
         let Some(client) = slot.client.as_ref().map(|clients| clients.read.clone()) else {
             return;
         };
         // Its own store, so a stopping feed clearing its series can't touch its successor's.
         let trends = Arc::new(Mutex::new(TrendStore::new()));
         let store = Arc::clone(&trends);
-        let mut feed = Telemetry::start(id.into(), client, target, store, timing, requests);
-        self.telemetry.publish(id, &mut feed, trends);
+        let mut feed = Telemetry::start(
+            id.into(),
+            client,
+            target,
+            store,
+            timing,
+            requests,
+            pending_after,
+        );
+        self.telemetry
+            .publish(id, generation, pin, &mut feed, trends);
         slot.telemetry = Some(SlotFeed {
             attempt: slot.attempt,
-            _feed: feed,
+            feed,
         });
     }
 }

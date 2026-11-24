@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::auth_plugin::tests::{FakePlugin, live};
+use crate::connection::member::MemberState;
 use crate::handle::CoreConfig;
 use crate::manager::{Changed, Cluster};
 use crate::protection::SessionUnlocks;
@@ -10,11 +11,16 @@ use crate::watch::HubRegistry;
 
 /// A manager with one context, `dev`, signing in with `plugin`, and nothing selected.
 fn manager_with(plugin: &FakePlugin, config_dir: PathBuf) -> (ClusterManager, PathBuf) {
+    manager_on(plugin, config_dir, "")
+}
+
+/// [`manager_with`], with `more` (YAML) appended to its contexts, each with a slot of its own.
+fn manager_on(plugin: &FakePlugin, config_dir: PathBuf, more: &str) -> (ClusterManager, PathBuf) {
     let path = plugin.dir.path().join("kubeconfig");
     let yaml = format!(
         "apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: \
-         http://127.0.0.1:1\nusers:\n- name: u\n  user:\n{}contexts:\n- name: dev\n  \
-         context:\n    cluster: c\n    user: u\n",
+         http://127.0.0.1:1\nusers:\n- name: u\n  user:\n{}- name: s\n  user: {{}}\n\
+         contexts:\n- name: dev\n  context:\n    cluster: c\n    user: u\n{more}",
         plugin.user_yaml()
     );
     std::fs::write(&path, yaml).unwrap();
@@ -31,17 +37,313 @@ fn manager_with(plugin: &FakePlugin, config_dir: PathBuf) -> (ClusterManager, Pa
     let hubs = HubRegistry::default();
     let mut manager = ClusterManager::new(config, events, hubs.clone(), SessionUnlocks::default());
     let loaded = crate::kubeconfig::load(std::slice::from_ref(&path));
-    let slot = Cluster::new(
-        loaded.contexts[0].clone(),
-        cluster::context_fingerprint(&loaded.merged, "dev"),
-        &hubs,
-        &manager.engine_config,
-    );
+    for info in &loaded.contexts {
+        let slot = Cluster::new(
+            info.clone(),
+            cluster::context_fingerprint(&loaded.merged, &info.name),
+            &hubs,
+            &manager.engine_config,
+        );
+        manager.clusters.push(slot);
+    }
     manager.contexts.record(&loaded);
     manager.kubeconfig = Arc::new(loaded);
     manager.kubeconfig_paths = vec![path.clone()];
-    manager.clusters.push(slot);
     (manager, path)
+}
+
+/// A manager with `dev` signing in with `plugin` and `other` with nothing to run, `active`
+/// selected and nothing connected.
+fn set_manager(plugin: &FakePlugin, config_dir: PathBuf, active: &str) -> ClusterManager {
+    let other = "- name: other\n  context:\n    cluster: c\n    user: s\n";
+    let (mut manager, _) = manager_on(plugin, config_dir, other);
+    manager.active = Some(active.to_owned());
+    manager.sync_roles();
+    manager
+}
+
+/// Opens the set of `dev` and `other`.
+fn open_set(manager: &mut ClusterManager) {
+    manager.set_running_set(vec!["dev".to_owned(), "other".to_owned()]);
+}
+
+fn dev_state(manager: &ClusterManager) -> MemberState {
+    manager.members["dev"].state().clone()
+}
+
+/// Whether `dev`'s current connection may run its plugin now.
+fn dev_may_run(manager: &ClusterManager) -> bool {
+    let slot = manager.cluster("dev").unwrap();
+    slot.access.grant(CredentialSource::Plugin).allowed()
+}
+
+/// Starts the queued background attempts, past the stagger after the set's first ones.
+fn pump_later(manager: &mut ClusterManager) {
+    manager.pump_members(Instant::now() + Duration::from_secs(60));
+}
+
+// With background sign-in consent, a member that is not selected connects at once, under the
+// consent's rules, and runs its plugin with no one to answer it.
+#[tokio::test]
+async fn a_consented_member_connects_in_the_background() {
+    let plugin = FakePlugin::hanging();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+
+    open_set(&mut manager);
+
+    assert_eq!(dev_state(&manager), MemberState::Connecting);
+    let slot = manager.cluster("dev").unwrap();
+    assert!(slot.access.unattended(), "connected under the consent");
+    assert!(matches!(slot.state, ConnectionState::Connecting));
+    assert!(dev_may_run(&manager));
+    plugin.wait_started().await;
+}
+
+// Without consent, a member that is not selected waits for a sign-in and runs nothing.
+#[tokio::test]
+async fn a_member_without_consent_waits_for_a_sign_in() {
+    let plugin = FakePlugin::hanging();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+
+    open_set(&mut manager);
+
+    assert!(matches!(
+        dev_state(&manager),
+        MemberState::SignInNeeded { .. }
+    ));
+    assert!(manager.cluster("dev").unwrap().connect_task.is_none());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(plugin.starts().is_empty(), "the plugin never ran");
+}
+
+// Switching away from a consented member replaces its foreground connection with one under the
+// consent, which later switches keep.
+#[tokio::test]
+async fn a_switch_keeps_a_consented_member_connected() {
+    let plugin = FakePlugin::hanging();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "dev");
+    allow(&mut manager).await;
+    open_set(&mut manager);
+    let foreground = manager
+        .cluster("dev")
+        .unwrap()
+        .access
+        .grant(CredentialSource::Plugin);
+    assert!(!manager.cluster("dev").unwrap().access.unattended());
+    plugin.wait_started().await;
+
+    manager.activate("other".to_owned());
+    pump_later(&mut manager);
+
+    assert!(!foreground.allowed(), "the foreground connection ended");
+    assert_eq!(dev_state(&manager), MemberState::Connecting);
+    let slot = manager.cluster("dev").unwrap();
+    assert!(slot.access.unattended(), "replaced under the consent");
+    assert!(dev_may_run(&manager));
+    let attempt = slot.attempt;
+
+    manager.activate("dev".to_owned());
+    assert!(dev_may_run(&manager), "selected, it goes on");
+    manager.activate("other".to_owned());
+    assert!(dev_may_run(&manager), "and again in the background");
+    assert_eq!(
+        manager.cluster("dev").unwrap().attempt,
+        attempt,
+        "not replaced"
+    );
+    assert_eq!(dev_state(&manager), MemberState::Connecting);
+}
+
+// Without consent, switching away ends the member's connection, and nothing it is replaced
+// with may run the plugin.
+#[tokio::test]
+async fn a_switch_demotes_a_member_without_consent() {
+    let plugin = FakePlugin::hanging();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "dev");
+    open_set(&mut manager);
+    let foreground = manager
+        .cluster("dev")
+        .unwrap()
+        .access
+        .grant(CredentialSource::Plugin);
+    plugin.wait_started().await;
+
+    manager.activate("other".to_owned());
+    pump_later(&mut manager);
+
+    assert!(!foreground.allowed(), "the foreground connection ended");
+    assert!(!manager.cluster("dev").unwrap().access.unattended());
+    assert!(!dev_may_run(&manager));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(plugin.starts().len(), 1, "only the foreground run");
+}
+
+// Selected, a member's connection made under consent connects again in the foreground when the
+// consent ends, rather than stay signed out.
+#[tokio::test]
+async fn a_selected_member_reconnects_when_its_consent_ends() {
+    let plugin = FakePlugin::hanging();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    open_set(&mut manager);
+    manager.activate("dev".to_owned());
+    assert!(manager.cluster("dev").unwrap().access.unattended());
+
+    manager.kept_grants().revoke("dev");
+    manager.set_keep_watching("dev".to_owned(), None).await;
+    manager.sync_keep_watching();
+
+    let slot = manager.cluster("dev").unwrap();
+    assert!(!slot.access.unattended());
+    assert!(matches!(slot.state, ConnectionState::Connecting));
+    assert!(dev_may_run(&manager), "in the foreground");
+}
+
+// Leaving the set drops a connection made under consent: it covers members only.
+#[tokio::test]
+async fn leaving_the_set_drops_a_consented_connection() {
+    let plugin = FakePlugin::hanging();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    open_set(&mut manager);
+    let consented = manager
+        .cluster("dev")
+        .unwrap()
+        .access
+        .grant(CredentialSource::Plugin);
+
+    manager.set_running_set(Vec::new());
+
+    assert!(!consented.allowed());
+    let slot = manager.cluster("dev").unwrap();
+    assert!(matches!(slot.state, ConnectionState::Disconnected));
+    assert!(slot.connect_task.is_none());
+}
+
+// A kubeconfig file change ends a member's sign-in still running, so a token from before the new
+// definitions are read never brings its connection up.
+#[tokio::test]
+async fn a_file_change_ends_a_members_sign_in_in_progress() {
+    let plugin = FakePlugin::hanging();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    open_set(&mut manager);
+    let consented = manager
+        .cluster("dev")
+        .unwrap()
+        .access
+        .grant(CredentialSource::Plugin);
+    let (leader, _) = plugin.wait_started().await;
+    let sign_in = consented.lease();
+
+    manager
+        .handle_internal(Internal::FilesChanged(Changed {
+            kubeconfig: true,
+            settings: false,
+            activity: false,
+            rearm: false,
+        }))
+        .await;
+
+    assert!(!sign_in.holds(), "the sign-in under way ended");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while live(leader) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the plugin should have been killed");
+    // Whatever the attempt reports, the member does not come up on it.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while matches!(
+            manager.cluster("dev").unwrap().state,
+            ConnectionState::Connecting
+        ) {
+            let internal = manager.internal_rx.as_mut().unwrap();
+            if let Ok(Some(message)) =
+                tokio::time::timeout(Duration::from_millis(50), internal.recv()).await
+            {
+                manager.handle_internal(message).await;
+            }
+        }
+    })
+    .await
+    .expect("the attempt should have ended");
+    assert!(!matches!(
+        manager.cluster("dev").unwrap().state,
+        ConnectionState::Connected(_)
+    ));
+    assert_ne!(dev_state(&manager), MemberState::Live);
+}
+
+// A definition that no longer runs a command still ends the access of a connection made under
+// consent: nothing demotes it, so the access must not stay live.
+#[tokio::test]
+async fn a_member_whose_credential_stops_running_a_command_loses_its_consent_access() {
+    let plugin = FakePlugin::hanging();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    open_set(&mut manager);
+    let consented = manager
+        .cluster("dev")
+        .unwrap()
+        .access
+        .grant(CredentialSource::Plugin);
+    assert!(consented.allowed());
+
+    // The definition now shows a static token, read without replacing the slot.
+    let path = plugin.dir.path().join("kubeconfig");
+    let yaml = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace(&plugin.user_yaml(), "    token: t\n");
+    std::fs::write(&path, yaml).unwrap();
+    manager.kubeconfig = Arc::new(crate::kubeconfig::load(std::slice::from_ref(&path)));
+    assert!(!manager.runs_a_command("dev"));
+    manager.sync_keep_watching();
+
+    assert!(!consented.allowed());
+    assert!(!manager.cluster("dev").unwrap().access.unattended() || !dev_may_run(&manager));
+}
+
+// Turning the consent off ends a member's connection made under it, and kills its plugin.
+#[tokio::test]
+async fn turning_consent_off_ends_a_members_connection() {
+    let plugin = FakePlugin::hanging();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    open_set(&mut manager);
+    let consented = manager
+        .cluster("dev")
+        .unwrap()
+        .access
+        .grant(CredentialSource::Plugin);
+    let (leader, _) = plugin.wait_started().await;
+
+    manager.kept_grants().revoke("dev");
+    manager.set_keep_watching("dev".to_owned(), None).await;
+    manager.sync_keep_watching();
+    pump_later(&mut manager);
+
+    assert!(!consented.allowed());
+    assert!(!manager.cluster("dev").unwrap().access.unattended());
+    assert!(!dev_may_run(&manager));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while live(leader) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the plugin should have been killed");
 }
 
 /// Turns on keep watching, then `dev`'s background sign-in toggle.
@@ -184,6 +486,29 @@ async fn an_unreadable_file_refuses_the_launch_and_keeps_consent() {
     assert!(check.refusal().await.is_ok());
     manager.sync_keep_watching();
     assert!(manager.keep.consents.contains_key("dev"));
+}
+
+// A slot that started over with the same definition gets a connection of its own: a feed of the
+// earlier slot would be refused by every alert pass and never replaced.
+#[tokio::test]
+async fn a_new_slot_generation_replaces_the_kept_connection() {
+    let plugin = FakePlugin::new("exit 1\n");
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _path) = manager_with(&plugin, config.path().to_owned());
+    allow(&mut manager).await;
+    manager.sync_keep_watching();
+    let first = manager.keep.feeds["dev"].attempt;
+
+    manager.sync_keep_watching();
+    assert_eq!(manager.keep.feeds["dev"].attempt, first, "nothing changed");
+
+    manager.clusters[0].generation += 1;
+    manager.sync_keep_watching();
+    assert_ne!(manager.keep.feeds["dev"].attempt, first);
+    assert_eq!(
+        manager.keep.feeds["dev"].generation,
+        Some(manager.clusters[0].generation)
+    );
 }
 
 // No path brings consent back: an entry removed by hand and put back has none.

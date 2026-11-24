@@ -27,9 +27,13 @@ futures = { version = "0.3.34", default-features = false, features = ["std"] }
 libc = "0.2.191"
 # Already in the tree (through kube, tokio and GPUI); finds search matches in log lines.
 memchr = "2.8.3"
+# Already in the tree; the recordings writer's bounded lock-free queue.
+crossbeam-queue = "0.3.14"
 # Already in the tree (through kube and GPUI); credential redaction for text served to agents.
 regex = "1.13.2"
 aho-corasick = "1.1.5"
+# Already in the tree through rmcp; compares cluster names by how they read.
+unicode-normalization = "0.1.26"
 notify = "8.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.2.1"
@@ -66,6 +70,8 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 # Already in the tree through rustls; HMAC-SHA256 and the key for the activity log's server keys.
 ring = "0.17.14"
 base64 = "0.22.1"
+# The recordings store (ADR-0018), with SQLite compiled in (github.com/rusqlite/rusqlite).
+rusqlite = { version = "0.43.0", features = ["bundled"] }
 # The server side of the fake exec WebSocket: the same tokio-tungstenite kube's client uses.
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 # Generates the fake server's throwaway CA and certificate at test time (github.com/rustls/rcgen).

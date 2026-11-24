@@ -6,7 +6,8 @@ use gpui_kit::*;
 
 use super::super::registry::{
     ActionError, Bind, CloseDetail, FocusFilter, FocusRows, OnView, OpenSelectedRow, SelectFirst,
-    SelectFromFilter, SelectLast, SelectNext, SelectPrev, SelectRow, SortBy, ToggleWide,
+    SelectFromFilter, SelectLast, SelectNext, SelectPrev, SelectRow, SortBy, ToggleProblemsOnly,
+    ToggleWide,
 };
 use super::{ResourceList, find_row, list_model};
 
@@ -21,6 +22,7 @@ impl ResourceList {
             .bind::<SelectRow>(Self::select_row)
             .bind::<SortBy>(Self::sort_by)
             .bind::<ToggleWide>(Self::toggle_wide)
+            .bind::<ToggleProblemsOnly>(Self::toggle_problems)
             .bind::<FocusFilter>(Self::focus_filter)
             .bind::<FocusRows>(Self::focus_rows)
             .bind::<SelectFromFilter>(Self::select_from_filter)
@@ -148,6 +150,48 @@ impl ResourceList {
         // A remembered sort on a wide column applies only while Wide is on.
         self.recompute(cx);
         cx.notify();
+    }
+
+    fn toggle_problems(&mut self, _: &ToggleProblemsOnly, _: &mut Window, cx: &mut Context<Self>) {
+        self.problems.toggle();
+        self.reconcile_problem_selection(cx);
+        self.recompute(cx);
+        cx.notify();
+    }
+
+    /// Whether the Problems toggle applies to this kind.
+    pub(in crate::ui) fn has_problem_filter(&self) -> bool {
+        super::problems::ProblemListKind::of(&self.kind).is_some()
+    }
+
+    /// Takes the newest problems of this list's cluster.
+    pub(in crate::ui) fn set_problems(
+        &mut self,
+        values: std::collections::HashMap<flint_core::ClusterId, super::problems::ClusterProblems>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.problems.update(values) {
+            if self.problems.is_on() {
+                self.reconcile_problem_selection(cx);
+                self.recompute(cx);
+            }
+            cx.notify();
+        }
+    }
+
+    /// Says when the toggle is on and this kind could not be checked.
+    pub(super) fn problems_note(&self) -> Option<String> {
+        let cluster = self.cluster.as_str();
+        self.problems
+            .hidden_pick_note()
+            .or_else(|| {
+                self.problems.unchecked_note(
+                    &self.kind,
+                    &self.label,
+                    std::iter::once((cluster, cluster)),
+                )
+            })
+            .or_else(|| self.problems.awaiting_note())
     }
 
     fn focus_filter(&mut self, _: &FocusFilter, window: &mut Window, cx: &mut Context<Self>) {

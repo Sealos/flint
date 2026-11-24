@@ -1,17 +1,20 @@
 //! Keeping a cluster watched in the background, against fake API servers and fake exec plugins:
 //! a plugin runs only with consent bound to its definition, without a prompt, stops at its first
-//! failure and dies with its watch, and a background cluster sends no write.
+//! failure and dies with its watch, and a background cluster sends no write. A running-set
+//! member with that consent connects under it, and writes only once unlocked.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use flint_core::handle::{Command, Event};
+use flint_core::handle::{Command, Event, MemberStatus};
 use flint_core::keep_watching::{
     BackgroundSignIn, KeepWatching, MAX_WATCHED_CLUSTERS, PluginOffer, WatchedCluster,
 };
-use flint_core::telemetry::Availability;
-use flint_core::{Settings, settings};
+use flint_core::problems::ProblemKind;
+use flint_core::telemetry::{Availability, FeedDiscovery};
+use flint_core::write::{WriteError, WriteProposal, WriteTarget};
+use flint_core::{KindId, Settings, WriteRefusal, settings};
 use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, Verb, WatchStep};
 
 #[allow(dead_code)]
@@ -549,6 +552,108 @@ async fn a_namespace_change_voids_consent() {
     assert_eq!(run_lines(&f.runs).len(), runs);
 }
 
+/// A token good for years: nothing needs to run the plugin again.
+const LASTING: &str = "printf '{\"apiVersion\":\"client.authentication.k8s.io/v1\",\
+                       \"kind\":\"ExecCredential\",\"status\":{\"token\":\"t\",\
+                       \"expirationTimestamp\":\"2099-01-01T00:00:00Z\"}}'\n";
+
+fn kept_discovery(f: &Fixture) -> Option<FeedDiscovery> {
+    f.core.handle.telemetry("b").map(|feed| feed.discovery)
+}
+
+fn vouches_for_all(f: &Fixture) -> bool {
+    matches!(
+        kept_discovery(f),
+        Some(FeedDiscovery::Kept(found)) if found.unchecked().is_empty()
+    )
+}
+
+fn vouches_for_none(f: &Fixture) -> bool {
+    matches!(
+        kept_discovery(f),
+        Some(FeedDiscovery::Kept(found)) if found.unchecked().len() == ProblemKind::ALL.len()
+    )
+}
+
+fn discovery_requests(server: &FakeApiServer) -> usize {
+    server
+        .requests()
+        .iter()
+        .filter(|request| matches!(request.path.as_str(), "/api" | "/apis"))
+        .count()
+}
+
+// covers #210
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kept_connection_discovers_on_the_token_it_holds() {
+    let f = fixture(LASTING, Settings::default()).await;
+    f.turn_on().await;
+    f.until_feed().await;
+    tokio::time::timeout(WAIT, async {
+        while !vouches_for_all(&f) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("discovery should have confirmed its resources");
+    settle().await;
+    assert_eq!(run_lines(&f.runs).len(), 1, "discovery ran no plugin");
+    assert!(f.b.writes().is_empty(), "{:?}", f.b.writes());
+}
+
+// covers #210
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_that_is_due_is_not_refreshed_for_discovery() {
+    let f = fixture(EXPIRED, Settings::default()).await;
+    f.turn_on().await;
+    f.until_feed().await;
+    f.b.wait_for_watches(&Gvr::core("pods"), 1, WAIT)
+        .await
+        .unwrap();
+    let runs = runs_once_settled(&f).await;
+    // Past discovery's first retries: each would need a new token.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(run_lines(&f.runs).len(), runs, "discovery ran the plugin");
+    assert_eq!(
+        discovery_requests(&f.b),
+        0,
+        "nothing was sent without a token"
+    );
+    assert!(vouches_for_none(&f));
+    assert_eq!(
+        f.status().await,
+        KeepWatching::Watching,
+        "not a sign-in failure"
+    );
+}
+
+// covers #210
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turning_it_off_ends_kept_discovery() {
+    let f = fixture(LASTING, Settings::default()).await;
+    // Every discovery fails, so it keeps retrying until its feed ends.
+    f.b.inject(Fault::status(500).verb(Verb::Discovery));
+    f.turn_on().await;
+    f.until_feed().await;
+    tokio::time::timeout(WAIT, async {
+        while discovery_requests(&f.b) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("discovery should have started");
+    assert!(vouches_for_none(&f));
+    f.core
+        .handle
+        .send(Command::RevokeBackgroundSignIn("b".to_owned()));
+    f.until_status(KeepWatching::NeedsConfirming).await;
+    settle().await;
+    let sent = discovery_requests(&f.b);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(discovery_requests(&f.b), sent, "discovery went on");
+    assert!(f.core.handle.telemetry("b").is_none());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_503_from_version_does_not_run_the_plugin_again() {
     let f = fixture(EXPIRED, Settings::default()).await;
@@ -866,6 +971,108 @@ async fn a_background_plugin_gets_no_display_or_browser() {
     f.until_feed().await;
     let seen = std::fs::read_to_string(format!("{}.env", f.script.display())).unwrap();
     assert_eq!(seen.trim(), "[][][false]");
+}
+
+/// A deployment `act` in `demo` on `server`, with `replicas`.
+fn workload(server: &FakeApiServer, replicas: u32) {
+    server.set_object(
+        &Gvr::new("apps", "v1", "deployments"),
+        serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "act", "namespace": "demo", "uid": "uid-act",
+                         "resourceVersion": "5000"},
+            "spec": {"replicas": replicas, "template": {"metadata": {}}},
+        }),
+    );
+}
+
+// A running-set member with background sign-in consent connects while another cluster is
+// selected, and stays read-only until it is unlocked; then its writes use the token its plugin
+// got in the background, with no prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_consented_set_member_writes_only_once_unlocked() {
+    let f = fixture(TOKEN, Settings::default()).await;
+    f.b.set_identity("member");
+    workload(&f.b, 2);
+    f.turn_on().await;
+    f.until_status(KeepWatching::Watching).await;
+    f.core
+        .handle
+        .send(Command::SetRunningSet(vec!["a".to_owned(), "b".to_owned()]));
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let reports = f.core.handle.running_set().await;
+            if reports
+                .iter()
+                .any(|r| r.cluster == "b" && r.status == MemberStatus::Live)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("b should be live in the background");
+
+    let target = WriteTarget {
+        cluster: "b".into(),
+        server: Some(f.b.url()),
+        kind: KindId::new("apps", "deployments"),
+        namespace: Some("demo".to_owned()),
+        name: "act".to_owned(),
+        uid: None,
+        resource_version: None,
+    };
+    let locked = f
+        .core
+        .handle
+        .review_write(target.clone(), WriteProposal::Scale { to: 5 })
+        .await;
+    assert_eq!(
+        locked.unwrap_err(),
+        WriteError::Refused(WriteRefusal::Protected {
+            cluster: "b".to_owned()
+        })
+    );
+    assert!(f.b.writes().is_empty(), "{:?}", f.b.writes());
+
+    f.core.handle.unlock("b", &f.b.url());
+    // The member is live before its discovery is back, and a kind it has not served yet is
+    // refused before anything is sent.
+    let review = tokio::time::timeout(WAIT, async {
+        loop {
+            match f
+                .core
+                .handle
+                .review_write(target.clone(), WriteProposal::Scale { to: 5 })
+                .await
+            {
+                Err(WriteError::NotServed(_)) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => return other,
+            }
+        }
+    })
+    .await
+    .expect("b's discovery should come back")
+    .expect("an unlocked member can be reviewed");
+    f.core
+        .handle
+        .run_write(review.into_intent())
+        .await
+        .expect("an unlocked member can be written");
+    let live =
+        f.b.object(&Gvr::new("apps", "v1", "deployments"), Some("demo"), "act")
+            .unwrap();
+    assert_eq!(live["spec"]["replicas"], 5);
+    let runs = run_lines(&f.runs);
+    assert!(!runs.is_empty());
+    for run in &runs {
+        assert!(run.contains("no-tty []"), "no terminal, empty stdin: {run}");
+        assert!(run.contains("\"interactive\":false"), "{run}");
+    }
 }
 
 #[test]

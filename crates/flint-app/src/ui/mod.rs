@@ -31,6 +31,7 @@ mod dock_model;
 #[cfg(test)]
 mod dock_tests;
 mod focus;
+mod helm_view;
 mod icons;
 mod keep_watching;
 mod list;
@@ -46,6 +47,7 @@ mod notice;
 mod object;
 mod palette;
 mod palette_model;
+mod pending_threshold;
 mod quit_flush;
 mod registry;
 mod resource_actions;
@@ -65,6 +67,7 @@ mod ui_state;
 #[cfg(any(test, feature = "automation"))]
 mod view_state;
 mod workspace;
+mod write_binding;
 mod write_confirm;
 
 use std::cell::Cell;

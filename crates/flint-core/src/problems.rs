@@ -37,6 +37,8 @@ use k8s_openapi::api::core::v1::{ContainerStateTerminated, ContainerStatus, Node
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference, Time};
 use k8s_openapi::jiff::{SignedDuration, Timestamp};
 
+use crate::thresholds::ThresholdMetric;
+
 /// Restarts a container needs before a back-off counts as a crash loop.
 ///
 /// The kubelet reports `CrashLoopBackOff` from the first failed restart, which also happens to
@@ -116,14 +118,39 @@ pub enum ProblemKind {
     ImagePull,
     /// A workload has settled with fewer ready replicas than it wants.
     WorkloadShort,
+    /// A pod has stayed Pending past its threshold, with no more specific problem.
+    PodPending,
 }
 
 impl ProblemKind {
+    /// Every kind of problem.
+    pub const ALL: [Self; 7] = [
+        Self::CrashLoop,
+        Self::OomKilled,
+        Self::ImagePull,
+        Self::PodPending,
+        Self::NodeNotReady,
+        Self::JobFailed,
+        Self::WorkloadShort,
+    ];
+
+    /// The API groups this kind is read from. A pod's owner is read through its ReplicaSet.
+    pub const fn api_groups(self) -> &'static [&'static str] {
+        match self {
+            Self::CrashLoop | Self::OomKilled | Self::ImagePull | Self::PodPending => &["", "apps"],
+            Self::NodeNotReady => &[""],
+            Self::JobFailed => &["batch"],
+            Self::WorkloadShort => &["apps"],
+        }
+    }
+
     /// How urgent this kind of problem is.
     pub const fn severity(self) -> ProblemSeverity {
         match self {
             Self::CrashLoop | Self::NodeNotReady | Self::ImagePull => ProblemSeverity::Critical,
-            Self::OomKilled | Self::JobFailed | Self::WorkloadShort => ProblemSeverity::Warning,
+            Self::OomKilled | Self::JobFailed | Self::WorkloadShort | Self::PodPending => {
+                ProblemSeverity::Warning
+            }
         }
     }
 }
@@ -253,6 +280,12 @@ pub enum ProblemSubject {
         pod: String,
         pod_uid: Option<String>,
         container: String,
+    },
+    /// A pod as a whole.
+    Pod {
+        namespace: String,
+        name: String,
+        uid: Option<String>,
     },
     /// A node.
     Node { name: String, uid: Option<String> },
@@ -440,7 +473,8 @@ pub struct Problem {
     /// When this was last known to start, if the object says.
     ///
     /// For a crash loop or OOM kill, the latest termination, so it moves on each restart. For a
-    /// node, Job or Deployment, the last transition of its condition. Image pull failures and
+    /// node, Job or Deployment, the last transition of its condition. For a stuck Pending pod,
+    /// its creation. Image pull failures and
     /// StatefulSet or DaemonSet shortfalls have no time in their status, so this is `None`.
     /// Never part of the identity.
     pub since: Option<Timestamp>,
@@ -514,6 +548,7 @@ impl Problem {
                 "Rollout stopped before reaching its desired replicas"
             }
             (ProblemKind::WorkloadShort, _) => "Workload has fewer ready replicas than desired",
+            (ProblemKind::PodPending, _) => "Pod has been Pending longer than its threshold",
         }
     }
 }
@@ -523,15 +558,26 @@ impl Problem {
 pub struct Classifier {
     cluster: Arc<str>,
     now: Timestamp,
+    pending_after: SignedDuration,
 }
 
 impl Classifier {
     /// A classifier for `cluster`, which is only copied into results, judging ages against `now`.
+    /// A pod counts as stuck Pending after the default threshold.
     pub fn new(cluster: impl Into<Arc<str>>, now: Timestamp) -> Self {
+        let seconds = ThresholdMetric::PendingPodSeconds.default_value();
         Self {
             cluster: cluster.into(),
             now,
+            pending_after: SignedDuration::from_secs(seconds.into()),
         }
+    }
+
+    /// This classifier with a pod counting as stuck once Pending for longer than `seconds`.
+    #[must_use]
+    pub fn with_pending_after(mut self, seconds: u32) -> Self {
+        self.pending_after = SignedDuration::from_secs(seconds.into());
+        self
     }
 
     /// The problems of every pod during a ReplicaSet outage. Test-only, so production code has to
@@ -576,6 +622,7 @@ impl Classifier {
             return;
         }
         let finished = phase == Some("Failed");
+        let found_before = out.len();
         let pull_grace = meta
             .creation_timestamp
             .as_ref()
@@ -607,6 +654,26 @@ impl Classifier {
                 owner_known,
                 ..problem
             });
+        }
+        // A container's own problem says more, and one failure is not counted twice.
+        if phase == Some("Pending") && out.len() == found_before {
+            let created = meta.creation_timestamp.as_ref().map(|created| created.0);
+            if let Some(since) =
+                created.filter(|c| self.now.duration_since(*c) > self.pending_after)
+            {
+                let subject = ProblemSubject::Pod {
+                    namespace: meta.namespace.clone().unwrap_or_default(),
+                    name: name.clone(),
+                    uid: meta.uid.clone(),
+                };
+                let (owner, owner_known) = replica_sets.resolve(meta);
+                let problem =
+                    self.problem(ProblemKind::PodPending, subject, owner, None, Some(since));
+                out.push(Problem {
+                    owner_known,
+                    ..problem
+                });
+            }
         }
     }
 

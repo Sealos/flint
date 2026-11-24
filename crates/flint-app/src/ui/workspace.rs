@@ -261,6 +261,7 @@ pub struct Workspace {
     /// nothing is restored from the old catalog (#255).
     generation: Option<u64>,
     list: Option<Entity<ResourceList>>,
+    problem_feed: problems::ProblemFeed,
     detail: Option<Entity<DetailView>>,
     /// The active cluster's overview, in place of a list.
     dashboard: Option<(Entity<DashboardView>, Subscription)>,
@@ -328,6 +329,9 @@ pub struct Workspace {
     /// Why the last Logs or Shell did not open, shown over the dock until the next one does,
     /// the selection, list or cluster changes, or [`ACTION_ERROR_SHOWN`] has passed.
     action_error: Option<String>,
+    /// The reason stays for all of [`ACTION_ERROR_SHOWN`]: it is about the cluster changing, so
+    /// that change, and the list reopening after it, must not take it away.
+    action_error_held: bool,
     _action_error: Task<()>,
     /// The review a resource action is waiting for.
     _write_review: Task<()>,
@@ -362,6 +366,7 @@ impl Workspace {
         let observe = cx.observe_in(&model, window, |this, _, window, cx| {
             this.show_appearance(window, cx);
             this.sync(window, cx);
+            this.follow_problem_connections(cx);
             cx.notify();
         });
         let nav = cx.new(NavPanel::new);
@@ -374,7 +379,7 @@ impl Workspace {
                 };
                 this.open_view(&open, window, cx);
             }
-            NavEvent::OpenOverview => this.open_dashboard(window, cx),
+            NavEvent::OpenOverview => this.open_overview(window, cx),
         });
         // Quitting right after a drag (or another change) still saves state.toml.
         let on_quit = cx.on_app_quit(|this: &mut Self, cx| {
@@ -412,6 +417,7 @@ impl Workspace {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let alive = this.update(cx, |this, cx| {
+                    this.refresh_problems(cx);
                     let Some(cluster) = this.cluster.clone() else {
                         return;
                     };
@@ -431,7 +437,7 @@ impl Workspace {
         });
         let dock = cx.new(Dock::new);
         let on_dock = cx.subscribe_in(&dock, window, |this, _, event, window, cx| match event {
-            DockEvent::Blurred => this.reclaim_focus(window, cx),
+            DockEvent::Blurred => this.recover_focus(window, cx),
             DockEvent::Restart(id) => this.restart_tab(*id, window, cx),
         });
         let focus = cx.focus_handle();
@@ -439,9 +445,9 @@ impl Workspace {
         // Focus left with a closed view (a cluster switch drops the list): take it back, so keys
         // and registered actions still reach the workspace.
         let on_focus_lost =
-            cx.on_focus_lost(window, |this, window, cx| this.reclaim_focus(window, cx));
+            cx.on_focus_lost(window, |this, window, cx| this.recover_focus(window, cx));
         let guards = Self::set_guards(Self::guards(cx.entity().downgrade()))
-            .when::<OpenClusterOverview>(|ws, _| ws.cluster.is_some());
+            .when::<OpenClusterOverview>(|ws, _| ws.cluster.is_some() || ws.sets.is_open());
         registry::install(focus.clone(), guards, cx);
         let cluster_sets = sets::ClusterSets::new(window, cx);
         // The window's close button asks first while a session would end, as Close Window does.
@@ -457,6 +463,7 @@ impl Workspace {
             cluster: None,
             generation: None,
             list: None,
+            problem_feed: Default::default(),
             detail: None,
             dashboard: None,
             sets: cluster_sets,
@@ -486,6 +493,7 @@ impl Workspace {
             startup_yaml: startup_view.as_ref().is_some_and(|v| v.yaml),
             startup_logs: startup_view.as_ref().is_some_and(|v| v.logs),
             action_error: None,
+            action_error_held: false,
             _action_error: Task::ready(()),
             _write_review: Task::ready(()),
             startup_view,
@@ -725,7 +733,7 @@ impl Workspace {
         let opening = match &key {
             TabKey::Logs(_) => Opening::ReconnectLogs,
             TabKey::Shell(_) => Opening::RestartShell,
-            TabKey::Activity(_) | TabKey::Compare(..) => return,
+            TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Helm(_) => return,
         };
         let check = self.model.read(cx).core().check_member(&member);
         self.sets.restart = cx.spawn_in(window, async move |this, cx| {
@@ -753,18 +761,16 @@ impl Workspace {
             TabKey::Logs(_) => Opening::ReconnectLogs,
             TabKey::Shell(_) => Opening::RestartShell,
             // Runs no session to start again.
-            TabKey::Activity(_) | TabKey::Compare(..) => return,
+            TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Helm(_) => return,
         };
         if let Some(reason) = self.sessions_blocked(key.context(), cx) {
             self.refuse(refused(opening, &reason), cx);
             return;
         }
         if matches!(key, TabKey::Shell(_))
-            && self
-                .cluster_summary(key.context(), cx)
-                .is_some_and(|c| self.model.read(cx).writes_paused(c))
+            && let Some(why) = self.writes_paused_why(key.context(), cx)
         {
-            self.refuse(refused(opening, &writes_paused_reason(key.context())), cx);
+            self.refuse(refused(opening, &why), cx);
             return;
         }
         if matches!(key, TabKey::Shell(_)) && self.is_protected(key.context(), cx) {
@@ -793,7 +799,7 @@ impl Workspace {
                         DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
                     }
                     // It returned above: an activity tab has no session to start again.
-                    TabKey::Activity(_) | TabKey::Compare(..) => {
+                    TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Helm(_) => {
                         unreachable!("these tabs do not restart")
                     }
                 },
@@ -808,18 +814,34 @@ impl Workspace {
 
     /// Says why Logs or Shell did not open, over the dock, for [`ACTION_ERROR_SHOWN`].
     pub(in crate::ui) fn refuse(&mut self, why: String, cx: &mut Context<Self>) {
+        self.show_action_error(why, false, cx);
+    }
+
+    /// [`Self::refuse`] for a reason that is about the cluster changing: it outlasts that change.
+    pub(in crate::ui) fn refuse_held(&mut self, why: String, cx: &mut Context<Self>) {
+        self.show_action_error(why, true, cx);
+    }
+
+    fn show_action_error(&mut self, why: String, held: bool, cx: &mut Context<Self>) {
         tracing::warn!("{why}");
         self.action_error = Some(why);
+        self.action_error_held = held;
         let timer = cx.background_executor().timer(ACTION_ERROR_SHOWN);
         self._action_error = cx.spawn(async move |this, cx| {
             timer.await;
-            let _ = this.update(cx, |ws, cx| ws.clear_action_error(cx));
+            let _ = this.update(cx, |ws, cx| {
+                ws.action_error_held = false;
+                ws.clear_action_error(cx);
+            });
         });
         cx.notify();
     }
 
     /// Takes the reason a Logs or Shell did not open away: it no longer applies.
     fn clear_action_error(&mut self, cx: &mut Context<Self>) {
+        if self.action_error_held {
+            return;
+        }
         if self.action_error.take().is_some() {
             self._action_error = Task::ready(());
             cx.notify();
@@ -859,7 +881,7 @@ impl Workspace {
                 return;
             }
         };
-        if let Some(why) = self.member_writes_paused(&request.cluster, cx) {
+        if let Some(why) = self.writes_paused_why(&request.cluster, cx) {
             self.refuse(refused(Opening::Shell, &why), cx);
             return;
         }
@@ -891,7 +913,7 @@ impl Workspace {
         let definition = match key {
             // The core ends a shell on any change of the exact URL, and a log session only when
             // the endpoint changes. Agent activity depends on neither.
-            TabKey::Shell(_) => summary.map_or(0, |c| c.definition),
+            TabKey::Shell(_) | TabKey::Helm(_) => summary.map_or(0, |c| c.definition),
             TabKey::Logs(_) => summary.map_or(0, |c| c.endpoint),
             TabKey::Activity(_) | TabKey::Compare(..) => 0,
         };
@@ -940,7 +962,7 @@ impl Workspace {
         let cluster = detail.read(cx).object().cluster.clone();
         let why = self.sessions_blocked(&cluster, cx);
         let protected = self.is_protected(&cluster, cx);
-        let writes_paused = self.member_writes_paused(&cluster, cx);
+        let writes_paused = self.writes_paused_why(&cluster, cx);
         let label = self.cluster_names(cx).exact(&cluster);
         // A set's row stays on its admitted server, which the write gate then holds it to.
         let server = match self.sets.member(&cluster) {
@@ -949,11 +971,20 @@ impl Workspace {
                 .cluster_summary(&cluster, cx)
                 .and_then(|c| c.info.server.clone()),
         };
+        let (connection, unsettled) =
+            self.cluster_summary(&cluster, cx)
+                .map_or((None, false), |c| {
+                    (
+                        Some((c.generation, c.definition)),
+                        c.provisional || c.paused,
+                    )
+                });
         detail.update(cx, |d, cx| {
             d.set_sessions_blocked(why, cx);
             d.set_protected(protected, label, cx);
             d.set_row_writes_paused(writes_paused, cx);
             d.set_server(server);
+            d.set_access_connection(connection, unsettled, cx);
         });
     }
 
@@ -974,6 +1005,15 @@ impl Workspace {
         let handle = window.window_handle();
         // The same claim as the row actions: one write at a time per object.
         let key = resource_actions::WriteKey::of(review.target());
+        // Only for the server the review named: otherwise it is already about another connection.
+        let guard = self
+            .cluster_summary(&review.target().cluster, cx)
+            .filter(|c| c.info.server == review.target().server)
+            .and_then(|_| self.connection_guard(&review.target().cluster, cx));
+        let Some(guard) = guard else {
+            self.refuse(super::write_binding::connection_changed_text(), cx);
+            return;
+        };
         let begin = {
             let (key, detail) = (key.clone(), detail.clone());
             move |cx: &mut App| match resource_actions::claim(
@@ -1011,6 +1051,7 @@ impl Workspace {
             review.clone(),
             &names,
             None,
+            guard,
             begin,
             move |result, cx| {
                 // First, and outside the window: a closed one must not keep the object claimed.
@@ -1050,9 +1091,10 @@ impl Workspace {
             Some(c) if c.info.server.is_none() => {
                 blocked(format!("{cluster} has no API server in kubeconfig"), false)
             }
-            Some(c) if self.model.read(cx).writes_paused(c) => {
-                blocked(writes_paused_reason(cluster), false)
-            }
+            Some(c) if self.model.read(cx).writes_paused(c) => blocked(
+                writes_paused_reason(&self.cluster_names(cx).exact(cluster)),
+                false,
+            ),
             Some(_) if self.is_protected(cluster, cx) => blocked(
                 protected_reason(&self.cluster_names(cx).exact(cluster)),
                 true,
@@ -1064,6 +1106,14 @@ impl Workspace {
     /// Brings the navigation and main area in line with the model: the active cluster and its
     /// discovery.
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if confirm::newest_is_stale(window, cx) {
+            let this = cx.weak_entity();
+            window.defer(cx, move |window, cx| {
+                if confirm::close_stale(window, cx) {
+                    let _ = this.update(cx, |ws, cx| ws.confirmation_closed(window, cx));
+                }
+            });
+        }
         self.check_dock_servers(cx);
         self.tell_detail_sessions_blocked(cx);
         self.tell_shells_protected(cx);
@@ -1146,6 +1196,9 @@ impl Workspace {
         // An open switcher follows the active cluster and its discovery.
         self.refresh_switcher(cx);
         let (Some(cluster), Some(discovery)) = (active, discovered.discovery) else {
+            if discovered.error.is_some() {
+                self.open_overview_without_discovery(window, cx);
+            }
             return;
         };
         if self.list.is_some() || self.dashboard.is_some() || self.sets.is_open() {
@@ -1188,6 +1241,27 @@ impl Workspace {
         {
             // The kind last open on this cluster, also after a restart.
             self.restore_kind(&entry, window, cx);
+        }
+        // A saved kind in a group discovery could not vouch for may come with its next retry.
+        let saved_may_come = self
+            .ui_state
+            .last_view(&cluster)
+            .is_some_and(|kind| may_still_be_discovered(&discovery, kind));
+        if self.list.is_none() && !saved_may_come {
+            self.open_default_overview(window, cx);
+        }
+    }
+
+    /// Discovery failed with nothing asked for, so there are no kinds to pick: the overview
+    /// needs none. An explicit or saved kind waits for discovery to work instead.
+    fn open_overview_without_discovery(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pending = self.startup_view.is_some()
+            || self
+                .cluster
+                .as_deref()
+                .is_some_and(|cluster| self.ui_state.last_view(cluster).is_some());
+        if !pending && self.list.is_none() && self.dashboard.is_none() && !self.sets.is_open() {
+            self.open_default_overview(window, cx);
         }
     }
 
@@ -1239,6 +1313,16 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(in crate::ui) fn save_last_view_for_test(&mut self, cluster: &str, kind: &str) {
+        let _ = self.ui_state.set_last_view(cluster, kind);
+    }
+
+    #[cfg(test)]
+    pub(in crate::ui) fn sidebar_focus_for_test(&self) -> FocusHandle {
+        self.sidebar_focus.clone()
+    }
+
+    #[cfg(test)]
     pub(in crate::ui) fn saved_namespace_filter(&self, cluster: &str) -> Vec<String> {
         self.ui_state.namespace_filter(cluster).to_vec()
     }
@@ -1265,14 +1349,36 @@ impl Workspace {
         }
     }
 
+    /// Opens a connected cluster on its overview when nothing else was asked for. A paused
+    /// cluster stays as it is, so no feed starts, and a set being admitted is not cancelled.
+    fn open_default_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let model = self.model.read(cx);
+        let ready = model.active_cluster().is_some_and(|cluster| {
+            matches!(cluster.state, ConnectionState::Connected(_))
+                && !model.sessions_paused(cluster)
+        });
+        if ready && !self.sets.is_opening() {
+            // Connecting from the sidebar leaves focus there, so its arrows keep working.
+            let take_focus =
+                self.palette.is_none() && !self.sidebar_focus.contains_focused(window, cx);
+            self.show_dashboard(take_focus, window, cx);
+        }
+    }
+
     /// Shows the active cluster's overview in place of its list. Go Back returns to the list.
     fn open_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_dashboard(true, window, cx);
+    }
+
+    fn show_dashboard(&mut self, take_focus: bool, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(cluster), Some(generation)) = (self.cluster.clone(), self.generation) else {
             return;
         };
         if let Some((view, _)) = &self.dashboard {
-            let focus = view.read(cx).focus_handle(cx);
-            window.focus(&focus, cx);
+            if take_focus {
+                let focus = view.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+            }
             return;
         }
         // Any place other than the list shown: the overview is not one Go Back returns to.
@@ -1286,8 +1392,10 @@ impl Workspace {
         let model = self.model.clone();
         let view = cx.new(|cx| DashboardView::following(model, cluster, generation, cx));
         let events = cx.subscribe_in(&view, window, Self::on_dashboard_event);
-        let focus = view.read(cx).focus_handle(cx);
-        window.focus(&focus, cx);
+        if take_focus {
+            let focus = view.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        }
         release_unfocused_input(window, cx);
         self.dashboard = Some((view, events));
         self.nav.update(cx, |nav, cx| nav.set_overview(true, cx));
@@ -1302,9 +1410,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let problems = match *event {
-            DashboardEvent::OpenFilteredList(category) => view.read(cx).problem_list(category),
+        let problems = match event {
+            DashboardEvent::OpenFilteredList(category) => view.read(cx).problem_list(*category),
             DashboardEvent::OpenShortWorkloads(kind) => view.read(cx).short_workloads(kind),
+            DashboardEvent::CannotOpen(why) => {
+                self.refuse(why.clone(), cx);
+                return;
+            }
         };
         let Some(problems) = problems.cloned() else {
             return;
@@ -1330,10 +1442,11 @@ impl Workspace {
     }
 
     /// Opens `entry`'s list on its own (the view last open on the cluster, `FLINT_VIEW`), not
-    /// at the user's asking: it takes focus only if the palette or the switcher is not open,
-    /// so they stay open with what was typed.
+    /// at the user's asking: it takes focus only if the palette, the switcher or a dialog is not
+    /// open, so they stay open with what was typed and keep their keys.
     fn restore_kind(&mut self, entry: &NavEntry, window: &mut Window, cx: &mut Context<Self>) {
-        let take_focus = self.palette.is_none();
+        let dialog = gpui_kit::component::WindowExt::has_active_dialog(window, cx);
+        let take_focus = self.palette.is_none() && !dialog;
         self.show_kind(entry, true, take_focus, window, cx);
     }
 
@@ -2255,7 +2368,11 @@ impl Workspace {
         let tip = if paused {
             WRITES_PAUSED_TIP.to_owned()
         } else {
-            protection_text(protection, &model.trust(cluster))
+            protection_text(
+                protection,
+                &model.trust(cluster),
+                cluster.info.server.as_deref(),
+            )
         };
         let text = if paused {
             WRITES_PAUSED
@@ -2726,7 +2843,7 @@ impl Workspace {
         let dashboard = self
             .dashboard
             .as_ref()
-            .filter(|_| !matches!(cluster.state, ConnectionState::Failed(_)));
+            .filter(|_| !connection_stopped(&cluster.state));
         let overview_notice = dashboard
             .filter(|_| matches!(cluster.state, ConnectionState::Connecting))
             .and_then(|_| {
@@ -2866,6 +2983,13 @@ impl Workspace {
 /// A side pane's title. On macOS it is the top row, as tall as the main header, and moves the
 /// window. A pane under the traffic lights (`traffic_lights` above zero) leaves the row to them
 /// and shows no title.
+/// Whether `kind` (`plural` or `plural.group`) is in a group `discovery` could not vouch for, so
+/// its absence proves nothing.
+fn may_still_be_discovered(discovery: &flint_core::ClusterDiscovery, kind: &str) -> bool {
+    let group = kind.split_once('.').map_or("", |(_, group)| group);
+    discovery.incomplete_groups.iter().any(|g| g == group)
+}
+
 fn pane_title(title: &'static str, traffic_lights: Pixels, theme: &Theme) -> impl IntoElement {
     let row = div()
         .px_3()
@@ -2885,7 +3009,11 @@ fn pane_title(title: &'static str, traffic_lights: Pixels, theme: &Theme) -> imp
 }
 
 /// What a cluster's protection is, in its row's tooltip.
-pub(super) fn protection_text(protection: Protection, trust: &TrustState) -> String {
+pub(super) fn protection_text(
+    protection: Protection,
+    trust: &TrustState,
+    server: Option<&str>,
+) -> String {
     let text = match protection {
         Protection::Protected => "Protected: read-only in Flint until you unlock or trust it",
         Protection::Local => "On this machine: unlocked",
@@ -2894,7 +3022,7 @@ pub(super) fn protection_text(protection: Protection, trust: &TrustState) -> Str
     };
     match trust {
         TrustState::ServerChanged { trusted_server } if protection != Protection::Trusted => {
-            let trusted = flint_core::redact::server_url(trusted_server);
+            let trusted = changed_from(server, trusted_server);
             format!("{text}. Cluster changed: trusted at {trusted}, now points elsewhere")
         }
         _ => text.to_owned(),
@@ -2929,9 +3057,9 @@ const WRITES_PAUSED: &str = "Writes paused";
 pub(super) const WRITES_PAUSED_TIP: &str =
     "Writes are paused until Flint can read your kubeconfig files and confirm this cluster";
 
-/// Why a shell cannot start on a cluster whose writes are paused.
+/// Why a write or a new shell cannot start on a cluster whose writes are paused.
 fn writes_paused_reason(cluster: &str) -> String {
-    format!("writes to {cluster} are paused until Flint can read your kubeconfig")
+    format!("a kubeconfig file can't be read, so writes and new shells on {cluster} are paused")
 }
 
 /// The access mode on a narrow header's second row: still tells every mode apart.
@@ -3156,13 +3284,25 @@ fn shown_host(server: &str) -> String {
 
 /// How a dialog names the server a pin was made for. Two different URLs can show as the same
 /// text, and "trusted at X, which is a different server" would then read as a contradiction.
+/// Only the old URL's origin is named: its path is not needed to tell the two apart.
 fn previous_address(server: &str, previous: &str) -> String {
-    let shown = flint_core::redact::server_url(previous);
-    if shown == flint_core::redact::server_url(server) {
+    use flint_core::redact::{server_origin, server_url};
+    let origin = server_origin(previous);
+    if server_url(previous) == server_url(server) {
         "another URL that shows the same here".to_owned()
+    } else if origin == server_origin(server) {
+        format!("another path on {origin}")
     } else {
-        shown
+        origin
     }
+}
+
+/// [`previous_address`] for a context that may have no server now, as a sidebar tooltip says it.
+pub(super) fn changed_from(server: Option<&str>, previous: &str) -> String {
+    server.map_or_else(
+        || flint_core::redact::server_origin(previous),
+        |server| previous_address(server, previous),
+    )
 }
 
 /// Asks before unlocking a protected cluster until Flint quits, naming the context and its
@@ -3817,6 +3957,9 @@ mod disconnect;
 
 #[path = "workspace_keys.rs"]
 mod keys;
+
+#[path = "workspace_problems.rs"]
+pub(in crate::ui) mod problems;
 
 #[path = "workspace_sets.rs"]
 mod sets;

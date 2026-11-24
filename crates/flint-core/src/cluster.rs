@@ -602,6 +602,13 @@ pub(crate) async fn connect_gated_with_policy(
         still_held()?;
         // Once: both clients then share it.
         let auth = kube::client::ConfigExt::auth_layer(&config)?.map(std::sync::Arc::new);
+        // Taken now, while the layer still holds what it just read from the file.
+        let admitted_token = match (&source, &auth) {
+            (credential::CredentialSource::TokenFile(_), Some(layer)) => {
+                tokio::runtime::Handle::current().block_on(credential::client_token(layer))
+            }
+            _ => None,
+        };
         let guarded = auth
             .as_ref()
             .and_then(|layer| credential::GuardedProvider::guarding(layer, &lease));
@@ -629,7 +636,8 @@ pub(crate) async fn connect_gated_with_policy(
                 read,
                 writes: WriteAccess::new(write),
             },
-            credential: WriteCredential::with_grant(files, source, token, auth, grant, guarded),
+            credential: WriteCredential::with_grant(files, source, token, auth, grant, guarded)
+                .with_admitted_token(admitted_token),
         })
     })
     .await
@@ -881,6 +889,24 @@ pub(crate) fn sending_credential(client: Client, credential: credential::BoundHe
     let service = tower::service_fn(move |mut request: http::Request<kube::client::Body>| {
         let client = client.clone();
         request.extensions_mut().insert(credential.clone());
+        async move { client.send(request).await }
+    });
+    Client::new(service, namespace)
+}
+
+/// `client`, whose requests use the exec token it holds now and never run the plugin for another.
+/// Each request still passes through the whole stack of `client`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "wraps a client build_client made, adding only a marker to each request"
+)]
+pub(crate) fn reusing_held_token(client: Client) -> Client {
+    let namespace = client.default_namespace().to_owned();
+    let service = tower::service_fn(move |mut request: http::Request<kube::client::Body>| {
+        let client = client.clone();
+        request
+            .extensions_mut()
+            .insert(crate::auth_plugin::HeldTokenOnly);
         async move { client.send(request).await }
     });
     Client::new(service, namespace)

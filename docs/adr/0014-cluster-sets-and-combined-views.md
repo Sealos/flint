@@ -31,6 +31,10 @@ one view, which this document calls a **cluster set**, and the UI calls super mo
   warm clusters ship later, members don't count against `warm_clusters`, and closing the set returns them to the
   warm rules. Each member's errors show in its sidebar row and as a one-line note in the combined list, and never block
   the other members' rows.
+- **Exec-plugin members:** a member whose credential runs a command connects while another cluster is selected only
+  with keep watching's background sign-in consent, under its rules
+  ([ADR-0012](./0012-keep-recently-used-clusters-warm.md)). Without it, the member shows sign-in needed until it is
+  selected.
 
 ## Considered Options
 

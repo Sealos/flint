@@ -66,6 +66,7 @@ impl Workspace {
                         AiExposureState::ServerChanged { .. } => "server_changed",
                     },
                     protection: model.protection(cluster).name(),
+                    kubeconfig_unreadable: model.writes_paused(cluster),
                     cursor: cursor.as_deref() == Some(cluster.info.name.as_str()),
                 }
             })
@@ -211,6 +212,14 @@ impl Workspace {
         }
         if self.nav.read(cx).focus_handle().is_focused(window) {
             return Focus::Navigation;
+        }
+        if let Some((overview, _)) = &self.dashboard
+            && overview
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+        {
+            return Focus::Overview;
         }
         if self
             .palette

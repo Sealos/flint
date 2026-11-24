@@ -209,6 +209,60 @@ pub struct CombinedQuery {
     pub group_by_cluster: bool,
     /// Clusters, by id, whose group shows its header only.
     pub collapsed: Vec<ClusterId>,
+    /// Only these objects, when set.
+    pub objects: Option<Arc<CombinedObjects>>,
+}
+
+/// Particular objects across a set's members. An object is matched by UID within its cluster, so
+/// one replaced under the same name is not it; only an object with no UID is matched by name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CombinedObjects {
+    clusters: HashMap<ClusterId, MemberObjects>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MemberObjects {
+    uids: HashSet<String>,
+    /// `namespace/name`, or `name` when cluster-scoped. A Kubernetes name holds no `/`.
+    without_uid: HashSet<String>,
+}
+
+impl MemberObjects {
+    fn matches(&self, namespace: Option<&str>, name: &str, uid: &str) -> bool {
+        self.uids.contains(uid)
+            || (!self.without_uid.is_empty()
+                && self.without_uid.contains(&match namespace {
+                    Some(namespace) => format!("{namespace}/{name}"),
+                    None => name.to_owned(),
+                }))
+    }
+}
+
+impl CombinedObjects {
+    /// Adds one cluster's objects: their `uids`, and `names` (`namespace/name`) of those with
+    /// no UID. A cluster added with none shows no rows.
+    pub fn extend(
+        &mut self,
+        cluster: &str,
+        uids: impl IntoIterator<Item = String>,
+        names: impl IntoIterator<Item = String>,
+    ) {
+        let member = self.clusters.entry(cluster.to_owned()).or_default();
+        member.uids.extend(uids);
+        member.without_uid.extend(names);
+    }
+
+    /// How many objects it holds, over every cluster.
+    pub fn len(&self) -> usize {
+        self.clusters
+            .values()
+            .map(|member| member.uids.len() + member.without_uid.len())
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// A sort by column key, so it survives a change in the union.
@@ -392,6 +446,12 @@ impl CombinedList {
             .map(|row| &**row)
     }
 
+    /// The row of member `member` with `uid`, whatever filters hide it. Linear.
+    pub fn find_row(&self, member: usize, uid: &str) -> Option<&Row> {
+        let rows = &self.members.get(member)?.snapshot.rows;
+        rows.iter().find(|row| &*row.uid == uid).map(|row| &**row)
+    }
+
     /// The identity of the row at `at`.
     pub fn row_id(&self, at: RowRef) -> Option<CombinedRowId> {
         let row = self.checked_row(at)?;
@@ -431,6 +491,17 @@ impl CombinedList {
     /// namespace, name, then cluster. Blank cells sort last in both directions, so one cluster
     /// lacking a column never pushes the others' rows down.
     pub fn compute(&self, query: &CombinedQuery, now: i64) -> CombinedView {
+        self.compute_where(query, now, |_, _| true)
+    }
+
+    /// [`Self::compute`] over the rows `keep` accepts, by member index. Counts and groups cover
+    /// only those rows.
+    pub fn compute_where(
+        &self,
+        query: &CombinedQuery,
+        now: i64,
+        keep: impl Fn(usize, &Row) -> bool,
+    ) -> CombinedView {
         let sort = self.resolve_sort(query);
         let mut picked: Vec<(usize, Vec<u32>)> = (0..self.members.len())
             .filter(|&m| {
@@ -440,7 +511,12 @@ impl CombinedList {
                         .iter()
                         .any(|c| c.as_str() == &*self.members[m].cluster)
             })
-            .map(|m| (m, self.filter_member(m, query, now)))
+            .map(|m| {
+                let mut rows = self.filter_member(m, query, now);
+                let snapshot = &self.members[m].snapshot;
+                rows.retain(|&row| keep(m, &snapshot.rows[row as usize]));
+                (m, rows)
+            })
             .collect();
         let matched = picked.iter().map(|(_, rows)| rows.len()).sum();
 
@@ -515,7 +591,7 @@ impl CombinedList {
         } else {
             query.text.clone()
         };
-        crate::view::compute(
+        let rows = crate::view::compute(
             &view.snapshot,
             &ViewQuery {
                 namespaces: query.namespaces.clone(),
@@ -523,7 +599,19 @@ impl CombinedList {
                 sort: None,
             },
             now,
-        )
+        );
+        let Some(objects) = &query.objects else {
+            return rows;
+        };
+        let Some(wanted) = objects.clusters.get(&*view.cluster) else {
+            return Vec::new();
+        };
+        rows.into_iter()
+            .filter(|&at| {
+                let row = &view.snapshot.rows[at as usize];
+                wanted.matches(row.namespace.as_deref(), &row.name, &row.uid)
+            })
+            .collect()
     }
 
     fn order(&self, rows: &mut Vec<RowRef>, sort: Option<ResolvedSort>, now: i64) {

@@ -22,7 +22,7 @@ use gpui_kit::*;
 use super::cluster_tag;
 use super::nav::NavPanel;
 use super::scope_picker;
-use super::workspace::{WRITES_PAUSED_TIP, protection_text, server_text};
+use super::workspace::{WRITES_PAUSED_TIP, changed_from, protection_text, server_text};
 
 pub struct ClustersModel {
     core: CoreHandle,
@@ -140,6 +140,14 @@ impl ClustersModel {
                 }
             }
             Event::ConnectionProgress(progress) => self.connection_progress = progress,
+            Event::WritesEnded {
+                cluster,
+                write_epoch,
+            } => {
+                if let Some(c) = self.clusters.iter_mut().find(|c| c.info.name == cluster) {
+                    c.write_epoch = c.write_epoch.max(write_epoch);
+                }
+            }
             Event::SettingsChanged {
                 settings,
                 error,
@@ -400,6 +408,21 @@ impl ClustersModel {
             cluster,
             server,
             enabled,
+        });
+    }
+
+    /// Sets one threshold, for all clusters or one context at one server (`None` clears it).
+    /// Written to `settings.toml`; the change comes back as a settings event.
+    pub fn set_threshold(
+        &mut self,
+        cluster: Option<flint_core::settings::ClusterPin>,
+        metric: flint_core::thresholds::ThresholdMetric,
+        value: Option<u32>,
+    ) {
+        self.send(Command::SetThreshold {
+            cluster,
+            metric,
+            value,
         });
     }
 
@@ -738,7 +761,7 @@ pub fn cluster_details(
         AiExposureState::ServerChanged { exposed_server } => format!(
             "Cluster changed: exposed at {}, now points elsewhere. Hidden from AI agents \
              until you expose it again.",
-            flint_core::redact::server_url(&exposed_server)
+            changed_from(cluster.info.server.as_deref(), &exposed_server)
         ),
     };
     let tag_line = model
@@ -750,7 +773,11 @@ pub fn cluster_details(
         if model.writes_paused(cluster) {
             WRITES_PAUSED_TIP.to_owned()
         } else {
-            protection_text(model.protection(cluster), &model.trust(cluster))
+            protection_text(
+                model.protection(cluster),
+                &model.trust(cluster),
+                cluster.info.server.as_deref(),
+            )
         },
         cluster.info.source.display()
     )
@@ -863,6 +890,7 @@ mod tests {
             generation: 1,
             definition: 1,
             endpoint: 1,
+            write_epoch: 0,
             confirmed: true,
             provisional: false,
             paused: false,

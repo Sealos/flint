@@ -40,12 +40,13 @@ use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Theme,
-    h_flex, v_flex,
+    WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -63,6 +64,7 @@ use super::registry::{
     ToggleSources, ToggleTimestamps, ToggleWrap,
 };
 use super::theme;
+use save::{OffThread, SaveSlot, SaveSlots};
 
 /// The height of one unwrapped log line.
 pub const LINE_HEIGHT: f32 = 18.;
@@ -102,9 +104,17 @@ impl LogRequest {
 struct PendingSave {
     scope: SaveScope,
     format: LineFormat,
+    held: Arc<OffThread<HeldSave>>,
+    selection: Option<LineSelection>,
+    /// Where a failure is reported if the tab has closed by then.
+    window: AnyWindowHandle,
+}
+
+/// What a save keeps alive until it ends, and its place among the saves under way.
+struct HeldSave {
     lines: flint_core::LogLines,
     matches: Vec<LineId>,
-    selection: Option<LineSelection>,
+    _slot: SaveSlot,
 }
 
 /// A line under the toolbar after a copy or a save. A muted one times out
@@ -135,7 +145,7 @@ pub struct LogView {
     selection_paused: bool,
     selection: Option<LineSelection>,
     /// A mouse selection is being dragged.
-    drag_selecting: bool,
+    pub(in crate::ui) drag_selecting: bool,
     query: SearchQuery,
     search: LogSearch,
     /// The matches among the rows shown in a filtered tab, kept until the search or the rows
@@ -148,6 +158,10 @@ pub struct LogView {
     >,
     /// The search's matches in the lines drawn, kept per line and bounded per frame.
     highlights: std::cell::RefCell<log_model::LineHighlights>,
+    /// The background scan of long lines drawn whole, for their regex highlights.
+    whole_line_scan: filter::ScanStop,
+    whole_line_scanning: bool,
+    _whole_lines: Task<()>,
     /// Bumped with every query, so a slow first scan of an old query is dropped.
     search_generation: u64,
     /// A scan of `search` runs on the core's threads: the first of `query`, or a long
@@ -324,6 +338,9 @@ impl LogView {
             search: LogSearch::default(),
             shown_matches: Default::default(),
             highlights: Default::default(),
+            whole_line_scan: Default::default(),
+            whole_line_scanning: false,
+            _whole_lines: Task::ready(()),
             search_generation: 0,
             searching: false,
             search_scan: Default::default(),
@@ -549,6 +566,7 @@ impl LogView {
         self.current_match = None;
         self.search_generation += 1;
         self.search_scan.stop();
+        self.stop_whole_line_scan();
         self.search = LogSearch::new(query.clone());
         // The matching lines shown follow the search, once it has stayed for a moment; a filter
         // of the old query on its way is dropped, and what is shown stays until the new one
@@ -776,6 +794,15 @@ impl LogView {
             self.set_note(Tone::Muted, "Still searching…".to_owned(), cx);
             return;
         }
+        let Some(slot) = cx.default_global::<SaveSlots>().take() else {
+            self.set_note(
+                Tone::Danger,
+                "Other log saves are still running. Try again when one finishes.".to_owned(),
+                cx,
+            );
+            cx.notify();
+            return;
+        };
         // A filtered tab writes the rows it shows: all of them, the selected ones, or the
         // matches among them, as a list of lines.
         let (scope, matches) = match (self.filter_rows(), scope) {
@@ -802,13 +829,24 @@ impl LogView {
                 timestamps: timestamps.unwrap_or(self.timestamps),
                 ..self.format()
             },
-            lines: self.snapshot.lines.clone(),
-            matches,
+            held: Arc::new(OffThread::new(
+                HeldSave {
+                    lines: self.snapshot.lines.clone(),
+                    matches,
+                    _slot: slot,
+                },
+                cx.background_executor().clone(),
+            )),
             selection: self.selection,
+            window: window.window_handle(),
         };
         // Counted, not built: the file's text is built off the UI thread once a path is chosen.
-        let count =
-            log_model::save_count(&save.lines, save.scope, &save.matches, save.selection) as u64;
+        let count = log_model::save_count(
+            &save.held.lines,
+            save.scope,
+            &save.held.matches,
+            save.selection,
+        ) as u64;
         let description = format!(
             "{} will be written as shown{}. The file is not redacted: it holds whatever the \
              pod logged, secrets included.",
@@ -839,9 +877,9 @@ impl LogView {
         let PendingSave {
             scope,
             format,
-            lines,
-            matches,
+            held,
             selection,
+            window,
         } = save;
         let name = log_model::suggested_file_name(&self.request.subject, self.request.previous);
         let path = cx.prompt_for_new_path(&Self::save_dir(), Some(&name));
@@ -859,38 +897,73 @@ impl LogView {
                     });
                     return;
                 }
-                // Cancelled.
-                _ => return,
+                // Cancelled: an earlier save's note no longer describes this one.
+                _ => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.set_note(Tone::Muted, "Save cancelled.".to_owned(), cx);
+                        cx.notify();
+                    });
+                    return;
+                }
             };
             let written = cx
                 .background_spawn(async move {
-                    let (text, count) =
-                        log_model::save_text(&lines, scope, &matches, selection, format)
-                            .ok_or_else(|| "there are no such lines".to_owned())?;
-                    std::fs::write(&path, text)
-                        .map(|()| (path, count))
-                        .map_err(|e| e.to_string())
+                    // Checked first, so a save of nothing leaves an existing file alone.
+                    if log_model::save_count(&held.lines, scope, &held.matches, selection) == 0 {
+                        return Err("there are no such lines".to_owned());
+                    }
+                    save::replace_file(&path, |file| {
+                        log_model::write_saved(
+                            file,
+                            &held.lines,
+                            scope,
+                            &held.matches,
+                            selection,
+                            format,
+                        )
+                    })
+                    .map(|count| (path, count))
+                    .map_err(|e| e.to_string())
                 })
                 .await;
-            let _ = this.update(cx, |view, cx| {
-                match written {
-                    Ok((path, count)) => view.set_note(
-                        Tone::Muted,
-                        format!(
-                            "Saved {} to {}, as shown and not redacted.",
-                            log_model::line_count(count as u64),
-                            path.display()
-                        ),
-                        cx,
-                    ),
-                    Err(e) => {
-                        view.set_note(Tone::Danger, format!("Could not save the logs: {e}"), cx)
-                    }
-                }
-                cx.notify();
-            });
+            Self::finish_save(&this, window, written, cx);
         })
         .detach();
+    }
+
+    /// Says how a save ended: in the tab, or in its window if the tab has closed and the save
+    /// failed.
+    fn finish_save(
+        this: &WeakEntity<Self>,
+        window: AnyWindowHandle,
+        written: Result<(PathBuf, usize), String>,
+        cx: &mut AsyncApp,
+    ) {
+        let failure = written
+            .as_ref()
+            .err()
+            .map(|e| format!("Could not save the logs: {e}"));
+        let shown = this.update(cx, |view, cx| {
+            match written {
+                Ok((path, count)) => view.set_note(
+                    Tone::Muted,
+                    format!(
+                        "Saved {} to {}, as shown and not redacted.",
+                        log_model::line_count(count as u64),
+                        path.display()
+                    ),
+                    cx,
+                ),
+                Err(e) => view.set_note(Tone::Danger, format!("Could not save the logs: {e}"), cx),
+            }
+            cx.notify();
+        });
+        if let (Err(_), Some(failure)) = (shown, failure) {
+            // A window closed meanwhile has nowhere left to say it.
+            let _ = window.update(cx, |_, window, cx| {
+                window.push_notification(Notification::error(failure), cx);
+            });
+        }
     }
 
     /// Shows `text` in the strip under the toolbar, in place of what was there. A muted note
@@ -982,7 +1055,7 @@ impl LogView {
         let shown = log_model::shown_line_with(line, self.line_view(), max, |short| {
             self.highlights
                 .borrow_mut()
-                .matches(id, line, &self.query, short)
+                .matches(id, line, &self.query, short, max)
         });
         // Rows past this frame's highlighting budget get theirs on the next one.
         if self.highlights.borrow_mut().take_redraw() {
@@ -1102,6 +1175,20 @@ impl LogView {
                     .when(!self.wrap, |el| el.truncate())
                     .child(StyledText::new(body).with_highlights(body_runs)),
             )
+            .when(shown.limited, |el| {
+                el.child(
+                    div()
+                        .id(("log-limited", id as usize))
+                        .flex_none()
+                        .pl_1()
+                        .text_color(theme.muted_foreground)
+                        .child("partial")
+                        .tooltip(|window, cx| {
+                            Tooltip::new("Only some of this line's matches are highlighted.")
+                                .build(window, cx)
+                        }),
+                )
+            })
             .when(shown.cut, |el| {
                 el.child(
                     div()
@@ -1529,13 +1616,20 @@ impl LogView {
                                     .tooltip("View options and Save")
                                     .dropdown_menu_with_anchor(
                                         Anchor::TopRight,
-                                        move |menu, _, cx| {
+                                        move |menu, window, cx| {
                                             fill_menu(
                                                 menu,
                                                 log_model::more_menu(&facts),
                                                 facts.timestamps,
                                                 "log-more",
                                                 cx,
+                                            )
+                                            // Every entry stays reachable in a short window.
+                                            .scrollable(true)
+                                            .max_h(
+                                                log_model::menu_max_height(
+                                                    window.viewport_size().height,
+                                                ),
                                             )
                                         },
                                     ),
@@ -1964,6 +2058,7 @@ impl Render for LogView {
         let mut scan_budget = filter::UiScanBudget::default();
         self.catch_up_search(&mut scan_budget, cx);
         self.catch_up_filter(&mut scan_budget, cx);
+        self.scan_whole_lines(cx);
         self.highlights.borrow_mut().begin_frame();
         let theme = cx.theme().clone();
         // The toolbar needs the tab's width, known only after layout: when it changed, draw
@@ -2042,6 +2137,9 @@ mod filter;
 #[cfg(any(test, feature = "automation"))]
 #[path = "log_state.rs"]
 mod state;
+
+#[path = "log_save.rs"]
+mod save;
 
 #[cfg(test)]
 #[path = "log_tests.rs"]

@@ -740,6 +740,119 @@ async fn save_writes_matches_as_shown_to_the_chosen_file(cx: &mut TestAppContext
     );
 }
 
+/// Asks to save every line and confirms, so the file picker is open.
+async fn save_up_to_the_picker(cx: &mut TestAppContext, window: AnyWindowHandle) {
+    cx.update_window(window, |_, window, cx| {
+        window.dispatch_action(
+            Box::new(SaveLines {
+                lines: SaveScope::All,
+                timestamps: None,
+            }),
+            cx,
+        )
+    })
+    .unwrap();
+    cx.wait_for(window, WAIT, |window, cx| window.has_active_dialog(cx))
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        registry::dispatch("ui::Confirm", serde_json::Value::Null, window, cx)
+    })
+    .unwrap()
+    .unwrap();
+    cx.run_until_parked();
+    assert!(cx.did_prompt_for_new_path());
+}
+
+// covers UP-46: cancelling the file picker replaces an earlier save's note and ends the save.
+#[gpui_kit::test]
+async fn a_cancelled_picker_leaves_no_stale_success(cx: &mut TestAppContext) {
+    let (core, dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    feed(cx, &view, lines.push(0, 3).streaming());
+
+    save_up_to_the_picker(cx, window).await;
+    let path = dir.path().join("first.log");
+    cx.simulate_new_path_selection(move |_| Some(path));
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-note").is_some()
+    })
+    .await;
+
+    save_up_to_the_picker(cx, window).await;
+    cx.simulate_new_path_selection(|_| None);
+    cx.run_until_parked();
+
+    let note = view.read_with(cx, |v, _| v.note.clone().unwrap().text);
+    assert_eq!(note, "Save cancelled.");
+    cx.update(|cx| {
+        let slots = cx.default_global::<super::save::SaveSlots>();
+        let held: Vec<_> = (0..super::save::MAX_SAVES).map(|_| slots.take()).collect();
+        assert!(held.iter().all(Option::is_some), "the save ended");
+    });
+}
+
+// covers UP-46: a save past the cap is refused with a reason, and asks nothing.
+#[gpui_kit::test]
+async fn a_save_past_the_cap_is_refused(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    feed(cx, &view, lines.push(0, 3).streaming());
+    let _running: Vec<_> = cx.update(|cx| {
+        let slots = cx.default_global::<super::save::SaveSlots>();
+        (0..super::save::MAX_SAVES).map(|_| slots.take()).collect()
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.dispatch_action(
+            Box::new(SaveLines {
+                lines: SaveScope::All,
+                timestamps: None,
+            }),
+            cx,
+        )
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, window, cx| {
+        assert!(!window.has_active_dialog(cx));
+    })
+    .unwrap();
+    let note = view.read_with(cx, |v, _| v.note.clone().unwrap().text);
+    assert!(note.contains("still running"), "{note}");
+}
+
+// covers UP-46: a save that fails after its tab closed is still reported, in the window.
+#[gpui_kit::test]
+async fn a_failed_save_of_a_closed_tab_is_reported(cx: &mut TestAppContext) {
+    let (core_a, _dir_a) = core();
+    let (core_b, _dir_b) = core();
+    let (window, _view) = open(cx, core_a);
+    let closed = cx
+        .update_window(window, |_, window, cx| {
+            cx.new(|cx| {
+                let mut view = LogView::new(core_b, request(), window, cx);
+                view.stop_streaming();
+                view
+            })
+            .downgrade()
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(closed.upgrade().is_none());
+
+    let mut app = cx.to_async();
+    LogView::finish_save(&closed, window, Err("disk full".to_owned()), &mut app);
+    cx.run_until_parked();
+
+    let shown = cx
+        .update_window(window, |_, window, cx| window.notifications(cx).len())
+        .unwrap();
+    assert_eq!(shown, 1);
+}
+
 // covers UP-45: a workload tab prefixes each line with its pod and container (a view toggle,
 // copied as shown) and counts the workload's streams in the toolbar.
 #[gpui_kit::test]
@@ -1994,9 +2107,10 @@ async fn a_large_selection_is_counted_and_copied(cx: &mut TestAppContext) {
     assert_eq!(note, "Copied 20,000 lines as shown, not redacted.");
 }
 
-// covers UP-43: between a snapshot and the next frame (here, a tab not drawn), Next Match and
-// Save Matching Lines see the lines shown: not matches evicted meanwhile, and new ones. While
-// a catch-up runs on the core's threads, they are refused.
+// covers UP-43: between a snapshot and the next frame (here, a tab not drawn), the guards of Next
+// Match and Save Matching Lines read the matches found, without evicted ones and testing no line.
+// Next Match itself catches up first. While a catch-up runs on the core's threads, they are
+// refused.
 #[gpui_kit::test]
 async fn match_actions_see_the_lines_shown_and_wait_for_a_scan(cx: &mut TestAppContext) {
     use super::CATCH_UP_ON_UI;
@@ -2028,10 +2142,11 @@ async fn match_actions_see_the_lines_shown_and_wait_for_a_scan(cx: &mut TestAppC
     // Line 14 matches, not scanned yet.
     feed(cx, &view, lines.push(14, 15).streaming());
     view.read_with(cx, |v, _| {
-        assert!(v.has_matches());
-        assert!(v.check_save(SaveScope::Matches).is_ok());
+        assert!(!v.has_matches(), "a line not scanned yet is not tested");
+        let refused = v.check_save(SaveScope::Matches).unwrap_err();
+        assert!(refused.to_string().contains("still searching"), "{refused}");
         let search = v.view_state().search;
-        assert_eq!((search.matches, search.searching), (1, false));
+        assert_eq!((search.matches, search.searching), (0, false));
     });
     let next = |cx: &mut TestAppContext| {
         cx.update_window(window, |_, window, cx| {
@@ -2041,6 +2156,12 @@ async fn match_actions_see_the_lines_shown_and_wait_for_a_scan(cx: &mut TestAppC
         view.read_with(cx, |v, _| v.current_match)
     };
     assert_eq!(next(cx), Some(14));
+    view.read_with(cx, |v, _| {
+        assert!(v.has_matches());
+        assert!(v.check_save(SaveScope::Matches).is_ok());
+        let search = v.view_state().search;
+        assert_eq!((search.matches, search.searching), (1, false));
+    });
 
     // Far behind: shown, it scans on the core's threads, and the actions wait for it.
     let mut lines = Feed::new(CATCH_UP_ON_UI as usize * 2);
@@ -2346,6 +2467,162 @@ fn a_regex_catch_up_is_bounded_by_text() {
         &view,
         &mut budget
     ));
+}
+
+// covers UP-48: a plain catch-up of few, very long lines goes to the core's threads too.
+#[test]
+fn a_plain_catch_up_is_bounded_by_text() {
+    use super::filter::{PLAIN_CATCH_UP_BYTES, UiScanBudget, catch_up_fits_ui};
+    use flint_core::SearchQuery;
+
+    let line = "x".repeat(60 * 1024);
+    let fit = PLAIN_CATCH_UP_BYTES / line.len();
+    let mut buffer = LogBuffer::new(fit + 2);
+    for _ in 0..fit + 1 {
+        buffer.push(LogLine::parse(&line, false));
+    }
+    let view = buffer.view();
+    let plain = SearchQuery::new("needle");
+    let mut budget = UiScanBudget::default();
+    assert!(catch_up_fits_ui(&plain, fit as u64, &view, &mut budget));
+    assert!(
+        !catch_up_fits_ui(&plain, fit as u64, &view, &mut budget),
+        "the search and the filter of a frame share the budget"
+    );
+    assert!(!catch_up_fits_ui(
+        &plain,
+        fit as u64 + 1,
+        &view,
+        &mut UiScanBudget::default()
+    ));
+}
+
+// covers UP-48: the first rows after a filter showed none go back to the place it held.
+#[gpui_kit::test]
+async fn rows_after_an_empty_filter_return_to_the_held_place(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(1_000);
+    feed(cx, &view, lines.push(1000, 1024).streaming());
+    draw(cx, window);
+    view.update(cx, |v, cx| {
+        v.context = 3;
+        v.set_query("line 2".into(), cx);
+    });
+    run(
+        cx,
+        window,
+        "logs::ToggleMatchingOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 0).await;
+    view.update(cx, |v, _| {
+        v.list.pause_following_tail();
+        v.held_anchor = Some(23);
+    });
+
+    // Ids 24 on match, so ids 21 to 23 come as their context.
+    feed(cx, &view, lines.push(2000, 2100).streaming());
+    until_rows(cx, window, &view, 103).await;
+    draw(cx, window);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.row_id(v.list.logical_scroll_top().item_ix), Some(23));
+        assert_eq!(v.held_anchor, None);
+    });
+}
+
+// covers UP-48: a drag goes on after a filter hid every selected row, to a row still shown.
+#[gpui_kit::test]
+async fn a_drag_survives_a_filter_that_hides_its_rows(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    feed(cx, &view, lines.push(0, 10).streaming());
+    draw(cx, window);
+    view.update(cx, |v, _| {
+        v.selection = Some(LineSelection::line(0));
+        v.drag_selecting = true;
+    });
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 2).await;
+    view.read_with(cx, |v, _| assert!(!v.has_selection() && v.is_selecting()));
+
+    run(
+        cx,
+        window,
+        "logs::DragSelection",
+        serde_json::json!({"line": 4}),
+    );
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.selection.map(|s| s.head), Some(4));
+    });
+    // A hidden destination is not taken.
+    run(
+        cx,
+        window,
+        "logs::DragSelection",
+        serde_json::json!({"line": 5}),
+    );
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.selection.map(|s| s.head), Some(4));
+        assert!(v.check_line::<registry::DragSelection>(5).is_err());
+    });
+}
+
+// covers UP-48: Set Context Lines refuses a value over the limit and says why, so the palette
+// stays open; the view keeps its context.
+#[gpui_kit::test]
+async fn context_lines_over_the_limit_are_refused(cx: &mut TestAppContext) {
+    assert!(LogView::check_context(100).is_ok());
+    let refusal = LogView::check_context(101).unwrap_err().to_string();
+    assert!(refusal.contains("0 to 100"), "{refusal}");
+
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    feed(cx, &view, lines.push(0, 10).streaming());
+    draw(cx, window);
+    let action = crate::ui::registry::SetLogContext { lines: 101 };
+    cx.update_window(window, |_, window, cx| {
+        window.dispatch_action(Box::new(action), cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| assert_eq!(v.context, 0));
+}
+
+// #309: clearing a regex while its long lines are being scanned, then restoring it, asks for
+// those lines again: the cancelled scan's results never landed.
+#[gpui_kit::test]
+async fn a_restored_regex_scans_its_long_lines_again(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (_window, view) = open(cx, core);
+    let text = format!(
+        "{}needle",
+        "x".repeat(flint_core::logs::HIGHLIGHT_BYTES * 2)
+    );
+    let line = LogLine::parse(&text, false);
+    view.update(cx, |v, cx| {
+        v.regex = true;
+        v.set_query("needle".into(), cx);
+        let query = v.query.clone();
+        v.highlights
+            .borrow_mut()
+            .matches(1, &line, &query, None, None);
+        assert_eq!(v.highlights.borrow_mut().take_wanted(), [1]);
+
+        v.set_query(String::new(), cx);
+        v.set_query("needle".into(), cx);
+        v.highlights
+            .borrow_mut()
+            .matches(1, &line, &query, None, None);
+        assert_eq!(v.highlights.borrow_mut().take_wanted(), [1]);
+    });
 }
 
 // covers UP-48: a regex over sources counts their bytes toward the UI thread's budget.

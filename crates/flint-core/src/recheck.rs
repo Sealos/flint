@@ -93,6 +93,11 @@ impl ContextPin {
         self.server.as_deref()
     }
 
+    /// The hash of the whole definition when pinned ([`crate::cluster::context_fingerprint`]).
+    pub fn definition(&self) -> Option<u64> {
+        self.definition
+    }
+
     /// A pin that matches no context's confirmed definition.
     pub fn stale() -> Self {
         ContextPin {
@@ -102,6 +107,13 @@ impl ContextPin {
             definition: None,
             server: None,
         }
+    }
+
+    /// Whether both pins are on one confirmed endpoint. A stale pin matches nothing.
+    pub fn same_endpoint_as(&self, other: &ContextPin) -> bool {
+        self.endpoint != 0
+            && self.endpoint == other.endpoint
+            && same_endpoint(self.server.as_deref(), other.server.as_deref())
     }
 
     /// Whether `other` is this pin on another connection definition, and nothing else moved.
@@ -155,6 +167,8 @@ pub(crate) struct Shown {
     /// [`Self::definition`] for the endpoint: an edit that only adds or drops a trailing slash
     /// keeps it, as it keeps a log session running.
     pub endpoint: u64,
+    /// [`Record::gate`]: what a write is held to.
+    pub gate: u64,
     /// A load confirmed the server shown. Otherwise it may be a fallback, showing only while a
     /// kubeconfig file before it can't be read.
     pub confirmed: bool,
@@ -200,6 +214,15 @@ pub(crate) struct ContextHistory {
     last: u64,
     /// The last load had a file it could not read, so a server shown may be a fallback.
     failing: bool,
+    /// Each context's confirmed definition and how often it changed.
+    revisions: HashMap<String, DefinitionRevision>,
+}
+
+/// A context's last confirmed definition, and how many confirmed changes led to it.
+#[derive(Debug, Clone, Default)]
+struct DefinitionRevision {
+    definition: Option<u64>,
+    revision: u64,
 }
 
 impl ContextHistory {
@@ -341,6 +364,7 @@ impl ContextHistory {
                 r.endpoint = self.last;
             }
         }
+        self.note_confirmed_definitions();
     }
 
     /// Whether `path` gave the merge a context, or a winning cluster or user entry, when it last
@@ -384,6 +408,37 @@ impl ContextHistory {
             gate: record.map_or(0, |r| r.gate),
             definition: record.and_then(|r| r.definition),
             server: server.map(str::to_owned),
+        }
+    }
+
+    /// How many confirmed changes `context`'s definition has had. Unlike a [`ContextPin`], it
+    /// moves on an edit that keeps the server, and never comes back when the edit is undone.
+    pub fn definition_revision(&self, context: &str) -> u64 {
+        self.revisions.get(context).map_or(0, |seen| seen.revision)
+    }
+
+    /// Counts the changes this load confirmed. A definition a failed file could still change
+    /// is not confirmed, and a removal counts as a change.
+    fn note_confirmed_definitions(&mut self) {
+        for (name, record) in &self.records {
+            if record.present && record.provisional {
+                continue;
+            }
+            let now = record.definition.filter(|_| record.present);
+            let seen = self.revisions.entry(name.clone()).or_default();
+            if seen.definition.is_some() && seen.definition != now {
+                seen.revision += 1;
+            }
+            seen.definition = now;
+        }
+    }
+
+    /// Ends every write reviewed or confirmed on `context` so far: the write gate refuses a pin
+    /// from before this, as after a fallback ([`Self::gate_moved`]). Sessions keep running.
+    pub fn end_writes(&mut self, context: &str) {
+        if let Some(r) = self.records.get_mut(context) {
+            self.last += 1;
+            r.gate = self.last;
         }
     }
 
@@ -468,11 +523,13 @@ impl ContextHistory {
             Some(r) => Shown {
                 definition: r.generation,
                 endpoint: r.endpoint,
+                gate: r.gate,
                 confirmed: r.confirmed && r.server.as_deref() == server,
             },
             None => Shown {
                 definition: 0,
                 endpoint: 0,
+                gate: 0,
                 confirmed: false,
             },
         }

@@ -98,6 +98,7 @@ async fn open_on(
             review,
             &names,
             None,
+            crate::ui::write_binding::ConnectionGuard::always(),
             move |_| {
                 asked.begun.set(asked.begun.get() + 1);
                 begin

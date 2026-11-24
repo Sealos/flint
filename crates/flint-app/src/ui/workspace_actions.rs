@@ -18,6 +18,11 @@ use gpui_kit::*;
 use std::rc::Rc;
 
 use super::super::activity_view::ActivityView;
+use super::super::helm_view::{HelmView, Pane as HelmPane};
+use super::super::registry::{
+    RefreshHelmReleases, SelectHelmRelease, ShowHelmDetails, ShowHelmHistory, ShowHelmManifest,
+    ShowHelmValues,
+};
 use flint_core::compare::CompareTarget;
 
 use super::super::clusters::ClustersModel;
@@ -44,14 +49,16 @@ use super::super::registry::{
     SaveMatchingLines, SaveScope, SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom,
     ScrollToTop, SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext,
     SelectNextLine, SelectPrev, SelectPrevLine, SelectRow, SelectText, SetDockHeight,
-    SetNamespaces, SetPaneWidth, ShowAll, ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml,
-    SortBy, ToggleAnnotations, ToggleCommandPalette, ToggleLabels, ToggleManagedFields,
-    ToggleNamespace, ToggleNavSection, TogglePause, ToggleResourceSwitcher, ToggleSecretValue,
+    SetLogContext, SetNamespaces, SetPaneWidth, ShowAll, ShowAllNamespaces, ShowOverview,
+    ShowTabList, ShowYaml, SortBy, ToggleAnnotations, ToggleCommandPalette, ToggleErrorsOnly,
+    ToggleLabels, ToggleLogRegex, ToggleManagedFields, ToggleMatchingOnly, ToggleNamespace,
+    ToggleNavSection, TogglePause, ToggleProblemsOnly, ToggleResourceSwitcher, ToggleSecretValue,
     ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
     WatchOpenViewsOnly,
 };
 use super::super::registry::{
-    BackToList, DisconnectCluster, EditAiScope, Handler, ShowAgentActivity, ToggleKeepWatching,
+    BackToList, DisconnectCluster, EditAiScope, Handler, ShowAgentActivity, ShowHelmReleases,
+    ToggleKeepWatching,
 };
 use super::super::registry::{
     ClearClusterTag, LockCluster, RenameCluster, SetClusterTag, TrustCluster, UnlockCluster,
@@ -119,6 +126,23 @@ impl Workspace {
         .bind::<DisconnectCluster>(Self::ask_disconnect)
         .bind::<EditAiScope>(Self::edit_ai_scope)
         .bind::<ShowAgentActivity>(Self::show_agent_activity)
+        .bind::<ShowHelmReleases>(Self::show_helm_releases)
+        .bind::<RefreshHelmReleases>(|ws, _, _, cx| ws.on_helm(cx, HelmView::refresh))
+        .bind::<SelectHelmRelease>(|ws, a, _, cx| {
+            ws.on_helm(cx, |view, cx| view.select_named(&a.namespace, &a.name, cx));
+        })
+        .bind::<ShowHelmDetails>(|ws, _, _, cx| {
+            ws.on_helm(cx, |view, cx| view.set_pane(HelmPane::Details, cx));
+        })
+        .bind::<ShowHelmHistory>(|ws, _, _, cx| {
+            ws.on_helm(cx, |view, cx| view.set_pane(HelmPane::History, cx));
+        })
+        .bind::<ShowHelmValues>(|ws, _, _, cx| {
+            ws.on_helm(cx, |view, cx| view.set_pane(HelmPane::Values, cx));
+        })
+        .bind::<ShowHelmManifest>(|ws, _, _, cx| {
+            ws.on_helm(cx, |view, cx| view.set_pane(HelmPane::Manifest, cx));
+        })
         .bind::<OpenCompare>(Self::open_compare)
         .bind::<CompareObject>(Self::compare_object)
         .bind::<UnlockCluster>(Self::unlock_cluster)
@@ -260,6 +284,10 @@ impl Workspace {
                 |_, _| true,
                 |ws, a, cx| ws.check_cluster::<ShowAgentActivity>(&a.cluster, cx),
             )
+            .add::<ShowHelmReleases>(
+                |_, _| true,
+                |ws, a, cx| ws.check_cluster::<ShowHelmReleases>(&a.cluster, cx),
+            )
             .add::<UnlockCluster>(|_, _| true, |ws, a, cx| ws.unlock_target(a, cx).map(drop))
             .add::<RenameCluster>(Self::settings_ok, |ws, a, cx| {
                 ws.check_cluster::<RenameCluster>(&a.cluster, cx)
@@ -328,6 +356,17 @@ impl Workspace {
             .when::<OpenSelectedRow>(view_open!(list_wide))
             .when::<FocusFilter>(view_open!(list_wide))
             .when::<ToggleWide>(|ws, cx| list_wide(ws, cx) == Some(true))
+            .when::<ToggleProblemsOnly>(|ws, cx| {
+                ws.list
+                    .as_ref()
+                    .is_some_and(|list| list.read(cx).has_problem_filter())
+            })
+            .when::<super::super::list::combined::ToggleCombinedProblems>(|ws, cx| {
+                ws.sets
+                    .running
+                    .as_ref()
+                    .is_some_and(|run| run.list.read(cx).has_problem_filter())
+            })
             .add::<SelectRow>(view_open!(list_wide), |ws, a, cx| match &ws.list {
                 Some(l) => l.read(cx).check_select_row(a),
                 None => Err(ActionError::unavailable::<SelectRow>()),
@@ -425,6 +464,12 @@ impl Workspace {
                         .map_err(ActionError::rejected::<CompareObject>)
                 },
             )
+            .when::<RefreshHelmReleases>(|ws, cx| ws.dock.read(cx).active_helm().is_some())
+            .when::<SelectHelmRelease>(|ws, cx| ws.dock.read(cx).active_helm().is_some())
+            .when::<ShowHelmDetails>(|ws, cx| ws.dock.read(cx).active_helm().is_some())
+            .when::<ShowHelmHistory>(|ws, cx| ws.dock.read(cx).active_helm().is_some())
+            .when::<ShowHelmValues>(|ws, cx| ws.dock.read(cx).active_helm().is_some())
+            .when::<ShowHelmManifest>(|ws, cx| ws.dock.read(cx).active_helm().is_some())
             .when::<RefreshCompare>(|ws, cx| ws.dock.read(cx).active_compare().is_some())
             .when::<ToggleCompareSame>(|ws, cx| ws.dock.read(cx).active_compare().is_some())
             .when::<ToggleCompareVolatile>(|ws, cx| ws.dock.read(cx).active_compare().is_some())
@@ -479,6 +524,10 @@ impl Workspace {
             .when::<ToggleTimestamps>(view_open!(log))
             .when::<ToggleWrap>(view_open!(log))
             .when::<ToggleSources>(view_open!(log, LogView::is_workload))
+            .when::<ToggleMatchingOnly>(view_open!(log))
+            .when::<ToggleErrorsOnly>(view_open!(log))
+            .when::<ToggleLogRegex>(view_open!(log))
+            .add::<SetLogContext>(view_open!(log), |_, a, _| LogView::check_context(a.lines))
             .when::<FocusSearch>(view_open!(log))
             .when::<NextMatch>(view_open!(log, LogView::has_matches))
             .when::<PrevMatch>(view_open!(log, LogView::has_matches))
@@ -510,7 +559,8 @@ impl Workspace {
                 }
             })
             .add::<DragSelection>(
-                view_open!(log, LogView::has_selection),
+                // A filter can hide every selected row mid-drag; the drag goes on to a row shown.
+                view_open!(log, LogView::can_drag_selection),
                 |ws, a, cx| match log(ws, cx) {
                     Some(l) => l.check_line::<DragSelection>(a.line),
                     None => Err(ActionError::unavailable::<DragSelection>()),
@@ -780,6 +830,31 @@ impl Workspace {
         self.model.read(cx).settings_error.is_none()
     }
 
+    /// A guard on the connection `cluster` has now, for a write's dialogs.
+    pub(in crate::ui) fn connection_guard(
+        &self,
+        cluster: &str,
+        cx: &App,
+    ) -> Option<super::super::write_binding::ConnectionGuard> {
+        super::super::write_binding::ConnectionGuard::of(&self.model, cluster, cx)
+    }
+
+    /// Says why a confirmation closed by itself, and gives focus back if what held it is gone.
+    pub(in crate::ui) fn confirmation_closed(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refuse_held(super::super::write_binding::connection_changed_text(), cx);
+        if window.focused(cx).is_none() {
+            let focus = self
+                .list
+                .as_ref()
+                .map_or_else(|| self.focus.clone(), |l| l.read(cx).focus_handle().clone());
+            window.focus(&focus, cx);
+        }
+    }
+
     pub(in crate::ui) fn cluster_summary<'a>(
         &self,
         name: &str,
@@ -984,10 +1059,16 @@ impl Workspace {
     /// if so. A cluster still connecting may: the object to act on is loading too.
     pub(in crate::ui) fn sessions_blocked(&self, cluster: &str, cx: &App) -> Option<String> {
         let summary = self.cluster_summary(cluster, cx);
+        // Only the words depend on the cause: whether this blocks is decided around it.
+        let waiting = || {
+            let cause = match summary.is_some_and(|c| self.model.read(cx).writes_paused(c)) {
+                true => "a kubeconfig file can't be read, so ",
+                false => "",
+            };
+            format!("{cause}{cluster} is waiting for its kubeconfig to be confirmed")
+        };
         if summary.is_some_and(|c| self.model.read(cx).sessions_paused(c)) {
-            return Some(format!(
-                "{cluster} is waiting for its kubeconfig to be confirmed"
-            ));
+            return Some(waiting());
         }
         match summary.map(|c| &c.state) {
             Some(ConnectionState::Connected(_) | ConnectionState::Connecting) => None,
@@ -995,9 +1076,7 @@ impl Workspace {
             Some(ConnectionState::Failed(error)) => {
                 Some(format!("{cluster} is not connected: {error}"))
             }
-            Some(ConnectionState::AwaitingConfirmation) => Some(format!(
-                "{cluster} is waiting for its kubeconfig to be confirmed"
-            )),
+            Some(ConnectionState::AwaitingConfirmation) => Some(waiting()),
             Some(ConnectionState::Disconnected) => Some(format!("{cluster} is not connected")),
             None => Some(format!("no kubeconfig context named {cluster}")),
         }
@@ -1152,6 +1231,42 @@ impl Workspace {
             move |_, cx| {
                 DockTab::Activity(cx.new(|cx| ActivityView::new(model, cluster, server, cx)))
             },
+            true,
+            window,
+            cx,
+        );
+    }
+
+    /// Runs `apply` on the Helm releases tab shown.
+    fn on_helm(
+        &mut self,
+        cx: &mut Context<Self>,
+        apply: impl FnOnce(&mut HelmView, &mut Context<HelmView>),
+    ) {
+        if let Some(view) = self.dock.read(cx).active_helm().cloned() {
+            view.update(cx, apply);
+        }
+    }
+
+    /// Opens (or shows) the cluster's Helm releases tab, focused. Strictly read-only.
+    fn show_helm_releases(
+        &mut self,
+        action: &ShowHelmReleases,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(e) = self.check_cluster::<ShowHelmReleases>(&action.cluster, cx) {
+            tracing::warn!("{e}");
+            return;
+        }
+        let core = self.model.read(cx).core().clone();
+        let cluster = action.cluster.clone();
+        let key = TabKey::Helm(cluster.clone());
+        let tab_cluster = self.tab_cluster(&key, cx);
+        self.open_tab(
+            key,
+            tab_cluster,
+            move |_, cx| DockTab::Helm(cx.new(|cx| HelmView::new(core, cluster, cx))),
             true,
             window,
             cx,
@@ -1740,6 +1855,10 @@ mod scope_tests;
 #[cfg(test)]
 #[path = "protect_tests.rs"]
 mod protect_tests;
+
+#[cfg(test)]
+#[path = "cluster_text_tests.rs"]
+mod cluster_text_tests;
 
 #[cfg(test)]
 #[path = "row_actions_tests.rs"]
