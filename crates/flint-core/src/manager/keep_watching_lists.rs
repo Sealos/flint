@@ -90,7 +90,10 @@ impl ClusterManager {
     fn warm_attempt(&self, id: &str) -> Option<u64> {
         let (attempt, _) = self.kept_read_client(id)?;
         let slot = self.cluster(id)?;
-        let warm = slot.warm.as_ref().is_some_and(|warm| warm.attempt == attempt);
+        let warm = slot
+            .warm
+            .as_ref()
+            .is_some_and(|warm| warm.attempt == attempt);
         let selected = self.active.as_deref() == Some(id);
         let connected = matches!(slot.state, ConnectionState::Connected(_));
         (warm || (selected && connected)).then_some(attempt)
@@ -120,13 +123,13 @@ impl ClusterManager {
             }
             None => {
                 slot.warm = None;
-                let source = slot
-                    .client
-                    .as_ref()
-                    .zip(version.as_ref())
-                    .map(|(clients, version)| {
-                        KubeSource::new(clients.read.clone(), Some(version), target) as _
-                    });
+                let source =
+                    slot.client
+                        .as_ref()
+                        .zip(version.as_ref())
+                        .map(|(clients, version)| {
+                            KubeSource::new(clients.read.clone(), Some(version), target) as _
+                        });
                 slot.watches.set_source(source);
             }
         }
@@ -174,7 +177,10 @@ mod churn_tests {
         assert!(high_churn(&KindId::events()));
         assert!(high_churn(&KindId::new("events.k8s.io", "events")));
         assert!(high_churn(&KindId::new("coordination.k8s.io", "leases")));
-        assert!(high_churn(&KindId::new("discovery.k8s.io", "endpointslices")));
+        assert!(high_churn(&KindId::new(
+            "discovery.k8s.io",
+            "endpointslices"
+        )));
         assert!(!high_churn(&KindId::pods()));
         assert!(!high_churn(&KindId::custom_resource_definitions()));
     }

@@ -964,7 +964,10 @@ async fn a_switch_keeps_a_watched_clusters_lists_warm() {
     assert!(task(&manager, "other", &events).is_some(), "back in front");
     let slot = manager.cluster("other").unwrap();
     assert!(matches!(slot.state, ConnectionState::Connected(_)));
-    assert!(slot.write_credential.is_some(), "writes go through the slot");
+    assert!(
+        slot.write_credential.is_some(),
+        "writes go through the slot"
+    );
 }
 
 // A cluster that is not watched drops its watches when it is left, as before.
