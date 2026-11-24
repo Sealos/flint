@@ -325,7 +325,10 @@ mod tests {
             .unwrap();
         let published = latest.borrow_and_update().clone();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(!latest.has_changed().unwrap(), "nothing changed, nothing woke");
+        assert!(
+            !latest.has_changed().unwrap(),
+            "nothing changed, nothing woke"
+        );
         assert!(
             Arc::ptr_eq(&published, &latest.borrow()),
             "the same snapshot, not a copy"

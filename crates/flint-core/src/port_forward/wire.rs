@@ -323,7 +323,10 @@ mod tests {
         assert_eq!(got.into_data().as_ref(), b"\0ping");
         // The server sees no close yet, so it can still answer.
         let waiting = tokio::time::timeout(std::time::Duration::from_millis(200), server.next());
-        assert!(waiting.await.is_err(), "no close is sent while it may answer");
+        assert!(
+            waiting.await.is_err(),
+            "no close is sent while it may answer"
+        );
         let mut frame = vec![0];
         frame.extend_from_slice(b"pong");
         server.send(Message::binary(frame)).await.unwrap();
