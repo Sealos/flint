@@ -668,21 +668,21 @@ pub async fn connect_unrestricted_for_tests(
 }
 
 /// What building a context's clients takes.
-struct Prepared {
-    config: kube::Config,
-    token: Option<crate::auth_plugin::RefreshingToken>,
+pub(crate) struct Prepared {
+    pub(crate) config: kube::Config,
+    pub(crate) token: Option<crate::auth_plugin::RefreshingToken>,
     /// Where the credential comes from, read before an exec plugin is replaced by its output.
     source: CredentialSource,
     /// Whether that credential may run, for the life of the connection.
     grant: CredentialGrant,
     /// An exec plugin's certificate and key replaced any the kubeconfig names.
-    replaced_certificate: bool,
+    pub(crate) replaced_certificate: bool,
     target: Target,
 }
 
 /// Reads `context`'s connection settings and runs its exec auth plugin, if any and if `access`
 /// allows it. A credential it does not allow is refused before anything could run it.
-async fn prepare(
+pub(crate) async fn prepare(
     kubeconfig: &Kubeconfig,
     context: &str,
     access: &CredentialAccess,

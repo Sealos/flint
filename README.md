@@ -193,9 +193,10 @@ Flint is in early development.
   hint says why.
 - **Forward Port** on a pod or service, and **Show Port Forwards** for the panel that lists, opens and stops them.
   Forwards listen on `127.0.0.1` only.
-- **Show Helm Releases…**: read-only Helm releases with details, history, masked values and manifest. It needs a
-  static credential (a token or a client certificate); clusters that sign in through an exec plugin or an auth
-  provider are not supported yet.
+- **Show Helm Releases…**: read-only Helm releases with details, history, masked values and manifest. On a
+  cluster that signs in through an exec plugin (EKS, GKE, Azure with kubelogin), turn on **Keep Watching** and its
+  background sign-in first: Flint then runs the plugin itself, with no prompt, and hands `helm` only the token.
+  Clusters that sign in through an auth provider are not supported.
 - Connections through an HTTPS proxy: a kubeconfig cluster's `proxy-url` is used for reads, with TLS to the API server
   itself.
 - Regex search in logs: **Toggle Regex Search** (⌥⌘R) reads the search and the Matching Lines Only filter as a regular
