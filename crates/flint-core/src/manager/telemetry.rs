@@ -105,12 +105,13 @@ impl ClusterManager {
     /// Whether `id` should have a feed now: it is selected or in the running set, in watch mode
     /// All or showing its overview, its connection is up and not paused, and that connection's
     /// credential can go on being used in its role. A credential that runs a program is used
-    /// only in the foreground.
+    /// only in the foreground. A selected cluster whose kept feed was handed over needs none.
     ///
     /// On view promises no watch of a kind without an open view. A feed watches seven kinds
     /// whatever is open, so in that mode it runs only for the overview, which is a view of them.
     pub(super) fn wants_telemetry(&self, id: &str) -> bool {
         if !self.wants_watches(id)
+            || self.kept_feed_handed_over(id)
             || (self.settings.watch_mode_for(id) != WatchMode::All
                 && !self.overview_showing(id)
                 && !self.keep_watching(id))
@@ -135,7 +136,9 @@ impl ClusterManager {
         }
         match self.connection_role(id) {
             Role::Foreground => true,
-            Role::Background => !credential.runs_a_command(),
+            // A member's connection made under background sign-in consent already runs its
+            // plugin: its feed reads through the same client and serves keep watching.
+            Role::Background => !credential.runs_a_command() || slot.access.unattended(),
             Role::Paused | Role::Retired => false,
         }
     }

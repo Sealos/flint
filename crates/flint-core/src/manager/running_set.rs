@@ -714,6 +714,7 @@ impl ClusterManager {
         if !active {
             let reason = consent_ended();
             self.apply_member(id, MemberEvent::CredentialLost { reason }, now);
+            self.member_signed_out(id);
             return;
         }
         self.reconnect_selected(id);
