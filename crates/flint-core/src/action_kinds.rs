@@ -186,8 +186,7 @@ fn definitions() -> ApiResource {
 /// that version with a `scale` subresource.
 fn crd_scale_paths(crd: &Value, group: &str, version: &str, plural: &str) -> Option<ScalePaths> {
     let spec = crd.get("spec")?;
-    if spec.get("group")?.as_str()? != group || spec.pointer("/names/plural")?.as_str()? != plural
-    {
+    if spec.get("group")?.as_str()? != group || spec.pointer("/names/plural")?.as_str()? != plural {
         return None;
     }
     let served = spec.get("versions")?.as_array()?.iter().find(|v| {
@@ -231,7 +230,10 @@ mod tests {
         assert_eq!(paths.replicas(&object), Some(3));
         assert_eq!(paths.status_replicas(&object), Some(2));
         assert_eq!(paths.replicas(&json!({"spec": {"size": -1}})), None);
-        assert_eq!(paths.replicas(&json!({"spec": {"size": 3_000_000_000u64}})), None);
+        assert_eq!(
+            paths.replicas(&json!({"spec": {"size": 3_000_000_000u64}})),
+            None
+        );
         assert_eq!(paths.replicas(&json!({"spec": {}})), None);
         for (spec, status) in [
             ("spec.size", ".status.n"),
@@ -272,9 +274,18 @@ mod tests {
             ScalePaths::from_crd(".spec.size", ".status.size")
         );
         assert_eq!(read(&crd("v1", false, scale.clone())), None, "not served");
-        assert_eq!(read(&crd("v2", true, scale.clone())), None, "another version");
         assert_eq!(
-            crd_scale_paths(&crd("v1", true, scale.clone()), "other.dev", "v1", "widgets"),
+            read(&crd("v2", true, scale.clone())),
+            None,
+            "another version"
+        );
+        assert_eq!(
+            crd_scale_paths(
+                &crd("v1", true, scale.clone()),
+                "other.dev",
+                "v1",
+                "widgets"
+            ),
             None,
             "another group"
         );

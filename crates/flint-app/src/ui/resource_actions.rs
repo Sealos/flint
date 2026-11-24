@@ -20,8 +20,8 @@ use flint_core::action_kinds;
 use flint_core::display::{ClusterNames, cluster_name_key, single_line};
 use flint_core::redact::first_line;
 use flint_core::write::{
-    BlockedReason, DrainReport, PodName, WriteError, WriteOutcome, WriteProposal, WriteReview,
-    WriteTarget,
+    BlockedReason, DrainReport, PodName, ResourceChange, WriteAction, WriteError, WriteOutcome,
+    WriteProposal, WriteReview, WriteTarget,
 };
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::Button;
@@ -31,7 +31,7 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, Theme, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::confirm::{self, DialogText};
+use super::confirm::{self, DialogText, ObjectGuard};
 use super::detail::access::Gated;
 use super::detail::{DetailView, Opening, Subject, protected_reason, refused};
 use super::notice::{notice, notice_with};
@@ -278,7 +278,9 @@ pub(in crate::ui) fn offered_for(
 pub(in crate::ui) fn offered(ws: &Workspace, detail: &DetailView, cx: &App) -> Vec<ResourceAction> {
     let object = detail.object();
     let deletable = ws.kind_deletable(&object.cluster, &object.kind, cx);
-    let scalable = ws.kind_scale_paths(&object.cluster, &object.kind, cx).is_some();
+    let scalable = ws
+        .kind_scale_paths(&object.cluster, &object.kind, cx)
+        .is_some();
     let cordoned = (object.kind.as_str() == "nodes")
         .then(|| detail.node_cordoned().ok())
         .flatten();
@@ -525,15 +527,34 @@ fn confirm_review(
     let this = cx.weak_entity();
     let handle = window.window_handle();
     let key = WriteKey::of(&request.target);
+    let object = ReviewedObject::of(ws, &review, cx).guard(this.clone());
     let begin = {
-        let (key, this, action) = (key.clone(), this.clone(), request.action);
-        move |cx: &mut App| match claim(&key, action, cx) {
-            Ok(()) => true,
-            Err(why) => {
-                let _ = this.update(cx, |ws, cx| {
-                    ws.refuse(refused(Opening::Write(action), &why), cx)
+        let (key, this, action, object) =
+            (key.clone(), this.clone(), request.action, object.clone());
+        let request = request.clone();
+        move |cx: &mut App| {
+            // Changed since its review, as this window last fetched it: reviewed again instead.
+            if object.changed(cx).is_some() {
+                let (this, request) = (this.clone(), request.clone());
+                let note = changed_note(&request.target.name);
+                // This runs inside the dialog's update of the window.
+                cx.defer(move |cx| {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let _ = this.update(cx, |ws, cx| {
+                            start_review(ws, request, Some(note), window, cx)
+                        });
+                    });
                 });
-                false
+                return false;
+            }
+            match claim(&key, action, cx) {
+                Ok(()) => true,
+                Err(why) => {
+                    let _ = this.update(cx, |ws, cx| {
+                        ws.refuse(refused(Opening::Write(action), &why), cx)
+                    });
+                    false
+                }
             }
         }
     };
@@ -545,6 +566,7 @@ fn confirm_review(
         &names,
         note.as_deref(),
         request.guard.clone(),
+        Some(object),
         begin,
         move |result, cx| {
             // First, and outside the window: a closed one must not keep the object claimed.
@@ -569,6 +591,91 @@ fn confirm_review(
             });
         },
     );
+}
+
+/// What a confirmation saw of its object when its review came back. A copy this window fetches
+/// after that and shows another object, or for a scale another count, closes the confirmation:
+/// a second one left open does not run after the first changed the object. The write checks the
+/// uid and the count again on the server whatever this says.
+#[derive(Clone)]
+struct ReviewedObject {
+    key: WriteKey,
+    name: String,
+    uid: Option<String>,
+    /// For a scale: the count reviewed, and where it is read (none: the kind lost Scale).
+    count: Option<(u32, Option<action_kinds::ScalePaths>)>,
+    at: jiff::Timestamp,
+}
+
+impl ReviewedObject {
+    fn of(ws: &Workspace, review: &WriteReview, cx: &App) -> Self {
+        let target = review.target();
+        let count = match review.action() {
+            WriteAction::Resource(action) => match action.change() {
+                ResourceChange::Scale { from, .. } => Some((
+                    *from,
+                    ws.kind_scale_paths(&target.cluster, &target.kind, cx),
+                )),
+                _ => None,
+            },
+            _ => None,
+        };
+        ReviewedObject {
+            key: WriteKey::of(target),
+            name: target.name.clone(),
+            uid: target.uid.clone(),
+            count,
+            at: jiff::Timestamp::now(),
+        }
+    }
+
+    /// Why `detail` says the object changed since the review, if it does. A pane that no longer
+    /// shows the object says so too.
+    fn changed(&self, detail: Option<&DetailView>) -> Option<String> {
+        let changed = || Some(object_changed_text(&self.name));
+        let Some(detail) = detail else {
+            return changed();
+        };
+        let shown = detail.object();
+        let key = WriteKey::new(
+            &shown.cluster,
+            &shown.kind,
+            shown.namespace.as_deref(),
+            &shown.name,
+        );
+        if key != self.key || detail.is_gone() {
+            return changed();
+        }
+        // A copy from before the review says nothing about what changed since.
+        let object = detail.fetched_since(self.at)?;
+        let uid = object
+            .pointer("/metadata/uid")
+            .and_then(serde_json::Value::as_str);
+        if self.uid.is_some() && uid != self.uid.as_deref() {
+            return changed();
+        }
+        match &self.count {
+            Some((from, Some(paths))) if paths.replicas(object) == Some(*from) => None,
+            Some(_) => changed(),
+            None => None,
+        }
+    }
+
+    /// The guard of a confirmation in the window of `ws`.
+    fn guard(self, ws: WeakEntity<Workspace>) -> ObjectGuard {
+        ObjectGuard::new(move |cx| {
+            let ws = ws.upgrade()?;
+            let detail = ws.read(cx).detail_view().map(|d| d.read(cx));
+            self.changed(detail)
+        })
+    }
+}
+
+/// Why a confirmation closed by itself.
+fn object_changed_text(name: &str) -> String {
+    format!(
+        "{name} changed since it was reviewed, so its confirmation was closed. Nothing was applied."
+    )
 }
 
 /// What follows a write that ran, in the window it started in. A drain's result is in the strip.

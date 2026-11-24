@@ -1082,6 +1082,7 @@ impl Workspace {
             &names,
             None,
             guard,
+            None,
             begin,
             move |result, cx| {
                 // First, and outside the window: a closed one must not keep the object claimed.
@@ -1140,7 +1141,8 @@ impl Workspace {
             let this = cx.weak_entity();
             window.defer(cx, move |window, cx| {
                 if confirm::close_stale(window, cx) {
-                    let _ = this.update(cx, |ws, cx| ws.confirmation_closed(window, cx));
+                    let why = super::write_binding::connection_changed_text();
+                    let _ = this.update(cx, |ws, cx| ws.confirmation_closed(why, window, cx));
                 }
             });
         }
@@ -1627,6 +1629,20 @@ impl Workspace {
                 });
                 self._detail_subscriptions =
                     vec![
+                        // A fetched copy can show that a confirmation's object changed.
+                        cx.observe_in(&detail, window, |_, _, window, cx| {
+                            if !gpui_kit::component::WindowExt::has_active_dialog(window, cx) {
+                                return;
+                            }
+                            let this = cx.weak_entity();
+                            window.defer(cx, move |window, cx| {
+                                if let Some(why) = confirm::close_changed(window, cx) {
+                                    let _ = this.update(cx, |ws, cx| {
+                                        ws.confirmation_closed(why, window, cx)
+                                    });
+                                }
+                            });
+                        }),
                         cx.subscribe_in(&detail, window, move |this, _, event, window, cx| {
                             match event {
                                 DetailEvent::Close => this.close_detail(window, cx),

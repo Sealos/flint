@@ -95,10 +95,10 @@ pub(super) fn declare_scale(
 /// The JSON pointer of the replica count a `scale` of `gvr` changes: `spec.replicas`, or the
 /// path [`Options::scaled`] names.
 pub(super) fn replicas_pointer(scaled: &[(Gvr, String)], gvr: &Gvr) -> String {
-    scaled
-        .iter()
-        .find(|(g, _)| g == gvr)
-        .map_or_else(|| "/spec/replicas".to_owned(), |(_, path)| path.replace('.', "/"))
+    scaled.iter().find(|(g, _)| g == gvr).map_or_else(
+        || "/spec/replicas".to_owned(),
+        |(_, path)| path.replace('.', "/"),
+    )
 }
 
 /// What `/version` answers. An override replaces `gitVersion`, `major` and `minor`, and drops the

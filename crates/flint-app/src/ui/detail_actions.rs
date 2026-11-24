@@ -694,6 +694,16 @@ impl DetailView {
         }
     }
 
+    /// The fetched object, if its fetch began after `at`: a copy at least that recent.
+    pub(in crate::ui) fn fetched_since(&self, at: jiff::Timestamp) -> Option<&Value> {
+        match &self.fetch {
+            Fetch::Loaded { detail, .. } if self.fetched_at.is_some_and(|f| f > at) => {
+                Some(&detail.object)
+            }
+            _ => None,
+        }
+    }
+
     /// The containers Logs can pick from: the fetched pod's, none while RBAC forbids its logs.
     pub(in crate::ui) fn log_containers(&self) -> &[super::super::object::PodContainer] {
         if self.access.forbidden(Gated::Logs).is_some() {

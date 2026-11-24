@@ -21,10 +21,10 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use flint_core::action_kinds;
 use flint_core::fleet::{
     FleetAction, FleetCancel, FleetObject, FleetPlan, FleetPreview, FleetResult,
 };
-use flint_core::action_kinds;
 use flint_core::handle::AdmittedMember;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::input::InputState;

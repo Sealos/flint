@@ -1448,7 +1448,11 @@ mod tests {
             Ok(ResourceChange::Scale { from: 4, to: 1 })
         );
         assert!(matches!(
-            review(&widgets, &json!({"spec": {"replicas": 9}}), WriteProposal::Scale { to: 1 }),
+            review(
+                &widgets,
+                &json!({"spec": {"replicas": 9}}),
+                WriteProposal::Scale { to: 1 }
+            ),
             Err(WriteError::Failed(_))
         ));
         assert!(matches!(

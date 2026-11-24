@@ -890,10 +890,11 @@ impl Workspace {
     /// Says why a confirmation closed by itself, and gives focus back if what held it is gone.
     pub(in crate::ui) fn confirmation_closed(
         &mut self,
+        why: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.refuse_held(super::super::write_binding::connection_changed_text(), cx);
+        self.refuse_held(why, cx);
         if window.focused(cx).is_none() {
             let focus = self
                 .list

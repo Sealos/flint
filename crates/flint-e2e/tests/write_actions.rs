@@ -573,7 +573,9 @@ fn gadget_target(server: &FakeApiServer) -> WriteTarget {
 }
 
 fn gadget_size(server: &FakeApiServer) -> Value {
-    server.object(&gadgets(), Some("demo"), "gadget-1").expect("the gadget")["spec"]["size"]
+    server
+        .object(&gadgets(), Some("demo"), "gadget-1")
+        .expect("the gadget")["spec"]["size"]
         .clone()
 }
 
@@ -601,7 +603,10 @@ async fn a_custom_resource_scales_through_its_scale_subresource() {
     let path = "/apis/fixtures.flint.dev/v1/namespaces/demo/gadgets/gadget-1/scale";
     let sent = since(&server, before);
     assert_eq!(writes_in(&sent), 1, "{sent:?}");
-    assert!(sent.contains(&(http::Method::PATCH, path.to_owned())), "{sent:?}");
+    assert!(
+        sent.contains(&(http::Method::PATCH, path.to_owned())),
+        "{sent:?}"
+    );
 
     let review = core
         .handle
