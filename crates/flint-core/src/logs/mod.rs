@@ -27,7 +27,8 @@ pub use line::{
     LineFormat, LineId, LineSource, LogLine, MAX_LINE_BYTES, Severity, classify, strip_controls,
 };
 pub use pattern::{
-    GUARD_SCAN_BYTES, GUARD_SCAN_LINES, MAX_PATTERN_BYTES, PatternError, ScanCancel,
+    GUARD_SCAN_BYTES, GUARD_SCAN_LINES, HIGHLIGHT_BYTES, LineRanges, MAX_PATTERN_BYTES,
+    PatternError, ScanCancel,
 };
 pub use pods::{Freshness, PodSet, WorkloadKind, WorkloadPod, WorkloadTarget};
 pub use search::{LogSearch, SearchMatcher, SearchQuery};

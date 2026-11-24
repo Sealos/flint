@@ -32,6 +32,8 @@ crossbeam-queue = "0.3.14"
 # Already in the tree (through kube and GPUI); credential redaction for text served to agents.
 regex = "1.13.2"
 aho-corasick = "1.1.5"
+# Already in the tree through rmcp; compares cluster names by how they read.
+unicode-normalization = "0.1.26"
 notify = "8.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.2.1"
