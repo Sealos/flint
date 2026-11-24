@@ -337,7 +337,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   and Shift-Cmd-W always does). A closed tab frees everything it held. Closing the window (Shift-Cmd-W, its close
   button, or Cmd-W with no tab shown) or quitting (Cmd-Q) while a shell runs or a log tab follows asks first, naming
   how many sessions end. Enter and Escape cancel; confirming needs the Quit or Close Window button (a click, or Space
-  when it has focus). With none running, nothing is asked. Cmd-J shows and hides the
+  when it has focus). With none running, nothing is asked. Quitting from outside Flint (the Dock icon's Quit, or
+  logging out of macOS) is not asked about, and loses any unapplied YAML edit. Cmd-J shows and hides the
   dock, and its height is remembered. Every tab names its cluster beside its title, and two clusters never read the
   same. With many tabs, the tab I open or show stays in view, also when the window is resized, and the tab list
   (Shift-Cmd-J, or the button at the strip's end) shows every tab with its cluster and status. Opening the same logs
@@ -431,6 +432,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **When** I press Review, then Apply.
 - **Then** I see a diff from the server dry-run, then the change is applied. Webhook or policy rejections are shown
   before anything is applied.
+- An edit I have not applied is kept only while Flint runs. Leaving the view or closing the window asks first, but
+  quitting from the Dock menu or logging out does not, and the edit is lost; Flint does not save drafts.
 - Tests: cluster.
 
 ### UP-52 Someone else changed it

@@ -514,7 +514,7 @@ window or quitting while a shell runs or a log tab follows asks first, naming ho
 #177). That confirmation sets `DialogText::default_cancel`: the dialog's own keys are off, and its description (which
 takes focus) and its buttons sit in the `DefaultCancel` key context, where Enter and Escape are bound to Cancel; with
 focus on the dialog's own node (a click on the title-bar strip), a keystroke interceptor (`confirm::init`) cancels. Enter and Escape cancel; confirming
-needs the Quit or Close Window button (a click, or Space when it has focus). A new tab kind implements `DockItem` and
+needs the Quit or Close Window button (a click, or Space when it has focus). Quit from the Dock icon or a macOS logout is not intercepted (GPUI has no hook to cancel it), so an unapplied YAML edit is lost there; drafts are not persisted. A new tab kind implements `DockItem` and
 adds a `DockTab` and `TabKey` variant; the module documentation lists the steps.
 
 - **Titles.** One pattern for every kind: `chatty · app`, `chatty · app (previous)`, `api (Deployment)`,
