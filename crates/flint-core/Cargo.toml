@@ -30,7 +30,8 @@ unicode-normalization.workspace = true
 base64.workspace = true
 http.workspace = true
 # The client stack with TCP keepalive (`cluster::build_client`); all already in the tree through kube.
-hyper-util = { workspace = true, features = ["client-legacy", "http1"] }
+hyper = { version = "1.12.0", default-features = false }
+hyper-util = { workspace = true, features = ["client-legacy", "client-proxy", "http1"] }
 hyper-timeout.workspace = true
 tower.workspace = true
 # Exec auth plugins run by Flint (`auth_plugin`): kubeconfig secrets and token expiry, both

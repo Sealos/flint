@@ -271,6 +271,20 @@ async fn run(
     for name in exec.drop_env.iter().flatten() {
         cmd.env_remove(name);
     }
+    // Last, on the environment the plugin would really get, the kubeconfig's `env` included.
+    let explicit: Vec<_> = cmd
+        .as_std()
+        .get_envs()
+        .map(|(name, value)| (name.to_owned(), value.map(ToOwned::to_owned)))
+        .collect();
+    for (name, address) in
+        crate::connection::proxy::plugin_environment(std::env::vars_os(), &explicit)
+    {
+        match address {
+            Some(address) => cmd.env(name, address),
+            None => cmd.env_remove(name),
+        };
+    }
     if lease.unattended() {
         // Discourages a browser sign-in. It can't prevent one: macOS `open` needs none of these.
         cmd.env_remove("DISPLAY")

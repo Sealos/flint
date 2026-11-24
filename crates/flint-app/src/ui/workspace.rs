@@ -4180,6 +4180,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dialogs_show_the_server_and_its_proxy() {
+        let grant = "https://prod.example:6443 via http://proxy.example:3128";
+        for text in [
+            super::unlock_dialog("prod", "prod", grant).text,
+            super::trust_dialog("prod", "prod", grant, None).text,
+            super::expose_dialog("prod", grant, None).text,
+        ] {
+            let line = format!("Server: {grant}");
+            assert!(text.lines().any(|l| l == line), "{text}");
+        }
+    }
+
     // covers UP-55: the target leads, and a moved context's warning comes before the explanation.
     #[test]
     fn unlock_and_trust_dialogs_name_the_target_first() {

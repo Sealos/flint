@@ -392,6 +392,20 @@ async fn a_detected_edit_ends_a_running_plugin_without_calling_it_a_failure() {
     assert_ne!(manager.keep_status("dev"), KeepWatching::SignInNeeded);
 }
 
+// A saved entry holds for the route it was turned on for: another proxy needs confirming.
+#[tokio::test]
+async fn another_proxy_needs_confirming_again() {
+    let plugin = FakePlugin::new("exit 1\n");
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _path) = manager_with(&plugin, config.path().to_owned());
+    allow(&mut manager).await;
+    assert_eq!(manager.keep_status("dev"), KeepWatching::Watching);
+
+    manager.clusters[0].info.proxy_url = Some("http://proxy.example:3128".to_owned());
+
+    assert_eq!(manager.keep_status("dev"), KeepWatching::NeedsConfirming);
+}
+
 /// An empty kubeconfig file next to the plugin.
 fn extra_file(plugin: &FakePlugin) -> PathBuf {
     let extra = plugin.dir.path().join("extra");
