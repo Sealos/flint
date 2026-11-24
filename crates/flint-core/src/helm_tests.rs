@@ -1232,20 +1232,22 @@ fn failure_shown(reason: &str) -> (String, String) {
 #[test]
 fn a_failure_reason_is_shown_after_redaction() {
     let plain = "Upgrade failed: timed out waiting for the condition";
-    let expected = format!("Failed: {plain}");
-    assert_eq!(failure_shown(plain), (expected.clone(), expected));
+    assert_eq!(
+        failure_shown(plain),
+        (format!("Failed: {plain}"), REASON_IN_DETAILS.to_owned())
+    );
 
     let secret = "Upgrade failed: Secret \"db-creds\" is invalid: data.password: Bearer \
                   q9bearervalue, password=hunter2\nsecond line q9-second";
-    for shown in <[String; 2]>::from(failure_shown(secret)) {
-        assert!(
-            shown.starts_with("Failed: Upgrade failed: Secret"),
-            "{shown}"
-        );
-        assert!(shown.ends_with(REASON_MASKED), "{shown}");
-        for hidden in ["db-creds", "q9bearervalue", "hunter2", "q9-second"] {
-            assert!(!shown.contains(hidden), "{hidden} in {shown}");
-        }
+    let (shown, history) = failure_shown(secret);
+    assert_eq!(history, REASON_IN_DETAILS);
+    assert!(
+        shown.starts_with("Failed: Upgrade failed: Secret"),
+        "{shown}"
+    );
+    assert!(shown.ends_with(REASON_MASKED), "{shown}");
+    for hidden in ["db-creds", "q9bearervalue", "hunter2", "q9-second"] {
+        assert!(!shown.contains(hidden), "{hidden} in {shown}");
     }
 
     // A value in no recognised form still reads as it was: only shapes are hidden.
@@ -1254,9 +1256,53 @@ fn a_failure_reason_is_shown_after_redaction() {
 
     let (details, history) = failure_shown("  ");
     assert_eq!(details, "Failed. Helm stored no reason.");
-    assert_eq!(history, details);
+    assert_eq!(history, REASON_IN_DETAILS);
     let (details, _) = failure_shown(&"x".repeat(1000));
     assert!(details.chars().count() < 320, "{details}");
+}
+
+// A failure reason quoting one of the release's own values: Details hides it with that
+// revision's values, and History, which has none loaded, shows no reason at all.
+#[tokio::test]
+async fn a_release_value_in_a_failure_reason_never_shows() {
+    let dir = tempfile::tempdir().unwrap();
+    let reason = "admission webhook denied the request: s3cr3tV4lue is on the breach list";
+    let helm = fake_helm(
+        dir.path(),
+        &format!(
+            "case \"$1\" in\n\
+             status) printf '{{\"name\":\"web\",\"version\":2,\"info\":{{\"status\":\"failed\",\
+             \"description\":\"{reason}\"}}}}' ;;\n\
+             history) printf '[{{\"revision\":2,\"status\":\"failed\",\"description\":\"{reason}\"}},\
+             {{\"revision\":1,\"status\":\"superseded\",\"description\":\"{reason}\"}}]' ;;\n\
+             *) printf '{{\"auth\":{{\"password\":\"s3cr3tV4lue\"}}}}' ;;\nesac"
+        ),
+    );
+    let details = run_at(&helm, &target(dir.path()), &HelmQuery::Details(release()))
+        .await
+        .unwrap();
+    let HelmOutput::Details(details) = details else {
+        panic!("details");
+    };
+    assert!(
+        !details.description.contains("s3cr3tV4lue"),
+        "{}",
+        details.description
+    );
+    assert!(
+        details.description.ends_with(REASON_MASKED),
+        "{}",
+        details.description
+    );
+
+    let history = run_at(&helm, &target(dir.path()), &HelmQuery::History(release()))
+        .await
+        .unwrap();
+    let HelmOutput::History(history) = history else {
+        panic!("history");
+    };
+    assert_eq!(history[0].description, REASON_IN_DETAILS);
+    assert_eq!(history[1].description, "Replaced by a later revision.");
 }
 
 // Other statuses keep fixed words: their description is not a reason.

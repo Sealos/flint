@@ -976,13 +976,22 @@ const REASON_CHARS: usize = 300;
 /// Follows a failure reason that redaction changed.
 pub const REASON_MASKED: &str = "(some values masked)";
 
-/// A release status in words. A failed one gives Helm's stored reason ([`failure_reason`]); any
-/// other gets fixed words.
-fn status_text(status: &str, description: &str, hidden: &HiddenValues) -> String {
+/// Stands for a failed revision's reason where that revision's values are not loaded.
+pub const REASON_IN_DETAILS: &str = "Failed. Details show the reason for the current revision.";
+
+/// A release status in words. A failed one gives Helm's stored reason ([`failure_reason`]) only
+/// with its revision's values (`hidden`) to scrub against, and [`REASON_IN_DETAILS`] without
+/// them; any other status gets fixed words.
+fn status_text(status: &str, description: &str, hidden: Option<&HiddenValues>) -> String {
     let fixed = match status {
         "deployed" => "Deployed.",
         "superseded" => "Replaced by a later revision.",
-        "failed" => return failure_reason(description, hidden),
+        "failed" => {
+            return hidden.map_or_else(
+                || REASON_IN_DETAILS.to_owned(),
+                |hidden| failure_reason(description, hidden),
+            );
+        }
         "uninstalled" => "Uninstalled.",
         "uninstalling" => "Uninstalling.",
         "pending-install" => "Install in progress.",
@@ -995,7 +1004,7 @@ fn status_text(status: &str, description: &str, hidden: &HiddenValues) -> String
 
 /// Helm's stored reason for a failed release, on one line and held to the rules for a server's
 /// error text ([`redact::hide_server_values`]): credentials, bearer values and every quoted value
-/// are hidden, then the revision's own values (`hidden`, where known), and only then is the line
+/// are hidden, then the revision's own values (`hidden`), and only then is the line
 /// cut. A reason redaction changed ends with [`REASON_MASKED`].
 fn failure_reason(description: &str, hidden: &HiddenValues) -> String {
     let shown = hidden.scrub_text(&redact::hide_server_values(description));
@@ -1011,7 +1020,7 @@ fn failure_reason(description: &str, hidden: &HiddenValues) -> String {
 
 /// `query`'s output as data, masked. `hidden` is what a manifest or details must not show. A list
 /// or history spans revisions with no one set of values to scrub against, so neither keeps the
-/// free-form app version.
+/// free-form app version, and history shows no failure reason.
 fn parse(query: &HelmQuery, out: &[u8], hidden: &HiddenValues) -> Result<HelmOutput, HelmError> {
     fn json<'a, T: Deserialize<'a>>(out: &'a [u8]) -> Result<T, HelmError> {
         serde_json::from_slice(out).map_err(|_| HelmError::BadOutput)
@@ -1039,7 +1048,11 @@ fn parse(query: &HelmQuery, out: &[u8], hidden: &HiddenValues) -> Result<HelmOut
                     status.namespace
                 },
                 revision: status.version,
-                description: status_text(&status.info.status, &status.info.description, hidden),
+                description: status_text(
+                    &status.info.status,
+                    &status.info.description,
+                    Some(hidden),
+                ),
                 status: status.info.status,
                 first_deployed: status.info.first_deployed,
                 last_deployed: status.info.last_deployed,
@@ -1051,7 +1064,7 @@ fn parse(query: &HelmQuery, out: &[u8], hidden: &HiddenValues) -> Result<HelmOut
         HelmQuery::History(_) => {
             let mut revisions: Vec<HelmRevision> = json(out)?;
             for revision in &mut revisions {
-                revision.description = status_text(&revision.status, &revision.description, hidden);
+                revision.description = status_text(&revision.status, &revision.description, None);
             }
             // Newest first.
             revisions.sort_by_key(|r| std::cmp::Reverse(r.revision));
