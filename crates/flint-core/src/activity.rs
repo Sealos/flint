@@ -267,6 +267,13 @@ impl ServerKeys {
         }
     }
 
+    /// HMAC-SHA256 of `message` under this key; none without a key. Callers prefix `message` with
+    /// a label of their own, so a digest made for one purpose never equals one made for another.
+    pub(crate) fn digest(&self, message: &[u8]) -> Option<[u8; 32]> {
+        let tag = ring::hmac::sign(self.key.as_ref()?, message);
+        <[u8; 32]>::try_from(tag.as_ref()).ok()
+    }
+
     /// The key of an API server URL: of the endpoint the cluster pin compares
     /// ([`crate::settings::server_identity`]), so two servers have one key only when a pin would
     /// take them for the same. Pass the URL as the kubeconfig has it, not the shown one, which

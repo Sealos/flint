@@ -60,6 +60,10 @@ impl NavPanel {
                                     .as_ref()
                                     .and_then(|set| set.coverage(&entry.id))
                                     .and_then(|coverage| coverage.badge()),
+                                problems: self
+                                    .problems
+                                    .get(&entry.id)
+                                    .map(|badge| badge.text.clone()),
                             })
                             .collect()
                     },

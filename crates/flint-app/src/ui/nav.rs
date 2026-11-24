@@ -23,6 +23,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::list::problems::ProblemBadge;
 use super::registry::{self, OpenClusterOverview, OpenView, RetryConnection, ToggleNavSection};
 use super::set_kinds::{MemberKinds, SetKinds};
 use super::theme::status_dot;
@@ -137,6 +138,8 @@ pub struct NavPanel {
     error: Option<String>,
     collapsed: HashMap<ClusterId, Collapsed>,
     states: HashMap<KindId, SyncState>,
+    /// Problem counts of the cluster or set on screen, by kind.
+    problems: HashMap<KindId, ProblemBadge>,
     selected: Option<KindId>,
     /// The cluster overview is open in the main area.
     overview: bool,
@@ -168,6 +171,7 @@ impl NavPanel {
             error: None,
             collapsed: HashMap::new(),
             states: HashMap::new(),
+            problems: HashMap::new(),
             selected: None,
             overview: false,
             scroll: ScrollHandle::new(),
@@ -187,6 +191,7 @@ impl NavPanel {
     ) {
         if self.cluster != cluster {
             self.states.clear();
+            self.problems.clear();
             self.selected = None;
             self.overview = false;
             self.cursor = None;
@@ -224,6 +229,18 @@ impl NavPanel {
         }
         if selected.is_some() && self.selected != selected {
             self.set_selected(selected, cx);
+        }
+    }
+
+    /// Shows the problem counts of the cluster or set on screen.
+    pub fn set_problem_badges(
+        &mut self,
+        badges: HashMap<KindId, ProblemBadge>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.problems != badges {
+            self.problems = badges;
+            cx.notify();
         }
     }
 
@@ -401,6 +418,11 @@ impl NavPanel {
                 .filter(|c| c.badge().is_some())
                 .map_or_else(String::new, |c| format!("\n{}", c.detail())),
         );
+        let problems = self.problems.get(&entry.id).cloned();
+        let tip = match &problems {
+            Some(problems) => format!("{tip}\n{}", problems.detail),
+            None => tip,
+        };
         let open = entry.id.to_string();
         h_flex()
             .id(SharedString::from(format!("nav-{}", entry.id)))
@@ -455,6 +477,21 @@ impl NavPanel {
                     .text_color(theme.muted_foreground)
                     .font_features(super::list::tabular_figures())
                     .child(badge)
+                    .test_support()
+            }))
+            .children(problems.map(|problems| {
+                div()
+                    .id(SharedString::from(format!("nav-problems-{}", entry.id)))
+                    .flex_none()
+                    .text_xs()
+                    .text_color(if problems.text == "?" {
+                        theme.muted_foreground
+                    } else {
+                        theme.danger
+                    })
+                    .font_features(super::list::tabular_figures())
+                    .aria_label(problems.detail)
+                    .child(problems.text)
                     .test_support()
             }))
             .children(mark.map(|m| match m {

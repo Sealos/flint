@@ -82,6 +82,10 @@ fn render(event: &AlertEvent) -> String {
             "summary new={} resolved={} untracked={}",
             s.new, s.resolved, s.untracked
         ),
+        AlertEvent::FleetSummary(s) => format!(
+            "fleet clusters={} new={} resolved={} untracked={}",
+            s.clusters, s.new, s.resolved, s.untracked
+        ),
         AlertEvent::ClusterUnavailable { open, .. } => format!("unavailable open={open}"),
         AlertEvent::ClusterAvailable { .. } => "available".to_owned(),
     }
@@ -1189,4 +1193,200 @@ fn a_replica_set_read_with_no_deployment_stays_its_own_owner() {
     assert_eq!(owners.pass(1, &pods, Some(&read)), ["raise solo-abc12 x1"]);
     owners.quiet(2..=20, &pods, None);
     assert_eq!(owners.open_names(), ["ReplicaSet solo-abc12"]);
+}
+
+/// Raised, resolved and summarised counts of a pass's events.
+#[derive(Default)]
+struct Delivered {
+    events: usize,
+    raised: u32,
+    resolved: u32,
+    held_new: u32,
+    held_resolved: u32,
+}
+
+impl Delivered {
+    fn add(&mut self, events: &[AlertEvent]) {
+        self.events += events.len();
+        for event in events {
+            match event {
+                AlertEvent::Raised(_) => self.raised += 1,
+                AlertEvent::Resolved(_) => self.resolved += 1,
+                AlertEvent::Summary(s) => {
+                    self.held_new += s.new;
+                    self.held_resolved += s.resolved;
+                }
+                AlertEvent::FleetSummary(s) => {
+                    self.held_new += s.new;
+                    self.held_resolved += s.resolved;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn pass_all(
+    engine: &mut AlertEngine,
+    clusters: &[(Arc<str>, Vec<Problem>)],
+    now: Timestamp,
+) -> Delivered {
+    let mut delivered = Delivered::default();
+    for (name, problems) in clusters {
+        let events = engine
+            .observe(name, now, ClusterSnapshot::complete(problems))
+            .unwrap();
+        delivered.add(&events);
+    }
+    delivered.add(&Vec::from_iter(engine.take_fleet_summary(now)));
+    delivered
+}
+
+#[test]
+fn many_clusters_share_one_delivery_budget_and_still_resolve() {
+    const CLUSTERS: usize = 32;
+    const GROUPS: usize = 8;
+    let names: Vec<Arc<str>> = (0..CLUSTERS)
+        .map(|n| Arc::from(format!("c{n:02}")))
+        .collect();
+    let quiet: Vec<(Arc<str>, Vec<Problem>)> =
+        names.iter().map(|n| (Arc::clone(n), vec![])).collect();
+    let stuck: Vec<(Arc<str>, Vec<Problem>)> = names
+        .iter()
+        .enumerate()
+        .map(|(at_cluster, name)| {
+            let mut problems: Vec<Problem> =
+                (0..GROUPS).map(|n| job(&format!("job-{n}"))).collect();
+            if at_cluster == CLUSTERS - 1 {
+                problems.push(crash("web", "web-1"));
+            }
+            for problem in &mut problems {
+                problem.id.cluster = Arc::clone(name);
+            }
+            (Arc::clone(name), problems)
+        })
+        .collect();
+
+    let mut engine = AlertEngine::new(AlertConfig::default());
+    pass_all(&mut engine, &quiet, at(0));
+    let storm = pass_all(&mut engine, &stuck, at(1));
+    assert!(storm.events <= 12, "{} notifications", storm.events);
+    assert_eq!(
+        (storm.raised + storm.held_new) as usize,
+        CLUSTERS * GROUPS + 1,
+        "every new group is told, one way or the other"
+    );
+    assert!(
+        engine
+            .open("c31")
+            .iter()
+            .any(|open| { open.key.kind == ProblemKind::CrashLoop })
+    );
+
+    // Only a group that raised its own alert reports its own resolution.
+    pass_all(&mut engine, &quiet, at(2));
+    let cleared = pass_all(&mut engine, &quiet, at(13));
+    assert_eq!(cleared.resolved + cleared.held_resolved, storm.raised);
+    for name in &names {
+        assert!(engine.open(name).is_empty());
+    }
+}
+
+#[test]
+fn a_critical_alert_keeps_its_share_of_the_budget() {
+    let names: Vec<Arc<str>> = (0..12).map(|n| Arc::from(format!("c{n:02}"))).collect();
+    let quiet: Vec<(Arc<str>, Vec<Problem>)> =
+        names.iter().map(|n| (Arc::clone(n), vec![])).collect();
+    let mut stuck: Vec<(Arc<str>, Vec<Problem>)> = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        let mut problem = if index == 11 {
+            crash("web", "web-1")
+        } else {
+            job("batch")
+        };
+        problem.id.cluster = Arc::clone(name);
+        stuck.push((Arc::clone(name), vec![problem]));
+    }
+    let mut engine = AlertEngine::new(AlertConfig::default());
+    pass_all(&mut engine, &quiet, at(0));
+    let mut raised_critical = false;
+    for (name, problems) in &stuck {
+        let events = engine
+            .observe(name, at(1), ClusterSnapshot::complete(problems))
+            .unwrap();
+        raised_critical |= events.iter().any(|event| {
+            matches!(event, AlertEvent::Raised(alert) if alert.key.kind == ProblemKind::CrashLoop)
+        });
+    }
+    assert!(raised_critical, "warnings must not use up the whole budget");
+}
+
+#[test]
+fn forgetting_a_cluster_drops_what_the_budget_held_for_it() {
+    let names: Vec<Arc<str>> = (0..4).map(|n| Arc::from(format!("c{n}"))).collect();
+    let quiet: Vec<(Arc<str>, Vec<Problem>)> =
+        names.iter().map(|n| (Arc::clone(n), vec![])).collect();
+    let stuck: Vec<(Arc<str>, Vec<Problem>)> = names
+        .iter()
+        .map(|name| {
+            let mut problems: Vec<Problem> = (0..8).map(|n| job(&format!("job-{n}"))).collect();
+            for problem in &mut problems {
+                problem.id.cluster = Arc::clone(name);
+            }
+            (Arc::clone(name), problems)
+        })
+        .collect();
+    let mut engine = AlertEngine::new(AlertConfig::default());
+    pass_all(&mut engine, &quiet, at(0));
+    for (name, problems) in &stuck {
+        engine
+            .observe(name, at(1), ClusterSnapshot::complete(problems))
+            .unwrap();
+    }
+    for name in &names {
+        engine.forget(name);
+    }
+    assert_eq!(engine.take_fleet_summary(at(1)), None);
+}
+
+#[test]
+fn an_outage_of_one_kind_does_not_resend_its_overflow() {
+    let over = MAX_TRACKED_PER_CLUSTER - CRITICAL_RESERVED_PER_CLUSTER + 2;
+    let jobs: Vec<Problem> = (0..over).map(|n| job(&format!("job-{n}"))).collect();
+    let mut engine = AlertEngine::new(config());
+    let first = engine
+        .observe(&cluster(), at(0), ClusterSnapshot::complete(&jobs))
+        .unwrap();
+    assert_eq!(
+        first.iter().map(render).collect::<Vec<_>>(),
+        ["summary new=0 resolved=0 untracked=2"]
+    );
+    let outage = ClusterSnapshot::Available {
+        problems: &[],
+        unchecked: &[ProblemKind::JobFailed],
+    };
+    assert!(
+        engine
+            .observe(&cluster(), at(1), outage)
+            .unwrap()
+            .is_empty()
+    );
+    let back = engine
+        .observe(&cluster(), at(6), ClusterSnapshot::complete(&jobs))
+        .unwrap();
+    assert!(
+        back.is_empty(),
+        "{:?}",
+        back.iter().map(render).collect::<Vec<_>>()
+    );
+
+    // Real growth is still reported.
+    let more: Vec<Problem> = (0..over + 1).map(|n| job(&format!("job-{n}"))).collect();
+    let grown = engine
+        .observe(&cluster(), at(12), ClusterSnapshot::complete(&more))
+        .unwrap();
+    assert_eq!(
+        grown.iter().map(render).collect::<Vec<_>>(),
+        ["summary new=0 resolved=0 untracked=1"]
+    );
 }
