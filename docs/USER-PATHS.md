@@ -789,6 +789,18 @@ Deferred until cluster sets are scheduled (#199).
   `no_proxy` list is reached directly. A proxy that is down is never skipped, and its credentials are never shown.
 - Tests: e2e (`flint-e2e/tests/proxy.rs`).
 
+### UP-126 Change settings in Settings
+- **When** I open Settings (Flint > Settings…, Cmd-, on macOS and Ctrl-, on Linux, or the command palette) and change
+  the appearance, desktop notifications or the default watch mode.
+- **Then** the main area shows Settings with its sections on the left. My edits wait in a draft until I press Save,
+  which writes only the settings I edited to `settings.toml`; Revert drops them. The draft stays while I switch views
+  and clusters, and the sidebar's Settings entry shows a dot meanwhile. If `settings.toml` changes while the draft
+  waits (from the Alerts menu, View > Appearance or an editor), a banner says so: Reload shows the file and drops the
+  draft, Save anyway writes only my edits. While `settings.toml` is invalid, Save is disabled. Quitting or closing the
+  window with a draft asks Save, Discard or Cancel.
+- Tests: unit (draft, revert, save of edited fields, the on-disk banner), ui (shortcut, save, banner, quit and close
+  question), e2e (`flint-e2e/tests/app/settings.rs`).
+
 ## M6: Install
 
 ### UP-80 Install from the DMG

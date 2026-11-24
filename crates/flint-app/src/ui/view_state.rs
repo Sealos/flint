@@ -44,6 +44,29 @@ pub struct AppState {
     pub alerts: Option<super::alert_center::AlertsState>,
     /// Cluster sets: the sidebar's choice, the saved sets and the running set.
     pub sets: ClusterSetsState,
+    /// The Settings view and its draft, which outlives leaving the view.
+    pub settings: SettingsState,
+}
+
+/// The Settings view (#739): whether it is shown, and its draft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SettingsState {
+    /// Whether the main area shows it.
+    pub open: bool,
+    pub section: super::settings_view::Section,
+    /// Whether edits wait for Save (the sidebar entry's dot).
+    pub dirty: bool,
+    /// The `settings.toml` keys of the edited fields.
+    pub edited: Vec<&'static str>,
+    /// The values shown: the file with the edits on top.
+    pub appearance: &'static str,
+    pub desktop_notifications: bool,
+    pub watch_mode: &'static str,
+    /// The file changed under the draft: the Reload / Save anyway banner.
+    pub changed_on_disk: bool,
+    /// `settings.toml` cannot be read; Save is disabled.
+    pub invalid: bool,
+    pub can_save: bool,
 }
 
 /// Cluster sets, as the sidebar and the set's view show them.
@@ -125,6 +148,8 @@ pub enum Focus {
     Menu,
     /// The command palette's search field.
     Palette,
+    /// The Settings view.
+    Settings,
     /// Something else.
     Other,
     None,
@@ -279,6 +304,8 @@ pub enum Main {
     AwaitingConfirmation,
     /// A resource list, and maybe the detail pane.
     List,
+    /// The Settings view.
+    Settings,
 }
 
 /// The header over the list.

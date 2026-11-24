@@ -579,6 +579,7 @@ async fn the_menus_hold_the_standard_items(cx: &mut TestAppContext) {
         items("Flint"),
         [
             "About Flint",
+            "Settings…",
             "Hide Flint",
             "Hide Others",
             "Show All",
