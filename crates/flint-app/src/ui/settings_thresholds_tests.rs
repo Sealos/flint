@@ -90,7 +90,7 @@ async fn a_global_threshold_is_typed_and_saved(cx: &mut TestAppContext) {
     assert_eq!(s.global["cpu_percent"], None, "the built-in default");
     assert_eq!(
         t.label(cx, "settings-threshold-cpu_percent").as_deref(),
-        Some("90")
+        Some("CPU threshold: 90. The built-in default, 90.")
     );
 
     t.click(cx, "settings-threshold-cpu_percent");
@@ -188,7 +188,7 @@ async fn an_out_of_range_threshold_blocks_save(cx: &mut TestAppContext) {
     assert_eq!(
         t.label(cx, "settings-threshold-pending_pod_seconds")
             .as_deref(),
-        Some("5m")
+        Some("Pending pods threshold: 5m. Pending pods must be a whole number from 1 to 86400.")
     );
 
     // Opening the field again shows the rejected text, ready to fix.
@@ -300,7 +300,7 @@ async fn the_override_table_adds_edits_and_resets_a_cluster(cx: &mut TestAppCont
     assert!(!s.dirty, "an empty row is nothing to save");
     assert_eq!(
         t.label(cx, "settings-override-0-cpu_percent").as_deref(),
-        Some("90"),
+        Some("CPU threshold for kind-alpha: 90. Follows the global value, 90."),
         "an empty cell shows the global value"
     );
 
@@ -433,7 +433,9 @@ async fn a_cluster_with_overrides_in_the_file_has_a_row(cx: &mut TestAppContext)
     assert_eq!(
         t.label(cx, "settings-override-0-pending_pod_seconds")
             .as_deref(),
-        Some("900")
+        Some(
+            "Pending pods threshold for kind-beta: 900. Set here. Clear the field to follow the level below."
+        )
     );
 }
 
@@ -454,4 +456,135 @@ async fn quit_with_a_rejected_value_asks_to_discard(cx: &mut TestAppContext) {
     let dialog: DialogState = state(cx, &t).dialog.expect("a dialog is open");
     assert_eq!(dialog.title, "Discard unsaved settings?");
     assert!(dialog.text.contains("not accepted"), "{}", dialog.text);
+}
+
+// covers UP-67: a value still being typed is part of Save, and switching section enters it
+// rather than dropping it.
+#[gpui_kit::test]
+async fn a_value_still_being_typed_is_entered_by_save_and_by_switching_section(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_section(cx, dir.path(), "thresholds").await;
+    t.click(cx, "settings-threshold-cpu_percent");
+    t.type_text(cx, "85");
+    edit(
+        cx,
+        &t,
+        "settings::ShowSettingsSection",
+        json!({ "section": "watching" }),
+    );
+    let s = state(cx, &t);
+    assert_eq!(s.settings.thresholds.typing, None);
+    assert_eq!(s.settings.thresholds.global["cpu_percent"], Some(85));
+    assert_eq!(
+        s.focus,
+        Focus::Settings,
+        "focus is not left on a field no longer drawn"
+    );
+
+    edit(
+        cx,
+        &t,
+        "settings::ShowSettingsSection",
+        json!({ "section": "thresholds" }),
+    );
+    t.click(cx, "settings-threshold-memory_percent");
+    t.type_text(cx, "60");
+    t.click(cx, "settings-save");
+    wait_for_file(cx, &t, |s| {
+        s.thresholds.global.get(ThresholdMetric::MemoryPercent) == Some(60)
+    })
+    .await;
+    let written = t.settings_toml();
+    assert!(written.contains("cpu_percent = 85"), "{written}");
+    assert!(written.contains("memory_percent = 60"), "{written}");
+}
+
+// covers UP-67: a row whose last override is cleared stays until Save, so the keyboard cursor
+// does not move onto another cluster; after Reset the cursor stands on Add override.
+#[gpui_kit::test]
+async fn a_cleared_row_stays_under_the_cursor_until_save(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_section(cx, dir.path(), "cluster_overrides").await;
+    edit(
+        cx,
+        &t,
+        "settings::EditClusterWatchMode",
+        json!({ "cluster": "kind-alpha", "mode": "on_view" }),
+    );
+    edit(
+        cx,
+        &t,
+        "settings::EditClusterWatchMode",
+        json!({ "cluster": "kind-beta", "mode": "all" }),
+    );
+    t.click(cx, "settings-save");
+    wait_for_file(cx, &t, |s| s.cluster_watch_mode.len() == 2).await;
+    assert_eq!(state(cx, &t).settings.thresholds.overrides.len(), 2);
+
+    // Watching on kind-alpha's row: On view, then Default, its last override.
+    for _ in 0..21 {
+        t.press(cx, "tab");
+        if state(cx, &t).settings.cursor.as_deref() == Some("settings-override-0-watch") {
+            break;
+        }
+    }
+    assert_eq!(
+        state(cx, &t).settings.cursor.as_deref(),
+        Some("settings-override-0-watch")
+    );
+    t.press(cx, "enter");
+    let s = state(cx, &t).settings;
+    assert_eq!(s.thresholds.overrides[0].cluster, "kind-alpha");
+    assert_eq!(s.thresholds.overrides[0].watch_mode, "default");
+    t.press(cx, "enter");
+    let s = state(cx, &t).settings;
+    assert_eq!(s.thresholds.overrides.len(), 2, "the cleared row stays");
+    assert_eq!(s.thresholds.overrides[0].cluster, "kind-alpha");
+    assert_eq!(s.thresholds.overrides[0].watch_mode, "all");
+    assert_eq!(
+        s.thresholds.overrides[1].watch_mode, "all",
+        "kind-beta is untouched"
+    );
+
+    // Reset from the keyboard, then Enter again: Add override, not kind-beta's Reset.
+    t.press(cx, "tab");
+    t.press(cx, "enter");
+    let s = state(cx, &t).settings;
+    assert_eq!(s.cursor.as_deref(), Some("settings-override-add"));
+    t.press(cx, "enter");
+    let s = state(cx, &t).settings;
+    assert!(
+        s.thresholds.candidates.is_some(),
+        "Enter opened Add override's list"
+    );
+    assert!(
+        s.thresholds
+            .overrides
+            .iter()
+            .any(|r| r.cluster == "kind-beta")
+    );
+}
+
+// covers UP-67: an action naming a cluster it cannot apply to is refused with the reason.
+#[gpui_kit::test]
+async fn threshold_actions_refuse_an_unknown_cluster(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_section(cx, dir.path(), "cluster_overrides").await;
+    let refused = t.dispatch(
+        cx,
+        "settings::EditThreshold",
+        json!({ "cluster": "nowhere", "metric": "cpu_percent", "value": "50" }),
+    );
+    assert!(refused.is_err(), "{refused:?}");
+    assert!(
+        t.dispatch(
+            cx,
+            "settings::ResetClusterOverrides",
+            json!({ "cluster": "kind-alpha" }),
+        )
+        .is_err()
+    );
+    assert!(!state(cx, &t).settings.dirty);
 }

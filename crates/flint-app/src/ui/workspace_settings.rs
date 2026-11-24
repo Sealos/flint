@@ -62,8 +62,8 @@ impl Workspace {
         Self::bind_threshold_actions(bind)
             .bind::<OpenSettings>(|ws, _, window, cx| ws.open_settings(window, cx))
             .bind::<CloseSettings>(|ws, _, window, cx| ws.close_settings(window, cx))
-            .bind::<ShowSettingsSection>(|ws, action, _, cx| {
-                ws.show_settings_section(action.section, cx)
+            .bind::<ShowSettingsSection>(|ws, action, window, cx| {
+                ws.show_settings_section(action.section, window, cx)
             })
             .bind::<EditAppearance>(|ws, action, _, cx| {
                 ws.edit_settings(Change::Appearance(action.appearance), cx)
@@ -75,7 +75,10 @@ impl Workspace {
                 ws.edit_settings(Change::WatchMode(action.mode), cx)
             })
             .bind::<SaveSettings>(|ws, _, window, cx| ws.save_settings(None, window, cx))
-            .bind::<RevertSettings>(|ws, _, _, cx| ws.revert_settings(cx))
+            .bind::<RevertSettings>(|ws, _, window, cx| {
+                ws.finish_threshold_entry(false, window, cx);
+                ws.revert_settings(cx)
+            })
             .bind::<NextSettingsControl>(|ws, _, _, cx| ws.move_settings_cursor(true, cx))
             .bind::<PreviousSettingsControl>(|ws, _, _, cx| ws.move_settings_cursor(false, cx))
             .bind::<ActivateSettingsControl>(|ws, _, window, cx| {
@@ -140,7 +143,7 @@ impl Workspace {
         self.settings_page.open = false;
         self.settings_page.opened_over = None;
         self.settings_page.cursor = None;
-        self.settings_page.thresholds.entry = None;
+        // A field still open is entered as the workspace next draws (flush_threshold_entry).
     }
 
     fn settings_invalid(&self, cx: &App) -> bool {
@@ -152,10 +155,15 @@ impl Workspace {
             && settings_view::can_save(&self.settings_page.draft, self.settings_invalid(cx))
     }
 
-    fn show_settings_section(&mut self, section: settings_view::Section, cx: &mut Context<Self>) {
+    fn show_settings_section(
+        &mut self,
+        section: settings_view::Section,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.settings_page.open {
+            self.finish_threshold_entry(true, window, cx);
             self.settings_page.section = section;
-            self.settings_page.thresholds.entry = None;
             cx.notify();
         }
     }
@@ -185,6 +193,8 @@ impl Workspace {
     /// [`SAVE_WAIT`], they stay, the footer says why, and `then` does not run. Nothing happens
     /// without edits, while `settings.toml` is invalid, or while an earlier Save is pending.
     fn save_settings(&mut self, then: Option<Then>, window: &mut Window, cx: &mut Context<Self>) {
+        // A threshold still being typed is part of what is saved (or, rejected, blocks it).
+        self.finish_threshold_entry(true, window, cx);
         if !self.can_save_settings(cx) {
             return;
         }
@@ -229,6 +239,7 @@ impl Workspace {
         match result {
             Ok(()) => {
                 self.settings_page.draft.saved(writes);
+                self.saved_thresholds_page();
                 for then in saving.after {
                     then(window, cx);
                 }
@@ -269,9 +280,12 @@ impl Workspace {
         };
         match stop {
             Stop::Done => self.close_settings(window, cx),
-            Stop::Reload | Stop::Revert => self.revert_settings(cx),
+            Stop::Reload | Stop::Revert => {
+                self.finish_threshold_entry(false, window, cx);
+                self.revert_settings(cx)
+            }
             Stop::SaveAnyway | Stop::Save => self.save_settings(None, window, cx),
-            Stop::Section(section) => self.show_settings_section(section, cx),
+            Stop::Section(section) => self.show_settings_section(section, window, cx),
             Stop::Appearance(appearance) => self.edit_settings(Change::Appearance(appearance), cx),
             Stop::DesktopNotifications => {
                 let file = self.model.read(cx).settings.clone();
@@ -347,6 +361,8 @@ impl Workspace {
         ending: &'static str,
         then: Then,
     ) -> bool {
+        // A threshold still being typed counts as an edit.
+        self.finish_threshold_entry(true, window, cx);
         if !self.has_settings_draft() {
             return false;
         }

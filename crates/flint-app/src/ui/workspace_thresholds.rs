@@ -28,8 +28,7 @@ impl Workspace {
         fn editable(ws: &Workspace, _: &App) -> bool {
             ws.settings_page.open && ws.settings_page.saving.is_none()
         }
-        fn metric(ws: &Workspace, key: &str) -> Result<(), String> {
-            let _ = ws;
+        fn metric(key: &str) -> Result<(), String> {
             settings_thresholds::metric_named(key)
                 .map(drop)
                 .ok_or_else(|| {
@@ -37,17 +36,78 @@ impl Workspace {
                     format!("the metric is one of {}", keys.join(", "))
                 })
         }
+        /// `context` names a cluster the action can apply to: one with a row, or one the
+        /// kubeconfig defines (with a server, when `bound`).
+        fn cluster(ws: &Workspace, context: &str, bound: bool, cx: &App) -> Result<(), String> {
+            let row = ws
+                .override_rows(cx)
+                .into_iter()
+                .find(|row| row.context == context);
+            let known = ws
+                .settings_clusters(cx)
+                .into_iter()
+                .find(|c| c.context == context);
+            let usable = match (row, known) {
+                (Some(row), _) => !bound || row.server.is_some(),
+                (None, Some(known)) => !bound || known.server.is_some(),
+                (None, None) => false,
+            };
+            if usable {
+                Ok(())
+            } else if bound {
+                Err(format!(
+                    "\"{context}\" is not a cluster with a server to bind an override to"
+                ))
+            } else {
+                Err(format!("\"{context}\" is not a cluster"))
+            }
+        }
+        fn threshold(
+            ws: &Workspace,
+            context: Option<&str>,
+            key: &str,
+            cx: &App,
+        ) -> Result<(), String> {
+            metric(key)?;
+            context.map_or(Ok(()), |c| cluster(ws, c, true, cx))
+        }
         guards
-            .add::<EditThreshold>(editable, |ws, action, _| {
-                metric(ws, &action.metric).map_err(ActionError::rejected::<EditThreshold>)
+            .add::<EditThreshold>(editable, |ws, action, cx| {
+                threshold(ws, action.cluster.as_deref(), &action.metric, cx)
+                    .map_err(ActionError::rejected::<EditThreshold>)
             })
-            .add::<TypeThreshold>(editable, |ws, action, _| {
-                metric(ws, &action.metric).map_err(ActionError::rejected::<TypeThreshold>)
+            .add::<TypeThreshold>(editable, |ws, action, cx| {
+                threshold(ws, action.cluster.as_deref(), &action.metric, cx)
+                    .map_err(ActionError::rejected::<TypeThreshold>)
             })
-            .when::<EditClusterAlerts>(editable)
-            .when::<EditClusterWatchMode>(editable)
-            .when::<ResetClusterOverrides>(editable)
-            .when::<AddClusterOverride>(editable)
+            .add::<EditClusterAlerts>(editable, |ws, action, cx| {
+                cluster(ws, &action.cluster, true, cx)
+                    .map_err(ActionError::rejected::<EditClusterAlerts>)
+            })
+            .add::<EditClusterWatchMode>(editable, |ws, action, cx| {
+                cluster(ws, &action.cluster, false, cx)
+                    .map_err(ActionError::rejected::<EditClusterWatchMode>)
+            })
+            .add::<ResetClusterOverrides>(editable, |ws, action, cx| {
+                let has_row = ws
+                    .override_rows(cx)
+                    .iter()
+                    .any(|r| r.context == action.cluster);
+                if has_row {
+                    Ok(())
+                } else {
+                    Err(ActionError::rejected::<ResetClusterOverrides>(format!(
+                        "\"{}\" has no row in Cluster overrides",
+                        action.cluster
+                    )))
+                }
+            })
+            .add::<AddClusterOverride>(editable, |ws, action, cx| match &action.cluster {
+                None => Ok(()),
+                Some(c) => {
+                    cluster(ws, c, true, cx).map_err(ActionError::rejected::<AddClusterOverride>)
+                }
+            })
             .when::<CancelThresholdEntry>(|ws, _| ws.settings_page.thresholds.entry.is_some())
     }
 
@@ -70,17 +130,13 @@ impl Workspace {
             ws.edit_cluster_alerts(&action.cluster, action.choice.enabled(), cx)
         })
         .bind::<EditClusterWatchMode>(|ws, action, _, cx| {
-            let change = Change::ClusterWatchMode {
-                context: action.cluster.clone(),
-                mode: action.mode.mode(),
-            };
-            ws.edit_settings(change, cx)
+            ws.edit_cluster_watch(&action.cluster, action.mode.mode(), cx)
         })
-        .bind::<ResetClusterOverrides>(|ws, action, _, cx| {
-            ws.reset_cluster_overrides(&action.cluster, cx)
+        .bind::<ResetClusterOverrides>(|ws, action, window, cx| {
+            ws.reset_cluster_overrides(&action.cluster, window, cx)
         })
-        .bind::<AddClusterOverride>(|ws, action, _, cx| {
-            ws.add_cluster_override(action.cluster.as_deref(), cx)
+        .bind::<AddClusterOverride>(|ws, action, window, cx| {
+            ws.add_cluster_override(action.cluster.as_deref(), window, cx)
         })
     }
 
@@ -92,7 +148,8 @@ impl Workspace {
             .iter()
             .map(|c| KnownCluster {
                 context: c.info.name.clone(),
-                server: c.info.server.clone(),
+                // A blank server binds nothing: the setters refuse it.
+                server: c.info.server.clone().filter(|s| !s.trim().is_empty()),
             })
             .collect()
     }
@@ -191,28 +248,39 @@ impl Workspace {
         }
     }
 
+    /// Keeps `context`'s row until Save or Revert once the draft touches it, so a row whose
+    /// last override is cleared does not vanish under the keyboard cursor.
+    fn keep_row(&mut self, context: &str) {
+        let added = &mut self.settings_page.thresholds.added;
+        if !added.iter().any(|c| c == context) {
+            added.push(context.to_owned());
+        }
+    }
+
+    /// Enters `text` for `target` into the draft. Also used once Settings is left with a field
+    /// open, so it does not ask for Settings to be shown; only a Save under way refuses it.
     fn enter_threshold(&mut self, target: ThresholdTarget, text: &str, cx: &mut Context<Self>) {
-        if !self.settings_page.open || self.settings_page.saving.is_some() {
+        if self.settings_page.saving.is_some() {
             return;
         }
+        if let Some(pin) = &target.cluster {
+            self.keep_row(&pin.context);
+        }
+        let file = self.model.read(cx).settings.clone();
+        let draft = &mut self.settings_page.draft;
         match settings_thresholds::parse_threshold(target.metric, text) {
-            Ok(value) => self.edit_settings(
+            Ok(value) => draft.edit(
                 Change::Threshold {
                     cluster: target.cluster,
                     metric: target.metric,
                     value,
                 },
-                cx,
+                &file,
             ),
-            Err(why) => {
-                let file = self.model.read(cx).settings.clone();
-                self.settings_page
-                    .draft
-                    .reject(target.field(), text.trim().to_owned(), why, &file);
-                self.settings_page.save_note = None;
-                cx.notify();
-            }
+            Err(why) => draft.reject(target.field(), text.trim().to_owned(), why, &file),
         }
+        self.settings_page.save_note = None;
+        cx.notify();
     }
 
     /// Puts a text field in place of a threshold's value, holding the value set at that level
@@ -231,11 +299,12 @@ impl Workspace {
         let Some(metric) = settings_thresholds::metric_named(metric) else {
             return;
         };
+        // Another field still open is entered first, as leaving it would; before the new
+        // field's row is found, since entering may change the rows.
+        self.finish_threshold_entry(true, window, cx);
         let Some((target, stop)) = self.threshold_target(cluster, metric, cx) else {
             return;
         };
-        // Another field still open is entered first, as leaving it would.
-        self.finish_threshold_entry(true, window, cx);
         let shown = self.shown_settings(cx);
         let text = match self.settings_page.draft.rejected(&target.field()) {
             Some(rejected) => rejected.text.clone(),
@@ -271,25 +340,60 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Closes the open threshold field, entering its text into the draft when `enter`, and
-    /// gives focus back to Settings.
+    /// Closes the open threshold field, entering its text into the draft when `enter`. Focus
+    /// goes back to Settings only if the field held it, so a dialog or the palette that took
+    /// focus keeps it. While a Save is being written, a field to enter stays open: its text
+    /// would be refused.
     pub(super) fn finish_threshold_entry(
         &mut self,
         enter: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if enter && self.settings_page.saving.is_some() {
+            return;
+        }
         let Some(entry) = self.settings_page.thresholds.entry.take() else {
             return;
         };
+        let had_focus = entry.input.focus_handle(cx).is_focused(window);
         if enter {
             let text = entry.input.read(cx).value().to_string();
             self.enter_threshold(entry.target, &text, cx);
         }
-        if self.settings_page.open {
+        if had_focus && self.settings_page.open {
             window.focus(&self.settings_page.focus, cx);
         }
         cx.notify();
+    }
+
+    /// Enters the text of a field left open when Settings was left with no window at hand
+    /// (the navigation). Called as the workspace draws.
+    pub(super) fn flush_threshold_entry(&mut self, cx: &mut Context<Self>) {
+        if self.settings_page.open || self.settings_page.saving.is_some() {
+            return;
+        }
+        if let Some(entry) = self.settings_page.thresholds.entry.take() {
+            let text = entry.input.read(cx).value().to_string();
+            self.enter_threshold(entry.target, &text, cx);
+        }
+    }
+
+    fn edit_cluster_watch(
+        &mut self,
+        context: &str,
+        mode: Option<flint_core::WatchMode>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings_page.saving.is_some() {
+            return;
+        }
+        self.keep_row(context);
+        let change = Change::ClusterWatchMode {
+            context: context.to_owned(),
+            mode,
+        };
+        self.edit_settings(change, cx);
     }
 
     fn edit_cluster_alerts(
@@ -304,11 +408,26 @@ impl Workspace {
         let Some(cluster) = row.pin() else {
             return;
         };
+        if self.settings_page.saving.is_some() {
+            return;
+        }
+        self.keep_row(context);
         self.edit_settings(Change::ClusterAlerts { cluster, enabled }, cx);
     }
 
-    /// Clears every override of `context` in the draft and drops its row.
-    fn reset_cluster_overrides(&mut self, context: &str, cx: &mut Context<Self>) {
+    /// Clears every override of `context` in the draft and drops its row. Text typed in the
+    /// open field is dropped too, and the keyboard cursor moves to Add override rather than onto
+    /// the row that takes this one's place.
+    fn reset_cluster_overrides(
+        &mut self,
+        context: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.settings_page.open || self.settings_page.saving.is_some() {
+            return;
+        }
+        self.finish_threshold_entry(false, window, cx);
         let rows = self.override_rows(cx);
         let row = rows.iter().find(|row| row.context == context);
         let mut changes = vec![Change::ClusterWatchMode {
@@ -330,16 +449,25 @@ impl Workspace {
             self.edit_settings(change, cx);
         }
         self.settings_page.thresholds.added.retain(|c| c != context);
+        if matches!(self.settings_page.cursor, Some(Stop::Threshold(_))) {
+            self.settings_page.cursor = Some(Stop::Threshold(ThresholdStop::Add));
+        }
         cx.notify();
     }
 
     /// Without `context`, shows or hides the clusters Add override offers; with one, gives it a
     /// row and closes the list.
-    fn add_cluster_override(&mut self, context: Option<&str>, cx: &mut Context<Self>) {
-        let page = &mut self.settings_page;
-        if !page.open || page.saving.is_some() {
+    fn add_cluster_override(
+        &mut self,
+        context: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.settings_page.open || self.settings_page.saving.is_some() {
             return;
         }
+        self.finish_threshold_entry(true, window, cx);
+        let page = &mut self.settings_page;
         let Some(context) = context else {
             page.thresholds.picking = !page.thresholds.picking;
             cx.notify();
@@ -362,6 +490,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.settings_page.saving.is_some() {
+            return;
+        }
         let rows = self.override_rows(cx);
         let shown = self.shown_settings(cx);
         let row = |index: usize| rows.get(index).cloned();
@@ -383,34 +514,37 @@ impl Workspace {
             ThresholdStop::Watch(index) => {
                 if let Some(row) = row(index) {
                     let next = row.watch(&shown).next();
-                    let change = Change::ClusterWatchMode {
-                        context: row.context.clone(),
-                        mode: next.mode(),
-                    };
-                    self.edit_settings(change, cx);
+                    self.edit_cluster_watch(&row.context, next.mode(), cx);
                 }
             }
             ThresholdStop::Reset(index) => {
                 if let Some(row) = row(index) {
-                    self.reset_cluster_overrides(&row.context, cx);
+                    self.reset_cluster_overrides(&row.context, window, cx);
                 }
             }
-            ThresholdStop::Add => self.add_cluster_override(None, cx),
+            ThresholdStop::Add => self.add_cluster_override(None, window, cx),
             ThresholdStop::Pick(index) => {
                 let candidates =
                     settings_thresholds::add_candidates(&self.settings_clusters(cx), &rows);
                 if let Some(context) = candidates.get(index) {
-                    self.add_cluster_override(Some(context), cx);
+                    self.add_cluster_override(Some(context), window, cx);
                 }
             }
         }
     }
 
-    /// Drops what the two sections hold besides the draft: Revert and Reload.
+    /// Drops what the two sections hold besides the draft: Revert and Reload. A field still
+    /// open is closed by the caller first, which has the window to give focus back.
     pub(super) fn revert_thresholds_page(&mut self) {
         let page = &mut self.settings_page.thresholds;
         page.added.clear();
         page.picking = false;
         page.entry = None;
+    }
+
+    /// Once a Save is written, rows given by Add override or kept while edited stay only if
+    /// they differ from the global settings.
+    pub(super) fn saved_thresholds_page(&mut self) {
+        self.settings_page.thresholds.added.clear();
     }
 }

@@ -700,6 +700,11 @@ fn override_row(
                     .small()
                     .when(alerts == AlertsChoice::Default, |b| b.ghost())
                     .w(px(CHOICE_WIDTH))
+                    .accessibility_label(format!(
+                        "Desktop alerts for {}: {}",
+                        row.context,
+                        alerts.label()
+                    ))
                     .label(alerts.label())
                     .tooltip("Desktop notifications for this cluster: Default follows Alerts.")
                     .disabled(!bound)
@@ -720,6 +725,7 @@ fn override_row(
                     .small()
                     .when(watch == WatchChoice::Default, |b| b.ghost())
                     .w(px(CHOICE_WIDTH))
+                    .accessibility_label(format!("Watching for {}: {}", row.context, watch.label()))
                     .label(watch.label())
                     .tooltip("What this cluster watches: Default follows Watching.")
                     .on_click(registry::on_click(EditClusterWatchMode {
@@ -765,6 +771,7 @@ fn override_row(
                     theme,
                     Button::new(reset_stop.id())
                         .small()
+                        .accessibility_label(format!("Reset the overrides of {}", row.context))
                         .label("Reset")
                         .tooltip(
                             "Clear this cluster's overrides, so it follows the global settings.",
@@ -840,6 +847,7 @@ fn number_cell(
             .child(
                 Input::new(&entry.input)
                     .id(SharedString::from(format!("{}-input", stop.id())))
+                    .aria_label(field_name(target.metric, context))
                     .small(),
             )
             .into_any_element();
@@ -866,6 +874,10 @@ fn number_cell(
             .small()
             .when(explicit.is_none() && rejected.is_none(), |b| b.ghost())
             .w(px(width))
+            .accessibility_label(format!(
+                "{}: {label}. {tooltip}",
+                field_name(target.metric, context)
+            ))
             .label(label)
             .tooltip(tooltip)
             .on_click(registry::on_click(TypeThreshold {
@@ -931,6 +943,14 @@ pub fn view_state(
             .entry
             .as_ref()
             .map(|entry| entry.stop.id().to_string()),
+    }
+}
+
+/// What a threshold field is, for a screen reader: `CPU threshold` or `CPU threshold for prod`.
+fn field_name(metric: ThresholdMetric, context: Option<&str>) -> String {
+    match context {
+        None => format!("{} threshold", metric_label(metric)),
+        Some(context) => format!("{} threshold for {context}", metric_label(metric)),
     }
 }
 
