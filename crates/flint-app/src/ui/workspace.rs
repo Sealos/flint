@@ -376,7 +376,7 @@ impl Workspace {
                 };
                 this.open_view(&open, window, cx);
             }
-            NavEvent::OpenOverview => this.open_dashboard(window, cx),
+            NavEvent::OpenOverview => this.open_overview(window, cx),
         });
         // Quitting right after a drag (or another change) still saves state.toml.
         let on_quit = cx.on_app_quit(|this: &mut Self, cx| {
@@ -443,7 +443,7 @@ impl Workspace {
         let on_focus_lost =
             cx.on_focus_lost(window, |this, window, cx| this.reclaim_focus(window, cx));
         let guards = Self::set_guards(Self::guards(cx.entity().downgrade()))
-            .when::<OpenClusterOverview>(|ws, _| ws.cluster.is_some());
+            .when::<OpenClusterOverview>(|ws, _| ws.cluster.is_some() || ws.sets.is_open());
         registry::install(focus.clone(), guards, cx);
         let cluster_sets = sets::ClusterSets::new(window, cx);
         // The window's close button asks first while a session would end, as Close Window does.
@@ -763,11 +763,9 @@ impl Workspace {
             return;
         }
         if matches!(key, TabKey::Shell(_))
-            && self
-                .cluster_summary(key.context(), cx)
-                .is_some_and(|c| self.model.read(cx).writes_paused(c))
+            && let Some(why) = self.writes_paused_why(key.context(), cx)
         {
-            self.refuse(refused(opening, &writes_paused_reason(key.context())), cx);
+            self.refuse(refused(opening, &why), cx);
             return;
         }
         if matches!(key, TabKey::Shell(_)) && self.is_protected(key.context(), cx) {
@@ -878,7 +876,7 @@ impl Workspace {
                 return;
             }
         };
-        if let Some(why) = self.member_writes_paused(&request.cluster, cx) {
+        if let Some(why) = self.writes_paused_why(&request.cluster, cx) {
             self.refuse(refused(Opening::Shell, &why), cx);
             return;
         }
@@ -959,7 +957,7 @@ impl Workspace {
         let cluster = detail.read(cx).object().cluster.clone();
         let why = self.sessions_blocked(&cluster, cx);
         let protected = self.is_protected(&cluster, cx);
-        let writes_paused = self.member_writes_paused(&cluster, cx);
+        let writes_paused = self.writes_paused_why(&cluster, cx);
         let label = self.cluster_names(cx).exact(&cluster);
         // A set's row stays on its admitted server, which the write gate then holds it to.
         let server = match self.sets.member(&cluster) {
@@ -968,11 +966,20 @@ impl Workspace {
                 .cluster_summary(&cluster, cx)
                 .and_then(|c| c.info.server.clone()),
         };
+        let (connection, unsettled) =
+            self.cluster_summary(&cluster, cx)
+                .map_or((None, false), |c| {
+                    (
+                        Some((c.generation, c.definition)),
+                        c.provisional || c.paused,
+                    )
+                });
         detail.update(cx, |d, cx| {
             d.set_sessions_blocked(why, cx);
             d.set_protected(protected, label, cx);
             d.set_row_writes_paused(writes_paused, cx);
             d.set_server(server);
+            d.set_access_connection(connection, unsettled, cx);
         });
     }
 
@@ -1079,9 +1086,10 @@ impl Workspace {
             Some(c) if c.info.server.is_none() => {
                 blocked(format!("{cluster} has no API server in kubeconfig"), false)
             }
-            Some(c) if self.model.read(cx).writes_paused(c) => {
-                blocked(writes_paused_reason(cluster), false)
-            }
+            Some(c) if self.model.read(cx).writes_paused(c) => blocked(
+                writes_paused_reason(&self.cluster_names(cx).exact(cluster)),
+                false,
+            ),
             Some(_) if self.is_protected(cluster, cx) => blocked(
                 protected_reason(&self.cluster_names(cx).exact(cluster)),
                 true,
@@ -2272,7 +2280,11 @@ impl Workspace {
         let tip = if paused {
             WRITES_PAUSED_TIP.to_owned()
         } else {
-            protection_text(protection, &model.trust(cluster))
+            protection_text(
+                protection,
+                &model.trust(cluster),
+                cluster.info.server.as_deref(),
+            )
         };
         let text = if paused {
             WRITES_PAUSED
@@ -2902,7 +2914,11 @@ fn pane_title(title: &'static str, traffic_lights: Pixels, theme: &Theme) -> imp
 }
 
 /// What a cluster's protection is, in its row's tooltip.
-pub(super) fn protection_text(protection: Protection, trust: &TrustState) -> String {
+pub(super) fn protection_text(
+    protection: Protection,
+    trust: &TrustState,
+    server: Option<&str>,
+) -> String {
     let text = match protection {
         Protection::Protected => "Protected: read-only in Flint until you unlock or trust it",
         Protection::Local => "On this machine: unlocked",
@@ -2911,7 +2927,7 @@ pub(super) fn protection_text(protection: Protection, trust: &TrustState) -> Str
     };
     match trust {
         TrustState::ServerChanged { trusted_server } if protection != Protection::Trusted => {
-            let trusted = flint_core::redact::server_url(trusted_server);
+            let trusted = changed_from(server, trusted_server);
             format!("{text}. Cluster changed: trusted at {trusted}, now points elsewhere")
         }
         _ => text.to_owned(),
@@ -2946,9 +2962,9 @@ const WRITES_PAUSED: &str = "Writes paused";
 pub(super) const WRITES_PAUSED_TIP: &str =
     "Writes are paused until Flint can read your kubeconfig files and confirm this cluster";
 
-/// Why a shell cannot start on a cluster whose writes are paused.
+/// Why a write or a new shell cannot start on a cluster whose writes are paused.
 fn writes_paused_reason(cluster: &str) -> String {
-    format!("writes to {cluster} are paused until Flint can read your kubeconfig")
+    format!("a kubeconfig file can't be read, so writes and new shells on {cluster} are paused")
 }
 
 /// The access mode on a narrow header's second row: still tells every mode apart.
@@ -3173,13 +3189,25 @@ fn shown_host(server: &str) -> String {
 
 /// How a dialog names the server a pin was made for. Two different URLs can show as the same
 /// text, and "trusted at X, which is a different server" would then read as a contradiction.
+/// Only the old URL's origin is named: its path is not needed to tell the two apart.
 fn previous_address(server: &str, previous: &str) -> String {
-    let shown = flint_core::redact::server_url(previous);
-    if shown == flint_core::redact::server_url(server) {
+    use flint_core::redact::{server_origin, server_url};
+    let origin = server_origin(previous);
+    if server_url(previous) == server_url(server) {
         "another URL that shows the same here".to_owned()
+    } else if origin == server_origin(server) {
+        format!("another path on {origin}")
     } else {
-        shown
+        origin
     }
+}
+
+/// [`previous_address`] for a context that may have no server now, as a sidebar tooltip says it.
+pub(super) fn changed_from(server: Option<&str>, previous: &str) -> String {
+    server.map_or_else(
+        || flint_core::redact::server_origin(previous),
+        |server| previous_address(server, previous),
+    )
 }
 
 /// Asks before unlocking a protected cluster until Flint quits, naming the context and its

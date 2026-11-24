@@ -775,6 +775,10 @@ impl TokenState {
     }
 }
 
+/// On a request that may use the token held now, and must not run the plugin for a new one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeldTokenOnly;
+
 /// What a refresh got, for every request that waited for it.
 type Refreshed = Result<SecretString, Arc<AuthError>>;
 
@@ -846,6 +850,20 @@ impl RefreshingToken {
                 Err(error) if is_not_allowed(&error) && self.0.grant.allowed() => continue,
                 Err(error) => Err(SharedAuthError(error).into()),
             };
+        }
+    }
+
+    /// The `Authorization` value of the token held now. Never runs the plugin: a token that is due
+    /// is refused, without counting as a failure of the credential.
+    async fn held_header(&self) -> Result<HeaderValue, BoxError> {
+        if !self.0.grant.allowed() {
+            return Err(not_allowed().into());
+        }
+        let state = self.0.state.lock().await;
+        if state.fresh() {
+            bearer(&state.token)
+        } else {
+            Err(not_allowed().into())
         }
     }
 
@@ -955,7 +973,11 @@ impl<B: Send + 'static> AsyncPredicate<Request<B>> for RefreshingToken {
     fn check(&mut self, mut request: Request<B>) -> Self::Future {
         let token = self.clone();
         Box::pin(async move {
-            let value = token.header().await?;
+            let value = if request.extensions().get::<HeldTokenOnly>().is_some() {
+                token.held_header().await?
+            } else {
+                token.header().await?
+            };
             request.headers_mut().insert(AUTHORIZATION, value);
             Ok(request)
         })
