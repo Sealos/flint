@@ -1,7 +1,7 @@
 //! How full a cluster is, and how much is in it, from the objects a feed already watches.
 //!
-//! A pod's requests and limits are added to its node's totals when it is trimmed, and the pod
-//! keeps only a [`PodTally`] slot, in a spec field the feed otherwise leaves empty. Pods asking for
+//! A pod's requests and limits are added to its node's totals when it enters the store. Its index
+//! entry keeps a [`PodTallySlot`] so the store can subtract them later. Pods asking for
 //! the same amounts share one table entry, so a large cluster adds no resource lists, loads or node
 //! names per pod. Amounts follow what the scheduler reserves: containers and sidecars add up, an
 //! init container counts when it needs more than that, pod-level resources replace the container
@@ -198,6 +198,13 @@ struct NodeTotals {
     limits: DemandSum,
 }
 
+/// The interned node and load for one counted pod.
+#[derive(Debug)]
+pub(super) struct PodTallySlot {
+    node: u32,
+    load: u32,
+}
+
 /// Per-node totals of the pods held, kept up to date as pods come, change and go.
 #[derive(Debug, Default)]
 pub(super) struct PodTally {
@@ -209,7 +216,7 @@ pub(super) struct PodTally {
 
 impl PodTally {
     /// Counts `claim` and returns the slot to give back to [`Self::remove`].
-    pub(super) fn add(&mut self, claim: &PodClaim) -> i64 {
+    pub(super) fn add(&mut self, claim: &PodClaim) -> PodTallySlot {
         let node = self.nodes.acquire(&claim.node);
         let load = self.loads.acquire(&claim.load);
         if self.totals.len() <= node as usize {
@@ -219,13 +226,11 @@ impl PodTally {
         totals.pods += 1;
         totals.requests.add(claim.load.requests);
         totals.limits.add(claim.load.limits);
-        ((u64::from(node) << 32) | u64::from(load)) as i64
+        PodTallySlot { node, load }
     }
 
     /// Takes back what [`Self::add`] counted for `slot`.
-    pub(super) fn remove(&mut self, slot: i64) {
-        let slot = slot as u64;
-        let (node, load) = ((slot >> 32) as u32, slot as u32);
+    pub(super) fn remove(&mut self, PodTallySlot { node, load }: PodTallySlot) {
         let amounts = *self.loads.get(load);
         let totals = &mut self.totals[node as usize];
         totals.pods -= 1;
@@ -771,6 +776,24 @@ mod tests {
         let spec = pod.spec.unwrap();
         assert!(spec.containers[0].resources.is_none());
         assert_eq!(claim.unwrap().load.requests.cpu, Some(1_000_000_000));
+    }
+
+    #[test]
+    fn counting_pods_leaves_deadlines_unset_and_removal_keeps_the_moved_pod_counted() {
+        let (first, first_claim) = pod("first", Some("a"), "Running", "1");
+        let (last, last_claim) = pod("last", Some("a"), "Running", "2");
+        let mut stores = stores(
+            vec![node("a", "8")],
+            vec![(first.clone(), first_claim), (last.clone(), last_claim)],
+        );
+        for pod in stores.pods.current().unwrap() {
+            assert_eq!(pod.spec.as_ref().unwrap().active_deadline_seconds, None);
+        }
+
+        stores.pods.remove(&first);
+        assert_eq!(capacity_of(&stores).unwrap().requests().cpu, cores(2));
+        stores.pods.remove(&last);
+        assert_eq!(capacity_of(&stores).unwrap().requests().cpu, cores(0));
     }
 
     #[test]
