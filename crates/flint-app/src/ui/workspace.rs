@@ -3233,10 +3233,10 @@ fn render_lock_button(
     )
 }
 
-/// A server URL as the UI shows it ([`flint_core::redact::server_url`]), or "no server". Pins
-/// are compared on the exact URL, never on this text.
+/// A server as the UI shows it, by its origin ([`flint_core::redact::server_origin`]: no path),
+/// or "no server". Pins are compared on the exact URL, never on this text.
 pub(super) fn server_text(server: Option<&str>) -> String {
-    server.map_or("no server".to_owned(), flint_core::redact::server_url)
+    server.map_or("no server".to_owned(), flint_core::redact::server_origin)
 }
 
 /// The main area's notice that the active context moved. Servers are sanitized and kept on one
@@ -3303,7 +3303,7 @@ fn confirm_unlock(
 /// title calls it ([`ClusterNames::with_real`]).
 fn unlock_dialog(shown: &str, context: &str, server: &str) -> DialogText {
     let context = flint_core::display::single_line(context);
-    let server = flint_core::redact::server_url(server);
+    let server = flint_core::redact::server_origin(server);
     DialogText {
         title: format!("Unlock {shown}?"),
         text: format!(
@@ -3341,7 +3341,7 @@ fn confirm_trust(
 fn trust_dialog(shown: &str, context: &str, server: &str, previous: Option<&str>) -> DialogText {
     let context = flint_core::display::single_line(context);
     let previous = previous.map(|previous| previous_address(server, previous));
-    let server = flint_core::redact::server_url(server);
+    let server = flint_core::redact::server_origin(server);
     let mut text = format!("Context: {context}\nServer: {server}\n\n");
     if let Some(previous) = previous {
         text.push_str(&format!(
@@ -3417,7 +3417,7 @@ fn confirm_expose(
 /// Enter goes back to the pickers: only the button accepts it.
 fn broaden_dialog(context: &str, server: &str, added: &[String], scope: &AiScope) -> DialogText {
     let context = flint_core::display::single_line(context);
-    let server = flint_core::redact::server_url(server);
+    let server = flint_core::redact::server_origin(server);
     let added = flint_core::display::single_line(&added.join("; "));
     let grant = flint_core::display::single_line(&scope_picker::summary(scope));
     DialogText {
@@ -3436,7 +3436,7 @@ fn broaden_dialog(context: &str, server: &str, added: &[String], scope: &AiScope
 /// The Edit AI Scope dialog of an exposed cluster: what agents may read now, and the pickers.
 fn scope_dialog(context: &str, server: &str, scope: &AiScope) -> DialogText {
     let context = flint_core::display::single_line(context);
-    let server = flint_core::redact::server_url(server);
+    let server = flint_core::redact::server_origin(server);
     DialogText {
         title: "What may AI agents read?".into(),
         text: format!(
@@ -3456,7 +3456,7 @@ fn scope_dialog(context: &str, server: &str, scope: &AiScope) -> DialogText {
 fn expose_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogText {
     let context = flint_core::display::single_line(context);
     let previous = previous.map(|previous| previous_address(server, previous));
-    let server = flint_core::redact::server_url(server);
+    let server = flint_core::redact::server_origin(server);
     let mut text = format!(
         "AI agents using Flint's MCP server will be able to read this cluster: resources, events \
          and pod logs. They cannot change anything. Secret values are hidden, and so are values in \
@@ -3991,6 +3991,32 @@ mod tests {
         assert!(text.contains("Flint hides"), "{text}");
         assert!(!text.contains("Was "), "{text}");
         assert!(!text.contains("@old") && !text.contains("@new"), "{text}");
+    }
+
+    #[test]
+    fn notices_and_dialogs_show_only_the_server_origin() {
+        let old = "https://proxy.example.com:6443/k8s/clusters/c-old?x=1";
+        let new = "https://other.example.com/k8s/clusters/c-new";
+        let moved = ServerMove {
+            old: Some(old.to_owned()),
+            new: Some(new.to_owned()),
+        };
+        let mut texts = vec![
+            repointed_text("dev", &moved),
+            super::server_text(Some(old)),
+            super::unlock_dialog("dev", "dev", old).text,
+            super::trust_dialog("dev", "dev", old, Some(new)).text,
+            super::expose_dialog("dev", old, Some(new)).text,
+            super::scope_dialog("dev", old, &Default::default()).text,
+            super::broaden_dialog("dev", old, &[], &Default::default()).text,
+        ];
+        assert!(
+            texts[0].contains("Was https://proxy.example.com:6443, now https://other.example.com.")
+        );
+        for text in texts.drain(..) {
+            assert!(!text.contains("/k8s") && !text.contains("x=1"), "{text}");
+            assert!(text.contains("https://proxy.example.com:6443"), "{text}");
+        }
     }
 
     // A title that is the context stays short; any other carries the context, and a context

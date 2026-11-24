@@ -871,7 +871,7 @@ impl Dock {
         let label = dock_model::full_title(&title, &tab.cluster);
         let mut tooltip = item.tab_tooltip().to_string();
         if let Some(server) = &tab.cluster.server {
-            tooltip.push_str(&format!(" ({})", flint_core::redact::server_url(server)));
+            tooltip.push_str(&format!(" ({})", flint_core::redact::server_origin(server)));
         }
         if tab.repointed {
             tooltip.push_str("\nIts context now points at a different API server.");
