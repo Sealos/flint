@@ -1025,43 +1025,43 @@ mod tests {
         serde_saphyr::to_string(value).unwrap()
     }
 
-    fn secret(password: &str, user: &str) -> serde_json::Value {
+    fn secret(first: &str, second: &str) -> serde_json::Value {
         json!({
             "apiVersion": "v1",
             "kind": "Secret",
             "metadata": {"name": "db", "resourceVersion": "7",
-                         "annotations": {"copy": "dXNlcg=="}},
-            "data": {"password": password, "user": user},
+                         "annotations": {"copy": "c2Vjb25k"}},
+            "data": {"alpha": first, "beta": second},
         })
     }
 
     // A Secret opens masked: keys shown, no value in the editor's text.
     #[test]
     fn a_secret_opens_with_its_values_masked() {
-        let text = editable_yaml(&shown_for_edit(&secret("b2xk", "dXNlcg=="), true)).unwrap();
+        let text = editable_yaml(&shown_for_edit(&secret("Zmlyc3Q=", "c2Vjb25k"), true)).unwrap();
+        assert!(text.contains("alpha:") && text.contains("beta:"), "{text}");
+        assert!(text.contains(flint_core::secret_edit::MASK), "{text}");
         assert!(
-            text.contains("password:") && text.contains("user:"),
+            !text.contains("Zmlyc3Q") && !text.contains("c2Vjb25k"),
             "{text}"
         );
-        assert!(text.contains(flint_core::secret_edit::MASK), "{text}");
-        assert!(!text.contains("b2xk") && !text.contains("dXNlcg"), "{text}");
     }
 
     // A mask left in place keeps the latest value, so a remote change to it is not overwritten;
     // a value typed over a remote change is named, without either value.
     #[test]
     fn a_mask_left_in_place_competes_with_nothing() {
-        let base = secret("b2xk", "dXNlcg==");
-        let latest = secret("cm90YXRlZA==", "dXNlcg==");
+        let base = secret("Zmlyc3Q=", "c2Vjb25k");
+        let latest = secret("dGhpcmQ=", "c2Vjb25k");
         let opened = editable_yaml(&shown_for_edit(&base, true)).unwrap();
         assert!(competing_changes(&base, &latest, &opened).is_empty());
-        let masked = format!("password: {}", flint_core::secret_edit::MASK);
-        let typed = opened.replace(&masked, "password: dHlwZWQ=");
+        let masked = format!("alpha: {}", flint_core::secret_edit::MASK);
+        let typed = opened.replace(&masked, "alpha: Zm91cnRo");
         assert_ne!(typed, opened);
         let paths = competing_changes(&base, &latest, &typed);
-        assert_eq!(paths, vec!["data.password"]);
+        assert_eq!(paths, vec!["data.alpha"]);
         let text = competing_text(&paths).unwrap();
-        for value in ["b2xk", "cm90YXRlZA", "dHlwZWQ"] {
+        for value in ["Zmlyc3Q", "dGhpcmQ", "Zm91cnRo"] {
             assert!(!text.contains(value), "{text}");
         }
     }
@@ -1070,16 +1070,16 @@ mod tests {
     // cluster is named, though its data line was left masked.
     #[test]
     fn string_data_over_a_rotated_key_is_named() {
-        let base = secret("b2xk", "dXNlcg==");
-        let latest = secret("cm90YXRlZA==", "dXNlcg==");
+        let base = secret("Zmlyc3Q=", "c2Vjb25k");
+        let latest = secret("dGhpcmQ=", "c2Vjb25k");
         let opened = editable_yaml(&shown_for_edit(&base, true)).unwrap();
-        let typed = format!("{opened}stringData:\n  password: typed-plain\n");
+        let typed = format!("{opened}stringData:\n  alpha: typed-text\n");
         let paths = competing_changes(&base, &latest, &typed);
-        assert_eq!(paths, vec!["data.password"]);
+        assert_eq!(paths, vec!["data.alpha"]);
         let text = competing_text(&paths).unwrap();
-        assert!(!text.contains("typed-plain"), "{text}");
+        assert!(!text.contains("typed-text"), "{text}");
         // On a key nobody changed, it competes with nothing.
-        let quiet = format!("{opened}stringData:\n  user: typed-plain\n");
+        let quiet = format!("{opened}stringData:\n  beta: typed-text\n");
         assert!(competing_changes(&base, &latest, &quiet).is_empty());
     }
 
@@ -1380,7 +1380,7 @@ mod tests {
             let edit = v.edit.as_ref().expect("the edit started");
             let text = edit.editor.read(cx).value().to_string();
             assert!(text.contains(flint_core::secret_edit::MASK), "{text}");
-            assert!(!text.contains("aHVudGVyMg"), "{text}");
+            assert!(!text.contains("Zmlyc3Q"), "{text}");
         });
     }
 
@@ -1440,7 +1440,7 @@ mod tests {
             "metadata": {
                 "name": "db", "namespace": "demo", "uid": "uid-db", "resourceVersion": "1"
             },
-            "data": {"password": "aHVudGVyMg=="},
+            "data": {"alpha": "Zmlyc3Q="},
         });
         let detail = ObjectDetail {
             yaml: serde_saphyr::to_string(&object).unwrap(),
