@@ -28,6 +28,7 @@ fn acts(cluster: &str, change: &str) -> PlanLine {
         verdict: Verdict::Acts {
             change: vec![change.to_owned()],
             warnings: Vec::new(),
+            diff: Vec::new(),
         },
     }
 }
@@ -220,38 +221,73 @@ fn a_refused_turn_and_a_stopped_run_say_so() {
     assert_eq!(lines, before);
 }
 
-// covers UP-101: an apply's or a delete's failed dry runs are shown first, and the run cannot
-// start until they are left out; restart and scale leave them out on their own.
+// covers UP-101: an apply's or a delete's target list shows each member's dry run; a member
+// whose dry run failed cannot be chosen, and every other starts chosen and can be left out.
+// Restart and scale leave failed members out on their own.
 #[test]
-fn failed_dry_runs_are_shown_before_the_plan() {
+fn the_target_list_offers_only_members_whose_dry_run_passed() {
     let lines = [
         left_out(
             "prod",
             "the edit changes the object's name, which cannot be changed here",
         ),
         acts("dev", "Creates it."),
+        acts("stage", "No change."),
     ];
+    let mut rows = target_rows(&lines);
     assert_eq!(
-        failed_dialog(&FleetAction::Delete, &object(), &lines, 0),
-        None
+        rows.iter()
+            .map(|r| (r.choosable, r.chosen))
+            .collect::<Vec<_>>(),
+        [(false, false), (true, true), (true, true)]
     );
-    let dialog = failed_dialog(&FleetAction::Delete, &object(), &lines, 1).unwrap();
+    assert!(rows[0].says.starts_with("left out: the edit changes"));
+    assert_eq!(rows[1].says, "Creates it.");
     assert_eq!(
-        dialog.title,
-        "The dry run of deleting web failed on 1 of 2 clusters"
+        targets_state(&rows),
+        ("Runs on 2 of 3 clusters.".to_owned(), false)
     );
-    assert!(
-        dialog.text.contains("Nothing runs until"),
-        "{}",
-        dialog.text
+    rows[1].chosen = false;
+    rows[2].chosen = false;
+    assert_eq!(
+        targets_state(&rows),
+        ("Choose a cluster to run on.".to_owned(), true)
     );
-    assert!(dialog.text.contains("prod: failed: the edit changes"));
-    assert!(dialog.text.contains("dev: Creates it."));
-    assert_eq!(dialog.ok, "Leave Them Out");
+    let dialog = targets_dialog(&FleetAction::Delete, &object());
+    assert_eq!(dialog.title, "Delete web: choose the clusters");
     assert!(FleetChoice::ApplyYaml.drops_by_hand());
     assert!(FleetChoice::Delete.drops_by_hand());
     assert!(!FleetChoice::RolloutRestart.drops_by_hand());
     assert!(!FleetChoice::Scale.drops_by_hand());
+}
+
+// covers UP-101: the plan shows each member's dry-run diff under its line.
+#[test]
+fn the_plan_shows_each_members_diff() {
+    let line = PlanLine {
+        cluster: "dev".to_owned(),
+        shown: "dev".to_owned(),
+        verdict: Verdict::Acts {
+            change: vec!["Changes it: 1 line added, 1 line removed.".to_owned()],
+            warnings: Vec::new(),
+            diff: vec![
+                "@@ -1 +1 @@".to_owned(),
+                "-a: 1".to_owned(),
+                "+a: 2".to_owned(),
+            ],
+        },
+    };
+    let apply = FleetAction::ApplyYaml {
+        manifest: flint_core::fleet::FleetManifest::new("a: 2"),
+    };
+    let (dialog, _) = plan_dialog(&apply, &object(), &[line]);
+    assert!(
+        dialog.text.contains(
+            "dev: Changes it: 1 line added, 1 line removed.\n    @@ -1 +1 @@\n    -a: 1\n    +a: 2"
+        ),
+        "{}",
+        dialog.text
+    );
 }
 
 // covers UP-101: an apply's and a delete's confirmation and results say what they do.

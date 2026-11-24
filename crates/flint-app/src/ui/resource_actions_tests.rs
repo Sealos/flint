@@ -512,6 +512,11 @@ impl LocalApi {
         }
     }
 
+    /// Each PUT of `web`: whether it was a dry run, and the object sent.
+    pub(in crate::ui::workspace) fn puts(&self) -> Vec<(bool, Value)> {
+        self.control.puts.lock().unwrap().clone()
+    }
+
     pub(super) fn patches(&self) -> usize {
         self.control.patches.load(Ordering::SeqCst)
     }

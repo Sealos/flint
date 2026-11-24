@@ -1028,3 +1028,128 @@ async fn a_change_just_before_the_delete_stops_the_run() {
     assert_eq!(stored_writes(b), 0);
     assert_eq!(real_writes(c), 0);
 }
+
+// covers UP-101: an apply keeps each member's own owners where it replaces the object, and sets
+// none where it creates it: another cluster's owner uid would have its collector delete it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_apply_keeps_each_members_owners_and_sends_none_from_elsewhere() {
+    let fleet = Fleet::start_creating(&[]).await;
+    let a = fleet.server("a");
+    let mut owned = live(a);
+    owned["metadata"]["ownerReferences"] =
+        json!([{"apiVersion": "v1", "kind": "ConfigMap", "name": "owner", "uid": "owner-a"}]);
+    a.set_object(&deployments(), owned);
+    let c = fleet.server("c");
+    assert!(c.remove_object(&deployments(), Some("demo"), NAME));
+    let FleetAction::ApplyYaml { manifest } = manifest(4) else {
+        unreachable!()
+    };
+    let elsewhere = manifest.as_str().replace(
+        "  labels:",
+        "  ownerReferences:\n  - {apiVersion: v1, kind: ConfigMap, name: owner, uid: owner-elsewhere}\n  labels:",
+    );
+    let action = FleetAction::ApplyYaml {
+        manifest: FleetManifest::new(elsewhere),
+    };
+
+    let preview = fleet.preview(action).await;
+    assert!(preview.is_ready());
+    let report = fleet.run(preview).await;
+    assert_eq!(statuses(&report), [const { FleetStatus::Done }; 3]);
+    assert_eq!(live(a)["metadata"]["ownerReferences"][0]["uid"], "owner-a");
+    assert!(live(fleet.server("b"))["metadata"]["ownerReferences"].is_null());
+    assert!(live(c)["metadata"]["ownerReferences"].is_null());
+    assert_eq!(replicas(a), 4);
+}
+
+// covers UP-101: a Service applied across the set keeps each member's own cluster IP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_service_apply_keeps_each_members_cluster_ip() {
+    let services = Gvr::core("services");
+    let fleet = Fleet::start_creating(&[]).await;
+    for (index, server) in fleet.servers.iter().enumerate() {
+        let ip = format!("10.0.0.{}", index + 1);
+        server.set_object(
+            &services,
+            json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {"name": NAME, "namespace": "demo", "uid": format!("svc-{index}"),
+                             "resourceVersion": "100"},
+                "spec": {"clusterIP": ip, "clusterIPs": [ip], "ports": [{"port": 80}]},
+            }),
+        );
+    }
+    let yaml = format!(
+        "apiVersion: v1\nkind: Service\nmetadata:\n  name: {NAME}\n  namespace: demo\nspec:\n  \
+         clusterIP: 10.9.9.9\n  clusterIPs: [10.9.9.9]\n  ports:\n  - port: 8080\n"
+    );
+    let plan = FleetPlan::new(
+        FleetAction::ApplyYaml {
+            manifest: FleetManifest::new(yaml),
+        },
+        FleetObject {
+            kind: KindId::new("", "services"),
+            namespace: Some("demo".to_owned()),
+            name: NAME.to_owned(),
+        },
+        fleet.members.clone(),
+    )
+    .unwrap();
+    let preview = fleet.core.handle.preview_fleet(plan).await;
+    for entry in preview.entries() {
+        assert_eq!(entry.refusal(), None, "{}", entry.cluster());
+    }
+    let report = fleet.run(preview).await;
+    assert_eq!(statuses(&report), [const { FleetStatus::Done }; 3]);
+    for (index, server) in fleet.servers.iter().enumerate() {
+        let service = server.object(&services, Some("demo"), NAME).unwrap();
+        assert_eq!(
+            service["spec"]["clusterIP"],
+            format!("10.0.0.{}", index + 1)
+        );
+        assert_eq!(service["spec"]["ports"][0]["port"], 8080);
+    }
+}
+
+// covers UP-101: the selected row's member is reviewed against the object shown there, by uid:
+// one deleted and made again under that name since is refused, and an apply does not create
+// it again where it went away. The other members match by name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_selected_member_is_bound_to_the_object_it_shows() {
+    for action in [FleetAction::Delete, manifest(4)] {
+        let fleet = Fleet::start_creating(&[]).await;
+        let b = fleet.server("b");
+        b.set_object(&deployments(), deployment("uid-again", 2));
+        let plan = FleetPlan::new(action.clone(), object(), fleet.members.clone())
+            .unwrap()
+            .with_shown_uid("b", "uid-1")
+            .unwrap();
+        let preview = fleet.core.handle.preview_fleet(plan).await;
+        assert_eq!(preview.entries()[0].refusal(), None, "{action:?}");
+        assert_eq!(
+            preview.entries()[1].refusal(),
+            Some(&WriteError::Replaced),
+            "{action:?}"
+        );
+        assert_eq!(preview.entries()[2].refusal(), None, "{action:?}");
+        assert_eq!(all_writes(b), 0, "not even a dry run: {action:?}");
+    }
+
+    let fleet = Fleet::start_creating(&[]).await;
+    let b = fleet.server("b");
+    assert!(b.remove_object(&deployments(), Some("demo"), NAME));
+    let plan = FleetPlan::new(manifest(4), object(), fleet.members.clone())
+        .unwrap()
+        .with_shown_uid("b", "uid-1")
+        .unwrap();
+    let preview = fleet.core.handle.preview_fleet(plan).await;
+    assert_eq!(preview.entries()[1].refusal(), Some(&WriteError::Gone));
+    assert_eq!(all_writes(b), 0, "not created again");
+    assert!(matches!(
+        FleetPlan::new(FleetAction::Delete, object(), fleet.members.clone())
+            .unwrap()
+            .with_shown_uid("elsewhere", "uid-1"),
+        Err(flint_core::fleet::FleetPlanError::NotAMember(_))
+    ));
+}

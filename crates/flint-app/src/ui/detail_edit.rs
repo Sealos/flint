@@ -7,7 +7,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use flint_core::write::WriteTarget;
 use flint_core::write::{WriteAction, WriteError, WriteOutcome, WriteProposal, WriteReview};
@@ -22,6 +21,7 @@ use super::access::Gated;
 use super::{DetailEvent, DetailTab, DetailView, Fetch, protected_reason};
 use crate::ui::write_binding::ConnectionGuard;
 use crate::ui::write_confirm;
+use crate::ui::yaml_diff::patch;
 
 pub(super) enum Phase {
     Editing,
@@ -344,26 +344,6 @@ fn competing_text(paths: &[String]) -> Option<String> {
 /// Whether the text sets `status`, which a review cannot show: the editor opens without it.
 fn sets_status(yaml: &str) -> bool {
     serde_saphyr::from_str::<Value>(yaml).is_ok_and(|value| value.get("status").is_some())
-}
-
-/// The longest a review's diff may take: past it, the diff is coarser but still correct.
-const DIFF_DEADLINE: Duration = Duration::from_secs(1);
-
-/// The change as a unified patch, or `None` if it changes nothing. Off the UI thread: a large
-/// value replaced can take long.
-fn patch(name: &str, before: &str, after: &str) -> Option<String> {
-    if before == after {
-        return None;
-    }
-    let diff = similar::TextDiff::configure()
-        .timeout(DIFF_DEADLINE)
-        .diff_lines(before, after);
-    let patch = diff
-        .unified_diff()
-        .context_radius(3)
-        .header(&format!("a/{name}.yaml"), &format!("b/{name}.yaml"))
-        .to_string();
-    Some(patch)
 }
 
 fn diff_file(patch: &str) -> Option<DiffFile> {
@@ -980,8 +960,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Fetch, Phase, Step, competing_text, edit_error_text, editable_yaml, patch, path_text,
-        sets_status, with_resource_version, without_server_owned,
+        Fetch, Phase, Step, competing_text, edit_error_text, editable_yaml, path_text, sets_status,
+        with_resource_version, without_server_owned,
     };
     use crate::ui::support_tests::{WAIT, objects, open_workspace, standard_sections};
 
@@ -1171,12 +1151,6 @@ mod tests {
         );
         assert_eq!(path_text(&[Step::Key("a"), Step::Item("b.c")]), "a[b.c]");
         assert_eq!(path_text(&[Step::Item("b]")]), "[name=\"b]\"]");
-    }
-
-    #[test]
-    fn a_review_without_a_change_has_no_diff() {
-        assert!(patch("a", "x: 1\n", "x: 1\n").is_none());
-        assert!(patch("a", "x: 1\n", "x: 2\n").is_some());
     }
 
     #[test]

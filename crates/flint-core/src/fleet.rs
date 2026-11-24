@@ -101,6 +101,8 @@ pub enum FleetPlanError {
     Duplicate(ClusterId),
     #[error("the object's name or namespace is not valid")]
     InvalidObject,
+    #[error("\"{0}\" is not in the target list")]
+    NotAMember(ClusterId),
 }
 
 /// An action, its object, and the admitted members it targets, in run order.
@@ -109,6 +111,8 @@ pub struct FleetPlan {
     action: FleetAction,
     object: FleetObject,
     members: Vec<AdmittedMember>,
+    /// The uid of the object as shown on a member, which binds that member's review to it.
+    shown: Option<(ClusterId, String)>,
 }
 
 impl FleetPlan {
@@ -138,7 +142,22 @@ impl FleetPlan {
             action,
             object,
             members,
+            shown: None,
         })
+    }
+
+    /// Binds `cluster`'s review to the object shown there, by its uid: another object of that
+    /// name there by then is refused, and an apply does not create it again. The other members
+    /// are matched by kind, namespace and name.
+    pub fn with_shown_uid(mut self, cluster: &str, uid: &str) -> Result<Self, FleetPlanError> {
+        if uid.is_empty() {
+            return Err(FleetPlanError::InvalidObject);
+        }
+        if !self.members.iter().any(|m| m.context() == cluster) {
+            return Err(FleetPlanError::NotAMember(cluster.to_owned()));
+        }
+        self.shown = Some((cluster.to_owned(), uid.to_owned()));
+        Ok(self)
     }
 
     pub fn action(&self) -> &FleetAction {
@@ -344,10 +363,15 @@ impl CoreHandle {
                 action,
                 object,
                 members,
+                shown,
             } = plan;
             let mut entries = Vec::with_capacity(members.len());
             for member in members {
-                let review = review_member(&core, &member, &action, &object).await;
+                let uid = shown
+                    .as_ref()
+                    .filter(|(cluster, _)| cluster == member.context())
+                    .map(|(_, uid)| uid.clone());
+                let review = review_member(&core, &member, &action, &object, uid).await;
                 entries.push(FleetPreviewEntry {
                     member,
                     review,
@@ -403,6 +427,7 @@ async fn review_member(
     member: &AdmittedMember,
     action: &FleetAction,
     object: &FleetObject,
+    uid: Option<String>,
 ) -> Result<ReviewedMember, WriteError> {
     let bound = core.bound_to(member.clone());
     let target = WriteTarget {
@@ -411,7 +436,7 @@ async fn review_member(
         kind: object.kind.clone(),
         namespace: object.namespace.clone(),
         name: object.name.clone(),
-        uid: None,
+        uid,
         resource_version: None,
     };
     let review = bound.review_write(target, action.proposal()).await?;

@@ -162,6 +162,30 @@ pub fn open_gated(
     );
 }
 
+/// [`open_gated`], which also closes and runs nothing once `guard` stops holding.
+pub(in crate::ui) fn open_gated_guarded(
+    window: &mut Window,
+    cx: &mut App,
+    dialog: DialogText,
+    content: AnyView,
+    guard: ConnectionGuard,
+    state: impl Fn(&App) -> ConfirmState + 'static,
+    on_ok: impl Fn(&mut Window, &mut App) -> bool + 'static,
+) {
+    debug_assert!(!dialog.default_cancel);
+    let gate: Gate = Rc::new(state);
+    open_dialog(
+        window,
+        cx,
+        dialog,
+        0,
+        Some(content),
+        Some(gate),
+        Some(guard),
+        on_ok,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn open_dialog(
     window: &mut Window,

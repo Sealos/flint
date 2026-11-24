@@ -1843,44 +1843,52 @@ async fn wait_for_dialog(
     }
 }
 
-// covers UP-101: a delete across the set shows the member whose dry run failed first; the run
-// starts only once it is left out, and it is sent nothing more.
+/// Waits until a single dialog is open, so its OK is the only one, and presses it.
+async fn press_only_ok(cx: &mut TestAppContext, t: &TestWorkspace) {
+    cx.wait_for(t.window, WAIT, |window, _| window.find_all("ok").len() == 1)
+        .await;
+    t.click(cx, "ok");
+}
+
+// covers UP-101: a delete across the set lists each member with its dry run; one whose dry run
+// failed cannot be chosen and is sent nothing more, and the rest run after one confirmation.
 #[gpui_kit::test]
-async fn a_fleet_delete_runs_once_a_failed_dry_run_is_left_out(cx: &mut TestAppContext) {
+async fn a_fleet_delete_leaves_a_failed_dry_run_out(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     // Alpha refuses its delete's dry run.
     let row = open_beta_row_answering(cx, dir.path(), &[422]).await;
     let t = &row.t;
     ask_fleet(cx, t, FleetChoice::Delete);
-    let failed = wait_for_dialog(
-        cx,
-        t,
-        "The dry run of deleting web failed on 1 of 2 clusters",
-    )
-    .await;
-    assert!(
-        failed.text.contains("kind-alpha: failed: "),
-        "{}",
-        failed.text
+    wait_for_dialog(cx, t, "Delete web: choose the clusters").await;
+    let alpha = t.label(cx, ("fleet-target-says", 0usize)).unwrap();
+    assert!(alpha.starts_with("left out: "), "{alpha}");
+    assert_eq!(
+        t.label(cx, ("fleet-target-says", 1usize)).as_deref(),
+        Some("Deletes it. This cannot be undone.")
     );
-    assert!(
-        failed
-            .text
-            .contains("kind-beta: Deletes it. This cannot be undone."),
-        "{}",
-        failed.text
+    assert_eq!(
+        t.find(cx, ("fleet-target", 0usize)).unwrap().checked(),
+        Some(false)
+    );
+    assert_eq!(
+        t.find(cx, ("fleet-target", 1usize)).unwrap().checked(),
+        Some(true)
     );
     assert_eq!(row.alpha_writes.load(Ordering::SeqCst), 1, "its dry run");
     assert_eq!(row.beta_writes.load(Ordering::SeqCst), 1, "its dry run");
+    // A member whose dry run failed cannot be put back.
+    t.click(cx, ("fleet-target", 0usize));
+    cx.run_until_parked();
+    assert_eq!(
+        t.find(cx, ("fleet-target", 0usize)).unwrap().checked(),
+        Some(false)
+    );
     t.click(cx, "ok");
     let plan = wait_for_dialog(cx, t, "Delete web on 1 of 2 clusters?").await;
     assert!(plan.text.contains("Runs on: kind-beta"), "{}", plan.text);
     assert_eq!(plan.ok, "Delete on 1 Cluster");
     assert!(plan.default_cancel, "Enter cancels a delete");
-    // The question before it has finished closing.
-    cx.wait_for(t.window, WAIT, |window, _| window.find_all("ok").len() == 1)
-        .await;
-    t.click(cx, "ok");
+    press_only_ok(cx, t).await;
     t.wait_for_label(cx, "fleet-summary", "Finished: 1 done, 1 left out.")
         .await;
     assert_eq!(
@@ -1891,8 +1899,54 @@ async fn a_fleet_delete_runs_once_a_failed_dry_run_is_left_out(cx: &mut TestAppC
     assert_eq!(row.beta_writes.load(Ordering::SeqCst), 2);
 }
 
+// covers UP-101, ADR-0015: a member whose dry run passed can still be left out of a delete; the
+// plan names only the members chosen, and the one left out gets nothing more.
+#[gpui_kit::test]
+async fn a_healthy_member_can_be_left_out_of_a_fleet_delete(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let row = open_beta_row(cx, dir.path()).await;
+    let t = &row.t;
+    ask_fleet(cx, t, FleetChoice::Delete);
+    wait_for_dialog(cx, t, "Delete web: choose the clusters").await;
+    t.click(cx, ("fleet-target", 0usize));
+    cx.run_until_parked();
+    assert_eq!(
+        t.find(cx, ("fleet-target", 0usize)).unwrap().checked(),
+        Some(false)
+    );
+    // With none chosen there is nothing to go on to.
+    t.click(cx, ("fleet-target", 1usize));
+    cx.run_until_parked();
+    t.click(cx, "ok");
+    cx.run_until_parked();
+    let shown = cx
+        .update_window(t.window, |_, window, cx| confirm::shown(window, cx))
+        .unwrap()
+        .map(|d| d.title);
+    assert_eq!(shown.as_deref(), Some("Delete web: choose the clusters"));
+    t.click(cx, ("fleet-target", 1usize));
+    cx.run_until_parked();
+    t.click(cx, "ok");
+    let plan = wait_for_dialog(cx, t, "Delete web on 1 of 2 clusters?").await;
+    assert!(plan.text.contains("Runs on: kind-beta"), "{}", plan.text);
+    assert!(
+        plan.text.contains("kind-alpha: left out: you left it out"),
+        "{}",
+        plan.text
+    );
+    press_only_ok(cx, t).await;
+    t.wait_for_label(cx, "fleet-summary", "Finished: 1 done, 1 left out.")
+        .await;
+    assert_eq!(
+        row.alpha_writes.load(Ordering::SeqCst),
+        1,
+        "its dry run only"
+    );
+    assert_eq!(row.beta_writes.load(Ordering::SeqCst), 2);
+}
+
 // covers UP-101: an apply across the set opens the selected object's manifest, dry-runs it on
-// each member, and after one confirmation applies it on each.
+// each member, shows each member's change, and after one confirmation applies it on each.
 #[gpui_kit::test]
 async fn a_fleet_apply_reviews_the_manifest_on_each_member_then_applies_it(
     cx: &mut TestAppContext,
@@ -1904,16 +1958,43 @@ async fn a_fleet_apply_reviews_the_manifest_on_each_member_then_applies_it(
     wait_for_dialog(cx, t, "Apply YAML to web across the set").await;
     assert_eq!(row.alpha_writes.load(Ordering::SeqCst), 0);
     t.click(cx, "ok");
+    wait_for_dialog(cx, t, "Apply YAML to web: choose the clusters").await;
+    press_only_ok(cx, t).await;
     let plan = wait_for_dialog(cx, t, "Apply YAML to web on 2 of 2 clusters?").await;
     assert!(plan.text.contains("kind-alpha: "), "{}", plan.text);
     assert_eq!(plan.ok, "Apply on 2 Clusters");
     assert_eq!(row.alpha_writes.load(Ordering::SeqCst), 1, "its dry run");
     assert_eq!(row.beta_writes.load(Ordering::SeqCst), 1, "its dry run");
-    t.click(cx, "ok");
+    press_only_ok(cx, t).await;
     t.wait_for_label(cx, "fleet-summary", "Finished: 2 done.")
         .await;
     assert_eq!(row.alpha_writes.load(Ordering::SeqCst), 2);
     assert_eq!(row.beta_writes.load(Ordering::SeqCst), 2);
+}
+
+// covers UP-101: from an apply's target list the manifest opens again as typed, to edit and
+// review again; nothing is written meanwhile.
+#[gpui_kit::test]
+async fn a_fleet_apply_goes_back_to_its_manifest_as_typed(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let row = open_beta_row(cx, dir.path()).await;
+    let t = &row.t;
+    ask_fleet(cx, t, FleetChoice::ApplyYaml);
+    wait_for_dialog(cx, t, "Apply YAML to web across the set").await;
+    t.type_text(cx, "x-draft: kept\n");
+    t.click(cx, "ok");
+    wait_for_dialog(cx, t, "Apply YAML to web: choose the clusters").await;
+    t.click(cx, "fleet-edit-again");
+    wait_for_dialog(cx, t, "Apply YAML to web across the set").await;
+    press_only_ok(cx, t).await;
+    wait_for_dialog(cx, t, "Apply YAML to web: choose the clusters").await;
+    let puts = row._apis.0.puts();
+    assert_eq!(puts.len(), 2, "two reviews, each a dry run");
+    assert!(puts.iter().all(|(dry_run, _)| *dry_run));
+    assert!(
+        puts.iter().all(|(_, sent)| sent["x-draft"] == "kept"),
+        "the draft went to both reviews: {puts:?}"
+    );
 }
 
 // covers UP-100, UP-54: protected members are left out before any request; with every member

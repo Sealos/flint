@@ -686,7 +686,53 @@ pub fn portable_manifest(yaml: &str) -> Result<String, WriteError> {
             metadata.remove(field);
         }
     }
+    if is_service(&body)
+        && let Some(spec) = body.get_mut("spec").and_then(Value::as_object_mut)
+        // A headless Service's "None" is chosen, not allocated: every cluster keeps it.
+        && spec.get("clusterIP").and_then(Value::as_str) != Some(HEADLESS)
+    {
+        for field in SERVICE_ALLOCATED {
+            spec.remove(field);
+        }
+    }
     render(&body)
+}
+
+/// The `clusterIP` of a headless Service.
+const HEADLESS: &str = "None";
+
+/// What a cluster allocates a Service: another cluster's would not be free, or would be another
+/// Service's.
+const SERVICE_ALLOCATED: [&str; 2] = ["clusterIP", "clusterIPs"];
+
+fn is_service(object: &Value) -> bool {
+    text_at(object, "/apiVersion") == Some("v1") && text_at(object, "/kind") == Some("Service")
+}
+
+/// A manifest replacing `live` keeps what this cluster gave the object, which the manifest left
+/// out ([`portable_manifest`]): its owners, and a Service's allocated addresses. Without them an
+/// unchanged apply would orphan a controller's object, or ask for new addresses.
+fn keep_destination_owned(body: &mut Value, live: &Value) {
+    if let (Some(owners), Some(metadata)) = (
+        live.pointer("/metadata/ownerReferences"),
+        body.get_mut("metadata").and_then(Value::as_object_mut),
+    ) && !metadata.contains_key("ownerReferences")
+    {
+        metadata.insert("ownerReferences".to_owned(), owners.clone());
+    }
+    if !is_service(body) {
+        return;
+    }
+    let Some(spec) = body.get_mut("spec").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for field in SERVICE_ALLOCATED {
+        if let Some(value) = live.pointer(&format!("/spec/{field}"))
+            && !spec.contains_key(field)
+        {
+            spec.insert(field.to_owned(), value.clone());
+        }
+    }
 }
 
 async fn prepare(
@@ -696,9 +742,9 @@ async fn prepare(
     live: &Value,
     proposal: WriteProposal,
 ) -> Result<WriteAction, WriteError> {
-    let yaml = match proposal {
-        WriteProposal::ApplyYaml { yaml } => yaml,
-        WriteProposal::ApplyManifest { yaml } => portable_manifest(&yaml)?,
+    let (yaml, manifest) = match proposal {
+        WriteProposal::ApplyYaml { yaml } => (yaml, false),
+        WriteProposal::ApplyManifest { yaml } => (portable_manifest(&yaml)?, true),
         proposal => {
             let change = write_actions::review(kind, live, proposal)?;
             let reviewed = write_actions::reviewed(gate, &target.name, live, &change).await?;
@@ -713,6 +759,9 @@ async fn prepare(
     };
     let mut body = edit_body(&yaml, kind, target)?;
     keep_live_status(&mut body, live);
+    if manifest {
+        keep_destination_owned(&mut body, live);
+    }
     let client = gate.client().await?;
     let result = replace(&client, kind, target, &body, true).await?;
     let result = serde_json::to_value(&result)

@@ -17,6 +17,7 @@ use super::confirm::{self, DialogText};
 use super::registry::{ApplyAcrossSet, DeleteAcrossSet, RestartAcrossSet, ScaleAcrossSet};
 use super::resource_actions::{ResourceAction, RunningWrite, error_text};
 use super::write_confirm::{change_lines, warning_text};
+use super::yaml_diff;
 
 /// Which fleet action was asked for, before a replica count or a manifest is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +95,9 @@ pub(in crate::ui) fn running_write(action: &FleetAction) -> RunningWrite {
     }
 }
 
+/// The most lines of one member's diff a plan shows.
+const DIFF_LINES: usize = 80;
+
 /// What an apply does on one member, from its server dry run: creates the object, changes it
 /// (how many lines), or leaves it as it is.
 pub(in crate::ui) fn edit_lines(edit: &ReviewedEdit) -> Vec<String> {
@@ -103,14 +107,14 @@ pub(in crate::ui) fn edit_lines(edit: &ReviewedEdit) -> Vec<String> {
     diff_lines(edit.before(), edit.after())
 }
 
+/// The member's dry-run diff, as the review shows it (Secret values hidden).
+pub(in crate::ui) fn edit_diff(edit: &ReviewedEdit) -> Vec<String> {
+    yaml_diff::hunk_lines(edit.before(), edit.after(), DIFF_LINES)
+}
+
 /// How `after` differs from `before`, in lines added and removed.
 fn diff_lines(before: &str, after: &str) -> Vec<String> {
-    let diff = similar::TextDiff::configure()
-        .timeout(std::time::Duration::from_secs(1))
-        .diff_lines(before, after);
-    let count = |tag| diff.iter_all_changes().filter(|c| c.tag() == tag).count();
-    let added = count(similar::ChangeTag::Insert);
-    let removed = count(similar::ChangeTag::Delete);
+    let (added, removed) = yaml_diff::counts(before, after);
     if added == 0 && removed == 0 {
         return vec!["No change.".to_owned()];
     }
@@ -145,6 +149,8 @@ pub(in crate::ui) enum Verdict {
     Acts {
         change: Vec<String>,
         warnings: Vec<String>,
+        /// An apply's dry-run diff on this member.
+        diff: Vec<String>,
     },
     /// It is left out and gets no request, and why.
     Refused(String),
@@ -184,7 +190,7 @@ pub(in crate::ui) fn plan_lines(
                 (None, None) => Verdict::Refused("it was not reviewed".to_owned()),
                 (None, Some(entry)) => match entry.refusal() {
                     Some(error) => Verdict::Refused(error_text(error)),
-                    None if !entry.will_run() => Verdict::Refused("left out".to_owned()),
+                    None if !entry.will_run() => Verdict::Refused("you left it out".to_owned()),
                     None => {
                         let target = member_target(preview, cluster, entry.server());
                         let change = match (entry.change(), entry.edit()) {
@@ -194,6 +200,7 @@ pub(in crate::ui) fn plan_lines(
                         };
                         Verdict::Acts {
                             change,
+                            diff: entry.edit().map(edit_diff).unwrap_or_default(),
                             warnings: entry
                                 .warnings()
                                 .iter()
@@ -284,13 +291,18 @@ pub(in crate::ui) fn plan_dialog(
     ];
     for line in lines {
         match &line.verdict {
-            Verdict::Acts { change, warnings } => {
+            Verdict::Acts {
+                change,
+                warnings,
+                diff,
+            } => {
                 text.push(
                     format!("{}: {}", line.shown, change.join(" "))
                         .trim_end()
                         .to_owned(),
                 );
                 text.extend(warnings.iter().map(|w| format!("  {w}")));
+                text.extend(diff.iter().map(|d| format!("    {d}")));
             }
             Verdict::Refused(why) => text.push(format!("{}: left out: {why}", line.shown)),
         }
@@ -331,48 +343,69 @@ pub(in crate::ui) fn plan_dialog(
     (dialog, count)
 }
 
-/// The question before the plan when the review or dry run failed on `failed` members: the run
-/// cannot start until they are left out. `None` when none failed.
-pub(in crate::ui) fn failed_dialog(
-    action: &FleetAction,
-    object: &FleetObject,
-    lines: &[PlanLine],
-    failed: usize,
-) -> Option<DialogText> {
-    if failed == 0 {
-        return None;
-    }
+/// The step before an apply's or a delete's plan: each member with what its dry run said, to
+/// keep in the run or leave out. A member whose review or dry run failed, or that was left out
+/// before it, cannot be chosen: nothing runs on it.
+pub(in crate::ui) fn targets_dialog(action: &FleetAction, object: &FleetObject) -> DialogText {
     let name = confirm::title_name(&single_line(&object.name));
-    let mut text = vec![
-        "Nothing runs until the clusters it failed on are left out. A cluster left out is sent          nothing; the next step shows the plan for the rest to confirm."
-            .to_owned(),
-        String::new(),
-    ];
-    for line in lines {
-        match &line.verdict {
-            Verdict::Acts { change, .. } => text.push(
-                format!("{}: {}", line.shown, change.join(" "))
-                    .trim_end()
-                    .to_owned(),
-            ),
-            Verdict::Refused(why) => text.push(format!("{}: failed: {why}", line.shown)),
-        }
-    }
     let what = match action {
-        FleetAction::Delete => format!("deleting {name}"),
-        _ => format!("applying YAML to {name}"),
+        FleetAction::Delete => format!("Delete {name}"),
+        _ => format!("Apply YAML to {name}"),
     };
-    Some(DialogText {
-        title: format!(
-            "The dry run of {what} failed on {failed} of {}",
-            clusters(lines.len())
-        ),
-        text: text.join("\n"),
-        ok: "Leave Them Out".to_owned(),
+    DialogText {
+        title: format!("{what}: choose the clusters"),
+        text: "Each cluster's dry run is below. Clear a cluster to leave it out: it is sent \
+               nothing. The next step shows the plan for the clusters chosen, to confirm."
+            .to_owned(),
+        ok: "Continue".to_owned(),
         cancel: "Cancel".to_owned(),
-        id: "fleet-failed-description",
+        id: "fleet-targets-description",
         default_cancel: false,
-    })
+    }
+}
+
+/// One member of the target list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::ui) struct TargetRow {
+    pub cluster: String,
+    pub shown: String,
+    /// What its dry run said, or why it cannot run.
+    pub says: String,
+    /// Whether it can be in the run: its review and dry run passed.
+    pub choosable: bool,
+    pub chosen: bool,
+}
+
+/// The target list, from the plan: every member that can run starts chosen.
+pub(in crate::ui) fn target_rows(lines: &[PlanLine]) -> Vec<TargetRow> {
+    lines
+        .iter()
+        .map(|line| {
+            let (says, choosable) = match &line.verdict {
+                Verdict::Acts { change, .. } => (change.join(" "), true),
+                Verdict::Refused(why) => (format!("left out: {why}"), false),
+            };
+            TargetRow {
+                cluster: line.cluster.clone(),
+                shown: line.shown.clone(),
+                says,
+                choosable,
+                chosen: choosable,
+            }
+        })
+        .collect()
+}
+
+/// What the target list says beside its buttons, and whether it can go on.
+pub(in crate::ui) fn targets_state(rows: &[TargetRow]) -> (String, bool) {
+    let chosen = rows.iter().filter(|r| r.chosen).count();
+    if chosen == 0 {
+        return ("Choose a cluster to run on.".to_owned(), true);
+    }
+    (
+        format!("Runs on {chosen} of {}.", clusters(rows.len())),
+        false,
+    )
 }
 
 /// "1 Cluster", "3 Clusters", for a button.

@@ -313,6 +313,63 @@ fn a_manifest_leaves_out_what_one_cluster_owns() {
 }
 
 #[test]
+fn a_service_manifest_leaves_out_its_addresses_unless_headless() {
+    let service = |ip: &str| {
+        format!(
+            "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\nspec:\n  clusterIP: {ip}\n  \
+             clusterIPs:\n  - {ip}\n  ports:\n  - port: 80\n"
+        )
+    };
+    let portable: Value =
+        serde_saphyr::from_str(&portable_manifest(&service("10.0.0.7")).unwrap()).unwrap();
+    assert_eq!(portable["spec"], json!({"ports": [{"port": 80}]}));
+    let headless: Value =
+        serde_saphyr::from_str(&portable_manifest(&service("None")).unwrap()).unwrap();
+    assert_eq!(headless["spec"]["clusterIP"], "None");
+    assert_eq!(headless["spec"]["clusterIPs"], json!(["None"]));
+}
+
+#[test]
+fn a_replace_keeps_what_the_destination_gave_the_object() {
+    let live = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": "web", "ownerReferences": [{"uid": "owner-here"}]},
+        "spec": {"clusterIP": "10.1.0.9", "clusterIPs": ["10.1.0.9"]},
+    });
+    let mut body = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": "web"},
+        "spec": {"ports": [{"port": 80}]},
+    });
+    keep_destination_owned(&mut body, &live);
+    assert_eq!(
+        body["metadata"]["ownerReferences"],
+        json!([{"uid": "owner-here"}])
+    );
+    assert_eq!(body["spec"]["clusterIP"], "10.1.0.9");
+    assert_eq!(body["spec"]["clusterIPs"], json!(["10.1.0.9"]));
+    // What the manifest says itself stays: the server answers for a change it cannot make.
+    let mut headless = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": "web"},
+        "spec": {"clusterIP": "None"},
+    });
+    keep_destination_owned(&mut headless, &live);
+    assert_eq!(headless["spec"]["clusterIP"], "None");
+    // Not a Service: only the owners.
+    let mut config = json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "web"}});
+    keep_destination_owned(&mut config, &live);
+    assert_eq!(
+        config["metadata"]["ownerReferences"],
+        json!([{"uid": "owner-here"}])
+    );
+    assert!(config.get("spec").is_none());
+}
+
+#[test]
 fn only_a_manifest_for_an_unshown_object_creates() {
     let manifest = WriteProposal::ApplyManifest {
         yaml: String::new(),

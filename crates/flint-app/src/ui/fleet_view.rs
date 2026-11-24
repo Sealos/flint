@@ -29,17 +29,21 @@ use flint_core::fleet::{
 };
 use flint_core::handle::AdmittedMember;
 use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::component::button::Button;
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Editor, EditorState, InputState};
-use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::confirm::{self, DialogText};
+use super::confirm::{self, ConfirmState, DialogText};
 use super::detail::protected_reason;
 use super::fleet_plan::{
-    FleetChoice, Outcome, PlanLine, ResultLine, current, failed_dialog, outcome_text, plan_dialog,
-    plan_lines, record, result_lines, run_dialog, running_write, summary,
+    FleetChoice, Outcome, PlanLine, ResultLine, TargetRow, current, outcome_text, plan_dialog,
+    plan_lines, record, result_lines, run_dialog, running_write, summary, target_rows,
+    targets_dialog, targets_state,
 };
+use super::registry::{self, Bind, EditFleetManifestAgain, OnView, ToggleFleetTarget};
 use super::resource_actions::{
     ResourceAction, ScaleField, WriteKey, claim, offered_for, parse_replicas, release,
 };
@@ -111,12 +115,15 @@ fn fleet_object(ws: &Workspace, cx: &App) -> Option<FleetObject> {
 
 /// The set's members split before any request: the ones to preview, each with a guard on the
 /// connection it has now, and the ones left out, with why.
+#[derive(Clone)]
 struct Planned {
     /// Every member, in the set's order.
     order: Vec<String>,
     acting: Vec<AdmittedMember>,
     guards: Vec<ConnectionGuard>,
     refused: Vec<(String, String)>,
+    /// The selected row's member and the uid it shows: that member's review is bound to it.
+    shown: Option<(String, String)>,
 }
 
 impl Planned {
@@ -128,11 +135,16 @@ impl Planned {
 
 fn plan_members(ws: &Workspace, cx: &App) -> Planned {
     let names = ws.cluster_names(cx);
+    let shown = ws.detail_view().and_then(|detail| {
+        let object = detail.read(cx).object();
+        (!object.uid.is_empty()).then(|| (object.cluster.to_string(), object.uid.to_string()))
+    });
     let mut planned = Planned {
         order: Vec::new(),
         acting: Vec::new(),
         guards: Vec::new(),
         refused: Vec::new(),
+        shown,
     };
     for (member, why) in ws.set_members_to_act_on(cx).unwrap_or_default() {
         let cluster = member.context().to_owned();
@@ -392,7 +404,17 @@ fn start_preview(
     cx: &mut Context<Workspace>,
 ) {
     let choice = FleetChoice::from(&action);
-    let plan = match FleetPlan::new(action, object.clone(), planned.acting.clone()) {
+    let plan = FleetPlan::new(action, object.clone(), planned.acting.clone()).and_then(|plan| {
+        // The selected row's member is held to the object it shows, by uid. A member left out
+        // before the preview is not reviewed at all.
+        match &planned.shown {
+            Some((cluster, uid)) if planned.acting.iter().any(|m| m.context() == cluster) => {
+                plan.with_shown_uid(cluster, uid)
+            }
+            _ => Ok(plan),
+        }
+    });
+    let plan = match plan {
         Ok(plan) => plan,
         Err(error) => {
             ws.refuse(refusal(choice, &error.to_string()), cx);
@@ -426,36 +448,168 @@ fn previewed(
         ws.refuse_held(connection_changed_text(), cx);
         return;
     }
-    let names = ws.cluster_names(cx);
-    let failed = preview.unresolved().len();
-    if FleetChoice::from(preview.action()).drops_by_hand() && failed > 0 {
-        let lines = plan_lines(&planned.order, &planned.refused, Some(&preview), |c| {
-            names.exact(c)
-        });
-        let Some(text) = failed_dialog(preview.action(), &object, &lines, failed) else {
-            return;
-        };
-        let this = cx.weak_entity();
-        let held = Rc::new(RefCell::new(Some((planned, object, preview))));
-        let on_ok = move |window: &mut Window, cx: &mut App| {
-            if let Some((planned, object, mut preview)) = held.borrow_mut().take() {
-                preview.drop_refused();
-                let this = this.clone();
-                // Once this question has closed: the plan is a dialog of its own.
-                window.defer(cx, move |window, cx| {
-                    let _ = this.update(cx, |ws, cx| {
-                        confirm_plan(ws, planned, object, preview, window, cx)
-                    });
-                });
-            }
-            true
-        };
-        confirm::open_pinned_guarded(window, cx, text, 0, None, guard, on_ok);
+    if FleetChoice::from(preview.action()).drops_by_hand() {
+        choose_targets(ws, planned, object, preview, window, cx);
         return;
     }
     // Left in, a refused member would keep the run from starting.
     preview.drop_refused();
     confirm_plan(ws, planned, object, preview, window, cx);
+}
+
+/// An apply's or a delete's target list: each member with its dry run, to keep in the run or
+/// leave out, the failed ones left out already. Its confirmation goes on to the plan for the
+/// members chosen; nothing runs from here.
+fn choose_targets(
+    ws: &mut Workspace,
+    planned: Planned,
+    object: FleetObject,
+    preview: FleetPreview,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let names = ws.cluster_names(cx);
+    let lines = plan_lines(&planned.order, &planned.refused, Some(&preview), |c| {
+        names.exact(c)
+    });
+    let this = cx.weak_entity();
+    // An apply can go back to its manifest, as typed, to fix what a dry run refused.
+    let on_edit: Option<EditAgain> = match preview.action() {
+        FleetAction::ApplyYaml { manifest } => {
+            let draft = manifest.as_str().to_owned();
+            let (planned, object, this) = (planned.clone(), object.clone(), this.clone());
+            Some(Rc::new(move |window: &mut Window, cx: &mut App| {
+                confirm::close_newest(window, cx);
+                let (planned, object, draft) = (planned.clone(), object.clone(), draft.clone());
+                let this = this.clone();
+                window.defer(cx, move |window, cx| {
+                    let _ =
+                        this.update(cx, |_, cx| ask_manifest(planned, object, draft, window, cx));
+                });
+            }))
+        }
+        _ => None,
+    };
+    let targets = cx.new(|cx| FleetTargets::new(target_rows(&lines), on_edit, cx));
+    let text = targets_dialog(preview.action(), &object);
+    let guard = planned.guard();
+    let read = targets.clone();
+    let state = move |cx: &App| {
+        let (note, blocked) = targets_state(&read.read(cx).rows);
+        ConfirmState { note, blocked }
+    };
+    let content = targets.clone().into();
+    let held = Rc::new(RefCell::new(Some((planned, object, preview))));
+    let on_ok = move |window: &mut Window, cx: &mut App| {
+        let Some((planned, object, mut preview)) = held.borrow_mut().take() else {
+            return true;
+        };
+        // Every failed member stays out; every member not chosen is left out too.
+        preview.drop_refused();
+        for row in &targets.read(cx).rows {
+            preview.set_dropped(&row.cluster, !row.chosen);
+        }
+        let this = this.clone();
+        // Once this list has closed: the plan is a dialog of its own.
+        window.defer(cx, move |window, cx| {
+            let _ = this.update(cx, |ws, cx| {
+                confirm_plan(ws, planned, object, preview, window, cx)
+            });
+        });
+        true
+    };
+    confirm::open_gated_guarded(window, cx, text, content, guard, state, on_ok);
+}
+
+/// Goes back from a target list to the manifest editor.
+type EditAgain = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// The target list of an apply or a delete: a checkbox per member. Each checkbox performs a
+/// registered action from this view's focus, as the drain options do.
+pub(in crate::ui) struct FleetTargets {
+    focus: FocusHandle,
+    pub(in crate::ui) rows: Vec<TargetRow>,
+    on_edit: Option<EditAgain>,
+}
+
+impl FleetTargets {
+    fn new(rows: Vec<TargetRow>, on_edit: Option<EditAgain>, cx: &mut Context<Self>) -> Self {
+        FleetTargets {
+            focus: cx.focus_handle(),
+            rows,
+            on_edit,
+        }
+    }
+
+    /// Every action of the list and its handler, for [`Bind`].
+    pub(in crate::ui) fn bind_actions<B: Bind<Self>>(bind: B) -> B {
+        bind.bind::<ToggleFleetTarget>(|this, action, _, cx| {
+            // A member that cannot run stays out, however it is asked.
+            if let Some(row) = this
+                .rows
+                .iter_mut()
+                .find(|r| r.cluster == action.cluster && r.choosable)
+            {
+                row.chosen = !row.chosen;
+                cx.notify();
+            }
+        })
+        .bind::<EditFleetManifestAgain>(|this, _, window, cx| {
+            if let Some(on_edit) = this.on_edit.clone() {
+                on_edit(window, cx);
+            }
+        })
+    }
+}
+
+impl Render for FleetTargets {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let element = v_flex()
+            .id("fleet-targets")
+            .track_focus(&self.focus)
+            .mt_2()
+            .gap_1()
+            .children(self.rows.iter().enumerate().map(|(i, row)| {
+                v_flex()
+                    .child(
+                        Checkbox::new(("fleet-target", i))
+                            .label(row.shown.clone())
+                            .checked(row.chosen)
+                            .disabled(!row.choosable)
+                            .on_click(registry::on_click_in(
+                                self.focus.clone(),
+                                ToggleFleetTarget {
+                                    cluster: row.cluster.clone(),
+                                },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id(("fleet-target-says", i))
+                            .aria_label(row.says.clone())
+                            .pl_6()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(row.says.clone())
+                            .test_support(),
+                    )
+            }))
+            .when(self.on_edit.is_some(), |el| {
+                el.child(
+                    h_flex().pt_1().child(
+                        Button::new("fleet-edit-again")
+                            .small()
+                            .label("Edit Manifest Again")
+                            .on_click(registry::on_click_in(
+                                self.focus.clone(),
+                                EditFleetManifestAgain,
+                            )),
+                    ),
+                )
+            });
+        Self::bind_actions(OnView::new(element, cx)).into_element()
+    }
 }
 
 /// The one confirmation of a preview whose refused members are all left out.
