@@ -37,7 +37,7 @@ fn defaults_are_in_range_with_unique_keys() {
         (MemoryPercent, "memory_percent", 90),
         (RestartsLastHour, "restarts_last_hour", 5),
         (WarningEventsLastHour, "warning_events_last_hour", 10),
-        (PendingPodSeconds, "pending_pod_seconds", 60),
+        (PendingPodSeconds, "pending_pod_seconds", 300),
     ];
     assert_eq!(ThresholdMetric::ALL.len(), expected.len());
     let defaults = Thresholds::default();
