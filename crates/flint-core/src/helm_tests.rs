@@ -53,6 +53,7 @@ fn target(dir: &Path) -> HelmTarget {
         pin,
         credential(CredentialSource::Definition),
         None,
+        None,
         runs_root(dir),
         &ProxyEnvironment::default(),
     )
@@ -264,6 +265,7 @@ async fn a_run_gets_the_connections_proxy() {
         pin_for(&merged),
         credential(CredentialSource::Definition),
         None,
+        None,
         runs_root(dir.path()),
         &environment,
     )
@@ -294,6 +296,7 @@ fn a_cluster_proxy_url_wins_over_the_environment() {
         "dev",
         pin_for(&merged),
         credential(CredentialSource::Definition),
+        None,
         None,
         unused_root(),
         &environment,
@@ -394,34 +397,167 @@ async fn a_run_is_pinned_and_gets_a_minimal_environment() {
     );
 }
 
-// An exec plugin or auth provider is refused, even behind a token that takes precedence in kube.
+// An auth provider, or an exec plugin behind a token that takes precedence in kube, is refused:
+// no consent covers either.
 #[test]
-fn a_credential_that_runs_a_program_is_refused() {
+fn a_credential_that_runs_a_program_unconsented_is_refused() {
     let with_exec = CONFIG.replace(
         "token: sekret-token",
         "token: t\n    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: /bin/evil",
     );
-    let merged = config(&with_exec);
-    let refused = HelmTarget::new(
-        &merged,
-        "dev",
-        pin_for(&merged),
-        credential(CredentialSource::Definition),
-        None,
-        unused_root(),
+    let with_provider = CONFIG.replace(
+        "token: sekret-token",
+        "auth-provider:\n      name: oidc\n      config: {}",
     );
-    assert_eq!(refused.err(), Some(HelmError::CredentialRunsCommand));
+    for (yaml, source) in [
+        (with_exec.as_str(), CredentialSource::Definition),
+        (with_provider.as_str(), CredentialSource::AuthProvider),
+        // The connection's credential runs a program the definition no longer names.
+        (CONFIG, CredentialSource::Plugin),
+    ] {
+        let merged = config(yaml);
+        let refused = HelmTarget::new(
+            &merged,
+            "dev",
+            pin_for(&merged),
+            credential(source),
+            None,
+            None,
+            unused_root(),
+        );
+        assert_eq!(refused.err(), Some(HelmError::SignInNotSupported));
+    }
+}
 
-    let merged = config(CONFIG);
-    let refused = HelmTarget::new(
-        &merged,
+/// A plugin under `dir` that prints `plugin-token` and counts its runs in `dir/plugin-runs`.
+fn sign_in_plugin(dir: &Path) -> PathBuf {
+    let path = dir.join("plugin");
+    let script = format!(
+        "#!/bin/sh\nprintf x >> '{}/plugin-runs'\nprintf '{{\"apiVersion\":\"client.\
+         authentication.k8s.io/v1\",\"kind\":\"ExecCredential\",\"status\":{{\"token\":\
+         \"plugin-token\"}}}}'\n",
+        dir.display()
+    );
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+fn plugin_runs(dir: &Path) -> usize {
+    std::fs::read(dir.join("plugin-runs")).map_or(0, |bytes| bytes.len())
+}
+
+/// [`CONFIG`] with `dev`'s user signing in through `plugin` called with `arg`.
+fn plugin_config(plugin: &Path, arg: &str) -> Kubeconfig {
+    config(&CONFIG.replace(
+        "token: sekret-token",
+        &format!(
+            "exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: {}\n      \
+             args: [{arg}]\n      interactiveMode: Never",
+            plugin.display()
+        ),
+    ))
+}
+
+/// Background sign-in consent for `dev` as `kubeconfig` defines it.
+fn consent_for(kubeconfig: &Kubeconfig) -> Arc<PluginConsent> {
+    let SignIn::Plugin(definition) = sign_in_of(kubeconfig, "dev") else {
+        panic!("not a plugin");
+    };
+    Arc::new(PluginConsent::seal(&definition).unwrap())
+}
+
+fn plugin_target(
+    merged: &Kubeconfig,
+    consent: Option<Arc<PluginConsent>>,
+) -> Result<HelmTarget, HelmError> {
+    HelmTarget::new(
+        merged,
         "dev",
-        pin_for(&merged),
+        pin_for(merged),
         credential(CredentialSource::Plugin),
+        consent,
         None,
         unused_root(),
-    );
+    )
+}
+
+// Without consent the plugin is refused, and the message points at the consent.
+#[test]
+fn a_plugin_without_consent_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let merged = plugin_config(&sign_in_plugin(dir.path()), "a");
+    let refused = plugin_target(&merged, None);
     assert_eq!(refused.err(), Some(HelmError::CredentialRunsCommand));
+    assert!(
+        HelmError::CredentialRunsCommand
+            .to_string()
+            .contains("Keep Watching")
+    );
+}
+
+// Consent given for another definition, or ended, does not let the plugin run.
+#[test]
+fn consent_for_another_or_ended_definition_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = sign_in_plugin(dir.path());
+    let merged = plugin_config(&plugin, "a");
+    let earlier = consent_for(&plugin_config(&plugin, "b"));
+    assert_eq!(
+        plugin_target(&merged, Some(earlier)).err(),
+        Some(HelmError::CredentialRunsCommand)
+    );
+    let revoked = consent_for(&merged);
+    revoked.void();
+    assert_eq!(
+        plugin_target(&merged, Some(revoked)).err(),
+        Some(HelmError::CredentialRunsCommand)
+    );
+}
+
+// With consent, Flint runs the plugin and `helm` gets only the token it printed.
+#[tokio::test]
+async fn a_consented_plugin_signs_in_for_helm() {
+    let dir = tempfile::tempdir().unwrap();
+    let merged = plugin_config(&sign_in_plugin(dir.path()), "a");
+    let target = plugin_target(&merged, Some(consent_for(&merged))).unwrap();
+    assert_eq!(
+        target.pinned_kubeconfig().err(),
+        Some(HelmError::SignInNotSupported),
+        "the plugin itself never reaches helm"
+    );
+    assert_eq!(plugin_runs(dir.path()), 0, "making the target runs nothing");
+
+    let signed = target.signed_in().await.unwrap();
+    assert_eq!(plugin_runs(dir.path()), 1);
+    let user = written_user(&signed);
+    assert_eq!(user["token"], "plugin-token");
+    assert!(user.get("exec").is_none(), "{user}");
+
+    let helm = fake_helm(dir.path(), "printf '[]'");
+    let signed = HelmTarget {
+        runs_root: runs_root(dir.path()),
+        ..signed
+    };
+    run_at(&helm, &signed, &HelmQuery::List).await.unwrap();
+    let seen = std::fs::read_to_string(dir.path().join("kubeconfig")).unwrap();
+    assert!(seen.contains("plugin-token"));
+    assert!(!seen.contains("exec"), "{seen}");
+}
+
+// Consent ended after the target was made starts no plugin.
+#[tokio::test]
+async fn consent_ended_before_the_run_starts_no_plugin() {
+    let dir = tempfile::tempdir().unwrap();
+    let merged = plugin_config(&sign_in_plugin(dir.path()), "a");
+    let consent = consent_for(&merged);
+    let target = plugin_target(&merged, Some(Arc::clone(&consent))).unwrap();
+    consent.void();
+    assert_eq!(
+        target.signed_in().await.err(),
+        Some(HelmError::CredentialRunsCommand)
+    );
+    assert_eq!(plugin_runs(dir.path()), 0);
 }
 
 // A context whose server is not the pinned one is refused.
@@ -435,6 +571,7 @@ fn a_repointed_context_is_refused() {
         "dev",
         pin,
         credential(CredentialSource::Definition),
+        None,
         None,
         unused_root(),
     );
@@ -458,8 +595,16 @@ async fn a_replaced_certificate_file_refuses_the_run() {
     let mut for_client = merged.clone();
     let files = hold_credential_files(&mut for_client, "dev");
     let held = WriteCredential::new(files, CredentialSource::Definition, None, None);
-    let target =
-        HelmTarget::new(&merged, "dev", pin_for(&merged), held, None, unused_root()).unwrap();
+    let target = HelmTarget::new(
+        &merged,
+        "dev",
+        pin_for(&merged),
+        held,
+        None,
+        None,
+        unused_root(),
+    )
+    .unwrap();
 
     let bytes = target.pinned_kubeconfig().unwrap();
     let written: Kubeconfig = serde_json::from_slice(&bytes).unwrap();
@@ -760,6 +905,7 @@ fn only_the_admitted_token_reaches_helm() {
         pin_for(&merged),
         credential(CredentialSource::Definition),
         None,
+        None,
         unused_root(),
     )
     .unwrap();
@@ -777,6 +923,7 @@ fn basic_auth_drops_a_token_beside_it() {
         "dev",
         pin_for(&merged),
         credential(CredentialSource::Definition),
+        None,
         None,
         unused_root(),
     )
@@ -811,6 +958,7 @@ async fn a_token_file_goes_in_as_the_admitted_snapshot() {
         pin_for(&merged),
         credential(CredentialSource::TokenFile(file)).with_admitted_token(token),
         None,
+        None,
         unused_root(),
     )
     .unwrap();
@@ -830,6 +978,7 @@ fn a_token_file_without_a_snapshot_is_refused() {
         "dev",
         pin_for(&merged),
         credential(CredentialSource::TokenFile(file)),
+        None,
         None,
         unused_root(),
     )

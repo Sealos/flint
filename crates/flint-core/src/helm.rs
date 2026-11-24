@@ -12,8 +12,11 @@
 //!   run's files stay in a private directory.
 //! - Certificate files go in as the bytes the connection was built from, and a file that no longer
 //!   holds them refuses the run.
-//! - A credential that runs a program (an exec plugin or auth provider) is refused: `helm` would
-//!   start it by itself, where Flint's consent and launch checks cannot apply.
+//! - `helm` never starts a program to sign in. An exec plugin is run by Flint before the run, as a
+//!   kept cluster's is (ADR-0012): only under the person's background sign-in consent for exactly
+//!   this definition, unattended, with no stdin, and killed if that consent ends. `helm` gets the
+//!   token or certificate it printed, never the plugin. Without that consent, and for an auth
+//!   provider, which can't be stopped once it runs, the run is refused.
 //! - The arguments are a list, with no shell, and the environment is only what is set here: no
 //!   `PATH`, and a home, Helm directories and working directory that exist for this run alone.
 //!
@@ -33,8 +36,10 @@ use secrecy::SecretString;
 use serde::{Deserialize, Deserializer};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
+use crate::connection::policy::{CredentialAccess, PluginRuns};
 use crate::connection::proxy::{self, ProxyEnvironment};
 use crate::credential::{CredentialSource, WriteCredential};
+use crate::keep_watching::{PluginConsent, SignIn, sign_in_of};
 use crate::read::{is_dns1123_label, is_dns1123_subdomain};
 use crate::recheck::ContextPin;
 
@@ -77,8 +82,18 @@ pub enum HelmError {
     UntrustedLocation,
     #[error("Flint's folder for helm can be changed by other accounts, so helm did not run.")]
     UnsafeRunDirectory,
-    #[error("Helm is not available for clusters that sign in with a credential plugin yet.")]
+    #[error(
+        "This cluster signs in with a command. To use Helm, turn on Keep Watching for it and let \
+         Flint run its sign-in command in the background."
+    )]
     CredentialRunsCommand,
+    #[error(
+        "Helm is not available for clusters that sign in with an auth provider, or with a command \
+         beside another credential."
+    )]
+    SignInNotSupported,
+    #[error("This cluster's sign-in command failed, so helm did not run.")]
+    SignInFailed,
     #[error("This cluster is not connected.")]
     NotConnected,
     #[error("This cluster's kubeconfig changed. Reopen Helm releases.")]
@@ -284,6 +299,9 @@ pub(crate) struct HelmTarget {
     /// Only this context, its cluster and its user.
     kubeconfig: Kubeconfig,
     credential: WriteCredential,
+    /// For an exec plugin: the background sign-in consent it runs under, which held over exactly
+    /// this definition when the target was made. `None` once the plugin's output replaced it.
+    consent: Option<Arc<PluginConsent>>,
     configured_helm: Option<PathBuf>,
     /// Where the run's private directory goes ([`runs_root`]).
     runs_root: PathBuf,
@@ -293,14 +311,16 @@ pub(crate) struct HelmTarget {
 }
 
 impl HelmTarget {
-    /// The target for `context` of `merged`, the definition `pin` was taken on. Refuses a user
-    /// entry naming any program, even one another credential takes precedence over: client-go's
-    /// order is not kube's, so `helm` could still run it.
+    /// The target for `context` of `merged`, the definition `pin` was taken on. An exec plugin is
+    /// accepted only with `consent` holding over exactly this definition. Refuses an auth
+    /// provider, and a user entry naming a program beside another credential: client-go's order
+    /// is not kube's, so `helm` could still run it.
     pub(crate) fn new(
         merged: &Kubeconfig,
         context: &str,
         pin: ContextPin,
         credential: WriteCredential,
+        consent: Option<Arc<PluginConsent>>,
         configured_helm: Option<PathBuf>,
         runs_root: PathBuf,
     ) -> Result<Self, HelmError> {
@@ -309,6 +329,7 @@ impl HelmTarget {
             context,
             pin,
             credential,
+            consent,
             configured_helm,
             runs_root,
             &ProxyEnvironment::current(),
@@ -316,11 +337,13 @@ impl HelmTarget {
     }
 
     /// [`Self::new`] under the proxy variables `environment` holds.
+    #[allow(clippy::too_many_arguments)]
     fn new_in(
         merged: &Kubeconfig,
         context: &str,
         pin: ContextPin,
         credential: WriteCredential,
+        consent: Option<Arc<PluginConsent>>,
         configured_helm: Option<PathBuf>,
         runs_root: PathBuf,
         environment: &ProxyEnvironment,
@@ -350,12 +373,12 @@ impl HelmTarget {
             ),
             None => None,
         };
-        if credential.runs_a_command()
-            || user
-                .and_then(|u| u.auth_info.as_ref())
-                .is_some_and(|a| a.exec.is_some() || a.auth_provider.is_some())
+        let auth = user.and_then(|u| u.auth_info.as_ref());
+        let plugin = auth.map(CredentialSource::of) == Some(CredentialSource::Plugin);
+        if plugin != credential.runs_a_command()
+            || (!plugin && auth.is_some_and(|a| a.exec.is_some() || a.auth_provider.is_some()))
         {
-            return Err(HelmError::CredentialRunsCommand);
+            return Err(HelmError::SignInNotSupported);
         }
         // The proxy Flint's own connection takes, so `helm` reaches the same server the same way.
         let mut proxy = Vec::new();
@@ -381,10 +404,20 @@ impl HelmTarget {
             current_context: Some(context.to_owned()),
             ..Kubeconfig::default()
         };
+        let consent = if plugin {
+            let consent = consent.ok_or(HelmError::CredentialRunsCommand)?;
+            match sign_in_of(&kubeconfig, context) {
+                SignIn::Plugin(definition) if consent.holds(&definition) => Some(consent),
+                _ => return Err(HelmError::CredentialRunsCommand),
+            }
+        } else {
+            None
+        };
         Ok(Self {
             context: context.to_owned(),
             kubeconfig,
             credential,
+            consent,
             configured_helm,
             runs_root,
             proxy,
@@ -392,8 +425,23 @@ impl HelmTarget {
     }
 
     /// The kubeconfig `helm` gets, with certificate and key files replaced by the bytes the
-    /// connection was built from. Blocks on the file system.
+    /// connection was built from. Blocks on the file system. Refused while an exec plugin or auth
+    /// provider is still in it: `helm` would run it.
     fn pinned_kubeconfig(&self) -> Result<Vec<u8>, HelmError> {
+        let config = self.pinned_config()?;
+        let names_program = config
+            .auth_infos
+            .iter()
+            .filter_map(|user| user.auth_info.as_ref())
+            .any(|auth| auth.exec.is_some() || auth.auth_provider.is_some());
+        if names_program {
+            return Err(HelmError::SignInNotSupported);
+        }
+        serde_json::to_vec(&config).map_err(|_| HelmError::NotStarted)
+    }
+
+    /// [`Self::kubeconfig`] with its files replaced by the bytes the connection was built from.
+    fn pinned_config(&self) -> Result<Kubeconfig, HelmError> {
         let mut config = self.kubeconfig.clone();
         for cluster in &mut config.clusters {
             self.inline_authority(cluster)?;
@@ -401,7 +449,91 @@ impl HelmTarget {
         for user in &mut config.auth_infos {
             self.inline_identity(user)?;
         }
-        serde_json::to_vec(&config).map_err(|_| HelmError::NotStarted)
+        Ok(config)
+    }
+
+    /// This target with its exec plugin's credential in place of the plugin, so `helm` starts no
+    /// program. The plugin runs as a kept cluster's does: unattended, with no stdin, and only while
+    /// the consent still holds over this definition, checked right before it starts. Dropping the
+    /// future kills it. A target with no plugin is returned as it is.
+    async fn signed_in(&self) -> Result<Self, HelmError> {
+        let Some(consent) = self.consent.clone() else {
+            return Ok(self.clone());
+        };
+        let SignIn::Plugin(definition) = sign_in_of(&self.kubeconfig, &self.context) else {
+            return Err(HelmError::Changed);
+        };
+        let definition = Arc::new(definition);
+        let pinned = {
+            let target = self.clone();
+            tokio::task::spawn_blocking(move || target.pinned_config())
+                .await
+                .map_err(|_| HelmError::NotStarted)??
+        };
+        let check = {
+            let (consent, definition) = (Arc::clone(&consent), Arc::clone(&definition));
+            crate::cluster::SendCheck::new(move || {
+                let verdict = if consent.holds(&definition) {
+                    Ok(())
+                } else {
+                    Err("the background sign-in consent ended".to_owned())
+                };
+                let verdict: futures::future::BoxFuture<'static, _> =
+                    Box::pin(std::future::ready(verdict));
+                verdict
+            })
+        };
+        let access =
+            CredentialAccess::consented(Arc::new(|| {}), Some(check), PluginRuns::default());
+        // Why it failed: the consent ended, or the plugin did.
+        let failed = || {
+            if consent.holds(&definition) {
+                HelmError::SignInFailed
+            } else {
+                HelmError::CredentialRunsCommand
+            }
+        };
+        let prepared = tokio::time::timeout(
+            RUN_TIMEOUT,
+            crate::cluster::prepare(&pinned, &self.context, &access),
+        )
+        .await
+        .map_err(|_| HelmError::TimedOut)?
+        .map_err(|_| failed())?;
+        let token = match &prepared.token {
+            Some(refreshing) => {
+                let header = refreshing.header().await.map_err(|_| failed())?;
+                let token = header
+                    .to_str()
+                    .ok()
+                    .and_then(|value| value.strip_prefix("Bearer "))
+                    .filter(|token| !token.is_empty())
+                    .ok_or(HelmError::SignInFailed)?;
+                Some(SecretString::from(token.to_owned()))
+            }
+            None => prepared.config.auth_info.token.clone(),
+        };
+        if !consent.holds(&definition) {
+            return Err(HelmError::CredentialRunsCommand);
+        }
+        let mut signed = self.clone();
+        let auth = signed
+            .kubeconfig
+            .auth_infos
+            .iter_mut()
+            .find_map(|user| user.auth_info.as_mut())
+            .ok_or(HelmError::Changed)?;
+        auth.exec = None;
+        auth.token = token;
+        if prepared.replaced_certificate {
+            let resolved = &prepared.config.auth_info;
+            auth.client_certificate = None;
+            auth.client_key = None;
+            auth.client_certificate_data = resolved.client_certificate_data.clone();
+            auth.client_key_data = resolved.client_key_data.clone();
+        }
+        signed.consent = None;
+        Ok(signed)
     }
 
     fn held(&self, path: &str) -> Result<String, HelmError> {
@@ -778,6 +910,7 @@ async fn run_helm(
 
 /// Runs `query` on `target`, with the `helm` the settings name or the first on this process's
 /// `PATH`.
+/// An exec plugin is run first, once for all of the query's commands ([`HelmTarget::signed_in`]).
 pub(crate) async fn run(target: &HelmTarget, query: &HelmQuery) -> Result<HelmOutput, HelmError> {
     let configured = target.configured_helm.clone();
     let path = std::env::var_os("PATH");
@@ -787,7 +920,8 @@ pub(crate) async fn run(target: &HelmTarget, query: &HelmQuery) -> Result<HelmOu
     })
     .await
     .map_err(|_| HelmError::NotStarted)??;
-    run_with(&found.path, target, query, admin).await
+    let target = target.signed_in().await?;
+    run_with(&found.path, &target, query, admin).await
 }
 
 #[derive(Deserialize, Default)]

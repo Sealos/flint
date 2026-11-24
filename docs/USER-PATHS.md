@@ -779,9 +779,12 @@ Deferred until cluster sets are scheduled (#199).
 - Tests: e2e (`flint-e2e/tests/app/notifications.rs`).
 
 ### UP-125 Connect through an HTTPS proxy
-- **Given** a kubeconfig cluster with a `proxy-url`.
+- **Given** a kubeconfig cluster with a `proxy-url`, or a `[proxy]` in `settings.toml` (for Flint started from Finder
+  or the Dock, which does not see `HTTPS_PROXY` from a shell profile).
 - **Then** Flint reads the cluster through the proxy with TLS to the API server itself, so a proxy that leads to
   another server fails the handshake. Such a context is never treated as a local cluster.
+- A cluster's own `proxy-url` wins over the setting, and the setting over `HTTPS_PROXY`. A server in the setting's
+  `no_proxy` list is reached directly. A proxy that is down is never skipped, and its credentials are never shown.
 - Tests: e2e (`flint-e2e/tests/proxy.rs`).
 
 ## M6: Install

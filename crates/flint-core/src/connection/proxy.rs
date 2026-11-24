@@ -1,7 +1,8 @@
 //! The proxy a connection goes through, if any.
 //!
-//! A cluster entry's `proxy-url` always applies. Without one, `HTTPS_PROXY` (or `https_proxy`)
-//! does, unless `NO_PROXY` (or `no_proxy`) exempts the API server. Only `http://` proxies are
+//! A cluster entry's `proxy-url` always applies. Without one, the `[proxy]` of `settings.toml`
+//! does ([`use_setting`]), else `HTTPS_PROXY` (or `https_proxy`), unless the no-proxy list that
+//! goes with it exempts the API server. Only `http://` proxies are
 //! supported, through `CONNECT`: TLS to the API server runs inside the tunnel, so the proxy sees
 //! neither the credentials nor the requests. Any other proxy is refused, never skipped.
 //!
@@ -20,6 +21,8 @@ use hyper_util::client::proxy::matcher::Matcher;
 use ring::hmac;
 use ring::rand::SystemRandom;
 
+use crate::settings::ProxySetting;
+
 /// What [`shown`] says of a proxy URL it can't read, which may be a mistyped secret.
 const UNREADABLE: &str = "an unreadable proxy URL";
 
@@ -27,6 +30,18 @@ const UNREADABLE: &str = "an unreadable proxy URL";
 /// one nor an environment proxy that `NO_PROXY` may exempt. Flint then sets the proxy it chose;
 /// were that ever skipped, this address leads nowhere.
 pub(crate) const LOADER_PLACEHOLDER: &str = "http://proxy.invalid:1";
+
+/// The proxy setting this process uses, from `settings.toml` at startup. Set once, so the proxy
+/// chosen when kubeconfig loads is the one a client later connects through.
+static SETTING: OnceLock<ProxySetting> = OnceLock::new();
+
+/// Uses `setting` for cluster connections from now on. The first call wins; later ones are
+/// ignored, since contexts loaded under the first are pinned to its route.
+pub(crate) fn use_setting(setting: &ProxySetting) {
+    if SETTING.set(setting.clone()).is_err() {
+        tracing::debug!("a proxy setting is already in use; the new one applies after a restart");
+    }
+}
 
 /// The proxy variables of an environment. Holds what may be a password, so it has no `Debug`.
 #[derive(Clone, Default)]
@@ -36,11 +51,17 @@ pub(crate) struct ProxyEnvironment {
 }
 
 impl ProxyEnvironment {
+    /// The proxy of this process: the variables of its environment under the setting it uses
+    /// ([`use_setting`]).
+    pub(crate) fn current() -> Self {
+        Self::of_process().under(SETTING.get())
+    }
+
     /// The variables of this process, in the order kube and kubectl read them.
     ///
     /// A value that is not UTF-8 stays set, lossily: as a proxy it then can't be read and is
     /// refused, and as `NO_PROXY` it exempts nothing. It never counts as unset.
-    pub(crate) fn current() -> Self {
+    fn of_process() -> Self {
         let first = |names: [&str; 2]| {
             names.iter().find_map(|name| {
                 let value = std::env::var_os(name)?;
@@ -51,6 +72,26 @@ impl ProxyEnvironment {
         ProxyEnvironment {
             https_proxy: first(["HTTPS_PROXY", "https_proxy"]),
             no_proxy: first(["NO_PROXY", "no_proxy"]),
+        }
+    }
+
+    /// This environment with `setting` over it. A setting's URL replaces the environment's proxy
+    /// together with its `NO_PROXY`: only the setting's own list exempts servers from it. A
+    /// setting with a no-proxy list and no URL replaces only `NO_PROXY`.
+    pub(crate) fn under(self, setting: Option<&ProxySetting>) -> Self {
+        let Some(setting) = setting else {
+            return self;
+        };
+        let no_proxy = setting.no_proxy_list();
+        match setting.url.as_deref().filter(|u| !u.trim().is_empty()) {
+            Some(url) => ProxyEnvironment {
+                https_proxy: Some(url.to_owned()),
+                no_proxy,
+            },
+            None => ProxyEnvironment {
+                no_proxy: no_proxy.or(self.no_proxy),
+                ..self
+            },
         }
     }
 

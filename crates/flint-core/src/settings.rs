@@ -326,6 +326,63 @@ pub const DEFAULT_LOG_TOTAL_MIB: u32 = 512;
 /// The range [`Settings::log_total_bytes`] keeps the setting in, in MiB.
 pub const LOG_TOTAL_MIB_RANGE: std::ops::RangeInclusive<u32> = 64..=16_384;
 
+/// The proxy for cluster connections (`[proxy]`), for an app started from Finder or the Dock,
+/// which does not get `HTTPS_PROXY` and `NO_PROXY` from a shell profile. A cluster entry's own
+/// `proxy-url` still wins. Read once at startup: a change applies after a restart.
+///
+/// The URL can hold a password. Its `Debug` shows only the proxy's address, and
+/// [`ProxySetting::shown_url`] is what may be displayed.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProxySetting {
+    /// The proxy URL, `http://host:port` or `http://user:password@host:port`. Set, it replaces
+    /// `HTTPS_PROXY` and `NO_PROXY` from the environment.
+    pub url: Option<String>,
+    /// Servers reached without the proxy, as `NO_PROXY` lists them: host names, domains
+    /// (`.example.com` or `*.example.com`), IP addresses and CIDR ranges, each with an optional
+    /// `:port`, or `*` for all.
+    pub no_proxy: Vec<String>,
+}
+
+impl ProxySetting {
+    /// Whether nothing is set, so the environment decides alone.
+    pub fn is_empty(&self) -> bool {
+        self.url.as_deref().is_none_or(|u| u.trim().is_empty()) && self.no_proxy_list().is_none()
+    }
+
+    /// The URL as it may be shown and logged: scheme, host and port, never its credentials.
+    pub fn shown_url(&self) -> Option<String> {
+        let url = self.url.as_deref().filter(|u| !u.trim().is_empty())?;
+        Some(crate::connection::proxy::shown(url))
+    }
+
+    /// The no-proxy list as `NO_PROXY` would hold it, or None if it names nothing.
+    pub(crate) fn no_proxy_list(&self) -> Option<String> {
+        let entries: Vec<&str> = self
+            .no_proxy
+            .iter()
+            .map(|e| e.trim())
+            .filter(|e| !e.is_empty())
+            .collect();
+        (!entries.is_empty()).then(|| entries.join(","))
+    }
+
+    /// Uses this setting for this process's cluster connections. The first call wins: contexts
+    /// loaded under it are pinned to its route, so a later setting applies after a restart.
+    pub fn use_for_this_process(&self) {
+        crate::connection::proxy::use_setting(self);
+    }
+}
+
+impl std::fmt::Debug for ProxySetting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxySetting")
+            .field("url", &self.shown_url())
+            .field("no_proxy", &self.no_proxy)
+            .finish()
+    }
+}
+
 /// User settings from `settings.toml`. Unknown keys are ignored so newer files still load.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -406,6 +463,9 @@ pub struct Settings {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub cluster_alerts: Vec<ClusterAlerts>,
+    /// The proxy for cluster connections without a `proxy-url` of their own. Read at startup.
+    #[serde(skip_serializing_if = "ProxySetting::is_empty")]
+    pub proxy: ProxySetting,
 }
 
 impl Default for Settings {
@@ -430,6 +490,7 @@ impl Default for Settings {
             desktop_notifications: false,
             watched_clusters: Vec::new(),
             cluster_alerts: Vec::new(),
+            proxy: ProxySetting::default(),
         }
     }
 }
@@ -790,6 +851,7 @@ const SETTINGS_KEYS: &[&str] = &[
     "log_total_mib",
     "desktop_notifications",
     "cluster_alerts",
+    "proxy",
 ];
 
 /// The keys of `table` that are not settings but look like a misspelt one (at most two edits
