@@ -43,7 +43,7 @@ impl Workspace {
         fn editable(ws: &Workspace, _: &App) -> bool {
             ws.settings_page.open && ws.settings_page.saving.is_none()
         }
-        guards
+        let guards = guards
             .when::<CloseSettings>(open)
             .when::<ShowSettingsSection>(open)
             .when::<NextSettingsControl>(open)
@@ -54,11 +54,13 @@ impl Workspace {
             .when::<EditWatchMode>(editable)
             .when::<SaveSettings>(|ws, cx| ws.can_save_settings(cx))
             .when::<RevertSettings>(|ws, _| {
-                ws.settings_page.draft.is_dirty() && ws.settings_page.saving.is_none()
-            })
+                settings_view::can_revert(&ws.settings_page) && ws.settings_page.saving.is_none()
+            });
+        Self::logs_paths_guards(guards)
     }
 
     pub(in crate::ui) fn bind_settings_actions<B: Bind<Self>>(bind: B) -> B {
+        let bind = Self::bind_logs_paths_actions(bind);
         bind.bind::<OpenSettings>(|ws, _, window, cx| ws.open_settings(window, cx))
             .bind::<CloseSettings>(|ws, _, window, cx| ws.close_settings(window, cx))
             .bind::<ShowSettingsSection>(|ws, action, _, cx| {
@@ -75,8 +77,12 @@ impl Workspace {
             })
             .bind::<SaveSettings>(|ws, _, window, cx| ws.save_settings(None, window, cx))
             .bind::<RevertSettings>(|ws, _, _, cx| ws.revert_settings(cx))
-            .bind::<NextSettingsControl>(|ws, _, _, cx| ws.move_settings_cursor(true, cx))
-            .bind::<PreviousSettingsControl>(|ws, _, _, cx| ws.move_settings_cursor(false, cx))
+            .bind::<NextSettingsControl>(|ws, _, window, cx| {
+                ws.move_settings_cursor(true, window, cx)
+            })
+            .bind::<PreviousSettingsControl>(|ws, _, window, cx| {
+                ws.move_settings_cursor(false, window, cx)
+            })
             .bind::<ActivateSettingsControl>(|ws, _, window, cx| {
                 ws.activate_settings_control(window, cx)
             })
@@ -95,6 +101,7 @@ impl Workspace {
         self.settings_page.open = true;
         self.settings_page.opened_over = Some(self.main_key());
         self.settings_page.cursor = None;
+        self.ensure_settings_inputs(window, cx);
         window.focus(&self.settings_page.focus, cx);
         cx.notify();
     }
@@ -144,9 +151,9 @@ impl Workspace {
         self.model.read(cx).settings_error.is_some()
     }
 
-    fn can_save_settings(&self, cx: &App) -> bool {
+    pub(super) fn can_save_settings(&self, cx: &App) -> bool {
         self.settings_page.saving.is_none()
-            && settings_view::can_save(&self.settings_page.draft, self.settings_invalid(cx))
+            && settings_view::can_save(&self.settings_page, self.settings_invalid(cx))
     }
 
     fn show_settings_section(&mut self, section: settings_view::Section, cx: &mut Context<Self>) {
@@ -156,7 +163,7 @@ impl Workspace {
         }
     }
 
-    fn edit_settings(&mut self, change: Change, cx: &mut Context<Self>) {
+    pub(super) fn edit_settings(&mut self, change: Change, cx: &mut Context<Self>) {
         if !self.settings_page.open || self.settings_page.saving.is_some() {
             return;
         }
@@ -172,14 +179,38 @@ impl Workspace {
         }
         self.settings_page.draft.revert();
         self.settings_page.save_note = None;
+        // The fields show the file again, as the workspace next draws.
+        self.settings_page.logs_paths.errors.clear();
+        self.settings_page.logs_paths.kubeconfig_note = None;
+        self.settings_page.logs_paths.resync = true;
         cx.notify();
+    }
+
+    /// Saves the draft. A draft that turns local cluster protection off asks first
+    /// ([`Self::confirm_unprotect`]), whichever way Save was asked for: the button, the banner's
+    /// Save anyway, the keyboard, the palette, or the quit and close question.
+    fn save_settings(&mut self, then: Option<Then>, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_save_settings(cx) {
+            return;
+        }
+        if self.settings_page.draft.loosens_protection() {
+            self.confirm_unprotect(then, window, cx);
+            return;
+        }
+        self.write_settings_draft(then, window, cx);
     }
 
     /// Hands the edited fields, and only those, to the core. They stay in the draft until it
     /// answers: written, they leave it and `then` runs; refused, or unanswered within
     /// [`SAVE_WAIT`], they stay, the footer says why, and `then` does not run. Nothing happens
     /// without edits, while `settings.toml` is invalid, or while an earlier Save is pending.
-    fn save_settings(&mut self, then: Option<Then>, window: &mut Window, cx: &mut Context<Self>) {
+    /// Only [`Self::save_settings`] and a confirmed [`Self::confirm_unprotect`] call it.
+    pub(super) fn write_settings_draft(
+        &mut self,
+        then: Option<Then>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.can_save_settings(cx) {
             return;
         }
@@ -188,7 +219,7 @@ impl Workspace {
             .model
             .read(cx)
             .core()
-            .write_settings(writes.iter().map(|c| c.to_write()).collect());
+            .write_settings(writes.iter().map(|c| c.clone().into_write()).collect());
         let written = writes.clone();
         let answer = cx.spawn_in(window, async move |this, cx| {
             let result = reply.await;
@@ -196,7 +227,16 @@ impl Workspace {
                 ws.finish_save(&written, result, window, cx)
             });
         });
+        // A Save that changes local cluster protection is never given up on: the write could
+        // still land after the view had let the user take it back, leaving protection off
+        // against their last choice. Edits stay locked until the core answers.
+        let changes_protection = writes
+            .iter()
+            .any(|c| matches!(c, Change::ProtectLocalClusters(_)));
         let give_up = cx.spawn(async move |this, cx| {
+            if changes_protection {
+                return;
+            }
             cx.background_executor().timer(SAVE_WAIT).await;
             let _ = this.update(cx, |ws, cx| {
                 if ws.settings_page.saving.take().is_some() {
@@ -240,12 +280,16 @@ impl Workspace {
     }
 
     /// Moves the keyboard cursor to the next (or previous) control, round the view.
-    fn move_settings_cursor(&mut self, forward: bool, cx: &mut Context<Self>) {
+    fn move_settings_cursor(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !self.settings_page.open {
             return;
         }
         let banner = self.settings_banner_shown(cx);
-        let stops = settings_view::stops(self.settings_page.section, banner);
+        let shown = self
+            .settings_page
+            .draft
+            .shown(&self.model.read(cx).settings);
+        let stops = settings_view::stops(self.settings_page.section, banner, &shown);
         let at = self
             .settings_page
             .cursor
@@ -257,6 +301,7 @@ impl Workspace {
             (Some(i), false) => (i + stops.len() - 1) % stops.len(),
         };
         self.settings_page.cursor = Some(stops[next]);
+        self.focus_settings_stop(window, cx);
         cx.notify();
     }
 
@@ -277,6 +322,10 @@ impl Workspace {
                 self.edit_settings(Change::DesktopNotifications(!on), cx)
             }
             Stop::WatchMode(mode) => self.edit_settings(Change::WatchMode(mode), cx),
+            Stop::Text(_)
+            | Stop::RemoveKubeconfig(_)
+            | Stop::AddKubeconfig
+            | Stop::ProtectLocalClusters => self.activate_logs_paths_stop(stop, window, cx),
         }
     }
 
@@ -353,13 +402,18 @@ impl Workspace {
             return true;
         }
         let invalid = self.settings_invalid(cx);
+        let fields_invalid = !self.settings_page.logs_paths.errors.is_empty();
         let workspace = cx.weak_entity();
-        if invalid {
+        if invalid || fields_invalid {
+            let why = if invalid {
+                "settings.toml is invalid"
+            } else {
+                "a field in Settings has a value that cannot be saved"
+            };
             let text = DialogText {
                 title: "Discard unsaved settings?".into(),
                 text: format!(
-                    "settings.toml is invalid, so your edits in Settings cannot be saved. \
-                     {ending} discards them."
+                    "{why}, so your edits in Settings cannot be saved. {ending} discards them."
                 ),
                 ok: "Discard".into(),
                 cancel: "Cancel".into(),

@@ -62,6 +62,18 @@ pub struct SettingsState {
     pub appearance: &'static str,
     pub desktop_notifications: bool,
     pub watch_mode: &'static str,
+    pub log_buffer_lines: u32,
+    pub log_buffer_mib: u32,
+    pub log_total_mib: u32,
+    pub kubeconfig_paths: Vec<String>,
+    pub path: Option<String>,
+    pub helm: Option<String>,
+    pub protect_local_clusters: bool,
+    /// Why a text field's value cannot be saved, by the field's element id. Save is disabled
+    /// while any is set.
+    pub field_errors: std::collections::BTreeMap<&'static str, String>,
+    /// Why the last kubeconfig file could not be added.
+    pub kubeconfig_note: Option<String>,
     /// The file changed under the draft: the Reload / Save anyway banner.
     pub changed_on_disk: bool,
     /// `settings.toml` cannot be read; Save is disabled.
@@ -119,7 +131,7 @@ pub struct SetCardState {
     /// The name the card shows.
     pub shown: String,
     pub tag: Option<flint_core::settings::ClusterTag>,
-    /// `live`, `partial`, `waiting`, `not_watched`, `unavailable` or `blocked`.
+    /// `live`, `partial`, `waiting`, `unavailable` or `blocked`.
     pub state: &'static str,
     /// What the card says about its state, if anything.
     pub note: Option<String>,

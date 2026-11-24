@@ -1326,21 +1326,43 @@ pub fn set_desktop_notifications(dir: &Path, enabled: bool) -> Result<Settings, 
 
 /// One global setting, written on its own through its setter: what the app's Settings view
 /// saves ([`crate::CoreHandle::write_settings`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsWrite {
     Appearance(Appearance),
     DesktopNotifications(bool),
     /// The global watch mode, not a cluster's override.
     WatchMode(WatchMode),
+    /// Lines each log session keeps, within [`LOG_BUFFER_LINES_RANGE`].
+    LogBufferLines(u32),
+    /// MiB each log session keeps, within [`LOG_BUFFER_MIB_RANGE`].
+    LogBufferMib(u32),
+    /// MiB all log sessions keep together, within [`LOG_TOTAL_MIB_RANGE`].
+    LogTotalMib(u32),
+    /// The extra kubeconfig files, in order; empty removes the key.
+    KubeconfigPaths(Vec<PathBuf>),
+    /// The `PATH` override; `None` uses the login shell's.
+    Path(Option<String>),
+    /// The `helm` binary; `None` finds it on `PATH`.
+    Helm(Option<PathBuf>),
+    /// Whether known local clusters are protected too. Turning it off needs a real file lock
+    /// ([`set_protect_local_clusters`]).
+    ProtectLocalClusters(bool),
 }
 
 impl SettingsWrite {
     /// What it changes, for an error message.
-    pub fn what(self) -> &'static str {
+    pub fn what(&self) -> &'static str {
         match self {
             SettingsWrite::Appearance(_) => "the appearance",
             SettingsWrite::DesktopNotifications(_) => "desktop notifications",
             SettingsWrite::WatchMode(_) => "the watch mode",
+            SettingsWrite::LogBufferLines(_) => "the log buffer size",
+            SettingsWrite::LogBufferMib(_) => "the log buffer memory",
+            SettingsWrite::LogTotalMib(_) => "the total log memory",
+            SettingsWrite::KubeconfigPaths(_) => "the kubeconfig paths",
+            SettingsWrite::Path(_) => "the PATH override",
+            SettingsWrite::Helm(_) => "the helm path",
+            SettingsWrite::ProtectLocalClusters(_) => "local cluster protection",
         }
     }
 
@@ -1350,6 +1372,13 @@ impl SettingsWrite {
             SettingsWrite::Appearance(a) => set_appearance(dir, a),
             SettingsWrite::DesktopNotifications(on) => set_desktop_notifications(dir, on),
             SettingsWrite::WatchMode(m) => set_watch_mode(dir, None, Some(m)),
+            SettingsWrite::LogBufferLines(lines) => set_log_buffer_lines(dir, lines),
+            SettingsWrite::LogBufferMib(mib) => set_log_buffer_mib(dir, mib),
+            SettingsWrite::LogTotalMib(mib) => set_log_total_mib(dir, mib),
+            SettingsWrite::KubeconfigPaths(paths) => set_kubeconfig_paths(dir, &paths),
+            SettingsWrite::Path(path) => set_path_override(dir, path.as_deref()),
+            SettingsWrite::Helm(helm) => set_helm(dir, helm.as_deref()),
+            SettingsWrite::ProtectLocalClusters(on) => set_protect_local_clusters(dir, on),
         }
     }
 }
@@ -1397,25 +1426,159 @@ pub fn set_cluster_alerts(
     })
 }
 
-/// Sets the lines each log session keeps and writes `settings.toml`. Returns the settings as
-/// written.
+/// Sets the lines each log session keeps and writes `settings.toml`. A value outside
+/// [`LOG_BUFFER_LINES_RANGE`] is refused, not clamped. Returns the settings as written.
 pub fn set_log_buffer_lines(dir: &Path, lines: u32) -> Result<Settings, SettingsError> {
+    set_bounded(dir, "log_buffer_lines", lines, LOG_BUFFER_LINES_RANGE)
+}
+
+/// Sets the MiB of memory each log session's lines may take and writes `settings.toml`. A value
+/// outside [`LOG_BUFFER_MIB_RANGE`] is refused. Returns the settings as written.
+pub fn set_log_buffer_mib(dir: &Path, mib: u32) -> Result<Settings, SettingsError> {
+    set_bounded(dir, "log_buffer_mib", mib, LOG_BUFFER_MIB_RANGE)
+}
+
+/// Sets the MiB of memory all log sessions together may take and writes `settings.toml`. A value
+/// outside [`LOG_TOTAL_MIB_RANGE`] is refused. Returns the settings as written.
+pub fn set_log_total_mib(dir: &Path, mib: u32) -> Result<Settings, SettingsError> {
+    set_bounded(dir, "log_total_mib", mib, LOG_TOTAL_MIB_RANGE)
+}
+
+/// Writes `key = value` once `value` is within `range`.
+fn set_bounded(
+    dir: &Path,
+    key: &'static str,
+    value: u32,
+    range: std::ops::RangeInclusive<u32>,
+) -> Result<Settings, SettingsError> {
+    if !range.contains(&value) {
+        return Err(SettingsError::Invalid {
+            path: dir.join(SETTINGS_FILE),
+            reason: format!(
+                "{key} must be from {} to {}, not {value}",
+                range.start(),
+                range.end()
+            ),
+        });
+    }
     edit_settings(dir, |table, _| {
-        table.insert(
-            "log_buffer_lines".into(),
-            toml::Value::Integer(lines.into()),
-        );
+        table.insert(key.into(), toml::Value::Integer(value.into()));
         Ok(())
     })
 }
 
-/// Sets the MiB of memory each log session's lines may take and writes `settings.toml`. Returns
-/// the settings as written.
-pub fn set_log_buffer_mib(dir: &Path, mib: u32) -> Result<Settings, SettingsError> {
+/// Whether `path` may be stored as a path setting: absolute, or under the home folder as `~/…`
+/// (or `~` itself), which Flint expands.
+pub fn is_storable_path(path: &Path) -> bool {
+    path.is_absolute() || path.starts_with("~")
+}
+
+/// Sets the extra kubeconfig files and writes `settings.toml`; an empty list removes the key.
+/// Each must be absolute or start with `~`, and none may be listed twice. The clusters reload as
+/// after a hand edit. Returns the settings as written.
+pub fn set_kubeconfig_paths(dir: &Path, paths: &[PathBuf]) -> Result<Settings, SettingsError> {
+    let invalid = |reason: String| SettingsError::Invalid {
+        path: dir.join(SETTINGS_FILE),
+        reason,
+    };
+    if let Some(bad) = paths.iter().find(|p| !is_storable_path(p)) {
+        return Err(invalid(format!(
+            "kubeconfig path {} must be absolute or start with ~",
+            bad.display()
+        )));
+    }
+    if let Some(twice) = paths
+        .iter()
+        .enumerate()
+        .find_map(|(i, p)| paths[..i].contains(p).then_some(p))
+    {
+        return Err(invalid(format!(
+            "kubeconfig path {} is listed twice",
+            twice.display()
+        )));
+    }
     edit_settings(dir, |table, _| {
-        table.insert("log_buffer_mib".into(), toml::Value::Integer(mib.into()));
+        if paths.is_empty() {
+            table.remove("kubeconfig_paths");
+        } else {
+            table.insert(
+                "kubeconfig_paths".into(),
+                toml::Value::try_from(paths.to_vec())?,
+            );
+        }
         Ok(())
     })
+}
+
+/// Sets the `PATH` override and writes `settings.toml`; `None` removes it. Every entry must be an
+/// absolute folder: an empty or relative one would run programs from wherever Flint's working
+/// folder is. Applies after a restart. Returns the settings as written.
+pub fn set_path_override(dir: &Path, path: Option<&str>) -> Result<Settings, SettingsError> {
+    if let Some(path) = path
+        && let Some(bad) = path
+            .split(':')
+            .find(|entry| !Path::new(entry).is_absolute())
+    {
+        return Err(SettingsError::Invalid {
+            path: dir.join(SETTINGS_FILE),
+            reason: format!("every PATH entry must be an absolute folder, not \"{bad}\""),
+        });
+    }
+    edit_settings(dir, |table, _| {
+        match path {
+            Some(path) => table.insert("path".into(), toml::Value::String(path.to_owned())),
+            None => table.remove("path"),
+        };
+        Ok(())
+    })
+}
+
+/// Sets the `helm` binary and writes `settings.toml`; `None` removes it, so `helm` is found on
+/// `PATH`. It must be absolute or start with `~`. Returns the settings as written.
+pub fn set_helm(dir: &Path, helm: Option<&Path>) -> Result<Settings, SettingsError> {
+    if let Some(helm) = helm
+        && !is_storable_path(helm)
+    {
+        return Err(SettingsError::Invalid {
+            path: dir.join(SETTINGS_FILE),
+            reason: format!("helm {} must be absolute or start with ~", helm.display()),
+        });
+    }
+    edit_settings(dir, |table, _| {
+        match helm {
+            Some(helm) => table.insert("helm".into(), toml::Value::try_from(helm)?),
+            None => table.remove("helm"),
+        };
+        Ok(())
+    })
+}
+
+/// Turns protection of known local clusters on or off and writes `settings.toml`. Returns the
+/// settings as written.
+///
+/// Turning it on is a revocation, and goes through even where file locks are unsupported.
+/// Turning it off loosens the write gate, so it refuses without a real lock rather than risk
+/// overwriting a concurrent save. The app asks for confirmation before it sends that.
+pub fn set_protect_local_clusters(dir: &Path, on: bool) -> Result<Settings, SettingsError> {
+    set_protect_local_clusters_with(dir, on, try_flock)
+}
+
+fn set_protect_local_clusters_with(
+    dir: &Path,
+    on: bool,
+    try_lock: TryLock,
+) -> Result<Settings, SettingsError> {
+    let edit = |table: &mut toml::Table, _: &Path| {
+        table.insert("protect_local_clusters".into(), toml::Value::Boolean(on));
+        Ok(true)
+    };
+    if on {
+        let path = dir.join(SETTINGS_FILE);
+        let lock = lock_for_save(&path, try_lock)?;
+        edit_locked(&path, &lock, edit)
+    } else {
+        edit_settings_locked_with(dir, try_lock, edit)
+    }
 }
 
 /// Reads `settings.toml`, lets `edit` change it as a TOML table, checks the result still parses
@@ -2749,6 +2912,112 @@ mod tests {
         assert_eq!(load_settings(dir.path()).unwrap(), written);
     }
 
+    // covers UP-127: the Settings view's log limits are refused out of range, never clamped into
+    // the file, and each edge of the range is written.
+    #[test]
+    fn log_setters_refuse_values_out_of_range() {
+        let dir = tempfile::tempdir().unwrap();
+        type Setter = fn(&Path, u32) -> Result<Settings, SettingsError>;
+        let setters: [(Setter, _); 3] = [
+            (set_log_buffer_lines, LOG_BUFFER_LINES_RANGE),
+            (set_log_buffer_mib, LOG_BUFFER_MIB_RANGE),
+            (set_log_total_mib, LOG_TOTAL_MIB_RANGE),
+        ];
+        for (set, range) in setters.clone() {
+            for bad in [range.start() - 1, range.end() + 1] {
+                let refused = set(dir.path(), bad);
+                assert!(
+                    matches!(refused, Err(SettingsError::Invalid { .. })),
+                    "{bad}: {refused:?}"
+                );
+                assert!(!dir.path().join(SETTINGS_FILE).exists(), "nothing written");
+            }
+        }
+        for (set, range) in setters.clone() {
+            set(dir.path(), *range.start()).unwrap();
+            set(dir.path(), *range.end()).unwrap();
+        }
+        let written = load_settings(dir.path()).unwrap();
+        assert_eq!(written.log_buffer_lines, 1_000_000);
+        assert_eq!(written.log_buffer_mib, 1024);
+        assert_eq!(written.log_total_mib, 16_384);
+    }
+
+    // covers UP-127
+    #[test]
+    fn kubeconfig_paths_are_written_checked_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SETTINGS_FILE), "watch_mode = \"on_view\"\n").unwrap();
+        let paths = vec![
+            PathBuf::from("~/extra/config"),
+            PathBuf::from("/abs/config"),
+        ];
+        let written = set_kubeconfig_paths(dir.path(), &paths).unwrap();
+        assert_eq!(written.kubeconfig_paths, paths);
+        assert_eq!(written.watch_mode, WatchMode::OnView);
+        assert_eq!(load_settings(dir.path()).unwrap(), written);
+
+        for bad in [
+            vec![PathBuf::from("relative/config")],
+            vec![PathBuf::from("/a"), PathBuf::from("/a")],
+        ] {
+            assert!(matches!(
+                set_kubeconfig_paths(dir.path(), &bad),
+                Err(SettingsError::Invalid { .. })
+            ));
+        }
+        assert_eq!(load_settings(dir.path()).unwrap().kubeconfig_paths, paths);
+
+        set_kubeconfig_paths(dir.path(), &[]).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
+        assert!(!text.contains("kubeconfig_paths"), "{text}");
+    }
+
+    // covers UP-127: PATH entries must be absolute folders; helm absolute or under `~`. `None`
+    // removes either, so the default applies.
+    #[test]
+    fn path_and_helm_are_checked_and_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = set_path_override(dir.path(), Some("/opt/bin:/usr/bin")).unwrap();
+        assert_eq!(written.path.as_deref(), Some("/opt/bin:/usr/bin"));
+        for bad in ["bin:/usr/bin", "/usr/bin::/bin", "~/bin"] {
+            assert!(
+                matches!(
+                    set_path_override(dir.path(), Some(bad)),
+                    Err(SettingsError::Invalid { .. })
+                ),
+                "{bad}"
+            );
+        }
+        let written = set_helm(dir.path(), Some(Path::new("~/bin/helm"))).unwrap();
+        assert_eq!(written.helm.as_deref(), Some(Path::new("~/bin/helm")));
+        assert!(set_helm(dir.path(), Some(Path::new("helm"))).is_err());
+
+        set_path_override(dir.path(), None).unwrap();
+        let written = set_helm(dir.path(), None).unwrap();
+        assert_eq!(written.path, None);
+        assert_eq!(written.helm, None);
+        let text = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
+        assert!(!text.contains("path") && !text.contains("helm"), "{text}");
+    }
+
+    // covers UP-127: protecting local clusters is a revocation and goes through without file
+    // locks; unprotecting them loosens the write gate and is refused without a real lock.
+    #[test]
+    fn protect_local_clusters_needs_a_lock_only_to_turn_off() {
+        let no_lock: TryLock = |_| Err(io::Error::from_raw_os_error(libc::ENOLCK));
+        let dir = tempfile::tempdir().unwrap();
+        let on = set_protect_local_clusters_with(dir.path(), true, no_lock).unwrap();
+        assert!(on.protect_local_clusters);
+        let refused = set_protect_local_clusters_with(dir.path(), false, no_lock);
+        assert!(matches!(refused, Err(SettingsError::Write { .. })));
+        assert!(load_settings(dir.path()).unwrap().protect_local_clusters);
+
+        let off = set_protect_local_clusters(dir.path(), false).unwrap();
+        assert!(!off.protect_local_clusters);
+        assert_eq!(load_settings(dir.path()).unwrap(), off);
+    }
+
     // covers UP-12
     #[test]
     fn parses_all_fields_and_ignores_unknown_keys() {
@@ -3641,6 +3910,20 @@ server = "https://staging.example:6443"
                 set_log_buffer_lines(dir, 5000).is_err(),
             ),
             ("set_log_buffer_mib", set_log_buffer_mib(dir, 8).is_err()),
+            ("set_log_total_mib", set_log_total_mib(dir, 64).is_err()),
+            (
+                "set_kubeconfig_paths",
+                set_kubeconfig_paths(dir, &[PathBuf::from("/k")]).is_err(),
+            ),
+            (
+                "set_path_override",
+                set_path_override(dir, Some("/bin")).is_err(),
+            ),
+            ("set_helm", set_helm(dir, Some(Path::new("/h"))).is_err()),
+            (
+                "set_protect_local_clusters",
+                set_protect_local_clusters(dir, false).is_err(),
+            ),
         ]
     }
 

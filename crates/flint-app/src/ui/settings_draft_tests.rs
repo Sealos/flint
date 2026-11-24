@@ -142,15 +142,60 @@ fn an_edit_stays_until_the_core_says_it_is_written() {
 fn changes_map_to_the_core_writes() {
     use flint_core::settings::SettingsWrite;
     assert_eq!(
-        Change::Appearance(Appearance::Dark).to_write(),
+        Change::Appearance(Appearance::Dark).into_write(),
         SettingsWrite::Appearance(Appearance::Dark)
     );
     assert_eq!(
-        Change::DesktopNotifications(true).to_write(),
+        Change::DesktopNotifications(true).into_write(),
         SettingsWrite::DesktopNotifications(true)
     );
     assert_eq!(
-        Change::WatchMode(WatchMode::OnView).to_write(),
+        Change::WatchMode(WatchMode::OnView).into_write(),
         SettingsWrite::WatchMode(WatchMode::OnView)
     );
+}
+
+// covers UP-127: only an edit that turns protection off loosens it; turning it back on leaves
+// nothing to confirm.
+#[test]
+fn only_turning_protection_off_loosens_it() {
+    let protected = Arc::new(Settings {
+        protect_local_clusters: true,
+        ..Settings::default()
+    });
+    let mut draft = SettingsDraft::default();
+    draft.edit(Change::LogBufferLines(5_000), &protected);
+    assert!(!draft.loosens_protection());
+    draft.edit(Change::ProtectLocalClusters(false), &protected);
+    assert!(draft.loosens_protection());
+    assert!(!draft.shown(&protected).protect_local_clusters);
+    draft.edit(Change::ProtectLocalClusters(true), &protected);
+    assert!(!draft.loosens_protection());
+    assert!(!draft.is_edited(Field::ProtectLocalClusters));
+
+    let mut draft = SettingsDraft::default();
+    draft.edit(Change::ProtectLocalClusters(true), &file());
+    assert!(!draft.loosens_protection(), "turning it on is no loosening");
+    assert_eq!(
+        Change::ProtectLocalClusters(false).into_write(),
+        flint_core::settings::SettingsWrite::ProtectLocalClusters(false)
+    );
+}
+
+#[test]
+fn forget_drops_one_field_and_the_base_with_the_last() {
+    let file = file();
+    let mut draft = SettingsDraft::default();
+    draft.edit(Change::LogBufferMib(32), &file);
+    draft.edit(Change::Helm(Some("/opt/helm".into())), &file);
+    draft.forget(Field::LogBufferMib);
+    assert!(!draft.is_edited(Field::LogBufferMib));
+    assert!(draft.is_edited(Field::Helm));
+    draft.forget(Field::Helm);
+    assert!(!draft.is_dirty());
+    let other = Settings {
+        appearance: Appearance::Dark,
+        ..Settings::default()
+    };
+    assert!(!draft.changed_on_disk(&other), "no draft, no banner");
 }

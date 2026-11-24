@@ -3866,6 +3866,7 @@ impl Render for Workspace {
         self.sync_namespace_picker_with_dialog(window, cx);
         self.close_finished_held_edit(window, cx);
         self.settings_follow_main();
+        self.sync_settings_fields(window, cx);
         let window_width = f32::from(window.viewport_size().width);
         let window_height = f32::from(window.viewport_size().height);
         self.sync_narrow_layout(window_width, window, cx);
@@ -4074,6 +4075,9 @@ pub(in crate::ui) mod problems;
 
 #[path = "workspace_settings.rs"]
 mod settings_entry;
+
+#[path = "workspace_settings_logs_paths.rs"]
+mod settings_logs_paths;
 
 #[path = "workspace_sets.rs"]
 mod sets;
