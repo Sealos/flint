@@ -1359,9 +1359,11 @@ impl Workspace {
         let server = member.server().to_owned();
         // Every read this view makes is bound to the member, in the core.
         let core = self.model.read(cx).core().bound_to(member);
+        let guards = crate::ui::write_binding::ConnectionGuards::new(&self.model);
         let detail = cx.new(|cx| {
             let mut view = DetailView::new(core, object, tab, window, cx);
             view.set_row_cluster(shown, server, cx);
+            view.set_connection_guards(guards);
             view
         });
         self._detail_subscriptions = vec![cx.subscribe_in(
@@ -1378,7 +1380,9 @@ impl Workspace {
                     this.open_shell(request.clone(), focus, window, cx)
                 }
                 DetailEvent::Refused(why) => this.refuse(why.clone(), cx),
-                DetailEvent::ConfirmWrite(review) => this.confirm_detail_write(review, window, cx),
+                DetailEvent::ConfirmWrite(review, reviewed_on) => {
+                    this.confirm_detail_write(review, reviewed_on.clone(), window, cx)
+                }
             },
         )];
         self.detail = Some(detail);
