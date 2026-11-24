@@ -465,7 +465,7 @@ impl DetailView {
     pub(in crate::ui) fn forward_check<A: Action>(&self) -> Result<(), ActionError> {
         if self.forward_target().is_none() {
             return Err(ActionError::rejected::<A>(
-                "a port-forward reaches a pod or a service",
+                "a port forward reaches a pod or a service",
             ));
         }
         if self.object.kind == KindId::pods()
