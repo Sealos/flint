@@ -281,6 +281,8 @@ pub struct Workspace {
     /// A right-click selected a row whose detail has not opened yet: the list stays in front
     /// when it does.
     menu_row_pending: bool,
+    /// The detail pane, when it outlived its list to keep an edit.
+    held_edit: Option<unapplied::HeldEdit>,
     /// What last had focus in the list or the detail with no dialog open, and the layout that
     /// hides it: a dialog gives focus back to it, though it may have been hidden meanwhile.
     pane_focus: Option<(WeakFocusHandle, MainPanes)>,
@@ -473,6 +475,7 @@ impl Workspace {
             list_in_front: false,
             right_press: false,
             menu_row_pending: false,
+            held_edit: None,
             pane_focus: None,
             dock,
             palette: None,
@@ -733,7 +736,9 @@ impl Workspace {
         let opening = match &key {
             TabKey::Logs(_) => Opening::ReconnectLogs,
             TabKey::Shell(_) => Opening::RestartShell,
-            TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Helm(_) => return,
+            TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Forwards(_) | TabKey::Helm(_) => {
+                return;
+            }
         };
         let check = self.model.read(cx).core().check_member(&member);
         self.sets.restart = cx.spawn_in(window, async move |this, cx| {
@@ -761,7 +766,9 @@ impl Workspace {
             TabKey::Logs(_) => Opening::ReconnectLogs,
             TabKey::Shell(_) => Opening::RestartShell,
             // Runs no session to start again.
-            TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Helm(_) => return,
+            TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Forwards(_) | TabKey::Helm(_) => {
+                return;
+            }
         };
         if let Some(reason) = self.sessions_blocked(key.context(), cx) {
             self.refuse(refused(opening, &reason), cx);
@@ -799,7 +806,10 @@ impl Workspace {
                         DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
                     }
                     // It returned above: an activity tab has no session to start again.
-                    TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Helm(_) => {
+                    TabKey::Activity(_)
+                    | TabKey::Compare(..)
+                    | TabKey::Forwards(_)
+                    | TabKey::Helm(_) => {
                         unreachable!("these tabs do not restart")
                     }
                 },
@@ -916,6 +926,8 @@ impl Workspace {
             TabKey::Shell(_) | TabKey::Helm(_) => summary.map_or(0, |c| c.definition),
             TabKey::Logs(_) => summary.map_or(0, |c| c.endpoint),
             TabKey::Activity(_) | TabKey::Compare(..) => 0,
+            // Pinned like a shell: the core ends a forward on the same changes.
+            TabKey::Forwards(_) => summary.map_or(0, |c| c.definition),
         };
         TabCluster::new(context, self.shown_server(context, cx).as_deref()).defined_by(definition)
     }
@@ -971,6 +983,10 @@ impl Workspace {
                 .cluster_summary(&cluster, cx)
                 .and_then(|c| c.info.server.clone()),
         };
+        // `None` for a context that is gone; an unconfirmed one says nothing yet.
+        let endpoint = self
+            .cluster_summary(&cluster, cx)
+            .map(|c| c.confirmed.then_some(c.endpoint));
         let (connection, unsettled) =
             self.cluster_summary(&cluster, cx)
                 .map_or((None, false), |c| {
@@ -984,6 +1000,11 @@ impl Workspace {
             d.set_protected(protected, label, cx);
             d.set_row_writes_paused(writes_paused, cx);
             d.set_server(server);
+            match endpoint {
+                Some(Some(endpoint)) => d.note_endpoint(endpoint, cx),
+                Some(None) => {}
+                None => d.note_context_gone(cx),
+            }
             d.set_access_connection(connection, unsettled, cx);
         });
     }
@@ -1016,11 +1037,15 @@ impl Workspace {
         };
         let begin = {
             let (key, detail) = (key.clone(), detail.clone());
-            move |cx: &mut App| match resource_actions::claim(
-                &key,
-                resource_actions::RunningWrite::YamlEdit,
-                cx,
-            ) {
+            // A context moved under the open confirmation stays refused even if it came back.
+            move |cx: &mut App| match match detail
+                .read_with(cx, |d, _| d.edit_moved_refusal())
+                .ok()
+                .flatten()
+            {
+                Some(why) => Err(why),
+                None => resource_actions::claim(&key, resource_actions::RunningWrite::YamlEdit, cx),
+            } {
                 Ok(()) => {
                     let _ = detail.update(cx, |d, cx| d.edit_applying(cx));
                     true
@@ -1299,9 +1324,8 @@ impl Workspace {
         self.clear_action_error(cx);
         self.leave_set(cx);
         self.list = None;
-        self.detail = None;
+        self.drop_pane_unless_edited(cx);
         self._list_subscriptions.clear();
-        self._detail_subscriptions.clear();
         if self.dashboard.take().is_some() {
             self.nav.update(cx, |nav, cx| nav.set_overview(false, cx));
         }
@@ -1379,6 +1403,9 @@ impl Workspace {
                 let focus = view.read(cx).focus_handle(cx);
                 window.focus(&focus, cx);
             }
+            return;
+        }
+        if self.asks_before_leaving(window, cx, |ws, window, cx| ws.open_dashboard(window, cx)) {
             return;
         }
         // Any place other than the list shown: the overview is not one Go Back returns to.
@@ -1528,6 +1555,15 @@ impl Workspace {
     ) {
         match event {
             ListEvent::Selected(None) => {
+                if self.unapplied_edit(cx).is_some() {
+                    if list.update(cx, |list, cx| list.undo_selection(cx)) {
+                        let list = list.clone();
+                        self.asks_before_leaving(window, cx, move |_, _, cx| {
+                            list.update(cx, |list, cx| list.clear_selection(cx));
+                        });
+                    }
+                    return;
+                }
                 self.menu_row_pending = false;
                 self.clear_action_error(cx);
                 self.detail = None;
@@ -1538,11 +1574,11 @@ impl Workspace {
                 release_unfocused_input(window, cx);
             }
             ListEvent::Selected(Some(selected)) => {
-                let list = list.read(cx);
+                let rows = list.read(cx);
                 let object = ObjectRef {
-                    cluster: list.cluster().to_owned(),
-                    kind: list.kind().clone(),
-                    kind_label: list.label().to_owned(),
+                    cluster: rows.cluster().to_owned(),
+                    kind: rows.kind().clone(),
+                    kind_label: rows.label().to_owned(),
                     namespace: selected.namespace.clone(),
                     name: selected.name.clone(),
                     uid: selected.uid.clone(),
@@ -1552,6 +1588,15 @@ impl Workspace {
                     .as_ref()
                     .is_some_and(|d| *d.read(cx).object() == object)
                 {
+                    return;
+                }
+                if self.unapplied_edit(cx).is_some() {
+                    if list.update(cx, |list, cx| list.undo_selection(cx)) {
+                        let (list, wanted) = (list.clone(), selected.clone());
+                        self.asks_before_leaving(window, cx, move |_, window, cx| {
+                            list.update(cx, |list, cx| list.reselect(&wanted, window, cx));
+                        });
+                    }
                     return;
                 }
                 // Moving between rows keeps the tab the user was on.
@@ -1573,16 +1618,11 @@ impl Workspace {
                     }
                     detail
                 });
-                let list = self.list.clone();
                 self._detail_subscriptions =
                     vec![
                         cx.subscribe_in(&detail, window, move |this, _, event, window, cx| {
                             match event {
-                                DetailEvent::Close => {
-                                    if let Some(list) = &list {
-                                        list.update(cx, |list, cx| list.clear_selection(cx));
-                                    }
-                                }
+                                DetailEvent::Close => this.close_detail(window, cx),
                                 DetailEvent::OpenLogs(request, focus) => {
                                     let focus = takes_focus(focus, window, cx);
                                     this.open_logs(request.clone(), focus, window, cx)
@@ -2203,7 +2243,7 @@ impl Workspace {
         let keep_watching = self
             .dashboard
             .is_some()
-            .then(|| self.render_keep_watching(&name, cx));
+            .then(|| self.render_keep_watching(&name, None, cx));
         let alerts = super::alert_center::render_button(cx);
         let first_row = super::theme::moves_window(h_flex())
             .h(px(HEADER_HEIGHT))
@@ -2269,7 +2309,13 @@ impl Workspace {
     }
 
     /// The overview's keep-watching toggle, saying what it would do and any state to act on.
-    fn render_keep_watching(&self, cluster: &str, cx: &Context<Self>) -> impl IntoElement {
+    /// `member` names a set member's copy of it, which needs ids of its own.
+    pub(super) fn render_keep_watching(
+        &self,
+        cluster: &str,
+        member: Option<&str>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let model = self.model.read(cx);
         let (status, sign_in) = model
             .keep_watching(cluster)
@@ -2277,7 +2323,7 @@ impl Workspace {
                 (view.status, view.sign_in)
             });
         let settings_ok = model.settings_error.is_none();
-        Button::new("keep-watching")
+        Button::new(member_id("keep-watching", member))
             .xsmall()
             .ghost()
             .label(keep_watching::toggle_label(status, sign_in))
@@ -2297,6 +2343,20 @@ impl Workspace {
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
         self.dashboard.as_ref()?;
+        self.background_sign_in_row(cluster, None, None, theme, cx)
+    }
+
+    /// The background sign-in toggle of `cluster` and the command it names, after `lead`.
+    /// `member` names a set member's copy of it, which needs ids of its own. None for a
+    /// credential that runs nothing.
+    pub(super) fn background_sign_in_row(
+        &self,
+        cluster: &str,
+        member: Option<&str>,
+        lead: Option<AnyElement>,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
         let view = self.model.read(cx).keep_watching(cluster)?.clone();
         if view.sign_in == BackgroundSignIn::NotNeeded {
             return None;
@@ -2306,7 +2366,7 @@ impl Workspace {
         let model = self.model.clone();
         let name = cluster.to_owned();
         let shown = view.shown_sign_in;
-        let toggle = Switch::new("background-sign-in")
+        let toggle = Switch::new(member_id("background-sign-in", member))
             .small()
             .checked(view.sign_in == BackgroundSignIn::On)
             .disabled(!enabled)
@@ -2325,7 +2385,7 @@ impl Workspace {
             });
         let command = view.command.map(|command| {
             div()
-                .id("background-sign-in-command")
+                .id(member_id("background-sign-in-command", member))
                 .min_w_0()
                 .truncate()
                 .text_xs()
@@ -2336,7 +2396,7 @@ impl Workspace {
         });
         Some(
             h_flex()
-                .id("background-sign-in-row")
+                .id(member_id("background-sign-in-row", member))
                 .w_full()
                 .flex_none()
                 .px_3()
@@ -2344,6 +2404,7 @@ impl Workspace {
                 .gap_3()
                 .border_b_1()
                 .border_color(theme.border)
+                .children(lead)
                 .child(div().flex_none().child(toggle))
                 .children(command)
                 .test_support()
@@ -2805,6 +2866,18 @@ impl Workspace {
         if let Some(set_view) = self.render_set_view(window_width, theme, cx) {
             return set_view;
         }
+        if let Some(detail) = self.edit_shown_alone(cx) {
+            return div()
+                .id("held-edit-pane")
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .relative()
+                .child(detail)
+                .children(self.detail_tag_strip(theme, cx))
+                .test_support()
+                .into_any_element();
+        }
         let model = self.model.read(cx);
         if model.loaded && model.clusters.is_empty() {
             let text = no_contexts_text(
@@ -3032,6 +3105,14 @@ pub(super) fn protection_text(
 /// A cluster as its row's controls name it: the title, then the full context when the title is
 /// not the context, since two contexts can share a title. The context is quoted and escaped, so
 /// no context or title can be written to read as another cluster's name.
+/// `base`, or for a set member's copy of a control, `base-<member>`.
+fn member_id(base: &'static str, member: Option<&str>) -> SharedString {
+    match member {
+        Some(member) => format!("{base}-{member}").into(),
+        None => base.into(),
+    }
+}
+
 fn control_name(title: &str, context: &str) -> String {
     let shown = flint_core::display::single_line(title);
     if title == context && !context.contains('"') {
@@ -3255,10 +3336,10 @@ fn render_lock_button(
     )
 }
 
-/// A server URL as the UI shows it ([`flint_core::redact::server_url`]), or "no server". Pins
-/// are compared on the exact URL, never on this text.
+/// A server as the UI shows it, by its origin ([`flint_core::redact::server_origin`]: no path),
+/// or "no server". Pins are compared on the exact URL, never on this text.
 pub(super) fn server_text(server: Option<&str>) -> String {
-    server.map_or("no server".to_owned(), flint_core::redact::server_url)
+    server.map_or("no server".to_owned(), flint_core::redact::server_origin)
 }
 
 /// The main area's notice that the active context moved. Servers are sanitized and kept on one
@@ -3325,7 +3406,7 @@ fn confirm_unlock(
 /// title calls it ([`ClusterNames::with_real`]).
 fn unlock_dialog(shown: &str, context: &str, server: &str) -> DialogText {
     let context = flint_core::display::single_line(context);
-    let server = flint_core::redact::server_url(server);
+    let server = flint_core::redact::server_origin(server);
     DialogText {
         title: format!("Unlock {shown}?"),
         text: format!(
@@ -3363,7 +3444,7 @@ fn confirm_trust(
 fn trust_dialog(shown: &str, context: &str, server: &str, previous: Option<&str>) -> DialogText {
     let context = flint_core::display::single_line(context);
     let previous = previous.map(|previous| previous_address(server, previous));
-    let server = flint_core::redact::server_url(server);
+    let server = flint_core::redact::server_origin(server);
     let mut text = format!("Context: {context}\nServer: {server}\n\n");
     if let Some(previous) = previous {
         text.push_str(&format!(
@@ -3439,7 +3520,7 @@ fn confirm_expose(
 /// Enter goes back to the pickers: only the button accepts it.
 fn broaden_dialog(context: &str, server: &str, added: &[String], scope: &AiScope) -> DialogText {
     let context = flint_core::display::single_line(context);
-    let server = flint_core::redact::server_url(server);
+    let server = flint_core::redact::server_origin(server);
     let added = flint_core::display::single_line(&added.join("; "));
     let grant = flint_core::display::single_line(&scope_picker::summary(scope));
     DialogText {
@@ -3458,7 +3539,7 @@ fn broaden_dialog(context: &str, server: &str, added: &[String], scope: &AiScope
 /// The Edit AI Scope dialog of an exposed cluster: what agents may read now, and the pickers.
 fn scope_dialog(context: &str, server: &str, scope: &AiScope) -> DialogText {
     let context = flint_core::display::single_line(context);
-    let server = flint_core::redact::server_url(server);
+    let server = flint_core::redact::server_origin(server);
     DialogText {
         title: "What may AI agents read?".into(),
         text: format!(
@@ -3478,7 +3559,7 @@ fn scope_dialog(context: &str, server: &str, scope: &AiScope) -> DialogText {
 fn expose_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogText {
     let context = flint_core::display::single_line(context);
     let previous = previous.map(|previous| previous_address(server, previous));
-    let server = flint_core::redact::server_url(server);
+    let server = flint_core::redact::server_origin(server);
     let mut text = format!(
         "AI agents using Flint's MCP server will be able to read this cluster: resources, events \
          and pod logs. They cannot change anything. Secret values are hidden, and so are values in \
@@ -3762,6 +3843,7 @@ fn namespace_button_text(filter: &[String], limit: Option<&flint_core::Namespace
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_namespace_picker_with_dialog(window, cx);
+        self.close_finished_held_edit(window, cx);
         let window_width = f32::from(window.viewport_size().width);
         let window_height = f32::from(window.viewport_size().height);
         self.sync_narrow_layout(window_width, window, cx);
@@ -3955,6 +4037,9 @@ mod actions;
 #[path = "workspace_disconnect.rs"]
 mod disconnect;
 
+#[path = "workspace_forwards.rs"]
+mod forwards;
+
 #[path = "workspace_keys.rs"]
 mod keys;
 
@@ -3979,6 +4064,13 @@ mod narrow_layout_tests;
 #[cfg(any(test, feature = "automation"))]
 #[path = "workspace_state.rs"]
 mod state;
+
+#[path = "workspace_unapplied.rs"]
+mod unapplied;
+
+#[cfg(test)]
+#[path = "workspace_unapplied_tests.rs"]
+mod unapplied_tests;
 
 #[cfg(test)]
 #[path = "workspace_view_tests.rs"]
@@ -4016,6 +4108,32 @@ mod tests {
         assert!(text.contains("Flint hides"), "{text}");
         assert!(!text.contains("Was "), "{text}");
         assert!(!text.contains("@old") && !text.contains("@new"), "{text}");
+    }
+
+    #[test]
+    fn notices_and_dialogs_show_only_the_server_origin() {
+        let old = "https://proxy.example.com:6443/k8s/clusters/c-old?x=1";
+        let new = "https://other.example.com/k8s/clusters/c-new";
+        let moved = ServerMove {
+            old: Some(old.to_owned()),
+            new: Some(new.to_owned()),
+        };
+        let mut texts = vec![
+            repointed_text("dev", &moved),
+            super::server_text(Some(old)),
+            super::unlock_dialog("dev", "dev", old).text,
+            super::trust_dialog("dev", "dev", old, Some(new)).text,
+            super::expose_dialog("dev", old, Some(new)).text,
+            super::scope_dialog("dev", old, &Default::default()).text,
+            super::broaden_dialog("dev", old, &[], &Default::default()).text,
+        ];
+        assert!(
+            texts[0].contains("Was https://proxy.example.com:6443, now https://other.example.com.")
+        );
+        for text in texts.drain(..) {
+            assert!(!text.contains("/k8s") && !text.contains("x=1"), "{text}");
+            assert!(text.contains("https://proxy.example.com:6443"), "{text}");
+        }
     }
 
     // A title that is the context stays short; any other carries the context, and a context
@@ -4202,6 +4320,19 @@ mod tests {
                 text.contains("Context: staging\\u{a}Server: https://staging.example\n"),
                 "{text}"
             );
+        }
+    }
+
+    #[test]
+    fn dialogs_show_the_server_and_its_proxy() {
+        let grant = "https://prod.example:6443 via http://proxy.example:3128";
+        for text in [
+            super::unlock_dialog("prod", "prod", grant).text,
+            super::trust_dialog("prod", "prod", grant, None).text,
+            super::expose_dialog("prod", grant, None).text,
+        ] {
+            let line = format!("Server: {grant}");
+            assert!(text.lines().any(|l| l == line), "{text}");
         }
     }
 

@@ -18,7 +18,7 @@ use super::objects::MAX_OBJECTS_PER_KIND;
 use super::usage::{Bounded, read_pods};
 use super::{CheckFailure, FailureCause, RequestGate, TelemetryTiming};
 use crate::cluster::{SafeErrorText, Target};
-use crate::metrics::{MetricsError, MetricsResult, NodeMetrics, PodMetrics, Usage};
+use crate::metrics::{MetricsError, MetricsResult, NodeMetrics, PodMetrics, PodSample, Usage};
 
 /// One poll of a list may take this many times [`TelemetryTiming::list_timeout`], waiting for its
 /// turn included, however many pages the server answers with.
@@ -49,27 +49,27 @@ impl<T> SideRead<T> {
 
 /// The newest usage by key, from `metrics.k8s.io`.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub enum UsageRead<K> {
+pub enum UsageRead<K, V = Usage> {
     /// No poll has finished.
     #[default]
     Waiting,
-    Current(Arc<BTreeMap<K, Usage>>),
+    Current(Arc<BTreeMap<K, V>>),
     /// It holds more than [`MAX_OBJECTS_PER_KIND`] entries.
     TooLarge,
     /// The last poll failed. [`MetricsError::NotInstalled`] is the case for an install hint.
     Unavailable(MetricsError),
 }
 
-impl<K: Ord> UsageRead<K> {
+impl<K: Ord, V: Copy> UsageRead<K, V> {
     /// The usage of `key`, if the last poll succeeded and reported it.
-    pub fn get(&self, key: &K) -> Option<Usage> {
+    pub fn get(&self, key: &K) -> Option<V> {
         match self {
             Self::Current(usage) => usage.get(key).copied(),
             Self::Waiting | Self::TooLarge | Self::Unavailable(_) => None,
         }
     }
 
-    fn of<T>(result: &MetricsResult<T>, entry: impl Fn(&T) -> (K, Usage)) -> Self {
+    fn of<T>(result: &MetricsResult<T>, entry: impl Fn(&T) -> (K, V)) -> Self {
         match result {
             Ok(list) if list.items.len() > MAX_OBJECTS_PER_KIND => Self::TooLarge,
             Ok(list) => Self::Current(Arc::new(list.items.iter().map(entry).collect())),
@@ -88,7 +88,7 @@ pub struct SideReads {
     pub warning_events: SideRead<Event>,
     /// Claims of every phase, as the dashboard's input takes them.
     pub pending_claims: SideRead<PersistentVolumeClaim>,
-    pub pod_usage: UsageRead<PodKey>,
+    pub pod_usage: UsageRead<PodKey, PodSample>,
     /// By node name.
     pub node_usage: UsageRead<String>,
 }
@@ -98,9 +98,9 @@ impl SideReads {
         UsageRead::of(result, |node| (node.name.clone(), node.usage))
     }
 
-    fn pod_usage_of(result: &MetricsResult<PodMetrics>) -> UsageRead<PodKey> {
+    fn pod_usage_of(result: &MetricsResult<PodMetrics>) -> UsageRead<PodKey, PodSample> {
         UsageRead::of(result, |pod| {
-            ((pod.namespace.clone(), pod.name.clone()), pod.total())
+            ((pod.namespace.clone(), pod.name.clone()), pod.sample())
         })
     }
 }

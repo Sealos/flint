@@ -13,6 +13,7 @@ use kube::api::{Api, LogParams};
 use super::line::MAX_LINE_BYTES;
 use super::session::{ContainerWait, FailedHop, LogSince, LogTarget};
 use crate::api_error::{ApiError, ApiErrorKind};
+use crate::api_path::{self, PathError};
 use crate::cluster::{ClusterError, Target};
 
 /// One request to the log endpoint.
@@ -189,6 +190,12 @@ impl LogError {
     }
 }
 
+impl From<PathError> for LogError {
+    fn from(error: PathError) -> Self {
+        Self::fatal(error.to_string())
+    }
+}
+
 /// Whether a 400 from the log endpoint says the container has not started yet.
 fn is_starting(message: &str) -> bool {
     [
@@ -259,6 +266,7 @@ impl LogSource for KubeLogSource {
         let request = request.clone();
         async move {
             let client = client().await?;
+            api_path::validate_names(Some(&request.target.namespace), Some(&request.target.pod))?;
             let api: Api<Pod> = Api::namespaced(client, &request.target.namespace);
             if let Some(uid) = &request.uid {
                 same_pod(api.get_opt(&request.target.pod).await, uid)?;
@@ -282,6 +290,7 @@ impl LogSource for KubeLogSource {
         let uid = uid.map(str::to_owned);
         async move {
             let client = client().await?;
+            api_path::validate_names(Some(&target.namespace), Some(&target.pod))?;
             let api: Api<Pod> = Api::namespaced(client, &target.namespace);
             let pod = api.get_opt(&target.pod).await;
             fate_of(pod, target.container.as_deref(), uid.as_deref())

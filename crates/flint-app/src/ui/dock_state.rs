@@ -30,13 +30,18 @@ impl Dock {
                         let (status, text) = view.status_state();
                         (status, text, None, Some(view.view_state()))
                     }
-                    DockTab::Activity(_) | DockTab::Compare(_) | DockTab::Helm(_) => {
-                        (TabStatusState::Watching, "Live".to_owned(), None, None)
-                    }
+                    DockTab::Activity(_)
+                    | DockTab::Compare(_)
+                    | DockTab::Forwards(_)
+                    | DockTab::Helm(_) => (TabStatusState::Watching, "Live".to_owned(), None, None),
                 };
                 let activity = match &tab.tab {
                     DockTab::Activity(view) => Some(ActivityTabState {
                         rows: view.read(cx).rows().iter().map(|r| r.label()).collect(),
+                    }),
+                    // The same list of rows: a forward's target, ports and state.
+                    DockTab::Forwards(view) => Some(ActivityTabState {
+                        rows: view.read(cx).row_labels(),
                     }),
                     _ => None,
                 };
@@ -110,7 +115,10 @@ impl Dock {
         let in_tab = self.tabs.iter().find_map(|tab| match &tab.tab {
             DockTab::Logs(view) => view.read(cx).focus_in(window, cx),
             DockTab::Shell(view) => view.read(cx).focus_in(window, cx),
-            DockTab::Activity(_) | DockTab::Compare(_) | DockTab::Helm(_) => None,
+            DockTab::Activity(_)
+            | DockTab::Compare(_)
+            | DockTab::Forwards(_)
+            | DockTab::Helm(_) => None,
         });
         Some(in_tab.unwrap_or(Focus::Dock))
     }
@@ -127,6 +135,7 @@ pub fn tab_kind(key: &TabKey) -> &'static str {
         TabKey::Shell(_) => "shell",
         TabKey::Activity(_) => "agent_activity",
         TabKey::Compare(..) => "compare",
+        TabKey::Forwards(_) => "port_forwards",
         TabKey::Helm(_) => "helm_releases",
     }
 }

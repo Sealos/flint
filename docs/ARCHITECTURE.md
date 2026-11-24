@@ -237,8 +237,9 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   do. Lock Again leaves running shells running; it stops new ones, and its menu entry, palette entry and dialog say
   so. Stop Trusting also locks the cluster, even if it was unlocked for the session. A trusted context whose
   cluster entry is gone (no server) cannot be unlocked or trusted, but its lock menu still removes the old trust.
-- Sessions the user started (log streams, exec terminals, port-forwards) keep running when the user switches to
-  another cluster, warm or cold. They end only when the user closes them or quits Flint.
+- Sessions the user started (log streams, exec terminals) keep running when the user switches to
+  another cluster, warm or cold. They end only when the user closes them or quits Flint. A port-forward keeps running
+  across a switch only if its cluster has keep watching on (see Port-forward).
 
 ## Resources
 
@@ -514,7 +515,7 @@ window or quitting while a shell runs or a log tab follows asks first, naming ho
 #177). That confirmation sets `DialogText::default_cancel`: the dialog's own keys are off, and its description (which
 takes focus) and its buttons sit in the `DefaultCancel` key context, where Enter and Escape are bound to Cancel; with
 focus on the dialog's own node (a click on the title-bar strip), a keystroke interceptor (`confirm::init`) cancels. Enter and Escape cancel; confirming
-needs the Quit or Close Window button (a click, or Space when it has focus). A new tab kind implements `DockItem` and
+needs the Quit or Close Window button (a click, or Space when it has focus). Quit from the Dock icon or a macOS logout is not intercepted (GPUI has no hook to cancel it), so an unapplied YAML edit is lost there; drafts are not persisted. A new tab kind implements `DockItem` and
 adds a `DockTab` and `TabKey` variant; the module documentation lists the steps.
 
 - **Titles.** One pattern for every kind: `chatty · app`, `chatty · app (previous)`, `api (Deployment)`,
@@ -790,9 +791,16 @@ it, and picks another one if that pod goes away. The user picks the local port, 
 can forward several ports of one target at once.
 
 A panel lists the active forwards: target, local and remote port, and state, with stop buttons. Ports named `http`
-or `web`, or with `appProtocol` `http`, get an **Open in browser** action for `http://localhost:<port>`. Ports named
-`https`, or with `appProtocol` `https`, open `https://localhost:<port>`. Unnamed ports offer Open in browser from the
-row's context menu. Forwards bind to `127.0.0.1` only and end when the app quits.
+or `web`, or with `appProtocol` `http`, get an **Open in browser** action for `http://127.0.0.1:<port>`. Ports named
+`https`, or with `appProtocol` `https`, open `https://127.0.0.1:<port>`. Unnamed ports offer Open in browser from the
+row's context menu. Forwards bind to `127.0.0.1` only.
+
+A forward takes the same gate as exec. Every connection asks the gate and takes a fresh client pinned to the definition
+and the connection the forward started on. An upgrade is sent once, and a pod target must keep the uid selected. A
+forward ends when its cluster is protected again, re-pointed or redefined (even if put back), paused, removed,
+disconnected or signed out, when keep watching or its exec consent is turned off, and when the app quits. On a switch
+it keeps running only if its cluster has keep watching on. A kept forward uses its existing connection: it never
+reconnects, and new connections on a cluster signing in through a plugin wait until that cluster is selected.
 
 ### Helm
 

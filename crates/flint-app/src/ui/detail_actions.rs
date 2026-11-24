@@ -8,7 +8,8 @@
 //! on a workload always waits for a current list of its pods (see `detail_pods`). An action
 //! that is refused, at once or once loaded, says why ([`DetailEvent::Refused`]).
 
-use flint_core::{LogSubject, LogTarget, PodSet, WorkloadPod, WorkloadTarget};
+use flint_core::port_forward::{DeclaredPort, ForwardTarget, declared_ports};
+use flint_core::{KindId, LogSubject, LogTarget, PodSet, WorkloadPod, WorkloadTarget};
 use gpui_kit::*;
 use serde_json::Value;
 
@@ -422,6 +423,91 @@ impl DetailView {
             },
             Subject::Other => None,
         }
+    }
+
+    /// Where Forward Port goes on this object: its namespace, a pod or service, and the ports
+    /// it declares once fetched. `None` for any other kind.
+    pub(in crate::ui) fn forward_target(
+        &self,
+    ) -> Option<(String, ForwardTarget, Vec<DeclaredPort>)> {
+        let name = self.object.name.clone();
+        let target = if self.object.kind == KindId::pods() {
+            ForwardTarget::Pod(name)
+        } else if self.object.kind == KindId::new("", "services") {
+            ForwardTarget::Service(name)
+        } else {
+            return None;
+        };
+        let ports = match &self.fetch {
+            Fetch::Loaded { detail, .. } => declared_ports(&detail.object),
+            _ => Vec::new(),
+        };
+        Some((self.object.namespace.clone()?, target, ports))
+    }
+
+    /// The uid of the pod shown, once loaded: a forward reaches that pod and no other.
+    pub(in crate::ui) fn forward_uid(&self) -> Option<String> {
+        if self.object.kind != KindId::pods() {
+            return None;
+        }
+        match &self.fetch {
+            Fetch::Loaded { detail, .. } => detail
+                .object
+                .pointer("/metadata/uid")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            _ => None,
+        }
+    }
+
+    /// Whether Forward Port can be asked for now, as far as known. It opens a channel into the
+    /// cluster, so it is refused as a shell is.
+    pub(in crate::ui) fn forward_check<A: Action>(&self) -> Result<(), ActionError> {
+        if self.forward_target().is_none() {
+            return Err(ActionError::rejected::<A>(
+                "a port-forward reaches a pod or a service",
+            ));
+        }
+        if self.object.kind == KindId::pods()
+            && matches!(self.fetch, Fetch::Loading | Fetch::Loaded { .. })
+            && self.forward_uid().is_none()
+        {
+            return Err(ActionError::rejected::<A>(format!(
+                "{} is still loading",
+                self.object.name
+            )));
+        }
+        if self.gone {
+            return Err(ActionError::rejected::<A>(format!(
+                "{} was deleted",
+                self.object.name
+            )));
+        }
+        if self.protected {
+            return Err(ActionError::rejected::<A>(protected_reason(
+                &self.cluster_label,
+            )));
+        }
+        if let Some(why) = self.access.forbidden(Gated::PortForward) {
+            return Err(ActionError::rejected::<A>(why));
+        }
+        if let Fetch::Failed(e) = &self.fetch {
+            return Err(ActionError::rejected::<A>(format!(
+                "{} could not be fetched: {e}",
+                self.object.name
+            )));
+        }
+        if self.subject == Subject::Pod
+            && let Some(why) = self.pod_finished()
+        {
+            return Err(ActionError::rejected::<A>(why));
+        }
+        Ok(())
+    }
+
+    /// Whether [`Self::forward_check`] refuses because the cluster is protected.
+    pub(in crate::ui) fn forward_protected(&self) -> bool {
+        !self.gone && self.protected && self.forward_target().is_some()
     }
 
     /// Whether [`Self::shell_check`] refuses because the cluster is protected: the decision the

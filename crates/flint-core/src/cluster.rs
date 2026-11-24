@@ -9,6 +9,7 @@ use kube::config::{KubeConfigOptions, Kubeconfig};
 
 use crate::api_error::{self, ApiError, Transport};
 use crate::connection::policy::{CredentialAccess, CredentialGrant};
+use crate::connection::proxy;
 use crate::credential::{self, CredentialSource, WriteCredential};
 use crate::protection::{ClusterClients, WriteAccess};
 use crate::redact;
@@ -576,6 +577,7 @@ pub(crate) async fn connect_gated_with_policy(
     context: &str,
     access: &CredentialAccess,
 ) -> Result<GatedConnection, ClusterError> {
+    route_preflight(kubeconfig, context)?;
     let mut held = kubeconfig.clone();
     let name = context.to_owned();
     let (held, files) = tokio::task::spawn_blocking(move || {
@@ -687,35 +689,49 @@ async fn prepare(
     if !kubeconfig.contexts.iter().any(|c| c.name == context) {
         return Err(ClusterError::UnknownContext(context.to_owned()));
     }
+    // kube's loader reads certificate and key files.
+    route_preflight(kubeconfig, context)?;
     let options = KubeConfigOptions {
         context: Some(context.to_owned()),
         cluster: None,
         user: None,
     };
-    let mut config = kube::Config::from_custom_kubeconfig(kubeconfig.clone(), &options)
+    let mut loadable = kubeconfig.clone();
+    let entry = swap_proxy_entry(&mut loadable, context);
+    let mut config = kube::Config::from_custom_kubeconfig(loadable, &options)
         .await
         .map_err(|e| ClusterError::Config {
             context: context.to_owned(),
             message: error_chain(&e),
         })?;
+    // Before anything runs a credential, so a route Flint refuses opens no login.
+    config.proxy_url = proxy_of(
+        entry.as_deref(),
+        &config.cluster_url.to_string(),
+        config.accept_invalid_certs,
+    )
+    .map_err(|refused| ClusterError::Config {
+        context: context.to_owned(),
+        message: refused.to_string(),
+    })?;
+    // What a plugin is told of the cluster holds the proxy's address, never its credentials.
+    if let Some(cluster) = config
+        .auth_info
+        .exec
+        .as_mut()
+        .and_then(|exec| exec.cluster.as_mut())
+    {
+        cluster.proxy_url = entry
+            .as_deref()
+            .filter(|e| !e.trim().is_empty())
+            .map(proxy::shown);
+    }
     let target = Target::of(kubeconfig, context);
     let source = CredentialSource::of(&config.auth_info);
     let grant = access.grant(source.clone());
     if !grant.allowed() {
         let denied = kube::Error::Auth(crate::auth_plugin::not_allowed());
         return Err(ClusterError::kube(denied).for_target(&target));
-    }
-    // kube's builder refuses a proxy (`proxy-url`, or `HTTPS_PROXY` and the like) before it runs
-    // an exec plugin: so does this, with kube's own error, so no login opens for nothing. A
-    // client it did build would have no read-only rule, so that is refused too.
-    if config.proxy_url.is_some() {
-        let built = tokio::task::spawn_blocking(move || Client::try_from(config))
-            .await
-            .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?;
-        return Err(match built {
-            Err(e) => ClusterError::kube(e).for_target(&target),
-            Ok(_) => ClusterError::Kube("connecting through a proxy is not supported".to_owned()),
-        });
     }
     let resolved = crate::auth_plugin::resolve_with_grant(&mut config, context, &grant)
         .await
@@ -728,6 +744,69 @@ async fn prepare(
         replaced_certificate: resolved.replaced_certificate,
         target,
     })
+}
+
+/// Refuses `context`'s route from the kubeconfig's own values, before any credential file is
+/// opened. A context or server that is missing is left for kube's loader to report.
+fn route_preflight(kubeconfig: &Kubeconfig, context: &str) -> Result<(), ClusterError> {
+    let cluster = kubeconfig
+        .contexts
+        .iter()
+        .find(|c| c.name == context)
+        .and_then(|c| c.context.as_ref())
+        .and_then(|c| kubeconfig.clusters.iter().find(|n| n.name == c.cluster))
+        .and_then(|n| n.cluster.as_ref());
+    let Some((cluster, server)) = cluster.and_then(|c| Some((c, c.server.as_deref()?))) else {
+        return Ok(());
+    };
+    let skips_verify = cluster.insecure_skip_tls_verify == Some(true);
+    proxy_of(cluster.proxy_url.as_deref(), server, skips_verify)
+        .map(drop)
+        .map_err(|refused| ClusterError::Config {
+            context: context.to_owned(),
+            message: refused.to_string(),
+        })
+}
+
+/// Gives `context`'s cluster entry [`proxy::LOADER_PLACEHOLDER`] as its proxy, and returns the
+/// `proxy-url` it had.
+fn swap_proxy_entry(kubeconfig: &mut Kubeconfig, context: &str) -> Option<String> {
+    let cluster = kubeconfig
+        .contexts
+        .iter()
+        .find(|c| c.name == context)
+        .and_then(|c| c.context.as_ref())
+        .map(|c| c.cluster.clone())?;
+    kubeconfig
+        .clusters
+        .iter_mut()
+        .find(|n| n.name == cluster)?
+        .cluster
+        .as_mut()?
+        .proxy_url
+        .replace(proxy::LOADER_PLACEHOLDER.to_owned())
+}
+
+/// The proxy to reach `server` through, given the cluster entry's `proxy-url`, checked to be one
+/// Flint can use on this route. kube's loader applies `NO_PROXY` to a `proxy-url` too, or not at
+/// all without its proxy features, so the choice is made here ([`proxy::chosen`]).
+fn proxy_of(
+    entry: Option<&str>,
+    server: &str,
+    skips_verify: bool,
+) -> Result<Option<http::Uri>, proxy::ProxyRefused> {
+    let environment = proxy::ProxyEnvironment::current();
+    let Some(chosen) = proxy::chosen(entry, Some(server), &environment) else {
+        return Ok(None);
+    };
+    proxy::ProxyTarget::parse(chosen)?;
+    proxy::check_route(server, skips_verify)?;
+    proxy::check_account_key(chosen)?;
+    chosen
+        .trim()
+        .parse()
+        .map(Some)
+        .map_err(|_| proxy::ProxyRefused::Unreadable)
 }
 
 /// What a client built by [`build_client`] may send.
@@ -743,6 +822,12 @@ enum Access {
 #[derive(Clone)]
 struct ReadRetry(kube::client::retry::RetryPolicy);
 
+/// A plain `GET`. A WebSocket upgrade is a `GET` too, but it opens a channel into the cluster, so
+/// it is sent once.
+fn retryable<B>(request: &http::Request<B>) -> bool {
+    request.method() == http::Method::GET && !request.headers().contains_key(http::header::UPGRADE)
+}
+
 impl<Res>
     tower::retry::Policy<http::Request<kube::client::Body>, http::Response<Res>, tower::BoxError>
     for ReadRetry
@@ -754,7 +839,7 @@ impl<Res>
         request: &mut http::Request<kube::client::Body>,
         result: &mut Result<http::Response<Res>, tower::BoxError>,
     ) -> Option<Self::Future> {
-        if request.method() != http::Method::GET {
+        if !retryable(request) {
             return None;
         }
         tower::retry::Policy::retry(&mut self.0, request, result)
@@ -764,7 +849,7 @@ impl<Res>
         &mut self,
         request: &http::Request<kube::client::Body>,
     ) -> Option<http::Request<kube::client::Body>> {
-        if request.method() != http::Method::GET {
+        if !retryable(request) {
             return None;
         }
         <kube::client::retry::RetryPolicy as tower::retry::Policy<
@@ -796,12 +881,11 @@ fn http_connector() -> hyper_util::client::legacy::connect::HttpConnector {
 /// `Client::try_from(config)` with TCP keepalive. kube 5.1 creates its `HttpConnector` inside
 /// `ClientBuilder::try_from` and has no hook to configure it, so this builds the same stack
 /// from kube's public parts (`ConfigExt`), as kube 5.1's `make_generic_builder` does for
-/// Flint's features (rustls, no proxy support, no gzip): TLS, kube's connect, read and write
-/// timeouts, base URI, retries, auth, and extra headers. Left out: kube's debug-level HTTP
-/// tracing spans, and the client's `valid_until` (an exec plugin certificate's expiry, which
-/// kube only records and Flint never reads). A kubeconfig with a proxy goes through kube's own
-/// builder in [`connect`], before any exec plugin runs, which reports that proxies are not
-/// supported, as before. `token` is the refreshing token of an exec auth plugin
+/// Flint's features (rustls, no gzip): TLS, kube's connect, read and write timeouts, base URI,
+/// retries, auth, and extra headers. Left out: kube's debug-level HTTP tracing spans, and the
+/// client's `valid_until` (an exec plugin certificate's expiry, which kube only records and
+/// Flint never reads). `config.proxy_url` was checked by [`prepare`]; TLS to the API server runs
+/// inside its tunnel. `token` is the refreshing token of an exec auth plugin
 /// ([`crate::auth_plugin::resolve_with_grant`]), set after kube's auth layer. `guarded`, if any,
 /// stands in for `auth` on requests, because `auth` could run a command a role may forbid.
 fn build_client(
@@ -816,10 +900,6 @@ fn build_client(
 
 /// [`build_client`], telling `observer` of each 401 the server answers, and asking `check` before
 /// each attempt: inside the retries, and before anything that resolves a credential.
-#[expect(
-    clippy::disallowed_types,
-    reason = "the one place that assembles a client"
-)]
 fn build_observed_client(
     config: &kube::Config,
     token: Option<crate::auth_plugin::RefreshingToken>,
@@ -829,12 +909,61 @@ fn build_observed_client(
     observer: Option<&CredentialGrant>,
     check: Option<&SendCheck>,
 ) -> Result<Client, kube::Error> {
+    let Some(proxy_url) = &config.proxy_url else {
+        let connector = http_connector();
+        return assemble_client(
+            connector, config, token, auth, guarded, access, observer, check,
+        );
+    };
+    // Refused again rather than connecting directly, whatever set the URL.
+    let target = proxy::ProxyTarget::parse(&proxy_url.to_string())
+        .and_then(|target| {
+            proxy::check_route(&config.cluster_url.to_string(), config.accept_invalid_certs)
+                .map(|()| target)
+        })
+        .map_err(|refused| kube::Error::Service(refused.to_string().into()))?;
+    let connector = target.tunnel(http_connector());
+    assemble_client(
+        connector, config, token, auth, guarded, access, observer, check,
+    )
+}
+
+/// The client stack of [`build_client`], over `connector`.
+#[expect(
+    clippy::disallowed_types,
+    reason = "the one place that assembles a client"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "build_observed_client's arguments and its connector"
+)]
+fn assemble_client<C>(
+    connector: C,
+    config: &kube::Config,
+    token: Option<crate::auth_plugin::RefreshingToken>,
+    auth: Option<&kube::client::middleware::AuthLayer>,
+    guarded: Option<&credential::GuardedProvider>,
+    access: Access,
+    observer: Option<&CredentialGrant>,
+    check: Option<&SendCheck>,
+) -> Result<Client, kube::Error>
+where
+    C: tower::Service<http::Uri> + Clone + Send + Sync + 'static,
+    C::Response: hyper_util::client::legacy::connect::Connection
+        + hyper::rt::Read
+        + hyper::rt::Write
+        + Send
+        + Unpin
+        + 'static,
+    C::Future: Send + 'static,
+    C::Error: std::error::Error + Send + Sync + 'static,
+{
     use kube::client::ConfigExt;
     use kube::client::retry::RetryPolicy;
     use tower::ServiceBuilder;
     use tower::retry::RetryLayer;
 
-    let https = config.rustls_https_connector_with_connector(http_connector())?;
+    let https = config.rustls_https_connector_with_connector(connector)?;
     let mut connector = hyper_timeout::TimeoutConnector::new(https);
     connector.set_connect_timeout(config.connect_timeout);
     connector.set_read_timeout(config.read_timeout);
@@ -890,6 +1019,35 @@ pub(crate) fn sending_credential(client: Client, credential: credential::BoundHe
         let client = client.clone();
         request.extensions_mut().insert(credential.clone());
         async move { client.send(request).await }
+    });
+    Client::new(service, namespace)
+}
+
+/// `client`, for one WebSocket upgrade: `check` is asked right before it is sent, and a refusal's
+/// body is dropped unread, so its size costs nothing. The status is all that is used of it.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "wraps a client build_client made, for one upgrade"
+)]
+pub(crate) fn upgrade_client(client: Client, check: SendCheck) -> Client {
+    let namespace = client.default_namespace().to_owned();
+    let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+        let (client, check) = (client.clone(), check.clone());
+        async move {
+            check
+                .refusal()
+                .await
+                .map_err(|why| kube::Error::Service(why.into()))?;
+            let response = client.send(request).await?;
+            if response.status() == http::StatusCode::SWITCHING_PROTOCOLS {
+                return Ok::<_, kube::Error>(response);
+            }
+            let (parts, _unread) = response.into_parts();
+            Ok(http::Response::from_parts(
+                parts,
+                kube::client::Body::empty(),
+            ))
+        }
     });
     Client::new(service, namespace)
 }

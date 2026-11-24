@@ -12,6 +12,7 @@ use std::time::Duration;
 use flint_core::write::WriteTarget;
 use flint_core::write::{WriteAction, WriteError, WriteOutcome, WriteProposal, WriteReview};
 use flint_core::{ObjectDetail, WriteRefusal};
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::diff::{DiffFile, DiffState};
 use gpui_kit::component::input::EditorState;
 use gpui_kit::*;
@@ -49,6 +50,15 @@ pub(super) struct YamlEdit {
     pub editor: Entity<EditorState>,
     pub diff: Entity<DiffState>,
     target: WriteTarget,
+    /// The text as opened, moved to each reloaded `resourceVersion`: what counts as no change.
+    baseline: String,
+    /// The confirmed endpoint number it was opened on. A context moved and put back has the same
+    /// URL but another number.
+    endpoint: Option<u64>,
+    /// Its context moved or left since: the text stays, and it can no longer be sent.
+    moved: bool,
+    /// A question opened while the editor was hidden: focus goes back to it once it shows.
+    refocus: bool,
     pub phase: Phase,
     /// Why the last step failed, in the server's or the core's words.
     pub error: Option<String>,
@@ -389,9 +399,82 @@ fn edit_error_text(error: &WriteError) -> String {
     }
 }
 
+/// Why an edit whose context moved cannot be reviewed or applied.
+const EDIT_MOVED: &str = "This context changed since the edit was opened, so it cannot be \
+     applied. Copy your text, then open the object again.";
+
 impl DetailView {
+    /// Whether the open edit's context moved or left since it was opened, even if it came back.
+    pub(in crate::ui) fn edit_moved(&self) -> bool {
+        self.edit.as_ref().is_some_and(|edit| edit.moved)
+    }
+
+    /// Why the open edit may not be written, if its context moved.
+    pub(in crate::ui) fn edit_moved_refusal(&self) -> Option<String> {
+        self.edit_moved().then(|| EDIT_MOVED.to_owned())
+    }
+
+    /// Takes in the context's confirmed endpoint number.
+    pub(in crate::ui) fn note_endpoint(&mut self, endpoint: u64, cx: &mut Context<Self>) {
+        self.endpoint = Some(endpoint);
+        let Some(edit) = &mut self.edit else {
+            return;
+        };
+        match edit.endpoint {
+            None => edit.endpoint = Some(endpoint),
+            Some(bound) if bound != endpoint => self.mark_edit_moved(cx),
+            Some(_) => {}
+        }
+    }
+
+    /// The context is gone from the kubeconfig files: if it returns, it is not the one edited.
+    pub(in crate::ui) fn note_context_gone(&mut self, cx: &mut Context<Self>) {
+        self.endpoint = None;
+        self.mark_edit_moved(cx);
+    }
+
+    fn mark_edit_moved(&mut self, cx: &mut Context<Self>) {
+        if let Some(edit) = self.edit.as_mut().filter(|edit| !edit.moved) {
+            edit.moved = true;
+            edit.error = Some(EDIT_MOVED.to_owned());
+            cx.notify();
+        }
+    }
+
+    /// Whether an edit is open, changed or not.
+    pub(in crate::ui) fn has_open_edit(&self) -> bool {
+        self.edit.is_some()
+    }
+
+    /// Whether the edit's confirmed write is running.
+    pub(in crate::ui) fn is_applying_edit(&self) -> bool {
+        matches!(self.edit.as_ref().map(|e| &e.phase), Some(Phase::Applying))
+    }
+
+    /// Hands focus to the editor once a question opened over a hidden one has closed.
+    pub(super) fn finish_focus_return(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.edit.as_mut().filter(|edit| edit.refocus) else {
+            return;
+        };
+        match edit.phase {
+            Phase::Reviewing | Phase::Applying => {}
+            Phase::Reviewed(_) => edit.refocus = false,
+            Phase::Editing | Phase::Conflict => {
+                if !window.has_active_dialog(cx) && self.focus.is_focused(window) {
+                    edit.refocus = false;
+                    cx.defer_in(window, |view, window, cx| {
+                        view.focus_shown_editor(window, cx)
+                    });
+                }
+            }
+        }
+    }
+
     /// Why this object cannot be edited now, as the disabled button says it.
     pub(in crate::ui) fn edit_blocked(&self) -> Option<String> {
+        if self.edit_moved() {
+            return Some(EDIT_MOVED.to_owned());
+        }
         if self.is_secret {
             return Some("Secret values are hidden, so a Secret cannot be edited here".to_owned());
         }
@@ -478,12 +561,17 @@ impl DetailView {
             state
         });
         editor.read(cx).focus_handle(cx).focus(window, cx);
+        let baseline = editor.read(cx).value().to_string();
         let diff = cx.new(|cx| DiffState::new(Vec::<DiffFile>::new(), cx));
         self.tab = DetailTab::Yaml;
         self.edit = Some(YamlEdit {
             editor,
             diff,
             target,
+            baseline,
+            endpoint: self.endpoint,
+            moved: false,
+            refocus: false,
             phase: Phase::Editing,
             error: None,
             seen: vec![opened],
@@ -761,6 +849,7 @@ impl DetailView {
             let yaml = with_resource_version(&edit.editor.read(cx).value(), version);
             edit.editor
                 .update(cx, |state, cx| state.set_value(yaml, window, cx));
+            edit.baseline = with_resource_version(&edit.baseline, version);
             edit.target.resource_version = Some(version.to_owned());
         }
         edit.phase = Phase::Editing;
@@ -787,6 +876,35 @@ impl DetailView {
             cx.notify();
         }
     }
+
+    /// Whether leaving this pane would lose typed text. Also while a confirmed write runs: the
+    /// server can still reject it, and the text is what is left to fix it from.
+    pub(in crate::ui) fn has_unapplied_edit(&self, cx: &App) -> bool {
+        self.edit
+            .as_ref()
+            .is_some_and(|edit| edit.editor.read(cx).value().as_ref() != edit.baseline.as_str())
+    }
+
+    /// Shows the edit and gives it focus, so that a question about it opens over it and Keep
+    /// editing returns there, also if the editor only comes back while the question is open.
+    pub(in crate::ui) fn reveal_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab = DetailTab::Yaml;
+        self.focus.focus(window, cx);
+        self.focus_shown_editor(window, cx);
+        if let Some(edit) = &mut self.edit {
+            edit.refocus = matches!(edit.phase, Phase::Reviewing | Phase::Applying);
+        }
+        cx.notify();
+    }
+
+    /// Drops the edit at the person's answer, leaving focus on this pane. A write already
+    /// confirmed runs on: its result finds no edit to report to.
+    pub(in crate::ui) fn discard_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.edit.take().is_some() {
+            self.focus.focus(window, cx);
+            cx.notify();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -803,6 +921,19 @@ impl DetailView {
         let text = edit.editor.read(cx).value().replace(from, to);
         edit.editor
             .update(cx, |state, cx| state.set_value(text, window, cx));
+    }
+
+    /// Puts the open edit in review, as a slow server would keep it.
+    pub(in crate::ui) fn set_edit_reviewing(&mut self, cx: &mut Context<Self>) {
+        if let Some(edit) = &mut self.edit {
+            edit.phase = Phase::Reviewing;
+            cx.notify();
+        }
+    }
+
+    /// The server the open edit is bound to.
+    pub(in crate::ui) fn open_edit_server(&self) -> Option<&str> {
+        self.edit.as_ref()?.target.server.as_deref()
     }
 
     pub(in crate::ui) fn edit_error(&self) -> Option<&str> {

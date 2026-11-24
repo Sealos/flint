@@ -240,7 +240,8 @@ impl ClusterManager {
         {
             return Err(format!("\"{id}\" is running on another server."));
         }
-        let at = self.contexts.pin(id, Some(&pin.server));
+        let proxy = self.cluster(id).and_then(|c| c.info.proxy_url.as_deref());
+        let at = self.contexts.pin_through(id, Some(&pin.server), proxy);
         if let Some(why) = self.contexts.check(Pinned::Logs, id, &at) {
             return Err(why);
         }

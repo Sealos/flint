@@ -13,7 +13,7 @@ use super::super::view_state::{
     Banner, Focus, Level, ListState, RowState, SortState, error_text, sync_word,
 };
 use super::combined::{self, CombinedResourceList};
-use super::{ResourceList, cell_text, limited_text, list_model, problems};
+use super::{ResourceList, limited_text, list_model, problems};
 
 #[cfg_attr(
     not(test),
@@ -152,15 +152,16 @@ impl ResourceList {
     fn sort_shown(&self) -> Option<(&str, bool)> {
         let col = self.drawn_sort_column()?;
         let descending = self.query.sort.as_ref()?.descending;
-        Some((&self.shown.columns[col].name, descending))
+        Some((&self.shown_columns[col].name, descending))
     }
 
     /// The list as drawn: the columns on screen, the rows passing the filters (in order), and
     /// what replaces or tops them.
     pub fn view_state(&self) -> ListState {
         let snapshot = &self.shown;
+        let shown_columns = &self.shown_columns;
         let columns: Vec<usize> = if self.drawn.is_empty() {
-            list_model::visible_columns(&snapshot.columns, self.show_wide)
+            list_model::visible_columns(shown_columns, self.show_wide)
         } else {
             self.drawn.iter().map(|&(col, _)| col).collect()
         };
@@ -176,10 +177,10 @@ impl ResourceList {
                 let cells: Vec<String> = columns
                     .iter()
                     .map(|&col| {
-                        if is_masked_column(secrets, &snapshot.columns, col) {
+                        if is_masked_column(secrets, shown_columns, col) {
                             MASK.to_owned()
                         } else {
-                            cell_text(row, col, now).to_string()
+                            self.shown_cell(i as usize, col, now).to_string()
                         }
                     })
                     .collect();
@@ -191,7 +192,7 @@ impl ResourceList {
                     cells_by_column: columns
                         .iter()
                         .zip(&cells)
-                        .map(|(&col, cell)| (snapshot.columns[col].name.to_string(), cell.clone()))
+                        .map(|(&col, cell)| (shown_columns[col].name.to_string(), cell.clone()))
                         .collect(),
                     cells,
                 }
@@ -206,7 +207,7 @@ impl ResourceList {
             count: self.row_count().text,
             columns: columns
                 .iter()
-                .map(|&col| snapshot.columns[col].name.to_string())
+                .map(|&col| shown_columns[col].name.to_string())
                 .collect(),
             rows,
             rows_truncated: self.rows.len() > ListState::ROW_LIMIT,
@@ -271,6 +272,9 @@ impl ResourceList {
         }
         if let Some(text) = self.filtered_out_text() {
             banners.push(Banner::new("list-filtered-out", Level::Info, text));
+        }
+        if let Some(hint) = self.usage.hint() {
+            banners.push(Banner::new("list-usage-hint", Level::Muted, hint));
         }
         if let Some(text) = self.problems_note() {
             banners.push(Banner::new(

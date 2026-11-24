@@ -10,5 +10,6 @@
 
 pub(crate) mod member;
 pub mod policy;
+pub(crate) mod proxy;
 pub(crate) mod retry;
 pub(crate) mod schedule;

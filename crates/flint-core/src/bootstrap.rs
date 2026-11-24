@@ -117,6 +117,7 @@ pub fn log_filter(flint_log: Option<&str>, rust_log: Option<&str>, verbose: bool
 /// changes the process environment. See [`env_path::apply_process_path`].
 pub unsafe fn bootstrap() -> Result<Bootstrap, SettingsError> {
     let config_dir = settings::config_dir()?;
+    crate::connection::proxy::use_route_key_in(&config_dir);
     // An unreadable file opens nothing up (`Settings::unreadable_fallback`).
     let (settings, settings_error) = settings::load_settings_or_fallback(&config_dir);
     // SAFETY: forwarded to the caller.

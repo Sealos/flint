@@ -570,38 +570,55 @@ fn up_55_repointing_during_a_confirmation_closes_it() -> Result<()> {
     Ok(())
 }
 
-// covers UP-55: disconnecting a cluster closes a Scale confirmation open on it, and nothing is
-// written, neither then nor once the cluster is selected again.
+// covers UP-55: an edit reviewed before its cluster was disconnected writes nothing, whatever
+// is answered once the cluster is selected again. A confirmation is modal, so the disconnect
+// comes between the review and the confirmation.
 #[test]
 #[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
-fn up_55_disconnecting_during_a_confirmation_writes_nothing() -> Result<()> {
+fn up_55_an_edit_reviewed_before_a_disconnect_writes_nothing() -> Result<()> {
     let cluster = TestCluster::fake(Options::default())?;
     let fake = cluster.fake_server().expect("a fake server");
+    seed_configmap(fake);
+    // Unprotected: the gate is open, so only the disconnect refuses.
     let app = App::launch(AppOptions::new(&cluster.kubeconfig))?;
     connect(&app, &cluster.context)?;
+    // Escape keeps the edit if a question about losing it is open.
+    let keep_editing = || -> Result<()> {
+        if !app.state()?["dialog"].is_null() {
+            app.press_key("escape")?;
+            app.wait_for("/dialog", Equals(Value::Null))?;
+        }
+        Ok(())
+    };
     reporting(&app, || {
-        open_asked(&app, Asked::ScaleReview)?;
-        let before = fake.writes().len();
+        edit_and_review(&app)?;
+        // Counted after the review's dry run.
+        let reviewed = fake.writes().len();
         app.dispatch(
             "workspace::DisconnectCluster",
             json!({"cluster": cluster.context}),
         )?;
-        app.wait_for("/dialog", Equals(Value::Null))?;
+        app.wait_for("/active_cluster", Equals(Value::Null))?;
+        keep_editing()?;
         connect(&app, &cluster.context)?;
-        // Anything still asked is answered: it must not reach the server either.
-        if !app.state()?["dialog"].is_null() {
+        keep_editing()?;
+        let _ = app.dispatch("detail::ApplyYamlEdit", Value::Null);
+        for _ in 0..3 {
+            if app.state()?["dialog"].is_null() {
+                break;
+            }
             let _ = app.click("ok");
+            std::thread::sleep(RETRY_WINDOW);
         }
         std::thread::sleep(RETRY_WINDOW);
-        assert_eq!(writes_since(fake, before), Vec::<String>::new());
+        assert_eq!(writes_since(fake, reviewed), Vec::<String>::new());
         Ok(())
     })?;
     app.quit()?;
-    assert!(
-        fake.object(&fake.gvr("deployments"), Some("demo"), "web")
-            .is_some_and(|web| web["spec"]["replicas"] != 5),
-        "the reviewed count was written"
-    );
+    let stored = fake
+        .object(&Gvr::core("configmaps"), Some("demo"), EDITED)
+        .context("no edited object")?;
+    assert_eq!(stored["immutable"], Value::Null, "{stored}");
     Ok(())
 }
 

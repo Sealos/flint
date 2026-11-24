@@ -263,8 +263,14 @@ fn hold(files: &mut Vec<HeldFile>, path: &str, role: FileRole) -> Option<Vec<u8>
     bytes.filter(|_| held.is_some())
 }
 
+/// Every path [`read_file`] was asked for, so a test can see a credential file left unopened.
+#[cfg(test)]
+pub(crate) static READ_PATHS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 /// Reads a regular file of at most [`FILE_CAP`] bytes.
 fn read_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(test)]
+    READ_PATHS.lock().unwrap().push(path.to_owned());
     // Follows a symlink, as projected tokens are. A pipe would block the read for good.
     if !std::fs::metadata(path)?.is_file() {
         return Err(std::io::ErrorKind::InvalidInput.into());
@@ -316,6 +322,7 @@ struct Parts {
 
 /// Which connection's credential something was learned with. Holds none of it: the credential
 /// is dropped with its connection, and an id never matches a later one.
+#[derive(Clone)]
 pub(crate) struct CredentialId(Weak<Parts>);
 
 impl CredentialId {
@@ -419,7 +426,38 @@ impl WriteCredential {
     pub(crate) async fn present(&self, client: Client) -> Result<Presented, WriteError> {
         let parts = &self.0;
         let lease = parts.grant.lease();
+        let (client, material) = self.resolve(client, &lease).await?;
+        let identity = if parts.check_identity {
+            Some(authenticated_identity(&client).await?)
+        } else {
+            None
+        };
         still_held(&lease)?;
+        Ok(Presented {
+            client,
+            binding: CredentialBinding {
+                material: material.finish().ok_or(WriteError::CredentialUnreadable)?,
+                identity,
+            },
+        })
+    }
+
+    /// `client`, set to send this credential as it is now, without asking the server who it is.
+    /// Refused as [`Self::present`] is, with nothing run or sent.
+    pub(crate) async fn resolved(&self, client: Client) -> Result<Client, WriteError> {
+        let lease = self.0.grant.lease();
+        let (client, _) = self.resolve(client, &lease).await?;
+        Ok(client)
+    }
+
+    /// Ends with the lease still held, and refuses otherwise.
+    async fn resolve(
+        &self,
+        client: Client,
+        lease: &CredentialLease,
+    ) -> Result<(Client, Digester), WriteError> {
+        let parts = &self.0;
+        still_held(lease)?;
         let mut material = Digester::new().ok_or(WriteError::CredentialUnreadable)?;
         for file in &parts.files {
             let held = file.held.ok_or(WriteError::CredentialUnreadable)?;
@@ -459,24 +497,12 @@ impl WriteCredential {
                 }
             }
         };
-        still_held(&lease)?;
+        still_held(lease)?;
         let client = match header {
             Some(header) => crate::cluster::sending_credential(client, BoundHeader(header)),
             None => client,
         };
-        let identity = if parts.check_identity {
-            Some(authenticated_identity(&client).await?)
-        } else {
-            None
-        };
-        still_held(&lease)?;
-        Ok(Presented {
-            client,
-            binding: CredentialBinding {
-                material: material.finish().ok_or(WriteError::CredentialUnreadable)?,
-                identity,
-            },
-        })
+        Ok((client, material))
     }
 }
 

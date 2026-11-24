@@ -210,8 +210,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ### UP-24 Switch clusters
 - **When** I switch to another cluster and back, and the old cluster is not kept warm (`warm_clusters = 1`, or it went
   cold).
-- **Then** the old cluster's watches stop. Switching back loads fresh data. Log, exec and port-forward sessions keep
-  running across the switch. (Before M5.5 every cluster behaves this way. Warm clusters are UP-78.)
+- **Then** the old cluster's watches stop. Switching back loads fresh data. Log and exec sessions keep running across
+  the switch; a port-forward keeps running only if its cluster has keep watching on. (Before M5.5 every cluster behaves this way. Warm clusters are UP-78.)
 - Tests: cluster, ui (from M5.5 with `warm_clusters = 1`).
 
 ### UP-25 Change the watch mode
@@ -337,7 +337,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   and Shift-Cmd-W always does). A closed tab frees everything it held. Closing the window (Shift-Cmd-W, its close
   button, or Cmd-W with no tab shown) or quitting (Cmd-Q) while a shell runs or a log tab follows asks first, naming
   how many sessions end. Enter and Escape cancel; confirming needs the Quit or Close Window button (a click, or Space
-  when it has focus). With none running, nothing is asked. Cmd-J shows and hides the
+  when it has focus). With none running, nothing is asked. Quitting from outside Flint (the Dock icon's Quit, or
+  logging out of macOS) is not asked about, and loses any unapplied YAML edit. Cmd-J shows and hides the
   dock, and its height is remembered. Every tab names its cluster beside its title, and two clusters never read the
   same. With many tabs, the tab I open or show stays in view, also when the window is resized, and the tab list
   (Shift-Cmd-J, or the button at the strip's end) shows every tab with its cluster and status. Opening the same logs
@@ -431,6 +432,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **When** I press Review, then Apply.
 - **Then** I see a diff from the server dry-run, then the change is applied. Webhook or policy rejections are shown
   before anything is applied.
+- An edit I have not applied is kept only while Flint runs. Leaving the view or closing the window asks first, but
+  quitting from the Dock menu or logging out does not, and the edit is lost; Flint does not save drafts.
 - Tests: cluster.
 
 ### UP-52 Someone else changed it
@@ -649,7 +652,7 @@ M4 used every number in the 6x block, so its later paths continue at UP-120.
 ### UP-74 Open a forwarded HTTP port
 - **Given** a forward to a port named `http`, `https` or `web`, or with `appProtocol` `http` or `https`.
 - **Then** the forwards panel shows its target, local and remote port and state, and an Open in browser action that
-  opens `http://localhost:<port>`, or `https://` for an `https` port. An unnamed port offers Open in browser from
+  opens `http://127.0.0.1:<port>`, or `https://` for an `https` port. An unnamed port offers Open in browser from
   its context menu. A forward to a service survives the loss of the pod behind it if another pod is ready.
 - Tests: cluster, ui.
 

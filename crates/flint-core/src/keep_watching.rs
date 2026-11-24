@@ -33,7 +33,8 @@ const SALT_BYTES: usize = 16;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchedCluster {
     pub context: String,
-    /// The exact API server it was turned on for.
+    /// The exact API server it was turned on for, with its proxy if it has one
+    /// ([`crate::kubeconfig::ContextInfo::grant_server`]).
     pub server: String,
 }
 

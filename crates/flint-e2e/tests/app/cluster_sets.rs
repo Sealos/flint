@@ -618,3 +618,61 @@ fn up_84_an_unreachable_member_does_not_block_the_others() -> Result<()> {
     assert_no_writes(&[&a, &b])?;
     Ok(())
 }
+
+/// Answers at once with a credential the fake servers accept.
+const ANSWERING_PLUGIN: &str = r#"#!/bin/sh
+printf '%s' '{"apiVersion":"client.authentication.k8s.io/v1beta1","kind":"ExecCredential","status":{"token":"e2e-stub-token"}}'
+"#;
+
+/// Makes every user in `two`'s kubeconfig sign in through a command that answers at once.
+fn sign_in_through_a_command(two: &TwoClusters) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let plugin = two.scratch.path().join("flint-e2e-answering-plugin");
+    std::fs::write(&plugin, ANSWERING_PLUGIN)?;
+    std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755))?;
+    let path = two.kubeconfig();
+    let mut config = kube::config::Kubeconfig::read_from(&path)?;
+    for user in &mut config.auth_infos {
+        let auth = user.auth_info.as_mut().context("a user's credential")?;
+        auth.exec = Some(serde_json::from_value(json!({
+            "apiVersion": "client.authentication.k8s.io/v1beta1",
+            "command": plugin,
+            "interactiveMode": "Never",
+        }))?);
+    }
+    flint_e2e::fake_api::kubeconfig::write(&path, &config)?;
+    Ok(())
+}
+
+// covers UP-84: a member that signs in through a command, not selected and without consent, asks
+// for sign-in and offers its background sign-in toggle, off. This build has the automation
+// channel, which can never turn that toggle on, so consent is covered by the core's tests.
+#[test]
+#[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
+fn up_84_an_exec_member_offers_its_background_sign_in() -> Result<()> {
+    let two = TwoClusters::start()?;
+    seed_pods(&two.a, &[("on-a", "Running")]);
+    seed_pods(&two.b, &[("on-b", "Running")]);
+    sign_in_through_a_command(&two)?;
+
+    let app = App::launch(AppOptions::new(two.kubeconfig()))?;
+    connect(&app, A)?;
+    open_together(&app, &[A, B])?;
+
+    let state = until(
+        "b asking for sign-in with its toggle offered, and a's pods shown",
+        || app.state().unwrap_or(Value::Null),
+        |state| {
+            member(state, B)["note"] == "Sign-in needed" && shown(state) == pairs(&[(A, "on-a")])
+        },
+    )?;
+    assert_eq!(member(&state, B)["background_sign_in"], json!(false));
+    assert_eq!(member(&state, A)["note"], Value::Null);
+    assert_eq!(member(&state, A)["background_sign_in"], Value::Null);
+
+    app.quit()?;
+    drain_after_quit();
+    assert_no_writes(&[&two.a, &two.b])?;
+    Ok(())
+}

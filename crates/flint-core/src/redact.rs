@@ -346,8 +346,20 @@ pub const HIDDEN_SERVER_URL: &str = "<server URL not shown>";
 /// fragment are dropped, since a hand-written kubeconfig could put a credential there. A URL that
 /// does not parse, or that still holds an `@` after that (a password with a `/` or `?` in it),
 /// becomes [`HIDDEN_SERVER_URL`]. The rest is what kubeconfig, `settings.toml` (ADR-0009) and the
-/// app's sidebar already show.
+/// app's sidebar already show. A grant's `server via proxy` shows each part sanitized on its own.
 pub fn server_url(url: &str) -> String {
+    match url.rsplit_once(" via ") {
+        Some((server, proxy)) => format!(
+            "{} via {}",
+            plain_server_url(server),
+            crate::connection::proxy::shown(proxy)
+        ),
+        None => plain_server_url(url),
+    }
+}
+
+/// [`server_url`] of one URL.
+pub(crate) fn plain_server_url(url: &str) -> String {
     let Ok(uri) = url.trim().parse::<http::Uri>() else {
         return HIDDEN_SERVER_URL.to_owned();
     };
@@ -388,9 +400,22 @@ pub fn server_url(url: &str) -> String {
 }
 
 /// [`server_url`] without its path: `scheme://host[:port]`, for a URL that is no longer the one
-/// in use, whose path nothing on screen needs. Never for comparing pins.
+/// in use, whose path nothing on screen needs. Never for comparing pins. A grant's
+/// `server via proxy` keeps its proxy, shown as [`server_url`] shows it.
 pub fn server_origin(url: &str) -> String {
-    let shown = server_url(url);
+    match url.rsplit_once(" via ") {
+        Some((server, proxy)) => format!(
+            "{} via {}",
+            plain_server_origin(server),
+            crate::connection::proxy::shown(proxy)
+        ),
+        None => plain_server_origin(url),
+    }
+}
+
+/// [`server_origin`] of one URL.
+fn plain_server_origin(url: &str) -> String {
+    let shown = plain_server_url(url);
     let host_at = shown.find("://").map_or(0, |at| at + "://".len());
     match shown[host_at..].find('/') {
         Some(path_at) => shown[..host_at + path_at].to_owned(),
@@ -821,6 +846,30 @@ mod tests {
     }
 
     #[test]
+    fn a_grant_shows_its_server_and_proxy_apart() {
+        for (grant, shown) in [
+            (
+                "https://u:p@api.example:6443/k8s via http://proxy.example:3128",
+                "https://api.example:6443/k8s via http://proxy.example:3128",
+            ),
+            (
+                "https://api.example:6443 via http://user:s3cret@proxy.example:3128",
+                "https://api.example:6443 via http://proxy.example:3128",
+            ),
+            (
+                "https://api.example:6443 via http://user:s3/cret@proxy.example:3128",
+                "https://api.example:6443 via an unreadable proxy URL",
+            ),
+            (
+                "https://u:pa/ss@api.example via http://proxy.example:3128",
+                "<server URL not shown> via http://proxy.example:3128",
+            ),
+        ] {
+            assert_eq!(server_url(grant), shown, "{grant}");
+        }
+    }
+
+    #[test]
     fn server_origins_keep_scheme_host_and_port_only() {
         for (url, shown) in [
             ("https://127.0.0.1:6443", "https://127.0.0.1:6443"),
@@ -830,6 +879,10 @@ mod tests {
             ),
             ("https://[::1]:6443/a/b", "https://[::1]:6443"),
             ("https://u:p/x@host", HIDDEN_SERVER_URL),
+            (
+                "https://api.example:6443/k8s via http://user:s3cret@proxy.example:3128",
+                "https://api.example:6443 via http://proxy.example:3128",
+            ),
         ] {
             assert_eq!(server_origin(url), shown, "{url}");
         }
