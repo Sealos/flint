@@ -1671,6 +1671,8 @@ impl Workspace {
         }
         match self.view_entry(&action.kind, cx) {
             Some(entry) => {
+                // Even the kind shown under Settings: it comes to the front.
+                self.leave_settings_for_view();
                 let open_already = match self.sets.running_kind() {
                     Some(kind) => *kind == entry.id,
                     None => self

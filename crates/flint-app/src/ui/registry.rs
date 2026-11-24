@@ -45,12 +45,18 @@ use super::compare::COMPARE_VIEW;
 pub use super::compare::{
     CompareObject, OpenCompare, RefreshCompare, ToggleCompareSame, ToggleCompareVolatile,
 };
+pub use super::confirm::ConfirmAlternative;
 pub use super::dashboard::set::{OpenSetMember, OpenSetProblem};
 use super::list::combined::{
     SelectCombinedRow, ShowAllCombinedRows, SortCombined, ToggleClusterFilter, ToggleClusterGroup,
     ToggleCombinedProblems, ToggleCombinedWide, ToggleGroupByCluster,
 };
 pub use super::pending_threshold::SetPendingThreshold;
+pub use super::settings_view::{
+    ActivateSettingsControl, CloseSettings, EditAppearance, EditDesktopNotifications,
+    EditWatchMode, NextSettingsControl, OpenSettings, PreviousSettingsControl, RevertSettings,
+    SaveSettings, ShowSettingsSection,
+};
 
 actions!(
     flint,
@@ -915,6 +921,8 @@ pub enum Scope {
     Detail,
     /// The open cluster overview.
     Dashboard,
+    /// The Settings view and its draft (opening it, too).
+    Settings,
     /// An open dialog (the Expose to AI confirmation).
     Dialog,
     /// The bottom dock and its tabs.
@@ -1952,6 +1960,22 @@ const CLUSTER_ALERTS: &[Arg] = &[
         ArgKind::Choice(&["default", "on", "off"]),
     ),
 ];
+const SETTINGS_SECTION: &[Arg] = &[arg(
+    "section",
+    "appearance, alerts or watching",
+    ArgKind::Choice(&["appearance", "alerts", "watching"]),
+)];
+const EDIT_APPEARANCE: &[Arg] = &[arg(
+    "appearance",
+    "system, light or dark",
+    ArgKind::Choice(&["system", "light", "dark"]),
+)];
+const EDIT_NOTIFICATIONS: &[Arg] = &[arg("enabled", "true or false", ArgKind::Bool)];
+const EDIT_WATCH_MODE: &[Arg] = &[arg(
+    "mode",
+    "all or on_view",
+    ArgKind::Choice(&["all", "on_view"]),
+)];
 const PENDING_THRESHOLD: &[Arg] = &[
     Arg {
         name: "cluster",
@@ -2227,6 +2251,76 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         .of(C::Flint, S::App)
         .hidden(),
         Spec::unit::<About>("About Flint", "Show Flint's version.").of(C::Flint, S::Workspace),
+        // Settings (#739): Cmd-, on macOS and Ctrl-, on Linux, as in most apps.
+        Spec::unit::<OpenSettings>(
+            "Settings",
+            "Open Flint's settings: appearance, notifications and the default watch mode.",
+        )
+        .of(C::Flint, S::Settings)
+        .keys(&[super::settings_view::OPEN_SETTINGS_KEY], Some(WORKSPACE)),
+        Spec::unit::<CloseSettings>(
+            "Close Settings",
+            "Leave Settings for the view shown before. Unsaved edits stay.",
+        )
+        .of(C::Flint, S::Settings)
+        .keys(&["escape"], Some(super::settings_view::SETTINGS_KEYS)),
+        Spec::unit::<SaveSettings>(
+            "Save Settings",
+            "Write the settings edited in Settings to settings.toml, and only those.",
+        )
+        .of(C::Flint, S::Settings),
+        Spec::unit::<RevertSettings>(
+            "Revert Settings",
+            "Drop the unsaved edits in Settings and show settings.toml as it is.",
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<ShowSettingsSection>(
+            "Show Settings Section…",
+            "Show one section of Settings.",
+            SETTINGS_SECTION,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditAppearance>(
+            "Edit Appearance…",
+            "Set the appearance in the Settings draft.",
+            EDIT_APPEARANCE,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditDesktopNotifications>(
+            "Edit Desktop Notifications…",
+            "Turn desktop notifications on or off in the Settings draft.",
+            EDIT_NOTIFICATIONS,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditWatchMode>(
+            "Edit Default Watch Mode…",
+            "Set the default watch mode in the Settings draft.",
+            EDIT_WATCH_MODE,
+        )
+        .of(C::Flint, S::Settings),
+        // The view's own Tab cycle, so its controls work without a mouse and Tab never reaches
+        // the panes hidden under it.
+        Spec::unit::<NextSettingsControl>(
+            "Next Settings Control",
+            "Move the cursor to the next control in Settings.",
+        )
+        .of(C::Flint, S::Settings)
+        .keys(&["tab", "down"], Some(super::settings_view::SETTINGS_KEYS))
+        .hidden(),
+        Spec::unit::<PreviousSettingsControl>(
+            "Previous Settings Control",
+            "Move the cursor to the previous control in Settings.",
+        )
+        .of(C::Flint, S::Settings)
+        .keys(&["shift-tab", "up"], Some(super::settings_view::SETTINGS_KEYS))
+        .hidden(),
+        Spec::unit::<ActivateSettingsControl>(
+            "Use Settings Control",
+            "Work the control under the cursor in Settings, as a click does.",
+        )
+        .of(C::Flint, S::Settings)
+        .keys(&["enter", "space"], Some(super::settings_view::SETTINGS_KEYS))
+        .hidden(),
         Spec::unit::<ToggleCommandPalette>(
             "Show Command Palette",
             "Search every action available now, and run one.",
@@ -2312,6 +2406,12 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             .hidden(),
         Spec::confirm(),
         Spec::unit::<Cancel>("Cancel", "Dismiss the open dialog.").of(C::Flint, S::Dialog),
+        Spec::unit::<ConfirmAlternative>(
+            "Choose Alternative",
+            "Answer the open dialog with its third choice (Discard).",
+        )
+        .of(C::Flint, S::Dialog)
+        .hidden(),
         // Clusters.
         Spec::with_args::<SelectCluster>(
             "Select Cluster…",

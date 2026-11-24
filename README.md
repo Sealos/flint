@@ -439,7 +439,9 @@ Flint reads kubeconfig the way `kubectl` does: the files in `KUBECONFIG` if it i
 plus any `kubeconfig_paths` from settings. It never writes to kubeconfig files, and it does not connect to any
 cluster until you select one.
 
-Settings live in `~/Library/Application Support/Flint/settings.toml` (or in `$FLINT_CONFIG_DIR` if set):
+Settings live in `~/Library/Application Support/Flint/settings.toml` (or in `$FLINT_CONFIG_DIR` if set). Flint >
+Settings… (Cmd-, on macOS, Ctrl-, on Linux) edits the appearance, desktop notifications and the default watch mode;
+its edits wait for Save, which writes only what you changed. Other keys are edited in the file:
 
 ```toml
 kubeconfig_paths = ["~/work/kubeconfig"]
