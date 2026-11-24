@@ -4079,6 +4079,9 @@ mod settings_entry;
 #[path = "workspace_sets.rs"]
 mod sets;
 
+#[path = "workspace_thresholds.rs"]
+mod thresholds_entry;
+
 #[cfg(test)]
 #[path = "keyboard_tests.rs"]
 mod keyboard_tests;

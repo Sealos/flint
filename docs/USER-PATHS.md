@@ -592,11 +592,18 @@ M3 used every number in the 5x block, so its later paths continue at UP-121.
 - Tests: unit (ring buffer, aggregation), ui.
 
 ### UP-67 Set warning thresholds
-- **Status:** planned (#102, not in 0.5.0), not built yet.
-- **When** I open the dashboard's Thresholds panel and set CPU warnings at 80% for this cluster only.
-- **Then** this cluster's tiles warn from 80%, other clusters keep the global default, and `settings.toml` holds the
-  typed override.
-- Tests: unit (settings), ui.
+- **When** I open Settings > Thresholds and type a global value (CPU %, memory %, restarts or Warning events in the
+  last hour, seconds a pod may stay Pending), or open Settings > Cluster overrides, add an override for this cluster
+  and set CPU warnings at 80% for it alone, then press Save.
+- **Then** this cluster's tiles warn from 80%, other clusters keep the global value, and `settings.toml` holds the
+  typed values (`[thresholds]` and a `[[thresholds.clusters]]` entry pinned to the cluster's server). An empty field
+  follows the level below. A number outside its metric's range, or not a whole number, stays in its field with the
+  reason under it, and Save is blocked until I fix it or revert. Cluster overrides lists only the clusters whose
+  thresholds, desktop alerts or watch mode differ from the global settings, with a Reset per row that clears all of
+  that cluster's overrides. The Alerts menu's Pending Pods submenu writes the same keys. From the keyboard, Tab
+  reaches each field, Enter opens it for typing, Enter enters the number and Esc drops it.
+- Tests: unit (settings writes, range validation, override rows), ui (`settings_thresholds_tests.rs`), e2e
+  (`flint-e2e/tests/app/settings.rs`).
 
 ### UP-68 Follow recent activity
 - **Status:** planned (#101, not in 0.5.0), not built yet.
@@ -800,7 +807,8 @@ Deferred until cluster sets are scheduled (#199).
 
 ### UP-126 Change settings in Settings
 - **When** I open Settings (Flint > Settings…, Cmd-, on macOS and Ctrl-, on Linux, or the command palette) and change
-  the appearance, desktop notifications or the default watch mode.
+  the appearance, desktop notifications, the default watch mode, the warning thresholds or a cluster's overrides
+  (UP-67).
 - **Then** the main area shows Settings with its sections on the left. My edits wait in a draft until I press Save,
   which writes only the settings I edited to `settings.toml`; Revert drops them. The draft stays while I switch views
   and clusters, and the sidebar's Settings entry shows a dot meanwhile. If `settings.toml` changes while the draft

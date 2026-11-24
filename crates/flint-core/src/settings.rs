@@ -1331,6 +1331,15 @@ pub enum SettingsField {
     Appearance,
     DesktopNotifications,
     WatchMode,
+    /// A threshold: global (`cluster` is `None`) or one cluster's override.
+    Threshold {
+        cluster: Option<ClusterPin>,
+        metric: ThresholdMetric,
+    },
+    /// A cluster's own choice of desktop alerts.
+    ClusterAlerts(ClusterPin),
+    /// A cluster's own watch mode, by context name.
+    ClusterWatchMode(String),
 }
 
 impl SettingsField {
@@ -1340,6 +1349,16 @@ impl SettingsField {
             SettingsField::Appearance => "appearance".to_owned(),
             SettingsField::DesktopNotifications => "desktop_notifications".to_owned(),
             SettingsField::WatchMode => "watch_mode".to_owned(),
+            SettingsField::Threshold {
+                cluster: None,
+                metric,
+            } => format!("thresholds.{}", metric.key()),
+            SettingsField::Threshold {
+                cluster: Some(pin),
+                metric,
+            } => format!("thresholds.clusters.{}.{}", pin.context, metric.key()),
+            SettingsField::ClusterAlerts(pin) => format!("cluster_alerts.{}", pin.context),
+            SettingsField::ClusterWatchMode(context) => format!("cluster_watch_mode.{context}"),
         }
     }
 }
@@ -1354,6 +1373,23 @@ pub enum SettingsWrite {
     DesktopNotifications(bool),
     /// The global watch mode, not a cluster's override.
     WatchMode(WatchMode),
+    /// A threshold, global (`cluster` is `None`) or for one cluster; `None` clears it, so it
+    /// follows the next level down.
+    Threshold {
+        cluster: Option<ClusterPin>,
+        metric: ThresholdMetric,
+        value: Option<u32>,
+    },
+    /// Whether a cluster posts desktop alerts; `None` follows `desktop_notifications`.
+    ClusterAlerts {
+        cluster: ClusterPin,
+        enabled: Option<bool>,
+    },
+    /// A cluster's watch mode; `None` follows the global one.
+    ClusterWatchMode {
+        context: String,
+        mode: Option<WatchMode>,
+    },
 }
 
 impl SettingsWrite {
@@ -1363,6 +1399,18 @@ impl SettingsWrite {
             SettingsWrite::Appearance(_) => SettingsField::Appearance,
             SettingsWrite::DesktopNotifications(_) => SettingsField::DesktopNotifications,
             SettingsWrite::WatchMode(_) => SettingsField::WatchMode,
+            SettingsWrite::Threshold {
+                cluster, metric, ..
+            } => SettingsField::Threshold {
+                cluster: cluster.clone(),
+                metric: *metric,
+            },
+            SettingsWrite::ClusterAlerts { cluster, .. } => {
+                SettingsField::ClusterAlerts(cluster.clone())
+            }
+            SettingsWrite::ClusterWatchMode { context, .. } => {
+                SettingsField::ClusterWatchMode(context.clone())
+            }
         }
     }
 
@@ -1372,6 +1420,9 @@ impl SettingsWrite {
             SettingsWrite::Appearance(_) => "the appearance",
             SettingsWrite::DesktopNotifications(_) => "desktop notifications",
             SettingsWrite::WatchMode(_) => "the watch mode",
+            SettingsWrite::Threshold { .. } => "the threshold",
+            SettingsWrite::ClusterAlerts { .. } => "the cluster's alerts",
+            SettingsWrite::ClusterWatchMode { .. } => "the cluster's watch mode",
         }
     }
 
@@ -1381,6 +1432,17 @@ impl SettingsWrite {
             SettingsWrite::Appearance(a) => settings.appearance == *a,
             SettingsWrite::DesktopNotifications(on) => settings.desktop_notifications == *on,
             SettingsWrite::WatchMode(m) => settings.watch_mode == *m,
+            SettingsWrite::Threshold {
+                cluster,
+                metric,
+                value,
+            } => settings.thresholds.explicit(cluster.as_ref(), *metric) == *value,
+            SettingsWrite::ClusterAlerts { cluster, enabled } => {
+                settings.cluster_alerts_choice(&cluster.context, Some(&cluster.server)) == *enabled
+            }
+            SettingsWrite::ClusterWatchMode { context, mode } => {
+                settings.cluster_watch_mode.get(context) == mode.as_ref()
+            }
         }
     }
 
@@ -1390,6 +1452,34 @@ impl SettingsWrite {
             SettingsWrite::Appearance(a) => settings.appearance = *a,
             SettingsWrite::DesktopNotifications(on) => settings.desktop_notifications = *on,
             SettingsWrite::WatchMode(m) => settings.watch_mode = *m,
+            SettingsWrite::Threshold {
+                cluster,
+                metric,
+                value,
+            } => {
+                // Out of range, the file write is refused too: nothing changes either way.
+                let _ = settings.thresholds.set(cluster.as_ref(), *metric, *value);
+            }
+            SettingsWrite::ClusterAlerts { cluster, enabled } => {
+                settings.cluster_alerts.retain(|e| {
+                    !(e.context == cluster.context && same_server(&e.server, &cluster.server))
+                });
+                if let Some(enabled) = enabled {
+                    settings.cluster_alerts.push(ClusterAlerts {
+                        context: cluster.context.clone(),
+                        server: cluster.server.clone(),
+                        enabled: *enabled,
+                    });
+                }
+            }
+            SettingsWrite::ClusterWatchMode { context, mode } => match mode {
+                Some(mode) => {
+                    settings.cluster_watch_mode.insert(context.clone(), *mode);
+                }
+                None => {
+                    settings.cluster_watch_mode.remove(context);
+                }
+            },
         }
     }
 
@@ -1399,6 +1489,17 @@ impl SettingsWrite {
             SettingsWrite::Appearance(a) => set_appearance(dir, *a),
             SettingsWrite::DesktopNotifications(on) => set_desktop_notifications(dir, *on),
             SettingsWrite::WatchMode(m) => set_watch_mode(dir, None, Some(*m)),
+            SettingsWrite::Threshold {
+                cluster,
+                metric,
+                value,
+            } => set_threshold(dir, cluster.as_ref(), *metric, *value),
+            SettingsWrite::ClusterAlerts { cluster, enabled } => {
+                set_cluster_alerts(dir, &cluster.context, &cluster.server, *enabled)
+            }
+            SettingsWrite::ClusterWatchMode { context, mode } => {
+                set_watch_mode(dir, Some(context), *mode)
+            }
         }
     }
 }
@@ -2945,6 +3046,53 @@ mod tests {
             ],
         );
         assert!(!SettingsWrite::Appearance(Appearance::Dark).holds_in(&Settings::default()));
+        let prod = ClusterPin::new("prod", "https://prod.example:6443");
+        let dev = ClusterPin::new("dev", "https://dev.example:6443");
+        let cpu = ThresholdMetric::CpuPercent;
+        let pending = ThresholdMetric::PendingPodSeconds;
+        let threshold = |cluster: Option<&ClusterPin>, metric, value| SettingsWrite::Threshold {
+            cluster: cluster.cloned(),
+            metric,
+            value,
+        };
+        assert_apply_matches_write(
+            "[thresholds]\nmemory_percent = 70\n\n[[thresholds.clusters]]\ncontext = \"dev\"\n\
+             server = \"https://dev.example:6443/\"\ncpu_percent = 50\n",
+            &[
+                threshold(None, cpu, Some(80)),
+                threshold(Some(&prod), cpu, Some(70)),
+                threshold(Some(&prod), pending, Some(600)),
+                threshold(Some(&prod), cpu, None),
+                threshold(Some(&dev), cpu, Some(60)),
+                threshold(Some(&dev), cpu, None),
+                threshold(Some(&prod), pending, None),
+                threshold(None, ThresholdMetric::MemoryPercent, None),
+                SettingsWrite::ClusterAlerts {
+                    cluster: prod.clone(),
+                    enabled: Some(false),
+                },
+                SettingsWrite::ClusterAlerts {
+                    cluster: prod.clone(),
+                    enabled: Some(true),
+                },
+                SettingsWrite::ClusterAlerts {
+                    cluster: prod.clone(),
+                    enabled: None,
+                },
+                SettingsWrite::ClusterWatchMode {
+                    context: "prod".into(),
+                    mode: Some(WatchMode::OnView),
+                },
+                SettingsWrite::ClusterWatchMode {
+                    context: "prod".into(),
+                    mode: None,
+                },
+            ],
+        );
+        assert_eq!(
+            threshold(Some(&prod), cpu, Some(1)).field().key(),
+            "thresholds.clusters.prod.cpu_percent"
+        );
         assert_eq!(
             SettingsWrite::WatchMode(WatchMode::OnView).field().key(),
             "watch_mode"

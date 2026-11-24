@@ -43,7 +43,7 @@ impl Workspace {
         fn editable(ws: &Workspace, _: &App) -> bool {
             ws.settings_page.open && ws.settings_page.saving.is_none()
         }
-        guards
+        Self::threshold_guards(guards)
             .when::<CloseSettings>(open)
             .when::<ShowSettingsSection>(open)
             .when::<NextSettingsControl>(open)
@@ -59,7 +59,8 @@ impl Workspace {
     }
 
     pub(in crate::ui) fn bind_settings_actions<B: Bind<Self>>(bind: B) -> B {
-        bind.bind::<OpenSettings>(|ws, _, window, cx| ws.open_settings(window, cx))
+        Self::bind_threshold_actions(bind)
+            .bind::<OpenSettings>(|ws, _, window, cx| ws.open_settings(window, cx))
             .bind::<CloseSettings>(|ws, _, window, cx| ws.close_settings(window, cx))
             .bind::<ShowSettingsSection>(|ws, action, _, cx| {
                 ws.show_settings_section(action.section, cx)
@@ -104,6 +105,7 @@ impl Workspace {
         if !self.settings_page.open {
             return;
         }
+        self.finish_threshold_entry(true, window, cx);
         self.leave_settings_for_view();
         window.focus(&self.focus, cx);
         self.recover_focus(window, cx);
@@ -138,6 +140,7 @@ impl Workspace {
         self.settings_page.open = false;
         self.settings_page.opened_over = None;
         self.settings_page.cursor = None;
+        self.settings_page.thresholds.entry = None;
     }
 
     fn settings_invalid(&self, cx: &App) -> bool {
@@ -152,11 +155,12 @@ impl Workspace {
     fn show_settings_section(&mut self, section: settings_view::Section, cx: &mut Context<Self>) {
         if self.settings_page.open {
             self.settings_page.section = section;
+            self.settings_page.thresholds.entry = None;
             cx.notify();
         }
     }
 
-    fn edit_settings(&mut self, change: Change, cx: &mut Context<Self>) {
+    pub(super) fn edit_settings(&mut self, change: Change, cx: &mut Context<Self>) {
         if !self.settings_page.open || self.settings_page.saving.is_some() {
             return;
         }
@@ -171,6 +175,7 @@ impl Workspace {
             return;
         }
         self.settings_page.draft.revert();
+        self.revert_thresholds_page();
         self.settings_page.save_note = None;
         cx.notify();
     }
@@ -241,7 +246,8 @@ impl Workspace {
             return;
         }
         let banner = self.settings_banner_shown(cx);
-        let stops = settings_view::stops(self.settings_page.section, banner);
+        let layout = self.overrides_layout(cx);
+        let stops = settings_view::stops(self.settings_page.section, banner, layout);
         let at = self
             .settings_page
             .cursor
@@ -273,6 +279,7 @@ impl Workspace {
                 self.edit_settings(Change::DesktopNotifications(!on), cx)
             }
             Stop::WatchMode(mode) => self.edit_settings(Change::WatchMode(mode), cx),
+            Stop::Threshold(stop) => self.activate_threshold_stop(stop, window, cx),
         }
     }
 
@@ -290,11 +297,13 @@ impl Workspace {
         if !self.settings_page.open {
             return None;
         }
+        let clusters = self.settings_clusters(cx);
         let model = self.model.read(cx);
         Some(settings_view::render(
             &self.settings_page,
             &model.settings,
             model.settings_error.is_some(),
+            &clusters,
             theme,
         ))
     }
@@ -306,9 +315,10 @@ impl Workspace {
 
     #[cfg(any(test, feature = "automation"))]
     pub(super) fn settings_view_state(&self, cx: &App) -> SettingsState {
+        let clusters = self.settings_clusters(cx);
         let model = self.model.read(cx);
         self.settings_page
-            .state(&model.settings, model.settings_error.is_some())
+            .state(&model.settings, model.settings_error.is_some(), &clusters)
     }
 
     /// Whether Settings holds edits not yet written, a Save under way included.
@@ -349,13 +359,18 @@ impl Workspace {
             return true;
         }
         let invalid = self.settings_invalid(cx);
+        let rejected = self.settings_page.draft.has_rejected();
         let workspace = cx.weak_entity();
-        if invalid {
+        if invalid || rejected {
+            let why = if invalid {
+                "settings.toml is invalid"
+            } else {
+                "Some values in Settings are not accepted"
+            };
             let text = DialogText {
                 title: "Discard unsaved settings?".into(),
                 text: format!(
-                    "settings.toml is invalid, so your edits in Settings cannot be saved. \
-                     {ending} discards them."
+                    "{why}, so your edits in Settings cannot be saved. {ending} discards them."
                 ),
                 ok: "Discard".into(),
                 cancel: "Cancel".into(),
