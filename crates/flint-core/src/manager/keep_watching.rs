@@ -67,6 +67,22 @@ struct LiveGrants {
     members: HashMap<ClusterId, CredentialAccess>,
     /// How many times each cluster's grant was ended, so a save under way can't bring it back.
     revocations: HashMap<ClusterId, u64>,
+    /// Other accesses under a cluster's consent, such as a Helm run's sign-in, by a key of their
+    /// own, while their [`HeldAccess`] lives.
+    held: HashMap<u64, (ClusterId, CredentialAccess)>,
+    next_held: u64,
+}
+
+/// An access held with the grants until dropped ([`KeptGrants::hold_access`]).
+pub(crate) struct HeldAccess {
+    grants: KeptGrants,
+    key: u64,
+}
+
+impl Drop for HeldAccess {
+    fn drop(&mut self) {
+        self.grants.live().held.remove(&self.key);
+    }
 }
 
 impl KeptGrants {
@@ -87,6 +103,31 @@ impl KeptGrants {
         if let Some(access) = live.members.get(id) {
             access.revoke();
         }
+        live.held
+            .values()
+            .filter(|(held, _)| held == id)
+            .for_each(|(_, access)| access.revoke());
+    }
+
+    /// The count of running plugins a quit waits for.
+    pub(crate) fn runs(&self) -> PluginRuns {
+        self.0.runs.clone()
+    }
+
+    /// Holds `access`, made under `id`'s consent, until the result is dropped: ending that
+    /// consent or quitting revokes it, and kills its plugin.
+    pub(crate) fn hold_access(&self, id: &str, access: &CredentialAccess) -> HeldAccess {
+        let mut live = self.live();
+        if live.quitting {
+            access.revoke();
+        }
+        let key = live.next_held;
+        live.next_held += 1;
+        live.held.insert(key, (id.to_owned(), access.clone()));
+        HeldAccess {
+            grants: self.clone(),
+            key,
+        }
     }
 
     /// Ends every grant now. The future resolves once their plugins are gone, or after
@@ -98,6 +139,7 @@ impl KeptGrants {
             live.consents.values().for_each(|consent| consent.void());
             live.feeds.values().for_each(|(_, access)| access.revoke());
             live.members.values().for_each(CredentialAccess::revoke);
+            live.held.values().for_each(|(_, access)| access.revoke());
         }
         let runs = self.0.runs.clone();
         async move {
@@ -534,7 +576,7 @@ impl ClusterManager {
     /// Asked right before each start of `id`'s plugin: the saved file list and the files as they
     /// are now must still define what was agreed to, whether or not a change has been noticed.
     /// A confirmed difference ends the consent at once, so undoing it later brings nothing back.
-    fn launch_check(&self, id: &str, consent: Arc<PluginConsent>) -> cluster::SendCheck {
+    pub(super) fn launch_check(&self, id: &str, consent: Arc<PluginConsent>) -> cluster::SendCheck {
         let files = LaunchFiles {
             paths: self.kubeconfig_paths.clone(),
             base: self.config.kubeconfig_base.clone(),

@@ -2,10 +2,12 @@
 
 // module-tests: ../../../flint-e2e/tests/helm_releases.rs
 
+use std::sync::Arc;
+
 use super::ClusterManager;
 use crate::cluster;
 use crate::handle::AdmittedMember;
-use crate::helm::{HelmError, HelmPin, HelmTarget, runs_root};
+use crate::helm::{HelmError, HelmPin, HelmTarget, PluginLaunch, runs_root};
 use crate::recheck::Pinned;
 use crate::settings::expand_tilde;
 
@@ -65,12 +67,18 @@ impl ClusterManager {
             .helm
             .as_deref()
             .map(|path| expand_tilde(path, home.as_deref()));
+        // Held as a kept feed's plugin is: the same launch check and grants.
+        let plugin = self.member_consent(id).map(|consent| PluginLaunch {
+            check: self.launch_check(id, Arc::clone(&consent)),
+            consent,
+            grants: self.kept_grants(),
+        });
         HelmTarget::new(
             &self.kubeconfig.merged,
             id,
             pin,
             credential,
-            self.member_consent(id),
+            plugin,
             configured,
             runs_root(&self.config.config_dir),
         )
