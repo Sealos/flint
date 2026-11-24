@@ -328,6 +328,9 @@ pub struct Workspace {
     /// Why the last Logs or Shell did not open, shown over the dock until the next one does,
     /// the selection, list or cluster changes, or [`ACTION_ERROR_SHOWN`] has passed.
     action_error: Option<String>,
+    /// The reason stays for all of [`ACTION_ERROR_SHOWN`]: it is about the cluster changing, so
+    /// that change, and the list reopening after it, must not take it away.
+    action_error_held: bool,
     _action_error: Task<()>,
     /// The review a resource action is waiting for.
     _write_review: Task<()>,
@@ -489,6 +492,7 @@ impl Workspace {
             startup_yaml: startup_view.as_ref().is_some_and(|v| v.yaml),
             startup_logs: startup_view.as_ref().is_some_and(|v| v.logs),
             action_error: None,
+            action_error_held: false,
             _action_error: Task::ready(()),
             _write_review: Task::ready(()),
             startup_view,
@@ -809,18 +813,34 @@ impl Workspace {
 
     /// Says why Logs or Shell did not open, over the dock, for [`ACTION_ERROR_SHOWN`].
     pub(in crate::ui) fn refuse(&mut self, why: String, cx: &mut Context<Self>) {
+        self.show_action_error(why, false, cx);
+    }
+
+    /// [`Self::refuse`] for a reason that is about the cluster changing: it outlasts that change.
+    pub(in crate::ui) fn refuse_held(&mut self, why: String, cx: &mut Context<Self>) {
+        self.show_action_error(why, true, cx);
+    }
+
+    fn show_action_error(&mut self, why: String, held: bool, cx: &mut Context<Self>) {
         tracing::warn!("{why}");
         self.action_error = Some(why);
+        self.action_error_held = held;
         let timer = cx.background_executor().timer(ACTION_ERROR_SHOWN);
         self._action_error = cx.spawn(async move |this, cx| {
             timer.await;
-            let _ = this.update(cx, |ws, cx| ws.clear_action_error(cx));
+            let _ = this.update(cx, |ws, cx| {
+                ws.action_error_held = false;
+                ws.clear_action_error(cx);
+            });
         });
         cx.notify();
     }
 
     /// Takes the reason a Logs or Shell did not open away: it no longer applies.
     fn clear_action_error(&mut self, cx: &mut Context<Self>) {
+        if self.action_error_held {
+            return;
+        }
         if self.action_error.take().is_some() {
             self._action_error = Task::ready(());
             cx.notify();
@@ -984,6 +1004,15 @@ impl Workspace {
         let handle = window.window_handle();
         // The same claim as the row actions: one write at a time per object.
         let key = resource_actions::WriteKey::of(review.target());
+        // Only for the server the review named: otherwise it is already about another connection.
+        let guard = self
+            .cluster_summary(&review.target().cluster, cx)
+            .filter(|c| c.info.server == review.target().server)
+            .and_then(|_| self.connection_guard(&review.target().cluster, cx));
+        let Some(guard) = guard else {
+            self.refuse(super::write_binding::connection_changed_text(), cx);
+            return;
+        };
         let begin = {
             let (key, detail) = (key.clone(), detail.clone());
             move |cx: &mut App| match resource_actions::claim(
@@ -1021,6 +1050,7 @@ impl Workspace {
             review.clone(),
             &names,
             None,
+            guard,
             begin,
             move |result, cx| {
                 // First, and outside the window: a closed one must not keep the object claimed.
@@ -1075,6 +1105,14 @@ impl Workspace {
     /// Brings the navigation and main area in line with the model: the active cluster and its
     /// discovery.
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if confirm::newest_is_stale(window, cx) {
+            let this = cx.weak_entity();
+            window.defer(cx, move |window, cx| {
+                if confirm::close_stale(window, cx) {
+                    let _ = this.update(cx, |ws, cx| ws.confirmation_closed(window, cx));
+                }
+            });
+        }
         self.check_dock_servers(cx);
         self.tell_detail_sessions_blocked(cx);
         self.tell_shells_protected(cx);
@@ -1398,10 +1436,11 @@ impl Workspace {
     }
 
     /// Opens `entry`'s list on its own (the view last open on the cluster, `FLINT_VIEW`), not
-    /// at the user's asking: it takes focus only if the palette or the switcher is not open,
-    /// so they stay open with what was typed.
+    /// at the user's asking: it takes focus only if the palette, the switcher or a dialog is not
+    /// open, so they stay open with what was typed and keep their keys.
     fn restore_kind(&mut self, entry: &NavEntry, window: &mut Window, cx: &mut Context<Self>) {
-        let take_focus = self.palette.is_none();
+        let dialog = gpui_kit::component::WindowExt::has_active_dialog(window, cx);
+        let take_focus = self.palette.is_none() && !dialog;
         self.show_kind(entry, true, take_focus, window, cx);
     }
 

@@ -14,25 +14,44 @@ use super::predicate::Predicate;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     /// Make a kubeconfig context the active cluster, as clicking it does.
-    SelectCluster { cluster: String },
+    SelectCluster {
+        cluster: String,
+    },
     /// Open a kind's list on the active cluster, as clicking it in the navigation does.
-    OpenView { kind: String },
+    OpenView {
+        kind: String,
+    },
     /// Select an object in the open list, as clicking its row does.
     SelectRow {
         namespace: Option<String>,
         name: String,
     },
     /// Dispatch a registered action by name, with its arguments.
-    DispatchAction { name: String, args: Value },
+    DispatchAction {
+        name: String,
+        args: Value,
+    },
     /// Type text into the focused element, one keystroke per character.
-    TypeText { text: String },
+    TypeText {
+        text: String,
+    },
     /// Press a key or chord, in GPUI syntax: `enter`, `escape`, `secondary-w`, `down`.
-    PressKey { key: String },
+    PressKey {
+        key: String,
+    },
     /// Right-click the drawn element named `id` (a row's `row-<uid>`), as the mouse does: for
     /// opening a context menu.
-    RightClick { id: String },
+    Click {
+        id: String,
+    },
+    RightClick {
+        id: String,
+    },
     /// Resize the window to `width` by `height` points, to check narrow and short layouts.
-    ResizeWindow { width: f32, height: f32 },
+    ResizeWindow {
+        width: f32,
+        height: f32,
+    },
     /// The visible view tree.
     State,
     /// Wait until `predicate` holds on `state`, or fail after `timeout_ms`.
@@ -42,7 +61,9 @@ pub enum Command {
     },
     /// Capture the window as a PNG named `name` in the screenshots directory (a timestamp when
     /// left out). Only a plain file name: see [`super::setup::screenshot_file`].
-    Screenshot { name: Option<String> },
+    Screenshot {
+        name: Option<String>,
+    },
     /// The registered actions, with whether each is available now: for finding out why a
     /// dispatch says `not_available`.
     Actions,
@@ -262,6 +283,10 @@ fn command(cmd: &str, args: Value) -> Result<Command, Error> {
             let a: KeyArgs = args_of(cmd, args)?;
             Command::PressKey { key: a.key }
         }
+        "click" => {
+            let a: ElementArgs = args_of(cmd, args)?;
+            Command::Click { id: a.id }
+        }
         "right_click" => {
             let a: ElementArgs = args_of(cmd, args)?;
             Command::RightClick { id: a.id }
@@ -412,6 +437,10 @@ mod tests {
             Command::PressKey {
                 key: "escape".into()
             }
+        );
+        assert_eq!(
+            ok(r#"{"cmd":"click","args":{"id":"ok"}}"#),
+            Command::Click { id: "ok".into() }
         );
         assert_eq!(
             ok(r#"{"cmd":"right_click","args":{"id":"row-uid-web"}}"#),

@@ -827,6 +827,31 @@ impl Workspace {
         self.model.read(cx).settings_error.is_none()
     }
 
+    /// A guard on the connection `cluster` has now, for a write's dialogs.
+    pub(in crate::ui) fn connection_guard(
+        &self,
+        cluster: &str,
+        cx: &App,
+    ) -> Option<super::super::write_binding::ConnectionGuard> {
+        super::super::write_binding::ConnectionGuard::of(&self.model, cluster, cx)
+    }
+
+    /// Says why a confirmation closed by itself, and gives focus back if what held it is gone.
+    pub(in crate::ui) fn confirmation_closed(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refuse_held(super::super::write_binding::connection_changed_text(), cx);
+        if window.focused(cx).is_none() {
+            let focus = self
+                .list
+                .as_ref()
+                .map_or_else(|| self.focus.clone(), |l| l.read(cx).focus_handle().clone());
+            window.focus(&focus, cx);
+        }
+    }
+
     pub(in crate::ui) fn cluster_summary<'a>(
         &self,
         name: &str,

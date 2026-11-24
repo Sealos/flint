@@ -654,6 +654,12 @@ impl App {
         self.request("press_key", json!({ "key": key }))
     }
 
+    /// Left-clicks the drawn element `id` (a dialog's `ok`), as the mouse does, whatever holds
+    /// focus.
+    pub fn click(&self, id: &str) -> Result<Value, AppError> {
+        self.request("click", json!({ "id": id }))
+    }
+
     /// Right-clicks the drawn element `id` (a row's `row-<uid>`, from the state's
     /// `list.rows[].id`), as the mouse does: opens its context menu (`state.menu`).
     pub fn right_click(&self, id: &str) -> Result<Value, AppError> {

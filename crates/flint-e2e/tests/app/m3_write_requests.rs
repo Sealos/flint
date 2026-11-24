@@ -4,7 +4,7 @@
 //!
 //! Inline validation (UP-50) is not built yet (#31), so it has no test here.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use flint_e2e::app::{App, AppOptions};
@@ -525,17 +525,11 @@ fn up_54_locking_during_a_confirmation_sends_nothing() -> Result<()> {
     Ok(())
 }
 
-// Known bug, UP-55: re-pointing a context while a confirmation is open moves focus from the dialog
-// to the list behind it. The dialog stays on screen, still naming the old server, and takes no
-// keys: Escape does not close it and `ui::Confirm` is unavailable. Set `FLINT_E2E_KNOWN_BUGS=1` to
-// run it. CI runs every ignored app test, so without that it returns at once.
+// covers UP-55: re-pointing a context closes a confirmation open on it, says why, and leaves the
+// keyboard working on what is behind it.
 #[test]
-#[ignore = "known bug: re-pointing a context takes focus from an open confirmation"]
-fn known_bug_repointing_during_a_confirmation_takes_focus_from_the_dialog() -> Result<()> {
-    if std::env::var_os("FLINT_E2E_KNOWN_BUGS").is_none() {
-        eprintln!("skipped: set FLINT_E2E_KNOWN_BUGS=1 to run this known bug");
-        return Ok(());
-    }
+#[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
+fn up_55_repointing_during_a_confirmation_closes_it() -> Result<()> {
     let cluster = TestCluster::fake(Options::default())?;
     let fake = cluster.fake_server().expect("a fake server");
     let other = FakeApiServer::start_blocking(Options::default())?;
@@ -553,17 +547,261 @@ fn known_bug_repointing_during_a_confirmation_takes_focus_from_the_dialog() -> R
             "/clusters",
             Any(json!({"name": cluster.context, "protection": "protected"})),
         )?;
+        let state = app.wait_for("/dialog", Equals(Value::Null))?;
+        assert_ne!(state["focus"], "none", "{}", state["focus"]);
+        assert!(
+            state["banners"].to_string().contains("connection changed"),
+            "{}",
+            state["banners"]
+        );
         std::thread::sleep(RETRY_WINDOW);
         assert!(fake.writes().is_empty(), "{:?}", fake.writes());
         assert!(other.writes().is_empty(), "{:?}", other.writes());
-        assert_eq!(app.state()?["focus"], "dialog", "the dialog lost focus");
+        // Enter and Escape reach what is behind it, and answer nothing.
+        app.press_key("enter")?;
         app.press_key("escape")?;
-        app.wait_for("/dialog", Equals(Value::Null))?;
+        assert!(app.state()?["dialog"].is_null());
+        std::thread::sleep(RETRY_WINDOW);
         Ok(())
     })?;
     app.quit()?;
     assert!(fake.writes().is_empty(), "{:?}", fake.writes());
     assert!(other.writes().is_empty(), "{:?}", other.writes());
+    Ok(())
+}
+
+/// A dialog of a write action, as far as it is opened before the context moves.
+#[derive(Clone, Copy, Debug)]
+enum Asked {
+    Delete,
+    Restart,
+    ScaleCount,
+    ScaleReview,
+    Cordon,
+    Uncordon,
+    DrainOptions,
+    DrainReview,
+    Apply,
+}
+
+const ASKED: [Asked; 9] = [
+    Asked::Delete,
+    Asked::Restart,
+    Asked::ScaleCount,
+    Asked::ScaleReview,
+    Asked::Cordon,
+    Asked::Uncordon,
+    Asked::DrainOptions,
+    Asked::DrainReview,
+    Asked::Apply,
+];
+
+/// Gives `fake` every object the dialogs act on, the same on both servers.
+fn seed_targets(fake: &FakeApiServer, asked: Asked) -> Result<()> {
+    let nodes = add_node(fake)?;
+    if matches!(asked, Asked::Uncordon) {
+        let mut node = fake.object(&nodes, None, NODE).context("no node")?;
+        node["spec"]["unschedulable"] = true.into();
+        fake.set_object(&nodes, node);
+    }
+    fake.add_pod(pod_on_node("evicted"));
+    seed_configmap(fake);
+    Ok(())
+}
+
+/// Opens `asked`'s dialog on its object.
+fn open_asked(app: &App, asked: Asked) -> Result<()> {
+    let (view, count, namespace, name) = match asked {
+        Asked::Apply => return open_apply(app),
+        Asked::Delete | Asked::Restart | Asked::ScaleCount | Asked::ScaleReview => {
+            ("deployments", 5, Some("demo"), "web")
+        }
+        _ => ("nodes", 2, None, NODE),
+    };
+    open_live(app, view, count)?;
+    select(app, namespace, name)?;
+    match asked {
+        Asked::Delete => open(app, "workspace::DeleteObject").map(drop),
+        Asked::Restart => open(app, "workspace::RestartObject").map(drop),
+        Asked::Cordon => open(app, "workspace::CordonNode").map(drop),
+        Asked::Uncordon => open(app, "workspace::UncordonNode").map(drop),
+        Asked::ScaleCount => open(app, "workspace::ScaleObject").map(drop),
+        Asked::DrainOptions => open(app, "workspace::DrainNode").map(drop),
+        Asked::ScaleReview => {
+            open(app, "workspace::ScaleObject")?;
+            app.press_key("secondary-a")?;
+            app.type_text("5")?;
+            app.dispatch("ui::Confirm", Value::Null)?;
+            app.wait_for("/dialog/text", Contains("to 5.".into()))?;
+            Ok(())
+        }
+        Asked::DrainReview => {
+            let first = open(app, "workspace::DrainNode")?;
+            app.dispatch("ui::Confirm", Value::Null)?;
+            until(
+                "the drain's review",
+                || app.state().unwrap_or(Value::Null),
+                |state| {
+                    state["dialog"]["text"]
+                        .as_str()
+                        .is_some_and(|text| text != first)
+                },
+            )?;
+            Ok(())
+        }
+        Asked::Apply => unreachable!("returned above"),
+    }
+}
+
+fn open_apply(app: &App) -> Result<()> {
+    edit_and_review(app)?;
+    app.dispatch("detail::ApplyYamlEdit", Value::Null)?;
+    app.wait_for("/dialog/title", Exists(true))?;
+    Ok(())
+}
+
+/// Where each server's arrival log stood at the moment a context moved.
+#[derive(Clone, Copy)]
+struct Moved {
+    /// Requests the server it left had received. Anything later came after the move.
+    from: usize,
+    /// Requests the server it reached had received.
+    to: usize,
+}
+
+/// Points the context from `from` at `to`, and waits until the app has reached it. The marks are
+/// taken immediately before the file changes, once access reviews have settled, so a request
+/// that arrives after the move can never count as earlier.
+fn repoint(
+    app: &App,
+    kubeconfig: &std::path::Path,
+    from: &FakeApiServer,
+    to: &FakeApiServer,
+) -> Result<Moved> {
+    let mut last = (access_reviews(from, 0, None).len(), Instant::now());
+    until(
+        "the access reviews to settle",
+        || {
+            let count = access_reviews(from, 0, None).len();
+            if count != last.0 {
+                last = (count, Instant::now());
+            }
+            last.1.elapsed()
+        },
+        |still| *still >= RETRY_WINDOW,
+    )?;
+    let moved = app.edit_kubeconfig([kubeconfig], || {
+        let moved = Moved {
+            from: from.arrivals().len(),
+            to: to.arrivals().len(),
+        };
+        to.write_kubeconfig(kubeconfig, None)?;
+        Ok(moved)
+    })?;
+    until(
+        "a request to the new server",
+        || to.arrivals().len(),
+        |count| *count > moved.to,
+    )?;
+    std::thread::sleep(RETRY_WINDOW);
+    Ok(moved)
+}
+
+/// Answers the open dialog from the keyboard: Enter, or the action Enter is bound to when nothing
+/// in the dialog holds focus.
+fn confirm_by_key(app: &App) -> Result<()> {
+    let shown = app.state()?["dialog"].clone();
+    app.press_key("enter")?;
+    if app.state()?["dialog"] == shown {
+        let _ = app.dispatch("ui::Confirm", Value::Null);
+    }
+    Ok(())
+}
+
+/// Every write after the first `from`, with what the server answered.
+fn writes_since(fake: &FakeApiServer, from: usize) -> Vec<String> {
+    fake.writes()[from..]
+        .iter()
+        .map(|w| format!("{} {}?{} -> {:?}", w.method, w.path, w.query, w.status))
+        .collect()
+}
+
+/// The permission checks among `fake`'s arrivals from `from` up to `to` (the end if `None`). The
+/// fake does not log them as writes.
+fn access_reviews(fake: &FakeApiServer, from: usize, to: Option<usize>) -> Vec<String> {
+    let arrivals = fake.arrivals();
+    arrivals[from..to.unwrap_or(arrivals.len())]
+        .iter()
+        .filter(|r| r.method == Method::POST && r.path.ends_with("/selfsubjectaccessreviews"))
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect()
+}
+
+// covers UP-55: whatever answers a write's dialog after its context moved, by mouse or by key,
+// neither the new server nor the one it was reviewed on receives a write.
+#[test]
+#[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
+fn up_55_answering_a_confirmation_after_a_repoint_writes_nowhere() -> Result<()> {
+    let mut reached = Vec::new();
+    for asked in ASKED {
+        for back in [false, true] {
+            for key in [false, true] {
+                let cluster = TestCluster::fake(Options::default())?;
+                let fake = cluster.fake_server().expect("a fake server");
+                let other = FakeApiServer::start_blocking(Options::default())?;
+                seed_targets(fake, asked)?;
+                seed_targets(&other, asked)?;
+                // Unprotected: the gate is open for both servers, so only the binding refuses.
+                let app = App::launch(AppOptions::new(&cluster.kubeconfig))?;
+                connect(&app, &cluster.context)?;
+                let mut left_open = false;
+                reporting(&app, || {
+                    open_asked(&app, asked)?;
+                    let (on_fake, on_other) = (fake.writes().len(), other.writes().len());
+                    let moved = repoint(&app, &cluster.kubeconfig, fake, &other)?;
+                    if back {
+                        repoint(&app, &cluster.kubeconfig, &other, fake)?;
+                    }
+                    if !app.state()?["dialog"].is_null() {
+                        reached.push(format!("{asked:?} back={back}: the dialog stayed open"));
+                    }
+                    // Answered if it is still there. A first step may lead to a review: that is
+                    // answered too.
+                    for answer in 0..3 {
+                        if app.state()?["dialog"].is_null() {
+                            break;
+                        }
+                        // Enter cancels a drain's review: only its button confirms it.
+                        let by_button = answer > 0 && matches!(asked, Asked::DrainOptions);
+                        if key && !by_button {
+                            confirm_by_key(&app)?;
+                        } else {
+                            let _ = app.click("ok");
+                        }
+                        std::thread::sleep(RETRY_WINDOW);
+                    }
+                    let mut first = writes_since(fake, on_fake);
+                    first.extend(access_reviews(fake, moved.from, None));
+                    let mut second = writes_since(&other, on_other);
+                    second.extend(access_reviews(&other, 0, None));
+                    if !first.is_empty() || !second.is_empty() {
+                        reached.push(format!(
+                            "{asked:?} back={back} key={key}: original {first:?} new {second:?}"
+                        ));
+                    }
+                    left_open = !app.state()?["dialog"].is_null();
+                    Ok(())
+                })?;
+                if left_open {
+                    app.mark_failing();
+                    drop(app);
+                } else {
+                    app.quit()?;
+                }
+            }
+        }
+    }
+    assert!(reached.is_empty(), "{reached:#?}");
     Ok(())
 }
 

@@ -85,6 +85,7 @@ async fn run(command: Command, target: &Target, cx: &mut AsyncApp) -> Result<Val
             settle(target, cx).await;
             Ok(json!({"handled": handled}))
         }
+        Command::Click { id } => click(target, cx, &id).await,
         Command::RightClick { id } => right_click(target, cx, &id).await,
         Command::ResizeWindow { width, height } => {
             in_window(target, cx, |window, _| {
@@ -163,6 +164,20 @@ async fn type_text(target: &Target, cx: &mut AsyncApp, text: &str) -> Result<Val
     Ok(json!({"keystrokes": strokes.len(), "handled": handled}))
 }
 
+/// Left-clicks the element `id` drawn in the window, as the mouse does, whatever holds focus.
+/// Refused as [`right_click`] is.
+async fn click(target: &Target, cx: &mut AsyncApp, id: &str) -> Result<Value, Error> {
+    settle(target, cx).await;
+    let element = ElementId::Name(SharedString::from(id.to_owned()));
+    in_window(target, cx, |window, cx| {
+        drawn_once(window, &element, "click", id)?;
+        window.click(element.clone(), cx);
+        Ok::<_, Error>(())
+    })??;
+    settle(target, cx).await;
+    Ok(json!({"clicked": id}))
+}
+
 /// Right-clicks the element `id` drawn in the window, as the mouse does (pointer move, button
 /// down and up at its center), then draws twice: a context menu is built a frame after the
 /// click. Refused when no element, or more than one, is drawn with that id, or it is out of view.
@@ -170,29 +185,38 @@ async fn right_click(target: &Target, cx: &mut AsyncApp, id: &str) -> Result<Val
     settle(target, cx).await;
     let element = ElementId::Name(SharedString::from(id.to_owned()));
     in_window(target, cx, |window, cx| {
-        let found = window.find_all(element.clone());
-        match found.as_slice() {
-            [] => Err(Error::new(
-                ErrorCode::Rejected,
-                format!("right_click: no element {id} is drawn"),
-            )),
-            [one] if !one.visible() => Err(Error::new(
-                ErrorCode::Rejected,
-                format!("right_click: {id} is drawn out of view"),
-            )),
-            [_] => {
-                window.right_click(element, cx);
-                Ok(())
-            }
-            many => Err(Error::new(
-                ErrorCode::Rejected,
-                format!("right_click: {} elements are drawn as {id}", many.len()),
-            )),
-        }
+        drawn_once(window, &element, "right_click", id)?;
+        window.right_click(element.clone(), cx);
+        Ok::<_, Error>(())
     })??;
     settle(target, cx).await;
     settle(target, cx).await;
     Ok(json!({"right_clicked": id}))
+}
+
+/// Refuses `command` unless exactly one element is drawn as `element`, in view.
+fn drawn_once(
+    window: &mut Window,
+    element: &ElementId,
+    command: &str,
+    id: &str,
+) -> Result<(), Error> {
+    let found = window.find_all(element.clone());
+    match found.as_slice() {
+        [] => Err(Error::new(
+            ErrorCode::Rejected,
+            format!("{command}: no element {id} is drawn"),
+        )),
+        [one] if !one.visible() => Err(Error::new(
+            ErrorCode::Rejected,
+            format!("{command}: {id} is drawn out of view"),
+        )),
+        [_] => Ok(()),
+        many => Err(Error::new(
+            ErrorCode::Rejected,
+            format!("{command}: {} elements are drawn as {id}", many.len()),
+        )),
+    }
 }
 
 /// Draws the settled window and writes it as a PNG under the screenshots directory: a new file
