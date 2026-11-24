@@ -2713,7 +2713,7 @@ impl Workspace {
             .disabled(!settings_ok)
             .tab_stop(false)
             .tooltip(format!(
-                "{label}\nWhich kinds Flint keeps live (watches) on this cluster"
+                "{label}\nAll kinds: every kind is watched. On view: the kinds of open views and the problem kinds are watched"
             ))
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, cx| {
                 let settings = model.read(cx).settings.clone();
@@ -2731,7 +2731,7 @@ impl Workspace {
                             .on_click(registry::on_click(WatchAllKinds)),
                     )
                     .item(
-                        PopupMenuItem::new("Open views only")
+                        PopupMenuItem::new("On view")
                             .checked(own == Some(WatchMode::OnView))
                             .on_click(registry::on_click(WatchOpenViewsOnly)),
                     )
@@ -2743,7 +2743,7 @@ impl Workspace {
                             .on_click(registry::on_click(DefaultWatchAllKinds)),
                     )
                     .item(
-                        PopupMenuItem::new("Open views only")
+                        PopupMenuItem::new("On view")
                             .checked(global == WatchMode::OnView)
                             .on_click(registry::on_click(DefaultWatchOpenViewsOnly)),
                     )
@@ -3792,15 +3792,15 @@ fn centered(content: impl IntoElement) -> AnyElement {
 fn mode_name(mode: WatchMode) -> &'static str {
     match mode {
         WatchMode::All => "all kinds",
-        WatchMode::OnView => "open views only",
+        WatchMode::OnView => "on view",
     }
 }
 
-/// The watch mode button's label: "Live: all kinds" or "Live: open views only".
+/// The watch mode button's label: "Live: all kinds" or "Live: on view".
 fn watch_mode_label(mode: WatchMode) -> &'static str {
     match mode {
         WatchMode::All => "Live: all kinds",
-        WatchMode::OnView => "Live: open views only",
+        WatchMode::OnView => "Live: on view",
     }
 }
 
@@ -3808,7 +3808,7 @@ fn watch_mode_label(mode: WatchMode) -> &'static str {
 fn watch_mode_short_label(mode: WatchMode) -> &'static str {
     match mode {
         WatchMode::All => "Live: all",
-        WatchMode::OnView => "Live: open",
+        WatchMode::OnView => "Live: on view",
     }
 }
 
@@ -4428,7 +4428,7 @@ mod tests {
     #[test]
     fn watch_mode_labels_name_the_mode() {
         assert_eq!(watch_mode_label(WatchMode::All), "Live: all kinds");
-        assert_eq!(watch_mode_label(WatchMode::OnView), "Live: open views only");
+        assert_eq!(watch_mode_label(WatchMode::OnView), "Live: on view");
         for mode in [WatchMode::All, WatchMode::OnView] {
             assert_eq!(watch_mode_label(mode), format!("Live: {}", mode_name(mode)));
         }

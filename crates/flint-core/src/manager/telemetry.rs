@@ -37,19 +37,6 @@ pub(super) struct OpenOverview {
 }
 
 impl ClusterManager {
-    /// Records an overview open on `cluster`'s current connection generation. A context that
-    /// starts over needs a new one, so an overview of its old definition starts nothing.
-    pub(super) fn open_overview(&mut self, id: u64, cluster: ClusterId) {
-        if let Some(generation) = self.cluster(&cluster).map(|slot| slot.generation) {
-            let overview = OpenOverview {
-                cluster,
-                generation,
-                live: None,
-            };
-            self.overviews.insert(id, overview);
-        }
-    }
-
     /// Records an overview only if `cluster` is still the slot `generation`.
     pub(super) fn open_overview_on(
         &mut self,

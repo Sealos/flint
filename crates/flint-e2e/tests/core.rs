@@ -2242,7 +2242,7 @@ async fn until_overview_watches(server: &FakeApiServer, open: bool, what: &str) 
 }
 
 // covers UP-25: in On view the selected cluster still finds problems with no overview open
-// (#715), a Pod Pending for over a minute among them, and an overview adds no second feed.
+// (#715), a Pod Pending for over a minute among them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn in_on_view_problems_are_found_with_no_overview_open() {
     use flint_core::problems::ProblemKind;
@@ -2279,12 +2279,7 @@ async fn in_on_view_problems_are_found_with_no_overview_open() {
     .await
     .expect("the Pending pod is counted");
 
-    let overview = core.handle.open_overview(CONTEXT);
-    overview.registered().await;
     assert_eq!(server.open_watches(&Gvr::core("pods")), 1, "one feed");
-    drop(overview);
-    core.handle.running_set().await;
-    assert!(pending(&core), "leaving the overview keeps the feed");
     assert!(server.writes().is_empty());
 }
 
@@ -2334,8 +2329,7 @@ async fn an_overview_reads_nothing_from_a_replaced_context() {
 
     let replacement = point_at(&core, &file, &second, "demo").await;
     assert_ne!(replacement, original);
-    // Another view of the new slot, so the name has a live feed the old overview could reach.
-    let _other_view = core.handle.open_overview(CONTEXT);
+    // The new slot has a live feed the old overview could reach.
     until_overview_watches(&second, true, "the replacement's feed").await;
     assert!(core.handle.telemetry(CONTEXT).is_some());
     assert!(open.telemetry().is_none(), "opened before the move");

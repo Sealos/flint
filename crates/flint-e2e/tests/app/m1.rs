@@ -346,7 +346,7 @@ fn up_25_change_the_watch_mode() -> Result<()> {
     // watched, and it persists.
     app.dispatch("workspace::WatchOpenViewsOnly", Value::Null)?;
     let state = app.wait_for("/header/watch_mode_source", Equals("cluster".into()))?;
-    assert_eq!(state["header"]["watch_mode"], "Live: open views only");
+    assert_eq!(state["header"]["watch_mode"], "Live: on view");
     until(
         "configmaps unwatched",
         || fake.open_watches(&configmaps),
@@ -368,7 +368,7 @@ fn up_25_change_the_watch_mode() -> Result<()> {
         |n| *n >= 1,
     )?;
     app.dispatch("workspace::DefaultWatchOpenViewsOnly", Value::Null)?;
-    app.wait_for("/header/watch_mode", Equals("Live: open views only".into()))?;
+    app.wait_for("/header/watch_mode", Equals("Live: on view".into()))?;
     until(
         "configmaps unwatched",
         || fake.open_watches(&configmaps),

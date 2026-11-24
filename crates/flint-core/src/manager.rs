@@ -873,7 +873,6 @@ impl ClusterManager {
                     self.release_hub_if_unwatched(&cluster, &kind);
                 }
             }
-            Request::OpenOverview { id, cluster } => self.open_overview(id, cluster),
             Request::OpenOverviewOn {
                 id,
                 cluster,
@@ -5753,9 +5752,12 @@ users:
     }
 
     fn open_dev_overview(manager: &mut ClusterManager, id: u64) {
-        manager.handle_request(Request::OpenOverview {
+        let generation = manager.cluster("dev").unwrap().generation;
+        manager.handle_request(Request::OpenOverviewOn {
             id,
             cluster: "dev".to_owned(),
+            generation,
+            live: tokio::sync::watch::channel(false).0,
         });
     }
 
