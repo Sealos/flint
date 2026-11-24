@@ -254,7 +254,10 @@ impl ClusterManager {
     pub(super) fn member_changed(&self, member: &AdmittedMember) -> Option<String> {
         let id = member.context();
         let changed = || format!("\"{id}\" changed since this set opened. Open the set again.");
-        if self.contexts.check(Pinned::Logs, id, &member.at).is_some() {
+        // A disconnect ends the admission too (`ContextHistory::end_writes`).
+        if self.contexts.check(Pinned::Logs, id, &member.at).is_some()
+            || self.contexts.gate_moved(id, &member.at)
+        {
             return Some(changed());
         }
         let shown = self.cluster(id).and_then(|c| c.info.server.as_deref());
@@ -354,6 +357,8 @@ impl ClusterManager {
     }
 
     fn join_set(&mut self, id: &str, now: Instant) {
+        // Opening a set with it is choosing it again.
+        self.disconnects.lift(id);
         let Some(server) = self.cluster(id).and_then(|c| c.info.server.clone()) else {
             return;
         };
@@ -375,7 +380,7 @@ impl ClusterManager {
     /// Ends `id`'s membership. Its watches stop unless it is active; a connection already up stays,
     /// as it does for a cluster switched away from, and one still being made is dropped. One made
     /// under consent is dropped either way, and the selected cluster connects again.
-    fn leave_set(&mut self, id: &str) {
+    pub(super) fn leave_set(&mut self, id: &str) {
         self.members.remove(id);
         self.schedule.dequeue(&id.to_owned());
         let active = self.active.as_deref() == Some(id);

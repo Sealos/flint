@@ -212,6 +212,8 @@ pub(crate) struct Shown {
     /// [`Self::definition`] for the endpoint: an edit that only adds or drops a trailing slash
     /// keeps it, as it keeps a log session running.
     pub endpoint: u64,
+    /// [`Record::gate`]: what a write is held to.
+    pub gate: u64,
     /// A load confirmed the server shown. Otherwise it may be a fallback, showing only while a
     /// kubeconfig file before it can't be read.
     pub confirmed: bool,
@@ -506,6 +508,15 @@ impl ContextHistory {
         }
     }
 
+    /// Ends every write reviewed or confirmed on `context` so far: the write gate refuses a pin
+    /// from before this, as after a fallback ([`Self::gate_moved`]). Sessions keep running.
+    pub fn end_writes(&mut self, context: &str) {
+        if let Some(r) = self.records.get_mut(context) {
+            self.last += 1;
+            r.gate = self.last;
+        }
+    }
+
     /// Whether a cluster entry's fallback showed since `pin` was taken: nothing new may start
     /// on it, though a session already running goes on.
     pub fn gate_moved(&self, context: &str, pin: &ContextPin) -> bool {
@@ -587,11 +598,13 @@ impl ContextHistory {
             Some(r) => Shown {
                 definition: r.generation,
                 endpoint: r.endpoint,
+                gate: r.gate,
                 confirmed: r.confirmed && r.server.as_deref() == server,
             },
             None => Shown {
                 definition: 0,
                 endpoint: 0,
+                gate: 0,
                 confirmed: false,
             },
         }

@@ -85,6 +85,10 @@ pub enum Command {
     /// Ends the selected cluster's connection attempt and its automatic retries, if it is still
     /// the slot `generation`. It stays failed until selected or retried.
     CancelConnection { cluster: ClusterId, generation: u64 },
+    /// Stops everything Flint runs for a cluster (watches, feeds, retries, log streams, clients)
+    /// and ends its keep-watching consent. Nothing connects it again until it is selected or a
+    /// set with it is opened. Shells are the front end's to end.
+    DisconnectCluster(ClusterId),
     /// Expose a cluster to AI agents at `server` (`Some`), limited to `scope` (ADR-0013), or hide
     /// it (`None`), in `settings.toml`. `server` is the URL the user confirmed; if the context
     /// no longer points there, nothing is written and an error is reported. Exposing an exposed
@@ -420,6 +424,8 @@ pub(crate) enum Request {
         server: Option<Option<String>>,
         /// Set for a running set's tab: the session is pinned to what was admitted.
         member: Option<AdmittedMember>,
+        /// How many times `cluster` had been disconnected when the tab asked.
+        disconnects: u64,
         subject: LogSubject,
         options: LogOptions,
         snapshots: watch::Sender<Arc<LogSnapshot>>,
@@ -550,6 +556,9 @@ pub struct ClusterSummary {
     /// The same for the endpoint: an edit that only adds or drops a trailing slash keeps it, as
     /// it keeps a log session running (a shell, which the write gate checks, ends).
     pub endpoint: u64,
+    /// Moves when nothing confirmed or reviewed before may be written any more on this context:
+    /// a disconnect, or a fallback showing another server. Never goes back.
+    pub write_epoch: u64,
     /// A load confirmed the server shown. Otherwise it may be a fallback, showing only while a
     /// kubeconfig file before it can't be read.
     pub confirmed: bool,
@@ -644,6 +653,12 @@ pub enum Event {
         cluster: ClusterId,
         state: ConnectionState,
     },
+    /// Nothing reviewed or confirmed on `cluster` before now may be written: its
+    /// [`ClusterSummary::write_epoch`] moved to `write_epoch`.
+    WritesEnded {
+        cluster: ClusterId,
+        write_epoch: u64,
+    },
     /// The selected cluster's connection attempts, while it is not connected. `None` once there
     /// is nothing to show.
     ConnectionProgress(Option<ConnectionProgress>),
@@ -706,6 +721,7 @@ pub struct CoreHandle {
     log_budget: Arc<crate::logs::LogBudget>,
     telemetry: crate::telemetry::TelemetryBoard,
     kept: crate::manager::KeptGrants,
+    disconnects: crate::manager::DisconnectCount,
     forwards: crate::manager::ForwardSignals,
     access: Arc<crate::access::AccessCache>,
     /// Set by [`Self::bound_to`]: one-off reads go only to this member.
@@ -739,6 +755,7 @@ impl CoreHandle {
         let telemetry = manager.telemetry_board();
         let holds = manager.definition_holds();
         let kept = manager.kept_grants();
+        let disconnects = manager.disconnect_count();
         let forwards = manager.forward_signals();
         runtime.spawn(manager.run(cmd_rx, req_rx));
         Ok(Self {
@@ -752,6 +769,7 @@ impl CoreHandle {
             log_budget,
             telemetry,
             kept,
+            disconnects,
             forwards,
             access: Arc::default(),
             bound: None,
@@ -992,6 +1010,22 @@ impl CoreHandle {
             bound: Some(Arc::new(member)),
             ..self.clone()
         }
+    }
+
+    /// How many times `cluster` was asked to disconnect, for a write to stamp when it starts.
+    pub(crate) fn disconnects_of(&self, cluster: &str) -> u64 {
+        self.disconnects.of(cluster)
+    }
+
+    /// Whether a write stamped with `asked` must stop ([`Self::disconnects_of`]).
+    pub(crate) fn disconnect_ends_write(&self, cluster: &str, asked: u64) -> bool {
+        self.disconnects.ends_write(cluster, asked)
+    }
+
+    /// Counts a disconnect of `cluster` as asked for, without sending it to the core.
+    #[cfg(test)]
+    pub(crate) fn ask_disconnect_for_test(&self, cluster: &str) {
+        self.disconnects.bump(cluster);
     }
 
     pub(crate) fn is_bound(&self) -> bool {
@@ -1253,6 +1287,7 @@ impl CoreHandle {
             cluster: cluster.to_owned(),
             server,
             member: self.bound.as_deref().cloned(),
+            disconnects: self.disconnects.of(cluster),
             subject: subject.clone(),
             options: options.clone(),
             snapshots,
@@ -1664,6 +1699,7 @@ impl CoreHandle {
     pub fn send(&self, command: Command) {
         // Ending a grant does not wait its turn behind a save the queue may be stuck on.
         if let Command::RevokeBackgroundSignIn(cluster)
+        | Command::DisconnectCluster(cluster)
         | Command::SetKeepWatching {
             cluster,
             definition: None,
@@ -1671,6 +1707,9 @@ impl CoreHandle {
         {
             self.kept.revoke(cluster);
             self.forwards.end_cluster(cluster);
+        }
+        if let Command::DisconnectCluster(cluster) = &command {
+            self.disconnects.bump(cluster);
         }
         if self.commands.try_send(command).is_err() {
             tracing::warn!("core is not running; command dropped");

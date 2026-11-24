@@ -339,6 +339,7 @@ mod tests {
             generation: 1,
             definition: 1,
             endpoint: 1,
+            write_epoch: 0,
             confirmed,
             provisional: !confirmed,
             paused: false,

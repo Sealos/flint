@@ -263,3 +263,33 @@ fn a_masked_looking_tracking_id_on_a_live_object_warns() {
     }});
     assert_eq!(warnings_for(&live).len(), 1);
 }
+
+// A disconnect asked for while a write runs stops its next request at once, before the core
+// has taken the command.
+#[tokio::test]
+async fn a_disconnect_asked_for_stops_the_next_request_before_the_core_runs_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = CoreHandle::start(crate::CoreConfig {
+        config_dir: dir.path().to_owned(),
+        settings: crate::settings::Settings::default(),
+        settings_error: None,
+        kubeconfig_base: Vec::new(),
+        home: None,
+        watch_files: false,
+        watch_timing: Default::default(),
+    })
+    .unwrap();
+    let mut gate = RequestGate::new(core.clone(), &target());
+    assert_eq!(gate.check_disconnects(), Ok(()));
+
+    core.ask_disconnect_for_test("dev");
+
+    let refused = WriteError::from(WriteRefusal::NotConnected {
+        cluster: "dev".to_owned(),
+    });
+    assert_eq!(gate.check_disconnects(), Err(refused.clone()));
+    assert_eq!(gate.client().await.err(), Some(refused.clone()));
+    // A write started now waits for the core to run the disconnect, too.
+    let later = RequestGate::new(core.clone(), &target());
+    assert_eq!(later.check_disconnects(), Err(refused));
+}
