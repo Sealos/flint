@@ -545,10 +545,9 @@ M3 used every number in the 5x block, so its later paths continue at UP-121.
 - Tests: cluster, ui.
 
 ### UP-61 See resource usage
-- **Status:** planned (#101, not in 0.5.0), not built yet.
 - **Then** pod and node lists show CPU and memory from metrics-server, refreshed about every 15 s. If metrics-server is
   missing, the columns are hidden and a hint is shown.
-- Tests: cluster (with and without metrics-server).
+- Tests: cluster (`flint-e2e/tests/telemetry.rs`, with and without metrics-server), ui (`ui/list_usage.rs`).
 
 ### UP-62 See how a namespace's workloads fit together
 - **When** I open the diagram for the `demo` namespace.
@@ -572,7 +571,6 @@ M3 used every number in the 5x block, so its later paths continue at UP-121.
 ---
 
 ### UP-65 See what's wrong when I connect
-- **Status:** planned (#101, not in 0.5.0), not built yet.
 - **When** I connect to a cluster, or pick Overview in the resource tree.
 - **Then** the dashboard shows counts of failing pods, not-ready nodes, recent Warning events, pending PVCs, failed Jobs
   and workloads short of replicas. Clicking a count opens the list filtered to exactly those objects. Counts update
@@ -580,7 +578,6 @@ M3 used every number in the 5x block, so its later paths continue at UP-121.
 - Tests: unit (problem rules), ui, e2e (fake API server).
 
 ### UP-66 See how full the cluster is
-- **Status:** planned (#101, not in 0.5.0), not built yet.
 - **When** metrics-server is installed and I look at the dashboard's usage tiles.
 - **Then** I see CPU and memory used against allocatable, and requests and limits against capacity, per node and in
   total, each with a sparkline of the last hour that keeps growing while I stay connected. Without metrics-server the
@@ -660,8 +657,8 @@ M4 used every number in the 6x block, so its later paths continue at UP-120.
 
 ## M5.5: Multi-cluster and AI
 
-Multi-cluster management, watching and alerting are the next focus and are not in 0.5.0, so cluster sets (UP-82 to
-UP-85) are not built yet. Warm clusters (UP-78, UP-79) are after 1.0 (#247). AI log analysis (UP-75 to UP-77) is not scheduled.
+Cluster sets (UP-82 to UP-85), keeping clusters watched (UP-123) and alerting (UP-124) shipped in 0.6.0; the
+namespace-level set views (UP-86, UP-87) did not. Warm clusters (UP-78, UP-79) are after 1.0 (#247). AI log analysis (UP-75 to UP-77) is not scheduled.
 
 M5.5 was added after M5 and M6 were numbered, so it shares the 7x block with M5 and uses UP-75 to UP-79.
 
@@ -758,6 +755,32 @@ Deferred until cluster sets are scheduled (#199).
 - **Then** an overview shows a card per cluster for `payments` (problems, usage, sparklines) under a totals strip,
   and clicking a card opens that cluster's `payments` overview.
 - Tests: unit (totals), ui, e2e.
+
+### UP-122 Show only the rows with problems
+- **When** I turn on Toggle Problems Only in a list of pods, workloads or nodes (or in a combined list).
+- **Then** the list shows only rows with problems, by the same rules as the overview and the alerts, and keeps
+  following the cluster. Turning it off shows every row again. A selected row the filter hides is closed.
+- Tests: ui (`ui/list_problems_tests.rs`).
+
+### UP-123 Keep a cluster watched in the background
+- **When** I choose Keep Watching Cluster… in a cluster's row menu and switch to another cluster.
+- **Then** the cluster keeps gathering overview data and alerts, and the sidebar shows it. If its credential runs an
+  exec plugin, nothing runs until I consent to background sign-in for that exact definition; any change of the
+  definition voids the consent, and a failed plugin or token refresh stops until I act. Consent is not saved: it
+  lasts until the app quits.
+- Tests: e2e (`flint-e2e/tests/keep_watching.rs`).
+
+### UP-124 Be told about a new problem
+- **Given** desktop notifications turned on (they are off by default and need `Flint.app`), for all clusters or one.
+- **When** a watched cluster, selected or not, gets a new problem.
+- **Then** one notification names the cluster, and opening the alert opens that cluster and no other.
+- Tests: e2e (`flint-e2e/tests/app/notifications.rs`).
+
+### UP-125 Connect through an HTTPS proxy
+- **Given** a kubeconfig cluster with a `proxy-url`.
+- **Then** Flint reads the cluster through the proxy with TLS to the API server itself, so a proxy that leads to
+  another server fails the handshake. Such a context is never treated as a local cluster.
+- Tests: e2e (`flint-e2e/tests/proxy.rs`).
 
 ## M6: Install
 
