@@ -9,10 +9,12 @@ use jiff::Timestamp;
 use tokio::sync::watch;
 
 use super::{
-    Availability, CheckFailure, FailureCause, RequestGate, SideReads, Telemetry, TelemetrySnapshot,
+    Availability, CheckFailure, FailureCause, KeptCoverage, KeptDiscovery, RequestGate, SideReads,
+    Telemetry, TelemetrySnapshot,
 };
 use crate::cluster::{ClusterId, SafeErrorText};
 use crate::metrics_trend::TrendStore;
+use crate::recheck::ContextPin;
 
 /// `good` as last values: readable, its age said in the status, and worth no alert change, since
 /// a pass that could not check the cluster clears nothing and raises nothing.
@@ -39,7 +41,20 @@ pub struct ClusterTelemetry {
     pub reads: SideReads,
     /// The feed has stopped, so `reads` are its last values and nothing polls any more.
     pub stopped: bool,
+    /// Where the catalog that may vouch for this feed's kinds comes from.
+    pub discovery: FeedDiscovery,
+    /// The slot this feed was started for. A summary of any other slot is not about this feed.
+    pub generation: u64,
     trends: Arc<Mutex<TrendStore>>,
+}
+
+/// The discovery that belongs with a feed.
+#[derive(Clone, Copy, Debug)]
+pub enum FeedDiscovery {
+    /// The feed runs on the cluster's slot, whose discovery applies.
+    Slot,
+    /// The feed runs on a kept-watching connection, and only that connection's discovery applies.
+    Kept(KeptCoverage),
 }
 
 impl ClusterTelemetry {
@@ -52,6 +67,8 @@ impl ClusterTelemetry {
             snapshot: Arc::new(snapshot),
             reads,
             stopped,
+            discovery: FeedDiscovery::Slot,
+            generation: 0,
             trends: Arc::default(),
         }
     }
@@ -83,9 +100,24 @@ struct Entry {
     last_good: Arc<Mutex<Option<Arc<TelemetrySnapshot>>>>,
     /// The feed has stopped: its last values stay, in memory only, until the entry is removed.
     held: Option<SideReads>,
+    /// The definition the feed's connection was on when it started.
+    pin: ContextPin,
+    /// A kept feed's own discovery. `None` for a feed on a slot.
+    kept: Option<watch::Receiver<KeptCoverage>>,
+    /// The slot this feed was started for.
+    generation: u64,
 }
 
 impl Entry {
+    /// What may vouch for this feed's kinds. A stopped feed's connection vouches for nothing.
+    fn discovery(&self) -> FeedDiscovery {
+        match &self.kept {
+            None => FeedDiscovery::Slot,
+            Some(_) if self.held.is_some() => FeedDiscovery::Kept(KeptCoverage::NONE),
+            Some(found) => FeedDiscovery::Kept(*found.borrow()),
+        }
+    }
+
     /// `None` once the feed's tasks have ended, so a stopped feed is never read as live. A feed
     /// that can no longer read its cluster shows what it last read, with its age.
     fn read(&self) -> Option<ClusterTelemetry> {
@@ -99,6 +131,8 @@ impl Entry {
             snapshot,
             reads,
             stopped: self.held.is_some(),
+            discovery: self.discovery(),
+            generation: self.generation,
             trends: Arc::clone(&self.trends),
         };
         if let Some(reads) = &self.held {
@@ -155,8 +189,38 @@ impl TelemetryBoard {
     pub(crate) fn publish(
         &self,
         cluster: &str,
+        generation: u64,
+        pin: ContextPin,
         feed: &mut Telemetry,
         trends: Arc<Mutex<TrendStore>>,
+    ) {
+        self.list(cluster, generation, pin, feed, trends, None);
+    }
+
+    /// Lists a kept connection's `feed`, which runs `discovery` for as long as it runs.
+    pub(crate) fn publish_kept(
+        &self,
+        cluster: &str,
+        generation: u64,
+        pin: ContextPin,
+        feed: &mut Telemetry,
+        trends: Arc<Mutex<TrendStore>>,
+        discovery: KeptDiscovery,
+    ) {
+        // A channel per feed: a result of an earlier connection has nowhere to land.
+        let (found, kept) = watch::channel(KeptCoverage::NONE);
+        feed.follow_discovery(discovery, found, self.version.clone());
+        self.list(cluster, generation, pin, feed, trends, Some(kept));
+    }
+
+    fn list(
+        &self,
+        cluster: &str,
+        generation: u64,
+        pin: ContextPin,
+        feed: &mut Telemetry,
+        trends: Arc<Mutex<TrendStore>>,
+        kept: Option<watch::Receiver<KeptCoverage>>,
     ) {
         let last_good = Arc::default();
         feed.notify_changes(self.version.clone(), Arc::clone(&last_good));
@@ -166,6 +230,9 @@ impl TelemetryBoard {
             trends,
             last_good,
             held: None,
+            pin,
+            kept,
+            generation,
         };
         self.feeds().insert(cluster.to_owned(), entry);
         self.bump();
@@ -209,6 +276,14 @@ impl TelemetryBoard {
 
     pub(crate) fn get(&self, cluster: &str) -> Option<ClusterTelemetry> {
         self.feeds().get(cluster).and_then(Entry::read)
+    }
+
+    /// [`Self::get`], only if the feed started on the endpoint of `pin`.
+    pub(crate) fn get_on(&self, cluster: &str, pin: &ContextPin) -> Option<ClusterTelemetry> {
+        self.feeds()
+            .get(cluster)
+            .filter(|entry| entry.pin.same_endpoint_as(pin))
+            .and_then(Entry::read)
     }
 
     pub(crate) fn all(&self) -> Vec<ClusterTelemetry> {

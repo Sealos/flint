@@ -162,6 +162,16 @@ pub struct WriteIntent {
     pub action: WriteAction,
 }
 
+impl WriteIntent {
+    /// This intent, refused if the object's `spec` is no longer the one reviewed.
+    pub(crate) fn holding_spec(mut self) -> Self {
+        if let WriteAction::Resource(action) = &mut self.action {
+            action.reviewed.hold_spec = true;
+        }
+        self
+    }
+}
+
 /// What a confirmation must say before a change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -422,6 +432,34 @@ impl CoreHandle {
             gate.credential = Some(intent.action.credential().clone());
             let kind = kind_of(&core, &intent.target).await?;
             execute(&mut gate, &kind, intent).await
+        });
+        async move { task.await.unwrap_or(Err(WriteRefusal::Stopped.into())) }
+    }
+
+    /// Asks the server to validate a reviewed change without storing it, through the same gate
+    /// as the write. An edit's review already did. Works on any executor.
+    pub(crate) fn dry_run_write(
+        &self,
+        intent: WriteIntent,
+    ) -> impl Future<Output = Result<(), WriteError>> + Send + 'static {
+        let core = self.clone();
+        let task = self.on_runtime(async move {
+            check_bound(&intent)?;
+            let WriteAction::Resource(action) = &intent.action else {
+                return Ok(());
+            };
+            let mut gate = RequestGate::new(core.clone(), &intent.target);
+            gate.pin = Some(action.pin.clone());
+            gate.credential = Some(action.credential.clone());
+            let kind = kind_of(&core, &intent.target).await?;
+            write_actions::dry_run(
+                &mut gate,
+                &kind,
+                &intent.target,
+                action.change(),
+                &action.reviewed,
+            )
+            .await
         });
         async move { task.await.unwrap_or(Err(WriteRefusal::Stopped.into())) }
     }
