@@ -1,7 +1,7 @@
 //! The bridge between a UI (or any other front end) and the core (ADR-0002).
 //!
 //! The core runs on its own multi-thread tokio runtime. Front ends send [`Command`]s (and the
-//! requests behind the other methods) over unbounded queues ([`crate::core_queue`]), so none is
+//! requests behind the other methods) over unbounded queues (`core_queue`), so none is
 //! lost to a full queue, and read [`Event`]s from a bounded queue ([`crate::events`]) that
 //! keeps the latest state of each kind; both work with any executor, so a GPUI task can await
 //! them directly. Nothing here blocks the caller.
@@ -1693,7 +1693,7 @@ impl CoreHandle {
     }
 
     /// Sends a command. Never blocks, and is never dropped for a full queue: commands are taken
-    /// in the order sent ([`crate::core_queue`]). Commands sent after the core stopped are
+    /// in the order sent (`core_queue`). Commands sent after the core stopped are
     /// dropped.
     pub fn send(&self, command: Command) {
         // Ending a grant does not wait its turn behind a save the queue may be stuck on.
