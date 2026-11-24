@@ -26,6 +26,7 @@ pub mod exec;
 pub mod fleet;
 pub mod gitops;
 pub mod handle;
+pub mod helm;
 pub mod keep_watching;
 pub mod kubeconfig;
 mod logging;

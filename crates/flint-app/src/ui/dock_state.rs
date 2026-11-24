@@ -30,7 +30,7 @@ impl Dock {
                         let (status, text) = view.status_state();
                         (status, text, None, Some(view.view_state()))
                     }
-                    DockTab::Activity(_) | DockTab::Compare(_) => {
+                    DockTab::Activity(_) | DockTab::Compare(_) | DockTab::Helm(_) => {
                         (TabStatusState::Watching, "Live".to_owned(), None, None)
                     }
                 };
@@ -110,7 +110,7 @@ impl Dock {
         let in_tab = self.tabs.iter().find_map(|tab| match &tab.tab {
             DockTab::Logs(view) => view.read(cx).focus_in(window, cx),
             DockTab::Shell(view) => view.read(cx).focus_in(window, cx),
-            DockTab::Activity(_) | DockTab::Compare(_) => None,
+            DockTab::Activity(_) | DockTab::Compare(_) | DockTab::Helm(_) => None,
         });
         Some(in_tab.unwrap_or(Focus::Dock))
     }
@@ -127,6 +127,7 @@ pub fn tab_kind(key: &TabKey) -> &'static str {
         TabKey::Shell(_) => "shell",
         TabKey::Activity(_) => "agent_activity",
         TabKey::Compare(..) => "compare",
+        TabKey::Helm(_) => "helm_releases",
     }
 }
 

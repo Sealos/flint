@@ -724,7 +724,7 @@ impl Workspace {
         let opening = match &key {
             TabKey::Logs(_) => Opening::ReconnectLogs,
             TabKey::Shell(_) => Opening::RestartShell,
-            TabKey::Activity(_) | TabKey::Compare(..) => return,
+            TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Helm(_) => return,
         };
         let check = self.model.read(cx).core().check_member(&member);
         self.sets.restart = cx.spawn_in(window, async move |this, cx| {
@@ -752,7 +752,7 @@ impl Workspace {
             TabKey::Logs(_) => Opening::ReconnectLogs,
             TabKey::Shell(_) => Opening::RestartShell,
             // Runs no session to start again.
-            TabKey::Activity(_) | TabKey::Compare(..) => return,
+            TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Helm(_) => return,
         };
         if let Some(reason) = self.sessions_blocked(key.context(), cx) {
             self.refuse(refused(opening, &reason), cx);
@@ -790,7 +790,7 @@ impl Workspace {
                         DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
                     }
                     // It returned above: an activity tab has no session to start again.
-                    TabKey::Activity(_) | TabKey::Compare(..) => {
+                    TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Helm(_) => {
                         unreachable!("these tabs do not restart")
                     }
                 },
@@ -888,7 +888,7 @@ impl Workspace {
         let definition = match key {
             // The core ends a shell on any change of the exact URL, and a log session only when
             // the endpoint changes. Agent activity depends on neither.
-            TabKey::Shell(_) => summary.map_or(0, |c| c.definition),
+            TabKey::Shell(_) | TabKey::Helm(_) => summary.map_or(0, |c| c.definition),
             TabKey::Logs(_) => summary.map_or(0, |c| c.endpoint),
             TabKey::Activity(_) | TabKey::Compare(..) => 0,
         };
