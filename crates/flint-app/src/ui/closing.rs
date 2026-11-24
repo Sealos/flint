@@ -3,8 +3,8 @@
 //! Window (its key, the Window menu, Cmd-W with no dock tab shown), the window's own close button
 //! and Quit all take this path; with nothing at work they close or quit at once.
 //!
-//! Quitting from outside the app (the Dock icon's Quit, logging out) is not asked about: GPUI
-//! offers no hook that can cancel it.
+//! Quitting from outside the app (the Dock icon's Quit, logging out) is not asked about, and
+//! loses an unapplied YAML edit: GPUI offers no hook that can cancel it.
 
 // module-tests: closing_tests.rs
 
@@ -45,6 +45,9 @@ pub fn install(cx: &mut App) {
 /// Makes the window's close button ask first, as Close Window does. Call once per window.
 pub fn guard_close_button(window: &Window, cx: &App) {
     window.on_window_should_close(cx, |window, cx| {
+        if asks_about_edit(window, cx, close_window_after) {
+            return false;
+        }
         let live = live_sessions(window, cx);
         if live.is_empty() {
             return true;
@@ -56,6 +59,9 @@ pub fn guard_close_button(window: &Window, cx: &App) {
 
 /// Closes `window`, asking first while a session in it would end.
 fn close_window(window: &mut Window, cx: &mut App) {
+    if asks_about_edit(window, cx, close_window_after) {
+        return;
+    }
     let live = live_sessions(window, cx);
     if live.is_empty() {
         window.remove_window();
@@ -66,6 +72,20 @@ fn close_window(window: &mut Window, cx: &mut App) {
 
 /// Quits, asking first (over the front window) while a session in any window would end.
 fn quit(cx: &mut App) {
+    // Each window's edit in turn, over that window: Discard comes back here for the next.
+    for handle in cx.windows() {
+        let asked = handle.update(cx, |_, window, cx| {
+            let held =
+                workspace(window, cx).is_some_and(|ws| ws.read(cx).unapplied_edit(cx).is_some());
+            if held {
+                window.activate_window();
+            }
+            held && asks_about_edit(window, cx, |_, cx| cx.defer(quit))
+        });
+        if matches!(asked, Ok(true)) {
+            return;
+        }
+    }
     let mut live = LiveSessions::default();
     for handle in cx.windows() {
         if let Ok(more) = handle.update(cx, |_, window, cx| live_sessions(window, cx)) {
@@ -101,12 +121,39 @@ fn ask(window: &mut Window, cx: &mut App, ending: Ending, live: LiveSessions) {
     );
 }
 
-/// The sessions at work in `window`'s workspace, if it holds one.
-fn live_sessions(window: &Window, cx: &App) -> LiveSessions {
+/// Asks about an unapplied YAML edit in `window`, if it holds one; Discard runs `then`. Whether
+/// the caller must stop.
+fn asks_about_edit(
+    window: &mut Window,
+    cx: &mut App,
+    then: impl Fn(&mut Window, &mut App) + 'static,
+) -> bool {
+    let Some(workspace) = workspace(window, cx) else {
+        return false;
+    };
+    workspace.update(cx, |ws, cx| {
+        ws.asks_before_leaving(window, cx, move |_, window, cx| then(window, cx))
+    })
+}
+
+/// Runs Close Window again once the update under way has ended.
+fn close_window_after(window: &mut Window, cx: &mut App) {
+    let handle = window.window_handle();
+    cx.defer(move |cx| {
+        let _ = handle.update(cx, |_, window, cx| close_window(window, cx));
+    });
+}
+
+fn workspace(window: &Window, cx: &App) -> Option<Entity<Workspace>> {
     window
         .root::<Root>()
         .flatten()
         .and_then(|root| root.read(cx).view().clone().downcast::<Workspace>().ok())
+}
+
+/// The sessions at work in `window`'s workspace, if it holds one.
+fn live_sessions(window: &Window, cx: &App) -> LiveSessions {
+    workspace(window, cx)
         .map(|workspace| workspace.read(cx).live_sessions(cx))
         .unwrap_or_default()
 }

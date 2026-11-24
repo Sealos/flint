@@ -290,6 +290,34 @@ fn drain_report(app: &App) -> Result<(String, String)> {
     Ok((field("title"), field("text")))
 }
 
+// covers UP-51 (#394): closing the pane over an unapplied edit asks. Keep editing leaves the edit
+// in the editor, Discard drops it, and neither answer sends a write.
+#[test]
+#[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
+fn up_51_unapplied_edit_asks_before_closing() -> Result<()> {
+    let cluster = TestCluster::fake(Options::default())?;
+    let fake = cluster.fake_server().expect("a fake server");
+    seed_configmap(fake, "5000", json!({"a": "1"}));
+    let app = launch_unlocked(&cluster)?;
+    start_edit(&app)?;
+
+    app.dispatch("detail::Close", Value::Null)?;
+    app.wait_for("/dialog/title", Equals("Discard unapplied edit?".into()))?;
+    app.dispatch("ui::Cancel", Value::Null)?;
+    app.wait_for("/dialog", Equals(Value::Null))?;
+    app.wait_for("/detail/edit", Equals("editing".into()))?;
+    app.wait_for("/focus", Equals("detail_yaml".into()))?;
+
+    app.dispatch("detail::Close", Value::Null)?;
+    app.wait_for("/dialog/title", Exists(true))?;
+    app.dispatch("ui::Confirm", Value::Null)?;
+    app.wait_for("/dialog", Equals(Value::Null))?;
+    app.wait_for("/detail", Equals(Value::Null))?;
+    assert!(fake.writes().is_empty(), "{:?}", fake.writes());
+    app.quit()?;
+    Ok(())
+}
+
 // covers UP-51: a webhook refusing the dry run or the write is shown in the editor, keeps the
 // edit, and is not retried; Cancel sends nothing, and the edit then applies once.
 #[test]
