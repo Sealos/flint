@@ -16,7 +16,7 @@ Behaviour that is accepted for now. Each entry says what happens and what stays 
 
 ## Alerts and confirmations
 
-- **Alerts can fire for Pending pods.** A pod that stays Pending for over a minute counts as a problem, like in the
+- **Alerts can fire for Pending pods.** A pod that stays Pending for over five minutes counts as a problem, like in the
   dashboard.
 - **A confirmation that is open when its row is hidden can still proceed.** Hiding the row (a filter, a search) does
   not close the dialog. The write gate still applies when it proceeds.
