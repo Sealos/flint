@@ -5,7 +5,7 @@
 //! through its dialog, so none depends on the default protection of a loopback address.
 
 use anyhow::{Context as _, Result};
-use flint_e2e::app::{App, AppOptions, Test};
+use flint_e2e::app::{App, Test};
 use flint_e2e::backend::TestCluster;
 use flint_e2e::fake_api::{FakeApiServer, Gvr, Options, WriteRecord};
 use http::Method;
@@ -13,78 +13,21 @@ use serde_json::{Value, json};
 
 use crate::support::*;
 
-const PROTECTED: &str = "protect_local_clusters = true\n";
 const PODINFO: &str = "/apis/apps/v1/namespaces/demo/deployments/podinfo";
 const RESTARTED_AT: &str = "/spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt";
 /// A node the protection test adds, already cordoned.
 const CORDONED: &str = "cordoned-node";
 
-fn launch(cluster: &TestCluster) -> Result<App> {
-    let app = App::launch(AppOptions::new(&cluster.kubeconfig).settings(PROTECTED))?;
-    connect(&app, &cluster.context)?;
-    assert_eq!(
-        sidebar(&app.state()?, &cluster.context)["protection"],
-        "protected"
-    );
-    Ok(app)
-}
-
-/// Answers the dialog of `action` (`UnlockCluster`, `TrustCluster`) and waits for `protection`.
-fn lift_protection(app: &App, context: &str, action: &str, protection: &str) -> Result<()> {
-    app.dispatch(&format!("workspace::{action}"), json!({"cluster": context}))?;
-    app.wait_for("/dialog/title", Exists(true))?;
-    app.dispatch("ui::Confirm", Value::Null)?;
-    app.wait_for(
-        "/clusters",
-        Any(json!({"name": context, "protection": protection})),
-    )?;
-    Ok(())
-}
-
-/// Selects `name` and waits until its object has loaded.
-fn select(app: &App, namespace: Option<&str>, name: &str) -> Result<()> {
-    app.select_row(namespace, name)?;
-    app.wait_for("/detail/name", Equals(name.into()))?;
-    app.wait_for("/detail/fetch", Equals("loaded".into()))?;
-    Ok(())
-}
-
 /// Selects `name` in `demo` and opens the confirmation of `action` once the registry offers it
 /// (a write still running on the object holds it back): returns what the dialog says.
 fn confirmation(app: &App, name: &str, action: &str) -> Result<String> {
     select(app, Some("demo"), name)?;
-    app_offers(app, action)?;
-    app.dispatch(action, Value::Null)?;
-    let state = app.wait_for("/dialog/title", Exists(true))?;
-    Ok(state["dialog"]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned())
-}
-
-/// Whether the registry offers `action` now.
-fn enabled(app: &App, action: &str) -> Result<bool> {
-    let actions = app.actions()?;
-    let entry = actions["actions"]
-        .as_array()
-        .and_then(|all| all.iter().find(|a| a["name"] == action))
-        .with_context(|| format!("no {action}"))?;
-    Ok(entry["enabled"] == true)
-}
-
-/// Waits until the registry offers `action`.
-fn app_offers(app: &App, action: &str) -> Result<()> {
-    until(
-        action,
-        || enabled(app, action).unwrap_or(false),
-        |offered| *offered,
-    )?;
-    Ok(())
+    open_dialog(app, action)
 }
 
 /// Asserts the registry does not offer `action` and that dispatching it anyway is refused.
 fn assert_refused(app: &App, action: &str) -> Result<()> {
-    assert!(!enabled(app, action)?, "{action} is offered");
+    assert!(!offered(app, action)?, "{action} is offered");
     assert!(app.dispatch(action, Value::Null).is_err(), "{action} ran");
     Ok(())
 }
@@ -105,12 +48,6 @@ fn add_copy(
     object["metadata"]["uid"] = format!("uid-{copy}").into();
     change(&mut object);
     fake.set_object(gvr, object);
-    Ok(())
-}
-
-fn dismiss(app: &App, key: &str) -> Result<()> {
-    app.press_key(key)?;
-    app.wait_for("/dialog", Equals(Value::Null))?;
     Ok(())
 }
 
@@ -138,22 +75,13 @@ fn one_write(writes: &[WriteRecord], before: usize) -> &WriteRecord {
     &new[0]
 }
 
-/// Waits until `count` writes were answered.
-fn answered(fake: &FakeApiServer, count: usize) -> Result<Vec<WriteRecord>> {
-    until(
-        "the write's answer",
-        || fake.writes(),
-        |writes| writes.len() >= count && writes.iter().all(|w| w.status.is_some()),
-    )
-}
-
 // covers UP-53, UP-92
 #[test]
 #[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
 fn up_53_destructive_actions_confirm() -> Result<()> {
     let cluster = TestCluster::fake(Options::default())?;
     let fake = cluster.fake_server().expect("a fake server");
-    let app = launch(&cluster)?;
+    let app = launch_protected(&cluster)?;
     lift_protection(&app, &cluster.context, "UnlockCluster", "unlocked")?;
     open_live(&app, "deployments", 5)?;
 
@@ -242,7 +170,7 @@ fn up_54_protected_cluster_is_read_only() -> Result<()> {
     add_copy(fake, &nodes, None, &node, CORDONED, |object| {
         object["spec"]["unschedulable"] = true.into();
     })?;
-    let app = launch(&cluster)?;
+    let app = launch_protected(&cluster)?;
 
     // Each action is unavailable, and dispatching it anyway is refused.
     open_live(&app, "nodes", 2)?;
@@ -275,15 +203,15 @@ fn up_54_protected_cluster_is_read_only() -> Result<()> {
         "workspace::RestartObject",
         "workspace::DeleteObject",
     ] {
-        app_offers(&app, action)?;
+        wait_offered(&app, action)?;
     }
     open_live(&app, "nodes", 2)?;
     select(&app, None, &node)?;
     for action in ["workspace::CordonNode", "workspace::DrainNode"] {
-        app_offers(&app, action)?;
+        wait_offered(&app, action)?;
     }
     select(&app, None, CORDONED)?;
-    app_offers(&app, "workspace::UncordonNode")?;
+    wait_offered(&app, "workspace::UncordonNode")?;
     assert!(fake.writes().is_empty(), "{:?}", fake.writes());
     app.quit()?;
     Ok(())
@@ -313,14 +241,14 @@ fn up_55_repointing_protects_again() -> Result<()> {
             ONLY_ON_SECOND,
             |_| {},
         )?;
-        let app = launch(&cluster)?;
+        let app = launch_protected(&cluster)?;
         lift_protection(&app, &cluster.context, action, protection)?;
 
         // Lifted: the first server's object offers every write.
         open_live(&app, "deployments", 5)?;
         select(&app, Some("demo"), "web")?;
         for write in WRITES {
-            app_offers(&app, write)?;
+            wait_offered(&app, write)?;
         }
 
         app.edit_kubeconfig([&cluster.kubeconfig], || {
@@ -357,7 +285,7 @@ fn up_55_repointing_protects_again() -> Result<()> {
         // Protection was the reason: lifted for this server, the same object offers them.
         lift_protection(&app, &cluster.context, action, protection)?;
         for write in WRITES {
-            app_offers(&app, write)?;
+            wait_offered(&app, write)?;
         }
 
         assert!(fake.writes().is_empty(), "{action}: {:?}", fake.writes());

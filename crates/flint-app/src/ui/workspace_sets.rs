@@ -1122,6 +1122,20 @@ impl Workspace {
         }
     }
 
+    /// The feed of `member`, bound to the server it was admitted on, or none while it `may_read`
+    /// no feed. The one lookup behind the problems toggle and the set's dashboard, so both read a
+    /// member from the same feed.
+    pub(super) fn admitted_feed(
+        &self,
+        member: &AdmittedMember,
+        may_read: bool,
+        cx: &App,
+    ) -> Option<flint_core::telemetry::ClusterTelemetry> {
+        may_read
+            .then(|| self.model.read(cx).core().member_telemetry(member))
+            .flatten()
+    }
+
     /// Why a row of `cluster` cannot be opened or acted on now, if so.
     fn set_row_refusal(&self, cluster: &str, cx: &App) -> Option<String> {
         let names = self.cluster_names(cx);
