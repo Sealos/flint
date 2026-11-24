@@ -585,7 +585,7 @@ pub(crate) struct KubeDialer {
 /// What a dial needs, without borrowing the dialer into its future.
 #[derive(Clone)]
 struct Access {
-    requests: async_channel::Sender<Request>,
+    requests: crate::core_queue::CoreQueue<Request>,
     id: u64,
     cluster: ClusterId,
     server: Option<Option<String>>,
@@ -1033,7 +1033,7 @@ async fn dial_once(
 
 impl KubeDialer {
     pub(crate) fn new(
-        requests: async_channel::Sender<Request>,
+        requests: crate::core_queue::CoreQueue<Request>,
         request: ForwardRequest,
         grant: ForwardGrant,
         admitted: Option<Arc<AdmittedMember>>,
