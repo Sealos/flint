@@ -260,6 +260,7 @@ pub struct Workspace {
     /// nothing is restored from the old catalog (#255).
     generation: Option<u64>,
     list: Option<Entity<ResourceList>>,
+    problem_feed: problems::ProblemFeed,
     detail: Option<Entity<DetailView>>,
     /// The active cluster's overview, in place of a list.
     dashboard: Option<(Entity<DashboardView>, Subscription)>,
@@ -361,6 +362,7 @@ impl Workspace {
         let observe = cx.observe_in(&model, window, |this, _, window, cx| {
             this.show_appearance(window, cx);
             this.sync(window, cx);
+            this.follow_problem_connections(cx);
             cx.notify();
         });
         let nav = cx.new(NavPanel::new);
@@ -411,6 +413,7 @@ impl Workspace {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let alive = this.update(cx, |this, cx| {
+                    this.refresh_problems(cx);
                     let Some(cluster) = this.cluster.clone() else {
                         return;
                     };
@@ -430,7 +433,7 @@ impl Workspace {
         });
         let dock = cx.new(Dock::new);
         let on_dock = cx.subscribe_in(&dock, window, |this, _, event, window, cx| match event {
-            DockEvent::Blurred => this.reclaim_focus(window, cx),
+            DockEvent::Blurred => this.recover_focus(window, cx),
             DockEvent::Restart(id) => this.restart_tab(*id, window, cx),
         });
         let focus = cx.focus_handle();
@@ -438,7 +441,7 @@ impl Workspace {
         // Focus left with a closed view (a cluster switch drops the list): take it back, so keys
         // and registered actions still reach the workspace.
         let on_focus_lost =
-            cx.on_focus_lost(window, |this, window, cx| this.reclaim_focus(window, cx));
+            cx.on_focus_lost(window, |this, window, cx| this.recover_focus(window, cx));
         let guards = Self::set_guards(Self::guards(cx.entity().downgrade()))
             .when::<OpenClusterOverview>(|ws, _| ws.cluster.is_some() || ws.sets.is_open());
         registry::install(focus.clone(), guards, cx);
@@ -456,6 +459,7 @@ impl Workspace {
             cluster: None,
             generation: None,
             list: None,
+            problem_feed: Default::default(),
             detail: None,
             dashboard: None,
             sets: cluster_sets,
@@ -724,7 +728,7 @@ impl Workspace {
         let opening = match &key {
             TabKey::Logs(_) => Opening::ReconnectLogs,
             TabKey::Shell(_) => Opening::RestartShell,
-            TabKey::Activity(_) | TabKey::Compare(..) => return,
+            TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Helm(_) => return,
         };
         let check = self.model.read(cx).core().check_member(&member);
         self.sets.restart = cx.spawn_in(window, async move |this, cx| {
@@ -752,7 +756,7 @@ impl Workspace {
             TabKey::Logs(_) => Opening::ReconnectLogs,
             TabKey::Shell(_) => Opening::RestartShell,
             // Runs no session to start again.
-            TabKey::Activity(_) | TabKey::Compare(..) => return,
+            TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Helm(_) => return,
         };
         if let Some(reason) = self.sessions_blocked(key.context(), cx) {
             self.refuse(refused(opening, &reason), cx);
@@ -790,7 +794,7 @@ impl Workspace {
                         DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
                     }
                     // It returned above: an activity tab has no session to start again.
-                    TabKey::Activity(_) | TabKey::Compare(..) => {
+                    TabKey::Activity(_) | TabKey::Compare(..) | TabKey::Helm(_) => {
                         unreachable!("these tabs do not restart")
                     }
                 },
@@ -888,7 +892,7 @@ impl Workspace {
         let definition = match key {
             // The core ends a shell on any change of the exact URL, and a log session only when
             // the endpoint changes. Agent activity depends on neither.
-            TabKey::Shell(_) => summary.map_or(0, |c| c.definition),
+            TabKey::Shell(_) | TabKey::Helm(_) => summary.map_or(0, |c| c.definition),
             TabKey::Logs(_) => summary.map_or(0, |c| c.endpoint),
             TabKey::Activity(_) | TabKey::Compare(..) => 0,
         };
@@ -1148,6 +1152,9 @@ impl Workspace {
         // An open switcher follows the active cluster and its discovery.
         self.refresh_switcher(cx);
         let (Some(cluster), Some(discovery)) = (active, discovered.discovery) else {
+            if discovered.error.is_some() {
+                self.open_overview_without_discovery(window, cx);
+            }
             return;
         };
         if self.list.is_some() || self.dashboard.is_some() || self.sets.is_open() {
@@ -1190,6 +1197,27 @@ impl Workspace {
         {
             // The kind last open on this cluster, also after a restart.
             self.restore_kind(&entry, window, cx);
+        }
+        // A saved kind in a group discovery could not vouch for may come with its next retry.
+        let saved_may_come = self
+            .ui_state
+            .last_view(&cluster)
+            .is_some_and(|kind| may_still_be_discovered(&discovery, kind));
+        if self.list.is_none() && !saved_may_come {
+            self.open_default_overview(window, cx);
+        }
+    }
+
+    /// Discovery failed with nothing asked for, so there are no kinds to pick: the overview
+    /// needs none. An explicit or saved kind waits for discovery to work instead.
+    fn open_overview_without_discovery(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pending = self.startup_view.is_some()
+            || self
+                .cluster
+                .as_deref()
+                .is_some_and(|cluster| self.ui_state.last_view(cluster).is_some());
+        if !pending && self.list.is_none() && self.dashboard.is_none() && !self.sets.is_open() {
+            self.open_default_overview(window, cx);
         }
     }
 
@@ -1241,6 +1269,16 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(in crate::ui) fn save_last_view_for_test(&mut self, cluster: &str, kind: &str) {
+        let _ = self.ui_state.set_last_view(cluster, kind);
+    }
+
+    #[cfg(test)]
+    pub(in crate::ui) fn sidebar_focus_for_test(&self) -> FocusHandle {
+        self.sidebar_focus.clone()
+    }
+
+    #[cfg(test)]
     pub(in crate::ui) fn saved_namespace_filter(&self, cluster: &str) -> Vec<String> {
         self.ui_state.namespace_filter(cluster).to_vec()
     }
@@ -1267,14 +1305,36 @@ impl Workspace {
         }
     }
 
+    /// Opens a connected cluster on its overview when nothing else was asked for. A paused
+    /// cluster stays as it is, so no feed starts, and a set being admitted is not cancelled.
+    fn open_default_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let model = self.model.read(cx);
+        let ready = model.active_cluster().is_some_and(|cluster| {
+            matches!(cluster.state, ConnectionState::Connected(_))
+                && !model.sessions_paused(cluster)
+        });
+        if ready && !self.sets.is_opening() {
+            // Connecting from the sidebar leaves focus there, so its arrows keep working.
+            let take_focus =
+                self.palette.is_none() && !self.sidebar_focus.contains_focused(window, cx);
+            self.show_dashboard(take_focus, window, cx);
+        }
+    }
+
     /// Shows the active cluster's overview in place of its list. Go Back returns to the list.
     fn open_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_dashboard(true, window, cx);
+    }
+
+    fn show_dashboard(&mut self, take_focus: bool, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(cluster), Some(generation)) = (self.cluster.clone(), self.generation) else {
             return;
         };
         if let Some((view, _)) = &self.dashboard {
-            let focus = view.read(cx).focus_handle(cx);
-            window.focus(&focus, cx);
+            if take_focus {
+                let focus = view.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+            }
             return;
         }
         // Any place other than the list shown: the overview is not one Go Back returns to.
@@ -1288,8 +1348,10 @@ impl Workspace {
         let model = self.model.clone();
         let view = cx.new(|cx| DashboardView::following(model, cluster, generation, cx));
         let events = cx.subscribe_in(&view, window, Self::on_dashboard_event);
-        let focus = view.read(cx).focus_handle(cx);
-        window.focus(&focus, cx);
+        if take_focus {
+            let focus = view.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        }
         release_unfocused_input(window, cx);
         self.dashboard = Some((view, events));
         self.nav.update(cx, |nav, cx| nav.set_overview(true, cx));
@@ -1304,9 +1366,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let problems = match *event {
-            DashboardEvent::OpenFilteredList(category) => view.read(cx).problem_list(category),
+        let problems = match event {
+            DashboardEvent::OpenFilteredList(category) => view.read(cx).problem_list(*category),
             DashboardEvent::OpenShortWorkloads(kind) => view.read(cx).short_workloads(kind),
+            DashboardEvent::CannotOpen(why) => {
+                self.refuse(why.clone(), cx);
+                return;
+            }
         };
         let Some(problems) = problems.cloned() else {
             return;
@@ -2716,7 +2782,7 @@ impl Workspace {
         let dashboard = self
             .dashboard
             .as_ref()
-            .filter(|_| !matches!(cluster.state, ConnectionState::Failed(_)));
+            .filter(|_| !connection_stopped(&cluster.state));
         let overview_notice = dashboard
             .filter(|_| matches!(cluster.state, ConnectionState::Connecting))
             .and_then(|_| {
@@ -2856,6 +2922,13 @@ impl Workspace {
 /// A side pane's title. On macOS it is the top row, as tall as the main header, and moves the
 /// window. A pane under the traffic lights (`traffic_lights` above zero) leaves the row to them
 /// and shows no title.
+/// Whether `kind` (`plural` or `plural.group`) is in a group `discovery` could not vouch for, so
+/// its absence proves nothing.
+fn may_still_be_discovered(discovery: &flint_core::ClusterDiscovery, kind: &str) -> bool {
+    let group = kind.split_once('.').map_or("", |(_, group)| group);
+    discovery.incomplete_groups.iter().any(|g| g == group)
+}
+
 fn pane_title(title: &'static str, traffic_lights: Pixels, theme: &Theme) -> impl IntoElement {
     let row = div()
         .px_3()
@@ -3820,6 +3893,9 @@ mod actions;
 
 #[path = "workspace_keys.rs"]
 mod keys;
+
+#[path = "workspace_problems.rs"]
+pub(in crate::ui) mod problems;
 
 #[path = "workspace_sets.rs"]
 mod sets;

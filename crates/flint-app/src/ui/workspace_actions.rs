@@ -18,6 +18,11 @@ use gpui_kit::*;
 use std::rc::Rc;
 
 use super::super::activity_view::ActivityView;
+use super::super::helm_view::{HelmView, Pane as HelmPane};
+use super::super::registry::{
+    RefreshHelmReleases, SelectHelmRelease, ShowHelmDetails, ShowHelmHistory, ShowHelmManifest,
+    ShowHelmValues,
+};
 use flint_core::compare::CompareTarget;
 
 use super::super::clusters::ClustersModel;
@@ -47,12 +52,12 @@ use super::super::registry::{
     SetLogContext, SetNamespaces, SetPaneWidth, ShowAll, ShowAllNamespaces, ShowOverview,
     ShowTabList, ShowYaml, SortBy, ToggleAnnotations, ToggleCommandPalette, ToggleErrorsOnly,
     ToggleLabels, ToggleLogRegex, ToggleManagedFields, ToggleMatchingOnly, ToggleNamespace,
-    ToggleNavSection, TogglePause, ToggleResourceSwitcher, ToggleSecretValue, ToggleSources,
-    ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
+    ToggleNavSection, TogglePause, ToggleProblemsOnly, ToggleResourceSwitcher, ToggleSecretValue,
+    ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
     WatchOpenViewsOnly,
 };
 use super::super::registry::{
-    BackToList, EditAiScope, Handler, ShowAgentActivity, ToggleKeepWatching,
+    BackToList, EditAiScope, Handler, ShowAgentActivity, ShowHelmReleases, ToggleKeepWatching,
 };
 use super::super::registry::{
     ClearClusterTag, LockCluster, RenameCluster, SetClusterTag, TrustCluster, UnlockCluster,
@@ -119,6 +124,23 @@ impl Workspace {
         .bind::<ToggleKeepWatching>(Self::toggle_keep_watching)
         .bind::<EditAiScope>(Self::edit_ai_scope)
         .bind::<ShowAgentActivity>(Self::show_agent_activity)
+        .bind::<ShowHelmReleases>(Self::show_helm_releases)
+        .bind::<RefreshHelmReleases>(|ws, _, _, cx| ws.on_helm(cx, HelmView::refresh))
+        .bind::<SelectHelmRelease>(|ws, a, _, cx| {
+            ws.on_helm(cx, |view, cx| view.select_named(&a.namespace, &a.name, cx));
+        })
+        .bind::<ShowHelmDetails>(|ws, _, _, cx| {
+            ws.on_helm(cx, |view, cx| view.set_pane(HelmPane::Details, cx));
+        })
+        .bind::<ShowHelmHistory>(|ws, _, _, cx| {
+            ws.on_helm(cx, |view, cx| view.set_pane(HelmPane::History, cx));
+        })
+        .bind::<ShowHelmValues>(|ws, _, _, cx| {
+            ws.on_helm(cx, |view, cx| view.set_pane(HelmPane::Values, cx));
+        })
+        .bind::<ShowHelmManifest>(|ws, _, _, cx| {
+            ws.on_helm(cx, |view, cx| view.set_pane(HelmPane::Manifest, cx));
+        })
         .bind::<OpenCompare>(Self::open_compare)
         .bind::<CompareObject>(Self::compare_object)
         .bind::<UnlockCluster>(Self::unlock_cluster)
@@ -259,6 +281,10 @@ impl Workspace {
                 |_, _| true,
                 |ws, a, cx| ws.check_cluster::<ShowAgentActivity>(&a.cluster, cx),
             )
+            .add::<ShowHelmReleases>(
+                |_, _| true,
+                |ws, a, cx| ws.check_cluster::<ShowHelmReleases>(&a.cluster, cx),
+            )
             .add::<UnlockCluster>(|_, _| true, |ws, a, cx| ws.unlock_target(a, cx).map(drop))
             .add::<RenameCluster>(Self::settings_ok, |ws, a, cx| {
                 ws.check_cluster::<RenameCluster>(&a.cluster, cx)
@@ -327,6 +353,17 @@ impl Workspace {
             .when::<OpenSelectedRow>(view_open!(list_wide))
             .when::<FocusFilter>(view_open!(list_wide))
             .when::<ToggleWide>(|ws, cx| list_wide(ws, cx) == Some(true))
+            .when::<ToggleProblemsOnly>(|ws, cx| {
+                ws.list
+                    .as_ref()
+                    .is_some_and(|list| list.read(cx).has_problem_filter())
+            })
+            .when::<super::super::list::combined::ToggleCombinedProblems>(|ws, cx| {
+                ws.sets
+                    .running
+                    .as_ref()
+                    .is_some_and(|run| run.list.read(cx).has_problem_filter())
+            })
             .add::<SelectRow>(view_open!(list_wide), |ws, a, cx| match &ws.list {
                 Some(l) => l.read(cx).check_select_row(a),
                 None => Err(ActionError::unavailable::<SelectRow>()),
@@ -424,6 +461,12 @@ impl Workspace {
                         .map_err(ActionError::rejected::<CompareObject>)
                 },
             )
+            .when::<RefreshHelmReleases>(|ws, cx| ws.dock.read(cx).active_helm().is_some())
+            .when::<SelectHelmRelease>(|ws, cx| ws.dock.read(cx).active_helm().is_some())
+            .when::<ShowHelmDetails>(|ws, cx| ws.dock.read(cx).active_helm().is_some())
+            .when::<ShowHelmHistory>(|ws, cx| ws.dock.read(cx).active_helm().is_some())
+            .when::<ShowHelmValues>(|ws, cx| ws.dock.read(cx).active_helm().is_some())
+            .when::<ShowHelmManifest>(|ws, cx| ws.dock.read(cx).active_helm().is_some())
             .when::<RefreshCompare>(|ws, cx| ws.dock.read(cx).active_compare().is_some())
             .when::<ToggleCompareSame>(|ws, cx| ws.dock.read(cx).active_compare().is_some())
             .when::<ToggleCompareVolatile>(|ws, cx| ws.dock.read(cx).active_compare().is_some())
@@ -1160,6 +1203,42 @@ impl Workspace {
             move |_, cx| {
                 DockTab::Activity(cx.new(|cx| ActivityView::new(model, cluster, server, cx)))
             },
+            true,
+            window,
+            cx,
+        );
+    }
+
+    /// Runs `apply` on the Helm releases tab shown.
+    fn on_helm(
+        &mut self,
+        cx: &mut Context<Self>,
+        apply: impl FnOnce(&mut HelmView, &mut Context<HelmView>),
+    ) {
+        if let Some(view) = self.dock.read(cx).active_helm().cloned() {
+            view.update(cx, apply);
+        }
+    }
+
+    /// Opens (or shows) the cluster's Helm releases tab, focused. Strictly read-only.
+    fn show_helm_releases(
+        &mut self,
+        action: &ShowHelmReleases,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(e) = self.check_cluster::<ShowHelmReleases>(&action.cluster, cx) {
+            tracing::warn!("{e}");
+            return;
+        }
+        let core = self.model.read(cx).core().clone();
+        let cluster = action.cluster.clone();
+        let key = TabKey::Helm(cluster.clone());
+        let tab_cluster = self.tab_cluster(&key, cx);
+        self.open_tab(
+            key,
+            tab_cluster,
+            move |_, cx| DockTab::Helm(cx.new(|cx| HelmView::new(core, cluster, cx))),
             true,
             window,
             cx,

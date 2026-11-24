@@ -740,6 +740,119 @@ async fn save_writes_matches_as_shown_to_the_chosen_file(cx: &mut TestAppContext
     );
 }
 
+/// Asks to save every line and confirms, so the file picker is open.
+async fn save_up_to_the_picker(cx: &mut TestAppContext, window: AnyWindowHandle) {
+    cx.update_window(window, |_, window, cx| {
+        window.dispatch_action(
+            Box::new(SaveLines {
+                lines: SaveScope::All,
+                timestamps: None,
+            }),
+            cx,
+        )
+    })
+    .unwrap();
+    cx.wait_for(window, WAIT, |window, cx| window.has_active_dialog(cx))
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        registry::dispatch("ui::Confirm", serde_json::Value::Null, window, cx)
+    })
+    .unwrap()
+    .unwrap();
+    cx.run_until_parked();
+    assert!(cx.did_prompt_for_new_path());
+}
+
+// covers UP-46: cancelling the file picker replaces an earlier save's note and ends the save.
+#[gpui_kit::test]
+async fn a_cancelled_picker_leaves_no_stale_success(cx: &mut TestAppContext) {
+    let (core, dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    feed(cx, &view, lines.push(0, 3).streaming());
+
+    save_up_to_the_picker(cx, window).await;
+    let path = dir.path().join("first.log");
+    cx.simulate_new_path_selection(move |_| Some(path));
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-note").is_some()
+    })
+    .await;
+
+    save_up_to_the_picker(cx, window).await;
+    cx.simulate_new_path_selection(|_| None);
+    cx.run_until_parked();
+
+    let note = view.read_with(cx, |v, _| v.note.clone().unwrap().text);
+    assert_eq!(note, "Save cancelled.");
+    cx.update(|cx| {
+        let slots = cx.default_global::<super::save::SaveSlots>();
+        let held: Vec<_> = (0..super::save::MAX_SAVES).map(|_| slots.take()).collect();
+        assert!(held.iter().all(Option::is_some), "the save ended");
+    });
+}
+
+// covers UP-46: a save past the cap is refused with a reason, and asks nothing.
+#[gpui_kit::test]
+async fn a_save_past_the_cap_is_refused(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    feed(cx, &view, lines.push(0, 3).streaming());
+    let _running: Vec<_> = cx.update(|cx| {
+        let slots = cx.default_global::<super::save::SaveSlots>();
+        (0..super::save::MAX_SAVES).map(|_| slots.take()).collect()
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.dispatch_action(
+            Box::new(SaveLines {
+                lines: SaveScope::All,
+                timestamps: None,
+            }),
+            cx,
+        )
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, window, cx| {
+        assert!(!window.has_active_dialog(cx));
+    })
+    .unwrap();
+    let note = view.read_with(cx, |v, _| v.note.clone().unwrap().text);
+    assert!(note.contains("still running"), "{note}");
+}
+
+// covers UP-46: a save that fails after its tab closed is still reported, in the window.
+#[gpui_kit::test]
+async fn a_failed_save_of_a_closed_tab_is_reported(cx: &mut TestAppContext) {
+    let (core_a, _dir_a) = core();
+    let (core_b, _dir_b) = core();
+    let (window, _view) = open(cx, core_a);
+    let closed = cx
+        .update_window(window, |_, window, cx| {
+            cx.new(|cx| {
+                let mut view = LogView::new(core_b, request(), window, cx);
+                view.stop_streaming();
+                view
+            })
+            .downgrade()
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(closed.upgrade().is_none());
+
+    let mut app = cx.to_async();
+    LogView::finish_save(&closed, window, Err("disk full".to_owned()), &mut app);
+    cx.run_until_parked();
+
+    let shown = cx
+        .update_window(window, |_, window, cx| window.notifications(cx).len())
+        .unwrap();
+    assert_eq!(shown, 1);
+}
+
 // covers UP-45: a workload tab prefixes each line with its pod and container (a view toggle,
 // copied as shown) and counts the workload's streams in the toolbar.
 #[gpui_kit::test]

@@ -37,7 +37,7 @@ use super::row_menu::{OpenRowMenu, RowMenu};
 
 use super::registry::{
     self, CloseDetail, SelectFirst, SelectLast, SelectNext, SelectPrev, SelectRow,
-    ShowAllNamespaces, SortBy, ToggleWide,
+    ShowAllNamespaces, SortBy, ToggleProblemsOnly, ToggleWide,
 };
 
 /// The list's key context; the registry binds the list's keys in it.
@@ -95,16 +95,34 @@ pub struct ObjectFilter {
     pub objects: Arc<CountedObjects>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread sorted a [`CountedObjects`]' namespaces.
+    static NAMESPACE_SORTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The objects a count was made of. An object is matched by UID, so one replaced under the same
 /// name is not it; only an object that reported no UID is matched by name.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct CountedObjects {
     uids: std::collections::HashSet<String>,
     /// `namespace/name`, or `name` when cluster-scoped. A Kubernetes name holds no `/`.
     without_uid: std::collections::HashSet<String>,
-    /// Sorted. Empty when no object is namespaced.
-    namespaces: Vec<String>,
+    /// Empty when no object is namespaced.
+    namespaces: std::collections::HashSet<String>,
+    /// `namespaces` in order, sorted once when first asked for after a change.
+    sorted_namespaces: std::sync::OnceLock<Vec<String>>,
 }
+
+impl PartialEq for CountedObjects {
+    fn eq(&self, other: &Self) -> bool {
+        self.uids == other.uids
+            && self.without_uid == other.without_uid
+            && self.namespaces == other.namespaces
+    }
+}
+
+impl Eq for CountedObjects {}
 
 impl CountedObjects {
     pub fn insert(&mut self, namespace: Option<&str>, name: &str, uid: Option<&str>) {
@@ -117,11 +135,10 @@ impl CountedObjects {
             }
         }
         if let Some(namespace) = namespace
-            && let Err(at) = self
-                .namespaces
-                .binary_search_by(|n| n.as_str().cmp(namespace))
+            && !self.namespaces.contains(namespace)
         {
-            self.namespaces.insert(at, namespace.to_owned());
+            self.namespaces.insert(namespace.to_owned());
+            self.sorted_namespaces.take();
         }
     }
 
@@ -140,6 +157,17 @@ impl CountedObjects {
 
     fn matches(&self, namespace: Option<&str>, name: &str, uid: &str) -> bool {
         self.uids.contains(uid) || self.without_uid.contains(&Self::key(namespace, name))
+    }
+
+    /// The namespaces of the objects, sorted.
+    pub fn namespaces(&self) -> &[String] {
+        self.sorted_namespaces.get_or_init(|| {
+            #[cfg(test)]
+            NAMESPACE_SORTS.with(|sorts| sorts.set(sorts.get() + 1));
+            let mut sorted: Vec<String> = self.namespaces.iter().cloned().collect();
+            sorted.sort_unstable();
+            sorted
+        })
     }
 
     fn key(namespace: Option<&str>, name: &str) -> String {
@@ -166,6 +194,7 @@ pub struct ResourceList {
     shown_columns: Arc<[flint_core::Column]>,
     rows: Arc<[u32]>,
     query: Query,
+    problems: problems::ProblemFilter,
     show_wide: bool,
     widths: ColumnWidths,
     selected: Option<Selected>,
@@ -346,6 +375,7 @@ impl ResourceList {
                 sort,
                 ..Default::default()
             },
+            problems: Default::default(),
             show_wide: false,
             widths: ColumnWidths::default(),
             selected: None,
@@ -522,7 +552,7 @@ impl ResourceList {
     /// The namespaces shown: a narrowed list covers its objects, whatever the picker holds.
     fn scope(&self) -> &[String] {
         match &self.query.only {
-            Some(only) => &only.objects.namespaces,
+            Some(only) => only.objects.namespaces(),
             None => &self.query.namespaces,
         }
     }
@@ -692,7 +722,15 @@ impl ResourceList {
         };
         self.missing = None;
         self.selected_seen = rows_revision(&self.latest, namespace);
-        let row = &self.latest.rows[row];
+        let row = Arc::clone(&self.latest.rows[row]);
+        if self.problems.hides(&self.kind, &self.cluster, &row) {
+            // Named from outside the list: a row the filter hides is not a target.
+            self.clear_selection(cx);
+            self.problems.note_hidden_pick(&row.name);
+            cx.notify();
+            return;
+        }
+        self.problems.clear_hidden_pick();
         self.selected = Some(Selected {
             uid: row.uid.clone(),
             name: row.name.to_string(),
@@ -742,6 +780,7 @@ impl ResourceList {
         let job_snapshot = snapshot.clone();
         let only = self.query.only.as_ref().map(|only| only.objects.clone());
         let job_only = only.clone();
+        let job_problems = self.problems.row_filter(&self.kind, &self.cluster);
         #[cfg(test)]
         let gate = self.compute_gate.clone();
         let job = cx.background_spawn(async move {
@@ -761,6 +800,19 @@ impl ResourceList {
                     .collect(),
                 None => rows,
             };
+            let rows: Arc<[u32]> = match &job_problems {
+                Some(filter) => rows
+                    .iter()
+                    .copied()
+                    .filter(|&i| filter.keeps(&job_snapshot.rows[i as usize]))
+                    .collect(),
+                None => rows,
+            };
+            let awaiting = job_problems.as_ref().map_or(0, |filter| {
+                rows.iter()
+                    .filter(|&&i| filter.awaits_check(&job_snapshot.rows[i as usize]))
+                    .count()
+            });
             let usage = Arc::new(usage_source.values(&job_snapshot.rows));
             let rows = job_sort
                 .and_then(|sort| {
@@ -776,10 +828,18 @@ impl ResourceList {
                 rows.iter()
                     .position(|&i| job_snapshot.rows[i as usize].uid == *uid)
             });
-            (rows, widths, scoped, selected_uid, position, usage)
+            (
+                rows,
+                widths,
+                scoped,
+                selected_uid,
+                position,
+                usage,
+                awaiting,
+            )
         });
         self._compute = cx.spawn(async move |this, cx| {
-            let (rows, widths, scoped, uid, position, usage) = job.await;
+            let (rows, widths, scoped, uid, position, usage, awaiting) = job.await;
             let select_first = this.update(cx, |list, cx| {
                 list.computing = false;
                 #[cfg(test)]
@@ -811,6 +871,7 @@ impl ResourceList {
                 list.scoped = scoped;
                 list.rows_in_one_namespace = one_namespace;
                 list.usage.set_values(usage);
+                list.problems.set_awaiting(awaiting);
                 list.apply(snapshot, rows, uid, position, cx);
                 if list.dirty {
                     list.recompute(cx);
@@ -843,6 +904,7 @@ impl ResourceList {
         cx: &mut Context<Self>,
     ) {
         self.shown_columns = self.usage.columns_for(&snapshot.columns);
+        self.reconcile_problem_selection(cx);
         self.shown = snapshot;
         self.rows = rows;
         // `drawn` indexes into the snapshot's columns, and the automation state and `SortBy` read
@@ -894,13 +956,44 @@ impl ResourceList {
             // The selection changed while this ran: find it again.
             Some(_) => self.dirty = true,
         }
+        self.reconcile_problem_selection(cx);
         cx.notify();
+    }
+
+    /// Whether the Problems filter, as it is now, hides the selected object. Judged on the
+    /// newest rows, then on those drawn, whichever job last computed them.
+    fn problems_hide_selected(&self) -> bool {
+        let Some(selected) = &self.selected else {
+            return false;
+        };
+        [&self.latest, &self.shown]
+            .into_iter()
+            .find_map(|rows| {
+                find_row(rows, selected.namespace.as_deref(), &selected.name)
+                    .map(|i| &rows.rows[i])
+                    .filter(|row| row.uid == selected.uid)
+            })
+            .is_some_and(|row| self.problems.hides(&self.kind, &self.cluster, row))
+    }
+
+    /// Ends a selection the filter hides, so its detail closes and it is no action's target.
+    pub(super) fn reconcile_problem_selection(&mut self, cx: &mut Context<Self>) {
+        if self.problems_hide_selected() {
+            self.hidden_selected = None;
+            self.clear_selection(cx);
+        }
     }
 
     fn select_index(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(&row_ix) = self.rows.get(ix) else {
             return;
         };
+        let row = &self.shown.rows[row_ix as usize];
+        // Drawn from an earlier filter, with the new rows still being computed.
+        if self.problems.hides(&self.kind, &self.cluster, row) {
+            return;
+        }
+        self.problems.clear_hidden_pick();
         let row = &self.shown.rows[row_ix as usize];
         let selected = Selected {
             uid: row.uid.clone(),
@@ -1338,6 +1431,12 @@ impl ResourceList {
                 )
             })
             .child(div().flex_1())
+            .when(problems::ProblemListKind::of(&self.kind).is_some(), |el| {
+                el.child(
+                    problems::toggle_button(self.problems.is_on())
+                        .on_click(registry::on_click(ToggleProblemsOnly)),
+                )
+            })
             .when(wide, |el| {
                 el.child(
                     Button::new("toggle-wide")
@@ -1503,6 +1602,16 @@ impl ResourceList {
                     theme.muted_foreground,
                 ))
             }
+            _ if self.rows.is_empty()
+                && !snapshot.rows.is_empty()
+                && self.problems.is_checked(&self.kind, &self.cluster) =>
+            {
+                Some(message(
+                    format!("No problems found in {label}"),
+                    Some("Turn off Problems to see every row.".to_owned()),
+                    theme.muted_foreground,
+                ))
+            }
             _ if self.rows.is_empty() => {
                 let filtered = !self.query.text.trim().is_empty()
                     || (self.namespaced && !self.query.namespaces.is_empty());
@@ -1643,6 +1752,14 @@ impl ResourceList {
             );
             banners.push(
                 notice("list-problem-filter", text.clone(), theme.info)
+                    .aria_label(text)
+                    .test_support()
+                    .into_any_element(),
+            );
+        }
+        if let Some(text) = self.problems_note() {
+            banners.push(
+                notice(problems::UNCHECKED_BANNER, text.clone(), theme.warning)
                     .aria_label(text)
                     .test_support()
                     .into_any_element(),
@@ -1986,6 +2103,13 @@ mod managed;
 )]
 #[path = "list_combined.rs"]
 pub mod combined;
+
+#[path = "list_problems.rs"]
+pub(in crate::ui) mod problems;
+
+#[cfg(test)]
+#[path = "list_problems_tests.rs"]
+mod problems_tests;
 
 #[cfg(any(test, feature = "automation"))]
 #[path = "list_state.rs"]

@@ -16,7 +16,14 @@ the background while the app runs, stored on disk.
   Automatic recordings show in the sidebar and as a notification.
 - **Storage:** one SQLite database in Flint's data directory (`recordings.sqlite`, owner-only permissions, WAL mode),
   with typed tables (recordings, lines with timestamp, pod, container and text, events, metric samples) — no JSON
-  blobs. Logs are stored as written, not redacted: a redaction false positive would destroy the exact line needed.
+  blobs.
+- **Redaction:** logs and events are stored redacted. A redaction false positive can cost part of a line; a credential
+  on disk costs more.
+- **Fail closed:** after any loss in a log source (a cut or clipped record, a dropped row, a queue overflow, or rows
+  arriving out of order), Flint stores no further text from that source until its stream actually restarts. It stores
+  a visible gap marker with a count instead. A clipped record keeps only the cut marker, never part of its value. Log
+  content cannot end this state: no PEM footer, delimiter, blank line, line count or timer does. Recordings accept
+  these gaps.
 - **Retention:** typed settings with defaults of 7 days, 500 MB per recording and 2 GB in total. The oldest data goes
   first; starred recordings are kept until deleted.
 - **Credentials:** recordings never run exec-plugin sign-ins in the background
@@ -26,8 +33,8 @@ the background while the app runs, stored on disk.
   events and CPU/memory tracks above on a shared time axis; clicking an event moves the logs to that moment.
 - **Agents:** recordings are not available through MCP. The MCP server stays at its six read-only tools
   ([ADR-0009](./0009-read-only-mcp-server.md)).
-- **Export:** a time range as plain-text logs plus events and metrics as CSV, with the "not redacted" warning that
-  Save logs shows.
+- **Export:** a time range as plain-text logs plus events and metrics as CSV. Redaction is best effort, so export keeps
+  the warning that Save logs shows.
 
 ## Considered Options
 
@@ -38,8 +45,11 @@ the background while the app runs, stored on disk.
   lifecycle and its own sign-in story. Deferred.
 - **Plain files per recording (JSON lines or text):** simpler to write, but time-range queries across lines, events
   and metrics, and retention by size and age, want an indexed store.
-- **Redacting or encrypting at rest:** redaction can destroy evidence irreversibly; encryption adds key management
-  and slows search. Owner-only files match how shells and kubectl cache sensitive data.
+- **Storing logs as written:** keeps every line exact, but puts any credential a workload logs on disk.
+- **Recovering mid-stream after a loss** (waiting for a PEM footer, or a fixed number of lines): log content can forge
+  or outlast any such signal, so it cannot prove the following text is safe.
+- **Encrypting at rest:** adds key management and slows search. Owner-only files match how shells and kubectl cache
+  sensitive data.
 - **Automatic recording without guards:** a bad rollout could record hundreds of pods; hence the opt-in, the pod cap
   and the auto-stop.
 
@@ -48,4 +58,7 @@ the background while the app runs, stored on disk.
 - Flint gains a SQLite dependency (bundled, so no system library) and a schema with migrations.
 - Recordings keep their cluster connected like a warm cluster, and count toward the memory and watch budgets; the
   soak test covers a running recording.
-- The data directory now holds sensitive logs; the docs say where and how to delete them.
+- The data directory still holds sensitive logs, since redaction is best effort; the docs say where and how to delete
+  them.
+- A recording can have gaps that a fuller capture would have filled: one lost row silences its source until that
+  stream restarts.

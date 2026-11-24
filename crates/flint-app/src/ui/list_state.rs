@@ -13,7 +13,7 @@ use super::super::view_state::{
     Banner, Focus, Level, ListState, RowState, SortState, error_text, sync_word,
 };
 use super::combined::{self, CombinedResourceList};
-use super::{ResourceList, limited_text, list_model};
+use super::{ResourceList, limited_text, list_model, problems};
 
 #[cfg_attr(
     not(test),
@@ -94,6 +94,10 @@ impl CombinedResourceList {
                     format!("{}: {}", m.display_name(), sync_word(m.state(), feed(i))),
                 )
             })
+            .chain(
+                self.problems_note()
+                    .map(|text| Banner::new(problems::UNCHECKED_BANNER, Level::Warning, text)),
+            )
             .chain(members.iter().enumerate().filter_map(|(i, m)| {
                 let limit = self.shown.coverage[i].limit.as_ref()?;
                 Some(Banner::new(
@@ -130,6 +134,7 @@ impl CombinedResourceList {
                 })
             }),
             wide: self.show_wide,
+            problems_only: self.problems.is_on(),
             placeholder: self.empty_state().map(|empty| match empty {
                 list_model::combined::EmptyState::Loading => "loading",
                 list_model::combined::EmptyState::NoRows
@@ -212,6 +217,7 @@ impl ResourceList {
                 descending,
             }),
             wide: self.show_wide,
+            problems_only: self.problems.is_on(),
             placeholder: self.placeholder_kind(),
             banners: self.banner_states(),
         }
@@ -245,7 +251,8 @@ impl ResourceList {
             _ if self.restoring_filter => Some("loading"),
             _ if self.rows.is_empty() => {
                 let filtered = !self.query.text.trim().is_empty()
-                    || (snapshot.namespaced && !self.query.namespaces.is_empty());
+                    || (snapshot.namespaced && !self.query.namespaces.is_empty())
+                    || self.problems.is_checked(&self.kind, &self.cluster);
                 Some(if !snapshot.rows.is_empty() && filtered {
                     "no_match"
                 } else {
@@ -268,6 +275,13 @@ impl ResourceList {
         }
         if let Some(hint) = self.usage.hint() {
             banners.push(Banner::new("list-usage-hint", Level::Muted, hint));
+        }
+        if let Some(text) = self.problems_note() {
+            banners.push(Banner::new(
+                problems::UNCHECKED_BANNER,
+                Level::Warning,
+                text,
+            ));
         }
         if let Some(limit) = &snapshot.limited_to
             && !limit.listed.is_empty()
