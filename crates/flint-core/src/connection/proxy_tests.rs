@@ -378,3 +378,188 @@ fn a_grant_differs_for_each_route() {
         grant_endpoint("https://api.example.test:6443/", Some("http://one:1"))
     );
 }
+
+fn setting(url: Option<&str>, no_proxy: &[&str]) -> ProxySetting {
+    ProxySetting {
+        url: url.map(str::to_owned),
+        no_proxy: no_proxy.iter().map(|e| (*e).to_owned()).collect(),
+    }
+}
+
+#[test]
+fn a_cluster_proxy_url_wins_over_the_setting_which_wins_over_the_environment() {
+    let env = environment(Some("http://env:1"), None);
+    let set = setting(Some("http://setting:2"), &[]);
+    let merged = env.clone().under(Some(&set));
+    assert_eq!(
+        chosen(Some("http://entry:3"), Some(SERVER), &merged),
+        Some("http://entry:3")
+    );
+    assert_eq!(
+        chosen(None, Some(SERVER), &merged),
+        Some("http://setting:2")
+    );
+    assert_eq!(chosen(None, Some(SERVER), &env), Some("http://env:1"));
+    let nothing = environment(None, None).under(Some(&ProxySetting::default()));
+    assert_eq!(chosen(None, Some(SERVER), &nothing), None);
+}
+
+#[test]
+fn an_empty_setting_leaves_the_environment_as_it_is() {
+    let env = environment(Some("http://env:1"), Some("other.test"));
+    for empty in [ProxySetting::default(), setting(Some("  "), &["", " "])] {
+        assert!(empty.is_empty());
+        let merged = env.clone().under(Some(&empty));
+        assert_eq!(merged.https_proxy.as_deref(), Some("http://env:1"));
+        assert_eq!(merged.no_proxy.as_deref(), Some("other.test"));
+    }
+}
+
+#[test]
+fn only_the_settings_no_proxy_list_exempts_from_its_proxy() {
+    // The environment's NO_PROXY belongs to the environment's proxy.
+    let env = environment(Some("http://env:1"), Some(".example.test"));
+    let set = setting(Some("http://setting:2"), &[]);
+    let merged = env.clone().under(Some(&set));
+    assert_eq!(
+        chosen(None, Some(SERVER), &merged),
+        Some("http://setting:2")
+    );
+
+    let exempting = setting(Some("http://setting:2"), &[" api.example.test ", ""]);
+    let merged = env.clone().under(Some(&exempting));
+    assert_eq!(chosen(None, Some(SERVER), &merged), None);
+    assert_eq!(
+        chosen(None, Some("https://other.test"), &merged),
+        Some("http://setting:2")
+    );
+}
+
+#[test]
+fn a_no_proxy_setting_alone_applies_to_the_environment_proxy() {
+    let env = environment(Some("http://env:1"), Some("other.test"));
+    let merged = env.under(Some(&setting(None, &["*.example.test"])));
+    assert_eq!(chosen(None, Some(SERVER), &merged), None);
+    assert_eq!(
+        chosen(None, Some("https://other.test"), &merged),
+        Some("http://env:1")
+    );
+}
+
+#[test]
+fn the_settings_no_proxy_list_matches_names_domains_addresses_and_ranges() {
+    let set = setting(
+        Some("http://setting:2"),
+        &[
+            "exact.test",
+            ".corp.test",
+            "*.wild.test",
+            "10.0.0.0/8",
+            "192.0.2.7:6443",
+        ],
+    );
+    let merged = environment(None, None).under(Some(&set));
+    for exempt in [
+        "https://exact.test",
+        "https://api.corp.test:6443",
+        "https://a.wild.test",
+        "https://10.1.2.3:6443",
+        "https://192.0.2.7:6443",
+    ] {
+        assert_eq!(chosen(None, Some(exempt), &merged), None, "{exempt}");
+    }
+    for proxied in [
+        "https://notexact.test",
+        "https://wild.test",
+        "https://11.1.2.3",
+        "https://192.0.2.7:443",
+    ] {
+        assert_eq!(
+            chosen(None, Some(proxied), &merged),
+            Some("http://setting:2"),
+            "{proxied}"
+        );
+    }
+}
+
+#[test]
+fn a_proxy_setting_never_shows_its_credentials() {
+    let set = setting(Some(ACCOUNT), &["10.0.0.0/8"]);
+    assert_eq!(set.shown_url().as_deref(), Some("http://proxy:3128"));
+    let settings = crate::settings::Settings {
+        proxy: set.clone(),
+        ..Default::default()
+    };
+    for text in [
+        format!("{set:?}"),
+        format!("{settings:?}"),
+        format!("{settings:#?}"),
+    ] {
+        assert!(text.contains("http://proxy:3128"), "{text}");
+        assert!(
+            !text.contains("alice") && !text.contains("s3cret"),
+            "{text}"
+        );
+    }
+    let unreadable = setting(Some("alice:s3cret@proxy:3128"), &[]);
+    assert_eq!(unreadable.shown_url().as_deref(), Some(UNREADABLE));
+    assert!(!format!("{unreadable:?}").contains("s3cret"));
+    // Its route identity tells the account apart without holding it.
+    let identity = route_identity(ACCOUNT);
+    assert!(identity.starts_with("http://proxy:3128#"), "{identity}");
+    assert!(!identity.contains("alice") && !identity.contains("s3cret"));
+}
+
+#[test]
+fn an_unsupported_setting_is_refused_without_its_credentials() {
+    let merged = environment(None, None).under(Some(&setting(
+        Some("socks5://alice:s3cret@proxy:1080"),
+        &[],
+    )));
+    let chosen = chosen(None, Some(SERVER), &merged).unwrap();
+    let text = ProxyTarget::parse(chosen).unwrap_err().to_string();
+    assert!(text.contains("socks5://proxy:1080"), "{text}");
+    assert!(
+        !text.contains("s3cret") && !text.contains("alice"),
+        "{text}"
+    );
+}
+
+#[test]
+fn the_proxy_section_loads_from_settings_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(crate::settings::SETTINGS_FILE),
+        "[proxy]\nurl = \"http://alice:s3cret@proxy:3128\"\n\
+         no_proxy = [\"10.0.0.0/8\", \".corp.test\"]\n",
+    )
+    .unwrap();
+    let settings = crate::settings::load_settings(dir.path()).unwrap();
+    assert_eq!(settings.proxy.url.as_deref(), Some(ACCOUNT));
+    assert_eq!(settings.proxy.no_proxy, ["10.0.0.0/8", ".corp.test"]);
+    assert_eq!(
+        settings.proxy.no_proxy_list().as_deref(),
+        Some("10.0.0.0/8,.corp.test")
+    );
+    // An unset section is not written back.
+    let saved = toml::to_string(&crate::settings::Settings::default()).unwrap();
+    assert!(!saved.contains("proxy"), "{saved}");
+}
+
+#[test]
+fn a_settings_error_near_the_proxy_does_not_quote_its_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(crate::settings::SETTINGS_FILE),
+        "[proxy]\nurl = \"http://alice:s3cret@proxy:3128\" oops\n",
+    )
+    .unwrap();
+    let error = crate::settings::load_settings(dir.path()).unwrap_err();
+    let reason = error.safe_reason();
+    assert!(
+        !reason.contains("s3cret") && !reason.contains("alice"),
+        "{reason}"
+    );
+    let summary = crate::redact::safe_error_summary(&error.to_string());
+    assert!(!summary.contains("s3cret"), "{summary}");
+}
