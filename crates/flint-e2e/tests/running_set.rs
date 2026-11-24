@@ -23,6 +23,14 @@ fn pod_kind() -> KindId {
     KindId::new("", "pods")
 }
 
+fn configmaps() -> Gvr {
+    Gvr::new("", "v1", "configmaps")
+}
+
+fn configmap_kind() -> KindId {
+    KindId::new("", "configmaps")
+}
+
 async fn servers<const N: usize>() -> [FakeApiServer; N] {
     let mut started = Vec::with_capacity(N);
     for _ in 0..N {
@@ -74,8 +82,12 @@ async fn until_status(handle: &CoreHandle, cluster: &str, wanted: impl Fn(&Membe
 }
 
 async fn until_no_watches(server: &FakeApiServer) {
+    until_no_watches_of(server, &pods()).await;
+}
+
+async fn until_no_watches_of(server: &FakeApiServer, gvr: &Gvr) {
     tokio::time::timeout(WAIT, async {
-        while server.open_watches(&pods()) > 0 {
+        while server.open_watches(gvr) > 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -120,7 +132,8 @@ async fn a_failing_and_a_hung_member_leave_another_live() {
     let reports = core.handle.running_set().await;
     let d = reports.iter().find(|r| r.cluster == "d").unwrap();
     assert_eq!(d.status, MemberStatus::Connecting, "still hanging");
-    assert_eq!(live.open_watches(&pods()), 1, "the live member goes on");
+    // Its list and its problem feed (#715) each watch pods.
+    assert!(live.open_watches(&pods()) >= 1, "the live member goes on");
     hold.release();
 }
 
@@ -198,8 +211,9 @@ async fn a_combined_view_sends_nothing_to_the_server_its_active_member_moved_to(
     let admitted = core.handle.admit_running_set(pins).await.unwrap();
     let member = admitted.into_iter().find(|m| m.context() == "a").unwrap();
     let combined = core.handle.bound_to(member);
-    let _view = combined.subscribe("a", &pod_kind());
-    a.wait_for_watches(&pods(), 1, WAIT).await.unwrap();
+    // A kind the active cluster's own problem feed (#715) does not watch on the new server.
+    let _view = combined.subscribe("a", &configmap_kind());
+    a.wait_for_watches(&configmaps(), 1, WAIT).await.unwrap();
 
     write_config(&path, &[&elsewhere, &b]);
     core.handle.reload_kubeconfig().await.unwrap();
@@ -211,11 +225,11 @@ async fn a_combined_view_sends_nothing_to_the_server_its_active_member_moved_to(
         .wait_for_watches(&services, 1, WAIT)
         .await
         .unwrap();
-    until_no_watches(&a).await;
+    until_no_watches_of(&a, &configmaps()).await;
     let reached: Vec<_> = elsewhere
         .requests()
         .into_iter()
-        .filter(|r| r.is_about(&pods()))
+        .filter(|r| r.is_about(&configmaps()))
         .map(|r| r.path)
         .collect();
     assert!(reached.is_empty(), "{reached:?}");
@@ -351,7 +365,14 @@ async fn a_member_view_inherits_nothing_from_the_previous_server() {
 #[tokio::test]
 async fn a_member_view_cut_off_on_a_fallback_stays_cut_off_when_restored() {
     let [a, b, fallback] = servers().await;
-    a.set_row(&pods(), pod_row("admitted-pod"));
+    // A kind the context's own problem feed (#715) does not watch once it is restored.
+    let row = a.new_row(
+        &configmaps(),
+        Some("default"),
+        "admitted-map",
+        &[("Data", "1")],
+    );
+    a.set_row(&configmaps(), row);
     let dir = tempfile::tempdir().unwrap();
     let primary = dir.path().join("primary");
     let secondary = dir.path().join("secondary");
@@ -369,12 +390,12 @@ async fn a_member_view_cut_off_on_a_fallback_stays_cut_off_when_restored() {
     let admitted = core.handle.admit_running_set(pins).await.unwrap();
     let member = admitted.into_iter().find(|m| m.context() == "a").unwrap();
     let combined = core.handle.bound_to(member);
-    let mut view = combined.subscribe("a", &pod_kind());
-    until_row(&mut view, "admitted-pod").await;
+    let mut view = combined.subscribe("a", &configmap_kind());
+    until_row(&mut view, "admitted-map").await;
 
     std::fs::write(&primary, "not: [valid").unwrap();
     core.handle.reload_kubeconfig().await.unwrap();
-    until_no_watches(&a).await;
+    until_no_watches_of(&a, &configmaps()).await;
     std::fs::write(&primary, restored).unwrap();
     core.handle.reload_kubeconfig().await.unwrap();
 
@@ -382,7 +403,11 @@ async fn a_member_view_cut_off_on_a_fallback_stays_cut_off_when_restored() {
     let services = a.gvr("services");
     let _own_view = core.handle.subscribe("a", &KindId::new("", "services"));
     a.wait_for_watches(&services, 1, WAIT).await.unwrap();
-    assert_eq!(a.open_watches(&pods()), 0, "the cut view asks for nothing");
+    assert_eq!(
+        a.open_watches(&configmaps()),
+        0,
+        "the cut view asks for nothing"
+    );
     let snapshot = view.latest();
     assert!(snapshot.rows.is_empty(), "{:?}", snapshot.names());
     assert_eq!(snapshot.state, SyncState::Idle);

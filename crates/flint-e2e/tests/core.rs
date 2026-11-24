@@ -2246,14 +2246,17 @@ async fn until_overview_watches(server: &FakeApiServer, open: bool, what: &str) 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn in_on_view_problems_are_found_with_no_overview_open() {
     use flint_core::problems::ProblemKind;
-    let server = FakeApiServer::start().await.unwrap();
+    // The server's time runs two minutes behind, so a pod it creates now has been Pending that long.
+    let server = FakeApiServer::start_with(Options {
+        now: std::time::SystemTime::now() - Duration::from_secs(120),
+        ..Options::default()
+    })
+    .await
+    .unwrap();
     server.add_pod(FakePod::from_json(serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",
-        "metadata": {
-            "name": "stuck", "namespace": "demo", "uid": "stuck-uid",
-            "creationTimestamp": "2026-01-01T00:00:00Z",
-        },
+        "metadata": {"name": "stuck", "namespace": "demo", "uid": "stuck-uid"},
         "spec": {"containers": [{"name": "app", "image": "busybox:1.37.0"}]},
         "status": {"phase": "Pending"},
     })));
