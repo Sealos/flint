@@ -534,19 +534,7 @@ impl ClusterManager {
             .map(|slot| slot.info.name.clone())
             .collect();
         for id in spent {
-            let Some(slot) = self.cluster_mut(&id) else {
-                continue;
-            };
-            slot.clear_connection();
-            // No attempt has id 0, so a discovery still running is ignored.
-            slot.attempt = 0;
-            slot.discovering = false;
-            slot.reconnect = true;
-            slot.state = ConnectionState::Disconnected;
-            self.emit(Event::ConnectionChanged {
-                cluster: id,
-                state: ConnectionState::Disconnected,
-            });
+            self.drop_to_reconnect(&id);
         }
     }
 
@@ -742,11 +730,17 @@ impl ClusterManager {
         if let Some(attempt) = slot.member_attempt.take() {
             self.schedule.finish(attempt);
         }
+        self.drop_to_reconnect(id);
+        self.reconnect_active(id);
+    }
+
+    /// Drops `id`'s connection and marks it for the usual paths to connect again. No attempt has
+    /// id 0, so a discovery still running is ignored.
+    pub(super) fn drop_to_reconnect(&mut self, id: &str) {
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
         slot.clear_connection();
-        // No attempt has id 0, so a discovery still running is ignored.
         slot.attempt = 0;
         slot.discovering = false;
         slot.reconnect = true;
@@ -755,7 +749,6 @@ impl ClusterManager {
             cluster: id.to_owned(),
             state: ConnectionState::Disconnected,
         });
-        self.reconnect_active(id);
     }
 
     /// A pause voids an attempt in flight: its task ends, so a result from before the pause can
