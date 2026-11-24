@@ -67,7 +67,7 @@ impl Workspace {
         if let Err(why) = self.session_member(cluster, cx) {
             return Some(why);
         }
-        self.member_writes_paused(cluster, cx)
+        self.writes_paused_why(cluster, cx)
     }
 
     /// Opens (or shows) `cluster`'s forwards tab.

@@ -363,6 +363,7 @@ impl PortForwardsView {
     }
 
     /// Each row's line, as the window's state reports it.
+    #[cfg(any(test, feature = "automation"))]
     pub fn row_labels(&self) -> Vec<String> {
         self.rows.iter().map(Row::label).collect()
     }
