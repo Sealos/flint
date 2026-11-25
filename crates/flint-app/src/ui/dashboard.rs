@@ -283,7 +283,7 @@ pub enum MetricsPanel {
     },
 }
 
-/// One resource's current value and last hour.
+/// One resource's current value and history.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MetricTile {
     pub label: &'static str,

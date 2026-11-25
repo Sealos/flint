@@ -1,26 +1,51 @@
-//! The last hour of node CPU and memory for dashboard sparklines (ADR-0017).
+//! The last hours of node CPU and memory for dashboard sparklines (ADR-0017).
 //!
-//! [`TrendStore`] keeps [`TREND_SAMPLES`] samples per series, per cluster, in memory only. It is
-//! pure: callers hand it each poll's result and the time, and it never reads a clock or a client.
+//! [`TrendStore`] keeps a window of samples per series, in memory only: 6 hours by default, from
+//! 1 to 24 ([`TrendStore::set_window_hours`]). It is pure: callers hand it each poll's result and the time, and it never reads a clock or a client.
 //!
 //! - **Gaps stay gaps.** A failed poll, an empty answer, a skipped poll or a total that would
 //!   miss a node leaves no sample, and reads show `None`, never zero.
 //! - **Steps follow elapsed time.** A poll waits [`POLL_INTERVAL`] after the last fetch *ended*,
 //!   so the real period is a little longer. Fixed wall-clock slots would show a false gap every
 //!   so often; rounding the time since the last sample does not.
-//! - **Memory has a hard bound.** See [`MAX_CLUSTERS`], [`MAX_NODES_PER_CLUSTER`] and
-//!   [`MAX_NODES`]: at most about 8 MiB of samples. A cluster that goes cold is dropped with
-//!   [`TrendStore::drop_cluster`].
+//! - **Memory follows what was collected, within a hard bound.** A ring grows as samples arrive
+//!   instead of being allocated at the window's length. At most [`MAX_NODES`] node series and
+//!   [`MAX_CLUSTERS`] totals hold 2 rings each of 8 bytes per step: about 46 MiB at 6 hours and
+//!   179 MiB at 24 hours, plus 16 bytes per step for each cluster's poll times. A cluster that
+//!   goes cold is dropped with [`TrendStore::drop_cluster`].
+//! - **A shorter window trims the oldest samples; a longer one keeps what was collected.**
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use jiff::Timestamp;
 
 use crate::cluster::ClusterId;
 use crate::metrics::{Cpu, Memory, MetricsList, MetricsResult, NodeMetrics, POLL_INTERVAL, Usage};
 
-/// Samples kept per series: one hour at [`POLL_INTERVAL`].
-pub const TREND_SAMPLES: usize = 240;
+/// Samples in one hour at [`POLL_INTERVAL`].
+pub const STEPS_PER_HOUR: usize = (3_600_000 / POLL_INTERVAL.as_millis()) as usize;
+
+/// The history length when nothing sets one, in hours.
+pub const DEFAULT_HOURS: u32 = 6;
+
+/// The longest history, in hours.
+pub const MAX_HOURS: u32 = 24;
+
+/// Samples kept per series for a window of `hours`, clamped to 1 to [`MAX_HOURS`].
+pub const fn steps_for_hours(hours: u32) -> usize {
+    let hours = if hours < 1 {
+        1
+    } else if hours > MAX_HOURS {
+        MAX_HOURS
+    } else {
+        hours
+    };
+    hours as usize * STEPS_PER_HOUR
+}
+
+/// How many slots a growing ring asks for at a time, so it neither reallocates on every sample
+/// nor holds much more than it has collected.
+const GROWTH_CHUNK: usize = 256;
 
 /// The most clusters a store holds. Further clusters get no trend until one is dropped.
 pub const MAX_CLUSTERS: usize = 32;
@@ -67,47 +92,76 @@ fn steps_between(earlier: Timestamp, later: Timestamp) -> i128 {
     (millis + CADENCE_MILLIS / 2).div_euclid(CADENCE_MILLIS)
 }
 
-/// One resource's samples, indexed by step modulo [`TREND_SAMPLES`].
+/// Appends `value` after `steps - 1` copies of `gap`, dropping the oldest entries beyond
+/// `window`. The deque only grows by what it is about to hold, in chunks, never past `window`.
+fn push_steps<T: Copy>(values: &mut VecDeque<T>, steps: u64, gap: T, value: T, window: usize) {
+    if steps >= window as u64 {
+        values.clear();
+        values.push_back(value);
+        return;
+    }
+    let steps = steps as usize;
+    let excess = (values.len() + steps).saturating_sub(window);
+    values.drain(..excess.min(values.len()));
+    let needed = values.len() + steps;
+    if needed > values.capacity() {
+        let extra = steps.max(GROWTH_CHUNK);
+        values.reserve_exact(extra.min(window - values.len()));
+    }
+    values.extend(std::iter::repeat_n(gap, steps - 1));
+    values.push_back(value);
+}
+
+/// Keeps the newest `window` entries and gives the rest of the memory back.
+fn trim<T>(values: &mut VecDeque<T>, window: usize) {
+    let excess = values.len().saturating_sub(window);
+    values.drain(..excess);
+    values.shrink_to(window);
+}
+
+/// One resource's samples, oldest first, ending at the step `newest`. Steps before the first one
+/// held, or after the newest, read as gaps.
 #[derive(Debug)]
 struct Ring {
-    values: Box<[u64]>,
-    /// The step of the newest sample. Every slot older than the window reads as a gap.
+    values: VecDeque<u64>,
+    /// The step of the last value.
     newest: u64,
 }
 
 impl Ring {
     fn new(step: u64) -> Self {
         Self {
-            values: vec![GAP; TREND_SAMPLES].into_boxed_slice(),
+            values: VecDeque::from([GAP]),
             newest: step,
         }
     }
 
-    /// Stores `value` at `step`, which is never older than the newest, and clears the steps
-    /// skipped since then.
-    fn put(&mut self, step: u64, value: u64) {
-        if step - self.newest >= TREND_SAMPLES as u64 {
-            self.values.fill(GAP);
-        } else {
-            for skipped in self.newest + 1..step {
-                self.values[slot(skipped)] = GAP;
+    /// Stores `value` at `step`, which is never older than the newest, and fills the steps
+    /// skipped since then with gaps. Keeps at most `window` steps.
+    fn put(&mut self, step: u64, value: u64, window: usize) {
+        let value = value.min(GAP - 1);
+        match step - self.newest {
+            0 => {
+                if let Some(last) = self.values.back_mut() {
+                    *last = value;
+                }
             }
+            steps => push_steps(&mut self.values, steps, GAP, value, window),
         }
-        self.values[slot(step)] = value.min(GAP - 1);
         self.newest = step;
     }
 
     fn get(&self, step: u64) -> Option<u64> {
-        if step > self.newest || self.newest - step >= TREND_SAMPLES as u64 {
-            return None;
-        }
-        let value = self.values[slot(step)];
+        let back = usize::try_from(self.newest.checked_sub(step)?).ok()?;
+        let index = self.values.len().checked_sub(1 + back)?;
+        let value = self.values[index];
         (value != GAP).then_some(value)
     }
-}
 
-fn slot(step: u64) -> usize {
-    (step % TREND_SAMPLES as u64) as usize
+    /// Keeps the newest `window` steps.
+    fn trim(&mut self, window: usize) {
+        trim(&mut self.values, window);
+    }
 }
 
 /// The CPU and memory rings of one node or of the total.
@@ -125,9 +179,14 @@ impl Series {
         }
     }
 
-    fn put(&mut self, step: u64, usage: Usage) {
-        self.cpu.put(step, usage.cpu.nanos());
-        self.memory.put(step, usage.memory.bytes());
+    fn put(&mut self, step: u64, usage: Usage, window: usize) {
+        self.cpu.put(step, usage.cpu.nanos(), window);
+        self.memory.put(step, usage.memory.bytes(), window);
+    }
+
+    fn trim(&mut self, window: usize) {
+        self.cpu.trim(window);
+        self.memory.trim(window);
     }
 
     fn newest(&self) -> u64 {
@@ -149,8 +208,9 @@ struct ClusterTrend {
     last_at: Timestamp,
     /// A poll failed since the last sample, so the next one must not look contiguous.
     gap_pending: bool,
-    /// When each step's poll finished, indexed like a [`Ring`]: `None` for a step no poll took.
-    times: Box<[Option<Timestamp>]>,
+    /// When each step's poll finished, aligned with a [`Ring`] that ends at `step`: `None` for a
+    /// step no poll took.
+    times: VecDeque<Option<Timestamp>>,
     total: Series,
     nodes: BTreeMap<String, Series>,
 }
@@ -161,11 +221,7 @@ impl ClusterTrend {
             step: 0,
             last_at: at,
             gap_pending: false,
-            times: {
-                let mut times = vec![None; TREND_SAMPLES].into_boxed_slice();
-                times[slot(0)] = Some(at);
-                times
-            },
+            times: VecDeque::from([Some(at)]),
             total: Series::new(0),
             nodes: BTreeMap::new(),
         }
@@ -173,7 +229,7 @@ impl ClusterTrend {
 
     /// Moves to the step of a sample taken `at`. `false` if it is too soon after the last one: it
     /// then belongs to the current step, whose time and cadence stay those of its first poll.
-    fn advance(&mut self, at: Timestamp) -> bool {
+    fn advance(&mut self, at: Timestamp, window: usize) -> bool {
         // A clock that went back cannot say how long it was, so that is a gap of unknown length.
         let mut steps = if at < self.last_at {
             2
@@ -186,22 +242,31 @@ impl ClusterTrend {
         if self.gap_pending {
             steps = steps.max(2);
         }
-        let previous = self.step;
-        self.step += steps.min(TREND_SAMPLES as i128) as u64;
-        for skipped in previous + 1..self.step {
-            self.times[slot(skipped)] = None;
-        }
-        self.times[slot(self.step)] = Some(at);
+        let steps = steps.min(window as i128) as u64;
+        self.step += steps;
+        push_steps(&mut self.times, steps, None, Some(at), window);
         self.last_at = at;
         self.gap_pending = false;
         let step = self.step;
         self.nodes
-            .retain(|_, series| step - series.newest() < TREND_SAMPLES as u64);
+            .retain(|_, series| step - series.newest() < window as u64);
         true
     }
 
+    /// Keeps the newest `window` steps, and drops a node whose samples are all older.
+    fn trim(&mut self, window: usize) {
+        trim(&mut self.times, window);
+        self.total.trim(window);
+        let step = self.step;
+        self.nodes
+            .retain(|_, series| step - series.newest() < window as u64);
+        for series in self.nodes.values_mut() {
+            series.trim(window);
+        }
+    }
+
     /// Writes one list at the current step. At most `room` nodes get a new series.
-    fn write(&mut self, list: &MetricsList<NodeMetrics>, mut room: usize) {
+    fn write(&mut self, list: &MetricsList<NodeMetrics>, mut room: usize, window: usize) {
         let step = self.step;
         let mut seen = BTreeSet::new();
         let mut complete = list.skipped == 0;
@@ -231,34 +296,62 @@ impl ClusterTrend {
                 continue;
             }
             if let Some(series) = self.nodes.get_mut(&node.name) {
-                series.put(step, node.usage);
+                series.put(step, node.usage, window);
             } else if room > 0 && node.name.len() <= MAX_NODE_NAME {
                 room -= 1;
                 let mut series = Series::new(step);
-                series.put(step, node.usage);
+                series.put(step, node.usage, window);
                 self.nodes.insert(node.name.clone(), series);
             }
         }
         if complete {
-            self.total.put(step, total);
+            self.total.put(step, total, window);
         }
     }
 
     /// Steps between the newest sample and `now`, not counting the one still expected.
-    fn steps_behind(&self, now: Timestamp) -> u64 {
-        (steps_between(self.last_at, now) - 1).clamp(0, TREND_SAMPLES as i128) as u64
+    fn steps_behind(&self, now: Timestamp, window: usize) -> u64 {
+        (steps_between(self.last_at, now) - 1).clamp(0, window as i128) as u64
     }
 }
 
 /// The in-memory trends of every connected cluster.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TrendStore {
     clusters: BTreeMap<ClusterId, ClusterTrend>,
+    /// Steps kept per series.
+    window: usize,
+}
+
+impl Default for TrendStore {
+    fn default() -> Self {
+        Self {
+            clusters: BTreeMap::new(),
+            window: steps_for_hours(DEFAULT_HOURS),
+        }
+    }
 }
 
 impl TrendStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Keeps `hours` of history (1 to [`MAX_HOURS`]) from now on. A shorter window trims the
+    /// oldest samples at once; a longer one keeps what is collected and fills as samples arrive.
+    pub fn set_window_hours(&mut self, hours: u32) {
+        let window = steps_for_hours(hours);
+        if window < self.window {
+            for trend in self.clusters.values_mut() {
+                trend.trim(window);
+            }
+        }
+        self.window = window;
+    }
+
+    /// How many steps each series reads and keeps.
+    pub fn window(&self) -> usize {
+        self.window
     }
 
     /// Takes one NodeMetrics poll result, finished at `at`. An error or an empty list leaves a
@@ -276,7 +369,7 @@ impl TrendStore {
         if let Some(trend) = self.clusters.get_mut(cluster) {
             // A poll too soon after the last one, such as a new feed's first, updates the
             // current step, so the newest values are never those of a feed that stopped.
-            trend.advance(at);
+            trend.advance(at, self.window);
         } else if self.clusters.len() >= MAX_CLUSTERS {
             return;
         } else {
@@ -284,11 +377,12 @@ impl TrendStore {
                 .insert(cluster.to_owned(), ClusterTrend::new(at));
         }
         let used: usize = self.clusters.values().map(|c| c.nodes.len()).sum();
+        let window = self.window;
         if let Some(trend) = self.clusters.get_mut(cluster) {
             let room = MAX_NODES_PER_CLUSTER
                 .saturating_sub(trend.nodes.len())
                 .min(MAX_NODES.saturating_sub(used));
-            trend.write(list, room);
+            trend.write(list, room, window);
         }
     }
 
@@ -297,7 +391,7 @@ impl TrendStore {
         self.clusters.remove(cluster);
     }
 
-    /// The last [`TREND_SAMPLES`] steps up to `now`, oldest first, with `None` for each gap.
+    /// The last [`TrendStore::window`] steps up to `now`, oldest first, with `None` for each gap.
     /// `None` if the store has no such cluster or series.
     pub fn series(
         &self,
@@ -312,9 +406,9 @@ impl TrendStore {
             TrendScope::Node(name) => trend.nodes.get(name)?,
         };
         let ring = series.ring(resource);
-        let right = trend.step + trend.steps_behind(now);
+        let right = trend.step + trend.steps_behind(now, self.window);
         Some(
-            (0..TREND_SAMPLES as u64)
+            (0..self.window as u64)
                 .rev()
                 .map(move |back| right.checked_sub(back).and_then(|step| ring.get(step))),
         )
@@ -331,15 +425,16 @@ impl TrendStore {
     ) -> Option<impl Iterator<Item = Option<Timestamp>> + '_> {
         let trend = self.clusters.get(cluster)?;
         let newest = trend.step;
-        let right = newest + trend.steps_behind(now);
-        Some((0..TREND_SAMPLES as u64).rev().map(move |back| {
+        let right = newest + trend.steps_behind(now, self.window);
+        Some((0..self.window as u64).rev().map(move |back| {
             let step = right.checked_sub(back)?;
-            let held = step <= newest && newest - step < TREND_SAMPLES as u64;
-            held.then(|| trend.times[slot(step)]).flatten()
+            let back = usize::try_from(newest.checked_sub(step)?).ok()?;
+            let index = trend.times.len().checked_sub(1 + back)?;
+            trend.times[index]
         }))
     }
 
-    /// How many rings are held, each of [`TREND_SAMPLES`] values.
+    /// How many rings are held, each of at most [`TrendStore::window`] values.
     pub fn ring_count(&self) -> usize {
         self.clusters
             .values()
@@ -355,6 +450,8 @@ mod tests {
     use crate::metrics::MetricsError;
 
     const CLUSTER: &str = "one";
+    /// Steps in the default window.
+    const TREND_SAMPLES: usize = DEFAULT_HOURS as usize * STEPS_PER_HOUR;
 
     fn at(seconds: i64) -> Timestamp {
         Timestamp::from_second(1_800_000_000 + seconds).unwrap()
@@ -747,5 +844,137 @@ mod tests {
             ]
         );
         assert!(store.sample_times("missing", now).is_none());
+    }
+    fn fill(store: &mut TrendStore, samples: i64) {
+        fill_from(store, 0, samples);
+    }
+
+    fn fill_from(store: &mut TrendStore, from: i64, to: i64) {
+        for i in from..to {
+            store.record(
+                CLUSTER,
+                at(i * 15),
+                &list(vec![node("a", i as u64, 1), node("b", 1, 1)]),
+            );
+        }
+    }
+
+    fn ring_capacity(store: &TrendStore) -> usize {
+        let trend = &store.clusters[CLUSTER];
+        trend.total.cpu.values.capacity()
+    }
+
+    #[test]
+    fn hours_map_to_steps_and_clamp() {
+        assert_eq!(steps_for_hours(1), 240);
+        assert_eq!(steps_for_hours(6), 1440);
+        assert_eq!(steps_for_hours(24), 5760);
+        assert_eq!(steps_for_hours(0), 240);
+        assert_eq!(steps_for_hours(99), 5760);
+        assert_eq!(TrendStore::new().window(), 1440);
+    }
+
+    #[test]
+    fn rings_grow_as_samples_arrive_not_to_the_full_window() {
+        let mut store = TrendStore::new();
+        store.set_window_hours(24);
+        fill(&mut store, 10);
+        let capacity = ring_capacity(&store);
+        assert!((10..=GROWTH_CHUNK + 1).contains(&capacity), "{capacity}");
+        let times = store.clusters[CLUSTER].times.capacity();
+        assert!(times <= GROWTH_CHUNK + 1, "{times}");
+        // Grown past a chunk, a ring still never holds more than the window.
+        fill_from(&mut store, 10, 410);
+        assert!(ring_capacity(&store) < 1000);
+        fill_from(&mut store, 410, 6410);
+        assert!(ring_capacity(&store) <= store.window());
+        assert_eq!(store.clusters[CLUSTER].total.cpu.values.len(), 5760);
+    }
+
+    #[test]
+    fn shortening_trims_the_oldest_samples_and_frees_memory() {
+        let mut store = TrendStore::new();
+        let total = 1000;
+        fill(&mut store, total);
+        let now = at((total - 1) * 15);
+        store.set_window_hours(1);
+        let values = read(&store, TrendScope::Total, now);
+        assert_eq!(values.len(), 240);
+        // The total of step i is i + 1 (node a) + 1 (node b) - 1... a reads i, b reads 1.
+        assert_eq!(values[0], Some(total as u64 - 240 + 1));
+        assert_eq!(values[239], Some(total as u64));
+        let node: Vec<_> = store
+            .series(CLUSTER, TrendScope::Node("a"), TrendResource::Cpu, now)
+            .unwrap()
+            .collect();
+        assert_eq!(node.len(), 240);
+        assert_eq!(node[0], Some(total as u64 - 240));
+        assert!(ring_capacity(&store) <= 240);
+        let times: Vec<_> = store.sample_times(CLUSTER, now).unwrap().collect();
+        assert_eq!(times.len(), 240);
+        assert_eq!(times[239], Some(now));
+        assert_eq!(times[0], Some(at((total - 240) * 15)));
+    }
+
+    #[test]
+    fn lengthening_keeps_what_was_collected() {
+        let mut store = TrendStore::new();
+        store.set_window_hours(1);
+        let total = 300;
+        fill(&mut store, total);
+        let now = at((total - 1) * 15);
+        store.set_window_hours(6);
+        let values = read(&store, TrendScope::Node("a"), now);
+        assert_eq!(values.len(), 1440);
+        // 240 samples were kept at one hour; the older 60 are gone, the rest read as before.
+        let held: Vec<_> = values.iter().flatten().copied().collect();
+        assert_eq!(held, (60..300).collect::<Vec<u64>>());
+        assert!(values[..1440 - 240].iter().all(Option::is_none));
+        // New samples extend into the longer window.
+        store.record(CLUSTER, at(total * 15), &one(7));
+        assert_eq!(
+            store
+                .series(
+                    CLUSTER,
+                    TrendScope::Node("a"),
+                    TrendResource::Cpu,
+                    at(total * 15)
+                )
+                .unwrap()
+                .flatten()
+                .count(),
+            241
+        );
+    }
+
+    #[test]
+    fn a_node_keeps_the_full_window_like_the_total() {
+        let mut store = TrendStore::new();
+        store.set_window_hours(12);
+        fill(&mut store, 3000);
+        let now = at(2999 * 15);
+        let node: Vec<_> = store
+            .series(CLUSTER, TrendScope::Node("b"), TrendResource::Cpu, now)
+            .unwrap()
+            .collect();
+        assert_eq!(node.len(), 2880);
+        assert!(node.iter().all(|v| *v == Some(1)));
+    }
+
+    #[test]
+    fn shrinking_drops_a_node_with_nothing_left_in_the_window() {
+        let mut store = TrendStore::new();
+        store.record(
+            CLUSTER,
+            at(0),
+            &list(vec![node("gone", 1, 1), node("a", 1, 1)]),
+        );
+        for i in 1..500 {
+            store.record(CLUSTER, at(i * 15), &one(1));
+        }
+        assert!(store.clusters[CLUSTER].nodes.contains_key("gone"));
+        store.set_window_hours(1);
+        assert!(!store.clusters[CLUSTER].nodes.contains_key("gone"));
+        assert!(store.clusters[CLUSTER].nodes.contains_key("a"));
     }
 }

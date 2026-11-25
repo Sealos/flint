@@ -22,7 +22,7 @@
 
 use flint_core::WatchMode;
 use flint_core::settings::{ClusterPin, Settings};
-use flint_core::thresholds::ThresholdMetric;
+use flint_core::thresholds::{HISTORY_HOURS_PRESETS, ThresholdMetric};
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
@@ -227,6 +227,7 @@ pub fn metric_label(metric: ThresholdMetric) -> &'static str {
         ThresholdMetric::RestartsLastHour => "Restarts",
         ThresholdMetric::WarningEventsLastHour => "Warning events",
         ThresholdMetric::PendingPodSeconds => "Pending pods",
+        ThresholdMetric::HistoryHours => "History",
     }
 }
 
@@ -237,6 +238,7 @@ fn metric_unit(metric: ThresholdMetric) -> &'static str {
         ThresholdMetric::RestartsLastHour => "restarts in the last hour",
         ThresholdMetric::WarningEventsLastHour => "Warning events in the last hour",
         ThresholdMetric::PendingPodSeconds => "seconds Pending",
+        ThresholdMetric::HistoryHours => "hours of CPU and memory history: 1, 3, 6, 12 or 24",
     }
 }
 
@@ -248,6 +250,7 @@ fn metric_heading(metric: ThresholdMetric) -> &'static str {
         ThresholdMetric::RestartsLastHour => "Restarts/h",
         ThresholdMetric::WarningEventsLastHour => "Warnings/h",
         ThresholdMetric::PendingPodSeconds => "Pending s",
+        ThresholdMetric::HistoryHours => "History h",
     }
 }
 
@@ -259,6 +262,12 @@ pub fn parse_threshold(metric: ThresholdMetric, text: &str) -> Result<Option<u32
         return Ok(None);
     }
     let range = metric.range();
+    if metric == ThresholdMetric::HistoryHours {
+        return match text.parse::<u32>() {
+            Ok(value) if HISTORY_HOURS_PRESETS.contains(&value) => Ok(Some(value)),
+            _ => Err("History must be 1, 3, 6, 12 or 24 hours.".to_owned()),
+        };
+    }
     match text.parse::<u32>() {
         Ok(value) if range.contains(&value) => Ok(Some(value)),
         _ => Err(format!(
@@ -1080,6 +1089,22 @@ mod unit_tests {
     }
 
     #[test]
+    fn the_history_length_is_one_of_the_presets() {
+        let history = ThresholdMetric::HistoryHours;
+        for preset in [1, 3, 6, 12, 24] {
+            assert_eq!(
+                parse_threshold(history, &preset.to_string()),
+                Ok(Some(preset))
+            );
+        }
+        assert_eq!(parse_threshold(history, " "), Ok(None));
+        let why = "History must be 1, 3, 6, 12 or 24 hours.";
+        for bad in ["0", "2", "5", "25", "48", "-3", "6.5", "six"] {
+            assert_eq!(parse_threshold(history, bad), Err(why.to_owned()), "{bad}");
+        }
+    }
+
+    #[test]
     fn every_metric_is_named_by_its_key() {
         for metric in ThresholdMetric::ALL {
             assert_eq!(metric_named(metric.key()), Some(metric));
@@ -1181,16 +1206,16 @@ mod unit_tests {
             rows: 2,
             candidates: Some(3),
         });
-        assert_eq!(stops.len(), 2 * 8 + 1 + 3);
+        assert_eq!(stops.len(), 2 * 9 + 1 + 3);
         assert_eq!(
             stops[0],
             ThresholdStop::Cell(0, ThresholdMetric::CpuPercent)
         );
         assert_eq!(
-            stops[8],
+            stops[9],
             ThresholdStop::Cell(1, ThresholdMetric::CpuPercent)
         );
-        assert_eq!(stops[16], ThresholdStop::Add);
+        assert_eq!(stops[18], ThresholdStop::Add);
         assert_eq!(global_stops().len(), ThresholdMetric::ALL.len());
         let ids: std::collections::BTreeSet<_> = stops.iter().map(|s| s.id()).collect();
         assert_eq!(ids.len(), stops.len(), "ids are unique");

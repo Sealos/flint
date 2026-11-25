@@ -63,7 +63,15 @@ pub enum ThresholdMetric {
     WarningEventsLastHour,
     /// Seconds a pod may stay Pending before it counts as a problem.
     PendingPodSeconds,
+    /// Hours of CPU and memory history the dashboard keeps. Not a warning level: it sets how long
+    /// the trend lines are (ADR-0017), and follows the same global and per-cluster levels.
+    HistoryHours,
 }
+
+/// The history lengths Settings offers, in hours.
+pub const HISTORY_HOURS_PRESETS: [u32; 5] = [1, 3, 6, 12, 24];
+/// The history length when nothing sets one.
+pub const DEFAULT_HISTORY_HOURS: u32 = 6;
 
 /// A metric's TOML key, default and accepted range.
 struct MetricSpec {
@@ -74,12 +82,13 @@ struct MetricSpec {
 
 impl ThresholdMetric {
     /// Every metric, in display order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::CpuPercent,
         Self::MemoryPercent,
         Self::RestartsLastHour,
         Self::WarningEventsLastHour,
         Self::PendingPodSeconds,
+        Self::HistoryHours,
     ];
 
     const fn spec(self) -> MetricSpec {
@@ -108,6 +117,11 @@ impl ThresholdMetric {
                 key: "pending_pod_seconds",
                 default: DEFAULT_PENDING_POD_SECONDS,
                 range: PENDING_SECONDS_RANGE,
+            },
+            Self::HistoryHours => MetricSpec {
+                key: "history_hours",
+                default: DEFAULT_HISTORY_HOURS,
+                range: 1..=24,
             },
         }
     }

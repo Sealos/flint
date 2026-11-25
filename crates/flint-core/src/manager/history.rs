@@ -13,6 +13,7 @@ use super::ClusterManager;
 use crate::ClusterId;
 use crate::keep_watching::KeepWatching;
 use crate::metrics_trend::TrendStore;
+use crate::thresholds::ThresholdMetric;
 
 /// One cluster's samples, shared by the feeds that write them and the readers that show them.
 pub(crate) type SharedTrends = Arc<Mutex<TrendStore>>;
@@ -74,6 +75,34 @@ impl TrendHistories {
 }
 
 impl ClusterManager {
+    /// The hours of history kept for `id`: its override, else the global value, at the server
+    /// the context points to now.
+    pub(super) fn history_hours(&self, id: &str) -> u32 {
+        let server = self
+            .cluster(id)
+            .and_then(|slot| slot.info.server.as_deref());
+        self.settings
+            .thresholds_for(id, server)
+            .get(ThresholdMetric::HistoryHours)
+    }
+
+    /// The history of `id` on definition `fingerprint` for a feed to write into, with the window
+    /// the settings give it.
+    pub(super) fn history_store(&mut self, id: &str, fingerprint: Option<u64>) -> SharedTrends {
+        let trends = self.histories.store(id, fingerprint);
+        let hours = self.history_hours(id);
+        set_hours(&trends, hours);
+        trends
+    }
+
+    /// Gives every kept history the window its cluster's settings say, so a change applies at
+    /// once: a shorter one trims, a longer one keeps what was collected.
+    pub(super) fn apply_history_windows(&self) {
+        for (id, history) in &self.histories.clusters {
+            set_hours(&history.trends, self.history_hours(id));
+        }
+    }
+
     /// Drops each history whose cluster is no longer watched or whose definition changed. Runs
     /// after the feeds were synced, so a hand-off within one message keeps its history.
     pub(super) fn sync_histories(&mut self) {
@@ -110,6 +139,13 @@ impl ClusterManager {
             None => watched,
         }
     }
+}
+
+pub(super) fn set_hours(trends: &SharedTrends, hours: u32) {
+    trends
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_window_hours(hours);
 }
 
 #[cfg(test)]
