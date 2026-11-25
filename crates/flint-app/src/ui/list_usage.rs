@@ -56,6 +56,11 @@ pub(in crate::ui) enum UsageSubject {
 }
 
 impl UsageSubject {
+    /// The kinds whose detail pane shows usage: only pods and nodes so far.
+    pub(in crate::ui) fn of_detail(kind: &KindId) -> Option<Self> {
+        Self::of(kind).filter(|subject| !matches!(subject, Self::Workloads(_)))
+    }
+
     pub(in crate::ui) fn of(kind: &KindId) -> Option<Self> {
         if *kind == KindId::pods() {
             return Some(Self::Pods);
@@ -63,14 +68,14 @@ impl UsageSubject {
         if *kind == KindId::new("", "nodes") {
             return Some(Self::Nodes);
         }
-        // A ReplicaSet's or a Job's pods name it as their controller. A Deployment's and a
-        // CronJob's are found through the ReplicaSets and Jobs they control; a StatefulSet's and a
-        // DaemonSet's own pods name them, which the same walk finds.
+        // A ReplicaSet's, Job's, StatefulSet's or DaemonSet's pods name it as their controller. A
+        // Deployment's and a CronJob's are found through the ReplicaSets and Jobs they control.
         let chain = match (kind.group(), kind.plural()) {
-            ("apps", "replicasets") | ("batch", "jobs") => OwnerChain::Direct,
-            ("apps", "deployments" | "statefulsets" | "daemonsets") | ("batch", "cronjobs") => {
-                OwnerChain::Workload
+            ("apps", "replicasets" | "statefulsets" | "daemonsets") | ("batch", "jobs") => {
+                OwnerChain::Direct
             }
+            ("apps", "deployments") => OwnerChain::ViaReplicaSets,
+            ("batch", "cronjobs") => OwnerChain::ViaJobs,
             _ => return None,
         };
         Some(Self::Workloads(chain))
@@ -114,9 +119,10 @@ impl UsageSource {
             UsageSubject::Workloads(chain) => {
                 let index = telemetry.snapshot.pods.clone();
                 Self::from_read(&telemetry.reads.pod_usage, current, |usage| match index {
-                    Some(index) => Self::Workloads(usage, index, chain),
-                    // Without the pods there is no telling whose they are.
-                    None => Self::Unknown,
+                    Some(index) if chain.is_known(&index) => Self::Workloads(usage, index, chain),
+                    // Without the pods, or the ReplicaSets or Jobs that say whose they are, a
+                    // workload with no pod found is not a workload with none.
+                    _ => Self::Unknown,
                 })
             }
             UsageSubject::Nodes => {
@@ -921,22 +927,33 @@ mod tests {
         );
         let workload = |group: &str, plural: &str| UsageSubject::of(&KindId::new(group, plural));
         for (group, plural) in [
-            ("apps", "deployments"),
+            ("apps", "replicasets"),
             ("apps", "statefulsets"),
             ("apps", "daemonsets"),
-            ("batch", "cronjobs"),
+            ("batch", "jobs"),
         ] {
-            assert_eq!(
-                workload(group, plural),
-                Some(UsageSubject::Workloads(OwnerChain::Workload))
-            );
-        }
-        for (group, plural) in [("apps", "replicasets"), ("batch", "jobs")] {
             assert_eq!(
                 workload(group, plural),
                 Some(UsageSubject::Workloads(OwnerChain::Direct))
             );
         }
+        assert_eq!(
+            workload("apps", "deployments"),
+            Some(UsageSubject::Workloads(OwnerChain::ViaReplicaSets))
+        );
+        assert_eq!(
+            workload("batch", "cronjobs"),
+            Some(UsageSubject::Workloads(OwnerChain::ViaJobs))
+        );
+        // Their panes show no usage yet.
+        assert_eq!(
+            UsageSubject::of_detail(&KindId::new("apps", "deployments")),
+            None
+        );
+        assert_eq!(
+            UsageSubject::of_detail(&KindId::pods()),
+            Some(UsageSubject::Pods)
+        );
         assert_eq!(workload("", "services"), None);
         assert_eq!(workload("metrics.k8s.io", "pods"), None);
     }
@@ -969,7 +986,7 @@ mod tests {
         let source = UsageSource::Workloads(
             Arc::new([(key, sample(10, 10))].into_iter().collect()),
             index,
-            OwnerChain::Workload,
+            OwnerChain::ViaReplicaSets,
         );
         let uid_row = |uid: &str| {
             let mut row = row(Some("a"), uid);

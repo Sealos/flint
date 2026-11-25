@@ -18,9 +18,22 @@ use flint_core::telemetry::{PodIndex, PodKey, PodOwner, PodRecord};
 pub(in crate::ui) enum OwnerChain {
     /// The pod's own controller: a ReplicaSet, a Job, a StatefulSet or a DaemonSet.
     Direct,
-    /// The workload above it: a Deployment through its ReplicaSet, a CronJob through its Job.
-    /// A pod of a StatefulSet or DaemonSet has no controller above its own.
-    Workload,
+    /// A Deployment, through the ReplicaSet that controls the pod.
+    ViaReplicaSets,
+    /// A CronJob, through the Job that controls the pod.
+    ViaJobs,
+}
+
+impl OwnerChain {
+    /// Whether `index` can follow this chain. If not, a workload with no counted pod may have
+    /// pods that could not be placed, so nothing can be said about it.
+    pub(in crate::ui) fn is_known(self, index: &PodIndex) -> bool {
+        match self {
+            Self::Direct => true,
+            Self::ViaReplicaSets => index.knows_replica_set_owners(),
+            Self::ViaJobs => index.knows_job_owners(),
+        }
+    }
 }
 
 /// What one amount adds up to over the counted pods.
@@ -178,7 +191,7 @@ pub(in crate::ui) fn totals_by_owner(
 fn owner<'a>(index: &'a PodIndex, pod: &'a PodRecord, chain: OwnerChain) -> Option<&'a PodOwner> {
     match chain {
         OwnerChain::Direct => pod.owner.as_ref(),
-        OwnerChain::Workload => index.workload_of(pod),
+        OwnerChain::ViaReplicaSets | OwnerChain::ViaJobs => index.workload_of(pod),
     }
 }
 
@@ -289,7 +302,7 @@ mod tests {
             controllers,
         );
 
-        let by_deployment = totals_by_owner(&index, &samples, OwnerChain::Workload);
+        let by_deployment = totals_by_owner(&index, &samples, OwnerChain::ViaReplicaSets);
         let total = by_deployment["dep"];
         assert_eq!(total.pods, 3);
         assert_eq!(total.cpu.used, 30_000_000);
@@ -317,7 +330,7 @@ mod tests {
             ],
             controllers,
         );
-        let totals = totals_by_owner(&index, &samples, OwnerChain::Workload);
+        let totals = totals_by_owner(&index, &samples, OwnerChain::ViaJobs);
         assert_eq!(totals["cron"].pods, 1);
         assert_eq!(totals["sts"].pods, 1);
         assert!(!totals.contains_key("job"));
@@ -335,7 +348,7 @@ mod tests {
             ],
             Controllers::new(),
         );
-        let total = totals_by_owner(&index, &samples, OwnerChain::Workload)["sts"];
+        let total = totals_by_owner(&index, &samples, OwnerChain::Direct)["sts"];
         assert_eq!(total.cpu.limit, None);
         assert_eq!(total.memory.limit, None);
         // The requests the pods set still add up: the second sets no memory request.
@@ -370,7 +383,7 @@ mod tests {
         let record = record("a", Some(sts), two, false);
         let index = PodIndex::for_tests([("u1", record)], Controllers::new());
         let samples = [(key("a"), two_container_sample())].into_iter().collect();
-        let total = totals_by_owner(&index, &samples, OwnerChain::Workload)["sts"];
+        let total = totals_by_owner(&index, &samples, OwnerChain::Direct)["sts"];
         assert!(total.budgeted);
         assert_eq!(total.cpu.limit, None);
     }
@@ -405,7 +418,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let totals = totals_by_owner(&index, &samples, OwnerChain::Workload);
+        let totals = totals_by_owner(&index, &samples, OwnerChain::Direct);
         assert_eq!(totals["sts"].pods, 1);
         assert_eq!(totals["sts"].cpu.used, 10_000_000);
         // A workload with no counted pod has no entry: its row shows no value.
@@ -423,15 +436,26 @@ mod tests {
             Controllers::new(),
         );
         samples.insert(key("b"), sample("migrate", 10, 20));
-        let total = totals_by_owner(&index, &samples, OwnerChain::Workload)["sts"];
+        let total = totals_by_owner(&index, &samples, OwnerChain::Direct)["sts"];
         assert!(!total.budgeted);
         assert_eq!((total.pods, total.cpu.used), (2, 20_000_000));
         assert_eq!((total.cpu.request, total.cpu.limit), (None, None));
     }
 
     #[test]
+    fn a_chain_through_owners_the_index_cannot_read_is_not_known() {
+        let unread = PodIndex::default();
+        assert!(OwnerChain::Direct.is_known(&unread));
+        assert!(!OwnerChain::ViaReplicaSets.is_known(&unread));
+        assert!(!OwnerChain::ViaJobs.is_known(&unread));
+        let read = PodIndex::for_tests([], Controllers::new());
+        assert!(OwnerChain::ViaReplicaSets.is_known(&read));
+        assert!(OwnerChain::ViaJobs.is_known(&read));
+    }
+
+    #[test]
     fn pods_nothing_controls_belong_to_no_workload() {
         let (index, samples) = index(vec![("u1", "a", None, limited())], Controllers::new());
-        assert!(totals_by_owner(&index, &samples, OwnerChain::Workload).is_empty());
+        assert!(totals_by_owner(&index, &samples, OwnerChain::ViaReplicaSets).is_empty());
     }
 }

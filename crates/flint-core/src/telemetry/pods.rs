@@ -116,6 +116,17 @@ impl PodIndex {
         Some(controllers.get(&owner.uid).unwrap_or(owner))
     }
 
+    /// Whether [`Self::workload_of`] can say which Deployment a ReplicaSet's pod belongs to. If
+    /// not, a pod of a ReplicaSet has no workload as far as the index knows.
+    pub fn knows_replica_set_owners(&self) -> bool {
+        self.replica_sets.is_some()
+    }
+
+    /// Whether [`Self::workload_of`] can say which CronJob a Job's pod belongs to.
+    pub fn knows_job_owners(&self) -> bool {
+        self.jobs.is_some()
+    }
+
     /// The index a feed's stores give, `None` while pods cannot be relied on.
     pub(super) fn of(
         pods: &KindStore<Pod>,

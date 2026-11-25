@@ -82,7 +82,7 @@ impl DetailUsage {
                 self.source.hint().map(UsagePanel::Hint)
             }
             UsageSource::Unknown => Some(unknown_lines()),
-            // A workload's pane shows no usage yet.
+            // Panes follow only the kinds [`UsageSubject::of_detail`] names.
             UsageSource::Workloads(..) => None,
             UsageSource::Nodes(usage, _) => Some(match usage.get(name) {
                 Some(&used) => {
