@@ -736,9 +736,10 @@ pub(crate) async fn prepare(
         let denied = kube::Error::Auth(crate::auth_plugin::not_allowed());
         return Err(ClusterError::kube(denied).for_target(&target));
     }
-    let resolved = crate::auth_plugin::resolve_with_grant(&mut config, context, &grant)
-        .await
-        .map_err(|e| ClusterError::kube(kube::Error::Auth(e)).for_target(&target))?;
+    let resolved =
+        crate::auth_plugin::resolve_with_grant(&mut config, context, &grant, entry.as_deref())
+            .await
+            .map_err(|e| ClusterError::kube(kube::Error::Auth(e)).for_target(&target))?;
     Ok(Prepared {
         config,
         token: resolved.token,
