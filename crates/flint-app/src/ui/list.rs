@@ -504,7 +504,6 @@ impl ResourceList {
         self.show_row_menu(uid.to_owned(), Point::default(), window, cx);
     }
 
-    #[cfg(test)]
     pub(in crate::ui) fn has_open_row_menu(&self) -> bool {
         self.open_row_menu.is_some()
     }
@@ -1291,9 +1290,10 @@ impl ResourceList {
                 })
                 .when(!is_selected, |el| el.hover(|el| el.bg(theme.table_hover)))
                 .when(stale, |el| el.text_color(theme.muted_foreground))
-                // By name, not position: rows may have been reordered by the time the click
-                // is handled.
-                .on_click(registry::on_click(select.clone()));
+                // By name, not position: rows may have been reordered by the time the press
+                // is handled. On the press, not the click: GPUI drops a click whose row is no
+                // longer under the pointer on release, and a live list moves rows (#753).
+                .on_mouse_down(MouseButton::Left, registry::on_click(select.clone()));
             let finished = health
                 && list_model::row_finished(&self.shown_columns, |i| {
                     cell_text(row, i, now).to_string()
