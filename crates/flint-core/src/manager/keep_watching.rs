@@ -813,6 +813,7 @@ impl ClusterManager {
     ) {
         let pending_after = self.pending_after(id);
         let current = self.cluster(id).and_then(|slot| slot.fingerprint);
+        let hours = self.history_hours(id);
         let Some(kept) = self.keep.feeds.get_mut(id) else {
             return;
         };
@@ -831,6 +832,7 @@ impl ClusterManager {
                 // next sync drops it.
                 let fingerprint = kept.fingerprint.filter(|print| current == Some(*print));
                 let trends = self.histories.store(id, fingerprint);
+                super::history::set_hours(&trends, hours);
                 let discovery = KeptDiscovery {
                     client: client.clone(),
                     requests: requests.clone(),
