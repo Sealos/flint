@@ -3,22 +3,28 @@
 //! [`ClustersModel`].
 
 use std::cell::RefCell;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use flint_core::settings::AiExposureState;
-use flint_core::{ConnectionState, Event, KindId, Settings, SyncState};
+use flint_core::{ConnectionState, Event, KindId, ServerVersion, Settings, SyncState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
-use gpui_kit::{AppContext as _, Context, TestAppContext, WeakEntity, point, px};
+use gpui_kit::{
+    AnyWindowHandle, AppContext as _, Context, Entity, MouseButton, MouseDownEvent, PlatformInput,
+    TestAppContext, WeakEntity, point, px,
+};
 use serde_json::json;
 
 use super::ClustersModel;
 use crate::ui::registry::ActionError;
 use crate::ui::support_tests::{
-    WAIT, kubeconfig_yaml, open_workspace, open_workspace_with, standard_sections,
+    WAIT, kubeconfig_yaml, open_window_over, open_workspace, open_workspace_with,
 };
+use crate::ui::tooltip_text::SHOW_DELAY;
+use crate::ui::workspace::Workspace;
 
 /// Test hook: feeds an event in as the core's event stream does (`support_tests.rs`).
 impl ClustersModel {
@@ -273,31 +279,105 @@ async fn a_malformed_settings_file_shows_a_banner_and_disables_the_toggles(
     );
 }
 
+async fn open_tooltip_workspace(
+    cx: &mut TestAppContext,
+    dir: &Path,
+    source: &Path,
+) -> (AnyWindowHandle, Entity<Workspace>, Entity<ClustersModel>) {
+    cx.executor().allow_parking();
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(
+        source,
+        kubeconfig_yaml(&[("kind-alpha", "https://cluster.example")]),
+    )
+    .unwrap();
+    let (window, workspace, model) = open_window_over(cx, dir, vec![source.to_owned()]);
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("cluster-kind-alpha").is_some()
+    })
+    .await;
+    (window, workspace, model)
+}
+
+fn tooltip_label(cx: &mut TestAppContext, handle: AnyWindowHandle) -> Option<String> {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window
+            .try_find("cluster-tooltip")?
+            .label()
+            .map(str::to_owned)
+    })
+    .unwrap()
+}
+
 // An open tooltip follows the row: with the pointer resting on it through an outage and the
 // recovery, it says what the row's dot says, and a routine relist does not read as trouble.
 #[gpui_kit::test]
 async fn an_open_tooltip_follows_the_clusters_presence(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
-    t.connect_alpha(cx, standard_sections()).await;
-    cx.update_window(t.window, |_, window, cx| {
+    let source = dir.path().join("configs/team/prod/kubeconfig");
+    let (handle, workspace, model) = open_tooltip_workspace(cx, dir.path(), &source).await;
+    model.update(cx, |model, cx| {
+        model.feed(Event::ActiveChanged(Some("kind-alpha".into())), cx);
+        model.feed(
+            Event::ConnectionChanged {
+                cluster: "kind-alpha".into(),
+                state: ConnectionState::Connected(ServerVersion {
+                    git_version: "v1.33.1".into(),
+                    platform: "linux/arm64".into(),
+                }),
+            },
+            cx,
+        );
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
         let row = window.find("cluster-kind-alpha").bounds();
         window.simulate_mouse_move(row.center(), cx);
     })
     .unwrap();
-    cx.executor().advance_clock(Duration::from_secs(1));
     cx.run_until_parked();
-    t.wait_for_element(cx, "cluster-tooltip").await;
+    cx.executor()
+        .advance_clock(SHOW_DELAY - Duration::from_millis(1));
+    assert!(tooltip_label(cx, handle).is_none());
+    cx.executor().advance_clock(Duration::from_millis(1));
+    cx.wait_for(handle, WAIT, |window, _| {
+        window.try_find("cluster-tooltip").is_some()
+    })
+    .await;
 
-    let nav = t.workspace.read_with(cx, |w, _| w.nav_view());
+    let full_source = format!("\nfrom {}", source.display());
+    assert!(tooltip_label(cx, handle).unwrap().ends_with(&full_source));
+    cx.update_window(handle, |_, window, _| {
+        let shortened = Path::new("…").join("team").join("prod").join("kubeconfig");
+        let shortened = shortened.to_string_lossy();
+        assert!(
+            gpui_kit::base::test_support::texts(window)
+                .iter()
+                .any(|text| {
+                    text.text().ends_with(shortened.as_ref()) && !text.text().contains(&full_source)
+                })
+        );
+    })
+    .unwrap();
+
+    let nav = workspace.read_with(cx, |w, _| w.nav_view());
     let mut shows = |state: SyncState, wanted: &str| {
         nav.update(cx, |nav, cx| {
             nav.set_states(vec![(KindId::pods(), state)], cx);
         });
         cx.run_until_parked();
-        let tip = t.label(cx, "cluster-tooltip").unwrap();
+        let tip = tooltip_label(cx, handle).unwrap();
         assert!(tip.contains(wanted), "{wanted:?} in {tip}");
-        let row = t.description(cx, "cluster-kind-alpha").unwrap();
+        let row = cx
+            .update_window(handle, |_, window, _| {
+                window
+                    .find("cluster-kind-alpha")
+                    .description()
+                    .unwrap()
+                    .to_owned()
+            })
+            .unwrap();
         assert_eq!(tip, row, "the tooltip and the row's description agree");
     };
     let trouble = SyncState::Reconnecting {
@@ -309,6 +389,21 @@ async fn an_open_tooltip_follows_the_clusters_presence(cx: &mut TestAppContext) 
         SyncState::Reconnecting { error: None },
         "\nConnected, Kubernetes v1.33.1\n",
     );
+
+    cx.update_window(handle, |_, window, cx| {
+        window.dispatch_event(
+            PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position: window.find("cluster-kind-alpha").bounds().center(),
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+            cx,
+        );
+    })
+    .unwrap();
+    assert!(tooltip_label(cx, handle).is_none());
 }
 
 // Dismissing a tooltip frees its view, and freeing the view unregisters its observers while the
@@ -316,8 +411,8 @@ async fn an_open_tooltip_follows_the_clusters_presence(cx: &mut TestAppContext) 
 #[gpui_kit::test]
 async fn a_dismissed_tooltip_stops_observing_the_cluster(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
-    t.connect_alpha(cx, standard_sections()).await;
+    let source = dir.path().join("kubeconfig");
+    let (handle, workspace, model) = open_tooltip_workspace(cx, dir.path(), &source).await;
     cx.run_until_parked();
 
     let opened = Rc::new(RefCell::new(Vec::<WeakEntity<Tooltip>>::new()));
@@ -325,23 +420,27 @@ async fn a_dismissed_tooltip_stops_observing_the_cluster(cx: &mut TestAppContext
         let opened = opened.clone();
         cx.observe_new(move |_: &mut Tooltip, _, cx| opened.borrow_mut().push(cx.weak_entity()))
     });
-    cx.update_window(t.window, |_, window, cx| {
+    cx.update_window(handle, |_, window, cx| {
         let row = window.find("cluster-kind-alpha").bounds();
         window.simulate_mouse_move(row.center(), cx);
     })
     .unwrap();
     cx.executor().advance_clock(Duration::from_secs(1));
     cx.run_until_parked();
-    t.wait_for_element(cx, "cluster-tooltip").await;
-    cx.update_window(t.window, |_, window, cx| {
+    cx.wait_for(handle, WAIT, |window, _| {
+        window.try_find("cluster-tooltip").is_some()
+    })
+    .await;
+    cx.update_window(handle, |_, window, cx| {
         window.simulate_mouse_move(point(px(5000.), px(5000.)), cx);
     })
     .unwrap();
     cx.executor().advance_clock(Duration::from_secs(1));
     cx.run_until_parked();
+    assert!(tooltip_label(cx, handle).is_none());
     // The window keeps the last two frames' views, so draw past both.
     for _ in 0..2 {
-        cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
             .unwrap();
         cx.run_until_parked();
     }
@@ -350,13 +449,13 @@ async fn a_dismissed_tooltip_stops_observing_the_cluster(cx: &mut TestAppContext
         tooltip.assert_released();
     }
 
-    let nav = t.workspace.read_with(cx, |w, _| w.nav_view());
+    let nav = workspace.read_with(cx, |w, _| w.nav_view());
     let callback = Rc::new(());
     let view = cx.update(|cx| {
         let held = callback.clone();
         super::following_tooltip(
             "kind-alpha".into(),
-            &t.model,
+            &model,
             &nav,
             move |cx| {
                 let _ = &held;
