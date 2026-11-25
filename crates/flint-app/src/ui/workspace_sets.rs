@@ -49,8 +49,8 @@ use super::super::registry::{
     ShowClusterSetList, ToggleClusterPicking, TogglePickedCluster,
 };
 use super::super::set_members::{
-    self, MemberAction, MemberCause, MemberLine, MemberSignIn, failed_cause, paused_text,
-    refusal_cause,
+    self, MemberAction, MemberCause, MemberLine, MemberSignIn, SignInTarget, failed_cause,
+    paused_text, refusal_cause,
 };
 #[cfg(any(test, feature = "automation"))]
 use super::super::view_state::{ClusterSetsState, OpenSetState, SetGroupState, SetMemberState};
@@ -1277,25 +1277,50 @@ impl Workspace {
     }
 
     /// Why a row of `cluster` cannot be opened or acted on now, if so.
-    /// For a click on a signed-out member's Sign in alone ([`MemberSignIn`]): runs its sign-in
-    /// once, now, bound to the member as the set admitted it and to the definitions its view
-    /// shows. The core refuses it if any of them changed since; why shows in the set's error.
-    /// Its rows come back with the member's next status.
-    pub(in super::super) fn sign_in_set_member(&mut self, cluster: &str, cx: &mut Context<Self>) {
-        let Some(member) = self
-            .sets
-            .running
-            .as_ref()
-            .and_then(|run| run.members.iter().find(|m| m.context() == cluster))
-            .cloned()
-        else {
-            return;
-        };
+    /// What each member's Sign in is drawn for now ([`MemberSignIn`]).
+    pub(super) fn member_sign_in(&self, run: &RunningSet, cx: &Context<Self>) -> MemberSignIn {
         let model = self.model.read(cx);
-        let view = model.keep_watching(cluster);
-        let definition = view.and_then(|view| view.definition);
-        let shown = view.and_then(|view| view.shown_sign_in);
-        let asked = model.core().sign_in_member(&member, definition, shown);
+        let targets = run
+            .members
+            .iter()
+            .map(|member| {
+                let view = model.keep_watching(member.context());
+                let target = SignInTarget {
+                    member: member.clone(),
+                    definition: view.and_then(|view| view.definition),
+                    shown: view.and_then(|view| view.shown_sign_in),
+                    in_place: view.is_none_or(|view| {
+                        view.sign_in != flint_core::keep_watching::BackgroundSignIn::Unavailable
+                    }),
+                };
+                (member.context().to_owned(), target)
+            })
+            .collect();
+        MemberSignIn::new(cx.entity().downgrade(), targets)
+    }
+
+    /// For a click on a signed-out member's Sign in alone ([`MemberSignIn`]): runs its sign-in
+    /// once, now, for the member as the set admitted it and the definitions its control was
+    /// drawn with. The core refuses it if any of them changed since; why shows in the set's
+    /// error. Its rows come back with the member's next status.
+    pub(in super::super) fn sign_in_set_member(
+        &mut self,
+        target: SignInTarget,
+        cx: &mut Context<Self>,
+    ) {
+        let in_set = self.sets.running.as_ref().is_some_and(|run| {
+            run.members
+                .iter()
+                .any(|m| m.context() == target.member.context())
+        });
+        if !in_set {
+            return;
+        }
+        let asked = self.model.read(cx).core().sign_in_member(
+            &target.member,
+            target.definition,
+            target.shown,
+        );
         self.sets.error = None;
         cx.spawn(async move |ws, cx| {
             if let Err(why) = asked.await {
@@ -1675,7 +1700,7 @@ impl Workspace {
         };
         // No member can show rows: the member block replaces the chips, the empty list and notes.
         let body = self.set_empty_state(run, cx).map_or(body, |lines| {
-            let sign_in = MemberSignIn::new(cx.entity().downgrade());
+            let sign_in = self.member_sign_in(run, cx);
             self.render_empty_members(lines, &sign_in, theme)
         });
         Some(
@@ -1789,7 +1814,11 @@ impl Workspace {
                         .child(div().text_color(theme.muted_foreground).child(line))
                         .children(cause.action().map(|action| {
                             let id = SharedString::from(format!("set-member-action-{cluster}"));
-                            let button = Button::new(id).xsmall().outline().label(action.label());
+                            let label = match action {
+                                MemberAction::SignIn => sign_in.label(&cluster),
+                                MemberAction::Retry => action.label(),
+                            };
+                            let button = Button::new(id).xsmall().outline().label(label);
                             match action {
                                 MemberAction::SignIn => button.on_click(sign_in.on_click(&cluster)),
                                 MemberAction::Retry => button.on_click(registry::on_click(

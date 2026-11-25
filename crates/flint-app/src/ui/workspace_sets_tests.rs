@@ -2349,6 +2349,27 @@ async fn sign_in_asks_the_core_for_that_member_and_selects_nothing(cx: &mut Test
     assert_eq!(now, active, "nothing was selected");
 }
 
+// Beside a working member, the signed-out member's chip keeps its filter toggle, and its
+// "Sign-in needed" is a control of its own that asks the core to sign it in.
+#[gpui_kit::test]
+async fn a_chips_sign_in_is_its_own_control(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_reports(cx, dir.path(), vec![signed_out("kind-beta")]).await;
+    t.wait_for_element(cx, "member-sign-in-kind-beta").await;
+    assert_eq!(
+        t.label(cx, "member-sign-in-kind-beta").as_deref(),
+        Some("Sign in")
+    );
+
+    t.click(cx, "member-sign-in-kind-beta");
+    cx.run_until_parked();
+    let error = t.workspace.read_with(cx, |ws, _| ws.sets.error.clone());
+    assert!(
+        error.is_some_and(|e| e.contains("kind-beta")),
+        "the core answered"
+    );
+}
+
 #[gpui_kit::test]
 async fn paused_members_are_listed_with_why_and_no_action(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();

@@ -1256,18 +1256,12 @@ impl CombinedResourceList {
                     .cursor_pointer()
                     .when(active, |el| el.bg(theme.table_active))
                     .hover(|el| el.bg(theme.table_hover))
-                    .when(!signed_out, |el| {
-                        el.on_click(registry::on_click_in(
-                            self.focus.clone(),
-                            ToggleClusterFilter {
-                                cluster: cluster.clone(),
-                            },
-                        ))
-                    })
-                    .when_some(
-                        self.member_sign_in.as_ref().filter(|_| signed_out),
-                        |el, sign_in| el.on_click(sign_in.on_click(&cluster)),
-                    )
+                    .on_click(registry::on_click_in(
+                        self.focus.clone(),
+                        ToggleClusterFilter {
+                            cluster: cluster.clone(),
+                        },
+                    ))
                     .when_some(member.tag(), |el, tag| {
                         el.child(tag_dot(&cluster, tag, theme))
                     })
@@ -1279,7 +1273,7 @@ impl CombinedResourceList {
                             .child(member.row_count().to_string()),
                     )
                     .child(if signed_out {
-                        sign_in_chip(theme)
+                        self.render_member_sign_in(&cluster, theme)
                     } else {
                         state_chip(member.state(), self.shown.feeds[i], theme)
                     })
@@ -1304,7 +1298,24 @@ impl CombinedResourceList {
             }))
     }
 
-    /// Marks the members that need a sign-in on their chips, whose click runs `sign_in`.
+    /// A signed-out member's "Sign-in needed", which signs it in when clicked: on its own, so
+    /// the chip's name and count still toggle the filter.
+    fn render_member_sign_in(&self, cluster: &str, theme: &Theme) -> AnyElement {
+        let chip = sign_in_chip(theme);
+        match &self.member_sign_in {
+            Some(sign_in) => div()
+                .id(SharedString::from(format!("member-sign-in-{cluster}")))
+                .cursor_pointer()
+                .aria_label(sign_in.label(cluster))
+                .child(chip)
+                .on_click(sign_in.on_click(cluster))
+                .test_support()
+                .into_any_element(),
+            None => chip,
+        }
+    }
+
+    /// Marks the members that need a sign-in on their chips, whose Sign in runs `sign_in`.
     pub(in super::super) fn set_signed_out(
         &mut self,
         members: HashSet<ClusterId>,

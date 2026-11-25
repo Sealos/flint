@@ -350,7 +350,7 @@ async fn a_members_failed_credential_stops_keep_watching_too() {
     land_dev(&mut manager).await;
     let attempt = manager.cluster("dev").unwrap().attempt;
 
-    manager.member_credential_failed("dev", attempt);
+    manager.member_credential_failed("dev", attempt, super::super::running_set::consent_ended());
     manager.sync_keep_watching();
 
     assert!(matches!(
@@ -1434,4 +1434,103 @@ async fn only_a_signed_out_member_in_the_set_signs_in() {
     assert!(gone.is_err(), "no longer a member");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(plugin.starts().is_empty());
+}
+
+/// Clicks `dev`'s Sign in and lands its attempt as connected.
+async fn signed_in_once(manager: &mut ClusterManager) {
+    click_sign_in(manager).unwrap();
+    pump_later(manager);
+    assert!(
+        manager
+            .cluster("dev")
+            .unwrap()
+            .access
+            .signed_in_once_access()
+    );
+    land_dev(manager).await;
+    assert_eq!(dev_state(manager), MemberState::Live);
+}
+
+// The click covers the background only: selecting the member connects it anew as the selected
+// cluster, and leaving the set drops a connection the click made.
+#[tokio::test]
+async fn a_signed_in_once_connection_stays_a_background_members() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _) = signed_out_set(&plugin, config.path().to_owned());
+    signed_in_once(&mut manager).await;
+
+    manager.activate("dev".to_owned());
+    let slot = manager.cluster("dev").unwrap();
+    assert!(
+        !slot.access.signed_in_once_access(),
+        "a selected cluster's own"
+    );
+    assert!(matches!(slot.state, ConnectionState::Connecting));
+
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _) = signed_out_set(&plugin, config.path().to_owned());
+    signed_in_once(&mut manager).await;
+    let once = manager
+        .cluster("dev")
+        .unwrap()
+        .access
+        .grant(CredentialSource::Plugin);
+    manager.set_running_set(Vec::new());
+    assert!(!once.allowed(), "ended with the membership");
+    let slot = manager.cluster("dev").unwrap();
+    assert!(matches!(slot.state, ConnectionState::Disconnected));
+}
+
+// When the token is due, the refused second start reaches the manager: the member asks for a
+// sign-in again at once.
+#[tokio::test]
+async fn a_spent_sign_in_asks_again() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _) = signed_out_set(&plugin, config.path().to_owned());
+    signed_in_once(&mut manager).await;
+    let attempt = manager.cluster("dev").unwrap().attempt;
+
+    manager
+        .handle_internal(Internal::MemberSignInSpent {
+            cluster: "dev".into(),
+            attempt,
+        })
+        .await;
+
+    let MemberState::SignInNeeded { reason } = dev_state(&manager) else {
+        panic!("{:?}", dev_state(&manager));
+    };
+    assert!(reason.to_string().contains("sign in again"), "{reason}");
+    assert!(
+        click_sign_in(&mut manager).is_ok(),
+        "Sign in is offered again"
+    );
+}
+
+// A member with background sign-in consent whose sign-in failed signs in attended on a click,
+// rather than run unattended again, and its consent stays as it was.
+#[tokio::test]
+async fn a_consented_member_signs_in_attended_on_a_click() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _) = signed_out_set(&plugin, config.path().to_owned());
+    allow(&mut manager).await;
+    manager.sync_keep_watching();
+    assert!(matches!(
+        dev_state(&manager),
+        MemberState::SignInNeeded { .. }
+    ));
+
+    click_sign_in(&mut manager).unwrap();
+    pump_later(&mut manager);
+
+    let slot = manager.cluster("dev").unwrap();
+    assert!(slot.access.signed_in_once_access());
+    assert!(!slot.access.unattended());
+    assert!(
+        manager.keep.consents.contains_key("dev"),
+        "consent unchanged"
+    );
 }

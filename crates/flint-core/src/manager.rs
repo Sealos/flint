@@ -379,6 +379,11 @@ enum Internal {
         cluster: ClusterId,
         attempt: u64,
     },
+    /// A member signed in once from the set view needed its sign-in to run again.
+    MemberSignInSpent {
+        cluster: ClusterId,
+        attempt: u64,
+    },
     FilesChanged(Changed),
     /// The file watches changed and now cover these directories. Anything may have been written
     /// before they started, so everything is read again.
@@ -1791,7 +1796,10 @@ impl ClusterManager {
             // The loop's sync starts what is due.
             Internal::KeepWatchRetry => {}
             Internal::MemberCredentialFailed { cluster, attempt } => {
-                self.member_credential_failed(&cluster, attempt);
+                self.member_credential_failed(&cluster, attempt, running_set::consent_ended());
+            }
+            Internal::MemberSignInSpent { cluster, attempt } => {
+                self.member_credential_failed(&cluster, attempt, running_set::sign_in_spent());
             }
             Internal::Discovered {
                 cluster,
@@ -2585,6 +2593,14 @@ impl ClusterManager {
             self.drop_spent_connections();
         }
         self.apply_member(&id, MemberEvent::Activated, Instant::now());
+        // A member signed in once from the set view connects anew as the selected cluster: the
+        // click covered one start in the background, and nothing more.
+        if self
+            .cluster(&id)
+            .is_some_and(|slot| slot.access.signed_in_once_access())
+        {
+            self.reconnect_selected(&id);
+        }
         self.ensure_connected(&id);
         // A connected cluster whose discovery failed gets another try when selected.
         if let Some(slot) = self.cluster_mut(&id)
@@ -2676,7 +2692,7 @@ impl ClusterManager {
         // A member in the background signs in once if the person just asked for it from the set
         // view. Otherwise it signs in under its keep-watching consent, if it has one, and never
         // with a prompt.
-        let once = self.take_member_sign_in(id, role);
+        let once = self.take_member_sign_in(id, role, attempt);
         let consent = (once.is_none() && role == Role::Background && self.members.contains_key(id))
             .then(|| self.member_consent(id))
             .flatten();

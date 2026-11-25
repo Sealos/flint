@@ -718,21 +718,28 @@ fn the_not_allowed_error_names_no_command() {
     assert!(text.to_string().contains("select the cluster"));
 }
 
-// A member signed in once from the set view starts its plugin once in the background, after
-// the definition check; a second start there is refused and ends the access. Selected, it runs
-// as a selected cluster's does.
+// A member signed in once from the set view starts its plugin once, after the definition
+// check; a second start is refused, ends the access and tells the manager.
 #[tokio::test]
-async fn a_sign_in_once_starts_once_in_the_background() {
+async fn a_sign_in_once_starts_once() {
     let checks = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&checks);
     let verify = SendCheck::new(move || {
         counted.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(()) })
     });
-    let access = CredentialAccess::signed_in_once(Role::Background, verify);
+    let spent = Arc::new(AtomicUsize::new(0));
+    let told = Arc::clone(&spent);
+    let access = CredentialAccess::signed_in_once(
+        verify,
+        Arc::new(move || {
+            told.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
     let grant = access.grant(CredentialSource::Plugin);
     assert!(grant.allowed());
     assert!(!access.unattended(), "the person who clicked is there");
+    assert!(access.signed_in_once_access());
     assert!(!access.grant(CredentialSource::AuthProvider).allowed());
     let first = grant.lease();
     assert!(
@@ -745,16 +752,15 @@ async fn a_sign_in_once_starts_once_in_the_background() {
         "the definition was checked"
     );
     assert!(grant.lease().holds(), "the connection it made goes on");
-
-    access.set_role(Role::Foreground);
-    assert!(grant.lease().launch_refusal().await.is_none(), "selected");
-    access.set_role(Role::Background);
-    assert_eq!(checks.load(Ordering::SeqCst), 1);
+    assert_eq!(spent.load(Ordering::SeqCst), 0);
 
     let again = grant.lease();
     assert!(again.launch_refusal().await.is_some(), "no second start");
     assert!(!again.holds() && !first.holds(), "the access ended");
     assert!(!grant.allowed());
+    assert_eq!(spent.load(Ordering::SeqCst), 1, "the manager is told once");
+    assert!(again.launch_refusal().await.is_some());
+    assert_eq!(spent.load(Ordering::SeqCst), 1);
     access.set_role(Role::Foreground);
     assert!(!grant.allowed(), "for good");
 }
@@ -763,7 +769,7 @@ async fn a_sign_in_once_starts_once_in_the_background() {
 #[tokio::test]
 async fn a_refused_sign_in_once_is_used_up() {
     let verify = SendCheck::new(|| Box::pin(async { Err("changed".to_owned()) }));
-    let access = CredentialAccess::signed_in_once(Role::Background, verify);
+    let access = CredentialAccess::signed_in_once(verify, Arc::new(|| {}));
     let grant = access.grant(CredentialSource::Plugin);
     assert_eq!(
         grant.lease().launch_refusal().await.as_deref(),

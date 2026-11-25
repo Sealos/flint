@@ -103,15 +103,14 @@ impl CredentialPolicy for KeptMember {
 }
 
 /// A running-set member the person signed in once from the set view: its credential may run in
-/// the background or selected, as [`KeptMember`]'s does, but the access's launch check lets its
-/// program start only once in the background ([`CredentialAccess::signed_in_once`]). An auth
-/// provider's command can't be stopped once it runs, so it never runs in the background here.
+/// the background, but the access's launch check lets its program start only once
+/// ([`CredentialAccess::signed_in_once`]). An auth provider's command can't be stopped once it
+/// runs, so it never runs here.
 pub(crate) struct SignedInOnce;
 
 impl CredentialPolicy for SignedInOnce {
     fn may_run(&self, source: &CredentialSource, role: Role) -> bool {
         !source.runs_a_command()
-            || role == Role::Foreground
             || (role == Role::Background && *source != CredentialSource::AuthProvider)
     }
 }
@@ -171,6 +170,8 @@ pub(crate) struct CredentialAccess {
     on_failure: Option<OnCredentialFailure>,
     /// Counts this connection's running plugins, for a kept connection.
     plugin_runs: Option<PluginRuns>,
+    /// Made by [`Self::signed_in_once`].
+    once: bool,
 }
 
 impl CredentialAccess {
@@ -183,6 +184,7 @@ impl CredentialAccess {
             launch_check: None,
             on_failure: None,
             plugin_runs: None,
+            once: false,
         }
     }
 
@@ -222,27 +224,21 @@ impl CredentialAccess {
 
     /// Access for a running-set member's connection the person asked to sign in once, now
     /// ([`SignedInOnce`]). It is attended: the person who clicked is there, so its program may
-    /// prompt or open a browser as a selected cluster's does. Before its one background start,
-    /// `verify` must accept the definition, and that start uses the click up whatever `verify`
-    /// answers. A later start in the background is refused and retires the access for good, so
-    /// nothing retries it: the connection is then spent, and the member asks for a sign-in again.
-    /// Selected, its program starts as a selected cluster's does, with no check of its own.
-    pub(crate) fn signed_in_once(role: Role, verify: SendCheck) -> Self {
+    /// prompt or open a browser as a selected cluster's does. Before its one start, `verify`
+    /// must accept the definition, and that start uses the click up whatever `verify` answers.
+    /// Any later start is refused and retires the access for good, and `on_spent` is told, so
+    /// nothing retries it and the member asks for a sign-in again. The manager never keeps this
+    /// access on a selected cluster or outside the set.
+    pub(crate) fn signed_in_once(verify: SendCheck, on_spent: OnCredentialFailure) -> Self {
         let used = AtomicBool::new(false);
-        let mut access = Self::new(Arc::new(SignedInOnce), role);
+        let mut access = Self::new(Arc::new(SignedInOnce), Role::Background);
+        access.once = true;
         // Weak: the check is held by the access it looks at.
         let roles = Arc::downgrade(&access.role);
         access.launch_check = Some(SendCheck::new(move || {
-            let roles = roles.upgrade();
-            let selected = roles
-                .as_ref()
-                .is_some_and(|role| role.borrow().role == Role::Foreground);
-            let first = !selected && !used.swap(true, Ordering::SeqCst);
-            if !selected
-                && !first
-                && let Some(roles) = &roles
-            {
-                roles.send_if_modified(|state| {
+            let first = !used.swap(true, Ordering::SeqCst);
+            if !first && let Some(roles) = roles.upgrade() {
+                let retired = roles.send_if_modified(|state| {
                     let live = state.role != Role::Retired;
                     if live {
                         state.role = Role::Retired;
@@ -250,12 +246,13 @@ impl CredentialAccess {
                     }
                     live
                 });
+                if retired {
+                    on_spent();
+                }
             }
             let verify = verify.clone();
             Box::pin(async move {
-                if selected {
-                    Ok(())
-                } else if first {
+                if first {
                     verify.refusal().await
                 } else {
                     Err("its sign-in already ran once; sign in again".to_owned())
@@ -263,6 +260,11 @@ impl CredentialAccess {
             })
         }));
         access
+    }
+
+    /// Whether this is the access of a member signed in once ([`Self::signed_in_once`]).
+    pub(crate) fn signed_in_once_access(&self) -> bool {
+        self.once
     }
 
     /// Whether this is a kept connection's access: nobody answers its program's prompts.

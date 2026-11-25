@@ -5,7 +5,6 @@ use flint_core::{ConnectionState, CoreHandle, KindId, Subscription as KindSubscr
 use gpui_kit::*;
 
 use super::super::super::set_kinds::MemberKinds;
-use super::super::super::set_members::MemberSignIn;
 use super::Workspace;
 
 impl Workspace {
@@ -29,7 +28,7 @@ impl Workspace {
             .map(|(m, _)| m.clone())
             .collect();
         let signed_out = self.signed_out_members(run, cx);
-        let sign_in = MemberSignIn::new(cx.entity().downgrade());
+        let sign_in = self.member_sign_in(run, cx);
         let note = self.nav.update(cx, |nav, cx| {
             nav.set_cluster_set(Some(members), Some(kind.clone()), cx);
             nav.set_kinds().and_then(|set| set.note(&kind))

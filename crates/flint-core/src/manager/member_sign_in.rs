@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::ClusterManager;
+use super::{ClusterManager, Internal};
 use crate::connection::member::{MemberEvent, MemberState, ServerIdentity};
 use crate::connection::policy::{CredentialAccess, Role};
 use crate::handle::{AdmittedMember, Event};
@@ -95,8 +95,6 @@ impl ClusterManager {
         match &*self.sign_in(id) {
             // Nothing runs: the attempt only tries the credential again.
             SignIn::Static => {}
-            // Its consent covers this run, under the background sign-in's own rules.
-            SignIn::Plugin(_) if self.member_consent(id).is_some() => {}
             SignIn::Plugin(_) => {
                 let consent = self.seal_shown_plugin(id, shown.ok_or_else(changed)?)?;
                 self.signing_in.insert(
@@ -129,7 +127,12 @@ impl ClusterManager {
     /// confirmed, and for the program the click saw. A selected member signs in as the selected
     /// cluster and uses none. Anything else leaves the attempt without it, so the plugin is
     /// refused and the member waits for a sign-in again.
-    pub(super) fn take_member_sign_in(&mut self, id: &str, role: Role) -> Option<CredentialAccess> {
+    pub(super) fn take_member_sign_in(
+        &mut self,
+        id: &str,
+        role: Role,
+        attempt: u64,
+    ) -> Option<CredentialAccess> {
         let pending = self.signing_in.remove(id)?;
         if role != Role::Background {
             return None;
@@ -164,7 +167,17 @@ impl ClusterManager {
         // The launch check reads the files again right before the program starts, as a
         // background sign-in's does.
         let check = self.launch_check(id, pending.consent);
-        Some(CredentialAccess::signed_in_once(role, check))
+        let spent = self.internal_tx.clone();
+        let cluster = id.to_owned();
+        Some(CredentialAccess::signed_in_once(
+            check,
+            Arc::new(move || {
+                let _ = spent.send(Internal::MemberSignInSpent {
+                    cluster: cluster.clone(),
+                    attempt,
+                });
+            }),
+        ))
     }
 
     /// Forgets a sign-in asked for `id` and not yet started.
