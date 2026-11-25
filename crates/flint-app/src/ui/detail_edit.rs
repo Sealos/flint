@@ -2,8 +2,9 @@
 //! and its diff), Apply through the shared confirmation, and a reload when the object changed.
 //!
 //! Every check that matters is in `flint_core::write`. This keeps the editor's text and which
-//! step it is at. A Secret is not editable: its values are masked here, and a mask must never
-//! be written back.
+//! step it is at. A Secret opens with its values masked, as the YAML tab shows them. A mask left
+//! in place keeps the value on the cluster: the core sends only what changed and never a mask
+//! (`flint_core::secret_edit`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -85,6 +86,16 @@ impl YamlEdit {
             None
         }
     }
+}
+
+/// The object the editor opens: a Secret's values (and annotation values that may copy them)
+/// masked, as the YAML tab shows them.
+fn shown_for_edit(object: &Value, is_secret: bool) -> Value {
+    let mut shown = object.clone();
+    if is_secret || flint_core::redact::is_secret_object(object) {
+        flint_core::redact::mask_secret(&mut shown, flint_core::secret_edit::MASK);
+    }
+    shown
 }
 
 /// The object as the editor opens it: no `status` or `managedFields`, `resourceVersion` kept.
@@ -170,11 +181,10 @@ enum Step<'a> {
     Item(&'a str),
 }
 
+/// `object` without what the server sets in `metadata`. `status` is kept: an edit may set it on
+/// a kind without a status subresource, and then a change to it on the cluster competes.
 fn without_server_owned(object: &Value) -> Value {
     let mut kept = object.clone();
-    if let Some(fields) = kept.as_object_mut() {
-        fields.remove("status");
-    }
     if let Some(metadata) = kept.get_mut("metadata").and_then(Value::as_object_mut) {
         for field in SERVER_OWNED_METADATA {
             metadata.remove(field);
@@ -185,14 +195,52 @@ fn without_server_owned(object: &Value) -> Value {
 
 /// The paths that differ between any state in `seen` and `latest` and that `yaml` would set to
 /// something other than `latest`, sorted. Text that does not parse has none: its review fails.
-fn competing_changes(seen: &[Value], latest: &Value, yaml: &str) -> Vec<String> {
-    let Ok(edited) = serde_saphyr::from_str::<Value>(yaml) else {
+/// `status` counts only when the text sets it: otherwise the write keeps the cluster's. Then it
+/// is the status the review's dry run wrote (`reviewed_after`, the review's after text), which an
+/// admission webhook may have changed from the typed one: the cluster's if the review did not
+/// show one. Without a review, the typed one.
+fn competing_changes(
+    seen: &[Value],
+    latest: &Value,
+    yaml: &str,
+    reviewed_after: Option<&str>,
+) -> Vec<String> {
+    let Ok(mut edited) = serde_saphyr::from_str::<Value>(yaml) else {
         return Vec::new();
     };
-    let latest = without_server_owned(latest);
-    let edited = without_server_owned(&edited);
+    if flint_core::redact::is_secret_object(latest) {
+        // A mask left in place keeps the latest value: it overwrites nothing. A `stringData`
+        // value lands in `data` under its key, so it is compared there.
+        edited = flint_core::secret_edit::effective_data(
+            &flint_core::secret_edit::with_live_values(&edited, latest),
+        );
+    }
+    let sets_status = edited.get("status").is_some();
+    if sets_status
+        && let Some(after) = reviewed_after
+        && let Some(fields) = edited.as_object_mut()
+    {
+        let written = serde_saphyr::from_str::<Value>(after)
+            .ok()
+            .and_then(|mut after| after.get_mut("status").map(Value::take))
+            .or_else(|| latest.get("status").cloned());
+        match written {
+            Some(status) => fields.insert("status".to_owned(), status),
+            None => fields.remove("status"),
+        };
+    }
+    let compared = |object: &Value| {
+        let mut kept = without_server_owned(object);
+        if let Some(fields) = kept.as_object_mut().filter(|_| !sets_status) {
+            fields.remove("status");
+        }
+        kept
+    };
+    let latest = compared(latest);
+    let edited = compared(&edited);
+    let seen: Vec<Value> = seen.iter().map(compared).collect();
     let mut found = BTreeSet::new();
-    for earlier in seen {
+    for earlier in &seen {
         collect_competing(
             Some(earlier),
             Some(&latest),
@@ -341,11 +389,6 @@ fn competing_text(paths: &[String]) -> Option<String> {
     ))
 }
 
-/// Whether the text sets `status`, which a review cannot show: the editor opens without it.
-fn sets_status(yaml: &str) -> bool {
-    serde_saphyr::from_str::<Value>(yaml).is_ok_and(|value| value.get("status").is_some())
-}
-
 fn diff_file(patch: &str) -> Option<DiffFile> {
     let file = DiffFile::parse(patch).ok()?.into_iter().next()?;
     Some(file.with_language("yaml"))
@@ -459,9 +502,6 @@ impl DetailView {
         if self.edit_moved() {
             return Some(EDIT_MOVED.to_owned());
         }
-        if self.is_secret {
-            return Some("Secret values are hidden, so a Secret cannot be edited here".to_owned());
-        }
         if self.gone {
             return Some("This object was deleted".to_owned());
         }
@@ -543,7 +583,7 @@ impl DetailView {
         };
         let target = self.edit_target(detail);
         let opened = without_server_owned(&detail.object);
-        let text = match editable_yaml(&detail.object) {
+        let text = match editable_yaml(&shown_for_edit(&detail.object, self.is_secret)) {
             Ok(text) => text,
             Err(why) => {
                 cx.emit(DetailEvent::Refused(format!(
@@ -661,11 +701,6 @@ impl DetailView {
             return;
         };
         let yaml = edit.editor.read(cx).value().to_string();
-        if sets_status(&yaml) {
-            edit.error = Some("Remove status: it cannot be edited here.".to_owned());
-            cx.notify();
-            return;
-        }
         edit.phase = Phase::Reviewing;
         edit.error = None;
         edit.competing.clear();
@@ -687,8 +722,9 @@ impl DetailView {
             let compare = compare.filter(|_| result.is_ok());
             let (patch, competing) = cx
                 .background_spawn(async move {
+                    let after = shown.as_ref().map(|(_, after)| after.as_str());
                     let competing = compare.map_or_else(Vec::new, |(seen, latest, yaml)| {
-                        competing_changes(&seen, &latest.object, &yaml)
+                        competing_changes(&seen, &latest.object, &yaml, after)
                     });
                     let patch = shown.and_then(|(before, after)| patch(&name, &before, &after));
                     (patch, competing)
@@ -955,13 +991,13 @@ impl DetailView {
 mod tests {
     use flint_core::write::WriteError;
     use flint_core::{KindId, ObjectDetail, SyncState, WriteRefusal};
-    use gpui_kit::test::TestAppContextExt as _;
+    use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
     use gpui_kit::{AppContext as _, TestAppContext};
     use serde_json::json;
 
     use super::{
-        Fetch, Phase, Step, competing_text, edit_error_text, editable_yaml, path_text, sets_status,
-        with_resource_version, without_server_owned,
+        DetailTab, Fetch, Phase, Step, competing_text, edit_error_text, editable_yaml, path_text,
+        shown_for_edit, with_resource_version, without_server_owned,
     };
     use crate::ui::support_tests::{WAIT, objects, open_workspace, standard_sections};
 
@@ -970,7 +1006,7 @@ mod tests {
         latest: &serde_json::Value,
         yaml: &str,
     ) -> Vec<String> {
-        super::competing_changes(&[without_server_owned(base)], latest, yaml)
+        super::competing_changes(&[without_server_owned(base)], latest, yaml, None)
     }
 
     // covers UP-51: the editor opens without status or managedFields, at its version.
@@ -1004,6 +1040,64 @@ mod tests {
 
     fn yaml(value: &serde_json::Value) -> String {
         serde_saphyr::to_string(value).unwrap()
+    }
+
+    fn secret(first: &str, second: &str) -> serde_json::Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": "db", "resourceVersion": "7",
+                         "annotations": {"copy": "c2Vjb25k"}},
+            "data": {"alpha": first, "beta": second},
+        })
+    }
+
+    // A Secret opens masked: keys shown, no value in the editor's text.
+    #[test]
+    fn a_secret_opens_with_its_values_masked() {
+        let text = editable_yaml(&shown_for_edit(&secret("Zmlyc3Q=", "c2Vjb25k"), true)).unwrap();
+        assert!(text.contains("alpha:") && text.contains("beta:"), "{text}");
+        assert!(text.contains(flint_core::secret_edit::MASK), "{text}");
+        assert!(
+            !text.contains("Zmlyc3Q") && !text.contains("c2Vjb25k"),
+            "{text}"
+        );
+    }
+
+    // A mask left in place keeps the latest value, so a remote change to it is not overwritten;
+    // a value typed over a remote change is named, without either value.
+    #[test]
+    fn a_mask_left_in_place_competes_with_nothing() {
+        let base = secret("Zmlyc3Q=", "c2Vjb25k");
+        let latest = secret("dGhpcmQ=", "c2Vjb25k");
+        let opened = editable_yaml(&shown_for_edit(&base, true)).unwrap();
+        assert!(competing_changes(&base, &latest, &opened).is_empty());
+        let masked = format!("alpha: {}", flint_core::secret_edit::MASK);
+        let typed = opened.replace(&masked, "alpha: Zm91cnRo");
+        assert_ne!(typed, opened);
+        let paths = competing_changes(&base, &latest, &typed);
+        assert_eq!(paths, vec!["data.alpha"]);
+        let text = competing_text(&paths).unwrap();
+        for value in ["Zmlyc3Q", "dGhpcmQ", "Zm91cnRo"] {
+            assert!(!text.contains(value), "{text}");
+        }
+    }
+
+    // Kubernetes writes stringData over data: a stringData value typed over a key rotated on the
+    // cluster is named, though its data line was left masked.
+    #[test]
+    fn string_data_over_a_rotated_key_is_named() {
+        let base = secret("Zmlyc3Q=", "c2Vjb25k");
+        let latest = secret("dGhpcmQ=", "c2Vjb25k");
+        let opened = editable_yaml(&shown_for_edit(&base, true)).unwrap();
+        let typed = format!("{opened}stringData:\n  alpha: typed-text\n");
+        let paths = competing_changes(&base, &latest, &typed);
+        assert_eq!(paths, vec!["data.alpha"]);
+        let text = competing_text(&paths).unwrap();
+        assert!(!text.contains("typed-text"), "{text}");
+        // On a key nobody changed, it competes with nothing.
+        let quiet = format!("{opened}stringData:\n  beta: typed-text\n");
+        assert!(competing_changes(&base, &latest, &quiet).is_empty());
     }
 
     // A stale value kept by a reload is named, and so is a new value over a remote change.
@@ -1076,7 +1170,26 @@ mod tests {
             "spec": {"replicas": 1, "paused": false},
             "status": {"ready": 5},
         });
-        assert!(competing_changes(&base, &only_server, &yaml(&base)).is_empty());
+        let mut opened = base.clone();
+        opened.as_object_mut().unwrap().remove("status");
+        assert!(competing_changes(&base, &only_server, &yaml(&opened)).is_empty());
+    }
+
+    // A kind without a status subresource takes a typed status: a status that changed on the
+    // cluster since is then overwritten, and listed.
+    #[test]
+    fn a_typed_status_competes_with_the_clusters() {
+        let at = |ready: u32| json!({"metadata": {"name": "a"}, "status": {"ready": ready}});
+        let typed = yaml(&at(9));
+        assert_eq!(competing_changes(&at(1), &at(5), &typed), ["status.ready"]);
+        assert!(competing_changes(&at(1), &at(1), &typed).is_empty());
+        // The text keeps the cluster's 5, and a webhook writes 0: 5 is still overwritten.
+        let seen = [without_server_owned(&at(1))];
+        let written = yaml(&at(0));
+        assert_eq!(
+            super::competing_changes(&seen, &at(5), &yaml(&at(5)), Some(&written)),
+            ["status.ready"]
+        );
     }
 
     #[test]
@@ -1107,10 +1220,10 @@ mod tests {
         let at = |n: u32| json!({"metadata": {"name": "a"}, "spec": {"replicas": n}});
         let seen = [without_server_owned(&at(1)), without_server_owned(&at(5))];
         assert_eq!(
-            super::competing_changes(&seen, &at(1), &yaml(&at(5))),
+            super::competing_changes(&seen, &at(1), &yaml(&at(5)), None),
             ["spec.replicas"]
         );
-        assert!(super::competing_changes(&seen, &at(1), &yaml(&at(1))).is_empty());
+        assert!(super::competing_changes(&seen, &at(1), &yaml(&at(1)), None).is_empty());
     }
 
     fn init(names: &[&str]) -> serde_json::Value {
@@ -1168,13 +1281,6 @@ mod tests {
         let value: serde_json::Value = serde_saphyr::from_str(&moved).unwrap();
         assert_eq!(value["metadata"]["resourceVersion"], "8", "{moved}");
         assert_eq!(value["metadata"]["name"], "a", "{moved}");
-    }
-
-    // A review hides status, so an edit that sets it is not sent.
-    #[test]
-    fn an_edit_that_sets_status_is_recognised() {
-        assert!(sets_status("kind: X\nstatus:\n  phase: Ready\n"));
-        assert!(!sets_status("kind: X\nspec:\n  status: keep\n"));
     }
 
     // The editor's own wording for a moved context: no mention of a shell, and the way forward.
@@ -1258,10 +1364,9 @@ mod tests {
             view.update(cx, |v, cx| {
                 v.show_fetched(detail.clone(), window, cx);
                 v.start_edit(window, cx);
+                // Its context moved meanwhile: the follow-up review is refused at once.
+                v.mark_edit_moved(cx);
                 let edit = v.edit.as_mut().expect("the edit started");
-                edit.editor.update(cx, |state, cx| {
-                    state.set_value("kind: Pod\nstatus: {}\n", window, cx)
-                });
                 edit.phase = Phase::Reviewing;
                 window.focus(&moved_to, cx);
                 v.edit_reloaded(Ok(std::sync::Arc::new(detail)), window, cx);
@@ -1274,10 +1379,105 @@ mod tests {
         view.read_with(cx, |v, _| {
             let (error, blocked) = (v.edit_error(), v.edit_blocked());
             assert!(
-                error.is_some_and(|e| e.contains("status")),
+                error.is_some_and(|e| e.contains("open the object again")),
                 "{error:?} {blocked:?}"
             );
         });
+    }
+
+    // covers UP-51: a Secret is editable, and its editor shows masks, never a value.
+    #[gpui_kit::test]
+    async fn a_secret_edit_starts_masked(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        let view = show_secret(cx, &t).await;
+        cx.update_window(t.window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                assert_eq!(v.edit_blocked(), None);
+                v.start_edit(window, cx);
+            })
+        })
+        .unwrap();
+        view.read_with(cx, |v, cx| {
+            let edit = v.edit.as_ref().expect("the edit started");
+            let text = edit.editor.read(cx).value().to_string();
+            assert!(text.contains(flint_core::secret_edit::MASK), "{text}");
+            assert!(!text.contains("Zmlyc3Q"), "{text}");
+        });
+    }
+
+    // covers UP-54: on a protected cluster, a Secret's Edit is disabled with Unlock beside it.
+    #[gpui_kit::test]
+    async fn a_protected_secret_offers_unlock_beside_edit(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.toml"),
+            "protect_local_clusters = true\n",
+        )
+        .unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        let view = show_secret(cx, &t).await;
+        view.update(cx, |v, _| v.tab = DetailTab::Yaml);
+        cx.run_until_parked();
+        cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.run_until_parked();
+        let drawn = cx
+            .update_window(t.window, |_, window, _| {
+                let state = |id| window.try_find(id).map(|b| b.disabled() == Some(true));
+                (state("yaml-edit"), state("yaml-edit-unlock"))
+            })
+            .unwrap();
+        assert_eq!(drawn, (Some(true), Some(false)));
+    }
+
+    /// Opens Secret `demo/db` in the detail pane, its fetch answered by hand.
+    async fn show_secret(
+        cx: &mut TestAppContext,
+        t: &crate::ui::support_tests::TestWorkspace,
+    ) -> gpui_kit::Entity<super::DetailView> {
+        let kind = KindId::new("", "secrets");
+        t.connect_alpha(cx, standard_sections()).await;
+        t.open_kind(
+            cx,
+            kind.plural(),
+            objects(kind.clone(), &[("demo", "db", 0)], SyncState::Synced, 1),
+        )
+        .await;
+        t.dispatch(
+            cx,
+            "resource_list::SelectRow",
+            json!({"namespace": "demo", "name": "db"}),
+        )
+        .unwrap();
+        let view = t.detail(cx).expect("the detail pane is open");
+        let failed = view.clone();
+        cx.wait_for(t.window, WAIT, move |_, cx| {
+            matches!(&failed.read(cx).fetch, Fetch::Failed(_))
+        })
+        .await;
+        let object = json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": "db", "namespace": "demo", "uid": "uid-db", "resourceVersion": "1"
+            },
+            "data": {"alpha": "Zmlyc3Q="},
+        });
+        let detail = ObjectDetail {
+            yaml: serde_saphyr::to_string(&object).unwrap(),
+            object,
+            managed_fields: None,
+            events: Vec::new(),
+            events_truncated: false,
+            events_error: None,
+        };
+        cx.update_window(t.window, |_, window, cx| {
+            view.update(cx, |v, cx| v.show_fetched(detail, window, cx))
+        })
+        .unwrap();
+        cx.run_until_parked();
+        view
     }
 
     #[gpui_kit::test]

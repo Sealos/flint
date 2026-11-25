@@ -743,8 +743,22 @@ opens in a tab in the bottom dock.
    Helm and controllers.
 4. A reload keeps the text being edited and moves it to the current `resourceVersion`, so the new diff shows any
    change the edit would undo. An edit that leaves `status` out keeps the live value, since a `PUT` to a kind without
-   a status subresource would erase it.
-5. A Secret is not editable yet: its values are masked in the YAML, and a mask must never be written back.
+   a status subresource would erase it. An edit may add `status` back on such a kind: the review then shows `status`
+   before and after, and the overwrite warning counts a change to it on the cluster. On a kind with a status
+   subresource the server ignores it, so the review is refused instead of showing a change Apply would not make.
+5. A Secret opens with every `data` and `stringData` value, and every annotation value outside the allowlist, masked
+   as the YAML tab shows them. A mask left in place keeps the value on the cluster and is never written back
+   (`flint_core::secret_edit`). Review and Apply send a JSON Merge Patch (`PATCH`, `dryRun=All` for the review) of
+   only what changed, with the reviewed `uid` and `resourceVersion` as preconditions, so an untouched value is never
+   sent. Apply reads the Secret again first and refuses with a conflict if its version moved since the review. A
+   mask under a key the cluster does not have there is refused, as is a review's placeholder or any mask left in
+   the patch. A changed `data` value must be base64; plain text goes under `stringData`, which the server encodes.
+   The review's diff names the keys added, changed (`<hidden, changed>`) and removed, never a value, and no error
+   quotes one: a server refusal shows its code, a known reason, the admission webhook's name and the fields it names
+   that the patch has, never its message, which a webhook could use to echo a value. A YAML syntax error names
+   only its line and column. Edit on a Secret is offered
+   when access allows `patch`, not `update`. The overwrite warning compares `stringData` as the `data` it becomes. A mask stands for the value under its own key: a masked line renamed onto another key keeps that
+   key's value, which the review shows as unchanged.
 
 Delete, scale, rollout restart, cordon, and drain are typed actions in `flint-core`, each with a confirmation in the
 UI. Every write refuses on a protected cluster ([ADR-0015](./adr/0015-clusters-are-protected-by-default.md)): it

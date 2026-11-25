@@ -110,6 +110,7 @@ fn reviewed() -> ReviewedEdit {
         pin: crate::recheck::ContextHistory::default().pin("dev", None),
         credential: crate::credential::CredentialBinding::for_tests(),
         body: json!({"data": {"password": "aHVudGVyMg=="}}),
+        secret: true,
         creates: false,
         before: String::new(),
         after: String::new(),
@@ -177,7 +178,7 @@ fn a_review_shows_no_secret_values_status_or_managed_fields() {
         "data": {"password": "aHVudGVyMg=="},
         "status": {"phase": "x"},
     });
-    let shown = shown_yaml(&secret).unwrap();
+    let shown = render(&shown_value(&secret, false)).unwrap();
     assert!(!shown.contains("aHVudGVyMg"), "{shown}");
     assert!(shown.contains("password"), "{shown}");
     assert!(
@@ -196,7 +197,7 @@ fn a_rotated_secret_value_shows_as_changed_without_its_value() {
             "data": {"password": password, "user": "YWRtaW4="},
         })
     };
-    let shown = shown_after(&secret("b2xk"), &secret("bmV3")).unwrap();
+    let shown = shown_after(&secret("b2xk"), &secret("bmV3"), false).unwrap();
     assert!(shown.contains(HIDDEN_CHANGED), "{shown}");
     assert_eq!(shown.matches(HIDDEN_CHANGED).count(), 1, "{shown}");
     assert!(
@@ -213,11 +214,74 @@ fn an_edit_without_status_keeps_the_live_status() {
     assert_eq!(body["status"]["phase"], "Ready");
 }
 
+// A kind without a status subresource takes `status` in a `PUT`: the review shows it then.
+#[test]
+fn a_review_shows_status_only_when_the_write_changes_it() {
+    let live = json!({"spec": {"a": 1}, "status": {"phase": "Ready"}});
+    let untouched = json!({"spec": {"a": 2}, "status": {"phase": "Ready"}});
+    assert_eq!(status_shown(&untouched, &live, &untouched), Ok(false));
+    let typed = json!({"spec": {"a": 1}, "status": {"phase": "Done"}});
+    assert_eq!(status_shown(&typed, &live, &typed), Ok(true));
+    let before = render(&shown_value(&live, true)).unwrap();
+    let after = shown_after(&live, &typed, true).unwrap();
+    assert!(
+        before.contains("Ready") && after.contains("Done"),
+        "{after}"
+    );
+    // No status before, one typed: shown as added.
+    let bare = json!({"spec": {}});
+    let added = json!({"spec": {}, "status": {"phase": "Done"}});
+    assert_eq!(status_shown(&added, &bare, &added), Ok(true));
+}
+
+// A kind with a status subresource ignores `status` in a `PUT`: the dry run keeps the live one,
+// and an edit that set another is refused rather than reviewed without it.
+#[test]
+fn a_status_the_server_does_not_take_is_refused() {
+    let live = json!({"spec": {"a": 1}, "status": {"phase": "Ready"}});
+    let typed = json!({"spec": {"a": 2}, "status": {"phase": "Done"}});
+    let result = json!({"spec": {"a": 2}, "status": {"phase": "Ready"}});
+    let refused = status_shown(&typed, &live, &result)
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("Remove status"), "{refused}");
+    let removed = json!({"spec": {"a": 2}});
+    assert!(status_shown(&removed, &live, &result).is_err());
+}
+
 #[test]
 fn invalid_yaml_does_not_repeat_the_text() {
     let yaml = "apiVersion: v1\nkind: Secret\nstringData:\n  password: \"hunter2\n";
     let error = edit_body(yaml, &kind(), &target()).unwrap_err().to_string();
     assert!(!error.contains("hunter2"), "{error}");
+}
+
+fn secret_kind() -> KindInfo {
+    KindInfo {
+        resource: ApiResource {
+            group: String::new(),
+            version: "v1".into(),
+            api_version: "v1".into(),
+            kind: "Secret".into(),
+            plural: "secrets".into(),
+        },
+        singular: "secret".into(),
+        short_names: Vec::new(),
+        namespaced: true,
+        verbs: Vec::new(),
+    }
+}
+
+#[test]
+fn a_secrets_invalid_yaml_names_only_where() {
+    // A pasted credential as an unquoted key, twice: the parser's message would name it.
+    let yaml = "apiVersion: v1\nkind: Secret\nmetadata:\n  name: web\nstringData:\n  \
+                sk-live-4f9a2c: a\n  sk-live-4f9a2c: b\n";
+    let error = edit_body(yaml, &secret_kind(), &target())
+        .unwrap_err()
+        .to_string();
+    assert!(!error.contains("sk-live"), "{error}");
+    assert!(error.contains("line 7"), "{error}");
 }
 
 #[test]

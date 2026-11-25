@@ -1028,6 +1028,11 @@ pub fn save_state(dir: &Path, state: &State) -> Result<(), SettingsError> {
     )
 }
 
+/// `pin` with its server as [`server_identity`] gives it.
+fn pin_identity(pin: &ClusterPin) -> ClusterPin {
+    ClusterPin::new(pin.context.clone(), server_identity(&pin.server))
+}
+
 /// Server URLs compare equal when they differ only by a trailing slash.
 fn same_server(a: &str, b: &str) -> bool {
     server_identity(a) == server_identity(b)
@@ -1178,33 +1183,40 @@ pub fn set_watch_mode(
     cluster: Option<&str>,
     mode: Option<WatchMode>,
 ) -> Result<Settings, SettingsError> {
+    edit_settings(dir, |table, _| edit_watch_mode(table, cluster, mode))
+}
+
+/// The table edit of [`set_watch_mode`].
+fn edit_watch_mode(
+    table: &mut toml::Table,
+    cluster: Option<&str>,
+    mode: Option<WatchMode>,
+) -> Result<(), SettingsError> {
     let value = |m: WatchMode| toml::Value::try_from(m);
-    edit_settings(dir, |table, _| {
-        match cluster {
-            None => {
-                let mode = mode.unwrap_or_default();
-                table.insert("watch_mode".into(), value(mode)?);
+    match cluster {
+        None => {
+            let mode = mode.unwrap_or_default();
+            table.insert("watch_mode".into(), value(mode)?);
+        }
+        Some(cluster) => {
+            let overrides = table
+                .entry("cluster_watch_mode")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            if !overrides.is_table() {
+                *overrides = toml::Value::Table(toml::Table::new());
             }
-            Some(cluster) => {
-                let overrides = table
-                    .entry("cluster_watch_mode")
-                    .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-                if !overrides.is_table() {
-                    *overrides = toml::Value::Table(toml::Table::new());
+            let overrides = overrides.as_table_mut().expect("a table");
+            match mode {
+                Some(mode) => {
+                    overrides.insert(cluster.to_owned(), value(mode)?);
                 }
-                let overrides = overrides.as_table_mut().expect("a table");
-                match mode {
-                    Some(mode) => {
-                        overrides.insert(cluster.to_owned(), value(mode)?);
-                    }
-                    None => {
-                        overrides.remove(cluster);
-                    }
+                None => {
+                    overrides.remove(cluster);
                 }
             }
         }
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 /// Replaces `context`'s keep-watching entry (`None` removes it), and writes `settings.toml`.
@@ -1358,22 +1370,28 @@ pub fn set_threshold(
     value: Option<u32>,
 ) -> Result<Settings, SettingsError> {
     let path = dir.join(SETTINGS_FILE);
-    let invalid = |path: &Path, error: thresholds::ThresholdWriteError| SettingsError::Invalid {
-        path: path.to_owned(),
-        reason: error.to_string(),
-    };
     if value.is_none() {
         let mut table: toml::Table = load_toml(&path)?;
-        let changed = thresholds::write_value(&mut table, cluster, metric, None)
-            .map_err(|e| invalid(&path, e))?;
-        if !changed {
+        if !edit_threshold(&mut table, &path, cluster, metric, None)? {
             return load_settings(dir);
         }
     }
     edit_settings(dir, |table, path| {
-        thresholds::write_value(table, cluster, metric, value)
-            .map(drop)
-            .map_err(|e| invalid(path, e))
+        edit_threshold(table, path, cluster, metric, value).map(drop)
+    })
+}
+
+/// The table edit of [`set_threshold`]: whether it changed anything.
+fn edit_threshold(
+    table: &mut toml::Table,
+    path: &Path,
+    cluster: Option<&ClusterPin>,
+    metric: ThresholdMetric,
+    value: Option<u32>,
+) -> Result<bool, SettingsError> {
+    thresholds::write_value(table, cluster, metric, value).map_err(|error| SettingsError::Invalid {
+        path: path.to_owned(),
+        reason: error.to_string(),
     })
 }
 
@@ -1397,32 +1415,231 @@ pub fn set_desktop_notifications(dir: &Path, enabled: bool) -> Result<Settings, 
     })
 }
 
-/// One global setting, written on its own through its setter: what the app's Settings view
-/// saves ([`crate::CoreHandle::write_settings`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a [`SettingsWrite`] changes. Two writes of one field replace each other, so the app's
+/// Settings draft keeps one edit per field.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SettingsField {
+    Appearance,
+    DesktopNotifications,
+    WatchMode,
+    /// A threshold: global (`cluster` is `None`) or one cluster's override.
+    Threshold {
+        cluster: Option<ClusterPin>,
+        metric: ThresholdMetric,
+    },
+    /// A cluster's own choice of desktop alerts.
+    ClusterAlerts(ClusterPin),
+    /// A cluster's own watch mode, by context name.
+    ClusterWatchMode(String),
+}
+
+impl SettingsField {
+    /// A threshold's field: global (`cluster` is `None`) or one cluster's override. The server is
+    /// compared as the setters compare it ([`server_identity`]), so two spellings of one server
+    /// are one field.
+    pub fn threshold(cluster: Option<&ClusterPin>, metric: ThresholdMetric) -> Self {
+        SettingsField::Threshold {
+            cluster: cluster.map(pin_identity),
+            metric,
+        }
+    }
+
+    /// A cluster's desktop alerts field, its server compared as [`SettingsField::threshold`]'s.
+    pub fn cluster_alerts(cluster: &ClusterPin) -> Self {
+        SettingsField::ClusterAlerts(pin_identity(cluster))
+    }
+
+    /// Where it is stored in `settings.toml`.
+    pub fn key(&self) -> String {
+        match self {
+            SettingsField::Appearance => "appearance".to_owned(),
+            SettingsField::DesktopNotifications => "desktop_notifications".to_owned(),
+            SettingsField::WatchMode => "watch_mode".to_owned(),
+            SettingsField::Threshold {
+                cluster: None,
+                metric,
+            } => format!("thresholds.{}", metric.key()),
+            SettingsField::Threshold {
+                cluster: Some(pin),
+                metric,
+            } => format!("thresholds.clusters.{}.{}", pin.context, metric.key()),
+            SettingsField::ClusterAlerts(pin) => format!("cluster_alerts.{}", pin.context),
+            SettingsField::ClusterWatchMode(context) => format!("cluster_watch_mode.{context}"),
+        }
+    }
+}
+
+/// One setting, written on its own through its setter: what the app's Settings view holds in
+/// its draft and saves ([`crate::CoreHandle::write_settings`]).
+///
+/// A new setting adds a variant with its arm in each method, and a [`SettingsField`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsWrite {
     Appearance(Appearance),
     DesktopNotifications(bool),
     /// The global watch mode, not a cluster's override.
     WatchMode(WatchMode),
+    /// A threshold, global (`cluster` is `None`) or for one cluster; `None` clears it, so it
+    /// follows the next level down.
+    Threshold {
+        cluster: Option<ClusterPin>,
+        metric: ThresholdMetric,
+        value: Option<u32>,
+    },
+    /// Whether a cluster posts desktop alerts; `None` follows `desktop_notifications`.
+    ClusterAlerts {
+        cluster: ClusterPin,
+        enabled: Option<bool>,
+    },
+    /// A cluster's watch mode; `None` follows the global one.
+    ClusterWatchMode {
+        context: String,
+        mode: Option<WatchMode>,
+    },
 }
 
 impl SettingsWrite {
+    /// The field it changes.
+    pub fn field(&self) -> SettingsField {
+        match self {
+            SettingsWrite::Appearance(_) => SettingsField::Appearance,
+            SettingsWrite::DesktopNotifications(_) => SettingsField::DesktopNotifications,
+            SettingsWrite::WatchMode(_) => SettingsField::WatchMode,
+            SettingsWrite::Threshold {
+                cluster, metric, ..
+            } => SettingsField::threshold(cluster.as_ref(), *metric),
+            SettingsWrite::ClusterAlerts { cluster, .. } => SettingsField::cluster_alerts(cluster),
+            SettingsWrite::ClusterWatchMode { context, .. } => {
+                SettingsField::ClusterWatchMode(context.clone())
+            }
+        }
+    }
+
     /// What it changes, for an error message.
-    pub fn what(self) -> &'static str {
+    pub fn what(&self) -> &'static str {
         match self {
             SettingsWrite::Appearance(_) => "the appearance",
             SettingsWrite::DesktopNotifications(_) => "desktop notifications",
             SettingsWrite::WatchMode(_) => "the watch mode",
+            SettingsWrite::Threshold { .. } => "the threshold",
+            SettingsWrite::ClusterAlerts { .. } => "the cluster's alerts",
+            SettingsWrite::ClusterWatchMode { .. } => "the cluster's watch mode",
         }
     }
 
-    /// Writes it to `settings.toml` in `dir`, through the same setter the other controls use.
-    pub fn write(self, dir: &Path) -> Result<Settings, SettingsError> {
+    /// Whether `settings` already hold it, so writing it would change nothing.
+    pub fn holds_in(&self, settings: &Settings) -> bool {
         match self {
-            SettingsWrite::Appearance(a) => set_appearance(dir, a),
-            SettingsWrite::DesktopNotifications(on) => set_desktop_notifications(dir, on),
-            SettingsWrite::WatchMode(m) => set_watch_mode(dir, None, Some(m)),
+            SettingsWrite::Appearance(a) => settings.appearance == *a,
+            SettingsWrite::DesktopNotifications(on) => settings.desktop_notifications == *on,
+            SettingsWrite::WatchMode(m) => settings.watch_mode == *m,
+            SettingsWrite::Threshold {
+                cluster,
+                metric,
+                value,
+            } => settings.thresholds.explicit(cluster.as_ref(), *metric) == *value,
+            SettingsWrite::ClusterAlerts { cluster, enabled } => {
+                settings.cluster_alerts_choice(&cluster.context, Some(&cluster.server)) == *enabled
+            }
+            SettingsWrite::ClusterWatchMode { context, mode } => {
+                settings.cluster_watch_mode.get(context) == mode.as_ref()
+            }
+        }
+    }
+
+    /// Applies it to `settings` in memory, as [`SettingsWrite::write`] does to the file.
+    pub fn apply(&self, settings: &mut Settings) {
+        match self {
+            SettingsWrite::Appearance(a) => settings.appearance = *a,
+            SettingsWrite::DesktopNotifications(on) => settings.desktop_notifications = *on,
+            SettingsWrite::WatchMode(m) => settings.watch_mode = *m,
+            SettingsWrite::Threshold {
+                cluster,
+                metric,
+                value,
+            } => {
+                // Out of range, the file write is refused too: nothing changes either way.
+                let _ = settings.thresholds.set(cluster.as_ref(), *metric, *value);
+            }
+            SettingsWrite::ClusterAlerts { cluster, enabled } => {
+                settings.cluster_alerts.retain(|e| {
+                    !(e.context == cluster.context && same_server(&e.server, &cluster.server))
+                });
+                if let Some(enabled) = enabled {
+                    settings.cluster_alerts.push(ClusterAlerts {
+                        context: cluster.context.clone(),
+                        server: cluster.server.clone(),
+                        enabled: *enabled,
+                    });
+                }
+            }
+            SettingsWrite::ClusterWatchMode { context, mode } => match mode {
+                Some(mode) => {
+                    settings.cluster_watch_mode.insert(context.clone(), *mode);
+                }
+                None => {
+                    settings.cluster_watch_mode.remove(context);
+                }
+            },
+        }
+    }
+
+    /// Applies it to `table`, the contents of `settings.toml` at `path`, as its setter does:
+    /// whether it changed anything.
+    fn edit(&self, table: &mut toml::Table, path: &Path) -> Result<bool, SettingsError> {
+        match self {
+            SettingsWrite::Appearance(a) => {
+                table.insert("appearance".into(), toml::Value::try_from(a)?);
+            }
+            SettingsWrite::DesktopNotifications(on) => {
+                table.insert("desktop_notifications".into(), toml::Value::Boolean(*on));
+            }
+            SettingsWrite::WatchMode(m) => edit_watch_mode(table, None, Some(*m))?,
+            SettingsWrite::Threshold {
+                cluster,
+                metric,
+                value,
+            } => return edit_threshold(table, path, cluster.as_ref(), *metric, *value),
+            SettingsWrite::ClusterAlerts { cluster, enabled } => {
+                return edit_cluster_alerts(table, &cluster.context, &cluster.server, *enabled);
+            }
+            SettingsWrite::ClusterWatchMode { context, mode } => {
+                edit_watch_mode(table, Some(context), *mode)?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Writes all of `writes` to `settings.toml` in `dir` as one save: read, edited and written
+    /// once under the save lock, so either every one is written or none is, and the settings
+    /// returned never show some of them without the others.
+    pub fn write_all(dir: &Path, writes: &[SettingsWrite]) -> Result<Settings, SettingsError> {
+        edit_settings_if_changed(dir, |table, path| {
+            let mut changed = false;
+            for write in writes {
+                changed |= write.edit(table, path)?;
+            }
+            Ok(changed)
+        })
+    }
+
+    /// Writes it to `settings.toml` in `dir`, through the same setter the other controls use.
+    pub fn write(&self, dir: &Path) -> Result<Settings, SettingsError> {
+        match self {
+            SettingsWrite::Appearance(a) => set_appearance(dir, *a),
+            SettingsWrite::DesktopNotifications(on) => set_desktop_notifications(dir, *on),
+            SettingsWrite::WatchMode(m) => set_watch_mode(dir, None, Some(*m)),
+            SettingsWrite::Threshold {
+                cluster,
+                metric,
+                value,
+            } => set_threshold(dir, cluster.as_ref(), *metric, *value),
+            SettingsWrite::ClusterAlerts { cluster, enabled } => {
+                set_cluster_alerts(dir, &cluster.context, &cluster.server, *enabled)
+            }
+            SettingsWrite::ClusterWatchMode { context, mode } => {
+                set_watch_mode(dir, Some(context), *mode)
+            }
         }
     }
 }
@@ -1436,38 +1653,52 @@ pub fn set_cluster_alerts(
     server: &str,
     enabled: Option<bool>,
 ) -> Result<Settings, SettingsError> {
-    let is_this = |entry: &toml::Value| {
-        let field = |key| entry.get(key).and_then(toml::Value::as_str);
-        field("context") == Some(context) && field("server").is_some_and(|s| same_server(s, server))
-    };
     if enabled.is_none() {
         let table: toml::Table = load_toml(&dir.join(SETTINGS_FILE))?;
         let chosen = table
             .get("cluster_alerts")
             .and_then(toml::Value::as_array)
-            .is_some_and(|entries| entries.iter().any(is_this));
+            .is_some_and(|entries| entries.iter().any(|e| is_alerts_of(e, context, server)));
         if !chosen {
             return load_settings(dir);
         }
     }
     edit_settings(dir, |table, _| {
-        let mut entries = match table.remove("cluster_alerts") {
-            Some(toml::Value::Array(entries)) => entries,
-            _ => Vec::new(),
-        };
-        entries.retain(|entry| !is_this(entry));
-        if let Some(enabled) = enabled {
-            entries.push(toml::Value::try_from(ClusterAlerts {
-                context: context.to_owned(),
-                server: server.to_owned(),
-                enabled,
-            })?);
-        }
-        if !entries.is_empty() {
-            table.insert("cluster_alerts".into(), toml::Value::Array(entries));
-        }
-        Ok(())
+        edit_cluster_alerts(table, context, server, enabled).map(drop)
     })
+}
+
+/// Whether `entry` of `cluster_alerts` is `context`'s at `server`.
+fn is_alerts_of(entry: &toml::Value, context: &str, server: &str) -> bool {
+    let field = |key| entry.get(key).and_then(toml::Value::as_str);
+    field("context") == Some(context) && field("server").is_some_and(|s| same_server(s, server))
+}
+
+/// The table edit of [`set_cluster_alerts`]: whether it changed anything.
+fn edit_cluster_alerts(
+    table: &mut toml::Table,
+    context: &str,
+    server: &str,
+    enabled: Option<bool>,
+) -> Result<bool, SettingsError> {
+    let mut entries = match table.remove("cluster_alerts") {
+        Some(toml::Value::Array(entries)) => entries,
+        _ => Vec::new(),
+    };
+    let before = entries.len();
+    entries.retain(|entry| !is_alerts_of(entry, context, server));
+    let removed = entries.len() != before;
+    if let Some(enabled) = enabled {
+        entries.push(toml::Value::try_from(ClusterAlerts {
+            context: context.to_owned(),
+            server: server.to_owned(),
+            enabled,
+        })?);
+    }
+    if !entries.is_empty() {
+        table.insert("cluster_alerts".into(), toml::Value::Array(entries));
+    }
+    Ok(removed || enabled.is_some())
 }
 
 /// Sets the lines each log session keeps and writes `settings.toml`. Returns the settings as
@@ -2958,6 +3189,140 @@ mod tests {
         assert!(!text.contains("appearance"), "{text}");
         assert!(text.contains("future_key"), "{text}");
         assert!(!text.contains("cluster_watch_mode"), "{text}");
+    }
+
+    /// Every write, applied in memory, gives the settings it writes to the file, which then
+    /// hold it.
+    fn assert_apply_matches_write(file: &str, writes: &[SettingsWrite]) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SETTINGS_FILE), file).unwrap();
+        let mut in_memory = load_settings(dir.path()).unwrap();
+        for write in writes {
+            write.apply(&mut in_memory);
+            let written = write.write(dir.path()).unwrap();
+            assert_eq!(in_memory, written, "{write:?}");
+            assert!(write.holds_in(&written), "{write:?}");
+        }
+    }
+
+    #[test]
+    fn two_spellings_of_a_server_are_one_field() {
+        let cpu = ThresholdMetric::CpuPercent;
+        let write = |server: &str| SettingsWrite::Threshold {
+            cluster: Some(ClusterPin::new("prod", server)),
+            metric: cpu,
+            value: Some(70),
+        };
+        assert_eq!(
+            write("https://prod.example:6443/").field(),
+            write("https://prod.example:6443").field()
+        );
+        let alerts = |server: &str| SettingsWrite::ClusterAlerts {
+            cluster: ClusterPin::new("prod", server),
+            enabled: Some(true),
+        };
+        assert_eq!(alerts("https://p/").field(), alerts("https://p").field());
+    }
+
+    #[test]
+    fn writes_are_saved_all_or_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(SETTINGS_FILE);
+        std::fs::write(&file, "thresholds = 1\n").unwrap();
+        let threshold = SettingsWrite::Threshold {
+            cluster: None,
+            metric: ThresholdMetric::CpuPercent,
+            value: Some(80),
+        };
+        let writes = [SettingsWrite::Appearance(Appearance::Dark), threshold];
+        assert!(SettingsWrite::write_all(dir.path(), &writes).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "thresholds = 1\n",
+            "a refused write leaves the others unwritten"
+        );
+
+        let ok = tempfile::tempdir().unwrap();
+        let written = SettingsWrite::write_all(ok.path(), &writes).unwrap();
+        assert_eq!(written.appearance, Appearance::Dark);
+        assert_eq!(written, load_settings(ok.path()).unwrap());
+
+        let empty = tempfile::tempdir().unwrap();
+        let clear = SettingsWrite::Threshold {
+            cluster: None,
+            metric: ThresholdMetric::CpuPercent,
+            value: None,
+        };
+        SettingsWrite::write_all(empty.path(), &[clear]).unwrap();
+        assert!(
+            !empty.path().join(SETTINGS_FILE).exists(),
+            "clearing what is not set writes nothing"
+        );
+    }
+
+    #[test]
+    fn a_settings_write_applies_in_memory_as_it_writes() {
+        assert_apply_matches_write(
+            "future_key = 1\n",
+            &[
+                SettingsWrite::Appearance(Appearance::Dark),
+                SettingsWrite::DesktopNotifications(true),
+                SettingsWrite::WatchMode(WatchMode::OnView),
+                SettingsWrite::WatchMode(WatchMode::All),
+            ],
+        );
+        assert!(!SettingsWrite::Appearance(Appearance::Dark).holds_in(&Settings::default()));
+        let prod = ClusterPin::new("prod", "https://prod.example:6443");
+        let dev = ClusterPin::new("dev", "https://dev.example:6443");
+        let cpu = ThresholdMetric::CpuPercent;
+        let pending = ThresholdMetric::PendingPodSeconds;
+        let threshold = |cluster: Option<&ClusterPin>, metric, value| SettingsWrite::Threshold {
+            cluster: cluster.cloned(),
+            metric,
+            value,
+        };
+        assert_apply_matches_write(
+            "[thresholds]\nmemory_percent = 70\n\n[[thresholds.clusters]]\ncontext = \"dev\"\n\
+             server = \"https://dev.example:6443/\"\ncpu_percent = 50\n",
+            &[
+                threshold(None, cpu, Some(80)),
+                threshold(Some(&prod), cpu, Some(70)),
+                threshold(Some(&prod), pending, Some(600)),
+                threshold(Some(&prod), cpu, None),
+                threshold(Some(&dev), cpu, Some(60)),
+                threshold(Some(&dev), cpu, None),
+                threshold(Some(&prod), pending, None),
+                threshold(None, ThresholdMetric::MemoryPercent, None),
+                SettingsWrite::ClusterAlerts {
+                    cluster: prod.clone(),
+                    enabled: Some(false),
+                },
+                SettingsWrite::ClusterAlerts {
+                    cluster: prod.clone(),
+                    enabled: Some(true),
+                },
+                SettingsWrite::ClusterAlerts {
+                    cluster: prod.clone(),
+                    enabled: None,
+                },
+                SettingsWrite::ClusterWatchMode {
+                    context: "prod".into(),
+                    mode: Some(WatchMode::OnView),
+                },
+                SettingsWrite::ClusterWatchMode {
+                    context: "prod".into(),
+                    mode: None,
+                },
+            ],
+        );
+        assert_eq!(
+            threshold(Some(&prod), cpu, Some(1)).field().key(),
+            "thresholds.clusters.prod.cpu_percent"
+        );
+        assert_eq!(
+            SettingsWrite::WatchMode(WatchMode::OnView).field().key(),
+            "watch_mode"
+        );
     }
 
     // covers UP-32

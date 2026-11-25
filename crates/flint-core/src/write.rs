@@ -24,7 +24,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use kube::Client;
-use kube::api::{DynamicObject, PostParams};
+use kube::api::{DynamicObject, Patch, PatchParams, PostParams};
 use serde_json::Value;
 
 use crate::ClusterId;
@@ -36,6 +36,7 @@ use crate::protection::WriteRefusal;
 use crate::read::{self, KindId, KindInfo};
 use crate::recheck::ContextPin;
 use crate::redact;
+use crate::secret_edit;
 use crate::write_actions;
 pub use crate::write_actions::{BlockedReason, DrainProgress, DrainReport, ManagedPod, PodName};
 
@@ -46,9 +47,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const FIELD_MANAGER: &str = "flint";
 
 /// What a Secret's values read as in a review's diff.
-const HIDDEN_VALUE: &str = "<hidden>";
+pub(crate) const HIDDEN_VALUE: &str = "<hidden>";
 /// A hidden value the change replaces.
-const HIDDEN_CHANGED: &str = "<hidden, changed>";
+pub(crate) const HIDDEN_CHANGED: &str = "<hidden, changed>";
 
 /// The object a change is for, as the front end showed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,7 +229,11 @@ pub struct ReviewedEdit {
     pin: ContextPin,
     /// The credential it was reviewed with.
     credential: CredentialBinding,
+    /// The object to `PUT`. For a Secret, the edit as typed, masks and all: the merge patch is
+    /// built from it against the live object at each request ([`secret_edit`]).
     body: Value,
+    /// A Secret, whose masked values are kept: written as a merge patch of what changed.
+    secret: bool,
     /// Whether it creates the object, which did not exist when reviewed: run, it is refused if
     /// the object exists by then.
     creates: bool,
@@ -242,8 +247,8 @@ impl ReviewedEdit {
         self.creates
     }
 
-    /// The live object as YAML, without `status` and `managedFields`, Secret values hidden.
-    /// Empty when it creates the object.
+    /// The live object as YAML, without `managedFields`, Secret values hidden, and with `status`
+    /// only when the write changes it. Empty when it creates the object.
     pub fn before(&self) -> &str {
         &self.before
     }
@@ -663,8 +668,9 @@ async fn prepare_create(
         pin: gate.reviewed_pin()?,
         credential: gate.reviewed_credential()?,
         before: String::new(),
-        after: shown_yaml(&result)?,
+        after: render(&shown_value(&result, false))?,
         body,
+        secret: false,
         creates: true,
     }))
 }
@@ -769,22 +775,31 @@ async fn prepare(
         }
     };
     let mut body = edit_body(&yaml, kind, target)?;
-    keep_live_status(&mut body, live);
     if manifest {
         keep_destination_owned(&mut body, live);
     }
-    let client = gate.client().await?;
-    let result = replace(&client, kind, target, &body, true).await?;
+    let secret = redact::is_secret_object(live);
+    let result = if secret {
+        let patch = secret_edit::patch(&body, live, target)?;
+        let client = gate.client().await?;
+        patch_object(&client, kind, target, &patch, true).await?
+    } else {
+        keep_live_status(&mut body, live);
+        let client = gate.client().await?;
+        replace(&client, kind, target, &body, true).await?
+    };
     let result = serde_json::to_value(&result)
         .map_err(|e| WriteError::Failed(format!("cannot read the dry run: {e}")))?;
     let result = with_type_of(result, &body);
+    let status = status_shown(&body, live, &result)?;
     Ok(WriteAction::ApplyYaml(ReviewedEdit {
         bound: target.clone(),
         pin: gate.reviewed_pin()?,
         credential: gate.reviewed_credential()?,
-        before: shown_yaml(live)?,
-        after: shown_after(live, &result)?,
+        before: render(&shown_value(live, status))?,
+        after: shown_after(live, &result, status)?,
         body,
+        secret,
         creates: false,
     }))
 }
@@ -796,6 +811,23 @@ async fn execute(
     progress: Option<async_channel::Sender<DrainProgress>>,
 ) -> Result<WriteOutcome, WriteError> {
     match &intent.action {
+        WriteAction::ApplyYaml(edit) if edit.secret && !edit.creates => {
+            // The patch is built from the Secret as it is now, which must still be the one
+            // reviewed: a mask keeps that object's value, not whatever is there later.
+            let client = gate.client().await?;
+            let live = read_live(&client, kind, &intent.target).await?;
+            let bound = bound_to_live(intent.target.clone(), &live)?;
+            if bound != intent.target || !redact::is_secret_object(&live) {
+                return Err(WriteError::Conflict);
+            }
+            let patch = secret_edit::patch(&edit.body, &live, &intent.target)?;
+            let client = gate.client().await?;
+            let written = patch_object(&client, kind, &intent.target, &patch, false).await?;
+            Ok(WriteOutcome {
+                resource_version: written.metadata.resource_version,
+                drain: None,
+            })
+        }
         WriteAction::ApplyYaml(edit) => {
             let client = gate.client().await?;
             let written = if edit.creates {
@@ -848,8 +880,40 @@ async fn replace(
         .map_err(write_error)
 }
 
+/// Sends a Secret's JSON Merge Patch. Its `uid` and `resourceVersion` are preconditions: a
+/// different object or version is a conflict. A refusal is worded without the server's message,
+/// which may quote a value ([`secret_edit::write_error`]).
+async fn patch_object(
+    client: &Client,
+    kind: &KindInfo,
+    target: &WriteTarget,
+    patch: &Value,
+    dry_run: bool,
+) -> Result<DynamicObject, WriteError> {
+    let params = PatchParams {
+        dry_run,
+        field_manager: Some(FIELD_MANAGER.to_owned()),
+        ..PatchParams::default()
+    };
+    let api = read::dynamic_api(
+        client,
+        kind,
+        target.namespace.as_deref(),
+        Some(&target.name),
+    )
+    .map_err(write_actions::ActionError::from)?;
+    tokio::time::timeout(
+        WRITE_TIMEOUT,
+        api.patch(&target.name, &params, &Patch::Merge(patch)),
+    )
+    .await
+    .map_err(|_| timed_out())?
+    .map_err(|error| secret_edit::write_error(error, patch))
+}
+
 /// Creates the object `body` describes, which `target` names. An object of that name by then
-/// is a conflict: the server refuses the create.
+/// is a conflict: the server refuses the create. A Secret is refused while it holds a mask or a
+/// placeholder, and its refusal is worded without the server's message, which may quote a value.
 async fn create(
     client: &Client,
     kind: &KindInfo,
@@ -857,6 +921,10 @@ async fn create(
     body: &Value,
     dry_run: bool,
 ) -> Result<DynamicObject, WriteError> {
+    let secret = redact::is_secret_object(body);
+    if secret {
+        secret_edit::check_new(body)?;
+    }
     let object: DynamicObject = serde_json::from_value(body.clone())
         .map_err(|e| WriteError::InvalidYaml(format!("not a Kubernetes object: {e}")))?;
     let params = PostParams {
@@ -873,7 +941,35 @@ async fn create(
     tokio::time::timeout(WRITE_TIMEOUT, api.create(&params, &object))
         .await
         .map_err(|_| timed_out())?
-        .map_err(write_error)
+        .map_err(|error| {
+            if secret {
+                secret_edit::write_error(error, body)
+            } else {
+                write_error(error)
+            }
+        })
+}
+
+fn is_secret_kind(kind: &KindInfo) -> bool {
+    kind.api_version() == "v1" && kind.kind() == "Secret"
+}
+
+/// Why `yaml` did not parse. For a Secret only where: the parser's words can quote any of its
+/// text, quoted or not (a duplicate key from a pasted value, say).
+fn yaml_error(error: &serde_saphyr::Error, secret: bool) -> WriteError {
+    if !secret {
+        return WriteError::InvalidYaml(format!(
+            "not valid YAML: {}",
+            redact::redact_quoted(&error.to_string())
+        ));
+    }
+    let at = error.location().map_or_else(String::new, |at| {
+        format!(" at line {}, column {}", at.line(), at.column())
+    });
+    WriteError::InvalidYaml(format!(
+        "not valid YAML{at}; the parser's message is not shown, because it may quote a Secret \
+         value"
+    ))
 }
 
 /// The body to `PUT` for `yaml`: the same object as `target`, at the version reviewed. An edit
@@ -882,12 +978,8 @@ async fn create(
 fn edit_body(yaml: &str, kind: &KindInfo, target: &WriteTarget) -> Result<Value, WriteError> {
     // No source snippet, and no quoted scalars: the text can be a Secret's.
     let options = serde_saphyr::options! { with_snippet: false };
-    let mut body: Value = serde_saphyr::from_str_with_options(yaml, options).map_err(|e| {
-        WriteError::InvalidYaml(format!(
-            "not valid YAML: {}",
-            redact::redact_quoted(&e.to_string())
-        ))
-    })?;
+    let mut body: Value = serde_saphyr::from_str_with_options(yaml, options)
+        .map_err(|e| yaml_error(&e, is_secret_kind(kind)))?;
     if !body.is_object() {
         return Err(WriteError::InvalidYaml(
             "not a Kubernetes object".to_owned(),
@@ -948,10 +1040,29 @@ fn keep_live_status(body: &mut Value, live: &Value) {
     }
 }
 
-/// `object` as a review shows it: no `status` or `managedFields`, Secret values hidden.
-fn shown_value(object: &Value) -> Value {
+/// Whether a review shows `status`: only when the write changes it, which a kind without a
+/// status subresource lets a `PUT` do. An edit that sets a status the dry run did not take (the
+/// kind has a status subresource, or the server set it back) is refused: the review would not
+/// show what was typed, and Apply would not write it.
+fn status_shown(body: &Value, live: &Value, result: &Value) -> Result<bool, WriteError> {
+    let changes = result.get("status") != live.get("status");
+    if !changes && body.get("status") != live.get("status") {
+        return Err(WriteError::InvalidYaml(
+            "this edit cannot change status: the server keeps it as it is for this object. \
+             Remove status to review the rest"
+                .to_owned(),
+        ));
+    }
+    Ok(changes)
+}
+
+/// `object` as a review shows it: no `managedFields`, Secret values hidden, and `status` only
+/// when `with_status`.
+fn shown_value(object: &Value, with_status: bool) -> Value {
     let mut shown = object.clone();
-    if let Some(fields) = shown.as_object_mut() {
+    if let Some(fields) = shown.as_object_mut()
+        && !with_status
+    {
         fields.remove("status");
     }
     if let Some(metadata) = shown.get_mut("metadata").and_then(Value::as_object_mut) {
@@ -963,14 +1074,10 @@ fn shown_value(object: &Value) -> Value {
     shown
 }
 
-fn shown_yaml(object: &Value) -> Result<String, WriteError> {
-    render(&shown_value(object))
-}
-
 /// The result of an edit as shown. A hidden value that changed says so, or the diff of a rotated
 /// Secret key would be empty.
-fn shown_after(live: &Value, after: &Value) -> Result<String, WriteError> {
-    let mut shown = shown_value(after);
+fn shown_after(live: &Value, after: &Value, with_status: bool) -> Result<String, WriteError> {
+    let mut shown = shown_value(after, with_status);
     for fields in ["/data", "/metadata/annotations"] {
         let was = live.pointer(fields).and_then(Value::as_object);
         let now = after.pointer(fields).and_then(Value::as_object);
