@@ -103,7 +103,7 @@ impl Workspace {
         let active_cluster = model.active_cluster();
         let main = match active_cluster.map(|c| &c.state) {
             None if model.loaded && model.clusters.is_empty() => Main::NoContexts,
-            None => Main::NoCluster,
+            None => self.home_state(cx),
             Some(ConnectionState::Failed(e)) => Main::Failed {
                 error: connection_error_text(e),
             },
@@ -116,6 +116,8 @@ impl Workspace {
         };
         let main = if self.settings_page.open {
             Main::Settings
+        } else if self.home.open {
+            self.home_state(cx)
         } else {
             main
         };

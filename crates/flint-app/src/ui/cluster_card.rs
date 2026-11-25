@@ -32,7 +32,7 @@ use super::{
 };
 
 /// The width of a card.
-const CARD_WIDTH: f32 = 300.;
+pub(in crate::ui) const CARD_WIDTH: f32 = 300.;
 const SPARKLINE_HEIGHT: f32 = 24.;
 
 /// What a click on a card opens.

@@ -95,7 +95,9 @@ actions!(
     workspace,
     [
         /// Open the active cluster's overview.
-        OpenClusterOverview
+        OpenClusterOverview,
+        /// Show the fleet home screen. The active cluster stays connected.
+        OpenHome
     ]
 );
 actions!(
@@ -2610,6 +2612,11 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         .of(C::Flint, S::Dialog)
         .hidden(),
         // Clusters.
+        Spec::unit::<OpenHome>(
+            "Go Home",
+            "Show every cluster at a glance: the health of those kept watching, and the rest. The active cluster stays connected.",
+        )
+        .of(C::Cluster, S::Workspace),
         Spec::with_args::<SelectCluster>(
             "Select Cluster…",
             "Make a cluster the active one and connect to it.",

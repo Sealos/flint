@@ -44,12 +44,18 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **When** I open Flint.
 - **Then** the sidebar lists every context once, with the first definition winning across files. Long EKS ARNs show a short
   name, with the full context in a tooltip. **No network request is made.**
+- On every launch, relaunches included, the main area shows the home screen. Each cluster kept watching (UP-123) has a
+  card in sidebar order, read only from its background watch: watching or sign-in needed, problem counts with the
+  lists they count, nodes and pods, the Kubernetes version, CPU and memory, and its latest alert. Every other cluster
+  is listed as not watched, with Open and Keep Watching; Keep Watching asks for background sign-in consent as the row
+  menu does. With no cluster kept watching, every context is listed. The home screen connects nothing. Clusters in a
+  set are not grouped.
 - A cluster can have a custom name (right-click it, or Rename Cluster… in the palette), kept in `settings.toml` by context
   name; kubeconfig is never written (UP-90). The row's second line still starts with the real name, the tooltip has the
   full context and server, and an unlock or trust confirmation names both. A name that reads like another context's name
   or short name, or another custom name, is not used. Shell tab chips, MCP, `FLINT_CLUSTER`, exposure and trust keep the
   context name.
-- Tests: unit (merge, dedupe), ui.
+- Tests: unit (merge, dedupe, the home screen's cards and list), ui (`ui/workspace_home_tests.rs`, UP-01 e2e).
 
 ### UP-02 Launch with no usable kubeconfig
 - **Given** a missing `~/.kube`, a `KUBECONFIG` pointing at files that don't exist, or a file with broken YAML. (An
@@ -62,8 +68,10 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ### UP-03 Connect to a cluster
 - **When** I select a cluster.
 - **Then** it becomes active, shows "connecting", then "connected" with the server version. The UI stays responsive
-  throughout.
-- Tests: cluster, ui (`FLINT_CLUSTER=kind-flint-dev`).
+  throughout. Selecting it from a home screen card or its Open button does the same.
+- The sidebar's **Home** entry (or Go Home in the palette) shows the home screen again at any time. The active cluster
+  stays connected meanwhile, and selecting it again returns to the view it was on.
+- Tests: cluster, ui (`FLINT_CLUSTER=kind-flint-dev`, `ui/workspace_home_tests.rs`).
 
 ### UP-04 Connection fails
 - **Given** a context that points at an unreachable server, uses an exec plugin that is missing, or uses a plugin that

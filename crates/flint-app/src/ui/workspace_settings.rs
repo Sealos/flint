@@ -128,7 +128,7 @@ impl Workspace {
     /// cluster or a set opened meanwhile. Views that open by themselves (a list restored, the
     /// overview once discovery ends) do not count; the navigation and Open Object leave
     /// Settings on their own.
-    fn main_key(&self) -> MainKey {
+    pub(super) fn main_key(&self) -> MainKey {
         MainKey {
             cluster: self.cluster.clone(),
             set: self.sets.running.as_ref().map(|r| r.list.entity_id()),

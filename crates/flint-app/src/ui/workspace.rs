@@ -270,6 +270,8 @@ pub struct Workspace {
     sets: sets::ClusterSets,
     /// The Settings view and its draft, which outlives leaving it.
     settings_page: super::settings_view::SettingsPage,
+    /// The fleet home screen.
+    home: home_entry::HomePage,
     /// The window is too narrow for the list and the detail side by side, as of the last draw.
     narrow: bool,
     /// The main header shows two rows, as of the last draw: the dock leaves it more room.
@@ -388,6 +390,7 @@ impl Workspace {
             }
             NavEvent::OpenOverview => {
                 this.leave_settings_for_view();
+                this.leave_home();
                 this.open_overview(window, cx)
             }
         });
@@ -478,6 +481,7 @@ impl Workspace {
             dashboard: None,
             sets: cluster_sets,
             settings_page: super::settings_view::SettingsPage::new(cx),
+            home: Default::default(),
             narrow: false,
             two_row_header: false,
             server_moves: ServerMoves::default(),
@@ -530,6 +534,7 @@ impl Workspace {
         };
         this.show_appearance(window, cx);
         this.load_saved_sets(cx);
+        this.watch_home_feeds(cx);
         if let Some(alerts) = cx.try_global::<super::alert_center::Alerts>() {
             let center = alerts.0.clone();
             this._subscriptions
@@ -1838,6 +1843,7 @@ impl Workspace {
             .border_r_1()
             .border_color(theme.sidebar_border)
             .child(pane_title("CLUSTERS", traffic_lights, theme))
+            .child(self.render_home_entry(theme, cx))
             .child(list)
             .child(self.render_sets_panel(open_members.as_ref().map(Vec::len), theme, cx))
             .child(self.render_settings_entry(theme))
@@ -2937,6 +2943,11 @@ impl Workspace {
         if let Some(settings) = self.render_settings_page(theme, cx) {
             return settings;
         }
+        if self.home.open
+            && let Some(home) = self.render_home(theme, cx)
+        {
+            return home;
+        }
         if let Some(set_view) = self.render_set_view(window_width, theme, cx) {
             return set_view;
         }
@@ -2974,18 +2985,10 @@ impl Workspace {
             );
         }
         let Some(cluster) = model.active_cluster().cloned() else {
-            return centered(
-                v_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(div().text_lg().child("Select a cluster"))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child("Flint connects only when you pick one in the sidebar."),
-                    ),
-            );
+            // On launch: the fleet home screen, which connects nothing.
+            return self
+                .render_home(theme, cx)
+                .unwrap_or_else(|| centered(div()));
         };
         let dashboard = self
             .dashboard
@@ -3917,6 +3920,7 @@ impl Render for Workspace {
         self.sync_namespace_picker_with_dialog(window, cx);
         self.close_finished_held_edit(window, cx);
         self.settings_follow_main();
+        self.home_follow_main(cx);
         self.flush_threshold_entry(cx);
         self.follow_threshold_rows(cx);
         self.close_orphaned_threshold_entry(window, cx);
@@ -3926,7 +3930,8 @@ impl Render for Workspace {
         self.two_row_header = self.header_has_two_rows(window_width, cx);
         let cx: &Context<Self> = cx;
         let theme = cx.theme();
-        let has_cluster = self.model.read(cx).active_cluster().is_some();
+        // With Home shown there is no header either.
+        let has_cluster = self.model.read(cx).active_cluster().is_some() && !self.home_shown(cx);
         let widths = self.layout(window_width, cx);
         let traffic_lights = super::theme::traffic_light_inset(window);
         h_flex()
@@ -3952,6 +3957,7 @@ impl Render for Workspace {
             .capture_action(cx.listener(|this, _: &OpenObject, _, _| {
                 this.list_in_front = false;
                 this.leave_settings_for_view();
+                this.leave_home();
             }))
             .capture_action(cx.listener(|this, _: &EditYaml, _, _| this.list_in_front = false))
             .capture_action(cx.listener(|this, _: &FocusFilter, _, _| this.list_in_front = true))
@@ -4122,6 +4128,13 @@ mod disconnect;
 
 #[path = "workspace_forwards.rs"]
 mod forwards;
+
+#[path = "workspace_home.rs"]
+mod home_entry;
+
+#[cfg(test)]
+#[path = "workspace_home_tests.rs"]
+mod home_tests;
 
 #[path = "workspace_keys.rs"]
 mod keys;

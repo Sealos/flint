@@ -66,7 +66,17 @@ fn up_01_launch_and_see_my_clusters() -> Result<()> {
     assert_eq!(sidebar(&state, ARN)["name"], ARN);
     assert_eq!(sidebar(&state, TwoClusters::A)["label"], TwoClusters::A);
     assert_eq!(state["active_cluster"], Value::Null);
-    assert_eq!(state["main"]["view"], "no_cluster");
+    // The home screen: nothing is kept watching, so every context is listed with its actions.
+    assert_eq!(state["main"]["view"], "home");
+    assert_eq!(state["main"]["watched"], json!([]));
+    let listed: Vec<&str> = state["main"]["unwatched"]
+        .as_array()
+        .map(|rows| rows.iter().filter_map(|r| r["cluster"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        listed,
+        [TwoClusters::A, TwoClusters::B, ARN, "from-settings"]
+    );
 
     // Listing clusters reached no server.
     std::thread::sleep(Duration::from_millis(500));
