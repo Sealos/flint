@@ -1531,15 +1531,13 @@ impl ClusterManager {
                 let _ = reply.send(applied);
             }
             Internal::WriteSettings { writes, reply } => {
-                let mut result = Ok(());
-                for write in writes {
-                    result = self
-                        .try_write_settings(write.what(), move |dir| write.write(dir))
-                        .await;
-                    if result.is_err() {
-                        break;
-                    }
-                }
+                // One save for all of them: never some written without the others, and the
+                // settings applied once, so no in-between state takes effect.
+                let result = self
+                    .try_write_settings("the settings", move |dir| {
+                        settings::SettingsWrite::write_all(dir, &writes)
+                    })
+                    .await;
                 let _ = reply.send(result);
             }
             Internal::LateRead { paths, seq, read } => {

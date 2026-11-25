@@ -57,11 +57,13 @@ pub struct SettingsState {
     /// Whether edits wait for Save (the sidebar entry's dot).
     pub dirty: bool,
     /// The `settings.toml` keys of the edited fields.
-    pub edited: Vec<&'static str>,
+    pub edited: Vec<String>,
     /// The values shown: the file with the edits on top.
     pub appearance: &'static str,
     pub desktop_notifications: bool,
     pub watch_mode: &'static str,
+    /// Thresholds and Cluster overrides, as shown.
+    pub thresholds: ThresholdsState,
     /// The file changed under the draft: the Reload / Save anyway banner.
     pub changed_on_disk: bool,
     /// `settings.toml` cannot be read; Save is disabled.
@@ -72,7 +74,48 @@ pub struct SettingsState {
     /// Why the last Save did not go through.
     pub note: Option<String>,
     /// The element id of the control under the keyboard cursor.
-    pub cursor: Option<&'static str>,
+    pub cursor: Option<String>,
+}
+
+/// Settings' Thresholds and Cluster overrides (#741), as shown: the file with the draft on top.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ThresholdsState {
+    /// The global value of each metric, by its `settings.toml` key; `null` for the built-in
+    /// default.
+    pub global: std::collections::BTreeMap<&'static str, Option<u32>>,
+    /// The Cluster overrides rows, by context name.
+    pub overrides: Vec<OverrideRowState>,
+    /// Values typed that their setting does not accept; they block Save.
+    pub rejected: Vec<RejectedState>,
+    /// The clusters Add override offers, while its list is open.
+    pub candidates: Option<Vec<String>>,
+    /// The element id of the threshold whose text field is open.
+    pub typing: Option<String>,
+}
+
+/// One row of Cluster overrides.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OverrideRowState {
+    pub cluster: String,
+    /// Whether the kubeconfig defines the context now.
+    pub known: bool,
+    /// Whether it has a server to bind thresholds and alerts to.
+    pub bound: bool,
+    /// Its own value of each metric, by key; `null` follows the global value.
+    pub thresholds: std::collections::BTreeMap<&'static str, Option<u32>>,
+    /// `default`, `on` or `off`.
+    pub alerts: &'static str,
+    /// `default`, `all` or `on_view`.
+    pub watch_mode: &'static str,
+}
+
+/// A value typed that its setting does not accept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RejectedState {
+    /// The `settings.toml` path of the field.
+    pub field: String,
+    pub text: String,
+    pub why: String,
 }
 
 /// Cluster sets, as the sidebar and the set's view show them.
