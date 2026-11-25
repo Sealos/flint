@@ -274,7 +274,7 @@ impl Workspace {
         let reply = self.model.read(cx).core().write_settings(
             writes
                 .iter()
-                .map(|c| c.clone().into_write(confirmed))
+                .map(|c| c.clone().into_write(confirmed.clone()))
                 .collect(),
         );
         let written = writes.clone();
@@ -297,7 +297,7 @@ impl Workspace {
             cx.background_executor().timer(SAVE_WAIT).await;
             let _ = this.update(cx, |ws, cx| {
                 if ws.settings_page.saving.take().is_some() {
-                    ws.take_typed_while_saving(cx);
+                    ws.take_typed_while_saving(None, cx);
                     ws.settings_page.save_note = Some(UNCONFIRMED.to_owned());
                     cx.notify();
                 }
@@ -326,7 +326,11 @@ impl Workspace {
         let Some(saving) = self.settings_page.saving.take() else {
             return;
         };
-        self.take_typed_while_saving(cx);
+        let written = match &result {
+            Ok(()) => writes.len(),
+            Err(failure) => failure.written.min(writes.len()),
+        };
+        self.take_typed_while_saving(Some(&writes[..written]), cx);
         match result {
             Ok(()) => {
                 self.settings_page.draft.saved(writes);
@@ -341,7 +345,6 @@ impl Workspace {
                 }
             }
             Err(failure) => {
-                let written = failure.written.min(writes.len());
                 self.settings_page.draft.saved(&writes[..written]);
                 self.settings_page.save_note = Some(save_failure_note(writes, &failure));
                 // Turning protection off was confirmed over a file that changed since: ask
@@ -386,6 +389,7 @@ impl Workspace {
             (Some(i), false) => (i + stops.len() - 1) % stops.len(),
         };
         self.settings_page.cursor = Some(stops[next]);
+        self.scroll_to_settings_cursor(cx);
         self.focus_settings_stop(window, cx);
         cx.notify();
     }

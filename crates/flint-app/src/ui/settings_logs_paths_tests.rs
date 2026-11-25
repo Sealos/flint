@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 use super::closing::Quits;
 use super::settings_draft::Change;
 use super::settings_logs_paths::{
-    TextField, UNPROTECT_STALE, UNPROTECT_TITLE, existing_file, remove_id, with_kubeconfig,
+    TextField, UNPROTECT_STALE, UNPROTECT_TITLE, content_row, existing_file, paths_stops,
+    remove_id, with_kubeconfig,
 };
 use super::settings_view::{Section, Stop, stops};
 use super::support_tests::{TestWorkspace, WAIT, open_workspace};
@@ -659,4 +660,73 @@ async fn text_typed_while_saving_stays_in_the_draft(cx: &mut TestAppContext) {
         0,
         "the quit waits for the new edit"
     );
+}
+
+// covers UP-127: every control of the Logs and Paths sections has a row of its own to scroll to,
+// in the order the keyboard reaches them.
+#[test]
+fn each_control_has_a_row_to_scroll_to() {
+    for kubeconfigs in [0, 1, 5] {
+        let rows: Vec<usize> = paths_stops(kubeconfigs)
+            .into_iter()
+            .map(|stop| content_row(stop, kubeconfigs).expect("in the content"))
+            .collect();
+        assert!(rows.windows(2).all(|w| w[0] < w[1]), "{rows:?}");
+        assert_eq!(rows.last(), Some(&(kubeconfigs.max(1) + 3)));
+    }
+    assert_eq!(content_row(Stop::Text(TextField::LogTotalMib), 0), Some(2));
+    assert_eq!(content_row(Stop::Save, 0), None);
+}
+
+// covers UP-127: Remove on a file listed twice drops the row clicked, keeping the others in order.
+#[gpui_kit::test]
+async fn remove_drops_the_row_clicked(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("settings.toml"),
+        "kubeconfig_paths = [\"/k/a\", \"/k/b\", \"/k/a\"]\n",
+    )
+    .unwrap();
+    let t = open_settings(cx, dir.path()).await;
+    show(cx, &t, "paths");
+    t.dispatch(
+        cx,
+        "settings::RemoveKubeconfigPath",
+        json!({ "path": "/k/a", "index": 2 }),
+    )
+    .unwrap();
+    assert_eq!(
+        state(cx, &t).settings.kubeconfig_paths,
+        ["/k/a", "/k/b"],
+        "the last row went"
+    );
+}
+
+// covers UP-127: text typed while saving that matches what the file held before the Save is
+// still an edit: the Save changes that value.
+#[gpui_kit::test]
+async fn the_old_value_typed_while_saving_stays_an_edit(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_settings(cx, dir.path()).await;
+    show(cx, &t, "logs");
+    t.dispatch(
+        cx,
+        "settings::EditLogBufferLines",
+        json!({ "lines": 20_000 }),
+    )
+    .unwrap();
+    let workspace = t.workspace.clone();
+    cx.update_window(t.window, |_, window, cx| {
+        super::registry::dispatch("settings::SaveSettings", Value::Null, window, cx).unwrap();
+        workspace.update(cx, |ws, cx| {
+            assert!(ws.settings_saving());
+            ws.type_settings_text(TextField::LogBufferLines, "100000", window, cx);
+        });
+    })
+    .unwrap();
+    wait_for_file(cx, &t, |s| s.log_buffer_lines == 20_000).await;
+    cx.run_until_parked();
+    let s = state(cx, &t);
+    assert_eq!(s.settings.edited, ["log_buffer_lines"], "{s:?}");
+    assert_eq!(s.settings.log_buffer_lines, 100_000);
 }

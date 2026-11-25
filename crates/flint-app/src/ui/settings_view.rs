@@ -481,8 +481,8 @@ pub fn render(page: &SettingsPage, file: &Settings, invalid: bool, theme: &Theme
                 .min_h_0()
                 .child(section_list(page, theme))
                 .child(
-                    // The section's blocks are its direct children, so Save can scroll one
-                    // into view ([`TextField::row`]).
+                    // The section's rows are its direct children, so the keyboard cursor and
+                    // Save can scroll one into view ([`logs_paths::content_row`]).
                     v_flex()
                         .id("settings-content")
                         .flex_1()
@@ -491,7 +491,6 @@ pub fn render(page: &SettingsPage, file: &Settings, invalid: bool, theme: &Theme
                         .overflow_y_scroll()
                         .track_scroll(&page.scroll)
                         .p_4()
-                        .gap_4()
                         .children(section_body(page, &shown, theme)),
                 ),
         )

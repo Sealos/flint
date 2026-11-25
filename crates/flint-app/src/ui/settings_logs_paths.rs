@@ -91,6 +91,10 @@ pub struct AddKubeconfigPath {
 #[serde(deny_unknown_fields)]
 pub struct RemoveKubeconfigPath {
     pub path: String,
+    /// The row clicked, so a file listed twice loses that row and not its first; ignored unless
+    /// that row still holds `path`. The palette names the file alone.
+    #[serde(default)]
+    pub index: Option<usize>,
 }
 
 /// Turn protection of local clusters on or off in the Settings draft. Off is confirmed at Save.
@@ -136,19 +140,6 @@ impl TextField {
                 Section::Logs
             }
             TextField::Path | TextField::Helm => Section::Paths,
-        }
-    }
-
-    /// Its block's place in its section, from the top: what [`logs_body`] and [`paths_body`]
-    /// put it at.
-    pub fn row(self) -> usize {
-        match self {
-            TextField::LogBufferLines => 0,
-            TextField::LogBufferMib => 1,
-            TextField::LogTotalMib => 2,
-            // Below the kubeconfig list.
-            TextField::Path => 1,
-            TextField::Helm => 2,
         }
     }
 
@@ -469,13 +460,12 @@ fn error_id(field: TextField) -> &'static str {
     }
 }
 
-/// The Logs section's blocks, in [`TextField::row`] order.
+/// The Logs section's rows, in [`content_row`] order.
 pub fn logs_body(page: &SettingsPage, theme: &Theme) -> Vec<AnyElement> {
     let draft = &page.draft;
     let block = |field: TextField, title, text| {
         group(title, text, draft.is_edited(field.field()), theme)
             .children(text_input(page, field, theme))
-            .into_any_element()
     };
     vec![
         block(
@@ -483,71 +473,88 @@ pub fn logs_body(page: &SettingsPage, theme: &Theme) -> Vec<AnyElement> {
             "Lines per log tab",
             "How many lines each log tab keeps before dropping its oldest, from 1,000 to \
              1,000,000. Applies to log tabs opened after Save.",
-        ),
+        )
+        .into_any_element(),
         block(
             TextField::LogBufferMib,
             "Memory per log tab (MiB)",
             "The most memory each log tab's lines may take, from 8 to 1,024 MiB; whichever \
              limit comes first applies. Applies to log tabs opened after Save.",
-        ),
+        )
+        .mt_4()
+        .into_any_element(),
         block(
             TextField::LogTotalMib,
             "Memory for all log tabs (MiB)",
             "The most memory all log tabs may take together, from 64 to 16,384 MiB. Past it, \
              background tabs drop their oldest lines first. Never below one tab's own limit. \
              Applies at Save.",
-        ),
+        )
+        .mt_4()
+        .into_any_element(),
     ]
 }
 
-/// The Paths section's blocks, in [`TextField::row`] order.
+/// The Paths section's rows, in [`content_row`] order: each kubeconfig file is a row of its
+/// own, so the keyboard cursor can bring any of them into view.
 pub fn paths_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> Vec<AnyElement> {
     let draft = &page.draft;
     let paths = &shown.kubeconfig_paths;
-    let list = group(
-        "Extra kubeconfig files",
-        "Loaded after KUBECONFIG or ~/.kube/config, in this order. Clusters reload after Save, \
-         as after editing settings.toml by hand.",
-        draft.is_edited(Field::KubeconfigPaths),
-        theme,
-    )
-    .child(
+    let mut rows = vec![
+        group(
+            "Extra kubeconfig files",
+            "Loaded after KUBECONFIG or ~/.kube/config, in this order. Clusters reload after \
+             Save, as after editing settings.toml by hand.",
+            draft.is_edited(Field::KubeconfigPaths),
+            theme,
+        )
+        .into_any_element(),
+    ];
+    if paths.is_empty() {
+        rows.push(
+            div()
+                .mt_2()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("None")
+                .into_any_element(),
+        );
+    }
+    rows.extend(paths.iter().enumerate().map(|(index, path)| {
+        let shown_path = path.display().to_string();
+        h_flex()
+            .id(("settings-kubeconfig-path", index))
+            .max_w(px(560.))
+            .when(index == 0, |el| el.mt_2())
+            .when(index > 0, |el| el.mt_1())
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .truncate()
+                    .child(shown_path.clone()),
+            )
+            .child(ring(
+                page,
+                Stop::RemoveKubeconfig(index),
+                theme,
+                Button::new(remove_id(index))
+                    .xsmall()
+                    .label("Remove")
+                    .tooltip(format!("Remove {shown_path} from the list"))
+                    .on_click(registry::on_click(RemoveKubeconfigPath {
+                        path: shown_path.clone(),
+                        index: Some(index),
+                    })),
+            ))
+            .into_any_element()
+    }));
+    rows.push(
         v_flex()
-            .id("settings-kubeconfig-paths")
+            .mt_1()
             .gap_1()
-            .when(paths.is_empty(), |el| {
-                el.child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child("None"),
-                )
-            })
-            .children(paths.iter().enumerate().map(|(index, path)| {
-                let shown_path = path.display().to_string();
-                h_flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_xs()
-                            .truncate()
-                            .child(shown_path.clone()),
-                    )
-                    .child(ring(
-                        page,
-                        Stop::RemoveKubeconfig(index),
-                        theme,
-                        Button::new(remove_id(index))
-                            .xsmall()
-                            .label("Remove")
-                            .tooltip(format!("Remove {shown_path} from the list"))
-                            .on_click(registry::on_click(RemoveKubeconfigPath {
-                                path: shown_path.clone(),
-                            })),
-                    ))
-            }))
             .child(
                 h_flex().child(ring(
                     page,
@@ -569,10 +576,10 @@ pub fn paths_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> Vec<A
                         .child(note)
                         .test_support(),
                 )
-            }),
+            })
+            .into_any_element(),
     );
-    vec![
-        list.into_any_element(),
+    rows.push(
         group(
             "PATH",
             "Where Flint finds kubectl plugins, helm and credential helpers: absolute folders \
@@ -580,17 +587,50 @@ pub fn paths_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> Vec<A
             draft.is_edited(Field::Path),
             theme,
         )
+        .mt_4()
         .children(text_input(page, TextField::Path, theme))
         .into_any_element(),
+    );
+    rows.push(
         group(
             "helm",
             "The helm binary for Helm releases. Empty finds helm on PATH.",
             draft.is_edited(Field::Helm),
             theme,
         )
+        .mt_4()
         .children(text_input(page, TextField::Helm, theme))
         .into_any_element(),
-    ]
+    );
+    rows
+}
+
+/// The row of the section's content that holds `stop`, from the top, for a Paths list of
+/// `kubeconfigs` files: what [`logs_body`] and [`paths_body`] lay out, and one row for each
+/// other section. `None` for a stop outside the content (the section list, the footer, the
+/// banner).
+pub fn content_row(stop: Stop, kubeconfigs: usize) -> Option<usize> {
+    // The list's heading, then its files (or "None"), then Add….
+    let add = 1 + kubeconfigs.max(1);
+    match stop {
+        Stop::Text(TextField::LogBufferLines) => Some(0),
+        Stop::Text(TextField::LogBufferMib) => Some(1),
+        Stop::Text(TextField::LogTotalMib) => Some(2),
+        Stop::RemoveKubeconfig(index) => Some(1 + index),
+        Stop::AddKubeconfig => Some(add),
+        Stop::Text(TextField::Path) => Some(add + 1),
+        Stop::Text(TextField::Helm) => Some(add + 2),
+        Stop::Appearance(_)
+        | Stop::DesktopNotifications
+        | Stop::WatchMode(_)
+        | Stop::ProtectLocalClusters => Some(0),
+        Stop::Done
+        | Stop::Reload
+        | Stop::Revert
+        | Stop::SaveAnyway
+        | Stop::Save
+        | Stop::Section(_) => None,
+    }
 }
 
 /// The confirmation's title.

@@ -178,10 +178,10 @@ fn only_turning_protection_off_loosens_it() {
     assert!(!draft.loosens_protection(), "turning it on is no loosening");
     let confirmed = flint_core::settings::SettingsRevision::of(&protected);
     assert_eq!(
-        Change::ProtectLocalClusters(false).into_write(Some(confirmed)),
+        Change::ProtectLocalClusters(false).into_write(Some(confirmed.clone())),
         flint_core::settings::SettingsWrite::ProtectLocalClusters {
             on: false,
-            confirmed: Some(confirmed),
+            confirmed: Some(confirmed.clone()),
         }
     );
     assert_eq!(

@@ -26,7 +26,7 @@ use super::super::settings_draft::Change;
 use super::super::settings_logs_paths::{
     AddKubeconfigPath, ChooseKubeconfigPaths, EditHelmPath, EditLogBufferLines, EditLogBufferMib,
     EditLogTotalMib, EditPathOverride, EditProtectLocalClusters, Inputs, RemoveKubeconfigPath,
-    TextField, UNPROTECT_ON_DISK, UNPROTECT_STALE, UNPROTECT_TEXT, UNPROTECT_TITLE,
+    TextField, UNPROTECT_ON_DISK, UNPROTECT_STALE, UNPROTECT_TEXT, UNPROTECT_TITLE, content_row,
     with_kubeconfig,
 };
 use super::super::settings_view::{self, Stop, Then};
@@ -80,7 +80,7 @@ impl Workspace {
             ws.add_kubeconfig_paths(vec![PathBuf::from(&action.path)], cx)
         })
         .bind::<RemoveKubeconfigPath>(|ws, action, _, cx| {
-            ws.remove_kubeconfig_path(&PathBuf::from(&action.path), cx)
+            ws.remove_kubeconfig_path(&PathBuf::from(&action.path), action.index, cx)
         })
         .bind::<ChooseKubeconfigPaths>(|ws, _, _, cx| ws.choose_kubeconfig_paths(cx))
         .bind::<EditProtectLocalClusters>(|ws, action, _, cx| {
@@ -142,9 +142,6 @@ impl Workspace {
     pub(super) fn sync_settings_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.settings_page.open || self.settings_page.logs_paths.inputs.is_none() {
             return;
-        }
-        if self.settings_page.saving.is_none() {
-            self.take_typed_while_saving(cx);
         }
         let resync = std::mem::take(&mut self.settings_page.logs_paths.resync);
         let page = &self.settings_page;
@@ -239,12 +236,25 @@ impl Workspace {
     /// [`Self::apply_settings_text`] once no Save is being written, whether or not Settings is
     /// still open.
     fn record_settings_text(&mut self, field: TextField, text: &str, cx: &mut Context<Self>) {
+        let file = self.model.read(cx).settings.clone();
+        self.record_settings_text_over(field, text, Some(&file), cx);
+    }
+
+    /// [`Self::record_settings_text`] with the value compared against `holding` (see
+    /// [`super::super::settings_draft::SettingsDraft::edit_over`]).
+    fn record_settings_text_over(
+        &mut self,
+        field: TextField,
+        text: &str,
+        holding: Option<&Settings>,
+        cx: &mut Context<Self>,
+    ) {
+        let file = self.model.read(cx).settings.clone();
         let page = &mut self.settings_page;
         match field.parse(text, home().as_deref()) {
             Ok(change) => {
                 page.logs_paths.errors.remove(&field);
-                let file = self.model.read(cx).settings.clone();
-                page.draft.edit(change, &file);
+                page.draft.edit_over(change, holding, &file);
             }
             Err(why) => {
                 page.logs_paths.errors.insert(field, why);
@@ -258,12 +268,26 @@ impl Workspace {
     /// Puts the text typed into fields while a Save was being written into the draft, now that
     /// the Save is answered (or given up on): before the written edits leave the draft, so a
     /// newer value typed over one stays, and before a quit or close waiting on the Save goes on.
-    pub(super) fn take_typed_while_saving(&mut self, cx: &mut Context<Self>) {
+    /// `written` are the edits the core says it wrote: the file may not have been reported with
+    /// them yet, so each value is compared with the file as they leave it. `None`: what was
+    /// written is not known, and each value typed is kept as an edit.
+    pub(super) fn take_typed_while_saving(
+        &mut self,
+        written: Option<&[Change]>,
+        cx: &mut Context<Self>,
+    ) {
         let typed = std::mem::take(&mut self.settings_page.logs_paths.typed_while_saving);
+        let holding = written.map(|written| {
+            let mut held = (*self.model.read(cx).settings).clone();
+            for change in written {
+                change.apply(&mut held);
+            }
+            held
+        });
         for field in typed {
             if let Some(input) = self.settings_page.logs_paths.input(field) {
                 let text = input.read(cx).value().to_string();
-                self.record_settings_text(field, &text, cx);
+                self.record_settings_text_over(field, &text, holding.as_ref(), cx);
             }
         }
     }
@@ -280,9 +304,20 @@ impl Workspace {
         };
         self.settings_page.section = field.section();
         self.settings_page.cursor = Some(Stop::Text(field));
-        self.settings_page.scroll.scroll_to_item(field.row());
+        self.scroll_to_settings_cursor(cx);
         self.focus_settings_stop(window, cx);
         cx.notify();
+    }
+
+    /// Scrolls the section so the control under the keyboard cursor is in view.
+    pub(super) fn scroll_to_settings_cursor(&mut self, cx: &App) {
+        let Some(stop) = self.settings_page.cursor else {
+            return;
+        };
+        let kubeconfigs = self.settings_shown(cx).kubeconfig_paths.len();
+        if let Some(row) = content_row(stop, kubeconfigs) {
+            self.settings_page.scroll.scroll_to_item(row);
+        }
     }
 
     /// Adds `paths` to the kubeconfig list in the draft, each that can be: one already listed,
@@ -315,13 +350,23 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Drops `path` from the kubeconfig list in the draft.
-    fn remove_kubeconfig_path(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+    /// Drops `path` from the kubeconfig list in the draft: the row at `index` when it holds
+    /// `path` (a file listed twice keeps its other row, and the order of the rest), otherwise
+    /// the first row that does.
+    fn remove_kubeconfig_path(
+        &mut self,
+        path: &std::path::Path,
+        index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
         if !self.settings_page.open || self.settings_page.saving.is_some() {
             return;
         }
         let mut list = self.settings_shown(cx).kubeconfig_paths;
-        let Some(at) = list.iter().position(|p| p == path) else {
+        let at = index
+            .filter(|&i| list.get(i).is_some_and(|p| p == path))
+            .or_else(|| list.iter().position(|p| p == path));
+        let Some(at) = at else {
             self.settings_page.logs_paths.kubeconfig_note =
                 Some(format!("{} is not in the list.", path.display()));
             cx.notify();
@@ -376,7 +421,7 @@ impl Workspace {
             Stop::Text(_) => self.focus_settings_stop(window, cx),
             Stop::RemoveKubeconfig(index) => {
                 if let Some(path) = self.settings_shown(cx).kubeconfig_paths.get(index) {
-                    self.remove_kubeconfig_path(&path.clone(), cx);
+                    self.remove_kubeconfig_path(&path.clone(), Some(index), cx);
                 }
             }
             Stop::AddKubeconfig => self.choose_kubeconfig_paths(cx),

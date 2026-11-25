@@ -135,7 +135,8 @@ impl Change {
         }
     }
 
-    fn apply(&self, settings: &mut Settings) {
+    /// Puts it into `settings`, as writing it puts it into the file.
+    pub fn apply(&self, settings: &mut Settings) {
         match self {
             Change::Appearance(a) => settings.appearance = *a,
             Change::DesktopNotifications(on) => settings.desktop_notifications = *on,
@@ -169,10 +170,17 @@ impl SettingsDraft {
     /// file already has drops that field's edit, so changing a control back leaves nothing to
     /// save.
     pub fn edit(&mut self, change: Change, file: &Arc<Settings>) {
+        self.edit_over(change, Some(file), file);
+    }
+
+    /// [`Self::edit`], where the value the file holds is not yet known from `file`: `holding` is
+    /// what it holds once writes the core acknowledged land, or `None` when that is unknown and
+    /// the edit is kept whatever its value.
+    pub fn edit_over(&mut self, change: Change, holding: Option<&Settings>, file: &Arc<Settings>) {
         if self.edits.is_empty() {
             self.base = Some(file.clone());
         }
-        if change.holds_in(file) {
+        if holding.is_some_and(|held| change.holds_in(held)) {
             self.edits.remove(&change.field());
         } else {
             self.edits.insert(change.field(), change);

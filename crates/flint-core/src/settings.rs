@@ -1369,20 +1369,22 @@ pub struct SettingsWriteFailure {
     pub why: String,
 }
 
-/// A fingerprint of the settings a confirmation was asked over: what [`load_settings`] read, as
-/// the core last reported it. A write that needs that confirmation compares it with the file
-/// under the save lock, so it never applies over a file changed since.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SettingsRevision(u64);
+/// The settings a confirmation was asked over: what [`load_settings`] read, as the core last
+/// reported it, kept whole (credentials included, which `Debug` leaves out) so any change to the
+/// file since shows. A write that needs that confirmation compares it with the file under the
+/// save lock, so it never applies over a file changed since.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsRevision(std::sync::Arc<Settings>);
 
 impl SettingsRevision {
-    /// The revision of `settings`. Equal settings give equal revisions within one build.
+    /// The revision of `settings`.
     pub fn of(settings: &Settings) -> Self {
-        use std::hash::{Hash as _, Hasher as _};
-        // Every field, in declaration order, maps in key order: deterministic.
-        let mut hasher = std::hash::DefaultHasher::new();
-        format!("{settings:?}").hash(&mut hasher);
-        SettingsRevision(hasher.finish())
+        SettingsRevision(std::sync::Arc::new(settings.clone()))
+    }
+
+    /// Whether `settings` are the ones confirmed.
+    fn holds(&self, settings: &Settings) -> bool {
+        *self.0 == *settings
     }
 }
 
@@ -1632,7 +1634,7 @@ fn set_protect_local_clusters_with(
                         path: path.to_owned(),
                         source,
                     })?;
-            if confirmed != Some(SettingsRevision::of(&held)) {
+            if !confirmed.as_ref().is_some_and(|c| c.holds(&held)) {
                 return Err(SettingsError::ProtectionConfirmationStale);
             }
         }
@@ -3077,7 +3079,8 @@ mod tests {
         let on = set_protect_local_clusters_with(dir.path(), true, None, no_lock).unwrap();
         assert!(on.protect_local_clusters);
         let confirmed = Some(SettingsRevision::of(&on));
-        let refused = set_protect_local_clusters_with(dir.path(), false, confirmed, no_lock);
+        let refused =
+            set_protect_local_clusters_with(dir.path(), false, confirmed.clone(), no_lock);
         assert!(matches!(refused, Err(SettingsError::Write { .. })));
         assert!(load_settings(dir.path()).unwrap().protect_local_clusters);
 
@@ -3099,7 +3102,7 @@ mod tests {
         assert_ne!(SettingsRevision::of(&newer), confirmed);
         let text = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
 
-        for stale in [Some(confirmed), None] {
+        for stale in [Some(confirmed.clone()), None] {
             let refused = set_protect_local_clusters(dir.path(), false, stale);
             assert!(
                 matches!(refused, Err(SettingsError::ProtectionConfirmationStale)),
