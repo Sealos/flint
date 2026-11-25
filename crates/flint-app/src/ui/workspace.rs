@@ -2260,9 +2260,9 @@ impl Workspace {
             let object = detail.read(cx).object();
             crumbs.push((object.name.clone().into(), object.name.clone()));
         }
-        let detail_alone = self.narrow && self.detail.is_some() && !self.list_in_front;
         let two_rows = self.header_has_two_rows(window_width, cx);
         let controls = set_header_controls();
+        let default_mode = self.model.read(cx).settings.watch_mode;
         let per_cluster = "Applies to one cluster: select a cluster to change it.";
         let namespaces = Button::new("namespace-filter-button")
             .xsmall()
@@ -2282,16 +2282,18 @@ impl Workspace {
         let watch_mode = Button::new("watch-mode")
             .xsmall()
             .ghost()
+            // As a cluster on the default shows it, so the slot keeps its width.
             .label(if two_rows {
-                "Live"
+                watch_mode_short_label(default_mode)
             } else {
-                "Live: per cluster"
+                watch_mode_label(default_mode)
             })
             .disabled(!controls.watch_mode)
             .tooltip(per_cluster);
         header_shell(
             header_breadcrumb(crumbs, self.detail.is_some(), theme),
-            detail_alone,
+            // Back is the cluster view's: a set keeps its own panes.
+            false,
             two_rows,
             vec![
                 namespaces.into_any_element(),

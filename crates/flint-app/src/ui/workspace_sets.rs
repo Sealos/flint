@@ -1680,7 +1680,17 @@ impl Workspace {
                 .flex_1()
                 .min_w_0()
                 .h_full()
-                .child(self.render_set_header(&run.label, &run.kind_label, window_width, theme, cx))
+                .child(self.render_set_header(
+                    &run.label,
+                    if run.dashboard.is_some() {
+                        "Overview"
+                    } else {
+                        &run.kind_label
+                    },
+                    window_width,
+                    theme,
+                    cx,
+                ))
                 .child(self.render_set_bar(run, theme, cx))
                 .children(self.render_member_sign_ins(run, theme, cx))
                 .child(body)

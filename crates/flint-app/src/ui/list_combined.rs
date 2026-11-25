@@ -371,18 +371,11 @@ impl CombinedResourceList {
     }
 
     /// Shows another kind in this list, titled `label`, keeping what the person set up: the text
-    /// filter, the cluster chips, the grouping and the sort when the new kind has its column.
+    /// filter, the cluster chips, the grouping and the sort, which applies once the new kind
+    /// has its column.
     /// What belongs to the old kind goes: its selection, its dashboard narrowing and its note.
     pub fn switch_kind(&mut self, label: String, source: CombinedSource, cx: &mut Context<Self>) {
         self.end_objects();
-        if self
-            .query
-            .sort
-            .as_ref()
-            .is_some_and(|s| source.list.column_index(&s.column).is_none())
-        {
-            self.query.sort = None;
-        }
         self.label = label;
         self.kind_note = None;
         self.hide_rows(cx);
