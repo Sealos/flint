@@ -65,6 +65,7 @@ use super::startup::StartupView;
 use super::terminal_model::ShellRequest;
 use super::terminal_view::{RestartBlocked, TerminalView};
 use super::theme;
+use super::tooltip_text::{SHOW_DELAY, cap_width};
 use super::ui_state::{self, UiState};
 use super::write_confirm;
 use flint_core::display::{self, ClusterNames};
@@ -283,6 +284,8 @@ pub struct Workspace {
     /// A right-click selected a row whose detail has not opened yet: the list stays in front
     /// when it does.
     menu_row_pending: bool,
+    /// A right-click made the last selection: its open menu keeps the detail from taking room.
+    right_selected: bool,
     /// The detail pane, when it outlived its list to keep an edit.
     held_edit: Option<unapplied::HeldEdit>,
     /// What last had focus in the list or the detail with no dialog open, and the layout that
@@ -481,6 +484,7 @@ impl Workspace {
             list_in_front: false,
             right_press: false,
             menu_row_pending: false,
+            right_selected: false,
             held_edit: None,
             pane_focus: None,
             dock,
@@ -1714,6 +1718,12 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Whether a namespace filter applies to what is shown: a cluster's own list. An open set
+    /// has no filter, so these changes would silently alter the active cluster's saved one.
+    pub(super) fn namespace_filter_applies(&self) -> bool {
+        self.cluster.is_some() && !self.sets.is_open()
+    }
+
     /// Sets the active cluster's namespace filter, remembers it in `state.toml`, and applies it
     /// to the open list.
     fn set_namespace_filter(&mut self, namespaces: Vec<String>, cx: &mut Context<Self>) {
@@ -1928,6 +1938,7 @@ impl Workspace {
             .border_1()
             .border_color(super::theme::cursor_ring(theme, ring))
             .tooltip(move |_, cx| cluster_tooltip(tip.0.clone(), &tip.1, &tip.2, cx))
+            .tooltip_show_delay(SHOW_DELAY)
             // While choosing clusters a click chooses: it must not connect to this one.
             // So does a Cmd-click, which starts choosing.
             .on_click({
@@ -2283,7 +2294,10 @@ impl Workspace {
                     })
                     .child(text)
                     .when(!tip.is_empty(), |el| {
-                        el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        el.tooltip(move |window, cx| {
+                            cap_width(Tooltip::new(tip.clone())).build(window, cx)
+                        })
+                        .tooltip_show_delay(SHOW_DELAY)
                     }),
             );
         }
@@ -2528,7 +2542,8 @@ impl Workspace {
             .text_color(color)
             .child(Icon::new(icon).xsmall())
             .child(if compact { short } else { text })
-            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .tooltip(move |window, cx| cap_width(Tooltip::new(tip.clone())).build(window, cx))
+            .tooltip_show_delay(SHOW_DELAY)
     }
 
     fn render_namespace_filter(
@@ -2805,8 +2820,29 @@ impl Workspace {
     /// pane beside the list: a detail shown alone fills the main area, so the sidebar keeps its
     /// width and its rows can still be told apart.
     fn layout(&self, window_width: f32, cx: &App) -> Layout {
-        let detail_beside = self.detail.is_some() && self.main_panes(cx) == MainPanes::Split;
-        layout(&self.panes, window_width, self.nav_shown(cx), detail_beside)
+        layout(
+            &self.panes,
+            window_width,
+            self.nav_shown(cx),
+            self.detail_beside(cx),
+        )
+    }
+
+    /// Whether the detail takes room beside the list: not while a right-click's menu is open
+    /// on the list, which would reflow under it.
+    fn detail_beside(&self, cx: &App) -> bool {
+        self.detail.is_some()
+            && self.main_panes(cx) == MainPanes::Split
+            && !self.detail_hidden_by_menu(cx)
+    }
+
+    /// Whether a right-click's open menu keeps the detail it opened out of the layout.
+    fn detail_hidden_by_menu(&self, cx: &App) -> bool {
+        self.right_selected
+            && self
+                .list
+                .as_ref()
+                .is_some_and(|l| l.read(cx).has_open_row_menu())
     }
 
     /// Whether the navigation is on screen: for the active cluster, or for an open set, which
@@ -3012,9 +3048,7 @@ impl Workspace {
                 .min_h_0()
                 .child(div().flex_1().min_w_0().h_full().child(list.clone()))
                 .when_some(
-                    self.detail
-                        .clone()
-                        .filter(|_| self.main_panes(cx) == MainPanes::Split),
+                    self.detail.clone().filter(|_| self.detail_beside(cx)),
                     |el, detail| {
                         el.child(
                             div()
@@ -3932,6 +3966,9 @@ impl Render for Workspace {
                 let right_click = std::mem::take(&mut this.right_press);
                 this.list_in_front = right_click;
                 this.menu_row_pending = right_click;
+                // Only a detail the right-click opens stays out of the layout: one already beside
+                // the list keeps its room.
+                this.right_selected = right_click && this.detail.is_none();
             }))
             .capture_action(cx.listener(|this, _: &OpenObject, _, _| {
                 this.list_in_front = false;

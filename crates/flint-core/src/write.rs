@@ -259,8 +259,8 @@ impl ReviewedEdit {
         self.creates
     }
 
-    /// The live object as YAML, without `status` and `managedFields`, Secret values hidden.
-    /// Empty when it creates the object.
+    /// The live object as YAML, without `managedFields`, Secret values hidden, and with `status`
+    /// only when the write changes it. Empty when it creates the object.
     pub fn before(&self) -> &str {
         &self.before
     }
@@ -680,7 +680,7 @@ async fn prepare_create(
         pin: gate.reviewed_pin()?,
         credential: gate.reviewed_credential()?,
         before: String::new(),
-        after: shown_yaml(&result)?,
+        after: render(&shown_value(&result, false))?,
         body,
         secret: false,
         creates: true,
@@ -811,12 +811,13 @@ async fn prepare(
     let result = serde_json::to_value(&result)
         .map_err(|e| WriteError::Failed(format!("cannot read the dry run: {e}")))?;
     let result = with_type_of(result, &body);
+    let status = status_shown(&body, live, &result)?;
     Ok(WriteAction::ApplyYaml(ReviewedEdit {
         bound: target.clone(),
         pin: gate.reviewed_pin()?,
         credential: gate.reviewed_credential()?,
-        before: shown_yaml(live)?,
-        after: shown_after(live, &result)?,
+        before: render(&shown_value(live, status))?,
+        after: shown_after(live, &result, status)?,
         body,
         secret,
         creates: false,
@@ -1059,10 +1060,29 @@ fn keep_live_status(body: &mut Value, live: &Value) {
     }
 }
 
-/// `object` as a review shows it: no `status` or `managedFields`, Secret values hidden.
-fn shown_value(object: &Value) -> Value {
+/// Whether a review shows `status`: only when the write changes it, which a kind without a
+/// status subresource lets a `PUT` do. An edit that sets a status the dry run did not take (the
+/// kind has a status subresource, or the server set it back) is refused: the review would not
+/// show what was typed, and Apply would not write it.
+fn status_shown(body: &Value, live: &Value, result: &Value) -> Result<bool, WriteError> {
+    let changes = result.get("status") != live.get("status");
+    if !changes && body.get("status") != live.get("status") {
+        return Err(WriteError::InvalidYaml(
+            "this edit cannot change status: the server keeps it as it is for this object. \
+             Remove status to review the rest"
+                .to_owned(),
+        ));
+    }
+    Ok(changes)
+}
+
+/// `object` as a review shows it: no `managedFields`, Secret values hidden, and `status` only
+/// when `with_status`.
+fn shown_value(object: &Value, with_status: bool) -> Value {
     let mut shown = object.clone();
-    if let Some(fields) = shown.as_object_mut() {
+    if let Some(fields) = shown.as_object_mut()
+        && !with_status
+    {
         fields.remove("status");
     }
     if let Some(metadata) = shown.get_mut("metadata").and_then(Value::as_object_mut) {
@@ -1074,14 +1094,10 @@ fn shown_value(object: &Value) -> Value {
     shown
 }
 
-fn shown_yaml(object: &Value) -> Result<String, WriteError> {
-    render(&shown_value(object))
-}
-
 /// The result of an edit as shown. A hidden value that changed says so, or the diff of a rotated
 /// Secret key would be empty.
-fn shown_after(live: &Value, after: &Value) -> Result<String, WriteError> {
-    let mut shown = shown_value(after);
+fn shown_after(live: &Value, after: &Value, with_status: bool) -> Result<String, WriteError> {
+    let mut shown = shown_value(after, with_status);
     for fields in ["/data", "/metadata/annotations"] {
         let was = live.pointer(fields).and_then(Value::as_object);
         let now = after.pointer(fields).and_then(Value::as_object);

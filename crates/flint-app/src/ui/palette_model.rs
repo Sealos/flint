@@ -104,12 +104,12 @@ impl Matcher {
     /// The score of `text` and the bytes matched, for highlighting; `None` when it does not
     /// match.
     pub fn score(&mut self, text: &str) -> Option<Score> {
-        self.run(text, true)
+        self.run(text, true, false)
     }
 
     /// The score alone, without the matched bytes: cheaper, for ranking.
     pub fn points(&mut self, text: &str) -> Option<i32> {
-        self.run(text, false).map(|s| s.points)
+        self.run(text, false, false).map(|s| s.points)
     }
 
     /// A quick score for ranking very many texts: the points of one good match rather than the
@@ -181,7 +181,7 @@ impl Matcher {
         }
     }
 
-    fn run(&mut self, text: &str, with_ranges: bool) -> Option<Score> {
+    fn run(&mut self, text: &str, with_ranges: bool, word_gaps: bool) -> Option<Score> {
         if self.query.is_empty() {
             return Some(Score {
                 points: 0,
@@ -255,7 +255,9 @@ impl Matcher {
             for j in i..n {
                 if j >= 2 {
                     let k = j - 2;
-                    if best[prev + k] > NONE {
+                    // An interior start is fine for a contiguous run, but a single letter
+                    // before the first gap must itself be a word start.
+                    if best[prev + k] > NONE && (!word_gaps || i > 1 || starts[k]) {
                         let value = best[prev + k] + GAP * k as i32;
                         if value > gapped.0 {
                             gapped = (value, k);
@@ -271,7 +273,7 @@ impl Matcher {
                     score = best[prev + j - 1] + CONSECUTIVE;
                     parent = j - 1;
                 }
-                if gapped.0 > NONE {
+                if gapped.0 > NONE && (!word_gaps || starts[j]) {
                     let value = gapped.0 - GAP * (j as i32 - 1);
                     if value > score {
                         score = value;
@@ -389,9 +391,8 @@ enum Clarity {
 }
 
 fn clarity(query: &str, label: &str) -> Clarity {
-    let spaced = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let query = spaced(query).to_lowercase();
-    let label = spaced(label).to_lowercase();
+    let query = normalized(query);
+    let label = normalized(label);
     if query.chars().count() < CLEAR_MATCH_CHARS {
         Clarity::Unclear
     } else if label.starts_with(&query) {
@@ -401,6 +402,40 @@ fn clarity(query: &str, label: &str) -> Clarity {
     } else {
         Clarity::Unclear
     }
+}
+
+fn normalized(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MatchQuality {
+    Exact,
+    WholeWord,
+    Prefix,
+    Fuzzy,
+}
+
+fn match_quality(query: &str, text: &str) -> MatchQuality {
+    let text = normalized(text);
+    if text == query {
+        return MatchQuality::Exact;
+    }
+    let mut quality = MatchQuality::Fuzzy;
+    let mut word_start = true;
+    for (at, c) in text.char_indices() {
+        if word_start && let Some(rest) = text[at..].strip_prefix(query) {
+            if rest.chars().next().is_none_or(|c| !c.is_alphanumeric()) {
+                return MatchQuality::WholeWord;
+            }
+            quality = MatchQuality::Prefix;
+        }
+        word_start = !c.is_alphanumeric();
+    }
+    quality
 }
 
 /// Whether `query` deliberately names `label`: at least [`CLEAR_MATCH_CHARS`] characters, and a
@@ -425,6 +460,15 @@ pub struct Hit {
 /// ones marked [`Candidate::last`] come after all the others, unless the query starts their
 /// name; even then they lose a tie.
 pub fn rank(query: &str, candidates: &[Candidate]) -> Vec<Hit> {
+    rank_candidates(query, candidates, false)
+}
+
+/// Ranks action names before fuzzy matches and only allows gaps at word boundaries.
+pub fn rank_actions(query: &str, candidates: &[Candidate]) -> Vec<Hit> {
+    rank_candidates(query, candidates, true)
+}
+
+fn rank_candidates(query: &str, candidates: &[Candidate], actions: bool) -> Vec<Hit> {
     if query.trim().is_empty() {
         let mut hits: Vec<(usize, &Candidate)> = candidates.iter().enumerate().collect();
         hits.sort_by_key(|(index, c)| (c.last, c.recent.unwrap_or(usize::MAX), *index));
@@ -437,15 +481,17 @@ pub fn rank(query: &str, candidates: &[Candidate]) -> Vec<Hit> {
             .collect();
     }
     let mut matcher = Matcher::new(query);
-    let mut scored: Vec<(Clarity, std::cmp::Reverse<i32>, bool, usize, Hit)> = candidates
+    let normalized_query = actions.then(|| normalized(query));
+    let mut scored: Vec<_> = candidates
         .iter()
         .enumerate()
         .filter_map(|(index, c)| {
-            let (points, ranges) = match matcher.score(&c.label) {
-                Some(score) => (score.points, score.ranges),
+            let (text, points, ranges) = match matcher.run(&c.label, true, actions) {
+                Some(score) => (c.label.as_str(), score.points, score.ranges),
                 None => {
-                    let alt = matcher.points(c.alt.as_deref()?)?;
-                    (alt - ALT_PENALTY, Vec::new())
+                    let text = c.alt.as_deref()?;
+                    let points = matcher.run(text, false, actions)?.points;
+                    (text, points - ALT_PENALTY, Vec::new())
                 }
             };
             Some((
@@ -454,6 +500,9 @@ pub fn rank(query: &str, candidates: &[Candidate]) -> Vec<Hit> {
                 } else {
                     Clarity::Name
                 },
+                normalized_query
+                    .as_deref()
+                    .map_or(MatchQuality::Fuzzy, |query| match_quality(query, text)),
                 std::cmp::Reverse(points),
                 c.last,
                 c.recent.unwrap_or(usize::MAX),
@@ -461,8 +510,8 @@ pub fn rank(query: &str, candidates: &[Candidate]) -> Vec<Hit> {
             ))
         })
         .collect();
-    scored.sort_by_key(|(clarity, points, last, recent, hit)| {
-        (*clarity, *points, *last, *recent, hit.index)
+    scored.sort_by_key(|(clarity, quality, points, last, recent, hit)| {
+        (*clarity, *quality, *points, *last, *recent, hit.index)
     });
     scored.into_iter().map(|(.., hit)| hit).collect()
 }
@@ -495,7 +544,7 @@ pub fn step(selected: usize, count: usize, step: isize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{Candidate, Matcher, Recents, clear_match, fuzzy, rank, step};
+    use super::{Candidate, Matcher, Recents, clear_match, fuzzy, rank, rank_actions, step};
 
     fn candidates(labels: &[&str]) -> Vec<Candidate> {
         labels
@@ -582,6 +631,36 @@ mod tests {
             c.iter().map(|c| c.label.clone()).collect::<Vec<_>>()
         );
         assert!(labels("zzz", &c).is_empty());
+    }
+
+    #[test]
+    fn action_search_prefers_whole_words_and_prefixes_and_rejects_scattered_letters() {
+        let mut c = candidates(&[
+            "Lock Cluster Again…",
+            "Set Cluster Colour Tag…",
+            "Clear Cluster Colour Tag…",
+            "Toggle Labels",
+            "Catalog Entries",
+            "List Object Groups",
+            "Open Logs",
+            "Read the Previous Output from Log",
+        ]);
+        c[4].recent = Some(0);
+        let hits = rank_actions("LoG", &c);
+        let labels: Vec<_> = hits.iter().map(|h| c[h.index].label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Read the Previous Output from Log",
+                "Open Logs",
+                "List Object Groups",
+                "Catalog Entries",
+            ]
+        );
+        assert_eq!(hits[1].ranges, vec![5..8_usize]);
+        assert_eq!(hits[2].ranges, [0..1, 5..6, 12..13]);
+        assert_eq!(hits[3].ranges, vec![4..7_usize]);
+        assert!(rank_actions("lgs", &c[6..7]).is_empty());
     }
 
     #[test]

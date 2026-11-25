@@ -3,8 +3,8 @@
 //! Enter runs the selected one from that focus, exactly as its key or menu item would
 //! ([`registry::dispatch_in`]); an action that takes arguments asks for them first, one at a
 //! time, from a list (a cluster, a namespace, a kind, a column, a container) or as typed text (a
-//! label selector). Esc, or Backspace in the empty field, goes back a step. Recently run actions
-//! come first.
+//! label selector). Esc, or Backspace in the empty field, goes back a step. With no query, the
+//! selected object's actions come first, with recently run actions first within each group.
 //!
 //! Matching runs when the query changes ([`palette_model`]), never while drawing, and the rows
 //! are a virtual list, so it stays quick with every action listed and with long argument lists
@@ -30,9 +30,10 @@ use serde_json::{Map, Value};
 
 use super::palette_model::{self, Candidate, Recents};
 use super::registry::{
-    self, ActionError, ActionSpec, Arg, ArgKind, Bind, CloseWindow, OnView, OpenObject, OpenView,
-    PaletteBack, PaletteConfirm, PaletteDismiss, PaletteDown, PalettePick, PaletteUp, PasteText,
-    Quit, Scope, ToggleCommandPalette, ToggleResourceSwitcher, Visibility,
+    self, ActionError, ActionSpec, Arg, ArgKind, Bind, Category, CloseWindow, OnView, OpenObject,
+    OpenView, PaletteBack, PaletteConfirm, PaletteDismiss, PaletteDown, PalettePick, PaletteUp,
+    PasteText, Quit, Scope, ShowDrainReport, ToggleCommandPalette, ToggleResourceSwitcher,
+    Visibility,
 };
 use super::switcher_model::{Index, Search};
 
@@ -641,15 +642,8 @@ impl CommandPalette {
             cx.notify();
             return;
         }
-        let hits = palette_model::rank(&query, &self.candidates);
         self.rows = match &self.step {
-            Step::Actions => hits
-                .into_iter()
-                .map(|h| Row::Action {
-                    entry: h.index,
-                    ranges: h.ranges,
-                })
-                .collect(),
+            Step::Actions => action_rows(&query, &self.entries, &self.candidates),
             Step::Argument { input, .. } => {
                 let typed = query.trim();
                 let offer_typed = !typed.is_empty()
@@ -662,7 +656,7 @@ impl CommandPalette {
                         }
                         ArgInput::Text => true,
                     };
-                let mut hits = hits;
+                let mut hits = palette_model::rank(&query, &self.candidates);
                 // Listed values equal to what was typed come first, the stored value before
                 // what is shown for it: with contexts `cluster/prod` and an EKS ARN shown as
                 // `cluster/prod`, Enter on "cluster/prod" takes the context of that name. The
@@ -1314,6 +1308,30 @@ fn resources_footer(resources: &Resources, rows: usize) -> SharedString {
 /// Quit and Close Window: never the row Enter runs without a choice (#407).
 fn ends_the_app(spec: &ActionSpec) -> bool {
     spec.name == Quit::name_for_type() || spec.name == CloseWindow::name_for_type()
+}
+
+fn action_rows(query: &str, entries: &[Entry], candidates: &[Candidate]) -> Vec<Row> {
+    let mut hits = palette_model::rank_actions(query, candidates);
+    if query.trim().is_empty() {
+        hits.sort_by_key(|hit| action_priority(entries[hit.index].spec));
+    }
+    hits.into_iter()
+        .map(|hit| Row::Action {
+            entry: hit.index,
+            ranges: hit.ranges,
+        })
+        .collect()
+}
+
+/// Actions on the selected object, then detail-pane controls, then the rest. The registry's
+/// guards already check whether each action is available for the current object.
+fn action_priority(spec: &ActionSpec) -> u8 {
+    match (spec.scope, spec.category) {
+        (Scope::Detail, Category::Logs | Category::Terminal) => 0,
+        (Scope::Workspace, Category::Detail) if spec.name != ShowDrainReport::name_for_type() => 0,
+        (Scope::Detail, _) => 1,
+        _ => 2,
+    }
 }
 
 /// What the query is matched against for an argument: each choice's label, and its stored

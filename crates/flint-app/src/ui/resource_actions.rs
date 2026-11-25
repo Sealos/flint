@@ -934,8 +934,9 @@ pub(in crate::ui) fn drain_strips(
     theme: &Theme,
     cx: &App,
 ) -> Vec<AnyElement> {
+    let mut strips: Vec<AnyElement> = write_confirm::done_strip(theme, cx).into_iter().collect();
     let Some(writes) = cx.try_global::<RunningWrites>() else {
-        return Vec::new();
+        return strips;
     };
     // Built once, and only for a strip that names a cluster.
     let mut make = Some(names);
@@ -945,7 +946,6 @@ pub(in crate::ui) fn drain_strips(
             .get_or_insert_with(|| make.take().map(|make| make()).unwrap_or_default())
             .clone()
     };
-    let mut strips = Vec::new();
     let draining: Vec<&WriteKey> = writes
         .running
         .iter()
