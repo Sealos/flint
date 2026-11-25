@@ -558,7 +558,7 @@ M3 used every number in the 5x block, so its later paths continue at UP-121.
 ### UP-61 See resource usage
 - **Then** pod and node lists show CPU and memory from metrics-server, refreshed about every 15 s. If metrics-server is
   missing, the columns are hidden and a hint is shown.
-- Tests: cluster (`flint-e2e/tests/dashboard_usage.rs`, `telemetry.rs`, with and without metrics-server), e2e (`tests/app/m4.rs`, the hint), ui (`ui/list_usage.rs`).
+- Tests: e2e (fake API server: `flint-e2e/tests/dashboard_usage.rs`, `telemetry.rs`, with and without metrics-server), e2e (`tests/app/m4.rs`, the hint), ui (`ui/list_usage.rs`).
 
 ### UP-62 See how a namespace's workloads fit together
 - **When** I open the diagram for the `demo` namespace.
@@ -593,7 +593,7 @@ M3 used every number in the 5x block, so its later paths continue at UP-121.
 - **Then** I see CPU and memory used against allocatable, and requests and limits against capacity, per node and in
   total, each with a sparkline of the last hour that keeps growing while I stay connected. Without metrics-server the
   tiles say how to install it.
-- Tests: unit (ring buffer, aggregation), cluster (`flint-e2e/tests/dashboard_usage.rs`; the growing sparkline needs a
+- Tests: unit (ring buffer, aggregation), e2e (fake API server: `flint-e2e/tests/dashboard_usage.rs`; the growing sparkline needs a
   clock control), ui.
 
 ### UP-67 Set warning thresholds

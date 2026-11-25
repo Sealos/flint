@@ -25,10 +25,11 @@ fn fake_app(options: Options) -> Result<(TestCluster, App)> {
     Ok((cluster, app))
 }
 
+/// Whether the list shows CPU or Memory. Fails if it lists no columns at all.
 fn has_usage_columns(state: &Value) -> bool {
-    state["list"]["columns"]
-        .as_array()
-        .is_some_and(|c| c.contains(&json!("CPU")) && c.contains(&json!("Memory")))
+    let columns = state["list"]["columns"].as_array().expect("list columns");
+    assert!(!columns.is_empty(), "the list has no columns");
+    columns.contains(&json!("CPU")) || columns.contains(&json!("Memory"))
 }
 
 // covers UP-61: without metrics-server the columns are hidden and a hint says why.

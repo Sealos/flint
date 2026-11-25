@@ -204,7 +204,8 @@ async fn up_66_without_metrics_server_the_tiles_have_no_usage() {
     let store = Arc::new(Mutex::new(TrendStore::new()));
     let mut feed = start(&server, &store).await;
     let snapshot = until(&mut feed, "the metrics answer and capacity", |s| {
-        s.metrics != MetricsCheck::Waiting && s.capacity.is_some()
+        s.metrics != MetricsCheck::Waiting
+            && s.capacity.as_ref().is_some_and(|c| c.pods().is_some())
     })
     .await;
     assert_eq!(
@@ -233,9 +234,8 @@ async fn up_61_list_usage_follows_metrics_server() {
     let node_usage = |feed: &Telemetry| feed.side_reads().node_usage.get(&NODE.to_owned());
     let pod_usage = |feed: &Telemetry| match &feed.side_reads().pod_usage {
         UsageRead::Current(values) => values
-            .iter()
-            .find(|(key, _)| format!("{key:?}").contains("crash-loop"))
-            .map(|(_, sample)| sample.usage),
+            .get(&("demo".to_owned(), "crash-loop".to_owned()))
+            .map(|sample| sample.usage),
         _ => None,
     };
     let (node, pod) = tokio::time::timeout(WAIT, async {
@@ -253,15 +253,24 @@ async fn up_61_list_usage_follows_metrics_server() {
     assert_eq!(pod.cpu.millis(), 30);
     assert_eq!(pod.memory.bytes(), 20 * MIB);
 
-    // Each poll brings the newest reading.
+    // Each poll brings the newest reading, of nodes and of pods.
     server.set_metrics(&MetricsTarget::node(NODE), "400m", "768Mi");
-    tokio::time::timeout(WAIT, async {
-        while node_usage(&feed).map(|u| u.cpu.millis()) != Some(400) {
+    server.set_metrics(&MetricsTarget::pod("demo", "crash-loop"), "45m", "24Mi");
+    let (node, pod) = tokio::time::timeout(WAIT, async {
+        loop {
+            if let (Some(node), Some(pod)) = (node_usage(&feed), pod_usage(&feed))
+                && node.cpu.millis() == 400
+                && pod.cpu.millis() == 45
+            {
+                return (node, pod);
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("the new reading arrives");
+    .expect("the new readings arrive");
+    assert_eq!(node.memory.bytes(), 768 * MIB);
+    assert_eq!(pod.memory.bytes(), 24 * MIB);
     feed.stop().await;
 }
 
