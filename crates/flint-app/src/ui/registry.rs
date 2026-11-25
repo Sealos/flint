@@ -778,8 +778,8 @@ pub struct SelectRow {
     pub name: String,
 }
 
-/// Sort by a column, as clicking its header does: ascending, descending, then unsorted. The
-/// choice is remembered for the cluster and kind.
+/// Cycle a column's sort as clicking its header does. The choice is remembered for the
+/// cluster and kind.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
 #[action(namespace = resource_list, no_json)]
 #[serde(deny_unknown_fields)]
@@ -792,6 +792,18 @@ pub struct SortBy {
     #[serde(default)]
     pub key: Option<String>,
 }
+
+/// Set a column's sort to ascending.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = resource_list, no_json)]
+#[serde(transparent)]
+pub struct SortByAscending(pub SortBy);
+
+/// Set a column's sort to descending.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = resource_list, no_json)]
+#[serde(transparent)]
+pub struct SortByDescending(pub SortBy);
 
 /// Reveal or hide one value of a Secret, by key.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
@@ -3024,7 +3036,19 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         .hidden(),
         Spec::with_args::<SortBy>(
             "Sort by Column…",
-            "Sort by a column: ascending, descending, then unsorted.",
+            "Cycle a column's sort. Numeric columns start descending and other columns start ascending.",
+            COLUMN,
+        )
+        .of(C::List, S::List),
+        Spec::with_args::<SortByAscending>(
+            "Sort by Column, Ascending…",
+            "Sort the chosen column in ascending order.",
+            COLUMN,
+        )
+        .of(C::List, S::List),
+        Spec::with_args::<SortByDescending>(
+            "Sort by Column, Descending…",
+            "Sort the chosen column in descending order.",
             COLUMN,
         )
         .of(C::List, S::List),
@@ -3925,6 +3949,8 @@ pub mod tests {
         // Reachable only from the palette (#29): no key, no menu item, no control.
         for name in [
             "resource_list::SortBy",
+            "resource_list::SortByAscending",
+            "resource_list::SortByDescending",
             "workspace::SelectCluster",
             "workspace::OpenView",
             "logs::OpenSelectorLogs",
