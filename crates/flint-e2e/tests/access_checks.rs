@@ -319,6 +319,48 @@ fn launches(log: &std::path::Path) -> usize {
     std::fs::read_to_string(log).map_or(0, |text| text.lines().count())
 }
 
+/// Waits until the active context's problem feed, which runs in On view too (#715), has started:
+/// it watches its seven kinds in requests that arrived after the first `since`, and then nothing
+/// is in flight, nothing arrives and the plugin in `log` is not launched for a while. The feed's
+/// requests use the context's credential, and with an expired token each refresh launches its
+/// plugin, so they must be done before launches are counted for anything else.
+async fn feed_settled(api: &FakeApiServer, since: usize, log: &std::path::Path) {
+    const KINDS: [&str; 7] = [
+        "/api/v1/pods",
+        "/api/v1/nodes",
+        "/apis/batch/v1/jobs",
+        "/apis/apps/v1/deployments",
+        "/apis/apps/v1/statefulsets",
+        "/apis/apps/v1/daemonsets",
+        "/apis/apps/v1/replicasets",
+    ];
+    let watching = || {
+        let arrived = api.arrivals();
+        KINDS.iter().all(|kind| {
+            arrived[since..]
+                .iter()
+                .any(|r| r.path == *kind && r.parsed_query().watch)
+        })
+    };
+    let state = || (api.arrivals().len(), launches(log));
+    tokio::time::timeout(WAIT, async {
+        while !watching() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut seen = state();
+        loop {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let now = state();
+            if now == seen && api.requests_in_flight() == 0 {
+                return;
+            }
+            seen = now;
+        }
+    })
+    .await
+    .expect("the active context's feed settled");
+}
+
 // covers #267: a set's row whose context now has another user at the same URL asks nothing with
 // the replacement credential, and does not launch its plugin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -350,10 +392,13 @@ async fn a_changed_member_credential_sends_no_check() {
     assert_eq!(asked.await, Access::Allowed);
 
     let log = write_plugin_user(&api, &second, &core);
+    feed_settled(&api, 0, &log).await;
+    let replaced = api.arrivals().len();
     core.handle.reload_kubeconfig().await.unwrap();
     core.handle.send(Command::Activate(CONTEXT.to_owned()));
     let delete = check(Some("demo"), "deployments", "delete");
     assert_eq!(settled(&core, delete).await, Access::Allowed);
+    feed_settled(&api, replaced, &log).await;
     let (sent, launched) = (reviews(&api), launches(&log));
     assert!(launched > 0, "the replacement is what the context uses now");
 
