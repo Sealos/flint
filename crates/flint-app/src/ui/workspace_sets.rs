@@ -130,6 +130,10 @@ impl RunningSet {
     }
 }
 
+pub(super) fn sidebar_set_members(run: Option<&RunningSet>) -> Option<Vec<&str>> {
+    run.map(|run| run.current_members().map(AdmittedMember::context).collect())
+}
+
 impl ClusterSets {
     pub(super) fn new(window: &mut Window, cx: &mut Context<Workspace>) -> Self {
         Self {
@@ -497,7 +501,17 @@ impl Workspace {
             return;
         }
         self.sets.error = None;
-        // A Cmd-click starts choosing from outside the choosing mode.
+        // A Cmd-click from an empty selection combines the active and clicked clusters.
+        if !self.sets.picking
+            && self.sets.picked.is_empty()
+            && let Some(active) = self.model.read(cx).active_cluster()
+            && active.info.name != action.cluster
+            && let Some(server) = &active.info.server
+        {
+            self.sets
+                .picked
+                .push(ClusterPin::new(active.info.name.clone(), server.clone()));
+        }
         self.sets.picking = true;
         let at = self
             .sets
@@ -1708,9 +1722,15 @@ impl Workspace {
         })
     }
 
-    /// The sidebar's foot: saved sets, and the controls for choosing clusters.
-    pub(super) fn render_sets_panel(&self, theme: &Theme, cx: &App) -> impl IntoElement {
+    /// The sidebar's foot: cluster sets and the controls for choosing clusters.
+    pub(super) fn render_sets_panel(
+        &self,
+        open_count: Option<usize>,
+        theme: &Theme,
+        cx: &App,
+    ) -> impl IntoElement {
         let sets = &self.sets;
+        let open_id = sets.running.as_ref().and_then(|run| run.set_id.as_deref());
         let count = sets.picked.len();
         let can_run = (MIN_CLUSTER_SET_MEMBERS..=MAX_CLUSTER_SET_MEMBERS).contains(&count);
         let typed = sets.name_input.read(cx).value().trim().to_string();
@@ -1725,6 +1745,9 @@ impl Workspace {
             .text_xs()
             .children(sets.saved.iter().map(|set| {
                 let name = set.name.clone();
+                let count = open_count
+                    .filter(|_| open_id == Some(set.id.as_str()))
+                    .unwrap_or(set.members.len());
                 div()
                     .id(SharedString::from(format!("set-menu-{name}")))
                     .w_full()
@@ -1734,6 +1757,8 @@ impl Workspace {
                             .ghost()
                             .w_full()
                             .label(name.clone())
+                            .accessibility_label(format!("{name} ({count})"))
+                            .child(div().flex_none().child(format!("({count})")))
                             .on_click(registry::on_click(OpenClusterSet { name: name.clone() })),
                     )
                     .context_menu(move |menu, _, _| {
@@ -1745,6 +1770,17 @@ impl Workspace {
                         )))
                     })
             }))
+            .when_some(open_count.filter(|_| open_id.is_none()), |el, count| {
+                let label = format!("Open set ({count})");
+                el.child(
+                    div()
+                        .id("open-unsaved-set")
+                        .aria_label(label.clone())
+                        .text_center()
+                        .child(label)
+                        .test_support(),
+                )
+            })
             .child(
                 Button::new("toggle-cluster-picking")
                     .xsmall()
