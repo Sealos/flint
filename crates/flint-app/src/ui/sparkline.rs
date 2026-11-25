@@ -148,6 +148,14 @@ impl SparklineShape {
             let x = (index as f64 / last) as f32;
             match bucket {
                 Some(bucket) => {
+                    // Missed polls between two buckets stay a break in the line.
+                    let before = index
+                        .checked_sub(1)
+                        .and_then(|before| buckets[before])
+                        .is_none_or(|before| self.values[before.end - 1].is_none());
+                    if (before || self.values[bucket.first].is_none()) && !run.is_empty() {
+                        plot.runs.push(std::mem::take(&mut run));
+                    }
                     run.push((x, scale(bucket.mean)));
                     if bucket.min < bucket.max {
                         plot.bands.push(Band {
@@ -200,7 +208,11 @@ impl SparklineShape {
         let when = if end - first == 1 {
             at(first, "%H:%M:%S")
         } else {
-            format!("{}\u{2013}{}", at(first, "%H:%M"), at(end - 1, "%H:%M"))
+            format!(
+                "{}\u{2013}{}",
+                at(first, "%H:%M:%S"),
+                at(end - 1, "%H:%M:%S")
+            )
         };
         let present = || self.values[first..end].iter().flatten().copied();
         Some(match (present().min(), present().max()) {
@@ -313,7 +325,7 @@ impl RenderOnce for Sparkline {
                         .bg(theme.popover)
                         .text_color(theme.popover_foreground)
                         .text_xs()
-                        .whitespace_nowrap()
+                        .max_w_full()
                         .child(text)
                         .test_support(),
                 )
@@ -513,6 +525,12 @@ mod tests {
     }
 
     #[test]
+    fn a_gap_between_two_buckets_breaks_the_line() {
+        let plot = shape(&[Some(10), None, None, Some(90)]).plot(2);
+        assert_eq!(plot.runs.len(), 2);
+    }
+
+    #[test]
     fn a_bucket_with_some_gaps_uses_the_samples_it_has() {
         let buckets = downsample(&[Some(2), None, Some(6), None], 2);
         assert_eq!(buckets[0].map(|b| (b.min, b.max, b.mean)), Some((2, 2, 2)));
@@ -547,11 +565,11 @@ mod tests {
         let s = shape(&series(&[1, 9, 4, 4, 2, 8, 3, 3]));
         assert_eq!(
             s.readout(2, 0, &utc).as_deref(),
-            Some("11:58\u{2013}11:59  min 1  max 9")
+            Some("11:58:15\u{2013}11:59:00  min 1  max 9")
         );
         assert_eq!(
             s.readout(2, 1, &utc).as_deref(),
-            Some("11:59\u{2013}12:00  min 2  max 8")
+            Some("11:59:15\u{2013}12:00:00  min 2  max 8")
         );
         assert_eq!(s.readout(2, 2, &utc), None);
     }
