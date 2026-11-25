@@ -11,7 +11,8 @@
 //! - **Memory follows what was collected, within a hard bound.** A ring grows as samples arrive
 //!   instead of being allocated at the window's length. At most [`MAX_NODES`] node series and
 //!   [`MAX_CLUSTERS`] totals hold 2 rings each of 8 bytes per step: about 46 MiB at 6 hours and
-//!   179 MiB at 24 hours, plus 16 bytes per step for each cluster's poll times. A cluster that
+//!   179 MiB at 24 hours in one store, plus 16 bytes per step for each cluster's poll times. The
+//!   manager gives each cluster its own store, so [`MAX_NODES`] bounds a cluster, not the app. A cluster that
 //!   goes cold is dropped with [`TrendStore::drop_cluster`].
 //! - **A shorter window trims the oldest samples; a longer one keeps what was collected.**
 
@@ -141,11 +142,10 @@ impl Ring {
     fn put(&mut self, step: u64, value: u64, window: usize) {
         let value = value.min(GAP - 1);
         match step - self.newest {
-            0 => {
-                if let Some(last) = self.values.back_mut() {
-                    *last = value;
-                }
-            }
+            0 => match self.values.back_mut() {
+                Some(last) => *last = value,
+                None => self.values.push_back(value),
+            },
             steps => push_steps(&mut self.values, steps, GAP, value, window),
         }
         self.newest = step;
@@ -158,9 +158,12 @@ impl Ring {
         (value != GAP).then_some(value)
     }
 
-    /// Keeps the newest `window` steps.
-    fn trim(&mut self, window: usize) {
-        trim(&mut self.values, window);
+    /// Keeps the steps inside the `window` that ends at `step`, the newest of the cluster. A
+    /// ring whose last sample is older keeps fewer, so a longer window never brings back what a
+    /// shorter one dropped.
+    fn trim(&mut self, window: usize, step: u64) {
+        let behind = usize::try_from(step.saturating_sub(self.newest)).unwrap_or(usize::MAX);
+        trim(&mut self.values, window.saturating_sub(behind));
     }
 }
 
@@ -184,9 +187,9 @@ impl Series {
         self.memory.put(step, usage.memory.bytes(), window);
     }
 
-    fn trim(&mut self, window: usize) {
-        self.cpu.trim(window);
-        self.memory.trim(window);
+    fn trim(&mut self, window: usize, step: u64) {
+        self.cpu.trim(window, step);
+        self.memory.trim(window, step);
     }
 
     fn newest(&self) -> u64 {
@@ -256,12 +259,12 @@ impl ClusterTrend {
     /// Keeps the newest `window` steps, and drops a node whose samples are all older.
     fn trim(&mut self, window: usize) {
         trim(&mut self.times, window);
-        self.total.trim(window);
         let step = self.step;
+        self.total.trim(window, step);
         self.nodes
             .retain(|_, series| step - series.newest() < window as u64);
         for series in self.nodes.values_mut() {
-            series.trim(window);
+            series.trim(window, step);
         }
     }
 
@@ -976,5 +979,27 @@ mod tests {
         store.set_window_hours(1);
         assert!(!store.clusters[CLUSTER].nodes.contains_key("gone"));
         assert!(store.clusters[CLUSTER].nodes.contains_key("a"));
+    }
+
+    #[test]
+    fn a_shorter_window_measures_every_ring_from_the_clusters_newest_step() {
+        let mut store = TrendStore::new();
+        // Two hours of complete polls, then half an hour of partial ones: node b missing for
+        // long enough to leave the total a gap.
+        fill(&mut store, 480);
+        for i in 480..600 {
+            let partial = Ok(MetricsList {
+                items: vec![node("a", 1, 1)],
+                skipped: 1,
+            });
+            store.record(CLUSTER, at(i * 15), &partial);
+        }
+        let now = at(599 * 15);
+        store.set_window_hours(1);
+        store.set_window_hours(6);
+        let totals = read(&store, TrendScope::Total, now);
+        // The newest hour holds 120 steps of complete polls at most, never the 240 before the
+        // partial ones.
+        assert!(totals.iter().flatten().count() <= 120);
     }
 }

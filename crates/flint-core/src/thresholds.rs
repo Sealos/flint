@@ -141,6 +141,13 @@ impl ThresholdMetric {
         self.spec().range
     }
 
+    /// Whether `value` is a threshold this metric accepts: in its range, and for the history
+    /// length one of [`HISTORY_HOURS_PRESETS`].
+    pub fn accepts(self, value: u32) -> bool {
+        self.range().contains(&value)
+            && (self != Self::HistoryHours || HISTORY_HOURS_PRESETS.contains(&value))
+    }
+
     const fn index(self) -> usize {
         self as usize
     }
@@ -227,7 +234,7 @@ impl ThresholdOverrides {
         metric: ThresholdMetric,
         value: Option<u32>,
     ) -> Result<(), ThresholdError> {
-        if value.is_some_and(|v| !metric.range().contains(&v)) {
+        if value.is_some_and(|v| !metric.accepts(v)) {
             return Err(ThresholdError { metric });
         }
         self.values[metric.index()] = value;
@@ -576,7 +583,7 @@ impl Fields {
             };
             let parsed = read
                 .and_then(|v| u32::try_from(v).ok())
-                .filter(|v| metric.range().contains(v));
+                .filter(|v| metric.accepts(*v));
             match parsed {
                 Some(_) => overrides.values[metric.index()] = parsed,
                 None => issues.push(ThresholdIssue::InvalidValue { entry, metric }),
@@ -751,7 +758,7 @@ pub(crate) fn write_value(
     metric: ThresholdMetric,
     value: Option<u32>,
 ) -> Result<bool, ThresholdWriteError> {
-    if value.is_some_and(|v| !metric.range().contains(&v)) {
+    if value.is_some_and(|v| !metric.accepts(v)) {
         return Err(ThresholdError { metric }.into());
     }
     if cluster.is_some_and(|c| c.context.trim().is_empty() || c.server.trim().is_empty()) {

@@ -22,7 +22,7 @@
 
 use flint_core::WatchMode;
 use flint_core::settings::{ClusterPin, Settings};
-use flint_core::thresholds::{HISTORY_HOURS_PRESETS, ThresholdMetric};
+use flint_core::thresholds::ThresholdMetric;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
@@ -264,7 +264,7 @@ pub fn parse_threshold(metric: ThresholdMetric, text: &str) -> Result<Option<u32
     let range = metric.range();
     if metric == ThresholdMetric::HistoryHours {
         return match text.parse::<u32>() {
-            Ok(value) if HISTORY_HOURS_PRESETS.contains(&value) => Ok(Some(value)),
+            Ok(value) if metric.accepts(value) => Ok(Some(value)),
             _ => Err("History must be 1, 3, 6, 12 or 24 hours.".to_owned()),
         };
     }

@@ -363,6 +363,11 @@ fn history_hours_default_range_and_presets() {
     let mut overrides = ThresholdOverrides::default();
     assert!(overrides.set(HistoryHours, Some(0)).is_err());
     assert!(overrides.set(HistoryHours, Some(25)).is_err());
+    // Only the presets, in a file and in a write alike.
+    assert!(overrides.set(HistoryHours, Some(2)).is_err());
+    let (settings, issues) = load("history_hours = 2\n");
+    assert_eq!(settings.global.get(HistoryHours), None);
+    assert_eq!(issues.len(), 1);
     assert!(overrides.set(HistoryHours, Some(24)).is_ok());
 }
 

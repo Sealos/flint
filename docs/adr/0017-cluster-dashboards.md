@@ -60,7 +60,8 @@ sorted by most problems first, under a totals strip. A count opens the combined 
   up to 24 hours of in-memory samples is in scope.
 - Memory grows with the number of series (nodes × metrics × connected clusters); each ring buffer is bounded
   (240 samples per hour of history, 8 bytes each). The node caps stay (`MAX_NODES_PER_CLUSTER` 500, `MAX_NODES` 2000,
-  `MAX_CLUSTERS` 32). Worst case with 2000 nodes and all rings full is about 46 MiB at 6 hours and 179 MiB at 24
-  hours, plus 16 bytes per step for each cluster's poll times. The memory soak test covers a dashboard left open.
+  `MAX_CLUSTERS` 32). Worst case for one cluster store with all rings full is about 44 MiB at 24 hours (500 nodes with their own
+  series) and 11 MiB at 6 hours, plus 16 bytes per step for its poll times; the 2000-node cap applies within a store,
+  not across clusters. The memory soak test covers a dashboard left open.
 - The dashboard opens extra watches on large clusters while it is showing, which the warm-cluster memory budget
   (ADR-0012) and the kwok measurements must include.

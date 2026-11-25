@@ -99,7 +99,14 @@ impl ClusterManager {
     /// once: a shorter one trims, a longer one keeps what was collected.
     pub(super) fn apply_history_windows(&self) {
         for (id, history) in &self.histories.clusters {
-            set_hours(&history.trends, self.history_hours(id));
+            // While the context shows another definition (a fallback from another file), its
+            // settings are not those of the history's: leave it as it is.
+            let same = self
+                .cluster(id)
+                .is_some_and(|slot| slot.fingerprint == Some(history.fingerprint));
+            if same {
+                set_hours(&history.trends, self.history_hours(id));
+            }
         }
     }
 
