@@ -7,7 +7,6 @@
 
 use std::f32::consts::TAU;
 
-use flint_core::metrics::{Share, share};
 use flint_core::thresholds::{ThresholdLevel, ThresholdMetric, Thresholds};
 use gpui_kit::component::{StyledExt as _, Theme};
 use gpui_kit::*;
@@ -63,10 +62,8 @@ impl RingSpec {
         let tone = if used > end {
             Tone::Over
         } else {
-            let percent = match share(used, Some(end)) {
-                Share::Percent(percent) => Some(u64::from(percent)),
-                Share::NotSet | Share::ZeroBudget => None,
-            };
+            // Truncated, so a ring warns only once use has really reached the threshold.
+            let percent = u64::try_from(u128::from(used) * 100 / u128::from(end)).ok();
             match thresholds.evaluate(metric, percent) {
                 ThresholdLevel::Warning => Tone::Warning,
                 ThresholdLevel::Healthy | ThresholdLevel::Unknown => Tone::Normal,
@@ -108,7 +105,7 @@ pub(super) fn tick_ends(inner: f32, outer: f32, fraction: f32) -> [(f32, f32); 2
 
 fn tone_color(tone: Tone, theme: &Theme) -> Hsla {
     match tone {
-        Tone::Normal => theme.primary,
+        Tone::Normal => theme.foreground,
         Tone::Warning => theme.warning,
         Tone::Over => theme.danger,
     }
