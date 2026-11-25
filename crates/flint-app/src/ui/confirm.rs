@@ -237,7 +237,10 @@ pub(in crate::ui) fn open_gated_guarded(
         0,
         Some(content),
         Some(gate),
-        Some(guard),
+        Guards {
+            connection: Some(guard),
+            object: None,
+        },
         on_ok,
     );
 }
@@ -420,7 +423,7 @@ pub fn open_with_alternative(
     // The buttons answer from here, inside the dialog, whatever holds focus.
     let focus = cx.focus_handle();
     let answer_from = focus.clone();
-    let live = LiveDialog::open(window, None, cx);
+    let live = LiveDialog::open(window, Guards::default(), cx);
     window.open_alert_dialog(cx, move |alert, _, _| {
         let (on_ok, on_alternative) = (on_ok.clone(), on_alternative.clone());
         let (live_ok, live_cancel, live_alternative) = (live.clone(), live.clone(), live.clone());

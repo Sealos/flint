@@ -1922,6 +1922,7 @@ mod tests {
                     &target,
                     &change,
                     &reviewed,
+                    None,
                 )
                 .await
                 .map(drop);
@@ -1991,6 +1992,7 @@ mod tests {
                     &held_target(),
                     &change,
                     &reviewed,
+                    None,
                 )
                 .await
                 .map(drop);
