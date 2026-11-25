@@ -1246,6 +1246,8 @@ impl CombinedResourceList {
                 let cluster = member.cluster().to_owned();
                 let active = chosen.contains(&cluster);
                 let signed_out = self.signed_out.contains(&cluster);
+                // A member already in the filter keeps its click for taking it out.
+                let signs_in = signed_out && !active;
                 h_flex()
                     .id(SharedString::from(format!("member-{cluster}")))
                     .gap_1()
@@ -1254,7 +1256,7 @@ impl CombinedResourceList {
                     .cursor_pointer()
                     .when(active, |el| el.bg(theme.table_active))
                     .hover(|el| el.bg(theme.table_hover))
-                    .when(!signed_out, |el| {
+                    .when(!signs_in, |el| {
                         el.on_click(registry::on_click_in(
                             self.focus.clone(),
                             ToggleClusterFilter {
@@ -1262,7 +1264,7 @@ impl CombinedResourceList {
                             },
                         ))
                     })
-                    .when(signed_out, |el| {
+                    .when(signs_in, |el| {
                         el.on_click(registry::on_click(set_members::sign_in_member(&cluster)))
                     })
                     .when_some(member.tag(), |el, tag| {

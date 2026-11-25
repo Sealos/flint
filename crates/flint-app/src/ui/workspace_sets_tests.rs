@@ -2313,7 +2313,7 @@ async fn no_member_signed_in_shows_one_row_each_instead_of_the_list(cx: &mut Tes
 }
 
 #[gpui_kit::test]
-async fn paused_members_are_listed_with_why_and_no_action(cx: &mut TestAppContext) {
+async fn paused_members_keep_the_rows_their_watches_still_supply(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let paused = |c: &str| report(c, MemberStatus::Live, true);
     let t = open_with_reports(
@@ -2322,13 +2322,8 @@ async fn paused_members_are_listed_with_why_and_no_action(cx: &mut TestAppContex
         vec![paused("kind-alpha"), paused("kind-beta")],
     )
     .await;
-    let rows = empty_block(cx, &t).unwrap();
-    assert_eq!(rows.len(), 2);
-    assert!(
-        rows.iter()
-            .all(|(_, line, action)| line.starts_with("Paused") && action.is_none()),
-        "{rows:?}"
-    );
+    // The pause says why in the model; the list stays while it still holds rows.
+    assert_eq!(empty_block(cx, &t), None);
 }
 
 #[gpui_kit::test]
@@ -2355,16 +2350,12 @@ async fn mixed_causes_each_get_their_own_row(cx: &mut TestAppContext) {
     let t = open_with_reports(
         cx,
         dir.path(),
-        vec![
-            signed_out("kind-alpha"),
-            report("kind-beta", MemberStatus::Live, true),
-        ],
+        vec![signed_out("kind-alpha"), failed("kind-beta")],
     )
     .await;
     let rows = empty_block(cx, &t).unwrap();
     assert_eq!(rows[0].2, Some("Sign in"));
-    assert_eq!(rows[1].2, None);
-    assert!(rows[1].1.starts_with("Paused"), "{rows:?}");
+    assert_eq!(rows[1].2, Some("Retry"));
 }
 
 #[gpui_kit::test]

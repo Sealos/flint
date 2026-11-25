@@ -24,6 +24,10 @@ pub(super) enum MemberCause {
     SignIn,
     /// Its connection failed and is retried after a backoff.
     Failed,
+    /// The person disconnected it: its rows are gone until the set is opened again.
+    Disconnected,
+    /// It left the server it was admitted on: its rows are gone until the set is opened again.
+    Changed,
 }
 
 /// What a row of the empty-state block offers.
@@ -55,6 +59,10 @@ impl MemberCause {
             Self::Paused => paused_text(shown),
             Self::SignIn => format!("{shown} needs sign-in: select it in the sidebar"),
             Self::Failed => return None,
+            Self::Disconnected => format!("{shown} was disconnected. Open the set again."),
+            Self::Changed => {
+                format!("{shown} changed since this set opened. Open the set again.")
+            }
         })
     }
 
@@ -67,6 +75,8 @@ impl MemberCause {
             Self::Paused => "Paused: a kubeconfig file defining it can't be read",
             Self::SignIn => "Sign-in needed",
             Self::Failed => "Connection failed",
+            Self::Disconnected => "Disconnected: open the set again",
+            Self::Changed => "Changed since the set opened: open the set again",
         }
     }
 
@@ -74,7 +84,12 @@ impl MemberCause {
         match self {
             Self::SignIn => Some(MemberAction::SignIn),
             Self::Failed => Some(MemberAction::Retry),
-            Self::Removed | Self::Provisional | Self::Moved | Self::Paused => None,
+            Self::Removed
+            | Self::Provisional
+            | Self::Moved
+            | Self::Paused
+            | Self::Disconnected
+            | Self::Changed => None,
         }
     }
 }

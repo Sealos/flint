@@ -1683,6 +1683,12 @@ impl Workspace {
         cx: &App,
     ) -> Option<MemberCause> {
         let member = run.members.iter().find(|m| m.context() == context)?;
+        if run.disconnected.contains(context) {
+            return Some(MemberCause::Disconnected);
+        }
+        if run.changed.contains(context) {
+            return Some(MemberCause::Changed);
+        }
         let report = run.reports.iter().find(|r| r.cluster == context);
         let summary = self.cluster_summary(context, cx);
         refusal_cause(member.pin(), summary, report)
@@ -1705,22 +1711,34 @@ impl Workspace {
     }
 
     /// One row per member with its cause, while no member can show rows. `None` otherwise, and
-    /// while the set shows its dashboard.
+    /// while the set shows its dashboard, a row or any rows.
     pub(super) fn set_empty_state(&self, run: &RunningSet, cx: &App) -> Option<Vec<MemberLine>> {
-        if run.dashboard.is_some() {
+        // An open row (an unapplied edit stays on show) or rows a surviving watch still supplies
+        // keep the list: the block only stands in for a list with nothing to show.
+        if run.dashboard.is_some() || self.detail.is_some() {
             return None;
         }
         let names = self.cluster_names(cx);
-        set_members::empty_state(
-            run.members
-                .iter()
-                .map(|m| {
-                    let context = m.context();
-                    let cause = self.set_member_cause(run, context, cx);
-                    (context.to_owned(), names.exact(context), cause)
+        let members: set_members::MemberCauses = run
+            .members
+            .iter()
+            .map(|m| {
+                let context = m.context();
+                let cause = self.set_member_cause(run, context, cx);
+                (context.to_owned(), names.exact(context), cause)
+            })
+            .collect();
+        // A pause stops nothing already running: a paused member's watch may still fill rows.
+        let paused_rows = run.snapshots.iter().any(|snapshot| {
+            !snapshot.rows.is_empty()
+                && members.iter().any(|(context, _, cause)| {
+                    *context == snapshot.cluster && *cause == Some(MemberCause::Paused)
                 })
-                .collect(),
-        )
+        });
+        if paused_rows {
+            return None;
+        }
+        set_members::empty_state(members)
     }
 
     /// The empty-state block: each member by its full name, why it shows nothing, and what to do.
