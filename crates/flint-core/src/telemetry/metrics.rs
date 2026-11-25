@@ -23,6 +23,9 @@ use crate::cluster::SafeErrorText;
 use crate::metrics::{MetricsError, MetricsList, MetricsResult, NodeMetrics};
 use crate::metrics_trend::TrendStore;
 
+/// The longest the first poll waits for the initial node check.
+const NODES_WAIT: Duration = Duration::from_secs(5);
+
 /// How soon a poll tries a held trend lock again.
 const LOCK_RETRY: Duration = Duration::from_millis(5);
 
@@ -125,15 +128,23 @@ pub(super) async fn run(
     reads: watch::Sender<SideReads>,
 ) {
     // A total needs the node inventory. Polling before the initial check can leave the
-    // dashboard without a total for a full interval even after the watch has opened.
+    // dashboard without a total for a full interval even after the watch has opened, so the
+    // first poll waits for it, but never longer than `NODES_WAIT`.
     let cluster = {
-        let Ok(snapshot) = latest
-            .wait_for(|snapshot| snapshot.kind(WatchedKind::Nodes) != &KindCheck::Starting)
-            .await
-        else {
-            return;
+        let ended = {
+            let waited = tokio::time::timeout(
+                NODES_WAIT,
+                latest
+                    .wait_for(|snapshot| snapshot.kind(WatchedKind::Nodes) != &KindCheck::Starting),
+            )
+            .await;
+            match waited {
+                Ok(Ok(snapshot)) => Some(Arc::clone(&snapshot.cluster)),
+                Ok(Err(_)) => return,
+                Err(_) => None,
+            }
         };
-        Arc::clone(&snapshot.cluster)
+        ended.unwrap_or_else(|| Arc::clone(&latest.borrow().cluster))
     };
     drop(latest);
     let fetch = || read_nodes(&client, &requests);
@@ -264,6 +275,61 @@ mod tests {
                 assert_eq!(total, Some(expected), "{resource:?}");
             }
         }
+        feed.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::disallowed_methods)] // No cluster or credentials: an in-memory transport.
+    async fn metrics_are_polled_when_the_node_check_never_finishes() {
+        let service = tower::service_fn(|request: http::Request<kube::client::Body>| async move {
+            let (status, body) = match request.uri().path() {
+                "/api/v1/nodes"
+                    if request
+                        .uri()
+                        .query()
+                        .is_some_and(|q| q.contains("watch=true")) =>
+                {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    (200, "")
+                }
+                "/api/v1/nodes" => std::future::pending().await,
+                "/apis/metrics.k8s.io/v1beta1/nodes" => (
+                    200,
+                    r#"{"items":[
+                    {"metadata":{"name":"a"},"usage":{"cpu":"250m","memory":"64Mi"}}
+                ]}"#,
+                ),
+                _ => (404, r#"{"kind":"Status","status":"Failure","code":404}"#),
+            };
+            Ok::<_, std::convert::Infallible>(
+                http::Response::builder()
+                    .status(status)
+                    .body(kube::client::Body::from(body.as_bytes().to_vec()))
+                    .unwrap(),
+            )
+        });
+        let trends = Arc::new(Mutex::new(TrendStore::new()));
+        let mut feed = Telemetry::start(
+            "member".into(),
+            Client::new(service, "default"),
+            crate::cluster::Target::of(&Default::default(), "member"),
+            Arc::clone(&trends),
+            TelemetryTiming::default(),
+            RequestGate::default(),
+            60,
+        );
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let snapshot = feed.latest();
+                if snapshot.metrics == (MetricsCheck::Current { nodes: 1 }) {
+                    break;
+                }
+                assert!(feed.changed().await);
+            }
+        })
+        .await
+        .expect("the first metrics poll starts without the node check");
+        assert_eq!(feed.latest().kind(WatchedKind::Nodes), &KindCheck::Starting);
         feed.stop().await;
     }
 
