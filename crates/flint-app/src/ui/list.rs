@@ -1221,6 +1221,7 @@ impl ResourceList {
     fn layout(&self, available: Option<f32>) -> (Vec<(usize, f32)>, usize) {
         let columns = &self.shown_columns;
         let width = |chars: usize| chars as f32 * CHAR_WIDTH + CELL_PADDING;
+        let bar_width = list_usage::BAR_CHARS as f32 * CHAR_WIDTH;
         let (mut drawn, dropped) = list_model::fit_columns(
             columns,
             |i| width(self.widths.chars(i, &columns[i])),
@@ -1231,7 +1232,7 @@ impl ResourceList {
             let name_min = width(list_model::NAME_MIN_CHARS);
             let namespace_min = width(SQUEEZED_NAMESPACE_CHARS);
             let sort = self.query.sort.as_ref();
-            list_usage::shed_usage(&mut drawn, columns, room, |i| {
+            list_usage::shed_usage(&mut drawn, columns, room, bar_width, |i| {
                 sort.is_some_and(|s| columns[i].key() == s.column)
             });
             let rules = list_model::ShedRules {
@@ -1321,13 +1322,18 @@ impl ResourceList {
                 let column = &self.shown_columns[col];
                 let usage_column =
                     matches!(column.role, ColumnRole::CpuUsage | ColumnRole::MemoryUsage);
-                // A usage cell keeps the bar's room out of its text's.
-                let bar_room = if usage_column {
+                // A column too narrow for its bar (see `shed_usage`) shows the value alone, and a
+                // usage cell with a bar keeps the bar's room out of its text's.
+                let with_bar = usage_column
+                    && self
+                        .usage
+                        .bar_fits(column.role, width, CHAR_WIDTH, CELL_PADDING);
+                let bar_room = if with_bar {
                     list_usage::BAR_CHARS as f32 * CHAR_WIDTH
                 } else {
                     0.
                 };
-                let bar = usage_column
+                let bar = with_bar
                     .then(|| self.usage.bar(column.role, row_ix as usize))
                     .flatten();
                 let list_model::CellStyle {

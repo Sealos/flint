@@ -161,6 +161,11 @@ pub(in crate::ui) fn hover(
     text
 }
 
+/// The hover of a reading whose request and limit are not known, which is not the same as none.
+pub(in crate::ui) fn hover_without_budget(used: u64, format: impl Fn(u64) -> String) -> String {
+    format!("Using {}\nRequest and limit: unknown", format(used))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

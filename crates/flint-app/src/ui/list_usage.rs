@@ -147,18 +147,26 @@ impl UsageSource {
                     let Some(&used) = usage.get(&*row.name) else {
                         return RowUsage::unknown();
                     };
-                    let node = capacity.as_ref().and_then(|c| c.node(&row.name));
-                    RowUsage {
-                        usage: Some(used),
-                        cpu: Scale::new(
-                            node.and_then(|n| n.requests.cpu).map(Cpu::nanos),
-                            node.and_then(|n| n.allocatable.cpu).map(Cpu::nanos),
+                    let Some(node) = capacity.as_ref().and_then(|c| c.node(&row.name)) else {
+                        return RowUsage::budget_unknown(used);
+                    };
+                    // Without allocatable there is nothing to scale to: what pods request is a
+                    // tick on that bar, not a bar of its own.
+                    let scale = |requested: Option<u64>, allocatable: Option<u64>| {
+                        allocatable
+                            .map_or_else(Scale::default, |end| Scale::new(requested, Some(end)))
+                    };
+                    RowUsage::measured(
+                        used,
+                        scale(
+                            node.requests.cpu.map(Cpu::nanos),
+                            node.allocatable.cpu.map(Cpu::nanos),
                         ),
-                        memory: Scale::new(
-                            node.and_then(|n| n.requests.memory).map(Memory::bytes),
-                            node.and_then(|n| n.allocatable.memory).map(Memory::bytes),
+                        scale(
+                            node.requests.memory.map(Memory::bytes),
+                            node.allocatable.memory.map(Memory::bytes),
                         ),
-                    }
+                    )
                 }),
                 true,
             ),
@@ -182,19 +190,21 @@ impl UsageSource {
                         let budget = index
                             .as_ref()
                             .and_then(|index| index.get(&row.uid))
-                            .and_then(|pod| pod.budget.for_sample(sample))
-                            .unwrap_or_default();
-                        RowUsage {
-                            usage: Some(sample.usage),
-                            cpu: Scale::new(
+                            .and_then(|pod| pod.budget.for_sample(sample));
+                        let Some(budget) = budget else {
+                            return RowUsage::budget_unknown(sample.usage);
+                        };
+                        RowUsage::measured(
+                            sample.usage,
+                            Scale::new(
                                 budget.requests.cpu.map(Cpu::nanos),
                                 budget.limits.cpu.map(Cpu::nanos),
                             ),
-                            memory: Scale::new(
+                            Scale::new(
                                 budget.requests.memory.map(Memory::bytes),
                                 budget.limits.memory.map(Memory::bytes),
                             ),
-                        }
+                        )
                     }),
                     false,
                 )
@@ -203,11 +213,24 @@ impl UsageSource {
     }
 }
 
+/// What a row's reading is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Reading {
+    /// The poll did not report the row. Its amounts are meaningless.
+    #[default]
+    Unknown,
+    /// Reported, and compared with what the row's scales say.
+    Measured,
+    /// Reported, but what to compare it with is not known: the feed has no record of the pod, or
+    /// the sample covers other containers than the record's budget.
+    BudgetUnknown,
+}
+
 /// One row's reading and what it is compared with.
 #[derive(Debug, Clone, Copy)]
 struct RowUsage {
-    /// `None` if the poll did not report the row.
-    usage: Option<Usage>,
+    reading: Reading,
+    usage: Usage,
     cpu: Scale,
     memory: Scale,
 }
@@ -215,9 +238,27 @@ struct RowUsage {
 impl RowUsage {
     fn unknown() -> Self {
         Self {
-            usage: None,
+            reading: Reading::Unknown,
+            usage: Usage::default(),
             cpu: Scale::default(),
             memory: Scale::default(),
+        }
+    }
+
+    fn budget_unknown(usage: Usage) -> Self {
+        Self {
+            reading: Reading::BudgetUnknown,
+            usage,
+            ..Self::unknown()
+        }
+    }
+
+    fn measured(usage: Usage, cpu: Scale, memory: Scale) -> Self {
+        Self {
+            reading: Reading::Measured,
+            usage,
+            cpu,
+            memory,
         }
     }
 }
@@ -227,7 +268,7 @@ impl RowUsage {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(in crate::ui) struct UsageValues {
     /// Whether the poll reported the row. Its amounts are meaningless otherwise.
-    known: Box<[bool]>,
+    known: Box<[Reading]>,
     cpu: Box<[u64]>,
     memory: Box<[u64]>,
     /// What each row's CPU and memory are compared with.
@@ -247,9 +288,9 @@ impl UsageValues {
         );
         let (mut cpu_scale, mut memory_scale) = (Vec::with_capacity(len), Vec::with_capacity(len));
         for row in rows {
-            known.push(row.usage.is_some());
-            cpu.push(row.usage.map_or(0, |u| u.cpu.nanos()));
-            memory.push(row.usage.map_or(0, |u| u.memory.bytes()));
+            known.push(row.reading);
+            cpu.push(row.usage.cpu.nanos());
+            memory.push(row.usage.memory.bytes());
             cpu_scale.push(row.cpu);
             memory_scale.push(row.memory);
         }
@@ -273,12 +314,10 @@ impl UsageValues {
 
     /// `row`'s amount in `values`, if the poll reported the row.
     fn known_value(&self, values: &[u64], row: usize) -> Option<u64> {
-        self.known
-            .get(row)
-            .copied()
-            .unwrap_or(false)
-            .then(|| values.get(row).copied())
-            .flatten()
+        match self.known.get(row) {
+            Some(Reading::Measured | Reading::BudgetUnknown) => values.get(row).copied(),
+            _ => None,
+        }
     }
 
     /// The text of `row`'s cell, if `role` is a usage column.
@@ -311,6 +350,11 @@ impl UsageValues {
     pub(in crate::ui) fn hover(&self, role: ColumnRole, row: usize) -> Option<String> {
         let (values, scales) = self.of_role(role)?;
         let used = self.known_value(values, row)?;
+        if self.known.get(row) == Some(&Reading::BudgetUnknown) {
+            return Some(list_usage_bar::hover_without_budget(used, |amount| {
+                display(role, amount)
+            }));
+        }
         let labels = if self.nodes { NODE_LABELS } else { POD_LABELS };
         Some(list_usage_bar::hover(
             used,
@@ -320,17 +364,16 @@ impl UsageValues {
         ))
     }
 
-    /// The characters the widest value of the usage column `role` needs, with room for the bar.
+    /// The characters the widest value of the usage column `role` needs, without the bar.
     fn chars(&self, role: ColumnRole) -> usize {
         let widest = self.of_role(role).and_then(|(values, _)| {
             (0..values.len())
                 .filter_map(|row| self.known_value(values, row))
                 .max()
         });
-        let text = widest.map_or(USAGE_CHARS, |value| {
+        widest.map_or(USAGE_CHARS, |value| {
             display(role, value).len().max(USAGE_CHARS)
-        });
-        text + BAR_CHARS
+        })
     }
 
     /// Orders `rows` by the usage column `role`: by share of the limit, else of the request, then
@@ -356,6 +399,10 @@ impl UsageValues {
     }
 }
 
+fn is_usage(role: ColumnRole) -> bool {
+    matches!(role, ColumnRole::CpuUsage | ColumnRole::MemoryUsage)
+}
+
 /// A raw amount as its column shows it.
 fn display(role: ColumnRole, value: u64) -> String {
     match role {
@@ -369,20 +416,30 @@ fn display(role: ColumnRole, value: u64) -> String {
 pub(in crate::ui) fn fit_widths(widths: &mut Vec<usize>, columns: &[Column], usage: &UsageValues) {
     widths.resize(columns.len(), 0);
     for (width, column) in widths.iter_mut().zip(columns) {
-        if matches!(column.role, ColumnRole::CpuUsage | ColumnRole::MemoryUsage) {
-            *width = usage.chars(column.role);
+        if is_usage(column.role) {
+            *width = usage.chars(column.role) + BAR_CHARS;
         }
     }
 }
 
-/// Leaves out Memory, then CPU, while the drawn columns are wider than `room`, so usage never
-/// narrows a name or status. A column for which `keep` holds stays: the list is sorted by it.
+/// Makes room for the other columns while the drawn columns are wider than `room`, so usage never
+/// narrows a name or status: first the usage columns give up their bars (`bar` wide each, and a
+/// column drawn that much narrower than it asks for draws no bar), then Memory goes, then CPU. A
+/// column for which `keep` holds stays: the list is sorted by it.
 pub(in crate::ui) fn shed_usage(
     drawn: &mut Vec<(usize, f32)>,
     columns: &[Column],
     room: f32,
+    bar: f32,
     keep: impl Fn(usize) -> bool,
 ) {
+    if drawn.iter().map(|&(_, width)| width).sum::<f32>() > room {
+        for (i, width) in drawn.iter_mut() {
+            if is_usage(columns[*i].role) {
+                *width -= bar;
+            }
+        }
+    }
     for role in [ColumnRole::MemoryUsage, ColumnRole::CpuUsage] {
         if drawn.iter().map(|&(_, width)| width).sum::<f32>() <= room {
             return;
@@ -430,6 +487,18 @@ impl ListUsage {
     /// The bar of a usage column's cell for the row at `row` of the snapshot drawn.
     pub(in crate::ui) fn bar(&self, role: ColumnRole, row: usize) -> Option<Bar> {
         self.values.bar(role, row, &self.thresholds)
+    }
+
+    /// Whether a usage column drawn `width` wide has room for its bar as well as its values.
+    pub(in crate::ui) fn bar_fits(
+        &self,
+        role: ColumnRole,
+        width: f32,
+        char_width: f32,
+        padding: f32,
+    ) -> bool {
+        let full = (self.values.chars(role) + BAR_CHARS) as f32 * char_width + padding;
+        width + 0.5 >= full
     }
 
     /// What hovering a usage column's cell says for the row at `row` of the snapshot drawn.
@@ -630,9 +699,9 @@ mod tests {
 
     fn collect(usage: &[Option<Usage>]) -> UsageValues {
         UsageValues::collect(
-            usage.iter().map(|&usage| RowUsage {
-                usage,
-                ..RowUsage::unknown()
+            usage.iter().map(|&usage| match usage {
+                Some(usage) => RowUsage::measured(usage, Scale::default(), Scale::default()),
+                None => RowUsage::unknown(),
             }),
             false,
         )
@@ -760,11 +829,8 @@ mod tests {
 
     #[test]
     fn usage_columns_sort_by_share_of_the_limit_then_request_then_raw_value() {
-        let mk = |cpu: u64, scale: Scale| RowUsage {
-            usage: Some(usage(cpu, 1)),
-            cpu: scale,
-            memory: Scale::default(),
-        };
+        let mk =
+            |cpu: u64, scale: Scale| RowUsage::measured(usage(cpu, 1), scale, Scale::default());
         let values = UsageValues::collect(
             [
                 mk(500, Scale::default()),
@@ -954,13 +1020,70 @@ mod tests {
         let all = vec![(0, 100.), (1, 50.), (2, 50.)];
         let kept = |room: f32, sorted: Option<usize>| {
             let mut drawn = all.clone();
-            shed_usage(&mut drawn, &columns, room, |i| Some(i) == sorted);
+            shed_usage(&mut drawn, &columns, room, 0., |i| Some(i) == sorted);
             drawn.iter().map(|&(i, _)| i).collect::<Vec<_>>()
         };
         assert_eq!(kept(200., None), [0, 1, 2]);
         assert_eq!(kept(150., None), [0, 1]);
         assert_eq!(kept(100., None), [0]);
         assert_eq!(kept(100., Some(2)), [0, 2]);
+    }
+
+    #[test]
+    fn a_narrow_list_drops_the_bars_before_a_usage_column() {
+        let columns = [
+            Column::synthetic("Name", ColumnType::String, ColumnRole::Name),
+            Column::synthetic("CPU", ColumnType::Number, ColumnRole::CpuUsage),
+            Column::synthetic("Memory", ColumnType::Number, ColumnRole::MemoryUsage),
+        ];
+        let all = vec![(0, 100.), (1, 70.), (2, 70.)];
+        let shed = |room: f32| {
+            let mut drawn = all.clone();
+            shed_usage(&mut drawn, &columns, room, 20., |_| false);
+            drawn
+        };
+        assert_eq!(shed(240.), all);
+        // Without bars the columns are 50 wide each and still fit.
+        assert_eq!(shed(200.), [(0, 100.), (1, 50.), (2, 50.)]);
+        assert_eq!(shed(150.), [(0, 100.), (1, 50.)]);
+    }
+
+    #[test]
+    fn a_reading_with_no_known_budget_says_so_and_a_node_needs_allocatable() {
+        let key = ("a".to_owned(), "web".to_owned());
+        let source = UsageSource::Pods(
+            Arc::new([(key, sample(10, 10))].into_iter().collect()),
+            None,
+        );
+        let values = source.values(&[web_row()]);
+        assert_eq!(
+            values.hover(ColumnRole::CpuUsage, 0).unwrap(),
+            "Using 10m\nRequest and limit: unknown"
+        );
+
+        use flint_core::telemetry::{Allocatable, NodeCapacity, Reserved};
+        let capacity = ClusterCapacity {
+            nodes: Arc::new([NodeCapacity {
+                name: "n1".into(),
+                allocatable: Allocatable::default(),
+                requests: Reserved {
+                    cpu: Some(Cpu::from_nanos(1_000_000_000)),
+                    memory: None,
+                },
+                limits: Reserved::default(),
+                pods: None,
+            }]),
+        };
+        let source = UsageSource::Nodes(
+            Arc::new([("n1".to_owned(), usage(2000, 5))].into_iter().collect()),
+            Some(capacity),
+        );
+        let values = source.values(&[row(None, "n1")]);
+        assert_eq!(
+            values.bar(ColumnRole::CpuUsage, 0, &Thresholds::default()),
+            None
+        );
+        assert_eq!(values.text(ColumnRole::CpuUsage, 0).unwrap(), "2000m");
     }
 
     #[test]
