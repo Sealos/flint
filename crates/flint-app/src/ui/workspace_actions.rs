@@ -350,7 +350,7 @@ impl Workspace {
             )
             .when::<GoBack>(|ws, cx| ws.can_go_back(cx))
             .add::<SetNamespaces>(
-                |ws, _| ws.cluster.is_some(),
+                |ws, _| ws.namespace_filter_applies(),
                 |_, a, _| match a.namespaces.iter().any(|n| n.trim().is_empty()) {
                     true => Err(ActionError::rejected::<SetNamespaces>(
                         "empty namespace name",
@@ -359,14 +359,14 @@ impl Workspace {
                 },
             )
             .add::<ToggleNamespace>(
-                |ws, _| ws.cluster.is_some(),
+                |ws, _| ws.namespace_filter_applies(),
                 |_, a, _| check_name::<ToggleNamespace>(&a.namespace),
             )
             .add::<AddNamespace>(
-                |ws, _| ws.cluster.is_some(),
+                |ws, _| ws.namespace_filter_applies(),
                 |_, a, _| check_name::<AddNamespace>(&a.namespace),
             )
-            .when::<ShowAllNamespaces>(|ws, _| ws.cluster.is_some())
+            .when::<ShowAllNamespaces>(|ws, _| ws.namespace_filter_applies())
             .when::<OpenNamespaceFilter>(|ws, cx| ws.namespace_filter_shown(cx))
             .when::<NamespacePickerNext>(|ws, _| ws.namespace_popover_open)
             .when::<NamespacePickerPrevious>(|ws, _| ws.namespace_popover_open)
@@ -1204,7 +1204,18 @@ impl Workspace {
                 let leaves = self.cluster.as_deref() != Some(action.cluster.as_str())
                     && !self.sets.has_member(Some(&action.cluster))
                     && !self.edit_is_on(&action.cluster, cx);
+                // A cluster outside the open set leaves it, also when it is the active one.
+                let leaves_set =
+                    self.sets.is_open() && !self.sets.has_member(Some(&action.cluster));
                 let again = action.clone();
+                if leaves_set
+                    && self.asks_before_leaving_set(window, cx, {
+                        let again = again.clone();
+                        move |ws, window, cx| ws.select_cluster(&again, window, cx)
+                    })
+                {
+                    return;
+                }
                 if leaves
                     && self.asks_before_leaving(window, cx, move |ws, window, cx| {
                         ws.select_cluster(&again, window, cx)
@@ -1215,7 +1226,14 @@ impl Workspace {
                 let cluster = action.cluster.clone();
                 // The sidebar's cursor follows the cluster picked, however it was picked.
                 self.sidebar_cursor = Some(cluster.clone());
+                let already_active = self.cluster.as_deref() == Some(cluster.as_str());
                 self.model.update(cx, |m, _| m.activate(cluster));
+                if leaves_set && already_active {
+                    // The core ignores activating the active cluster, so nothing else closes the
+                    // set: show what this cluster had before.
+                    self.close_list(cx);
+                    self.sync(window, cx);
+                }
             }
             Err(e) => tracing::warn!("{e}"),
         }

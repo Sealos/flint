@@ -23,12 +23,14 @@ use flint_core::keep_watching::BackgroundSignIn;
 use flint_core::settings::{ClusterPin, Settings, SettingsError};
 use flint_core::{ClusterId, ClusterSummary, KindId, KindSnapshot, NavEntry, SyncState};
 use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, Theme, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Theme,
+    h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -64,6 +66,10 @@ pub(super) struct ClusterSets {
     picked: Vec<ClusterPin>,
     saved: Vec<ClusterSet>,
     name_input: Entity<InputState>,
+    /// The set bar's own name field, for saving the set that is open.
+    bar_name_input: Entity<InputState>,
+    /// Set while a confirmed discard of an unsaved set runs its action.
+    leave_confirmed: bool,
     error: Option<String>,
     pub(super) running: Option<RunningSet>,
     /// The newest admission still waiting for the core's answer.
@@ -72,6 +78,7 @@ pub(super) struct ClusterSets {
     /// Tabs opened from a set's row, with the member they stay bound to after the set closes.
     tab_pins: HashMap<u64, AdmittedMember>,
     pub(super) restart: Task<()>,
+    _enter: Vec<Subscription>,
     _admit: Task<()>,
     _io: Task<()>,
 }
@@ -95,6 +102,8 @@ pub(super) struct RunningSet {
     label: String,
     /// The saved set this view shows, which a rename or delete of it carries over to this view.
     set_id: Option<String>,
+    /// Which opening made this view, so a late answer about another view is not applied to it.
+    token: u64,
     members: Vec<AdmittedMember>,
     /// Members that left their admitted server: their rows are gone and stay gone.
     changed: HashSet<ClusterId>,
@@ -130,13 +139,38 @@ impl RunningSet {
     }
 }
 
+pub(super) fn sidebar_set_members(run: Option<&RunningSet>) -> Option<Vec<&str>> {
+    run.map(|run| run.current_members().map(AdmittedMember::context).collect())
+}
+
 impl ClusterSets {
     pub(super) fn new(window: &mut Window, cx: &mut Context<Workspace>) -> Self {
+        let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Set name"));
+        let bar_name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Set name"));
+        // Return saves, as the Save Set button beside the field does.
+        let _enter = [&name_input, &bar_name_input]
+            .into_iter()
+            .map(|input| {
+                cx.subscribe_in(input, window, |ws, input, event, window, cx| {
+                    if let InputEvent::PressEnter { .. } = event {
+                        let name = input.read(cx).value().trim().to_owned();
+                        // This listener holds the workspace, so it cannot go through the
+                        // registry's guards: it asks the same questions.
+                        if !name.is_empty() && ws.sets.can_save() {
+                            ws.save_set(&SaveClusterSet { name }, window, cx);
+                        }
+                    }
+                })
+            })
+            .collect();
         Self {
             picking: false,
             picked: Vec::new(),
             saved: Vec::new(),
-            name_input: cx.new(|cx| InputState::new(window, cx).placeholder("Set name")),
+            name_input,
+            bar_name_input,
+            _enter,
+            leave_confirmed: false,
             error: None,
             running: None,
             opening: None,
@@ -206,6 +240,23 @@ impl ClusterSets {
 
     pub(super) fn picking(&self) -> bool {
         self.picking
+    }
+
+    /// Whether the open set is one that was never saved.
+    pub(super) fn is_unsaved(&self) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|run| run.set_id.is_none())
+    }
+
+    /// Whether a set can be saved now: the clusters being chosen, or else the open unsaved set.
+    fn can_save(&self) -> bool {
+        match self.picking {
+            true => {
+                (MIN_CLUSTER_SET_MEMBERS..=MAX_CLUSTER_SET_MEMBERS).contains(&self.picked.len())
+            }
+            false => self.is_unsaved(),
+        }
     }
 
     fn is_picked(&self, cluster: &str) -> bool {
@@ -385,10 +436,7 @@ impl Workspace {
             })
             .add::<TogglePickedCluster>(|_, _| true, |ws, a, cx| ws.check_pick(a, cx))
             .add::<SaveClusterSet>(
-                |ws, _| {
-                    (MIN_CLUSTER_SET_MEMBERS..=MAX_CLUSTER_SET_MEMBERS)
-                        .contains(&ws.sets.picked.len())
-                },
+                |ws, _| ws.sets.can_save(),
                 |_, a, _| match a.name.trim().is_empty() {
                     true => Err(ActionError::rejected::<SaveClusterSet>("the name is empty")),
                     false => Ok(()),
@@ -497,7 +545,17 @@ impl Workspace {
             return;
         }
         self.sets.error = None;
-        // A Cmd-click starts choosing from outside the choosing mode.
+        // A Cmd-click from an empty selection combines the active and clicked clusters.
+        if !self.sets.picking
+            && self.sets.picked.is_empty()
+            && let Some(active) = self.model.read(cx).active_cluster()
+            && active.info.name != action.cluster
+            && let Some(server) = &active.info.server
+        {
+            self.sets
+                .picked
+                .push(ClusterPin::new(active.info.name.clone(), server.clone()));
+        }
         self.sets.picking = true;
         let at = self
             .sets
@@ -721,6 +779,10 @@ impl Workspace {
         let is_it = |set_id: &Option<String>| set_id.as_deref() == Some(id);
         let open = self.sets.running.as_ref().is_some_and(|r| is_it(&r.set_id));
         let pending = self.sets.opening.as_ref().is_some_and(|o| is_it(&o.set_id));
+        if pending {
+            // Called off whatever is answered about the view that is open.
+            self.sets.opening = None;
+        }
         if open || (pending && self.sets.is_open()) {
             self.close_set(&CloseClusterSet, window, cx);
         } else if pending {
@@ -741,7 +803,12 @@ impl Workspace {
     }
 
     fn save_set(&mut self, action: &SaveClusterSet, window: &mut Window, cx: &mut Context<Self>) {
-        let pins = self.picked_pins(cx);
+        // Choosing clusters saves what was chosen; otherwise the open set is saved as it runs.
+        let from_picking = self.sets.picking;
+        let pins = match from_picking {
+            true => self.picked_pins(cx),
+            false => self.running_pins(),
+        };
         // A set saved now must name the clusters that were chosen, on the servers they were.
         let names = self.cluster_names(cx);
         let refused = pins.iter().find_map(|pin| {
@@ -753,14 +820,112 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let name = action.name.clone();
-        let input = self.sets.name_input.clone();
+        let name = action.name.trim().to_owned();
+        let saved_as = name.clone();
+        let saved_view = self.sets.running.as_ref().map(|run| run.token);
+        let saved_pins = pins.clone();
+        let inputs = [
+            self.sets.name_input.clone(),
+            self.sets.bar_name_input.clone(),
+        ];
         self.write_sets(
             move |dir| create_cluster_set(dir, &name, &pins),
-            move |_, window, cx| input.update(cx, |input, cx| input.set_value("", window, cx)),
+            move |ws, window, cx| {
+                // Only what this save owns changes: a newer choice or name stays as typed.
+                for input in &inputs {
+                    if input.read(cx).value().trim() == saved_as {
+                        input.update(cx, |input, cx| input.set_value("", window, cx));
+                    }
+                }
+                if from_picking {
+                    let same = ws.sets.picked.len() == saved_pins.len()
+                        && saved_pins.iter().all(|p| ws.sets.is_picked(&p.context));
+                    if same {
+                        ws.sets.picking = false;
+                        ws.sets.picked.clear();
+                    }
+                } else {
+                    ws.adopt_saved(&saved_as, saved_view, cx);
+                }
+            },
             window,
             cx,
         );
+    }
+
+    /// The open set's members, as the pins it runs on.
+    fn running_pins(&self) -> Vec<ClusterPin> {
+        self.sets.running.as_ref().map_or_else(Vec::new, |run| {
+            run.members.iter().map(|m| m.pin().clone()).collect()
+        })
+    }
+
+    /// Makes the unsaved open set the saved set `name`, just written.
+    fn adopt_saved(&mut self, name: &str, view: Option<u64>, cx: &mut Context<Self>) {
+        let Some(id) = self.saved_id(name) else {
+            return;
+        };
+        let still_it = |r: &&mut RunningSet| r.set_id.is_none() && Some(r.token) == view;
+        if let Some(run) = self.sets.running.as_mut().filter(still_it) {
+            run.set_id = Some(id.clone());
+            self.relabel_running(&id, cx);
+        }
+    }
+
+    /// Asks before an unsaved open set is lost: `true` if the caller must stop. Discard runs
+    /// `then` (which closes the set as it goes); Save... puts the cursor in the set bar's name
+    /// field; Keep open changes nothing.
+    pub(in crate::ui) fn asks_before_leaving_set(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> bool {
+        if self.sets.leave_confirmed || !self.sets.is_unsaved() {
+            return false;
+        }
+        if window.has_active_dialog(cx) {
+            return true;
+        }
+        let dialog = DialogText {
+            title: "Leave this unsaved set?".into(),
+            text: "This set was opened together and has not been saved. Leaving it closes it, \
+                   and it can only be opened again by choosing its clusters again."
+                .into(),
+            ok: "Discard".into(),
+            cancel: "Keep open".into(),
+            id: "unsaved-set-description",
+            default_cancel: false,
+        };
+        let workspace = cx.weak_entity();
+        let again = workspace.clone();
+        confirm::open_with_alternative(
+            window,
+            cx,
+            dialog,
+            "Save\u{2026}".into(),
+            move |window, cx| {
+                let _ = workspace.update(cx, |ws, cx| {
+                    ws.sets.leave_confirmed = true;
+                    then(ws, window, cx);
+                    ws.sets.leave_confirmed = false;
+                });
+            },
+            move |window, cx| {
+                let _ = again.update(cx, |ws, cx| {
+                    // The bar's field is shown only when not choosing: stop choosing first.
+                    ws.sets.picking = false;
+                    ws.sets.picked.clear();
+                    let input = ws.sets.bar_name_input.clone();
+                    cx.notify();
+                    cx.defer_in(window, move |_, window, cx| {
+                        input.update(cx, |input, cx| input.focus(window, cx));
+                    });
+                });
+            },
+        );
+        cx.notify();
+        true
     }
 
     /// Asks the core to run `pins` as the set, and opens their combined list with the members it
@@ -776,6 +941,13 @@ impl Workspace {
         // As asked for: opening again after a question must open the same set.
         let again = (pins.clone(), saved.clone());
         if self.asks_before_leaving(window, cx, move |ws, window, cx| {
+            let (pins, saved) = again.clone();
+            ws.open_set(pins, saved, window, cx);
+        }) {
+            return;
+        }
+        let again = (pins.clone(), saved.clone());
+        if self.asks_before_leaving_set(window, cx, move |ws, window, cx| {
             let (pins, saved) = again.clone();
             ws.open_set(pins, saved, window, cx);
         }) {
@@ -836,8 +1008,12 @@ impl Workspace {
         if self.sets.opening.as_ref().map(|o| o.token) != Some(token) {
             // Closed while the core was admitting it, and nothing newer is on its way.
             let admitted = opened.is_ok_and(|set| !set.members.is_empty());
-            if self.sets.opening.is_none() && !self.sets.is_open() && admitted {
-                drop(self.model.read(cx).core().admit_running_set(Vec::new()));
+            if self.sets.opening.is_none() && admitted {
+                match self.sets.is_open() {
+                    false => drop(self.model.read(cx).core().admit_running_set(Vec::new())),
+                    // Called off while another view stays open: the core runs that one.
+                    true => self.restore_core_set(cx),
+                }
             }
             return;
         }
@@ -877,6 +1053,7 @@ impl Workspace {
         );
         if let Some(run) = &mut self.sets.running {
             run.set_id = set_id;
+            run.token = token;
             run.left_out = left_out;
         }
         self.refresh_set_kinds(cx);
@@ -954,6 +1131,7 @@ impl Workspace {
         self.sets.running = Some(RunningSet {
             label,
             set_id: None,
+            token: 0,
             members,
             changed: gone.changed,
             disconnected: gone.disconnected,
@@ -1431,10 +1609,17 @@ impl Workspace {
         }) {
             return;
         }
+        if self.asks_before_leaving_set(window, cx, |ws, window, cx| {
+            ws.close_set(&CloseClusterSet, window, cx)
+        }) {
+            return;
+        }
         self.close_list(cx);
         let focus = self.focus.clone();
         window.focus(&focus, cx);
         release_unfocused_input(window, cx);
+        // Back to what the active cluster shows: its last kind, or its overview.
+        self.sync(window, cx);
         cx.notify();
     }
 
@@ -1675,6 +1860,22 @@ impl Workspace {
                     }),
             )
             .child(div().flex_1())
+            .when(run.set_id.is_none() && !self.sets.picking, |el| {
+                let typed = self.sets.bar_name_input.read(cx).value().trim().to_string();
+                el.child(
+                    div()
+                        .w(px(140.))
+                        .child(Input::new(&self.sets.bar_name_input).xsmall()),
+                )
+                .child(
+                    Button::new("save-open-set")
+                        .xsmall()
+                        .outline()
+                        .disabled(typed.is_empty())
+                        .label("Save Set")
+                        .on_click(registry::on_click(SaveClusterSet { name: typed })),
+                )
+            })
             .child(if run.dashboard.is_some() {
                 Button::new("show-set-list")
                     .xsmall()
@@ -1708,9 +1909,15 @@ impl Workspace {
         })
     }
 
-    /// The sidebar's foot: saved sets, and the controls for choosing clusters.
-    pub(super) fn render_sets_panel(&self, theme: &Theme, cx: &App) -> impl IntoElement {
+    /// The sidebar's foot: cluster sets and the controls for choosing clusters.
+    pub(super) fn render_sets_panel(
+        &self,
+        open_count: Option<usize>,
+        theme: &Theme,
+        cx: &App,
+    ) -> impl IntoElement {
         let sets = &self.sets;
+        let open_id = sets.running.as_ref().and_then(|run| run.set_id.as_deref());
         let count = sets.picked.len();
         let can_run = (MIN_CLUSTER_SET_MEMBERS..=MAX_CLUSTER_SET_MEMBERS).contains(&count);
         let typed = sets.name_input.read(cx).value().trim().to_string();
@@ -1723,8 +1930,26 @@ impl Workspace {
             .border_t_1()
             .border_color(theme.sidebar_border)
             .text_xs()
+            .when(!sets.saved.is_empty(), |el| {
+                el.child(
+                    div()
+                        .id("saved-sets-heading")
+                        .px_1()
+                        .text_color(theme.muted_foreground)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Saved Sets"),
+                )
+            })
             .children(sets.saved.iter().map(|set| {
                 let name = set.name.clone();
+                let count = open_count
+                    .filter(|_| open_id == Some(set.id.as_str()))
+                    .unwrap_or(set.members.len());
+                let open = self
+                    .sets
+                    .running
+                    .as_ref()
+                    .is_some_and(|run| run.set_id.as_deref() == Some(set.id.as_str()));
                 div()
                     .id(SharedString::from(format!("set-menu-{name}")))
                     .w_full()
@@ -1733,18 +1958,38 @@ impl Workspace {
                             .xsmall()
                             .ghost()
                             .w_full()
+                            .justify_start()
+                            .icon(Icon::new(if open {
+                                IconName::Check
+                            } else {
+                                IconName::Folder
+                            }))
                             .label(name.clone())
+                            .accessibility_label(format!("{name} ({count})"))
+                            .child(div().flex_none().child(format!("({count})")))
+                            .selected(open)
                             .on_click(registry::on_click(OpenClusterSet { name: name.clone() })),
                     )
                     .context_menu(move |menu, _, _| {
-                        menu.item(PopupMenuItem::new("Rename…").on_click(registry::on_click(
-                            RenameClusterSet { name: name.clone() },
-                        )))
-                        .item(PopupMenuItem::new("Delete…").on_click(registry::on_click(
-                            DeleteClusterSet { name: name.clone() },
-                        )))
+                        menu.item(PopupMenuItem::new("Rename\u{2026}").on_click(
+                            registry::on_click(RenameClusterSet { name: name.clone() }),
+                        ))
+                        .item(PopupMenuItem::new("Delete\u{2026}").on_click(
+                            registry::on_click(DeleteClusterSet { name: name.clone() }),
+                        ))
                     })
             }))
+            .when_some(open_count.filter(|_| open_id.is_none()), |el, count| {
+                let label = format!("Open set ({count})");
+                el.child(
+                    div()
+                        .id("open-unsaved-set")
+                        .aria_label(label.clone())
+                        .text_center()
+                        .child(label)
+                        .test_support(),
+                )
+            })
             .child(
                 Button::new("toggle-cluster-picking")
                     .xsmall()
