@@ -70,7 +70,7 @@ impl DetailUsage {
                 .cloned()
                 .and_then(|list| serde_json::from_value::<BTreeMap<String, Quantity>>(list).ok())
                 .map(|list| Budget::Node(Amounts::from_quantities(&list))),
-            None => None,
+            Some(UsageSubject::Workloads(_)) | None => None,
         };
     }
 
@@ -82,6 +82,8 @@ impl DetailUsage {
                 self.source.hint().map(UsagePanel::Hint)
             }
             UsageSource::Unknown => Some(unknown_lines()),
+            // A workload's pane shows no usage yet.
+            UsageSource::Workloads(..) => None,
             UsageSource::Nodes(usage, _) => Some(match usage.get(name) {
                 Some(&used) => {
                     let allocatable = match self.budget {

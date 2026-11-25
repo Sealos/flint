@@ -32,11 +32,11 @@ fn has_usage_columns(state: &Value) -> bool {
     columns.contains(&json!("CPU")) || columns.contains(&json!("Memory"))
 }
 
-// covers UP-61: with metrics-server the pod list shows the CPU and Memory columns, wide enough
-// that none is shed.
+// covers UP-61: with metrics-server the pod and workload lists show the CPU and Memory columns,
+// wide enough that none is shed.
 #[test]
 #[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
-fn up_61_with_metrics_server_the_pod_list_shows_cpu_and_memory() -> Result<()> {
+fn up_61_with_metrics_server_the_pod_and_workload_lists_show_cpu_and_memory() -> Result<()> {
     let (cluster, app) = fake_app(Options::default())?;
     cluster.fake_server().expect("a fake server").set_metrics(
         &MetricsTarget::pod("demo", "crash-loop"),
@@ -47,6 +47,12 @@ fn up_61_with_metrics_server_the_pod_list_shows_cpu_and_memory() -> Result<()> {
     app.wait_for("/list/columns", Contains(json!("CPU")))?;
     app.wait_for("/list/columns", Contains(json!("Memory")))?;
     app.screenshot_themes("up61-pod-usage-bars")?;
+
+    // The workload lists carry the same columns, as totals over their pods.
+    app.open_view("deployments")?;
+    app.wait_for("/list/sync", Equals("live".into()))?;
+    app.wait_for("/list/columns", Contains(json!("CPU")))?;
+    app.wait_for("/list/columns", Contains(json!("Memory")))?;
     Ok(())
 }
 
