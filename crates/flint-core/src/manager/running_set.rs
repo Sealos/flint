@@ -382,6 +382,7 @@ impl ClusterManager {
     /// under consent is dropped either way, and the selected cluster connects again.
     pub(super) fn leave_set(&mut self, id: &str) {
         self.members.remove(id);
+        self.drop_member_sign_in(id);
         self.schedule.dequeue(&id.to_owned());
         let active = self.active.as_deref() == Some(id);
         let mut dropped = false;

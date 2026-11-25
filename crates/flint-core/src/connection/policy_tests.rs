@@ -717,3 +717,58 @@ fn the_not_allowed_error_names_no_command() {
     assert!(is_not_allowed(&text));
     assert!(text.to_string().contains("select the cluster"));
 }
+
+// A member signed in once from the set view starts its plugin once in the background, after
+// the definition check; a second start there is refused and ends the access. Selected, it runs
+// as a selected cluster's does.
+#[tokio::test]
+async fn a_sign_in_once_starts_once_in_the_background() {
+    let checks = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&checks);
+    let verify = SendCheck::new(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    });
+    let access = CredentialAccess::signed_in_once(Role::Background, verify);
+    let grant = access.grant(CredentialSource::Plugin);
+    assert!(grant.allowed());
+    assert!(!access.unattended(), "the person who clicked is there");
+    assert!(!access.grant(CredentialSource::AuthProvider).allowed());
+    let first = grant.lease();
+    assert!(
+        first.launch_refusal().await.is_none(),
+        "the start asked for"
+    );
+    assert_eq!(
+        checks.load(Ordering::SeqCst),
+        1,
+        "the definition was checked"
+    );
+    assert!(grant.lease().holds(), "the connection it made goes on");
+
+    access.set_role(Role::Foreground);
+    assert!(grant.lease().launch_refusal().await.is_none(), "selected");
+    access.set_role(Role::Background);
+    assert_eq!(checks.load(Ordering::SeqCst), 1);
+
+    let again = grant.lease();
+    assert!(again.launch_refusal().await.is_some(), "no second start");
+    assert!(!again.holds() && !first.holds(), "the access ended");
+    assert!(!grant.allowed());
+    access.set_role(Role::Foreground);
+    assert!(!grant.allowed(), "for good");
+}
+
+// Verified as refused, the start still uses the click up: nothing retries it.
+#[tokio::test]
+async fn a_refused_sign_in_once_is_used_up() {
+    let verify = SendCheck::new(|| Box::pin(async { Err("changed".to_owned()) }));
+    let access = CredentialAccess::signed_in_once(Role::Background, verify);
+    let grant = access.grant(CredentialSource::Plugin);
+    assert_eq!(
+        grant.lease().launch_refusal().await.as_deref(),
+        Some("changed")
+    );
+    assert!(grant.lease().launch_refusal().await.is_some());
+    assert!(!grant.allowed());
+}

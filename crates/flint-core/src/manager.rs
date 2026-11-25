@@ -42,6 +42,7 @@ mod forwards;
 mod helm;
 mod keep_watching;
 mod keep_watching_lists;
+mod member_sign_in;
 mod running_set;
 mod selected_retry;
 mod telemetry;
@@ -548,6 +549,8 @@ pub(crate) struct ClusterManager {
     active: Option<ClusterId>,
     /// Clusters kept running beside the active one ([`Command::SetRunningSet`]).
     members: HashMap<ClusterId, Member>,
+    /// Sign-ins of members asked for from the set view, until their next attempt starts.
+    signing_in: HashMap<ClusterId, member_sign_in::PendingSignIn>,
     /// When members' background connection attempts may start.
     schedule: Schedule<ClusterId>,
     /// Automatic retries of the selected cluster.
@@ -637,6 +640,7 @@ impl ClusterManager {
             clusters: Vec::new(),
             active: None,
             members: HashMap::new(),
+            signing_in: HashMap::new(),
             schedule: Schedule::default(),
             retries: Default::default(),
             disconnects: Default::default(),
@@ -1030,6 +1034,14 @@ impl ClusterManager {
             }
             Request::CheckMember { member, reply } => {
                 let _ = reply.send(self.member_changed(&member));
+            }
+            Request::SignInMember {
+                member,
+                definition,
+                shown,
+                reply,
+            } => {
+                let _ = reply.send(self.sign_in_member(&member, definition, shown));
             }
             Request::HelmPin { cluster, reply } => {
                 let _ = reply.send(self.helm_pin(&cluster));
@@ -2657,14 +2669,17 @@ impl ClusterManager {
             return;
         }
         self.next_attempt += 1;
-        // A member in the background signs in under its keep-watching consent, if it has one,
-        // and never with a prompt.
-        let consent = (role == Role::Background && self.members.contains_key(id))
+        // A member in the background signs in once if the person just asked for it from the set
+        // view. Otherwise it signs in under its keep-watching consent, if it has one, and never
+        // with a prompt.
+        let once = self.take_member_sign_in(id, role);
+        let consent = (once.is_none() && role == Role::Background && self.members.contains_key(id))
             .then(|| self.member_consent(id))
             .flatten();
-        let access = match consent {
-            Some(consent) => self.member_access(id, attempt, consent),
-            None => CredentialAccess::new(Arc::new(ForegroundOnly), role),
+        let access = match (once, consent) {
+            (Some(once), _) => once,
+            (None, Some(consent)) => self.member_access(id, attempt, consent),
+            (None, None) => CredentialAccess::new(Arc::new(ForegroundOnly), role),
         };
         let no_prompt = access.unattended().then(|| {
             let mut merged = kubeconfig.merged.clone();

@@ -359,11 +359,12 @@ impl ClusterManager {
         self.keep.offers.clear();
         self.keep.feeds.retain(|_, kept| !kept.runs_plugin);
         self.keep.grants.revoke_members();
+        self.drop_member_sign_ins();
         self.void_broken_consents();
     }
 
     /// How `id` signs in on the current load. An answer read from an older load is never used.
-    fn sign_in(&self, id: &str) -> Arc<SignIn> {
+    pub(super) fn sign_in(&self, id: &str) -> Arc<SignIn> {
         self.keep
             .sign_ins
             .as_ref()
@@ -679,6 +680,22 @@ impl ClusterManager {
             SignIn::Plugin(definition) if consent.holds(definition) => Some(Arc::clone(consent)),
             _ => None,
         }
+    }
+
+    /// A seal over `id`'s plugin definition and the program it runs now, if `shown` names that
+    /// definition in a view ([`KeepWatchView::shown_sign_in`]): what a view showed is what runs.
+    pub(super) fn seal_shown_plugin(&self, id: &str, shown: u64) -> Result<PluginConsent, String> {
+        let sign_in = self.sign_in(id);
+        let SignIn::Plugin(definition) = &*sign_in else {
+            return Err(format!("\"{id}\" does not sign in through a command."));
+        };
+        if self.keep.view_key.as_ref().map(|key| key.name(definition)) != Some(shown) {
+            return Err(format!(
+                "\"{id}\" changed. Check its sign-in and try again."
+            ));
+        }
+        PluginConsent::seal(definition)
+            .ok_or_else(|| "Flint could not record this choice.".to_owned())
     }
 
     /// Access for a connection of running-set member `id` made in the background under
@@ -1012,18 +1029,9 @@ impl ClusterManager {
         let Some(server) = server else {
             return Err(format!("\"{id}\" names no server."));
         };
-        let sign_in = self.sign_in(id);
-        let SignIn::Plugin(definition) = &*sign_in else {
-            return Err(format!("\"{id}\" does not sign in through a command."));
-        };
-        if self.keep.view_key.as_ref().map(|key| key.name(definition)) != Some(shown) {
-            return Err(format!(
-                "\"{id}\" changed. Check its sign-in and try again."
-            ));
-        }
-        let unrecorded = || "Flint could not record this choice.".to_owned();
-        let consent = PluginConsent::seal(definition).ok_or_else(unrecorded)?;
-        let ticket = OfferTicket::new().ok_or_else(unrecorded)?;
+        let consent = self.seal_shown_plugin(id, shown)?;
+        let ticket =
+            OfferTicket::new().ok_or_else(|| "Flint could not record this choice.".to_owned())?;
         self.keep.offers.insert(
             id.to_owned(),
             PendingOffer {
