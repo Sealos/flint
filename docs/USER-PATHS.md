@@ -45,8 +45,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **Then** the sidebar lists every context once, with the first definition winning across files. Long EKS ARNs show a short
   name, with the full context in a tooltip. **No network request is made.**
 - On every launch, relaunches included, the main area shows the home screen. Each cluster kept watching (UP-123) has a
-  card in sidebar order, read only from its background watch: watching or sign-in needed, problem counts with the
-  lists they count, nodes and pods, the Kubernetes version, CPU and memory, and its latest alert. Every other cluster
+  card in sidebar order, read only from its background watch: watching or sign-in needed, problem counts, nodes
+  and pods, the Kubernetes version, CPU and memory, and its latest alert. Every other cluster
   is listed as not watched, with Open and Keep Watching; Keep Watching asks for background sign-in consent as the row
   menu does. With no cluster kept watching, every context is listed. The home screen connects nothing. Clusters in a
   set are not grouped.

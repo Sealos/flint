@@ -17,7 +17,8 @@ use gpui_kit::component::{Selectable as _, Sizable as _, Theme};
 use gpui_kit::*;
 use jiff::Timestamp;
 
-use super::super::dashboard::cluster_card::{CardActions, ClusterRead};
+use super::super::dashboard::FeedId;
+use super::super::dashboard::cluster_card::{CardActions, CardTarget, ClusterRead};
 use super::super::dashboard::set::AGE_OUT_INTERVAL;
 use super::super::home::{self, HomeCard, HomePlan, HomeRead, HomeRow, HomeView};
 use super::super::registry::{self, OpenHome, SelectCluster};
@@ -105,6 +106,10 @@ impl Workspace {
             return false;
         }
         let model = self.model.read(cx);
+        // With no context at all, the main area keeps saying where Flint looked.
+        if !model.loaded || model.clusters.is_empty() {
+            return false;
+        }
         self.home.open
             || (model.loaded
                 && !model.clusters.is_empty()
@@ -179,9 +184,15 @@ impl Workspace {
         self.home._read = Some(cx.spawn(async move |this, cx| {
             let cards = job.await;
             let _ = this.update(cx, |ws, cx| {
-                ws.home.cards = cards;
                 ws.home.reading = false;
-                if std::mem::take(&mut ws.home.dirty) {
+                // Read from a feed that has since been replaced or stopped: read again.
+                let stale = cards
+                    .iter()
+                    .any(|card| !ws.feed_still_runs(card.cluster(), card.card.feed.as_ref(), cx));
+                if !stale {
+                    ws.home.cards = cards;
+                }
+                if std::mem::take(&mut ws.home.dirty) || stale {
                     ws.refresh_home(cx);
                 }
                 cx.notify();
@@ -189,12 +200,25 @@ impl Workspace {
         }));
     }
 
-    /// The card read for `cluster` in its present state, if any.
-    fn home_card(&self, cluster: &str, status: KeepWatching) -> Option<&HomeCard> {
-        self.home
-            .cards
-            .iter()
-            .find(|card| card.cluster() == cluster && card.status == status)
+    /// Whether `cluster`'s feed is still `feed`, the one a card was read from (`None`: the card
+    /// read no feed, so nothing can have gone stale).
+    fn feed_still_runs(&self, cluster: &str, feed: Option<&FeedId>, cx: &App) -> bool {
+        feed.is_none_or(|feed| {
+            self.model
+                .read(cx)
+                .core()
+                .telemetry(cluster)
+                .is_some_and(|telemetry| FeedId::of(&telemetry) == *feed)
+        })
+    }
+
+    /// The card read for `cluster` in its present state and from the feed it runs now, if any.
+    fn home_card(&self, cluster: &str, status: KeepWatching, cx: &App) -> Option<&HomeCard> {
+        self.home.cards.iter().find(|card| {
+            card.cluster() == cluster
+                && card.status == status
+                && self.feed_still_runs(cluster, card.card.feed.as_ref(), cx)
+        })
     }
 
     fn home_view(&self, cx: &App) -> HomeView<'_> {
@@ -207,7 +231,7 @@ impl Workspace {
                 .watched
                 .into_iter()
                 .map(|(cluster, status)| {
-                    let card = self.home_card(&cluster, status);
+                    let card = self.home_card(&cluster, status, cx);
                     let shown = names.exact(&cluster);
                     (cluster, shown, status, card)
                 })
@@ -232,11 +256,13 @@ impl Workspace {
         if !self.home_shown(cx) {
             return None;
         }
-        // Every link on a card selects its cluster, as a click on it in the sidebar does.
-        let actions: CardActions = Rc::new(|cluster, _| {
-            Box::new(SelectCluster {
+        // A card's name selects its cluster, as a click on it in the sidebar does. Its counts
+        // open nothing: their lists belong to the cluster's own overview.
+        let actions: CardActions = Rc::new(|cluster, target| match target {
+            CardTarget::Cluster => Some(Box::new(SelectCluster {
                 cluster: cluster.to_owned(),
-            })
+            })),
+            CardTarget::Problem { .. } => None,
         });
         Some(home::render(
             &self.home_view(cx),

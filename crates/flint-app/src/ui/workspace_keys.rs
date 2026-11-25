@@ -146,16 +146,18 @@ impl Workspace {
         if self.nav_shown(cx) {
             panes.push((Pane::Navigation, self.nav.read(cx).focus_handle().clone()));
         }
-        if let Some((overview, _)) = &self.dashboard {
+        // Home covers the overview, the list and the detail.
+        let covered = self.home.open;
+        if let Some((overview, _)) = self.dashboard.as_ref().filter(|_| !covered) {
             panes.push((Pane::Overview, overview.read(cx).focus_handle(cx)));
         }
-        if let Some(list) = &self.list {
+        if let Some(list) = self.list.as_ref().filter(|_| !covered) {
             panes.push((Pane::List, list.read(cx).focus_handle().clone()));
         }
         if let Some(detail) = self
             .detail
             .as_ref()
-            .filter(|_| !self.detail_hidden_by_menu(cx))
+            .filter(|_| !covered && !self.detail_hidden_by_menu(cx))
         {
             panes.push((Pane::Detail, detail.read(cx).focus_handle().clone()));
         }
@@ -201,6 +203,10 @@ impl Workspace {
     pub(super) fn recover_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings_page.open {
             window.focus(&self.settings_page.focus, cx);
+            return;
+        }
+        if self.home.open {
+            window.focus(&self.focus, cx);
             return;
         }
         if self.list.is_none()

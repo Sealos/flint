@@ -1543,7 +1543,7 @@ pub fn on_click_dyn_in<E: ?Sized>(
 ) -> impl Fn(&E, &mut Window, &mut App) + 'static {
     move |_, window, cx| {
         if let Err(e) = dispatch_in(&focus, action.as_ref(), window, cx) {
-            tracing::warn!("{e}");
+            report_refusal(&e, cx);
         }
     }
 }

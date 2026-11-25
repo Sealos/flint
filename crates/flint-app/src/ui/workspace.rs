@@ -1390,6 +1390,8 @@ impl Workspace {
             center.update(cx, |center, _| center.clear_overview());
         }
         if here {
+            // Asked for by opening the alert: in front of Home too.
+            self.leave_home();
             self.open_dashboard(window, cx);
         }
     }

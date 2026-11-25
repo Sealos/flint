@@ -49,9 +49,10 @@ pub(in crate::ui) enum CardTarget {
     },
 }
 
-/// The action a click on the card of the named cluster performs. A link is drawn only where the
-/// card may open something; the click goes through the action registry from the card's focus.
-pub(in crate::ui) type CardActions = Rc<dyn Fn(&str, CardTarget) -> Box<dyn Action>>;
+/// The action a click on the card of the named cluster performs, if the caller offers one. A link
+/// is drawn only where the card may open something and an action is named; the click goes
+/// through the action registry from the card's focus.
+pub(in crate::ui) type CardActions = Rc<dyn Fn(&str, CardTarget) -> Option<Box<dyn Action>>>;
 
 /// The kind and label a problem list opens, as the navigation names them.
 pub(in crate::ui) fn kind_entry(plural: &str) -> Option<(KindId, &'static str)> {
@@ -442,14 +443,16 @@ pub(in crate::ui) fn render_card(
         .text_sm()
         .when_some(card.tag, |el, tag| el.child(tag_dot(cluster, tag, theme)))
         .child(div().truncate().child(card.shown.clone()))
-        .when(opens, |el| {
-            el.cursor_pointer()
-                .hover(|el| el.bg(theme.table_hover))
-                .on_click(registry::on_click_dyn_in(
-                    focus.clone(),
-                    actions(cluster, CardTarget::Cluster),
-                ))
-        })
+        .when_some(
+            opens
+                .then(|| actions(cluster, CardTarget::Cluster))
+                .flatten(),
+            |el, action| {
+                el.cursor_pointer()
+                    .hover(|el| el.bg(theme.table_hover))
+                    .on_click(registry::on_click_dyn_in(focus.clone(), action))
+            },
+        )
         .test_support();
     let rows = card.tiles.iter().flat_map(|tile| {
         let name = category_name(tile.category);
@@ -471,31 +474,34 @@ pub(in crate::ui) fn render_card(
                 tile.label.to_owned(),
                 tile.value(),
                 level_color(tile.level, theme),
-                target.map(|target| actions(cluster, target)),
+                target.and_then(|target| actions(cluster, target)),
                 focus,
                 theme,
             )
             .into_any_element(),
         ];
         if links_kinds && opens {
-            rows.extend(card.short_kinds.iter().map(|kind| {
+            rows.extend(card.short_kinds.iter().filter_map(|kind| {
                 let label = kind_entry(kind).map_or(*kind, |(_, label)| label);
-                count_link(
-                    format!("set-card-{cluster}-{name}-{kind}"),
-                    format!("Open short {label}"),
-                    String::new(),
-                    theme.foreground,
-                    Some(actions(
-                        cluster,
-                        CardTarget::Problem {
-                            category: name,
-                            kind: Some((*kind).to_owned()),
-                        },
-                    )),
-                    focus,
-                    theme,
+                let action = actions(
+                    cluster,
+                    CardTarget::Problem {
+                        category: name,
+                        kind: Some((*kind).to_owned()),
+                    },
+                )?;
+                Some(
+                    count_link(
+                        format!("set-card-{cluster}-{name}-{kind}"),
+                        format!("Open short {label}"),
+                        String::new(),
+                        theme.foreground,
+                        Some(action),
+                        focus,
+                        theme,
+                    )
+                    .into_any_element(),
                 )
-                .into_any_element()
             }));
         }
         rows

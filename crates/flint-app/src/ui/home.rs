@@ -55,8 +55,11 @@ pub(super) fn status_word(status: KeepWatching) -> &'static str {
 pub(super) fn blocked_reason(status: KeepWatching) -> Option<String> {
     match status {
         KeepWatching::Watching | KeepWatching::Off => None,
-        KeepWatching::SignInNeeded | KeepWatching::NeedsConfirming => {
-            Some("Sign-in needed: open the cluster to sign in.".to_owned())
+        KeepWatching::SignInNeeded => {
+            Some("Sign-in needed: its sign-in failed. Open the cluster to sign in.".to_owned())
+        }
+        KeepWatching::NeedsConfirming => {
+            Some("Sign-in needed: open the cluster and allow its background sign-in.".to_owned())
         }
         KeepWatching::Paused => {
             Some("Paused: a kubeconfig file defining it can't be read.".to_owned())

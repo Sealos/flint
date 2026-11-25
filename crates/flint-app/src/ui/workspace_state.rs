@@ -98,8 +98,14 @@ impl Workspace {
             ));
         }
 
-        let list = self.list.as_ref().map(|l| l.read(cx));
-        let detail = self.detail.as_ref().map(|d| d.read(cx));
+        // Home covers the header, the list and the detail.
+        let covered = self.home.open && self.home_shown(cx);
+        let list = self.list.as_ref().filter(|_| !covered).map(|l| l.read(cx));
+        let detail = self
+            .detail
+            .as_ref()
+            .filter(|_| !covered)
+            .map(|d| d.read(cx));
         let active_cluster = model.active_cluster();
         let main = match active_cluster.map(|c| &c.state) {
             None if model.loaded && model.clusters.is_empty() => Main::NoContexts,
@@ -116,12 +122,12 @@ impl Workspace {
         };
         let main = if self.settings_page.open {
             Main::Settings
-        } else if self.home.open {
+        } else if covered {
             self.home_state(cx)
         } else {
             main
         };
-        let header = active_cluster.map(|cluster| {
+        let header = active_cluster.filter(|_| !covered).map(|cluster| {
             let name = &cluster.info.name;
             let filter = self.ui_state.namespace_filter(name).to_vec();
             let controls = header_controls(cluster, list);
