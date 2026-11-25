@@ -2318,6 +2318,22 @@ async fn point_at(core: &Core, file: &Path, server: &FakeApiServer, namespace: &
     .expect("the load is reported")
 }
 
+/// Opens an overview on `generation` and waits until it reads that slot's own feed. `point_at`
+/// returns before the new slot has connected, and the previous definition's watches may still be
+/// closing on their server, so server-side watch counts alone do not show the slot is up.
+async fn open_own_feed(core: &Core, generation: u64) -> flint_core::OverviewInterest {
+    let open = core.handle.open_overview_on(CONTEXT, generation);
+    open.registered().await;
+    tokio::time::timeout(WAIT, async {
+        while open.telemetry().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the slot's own feed is up");
+    open
+}
+
 // An overview belongs to the slot it was opened on: the context's next definition is not read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_overview_reads_nothing_from_a_replaced_context() {
@@ -2331,23 +2347,15 @@ async fn an_overview_reads_nothing_from_a_replaced_context() {
     std::fs::write(&file, config.to_string()).unwrap();
     let core = Core::start_on(dir, vec![file.clone()], Settings::default()).await;
     let original = point_at(&core, &file, &first, "other").await;
-    let open = core.handle.open_overview_on(CONTEXT, original);
-    open.registered().await;
-    // Problem detection runs in On view (#715), so the context's first definition had a feed of
-    // its own on this server. Its watches can still be closing when the new slot has not yet
-    // connected, so they don't show the overview's feed is up: wait for the overview to read it.
+    // Problem detection runs in On view (#715), so a replaced definition had a feed of its own on
+    // its server, with watches that can still be closing. Only an overview that reads the slot's
+    // own feed shows the slot is connected.
+    let open = open_own_feed(&core, original).await;
     until_overview_watches(&first, true, "the first server's feed").await;
-    tokio::time::timeout(WAIT, async {
-        while open.telemetry().is_none() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("its own slot");
 
     let replacement = point_at(&core, &file, &second, "demo").await;
     assert_ne!(replacement, original);
-    // The new slot has a live feed the old overview could reach.
+    let current = open_own_feed(&core, replacement).await;
     until_overview_watches(&second, true, "the replacement's feed").await;
     assert!(core.handle.telemetry(CONTEXT).is_some());
     assert!(open.telemetry().is_none(), "opened before the move");
@@ -2356,8 +2364,6 @@ async fn an_overview_reads_nothing_from_a_replaced_context() {
     late.registered().await;
     assert!(late.telemetry().is_none(), "asked for after the move");
 
-    let current = core.handle.open_overview_on(CONTEXT, replacement);
-    current.registered().await;
     assert!(current.telemetry().is_some(), "the replacement's own");
     assert!(first.writes().is_empty() && second.writes().is_empty());
 }
