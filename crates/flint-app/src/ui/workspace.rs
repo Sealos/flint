@@ -65,6 +65,7 @@ use super::startup::StartupView;
 use super::terminal_model::ShellRequest;
 use super::terminal_view::{RestartBlocked, TerminalView};
 use super::theme;
+use super::tooltip_text::{SHOW_DELAY, cap_width};
 use super::ui_state::{self, UiState};
 use super::write_confirm;
 use flint_core::display::{self, ClusterNames};
@@ -1900,6 +1901,7 @@ impl Workspace {
             .border_1()
             .border_color(super::theme::cursor_ring(theme, ring))
             .tooltip(move |_, cx| cluster_tooltip(tip.0.clone(), &tip.1, &tip.2, cx))
+            .tooltip_show_delay(SHOW_DELAY)
             // While choosing clusters a click chooses: it must not connect to this one.
             // So does a Cmd-click, which starts choosing.
             .on_click({
@@ -2255,7 +2257,10 @@ impl Workspace {
                     })
                     .child(text)
                     .when(!tip.is_empty(), |el| {
-                        el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        el.tooltip(move |window, cx| {
+                            cap_width(Tooltip::new(tip.clone())).build(window, cx)
+                        })
+                        .tooltip_show_delay(SHOW_DELAY)
                     }),
             );
         }
@@ -2500,7 +2505,8 @@ impl Workspace {
             .text_color(color)
             .child(Icon::new(icon).xsmall())
             .child(if compact { short } else { text })
-            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .tooltip(move |window, cx| cap_width(Tooltip::new(tip.clone())).build(window, cx))
+            .tooltip_show_delay(SHOW_DELAY)
     }
 
     fn render_namespace_filter(

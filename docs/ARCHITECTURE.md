@@ -165,8 +165,7 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
 - One window shows a cluster sidebar. Exactly one cluster is **active**, meaning the one in view.
 - Planned after 1.0 (#247). The last N clusters the user selected (`warm_clusters`, default 3, counting the active one) stay **warm**: connected,
   with their watches running in the background, so switching to them is instant. The least recently used is made
-  **cold** when the set is full, when the stores of the background clusters (not the active one) go over
-  `warm_memory_mib` (default 128), after 30 minutes unused, or when the Mac sleeps. A cold cluster keeps its client
+  **cold** when the set is full, after 30 minutes unused, or when the Mac sleeps. A cold cluster keeps its client
   and discovery cache but drops its watches ([ADR-0008](./adr/0008-watch-everything-on-active-cluster.md), amended
   by [ADR-0012](./adr/0012-keep-recently-used-clusters-warm.md)).
 - The warm set starts empty on launch. Flint never runs an exec plugin for a cluster that is not active. A warm
@@ -1227,7 +1226,7 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   `settings.toml` on Linux too, so the same directory override covers both files
   ([ADR-0016](./adr/0016-linux-appimage.md)).
 - `settings.toml`: `appearance`, `ai_exposed_clusters`, `trusted_clusters`, `protect_local_clusters`, extra kubeconfig paths, watch mode (global plus per-cluster), log buffer size (`log_buffer_lines`, `log_buffer_mib`, and `log_total_mib` for all tabs together), a `path`
-  override, and a `helm` binary override. From M5.5 also `warm_clusters`, `warm_memory_mib`,
+  override, and a `helm` binary override. From M5.5 also `warm_clusters`,
   `log_analysis_clusters` (context, server URL, CLI, binary path, and whether to confirm each send), the log
   analysis line limit, and a `claude` binary override.
 - `[proxy]` in `settings.toml`: the proxy for cluster connections, since Flint started from Finder or the Dock does not
