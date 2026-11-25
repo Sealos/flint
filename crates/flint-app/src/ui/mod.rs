@@ -80,6 +80,7 @@ mod view_state;
 mod workspace;
 mod write_binding;
 mod write_confirm;
+mod yaml_diff;
 
 use std::cell::Cell;
 use std::rc::Rc;

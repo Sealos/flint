@@ -538,6 +538,23 @@ pub struct ToggleDrainOption {
     pub option: DrainOption,
 }
 
+/// In a fleet action's target list: take a cluster out of the run, or put it back.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = cluster_sets, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct ToggleFleetTarget {
+    pub cluster: String,
+}
+
+actions!(
+    cluster_sets,
+    [
+        /// In a fleet apply's target list: go back to the manifest, as typed, to edit and
+        /// review it again.
+        EditFleetManifestAgain
+    ]
+);
+
 /// Choose the name Flint shows for a cluster: opens a dialog naming its context and server.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
 #[action(namespace = workspace, no_json)]
@@ -701,7 +718,13 @@ actions!(
         RestartAcrossSet,
         /// Ask for a replica count, then scale the selected workload on every member of the
         /// running set, one at a time, after a per-member plan and one confirmation.
-        ScaleAcrossSet
+        ScaleAcrossSet,
+        /// Edit a manifest of the selected object, then apply it on every member of the running
+        /// set, one at a time, after a per-member dry run and one confirmation.
+        ApplyAcrossSet,
+        /// Delete the selected object on every member of the running set, one at a time, after
+        /// a per-member dry run and one confirmation.
+        DeleteAcrossSet
     ]
 );
 
@@ -3033,6 +3056,18 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
              running set, one at a time, after a per-member plan and one confirmation.",
         )
         .of(C::Detail, S::Workspace),
+        Spec::unit::<ApplyAcrossSet>(
+            "Apply YAML to Selected Object Across Set",
+            "Edit a manifest of the selected object, then apply it on every member of the \
+             running set, one at a time, after a per-member dry run and one confirmation.",
+        )
+        .of(C::Detail, S::Workspace),
+        Spec::unit::<DeleteAcrossSet>(
+            "Delete Selected Object Across Set",
+            "Delete the selected object on every member of the running set, one at a time, \
+             after a per-member dry run and one confirmation.",
+        )
+        .of(C::Detail, S::Workspace),
         Spec::with_args::<OpenSetMember>(
             "Open Set Member…",
             "Open the combined list filtered to one member.",
@@ -3271,6 +3306,19 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Include the fields each cluster assigns for itself.",
         )
         .of(C::Detail, S::Compare),
+        Spec::with_args::<ToggleFleetTarget>(
+            "Toggle Fleet Target…",
+            "In a fleet action's target list, take a cluster out of the run or put it back.",
+            CLUSTER,
+        )
+        .of(C::Cluster, S::Dialog)
+        .hidden(),
+        Spec::unit::<EditFleetManifestAgain>(
+            "Edit Fleet Manifest Again",
+            "In a fleet apply's target list, go back to the manifest to edit and review it again.",
+        )
+        .of(C::Cluster, S::Dialog)
+        .hidden(),
         Spec::with_args::<ToggleDrainOption>(
             "Toggle Drain Option…",
             "In the drain dialog, turn an option on or off.",

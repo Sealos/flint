@@ -162,7 +162,7 @@ pub struct SetCardState {
     /// The name the card shows.
     pub shown: String,
     pub tag: Option<flint_core::settings::ClusterTag>,
-    /// `live`, `partial`, `waiting`, `not_watched`, `unavailable` or `blocked`.
+    /// `live`, `partial`, `waiting`, `unavailable` or `blocked`.
     pub state: &'static str,
     /// What the card says about its state, if anything.
     pub note: Option<String>,
