@@ -574,7 +574,12 @@ async fn the_menus_hold_the_standard_items(cx: &mut TestAppContext) {
             .collect()
     };
     let names: Vec<String> = menus.iter().map(|m| m.name.to_string()).collect();
-    assert_eq!(names, ["Flint", "Edit", "View", "Window", "Help"]);
+    assert_eq!(
+        names,
+        [
+            "Flint", "File", "Edit", "View", "Cluster", "Resource", "Window", "Help"
+        ]
+    );
     assert_eq!(
         items("Flint"),
         [
@@ -599,6 +604,30 @@ async fn the_menus_hold_the_standard_items(cx: &mut TestAppContext) {
             "Appearance"
         ]
     );
+}
+
+// File, Cluster and Resource (#781): the Resource items follow the selection, as the palette does.
+#[gpui_kit::test]
+async fn the_resource_menu_is_disabled_without_a_selection(cx: &mut TestAppContext) {
+    use gpui_kit::OwnedMenuItem;
+    let dir = tempfile::tempdir().unwrap();
+    let _t = open_workspace(cx, dir.path()).await;
+    cx.run_until_parked();
+    let menus = cx.update(|cx| cx.get_menus()).unwrap();
+    let resource = menus.iter().find(|m| m.name == "Resource").unwrap();
+    let delete = resource
+        .items
+        .iter()
+        .find_map(|item| match item {
+            OwnedMenuItem::Action { name, disabled, .. }
+                if *name == registry::label::<registry::DeleteObject>() =>
+            {
+                Some(*disabled)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(delete, "Delete is disabled with nothing selected");
 }
 
 /// The palette as it shows `query`, opened for it and closed again.
