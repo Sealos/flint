@@ -95,7 +95,7 @@ impl SecretValue {
 }
 
 /// What a hidden Secret value is replaced with, in the Overview and the YAML.
-pub const MASK: &str = "••••••••";
+pub const MASK: &str = flint_core::redact::SECRET_MASK;
 
 fn str_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
     path.iter()
