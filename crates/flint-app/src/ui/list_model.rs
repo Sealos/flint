@@ -428,14 +428,15 @@ pub const NAME_COMFORT_CHARS: usize = 30;
 
 /// Leaves out the columns after Status, the rightmost first, while the drawn columns would leave
 /// the Name column less than `name_target` of `room`, so a name is not cut while a trailing
-/// Restarts or Age could go instead. Never a column through Status, nor one for which `keep`
-/// holds (the one the list is sorted by). A list without Status sheds nothing, as in
-/// [`shed_columns`]: the table scrolls sideways there.
+/// Restarts or Age could go instead. Only those two can go (a custom printer column stays,
+/// reachable by scrolling), never one for which `keep` holds (the one the list is sorted by).
+/// Namespace counts at `namespace_min`, as it narrows before Name does. A list without Status
+/// sheds nothing, as in [`shed_columns`]: the table scrolls sideways there.
 pub fn shed_trailing(
     drawn: &mut Vec<(usize, f32)>,
     columns: &[Column],
     room: f32,
-    name_target: f32,
+    (name_target, namespace_min): (f32, f32),
     keep: impl Fn(usize) -> bool,
 ) {
     let Some(status) = drawn.iter().position(|&(i, _)| {
@@ -447,13 +448,20 @@ pub fn shed_trailing(
         drawn
             .iter()
             .filter(|&&(i, _)| columns[i].role != ColumnRole::Name)
-            .map(|&(_, width)| width)
+            .map(|&(i, width)| match columns[i].role {
+                ColumnRole::Namespace => width.min(namespace_min),
+                _ => width,
+            })
             .sum()
     };
     while others(drawn) + name_target > room {
         let Some(pos) = drawn
             .iter()
-            .rposition(|&(i, _)| !keep(i))
+            .rposition(|&(i, _)| {
+                let optional = columns[i].role == ColumnRole::Age
+                    || columns[i].name.eq_ignore_ascii_case("Restarts");
+                optional && !keep(i)
+            })
             .filter(|&pos| pos > status)
         else {
             return;
@@ -1641,7 +1649,9 @@ mod tests {
         ];
         let shed = |room: f32, keep: Option<usize>| {
             let mut drawn = vec![(0, 300.), (1, 152.), (2, 80.), (3, 76.)];
-            shed_trailing(&mut drawn, &columns, room, 270., |i| Some(i) == keep);
+            shed_trailing(&mut drawn, &columns, room, (270., 110.), |i| {
+                Some(i) == keep
+            });
             drawn.into_iter().map(|(i, _)| i).collect::<Vec<_>>()
         };
         // 152 + 80 + 76 + 270 = 578.
@@ -1653,8 +1663,27 @@ mod tests {
         // A list without Status scrolls instead.
         let plain = [columns[0].clone(), columns[2].clone(), columns[3].clone()];
         let mut drawn = vec![(0, 300.), (1, 80.), (2, 76.)];
-        shed_trailing(&mut drawn, &plain, 100., 270., |_| false);
+        shed_trailing(&mut drawn, &plain, 100., (270., 110.), |_| false);
         assert_eq!(drawn.len(), 3);
+        // A custom column after Status scrolls instead of going.
+        let custom = [
+            columns[0].clone(),
+            columns[1].clone(),
+            col("Version", 0, ColumnRole::Value, ColumnType::String),
+        ];
+        let mut drawn = vec![(0, 300.), (1, 152.), (2, 80.)];
+        shed_trailing(&mut drawn, &custom, 100., (270., 110.), |_| false);
+        assert_eq!(drawn.len(), 3);
+        // Namespace counts at its minimum: 110 + 152 + 76 + 270 fits 608.
+        let spaced = [
+            columns[0].clone(),
+            col("Namespace", 0, ColumnRole::Namespace, ColumnType::String),
+            columns[1].clone(),
+            columns[3].clone(),
+        ];
+        let mut drawn = vec![(0, 300.), (1, 170.), (2, 152.), (3, 76.)];
+        shed_trailing(&mut drawn, &spaced, 608., (270., 110.), |_| false);
+        assert_eq!(drawn.len(), 4);
     }
 
     // covers UP-20, UP-25, UP-27: a long name must not be cut while the list has room.

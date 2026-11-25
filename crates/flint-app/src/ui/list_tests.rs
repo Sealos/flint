@@ -442,15 +442,15 @@ async fn a_narrow_list_keeps_name_and_status_readable(cx: &mut TestAppContext) {
     assert!(status_end <= 400., "Status ends at {status_end}");
 }
 
-// covers UP-20, UP-23: when the columns through Status fit, nothing is hidden: Restarts and Age
-// scroll instead.
+// covers UP-20, UP-23, #779: when the columns through Status fit, they all show; Restarts and
+// Age may give way to the name.
 #[gpui_kit::test]
 async fn a_narrow_list_hides_nothing_when_status_fits(cx: &mut TestAppContext) {
     let (core, _dir) = core();
     let (window, list) = open_sized(cx, core, "Pods", 450.);
     let pod = pod_like("pods", LONG_POD, "Running");
     show_narrow(cx, window, &list, pod, &[NARROW_NAMESPACE]).await;
-    for column in ["Name", "Namespace", "Ready", "Status", "Restarts", "Age"] {
+    for column in ["Name", "Namespace", "Ready", "Status"] {
         assert!(has_header(cx, window, column), "{column} is hidden");
     }
     let status_end = header_end(cx, window, "Status");

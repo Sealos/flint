@@ -4,10 +4,10 @@
 const SMALL_CHAR_WIDTH: f32 = 6.5;
 
 /// What a cluster row spends beside its second line's text: padding, the status dot and gaps.
-const ROW_CHROME: f32 = 56.;
+const ROW_CHROME: f32 = 90.;
 
 /// The fewest characters a cut address keeps: enough for the start of the host and the port.
-const MIN_ADDRESS_CHARS: usize = 12;
+const MIN_ADDRESS_CHARS: usize = 8;
 
 /// How many characters of a cluster row's second line (its address) fit a sidebar `width` wide.
 pub(super) fn sidebar_subtitle_chars(width: f32) -> usize {
@@ -30,7 +30,7 @@ mod tests {
         // The narrowest sidebar still keeps room for a host start and a port.
         assert_eq!(sidebar_subtitle_chars(140.), MIN_ADDRESS_CHARS);
         assert_eq!(sidebar_subtitle_chars(0.), MIN_ADDRESS_CHARS);
-        assert_eq!(sidebar_subtitle_chars(200.), 22);
+        assert_eq!(sidebar_subtitle_chars(200.), 16);
         assert!(sidebar_subtitle_chars(420.) > sidebar_subtitle_chars(200.));
     }
 
@@ -46,6 +46,6 @@ mod tests {
 
     #[test]
     fn an_address_that_fits_is_unchanged() {
-        assert_eq!(fit_end_visible("10.0.0.1:6443", 22), "10.0.0.1:6443");
+        assert_eq!(fit_end_visible("10.0.0.1:6443", 16), "10.0.0.1:6443");
     }
 }
