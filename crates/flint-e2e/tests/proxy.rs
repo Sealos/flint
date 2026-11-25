@@ -656,6 +656,30 @@ async fn a_socks_proxy_that_refuses_the_account_says_so_and_sends_nothing() {
 }
 
 #[tokio::test]
+async fn a_socks5_server_name_that_does_not_resolve_says_so() {
+    let api = FakeApiServer::start().await.unwrap();
+    let (proxy, seen) = fake_socks(api.addr(), None).await;
+    let (mut kubeconfig, context) = through(api.kubeconfig(None), &format!("socks5://{proxy}"));
+    // `.invalid` never resolves (RFC 2606).
+    kubeconfig.clusters[0].cluster.as_mut().unwrap().server =
+        Some("https://flint-test.invalid:6443".to_owned());
+
+    let error = match cluster::connect(&kubeconfig, &context).await {
+        Ok(client) => cluster::server_version(&client).await.unwrap_err(),
+        Err(e) => e,
+    };
+
+    let text = error.to_string();
+    if seen.lock().unwrap().destinations.is_empty() {
+        assert!(text.contains("could not resolve"), "{text}");
+        assert_eq!(arrivals(&api), 0);
+    } else {
+        // Some resolvers answer every name; then the proxy was given that answer.
+        eprintln!("skipped: this resolver answers for flint-test.invalid");
+    }
+}
+
+#[tokio::test]
 async fn a_socks_proxy_that_is_down_does_not_fall_back_to_a_direct_connection() {
     let api = FakeApiServer::start().await.unwrap();
     let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
