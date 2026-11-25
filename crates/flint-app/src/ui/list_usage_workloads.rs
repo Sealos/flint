@@ -119,13 +119,34 @@ pub(in crate::ui) fn totals_by_owner(
     samples: &BTreeMap<PodKey, PodSample>,
     chain: OwnerChain,
 ) -> HashMap<Arc<str>, Totals> {
+    totals(index, samples, chain, None)
+}
+
+/// The totals of the one workload with this `uid`, `None` if it has no counted pod.
+pub(in crate::ui) fn totals_of(
+    index: &PodIndex,
+    samples: &BTreeMap<PodKey, PodSample>,
+    chain: OwnerChain,
+    uid: &str,
+) -> Option<Totals> {
+    totals(index, samples, chain, Some(uid)).remove(uid)
+}
+
+fn totals(
+    index: &PodIndex,
+    samples: &BTreeMap<PodKey, PodSample>,
+    chain: OwnerChain,
+    only: Option<&str>,
+) -> HashMap<Arc<str>, Totals> {
     let mut running: HashMap<Arc<str>, Running> = HashMap::new();
     let mut key = PodKey::default();
     for pod in index.iter() {
         if pod.finished {
             continue;
         }
-        let Some(owner) = owner(index, pod, chain) else {
+        let Some(owner) =
+            owner(index, pod, chain).filter(|o| only.is_none_or(|uid| *o.uid == *uid))
+        else {
             continue;
         };
         key.0.clear();
@@ -451,6 +472,30 @@ mod tests {
         let read = PodIndex::for_tests([], Controllers::new());
         assert!(OwnerChain::ViaReplicaSets.is_known(&read));
         assert!(OwnerChain::ViaJobs.is_known(&read));
+    }
+
+    #[test]
+    fn one_workload_alone_is_the_same_as_its_entry_among_all() {
+        let sts = owner("StatefulSet", "apps", "db", "sts");
+        let other = owner("StatefulSet", "apps", "cache", "other");
+        let (index, samples) = index(
+            vec![
+                ("u1", "a", Some(sts.clone()), limited()),
+                ("u2", "b", Some(sts), limited()),
+                ("u3", "c", Some(other), limited()),
+            ],
+            Controllers::new(),
+        );
+        let all = totals_by_owner(&index, &samples, OwnerChain::Direct);
+        assert_eq!(
+            totals_of(&index, &samples, OwnerChain::Direct, "sts"),
+            Some(all["sts"])
+        );
+        assert_eq!(all["sts"].pods, 2);
+        assert_eq!(
+            totals_of(&index, &samples, OwnerChain::Direct, "none"),
+            None
+        );
     }
 
     #[test]

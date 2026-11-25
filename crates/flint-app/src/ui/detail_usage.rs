@@ -77,7 +77,10 @@ impl DetailUsage {
         }
         let changed = self.source != source;
         self.source = source;
-        self.read_workload();
+        // Only when the readings changed: adding up a workload's pods is not free.
+        if changed {
+            self.read_workload();
+        }
         changed
     }
 
@@ -85,8 +88,8 @@ impl DetailUsage {
     fn read_workload(&mut self) {
         self.workload = match (&self.source, &self.uid) {
             (UsageSource::Workloads(usage, index, chain), Some(uid)) => {
-                match list_usage_workloads::totals_by_owner(index, usage, *chain).get(&**uid) {
-                    Some(&totals) => WorkloadReading::Totals(totals),
+                match list_usage_workloads::totals_of(index, usage, *chain, uid) {
+                    Some(totals) => WorkloadReading::Totals(totals),
                     None => WorkloadReading::Idle,
                 }
             }
@@ -355,23 +358,27 @@ fn node_rings(
     thresholds: &Thresholds,
 ) -> UsagePanel {
     let (cpu, memory) = measures(used, thresholds);
-    match allocatable {
-        Some(allocatable) => UsagePanel::Rings {
-            cpu: cpu.ring(
-                requests.cpu.map(Cpu::nanos),
-                allocatable.cpu.map(Cpu::nanos),
-                "allocatable",
-            ),
-            memory: memory.ring(
-                requests.memory.map(Memory::bytes),
-                allocatable.memory.map(Memory::bytes),
-                "allocatable",
-            ),
-        },
-        None => UsagePanel::Rings {
-            cpu: cpu.text_only("allocatable"),
-            memory: memory.text_only("allocatable"),
-        },
+    // A ring needs positive allocatable to be the circle: without it, what pods request would
+    // stand in for the capacity, and a node would look full that has no known size.
+    let ring =
+        |measure: &Measure, requests: Option<u64>, allocatable: Option<u64>| match allocatable
+            .filter(|&amount| amount > 0)
+        {
+            Some(_) => measure.ring(requests, allocatable, "allocatable"),
+            None => measure.text_only("allocatable"),
+        };
+    let allocatable = allocatable.unwrap_or_default();
+    UsagePanel::Rings {
+        cpu: ring(
+            &cpu,
+            requests.cpu.map(Cpu::nanos),
+            allocatable.cpu.map(Cpu::nanos),
+        ),
+        memory: ring(
+            &memory,
+            requests.memory.map(Memory::bytes),
+            allocatable.memory.map(Memory::bytes),
+        ),
     }
 }
 
@@ -718,6 +725,36 @@ mod tests {
         );
         detail.set_source(source);
         detail
+    }
+
+    #[test]
+    fn a_node_with_no_allocatable_for_a_metric_gets_no_ring_for_it() {
+        use flint_core::telemetry::{Allocatable, ClusterCapacity, NodeCapacity, Reserved};
+        let capacity = ClusterCapacity {
+            nodes: Arc::new([NodeCapacity {
+                name: "n1".into(),
+                allocatable: Allocatable::default(),
+                requests: Reserved {
+                    cpu: Some(Cpu::from_nanos(500_000_000)),
+                    memory: None,
+                },
+                limits: Reserved::default(),
+                pods: None,
+            }]),
+        };
+        let source = UsageSource::Nodes(
+            Arc::new([("n1".to_owned(), usage(1000, 512))].into_iter().collect()),
+            Some(capacity),
+        );
+        // Memory is allocatable; CPU is missing, and the node's requests must not stand in.
+        let detail = node_detail(
+            source,
+            &json!({"status": {"allocatable": {"memory": "1Gi"}}}),
+        );
+        let (cpu, memory) = rings(detail.panel(None, "n1"));
+        assert_eq!(cpu.spec, None);
+        assert_eq!(cpu.center, "1000m");
+        assert!(memory.spec.is_some());
     }
 
     #[test]
