@@ -224,7 +224,10 @@ fn a_review_shows_status_only_when_the_write_changes_it() {
     assert_eq!(status_shown(&typed, &live, &typed), Ok(true));
     let before = render(&shown_value(&live, true)).unwrap();
     let after = shown_after(&live, &typed, true).unwrap();
-    assert!(before.contains("Ready") && after.contains("Done"), "{after}");
+    assert!(
+        before.contains("Ready") && after.contains("Done"),
+        "{after}"
+    );
     // No status before, one typed: shown as added.
     let bare = json!({"spec": {}});
     let added = json!({"spec": {}, "status": {"phase": "Done"}});
@@ -238,7 +241,9 @@ fn a_status_the_server_does_not_take_is_refused() {
     let live = json!({"spec": {"a": 1}, "status": {"phase": "Ready"}});
     let typed = json!({"spec": {"a": 2}, "status": {"phase": "Done"}});
     let result = json!({"spec": {"a": 2}, "status": {"phase": "Ready"}});
-    let refused = status_shown(&typed, &live, &result).unwrap_err().to_string();
+    let refused = status_shown(&typed, &live, &result)
+        .unwrap_err()
+        .to_string();
     assert!(refused.contains("Remove status"), "{refused}");
     let removed = json!({"spec": {"a": 2}});
     assert!(status_shown(&removed, &live, &result).is_err());
