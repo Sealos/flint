@@ -40,6 +40,7 @@ mod disconnect;
 mod file_watch;
 mod forwards;
 mod helm;
+mod history;
 mod keep_watching;
 mod keep_watching_lists;
 mod member_sign_in;
@@ -578,6 +579,8 @@ pub(crate) struct ClusterManager {
     /// The running telemetry feeds, as the front end reads them.
     telemetry: crate::telemetry::TelemetryBoard,
     telemetry_timing: crate::telemetry::TelemetryTiming,
+    /// Each watched cluster's CPU and memory history, which outlives the feeds writing it.
+    histories: history::TrendHistories,
     /// The clusters the user unlocked for this session, shared with the front end (ADR-0015).
     unlocks: SessionUnlocks,
     /// Contexts the last load did not show, listed only because a file that defined them can't
@@ -656,6 +659,7 @@ impl ClusterManager {
             log_budget,
             telemetry: Default::default(),
             telemetry_timing: Default::default(),
+            histories: Default::default(),
             unlocks,
             held: HashSet::new(),
             settled: SettledDefinitions::default(),
