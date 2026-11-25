@@ -285,7 +285,7 @@ pub enum MetricsPanel {
     },
 }
 
-/// One resource's current value and last hour.
+/// One resource's current value and history.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MetricTile {
     pub label: &'static str,
@@ -556,6 +556,11 @@ fn metrics(input: &DashboardInput<'_>) -> MetricsPanel {
             )
             .map(Iterator::collect)
             .unwrap_or_default();
+        let times: Vec<Option<Timestamp>> = input
+            .trends
+            .sample_times(&input.snapshot.cluster, input.now)
+            .map(Iterator::collect)
+            .unwrap_or_default();
         let recent = samples
             .iter()
             .rev()
@@ -570,6 +575,7 @@ fn metrics(input: &DashboardInput<'_>) -> MetricsPanel {
             value,
             shape: Arc::new(SparklineShape::new(
                 samples,
+                times,
                 input.now,
                 POLL_INTERVAL,
                 format,

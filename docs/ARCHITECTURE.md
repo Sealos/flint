@@ -39,7 +39,7 @@ in [`docs/adr/`](./adr/). The journeys every release must keep working, with sta
 
 - Windows builds, and Linux packages other than the AppImage (Flatpak, Snap). The AppImage remains the Linux install
   for 1.0; deb and rpm packages come after it (#468, #469).
-- Prometheus charts or stored metric history. Dashboards keep an hour of their own samples in memory
+- Prometheus charts or stored metric history. Dashboards keep up to 24 hours (6 by default) of their own samples in memory
   ([ADR-0017](./adr/0017-cluster-dashboards.md)).
 - Local terminal tabs and node shells (shells into a node through a privileged pod).
 - An extension or plugin API ([ADR-0007](./adr/0007-no-extension-api-in-v1.md)).
@@ -773,7 +773,7 @@ Each cluster opens on a dashboard, also reachable from **Overview** at the top o
 problem (failing pods, not-ready nodes, Warning events in the last hour, pending PVCs, failed Jobs, workloads short of
 replicas) opening the matching filtered list, the individual problems by severity, each opening its object, and recent
 Warning events. **Capacity left** shows CPU, memory and pod slots against allocatable, with requests, limits and live
-usage, then one row per node, most allocated first, and a sparkline of the last hour. Requests come from the watched
+usage, then one row per node, most allocated first, and a sparkline of the metrics history. Requests come from the watched
 pods, so they show without metrics-server; usage then shows as unavailable. **What's in the cluster** has the
 Kubernetes version, read once per feed, and counts of nodes, pods and workloads that open their lists. The feed keeps
 per-node totals rather than each pod's resource lists. The sparklines come from Flint's own 15-second metrics-server

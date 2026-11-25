@@ -1,5 +1,6 @@
 use super::ThresholdMetric::{
-    CpuPercent, MemoryPercent, PendingPodSeconds, RestartsLastHour, WarningEventsLastHour,
+    CpuPercent, HistoryHours, MemoryPercent, PendingPodSeconds, RestartsLastHour,
+    WarningEventsLastHour,
 };
 use super::*;
 
@@ -38,6 +39,7 @@ fn defaults_are_in_range_with_unique_keys() {
         (RestartsLastHour, "restarts_last_hour", 5),
         (WarningEventsLastHour, "warning_events_last_hour", 10),
         (PendingPodSeconds, "pending_pod_seconds", 300),
+        (HistoryHours, "history_hours", 6),
     ];
     assert_eq!(ThresholdMetric::ALL.len(), expected.len());
     let defaults = Thresholds::default();
@@ -349,4 +351,45 @@ fn a_context_named_like_the_datetime_marker_is_a_plain_string() {
         .thresholds
         .for_cluster("$__toml_private_datetime", Some(A));
     assert_eq!(marker.get(MemoryPercent), 60);
+}
+
+#[test]
+fn history_hours_default_range_and_presets() {
+    assert_eq!(Thresholds::default().get(HistoryHours), 6);
+    assert_eq!(HistoryHours.range(), 1..=24);
+    for preset in HISTORY_HOURS_PRESETS {
+        assert!(HistoryHours.range().contains(&preset));
+    }
+    let mut overrides = ThresholdOverrides::default();
+    assert!(overrides.set(HistoryHours, Some(0)).is_err());
+    assert!(overrides.set(HistoryHours, Some(25)).is_err());
+    // Only the presets, in a file and in a write alike.
+    assert!(overrides.set(HistoryHours, Some(2)).is_err());
+    let (settings, issues) = load("history_hours = 2\n");
+    assert_eq!(settings.global.get(HistoryHours), None);
+    assert_eq!(issues.len(), 1);
+    assert!(overrides.set(HistoryHours, Some(24)).is_ok());
+}
+
+#[test]
+fn a_cluster_override_of_history_hours_wins_over_the_global_value() {
+    let (settings, issues) = load(
+        "history_hours = 12\n\n[[clusters]]\ncontext = \"prod\"\n\
+         server = \"https://p.example\"\nhistory_hours = 24\n\n[[clusters]]\n\
+         context = \"bad\"\nserver = \"https://b.example\"\nhistory_hours = 99\n",
+    );
+    assert_eq!(
+        issues,
+        vec![ThresholdIssue::InvalidValue {
+            entry: Some(1),
+            metric: HistoryHours
+        }]
+    );
+    let hours = |context: &str, server: Option<&str>| {
+        settings.for_cluster(context, server).get(HistoryHours)
+    };
+    assert_eq!(hours("prod", Some("https://p.example")), 24);
+    assert_eq!(hours("other", Some("https://o.example")), 12);
+    // An invalid override falls back to the global value, not to the default.
+    assert_eq!(hours("bad", Some("https://b.example")), 12);
 }

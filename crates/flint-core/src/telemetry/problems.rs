@@ -10,6 +10,7 @@ use tokio::sync::watch;
 use super::capacity::{Inventory, capacity_of};
 use super::checked::CheckedObjects;
 use super::objects::Stores;
+use super::pods::PodIndex;
 use super::{
     Availability, CheckFailure, KindCheck, MetricsCheck, Shared, TelemetrySnapshot,
     TelemetryTiming, VersionCheck, WatchedKind,
@@ -145,6 +146,7 @@ fn evaluate(
         counts,
         metrics,
         capacity: capacity_of(stores),
+        pods: PodIndex::of(&stores.pods, &stores.replica_sets, &stores.jobs),
         inventory: Inventory::of(stores),
         rollouts: stores
             .deployments
@@ -250,6 +252,14 @@ mod tests {
         )
     }
 
+    /// `pod` as a store takes it, untrimmed.
+    fn untrimmed(
+        pod: k8s_openapi::api::core::v1::Pod,
+    ) -> (k8s_openapi::api::core::v1::Pod, super::super::pods::PodRead) {
+        let read = super::super::pods::PodRead::of(&pod);
+        (pod, read)
+    }
+
     fn pending_pod(created: Timestamp) -> k8s_openapi::api::core::v1::Pod {
         serde_json::from_value(serde_json::json!({
             "metadata": {
@@ -294,7 +304,7 @@ mod tests {
     async fn the_shared_timer_moves_a_pod_in_and_out_with_no_event() {
         let created = Timestamp::now() - jiff::SignedDuration::from_secs(1);
         let mut stores = all_current();
-        stores.pods.replace(vec![(pending_pod(created), None)]);
+        stores.pods.replace(vec![untrimmed(pending_pod(created))]);
         let shared = shared_with(stores, 2);
         let first = Arc::new(TelemetrySnapshot::starting("one".into(), Timestamp::now()));
         let (sender, mut latest) = watch::channel(first);
@@ -309,7 +319,7 @@ mod tests {
         // Stops being Pending, and nothing says so but the next tick.
         let mut running = pending_pod(created);
         running.status.as_mut().unwrap().phase = Some("Running".to_owned());
-        shared.stores().pods.replace(vec![(running, None)]);
+        shared.stores().pods.replace(vec![untrimmed(running)]);
         wait_for_pending(&mut latest, false).await;
         task.abort();
     }
@@ -346,7 +356,7 @@ mod tests {
     async fn a_changed_threshold_applies_to_a_running_feed() {
         let created = Timestamp::now() - jiff::SignedDuration::from_secs(30);
         let mut stores = all_current();
-        stores.pods.replace(vec![(pending_pod(created), None)]);
+        stores.pods.replace(vec![untrimmed(pending_pod(created))]);
         let shared = shared_with(stores, 60);
         let first = Arc::new(TelemetrySnapshot::starting("one".into(), Timestamp::now()));
         let (sender, mut latest) = watch::channel(first);
@@ -378,7 +388,7 @@ mod tests {
                 let mut pod = pending_pod(created);
                 pod.metadata.name = Some(format!("pod-{i}"));
                 pod.metadata.uid = Some(format!("uid-{i}"));
-                (pod, None)
+                untrimmed(pod)
             })
             .collect();
         let mut stores = all_current();
