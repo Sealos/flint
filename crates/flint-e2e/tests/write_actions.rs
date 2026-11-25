@@ -1014,6 +1014,7 @@ async fn a_failed_node_check_reports_the_listed_pods_as_not_tried() {
     let seen = server.arrivals();
     let order: Vec<_> = seen[from..]
         .iter()
+        .filter(|r| !background_read(r))
         .filter(|r| r.path == node_path || r.path == "/api/v1/pods")
         .map(|r| (r.method.clone(), r.path.as_str()))
         .collect();
