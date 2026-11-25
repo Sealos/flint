@@ -73,6 +73,13 @@ impl ClusterTelemetry {
         }
     }
 
+    /// Gives a front-end test samples without a running feed.
+    #[cfg(feature = "test-support")]
+    pub fn with_trends_for_tests(mut self, trends: TrendStore) -> Self {
+        self.trends = Arc::new(Mutex::new(trends));
+        self
+    }
+
     /// Runs `read` on this feed's trends, whose series are under the cluster's name. Keep it
     /// short: the feed's metrics poll waits on the same lock.
     pub fn with_trends<R>(&self, read: impl FnOnce(&TrendStore) -> R) -> R {
