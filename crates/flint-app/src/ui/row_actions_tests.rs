@@ -1300,6 +1300,48 @@ async fn a_row_menu_stays_open_while_its_object_loads(cx: &mut TestAppContext) {
     assert!(!open, "escape dismisses the menu");
 }
 
+// covers #399: the arrow keys move the highlight, and a menu rebuilt by a live update keeps it on
+// the same entry, so Enter still acts on it.
+#[gpui_kit::test]
+async fn a_rebuilt_row_menu_keeps_its_highlighted_entry(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "kind-alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    show_loading(cx, &t);
+    right_click(cx, &t, "web").await;
+    assert_eq!(
+        menu(cx, &t),
+        [
+            "Logs",
+            "Previous Logs",
+            "Shell",
+            "Forward Port",
+            "web is still loading"
+        ]
+    );
+    // Logs, Previous Logs, Shell.
+    for _ in 0..3 {
+        press(cx, &t, "down");
+    }
+    let rebuilds = crate::ui::row_menu::tests::REBUILDS.with(|n| n.get());
+    show_fetched(cx, &t, pod_detail("web"));
+    draw(cx, &t);
+    assert_ne!(
+        crate::ui::row_menu::tests::REBUILDS.with(|n| n.get()),
+        rebuilds,
+        "the menu was rebuilt"
+    );
+    // Shell is a container picker now: Enter opens it.
+    press(cx, &t, "enter");
+    assert_eq!(
+        submenu(cx, &t),
+        ["app (default)", "sidecar"],
+        "Enter acted on Shell"
+    );
+}
+
 fn menu_open(cx: &mut TestAppContext, t: &TestWorkspace) -> bool {
     draw(cx, t);
     cx.update_window(t.window, |_, window, _| {
