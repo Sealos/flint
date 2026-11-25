@@ -4,8 +4,8 @@
 //!
 //! A card is built from a cluster's telemetry feed alone ([`ClusterRead`] to [`ClusterCard`]) and
 //! assumes no cluster set. It keeps counts and sparklines, never the objects behind them. Clicks
-//! are not dispatched here: the caller passes a [`CardClick`] that learns which [`CardTarget`]
-//! was clicked.
+//! are not dispatched here: the caller passes [`CardActions`] that name the action for each [`CardTarget`]
+//! clicked.
 
 // module-tests: set_dashboard_tests.rs
 
