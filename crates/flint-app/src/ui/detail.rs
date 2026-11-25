@@ -939,7 +939,7 @@ impl DetailView {
                     .into_any_element(),
             ),
             _ => Some(
-                button
+                with_dropdown_chevron(button)
                     .tooltip(picker_hint(
                         containers.iter().find(|c| c.default).map(|c| &c.name[..]),
                         &keys,
@@ -1069,7 +1069,7 @@ impl DetailView {
             );
         }
         Some(
-            button
+            with_dropdown_chevron(button)
                 .tooltip({
                     let hint = if not_running.contains(&default) {
                         format!("Choose a container (the default, {default}, is not running)")
@@ -1948,6 +1948,10 @@ pub(in crate::ui) fn shell_item(
         container: name.to_owned(),
     };
     (item, action)
+}
+
+fn with_dropdown_chevron(button: Button) -> Button {
+    button.dropdown_caret(true)
 }
 
 /// The tooltip of a button that picks a container: the key skips the picker and opens the
