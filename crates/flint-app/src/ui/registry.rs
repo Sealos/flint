@@ -1081,6 +1081,29 @@ impl fmt::Display for ActionError {
 
 impl std::error::Error for ActionError {}
 
+impl ActionError {
+    /// The refusal as one sentence for the person who clicked: never an internal action name.
+    pub fn for_person(&self) -> String {
+        let sentence = match self {
+            ActionError::NotAvailable(_) => "That is not available in the current view".to_owned(),
+            ActionError::Rejected { reason, .. } => reason.clone(),
+            ActionError::InvalidArgs { message, .. } => message.clone(),
+            ActionError::Unknown(_) => "That is not available".to_owned(),
+        };
+        let mut chars = sentence.chars();
+        let first = chars.next().map(|c| c.to_uppercase().collect::<String>());
+        let text = first
+            .into_iter()
+            .chain(chars.map(String::from))
+            .collect::<String>();
+        if text.ends_with('.') {
+            text
+        } else {
+            format!("{text}.")
+        }
+    }
+}
+
 /// An action the app offers: what it is called, what it does, and how to make one.
 pub struct ActionSpec {
     /// The GPUI action name, `namespace::Name`. Stable: automation and key maps refer to it.
@@ -1470,12 +1493,27 @@ pub fn perform(action: &dyn Action, window: &mut Window, cx: &mut App) -> Result
 }
 
 /// A click handler that performs `action`: what every control in `ui/` uses, so a click is
-/// exactly its action. A refusal is logged: the control was drawn from older state.
+/// exactly its action. A refusal is logged and shown ([`report_refusal`]): the control was
+/// drawn from older state.
 pub fn on_click<E: ?Sized, A: Action>(action: A) -> impl Fn(&E, &mut Window, &mut App) + 'static {
     move |_, window, cx| {
         if let Err(e) = perform(&action, window, cx) {
-            tracing::warn!("{e}");
+            report_refusal(&e, cx);
         }
+    }
+}
+
+/// Logs `error` and tells the person why their click did nothing, in the installed workspace's
+/// notice.
+pub fn report_refusal(error: &ActionError, cx: &mut App) {
+    tracing::warn!("{error}");
+    let workspace = cx
+        .try_global::<Installed>()
+        .and_then(|installed| installed.owner.as_ref()?.upgrade())
+        .and_then(|owner| owner.downcast::<super::workspace::Workspace>().ok());
+    if let Some(workspace) = workspace {
+        let why = error.for_person();
+        workspace.update(cx, |ws, cx| ws.refuse(why, cx));
     }
 }
 
@@ -1487,7 +1525,7 @@ pub fn on_click_in<E: ?Sized, A: Action>(
 ) -> impl Fn(&E, &mut Window, &mut App) + 'static {
     move |_, window, cx| {
         if let Err(e) = dispatch_in(&focus, &action, window, cx) {
-            tracing::warn!("{e}");
+            report_refusal(&e, cx);
         }
     }
 }
@@ -1627,6 +1665,8 @@ struct Guard {
 struct Installed {
     target: Option<FocusHandle>,
     guards: HashMap<TypeId, Guard>,
+    /// The view the guards belong to, which shows a refused click's reason.
+    owner: Option<AnyWeakEntity>,
 }
 
 impl Global for Installed {}
@@ -1695,6 +1735,7 @@ impl<V: 'static> Guards<V> {
 pub fn install<V: 'static>(target: FocusHandle, guards: Guards<V>, cx: &mut App) {
     cx.set_global(Installed {
         target: Some(target),
+        owner: Some(guards.view.into()),
         guards: guards.guards,
     });
 }
@@ -3601,6 +3642,16 @@ pub mod tests {
         ActionError, Bind, Category, Handler, OpenView, Scope, SelectRow, Visibility, actions,
         find, key_hint, key_hint_for,
     };
+
+    #[test]
+    fn a_refusal_reads_as_a_sentence_without_the_action_name() {
+        let gone = ActionError::rejected::<SelectRow>("no row web in the list as shown");
+        assert_eq!(gone.for_person(), "No row web in the list as shown.");
+        let unavailable = ActionError::unavailable::<SelectRow>();
+        let text = unavailable.for_person();
+        assert!(!text.contains("resource_list"), "{text}");
+        assert!(text.ends_with('.'), "{text}");
+    }
 
     /// Collects the names of the actions a view binds.
     pub struct Names(Vec<&'static str>);

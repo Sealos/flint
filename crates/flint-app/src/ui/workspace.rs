@@ -283,6 +283,8 @@ pub struct Workspace {
     /// A right-click selected a row whose detail has not opened yet: the list stays in front
     /// when it does.
     menu_row_pending: bool,
+    /// A right-click made the last selection: its open menu keeps the detail from taking room.
+    right_selected: bool,
     /// The detail pane, when it outlived its list to keep an edit.
     held_edit: Option<unapplied::HeldEdit>,
     /// What last had focus in the list or the detail with no dialog open, and the layout that
@@ -481,6 +483,7 @@ impl Workspace {
             list_in_front: false,
             right_press: false,
             menu_row_pending: false,
+            right_selected: false,
             held_edit: None,
             pane_focus: None,
             dock,
@@ -2768,8 +2771,24 @@ impl Workspace {
     /// pane beside the list: a detail shown alone fills the main area, so the sidebar keeps its
     /// width and its rows can still be told apart.
     fn layout(&self, window_width: f32, cx: &App) -> Layout {
-        let detail_beside = self.detail.is_some() && self.main_panes(cx) == MainPanes::Split;
-        layout(&self.panes, window_width, self.nav_shown(cx), detail_beside)
+        layout(
+            &self.panes,
+            window_width,
+            self.nav_shown(cx),
+            self.detail_beside(cx),
+        )
+    }
+
+    /// Whether the detail takes room beside the list: not while a right-click's menu is open
+    /// on the list, which would reflow under it.
+    fn detail_beside(&self, cx: &App) -> bool {
+        self.detail.is_some()
+            && self.main_panes(cx) == MainPanes::Split
+            && !(self.right_selected
+                && self
+                    .list
+                    .as_ref()
+                    .is_some_and(|l| l.read(cx).has_open_row_menu()))
     }
 
     /// Whether the navigation is on screen: for the active cluster, or for an open set, which
@@ -2975,9 +2994,7 @@ impl Workspace {
                 .min_h_0()
                 .child(div().flex_1().min_w_0().h_full().child(list.clone()))
                 .when_some(
-                    self.detail
-                        .clone()
-                        .filter(|_| self.main_panes(cx) == MainPanes::Split),
+                    self.detail.clone().filter(|_| self.detail_beside(cx)),
                     |el, detail| {
                         el.child(
                             div()
@@ -3892,6 +3909,7 @@ impl Render for Workspace {
                 let right_click = std::mem::take(&mut this.right_press);
                 this.list_in_front = right_click;
                 this.menu_row_pending = right_click;
+                this.right_selected = right_click;
             }))
             .capture_action(cx.listener(|this, _: &OpenObject, _, _| {
                 this.list_in_front = false;
