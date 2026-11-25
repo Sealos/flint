@@ -52,6 +52,10 @@ use super::list::combined::{
     ToggleCombinedProblems, ToggleCombinedWide, ToggleGroupByCluster,
 };
 pub use super::pending_threshold::SetPendingThreshold;
+pub use super::settings_thresholds::{
+    AddClusterOverride, CancelThresholdEntry, EditClusterAlerts, EditClusterWatchMode,
+    EditThreshold, ResetClusterOverrides, TypeThreshold,
+};
 pub use super::settings_view::{
     ActivateSettingsControl, CloseSettings, EditAppearance, EditDesktopNotifications,
     EditWatchMode, NextSettingsControl, OpenSettings, PreviousSettingsControl, RevertSettings,
@@ -2026,9 +2030,80 @@ const CLUSTER_ALERTS: &[Arg] = &[
 ];
 const SETTINGS_SECTION: &[Arg] = &[arg(
     "section",
-    "appearance, alerts or watching",
-    ArgKind::Choice(&["appearance", "alerts", "watching"]),
+    "appearance, alerts, watching, thresholds or cluster_overrides",
+    ArgKind::Choice(&[
+        "appearance",
+        "alerts",
+        "watching",
+        "thresholds",
+        "cluster_overrides",
+    ]),
 )];
+const THRESHOLD_METRICS: &[&str] = &[
+    "cpu_percent",
+    "memory_percent",
+    "restarts_last_hour",
+    "warning_events_last_hour",
+    "pending_pod_seconds",
+];
+const EDIT_THRESHOLD: &[Arg] = &[
+    Arg {
+        name: "cluster",
+        description: "kubeconfig context name; the global value when left out",
+        required: false,
+        kind: ArgKind::Cluster,
+    },
+    arg(
+        "metric",
+        "cpu_percent, memory_percent, restarts_last_hour, warning_events_last_hour or \
+         pending_pod_seconds",
+        ArgKind::Choice(THRESHOLD_METRICS),
+    ),
+    Arg {
+        name: "value",
+        description: "a whole number; left out or empty to follow the level below",
+        required: false,
+        kind: ArgKind::Text,
+    },
+];
+const TYPE_THRESHOLD: &[Arg] = &[
+    Arg {
+        name: "cluster",
+        description: "kubeconfig context name; the global value when left out",
+        required: false,
+        kind: ArgKind::Cluster,
+    },
+    arg(
+        "metric",
+        "cpu_percent, memory_percent, restarts_last_hour, warning_events_last_hour or \
+         pending_pod_seconds",
+        ArgKind::Choice(THRESHOLD_METRICS),
+    ),
+];
+const EDIT_CLUSTER_ALERTS: &[Arg] = &[
+    arg("cluster", "kubeconfig context name", ArgKind::Cluster),
+    arg(
+        "choice",
+        "default, on or off",
+        ArgKind::Choice(&["default", "on", "off"]),
+    ),
+];
+const EDIT_CLUSTER_WATCH_MODE: &[Arg] = &[
+    arg("cluster", "kubeconfig context name", ArgKind::Cluster),
+    arg(
+        "mode",
+        "default, all or on_view",
+        ArgKind::Choice(&["default", "all", "on_view"]),
+    ),
+];
+const RESET_CLUSTER_OVERRIDES: &[Arg] =
+    &[arg("cluster", "kubeconfig context name", ArgKind::Cluster)];
+const ADD_CLUSTER_OVERRIDE: &[Arg] = &[Arg {
+    name: "cluster",
+    description: "kubeconfig context name; shows the list of clusters when left out",
+    required: false,
+    kind: ArgKind::Cluster,
+}];
 const EDIT_APPEARANCE: &[Arg] = &[arg(
     "appearance",
     "system, light or dark",
@@ -2360,6 +2435,52 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Edit Default Watch Mode…",
             "Set the default watch mode in the Settings draft.",
             EDIT_WATCH_MODE,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditThreshold>(
+            "Edit Threshold…",
+            "Set a warning threshold, global or for one cluster, in the Settings draft.",
+            EDIT_THRESHOLD,
+        )
+        .of(C::Flint, S::Settings)
+        // The palette skips the optional value, so from there it could only clear one.
+        .hidden(),
+        Spec::with_args::<TypeThreshold>(
+            "Type Threshold…",
+            "Open the text field of a warning threshold in Settings.",
+            TYPE_THRESHOLD,
+        )
+        .of(C::Flint, S::Settings)
+        .hidden(),
+        Spec::unit::<CancelThresholdEntry>(
+            "Cancel Threshold Entry",
+            "Drop what is typed in a threshold field in Settings.",
+        )
+        .of(C::Flint, S::Settings)
+        .keys(&["escape"], Some(super::settings_view::SETTINGS_INPUT_KEYS))
+        .hidden(),
+        Spec::with_args::<EditClusterAlerts>(
+            "Edit Cluster Alerts Override…",
+            "Set whether one cluster posts desktop notifications, in the Settings draft.",
+            EDIT_CLUSTER_ALERTS,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditClusterWatchMode>(
+            "Edit Cluster Watch Mode Override…",
+            "Set one cluster's watch mode in the Settings draft.",
+            EDIT_CLUSTER_WATCH_MODE,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<ResetClusterOverrides>(
+            "Reset Cluster Overrides…",
+            "Clear one cluster's thresholds, alerts and watch mode overrides in the Settings draft.",
+            RESET_CLUSTER_OVERRIDES,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<AddClusterOverride>(
+            "Add Cluster Override…",
+            "Give a cluster a row in Settings' Cluster overrides.",
+            ADD_CLUSTER_OVERRIDE,
         )
         .of(C::Flint, S::Settings),
         // The view's own Tab cycle, so its controls work without a mouse and Tab never reaches
@@ -3796,6 +3917,7 @@ pub mod tests {
             "workspace::SetNamespaces",
             "detail::ToggleSecretValue",
             "resource_list::CloseDetail",
+            "settings::EditThreshold",
         ] {
             assert!(hidden.contains(&name), "{name} is in the palette");
         }
@@ -3948,13 +4070,15 @@ pub mod tests {
     }
 
     /// Plain keys never fire while typing in a field, except Esc meant for the log search field
-    /// itself (which the field passes on), and the keys the palette's field and the list's
+    /// or a Settings threshold field itself (which the field passes on), and the keys the palette's field and the list's
     /// filter hand on (no field there takes Enter, Esc or Down for itself). Keys with a modifier
     /// are not plain.
     fn plain_key_allowed(key: &str, context: Option<&str>) -> bool {
         key.contains('-')
             || context.is_some_and(|c| c.contains("!Input"))
             || (key == "escape" && context == Some(super::LOG_SEARCH))
+            || (key == "escape"
+                && context == Some(super::super::settings_view::SETTINGS_INPUT_KEYS))
             || context == Some(super::PALETTE_INPUT)
             || (matches!(key, "escape" | "enter" | "down") && context == Some(super::LIST_FILTER))
             || (matches!(key, "tab" | "up" | "down")
