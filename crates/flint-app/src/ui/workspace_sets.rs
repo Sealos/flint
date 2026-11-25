@@ -102,6 +102,8 @@ pub(super) struct RunningSet {
     label: String,
     /// The saved set this view shows, which a rename or delete of it carries over to this view.
     set_id: Option<String>,
+    /// Which opening made this view, so a late answer about another view is not applied to it.
+    token: u64,
     members: Vec<AdmittedMember>,
     /// Members that left their admitted server: their rows are gone and stay gone.
     changed: HashSet<ClusterId>,
@@ -763,6 +765,10 @@ impl Workspace {
         let is_it = |set_id: &Option<String>| set_id.as_deref() == Some(id);
         let open = self.sets.running.as_ref().is_some_and(|r| is_it(&r.set_id));
         let pending = self.sets.opening.as_ref().is_some_and(|o| is_it(&o.set_id));
+        if pending {
+            // Called off whatever is answered about the view that is open.
+            self.sets.opening = None;
+        }
         if open || (pending && self.sets.is_open()) {
             self.close_set(&CloseClusterSet, window, cx);
         } else if pending {
@@ -802,6 +808,8 @@ impl Workspace {
         }
         let name = action.name.trim().to_owned();
         let saved_as = name.clone();
+        let saved_view = self.sets.running.as_ref().map(|run| run.token);
+        let saved_pins = pins.clone();
         let inputs = [
             self.sets.name_input.clone(),
             self.sets.bar_name_input.clone(),
@@ -809,15 +817,21 @@ impl Workspace {
         self.write_sets(
             move |dir| create_cluster_set(dir, &name, &pins),
             move |ws, window, cx| {
+                // Only what this save owns changes: a newer choice or name stays as typed.
                 for input in &inputs {
-                    input.update(cx, |input, cx| input.set_value("", window, cx));
+                    if input.read(cx).value().trim() == saved_as {
+                        input.update(cx, |input, cx| input.set_value("", window, cx));
+                    }
                 }
-                // The set is saved: leave choosing, and let the open view follow it.
                 if from_picking {
-                    ws.sets.picking = false;
-                    ws.sets.picked.clear();
+                    let same = ws.sets.picked.len() == saved_pins.len()
+                        && saved_pins.iter().all(|p| ws.sets.is_picked(&p.context));
+                    if same {
+                        ws.sets.picking = false;
+                        ws.sets.picked.clear();
+                    }
                 } else {
-                    ws.adopt_saved(&saved_as, cx);
+                    ws.adopt_saved(&saved_as, saved_view, cx);
                 }
             },
             window,
@@ -833,11 +847,12 @@ impl Workspace {
     }
 
     /// Makes the unsaved open set the saved set `name`, just written.
-    fn adopt_saved(&mut self, name: &str, cx: &mut Context<Self>) {
+    fn adopt_saved(&mut self, name: &str, view: Option<u64>, cx: &mut Context<Self>) {
         let Some(id) = self.saved_id(name) else {
             return;
         };
-        if let Some(run) = self.sets.running.as_mut().filter(|r| r.set_id.is_none()) {
+        let still_it = |r: &&mut RunningSet| r.set_id.is_none() && Some(r.token) == view;
+        if let Some(run) = self.sets.running.as_mut().filter(still_it) {
             run.set_id = Some(id.clone());
             self.relabel_running(&id, cx);
         }
@@ -884,8 +899,14 @@ impl Workspace {
             },
             move |window, cx| {
                 let _ = again.update(cx, |ws, cx| {
+                    // The bar's field is shown only when not choosing: stop choosing first.
+                    ws.sets.picking = false;
+                    ws.sets.picked.clear();
                     let input = ws.sets.bar_name_input.clone();
-                    input.update(cx, |input, cx| input.focus(window, cx));
+                    cx.notify();
+                    cx.defer_in(window, move |_, window, cx| {
+                        input.update(cx, |input, cx| input.focus(window, cx));
+                    });
                 });
             },
         );
@@ -973,8 +994,12 @@ impl Workspace {
         if self.sets.opening.as_ref().map(|o| o.token) != Some(token) {
             // Closed while the core was admitting it, and nothing newer is on its way.
             let admitted = opened.is_ok_and(|set| !set.members.is_empty());
-            if self.sets.opening.is_none() && !self.sets.is_open() && admitted {
-                drop(self.model.read(cx).core().admit_running_set(Vec::new()));
+            if self.sets.opening.is_none() && admitted {
+                match self.sets.is_open() {
+                    false => drop(self.model.read(cx).core().admit_running_set(Vec::new())),
+                    // Called off while another view stays open: the core runs that one.
+                    true => self.restore_core_set(cx),
+                }
             }
             return;
         }
@@ -1014,6 +1039,7 @@ impl Workspace {
         );
         if let Some(run) = &mut self.sets.running {
             run.set_id = set_id;
+            run.token = token;
             run.left_out = left_out;
         }
         self.refresh_set_kinds(cx);
@@ -1091,6 +1117,7 @@ impl Workspace {
         self.sets.running = Some(RunningSet {
             label,
             set_id: None,
+            token: 0,
             members,
             changed: gone.changed,
             disconnected: gone.disconnected,

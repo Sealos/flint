@@ -2192,3 +2192,34 @@ async fn clicking_the_active_non_member_leaves_the_set(cx: &mut TestAppContext) 
     assert!(!set_is_open(cx, &t), "the set closed");
     assert!(t.find(cx, "cluster-set-view").is_none());
 }
+
+// #767: Return in the set name field saves, as the Save Set button does.
+#[gpui_kit::test]
+async fn return_in_the_name_field_saves(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_quiet_workspace(cx, dir.path()).await;
+    cx.update(|cx| cx.set_global(SettingsDir(dir.path().to_owned())));
+    t.dispatch(cx, "cluster_sets::ToggleClusterPicking", Value::Null)
+        .unwrap();
+    pick(cx, &t, "kind-alpha");
+    pick(cx, &t, "kind-beta");
+    let input = t
+        .workspace
+        .read_with(cx, |ws, _| ws.sets.name_input.clone());
+    cx.update_window(t.window, |_, window, cx| {
+        input.update(cx, |input, cx| input.set_value("pair", window, cx));
+        input.update(cx, |_, cx| {
+            cx.emit(gpui_kit::component::input::InputEvent::PressEnter {
+                secondary: false,
+                shift: false,
+            })
+        });
+    })
+    .unwrap();
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        !workspace.read(cx).sets.saved.is_empty()
+    })
+    .await;
+    assert_eq!(saved_names(cx, &t), ["pair"]);
+}
