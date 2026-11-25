@@ -21,6 +21,13 @@ sorted by most problems first, under a totals strip. A count opens the combined 
 - **Trends are Flint's own samples, kept in memory.** While a cluster is connected (active, warm, or a set member),
   Flint keeps its 15-second metrics-server samples for the last hour in a bounded ring buffer per series. Nothing is
   written to disk and no Prometheus is queried. A cluster that goes cold drops its samples.
+- **One history per cluster, owned by the core's manager, not by a feed.** The feed on the cluster's own connection
+  and the kept feed of a cluster kept watching ([ADR-0012](./0012-keep-recently-used-clusters-warm.md)) write into
+  the same history, so it survives switching away and back, a hand-off between the two feeds (a set member leaving
+  the set, a kept feed falling back to the cluster's connection), a reconnect and a lapsed sign-in. Time with no
+  poll shows as a gap, never as zero. A cluster kept watching holds its history until keep watching is turned off
+  or its consent ends; any other cluster drops it once it is neither selected nor in the open set. A changed
+  context definition (another server or credential) always starts an empty history.
 - **Data:** the dashboard counts as an open view of the kinds it needs, so it watches them while it is showing, in
   either watch mode ([ADR-0008](./0008-watch-everything-on-active-cluster.md)), and stops when the user leaves.
 - **Thresholds are configurable:** typed defaults in `settings.toml` (for example CPU and memory warnings at 90% of
