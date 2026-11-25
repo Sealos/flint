@@ -430,6 +430,15 @@ pub struct ClusterCapacity {
 }
 
 impl ClusterCapacity {
+    /// The node called `name`: what it offers, and what the pods scheduled on it request and
+    /// limit, as `kubectl describe node` shows under "Allocated resources".
+    pub fn node(&self, name: &str) -> Option<&NodeCapacity> {
+        self.nodes
+            .binary_search_by(|node| node.name.as_str().cmp(name))
+            .ok()
+            .map(|at| &self.nodes[at])
+    }
+
     /// What every node offers, each `None` unless all of them report it.
     pub fn allocatable(&self) -> Allocatable {
         let nodes = &self.nodes;
@@ -499,7 +508,7 @@ impl Inventory {
 /// nodes still show what they offer, with what is reserved unknown.
 pub(super) fn capacity_of(stores: &Stores) -> Option<ClusterCapacity> {
     let nodes = stores.nodes.current()?;
-    let tally = stores.pods.current_totals();
+    let tally = stores.pods.current_totals().map(|totals| &totals.tally);
     let mut rows: Vec<NodeCapacity> = nodes
         .iter()
         .filter_map(|node| {
@@ -775,7 +784,7 @@ mod tests {
         let (pod, claim) = pod("a", Some("n"), "Running", "1");
         let spec = pod.spec.unwrap();
         assert!(spec.containers[0].resources.is_none());
-        assert_eq!(claim.unwrap().load.requests.cpu, Some(1_000_000_000));
+        assert_eq!(claim.claim.unwrap().load.requests.cpu, Some(1_000_000_000));
     }
 
     #[test]
@@ -847,7 +856,7 @@ mod tests {
             .map(|i| pod(&format!("p{i}"), Some("a"), "Running", "1"))
             .collect();
         let stores = stores(vec![node("a", "8")], pods);
-        let tally = stores.pods.current_totals().unwrap();
+        let tally = &stores.pods.current_totals().unwrap().tally;
         assert_eq!(tally.loads.ids.len(), 1);
         assert_eq!(tally.nodes.ids.len(), 1);
     }
