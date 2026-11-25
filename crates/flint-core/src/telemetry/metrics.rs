@@ -18,10 +18,16 @@ use kube::Client;
 use tokio::sync::watch;
 
 use super::usage::{Bounded, read_nodes};
-use super::{MetricsCheck, RequestGate, Shared, SideReads, UsageRead};
+use super::{
+    KindCheck, MetricsCheck, RequestGate, Shared, SideReads, TelemetrySnapshot, UsageRead,
+    WatchedKind,
+};
 use crate::cluster::SafeErrorText;
 use crate::metrics::{MetricsError, MetricsList, MetricsResult, NodeMetrics};
 use crate::metrics_trend::TrendStore;
+
+/// The longest the first poll waits for the initial node check.
+const NODES_WAIT: Duration = Duration::from_secs(5);
 
 /// How soon a poll tries a held trend lock again.
 const LOCK_RETRY: Duration = Duration::from_millis(5);
@@ -88,7 +94,7 @@ async fn record(trends: &Mutex<TrendStore>, cluster: &str, result: &MetricsResul
 
 /// Polls until the task is stopped.
 pub(super) async fn run(
-    cluster: Arc<str>,
+    mut latest: watch::Receiver<Arc<TelemetrySnapshot>>,
     client: Client,
     requests: RequestGate,
     trends: Arc<Mutex<TrendStore>>,
@@ -96,6 +102,26 @@ pub(super) async fn run(
     every: Duration,
     reads: watch::Sender<SideReads>,
 ) {
+    // A total needs the node inventory. Polling before the initial check can leave the
+    // dashboard without a total for a full interval even after the watch has opened, so the
+    // first poll waits for it, but never longer than `NODES_WAIT`.
+    let cluster = {
+        let ended = {
+            let waited = tokio::time::timeout(
+                NODES_WAIT,
+                latest
+                    .wait_for(|snapshot| snapshot.kind(WatchedKind::Nodes) != &KindCheck::Starting),
+            )
+            .await;
+            match waited {
+                Ok(Ok(snapshot)) => Some(Arc::clone(&snapshot.cluster)),
+                Ok(Err(_)) => return,
+                Err(_) => None,
+            }
+        };
+        ended.unwrap_or_else(|| Arc::clone(&latest.borrow().cluster))
+    };
+    drop(latest);
     let fetch = || read_nodes(&client, &requests);
     poll(cluster, fetch, trends, shared, every, reads).await;
 }
@@ -148,6 +174,135 @@ mod tests {
     use super::*;
     use crate::metrics::Usage;
     use crate::metrics_trend::{TrendResource, TrendScope};
+    use crate::telemetry::{Telemetry, TelemetryTiming};
+
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::disallowed_methods)] // No cluster or credentials: an in-memory transport.
+    async fn the_first_poll_records_a_total_when_the_node_watch_takes_longer_to_open() {
+        let service = tower::service_fn(|request: http::Request<kube::client::Body>| async move {
+            let (status, body) = match request.uri().path() {
+                "/api/v1/nodes"
+                    if request
+                        .uri()
+                        .query()
+                        .is_some_and(|q| q.contains("watch=true")) =>
+                {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    (200, "")
+                }
+                "/api/v1/nodes" => (
+                    200,
+                    r#"{"metadata":{"resourceVersion":"1"},
+                    "items":[{"metadata":{"name":"a"}}]}"#,
+                ),
+                "/apis/metrics.k8s.io/v1beta1/nodes" => (
+                    200,
+                    r#"{"items":[
+                    {"metadata":{"name":"a"},"usage":{"cpu":"250m","memory":"64Mi"}}
+                ]}"#,
+                ),
+                _ => (404, r#"{"kind":"Status","status":"Failure","code":404}"#),
+            };
+            Ok::<_, std::convert::Infallible>(
+                http::Response::builder()
+                    .status(status)
+                    .body(kube::client::Body::from(body.as_bytes().to_vec()))
+                    .unwrap(),
+            )
+        });
+        let trends = Arc::new(Mutex::new(TrendStore::new()));
+        let mut feed = Telemetry::start(
+            "member".into(),
+            Client::new(service, "default"),
+            crate::cluster::Target::of(&Default::default(), "member"),
+            Arc::clone(&trends),
+            TelemetryTiming::default(),
+            RequestGate::default(),
+            60,
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = feed.latest();
+                if snapshot.kind(WatchedKind::Nodes) == &KindCheck::Current
+                    && snapshot.metrics == (MetricsCheck::Current { nodes: 1 })
+                {
+                    break;
+                }
+                assert!(feed.changed().await);
+            }
+        })
+        .await
+        .expect("the node watch and first metrics poll answer within one poll interval");
+        {
+            let store = trends.lock().unwrap();
+            for (resource, expected) in [
+                (TrendResource::Cpu, 250_000_000),
+                (TrendResource::Memory, 64 * 1024 * 1024),
+            ] {
+                let total = store
+                    .series("member", TrendScope::Total, resource, Timestamp::now())
+                    .and_then(Iterator::last)
+                    .flatten();
+                assert_eq!(total, Some(expected), "{resource:?}");
+            }
+        }
+        feed.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::disallowed_methods)] // No cluster or credentials: an in-memory transport.
+    async fn metrics_are_polled_when_the_node_check_never_finishes() {
+        let service = tower::service_fn(|request: http::Request<kube::client::Body>| async move {
+            let (status, body) = match request.uri().path() {
+                "/api/v1/nodes"
+                    if request
+                        .uri()
+                        .query()
+                        .is_some_and(|q| q.contains("watch=true")) =>
+                {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    (200, "")
+                }
+                "/api/v1/nodes" => std::future::pending().await,
+                "/apis/metrics.k8s.io/v1beta1/nodes" => (
+                    200,
+                    r#"{"items":[
+                    {"metadata":{"name":"a"},"usage":{"cpu":"250m","memory":"64Mi"}}
+                ]}"#,
+                ),
+                _ => (404, r#"{"kind":"Status","status":"Failure","code":404}"#),
+            };
+            Ok::<_, std::convert::Infallible>(
+                http::Response::builder()
+                    .status(status)
+                    .body(kube::client::Body::from(body.as_bytes().to_vec()))
+                    .unwrap(),
+            )
+        });
+        let trends = Arc::new(Mutex::new(TrendStore::new()));
+        let mut feed = Telemetry::start(
+            "member".into(),
+            Client::new(service, "default"),
+            crate::cluster::Target::of(&Default::default(), "member"),
+            Arc::clone(&trends),
+            TelemetryTiming::default(),
+            RequestGate::default(),
+            60,
+        );
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let snapshot = feed.latest();
+                if snapshot.metrics == (MetricsCheck::Current { nodes: 1 }) {
+                    break;
+                }
+                assert!(feed.changed().await);
+            }
+        })
+        .await
+        .expect("the first metrics poll starts without the node check");
+        assert_eq!(feed.latest().kind(WatchedKind::Nodes), &KindCheck::Starting);
+        feed.stop().await;
+    }
 
     fn node_list() -> MetricsResult<NodeMetrics> {
         Ok(MetricsList {
