@@ -13,7 +13,7 @@ use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::*;
 
 use super::super::registry::{ActionError, Bind, Guards};
-use super::super::settings_draft::Change;
+use super::super::settings_draft::{Change, Field};
 use super::super::settings_thresholds::{
     self, AddClusterOverride, CancelThresholdEntry, EditClusterAlerts, EditClusterWatchMode,
     EditThreshold, KnownCluster, OverrideRow, OverridesLayout, ResetClusterOverrides,
@@ -337,6 +337,7 @@ impl Workspace {
             _subscription: subscription,
         });
         self.settings_page.cursor = Some(Stop::Threshold(stop));
+        self.track_threshold_cursor(cx);
         cx.notify();
     }
 
@@ -427,7 +428,15 @@ impl Workspace {
         if !self.settings_page.open || self.settings_page.saving.is_some() {
             return;
         }
-        self.finish_threshold_entry(false, window, cx);
+        // Text typed for this cluster goes with its overrides; for another, it is entered.
+        let own = self
+            .settings_page
+            .thresholds
+            .entry
+            .as_ref()
+            .and_then(|entry| entry.target.cluster.as_ref())
+            .is_some_and(|pin| pin.context == context);
+        self.finish_threshold_entry(!own, window, cx);
         let rows = self.override_rows(cx);
         let row = rows.iter().find(|row| row.context == context);
         let mut changes = vec![Change::ClusterWatchMode {
@@ -479,6 +488,7 @@ impl Workspace {
                 index,
                 ThresholdMetric::ALL[0],
             )));
+            self.track_threshold_cursor(cx);
         }
         cx.notify();
     }
@@ -530,6 +540,83 @@ impl Workspace {
                     self.add_cluster_override(Some(context), window, cx);
                 }
             }
+        }
+    }
+
+    /// Remembers which cluster's row the keyboard cursor stands on, and scrolls its control
+    /// into view.
+    pub(super) fn track_threshold_cursor(&mut self, cx: &App) {
+        let Some(Stop::Threshold(stop)) = self.settings_page.cursor else {
+            self.settings_page.thresholds.cursor_row = None;
+            return;
+        };
+        let rows = self.override_rows(cx);
+        self.settings_page.thresholds.cursor_row = stop
+            .row()
+            .and_then(|index| rows.get(index))
+            .map(|row| row.context.clone());
+        self.settings_page
+            .scroll
+            .scroll_to_item(settings_thresholds::scroll_index(stop, rows.len()));
+    }
+
+    /// Keeps the keyboard cursor and the open field on their cluster when rows above come or
+    /// go (a Save, a reload of the file or kubeconfig), and drops the cursor when its row is
+    /// gone. Called as the workspace draws and before the cursor moves or is used.
+    pub(super) fn follow_threshold_rows(&mut self, cx: &App) {
+        if !self.settings_page.open {
+            return;
+        }
+        let rows = self.override_rows(cx);
+        let index_of = |context: &str| rows.iter().position(|row| row.context == context);
+        if let Some(Stop::Threshold(stop)) = self.settings_page.cursor
+            && stop.row().is_some()
+            && let Some(context) = &self.settings_page.thresholds.cursor_row
+        {
+            self.settings_page.cursor = index_of(context).map(|i| Stop::Threshold(stop.at_row(i)));
+        }
+        if let Some(entry) = &mut self.settings_page.thresholds.entry
+            && let Some(pin) = &entry.target.cluster
+            && let Some(i) = index_of(&pin.context)
+        {
+            entry.stop = entry.stop.at_row(i);
+        }
+        // A value rejected for an override no row is bound to any more (its context now
+        // points elsewhere) has nowhere to be fixed: it would block Save for good.
+        let bound: Vec<_> = rows.iter().filter_map(OverrideRow::pin).collect();
+        self.settings_page
+            .draft
+            .retain_rejected(|field| match field {
+                Field::Threshold {
+                    cluster: Some(pin), ..
+                } => bound.iter().any(|b| b.matches(&pin.context, &pin.server)),
+                _ => true,
+            });
+    }
+
+    /// Closes the open field when its cluster no longer has a row to draw it in (entering
+    /// its text), so focus is not left on a field that is not drawn.
+    pub(super) fn close_orphaned_threshold_entry(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let orphaned = self
+            .settings_page
+            .thresholds
+            .entry
+            .as_ref()
+            .is_some_and(|entry| {
+                entry.target.cluster.as_ref().is_some_and(|pin| {
+                    !self
+                        .override_rows(cx)
+                        .iter()
+                        .filter_map(OverrideRow::pin)
+                        .any(|row| row.matches(&pin.context, &pin.server))
+                })
+            });
+        if orphaned && self.settings_page.open {
+            self.finish_threshold_entry(true, window, cx);
         }
     }
 

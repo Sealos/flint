@@ -3868,6 +3868,8 @@ impl Render for Workspace {
         self.close_finished_held_edit(window, cx);
         self.settings_follow_main();
         self.flush_threshold_entry(cx);
+        self.follow_threshold_rows(cx);
+        self.close_orphaned_threshold_entry(window, cx);
         let window_width = f32::from(window.viewport_size().width);
         let window_height = f32::from(window.viewport_size().height);
         self.sync_narrow_layout(window_width, window, cx);

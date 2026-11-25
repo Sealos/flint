@@ -88,6 +88,13 @@ impl SettingsDraft {
         !self.rejected.is_empty()
     }
 
+    /// Keeps only the rejected values whose field `keep` accepts: one for an override that no
+    /// longer applies to any cluster has nowhere to be fixed.
+    pub fn retain_rejected(&mut self, mut keep: impl FnMut(&Field) -> bool) {
+        self.rejected.retain(|field, _| keep(field));
+        self.settle();
+    }
+
     /// Every rejected value, in a stable order.
     #[cfg(any(test, feature = "automation"))]
     pub fn all_rejected(&self) -> impl Iterator<Item = (&Field, &Rejected)> + '_ {

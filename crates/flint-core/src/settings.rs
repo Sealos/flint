@@ -956,6 +956,11 @@ pub fn save_state(dir: &Path, state: &State) -> Result<(), SettingsError> {
 }
 
 /// Server URLs compare equal when they differ only by a trailing slash.
+/// `pin` with its server as [`server_identity`] gives it.
+fn pin_identity(pin: &ClusterPin) -> ClusterPin {
+    ClusterPin::new(pin.context.clone(), server_identity(&pin.server))
+}
+
 fn same_server(a: &str, b: &str) -> bool {
     server_identity(a) == server_identity(b)
 }
@@ -1343,6 +1348,21 @@ pub enum SettingsField {
 }
 
 impl SettingsField {
+    /// A threshold's field: global (`cluster` is `None`) or one cluster's override. The server is
+    /// compared as the setters compare it ([`server_identity`]), so two spellings of one server
+    /// are one field.
+    pub fn threshold(cluster: Option<&ClusterPin>, metric: ThresholdMetric) -> Self {
+        SettingsField::Threshold {
+            cluster: cluster.map(pin_identity),
+            metric,
+        }
+    }
+
+    /// A cluster's desktop alerts field, its server compared as [`SettingsField::threshold`]'s.
+    pub fn cluster_alerts(cluster: &ClusterPin) -> Self {
+        SettingsField::ClusterAlerts(pin_identity(cluster))
+    }
+
     /// Where it is stored in `settings.toml`.
     pub fn key(&self) -> String {
         match self {
@@ -1401,13 +1421,8 @@ impl SettingsWrite {
             SettingsWrite::WatchMode(_) => SettingsField::WatchMode,
             SettingsWrite::Threshold {
                 cluster, metric, ..
-            } => SettingsField::Threshold {
-                cluster: cluster.clone(),
-                metric: *metric,
-            },
-            SettingsWrite::ClusterAlerts { cluster, .. } => {
-                SettingsField::ClusterAlerts(cluster.clone())
-            }
+            } => SettingsField::threshold(cluster.as_ref(), *metric),
+            SettingsWrite::ClusterAlerts { cluster, .. } => SettingsField::cluster_alerts(cluster),
             SettingsWrite::ClusterWatchMode { context, .. } => {
                 SettingsField::ClusterWatchMode(context.clone())
             }
@@ -1481,6 +1496,28 @@ impl SettingsWrite {
                 }
             },
         }
+    }
+
+    /// Checks, without writing, that `settings.toml` in `dir` can take it: a threshold needs a
+    /// `thresholds` section (and `clusters` list) of the right shape. A Save checks every write
+    /// first, so a refused one does not leave the others half written.
+    pub fn check(&self, dir: &Path) -> Result<(), SettingsError> {
+        let SettingsWrite::Threshold {
+            cluster,
+            metric,
+            value,
+        } = self
+        else {
+            return Ok(());
+        };
+        let path = dir.join(SETTINGS_FILE);
+        let mut table: toml::Table = load_toml(&path)?;
+        thresholds::write_value(&mut table, cluster.as_ref(), *metric, *value)
+            .map(drop)
+            .map_err(|e| SettingsError::Invalid {
+                path,
+                reason: e.to_string(),
+            })
     }
 
     /// Writes it to `settings.toml` in `dir`, through the same setter the other controls use.
@@ -3032,6 +3069,48 @@ mod tests {
             assert_eq!(in_memory, written, "{write:?}");
             assert!(write.holds_in(&written), "{write:?}");
         }
+    }
+
+    #[test]
+    fn two_spellings_of_a_server_are_one_field() {
+        let cpu = ThresholdMetric::CpuPercent;
+        let write = |server: &str| SettingsWrite::Threshold {
+            cluster: Some(ClusterPin::new("prod", server)),
+            metric: cpu,
+            value: Some(70),
+        };
+        assert_eq!(
+            write("https://prod.example:6443/").field(),
+            write("https://prod.example:6443").field()
+        );
+        let alerts = |server: &str| SettingsWrite::ClusterAlerts {
+            cluster: ClusterPin::new("prod", server),
+            enabled: Some(true),
+        };
+        assert_eq!(alerts("https://p/").field(), alerts("https://p").field());
+    }
+
+    #[test]
+    fn a_threshold_write_is_checked_before_anything_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SETTINGS_FILE), "thresholds = 1\n").unwrap();
+        let write = SettingsWrite::Threshold {
+            cluster: None,
+            metric: ThresholdMetric::CpuPercent,
+            value: Some(80),
+        };
+        assert!(write.check(dir.path()).is_err());
+        assert!(
+            SettingsWrite::Appearance(Appearance::Dark)
+                .check(dir.path())
+                .is_ok()
+        );
+        let ok = tempfile::tempdir().unwrap();
+        assert!(write.check(ok.path()).is_ok());
+        assert!(
+            !ok.path().join(SETTINGS_FILE).exists(),
+            "a check writes nothing"
+        );
     }
 
     #[test]

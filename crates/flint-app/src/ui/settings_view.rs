@@ -256,6 +256,8 @@ pub struct SettingsPage {
     pub cursor: Option<Stop>,
     /// Thresholds and Cluster overrides: rows added, the cluster list, the field being typed.
     pub thresholds: ThresholdsPage,
+    /// The scrolling content, so the keyboard cursor can bring a control into view.
+    pub scroll: ScrollHandle,
 }
 
 impl SettingsPage {
@@ -270,6 +272,7 @@ impl SettingsPage {
             save_note: None,
             cursor: None,
             thresholds: ThresholdsPage::default(),
+            scroll: ScrollHandle::new(),
         }
     }
 
@@ -471,9 +474,10 @@ pub fn render(
                         .min_w_0()
                         .h_full()
                         .overflow_y_scroll()
+                        .track_scroll(&page.scroll)
                         .p_4()
                         .gap_3()
-                        .child(section_body(page, &shown, clusters, theme)),
+                        .children(section_body(page, &shown, clusters, theme)),
                 ),
         )
         .child(footer(page, invalid, theme))
@@ -576,10 +580,11 @@ fn section_body(
     shown: &Settings,
     clusters: &[KnownCluster],
     theme: &Theme,
-) -> AnyElement {
+) -> Vec<AnyElement> {
     let draft = &page.draft;
+    let one = |element: AnyElement| vec![element];
     match page.section {
-        Section::Appearance => group(
+        Section::Appearance => one(group(
             "Appearance",
             "Flint Light, Flint Dark, or whichever the system uses. View > Appearance changes it at \
              once; here it changes on Save.",
@@ -608,8 +613,8 @@ fn section_body(
                 }),
             ),
         )
-        .into_any_element(),
-        Section::Alerts => group(
+        .into_any_element()),
+        Section::Alerts => one(group(
             "Desktop notifications",
             "Post a notification when a watched cluster has a new problem. Only clusters that \
              watch all kinds are covered. A cluster's own choice (Cluster overrides, or the \
@@ -630,8 +635,8 @@ fn section_body(
                     })),
             )),
         )
-        .into_any_element(),
-        Section::Watching => group(
+        .into_any_element()),
+        Section::Watching => one(group(
             "Default watch mode",
             "Which kinds are watched on the active cluster. All kinds keeps the overview, \
              problems and alerts live; Open views only watches a kind while a view shows it. A \
@@ -660,7 +665,7 @@ fn section_body(
                 }),
             ),
         )
-        .into_any_element(),
+        .into_any_element()),
         Section::Thresholds => settings_thresholds::render_global(page, shown, theme),
         Section::ClusterOverrides => {
             let rows = settings_thresholds::override_rows(shown, clusters, &page.thresholds.added);
@@ -699,6 +704,8 @@ pub(super) fn group(title: &'static str, text: &'static str, edited: bool, theme
 fn footer(page: &SettingsPage, invalid: bool, theme: &Theme) -> impl IntoElement {
     let draft = &page.draft;
     let dirty = draft.is_dirty();
+    // A threshold still being typed is entered by Save and dropped by Revert.
+    let typing = page.thresholds.entry.is_some();
     let saving = page.saving.is_some();
     let (note, color): (SharedString, Hsla) = match &page.save_note {
         _ if saving => ("Saving…".into(), theme.muted_foreground),
@@ -733,7 +740,7 @@ fn footer(page: &SettingsPage, invalid: bool, theme: &Theme) -> impl IntoElement
             Button::new("settings-revert")
                 .small()
                 .label("Revert")
-                .disabled(saving || !dirty)
+                .disabled(saving || !(dirty || typing))
                 .on_click(registry::on_click(RevertSettings)),
         ))
         .child(ring(
@@ -744,7 +751,7 @@ fn footer(page: &SettingsPage, invalid: bool, theme: &Theme) -> impl IntoElement
                 .small()
                 .primary()
                 .label("Save")
-                .disabled(saving || !can_save(draft, invalid))
+                .disabled(saving || invalid || !(can_save(draft, invalid) || typing))
                 .on_click(registry::on_click(SaveSettings)),
         ))
 }

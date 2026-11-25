@@ -279,10 +279,7 @@ pub struct ThresholdTarget {
 
 impl ThresholdTarget {
     pub fn field(&self) -> Field {
-        Field::Threshold {
-            cluster: self.cluster.clone(),
-            metric: self.metric,
-        }
+        Field::threshold(self.cluster.as_ref(), self.metric)
     }
 
     /// The value set at this level, if any.
@@ -436,6 +433,27 @@ pub enum ThresholdStop {
 }
 
 impl ThresholdStop {
+    /// The row it belongs to, for a control of a Cluster overrides row.
+    pub fn row(self) -> Option<usize> {
+        match self {
+            Self::Cell(row, _) | Self::Alerts(row) | Self::Watch(row) | Self::Reset(row) => {
+                Some(row)
+            }
+            Self::Global(_) | Self::Add | Self::Pick(_) => None,
+        }
+    }
+
+    /// The same control on row `row`.
+    pub fn at_row(self, row: usize) -> Self {
+        match self {
+            Self::Cell(_, metric) => Self::Cell(row, metric),
+            Self::Alerts(_) => Self::Alerts(row),
+            Self::Watch(_) => Self::Watch(row),
+            Self::Reset(_) => Self::Reset(row),
+            other => other,
+        }
+    }
+
     /// The element id of the control.
     pub fn id(self) -> SharedString {
         match self {
@@ -495,24 +513,26 @@ pub struct ThresholdsPage {
     pub picking: bool,
     /// The threshold being typed.
     pub entry: Option<ThresholdEntry>,
+    /// The cluster whose row the keyboard cursor stands on, so the cursor follows it when rows
+    /// above come or go.
+    pub cursor_row: Option<String>,
 }
 
-/// The Thresholds section.
-pub fn render_global(page: &SettingsPage, shown: &Settings, theme: &Theme) -> AnyElement {
-    let edited = ThresholdMetric::ALL.into_iter().any(|metric| {
-        page.draft.is_edited(&Field::Threshold {
-            cluster: None,
-            metric,
-        })
-    });
-    group(
+/// The Thresholds section, as the children of the scrolling content: its heading, then a
+/// field per metric ([`scroll_index`]).
+pub fn render_global(page: &SettingsPage, shown: &Settings, theme: &Theme) -> Vec<AnyElement> {
+    let edited = ThresholdMetric::ALL
+        .into_iter()
+        .any(|metric| page.draft.is_edited(&Field::threshold(None, metric)));
+    let heading = group(
         "Warning thresholds",
         "The cluster overview warns from these values, on every cluster without its own \
          (Cluster overrides). Leave a field empty for the built-in default.",
         edited,
         theme,
     )
-    .children(ThresholdMetric::ALL.map(|metric| {
+    .into_any_element();
+    let fields = ThresholdMetric::ALL.map(|metric| {
         let target = ThresholdTarget {
             cluster: None,
             metric,
@@ -545,22 +565,53 @@ pub fn render_global(page: &SettingsPage, shown: &Settings, theme: &Theme) -> An
                     ),
             )
             .children(rejected.map(|r| error_text(stop.id(), &r.why, theme)))
-    }))
-    .into_any_element()
+            .into_any_element()
+    });
+    std::iter::once(heading).chain(fields).collect()
 }
 
-/// The Cluster overrides section: a block per row, its controls wrapping to the width there is.
+/// Which child of the scrolling content holds `stop`, as [`render_global`] and
+/// [`render_overrides`] lay them out: the heading first, then one per field or row, then Add
+/// override and its list.
+pub fn scroll_index(stop: ThresholdStop, rows: usize) -> usize {
+    match stop {
+        ThresholdStop::Global(metric) => {
+            1 + ThresholdMetric::ALL
+                .iter()
+                .position(|m| *m == metric)
+                .unwrap_or(0)
+        }
+        ThresholdStop::Cell(row, _)
+        | ThresholdStop::Alerts(row)
+        | ThresholdStop::Watch(row)
+        | ThresholdStop::Reset(row) => 1 + row,
+        ThresholdStop::Add => 1 + rows,
+        ThresholdStop::Pick(_) => 2 + rows,
+    }
+}
+
+/// The Cluster overrides section, as the children of the scrolling content: its heading, a
+/// block per row (its controls wrapping to the width there is), Add override and its list.
 pub fn render_overrides(
     page: &SettingsPage,
     shown: &Settings,
     rows: &[OverrideRow],
     candidates: &[String],
     theme: &Theme,
-) -> AnyElement {
+) -> Vec<AnyElement> {
     let edited = rows.iter().any(|row| row_edited(page, row));
-    let mut table = v_flex().id("settings-overrides").gap_2();
+    let mut heading = group(
+        "Cluster overrides",
+        "Clusters whose warning thresholds, desktop alerts or watch mode differ from the global \
+         settings. An empty threshold shows the global value and follows it. Thresholds and \
+         alerts are bound to the server the context points to now.",
+        edited,
+        theme,
+    )
+    .id("settings-overrides")
+    .max_w(px(TABLE_WIDTH));
     if rows.is_empty() {
-        table = table.child(
+        heading = heading.child(
             div()
                 .id("settings-overrides-empty")
                 .text_xs()
@@ -569,8 +620,14 @@ pub fn render_overrides(
                 .test_support(),
         );
     }
+    let mut items = vec![heading.into_any_element()];
     for (index, row) in rows.iter().enumerate() {
-        table = table.child(override_row(page, shown, index, row, theme));
+        items.push(
+            div()
+                .max_w(px(TABLE_WIDTH))
+                .child(override_row(page, shown, index, row, theme))
+                .into_any_element(),
+        );
     }
     let picking = page.thresholds.picking;
     let add = h_flex().gap_2().child(ring(
@@ -624,19 +681,9 @@ pub fn render_overrides(
             .test_support()
             .into_any_element()
     });
-    group(
-        "Cluster overrides",
-        "Clusters whose warning thresholds, desktop alerts or watch mode differ from the global \
-         settings. An empty threshold shows the global value and follows it. Thresholds and \
-         alerts are bound to the server the context points to now.",
-        edited,
-        theme,
-    )
-    .max_w(px(TABLE_WIDTH))
-    .child(table)
-    .child(add)
-    .children(picker)
-    .into_any_element()
+    items.push(add.into_any_element());
+    items.extend(picker);
+    items
 }
 
 /// One row of Cluster overrides: the cluster and Reset, then a labelled control per threshold,
@@ -812,13 +859,10 @@ fn row_edited(page: &SettingsPage, row: &OverrideRow) -> bool {
     let Some(pin) = row.pin() else {
         return false;
     };
-    draft.is_edited(&Field::ClusterAlerts(pin.clone()))
-        || ThresholdMetric::ALL.into_iter().any(|metric| {
-            draft.is_edited(&Field::Threshold {
-                cluster: Some(pin.clone()),
-                metric,
-            })
-        })
+    draft.is_edited(&Field::cluster_alerts(&pin))
+        || ThresholdMetric::ALL
+            .into_iter()
+            .any(|metric| draft.is_edited(&Field::threshold(Some(&pin), metric)))
 }
 
 /// Whether a field of `section` holds an edit, for the section list's dot.
@@ -841,7 +885,12 @@ fn number_cell(
     width: f32,
     theme: &Theme,
 ) -> AnyElement {
-    if let Some(entry) = page.thresholds.entry.as_ref().filter(|e| e.stop == stop) {
+    if let Some(entry) = page
+        .thresholds
+        .entry
+        .as_ref()
+        .filter(|e| e.target == *target)
+    {
         return div()
             .w(px(width))
             .child(

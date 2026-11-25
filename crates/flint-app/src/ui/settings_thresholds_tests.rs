@@ -10,9 +10,10 @@ use gpui_kit::test::TestAppContextExt as _;
 use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
 
+use super::closing::Quits;
 use super::settings_view::REJECTED;
 use super::support_tests::{
-    TestWorkspace, WAIT, alpha_and_beta, open_workspace, open_workspace_with,
+    TestWorkspace, WAIT, alpha_and_beta, kubeconfig_yaml, open_workspace, open_workspace_with,
 };
 use super::view_state::{AppState, DialogState, Focus};
 
@@ -587,4 +588,212 @@ async fn threshold_actions_refuse_an_unknown_cluster(cx: &mut TestAppContext) {
         .is_err()
     );
     assert!(!state(cx, &t).settings.dirty);
+}
+
+/// Saves watch mode overrides for both clusters, so each has a row: kind-alpha first.
+async fn rows_for_both(cx: &mut TestAppContext, t: &TestWorkspace) {
+    for (cluster, mode) in [("kind-alpha", "on_view"), ("kind-beta", "on_view")] {
+        edit(
+            cx,
+            t,
+            "settings::EditClusterWatchMode",
+            json!({ "cluster": cluster, "mode": mode }),
+        );
+    }
+    t.click(cx, "settings-save");
+    wait_for_file(cx, t, |s| s.cluster_watch_mode.len() == 2).await;
+}
+
+// covers UP-126, UP-67: a threshold still being typed is an unsaved edit: quitting asks.
+#[gpui_kit::test]
+async fn quit_with_only_a_value_being_typed_asks(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_section(cx, dir.path(), "thresholds").await;
+    t.click(cx, "settings-threshold-cpu_percent");
+    t.type_text(cx, "80");
+    assert!(!state(cx, &t).settings.dirty, "not entered yet");
+    t.press_key_of(cx, "flint::Quit");
+    cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
+        .await;
+    let dialog: DialogState = state(cx, &t).dialog.expect("a dialog is open");
+    assert_eq!(dialog.title, "Save your settings?");
+    assert_eq!(
+        cx.update(|cx| cx.try_global::<Quits>().map_or(0, |q| q.0)),
+        0
+    );
+    assert_eq!(
+        state(cx, &t).settings.thresholds.global["cpu_percent"],
+        Some(80)
+    );
+}
+
+// covers UP-67: the first edit, still being typed, is saved by Save, and Revert drops it.
+#[gpui_kit::test]
+async fn save_and_revert_work_on_a_value_still_being_typed(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_section(cx, dir.path(), "thresholds").await;
+    t.click(cx, "settings-threshold-restarts_last_hour");
+    t.type_text(cx, "3");
+    assert!(t.available(cx).contains(&"settings::RevertSettings"));
+    t.click(cx, "settings-revert");
+    let s = state(cx, &t).settings;
+    assert!(!s.dirty && s.thresholds.typing.is_none(), "{s:?}");
+
+    t.click(cx, "settings-threshold-restarts_last_hour");
+    t.type_text(cx, "3");
+    assert!(t.available(cx).contains(&"settings::SaveSettings"));
+    t.click(cx, "settings-save");
+    wait_for_file(cx, &t, |s| {
+        s.thresholds.global.get(ThresholdMetric::RestartsLastHour) == Some(3)
+    })
+    .await;
+    assert!(t.settings_toml().contains("restarts_last_hour = 3"));
+
+    // Typed out of range, Save enters it and stops there.
+    t.click(cx, "settings-threshold-restarts_last_hour");
+    t.press(cx, "secondary-a");
+    t.type_text(cx, "0");
+    t.click(cx, "settings-save");
+    let s = state(cx, &t).settings;
+    assert_eq!(s.thresholds.rejected.len(), 1, "{s:?}");
+    assert!(!s.saving);
+}
+
+// covers UP-67: Reset on another cluster keeps what is typed for this one.
+#[gpui_kit::test]
+async fn reset_of_another_cluster_keeps_the_value_being_typed(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_section(cx, dir.path(), "cluster_overrides").await;
+    rows_for_both(cx, &t).await;
+    t.click(cx, "settings-override-0-cpu_percent");
+    t.type_text(cx, "70");
+    t.click(cx, "settings-override-1-reset");
+    let s = state(cx, &t).settings;
+    let alpha = s
+        .thresholds
+        .overrides
+        .iter()
+        .find(|r| r.cluster == "kind-alpha")
+        .unwrap();
+    assert_eq!(alpha.thresholds["cpu_percent"], Some(70));
+    assert_eq!(alpha.watch_mode, "on_view");
+}
+
+// covers UP-67: the keyboard cursor follows its cluster when a row appears above it.
+#[gpui_kit::test]
+async fn the_cursor_follows_its_cluster_when_rows_change(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_section(cx, dir.path(), "cluster_overrides").await;
+    edit(
+        cx,
+        &t,
+        "settings::EditClusterWatchMode",
+        json!({ "cluster": "kind-beta", "mode": "on_view" }),
+    );
+    t.click(cx, "settings-save");
+    wait_for_file(cx, &t, |s| s.cluster_watch_mode.len() == 1).await;
+    for _ in 0..30 {
+        t.press(cx, "tab");
+        if state(cx, &t).settings.cursor.as_deref() == Some("settings-override-0-watch") {
+            break;
+        }
+    }
+    assert_eq!(
+        state(cx, &t).settings.cursor.as_deref(),
+        Some("settings-override-0-watch")
+    );
+    // kind-alpha gets a row above, from outside Settings (its header's watch mode menu).
+    t.model.update(cx, |model, _| {
+        model.set_watch_mode(Some("kind-alpha".into()), Some(WatchMode::All))
+    });
+    wait_for_file(cx, &t, |s| s.cluster_watch_mode.len() == 2).await;
+    t.press(cx, "enter");
+    let s = state(cx, &t).settings;
+    assert_eq!(s.cursor.as_deref(), Some("settings-override-1-watch"));
+    let mode = |name: &str| {
+        s.thresholds
+            .overrides
+            .iter()
+            .find(|r| r.cluster == name)
+            .unwrap()
+            .watch_mode
+    };
+    assert_eq!(mode("kind-alpha"), "all", "kind-alpha is untouched");
+    assert_eq!(
+        mode("kind-beta"),
+        "default",
+        "Enter worked kind-beta's control"
+    );
+}
+
+// covers UP-67: after switching section, Enter works the section list, not a threshold of the
+// section left.
+#[gpui_kit::test]
+async fn switching_section_moves_the_cursor_to_the_section_list(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_section(cx, dir.path(), "thresholds").await;
+    for _ in 0..7 {
+        t.press(cx, "tab");
+    }
+    assert_eq!(
+        state(cx, &t).settings.cursor.as_deref(),
+        Some("settings-threshold-cpu_percent")
+    );
+    t.click(cx, "settings-section-watching");
+    assert_eq!(
+        state(cx, &t).settings.cursor.as_deref(),
+        Some("settings-section-watching")
+    );
+    t.press(cx, "enter");
+    let s = state(cx, &t).settings;
+    assert_eq!(s.thresholds.typing, None);
+    assert_eq!(s.section, super::settings_view::Section::Watching);
+}
+
+// covers UP-67: a value rejected for an override whose context now points to another server
+// has nowhere to be fixed, so it no longer blocks Save.
+#[gpui_kit::test]
+async fn a_rejected_override_of_a_repointed_context_is_retired(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_section(cx, dir.path(), "cluster_overrides").await;
+    edit(
+        cx,
+        &t,
+        "settings::EditThreshold",
+        json!({ "cluster": "kind-alpha", "metric": "cpu_percent", "value": "0" }),
+    );
+    edit(
+        cx,
+        &t,
+        "settings::EditWatchMode",
+        json!({ "mode": "on_view" }),
+    );
+    assert!(!state(cx, &t).settings.can_save);
+    let beta = t.model.read_with(cx, |model, _| {
+        model
+            .clusters
+            .iter()
+            .find(|c| c.info.name == "kind-beta")
+            .and_then(|c| c.info.server.clone())
+            .unwrap()
+    });
+    std::fs::write(
+        dir.path().join("kubeconfig"),
+        kubeconfig_yaml(&[("kind-alpha", "https://127.0.0.1:9"), ("kind-beta", &beta)]),
+    )
+    .unwrap();
+    let core = t.workspace.read_with(cx, |ws, cx| ws.core(cx).clone());
+    core.reload_kubeconfig().await.unwrap();
+    cx.run_until_parked();
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model.read(cx).clusters.iter().any(|c| {
+            c.info.name == "kind-alpha" && c.info.server.as_deref() == Some("https://127.0.0.1:9")
+        })
+    })
+    .await;
+    t.find(cx, "settings-view");
+    let s = state(cx, &t).settings;
+    assert!(s.thresholds.rejected.is_empty(), "{s:?}");
+    assert!(s.can_save);
 }

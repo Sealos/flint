@@ -52,9 +52,16 @@ impl Workspace {
             .when::<EditAppearance>(editable)
             .when::<EditDesktopNotifications>(editable)
             .when::<EditWatchMode>(editable)
-            .when::<SaveSettings>(|ws, cx| ws.can_save_settings(cx))
+            // A threshold still being typed is entered by Save, which then checks the draft,
+            // and dropped by Revert.
+            .when::<SaveSettings>(|ws, cx| {
+                ws.can_save_settings(cx)
+                    || (ws.settings_page.thresholds.entry.is_some()
+                        && ws.settings_page.saving.is_none()
+                        && !ws.settings_invalid(cx))
+            })
             .when::<RevertSettings>(|ws, _| {
-                ws.settings_page.draft.is_dirty() && ws.settings_page.saving.is_none()
+                ws.has_settings_draft() && ws.settings_page.saving.is_none()
             })
     }
 
@@ -164,6 +171,10 @@ impl Workspace {
         if self.settings_page.open {
             self.finish_threshold_entry(true, window, cx);
             self.settings_page.section = section;
+            // The cursor stays on the section list, never on a control no longer drawn.
+            if self.settings_page.cursor.is_some() {
+                self.settings_page.cursor = Some(Stop::Section(section));
+            }
             cx.notify();
         }
     }
@@ -256,6 +267,7 @@ impl Workspace {
         if !self.settings_page.open {
             return;
         }
+        self.follow_threshold_rows(cx);
         let banner = self.settings_banner_shown(cx);
         let layout = self.overrides_layout(cx);
         let stops = settings_view::stops(self.settings_page.section, banner, layout);
@@ -270,14 +282,22 @@ impl Workspace {
             (Some(i), false) => (i + stops.len() - 1) % stops.len(),
         };
         self.settings_page.cursor = Some(stops[next]);
+        self.track_threshold_cursor(cx);
         cx.notify();
     }
 
     /// Enter or Space: does what clicking the control under the cursor does.
     fn activate_settings_control(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.follow_threshold_rows(cx);
         let Some(stop) = self.settings_page.cursor else {
             return;
         };
+        // Only a control drawn now: never one of a section no longer shown.
+        let banner = self.settings_banner_shown(cx);
+        let layout = self.overrides_layout(cx);
+        if !settings_view::stops(self.settings_page.section, banner, layout).contains(&stop) {
+            return;
+        }
         match stop {
             Stop::Done => self.close_settings(window, cx),
             Stop::Reload | Stop::Revert => {
@@ -337,7 +357,7 @@ impl Workspace {
 
     /// Whether Settings holds edits not yet written, a Save under way included.
     pub(in crate::ui) fn has_settings_draft(&self) -> bool {
-        self.settings_page.draft.is_dirty()
+        self.settings_page.draft.is_dirty() || self.settings_page.thresholds.entry.is_some()
     }
 
     /// Asks Save / Discard / Cancel about unsaved settings, if there are any; Save (once
