@@ -132,11 +132,12 @@ mod tests {
         ConnectionState, Event, KindId, SafeErrorText, SectionKind, ServerVersion, SyncState,
     };
     use gpui_kit::TestAppContext;
+    use gpui_kit::test::TestAppContextExt as _;
     use serde_json::{Value, json};
 
     use crate::ui::set_kinds::{KindCoverage, MemberKinds};
     use crate::ui::support_tests::{
-        CURRENT_GENERATION, TestWorkspace, discovery, entry, open_workspace, section,
+        CURRENT_GENERATION, TestWorkspace, WAIT, discovery, entry, open_workspace, section,
         standard_sections,
     };
 
@@ -414,6 +415,12 @@ mod tests {
         cx.run_until_parked();
         t.dispatch(cx, "cluster_sets::CloseClusterSet", Value::Null)
             .unwrap();
+        // An unsaved set asks before it closes.
+        cx.wait_for(t.window, WAIT, |window, cx| {
+            gpui_kit::component::WindowExt::has_active_dialog(window, cx)
+        })
+        .await;
+        t.click(cx, "ok");
         cx.run_until_parked();
         let cleared = t
             .workspace
