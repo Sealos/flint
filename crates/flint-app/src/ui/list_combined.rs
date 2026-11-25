@@ -7,6 +7,7 @@
 //! The workspace opens it with [`CombinedResourceList::new`] and a [`CombinedSource`], then calls
 //! [`CombinedResourceList::set_source`] for each update.
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,8 +41,9 @@ use super::super::registry::{
     self, CloseDetail, FocusFilter, FocusRows, OpenSelectedRow, SelectFirst, SelectFromFilter,
     SelectLast, SelectNext, SelectPrev,
 };
+use super::super::set_members;
 use super::problems::{self, ClusterProblems, MemberFilter, ProblemFilter, ProblemListKind};
-use super::{CONTEXT, ROW_HEIGHT, limited_text, notice, state_chip, tabular_figures};
+use super::{CONTEXT, ROW_HEIGHT, limited_text, notice, sign_in_chip, state_chip, tabular_figures};
 
 /// Selects a row by its cluster and uid, as clicking it does.
 #[derive(Debug, Clone, Default, PartialEq, serde::Deserialize, Action)]
@@ -126,6 +128,8 @@ pub struct CombinedResourceList {
     pub(in super::super) label: String,
     /// Which members lack this kind, or can't be confirmed to serve it.
     kind_note: Option<String>,
+    /// Members that need a sign-in: their chip says so, and a click signs in.
+    signed_out: HashSet<ClusterId>,
     latest: CombinedSource,
     /// The source being drawn and its view. Always replaced together: a [`RowRef`] means
     /// nothing in any other list.
@@ -211,6 +215,7 @@ impl CombinedResourceList {
         let mut list = Self {
             label,
             kind_note: None,
+            signed_out: HashSet::new(),
             shown: source.clone(),
             latest: source,
             view: Arc::new(CombinedView::default()),
@@ -1240,6 +1245,7 @@ impl CombinedResourceList {
             .children(list.members().iter().enumerate().map(|(i, member)| {
                 let cluster = member.cluster().to_owned();
                 let active = chosen.contains(&cluster);
+                let signed_out = self.signed_out.contains(&cluster);
                 h_flex()
                     .id(SharedString::from(format!("member-{cluster}")))
                     .gap_1()
@@ -1248,12 +1254,17 @@ impl CombinedResourceList {
                     .cursor_pointer()
                     .when(active, |el| el.bg(theme.table_active))
                     .hover(|el| el.bg(theme.table_hover))
-                    .on_click(registry::on_click_in(
-                        self.focus.clone(),
-                        ToggleClusterFilter {
-                            cluster: cluster.clone(),
-                        },
-                    ))
+                    .when(!signed_out, |el| {
+                        el.on_click(registry::on_click_in(
+                            self.focus.clone(),
+                            ToggleClusterFilter {
+                                cluster: cluster.clone(),
+                            },
+                        ))
+                    })
+                    .when(signed_out, |el| {
+                        el.on_click(registry::on_click(set_members::sign_in_member(&cluster)))
+                    })
                     .when_some(member.tag(), |el, tag| {
                         el.child(tag_dot(&cluster, tag, theme))
                     })
@@ -1264,7 +1275,11 @@ impl CombinedResourceList {
                             .font_features(tabular_figures())
                             .child(member.row_count().to_string()),
                     )
-                    .child(state_chip(member.state(), self.shown.feeds[i], theme))
+                    .child(if signed_out {
+                        sign_in_chip(theme)
+                    } else {
+                        state_chip(member.state(), self.shown.feeds[i], theme)
+                    })
                     .when_some(self.shown.coverage[i].limit.as_ref(), |el, limit| {
                         let note = SharedString::from(model::limited_note(limit));
                         let detail = limit_detail(&self.label, limit);
@@ -1284,6 +1299,14 @@ impl CombinedResourceList {
                     })
                     .test_support()
             }))
+    }
+
+    /// Marks the members that need a sign-in on their chips.
+    pub fn set_signed_out(&mut self, members: HashSet<ClusterId>, cx: &mut Context<Self>) {
+        if self.signed_out != members {
+            self.signed_out = members;
+            cx.notify();
+        }
     }
 
     /// Names the members without this kind under the member notes (`None`: all have it).
