@@ -58,6 +58,7 @@ use super::super::registry::{
     ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
     WatchOpenViewsOnly,
 };
+use super::super::registry::{ApplyAcrossSet, DeleteAcrossSet, RestartAcrossSet, ScaleAcrossSet};
 use super::super::registry::{
     BackToList, DisconnectCluster, EditAiScope, Handler, ShowAgentActivity, ShowHelmReleases,
     ToggleKeepWatching,
@@ -77,7 +78,6 @@ use super::super::registry::{
     ForwardPort, OpenForwardedPort, ShowPortForwards, StartPortForward, StopAllPortForwards,
     StopPortForward,
 };
-use super::super::registry::{RestartAcrossSet, ScaleAcrossSet};
 use super::super::resource_actions::{self, ResourceAction};
 use super::super::scope_picker::ScopePicker;
 use super::super::terminal_view::TerminalView;
@@ -189,6 +189,12 @@ impl Workspace {
         .bind::<ScaleAcrossSet>(|this, _, window, cx| {
             fleet_view::request(this, FleetChoice::Scale, window, cx)
         })
+        .bind::<ApplyAcrossSet>(|this, _, window, cx| {
+            fleet_view::request(this, FleetChoice::ApplyYaml, window, cx)
+        })
+        .bind::<DeleteAcrossSet>(|this, _, window, cx| {
+            fleet_view::request(this, FleetChoice::Delete, window, cx)
+        })
         .bind::<CordonNode>(|this, _, window, cx| {
             resource_actions::request(this, ResourceAction::Cordon, window, cx)
         })
@@ -198,7 +204,10 @@ impl Workspace {
         .bind::<DrainNode>(|this, _, window, cx| {
             resource_actions::request(this, ResourceAction::Drain, window, cx)
         })
-        .bind::<ShowDrainReport>(|_, _, window, cx| resource_actions::show_drain_report(window, cx))
+        .bind::<ShowDrainReport>(|this, _, window, cx| {
+            let names = this.cluster_names(cx);
+            resource_actions::show_drain_report(&names, window, cx)
+        })
         .bind::<RetryConnection>(Self::retry_connection)
         .bind::<CancelConnection>(|this, _, _, cx| {
             if this.model.read(cx).can_cancel_connection() {
@@ -493,6 +502,12 @@ impl Workspace {
             })
             .when::<ScaleAcrossSet>(|ws, cx| {
                 fleet_view::available(ws, FleetChoice::Scale, cx).is_ok()
+            })
+            .when::<ApplyAcrossSet>(|ws, cx| {
+                fleet_view::available(ws, FleetChoice::ApplyYaml, cx).is_ok()
+            })
+            .when::<DeleteAcrossSet>(|ws, cx| {
+                fleet_view::available(ws, FleetChoice::Delete, cx).is_ok()
             })
             .when::<CordonNode>(|ws, cx| {
                 resource_actions::available(ws, ResourceAction::Cordon, cx).is_ok()
@@ -1671,6 +1686,8 @@ impl Workspace {
         }
         match self.view_entry(&action.kind, cx) {
             Some(entry) => {
+                // Even the kind shown under Settings: it comes to the front.
+                self.leave_settings_for_view();
                 let open_already = match self.sets.running_kind() {
                     Some(kind) => *kind == entry.id,
                     None => self

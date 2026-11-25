@@ -1138,6 +1138,47 @@ async fn a_switch_hands_the_warm_feed_over_and_back() {
     assert!(f.b.writes().is_empty(), "{:?}", f.b.writes());
 }
 
+/// How many times `server` was asked for the deployments' rows from the start: a list, or a
+/// watch that streams them first.
+fn deployment_lists(server: &FakeApiServer) -> usize {
+    server
+        .requests()
+        .iter()
+        .filter(|request| request.path.ends_with("/deployments"))
+        .filter(|request| {
+            request.verb == Verb::List
+                || (request.verb == Verb::Watch && request.query.contains("sendInitialEvents=true"))
+        })
+        .count()
+}
+
+// A watched cluster's core resource lists stay warm across switches: leaving it and selecting it
+// again lists none of them anew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_switch_back_lists_nothing_again() {
+    let f = fixture(LASTING, Settings::default()).await;
+    f.turn_on().await;
+    f.until_feed().await;
+    switch_to(&f, "b").await;
+    tokio::time::timeout(WAIT, async {
+        while deployment_lists(&f.b) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the selected cluster should list its deployments");
+    settle().await;
+    let listed = deployment_lists(&f.b);
+
+    switch_to(&f, "a").await;
+    settle().await;
+    switch_to(&f, "b").await;
+    settle().await;
+
+    assert_eq!(deployment_lists(&f.b), listed, "nothing listed again");
+    assert!(f.b.writes().is_empty(), "{:?}", f.b.writes());
+}
+
 #[test]
 fn the_setting_is_typed_and_capped_on_write() {
     let dir = tempfile::tempdir().unwrap();

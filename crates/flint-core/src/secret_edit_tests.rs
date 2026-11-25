@@ -320,3 +320,24 @@ fn string_data_lands_in_data() {
     assert!(plain.get("stringData").is_none());
     assert!(plain["data"]["a"].is_string());
 }
+
+#[test]
+fn a_new_secret_holding_a_mask_is_refused_without_naming_a_value() {
+    let masked = json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {"name": "db"},
+        "data": {"password": MASK},
+    });
+    let Err(WriteError::InvalidYaml(why)) = check_new(&masked) else {
+        panic!("a mask in a new Secret must be refused");
+    };
+    assert!(why.contains("data"), "{why}");
+    let typed = json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {"name": "db"},
+        "stringData": {"password": "hunter2"},
+    });
+    assert!(check_new(&typed).is_ok());
+}

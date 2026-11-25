@@ -29,5 +29,6 @@ mod m3_write_requests;
 mod m3_writes;
 mod notifications;
 mod quit;
+mod settings;
 mod support;
 mod window_close;

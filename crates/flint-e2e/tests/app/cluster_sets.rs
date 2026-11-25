@@ -1,9 +1,9 @@
-//! Cluster sets (UP-82 to UP-84): choosing clusters, saving a set, and the combined list, driven
+//! Cluster sets (UP-82 to UP-85): choosing clusters, saving a set, and the combined list, driven
 //! through the set actions against fake API servers.
 
 use anyhow::{Context as _, Result, ensure};
 use flint_e2e::app::{App, AppOptions};
-use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, Options, write_kubeconfigs};
+use flint_e2e::fake_api::{FakeApiServer, FakePod, Fault, Gvr, Options, write_kubeconfigs};
 use http::Method;
 use serde_json::{Value, json};
 
@@ -695,5 +695,154 @@ fn up_84_an_exec_member_offers_its_background_sign_in() -> Result<()> {
     app.quit()?;
     drain_after_quit();
     assert_no_writes(&[&two.a, &two.b])?;
+    Ok(())
+}
+
+/// Replaces the pods of `fake` with crashing ones named `crashing` and healthy ones named
+/// `healthy`, all in `demo`.
+fn seed_workloads(fake: &FakeApiServer, crashing: &[&str], healthy: &[&str]) {
+    let gvr = Gvr::core("pods");
+    for row in fake.rows(&gvr) {
+        fake.remove_row(&gvr, row.namespace(), row.name());
+    }
+    for name in crashing {
+        fake.add_pod(
+            FakePod::new("demo", name, &["app"])
+                .restarted("app")
+                .restarted("app")
+                .restarted("app")
+                .restarted("app")
+                .waiting("app", "CrashLoopBackOff"),
+        );
+    }
+    for name in healthy {
+        fake.add_pod(FakePod::new("demo", name, &["app"]));
+    }
+}
+
+fn dashboard(state: &Value) -> &Value {
+    &state["sets"]["open"]["dashboard"]
+}
+
+/// The dashboard's cards as `(cluster, state, failing pods)`, worst first.
+fn cards(state: &Value) -> Vec<(String, String, Option<u64>)> {
+    dashboard(state)["cards"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|card| {
+            let failing = card["counts"]
+                .as_array()
+                .and_then(|counts| counts.iter().find(|c| c["category"] == "failing_pods"))
+                .and_then(|count| count["count"].as_u64());
+            (text(&card["cluster"]), text(&card["state"]), failing)
+        })
+        .collect()
+}
+
+fn total<'a>(state: &'a Value, category: &str) -> &'a Value {
+    dashboard(state)["totals"]
+        .as_array()
+        .and_then(|t| t.iter().find(|t| t["category"] == category))
+        .unwrap_or(&Value::Null)
+}
+
+/// The rows the open combined list shows, sorted, as `(cluster, name)`.
+fn sorted_rows(state: &Value) -> Vec<(String, String)> {
+    let mut rows = shown(state);
+    rows.sort();
+    rows
+}
+
+// covers UP-85
+#[test]
+#[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
+fn up_85_set_dashboard() -> Result<()> {
+    const C: &str = "kind-fake-c";
+    let two = TwoClusters::start()?;
+    let c = FakeApiServer::start_blocking(Options::default())?;
+    seed_workloads(&two.a, &["crash-a1", "crash-a2"], &["ok-a"]);
+    seed_workloads(&two.b, &["crash-b"], &["ok-b1", "ok-b2"]);
+    seed_workloads(&c, &[], &["ok-c"]);
+    c.inject(Fault::drop_connection());
+    let kubeconfig = two.kubeconfig();
+    write_kubeconfigs(
+        &kubeconfig,
+        &[(&two.a, A, None), (&two.b, B, None), (&c, C, None)],
+    )?;
+    let tags = format!(
+        "[[cluster_tags]]\ncontext = \"{B}\"\nserver = \"{}\"\ntag = \"blue\"\n",
+        two.b.url()
+    );
+    let app = App::launch(AppOptions::new(&kubeconfig).settings(&tags))?;
+    connect(&app, A)?;
+    open_together(&app, &[A, B, C])?;
+    app.dispatch("cluster_sets::OpenClusterSetDashboard", Value::Null)?;
+
+    // A card per member, the one with the most problems first. The unreachable member has a
+    // card of its own that counts nothing.
+    let state = until(
+        "a and b counted, c with a card of its own",
+        || app.state().unwrap_or(Value::Null),
+        |state| {
+            let cards = cards(state);
+            cards.len() == 3
+                && cards[..2]
+                    == [
+                        (A.to_owned(), "live".to_owned(), Some(2)),
+                        (B.to_owned(), "live".to_owned(), Some(1)),
+                    ]
+                && cards[2].0 == C
+        },
+    )?;
+    let last = &dashboard(&state)["cards"][2];
+    assert_ne!(last["state"], "live", "{last}");
+    assert_eq!(last["counts"][0]["count"], Value::Null, "{last}");
+    assert_eq!(dashboard(&state)["cards"][1]["tag"], "blue");
+    assert_eq!(dashboard(&state)["cards"][0]["tag"], Value::Null);
+
+    // The totals add up what could be counted and say what could not.
+    let failing = total(&state, "failing_pods");
+    assert_eq!(failing["known"], 3, "{failing}");
+    assert_eq!(failing["missing"], 1, "{failing}");
+    assert_eq!(failing["value"], "3+", "{failing}");
+    assert_eq!(failing["opens"], true);
+    assert!(
+        text(&dashboard(&state)["partial"]).contains("1 of 3"),
+        "{}",
+        dashboard(&state)["partial"]
+    );
+
+    // A count on a card opens the combined list of what it counted, on that cluster only.
+    app.dispatch(
+        "cluster_sets::OpenSetProblem",
+        json!({"category": "failing_pods", "cluster": A}),
+    )?;
+    app.wait_for("/sets/open/dashboard", Exists(false))?;
+    let state = app.wait_for(ROWS, Test::at_least(2))?;
+    assert_eq!(state["sets"]["open"]["list"]["kind"], "pods");
+    assert_eq!(
+        sorted_rows(&state),
+        pairs(&[(A, "crash-a1"), (A, "crash-a2")])
+    );
+
+    // A total opens it across the members that counted.
+    app.dispatch("cluster_sets::OpenClusterSetDashboard", Value::Null)?;
+    app.wait_for("/sets/open/dashboard/cards", Test::at_least(3))?;
+    app.dispatch(
+        "cluster_sets::OpenSetProblem",
+        json!({"category": "failing_pods"}),
+    )?;
+    app.wait_for("/sets/open/dashboard", Exists(false))?;
+    let state = app.wait_for(ROWS, Test::at_least(3))?;
+    assert_eq!(
+        sorted_rows(&state),
+        pairs(&[(A, "crash-a1"), (A, "crash-a2"), (B, "crash-b")])
+    );
+
+    app.quit()?;
+    drain_after_quit();
+    assert_no_writes(&[&two.a, &two.b, &c])?;
     Ok(())
 }

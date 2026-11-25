@@ -108,6 +108,20 @@ pub(crate) fn patch(
     Ok(patch)
 }
 
+/// Refuses a new Secret that holds a mask or a review's placeholder: there is no live value to
+/// keep, so it would be written as the value. Names no value.
+pub(crate) fn check_new(object: &Value) -> Result<(), WriteError> {
+    for (field, pointer) in MASKED {
+        if object.pointer(pointer).is_some_and(holds_hidden) {
+            return Err(invalid(&format!(
+                "{field} holds a hidden value's mask or placeholder, and a new Secret has no \
+                 value to keep; type each value in full"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Checks each masked map's entries: a mask must have a live value to keep, and a changed value
 /// must be one the server takes as typed.
 fn check_values(edited: &Value, live: &Value) -> Result<(), WriteError> {

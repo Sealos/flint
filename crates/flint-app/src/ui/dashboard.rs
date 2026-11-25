@@ -40,6 +40,9 @@ mod feed;
 mod overview;
 #[path = "set_dashboard.rs"]
 pub(in crate::ui) mod set;
+#[cfg(any(test, feature = "automation"))]
+#[path = "set_dashboard_state.rs"]
+mod set_state;
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "only tests ask a sparkline if it is empty")

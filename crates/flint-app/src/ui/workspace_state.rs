@@ -114,6 +114,11 @@ impl Workspace {
             },
             Some(_) => Main::Connecting,
         };
+        let main = if self.settings_page.open {
+            Main::Settings
+        } else {
+            main
+        };
         let header = active_cluster.map(|cluster| {
             let name = &cluster.info.name;
             let filter = self.ui_state.namespace_filter(name).to_vec();
@@ -185,6 +190,7 @@ impl Workspace {
                 .try_global::<super::super::alert_center::Alerts>()
                 .map(|alerts| alerts.0.read(cx).view_state()),
             sets: self.sets_view_state(cx),
+            settings: self.settings_view_state(cx),
         }
     }
 
@@ -212,6 +218,9 @@ impl Workspace {
         }
         if self.nav.read(cx).focus_handle().is_focused(window) {
             return Focus::Navigation;
+        }
+        if self.settings_page.open && self.settings_page.focus.is_focused(window) {
+            return Focus::Settings;
         }
         if let Some((overview, _)) = &self.dashboard
             && overview
