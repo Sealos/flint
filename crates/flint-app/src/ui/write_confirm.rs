@@ -337,7 +337,12 @@ const DONE_SHOWN: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// What a write that went through says: feedback only, nothing it did depends on it.
 pub(in crate::ui) fn done_text(target: &WriteTarget, action: &WriteAction) -> String {
-    let name = single_line(&target.name);
+    // Where it was done, so that a notice over another cluster's `web` is not read as its.
+    let name = match &target.namespace {
+        Some(ns) => format!("{ns}/{}", single_line(&target.name)),
+        None => single_line(&target.name),
+    };
+    let name = format!("{name} on {}", single_line(target.cluster.as_str()));
     match action {
         WriteAction::ApplyYaml(_) => format!("Applied changes to {name}."),
         WriteAction::Resource(action) => change_done(action.change(), &name),
@@ -348,9 +353,9 @@ pub(in crate::ui) fn done_text(target: &WriteTarget, action: &WriteAction) -> St
 /// What a resource change that went through says of `name`.
 fn change_done(change: &ResourceChange, name: &str) -> String {
     match change {
-        ResourceChange::Delete => format!("Deleted {name}."),
+        ResourceChange::Delete => format!("Deletion of {name} requested."),
         ResourceChange::Scale { from, to } => format!("Scaled {name} from {from} to {to}."),
-        ResourceChange::RolloutRestart => format!("Restarted {name}."),
+        ResourceChange::RolloutRestart => format!("Restart of {name} requested."),
         ResourceChange::Cordon => format!("Cordoned {name}."),
         ResourceChange::Uncordon => format!("Uncordoned {name}."),
         ResourceChange::Drain { .. } => format!("Drained {name}."),
@@ -744,12 +749,15 @@ mod tests {
     fn a_finished_change_says_what_it_did_to_the_object() {
         use super::change_done;
         let say = |change| change_done(&change, "web");
-        assert_eq!(say(ResourceChange::Delete), "Deleted web.");
+        assert_eq!(say(ResourceChange::Delete), "Deletion of web requested.");
         assert_eq!(
             say(ResourceChange::Scale { from: 2, to: 5 }),
             "Scaled web from 2 to 5."
         );
-        assert_eq!(say(ResourceChange::RolloutRestart), "Restarted web.");
+        assert_eq!(
+            say(ResourceChange::RolloutRestart),
+            "Restart of web requested."
+        );
         assert_eq!(say(ResourceChange::Cordon), "Cordoned web.");
         assert_eq!(say(ResourceChange::Uncordon), "Uncordoned web.");
     }
