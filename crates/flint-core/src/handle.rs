@@ -662,7 +662,9 @@ pub struct ProxyApplied {
     pub reconnecting: Vec<ClusterId>,
     /// The clusters the new setting reaches another way (another proxy, or none). What was pinned
     /// to the old route no longer holds for them: their log streams and shells end, and trust,
-    /// unlocks, AI exposure and keep watching given on it must be given again.
+    /// unlocks, AI exposure and keep watching given on it must be given again. Known once the
+    /// files were read under the new setting (`loaded`); [`ProxyReconnectReport::rerouted`]
+    /// always has them.
     pub rerouted: Vec<ClusterId>,
     /// How many port-forwards ended. Each was bound to a connection that is gone; start it
     /// again to forward on the new one.
@@ -681,6 +683,8 @@ pub const PROXY_REPORT_AFTER: Duration = Duration::from_secs(60);
 /// How the clusters a proxy change connected again came back ([`ProxyApplied::settled`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProxyReconnectReport {
+    /// The clusters the new setting reaches another way, as when the report was made.
+    pub rerouted: Vec<ClusterId>,
     pub reconnected: Vec<ClusterId>,
     /// Each with why, in words safe to show: never a proxy's credentials.
     pub failed: Vec<(ClusterId, String)>,

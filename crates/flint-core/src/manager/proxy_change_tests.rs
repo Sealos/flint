@@ -132,11 +132,11 @@ fn a_supported_setting_checks_out() {
 }
 
 #[test]
-fn saving_a_setting_replaces_the_proxy_table_and_an_empty_one_removes_it() {
+fn saving_a_setting_replaces_its_keys_and_keeps_the_file_to_its_owner() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         settings_file(dir.path()),
-        "appearance = \"dark\"\n[proxy]\nurl = \"http://old.example:3128\"\n",
+        "appearance = \"dark\"\n[proxy]\nurl = \"http://old.example:3128\"\nlater = 1\n",
     )
     .unwrap();
     let saved = crate::settings::set_proxy(
@@ -154,10 +154,79 @@ fn saving_a_setting_replaces_the_proxy_table_and_an_empty_one_removes_it() {
     assert_eq!(saved.proxy.no_proxy, ["internal.example"]);
     assert_eq!(saved.appearance, crate::settings::Appearance::Dark);
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(settings_file(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "{mode:o}: it can hold the proxy's password"
+        );
+    }
+
     let cleared = crate::settings::set_proxy(dir.path(), &ProxySetting::default()).unwrap();
     assert!(cleared.proxy.is_empty());
     let text = std::fs::read_to_string(settings_file(dir.path())).unwrap();
-    assert!(!text.contains("proxy"), "{text}");
+    assert!(
+        !text.contains("url") && !text.contains("no_proxy"),
+        "{text}"
+    );
+    assert!(
+        text.contains("later = 1"),
+        "a key of a later version survives: {text}"
+    );
+
+    std::fs::write(
+        settings_file(dir.path()),
+        "[proxy]\nurl = \"http://a.example:1\"\n",
+    )
+    .unwrap();
+    crate::settings::set_proxy(dir.path(), &ProxySetting::default()).unwrap();
+    let text = std::fs::read_to_string(settings_file(dir.path())).unwrap();
+    assert!(!text.contains("proxy"), "an empty table goes: {text}");
+}
+
+// covers UP-125: a connection attempt started before a change goes on under the setting its
+// load had, from its first request to its credential plugin.
+#[test]
+fn an_attempt_keeps_the_setting_it_started_under() {
+    in_child("child_an_attempt_keeps_the_setting_it_started_under");
+}
+
+#[tokio::test]
+async fn child_an_attempt_keeps_the_setting_it_started_under() {
+    if !is_child() {
+        return;
+    }
+    proxy::use_setting(&setting("http://old.example:3128"));
+    proxy::replace_setting(&setting("http://new.example:3128")).unwrap();
+    let chosen = |environment: proxy::ProxyEnvironment| environment.https_proxy;
+
+    assert_eq!(
+        chosen(proxy::ProxyEnvironment::current()).as_deref(),
+        Some("http://new.example:3128")
+    );
+    let (generation, old) = proxy::pinned_to(0, async {
+        proxy::ProxyEnvironment::current_with_generation()
+    })
+    .await;
+    assert_eq!(generation, 0);
+    assert_eq!(chosen(old).as_deref(), Some("http://old.example:3128"));
+    let variables = proxy::pinned_to(0, async { proxy::plugin_setting_variables(None) }).await;
+    assert!(
+        variables
+            .iter()
+            .any(|(_, value)| value.as_deref() == Some("http://old.example:3128")),
+        "the plugin is told the old proxy too"
+    );
+    // A generation this process never had takes no route through the setting.
+    let unknown = proxy::pinned_to(7, async { proxy::ProxyEnvironment::current() }).await;
+    let unknown = chosen(unknown).unwrap();
+    assert!(proxy::ProxyTarget::parse(&unknown).is_err());
 }
 
 // covers UP-125: a proxy change saves the setting, rebuilds every slot on it, and leaves none
@@ -336,6 +405,7 @@ fn waiting_on(
         seq: 1,
         pending: Some(Pending {
             seq: 1,
+            routes: Default::default(),
             waiting: ids
                 .iter()
                 .map(|id| (*id).to_owned())

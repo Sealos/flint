@@ -424,7 +424,13 @@ impl std::fmt::Debug for ProxySetting {
 /// also puts the setting in use ([`crate::CoreHandle::apply_proxy`]).
 pub(crate) fn set_proxy(dir: &Path, proxy: &ProxySetting) -> Result<Settings, SettingsError> {
     edit_settings(dir, |table, _| {
-        let mut entry = toml::Table::new();
+        // Keys of the table this version does not know survive.
+        let mut entry = match table.remove("proxy") {
+            Some(toml::Value::Table(entry)) => entry,
+            _ => toml::Table::new(),
+        };
+        entry.remove("url");
+        entry.remove("no_proxy");
         if let Some(url) = proxy
             .url
             .as_deref()
@@ -443,9 +449,7 @@ pub(crate) fn set_proxy(dir: &Path, proxy: &ProxySetting) -> Result<Settings, Se
         if !no_proxy.is_empty() {
             entry.insert("no_proxy".into(), toml::Value::Array(no_proxy));
         }
-        if entry.is_empty() {
-            table.remove("proxy");
-        } else {
+        if !entry.is_empty() {
             table.insert("proxy".into(), toml::Value::Table(entry));
         }
         Ok(())
@@ -1889,8 +1893,25 @@ fn write_atomic(path: &Path, text: &str, dangling: DanglingLink) -> Result<(), S
         Err(source) => return Err(err(source)),
     };
     let tmp = path.with_extension(format!("toml.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, text).map_err(err)?;
+    write_owner_only(&tmp, text).map_err(err)?;
     std::fs::rename(&tmp, path).map_err(err)
+}
+
+/// Writes `text` to a new file at `path` that only its owner can read: `settings.toml` can hold
+/// a proxy's password.
+fn write_owner_only(path: &Path, text: &str) -> io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    // A leftover file of the same name keeps its mode: set it.
+    #[cfg(unix)]
+    file.set_permissions(
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )?;
+    file.write_all(text.as_bytes())
 }
 
 pub(crate) fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {

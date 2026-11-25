@@ -2735,11 +2735,16 @@ impl ClusterManager {
         let rejections = internal.clone();
         let attempt_task = tokio::spawn(async move {
             let merged = no_prompt.as_ref().unwrap_or(&kubeconfig.merged);
-            let result = cluster::connect_gated_and_check_with_policy(
-                merged,
-                &name,
-                CONNECT_TIMEOUT,
-                &access,
+            // Under the proxy setting this load chose its routes with, whatever is put in use
+            // while it runs.
+            let result = crate::connection::proxy::pinned_to(
+                kubeconfig.proxy_generation,
+                cluster::connect_gated_and_check_with_policy(
+                    merged,
+                    &name,
+                    CONNECT_TIMEOUT,
+                    &access,
+                ),
             )
             .await;
             result.map_err(|e| {

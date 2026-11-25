@@ -12,9 +12,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use super::ClusterManager;
 use crate::ClusterId;
-use crate::handle::{
-    ConnectionState, Event, PROXY_REPORT_AFTER, ProxyApplied, ProxyReconnectReport,
-};
+use crate::handle::{ConnectionState, PROXY_REPORT_AFTER, ProxyApplied, ProxyReconnectReport};
 use crate::keep_watching::KeepWatching;
 use crate::settings::{self, ProxySetting};
 
@@ -29,6 +27,8 @@ pub(super) struct ProxyChange {
 /// A change whose reconnections have not all settled.
 struct Pending {
     seq: u64,
+    /// Each context's route before the change.
+    routes: HashMap<ClusterId, Option<String>>,
     waiting: BTreeSet<ClusterId>,
     report: ProxyReconnectReport,
     settled: tokio::sync::oneshot::Sender<ProxyReconnectReport>,
@@ -76,33 +76,16 @@ impl ClusterManager {
         tracing::info!("proxy setting replaced; connecting every cluster again");
 
         // Every slot is behind the setting now, so held: no new connection, session or write
-        // starts on its old route. What was reviewed or confirmed on it is over.
+        // starts on its old route. A write reviewed on a slot is refused once the load replaces
+        // it, and one on a rerouted context by its moved route too.
         let forwards_ended = self.end_forwards_for_proxy();
-        let names: Vec<ClusterId> = self.clusters.iter().map(|c| c.info.name.clone()).collect();
-        for id in &names {
-            self.contexts.end_writes(id);
-            let write_epoch = self.contexts.shown(id, None).gate;
-            self.emit(Event::WritesEnded {
-                cluster: id.clone(),
-                write_epoch,
-            });
-        }
         self.publish_holds();
 
         self.suspend_kept_plugins();
         self.marks.changed(self.read_seq);
         let loaded = self.reload_kubeconfig().await;
 
-        let rerouted = self
-            .clusters
-            .iter()
-            .filter(|slot| {
-                routes
-                    .get(&slot.info.name)
-                    .is_some_and(|before| *before != slot.info.proxy_url)
-            })
-            .map(|slot| slot.info.name.clone())
-            .collect();
+        let rerouted = self.rerouted_since(&routes);
         let reconnecting: Vec<ClusterId> = running
             .into_iter()
             .filter(|id| self.cluster(id).is_some())
@@ -115,6 +98,7 @@ impl ClusterManager {
         self.finish_proxy_report();
         self.proxy_change.pending = Some(Pending {
             seq,
+            routes,
             waiting: reconnecting.iter().cloned().collect(),
             report: ProxyReconnectReport::default(),
             settled,
@@ -172,11 +156,25 @@ impl ClusterManager {
         }
     }
 
+    /// The contexts whose route is not what `routes` had.
+    fn rerouted_since(&self, routes: &HashMap<ClusterId, Option<String>>) -> Vec<ClusterId> {
+        self.clusters
+            .iter()
+            .filter(|slot| {
+                routes
+                    .get(&slot.info.name)
+                    .is_some_and(|before| *before != slot.info.proxy_url)
+            })
+            .map(|slot| slot.info.name.clone())
+            .collect()
+    }
+
     /// Sends the pending report, with what it still waits for as failed.
     fn finish_proxy_report(&mut self) {
         let Some(mut pending) = self.proxy_change.pending.take() else {
             return;
         };
+        pending.report.rerouted = self.rerouted_since(&pending.routes);
         for id in std::mem::take(&mut pending.waiting) {
             let why = "did not connect in time on the new proxy setting".to_owned();
             pending.report.failed.push((id, why));
@@ -214,7 +212,14 @@ impl ClusterManager {
             KeepWatching::SignInNeeded => Some(Outcome::Failed(
                 "it needs a sign-in to be watched in the background".to_owned(),
             )),
-            KeepWatching::Off if slot.reconnect || self.active.as_deref() == Some(id) => None,
+            // A member may still wait for its turn to connect.
+            KeepWatching::Off
+                if slot.reconnect
+                    || self.active.as_deref() == Some(id)
+                    || self.members.contains_key(id) =>
+            {
+                None
+            }
             KeepWatching::Off => Some(Outcome::Failed("it is not connected".to_owned())),
         }
     }

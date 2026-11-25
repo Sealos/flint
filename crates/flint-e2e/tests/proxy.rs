@@ -908,6 +908,7 @@ async fn proxy_change_child() {
         .expect("the report in time")
         .expect("a report");
     assert_eq!(report.reconnected, [CONTEXT], "{report:?}");
+    assert_eq!(report.rerouted, [CONTEXT], "{report:?}");
     assert!(report.failed.is_empty(), "{report:?}");
 
     let mut updates = before.updates();

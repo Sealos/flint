@@ -1235,8 +1235,11 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   or write starts) until a load under the new one replaces it, and that load replaces every slot, so each client,
   feed and kept feed is built again. Nothing rebinds: a context the new setting reaches another way is on another
   route, so its log streams and shells end as for a re-pointed context, and its grants no longer hold. Every
-  port-forward ends, bound to its connection. The caller gets the clusters reconnecting, those rerouted, the
-  forwards ended, and a report of which came back. Refused while `settings.toml` is invalid or was unreadable at
+  port-forward ends, bound to its connection. An attempt already running when the setting changes goes on under the
+  setting of its load (`connection::proxy::pinned_to`), plugin environment included, and its result is dropped with
+  its slot; background sign-in consent holds only on the route keep watching was turned on for. The caller gets the
+  clusters reconnecting, those rerouted, the forwards ended, and a report of which came back and which were
+  rerouted. `settings.toml` is written owner-only, as it can hold the proxy's password. Refused while `settings.toml` is invalid or was unreadable at
   startup. Every context loaded in a process is pinned to the route it connects through. An `http://` proxy is
   used through `CONNECT`; `socks5://` (names resolved by Flint) and `socks5h://` (names resolved by the proxy), from a
   `proxy-url`, the setting or `HTTPS_PROXY`, through SOCKS5 with the URL's user name and password; TLS to the API

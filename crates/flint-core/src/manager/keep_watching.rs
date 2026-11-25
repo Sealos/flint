@@ -675,6 +675,12 @@ impl ClusterManager {
     /// not end it: a paused connection runs nothing anyway.
     pub(super) fn member_consent(&self, id: &str) -> Option<Arc<PluginConsent>> {
         let consent = self.keep.consents.get(id).filter(|c| !c.is_void())?;
+        // Given for the route keep watching was turned on for: another proxy is another route,
+        // even before a pass of `sync_keep_watching` voids it.
+        let entry = self.settings.watched_cluster(id)?;
+        if self.cluster(id)?.info.grant_server().as_deref() != Some(entry.server.as_str()) {
+            return None;
+        }
         match &*self.sign_in(id) {
             SignIn::Plugin(definition) if consent.holds(definition) => Some(Arc::clone(consent)),
             _ => None,
@@ -751,6 +757,7 @@ impl ClusterManager {
         self.keep.grants.admit(id, attempt, &access);
         let mut kubeconfig = self.kubeconfig.merged.clone();
         cluster::disable_interactive_exec(&mut kubeconfig);
+        let proxy_generation = self.kubeconfig.proxy_generation;
         // Read with the config it connects from: the connection may finish after a reload.
         let shown = self.cluster(id).and_then(|slot| slot.info.server.clone());
         let pin = self.contexts.pin(id, shown.as_deref());
@@ -761,11 +768,15 @@ impl ClusterManager {
             let Ok(_turn) = connects.acquire_owned().await else {
                 return;
             };
-            let result = cluster::connect_read_only_with_policy(
-                &kubeconfig,
-                &name,
-                cluster::CONNECT_TIMEOUT,
-                &task_access,
+            // Under the proxy setting this load chose its routes with.
+            let result = crate::connection::proxy::pinned_to(
+                proxy_generation,
+                cluster::connect_read_only_with_policy(
+                    &kubeconfig,
+                    &name,
+                    cluster::CONNECT_TIMEOUT,
+                    &task_access,
+                ),
             )
             .await
             .map_err(|error| super::running_set::needs_sign_in(&error));
