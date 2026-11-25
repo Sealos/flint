@@ -65,16 +65,28 @@ fn note(id: &'static str, text: String, color: Hsla) -> impl IntoElement {
         .test_support()
 }
 
-/// The line above the tiles, when something is not fully checked.
-pub fn status_banner(status: &DashboardStatus, theme: &Theme) -> Option<impl IntoElement> {
-    let (text, color) = match status {
-        DashboardStatus::Checked => return None,
-        DashboardStatus::Starting => ("Checking this cluster…".to_owned(), theme.muted_foreground),
-        DashboardStatus::Partial(text) => (text.clone(), theme.warning),
-        DashboardStatus::CannotBeChecked(text) => (text.clone(), theme.danger),
+/// The line above the tiles, when something is not fully checked. Its place is kept when there is
+/// nothing to say, so the tiles do not move when "Checking this cluster…" goes away.
+pub fn status_banner(status: &DashboardStatus, theme: &Theme) -> impl IntoElement {
+    let line = match status {
+        DashboardStatus::Checked => None,
+        DashboardStatus::Starting => {
+            Some(("Checking this cluster…".to_owned(), theme.muted_foreground))
+        }
+        DashboardStatus::Partial(text) => Some((text.clone(), theme.warning)),
+        DashboardStatus::CannotBeChecked(text) => Some((text.clone(), theme.danger)),
     };
-    Some(note("dashboard-status", text, color))
+    div()
+        .w_full()
+        .flex_none()
+        .min_h(STATUS_LINE_HEIGHT)
+        .when_some(line, |slot, (text, color)| {
+            slot.child(note("dashboard-status", text, color))
+        })
 }
+
+/// One `text_sm` line.
+const STATUS_LINE_HEIGHT: Pixels = px(20.);
 
 fn level_color(level: ThresholdLevel, theme: &Theme) -> Hsla {
     match level {

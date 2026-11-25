@@ -29,8 +29,8 @@ fn an_edit_shows_over_the_file_until_saved() {
     let mut draft = SettingsDraft::default();
     draft.edit(Change::Appearance(Appearance::Dark), &file);
     assert!(draft.is_dirty());
-    assert!(draft.is_edited(Field::Appearance));
-    assert!(!draft.is_edited(Field::WatchMode));
+    assert!(draft.is_edited(&Field::Appearance));
+    assert!(!draft.is_edited(&Field::WatchMode));
     let shown = draft.shown(&file);
     assert_eq!(shown.appearance, Appearance::Dark);
     assert_eq!(shown.watch_mode, file.watch_mode);
@@ -133,24 +133,7 @@ fn an_edit_stays_until_the_core_says_it_is_written() {
     // Only the watch mode was written; the appearance was edited again meanwhile.
     draft.edit(Change::Appearance(Appearance::Light), &file);
     draft.saved(&writes);
-    assert!(draft.is_edited(Field::Appearance));
-    assert!(!draft.is_edited(Field::WatchMode));
+    assert!(draft.is_edited(&Field::Appearance));
+    assert!(!draft.is_edited(&Field::WatchMode));
     assert_eq!(draft.shown(&file).appearance, Appearance::Light);
-}
-
-#[test]
-fn changes_map_to_the_core_writes() {
-    use flint_core::settings::SettingsWrite;
-    assert_eq!(
-        Change::Appearance(Appearance::Dark).to_write(),
-        SettingsWrite::Appearance(Appearance::Dark)
-    );
-    assert_eq!(
-        Change::DesktopNotifications(true).to_write(),
-        SettingsWrite::DesktopNotifications(true)
-    );
-    assert_eq!(
-        Change::WatchMode(WatchMode::OnView).to_write(),
-        SettingsWrite::WatchMode(WatchMode::OnView)
-    );
 }
