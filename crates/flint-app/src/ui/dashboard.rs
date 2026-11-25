@@ -16,7 +16,7 @@ use flint_core::activity::is_invisible;
 use flint_core::dashboard::{
     ProblemCategory, WARNING_EVENT_WINDOW, count_pending_claims, count_recent_warnings,
 };
-use flint_core::metrics::MetricsError;
+use flint_core::metrics::{MetricsError, POLL_INTERVAL};
 use flint_core::metrics_trend::{TrendResource, TrendScope, TrendStore};
 use flint_core::rollout::{COMPLETE_WINDOW, Rollout, RolloutState};
 use flint_core::telemetry::{
@@ -283,7 +283,7 @@ pub enum MetricsPanel {
     },
 }
 
-/// One resource's current value and last hour.
+/// One resource's current value and history.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MetricTile {
     pub label: &'static str,
@@ -554,6 +554,11 @@ fn metrics(input: &DashboardInput<'_>) -> MetricsPanel {
             )
             .map(Iterator::collect)
             .unwrap_or_default();
+        let times: Vec<Option<Timestamp>> = input
+            .trends
+            .sample_times(&input.snapshot.cluster, input.now)
+            .map(Iterator::collect)
+            .unwrap_or_default();
         let recent = samples
             .iter()
             .rev()
@@ -566,7 +571,13 @@ fn metrics(input: &DashboardInput<'_>) -> MetricsPanel {
         MetricTile {
             label,
             value,
-            shape: Arc::new(SparklineShape::new(&samples)),
+            shape: Arc::new(SparklineShape::new(
+                samples,
+                times,
+                input.now,
+                POLL_INTERVAL,
+                format,
+            )),
         }
     };
     MetricsPanel::Tiles {

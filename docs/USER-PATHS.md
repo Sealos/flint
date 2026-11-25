@@ -591,7 +591,7 @@ M3 used every number in the 5x block, so its later paths continue at UP-121.
 ### UP-66 See how full the cluster is
 - **When** metrics-server is installed and I look at the dashboard's usage tiles.
 - **Then** I see CPU and memory used against allocatable, and requests and limits against capacity, per node and in
-  total, each with a sparkline of the last hour that keeps growing while I stay connected. Without metrics-server the
+  total, each with a sparkline of the metrics history that keeps growing while I stay connected. Without metrics-server the
   tiles say how to install it.
 - Tests: unit (ring buffer, aggregation), e2e (fake API server: `flint-e2e/tests/dashboard_usage.rs`; the growing sparkline needs a
   clock control), ui.
@@ -724,13 +724,13 @@ M5.5 was added after M5 and M6 were numbered, so it shares the 7x block with M5 
 
 ### UP-79 Warm clusters stay bounded and quiet
 - **Status:** planned (#247, After 1.0), not built yet.
-- **When** I use more clusters than `warm_clusters`, the background clusters go over `warm_memory_mib`, a warm
+- **When** I use more clusters than `warm_clusters`, a warm
   cluster sits unused for 30 minutes, the Mac sleeps, or a warm cluster's credential expires.
 - **Then** the least recently used (or the affected) cluster goes cold, and the sidebar shows it. An expired
   credential shows a "sign-in needed" badge, and no exec plugin runs until I click the cluster. Background errors
   show only in the sidebar, never as toasts. Disconnect makes a warm cluster cold by hand. With 3 idle warm
   clusters, Flint uses under 1% CPU.
-- Tests: unit (eviction, budget, idle limit), cluster, manual (exec-plugin cluster).
+- Tests: unit (eviction, idle limit), cluster, manual (exec-plugin cluster).
 
 ---
 

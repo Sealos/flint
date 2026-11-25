@@ -8,6 +8,9 @@
 mod accent;
 mod activity_view;
 mod alert_center;
+mod app_menus;
+#[cfg(test)]
+mod app_menus_tests;
 #[cfg(test)]
 mod appearance_tests;
 #[cfg(feature = "automation")]
@@ -59,6 +62,7 @@ mod resource_actions;
 mod row_menu;
 mod scope_picker;
 mod set_kinds;
+mod set_members;
 mod settings_draft;
 mod settings_thresholds;
 #[cfg(test)]
@@ -75,6 +79,7 @@ mod terminal_model;
 mod terminal_palette;
 mod terminal_view;
 mod theme;
+mod tooltip_text;
 mod ui_state;
 #[cfg(any(test, feature = "automation"))]
 mod view_state;
@@ -94,8 +99,8 @@ use gpui_kit::*;
 use clusters::ClustersModel;
 use gpui_kit::component::input;
 use registry::{
-    About, AppearanceDark, AppearanceLight, AppearanceSystem, CloseActiveTab, CloseWindow, GoBack,
-    Hide, HideOthers, MinimizeWindow, OpenHelp, OpenSettings, Quit, ShowAll, ToggleCommandPalette,
+    About, AppearanceDark, AppearanceLight, AppearanceSystem, GoBack, Hide, HideOthers,
+    MinimizeWindow, OpenHelp, OpenSettings, Quit, ShowAll, ToggleCommandPalette,
     ToggleResourceSwitcher, ZoomWindow,
 };
 use ui_state::UiState;
@@ -246,11 +251,11 @@ fn window_options(bounds: Bounds<Pixels>) -> WindowOptions {
     }
 }
 
-/// The standard macOS menus, every item a registered action (their keys come from the registry)
+/// The menus (see [`all_menus`]), every item a registered action (their keys come from the registry)
 /// except Services, which the OS fills: the app menu (About Flint, Settings…, Services, Hide Flint, Hide
 /// Others, Show All, Quit), Edit (Undo, Redo, Cut, Copy, Paste and Select All, for the text
-/// fields), View (the command palette, Appearance), Window (Minimize, Zoom, Close Dock Tab, Close
-/// Window) and Help. Quit and Close Window ask first while a session would end ([`closing`]).
+/// fields), View (the command palette, Appearance), File, Cluster and Resource ([`app_menus`]),
+/// Window (Minimize, Zoom) and Help. Quit and Close Window ask first while a session would end ([`closing`]).
 /// GPUI shows no menu bar on Linux: there, every item is in the command palette (Ctrl-Shift-P),
 /// and Quit and Close Window have their keys too.
 fn install_menus(appearance: Appearance, cx: &mut App) {
@@ -291,7 +296,12 @@ impl base::RootPlugin for WindowActions {
 }
 
 fn set_menus(appearance: Appearance, cx: &mut App) {
-    cx.set_menus([
+    app_menus::update(cx, |inputs| inputs.appearance = appearance);
+}
+
+/// The whole menu bar: the standard menus around File, Cluster and Resource ([`app_menus`]).
+fn all_menus(inputs: &app_menus::MenuInputs, enabled: app_menus::Enabled) -> Vec<Menu> {
+    vec![
         Menu::new("Flint").items([
             MenuItem::action(registry::label::<About>(), About),
             MenuItem::separator(),
@@ -306,17 +316,17 @@ fn set_menus(appearance: Appearance, cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action(registry::label::<Quit>(), Quit),
         ]),
+        app_menus::file_menu(enabled),
         edit_menu(),
-        view_menu(appearance),
+        view_menu(inputs.appearance),
+        app_menus::cluster_menu(inputs, enabled),
+        app_menus::resource_menu(enabled),
         Menu::new("Window").items([
             MenuItem::action(registry::label::<MinimizeWindow>(), MinimizeWindow),
             MenuItem::action(registry::label::<ZoomWindow>(), ZoomWindow),
-            MenuItem::separator(),
-            MenuItem::action(registry::label::<CloseActiveTab>(), CloseActiveTab),
-            MenuItem::action(registry::label::<CloseWindow>(), CloseWindow),
         ]),
         Menu::new("Help").items([MenuItem::action(registry::label::<OpenHelp>(), OpenHelp)]),
-    ]);
+    ]
 }
 
 /// Edit: Undo, Redo, Cut, Copy, Paste and Select All, which the focused text field handles. A

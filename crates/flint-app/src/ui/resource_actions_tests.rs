@@ -257,6 +257,8 @@ async fn a_workloads_logs_button_follows_a_refusal(cx: &mut TestAppContext) {
     open_deployments(cx, &t).await;
     list_one_pod(cx);
     right_click(cx, &t, "web").await;
+    // The detail the right-click opened takes its room once the menu is closed.
+    t.press(cx, "escape");
     cx.run_until_parked();
     let detail = t.workspace.read_with(cx, |ws, _| ws.detail_view().unwrap());
     detail.update(cx, |d, cx| {

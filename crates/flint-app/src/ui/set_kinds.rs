@@ -22,6 +22,9 @@ pub struct MemberKinds {
     /// Whether the newest discovery succeeded. If not, `discovery` is an older result, whose
     /// missing kinds prove nothing.
     pub complete: bool,
+    /// Whether the member needs a sign-in. Its chip says so: the kind is not "not confirmed" on
+    /// it as well.
+    pub signed_out: bool,
 }
 
 impl MemberKinds {
@@ -33,6 +36,7 @@ impl MemberKinds {
         };
         same_discovery
             && self.complete == other.complete
+            && self.signed_out == other.signed_out
             && self.cluster == other.cluster
             && self.shown == other.shown
     }
@@ -98,6 +102,7 @@ impl KindCoverage {
             match member.presence(kind) {
                 Presence::Serves => coverage.serving += 1,
                 Presence::Lacks => coverage.lacking.push(member.shown.clone()),
+                Presence::Unknown if member.signed_out => {}
                 Presence::Unknown => coverage.unconfirmed.push(member.shown.clone()),
             }
         }
@@ -270,6 +275,7 @@ mod tests {
             shown: name.to_uppercase(),
             discovery: Some(Arc::new(found)),
             complete: true,
+            signed_out: false,
         }
     }
 
@@ -279,6 +285,7 @@ mod tests {
             shown: name.to_uppercase(),
             discovery: None,
             complete: false,
+            signed_out: false,
         }
     }
 
@@ -299,6 +306,25 @@ mod tests {
         );
         assert_eq!(set.coverage(&KindId::pods()).unwrap().badge(), None);
         assert_eq!(set.note(&KindId::pods()), None);
+    }
+
+    #[test]
+    fn a_signed_out_member_is_not_called_unconfirmed() {
+        let mut out = silent("a");
+        out.signed_out = true;
+        let set = SetKinds::new(vec![out, member("b", found(true)), silent("c")]);
+        let coverage = set.coverage(&widgets()).unwrap();
+        // Its chip says it needs a sign-in; the note names only the member nothing is known of.
+        assert_eq!(coverage.unconfirmed, ["C"]);
+        assert_eq!(coverage.serving, 1);
+        assert_eq!(
+            set.note(&widgets()).as_deref(),
+            Some("Widgets not confirmed on C.")
+        );
+        let mut only = silent("a");
+        only.signed_out = true;
+        let set = SetKinds::new(vec![only, member("b", found(true))]);
+        assert_eq!(set.note(&widgets()), None);
     }
 
     #[test]

@@ -14,7 +14,7 @@ use flint_core::{
     Appearance, ClusterDiscovery, ClusterId, ClusterSummary, Command, ConnectionState, CoreHandle,
     Event, KindId, Protection, Settings, SyncState, WatchMode,
 };
-use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::Theme;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
@@ -22,6 +22,7 @@ use gpui_kit::*;
 use super::cluster_tag;
 use super::nav::NavPanel;
 use super::scope_picker;
+use super::tooltip_text::{cap_width, shorten_path};
 use super::workspace::{WRITES_PAUSED_TIP, changed_from, protection_text, server_text};
 
 pub struct ClustersModel {
@@ -734,8 +735,17 @@ fn reconnecting(states: &HashMap<KindId, SyncState>) -> Option<Presence<'_>> {
     Some(Presence::Reconnecting { error })
 }
 
-/// A cluster row's full description: its tooltip and its accessible description.
+/// A cluster row's accessible description, including the full kubeconfig path.
 pub fn cluster_details(
+    model: &ClustersModel,
+    cluster: &ClusterSummary,
+    states: &HashMap<KindId, SyncState>,
+) -> String {
+    let details = cluster_details_without_source(model, cluster, states);
+    format!("{details}\nfrom {}", cluster.info.source.display())
+}
+
+fn cluster_details_without_source(
     model: &ClustersModel,
     cluster: &ClusterSummary,
     states: &HashMap<KindId, SyncState>,
@@ -766,9 +776,9 @@ pub fn cluster_details(
     };
     let tag_line = model
         .cluster_tag(cluster)
-        .map_or_else(String::new, |t| format!("{}\n", cluster_tag::tag_text(t)));
+        .map_or_else(String::new, |t| format!("\n{}", cluster_tag::tag_text(t)));
     format!(
-        "{name}\n{}\n{state}\n{}\n{exposure}\n{tag_line}from {}",
+        "{name}\n{}\n{state}\n{}\n{exposure}{tag_line}",
         server_text(cluster.info.server.as_deref()),
         if model.writes_paused(cluster) {
             WRITES_PAUSED_TIP.to_owned()
@@ -778,8 +788,7 @@ pub fn cluster_details(
                 &model.trust(cluster),
                 cluster.info.server.as_deref(),
             )
-        },
-        cluster.info.source.display()
+        }
     )
 }
 
@@ -810,24 +819,31 @@ fn following_tooltip(
             cx.observe(nav, move |_, _, cx| on_change(cx)),
         ];
         let (model, nav) = (model.downgrade(), nav.downgrade());
-        Tooltip::element(move |_, cx| {
+        let home = std::env::home_dir();
+        cap_width(Tooltip::element(move |_, cx| {
             // Moved into the content, which the view owns and drops with itself.
             let _owned = &subscriptions;
-            let text = model
+            let (label, text) = model
                 .upgrade()
                 .zip(nav.upgrade())
                 .and_then(|(model, nav)| {
                     let model = model.read(cx);
                     let row = model.clusters.iter().find(|c| c.info.name == cluster)?;
-                    Some(cluster_details(model, row, nav.read(cx).states()))
+                    let details = cluster_details_without_source(model, row, nav.read(cx).states());
+                    let source = &row.info.source;
+                    Some((
+                        format!("{details}\nfrom {}", source.display()),
+                        format!("{details}\nfrom {}", shorten_path(source, home.as_deref())),
+                    ))
                 })
                 .unwrap_or_default();
+            let text = SharedString::from(text);
             div()
                 .id("cluster-tooltip")
-                .aria_label(text.clone())
-                .child(text)
+                .aria_label(label)
+                .child(text.clone().test_text(text))
                 .test_support()
-        })
+        }))
     })
 }
 
