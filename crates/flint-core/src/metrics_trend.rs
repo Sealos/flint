@@ -171,7 +171,8 @@ impl ClusterTrend {
         }
     }
 
-    /// Moves to the step of a sample taken `at`. `false` if it is too soon after the last one.
+    /// Moves to the step of a sample taken `at`. `false` if it is too soon after the last one: it
+    /// then belongs to the current step, whose time and cadence stay those of its first poll.
     fn advance(&mut self, at: Timestamp) -> bool {
         // A clock that went back cannot say how long it was, so that is a gap of unknown length.
         let mut steps = if at < self.last_at {
@@ -273,9 +274,9 @@ impl TrendStore {
             }
         };
         if let Some(trend) = self.clusters.get_mut(cluster) {
-            if !trend.advance(at) {
-                return;
-            }
+            // A poll too soon after the last one, such as a new feed's first, updates the
+            // current step, so the newest values are never those of a feed that stopped.
+            trend.advance(at);
         } else if self.clusters.len() >= MAX_CLUSTERS {
             return;
         } else {
@@ -319,8 +320,9 @@ impl TrendStore {
         )
     }
 
-    /// When each step [`Self::series`] reads up to `now` was polled, oldest first and aligned
-    /// with it: `None` for a step no poll took, such as one still expected or one in a gap.
+    /// When each step [`Self::series`] reads up to `now` was first polled, oldest first and
+    /// aligned with it: `None` for a step no poll took, such as one still expected or one in a
+    /// gap.
     /// `None` if the store has no such cluster.
     pub fn sample_times(
         &self,
@@ -503,11 +505,19 @@ mod tests {
     }
 
     #[test]
-    fn a_sample_too_soon_is_ignored() {
+    fn a_sample_too_soon_updates_the_current_step() {
         let mut store = TrendStore::new();
         store.record(CLUSTER, at(0), &one(5));
         store.record(CLUSTER, at(3), &one(9));
-        assert_eq!(tail(&store, TrendScope::Total, at(3), 2), [None, Some(5)]);
+        assert_eq!(tail(&store, TrendScope::Total, at(3), 2), [None, Some(9)]);
+        let times: Vec<_> = store.sample_times(CLUSTER, at(3)).unwrap().collect();
+        assert_eq!(times.last(), Some(&Some(at(0))), "the step keeps its time");
+        store.record(CLUSTER, at(15), &one(7));
+        assert_eq!(
+            tail(&store, TrendScope::Total, at(15), 2),
+            [Some(9), Some(7)],
+            "and its cadence"
+        );
     }
 
     #[test]

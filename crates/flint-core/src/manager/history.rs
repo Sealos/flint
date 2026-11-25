@@ -7,7 +7,7 @@
 //! different server or credential never inherits old samples.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use super::ClusterManager;
 use crate::ClusterId;
@@ -59,9 +59,17 @@ impl TrendHistories {
         self.clusters.get(cluster).map(|history| &history.trends)
     }
 
-    /// Drops `cluster`'s history. A feed still holding it writes on into a store nothing reads.
+    /// Drops `cluster`'s history and empties it, so last values still listed for a stopped feed
+    /// show none of its samples either. A feed still holding it writes on into a store nothing
+    /// keeps.
     pub(crate) fn forget(&mut self, cluster: &str) {
-        self.clusters.remove(cluster);
+        if let Some(history) = self.clusters.remove(cluster) {
+            history
+                .trends
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .drop_cluster(cluster);
+        }
     }
 }
 
@@ -91,9 +99,12 @@ impl ClusterManager {
             KeepWatching::Watching | KeepWatching::SignInNeeded | KeepWatching::Paused
         );
         match self.cluster(id) {
-            Some(slot) => {
-                slot.fingerprint == Some(fingerprint) && (watched || self.wants_watches(id))
+            // A paused context may show a fallback from another file, which is no confirmed
+            // change: the history waits for the files to settle. No feed runs meanwhile.
+            Some(slot) if slot.fingerprint != Some(fingerprint) => {
+                (self.paused(id) || self.unsettled(id)) && (watched || self.wants_watches(id))
             }
+            Some(_) => watched || self.wants_watches(id),
             // Missing from a load that could not read every file: paused, not removed. A later
             // load on another definition drops it then.
             None => watched,

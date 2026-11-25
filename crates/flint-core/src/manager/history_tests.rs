@@ -334,3 +334,56 @@ async fn an_unwatched_cluster_drops_its_history_when_left() {
 
     assert!(manager.histories.get("other").is_none());
 }
+
+// Dropping a history empties it, so last values still listed for a stopped feed show none of it.
+#[test]
+fn a_dropped_history_is_emptied() {
+    let mut histories = TrendHistories::default();
+    let held = histories.store("one", Some(1));
+    let list = Ok(MetricsList {
+        items: vec![NodeMetrics {
+            name: "a".into(),
+            timestamp: None,
+            window: None,
+            usage: Usage::default(),
+        }],
+        skipped: 0,
+    });
+    held.lock().unwrap().record("one", start(), &list);
+
+    histories.forget("one");
+
+    let store = held.lock().unwrap();
+    assert!(
+        store
+            .series("one", TrendScope::Total, TrendResource::Cpu, start())
+            .is_none()
+    );
+}
+
+// A paused context showing a fallback from another file is no confirmed change: the history
+// waits for the files to settle, and is dropped if the change is confirmed.
+#[tokio::test]
+async fn a_paused_fallback_keeps_the_history_until_confirmed() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "dev");
+    watched_other(&mut manager).await;
+    sample(&manager, "other", start(), 100);
+    let slot = manager.cluster_mut("other").unwrap();
+    slot.fingerprint = slot.fingerprint.map(|print| print.wrapping_add(1));
+
+    manager.held.insert("other".to_owned());
+    sync(&mut manager);
+    assert!(
+        manager.histories.get("other").is_some(),
+        "kept while paused"
+    );
+
+    manager.held.remove("other");
+    sync(&mut manager);
+    assert!(
+        manager.histories.get("other").is_none(),
+        "dropped once confirmed"
+    );
+}

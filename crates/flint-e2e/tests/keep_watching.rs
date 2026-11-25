@@ -1208,6 +1208,13 @@ async fn never_prompting(body: &str) -> Fixture {
     f
 }
 
+/// When the oldest step of `b`'s history its feed shows now was polled.
+fn b_first_poll(f: &Fixture) -> Option<String> {
+    let feed = f.core.handle.telemetry("b")?;
+    let at = feed.snapshot.at;
+    feed.with_trends(|store| Some(store.sample_times("b", at)?.flatten().next()?.to_string()))
+}
+
 /// Waits until `done` holds.
 async fn until_b_feed(f: &Fixture, what: &str, done: impl Fn(&Fixture) -> bool) {
     tokio::time::timeout(WAIT, async {
@@ -1243,6 +1250,7 @@ async fn leaving_a_cluster_hands_its_history_to_the_kept_feed() {
     .await;
     assert!(!kept_feed_serves(&f), "the slot's own feed");
     assert_eq!(b_cpu_samples(&f), [250_000_000]);
+    let first = b_first_poll(&f).expect("a polled step");
 
     f.b.set_metrics(&MetricsTarget::node(NODE), "750m", "1Gi");
     f.turn_on().await;
@@ -1252,11 +1260,12 @@ async fn leaving_a_cluster_hands_its_history_to_the_kept_feed() {
     })
     .await;
 
+    assert_eq!(b_first_poll(&f), Some(first), "the history goes on");
     let samples = b_cpu_samples(&f);
     assert_eq!(
-        samples.first(),
-        Some(&250_000_000),
-        "the history goes on: {samples:?}"
+        samples.last(),
+        Some(&750_000_000),
+        "the newest values are the kept feed's: {samples:?}"
     );
     assert!(f.b.writes().is_empty(), "{:?}", f.b.writes());
 }
