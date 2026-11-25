@@ -149,6 +149,8 @@ struct ClusterTrend {
     last_at: Timestamp,
     /// A poll failed since the last sample, so the next one must not look contiguous.
     gap_pending: bool,
+    /// When each step's poll finished, indexed like a [`Ring`]: `None` for a step no poll took.
+    times: Box<[Option<Timestamp>]>,
     total: Series,
     nodes: BTreeMap<String, Series>,
 }
@@ -159,6 +161,11 @@ impl ClusterTrend {
             step: 0,
             last_at: at,
             gap_pending: false,
+            times: {
+                let mut times = vec![None; TREND_SAMPLES].into_boxed_slice();
+                times[slot(0)] = Some(at);
+                times
+            },
             total: Series::new(0),
             nodes: BTreeMap::new(),
         }
@@ -178,7 +185,12 @@ impl ClusterTrend {
         if self.gap_pending {
             steps = steps.max(2);
         }
+        let previous = self.step;
         self.step += steps.min(TREND_SAMPLES as i128) as u64;
+        for skipped in previous + 1..self.step {
+            self.times[slot(skipped)] = None;
+        }
+        self.times[slot(self.step)] = Some(at);
         self.last_at = at;
         self.gap_pending = false;
         let step = self.step;
@@ -305,6 +317,24 @@ impl TrendStore {
                 .rev()
                 .map(move |back| right.checked_sub(back).and_then(|step| ring.get(step))),
         )
+    }
+
+    /// When each step [`Self::series`] reads up to `now` was polled, oldest first and aligned
+    /// with it: `None` for a step no poll took, such as one still expected or one in a gap.
+    /// `None` if the store has no such cluster.
+    pub fn sample_times(
+        &self,
+        cluster: &str,
+        now: Timestamp,
+    ) -> Option<impl Iterator<Item = Option<Timestamp>> + '_> {
+        let trend = self.clusters.get(cluster)?;
+        let newest = trend.step;
+        let right = newest + trend.steps_behind(now);
+        Some((0..TREND_SAMPLES as u64).rev().map(move |back| {
+            let step = right.checked_sub(back)?;
+            let held = step <= newest && newest - step < TREND_SAMPLES as u64;
+            held.then(|| trend.times[slot(step)]).flatten()
+        }))
     }
 
     /// How many rings are held, each of [`TREND_SAMPLES`] values.
@@ -683,5 +713,29 @@ mod tests {
         store.record(CLUSTER, at(0), &list(vec![node(&name, 4, 4)]));
         assert_eq!(store.ring_count(), 2);
         assert_eq!(tail(&store, TrendScope::Total, at(0), 1), [Some(4)]);
+    }
+
+    #[test]
+    fn each_step_reads_the_time_it_was_polled() {
+        let mut store = TrendStore::new();
+        store.record(CLUSTER, at_millis(0), &one(1));
+        store.record(CLUSTER, at_millis(15_200), &one(2));
+        store.record(CLUSTER, at_millis(61_000), &one(3));
+        let now = at_millis(61_000);
+        let times: Vec<_> = store.sample_times(CLUSTER, now).unwrap().collect();
+        let values = read(&store, TrendScope::Total, now);
+        assert_eq!(times.len(), values.len());
+        let n = times.len();
+        assert_eq!(
+            times[n - 5..],
+            [
+                Some(at_millis(0)),
+                Some(at_millis(15_200)),
+                None,
+                None,
+                Some(at_millis(61_000)),
+            ]
+        );
+        assert!(store.sample_times("missing", now).is_none());
     }
 }
