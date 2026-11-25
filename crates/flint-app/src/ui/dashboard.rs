@@ -1029,7 +1029,7 @@ impl Render for DashboardView {
             .text_color(theme.foreground)
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
-            .children(tiles::status_banner(&self.model.status, theme))
+            .child(tiles::status_banner(&self.model.status, theme))
             .child(tiles::problem_tiles(
                 &self.model.tiles,
                 &self.lists,
