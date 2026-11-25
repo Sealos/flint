@@ -235,6 +235,7 @@ fn secret_kind() -> KindInfo {
         short_names: Vec::new(),
         namespaced: true,
         verbs: Vec::new(),
+        scale: Default::default(),
     }
 }
 
