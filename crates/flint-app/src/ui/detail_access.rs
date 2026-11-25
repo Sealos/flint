@@ -163,6 +163,8 @@ impl ObjectAccess {
         let object = |verb: &str| on(group, plural, None, Some(&self.name), verb);
         let pod = |sub: &str, name: &str| on("", "pods", Some(sub), Some(name), "get");
         match what {
+            // A Secret's edit is a merge patch of what changed; any other kind's is a replace.
+            Gated::Edit if group.is_empty() && plural == "secrets" => vec![object("patch")],
             Gated::Edit => vec![object("update")],
             Gated::Logs => match self.subject {
                 Subject::Pod => vec![pod("log", &self.name)],
@@ -639,6 +641,9 @@ mod tests {
         let access = deployment();
         let one = |what| wanted(&access, what).remove(0);
         assert_eq!(one(Gated::Edit).verb, "update");
+        // A Secret's edit is a merge patch.
+        let secret = object("", "secrets", Some("demo"), "db");
+        assert_eq!(wanted(&secret, Gated::Edit).remove(0).verb, "patch");
         let scale = one(Gated::Write(ResourceAction::Scale));
         assert_eq!(
             (scale.verb.as_str(), scale.subresource.as_deref()),
