@@ -276,7 +276,7 @@ pub(super) struct DrawnLinks {
 }
 
 /// What a click on a link that no longer holds says.
-const STALE_LINK: &str = "That changed while you clicked. The overview is up to date now.";
+const STALE_LINK: &str = "That link changed while you clicked, so nothing opened. Try again.";
 
 /// How a confirmed link is performed: [`registry::dispatch_in`].
 type Dispatch =

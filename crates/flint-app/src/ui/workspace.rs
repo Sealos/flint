@@ -2784,11 +2784,16 @@ impl Workspace {
     fn detail_beside(&self, cx: &App) -> bool {
         self.detail.is_some()
             && self.main_panes(cx) == MainPanes::Split
-            && !(self.right_selected
-                && self
-                    .list
-                    .as_ref()
-                    .is_some_and(|l| l.read(cx).has_open_row_menu()))
+            && !self.detail_hidden_by_menu(cx)
+    }
+
+    /// Whether a right-click's open menu keeps the detail it opened out of the layout.
+    fn detail_hidden_by_menu(&self, cx: &App) -> bool {
+        self.right_selected
+            && self
+                .list
+                .as_ref()
+                .is_some_and(|l| l.read(cx).has_open_row_menu())
     }
 
     /// Whether the navigation is on screen: for the active cluster, or for an open set, which
@@ -3909,7 +3914,9 @@ impl Render for Workspace {
                 let right_click = std::mem::take(&mut this.right_press);
                 this.list_in_front = right_click;
                 this.menu_row_pending = right_click;
-                this.right_selected = right_click;
+                // Only a detail the right-click opens stays out of the layout: one already beside
+                // the list keeps its room.
+                this.right_selected = right_click && this.detail.is_none();
             }))
             .capture_action(cx.listener(|this, _: &OpenObject, _, _| {
                 this.list_in_front = false;
