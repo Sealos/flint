@@ -78,6 +78,7 @@ pub fn status_banner(status: &DashboardStatus, theme: &Theme) -> impl IntoElemen
     };
     div()
         .w_full()
+        .flex_none()
         .min_h(STATUS_LINE_HEIGHT)
         .when_some(line, |slot, (text, color)| {
             slot.child(note("dashboard-status", text, color))
