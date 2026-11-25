@@ -53,6 +53,7 @@ use super::registry::{
 };
 use super::terminal_model::ShellRequest;
 use super::terminal_view::TerminalView;
+use super::tooltip_text::{SHOW_DELAY, cap_width};
 
 /// The dock's height before the user drags it.
 pub const DEFAULT_HEIGHT: f32 = 280.;
@@ -987,7 +988,8 @@ impl Dock {
                     .tooltip(format!("Close tab ({})", registry::key_hint("secondary-w")))
                     .on_click(registry::on_click_contained(CloseTab { tab: id })),
             )
-            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .tooltip(move |window, cx| cap_width(Tooltip::new(tooltip.clone())).build(window, cx))
+            .tooltip_show_delay(SHOW_DELAY)
             .test_support()
             .into_any_element()
     }
@@ -1005,7 +1007,8 @@ pub fn cluster_chip(
     div()
         .id(id)
         .when_some(tooltip, |el, tooltip| {
-            el.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            el.tooltip(move |window, cx| cap_width(Tooltip::new(tooltip.clone())).build(window, cx))
+                .tooltip_show_delay(SHOW_DELAY)
         })
         .flex_none()
         .px_1()
