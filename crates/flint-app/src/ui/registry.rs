@@ -52,6 +52,10 @@ use super::list::combined::{
     ToggleCombinedProblems, ToggleCombinedWide, ToggleGroupByCluster,
 };
 pub use super::pending_threshold::SetPendingThreshold;
+pub use super::settings_thresholds::{
+    AddClusterOverride, CancelThresholdEntry, EditClusterAlerts, EditClusterWatchMode,
+    EditThreshold, ResetClusterOverrides, TypeThreshold,
+};
 pub use super::settings_view::{
     ActivateSettingsControl, CloseSettings, EditAppearance, EditDesktopNotifications,
     EditWatchMode, NextSettingsControl, OpenSettings, PreviousSettingsControl, RevertSettings,
@@ -1081,6 +1085,29 @@ impl fmt::Display for ActionError {
 
 impl std::error::Error for ActionError {}
 
+impl ActionError {
+    /// The refusal as one sentence for the person who clicked: never an internal action name.
+    pub fn for_person(&self) -> String {
+        let sentence = match self {
+            ActionError::NotAvailable(_) => "That is not available in the current view".to_owned(),
+            ActionError::Rejected { reason, .. } => reason.clone(),
+            ActionError::InvalidArgs { message, .. } => message.clone(),
+            ActionError::Unknown(_) => "That is not available".to_owned(),
+        };
+        let mut chars = sentence.chars();
+        let first = chars.next().map(|c| c.to_uppercase().collect::<String>());
+        let text = first
+            .into_iter()
+            .chain(chars.map(String::from))
+            .collect::<String>();
+        if text.ends_with('.') {
+            text
+        } else {
+            format!("{text}.")
+        }
+    }
+}
+
 /// An action the app offers: what it is called, what it does, and how to make one.
 pub struct ActionSpec {
     /// The GPUI action name, `namespace::Name`. Stable: automation and key maps refer to it.
@@ -1470,12 +1497,27 @@ pub fn perform(action: &dyn Action, window: &mut Window, cx: &mut App) -> Result
 }
 
 /// A click handler that performs `action`: what every control in `ui/` uses, so a click is
-/// exactly its action. A refusal is logged: the control was drawn from older state.
+/// exactly its action. A refusal is logged and shown ([`report_refusal`]): the control was
+/// drawn from older state.
 pub fn on_click<E: ?Sized, A: Action>(action: A) -> impl Fn(&E, &mut Window, &mut App) + 'static {
     move |_, window, cx| {
         if let Err(e) = perform(&action, window, cx) {
-            tracing::warn!("{e}");
+            report_refusal(&e, cx);
         }
+    }
+}
+
+/// Logs `error` and tells the person why their click did nothing, in the installed workspace's
+/// notice.
+pub fn report_refusal(error: &ActionError, cx: &mut App) {
+    tracing::warn!("{error}");
+    let workspace = cx
+        .try_global::<Installed>()
+        .and_then(|installed| installed.owner.as_ref()?.upgrade())
+        .and_then(|owner| owner.downcast::<super::workspace::Workspace>().ok());
+    if let Some(workspace) = workspace {
+        let why = error.for_person();
+        workspace.update(cx, |ws, cx| ws.refuse(why, cx));
     }
 }
 
@@ -1487,7 +1529,7 @@ pub fn on_click_in<E: ?Sized, A: Action>(
 ) -> impl Fn(&E, &mut Window, &mut App) + 'static {
     move |_, window, cx| {
         if let Err(e) = dispatch_in(&focus, &action, window, cx) {
-            tracing::warn!("{e}");
+            report_refusal(&e, cx);
         }
     }
 }
@@ -1627,6 +1669,8 @@ struct Guard {
 struct Installed {
     target: Option<FocusHandle>,
     guards: HashMap<TypeId, Guard>,
+    /// The view the guards belong to, which shows a refused click's reason.
+    owner: Option<AnyWeakEntity>,
 }
 
 impl Global for Installed {}
@@ -1695,6 +1739,7 @@ impl<V: 'static> Guards<V> {
 pub fn install<V: 'static>(target: FocusHandle, guards: Guards<V>, cx: &mut App) {
     cx.set_global(Installed {
         target: Some(target),
+        owner: Some(guards.view.into()),
         guards: guards.guards,
     });
 }
@@ -1985,9 +2030,80 @@ const CLUSTER_ALERTS: &[Arg] = &[
 ];
 const SETTINGS_SECTION: &[Arg] = &[arg(
     "section",
-    "appearance, alerts or watching",
-    ArgKind::Choice(&["appearance", "alerts", "watching"]),
+    "appearance, alerts, watching, thresholds or cluster_overrides",
+    ArgKind::Choice(&[
+        "appearance",
+        "alerts",
+        "watching",
+        "thresholds",
+        "cluster_overrides",
+    ]),
 )];
+const THRESHOLD_METRICS: &[&str] = &[
+    "cpu_percent",
+    "memory_percent",
+    "restarts_last_hour",
+    "warning_events_last_hour",
+    "pending_pod_seconds",
+];
+const EDIT_THRESHOLD: &[Arg] = &[
+    Arg {
+        name: "cluster",
+        description: "kubeconfig context name; the global value when left out",
+        required: false,
+        kind: ArgKind::Cluster,
+    },
+    arg(
+        "metric",
+        "cpu_percent, memory_percent, restarts_last_hour, warning_events_last_hour or \
+         pending_pod_seconds",
+        ArgKind::Choice(THRESHOLD_METRICS),
+    ),
+    Arg {
+        name: "value",
+        description: "a whole number; left out or empty to follow the level below",
+        required: false,
+        kind: ArgKind::Text,
+    },
+];
+const TYPE_THRESHOLD: &[Arg] = &[
+    Arg {
+        name: "cluster",
+        description: "kubeconfig context name; the global value when left out",
+        required: false,
+        kind: ArgKind::Cluster,
+    },
+    arg(
+        "metric",
+        "cpu_percent, memory_percent, restarts_last_hour, warning_events_last_hour or \
+         pending_pod_seconds",
+        ArgKind::Choice(THRESHOLD_METRICS),
+    ),
+];
+const EDIT_CLUSTER_ALERTS: &[Arg] = &[
+    arg("cluster", "kubeconfig context name", ArgKind::Cluster),
+    arg(
+        "choice",
+        "default, on or off",
+        ArgKind::Choice(&["default", "on", "off"]),
+    ),
+];
+const EDIT_CLUSTER_WATCH_MODE: &[Arg] = &[
+    arg("cluster", "kubeconfig context name", ArgKind::Cluster),
+    arg(
+        "mode",
+        "default, all or on_view",
+        ArgKind::Choice(&["default", "all", "on_view"]),
+    ),
+];
+const RESET_CLUSTER_OVERRIDES: &[Arg] =
+    &[arg("cluster", "kubeconfig context name", ArgKind::Cluster)];
+const ADD_CLUSTER_OVERRIDE: &[Arg] = &[Arg {
+    name: "cluster",
+    description: "kubeconfig context name; shows the list of clusters when left out",
+    required: false,
+    kind: ArgKind::Cluster,
+}];
 const EDIT_APPEARANCE: &[Arg] = &[arg(
     "appearance",
     "system, light or dark",
@@ -2319,6 +2435,52 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Edit Default Watch Mode…",
             "Set the default watch mode in the Settings draft.",
             EDIT_WATCH_MODE,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditThreshold>(
+            "Edit Threshold…",
+            "Set a warning threshold, global or for one cluster, in the Settings draft.",
+            EDIT_THRESHOLD,
+        )
+        .of(C::Flint, S::Settings)
+        // The palette skips the optional value, so from there it could only clear one.
+        .hidden(),
+        Spec::with_args::<TypeThreshold>(
+            "Type Threshold…",
+            "Open the text field of a warning threshold in Settings.",
+            TYPE_THRESHOLD,
+        )
+        .of(C::Flint, S::Settings)
+        .hidden(),
+        Spec::unit::<CancelThresholdEntry>(
+            "Cancel Threshold Entry",
+            "Drop what is typed in a threshold field in Settings.",
+        )
+        .of(C::Flint, S::Settings)
+        .keys(&["escape"], Some(super::settings_view::SETTINGS_INPUT_KEYS))
+        .hidden(),
+        Spec::with_args::<EditClusterAlerts>(
+            "Edit Cluster Alerts Override…",
+            "Set whether one cluster posts desktop notifications, in the Settings draft.",
+            EDIT_CLUSTER_ALERTS,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditClusterWatchMode>(
+            "Edit Cluster Watch Mode Override…",
+            "Set one cluster's watch mode in the Settings draft.",
+            EDIT_CLUSTER_WATCH_MODE,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<ResetClusterOverrides>(
+            "Reset Cluster Overrides…",
+            "Clear one cluster's thresholds, alerts and watch mode overrides in the Settings draft.",
+            RESET_CLUSTER_OVERRIDES,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<AddClusterOverride>(
+            "Add Cluster Override…",
+            "Give a cluster a row in Settings' Cluster overrides.",
+            ADD_CLUSTER_OVERRIDE,
         )
         .of(C::Flint, S::Settings),
         // The view's own Tab cycle, so its controls work without a mouse and Tab never reaches
@@ -3602,6 +3764,16 @@ pub mod tests {
         find, key_hint, key_hint_for,
     };
 
+    #[test]
+    fn a_refusal_reads_as_a_sentence_without_the_action_name() {
+        let gone = ActionError::rejected::<SelectRow>("no row web in the list as shown");
+        assert_eq!(gone.for_person(), "No row web in the list as shown.");
+        let unavailable = ActionError::unavailable::<SelectRow>();
+        let text = unavailable.for_person();
+        assert!(!text.contains("resource_list"), "{text}");
+        assert!(text.ends_with('.'), "{text}");
+    }
+
     /// Collects the names of the actions a view binds.
     pub struct Names(Vec<&'static str>);
 
@@ -3745,6 +3917,7 @@ pub mod tests {
             "workspace::SetNamespaces",
             "detail::ToggleSecretValue",
             "resource_list::CloseDetail",
+            "settings::EditThreshold",
         ] {
             assert!(hidden.contains(&name), "{name} is in the palette");
         }
@@ -3897,13 +4070,15 @@ pub mod tests {
     }
 
     /// Plain keys never fire while typing in a field, except Esc meant for the log search field
-    /// itself (which the field passes on), and the keys the palette's field and the list's
+    /// or a Settings threshold field itself (which the field passes on), and the keys the palette's field and the list's
     /// filter hand on (no field there takes Enter, Esc or Down for itself). Keys with a modifier
     /// are not plain.
     fn plain_key_allowed(key: &str, context: Option<&str>) -> bool {
         key.contains('-')
             || context.is_some_and(|c| c.contains("!Input"))
             || (key == "escape" && context == Some(super::LOG_SEARCH))
+            || (key == "escape"
+                && context == Some(super::super::settings_view::SETTINGS_INPUT_KEYS))
             || context == Some(super::PALETTE_INPUT)
             || (matches!(key, "escape" | "enter" | "down") && context == Some(super::LIST_FILTER))
             || (matches!(key, "tab" | "up" | "down")

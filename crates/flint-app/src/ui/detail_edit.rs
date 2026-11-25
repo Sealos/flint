@@ -181,11 +181,10 @@ enum Step<'a> {
     Item(&'a str),
 }
 
+/// `object` without what the server sets in `metadata`. `status` is kept: an edit may set it on
+/// a kind without a status subresource, and then a change to it on the cluster competes.
 fn without_server_owned(object: &Value) -> Value {
     let mut kept = object.clone();
-    if let Some(fields) = kept.as_object_mut() {
-        fields.remove("status");
-    }
     if let Some(metadata) = kept.get_mut("metadata").and_then(Value::as_object_mut) {
         for field in SERVER_OWNED_METADATA {
             metadata.remove(field);
@@ -196,7 +195,16 @@ fn without_server_owned(object: &Value) -> Value {
 
 /// The paths that differ between any state in `seen` and `latest` and that `yaml` would set to
 /// something other than `latest`, sorted. Text that does not parse has none: its review fails.
-fn competing_changes(seen: &[Value], latest: &Value, yaml: &str) -> Vec<String> {
+/// `status` counts only when the text sets it: otherwise the write keeps the cluster's. Then it
+/// is the status the review's dry run wrote (`reviewed_after`, the review's after text), which an
+/// admission webhook may have changed from the typed one: the cluster's if the review did not
+/// show one. Without a review, the typed one.
+fn competing_changes(
+    seen: &[Value],
+    latest: &Value,
+    yaml: &str,
+    reviewed_after: Option<&str>,
+) -> Vec<String> {
     let Ok(mut edited) = serde_saphyr::from_str::<Value>(yaml) else {
         return Vec::new();
     };
@@ -207,10 +215,32 @@ fn competing_changes(seen: &[Value], latest: &Value, yaml: &str) -> Vec<String> 
             &flint_core::secret_edit::with_live_values(&edited, latest),
         );
     }
-    let latest = without_server_owned(latest);
-    let edited = without_server_owned(&edited);
+    let sets_status = edited.get("status").is_some();
+    if sets_status
+        && let Some(after) = reviewed_after
+        && let Some(fields) = edited.as_object_mut()
+    {
+        let written = serde_saphyr::from_str::<Value>(after)
+            .ok()
+            .and_then(|mut after| after.get_mut("status").map(Value::take))
+            .or_else(|| latest.get("status").cloned());
+        match written {
+            Some(status) => fields.insert("status".to_owned(), status),
+            None => fields.remove("status"),
+        };
+    }
+    let compared = |object: &Value| {
+        let mut kept = without_server_owned(object);
+        if let Some(fields) = kept.as_object_mut().filter(|_| !sets_status) {
+            fields.remove("status");
+        }
+        kept
+    };
+    let latest = compared(latest);
+    let edited = compared(&edited);
+    let seen: Vec<Value> = seen.iter().map(compared).collect();
     let mut found = BTreeSet::new();
-    for earlier in seen {
+    for earlier in &seen {
         collect_competing(
             Some(earlier),
             Some(&latest),
@@ -357,11 +387,6 @@ fn competing_text(paths: &[String]) -> Option<String> {
          {it}:\n{}",
         paths.join("\n")
     ))
-}
-
-/// Whether the text sets `status`, which a review cannot show: the editor opens without it.
-fn sets_status(yaml: &str) -> bool {
-    serde_saphyr::from_str::<Value>(yaml).is_ok_and(|value| value.get("status").is_some())
 }
 
 fn diff_file(patch: &str) -> Option<DiffFile> {
@@ -676,11 +701,6 @@ impl DetailView {
             return;
         };
         let yaml = edit.editor.read(cx).value().to_string();
-        if sets_status(&yaml) {
-            edit.error = Some("Remove status: it cannot be edited here.".to_owned());
-            cx.notify();
-            return;
-        }
         edit.phase = Phase::Reviewing;
         edit.error = None;
         edit.competing.clear();
@@ -702,8 +722,9 @@ impl DetailView {
             let compare = compare.filter(|_| result.is_ok());
             let (patch, competing) = cx
                 .background_spawn(async move {
+                    let after = shown.as_ref().map(|(_, after)| after.as_str());
                     let competing = compare.map_or_else(Vec::new, |(seen, latest, yaml)| {
-                        competing_changes(&seen, &latest.object, &yaml)
+                        competing_changes(&seen, &latest.object, &yaml, after)
                     });
                     let patch = shown.and_then(|(before, after)| patch(&name, &before, &after));
                     (patch, competing)
@@ -976,7 +997,7 @@ mod tests {
 
     use super::{
         DetailTab, Fetch, Phase, Step, competing_text, edit_error_text, editable_yaml, path_text,
-        sets_status, shown_for_edit, with_resource_version, without_server_owned,
+        shown_for_edit, with_resource_version, without_server_owned,
     };
     use crate::ui::support_tests::{WAIT, objects, open_workspace, standard_sections};
 
@@ -985,7 +1006,7 @@ mod tests {
         latest: &serde_json::Value,
         yaml: &str,
     ) -> Vec<String> {
-        super::competing_changes(&[without_server_owned(base)], latest, yaml)
+        super::competing_changes(&[without_server_owned(base)], latest, yaml, None)
     }
 
     // covers UP-51: the editor opens without status or managedFields, at its version.
@@ -1149,7 +1170,26 @@ mod tests {
             "spec": {"replicas": 1, "paused": false},
             "status": {"ready": 5},
         });
-        assert!(competing_changes(&base, &only_server, &yaml(&base)).is_empty());
+        let mut opened = base.clone();
+        opened.as_object_mut().unwrap().remove("status");
+        assert!(competing_changes(&base, &only_server, &yaml(&opened)).is_empty());
+    }
+
+    // A kind without a status subresource takes a typed status: a status that changed on the
+    // cluster since is then overwritten, and listed.
+    #[test]
+    fn a_typed_status_competes_with_the_clusters() {
+        let at = |ready: u32| json!({"metadata": {"name": "a"}, "status": {"ready": ready}});
+        let typed = yaml(&at(9));
+        assert_eq!(competing_changes(&at(1), &at(5), &typed), ["status.ready"]);
+        assert!(competing_changes(&at(1), &at(1), &typed).is_empty());
+        // The text keeps the cluster's 5, and a webhook writes 0: 5 is still overwritten.
+        let seen = [without_server_owned(&at(1))];
+        let written = yaml(&at(0));
+        assert_eq!(
+            super::competing_changes(&seen, &at(5), &yaml(&at(5)), Some(&written)),
+            ["status.ready"]
+        );
     }
 
     #[test]
@@ -1180,10 +1220,10 @@ mod tests {
         let at = |n: u32| json!({"metadata": {"name": "a"}, "spec": {"replicas": n}});
         let seen = [without_server_owned(&at(1)), without_server_owned(&at(5))];
         assert_eq!(
-            super::competing_changes(&seen, &at(1), &yaml(&at(5))),
+            super::competing_changes(&seen, &at(1), &yaml(&at(5)), None),
             ["spec.replicas"]
         );
-        assert!(super::competing_changes(&seen, &at(1), &yaml(&at(1))).is_empty());
+        assert!(super::competing_changes(&seen, &at(1), &yaml(&at(1)), None).is_empty());
     }
 
     fn init(names: &[&str]) -> serde_json::Value {
@@ -1241,13 +1281,6 @@ mod tests {
         let value: serde_json::Value = serde_saphyr::from_str(&moved).unwrap();
         assert_eq!(value["metadata"]["resourceVersion"], "8", "{moved}");
         assert_eq!(value["metadata"]["name"], "a", "{moved}");
-    }
-
-    // A review hides status, so an edit that sets it is not sent.
-    #[test]
-    fn an_edit_that_sets_status_is_recognised() {
-        assert!(sets_status("kind: X\nstatus:\n  phase: Ready\n"));
-        assert!(!sets_status("kind: X\nspec:\n  status: keep\n"));
     }
 
     // The editor's own wording for a moved context: no mention of a shell, and the way forward.
@@ -1331,10 +1364,9 @@ mod tests {
             view.update(cx, |v, cx| {
                 v.show_fetched(detail.clone(), window, cx);
                 v.start_edit(window, cx);
+                // Its context moved meanwhile: the follow-up review is refused at once.
+                v.mark_edit_moved(cx);
                 let edit = v.edit.as_mut().expect("the edit started");
-                edit.editor.update(cx, |state, cx| {
-                    state.set_value("kind: Pod\nstatus: {}\n", window, cx)
-                });
                 edit.phase = Phase::Reviewing;
                 window.focus(&moved_to, cx);
                 v.edit_reloaded(Ok(std::sync::Arc::new(detail)), window, cx);
@@ -1347,7 +1379,7 @@ mod tests {
         view.read_with(cx, |v, _| {
             let (error, blocked) = (v.edit_error(), v.edit_blocked());
             assert!(
-                error.is_some_and(|e| e.contains("status")),
+                error.is_some_and(|e| e.contains("open the object again")),
                 "{error:?} {blocked:?}"
             );
         });

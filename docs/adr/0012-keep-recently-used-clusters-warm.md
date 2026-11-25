@@ -15,10 +15,8 @@ time.
 - **Eviction by least recent use.** Selecting a cluster moves it to the front. When the set holds more than N
   clusters, the one used least recently becomes **cold**: its watches stop, and it keeps only its client and
   discovery cache, as in 0008. The active cluster is never evicted.
-- **Memory budget.** Each store keeps an estimate of its size (rows, labels and cell text), calibrated against
-  measured RSS by a multiplier. `warm_memory_mib` (default 128) covers only the background clusters, not the active
-  one. When they go over it, the least recently used is made cold until the total fits. A very large cluster can
-  therefore go cold as soon as the user leaves it.
+- **No memory budget.** Memory is bounded by the number of warm clusters (`warm_clusters`), the idle limit and
+  the per-kind object cap in [LIMITS.md](../LIMITS.md), not by a size estimate. See the amendment below.
 - **Idle limit.** A warm cluster goes cold after 30 minutes without being selected, and when the Mac sleeps. When
   several warm clusters reconnect at once, after a network change for example, their reconnects are staggered.
 - **Watch modes.** In mode All, a warm cluster keeps its watches but drops the high-churn kinds that no open view
@@ -97,6 +95,19 @@ launch**.
   age. Nothing is written to disk ([ADR-0017](./0017-cluster-dashboards.md)).
 - **Sidebar.** Only "watching" or "sign-in needed". Health badges are deferred.
 
+## Amendment: no memory budget (2026-11-25)
+
+The `warm_memory_mib` budget (default 128) is dropped, and so is the per-store size estimate and the multiplier
+calibrated against RSS that it needed. It was never built.
+
+- **Why.** Stores already hold trimmed rows with interned strings, not full objects, and the warm set is already
+  capped by count and idle time. An estimate of each store's size would add code on every update to enforce a limit
+  that no measurement has shown to be needed. Compressing stores in memory was considered for the same goal and
+  rejected: it costs CPU on every read, and macOS already compresses idle pages.
+- **What bounds memory instead.** `warm_clusters`, the 30-minute idle limit, the dropped high-churn kinds in mode
+  All, and the per-kind cap in [LIMITS.md](../LIMITS.md).
+- **Revisit when** a measured footprint with warm clusters becomes a problem; then set a target first.
+
 ## Sidebar
 
 Each cluster is **active**, **warm** or **cold**. A badge adds **reconnecting**, **sign-in needed** or **error**
@@ -109,12 +120,11 @@ cluster cold.
 The M1 measurements ([m1-watch-measurements.md](../spikes/m1-watch-measurements.md)) put the core at 7 MiB RSS
 before activation and 19 MiB with every kind synced in mode All. That cluster held 62 kinds and about 3,500 rows.
 So a small warm cluster adds about 12 MiB, and the default of 3 costs about 24 MiB more than 0008 on small
-clusters. The cost per row grows with labels and cell text, so large clusters cost more. The 128 MiB budget caps the
-background clusters whatever their size.
+clusters. The cost per row grows with labels and cell text, so large clusters cost more; lowering `warm_clusters`
+is the way to spend less.
 
-The target for CPU is under 1% of one core with 3 idle warm clusters. Before warm clusters roll out, the estimate is checked
-against RSS with 1, 3 and 5 warm clusters at 10,000 and 50,000 pods (simulated with kwok), and the multiplier is
-set from those numbers.
+The target for CPU is under 1% of one core with 3 idle warm clusters. Before warm clusters roll out, the footprint
+is measured with 1, 3 and 5 warm clusters at 10,000 and 50,000 pods (simulated with kwok).
 
 ## Considered Options
 

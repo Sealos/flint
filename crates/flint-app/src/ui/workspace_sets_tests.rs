@@ -15,7 +15,7 @@ use flint_core::{
     ServerVersion, SyncState,
 };
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
-use gpui_kit::{AppContext as _, TestAppContext};
+use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, Modifiers, TestAppContext};
 use serde_json::{Value, json};
 
 use super::super::Workspace;
@@ -23,15 +23,16 @@ use super::super::actions::resource_actions_tests::LocalApi;
 use super::super::unapplied_tests::{answered, asked, has_edit, type_edit};
 use super::{
     ClusterSet, CombinedListEvent, PendingOpen, SettingsDir, click_chooses, member_refusal,
-    rename_problem,
+    rename_problem, sidebar_set_members,
 };
+use crate::ui::clusters::ClustersModel;
 use crate::ui::confirm;
 use crate::ui::fleet_plan::FleetChoice;
 use crate::ui::fleet_view;
 use crate::ui::list::combined::row_id;
 use crate::ui::resource_actions::{ResourceAction, available, request, target_of};
 use crate::ui::support_tests::{
-    CURRENT_GENERATION, TestWorkspace, WAIT, discovery, kubeconfig_yaml, objects,
+    CURRENT_GENERATION, TestWorkspace, WAIT, discovery, kubeconfig_yaml, objects, open_window_over,
     open_workspace_with, standard_sections,
 };
 
@@ -56,6 +57,32 @@ async fn open_quiet_workspace(cx: &mut TestAppContext, dir: &std::path::Path) ->
         vec![path]
     })
     .await
+}
+
+const SIDEBAR_CONTEXTS: [(&str, &str); 3] = [
+    ("kind-alpha", "https://alpha.invalid"),
+    ("kind-beta", "https://beta.invalid"),
+    ("kind-gamma", "https://gamma.invalid"),
+];
+
+// These contexts can join a set but won't connect without background sign-in consent.
+async fn open_sidebar_workspace(
+    cx: &mut TestAppContext,
+    dir: &std::path::Path,
+) -> (AnyWindowHandle, Entity<Workspace>, Entity<ClustersModel>) {
+    cx.executor().allow_parking();
+    let path = dir.join("kubeconfig");
+    let yaml = kubeconfig_yaml(&SIDEBAR_CONTEXTS).replace(
+        "user: {token: t}",
+        "user:\n    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      \
+         command: /usr/bin/false\n      interactiveMode: Never",
+    );
+    std::fs::write(&path, yaml).unwrap();
+    let (window, workspace, model) = open_window_over(cx, dir, vec![path]);
+    let loaded = model.clone();
+    cx.wait_for(window, WAIT, move |_, cx| loaded.read(cx).loaded)
+        .await;
+    (window, workspace, model)
 }
 
 fn pick(cx: &mut TestAppContext, t: &TestWorkspace, cluster: &str) {
@@ -910,8 +937,6 @@ async fn save_both(cx: &mut TestAppContext, t: &TestWorkspace) {
         !workspace.read(cx).sets.saved.is_empty()
     })
     .await;
-    t.dispatch(cx, "cluster_sets::ToggleClusterPicking", Value::Null)
-        .unwrap();
 }
 
 fn saved_names(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<String> {
@@ -1095,6 +1120,9 @@ async fn discarding_keeps_the_left_out_notice(cx: &mut TestAppContext) {
     )
     .unwrap();
     asked(cx, t).await;
+    t.click(cx, "ok");
+    // The set it replaces was never saved: that asks as well.
+    asked_about_unsaved_set(cx, t).await;
     t.click(cx, "ok");
     answered(cx, t).await;
     let workspace = t.workspace.clone();
@@ -1591,6 +1619,74 @@ async fn a_member_back_after_the_view_looked_joins(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+async fn sidebar_marks_and_counts_current_set_members(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (window, workspace, _) = open_sidebar_workspace(cx, dir.path()).await;
+    workspace.update(cx, |ws, cx| {
+        let members = SIDEBAR_CONTEXTS[..2]
+            .iter()
+            .map(|&(name, server)| ClusterPin::new(name, server))
+            .collect();
+        ws.sets
+            .saved
+            .push(ClusterSet::new("saved", members).unwrap());
+        assert!(sidebar_set_members(ws.sets.running.as_ref()).is_none());
+        cx.notify();
+    });
+    let assert_sidebar = |cx: &mut TestAppContext, alpha, beta, count| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.try_find("cluster-set-mark-kind-alpha").is_some(),
+                alpha
+            );
+            assert_eq!(
+                window.try_find("cluster-set-mark-kind-beta").is_some(),
+                beta
+            );
+            assert!(window.try_find("cluster-set-mark-kind-gamma").is_none());
+            assert_eq!(window.find("open-set-saved").label(), Some(count));
+        })
+        .unwrap();
+    };
+    assert_sidebar(cx, false, false, "saved (2)");
+    cx.update_window(window, |_, window, cx| window.click("open-set-saved", cx))
+        .unwrap();
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("cluster-set-view").is_some()
+    })
+    .await;
+    assert_sidebar(cx, true, true, "saved (2)");
+
+    workspace.update(cx, |ws, cx| {
+        ws.discard_member("kind-beta", "kind-beta changed".into(), cx);
+        assert_eq!(
+            sidebar_set_members(ws.sets.running.as_ref()).unwrap(),
+            ["kind-alpha"]
+        );
+    });
+    assert_sidebar(cx, true, false, "saved (1)");
+
+    cx.update_window(window, |_, window, cx| {
+        window.click("close-cluster-set", cx);
+        workspace.update(cx, |ws, cx| {
+            ws.sets.picking = true;
+            ws.sets.picked = ws.sets.saved[0].members.clone();
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.click("open-picked-clusters", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, WAIT, |window, _| {
+        window
+            .try_find("open-unsaved-set")
+            .is_some_and(|entry| entry.label() == Some("Open set (2)"))
+    })
+    .await;
+}
+
+#[gpui_kit::test]
 async fn an_unsaved_set_is_titled_by_the_members_admitted(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let set = saved_set(cx, dir.path(), &THREE).await;
@@ -1714,6 +1810,68 @@ async fn a_cmd_click_chooses_and_a_plain_click_does_not(cx: &mut TestAppContext)
     assert_eq!(picked.len(), 1);
     assert_eq!(picked[0].context, "kind-beta");
     assert!(!t.server_was_contacted(), "choosing connects to nothing");
+}
+
+#[gpui_kit::test]
+async fn cmd_click_seeds_the_active_cluster(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (window, workspace, model) = open_sidebar_workspace(cx, dir.path()).await;
+    model.update(cx, |model, cx| {
+        model.feed(Event::ActiveChanged(Some("kind-beta".into())), cx)
+    });
+    let cmd_click = |cx: &mut TestAppContext, row| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click_with_modifiers(row, Modifiers::secondary_key(cx), cx);
+        })
+        .unwrap();
+    };
+    let toggle_picking = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            window.click("toggle-cluster-picking", cx)
+        })
+        .unwrap();
+    };
+    let picked = |cx: &mut TestAppContext| {
+        workspace.read_with(cx, |ws, _| {
+            assert!(ws.sets.picking());
+            assert!(!ws.sets.is_open());
+            ws.sets
+                .picked
+                .iter()
+                .map(|pin| pin.context.clone())
+                .collect::<Vec<_>>()
+        })
+    };
+
+    cmd_click(cx, "cluster-kind-alpha");
+    assert_eq!(picked(cx), ["kind-beta", "kind-alpha"]);
+    cx.update_window(window, |_, window, _| {
+        assert_ne!(window.find("open-picked-clusters").disabled(), Some(true));
+    })
+    .unwrap();
+
+    toggle_picking(cx);
+    cmd_click(cx, "cluster-kind-beta");
+    assert_eq!(picked(cx), ["kind-beta"]);
+
+    toggle_picking(cx);
+    toggle_picking(cx);
+    cmd_click(cx, "cluster-kind-alpha");
+    assert_eq!(picked(cx), ["kind-alpha"]);
+
+    toggle_picking(cx);
+    model.update(cx, |model, cx| {
+        let active = model
+            .clusters
+            .iter_mut()
+            .find(|c| c.info.name == "kind-beta")
+            .unwrap();
+        active.info.server = None;
+        cx.notify();
+    });
+    cmd_click(cx, "cluster-kind-alpha");
+    assert_eq!(picked(cx), ["kind-alpha"]);
 }
 
 #[test]
@@ -2060,4 +2218,165 @@ async fn a_paused_set_member_shows_shell_disabled_with_the_reason(cx: &mut TestA
     // The pod itself may not be fetched in this test; the pause is no longer the reason.
     assert!(!menu.is_err_and(|why| why.contains("paused")));
     assert_eq!(guard, None);
+}
+
+/// Waits for the unsaved-set question and checks what it offers.
+async fn asked_about_unsaved_set(cx: &mut TestAppContext, t: &TestWorkspace) {
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |window, cx| {
+        workspace
+            .update(cx, |ws, cx| ws.view_state(window, cx).dialog)
+            .is_some_and(|dialog| dialog.title == "Leave this unsaved set?")
+    })
+    .await;
+}
+
+fn set_is_open(cx: &mut TestAppContext, t: &TestWorkspace) -> bool {
+    t.workspace.read_with(cx, |ws, _| ws.sets.is_open())
+}
+
+// #766: closing a set opened together asks first; Keep open keeps it, Discard closes it.
+#[gpui_kit::test]
+async fn leaving_an_unsaved_set_asks(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_quiet_workspace(cx, dir.path()).await;
+    open_both(cx, &t).await;
+    t.dispatch(cx, "cluster_sets::CloseClusterSet", Value::Null)
+        .unwrap();
+    asked_about_unsaved_set(cx, &t).await;
+    t.press(cx, "escape");
+    answered(cx, &t).await;
+    assert!(set_is_open(cx, &t), "Keep open keeps the set");
+    t.dispatch(cx, "cluster_sets::CloseClusterSet", Value::Null)
+        .unwrap();
+    asked_about_unsaved_set(cx, &t).await;
+    t.click(cx, "ok");
+    answered(cx, &t).await;
+    assert!(!set_is_open(cx, &t), "Discard closes it");
+}
+
+// #762, #766: a set opened together is saved from its own bar, after which leaving asks nothing.
+#[gpui_kit::test]
+async fn an_open_set_is_saved_from_its_bar(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_quiet_workspace(cx, dir.path()).await;
+    cx.update(|cx| cx.set_global(SettingsDir(dir.path().to_owned())));
+    open_both(cx, &t).await;
+    assert!(t.find(cx, "save-open-set").is_some(), "the bar offers Save");
+    t.dispatch(
+        cx,
+        "cluster_sets::SaveClusterSet",
+        json!({ "name": "pair" }),
+    )
+    .unwrap();
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        !workspace.read(cx).sets.is_unsaved() && !workspace.read(cx).sets.saved.is_empty()
+    })
+    .await;
+    assert_eq!(saved_names(cx, &t), ["pair"]);
+    assert!(t.settings_toml().contains("pair"));
+    assert!(t.find(cx, "save-open-set").is_none(), "saved: no Save left");
+    t.dispatch(cx, "cluster_sets::CloseClusterSet", Value::Null)
+        .unwrap();
+    assert!(!set_is_open(cx, &t), "a saved set closes without asking");
+}
+
+// #767: saving chosen clusters leaves choosing mode.
+#[gpui_kit::test]
+async fn saving_chosen_clusters_leaves_choosing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_quiet_workspace(cx, dir.path()).await;
+    cx.update(|cx| cx.set_global(SettingsDir(dir.path().to_owned())));
+    save_both(cx, &t).await;
+    t.workspace.read_with(cx, |ws, _| {
+        assert!(!ws.sets.picking(), "choosing is off after the save");
+        assert!(ws.sets.picked.is_empty());
+    });
+}
+
+// #759: with a set open there is no namespace filter to change, so its actions are off.
+#[gpui_kit::test]
+async fn an_open_set_has_no_namespace_filter_actions(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_quiet_workspace(cx, dir.path()).await;
+    open_both(cx, &t).await;
+    for (action, args) in [
+        ("workspace::SetNamespaces", json!({ "namespaces": ["a"] })),
+        ("workspace::ToggleNamespace", json!({ "namespace": "a" })),
+        ("workspace::AddNamespace", json!({ "namespace": "a" })),
+    ] {
+        assert!(
+            t.dispatch(cx, action, args).is_err(),
+            "{action} is refused in a set"
+        );
+    }
+}
+
+// #760: clicking a cluster outside the set leaves it, also when that cluster is already active,
+// and the main area shows that cluster again instead of an empty page.
+#[gpui_kit::test]
+async fn clicking_the_active_non_member_leaves_the_set(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace_with(cx, dir.path(), |dir, servers| {
+        let path = dir.join("kubeconfig");
+        let contexts = [
+            ("kind-alpha", servers.silent.as_str()),
+            ("kind-beta", servers.silent.as_str()),
+            ("kind-gamma", servers.silent.as_str()),
+        ];
+        std::fs::write(&path, kubeconfig_yaml(&contexts)).unwrap();
+        vec![path]
+    })
+    .await;
+    t.dispatch(
+        cx,
+        "workspace::SelectCluster",
+        json!({ "cluster": "kind-gamma" }),
+    )
+    .unwrap();
+    open_both(cx, &t).await;
+    assert!(set_is_open(cx, &t));
+    t.dispatch(
+        cx,
+        "workspace::SelectCluster",
+        json!({ "cluster": "kind-gamma" }),
+    )
+    .unwrap();
+    asked_about_unsaved_set(cx, &t).await;
+    t.click(cx, "ok");
+    answered(cx, &t).await;
+    assert!(!set_is_open(cx, &t), "the set closed");
+    assert!(t.find(cx, "cluster-set-view").is_none());
+}
+
+// #767: Return in the set name field saves, as the Save Set button does.
+#[gpui_kit::test]
+async fn return_in_the_name_field_saves(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_quiet_workspace(cx, dir.path()).await;
+    cx.update(|cx| cx.set_global(SettingsDir(dir.path().to_owned())));
+    t.dispatch(cx, "cluster_sets::ToggleClusterPicking", Value::Null)
+        .unwrap();
+    pick(cx, &t, "kind-alpha");
+    pick(cx, &t, "kind-beta");
+    let input = t
+        .workspace
+        .read_with(cx, |ws, _| ws.sets.name_input.clone());
+    cx.update_window(t.window, |_, window, cx| {
+        input.update(cx, |input, cx| input.set_value("pair", window, cx));
+        input.update(cx, |_, cx| {
+            cx.emit(gpui_kit::component::input::InputEvent::PressEnter {
+                secondary: false,
+                shift: false,
+            })
+        });
+    })
+    .unwrap();
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        !workspace.read(cx).sets.saved.is_empty()
+    })
+    .await;
+    assert_eq!(saved_names(cx, &t), ["pair"]);
 }

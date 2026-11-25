@@ -351,7 +351,7 @@ async fn quit_while_a_save_is_pending_waits_for_it(cx: &mut TestAppContext) {
     let pending = cx
         .update_window(t.window, |_, window, cx| {
             super::registry::dispatch("settings::SaveSettings", Value::Null, window, cx).unwrap();
-            let pending = workspace.read(cx).has_settings_draft();
+            let pending = workspace.read(cx).has_settings_draft(cx);
             super::registry::dispatch("flint::Quit", Value::Null, window, cx).unwrap();
             pending
         })
@@ -403,13 +403,19 @@ async fn the_keyboard_alone_changes_and_saves_a_setting(cx: &mut TestAppContext)
     let dir = tempfile::tempdir().unwrap();
     let t = open_settings(cx, dir.path()).await;
     t.press(cx, "tab");
-    assert_eq!(state(cx, &t).settings.cursor, Some("settings-close"));
-    // Done, the three sections, then System, Light and Dark.
-    for _ in 0..6 {
+    assert_eq!(
+        state(cx, &t).settings.cursor.as_deref(),
+        Some("settings-close")
+    );
+    // Done, the five sections, then System, Light and Dark.
+    for _ in 0..8 {
         t.press(cx, "tab");
     }
     let s = state(cx, &t);
-    assert_eq!(s.settings.cursor, Some("settings-appearance-dark"));
+    assert_eq!(
+        s.settings.cursor.as_deref(),
+        Some("settings-appearance-dark")
+    );
     assert_eq!(s.focus, Focus::Settings, "Tab stays in Settings");
     t.press(cx, "enter");
     assert_eq!(state(cx, &t).settings.edited, ["appearance"]);
@@ -417,11 +423,20 @@ async fn the_keyboard_alone_changes_and_saves_a_setting(cx: &mut TestAppContext)
     // Round to the start and back: Shift-Tab from Done wraps to Save.
     t.press(cx, "tab");
     t.press(cx, "tab");
-    assert_eq!(state(cx, &t).settings.cursor, Some("settings-save"));
+    assert_eq!(
+        state(cx, &t).settings.cursor.as_deref(),
+        Some("settings-save")
+    );
     t.press(cx, "tab");
-    assert_eq!(state(cx, &t).settings.cursor, Some("settings-close"));
+    assert_eq!(
+        state(cx, &t).settings.cursor.as_deref(),
+        Some("settings-close")
+    );
     t.press(cx, "shift-tab");
-    assert_eq!(state(cx, &t).settings.cursor, Some("settings-save"));
+    assert_eq!(
+        state(cx, &t).settings.cursor.as_deref(),
+        Some("settings-save")
+    );
     t.press(cx, "space");
     wait_for_file(cx, &t, |s| s.appearance == flint_core::Appearance::Dark).await;
     assert!(!state(cx, &t).settings.dirty);
@@ -431,7 +446,7 @@ async fn the_keyboard_alone_changes_and_saves_a_setting(cx: &mut TestAppContext)
     t.press(cx, "tab");
     t.press(cx, "tab");
     assert_eq!(
-        state(cx, &t).settings.cursor,
+        state(cx, &t).settings.cursor.as_deref(),
         Some("settings-section-alerts")
     );
     t.press(cx, "enter");
