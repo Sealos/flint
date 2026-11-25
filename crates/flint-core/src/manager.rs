@@ -334,7 +334,7 @@ enum Internal {
     /// Write settings, then say how ([`crate::CoreHandle::write_settings`]).
     WriteSettings {
         writes: Vec<settings::SettingsWrite>,
-        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+        reply: tokio::sync::oneshot::Sender<Result<Arc<Settings>, String>>,
     },
     Connected {
         cluster: ClusterId,
@@ -1563,7 +1563,9 @@ impl ClusterManager {
                 if unprotect && result.is_err() {
                     self.reload_settings().await;
                 }
-                let _ = reply.send(result);
+                // Written, the settings as saved: what the file holds now, outside edits
+                // included, which the front end may not have heard of yet.
+                let _ = reply.send(result.map(|()| self.settings.clone()));
             }
             Internal::LateRead { paths, seq, read } => {
                 let in_order = self.saw_read(&paths, Some(&read));

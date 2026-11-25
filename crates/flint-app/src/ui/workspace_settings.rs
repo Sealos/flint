@@ -307,17 +307,16 @@ impl Workspace {
     fn finish_save(
         &mut self,
         writes: &[Change],
-        result: Result<(), String>,
+        result: Result<std::sync::Arc<flint_core::Settings>, String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(saving) = self.settings_page.saving.take() else {
             return;
         };
-        let written: &[Change] = if result.is_ok() { writes } else { &[] };
-        self.take_typed_while_saving(Some(written), cx);
+        self.take_typed_while_saving(result.as_deref().ok(), cx);
         match result {
-            Ok(()) => {
+            Ok(_) => {
                 self.settings_page.draft.saved(writes);
                 self.saved_thresholds_page();
                 if self.has_settings_draft(cx) {

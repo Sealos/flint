@@ -50,9 +50,11 @@ async fn wait_for_file(
     t: &TestWorkspace,
     wanted: impl Fn(&Settings) -> bool + 'static,
 ) {
+    // The file as wanted, and the Save that wrote it answered.
     let model = t.model.clone();
+    let workspace = t.workspace.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
-        wanted(&model.read(cx).settings)
+        wanted(&model.read(cx).settings) && !workspace.read(cx).settings_saving()
     })
     .await;
 }

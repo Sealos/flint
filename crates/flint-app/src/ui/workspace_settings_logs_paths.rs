@@ -1,5 +1,5 @@
 //! The workspace's side of the Logs, Paths and Write safety sections of Settings
-//! ([`settings_logs_paths`]): their actions and guards, the text fields, the kubeconfig file
+//! ([`super::super::settings_logs_paths`]): their actions and guards, the text fields, the kubeconfig file
 //! picker, and the confirmation that Save asks before it turns local cluster protection off.
 //!
 //! Turning protection off never happens silently. Whichever way Save is asked for, a draft that
@@ -120,6 +120,14 @@ impl Workspace {
                         InputEvent::Change => {
                             let text = input.read(cx).value().to_string();
                             ws.apply_settings_text(field, &text, cx);
+                        }
+                        // A click into the field puts the keyboard cursor on it, so Tab goes
+                        // on from there.
+                        InputEvent::Focus => {
+                            if ws.settings_page.open {
+                                ws.settings_page.cursor = Some(Stop::Text(field));
+                                cx.notify();
+                            }
                         }
                         // Enter leaves the field for the view, the cursor still on it.
                         InputEvent::PressEnter { .. } => {
@@ -260,7 +268,7 @@ impl Workspace {
     ) {
         let file = self.model.read(cx).settings.clone();
         let page = &mut self.settings_page;
-        match field.parse(text, home().as_deref()) {
+        match field.parse(text) {
             // An accepted value replaces one rejected before.
             Ok(change) => page.draft.edit_over(change, holding, &file),
             Err(why) => page
@@ -274,26 +282,19 @@ impl Workspace {
     /// Puts the text typed into fields while a Save was being written into the draft, now that
     /// the Save is answered (or given up on): before the written edits leave the draft, so a
     /// newer value typed over one stays, and before a quit or close waiting on the Save goes on.
-    /// `written` are the edits the core says it wrote: the file may not have been reported with
-    /// them yet, so each value is compared with the file as they leave it. `None`: what was
-    /// written is not known, and each value typed is kept as an edit.
+    /// `saved` is the file as the core saved it, which the view may not have heard of yet: each
+    /// value is compared with it. `None`: what the file holds is not known (the Save failed or
+    /// went unanswered), and each value typed is kept as an edit.
     pub(super) fn take_typed_while_saving(
         &mut self,
-        written: Option<&[Change]>,
+        saved: Option<&Settings>,
         cx: &mut Context<Self>,
     ) {
         let typed = std::mem::take(&mut self.settings_page.logs_paths.typed_while_saving);
-        let holding = written.map(|written| {
-            let mut held = (*self.model.read(cx).settings).clone();
-            for change in written {
-                change.apply(&mut held);
-            }
-            held
-        });
         for field in typed {
             if let Some(input) = self.settings_page.logs_paths.input(field) {
                 let text = input.read(cx).value().to_string();
-                self.record_settings_text_over(field, &text, holding.as_ref(), cx);
+                self.record_settings_text_over(field, &text, saved, cx);
             }
         }
     }
@@ -352,21 +353,47 @@ impl Workspace {
             cx.notify();
             return;
         }
+        // The files are looked at off the UI thread: a slow or gone network mount must not
+        // stall the window.
         let home = home();
         let before = self.settings_shown(cx).kubeconfig_paths;
-        let mut list = before.clone();
-        let mut note = None;
-        for path in paths {
-            match with_kubeconfig(&list, &path, home.as_deref()) {
-                Ok(added) => list = added,
-                Err(why) => note = Some(why),
+        let checked = cx.background_spawn({
+            let before = before.clone();
+            async move {
+                let mut list = before;
+                let mut note = None;
+                for path in paths {
+                    match with_kubeconfig(&list, &path, home.as_deref()) {
+                        Ok(added) => list = added,
+                        Err(why) => note = Some(why),
+                    }
+                }
+                (list, note)
             }
-        }
-        if list != before {
-            self.edit_settings(Change::KubeconfigPaths(list), cx);
-        }
-        self.settings_page.logs_paths.kubeconfig_note = note;
-        cx.notify();
+        });
+        cx.spawn(async move |this, cx| {
+            let (list, note) = checked.await;
+            let _ = this.update(cx, |ws, cx| {
+                // Applied only over the list it was checked against.
+                let current = ws.settings_shown(cx).kubeconfig_paths;
+                if !ws.settings_page.open || ws.settings_page.saving.is_some() || current != before
+                {
+                    ws.settings_page.logs_paths.kubeconfig_note = Some(
+                        "The list changed while the files were checked, so nothing was added. \
+                         Add them again."
+                            .into(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                if list != before {
+                    ws.edit_settings(Change::KubeconfigPaths(list), cx);
+                }
+                ws.settings_page.logs_paths.kubeconfig_note = note;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Drops `path` from the kubeconfig list in the draft: the row at `index` when it holds

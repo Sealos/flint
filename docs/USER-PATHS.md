@@ -833,8 +833,8 @@ Deferred until cluster sets are scheduled (#199).
   a Save is being written stays in the draft. Save writes every edit in one save, or none of them. Add… opens a file picker and adds the files I choose to the kubeconfig list (a file already listed, or one
   that is not there, is refused with a note; files already in the list stay accepted), Remove drops the row I chose,
   and after Save the clusters reload as after a hand edit.
-  `PATH` takes absolute folders separated by colons and applies after a restart; `helm` takes an existing file, absolute
-  or under `~`; either left empty uses the default. Turning protection of local clusters on saves without a question.
+  `PATH` takes absolute folders separated by colons and applies after a restart; `helm` takes a path, absolute or under
+  `~`, which Flint checks when it runs helm; either left empty uses the default. Turning protection of local clusters on saves without a question.
   Turning it off asks at Save, whichever way Save is asked for (the button, Save anyway, the keyboard, the palette, or
   the quit and close question), saying that writes to local clusters will no longer be gated; Enter and Cancel keep the
   whole draft unsaved, only the button confirms. If my edits or `settings.toml` change while that question is open,

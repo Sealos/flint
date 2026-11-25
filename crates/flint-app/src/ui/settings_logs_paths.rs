@@ -188,9 +188,8 @@ impl TextField {
         }
     }
 
-    /// The edit `text` makes, or why it is not valid. `home` expands a leading `~` to check that
-    /// a file exists.
-    pub fn parse(self, text: &str, home: Option<&Path>) -> Result<Change, String> {
+    /// The edit `text` makes, or why it is not valid. Nothing on disk is looked at.
+    pub fn parse(self, text: &str) -> Result<Change, String> {
         let text = text.trim();
         match self {
             TextField::LogBufferLines => {
@@ -203,7 +202,7 @@ impl TextField {
                 bounded(text, LOG_TOTAL_MIB_RANGE, "MiB").map(Change::LogTotalMib)
             }
             TextField::Path => parse_path_override(text).map(Change::Path),
-            TextField::Helm => parse_helm(text, home).map(Change::Helm),
+            TextField::Helm => parse_helm(text).map(Change::Helm),
         }
     }
 }
@@ -249,6 +248,9 @@ fn parse_path_override(text: &str) -> Result<Option<String>, String> {
     if text.is_empty() {
         return Ok(None);
     }
+    if text.contains('\0') {
+        return Err("A NUL character is not allowed.".into());
+    }
     match text.split(':').find(|e| !Path::new(e).is_absolute()) {
         Some("") => Err("An empty entry (two colons, or one at either end) is not allowed.".into()),
         Some(bad) => Err(format!(
@@ -258,14 +260,17 @@ fn parse_path_override(text: &str) -> Result<Option<String>, String> {
     }
 }
 
-/// The `helm` binary: empty is the one on `PATH`; otherwise an existing file, absolute or under
-/// `~`.
-fn parse_helm(text: &str, home: Option<&Path>) -> Result<Option<PathBuf>, String> {
+/// The `helm` binary: empty is the one on `PATH`; otherwise a path, absolute or under `~`. It is
+/// checked as typed without looking at the disk, which could stall the window on a slow mount;
+/// Flint checks the binary itself when it runs helm.
+fn parse_helm(text: &str) -> Result<Option<PathBuf>, String> {
     if text.is_empty() {
         return Ok(None);
     }
     let path = PathBuf::from(text);
-    existing_file(&path, home)?;
+    if !is_storable_path(&path) {
+        return Err("Use an absolute path, or one that starts with ~/.".into());
+    }
     Ok(Some(path))
 }
 

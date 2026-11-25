@@ -1907,6 +1907,12 @@ fn edit_path_override(
     file: &Path,
     path: Option<&str>,
 ) -> Result<(), SettingsError> {
+    if path.is_some_and(|path| path.contains('\0')) {
+        return Err(SettingsError::Invalid {
+            path: file.to_owned(),
+            reason: "the PATH override must not contain a NUL character".to_owned(),
+        });
+    }
     if let Some(path) = path
         && let Some(bad) = path
             .split(':')
@@ -3375,7 +3381,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let written = set_path_override(dir.path(), Some("/opt/bin:/usr/bin")).unwrap();
         assert_eq!(written.path.as_deref(), Some("/opt/bin:/usr/bin"));
-        for bad in ["bin:/usr/bin", "/usr/bin::/bin", "~/bin"] {
+        for bad in ["bin:/usr/bin", "/usr/bin::/bin", "~/bin", "/usr/bin\0x"] {
             assert!(
                 matches!(
                     set_path_override(dir.path(), Some(bad)),

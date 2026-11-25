@@ -21,7 +21,7 @@ use super::view_state::{AppState, DialogState};
 
 #[test]
 fn log_limits_are_range_checked() {
-    let parse = |field: TextField, text: &str| field.parse(text, None);
+    let parse = |field: TextField, text: &str| field.parse(text);
     assert_eq!(
         parse(TextField::LogBufferLines, "1000"),
         Ok(Change::LogBufferLines(1000))
@@ -54,7 +54,7 @@ fn log_limits_are_range_checked() {
 
 #[test]
 fn the_path_override_takes_absolute_folders_only() {
-    let parse = |text: &str| TextField::Path.parse(text, None);
+    let parse = |text: &str| TextField::Path.parse(text);
     assert_eq!(parse(""), Ok(Change::Path(None)));
     assert_eq!(parse("  "), Ok(Change::Path(None)));
     assert_eq!(
@@ -74,26 +74,24 @@ fn the_path_override_takes_absolute_folders_only() {
 }
 
 #[test]
-fn helm_and_kubeconfig_paths_must_be_files() {
+fn helm_is_a_path_and_kubeconfigs_must_be_files() {
     let dir = tempfile::tempdir().unwrap();
     let helm = dir.path().join("helm");
     std::fs::write(&helm, "").unwrap();
     let home = Some(dir.path());
 
-    assert_eq!(TextField::Helm.parse("", home), Ok(Change::Helm(None)));
+    assert_eq!(TextField::Helm.parse(""), Ok(Change::Helm(None)));
     assert_eq!(
-        TextField::Helm.parse(helm.to_str().unwrap(), home),
+        TextField::Helm.parse(helm.to_str().unwrap()),
         Ok(Change::Helm(Some(helm.clone())))
     );
-    // `~` is the home folder.
+    // `~` is the home folder. The disk is not looked at as it is typed.
     assert_eq!(
-        TextField::Helm.parse("~/helm", home),
-        Ok(Change::Helm(Some(PathBuf::from("~/helm"))))
+        TextField::Helm.parse("~/missing"),
+        Ok(Change::Helm(Some(PathBuf::from("~/missing"))))
     );
-    assert!(TextField::Helm.parse("helm", home).is_err(), "relative");
-    assert!(TextField::Helm.parse("~/missing", home).is_err());
-    let folder = TextField::Helm.parse(dir.path().to_str().unwrap(), home);
-    assert!(folder.unwrap_err().contains("not a file"));
+    assert!(TextField::Helm.parse("helm").is_err(), "relative");
+    assert!(TextField::Path.parse("/usr/bin\0x").is_err(), "NUL");
     assert!(existing_file(Path::new("~/helm"), None).is_err(), "no HOME");
 
     let listed = with_kubeconfig(&[], &helm, home).unwrap();
@@ -179,9 +177,11 @@ async fn wait_for_file(
     t: &TestWorkspace,
     wanted: impl Fn(&flint_core::Settings) -> bool + 'static,
 ) {
+    // The file as wanted, and the Save that wrote it answered.
     let model = t.model.clone();
+    let workspace = t.workspace.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
-        wanted(&model.read(cx).settings)
+        wanted(&model.read(cx).settings) && !workspace.read(cx).settings_saving()
     })
     .await;
 }
@@ -747,4 +747,22 @@ async fn the_old_value_typed_while_saving_stays_an_edit(cx: &mut TestAppContext)
     let s = state(cx, &t);
     assert_eq!(s.settings.edited, ["log_buffer_lines"], "{s:?}");
     assert_eq!(s.settings.log_buffer_lines, 100_000);
+}
+
+// covers UP-127: a click into a field puts the keyboard cursor there, and Tab goes on from it.
+#[gpui_kit::test]
+async fn tab_goes_on_from_a_clicked_field(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_settings(cx, dir.path()).await;
+    show(cx, &t, "logs");
+    t.click(cx, "settings-log-buffer-lines");
+    assert_eq!(
+        state(cx, &t).settings.cursor.as_deref(),
+        Some("settings-log-buffer-lines")
+    );
+    t.press(cx, "tab");
+    assert_eq!(
+        state(cx, &t).settings.cursor.as_deref(),
+        Some("settings-log-buffer-mib")
+    );
 }
