@@ -24,7 +24,11 @@ fn pod(name: &str, node: Option<&str>, phase: &str, spec: Value, owner: Option<V
 }
 
 fn owner(kind: &str, name: &str) -> Value {
-    json!({"apiVersion": "apps/v1", "kind": kind, "name": name, "uid": format!("uid-{name}"),
+    let api_version = match kind {
+        "Job" | "CronJob" => "batch/v1",
+        _ => "apps/v1",
+    };
+    json!({"apiVersion": api_version, "kind": kind, "name": name, "uid": format!("uid-{name}"),
            "controller": true})
 }
 
@@ -155,6 +159,58 @@ fn an_unchanged_store_gives_the_same_index_without_rebuilding() {
     let (first, second) = (index(&stores), index(&stores));
     assert!(Arc::ptr_eq(&first.pods, &second.pods));
     assert_eq!(first, second);
+}
+
+#[test]
+fn an_update_that_changes_no_record_keeps_the_index() {
+    let spec = || json!({"containers": [container("a", json!({"cpu": "1"}), json!({}))]});
+    let mut stores = current(vec![pod("web", Some("n1"), "Running", spec(), None)]);
+    let first = index(&stores);
+    let mut annotated = pod("web", Some("n1"), "Running", spec(), None);
+    annotated.metadata.annotations = Some([("note".to_owned(), "x".to_owned())].into());
+    let (annotated, read) = trimmed(annotated);
+    assert!(stores.pods.upsert(annotated, read));
+    assert_eq!(first, index(&stores), "nothing a list reads changed");
+
+    let (resized, read) = trimmed(pod(
+        "web",
+        Some("n1"),
+        "Running",
+        json!({"containers": [container("a", json!({"cpu": "2"}), json!({}))]}),
+        None,
+    ));
+    assert!(stores.pods.upsert(resized, read));
+    assert_ne!(first, index(&stores));
+}
+
+#[test]
+fn a_record_keeps_the_creation_time_to_match_samples_with() {
+    let mut pod = pod("web", None, "Pending", json!({"containers": []}), None);
+    pod.metadata.creation_timestamp = Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+        jiff::Timestamp::from_second(1_800_000_000).unwrap(),
+    ));
+    let stores = current(vec![pod]);
+    assert_eq!(
+        index(&stores).get("uid-web").unwrap().created,
+        Some(1_800_000_000)
+    );
+}
+
+#[test]
+fn a_custom_kind_named_like_a_built_in_one_is_its_own_workload() {
+    let custom = json!({"apiVersion": "example.com/v1", "kind": "ReplicaSet", "name": "mine",
+                        "uid": "uid-mine", "controller": true});
+    let mut stores = current(vec![pod(
+        "p",
+        None,
+        "Running",
+        json!({"containers": []}),
+        Some(custom),
+    )]);
+    stores.replica_sets.invalidate(KindCheck::TooLarge);
+    let index = PodIndex::of(&stores.pods, &stores.replica_sets, &stores.jobs).unwrap();
+    let workload = index.workload_of(index.get("uid-p").unwrap()).unwrap();
+    assert_eq!((&*workload.group, &*workload.name), ("example.com", "mine"));
 }
 
 #[test]
@@ -297,6 +353,14 @@ fn a_replica_set_change_rebuilds_the_controllers() {
     assert_ne!(first, second);
     let owner = &second.replica_sets.as_ref().unwrap()["uid-web-1"];
     assert_eq!(&*owner.name, "other");
+
+    let (same, ()) = replica_set("web-1", "other");
+    assert!(stores.replica_sets.upsert(same, ()));
+    assert_eq!(
+        second,
+        index(&stores),
+        "a status change keeps the controllers"
+    );
 }
 
 #[test]

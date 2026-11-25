@@ -15,7 +15,7 @@ use kube::Resource;
 use serde::de::DeserializeOwned;
 
 use super::capacity::ALLOCATABLE_KEYS;
-use super::pods::{ControllerCache, PodRead, PodSlot, PodTotals};
+use super::pods::{ControllerCache, ControllerSlot, PodRead, PodSlot, PodTotals};
 use super::{KindCheck, WatchedKind};
 
 /// The most objects of one kind a feed holds.
@@ -93,6 +93,9 @@ impl<K: Tracked> KindStore<K> {
         };
         if let Some(entry) = self.index.get_mut(&key) {
             let tally_slot = item.count(extra, &mut self.totals);
+            if !K::same_entry(&entry.tally_slot, &tally_slot) {
+                K::entries_changed(&mut self.totals);
+            }
             let old_slot = std::mem::replace(&mut entry.tally_slot, tally_slot);
             self.items[entry.at] = item;
             K::uncount(old_slot, &mut self.totals);
@@ -102,6 +105,7 @@ impl<K: Tracked> KindStore<K> {
             return false;
         }
         let tally_slot = item.count(extra, &mut self.totals);
+        K::entries_changed(&mut self.totals);
         self.index.insert(
             key,
             StoreEntry {
@@ -121,6 +125,7 @@ impl<K: Tracked> KindStore<K> {
         };
         self.items.swap_remove(at);
         K::uncount(tally_slot, &mut self.totals);
+        K::entries_changed(&mut self.totals);
         if let Some(moved) = self.items.get(at).and_then(|m| key_of(m.meta())) {
             self.index
                 .get_mut(&moved)
@@ -194,6 +199,15 @@ pub(super) trait Tracked:
 
     /// Takes this object out of `totals` using the slot returned by [`Self::count`].
     fn uncount(_slot: Self::TallySlot, _totals: &mut Self::Totals) {}
+
+    /// Whether an update left what the slots publish as it was. `false` makes the store call
+    /// [`Self::entries_changed`].
+    fn same_entry(_old: &Self::TallySlot, _new: &Self::TallySlot) -> bool {
+        true
+    }
+
+    /// An object came or left, or an update changed what its slot publishes.
+    fn entries_changed(_totals: &mut Self::Totals) {}
 }
 
 fn trim_meta(meta: &mut ObjectMeta) {
@@ -293,6 +307,14 @@ impl Tracked for Pod {
     fn uncount(slot: PodSlot, totals: &mut PodTotals) {
         totals.uncount(slot);
     }
+
+    fn same_entry(old: &PodSlot, new: &PodSlot) -> bool {
+        old.publishes_as(new)
+    }
+
+    fn entries_changed(totals: &mut PodTotals) {
+        totals.changed();
+    }
 }
 
 impl Tracked for Node {
@@ -329,13 +351,17 @@ impl Tracked for Node {
 impl Tracked for Job {
     type Extra = ();
     type Totals = ControllerCache;
-    type TallySlot = ();
+    type TallySlot = ControllerSlot;
 
-    fn count(&self, (): (), totals: &mut ControllerCache) {
-        totals.changed();
+    fn count(&self, (): (), totals: &mut ControllerCache) -> ControllerSlot {
+        ControllerSlot::of(self.meta(), totals)
     }
 
-    fn uncount((): (), totals: &mut ControllerCache) {
+    fn same_entry(old: &ControllerSlot, new: &ControllerSlot) -> bool {
+        old == new
+    }
+
+    fn entries_changed(totals: &mut ControllerCache) {
         totals.changed();
     }
 
@@ -422,13 +448,17 @@ impl Tracked for DaemonSet {
 impl Tracked for ReplicaSet {
     type Extra = ();
     type Totals = ControllerCache;
-    type TallySlot = ();
+    type TallySlot = ControllerSlot;
 
-    fn count(&self, (): (), totals: &mut ControllerCache) {
-        totals.changed();
+    fn count(&self, (): (), totals: &mut ControllerCache) -> ControllerSlot {
+        ControllerSlot::of(self.meta(), totals)
     }
 
-    fn uncount((): (), totals: &mut ControllerCache) {
+    fn same_entry(old: &ControllerSlot, new: &ControllerSlot) -> bool {
+        old == new
+    }
+
+    fn entries_changed(totals: &mut ControllerCache) {
         totals.changed();
     }
 

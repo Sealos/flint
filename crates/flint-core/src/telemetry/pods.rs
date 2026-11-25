@@ -23,6 +23,8 @@ use crate::metrics::PodBudgetCheck;
 /// The object that controls another, from its controller owner reference.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PodOwner {
+    /// The API group, empty for the core group: `apps` for a ReplicaSet, `batch` for a Job.
+    pub group: Arc<str>,
     /// Such as `ReplicaSet`, `Job`, `StatefulSet` or `DaemonSet`.
     pub kind: Arc<str>,
     pub name: Arc<str>,
@@ -35,6 +37,9 @@ pub struct PodOwner {
 pub struct PodRecord {
     pub namespace: Arc<str>,
     pub name: Box<str>,
+    /// `metadata.creationTimestamp`, Unix seconds, to tell a usage sample of an earlier pod
+    /// under the same name apart through [`PodSample::follows_creation`](crate::metrics::PodSample::follows_creation).
+    pub created: Option<i64>,
     /// Its requests and limits, under the rules of the detail pane: compare a usage sample with
     /// them through [`PodBudgetCheck::for_sample`].
     pub budget: PodBudgetCheck,
@@ -103,9 +108,9 @@ impl PodIndex {
     /// while the ReplicaSets or Jobs that would say cannot be read.
     pub fn workload_of<'a>(&'a self, pod: &'a PodRecord) -> Option<&'a PodOwner> {
         let owner = pod.owner.as_ref()?;
-        let controllers = match &*owner.kind {
-            "ReplicaSet" => self.replica_sets.as_deref()?,
-            "Job" => self.jobs.as_deref()?,
+        let controllers = match (&*owner.group, &*owner.kind) {
+            ("apps", "ReplicaSet") => self.replica_sets.as_deref()?,
+            ("batch", "Job") => self.jobs.as_deref()?,
             _ => return Some(owner),
         };
         Some(controllers.get(&owner.uid).unwrap_or(owner))
@@ -178,6 +183,14 @@ pub(super) struct PodSlot {
     record: Option<(Arc<str>, Arc<PodRecord>)>,
 }
 
+impl PodSlot {
+    /// Whether `other` publishes the same record, so that an update such as a new annotation
+    /// keeps the index built.
+    pub(super) fn publishes_as(&self, other: &Self) -> bool {
+        self.record == other.record
+    }
+}
+
 /// Strings many pods share, each held once. Strings no record holds any more are dropped when the
 /// set has doubled since it was last pruned.
 #[derive(Debug, Default)]
@@ -213,17 +226,13 @@ pub(crate) struct PodTotals {
 }
 
 impl PodTotals {
-    fn owner(&mut self, owner: &OwnerReference) -> PodOwner {
-        PodOwner {
-            kind: self.names.get(&owner.kind),
-            name: self.names.get(&owner.name),
-            uid: self.names.get(&owner.uid),
-        }
+    /// A pod came or left, or its record changed.
+    pub(super) fn changed(&mut self) {
+        self.built.take();
     }
 
     /// Counts `pod`, trimmed, with what was read before trimming.
     pub(super) fn count(&mut self, pod: &Pod, read: PodRead) -> PodSlot {
-        self.built.take();
         let tally = read.claim.as_ref().map(|claim| self.tally.add(claim));
         let meta = pod.meta();
         let record = meta.name.as_deref().zip(read.budget).map(|(name, budget)| {
@@ -235,7 +244,8 @@ impl PodTotals {
                 name: name.into(),
                 budget,
                 node: read.node.as_deref().map(|node| self.names.get(node)),
-                owner: controller_of(meta).map(|owner| self.owner(owner)),
+                created: meta.creation_timestamp.as_ref().map(|t| t.0.as_second()),
+                owner: controller_of(meta).map(|owner| owner_of(&mut self.names, owner)),
                 finished: read.finished,
             };
             (uid, Arc::new(record))
@@ -244,7 +254,6 @@ impl PodTotals {
     }
 
     pub(super) fn uncount(&mut self, slot: PodSlot) {
-        self.built.take();
         if let Some(tally) = slot.tally {
             self.tally.remove(tally);
         }
@@ -269,6 +278,7 @@ impl KindStore<Pod> {
 /// What a ReplicaSet or Job store keeps: who controls them, built once per change.
 #[derive(Debug, Default)]
 pub(crate) struct ControllerCache {
+    names: Names,
     built: OnceLock<Arc<Controllers>>,
 }
 
@@ -278,29 +288,41 @@ impl ControllerCache {
     }
 }
 
-impl<K: Tracked<Totals = ControllerCache>> KindStore<K> {
+/// A ReplicaSet's or Job's uid and controller, kept in its index entry.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ControllerSlot(Option<(Arc<str>, PodOwner)>);
+
+impl ControllerSlot {
+    pub(super) fn of(meta: &ObjectMeta, totals: &mut ControllerCache) -> Self {
+        let uid = meta.uid.as_deref().filter(|uid| !uid.is_empty());
+        Self(
+            uid.zip(controller_of(meta))
+                .map(|(uid, owner)| (totals.names.get(uid), owner_of(&mut totals.names, owner))),
+        )
+    }
+}
+
+impl<K: Tracked<Totals = ControllerCache, TallySlot = ControllerSlot>> KindStore<K> {
     /// The controller of each object held, by its uid, if they can be relied on.
     fn controllers(&self) -> Option<Arc<Controllers>> {
-        let items = self.current()?;
         let totals = self.current_totals()?;
-        let built = totals.built.get_or_init(|| {
-            let mut names = Names::default();
-            let controllers = items
-                .iter()
-                .filter_map(|item| {
-                    let uid = item.meta().uid.as_deref().filter(|uid| !uid.is_empty())?;
-                    let owner = controller_of(item.meta())?;
-                    let owner = PodOwner {
-                        kind: names.get(&owner.kind),
-                        name: names.get(&owner.name),
-                        uid: names.get(&owner.uid),
-                    };
-                    Some((Arc::from(uid), owner))
-                })
-                .collect();
-            Arc::new(controllers)
-        });
+        let built = totals
+            .built
+            .get_or_init(|| Arc::new(self.slots().filter_map(|slot| slot.0.clone()).collect()));
         Some(Arc::clone(built))
+    }
+}
+
+fn owner_of(names: &mut Names, owner: &OwnerReference) -> PodOwner {
+    let group = owner
+        .api_version
+        .rsplit_once('/')
+        .map_or("", |(group, _)| group);
+    PodOwner {
+        group: names.get(group),
+        kind: names.get(&owner.kind),
+        name: names.get(&owner.name),
+        uid: names.get(&owner.uid),
     }
 }
 
