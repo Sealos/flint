@@ -8,6 +8,8 @@
 //! action's enabled state. They add no write behaviour; Scale, Restart, Delete and the node
 //! actions still open their own review and confirmation.
 
+// module-tests: app_menus_tests.rs
+
 use flint_core::Appearance;
 use flint_core::settings::ClusterTag;
 use gpui_kit::*;
