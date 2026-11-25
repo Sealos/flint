@@ -328,7 +328,8 @@ pub const LOG_TOTAL_MIB_RANGE: std::ops::RangeInclusive<u32> = 64..=16_384;
 
 /// The proxy for cluster connections (`[proxy]`), for an app started from Finder or the Dock,
 /// which does not get `HTTPS_PROXY` and `NO_PROXY` from a shell profile. A cluster entry's own
-/// `proxy-url` still wins. Read once at startup: a change applies after a restart.
+/// `proxy-url` still wins. Read at startup; a change made by hand applies after a restart, and one
+/// saved from Settings at once ([`crate::CoreHandle::apply_proxy`]).
 ///
 /// The URL can hold a password. Its `Debug` shows only the proxy's address, and
 /// [`ProxySetting::shown_url`] is what may be displayed.
@@ -369,9 +370,43 @@ impl ProxySetting {
     }
 
     /// Uses this setting for this process's cluster connections. The first call wins: contexts
-    /// loaded under it are pinned to its route, so a later setting applies after a restart.
+    /// loaded under it are pinned to its route, so a later setting applies after a restart, or
+    /// through [`crate::CoreHandle::apply_proxy`].
     pub fn use_for_this_process(&self) {
         crate::connection::proxy::use_setting(self);
+    }
+
+    /// Why Flint could not use this setting, if it could not: a URL it can't read or whose scheme
+    /// it does not support, or a no-proxy entry that holds a comma or a space. What it says holds
+    /// no credentials of the URL.
+    pub fn check(&self) -> Result<(), String> {
+        if let Some(url) = self.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+            crate::connection::proxy::ProxyTarget::parse(url).map_err(|refused| match refused {
+                crate::connection::proxy::ProxyRefused::Unsupported { shown, scheme } => {
+                    format!(
+                        "the proxy {shown} uses {scheme}, which Flint does not support; use \
+                             an http://, socks5:// or socks5h:// proxy"
+                    )
+                }
+                crate::connection::proxy::ProxyRefused::SocksCredentialTooLong => {
+                    "the proxy's user name or password is longer than SOCKS5 allows (255 \
+                         bytes)"
+                        .to_owned()
+                }
+                _ => "the proxy URL can't be read; use http://, socks5:// or \
+                          socks5h://host:port"
+                    .to_owned(),
+            })?;
+        }
+        for entry in self.no_proxy.iter().map(|e| e.trim()) {
+            if entry.contains(',') || entry.chars().any(char::is_whitespace) {
+                return Err(format!(
+                    "the no-proxy entry \"{entry}\" holds a comma or a space; give one host, \
+                     domain, address or range per entry"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -382,6 +417,39 @@ impl std::fmt::Debug for ProxySetting {
             .field("no_proxy", &self.no_proxy)
             .finish()
     }
+}
+
+/// Replaces the `[proxy]` of `settings.toml` with `proxy`, or removes it when `proxy` sets
+/// nothing, and writes the file. Returns the settings as written. Only the core calls it, as it
+/// also puts the setting in use ([`crate::CoreHandle::apply_proxy`]).
+pub(crate) fn set_proxy(dir: &Path, proxy: &ProxySetting) -> Result<Settings, SettingsError> {
+    edit_settings(dir, |table, _| {
+        let mut entry = toml::Table::new();
+        if let Some(url) = proxy
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
+            entry.insert("url".into(), toml::Value::String(url.to_owned()));
+        }
+        let no_proxy: Vec<toml::Value> = proxy
+            .no_proxy
+            .iter()
+            .map(|e| e.trim())
+            .filter(|e| !e.is_empty())
+            .map(|e| toml::Value::String(e.to_owned()))
+            .collect();
+        if !no_proxy.is_empty() {
+            entry.insert("no_proxy".into(), toml::Value::Array(no_proxy));
+        }
+        if entry.is_empty() {
+            table.remove("proxy");
+        } else {
+            table.insert("proxy".into(), toml::Value::Table(entry));
+        }
+        Ok(())
+    })
 }
 
 /// User settings from `settings.toml`. Unknown keys are ignored so newer files still load.
@@ -464,7 +532,8 @@ pub struct Settings {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub cluster_alerts: Vec<ClusterAlerts>,
-    /// The proxy for cluster connections without a `proxy-url` of their own. Read at startup.
+    /// The proxy for cluster connections without a `proxy-url` of their own. Read at startup,
+    /// and put in use again when Settings saves it.
     #[serde(skip_serializing_if = "ProxySetting::is_empty")]
     pub proxy: ProxySetting,
 }

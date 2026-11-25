@@ -42,6 +42,7 @@ mod forwards;
 mod helm;
 mod keep_watching;
 mod keep_watching_lists;
+mod proxy_change;
 mod running_set;
 mod selected_retry;
 mod telemetry;
@@ -105,6 +106,10 @@ pub(crate) struct Cluster {
     /// re-pointed or otherwise changed, one back after being removed) has a new one. Front ends
     /// tell a cluster that started over by it, whatever lists they skipped (#255).
     generation: u64,
+    /// The proxy setting generation of the load that made this slot
+    /// ([`LoadedKubeconfig::proxy_generation`]). Behind the setting in use, the slot is held
+    /// until a load under that setting replaces it ([`ClusterManager::held`]).
+    proxy_generation: u64,
     /// Kept while the cluster is not active (ADR-0008).
     discovery: Option<Arc<ClusterDiscovery>>,
     discovering: bool,
@@ -178,6 +183,7 @@ impl Cluster {
             awaits_selection: false,
             reconnect: false,
             generation: 0,
+            proxy_generation: crate::connection::proxy::generation(),
             discovery: None,
             discovering: false,
             discovery_task: None,
@@ -327,6 +333,15 @@ enum ReadFor {
 }
 
 enum Internal {
+    /// Put a new proxy setting in use, then say what that did ([`crate::CoreHandle::apply_proxy`]).
+    ApplyProxy {
+        setting: settings::ProxySetting,
+        reply: tokio::sync::oneshot::Sender<Result<crate::handle::ProxyApplied, String>>,
+    },
+    /// Time to report the proxy change `change`, whatever has not settled yet.
+    ProxyReportDue {
+        change: u64,
+    },
     /// Reload kubeconfig, then say so ([`crate::CoreHandle::reload_kubeconfig`]).
     ReloadKubeconfig {
         reply: tokio::sync::oneshot::Sender<bool>,
@@ -589,6 +604,8 @@ pub(crate) struct ClusterManager {
     /// Clusters watched in the background, on connections of their own.
     keep: keep_watching::KeepWatch,
     forwards: forwards::Forwards,
+    /// The last proxy change saved from Settings, and what it still waits for.
+    proxy_change: proxy_change::ProxyChange,
 }
 
 impl ClusterManager {
@@ -658,6 +675,7 @@ impl ClusterManager {
             holds: DefinitionHolds::default(),
             keep: Default::default(),
             forwards: Default::default(),
+            proxy_change: Default::default(),
             reader: KubeconfigReader::default(),
             stalled_on: None,
             read_seq: 0,
@@ -699,6 +717,7 @@ impl ClusterManager {
             self.sync_forwards();
             self.sync_selected_retry();
             self.sync_telemetry();
+            self.sync_proxy_report();
         }
     }
 
@@ -851,6 +870,11 @@ impl ClusterManager {
                 let _ = self
                     .internal_tx
                     .send(Internal::WriteSettings { writes, reply });
+            }
+            Request::ApplyProxy { setting, reply } => {
+                let _ = self
+                    .internal_tx
+                    .send(Internal::ApplyProxy { setting, reply });
             }
             Request::ActivatePinned {
                 cluster,
@@ -1530,6 +1554,11 @@ impl ClusterManager {
                 let applied = self.reload_kubeconfig().await;
                 let _ = reply.send(applied);
             }
+            Internal::ApplyProxy { setting, reply } => {
+                let result = self.apply_proxy(setting).await;
+                let _ = reply.send(result);
+            }
+            Internal::ProxyReportDue { change } => self.proxy_report_due(change),
             Internal::WriteSettings { writes, reply } => {
                 let mut result = Ok(());
                 for write in writes {
@@ -2363,9 +2392,14 @@ impl ClusterManager {
         }
     }
 
-    /// Whether `id`'s slot is only kept because a file that defined it can't be parsed.
+    /// Whether `id`'s slot is only kept because a file that defined it can't be parsed, or was
+    /// loaded under a proxy setting that is no longer in use: its route is not the one a new
+    /// connection would take, so nothing new starts on it until a load replaces it.
     fn held(&self, id: &str) -> bool {
         self.held.contains(id)
+            || self
+                .cluster(id)
+                .is_some_and(|slot| slot.proxy_generation != crate::connection::proxy::generation())
     }
 
     /// Whether `id` is listed but a file that can't be parsed could still change its definition:
@@ -2942,7 +2976,10 @@ impl ClusterManager {
             let fingerprint = cluster::context_fingerprint(&loaded.merged, &info.name);
             let was_paused = paused.contains(&info.name);
             let slot = match old.remove(&info.name) {
-                Some(mut existing) if existing.fingerprint == fingerprint => {
+                Some(mut existing)
+                    if existing.fingerprint == fingerprint
+                        && existing.proxy_generation == loaded.proxy_generation =>
+                {
                     // Back unchanged. No connection starts while paused, so start it now.
                     if was_paused && self.active.as_deref() == Some(&info.name) {
                         changed_active = true;
@@ -2951,9 +2988,9 @@ impl ClusterManager {
                     existing
                 }
                 Some(old) => {
-                    // The context's connection details changed: the client is stale. The fresh
-                    // slot has attempt 0, which no in-flight attempt uses. The front end's
-                    // namespace filter still applies.
+                    // The context's connection details changed, or the proxy setting it was
+                    // loaded under: the client is stale. The fresh slot has attempt 0, which no
+                    // in-flight attempt uses. The front end's namespace filter still applies.
                     if self.active.as_deref() == Some(&info.name) {
                         changed_active = true;
                         if self.retries.retry.has_retried(&info.name, old.generation) {
@@ -2966,6 +3003,7 @@ impl ClusterManager {
                     fresh.namespace_filter = old.namespace_filter.clone();
                     fresh.update_scope();
                     fresh.generation = self.next_generation();
+                    fresh.proxy_generation = loaded.proxy_generation;
                     // A slot that waits for a new selection goes on waiting through later loads.
                     if old.awaits_selection {
                         fresh.awaits_selection = true;
@@ -2984,6 +3022,7 @@ impl ClusterManager {
                     let mut fresh =
                         Cluster::new(info.clone(), fingerprint, &self.hubs, &self.engine_config);
                     fresh.generation = self.next_generation();
+                    fresh.proxy_generation = loaded.proxy_generation;
                     fresh
                 }
             };
@@ -3071,6 +3110,14 @@ impl ClusterManager {
             paths: path_exist,
         };
         self.emit(Event::ClustersChanged(Arc::new(snapshot)));
+        // A read that began before the proxy setting changed: its slots stay held, and the files
+        // are read again under the setting in use.
+        if loaded.proxy_generation != crate::connection::proxy::generation() {
+            let _ = self.internal_tx.send(Internal::FilesChanged(Changed {
+                kubeconfig: true,
+                ..Changed::default()
+            }));
+        }
 
         if let Some(active) = self.active.clone() {
             if old.contains_key(&active) {
