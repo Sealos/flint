@@ -422,6 +422,46 @@ pub fn shed_columns(
     }
 }
 
+/// The width in characters a name is given before the columns after Status start to go: enough
+/// for a pod's generated name (`podinfo-5d9c7b8d6d-b8chj`) in full.
+pub const NAME_COMFORT_CHARS: usize = 30;
+
+/// Leaves out the columns after Status, the rightmost first, while the drawn columns would leave
+/// the Name column less than `name_target` of `room`, so a name is not cut while a trailing
+/// Restarts or Age could go instead. Never a column through Status, nor one for which `keep`
+/// holds (the one the list is sorted by). A list without Status sheds nothing, as in
+/// [`shed_columns`]: the table scrolls sideways there.
+pub fn shed_trailing(
+    drawn: &mut Vec<(usize, f32)>,
+    columns: &[Column],
+    room: f32,
+    name_target: f32,
+    keep: impl Fn(usize) -> bool,
+) {
+    let Some(status) = drawn.iter().position(|&(i, _)| {
+        columns[i].role == ColumnRole::Value && columns[i].name.eq_ignore_ascii_case("Status")
+    }) else {
+        return;
+    };
+    let others = |drawn: &[(usize, f32)]| -> f32 {
+        drawn
+            .iter()
+            .filter(|&&(i, _)| columns[i].role != ColumnRole::Name)
+            .map(|&(_, width)| width)
+            .sum()
+    };
+    while others(drawn) + name_target > room {
+        let Some(pos) = drawn
+            .iter()
+            .rposition(|&(i, _)| !keep(i))
+            .filter(|&pos| pos > status)
+        else {
+            return;
+        };
+        drawn.remove(pos);
+    }
+}
+
 /// Narrows the Namespace column, then the Name column, down to their minimums when the drawn
 /// columns are wider than `room`, so the status columns to their right stay in view instead of
 /// scrolling off. Namespaces go first: they repeat down the list and the namespace filter names
@@ -1588,6 +1628,33 @@ mod tests {
             |_| false,
         );
         assert_eq!(drawn.len(), 2);
+    }
+
+    // covers #779: a name is not cut while a trailing column could go instead.
+    #[test]
+    fn trailing_columns_go_before_a_name_is_cut() {
+        let columns = vec![
+            col("Name", 0, ColumnRole::Name, ColumnType::String),
+            col("Status", 0, ColumnRole::Value, ColumnType::String),
+            col("Restarts", 0, ColumnRole::Value, ColumnType::Integer),
+            col("Age", 0, ColumnRole::Age, ColumnType::String),
+        ];
+        let shed = |room: f32, keep: Option<usize>| {
+            let mut drawn = vec![(0, 300.), (1, 152.), (2, 80.), (3, 76.)];
+            shed_trailing(&mut drawn, &columns, room, 270., |i| Some(i) == keep);
+            drawn.into_iter().map(|(i, _)| i).collect::<Vec<_>>()
+        };
+        // 152 + 80 + 76 + 270 = 578.
+        assert_eq!(shed(578., None), [0, 1, 2, 3], "everything fits");
+        assert_eq!(shed(577., None), [0, 1, 2], "Age first");
+        assert_eq!(shed(497., None), [0, 1], "then Restarts");
+        assert_eq!(shed(300., None), [0, 1], "Status and Name stay");
+        assert_eq!(shed(300., Some(2)), [0, 1, 2], "the sorted column stays");
+        // A list without Status scrolls instead.
+        let plain = [columns[0].clone(), columns[2].clone(), columns[3].clone()];
+        let mut drawn = vec![(0, 300.), (1, 80.), (2, 76.)];
+        shed_trailing(&mut drawn, &plain, 100., 270., |_| false);
+        assert_eq!(drawn.len(), 3);
     }
 
     // covers UP-20, UP-25, UP-27: a long name must not be cut while the list has room.

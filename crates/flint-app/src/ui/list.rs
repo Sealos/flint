@@ -1233,6 +1233,16 @@ impl ResourceList {
                 rules,
                 |i| sort.is_some_and(|s| columns[i].key() == s.column),
             );
+            let name_target = columns
+                .iter()
+                .position(|c| c.role == ColumnRole::Name)
+                .map_or(name_min, |name| {
+                    let wanted = self.widths.wanted(name, &columns[name]);
+                    width(wanted.min(list_model::NAME_COMFORT_CHARS))
+                });
+            list_model::shed_trailing(&mut drawn, columns, room, name_target, |i| {
+                sort.is_some_and(|s| columns[i].key() == s.column)
+            });
             list_model::squeeze_identity(&mut drawn, columns, room, name_min, namespace_min);
             if let Some(name) = columns.iter().position(|c| c.role == ColumnRole::Name) {
                 let wanted = width(self.widths.wanted(name, &columns[name]));
