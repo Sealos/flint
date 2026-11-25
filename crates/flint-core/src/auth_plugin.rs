@@ -45,6 +45,7 @@ use tower::filter::{AsyncFilterLayer, AsyncPredicate};
 
 use crate::cluster::{CONNECT_TIMEOUT, PluginProblem};
 use crate::connection::policy::{CredentialGrant, CredentialLease};
+use crate::connection::proxy::PluginVariable;
 use crate::redact;
 
 /// A token this close to its expiry is refreshed first, as kube does.
@@ -105,6 +106,7 @@ pub(crate) async fn resolve_with_grant(
     config: &mut kube::Config,
     context: &str,
     grant: &CredentialGrant,
+    own_proxy: Option<&str>,
 ) -> Result<Resolved, AuthError> {
     let auth = &config.auth_info;
     // kube's precedence (`Auth::try_from`): all of these win over an exec plugin.
@@ -119,12 +121,13 @@ pub(crate) async fn resolve_with_grant(
         return Ok(Resolved::default());
     };
     let auth = &mut config.auth_info;
+    let proxy = crate::connection::proxy::plugin_setting_variables(own_proxy);
     let lease = grant.lease();
     let terminal = Terminal::acquire(exec.interactive_mode == Some(ExecInteractiveMode::Always));
     let credential = tokio::select! {
         biased;
         () = lease.revoked() => return Err(not_allowed()),
-        credential = run(&exec, &lease, terminal, || {}) => credential?,
+        credential = run(&exec, &proxy, &lease, terminal, || {}) => credential?,
     };
     if !lease.holds() {
         return Err(not_allowed());
@@ -167,6 +170,7 @@ pub(crate) async fn resolve_with_grant(
                     context: context.to_owned(),
                     exec,
                     token,
+                    proxy,
                     expires,
                     refreshing: None,
                     resting: None,
@@ -182,6 +186,7 @@ pub(crate) async fn resolve_with_grant(
 /// would start. Dropping the future kills the plugin's process group.
 async fn run(
     exec: &ExecConfig,
+    proxy: &[PluginVariable],
     lease: &CredentialLease,
     terminal: impl Future<Output = Acquired>,
     on_start: impl FnOnce(),
@@ -192,7 +197,7 @@ async fn run(
         cmd.args(args);
     }
     // The proxy setting first, so the kubeconfig's own `env` wins over it.
-    for (name, value) in crate::connection::proxy::plugin_setting_variables() {
+    for (name, value) in proxy {
         match value {
             Some(value) => cmd.env(name, value),
             None => cmd.env_remove(name),
@@ -770,6 +775,9 @@ struct TokenState {
     /// The context the client is for: [`retry_now`] names it.
     context: String,
     exec: ExecConfig,
+    /// The proxy variables its plugin starts with
+    /// ([`crate::connection::proxy::plugin_setting_variables`]).
+    proxy: Vec<PluginVariable>,
     token: SecretString,
     expires: Timestamp,
     /// The refresh running, which requests wait for: it resolves to the token it got or why it
@@ -881,8 +889,12 @@ impl RefreshingToken {
                         let terminal = Terminal::acquire(
                             state.exec.interactive_mode == Some(ExecInteractiveMode::Always),
                         );
-                        let refresh =
-                            self.start_refresh(state.exec.clone(), state.context.clone(), terminal);
+                        let refresh = self.start_refresh(
+                            state.exec.clone(),
+                            state.proxy.clone(),
+                            state.context.clone(),
+                            terminal,
+                        );
                         state.refreshing = Some(refresh.clone());
                         refresh
                     }
@@ -920,6 +932,7 @@ impl RefreshingToken {
     fn start_refresh(
         &self,
         exec: ExecConfig,
+        proxy: Vec<PluginVariable>,
         context: String,
         terminal: impl Future<Output = Acquired> + Send + 'static,
     ) -> Shared<BoxFuture<'static, Refreshed>> {
@@ -936,7 +949,7 @@ impl RefreshingToken {
                 () = lease.revoked() => None,
                 result = tokio::time::timeout(
                     CONNECT_TIMEOUT,
-                    run(&exec, &lease, terminal, || started = true),
+                    run(&exec, &proxy, &lease, terminal, || started = true),
                 ) => Some(result),
             };
             let mut state = state.lock().await;
