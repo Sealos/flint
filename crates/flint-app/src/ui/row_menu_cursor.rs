@@ -19,11 +19,18 @@ pub(in crate::ui) struct MenuCursor {
     entries: Vec<CursorEntry>,
     /// Index into `entries` of the highlighted entry; always an enabled one.
     at: Option<usize>,
+    /// The pointer has moved over the menu, which highlights what it passes over without the
+    /// cursor seeing it: the cursor cannot tell where the highlight is.
+    lost: bool,
 }
 
 impl MenuCursor {
     pub fn new(entries: Vec<CursorEntry>) -> Self {
-        MenuCursor { entries, at: None }
+        MenuCursor {
+            entries,
+            at: None,
+            lost: false,
+        }
     }
 
     pub fn label(&self) -> Option<&str> {
@@ -34,14 +41,26 @@ impl MenuCursor {
         (0..self.entries.len()).filter(|&ix| self.entries[ix].enabled)
     }
 
+    /// Gives up following the highlight for this menu.
+    pub fn lose(&mut self) {
+        self.at = None;
+        self.lost = true;
+    }
+
     /// The Down key: the next enabled entry, the first from none or after the last.
     pub fn down(&mut self) {
+        if self.lost {
+            return;
+        }
         let next = self.at.and_then(|at| self.enabled().find(|&ix| ix > at));
         self.at = next.or_else(|| self.enabled().next());
     }
 
     /// The Up key: the previous enabled entry, the last from none or before the first.
     pub fn up(&mut self) {
+        if self.lost {
+            return;
+        }
         let prev = self
             .at
             .and_then(|at| self.enabled().rev().find(|&ix| ix < at));
@@ -52,7 +71,7 @@ impl MenuCursor {
     /// highlight the entry that was highlighted, or none when there was none or it is gone or
     /// disabled now.
     pub fn rebuilt(&mut self, entries: Vec<CursorEntry>) -> Option<usize> {
-        let label = self.label().map(str::to_owned);
+        let label = self.label().filter(|_| !self.lost).map(str::to_owned);
         self.entries = entries;
         self.at =
             label.and_then(|label| self.enabled().find(|&ix| self.entries[ix].label == label));
@@ -144,6 +163,17 @@ mod tests {
         assert_eq!(c.rebuilt(entries(&["-Logs", "Shell"])), None);
         c.down();
         assert_eq!(c.label(), Some("Shell"), "Down starts from the top again");
+    }
+
+    #[test]
+    fn a_menu_the_pointer_moved_over_is_not_followed() {
+        let mut c = MenuCursor::new(entries(&["Logs", "Shell"]));
+        c.down();
+        c.lose();
+        assert_eq!(c.label(), None);
+        c.down();
+        assert_eq!(c.label(), None, "the keys are not followed any more");
+        assert_eq!(c.rebuilt(entries(&["Logs", "Shell"])), None);
     }
 
     #[test]

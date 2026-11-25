@@ -427,6 +427,8 @@ pub fn row_menu(workspace: WeakEntity<Workspace>) -> RowMenu {
         let cursor = Rc::new(RefCell::new(MenuCursor::new(cursor_entries(
             shown.borrow().as_ref(),
         ))));
+        // Where the pointer was when the menu opened: the menu highlights what it passes over.
+        let pointer = window.mouse_position();
         // Built again whenever what it shows changes while it is open (the object or the pods
         // arrived, the cluster disconnected, another row got selected). The observers are
         // dropped when the menu is dismissed.
@@ -445,6 +447,9 @@ pub fn row_menu(workspace: WeakEntity<Workspace>) -> RowMenu {
                 *shown.borrow_mut() = now.clone();
                 #[cfg(test)]
                 tests::REBUILDS.with(|n| n.set(n.get() + 1));
+                if window.mouse_position() != pointer {
+                    cursor.borrow_mut().lose();
+                }
                 let presses = cursor.borrow_mut().rebuilt(cursor_entries(now.as_ref()));
                 let workspace = workspace.clone();
                 menu.rebuild(window, cx, move |menu, window, cx| {
@@ -480,6 +485,9 @@ pub fn row_menu(workspace: WeakEntity<Workspace>) -> RowMenu {
                 // A submenu or something else has the keys when the menu itself does not.
                 if menu.focus_handle(cx).is_focused(window) {
                     let mut cursor = key_cursor.borrow_mut();
+                    if window.mouse_position() != pointer {
+                        cursor.lose();
+                    }
                     if down { cursor.down() } else { cursor.up() }
                 }
             }),
@@ -854,8 +862,15 @@ pub(in crate::ui) fn refusal(
 /// the menu says it once, in the note).
 /// What a row's menu lists, in order, as the tests and the state report it and as the keyboard
 /// cursor follows it.
+#[cfg_attr(
+    not(any(test, feature = "automation")),
+    allow(dead_code, reason = "read by the state report")
+)]
 struct Listed {
     label: String,
+    /// What the keyboard cursor knows the entry by when its label changes (Shell names the pod
+    /// once a workload's pods are listed).
+    key: Option<&'static str>,
     enabled: bool,
     reason: Option<String>,
     /// A picker's entries (containers): label and whether it can run.
@@ -868,12 +883,14 @@ fn listed(a: &RowActions) -> Vec<Listed> {
 
     let entry = |label: String, can: &Availability| Listed {
         label,
+        key: None,
         enabled: can.is_ok(),
         reason: can.as_ref().err().cloned(),
         submenu: Vec::new(),
     };
     let picker = |label: String, submenu: Vec<(String, bool)>| Listed {
         label,
+        key: None,
         enabled: true,
         reason: None,
         submenu,
@@ -900,7 +917,7 @@ fn listed(a: &RowActions) -> Vec<Listed> {
             });
         }
         let label = shell_entry_label_within(a, SHELL_POD_NAME);
-        entries.push(match &a.shell_pod {
+        let mut shell = match &a.shell_pod {
             Some(shell) if a.shell_picker && a.blocked.is_none() => picker(
                 label,
                 shell
@@ -913,7 +930,9 @@ fn listed(a: &RowActions) -> Vec<Listed> {
                     .collect(),
             ),
             _ => entry(label, &shell_in_menu(a)),
-        });
+        };
+        shell.key = Some("Shell");
+        entries.push(shell);
     }
     if let Some(can) = forward_in_menu(a) {
         entries.push(entry(registry::label::<ForwardPort>().to_owned(), &can));
@@ -945,7 +964,7 @@ fn cursor_entries(a: Option<&RowActions>) -> Vec<CursorEntry> {
         .unwrap_or_default()
         .into_iter()
         .map(|e| CursorEntry {
-            label: e.label,
+            label: e.key.map_or(e.label, str::to_owned),
             enabled: e.enabled,
         })
         .collect()
