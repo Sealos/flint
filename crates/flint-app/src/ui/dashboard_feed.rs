@@ -572,6 +572,7 @@ fn waiting_snapshot(cluster: &str, now: Timestamp) -> TelemetrySnapshot {
         counts: ProblemSummariser::default().summarise(&ProblemSnapshot::unavailable(), now),
         metrics: MetricsCheck::Waiting,
         capacity: None,
+        pods: None,
         inventory: Inventory::default(),
         rollouts: Arc::default(),
         version: VersionCheck::Waiting,

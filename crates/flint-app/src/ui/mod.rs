@@ -41,6 +41,8 @@ mod list_model;
 #[cfg(test)]
 mod list_sort_tests;
 mod list_usage;
+mod list_usage_bar;
+mod list_usage_workloads;
 mod log_model;
 mod log_view;
 mod menu_fit;

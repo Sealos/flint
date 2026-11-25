@@ -454,3 +454,66 @@ async fn deployment_rollouts_come_from_the_watch_already_kept() {
     feed.stop().await;
     assert!(server.writes().is_empty());
 }
+
+/// A pod of `web-1` asking for 250m CPU and 64Mi, limited to 128Mi of memory and no CPU.
+fn budgeted(name: &str) -> FakePod {
+    let mut pod = FakePod::new("demo", name, &["app"])
+        .owner("ReplicaSet", "web-1")
+        .into_json();
+    pod["spec"]["containers"][0]["resources"] = serde_json::json!({
+        "requests": {"cpu": "250m", "memory": "64Mi"},
+        "limits": {"memory": "128Mi"},
+    });
+    FakePod::from_json(pod)
+}
+
+#[tokio::test]
+async fn pod_budgets_nodes_and_owners_come_from_the_pods_already_watched() {
+    let server = FakeApiServer::start().await.unwrap();
+    let pod = budgeted("budgeted");
+    let uid = pod.uid().to_owned();
+    server.add_pod(pod);
+    let store = trends();
+    let mut feed = start(&server, &store).await;
+    let snapshot = until(&mut feed, "the pod's record", |s| {
+        checked(s)
+            && s.pods.as_ref().is_some_and(|pods| pods.get(&uid).is_some())
+            && s.capacity.is_some()
+    })
+    .await;
+    let pods = snapshot.pods.as_ref().unwrap();
+    let record = pods.get(&uid).unwrap();
+    assert_eq!(&*record.name, "budgeted");
+    assert_eq!(&*record.namespace, "demo");
+    assert!(!record.finished);
+    let node = record.node.clone().expect("scheduled");
+    let owner = record.owner.as_ref().unwrap();
+    assert_eq!((&*owner.kind, &*owner.name), ("ReplicaSet", "web-1"));
+
+    let capacity = snapshot.capacity.as_ref().unwrap();
+    let on_node = capacity.node(&node).expect("the pod's node is listed");
+    let requested = on_node.requests.cpu.expect("every request readable");
+    assert!(requested.millis() >= 250, "{requested:?}");
+
+    let lists_before = pod_lists(&server);
+    server.delete_pod("demo", "budgeted");
+    until(&mut feed, "the stopped pod's record", |s| {
+        s.pods
+            .as_ref()
+            .and_then(|pods| pods.get(&uid))
+            .is_some_and(|record| record.finished)
+    })
+    .await;
+    server.finish_delete("demo", "budgeted");
+    until(&mut feed, "the deleted pod's record to go", |s| {
+        s.pods.as_ref().is_some_and(|pods| pods.get(&uid).is_none())
+    })
+    .await;
+    feed.stop().await;
+    assert_eq!(
+        pod_lists(&server),
+        lists_before,
+        "the watch carries the change"
+    );
+    assert!(server.writes().is_empty());
+}

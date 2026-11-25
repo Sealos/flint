@@ -1148,6 +1148,22 @@ impl Workspace {
 
     /// Brings the navigation and main area in line with the model: the active cluster and its
     /// discovery.
+    /// Gives the open list the thresholds in force for its cluster, which Settings may have changed.
+    fn push_list_thresholds(&self, cx: &mut Context<Self>) {
+        let Some(list) = &self.list else {
+            return;
+        };
+        let model = self.model.read(cx);
+        let cluster = list.read(cx).cluster().to_owned();
+        let server = model
+            .clusters
+            .iter()
+            .find(|c| c.info.name == cluster)
+            .and_then(|c| c.info.server.as_deref());
+        let thresholds = model.settings.thresholds_for(&cluster, server);
+        list.update(cx, |list, cx| list.set_thresholds(thresholds, cx));
+    }
+
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if confirm::newest_is_stale(window, cx) {
             let this = cx.weak_entity();
@@ -1157,6 +1173,7 @@ impl Workspace {
                 }
             });
         }
+        self.push_list_thresholds(cx);
         self.check_dock_servers(cx);
         self.tell_detail_sessions_blocked(cx);
         self.tell_shells_protected(cx);
@@ -1556,6 +1573,7 @@ impl Workspace {
         // The closed list's filter, if it had focus.
         release_unfocused_input(window, cx);
         self.list = Some(list);
+        self.push_list_thresholds(cx);
         let save = self.ui_state.set_last_view(&cluster, entry.id.as_str());
         self.persist(save, cx);
         let selected = Some(entry.id.clone());
@@ -1681,6 +1699,12 @@ impl Workspace {
             }
         }
         cx.notify();
+    }
+
+    /// Whether a namespace filter applies to what is shown: a cluster's own list. An open set
+    /// has no filter, so these changes would silently alter the active cluster's saved one.
+    pub(super) fn namespace_filter_applies(&self) -> bool {
+        self.cluster.is_some() && !self.sets.is_open()
     }
 
     /// Sets the active cluster's namespace filter, remembers it in `state.toml`, and applies it

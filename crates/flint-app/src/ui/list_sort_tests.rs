@@ -83,14 +83,17 @@ fn pod_usage() -> UsageSource {
         }
         .sample()
     };
-    UsageSource::Pods(Arc::new(
-        [
-            (("demo".to_owned(), "web".to_owned()), sample(5)),
-            (("data".to_owned(), "db".to_owned()), sample(40)),
-        ]
-        .into_iter()
-        .collect(),
-    ))
+    UsageSource::Pods(
+        Arc::new(
+            [
+                (("demo".to_owned(), "web".to_owned()), sample(5)),
+                (("data".to_owned(), "db".to_owned()), sample(40)),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+        None,
+    )
 }
 
 fn cpu_cells(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<(String, Option<String>)> {

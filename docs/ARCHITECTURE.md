@@ -743,7 +743,9 @@ opens in a tab in the bottom dock.
    Helm and controllers.
 4. A reload keeps the text being edited and moves it to the current `resourceVersion`, so the new diff shows any
    change the edit would undo. An edit that leaves `status` out keeps the live value, since a `PUT` to a kind without
-   a status subresource would erase it.
+   a status subresource would erase it. An edit may add `status` back on such a kind: the review then shows `status`
+   before and after, and the overwrite warning counts a change to it on the cluster. On a kind with a status
+   subresource the server ignores it, so the review is refused instead of showing a change Apply would not make.
 5. A Secret opens with every `data` and `stringData` value, and every annotation value outside the allowlist, masked
    as the YAML tab shows them. A mask left in place keeps the value on the cluster and is never written back
    (`flint_core::secret_edit`). Review and Apply send a JSON Merge Patch (`PATCH`, `dryRun=All` for the review) of
