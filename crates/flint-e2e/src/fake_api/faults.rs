@@ -20,8 +20,9 @@ pub enum Effect {
     ForbiddenAs(String),
     /// Any other error status (500, 429, 404...).
     Status(u16),
-    /// The 429 the Eviction API answers when a PodDisruptionBudget does not allow it.
-    DisruptionBudget,
+    /// The 429 the Eviction API answers when a PodDisruptionBudget does not allow it, naming the
+    /// budget as the API server does when this has its name.
+    DisruptionBudget(Option<String>),
     /// The response is sent normally after this delay.
     Delay(Duration),
     /// The response is sent normally once the test releases it ([`Fault::hold`]).
@@ -153,9 +154,15 @@ impl Fault {
         Fault::new(Effect::Status(code))
     }
 
-    /// A PodDisruptionBudget refuses the eviction ([`Effect::DisruptionBudget`]).
+    /// A PodDisruptionBudget refuses the eviction ([`Effect::DisruptionBudget`]), without
+    /// saying which.
     pub fn disruption_budget() -> Self {
-        Fault::new(Effect::DisruptionBudget)
+        Fault::new(Effect::DisruptionBudget(None))
+    }
+
+    /// The PodDisruptionBudget `name` refuses the eviction, and the answer names it.
+    pub fn disruption_budget_named(name: &str) -> Self {
+        Fault::new(Effect::DisruptionBudget(Some(name.to_owned())))
     }
 
     /// Answers normally after `delay` ([`Effect::Delay`]).

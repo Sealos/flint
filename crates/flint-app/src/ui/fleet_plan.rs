@@ -1,5 +1,5 @@
-//! What a fleet action on a cluster set says (#705, UP-100): the per-member plan its one
-//! confirmation shows, and the per-member results as the run goes.
+//! What a fleet action on a cluster set says (#705, #450, UP-100, UP-101): the per-member plan
+//! its one confirmation shows, and the per-member results as the run goes.
 //!
 //! Only wording and bookkeeping: what runs, and where, is decided by the core's fleet engine
 //! ([`flint_core::fleet`]) and the write gate it asks for every member. A member this module
@@ -10,28 +10,41 @@ use flint_core::display::single_line;
 use flint_core::fleet::{
     FleetAction, FleetObject, FleetPreview, FleetResult, FleetSkip, FleetStatus,
 };
-use flint_core::write::WriteTarget;
+use flint_core::write::{ResourceChange, ReviewedEdit, WriteTarget};
 use gpui_kit::Action;
 
 use super::confirm::{self, DialogText};
-use super::registry::{RestartAcrossSet, ScaleAcrossSet};
-use super::resource_actions::{ResourceAction, error_text};
+use super::registry::{ApplyAcrossSet, DeleteAcrossSet, RestartAcrossSet, ScaleAcrossSet};
+use super::resource_actions::{ResourceAction, RunningWrite, error_text};
 use super::write_confirm::{change_lines, warning_text};
+use super::yaml_diff;
 
-/// Which fleet action was asked for, before a replica count is known.
+/// Which fleet action was asked for, before a replica count or a manifest is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::ui) enum FleetChoice {
     RolloutRestart,
     Scale,
+    ApplyYaml,
+    Delete,
 }
 
 impl FleetChoice {
-    /// The single-cluster action it matches: which kinds offer it, how a refusal starts, and
-    /// what claims the object while it runs.
-    pub(in crate::ui) fn resource_action(self) -> ResourceAction {
+    /// The single-cluster action it matches, which says which kinds offer it. Apply YAML has
+    /// none: it is an edit.
+    pub(in crate::ui) fn resource_action(self) -> Option<ResourceAction> {
         match self {
-            FleetChoice::RolloutRestart => ResourceAction::RolloutRestart,
-            FleetChoice::Scale => ResourceAction::Scale,
+            FleetChoice::RolloutRestart => Some(ResourceAction::RolloutRestart),
+            FleetChoice::Scale => Some(ResourceAction::Scale),
+            FleetChoice::Delete => Some(ResourceAction::Delete),
+            FleetChoice::ApplyYaml => None,
+        }
+    }
+
+    /// How a refusal starts.
+    pub(in crate::ui) fn cant(self) -> &'static str {
+        match self.resource_action() {
+            Some(action) => action.cant(),
+            None => "Can't apply YAML across the set",
         }
     }
 
@@ -40,6 +53,8 @@ impl FleetChoice {
         match self {
             FleetChoice::RolloutRestart => "Rollout Restart Across Set…",
             FleetChoice::Scale => "Scale Across Set…",
+            FleetChoice::ApplyYaml => "Apply YAML Across Set…",
+            FleetChoice::Delete => "Delete Across Set…",
         }
     }
 
@@ -48,7 +63,81 @@ impl FleetChoice {
         match self {
             FleetChoice::RolloutRestart => Box::new(RestartAcrossSet),
             FleetChoice::Scale => Box::new(ScaleAcrossSet),
+            FleetChoice::ApplyYaml => Box::new(ApplyAcrossSet),
+            FleetChoice::Delete => Box::new(DeleteAcrossSet),
         }
+    }
+
+    /// Whether a member whose review or dry run failed must be left out by hand before the run
+    /// can start, rather than being left out on its own. Apply and delete: what each member
+    /// gets differs, so a failure is shown first.
+    pub(in crate::ui) fn drops_by_hand(self) -> bool {
+        matches!(self, FleetChoice::ApplyYaml | FleetChoice::Delete)
+    }
+}
+
+impl From<&FleetAction> for FleetChoice {
+    fn from(action: &FleetAction) -> Self {
+        match action {
+            FleetAction::Scale { .. } => FleetChoice::Scale,
+            FleetAction::ApplyYaml { .. } => FleetChoice::ApplyYaml,
+            FleetAction::Delete => FleetChoice::Delete,
+            _ => FleetChoice::RolloutRestart,
+        }
+    }
+}
+
+/// What claims each member's object while `action` runs there.
+pub(in crate::ui) fn running_write(action: &FleetAction) -> RunningWrite {
+    match FleetChoice::from(action).resource_action() {
+        Some(resource) => RunningWrite::Action(resource),
+        None => RunningWrite::YamlEdit,
+    }
+}
+
+/// The most lines of one member's diff a plan shows.
+const DIFF_LINES: usize = 80;
+
+/// What an apply does on one member, from its server dry run: creates the object, changes it
+/// (how many lines), or leaves it as it is.
+pub(in crate::ui) fn edit_lines(edit: &ReviewedEdit) -> Vec<String> {
+    if edit.creates() {
+        return vec!["Creates it.".to_owned()];
+    }
+    diff_lines(edit.before(), edit.after())
+}
+
+/// The member's dry-run diff, as the review shows it (Secret values hidden).
+pub(in crate::ui) fn edit_diff(edit: &ReviewedEdit) -> Vec<String> {
+    yaml_diff::hunk_lines(edit.before(), edit.after(), DIFF_LINES)
+}
+
+/// How `after` differs from `before`, in lines added and removed.
+fn diff_lines(before: &str, after: &str) -> Vec<String> {
+    let (added, removed) = yaml_diff::counts(before, after);
+    if added == 0 && removed == 0 {
+        return vec!["No change.".to_owned()];
+    }
+    vec![format!(
+        "Changes it: {} added, {} removed.",
+        line_count(added),
+        line_count(removed)
+    )]
+}
+
+/// "1 line", "3 lines".
+fn line_count(n: usize) -> String {
+    match n {
+        1 => "1 line".to_owned(),
+        n => format!("{n} lines"),
+    }
+}
+
+/// What a resource action does on one member.
+fn action_lines(change: &ResourceChange) -> Vec<String> {
+    match change {
+        ResourceChange::Delete => vec!["Deletes it. This cannot be undone.".to_owned()],
+        change => change_lines(change),
     }
 }
 
@@ -60,6 +149,8 @@ pub(in crate::ui) enum Verdict {
     Acts {
         change: Vec<String>,
         warnings: Vec<String>,
+        /// An apply's dry-run diff on this member.
+        diff: Vec<String>,
     },
     /// It is left out and gets no request, and why.
     Refused(String),
@@ -99,11 +190,17 @@ pub(in crate::ui) fn plan_lines(
                 (None, None) => Verdict::Refused("it was not reviewed".to_owned()),
                 (None, Some(entry)) => match entry.refusal() {
                     Some(error) => Verdict::Refused(error_text(error)),
-                    None if !entry.will_run() => Verdict::Refused("left out".to_owned()),
+                    None if !entry.will_run() => Verdict::Refused("you left it out".to_owned()),
                     None => {
                         let target = member_target(preview, cluster, entry.server());
+                        let change = match (entry.change(), entry.edit()) {
+                            (Some(change), _) => action_lines(change),
+                            (None, Some(edit)) => edit_lines(edit),
+                            (None, None) => Vec::new(),
+                        };
                         Verdict::Acts {
-                            change: entry.change().map(change_lines).unwrap_or_default(),
+                            change,
+                            diff: entry.edit().map(edit_diff).unwrap_or_default(),
                             warnings: entry
                                 .warnings()
                                 .iter()
@@ -145,10 +242,22 @@ fn clusters(n: usize) -> String {
 }
 
 /// The verb of a title ("Restart", "Scale web to 5").
-fn doing(action: FleetAction, name: &str) -> String {
+fn doing(action: &FleetAction, name: &str) -> String {
     match action {
         FleetAction::Scale { to } => format!("Scale {name} to {to}"),
+        FleetAction::ApplyYaml { .. } => format!("Apply YAML to {name}"),
+        FleetAction::Delete => format!("Delete {name}"),
         _ => format!("Restart {name}"),
+    }
+}
+
+/// The verb of the button that starts the run.
+fn verb(action: &FleetAction) -> &'static str {
+    match action {
+        FleetAction::Scale { .. } => "Scale",
+        FleetAction::ApplyYaml { .. } => "Apply",
+        FleetAction::Delete => "Delete",
+        _ => "Restart",
     }
 }
 
@@ -170,7 +279,7 @@ fn pinned_lines(object: &FleetObject, acting: &[&PlanLine]) -> Vec<String> {
 /// the members it runs on and the object, pinned. With no member to act on it only says why,
 /// and has nothing to confirm. Returns the text and how many of its last lines are pinned.
 pub(in crate::ui) fn plan_dialog(
-    action: FleetAction,
+    action: &FleetAction,
     object: &FleetObject,
     lines: &[PlanLine],
 ) -> (DialogText, usize) {
@@ -182,13 +291,18 @@ pub(in crate::ui) fn plan_dialog(
     ];
     for line in lines {
         match &line.verdict {
-            Verdict::Acts { change, warnings } => {
+            Verdict::Acts {
+                change,
+                warnings,
+                diff,
+            } => {
                 text.push(
                     format!("{}: {}", line.shown, change.join(" "))
                         .trim_end()
                         .to_owned(),
                 );
                 text.extend(warnings.iter().map(|w| format!("  {w}")));
+                text.extend(diff.iter().map(|d| format!("    {d}")));
             }
             Verdict::Refused(why) => text.push(format!("{}: left out: {why}", line.shown)),
         }
@@ -211,10 +325,7 @@ pub(in crate::ui) fn plan_dialog(
     let pinned = pinned_lines(object, &acting);
     let count = pinned.len();
     text.extend(pinned);
-    let verb = match action {
-        FleetAction::Scale { .. } => "Scale",
-        _ => "Restart",
-    };
+    let verb = verb(action);
     let dialog = DialogText {
         title: format!(
             "{} on {} of {}?",
@@ -226,9 +337,75 @@ pub(in crate::ui) fn plan_dialog(
         ok: format!("{verb} on {}", title_clusters(acting.len())),
         cancel: "Cancel".to_owned(),
         id: "fleet-plan-description",
-        default_cancel: false,
+        // A delete cannot be got back: as on one cluster, Enter cancels it.
+        default_cancel: matches!(action, FleetAction::Delete),
     };
     (dialog, count)
+}
+
+/// The step before an apply's or a delete's plan: each member with what its dry run said, to
+/// keep in the run or leave out. A member whose review or dry run failed, or that was left out
+/// before it, cannot be chosen: nothing runs on it.
+pub(in crate::ui) fn targets_dialog(action: &FleetAction, object: &FleetObject) -> DialogText {
+    let name = confirm::title_name(&single_line(&object.name));
+    let what = match action {
+        FleetAction::Delete => format!("Delete {name}"),
+        _ => format!("Apply YAML to {name}"),
+    };
+    DialogText {
+        title: format!("{what}: choose the clusters"),
+        text: "Each cluster's dry run is below. Clear a cluster to leave it out: it is sent \
+               nothing. The next step shows the plan for the clusters chosen, to confirm."
+            .to_owned(),
+        ok: "Continue".to_owned(),
+        cancel: "Cancel".to_owned(),
+        id: "fleet-targets-description",
+        default_cancel: false,
+    }
+}
+
+/// One member of the target list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::ui) struct TargetRow {
+    pub cluster: String,
+    pub shown: String,
+    /// What its dry run said, or why it cannot run.
+    pub says: String,
+    /// Whether it can be in the run: its review and dry run passed.
+    pub choosable: bool,
+    pub chosen: bool,
+}
+
+/// The target list, from the plan: every member that can run starts chosen.
+pub(in crate::ui) fn target_rows(lines: &[PlanLine]) -> Vec<TargetRow> {
+    lines
+        .iter()
+        .map(|line| {
+            let (says, choosable) = match &line.verdict {
+                Verdict::Acts { change, .. } => (change.join(" "), true),
+                Verdict::Refused(why) => (format!("left out: {why}"), false),
+            };
+            TargetRow {
+                cluster: line.cluster.clone(),
+                shown: line.shown.clone(),
+                says,
+                choosable,
+                chosen: choosable,
+            }
+        })
+        .collect()
+}
+
+/// What the target list says beside its buttons, and whether it can go on.
+pub(in crate::ui) fn targets_state(rows: &[TargetRow]) -> (String, bool) {
+    let chosen = rows.iter().filter(|r| r.chosen).count();
+    if chosen == 0 {
+        return ("Choose a cluster to run on.".to_owned(), true);
+    }
+    (
+        format!("Runs on {chosen} of {}.", clusters(rows.len())),
+        false,
+    )
 }
 
 /// "1 Cluster", "3 Clusters", for a button.
@@ -241,14 +418,17 @@ fn title_clusters(n: usize) -> String {
 
 /// What the results dialog says above its lines.
 pub(in crate::ui) fn run_dialog(
-    action: FleetAction,
+    action: &FleetAction,
     object: &FleetObject,
     acting: usize,
 ) -> DialogText {
     let name = confirm::title_name(&single_line(&object.name));
+    let on = clusters(acting);
     let title = match action {
-        FleetAction::Scale { to } => format!("Scaling {name} to {to} on {}", clusters(acting)),
-        _ => format!("Restarting {name} on {}", clusters(acting)),
+        FleetAction::Scale { to } => format!("Scaling {name} to {to} on {on}"),
+        FleetAction::ApplyYaml { .. } => format!("Applying YAML to {name} on {on}"),
+        FleetAction::Delete => format!("Deleting {name} on {on}"),
+        _ => format!("Restarting {name} on {on}"),
     };
     DialogText {
         title,
@@ -310,6 +490,9 @@ pub(in crate::ui) fn record(lines: &mut [ResultLine], result: &FleetResult) {
         }
         FleetStatus::Skipped(FleetSkip::Cancelled) => {
             Outcome::NotTried("not tried: the run was stopped")
+        }
+        FleetStatus::Skipped(FleetSkip::NotStarted) => {
+            Outcome::NotTried("not tried: a failed cluster was not left out")
         }
         FleetStatus::Skipped(FleetSkip::Dropped) => match &line.outcome {
             Outcome::Refused(_) => return,
