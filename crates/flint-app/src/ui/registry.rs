@@ -1496,6 +1496,18 @@ pub fn on_click_in<E: ?Sized, A: Action>(
     }
 }
 
+/// [`on_click_in`] for an action chosen at draw time.
+pub fn on_click_dyn_in<E: ?Sized>(
+    focus: FocusHandle,
+    action: Box<dyn Action>,
+) -> impl Fn(&E, &mut Window, &mut App) + 'static {
+    move |_, window, cx| {
+        if let Err(e) = dispatch_in(&focus, action.as_ref(), window, cx) {
+            tracing::warn!("{e}");
+        }
+    }
+}
+
 /// [`on_click`] that also hands a refusal to `refused`, for a control drawn from state that may
 /// be older than the click (a menu left open), so the user learns why nothing happened.
 pub fn on_click_or<E: ?Sized>(
