@@ -325,8 +325,9 @@ async fn capacity_needs_no_metrics_server_and_the_version_is_read_once() {
     assert!(server.writes().is_empty());
 }
 
+// The store is the cluster's history: a stopped feed leaves its samples to the next feed on it.
 #[tokio::test]
-async fn metrics_reach_the_trend_store_and_stopping_forgets_them() {
+async fn metrics_reach_the_trend_store_and_outlive_the_feed() {
     let server = FakeApiServer::start().await.unwrap();
     let store = trends();
     let mut feed = start(&server, &store).await;
@@ -336,17 +337,32 @@ async fn metrics_reach_the_trend_store_and_stopping_forgets_them() {
         |s| matches!(s.metrics, MetricsCheck::Current { nodes } if nodes > 0),
     )
     .await;
-    let has_series = |store: &Arc<Mutex<TrendStore>>| {
+    let samples = |store: &Arc<Mutex<TrendStore>>| -> usize {
         store
             .lock()
             .unwrap()
-            .series(CONTEXT, TrendScope::Total, TrendResource::Cpu, polled.at)
-            .is_some()
+            .series(
+                CONTEXT,
+                TrendScope::Node("flint-dev-control-plane"),
+                TrendResource::Cpu,
+                polled.at,
+            )
+            .map_or(0, |series| series.flatten().count())
     };
-    assert!(has_series(&store));
+    assert_eq!(samples(&store), 1);
 
     feed.stop().await;
-    assert!(!has_series(&store));
+    assert_eq!(samples(&store), 1, "stopping keeps the samples");
+
+    let mut next = start(&server, &store).await;
+    until(
+        &mut next,
+        "the next feed's metrics poll",
+        |s| matches!(s.metrics, MetricsCheck::Current { nodes } if nodes > 0),
+    )
+    .await;
+    assert_eq!(samples(&store), 1, "the next feed writes on into them");
+    next.stop().await;
 }
 
 #[tokio::test]

@@ -382,8 +382,8 @@ pub struct Telemetry {
 
 impl Telemetry {
     /// Starts the feed of `cluster` on `client`, a read client. Must run inside a tokio runtime.
-    /// This cluster's series are removed from `trends` when the feed stops, so a feed that
-    /// replaces this one needs a store of its own. Every request goes through `requests`.
+    /// Its metrics poll records into `trends`, the cluster's history, and leaves it as it is when
+    /// the feed stops. Every request goes through `requests`.
     pub(crate) fn start(
         cluster: Arc<str>,
         client: kube::Client,
