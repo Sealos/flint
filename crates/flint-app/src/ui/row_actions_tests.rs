@@ -692,14 +692,16 @@ async fn a_workload_rows_logs_merge_its_pods(cx: &mut TestAppContext) {
         open_menu(cx, &t, "web").await,
         ["Logs", "Shell", "", "Scale…", "Rollout Restart…"]
     );
+    assert_eq!(registry::label::<registry::OpenLogs>(), "Open Logs");
+    click_entry(cx, &t, 0);
+    // The pane's button, drawn once the menu has closed.
+    draw(cx, &t);
     let button = cx
         .update_window(t.window, |_, window, _| {
             window.find("detail-logs").label().map(str::to_owned)
         })
         .unwrap();
     assert_eq!(button.as_deref(), Some("Logs"));
-    assert_eq!(registry::label::<registry::OpenLogs>(), "Open Logs");
-    click_entry(cx, &t, 0);
     assert_eq!(
         dock_tabs(cx, &t),
         (vec!["web (Deployment)".to_owned()], Some(0))
