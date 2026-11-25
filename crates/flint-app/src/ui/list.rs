@@ -2041,6 +2041,20 @@ fn state_chip(state: &SyncState, feed: Feed, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
+/// What a signed-out member's chip says instead of its sync state. Clicking the chip signs in.
+fn sign_in_chip(theme: &Theme) -> AnyElement {
+    h_flex()
+        .id("sync-state")
+        .gap_1()
+        .flex_none()
+        .text_xs()
+        .text_color(theme.warning)
+        .child(super::theme::status_dot(theme.warning, true))
+        .child("Sign-in needed")
+        .tooltip(|window, cx| Tooltip::new("Click to sign in").build(window, cx))
+        .into_any_element()
+}
+
 impl Render for ResourceList {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The pane width from the last layout decides which wide columns fit. While it keeps

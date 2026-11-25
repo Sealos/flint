@@ -17,6 +17,7 @@ pub mod cluster_sets;
 pub mod combined;
 pub mod compare;
 mod connection;
+mod core_queue;
 mod credential;
 pub mod dashboard;
 pub mod discovery;
