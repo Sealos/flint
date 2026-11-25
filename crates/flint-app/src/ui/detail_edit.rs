@@ -217,10 +217,11 @@ fn competing_changes(seen: &[Value], latest: &Value, yaml: &str) -> Vec<String> 
     };
     let latest = compared(latest);
     let edited = compared(&edited);
+    let seen: Vec<Value> = seen.iter().map(compared).collect();
     let mut found = BTreeSet::new();
-    for earlier in seen.iter().map(compared) {
+    for earlier in &seen {
         collect_competing(
-            Some(&earlier),
+            Some(earlier),
             Some(&latest),
             Some(&edited),
             &mut Vec::new(),
