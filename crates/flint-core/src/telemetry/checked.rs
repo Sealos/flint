@@ -44,7 +44,7 @@ impl CheckedObjects {
 }
 
 /// The identity a list row has for this object: its UID, else its namespaced name.
-fn identity(meta: &ObjectMeta) -> Cow<'_, str> {
+pub(super) fn identity(meta: &ObjectMeta) -> Cow<'_, str> {
     if let Some(uid) = meta.uid.as_deref().filter(|uid| !uid.is_empty()) {
         return Cow::Borrowed(uid);
     }

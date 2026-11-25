@@ -14,7 +14,8 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Resource;
 use serde::de::DeserializeOwned;
 
-use super::capacity::{ALLOCATABLE_KEYS, PodClaim, PodTally, PodTallySlot};
+use super::capacity::ALLOCATABLE_KEYS;
+use super::pods::{ControllerCache, PodRead, PodSlot, PodTotals};
 use super::{KindCheck, WatchedKind};
 
 /// The most objects of one kind a feed holds.
@@ -61,6 +62,11 @@ impl<K: Tracked> KindStore<K> {
     /// The objects, if they can be relied on.
     pub(super) fn current(&self) -> Option<&[K]> {
         (self.check == KindCheck::Current).then_some(self.items.as_slice())
+    }
+
+    /// The index entries' tally slots, in no particular order.
+    pub(super) fn slots(&self) -> impl Iterator<Item = &K::TallySlot> {
+        self.index.values().map(|entry| &entry.tally_slot)
     }
 
     /// What the objects add up to, if they can be relied on.
@@ -238,16 +244,16 @@ fn trim_container_status(status: &mut ContainerStatus) {
 }
 
 impl Tracked for Pod {
-    type Extra = Option<PodClaim>;
-    type Totals = PodTally;
-    type TallySlot = Option<PodTallySlot>;
+    type Extra = PodRead;
+    type Totals = PodTotals;
+    type TallySlot = PodSlot;
 
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.pods
     }
 
-    fn trim(&mut self) -> Option<PodClaim> {
-        let claim = PodClaim::of(self);
+    fn trim(&mut self) -> PodRead {
+        let read = PodRead::of(self);
         trim_meta(&mut self.metadata);
         self.spec = self.spec.take().map(|mut spec| {
             spec.containers.iter_mut().for_each(trim_container);
@@ -277,18 +283,15 @@ impl Tracked for Pod {
             }
             trimmed
         });
-        claim
+        read
     }
 
-    fn count(&self, claim: Option<PodClaim>, totals: &mut PodTally) -> Option<PodTallySlot> {
-        self.spec.as_ref()?;
-        claim.map(|claim| totals.add(&claim))
+    fn count(&self, read: PodRead, totals: &mut PodTotals) -> PodSlot {
+        totals.count(self, read)
     }
 
-    fn uncount(slot: Option<PodTallySlot>, totals: &mut PodTally) {
-        if let Some(slot) = slot {
-            totals.remove(slot);
-        }
+    fn uncount(slot: PodSlot, totals: &mut PodTotals) {
+        totals.uncount(slot);
     }
 }
 
@@ -325,8 +328,16 @@ impl Tracked for Node {
 
 impl Tracked for Job {
     type Extra = ();
-    type Totals = ();
+    type Totals = ControllerCache;
     type TallySlot = ();
+
+    fn count(&self, (): (), totals: &mut ControllerCache) {
+        totals.changed();
+    }
+
+    fn uncount((): (), totals: &mut ControllerCache) {
+        totals.changed();
+    }
 
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.jobs
@@ -410,8 +421,16 @@ impl Tracked for DaemonSet {
 
 impl Tracked for ReplicaSet {
     type Extra = ();
-    type Totals = ();
+    type Totals = ControllerCache;
     type TallySlot = ();
+
+    fn count(&self, (): (), totals: &mut ControllerCache) {
+        totals.changed();
+    }
+
+    fn uncount((): (), totals: &mut ControllerCache) {
+        totals.changed();
+    }
 
     fn store(stores: &mut Stores) -> &mut KindStore<Self> {
         &mut stores.replica_sets
@@ -448,6 +467,12 @@ mod tests {
         .unwrap()
     }
 
+    fn read(name: &str) -> (Pod, PodRead) {
+        let mut pod = pod(name);
+        let read = pod.trim();
+        (pod, read)
+    }
+
     #[test]
     fn a_trimmed_pod_keeps_what_classification_reads_and_no_template_values() {
         let mut trimmed = pod("a");
@@ -469,9 +494,10 @@ mod tests {
     #[test]
     fn the_store_replaces_removes_and_keeps_its_index() {
         let mut store = KindStore::<Pod>::default();
-        store.replace(vec![(pod("a"), None), (pod("b"), None), (pod("c"), None)]);
+        store.replace(vec![read("a"), read("b"), read("c")]);
         store.remove(&pod("a"));
-        assert!(store.upsert(pod("b"), None));
+        let (b, extra) = read("b");
+        assert!(store.upsert(b, extra));
         store.remove(&pod("c"));
         store.check = KindCheck::Current;
         let names: Vec<_> = store
@@ -504,7 +530,7 @@ mod tests {
     #[test]
     fn objects_held_are_not_current_until_the_check_says_so() {
         let mut store = KindStore::<Pod>::default();
-        store.replace(vec![(pod("a"), None)]);
+        store.replace(vec![read("a")]);
         assert!(store.current().is_none());
         store.check = KindCheck::Current;
         assert_eq!(store.current().map(<[Pod]>::len), Some(1));
