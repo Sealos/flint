@@ -43,7 +43,7 @@ impl Workspace {
         fn editable(ws: &Workspace, _: &App) -> bool {
             ws.settings_page.open && ws.settings_page.saving.is_none()
         }
-        guards
+        Self::threshold_guards(guards)
             .when::<CloseSettings>(open)
             .when::<ShowSettingsSection>(open)
             .when::<NextSettingsControl>(open)
@@ -52,17 +52,27 @@ impl Workspace {
             .when::<EditAppearance>(editable)
             .when::<EditDesktopNotifications>(editable)
             .when::<EditWatchMode>(editable)
-            .when::<SaveSettings>(|ws, cx| ws.can_save_settings(cx))
+            // A threshold still being typed is entered by Save, which then checks the draft,
+            // and dropped by Revert.
+            .when::<SaveSettings>(|ws, cx| {
+                ws.can_save_settings(cx)
+                    || (ws.settings_page.thresholds.entry.is_some()
+                        && ws.settings_page.saving.is_none()
+                        && !ws.settings_invalid(cx))
+            })
+            // Revert also closes a field left open, as its button shows.
             .when::<RevertSettings>(|ws, _| {
-                ws.settings_page.draft.is_dirty() && ws.settings_page.saving.is_none()
+                (ws.settings_page.draft.is_dirty() || ws.settings_page.thresholds.entry.is_some())
+                    && ws.settings_page.saving.is_none()
             })
     }
 
     pub(in crate::ui) fn bind_settings_actions<B: Bind<Self>>(bind: B) -> B {
-        bind.bind::<OpenSettings>(|ws, _, window, cx| ws.open_settings(window, cx))
+        Self::bind_threshold_actions(bind)
+            .bind::<OpenSettings>(|ws, _, window, cx| ws.open_settings(window, cx))
             .bind::<CloseSettings>(|ws, _, window, cx| ws.close_settings(window, cx))
-            .bind::<ShowSettingsSection>(|ws, action, _, cx| {
-                ws.show_settings_section(action.section, cx)
+            .bind::<ShowSettingsSection>(|ws, action, window, cx| {
+                ws.show_settings_section(action.section, window, cx)
             })
             .bind::<EditAppearance>(|ws, action, _, cx| {
                 ws.edit_settings(Change::Appearance(action.appearance), cx)
@@ -74,7 +84,10 @@ impl Workspace {
                 ws.edit_settings(Change::WatchMode(action.mode), cx)
             })
             .bind::<SaveSettings>(|ws, _, window, cx| ws.save_settings(None, window, cx))
-            .bind::<RevertSettings>(|ws, _, _, cx| ws.revert_settings(cx))
+            .bind::<RevertSettings>(|ws, _, window, cx| {
+                ws.finish_threshold_entry(false, window, cx);
+                ws.revert_settings(cx)
+            })
             .bind::<NextSettingsControl>(|ws, _, _, cx| ws.move_settings_cursor(true, cx))
             .bind::<PreviousSettingsControl>(|ws, _, _, cx| ws.move_settings_cursor(false, cx))
             .bind::<ActivateSettingsControl>(|ws, _, window, cx| {
@@ -104,6 +117,7 @@ impl Workspace {
         if !self.settings_page.open {
             return;
         }
+        self.finish_threshold_entry(true, window, cx);
         self.leave_settings_for_view();
         window.focus(&self.focus, cx);
         self.recover_focus(window, cx);
@@ -138,6 +152,7 @@ impl Workspace {
         self.settings_page.open = false;
         self.settings_page.opened_over = None;
         self.settings_page.cursor = None;
+        // A field still open is entered as the workspace next draws (flush_threshold_entry).
     }
 
     fn settings_invalid(&self, cx: &App) -> bool {
@@ -149,14 +164,24 @@ impl Workspace {
             && settings_view::can_save(&self.settings_page.draft, self.settings_invalid(cx))
     }
 
-    fn show_settings_section(&mut self, section: settings_view::Section, cx: &mut Context<Self>) {
+    pub(super) fn show_settings_section(
+        &mut self,
+        section: settings_view::Section,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.settings_page.open {
+            self.finish_threshold_entry(true, window, cx);
             self.settings_page.section = section;
+            // The cursor stays on the section list, never on a control no longer drawn.
+            if self.settings_page.cursor.is_some() {
+                self.settings_page.cursor = Some(Stop::Section(section));
+            }
             cx.notify();
         }
     }
 
-    fn edit_settings(&mut self, change: Change, cx: &mut Context<Self>) {
+    pub(super) fn edit_settings(&mut self, change: Change, cx: &mut Context<Self>) {
         if !self.settings_page.open || self.settings_page.saving.is_some() {
             return;
         }
@@ -171,6 +196,7 @@ impl Workspace {
             return;
         }
         self.settings_page.draft.revert();
+        self.revert_thresholds_page();
         self.settings_page.save_note = None;
         cx.notify();
     }
@@ -180,15 +206,13 @@ impl Workspace {
     /// [`SAVE_WAIT`], they stay, the footer says why, and `then` does not run. Nothing happens
     /// without edits, while `settings.toml` is invalid, or while an earlier Save is pending.
     fn save_settings(&mut self, then: Option<Then>, window: &mut Window, cx: &mut Context<Self>) {
+        // A threshold still being typed is part of what is saved (or, rejected, blocks it).
+        self.finish_threshold_entry(true, window, cx);
         if !self.can_save_settings(cx) {
             return;
         }
         let writes = self.settings_page.draft.edits();
-        let reply = self
-            .model
-            .read(cx)
-            .core()
-            .write_settings(writes.iter().map(|c| c.to_write()).collect());
+        let reply = self.model.read(cx).core().write_settings(writes.clone());
         let written = writes.clone();
         let answer = cx.spawn_in(window, async move |this, cx| {
             let result = reply.await;
@@ -228,6 +252,7 @@ impl Workspace {
         match result {
             Ok(()) => {
                 self.settings_page.draft.saved(writes);
+                self.saved_thresholds_page();
                 for then in saving.after {
                     then(window, cx);
                 }
@@ -244,8 +269,10 @@ impl Workspace {
         if !self.settings_page.open {
             return;
         }
+        self.follow_threshold_rows(cx);
         let banner = self.settings_banner_shown(cx);
-        let stops = settings_view::stops(self.settings_page.section, banner);
+        let layout = self.overrides_layout(cx);
+        let stops = settings_view::stops(self.settings_page.section, banner, layout);
         let at = self
             .settings_page
             .cursor
@@ -257,19 +284,30 @@ impl Workspace {
             (Some(i), false) => (i + stops.len() - 1) % stops.len(),
         };
         self.settings_page.cursor = Some(stops[next]);
+        self.track_threshold_cursor(cx);
         cx.notify();
     }
 
     /// Enter or Space: does what clicking the control under the cursor does.
     fn activate_settings_control(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.follow_threshold_rows(cx);
         let Some(stop) = self.settings_page.cursor else {
             return;
         };
+        // Only a control drawn now: never one of a section no longer shown.
+        let banner = self.settings_banner_shown(cx);
+        let layout = self.overrides_layout(cx);
+        if !settings_view::stops(self.settings_page.section, banner, layout).contains(&stop) {
+            return;
+        }
         match stop {
             Stop::Done => self.close_settings(window, cx),
-            Stop::Reload | Stop::Revert => self.revert_settings(cx),
+            Stop::Reload | Stop::Revert => {
+                self.finish_threshold_entry(false, window, cx);
+                self.revert_settings(cx)
+            }
             Stop::SaveAnyway | Stop::Save => self.save_settings(None, window, cx),
-            Stop::Section(section) => self.show_settings_section(section, cx),
+            Stop::Section(section) => self.show_settings_section(section, window, cx),
             Stop::Appearance(appearance) => self.edit_settings(Change::Appearance(appearance), cx),
             Stop::DesktopNotifications => {
                 let file = self.model.read(cx).settings.clone();
@@ -277,6 +315,7 @@ impl Workspace {
                 self.edit_settings(Change::DesktopNotifications(!on), cx)
             }
             Stop::WatchMode(mode) => self.edit_settings(Change::WatchMode(mode), cx),
+            Stop::Threshold(stop) => self.activate_threshold_stop(stop, window, cx),
         }
     }
 
@@ -294,11 +333,13 @@ impl Workspace {
         if !self.settings_page.open {
             return None;
         }
+        let clusters = self.settings_clusters(cx);
         let model = self.model.read(cx);
         Some(settings_view::render(
             &self.settings_page,
             &model.settings,
             model.settings_error.is_some(),
+            &clusters,
             theme,
         ))
     }
@@ -310,14 +351,21 @@ impl Workspace {
 
     #[cfg(any(test, feature = "automation"))]
     pub(super) fn settings_view_state(&self, cx: &App) -> SettingsState {
+        let clusters = self.settings_clusters(cx);
         let model = self.model.read(cx);
         self.settings_page
-            .state(&model.settings, model.settings_error.is_some())
+            .state(&model.settings, model.settings_error.is_some(), &clusters)
     }
 
     /// Whether Settings holds edits not yet written, a Save under way included.
-    pub(in crate::ui) fn has_settings_draft(&self) -> bool {
+    pub(in crate::ui) fn has_settings_draft(&self, cx: &App) -> bool {
         self.settings_page.draft.is_dirty()
+            || self
+                .settings_page
+                .thresholds
+                .entry
+                .as_ref()
+                .is_some_and(|entry| entry.typed(cx).is_some())
     }
 
     /// Asks Save / Discard / Cancel about unsaved settings, if there are any; Save (once
@@ -341,7 +389,9 @@ impl Workspace {
         ending: &'static str,
         then: Then,
     ) -> bool {
-        if !self.has_settings_draft() {
+        // A threshold still being typed counts as an edit.
+        self.finish_threshold_entry(true, window, cx);
+        if !self.has_settings_draft(cx) {
             return false;
         }
         // A Save already on its way: close or quit once it is written, never before.
@@ -353,13 +403,18 @@ impl Workspace {
             return true;
         }
         let invalid = self.settings_invalid(cx);
+        let rejected = self.settings_page.draft.has_rejected();
         let workspace = cx.weak_entity();
-        if invalid {
+        if invalid || rejected {
+            let why = if invalid {
+                "settings.toml is invalid"
+            } else {
+                "Some values in Settings are not accepted"
+            };
             let text = DialogText {
                 title: "Discard unsaved settings?".into(),
                 text: format!(
-                    "settings.toml is invalid, so your edits in Settings cannot be saved. \
-                     {ending} discards them."
+                    "{why}, so your edits in Settings cannot be saved. {ending} discards them."
                 ),
                 ok: "Discard".into(),
                 cancel: "Cancel".into(),

@@ -82,7 +82,7 @@ fn quit(cx: &mut App) {
     // Unsaved settings first, over the window that holds them: Save or Discard come back here.
     for handle in cx.windows() {
         let asked = handle.update(cx, |_, window, cx| {
-            let held = workspace(window, cx).is_some_and(|ws| ws.read(cx).has_settings_draft());
+            let held = workspace(window, cx).is_some_and(|ws| ws.read(cx).has_settings_draft(cx));
             if held {
                 window.activate_window();
             }
