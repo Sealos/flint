@@ -867,7 +867,7 @@ impl Dock {
     }
 
     /// The dock's actions on the tab shown, for [`Bind`]: bound only while a tab is shown
-    /// ([`Dock::shown_tab`]), so the Window menu's Close Dock Tab is disabled otherwise. Cmd-W
+    /// ([`Dock::shown_tab`]), so the File menu's Close Dock Tab is disabled otherwise. Cmd-W
     /// then falls through to its lower-precedence binding, Close Window (#177).
     pub fn bind_shown_tab_actions<B: Bind<Self>>(bind: B) -> B {
         bind.bind::<CloseActiveTab>(|dock, _, window, cx| match dock.shown_tab() {

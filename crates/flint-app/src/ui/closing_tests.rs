@@ -513,8 +513,8 @@ async fn minimize_and_zoom_need_an_active_window(cx: &mut TestAppContext) {
     assert!(cx.update(|cx| cx.is_action_available(&Hide)));
 }
 
-// The Window menu holds Minimize and Zoom above the closing items. The test window implements
-// neither, so this checks their place and does not dispatch them.
+// The Window menu holds Minimize and Zoom, and the File menu the closing items. The test window
+// implements neither, so this checks their place and does not dispatch them.
 #[gpui_kit::test]
 async fn the_window_and_help_menus_hold_the_standard_items(cx: &mut TestAppContext) {
     use gpui_kit::OwnedMenuItem;
@@ -534,12 +534,12 @@ async fn the_window_and_help_menus_hold_the_standard_items(cx: &mut TestAppConte
     };
     assert_eq!(
         names("Window"),
-        [
-            "flint::MinimizeWindow",
-            "flint::ZoomWindow",
-            "dock::CloseActiveTab",
-            "flint::CloseWindow"
-        ]
+        ["flint::MinimizeWindow", "flint::ZoomWindow"]
+    );
+    assert_eq!(
+        names("File")[3..],
+        // Close Dock Tab holds an action nothing handles while no dock tab is shown.
+        ["menu::Unavailable", "flint::CloseWindow"]
     );
     assert_eq!(names("Help"), ["flint::OpenHelp"]);
     assert!(names("Flint").contains(&"Services".to_owned()));

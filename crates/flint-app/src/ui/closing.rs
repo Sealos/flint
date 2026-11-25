@@ -1,6 +1,6 @@
 //! Closing the window and quitting (#177). Both end every session in the dock and stop every
 //! running port forward, so while a shell, a following log tab or a forward is still at work they
-//! ask first, naming how many end. Close Window (its key, the Window menu, Cmd-W with no dock tab
+//! ask first, naming how many end. Close Window (its key, the File menu, Cmd-W with no dock tab
 //! shown), the window's own close button and Quit all take this path; with nothing at work they
 //! close or quit at once. An unapplied YAML edit on top of that joins the same question, so it is
 //! one prompt, never two. Unsaved edits in Settings are asked about first, on their own: Save,
