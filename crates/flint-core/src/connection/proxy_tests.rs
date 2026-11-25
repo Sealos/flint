@@ -769,3 +769,71 @@ fn a_plugin_never_gets_the_settings_proxy_credentials() {
         assert_eq!(address.as_deref(), Some("socks5://bastion:1080"));
     }
 }
+
+#[test]
+fn while_settings_are_unreadable_a_plugin_gets_its_clusters_own_proxy() {
+    let unreadable = InUse::Unreadable;
+    let own = " socks5://alice:s3cret@bastion:1080 ";
+    let url = Some(own.trim().to_owned());
+    assert_eq!(
+        plugin_variables_under(Some(&unreadable), Some(own)),
+        [
+            ("HTTPS_PROXY", url.clone()),
+            ("https_proxy", url.clone()),
+            ("ALL_PROXY", url.clone()),
+            ("all_proxy", url),
+            ("NO_PROXY", None),
+            ("no_proxy", None),
+        ]
+    );
+    // Without one the cluster is refused before its plugin could run.
+    assert!(plugin_variables_under(Some(&unreadable), None).is_empty());
+    assert!(plugin_variables_under(Some(&unreadable), Some(" ")).is_empty());
+    // A readable setting decides as before, and no setting leaves the environment as it is.
+    let readable = InUse::Setting(setting(Some("http://proxy:3128"), &[]));
+    let own = Some("http://own:3128");
+    assert_eq!(
+        plugin_variables_under(Some(&readable), own)[0],
+        ("HTTPS_PROXY", Some("http://proxy:3128".to_owned()))
+    );
+    assert!(plugin_variables_under(None, own).is_empty());
+}
+
+#[tokio::test]
+async fn socks5_resolves_names_without_blocking_and_keeps_addresses() {
+    let named: Uri = "https://localhost:6443".parse().unwrap();
+    let address = resolved(named).await.unwrap();
+    let host = address.host().unwrap();
+    assert!(host == "127.0.0.1" || host == "[::1]", "{host}");
+    assert_eq!(address.port_u16(), Some(6443));
+    assert_eq!(address.scheme_str(), Some("https"));
+
+    for kept in ["https://10.0.0.1:6443", "https://[fd00::1]:6443"] {
+        let uri: Uri = kept.parse().unwrap();
+        assert_eq!(resolved(uri.clone()).await.unwrap(), uri);
+    }
+}
+
+#[tokio::test]
+async fn a_socks5_name_that_does_not_resolve_says_so() {
+    let target = ProxyTarget::parse("socks5://alice:proxy-secret@127.0.0.1:1").unwrap();
+    let ProxyConnector::Socks(mut connector) =
+        target.tunnel(hyper_util::client::legacy::connect::HttpConnector::new())
+    else {
+        panic!("not a SOCKS connector");
+    };
+    let dst: Uri = "https://flint-test.invalid:6443".parse().unwrap();
+    let Err(error) = tower::Service::call(&mut connector, dst).await else {
+        panic!("connected");
+    };
+    if !matches!(error, SocksConnectError::Unresolved(_)) {
+        // Some resolvers answer every name (RFC 2606 aside); the proxy, which is down, is next.
+        eprintln!("skipped: this resolver answers for flint-test.invalid");
+        return;
+    }
+    assert!(!error.to_string().contains("proxy-secret"));
+    assert_eq!(
+        crate::api_error::classify_transport(&error),
+        Some(crate::api_error::Transport::Unresolved)
+    );
+}

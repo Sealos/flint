@@ -11,11 +11,12 @@ use flint_core::handle::{Command, Event, MemberStatus};
 use flint_core::keep_watching::{
     BackgroundSignIn, KeepWatching, MAX_WATCHED_CLUSTERS, PluginOffer, WatchedCluster,
 };
+use flint_core::metrics_trend::{TrendResource, TrendScope};
 use flint_core::problems::ProblemKind;
 use flint_core::telemetry::{Availability, FeedDiscovery};
 use flint_core::write::{WriteError, WriteProposal, WriteTarget};
 use flint_core::{KindId, Settings, WriteRefusal, settings};
-use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, Verb, WatchStep};
+use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, MetricsTarget, Verb, WatchStep};
 
 #[allow(dead_code)]
 mod core_support;
@@ -1177,6 +1178,124 @@ async fn a_switch_back_lists_nothing_again() {
 
     assert_eq!(deployment_lists(&f.b), listed, "nothing listed again");
     assert!(f.b.writes().is_empty(), "{:?}", f.b.writes());
+}
+
+/// The node every fake API server reports.
+const NODE: &str = "flint-dev-control-plane";
+
+/// The CPU samples of `b`'s node in the history its feed shows now, oldest first, without gaps.
+fn b_cpu_samples(f: &Fixture) -> Vec<u64> {
+    let Some(feed) = f.core.handle.telemetry("b") else {
+        return Vec::new();
+    };
+    // Up to the newest sample: a time before it still reads every step up to it.
+    let at = feed.snapshot.at;
+    feed.with_trends(|store| {
+        store
+            .series("b", TrendScope::Node(NODE), TrendResource::Cpu, at)
+            .map(|series| series.flatten().collect())
+            .unwrap_or_default()
+    })
+}
+
+/// [`fixture`] with a plugin that never prompts, so selecting `b` from a test run in a terminal
+/// does not wait for the terminal.
+async fn never_prompting(body: &str) -> Fixture {
+    let f = fixture(body, Settings::default()).await;
+    let mut user = exec_user(&f.script, &["get-token"]);
+    user["exec"]["interactiveMode"] = "Never".into();
+    f.rewrite(user).await;
+    f
+}
+
+/// When the oldest step of `b`'s history its feed shows now was polled.
+fn b_first_poll(f: &Fixture) -> Option<String> {
+    let feed = f.core.handle.telemetry("b")?;
+    let at = feed.snapshot.at;
+    feed.with_trends(|store| Some(store.sample_times("b", at)?.flatten().next()?.to_string()))
+}
+
+/// Waits until `done` holds.
+async fn until_b_feed(f: &Fixture, what: &str, done: impl Fn(&Fixture) -> bool) {
+    tokio::time::timeout(WAIT, async {
+        while !done(f) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("never reached: {what}"));
+}
+
+/// Whether `b`'s feed read metrics in its latest pass.
+fn b_metrics_read(f: &Fixture) -> bool {
+    f.core.handle.telemetry("b").is_some_and(|feed| {
+        matches!(
+            feed.snapshot.metrics,
+            flint_core::telemetry::MetricsCheck::Current { .. }
+        )
+    })
+}
+
+// Opened before keep watching was on, `b`'s history is recorded by its slot's feed. Leaving it
+// stops that feed, and the kept feed that takes over shows the same history rather than one of
+// its own: the sample from before the switch is still the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn leaving_a_cluster_hands_its_history_to_the_kept_feed() {
+    let f = never_prompting(LASTING).await;
+    f.b.set_metrics(&MetricsTarget::node(NODE), "250m", "1Gi");
+    switch_to(&f, "b").await;
+    until_b_feed(&f, "a sample on the slot's feed", |f| {
+        !b_cpu_samples(f).is_empty()
+    })
+    .await;
+    assert!(!kept_feed_serves(&f), "the slot's own feed");
+    assert_eq!(b_cpu_samples(&f), [250_000_000]);
+    let first = b_first_poll(&f).expect("a polled step");
+
+    f.b.set_metrics(&MetricsTarget::node(NODE), "750m", "1Gi");
+    f.turn_on().await;
+    switch_to(&f, "a").await;
+    until_b_feed(&f, "the kept feed reading metrics", |f| {
+        kept_feed_serves(f) && b_metrics_read(f)
+    })
+    .await;
+
+    assert_eq!(b_first_poll(&f), Some(first), "the history goes on");
+    let samples = b_cpu_samples(&f);
+    assert_eq!(
+        samples.last(),
+        Some(&750_000_000),
+        "the newest values are the kept feed's: {samples:?}"
+    );
+    assert!(f.b.writes().is_empty(), "{:?}", f.b.writes());
+}
+
+// Turning keep watching off while the cluster is in the background drops its history: selecting
+// it again starts an empty one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turning_keep_watching_off_drops_the_history() {
+    let f = never_prompting(LASTING).await;
+    f.b.set_metrics(&MetricsTarget::node(NODE), "250m", "1Gi");
+    f.turn_on().await;
+    f.until_feed().await;
+    until_b_feed(&f, "a sample on the kept feed", |f| {
+        !b_cpu_samples(f).is_empty()
+    })
+    .await;
+
+    f.core.handle.send(Command::SetKeepWatching {
+        cluster: "b".to_owned(),
+        definition: None,
+    });
+    f.until_status(KeepWatching::Off).await;
+    f.b.set_metrics(&MetricsTarget::node(NODE), "750m", "1Gi");
+    switch_to(&f, "b").await;
+    until_b_feed(&f, "a sample on the slot's feed", |f| {
+        b_metrics_read(f) && !b_cpu_samples(f).is_empty()
+    })
+    .await;
+
+    assert_eq!(b_cpu_samples(&f), [750_000_000], "nothing carried over");
 }
 
 #[test]

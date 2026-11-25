@@ -78,13 +78,26 @@ fn use_in_process(setting: InUse) {
 /// `reason`, why `settings.toml` can't be read, saying what that means for the proxy when the
 /// file was unreadable at startup. Holds nothing of the file.
 pub(crate) fn settings_error_with_proxy_note(reason: String) -> String {
-    with_proxy_note(reason, matches!(SETTING.get(), Some(InUse::Unreadable)))
+    with_proxy_note(reason, setting_unreadable_at_startup())
 }
+
+/// Whether `settings.toml` could not be read at startup, so its proxy setting is unknown to this
+/// process ([`use_unreadable_setting`]) however the file reads now.
+pub(crate) fn setting_unreadable_at_startup() -> bool {
+    matches!(SETTING.get(), Some(InUse::Unreadable))
+}
+
+/// What a `settings.toml` that reads again says while [`setting_unreadable_at_startup`]: its
+/// proxy setting applies only after a restart, so it still counts as not applied.
+pub(crate) const RESTART_TO_APPLY: &str = "settings.toml can be read again, but its proxy \
+     setting applies only after Flint restarts. Until then clusters without a proxy-url of their \
+     own do not connect, and settings.toml is treated as unreadable: nothing is trusted, exposed \
+     to AI or watched in the background";
 
 /// `reason`, with the proxy note when the setting in use is `unreadable`. The note follows the
 /// reason's first line: a TOML parse error goes on with lines that quote the file, and what is
 /// shown of an error is its first line.
-fn with_proxy_note(reason: String, unreadable: bool) -> String {
+pub(crate) fn with_proxy_note(reason: String, unreadable: bool) -> String {
     if !unreadable {
         return reason;
     }
@@ -450,15 +463,35 @@ pub(crate) fn plugin_environment(
         .collect()
 }
 
+/// A proxy variable for an exec plugin: set to the value, or removed (`None`).
+pub(crate) type PluginVariable = (&'static str, Option<String>);
+
 /// The proxy variables an exec plugin starts with under the proxy setting this process uses,
 /// each to set (`Some`) or remove (`None`), so a plugin reaches its sign-in service the way
 /// Flint's own connections go when they take the setting. Applied before the kubeconfig's own
 /// `env`, which wins, and before [`plugin_environment`], which still keeps any credentials of
-/// the URL from the plugin. Empty without a setting, and while `settings.toml` can't be read.
-pub(crate) fn plugin_setting_variables() -> Vec<(&'static str, Option<String>)> {
-    match SETTING.get() {
+/// the URL from the plugin. Empty without a setting.
+///
+/// While `settings.toml` can't be read, only a cluster with a `proxy-url` of its own (`own`)
+/// connects, and its plugin is given that proxy, with no exemptions, as its connection is.
+pub(crate) fn plugin_setting_variables(own: Option<&str>) -> Vec<PluginVariable> {
+    plugin_variables_under(SETTING.get(), own)
+}
+
+/// [`plugin_setting_variables`] under the setting `in_use`.
+fn plugin_variables_under(in_use: Option<&InUse>, own: Option<&str>) -> Vec<PluginVariable> {
+    match in_use {
         Some(InUse::Setting(setting)) => setting_variables(setting),
-        None | Some(InUse::Unreadable) => Vec::new(),
+        None => Vec::new(),
+        Some(InUse::Unreadable) => {
+            let Some(own) = own.map(str::trim).filter(|u| !u.is_empty()) else {
+                return Vec::new();
+            };
+            setting_variables(&ProxySetting {
+                url: Some(own.to_owned()),
+                no_proxy: Vec::new(),
+            })
+        }
     }
 }
 
@@ -622,7 +655,107 @@ impl std::fmt::Debug for ProxyTarget {
 /// A connector reaching every destination through a proxy ([`ProxyTarget::tunnel`]).
 pub(crate) enum ProxyConnector<C> {
     Connect(Tunnel<C>),
-    Socks(SocksV5<C>),
+    Socks(SocksConnector<C>),
+}
+
+/// A SOCKS5 tunnel. For `socks5://` the destination's name is resolved here, without blocking
+/// an async worker, and the proxy is given the address.
+#[derive(Clone)]
+pub(crate) struct SocksConnector<C> {
+    socks: SocksV5<C>,
+    resolution: SocksResolution,
+}
+
+/// The API server's name could not be resolved for a `socks5://` proxy, which is given an
+/// address. Says nothing of the proxy.
+#[derive(Debug, thiserror::Error)]
+#[error("the API server's name can't be resolved")]
+pub(crate) struct UnresolvedName;
+
+/// Why a SOCKS5 tunnel was not opened: `E` is the SOCKS connector's own error.
+#[derive(Debug)]
+pub(crate) enum SocksConnectError<E> {
+    /// `socks5://` could not resolve the destination's name.
+    Unresolved(UnresolvedName),
+    Socks(E),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for SocksConnectError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SocksConnectError::Unresolved(e) => e.fmt(f),
+            SocksConnectError::Socks(e) => e.fmt(f),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for SocksConnectError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SocksConnectError::Unresolved(e) => Some(e),
+            SocksConnectError::Socks(e) => Some(e),
+        }
+    }
+}
+
+/// The error of the SOCKS5 connector over `C`.
+type SocksErrorOf<C> = <SocksV5<C> as tower::Service<Uri>>::Error;
+
+/// `dst` with its host replaced by the first address its name resolves to, looked up without
+/// blocking the async worker. An address is kept as it is.
+async fn resolved(dst: Uri) -> Result<Uri, UnresolvedName> {
+    let host = dst.host().ok_or(UnresolvedName)?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(dst);
+    }
+    let port = dst.port_u16().unwrap_or(443);
+    let address = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| UnresolvedName)?
+        .next()
+        .ok_or(UnresolvedName)?;
+    let mut parts = dst.into_parts();
+    parts.authority = Some(address.to_string().parse().map_err(|_| UnresolvedName)?);
+    Uri::from_parts(parts).map_err(|_| UnresolvedName)
+}
+
+impl<C> tower::Service<Uri> for SocksConnector<C>
+where
+    C: tower::Service<Uri> + Clone + Send + 'static,
+    C::Future: Send + 'static,
+    C::Response: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    C::Error: Send + 'static,
+{
+    type Response = C::Response;
+    type Error = SocksConnectError<SocksErrorOf<C>>;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.socks.poll_ready(cx).map_err(SocksConnectError::Socks)
+    }
+
+    fn call(&mut self, dst: Uri) -> Self::Future {
+        if self.resolution == SocksResolution::Proxy {
+            let connecting = self.socks.call(dst);
+            return Box::pin(async move { connecting.await.map_err(SocksConnectError::Socks) });
+        }
+        // The connector made ready goes with the call; a clone stays for the next one.
+        let clone = self.socks.clone();
+        let mut socks = std::mem::replace(&mut self.socks, clone);
+        Box::pin(async move {
+            let dst = resolved(dst).await.map_err(SocksConnectError::Unresolved)?;
+            socks.call(dst).await.map_err(SocksConnectError::Socks)
+        })
+    }
 }
 
 impl ProxyTarget {
@@ -708,11 +841,16 @@ impl ProxyTarget {
                 resolution,
                 account,
             } => {
-                let socks = SocksV5::new(self.uri.clone(), connector)
-                    .local_dns(*resolution == SocksResolution::Local);
-                ProxyConnector::Socks(match account {
+                // For `socks5://`, `SocksConnector` resolves the name first, so the proxy is
+                // given an address; for `socks5h://`, the name.
+                let socks = SocksV5::new(self.uri.clone(), connector);
+                let socks = match account {
                     Some((user, password)) => socks.with_auth(user.clone(), password.clone()),
                     None => socks,
+                };
+                ProxyConnector::Socks(SocksConnector {
+                    socks,
+                    resolution: *resolution,
                 })
             }
         }

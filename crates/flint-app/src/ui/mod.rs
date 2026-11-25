@@ -77,6 +77,7 @@ mod terminal_model;
 mod terminal_palette;
 mod terminal_view;
 mod theme;
+mod tooltip_text;
 mod ui_state;
 #[cfg(any(test, feature = "automation"))]
 mod view_state;

@@ -7,6 +7,8 @@ use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
+use super::tooltip_text::{SHOW_DELAY, cap_width};
+
 /// The most lines a notice or a caption wraps to: enough for a server's sentence in a narrow
 /// pane. A longer message ends in an ellipsis, and its tooltip still has all of it.
 const MAX_NOTICE_LINES: usize = 6;
@@ -100,7 +102,8 @@ pub fn notice(
     strip(id, color, ONE_LINE_HEIGHT)
         .text_color(color)
         .child(clamped(div()).child(text))
-        .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+        .tooltip(move |window, cx| cap_width(Tooltip::new(full.clone())).build(window, cx))
+        .tooltip_show_delay(SHOW_DELAY)
 }
 
 /// A [`notice`] with a control at its end (a Reconnect or Restart button).
@@ -118,7 +121,8 @@ pub fn notice_with(
             clamped(div().flex_1().min_w_0())
                 .child(text)
                 .id("notice-text")
-                .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx)),
+                .tooltip(move |window, cx| cap_width(Tooltip::new(full.clone())).build(window, cx))
+                .tooltip_show_delay(SHOW_DELAY),
             control,
         ))
 }
