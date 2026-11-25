@@ -195,8 +195,16 @@ fn without_server_owned(object: &Value) -> Value {
 
 /// The paths that differ between any state in `seen` and `latest` and that `yaml` would set to
 /// something other than `latest`, sorted. Text that does not parse has none: its review fails.
-/// `status` counts only when the text sets it: otherwise the write keeps the cluster's.
-fn competing_changes(seen: &[Value], latest: &Value, yaml: &str) -> Vec<String> {
+/// `status` counts only when the text sets it: otherwise the write keeps the cluster's. Then it
+/// is the status the review's dry run wrote (`reviewed_after`, the review's after text), which an
+/// admission webhook may have changed from the typed one: the cluster's if the review did not
+/// show one.
+fn competing_changes(
+    seen: &[Value],
+    latest: &Value,
+    yaml: &str,
+    reviewed_after: Option<&str>,
+) -> Vec<String> {
     let Ok(mut edited) = serde_saphyr::from_str::<Value>(yaml) else {
         return Vec::new();
     };
@@ -208,6 +216,16 @@ fn competing_changes(seen: &[Value], latest: &Value, yaml: &str) -> Vec<String> 
         );
     }
     let sets_status = edited.get("status").is_some();
+    if sets_status && let Some(fields) = edited.as_object_mut() {
+        let written = reviewed_after
+            .and_then(|after| serde_saphyr::from_str::<Value>(after).ok())
+            .and_then(|mut after| after.get_mut("status").map(Value::take))
+            .or_else(|| latest.get("status").cloned());
+        match written {
+            Some(status) => fields.insert("status".to_owned(), status),
+            None => fields.remove("status"),
+        };
+    }
     let compared = |object: &Value| {
         let mut kept = without_server_owned(object);
         if let Some(fields) = kept.as_object_mut().filter(|_| !sets_status) {
@@ -701,8 +719,9 @@ impl DetailView {
             let compare = compare.filter(|_| result.is_ok());
             let (patch, competing) = cx
                 .background_spawn(async move {
+                    let after = shown.as_ref().map(|(_, after)| after.as_str());
                     let competing = compare.map_or_else(Vec::new, |(seen, latest, yaml)| {
-                        competing_changes(&seen, &latest.object, &yaml)
+                        competing_changes(&seen, &latest.object, &yaml, after)
                     });
                     let patch = shown.and_then(|(before, after)| patch(&name, &before, &after));
                     (patch, competing)
@@ -984,7 +1003,7 @@ mod tests {
         latest: &serde_json::Value,
         yaml: &str,
     ) -> Vec<String> {
-        super::competing_changes(&[without_server_owned(base)], latest, yaml)
+        super::competing_changes(&[without_server_owned(base)], latest, yaml, None)
     }
 
     // covers UP-51: the editor opens without status or managedFields, at its version.
@@ -1161,6 +1180,13 @@ mod tests {
         let typed = yaml(&at(9));
         assert_eq!(competing_changes(&at(1), &at(5), &typed), ["status.ready"]);
         assert!(competing_changes(&at(1), &at(1), &typed).is_empty());
+        // The text keeps the cluster's 5, and a webhook writes 0: 5 is still overwritten.
+        let seen = [without_server_owned(&at(1))];
+        let written = yaml(&at(0));
+        assert_eq!(
+            super::competing_changes(&seen, &at(5), &yaml(&at(5)), Some(&written)),
+            ["status.ready"]
+        );
     }
 
     #[test]
@@ -1191,10 +1217,10 @@ mod tests {
         let at = |n: u32| json!({"metadata": {"name": "a"}, "spec": {"replicas": n}});
         let seen = [without_server_owned(&at(1)), without_server_owned(&at(5))];
         assert_eq!(
-            super::competing_changes(&seen, &at(1), &yaml(&at(5))),
+            super::competing_changes(&seen, &at(1), &yaml(&at(5)), None),
             ["spec.replicas"]
         );
-        assert!(super::competing_changes(&seen, &at(1), &yaml(&at(1))).is_empty());
+        assert!(super::competing_changes(&seen, &at(1), &yaml(&at(1)), None).is_empty());
     }
 
     fn init(names: &[&str]) -> serde_json::Value {
