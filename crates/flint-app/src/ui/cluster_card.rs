@@ -15,7 +15,7 @@ use flint_core::KindId;
 use flint_core::dashboard::{ProblemCategory, ProblemCounts};
 use flint_core::metrics_trend::{TrendResource, TrendScope};
 use flint_core::settings::ClusterTag;
-use flint_core::telemetry::{Availability, ClusterTelemetry};
+use flint_core::telemetry::{Availability, ClusterTelemetry, MetricsCheck};
 use flint_core::thresholds::{ThresholdLevel, ThresholdMetric, Thresholds};
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{Theme, h_flex, v_flex};
@@ -27,7 +27,9 @@ use super::super::cluster_tag::tag_dot;
 use super::super::registry;
 use super::feed::{FeedId, ProblemLists, read};
 use super::sparkline::sparkline;
-use super::{DashboardStatus, MetricTile, MetricsPanel, ProblemTile, category_name};
+use super::{
+    DashboardStatus, METRICS_WAITING, MetricTile, MetricsPanel, ProblemTile, category_name,
+};
 
 /// The width of a card.
 const CARD_WIDTH: f32 = 300.;
@@ -93,7 +95,7 @@ impl CardState {
         match self {
             Self::Live => None,
             Self::Partial(why) | Self::Unavailable(why) | Self::Blocked(why) => Some(why.clone()),
-            Self::Waiting => Some("Waiting for the first metrics.".to_owned()),
+            Self::Waiting => Some(METRICS_WAITING.to_owned()),
         }
     }
 }
@@ -132,6 +134,7 @@ pub struct ClusterCard {
     pub level: ThresholdLevel,
     pub cpu: Option<CardMetric>,
     pub memory: Option<CardMetric>,
+    pub(super) metrics_notice: Option<String>,
     /// The kinds its short-workloads count opens. Empty while they cannot be told apart.
     pub short_kinds: Vec<&'static str>,
     /// The feed these values came from: a click is refused once another is running.
@@ -139,10 +142,18 @@ pub struct ClusterCard {
 }
 
 impl ClusterCard {
+    pub(super) fn note(&self) -> Option<String> {
+        match (self.state.note(), &self.metrics_notice) {
+            (Some(state), Some(metrics)) => Some(format!("{state} {metrics}")),
+            (None, Some(metrics)) => Some(metrics.clone()),
+            (state, None) => state,
+        }
+    }
+
     /// The card in one line, for accessibility and tests.
     pub fn description(&self) -> String {
         let counts: Vec<String> = self.tiles.iter().map(ProblemTile::description).collect();
-        match self.state.note() {
+        match self.note() {
             Some(note) => format!("{}: {note} {}", self.shown, counts.join(", ")),
             None => format!("{}: {}", self.shown, counts.join(", ")),
         }
@@ -159,6 +170,7 @@ impl ClusterCard {
         self.level = ThresholdLevel::Unknown;
         self.cpu = None;
         self.memory = None;
+        self.metrics_notice = None;
         self.short_kinds.clear();
         self.feed = None;
     }
@@ -199,7 +211,7 @@ fn used_percent(telemetry: &ClusterTelemetry, resource: TrendResource) -> Option
 
 fn card_metric(
     telemetry: &ClusterTelemetry,
-    tile: &MetricTile,
+    tile: MetricTile,
     resource: TrendResource,
     metric: ThresholdMetric,
     thresholds: &Thresholds,
@@ -210,7 +222,7 @@ fn card_metric(
         .as_ref()
         .and_then(|_| used_percent(telemetry, resource));
     CardMetric {
-        tile: tile.clone(),
+        tile,
         level: thresholds.evaluate(metric, percent),
     }
 }
@@ -272,24 +284,47 @@ pub(in crate::ui) fn card(member: ClusterRead, now: Timestamp) -> ClusterCard {
             .find(|tile| tile.category == category)
             .and_then(|tile| tile.count)
     });
-    let (cpu, memory) = match (usable, &model.metrics) {
-        (Some(telemetry), MetricsPanel::Tiles { cpu, memory, .. }) => (
-            Some(card_metric(
-                telemetry,
+    let (cpu, memory, metrics_notice) = match (usable, model.metrics) {
+        (None, _) => (None, None, None),
+        (Some(_), MetricsPanel::Waiting) => (None, None, Some(METRICS_WAITING.to_owned())),
+        (Some(_), MetricsPanel::NotInstalled) => {
+            (None, None, Some("No metrics-server installed.".to_owned()))
+        }
+        (
+            Some(telemetry),
+            MetricsPanel::Tiles {
                 cpu,
-                TrendResource::Cpu,
-                ThresholdMetric::CpuPercent,
-                &member.thresholds,
-            )),
-            Some(card_metric(
-                telemetry,
                 memory,
-                TrendResource::Memory,
-                ThresholdMetric::MemoryPercent,
-                &member.thresholds,
-            )),
-        ),
-        _ => (None, None),
+                notice,
+            },
+        ) => {
+            let notice = notice.or_else(|| {
+                (cpu.value.is_none() || memory.value.is_none()).then(|| {
+                    match telemetry.snapshot.metrics {
+                        MetricsCheck::Current { nodes: 0 } => "No node metrics were returned.",
+                        _ => "Waiting for fresh metrics from all nodes.",
+                    }
+                    .to_owned()
+                })
+            });
+            (
+                Some(card_metric(
+                    telemetry,
+                    cpu,
+                    TrendResource::Cpu,
+                    ThresholdMetric::CpuPercent,
+                    &member.thresholds,
+                )),
+                Some(card_metric(
+                    telemetry,
+                    memory,
+                    TrendResource::Memory,
+                    ThresholdMetric::MemoryPercent,
+                    &member.thresholds,
+                )),
+                notice,
+            )
+        }
     };
     let level = [cpu.as_ref(), memory.as_ref()]
         .into_iter()
@@ -312,6 +347,7 @@ pub(in crate::ui) fn card(member: ClusterRead, now: Timestamp) -> ClusterCard {
         level,
         cpu,
         memory,
+        metrics_notice,
     }
 }
 
@@ -478,7 +514,7 @@ pub(in crate::ui) fn render_card(
             _ => theme.border,
         })
         .child(header)
-        .when_some(card.state.note(), |el, note| {
+        .when_some(card.note(), |el, note| {
             el.child(
                 div()
                     .id(SharedString::from(format!("set-card-note-{cluster}")))

@@ -16,7 +16,7 @@ use flint_core::activity::is_invisible;
 use flint_core::dashboard::{
     ProblemCategory, WARNING_EVENT_WINDOW, count_pending_claims, count_recent_warnings,
 };
-use flint_core::metrics::MetricsError;
+use flint_core::metrics::{MetricsError, POLL_INTERVAL};
 use flint_core::metrics_trend::{TrendResource, TrendScope, TrendStore};
 use flint_core::rollout::{COMPLETE_WINDOW, Rollout, RolloutState};
 use flint_core::telemetry::{
@@ -568,7 +568,12 @@ fn metrics(input: &DashboardInput<'_>) -> MetricsPanel {
         MetricTile {
             label,
             value,
-            shape: Arc::new(SparklineShape::new(&samples)),
+            shape: Arc::new(SparklineShape::new(
+                samples,
+                input.now,
+                POLL_INTERVAL,
+                format,
+            )),
         }
     };
     MetricsPanel::Tiles {

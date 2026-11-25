@@ -15,7 +15,7 @@ use flint_core::{
     ServerVersion, SyncState,
 };
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
-use gpui_kit::{AppContext as _, TestAppContext};
+use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, Modifiers, TestAppContext};
 use serde_json::{Value, json};
 
 use super::super::Workspace;
@@ -23,15 +23,16 @@ use super::super::actions::resource_actions_tests::LocalApi;
 use super::super::unapplied_tests::{answered, asked, has_edit, type_edit};
 use super::{
     ClusterSet, CombinedListEvent, PendingOpen, SettingsDir, click_chooses, member_refusal,
-    rename_problem,
+    rename_problem, sidebar_set_members,
 };
+use crate::ui::clusters::ClustersModel;
 use crate::ui::confirm;
 use crate::ui::fleet_plan::FleetChoice;
 use crate::ui::fleet_view;
 use crate::ui::list::combined::row_id;
 use crate::ui::resource_actions::{ResourceAction, available, request, target_of};
 use crate::ui::support_tests::{
-    CURRENT_GENERATION, TestWorkspace, WAIT, discovery, kubeconfig_yaml, objects,
+    CURRENT_GENERATION, TestWorkspace, WAIT, discovery, kubeconfig_yaml, objects, open_window_over,
     open_workspace_with, standard_sections,
 };
 
@@ -56,6 +57,32 @@ async fn open_quiet_workspace(cx: &mut TestAppContext, dir: &std::path::Path) ->
         vec![path]
     })
     .await
+}
+
+const SIDEBAR_CONTEXTS: [(&str, &str); 3] = [
+    ("kind-alpha", "https://alpha.invalid"),
+    ("kind-beta", "https://beta.invalid"),
+    ("kind-gamma", "https://gamma.invalid"),
+];
+
+// These contexts can join a set but won't connect without background sign-in consent.
+async fn open_sidebar_workspace(
+    cx: &mut TestAppContext,
+    dir: &std::path::Path,
+) -> (AnyWindowHandle, Entity<Workspace>, Entity<ClustersModel>) {
+    cx.executor().allow_parking();
+    let path = dir.join("kubeconfig");
+    let yaml = kubeconfig_yaml(&SIDEBAR_CONTEXTS).replace(
+        "user: {token: t}",
+        "user:\n    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      \
+         command: /usr/bin/false\n      interactiveMode: Never",
+    );
+    std::fs::write(&path, yaml).unwrap();
+    let (window, workspace, model) = open_window_over(cx, dir, vec![path]);
+    let loaded = model.clone();
+    cx.wait_for(window, WAIT, move |_, cx| loaded.read(cx).loaded)
+        .await;
+    (window, workspace, model)
 }
 
 fn pick(cx: &mut TestAppContext, t: &TestWorkspace, cluster: &str) {
@@ -1592,6 +1619,74 @@ async fn a_member_back_after_the_view_looked_joins(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+async fn sidebar_marks_and_counts_current_set_members(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (window, workspace, _) = open_sidebar_workspace(cx, dir.path()).await;
+    workspace.update(cx, |ws, cx| {
+        let members = SIDEBAR_CONTEXTS[..2]
+            .iter()
+            .map(|&(name, server)| ClusterPin::new(name, server))
+            .collect();
+        ws.sets
+            .saved
+            .push(ClusterSet::new("saved", members).unwrap());
+        assert!(sidebar_set_members(ws.sets.running.as_ref()).is_none());
+        cx.notify();
+    });
+    let assert_sidebar = |cx: &mut TestAppContext, alpha, beta, count| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.try_find("cluster-set-mark-kind-alpha").is_some(),
+                alpha
+            );
+            assert_eq!(
+                window.try_find("cluster-set-mark-kind-beta").is_some(),
+                beta
+            );
+            assert!(window.try_find("cluster-set-mark-kind-gamma").is_none());
+            assert_eq!(window.find("open-set-saved").label(), Some(count));
+        })
+        .unwrap();
+    };
+    assert_sidebar(cx, false, false, "saved (2)");
+    cx.update_window(window, |_, window, cx| window.click("open-set-saved", cx))
+        .unwrap();
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("cluster-set-view").is_some()
+    })
+    .await;
+    assert_sidebar(cx, true, true, "saved (2)");
+
+    workspace.update(cx, |ws, cx| {
+        ws.discard_member("kind-beta", "kind-beta changed".into(), cx);
+        assert_eq!(
+            sidebar_set_members(ws.sets.running.as_ref()).unwrap(),
+            ["kind-alpha"]
+        );
+    });
+    assert_sidebar(cx, true, false, "saved (1)");
+
+    cx.update_window(window, |_, window, cx| {
+        window.click("close-cluster-set", cx);
+        workspace.update(cx, |ws, cx| {
+            ws.sets.picking = true;
+            ws.sets.picked = ws.sets.saved[0].members.clone();
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.click("open-picked-clusters", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, WAIT, |window, _| {
+        window
+            .try_find("open-unsaved-set")
+            .is_some_and(|entry| entry.label() == Some("Open set (2)"))
+    })
+    .await;
+}
+
+#[gpui_kit::test]
 async fn an_unsaved_set_is_titled_by_the_members_admitted(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let set = saved_set(cx, dir.path(), &THREE).await;
@@ -1715,6 +1810,68 @@ async fn a_cmd_click_chooses_and_a_plain_click_does_not(cx: &mut TestAppContext)
     assert_eq!(picked.len(), 1);
     assert_eq!(picked[0].context, "kind-beta");
     assert!(!t.server_was_contacted(), "choosing connects to nothing");
+}
+
+#[gpui_kit::test]
+async fn cmd_click_seeds_the_active_cluster(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (window, workspace, model) = open_sidebar_workspace(cx, dir.path()).await;
+    model.update(cx, |model, cx| {
+        model.feed(Event::ActiveChanged(Some("kind-beta".into())), cx)
+    });
+    let cmd_click = |cx: &mut TestAppContext, row| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click_with_modifiers(row, Modifiers::secondary_key(cx), cx);
+        })
+        .unwrap();
+    };
+    let toggle_picking = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            window.click("toggle-cluster-picking", cx)
+        })
+        .unwrap();
+    };
+    let picked = |cx: &mut TestAppContext| {
+        workspace.read_with(cx, |ws, _| {
+            assert!(ws.sets.picking());
+            assert!(!ws.sets.is_open());
+            ws.sets
+                .picked
+                .iter()
+                .map(|pin| pin.context.clone())
+                .collect::<Vec<_>>()
+        })
+    };
+
+    cmd_click(cx, "cluster-kind-alpha");
+    assert_eq!(picked(cx), ["kind-beta", "kind-alpha"]);
+    cx.update_window(window, |_, window, _| {
+        assert_ne!(window.find("open-picked-clusters").disabled(), Some(true));
+    })
+    .unwrap();
+
+    toggle_picking(cx);
+    cmd_click(cx, "cluster-kind-beta");
+    assert_eq!(picked(cx), ["kind-beta"]);
+
+    toggle_picking(cx);
+    toggle_picking(cx);
+    cmd_click(cx, "cluster-kind-alpha");
+    assert_eq!(picked(cx), ["kind-alpha"]);
+
+    toggle_picking(cx);
+    model.update(cx, |model, cx| {
+        let active = model
+            .clusters
+            .iter_mut()
+            .find(|c| c.info.name == "kind-beta")
+            .unwrap();
+        active.info.server = None;
+        cx.notify();
+    });
+    cmd_click(cx, "cluster-kind-alpha");
+    assert_eq!(picked(cx), ["kind-alpha"]);
 }
 
 #[test]
