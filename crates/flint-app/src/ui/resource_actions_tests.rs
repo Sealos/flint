@@ -1691,3 +1691,37 @@ async fn a_yaml_edit_and_a_row_action_cannot_overlap(cx: &mut TestAppContext) {
     );
     cx.update(|cx| release(&web_key(), cx));
 }
+
+// covers UP-53: a review that comes back once its row is no longer selected opens no
+// confirmation: nothing would watch its object while it stayed open.
+#[gpui_kit::test]
+async fn a_review_of_a_row_no_longer_selected_is_not_opened(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let api = LocalApi::start(&[]);
+    let t = connected(cx, dir.path(), &api).await;
+    open_deployments(cx, &t).await;
+    select_loaded(cx, &t, "web").await;
+    let workspace = t.workspace.clone();
+    cx.update_window(t.window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| {
+            request(ws, ResourceAction::RolloutRestart, window, cx);
+            ws.close_detail(window, cx);
+        })
+    })
+    .unwrap();
+    let ws = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        ws.read(cx).action_error().is_some()
+    })
+    .await;
+    draw(cx, &t);
+    assert!(!t.has_dialog(cx));
+    let why = t
+        .workspace
+        .read_with(cx, |ws, _| ws.action_error().map(str::to_owned));
+    assert_eq!(
+        why.as_deref(),
+        Some("web is no longer selected, so its review was not opened. Nothing was applied.")
+    );
+    assert_eq!(api.patches(), 0);
+}

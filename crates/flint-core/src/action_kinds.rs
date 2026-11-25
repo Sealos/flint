@@ -84,11 +84,15 @@ fn count_at(object: &Value, pointer: &str) -> Option<u32> {
 
 /// `.spec.a.b` as `/spec/a/b`, if it is a plain field path whose first field is `root`. A field
 /// name is taken literally, with `~` and `/` escaped for the pointer; array indexes, quoting,
-/// wildcards and filters are not plain.
+/// wildcards and filters are not plain. Nor is a field a JSON Pointer could take for an array
+/// index (`0`, `-`): Kubernetes reads every field as an object key, and a pointer through an
+/// array would read and write another field than the one it names.
 fn pointer(path: &str, root: &str) -> Option<String> {
     let fields: Vec<&str> = path.strip_prefix('.')?.split('.').collect();
     let plain = |field: &&str| {
         !field.is_empty()
+            && *field != "-"
+            && !field.chars().all(|c| c.is_ascii_digit())
             && !field
                 .chars()
                 .any(|c| c.is_whitespace() || c.is_control() || "[]'\"*@$()?,:\\{}".contains(c))
@@ -129,8 +133,17 @@ impl KindInfo {
     }
 }
 
-/// How many definitions are read at once.
-const DEFINITIONS_AT_ONCE: usize = 8;
+/// How many definitions are read at once: enough that a few stalled reads hold up none of the
+/// others behind them.
+const DEFINITIONS_AT_ONCE: usize = 64;
+
+/// How long discovery waits for definitions in all. A definition not read by then leaves its kind
+/// without Scale; the kinds themselves are not held up longer than this.
+pub(crate) const SCALE_PATHS_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// How long one read of a definition may take during discovery, so a failure that may pass
+/// still leaves time to read it again within [`SCALE_PATHS_TIMEOUT`].
+const DEFINITION_READ_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// How many times a definition is read when the reads fail for a reason that may pass.
 const DEFINITION_TRIES: u32 = 3;
@@ -166,6 +179,7 @@ pub(crate) async fn read_scale_paths(client: &Client, kinds: &mut [KindInfo], li
         .collect();
     let mut found = futures::stream::iter(reads)
         .map(|(index, resource)| async move {
+            let limit = limit.min(DEFINITION_READ_TIMEOUT);
             let paths = definition_scale_paths_retried(client, &resource, limit).await;
             if paths.is_none() {
                 tracing::debug!(
@@ -315,6 +329,10 @@ mod tests {
             (".spec.*", ".status.n"),
             (".spec.a b", ".status.n"),
             (".spec.a:b", ".status.n"),
+            // A pointer would take these for array indexes.
+            (".spec.pools.0.size", ".status.n"),
+            (".spec.pools.-.size", ".status.n"),
+            (".spec.size", ".status.0"),
             (".spec.size", ".spec.n"),
             (".spec.size", ""),
         ] {

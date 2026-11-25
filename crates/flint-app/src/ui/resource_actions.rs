@@ -483,11 +483,15 @@ fn start_review(
     let review = request
         .core
         .review_write(request.target.clone(), request.proposal.clone());
+    // A copy fetched after this may already show a change the review's read missed.
+    let asked = jiff::Timestamp::now();
     let handle = window.window_handle();
     let task = cx.spawn(async move |this, cx| {
         let result = review.await;
         let _ = cx.update_window(handle, |_, window, cx| {
-            let _ = this.update(cx, |ws, cx| reviewed(ws, request, note, result, window, cx));
+            let _ = this.update(cx, |ws, cx| {
+                reviewed(ws, request, note, asked, result, window, cx)
+            });
         });
     });
     ws.set_write_review(task);
@@ -497,6 +501,7 @@ fn reviewed(
     ws: &mut Workspace,
     request: Request,
     note: Option<String>,
+    asked: jiff::Timestamp,
     result: Result<WriteReview, WriteError>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
@@ -506,8 +511,17 @@ fn reviewed(
         ws.refuse_held(connection_changed_text(), cx);
         return;
     }
+    // Nor one of a row no longer selected: nothing would watch its object while it is open.
+    if !still_shown(ws, &request.target, cx) {
+        let why = format!(
+            "{} is no longer selected, so its review was not opened. Nothing was applied.",
+            request.target.name
+        );
+        ws.refuse(why, cx);
+        return;
+    }
     match result {
-        Ok(review) => confirm_review(ws, request, review, note, window, cx),
+        Ok(review) => confirm_review(ws, request, review, note, asked, window, cx),
         // Another object has the name now: this review is of that one, and says so.
         Err(WriteError::Replaced) if request.target.uid.is_some() => {
             let note = replaced_note(&request.target.name);
@@ -534,11 +548,24 @@ pub(in crate::ui) fn error_text(error: &WriteError) -> String {
     }
 }
 
+/// Whether the detail pane still shows `target`, by key and, when it names one, uid.
+fn still_shown(ws: &Workspace, target: &WriteTarget, cx: &App) -> bool {
+    ws.detail_view().is_some_and(|detail| {
+        let detail = detail.read(cx);
+        shown_key(detail) == WriteKey::of(target)
+            && target
+                .uid
+                .as_deref()
+                .is_none_or(|uid| uid == &*detail.object().uid)
+    })
+}
+
 fn confirm_review(
     ws: &mut Workspace,
     request: Request,
     review: WriteReview,
     note: Option<String>,
+    asked: jiff::Timestamp,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -548,7 +575,7 @@ fn confirm_review(
     let this = cx.weak_entity();
     let handle = window.window_handle();
     let key = WriteKey::of(&request.target);
-    let object = ReviewedObject::of(ws, &review, cx).guard(this.clone());
+    let object = ReviewedObject::of(ws, &review, asked, cx).guard(this.clone());
     // A fetch running now began before the review and cannot speak for it: fetch once more.
     if let Some(detail) = ws.detail_view() {
         detail.update(cx, |detail, _| detail.fetch_again_after_running());
@@ -611,10 +638,12 @@ fn confirm_review(
             });
         },
     );
+    // A copy fetched while the review ran may show a change already: nothing else would ask.
+    ws.close_changed_confirmations(window, cx);
 }
 
-/// What a confirmation saw of its object when its review came back. A copy this window fetches
-/// after that and shows another object, or for a scale another count, closes the confirmation:
+/// What a confirmation saw of its object when its review was asked for. A copy this window
+/// fetches after that and shows another object, or for a scale another count, closes the confirmation:
 /// a second one left open does not run after the first changed the object. The write checks the
 /// uid and the count again on the server whatever this says.
 #[derive(Clone)]
@@ -635,7 +664,8 @@ struct ReviewedObject {
 }
 
 impl ReviewedObject {
-    fn of(ws: &Workspace, review: &WriteReview, cx: &App) -> Self {
+    /// `asked`: when the review was asked for. A copy fetched since may be newer than its read.
+    fn of(ws: &Workspace, review: &WriteReview, asked: jiff::Timestamp, cx: &App) -> Self {
         let target = review.target();
         let (count, restarted_at) = match review.action() {
             WriteAction::Resource(action) => {
@@ -664,7 +694,7 @@ impl ReviewedObject {
             name: target.name.clone(),
             uid: target.uid.clone(),
             count,
-            at: jiff::Timestamp::now(),
+            at: asked,
             restarted_at,
             watched,
         }
@@ -683,7 +713,7 @@ impl ReviewedObject {
         if shown_key(detail) != self.key || detail.is_gone() {
             return changed();
         }
-        // A copy from before the review says nothing about what changed since.
+        // A copy from before the review was asked for says nothing about what changed since.
         let object = detail.fetched_since(self.at)?;
         let uid = object
             .pointer("/metadata/uid")

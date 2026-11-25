@@ -186,9 +186,11 @@ async fn discover_kinds_within(
     let mut found = tokio::time::timeout(overall, discover)
         .await
         .unwrap_or_else(|_| Err(ClusterError::timeout(overall, None)))?;
-    // Bounded on its own: a slow definition leaves its kind without Scale, never fails discovery.
+    // Bounded on its own, and shorter than a request: a slow definition leaves its kind without
+    // Scale, never fails discovery, and holds up the kinds only briefly.
     let scale = action_kinds::read_scale_paths(client, &mut found.kinds, per_request);
-    if tokio::time::timeout(per_request, scale).await.is_err() {
+    let bound = per_request.min(action_kinds::SCALE_PATHS_TIMEOUT);
+    if tokio::time::timeout(bound, scale).await.is_err() {
         tracing::debug!("reading scale paths timed out; those kinds have no Scale");
     }
     // Put the core group first, then sort by group and kind.

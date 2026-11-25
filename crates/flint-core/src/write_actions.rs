@@ -113,6 +113,12 @@ pub(crate) fn review(
             let Some(paths) = scale.filter(|_| kind.scale_paths().is_some()) else {
                 return refuse("scaled");
             };
+            // The API's count is an `int32`: a larger one would be stored as another.
+            if i32::try_from(to).is_err() {
+                return Err(WriteError::Rejected(format!(
+                    "{to} replicas is more than Kubernetes can keep"
+                )));
+            }
             // Where its `scale` subresource reads it: what the write tests.
             let from = paths
                 .replicas(live)
@@ -1601,6 +1607,11 @@ mod tests {
             review(&deployments, &live, WriteProposal::Scale { to: 5 }),
             Ok(ResourceChange::Scale { from: 2, to: 5 })
         );
+        let too_many = i32::MAX as u32 + 1;
+        assert!(matches!(
+            review(&deployments, &live, WriteProposal::Scale { to: too_many }),
+            Err(WriteError::Rejected(_))
+        ));
         assert!(matches!(
             review(
                 &deployments,
