@@ -248,7 +248,7 @@ fn open_dialog(
         };
         #[cfg(feature = "automation")]
         let alert = alert.entrance(gpui_kit::component::dialog::DialogEntrance::None);
-        alert
+        modal(alert)
             .confirm()
             .title(dialog.title.clone())
             .description(
@@ -370,7 +370,7 @@ pub fn open_with_alternative(
         let (live_ok, live_cancel, live_alternative) = (live.clone(), live.clone(), live.clone());
         #[cfg(feature = "automation")]
         let alert = alert.entrance(gpui_kit::component::dialog::DialogEntrance::None);
-        alert
+        modal(alert)
             .confirm()
             .title(dialog.title.clone())
             .description(
@@ -769,6 +769,14 @@ pub fn title_name(name: &str) -> String {
     fit_value("", name, &|shown: &str| {
         shown.chars().count() <= TITLE_NAME_CHARS
     })
+}
+
+/// What every confirmation shares: centred in the window, whatever its height, over the dimmed
+/// content behind it.
+fn modal(
+    alert: gpui_kit::component::dialog::AlertDialog,
+) -> gpui_kit::component::dialog::AlertDialog {
+    alert.centered()
 }
 
 /// The lines that stay on show, each on one line, measured so the text under them takes only the
