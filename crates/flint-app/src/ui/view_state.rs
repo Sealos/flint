@@ -204,8 +204,6 @@ pub struct SetMemberState {
     pub cluster: String,
     /// What the set's bar says is wrong with it (`Changed`, `Failed`, ...).
     pub note: Option<String>,
-    /// Whether its background sign-in is on, when the set bar offers it.
-    pub background_sign_in: Option<bool>,
     pub tag: Option<flint_core::settings::ClusterTag>,
 }
 

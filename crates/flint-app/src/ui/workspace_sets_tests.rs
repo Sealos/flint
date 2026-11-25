@@ -600,8 +600,10 @@ async fn a_member_with_paused_writes_keeps_its_row_and_offers_no_write(cx: &mut 
         cx.run_until_parked();
     };
     set_provisional(true, cx);
-    t.wait_for_label(cx, "set-member-kind-beta", "kind-beta: Writes paused")
-        .await;
+    assert_eq!(
+        member_note(cx, &t, "kind-beta").as_deref(),
+        Some("Writes paused")
+    );
     assert_eq!(detail_cluster(cx, &t).as_deref(), Some("kind-beta"));
     t.workspace.read_with(cx, |ws, cx| {
         let why = available(ws, ResourceAction::Delete, cx).unwrap_err();
@@ -628,8 +630,7 @@ async fn a_member_with_paused_writes_keeps_its_row_and_offers_no_write(cx: &mut 
     });
 
     set_provisional(false, cx);
-    t.wait_for_label(cx, "set-member-kind-beta", "kind-beta")
-        .await;
+    assert_eq!(member_note(cx, &t, "kind-beta"), None);
     t.workspace.read_with(cx, |ws, cx| {
         assert_eq!(ws.writes_paused_why("kind-beta", cx), None);
         assert!(
@@ -662,8 +663,10 @@ async fn a_member_needing_sign_in_is_shown_and_its_row_closes(cx: &mut TestAppCo
     });
     cx.run_until_parked();
     assert_eq!(detail_cluster(cx, &t), None, "no action stays on offer");
-    let label = t.label(cx, "set-member-kind-beta").unwrap();
-    assert!(label.ends_with("Sign-in needed"), "{label}");
+    assert_eq!(
+        member_note(cx, &t, "kind-beta").as_deref(),
+        Some("Sign-in needed")
+    );
 }
 
 #[gpui_kit::test]
@@ -700,8 +703,7 @@ async fn a_member_that_changed_loses_its_rows_and_offers_no_action(cx: &mut Test
     });
     assert_eq!(rows, 0);
     assert!(refused.contains("changed"), "{refused}");
-    let label = t.label(cx, "set-member-kind-beta").unwrap();
-    assert!(label.ends_with("Changed"), "{label}");
+    assert_eq!(member_note(cx, &t, "kind-beta").as_deref(), Some("Changed"));
 }
 
 #[gpui_kit::test]
@@ -916,13 +918,10 @@ fn a_member_is_refused_unless_it_is_the_pinned_confirmed_cluster() {
         paused,
     };
     let current = summary("https://a.example", true);
-    assert_eq!(
-        member_refusal(&pin, Some(&current), None, "prod", false),
-        None
-    );
+    assert_eq!(member_refusal(&pin, Some(&current), None, "prod"), None);
     let live = report(false, MemberStatus::Live);
     assert_eq!(
-        member_refusal(&pin, Some(&current), Some(&live), "prod", false),
+        member_refusal(&pin, Some(&current), Some(&live), "prod"),
         None
     );
     // Unchanged while a file is unreadable: it keeps reading, and only its writes are paused.
@@ -931,7 +930,7 @@ fn a_member_is_refused_unless_it_is_the_pinned_confirmed_cluster() {
         ..current.clone()
     };
     assert_eq!(
-        member_refusal(&pin, Some(&writes_paused), Some(&live), "prod", false),
+        member_refusal(&pin, Some(&writes_paused), Some(&live), "prod"),
         None
     );
     // The summary says so before the next member report does.
@@ -940,7 +939,7 @@ fn a_member_is_refused_unless_it_is_the_pinned_confirmed_cluster() {
         paused: true,
         ..current.clone()
     };
-    let why = member_refusal(&pin, Some(&paused), None, "prod", false).unwrap();
+    let why = member_refusal(&pin, Some(&paused), None, "prod").unwrap();
     assert!(why.contains("paused"), "{why}");
     for (summary, report, says) in [
         (None, None, "no longer"),
@@ -970,19 +969,9 @@ fn a_member_is_refused_unless_it_is_the_pinned_confirmed_cluster() {
             "sign-in",
         ),
     ] {
-        let why = member_refusal(&pin, summary.as_ref(), report.as_ref(), "prod", false).unwrap();
+        let why = member_refusal(&pin, summary.as_ref(), report.as_ref(), "prod").unwrap();
         assert!(why.contains(says), "{why}");
     }
-    // A member whose background sign-in the set bar offers points there, not at the sidebar.
-    let signing = report(
-        false,
-        MemberStatus::SignInNeeded {
-            reason: SafeErrorText::reduced("expired"),
-        },
-    );
-    let why = member_refusal(&pin, Some(&current), Some(&signing), "prod", true).unwrap();
-    assert!(why.contains("background sign-in"), "{why}");
-    assert!(!why.contains("sidebar"), "{why}");
 }
 
 /// Saves `kind-alpha` and `kind-beta` as the set `both`.
@@ -1852,8 +1841,10 @@ async fn a_member_that_returns_is_back_the_next_time_the_set_opens(cx: &mut Test
     set.t.wait_for_element(cx, "cluster-set-view").await;
     cx.run_until_parked();
     assert_eq!(set.members(cx), THREE);
-    let label = set.t.label(cx, "set-member-kind-gamma").unwrap();
-    assert!(!label.contains("left out"), "{label}");
+    assert!(
+        set.t.label(cx, "set-member-kind-gamma").is_none(),
+        "no longer left out"
+    );
     assert_eq!(set.t.settings_toml(), set.settings);
 }
 
@@ -2444,4 +2435,176 @@ async fn return_in_the_name_field_saves(cx: &mut TestAppContext) {
     })
     .await;
     assert_eq!(saved_names(cx, &t), ["pair"]);
+}
+
+/// What the set's state says is wrong with `cluster`, as the automation channel reads it.
+fn member_note(cx: &mut TestAppContext, t: &TestWorkspace, cluster: &str) -> Option<String> {
+    t.workspace.read_with(cx, |ws, cx| {
+        let open = ws.sets_view_state(cx).open.expect("an open set");
+        open.members
+            .into_iter()
+            .find(|m| m.cluster == cluster)
+            .expect("a member")
+            .note
+    })
+}
+
+fn report(cluster: &str, status: MemberStatus, paused: bool) -> MemberReport {
+    MemberReport {
+        cluster: cluster.into(),
+        status,
+        paused,
+    }
+}
+
+fn signed_out(cluster: &str) -> MemberReport {
+    let reason = SafeErrorText::reduced("expired");
+    report(cluster, MemberStatus::SignInNeeded { reason }, false)
+}
+
+fn failed(cluster: &str) -> MemberReport {
+    let error = SafeErrorText::reduced("refused");
+    report(cluster, MemberStatus::Failed { error }, false)
+}
+
+/// The empty-state block's rows as `(cluster, cause line, action label)`.
+fn empty_block(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+) -> Option<Vec<(String, &'static str, Option<&'static str>)>> {
+    t.workspace.read_with(cx, |ws, cx| {
+        let run = ws.sets.running.as_ref()?;
+        Some(
+            ws.set_empty_state(run, cx)?
+                .into_iter()
+                .map(|l| {
+                    (
+                        l.cluster,
+                        l.cause.line(),
+                        l.cause.action().map(|a| a.label()),
+                    )
+                })
+                .collect(),
+        )
+    })
+}
+
+async fn open_with_reports(
+    cx: &mut TestAppContext,
+    dir: &std::path::Path,
+    reports: Vec<MemberReport>,
+) -> TestWorkspace {
+    let t = open_quiet_workspace(cx, dir).await;
+    connect(cx, &t, "kind-alpha");
+    connect(cx, &t, "kind-beta");
+    open_both(cx, &t).await;
+    t.workspace
+        .update(cx, |ws, cx| ws.set_member_reports(reports, cx));
+    cx.run_until_parked();
+    t
+}
+
+#[gpui_kit::test]
+async fn no_member_signed_in_shows_one_row_each_instead_of_the_list(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_reports(
+        cx,
+        dir.path(),
+        vec![signed_out("kind-alpha"), signed_out("kind-beta")],
+    )
+    .await;
+    assert_eq!(
+        empty_block(cx, &t).unwrap(),
+        [
+            ("kind-alpha".into(), "Sign-in needed", Some("Sign in")),
+            ("kind-beta".into(), "Sign-in needed", Some("Sign in")),
+        ]
+    );
+    t.wait_for_element(cx, "set-members-empty").await;
+    assert_eq!(
+        t.label(cx, "set-member-empty-kind-alpha").as_deref(),
+        Some("kind-alpha: Sign-in needed")
+    );
+    assert!(t.label(cx, "set-member-action-kind-beta").is_some());
+    // The chips, the empty table and the footer are gone with the list.
+    assert!(t.find(cx, "combined-members").is_none());
+    assert!(t.find(cx, "combined-kind-note").is_none());
+    // No consent toggle, no command, no per-member header chip.
+    assert!(t.find(cx, "background-sign-in-row-kind-alpha").is_none());
+    assert!(t.find(cx, "set-member-kind-alpha").is_none());
+}
+
+#[gpui_kit::test]
+async fn paused_members_keep_the_rows_their_watches_still_supply(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let paused = |c: &str| report(c, MemberStatus::Live, true);
+    let t = open_with_reports(
+        cx,
+        dir.path(),
+        vec![paused("kind-alpha"), paused("kind-beta")],
+    )
+    .await;
+    // The pause says why in the model; the list stays while it still holds rows.
+    assert_eq!(empty_block(cx, &t), None);
+}
+
+#[gpui_kit::test]
+async fn failed_members_are_listed_with_retry(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_reports(
+        cx,
+        dir.path(),
+        vec![failed("kind-alpha"), failed("kind-beta")],
+    )
+    .await;
+    assert_eq!(
+        empty_block(cx, &t).unwrap(),
+        [
+            ("kind-alpha".into(), "Connection failed", Some("Retry")),
+            ("kind-beta".into(), "Connection failed", Some("Retry")),
+        ]
+    );
+}
+
+#[gpui_kit::test]
+async fn mixed_causes_each_get_their_own_row(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_reports(
+        cx,
+        dir.path(),
+        vec![signed_out("kind-alpha"), failed("kind-beta")],
+    )
+    .await;
+    let rows = empty_block(cx, &t).unwrap();
+    assert_eq!(rows[0].2, Some("Sign in"));
+    assert_eq!(rows[1].2, Some("Retry"));
+}
+
+#[gpui_kit::test]
+async fn a_signed_out_member_beside_a_working_one_is_only_a_chip(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_reports(cx, dir.path(), vec![signed_out("kind-beta")]).await;
+    assert_eq!(empty_block(cx, &t), None, "kind-alpha can still show rows");
+    let (signed_out, note) = t.workspace.read_with(cx, |ws, cx| {
+        let run = ws.sets.running.as_ref().unwrap();
+        (
+            ws.signed_out_members(run, cx),
+            run.list.read(cx).kind_note().map(str::to_owned),
+        )
+    });
+    assert_eq!(
+        signed_out,
+        std::collections::HashSet::from(["kind-beta".to_owned()])
+    );
+    // No "not confirmed" footer for the sign-in cause.
+    assert!(
+        note.as_deref().is_none_or(|n| !n.contains("kind-beta")),
+        "{note:?}"
+    );
+    assert!(t.find(cx, "set-members-empty").is_none());
+    assert!(t.find(cx, "background-sign-in-row-kind-beta").is_none());
+    assert!(
+        t.find(cx, "set-member-kind-beta").is_none(),
+        "no header chip"
+    );
 }

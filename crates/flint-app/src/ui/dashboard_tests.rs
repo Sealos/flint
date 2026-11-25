@@ -59,6 +59,7 @@ fn snapshot(availability: Availability, metrics: MetricsCheck) -> TelemetrySnaps
         counts,
         metrics,
         capacity: None,
+        pods: None,
         inventory: Default::default(),
         rollouts: Default::default(),
         version: Default::default(),
