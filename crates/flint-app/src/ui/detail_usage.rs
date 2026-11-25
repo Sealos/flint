@@ -1,14 +1,17 @@
 //! A pod's or node's current use against its requests, limits or allocatable, from the cluster
-//! feed's metrics poll. The pane makes no request of its own.
+//! feed's metrics poll, as the rings of the Usage section ([`super::ring`]). The pane makes no
+//! request of its own.
 
 use std::collections::BTreeMap;
 
 use flint_core::metrics::{Amounts, Cpu, Memory, PodBudget, PodBudgetCheck, Share, Usage, share};
+use flint_core::thresholds::{ThresholdMetric, Thresholds};
 use k8s_openapi::api::core::v1::PodSpec;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use serde_json::Value;
 
 use super::super::list_usage::{UNKNOWN_TEXT, UsageSource, UsageSubject, cpu_text, memory_text};
+use super::ring::RingSpec;
 
 /// What the object's own definition gives to compare use with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,10 +21,22 @@ enum Budget {
 }
 
 /// What the Usage section shows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) enum UsagePanel {
     Hint(&'static str),
-    Lines { cpu: String, memory: String },
+    Rings { cpu: UsageRing, memory: UsageRing },
+}
+
+/// One metric of the Usage section: a ring, or only text when there is nothing to compare with.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct UsageRing {
+    pub label: &'static str,
+    pub spec: Option<RingSpec>,
+    /// What the middle of the ring says: the share of the limit, request or allocatable. Without
+    /// a ring, the amount in use, or `unknown`.
+    pub center: String,
+    /// The exact amounts and shares, one per line.
+    pub lines: Vec<String>,
 }
 
 /// The usage of the object a detail pane shows.
@@ -29,6 +44,8 @@ pub(super) enum UsagePanel {
 pub(super) struct DetailUsage {
     source: UsageSource,
     budget: Option<Budget>,
+    /// The warning thresholds of the object's cluster, from Settings.
+    thresholds: Thresholds,
     /// The object's `creationTimestamp`, Unix seconds: a sample from before it is another's.
     created: Option<i64>,
     /// The object was deleted, so a reading under its name is now another object's.
@@ -43,6 +60,13 @@ impl DetailUsage {
         }
         let changed = self.source != source;
         self.source = source;
+        changed
+    }
+
+    /// Takes the thresholds in force for the object's cluster. `true` if they change the pane.
+    pub(super) fn set_thresholds(&mut self, thresholds: Thresholds) -> bool {
+        let changed = self.thresholds != thresholds;
+        self.thresholds = thresholds;
         changed
     }
 
@@ -81,16 +105,16 @@ impl DetailUsage {
             UsageSource::NoFeed | UsageSource::NotInstalled => {
                 self.source.hint().map(UsagePanel::Hint)
             }
-            UsageSource::Unknown => Some(unknown_lines()),
+            UsageSource::Unknown => Some(unknown_rings()),
             UsageSource::Nodes(usage) => Some(match usage.get(name) {
                 Some(&used) => {
                     let allocatable = match self.budget {
                         Some(Budget::Node(amounts)) => Some(amounts),
                         _ => None,
                     };
-                    node_lines(used, allocatable)
+                    node_rings(used, allocatable, &self.thresholds)
                 }
-                None => unknown_lines(),
+                None => unknown_rings(),
             }),
             UsageSource::Pods(usage) => {
                 let key = (namespace?.to_owned(), name.to_owned());
@@ -103,94 +127,148 @@ impl DetailUsage {
                             Some(Budget::Pod(check)) => check.for_sample(sample),
                             _ => None,
                         };
-                        pod_lines(sample.usage, budget)
+                        pod_rings(sample.usage, budget, &self.thresholds)
                     }
-                    None => unknown_lines(),
+                    None => unknown_rings(),
                 })
             }
         }
     }
 }
 
-fn unknown_lines() -> UsagePanel {
-    UsagePanel::Lines {
-        cpu: UNKNOWN_TEXT.to_owned(),
-        memory: UNKNOWN_TEXT.to_owned(),
+fn unknown_rings() -> UsagePanel {
+    let unknown = |label| UsageRing {
+        label,
+        spec: None,
+        center: UNKNOWN_TEXT.to_owned(),
+        lines: Vec::new(),
+    };
+    UsagePanel::Rings {
+        cpu: unknown("CPU"),
+        memory: unknown("Memory"),
     }
 }
 
 /// `50% of 250m request`, or what stands in for it.
-fn against(used: u64, amount: Option<u64>, text: Option<String>, what: &str) -> String {
-    match (share(used, amount), text) {
-        (Share::Percent(percent), Some(text)) => format!("{percent}% of {text} {what}"),
+fn against(used: u64, amount: Option<u64>, text: &dyn Fn(u64) -> String, what: &str) -> String {
+    match (share(used, amount), amount) {
+        (Share::Percent(percent), Some(amount)) => format!("{percent}% of {} {what}", text(amount)),
         (Share::ZeroBudget, _) => format!("{what} is zero"),
         _ => format!("no {what}"),
     }
 }
 
-fn cpu_against(used: Cpu, amount: Option<Cpu>, what: &str) -> String {
-    against(
-        used.nanos(),
-        amount.map(Cpu::nanos),
-        amount.map(cpu_text),
-        what,
+/// One metric's use, and how to read and write its amounts.
+struct Measure<'a> {
+    label: &'static str,
+    metric: ThresholdMetric,
+    thresholds: &'a Thresholds,
+    used: u64,
+    text: &'a dyn Fn(u64) -> String,
+}
+
+impl Measure<'_> {
+    /// Use that has nothing to be compared with: the amount only, saying why there is no ring.
+    fn text_only(&self, against: &str) -> UsageRing {
+        let used = (self.text)(self.used);
+        UsageRing {
+            label: self.label,
+            spec: None,
+            center: used.clone(),
+            lines: vec![format!("{used} used, against {against} {UNKNOWN_TEXT}")],
+        }
+    }
+
+    /// The ring of use against `request` and `end`, the limit of a pod or allocatable of a node
+    /// (`end_word` names it).
+    fn ring(&self, request: Option<u64>, end: Option<u64>, end_word: &str) -> UsageRing {
+        let spec = RingSpec::of(self.used, request, end, self.metric, self.thresholds);
+        let circle = end
+            .filter(|&end| end > 0)
+            .or(request.filter(|&request| request > 0));
+        let center = match (spec, share(self.used, circle)) {
+            (Some(_), Share::Percent(percent)) => format!("{percent}%"),
+            _ => (self.text)(self.used),
+        };
+        let mut lines = vec![format!("{} used", (self.text)(self.used))];
+        if request.is_some() || end_word == "limit" {
+            lines.push(against(self.used, request, self.text, "request"));
+        }
+        lines.push(against(self.used, end, self.text, end_word));
+        UsageRing {
+            label: self.label,
+            spec,
+            center,
+            lines,
+        }
+    }
+}
+
+fn cpu_text_of(nanos: u64) -> String {
+    cpu_text(Cpu::from_nanos(nanos))
+}
+
+fn memory_text_of(bytes: u64) -> String {
+    memory_text(Memory::from_bytes(bytes))
+}
+
+fn measures<'a>(used: Usage, thresholds: &'a Thresholds) -> (Measure<'a>, Measure<'a>) {
+    (
+        Measure {
+            label: "CPU",
+            metric: ThresholdMetric::CpuPercent,
+            thresholds,
+            used: used.cpu.nanos(),
+            text: &cpu_text_of,
+        },
+        Measure {
+            label: "Memory",
+            metric: ThresholdMetric::MemoryPercent,
+            thresholds,
+            used: used.memory.bytes(),
+            text: &memory_text_of,
+        },
     )
 }
 
-fn memory_against(used: Memory, amount: Option<Memory>, what: &str) -> String {
-    against(
-        used.bytes(),
-        amount.map(Memory::bytes),
-        amount.map(memory_text),
-        what,
-    )
-}
-
-fn pod_lines(used: Usage, budget: Option<PodBudget>) -> UsagePanel {
-    let (cpu, memory) = match budget {
-        Some(budget) => (
-            format!(
-                "{} used, {}, {}",
-                cpu_text(used.cpu),
-                cpu_against(used.cpu, budget.requests.cpu, "request"),
-                cpu_against(used.cpu, budget.limits.cpu, "limit"),
+fn pod_rings(used: Usage, budget: Option<PodBudget>, thresholds: &Thresholds) -> UsagePanel {
+    let (cpu, memory) = measures(used, thresholds);
+    match budget {
+        Some(budget) => UsagePanel::Rings {
+            cpu: cpu.ring(
+                budget.requests.cpu.map(Cpu::nanos),
+                budget.limits.cpu.map(Cpu::nanos),
+                "limit",
             ),
-            format!(
-                "{} used, {}, {}",
-                memory_text(used.memory),
-                memory_against(used.memory, budget.requests.memory, "request"),
-                memory_against(used.memory, budget.limits.memory, "limit"),
+            memory: memory.ring(
+                budget.requests.memory.map(Memory::bytes),
+                budget.limits.memory.map(Memory::bytes),
+                "limit",
             ),
-        ),
+        },
         // The sample covers other containers than the spec's: no percentage would be true.
-        None => (
-            format!(
-                "{} used, against requests and limits {UNKNOWN_TEXT}",
-                cpu_text(used.cpu)
-            ),
-            format!(
-                "{} used, against requests and limits {UNKNOWN_TEXT}",
-                memory_text(used.memory)
-            ),
-        ),
-    };
-    UsagePanel::Lines { cpu, memory }
+        None => UsagePanel::Rings {
+            cpu: cpu.text_only("requests and limits"),
+            memory: memory.text_only("requests and limits"),
+        },
+    }
 }
 
-fn node_lines(used: Usage, allocatable: Option<Amounts>) -> UsagePanel {
-    let line = |text: String, compared: Option<String>| match compared {
-        Some(compared) => format!("{text} used, {compared}"),
-        None => format!("{text} used, against allocatable {UNKNOWN_TEXT}"),
-    };
-    UsagePanel::Lines {
-        cpu: line(
-            cpu_text(used.cpu),
-            allocatable.map(|a| cpu_against(used.cpu, a.cpu, "allocatable")),
-        ),
-        memory: line(
-            memory_text(used.memory),
-            allocatable.map(|a| memory_against(used.memory, a.memory, "allocatable")),
-        ),
+/// A node's rings run to allocatable.
+///
+/// TODO(#801): the tick at the total requests of the node's pods needs the per-node requested
+/// totals of #798; until they are read the ring has no tick.
+fn node_rings(used: Usage, allocatable: Option<Amounts>, thresholds: &Thresholds) -> UsagePanel {
+    let (cpu, memory) = measures(used, thresholds);
+    match allocatable {
+        Some(allocatable) => UsagePanel::Rings {
+            cpu: cpu.ring(None, allocatable.cpu.map(Cpu::nanos), "allocatable"),
+            memory: memory.ring(None, allocatable.memory.map(Memory::bytes), "allocatable"),
+        },
+        None => UsagePanel::Rings {
+            cpu: cpu.text_only("allocatable"),
+            memory: memory.text_only("allocatable"),
+        },
     }
 }
 
@@ -202,6 +280,7 @@ mod tests {
     use serde_json::json;
 
     use super::super::super::list_usage::{NO_FEED_HINT, NOT_INSTALLED_HINT};
+    use super::super::ring::Tone;
     use super::*;
 
     const MIB: u64 = 1024 * 1024;
@@ -253,44 +332,106 @@ mod tests {
         detail
     }
 
-    fn lines(cpu: &str, memory: &str) -> Option<UsagePanel> {
-        Some(UsagePanel::Lines {
-            cpu: cpu.to_owned(),
-            memory: memory.to_owned(),
-        })
+    fn rings(panel: Option<UsagePanel>) -> (UsageRing, UsageRing) {
+        match panel {
+            Some(UsagePanel::Rings { cpu, memory }) => (cpu, memory),
+            other => panic!("expected rings, got {other:?}"),
+        }
+    }
+
+    fn unknown_ring(ring: &UsageRing) -> bool {
+        ring.spec.is_none() && ring.center == UNKNOWN_TEXT && ring.lines.is_empty()
     }
 
     #[test]
     fn a_pod_shows_use_against_its_requests_and_limits() {
         let detail = pod_detail(pod_source(&["app"], usage(100, 200)));
+        let (cpu, memory) = rings(detail.panel(Some("ns"), "web"));
+        // No CPU limit: the request ends the circle.
+        assert_eq!(cpu.center, "50%");
+        assert_eq!(cpu.lines, ["100m used", "50% of 200m request", "no limit"]);
+        let spec = cpu.spec.unwrap();
+        assert_eq!((spec.fill, spec.tick, spec.tone), (0.5, None, Tone::Normal));
+        // Memory limit 400Mi, request 100Mi: the circle is the limit, the tick the request.
+        assert_eq!(memory.center, "50%");
         assert_eq!(
-            detail.panel(Some("ns"), "web"),
-            lines(
-                "100m used, 50% of 200m request, no limit",
-                "200Mi used, 200% of 100Mi request, 50% of 400Mi limit",
-            )
+            memory.lines,
+            ["200Mi used", "200% of 100Mi request", "50% of 400Mi limit"]
+        );
+        let spec = memory.spec.unwrap();
+        assert_eq!(
+            (spec.fill, spec.tick, spec.tone),
+            (0.5, Some(0.25), Tone::Normal)
         );
     }
 
     #[test]
-    fn a_sample_of_other_containers_gets_no_percentage() {
+    fn use_past_the_request_with_no_limit_is_red() {
+        let detail = pod_detail(pod_source(&["app"], usage(300, 200)));
+        let (cpu, _) = rings(detail.panel(Some("ns"), "web"));
+        assert_eq!(cpu.spec.unwrap().tone, Tone::Over);
+        assert_eq!(cpu.center, "150%");
+    }
+
+    #[test]
+    fn the_warning_colour_follows_the_settings_thresholds() {
+        let mut detail = pod_detail(pod_source(&["app"], usage(100, 200)));
+        let mut overrides = flint_core::thresholds::ThresholdOverrides::default();
+        overrides
+            .set(ThresholdMetric::CpuPercent, Some(40))
+            .unwrap();
+        assert!(detail.set_thresholds(Thresholds::default().merged(&overrides)));
+        assert!(!detail.set_thresholds(Thresholds::default().merged(&overrides)));
+        let (cpu, memory) = rings(detail.panel(Some("ns"), "web"));
+        assert_eq!(cpu.spec.unwrap().tone, Tone::Warning);
+        assert_eq!(memory.spec.unwrap().tone, Tone::Normal);
+    }
+
+    #[test]
+    fn a_pod_with_neither_request_nor_limit_has_a_value_and_no_ring() {
+        let mut detail = DetailUsage::default();
+        detail.set_object(
+            Some(UsageSubject::Pods),
+            &json!({
+                "metadata": {"creationTimestamp": "1970-01-01T00:01:40Z"},
+                "spec": {"containers": [{"name": "app"}]}
+            }),
+        );
+        detail.set_source(pod_source(&["app"], usage(100, 200)));
+        let (cpu, memory) = rings(detail.panel(Some("ns"), "web"));
+        assert_eq!(cpu.spec, None);
+        assert_eq!(cpu.center, "100m");
+        assert_eq!(cpu.lines, ["100m used", "no request", "no limit"]);
+        assert_eq!(memory.spec, None);
+    }
+
+    #[test]
+    fn a_sample_of_other_containers_gets_no_ring() {
         let detail = pod_detail(pod_source(&["migrate"], usage(100, 200)));
+        let (cpu, memory) = rings(detail.panel(Some("ns"), "web"));
+        assert_eq!(cpu.spec, None);
         assert_eq!(
-            detail.panel(Some("ns"), "web"),
-            lines(
-                "100m used, against requests and limits unknown",
-                "200Mi used, against requests and limits unknown",
-            )
+            cpu.lines,
+            ["100m used, against requests and limits unknown"]
+        );
+        assert_eq!(
+            memory.lines,
+            ["200Mi used, against requests and limits unknown"]
         );
     }
 
     #[test]
     fn a_pod_the_poll_did_not_report_is_unknown_not_zero() {
         let detail = pod_detail(pod_source(&["app"], usage(1, 1)));
-        assert_eq!(
-            detail.panel(Some("ns"), "other"),
-            lines(UNKNOWN_TEXT, UNKNOWN_TEXT)
-        );
+        let (cpu, memory) = rings(detail.panel(Some("ns"), "other"));
+        assert!(unknown_ring(&cpu) && unknown_ring(&memory));
+    }
+
+    fn node_detail(source: UsageSource, object: &Value) -> DetailUsage {
+        let mut detail = DetailUsage::default();
+        detail.set_object(Some(UsageSubject::Nodes), object);
+        detail.set_source(source);
+        detail
     }
 
     #[test]
@@ -298,20 +439,17 @@ mod tests {
         let source = UsageSource::Nodes(Arc::new(
             [("n1".to_owned(), usage(1000, 512))].into_iter().collect(),
         ));
-        let mut detail = DetailUsage::default();
-        detail.set_object(
-            Some(UsageSubject::Nodes),
+        let detail = node_detail(
+            source,
             &json!({"status": {"allocatable": {"cpu": "4", "memory": "1Gi"}}}),
         );
-        detail.set_source(source);
-        assert_eq!(
-            detail.panel(None, "n1"),
-            lines(
-                "1000m used, 25% of 4000m allocatable",
-                "512Mi used, 50% of 1024Mi allocatable",
-            )
-        );
-        assert_eq!(detail.panel(None, "n2"), lines(UNKNOWN_TEXT, UNKNOWN_TEXT));
+        let (cpu, memory) = rings(detail.panel(None, "n1"));
+        assert_eq!(cpu.center, "25%");
+        assert_eq!(cpu.lines, ["1000m used", "25% of 4000m allocatable"]);
+        assert_eq!(memory.center, "50%");
+        assert_eq!(memory.lines, ["512Mi used", "50% of 1024Mi allocatable"]);
+        let (cpu, memory) = rings(detail.panel(None, "n2"));
+        assert!(unknown_ring(&cpu) && unknown_ring(&memory));
     }
 
     #[test]
@@ -319,16 +457,11 @@ mod tests {
         let source = UsageSource::Nodes(Arc::new(
             [("n1".to_owned(), usage(10, 20))].into_iter().collect(),
         ));
-        let mut detail = DetailUsage::default();
-        detail.set_object(Some(UsageSubject::Nodes), &json!({"status": {}}));
-        detail.set_source(source);
-        assert_eq!(
-            detail.panel(None, "n1"),
-            lines(
-                "10m used, against allocatable unknown",
-                "20Mi used, against allocatable unknown",
-            )
-        );
+        let detail = node_detail(source, &json!({"status": {}}));
+        let (cpu, memory) = rings(detail.panel(None, "n1"));
+        assert_eq!(cpu.spec, None);
+        assert_eq!(cpu.lines, ["10m used, against allocatable unknown"]);
+        assert_eq!(memory.lines, ["20Mi used, against allocatable unknown"]);
     }
 
     #[test]
@@ -360,10 +493,8 @@ mod tests {
             Some(UsageSubject::Pods),
             &json!({"metadata": {"creationTimestamp": "1970-01-01T00:16:40Z"}}),
         );
-        assert_eq!(
-            detail.panel(Some("ns"), "web"),
-            lines(UNKNOWN_TEXT, UNKNOWN_TEXT)
-        );
+        let (cpu, memory) = rings(detail.panel(Some("ns"), "web"));
+        assert!(unknown_ring(&cpu) && unknown_ring(&memory));
     }
 
     #[test]
@@ -371,18 +502,14 @@ mod tests {
         let mut detail = pod_detail(UsageSource::Unknown);
         detail.mark_deleted();
         assert!(!detail.set_source(pod_source(&["app"], usage(100, 200))));
-        assert_eq!(
-            detail.panel(Some("ns"), "web"),
-            lines(UNKNOWN_TEXT, UNKNOWN_TEXT)
-        );
+        let (cpu, memory) = rings(detail.panel(Some("ns"), "web"));
+        assert!(unknown_ring(&cpu) && unknown_ring(&memory));
     }
 
     #[test]
     fn a_failed_poll_is_unknown() {
         let detail = pod_detail(UsageSource::Unknown);
-        assert_eq!(
-            detail.panel(Some("ns"), "web"),
-            lines(UNKNOWN_TEXT, UNKNOWN_TEXT)
-        );
+        let (cpu, memory) = rings(detail.panel(Some("ns"), "web"));
+        assert!(unknown_ring(&cpu) && unknown_ring(&memory));
     }
 }
