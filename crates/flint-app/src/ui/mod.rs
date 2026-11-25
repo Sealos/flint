@@ -62,6 +62,7 @@ mod row_menu;
 mod row_menu_cursor;
 mod scope_picker;
 mod set_kinds;
+mod set_members;
 mod settings_draft;
 mod settings_thresholds;
 #[cfg(test)]
