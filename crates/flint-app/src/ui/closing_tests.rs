@@ -538,7 +538,8 @@ async fn the_window_and_help_menus_hold_the_standard_items(cx: &mut TestAppConte
     );
     assert_eq!(
         names("File")[3..],
-        ["dock::CloseActiveTab", "flint::CloseWindow"]
+        // Close Dock Tab holds an action nothing handles while no dock tab is shown.
+        ["menu::Unavailable", "flint::CloseWindow"]
     );
     assert_eq!(names("Help"), ["flint::OpenHelp"]);
     assert!(names("Flint").contains(&"Services".to_owned()));

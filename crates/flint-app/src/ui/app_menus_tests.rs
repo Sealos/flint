@@ -15,7 +15,10 @@ fn inputs(cluster: Option<&str>, clusters: &[&str]) -> MenuInputs {
     MenuInputs {
         appearance: Appearance::System,
         cluster: cluster.map(str::to_owned),
-        clusters: clusters.iter().map(|c| (*c).to_owned()).collect(),
+        clusters: clusters
+            .iter()
+            .map(|c| ((*c).to_owned(), format!("{c} shown")))
+            .collect(),
     }
 }
 
@@ -88,8 +91,8 @@ fn cluster_menu_holds_the_cluster_items() {
         format!("Watch Mode > {}", registry::label::<WatchAllKinds>()),
         "Colour Tag > Blue".to_owned(),
         "Colour Tag > Red".to_owned(),
-        "Switch To > dev".to_owned(),
-        "Switch To > prod".to_owned(),
+        "Switch To > dev shown".to_owned(),
+        "Switch To > prod shown".to_owned(),
     ] {
         assert!(names.contains(&expected), "{expected}: {names:?}");
     }
@@ -119,7 +122,7 @@ fn cluster_items_act_on_the_active_cluster() {
             _ => None,
         })
         .collect();
-    assert_eq!(checked, ["prod"]);
+    assert_eq!(checked, ["prod shown"]);
 }
 
 #[test]
@@ -159,6 +162,22 @@ fn resource_items_are_disabled_when_the_action_is_not_enabled() {
     assert!(state(&rows, registry::label::<OpenLogs>()));
     assert!(!state(&rows, registry::label::<DeleteObject>()));
     assert!(!state(&rows, registry::label::<OpenShell>()));
+}
+
+// The native menu enables an item whose action has a handler, so a disabled item holds an action
+// nothing handles.
+#[test]
+fn disabled_items_hold_an_action_nothing_handles() {
+    let menu = resource_menu(&mut |_| false);
+    for item in &menu.items {
+        if let MenuItem::Action {
+            action, disabled, ..
+        } = item
+        {
+            assert!(disabled);
+            assert!(action.as_any().is::<super::app_menus::Unavailable>());
+        }
+    }
 }
 
 #[test]

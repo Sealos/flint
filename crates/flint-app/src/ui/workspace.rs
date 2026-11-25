@@ -3869,7 +3869,12 @@ impl Workspace {
     fn sync_menus(&self, cx: &mut Context<Self>) {
         let model = self.model.read(cx);
         let cluster = model.active_cluster().map(|c| c.info.name.clone());
-        let clusters: Vec<String> = model.clusters.iter().map(|c| c.info.name.clone()).collect();
+        let names = model.names();
+        let clusters: Vec<(String, String)> = model
+            .clusters
+            .iter()
+            .map(|c| (c.info.name.clone(), names.with_real(&c.info.name)))
+            .collect();
         cx.defer(move |cx| {
             super::app_menus::update(cx, |inputs| {
                 inputs.cluster = cluster;

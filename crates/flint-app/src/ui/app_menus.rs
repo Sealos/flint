@@ -33,8 +33,9 @@ pub(super) struct MenuInputs {
     pub appearance: Appearance,
     /// The active cluster's context name, which the Cluster menu's items act on.
     pub cluster: Option<String>,
-    /// Every cluster listed, for the Switch To submenu.
-    pub clusters: Vec<String>,
+    /// Every cluster listed, as its context name and the name shown for it, for the Switch To
+    /// submenu.
+    pub clusters: Vec<(String, String)>,
 }
 
 /// What the menu bar shows now: its inputs and the enabled state of each item, in menu order.
@@ -44,6 +45,16 @@ struct Shown {
 }
 
 impl Global for Shown {}
+
+actions!(
+    menu,
+    [
+        /// What a menu item that cannot do anything now holds in place of its action. Nothing
+        /// handles it, so the native menu, which asks only whether an action has a handler,
+        /// shows the item disabled.
+        Unavailable
+    ]
+);
 
 /// Whether an action would do something now.
 pub(super) type Enabled<'a> = &'a mut dyn FnMut(&dyn Action) -> bool;
@@ -61,9 +72,16 @@ fn named(
     checked: bool,
 ) -> MenuItem {
     let ok = enabled(&action);
+    // The native menu asks only whether the action has a handler, not the registry's guards, and
+    // enables the item then whatever `disabled` says.
+    let action: Box<dyn Action> = if ok {
+        Box::new(action)
+    } else {
+        Box::new(Unavailable)
+    };
     MenuItem::Action {
         name: name.into(),
-        action: Box::new(action),
+        action,
         os_action: None,
         checked,
         disabled: !ok,
@@ -104,12 +122,12 @@ pub(super) fn cluster_menu(inputs: &MenuInputs, enabled: Enabled) -> Menu {
         enabled,
     ));
     let mut switch: Vec<MenuItem> = Vec::new();
-    for name in &inputs.clusters {
+    for (context, shown) in &inputs.clusters {
         let action = SelectCluster {
-            cluster: name.clone(),
+            cluster: context.clone(),
         };
-        let active = inputs.cluster.as_deref() == Some(name.as_str());
-        switch.push(named(name.clone(), action, enabled, active));
+        let active = inputs.cluster.as_deref() == Some(context.as_str());
+        switch.push(named(shown.clone(), action, enabled, active));
     }
     Menu::new("Cluster").items([
         item(OpenClusterOverview, enabled),
