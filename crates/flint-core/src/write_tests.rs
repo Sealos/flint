@@ -221,6 +221,34 @@ fn invalid_yaml_does_not_repeat_the_text() {
     assert!(!error.contains("hunter2"), "{error}");
 }
 
+fn secret_kind() -> KindInfo {
+    KindInfo {
+        resource: ApiResource {
+            group: String::new(),
+            version: "v1".into(),
+            api_version: "v1".into(),
+            kind: "Secret".into(),
+            plural: "secrets".into(),
+        },
+        singular: "secret".into(),
+        short_names: Vec::new(),
+        namespaced: true,
+        verbs: Vec::new(),
+    }
+}
+
+#[test]
+fn a_secrets_invalid_yaml_names_only_where() {
+    // A pasted credential as an unquoted key, twice: the parser's message would name it.
+    let yaml = "apiVersion: v1\nkind: Secret\nmetadata:\n  name: web\nstringData:\n  \
+                sk-live-4f9a2c: a\n  sk-live-4f9a2c: b\n";
+    let error = edit_body(yaml, &secret_kind(), &target())
+        .unwrap_err()
+        .to_string();
+    assert!(!error.contains("sk-live"), "{error}");
+    assert!(error.contains("line 7"), "{error}");
+}
+
 #[test]
 fn the_gitops_warning_comes_from_the_live_object() {
     let managed = json!({

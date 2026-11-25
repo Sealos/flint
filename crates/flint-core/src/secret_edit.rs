@@ -179,13 +179,16 @@ fn looks_masked(text: &str) -> bool {
 }
 
 /// Whether the API server decodes `text` as a `data` value: standard base64, padded, line
-/// breaks ignored.
+/// breaks ignored, and unused trailing bits allowed as Go's decoder allows them (`YR==`).
 fn is_base64(text: &str) -> bool {
     use base64::Engine as _;
+    use base64::engine::general_purpose::{GeneralPurpose, PAD};
+    const DECODER: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        PAD.with_decode_allow_trailing_bits(true),
+    );
     let joined: String = text.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
-    base64::engine::general_purpose::STANDARD
-        .decode(joined)
-        .is_ok()
+    DECODER.decode(joined).is_ok()
 }
 
 fn invalid(why: &str) -> WriteError {
@@ -359,31 +362,30 @@ fn webhook_name(message: &str) -> Option<&str> {
     (dns && rest.starts_with(" denied the request")).then_some(name)
 }
 
-/// The field paths a server can name for what `patch` sets: its masked maps, each of their keys
-/// in both of the API server's spellings, and its other top-level fields.
+/// The field paths a server can name for what `patch` sets: every map key in it, at any depth,
+/// in both of the API server's spellings below the top (`metadata.labels.app` and
+/// `metadata.labels[app]`). Built from keys only, never from a value.
 fn patch_fields(patch: &Value) -> BTreeSet<String> {
     let mut fields = BTreeSet::new();
-    let Some(top) = patch.as_object() else {
-        return fields;
-    };
-    for key in top.keys().filter(|key| *key != "metadata") {
-        fields.insert(key.clone());
-    }
-    for (path, pointer) in [
-        ("data", "/data"),
-        ("stringData", "/stringData"),
-        ("metadata.annotations", "/metadata/annotations"),
-    ] {
-        let Some(map) = patch.pointer(pointer).and_then(Value::as_object) else {
-            continue;
-        };
-        fields.insert(path.to_owned());
-        for key in map.keys() {
-            fields.insert(format!("{path}[{key}]"));
-            fields.insert(format!("{path}.{key}"));
+    if let Some(top) = patch.as_object() {
+        for (key, value) in top {
+            fields.insert(key.clone());
+            add_fields(&mut fields, key, value);
         }
     }
     fields
+}
+
+fn add_fields(fields: &mut BTreeSet<String>, path: &str, value: &Value) {
+    let Some(map) = value.as_object() else {
+        return;
+    };
+    for (key, value) in map {
+        fields.insert(format!("{path}[{key}]"));
+        let dotted = format!("{path}.{key}");
+        add_fields(fields, &dotted, value);
+        fields.insert(dotted);
+    }
 }
 
 #[cfg(test)]

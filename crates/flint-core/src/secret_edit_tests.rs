@@ -176,6 +176,30 @@ fn a_changed_data_value_must_be_base64() {
 }
 
 #[test]
+fn base64_is_read_as_the_api_server_reads_it() {
+    // Unused trailing bits are allowed, as Go's decoder allows them.
+    assert!(is_base64("YR=="));
+    assert!(is_base64("YQ=="));
+    assert!(!is_base64("YQ"), "padding is required");
+    assert!(!is_base64("Y!=="), "outside the alphabet");
+}
+
+#[test]
+fn a_refusal_names_any_field_the_patch_sets() {
+    let patch = json!({
+        "metadata": {"uid": "uid-1", "resourceVersion": "10", "labels": {"app": "web"}},
+        "data": {"password": NEW},
+    });
+    let error = write_error(
+        rejection(422, "Invalid", "x", &["metadata.labels", "web"]),
+        &patch,
+    );
+    let text = error.to_string();
+    assert!(text.contains("fields: metadata.labels"), "{text}");
+    assert!(!text.contains("web"), "{text}");
+}
+
+#[test]
 fn a_value_that_is_not_a_string_is_refused() {
     for value in [json!(5432), Value::Null, json!({"a": 1})] {
         let mut edited = opened();

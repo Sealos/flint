@@ -949,18 +949,36 @@ async fn create(
         })
 }
 
+fn is_secret_kind(kind: &KindInfo) -> bool {
+    kind.api_version() == "v1" && kind.kind() == "Secret"
+}
+
+/// Why `yaml` did not parse. For a Secret only where: the parser's words can quote any of its
+/// text, quoted or not (a duplicate key from a pasted value, say).
+fn yaml_error(error: &serde_saphyr::Error, secret: bool) -> WriteError {
+    if !secret {
+        return WriteError::InvalidYaml(format!(
+            "not valid YAML: {}",
+            redact::redact_quoted(&error.to_string())
+        ));
+    }
+    let at = error.location().map_or_else(String::new, |at| {
+        format!(" at line {}, column {}", at.line(), at.column())
+    });
+    WriteError::InvalidYaml(format!(
+        "not valid YAML{at}; the parser's message is not shown, because it may quote a Secret \
+         value"
+    ))
+}
+
 /// The body to `PUT` for `yaml`: the same object as `target`, at the version reviewed. An edit
 /// cannot move it to another name, namespace or kind, or drop the version that makes a
 /// concurrent change a conflict.
 fn edit_body(yaml: &str, kind: &KindInfo, target: &WriteTarget) -> Result<Value, WriteError> {
     // No source snippet, and no quoted scalars: the text can be a Secret's.
     let options = serde_saphyr::options! { with_snippet: false };
-    let mut body: Value = serde_saphyr::from_str_with_options(yaml, options).map_err(|e| {
-        WriteError::InvalidYaml(format!(
-            "not valid YAML: {}",
-            redact::redact_quoted(&e.to_string())
-        ))
-    })?;
+    let mut body: Value = serde_saphyr::from_str_with_options(yaml, options)
+        .map_err(|e| yaml_error(&e, is_secret_kind(kind)))?;
     if !body.is_object() {
         return Err(WriteError::InvalidYaml(
             "not a Kubernetes object".to_owned(),
