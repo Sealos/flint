@@ -36,7 +36,7 @@ impl SetDashboardModel {
                     shown: card.shown.clone(),
                     tag: card.tag,
                     state: state_name(card),
-                    note: card.state.note(),
+                    note: card.note(),
                     level: level_name(card.level),
                     counts: card
                         .tiles

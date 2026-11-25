@@ -436,7 +436,7 @@ impl Telemetry {
             timing.list_timeout,
         ));
         tasks.spawn(metrics::run(
-            Arc::clone(&cluster),
+            latest.clone(),
             client,
             requests,
             trends,

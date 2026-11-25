@@ -2,21 +2,25 @@
 
 use std::sync::Arc;
 
+use flint_core::cluster::SafeErrorText;
 use flint_core::dashboard::{ProblemCategory, ProblemCounts};
-use flint_core::telemetry::Availability;
+use flint_core::metrics::{Cpu, Memory, MetricsError, MetricsList, NodeMetrics, Usage};
+use flint_core::metrics_trend::TrendStore;
+use flint_core::telemetry::{Availability, ClusterTelemetry, MetricsCheck};
 use flint_core::thresholds::{ThresholdLevel, Thresholds};
 use flint_core::{KindId, KindSnapshot, SyncState};
-use gpui_kit::{AppContext as _, Entity, TestAppContext};
+use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::{AppContext as _, Entity, TestAppContext, WindowOptions};
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use super::super::super::list::{CountedObjects, ObjectFilter};
 use super::super::super::support_tests::{TestWorkspace, objects, open_workspace};
 use super::super::feed::{FeedId, ProblemList, ProblemLists};
-use super::super::{NO_VALUE, ProblemTile, category_label};
+use super::super::{METRICS_WAITING, NO_VALUE, ProblemTile, category_label};
 use super::{
     CardState, MemberRead, SetCard, SetDashboardModel, SetDashboardView, TestFeeds, TotalTile,
-    assemble, card, kind_entry, total_kind,
+    assemble, build, card, kind_entry, total_kind,
 };
 
 fn tiles(count: impl Fn(ProblemCategory) -> Option<u32>) -> Vec<ProblemTile> {
@@ -51,6 +55,7 @@ fn card_with(cluster: &str, state: CardState, failing: Option<u32>, feed: &str) 
         level: ThresholdLevel::Healthy,
         cpu: None,
         memory: None,
+        metrics_notice: None,
         short_kinds: vec!["deployments"],
         feed: counting.then(|| FeedId::for_test(feed)),
         state,
@@ -171,11 +176,134 @@ fn a_member_without_a_feed_is_waiting_for_it() {
         server: "https://a".into(),
         thresholds: Thresholds::default(),
     };
-    assert_eq!(card_with_read(member).state, CardState::Waiting);
+    let card = card_with_read(member);
+    assert_eq!(card.state, CardState::Waiting);
+    assert_eq!(card.note().as_deref(), Some(METRICS_WAITING));
 }
 
 fn card_with_read(member: MemberRead) -> SetCard {
     card(member, Timestamp::now())
+}
+
+fn member_with_metrics(
+    cluster: &str,
+    check: MetricsCheck,
+    sample: Option<(Timestamp, u64, u64)>,
+) -> MemberRead {
+    let mut telemetry =
+        ClusterTelemetry::for_tests(Availability::Checked, Default::default(), false);
+    let snapshot = Arc::make_mut(&mut telemetry.snapshot);
+    snapshot.cluster = cluster.into();
+    snapshot.metrics = check;
+    let mut trends = TrendStore::new();
+    if let Some((at, cpu_millis, memory_mib)) = sample {
+        trends.record(
+            cluster,
+            at,
+            &Ok(MetricsList {
+                items: vec![NodeMetrics {
+                    name: "node".into(),
+                    timestamp: None,
+                    window: None,
+                    usage: Usage {
+                        cpu: Cpu::from_nanos(cpu_millis * 1_000_000),
+                        memory: Memory::from_bytes(memory_mib * 1024 * 1024),
+                    },
+                }],
+                skipped: 0,
+            }),
+        );
+    }
+    MemberRead {
+        cluster: cluster.into(),
+        shown: cluster.into(),
+        tag: None,
+        blocked: None,
+        telemetry: Some(telemetry.with_trends_for_tests(trends)),
+        server: format!("https://{cluster}"),
+        thresholds: Thresholds::default(),
+    }
+}
+
+#[test]
+fn cards_show_each_members_own_metrics() {
+    let now = Timestamp::from_second(1_800_000_000).unwrap();
+    let current = MetricsCheck::Current { nodes: 1 };
+    let model = build(
+        vec![
+            member_with_metrics("active", current.clone(), Some((now, 250, 64))),
+            member_with_metrics("member", current, Some((now, 750, 128))),
+        ],
+        now,
+    );
+    for (cluster, cpu, memory) in [("active", "250m", "64 MiB"), ("member", "750m", "128 MiB")] {
+        let card = model.card(cluster).unwrap();
+        assert_eq!(card.cpu.as_ref().unwrap().tile.value.as_deref(), Some(cpu));
+        assert_eq!(
+            card.memory.as_ref().unwrap().tile.value.as_deref(),
+            Some(memory)
+        );
+        assert_eq!(card.note(), None);
+    }
+}
+
+#[test]
+fn cards_explain_when_cpu_and_memory_are_unavailable() {
+    let now = Timestamp::from_second(1_800_000_000).unwrap();
+    let old = Timestamp::from_second(now.as_second() - 120).unwrap();
+    for (check, sample, reason) in [
+        (
+            MetricsCheck::Waiting,
+            None,
+            "Waiting for the first metrics sample",
+        ),
+        (
+            MetricsCheck::Unavailable(MetricsError::NotInstalled),
+            None,
+            "No metrics-server installed",
+        ),
+        (
+            MetricsCheck::Unavailable(MetricsError::Forbidden(SafeErrorText::reduced("denied"))),
+            Some((now, 250, 64)),
+            "no permission to read metrics",
+        ),
+        (
+            MetricsCheck::Unavailable(MetricsError::Failed(SafeErrorText::reduced("timed out"))),
+            Some((now, 250, 64)),
+            "cannot be checked",
+        ),
+        (
+            MetricsCheck::Current { nodes: 0 },
+            Some((now, 250, 64)),
+            "No node metrics were returned",
+        ),
+        (
+            MetricsCheck::Current { nodes: 1 },
+            None,
+            "Waiting for fresh metrics from all nodes",
+        ),
+        (
+            MetricsCheck::Current { nodes: 1 },
+            Some((old, 250, 64)),
+            "Waiting for fresh metrics from all nodes",
+        ),
+    ] {
+        let card = card(member_with_metrics("member", check, sample), now);
+        assert_eq!(card.state, CardState::Live);
+        assert!(
+            [card.cpu.as_ref(), card.memory.as_ref()]
+                .into_iter()
+                .flatten()
+                .all(|metric| {
+                    metric.tile.value.is_none() && metric.level == ThresholdLevel::Unknown
+                })
+        );
+        assert!(
+            card.description().contains(reason),
+            "{}",
+            card.description()
+        );
+    }
 }
 
 #[test]
@@ -196,6 +324,49 @@ fn every_problem_list_kind_has_an_entry() {
 }
 
 // View tests.
+
+#[gpui_kit::test]
+async fn draws_metrics_and_an_unavailable_reason_on_their_own_cards(cx: &mut TestAppContext) {
+    let now = Timestamp::from_second(1_800_000_000).unwrap();
+    let model = build(
+        vec![
+            member_with_metrics(
+                "a",
+                MetricsCheck::Current { nodes: 1 },
+                Some((now, 250, 64)),
+            ),
+            member_with_metrics(
+                "b",
+                MetricsCheck::Unavailable(MetricsError::NotInstalled),
+                None,
+            ),
+        ],
+        now,
+    );
+    cx.update(gpui_kit::init);
+    let (window, _) = cx
+        .update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
+                cx.new(|cx| {
+                    let mut view = SetDashboardView::new(cx);
+                    view.set_model(model, cx);
+                    view
+                })
+            })
+        })
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        for (id, label) in [
+            ("set-card-cpu-a", "CPU: 250m"),
+            ("set-card-memory-a", "Memory: 64 MiB"),
+            ("set-card-note-b", "No metrics-server installed."),
+        ] {
+            assert_eq!(window.try_find(id).unwrap().label(), Some(label));
+        }
+    })
+    .unwrap();
+}
 
 const OPEN: &str = "cluster_sets::OpenClusterSetDashboard";
 const OPEN_PROBLEM: &str = "cluster_sets::OpenSetProblem";
