@@ -513,9 +513,12 @@ pub struct ThresholdsPage {
     pub picking: bool,
     /// The threshold being typed.
     pub entry: Option<ThresholdEntry>,
-    /// The cluster whose row the keyboard cursor stands on, so the cursor follows it when rows
-    /// above come or go.
+    /// The cluster whose row (or Add override candidate) the keyboard cursor stands on, so the
+    /// cursor follows it when rows or candidates before it come or go.
     pub cursor_row: Option<String>,
+    /// The Add override candidates, scrolled on their own so the one under the keyboard cursor
+    /// is in view however many there are.
+    pub pick_scroll: ScrollHandle,
 }
 
 /// The Thresholds section, as the children of the scrolling content: its heading, then a
@@ -590,6 +593,10 @@ pub fn scroll_index(stop: ThresholdStop, rows: usize) -> usize {
     }
 }
 
+/// The tallest the Add override candidates get before they scroll, so the list fits in the
+/// Settings content and the keyboard cursor can bring any candidate into view.
+const PICK_LIST_HEIGHT: f32 = 160.;
+
 /// The Cluster overrides section, as the children of the scrolling content: its heading, a
 /// block per row (its controls wrapping to the width there is), Add override and its list.
 pub fn render_overrides(
@@ -660,8 +667,12 @@ pub fn render_overrides(
             )
             .child(
                 h_flex()
+                    .id("settings-override-pick-list")
                     .flex_wrap()
                     .gap_1()
+                    .max_h(px(PICK_LIST_HEIGHT))
+                    .overflow_y_scroll()
+                    .track_scroll(&page.thresholds.pick_scroll)
                     .children(candidates.iter().enumerate().map(|(index, context)| {
                         let stop = ThresholdStop::Pick(index);
                         ring(
@@ -889,7 +900,7 @@ fn number_cell(
         .thresholds
         .entry
         .as_ref()
-        .filter(|e| e.target == *target)
+        .filter(|e| e.target.field() == target.field())
     {
         return div()
             .w(px(width))

@@ -769,6 +769,15 @@ async fn a_rejected_override_of_a_repointed_context_is_retired(cx: &mut TestAppC
         json!({ "mode": "on_view" }),
     );
     assert!(!state(cx, &t).settings.can_save);
+    repoint_alpha(cx, &t, dir.path()).await;
+    t.find(cx, "settings-view");
+    let s = state(cx, &t).settings;
+    assert!(s.thresholds.rejected.is_empty(), "{s:?}");
+    assert!(s.can_save);
+}
+
+/// Points kind-alpha to another server in the kubeconfig, and waits for the app to show it.
+async fn repoint_alpha(cx: &mut TestAppContext, t: &TestWorkspace, dir: &std::path::Path) {
     let beta = t.model.read_with(cx, |model, _| {
         model
             .clusters
@@ -778,7 +787,7 @@ async fn a_rejected_override_of_a_repointed_context_is_retired(cx: &mut TestAppC
             .unwrap()
     });
     std::fs::write(
-        dir.path().join("kubeconfig"),
+        dir.join("kubeconfig"),
         kubeconfig_yaml(&[("kind-alpha", "https://127.0.0.1:9"), ("kind-beta", &beta)]),
     )
     .unwrap();
@@ -792,8 +801,35 @@ async fn a_rejected_override_of_a_repointed_context_is_retired(cx: &mut TestAppC
         })
     })
     .await;
+}
+
+// covers UP-67: Reset on a context that now points to another server also drops the edits made
+// for the old one, hidden since, so a later Save does not write them.
+#[gpui_kit::test]
+async fn reset_of_a_repointed_context_drops_its_hidden_edits(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_section(cx, dir.path(), "cluster_overrides").await;
+    edit(
+        cx,
+        &t,
+        "settings::EditThreshold",
+        json!({ "cluster": "kind-alpha", "metric": "cpu_percent", "value": "70" }),
+    );
+    edit(
+        cx,
+        &t,
+        "settings::EditClusterWatchMode",
+        json!({ "cluster": "kind-alpha", "mode": "on_view" }),
+    );
+    repoint_alpha(cx, &t, dir.path()).await;
     t.find(cx, "settings-view");
+    assert!(state(cx, &t).settings.dirty);
+    edit(
+        cx,
+        &t,
+        "settings::ResetClusterOverrides",
+        json!({ "cluster": "kind-alpha" }),
+    );
     let s = state(cx, &t).settings;
-    assert!(s.thresholds.rejected.is_empty(), "{s:?}");
-    assert!(s.can_save);
+    assert!(!s.dirty, "nothing is left to save: {s:?}");
 }

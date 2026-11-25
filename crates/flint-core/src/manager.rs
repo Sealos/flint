@@ -1545,37 +1545,13 @@ impl ClusterManager {
                 let _ = reply.send(applied);
             }
             Internal::WriteSettings { writes, reply } => {
-                // Every write is checked first, so one the file cannot take leaves the others
-                // unwritten too.
-                let dir = self.config.config_dir.clone();
-                let checks = writes.clone();
-                let checked = tokio::task::spawn_blocking(move || {
-                    checks.iter().try_for_each(|write| {
-                        write.check(&dir).map_err(|e| {
-                            format!(
-                                "{} cannot be saved: {}",
-                                write.what(),
-                                crate::redact::safe_error_summary(&e.to_string())
-                            )
-                        })
+                // One save for all of them: never some written without the others, and the
+                // settings applied once, so no in-between state takes effect.
+                let result = self
+                    .try_write_settings("the settings", move |dir| {
+                        settings::SettingsWrite::write_all(dir, &writes)
                     })
-                })
-                .await
-                .unwrap_or_else(|e| Err(format!("settings check failed: {e}")));
-                if let Err(why) = checked {
-                    self.emit(Event::Error(why.clone()));
-                    let _ = reply.send(Err(why));
-                    return;
-                }
-                let mut result = Ok(());
-                for write in writes {
-                    result = self
-                        .try_write_settings(write.what(), move |dir| write.write(dir))
-                        .await;
-                    if result.is_err() {
-                        break;
-                    }
-                }
+                    .await;
                 let _ = reply.send(result);
             }
             Internal::LateRead { paths, seq, read } => {

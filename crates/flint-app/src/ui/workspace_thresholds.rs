@@ -437,6 +437,15 @@ impl Workspace {
             .and_then(|entry| entry.target.cluster.as_ref())
             .is_some_and(|pin| pin.context == context);
         self.finish_threshold_entry(!own, window, cx);
+        // Edits made while the context pointed to another server are hidden now: they go too,
+        // or a later Save would still write them.
+        self.settings_page.draft.forget(|field| match field {
+            Field::Threshold {
+                cluster: Some(pin), ..
+            }
+            | Field::ClusterAlerts(pin) => pin.context == context,
+            _ => false,
+        });
         let rows = self.override_rows(cx);
         let row = rows.iter().find(|row| row.context == context);
         let mut changes = vec![Change::ClusterWatchMode {
@@ -551,10 +560,21 @@ impl Workspace {
             return;
         };
         let rows = self.override_rows(cx);
-        self.settings_page.thresholds.cursor_row = stop
-            .row()
-            .and_then(|index| rows.get(index))
-            .map(|row| row.context.clone());
+        self.settings_page.thresholds.cursor_row = match stop {
+            ThresholdStop::Pick(index) => {
+                let candidates =
+                    settings_thresholds::add_candidates(&self.settings_clusters(cx), &rows);
+                self.settings_page
+                    .thresholds
+                    .pick_scroll
+                    .scroll_to_item(index);
+                candidates.get(index).cloned()
+            }
+            _ => stop
+                .row()
+                .and_then(|index| rows.get(index))
+                .map(|row| row.context.clone()),
+        };
         self.settings_page
             .scroll
             .scroll_to_item(settings_thresholds::scroll_index(stop, rows.len()));
@@ -570,10 +590,21 @@ impl Workspace {
         let rows = self.override_rows(cx);
         let index_of = |context: &str| rows.iter().position(|row| row.context == context);
         if let Some(Stop::Threshold(stop)) = self.settings_page.cursor
-            && stop.row().is_some()
             && let Some(context) = &self.settings_page.thresholds.cursor_row
         {
-            self.settings_page.cursor = index_of(context).map(|i| Stop::Threshold(stop.at_row(i)));
+            if let ThresholdStop::Pick(_) = stop {
+                // A candidate is followed by name, and left for Add override once it is no
+                // longer offered, so Enter never adds another cluster.
+                let candidates =
+                    settings_thresholds::add_candidates(&self.settings_clusters(cx), &rows);
+                let pick = candidates.iter().position(|c| c == context);
+                self.settings_page.cursor = Some(Stop::Threshold(
+                    pick.map_or(ThresholdStop::Add, ThresholdStop::Pick),
+                ));
+            } else if stop.row().is_some() {
+                self.settings_page.cursor =
+                    index_of(context).map(|i| Stop::Threshold(stop.at_row(i)));
+            }
         }
         if let Some(entry) = &mut self.settings_page.thresholds.entry
             && let Some(pin) = &entry.target.cluster

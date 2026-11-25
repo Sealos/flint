@@ -3,8 +3,8 @@
 //! The draft holds only the fields the user changed, each with its new value, over the file as
 //! the core last reported it. What the view shows is the file with the edits on top
 //! ([`SettingsDraft::shown`]), so without edits it simply follows the file. Save writes the
-//! edited fields alone ([`SettingsDraft::edits`]), each through its own setter, so a change made
-//! elsewhere to another field survives; they leave the draft only once the core says they are
+//! edited fields alone ([`SettingsDraft::edits`]), all in one save, so a change made elsewhere
+//! to another field survives; they leave the draft only once the core says they are
 //! written ([`SettingsDraft::saved`]). The draft also remembers the file it was started over:
 //! when the file changes under a pending draft ([`SettingsDraft::changed_on_disk`]), the view
 //! says so and offers Reload or Save anyway.
@@ -92,6 +92,13 @@ impl SettingsDraft {
     /// longer applies to any cluster has nowhere to be fixed.
     pub fn retain_rejected(&mut self, mut keep: impl FnMut(&Field) -> bool) {
         self.rejected.retain(|field, _| keep(field));
+        self.settle();
+    }
+
+    /// Drops the edit and the rejected value of every field `forget` names.
+    pub fn forget(&mut self, mut forget: impl FnMut(&Field) -> bool) {
+        self.edits.retain(|field, _| !forget(field));
+        self.rejected.retain(|field, _| !forget(field));
         self.settle();
     }
 
