@@ -49,7 +49,8 @@ use super::super::registry::{
     ShowClusterSetList, ToggleClusterPicking, TogglePickedCluster,
 };
 use super::super::set_members::{
-    self, MemberAction, MemberCause, MemberLine, failed_cause, paused_text, refusal_cause,
+    self, MemberAction, MemberCause, MemberLine, MemberSignIn, failed_cause, paused_text,
+    refusal_cause,
 };
 #[cfg(any(test, feature = "automation"))]
 use super::super::view_state::{ClusterSetsState, OpenSetState, SetGroupState, SetMemberState};
@@ -1276,6 +1277,38 @@ impl Workspace {
     }
 
     /// Why a row of `cluster` cannot be opened or acted on now, if so.
+    /// For a click on a signed-out member's Sign in alone ([`MemberSignIn`]): runs its sign-in
+    /// once, now, bound to the member as the set admitted it and to the definitions its view
+    /// shows. The core refuses it if any of them changed since; why shows in the set's error.
+    /// Its rows come back with the member's next status.
+    pub(in super::super) fn sign_in_set_member(&mut self, cluster: &str, cx: &mut Context<Self>) {
+        let Some(member) = self
+            .sets
+            .running
+            .as_ref()
+            .and_then(|run| run.members.iter().find(|m| m.context() == cluster))
+            .cloned()
+        else {
+            return;
+        };
+        let model = self.model.read(cx);
+        let view = model.keep_watching(cluster);
+        let definition = view.and_then(|view| view.definition);
+        let shown = view.and_then(|view| view.shown_sign_in);
+        let asked = model.core().sign_in_member(&member, definition, shown);
+        self.sets.error = None;
+        cx.spawn(async move |ws, cx| {
+            if let Err(why) = asked.await {
+                let _ = ws.update(cx, |ws, cx| {
+                    ws.sets.error = Some(why);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
     pub(super) fn set_row_refusal(&self, cluster: &str, cx: &App) -> Option<String> {
         let names = self.cluster_names(cx);
         let shown = names.exact(cluster);
@@ -1641,9 +1674,10 @@ impl Workspace {
                 .into_any_element(),
         };
         // No member can show rows: the member block replaces the chips, the empty list and notes.
-        let body = self
-            .set_empty_state(run, cx)
-            .map_or(body, |lines| self.render_empty_members(lines, theme));
+        let body = self.set_empty_state(run, cx).map_or(body, |lines| {
+            let sign_in = MemberSignIn::new(cx.entity().downgrade());
+            self.render_empty_members(lines, &sign_in, theme)
+        });
         Some(
             v_flex()
                 .id("cluster-set-view")
@@ -1724,7 +1758,12 @@ impl Workspace {
     }
 
     /// The empty-state block: each member by its full name, why it shows nothing, and what to do.
-    fn render_empty_members(&self, lines: Vec<MemberLine>, theme: &Theme) -> AnyElement {
+    fn render_empty_members(
+        &self,
+        lines: Vec<MemberLine>,
+        sign_in: &MemberSignIn,
+        theme: &Theme,
+    ) -> AnyElement {
         v_flex()
             .id("set-members-empty")
             .flex_1()
@@ -1752,9 +1791,7 @@ impl Workspace {
                             let id = SharedString::from(format!("set-member-action-{cluster}"));
                             let button = Button::new(id).xsmall().outline().label(action.label());
                             match action {
-                                MemberAction::SignIn => button.on_click(registry::on_click(
-                                    set_members::sign_in_member(&cluster),
-                                )),
+                                MemberAction::SignIn => button.on_click(sign_in.on_click(&cluster)),
                                 MemberAction::Retry => button.on_click(registry::on_click(
                                     set_members::retry_member(&cluster),
                                 )),

@@ -2312,6 +2312,43 @@ async fn no_member_signed_in_shows_one_row_each_instead_of_the_list(cx: &mut Tes
     assert!(t.find(cx, "set-member-kind-alpha").is_none());
 }
 
+// A member's Sign in asks the core to sign that member in once, bound to the member as the set
+// admitted it; it selects nothing. Here the core's own member is not waiting for a sign-in, so
+// it refuses, and the set says why.
+#[gpui_kit::test]
+async fn sign_in_asks_the_core_for_that_member_and_selects_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_reports(
+        cx,
+        dir.path(),
+        vec![signed_out("kind-alpha"), signed_out("kind-beta")],
+    )
+    .await;
+    let active = t.workspace.read_with(cx, |ws, cx| {
+        ws.model
+            .read(cx)
+            .active_cluster()
+            .map(|c| c.info.name.clone())
+    });
+    t.wait_for_element(cx, "set-member-action-kind-beta").await;
+
+    t.click(cx, "set-member-action-kind-beta");
+    cx.run_until_parked();
+
+    let (error, now) = t.workspace.read_with(cx, |ws, cx| {
+        (
+            ws.sets.error.clone(),
+            ws.model
+                .read(cx)
+                .active_cluster()
+                .map(|c| c.info.name.clone()),
+        )
+    });
+    let error = error.expect("the core answered");
+    assert!(error.contains("kind-beta"), "{error}");
+    assert_eq!(now, active, "nothing was selected");
+}
+
 #[gpui_kit::test]
 async fn paused_members_are_listed_with_why_and_no_action(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();

@@ -128,8 +128,9 @@ pub struct CombinedResourceList {
     pub(in super::super) label: String,
     /// Which members lack this kind, or can't be confirmed to serve it.
     kind_note: Option<String>,
-    /// Members that need a sign-in: their chip says so, and a click signs in.
+    /// Members that need a sign-in: their chip says so, and a click signs in through this.
     signed_out: HashSet<ClusterId>,
+    member_sign_in: Option<set_members::MemberSignIn>,
     latest: CombinedSource,
     /// The source being drawn and its view. Always replaced together: a [`RowRef`] means
     /// nothing in any other list.
@@ -216,6 +217,7 @@ impl CombinedResourceList {
             label,
             kind_note: None,
             signed_out: HashSet::new(),
+            member_sign_in: None,
             shown: source.clone(),
             latest: source,
             view: Arc::new(CombinedView::default()),
@@ -1262,9 +1264,10 @@ impl CombinedResourceList {
                             },
                         ))
                     })
-                    .when(signed_out, |el| {
-                        el.on_click(registry::on_click(set_members::sign_in_member(&cluster)))
-                    })
+                    .when_some(
+                        self.member_sign_in.as_ref().filter(|_| signed_out),
+                        |el, sign_in| el.on_click(sign_in.on_click(&cluster)),
+                    )
                     .when_some(member.tag(), |el, tag| {
                         el.child(tag_dot(&cluster, tag, theme))
                     })
@@ -1301,8 +1304,14 @@ impl CombinedResourceList {
             }))
     }
 
-    /// Marks the members that need a sign-in on their chips.
-    pub fn set_signed_out(&mut self, members: HashSet<ClusterId>, cx: &mut Context<Self>) {
+    /// Marks the members that need a sign-in on their chips, whose click runs `sign_in`.
+    pub(in super::super) fn set_signed_out(
+        &mut self,
+        members: HashSet<ClusterId>,
+        sign_in: set_members::MemberSignIn,
+        cx: &mut Context<Self>,
+    ) {
+        self.member_sign_in = Some(sign_in);
         if self.signed_out != members {
             self.signed_out = members;
             cx.notify();

@@ -35,10 +35,10 @@ pub(super) struct PendingSignIn {
 
 impl ClusterManager {
     /// Signs member `member` in once, now, if it waits for a sign-in and is still exactly what
-    /// the view showed: the member admitted to the open set, on the definition `definition`
-    /// ([`KeepWatchView::definition`](crate::keep_watching::KeepWatchView)) and, for an exec
-    /// plugin, the plugin definition `shown` ([`KeepWatchView::shown_sign_in`]
-    /// (crate::keep_watching::KeepWatchView)). Anything else is refused and runs nothing.
+    /// the view showed: the member admitted to the open set, on the definition `definition` and,
+    /// for an exec plugin, the plugin definition `shown`, both as its
+    /// [`KeepWatchView`](crate::keep_watching::KeepWatchView) names them. Anything else is
+    /// refused and runs nothing.
     pub(super) fn sign_in_member(
         &mut self,
         member: &AdmittedMember,

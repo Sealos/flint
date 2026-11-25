@@ -7,7 +7,10 @@ use flint_core::handle::{MemberReport, MemberStatus};
 use flint_core::settings::ClusterPin;
 use flint_core::{ClusterId, ClusterSummary};
 
+use gpui_kit::{App, ClickEvent, WeakEntity, Window};
+
 use super::registry::SelectCluster;
+use super::workspace::Workspace;
 
 /// Why a member's rows cannot be shown or acted on now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +56,7 @@ impl MemberCause {
             }
             Self::Moved => format!("{shown} now points at another server"),
             Self::Paused => paused_text(shown),
-            Self::SignIn => format!("{shown} needs sign-in: select it in the sidebar"),
+            Self::SignIn => format!("{shown} needs sign-in: use its Sign in"),
             Self::Failed => return None,
         })
     }
@@ -149,12 +152,27 @@ pub(super) fn empty_state(members: MemberCauses) -> Option<Vec<MemberLine>> {
     lines.filter(|lines| !lines.is_empty())
 }
 
-/// The action of every "Sign in" in the set view: the chip of a signed-out member and a row of
-/// the empty-state block, each wrapped in `registry::on_click`. For now it selects the member in
-/// the sidebar, which is where a sign-in command runs; the one-shot sign-in replaces this body.
-pub(super) fn sign_in_member(cluster: &str) -> SelectCluster {
-    SelectCluster {
-        cluster: cluster.to_owned(),
+/// What every "Sign in" in the set view runs: the chip of a signed-out member and a row of the
+/// empty-state block. The click is the consent to run that member's sign-in command once, now
+/// ([`Workspace::sign_in_set_member`]). Deliberately not a registered action: no command palette
+/// entry, key binding or automation `dispatch` reaches it.
+#[derive(Clone)]
+pub(super) struct MemberSignIn(WeakEntity<Workspace>);
+
+impl MemberSignIn {
+    pub(super) fn new(workspace: WeakEntity<Workspace>) -> Self {
+        Self(workspace)
+    }
+
+    /// The click handler of `cluster`'s Sign in.
+    pub(super) fn on_click(
+        &self,
+        cluster: &str,
+    ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+        let (workspace, cluster) = (self.0.clone(), cluster.to_owned());
+        move |_, _, cx| {
+            let _ = workspace.update(cx, |ws, cx| ws.sign_in_set_member(&cluster, cx));
+        }
     }
 }
 
@@ -247,7 +265,7 @@ mod tests {
             MemberCause::SignIn
                 .refusal("a")
                 .unwrap()
-                .contains("sidebar")
+                .contains("Sign in")
         );
     }
 }
