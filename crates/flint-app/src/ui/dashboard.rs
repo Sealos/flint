@@ -554,6 +554,11 @@ fn metrics(input: &DashboardInput<'_>) -> MetricsPanel {
             )
             .map(Iterator::collect)
             .unwrap_or_default();
+        let times: Vec<Option<Timestamp>> = input
+            .trends
+            .sample_times(&input.snapshot.cluster, input.now)
+            .map(Iterator::collect)
+            .unwrap_or_default();
         let recent = samples
             .iter()
             .rev()
@@ -568,6 +573,7 @@ fn metrics(input: &DashboardInput<'_>) -> MetricsPanel {
             value,
             shape: Arc::new(SparklineShape::new(
                 samples,
+                times,
                 input.now,
                 POLL_INTERVAL,
                 format,
