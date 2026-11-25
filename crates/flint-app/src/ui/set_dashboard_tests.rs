@@ -9,13 +9,18 @@ use flint_core::metrics_trend::TrendStore;
 use flint_core::telemetry::{Availability, ClusterTelemetry, MetricsCheck};
 use flint_core::thresholds::{ThresholdLevel, Thresholds};
 use flint_core::{KindId, KindSnapshot, SyncState};
+<<<<<<< HEAD
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AppContext as _, Entity, TestAppContext, WindowOptions};
+=======
+use gpui_kit::test::TestAppContextExt as _;
+use gpui_kit::{AppContext as _, Entity, TestAppContext};
+>>>>>>> origin/master
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use super::super::super::list::{CountedObjects, ObjectFilter};
-use super::super::super::support_tests::{TestWorkspace, objects, open_workspace};
+use super::super::super::support_tests::{TestWorkspace, WAIT, objects, open_workspace};
 use super::super::feed::{FeedId, ProblemList, ProblemLists};
 use super::super::{METRICS_WAITING, NO_VALUE, ProblemTile, category_label};
 use super::{
@@ -719,6 +724,12 @@ async fn closing_the_set_closes_its_dashboard(cx: &mut TestAppContext) {
     let (t, _view) = open_set(cx, dir.path()).await;
     t.dispatch(cx, "cluster_sets::CloseClusterSet", Value::Null)
         .unwrap();
+    // An unsaved set asks before it closes.
+    cx.wait_for(t.window, WAIT, |window, cx| {
+        gpui_kit::component::WindowExt::has_active_dialog(window, cx)
+    })
+    .await;
+    t.click(cx, "ok");
     cx.run_until_parked();
     assert!(!dashboard_open(cx, &t));
     assert!(!t.workspace.read_with(cx, |ws, _| ws.set_is_open_for_test()));

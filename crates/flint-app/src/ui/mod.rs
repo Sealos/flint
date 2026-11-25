@@ -59,6 +59,9 @@ mod row_menu;
 mod scope_picker;
 mod set_kinds;
 mod settings_draft;
+mod settings_thresholds;
+#[cfg(test)]
+mod settings_thresholds_tests;
 mod settings_view;
 #[cfg(test)]
 mod settings_view_tests;
@@ -71,6 +74,7 @@ mod terminal_model;
 mod terminal_palette;
 mod terminal_view;
 mod theme;
+mod tooltip_text;
 mod ui_state;
 #[cfg(any(test, feature = "automation"))]
 mod view_state;

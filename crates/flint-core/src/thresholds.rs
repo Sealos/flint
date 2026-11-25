@@ -357,6 +357,54 @@ impl ThresholdSettings {
     pub fn is_empty(&self) -> bool {
         self.global.is_empty() && self.clusters.iter().all(|c| c.overrides.is_empty())
     }
+
+    /// The value set for `metric` at one level: the global values (`cluster` is `None`) or
+    /// that cluster's overrides. `None` when that level leaves it to the next one down.
+    pub fn explicit(&self, cluster: Option<&ClusterPin>, metric: ThresholdMetric) -> Option<u32> {
+        match cluster {
+            None => self.global.get(metric),
+            Some(pin) => self
+                .clusters
+                .iter()
+                .find(|entry| entry.cluster.matches(&pin.context, &pin.server))
+                .and_then(|entry| entry.overrides.get(metric)),
+        }
+    }
+
+    /// Sets `metric` at one level, or clears it with `None`, in memory as
+    /// [`crate::settings::set_threshold`] does in the file: a cluster entry is added for the
+    /// first override and removed with the last. A value out of range changes nothing.
+    pub fn set(
+        &mut self,
+        cluster: Option<&ClusterPin>,
+        metric: ThresholdMetric,
+        value: Option<u32>,
+    ) -> Result<(), ThresholdError> {
+        let Some(pin) = cluster else {
+            return self.global.set(metric, value);
+        };
+        let is_this = |entry: &ClusterThresholds| entry.cluster.matches(&pin.context, &pin.server);
+        let mut found = false;
+        for entry in self.clusters.iter_mut().filter(|entry| is_this(entry)) {
+            entry.overrides.set(metric, value)?;
+            found = true;
+        }
+        match value {
+            Some(_) if !found => {
+                let mut overrides = ThresholdOverrides::default();
+                overrides.set(metric, value)?;
+                self.clusters.push(ClusterThresholds {
+                    cluster: pin.clone(),
+                    overrides,
+                });
+            }
+            Some(_) => {}
+            None => self
+                .clusters
+                .retain(|entry| !(is_this(entry) && entry.overrides.is_empty())),
+        }
+        Ok(())
+    }
 }
 
 impl<'de> Deserialize<'de> for ThresholdSettings {

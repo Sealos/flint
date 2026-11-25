@@ -27,6 +27,7 @@ mod m3;
 mod m3_edit_actions;
 mod m3_write_requests;
 mod m3_writes;
+mod m4;
 mod notifications;
 mod quit;
 mod settings;

@@ -635,7 +635,7 @@ async fn never_preselects_quit_or_close_window(cx: &mut TestAppContext) {
 
     // Short or scattered: not selected. "flint" is only a later word of Quit Flint, so About
     // Flint comes first.
-    for query in ["q", "qt", "qu", "flint"] {
+    for query in ["q", "qt", "qtf", "qu", "flint"] {
         let palette = showing(cx, &t, query).await;
         let first = preselected(&palette);
         assert!(
@@ -656,15 +656,68 @@ async fn never_preselects_quit_or_close_window(cx: &mut TestAppContext) {
 
     // A scattered match listing only Quit: Enter runs nothing until an arrow key selects it.
     open_palette(cx, &t).await;
-    t.type_text(cx, "qtf");
+    t.type_text(cx, "qf");
     let palette = shown(cx, &t);
     assert_eq!(labels(&palette), ["Quit Flint"]);
     assert_eq!(palette.selected, None, "{palette:?}");
     t.press(cx, "enter");
-    assert_eq!(shown(cx, &t).query, "qtf", "Enter ran nothing");
+    assert_eq!(shown(cx, &t).query, "qf", "Enter ran nothing");
     t.press(cx, "down");
     assert_eq!(selected(&shown(cx, &t)), "Quit Flint");
     t.press(cx, "escape");
+}
+
+#[test]
+fn empty_query_puts_selected_object_actions_before_global_actions() {
+    use super::{Candidate, Entry, Row, action_rows};
+
+    let (entries, candidates): (Vec<_>, Vec<_>) = [
+        ("flint::AppearanceSystem", Some(0)),
+        ("detail::Close", None),
+        ("detail::OpenLogs", None),
+        ("detail::OpenShell", Some(1)),
+        ("workspace::DeleteObject", None),
+        ("workspace::ScaleObject", None),
+    ]
+    .into_iter()
+    .map(|(name, recent)| {
+        let spec = registry::find(name).unwrap();
+        (
+            Entry {
+                spec,
+                shortcut: None,
+            },
+            Candidate {
+                label: spec.label.into(),
+                alt: None,
+                recent,
+                last: false,
+            },
+        )
+    })
+    .unzip();
+    let listed = |query| {
+        action_rows(query, &entries, &candidates)
+            .into_iter()
+            .map(|row| match row {
+                Row::Action { entry, .. } => entries[entry].spec.label,
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        listed(""),
+        [
+            "Open Shell",
+            "Open Logs",
+            "Delete Selected Object",
+            "Scale Selected Workload",
+            "Close Detail",
+            "Use System Appearance"
+        ]
+    );
+    assert_eq!(listed("  "), listed(""));
+    assert_eq!(listed("appearance"), ["Use System Appearance"]);
 }
 
 /// A pod `name` in `demo` with containers `app` and `sidecar`, selected and shown in the detail

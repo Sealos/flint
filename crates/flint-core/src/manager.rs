@@ -40,6 +40,7 @@ mod disconnect;
 mod file_watch;
 mod forwards;
 mod helm;
+mod history;
 mod keep_watching;
 mod keep_watching_lists;
 mod running_set;
@@ -575,6 +576,8 @@ pub(crate) struct ClusterManager {
     /// The running telemetry feeds, as the front end reads them.
     telemetry: crate::telemetry::TelemetryBoard,
     telemetry_timing: crate::telemetry::TelemetryTiming,
+    /// Each watched cluster's CPU and memory history, which outlives the feeds writing it.
+    histories: history::TrendHistories,
     /// The clusters the user unlocked for this session, shared with the front end (ADR-0015).
     unlocks: SessionUnlocks,
     /// Contexts the last load did not show, listed only because a file that defined them can't
@@ -652,6 +655,7 @@ impl ClusterManager {
             log_budget,
             telemetry: Default::default(),
             telemetry_timing: Default::default(),
+            histories: Default::default(),
             unlocks,
             held: HashSet::new(),
             settled: SettledDefinitions::default(),
@@ -1493,25 +1497,11 @@ impl ClusterManager {
     /// Takes new settings (or the error loading them, which means nothing is exposed), emits them
     /// if they changed, and reloads kubeconfig if the file list changed.
     async fn apply_settings(&mut self, result: Result<Settings, String>) {
-        let (settings, error) = match result {
-            Ok(s) => (s, None),
-            Err(e) => {
-                // Expose nothing (as the MCP server does), trust nothing and protect local
-                // clusters too (as at startup), but keep the other settings, so a typo does
-                // not make clusters from extra kubeconfig files disappear. An entry removed by
-                // hand behind the typo must not stay in force.
-                tracing::warn!(
-                    "settings.toml unreadable; nothing is exposed to AI or trusted, and local \
-                     clusters are protected: {}",
-                    crate::redact::safe_error_summary(&e)
-                );
-                let kept = (*self.settings).clone().unreadable_fallback();
-                (
-                    kept,
-                    Some(crate::connection::proxy::settings_error_with_proxy_note(e)),
-                )
-            }
-        };
+        let (settings, error) = settings_in_force(
+            result,
+            &self.settings,
+            crate::connection::proxy::setting_unreadable_at_startup(),
+        );
         if *self.settings == settings && self.settings_error == error {
             return;
         }
@@ -1545,15 +1535,13 @@ impl ClusterManager {
                 let _ = reply.send(applied);
             }
             Internal::WriteSettings { writes, reply } => {
-                let mut result = Ok(());
-                for write in writes {
-                    result = self
-                        .try_write_settings(write.what(), move |dir| write.write(dir))
-                        .await;
-                    if result.is_err() {
-                        break;
-                    }
-                }
+                // One save for all of them: never some written without the others, and the
+                // settings applied once, so no in-between state takes effect.
+                let result = self
+                    .try_write_settings("the settings", move |dir| {
+                        settings::SettingsWrite::write_all(dir, &writes)
+                    })
+                    .await;
                 let _ = reply.send(result);
             }
             Internal::LateRead { paths, seq, read } => {
@@ -3308,10 +3296,71 @@ fn keep_skipped_groups(
     kinds
 }
 
+/// The settings in force after loading `settings.toml` gave `result`, with the error the banner
+/// shows, if any. `current` is what was in force before; `unreadable_at_startup` says the file
+/// could not be read when Flint started, so its proxy setting can't apply before a restart.
+fn settings_in_force(
+    result: Result<Settings, String>,
+    current: &Settings,
+    unreadable_at_startup: bool,
+) -> (Settings, Option<String>) {
+    use crate::connection::proxy;
+    match result {
+        // Readable again, but its proxy setting is still unknown to this process: clusters that
+        // would take it stay refused, so the rest stays closed too and the banner stays up.
+        Ok(s) if unreadable_at_startup => (
+            s.unreadable_fallback(),
+            Some(proxy::RESTART_TO_APPLY.to_owned()),
+        ),
+        Ok(s) => (s, None),
+        Err(e) => {
+            // Expose nothing (as the MCP server does), trust nothing and protect local clusters
+            // too (as at startup), but keep the other settings, so a typo does not make
+            // clusters from extra kubeconfig files disappear. An entry removed by hand behind
+            // the typo must not stay in force.
+            tracing::warn!(
+                "settings.toml unreadable; nothing is exposed to AI or trusted, and local \
+                 clusters are protected: {}",
+                crate::redact::safe_error_summary(&e)
+            );
+            (
+                current.clone().unreadable_fallback(),
+                Some(proxy::with_proxy_note(e, unreadable_at_startup)),
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::connection::member::MemberState;
+
+    #[test]
+    fn settings_readable_again_after_an_unreadable_start_wait_for_a_restart() {
+        let readable = Settings {
+            protect_local_clusters: false,
+            ..Settings::default()
+        };
+        let current = Settings::default().unreadable_fallback();
+
+        let (settings, error) = settings_in_force(Ok(readable.clone()), &current, true);
+        assert_eq!(
+            error.as_deref(),
+            Some(crate::connection::proxy::RESTART_TO_APPLY)
+        );
+        assert!(settings.protect_local_clusters, "nothing opens up");
+
+        let (settings, error) = settings_in_force(Ok(readable.clone()), &current, false);
+        assert_eq!(error, None);
+        assert_eq!(settings, readable);
+
+        let (_, error) = settings_in_force(Err("bad".into()), &readable, true);
+        assert!(error.unwrap().contains("restarts"));
+        let (settings, error) = settings_in_force(Err("bad".into()), &readable, false);
+        assert_eq!(error.as_deref(), Some("bad"));
+        assert!(settings.protect_local_clusters);
+    }
 
     // covers UP-20, UP-22
     #[test]

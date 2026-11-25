@@ -558,7 +558,7 @@ M3 used every number in the 5x block, so its later paths continue at UP-121.
 ### UP-61 See resource usage
 - **Then** pod and node lists show CPU and memory from metrics-server, refreshed about every 15 s. If metrics-server is
   missing, the columns are hidden and a hint is shown.
-- Tests: cluster (`flint-e2e/tests/telemetry.rs`, with and without metrics-server), ui (`ui/list_usage.rs`).
+- Tests: e2e (fake API server: `flint-e2e/tests/dashboard_usage.rs`, `telemetry.rs`, with and without metrics-server), e2e (`tests/app/m4.rs`, the hint), ui (`ui/list_usage.rs`).
 
 ### UP-62 See how a namespace's workloads fit together
 - **When** I open the diagram for the `demo` namespace.
@@ -593,14 +593,22 @@ M3 used every number in the 5x block, so its later paths continue at UP-121.
 - **Then** I see CPU and memory used against allocatable, and requests and limits against capacity, per node and in
   total, each with a sparkline of the last hour that keeps growing while I stay connected. Without metrics-server the
   tiles say how to install it.
-- Tests: unit (ring buffer, aggregation), ui.
+- Tests: unit (ring buffer, aggregation), e2e (fake API server: `flint-e2e/tests/dashboard_usage.rs`; the growing sparkline needs a
+  clock control), ui.
 
 ### UP-67 Set warning thresholds
-- **Status:** planned (#102, not in 0.5.0), not built yet.
-- **When** I open the dashboard's Thresholds panel and set CPU warnings at 80% for this cluster only.
-- **Then** this cluster's tiles warn from 80%, other clusters keep the global default, and `settings.toml` holds the
-  typed override.
-- Tests: unit (settings), ui.
+- **When** I open Settings > Thresholds and type a global value (CPU %, memory %, restarts or Warning events in the
+  last hour, seconds a pod may stay Pending), or open Settings > Cluster overrides, add an override for this cluster
+  and set CPU warnings at 80% for it alone, then press Save.
+- **Then** this cluster's tiles warn from 80%, other clusters keep the global value, and `settings.toml` holds the
+  typed values (`[thresholds]` and a `[[thresholds.clusters]]` entry pinned to the cluster's server). An empty field
+  follows the level below. A number outside its metric's range, or not a whole number, stays in its field with the
+  reason under it, and Save is blocked until I fix it or revert. Cluster overrides lists only the clusters whose
+  thresholds, desktop alerts or watch mode differ from the global settings, with a Reset per row that clears all of
+  that cluster's overrides. The Alerts menu's Pending Pods submenu writes the same keys. From the keyboard, Tab
+  reaches each field, Enter opens it for typing, Enter enters the number and Esc drops it.
+- Tests: unit (settings writes, range validation, override rows), ui (`settings_thresholds_tests.rs`), e2e
+  (`flint-e2e/tests/app/settings.rs`).
 
 ### UP-68 Follow recent activity
 - **Status:** planned (#101, not in 0.5.0), not built yet.
@@ -716,13 +724,13 @@ M5.5 was added after M5 and M6 were numbered, so it shares the 7x block with M5 
 
 ### UP-79 Warm clusters stay bounded and quiet
 - **Status:** planned (#247, After 1.0), not built yet.
-- **When** I use more clusters than `warm_clusters`, the background clusters go over `warm_memory_mib`, a warm
+- **When** I use more clusters than `warm_clusters`, a warm
   cluster sits unused for 30 minutes, the Mac sleeps, or a warm cluster's credential expires.
 - **Then** the least recently used (or the affected) cluster goes cold, and the sidebar shows it. An expired
   credential shows a "sign-in needed" badge, and no exec plugin runs until I click the cluster. Background errors
   show only in the sidebar, never as toasts. Disconnect makes a warm cluster cold by hand. With 3 idle warm
   clusters, Flint uses under 1% CPU.
-- Tests: unit (eviction, budget, idle limit), cluster, manual (exec-plugin cluster).
+- Tests: unit (eviction, idle limit), cluster, manual (exec-plugin cluster).
 
 ---
 
@@ -804,7 +812,8 @@ Deferred until cluster sets are scheduled (#199).
 
 ### UP-126 Change settings in Settings
 - **When** I open Settings (Flint > Settings…, Cmd-, on macOS and Ctrl-, on Linux, or the command palette) and change
-  the appearance, desktop notifications or the default watch mode.
+  the appearance, desktop notifications, the default watch mode, the warning thresholds or a cluster's overrides
+  (UP-67).
 - **Then** the main area shows Settings with its sections on the left. My edits wait in a draft until I press Save,
   which writes only the settings I edited to `settings.toml`; Revert drops them. The draft stays while I switch views
   and clusters, and the sidebar's Settings entry shows a dot meanwhile. If `settings.toml` changes while the draft
