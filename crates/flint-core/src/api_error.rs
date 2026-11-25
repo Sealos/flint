@@ -293,6 +293,10 @@ fn classify_one(e: &(dyn StdError + 'static)) -> Option<Transport> {
     if let Some(tls) = e.downcast_ref::<rustls::Error>() {
         return Some(Transport::Tls(tls_problem(tls)));
     }
+    // A `socks5://` proxy is given an address, so the name is looked up first, here.
+    if e.is::<crate::connection::proxy::UnresolvedName>() {
+        return Some(Transport::Unresolved);
+    }
     if let Some(io) = e.downcast_ref::<std::io::Error>() {
         return match io.kind() {
             ErrorKind::ConnectionRefused => Some(Transport::Refused),

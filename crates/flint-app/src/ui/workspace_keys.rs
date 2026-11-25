@@ -152,7 +152,11 @@ impl Workspace {
         if let Some(list) = &self.list {
             panes.push((Pane::List, list.read(cx).focus_handle().clone()));
         }
-        if let Some(detail) = &self.detail {
+        if let Some(detail) = self
+            .detail
+            .as_ref()
+            .filter(|_| !self.detail_hidden_by_menu(cx))
+        {
             panes.push((Pane::Detail, detail.read(cx).focus_handle().clone()));
         }
         if let Some(dock) = self.dock.read(cx).shown_tab_focus(cx) {

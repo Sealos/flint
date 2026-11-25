@@ -275,6 +275,9 @@ pub(super) struct DrawnLinks {
     pub(super) focus: FocusHandle,
 }
 
+/// What a click on a link that no longer holds says.
+const STALE_LINK: &str = "That link changed while you clicked, so nothing opened. Try again.";
+
 /// How a confirmed link is performed: [`registry::dispatch_in`].
 type Dispatch =
     fn(&FocusHandle, &dyn Action, &mut Window, &mut App) -> Result<(), registry::ActionError>;
@@ -296,6 +299,14 @@ impl DrawnLinks {
             .unwrap_or(false)
     }
 
+    /// Tells the person a link they clicked no longer holds: the values on screen were read
+    /// again, so nothing happened and they should look at what is shown now.
+    fn say_changed(&self, cx: &mut App) {
+        let _ = self.view.update(cx, |_, cx| {
+            cx.emit(DashboardEvent::CannotOpen(STALE_LINK.to_owned()));
+        });
+    }
+
     /// Dispatches `action` while `holds` says the model still links to it.
     pub(super) fn on_click<E: ?Sized, A: 'static>(
         &self,
@@ -307,6 +318,8 @@ impl DrawnLinks {
         move |event, window, cx| {
             if links.hold(|model| holds(model, &action), cx) {
                 perform(event, window, cx);
+            } else {
+                links.say_changed(cx);
             }
         }
     }
@@ -323,6 +336,7 @@ impl DrawnLinks {
         let (key, object, uid) = (row.key.clone(), row.object.clone(), row.object_uid.clone());
         move |_, window, cx| {
             if !links.hold(|model| model.links_warning(&key, &open), cx) {
+                links.say_changed(cx);
                 return;
             }
             let target = WarningTarget {
