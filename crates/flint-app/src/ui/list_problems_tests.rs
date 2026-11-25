@@ -75,6 +75,7 @@ fn snapshot_judging(
         counts: ProblemSummariser::default().summarise(&ProblemSnapshot::unavailable(), at),
         metrics: Default::default(),
         capacity: None,
+        pods: None,
         inventory: Default::default(),
         rollouts: Default::default(),
         version: Default::default(),
