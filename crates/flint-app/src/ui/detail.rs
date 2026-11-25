@@ -808,6 +808,7 @@ impl DetailView {
                     .children(self.render_shell_button())
                     .child(
                         Button::new("detail-refresh")
+                            .accessibility_label("Fetch again")
                             .icon(IconName::RefreshCw)
                             .xsmall()
                             .ghost()
@@ -816,6 +817,7 @@ impl DetailView {
                     )
                     .child(
                         Button::new("detail-close")
+                            .accessibility_label("Close")
                             .icon(IconName::Close)
                             .xsmall()
                             .ghost()
@@ -1802,6 +1804,11 @@ impl DetailView {
                 )
                 .child(
                     Button::new(SharedString::from(format!("reveal-{}", entry.key)))
+                        .accessibility_label(if revealed {
+                            format!("Hide value of {}", entry.key)
+                        } else {
+                            format!("Reveal value of {}", entry.key)
+                        })
                         .icon(if revealed {
                             IconName::EyeOff
                         } else {

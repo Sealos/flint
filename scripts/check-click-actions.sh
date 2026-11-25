@@ -5,6 +5,8 @@
 # (`registry::on_click(..)`, `registry::perform(..)`). A handler that is not a control (it only
 # stops a click from reaching the row under it) says so on the line before:
 #   // not-an-action: <why>
+# An icon-only `Button` must also carry a name for assistive technology: a `.label(`,
+# `.accessibility_label(` or `.aria_label(` within the next 14 lines (a tooltip is not a name).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -21,6 +23,25 @@ while IFS= read -r f; do
         for (j = i; j <= i + 3 && j <= NR; j++) if (line[j] ~ /registry::/) ok = 1
         if (i > 1 && line[i - 1] ~ /\/\/ not-an-action:/) ok = 1
         if (!ok) { printf "error: %s:%d: click handler does not perform a registered action\n", file, i; bad = 1 }
+      }
+      exit bad
+    }' "$f" || fail=1
+done < <(find crates/flint-app/src/ui -name '*.rs' | sort)
+
+while IFS= read -r f; do
+  case "$(basename "$f")" in *tests.rs) continue ;; esac
+  awk -v file="$f" '
+    { line[NR] = $0 }
+    END {
+      bad = 0
+      for (i = 1; i <= NR; i++) {
+        if (line[i] !~ /Button::new\(/ || line[i] ~ /^[[:space:]]*\/\//) continue
+        ok = 0
+        for (j = i; j <= i + 14 && j <= NR; j++) {
+          if (j > i && line[j] ~ /Button::new\(/) break
+          if (line[j] ~ /\.label\(|accessibility_label\(|\.aria_label\(/) ok = 1
+        }
+        if (!ok) { printf "error: %s:%d: button has no accessible name\n", file, i; bad = 1 }
       }
       exit bad
     }' "$f" || fail=1
