@@ -198,7 +198,7 @@ fn without_server_owned(object: &Value) -> Value {
 /// `status` counts only when the text sets it: otherwise the write keeps the cluster's. Then it
 /// is the status the review's dry run wrote (`reviewed_after`, the review's after text), which an
 /// admission webhook may have changed from the typed one: the cluster's if the review did not
-/// show one.
+/// show one. Without a review, the typed one.
 fn competing_changes(
     seen: &[Value],
     latest: &Value,
@@ -216,9 +216,12 @@ fn competing_changes(
         );
     }
     let sets_status = edited.get("status").is_some();
-    if sets_status && let Some(fields) = edited.as_object_mut() {
-        let written = reviewed_after
-            .and_then(|after| serde_saphyr::from_str::<Value>(after).ok())
+    if sets_status
+        && let Some(after) = reviewed_after
+        && let Some(fields) = edited.as_object_mut()
+    {
+        let written = serde_saphyr::from_str::<Value>(after)
+            .ok()
             .and_then(|mut after| after.get_mut("status").map(Value::take))
             .or_else(|| latest.get("status").cloned());
         match written {
