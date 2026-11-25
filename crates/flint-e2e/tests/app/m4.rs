@@ -1,7 +1,7 @@
 //! M4 user paths: curated views and metrics (docs/USER-PATHS.md).
 //!
-//! The pod and node lists' readings are in `dashboard_usage.rs`: the app's lists do not show the
-//! CPU and Memory columns against the fake metrics-server yet, so only the hint is checked here.
+//! The pod and node lists' readings are in `dashboard_usage.rs`; here the app's pod list shows the
+//! CPU and Memory columns against the fake metrics-server, and the hint without one.
 //!
 //! Not here: UP-60 (the detail pane's container states, rollout progress and endpoints) has no
 //! automation state to read yet, UP-62 to UP-64 need the diagram, which is not built, and
@@ -11,7 +11,7 @@
 use anyhow::Result;
 use flint_e2e::app::{App, AppOptions};
 use flint_e2e::backend::TestCluster;
-use flint_e2e::fake_api::Options;
+use flint_e2e::fake_api::{MetricsTarget, Options};
 use serde_json::{Value, json};
 
 use crate::support::*;
@@ -30,6 +30,24 @@ fn has_usage_columns(state: &Value) -> bool {
     let columns = state["list"]["columns"].as_array().expect("list columns");
     assert!(!columns.is_empty(), "the list has no columns");
     columns.contains(&json!("CPU")) || columns.contains(&json!("Memory"))
+}
+
+// covers UP-61: with metrics-server the pod list shows the CPU and Memory columns, wide enough
+// that none is shed.
+#[test]
+#[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
+fn up_61_with_metrics_server_the_pod_list_shows_cpu_and_memory() -> Result<()> {
+    let (cluster, app) = fake_app(Options::default())?;
+    cluster.fake_server().expect("a fake server").set_metrics(
+        &MetricsTarget::pod("demo", "crash-loop"),
+        "30m",
+        "20Mi",
+    );
+    open_live(&app, "pods", 17)?;
+    app.wait_for("/list/columns", Contains(json!("CPU")))?;
+    app.wait_for("/list/columns", Contains(json!("Memory")))?;
+    app.screenshot_themes("up61-pod-usage-bars")?;
+    Ok(())
 }
 
 // covers UP-61: without metrics-server the columns are hidden and a hint says why.

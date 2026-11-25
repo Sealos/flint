@@ -82,7 +82,7 @@ impl DetailUsage {
                 self.source.hint().map(UsagePanel::Hint)
             }
             UsageSource::Unknown => Some(unknown_lines()),
-            UsageSource::Nodes(usage) => Some(match usage.get(name) {
+            UsageSource::Nodes(usage, _) => Some(match usage.get(name) {
                 Some(&used) => {
                     let allocatable = match self.budget {
                         Some(Budget::Node(amounts)) => Some(amounts),
@@ -92,7 +92,7 @@ impl DetailUsage {
                 }
                 None => unknown_lines(),
             }),
-            UsageSource::Pods(usage) => {
+            UsageSource::Pods(usage, _) => {
                 let key = (namespace?.to_owned(), name.to_owned());
                 let sample = usage
                     .get(&key)
@@ -230,7 +230,7 @@ mod tests {
         }
         .sample();
         let key = ("ns".to_owned(), "web".to_owned());
-        UsageSource::Pods(Arc::new([(key, sample)].into_iter().collect()))
+        UsageSource::Pods(Arc::new([(key, sample)].into_iter().collect()), None)
     }
 
     fn pod_object() -> Value {
@@ -295,9 +295,10 @@ mod tests {
 
     #[test]
     fn a_node_shows_use_against_allocatable() {
-        let source = UsageSource::Nodes(Arc::new(
-            [("n1".to_owned(), usage(1000, 512))].into_iter().collect(),
-        ));
+        let source = UsageSource::Nodes(
+            Arc::new([("n1".to_owned(), usage(1000, 512))].into_iter().collect()),
+            None,
+        );
         let mut detail = DetailUsage::default();
         detail.set_object(
             Some(UsageSubject::Nodes),
@@ -316,9 +317,10 @@ mod tests {
 
     #[test]
     fn a_node_with_no_readable_allocatable_says_so() {
-        let source = UsageSource::Nodes(Arc::new(
-            [("n1".to_owned(), usage(10, 20))].into_iter().collect(),
-        ));
+        let source = UsageSource::Nodes(
+            Arc::new([("n1".to_owned(), usage(10, 20))].into_iter().collect()),
+            None,
+        );
         let mut detail = DetailUsage::default();
         detail.set_object(Some(UsageSubject::Nodes), &json!({"status": {}}));
         detail.set_source(source);
