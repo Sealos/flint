@@ -138,7 +138,7 @@ fn always_allowed() -> CredentialGrant {
 /// [`resolve_with_grant`] under the policy every connection has today.
 async fn resolve(config: &mut kube::Config, context: &str) -> Result<Resolved, AuthError> {
     let grant = CredentialAccess::always().grant(CredentialSource::of(&config.auth_info));
-    resolve_with_grant(config, context, &grant).await
+    resolve_with_grant(config, context, &grant, None).await
 }
 
 async fn config(kubeconfig: &Kubeconfig) -> kube::Config {
@@ -776,6 +776,7 @@ async fn a_refresh_waiting_for_the_foreground_times_out_without_cooldown() {
     let state = Arc::new(tokio::sync::Mutex::new(TokenState {
         context: context.clone(),
         exec: exec.clone(),
+        proxy: Vec::new(),
         token: SecretString::from("t-old"),
         expires: "2000-01-01T00:00:00Z".parse().unwrap(),
         refreshing: None,
@@ -796,7 +797,7 @@ async fn a_refresh_waiting_for_the_foreground_times_out_without_cooldown() {
         .await
     };
     let Err(error) = token
-        .start_refresh(exec, context, waiting_for_foreground)
+        .start_refresh(exec, Vec::new(), context, waiting_for_foreground)
         .await
     else {
         panic!("the plugin should time out waiting for the foreground");
@@ -1255,6 +1256,7 @@ async fn a_refresh_that_died_is_replaced() {
         state: Arc::new(tokio::sync::Mutex::new(TokenState {
             context: "ctx".into(),
             exec,
+            proxy: Vec::new(),
             token: SecretString::from("t-old"),
             expires: "2000-01-01T00:00:00Z".parse().unwrap(),
             refreshing: Some(died),
@@ -1273,6 +1275,7 @@ fn a_retry_ends_the_rest_of_its_own_cluster_only() {
     let resting = |context: &str| TokenState {
         context: context.into(),
         exec: ExecConfig::default(),
+        proxy: Vec::new(),
         token: SecretString::from("t"),
         expires: Timestamp::now(),
         refreshing: None,
@@ -1312,9 +1315,13 @@ async fn a_lease_ended_before_the_spawn_starts_no_plugin() {
     access.set_role(crate::connection::policy::Role::Background);
 
     let mut started = false;
-    let result = run(&exec, &lease, std::future::ready(Acquired::None), || {
-        started = true
-    })
+    let result = run(
+        &exec,
+        &[],
+        &lease,
+        std::future::ready(Acquired::None),
+        || started = true,
+    )
     .await;
 
     assert!(matches!(result, Err(ref error) if is_not_allowed(error)));
