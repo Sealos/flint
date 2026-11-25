@@ -19,6 +19,10 @@ use serde_json::Value;
 
 use crate::table::{Column, ColumnRole, wire_role};
 
+/// What a hidden Secret value reads as wherever the app shows one. The YAML editor shows it too,
+/// and an edit that leaves it in place keeps the value on the cluster ([`crate::secret_edit`]).
+pub const SECRET_MASK: &str = "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}";
+
 /// Secret annotations whose values are shown.
 const SAFE_SECRET_ANNOTATIONS: &[&str] = &[
     "kubernetes.io/service-account.name",
