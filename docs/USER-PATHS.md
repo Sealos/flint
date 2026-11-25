@@ -451,8 +451,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **Then** a confirmation names the cluster, server, namespace and object, after any GitOps warning. Delete and Drain
   take the button: Enter cancels them. Scale asks for the count first and shows from and to; it applies to
   Deployments, StatefulSets, ReplicaSets, ReplicationControllers, and custom resources whose definition declares a
-  `scale` subresource with replica paths Flint can read (scaled through that subresource). A confirmation left open
-  closes, saying why, once the object is replaced or, for Scale, its count changes. Drain first offers two
+  `scale` subresource with replica paths Flint can read (the field its definition names at review is patched on the
+  object itself, so the review's field is the one written). A confirmation left open closes, saying why, once the
+  object is replaced, its row leaves the selection or, for Scale, its count changes. Drain first offers two
   unchecked options (delete emptyDir data, force pods without a controller), each saying what is lost; completed and
   failed pods are removed whatever they say. Drain's warning also names GitOps-managed pods it would evict. Each
   action rechecks the live object first. If the object changed, nothing is run again: a new review opens, saying

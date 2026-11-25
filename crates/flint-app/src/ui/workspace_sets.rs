@@ -1309,6 +1309,8 @@ impl Workspace {
             self.clear_action_error(cx);
             self.detail = None;
             self._detail_subscriptions.clear();
+            // The pane that watched a confirmation's object is gone with its row.
+            self.close_changed_confirmations(window, cx);
             let focus = list.read(cx).focus_handle().clone();
             window.focus(&focus, cx);
             release_unfocused_input(window, cx);

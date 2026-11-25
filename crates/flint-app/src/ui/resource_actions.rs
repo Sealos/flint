@@ -622,7 +622,7 @@ struct ReviewedObject {
     key: WriteKey,
     name: String,
     uid: Option<String>,
-    /// For a scale: the count reviewed, and where it is read (none: the kind lost Scale).
+    /// For a scale: the count reviewed, and where its review read it.
     count: Option<(u32, Option<action_kinds::ScalePaths>)>,
     at: jiff::Timestamp,
     /// For a restart: the pod template's `restartedAt` as reviewed. Another one shows a restart
@@ -640,10 +640,10 @@ impl ReviewedObject {
         let (count, restarted_at) = match review.action() {
             WriteAction::Resource(action) => {
                 let count = match action.change() {
-                    ResourceChange::Scale { from, .. } => Some((
-                        *from,
-                        ws.kind_scale_paths(&target.cluster, &target.kind, cx),
-                    )),
+                    // Read where the review read it, not where discovery said.
+                    ResourceChange::Scale { from, .. } => {
+                        Some((*from, action.scale_paths().cloned()))
+                    }
                     _ => None,
                 };
                 let restarted = action.restarted_at().map(|at| at.map(str::to_owned));

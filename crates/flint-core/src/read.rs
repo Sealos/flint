@@ -1393,8 +1393,8 @@ mod tests {
     }
 
     /// A fake API server: answers each path in `routes` with its status and JSON body, anything
-    /// else with 404, and counts connections. Plain HTTP on 127.0.0.1, one request per
-    /// connection.
+    /// else with 404, and counts connections. A path listed more than once gets its answers in
+    /// order, the last one from then on. Plain HTTP on 127.0.0.1, one request per connection.
     async fn fake_api(
         routes: Vec<(&'static str, u16, serde_json::Value)>,
     ) -> (Client, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
@@ -1404,10 +1404,15 @@ mod tests {
         let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = connections.clone();
         let routes = std::sync::Arc::new(routes);
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            usize,
+        >::new()));
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let routes = routes.clone();
+                let hits = hits.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0u8; 4096];
@@ -1426,9 +1431,15 @@ mod tests {
                         .next()
                         .unwrap_or("/")
                         .to_owned();
-                    let (code, body) = routes
-                        .iter()
-                        .find(|(p, _, _)| *p == path)
+                    let answers: Vec<_> = routes.iter().filter(|(p, _, _)| *p == path).collect();
+                    let hit = {
+                        let mut hits = hits.lock().unwrap();
+                        let hit = hits.entry(path.clone()).or_default();
+                        *hit += 1;
+                        *hit - 1
+                    };
+                    let (code, body) = answers
+                        .get(hit.min(answers.len().saturating_sub(1)))
                         .map(|(_, code, body)| (*code, body.to_string()))
                         .unwrap_or_else(|| {
                             (
@@ -1611,6 +1622,41 @@ mod tests {
         );
         assert!(kinds[0].scale_paths().is_some());
         assert_eq!(kinds[1].scale, ScaleSubresource::Unread);
+    }
+
+    // covers UP-53: a definition read that fails for a reason that may pass is read again, and
+    // one the server refuses is not.
+    #[tokio::test]
+    async fn a_definition_read_that_may_pass_is_tried_again() {
+        use serde_json::json;
+        let crd = |plural: &str| {
+            json!({"apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+                   "metadata": {"name": format!("{plural}.example.dev")},
+                   "spec": {"group": "example.dev", "names": {"plural": plural},
+                            "versions": [{"name": "v1", "served": true, "subresources": {"scale":
+                                {"specReplicasPath": ".spec.size",
+                                 "statusReplicasPath": ".status.n"}}}]}})
+        };
+        // kube itself tries a 503 again; a 500 it does not.
+        let failed = json!({"kind": "Status", "code": 500, "reason": "InternalError"});
+        let forbidden = json!({"kind": "Status", "code": 403, "reason": "Forbidden"});
+        let widgets = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/widgets.example.dev";
+        let gizmos = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/gizmos.example.dev";
+        let (client, _) = fake_api(vec![
+            (widgets, 500, failed),
+            (widgets, 200, crd("widgets")),
+            (gizmos, 403, forbidden),
+            (gizmos, 200, crd("gizmos")),
+        ])
+        .await;
+        let kind = |plural: &str| KindInfo {
+            scale: ScaleSubresource::Unread,
+            ..kind("example.dev", "v1", "Widget", plural)
+        };
+        let mut kinds = vec![kind("widgets"), kind("gizmos")];
+        action_kinds::read_scale_paths(&client, &mut kinds, Duration::from_secs(5)).await;
+        assert!(kinds[0].scale_paths().is_some(), "read again after a 500");
+        assert_eq!(kinds[1].scale, ScaleSubresource::Unread, "a refusal stands");
     }
 
     // covers UP-10

@@ -2064,3 +2064,34 @@ async fn a_paused_set_member_shows_shell_disabled_with_the_reason(cx: &mut TestA
     assert!(!menu.is_err_and(|why| why.contains("paused")));
     assert_eq!(guard, None);
 }
+
+// covers UP-53: a row that leaves the selection takes its pane, which watched the object of the
+// open confirmation: the confirmation closes, unanswered, and nothing is written.
+#[gpui_kit::test]
+async fn a_rows_confirmation_closes_when_the_row_leaves_the_selection(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let row = open_beta_row(cx, dir.path()).await;
+    let t = &row.t;
+    offer_restart(cx, t).await;
+    let (workspace, window) = (t.workspace.clone(), t.window);
+    cx.update_window(window, |_, _, cx| {
+        workspace.update(cx, |ws, cx| {
+            let list = ws.sets.running.as_ref().unwrap().list.clone();
+            list.update(cx, |list, cx| list.clear_selection(cx));
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert!(!t.has_dialog(cx), "the confirmation closed");
+    let said = t
+        .workspace
+        .read_with(cx, |ws, _| ws.action_error().map(str::to_owned));
+    assert!(
+        said.as_deref()
+            .is_some_and(|s| s.contains("changed since it was reviewed")),
+        "{said:?}"
+    );
+    assert_eq!(row.beta_writes.load(Ordering::SeqCst), 0);
+}

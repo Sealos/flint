@@ -580,9 +580,9 @@ fn gadget_size(server: &FakeApiServer) -> Value {
 }
 
 // covers UP-52, UP-53: a custom resource whose definition declares a scale subresource is scaled
-// through it, from the count at the definition's path, and bound to that count.
+// from the count at the definition's path, by a patch of that very field, bound to that count.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_custom_resource_scales_through_its_scale_subresource() {
+async fn a_custom_resource_scales_at_its_definitions_replica_field() {
     let server = scaled_gadgets().await;
     let core = Core::start(&server, Settings::default()).await;
     let review = core
@@ -600,7 +600,7 @@ async fn a_custom_resource_scales_through_its_scale_subresource() {
     let before = server.requests().len();
     core.handle.run_write(review.into_intent()).await.unwrap();
     assert_eq!(gadget_size(&server), 5);
-    let path = "/apis/fixtures.flint.dev/v1/namespaces/demo/gadgets/gadget-1/scale";
+    let path = "/apis/fixtures.flint.dev/v1/namespaces/demo/gadgets/gadget-1";
     let sent = since(&server, before);
     assert_eq!(writes_in(&sent), 1, "{sent:?}");
     assert!(

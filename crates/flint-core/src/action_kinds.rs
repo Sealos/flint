@@ -63,6 +63,11 @@ impl ScalePaths {
         count_at(object, &self.spec_replicas)
     }
 
+    /// Where the replica count asked for is, as a JSON pointer: what Scale tests and sets.
+    pub(crate) fn spec_pointer(&self) -> &str {
+        &self.spec_replicas
+    }
+
     /// The replica count `object` reports, if it says one.
     pub fn status_replicas(&self, object: &Value) -> Option<u32> {
         count_at(object, &self.status_replicas)
@@ -127,6 +132,21 @@ impl KindInfo {
 /// How many definitions are read at once.
 const DEFINITIONS_AT_ONCE: usize = 8;
 
+/// How many times a definition is read when the reads fail for a reason that may pass.
+const DEFINITION_TRIES: u32 = 3;
+
+/// The pause before reading a definition again after a failure that may pass.
+const DEFINITION_RETRY_PAUSE: Duration = Duration::from_millis(200);
+
+/// Why a definition was not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DefinitionUnread {
+    /// The server said no: not found, forbidden, or another answer that would not change.
+    Refused,
+    /// No answer, a timeout, or an answer that may differ on a later try.
+    Transient,
+}
+
 /// Reads the CustomResourceDefinition of each custom kind discovery lists with a `scale`
 /// subresource, and keeps its replica paths. A definition that cannot be read, or does not
 /// declare plain paths for the version discovery serves, leaves its kind without Scale.
@@ -146,7 +166,7 @@ pub(crate) async fn read_scale_paths(client: &Client, kinds: &mut [KindInfo], li
         .collect();
     let mut found = futures::stream::iter(reads)
         .map(|(index, resource)| async move {
-            let paths = definition_scale_paths(client, &resource, limit).await;
+            let paths = definition_scale_paths_retried(client, &resource, limit).await;
             if paths.is_none() {
                 tracing::debug!(
                     kind = format!("{}.{}", resource.plural, resource.group),
@@ -164,21 +184,55 @@ pub(crate) async fn read_scale_paths(client: &Client, kinds: &mut [KindInfo], li
     }
 }
 
-/// The replica paths the CustomResourceDefinition of `resource` declares now for its version,
-/// read within `limit`; `None` if it cannot be read or declares none Flint can read.
-pub(crate) async fn definition_scale_paths(
+/// [`definition_scale_paths`], read again after a failure that may pass, a few times: one
+/// failed read would otherwise leave the kind without Scale for as long as discovery stands.
+async fn definition_scale_paths_retried(
     client: &Client,
     resource: &ApiResource,
     limit: Duration,
 ) -> Option<ScalePaths> {
+    for attempt in 1..=DEFINITION_TRIES {
+        match definition_scale_paths(client, resource, limit).await {
+            Ok(paths) => return paths,
+            Err(DefinitionUnread::Refused) => return None,
+            Err(DefinitionUnread::Transient) if attempt < DEFINITION_TRIES => {
+                tokio::time::sleep(DEFINITION_RETRY_PAUSE * attempt).await;
+            }
+            Err(DefinitionUnread::Transient) => return None,
+        }
+    }
+    None
+}
+
+/// The replica paths the CustomResourceDefinition of `resource` declares now for its version,
+/// read within `limit`: `Ok(None)` if it declares none Flint can read.
+pub(crate) async fn definition_scale_paths(
+    client: &Client,
+    resource: &ApiResource,
+    limit: Duration,
+) -> Result<Option<ScalePaths>, DefinitionUnread> {
     let api: Api<DynamicObject> = Api::all_with(client.clone(), &definitions());
     let name = format!("{}.{}", resource.plural, resource.group);
-    let crd = tokio::time::timeout(limit, api.get(&name))
-        .await
-        .ok()?
-        .ok()?;
-    let crd = serde_json::to_value(&crd).ok()?;
-    crd_scale_paths(&crd, &resource.group, &resource.version, &resource.plural)
+    let crd = match tokio::time::timeout(limit, api.get(&name)).await {
+        Ok(Ok(crd)) => crd,
+        Ok(Err(kube::Error::Api(status))) if !may_pass(status.code) => {
+            return Err(DefinitionUnread::Refused);
+        }
+        Ok(Err(_)) | Err(_) => return Err(DefinitionUnread::Transient),
+    };
+    let crd = serde_json::to_value(&crd).map_err(|_| DefinitionUnread::Refused)?;
+    Ok(crd_scale_paths(
+        &crd,
+        &resource.group,
+        &resource.version,
+        &resource.plural,
+    ))
+}
+
+/// Whether an API error with HTTP status `code` may not recur: throttling, a timeout, or a
+/// server error.
+fn may_pass(code: u16) -> bool {
+    matches!(code, 408 | 429) || code >= 500
 }
 
 fn definitions() -> ApiResource {
