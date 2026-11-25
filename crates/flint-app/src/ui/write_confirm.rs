@@ -11,9 +11,12 @@ use flint_core::write::{
     DrainProgress, ResourceChange, WriteAction, WriteError, WriteOutcome, WriteReview, WriteTarget,
     WriteWarning,
 };
+use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::component::Theme;
 use gpui_kit::*;
 
 use super::confirm::{self, DialogText};
+use super::notice::notice;
 use super::write_binding::ConnectionGuard;
 
 /// How a confirmation words its action, and whether only its button may confirm it.
@@ -308,6 +311,7 @@ pub(in crate::ui) fn confirmation(
         if used.replace(true) || !begin(cx) {
             return;
         }
+        let (target, action) = (review.target().clone(), review.action().clone());
         let (tell, told) = async_channel::unbounded();
         let run = core.run_write_telling(review.clone().into_intent(), Some(tell));
         let (on_progress, on_done) = (on_progress.clone(), on_done.clone());
@@ -317,10 +321,94 @@ pub(in crate::ui) fn confirmation(
                 cx.update(|cx| on_progress(progress, cx));
             }
             let result = run.await;
-            cx.update(|cx| on_done(result, cx));
+            cx.update(|cx| {
+                if let Ok(outcome) = &result {
+                    say_done(&target, &action, outcome, cx);
+                }
+                on_done(result, cx)
+            });
         })
         .detach();
     }
+}
+
+/// How long the notice of a write that went through stays shown.
+const DONE_SHOWN: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// What a write that went through says: feedback only, nothing it did depends on it.
+pub(in crate::ui) fn done_text(target: &WriteTarget, action: &WriteAction) -> String {
+    let name = single_line(&target.name);
+    match action {
+        WriteAction::ApplyYaml(_) => format!("Applied changes to {name}."),
+        WriteAction::Resource(action) => change_done(action.change(), &name),
+        _ => format!("Changed {name}."),
+    }
+}
+
+/// What a resource change that went through says of `name`.
+fn change_done(change: &ResourceChange, name: &str) -> String {
+    match change {
+        ResourceChange::Delete => format!("Deleted {name}."),
+        ResourceChange::Scale { from, to } => format!("Scaled {name} from {from} to {to}."),
+        ResourceChange::RolloutRestart => format!("Restarted {name}."),
+        ResourceChange::Cordon => format!("Cordoned {name}."),
+        ResourceChange::Uncordon => format!("Uncordoned {name}."),
+        ResourceChange::Drain { .. } => format!("Drained {name}."),
+        _ => format!("Changed {name}."),
+    }
+}
+
+/// The notice of the latest write that went through, in every window, until it has been shown
+/// for [`DONE_SHOWN`] or a newer one replaces it.
+#[derive(Default)]
+struct DoneNotice {
+    text: Option<String>,
+    /// Which notice this is: an older one's timer must not clear a newer one.
+    generation: u64,
+}
+
+impl Global for DoneNotice {}
+
+/// Shows what a write that went through did. A drain's report has its own strip.
+fn say_done(target: &WriteTarget, action: &WriteAction, outcome: &WriteOutcome, cx: &mut App) {
+    if outcome.drain.is_some() {
+        return;
+    }
+    let text = done_text(target, action);
+    let generation = cx.update_default_global::<DoneNotice, _>(|notice, _| {
+        notice.generation += 1;
+        notice.text = Some(text);
+        notice.generation
+    });
+    cx.refresh_windows();
+    let timer = cx.background_executor().timer(DONE_SHOWN);
+    cx.spawn(async move |cx| {
+        timer.await;
+        cx.update(|cx| {
+            let current = cx.update_default_global::<DoneNotice, _>(|notice, _| {
+                let current = notice.generation == generation;
+                if current {
+                    notice.text = None;
+                }
+                current
+            });
+            if current {
+                cx.refresh_windows();
+            }
+        });
+    })
+    .detach();
+}
+
+/// The notice for the strips over the dock: what the latest write that went through did.
+pub(in crate::ui) fn done_strip(theme: &Theme, cx: &App) -> Option<AnyElement> {
+    let text = cx.try_global::<DoneNotice>()?.text.clone()?;
+    Some(
+        notice("write-done", text.clone(), theme.success)
+            .aria_label(text)
+            .test_support()
+            .into_any_element(),
+    )
 }
 
 #[cfg(test)]
@@ -652,6 +740,20 @@ mod tests {
 
     // covers UP-53: each action says what it does; Delete and Drain take the button, and Scale
     // shows both counts.
+    #[test]
+    fn a_finished_change_says_what_it_did_to_the_object() {
+        use super::change_done;
+        let say = |change| change_done(&change, "web");
+        assert_eq!(say(ResourceChange::Delete), "Deleted web.");
+        assert_eq!(
+            say(ResourceChange::Scale { from: 2, to: 5 }),
+            "Scaled web from 2 to 5."
+        );
+        assert_eq!(say(ResourceChange::RolloutRestart), "Restarted web.");
+        assert_eq!(say(ResourceChange::Cordon), "Cordoned web.");
+        assert_eq!(say(ResourceChange::Uncordon), "Uncordoned web.");
+    }
+
     #[test]
     fn each_resource_action_is_worded() {
         for (change, ok, deliberate) in [
