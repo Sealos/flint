@@ -602,7 +602,12 @@ fn deployment() -> Value {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
         "metadata": {"name": "web", "namespace": "demo", "uid": "uid-web", "resourceVersion": "7"},
-        "spec": {"replicas": 2},
+        // The API server requires template labels that match the selector.
+        "spec": {
+            "replicas": 2,
+            "selector": {"matchLabels": {"app": "web"}},
+            "template": {"metadata": {"labels": {"app": "web"}}},
+        },
     })
 }
 
