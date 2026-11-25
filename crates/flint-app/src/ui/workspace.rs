@@ -65,6 +65,7 @@ use super::startup::StartupView;
 use super::terminal_model::ShellRequest;
 use super::terminal_view::{RestartBlocked, TerminalView};
 use super::theme;
+use super::tooltip_text::{SHOW_DELAY, cap_width};
 use super::ui_state::{self, UiState};
 use super::write_confirm;
 use flint_core::display::{self, ClusterNames};
@@ -1716,6 +1717,7 @@ impl Workspace {
     ) -> impl IntoElement {
         let model = self.model.read(cx);
         let active = model.active.clone();
+        let open_members = sets::sidebar_set_members(self.sets.running.as_ref());
 
         // Scrolls by itself, so the keyboard cursor can bring a cluster row into view
         // (`Workspace::move_sidebar_cursor`): its rows are its children.
@@ -1753,6 +1755,9 @@ impl Workspace {
         let states = self.nav.read(cx).states();
         for cluster in &model.clusters {
             let is_active = active.as_deref() == Some(cluster.info.name.as_str());
+            let set_member = open_members
+                .as_deref()
+                .is_some_and(|members| members.contains(&cluster.info.name.as_str()));
             let presence = Presence::of(&cluster.state, is_active, states);
             let exposure = (model.ai_exposure(cluster), model.ai_scope(cluster));
             let settings_ok = model.settings_error.is_none();
@@ -1772,6 +1777,7 @@ impl Workspace {
                 (
                     is_active,
                     ring,
+                    set_member,
                     presence,
                     cluster_details(model, cluster, states),
                 ),
@@ -1835,7 +1841,7 @@ impl Workspace {
             .border_color(theme.sidebar_border)
             .child(pane_title("CLUSTERS", traffic_lights, theme))
             .child(list)
-            .child(self.render_sets_panel(theme, cx))
+            .child(self.render_sets_panel(open_members.as_ref().map(Vec::len), theme, cx))
             .child(self.render_settings_entry(theme))
             .child(pane_handle(
                 "clusters-edge",
@@ -1847,9 +1853,7 @@ impl Workspace {
     fn render_cluster_row(
         &self,
         cluster: &ClusterSummary,
-        // Whether it is the active cluster, whether the sidebar's cursor is on it, its presence
-        // and its full description.
-        (is_active, ring, presence, tooltip): (bool, bool, Presence<'_>, String),
+        (is_active, ring, set_member, presence, tooltip): (bool, bool, bool, Presence<'_>, String),
         (exposure, ai_scope): (AiExposureState, Option<AiScope>),
         (protection, trust, writes_paused): (Protection, TrustState, bool),
         (settings_ok, names, tag, (keep, keep_sign_in), can_disconnect, subtitle_chars): (
@@ -1903,6 +1907,7 @@ impl Workspace {
             .border_1()
             .border_color(super::theme::cursor_ring(theme, ring))
             .tooltip(move |_, cx| cluster_tooltip(tip.0.clone(), &tip.1, &tip.2, cx))
+            .tooltip_show_delay(SHOW_DELAY)
             // While choosing clusters a click chooses: it must not connect to this one.
             // So does a Cmd-click, which starts choosing.
             .on_click({
@@ -1931,6 +1936,19 @@ impl Workspace {
                         h_flex()
                             .gap_1p5()
                             .min_w_0()
+                            .when(set_member, |line| {
+                                let label = "Member of the open cluster set";
+                                line.child(
+                                    theme::status_dot(theme.list_active_border, false)
+                                        .id(SharedString::from(format!("cluster-set-mark-{name}")))
+                                        .flex_none()
+                                        .aria_label(label)
+                                        .tooltip(move |window, cx| {
+                                            Tooltip::new(label).build(window, cx)
+                                        })
+                                        .test_support(),
+                                )
+                            })
                             .child(
                                 div()
                                     .min_w_0()
@@ -2263,7 +2281,10 @@ impl Workspace {
                     })
                     .child(text)
                     .when(!tip.is_empty(), |el| {
-                        el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        el.tooltip(move |window, cx| {
+                            cap_width(Tooltip::new(tip.clone())).build(window, cx)
+                        })
+                        .tooltip_show_delay(SHOW_DELAY)
                     }),
             );
         }
@@ -2508,7 +2529,8 @@ impl Workspace {
             .text_color(color)
             .child(Icon::new(icon).xsmall())
             .child(if compact { short } else { text })
-            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .tooltip(move |window, cx| cap_width(Tooltip::new(tip.clone())).build(window, cx))
+            .tooltip_show_delay(SHOW_DELAY)
     }
 
     fn render_namespace_filter(
