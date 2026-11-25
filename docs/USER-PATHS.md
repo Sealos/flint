@@ -453,8 +453,11 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   unchecked options (delete emptyDir data, force pods without a controller), each saying what is lost; completed and
   failed pods are removed whatever they say. Drain's warning also names GitOps-managed pods it would evict. Each
   action rechecks the live object first. If the object changed, nothing is run again: a new review opens, saying
-  so. Drain reports what it did, also when it stopped early:
-  cordoned, evicted, blocked and why (a PodDisruptionBudget is named), skipped, not tried, may still be terminating.
+  so. A running drain's strip says where it is, pod by pod: the pod being evicted, how many were tried, evicted and
+  blocked, then how many are still terminating. Drain reports what it did, naming the node and its cluster, also when
+  it stopped early: cordoned, evicted, blocked and why (a PodDisruptionBudget is the reason, named when the server
+  names it), skipped, not tried (also the listed pods when the node check after listing stops it), may still be
+  terminating.
 - Tests: cluster, ui.
 
 ---

@@ -28,6 +28,7 @@ fn acts(cluster: &str, change: &str) -> PlanLine {
         verdict: Verdict::Acts {
             change: vec![change.to_owned()],
             warnings: Vec::new(),
+            diff: Vec::new(),
         },
     }
 }
@@ -87,7 +88,7 @@ fn the_confirmation_names_the_members_it_runs_on() {
         ),
         acts("beta", "Replicas: 3 to 5."),
     ];
-    let (dialog, pinned) = plan_dialog(FleetAction::Scale { to: 5 }, &object(), &lines);
+    let (dialog, pinned) = plan_dialog(&FleetAction::Scale { to: 5 }, &object(), &lines);
     assert_eq!(dialog.title, "Scale web to 5 on 2 of 3 clusters?");
     assert_eq!(dialog.ok, "Scale on 2 Clusters");
     assert_eq!(dialog.cancel, "Cancel");
@@ -113,7 +114,7 @@ fn the_confirmation_names_the_members_it_runs_on() {
 #[test]
 fn one_member_is_named_in_the_singular() {
     let lines = [acts("alpha", "Replaces its pods.")];
-    let (dialog, _) = plan_dialog(FleetAction::RolloutRestart, &object(), &lines);
+    let (dialog, _) = plan_dialog(&FleetAction::RolloutRestart, &object(), &lines);
     assert_eq!(dialog.title, "Restart web on 1 of 1 cluster?");
     assert_eq!(dialog.ok, "Restart on 1 Cluster");
 }
@@ -122,7 +123,7 @@ fn one_member_is_named_in_the_singular() {
 #[test]
 fn with_no_member_to_act_on_there_is_nothing_to_confirm() {
     let lines = [left_out("prod", "locked"), left_out("dev", "not connected")];
-    let (dialog, pinned) = plan_dialog(FleetAction::RolloutRestart, &object(), &lines);
+    let (dialog, pinned) = plan_dialog(&FleetAction::RolloutRestart, &object(), &lines);
     assert_eq!(dialog.title, "Nothing to run for web");
     assert_eq!(dialog.ok, "Close");
     assert!(dialog.cancel.is_empty());
@@ -218,6 +219,124 @@ fn a_refused_turn_and_a_stopped_run_say_so() {
     let before = lines.clone();
     record(&mut lines, &result("elsewhere", FleetStatus::Done));
     assert_eq!(lines, before);
+}
+
+// covers UP-101: an apply's or a delete's target list shows each member's dry run; a member
+// whose dry run failed cannot be chosen, and every other starts chosen and can be left out.
+// Restart and scale leave failed members out on their own.
+#[test]
+fn the_target_list_offers_only_members_whose_dry_run_passed() {
+    let lines = [
+        left_out(
+            "prod",
+            "the edit changes the object's name, which cannot be changed here",
+        ),
+        acts("dev", "Creates it."),
+        acts("stage", "No change."),
+    ];
+    let mut rows = target_rows(&lines);
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.choosable, r.chosen))
+            .collect::<Vec<_>>(),
+        [(false, false), (true, true), (true, true)]
+    );
+    assert!(rows[0].says.starts_with("left out: the edit changes"));
+    assert_eq!(rows[1].says, "Creates it.");
+    assert_eq!(
+        targets_state(&rows),
+        ("Runs on 2 of 3 clusters.".to_owned(), false)
+    );
+    rows[1].chosen = false;
+    rows[2].chosen = false;
+    assert_eq!(
+        targets_state(&rows),
+        ("Choose a cluster to run on.".to_owned(), true)
+    );
+    let dialog = targets_dialog(&FleetAction::Delete, &object());
+    assert_eq!(dialog.title, "Delete web: choose the clusters");
+    assert!(FleetChoice::ApplyYaml.drops_by_hand());
+    assert!(FleetChoice::Delete.drops_by_hand());
+    assert!(!FleetChoice::RolloutRestart.drops_by_hand());
+    assert!(!FleetChoice::Scale.drops_by_hand());
+}
+
+// covers UP-101: the plan shows each member's dry-run diff under its line.
+#[test]
+fn the_plan_shows_each_members_diff() {
+    let line = PlanLine {
+        cluster: "dev".to_owned(),
+        shown: "dev".to_owned(),
+        verdict: Verdict::Acts {
+            change: vec!["Changes it: 1 line added, 1 line removed.".to_owned()],
+            warnings: Vec::new(),
+            diff: vec![
+                "@@ -1 +1 @@".to_owned(),
+                "-a: 1".to_owned(),
+                "+a: 2".to_owned(),
+            ],
+        },
+    };
+    let apply = FleetAction::ApplyYaml {
+        manifest: flint_core::fleet::FleetManifest::new("a: 2"),
+    };
+    let (dialog, _) = plan_dialog(&apply, &object(), &[line]);
+    assert!(
+        dialog.text.contains(
+            "dev: Changes it: 1 line added, 1 line removed.\n    @@ -1 +1 @@\n    -a: 1\n    +a: 2"
+        ),
+        "{}",
+        dialog.text
+    );
+}
+
+// covers UP-101: an apply's and a delete's confirmation and results say what they do.
+#[test]
+fn apply_and_delete_are_worded_as_such() {
+    let lines = [acts("dev", "Changes it: 1 line added, 2 lines removed.")];
+    let apply = FleetAction::ApplyYaml {
+        manifest: flint_core::fleet::FleetManifest::new("kind: Deployment"),
+    };
+    let (dialog, _) = plan_dialog(&apply, &object(), &lines);
+    assert_eq!(dialog.title, "Apply YAML to web on 1 of 1 cluster?");
+    assert_eq!(dialog.ok, "Apply on 1 Cluster");
+    let (dialog, _) = plan_dialog(&FleetAction::Delete, &object(), &lines);
+    assert_eq!(dialog.title, "Delete web on 1 of 1 cluster?");
+    assert_eq!(dialog.ok, "Delete on 1 Cluster");
+    assert!(dialog.default_cancel, "Enter cancels a delete");
+    let (dialog, _) = plan_dialog(&apply, &object(), &lines);
+    assert!(!dialog.default_cancel);
+    assert_eq!(
+        run_dialog(&FleetAction::Delete, &object(), 2).title,
+        "Deleting web on 2 clusters"
+    );
+    assert_eq!(running_write(&apply), RunningWrite::YamlEdit);
+    assert_eq!(
+        running_write(&FleetAction::Delete),
+        RunningWrite::Action(ResourceAction::Delete)
+    );
+}
+
+#[test]
+fn an_apply_says_how_much_it_changes() {
+    assert_eq!(diff_lines("a: 1\n", "a: 1\n"), ["No change."]);
+    assert_eq!(
+        diff_lines("a: 1\nb: 2\n", "a: 3\n"),
+        ["Changes it: 1 line added, 2 lines removed."]
+    );
+}
+
+#[test]
+fn a_run_that_did_not_start_says_why() {
+    let mut lines = result_lines(&[acts("a", "x")]);
+    record(
+        &mut lines,
+        &result("a", FleetStatus::Skipped(FleetSkip::NotStarted)),
+    );
+    assert_eq!(
+        texts(&lines, true),
+        ["a: not tried: a failed cluster was not left out"]
+    );
 }
 
 // covers UP-100: the results show each member as it ends, and closing them stops the run before

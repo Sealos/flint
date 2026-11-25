@@ -269,11 +269,19 @@ async fn recheck(
     let client = gate.client().await?;
     let live = read_live(&client, kind, target).await?;
     let uid = live.pointer("/metadata/uid").and_then(Value::as_str);
+    let version = live
+        .pointer("/metadata/resourceVersion")
+        .and_then(Value::as_str);
     let paused = live.pointer("/spec/paused").and_then(Value::as_bool) == Some(true);
+    // A held delete is for the object exactly as reviewed: any change since stops it.
+    let changed_before_delete = reviewed.hold_spec
+        && *change == ResourceChange::Delete
+        && version != target.resource_version.as_deref();
     if uid != target.uid.as_deref()
         || gitops::managed_by_live_object(&live) != reviewed.managed
         || (paused && *change == ResourceChange::RolloutRestart)
         || (reviewed.hold_spec && ReviewedSpec::of(&live) != reviewed.spec)
+        || changed_before_delete
     {
         return Err(WriteError::Conflict);
     }
@@ -313,6 +321,7 @@ pub(crate) async fn dry_run(
             send_scale(gate, &object, *from, *to, mode).await?;
         }
         ResourceChange::RolloutRestart => send_restart(gate, &object, mode).await?,
+        ResourceChange::Delete => send_delete(gate, &object, mode).await?,
         _ => {
             return Err(WriteError::Rejected(
                 "this action has no server dry run".to_owned(),
@@ -322,13 +331,15 @@ pub(crate) async fn dry_run(
     Ok(())
 }
 
-/// Runs a reviewed action on `target`, once the live object still matches its review.
+/// Runs a reviewed action on `target`, once the live object still matches its review. A drain
+/// tells its progress to `progress`, which changes nothing it does.
 pub(crate) async fn run(
     gate: &mut impl ActionGate,
     kind: &KindInfo,
     target: &WriteTarget,
     change: &ResourceChange,
     reviewed: &Reviewed,
+    progress: Option<async_channel::Sender<DrainProgress>>,
 ) -> Result<WriteOutcome, WriteError> {
     let object = action_object(kind, target)?;
     let done = |drain| WriteOutcome {
@@ -341,7 +352,7 @@ pub(crate) async fn run(
         held: held.as_ref(),
     };
     match change {
-        ResourceChange::Delete => delete(gate, &object).await?,
+        ResourceChange::Delete => send_delete(gate, &object, mode).await?,
         ResourceChange::Scale { from, to } => send_scale(gate, &object, *from, *to, mode).await?,
         ResourceChange::RolloutRestart => send_restart(gate, &object, mode).await?,
         ResourceChange::Cordon => set_cordoned(gate, &object, true).await?,
@@ -358,6 +369,7 @@ pub(crate) async fn run(
                     .iter()
                     .map(|pod| (pod.uid.clone(), pod.managed.clone()))
                     .collect(),
+                progress,
                 ..Default::default()
             };
             let now = managed_pods(gate, &object.name, &options).await?;
@@ -593,15 +605,29 @@ fn uid_precondition(uid: &str) -> Preconditions {
 }
 
 /// Deletes `object`, if it is still the one with its uid.
+#[cfg(test)]
 pub(crate) async fn delete(
     gate: &mut impl ActionGate,
     object: &ActionObject,
 ) -> Result<(), ActionError> {
+    send_delete(gate, object, PatchMode::default()).await
+}
+
+/// Deletes `object`, if it is still the one with its uid, and for a held delete still at the
+/// version its recheck read.
+async fn send_delete(
+    gate: &mut impl ActionGate,
+    object: &ActionObject,
+    mode: PatchMode<'_>,
+) -> Result<(), ActionError> {
     // Refuse an unsafe name before the gate runs any credential check.
     object.check_path_segments()?;
     let client = gate.client().await?;
+    let mut preconditions = uid_precondition(&object.uid);
+    preconditions.resource_version = mode.held.map(|held| held.resource_version.clone());
     let params = DeleteParams {
-        preconditions: Some(uid_precondition(&object.uid)),
+        preconditions: Some(preconditions),
+        dry_run: mode.dry_run,
         ..Default::default()
     };
     timed(object.api(client)?.delete(&object.name, &params))
@@ -738,6 +764,8 @@ pub(crate) struct DrainOptions {
     /// How long to wait for evicted pods to terminate.
     pub(crate) wait: Duration,
     pub(crate) poll: Duration,
+    /// Where the drain's progress goes, as it runs. Only told: it decides nothing.
+    pub(crate) progress: Option<async_channel::Sender<DrainProgress>>,
 }
 
 impl Default for DrainOptions {
@@ -748,6 +776,7 @@ impl Default for DrainOptions {
             warned: BTreeMap::new(),
             wait: Duration::from_secs(60),
             poll: Duration::from_secs(1),
+            progress: None,
         }
     }
 }
@@ -772,8 +801,9 @@ pub struct ManagedPod {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BlockedReason {
-    /// A PodDisruptionBudget does not allow it now.
-    DisruptionBudget,
+    /// A PodDisruptionBudget does not allow it now: the budget's name, when the server gives it.
+    /// The budget is in the pod's namespace.
+    DisruptionBudget(Option<String>),
     /// No controller would recreate it.
     Unmanaged,
     /// It has `emptyDir` data that would be lost.
@@ -804,6 +834,48 @@ pub struct DrainReport {
     pub terminating: Vec<PodName>,
     /// Why the drain stopped early.
     pub stopped: Option<WriteError>,
+}
+
+/// Where a running drain is, told after each step: what it will try, and what it did so far.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DrainProgress {
+    /// Pods it will try to evict, once it has listed them.
+    pub to_evict: usize,
+    /// Of those, the pods tried so far.
+    pub tried: usize,
+    /// Evictions the API server accepted so far.
+    pub evicted: usize,
+    /// Pods left on the node so far, for any reason.
+    pub blocked: usize,
+    /// The pod it is evicting now.
+    pub current: Option<PodName>,
+    /// Once every pod was tried: evicted pods not yet confirmed gone.
+    pub terminating: Option<usize>,
+}
+
+/// Tells the drain's progress, if anyone listens. Never waits, and never fails the drain.
+fn tell(options: &DrainOptions, progress: impl FnOnce() -> DrainProgress) {
+    if let Some(sender) = &options.progress {
+        let _ = sender.try_send(progress());
+    }
+}
+
+/// The progress of a drain that has `to_evict` pods to try and has tried `tried` of them.
+fn progress_of(
+    report: &DrainReport,
+    to_evict: usize,
+    tried: usize,
+    current: Option<&PodName>,
+) -> DrainProgress {
+    DrainProgress {
+        to_evict,
+        tried,
+        evicted: report.evicted.len(),
+        blocked: report.blocked.len(),
+        current: current.cloned(),
+        terminating: None,
+    }
 }
 
 /// What a drain does with a pod.
@@ -1000,6 +1072,7 @@ pub(crate) async fn drain(
     match recheck.await {
         Ok(now) if now.metadata.uid.as_deref() == Some(node.uid.as_str()) => {}
         Ok(_) => {
+            report.remaining = pods.iter().map(pod_name).collect();
             report.stopped = Some(WriteError::Replaced);
             return report;
         }
@@ -1021,10 +1094,14 @@ pub(crate) async fn drain(
         }
     }
 
+    let total = to_evict.len();
+    tell(options, || progress_of(&report, total, 0, None));
     let mut accepted = Vec::new();
-    let mut pods = to_evict.into_iter();
-    while let Some(pod) = pods.next() {
+    let mut pods = to_evict.into_iter().enumerate();
+    while let Some((tried, pod)) = pods.next() {
         let name = pod_name(&pod);
+        tell(options, || progress_of(&report, total, tried, Some(&name)));
+        let pods = pods.by_ref().map(|(_, pod)| pod);
         let client = match gate.client().await {
             Ok(client) => client,
             Err(error) => {
@@ -1079,8 +1156,10 @@ pub(crate) async fn drain(
             }
             Err(error) => {
                 let reason = match api_code(&error) {
-                    Some(429) if is_disruption_budget(&error) => BlockedReason::DisruptionBudget,
-                    Some(429) => BlockedReason::Throttled,
+                    Some(429) => match disruption_budget(&error) {
+                        Some(budget) => BlockedReason::DisruptionBudget(budget),
+                        None => BlockedReason::Throttled,
+                    },
                     Some(409) => BlockedReason::Changed,
                     _ => BlockedReason::Failed(error_text(error)),
                 };
@@ -1088,25 +1167,57 @@ pub(crate) async fn drain(
             }
         }
     }
-    let (terminating, stopped) = wait_until_gone(gate, accepted, options).await;
+    let waiting = DrainProgress {
+        terminating: Some(accepted.len()),
+        ..progress_of(&report, total, total, None)
+    };
+    if !accepted.is_empty() {
+        tell(options, || waiting.clone());
+    }
+    let (terminating, stopped) = wait_until_gone(gate, accepted, options, waiting).await;
     report.terminating = terminating;
     report.stopped = stopped.map(Into::into);
     report
 }
 
-/// Whether a 429 from the Eviction API is a PodDisruptionBudget's, not a rate limit.
-fn is_disruption_budget(error: &kube::Error) -> bool {
+/// Whether a 429 from the Eviction API is a PodDisruptionBudget's, not a rate limit: `Some`
+/// with the budget's name if the server's answer names it.
+fn disruption_budget(error: &kube::Error) -> Option<Option<String>> {
     let kube::Error::Api(status) = error else {
-        return false;
+        return None;
     };
-    status
-        .details
-        .as_ref()
-        .is_some_and(|d| d.causes.iter().any(|c| c.reason == "DisruptionBudget"))
+    let causes: &[_] = status.details.as_ref().map_or(&[], |d| &d.causes[..]);
+    let budget_causes = || causes.iter().filter(|c| c.reason == "DisruptionBudget");
+    let is_budget = budget_causes().next().is_some()
         || status
             .message
             .to_ascii_lowercase()
-            .contains("disruption budget")
+            .contains("disruption budget");
+    is_budget.then(|| budget_causes().find_map(|c| budget_name(&c.message)))
+}
+
+/// The budget a cause's message names, as the Eviction API words it: "The disruption budget
+/// NAME needs ...", "... NAME is still being processed ..." or, when the budget failed to sync,
+/// "... NAME does not allow evicting pods currently ...". Only a valid object name counts, so a
+/// reworded message names none rather than a wrong one.
+fn budget_name(message: &str) -> Option<String> {
+    let rest = message.strip_prefix("The disruption budget ")?;
+    let (name, after) = rest.split_once(' ')?;
+    let valid = !name.is_empty()
+        && name.len() <= 253
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name.ends_with(|c: char| c.is_ascii_alphanumeric());
+    let worded = [
+        "needs ",
+        "is still being processed",
+        "does not allow evicting pods",
+    ]
+    .iter()
+    .any(|wording| after.starts_with(wording));
+    (valid && worded).then(|| name.to_owned())
 }
 
 /// Whether `pod` is confirmed gone: no pod has its name, or another one does.
@@ -1155,6 +1266,7 @@ async fn wait_until_gone(
     gate: &mut impl ActionGate,
     pods: Vec<Pod>,
     options: &DrainOptions,
+    progress: DrainProgress,
 ) -> (Vec<PodName>, Option<ActionError>) {
     let deadline = Instant::now() + options.wait;
     let mut left: Vec<Pod> = pods;
@@ -1192,6 +1304,10 @@ async fn wait_until_gone(
             }
         }
         left = still;
+        tell(options, || DrainProgress {
+            terminating: Some(left.len()),
+            ..progress.clone()
+        });
         if left.is_empty() || Instant::now() >= deadline {
             return (sorted_names(&left), None);
         }
@@ -2119,7 +2235,7 @@ mod tests {
         let report = drain(&mut writes(client, open()), &node(), &quick()).await;
         assert_eq!(
             report.blocked,
-            [(named("guarded"), BlockedReason::DisruptionBudget)]
+            [(named("guarded"), BlockedReason::DisruptionBudget(None))]
         );
         assert_eq!(report.evicted, [named("web")]);
         let tries = log
@@ -2129,6 +2245,110 @@ mod tests {
             .filter(|s| s.path.ends_with("/guarded/eviction"))
             .count();
         assert_eq!(tries, 1);
+    }
+
+    // covers UP-53: a budget the server's answer names is named in the report; a message worded
+    // otherwise names none.
+    #[tokio::test]
+    async fn a_disruption_budget_the_server_names_is_named() {
+        let pods = vec![
+            pod("named", Some("ReplicaSet"), json!({})),
+            pod("pending", Some("ReplicaSet"), json!({})),
+            pod("unsynced", Some("ReplicaSet"), json!({})),
+            pod("odd", Some("ReplicaSet"), json!({})),
+        ];
+        let (client, _log) = fake(drain_server(pods, |name| {
+            let message = match name {
+                "named" => "The disruption budget web-pdb needs 2 healthy pods and has 1 currently",
+                "pending" => {
+                    "The disruption budget db.budget is still being processed by the server."
+                }
+                "unsynced" => {
+                    "The disruption budget cache-pdb does not allow evicting pods currently \
+                     because it failed sync: no matching pods"
+                }
+                _ => "The disruption budget Not A Name needs more healthy pods.",
+            };
+            let mut refused = status(429, "TooManyRequests");
+            refused["details"] =
+                json!({"causes": [{"reason": "DisruptionBudget", "message": message}]});
+            (429, refused)
+        }));
+        let report = drain(&mut writes(client, open()), &node(), &quick()).await;
+        assert_eq!(
+            report.blocked,
+            [
+                (
+                    named("named"),
+                    BlockedReason::DisruptionBudget(Some("web-pdb".into()))
+                ),
+                (
+                    named("pending"),
+                    BlockedReason::DisruptionBudget(Some("db.budget".into()))
+                ),
+                (
+                    named("unsynced"),
+                    BlockedReason::DisruptionBudget(Some("cache-pdb".into()))
+                ),
+                (named("odd"), BlockedReason::DisruptionBudget(None)),
+            ]
+        );
+    }
+
+    // covers UP-53: a drain tells its progress pod by pod, and telling it changes nothing it
+    // sends.
+    #[tokio::test]
+    async fn a_drain_tells_its_progress_pod_by_pod() {
+        let pods = || {
+            vec![
+                pod("one", Some("ReplicaSet"), json!({})),
+                pod("bare", None, json!({})),
+                pod("two", Some("ReplicaSet"), json!({})),
+            ]
+        };
+        let (client, quiet_log) = fake(drain_server(pods(), |_| accepted()));
+        let quiet = drain(&mut writes(client, open()), &node(), &quick()).await;
+
+        let (client, log) = fake(drain_server(pods(), |_| accepted()));
+        let (sender, receiver) = async_channel::unbounded();
+        let options = DrainOptions {
+            progress: Some(sender),
+            ..quick()
+        };
+        let report = drain(&mut writes(client, open()), &node(), &options).await;
+        drop(options);
+        let told: Vec<DrainProgress> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+
+        assert_eq!(report, quiet, "the same drain");
+        let sent = |log: &Arc<Mutex<Vec<Seen>>>| -> Vec<(String, String)> {
+            log.lock()
+                .unwrap()
+                .iter()
+                .map(|s| (s.method.clone(), s.path.clone()))
+                .collect()
+        };
+        assert_eq!(sent(&log), sent(&quiet_log), "the same requests");
+
+        let at = |tried, evicted, current: Option<&str>| DrainProgress {
+            to_evict: 2,
+            tried,
+            evicted,
+            blocked: 1,
+            current: current.map(named),
+            terminating: None,
+        };
+        assert_eq!(
+            told[..3],
+            [at(0, 0, None), at(0, 0, Some("one")), at(1, 1, Some("two"))]
+        );
+        assert_eq!(
+            told[3],
+            DrainProgress {
+                terminating: Some(2),
+                ..at(2, 2, None)
+            }
+        );
+        assert_eq!(told.last().unwrap().terminating, Some(0), "{told:?}");
     }
 
     // covers UP-54: the gate closing during a drain stops the next eviction, and the report
@@ -2207,6 +2427,7 @@ mod tests {
         let report = drain(&mut writes(client, open()), &node(), &quick()).await;
         assert_eq!(report.stopped, Some(WriteError::Replaced));
         assert!(report.evicted.is_empty());
+        assert_eq!(report.remaining, [named("one")], "listed, not tried");
         assert!(!log.lock().unwrap().iter().any(|s| s.method == "POST"));
     }
 

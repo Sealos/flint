@@ -10,6 +10,7 @@ fn step(
     Step {
         cluster: cluster.to_owned(),
         dropped,
+        blocked: false,
         work: (cluster.to_owned(), outcome),
     }
 }
@@ -154,6 +155,50 @@ fn each_action_is_its_write_proposal() {
         FleetAction::Scale { to: 3 }.proposal(),
         WriteProposal::Scale { to: 3 }
     );
+    assert_eq!(FleetAction::Delete.proposal(), WriteProposal::Delete);
+    let manifest = FleetManifest::new("kind: ConfigMap");
+    assert_eq!(
+        FleetAction::ApplyYaml { manifest }.proposal(),
+        WriteProposal::ApplyManifest {
+            yaml: "kind: ConfigMap".to_owned()
+        }
+    );
+}
+
+#[test]
+fn a_manifest_is_never_printed() {
+    let action = FleetAction::ApplyYaml {
+        manifest: FleetManifest::new("data:\n  password: hunter2"),
+    };
+    assert!(!format!("{action:?}").contains("hunter2"));
+}
+
+#[tokio::test]
+async fn a_blocked_run_starts_no_cluster() {
+    let blocked = |cluster: &str| Step {
+        blocked: true,
+        ..step(cluster, false, Ok(()))
+    };
+    let (report, started) = driven(
+        vec![
+            blocked("a"),
+            step("b", false, Err(WriteError::Conflict)),
+            blocked("c"),
+        ],
+        FleetCancel::new(),
+        None,
+    )
+    .await;
+    // Only the refused cluster's work starts, and it fails with its refusal, sending nothing.
+    assert_eq!(started, ["b"]);
+    assert_eq!(
+        statuses(&report),
+        [
+            FleetStatus::Skipped(FleetSkip::NotStarted),
+            FleetStatus::Failed(WriteError::Conflict),
+            FleetStatus::Skipped(FleetSkip::NotStarted),
+        ]
+    );
 }
 
 fn refused_entry(cluster: &str, error: WriteError) -> FleetPreviewEntry {
@@ -183,9 +228,15 @@ fn refused_clusters_are_dropped_and_never_run() {
         ],
     };
     assert!(preview.entries().iter().all(|e| !e.will_run()));
+    assert_eq!(preview.unresolved(), ["a", "b"]);
+    assert!(!preview.is_ready());
     assert_eq!(preview.drop_refused(), ["a", "b"]);
+    assert!(preview.unresolved().is_empty());
+    // Nothing is left to run.
+    assert!(!preview.is_ready());
     assert!(preview.entries().iter().all(|e| e.is_dropped()));
     // A refusal stays one when the cluster is put back: it would fail at its turn.
     assert!(preview.set_dropped("a", false));
     assert!(!preview.entries()[0].will_run());
+    assert_eq!(preview.unresolved(), ["a"]);
 }
