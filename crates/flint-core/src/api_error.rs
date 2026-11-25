@@ -159,7 +159,7 @@ pub enum Transport {
 pub enum ProxyFailure {
     /// Nothing answered at the proxy's address.
     Unreachable,
-    /// The proxy answered 407.
+    /// The proxy asked for credentials or refused them (HTTP 407, a SOCKS5 sign-in).
     AuthRequired,
     /// The proxy answered, but would not open the tunnel.
     Denied,
@@ -204,7 +204,8 @@ impl Transport {
                  without it"
             ),
             Transport::Proxy(ProxyFailure::AuthRequired) => format!(
-                "the proxy for {s} asks for credentials (407); check the ones in its proxy URL"
+                "the proxy for {s} asks for credentials or refused them; check the ones in its \
+                 proxy URL"
             ),
             Transport::Proxy(ProxyFailure::Denied) => {
                 format!("the proxy refused to open a tunnel to {s}")
@@ -322,6 +323,26 @@ fn classify_one(e: &(dyn StdError + 'static)) -> Option<Transport> {
         "tunnel error: unexpected end of file"
         | "tunnel error: io error establishing tunnel"
         | "tunnel error: proxy response headers too long" => {
+            Some(Transport::Proxy(ProxyFailure::Broken))
+        }
+        "SOCKS error: failed to create underlying connection" => {
+            Some(Transport::Proxy(ProxyFailure::Unreachable))
+        }
+        "SOCKS error: credentials not accepted"
+        | "SOCKS error: server does not support user/pass authentication" => {
+            Some(Transport::Proxy(ProxyFailure::AuthRequired))
+        }
+        "SOCKS error: general server failure"
+        | "SOCKS error: connection not allowed"
+        | "SOCKS error: network unreachable"
+        | "SOCKS error: host unreachable"
+        | "SOCKS error: connection refused"
+        | "SOCKS error: ttl expired"
+        | "SOCKS error: command not supported"
+        | "SOCKS error: address type not supported" => Some(Transport::Proxy(ProxyFailure::Denied)),
+        "SOCKS error: io error during SOCKS handshake"
+        | "SOCKS error: failed parsing server response"
+        | "SOCKS error: server implements authentication incorrectly" => {
             Some(Transport::Proxy(ProxyFailure::Broken))
         }
         _ => None,

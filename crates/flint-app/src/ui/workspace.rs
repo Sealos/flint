@@ -267,6 +267,8 @@ pub struct Workspace {
     dashboard: Option<(Entity<DashboardView>, Subscription)>,
     /// The sidebar's choice of clusters, saved sets and the running set's combined list.
     sets: sets::ClusterSets,
+    /// The Settings view and its draft, which outlives leaving it.
+    settings_page: super::settings_view::SettingsPage,
     /// The window is too narrow for the list and the detail side by side, as of the last draw.
     narrow: bool,
     /// The main header shows two rows, as of the last draw: the dock leaves it more room.
@@ -381,7 +383,10 @@ impl Workspace {
                 };
                 this.open_view(&open, window, cx);
             }
-            NavEvent::OpenOverview => this.open_overview(window, cx),
+            NavEvent::OpenOverview => {
+                this.leave_settings_for_view();
+                this.open_overview(window, cx)
+            }
         });
         // Quitting right after a drag (or another change) still saves state.toml.
         let on_quit = cx.on_app_quit(|this: &mut Self, cx| {
@@ -448,7 +453,7 @@ impl Workspace {
         // and registered actions still reach the workspace.
         let on_focus_lost =
             cx.on_focus_lost(window, |this, window, cx| this.recover_focus(window, cx));
-        let guards = Self::set_guards(Self::guards(cx.entity().downgrade()))
+        let guards = Self::settings_guards(Self::set_guards(Self::guards(cx.entity().downgrade())))
             .when::<OpenClusterOverview>(|ws, _| ws.cluster.is_some() || ws.sets.is_open());
         registry::install(focus.clone(), guards, cx);
         let cluster_sets = sets::ClusterSets::new(window, cx);
@@ -469,6 +474,7 @@ impl Workspace {
             detail: None,
             dashboard: None,
             sets: cluster_sets,
+            settings_page: super::settings_view::SettingsPage::new(cx),
             narrow: false,
             two_row_header: false,
             server_moves: ServerMoves::default(),
@@ -1084,6 +1090,7 @@ impl Workspace {
             guard,
             None,
             begin,
+            |_, _| {},
             move |result, cx| {
                 // First, and outside the window: a closed one must not keep the object claimed.
                 resource_actions::release(&key, cx);
@@ -1841,6 +1848,7 @@ impl Workspace {
             .child(pane_title("CLUSTERS", traffic_lights, theme))
             .child(list)
             .child(self.render_sets_panel(theme, cx))
+            .child(self.render_settings_entry(theme))
             .child(pane_handle(
                 "clusters-edge",
                 Pane::Clusters,
@@ -2736,7 +2744,7 @@ impl Workspace {
             .disabled(!settings_ok)
             .tab_stop(false)
             .tooltip(format!(
-                "{label}\nWhich kinds Flint keeps live (watches) on this cluster"
+                "{label}\nAll kinds: every kind is watched. On view: the kinds of open views and the problem kinds are watched"
             ))
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, cx| {
                 let settings = model.read(cx).settings.clone();
@@ -2754,7 +2762,7 @@ impl Workspace {
                             .on_click(registry::on_click(WatchAllKinds)),
                     )
                     .item(
-                        PopupMenuItem::new("Open views only")
+                        PopupMenuItem::new("On view")
                             .checked(own == Some(WatchMode::OnView))
                             .on_click(registry::on_click(WatchOpenViewsOnly)),
                     )
@@ -2766,7 +2774,7 @@ impl Workspace {
                             .on_click(registry::on_click(DefaultWatchAllKinds)),
                     )
                     .item(
-                        PopupMenuItem::new("Open views only")
+                        PopupMenuItem::new("On view")
                             .checked(global == WatchMode::OnView)
                             .on_click(registry::on_click(DefaultWatchOpenViewsOnly)),
                     )
@@ -2897,6 +2905,9 @@ impl Workspace {
     }
 
     fn render_main(&self, window_width: f32, theme: &Theme, cx: &Context<Self>) -> AnyElement {
+        if let Some(settings) = self.render_settings_page(theme, cx) {
+            return settings;
+        }
         if let Some(set_view) = self.render_set_view(window_width, theme, cx) {
             return set_view;
         }
@@ -3815,15 +3826,15 @@ fn centered(content: impl IntoElement) -> AnyElement {
 fn mode_name(mode: WatchMode) -> &'static str {
     match mode {
         WatchMode::All => "all kinds",
-        WatchMode::OnView => "open views only",
+        WatchMode::OnView => "on view",
     }
 }
 
-/// The watch mode button's label: "Live: all kinds" or "Live: open views only".
+/// The watch mode button's label: "Live: all kinds" or "Live: on view".
 fn watch_mode_label(mode: WatchMode) -> &'static str {
     match mode {
         WatchMode::All => "Live: all kinds",
-        WatchMode::OnView => "Live: open views only",
+        WatchMode::OnView => "Live: on view",
     }
 }
 
@@ -3831,7 +3842,7 @@ fn watch_mode_label(mode: WatchMode) -> &'static str {
 fn watch_mode_short_label(mode: WatchMode) -> &'static str {
     match mode {
         WatchMode::All => "Live: all",
-        WatchMode::OnView => "Live: open",
+        WatchMode::OnView => "Live: on view",
     }
 }
 
@@ -3878,6 +3889,7 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_namespace_picker_with_dialog(window, cx);
         self.close_finished_held_edit(window, cx);
+        self.settings_follow_main();
         let window_width = f32::from(window.viewport_size().width);
         let window_height = f32::from(window.viewport_size().height);
         self.sync_narrow_layout(window_width, window, cx);
@@ -3892,6 +3904,7 @@ impl Render for Workspace {
             .key_context(registry::WORKSPACE)
             .map(|el| self.register_actions(el, cx))
             .map(|el| self.register_set_actions(el, cx))
+            .map(|el| self.register_settings_actions(el, cx))
             // Captured, as the list reports no change for the row already selected: asking for
             // a row or object shows the detail, and asking for the filter shows the list. A
             // right-click selects its row without leaving it: the row hosts the context menu.
@@ -3903,7 +3916,10 @@ impl Render for Workspace {
                 this.list_in_front = right_click;
                 this.menu_row_pending = right_click;
             }))
-            .capture_action(cx.listener(|this, _: &OpenObject, _, _| this.list_in_front = false))
+            .capture_action(cx.listener(|this, _: &OpenObject, _, _| {
+                this.list_in_front = false;
+                this.leave_settings_for_view();
+            }))
             .capture_action(cx.listener(|this, _: &EditYaml, _, _| this.list_in_front = false))
             .capture_action(cx.listener(|this, _: &FocusFilter, _, _| this.list_in_front = true))
             .child(
@@ -4079,6 +4095,9 @@ mod keys;
 
 #[path = "workspace_problems.rs"]
 pub(in crate::ui) mod problems;
+
+#[path = "workspace_settings.rs"]
+mod settings_entry;
 
 #[path = "workspace_sets.rs"]
 mod sets;
@@ -4451,7 +4470,7 @@ mod tests {
     #[test]
     fn watch_mode_labels_name_the_mode() {
         assert_eq!(watch_mode_label(WatchMode::All), "Live: all kinds");
-        assert_eq!(watch_mode_label(WatchMode::OnView), "Live: open views only");
+        assert_eq!(watch_mode_label(WatchMode::OnView), "Live: on view");
         for mode in [WatchMode::All, WatchMode::OnView] {
             assert_eq!(watch_mode_label(mode), format!("Live: {}", mode_name(mode)));
         }

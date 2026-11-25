@@ -45,12 +45,18 @@ use super::compare::COMPARE_VIEW;
 pub use super::compare::{
     CompareObject, OpenCompare, RefreshCompare, ToggleCompareSame, ToggleCompareVolatile,
 };
+pub use super::confirm::ConfirmAlternative;
 pub use super::dashboard::set::{OpenSetMember, OpenSetProblem};
 use super::list::combined::{
     SelectCombinedRow, ShowAllCombinedRows, SortCombined, ToggleClusterFilter, ToggleClusterGroup,
     ToggleCombinedProblems, ToggleCombinedWide, ToggleGroupByCluster,
 };
 pub use super::pending_threshold::SetPendingThreshold;
+pub use super::settings_view::{
+    ActivateSettingsControl, CloseSettings, EditAppearance, EditDesktopNotifications,
+    EditWatchMode, NextSettingsControl, OpenSettings, PreviousSettingsControl, RevertSettings,
+    SaveSettings, ShowSettingsSection,
+};
 
 actions!(
     flint,
@@ -127,13 +133,13 @@ actions!(
         NamespacePickerPrevious,
         /// Watch every kind on the active cluster.
         WatchAllKinds,
-        /// Watch only the kinds open in a view, on the active cluster.
+        /// Watch the kinds of open views and the problem kinds, on the active cluster.
         WatchOpenViewsOnly,
         /// Let the active cluster follow the default watch mode.
         UseDefaultWatchMode,
         /// Make "all kinds" the default watch mode.
         DefaultWatchAllKinds,
-        /// Make "open views only" the default watch mode.
+        /// Make "on view" the default watch mode.
         DefaultWatchOpenViewsOnly,
         /// Go back to the kind and object shown before.
         GoBack,
@@ -528,6 +534,23 @@ pub struct ToggleDrainOption {
     pub option: DrainOption,
 }
 
+/// In a fleet action's target list: take a cluster out of the run, or put it back.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = cluster_sets, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct ToggleFleetTarget {
+    pub cluster: String,
+}
+
+actions!(
+    cluster_sets,
+    [
+        /// In a fleet apply's target list: go back to the manifest, as typed, to edit and
+        /// review it again.
+        EditFleetManifestAgain
+    ]
+);
+
 /// Choose the name Flint shows for a cluster: opens a dialog naming its context and server.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
 #[action(namespace = workspace, no_json)]
@@ -691,7 +714,13 @@ actions!(
         RestartAcrossSet,
         /// Ask for a replica count, then scale the selected workload on every member of the
         /// running set, one at a time, after a per-member plan and one confirmation.
-        ScaleAcrossSet
+        ScaleAcrossSet,
+        /// Edit a manifest of the selected object, then apply it on every member of the running
+        /// set, one at a time, after a per-member dry run and one confirmation.
+        ApplyAcrossSet,
+        /// Delete the selected object on every member of the running set, one at a time, after
+        /// a per-member dry run and one confirmation.
+        DeleteAcrossSet
     ]
 );
 
@@ -915,6 +944,8 @@ pub enum Scope {
     Detail,
     /// The open cluster overview.
     Dashboard,
+    /// The Settings view and its draft (opening it, too).
+    Settings,
     /// An open dialog (the Expose to AI confirmation).
     Dialog,
     /// The bottom dock and its tabs.
@@ -1952,6 +1983,22 @@ const CLUSTER_ALERTS: &[Arg] = &[
         ArgKind::Choice(&["default", "on", "off"]),
     ),
 ];
+const SETTINGS_SECTION: &[Arg] = &[arg(
+    "section",
+    "appearance, alerts or watching",
+    ArgKind::Choice(&["appearance", "alerts", "watching"]),
+)];
+const EDIT_APPEARANCE: &[Arg] = &[arg(
+    "appearance",
+    "system, light or dark",
+    ArgKind::Choice(&["system", "light", "dark"]),
+)];
+const EDIT_NOTIFICATIONS: &[Arg] = &[arg("enabled", "true or false", ArgKind::Bool)];
+const EDIT_WATCH_MODE: &[Arg] = &[arg(
+    "mode",
+    "all or on_view",
+    ArgKind::Choice(&["all", "on_view"]),
+)];
 const PENDING_THRESHOLD: &[Arg] = &[
     Arg {
         name: "cluster",
@@ -2227,6 +2274,76 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         .of(C::Flint, S::App)
         .hidden(),
         Spec::unit::<About>("About Flint", "Show Flint's version.").of(C::Flint, S::Workspace),
+        // Settings (#739): Cmd-, on macOS and Ctrl-, on Linux, as in most apps.
+        Spec::unit::<OpenSettings>(
+            "Settings",
+            "Open Flint's settings: appearance, notifications and the default watch mode.",
+        )
+        .of(C::Flint, S::Settings)
+        .keys(&[super::settings_view::OPEN_SETTINGS_KEY], Some(WORKSPACE)),
+        Spec::unit::<CloseSettings>(
+            "Close Settings",
+            "Leave Settings for the view shown before. Unsaved edits stay.",
+        )
+        .of(C::Flint, S::Settings)
+        .keys(&["escape"], Some(super::settings_view::SETTINGS_KEYS)),
+        Spec::unit::<SaveSettings>(
+            "Save Settings",
+            "Write the settings edited in Settings to settings.toml, and only those.",
+        )
+        .of(C::Flint, S::Settings),
+        Spec::unit::<RevertSettings>(
+            "Revert Settings",
+            "Drop the unsaved edits in Settings and show settings.toml as it is.",
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<ShowSettingsSection>(
+            "Show Settings Section…",
+            "Show one section of Settings.",
+            SETTINGS_SECTION,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditAppearance>(
+            "Edit Appearance…",
+            "Set the appearance in the Settings draft.",
+            EDIT_APPEARANCE,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditDesktopNotifications>(
+            "Edit Desktop Notifications…",
+            "Turn desktop notifications on or off in the Settings draft.",
+            EDIT_NOTIFICATIONS,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditWatchMode>(
+            "Edit Default Watch Mode…",
+            "Set the default watch mode in the Settings draft.",
+            EDIT_WATCH_MODE,
+        )
+        .of(C::Flint, S::Settings),
+        // The view's own Tab cycle, so its controls work without a mouse and Tab never reaches
+        // the panes hidden under it.
+        Spec::unit::<NextSettingsControl>(
+            "Next Settings Control",
+            "Move the cursor to the next control in Settings.",
+        )
+        .of(C::Flint, S::Settings)
+        .keys(&["tab", "down"], Some(super::settings_view::SETTINGS_KEYS))
+        .hidden(),
+        Spec::unit::<PreviousSettingsControl>(
+            "Previous Settings Control",
+            "Move the cursor to the previous control in Settings.",
+        )
+        .of(C::Flint, S::Settings)
+        .keys(&["shift-tab", "up"], Some(super::settings_view::SETTINGS_KEYS))
+        .hidden(),
+        Spec::unit::<ActivateSettingsControl>(
+            "Use Settings Control",
+            "Work the control under the cursor in Settings, as a click does.",
+        )
+        .of(C::Flint, S::Settings)
+        .keys(&["enter", "space"], Some(super::settings_view::SETTINGS_KEYS))
+        .hidden(),
         Spec::unit::<ToggleCommandPalette>(
             "Show Command Palette",
             "Search every action available now, and run one.",
@@ -2312,6 +2429,12 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             .hidden(),
         Spec::confirm(),
         Spec::unit::<Cancel>("Cancel", "Dismiss the open dialog.").of(C::Flint, S::Dialog),
+        Spec::unit::<ConfirmAlternative>(
+            "Choose Alternative",
+            "Answer the open dialog with its third choice (Discard).",
+        )
+        .of(C::Flint, S::Dialog)
+        .hidden(),
         // Clusters.
         Spec::with_args::<SelectCluster>(
             "Select Cluster…",
@@ -2506,8 +2629,8 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<WatchAllKinds>("Watch All Kinds", "Watch every kind on the active cluster.")
             .of(C::Cluster, S::Workspace),
         Spec::unit::<WatchOpenViewsOnly>(
-            "Watch Open Views Only",
-            "Watch only the kinds open in a view, on the active cluster.",
+            "Watch On View",
+            "Watch the kinds of open views and the problem kinds, on the active cluster.",
         )
         .of(C::Cluster, S::Workspace),
         Spec::unit::<UseDefaultWatchMode>(
@@ -2521,8 +2644,8 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         )
         .of(C::Cluster, S::Workspace),
         Spec::unit::<DefaultWatchOpenViewsOnly>(
-            "Watch Open Views Only by Default",
-            "Make watching only open views the default for all clusters.",
+            "Watch On View by Default",
+            "Make watching the kinds of open views and the problem kinds the default for all clusters.",
         )
         .of(C::Cluster, S::Workspace),
         // Navigation and panes.
@@ -2812,6 +2935,18 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
              running set, one at a time, after a per-member plan and one confirmation.",
         )
         .of(C::Detail, S::Workspace),
+        Spec::unit::<ApplyAcrossSet>(
+            "Apply YAML to Selected Object Across Set",
+            "Edit a manifest of the selected object, then apply it on every member of the \
+             running set, one at a time, after a per-member dry run and one confirmation.",
+        )
+        .of(C::Detail, S::Workspace),
+        Spec::unit::<DeleteAcrossSet>(
+            "Delete Selected Object Across Set",
+            "Delete the selected object on every member of the running set, one at a time, \
+             after a per-member dry run and one confirmation.",
+        )
+        .of(C::Detail, S::Workspace),
         Spec::with_args::<OpenSetMember>(
             "Open Set Member…",
             "Open the combined list filtered to one member.",
@@ -3050,6 +3185,19 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Include the fields each cluster assigns for itself.",
         )
         .of(C::Detail, S::Compare),
+        Spec::with_args::<ToggleFleetTarget>(
+            "Toggle Fleet Target…",
+            "In a fleet action's target list, take a cluster out of the run or put it back.",
+            CLUSTER,
+        )
+        .of(C::Cluster, S::Dialog)
+        .hidden(),
+        Spec::unit::<EditFleetManifestAgain>(
+            "Edit Fleet Manifest Again",
+            "In a fleet apply's target list, go back to the manifest to edit and review it again.",
+        )
+        .of(C::Cluster, S::Dialog)
+        .hidden(),
         Spec::with_args::<ToggleDrainOption>(
             "Toggle Drain Option…",
             "In the drain dialog, turn an option on or off.",

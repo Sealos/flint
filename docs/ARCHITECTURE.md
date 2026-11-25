@@ -335,8 +335,10 @@ Two modes, set globally with an optional per-cluster override ([ADR-0008](./adr/
 - **All (default):** while a cluster is active, Flint watches every kind it discovered that can be listed and
   watched. Moving between lists is instant.
 - **On view:** Flint watches a kind only while a list or detail view for it is open. Uses less memory on very large
-  clusters, but a list may need a moment to load when you open it. The cluster's telemetry feed runs in this mode only
-  while its overview is open, so its problems, capacity and node metrics are not available otherwise.
+  clusters, but a list may need a moment to load when you open it. Problem detection still runs (#715): the
+  telemetry feed, with its seven kinds and per-kind caps, runs while the cluster is connected as the selected cluster
+  or an open set member, overview open or not. It follows that connection and never makes one: a member whose
+  sign-in runs a program has a feed in the background only with keep-watching consent.
 
 When the user switches to another cluster, the old one stays warm. In mode All it keeps its watches, except the
 high-churn kinds no open view needs (Events, Leases, EndpointSlices), which start again when it becomes active. In
@@ -1219,7 +1221,7 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 
   ```toml
   [proxy]
-  url = "http://user:password@proxy.example.com:3128"  # http:// only; credentials are optional
+  url = "http://user:password@proxy.example.com:3128"  # http://, socks5:// or socks5h://; credentials optional
   no_proxy = ["10.0.0.0/8", ".corp.example.com", "kind.local:6443"]
   ```
 
@@ -1227,8 +1229,17 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   `no_proxy` list exempts servers from it); a `no_proxy` list without a `url` replaces `NO_PROXY` alone. `no_proxy`
   takes `NO_PROXY` entries: names, `.domain` or `*.domain` suffixes, IP addresses and CIDR ranges, each with an
   optional `:port`, or `*`. It is read once at startup (`bootstrap`, in the app and `flint mcp`) and applies after a
-  restart, so every context loaded in a process is pinned to the route it connects through. A proxy that can't be
-  read, uses another scheme or is down is refused, never skipped. The URL is shown, logged and saved in grants only
+  restart, so every context loaded in a process is pinned to the route it connects through. An `http://` proxy is
+  used through `CONNECT`; `socks5://` (names resolved by Flint) and `socks5h://` (names resolved by the proxy), from a
+  `proxy-url`, the setting or `HTTPS_PROXY`, through SOCKS5 with the URL's user name and password; TLS to the API
+  server runs inside either tunnel. A proxy that can't be read, uses another scheme or is down is refused, never
+  skipped. A `settings.toml` that exists but can't be read leaves the setting unknown: every cluster without a
+  `proxy-url` of its own is refused (`ProxyRefused::SettingsUnreadable`) until the file reads and Flint restarts, and
+  the settings error says so; a missing file leaves the environment to decide. Exec credential plugins start with the
+  setting's `HTTPS_PROXY` / `NO_PROXY` (both spellings, and `ALL_PROXY` for SOCKS) under the kubeconfig's own `env`,
+  with the URL's credentials removed as for any inherited proxy. `helm` gets the proxy Flint connects through, except
+  a SOCKS one: client-go sends `socks5` names to the proxy and refuses `socks5h`, so a Helm run there is refused
+  (`HelmError::SocksProxy`). The URL is shown, logged and saved in grants only
   as its address, with an opaque keyed digest of its account (`connection::proxy::route_identity`), so a changed
   proxy or account voids trust, unlocks, AI exposure and keep watching like any other route change. `ProxySetting`'s
   `Debug` hides the credentials too.

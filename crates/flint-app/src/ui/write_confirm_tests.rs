@@ -104,6 +104,7 @@ async fn open_on(
                 asked.begun.set(asked.begun.get() + 1);
                 begin
             },
+            |_, _| {},
             move |result, _| finished.done.borrow_mut().push(result),
         );
     })
@@ -283,6 +284,7 @@ async fn handler(
             asked.begun.set(asked.begun.get() + 1);
             begin
         },
+        |_, _| {},
         move |result, _| finished.done.borrow_mut().push(result),
     );
     (flow, confirmed)

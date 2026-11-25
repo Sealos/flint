@@ -308,10 +308,15 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
         })
         .collect();
     // Offered only where one can run: a set's row of a kind that has the action.
-    let fleet: Vec<FleetChoice> = [FleetChoice::Scale, FleetChoice::RolloutRestart]
-        .into_iter()
-        .filter(|choice| fleet_view::available(ws, *choice, cx).is_ok())
-        .collect();
+    let fleet: Vec<FleetChoice> = [
+        FleetChoice::Scale,
+        FleetChoice::RolloutRestart,
+        FleetChoice::ApplyYaml,
+        FleetChoice::Delete,
+    ]
+    .into_iter()
+    .filter(|choice| fleet_view::available(ws, *choice, cx).is_ok())
+    .collect();
     let object = detail.object();
     let compare = compare_entry(ws, compare_object(object), cx);
     let deletable = ws.kind_deletable(&object.cluster, &object.kind, cx);

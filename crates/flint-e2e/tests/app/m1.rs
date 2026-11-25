@@ -343,22 +343,23 @@ fn up_24_switch_clusters() -> Result<()> {
 fn up_25_change_the_watch_mode() -> Result<()> {
     let (cluster, app) = fake_app(Options::default())?;
     let fake = cluster.fake_server().expect("a fake server");
-    let (pods, deployments) = (fake.gvr("pods"), fake.gvr("deployments"));
+    let (pods, configmaps) = (fake.gvr("pods"), fake.gvr("configmaps"));
     open_live(&app, "pods", 17)?;
     // Default mode, all kinds: kinds not open are watched too.
     until(
-        "deployments watched",
-        || fake.open_watches(&deployments),
+        "configmaps watched",
+        || fake.open_watches(&configmaps),
         |n| *n >= 1,
     )?;
 
-    // On view, for this cluster: only the open list is watched, and it persists.
+    // On view, for this cluster: only the open list and the problem feed's kinds are
+    // watched, and it persists.
     app.dispatch("workspace::WatchOpenViewsOnly", Value::Null)?;
     let state = app.wait_for("/header/watch_mode_source", Equals("cluster".into()))?;
-    assert_eq!(state["header"]["watch_mode"], "Live: open views only");
+    assert_eq!(state["header"]["watch_mode"], "Live: on view");
     until(
-        "deployments unwatched",
-        || fake.open_watches(&deployments),
+        "configmaps unwatched",
+        || fake.open_watches(&configmaps),
         |n| *n == 0,
     )?;
     assert!(fake.open_watches(&pods) >= 1);
@@ -372,15 +373,15 @@ fn up_25_change_the_watch_mode() -> Result<()> {
     app.dispatch("workspace::UseDefaultWatchMode", Value::Null)?;
     app.wait_for("/header/watch_mode_source", Equals("default".into()))?;
     until(
-        "deployments watched again",
-        || fake.open_watches(&deployments),
+        "configmaps watched again",
+        || fake.open_watches(&configmaps),
         |n| *n >= 1,
     )?;
     app.dispatch("workspace::DefaultWatchOpenViewsOnly", Value::Null)?;
-    app.wait_for("/header/watch_mode", Equals("Live: open views only".into()))?;
+    app.wait_for("/header/watch_mode", Equals("Live: on view".into()))?;
     until(
-        "deployments unwatched",
-        || fake.open_watches(&deployments),
+        "configmaps unwatched",
+        || fake.open_watches(&configmaps),
         |n| *n == 0,
     )?;
     let settings = std::fs::read_to_string(app.config_dir().join("settings.toml"))?;
@@ -388,33 +389,25 @@ fn up_25_change_the_watch_mode() -> Result<()> {
     Ok(())
 }
 
-// covers UP-25: in On view, the overview is an open view of the kinds it reads.
+// covers UP-25: in On view, problems are still found with no overview open (#715): the
+// problem feed's kinds are watched, and other kinds only while a view of them is open.
 #[test]
 #[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
-fn up_25_on_view_watches_for_the_overview_until_it_is_left() -> Result<()> {
+fn up_25_on_view_still_finds_problems_with_no_overview_open() -> Result<()> {
     let (cluster, app) = fake_app(Options::default())?;
     let fake = cluster.fake_server().expect("a fake server");
-    let deployments = fake.gvr("deployments");
+    let (deployments, configmaps) = (fake.gvr("deployments"), fake.gvr("configmaps"));
     open_live(&app, "pods", 17)?;
     app.dispatch("workspace::WatchOpenViewsOnly", Value::Null)?;
     app.wait_for("/header/watch_mode_source", Equals("cluster".into()))?;
     until(
-        "no overview, no watch",
-        || fake.open_watches(&deployments),
-        |n| *n == 0,
-    )?;
-
-    app.dispatch("workspace::OpenClusterOverview", Value::Null)?;
-    until(
-        "watched while the overview shows",
+        "the problem feed watches with no overview",
         || fake.open_watches(&deployments),
         |n| *n >= 1,
     )?;
-
-    open_live(&app, "pods", 17)?;
     until(
-        "unwatched after leaving it",
-        || fake.open_watches(&deployments),
+        "a kind with no view is not watched",
+        || fake.open_watches(&configmaps),
         |n| *n == 0,
     )?;
     assert!(fake.writes().is_empty());

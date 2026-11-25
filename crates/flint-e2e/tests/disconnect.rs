@@ -128,7 +128,8 @@ async fn a_set_member_leaves_while_the_others_go_on() {
     let members = core.handle.running_set().await;
     assert_eq!(members.len(), 1);
     assert_eq!(members[0].cluster, "a");
-    assert_eq!(a.open_watches(&pods()), 1, "the other member goes on");
+    // Its list and its problem feed (#715) each watch pods.
+    assert!(a.open_watches(&pods()) >= 1, "the other member goes on");
     stays_quiet(&core.handle, &b).await;
 }
 

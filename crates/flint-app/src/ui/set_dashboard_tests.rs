@@ -94,7 +94,6 @@ fn a_total_lacking_a_member_says_it_is_partial() {
         CardState::Blocked("Paused".into()),
         CardState::Blocked("Changed, left out of this set.".into()),
         CardState::Unavailable("This cluster cannot be checked.".into()),
-        CardState::NotWatched,
         CardState::Waiting,
     ] {
         let model = assemble(vec![
@@ -117,7 +116,7 @@ fn a_full_total_is_exact_and_one_with_no_member_shows_no_number() {
     assert_eq!(total(&full, ProblemCategory::FailingPods).value(2), "5");
     assert_eq!(full.partial, None);
     let none = assemble(vec![
-        card_with("a", CardState::NotWatched, None, "a"),
+        card_with("a", CardState::Blocked("Paused".into()), None, "a"),
         card_with("b", CardState::Waiting, None, "b"),
     ]);
     let failing = total(&none, ProblemCategory::FailingPods);
@@ -152,7 +151,6 @@ fn a_blocked_member_shows_no_values_even_with_a_feed_on_the_board() {
         telemetry: None,
         server: "https://a".into(),
         thresholds: Thresholds::default(),
-        watched: true,
     };
     let card = card_with_read(member);
     assert!(matches!(card.state, CardState::Blocked(_)));
@@ -161,9 +159,10 @@ fn a_blocked_member_shows_no_values_even_with_a_feed_on_the_board() {
     assert_eq!(card.level, ThresholdLevel::Unknown);
 }
 
+// In either watch mode a member's feed runs, so one not yet read is waiting for it (#715).
 #[test]
-fn a_member_without_a_feed_says_whether_it_is_watched() {
-    let member = |watched| MemberRead {
+fn a_member_without_a_feed_is_waiting_for_it() {
+    let member = MemberRead {
         cluster: "a".into(),
         shown: "a".into(),
         tag: None,
@@ -171,10 +170,8 @@ fn a_member_without_a_feed_says_whether_it_is_watched() {
         telemetry: None,
         server: "https://a".into(),
         thresholds: Thresholds::default(),
-        watched,
     };
-    assert_eq!(card_with_read(member(true)).state, CardState::Waiting);
-    assert_eq!(card_with_read(member(false)).state, CardState::NotWatched);
+    assert_eq!(card_with_read(member).state, CardState::Waiting);
 }
 
 fn card_with_read(member: MemberRead) -> SetCard {

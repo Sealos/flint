@@ -424,6 +424,14 @@ fn remove(
             format!("the uid of \"{name}\" does not match the precondition"),
         ));
     }
+    let version = options.pointer("/preconditions/resourceVersion");
+    if version.is_some() && version != object.pointer("/metadata/resourceVersion") {
+        return Err(ApiError::new(
+            409,
+            "Conflict",
+            format!("the resourceVersion of \"{name}\" does not match the precondition"),
+        ));
+    }
     if dry_run {
         return Ok(());
     }

@@ -2,9 +2,11 @@
 //!
 //! A cluster entry's `proxy-url` always applies. Without one, the `[proxy]` of `settings.toml`
 //! does ([`use_setting`]), else `HTTPS_PROXY` (or `https_proxy`), unless the no-proxy list that
-//! goes with it exempts the API server. Only `http://` proxies are
-//! supported, through `CONNECT`: TLS to the API server runs inside the tunnel, so the proxy sees
-//! neither the credentials nor the requests. Any other proxy is refused, never skipped.
+//! goes with it exempts the API server. `http://` proxies are used through `CONNECT`, and
+//! `socks5://` (names resolved here) and `socks5h://` (names resolved by the proxy) through a
+//! SOCKS5 tunnel. Either way TLS to the API server runs inside the tunnel, so the proxy sees
+//! neither the credentials nor the requests. Any other proxy is refused, never skipped, and so is
+//! every route that would take the setting while `settings.toml` could not be read at startup.
 //!
 //! A proxy URL can hold a password. Only [`shown`], and [`route_identity`] with its one-way
 //! digest, leave this module as text.
@@ -16,7 +18,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use http::{HeaderValue, Uri};
-use hyper_util::client::legacy::connect::proxy::Tunnel;
+use hyper_util::client::legacy::connect::proxy::{SocksV5, Tunnel};
 use hyper_util::client::proxy::matcher::Matcher;
 use ring::hmac;
 use ring::rand::SystemRandom;
@@ -31,16 +33,70 @@ const UNREADABLE: &str = "an unreadable proxy URL";
 /// were that ever skipped, this address leads nowhere.
 pub(crate) const LOADER_PLACEHOLDER: &str = "http://proxy.invalid:1";
 
+/// Stands in for the proxy of a route that would take the setting while `settings.toml` could
+/// not be read: every use of it is refused ([`ProxyRefused::SettingsUnreadable`]).
+const SETTINGS_UNREADABLE: &str = "flint-settings-unreadable://settings.toml";
+
+/// What [`shown`] says of [`SETTINGS_UNREADABLE`].
+const SETTINGS_UNREADABLE_SHOWN: &str = "the proxy setting of an unreadable settings.toml";
+
+/// The port of a SOCKS proxy URL that names none, as curl and Go use.
+const SOCKS_DEFAULT_PORT: u16 = 1080;
+
+/// The proxy setting this process uses.
+#[derive(Clone)]
+enum InUse {
+    /// The `[proxy]` of a `settings.toml` that was read, or the defaults when there was none.
+    Setting(ProxySetting),
+    /// `settings.toml` exists but could not be read, so the setting is unknown.
+    Unreadable,
+}
+
 /// The proxy setting this process uses, from `settings.toml` at startup. Set once, so the proxy
 /// chosen when kubeconfig loads is the one a client later connects through.
-static SETTING: OnceLock<ProxySetting> = OnceLock::new();
+static SETTING: OnceLock<InUse> = OnceLock::new();
 
 /// Uses `setting` for cluster connections from now on. The first call wins; later ones are
 /// ignored, since contexts loaded under the first are pinned to its route.
 pub(crate) fn use_setting(setting: &ProxySetting) {
-    if SETTING.set(setting.clone()).is_err() {
+    use_in_process(InUse::Setting(setting.clone()));
+}
+
+/// Refuses, from now on, every cluster connection that would take the proxy setting: those
+/// without a `proxy-url` of their own. For a `settings.toml` that exists but can't be read, whose
+/// proxy may have been meant for every cluster. The first call wins, as for [`use_setting`].
+pub(crate) fn use_unreadable_setting() {
+    use_in_process(InUse::Unreadable);
+}
+
+fn use_in_process(setting: InUse) {
+    if SETTING.set(setting).is_err() {
         tracing::debug!("a proxy setting is already in use; the new one applies after a restart");
     }
+}
+
+/// `reason`, why `settings.toml` can't be read, saying what that means for the proxy when the
+/// file was unreadable at startup. Holds nothing of the file.
+pub(crate) fn settings_error_with_proxy_note(reason: String) -> String {
+    with_proxy_note(reason, matches!(SETTING.get(), Some(InUse::Unreadable)))
+}
+
+/// `reason`, with the proxy note when the setting in use is `unreadable`. The note follows the
+/// reason's first line: a TOML parse error goes on with lines that quote the file, and what is
+/// shown of an error is its first line.
+fn with_proxy_note(reason: String, unreadable: bool) -> String {
+    if !unreadable {
+        return reason;
+    }
+    let reason = reason
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    format!(
+        "{reason}. Its proxy setting could not be applied, so clusters without a proxy-url of \
+         their own do not connect until settings.toml can be read and Flint restarts"
+    )
 }
 
 /// The proxy variables of an environment. Holds what may be a password, so it has no `Debug`.
@@ -54,7 +110,21 @@ impl ProxyEnvironment {
     /// The proxy of this process: the variables of its environment under the setting it uses
     /// ([`use_setting`]).
     pub(crate) fn current() -> Self {
-        Self::of_process().under(SETTING.get())
+        match SETTING.get() {
+            Some(InUse::Setting(setting)) => Self::of_process().under(Some(setting)),
+            None => Self::of_process(),
+            Some(InUse::Unreadable) => Self::unreadable_setting(),
+        }
+    }
+
+    /// The environment while `settings.toml` can't be read: every route without a `proxy-url`
+    /// of its own takes a proxy that is always refused. Nothing is exempt, since the setting's
+    /// no-proxy list is unknown too.
+    fn unreadable_setting() -> Self {
+        ProxyEnvironment {
+            https_proxy: Some(SETTINGS_UNREADABLE.to_owned()),
+            no_proxy: None,
+        }
     }
 
     /// The variables of this process, in the order kube and kubectl read them.
@@ -208,6 +278,9 @@ pub(crate) fn chosen<'a>(
 
 /// `proxy` as it may be shown, logged and saved: scheme, host and port, with no credentials.
 pub(crate) fn shown(proxy: &str) -> String {
+    if proxy.trim() == SETTINGS_UNREADABLE {
+        return SETTINGS_UNREADABLE_SHOWN.to_owned();
+    }
     // The same reading of the authority as a server URL: a bad port or a stray `@` means what
     // parsed as the host may be part of a credential.
     if crate::redact::plain_server_url(proxy) == crate::redact::HIDDEN_SERVER_URL {
@@ -377,6 +450,53 @@ pub(crate) fn plugin_environment(
         .collect()
 }
 
+/// The proxy variables an exec plugin starts with under the proxy setting this process uses,
+/// each to set (`Some`) or remove (`None`), so a plugin reaches its sign-in service the way
+/// Flint's own connections go when they take the setting. Applied before the kubeconfig's own
+/// `env`, which wins, and before [`plugin_environment`], which still keeps any credentials of
+/// the URL from the plugin. Empty without a setting, and while `settings.toml` can't be read.
+pub(crate) fn plugin_setting_variables() -> Vec<(&'static str, Option<String>)> {
+    match SETTING.get() {
+        Some(InUse::Setting(setting)) => setting_variables(setting),
+        None | Some(InUse::Unreadable) => Vec::new(),
+    }
+}
+
+/// [`plugin_setting_variables`] for `setting`. Both spellings of each variable are set, since
+/// tools differ in which they read first. A SOCKS URL goes in `ALL_PROXY` too, which curl reads.
+fn setting_variables(setting: &ProxySetting) -> Vec<(&'static str, Option<String>)> {
+    let mut variables = Vec::new();
+    let url = setting
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty());
+    let no_proxy = setting.no_proxy_list();
+    if let Some(url) = url {
+        for name in ["HTTPS_PROXY", "https_proxy"] {
+            variables.push((name, Some(url.to_owned())));
+        }
+        if scheme_of(url).is_some_and(|s| SocksResolution::of_scheme(&s).is_some()) {
+            for name in ["ALL_PROXY", "all_proxy"] {
+                variables.push((name, Some(url.to_owned())));
+            }
+        }
+    }
+    // A URL takes its own no-proxy list, or none: the environment's belongs to its own proxy.
+    if url.is_some() || no_proxy.is_some() {
+        for name in ["NO_PROXY", "no_proxy"] {
+            variables.push((name, no_proxy.clone()));
+        }
+    }
+    variables
+}
+
+/// The scheme of `proxy`, in lowercase, if it can be read.
+fn scheme_of(proxy: &str) -> Option<String> {
+    let uri = proxy.trim().parse::<Uri>().ok()?;
+    Some(uri.scheme_str()?.to_ascii_lowercase())
+}
+
 /// What a grant (trust, an unlock, AI exposure, keep watching) is pinned to: the server, and the
 /// proxy shown for it. A grant made for one route does not hold for another.
 pub fn grant_endpoint<'a>(server: &'a str, proxy: Option<&str>) -> Cow<'a, str> {
@@ -389,13 +509,27 @@ pub fn grant_endpoint<'a>(server: &'a str, proxy: Option<&str>) -> Cow<'a, str> 
 /// Why a connection was not made through its proxy. Its text holds no credentials.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ProxyRefused {
-    #[error("the proxy URL can't be read; use http://host:port. Flint did not connect without it")]
+    #[error(
+        "the proxy URL can't be read; use http://, socks5:// or socks5h://host:port. Flint did \
+         not connect without it"
+    )]
     Unreadable,
     #[error(
-        "the proxy {shown} uses {scheme}, which Flint does not support; use an http:// proxy. \
-         Flint did not connect without it"
+        "the proxy {shown} uses {scheme}, which Flint does not support; use an http://, \
+         socks5:// or socks5h:// proxy. Flint did not connect without it"
     )]
     Unsupported { shown: String, scheme: String },
+    #[error(
+        "settings.toml could not be read when Flint started, so its proxy setting is unknown \
+         and this cluster has no proxy-url of its own; fix settings.toml and restart Flint. \
+         Flint did not connect"
+    )]
+    SettingsUnreadable,
+    #[error(
+        "the proxy's user name or password is longer than SOCKS5 allows (255 bytes). Flint did \
+         not connect without it"
+    )]
+    SocksCredentialTooLong,
     #[error(
         "the API server uses plain HTTP, so a proxy could read its credentials; use https. \
          Flint did not connect"
@@ -437,11 +571,44 @@ pub(crate) fn check_route(server: &str, skips_verify: bool) -> Result<(), ProxyR
     Ok(())
 }
 
-/// A proxy to tunnel through. Holds its credentials as a sensitive header value.
+/// Where a SOCKS5 proxy's destination names are resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SocksResolution {
+    /// `socks5://`: here, and the proxy is given an address.
+    Local,
+    /// `socks5h://`: by the proxy, which is given the name.
+    Proxy,
+}
+
+impl SocksResolution {
+    /// The resolution `scheme` (in lowercase) stands for, or None if it is not SOCKS5.
+    fn of_scheme(scheme: &str) -> Option<Self> {
+        match scheme {
+            "socks5" => Some(SocksResolution::Local),
+            "socks5h" => Some(SocksResolution::Proxy),
+            _ => None,
+        }
+    }
+}
+
+/// How a proxy is spoken to, with its credentials. Never `Debug`: they would show.
+#[derive(Clone)]
+enum Kind {
+    /// HTTP `CONNECT`, with a `Proxy-Authorization` header value marked sensitive.
+    Connect { authorization: Option<HeaderValue> },
+    /// SOCKS5, with a user name and password.
+    Socks {
+        resolution: SocksResolution,
+        account: Option<(String, String)>,
+    },
+}
+
+/// A proxy to tunnel through, with its credentials.
 #[derive(Clone)]
 pub(crate) struct ProxyTarget {
+    /// The proxy's address alone, so no connection error can quote the credentials.
     uri: Uri,
-    authorization: Option<HeaderValue>,
+    kind: Kind,
 }
 
 impl std::fmt::Debug for ProxyTarget {
@@ -452,45 +619,102 @@ impl std::fmt::Debug for ProxyTarget {
     }
 }
 
+/// A connector reaching every destination through a proxy ([`ProxyTarget::tunnel`]).
+pub(crate) enum ProxyConnector<C> {
+    Connect(Tunnel<C>),
+    Socks(SocksV5<C>),
+}
+
 impl ProxyTarget {
     /// The proxy at `proxy`, if Flint can connect through it.
     pub(crate) fn parse(proxy: &str) -> Result<Self, ProxyRefused> {
         let proxy = proxy.trim();
-        if shown(proxy) == UNREADABLE {
+        if proxy == SETTINGS_UNREADABLE {
+            return Err(ProxyRefused::SettingsUnreadable);
+        }
+        let address = shown(proxy);
+        if address == UNREADABLE {
             return Err(ProxyRefused::Unreadable);
         }
         let uri = proxy.parse::<Uri>().map_err(|_| ProxyRefused::Unreadable)?;
         let (Some(scheme), Some(_)) = (uri.scheme_str(), uri.host()) else {
             return Err(ProxyRefused::Unreadable);
         };
-        if !scheme.eq_ignore_ascii_case("http") {
+        let scheme = scheme.to_ascii_lowercase();
+        let socks = SocksResolution::of_scheme(&scheme);
+        if scheme != "http" && socks.is_none() {
             return Err(ProxyRefused::Unsupported {
-                shown: shown(proxy),
-                scheme: scheme.to_ascii_lowercase(),
+                shown: address,
+                scheme,
             });
         }
-        // The address alone, so no connection error can quote the credentials.
-        let uri = shown(proxy)
+        // A SOCKS proxy's address names its port: the connector under the tunnel would take 80
+        // for a scheme it does not know.
+        let address = match (socks, uri.port_u16()) {
+            (Some(_), None) => format!("{address}:{SOCKS_DEFAULT_PORT}"),
+            _ => address,
+        };
+        let address = address
             .parse::<Uri>()
             .map_err(|_| ProxyRefused::Unreadable)?;
+        // The matcher knows SOCKS schemes in lowercase only.
+        let (_, rest) = proxy.split_once("://").ok_or(ProxyRefused::Unreadable)?;
         let destination = Uri::from_static("https://api.invalid");
         let intercept = Matcher::builder()
-            .all(proxy.to_owned())
+            .all(format!("{scheme}://{rest}"))
             .build()
             .intercept(&destination)
             .ok_or(ProxyRefused::Unreadable)?;
-        Ok(ProxyTarget {
-            uri,
-            authorization: intercept.basic_auth().cloned(),
-        })
+        let kind = match socks {
+            None => Kind::Connect {
+                authorization: intercept.basic_auth().cloned(),
+            },
+            Some(resolution) => {
+                let account = intercept
+                    .raw_auth()
+                    .map(|(user, password)| (user.to_owned(), password.to_owned()));
+                if account
+                    .as_ref()
+                    .is_some_and(|(user, password)| user.len() > 255 || password.len() > 255)
+                {
+                    return Err(ProxyRefused::SocksCredentialTooLong);
+                }
+                Kind::Socks {
+                    resolution,
+                    account,
+                }
+            }
+        };
+        Ok(ProxyTarget { uri: address, kind })
     }
 
-    /// `connector`, reaching every destination through a `CONNECT` tunnel to this proxy.
-    pub(crate) fn tunnel<C>(&self, connector: C) -> Tunnel<C> {
-        let tunnel = Tunnel::new(self.uri.clone(), connector);
-        match &self.authorization {
-            Some(authorization) => tunnel.with_auth(authorization.clone()),
-            None => tunnel,
+    /// Whether this is a SOCKS5 proxy.
+    pub(crate) fn is_socks(&self) -> bool {
+        matches!(self.kind, Kind::Socks { .. })
+    }
+
+    /// `connector`, reaching every destination through a tunnel to this proxy: `CONNECT` for an
+    /// HTTP proxy, SOCKS5 for a SOCKS one.
+    pub(crate) fn tunnel<C>(&self, connector: C) -> ProxyConnector<C> {
+        match &self.kind {
+            Kind::Connect { authorization } => {
+                let tunnel = Tunnel::new(self.uri.clone(), connector);
+                ProxyConnector::Connect(match authorization {
+                    Some(authorization) => tunnel.with_auth(authorization.clone()),
+                    None => tunnel,
+                })
+            }
+            Kind::Socks {
+                resolution,
+                account,
+            } => {
+                let socks = SocksV5::new(self.uri.clone(), connector)
+                    .local_dns(*resolution == SocksResolution::Local);
+                ProxyConnector::Socks(match account {
+                    Some((user, password)) => socks.with_auth(user.clone(), password.clone()),
+                    None => socks,
+                })
+            }
         }
     }
 }

@@ -5,7 +5,8 @@ warm and keep their watches. Only clusters outside that set drop their watches a
 
 By default, while a cluster is active (shown in the window), Flint watches every discovered kind that can be listed
 and watched, so moving between lists is instant. A setting, global with a per-cluster override, switches to **on
-view** mode, which watches a kind only while one of its views is open. Clusters that are not active drop all their
+view** mode, which watches a kind only while one of its views is open, apart from the seven kinds problem detection
+watches while the cluster is selected or an open set member (#715). Clusters that are not active drop all their
 watches but keep their client and discovery cache. Switching back starts the watches again with a fresh list.
 
 This trades some memory for speed on the cluster being worked on, and stops memory from growing with the number of

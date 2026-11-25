@@ -433,6 +433,7 @@ impl GroupFailure {
             }
             ClusterError::Kube(_) => "client error",
             ClusterError::UnknownContext(_) | ClusterError::Config { .. } => "invalid config",
+            ClusterError::ProxySettingUnknown => "proxy setting unknown",
         };
         Self { status, category }
     }

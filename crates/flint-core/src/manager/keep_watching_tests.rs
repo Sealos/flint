@@ -4,8 +4,10 @@ use super::*;
 use crate::auth_plugin::tests::{FakePlugin, live};
 use crate::connection::member::MemberState;
 use crate::handle::CoreConfig;
+use crate::manager::keep_watching_lists::{WARM_KINDS, WARM_LIST_CLUSTERS};
 use crate::manager::{Changed, Cluster};
 use crate::protection::SessionUnlocks;
+use crate::read::KindId;
 use crate::settings::Settings;
 use crate::watch::HubRegistry;
 
@@ -894,4 +896,353 @@ async fn ending_consent_drops_a_handed_over_feed() {
         !manager.keep.feeds.contains_key("dev"),
         "no background feed without consent"
     );
+}
+
+/// Gives `id` discovery of pods, config maps and events, in watch mode All, as its connect would.
+/// Returns those kinds.
+fn discovered(manager: &mut ClusterManager, id: &str) -> [KindId; 3] {
+    use crate::discovery::tests::kind;
+    let verbs = &["get", "list", "watch"];
+    let kinds = vec![
+        kind("", "Pod", "pods", true, verbs),
+        kind("", "ConfigMap", "configmaps", true, verbs),
+        kind("", "Event", "events", true, verbs),
+    ];
+    let ids = [kinds[0].id(), kinds[1].id(), kinds[2].id()];
+    let slot = manager.cluster_mut(id).unwrap();
+    slot.watches.set_kinds(&kinds);
+    slot.discovery = Some(Arc::new(crate::discovery::ClusterDiscovery::new(kinds)));
+    manager.reconcile(id);
+    ids
+}
+
+/// The task watching `kind` on `id`, if one runs.
+fn task(manager: &ClusterManager, id: &str, kind: &KindId) -> Option<tokio::task::Id> {
+    manager
+        .cluster(id)
+        .unwrap()
+        .watches
+        .tasks()
+        .get(kind)
+        .copied()
+}
+
+// A watched cluster's resource watches read through its kept connection: leaving it keeps them
+// running, without the high-churn kinds, and selecting it again starts none of them over, so
+// nothing is listed again. Writes still go through the slot.
+#[tokio::test]
+async fn a_switch_keeps_a_watched_clusters_lists_warm() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "dev");
+    watched_other(&mut manager).await;
+    select_and_land(&mut manager, "other").await;
+    let [pods, config_maps, events] = discovered(&mut manager, "other");
+    assert!(manager.lists_warm("other"));
+    let pods_task = task(&manager, "other", &pods).expect("pods are watched");
+    let maps_task = task(&manager, "other", &config_maps).expect("config maps are watched");
+    assert!(task(&manager, "other", &events).is_some());
+    // A view showed config maps a moment ago.
+    open_view(&mut manager, 1, "other", &config_maps);
+    close_view(&mut manager, 1, "other");
+
+    manager.activate("dev".to_owned());
+    sync(&mut manager);
+    assert!(manager.lists_warm("other"), "warm in the background");
+    assert_eq!(
+        task(&manager, "other", &pods),
+        Some(pods_task),
+        "a core kind"
+    );
+    assert_eq!(
+        task(&manager, "other", &config_maps),
+        Some(maps_task),
+        "shown last"
+    );
+    assert!(
+        task(&manager, "other", &events).is_none(),
+        "high-churn kinds stop in the background"
+    );
+
+    manager.activate("other".to_owned());
+    sync(&mut manager);
+    assert_eq!(
+        task(&manager, "other", &pods),
+        Some(pods_task),
+        "not listed again"
+    );
+    assert_eq!(task(&manager, "other", &config_maps), Some(maps_task));
+    assert!(task(&manager, "other", &events).is_some(), "back in front");
+    let slot = manager.cluster("other").unwrap();
+    assert!(matches!(slot.state, ConnectionState::Connected(_)));
+    assert!(
+        slot.write_credential.is_some(),
+        "writes go through the slot"
+    );
+}
+
+/// Opens view `view` on `kind` of `id`, as a subscription would.
+fn open_view(manager: &mut ClusterManager, view: u64, id: &str, kind: &KindId) {
+    manager
+        .subscriptions
+        .insert(view, (id.to_owned(), kind.clone(), None));
+    manager.reconcile(id);
+}
+
+/// Closes view `view` of `id`.
+fn close_view(manager: &mut ClusterManager, view: u64, id: &str) {
+    manager.subscriptions.remove(&view);
+    manager.reconcile(id);
+}
+
+// In the background a cluster keeps at most a few kinds: those its views showed last, before
+// the core kinds, and none that no view showed.
+#[tokio::test]
+async fn a_background_cluster_keeps_only_its_last_shown_kinds() {
+    use crate::discovery::tests::kind;
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "dev");
+    watched_other(&mut manager).await;
+    select_and_land(&mut manager, "other").await;
+    let verbs = &["get", "list", "watch"];
+    let mut kinds = vec![kind("", "Pod", "pods", true, verbs)];
+    for n in 0..=WARM_KINDS + 1 {
+        let plural = format!("widgets{n}");
+        kinds.push(kind("example.com", "Widget", &plural, true, verbs));
+    }
+    let ids: Vec<KindId> = kinds.iter().map(|kind| kind.id()).collect();
+    let slot = manager.cluster_mut("other").unwrap();
+    slot.watches.set_kinds(&kinds);
+    slot.discovery = Some(Arc::new(crate::discovery::ClusterDiscovery::new(kinds)));
+    manager.reconcile("other");
+    assert_eq!(
+        manager.cluster("other").unwrap().watches.tasks().len(),
+        ids.len()
+    );
+    // Views show every widget but the last, one after another.
+    let widgets = &ids[1..ids.len() - 1];
+    for (view, widget) in widgets.iter().enumerate() {
+        open_view(&mut manager, view as u64, "other", widget);
+        close_view(&mut manager, view as u64, "other");
+    }
+
+    manager.activate("dev".to_owned());
+    sync(&mut manager);
+
+    let running = manager.cluster("other").unwrap().watches.tasks();
+    assert_eq!(running.len(), WARM_KINDS, "{running:?}");
+    for widget in &widgets[widgets.len() - WARM_KINDS..] {
+        assert!(running.contains_key(widget), "{widget} was shown last");
+    }
+    assert!(!running.contains_key(&ids[0]), "no room left for pods");
+    assert!(!running.contains_key(&ids[1]), "shown first");
+    assert!(!running.contains_key(&ids[ids.len() - 1]), "never shown");
+}
+
+// Disconnecting a watched cluster in the background stops its warm lists before the settings
+// are written: nothing reads through its kept connection once the disconnect is under way.
+#[tokio::test]
+async fn disconnect_stops_warm_lists_at_once() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "dev");
+    watched_other(&mut manager).await;
+    select_and_land(&mut manager, "other").await;
+    let [pods, ..] = discovered(&mut manager, "other");
+    manager.activate("dev".to_owned());
+    sync(&mut manager);
+    assert!(task(&manager, "other", &pods).is_some(), "warm");
+
+    manager.disconnect_cluster("other".to_owned()).await;
+
+    assert!(!manager.lists_warm("other"));
+    assert!(manager.cluster("other").unwrap().watches.tasks().is_empty());
+}
+
+// Ending background sign-in consent, or keep watching, stops warm lists in the background before
+// the loop's next sync.
+#[tokio::test]
+async fn ending_consent_or_keep_watching_stops_warm_lists_at_once() {
+    for turn_off in [false, true] {
+        let plugin = token_plugin();
+        let config = tempfile::tempdir().unwrap();
+        let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+        allow(&mut manager).await;
+        sync(&mut manager);
+        land_kept(&mut manager, "dev").await;
+        select_and_land(&mut manager, "dev").await;
+        let [pods, ..] = discovered(&mut manager, "dev");
+        manager.activate("other".to_owned());
+        sync(&mut manager);
+        assert!(task(&manager, "dev", &pods).is_some(), "warm");
+
+        if turn_off {
+            manager.set_keep_watching("dev".to_owned(), None).await;
+        } else {
+            manager.kept_grants().revoke("dev");
+            manager.revoke_background_sign_in("dev");
+        }
+
+        assert!(!manager.lists_warm("dev"), "turn_off={turn_off}");
+        assert!(manager.cluster("dev").unwrap().watches.tasks().is_empty());
+    }
+}
+
+// A cluster that is not watched drops its watches when it is left, as before.
+#[tokio::test]
+async fn an_unwatched_cluster_keeps_no_lists_warm() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "dev");
+    select_and_land(&mut manager, "other").await;
+    let [pods, ..] = discovered(&mut manager, "other");
+    assert!(!manager.lists_warm("other"));
+    assert!(task(&manager, "other", &pods).is_some());
+
+    manager.activate("dev".to_owned());
+    sync(&mut manager);
+    assert!(manager.cluster("other").unwrap().watches.tasks().is_empty());
+}
+
+// A changed definition drops warm lists: the selected cluster's watches start over on the slot's
+// own connection, and none reads through a connection made for the old definition.
+#[tokio::test]
+async fn a_definition_change_drops_warm_lists() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "dev");
+    watched_other(&mut manager).await;
+    select_and_land(&mut manager, "other").await;
+    let [pods, ..] = discovered(&mut manager, "other");
+    let warm = task(&manager, "other", &pods).unwrap();
+
+    let slot = manager.cluster_mut("other").unwrap();
+    slot.fingerprint = slot.fingerprint.map(|print| print.wrapping_add(1));
+    sync(&mut manager);
+
+    assert!(!manager.lists_warm("other"));
+    let now = task(&manager, "other", &pods).expect("still watched on the slot");
+    assert_ne!(now, warm, "started over on the slot's connection");
+}
+
+// Ending a plugin's background sign-in consent drops the warm lists of a cluster in the
+// background: its watches stop at once.
+#[tokio::test]
+async fn ending_consent_stops_warm_lists_in_the_background() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    sync(&mut manager);
+    land_kept(&mut manager, "dev").await;
+    select_and_land(&mut manager, "dev").await;
+    let [pods, ..] = discovered(&mut manager, "dev");
+    assert!(manager.lists_warm("dev"));
+    manager.activate("other".to_owned());
+    sync(&mut manager);
+    assert!(
+        task(&manager, "dev", &pods).is_some(),
+        "warm in the background"
+    );
+
+    manager.kept_grants().revoke("dev");
+    manager.revoke_background_sign_in("dev");
+    sync(&mut manager);
+
+    assert!(!manager.lists_warm("dev"));
+    assert!(manager.cluster("dev").unwrap().watches.tasks().is_empty());
+}
+
+// At most a few clusters keep warm lists in the background, the most recently left.
+#[tokio::test]
+async fn only_the_most_recently_left_clusters_keep_warm_lists() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let names: Vec<String> = (0..=WARM_LIST_CLUSTERS).map(|n| format!("w{n}")).collect();
+    let more: String = names
+        .iter()
+        .map(|name| format!("- name: {name}\n  context:\n    cluster: c\n    user: s\n"))
+        .collect();
+    let (mut manager, _) = manager_on(&plugin, config.path().to_owned(), &more);
+    manager.active = Some("dev".to_owned());
+    manager.sync_roles();
+    for name in &names {
+        let definition = manager.keep_watching_views()[name].definition;
+        manager.set_keep_watching(name.clone(), definition).await;
+        sync(&mut manager);
+        land_kept(&mut manager, name).await;
+        select_and_land(&mut manager, name).await;
+        discovered(&mut manager, name);
+    }
+    manager.activate("dev".to_owned());
+    sync(&mut manager);
+
+    assert!(!manager.lists_warm(&names[0]), "the least recent goes cold");
+    assert!(
+        manager
+            .cluster(&names[0])
+            .unwrap()
+            .watches
+            .tasks()
+            .is_empty()
+    );
+    for name in &names[1..] {
+        assert!(manager.lists_warm(name), "{name}");
+    }
+}
+
+// A handed-over feed whose credential fails in the background while its cluster is selected
+// ends without stopping keep watching: the slot's working connection starts a feed in its place,
+// even in On view with no overview open, and leaving the cluster starts a kept feed again.
+#[tokio::test]
+async fn a_handed_over_feed_failing_while_selected_falls_back_to_the_slot() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    manager.settings = Arc::new(Settings {
+        watch_mode: crate::settings::WatchMode::OnView,
+        ..(*manager.settings).clone()
+    });
+    allow(&mut manager).await;
+    sync(&mut manager);
+    let attempt = land_kept(&mut manager, "dev").await;
+    select_and_land(&mut manager, "dev").await;
+    assert!(manager.kept_feed_handed_over("dev"));
+
+    manager.kept_failed("dev", attempt);
+    sync(&mut manager);
+
+    assert_eq!(manager.keep_status("dev"), KeepWatching::Watching);
+    assert!(
+        !manager.keep.feeds.contains_key("dev"),
+        "none in the background"
+    );
+    assert!(
+        manager.cluster("dev").unwrap().telemetry.is_some(),
+        "the slot's feed keeps the alerts going"
+    );
+
+    manager.activate("other".to_owned());
+    sync(&mut manager);
+    let kept = manager.keep.feeds.get("dev").expect("a kept feed again");
+    assert_ne!(kept.attempt, attempt);
+    assert_eq!(manager.keep_status("dev"), KeepWatching::Watching);
+}
+
+// The same failure while the cluster is in the background waits for a sign-in, as before.
+#[tokio::test]
+async fn a_kept_feed_failing_in_the_background_waits_for_a_sign_in() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "other");
+    allow(&mut manager).await;
+    sync(&mut manager);
+    let attempt = land_kept(&mut manager, "dev").await;
+
+    manager.kept_failed("dev", attempt);
+    sync(&mut manager);
+
+    assert_eq!(manager.keep_status("dev"), KeepWatching::SignInNeeded);
+    assert!(!manager.keep.feeds.contains_key("dev"));
 }

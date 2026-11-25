@@ -4,8 +4,8 @@
 //! what it decides into notifications. [`AlertCenter`] runs it in the app, reports what the OS
 //! answered, and opens or investigates an alert.
 //!
-//! - **Reads nothing itself.** It uses what the feeds already hold, so a paused cluster, or one in
-//!   watch mode On view, gets no request from here.
+//! - **Reads nothing itself.** It uses what the feeds already hold, so a paused cluster, or one
+//!   with no feed, gets no request from here. A feed runs in either watch mode (#715).
 //! - **Fails closed.** A kind of problem whose API group discovery could not vouch for is
 //!   unchecked: it neither raises nor resolves.
 //! - **Pinned.** An alert keeps the identity of the cluster that raised it. Opening it after that
@@ -29,7 +29,7 @@ use flint_core::discovery::ClusterDiscovery;
 use flint_core::handle::{ActivationRefused, ClusterSummary, ConnectionState, ReadPin};
 use flint_core::problems::ProblemKind;
 use flint_core::read::DiscoveredKinds;
-use flint_core::settings::{Settings, WatchMode, load_settings};
+use flint_core::settings::{Settings, load_settings};
 use flint_core::telemetry::{ClusterTelemetry, FeedDiscovery, KeptCoverage, TelemetrySnapshot};
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -238,7 +238,8 @@ pub enum Reading<'a> {
     },
     /// It should be readable and is not: its connection failed or it is paused.
     Lost,
-    /// Flint is not keeping it watched.
+    /// It has no feed: it is neither selected, in the running set nor kept watching, or its
+    /// sign-in may not run in the background.
     NotWatched,
     /// Its alerts are turned off.
     Muted,
@@ -247,15 +248,11 @@ pub enum Reading<'a> {
 /// What `summary`'s state and feed say about it.
 pub fn reading<'a>(
     summary: &ClusterSummary,
-    mode: WatchMode,
     snapshot: Option<&'a TelemetrySnapshot>,
     discovery: Option<&'a ClusterDiscovery>,
 ) -> Reading<'a> {
     if summary.paused {
         return Reading::Lost;
-    }
-    if mode != WatchMode::All {
-        return Reading::NotWatched;
     }
     if let Some(snapshot) = snapshot {
         return Reading::Feed {
@@ -276,13 +273,12 @@ pub fn reading<'a>(
 /// about another server.
 fn feed_reading<'a>(
     summary: &ClusterSummary,
-    mode: WatchMode,
     feed: Option<&'a ClusterTelemetry>,
     slot: Option<&'a ClusterDiscovery>,
 ) -> Reading<'a> {
     let feed = feed.filter(|feed| feed.generation == summary.generation);
     let snapshot = feed.map(|feed| &*feed.snapshot);
-    match (reading(summary, mode, snapshot, slot), feed) {
+    match (reading(summary, snapshot, slot), feed) {
         (
             Reading::Feed { snapshot, .. },
             Some(ClusterTelemetry {
@@ -885,12 +881,7 @@ impl AlertCenter {
                     origin: AlertOrigin::of(summary),
                     label,
                     reading: if on {
-                        feed_reading(
-                            summary,
-                            model.settings.alert_mode_for(id),
-                            feed.as_ref(),
-                            slot,
-                        )
+                        feed_reading(summary, feed.as_ref(), slot)
                     } else {
                         Reading::Muted
                     },

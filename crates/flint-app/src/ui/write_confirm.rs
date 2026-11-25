@@ -8,7 +8,8 @@ use std::rc::Rc;
 use flint_core::CoreHandle;
 use flint_core::display::{ClusterNames, single_line};
 use flint_core::write::{
-    ResourceChange, WriteAction, WriteError, WriteOutcome, WriteReview, WriteTarget, WriteWarning,
+    DrainProgress, ResourceChange, WriteAction, WriteError, WriteOutcome, WriteReview, WriteTarget,
+    WriteWarning,
 };
 use gpui_kit::*;
 
@@ -254,8 +255,9 @@ fn take_edit_note(review: &WriteReview, cx: &mut App) -> Option<String> {
 /// Asks to confirm `review`, first saying `note` (why this review was opened again), then runs it
 /// on `core` and calls `on_done` with the result. Cancelling runs nothing and does not call it.
 /// Confirming asks `begin` right before the write: `false` runs nothing and does not call
-/// `on_done`. With `object`, the confirmation closes unanswered once that says the object
-/// changed ([`confirm::close_changed`]).
+/// `on_done`. A drain tells `on_progress` where it is as it runs, always before `on_done`. With
+/// `object`, the confirmation closes unanswered once that says the object changed
+/// ([`confirm::close_changed`]).
 #[allow(clippy::too_many_arguments)]
 pub(in crate::ui) fn open_noted(
     window: &mut Window,
@@ -267,6 +269,7 @@ pub(in crate::ui) fn open_noted(
     guard: ConnectionGuard,
     object: Option<ObjectGuard>,
     begin: impl Fn(&mut App) -> bool + 'static,
+    on_progress: impl Fn(DrainProgress, &mut App) + 'static,
     on_done: impl Fn(Result<WriteOutcome, WriteError>, &mut App) + 'static,
 ) {
     let shown = names.with_real(&review.target().cluster);
@@ -284,7 +287,7 @@ pub(in crate::ui) fn open_noted(
         .collect();
     let text = dialog_text_saying(review.target(), worded, review.warnings(), &saying, &shown);
     let pinned = target_lines(review.target()).len();
-    let confirmed = confirmation(core, review, begin, on_done);
+    let confirmed = confirmation(core, review, begin, on_progress, on_done);
     let on_ok = move |_: &mut Window, cx: &mut App| {
         confirmed(cx);
         true
@@ -304,17 +307,24 @@ pub(in crate::ui) fn confirmation(
     core: CoreHandle,
     review: WriteReview,
     begin: impl Fn(&mut App) -> bool + 'static,
+    on_progress: impl Fn(DrainProgress, &mut App) + 'static,
     on_done: impl Fn(Result<WriteOutcome, WriteError>, &mut App) + 'static,
 ) -> impl Fn(&mut App) + 'static {
+    let on_progress = Rc::new(on_progress);
     let on_done = Rc::new(on_done);
     let used = Cell::new(false);
     move |cx| {
         if used.replace(true) || !begin(cx) {
             return;
         }
-        let run = core.run_write(review.clone().into_intent());
-        let on_done = on_done.clone();
+        let (tell, told) = async_channel::unbounded();
+        let run = core.run_write_telling(review.clone().into_intent(), Some(tell));
+        let (on_progress, on_done) = (on_progress.clone(), on_done.clone());
         cx.spawn(async move |cx| {
+            // The write holds the sender until it ends, so no progress comes after its result.
+            while let Ok(progress) = told.recv().await {
+                cx.update(|cx| on_progress(progress, cx));
+            }
             let result = run.await;
             cx.update(|cx| on_done(result, cx));
         })

@@ -189,6 +189,8 @@ impl ClusterManager {
         slot.rejected_attempt = None;
         slot.transient_attempt = None;
         let attempt = slot.member_attempt.take();
+        // Warm lists end with the slot: nothing reads through its kept connection from here on.
+        slot.warm = None;
         slot.clear_connection();
         slot.state = ConnectionState::Disconnected;
         if let Some(attempt) = attempt {

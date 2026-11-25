@@ -1617,6 +1617,9 @@ impl Workspace {
                     .collect(),
                 left_out: run.left_out.iter().map(|m| m.context.clone()).collect(),
                 list: list.view_state(),
+                dashboard: self
+                    .set_dashboard()
+                    .map(|view| view.read(cx).model.view_state()),
             }
         });
         ClusterSetsState {
