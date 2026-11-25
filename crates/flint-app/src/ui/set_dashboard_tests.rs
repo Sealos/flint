@@ -9,13 +9,8 @@ use flint_core::metrics_trend::TrendStore;
 use flint_core::telemetry::{Availability, ClusterTelemetry, MetricsCheck};
 use flint_core::thresholds::{ThresholdLevel, Thresholds};
 use flint_core::{KindId, KindSnapshot, SyncState};
-<<<<<<< HEAD
-use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext as _, Entity, TestAppContext, WindowOptions};
-=======
-use gpui_kit::test::TestAppContextExt as _;
-use gpui_kit::{AppContext as _, Entity, TestAppContext};
->>>>>>> origin/master
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
