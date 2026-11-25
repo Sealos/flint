@@ -31,7 +31,7 @@ use crate::ui::fleet_view;
 use crate::ui::list::combined::row_id;
 use crate::ui::resource_actions::{ResourceAction, available, request, target_of};
 use crate::ui::support_tests::{
-    CURRENT_GENERATION, TestWorkspace, WAIT, discovery, kubeconfig_yaml, objects, open_workspace,
+    CURRENT_GENERATION, TestWorkspace, WAIT, discovery, kubeconfig_yaml, objects,
     open_workspace_with, standard_sections,
 };
 
@@ -39,6 +39,23 @@ fn pods_of(cluster: &str, rows: &[(&str, &str, i64)]) -> Arc<KindSnapshot> {
     let mut snapshot = (*objects(flint_core::KindId::pods(), rows, SyncState::Synced, 1)).clone();
     snapshot.cluster = cluster.into();
     Arc::new(snapshot)
+}
+
+/// The workspace over `kind-alpha` and `kind-beta`, both on the server that accepts connections
+/// and never answers. The tests feed each member's state by hand; a server refusing connections
+/// would let the core's own attempt fail and replace a fed `Connected` at a time that depends on
+/// the machine's speed.
+async fn open_quiet_workspace(cx: &mut TestAppContext, dir: &std::path::Path) -> TestWorkspace {
+    open_workspace_with(cx, dir, |dir, servers| {
+        let path = dir.join("kubeconfig");
+        let contexts = [
+            ("kind-alpha", servers.silent.as_str()),
+            ("kind-beta", servers.silent.as_str()),
+        ];
+        std::fs::write(&path, kubeconfig_yaml(&contexts)).unwrap();
+        vec![path]
+    })
+    .await
 }
 
 fn pick(cx: &mut TestAppContext, t: &TestWorkspace, cluster: &str) {
@@ -121,7 +138,7 @@ fn detail_cluster(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<String> 
 #[gpui_kit::test]
 async fn choosing_clusters_never_connects_and_is_limited(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
+    let t = open_quiet_workspace(cx, dir.path()).await;
     assert!(
         t.dispatch(cx, "cluster_sets::OpenPickedClusters", Value::Null)
             .is_err(),
@@ -144,7 +161,7 @@ async fn choosing_clusters_never_connects_and_is_limited(cx: &mut TestAppContext
 #[gpui_kit::test]
 async fn a_saved_set_opens_its_combined_list(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
+    let t = open_quiet_workspace(cx, dir.path()).await;
     cx.update(|cx| cx.set_global(SettingsDir(dir.path().to_owned())));
     t.dispatch(cx, "cluster_sets::ToggleClusterPicking", Value::Null)
         .unwrap();
@@ -520,7 +537,7 @@ async fn a_protected_members_row_refuses_its_actions(cx: &mut TestAppContext) {
         "protect_local_clusters = true\n",
     )
     .unwrap();
-    let t = open_workspace(cx, dir.path()).await;
+    let t = open_quiet_workspace(cx, dir.path()).await;
     connect(cx, &t, "kind-alpha");
     connect(cx, &t, "kind-beta");
     open_both(cx, &t).await;
@@ -537,7 +554,7 @@ async fn a_protected_members_row_refuses_its_actions(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 async fn a_member_with_paused_writes_keeps_its_row_and_offers_no_write(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
+    let t = open_quiet_workspace(cx, dir.path()).await;
     connect(cx, &t, "kind-alpha");
     connect(cx, &t, "kind-beta");
     open_both(cx, &t).await;
@@ -600,7 +617,7 @@ async fn a_member_with_paused_writes_keeps_its_row_and_offers_no_write(cx: &mut 
 #[gpui_kit::test]
 async fn a_member_needing_sign_in_is_shown_and_its_row_closes(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
+    let t = open_quiet_workspace(cx, dir.path()).await;
     connect(cx, &t, "kind-alpha");
     connect(cx, &t, "kind-beta");
     open_both(cx, &t).await;
@@ -625,7 +642,7 @@ async fn a_member_needing_sign_in_is_shown_and_its_row_closes(cx: &mut TestAppCo
 #[gpui_kit::test]
 async fn a_member_that_changed_loses_its_rows_and_offers_no_action(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
+    let t = open_quiet_workspace(cx, dir.path()).await;
     connect(cx, &t, "kind-alpha");
     connect(cx, &t, "kind-beta");
     open_both(cx, &t).await;
@@ -663,7 +680,7 @@ async fn a_member_that_changed_loses_its_rows_and_offers_no_action(cx: &mut Test
 #[gpui_kit::test]
 async fn a_row_tab_does_not_restart_once_its_context_moved(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
+    let t = open_quiet_workspace(cx, dir.path()).await;
     connect(cx, &t, "kind-alpha");
     connect(cx, &t, "kind-beta");
     open_both(cx, &t).await;
@@ -719,7 +736,7 @@ async fn a_row_tab_does_not_restart_once_its_context_moved(cx: &mut TestAppConte
 #[gpui_kit::test]
 async fn a_selected_row_comes_back_in_front_of_the_list(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
+    let t = open_quiet_workspace(cx, dir.path()).await;
     connect(cx, &t, "kind-alpha");
     connect(cx, &t, "kind-beta");
     open_both(cx, &t).await;
@@ -760,7 +777,7 @@ async fn a_selected_row_comes_back_in_front_of_the_list(cx: &mut TestAppContext)
 #[gpui_kit::test]
 async fn cmd_f_reaches_the_combined_filter(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
+    let t = open_quiet_workspace(cx, dir.path()).await;
     open_both(cx, &t).await;
     t.focus_workspace(cx);
     assert!(
@@ -906,7 +923,7 @@ fn saved_names(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<String> {
 #[gpui_kit::test]
 async fn a_saved_set_is_renamed_and_its_open_view_follows(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
+    let t = open_quiet_workspace(cx, dir.path()).await;
     cx.update(|cx| cx.set_global(SettingsDir(dir.path().to_owned())));
     save_both(cx, &t).await;
     t.dispatch(
@@ -960,7 +977,7 @@ async fn editing_a_row(
     TestWorkspace,
     gpui_kit::Entity<crate::ui::detail::DetailView>,
 ) {
-    let t = open_workspace(cx, dir).await;
+    let t = open_quiet_workspace(cx, dir).await;
     connect(cx, &t, "kind-alpha");
     connect(cx, &t, "kind-beta");
     open_both(cx, &t).await;
@@ -1126,7 +1143,7 @@ fn server_of(cx: &mut TestAppContext, t: &TestWorkspace, cluster: &str) -> Strin
 #[gpui_kit::test]
 async fn deleting_the_open_set_closes_it_and_stops_the_core(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
+    let t = open_quiet_workspace(cx, dir.path()).await;
     cx.update(|cx| cx.set_global(SettingsDir(dir.path().to_owned())));
     save_both(cx, &t).await;
     t.dispatch(
@@ -1160,7 +1177,7 @@ async fn deleting_the_open_set_closes_it_and_stops_the_core(cx: &mut TestAppCont
 #[gpui_kit::test]
 async fn deleting_a_set_stops_its_open_on_the_way(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
+    let t = open_quiet_workspace(cx, dir.path()).await;
     cx.update(|cx| cx.set_global(SettingsDir(dir.path().to_owned())));
     save_both(cx, &t).await;
     let id = t
@@ -1206,7 +1223,7 @@ async fn deleting_a_set_stops_its_open_on_the_way(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 async fn a_choice_stays_on_the_server_it_was_made_on(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
+    let t = open_quiet_workspace(cx, dir.path()).await;
     cx.update(|cx| cx.set_global(SettingsDir(dir.path().to_owned())));
     let alpha = server_of(cx, &t, "kind-alpha");
     pick(cx, &t, "kind-alpha");
@@ -1249,7 +1266,7 @@ async fn a_choice_stays_on_the_server_it_was_made_on(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 async fn deleting_a_set_waits_for_the_confirmation(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
+    let t = open_quiet_workspace(cx, dir.path()).await;
     cx.update(|cx| cx.set_global(SettingsDir(dir.path().to_owned())));
     save_both(cx, &t).await;
     t.dispatch(
@@ -1344,7 +1361,7 @@ async fn a_repointed_member_is_left_out_and_never_contacted(cx: &mut TestAppCont
 #[gpui_kit::test]
 async fn a_set_left_with_one_member_does_not_open(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
+    let t = open_quiet_workspace(cx, dir.path()).await;
     let alpha = t.workspace.read_with(cx, |ws, cx| {
         let summary = ws.cluster_summary("kind-alpha", cx).unwrap();
         summary.info.server.clone().unwrap()
@@ -1682,7 +1699,7 @@ async fn a_member_that_returns_is_back_the_next_time_the_set_opens(cx: &mut Test
 #[gpui_kit::test]
 async fn a_cmd_click_chooses_and_a_plain_click_does_not(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
+    let t = open_quiet_workspace(cx, dir.path()).await;
     cx.update(|cx| {
         let cmd = gpui_kit::Modifiers::secondary_key(cx);
         assert!(click_chooses(false, cmd, cx));
@@ -1784,6 +1801,202 @@ async fn a_fleet_failure_stops_the_run_and_says_so(cx: &mut TestAppContext) {
     );
 }
 
+/// Asks for `choice` on the open row across the set, without waiting.
+fn ask_fleet(cx: &mut TestAppContext, t: &TestWorkspace, choice: FleetChoice) {
+    let (workspace, window) = (t.workspace.clone(), t.window);
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| {
+            assert_eq!(fleet_view::available(ws, choice, cx), Ok(()));
+            fleet_view::request(ws, choice, window, cx);
+        })
+    })
+    .unwrap();
+}
+
+/// Waits until the newest confirmation's title is `title`, and returns it.
+async fn wait_for_dialog(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+    title: &'static str,
+) -> confirm::DialogText {
+    let shown = move |cx: &mut TestAppContext| {
+        cx.update_window(t.window, |_, window, cx| {
+            window.render_frame(cx);
+            confirm::shown(window, cx)
+        })
+        .unwrap()
+    };
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        if let Some(dialog) = shown(cx).filter(|d| d.title == title) {
+            return dialog;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no dialog \"{title}\": {:?}",
+            shown(cx).map(|d| d.title)
+        );
+        cx.background_executor
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+        cx.run_until_parked();
+    }
+}
+
+/// Waits until a single dialog is open, so its OK is the only one, and presses it.
+async fn press_only_ok(cx: &mut TestAppContext, t: &TestWorkspace) {
+    cx.wait_for(t.window, WAIT, |window, _| window.find_all("ok").len() == 1)
+        .await;
+    t.click(cx, "ok");
+}
+
+// covers UP-101: a delete across the set lists each member with its dry run; one whose dry run
+// failed cannot be chosen and is sent nothing more, and the rest run after one confirmation.
+#[gpui_kit::test]
+async fn a_fleet_delete_leaves_a_failed_dry_run_out(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    // Alpha refuses its delete's dry run.
+    let row = open_beta_row_answering(cx, dir.path(), &[422]).await;
+    let t = &row.t;
+    ask_fleet(cx, t, FleetChoice::Delete);
+    wait_for_dialog(cx, t, "Delete web: choose the clusters").await;
+    let alpha = t.label(cx, ("fleet-target-says", 0usize)).unwrap();
+    assert!(alpha.starts_with("left out: "), "{alpha}");
+    assert_eq!(
+        t.label(cx, ("fleet-target-says", 1usize)).as_deref(),
+        Some("Deletes it. This cannot be undone.")
+    );
+    assert_eq!(
+        t.find(cx, ("fleet-target", 0usize)).unwrap().checked(),
+        Some(false)
+    );
+    assert_eq!(
+        t.find(cx, ("fleet-target", 1usize)).unwrap().checked(),
+        Some(true)
+    );
+    assert_eq!(row.alpha_writes.load(Ordering::SeqCst), 1, "its dry run");
+    assert_eq!(row.beta_writes.load(Ordering::SeqCst), 1, "its dry run");
+    // A member whose dry run failed cannot be put back.
+    t.click(cx, ("fleet-target", 0usize));
+    cx.run_until_parked();
+    assert_eq!(
+        t.find(cx, ("fleet-target", 0usize)).unwrap().checked(),
+        Some(false)
+    );
+    t.click(cx, "ok");
+    let plan = wait_for_dialog(cx, t, "Delete web on 1 of 2 clusters?").await;
+    assert!(plan.text.contains("Runs on: kind-beta"), "{}", plan.text);
+    assert_eq!(plan.ok, "Delete on 1 Cluster");
+    assert!(plan.default_cancel, "Enter cancels a delete");
+    press_only_ok(cx, t).await;
+    t.wait_for_label(cx, "fleet-summary", "Finished: 1 done, 1 left out.")
+        .await;
+    assert_eq!(
+        row.alpha_writes.load(Ordering::SeqCst),
+        1,
+        "left out: nothing more"
+    );
+    assert_eq!(row.beta_writes.load(Ordering::SeqCst), 2);
+}
+
+// covers UP-101, ADR-0015: a member whose dry run passed can still be left out of a delete; the
+// plan names only the members chosen, and the one left out gets nothing more.
+#[gpui_kit::test]
+async fn a_healthy_member_can_be_left_out_of_a_fleet_delete(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let row = open_beta_row(cx, dir.path()).await;
+    let t = &row.t;
+    ask_fleet(cx, t, FleetChoice::Delete);
+    wait_for_dialog(cx, t, "Delete web: choose the clusters").await;
+    t.click(cx, ("fleet-target", 0usize));
+    cx.run_until_parked();
+    assert_eq!(
+        t.find(cx, ("fleet-target", 0usize)).unwrap().checked(),
+        Some(false)
+    );
+    // With none chosen there is nothing to go on to.
+    t.click(cx, ("fleet-target", 1usize));
+    cx.run_until_parked();
+    t.click(cx, "ok");
+    cx.run_until_parked();
+    let shown = cx
+        .update_window(t.window, |_, window, cx| confirm::shown(window, cx))
+        .unwrap()
+        .map(|d| d.title);
+    assert_eq!(shown.as_deref(), Some("Delete web: choose the clusters"));
+    t.click(cx, ("fleet-target", 1usize));
+    cx.run_until_parked();
+    t.click(cx, "ok");
+    let plan = wait_for_dialog(cx, t, "Delete web on 1 of 2 clusters?").await;
+    assert!(plan.text.contains("Runs on: kind-beta"), "{}", plan.text);
+    assert!(
+        plan.text.contains("kind-alpha: left out: you left it out"),
+        "{}",
+        plan.text
+    );
+    press_only_ok(cx, t).await;
+    t.wait_for_label(cx, "fleet-summary", "Finished: 1 done, 1 left out.")
+        .await;
+    assert_eq!(
+        row.alpha_writes.load(Ordering::SeqCst),
+        1,
+        "its dry run only"
+    );
+    assert_eq!(row.beta_writes.load(Ordering::SeqCst), 2);
+}
+
+// covers UP-101: an apply across the set opens the selected object's manifest, dry-runs it on
+// each member, shows each member's change, and after one confirmation applies it on each.
+#[gpui_kit::test]
+async fn a_fleet_apply_reviews_the_manifest_on_each_member_then_applies_it(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let row = open_beta_row(cx, dir.path()).await;
+    let t = &row.t;
+    ask_fleet(cx, t, FleetChoice::ApplyYaml);
+    wait_for_dialog(cx, t, "Apply YAML to web across the set").await;
+    assert_eq!(row.alpha_writes.load(Ordering::SeqCst), 0);
+    t.click(cx, "ok");
+    wait_for_dialog(cx, t, "Apply YAML to web: choose the clusters").await;
+    press_only_ok(cx, t).await;
+    let plan = wait_for_dialog(cx, t, "Apply YAML to web on 2 of 2 clusters?").await;
+    assert!(plan.text.contains("kind-alpha: "), "{}", plan.text);
+    assert_eq!(plan.ok, "Apply on 2 Clusters");
+    assert_eq!(row.alpha_writes.load(Ordering::SeqCst), 1, "its dry run");
+    assert_eq!(row.beta_writes.load(Ordering::SeqCst), 1, "its dry run");
+    press_only_ok(cx, t).await;
+    t.wait_for_label(cx, "fleet-summary", "Finished: 2 done.")
+        .await;
+    assert_eq!(row.alpha_writes.load(Ordering::SeqCst), 2);
+    assert_eq!(row.beta_writes.load(Ordering::SeqCst), 2);
+}
+
+// covers UP-101: from an apply's target list the manifest opens again as typed, to edit and
+// review again; nothing is written meanwhile.
+#[gpui_kit::test]
+async fn a_fleet_apply_goes_back_to_its_manifest_as_typed(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let row = open_beta_row(cx, dir.path()).await;
+    let t = &row.t;
+    ask_fleet(cx, t, FleetChoice::ApplyYaml);
+    wait_for_dialog(cx, t, "Apply YAML to web across the set").await;
+    t.type_text(cx, "x-draft: kept\n");
+    t.click(cx, "ok");
+    wait_for_dialog(cx, t, "Apply YAML to web: choose the clusters").await;
+    t.click(cx, "fleet-edit-again");
+    wait_for_dialog(cx, t, "Apply YAML to web across the set").await;
+    press_only_ok(cx, t).await;
+    wait_for_dialog(cx, t, "Apply YAML to web: choose the clusters").await;
+    let puts = row._apis.0.puts();
+    assert_eq!(puts.len(), 2, "two reviews, each a dry run");
+    assert!(puts.iter().all(|(dry_run, _)| *dry_run));
+    assert!(
+        puts.iter().all(|(_, sent)| sent["x-draft"] == "kept"),
+        "the draft went to both reviews: {puts:?}"
+    );
+}
+
 // covers UP-100, UP-54: protected members are left out before any request; with every member
 // protected there is nothing to confirm.
 #[gpui_kit::test]
@@ -1804,4 +2017,47 @@ async fn a_fleet_action_leaves_protected_members_out(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(row.alpha_writes.load(Ordering::SeqCst), 0);
     assert_eq!(row.beta_writes.load(Ordering::SeqCst), 0);
+}
+
+// A set's row whose member the set reports paused offers no Shell: the row menu says why, and
+// the action's guard agrees. It comes back once the member runs again.
+#[gpui_kit::test]
+async fn a_paused_set_member_shows_shell_disabled_with_the_reason(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_quiet_workspace(cx, dir.path()).await;
+    connect(cx, &t, "kind-alpha");
+    connect(cx, &t, "kind-beta");
+    open_both(cx, &t).await;
+    select_row(cx, &t, "kind-beta");
+    let set_paused = |paused, cx: &mut TestAppContext| {
+        t.workspace.update(cx, |ws, cx| {
+            // Set directly: the row stays selected, as it does while an edit is unapplied.
+            ws.sets.running.as_mut().unwrap().reports = vec![MemberReport {
+                cluster: "kind-beta".into(),
+                status: MemberStatus::Live,
+                paused,
+            }];
+            cx.notify();
+        });
+    };
+    let shell = |cx: &mut TestAppContext| {
+        t.workspace.read_with(cx, |ws, cx| {
+            let menu = crate::ui::row_menu::row_actions(ws, cx).unwrap();
+            let guard = ws.sessions_blocked("kind-beta", cx);
+            (menu.shell, guard)
+        })
+    };
+    set_paused(true, cx);
+    let (menu, guard) = shell(cx);
+    let why = menu.unwrap_err();
+    assert!(why.contains("paused"), "{why}");
+    assert_eq!(guard.as_deref(), Some(why.as_str()));
+
+    set_paused(false, cx);
+    // Any check of the open row while paused closes it, as it should: choose it again.
+    select_row(cx, &t, "kind-beta");
+    let (menu, guard) = shell(cx);
+    // The pod itself may not be fetched in this test; the pause is no longer the reason.
+    assert!(!menu.is_err_and(|why| why.contains("paused")));
+    assert_eq!(guard, None);
 }

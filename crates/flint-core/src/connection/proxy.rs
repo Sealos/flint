@@ -94,11 +94,18 @@ pub(crate) const RESTART_TO_APPLY: &str = "settings.toml can be read again, but 
      own do not connect, and settings.toml is treated as unreadable: nothing is trusted, exposed \
      to AI or watched in the background";
 
-/// `reason`, with the proxy note when the setting in use is `unreadable`.
+/// `reason`, with the proxy note when the setting in use is `unreadable`. The note follows the
+/// reason's first line: a TOML parse error goes on with lines that quote the file, and what is
+/// shown of an error is its first line.
 pub(crate) fn with_proxy_note(reason: String, unreadable: bool) -> String {
     if !unreadable {
         return reason;
     }
+    let reason = reason
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
     format!(
         "{reason}. Its proxy setting could not be applied, so clusters without a proxy-url of \
          their own do not connect until settings.toml can be read and Flint restarts"

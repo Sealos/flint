@@ -498,19 +498,55 @@ fn consent_for(kubeconfig: &Kubeconfig) -> Arc<PluginConsent> {
     Arc::new(PluginConsent::seal(&definition).unwrap())
 }
 
-fn plugin_target(
+/// What a plugin of `merged` runs under with `consent`: a launch check that verifies the
+/// program in full, as the manager's does, and `grants`.
+fn launch_under(
+    merged: &Kubeconfig,
+    consent: Arc<PluginConsent>,
+    grants: &KeptGrants,
+) -> PluginLaunch {
+    let SignIn::Plugin(definition) = sign_in_of(merged, "dev") else {
+        panic!("not a plugin");
+    };
+    let (judged, definition) = (Arc::clone(&consent), Arc::new(definition));
+    let check = crate::cluster::SendCheck::new(move || {
+        let (judged, definition) = (Arc::clone(&judged), Arc::clone(&definition));
+        Box::pin(async move {
+            let same = tokio::task::spawn_blocking(move || judged.verify(&definition))
+                .await
+                .unwrap_or(false);
+            same.then_some(())
+                .ok_or_else(|| "not the program agreed to".to_owned())
+        })
+    });
+    PluginLaunch {
+        consent,
+        check,
+        grants: grants.clone(),
+    }
+}
+
+fn plugin_target_under(
     merged: &Kubeconfig,
     consent: Option<Arc<PluginConsent>>,
+    grants: &KeptGrants,
 ) -> Result<HelmTarget, HelmError> {
     HelmTarget::new(
         merged,
         "dev",
         pin_for(merged),
         credential(CredentialSource::Plugin),
-        consent,
+        consent.map(|consent| launch_under(merged, consent, grants)),
         None,
         unused_root(),
     )
+}
+
+fn plugin_target(
+    merged: &Kubeconfig,
+    consent: Option<Arc<PluginConsent>>,
+) -> Result<HelmTarget, HelmError> {
+    plugin_target_under(merged, consent, &KeptGrants::default())
 }
 
 // Without consent the plugin is refused, and the message points at the consent.
@@ -589,6 +625,92 @@ async fn consent_ended_before_the_run_starts_no_plugin() {
         Some(HelmError::CredentialRunsCommand)
     );
     assert_eq!(plugin_runs(dir.path()), 0);
+}
+
+// The launch check reads the program in full right before it starts: one replaced after the
+// target was made never runs, and ends the consent.
+#[tokio::test]
+async fn a_replaced_plugin_program_starts_no_plugin() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = sign_in_plugin(dir.path());
+    let merged = plugin_config(&plugin, "a");
+    let consent = consent_for(&merged);
+    let target = plugin_target(&merged, Some(Arc::clone(&consent))).unwrap();
+    let replaced = std::fs::read_to_string(&plugin)
+        .unwrap()
+        .replace("plugin-token", "other-token");
+    std::fs::write(&plugin, replaced).unwrap();
+
+    assert_eq!(
+        target.signed_in().await.err(),
+        Some(HelmError::CredentialRunsCommand)
+    );
+    assert_eq!(plugin_runs(dir.path()), 0);
+    assert!(consent.is_void());
+}
+
+/// A plugin under `dir` that writes its pid to `dir/pid` and never answers.
+fn stuck_plugin(dir: &Path) -> PathBuf {
+    let path = dir.join("plugin");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s' \"$$\" > '{d}/pid.new'\n/bin/mv '{d}/pid.new' '{d}/pid'\nexec \
+         /bin/sleep 60\n",
+        d = dir.display()
+    );
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+fn alive(pid: &str) -> bool {
+    std::process::Command::new("/bin/kill")
+        .args(["-0", pid])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+// A Helm run's plugin is counted with the keep-watching grants, so a quit waits for it, and
+// killed by the quit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quitting_waits_for_and_kills_a_running_helm_plugin() {
+    let dir = tempfile::tempdir().unwrap();
+    let merged = plugin_config(&stuck_plugin(dir.path()), "a");
+    let grants = KeptGrants::default();
+    let target = plugin_target_under(&merged, Some(consent_for(&merged)), &grants).unwrap();
+    let signing = tokio::spawn(async move { target.signed_in().await.err() });
+    let pid_file = dir.path().join("pid");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !pid_file.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the plugin started");
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), grants.runs().ended())
+            .await
+            .is_err(),
+        "a quit would wait for it"
+    );
+
+    grants.quit().await;
+    let ended = tokio::time::timeout(Duration::from_secs(5), signing)
+        .await
+        .expect("the sign-in ends with the quit")
+        .unwrap();
+    assert!(ended.is_some(), "no token after the quit");
+    let mut running = true;
+    for _ in 0..200 {
+        running = alive(&pid);
+        if !running {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!running, "the plugin was killed");
 }
 
 // A context whose server is not the pinned one is refused.
@@ -1120,26 +1242,110 @@ async fn a_masked_value_does_not_reappear_in_the_manifest() {
     assert!(!text.contains(&encoded), "{text}");
 }
 
-// A stored failure can quote a credential in any format, so its text is never shown.
-#[test]
-fn details_and_history_show_fixed_status_text() {
-    let opaque = "Upgrade failed: admission denied value q9-opaque-credential";
-    let out = json!({"name": "web", "info": {"status": "failed", "description": opaque}});
+/// What details and history say of a release that failed with `reason`.
+fn failure_shown(reason: &str) -> (String, String) {
+    let out = json!({"name": "web", "info": {"status": "failed", "description": reason}});
     let HelmOutput::Details(details) =
         parse(&HelmQuery::Details(release()), out.to_string().as_bytes()).unwrap()
     else {
         panic!("details");
     };
-    assert!(!details.description.contains("q9-opaque"), "{details:?}");
-    assert!(!details.description.is_empty());
-
-    let out = json!([{"revision": 1, "status": "failed", "description": opaque}]);
+    let out = json!([{"revision": 1, "status": "failed", "description": reason}]);
     let HelmOutput::History(history) =
         parse(&HelmQuery::History(release()), out.to_string().as_bytes()).unwrap()
     else {
         panic!("history");
     };
-    assert!(!history[0].description.contains("q9-opaque"), "{history:?}");
+    (details.description.clone(), history[0].description.clone())
+}
+
+// A failed release shows Helm's reason, held to the rules for a server's error text.
+#[test]
+fn a_failure_reason_is_shown_after_redaction() {
+    let plain = "Upgrade failed: timed out waiting for the condition";
+    assert_eq!(
+        failure_shown(plain),
+        (format!("Failed: {plain}"), REASON_IN_DETAILS.to_owned())
+    );
+
+    let secret = "Upgrade failed: Secret \"db-creds\" is invalid: data.password: Bearer \
+                  q9bearervalue, password=hunter2\nsecond line q9-second";
+    let (shown, history) = failure_shown(secret);
+    assert_eq!(history, REASON_IN_DETAILS);
+    assert!(
+        shown.starts_with("Failed: Upgrade failed: Secret"),
+        "{shown}"
+    );
+    assert!(shown.ends_with(REASON_MASKED), "{shown}");
+    for hidden in ["db-creds", "q9bearervalue", "hunter2", "q9-second"] {
+        assert!(!shown.contains(hidden), "{hidden} in {shown}");
+    }
+
+    // A value in no recognised form still reads as it was: only shapes are hidden.
+    let (details, _) = failure_shown("admission denied value q9-opaque");
+    assert_eq!(details, "Failed: admission denied value q9-opaque");
+
+    let (details, history) = failure_shown("  ");
+    assert_eq!(details, "Failed. Helm stored no reason.");
+    assert_eq!(history, REASON_IN_DETAILS);
+    let (details, _) = failure_shown(&"x".repeat(1000));
+    assert!(details.chars().count() < 320, "{details}");
+}
+
+// A failure reason quoting one of the release's own values: Details hides it with that
+// revision's values, and History, which has none loaded, shows no reason at all.
+#[tokio::test]
+async fn a_release_value_in_a_failure_reason_never_shows() {
+    let dir = tempfile::tempdir().unwrap();
+    let reason = "admission webhook denied the request: s3cr3tV4lue is on the breach list";
+    let helm = fake_helm(
+        dir.path(),
+        &format!(
+            "case \"$1\" in\n\
+             status) printf '{{\"name\":\"web\",\"version\":2,\"info\":{{\"status\":\"failed\",\
+             \"description\":\"{reason}\"}}}}' ;;\n\
+             history) printf '[{{\"revision\":2,\"status\":\"failed\",\"description\":\"{reason}\"}},\
+             {{\"revision\":1,\"status\":\"superseded\",\"description\":\"{reason}\"}}]' ;;\n\
+             *) printf '{{\"auth\":{{\"password\":\"s3cr3tV4lue\"}}}}' ;;\nesac"
+        ),
+    );
+    let details = run_at(&helm, &target(dir.path()), &HelmQuery::Details(release()))
+        .await
+        .unwrap();
+    let HelmOutput::Details(details) = details else {
+        panic!("details");
+    };
+    assert!(
+        !details.description.contains("s3cr3tV4lue"),
+        "{}",
+        details.description
+    );
+    assert!(
+        details.description.ends_with(REASON_MASKED),
+        "{}",
+        details.description
+    );
+
+    let history = run_at(&helm, &target(dir.path()), &HelmQuery::History(release()))
+        .await
+        .unwrap();
+    let HelmOutput::History(history) = history else {
+        panic!("history");
+    };
+    assert_eq!(history[0].description, REASON_IN_DETAILS);
+    assert_eq!(history[1].description, "Replaced by a later revision.");
+}
+
+// Other statuses keep fixed words: their description is not a reason.
+#[test]
+fn other_statuses_show_fixed_words() {
+    let out = json!({"name": "web", "info": {"status": "deployed", "description": "q9-said"}});
+    let HelmOutput::Details(details) =
+        parse(&HelmQuery::Details(release()), out.to_string().as_bytes()).unwrap()
+    else {
+        panic!("details");
+    };
+    assert_eq!(details.description, "Deployed.");
 }
 
 // What a crash left is removed; a run still going is not.

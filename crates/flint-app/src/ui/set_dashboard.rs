@@ -100,8 +100,6 @@ pub enum CardState {
     Partial(String),
     /// A feed should be running but has shown nothing yet.
     Waiting,
-    /// Its watch mode runs no feed while it is in the background.
-    NotWatched,
     /// Its feed cannot read the cluster now.
     Unavailable(String),
     /// Paused, moved, left out or needing sign-in: nothing of it may be read or opened.
@@ -120,9 +118,6 @@ impl CardState {
             Self::Live => None,
             Self::Partial(why) | Self::Unavailable(why) | Self::Blocked(why) => Some(why.clone()),
             Self::Waiting => Some("Waiting for the first metrics.".to_owned()),
-            Self::NotWatched => Some(
-                "Not watched in the background: its watch mode is \"open views only\".".to_owned(),
-            ),
         }
     }
 }
@@ -138,8 +133,6 @@ pub struct MemberRead {
     pub telemetry: Option<ClusterTelemetry>,
     pub server: String,
     pub thresholds: Thresholds,
-    /// Its watch mode runs a feed in the background.
-    pub watched: bool,
 }
 
 /// CPU or memory on a card.
@@ -304,11 +297,9 @@ fn state_of(read: &MemberRead, status: &DashboardStatus) -> CardState {
     if let Some(why) = &read.blocked {
         return CardState::Blocked(why.clone());
     }
+    // Every admitted member runs a feed in either watch mode (#715).
     if read.telemetry.is_none() {
-        return match read.watched {
-            true => CardState::Waiting,
-            false => CardState::NotWatched,
-        };
+        return CardState::Waiting;
     }
     match status {
         DashboardStatus::Starting => CardState::Waiting,

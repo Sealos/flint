@@ -75,8 +75,8 @@ pub(super) struct Feed {
     source: Option<(WeakEntity<ClustersModel>, ClusterId)>,
     /// The slot this view follows: its server is the one that labels the feed's values.
     generation: u64,
-    /// Keeps the cluster's feed running in watch mode On view while this view lives, and is the
-    /// only way this view reads it, so it never shows a later slot of the same context.
+    /// Binds this view to its slot's feed, and is the only way this view reads it, so it never
+    /// shows a later slot of the same context.
     interest: Option<OverviewInterest>,
     /// The feed the values on screen came from. `None` for the waiting state.
     shown: Option<FeedId>,

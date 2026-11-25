@@ -765,11 +765,32 @@ impl App {
             ("flint::AppearanceLight", "light"),
             ("flint::AppearanceDark", "dark"),
         ] {
-            self.dispatch(action, Value::Null)?;
-            self.wait_for("/appearance", Test::Equals(appearance.into()))?;
+            self.set_appearance(action, appearance)?;
             shots.push(self.screenshot(&format!("{name}-{appearance}"))?);
         }
         Ok(shots)
+    }
+
+    /// Dispatches an appearance action and waits until `/appearance` shows `appearance`.
+    ///
+    /// The action only sends a command to the core, which writes `settings.toml` and reports the
+    /// change back; a command lost or delayed on a loaded runner can leave the setting unchanged
+    /// well past a single wait (seen as `/appearance` staying "system"). Setting an appearance
+    /// twice is harmless, so the action is sent again each time a short wait passes, within
+    /// [`WAIT`] overall; the last failure carries the state and the app log.
+    fn set_appearance(&self, action: &str, appearance: &str) -> Result<(), AppError> {
+        const TRIES: u32 = 4;
+        let mut last = None;
+        for _ in 0..TRIES {
+            self.dispatch(action, Value::Null)?;
+            match self.wait_for_within("/appearance", Test::Equals(appearance.into()), WAIT / TRIES)
+            {
+                Ok(_) => return Ok(()),
+                Err(error) if error.code == "timeout" => last = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last.expect("at least one try"))
     }
 
     /// Quits the app and waits for it to exit, keeping its scratch directories for

@@ -19,6 +19,7 @@ use super::telemetry::reads_token_file;
 use super::{ClusterManager, Internal};
 use crate::ClusterId;
 use crate::cluster;
+use crate::connection::member::MemberState;
 use crate::connection::policy::{CredentialAccess, PluginRuns, Role};
 use crate::credential::CredentialSource;
 use crate::handle::{ConnectionState, Event};
@@ -67,6 +68,22 @@ struct LiveGrants {
     members: HashMap<ClusterId, CredentialAccess>,
     /// How many times each cluster's grant was ended, so a save under way can't bring it back.
     revocations: HashMap<ClusterId, u64>,
+    /// Other accesses under a cluster's consent, such as a Helm run's sign-in, by a key of their
+    /// own, while their [`HeldAccess`] lives.
+    held: HashMap<u64, (ClusterId, CredentialAccess)>,
+    next_held: u64,
+}
+
+/// An access held with the grants until dropped ([`KeptGrants::hold_access`]).
+pub(crate) struct HeldAccess {
+    grants: KeptGrants,
+    key: u64,
+}
+
+impl Drop for HeldAccess {
+    fn drop(&mut self) {
+        self.grants.live().held.remove(&self.key);
+    }
 }
 
 impl KeptGrants {
@@ -87,6 +104,31 @@ impl KeptGrants {
         if let Some(access) = live.members.get(id) {
             access.revoke();
         }
+        live.held
+            .values()
+            .filter(|(held, _)| held == id)
+            .for_each(|(_, access)| access.revoke());
+    }
+
+    /// The count of running plugins a quit waits for.
+    pub(crate) fn runs(&self) -> PluginRuns {
+        self.0.runs.clone()
+    }
+
+    /// Holds `access`, made under `id`'s consent, until the result is dropped: ending that
+    /// consent or quitting revokes it, and kills its plugin.
+    pub(crate) fn hold_access(&self, id: &str, access: &CredentialAccess) -> HeldAccess {
+        let mut live = self.live();
+        if live.quitting {
+            access.revoke();
+        }
+        let key = live.next_held;
+        live.next_held += 1;
+        live.held.insert(key, (id.to_owned(), access.clone()));
+        HeldAccess {
+            grants: self.clone(),
+            key,
+        }
     }
 
     /// Ends every grant now. The future resolves once their plugins are gone, or after
@@ -98,6 +140,7 @@ impl KeptGrants {
             live.consents.values().for_each(|consent| consent.void());
             live.feeds.values().for_each(|(_, access)| access.revoke());
             live.members.values().for_each(CredentialAccess::revoke);
+            live.held.values().for_each(|(_, access)| access.revoke());
         }
         let runs = self.0.runs.clone();
         async move {
@@ -220,6 +263,9 @@ struct KeptFeed {
     access: CredentialAccess,
     connecting: Option<AbortHandle>,
     feed: Option<Telemetry>,
+    /// The connection's read client, once up. The slot's resource watches may read through it
+    /// ([`ClusterManager::sync_warm_lists`]); it has no write client.
+    client: Option<kube::Client>,
     /// The definition its connection was started from, which labels the feed it leads to.
     pin: crate::recheck::ContextPin,
 }
@@ -391,22 +437,81 @@ impl ClusterManager {
         }
     }
 
-    /// Whether `id` is watched and may be read now. It overrides On view.
+    /// Whether `id` is watched and may be read now, selected or not.
     pub(super) fn keep_watching(&self, id: &str) -> bool {
         self.keep_status(id) == KeepWatching::Watching
     }
 
-    /// Whether `id` needs a feed of its own: its slot has none and can't have one.
+    /// Whether `id` needs a feed of its own: its slot has none and can't have one, or it was just
+    /// selected and its warm feed is handed over.
     fn wants_kept_feed(&self, id: &str) -> bool {
+        self.kept_feed_allowed(id)
+            && (self.kept_feed_handed_over(id)
+                || (self.active.as_deref() != Some(id) && !self.wants_telemetry(id)))
+    }
+
+    /// Whether a kept feed may run for `id` at all.
+    fn kept_feed_allowed(&self, id: &str) -> bool {
         !self.keep.grants.quitting()
             && !self.disconnects.holds(id)
-            && self.active.as_deref() != Some(id)
             && self.keep_watching(id)
-            && !self.wants_telemetry(id)
+            && !self.member_serves_keep(id)
+    }
+
+    /// Whether `id` is selected and its kept feed, live on the slot and definition it was started
+    /// for, serves it in place of a feed on the slot. Selecting a watched cluster then lists
+    /// nothing again, and leaving it keeps the same feed running. A connection still being made
+    /// is not handed over, and a changed definition or ended consent drops the feed, so the slot
+    /// starts one of its own. The feed has only a read client: writes still go through the slot.
+    pub(super) fn kept_feed_handed_over(&self, id: &str) -> bool {
+        self.active.as_deref() == Some(id) && self.live_kept_feed(id).is_some()
+    }
+
+    /// `id`'s kept feed, if it is up on the slot and whole definition it was started for and may
+    /// run now.
+    fn live_kept_feed(&self, id: &str) -> Option<&KeptFeed> {
+        if !self.kept_feed_allowed(id) {
+            return None;
+        }
+        let slot = self.cluster(id);
+        let fingerprint = slot.and_then(|slot| slot.fingerprint);
+        let generation = slot.map(|slot| slot.generation);
+        self.keep.feeds.get(id).filter(|kept| {
+            kept.feed.is_some() && kept.fingerprint == fingerprint && kept.generation == generation
+        })
+    }
+
+    /// The read client of `id`'s live kept feed ([`Self::live_kept_feed`]), with the attempt that
+    /// made it. Reads only: the kept connection has no write client.
+    pub(super) fn kept_read_client(&self, id: &str) -> Option<(u64, kube::Client)> {
+        let kept = self.live_kept_feed(id)?;
+        Some((kept.attempt, kept.client.clone()?))
+    }
+
+    /// Whether `id` is a member of the open set with background sign-in consent that is up or
+    /// still connecting. Its slot then connects under that consent and its feed serves keep
+    /// watching, so its plugin runs once. A member waiting for a sign-in makes no connection, and
+    /// leaving the set ends it: the kept feed takes over in both cases.
+    fn member_serves_keep(&self, id: &str) -> bool {
+        self.member_on_its_server(id)
+            && self.member_consent(id).is_some()
+            && self
+                .members
+                .get(id)
+                .is_some_and(|member| !matches!(member.state(), MemberState::SignInNeeded { .. }))
+    }
+
+    /// Member `id`'s connection made under consent in the background failed. Like a kept feed's
+    /// first failure, keep watching then waits for a sign-in, so no kept feed runs the plugin
+    /// again until the person acts.
+    pub(super) fn member_signed_out(&mut self, id: &str) {
+        if self.keep_watching(id) && self.member_consent(id).is_some() {
+            self.stop_kept(id);
+        }
     }
 
     /// Whether no change of the kubeconfig files is waiting to be read.
-    fn definitions_settled(&self) -> bool {
+    pub(super) fn definitions_settled(&self) -> bool {
         !self.change_queued() && !self.reader.busy(&self.kubeconfig_paths)
     }
 
@@ -494,6 +599,7 @@ impl ClusterManager {
                 self.start_kept(id);
             }
         }
+        self.sync_warm_lists();
         self.publish_keep_watching();
     }
 
@@ -534,7 +640,7 @@ impl ClusterManager {
     /// Asked right before each start of `id`'s plugin: the saved file list and the files as they
     /// are now must still define what was agreed to, whether or not a change has been noticed.
     /// A confirmed difference ends the consent at once, so undoing it later brings nothing back.
-    fn launch_check(&self, id: &str, consent: Arc<PluginConsent>) -> cluster::SendCheck {
+    pub(super) fn launch_check(&self, id: &str, consent: Arc<PluginConsent>) -> cluster::SendCheck {
         let files = LaunchFiles {
             paths: self.kubeconfig_paths.clone(),
             base: self.config.kubeconfig_base.clone(),
@@ -684,6 +790,7 @@ impl ClusterManager {
                 access,
                 connecting: Some(task.abort_handle()),
                 feed: None,
+                client: None,
                 pin,
             },
         );
@@ -726,6 +833,7 @@ impl ClusterManager {
                     grant: kept.access.grant(CredentialSource::Plugin),
                     pace: Arc::clone(&self.keep.discovery_pace),
                 };
+                kept.client = Some(client.clone());
                 let mut feed = Telemetry::start(
                     id.into(),
                     client,
@@ -764,14 +872,22 @@ impl ClusterManager {
         }
     }
 
-    /// The credential of attempt `attempt` failed or was refused.
+    /// The credential of attempt `attempt` failed or was refused. A feed handed over to the
+    /// selected cluster only ends: the slot's foreground connection, which works on its own,
+    /// starts a feed in its place, so alerts go on and keep watching stays on. Leaving the
+    /// cluster starts a kept feed again, and a failure then waits for a sign-in as usual.
     pub(super) fn kept_failed(&mut self, id: &str, attempt: u64) {
         if self
             .keep
             .feeds
             .get(id)
-            .is_some_and(|kept| kept.attempt == attempt)
+            .is_none_or(|kept| kept.attempt != attempt)
         {
+            return;
+        }
+        if self.kept_feed_handed_over(id) {
+            self.keep.feeds.remove(id);
+        } else {
             self.stop_kept(id);
         }
     }
@@ -782,6 +898,7 @@ impl ClusterManager {
         let fingerprint = self.cluster(id).and_then(|slot| slot.fingerprint);
         self.keep.stopped.insert(id.to_owned(), fingerprint);
         self.keep.feeds.remove(id);
+        self.drop_stale_warm_lists(id);
     }
 
     /// Keeps `id` off while unreadable settings hide its entry, as if the entry were removed.
@@ -802,6 +919,8 @@ impl ClusterManager {
             self.keep.consents.remove(&id);
             self.keep.offers.remove(&id);
             self.keep.feeds.remove(&id);
+            // Before the settings write below: nothing reads through the kept connection after.
+            self.drop_stale_warm_lists(&id);
             self.keep_watching_acted_on(&id);
             self.keep.voided.remove(&id);
             self.keep.turned_off.insert(id.clone());
@@ -865,6 +984,7 @@ impl ClusterManager {
         self.keep.consents.remove(id);
         self.keep.offers.remove(id);
         self.keep.feeds.remove(id);
+        self.drop_stale_warm_lists(id);
         self.keep.stopped.remove(id);
         self.keep.retry_at.remove(id);
     }

@@ -293,7 +293,7 @@ impl ExecFailureKind {
             | ClusterError::Config { .. }
             | ClusterError::ExecPluginNotFound { .. }
             | ClusterError::ExecPlugin { .. } => ExecFailureKind::SignIn,
-            ClusterError::Kube(_) => ExecFailureKind::Other,
+            ClusterError::Kube(_) | ClusterError::ProxySettingUnknown => ExecFailureKind::Other,
         }
     }
 }

@@ -908,8 +908,7 @@ async fn the_second_row_controls_work_by_their_actions(cx: &mut TestAppContext) 
 
     t.dispatch(cx, "workspace::WatchOpenViewsOnly", Value::Null)
         .unwrap();
-    t.wait_for_label(cx, "watch-mode", "Live: open views only")
-        .await;
+    t.wait_for_label(cx, "watch-mode", "Live: on view").await;
 }
 
 // #433: at the minimum size the detail-alone header moves its controls to a second row, inside

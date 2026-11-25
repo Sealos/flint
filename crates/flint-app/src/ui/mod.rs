@@ -58,6 +58,10 @@ mod resource_actions;
 mod row_menu;
 mod scope_picker;
 mod set_kinds;
+mod settings_draft;
+mod settings_view;
+#[cfg(test)]
+mod settings_view_tests;
 mod startup;
 #[cfg(test)]
 mod support_tests;
@@ -73,6 +77,7 @@ mod view_state;
 mod workspace;
 mod write_binding;
 mod write_confirm;
+mod yaml_diff;
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -86,7 +91,7 @@ use clusters::ClustersModel;
 use gpui_kit::component::input;
 use registry::{
     About, AppearanceDark, AppearanceLight, AppearanceSystem, CloseActiveTab, CloseWindow, GoBack,
-    Hide, HideOthers, MinimizeWindow, OpenHelp, Quit, ShowAll, ToggleCommandPalette,
+    Hide, HideOthers, MinimizeWindow, OpenHelp, OpenSettings, Quit, ShowAll, ToggleCommandPalette,
     ToggleResourceSwitcher, ZoomWindow,
 };
 use ui_state::UiState;
@@ -238,7 +243,7 @@ fn window_options(bounds: Bounds<Pixels>) -> WindowOptions {
 }
 
 /// The standard macOS menus, every item a registered action (their keys come from the registry)
-/// except Services, which the OS fills: the app menu (About Flint, Services, Hide Flint, Hide
+/// except Services, which the OS fills: the app menu (About Flint, Settings…, Services, Hide Flint, Hide
 /// Others, Show All, Quit), Edit (Undo, Redo, Cut, Copy, Paste and Select All, for the text
 /// fields), View (the command palette, Appearance), Window (Minimize, Zoom, Close Dock Tab, Close
 /// Window) and Help. Quit and Close Window ask first while a session would end ([`closing`]).
@@ -285,6 +290,9 @@ fn set_menus(appearance: Appearance, cx: &mut App) {
     cx.set_menus([
         Menu::new("Flint").items([
             MenuItem::action(registry::label::<About>(), About),
+            MenuItem::separator(),
+            // "…": it opens a view of its own, as macOS apps write it.
+            MenuItem::action("Settings…", OpenSettings),
             MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),

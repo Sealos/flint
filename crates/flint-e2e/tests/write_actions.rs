@@ -7,11 +7,11 @@ use std::time::Duration;
 use flint_core::WriteRefusal;
 use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event};
 use flint_core::write::{
-    BlockedReason, DrainReport, PodName, WriteError, WriteOutcome, WriteProposal, WriteTarget,
-    WriteWarning,
+    BlockedReason, DrainProgress, DrainReport, PodName, WriteError, WriteOutcome, WriteProposal,
+    WriteTarget, WriteWarning,
 };
 use flint_core::{KindId, Settings, WatchMode, WatchTiming};
-use flint_e2e::fake_api::{CONTEXT, FakeApiServer, FakePod, Fault, Gvr, Verb};
+use flint_e2e::fake_api::{CONTEXT, FakeApiServer, FakePod, Fault, Gvr, RequestRecord, Verb};
 use serde_json::{Value, json};
 
 const WAIT: Duration = Duration::from_secs(30);
@@ -567,19 +567,26 @@ async fn cordon_and_uncordon() {
 }
 
 // covers UP-53: a drain cordons, evicts, leaves DaemonSet pods, and reports a pod a
-// PodDisruptionBudget protects after one try.
+// PodDisruptionBudget protects after one try, naming the budget when the server does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drain_reports_pods_a_budget_protects() {
     let server = FakeApiServer::start().await.unwrap();
     node(&server);
     server.add_pod(pod_on_node("agent", "DaemonSet"));
     server.add_pod(pod_on_node("guarded", "ReplicaSet"));
+    server.add_pod(pod_on_node("kept", "ReplicaSet"));
     server.add_pod(pod_on_node("web", "ReplicaSet"));
     let core = Core::start(&server, Settings::default()).await;
     server.inject(
         Fault::disruption_budget()
             .on(&Gvr::core("pods"))
             .named("guarded")
+            .subresource("eviction"),
+    );
+    server.inject(
+        Fault::disruption_budget_named("kept-pdb")
+            .on(&Gvr::core("pods"))
+            .named("kept")
             .subresource("eviction"),
     );
 
@@ -595,15 +602,147 @@ async fn drain_reports_pods_a_budget_protects() {
     assert_eq!(drained.skipped, [named("agent")]);
     assert_eq!(
         drained.blocked,
-        [(named("guarded"), BlockedReason::DisruptionBudget)]
+        [
+            (named("guarded"), BlockedReason::DisruptionBudget(None)),
+            (
+                named("kept"),
+                BlockedReason::DisruptionBudget(Some("kept-pdb".to_owned()))
+            ),
+        ]
     );
     assert!(drained.remaining.is_empty());
     assert_eq!(drained.stopped, None);
     assert_eq!(evictions(&server, "guarded"), 1, "not retried");
+    assert_eq!(evictions(&server, "kept"), 1, "not retried");
     assert_eq!(evictions(&server, "agent"), 0);
     let pods = Gvr::core("pods");
     assert!(server.object(&pods, Some("demo"), "web").is_none());
     assert!(server.object(&pods, Some("demo"), "guarded").is_some());
+}
+
+// covers UP-53: a running drain tells where it is pod by pod, before its result, and telling it
+// sends nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drain_tells_its_progress_while_it_runs() {
+    let server = FakeApiServer::start().await.unwrap();
+    node(&server);
+    for name in ["pod-a", "pod-b"] {
+        server.add_pod(pod_on_node(name, "ReplicaSet"));
+    }
+    server.add_pod(bare_pod("bare"));
+    let core = Core::start(&server, Settings::default()).await;
+    let review = core
+        .handle
+        .review_write(node_target(&server), drain())
+        .await
+        .unwrap();
+    let (held, hold) = Fault::hold();
+    server.inject(
+        held.on(&Gvr::core("pods"))
+            .verb(Verb::Other)
+            .named("pod-b")
+            .subresource("eviction")
+            .times(1),
+    );
+    let from = server.requests().len();
+    let (tell, told) = async_channel::unbounded::<DrainProgress>();
+    let running = tokio::spawn(
+        core.handle
+            .run_write_telling(review.into_intent(), Some(tell)),
+    );
+
+    // While pod-b's eviction is held, the progress already says pod-a went and pod-b is next.
+    let mut seen = Vec::new();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let progress = told.recv().await.expect("progress before the end");
+            let at_b = progress.current == Some(named("pod-b"));
+            seen.push(progress);
+            if at_b {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("progress for pod-b");
+    tokio::time::timeout(WAIT, hold.reached())
+        .await
+        .expect("pod-b's eviction held");
+    let now = seen.last().unwrap();
+    assert_eq!(
+        (now.to_evict, now.tried, now.evicted),
+        (2, 1, 1),
+        "{seen:?}"
+    );
+    assert_eq!(now.blocked, 1, "the bare pod: {seen:?}");
+    assert!(!running.is_finished(), "told while it runs");
+    hold.release();
+
+    let drained = report(running.await.unwrap().unwrap());
+    let rest: Vec<DrainProgress> = std::iter::from_fn(|| told.try_recv().ok()).collect();
+    assert!(told.is_closed(), "the write let go of the sender");
+    assert_eq!(drained.evicted, [named("pod-a"), named("pod-b")]);
+    assert_eq!(drained.blocked, [(named("bare"), BlockedReason::Unmanaged)]);
+    let last = rest.last().expect("progress after pod-b");
+    assert_eq!(last.terminating, Some(0), "{rest:?}");
+    assert_eq!(last.evicted, 2);
+    let evictions_sent = since(&server, from)
+        .iter()
+        .filter(|(method, _)| *method == http::Method::POST)
+        .count();
+    assert_eq!(
+        evictions_sent, 2,
+        "one eviction per pod, as without progress"
+    );
+}
+
+// covers UP-53: a node replaced under its name while its pods were listed stops the drain, and the
+// pods it had listed are reported as not tried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replaced_node_reports_the_listed_pods_as_not_tried() {
+    let server = FakeApiServer::start().await.unwrap();
+    node(&server);
+    for name in ["pod-a", "pod-b"] {
+        server.add_pod(pod_on_node(name, "ReplicaSet"));
+    }
+    let core = Core::start(&server, Settings::default()).await;
+    let review = core
+        .handle
+        .review_write(node_target(&server), drain())
+        .await
+        .unwrap();
+    // First match wins: the list before the cordon passes, and the drain's own list is held.
+    let pod_list = || {
+        Fault::delay(Duration::ZERO)
+            .on(&Gvr::core("pods"))
+            .verb(Verb::List)
+    };
+    server.inject(pod_list().times(1));
+    let (held, hold) = Fault::hold();
+    server.inject(held.on(&Gvr::core("pods")).verb(Verb::List).times(1));
+    let running = tokio::spawn(core.handle.run_write(review.into_intent()));
+    tokio::time::timeout(WAIT, hold.reached())
+        .await
+        .expect("the drain's pod list held");
+    server.set_object(
+        &nodes(),
+        json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": NODE, "uid": "uid-new-node", "resourceVersion": "6001"},
+            "spec": {},
+        }),
+    );
+    hold.release();
+
+    let drained = report(running.await.unwrap().unwrap());
+    server.clear_faults();
+    assert!(drained.cordoned);
+    assert_eq!(drained.stopped, Some(WriteError::Replaced));
+    assert!(drained.evicted.is_empty());
+    assert_eq!(drained.remaining, [named("pod-a"), named("pod-b")]);
+    assert_eq!(evictions(&server, "pod-a"), 0);
+    assert_eq!(evictions(&server, "pod-b"), 0);
 }
 
 // covers UP-54: locking the cluster during a drain stops the next eviction, and the outcome says
@@ -856,13 +995,37 @@ fn set_labels(
     server.set_object(gvr, object);
 }
 
-/// The requests since the first `from`. These tests run in On view, which has no telemetry feed,
-/// so nothing but the action under test reads these objects.
+/// The requests since the first `from` that the action under test could have sent. Problem
+/// detection runs in On view too (#715), so its feed's cluster-wide lists and watches, and
+/// discovery, can land while an action runs: those are left out ([`background_read`]). Every
+/// write, every read of a named object and the drain's read of a node's pods are kept.
 fn since(server: &FakeApiServer, from: usize) -> Vec<(http::Method, String)> {
     server.requests()[from..]
         .iter()
+        .filter(|r| !background_read(r))
         .map(|r| (r.method.clone(), r.path.clone()))
         .collect()
+}
+
+/// A GET of a whole collection across the cluster, or of discovery, other than a drain's read of
+/// a node's pods. An action reads only the object it acts on, the pods it evicts and, for a
+/// drain, the pods on its node, so a read like this comes from a feed, never from an action.
+fn background_read(request: &RequestRecord) -> bool {
+    if request.method != http::Method::GET {
+        return false;
+    }
+    let on_node = request
+        .parsed_query()
+        .field_selector
+        .is_some_and(|fields| fields.starts_with("spec.nodeName="));
+    let segments: Vec<&str> = request.path.trim_matches('/').split('/').collect();
+    // `/api/v1/<plural>` and `/apis/<group>/<version>/<plural>` at most: no name, no namespace.
+    let cluster_wide = match segments.first() {
+        Some(&"api") => segments.len() <= 3,
+        Some(&"apis") => segments.len() <= 4,
+        _ => false,
+    };
+    cluster_wide && !on_node
 }
 
 fn writes_in(requests: &[(http::Method, String)]) -> usize {
@@ -1175,7 +1338,7 @@ async fn a_drain_warns_about_the_managed_pods_it_evicts() {
     assert!(
         drained
             .blocked
-            .contains(&(named("guarded"), BlockedReason::DisruptionBudget))
+            .contains(&(named("guarded"), BlockedReason::DisruptionBudget(None)))
     );
     assert_eq!(drained.stopped, None);
     let pods = Gvr::core("pods");

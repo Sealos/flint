@@ -58,6 +58,7 @@ use super::super::registry::{
     ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
     WatchOpenViewsOnly,
 };
+use super::super::registry::{ApplyAcrossSet, DeleteAcrossSet, RestartAcrossSet, ScaleAcrossSet};
 use super::super::registry::{
     BackToList, DisconnectCluster, EditAiScope, Handler, ShowAgentActivity, ShowHelmReleases,
     ToggleKeepWatching,
@@ -77,7 +78,6 @@ use super::super::registry::{
     ForwardPort, OpenForwardedPort, ShowPortForwards, StartPortForward, StopAllPortForwards,
     StopPortForward,
 };
-use super::super::registry::{RestartAcrossSet, ScaleAcrossSet};
 use super::super::resource_actions::{self, ResourceAction};
 use super::super::scope_picker::ScopePicker;
 use super::super::terminal_view::TerminalView;
@@ -189,6 +189,12 @@ impl Workspace {
         .bind::<ScaleAcrossSet>(|this, _, window, cx| {
             fleet_view::request(this, FleetChoice::Scale, window, cx)
         })
+        .bind::<ApplyAcrossSet>(|this, _, window, cx| {
+            fleet_view::request(this, FleetChoice::ApplyYaml, window, cx)
+        })
+        .bind::<DeleteAcrossSet>(|this, _, window, cx| {
+            fleet_view::request(this, FleetChoice::Delete, window, cx)
+        })
         .bind::<CordonNode>(|this, _, window, cx| {
             resource_actions::request(this, ResourceAction::Cordon, window, cx)
         })
@@ -198,7 +204,10 @@ impl Workspace {
         .bind::<DrainNode>(|this, _, window, cx| {
             resource_actions::request(this, ResourceAction::Drain, window, cx)
         })
-        .bind::<ShowDrainReport>(|_, _, window, cx| resource_actions::show_drain_report(window, cx))
+        .bind::<ShowDrainReport>(|this, _, window, cx| {
+            let names = this.cluster_names(cx);
+            resource_actions::show_drain_report(&names, window, cx)
+        })
         .bind::<RetryConnection>(Self::retry_connection)
         .bind::<CancelConnection>(|this, _, _, cx| {
             if this.model.read(cx).can_cancel_connection() {
@@ -493,6 +502,12 @@ impl Workspace {
             })
             .when::<ScaleAcrossSet>(|ws, cx| {
                 fleet_view::available(ws, FleetChoice::Scale, cx).is_ok()
+            })
+            .when::<ApplyAcrossSet>(|ws, cx| {
+                fleet_view::available(ws, FleetChoice::ApplyYaml, cx).is_ok()
+            })
+            .when::<DeleteAcrossSet>(|ws, cx| {
+                fleet_view::available(ws, FleetChoice::Delete, cx).is_ok()
             })
             .when::<CordonNode>(|ws, cx| {
                 resource_actions::available(ws, ResourceAction::Cordon, cx).is_ok()
@@ -1105,6 +1120,17 @@ impl Workspace {
     /// Why log and shell sessions cannot open on `cluster` now (it is paused or not connected),
     /// if so. A cluster still connecting may: the object to act on is loading too.
     pub(in crate::ui) fn sessions_blocked(&self, cluster: &str, cx: &App) -> Option<String> {
+        self.cluster_sessions_blocked(cluster, cx).or_else(|| {
+            // A set's row also waits on what the set says of its member (a paused one, say):
+            // the refusal `session_member` gives when the session is asked for.
+            self.sets
+                .member(cluster)
+                .and_then(|_| self.set_row_refusal(cluster, cx))
+        })
+    }
+
+    /// [`Self::sessions_blocked`] as the cluster's own connection says.
+    fn cluster_sessions_blocked(&self, cluster: &str, cx: &App) -> Option<String> {
         let summary = self.cluster_summary(cluster, cx);
         // Only the words depend on the cause: whether this blocks is decided around it.
         let waiting = || {
@@ -1660,6 +1686,8 @@ impl Workspace {
         }
         match self.view_entry(&action.kind, cx) {
             Some(entry) => {
+                // Even the kind shown under Settings: it comes to the front.
+                self.leave_settings_for_view();
                 let open_already = match self.sets.running_kind() {
                     Some(kind) => *kind == entry.id,
                     None => self

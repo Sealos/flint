@@ -162,6 +162,30 @@ pub fn open_gated(
     );
 }
 
+/// [`open_gated`], which also closes and runs nothing once `guard` stops holding.
+pub(in crate::ui) fn open_gated_guarded(
+    window: &mut Window,
+    cx: &mut App,
+    dialog: DialogText,
+    content: AnyView,
+    guard: ConnectionGuard,
+    state: impl Fn(&App) -> ConfirmState + 'static,
+    on_ok: impl Fn(&mut Window, &mut App) -> bool + 'static,
+) {
+    debug_assert!(!dialog.default_cancel);
+    let gate: Gate = Rc::new(state);
+    open_dialog(
+        window,
+        cx,
+        dialog,
+        0,
+        Some(content),
+        Some(gate),
+        Some(guard),
+        on_ok,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn open_dialog(
     window: &mut Window,
@@ -311,6 +335,105 @@ fn open_dialog(
     }
     // Whether the text overflows is known once it is laid out.
     window.on_next_frame(|window, _| window.refresh());
+}
+
+actions!(
+    dialog,
+    [
+        /// Answer the open dialog with its third choice (Discard, beside Cancel and Save).
+        ConfirmAlternative
+    ]
+);
+
+/// A confirmation with a third answer beside Cancel and OK: `alternative` (Discard, when OK
+/// saves). Enter confirms and Escape cancels, as in [`open`]; the alternative is its button or
+/// [`ConfirmAlternative`]. The dialog closes before either answer runs.
+pub fn open_with_alternative(
+    window: &mut Window,
+    cx: &mut App,
+    dialog: DialogText,
+    alternative: String,
+    on_ok: impl Fn(&mut Window, &mut App) + 'static,
+    on_alternative: impl Fn(&mut Window, &mut App) + 'static,
+) {
+    debug_assert!(!dialog.default_cancel);
+    #[cfg(any(test, feature = "automation"))]
+    remember(window, dialog.clone(), cx);
+    let on_ok = Rc::new(on_ok);
+    let on_alternative = Rc::new(on_alternative);
+    // The buttons answer from here, inside the dialog, whatever holds focus.
+    let focus = cx.focus_handle();
+    let answer_from = focus.clone();
+    let live = LiveDialog::open(window, None, cx);
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let (on_ok, on_alternative) = (on_ok.clone(), on_alternative.clone());
+        let (live_ok, live_cancel, live_alternative) = (live.clone(), live.clone(), live.clone());
+        #[cfg(feature = "automation")]
+        let alert = alert.entrance(gpui_kit::component::dialog::DialogEntrance::None);
+        alert
+            .confirm()
+            .title(dialog.title.clone())
+            .description(
+                div()
+                    .id(dialog.id)
+                    .aria_label(dialog.text.clone())
+                    .track_focus(&focus)
+                    .on_action(move |_: &ConfirmAlternative, window, cx| {
+                        if live_alternative.retire(window, cx) {
+                            window.close_dialog(cx);
+                            on_alternative(window, cx);
+                        }
+                    })
+                    .child(dialog.text.clone())
+                    .test_support(),
+            )
+            .ok_text(dialog.ok.clone())
+            .cancel_text(dialog.cancel.clone())
+            .footer(alternative_footer(&dialog, &alternative, &focus))
+            .on_cancel(move |_, window, cx| live_cancel.retire(window, cx))
+            .on_ok(move |_, window, cx| {
+                if live_ok.retire(window, cx) {
+                    window.close_dialog(cx);
+                    on_ok(window, cx);
+                }
+                false
+            })
+    });
+    answer_from.focus(window, cx);
+}
+
+/// The buttons of [`open_with_alternative`]: Cancel, the alternative, and OK.
+fn alternative_footer(
+    dialog: &DialogText,
+    alternative: &str,
+    focus: &FocusHandle,
+) -> impl IntoElement {
+    use gpui_kit::base::actions::{Cancel, Confirm};
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::dialog::DialogFooter;
+
+    use super::registry;
+
+    DialogFooter::new()
+        .child(
+            Button::new("cancel")
+                .label(dialog.cancel.clone())
+                .on_click(registry::on_click_in(focus.clone(), Cancel)),
+        )
+        .child(
+            Button::new("alternative")
+                .label(alternative.to_owned())
+                .on_click(registry::on_click_in(focus.clone(), ConfirmAlternative)),
+        )
+        .child(
+            Button::new("ok")
+                .label(dialog.ok.clone())
+                .primary()
+                .on_click(registry::on_click_in(
+                    focus.clone(),
+                    Confirm { secondary: false },
+                )),
+        )
 }
 
 /// The confirmations not yet answered, per window, oldest first. A dialog's controls stay on

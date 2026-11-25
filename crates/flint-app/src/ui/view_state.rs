@@ -44,6 +44,35 @@ pub struct AppState {
     pub alerts: Option<super::alert_center::AlertsState>,
     /// Cluster sets: the sidebar's choice, the saved sets and the running set.
     pub sets: ClusterSetsState,
+    /// The Settings view and its draft, which outlives leaving the view.
+    pub settings: SettingsState,
+}
+
+/// The Settings view (#739): whether it is shown, and its draft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SettingsState {
+    /// Whether the main area shows it.
+    pub open: bool,
+    pub section: super::settings_view::Section,
+    /// Whether edits wait for Save (the sidebar entry's dot).
+    pub dirty: bool,
+    /// The `settings.toml` keys of the edited fields.
+    pub edited: Vec<&'static str>,
+    /// The values shown: the file with the edits on top.
+    pub appearance: &'static str,
+    pub desktop_notifications: bool,
+    pub watch_mode: &'static str,
+    /// The file changed under the draft: the Reload / Save anyway banner.
+    pub changed_on_disk: bool,
+    /// `settings.toml` cannot be read; Save is disabled.
+    pub invalid: bool,
+    pub can_save: bool,
+    /// A Save waits for the core's answer; its edits are still in the draft.
+    pub saving: bool,
+    /// Why the last Save did not go through.
+    pub note: Option<String>,
+    /// The element id of the control under the keyboard cursor.
+    pub cursor: Option<&'static str>,
 }
 
 /// Cluster sets, as the sidebar and the set's view show them.
@@ -68,6 +97,62 @@ pub struct OpenSetState {
     /// Saved members the core left out when the set opened.
     pub left_out: Vec<String>,
     pub list: ListState,
+    /// The set's dashboard, while it is open in place of the list.
+    pub dashboard: Option<SetDashboardState>,
+}
+
+/// The open dashboard of a cluster set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SetDashboardState {
+    /// A card per member, worst first.
+    pub cards: Vec<SetCardState>,
+    /// One count per problem category across the set.
+    pub totals: Vec<SetTotalState>,
+    /// Names the members a total lacks, when one does.
+    pub partial: Option<String>,
+}
+
+/// One member's card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SetCardState {
+    pub cluster: String,
+    /// The name the card shows.
+    pub shown: String,
+    pub tag: Option<flint_core::settings::ClusterTag>,
+    /// `live`, `partial`, `waiting`, `unavailable` or `blocked`.
+    pub state: &'static str,
+    /// What the card says about its state, if anything.
+    pub note: Option<String>,
+    /// `healthy`, `warning` or `unknown`, from the member's counts, CPU and memory.
+    pub level: &'static str,
+    /// One per problem category, as the card's counts show them.
+    pub counts: Vec<SetCountState>,
+}
+
+/// One problem count on a card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SetCountState {
+    /// As the count's link names it (`failing_pods`).
+    pub category: &'static str,
+    pub label: &'static str,
+    /// `None` when it could not be read.
+    pub count: Option<u32>,
+    /// Whether clicking it opens a list.
+    pub opens: bool,
+}
+
+/// One total across the set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SetTotalState {
+    pub category: &'static str,
+    pub label: &'static str,
+    /// The number as shown (`3`, `2+`, or a dash).
+    pub value: String,
+    pub known: u32,
+    /// Members the total could not include.
+    pub missing: u32,
+    /// Whether one list can show everything it counted.
+    pub opens: bool,
 }
 
 /// A member of the running set.
@@ -125,6 +210,8 @@ pub enum Focus {
     Menu,
     /// The command palette's search field.
     Palette,
+    /// The Settings view.
+    Settings,
     /// Something else.
     Other,
     None,
@@ -279,6 +366,8 @@ pub enum Main {
     AwaitingConfirmation,
     /// A resource list, and maybe the detail pane.
     List,
+    /// The Settings view.
+    Settings,
 }
 
 /// The header over the list.

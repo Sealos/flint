@@ -1117,6 +1117,7 @@ impl Workspace {
         if run.reports != reports {
             run.reports = reports;
             self.check_set_row(cx);
+            self.tell_detail_sessions_blocked(cx);
             self.refresh_set_kinds(cx);
             cx.notify();
         }
@@ -1137,7 +1138,7 @@ impl Workspace {
     }
 
     /// Why a row of `cluster` cannot be opened or acted on now, if so.
-    fn set_row_refusal(&self, cluster: &str, cx: &App) -> Option<String> {
+    pub(super) fn set_row_refusal(&self, cluster: &str, cx: &App) -> Option<String> {
         let names = self.cluster_names(cx);
         let shown = names.exact(cluster);
         let run = self.sets.running.as_ref()?;
@@ -1612,6 +1613,9 @@ impl Workspace {
                     .collect(),
                 left_out: run.left_out.iter().map(|m| m.context.clone()).collect(),
                 list: list.view_state(),
+                dashboard: self
+                    .set_dashboard()
+                    .map(|view| view.read(cx).model.view_state()),
             }
         });
         ClusterSetsState {

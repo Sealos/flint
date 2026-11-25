@@ -335,8 +335,10 @@ Two modes, set globally with an optional per-cluster override ([ADR-0008](./adr/
 - **All (default):** while a cluster is active, Flint watches every kind it discovered that can be listed and
   watched. Moving between lists is instant.
 - **On view:** Flint watches a kind only while a list or detail view for it is open. Uses less memory on very large
-  clusters, but a list may need a moment to load when you open it. The cluster's telemetry feed runs in this mode only
-  while its overview is open, so its problems, capacity and node metrics are not available otherwise.
+  clusters, but a list may need a moment to load when you open it. Problem detection still runs (#715): the
+  telemetry feed, with its seven kinds and per-kind caps, runs while the cluster is connected as the selected cluster
+  or an open set member, overview open or not. It follows that connection and never makes one: a member whose
+  sign-in runs a program has a feed in the background only with keep-watching consent.
 
 When the user switches to another cluster, the old one stays warm. In mode All it keeps its watches, except the
 high-churn kinds no open view needs (Events, Leases, EndpointSlices), which start again when it becomes active. In
