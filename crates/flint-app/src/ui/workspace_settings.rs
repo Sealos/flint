@@ -60,8 +60,10 @@ impl Workspace {
                         && ws.settings_page.saving.is_none()
                         && !ws.settings_invalid(cx))
             })
+            // Revert also closes a field left open, as its button shows.
             .when::<RevertSettings>(|ws, _| {
-                ws.has_settings_draft() && ws.settings_page.saving.is_none()
+                (ws.settings_page.draft.is_dirty() || ws.settings_page.thresholds.entry.is_some())
+                    && ws.settings_page.saving.is_none()
             })
     }
 
@@ -162,7 +164,7 @@ impl Workspace {
             && settings_view::can_save(&self.settings_page.draft, self.settings_invalid(cx))
     }
 
-    fn show_settings_section(
+    pub(super) fn show_settings_section(
         &mut self,
         section: settings_view::Section,
         window: &mut Window,
@@ -356,8 +358,14 @@ impl Workspace {
     }
 
     /// Whether Settings holds edits not yet written, a Save under way included.
-    pub(in crate::ui) fn has_settings_draft(&self) -> bool {
-        self.settings_page.draft.is_dirty() || self.settings_page.thresholds.entry.is_some()
+    pub(in crate::ui) fn has_settings_draft(&self, cx: &App) -> bool {
+        self.settings_page.draft.is_dirty()
+            || self
+                .settings_page
+                .thresholds
+                .entry
+                .as_ref()
+                .is_some_and(|entry| entry.typed(cx).is_some())
     }
 
     /// Asks Save / Discard / Cancel about unsaved settings, if there are any; Save (once
@@ -383,7 +391,7 @@ impl Workspace {
     ) -> bool {
         // A threshold still being typed counts as an edit.
         self.finish_threshold_entry(true, window, cx);
-        if !self.has_settings_draft() {
+        if !self.has_settings_draft(cx) {
             return false;
         }
         // A Save already on its way: close or quit once it is written, never before.

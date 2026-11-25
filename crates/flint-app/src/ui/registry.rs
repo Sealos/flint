@@ -2378,7 +2378,9 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Set a warning threshold, global or for one cluster, in the Settings draft.",
             EDIT_THRESHOLD,
         )
-        .of(C::Flint, S::Settings),
+        .of(C::Flint, S::Settings)
+        // The palette skips the optional value, so from there it could only clear one.
+        .hidden(),
         Spec::with_args::<TypeThreshold>(
             "Type Threshold…",
             "Open the text field of a warning threshold in Settings.",
@@ -3816,6 +3818,7 @@ pub mod tests {
             "workspace::SetNamespaces",
             "detail::ToggleSecretValue",
             "resource_list::CloseDetail",
+            "settings::EditThreshold",
         ] {
             assert!(hidden.contains(&name), "{name} is in the palette");
         }

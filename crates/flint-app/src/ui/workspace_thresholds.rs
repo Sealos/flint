@@ -7,7 +7,9 @@
 
 // module-tests: settings_thresholds_tests.rs
 
-use flint_core::settings::Settings;
+use std::sync::Arc;
+
+use flint_core::settings::{ClusterPin, Settings};
 use flint_core::thresholds::ThresholdMetric;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::*;
@@ -244,7 +246,7 @@ impl Workspace {
             return;
         };
         if let Some((target, _)) = self.threshold_target(cluster, metric, cx) {
-            self.enter_threshold(target, text.unwrap_or_default(), cx);
+            self.enter_threshold(target, text.unwrap_or_default(), None, cx);
         }
     }
 
@@ -259,7 +261,15 @@ impl Workspace {
 
     /// Enters `text` for `target` into the draft. Also used once Settings is left with a field
     /// open, so it does not ask for Settings to be shown; only a Save under way refuses it.
-    fn enter_threshold(&mut self, target: ThresholdTarget, text: &str, cx: &mut Context<Self>) {
+    /// `opened_over` is the file a field showed when it opened: a draft this starts is over it,
+    /// so a change to the file since shows as one.
+    fn enter_threshold(
+        &mut self,
+        target: ThresholdTarget,
+        text: &str,
+        opened_over: Option<&Arc<Settings>>,
+        cx: &mut Context<Self>,
+    ) {
         if self.settings_page.saving.is_some() {
             return;
         }
@@ -268,6 +278,9 @@ impl Workspace {
         }
         let file = self.model.read(cx).settings.clone();
         let draft = &mut self.settings_page.draft;
+        if let Some(opened_over) = opened_over {
+            draft.begin(opened_over);
+        }
         match settings_thresholds::parse_threshold(target.metric, text) {
             Ok(value) => draft.edit(
                 Change::Threshold {
@@ -315,6 +328,7 @@ impl Workspace {
         };
         let placeholder = target.inherited(&shown).to_string();
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        let text_opened = text.clone();
         input.update(cx, |state, cx| {
             state.set_value(text, window, cx);
             state.select_all(window, cx);
@@ -334,6 +348,8 @@ impl Workspace {
             target,
             stop,
             input,
+            opened: text_opened,
+            file: self.model.read(cx).settings.clone(),
             _subscription: subscription,
         });
         self.settings_page.cursor = Some(Stop::Threshold(stop));
@@ -358,9 +374,8 @@ impl Workspace {
             return;
         };
         let had_focus = entry.input.focus_handle(cx).is_focused(window);
-        if enter {
-            let text = entry.input.read(cx).value().to_string();
-            self.enter_threshold(entry.target, &text, cx);
+        if enter && let Some(text) = entry.typed(cx) {
+            self.enter_threshold(entry.target, &text, Some(&entry.file), cx);
         }
         if had_focus && self.settings_page.open {
             window.focus(&self.settings_page.focus, cx);
@@ -374,9 +389,10 @@ impl Workspace {
         if self.settings_page.open || self.settings_page.saving.is_some() {
             return;
         }
-        if let Some(entry) = self.settings_page.thresholds.entry.take() {
-            let text = entry.input.read(cx).value().to_string();
-            self.enter_threshold(entry.target, &text, cx);
+        if let Some(entry) = self.settings_page.thresholds.entry.take()
+            && let Some(text) = entry.typed(cx)
+        {
+            self.enter_threshold(entry.target, &text, Some(&entry.file), cx);
         }
     }
 
@@ -463,6 +479,38 @@ impl Workspace {
                 value: None,
             }));
         }
+        // A context gone from the kubeconfig may hold overrides pinned to several servers: its
+        // one row's Reset clears them all.
+        if !self
+            .settings_clusters(cx)
+            .iter()
+            .any(|known| known.context == context)
+        {
+            let shown = self.shown_settings(cx);
+            let pins = shown
+                .thresholds
+                .clusters
+                .iter()
+                .map(|c| c.cluster.clone())
+                .chain(
+                    shown
+                        .cluster_alerts
+                        .iter()
+                        .map(|a| ClusterPin::new(a.context.clone(), a.server.clone())),
+                )
+                .filter(|pin| pin.context == context);
+            for pin in pins {
+                changes.push(Change::ClusterAlerts {
+                    cluster: pin.clone(),
+                    enabled: None,
+                });
+                changes.extend(ThresholdMetric::ALL.map(|metric| Change::Threshold {
+                    cluster: Some(pin.clone()),
+                    metric,
+                    value: None,
+                }));
+            }
+        }
         for change in changes {
             self.edit_settings(change, cx);
         }
@@ -485,9 +533,14 @@ impl Workspace {
             return;
         }
         self.finish_threshold_entry(true, window, cx);
+        // From the palette, over another section: show the one with the list and the rows.
+        let elsewhere = self.settings_page.section != Section::ClusterOverrides;
+        if elsewhere {
+            self.show_settings_section(Section::ClusterOverrides, window, cx);
+        }
         let page = &mut self.settings_page;
         let Some(context) = context else {
-            page.thresholds.picking = !page.thresholds.picking;
+            page.thresholds.picking = elsewhere || !page.thresholds.picking;
             cx.notify();
             return;
         };
@@ -582,12 +635,27 @@ impl Workspace {
 
     /// Keeps the keyboard cursor and the open field on their cluster when rows above come or
     /// go (a Save, a reload of the file or kubeconfig), and drops the cursor when its row is
-    /// gone. Called as the workspace draws and before the cursor moves or is used.
+    /// gone. Retires a value rejected for an override no row is bound to any more, Settings open
+    /// or not. Called as the workspace draws and before the cursor moves or is used.
     pub(super) fn follow_threshold_rows(&mut self, cx: &App) {
-        if !self.settings_page.open {
+        if !self.settings_page.open && !self.settings_page.draft.has_rejected() {
             return;
         }
         let rows = self.override_rows(cx);
+        // A value rejected for an override no row is bound to any more (its context now
+        // points elsewhere) has nowhere to be fixed: it would block Save for good.
+        let bound: Vec<_> = rows.iter().filter_map(OverrideRow::pin).collect();
+        self.settings_page
+            .draft
+            .retain_rejected(|field| match field {
+                Field::Threshold {
+                    cluster: Some(pin), ..
+                } => bound.iter().any(|b| b.matches(&pin.context, &pin.server)),
+                _ => true,
+            });
+        if !self.settings_page.open {
+            return;
+        }
         let index_of = |context: &str| rows.iter().position(|row| row.context == context);
         if let Some(Stop::Threshold(stop)) = self.settings_page.cursor
             && let Some(context) = &self.settings_page.thresholds.cursor_row
@@ -612,17 +680,6 @@ impl Workspace {
         {
             entry.stop = entry.stop.at_row(i);
         }
-        // A value rejected for an override no row is bound to any more (its context now
-        // points elsewhere) has nowhere to be fixed: it would block Save for good.
-        let bound: Vec<_> = rows.iter().filter_map(OverrideRow::pin).collect();
-        self.settings_page
-            .draft
-            .retain_rejected(|field| match field {
-                Field::Threshold {
-                    cluster: Some(pin), ..
-                } => bound.iter().any(|b| b.matches(&pin.context, &pin.server)),
-                _ => true,
-            });
     }
 
     /// Closes the open field when its cluster no longer has a row to draw it in (entering

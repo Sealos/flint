@@ -161,9 +161,15 @@ impl SettingsDraft {
         self.settle();
     }
 
+    /// Starts a draft over `file`, if none is started: an edit that follows is over it, not over
+    /// the file as it is by then, so a change in between shows as made on disk.
+    pub fn begin(&mut self, file: &Arc<Settings>) {
+        self.start(file);
+    }
+
     /// Remembers the file a draft starts over.
     fn start(&mut self, file: &Arc<Settings>) {
-        if !self.is_dirty() {
+        if self.base.is_none() {
             self.base = Some(file.clone());
         }
     }

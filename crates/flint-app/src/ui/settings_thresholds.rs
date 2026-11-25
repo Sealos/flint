@@ -501,7 +501,19 @@ pub struct ThresholdEntry {
     pub target: ThresholdTarget,
     pub stop: ThresholdStop,
     pub input: Entity<InputState>,
+    /// The text it opened with: left as it is, the field enters nothing.
+    pub opened: String,
+    /// The settings as the file held them when it opened, which a draft it starts is over.
+    pub file: std::sync::Arc<Settings>,
     pub _subscription: Subscription,
+}
+
+impl ThresholdEntry {
+    /// The text in the field, if it differs from what it opened with.
+    pub fn typed(&self, cx: &App) -> Option<String> {
+        let text = self.input.read(cx).value().to_string();
+        (text.trim() != self.opened.trim()).then_some(text)
+    }
 }
 
 /// What the two sections hold besides the draft.

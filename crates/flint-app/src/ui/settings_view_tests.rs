@@ -351,7 +351,7 @@ async fn quit_while_a_save_is_pending_waits_for_it(cx: &mut TestAppContext) {
     let pending = cx
         .update_window(t.window, |_, window, cx| {
             super::registry::dispatch("settings::SaveSettings", Value::Null, window, cx).unwrap();
-            let pending = workspace.read(cx).has_settings_draft();
+            let pending = workspace.read(cx).has_settings_draft(cx);
             super::registry::dispatch("flint::Quit", Value::Null, window, cx).unwrap();
             pending
         })
