@@ -110,10 +110,15 @@ fn helm_and_kubeconfig_paths_must_be_files() {
 fn the_keyboard_reaches_every_control_of_the_sections() {
     let mut shown = flint_core::Settings::default();
     let ids = |section, shown: &flint_core::Settings| {
-        stops(section, false, shown)
-            .into_iter()
-            .map(Stop::id)
-            .collect::<Vec<_>>()
+        stops(
+            section,
+            false,
+            Default::default(),
+            shown.kubeconfig_paths.len(),
+        )
+        .into_iter()
+        .map(|stop| stop.id().to_string())
+        .collect::<Vec<_>>()
     };
     let logs = ids(Section::Logs, &shown);
     for id in [
@@ -121,7 +126,7 @@ fn the_keyboard_reaches_every_control_of_the_sections() {
         "settings-log-buffer-mib",
         "settings-log-total-mib",
     ] {
-        assert!(logs.contains(&id), "{id}");
+        assert!(logs.iter().any(|l| l == id), "{id}");
     }
     shown.kubeconfig_paths = vec!["/a".into(), "/b".into()];
     let paths = ids(Section::Paths, &shown);
@@ -132,9 +137,13 @@ fn the_keyboard_reaches_every_control_of_the_sections() {
         "settings-path",
         "settings-helm",
     ] {
-        assert!(paths.contains(&id), "{id}");
+        assert!(paths.iter().any(|p| p == id), "{id}");
     }
-    assert!(ids(Section::Safety, &shown).contains(&"settings-protect-local-clusters"));
+    assert!(
+        ids(Section::Safety, &shown)
+            .iter()
+            .any(|id| id == "settings-protect-local-clusters")
+    );
     assert_eq!(remove_id(1), remove_id(1));
     assert!(std::ptr::eq(remove_id(3), remove_id(3)), "made once");
 }
@@ -234,7 +243,10 @@ async fn a_log_limit_is_checked_as_typed_and_saved(cx: &mut TestAppContext) {
         t.press(cx, "tab");
     }
     let s = state(cx, &t);
-    assert_eq!(s.settings.cursor, Some("settings-log-buffer-lines"));
+    assert_eq!(
+        s.settings.cursor.as_deref(),
+        Some("settings-log-buffer-lines")
+    );
     t.press(cx, "secondary-a");
     t.type_text(cx, "500");
     let s = state(cx, &t);
@@ -261,10 +273,13 @@ async fn a_log_limit_is_checked_as_typed_and_saved(cx: &mut TestAppContext) {
     t.press(cx, "escape");
     let s = state(cx, &t);
     assert!(s.settings.open);
-    assert_eq!(s.settings.cursor, Some("settings-log-buffer-lines"));
+    assert_eq!(
+        s.settings.cursor.as_deref(),
+        Some("settings-log-buffer-lines")
+    );
     t.press(cx, "tab");
     assert_eq!(
-        state(cx, &t).settings.cursor,
+        state(cx, &t).settings.cursor.as_deref(),
         Some("settings-log-buffer-mib")
     );
     t.type_text(cx, "9999");
@@ -279,7 +294,7 @@ async fn a_log_limit_is_checked_as_typed_and_saved(cx: &mut TestAppContext) {
     t.type_text(cx, "64");
     t.press(cx, "shift-tab");
     assert_eq!(
-        state(cx, &t).settings.cursor,
+        state(cx, &t).settings.cursor.as_deref(),
         Some("settings-log-buffer-lines")
     );
 
@@ -306,7 +321,10 @@ async fn revert_clears_a_field_error(cx: &mut TestAppContext) {
             .field_errors
             .contains_key("settings-log-total-mib")
     );
-    assert!(!s.settings.dirty, "an invalid value is no edit");
+    assert!(
+        s.settings.dirty && s.settings.edited.is_empty(),
+        "an invalid value is held as rejected, not as an edit"
+    );
     t.click(cx, "settings-revert");
     let s = state(cx, &t);
     assert!(s.settings.field_errors.is_empty());
@@ -599,13 +617,13 @@ async fn save_shows_the_invalid_field_and_quit_still_asks(cx: &mut TestAppContex
     t.dispatch(cx, "settings::EditLogTotalMib", json!({ "mib": 20 }))
         .unwrap();
     let s = state(cx, &t);
-    assert!(!s.settings.dirty && !s.settings.can_save, "{s:?}");
+    assert!(s.settings.dirty && !s.settings.can_save, "{s:?}");
     show(cx, &t, "appearance");
 
     t.click(cx, "settings-save");
     let s = state(cx, &t);
     assert_eq!(s.settings.section, Section::Logs);
-    assert_eq!(s.settings.cursor, Some("settings-log-total-mib"));
+    assert_eq!(s.settings.cursor.as_deref(), Some("settings-log-total-mib"));
     assert!(!dir.path().join("settings.toml").exists());
 
     t.press_key_of(cx, "flint::Quit");

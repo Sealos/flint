@@ -56,6 +56,10 @@ pub use super::settings_logs_paths::{
     AddKubeconfigPath, ChooseKubeconfigPaths, EditHelmPath, EditLogBufferLines, EditLogBufferMib,
     EditLogTotalMib, EditPathOverride, EditProtectLocalClusters, RemoveKubeconfigPath,
 };
+pub use super::settings_thresholds::{
+    AddClusterOverride, CancelThresholdEntry, EditClusterAlerts, EditClusterWatchMode,
+    EditThreshold, ResetClusterOverrides, TypeThreshold,
+};
 pub use super::settings_view::{
     ActivateSettingsControl, CloseSettings, EditAppearance, EditDesktopNotifications,
     EditWatchMode, NextSettingsControl, OpenSettings, PreviousSettingsControl, RevertSettings,
@@ -538,6 +542,23 @@ pub struct ToggleDrainOption {
     pub option: DrainOption,
 }
 
+/// In a fleet action's target list: take a cluster out of the run, or put it back.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = cluster_sets, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct ToggleFleetTarget {
+    pub cluster: String,
+}
+
+actions!(
+    cluster_sets,
+    [
+        /// In a fleet apply's target list: go back to the manifest, as typed, to edit and
+        /// review it again.
+        EditFleetManifestAgain
+    ]
+);
+
 /// Choose the name Flint shows for a cluster: opens a dialog naming its context and server.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
 #[action(namespace = workspace, no_json)]
@@ -701,7 +722,13 @@ actions!(
         RestartAcrossSet,
         /// Ask for a replica count, then scale the selected workload on every member of the
         /// running set, one at a time, after a per-member plan and one confirmation.
-        ScaleAcrossSet
+        ScaleAcrossSet,
+        /// Edit a manifest of the selected object, then apply it on every member of the running
+        /// set, one at a time, after a per-member dry run and one confirmation.
+        ApplyAcrossSet,
+        /// Delete the selected object on every member of the running set, one at a time, after
+        /// a per-member dry run and one confirmation.
+        DeleteAcrossSet
     ]
 );
 
@@ -1966,9 +1993,80 @@ const CLUSTER_ALERTS: &[Arg] = &[
 ];
 const SETTINGS_SECTION: &[Arg] = &[arg(
     "section",
-    "appearance, alerts or watching",
-    ArgKind::Choice(&["appearance", "alerts", "watching"]),
+    "appearance, alerts, watching, thresholds or cluster_overrides",
+    ArgKind::Choice(&[
+        "appearance",
+        "alerts",
+        "watching",
+        "thresholds",
+        "cluster_overrides",
+    ]),
 )];
+const THRESHOLD_METRICS: &[&str] = &[
+    "cpu_percent",
+    "memory_percent",
+    "restarts_last_hour",
+    "warning_events_last_hour",
+    "pending_pod_seconds",
+];
+const EDIT_THRESHOLD: &[Arg] = &[
+    Arg {
+        name: "cluster",
+        description: "kubeconfig context name; the global value when left out",
+        required: false,
+        kind: ArgKind::Cluster,
+    },
+    arg(
+        "metric",
+        "cpu_percent, memory_percent, restarts_last_hour, warning_events_last_hour or \
+         pending_pod_seconds",
+        ArgKind::Choice(THRESHOLD_METRICS),
+    ),
+    Arg {
+        name: "value",
+        description: "a whole number; left out or empty to follow the level below",
+        required: false,
+        kind: ArgKind::Text,
+    },
+];
+const TYPE_THRESHOLD: &[Arg] = &[
+    Arg {
+        name: "cluster",
+        description: "kubeconfig context name; the global value when left out",
+        required: false,
+        kind: ArgKind::Cluster,
+    },
+    arg(
+        "metric",
+        "cpu_percent, memory_percent, restarts_last_hour, warning_events_last_hour or \
+         pending_pod_seconds",
+        ArgKind::Choice(THRESHOLD_METRICS),
+    ),
+];
+const EDIT_CLUSTER_ALERTS: &[Arg] = &[
+    arg("cluster", "kubeconfig context name", ArgKind::Cluster),
+    arg(
+        "choice",
+        "default, on or off",
+        ArgKind::Choice(&["default", "on", "off"]),
+    ),
+];
+const EDIT_CLUSTER_WATCH_MODE: &[Arg] = &[
+    arg("cluster", "kubeconfig context name", ArgKind::Cluster),
+    arg(
+        "mode",
+        "default, all or on_view",
+        ArgKind::Choice(&["default", "all", "on_view"]),
+    ),
+];
+const RESET_CLUSTER_OVERRIDES: &[Arg] =
+    &[arg("cluster", "kubeconfig context name", ArgKind::Cluster)];
+const ADD_CLUSTER_OVERRIDE: &[Arg] = &[Arg {
+    name: "cluster",
+    description: "kubeconfig context name; shows the list of clusters when left out",
+    required: false,
+    kind: ArgKind::Cluster,
+}];
 const EDIT_APPEARANCE: &[Arg] = &[arg(
     "appearance",
     "system, light or dark",
@@ -2373,6 +2471,52 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Turn protection of local clusters on or off in the Settings draft. Turning it off \
              is confirmed at Save.",
             EDIT_PROTECT_LOCAL,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditThreshold>(
+            "Edit Threshold…",
+            "Set a warning threshold, global or for one cluster, in the Settings draft.",
+            EDIT_THRESHOLD,
+        )
+        .of(C::Flint, S::Settings)
+        // The palette skips the optional value, so from there it could only clear one.
+        .hidden(),
+        Spec::with_args::<TypeThreshold>(
+            "Type Threshold…",
+            "Open the text field of a warning threshold in Settings.",
+            TYPE_THRESHOLD,
+        )
+        .of(C::Flint, S::Settings)
+        .hidden(),
+        Spec::unit::<CancelThresholdEntry>(
+            "Cancel Threshold Entry",
+            "Drop what is typed in a threshold field in Settings.",
+        )
+        .of(C::Flint, S::Settings)
+        .keys(&["escape"], Some(super::settings_view::SETTINGS_INPUT_KEYS))
+        .hidden(),
+        Spec::with_args::<EditClusterAlerts>(
+            "Edit Cluster Alerts Override…",
+            "Set whether one cluster posts desktop notifications, in the Settings draft.",
+            EDIT_CLUSTER_ALERTS,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditClusterWatchMode>(
+            "Edit Cluster Watch Mode Override…",
+            "Set one cluster's watch mode in the Settings draft.",
+            EDIT_CLUSTER_WATCH_MODE,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<ResetClusterOverrides>(
+            "Reset Cluster Overrides…",
+            "Clear one cluster's thresholds, alerts and watch mode overrides in the Settings draft.",
+            RESET_CLUSTER_OVERRIDES,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<AddClusterOverride>(
+            "Add Cluster Override…",
+            "Give a cluster a row in Settings' Cluster overrides.",
+            ADD_CLUSTER_OVERRIDE,
         )
         .of(C::Flint, S::Settings),
         // The view's own Tab cycle, so its controls work without a mouse and Tab never reaches
@@ -2989,6 +3133,18 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
              running set, one at a time, after a per-member plan and one confirmation.",
         )
         .of(C::Detail, S::Workspace),
+        Spec::unit::<ApplyAcrossSet>(
+            "Apply YAML to Selected Object Across Set",
+            "Edit a manifest of the selected object, then apply it on every member of the \
+             running set, one at a time, after a per-member dry run and one confirmation.",
+        )
+        .of(C::Detail, S::Workspace),
+        Spec::unit::<DeleteAcrossSet>(
+            "Delete Selected Object Across Set",
+            "Delete the selected object on every member of the running set, one at a time, \
+             after a per-member dry run and one confirmation.",
+        )
+        .of(C::Detail, S::Workspace),
         Spec::with_args::<OpenSetMember>(
             "Open Set Member…",
             "Open the combined list filtered to one member.",
@@ -3227,6 +3383,19 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Include the fields each cluster assigns for itself.",
         )
         .of(C::Detail, S::Compare),
+        Spec::with_args::<ToggleFleetTarget>(
+            "Toggle Fleet Target…",
+            "In a fleet action's target list, take a cluster out of the run or put it back.",
+            CLUSTER,
+        )
+        .of(C::Cluster, S::Dialog)
+        .hidden(),
+        Spec::unit::<EditFleetManifestAgain>(
+            "Edit Fleet Manifest Again",
+            "In a fleet apply's target list, go back to the manifest to edit and review it again.",
+        )
+        .of(C::Cluster, S::Dialog)
+        .hidden(),
         Spec::with_args::<ToggleDrainOption>(
             "Toggle Drain Option…",
             "In the drain dialog, turn an option on or off.",
@@ -3774,6 +3943,7 @@ pub mod tests {
             "workspace::SetNamespaces",
             "detail::ToggleSecretValue",
             "resource_list::CloseDetail",
+            "settings::EditThreshold",
         ] {
             assert!(hidden.contains(&name), "{name} is in the palette");
         }
@@ -3926,13 +4096,15 @@ pub mod tests {
     }
 
     /// Plain keys never fire while typing in a field, except Esc meant for the log search field
-    /// itself (which the field passes on), and the keys the palette's field and the list's
+    /// or a Settings threshold field itself (which the field passes on), and the keys the palette's field and the list's
     /// filter hand on (no field there takes Enter, Esc or Down for itself). Keys with a modifier
     /// are not plain.
     fn plain_key_allowed(key: &str, context: Option<&str>) -> bool {
         key.contains('-')
             || context.is_some_and(|c| c.contains("!Input"))
             || (key == "escape" && context == Some(super::LOG_SEARCH))
+            || (key == "escape"
+                && context == Some(super::super::settings_view::SETTINGS_INPUT_KEYS))
             || context == Some(super::PALETTE_INPUT)
             || (matches!(key, "escape" | "enter" | "down") && context == Some(super::LIST_FILTER))
             || (matches!(key, "tab" | "up" | "down")

@@ -110,6 +110,8 @@ fn reviewed() -> ReviewedEdit {
         pin: crate::recheck::ContextHistory::default().pin("dev", None),
         credential: crate::credential::CredentialBinding::for_tests(),
         body: json!({"data": {"password": "aHVudGVyMg=="}}),
+        secret: true,
+        creates: false,
         before: String::new(),
         after: String::new(),
     }
@@ -219,6 +221,34 @@ fn invalid_yaml_does_not_repeat_the_text() {
     assert!(!error.contains("hunter2"), "{error}");
 }
 
+fn secret_kind() -> KindInfo {
+    KindInfo {
+        resource: ApiResource {
+            group: String::new(),
+            version: "v1".into(),
+            api_version: "v1".into(),
+            kind: "Secret".into(),
+            plural: "secrets".into(),
+        },
+        singular: "secret".into(),
+        short_names: Vec::new(),
+        namespaced: true,
+        verbs: Vec::new(),
+    }
+}
+
+#[test]
+fn a_secrets_invalid_yaml_names_only_where() {
+    // A pasted credential as an unquoted key, twice: the parser's message would name it.
+    let yaml = "apiVersion: v1\nkind: Secret\nmetadata:\n  name: web\nstringData:\n  \
+                sk-live-4f9a2c: a\n  sk-live-4f9a2c: b\n";
+    let error = edit_body(yaml, &secret_kind(), &target())
+        .unwrap_err()
+        .to_string();
+    assert!(!error.contains("sk-live"), "{error}");
+    assert!(error.contains("line 7"), "{error}");
+}
+
 #[test]
 fn the_gitops_warning_comes_from_the_live_object() {
     let managed = json!({
@@ -292,4 +322,98 @@ async fn a_disconnect_asked_for_stops_the_next_request_before_the_core_runs_it()
     // A write started now waits for the core to run the disconnect, too.
     let later = RequestGate::new(core.clone(), &target());
     assert_eq!(later.check_disconnects(), Err(refused));
+}
+
+#[test]
+fn a_manifest_leaves_out_what_one_cluster_owns() {
+    let yaml = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web\n  namespace: demo\n  uid: uid-a\n  resourceVersion: '7'\n  generation: 2\n  ownerReferences:\n  - uid: owner-a\n  labels:\n    app: web\ndata:\n  key: value\nstatus:\n  x: 1\n";
+    let portable: Value = serde_saphyr::from_str(&portable_manifest(yaml).unwrap()).unwrap();
+    assert_eq!(
+        portable,
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "web", "namespace": "demo", "labels": {"app": "web"}},
+            "data": {"key": "value"},
+        })
+    );
+    // Not YAML: left for the review to refuse in its own words.
+    assert_eq!(portable_manifest("a: [").unwrap(), "a: [");
+}
+
+#[test]
+fn a_service_manifest_leaves_out_its_addresses_unless_headless() {
+    let service = |ip: &str| {
+        format!(
+            "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\nspec:\n  clusterIP: {ip}\n  \
+             clusterIPs:\n  - {ip}\n  ports:\n  - port: 80\n"
+        )
+    };
+    let portable: Value =
+        serde_saphyr::from_str(&portable_manifest(&service("10.0.0.7")).unwrap()).unwrap();
+    assert_eq!(portable["spec"], json!({"ports": [{"port": 80}]}));
+    let headless: Value =
+        serde_saphyr::from_str(&portable_manifest(&service("None")).unwrap()).unwrap();
+    assert_eq!(headless["spec"]["clusterIP"], "None");
+    assert_eq!(headless["spec"]["clusterIPs"], json!(["None"]));
+}
+
+#[test]
+fn a_replace_keeps_what_the_destination_gave_the_object() {
+    let live = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": "web", "ownerReferences": [{"uid": "owner-here"}]},
+        "spec": {"clusterIP": "10.1.0.9", "clusterIPs": ["10.1.0.9"]},
+    });
+    let mut body = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": "web"},
+        "spec": {"ports": [{"port": 80}]},
+    });
+    keep_destination_owned(&mut body, &live);
+    assert_eq!(
+        body["metadata"]["ownerReferences"],
+        json!([{"uid": "owner-here"}])
+    );
+    assert_eq!(body["spec"]["clusterIP"], "10.1.0.9");
+    assert_eq!(body["spec"]["clusterIPs"], json!(["10.1.0.9"]));
+    // What the manifest says itself stays: the server answers for a change it cannot make.
+    let mut headless = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": "web"},
+        "spec": {"clusterIP": "None"},
+    });
+    keep_destination_owned(&mut headless, &live);
+    assert_eq!(headless["spec"]["clusterIP"], "None");
+    // Not a Service: only the owners.
+    let mut config = json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "web"}});
+    keep_destination_owned(&mut config, &live);
+    assert_eq!(
+        config["metadata"]["ownerReferences"],
+        json!([{"uid": "owner-here"}])
+    );
+    assert!(config.get("spec").is_none());
+}
+
+#[test]
+fn only_a_manifest_for_an_unshown_object_creates() {
+    let manifest = WriteProposal::ApplyManifest {
+        yaml: String::new(),
+    };
+    let unshown = WriteTarget {
+        uid: None,
+        resource_version: None,
+        ..target()
+    };
+    assert!(creates_when_absent(&unshown, &manifest));
+    // An object that was shown and went away is gone, not created again.
+    assert!(!creates_when_absent(&target(), &manifest));
+    let edit = WriteProposal::ApplyYaml {
+        yaml: String::new(),
+    };
+    assert!(!creates_when_absent(&unshown, &edit));
+    assert!(!creates_when_absent(&unshown, &WriteProposal::Delete));
 }

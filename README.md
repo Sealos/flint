@@ -446,11 +446,12 @@ plus any `kubeconfig_paths` from settings. It never writes to kubeconfig files, 
 cluster until you select one.
 
 Settings live in `~/Library/Application Support/Flint/settings.toml` (or in `$FLINT_CONFIG_DIR` if set). Flint >
-Settings… (Cmd-, on macOS, Ctrl-, on Linux) edits the appearance, desktop notifications, the default watch mode, the
-three log buffer limits, the extra kubeconfig files, the `path` and `helm` overrides and `protect_local_clusters`. Its
-edits wait for Save, which writes only what you changed; a value out of range or a path that cannot be used blocks
-Save until it is fixed. Turning `protect_local_clusters` off asks for confirmation at Save; turning it on does not.
-Other keys are edited in the file:
+Settings… (Cmd-, on macOS, Ctrl-, on Linux) edits the appearance, desktop notifications, the default watch mode,
+the warning thresholds, per-cluster overrides of thresholds, alerts and watch mode (Cluster overrides), the three log
+buffer limits, the extra kubeconfig files, the `path` and `helm` overrides and `protect_local_clusters`. Its edits
+wait for Save, which writes only what you changed, all in one save; a value out of range or a path that cannot be used
+blocks Save until it is fixed. Turning `protect_local_clusters` off asks for confirmation at Save; turning it on does
+not. Other keys are edited in the file:
 
 ```toml
 kubeconfig_paths = ["~/work/kubeconfig"]
@@ -494,9 +495,10 @@ watch_mode = "all"                # or "on_view"
 # namespaces = ["shop"]          # optional: only these namespaces (empty or missing: all)
 # kinds = ["pods", "deployments.apps"]  # optional: only these kinds (empty or missing: all)
 
-# Warning thresholds of the cluster overview, also written by Set Pending Pod Threshold…: percent of allocatable
-# (1 to 100), counts per hour (1 to 10000) and seconds (1 to 86400). Defaults: 90, 90, 5, 10 and 300. A
-# [[thresholds.clusters]] entry (context and server, then any of the same keys) overrides them for one cluster.
+# Warning thresholds of the cluster overview, written by Settings > Thresholds and Cluster overrides (and Set Pending
+# Pod Threshold…): percent of allocatable (1 to 100), counts per hour (1 to 10000) and seconds (1 to 86400). Defaults:
+# 90, 90, 5, 10 and 300. A [[thresholds.clusters]] entry (context and server, then any of the same keys) overrides
+# them for one cluster.
 # [thresholds]
 # cpu_percent = 90
 # memory_percent = 90
@@ -516,7 +518,7 @@ watch_mode = "all"                # or "on_view"
 # context = "staging"
 # server = "https://staging.example.com:6443"
 
-# Per-cluster choice that overrides desktop_notifications (Set Cluster Alerts…).
+# Per-cluster choice that overrides desktop_notifications (Set Cluster Alerts…, or Settings > Cluster overrides).
 # [[cluster_alerts]]
 # context = "staging"
 # server = "https://staging.example.com:6443"

@@ -4,8 +4,8 @@
 //! with a draft.
 //!
 //! Save hands the edited fields to the core ([`flint_core::CoreHandle::write_settings`]), which
-//! writes each through the same setter the View menu, the Alerts menu and the header use, and
-//! answers once they are written. Nothing about a setting written here is loosened. The edits
+//! writes them all in one save, each as the setter the View menu, the Alerts menu and the header
+//! use writes it, and answers once they are written: all of them, or none. Nothing about a setting written here is loosened. The edits
 //! stay in the draft until that answer: a failed or unconfirmed Save keeps them.
 
 // module-tests: settings_view_tests.rs
@@ -17,7 +17,7 @@ use gpui_kit::*;
 
 use super::super::confirm::{self, DialogText};
 use super::super::registry::{Bind, Guards, OnView};
-use super::super::settings_draft::Change;
+use super::super::settings_draft::{Change, SettingsDraft};
 use super::super::settings_view::{
     self, ActivateSettingsControl, CloseSettings, EditAppearance, EditDesktopNotifications,
     EditWatchMode, MainKey, NextSettingsControl, OpenSettings, PreviousSettingsControl,
@@ -26,7 +26,7 @@ use super::super::settings_view::{
 #[cfg(any(test, feature = "automation"))]
 use super::super::view_state::SettingsState;
 use super::Workspace;
-use flint_core::settings::{PROTECTION_CONFIRMATION_STALE, SettingsWriteFailure};
+use flint_core::settings::{PROTECTION_CONFIRMATION_STALE, SettingsRevision};
 
 /// How long a Save waits for the core's answer before it says it could not be confirmed.
 const SAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -40,38 +40,6 @@ const UNCONFIRMED: &str =
 const EDITED_WHILE_SAVING: &str =
     "Saved. Edits made while saving are not saved yet; save or revert them, then try again.";
 
-/// What the footer says when a Save stopped part way: what was written, what was refused and
-/// why, and what was not tried.
-pub(in crate::ui) fn save_failure_note(
-    writes: &[Change],
-    failure: &SettingsWriteFailure,
-) -> String {
-    let written = failure.written.min(writes.len());
-    let names = |changes: &[Change]| {
-        let names: Vec<&str> = changes.iter().map(Change::what).collect();
-        match names.as_slice() {
-            [] => String::new(),
-            [one] => (*one).to_owned(),
-            [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
-        }
-    };
-    let mut note = String::new();
-    if written > 0 {
-        note.push_str(&format!("Saved {}. ", names(&writes[..written])));
-    }
-    match writes.get(written) {
-        Some(failed) => {
-            note.push_str(&format!("Not saved: {}: {}", failed.what(), failure.why));
-            let rest = &writes[written + 1..];
-            if !rest.is_empty() {
-                note.push_str(&format!(". Also not saved: {}", names(rest)));
-            }
-        }
-        None => note.push_str(&format!("Not saved: {}", failure.why)),
-    }
-    note
-}
-
 impl Workspace {
     pub(super) fn settings_guards(guards: Guards<Self>) -> Guards<Self> {
         fn open(ws: &Workspace, _: &App) -> bool {
@@ -81,7 +49,7 @@ impl Workspace {
         fn editable(ws: &Workspace, _: &App) -> bool {
             ws.settings_page.open && ws.settings_page.saving.is_none()
         }
-        let guards = guards
+        Self::logs_paths_guards(Self::threshold_guards(guards))
             .when::<CloseSettings>(open)
             .when::<ShowSettingsSection>(open)
             .when::<NextSettingsControl>(open)
@@ -90,22 +58,29 @@ impl Workspace {
             .when::<EditAppearance>(editable)
             .when::<EditDesktopNotifications>(editable)
             .when::<EditWatchMode>(editable)
-            // With a field's text invalid, Save shows that field instead of writing.
+            // A threshold still being typed is entered by Save, which then checks the draft,
+            // and dropped by Revert.
+            // With a value rejected, Save shows its field instead of writing.
             .when::<SaveSettings>(|ws, cx| {
-                ws.can_save_settings(cx) || ws.settings_field_error_to_show()
+                ws.can_save_settings(cx)
+                    || ws.settings_field_error_to_show()
+                    || (ws.settings_page.thresholds.entry.is_some()
+                        && ws.settings_page.saving.is_none()
+                        && !ws.settings_invalid(cx))
             })
+            // Revert also closes a field left open, as its button shows.
             .when::<RevertSettings>(|ws, _| {
-                settings_view::can_revert(&ws.settings_page) && ws.settings_page.saving.is_none()
-            });
-        Self::logs_paths_guards(guards)
+                (ws.settings_page.draft.is_dirty() || ws.settings_page.thresholds.entry.is_some())
+                    && ws.settings_page.saving.is_none()
+            })
     }
 
     pub(in crate::ui) fn bind_settings_actions<B: Bind<Self>>(bind: B) -> B {
-        let bind = Self::bind_logs_paths_actions(bind);
-        bind.bind::<OpenSettings>(|ws, _, window, cx| ws.open_settings(window, cx))
+        Self::bind_logs_paths_actions(Self::bind_threshold_actions(bind))
+            .bind::<OpenSettings>(|ws, _, window, cx| ws.open_settings(window, cx))
             .bind::<CloseSettings>(|ws, _, window, cx| ws.close_settings(window, cx))
-            .bind::<ShowSettingsSection>(|ws, action, _, cx| {
-                ws.show_settings_section(action.section, cx)
+            .bind::<ShowSettingsSection>(|ws, action, window, cx| {
+                ws.show_settings_section(action.section, window, cx)
             })
             .bind::<EditAppearance>(|ws, action, _, cx| {
                 ws.edit_settings(Change::Appearance(action.appearance), cx)
@@ -117,7 +92,10 @@ impl Workspace {
                 ws.edit_settings(Change::WatchMode(action.mode), cx)
             })
             .bind::<SaveSettings>(|ws, _, window, cx| ws.save_settings(None, window, cx))
-            .bind::<RevertSettings>(|ws, _, _, cx| ws.revert_settings(cx))
+            .bind::<RevertSettings>(|ws, _, window, cx| {
+                ws.finish_threshold_entry(false, window, cx);
+                ws.revert_settings(cx)
+            })
             .bind::<NextSettingsControl>(|ws, _, window, cx| {
                 ws.move_settings_cursor(true, window, cx)
             })
@@ -152,6 +130,7 @@ impl Workspace {
         if !self.settings_page.open {
             return;
         }
+        self.finish_threshold_entry(true, window, cx);
         self.leave_settings_for_view();
         window.focus(&self.focus, cx);
         self.recover_focus(window, cx);
@@ -186,6 +165,7 @@ impl Workspace {
         self.settings_page.open = false;
         self.settings_page.opened_over = None;
         self.settings_page.cursor = None;
+        // A field still open is entered as the workspace next draws (flush_threshold_entry).
     }
 
     fn settings_invalid(&self, cx: &App) -> bool {
@@ -194,12 +174,22 @@ impl Workspace {
 
     pub(super) fn can_save_settings(&self, cx: &App) -> bool {
         self.settings_page.saving.is_none()
-            && settings_view::can_save(&self.settings_page, self.settings_invalid(cx))
+            && settings_view::can_save(&self.settings_page.draft, self.settings_invalid(cx))
     }
 
-    fn show_settings_section(&mut self, section: settings_view::Section, cx: &mut Context<Self>) {
+    pub(super) fn show_settings_section(
+        &mut self,
+        section: settings_view::Section,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.settings_page.open {
+            self.finish_threshold_entry(true, window, cx);
             self.settings_page.section = section;
+            // The cursor stays on the section list, never on a control no longer drawn.
+            if self.settings_page.cursor.is_some() {
+                self.settings_page.cursor = Some(Stop::Section(section));
+            }
             cx.notify();
         }
     }
@@ -219,26 +209,28 @@ impl Workspace {
             return;
         }
         self.settings_page.draft.revert();
+        self.revert_thresholds_page();
         self.settings_page.save_note = None;
-        // The fields show the file again, as the workspace next draws.
-        self.settings_page.logs_paths.errors.clear();
+        // The text fields show the file again, as the workspace next draws.
         self.settings_page.logs_paths.kubeconfig_note = None;
         self.settings_page.logs_paths.resync = true;
         cx.notify();
     }
 
-    /// Whether a field holds invalid text that Save would show rather than write.
+    /// Whether a value typed is rejected, which Save shows rather than writes.
     fn settings_field_error_to_show(&self) -> bool {
         self.settings_page.open
             && self.settings_page.saving.is_none()
-            && !self.settings_page.logs_paths.errors.is_empty()
+            && self.settings_page.draft.has_rejected()
     }
 
     /// Saves the draft. A draft that turns local cluster protection off asks first
     /// ([`Self::confirm_unprotect`]), whichever way Save was asked for: the button, the banner's
-    /// Save anyway, the keyboard, the palette, or the quit and close question. While a field
-    /// holds invalid text, nothing is written: Save shows that field, scrolled into view.
+    /// Save anyway, the keyboard, the palette, or the quit and close question. While a value
+    /// typed is rejected, nothing is written: Save shows its field, scrolled into view.
     fn save_settings(&mut self, then: Option<Then>, window: &mut Window, cx: &mut Context<Self>) {
+        // A threshold still being typed is part of what is saved (or, rejected, blocks it).
+        self.finish_threshold_entry(true, window, cx);
         if self.settings_field_error_to_show() {
             self.show_settings_field_error(window, cx);
             return;
@@ -253,17 +245,17 @@ impl Workspace {
         self.write_settings_draft(then, None, window, cx);
     }
 
-    /// Hands the edited fields, and only those, to the core. They stay in the draft until it
-    /// answers: written, they leave it and `then` runs; refused, or unanswered within
+    /// Hands the edited fields, and only those, to the core, in one save. They stay in the draft
+    /// until it answers: written, they leave it and `then` runs; refused, or unanswered within
     /// [`SAVE_WAIT`], they stay, the footer says why, and `then` does not run. Nothing happens
     /// without edits, while `settings.toml` is invalid, or while an earlier Save is pending.
     /// Only [`Self::save_settings`] and a confirmed [`Self::confirm_unprotect`] call it; the
-    /// latter passes `confirmed`, the revision of the settings it was confirmed over, which the
-    /// core requires to turn protection off.
+    /// latter passes `confirmed`, the settings it was confirmed over, without which the core
+    /// refuses to turn protection off.
     pub(super) fn write_settings_draft(
         &mut self,
         then: Option<Then>,
-        confirmed: Option<flint_core::settings::SettingsRevision>,
+        confirmed: Option<SettingsRevision>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -271,12 +263,11 @@ impl Workspace {
             return;
         }
         let writes = self.settings_page.draft.edits();
-        let reply = self.model.read(cx).core().write_settings(
-            writes
-                .iter()
-                .map(|c| c.clone().into_write(confirmed.clone()))
-                .collect(),
-        );
+        let reply = self
+            .model
+            .read(cx)
+            .core()
+            .write_settings(SettingsDraft::confirmed(&writes, confirmed.as_ref()));
         let written = writes.clone();
         let answer = cx.spawn_in(window, async move |this, cx| {
             let result = reply.await;
@@ -284,14 +275,12 @@ impl Workspace {
                 ws.finish_save(&written, result, window, cx)
             });
         });
-        // A Save that changes local cluster protection is never given up on: the write could
+        // A Save that turns local cluster protection off is never given up on: the write could
         // still land after the view had let the user take it back, leaving protection off
         // against their last choice. Edits stay locked until the core answers.
-        let changes_protection = writes
-            .iter()
-            .any(|c| matches!(c, Change::ProtectLocalClusters(_)));
+        let unprotects = self.settings_page.draft.loosens_protection();
         let give_up = cx.spawn(async move |this, cx| {
-            if changes_protection {
+            if unprotects {
                 return;
             }
             cx.background_executor().timer(SAVE_WAIT).await;
@@ -312,29 +301,26 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The core's answer to a Save of `writes`. Text typed into a field meanwhile joins the
-    /// draft first, so it is neither lost nor taken for saved. Written edits leave the draft;
-    /// on a failure the footer names what was saved and what was not. `then` (quit, close) runs
-    /// only once everything is saved and nothing new waits.
+    /// The core's answer to a Save of `writes`, all written or none. Text typed into a field
+    /// meanwhile joins the draft first, so it is neither lost nor taken for saved. `then` (quit,
+    /// close) runs only once everything is saved and nothing new waits.
     fn finish_save(
         &mut self,
         writes: &[Change],
-        result: Result<(), SettingsWriteFailure>,
+        result: Result<(), String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(saving) = self.settings_page.saving.take() else {
             return;
         };
-        let written = match &result {
-            Ok(()) => writes.len(),
-            Err(failure) => failure.written.min(writes.len()),
-        };
-        self.take_typed_while_saving(Some(&writes[..written]), cx);
+        let written: &[Change] = if result.is_ok() { writes } else { &[] };
+        self.take_typed_while_saving(Some(written), cx);
         match result {
             Ok(()) => {
                 self.settings_page.draft.saved(writes);
-                if self.has_settings_draft() {
+                self.saved_thresholds_page();
+                if self.has_settings_draft(cx) {
                     if !saving.after.is_empty() {
                         self.settings_page.save_note = Some(EDITED_WHILE_SAVING.to_owned());
                     }
@@ -344,12 +330,11 @@ impl Workspace {
                     }
                 }
             }
-            Err(failure) => {
-                self.settings_page.draft.saved(&writes[..written]);
-                self.settings_page.save_note = Some(save_failure_note(writes, &failure));
+            Err(why) => {
+                self.settings_page.save_note = Some(format!("Not saved: {why}"));
                 // Turning protection off was confirmed over a file that changed since: ask
                 // again, over the file as it is now.
-                if failure.why.contains(PROTECTION_CONFIRMATION_STALE)
+                if why.contains(PROTECTION_CONFIRMATION_STALE)
                     && self.settings_page.draft.loosens_protection()
                 {
                     let after = saving.after;
@@ -372,12 +357,11 @@ impl Workspace {
         if !self.settings_page.open {
             return;
         }
+        self.follow_threshold_rows(cx);
         let banner = self.settings_banner_shown(cx);
-        let shown = self
-            .settings_page
-            .draft
-            .shown(&self.model.read(cx).settings);
-        let stops = settings_view::stops(self.settings_page.section, banner, &shown);
+        let layout = self.overrides_layout(cx);
+        let kubeconfigs = self.settings_kubeconfigs(cx);
+        let stops = settings_view::stops(self.settings_page.section, banner, layout, kubeconfigs);
         let at = self
             .settings_page
             .cursor
@@ -389,6 +373,7 @@ impl Workspace {
             (Some(i), false) => (i + stops.len() - 1) % stops.len(),
         };
         self.settings_page.cursor = Some(stops[next]);
+        self.track_threshold_cursor(cx);
         self.scroll_to_settings_cursor(cx);
         self.focus_settings_stop(window, cx);
         cx.notify();
@@ -396,14 +381,27 @@ impl Workspace {
 
     /// Enter or Space: does what clicking the control under the cursor does.
     fn activate_settings_control(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.follow_threshold_rows(cx);
         let Some(stop) = self.settings_page.cursor else {
             return;
         };
+        // Only a control drawn now: never one of a section no longer shown.
+        let banner = self.settings_banner_shown(cx);
+        let layout = self.overrides_layout(cx);
+        let kubeconfigs = self.settings_kubeconfigs(cx);
+        if !settings_view::stops(self.settings_page.section, banner, layout, kubeconfigs)
+            .contains(&stop)
+        {
+            return;
+        }
         match stop {
             Stop::Done => self.close_settings(window, cx),
-            Stop::Reload | Stop::Revert => self.revert_settings(cx),
+            Stop::Reload | Stop::Revert => {
+                self.finish_threshold_entry(false, window, cx);
+                self.revert_settings(cx)
+            }
             Stop::SaveAnyway | Stop::Save => self.save_settings(None, window, cx),
-            Stop::Section(section) => self.show_settings_section(section, cx),
+            Stop::Section(section) => self.show_settings_section(section, window, cx),
             Stop::Appearance(appearance) => self.edit_settings(Change::Appearance(appearance), cx),
             Stop::DesktopNotifications => {
                 let file = self.model.read(cx).settings.clone();
@@ -411,6 +409,7 @@ impl Workspace {
                 self.edit_settings(Change::DesktopNotifications(!on), cx)
             }
             Stop::WatchMode(mode) => self.edit_settings(Change::WatchMode(mode), cx),
+            Stop::Threshold(stop) => self.activate_threshold_stop(stop, window, cx),
             Stop::Text(_)
             | Stop::RemoveKubeconfig(_)
             | Stop::AddKubeconfig
@@ -432,11 +431,13 @@ impl Workspace {
         if !self.settings_page.open {
             return None;
         }
+        let clusters = self.settings_clusters(cx);
         let model = self.model.read(cx);
         Some(settings_view::render(
             &self.settings_page,
             &model.settings,
             model.settings_error.is_some(),
+            &clusters,
             theme,
         ))
     }
@@ -448,19 +449,23 @@ impl Workspace {
 
     #[cfg(any(test, feature = "automation"))]
     pub(super) fn settings_view_state(&self, cx: &App) -> SettingsState {
+        let clusters = self.settings_clusters(cx);
         let model = self.model.read(cx);
         self.settings_page
-            .state(&model.settings, model.settings_error.is_some())
+            .state(&model.settings, model.settings_error.is_some(), &clusters)
     }
 
-    /// Whether Settings holds edits not yet written, a Save under way included: edits in the
-    /// draft, a field's invalid text (an edit that cannot be saved yet), or text typed while a
-    /// Save was being written.
-    pub(in crate::ui) fn has_settings_draft(&self) -> bool {
-        let fields = &self.settings_page.logs_paths;
+    /// Whether Settings holds edits not yet written, a Save under way included: the draft (its
+    /// rejected values too), a threshold being typed, or text typed while a Save was written.
+    pub(in crate::ui) fn has_settings_draft(&self, cx: &App) -> bool {
         self.settings_page.draft.is_dirty()
-            || !fields.errors.is_empty()
-            || !fields.typed_while_saving.is_empty()
+            || !self.settings_page.logs_paths.typed_while_saving.is_empty()
+            || self
+                .settings_page
+                .thresholds
+                .entry
+                .as_ref()
+                .is_some_and(|entry| entry.typed(cx).is_some())
     }
 
     /// Asks Save / Discard / Cancel about unsaved settings, if there are any; Save (once
@@ -484,7 +489,9 @@ impl Workspace {
         ending: &'static str,
         then: Then,
     ) -> bool {
-        if !self.has_settings_draft() {
+        // A threshold still being typed counts as an edit.
+        self.finish_threshold_entry(true, window, cx);
+        if !self.has_settings_draft(cx) {
             return false;
         }
         // A Save already on its way: close or quit once it is written, never before.
@@ -496,13 +503,13 @@ impl Workspace {
             return true;
         }
         let invalid = self.settings_invalid(cx);
-        let fields_invalid = !self.settings_page.logs_paths.errors.is_empty();
+        let rejected = self.settings_page.draft.has_rejected();
         let workspace = cx.weak_entity();
-        if invalid || fields_invalid {
+        if invalid || rejected {
             let why = if invalid {
                 "settings.toml is invalid"
             } else {
-                "a field in Settings has a value that cannot be saved"
+                "Some values in Settings are not accepted"
             };
             let text = DialogText {
                 title: "Discard unsaved settings?".into(),

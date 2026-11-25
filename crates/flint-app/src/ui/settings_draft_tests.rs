@@ -29,8 +29,8 @@ fn an_edit_shows_over_the_file_until_saved() {
     let mut draft = SettingsDraft::default();
     draft.edit(Change::Appearance(Appearance::Dark), &file);
     assert!(draft.is_dirty());
-    assert!(draft.is_edited(Field::Appearance));
-    assert!(!draft.is_edited(Field::WatchMode));
+    assert!(draft.is_edited(&Field::Appearance));
+    assert!(!draft.is_edited(&Field::WatchMode));
     let shown = draft.shown(&file);
     assert_eq!(shown.appearance, Appearance::Dark);
     assert_eq!(shown.watch_mode, file.watch_mode);
@@ -133,32 +133,19 @@ fn an_edit_stays_until_the_core_says_it_is_written() {
     // Only the watch mode was written; the appearance was edited again meanwhile.
     draft.edit(Change::Appearance(Appearance::Light), &file);
     draft.saved(&writes);
-    assert!(draft.is_edited(Field::Appearance));
-    assert!(!draft.is_edited(Field::WatchMode));
+    assert!(draft.is_edited(&Field::Appearance));
+    assert!(!draft.is_edited(&Field::WatchMode));
     assert_eq!(draft.shown(&file).appearance, Appearance::Light);
 }
 
-#[test]
-fn changes_map_to_the_core_writes() {
-    use flint_core::settings::SettingsWrite;
-    assert_eq!(
-        Change::Appearance(Appearance::Dark).into_write(None),
-        SettingsWrite::Appearance(Appearance::Dark)
-    );
-    assert_eq!(
-        Change::DesktopNotifications(true).into_write(None),
-        SettingsWrite::DesktopNotifications(true)
-    );
-    assert_eq!(
-        Change::WatchMode(WatchMode::OnView).into_write(None),
-        SettingsWrite::WatchMode(WatchMode::OnView)
-    );
-}
-
 // covers UP-127: only an edit that turns protection off loosens it; turning it back on leaves
-// nothing to confirm.
+// nothing to confirm. What is written carries the confirmation only when turning it off.
 #[test]
 fn only_turning_protection_off_loosens_it() {
+    let protect = |on| Change::ProtectLocalClusters {
+        on,
+        confirmed: None,
+    };
     let protected = Arc::new(Settings {
         protect_local_clusters: true,
         ..Settings::default()
@@ -166,48 +153,28 @@ fn only_turning_protection_off_loosens_it() {
     let mut draft = SettingsDraft::default();
     draft.edit(Change::LogBufferLines(5_000), &protected);
     assert!(!draft.loosens_protection());
-    draft.edit(Change::ProtectLocalClusters(false), &protected);
+    draft.edit(protect(false), &protected);
     assert!(draft.loosens_protection());
     assert!(!draft.shown(&protected).protect_local_clusters);
-    draft.edit(Change::ProtectLocalClusters(true), &protected);
+
+    let confirmed = flint_core::settings::SettingsRevision::of(&protected);
+    let writes = SettingsDraft::confirmed(&draft.edits(), Some(&confirmed));
+    assert!(writes.contains(&Change::ProtectLocalClusters {
+        on: false,
+        confirmed: Some(confirmed.clone()),
+    }));
+    assert!(writes.contains(&Change::LogBufferLines(5_000)));
+
+    draft.edit(protect(true), &protected);
     assert!(!draft.loosens_protection());
-    assert!(!draft.is_edited(Field::ProtectLocalClusters));
+    assert!(!draft.is_edited(&Field::ProtectLocalClusters));
 
     let mut draft = SettingsDraft::default();
-    draft.edit(Change::ProtectLocalClusters(true), &file());
+    draft.edit(protect(true), &file());
     assert!(!draft.loosens_protection(), "turning it on is no loosening");
-    let confirmed = flint_core::settings::SettingsRevision::of(&protected);
     assert_eq!(
-        Change::ProtectLocalClusters(false).into_write(Some(confirmed.clone())),
-        flint_core::settings::SettingsWrite::ProtectLocalClusters {
-            on: false,
-            confirmed: Some(confirmed.clone()),
-        }
-    );
-    assert_eq!(
-        Change::ProtectLocalClusters(true).into_write(Some(confirmed)),
-        flint_core::settings::SettingsWrite::ProtectLocalClusters {
-            on: true,
-            confirmed: None,
-        },
+        SettingsDraft::confirmed(&draft.edits(), Some(&confirmed)),
+        [protect(true)],
         "turning it on needs no confirmation"
     );
-}
-
-#[test]
-fn forget_drops_one_field_and_the_base_with_the_last() {
-    let file = file();
-    let mut draft = SettingsDraft::default();
-    draft.edit(Change::LogBufferMib(32), &file);
-    draft.edit(Change::Helm(Some("/opt/helm".into())), &file);
-    draft.forget(Field::LogBufferMib);
-    assert!(!draft.is_edited(Field::LogBufferMib));
-    assert!(draft.is_edited(Field::Helm));
-    draft.forget(Field::Helm);
-    assert!(!draft.is_dirty());
-    let other = Settings {
-        appearance: Appearance::Dark,
-        ..Settings::default()
-    };
-    assert!(!draft.changed_on_disk(&other), "no draft, no banner");
 }

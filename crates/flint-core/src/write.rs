@@ -24,7 +24,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use kube::Client;
-use kube::api::{DynamicObject, PostParams};
+use kube::api::{DynamicObject, Patch, PatchParams, PostParams};
 use serde_json::Value;
 
 use crate::ClusterId;
@@ -36,8 +36,9 @@ use crate::protection::WriteRefusal;
 use crate::read::{self, KindId, KindInfo};
 use crate::recheck::ContextPin;
 use crate::redact;
+use crate::secret_edit;
 use crate::write_actions;
-pub use crate::write_actions::{BlockedReason, DrainReport, ManagedPod, PodName};
+pub use crate::write_actions::{BlockedReason, DrainProgress, DrainReport, ManagedPod, PodName};
 
 /// How long one request of a write may take.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -46,9 +47,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const FIELD_MANAGER: &str = "flint";
 
 /// What a Secret's values read as in a review's diff.
-const HIDDEN_VALUE: &str = "<hidden>";
+pub(crate) const HIDDEN_VALUE: &str = "<hidden>";
 /// A hidden value the change replaces.
-const HIDDEN_CHANGED: &str = "<hidden, changed>";
+pub(crate) const HIDDEN_CHANGED: &str = "<hidden, changed>";
 
 /// The object a change is for, as the front end showed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +72,12 @@ pub struct WriteTarget {
 pub enum WriteProposal {
     /// Replace the object with this YAML.
     ApplyYaml {
+        yaml: String,
+    },
+    /// Create the object from this manifest, or replace it if it exists. One manifest for
+    /// several clusters: the fields a cluster's own copy carries (`uid`, `resourceVersion`,
+    /// `status` and the like) are left out, and each cluster's are used.
+    ApplyManifest {
         yaml: String,
     },
     Delete,
@@ -222,13 +229,26 @@ pub struct ReviewedEdit {
     pin: ContextPin,
     /// The credential it was reviewed with.
     credential: CredentialBinding,
+    /// The object to `PUT`. For a Secret, the edit as typed, masks and all: the merge patch is
+    /// built from it against the live object at each request ([`secret_edit`]).
     body: Value,
+    /// A Secret, whose masked values are kept: written as a merge patch of what changed.
+    secret: bool,
+    /// Whether it creates the object, which did not exist when reviewed: run, it is refused if
+    /// the object exists by then.
+    creates: bool,
     before: String,
     after: String,
 }
 
 impl ReviewedEdit {
+    /// Whether it creates the object rather than replacing it.
+    pub fn creates(&self) -> bool {
+        self.creates
+    }
+
     /// The live object as YAML, without `status` and `managedFields`, Secret values hidden.
+    /// Empty when it creates the object.
     pub fn before(&self) -> &str {
         &self.before
     }
@@ -421,7 +441,18 @@ impl CoreHandle {
             let mut gate = RequestGate::new(core.clone(), &target);
             let kind = kind_of(&core, &target).await?;
             let client = gate.client().await?;
-            let live = read_live(&client, &kind, &target).await?;
+            let live = match read_live(&client, &kind, &target).await {
+                // Only a manifest creates, and only an object that was never shown.
+                Err(WriteError::Gone) if creates_when_absent(&target, &proposal) => {
+                    let action = prepare_create(&mut gate, &kind, &target, proposal).await?;
+                    return Ok(WriteReview {
+                        target,
+                        action,
+                        warnings: Vec::new(),
+                    });
+                }
+                live => live?,
+            };
             let target = bound_to_live(target, &live)?;
             let mut warnings = warnings_for(&live);
             let action = prepare(&mut gate, &kind, &target, &live, proposal).await?;
@@ -445,6 +476,17 @@ impl CoreHandle {
         &self,
         intent: WriteIntent,
     ) -> impl Future<Output = Result<WriteOutcome, WriteError>> + Send + 'static {
+        self.run_write_telling(intent, None)
+    }
+
+    /// [`CoreHandle::run_write`], telling a drain's progress to `progress` as it runs. The
+    /// progress only reports: it changes nothing the drain does. `progress` is dropped once the
+    /// write has ended, so its receiver ends before the write's result is ready.
+    pub fn run_write_telling(
+        &self,
+        intent: WriteIntent,
+        progress: Option<async_channel::Sender<DrainProgress>>,
+    ) -> impl Future<Output = Result<WriteOutcome, WriteError>> + Send + 'static {
         let core = self.clone();
         let task = self.on_runtime(async move {
             check_bound(&intent)?;
@@ -452,7 +494,7 @@ impl CoreHandle {
             gate.pin = Some(intent.action.pin().clone());
             gate.credential = Some(intent.action.credential().clone());
             let kind = kind_of(&core, &intent.target).await?;
-            execute(&mut gate, &kind, intent).await
+            execute(&mut gate, &kind, intent, progress).await
         });
         async move { task.await.unwrap_or(Err(WriteRefusal::Stopped.into())) }
     }
@@ -597,6 +639,119 @@ fn check_bound(intent: &WriteIntent) -> Result<(), WriteError> {
     }
 }
 
+/// Whether a missing object is created rather than refused: a manifest, for a target that
+/// names no uid or version, so no object it was shown as.
+fn creates_when_absent(target: &WriteTarget, proposal: &WriteProposal) -> bool {
+    matches!(proposal, WriteProposal::ApplyManifest { .. })
+        && target.uid.is_none()
+        && target.resource_version.is_none()
+}
+
+/// The review of a manifest for an object that does not exist: a server dry run of its create.
+async fn prepare_create(
+    gate: &mut RequestGate,
+    kind: &KindInfo,
+    target: &WriteTarget,
+    proposal: WriteProposal,
+) -> Result<WriteAction, WriteError> {
+    let WriteProposal::ApplyManifest { yaml } = proposal else {
+        return Err(WriteError::Gone);
+    };
+    let body = edit_body(&portable_manifest(&yaml)?, kind, target)?;
+    let client = gate.client().await?;
+    let result = create(&client, kind, target, &body, true).await?;
+    let result = serde_json::to_value(&result)
+        .map_err(|e| WriteError::Failed(format!("cannot read the dry run: {e}")))?;
+    let result = with_type_of(result, &body);
+    Ok(WriteAction::ApplyYaml(ReviewedEdit {
+        bound: target.clone(),
+        pin: gate.reviewed_pin()?,
+        credential: gate.reviewed_credential()?,
+        before: String::new(),
+        after: shown_yaml(&result)?,
+        body,
+        secret: false,
+        creates: true,
+    }))
+}
+
+/// Fields of one cluster's copy of an object, which mean nothing on another. Owner references
+/// name owners by uid: kept, they would have another cluster's collector delete the object.
+const CLUSTER_OWNED_METADATA: [&str; 7] = [
+    "uid",
+    "ownerReferences",
+    "resourceVersion",
+    "creationTimestamp",
+    "generation",
+    "managedFields",
+    "selfLink",
+];
+
+/// `yaml` without the fields one cluster's copy carries, as YAML again: what a manifest for
+/// several clusters keeps. Not YAML, or not an object, is left for the review to refuse.
+pub fn portable_manifest(yaml: &str) -> Result<String, WriteError> {
+    let options = serde_saphyr::options! { with_snippet: false };
+    let Ok(mut body) = serde_saphyr::from_str_with_options::<Value>(yaml, options) else {
+        return Ok(yaml.to_owned());
+    };
+    let Some(fields) = body.as_object_mut() else {
+        return Ok(yaml.to_owned());
+    };
+    fields.remove("status");
+    if let Some(metadata) = fields.get_mut("metadata").and_then(Value::as_object_mut) {
+        for field in CLUSTER_OWNED_METADATA {
+            metadata.remove(field);
+        }
+    }
+    if is_service(&body)
+        && let Some(spec) = body.get_mut("spec").and_then(Value::as_object_mut)
+        // A headless Service's "None" is chosen, not allocated: every cluster keeps it.
+        && spec.get("clusterIP").and_then(Value::as_str) != Some(HEADLESS)
+    {
+        for field in SERVICE_ALLOCATED {
+            spec.remove(field);
+        }
+    }
+    render(&body)
+}
+
+/// The `clusterIP` of a headless Service.
+const HEADLESS: &str = "None";
+
+/// What a cluster allocates a Service: another cluster's would not be free, or would be another
+/// Service's.
+const SERVICE_ALLOCATED: [&str; 2] = ["clusterIP", "clusterIPs"];
+
+fn is_service(object: &Value) -> bool {
+    text_at(object, "/apiVersion") == Some("v1") && text_at(object, "/kind") == Some("Service")
+}
+
+/// A manifest replacing `live` keeps what this cluster gave the object, which the manifest left
+/// out ([`portable_manifest`]): its owners, and a Service's allocated addresses. Without them an
+/// unchanged apply would orphan a controller's object, or ask for new addresses.
+fn keep_destination_owned(body: &mut Value, live: &Value) {
+    if let (Some(owners), Some(metadata)) = (
+        live.pointer("/metadata/ownerReferences"),
+        body.get_mut("metadata").and_then(Value::as_object_mut),
+    ) && !metadata.contains_key("ownerReferences")
+    {
+        metadata.insert("ownerReferences".to_owned(), owners.clone());
+    }
+    if !is_service(body) {
+        return;
+    }
+    let Some(spec) = body.get_mut("spec").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for field in SERVICE_ALLOCATED {
+        if let Some(value) = live.pointer(&format!("/spec/{field}"))
+            && !spec.contains_key(field)
+        {
+            spec.insert(field.to_owned(), value.clone());
+        }
+    }
+}
+
 async fn prepare(
     gate: &mut RequestGate,
     kind: &KindInfo,
@@ -604,47 +759,81 @@ async fn prepare(
     live: &Value,
     proposal: WriteProposal,
 ) -> Result<WriteAction, WriteError> {
-    match proposal {
-        WriteProposal::ApplyYaml { yaml } => {
-            let mut body = edit_body(&yaml, kind, target)?;
-            keep_live_status(&mut body, live);
-            let client = gate.client().await?;
-            let result = replace(&client, kind, target, &body, true).await?;
-            let result = serde_json::to_value(&result)
-                .map_err(|e| WriteError::Failed(format!("cannot read the dry run: {e}")))?;
-            let result = with_type_of(result, &body);
-            Ok(WriteAction::ApplyYaml(ReviewedEdit {
-                bound: target.clone(),
-                pin: gate.reviewed_pin()?,
-                credential: gate.reviewed_credential()?,
-                before: shown_yaml(live)?,
-                after: shown_after(live, &result)?,
-                body,
-            }))
-        }
+    let (yaml, manifest) = match proposal {
+        WriteProposal::ApplyYaml { yaml } => (yaml, false),
+        WriteProposal::ApplyManifest { yaml } => (portable_manifest(&yaml)?, true),
         proposal => {
             let change = write_actions::review(kind, live, proposal)?;
             let reviewed = write_actions::reviewed(gate, &target.name, live, &change).await?;
-            Ok(WriteAction::Resource(ReviewedAction {
+            return Ok(WriteAction::Resource(ReviewedAction {
                 bound: target.clone(),
                 pin: gate.reviewed_pin()?,
                 credential: gate.reviewed_credential()?,
                 change,
                 reviewed,
-            }))
+            }));
         }
+    };
+    let mut body = edit_body(&yaml, kind, target)?;
+    if manifest {
+        keep_destination_owned(&mut body, live);
     }
+    let secret = redact::is_secret_object(live);
+    let result = if secret {
+        let patch = secret_edit::patch(&body, live, target)?;
+        let client = gate.client().await?;
+        patch_object(&client, kind, target, &patch, true).await?
+    } else {
+        keep_live_status(&mut body, live);
+        let client = gate.client().await?;
+        replace(&client, kind, target, &body, true).await?
+    };
+    let result = serde_json::to_value(&result)
+        .map_err(|e| WriteError::Failed(format!("cannot read the dry run: {e}")))?;
+    let result = with_type_of(result, &body);
+    Ok(WriteAction::ApplyYaml(ReviewedEdit {
+        bound: target.clone(),
+        pin: gate.reviewed_pin()?,
+        credential: gate.reviewed_credential()?,
+        before: shown_yaml(live)?,
+        after: shown_after(live, &result)?,
+        body,
+        secret,
+        creates: false,
+    }))
 }
 
 async fn execute(
     gate: &mut RequestGate,
     kind: &KindInfo,
     intent: WriteIntent,
+    progress: Option<async_channel::Sender<DrainProgress>>,
 ) -> Result<WriteOutcome, WriteError> {
     match &intent.action {
+        WriteAction::ApplyYaml(edit) if edit.secret && !edit.creates => {
+            // The patch is built from the Secret as it is now, which must still be the one
+            // reviewed: a mask keeps that object's value, not whatever is there later.
+            let client = gate.client().await?;
+            let live = read_live(&client, kind, &intent.target).await?;
+            let bound = bound_to_live(intent.target.clone(), &live)?;
+            if bound != intent.target || !redact::is_secret_object(&live) {
+                return Err(WriteError::Conflict);
+            }
+            let patch = secret_edit::patch(&edit.body, &live, &intent.target)?;
+            let client = gate.client().await?;
+            let written = patch_object(&client, kind, &intent.target, &patch, false).await?;
+            Ok(WriteOutcome {
+                resource_version: written.metadata.resource_version,
+                drain: None,
+            })
+        }
         WriteAction::ApplyYaml(edit) => {
             let client = gate.client().await?;
-            let written = replace(&client, kind, &intent.target, &edit.body, false).await?;
+            let written = if edit.creates {
+                create(&client, kind, &intent.target, &edit.body, false).await?
+            } else {
+                replace(&client, kind, &intent.target, &edit.body, false).await?
+            };
             Ok(WriteOutcome {
                 resource_version: written.metadata.resource_version,
                 drain: None,
@@ -657,6 +846,7 @@ async fn execute(
                 &intent.target,
                 action.change(),
                 &action.reviewed,
+                progress,
             )
             .await
         }
@@ -689,18 +879,106 @@ async fn replace(
         .map_err(write_error)
 }
 
+/// Sends a Secret's JSON Merge Patch. Its `uid` and `resourceVersion` are preconditions: a
+/// different object or version is a conflict. A refusal is worded without the server's message,
+/// which may quote a value ([`secret_edit::write_error`]).
+async fn patch_object(
+    client: &Client,
+    kind: &KindInfo,
+    target: &WriteTarget,
+    patch: &Value,
+    dry_run: bool,
+) -> Result<DynamicObject, WriteError> {
+    let params = PatchParams {
+        dry_run,
+        field_manager: Some(FIELD_MANAGER.to_owned()),
+        ..PatchParams::default()
+    };
+    let api = read::dynamic_api(
+        client,
+        kind,
+        target.namespace.as_deref(),
+        Some(&target.name),
+    )
+    .map_err(write_actions::ActionError::from)?;
+    tokio::time::timeout(
+        WRITE_TIMEOUT,
+        api.patch(&target.name, &params, &Patch::Merge(patch)),
+    )
+    .await
+    .map_err(|_| timed_out())?
+    .map_err(|error| secret_edit::write_error(error, patch))
+}
+
+/// Creates the object `body` describes, which `target` names. An object of that name by then
+/// is a conflict: the server refuses the create. A Secret is refused while it holds a mask or a
+/// placeholder, and its refusal is worded without the server's message, which may quote a value.
+async fn create(
+    client: &Client,
+    kind: &KindInfo,
+    target: &WriteTarget,
+    body: &Value,
+    dry_run: bool,
+) -> Result<DynamicObject, WriteError> {
+    let secret = redact::is_secret_object(body);
+    if secret {
+        secret_edit::check_new(body)?;
+    }
+    let object: DynamicObject = serde_json::from_value(body.clone())
+        .map_err(|e| WriteError::InvalidYaml(format!("not a Kubernetes object: {e}")))?;
+    let params = PostParams {
+        dry_run,
+        field_manager: Some(FIELD_MANAGER.to_owned()),
+    };
+    let api = read::dynamic_api(
+        client,
+        kind,
+        target.namespace.as_deref(),
+        Some(&target.name),
+    )
+    .map_err(write_actions::ActionError::from)?;
+    tokio::time::timeout(WRITE_TIMEOUT, api.create(&params, &object))
+        .await
+        .map_err(|_| timed_out())?
+        .map_err(|error| {
+            if secret {
+                secret_edit::write_error(error, body)
+            } else {
+                write_error(error)
+            }
+        })
+}
+
+fn is_secret_kind(kind: &KindInfo) -> bool {
+    kind.api_version() == "v1" && kind.kind() == "Secret"
+}
+
+/// Why `yaml` did not parse. For a Secret only where: the parser's words can quote any of its
+/// text, quoted or not (a duplicate key from a pasted value, say).
+fn yaml_error(error: &serde_saphyr::Error, secret: bool) -> WriteError {
+    if !secret {
+        return WriteError::InvalidYaml(format!(
+            "not valid YAML: {}",
+            redact::redact_quoted(&error.to_string())
+        ));
+    }
+    let at = error.location().map_or_else(String::new, |at| {
+        format!(" at line {}, column {}", at.line(), at.column())
+    });
+    WriteError::InvalidYaml(format!(
+        "not valid YAML{at}; the parser's message is not shown, because it may quote a Secret \
+         value"
+    ))
+}
+
 /// The body to `PUT` for `yaml`: the same object as `target`, at the version reviewed. An edit
 /// cannot move it to another name, namespace or kind, or drop the version that makes a
 /// concurrent change a conflict.
 fn edit_body(yaml: &str, kind: &KindInfo, target: &WriteTarget) -> Result<Value, WriteError> {
     // No source snippet, and no quoted scalars: the text can be a Secret's.
     let options = serde_saphyr::options! { with_snippet: false };
-    let mut body: Value = serde_saphyr::from_str_with_options(yaml, options).map_err(|e| {
-        WriteError::InvalidYaml(format!(
-            "not valid YAML: {}",
-            redact::redact_quoted(&e.to_string())
-        ))
-    })?;
+    let mut body: Value = serde_saphyr::from_str_with_options(yaml, options)
+        .map_err(|e| yaml_error(&e, is_secret_kind(kind)))?;
     if !body.is_object() {
         return Err(WriteError::InvalidYaml(
             "not a Kubernetes object".to_owned(),

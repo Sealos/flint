@@ -1,3 +1,6 @@
 /target
 /.dev
 .DS_Store
+.scratch-target
+target-scratch
+.target-scratch

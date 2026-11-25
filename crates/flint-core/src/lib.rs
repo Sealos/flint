@@ -45,6 +45,7 @@ mod recheck;
 pub mod recordings;
 pub mod redact;
 pub mod rollout;
+pub mod secret_edit;
 pub mod settings;
 pub mod store;
 pub mod table;

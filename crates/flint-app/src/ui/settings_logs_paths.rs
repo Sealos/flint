@@ -4,7 +4,8 @@
 //!
 //! The limits and the two overrides are text fields ([`TextField`]). What is typed is checked as
 //! it is typed ([`TextField::parse`]): a valid value is an edit in the draft, an invalid one is
-//! an error under its field, which keeps Save disabled until it is fixed or reverted. Each field
+//! held in the draft as rejected, with why under its field; Save then shows that field instead
+//! of writing, until it is fixed or reverted. Each field
 //! also has a registered action (`settings::EditLogBufferLines`, ...), so the palette and
 //! automation set the same draft. The kubeconfig files are a list: Add… opens a file picker,
 //! Remove drops one.
@@ -14,7 +15,7 @@
 
 // module-tests: settings_logs_paths_tests.rs
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -310,12 +311,10 @@ pub fn with_kubeconfig(
 }
 
 /// What these sections hold beside the draft: their inputs, once Settings has been opened in a
-/// window, and what is wrong with each field.
+/// window. A field's text that is not valid is in the draft, as rejected.
 #[derive(Default)]
 pub struct LogsPathsFields {
     pub inputs: Option<Inputs>,
-    /// Why a field's text is not valid. While any is set, Save is disabled.
-    pub errors: BTreeMap<TextField, String>,
     /// Why the last kubeconfig file could not be added.
     pub kubeconfig_note: Option<String>,
     /// Put what the view shows into every field once, the focused one too (Revert, Reload).
@@ -393,7 +392,7 @@ fn text_input(
     theme: &Theme,
 ) -> Option<impl IntoElement + use<>> {
     let input = page.logs_paths.input(field)?;
-    let error = page.logs_paths.errors.get(&field).cloned();
+    let error = page.draft.rejected(&field.field()).map(|r| r.why.clone());
     let on = page.cursor == Some(Stop::Text(field));
     let border = if error.is_some() {
         theme.danger
@@ -464,7 +463,7 @@ fn error_id(field: TextField) -> &'static str {
 pub fn logs_body(page: &SettingsPage, theme: &Theme) -> Vec<AnyElement> {
     let draft = &page.draft;
     let block = |field: TextField, title, text| {
-        group(title, text, draft.is_edited(field.field()), theme)
+        group(title, text, draft.is_edited(&field.field()), theme)
             .children(text_input(page, field, theme))
     };
     vec![
@@ -481,7 +480,6 @@ pub fn logs_body(page: &SettingsPage, theme: &Theme) -> Vec<AnyElement> {
             "The most memory each log tab's lines may take, from 8 to 1,024 MiB; whichever \
              limit comes first applies. Applies to log tabs opened after Save.",
         )
-        .mt_4()
         .into_any_element(),
         block(
             TextField::LogTotalMib,
@@ -490,7 +488,6 @@ pub fn logs_body(page: &SettingsPage, theme: &Theme) -> Vec<AnyElement> {
              background tabs drop their oldest lines first. Never below one tab's own limit. \
              Applies at Save.",
         )
-        .mt_4()
         .into_any_element(),
     ]
 }
@@ -505,7 +502,7 @@ pub fn paths_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> Vec<A
             "Extra kubeconfig files",
             "Loaded after KUBECONFIG or ~/.kube/config, in this order. Clusters reload after \
              Save, as after editing settings.toml by hand.",
-            draft.is_edited(Field::KubeconfigPaths),
+            draft.is_edited(&Field::KubeconfigPaths),
             theme,
         )
         .into_any_element(),
@@ -513,7 +510,6 @@ pub fn paths_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> Vec<A
     if paths.is_empty() {
         rows.push(
             div()
-                .mt_2()
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .child("None")
@@ -525,8 +521,6 @@ pub fn paths_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> Vec<A
         h_flex()
             .id(("settings-kubeconfig-path", index))
             .max_w(px(560.))
-            .when(index == 0, |el| el.mt_2())
-            .when(index > 0, |el| el.mt_1())
             .gap_2()
             .child(
                 div()
@@ -553,7 +547,6 @@ pub fn paths_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> Vec<A
     }));
     rows.push(
         v_flex()
-            .mt_1()
             .gap_1()
             .child(
                 h_flex().child(ring(
@@ -584,10 +577,9 @@ pub fn paths_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> Vec<A
             "PATH",
             "Where Flint finds kubectl plugins, helm and credential helpers: absolute folders \
              separated by colons. Empty uses the login shell's PATH. Applies after a restart.",
-            draft.is_edited(Field::Path),
+            draft.is_edited(&Field::Path),
             theme,
         )
-        .mt_4()
         .children(text_input(page, TextField::Path, theme))
         .into_any_element(),
     );
@@ -595,10 +587,9 @@ pub fn paths_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> Vec<A
         group(
             "helm",
             "The helm binary for Helm releases. Empty finds helm on PATH.",
-            draft.is_edited(Field::Helm),
+            draft.is_edited(&Field::Helm),
             theme,
         )
-        .mt_4()
         .children(text_input(page, TextField::Helm, theme))
         .into_any_element(),
     );
@@ -629,7 +620,9 @@ pub fn content_row(stop: Stop, kubeconfigs: usize) -> Option<usize> {
         | Stop::Revert
         | Stop::SaveAnyway
         | Stop::Save
-        | Stop::Section(_) => None,
+        | Stop::Section(_)
+        // Thresholds bring their own controls into view.
+        | Stop::Threshold(_) => None,
     }
 }
 
@@ -664,7 +657,7 @@ pub fn safety_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> AnyE
          on this machine) start unlocked, so Flint changes them without asking for an unlock. \
          Turn this on to gate writes to them like any other cluster. Other clusters stay \
          protected either way.",
-        draft.is_edited(Field::ProtectLocalClusters),
+        draft.is_edited(&Field::ProtectLocalClusters),
         theme,
     )
     .child(

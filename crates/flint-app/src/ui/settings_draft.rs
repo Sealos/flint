@@ -3,172 +3,62 @@
 //! The draft holds only the fields the user changed, each with its new value, over the file as
 //! the core last reported it. What the view shows is the file with the edits on top
 //! ([`SettingsDraft::shown`]), so without edits it simply follows the file. Save writes the
-//! edited fields alone ([`SettingsDraft::edits`]), each through its own setter, so a change made
-//! elsewhere to another field survives; they leave the draft only once the core says they are
+//! edited fields alone ([`SettingsDraft::edits`]), all in one save, so a change made elsewhere
+//! to another field survives; they leave the draft only once the core says they are
 //! written ([`SettingsDraft::saved`]). The draft also remembers the file it was started over:
 //! when the file changes under a pending draft ([`SettingsDraft::changed_on_disk`]), the view
 //! says so and offers Reload or Save anyway.
 //!
-//! A slice that adds a setting adds a [`Field`] and a [`Change`] variant; nothing else here
-//! changes.
+//! A value typed into a field that its setting does not accept is held too
+//! ([`SettingsDraft::reject`]), with why: it shows where it was typed and blocks Save until it
+//! is fixed or reverted.
+//!
+//! An edit is the core's own [`SettingsWrite`] (here [`Change`]), keyed by its
+//! [`SettingsField`] (here [`Field`]): a slice that adds a setting extends those in
+//! `flint_core::settings`, and nothing here changes.
+//!
+//! [`SettingsWrite`]: flint_core::settings::SettingsWrite
+//! [`SettingsField`]: flint_core::settings::SettingsField
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use flint_core::settings::{SettingsRevision, SettingsWrite};
-use flint_core::{Appearance, Settings, WatchMode};
+use flint_core::Settings;
+use flint_core::settings::SettingsRevision;
+pub use flint_core::settings::{SettingsField as Field, SettingsWrite as Change};
 
-/// A setting the Settings view edits. Save writes the edits in this order and stops at the
-/// first that fails, so local cluster protection comes first: turning it on lands before
-/// anything else can fail, and turning it off (refused without a file lock) fails before
-/// anything else is written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Field {
-    ProtectLocalClusters,
-    Appearance,
-    DesktopNotifications,
-    WatchMode,
-    LogBufferLines,
-    LogBufferMib,
-    LogTotalMib,
-    KubeconfigPaths,
-    Path,
-    Helm,
-}
-
-impl Field {
-    /// The `settings.toml` key it is stored under.
-    #[cfg(any(test, feature = "automation"))]
-    pub fn key(self) -> &'static str {
-        match self {
-            Field::Appearance => "appearance",
-            Field::DesktopNotifications => "desktop_notifications",
-            Field::WatchMode => "watch_mode",
-            Field::LogBufferLines => "log_buffer_lines",
-            Field::LogBufferMib => "log_buffer_mib",
-            Field::LogTotalMib => "log_total_mib",
-            Field::KubeconfigPaths => "kubeconfig_paths",
-            Field::Path => "path",
-            Field::Helm => "helm",
-            Field::ProtectLocalClusters => "protect_local_clusters",
-        }
-    }
-}
-
-/// One edit: a field and the value it gets.
+/// Text typed for a field that its setting does not accept.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Change {
-    Appearance(Appearance),
-    DesktopNotifications(bool),
-    /// The global watch mode. A cluster's own override is not this.
-    WatchMode(WatchMode),
-    LogBufferLines(u32),
-    LogBufferMib(u32),
-    LogTotalMib(u32),
-    /// The whole list of extra kubeconfig files, in order.
-    KubeconfigPaths(Vec<PathBuf>),
-    /// The `PATH` override; `None` is the login shell's.
-    Path(Option<String>),
-    /// The `helm` binary; `None` is the one on `PATH`.
-    Helm(Option<PathBuf>),
-    /// Turning it off loosens the write gate: Save asks first
-    /// ([`SettingsDraft::loosens_protection`]).
-    ProtectLocalClusters(bool),
-}
-
-impl Change {
-    pub fn field(&self) -> Field {
-        match self {
-            Change::Appearance(_) => Field::Appearance,
-            Change::DesktopNotifications(_) => Field::DesktopNotifications,
-            Change::WatchMode(_) => Field::WatchMode,
-            Change::LogBufferLines(_) => Field::LogBufferLines,
-            Change::LogBufferMib(_) => Field::LogBufferMib,
-            Change::LogTotalMib(_) => Field::LogTotalMib,
-            Change::KubeconfigPaths(_) => Field::KubeconfigPaths,
-            Change::Path(_) => Field::Path,
-            Change::Helm(_) => Field::Helm,
-            Change::ProtectLocalClusters(_) => Field::ProtectLocalClusters,
-        }
-    }
-
-    /// Whether `settings` already have this value.
-    pub fn holds_in(&self, settings: &Settings) -> bool {
-        match self {
-            Change::Appearance(a) => settings.appearance == *a,
-            Change::DesktopNotifications(on) => settings.desktop_notifications == *on,
-            Change::WatchMode(m) => settings.watch_mode == *m,
-            Change::LogBufferLines(n) => settings.log_buffer_lines == *n,
-            Change::LogBufferMib(n) => settings.log_buffer_mib == *n,
-            Change::LogTotalMib(n) => settings.log_total_mib == *n,
-            Change::KubeconfigPaths(paths) => settings.kubeconfig_paths == *paths,
-            Change::Path(path) => settings.path == *path,
-            Change::Helm(helm) => settings.helm == *helm,
-            Change::ProtectLocalClusters(on) => settings.protect_local_clusters == *on,
-        }
-    }
-
-    /// What it changes, for a message.
-    pub fn what(&self) -> &'static str {
-        self.clone().into_write(None).what()
-    }
-
-    /// The core's write for it. Turning local cluster protection off carries `confirmed`, the
-    /// revision of the settings the person confirmed it over; the core refuses it without one,
-    /// or over a file changed since.
-    pub fn into_write(self, confirmed: Option<SettingsRevision>) -> SettingsWrite {
-        match self {
-            Change::Appearance(a) => SettingsWrite::Appearance(a),
-            Change::DesktopNotifications(on) => SettingsWrite::DesktopNotifications(on),
-            Change::WatchMode(m) => SettingsWrite::WatchMode(m),
-            Change::LogBufferLines(n) => SettingsWrite::LogBufferLines(n),
-            Change::LogBufferMib(n) => SettingsWrite::LogBufferMib(n),
-            Change::LogTotalMib(n) => SettingsWrite::LogTotalMib(n),
-            Change::KubeconfigPaths(paths) => SettingsWrite::KubeconfigPaths(paths),
-            Change::Path(path) => SettingsWrite::Path(path),
-            Change::Helm(helm) => SettingsWrite::Helm(helm),
-            Change::ProtectLocalClusters(on) => SettingsWrite::ProtectLocalClusters {
-                on,
-                confirmed: confirmed.filter(|_| !on),
-            },
-        }
-    }
-
-    /// Puts it into `settings`, as writing it puts it into the file.
-    pub fn apply(&self, settings: &mut Settings) {
-        match self {
-            Change::Appearance(a) => settings.appearance = *a,
-            Change::DesktopNotifications(on) => settings.desktop_notifications = *on,
-            Change::WatchMode(m) => settings.watch_mode = *m,
-            Change::LogBufferLines(n) => settings.log_buffer_lines = *n,
-            Change::LogBufferMib(n) => settings.log_buffer_mib = *n,
-            Change::LogTotalMib(n) => settings.log_total_mib = *n,
-            Change::KubeconfigPaths(paths) => settings.kubeconfig_paths = paths.clone(),
-            Change::Path(path) => settings.path = path.clone(),
-            Change::Helm(helm) => settings.helm = helm.clone(),
-            Change::ProtectLocalClusters(on) => settings.protect_local_clusters = *on,
-        }
-    }
+pub struct Rejected {
+    pub text: String,
+    /// Why, as the field's inline error says it.
+    pub why: String,
 }
 
 /// The edits not saved yet, and the file they were made over.
 #[derive(Debug, Clone, Default)]
 pub struct SettingsDraft {
     edits: BTreeMap<Field, Change>,
+    /// Values typed that their setting does not accept: they block Save.
+    rejected: BTreeMap<Field, Rejected>,
     /// The file as it was when the first edit was made; `None` without edits.
     base: Option<Arc<Settings>>,
 }
 
 impl SettingsDraft {
-    /// Whether anything waits for Save.
+    /// Whether anything waits for Save, a rejected value included.
     pub fn is_dirty(&self) -> bool {
-        !self.edits.is_empty()
+        !self.edits.is_empty() || !self.rejected.is_empty()
+    }
+
+    /// Whether the edits can be saved: there are some, and no value typed is rejected.
+    pub fn is_ready(&self) -> bool {
+        !self.edits.is_empty() && self.rejected.is_empty()
     }
 
     /// Records `change` over `file`, the settings as the core last reported them. A value the
     /// file already has drops that field's edit, so changing a control back leaves nothing to
-    /// save.
+    /// save. It replaces a value rejected for the field.
     pub fn edit(&mut self, change: Change, file: &Arc<Settings>) {
         self.edit_over(change, Some(file), file);
     }
@@ -177,28 +67,69 @@ impl SettingsDraft {
     /// what it holds once writes the core acknowledged land, or `None` when that is unknown and
     /// the edit is kept whatever its value.
     pub fn edit_over(&mut self, change: Change, holding: Option<&Settings>, file: &Arc<Settings>) {
-        if self.edits.is_empty() {
-            self.base = Some(file.clone());
-        }
+        self.start(file);
+        let field = change.field();
+        self.rejected.remove(&field);
         if holding.is_some_and(|held| change.holds_in(held)) {
-            self.edits.remove(&change.field());
+            self.edits.remove(&field);
         } else {
-            self.edits.insert(change.field(), change);
+            self.edits.insert(field, change);
         }
-        if self.edits.is_empty() {
-            self.base = None;
-        }
+        self.settle();
     }
 
-    /// Whether `field` has an edit.
-    pub fn is_edited(&self, field: Field) -> bool {
-        self.edits.contains_key(&field)
+    /// Records `text`, typed for `field`, as a value its setting does not accept, and why. The
+    /// field's edit, if any, is dropped: the view shows the file's value under the text.
+    pub fn reject(&mut self, field: Field, text: String, why: String, file: &Arc<Settings>) {
+        self.start(file);
+        self.edits.remove(&field);
+        self.rejected.insert(field, Rejected { text, why });
     }
 
-    /// The edited fields, in a stable order.
+    /// The value rejected for `field`, if any.
+    pub fn rejected(&self, field: &Field) -> Option<&Rejected> {
+        self.rejected.get(field)
+    }
+
+    /// Whether a value typed is rejected, which blocks Save.
+    pub fn has_rejected(&self) -> bool {
+        !self.rejected.is_empty()
+    }
+
+    /// Keeps only the rejected values whose field `keep` accepts: one for an override that no
+    /// longer applies to any cluster has nowhere to be fixed.
+    pub fn retain_rejected(&mut self, mut keep: impl FnMut(&Field) -> bool) {
+        self.rejected.retain(|field, _| keep(field));
+        self.settle();
+    }
+
+    /// Drops the edit and the rejected value of every field `forget` names.
+    pub fn forget(&mut self, mut forget: impl FnMut(&Field) -> bool) {
+        self.edits.retain(|field, _| !forget(field));
+        self.rejected.retain(|field, _| !forget(field));
+        self.settle();
+    }
+
+    /// Every rejected value, in a stable order.
     #[cfg(any(test, feature = "automation"))]
-    pub fn edited(&self) -> impl Iterator<Item = Field> + '_ {
-        self.edits.keys().copied()
+    pub fn all_rejected(&self) -> impl Iterator<Item = (&Field, &Rejected)> + '_ {
+        self.rejected.iter()
+    }
+
+    /// Whether `field` has an edit or a rejected value.
+    pub fn is_edited(&self, field: &Field) -> bool {
+        self.edits.contains_key(field) || self.rejected.contains_key(field)
+    }
+
+    /// Every field with an edit or a rejected value.
+    pub fn touched(&self) -> impl Iterator<Item = &Field> + '_ {
+        self.edits.keys().chain(self.rejected.keys())
+    }
+
+    /// The edited fields, in a stable order. Rejected values are not among them.
+    #[cfg(any(test, feature = "automation"))]
+    pub fn edited(&self) -> impl Iterator<Item = &Field> + '_ {
+        self.edits.keys()
     }
 
     /// What the view shows: `file` with the edits on top.
@@ -216,17 +147,10 @@ impl SettingsDraft {
         self.base.as_deref().is_some_and(|base| base != file)
     }
 
-    /// Drops the edit of `field`, if any: its control no longer shows a value that can be saved.
-    pub fn forget(&mut self, field: Field) {
-        self.edits.remove(&field);
-        if self.edits.is_empty() {
-            self.base = None;
-        }
-    }
-
-    /// Drops every edit (Revert, Reload, Discard).
+    /// Drops every edit and rejected value (Revert, Reload, Discard).
     pub fn revert(&mut self) {
         self.edits.clear();
+        self.rejected.clear();
         self.base = None;
     }
 
@@ -238,7 +162,25 @@ impl SettingsDraft {
     /// Whether saving would turn local cluster protection off: Save asks first, whatever the
     /// file says now, so an edit made over another file never loosens it unasked.
     pub fn loosens_protection(&self) -> bool {
-        self.edits.get(&Field::ProtectLocalClusters) == Some(&Change::ProtectLocalClusters(false))
+        matches!(
+            self.edits.get(&Field::ProtectLocalClusters),
+            Some(Change::ProtectLocalClusters { on: false, .. })
+        )
+    }
+
+    /// `edits` as the core is to write them: turning protection off carries `confirmed`, the
+    /// settings it was confirmed over, without which the core refuses it.
+    pub fn confirmed(edits: &[Change], confirmed: Option<&SettingsRevision>) -> Vec<Change> {
+        edits
+            .iter()
+            .map(|change| match change {
+                Change::ProtectLocalClusters { on: false, .. } => Change::ProtectLocalClusters {
+                    on: false,
+                    confirmed: confirmed.cloned(),
+                },
+                other => other.clone(),
+            })
+            .collect()
     }
 
     /// Drops `written`, now in the file, from the draft. An edit changed since is kept.
@@ -248,7 +190,25 @@ impl SettingsDraft {
                 self.edits.remove(&change.field());
             }
         }
-        if self.edits.is_empty() {
+        self.settle();
+    }
+
+    /// Starts a draft over `file`, if none is started: an edit that follows is over it, not over
+    /// the file as it is by then, so a change in between shows as made on disk.
+    pub fn begin(&mut self, file: &Arc<Settings>) {
+        self.start(file);
+    }
+
+    /// Remembers the file a draft starts over.
+    fn start(&mut self, file: &Arc<Settings>) {
+        if self.base.is_none() {
+            self.base = Some(file.clone());
+        }
+    }
+
+    /// Forgets the file once nothing waits.
+    fn settle(&mut self) {
+        if !self.is_dirty() {
             self.base = None;
         }
     }

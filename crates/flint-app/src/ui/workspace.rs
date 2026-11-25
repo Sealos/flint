@@ -1089,6 +1089,7 @@ impl Workspace {
             None,
             guard,
             begin,
+            |_, _| {},
             move |result, cx| {
                 // First, and outside the window: a closed one must not keep the object claimed.
                 resource_actions::release(&key, cx);
@@ -3866,6 +3867,9 @@ impl Render for Workspace {
         self.sync_namespace_picker_with_dialog(window, cx);
         self.close_finished_held_edit(window, cx);
         self.settings_follow_main();
+        self.flush_threshold_entry(cx);
+        self.follow_threshold_rows(cx);
+        self.close_orphaned_threshold_entry(window, cx);
         self.sync_settings_fields(window, cx);
         let window_width = f32::from(window.viewport_size().width);
         let window_height = f32::from(window.viewport_size().height);
@@ -4081,6 +4085,9 @@ mod settings_logs_paths;
 
 #[path = "workspace_sets.rs"]
 mod sets;
+
+#[path = "workspace_thresholds.rs"]
+mod thresholds_entry;
 
 #[cfg(test)]
 #[path = "keyboard_tests.rs"]

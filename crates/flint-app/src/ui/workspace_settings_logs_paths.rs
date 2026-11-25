@@ -29,8 +29,17 @@ use super::super::settings_logs_paths::{
     TextField, UNPROTECT_ON_DISK, UNPROTECT_STALE, UNPROTECT_TEXT, UNPROTECT_TITLE, content_row,
     with_kubeconfig,
 };
-use super::super::settings_view::{self, Stop, Then};
+use super::super::settings_view::{self, Section, Stop, Then};
 use super::Workspace;
+
+/// The edit that turns local cluster protection on or off. Turning it off is confirmed at Save,
+/// which adds what it was confirmed over.
+fn protect(on: bool) -> Change {
+    Change::ProtectLocalClusters {
+        on,
+        confirmed: None,
+    }
+}
 
 /// The user's home folder, to check paths that start with `~`.
 fn home() -> Option<PathBuf> {
@@ -84,7 +93,7 @@ impl Workspace {
         })
         .bind::<ChooseKubeconfigPaths>(|ws, _, _, cx| ws.choose_kubeconfig_paths(cx))
         .bind::<EditProtectLocalClusters>(|ws, action, _, cx| {
-            ws.edit_settings(Change::ProtectLocalClusters(action.enabled), cx)
+            ws.edit_settings(protect(action.enabled), cx)
         })
     }
 
@@ -159,7 +168,7 @@ impl Workspace {
             .iter()
             .filter(|(field, _)| {
                 Some(*field) != focused
-                    && !page.logs_paths.errors.contains_key(field)
+                    && page.draft.rejected(&field.field()).is_none()
                     && !page.logs_paths.typed_while_saving.contains(field)
             })
             .filter_map(|(field, input)| {
@@ -252,14 +261,11 @@ impl Workspace {
         let file = self.model.read(cx).settings.clone();
         let page = &mut self.settings_page;
         match field.parse(text, home().as_deref()) {
-            Ok(change) => {
-                page.logs_paths.errors.remove(&field);
-                page.draft.edit_over(change, holding, &file);
-            }
-            Err(why) => {
-                page.logs_paths.errors.insert(field, why);
-                page.draft.forget(field.field());
-            }
+            // An accepted value replaces one rejected before.
+            Ok(change) => page.draft.edit_over(change, holding, &file),
+            Err(why) => page
+                .draft
+                .reject(field.field(), text.to_owned(), why, &file),
         }
         page.save_note = None;
         cx.notify();
@@ -292,21 +298,35 @@ impl Workspace {
         }
     }
 
-    /// Shows the first field whose text is invalid: its section, the keyboard cursor and focus on
-    /// it, scrolled into view. What Save does while one is.
+    /// Shows the first value rejected: its section and, for a field of these sections, the
+    /// keyboard cursor and focus on it, scrolled into view. What Save does while one is.
     pub(super) fn show_settings_field_error(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(field) = self.settings_page.logs_paths.errors.keys().next().copied() else {
+        let draft = &self.settings_page.draft;
+        let Some(rejected) = draft
+            .touched()
+            .find(|field| draft.rejected(field).is_some())
+            .cloned()
+        else {
             return;
         };
-        self.settings_page.section = field.section();
-        self.settings_page.cursor = Some(Stop::Text(field));
-        self.scroll_to_settings_cursor(cx);
-        self.focus_settings_stop(window, cx);
+        if let Some(field) = TextField::ALL.into_iter().find(|f| f.field() == rejected) {
+            self.settings_page.section = field.section();
+            self.settings_page.cursor = Some(Stop::Text(field));
+            self.scroll_to_settings_cursor(cx);
+            self.focus_settings_stop(window, cx);
+        } else if let Some(section) = Section::ALL.into_iter().find(|s| s.holds(&rejected)) {
+            self.show_settings_section(section, window, cx);
+        }
         cx.notify();
+    }
+
+    /// How many files the Paths section lists, as shown.
+    pub(super) fn settings_kubeconfigs(&self, cx: &App) -> usize {
+        self.settings_shown(cx).kubeconfig_paths.len()
     }
 
     /// Scrolls the section so the control under the keyboard cursor is in view.
@@ -314,8 +334,7 @@ impl Workspace {
         let Some(stop) = self.settings_page.cursor else {
             return;
         };
-        let kubeconfigs = self.settings_shown(cx).kubeconfig_paths.len();
-        if let Some(row) = content_row(stop, kubeconfigs) {
+        if let Some(row) = content_row(stop, self.settings_kubeconfigs(cx)) {
             self.settings_page.scroll.scroll_to_item(row);
         }
     }
@@ -427,7 +446,7 @@ impl Workspace {
             Stop::AddKubeconfig => self.choose_kubeconfig_paths(cx),
             Stop::ProtectLocalClusters => {
                 let on = self.settings_shown(cx).protect_local_clusters;
-                self.edit_settings(Change::ProtectLocalClusters(!on), cx);
+                self.edit_settings(protect(!on), cx);
             }
             _ => {}
         }

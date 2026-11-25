@@ -162,6 +162,30 @@ pub fn open_gated(
     );
 }
 
+/// [`open_gated`], which also closes and runs nothing once `guard` stops holding.
+pub(in crate::ui) fn open_gated_guarded(
+    window: &mut Window,
+    cx: &mut App,
+    dialog: DialogText,
+    content: AnyView,
+    guard: ConnectionGuard,
+    state: impl Fn(&App) -> ConfirmState + 'static,
+    on_ok: impl Fn(&mut Window, &mut App) -> bool + 'static,
+) {
+    debug_assert!(!dialog.default_cancel);
+    let gate: Gate = Rc::new(state);
+    open_dialog(
+        window,
+        cx,
+        dialog,
+        0,
+        Some(content),
+        Some(gate),
+        Some(guard),
+        on_ok,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn open_dialog(
     window: &mut Window,
@@ -224,7 +248,7 @@ fn open_dialog(
         };
         #[cfg(feature = "automation")]
         let alert = alert.entrance(gpui_kit::component::dialog::DialogEntrance::None);
-        alert
+        modal(alert)
             .confirm()
             .title(dialog.title.clone())
             .description(
@@ -346,7 +370,7 @@ pub fn open_with_alternative(
         let (live_ok, live_cancel, live_alternative) = (live.clone(), live.clone(), live.clone());
         #[cfg(feature = "automation")]
         let alert = alert.entrance(gpui_kit::component::dialog::DialogEntrance::None);
-        alert
+        modal(alert)
             .confirm()
             .title(dialog.title.clone())
             .description(
@@ -745,6 +769,14 @@ pub fn title_name(name: &str) -> String {
     fit_value("", name, &|shown: &str| {
         shown.chars().count() <= TITLE_NAME_CHARS
     })
+}
+
+/// What every confirmation shares: centred in the window, whatever its height, over the dimmed
+/// content behind it.
+fn modal(
+    alert: gpui_kit::component::dialog::AlertDialog,
+) -> gpui_kit::component::dialog::AlertDialog {
+    alert.centered()
 }
 
 /// The lines that stay on show, each on one line, measured so the text under them takes only the

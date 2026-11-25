@@ -351,7 +351,7 @@ async fn quit_while_a_save_is_pending_waits_for_it(cx: &mut TestAppContext) {
     let pending = cx
         .update_window(t.window, |_, window, cx| {
             super::registry::dispatch("settings::SaveSettings", Value::Null, window, cx).unwrap();
-            let pending = workspace.read(cx).has_settings_draft();
+            let pending = workspace.read(cx).has_settings_draft(cx);
             super::registry::dispatch("flint::Quit", Value::Null, window, cx).unwrap();
             pending
         })
@@ -403,13 +403,19 @@ async fn the_keyboard_alone_changes_and_saves_a_setting(cx: &mut TestAppContext)
     let dir = tempfile::tempdir().unwrap();
     let t = open_settings(cx, dir.path()).await;
     t.press(cx, "tab");
-    assert_eq!(state(cx, &t).settings.cursor, Some("settings-close"));
+    assert_eq!(
+        state(cx, &t).settings.cursor.as_deref(),
+        Some("settings-close")
+    );
     // Done, the sections, then System, Light and Dark.
     for _ in 0..super::settings_view::Section::ALL.len() + 3 {
         t.press(cx, "tab");
     }
     let s = state(cx, &t);
-    assert_eq!(s.settings.cursor, Some("settings-appearance-dark"));
+    assert_eq!(
+        s.settings.cursor.as_deref(),
+        Some("settings-appearance-dark")
+    );
     assert_eq!(s.focus, Focus::Settings, "Tab stays in Settings");
     t.press(cx, "enter");
     assert_eq!(state(cx, &t).settings.edited, ["appearance"]);
@@ -417,11 +423,20 @@ async fn the_keyboard_alone_changes_and_saves_a_setting(cx: &mut TestAppContext)
     // Round to the start and back: Shift-Tab from Done wraps to Save.
     t.press(cx, "tab");
     t.press(cx, "tab");
-    assert_eq!(state(cx, &t).settings.cursor, Some("settings-save"));
+    assert_eq!(
+        state(cx, &t).settings.cursor.as_deref(),
+        Some("settings-save")
+    );
     t.press(cx, "tab");
-    assert_eq!(state(cx, &t).settings.cursor, Some("settings-close"));
+    assert_eq!(
+        state(cx, &t).settings.cursor.as_deref(),
+        Some("settings-close")
+    );
     t.press(cx, "shift-tab");
-    assert_eq!(state(cx, &t).settings.cursor, Some("settings-save"));
+    assert_eq!(
+        state(cx, &t).settings.cursor.as_deref(),
+        Some("settings-save")
+    );
     t.press(cx, "space");
     wait_for_file(cx, &t, |s| s.appearance == flint_core::Appearance::Dark).await;
     assert!(!state(cx, &t).settings.dirty);
@@ -431,7 +446,7 @@ async fn the_keyboard_alone_changes_and_saves_a_setting(cx: &mut TestAppContext)
     t.press(cx, "tab");
     t.press(cx, "tab");
     assert_eq!(
-        state(cx, &t).settings.cursor,
+        state(cx, &t).settings.cursor.as_deref(),
         Some("settings-section-alerts")
     );
     t.press(cx, "enter");
@@ -454,37 +469,4 @@ async fn enter_does_not_discard_when_the_file_is_invalid(cx: &mut TestAppContext
         .await;
     assert_eq!(quits(cx), 0);
     assert!(state(cx, &t).settings.dirty);
-}
-
-// covers UP-127: a Save that stops part way names what was saved, what was refused and why, and
-// what was not tried.
-#[test]
-fn a_partial_save_says_what_was_and_was_not_saved() {
-    use super::settings_draft::Change;
-    use super::workspace::settings_entry::save_failure_note;
-    use flint_core::settings::SettingsWriteFailure;
-    let writes = [
-        Change::DesktopNotifications(true),
-        Change::LogBufferLines(5_000),
-        Change::Path(Some("/bin".into())),
-        Change::Helm(None),
-    ];
-    let failure = |written| SettingsWriteFailure {
-        written,
-        why: "disk full".into(),
-    };
-    assert_eq!(
-        save_failure_note(&writes, &failure(2)),
-        "Saved desktop notifications and the log buffer size. Not saved: the PATH override: \
-         disk full. Also not saved: the helm path"
-    );
-    assert_eq!(
-        save_failure_note(&writes, &failure(0)),
-        "Not saved: desktop notifications: disk full. Also not saved: the log buffer size, the \
-         PATH override and the helm path"
-    );
-    assert_eq!(
-        save_failure_note(&writes[..1], &failure(0)),
-        "Not saved: desktop notifications: disk full"
-    );
 }

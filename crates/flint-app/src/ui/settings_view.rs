@@ -10,7 +10,9 @@
 //! cursor, and Esc leaves.
 //!
 //! Sections so far: Appearance, Alerts (desktop notifications), Watching (the default watch
-//! mode), and Logs, Paths and Write safety ([`super::settings_logs_paths`]). A slice that adds settings adds a [`Section`] (or a block to one), its
+//! mode), Thresholds and Cluster overrides ([`super::settings_thresholds`]), and Logs, Paths and
+//! Write safety ([`super::settings_logs_paths`]). A slice that adds settings adds a [`Section`]
+//! (or a block to one), its
 //! [`super::settings_draft::Change`]s and its [`Stop`]s.
 
 // module-tests: settings_view_tests.rs
@@ -31,11 +33,17 @@ use serde::{Deserialize, Serialize};
 use super::registry;
 use super::settings_draft::{Field, SettingsDraft};
 use super::settings_logs_paths::{self as logs_paths, LogsPathsFields, TextField};
+use super::settings_thresholds::{
+    self, KnownCluster, OverridesLayout, ThresholdStop, ThresholdsPage,
+};
 #[cfg(any(test, feature = "automation"))]
 use super::view_state::SettingsState;
 
 /// The key context of the Settings view, outside any text field.
 pub const SETTINGS_KEYS: &str = "SettingsView && !Input";
+
+/// The key context of a text field in the Settings view.
+pub const SETTINGS_INPUT_KEYS: &str = "SettingsView > Input";
 
 actions!(
     flint,
@@ -102,16 +110,20 @@ pub enum Section {
     Appearance,
     Alerts,
     Watching,
+    Thresholds,
+    ClusterOverrides,
     Logs,
     Paths,
     Safety,
 }
 
 impl Section {
-    pub const ALL: [Section; 6] = [
+    pub const ALL: [Section; 8] = [
         Section::Appearance,
         Section::Alerts,
         Section::Watching,
+        Section::Thresholds,
+        Section::ClusterOverrides,
         Section::Logs,
         Section::Paths,
         Section::Safety,
@@ -122,6 +134,8 @@ impl Section {
             Section::Appearance => "Appearance",
             Section::Alerts => "Alerts",
             Section::Watching => "Watching",
+            Section::Thresholds => "Thresholds",
+            Section::ClusterOverrides => "Cluster overrides",
             Section::Logs => "Logs",
             Section::Paths => "Paths",
             Section::Safety => "Write safety",
@@ -133,25 +147,28 @@ impl Section {
             Section::Appearance => "settings-section-appearance",
             Section::Alerts => "settings-section-alerts",
             Section::Watching => "settings-section-watching",
+            Section::Thresholds => "settings-section-thresholds",
+            Section::ClusterOverrides => "settings-section-cluster-overrides",
             Section::Logs => "settings-section-logs",
             Section::Paths => "settings-section-paths",
             Section::Safety => "settings-section-safety",
         }
     }
 
-    /// The fields its controls edit.
-    pub fn fields(self) -> &'static [Field] {
+    /// Whether its controls edit `field`.
+    pub fn holds(self, field: &Field) -> bool {
         match self {
-            Section::Appearance => &[Field::Appearance],
-            Section::Alerts => &[Field::DesktopNotifications],
-            Section::Watching => &[Field::WatchMode],
-            Section::Logs => &[
-                Field::LogBufferLines,
-                Field::LogBufferMib,
-                Field::LogTotalMib,
-            ],
-            Section::Paths => &[Field::KubeconfigPaths, Field::Path, Field::Helm],
-            Section::Safety => &[Field::ProtectLocalClusters],
+            Section::Appearance => *field == Field::Appearance,
+            Section::Alerts => *field == Field::DesktopNotifications,
+            Section::Watching => *field == Field::WatchMode,
+            Section::Thresholds => settings_thresholds::holds(field, false),
+            Section::ClusterOverrides => settings_thresholds::holds(field, true),
+            Section::Logs => matches!(
+                field,
+                Field::LogBufferLines | Field::LogBufferMib | Field::LogTotalMib
+            ),
+            Section::Paths => matches!(field, Field::KubeconfigPaths | Field::Path | Field::Helm),
+            Section::Safety => *field == Field::ProtectLocalClusters,
         }
     }
 }
@@ -166,6 +183,7 @@ pub enum Stop {
     Appearance(Appearance),
     DesktopNotifications,
     WatchMode(WatchMode),
+    Threshold(ThresholdStop),
     /// A text field of the Logs or Paths section.
     Text(TextField),
     /// The Remove button of the kubeconfig file at this position.
@@ -178,31 +196,37 @@ pub enum Stop {
 
 impl Stop {
     /// The element id of the control.
-    pub fn id(self) -> &'static str {
+    pub fn id(self) -> SharedString {
         match self {
-            Stop::Done => "settings-close",
-            Stop::Reload => "settings-reload",
-            Stop::SaveAnyway => "settings-save-anyway",
-            Stop::Section(section) => section.id(),
-            Stop::Appearance(Appearance::System) => "settings-appearance-system",
-            Stop::Appearance(Appearance::Light) => "settings-appearance-light",
-            Stop::Appearance(Appearance::Dark) => "settings-appearance-dark",
-            Stop::DesktopNotifications => "settings-desktop-notifications",
-            Stop::WatchMode(WatchMode::All) => "settings-watch-all",
-            Stop::WatchMode(WatchMode::OnView) => "settings-watch-on-view",
-            Stop::Text(field) => field.id(),
-            Stop::RemoveKubeconfig(index) => logs_paths::remove_id(index),
-            Stop::AddKubeconfig => "settings-kubeconfig-add",
-            Stop::ProtectLocalClusters => "settings-protect-local-clusters",
-            Stop::Revert => "settings-revert",
-            Stop::Save => "settings-save",
+            Stop::Done => "settings-close".into(),
+            Stop::Reload => "settings-reload".into(),
+            Stop::SaveAnyway => "settings-save-anyway".into(),
+            Stop::Section(section) => section.id().into(),
+            Stop::Appearance(Appearance::System) => "settings-appearance-system".into(),
+            Stop::Appearance(Appearance::Light) => "settings-appearance-light".into(),
+            Stop::Appearance(Appearance::Dark) => "settings-appearance-dark".into(),
+            Stop::DesktopNotifications => "settings-desktop-notifications".into(),
+            Stop::WatchMode(WatchMode::All) => "settings-watch-all".into(),
+            Stop::WatchMode(WatchMode::OnView) => "settings-watch-on-view".into(),
+            Stop::Threshold(stop) => stop.id(),
+            Stop::Text(field) => field.id().into(),
+            Stop::RemoveKubeconfig(index) => logs_paths::remove_id(index).into(),
+            Stop::AddKubeconfig => "settings-kubeconfig-add".into(),
+            Stop::ProtectLocalClusters => "settings-protect-local-clusters".into(),
+            Stop::Revert => "settings-revert".into(),
+            Stop::Save => "settings-save".into(),
         }
     }
 }
 
-/// The controls in the order Tab visits them, with `section` shown over `shown` settings and the
-/// on-disk banner shown or not.
-pub fn stops(section: Section, banner: bool, shown: &Settings) -> Vec<Stop> {
+/// The controls in the order Tab visits them, with `section` shown, the on-disk banner shown or
+/// not, Cluster overrides drawn as `overrides` says, and `kubeconfigs` files in the Paths list.
+pub fn stops(
+    section: Section,
+    banner: bool,
+    overrides: OverridesLayout,
+    kubeconfigs: usize,
+) -> Vec<Stop> {
     let mut stops = vec![Stop::Done];
     if banner {
         stops.extend([Stop::Reload, Stop::SaveAnyway]);
@@ -214,8 +238,18 @@ pub fn stops(section: Section, banner: bool, shown: &Settings) -> Vec<Stop> {
         ),
         Section::Alerts => stops.push(Stop::DesktopNotifications),
         Section::Watching => stops.extend([WatchMode::All, WatchMode::OnView].map(Stop::WatchMode)),
+        Section::Thresholds => stops.extend(
+            settings_thresholds::global_stops()
+                .into_iter()
+                .map(Stop::Threshold),
+        ),
+        Section::ClusterOverrides => stops.extend(
+            settings_thresholds::override_stops(overrides)
+                .into_iter()
+                .map(Stop::Threshold),
+        ),
         Section::Logs => stops.extend(logs_paths::logs_stops()),
-        Section::Paths => stops.extend(logs_paths::paths_stops(shown.kubeconfig_paths.len())),
+        Section::Paths => stops.extend(logs_paths::paths_stops(kubeconfigs)),
         Section::Safety => stops.push(Stop::ProtectLocalClusters),
     }
     stops.extend([Stop::Revert, Stop::Save]);
@@ -258,9 +292,11 @@ pub struct SettingsPage {
     pub save_note: Option<String>,
     /// The control the keyboard cursor stands on, once Tab moved it.
     pub cursor: Option<Stop>,
-    /// The Logs and Paths sections' inputs and field errors.
+    /// Thresholds and Cluster overrides: rows added, the cluster list, the field being typed.
+    pub thresholds: ThresholdsPage,
+    /// The Logs and Paths sections' text inputs and the kubeconfig list's note.
     pub logs_paths: LogsPathsFields,
-    /// The section's scroll position, so Save can bring a field with an error into view.
+    /// The scrolling content, so the keyboard cursor can bring a control into view.
     pub scroll: ScrollHandle,
 }
 
@@ -275,14 +311,21 @@ impl SettingsPage {
             saving: None,
             save_note: None,
             cursor: None,
+            thresholds: ThresholdsPage::default(),
             logs_paths: LogsPathsFields::default(),
             scroll: ScrollHandle::new(),
         }
     }
 
-    /// The view as automation reads it, over `file` (`invalid`: it could not be read).
+    /// The view as automation reads it, over `file` (`invalid`: it could not be read), with
+    /// the kubeconfig's `clusters`.
     #[cfg(any(test, feature = "automation"))]
-    pub fn state(&self, file: &Settings, invalid: bool) -> SettingsState {
+    pub fn state(
+        &self,
+        file: &Settings,
+        invalid: bool,
+        clusters: &[KnownCluster],
+    ) -> SettingsState {
         let shown = self.draft.shown(file);
         SettingsState {
             open: self.open,
@@ -303,31 +346,28 @@ impl SettingsPage {
             path: shown.path.clone(),
             helm: shown.helm.as_ref().map(|p| p.display().to_string()),
             protect_local_clusters: shown.protect_local_clusters,
-            field_errors: self
-                .logs_paths
-                .errors
-                .iter()
-                .map(|(field, why)| (field.id(), why.clone()))
+            field_errors: TextField::ALL
+                .into_iter()
+                .filter_map(|field| {
+                    let rejected = self.draft.rejected(&field.field())?;
+                    Some((field.id(), rejected.why.clone()))
+                })
                 .collect(),
             kubeconfig_note: self.logs_paths.kubeconfig_note.clone(),
+            thresholds: settings_thresholds::view_state(self, &shown, clusters),
             changed_on_disk: banner_shown(self, file),
             invalid,
-            can_save: self.saving.is_none() && can_save(self, invalid),
+            can_save: self.saving.is_none() && can_save(&self.draft, invalid),
             saving: self.saving.is_some(),
             note: self.save_note.clone(),
-            cursor: self.cursor.map(Stop::id),
+            cursor: self.cursor.map(|stop| stop.id().to_string()),
         }
     }
 }
 
-/// Save needs edits, a readable file, and no field holding an invalid value.
-pub fn can_save(page: &SettingsPage, invalid: bool) -> bool {
-    page.draft.is_dirty() && !invalid && page.logs_paths.errors.is_empty()
-}
-
-/// Revert has edits to drop, or a field's invalid text to put back.
-pub fn can_revert(page: &SettingsPage) -> bool {
-    page.draft.is_dirty() || !page.logs_paths.errors.is_empty()
+/// Save needs edits, none rejected, and a readable file.
+pub fn can_save(draft: &SettingsDraft, invalid: bool) -> bool {
+    draft.is_ready() && !invalid
 }
 
 /// Whether the "modified outside Settings" banner shows: not while a Save of ours is landing.
@@ -356,8 +396,8 @@ pub fn watch_mode_name(mode: WatchMode) -> &'static str {
 pub const CHANGED_ON_DISK: &str = "settings.toml was modified outside Settings. Reload shows the \
     file and drops your edits; Save anyway writes only the settings you edited.";
 
-/// The footer while a field holds a value that cannot be saved.
-pub const FIX_FIELDS: &str = "A field has a value that cannot be saved. Fix it, or Revert.";
+/// The footer while a value typed is not accepted.
+pub const REJECTED: &str = "Some values are not accepted. Fix the fields marked in red to save.";
 
 /// The banner while the file cannot be read.
 pub const INVALID: &str =
@@ -422,8 +462,15 @@ pub(super) fn ring(
         .child(control)
 }
 
-/// The Settings view, over `file` as the core last reported it.
-pub fn render(page: &SettingsPage, file: &Settings, invalid: bool, theme: &Theme) -> AnyElement {
+/// The Settings view, over `file` as the core last reported it, with the kubeconfig's
+/// `clusters`.
+pub fn render(
+    page: &SettingsPage,
+    file: &Settings,
+    invalid: bool,
+    clusters: &[KnownCluster],
+    theme: &Theme,
+) -> AnyElement {
     let draft = &page.draft;
     let shown = draft.shown(file);
     let changed = banner_shown(page, file);
@@ -464,7 +511,7 @@ pub fn render(page: &SettingsPage, file: &Settings, invalid: bool, theme: &Theme
                     Button::new("settings-save-anyway")
                         .xsmall()
                         .label("Save anyway")
-                        .disabled(invalid)
+                        .disabled(invalid || draft.has_rejected())
                         .on_click(registry::on_click(SaveSettings)),
                 ));
             el.child(banner(
@@ -481,8 +528,6 @@ pub fn render(page: &SettingsPage, file: &Settings, invalid: bool, theme: &Theme
                 .min_h_0()
                 .child(section_list(page, theme))
                 .child(
-                    // The section's rows are its direct children, so the keyboard cursor and
-                    // Save can scroll one into view ([`logs_paths::content_row`]).
                     v_flex()
                         .id("settings-content")
                         .flex_1()
@@ -491,7 +536,8 @@ pub fn render(page: &SettingsPage, file: &Settings, invalid: bool, theme: &Theme
                         .overflow_y_scroll()
                         .track_scroll(&page.scroll)
                         .p_4()
-                        .children(section_body(page, &shown, theme)),
+                        .gap_3()
+                        .children(section_body(page, &shown, clusters, theme)),
                 ),
         )
         .child(footer(page, invalid, theme))
@@ -564,9 +610,7 @@ fn section_list(page: &SettingsPage, theme: &Theme) -> impl IntoElement {
         .border_r_1()
         .border_color(theme.border)
         .children(Section::ALL.map(|section| {
-            let edited = section.fields().iter().any(|f| {
-                page.draft.is_edited(*f) || page.logs_paths.errors.keys().any(|e| e.field() == *f)
-            });
+            let edited = page.draft.touched().any(|f| section.holds(f));
             h_flex()
                 .w_full()
                 .gap_1()
@@ -591,17 +635,20 @@ fn section_list(page: &SettingsPage, theme: &Theme) -> impl IntoElement {
         }))
 }
 
-/// The section's blocks, top to bottom.
-fn section_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> Vec<AnyElement> {
+fn section_body(
+    page: &SettingsPage,
+    shown: &Settings,
+    clusters: &[KnownCluster],
+    theme: &Theme,
+) -> Vec<AnyElement> {
     let draft = &page.draft;
-    let single = match page.section {
-        Section::Logs => return logs_paths::logs_body(page, theme),
-        Section::Paths => return logs_paths::paths_body(page, shown, theme),
-        Section::Appearance => group(
+    let one = |element: AnyElement| vec![element];
+    match page.section {
+        Section::Appearance => one(group(
             "Appearance",
             "Flint Light, Flint Dark, or whichever the system uses. View > Appearance changes it at \
              once; here it changes on Save.",
-            draft.is_edited(Field::Appearance),
+            draft.is_edited(&Field::Appearance),
             theme,
         )
         .child(
@@ -626,12 +673,13 @@ fn section_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> Vec<Any
                 }),
             ),
         )
-        .into_any_element(),
-        Section::Alerts => group(
+        .into_any_element()),
+        Section::Alerts => one(group(
             "Desktop notifications",
             "Post a notification when a watched cluster has a new problem. Only clusters that \
-             watch all kinds are covered. Per-cluster choices stay in the Alerts menu.",
-            draft.is_edited(Field::DesktopNotifications),
+             watch all kinds are covered. A cluster's own choice (Cluster overrides, or the \
+             Alerts menu) overrides this.",
+            draft.is_edited(&Field::DesktopNotifications),
             theme,
         )
         .child(
@@ -647,13 +695,13 @@ fn section_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> Vec<Any
                     })),
             )),
         )
-        .into_any_element(),
-        Section::Watching => group(
+        .into_any_element()),
+        Section::Watching => one(group(
             "Default watch mode",
             "Which kinds are watched on the active cluster. All kinds keeps the overview, \
              problems and alerts live; Open views only watches a kind while a view shows it. A \
-             cluster's own choice, made from its header, overrides this.",
-            draft.is_edited(Field::WatchMode),
+             cluster's own choice, made from its header or in Cluster overrides, overrides this.",
+            draft.is_edited(&Field::WatchMode),
             theme,
         )
         .child(
@@ -677,10 +725,17 @@ fn section_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> Vec<Any
                 }),
             ),
         )
-        .into_any_element(),
-        Section::Safety => logs_paths::safety_body(page, shown, theme),
-    };
-    vec![single]
+        .into_any_element()),
+        Section::Thresholds => settings_thresholds::render_global(page, shown, theme),
+        Section::ClusterOverrides => {
+            let rows = settings_thresholds::override_rows(shown, clusters, &page.thresholds.added);
+            let candidates = settings_thresholds::add_candidates(clusters, &rows);
+            settings_thresholds::render_overrides(page, shown, &rows, &candidates, theme)
+        }
+        Section::Logs => logs_paths::logs_body(page, theme),
+        Section::Paths => logs_paths::paths_body(page, shown, theme),
+        Section::Safety => one(logs_paths::safety_body(page, shown, theme)),
+    }
 }
 
 /// A titled block of controls, saying when it holds an unsaved edit.
@@ -712,11 +767,13 @@ pub(super) fn group(title: &'static str, text: &'static str, edited: bool, theme
 fn footer(page: &SettingsPage, invalid: bool, theme: &Theme) -> impl IntoElement {
     let draft = &page.draft;
     let dirty = draft.is_dirty();
+    // A threshold still being typed is entered by Save and dropped by Revert.
+    let typing = page.thresholds.entry.is_some();
     let saving = page.saving.is_some();
     let (note, color): (SharedString, Hsla) = match &page.save_note {
         _ if saving => ("Saving…".into(), theme.muted_foreground),
         Some(why) => (why.clone().into(), theme.danger),
-        None if !page.logs_paths.errors.is_empty() => (FIX_FIELDS.into(), theme.danger),
+        None if draft.has_rejected() => (REJECTED.into(), theme.danger),
         None if dirty => ("Unsaved changes".into(), theme.muted_foreground),
         None => ("No unsaved changes".into(), theme.muted_foreground),
     };
@@ -746,7 +803,7 @@ fn footer(page: &SettingsPage, invalid: bool, theme: &Theme) -> impl IntoElement
             Button::new("settings-revert")
                 .small()
                 .label("Revert")
-                .disabled(saving || !can_revert(page))
+                .disabled(saving || !(dirty || typing))
                 .on_click(registry::on_click(RevertSettings)),
         ))
         .child(ring(
@@ -757,9 +814,11 @@ fn footer(page: &SettingsPage, invalid: bool, theme: &Theme) -> impl IntoElement
                 .small()
                 .primary()
                 .label("Save")
-                // With a field's text invalid, Save shows that field rather than writing.
+                // With a value rejected, Save shows its field rather than writing.
                 .disabled(
-                    saving || !(can_save(page, invalid) || !page.logs_paths.errors.is_empty()),
+                    saving
+                        || invalid
+                        || !(can_save(draft, invalid) || typing || draft.has_rejected()),
                 )
                 .on_click(registry::on_click(SaveSettings)),
         ))

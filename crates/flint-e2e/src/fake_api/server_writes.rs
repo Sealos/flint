@@ -288,6 +288,15 @@ fn patch(
             }]});
             return Err(error);
         }
+        // As on the API server, a `resourceVersion` in a merge patch is a precondition.
+        let version = body.pointer("/metadata/resourceVersion");
+        if version.is_some() && version != object.pointer("/metadata/resourceVersion") {
+            return Err(ApiError::new(
+                409,
+                "Conflict",
+                format!("the object \"{name}\" has been modified"),
+            ));
+        }
         merge(&mut object, body);
     }
     // Checked first, so a dry run refuses what the write would, and a refusal moves no version.
@@ -418,6 +427,14 @@ fn remove(
             409,
             "Conflict",
             format!("the uid of \"{name}\" does not match the precondition"),
+        ));
+    }
+    let version = options.pointer("/preconditions/resourceVersion");
+    if version.is_some() && version != object.pointer("/metadata/resourceVersion") {
+        return Err(ApiError::new(
+            409,
+            "Conflict",
+            format!("the resourceVersion of \"{name}\" does not match the precondition"),
         ));
     }
     if dry_run {

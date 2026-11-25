@@ -436,6 +436,10 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **When** I press Review, then Apply.
 - **Then** I see a diff from the server dry-run, then the change is applied. Webhook or policy rejections are shown
   before anything is applied.
+- A Secret opens with its values masked. A value I leave masked keeps what the cluster has; only the keys I add,
+  change or remove are sent, and the diff names those keys without showing any value. A changed `data` value must
+  be base64; plain text goes under `stringData`. A mask under a key the cluster does not have is refused, and so is
+  an Apply after someone else changed the Secret since my review.
 - An edit I have not applied is kept only while Flint runs. Leaving the view or closing the window asks first, but
   quitting from the Dock menu or logging out does not, and the edit is lost; Flint does not save drafts.
 - Tests: cluster.
@@ -453,8 +457,11 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   unchecked options (delete emptyDir data, force pods without a controller), each saying what is lost; completed and
   failed pods are removed whatever they say. Drain's warning also names GitOps-managed pods it would evict. Each
   action rechecks the live object first. If the object changed, nothing is run again: a new review opens, saying
-  so. Drain reports what it did, also when it stopped early:
-  cordoned, evicted, blocked and why (a PodDisruptionBudget is named), skipped, not tried, may still be terminating.
+  so. A running drain's strip says where it is, pod by pod: the pod being evicted, how many were tried, evicted and
+  blocked, then how many are still terminating. Drain reports what it did, naming the node and its cluster, also when
+  it stopped early: cordoned, evicted, blocked and why (a PodDisruptionBudget is the reason, named when the server
+  names it), skipped, not tried (also the listed pods when the node check after listing stops it), may still be
+  terminating.
 - Tests: cluster, ui.
 
 ---
@@ -589,11 +596,18 @@ M3 used every number in the 5x block, so its later paths continue at UP-121.
 - Tests: unit (ring buffer, aggregation), ui.
 
 ### UP-67 Set warning thresholds
-- **Status:** planned (#102, not in 0.5.0), not built yet.
-- **When** I open the dashboard's Thresholds panel and set CPU warnings at 80% for this cluster only.
-- **Then** this cluster's tiles warn from 80%, other clusters keep the global default, and `settings.toml` holds the
-  typed override.
-- Tests: unit (settings), ui.
+- **When** I open Settings > Thresholds and type a global value (CPU %, memory %, restarts or Warning events in the
+  last hour, seconds a pod may stay Pending), or open Settings > Cluster overrides, add an override for this cluster
+  and set CPU warnings at 80% for it alone, then press Save.
+- **Then** this cluster's tiles warn from 80%, other clusters keep the global value, and `settings.toml` holds the
+  typed values (`[thresholds]` and a `[[thresholds.clusters]]` entry pinned to the cluster's server). An empty field
+  follows the level below. A number outside its metric's range, or not a whole number, stays in its field with the
+  reason under it, and Save is blocked until I fix it or revert. Cluster overrides lists only the clusters whose
+  thresholds, desktop alerts or watch mode differ from the global settings, with a Reset per row that clears all of
+  that cluster's overrides. The Alerts menu's Pending Pods submenu writes the same keys. From the keyboard, Tab
+  reaches each field, Enter opens it for typing, Enter enters the number and Esc drops it.
+- Tests: unit (settings writes, range validation, override rows), ui (`settings_thresholds_tests.rs`), e2e
+  (`flint-e2e/tests/app/settings.rs`).
 
 ### UP-68 Follow recent activity
 - **Status:** planned (#101, not in 0.5.0), not built yet.
@@ -797,7 +811,8 @@ Deferred until cluster sets are scheduled (#199).
 
 ### UP-126 Change settings in Settings
 - **When** I open Settings (Flint > Settings…, Cmd-, on macOS and Ctrl-, on Linux, or the command palette) and change
-  the appearance, desktop notifications or the default watch mode.
+  the appearance, desktop notifications, the default watch mode, the warning thresholds or a cluster's overrides
+  (UP-67).
 - **Then** the main area shows Settings with its sections on the left. My edits wait in a draft until I press Save,
   which writes only the settings I edited to `settings.toml`; Revert drops them. The draft stays while I switch views
   and clusters, and the sidebar's Settings entry shows a dot meanwhile. If `settings.toml` changes while the draft
@@ -815,9 +830,9 @@ Deferred until cluster sets are scheduled (#199).
 - **Then** each log limit is checked as I type it (lines per tab 1,000 to 1,000,000, MiB per tab 8 to 1,024, MiB for
   all tabs 64 to 16,384); a value out of range shows an error under its field, and Save writes nothing but brings that
   field into view until I fix it or Revert; quitting or closing with such a field asks to discard it. Text I type while
-  a Save is being written stays in the draft. A Save that stops part way says which settings were saved and which were
-  not. Add… opens a file picker and adds the files I choose to the kubeconfig list (a file already listed, or one
-  that is not there, is refused with a note; files already in the list stay accepted), Remove drops one, and after Save the clusters reload as after a hand edit.
+  a Save is being written stays in the draft. Save writes every edit in one save, or none of them. Add… opens a file picker and adds the files I choose to the kubeconfig list (a file already listed, or one
+  that is not there, is refused with a note; files already in the list stay accepted), Remove drops the row I chose,
+  and after Save the clusters reload as after a hand edit.
   `PATH` takes absolute folders separated by colons and applies after a restart; `helm` takes an existing file, absolute
   or under `~`; either left empty uses the default. Turning protection of local clusters on saves without a question.
   Turning it off asks at Save, whichever way Save is asked for (the button, Save anyway, the keyboard, the palette, or
@@ -828,8 +843,8 @@ Deferred until cluster sets are scheduled (#199).
   settings I confirmed it over: if `settings.toml` changed after I confirmed, nothing is written and the question is
   asked again. Its write gate stays authoritative. From the keyboard, Tab reaches every field and button, puts focus in a text field, and goes on from
   inside one; Escape leaves a field for the view.
-- Tests: unit (range checks, path checks, the kubeconfig list, `SettingsWrite` setters, the lock needed to unprotect, unprotect refused over a changed file, saved kubeconfig entries
-  kept, the partial save note),
+- Tests: unit (range checks, path checks, the kubeconfig list, `SettingsWrite` setters, the lock needed to unprotect,
+  unprotect refused over a changed file, alone and in one save with other settings, saved kubeconfig entries kept),
   ui (typing and saving a limit, field errors and Revert, the file picker, path and helm, protection on without a
   question, off with Enter, Cancel and confirm, a change on disk during the question, the quit question, Save showing
   an invalid field, text typed while saving), e2e
