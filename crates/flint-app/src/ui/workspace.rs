@@ -4074,7 +4074,7 @@ mod keys;
 pub(in crate::ui) mod problems;
 
 #[path = "workspace_settings.rs"]
-mod settings_entry;
+pub(in crate::ui) mod settings_entry;
 
 #[path = "workspace_settings_logs_paths.rs"]
 mod settings_logs_paths;

@@ -334,7 +334,7 @@ enum Internal {
     /// Write settings, then say how ([`crate::CoreHandle::write_settings`]).
     WriteSettings {
         writes: Vec<settings::SettingsWrite>,
-        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+        reply: tokio::sync::oneshot::Sender<Result<(), settings::SettingsWriteFailure>>,
     },
     Connected {
         cluster: ClusterId,
@@ -1546,11 +1546,21 @@ impl ClusterManager {
             }
             Internal::WriteSettings { writes, reply } => {
                 let mut result = Ok(());
-                for write in writes {
-                    result = self
+                for (written, write) in writes.into_iter().enumerate() {
+                    let unprotect = matches!(
+                        write,
+                        settings::SettingsWrite::ProtectLocalClusters { on: false, .. }
+                    );
+                    if let Err(why) = self
                         .try_write_settings(write.what(), move |dir| write.write(dir))
-                        .await;
-                    if result.is_err() {
+                        .await
+                    {
+                        // Refused over a file changed since it was confirmed: read it now, so
+                        // the confirmation asked again is asked over the file as it is.
+                        if unprotect {
+                            self.reload_settings().await;
+                        }
+                        result = Err(settings::SettingsWriteFailure { written, why });
                         break;
                     }
                 }

@@ -354,7 +354,7 @@ pub(crate) enum Request {
     /// Write these settings in order, and say how that went.
     WriteSettings {
         writes: Vec<crate::settings::SettingsWrite>,
-        reply: oneshot::Sender<Result<(), String>>,
+        reply: oneshot::Sender<Result<(), crate::settings::SettingsWriteFailure>>,
     },
     /// Activates `cluster` only if it is still the slot and definition given, in the same step.
     ActivatePinned {
@@ -1169,24 +1169,34 @@ impl CoreHandle {
     }
 
     /// Writes `writes` to `settings.toml` one after another, each through its own setter, and
-    /// resolves once they are written and applied, or with the (sanitized) reason the first that
-    /// failed did not; the ones after it are not written. The change also arrives as
+    /// resolves once they are written and applied, or with how many were and the (sanitized)
+    /// reason the next one was not; the ones after it are not written. The change also arrives as
     /// `Event::SettingsChanged`, and a failure as `Event::Error`. Like every settings write it
     /// refuses while `settings.toml` is invalid. Works on any executor.
     pub fn write_settings(
         &self,
         writes: Vec<crate::settings::SettingsWrite>,
-    ) -> impl Future<Output = Result<(), String>> + Send + 'static {
+    ) -> impl Future<Output = Result<(), crate::settings::SettingsWriteFailure>> + Send + 'static
+    {
+        use crate::settings::SettingsWriteFailure;
         let (reply, rx) = oneshot::channel();
         let sent = self
             .requests
             .try_send(Request::WriteSettings { writes, reply });
         async move {
             if sent.is_err() {
-                return Err("the settings could not be sent to be written".to_owned());
+                return Err(SettingsWriteFailure {
+                    written: 0,
+                    why: "the settings could not be sent to be written".to_owned(),
+                });
             }
-            rx.await
-                .unwrap_or_else(|_| Err("the settings were not written".to_owned()))
+            // The manager went away mid-batch: how much it wrote is not known.
+            rx.await.unwrap_or_else(|_| {
+                Err(SettingsWriteFailure {
+                    written: 0,
+                    why: "the settings were not written".to_owned(),
+                })
+            })
         }
     }
 

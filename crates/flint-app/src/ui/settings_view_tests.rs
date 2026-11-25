@@ -455,3 +455,36 @@ async fn enter_does_not_discard_when_the_file_is_invalid(cx: &mut TestAppContext
     assert_eq!(quits(cx), 0);
     assert!(state(cx, &t).settings.dirty);
 }
+
+// covers UP-127: a Save that stops part way names what was saved, what was refused and why, and
+// what was not tried.
+#[test]
+fn a_partial_save_says_what_was_and_was_not_saved() {
+    use super::settings_draft::Change;
+    use super::workspace::settings_entry::save_failure_note;
+    use flint_core::settings::SettingsWriteFailure;
+    let writes = [
+        Change::DesktopNotifications(true),
+        Change::LogBufferLines(5_000),
+        Change::Path(Some("/bin".into())),
+        Change::Helm(None),
+    ];
+    let failure = |written| SettingsWriteFailure {
+        written,
+        why: "disk full".into(),
+    };
+    assert_eq!(
+        save_failure_note(&writes, &failure(2)),
+        "Saved desktop notifications and the log buffer size. Not saved: the PATH override: \
+         disk full. Also not saved: the helm path"
+    );
+    assert_eq!(
+        save_failure_note(&writes, &failure(0)),
+        "Not saved: desktop notifications: disk full. Also not saved: the log buffer size, the \
+         PATH override and the helm path"
+    );
+    assert_eq!(
+        save_failure_note(&writes[..1], &failure(0)),
+        "Not saved: desktop notifications: disk full"
+    );
+}

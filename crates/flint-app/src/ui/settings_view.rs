@@ -260,6 +260,8 @@ pub struct SettingsPage {
     pub cursor: Option<Stop>,
     /// The Logs and Paths sections' inputs and field errors.
     pub logs_paths: LogsPathsFields,
+    /// The section's scroll position, so Save can bring a field with an error into view.
+    pub scroll: ScrollHandle,
 }
 
 impl SettingsPage {
@@ -274,6 +276,7 @@ impl SettingsPage {
             save_note: None,
             cursor: None,
             logs_paths: LogsPathsFields::default(),
+            scroll: ScrollHandle::new(),
         }
     }
 
@@ -478,15 +481,18 @@ pub fn render(page: &SettingsPage, file: &Settings, invalid: bool, theme: &Theme
                 .min_h_0()
                 .child(section_list(page, theme))
                 .child(
+                    // The section's blocks are its direct children, so Save can scroll one
+                    // into view ([`TextField::row`]).
                     v_flex()
                         .id("settings-content")
                         .flex_1()
                         .min_w_0()
                         .h_full()
                         .overflow_y_scroll()
+                        .track_scroll(&page.scroll)
                         .p_4()
-                        .gap_3()
-                        .child(section_body(page, &shown, theme)),
+                        .gap_4()
+                        .children(section_body(page, &shown, theme)),
                 ),
         )
         .child(footer(page, invalid, theme))
@@ -586,9 +592,12 @@ fn section_list(page: &SettingsPage, theme: &Theme) -> impl IntoElement {
         }))
 }
 
-fn section_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> AnyElement {
+/// The section's blocks, top to bottom.
+fn section_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> Vec<AnyElement> {
     let draft = &page.draft;
-    match page.section {
+    let single = match page.section {
+        Section::Logs => return logs_paths::logs_body(page, theme),
+        Section::Paths => return logs_paths::paths_body(page, shown, theme),
         Section::Appearance => group(
             "Appearance",
             "Flint Light, Flint Dark, or whichever the system uses. View > Appearance changes it at \
@@ -670,10 +679,9 @@ fn section_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> AnyElem
             ),
         )
         .into_any_element(),
-        Section::Logs => logs_paths::logs_body(page, theme),
-        Section::Paths => logs_paths::paths_body(page, shown, theme),
         Section::Safety => logs_paths::safety_body(page, shown, theme),
-    }
+    };
+    vec![single]
 }
 
 /// A titled block of controls, saying when it holds an unsaved edit.
@@ -750,7 +758,10 @@ fn footer(page: &SettingsPage, invalid: bool, theme: &Theme) -> impl IntoElement
                 .small()
                 .primary()
                 .label("Save")
-                .disabled(saving || !can_save(page, invalid))
+                // With a field's text invalid, Save shows that field rather than writing.
+                .disabled(
+                    saving || !(can_save(page, invalid) || !page.logs_paths.errors.is_empty()),
+                )
                 .on_click(registry::on_click(SaveSettings)),
         ))
 }

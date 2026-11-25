@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use flint_core::Settings;
+use flint_core::settings::SettingsRevision;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::*;
 
@@ -143,13 +144,7 @@ impl Workspace {
             return;
         }
         if self.settings_page.saving.is_none() {
-            let typed = std::mem::take(&mut self.settings_page.logs_paths.typed_while_saving);
-            for field in typed {
-                if let Some(input) = self.settings_page.logs_paths.input(field) {
-                    let text = input.read(cx).value().to_string();
-                    self.apply_settings_text(field, &text, cx);
-                }
-            }
+            self.take_typed_while_saving(cx);
         }
         let resync = std::mem::take(&mut self.settings_page.logs_paths.resync);
         let page = &self.settings_page;
@@ -187,6 +182,28 @@ impl Workspace {
         Some(input.read(cx).value().to_string())
     }
 
+    /// Types `text` into `field`'s input, as the keyboard would, even while a Save is being
+    /// written (which the palette's edits wait for).
+    #[cfg(test)]
+    pub(in crate::ui) fn type_settings_text(
+        &mut self,
+        field: TextField,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(input) = self.settings_page.logs_paths.input(field).cloned() {
+            input.update(cx, |state, cx| state.set_value(text.to_owned(), window, cx));
+        }
+        self.apply_settings_text(field, text, cx);
+    }
+
+    /// Whether a Save is being written.
+    #[cfg(test)]
+    pub(in crate::ui) fn settings_saving(&self) -> bool {
+        self.settings_page.saving.is_some()
+    }
+
     /// Sets `field` to `text`, as typing it would: the palette's and automation's way in.
     fn set_settings_text(
         &mut self,
@@ -202,7 +219,7 @@ impl Workspace {
     }
 
     /// `text` is in `field` now: a valid value is an edit, an invalid one an error under the
-    /// field that keeps Save disabled. An invalid value drops the field's earlier edit, so
+    /// field that keeps Save from writing. An invalid value drops the field's earlier edit, so
     /// nothing saves what the field no longer shows.
     fn apply_settings_text(&mut self, field: TextField, text: &str, cx: &mut Context<Self>) {
         if !self.settings_page.open {
@@ -216,18 +233,56 @@ impl Workspace {
                 .insert(field);
             return;
         }
+        self.record_settings_text(field, text, cx);
+    }
+
+    /// [`Self::apply_settings_text`] once no Save is being written, whether or not Settings is
+    /// still open.
+    fn record_settings_text(&mut self, field: TextField, text: &str, cx: &mut Context<Self>) {
+        let page = &mut self.settings_page;
         match field.parse(text, home().as_deref()) {
             Ok(change) => {
-                self.settings_page.logs_paths.errors.remove(&field);
-                self.edit_settings(change, cx);
+                page.logs_paths.errors.remove(&field);
+                let file = self.model.read(cx).settings.clone();
+                page.draft.edit(change, &file);
             }
             Err(why) => {
-                self.settings_page.logs_paths.errors.insert(field, why);
-                self.settings_page.draft.forget(field.field());
-                self.settings_page.save_note = None;
-                cx.notify();
+                page.logs_paths.errors.insert(field, why);
+                page.draft.forget(field.field());
             }
         }
+        page.save_note = None;
+        cx.notify();
+    }
+
+    /// Puts the text typed into fields while a Save was being written into the draft, now that
+    /// the Save is answered (or given up on): before the written edits leave the draft, so a
+    /// newer value typed over one stays, and before a quit or close waiting on the Save goes on.
+    pub(super) fn take_typed_while_saving(&mut self, cx: &mut Context<Self>) {
+        let typed = std::mem::take(&mut self.settings_page.logs_paths.typed_while_saving);
+        for field in typed {
+            if let Some(input) = self.settings_page.logs_paths.input(field) {
+                let text = input.read(cx).value().to_string();
+                self.record_settings_text(field, &text, cx);
+            }
+        }
+    }
+
+    /// Shows the first field whose text is invalid: its section, the keyboard cursor and focus on
+    /// it, scrolled into view. What Save does while one is.
+    pub(super) fn show_settings_field_error(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(field) = self.settings_page.logs_paths.errors.keys().next().copied() else {
+            return;
+        };
+        self.settings_page.section = field.section();
+        self.settings_page.cursor = Some(Stop::Text(field));
+        self.settings_page.scroll.scroll_to_item(field.row());
+        self.focus_settings_stop(window, cx);
+        cx.notify();
     }
 
     /// Adds `paths` to the kubeconfig list in the draft, each that can be: one already listed,
@@ -399,6 +454,9 @@ impl Workspace {
             cx.notify();
             return;
         }
-        self.write_settings_draft(then, window, cx);
+        // The core turns protection off only over the file confirmed here: if `settings.toml`
+        // changed since, it refuses, and the confirmation is asked again.
+        let confirmed = SettingsRevision::of(file);
+        self.write_settings_draft(then, Some(confirmed), window, cx);
     }
 }

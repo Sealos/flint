@@ -243,10 +243,10 @@ async fn a_log_limit_is_checked_as_typed_and_saved(cx: &mut TestAppContext) {
     );
     assert!(!s.settings.can_save);
     assert!(t.find(cx, "settings-log-buffer-lines-error").is_some());
-    assert!(
-        t.dispatch(cx, "settings::SaveSettings", Value::Null)
-            .is_err()
-    );
+    // Save shows the field instead of writing.
+    t.dispatch(cx, "settings::SaveSettings", Value::Null)
+        .unwrap();
+    assert!(!dir.path().join("settings.toml").exists());
 
     t.press(cx, "secondary-a");
     t.type_text(cx, "20000");
@@ -586,4 +586,77 @@ async fn revert_resets_the_focused_field(cx: &mut TestAppContext) {
     });
     assert_eq!(text.as_deref(), Some("100000"));
     assert!(!state(cx, &t).settings.dirty);
+}
+
+// covers UP-127: Save with a field's text invalid writes nothing and shows that field: its
+// section, the cursor on it. Such a draft is unsaved too: quitting asks to discard it.
+#[gpui_kit::test]
+async fn save_shows_the_invalid_field_and_quit_still_asks(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_settings(cx, dir.path()).await;
+    show(cx, &t, "logs");
+    t.dispatch(cx, "settings::EditLogTotalMib", json!({ "mib": 20 }))
+        .unwrap();
+    let s = state(cx, &t);
+    assert!(!s.settings.dirty && !s.settings.can_save, "{s:?}");
+    show(cx, &t, "appearance");
+
+    t.click(cx, "settings-save");
+    let s = state(cx, &t);
+    assert_eq!(s.settings.section, Section::Logs);
+    assert_eq!(s.settings.cursor, Some("settings-log-total-mib"));
+    assert!(!dir.path().join("settings.toml").exists());
+
+    t.press_key_of(cx, "flint::Quit");
+    let dialog = shown_dialog(cx, &t).await;
+    assert_eq!(dialog.title, "Discard unsaved settings?");
+    t.click(cx, "cancel");
+    no_dialog(cx, &t).await;
+    assert_eq!(
+        cx.update(|cx| cx.try_global::<Quits>().map_or(0, |q| q.0)),
+        0
+    );
+}
+
+// covers UP-127: text typed into a field while a Save is being written joins the draft once the
+// Save is answered; a quit that waited on the Save waits for that edit too.
+#[gpui_kit::test]
+async fn text_typed_while_saving_stays_in_the_draft(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_settings(cx, dir.path()).await;
+    show(cx, &t, "logs");
+    t.dispatch(
+        cx,
+        "settings::EditLogBufferLines",
+        json!({ "lines": 20_000 }),
+    )
+    .unwrap();
+    let workspace = t.workspace.clone();
+    cx.update_window(t.window, |_, window, cx| {
+        super::registry::dispatch("settings::SaveSettings", Value::Null, window, cx).unwrap();
+        workspace.update(cx, |ws, cx| {
+            assert!(ws.settings_saving());
+            ws.type_settings_text(TextField::LogBufferMib, "128", window, cx);
+        });
+    })
+    .unwrap();
+    t.press_key_of(cx, "flint::Quit");
+    wait_for_file(cx, &t, |s| s.log_buffer_lines == 20_000).await;
+    cx.run_until_parked();
+
+    let s = state(cx, &t);
+    assert_eq!(s.settings.edited, ["log_buffer_mib"], "{s:?}");
+    assert_eq!(s.settings.log_buffer_mib, 128);
+    assert!(
+        s.settings
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains("Edits made while saving")),
+        "{s:?}"
+    );
+    assert_eq!(
+        cx.update(|cx| cx.try_global::<Quits>().map_or(0, |q| q.0)),
+        0,
+        "the quit waits for the new edit"
+    );
 }

@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use flint_core::settings::SettingsWrite;
+use flint_core::settings::{SettingsRevision, SettingsWrite};
 use flint_core::{Appearance, Settings, WatchMode};
 
 /// A setting the Settings view edits. Save writes the edits in this order and stops at the
@@ -109,8 +109,15 @@ impl Change {
         }
     }
 
-    /// The core's write for it.
-    pub fn into_write(self) -> SettingsWrite {
+    /// What it changes, for a message.
+    pub fn what(&self) -> &'static str {
+        self.clone().into_write(None).what()
+    }
+
+    /// The core's write for it. Turning local cluster protection off carries `confirmed`, the
+    /// revision of the settings the person confirmed it over; the core refuses it without one,
+    /// or over a file changed since.
+    pub fn into_write(self, confirmed: Option<SettingsRevision>) -> SettingsWrite {
         match self {
             Change::Appearance(a) => SettingsWrite::Appearance(a),
             Change::DesktopNotifications(on) => SettingsWrite::DesktopNotifications(on),
@@ -121,7 +128,10 @@ impl Change {
             Change::KubeconfigPaths(paths) => SettingsWrite::KubeconfigPaths(paths),
             Change::Path(path) => SettingsWrite::Path(path),
             Change::Helm(helm) => SettingsWrite::Helm(helm),
-            Change::ProtectLocalClusters(on) => SettingsWrite::ProtectLocalClusters(on),
+            Change::ProtectLocalClusters(on) => SettingsWrite::ProtectLocalClusters {
+                on,
+                confirmed: confirmed.filter(|_| !on),
+            },
         }
     }
 

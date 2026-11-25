@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use super::registry;
 use super::settings_draft::{Change, Field};
 use super::settings_view::{
-    NextSettingsControl, PreviousSettingsControl, SettingsPage, Stop, group, ring,
+    NextSettingsControl, PreviousSettingsControl, Section, SettingsPage, Stop, group, ring,
 };
 
 /// Set the lines each log tab keeps, in the Settings draft.
@@ -128,6 +128,29 @@ impl TextField {
         TextField::Path,
         TextField::Helm,
     ];
+
+    /// The section it is in.
+    pub fn section(self) -> Section {
+        match self {
+            TextField::LogBufferLines | TextField::LogBufferMib | TextField::LogTotalMib => {
+                Section::Logs
+            }
+            TextField::Path | TextField::Helm => Section::Paths,
+        }
+    }
+
+    /// Its block's place in its section, from the top: what [`logs_body`] and [`paths_body`]
+    /// put it at.
+    pub fn row(self) -> usize {
+        match self {
+            TextField::LogBufferLines => 0,
+            TextField::LogBufferMib => 1,
+            TextField::LogTotalMib => 2,
+            // Below the kubeconfig list.
+            TextField::Path => 1,
+            TextField::Helm => 2,
+        }
+    }
 
     pub fn field(self) -> Field {
         match self {
@@ -446,39 +469,39 @@ fn error_id(field: TextField) -> &'static str {
     }
 }
 
-/// The Logs section.
-pub fn logs_body(page: &SettingsPage, theme: &Theme) -> AnyElement {
+/// The Logs section's blocks, in [`TextField::row`] order.
+pub fn logs_body(page: &SettingsPage, theme: &Theme) -> Vec<AnyElement> {
     let draft = &page.draft;
     let block = |field: TextField, title, text| {
         group(title, text, draft.is_edited(field.field()), theme)
             .children(text_input(page, field, theme))
+            .into_any_element()
     };
-    v_flex()
-        .gap_4()
-        .child(block(
+    vec![
+        block(
             TextField::LogBufferLines,
             "Lines per log tab",
             "How many lines each log tab keeps before dropping its oldest, from 1,000 to \
              1,000,000. Applies to log tabs opened after Save.",
-        ))
-        .child(block(
+        ),
+        block(
             TextField::LogBufferMib,
             "Memory per log tab (MiB)",
             "The most memory each log tab's lines may take, from 8 to 1,024 MiB; whichever \
              limit comes first applies. Applies to log tabs opened after Save.",
-        ))
-        .child(block(
+        ),
+        block(
             TextField::LogTotalMib,
             "Memory for all log tabs (MiB)",
             "The most memory all log tabs may take together, from 64 to 16,384 MiB. Past it, \
              background tabs drop their oldest lines first. Never below one tab's own limit. \
              Applies at Save.",
-        ))
-        .into_any_element()
+        ),
+    ]
 }
 
-/// The Paths section.
-pub fn paths_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> AnyElement {
+/// The Paths section's blocks, in [`TextField::row`] order.
+pub fn paths_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> Vec<AnyElement> {
     let draft = &page.draft;
     let paths = &shown.kubeconfig_paths;
     let list = group(
@@ -548,29 +571,26 @@ pub fn paths_body(page: &SettingsPage, shown: &Settings, theme: &Theme) -> AnyEl
                 )
             }),
     );
-    v_flex()
-        .gap_4()
-        .child(list)
-        .child(
-            group(
-                "PATH",
-                "Where Flint finds kubectl plugins, helm and credential helpers: absolute folders \
-                 separated by colons. Empty uses the login shell's PATH. Applies after a restart.",
-                draft.is_edited(Field::Path),
-                theme,
-            )
-            .children(text_input(page, TextField::Path, theme)),
+    vec![
+        list.into_any_element(),
+        group(
+            "PATH",
+            "Where Flint finds kubectl plugins, helm and credential helpers: absolute folders \
+             separated by colons. Empty uses the login shell's PATH. Applies after a restart.",
+            draft.is_edited(Field::Path),
+            theme,
         )
-        .child(
-            group(
-                "helm",
-                "The helm binary for Helm releases. Empty finds helm on PATH.",
-                draft.is_edited(Field::Helm),
-                theme,
-            )
-            .children(text_input(page, TextField::Helm, theme)),
+        .children(text_input(page, TextField::Path, theme))
+        .into_any_element(),
+        group(
+            "helm",
+            "The helm binary for Helm releases. Empty finds helm on PATH.",
+            draft.is_edited(Field::Helm),
+            theme,
         )
-        .into_any_element()
+        .children(text_input(page, TextField::Helm, theme))
+        .into_any_element(),
+    ]
 }
 
 /// The confirmation's title.

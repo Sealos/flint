@@ -26,6 +26,7 @@ use super::super::settings_view::{
 #[cfg(any(test, feature = "automation"))]
 use super::super::view_state::SettingsState;
 use super::Workspace;
+use flint_core::settings::{PROTECTION_CONFIRMATION_STALE, SettingsWriteFailure};
 
 /// How long a Save waits for the core's answer before it says it could not be confirmed.
 const SAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -33,6 +34,43 @@ const SAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// What the footer says when the core did not answer a Save in time.
 const UNCONFIRMED: &str =
     "The save could not be confirmed. Your edits are kept; save again to retry.";
+
+/// What the footer says when a Save asked for by quit or close went through but edits were made
+/// while it was being written: the quit or close waits for them.
+const EDITED_WHILE_SAVING: &str =
+    "Saved. Edits made while saving are not saved yet; save or revert them, then try again.";
+
+/// What the footer says when a Save stopped part way: what was written, what was refused and
+/// why, and what was not tried.
+pub(in crate::ui) fn save_failure_note(
+    writes: &[Change],
+    failure: &SettingsWriteFailure,
+) -> String {
+    let written = failure.written.min(writes.len());
+    let names = |changes: &[Change]| {
+        let names: Vec<&str> = changes.iter().map(Change::what).collect();
+        match names.as_slice() {
+            [] => String::new(),
+            [one] => (*one).to_owned(),
+            [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        }
+    };
+    let mut note = String::new();
+    if written > 0 {
+        note.push_str(&format!("Saved {}. ", names(&writes[..written])));
+    }
+    match writes.get(written) {
+        Some(failed) => {
+            note.push_str(&format!("Not saved: {}: {}", failed.what(), failure.why));
+            let rest = &writes[written + 1..];
+            if !rest.is_empty() {
+                note.push_str(&format!(". Also not saved: {}", names(rest)));
+            }
+        }
+        None => note.push_str(&format!("Not saved: {}", failure.why)),
+    }
+    note
+}
 
 impl Workspace {
     pub(super) fn settings_guards(guards: Guards<Self>) -> Guards<Self> {
@@ -52,7 +90,10 @@ impl Workspace {
             .when::<EditAppearance>(editable)
             .when::<EditDesktopNotifications>(editable)
             .when::<EditWatchMode>(editable)
-            .when::<SaveSettings>(|ws, cx| ws.can_save_settings(cx))
+            // With a field's text invalid, Save shows that field instead of writing.
+            .when::<SaveSettings>(|ws, cx| {
+                ws.can_save_settings(cx) || ws.settings_field_error_to_show()
+            })
             .when::<RevertSettings>(|ws, _| {
                 settings_view::can_revert(&ws.settings_page) && ws.settings_page.saving.is_none()
             });
@@ -186,10 +227,22 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Whether a field holds invalid text that Save would show rather than write.
+    fn settings_field_error_to_show(&self) -> bool {
+        self.settings_page.open
+            && self.settings_page.saving.is_none()
+            && !self.settings_page.logs_paths.errors.is_empty()
+    }
+
     /// Saves the draft. A draft that turns local cluster protection off asks first
     /// ([`Self::confirm_unprotect`]), whichever way Save was asked for: the button, the banner's
-    /// Save anyway, the keyboard, the palette, or the quit and close question.
+    /// Save anyway, the keyboard, the palette, or the quit and close question. While a field
+    /// holds invalid text, nothing is written: Save shows that field, scrolled into view.
     fn save_settings(&mut self, then: Option<Then>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_field_error_to_show() {
+            self.show_settings_field_error(window, cx);
+            return;
+        }
         if !self.can_save_settings(cx) {
             return;
         }
@@ -197,17 +250,20 @@ impl Workspace {
             self.confirm_unprotect(then, window, cx);
             return;
         }
-        self.write_settings_draft(then, window, cx);
+        self.write_settings_draft(then, None, window, cx);
     }
 
     /// Hands the edited fields, and only those, to the core. They stay in the draft until it
     /// answers: written, they leave it and `then` runs; refused, or unanswered within
     /// [`SAVE_WAIT`], they stay, the footer says why, and `then` does not run. Nothing happens
     /// without edits, while `settings.toml` is invalid, or while an earlier Save is pending.
-    /// Only [`Self::save_settings`] and a confirmed [`Self::confirm_unprotect`] call it.
+    /// Only [`Self::save_settings`] and a confirmed [`Self::confirm_unprotect`] call it; the
+    /// latter passes `confirmed`, the revision of the settings it was confirmed over, which the
+    /// core requires to turn protection off.
     pub(super) fn write_settings_draft(
         &mut self,
         then: Option<Then>,
+        confirmed: Option<flint_core::settings::SettingsRevision>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -215,11 +271,12 @@ impl Workspace {
             return;
         }
         let writes = self.settings_page.draft.edits();
-        let reply = self
-            .model
-            .read(cx)
-            .core()
-            .write_settings(writes.iter().map(|c| c.clone().into_write()).collect());
+        let reply = self.model.read(cx).core().write_settings(
+            writes
+                .iter()
+                .map(|c| c.clone().into_write(confirmed))
+                .collect(),
+        );
         let written = writes.clone();
         let answer = cx.spawn_in(window, async move |this, cx| {
             let result = reply.await;
@@ -240,6 +297,7 @@ impl Workspace {
             cx.background_executor().timer(SAVE_WAIT).await;
             let _ = this.update(cx, |ws, cx| {
                 if ws.settings_page.saving.take().is_some() {
+                    ws.take_typed_while_saving(cx);
                     ws.settings_page.save_note = Some(UNCONFIRMED.to_owned());
                     cx.notify();
                 }
@@ -254,26 +312,53 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The core's answer to a Save of `writes`.
+    /// The core's answer to a Save of `writes`. Text typed into a field meanwhile joins the
+    /// draft first, so it is neither lost nor taken for saved. Written edits leave the draft;
+    /// on a failure the footer names what was saved and what was not. `then` (quit, close) runs
+    /// only once everything is saved and nothing new waits.
     fn finish_save(
         &mut self,
         writes: &[Change],
-        result: Result<(), String>,
+        result: Result<(), SettingsWriteFailure>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(saving) = self.settings_page.saving.take() else {
             return;
         };
+        self.take_typed_while_saving(cx);
         match result {
             Ok(()) => {
                 self.settings_page.draft.saved(writes);
-                for then in saving.after {
-                    then(window, cx);
+                if self.has_settings_draft() {
+                    if !saving.after.is_empty() {
+                        self.settings_page.save_note = Some(EDITED_WHILE_SAVING.to_owned());
+                    }
+                } else {
+                    for then in saving.after {
+                        then(window, cx);
+                    }
                 }
             }
-            Err(why) => {
-                self.settings_page.save_note = Some(format!("Not saved: {why}"));
+            Err(failure) => {
+                let written = failure.written.min(writes.len());
+                self.settings_page.draft.saved(&writes[..written]);
+                self.settings_page.save_note = Some(save_failure_note(writes, &failure));
+                // Turning protection off was confirmed over a file that changed since: ask
+                // again, over the file as it is now.
+                if failure.why.contains(PROTECTION_CONFIRMATION_STALE)
+                    && self.settings_page.draft.loosens_protection()
+                {
+                    let after = saving.after;
+                    let then: Option<Then> = (!after.is_empty()).then(|| {
+                        Rc::new(move |window: &mut Window, cx: &mut App| {
+                            for then in &after {
+                                then(window, cx);
+                            }
+                        }) as Then
+                    });
+                    self.confirm_unprotect(then, window, cx);
+                }
             }
         }
         cx.notify();
@@ -364,9 +449,14 @@ impl Workspace {
             .state(&model.settings, model.settings_error.is_some())
     }
 
-    /// Whether Settings holds edits not yet written, a Save under way included.
+    /// Whether Settings holds edits not yet written, a Save under way included: edits in the
+    /// draft, a field's invalid text (an edit that cannot be saved yet), or text typed while a
+    /// Save was being written.
     pub(in crate::ui) fn has_settings_draft(&self) -> bool {
+        let fields = &self.settings_page.logs_paths;
         self.settings_page.draft.is_dirty()
+            || !fields.errors.is_empty()
+            || !fields.typed_while_saving.is_empty()
     }
 
     /// Asks Save / Discard / Cancel about unsaved settings, if there are any; Save (once

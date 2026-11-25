@@ -45,7 +45,15 @@ pub enum SettingsError {
         "the AI scope of \"{context}\" changed while it was being edited; open Edit AI Scope again"
     )]
     ScopeChanged { context: String },
+    /// Turning local cluster protection off, confirmed over settings the file no longer holds
+    /// (or with no confirmation at all).
+    #[error("{PROTECTION_CONFIRMATION_STALE}")]
+    ProtectionConfirmationStale,
 }
+
+/// Why turning local cluster protection off was refused: the confirmation was for other settings.
+pub const PROTECTION_CONFIRMATION_STALE: &str =
+    "settings.toml changed after turning off local cluster protection was confirmed; confirm again";
 
 /// Which kinds are watched while a cluster is active (ADR-0008).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1344,9 +1352,38 @@ pub enum SettingsWrite {
     Path(Option<String>),
     /// The `helm` binary; `None` finds it on `PATH`.
     Helm(Option<PathBuf>),
-    /// Whether known local clusters are protected too. Turning it off needs a real file lock
-    /// ([`set_protect_local_clusters`]).
-    ProtectLocalClusters(bool),
+    /// Whether known local clusters are protected too. Turning it off needs a real file lock and
+    /// the revision of the settings the person confirmed it over; it is refused if the file no
+    /// longer holds them ([`set_protect_local_clusters`]).
+    ProtectLocalClusters {
+        on: bool,
+        confirmed: Option<SettingsRevision>,
+    },
+}
+
+/// How a batch of [`SettingsWrite`]s failed ([`crate::CoreHandle::write_settings`]): the first
+/// `written` were written, the next one was refused for `why`, and those after it were not tried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsWriteFailure {
+    pub written: usize,
+    pub why: String,
+}
+
+/// A fingerprint of the settings a confirmation was asked over: what [`load_settings`] read, as
+/// the core last reported it. A write that needs that confirmation compares it with the file
+/// under the save lock, so it never applies over a file changed since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SettingsRevision(u64);
+
+impl SettingsRevision {
+    /// The revision of `settings`. Equal settings give equal revisions within one build.
+    pub fn of(settings: &Settings) -> Self {
+        use std::hash::{Hash as _, Hasher as _};
+        // Every field, in declaration order, maps in key order: deterministic.
+        let mut hasher = std::hash::DefaultHasher::new();
+        format!("{settings:?}").hash(&mut hasher);
+        SettingsRevision(hasher.finish())
+    }
 }
 
 impl SettingsWrite {
@@ -1362,7 +1399,7 @@ impl SettingsWrite {
             SettingsWrite::KubeconfigPaths(_) => "the kubeconfig paths",
             SettingsWrite::Path(_) => "the PATH override",
             SettingsWrite::Helm(_) => "the helm path",
-            SettingsWrite::ProtectLocalClusters(_) => "local cluster protection",
+            SettingsWrite::ProtectLocalClusters { .. } => "local cluster protection",
         }
     }
 
@@ -1378,7 +1415,9 @@ impl SettingsWrite {
             SettingsWrite::KubeconfigPaths(paths) => set_kubeconfig_paths(dir, &paths),
             SettingsWrite::Path(path) => set_path_override(dir, path.as_deref()),
             SettingsWrite::Helm(helm) => set_helm(dir, helm.as_deref()),
-            SettingsWrite::ProtectLocalClusters(on) => set_protect_local_clusters(dir, on),
+            SettingsWrite::ProtectLocalClusters { on, confirmed } => {
+                set_protect_local_clusters(dir, on, confirmed)
+            }
         }
     }
 }
@@ -1474,30 +1513,39 @@ pub fn is_storable_path(path: &Path) -> bool {
 }
 
 /// Sets the extra kubeconfig files and writes `settings.toml`; an empty list removes the key.
-/// Each must be absolute or start with `~`, and none may be listed twice. The clusters reload as
-/// after a hand edit. Returns the settings as written.
+/// Each entry the file does not list yet must be absolute or start with `~`, and may not be
+/// listed twice; the entries it already lists stay accepted as they are, so a list edited by hand
+/// can still be added to. The clusters reload as after a hand edit. Returns the settings as
+/// written.
 pub fn set_kubeconfig_paths(dir: &Path, paths: &[PathBuf]) -> Result<Settings, SettingsError> {
-    let invalid = |reason: String| SettingsError::Invalid {
-        path: dir.join(SETTINGS_FILE),
-        reason,
-    };
-    if let Some(bad) = paths.iter().find(|p| !is_storable_path(p)) {
-        return Err(invalid(format!(
-            "kubeconfig path {} must be absolute or start with ~",
-            bad.display()
-        )));
-    }
-    if let Some(twice) = paths
-        .iter()
-        .enumerate()
-        .find_map(|(i, p)| paths[..i].contains(p).then_some(p))
-    {
-        return Err(invalid(format!(
-            "kubeconfig path {} is listed twice",
-            twice.display()
-        )));
-    }
-    edit_settings(dir, |table, _| {
+    edit_settings(dir, |table, path| {
+        let invalid = |reason: String| SettingsError::Invalid {
+            path: path.to_owned(),
+            reason,
+        };
+        let saved: Vec<PathBuf> = match table.get("kubeconfig_paths") {
+            Some(list) => list.clone().try_into().unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let count = |list: &[PathBuf], p: &PathBuf| list.iter().filter(|q| *q == p).count();
+        if let Some(bad) = paths
+            .iter()
+            .find(|p| !saved.contains(p) && !is_storable_path(p))
+        {
+            return Err(invalid(format!(
+                "kubeconfig path {} must be absolute or start with ~",
+                bad.display()
+            )));
+        }
+        if let Some(twice) = paths
+            .iter()
+            .find(|p| count(paths, p) > count(&saved, p).max(1))
+        {
+            return Err(invalid(format!(
+                "kubeconfig path {} is listed twice",
+                twice.display()
+            )));
+        }
         if paths.is_empty() {
             table.remove("kubeconfig_paths");
         } else {
@@ -1558,17 +1606,36 @@ pub fn set_helm(dir: &Path, helm: Option<&Path>) -> Result<Settings, SettingsErr
 ///
 /// Turning it on is a revocation, and goes through even where file locks are unsupported.
 /// Turning it off loosens the write gate, so it refuses without a real lock rather than risk
-/// overwriting a concurrent save. The app asks for confirmation before it sends that.
-pub fn set_protect_local_clusters(dir: &Path, on: bool) -> Result<Settings, SettingsError> {
-    set_protect_local_clusters_with(dir, on, try_flock)
+/// overwriting a concurrent save, and refuses unless `confirmed` is the revision of the settings
+/// the file holds under that lock: the app asks for confirmation over the settings it shows, and
+/// a file changed since was not what was confirmed.
+pub fn set_protect_local_clusters(
+    dir: &Path,
+    on: bool,
+    confirmed: Option<SettingsRevision>,
+) -> Result<Settings, SettingsError> {
+    set_protect_local_clusters_with(dir, on, confirmed, try_flock)
 }
 
 fn set_protect_local_clusters_with(
     dir: &Path,
     on: bool,
+    confirmed: Option<SettingsRevision>,
     try_lock: TryLock,
 ) -> Result<Settings, SettingsError> {
-    let edit = |table: &mut toml::Table, _: &Path| {
+    let edit = |table: &mut toml::Table, path: &Path| {
+        if !on {
+            let held: Settings =
+                toml::Value::Table(table.clone())
+                    .try_into()
+                    .map_err(|source| SettingsError::Parse {
+                        path: path.to_owned(),
+                        source,
+                    })?;
+            if confirmed != Some(SettingsRevision::of(&held)) {
+                return Err(SettingsError::ProtectionConfirmationStale);
+            }
+        }
         table.insert("protect_local_clusters".into(), toml::Value::Boolean(on));
         Ok(true)
     };
@@ -3007,15 +3074,84 @@ mod tests {
     fn protect_local_clusters_needs_a_lock_only_to_turn_off() {
         let no_lock: TryLock = |_| Err(io::Error::from_raw_os_error(libc::ENOLCK));
         let dir = tempfile::tempdir().unwrap();
-        let on = set_protect_local_clusters_with(dir.path(), true, no_lock).unwrap();
+        let on = set_protect_local_clusters_with(dir.path(), true, None, no_lock).unwrap();
         assert!(on.protect_local_clusters);
-        let refused = set_protect_local_clusters_with(dir.path(), false, no_lock);
+        let confirmed = Some(SettingsRevision::of(&on));
+        let refused = set_protect_local_clusters_with(dir.path(), false, confirmed, no_lock);
         assert!(matches!(refused, Err(SettingsError::Write { .. })));
         assert!(load_settings(dir.path()).unwrap().protect_local_clusters);
 
-        let off = set_protect_local_clusters(dir.path(), false).unwrap();
+        let off = set_protect_local_clusters(dir.path(), false, confirmed).unwrap();
         assert!(!off.protect_local_clusters);
         assert_eq!(load_settings(dir.path()).unwrap(), off);
+    }
+
+    // covers UP-127: turning protection off was confirmed over one settings file; if the file
+    // changed since, or no confirmation came with it, nothing is written and protection stays.
+    #[test]
+    fn unprotect_is_refused_over_settings_changed_since_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        set_protect_local_clusters(dir.path(), true, None).unwrap();
+        let shown = set_log_buffer_lines(dir.path(), 5000).unwrap();
+        let confirmed = SettingsRevision::of(&shown);
+        // Another save lands between the confirmation and the write.
+        let newer = set_log_buffer_lines(dir.path(), 6000).unwrap();
+        assert_ne!(SettingsRevision::of(&newer), confirmed);
+        let text = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
+
+        for stale in [Some(confirmed), None] {
+            let refused = set_protect_local_clusters(dir.path(), false, stale);
+            assert!(
+                matches!(refused, Err(SettingsError::ProtectionConfirmationStale)),
+                "{refused:?}"
+            );
+            let after = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
+            assert_eq!(after, text, "nothing written");
+            assert!(load_settings(dir.path()).unwrap().protect_local_clusters);
+        }
+        let refused = SettingsWrite::ProtectLocalClusters {
+            on: false,
+            confirmed: Some(confirmed),
+        }
+        .write(dir.path());
+        assert!(refused.is_err());
+
+        // Confirmed over the file as it is now, it goes through.
+        let off = SettingsWrite::ProtectLocalClusters {
+            on: false,
+            confirmed: Some(SettingsRevision::of(&load_settings(dir.path()).unwrap())),
+        }
+        .write(dir.path())
+        .unwrap();
+        assert!(!off.protect_local_clusters);
+        assert_eq!(off.log_buffer_lines, 6000);
+    }
+
+    // covers UP-127: entries the file already lists stay accepted as they are, even ones the
+    // view would not add (relative, or listed twice by hand); new ones are still checked.
+    #[test]
+    fn kubeconfig_paths_keep_entries_already_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "kubeconfig_paths = [\"rel/config\", \"/dup\", \"/dup\"]\n",
+        )
+        .unwrap();
+        let mut paths: Vec<PathBuf> = ["rel/config", "/dup", "/dup", "/new"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let written = set_kubeconfig_paths(dir.path(), &paths).unwrap();
+        assert_eq!(written.kubeconfig_paths, paths);
+
+        paths.push(PathBuf::from("other/rel"));
+        assert!(set_kubeconfig_paths(dir.path(), &paths).is_err());
+        paths.pop();
+        paths.push(PathBuf::from("/new"));
+        assert!(set_kubeconfig_paths(dir.path(), &paths).is_err());
+        paths.pop();
+        paths.push(PathBuf::from("/dup"));
+        assert!(set_kubeconfig_paths(dir.path(), &paths).is_err());
     }
 
     // covers UP-12
@@ -3922,7 +4058,13 @@ server = "https://staging.example:6443"
             ("set_helm", set_helm(dir, Some(Path::new("/h"))).is_err()),
             (
                 "set_protect_local_clusters",
-                set_protect_local_clusters(dir, false).is_err(),
+                // Confirmed over the file as it loads now, if it does.
+                set_protect_local_clusters(
+                    dir,
+                    false,
+                    load_settings(dir).ok().map(|s| SettingsRevision::of(&s)),
+                )
+                .is_err(),
             ),
         ]
     }

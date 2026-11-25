@@ -142,15 +142,15 @@ fn an_edit_stays_until_the_core_says_it_is_written() {
 fn changes_map_to_the_core_writes() {
     use flint_core::settings::SettingsWrite;
     assert_eq!(
-        Change::Appearance(Appearance::Dark).into_write(),
+        Change::Appearance(Appearance::Dark).into_write(None),
         SettingsWrite::Appearance(Appearance::Dark)
     );
     assert_eq!(
-        Change::DesktopNotifications(true).into_write(),
+        Change::DesktopNotifications(true).into_write(None),
         SettingsWrite::DesktopNotifications(true)
     );
     assert_eq!(
-        Change::WatchMode(WatchMode::OnView).into_write(),
+        Change::WatchMode(WatchMode::OnView).into_write(None),
         SettingsWrite::WatchMode(WatchMode::OnView)
     );
 }
@@ -176,9 +176,21 @@ fn only_turning_protection_off_loosens_it() {
     let mut draft = SettingsDraft::default();
     draft.edit(Change::ProtectLocalClusters(true), &file());
     assert!(!draft.loosens_protection(), "turning it on is no loosening");
+    let confirmed = flint_core::settings::SettingsRevision::of(&protected);
     assert_eq!(
-        Change::ProtectLocalClusters(false).into_write(),
-        flint_core::settings::SettingsWrite::ProtectLocalClusters(false)
+        Change::ProtectLocalClusters(false).into_write(Some(confirmed)),
+        flint_core::settings::SettingsWrite::ProtectLocalClusters {
+            on: false,
+            confirmed: Some(confirmed),
+        }
+    );
+    assert_eq!(
+        Change::ProtectLocalClusters(true).into_write(Some(confirmed)),
+        flint_core::settings::SettingsWrite::ProtectLocalClusters {
+            on: true,
+            confirmed: None,
+        },
+        "turning it on needs no confirmation"
     );
 }
 
