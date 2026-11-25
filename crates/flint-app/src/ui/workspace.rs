@@ -1837,6 +1837,7 @@ impl Workspace {
             .text_color(theme.sidebar_foreground)
             .border_r_1()
             .border_color(theme.sidebar_border)
+            .pr(px(HANDLE_GUTTER))
             .child(pane_title("CLUSTERS", traffic_lights, theme))
             .child(list)
             .child(self.render_sets_panel(open_members.as_ref().map(Vec::len), theme, cx))
@@ -2192,6 +2193,7 @@ impl Workspace {
             .text_color(theme.sidebar_foreground)
             .border_r_1()
             .border_color(theme.sidebar_border)
+            .pr(px(HANDLE_GUTTER))
             .child(pane_title("RESOURCES", px(0.), theme))
             .child(div().flex_1().min_h_0().child(self.nav.clone()))
             .child(pane_handle(
@@ -2348,11 +2350,14 @@ impl Workspace {
             first_row
                 .border_b_1()
                 .border_color(theme.border)
-                .child(access_mode)
-                .children(namespaces)
-                .children(keep_watching)
-                .children(watch_mode)
-                .children(alerts)
+                .child(
+                    super::theme::keeps_press(h_flex().flex_none().gap_2())
+                        .child(access_mode)
+                        .children(namespaces)
+                        .children(keep_watching)
+                        .children(watch_mode)
+                        .children(alerts),
+                )
                 .into_any_element()
         }
     }
@@ -3037,6 +3042,7 @@ impl Workspace {
                                 .relative()
                                 .border_l_1()
                                 .border_color(theme.border)
+                                .pl(px(HANDLE_GUTTER))
                                 .child(detail)
                                 .children(self.detail_tag_strip(theme, cx))
                                 .child(pane_handle(
@@ -3694,6 +3700,22 @@ fn sidebar_error(
         .into_any_element()
 }
 
+/// The width of a resize handle's band (gpui's 1 px line and 4 px of padding). A pane keeps this
+/// much of its edge free of content, so the band takes the pointer only over empty space.
+const HANDLE_GUTTER: f32 = 5.;
+
+/// Whether the top of the main area needs its own strip to drag the window by: only where nothing
+/// else draws there. The Settings page (with its own title bar), a set's bar and a held edit
+/// have content at the top, and a strip over them would swallow presses meant for it.
+fn window_strip_shown(
+    has_cluster: bool,
+    settings_open: bool,
+    set_running: bool,
+    edit_alone: bool,
+) -> bool {
+    !(has_cluster || settings_open || set_running || edit_alone)
+}
+
 /// The drag handle on one edge of a resizable pane.
 fn pane_handle(id: &'static str, pane: Pane, edge: HandleEdge) -> impl IntoElement {
     resize_handle::<PaneDrag, PaneDrag>(id, Axis::Horizontal)
@@ -3927,6 +3949,12 @@ impl Render for Workspace {
         let cx: &Context<Self> = cx;
         let theme = cx.theme();
         let has_cluster = self.model.read(cx).active_cluster().is_some();
+        let strip_shown = window_strip_shown(
+            has_cluster,
+            self.settings_page.open,
+            self.sets.running.is_some(),
+            self.edit_shown_alone(cx).is_some(),
+        );
         let widths = self.layout(window_width, cx);
         let traffic_lights = super::theme::traffic_light_inset(window);
         h_flex()
@@ -3996,7 +4024,7 @@ impl Render for Workspace {
                     .relative()
                     // With no cluster there is no header, and the window still needs a top to
                     // drag it by.
-                    .when(!has_cluster, |el| {
+                    .when(strip_shown, |el| {
                         el.child(
                             super::theme::moves_window(div())
                                 .absolute()
@@ -4029,6 +4057,7 @@ impl Render for Workspace {
                                 .relative()
                                 .border_t_1()
                                 .border_color(theme.border)
+                                .pt(px(HANDLE_GUTTER))
                                 .child(self.dock.clone())
                                 .child(
                                     resize_handle::<DockDrag, DockDrag>(
@@ -4168,9 +4197,9 @@ mod view_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        Layout, LockEntry, MIN_LIST_WIDTH, ServerMove, access_mode_short_text, control_name,
-        exposure_label, layout, lock_label, lock_menu, mode_name, namespace_summary,
-        no_contexts_text, repointed_text, watch_mode_label,
+        HANDLE_GUTTER, Layout, LockEntry, MIN_LIST_WIDTH, ServerMove, access_mode_short_text,
+        control_name, exposure_label, layout, lock_label, lock_menu, mode_name, namespace_summary,
+        no_contexts_text, repointed_text, watch_mode_label, window_strip_shown,
     };
     use flint_core::settings::{AiExposureState, PaneWidths, TrustState};
     use flint_core::{Protection, WatchMode};
@@ -4552,5 +4581,22 @@ mod tests {
             broken.lines
         );
         assert_eq!(broken.lines[1..], unset.lines[..]);
+    }
+
+    #[test]
+    fn the_window_strip_shows_only_over_an_empty_main_area() {
+        assert!(window_strip_shown(false, false, false, false));
+        // A cluster has its header; Settings has its title bar; a set has its bar; a held edit
+        // has its pane. A strip over any of them would take their presses.
+        assert!(!window_strip_shown(true, false, false, false));
+        assert!(!window_strip_shown(false, true, false, false));
+        assert!(!window_strip_shown(false, false, true, false));
+        assert!(!window_strip_shown(false, false, false, true));
+    }
+
+    #[test]
+    fn the_handle_gutter_covers_the_whole_band() {
+        // gpui's band: a 1 px line and 4 px of padding on the inner side.
+        assert_eq!(HANDLE_GUTTER, 1. + 4.);
     }
 }
