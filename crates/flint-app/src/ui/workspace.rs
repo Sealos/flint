@@ -1001,11 +1001,17 @@ impl Workspace {
                         c.provisional || c.paused,
                     )
                 });
+        let thresholds = self
+            .model
+            .read(cx)
+            .settings
+            .thresholds_for(&cluster, server.as_deref());
         detail.update(cx, |d, cx| {
             d.set_sessions_blocked(why, cx);
             d.set_protected(protected, label, cx);
             d.set_row_writes_paused(writes_paused, cx);
             d.set_server(server);
+            d.set_thresholds(thresholds, cx);
             match endpoint {
                 Some(Some(endpoint)) => d.note_endpoint(endpoint, cx),
                 Some(None) => {}

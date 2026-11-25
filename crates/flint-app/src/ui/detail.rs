@@ -446,6 +446,17 @@ impl DetailView {
         self.connection_guards = Some(guards);
     }
 
+    /// Takes the thresholds Settings gives the object's cluster, which colour the usage rings.
+    pub(in crate::ui) fn set_thresholds(
+        &mut self,
+        thresholds: flint_core::thresholds::Thresholds,
+        cx: &mut Context<Self>,
+    ) {
+        if self.usage.set_thresholds(thresholds) {
+            cx.notify();
+        }
+    }
+
     pub(in crate::ui) fn set_server(&mut self, server: Option<String>) {
         if self.row_server.is_none() {
             self.server = server;
@@ -1477,13 +1488,15 @@ impl DetailView {
                     theme,
                 ));
             }
-            Some(usage::UsagePanel::Lines { cpu, memory }) => {
+            Some(usage::UsagePanel::Rings { cpu, memory }) => {
                 body = body.child(section(
                     "Usage",
                     None,
-                    v_flex()
-                        .child(key_value(("usage", 0), "CPU", cpu, false, theme))
-                        .child(key_value(("usage", 1), "Memory", memory, false, theme)),
+                    h_flex()
+                        .gap_6()
+                        .flex_wrap()
+                        .child(usage_ring_block("usage-cpu", cpu, theme))
+                        .child(usage_ring_block("usage-memory", memory, theme)),
                     theme,
                 ));
             }
@@ -1859,6 +1872,45 @@ fn section(
         .child(content)
 }
 
+/// One metric of the Usage section: its ring (or the amount when there is no ring) with the exact
+/// amounts and shares beside it.
+fn usage_ring_block(id: &'static str, ring: usage::UsageRing, theme: &Theme) -> impl IntoElement {
+    let usage::UsageRing {
+        label,
+        spec,
+        center,
+        lines,
+    } = ring;
+    h_flex()
+        .id(id)
+        .gap_3()
+        .items_center()
+        .child(match spec {
+            Some(spec) => self::ring::usage_ring(spec, center, theme).into_any_element(),
+            None => div()
+                .w(px(88.))
+                .flex_none()
+                .text_sm()
+                .font_semibold()
+                .text_center()
+                .text_color(theme.muted_foreground)
+                .child(center)
+                .into_any_element(),
+        })
+        .child(
+            v_flex()
+                .gap_0p5()
+                .text_sm()
+                .child(div().font_semibold().child(label))
+                .children(lines.into_iter().map(|line| {
+                    div()
+                        .font_features(tabular_figures())
+                        .text_color(theme.muted_foreground)
+                        .child(line)
+                })),
+        )
+}
+
 /// One metadata line; `mono` for names and identifiers.
 fn key_value(
     id: (&'static str, usize),
@@ -2081,6 +2133,9 @@ mod sync;
 
 #[path = "detail_usage.rs"]
 mod usage;
+
+#[path = "detail_usage_ring.rs"]
+mod ring;
 
 pub(in crate::ui) use actions::{
     Opening, PROTECTED_NOTE, ShellPod, protected_reason, reason, refused,
