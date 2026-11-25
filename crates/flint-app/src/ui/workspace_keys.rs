@@ -195,6 +195,10 @@ impl Workspace {
     /// Takes focus back after it was lost: to the overview when that is what the main area
     /// shows.
     pub(super) fn recover_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_page.open {
+            window.focus(&self.settings_page.focus, cx);
+            return;
+        }
         if self.list.is_none()
             && !self.namespace_popover_open
             && let Some((overview, _)) = &self.dashboard

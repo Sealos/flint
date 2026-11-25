@@ -352,6 +352,11 @@ pub(crate) enum Request {
     ReloadKubeconfig {
         reply: oneshot::Sender<bool>,
     },
+    /// Write these settings in order, and say how that went.
+    WriteSettings {
+        writes: Vec<crate::settings::SettingsWrite>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     /// Activates `cluster` only if it is still the slot and definition given, in the same step.
     ActivatePinned {
         cluster: ClusterId,
@@ -375,12 +380,7 @@ pub(crate) enum Request {
     Unsubscribe {
         id: u64,
     },
-    /// An overview of `cluster` is showing.
-    OpenOverview {
-        id: u64,
-        cluster: ClusterId,
-    },
-    /// [`Self::OpenOverview`] only if `cluster` is still the slot `generation`.
+    /// An overview of `cluster` is showing, only if `cluster` is still the slot `generation`.
     OpenOverviewOn {
         id: u64,
         cluster: ClusterId,
@@ -852,8 +852,7 @@ impl CoreHandle {
     }
 
     /// What the feed of `cluster` knows. `None` while it has none: it is neither kept watching,
-    /// selected nor in the running set, is in watch mode On view with no overview showing, is not
-    /// connected, is paused, or its sign-in runs a program and it is in the background without
+    /// selected nor in the running set, is not connected, is paused, or its sign-in runs a program and it is in the background without
     /// consent. A kept cluster that stopped or can't be reached shows its last values, with
     /// their age in the status. Never blocks.
     pub fn telemetry(&self, cluster: &str) -> Option<crate::telemetry::ClusterTelemetry> {
@@ -923,27 +922,11 @@ impl CoreHandle {
         }
     }
 
-    /// Marks `cluster`'s overview as showing until the result is dropped, so its telemetry feed
-    /// runs in watch mode On view too, while the cluster is active and not paused. Reads only.
-    /// A handle bound to a member starts nothing. Never blocks.
-    pub fn open_overview(&self, cluster: &str) -> OverviewInterest {
-        let id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
-        if matches!(self.read_binding(cluster), Ok(None)) {
-            let _ = self.requests.push(Request::OpenOverview {
-                id,
-                cluster: cluster.to_owned(),
-            });
-        }
-        OverviewInterest {
-            id,
-            requests: self.requests.clone(),
-            bound: None,
-        }
-    }
-
-    /// [`Self::open_overview`] for the slot `generation` of `cluster`. The core compares them as
-    /// it registers, so a context re-pointed meanwhile registers nothing, and
-    /// [`OverviewInterest::telemetry`] never reads the feed of a later slot.
+    /// Marks the overview of the slot `generation` of `cluster` as showing until the result is
+    /// dropped. The cluster's feed runs whether or not one is showing, in either watch mode
+    /// (#715). Reads only. A handle bound to a member starts nothing. Never blocks. The core
+    /// compares the generation as it registers, so a context re-pointed meanwhile registers
+    /// nothing, and [`OverviewInterest::telemetry`] never reads the feed of a later slot.
     pub fn open_overview_on(&self, cluster: &str, generation: u64) -> OverviewInterest {
         let id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
         let (live, seen) = watch::channel(false);
@@ -1180,6 +1163,26 @@ impl CoreHandle {
         let (reply, rx) = oneshot::channel();
         let _ = self.requests.push(Request::ReloadKubeconfig { reply });
         async move { reload_outcome(rx.await.ok()) }
+    }
+
+    /// Writes `writes` to `settings.toml` one after another, each through its own setter, and
+    /// resolves once they are written and applied, or with the (sanitized) reason the first that
+    /// failed did not; the ones after it are not written. The change also arrives as
+    /// `Event::SettingsChanged`, and a failure as `Event::Error`. Like every settings write it
+    /// refuses while `settings.toml` is invalid. Works on any executor.
+    pub fn write_settings(
+        &self,
+        writes: Vec<crate::settings::SettingsWrite>,
+    ) -> impl Future<Output = Result<(), String>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let sent = self.requests.push(Request::WriteSettings { writes, reply });
+        async move {
+            if sent.is_err() {
+                return Err("the settings could not be sent to be written".to_owned());
+            }
+            rx.await
+                .unwrap_or_else(|_| Err("the settings were not written".to_owned()))
+        }
     }
 
     /// The kinds of `cluster` being watched (or polled) right now, sorted. For status displays
@@ -1803,7 +1806,7 @@ impl Drop for Subscription {
     }
 }
 
-/// An overview on show, from [`CoreHandle::open_overview`]. Dropping it ends its watches.
+/// An overview on show, from [`CoreHandle::open_overview_on`]. Dropping it ends its binding.
 #[derive(Debug)]
 pub struct OverviewInterest {
     id: u64,

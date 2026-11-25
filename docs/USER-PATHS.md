@@ -216,7 +216,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 
 ### UP-25 Change the watch mode
 - **When** I set the watch mode to "On view", globally or for one cluster.
-- **Then** only open views are watched, and the setting persists.
+- **Then** only open views are watched, and the setting persists. Problems are still found without an open view: the
+  problem feed's seven kinds are watched while the cluster is selected or an open set member, so a Pod Pending for
+  longer than its threshold (five minutes by default) shows in the alert center and the set dashboard.
 - Tests: unit, cluster.
 
 ### UP-26 Large cluster stays smooth
@@ -451,8 +453,11 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   unchecked options (delete emptyDir data, force pods without a controller), each saying what is lost; completed and
   failed pods are removed whatever they say. Drain's warning also names GitOps-managed pods it would evict. Each
   action rechecks the live object first. If the object changed, nothing is run again: a new review opens, saying
-  so. Drain reports what it did, also when it stopped early:
-  cordoned, evicted, blocked and why (a PodDisruptionBudget is named), skipped, not tried, may still be terminating.
+  so. A running drain's strip says where it is, pod by pod: the pod being evicted, how many were tried, evicted and
+  blocked, then how many are still terminating. Drain reports what it did, naming the node and its cluster, also when
+  it stopped early: cordoned, evicted, blocked and why (a PodDisruptionBudget is the reason, named when the server
+  names it), skipped, not tried (also the listed pods when the node check after listing stops it), may still be
+  terminating.
 - Tests: cluster, ui.
 
 ---
@@ -792,6 +797,20 @@ Deferred until cluster sets are scheduled (#199).
 - With a `settings.toml` that can't be read, a cluster without its own `proxy-url` is refused, and the settings error
   says the proxy setting could not be applied.
 - Tests: e2e (`flint-e2e/tests/proxy.rs`).
+
+### UP-126 Change settings in Settings
+- **When** I open Settings (Flint > Settings…, Cmd-, on macOS and Ctrl-, on Linux, or the command palette) and change
+  the appearance, desktop notifications or the default watch mode.
+- **Then** the main area shows Settings with its sections on the left. My edits wait in a draft until I press Save,
+  which writes only the settings I edited to `settings.toml`; Revert drops them. The draft stays while I switch views
+  and clusters, and the sidebar's Settings entry shows a dot meanwhile. If `settings.toml` changes while the draft
+  waits (from the Alerts menu, View > Appearance or an editor), a banner says so: Reload shows the file and drops the
+  draft, Save anyway writes only my edits. My edits leave the draft only once they are written: a Save that fails or
+  cannot be confirmed keeps them and says so. While `settings.toml` is invalid, Save is disabled. Quitting or closing
+  the window with a draft asks Save, Discard or Cancel, and a Save still being written is waited for. From the
+  keyboard, Tab and Shift-Tab go round the view's own controls, and Enter or Space works the one under the cursor.
+- Tests: unit (draft, revert, save of edited fields, the on-disk banner), ui (shortcut, save, banner, quit and close
+  question), e2e (`flint-e2e/tests/app/settings.rs`).
 
 ## M6: Install
 

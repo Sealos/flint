@@ -20,7 +20,7 @@ use flint_core::{
 };
 use flint_e2e::fake_api::{
     CONTEXT, ContainerLog, ExecEnd, FakeApiServer, FakePod, Fault, Gvr, Options, REMOTE_CONTEXT,
-    TtySize, Verb, WatchStep,
+    RequestRecord, TtySize, Verb, WatchStep,
 };
 
 mod core_support;
@@ -266,11 +266,18 @@ async fn a_pinned_read_is_one_get_and_a_changed_pin_sends_nothing() {
     .await
     .expect("the cluster list");
     let kind = KindId::new("apps", "deployments");
-    let count = |wanted: &dyn Fn(&str) -> bool| {
-        server.requests().iter().filter(|r| wanted(&r.path)).count()
+    let count = |wanted: &dyn Fn(&RequestRecord) -> bool| {
+        server.requests().iter().filter(|r| wanted(r)).count()
     };
-    let is_events = |path: &str| path.ends_with("/events");
-    let is_object = |path: &str| path == OBJECT;
+    // A detail's Events read names the object it is about. Problem detection runs in On view too
+    // (#715), and its feed lists Warning events across the cluster: that is not a detail's read.
+    let is_events = |r: &RequestRecord| {
+        r.path.ends_with("/events")
+            && r.parsed_query()
+                .field_selector
+                .is_some_and(|fields| fields.contains("involvedObject."))
+    };
+    let is_object = |r: &RequestRecord| r.path == OBJECT;
     let events_before = count(&is_events);
 
     let detail = core
@@ -2241,27 +2248,47 @@ async fn until_overview_watches(server: &FakeApiServer, open: bool, what: &str) 
     .unwrap_or_else(|_| panic!("{what}: never reached"));
 }
 
-// covers UP-25: On view watches the overview's kinds only while it is showing.
+// covers UP-25: in On view the selected cluster still finds problems with no overview open
+// (#715), a Pod Pending for longer than the default threshold among them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn in_on_view_the_overview_watches_its_kinds_until_it_is_left() {
-    let server = FakeApiServer::start().await.unwrap();
+async fn in_on_view_problems_are_found_with_no_overview_open() {
+    use flint_core::problems::ProblemKind;
+    // The server's time runs a minute past the default threshold behind, so a pod it creates now
+    // has been Pending that long.
+    let threshold = flint_core::ThresholdMetric::PendingPodSeconds.default_value();
+    let server = FakeApiServer::start_with(Options {
+        now: std::time::SystemTime::now() - Duration::from_secs(u64::from(threshold) + 60),
+        ..Options::default()
+    })
+    .await
+    .unwrap();
+    server.add_pod(FakePod::from_json(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "stuck", "namespace": "demo", "uid": "stuck-uid"},
+        "spec": {"containers": [{"name": "app", "image": "busybox:1.37.0"}]},
+        "status": {"phase": "Pending"},
+    })));
     let core = Core::start(&server, None).await;
     core.handle.discovery(CONTEXT).await.expect("connected");
-    // Past the manager's next pass, and long enough for a watch that should not exist to open.
-    core.handle.running_set().await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(core.handle.telemetry(CONTEXT).is_none());
-    for kind in ["pods", "nodes"] {
-        assert_eq!(server.open_watches(&Gvr::core(kind)), 0, "{kind}");
-    }
+    until_overview_watches(&server, true, "watching with no overview").await;
+    let pending = |core: &Core| {
+        core.handle.telemetry(CONTEXT).is_some_and(|feed| {
+            feed.snapshot
+                .problems
+                .iter()
+                .any(|problem| problem.kind() == ProblemKind::PodPending)
+        })
+    };
+    tokio::time::timeout(WAIT, async {
+        while !pending(&core) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the Pending pod is counted");
 
-    let overview = core.handle.open_overview(CONTEXT);
-    until_overview_watches(&server, true, "watching after opening").await;
-    assert!(core.handle.telemetry(CONTEXT).is_some());
-
-    drop(overview);
-    until_overview_watches(&server, false, "no watch after leaving").await;
-    assert!(core.handle.telemetry(CONTEXT).is_none());
+    assert_eq!(server.open_watches(&Gvr::core("pods")), 1, "one feed");
     assert!(server.writes().is_empty());
 }
 
@@ -2291,6 +2318,22 @@ async fn point_at(core: &Core, file: &Path, server: &FakeApiServer, namespace: &
     .expect("the load is reported")
 }
 
+/// Opens an overview on `generation` and waits until it reads that slot's own feed. `point_at`
+/// returns before the new slot has connected, and the previous definition's watches may still be
+/// closing on their server, so server-side watch counts alone do not show the slot is up.
+async fn open_own_feed(core: &Core, generation: u64) -> flint_core::OverviewInterest {
+    let open = core.handle.open_overview_on(CONTEXT, generation);
+    open.registered().await;
+    tokio::time::timeout(WAIT, async {
+        while open.telemetry().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the slot's own feed is up");
+    open
+}
+
 // An overview belongs to the slot it was opened on: the context's next definition is not read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_overview_reads_nothing_from_a_replaced_context() {
@@ -2304,15 +2347,15 @@ async fn an_overview_reads_nothing_from_a_replaced_context() {
     std::fs::write(&file, config.to_string()).unwrap();
     let core = Core::start_on(dir, vec![file.clone()], Settings::default()).await;
     let original = point_at(&core, &file, &first, "other").await;
-    let open = core.handle.open_overview_on(CONTEXT, original);
-    open.registered().await;
+    // Problem detection runs in On view (#715), so a replaced definition had a feed of its own on
+    // its server, with watches that can still be closing. Only an overview that reads the slot's
+    // own feed shows the slot is connected.
+    let open = open_own_feed(&core, original).await;
     until_overview_watches(&first, true, "the first server's feed").await;
-    assert!(open.telemetry().is_some(), "its own slot");
 
     let replacement = point_at(&core, &file, &second, "demo").await;
     assert_ne!(replacement, original);
-    // Another view of the new slot, so the name has a live feed the old overview could reach.
-    let _other_view = core.handle.open_overview(CONTEXT);
+    let current = open_own_feed(&core, replacement).await;
     until_overview_watches(&second, true, "the replacement's feed").await;
     assert!(core.handle.telemetry(CONTEXT).is_some());
     assert!(open.telemetry().is_none(), "opened before the move");
@@ -2321,8 +2364,6 @@ async fn an_overview_reads_nothing_from_a_replaced_context() {
     late.registered().await;
     assert!(late.telemetry().is_none(), "asked for after the move");
 
-    let current = core.handle.open_overview_on(CONTEXT, replacement);
-    current.registered().await;
     assert!(current.telemetry().is_some(), "the replacement's own");
     assert!(first.writes().is_empty() && second.writes().is_empty());
 }
