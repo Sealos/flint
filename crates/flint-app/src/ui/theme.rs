@@ -9,6 +9,7 @@ use std::rc::Rc;
 
 use flint_core::Appearance;
 use flint_core::settings::ClusterTag;
+use gpui_kit::base::TooltipDefaults;
 use gpui_kit::component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode, ThemeSet};
 use gpui_kit::{
     App, Div, Hsla, InteractiveElement, MouseButton, Pixels, SharedString, Styled as _, Window,
@@ -210,6 +211,9 @@ pub fn cluster_tag_color(tag: ClusterTag, theme: &Theme) -> Hsla {
 /// Installs Flint Light and Flint Dark in place of gpui-component's defaults, showing `mode`.
 /// Call after `gpui_kit::init`.
 pub fn init(mode: ThemeMode, cx: &mut App) {
+    TooltipDefaults::default()
+        .with_show_delay(super::tooltip_text::SHOW_DELAY)
+        .install(cx);
     let (light, dark) = themes(&ACCENT);
     let theme = Theme::global_mut(cx);
     theme.light_theme = Rc::new(light);

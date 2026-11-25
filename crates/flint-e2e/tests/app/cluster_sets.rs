@@ -667,11 +667,10 @@ fn sign_in_through_a_command(two: &TwoClusters) -> Result<()> {
 }
 
 // covers UP-84: a member that signs in through a command, not selected and without consent, asks
-// for sign-in and offers its background sign-in toggle, off. This build has the automation
-// channel, which can never turn that toggle on, so consent is covered by the core's tests.
+// for sign-in. The set view shows no consent toggle for it: that stays on the cluster's overview.
 #[test]
 #[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
-fn up_84_an_exec_member_offers_its_background_sign_in() -> Result<()> {
+fn up_84_an_exec_member_asks_for_sign_in() -> Result<()> {
     let two = TwoClusters::start()?;
     seed_pods(&two.a, &[("on-a", "Running")]);
     seed_pods(&two.b, &[("on-b", "Running")]);
@@ -682,15 +681,13 @@ fn up_84_an_exec_member_offers_its_background_sign_in() -> Result<()> {
     open_together(&app, &[A, B])?;
 
     let state = until(
-        "b asking for sign-in with its toggle offered, and a's pods shown",
+        "b asking for sign-in, and a's pods shown",
         || app.state().unwrap_or(Value::Null),
         |state| {
             member(state, B)["note"] == "Sign-in needed" && shown(state) == pairs(&[(A, "on-a")])
         },
     )?;
-    assert_eq!(member(&state, B)["background_sign_in"], json!(false));
     assert_eq!(member(&state, A)["note"], Value::Null);
-    assert_eq!(member(&state, A)["background_sign_in"], Value::Null);
 
     app.quit()?;
     drain_after_quit();

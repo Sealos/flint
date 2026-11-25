@@ -104,6 +104,13 @@ impl DetailUsage {
         changed
     }
 
+    /// Takes the thresholds in force for the object's cluster. `true` if they change the pane.
+    pub(super) fn set_thresholds(&mut self, thresholds: Thresholds) -> bool {
+        let changed = self.thresholds != thresholds;
+        self.thresholds = thresholds;
+        changed
+    }
+
     /// The object was deleted: its usage is unknown from now on.
     pub(super) fn mark_deleted(&mut self) {
         self.deleted = true;

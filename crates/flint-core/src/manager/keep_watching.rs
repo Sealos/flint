@@ -29,7 +29,6 @@ use crate::keep_watching::{
     too_many_watched,
 };
 use crate::kubeconfig::LoadedKubeconfig;
-use crate::metrics_trend::TrendStore;
 use crate::telemetry::{DiscoveryPace, KeptDiscovery, Telemetry};
 
 /// How long a connection that failed for a reason worth retrying waits before the next.
@@ -813,6 +812,8 @@ impl ClusterManager {
         result: Result<kube::Client, bool>,
     ) {
         let pending_after = self.pending_after(id);
+        let current = self.cluster(id).and_then(|slot| slot.fingerprint);
+        let hours = self.history_hours(id);
         let Some(kept) = self.keep.feeds.get_mut(id) else {
             return;
         };
@@ -826,7 +827,12 @@ impl ClusterManager {
                 let requests = self
                     .telemetry
                     .request_gate(reads_token_file(&self.kubeconfig.merged, id));
-                let trends = Arc::new(Mutex::new(TrendStore::new()));
+                // The cluster's history, which the slot's feed may have written until now. A
+                // connection made for a definition the slot no longer has writes into none: the
+                // next sync drops it.
+                let fingerprint = kept.fingerprint.filter(|print| current == Some(*print));
+                let trends = self.histories.store(id, fingerprint);
+                super::history::set_hours(&trends, hours);
                 let discovery = KeptDiscovery {
                     client: client.clone(),
                     requests: requests.clone(),
@@ -1210,4 +1216,4 @@ impl ClusterManager {
 
 #[cfg(test)]
 #[path = "keep_watching_tests.rs"]
-mod tests;
+pub(super) mod tests;

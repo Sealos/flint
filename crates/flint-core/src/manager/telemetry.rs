@@ -7,7 +7,7 @@
 
 // module-tests: ../manager.rs
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use kube::config::Kubeconfig;
 use tokio::sync::watch;
@@ -18,7 +18,6 @@ use crate::cluster;
 use crate::connection::policy::Role;
 use crate::credential::CredentialSource;
 use crate::handle::ConnectionState;
-use crate::metrics_trend::TrendStore;
 use crate::telemetry::Telemetry;
 
 /// A running feed and the connection attempt it follows.
@@ -123,6 +122,7 @@ impl ClusterManager {
                 self.start_telemetry(index, &id);
             }
         }
+        self.sync_histories();
     }
 
     /// Stops every feed no longer wanted or on an older connection and takes it off the board.
@@ -184,19 +184,21 @@ impl ClusterManager {
         let pin = self
             .contexts
             .pin(id, self.clusters[index].info.server.as_deref());
+        if self.clusters[index].client.is_none() {
+            return;
+        }
+        // The cluster's history, which a feed before this one may have written.
+        let trends = self.history_store(id, self.clusters[index].fingerprint);
         let slot: &mut Cluster = &mut self.clusters[index];
         let generation = slot.generation;
         let Some(client) = slot.client.as_ref().map(|clients| clients.read.clone()) else {
             return;
         };
-        // Its own store, so a stopping feed clearing its series can't touch its successor's.
-        let trends = Arc::new(Mutex::new(TrendStore::new()));
-        let store = Arc::clone(&trends);
         let mut feed = Telemetry::start(
             id.into(),
             client,
             target,
-            store,
+            Arc::clone(&trends),
             timing,
             requests,
             pending_after,

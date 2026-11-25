@@ -40,6 +40,7 @@ mod disconnect;
 mod file_watch;
 mod forwards;
 mod helm;
+mod history;
 mod keep_watching;
 mod keep_watching_lists;
 mod running_set;
@@ -575,6 +576,8 @@ pub(crate) struct ClusterManager {
     /// The running telemetry feeds, as the front end reads them.
     telemetry: crate::telemetry::TelemetryBoard,
     telemetry_timing: crate::telemetry::TelemetryTiming,
+    /// Each watched cluster's CPU and memory history, which outlives the feeds writing it.
+    histories: history::TrendHistories,
     /// The clusters the user unlocked for this session, shared with the front end (ADR-0015).
     unlocks: SessionUnlocks,
     /// Contexts the last load did not show, listed only because a file that defined them can't
@@ -652,6 +655,7 @@ impl ClusterManager {
             log_budget,
             telemetry: Default::default(),
             telemetry_timing: Default::default(),
+            histories: Default::default(),
             unlocks,
             held: HashSet::new(),
             settled: SettledDefinitions::default(),
@@ -1505,6 +1509,7 @@ impl ClusterManager {
         self.settings_error = error;
         self.log_budget.set_limit(self.settings.log_total_bytes());
         self.apply_pending_thresholds();
+        self.apply_history_windows();
         // The watch mode may have changed: start and stop the watches first, so a front end
         // that reads the stores when it hears of the change (the resource switcher) finds
         // them as the new settings have them.
@@ -5174,7 +5179,7 @@ mod tests {
         let unlocks = manager.unlocks.clone();
         unlocks.unlock("dev", "https://remote-a");
         let pin = manager.contexts.pin_confirmed("dev");
-        let (requests, inbox) = async_channel::bounded(8);
+        let (requests, inbox) = crate::core_queue::CoreQueue::new();
         let check = crate::handle::launch_check(requests, "dev".into(), pin);
         let protected = Err(WriteRefusal::Protected {
             cluster: "dev".into(),
