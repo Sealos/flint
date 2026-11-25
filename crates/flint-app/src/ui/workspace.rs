@@ -1680,6 +1680,12 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Whether a namespace filter applies to what is shown: a cluster's own list. An open set
+    /// has no filter, so these changes would silently alter the active cluster's saved one.
+    pub(super) fn namespace_filter_applies(&self) -> bool {
+        self.cluster.is_some() && !self.sets.is_open()
+    }
+
     /// Sets the active cluster's namespace filter, remembers it in `state.toml`, and applies it
     /// to the open list.
     fn set_namespace_filter(&mut self, namespaces: Vec<String>, cx: &mut Context<Self>) {
