@@ -260,7 +260,7 @@ pub fn metrics_section(panel: &MetricsPanel, theme: &Theme) -> impl IntoElement 
             )
             .into_any_element(),
     };
-    section("CPU and memory, last hour", theme).child(body)
+    section("CPU and memory history", theme).child(body)
 }
 
 fn metric_tile(id: &'static str, tile: &MetricTile, theme: &Theme) -> impl IntoElement {

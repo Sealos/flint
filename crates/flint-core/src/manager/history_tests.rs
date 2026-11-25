@@ -94,6 +94,56 @@ fn a_history_is_kept_per_definition() {
     assert!(Arc::ptr_eq(&other, histories.get("one").unwrap()));
 }
 
+// The window of a history follows the settings: the global value, then the cluster's own, applied
+// to a history that already holds samples.
+#[tokio::test]
+async fn a_history_window_follows_the_settings() {
+    use crate::settings::ClusterPin;
+    use crate::thresholds::ThresholdMetric::HistoryHours;
+
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = set_manager(&plugin, config.path().to_owned(), "dev");
+    select_and_land(&mut manager, "other").await;
+    let window = |manager: &ClusterManager| {
+        manager
+            .histories
+            .get("other")
+            .expect("a history")
+            .lock()
+            .unwrap()
+            .window()
+    };
+    sample(&manager, "other", start(), 100);
+    assert_eq!(window(&manager), 6 * 240);
+
+    let server = manager
+        .cluster("other")
+        .unwrap()
+        .info
+        .server
+        .clone()
+        .unwrap();
+    let mut settings = (*manager.settings).clone();
+    settings
+        .thresholds
+        .set(None, HistoryHours, Some(12))
+        .unwrap();
+    manager.settings = Arc::new(settings.clone());
+    manager.apply_history_windows();
+    assert_eq!(window(&manager), 12 * 240);
+
+    let pin = ClusterPin::new("other", server);
+    settings
+        .thresholds
+        .set(Some(&pin), HistoryHours, Some(1))
+        .unwrap();
+    manager.settings = Arc::new(settings);
+    manager.apply_history_windows();
+    assert_eq!(window(&manager), 240);
+    assert_eq!(values(&cpu(&manager, "other", start())), [100]);
+}
+
 // Opened before its kept feed was up, the slot's feed records the history. Leaving the cluster
 // stops that feed, and the kept feed that takes over goes on with the same series, with a gap
 // for the time no poll ran.

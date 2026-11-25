@@ -595,7 +595,7 @@ M3 used every number in the 5x block, so its later paths continue at UP-121.
 ### UP-66 See how full the cluster is
 - **When** metrics-server is installed and I look at the dashboard's usage tiles.
 - **Then** I see CPU and memory used against allocatable, and requests and limits against capacity, per node and in
-  total, each with a sparkline of the last hour that keeps growing while I stay connected. Without metrics-server the
+  total, each with a sparkline of the metrics history that keeps growing while I stay connected. Without metrics-server the
   tiles say how to install it.
 - Tests: unit (ring buffer, aggregation), e2e (fake API server: `flint-e2e/tests/dashboard_usage.rs`; the growing sparkline needs a
   clock control), ui.
