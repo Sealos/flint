@@ -52,11 +52,12 @@ use super::super::registry::{
     ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAllLines, SelectCluster, SelectFirst,
     SelectLast, SelectLine, SelectNext, SelectNextLine, SelectPrev, SelectPrevLine, SelectRow,
     SelectText, SetDockHeight, SetLogContext, SetNamespaces, SetPaneWidth, ShowAll,
-    ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml, SortBy, ToggleAnnotations,
-    ToggleCommandPalette, ToggleErrorsOnly, ToggleLabels, ToggleLogRegex, ToggleManagedFields,
-    ToggleMatchingOnly, ToggleNamespace, ToggleNavSection, TogglePause, ToggleProblemsOnly,
-    ToggleResourceSwitcher, ToggleSecretValue, ToggleSources, ToggleTimestamps, ToggleWide,
-    ToggleWrap, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
+    ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml, SortBy, SortByAscending,
+    SortByDescending, ToggleAnnotations, ToggleCommandPalette, ToggleErrorsOnly, ToggleLabels,
+    ToggleLogRegex, ToggleManagedFields, ToggleMatchingOnly, ToggleNamespace, ToggleNavSection,
+    TogglePause, ToggleProblemsOnly, ToggleResourceSwitcher, ToggleSecretValue, ToggleSources,
+    ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
+    WatchOpenViewsOnly,
 };
 use super::super::registry::{ApplyAcrossSet, DeleteAcrossSet, RestartAcrossSet, ScaleAcrossSet};
 use super::super::registry::{
@@ -402,8 +403,16 @@ impl Workspace {
                 None => Err(ActionError::unavailable::<SelectRow>()),
             })
             .add::<SortBy>(view_open!(list_wide), |ws, a, cx| match &ws.list {
-                Some(l) => l.read(cx).check_sort(a),
+                Some(l) => l.read(cx).check_sort::<SortBy>(a),
                 None => Err(ActionError::unavailable::<SortBy>()),
+            })
+            .add::<SortByAscending>(view_open!(list_wide), |ws, a, cx| match &ws.list {
+                Some(l) => l.read(cx).check_sort::<SortByAscending>(&a.0),
+                None => Err(ActionError::unavailable::<SortByAscending>()),
+            })
+            .add::<SortByDescending>(view_open!(list_wide), |ws, a, cx| match &ws.list {
+                Some(l) => l.read(cx).check_sort::<SortByDescending>(&a.0),
+                None => Err(ActionError::unavailable::<SortByDescending>()),
             })
             // The detail pane's.
             .when::<Refresh>(view_open!(detail))

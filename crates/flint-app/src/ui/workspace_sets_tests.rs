@@ -803,6 +803,71 @@ async fn a_selected_row_comes_back_in_front_of_the_list(cx: &mut TestAppContext)
     assert_eq!(detail_cluster(cx, &t).as_deref(), Some("kind-beta"));
 }
 
+// A set has a header like a cluster's: the set and its kind, and the controls in their places,
+// off because each belongs to one cluster (#763).
+#[gpui_kit::test]
+async fn a_set_has_a_header_with_its_controls_off(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_quiet_workspace(cx, dir.path()).await;
+    open_both(cx, &t).await;
+    t.wait_for_element(cx, ("crumb", 1usize)).await;
+    assert_eq!(t.label(cx, ("crumb", 1usize)).as_deref(), Some("Pods"));
+    for id in ["namespace-filter-button", "keep-watching", "watch-mode"] {
+        assert_eq!(t.find(cx, id).unwrap().disabled(), Some(true), "{id}");
+    }
+}
+
+// Changing kinds in a set swaps the kind in the same list: the filter text, the grouping and the
+// cluster chips stay, and the old kind's selection does not (#763). A row's detail names its kind,
+// not the list's title.
+#[gpui_kit::test]
+async fn changing_the_kind_of_a_set_keeps_the_list_and_its_view(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_quiet_workspace(cx, dir.path()).await;
+    connect(cx, &t, "kind-alpha");
+    connect(cx, &t, "kind-beta");
+    open_both(cx, &t).await;
+    select_row(cx, &t, "kind-beta");
+    assert_eq!(
+        t.workspace
+            .read_with(cx, |ws, cx| ws.detail_view().map(|d| d
+                .read(cx)
+                .object()
+                .kind_label
+                .clone())),
+        Some("Pods".to_owned())
+    );
+    let list = t
+        .workspace
+        .read_with(cx, |ws, _| ws.sets.running.as_ref().unwrap().list.clone());
+    list.update(cx, |list, cx| {
+        list.set_group_by_cluster(true, cx);
+        list.toggle_cluster_filter("kind-beta", cx);
+    });
+    let (workspace, window) = (t.workspace.clone(), t.window);
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| {
+            assert!(ws.show_kind_in_set(&deployments_entry(), window, cx));
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let same = t.workspace.read_with(cx, |ws, _| {
+        ws.sets.running.as_ref().unwrap().list.entity_id() == list.entity_id()
+    });
+    assert!(same, "the list is the one the set opened with");
+    list.read_with(cx, |list, _| {
+        assert!(list.query.group_by_cluster);
+        assert_eq!(list.query.clusters, ["kind-beta"]);
+        assert!(list.label.starts_with("Deployments"), "{}", list.label);
+        assert!(list.selected().is_none());
+    });
+    assert!(
+        t.workspace
+            .read_with(cx, |ws, _| ws.detail_view().is_none())
+    );
+}
+
 #[gpui_kit::test]
 async fn cmd_f_reaches_the_combined_filter(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
