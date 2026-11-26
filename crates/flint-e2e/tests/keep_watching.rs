@@ -1160,6 +1160,19 @@ fn deployment_lists(server: &FakeApiServer) -> usize {
         .count()
 }
 
+/// How many deployments watches `server` was asked for that stream the rows first: what the
+/// selected cluster's resource list opens with. The kept feed's own reads are lists.
+fn deployment_watch_lists(server: &FakeApiServer) -> usize {
+    server
+        .requests()
+        .iter()
+        .filter(|request| request.path.ends_with("/deployments"))
+        .filter(|request| {
+            request.verb == Verb::Watch && request.query.contains("sendInitialEvents=true")
+        })
+        .count()
+}
+
 // A watched cluster's core resource lists stay warm across switches: leaving it and selecting it
 // again lists none of them anew.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1168,8 +1181,10 @@ async fn a_switch_back_lists_nothing_again() {
     f.turn_on().await;
     f.until_feed().await;
     switch_to(&f, "b").await;
+    // The kept feed lists the deployments in the background too, so a list alone may not be the
+    // selected cluster's: wait for its own watch.
     tokio::time::timeout(WAIT, async {
-        while deployment_lists(&f.b) == 0 {
+        while deployment_watch_lists(&f.b) == 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
