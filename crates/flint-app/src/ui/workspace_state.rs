@@ -191,6 +191,10 @@ impl Workspace {
                 state.actions = row_action_states(self, cx);
                 state
             }),
+            dashboard: self
+                .dashboard
+                .as_ref()
+                .map(|(view, _)| view.read(cx).view_state()),
             dock,
             menu,
             palette: self.palette.as_ref().map(|(p, _)| p.read(cx).view_state()),
