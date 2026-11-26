@@ -87,12 +87,10 @@ impl DetailUsage {
     /// Adds up the workload's pods, if the pane shows one.
     fn read_workload(&mut self) {
         self.workload = match (&self.source, &self.uid) {
-            (UsageSource::Workloads(usage, index, chain), Some(uid)) => {
-                match list_usage_workloads::totals_of(index, usage, *chain, uid) {
-                    Some(totals) => WorkloadReading::Totals(totals),
-                    None => WorkloadReading::Idle,
-                }
-            }
+            (UsageSource::Workloads(..), Some(uid)) => match self.source.workload_totals(uid) {
+                Some(totals) => WorkloadReading::Totals(totals),
+                None => WorkloadReading::Idle,
+            },
             _ => WorkloadReading::Unread,
         };
     }
@@ -713,7 +711,7 @@ mod tests {
                 (("ns".to_owned(), name.to_owned()), sample)
             })
             .collect();
-        let source = UsageSource::Workloads(
+        let source = UsageSource::workloads(
             Arc::new(samples),
             PodIndex::for_tests(records, Controllers::new()),
             OwnerChain::Direct,

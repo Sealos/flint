@@ -332,7 +332,13 @@ impl ResourceList {
                 let mut updates = core.telemetry_updates();
                 cx.spawn(async move |this, cx| {
                     while updates.changed().await {
-                        let source = UsageSource::of(subject, core.telemetry(&cluster).as_ref());
+                        let telemetry = core.telemetry(&cluster);
+                        // Adding up workloads walks every pod: not on the UI thread.
+                        let source = cx
+                            .background_spawn(async move {
+                                UsageSource::of(subject, telemetry.as_ref())
+                            })
+                            .await;
                         if this
                             .update(cx, |list, cx| list.set_usage_source(source, cx))
                             .is_err()
