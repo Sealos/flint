@@ -996,6 +996,15 @@ pub fn proxy_generation() -> u64 {
     crate::connection::proxy::generation()
 }
 
+/// Runs `attempt` under the proxy setting of generation `generation`, whatever is put in use
+/// meanwhile: a client built in it takes the route of the kubeconfig load it was read from.
+pub async fn under_proxy_generation<F: std::future::Future>(
+    generation: u64,
+    attempt: F,
+) -> F::Output {
+    crate::connection::proxy::pinned_to(generation, attempt).await
+}
+
 pub fn load_settings(dir: &Path) -> Result<Settings, SettingsError> {
     let path = dir.join(SETTINGS_FILE);
     let Some(text) = read_settings_text(&path)? else {

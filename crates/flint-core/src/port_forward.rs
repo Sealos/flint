@@ -345,6 +345,16 @@ pub(crate) enum DialError {
     Dropped(String),
 }
 
+/// A change of a forward's binding, as its task sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Rebinding {
+    /// It waits to be bound again: nothing new is opened.
+    pub(crate) waits: bool,
+    /// A proxy change held it since the last change seen: what it carries went on the old
+    /// route.
+    pub(crate) held: bool,
+}
+
 /// Why a connection could not be opened, in words.
 fn dial_text(error: &DialError) -> String {
     match error {
@@ -360,8 +370,10 @@ pub(crate) trait Dialer: Send + Sync + 'static {
     fn check(&self) -> BoxFuture<'static, Result<(), DialError>>;
     /// Resolves with how the forward ends, once the core ends it.
     fn ended(&self) -> BoxFuture<'static, ForwardState>;
-    /// Each change of whether the forward waits to be bound again ([`ForwardBinding`]).
-    fn rebinding(&self) -> BoxStream<'static, bool>;
+    /// Each change of its binding ([`ForwardBinding`]): whether it waits to be bound again, and
+    /// whether a proxy change held it since the last change seen, which may come with its
+    /// rebind in one step.
+    fn rebinding(&self) -> BoxStream<'static, Rebinding>;
     /// The forward listens on `port`.
     fn listening(&self, _port: u16) {}
     /// The pod a connection would reach now.
@@ -487,10 +499,12 @@ pub(crate) async fn serve<D: Dialer>(
             state = &mut ended => break state,
             failure = &mut gate => break ForwardState::Failed(failure),
             failure = &mut target => break ForwardState::Failed(failure),
-            Some(waits) = rebinding.next() => {
-                if waits {
-                    // Its connections went through the old route: they end, and new ones wait.
+            Some(change) = rebinding.next() => {
+                if change.held {
+                    // Its connections went through the old route: they end.
                     conns.abort_all();
+                }
+                if change.waits {
                     out.send_modify(|s| s.warning = Some(REBINDING.to_owned()));
                 } else {
                     out.send_if_modified(|s| s.warning.take().is_some());
@@ -606,6 +620,9 @@ pub(crate) struct ForwardBinding {
     pub(crate) connection: CredentialId,
     /// Waiting to be bound again after a proxy change: nothing new is opened.
     pub(crate) rebinding: bool,
+    /// How many proxy changes held it, so a task that sees the hold and the rebind as one change
+    /// still drops what it carried on the old route.
+    pub(crate) holds: u64,
 }
 
 /// What a forward says while it waits to be bound again after a proxy change.
@@ -769,12 +786,17 @@ impl Access {
         })
     }
 
-    /// `result`, after ending every forward on this connection if its sign-in was refused.
-    fn after<T>(&self, result: Result<T, DialError>) -> Result<T, DialError> {
+    /// `result`, after ending every forward on `connection`, the one it was tried on, if its
+    /// sign-in was refused. One the forward was moved off meanwhile ends nothing.
+    fn after<T>(
+        &self,
+        connection: &CredentialId,
+        result: Result<T, DialError>,
+    ) -> Result<T, DialError> {
         if let Err(DialError::Fatal(failure)) = &result
             && failure.kind == ForwardFailureKind::Unauthorized
         {
-            self.signals.end_connection(&self.binding().connection);
+            self.signals.end_connection(connection);
         }
         result
     }
@@ -999,13 +1021,20 @@ impl Dialer for KubeDialer {
         async move { access.check().await }.boxed()
     }
 
-    fn rebinding(&self) -> BoxStream<'static, bool> {
+    fn rebinding(&self) -> BoxStream<'static, Rebinding> {
         let mut binding = self.access.binding.clone();
-        binding.borrow_and_update();
-        futures::stream::unfold(binding, |mut binding| async move {
+        let holds = binding.borrow_and_update().holds;
+        futures::stream::unfold((binding, holds), |(mut binding, seen)| async move {
             binding.changed().await.ok()?;
-            let waits = binding.borrow_and_update().rebinding;
-            Some((waits, binding))
+            let (waits, holds) = {
+                let now = binding.borrow_and_update();
+                (now.rebinding, now.holds)
+            };
+            let change = Rebinding {
+                waits,
+                held: holds != seen,
+            };
+            Some((change, (binding, holds)))
         })
         .boxed()
     }
@@ -1030,6 +1059,7 @@ impl Dialer for KubeDialer {
         let request = self.request.clone();
         let uid = Arc::clone(&self.uid);
         async move {
+            let connection = access.binding().connection;
             let probed = async {
                 access.check().await?;
                 let client = access.signed_in().await?;
@@ -1044,7 +1074,7 @@ impl Dialer for KubeDialer {
                 Ok(backend.pod)
             }
             .await;
-            access.after(probed)
+            access.after(&connection, probed)
         }
         .boxed()
     }
@@ -1054,8 +1084,9 @@ impl Dialer for KubeDialer {
         let request = self.request.clone();
         let uid = Arc::clone(&self.uid);
         async move {
+            let connection = access.binding().connection;
             let dialed = dial_once(&access, &request, &uid).await;
-            access.after(dialed)
+            access.after(&connection, dialed)
         }
         .boxed()
     }
@@ -1274,8 +1305,8 @@ mod tests {
         probe: Mutex<Option<DialError>>,
         report_error: AtomicBool,
         slow_close: AtomicBool,
-        /// Whether it waits to be bound again, as a proxy change makes it.
-        rebinding: watch::Sender<bool>,
+        /// Changes of its binding, as a proxy change makes them.
+        rebinding: watch::Sender<Option<Rebinding>>,
     }
 
     /// Takes a moment to drop, as a connection slow to close does.
@@ -1320,12 +1351,12 @@ mod tests {
             futures::future::pending().boxed()
         }
 
-        fn rebinding(&self) -> BoxStream<'static, bool> {
+        fn rebinding(&self) -> BoxStream<'static, Rebinding> {
             let rx = self.rebinding.subscribe();
             futures::stream::unfold(rx, |mut rx| async move {
                 rx.changed().await.ok()?;
-                let waits = *rx.borrow_and_update();
-                Some((waits, rx))
+                let change = (*rx.borrow_and_update())?;
+                Some((change, rx))
             })
             .boxed()
         }
@@ -1571,16 +1602,37 @@ mod tests {
         let (_forward, mut updates, port) = started(&dialer, None).await;
         let mut old = round_trip(port).await;
 
-        dialer.rebinding.send_replace(true);
+        dialer.rebinding.send_replace(Some(Rebinding {
+            waits: true,
+            held: true,
+        }));
         ended(&mut old).await;
         let shown = wait_for(&mut updates, |s| s.warning.is_some()).await;
         assert_eq!(shown.warning.as_deref(), Some(REBINDING));
         assert_eq!(shown.state, ForwardState::Listening);
         assert_eq!(shown.local_port, Some(port));
 
-        dialer.rebinding.send_replace(false);
+        dialer.rebinding.send_replace(Some(Rebinding {
+            waits: false,
+            held: false,
+        }));
         let shown = wait_for(&mut updates, |s| s.warning.is_none()).await;
         assert_eq!(shown.state, ForwardState::Listening);
+        let _again = round_trip(port).await;
+    }
+
+    // A hold and its rebind seen as one change still end what went on the old route.
+    #[tokio::test]
+    async fn a_hold_seen_with_its_rebind_still_drops_old_connections() {
+        let dialer = Arc::new(FakeDialer::default());
+        let (_forward, _updates, port) = started(&dialer, None).await;
+        let mut old = round_trip(port).await;
+
+        dialer.rebinding.send_replace(Some(Rebinding {
+            waits: false,
+            held: true,
+        }));
+        ended(&mut old).await;
         let _again = round_trip(port).await;
     }
 
@@ -1727,7 +1779,7 @@ mod tests {
             futures::future::pending().boxed()
         }
 
-        fn rebinding(&self) -> BoxStream<'static, bool> {
+        fn rebinding(&self) -> BoxStream<'static, Rebinding> {
             futures::stream::pending().boxed()
         }
 

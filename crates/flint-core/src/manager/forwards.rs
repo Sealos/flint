@@ -215,6 +215,7 @@ impl ClusterManager {
             pin: pin.clone(),
             connection: connection.clone(),
             rebinding: false,
+            holds: 0,
         });
         let local_port = Arc::new(AtomicU16::new(0));
         let kept = self.keep_watching(&cluster);
@@ -363,7 +364,10 @@ impl ClusterManager {
         for live in self.forwards.live.values_mut() {
             if live.rebinding.is_none() {
                 live.rebinding = Some(contexts.definition_revision(&live.cluster));
-                live.binding.send_modify(|binding| binding.rebinding = true);
+                live.binding.send_modify(|binding| {
+                    binding.rebinding = true;
+                    binding.holds += 1;
+                });
             }
         }
         self.forwards.live.len()
@@ -413,11 +417,16 @@ impl ClusterManager {
                 format!("{cluster} did not reconnect on the new proxy setting: {why}"),
             )));
         }
+        // Back with a read feed only, as a cluster watched in the background is: nothing to
+        // forward on.
         let Some(credential) = slot.write_credential.as_ref() else {
-            let refusal = WriteRefusal::NotConnected {
-                cluster: cluster.to_owned(),
-            };
-            return Some(Err(gate_failure(&refusal.into())));
+            return Some(Err(ForwardFailure::new(
+                ForwardFailureKind::Refused,
+                format!(
+                    "{cluster} reconnected for watching only; select it and start the forward \
+                     again"
+                ),
+            )));
         };
         let pin = self.session_pin(cluster);
         let same = pin.same_definition_on_any_route(&live.pin)
@@ -469,10 +478,10 @@ impl ClusterManager {
         live.pin = pin.clone();
         live.connection = connection.clone();
         live.rebinding = None;
-        live.binding.send_replace(ForwardBinding {
-            pin,
-            connection,
-            rebinding: false,
+        live.binding.send_modify(|binding| {
+            binding.pin = pin;
+            binding.connection = connection;
+            binding.rebinding = false;
         });
         let outcome = live.outcome(None);
         self.note_forward(outcome);

@@ -172,7 +172,11 @@ async fn a_refused_send_check_releases_the_slots() {
     let conn = server.client(&ctx, "dev").await.unwrap();
 
     std::fs::write(dir.path().join("settings.toml"), "").unwrap();
-    assert!(!server.inner.still_connectable("dev", conn.fingerprint));
+    assert!(
+        !server
+            .inner
+            .still_connectable("dev", conn.fingerprint, conn.generation)
+    );
     assert_released(&server);
 }
 
