@@ -20,6 +20,7 @@ use super::{
     OpenShortWorkloads, ProblemList, ProblemLists, ProblemTile, WARNINGS_UNAVAILABLE, WarningRow,
     WarningsPanel,
 };
+use crate::ui::list_usage_bar::BarLevel;
 use crate::ui::registry;
 use flint_core::problems::ProblemSeverity;
 use flint_core::rollout::RolloutState;
@@ -517,7 +518,12 @@ fn capacity_card(index: usize, card: &CapacityCard, theme: &Theme) -> impl IntoE
                         .h_full()
                         .w(relative(filled))
                         .rounded(theme.radius)
-                        .bg(if over { theme.warning } else { theme.primary }),
+                        .bg(if over {
+                            BarLevel::Over
+                        } else {
+                            BarLevel::Normal
+                        }
+                        .color(theme)),
                 ),
         )
         .child(capacity_line(

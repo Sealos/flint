@@ -323,6 +323,14 @@ fn every_problem_list_kind_has_an_entry() {
     assert!(kind_entry("configmaps").is_none());
 }
 
+#[test]
+fn a_short_kind_row_names_the_kind_and_what_is_short() {
+    assert_eq!(
+        super::super::cluster_card::short_kind_label("Deployments"),
+        "Deployments short of replicas"
+    );
+}
+
 // View tests.
 
 #[gpui_kit::test]
@@ -486,6 +494,24 @@ async fn a_count_opens_the_combined_list_of_exactly_what_it_counted(cx: &mut Tes
     assert!(!dashboard_open(cx, &t));
     assert!(shown_label(cx, &t).unwrap().contains("kind-beta"));
     assert_eq!(matched(cx, &t), 1);
+}
+
+#[gpui_kit::test]
+async fn a_card_link_opens_from_the_keyboard(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, view) = open_set(cx, dir.path()).await;
+    cx.update_window(t.window, |_, window, cx| {
+        window.render_frame(cx);
+        let focus = view.read(cx).focus.clone();
+        window.focus(&focus, cx);
+    })
+    .unwrap();
+    t.press(cx, "down");
+    t.press(cx, "enter");
+    assert!(
+        !dashboard_open(cx, &t),
+        "Down then Enter opened a card link"
+    );
 }
 
 #[gpui_kit::test]

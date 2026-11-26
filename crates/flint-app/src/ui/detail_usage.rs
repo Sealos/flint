@@ -10,7 +10,9 @@ use k8s_openapi::api::core::v1::PodSpec;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use serde_json::Value;
 
-use super::super::list_usage::{UNKNOWN_TEXT, UsageSource, UsageSubject, cpu_text, memory_text};
+use super::super::list_usage::{
+    UNKNOWN_TEXT, UsageSource, UsageSubject, cpu_amount, memory_amount,
+};
 use super::super::list_usage_workloads::Totals;
 use super::ring::RingSpec;
 
@@ -283,11 +285,11 @@ impl Measure<'_> {
 }
 
 fn cpu_text_of(nanos: u64) -> String {
-    cpu_text(Cpu::from_nanos(nanos))
+    cpu_amount(nanos)
 }
 
 fn memory_text_of(bytes: u64) -> String {
-    memory_text(Memory::from_bytes(bytes))
+    memory_amount(bytes)
 }
 
 fn measures<'a>(used: Usage, thresholds: &'a Thresholds) -> (Measure<'a>, Measure<'a>) {
@@ -464,7 +466,11 @@ mod tests {
         assert_eq!(memory.center, "50%");
         assert_eq!(
             memory.lines,
-            ["200Mi used", "200% of 100Mi request", "50% of 400Mi limit"]
+            [
+                "200 MiB used",
+                "200% of 100 MiB request",
+                "50% of 400 MiB limit"
+            ]
         );
         let spec = memory.spec.unwrap();
         assert_eq!(
@@ -524,7 +530,7 @@ mod tests {
         );
         assert_eq!(
             memory.lines,
-            ["200Mi used, against requests and limits unknown"]
+            ["200 MiB used, against requests and limits unknown"]
         );
     }
 
@@ -554,9 +560,12 @@ mod tests {
         );
         let (cpu, memory) = rings(detail.panel(None, "n1"));
         assert_eq!(cpu.center, "25%");
-        assert_eq!(cpu.lines, ["1000m used", "25% of 4000m allocatable"]);
+        assert_eq!(
+            cpu.lines,
+            ["1.00 cores used", "25% of 4.00 cores allocatable"]
+        );
         assert_eq!(memory.center, "50%");
-        assert_eq!(memory.lines, ["512Mi used", "50% of 1024Mi allocatable"]);
+        assert_eq!(memory.lines, ["512 MiB used", "50% of 1.0 GiB allocatable"]);
         let (cpu, memory) = rings(detail.panel(None, "n2"));
         assert!(unknown_ring(&cpu) && unknown_ring(&memory));
     }
@@ -571,7 +580,7 @@ mod tests {
         let (cpu, memory) = rings(detail.panel(None, "n1"));
         assert_eq!(cpu.spec, None);
         assert_eq!(cpu.lines, ["10m used, against allocatable unknown"]);
-        assert_eq!(memory.lines, ["20Mi used, against allocatable unknown"]);
+        assert_eq!(memory.lines, ["20 MiB used, against allocatable unknown"]);
     }
 
     #[test]
@@ -652,9 +661,9 @@ mod tests {
         assert_eq!(
             cpu.lines,
             [
-                "1000m used",
-                "2000m requested by pods",
-                "25% of 4000m allocatable"
+                "1.00 cores used",
+                "2.00 cores requested by pods",
+                "25% of 4.00 cores allocatable"
             ]
         );
         // No memory request is known: no tick.
@@ -751,7 +760,7 @@ mod tests {
         );
         let (cpu, memory) = rings(detail.panel(None, "n1"));
         assert_eq!(cpu.spec, None);
-        assert_eq!(cpu.center, "1000m");
+        assert_eq!(cpu.center, "1.00 cores");
         assert!(memory.spec.is_some());
     }
 

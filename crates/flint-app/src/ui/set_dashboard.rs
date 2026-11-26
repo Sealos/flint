@@ -24,6 +24,7 @@ use gpui_kit::*;
 use jiff::Timestamp;
 use serde::Deserialize;
 
+use super::super::focus::link_focus;
 pub use super::cluster_card::CardState;
 use super::cluster_card::{CardActions, CardTarget, card, count_link, render_card};
 pub use super::cluster_card::{ClusterCard as SetCard, ClusterRead as MemberRead};
@@ -352,8 +353,7 @@ impl Render for SetDashboardView {
                 }),
             })
         });
-        v_flex()
-            .id("set-dashboard")
+        link_focus(v_flex().id("set-dashboard"), focus)
             .track_focus(focus)
             .size_full()
             .min_h_0()
