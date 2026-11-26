@@ -48,9 +48,14 @@ use super::registry::{
     OpenShell, UnlockCluster,
 };
 use super::resource_actions::{self, ResourceAction, has_sessions};
+use super::row_menu_cursor::{CursorEntry, MenuCursor};
 #[cfg(any(test, feature = "automation"))]
 use super::view_state::{MenuEntryState, SubmenuEntryState};
 use super::workspace::Workspace;
+
+/// The names of gpui-component's menu actions for the arrow keys (its action types are private).
+const SELECT_DOWN: &str = "ui::SelectDown";
+const SELECT_UP: &str = "ui::SelectUp";
 
 /// Builds a row's context menu (gpui-component's `context_menu` builder).
 pub type RowMenu = Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>;
@@ -422,12 +427,19 @@ pub fn row_menu(workspace: WeakEntity<Workspace>) -> RowMenu {
         // What this menu compares, whichever row gets selected while it is open.
         let bound = compare_object(detail.read(cx).object());
         let shown = Rc::new(RefCell::new(row_actions_on(ws.read(cx), &bound, cx)));
+        // Where the arrow keys put the highlight, kept through the rebuilds below.
+        let cursor = Rc::new(RefCell::new(MenuCursor::new(cursor_entries(
+            shown.borrow().as_ref(),
+        ))));
+        // Where the pointer was when the menu opened: the menu highlights what it passes over.
+        let pointer = window.mouse_position();
         // Built again whenever what it shows changes while it is open (the object or the pods
         // arrived, the cluster disconnected, another row got selected). The observers are
         // dropped when the menu is dismissed.
         let rebuild = {
             let workspace = workspace.clone();
             let shown = shown.clone();
+            let cursor = cursor.clone();
             move |menu: &mut PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
                 let Some(ws) = workspace.upgrade() else {
                     return;
@@ -439,14 +451,50 @@ pub fn row_menu(workspace: WeakEntity<Workspace>) -> RowMenu {
                 *shown.borrow_mut() = now.clone();
                 #[cfg(test)]
                 tests::REBUILDS.with(|n| n.set(n.get() + 1));
+                if window.mouse_position() != pointer {
+                    cursor.borrow_mut().lose();
+                }
+                let presses = cursor.borrow_mut().rebuilt(cursor_entries(now.as_ref()));
                 let workspace = workspace.clone();
                 menu.rebuild(window, cx, move |menu, window, cx| {
                     fill(menu, now.clone(), &workspace, window, cx)
                 });
+                // The rebuilt menu has nothing highlighted: press Down to the entry that was,
+                // once the menu is drawn, if the keys are still what is steering it.
+                if let Some(presses) = presses.filter(|_| window.last_input_was_keyboard()) {
+                    let own = menu.focus_handle(cx);
+                    window.defer(cx, move |window, cx| {
+                        let Ok(down) = cx.build_action(SELECT_DOWN, None) else {
+                            return;
+                        };
+                        if own.is_focused(window) {
+                            for _ in 0..presses {
+                                own.dispatch_action(down.as_ref(), window, cx);
+                            }
+                        }
+                    });
+                }
             }
         };
+        let key_cursor = cursor.clone();
         let on_detail = rebuild.clone();
         let observers = vec![
+            // After the menu has moved its highlight for an arrow key, move the cursor with it.
+            cx.observe_keystrokes(move |menu, event, window, cx| {
+                let down = match event.action.as_deref().map(|action| action.name()) {
+                    Some(SELECT_DOWN) => true,
+                    Some(SELECT_UP) => false,
+                    _ => return,
+                };
+                // A submenu or something else has the keys when the menu itself does not.
+                if menu.focus_handle(cx).is_focused(window) {
+                    let mut cursor = key_cursor.borrow_mut();
+                    if window.mouse_position() != pointer {
+                        cursor.lose();
+                    }
+                    if down { cursor.down() } else { cursor.up() }
+                }
+            }),
             cx.observe_in(&detail, window, move |menu, _, window, cx| {
                 on_detail(menu, window, cx)
             }),
@@ -816,30 +864,44 @@ pub(in crate::ui) fn refusal(
 /// can open) and every entry, a picker with its containers. Whether an entry is enabled and why
 /// not come from the same checks as the menu's (a disabled entry's reason is given even where
 /// the menu says it once, in the note).
-#[cfg(any(test, feature = "automation"))]
-pub fn menu_state(a: &RowActions) -> (Option<String>, Vec<MenuEntryState>) {
+/// What a row's menu lists, in order, as the tests and the state report it and as the keyboard
+/// cursor follows it.
+#[cfg_attr(
+    not(any(test, feature = "automation")),
+    allow(dead_code, reason = "read by the state report")
+)]
+struct Listed {
+    label: String,
+    /// What the keyboard cursor knows the entry by when its label changes (Shell names the pod
+    /// once a workload's pods are listed).
+    key: Option<&'static str>,
+    enabled: bool,
+    reason: Option<String>,
+    /// A picker's entries (containers): label and whether it can run.
+    submenu: Vec<(String, bool)>,
+}
+
+/// The entries of the menu for `a`, without the notes between them.
+fn listed(a: &RowActions) -> Vec<Listed> {
     use super::detail::{container_label, shell_label};
 
-    let entry = |label: String, can: &Availability| MenuEntryState {
+    let entry = |label: String, can: &Availability| Listed {
         label,
+        key: None,
         enabled: can.is_ok(),
         reason: can.as_ref().err().cloned(),
-        checked: None,
         submenu: Vec::new(),
     };
-    let picker = |label: String, submenu: Vec<SubmenuEntryState>| MenuEntryState {
+    let picker = |label: String, submenu: Vec<(String, bool)>| Listed {
         label,
+        key: None,
         enabled: true,
         reason: None,
-        checked: None,
         submenu,
     };
     let logs_of = |containers: &mut dyn Iterator<Item = &PodContainer>| {
         containers
-            .map(|c| SubmenuEntryState {
-                label: container_label(&c.name, c.init, c.default),
-                enabled: true,
-            })
+            .map(|c| (container_label(&c.name, c.init, c.default), true))
             .collect()
     };
     let several = a.log_containers.len() > 1;
@@ -859,7 +921,7 @@ pub fn menu_state(a: &RowActions) -> (Option<String>, Vec<MenuEntryState>) {
             });
         }
         let label = shell_entry_label_within(a, SHELL_POD_NAME);
-        entries.push(match &a.shell_pod {
+        let mut shell = match &a.shell_pod {
             Some(shell) if a.shell_picker && a.blocked.is_none() => picker(
                 label,
                 shell
@@ -867,15 +929,14 @@ pub fn menu_state(a: &RowActions) -> (Option<String>, Vec<MenuEntryState>) {
                     .iter()
                     .map(|name| {
                         let running = !shell.not_running.contains(name);
-                        SubmenuEntryState {
-                            label: shell_label(name, *name == shell.default, running),
-                            enabled: running,
-                        }
+                        (shell_label(name, *name == shell.default, running), running)
                     })
                     .collect(),
             ),
             _ => entry(label, &shell_in_menu(a)),
-        });
+        };
+        shell.key = Some("Shell");
+        entries.push(shell);
     }
     if let Some(can) = forward_in_menu(a) {
         entries.push(entry(registry::label::<ForwardPort>().to_owned(), &can));
@@ -898,6 +959,37 @@ pub fn menu_state(a: &RowActions) -> (Option<String>, Vec<MenuEntryState>) {
     if let Some(unlock) = &a.unlock {
         entries.push(entry(unlock_label(&unlock.name), &Ok(())));
     }
+    entries
+}
+
+/// The menu's entries for the keyboard cursor.
+fn cursor_entries(a: Option<&RowActions>) -> Vec<CursorEntry> {
+    a.map(listed)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| CursorEntry {
+            label: e.key.map_or(e.label, str::to_owned),
+            enabled: e.enabled,
+        })
+        .collect()
+}
+
+#[cfg(any(test, feature = "automation"))]
+pub fn menu_state(a: &RowActions) -> (Option<String>, Vec<MenuEntryState>) {
+    let entries = listed(a)
+        .into_iter()
+        .map(|e| MenuEntryState {
+            label: e.label,
+            enabled: e.enabled,
+            checked: None,
+            reason: e.reason,
+            submenu: e
+                .submenu
+                .into_iter()
+                .map(|(label, enabled)| SubmenuEntryState { label, enabled })
+                .collect(),
+        })
+        .collect();
     (a.blocked.clone(), entries)
 }
 

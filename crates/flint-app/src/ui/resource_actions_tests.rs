@@ -801,7 +801,9 @@ fn answer(method: &str, path: &str, query: &str, body: &[u8], control: &Control)
     }
 }
 
-/// Waits until an open confirmation's text contains `wanted`, and returns it.
+/// Waits until an open confirmation's text contains `wanted` and its dialog is active, and
+/// returns the text. The last drawn frame alone can still show a dialog that is closing or not
+/// yet active, which `ui::Confirm` would not reach.
 async fn wait_for_confirmation(
     cx: &mut TestAppContext,
     t: &TestWorkspace,
@@ -814,8 +816,10 @@ async fn wait_for_confirmation(
             .filter_map(|e| e.label().map(str::to_owned))
             .find(|l| l.contains(wanted))
     };
-    cx.wait_for(t.window, WAIT, move |window, _| matching(window).is_some())
-        .await;
+    cx.wait_for(t.window, WAIT, move |window, cx| {
+        matching(window).is_some() && gpui_kit::component::WindowExt::has_active_dialog(window, cx)
+    })
+    .await;
     draw(cx, t);
     cx.update_window(t.window, |_, window, _| matching(window))
         .unwrap()

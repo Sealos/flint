@@ -2984,12 +2984,23 @@ impl Workspace {
             return set_view;
         }
         if let Some(detail) = self.edit_shown_alone(cx) {
+            // The pane's own header belongs to the detail view, so a strip over the top edge
+            // drags the window, as with no cluster. It is drawn first: the header's buttons sit
+            // above it and take their presses before it sees them.
             return div()
                 .id("held-edit-pane")
                 .flex_1()
                 .min_w_0()
                 .h_full()
                 .relative()
+                .child(
+                    super::theme::moves_window(div())
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w_full()
+                        .h(px(HEADER_HEIGHT)),
+                )
                 .child(detail)
                 .children(self.detail_tag_strip(theme, cx))
                 .test_support()

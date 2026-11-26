@@ -2375,6 +2375,49 @@ async fn clicking_the_active_non_member_leaves_the_set(cx: &mut TestAppContext) 
     assert!(t.find(cx, "cluster-set-view").is_none());
 }
 
+// #834: leaving an unsaved set by a cluster outside it, with an edit unapplied, asks about the
+// edit once and then the set once: Discard on the edit does not bring the first question back.
+#[gpui_kit::test]
+async fn leaving_an_unsaved_set_with_an_edit_asks_each_once(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace_with(cx, dir.path(), |dir, servers| {
+        let path = dir.join("kubeconfig");
+        let contexts = [
+            ("kind-alpha", servers.silent.as_str()),
+            ("kind-beta", servers.silent.as_str()),
+            ("kind-gamma", servers.silent.as_str()),
+        ];
+        std::fs::write(&path, kubeconfig_yaml(&contexts)).unwrap();
+        vec![path]
+    })
+    .await;
+    connect(cx, &t, "kind-alpha");
+    connect(cx, &t, "kind-beta");
+    open_both(cx, &t).await;
+    cx.update_window(t.window, |_, window, _| window.activate_window())
+        .unwrap();
+    select_row(cx, &t, "kind-beta");
+    cx.run_until_parked();
+    let detail = t.detail(cx).expect("the row's detail");
+    type_edit(cx, &t, &detail, "default", "web");
+    assert!(has_edit(cx, &detail));
+
+    t.dispatch(
+        cx,
+        "workspace::SelectCluster",
+        json!({ "cluster": "kind-gamma" }),
+    )
+    .unwrap();
+    asked(cx, &t).await;
+    t.click(cx, "ok");
+    asked_about_unsaved_set(cx, &t).await;
+    t.click(cx, "ok");
+    answered(cx, &t).await;
+    cx.run_until_parked();
+    assert!(!set_is_open(cx, &t), "the set closed");
+    assert!(t.find(cx, "cluster-set-view").is_none());
+}
+
 // #767: Return in the set name field saves, as the Save Set button does.
 #[gpui_kit::test]
 async fn return_in_the_name_field_saves(cx: &mut TestAppContext) {
