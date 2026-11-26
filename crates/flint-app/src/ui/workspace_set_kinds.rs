@@ -27,11 +27,15 @@ impl Workspace {
             .filter(|(m, found)| run.held.contains(m.context()) && found.vouches_for(&kind))
             .map(|(m, _)| m.clone())
             .collect();
+        let signed_out = self.signed_out_members(run, cx);
         let note = self.nav.update(cx, |nav, cx| {
             nav.set_cluster_set(Some(members), Some(kind.clone()), cx);
             nav.set_kinds().and_then(|set| set.note(&kind))
         });
-        list.update(cx, |list, cx| list.set_kind_note(note, cx));
+        list.update(cx, |list, cx| {
+            list.set_signed_out(signed_out, cx);
+            list.set_kind_note(note, cx)
+        });
         self.release_held(ready, &kind, cx);
     }
 
@@ -53,18 +57,19 @@ impl Workspace {
                 let connected = self
                     .cluster_summary(cluster, cx)
                     .is_some_and(|c| matches!(c.state, ConnectionState::Connected(_)));
-                let down = reports.iter().any(|r| {
-                    r.cluster == cluster
-                        && matches!(
-                            r.status,
-                            MemberStatus::Failed { .. } | MemberStatus::SignInNeeded { .. }
-                        )
+                let signed_out = reports.iter().any(|r| {
+                    r.cluster == cluster && matches!(r.status, MemberStatus::SignInNeeded { .. })
                 });
+                let down = signed_out
+                    || reports.iter().any(|r| {
+                        r.cluster == cluster && matches!(r.status, MemberStatus::Failed { .. })
+                    });
                 MemberKinds {
                     cluster: cluster.to_owned(),
                     shown: names.exact(cluster),
                     discovery: found.and_then(|d| d.discovery.clone()),
                     complete: connected && !down && found.is_some_and(|d| d.error.is_none()),
+                    signed_out,
                 }
             })
             .collect()
@@ -372,6 +377,7 @@ mod tests {
             shown: cluster.into(),
             discovery: None,
             complete: false,
+            signed_out: false,
         };
         let nav = t.workspace.read_with(cx, |ws, _| ws.nav_view());
         nav.update(cx, |nav, cx| {
