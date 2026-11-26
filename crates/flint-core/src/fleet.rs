@@ -19,17 +19,28 @@
 //! A preview whose refused members are not all dropped does not run at all
 //! ([`FleetPreview::is_ready`]).
 //!
+//! After a member's write to a kind with rollouts (Deployments, StatefulSets, DaemonSets), the
+//! run waits for that rollout ([`crate::rollout::rollout_wait`]) before the next member. A
+//! rollout that fails or does not finish within the plan's timeout fails the member and stops
+//! the run. The wait only reads, each time through the gate the write went through: the same
+//! member, pin and credential identity, and refused after a disconnect. A delete waits for
+//! nothing.
+//!
 //! To add an action: a [`FleetAction`] variant and its [`WriteProposal`]. The run loop does not
 //! change.
 
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use serde_json::Value;
 
 use crate::ClusterId;
 use crate::api_path::validate_names;
 use crate::handle::{AdmittedMember, CoreHandle};
 use crate::read::KindId;
+use crate::rollout::{RolloutWait, rollout_wait};
 use crate::write::{
     ResourceChange, ReviewedEdit, WriteAction, WriteError, WriteIntent, WriteProposal, WriteTarget,
     WriteWarning,
@@ -113,6 +124,7 @@ pub struct FleetPlan {
     members: Vec<AdmittedMember>,
     /// The uid of the object as shown on a member, which binds that member's review to it.
     shown: Option<(ClusterId, String)>,
+    rollout_timeout: Duration,
 }
 
 impl FleetPlan {
@@ -143,7 +155,15 @@ impl FleetPlan {
             object,
             members,
             shown: None,
+            rollout_timeout: ROLLOUT_TIMEOUT,
         })
+    }
+
+    /// How long a run waits for each member's rollout before that member fails
+    /// ([`ROLLOUT_TIMEOUT`] unless set).
+    pub fn with_rollout_timeout(mut self, timeout: Duration) -> Self {
+        self.rollout_timeout = timeout;
+        self
     }
 
     /// Binds `cluster`'s review to the object shown there, by its uid: another object of that
@@ -240,6 +260,7 @@ pub struct FleetPreview {
     action: FleetAction,
     object: FleetObject,
     entries: Vec<FleetPreviewEntry>,
+    rollout_timeout: Duration,
 }
 
 impl FleetPreview {
@@ -328,13 +349,59 @@ pub enum FleetSkip {
     NotStarted,
 }
 
-/// How one cluster of a run ended.
+/// Why a member whose write was accepted failed while its rollout was awaited.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RolloutFailure {
+    /// The controller gave up (`ProgressDeadlineExceeded`), in its own words.
+    #[error("the rollout failed: {0}")]
+    Failed(String),
+    #[error("the rollout did not finish within {}", wait_text(*.0))]
+    TimedOut(Duration),
+    /// The object could not be read again: refused by the gate, gone, replaced or unanswered.
+    /// The write itself was accepted.
+    #[error("the change was made, but its rollout could not be checked: {0}")]
+    Unread(WriteError),
+    /// The object's spec changed again (by a controller, GitOps or someone else) before the
+    /// rollout of this change finished, so this change's rollout can no longer be judged.
+    #[error("the object was changed again before this change finished rolling out")]
+    Superseded,
+}
+
+fn wait_text(timeout: Duration) -> String {
+    let seconds = timeout.as_secs();
+    if seconds >= 60 && seconds.is_multiple_of(60) {
+        let minutes = seconds / 60;
+        format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
+    } else {
+        format!("{} s", timeout.as_secs_f32())
+    }
+}
+
+/// How one cluster of a run ended, or, for [`FleetStatus::WaitingForRollout`], where it stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FleetStatus {
+    /// Written, with no rollout to wait for (a delete, or a kind without rollout status).
     Done,
+    /// Written, and the run waits for its rollout before the next cluster. Not an end: heard
+    /// by `on_result` before the cluster's end, never in a [`FleetReport`].
+    WaitingForRollout,
+    /// Written, and its rollout finished.
+    RolledOut,
     Failed(WriteError),
+    /// Written, but its rollout failed or did not finish in time. Stops the run.
+    RolloutFailed(RolloutFailure),
+    /// Written, but the run was cancelled before its rollout finished.
+    RolloutNotAwaited,
     Skipped(FleetSkip),
+}
+
+impl FleetStatus {
+    /// Whether this cluster stops the run.
+    fn stops_run(&self) -> bool {
+        matches!(self, Self::Failed(_) | Self::RolloutFailed(_))
+    }
 }
 
 /// One cluster's line of a [`FleetReport`].
@@ -364,6 +431,7 @@ impl CoreHandle {
                 object,
                 members,
                 shown,
+                rollout_timeout,
             } = plan;
             let mut entries = Vec::with_capacity(members.len());
             for member in members {
@@ -382,14 +450,17 @@ impl CoreHandle {
                 action,
                 object,
                 entries,
+                rollout_timeout,
             }
         }
     }
 
-    /// Runs `preview` one cluster at a time, stopping at the first failure. `on_result` hears
-    /// each cluster as it ends. While a cluster refused in the preview is not dropped, nothing
-    /// runs: that cluster fails with its refusal and every other is not started. Writes are
-    /// never retried.
+    /// Runs `preview` one cluster at a time, stopping at the first failure. After a write to a
+    /// kind with rollouts, the next cluster starts only once that rollout has finished; a failed
+    /// or timed-out rollout is a failure. `on_result` hears each cluster as it ends, and before
+    /// that as [`FleetStatus::WaitingForRollout`] while its rollout is awaited. While a cluster
+    /// refused in the preview is not dropped, nothing runs: that cluster fails with its refusal
+    /// and every other is not started. Writes are never retried.
     pub fn run_fleet(
         &self,
         preview: FleetPreview,
@@ -398,6 +469,10 @@ impl CoreHandle {
     ) -> impl Future<Output = FleetReport> + Send + 'static {
         let core = self.clone();
         let blocked = !preview.unresolved().is_empty();
+        let waits = preview.action != FleetAction::Delete
+            && crate::action_kinds::restarts(&preview.object.kind);
+        let kind = preview.object.kind.clone();
+        let timeout = preview.rollout_timeout;
         let steps = preview
             .entries
             .into_iter()
@@ -408,16 +483,129 @@ impl CoreHandle {
                 work: (entry.member, entry.review),
             })
             .collect();
+        let waiting = cancel.clone();
         drive(steps, cancel, on_result, move |(member, review)| {
             let core = core.clone();
+            let cancel = waiting.clone();
+            let kind = kind.clone();
             async move {
                 let reviewed = review?;
-                core.bound_to(member)
-                    .run_write(reviewed.intent)
-                    .await
-                    .map(drop)
+                let bound = core.bound_to(member);
+                let intent = reviewed.intent;
+                // Stamped before the write: a disconnect asked for from here on ends the wait.
+                let disconnects = bound.disconnects_of(&intent.target.cluster);
+                bound.run_write(intent.clone()).await?;
+                if !waits {
+                    return Ok(None);
+                }
+                let wait = Rollout {
+                    core: bound,
+                    intent,
+                    kind,
+                    disconnects,
+                    cancel,
+                    timeout,
+                };
+                Ok(Some(wait.awaited()))
             }
         })
+    }
+}
+
+/// How long a run waits for one member's rollout unless its plan says otherwise: a Deployment's
+/// default progress deadline, after which its controller reports the rollout failed.
+pub const ROLLOUT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How often a waiting run reads the object again, at most.
+const ROLLOUT_POLL: Duration = Duration::from_secs(2);
+
+/// How often a waiting run looks for a cancel between reads.
+const CANCEL_TICK: Duration = Duration::from_millis(100);
+
+/// One member's rollout, awaited after its write.
+struct Rollout {
+    /// Bound to the member.
+    core: CoreHandle,
+    /// The write, whose gate every read goes through.
+    intent: WriteIntent,
+    kind: KindId,
+    /// [`CoreHandle::disconnects_of`] the member before the write.
+    disconnects: u64,
+    cancel: FleetCancel,
+    timeout: Duration,
+}
+
+impl Rollout {
+    /// Reads the object until its rollout finishes, fails, times out, or the run is cancelled.
+    /// Sends nothing but reads, on the core's runtime.
+    async fn awaited(self) -> FleetStatus {
+        let core = self.core.clone();
+        let ended = core.on_runtime(self.run()).await;
+        ended.unwrap_or(FleetStatus::RolloutFailed(RolloutFailure::Unread(
+            crate::WriteRefusal::Stopped.into(),
+        )))
+    }
+
+    async fn run(self) -> FleetStatus {
+        use tokio::time::Instant;
+        let failed = FleetStatus::RolloutFailed;
+        let deadline = Instant::now() + self.timeout;
+        let poll = ROLLOUT_POLL.min(self.timeout / 4).max(CANCEL_TICK);
+        let mut uid = self.intent.target.uid.clone();
+        // The generation first read after the write: this change's.
+        let mut generation = None;
+        loop {
+            if self.cancel.is_cancelled() {
+                return FleetStatus::RolloutNotAwaited;
+            }
+            if Instant::now() >= deadline {
+                return failed(RolloutFailure::TimedOut(self.timeout));
+            }
+            let read = self.core.read_written(&self.intent, self.disconnects);
+            // A cancel does not wait for a slow read: the write is done, the read only checks.
+            let read = tokio::select! {
+                read = tokio::time::timeout_at(deadline, read) => read,
+                () = self.cancelled() => return FleetStatus::RolloutNotAwaited,
+            };
+            let object = match read {
+                Err(_) => return failed(RolloutFailure::TimedOut(self.timeout)),
+                Ok(Err(error)) => return failed(RolloutFailure::Unread(error)),
+                Ok(Ok(object)) => object,
+            };
+            // The object written, not one made since under its name.
+            let live = object.pointer("/metadata/uid").and_then(Value::as_str);
+            match (uid.as_deref(), live) {
+                (Some(written), Some(live)) if written == live => {}
+                (None, Some(live)) => uid = Some(live.to_owned()),
+                _ => return failed(RolloutFailure::Unread(WriteError::Replaced)),
+            }
+            let live = object
+                .pointer("/metadata/generation")
+                .and_then(Value::as_i64);
+            match generation {
+                None => generation = Some(live),
+                Some(written) if written != live => return failed(RolloutFailure::Superseded),
+                Some(_) => {}
+            }
+            match rollout_wait(&self.kind, &object) {
+                None => return FleetStatus::Done,
+                Some(RolloutWait::Finished) => return FleetStatus::RolledOut,
+                Some(RolloutWait::Failed(why)) => return failed(RolloutFailure::Failed(why)),
+                Some(RolloutWait::Waiting(_)) => {}
+            }
+            let next = (Instant::now() + poll).min(deadline);
+            tokio::select! {
+                () = tokio::time::sleep_until(next) => {}
+                () = self.cancelled() => {}
+            }
+        }
+    }
+
+    /// Ends once the run is cancelled.
+    async fn cancelled(&self) {
+        while !self.cancel.is_cancelled() {
+            tokio::time::sleep(CANCEL_TICK).await;
+        }
     }
 }
 
@@ -456,16 +644,18 @@ struct Step<W> {
     work: W,
 }
 
-/// The run loop: knows nothing about what a step does. After a failure or a cancel, no later
-/// step's work starts.
-async fn drive<W, F>(
+/// The run loop: knows nothing about what a step does. A step's work that leaves a wait
+/// (its rollout) is heard as waiting, then ends when the wait does. After a failure or a cancel,
+/// no later step's work starts.
+async fn drive<W, F, A>(
     steps: Vec<Step<W>>,
     cancel: FleetCancel,
     mut on_result: impl FnMut(&FleetResult),
     mut run: impl FnMut(W) -> F,
 ) -> FleetReport
 where
-    F: Future<Output = Result<(), WriteError>>,
+    F: Future<Output = Result<Option<A>, WriteError>>,
+    A: Future<Output = FleetStatus>,
 {
     let mut results = Vec::with_capacity(steps.len());
     let mut failed = false;
@@ -479,13 +669,19 @@ where
         } else if cancel.is_cancelled() {
             FleetStatus::Skipped(FleetSkip::Cancelled)
         } else {
-            match run(step.work).await {
-                Ok(()) => FleetStatus::Done,
-                Err(error) => {
-                    failed = true;
-                    FleetStatus::Failed(error)
+            let status = match run(step.work).await {
+                Ok(None) => FleetStatus::Done,
+                Ok(Some(wait)) => {
+                    on_result(&FleetResult {
+                        cluster: step.cluster.clone(),
+                        status: FleetStatus::WaitingForRollout,
+                    });
+                    wait.await
                 }
-            }
+                Err(error) => FleetStatus::Failed(error),
+            };
+            failed = status.stops_run();
+            status
         };
         let result = FleetResult {
             cluster: step.cluster,

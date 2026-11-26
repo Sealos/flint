@@ -8,7 +8,7 @@
 
 use flint_core::display::single_line;
 use flint_core::fleet::{
-    FleetAction, FleetObject, FleetPreview, FleetResult, FleetSkip, FleetStatus,
+    FleetAction, FleetObject, FleetPreview, FleetResult, FleetSkip, FleetStatus, RolloutFailure,
 };
 use flint_core::write::{ResourceChange, ReviewedEdit, WriteTarget};
 use gpui_kit::Action;
@@ -432,8 +432,8 @@ pub(in crate::ui) fn run_dialog(
     };
     DialogText {
         title,
-        text: "One cluster at a time; the first failure stops the rest. Closing this stops the \
-               run before the next cluster."
+        text: "One cluster at a time, each waiting for its rollout to finish; the first failure \
+               stops the rest. Closing this stops the run before the next cluster."
             .to_owned(),
         ok: "Close".to_owned(),
         cancel: String::new(),
@@ -447,7 +447,13 @@ pub(in crate::ui) fn run_dialog(
 pub(in crate::ui) enum Outcome {
     /// Its turn has not come.
     Waiting,
+    /// Changed, and the run waits for its rollout.
+    RollingOut,
     Done,
+    /// Changed, and its rollout finished.
+    RolledOut,
+    /// Changed, but the run stopped before its rollout finished.
+    NotAwaited,
     Failed(String),
     /// Left out by the plan, and why.
     Refused(String),
@@ -484,7 +490,11 @@ pub(in crate::ui) fn record(lines: &mut [ResultLine], result: &FleetResult) {
     };
     line.outcome = match &result.status {
         FleetStatus::Done => Outcome::Done,
+        FleetStatus::WaitingForRollout => Outcome::RollingOut,
+        FleetStatus::RolledOut => Outcome::RolledOut,
+        FleetStatus::RolloutNotAwaited => Outcome::NotAwaited,
         FleetStatus::Failed(error) => Outcome::Failed(error_text(error)),
+        FleetStatus::RolloutFailed(failure) => Outcome::Failed(rollout_failure_text(failure)),
         FleetStatus::Skipped(FleetSkip::AfterFailure) => {
             Outcome::NotTried("not tried: an earlier cluster failed")
         }
@@ -503,12 +513,30 @@ pub(in crate::ui) fn record(lines: &mut [ResultLine], result: &FleetResult) {
     };
 }
 
+/// Why a member's rollout failed. The controller's words come from the cluster, so they are
+/// shown on one line, with anything that draws misleadingly escaped.
+fn rollout_failure_text(failure: &RolloutFailure) -> String {
+    match failure {
+        // Not the write's wording: the change was made, only the check of it failed.
+        RolloutFailure::Unread(error) => format!(
+            "the change was made, but its rollout could not be checked: {}",
+            single_line(&error.to_string())
+        ),
+        other => single_line(&other.to_string()),
+    }
+}
+
 /// What a result line says after the member's name. `current` is the member whose turn it is.
 pub(in crate::ui) fn outcome_text(outcome: &Outcome, current: bool) -> String {
     match outcome {
         Outcome::Waiting if current => "running…".to_owned(),
         Outcome::Waiting => "waiting".to_owned(),
+        Outcome::RollingOut => "waiting for rollout…".to_owned(),
         Outcome::Done => "done".to_owned(),
+        Outcome::RolledOut => "rolled out".to_owned(),
+        Outcome::NotAwaited => {
+            "changed; the run was stopped before its rollout finished".to_owned()
+        }
         Outcome::Failed(why) => format!("failed: {why}"),
         Outcome::Refused(why) => format!("left out: {why}"),
         Outcome::NotTried(why) => (*why).to_owned(),
@@ -520,14 +548,20 @@ pub(in crate::ui) fn current(lines: &[ResultLine], finished: bool) -> Option<usi
     if finished {
         return None;
     }
-    lines.iter().position(|l| l.outcome == Outcome::Waiting)
+    lines
+        .iter()
+        .position(|l| matches!(l.outcome, Outcome::RollingOut | Outcome::Waiting))
 }
 
 /// The count under the results once the run has ended ("2 done, 1 failed, 1 not tried").
 pub(in crate::ui) fn summary(lines: &[ResultLine]) -> String {
     let count = |f: fn(&Outcome) -> bool| lines.iter().filter(|l| f(&l.outcome)).count();
     let parts = [
-        (count(|o| *o == Outcome::Done), "done"),
+        (
+            count(|o| matches!(o, Outcome::Done | Outcome::RolledOut)),
+            "done",
+        ),
+        (count(|o| *o == Outcome::NotAwaited), "not awaited"),
         (count(|o| matches!(o, Outcome::Failed(_))), "failed"),
         (
             count(|o| matches!(o, Outcome::NotTried(_) | Outcome::Waiting)),

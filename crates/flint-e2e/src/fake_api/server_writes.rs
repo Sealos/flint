@@ -230,6 +230,9 @@ fn create(
     if let Some(namespace) = namespace {
         meta.insert("namespace".into(), namespace.into());
     }
+    if !dry_run {
+        super::rollouts::after_write(inner.options.rollouts, gvr, None, &mut object);
+    }
     let stored = if dry_run {
         state
             .row_for_object(gvr, &mut object, &[])
@@ -272,6 +275,7 @@ fn patch(
 ) -> Result<Response<Body>, ApiError> {
     let mut state = lock(&inner.state);
     let mut object = state.object(gvr, namespace, name)?;
+    let before = object.clone();
     if content_type.starts_with("application/json-patch+json") {
         let operations = body
             .as_array()
@@ -307,6 +311,7 @@ fn patch(
         drop(state);
         return Ok(rebased(inner, object));
     }
+    super::rollouts::after_write(inner.options.rollouts, gvr, Some(&before), &mut object);
     let version = state.bump();
     object["metadata"]["resourceVersion"] = version.to_string().into();
     let row = state
@@ -379,10 +384,12 @@ fn patch_scale(
         return Ok(rebased(inner, scale));
     }
     let to = scale.pointer("/spec/replicas").cloned().unwrap_or(json!(0));
+    let before = object.clone();
     match object.pointer_mut(&pointer) {
         Some(count) => *count = to,
         None => return Err(ApiError::new(422, "Invalid", "no replica count to scale")),
     }
+    super::rollouts::after_write(inner.options.rollouts, gvr, Some(&before), &mut object);
     let version = state.bump();
     object["metadata"]["resourceVersion"] = version.to_string().into();
     scale["metadata"]["resourceVersion"] = version.to_string().into();

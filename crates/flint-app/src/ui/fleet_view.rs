@@ -768,7 +768,7 @@ impl Render for FleetRunView {
             .children(self.lines.iter().enumerate().map(|(i, line)| {
                 let text = outcome_text(&line.outcome, current == Some(i));
                 let color = match line.outcome {
-                    Outcome::Done => theme.success,
+                    Outcome::Done | Outcome::RolledOut => theme.success,
                     Outcome::Failed(_) => theme.danger,
                     _ => theme.muted_foreground,
                 };

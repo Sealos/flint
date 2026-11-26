@@ -540,6 +540,37 @@ impl CoreHandle {
     }
 }
 
+impl CoreHandle {
+    /// Reads the object `intent` wrote, after the write, through the same gate as that write:
+    /// on the pin and with the credential it was reviewed with, and on this handle's member if
+    /// it is bound to one. A context that changed, a credential that authenticates as someone
+    /// else, or a disconnect asked for since `disconnects` ([`Self::disconnects_of`], stamped
+    /// before the write) refuses the read before it is sent. Sends one `GET` and nothing else.
+    /// Works on any executor.
+    pub(crate) fn read_written(
+        &self,
+        intent: &WriteIntent,
+        disconnects: u64,
+    ) -> impl Future<Output = Result<Value, WriteError>> + Send + 'static {
+        let core = self.clone();
+        let bound = check_bound(intent);
+        let target = intent.target.clone();
+        let pin = intent.action.pin().clone();
+        let credential = intent.action.credential().clone();
+        let task = self.on_runtime(async move {
+            bound?;
+            let mut gate = RequestGate::new(core.clone(), &target);
+            gate.disconnects = disconnects;
+            gate.pin = Some(pin);
+            gate.credential = Some(credential);
+            let kind = kind_of(&core, &target).await?;
+            let client = gate.client().await?;
+            read_live(&client, &kind, &target).await
+        });
+        async move { task.await.unwrap_or(Err(WriteRefusal::Stopped.into())) }
+    }
+}
+
 async fn kind_of(core: &CoreHandle, target: &WriteTarget) -> Result<KindInfo, WriteError> {
     let discovery = core.discovery(&target.cluster).await;
     if let Some(kind) = discovery.as_ref().and_then(|d| d.kind(&target.kind)) {

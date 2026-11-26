@@ -1986,7 +1986,7 @@ async fn a_fleet_restart_runs_on_each_member_after_one_confirmation(cx: &mut Tes
     assert_eq!(row.beta_writes.load(Ordering::SeqCst), 2);
     assert_eq!(
         t.label(cx, ("fleet-result", 0usize)).as_deref(),
-        Some("kind-alpha: done")
+        Some("kind-alpha: rolled out")
     );
 }
 
