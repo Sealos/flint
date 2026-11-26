@@ -43,6 +43,7 @@ mod helm;
 mod history;
 mod keep_watching;
 mod keep_watching_lists;
+mod member_sign_in;
 mod proxy_change;
 mod running_set;
 mod selected_retry;
@@ -393,6 +394,11 @@ enum Internal {
         cluster: ClusterId,
         attempt: u64,
     },
+    /// A member signed in once from the set view needed its sign-in to run again.
+    MemberSignInSpent {
+        cluster: ClusterId,
+        attempt: u64,
+    },
     FilesChanged(Changed),
     /// The file watches changed and now cover these directories. Anything may have been written
     /// before they started, so everything is read again.
@@ -564,6 +570,8 @@ pub(crate) struct ClusterManager {
     active: Option<ClusterId>,
     /// Clusters kept running beside the active one ([`Command::SetRunningSet`]).
     members: HashMap<ClusterId, Member>,
+    /// Sign-ins of members asked for from the set view, until their next attempt starts.
+    signing_in: HashMap<ClusterId, member_sign_in::PendingSignIn>,
     /// When members' background connection attempts may start.
     schedule: Schedule<ClusterId>,
     /// Automatic retries of the selected cluster.
@@ -657,6 +665,7 @@ impl ClusterManager {
             clusters: Vec::new(),
             active: None,
             members: HashMap::new(),
+            signing_in: HashMap::new(),
             schedule: Schedule::default(),
             retries: Default::default(),
             disconnects: Default::default(),
@@ -1058,6 +1067,14 @@ impl ClusterManager {
             }
             Request::CheckMember { member, reply } => {
                 let _ = reply.send(self.member_changed(&member));
+            }
+            Request::SignInMember {
+                member,
+                definition,
+                shown,
+                reply,
+            } => {
+                let _ = reply.send(self.sign_in_member(&member, definition, shown));
             }
             Request::HelmPin { cluster, reply } => {
                 let _ = reply.send(self.helm_pin(&cluster));
@@ -1697,6 +1714,9 @@ impl ClusterManager {
                 // Made under consent in the background: like a kept feed, its first failure
                 // waits for a sign-in, with no retry.
                 let unattended = slot.access.unattended() && !active;
+                // Made by one sign-in from the set view: an ended lease means it was used up, or
+                // a file change stopped it, and the member waits for a sign-in, with no retry.
+                let once = slot.access.signed_in_once_access() && !active;
                 // Dropped either way: the load that ends the pause connects again.
                 if paused {
                     slot.access.revoke();
@@ -1714,10 +1734,11 @@ impl ClusterManager {
                 // Its lease ended while it was being made (switched away and back), so what it
                 // returned, an error included, is no answer about the cluster. It is dropped, and
                 // the current selection connects anew under a new grant.
-                if (lease_ended && !unattended)
-                    || result
-                        .as_ref()
-                        .is_ok_and(|(connection, _)| connection.credential.spent())
+                if (lease_ended && !unattended && !once)
+                    || (!once
+                        && result
+                            .as_ref()
+                            .is_ok_and(|(connection, _)| connection.credential.spent()))
                 {
                     self.drop_to_reconnect(&cluster);
                     let now = Instant::now();
@@ -1731,13 +1752,18 @@ impl ClusterManager {
                     return;
                 }
                 let result = match result {
+                    Ok(_) if lease_ended && once => Err(running_set::sign_in_spent()),
                     Ok(_) if lease_ended => Err(running_set::consent_ended()),
+                    // Spent while connecting, as an ended lease is.
+                    Ok((connection, _)) if once && connection.credential.spent() => {
+                        Err(running_set::sign_in_spent())
+                    }
                     result => result,
                 };
                 let connected = result.is_ok();
                 let outcome = match &result {
                     Ok(_) => AttemptOutcome::Connected,
-                    Err(error) if rejected || unattended => {
+                    Err(error) if rejected || unattended || once => {
                         AttemptOutcome::AuthRejected(error.clone())
                     }
                     Err(error) => AttemptOutcome::Failed(error.clone()),
@@ -1809,7 +1835,10 @@ impl ClusterManager {
             // The loop's sync starts what is due.
             Internal::KeepWatchRetry => {}
             Internal::MemberCredentialFailed { cluster, attempt } => {
-                self.member_credential_failed(&cluster, attempt);
+                self.member_credential_failed(&cluster, attempt, running_set::consent_ended());
+            }
+            Internal::MemberSignInSpent { cluster, attempt } => {
+                self.member_credential_failed(&cluster, attempt, running_set::sign_in_spent());
             }
             Internal::Discovered {
                 cluster,
@@ -2608,6 +2637,14 @@ impl ClusterManager {
             self.drop_spent_connections();
         }
         self.apply_member(&id, MemberEvent::Activated, Instant::now());
+        // A member signed in once from the set view connects anew as the selected cluster: the
+        // click covered one start in the background, and nothing more.
+        if self
+            .cluster(&id)
+            .is_some_and(|slot| slot.access.signed_in_once_access())
+        {
+            self.reconnect_selected(&id);
+        }
         self.ensure_connected(&id);
         // A connected cluster whose discovery failed gets another try when selected.
         if let Some(slot) = self.cluster_mut(&id)
@@ -2696,16 +2733,20 @@ impl ClusterManager {
             return;
         }
         self.next_attempt += 1;
-        // A member in the background signs in under its keep-watching consent, if it has one,
-        // and never with a prompt.
-        let consent = (role == Role::Background && self.members.contains_key(id))
+        // A member in the background signs in once if the person just asked for it from the set
+        // view. Otherwise it signs in under its keep-watching consent, if it has one, and never
+        // with a prompt.
+        let once = self.take_member_sign_in(id, role, attempt);
+        let consent = (once.is_none() && role == Role::Background && self.members.contains_key(id))
             .then(|| self.member_consent(id))
             .flatten();
-        let access = match consent {
-            Some(consent) => self.member_access(id, attempt, consent),
-            None => CredentialAccess::new(Arc::new(ForegroundOnly), role),
+        let access = match (once, consent) {
+            (Some(once), _) => once,
+            (None, Some(consent)) => self.member_access(id, attempt, consent),
+            (None, None) => CredentialAccess::new(Arc::new(ForegroundOnly), role),
         };
-        let no_prompt = access.unattended().then(|| {
+        // A kept connection's program and one signed in once from the set view get no input.
+        let no_prompt = access.takes_no_input().then(|| {
             let mut merged = kubeconfig.merged.clone();
             cluster::disable_interactive_exec(&mut merged);
             merged
