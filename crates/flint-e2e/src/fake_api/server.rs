@@ -74,6 +74,11 @@ pub struct Options {
     /// resource also removes its CustomResourceDefinition. Naming a resource the fixtures do not
     /// serve fails the server's start.
     pub hidden: Vec<Gvr>,
+    /// Custom resources served with a `scale` subresource, each with the path its definition
+    /// names for the replica count (`.spec.size`): in discovery, in its
+    /// CustomResourceDefinition, and for a `PATCH` of `scale`. Naming a resource the fixtures do
+    /// not serve, or a built-in one, fails the server's start.
+    pub scaled: Vec<(Gvr, String)>,
 }
 
 impl Default for Options {
@@ -88,6 +93,7 @@ impl Default for Options {
             no_metrics: false,
             version: None,
             hidden: Vec::new(),
+            scaled: Vec::new(),
         }
     }
 }
@@ -370,6 +376,7 @@ impl FakeApiServer {
             }
         }
         variants::check_hidden(&fixtures, &options.hidden)?;
+        variants::check_scaled(&fixtures, &options.scaled)?;
         let version = variants::version(&fixtures.version, options.version.as_deref())?;
         let tls = tls::generate()?;
         let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -380,6 +387,7 @@ impl FakeApiServer {
         let clock = Clock::new(options.now);
         let mut state = State::new(&fixtures);
         variants::remove_hidden_crds(&mut state, &fixtures, &options.hidden);
+        variants::declare_scale(&mut state, &fixtures, &options.scaled)?;
         let inner = Arc::new(Inner {
             state: Arc::new(Mutex::new(state)),
             version,
@@ -1188,6 +1196,7 @@ fn respond(
                     fixtures.discovery_groups.clone()
                 };
                 variants::hide_from_discovery(&mut body, &inner.options.hidden);
+                variants::scale_in_discovery(&mut body, &inner.options.scaled);
                 Ok(json_with(200, DISCOVERY_CONTENT_TYPE, &body))
             } else {
                 Err(ApiError::not_found(

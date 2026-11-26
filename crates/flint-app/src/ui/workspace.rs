@@ -1006,6 +1006,8 @@ impl Workspace {
                         c.provisional || c.paused,
                     )
                 });
+        let kind = detail.read(cx).object().kind.clone();
+        let scalable = self.kind_scale_paths(&cluster, &kind, cx).is_some();
         let thresholds = self
             .model
             .read(cx)
@@ -1022,6 +1024,7 @@ impl Workspace {
                 Some(None) => {}
                 None => d.note_context_gone(cx),
             }
+            d.set_access_scalable(scalable, cx);
             d.set_access_connection(connection, unsettled, cx);
         });
     }
@@ -1099,6 +1102,7 @@ impl Workspace {
             &names,
             None,
             guard,
+            None,
             begin,
             |_, _| {},
             move |result, cx| {
@@ -1151,6 +1155,36 @@ impl Workspace {
         }
     }
 
+    /// Closes a confirmation whose object a copy fetched by `detail` shows changed. Every detail
+    /// pane of the window has it, a cluster set's included.
+    pub(in crate::ui) fn close_confirmations_on_change(
+        detail: &Entity<DetailView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.observe_in(detail, window, |ws, _, window, cx| {
+            ws.close_changed_confirmations(window, cx);
+        })
+    }
+
+    /// Closes, once this update is done, each confirmation whose object the detail pane shows
+    /// changed, or no longer shows.
+    pub(in crate::ui) fn close_changed_confirmations(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !gpui_kit::component::WindowExt::has_active_dialog(window, cx) {
+            return;
+        }
+        let this = cx.weak_entity();
+        window.defer(cx, move |window, cx| {
+            if let Some(why) = confirm::close_changed(window, cx) {
+                let _ = this.update(cx, |ws, cx| ws.confirmation_closed(why, window, cx));
+            }
+        });
+    }
+
     /// Brings the navigation and main area in line with the model: the active cluster and its
     /// discovery.
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1158,7 +1192,8 @@ impl Workspace {
             let this = cx.weak_entity();
             window.defer(cx, move |window, cx| {
                 if confirm::close_stale(window, cx) {
-                    let _ = this.update(cx, |ws, cx| ws.confirmation_closed(window, cx));
+                    let why = super::write_binding::connection_changed_text();
+                    let _ = this.update(cx, |ws, cx| ws.confirmation_closed(why, window, cx));
                 }
             });
         }
@@ -1591,6 +1626,7 @@ impl Workspace {
                 self.clear_action_error(cx);
                 self.detail = None;
                 self._detail_subscriptions.clear();
+                self.close_changed_confirmations(window, cx);
                 let focus = list.read(cx).focus_handle().clone();
                 window.focus(&focus, cx);
                 // The closed pane's YAML, if it had focus.
@@ -1645,6 +1681,7 @@ impl Workspace {
                 });
                 self._detail_subscriptions =
                     vec![
+                        Self::close_confirmations_on_change(&detail, window, cx),
                         cx.subscribe_in(&detail, window, move |this, _, event, window, cx| {
                             match event {
                                 DetailEvent::Close => this.close_detail(window, cx),

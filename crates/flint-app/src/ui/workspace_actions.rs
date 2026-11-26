@@ -913,10 +913,11 @@ impl Workspace {
     /// Says why a confirmation closed by itself, and gives focus back if what held it is gone.
     pub(in crate::ui) fn confirmation_closed(
         &mut self,
+        why: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.refuse_held(super::super::write_binding::connection_changed_text(), cx);
+        self.refuse_held(why, cx);
         if window.focused(cx).is_none() {
             let focus = self
                 .list
@@ -1546,6 +1547,25 @@ impl Workspace {
             .and_then(|d| d.discovery.as_ref())
             .and_then(|d| d.kind(kind))
             .is_some_and(|k| k.supports("delete"))
+    }
+
+    /// Where Scale reads and writes the replica count of `kind` on `cluster`, if it has Scale: a
+    /// built-in kind always, a custom resource once discovery read its definition's paths.
+    pub(in crate::ui) fn kind_scale_paths(
+        &self,
+        cluster: &str,
+        kind: &flint_core::KindId,
+        cx: &App,
+    ) -> Option<flint_core::action_kinds::ScalePaths> {
+        if flint_core::action_kinds::scales_built_in(kind) {
+            return Some(flint_core::action_kinds::ScalePaths::built_in());
+        }
+        self.model
+            .read(cx)
+            .discovered(cluster)
+            .and_then(|d| d.discovery.as_ref())
+            .and_then(|d| d.kind(kind))
+            .and_then(flint_core::KindInfo::scale_paths)
     }
 
     /// Holds the review being read for a resource action; a newer one replaces it.

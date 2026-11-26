@@ -434,6 +434,7 @@ mod tests {
             verbs: ["get", "list"].map(String::from).to_vec(),
             singular: kind.to_lowercase(),
             short_names: short.iter().map(|s| (*s).to_owned()).collect(),
+            scale: Default::default(),
         }
     }
 
