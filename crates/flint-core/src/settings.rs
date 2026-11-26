@@ -411,6 +411,15 @@ impl ProxySetting {
         crate::connection::proxy::use_setting(self);
     }
 
+    /// Uses this setting, read from a `settings.toml` saved since this process started, for
+    /// connections made from now on, as a process started now would: for a process without the
+    /// core's manager (`flint mcp`), which builds its clients again under it. Returns whether the
+    /// setting in use changed, which also moves [`proxy_generation`]. Never while the file was
+    /// unreadable at startup: that proxy applies only after a restart.
+    pub fn follow_in_this_process(&self) -> bool {
+        crate::connection::proxy::follow_setting(self)
+    }
+
     /// Why Flint could not use this setting, if it could not: a URL it can't read or whose scheme
     /// it does not support, or a no-proxy entry that holds a comma or a space. What it says holds
     /// no credentials of the URL.
@@ -978,6 +987,22 @@ fn config_dir_from(
         },
     }
     .ok_or(SettingsError::NoConfigDir)
+}
+
+/// How many times this process replaced its proxy setting since startup: a kubeconfig loaded
+/// under another generation ([`crate::kubeconfig::LoadedKubeconfig::proxy_generation`]) chose its
+/// routes under another setting.
+pub fn proxy_generation() -> u64 {
+    crate::connection::proxy::generation()
+}
+
+/// Runs `attempt` under the proxy setting of generation `generation`, whatever is put in use
+/// meanwhile: a client built in it takes the route of the kubeconfig load it was read from.
+pub async fn under_proxy_generation<F: std::future::Future>(
+    generation: u64,
+    attempt: F,
+) -> F::Output {
+    crate::connection::proxy::pinned_to(generation, attempt).await
 }
 
 pub fn load_settings(dir: &Path) -> Result<Settings, SettingsError> {

@@ -1241,18 +1241,28 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   A cluster entry's own `proxy-url` wins. Otherwise a set `url` replaces `HTTPS_PROXY` and `NO_PROXY` (only its own
   `no_proxy` list exempts servers from it); a `no_proxy` list without a `url` replaces `NO_PROXY` alone. `no_proxy`
   takes `NO_PROXY` entries: names, `.domain` or `*.domain` suffixes, IP addresses and CIDR ranges, each with an
-  optional `:port`, or `*`. It is read at startup (`bootstrap`, in the app and `flint mcp`); an edit to the file
-  applies after a restart. `CoreHandle::apply_proxy` saves a new setting and puts it in use at once
+  optional `:port`, or `*`. It is read at startup (`bootstrap`, in the app and `flint mcp`); in the app, an edit to
+  the file applies after a restart. `flint mcp` reads `settings.toml` on every call and puts a changed `[proxy]` in
+  use as a fresh start would (`ProxySetting::follow_in_this_process`): kubeconfig is loaded again under it, so routes
+  and the AI exposure pinned to them are checked again, and its cached clients, keyed by the proxy generation, are
+  built again; a call already running finishes on the client it holds. `CoreHandle::apply_proxy` saves a new setting
+  and puts it in use at once
   (`manager/proxy_change.rs`): every kubeconfig load records the setting generation it chose routes under
   (`LoadedKubeconfig::proxy_generation`), a slot loaded under an older one is held (nothing new connects, no session
   or write starts) until a load under the new one replaces it, and that load replaces every slot, so each client,
-  feed and kept feed is built again. Nothing rebinds: a context the new setting reaches another way is on another
-  route, so its log streams and shells end as for a re-pointed context, and its grants no longer hold. Every
-  port-forward ends, bound to its connection. An attempt already running when the setting changes goes on under the
+  feed and kept feed is built again. A context the new setting reaches another way is on another route, so its log
+  streams and shells end as for a re-pointed context, and its grants no longer hold. Port-forwards are the one thing
+  bound again (`manager/forwards.rs`): each keeps its listener on the same local port, drops the connections it
+  carried, and waits (`ForwardBinding::rebinding`) until its cluster is back on the new setting. It then goes on
+  with the new connection only for the same definition on the same server, unchanged meanwhile
+  (`ContextPin::same_definition_on_any_route` and the definition revision), and only through the gate a new forward
+  takes on the new route; otherwise, or when its cluster does not come back before the report, it ends saying why.
+  A forward on a running set's member ends if its route moved. An attempt already running when the setting changes
+  goes on under the
   setting of its load (`connection::proxy::pinned_to`), plugin environment included, and its result is dropped with
   its slot; background sign-in consent holds only on the route keep watching was turned on for. The caller gets the
-  clusters reconnecting, those rerouted, the forwards ended, and a report of which came back and which were
-  rerouted. `settings.toml` is written owner-only, as it can hold the proxy's password. Refused while `settings.toml` is invalid or was unreadable at
+  clusters reconnecting, those rerouted, how many forwards wait, and a report of which came back, which were
+  rerouted, and each forward's local port and whether it reconnected or why it ended. `settings.toml` is written owner-only, as it can hold the proxy's password. Refused while `settings.toml` is invalid or was unreadable at
   startup. Every context loaded in a process is pinned to the route it connects through. An `http://` proxy is
   used through `CONNECT`; `socks5://` (names resolved by Flint) and `socks5h://` (names resolved by the proxy), from a
   `proxy-url`, the setting or `HTTPS_PROXY`, through SOCKS5 with the URL's user name and password; TLS to the API

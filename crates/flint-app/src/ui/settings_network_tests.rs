@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use flint_core::handle::ProxyReconnectReport;
+use flint_core::handle::{ForwardReconnect, ProxyReconnectReport};
 use flint_core::settings::ProxySetting;
 use gpui_kit::test::TestAppContextExt as _;
 use gpui_kit::{AppContext as _, TestAppContext};
@@ -90,7 +90,10 @@ fn the_confirmation_says_what_reconnects_and_what_ends() {
         text.contains("writes waiting for review are refused"),
         "{text}"
     );
-    assert!(text.contains("2 port-forwards end"), "{text}");
+    assert!(
+        text.contains("2 port-forwards keep their local ports and reconnect"),
+        "{text}"
+    );
     assert!(text.contains("1 shell and 3 log streams open"), "{text}");
     assert!(!text.contains(SECRET), "{text}");
 
@@ -103,23 +106,30 @@ fn the_confirmation_says_what_reconnects_and_what_ends() {
 fn the_report_names_what_reconnected_and_what_did_not() {
     let waiting = Progress::Reconnecting {
         waiting: vec!["kind-alpha".into()],
-        forwards_ended: 1,
+        forwards: 1,
     };
     assert_eq!(
         waiting.lines(),
         [
             "Applied. Reconnecting: kind-alpha…",
-            "1 port-forward ended; start it again."
+            "Reconnecting 1 port-forward on its local port…"
         ]
     );
-    let done = Progress::Done {
-        report: ProxyReconnectReport {
-            rerouted: vec!["kind-alpha".into()],
-            reconnected: vec!["kind-alpha".into()],
-            failed: vec![("kind-beta".into(), "the proxy refused".into())],
-        },
-        forwards_ended: 0,
+    let forward = |cluster: &str, ended: Option<&str>| ForwardReconnect {
+        cluster: cluster.into(),
+        target: "service/web port 80 in demo".into(),
+        local_port: Some(8080),
+        ended: ended.map(str::to_owned),
     };
+    let done = Progress::Done(ProxyReconnectReport {
+        rerouted: vec!["kind-alpha".into()],
+        reconnected: vec!["kind-alpha".into()],
+        failed: vec![("kind-beta".into(), "the proxy refused".into())],
+        forwards: vec![
+            forward("kind-alpha", None),
+            forward("kind-beta", Some("kind-beta did not reconnect")),
+        ],
+    });
     assert!(done.failed());
     assert_eq!(
         done.lines(),
@@ -127,13 +137,23 @@ fn the_report_names_what_reconnected_and_what_did_not() {
             "Reconnected: kind-alpha.",
             "Not reconnected: kind-beta: the proxy refused.",
             "Now reached another way: kind-alpha. Unlock, trust and keep watching them again if \
-             they were."
+             they were.",
+            "Port-forward reconnected: service/web port 80 in demo of kind-alpha on local port \
+             8080.",
+            "Port-forward ended: service/web port 80 in demo of kind-beta on local port 8080: \
+             kind-beta did not reconnect."
         ]
     );
-    let nothing = Progress::Done {
-        report: ProxyReconnectReport::default(),
-        forwards_ended: 0,
-    };
+    let forward_ended = Progress::Done(ProxyReconnectReport {
+        reconnected: vec!["kind-alpha".into()],
+        forwards: vec![forward("kind-alpha", Some("kind-alpha is protected"))],
+        ..ProxyReconnectReport::default()
+    });
+    assert!(
+        forward_ended.failed(),
+        "an ended forward counts as a failure"
+    );
+    let nothing = Progress::Done(ProxyReconnectReport::default());
     assert!(!nothing.failed());
     assert!(nothing.lines()[0].contains("No cluster was connected"));
 }
@@ -453,8 +473,7 @@ async fn apply_child(cx: &mut TestAppContext) {
         )
     })
     .await;
-    let Some(Progress::Done { report, .. }) =
-        t.workspace.read_with(cx, |ws, _| ws.network_progress())
+    let Some(Progress::Done(report)) = t.workspace.read_with(cx, |ws, _| ws.network_progress())
     else {
         panic!("applied and reported");
     };

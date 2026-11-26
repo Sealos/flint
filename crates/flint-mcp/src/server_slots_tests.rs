@@ -172,7 +172,11 @@ async fn a_refused_send_check_releases_the_slots() {
     let conn = server.client(&ctx, "dev").await.unwrap();
 
     std::fs::write(dir.path().join("settings.toml"), "").unwrap();
-    assert!(!server.inner.still_connectable("dev", conn.fingerprint));
+    assert!(
+        !server
+            .inner
+            .still_connectable("dev", conn.fingerprint, conn.generation)
+    );
     assert_released(&server);
 }
 
@@ -234,4 +238,78 @@ async fn idle_eviction_does_not_forget_the_confirmed_definition() {
     assert_every_tool_waits(&server, "secondtoken", dir.path()).await;
     assert_eq!(requests.lock().unwrap().len(), reached, "nothing was sent");
     assert_eq!(sent(&requests, "secondtoken"), 0);
+}
+
+/// Set for the child process [`a_saved_proxy_change_rebuilds_the_clients_under_it`] runs in.
+const PROXY_CHILD: &str = "FLINT_TEST_MCP_PROXY_CHILD";
+
+// covers UP-125: a running server puts a proxy saved in settings.toml since it started in use as
+// a fresh start would: the context's route is checked again, exposure given on the old route no
+// longer holds, and the client is built again on the new route. Saving no proxy again goes back.
+// In a child process, since the setting in use is the process's.
+#[test]
+fn a_saved_proxy_change_rebuilds_the_clients_under_it() {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "server::slots_tests::saved_proxy_change_child",
+            "--exact",
+            "--nocapture",
+        ])
+        .env(PROXY_CHILD, "1")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .status()
+        .unwrap();
+    assert!(status.success(), "the child process failed");
+}
+
+#[tokio::test]
+async fn saved_proxy_change_child() {
+    if std::env::var_os(PROXY_CHILD).is_none() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (url, requests) = fake_api();
+    let one = config(&url, "    token: firsttoken\n");
+    let (server, first) = two_files(dir.path(), &url, &one, NO_CONTEXTS);
+    let settings = dir.path().join("settings.toml");
+    let direct = std::fs::read_to_string(&settings).unwrap();
+    warm(&server).await;
+    assert_eq!(flint_core::settings::proxy_generation(), 0);
+    let reached = requests.lock().unwrap().len();
+
+    // Nothing listens there: a connection through it could not reach the server.
+    let proxy = "[proxy]\nurl = \"http://127.0.0.1:9\"\n";
+    std::fs::write(&settings, format!("{direct}{proxy}")).unwrap();
+    server.context().await.unwrap();
+    assert_eq!(flint_core::settings::proxy_generation(), 1);
+    assert_released(&server);
+
+    // Exposed again on the route the proxy gives it.
+    let loaded = flint_core::kubeconfig::load(&[first, dir.path().join("second")]);
+    let route = loaded.context("dev").unwrap().grant_server().unwrap();
+    assert!(route.ends_with(" via http://127.0.0.1:9"), "{route}");
+    let exposed = format!("[[ai_exposed_clusters]]\ncontext = \"dev\"\nserver = \"{route}\"\n");
+    std::fs::write(&settings, format!("{exposed}{proxy}")).unwrap();
+    let listed = server.do_list_clusters().await.unwrap();
+    let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+    let row = &listed["clusters"][0];
+    assert_eq!(row["reachable"], json!(false), "{listed}");
+    let error = row["error"].as_str().unwrap();
+    assert!(
+        error.contains("plain HTTP"),
+        "the new route was checked: {error}"
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        reached,
+        "nothing went direct"
+    );
+
+    std::fs::write(&settings, &direct).unwrap();
+    assert_reachable(&server).await;
+    assert_eq!(flint_core::settings::proxy_generation(), 2);
+    assert!(requests.lock().unwrap().len() > reached, "direct again");
 }

@@ -1,8 +1,15 @@
 //! The MCP tools. Each call re-reads `settings.toml` (so the app's Expose to AI toggle applies at
 //! once), recomputes the kubeconfig file list from it, reloads kubeconfig when a file changed,
 //! checks the cluster against the opt-in list, and only then touches the network.
+//!
+//! A proxy saved in `settings.toml` since startup is put in use as a fresh start would use it
+//! ([`flint_core::settings::ProxySetting::follow_in_this_process`]): kubeconfig is loaded again
+//! under it, so each context's route, and the exposure pinned to it, is checked again, and every
+//! cached client is built again, since clients are cached per proxy generation. A call already
+//! running keeps the client it holds and finishes on it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash as _, Hasher as _};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
@@ -66,6 +73,8 @@ struct Inner {
     read_files: fn(&[PathBuf]) -> KubeconfigRead,
     clients: SlotCache<Client>,
     discovery: SlotCache<Discovered>,
+    /// Held while `settings.toml` is read and its proxy put in use.
+    settings_read: Mutex<()>,
     /// Fingerprints computed for one parsed kubeconfig.
     fingerprints: Mutex<Option<KnownFingerprints>>,
     /// Starts the idle sweep on the first call, which runs inside the runtime.
@@ -213,6 +222,10 @@ struct Conn {
     /// Held while the connection is in use, so the client does not count as idle.
     _slot: Arc<Slot<Client>>,
     fingerprint: u64,
+    /// The proxy generation of the route its client was built on.
+    generation: u64,
+    /// What its client is cached under ([`slot_key`]).
+    key: u64,
     target: Target,
     /// What the agent may read of the cluster (ADR-0013).
     scope: policy::AiScope,
@@ -698,6 +711,7 @@ impl FlintMcp {
                 clients: SlotCache::new(None, SLOT_IDLE),
                 discovery: SlotCache::new(Some(DISCOVERY_TTL), SLOT_IDLE),
                 fingerprints: Mutex::default(),
+                settings_read: Mutex::default(),
                 slot_sweep: Once::new(),
                 warned_scopes: std::sync::Mutex::default(),
                 admission: Admission::new(limits),
@@ -977,7 +991,7 @@ impl FlintMcp {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
             // The full TOML error quotes lines of settings.toml; give the agent one safe line.
-            let settings = settings::load_settings(&inner.config_dir).map_err(|e| {
+            let settings = inner.load_settings().map_err(|e| {
                 // Nothing is known to be exposed, as for a send check.
                 inner.retain_slots(&LiveKeys::default());
                 let setup = policy::Setup::new(inner.flavour, &inner.config_dir);
@@ -1046,19 +1060,24 @@ impl FlintMcp {
         // Derived from the same kubeconfig entries as the fingerprint, so it always matches the
         // cached client.
         let target = Target::of(&ctx.kubeconfig.merged, &info.name);
+        let generation = ctx.kubeconfig.proxy_generation;
+        let key = slot_key(fingerprint, generation);
         let slot = self
-            .checked_slot(&self.inner.clients, name, fingerprint)
+            .checked_slot(&self.inner.clients, name, fingerprint, generation, key)
             .await?;
         let client = slot
             .cell
             .get_or_try_init(|| async {
+                // On the route this call's kubeconfig chose and its exposure and scope were read
+                // for, whatever setting is put in use meanwhile.
+                let connect = cluster::connect_checked(
+                    &ctx.kubeconfig.merged,
+                    &info.name,
+                    self.send_check(name, fingerprint, generation),
+                );
                 tokio::time::timeout(
                     TOOL_CONNECT_TIMEOUT,
-                    cluster::connect_checked(
-                        &ctx.kubeconfig.merged,
-                        &info.name,
-                        self.send_check(name, fingerprint),
-                    ),
+                    settings::under_proxy_generation(generation, connect),
                 )
                 .await
                 .map_err(|_| ClusterError::timeout(TOOL_CONNECT_TIMEOUT, None))?
@@ -1071,22 +1090,27 @@ impl FlintMcp {
             client,
             _slot: slot,
             fingerprint,
+            generation,
+            key,
             target,
             scope,
         })
     }
 
-    /// What a client built for `name` at `fingerprint` asks before each attempt to send: a retry
-    /// can come after the context was paused or its definition changed. Holds the server weakly,
-    /// as the server keeps the client.
-    fn send_check(&self, name: &str, fingerprint: u64) -> cluster::SendCheck {
+    /// What a client built for `name` at `fingerprint`, on the route of proxy generation
+    /// `generation`, asks before each attempt to send: a retry can come after the context was
+    /// paused, its definition changed, or another proxy setting was saved. Holds the server
+    /// weakly, as the server keeps the client.
+    fn send_check(&self, name: &str, fingerprint: u64, generation: u64) -> cluster::SendCheck {
         let inner = Arc::downgrade(&self.inner);
         let name = name.to_owned();
         cluster::SendCheck::new(move || {
             let (inner, name) = (inner.clone(), name.clone());
             Box::pin(async move {
-                if connectable_now(inner, name, fingerprint).await {
+                if connectable_now(inner, name, fingerprint, generation).await {
                     Ok(())
+                } else if settings::proxy_generation() != generation {
+                    Err(PROXY_CHANGED.to_owned())
                 } else {
                     Err(policy::PAUSED_CLUSTER.to_owned())
                 }
@@ -1094,19 +1118,26 @@ impl FlintMcp {
         })
     }
 
-    /// The slot for `name`. One not stored yet is stored only after a read of the files made
-    /// from here on shows the context as connectable, and only if no change was seen since.
+    /// The slot for `name` at `fingerprint`, cached under `key`. One not stored yet is stored
+    /// only after a read of the files made from here on shows the context as connectable, and
+    /// only if no change was seen since.
     async fn checked_slot<T>(
         &self,
         cache: &SlotCache<T>,
         name: &str,
         fingerprint: u64,
+        generation: u64,
+        key: u64,
     ) -> Result<Arc<Slot<T>>, ToolError> {
-        let (slot, epoch) = match cache.acquire(name, fingerprint) {
+        let (slot, epoch) = match cache.acquire(name, key) {
             Acquired::Stored(slot) => return Ok(slot),
             Acquired::Pending { slot, epoch } => (slot, epoch),
         };
-        if !connectable_now(Arc::downgrade(&self.inner), name.to_owned(), fingerprint).await {
+        let inner = Arc::downgrade(&self.inner);
+        if !connectable_now(inner, name.to_owned(), fingerprint, generation).await {
+            if settings::proxy_generation() != generation {
+                return Err(ToolError::new(PROXY_CHANGED));
+            }
             return Err(ToolError::new(policy::PAUSED_CLUSTER));
         }
         cache.publish(name, &slot, epoch);
@@ -1119,7 +1150,13 @@ impl FlintMcp {
 
     async fn discovered(&self, cluster: &str, conn: &Conn) -> Result<Discovered, ToolError> {
         let slot = self
-            .checked_slot(&self.inner.discovery, cluster, conn.fingerprint)
+            .checked_slot(
+                &self.inner.discovery,
+                cluster,
+                conn.fingerprint,
+                conn.generation,
+                conn.key,
+            )
             .await?;
         // Groups skipped this time are missing until the cache expires; the agent can retry.
         let discovered = slot
@@ -1792,18 +1829,52 @@ impl FlintMcp {
     }
 }
 
+/// What a call whose route a newly saved proxy setting replaced is told.
+const PROXY_CHANGED: &str = "the proxy setting in settings.toml changed during this call, so the \
+     cluster may be reached another way now; call the tool again.";
+
 /// [`Inner::still_connectable`] off the async threads; no once the server is gone.
-async fn connectable_now(inner: std::sync::Weak<Inner>, name: String, fingerprint: u64) -> bool {
+async fn connectable_now(
+    inner: std::sync::Weak<Inner>,
+    name: String,
+    fingerprint: u64,
+    generation: u64,
+) -> bool {
     tokio::task::spawn_blocking(move || {
         inner
             .upgrade()
-            .is_some_and(|inner| inner.still_connectable(&name, fingerprint))
+            .is_some_and(|inner| inner.still_connectable(&name, fingerprint, generation))
     })
     .await
     .unwrap_or(false)
 }
 
+/// What a context's client and discovery are cached under: its `fingerprint` and the proxy
+/// generation its kubeconfig was loaded under, so a proxy change builds them again on its route.
+fn slot_key(fingerprint: u64, proxy_generation: u64) -> u64 {
+    if proxy_generation == 0 {
+        return fingerprint;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (fingerprint, proxy_generation).hash(&mut hasher);
+    hasher.finish()
+}
+
 impl Inner {
+    /// `settings.toml` as it is now, with its proxy put in use if it changed since startup or
+    /// the last call: kubeconfig is then loaded again under it, and every client built again.
+    fn load_settings(&self) -> Result<flint_core::Settings, settings::SettingsError> {
+        // Read and put in use in one step, so an older read never replaces a newer setting.
+        let _reading = self.settings_read.lock().unwrap_or_else(|e| e.into_inner());
+        let loaded = settings::load_settings(&self.config_dir)?;
+        if loaded.proxy.follow_in_this_process() {
+            tracing::info!(
+                "the proxy setting in settings.toml changed; connecting through it from now on"
+            );
+        }
+        Ok(loaded)
+    }
+
     /// The merged kubeconfig for `paths`, parsed again only when a file changed. Exec auth
     /// plugins are set to never prompt: stdin is the MCP stream. Also returns the contexts that
     /// load paused. No lock is held across the read: a file can stall, and a call on another
@@ -1825,9 +1896,10 @@ impl Inner {
         } = confirmed.judge(read);
         let mut stored = self.kubeconfig.lock().unwrap();
         if outcome == ReadOutcome::Obsolete
-            && let Some(newer) = stored
-                .as_ref()
-                .filter(|parsed| parsed.kubeconfig.paths == paths)
+            && let Some(newer) = stored.as_ref().filter(|parsed| {
+                parsed.kubeconfig.paths == paths
+                    && parsed.kubeconfig.proxy_generation >= loaded.proxy_generation
+            })
         {
             return (newer.kubeconfig.clone(), newer.paused.clone());
         }
@@ -1843,10 +1915,11 @@ impl Inner {
         (loaded, paused)
     }
 
-    /// Whether `name` is still exposed, unpaused and defined as `fingerprint` says, by the files
-    /// as they are now. Settings that can't be read count as no.
-    fn still_connectable(&self, name: &str, fingerprint: u64) -> bool {
-        let Ok(settings) = settings::load_settings(&self.config_dir) else {
+    /// Whether `name` is still exposed, unpaused and defined as `fingerprint` says, on the route
+    /// of proxy generation `generation`, by the files as they are now. Settings that can't be
+    /// read count as no.
+    fn still_connectable(&self, name: &str, fingerprint: u64, generation: u64) -> bool {
+        let Ok(settings) = self.load_settings() else {
             self.retain_slots(&LiveKeys::default());
             return false;
         };
@@ -1855,6 +1928,7 @@ impl Inner {
         let (loaded, paused) = self.load_kubeconfig(&paths);
         self.retain_slots(&self.live_keys(&settings, &loaded, &paused));
         !paused.contains(name)
+            && loaded.proxy_generation == generation
             && policy::exposed_cluster(&settings, &loaded, name).is_ok()
             && cluster::context_fingerprint(&loaded.merged, name) == Some(fingerprint)
     }
@@ -1882,7 +1956,10 @@ impl Inner {
             };
             if let Some(fingerprint) = fingerprint {
                 known.insert(info.name.clone(), fingerprint);
-                live.insert(info.name.clone(), fingerprint);
+                live.insert(
+                    info.name.clone(),
+                    slot_key(fingerprint, loaded.proxy_generation),
+                );
             }
         }
         Arc::new(live)
@@ -1912,12 +1989,16 @@ impl Inner {
         });
     }
 
-    /// The last parse, if it still stands for files stamped `stamps`.
+    /// The last parse, if it still stands for files stamped `stamps` and was made under the
+    /// proxy setting in use: routes are chosen as a kubeconfig is loaded.
     fn parsed(&self, stamps: &FileStamps) -> Option<(Arc<LoadedKubeconfig>, Arc<HashSet<String>>)> {
         let cached = self.kubeconfig.lock().unwrap();
-        let parsed = cached
-            .as_ref()
-            .filter(|parsed| parsed.reusable && parsed.stamps == *stamps)?;
+        let generation = settings::proxy_generation();
+        let parsed = cached.as_ref().filter(|parsed| {
+            parsed.reusable
+                && parsed.stamps == *stamps
+                && parsed.kubeconfig.proxy_generation == generation
+        })?;
         Some((parsed.kubeconfig.clone(), parsed.paused.clone()))
     }
 }

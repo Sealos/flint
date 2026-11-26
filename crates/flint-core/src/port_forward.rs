@@ -6,7 +6,10 @@
 //! forward started on, and is never kept. The manager ends a forward as soon as the gate
 //! refuses (protected, re-pointed, paused, removed), its connection goes, or a change of cluster
 //! or of keep watching leaves it without a reason to run. The listener closes and every
-//! connection ends.
+//! connection ends. A proxy change is the one exception: the forward keeps its listener, drops
+//! its connections, and waits for its cluster to come back on the new setting. The manager then
+//! binds it to the new connection if it is the same definition and the gate still lets it run,
+//! or ends it saying why (`ForwardBinding`).
 //!
 //! A forward to a pod reaches that pod only, by uid: one recreated under its name ends it. A
 //! Service forward picks a ready pod for each new connection, so it moves to another pod when
@@ -16,11 +19,13 @@ use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use futures::FutureExt as _;
 use futures::future::BoxFuture;
+use futures::stream::BoxStream;
+use futures::{FutureExt as _, StreamExt as _};
 use k8s_openapi::api::core::v1::{Pod, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::api::ListParams;
@@ -340,12 +345,37 @@ pub(crate) enum DialError {
     Dropped(String),
 }
 
+/// A change of a forward's binding, as its task sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Rebinding {
+    /// It waits to be bound again: nothing new is opened.
+    pub(crate) waits: bool,
+    /// A proxy change held it since the last change seen: what it carries went on the old
+    /// route.
+    pub(crate) held: bool,
+}
+
+/// Why a connection could not be opened, in words.
+fn dial_text(error: &DialError) -> String {
+    match error {
+        DialError::Fatal(failure) => failure.message.clone(),
+        DialError::Dropped(why) => why.clone(),
+    }
+}
+
 /// Reaches the target. A seam, so forwarding is testable without a cluster.
 pub(crate) trait Dialer: Send + Sync + 'static {
-    /// Whether the gate still allows this forward.
-    fn check(&self) -> BoxFuture<'static, Result<(), ForwardFailure>>;
+    /// Whether the gate still allows this forward: [`DialError::Dropped`] while it waits to be
+    /// bound again after a proxy change.
+    fn check(&self) -> BoxFuture<'static, Result<(), DialError>>;
     /// Resolves with how the forward ends, once the core ends it.
     fn ended(&self) -> BoxFuture<'static, ForwardState>;
+    /// Each change of its binding ([`ForwardBinding`]): whether it waits to be bound again, and
+    /// whether a proxy change held it since the last change seen, which may come with its
+    /// rebind in one step.
+    fn rebinding(&self) -> BoxStream<'static, Rebinding>;
+    /// The forward listens on `port`.
+    fn listening(&self, _port: u16) {}
     /// The pod a connection would reach now.
     fn probe(&self) -> BoxFuture<'static, Result<String, DialError>>;
     fn dial(&self) -> BoxFuture<'static, Result<Upstream, DialError>>;
@@ -400,11 +430,12 @@ async fn relay<D: Dialer>(
     None
 }
 
-/// Resolves with why the forward must end, once the gate refuses.
+/// Resolves with why the forward must end, once the gate refuses. Waiting to be bound again is
+/// no refusal.
 async fn watch_gate<D: Dialer>(dialer: Arc<D>) -> ForwardFailure {
     loop {
         tokio::time::sleep(GATE_EVERY).await;
-        if let Err(failure) = dialer.check().await {
+        if let Err(DialError::Fatal(failure)) = dialer.check().await {
             return failure;
         }
     }
@@ -458,6 +489,7 @@ pub(crate) async fn serve<D: Dialer>(
     let mut ended = dialer.ended();
     let mut gate = Box::pin(watch_gate(dialer.clone()));
     let mut target = Box::pin(watch_target(dialer.clone(), out.clone()));
+    let mut rebinding = dialer.rebinding();
     // Accepted, and waiting for room in the budget all forwards share.
     let mut waiting: Option<TcpStream> = None;
     let end = loop {
@@ -467,6 +499,17 @@ pub(crate) async fn serve<D: Dialer>(
             state = &mut ended => break state,
             failure = &mut gate => break ForwardState::Failed(failure),
             failure = &mut target => break ForwardState::Failed(failure),
+            Some(change) = rebinding.next() => {
+                if change.held {
+                    // Its connections went through the old route: they end.
+                    conns.abort_all();
+                }
+                if change.waits {
+                    out.send_modify(|s| s.warning = Some(REBINDING.to_owned()));
+                } else {
+                    out.send_if_modified(|s| s.warning.take().is_some());
+                }
+            }
             Some(done) = conns.join_next(), if !conns.is_empty() => {
                 if let Ok(Some(failure)) = done {
                     break ForwardState::Failed(failure);
@@ -513,7 +556,8 @@ pub(crate) async fn run<D: Dialer>(
         channels.say_stopped();
         return;
     };
-    if let Err(failure) = checked {
+    // One that waits to be bound again listens meanwhile: the rebind decides.
+    if let Err(DialError::Fatal(failure)) = checked {
         channels
             .out
             .send_modify(|s| s.state = ForwardState::Failed(failure));
@@ -530,6 +574,9 @@ pub(crate) async fn run<D: Dialer>(
         }
     };
     let local_port = listener.local_addr().ok().map(|a| a.port());
+    if let Some(port) = local_port {
+        dialer.listening(port);
+    }
     channels.out.send_modify(|s| {
         s.local_port = local_port;
         s.state = ForwardState::Listening;
@@ -563,14 +610,33 @@ pub(crate) fn gate_failure(refusal: &WriteError) -> ForwardFailure {
     ForwardFailure::new(ForwardFailureKind::Refused, message)
 }
 
+/// What a running forward opens its connections on: the definition and the connection it was
+/// admitted on. A proxy change holds it (`rebinding`) until its cluster is back on the new
+/// setting; the manager then moves it to the new connection, only for the same definition on
+/// the same server and only if the gate lets it run there, or ends it.
+#[derive(Clone)]
+pub(crate) struct ForwardBinding {
+    pub(crate) pin: ContextPin,
+    pub(crate) connection: CredentialId,
+    /// Waiting to be bound again after a proxy change: nothing new is opened.
+    pub(crate) rebinding: bool,
+    /// How many proxy changes held it, so a task that sees the hold and the rebind as one change
+    /// still drops what it carried on the old route.
+    pub(crate) holds: u64,
+}
+
+/// What a forward says while it waits to be bound again after a proxy change.
+pub(crate) const REBINDING: &str = "reconnecting on the new proxy setting";
+
 /// What the core admitted a forward on: the definition, the connection, and how it hears that it
 /// must end.
 pub(crate) struct ForwardGrant {
     pub(crate) id: u64,
-    pub(crate) pin: ContextPin,
-    pub(crate) connection: CredentialId,
+    pub(crate) binding: watch::Receiver<ForwardBinding>,
     pub(crate) ended: watch::Receiver<Option<ForwardState>>,
     pub(crate) signals: ForwardSignals,
+    /// The port it listens on, `0` until it does: for the proxy change's report.
+    pub(crate) local_port: Arc<AtomicU16>,
 }
 
 /// The real [`Dialer`]: every connection asks the gate and takes a fresh client.
@@ -580,6 +646,7 @@ pub(crate) struct KubeDialer {
     ended: watch::Receiver<Option<ForwardState>>,
     /// The uid a pod target must have.
     uid: Arc<Mutex<Option<String>>>,
+    local_port: Arc<AtomicU16>,
 }
 
 /// What a dial needs, without borrowing the dialer into its future.
@@ -589,18 +656,41 @@ struct Access {
     id: u64,
     cluster: ClusterId,
     server: Option<Option<String>>,
-    pin: ContextPin,
-    connection: CredentialId,
+    /// What it is bound to now, which the manager moves after a proxy change.
+    binding: watch::Receiver<ForwardBinding>,
     admitted: Option<Arc<AdmittedMember>>,
     signals: ForwardSignals,
 }
 
+/// A refusal because Flint is stopping.
+fn stopped() -> DialError {
+    DialError::Fatal(gate_failure(&WriteRefusal::Stopped.into()))
+}
+
 impl Access {
-    async fn check(&self) -> Result<(), ForwardFailure> {
+    fn binding(&self) -> ForwardBinding {
+        self.binding.borrow().clone()
+    }
+
+    /// `failure` as the reason to end, unless the forward now waits to be bound again: what
+    /// refused it then was its old connection going, and the rebind decides.
+    fn refused(&self, failure: ForwardFailure) -> DialError {
+        if self.binding.borrow().rebinding {
+            DialError::Dropped(REBINDING.to_owned())
+        } else {
+            DialError::Fatal(failure)
+        }
+    }
+
+    async fn check(&self) -> Result<(), DialError> {
+        let bound = self.binding();
+        if bound.rebinding {
+            return Err(DialError::Dropped(REBINDING.to_owned()));
+        }
         if let Some(member) = &self.admitted
-            && !member.holds(&self.cluster, &self.pin)
+            && !member.holds(&self.cluster, &bound.pin)
         {
-            return Err(gate_failure(&WriteError::ConnectionChanged));
+            return Err(self.refused(gate_failure(&WriteError::ConnectionChanged)));
         }
         let (reply, rx) = oneshot::channel();
         let sent = self
@@ -608,15 +698,14 @@ impl Access {
             .send(Request::CheckForward { id: self.id, reply })
             .await;
         if sent.is_err() {
-            return Err(gate_failure(&WriteRefusal::Stopped.into()));
+            return Err(stopped());
         }
-        rx.await
-            .unwrap_or_else(|_| Err(gate_failure(&WriteRefusal::Stopped.into())))
+        rx.await.unwrap_or_else(|_| Err(stopped()))
     }
 
     /// A client for one request, read in one step with the pin: refused unless it is the
-    /// definition and the connection the forward started on.
-    async fn client(&self) -> Result<(GatedClient, WriteCredential), ForwardFailure> {
+    /// definition and the connection the forward is bound to.
+    async fn client(&self) -> Result<(GatedClient, WriteCredential), DialError> {
         let (reply, rx) = oneshot::channel();
         let sent = self
             .requests
@@ -628,14 +717,17 @@ impl Access {
             })
             .await;
         if sent.is_err() {
-            return Err(gate_failure(&WriteRefusal::Stopped.into()));
+            return Err(stopped());
         }
         let (client, pin, credential) = rx
             .await
             .unwrap_or(Err(WriteRefusal::Stopped.into()))
-            .map_err(|e| gate_failure(&e))?;
-        if pin != self.pin || !credential.id().is(&self.connection) {
-            return Err(gate_failure(&WriteError::ConnectionChanged));
+            .map_err(|e| self.refused(gate_failure(&e)))?;
+        // Read after the answer: the manager moves the binding before it answers on the new
+        // connection.
+        let bound = self.binding();
+        if bound.rebinding || pin != bound.pin || !credential.id().is(&bound.connection) {
+            return Err(self.refused(gate_failure(&WriteError::ConnectionChanged)));
         }
         Ok((client, credential))
     }
@@ -643,39 +735,39 @@ impl Access {
     /// The client with its credential already resolved, under the connection's own grant: what
     /// is sent with it runs nothing and waits for no refresh.
     async fn signed_in(&self) -> Result<kube::Client, DialError> {
-        let (client, credential) = self.client().await.map_err(DialError::Fatal)?;
+        let (client, credential) = self.client().await?;
         match credential.resolved(client.into_client()).await {
             Ok(client) => Ok(client),
             Err(WriteError::IdentityUnverified) => Err(DialError::Dropped(format!(
                 "{} must be selected to sign in again",
                 self.cluster
             ))),
-            Err(refusal) => Err(DialError::Fatal(gate_failure(&refusal))),
+            Err(refusal) => Err(self.refused(gate_failure(&refusal))),
         }
     }
 
-    /// Whether the files as they are now still give the definition the forward started on.
-    async fn check_definition(&self) -> Result<(), ForwardFailure> {
+    /// Whether the files as they are now still give the definition the forward is bound to.
+    async fn check_definition(&self) -> Result<(), DialError> {
         let (reply, rx) = oneshot::channel();
         let sent = self
             .requests
             .send(Request::CheckWritePin {
                 cluster: self.cluster.clone(),
-                pin: self.pin.clone(),
+                pin: self.binding().pin,
                 reply,
             })
             .await;
         if sent.is_err() {
-            return Err(gate_failure(&WriteRefusal::Stopped.into()));
+            return Err(stopped());
         }
         rx.await
             .unwrap_or(Err(WriteRefusal::Stopped.into()))
-            .map_err(|e| gate_failure(&e))
+            .map_err(|e| self.refused(gate_failure(&e)))
     }
 
     /// The gate, for the moment an upgrade is sent: the files, then the manager's state. A
     /// refusal is left in `refused`, since the client's error can't carry it.
-    fn send_check(&self, refused: Arc<Mutex<Option<ForwardFailure>>>) -> SendCheck {
+    fn send_check(&self, refused: Arc<Mutex<Option<DialError>>>) -> SendCheck {
         let access = self.clone();
         SendCheck::new(move || {
             let (access, refused) = (access.clone(), Arc::clone(&refused));
@@ -684,9 +776,9 @@ impl Access {
                     Ok(()) => access.check().await,
                     Err(failure) => Err(failure),
                 };
-                checked.map_err(|failure| {
-                    let text = failure.to_string();
-                    *refused.lock().unwrap_or_else(|e| e.into_inner()) = Some(failure);
+                checked.map_err(|error| {
+                    let text = dial_text(&error);
+                    *refused.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
                     text
                 })
             }
@@ -694,12 +786,17 @@ impl Access {
         })
     }
 
-    /// `result`, after ending every forward on this connection if its sign-in was refused.
-    fn after<T>(&self, result: Result<T, DialError>) -> Result<T, DialError> {
+    /// `result`, after ending every forward on `connection`, the one it was tried on, if its
+    /// sign-in was refused. One the forward was moved off meanwhile ends nothing.
+    fn after<T>(
+        &self,
+        connection: &CredentialId,
+        result: Result<T, DialError>,
+    ) -> Result<T, DialError> {
         if let Err(DialError::Fatal(failure)) = &result
             && failure.kind == ForwardFailureKind::Unauthorized
         {
-            self.signals.end_connection(&self.connection);
+            self.signals.end_connection(connection);
         }
         result
     }
@@ -919,9 +1016,31 @@ fn pick_backends(service: &Service, slices: &[EndpointSlice], port: u16) -> Vec<
 }
 
 impl Dialer for KubeDialer {
-    fn check(&self) -> BoxFuture<'static, Result<(), ForwardFailure>> {
+    fn check(&self) -> BoxFuture<'static, Result<(), DialError>> {
         let access = self.access.clone();
         async move { access.check().await }.boxed()
+    }
+
+    fn rebinding(&self) -> BoxStream<'static, Rebinding> {
+        let mut binding = self.access.binding.clone();
+        let holds = binding.borrow_and_update().holds;
+        futures::stream::unfold((binding, holds), |(mut binding, seen)| async move {
+            binding.changed().await.ok()?;
+            let (waits, holds) = {
+                let now = binding.borrow_and_update();
+                (now.rebinding, now.holds)
+            };
+            let change = Rebinding {
+                waits,
+                held: holds != seen,
+            };
+            Some((change, (binding, holds)))
+        })
+        .boxed()
+    }
+
+    fn listening(&self, port: u16) {
+        self.local_port.store(port, Ordering::Relaxed);
     }
 
     fn ended(&self) -> BoxFuture<'static, ForwardState> {
@@ -940,8 +1059,9 @@ impl Dialer for KubeDialer {
         let request = self.request.clone();
         let uid = Arc::clone(&self.uid);
         async move {
+            let connection = access.binding().connection;
             let probed = async {
-                access.check().await.map_err(DialError::Fatal)?;
+                access.check().await?;
                 let client = access.signed_in().await?;
                 let backend = resolve(
                     &client,
@@ -954,7 +1074,7 @@ impl Dialer for KubeDialer {
                 Ok(backend.pod)
             }
             .await;
-            access.after(probed)
+            access.after(&connection, probed)
         }
         .boxed()
     }
@@ -964,8 +1084,9 @@ impl Dialer for KubeDialer {
         let request = self.request.clone();
         let uid = Arc::clone(&self.uid);
         async move {
+            let connection = access.binding().connection;
             let dialed = dial_once(&access, &request, &uid).await;
-            access.after(dialed)
+            access.after(&connection, dialed)
         }
         .boxed()
     }
@@ -977,7 +1098,7 @@ async fn dial_once(
     request: &ForwardRequest,
     uid: &Mutex<Option<String>>,
 ) -> Result<Upstream, DialError> {
-    access.check().await.map_err(DialError::Fatal)?;
+    access.check().await?;
     let client = access.signed_in().await?;
     let backend = resolve(
         &client,
@@ -994,14 +1115,14 @@ async fn dial_once(
         Ok(tunnel) => tunnel,
         Err(error) => {
             // Refused by the gate at send time, or it closed meanwhile.
-            if let Some(failure) = refused.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                return Err(DialError::Fatal(failure));
+            if let Some(error) = refused.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                return Err(error);
             }
             // Before the gate, which a stuck manager would hold this refusal behind.
             if error == WireError::Status(401) {
                 return Err(DialError::Fatal(unauthorized()));
             }
-            access.check().await.map_err(DialError::Fatal)?;
+            access.check().await?;
             return Err(match error {
                 WireError::Status(403) => forbidden("port-forwarding to this pod"),
                 WireError::Status(404) if matches!(request.target, ForwardTarget::Pod(_)) => {
@@ -1023,7 +1144,7 @@ async fn dial_once(
         &backend,
     )
     .await?;
-    access.check().await.map_err(DialError::Fatal)?;
+    access.check().await?;
     Ok(Upstream {
         stream: Box::pin(tunnel.stream),
         failed: tunnel.failed.map(|reported| reported.is_ok()).boxed(),
@@ -1049,14 +1170,14 @@ impl KubeDialer {
                 id: grant.id,
                 cluster: request.cluster.clone(),
                 server: request.server.clone(),
-                pin: grant.pin,
-                connection: grant.connection,
+                binding: grant.binding,
                 admitted,
                 signals: grant.signals,
             },
             request,
             ended: grant.ended,
             uid: Arc::new(Mutex::new(uid)),
+            local_port: grant.local_port,
         }
     }
 }
@@ -1184,6 +1305,8 @@ mod tests {
         probe: Mutex<Option<DialError>>,
         report_error: AtomicBool,
         slow_close: AtomicBool,
+        /// Changes of its binding, as a proxy change makes them.
+        rebinding: watch::Sender<Option<Rebinding>>,
     }
 
     /// Takes a moment to drop, as a connection slow to close does.
@@ -1207,16 +1330,16 @@ mod tests {
     }
 
     impl Dialer for Arc<FakeDialer> {
-        fn check(&self) -> BoxFuture<'static, Result<(), ForwardFailure>> {
+        fn check(&self) -> BoxFuture<'static, Result<(), DialError>> {
             let refused = self.refused.load(Ordering::SeqCst);
             async move {
                 if refused {
-                    Err(gate_failure(
+                    Err(DialError::Fatal(gate_failure(
                         &WriteRefusal::Protected {
                             cluster: "dev".into(),
                         }
                         .into(),
-                    ))
+                    )))
                 } else {
                     Ok(())
                 }
@@ -1226,6 +1349,16 @@ mod tests {
 
         fn ended(&self) -> BoxFuture<'static, ForwardState> {
             futures::future::pending().boxed()
+        }
+
+        fn rebinding(&self) -> BoxStream<'static, Rebinding> {
+            let rx = self.rebinding.subscribe();
+            futures::stream::unfold(rx, |mut rx| async move {
+                rx.changed().await.ok()?;
+                let change = (*rx.borrow_and_update())?;
+                Some((change, rx))
+            })
+            .boxed()
         }
 
         fn probe(&self) -> BoxFuture<'static, Result<String, DialError>> {
@@ -1461,6 +1594,48 @@ mod tests {
         assert_eq!(shown.state, ForwardState::Listening);
     }
 
+    // covers UP-125: while a proxy change holds it, a forward keeps its port, ends the
+    // connections it carried on the old route, and carries new ones once bound again.
+    #[tokio::test]
+    async fn waiting_to_be_bound_again_drops_connections_and_keeps_the_port() {
+        let dialer = Arc::new(FakeDialer::default());
+        let (_forward, mut updates, port) = started(&dialer, None).await;
+        let mut old = round_trip(port).await;
+
+        dialer.rebinding.send_replace(Some(Rebinding {
+            waits: true,
+            held: true,
+        }));
+        ended(&mut old).await;
+        let shown = wait_for(&mut updates, |s| s.warning.is_some()).await;
+        assert_eq!(shown.warning.as_deref(), Some(REBINDING));
+        assert_eq!(shown.state, ForwardState::Listening);
+        assert_eq!(shown.local_port, Some(port));
+
+        dialer.rebinding.send_replace(Some(Rebinding {
+            waits: false,
+            held: false,
+        }));
+        let shown = wait_for(&mut updates, |s| s.warning.is_none()).await;
+        assert_eq!(shown.state, ForwardState::Listening);
+        let _again = round_trip(port).await;
+    }
+
+    // A hold and its rebind seen as one change still end what went on the old route.
+    #[tokio::test]
+    async fn a_hold_seen_with_its_rebind_still_drops_old_connections() {
+        let dialer = Arc::new(FakeDialer::default());
+        let (_forward, _updates, port) = started(&dialer, None).await;
+        let mut old = round_trip(port).await;
+
+        dialer.rebinding.send_replace(Some(Rebinding {
+            waits: false,
+            held: true,
+        }));
+        ended(&mut old).await;
+        let _again = round_trip(port).await;
+    }
+
     #[tokio::test]
     async fn an_error_on_the_port_is_reported_as_a_drop() {
         let dialer = Arc::new(FakeDialer::default());
@@ -1591,7 +1766,7 @@ mod tests {
     }
 
     impl Dialer for Arc<SlowGate> {
-        fn check(&self) -> BoxFuture<'static, Result<(), ForwardFailure>> {
+        fn check(&self) -> BoxFuture<'static, Result<(), DialError>> {
             let gate = Arc::clone(self);
             async move {
                 gate.release.notified().await;
@@ -1602,6 +1777,10 @@ mod tests {
 
         fn ended(&self) -> BoxFuture<'static, ForwardState> {
             futures::future::pending().boxed()
+        }
+
+        fn rebinding(&self) -> BoxStream<'static, Rebinding> {
+            futures::stream::pending().boxed()
         }
 
         fn probe(&self) -> BoxFuture<'static, Result<String, DialError>> {

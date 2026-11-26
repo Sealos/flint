@@ -72,8 +72,9 @@ pub use exec::{
 };
 pub use handle::{
     ClusterSummary, ClustersSnapshot, Command, ConnectionProgress, ConnectionState, CoreConfig,
-    CoreHandle, Event, LogSession, LogUpdates, OverviewInterest, PROXY_REPORT_AFTER, ProxyApplied,
-    ProxyReconnectReport, ReloadError, SlotBinding, Subscription, WatchTiming,
+    CoreHandle, Event, ForwardReconnect, LogSession, LogUpdates, OverviewInterest,
+    PROXY_REPORT_AFTER, ProxyApplied, ProxyReconnectReport, ReloadError, SlotBinding, Subscription,
+    WatchTiming,
 };
 pub use logs::{
     FilterSpec, Freshness, LineFormat, LineId, LineSelection, LineSource, LogFilter, LogLine,

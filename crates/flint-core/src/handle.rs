@@ -506,13 +506,16 @@ pub(crate) enum Request {
     AdmitForward {
         cluster: ClusterId,
         server: Option<Option<String>>,
+        /// What it forwards, as a proxy change's report names it.
+        target: String,
         admitted: Option<Arc<AdmittedMember>>,
         reply: oneshot::Sender<Result<crate::port_forward::ForwardGrant, WriteError>>,
     },
-    /// Whether admitted forward `id` may carry on. Answered from memory.
+    /// Whether admitted forward `id` may carry on, or waits to be bound again after a proxy
+    /// change. Answered from memory.
     CheckForward {
         id: u64,
-        reply: oneshot::Sender<Result<(), crate::port_forward::ForwardFailure>>,
+        reply: oneshot::Sender<Result<(), crate::port_forward::DialError>>,
     },
     /// Why a session opened on `cluster` at `pin` must end (the context was re-pointed or
     /// removed since), or `None`. Never contacts the server.
@@ -688,9 +691,11 @@ pub struct ProxyApplied {
     /// files were read under the new setting (`loaded`); [`ProxyReconnectReport::rerouted`]
     /// always has them.
     pub rerouted: Vec<ClusterId>,
-    /// How many port-forwards ended. Each was bound to a connection that is gone; start it
-    /// again to forward on the new one.
-    pub forwards_ended: usize,
+    /// How many port-forwards wait to reconnect on the new setting. Each keeps its local port
+    /// and is bound to the new connection once its cluster is back, if it is the same cluster
+    /// and the gate still lets it run; otherwise it ends, saying why
+    /// ([`ProxyReconnectReport::forwards`]).
+    pub forwards: usize,
     /// Whether the kubeconfig files were read under the new setting already. Until they are,
     /// every cluster is held: nothing new connects and nothing is written.
     pub loaded: bool,
@@ -710,6 +715,20 @@ pub struct ProxyReconnectReport {
     pub reconnected: Vec<ClusterId>,
     /// Each with why, in words safe to show: never a proxy's credentials.
     pub failed: Vec<(ClusterId, String)>,
+    /// How each port-forward running at the change came back.
+    pub forwards: Vec<ForwardReconnect>,
+}
+
+/// How one port-forward came back from a proxy change ([`ProxyReconnectReport::forwards`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardReconnect {
+    pub cluster: ClusterId,
+    /// What it forwards: `pod/web port 8080 in demo`.
+    pub target: String,
+    /// The local port it listens on, unchanged by the change; `None` if it never listened.
+    pub local_port: Option<u16>,
+    /// Why it ended, in words safe to show; `None` when it reconnected on the same port.
+    pub ended: Option<String>,
 }
 
 /// The full cluster list. Sent whole whenever kubeconfig is (re)loaded.
@@ -1567,6 +1586,10 @@ impl CoreHandle {
             let asked = requests.send(Request::AdmitForward {
                 cluster: request.cluster.clone(),
                 server: request.server.clone(),
+                target: format!(
+                    "{} port {} in {}",
+                    request.target, request.remote_port, request.namespace
+                ),
                 admitted: admitted.clone(),
                 reply,
             });
