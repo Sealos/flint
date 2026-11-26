@@ -1238,9 +1238,7 @@ impl CoreHandle {
         setting: crate::settings::ProxySetting,
     ) -> impl Future<Output = Result<ProxyApplied, String>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let sent = self
-            .requests
-            .try_send(Request::ApplyProxy { setting, reply });
+        let sent = self.requests.push(Request::ApplyProxy { setting, reply });
         async move {
             if sent.is_err() {
                 return Err("the proxy setting could not be sent to be saved".to_owned());
