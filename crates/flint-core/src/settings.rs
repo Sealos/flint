@@ -369,6 +369,26 @@ impl ProxySetting {
         (!entries.is_empty()).then(|| entries.join(","))
     }
 
+    /// This setting as `settings.toml` saves it: the URL and each no-proxy entry trimmed, and
+    /// blank ones dropped.
+    pub(crate) fn normalized(&self) -> Self {
+        Self {
+            url: self
+                .url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .map(str::to_owned),
+            no_proxy: self
+                .no_proxy
+                .iter()
+                .map(|e| e.trim())
+                .filter(|e| !e.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
+
     /// Uses this setting for this process's cluster connections. The first call wins: contexts
     /// loaded under it are pinned to its route, so a later setting applies after a restart, or
     /// through [`crate::CoreHandle::apply_proxy`].
@@ -398,11 +418,13 @@ impl ProxySetting {
                     .to_owned(),
             })?;
         }
-        for entry in self.no_proxy.iter().map(|e| e.trim()) {
+        for (n, entry) in self.no_proxy.iter().map(|e| e.trim()).enumerate() {
             if entry.contains(',') || entry.chars().any(char::is_whitespace) {
+                // The entry itself is not quoted: a URL pasted into it may hold credentials.
                 return Err(format!(
-                    "the no-proxy entry \"{entry}\" holds a comma or a space; give one host, \
-                     domain, address or range per entry"
+                    "no-proxy entry {} holds a comma or a space; give one host, domain, \
+                     address or range per entry",
+                    n + 1
                 ));
             }
         }

@@ -100,6 +100,11 @@ async fn a_setting_that_does_not_check_out_changes_nothing() {
             url: None,
             no_proxy: vec!["a.example, b.example".into()],
         },
+        // A URL pasted where a no-proxy entry goes is refused without being quoted.
+        ProxySetting {
+            url: None,
+            no_proxy: vec!["localhost, http://user:hunter2@proxy.example:3128".into()],
+        },
     ] {
         let error = manager.apply_proxy(refused).await.unwrap_err();
         assert!(!error.contains("hunter2"), "{error}");
@@ -405,6 +410,7 @@ fn waiting_on(
         seq: 1,
         pending: Some(Pending {
             seq: 1,
+            generation: proxy::generation(),
             routes: Default::default(),
             waiting: ids
                 .iter()
@@ -453,4 +459,84 @@ async fn a_report_that_runs_out_of_time_counts_the_rest_as_failed() {
     assert!(report.reconnected.is_empty());
     assert_eq!(report.failed.len(), 1);
     assert!(report.failed[0].1.contains("in time"), "{report:?}");
+}
+
+// covers UP-125: helm takes the route Flint shows, so a URL saved with spaces around it is used
+// trimmed, as it is saved.
+#[test]
+fn a_setting_is_used_as_it_is_saved() {
+    let padded = setting("  http://proxy.example:3128 \n");
+    let used = proxy::ProxyEnvironment::default().under(Some(&padded));
+    assert_eq!(
+        used.https_proxy.as_deref(),
+        Some("http://proxy.example:3128")
+    );
+    let normalized = ProxySetting {
+        url: Some(" ".into()),
+        no_proxy: vec![" .example.com ".into(), "  ".into()],
+    }
+    .normalized();
+    assert_eq!(normalized.url, None);
+    assert_eq!(normalized.no_proxy, [".example.com"]);
+}
+
+// covers UP-125: with nothing to reconnect, the report still waits for the load under the new
+// setting, so the routes it reports are the new ones.
+#[tokio::test]
+async fn the_report_waits_for_the_load_under_the_new_setting() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = manager_in(dir.path()).await;
+    let mut settled = waiting_on(&mut manager, &[]);
+    let next = proxy::generation() + 1;
+    if let Some(pending) = &mut manager.proxy_change.pending {
+        pending.generation = next;
+    }
+
+    manager.sync_proxy_report();
+    assert!(
+        settled.try_recv().is_err(),
+        "no slot is loaded under it yet"
+    );
+
+    for id in ["dev", "own"] {
+        manager.cluster_mut(id).unwrap().proxy_generation = next;
+    }
+    manager.sync_proxy_report();
+    let report = settled.try_recv().expect("reported once loaded");
+    assert!(report.failed.is_empty(), "{report:?}");
+}
+
+// covers UP-125: a second change sends the first one's report against the routes the first one
+// loaded, with what it still waited for as replaced.
+#[test]
+fn a_newer_change_finishes_the_earlier_report_first() {
+    in_child("child_a_newer_change_finishes_the_earlier_report_first");
+}
+
+#[tokio::test]
+async fn child_a_newer_change_finishes_the_earlier_report_first() {
+    if !is_child() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = manager_in(dir.path()).await;
+    manager.active = Some("dev".to_owned());
+
+    let first = manager
+        .apply_proxy(setting("http://proxy.example:3128"))
+        .await
+        .unwrap();
+    assert_eq!(first.reconnecting, ["dev"]);
+    let mut first_settled = first.settled;
+    assert!(first_settled.try_recv().is_err(), "dev has not connected");
+
+    manager.apply_proxy(ProxySetting::default()).await.unwrap();
+    let report = first_settled.try_recv().expect("the first report went out");
+    assert_eq!(
+        report.rerouted,
+        ["dev"],
+        "against the first change's routes"
+    );
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    assert!(report.failed[0].1.contains("newer"), "{report:?}");
 }

@@ -247,7 +247,12 @@ impl ProxyEnvironment {
             return self;
         };
         let no_proxy = setting.no_proxy_list();
-        match setting.url.as_deref().filter(|u| !u.trim().is_empty()) {
+        match setting
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
             Some(url) => ProxyEnvironment {
                 https_proxy: Some(url.to_owned()),
                 no_proxy,

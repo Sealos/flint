@@ -27,12 +27,18 @@ pub(super) struct ProxyChange {
 /// A change whose reconnections have not all settled.
 struct Pending {
     seq: u64,
+    /// The proxy generation this change put in use: the report waits until every slot is
+    /// loaded under it, so the routes it reports are the new ones.
+    generation: u64,
     /// Each context's route before the change.
     routes: HashMap<ClusterId, Option<String>>,
     waiting: BTreeSet<ClusterId>,
     report: ProxyReconnectReport,
     settled: tokio::sync::oneshot::Sender<ProxyReconnectReport>,
 }
+
+/// Why a cluster the report still waits for when its timer runs out failed.
+const TIMED_OUT: &str = "did not connect in time on the new proxy setting";
 
 /// How a cluster waited on came back, once it did.
 enum Outcome {
@@ -49,6 +55,7 @@ impl ClusterManager {
         setting: ProxySetting,
     ) -> Result<ProxyApplied, String> {
         setting.check()?;
+        let setting = setting.normalized();
         if crate::connection::proxy::setting_unreadable_at_startup() {
             return Err(crate::connection::proxy::ReplaceRefused::UnreadableAtStartup.to_string());
         }
@@ -72,7 +79,11 @@ impl ClusterManager {
         let written = setting.clone();
         self.try_write_settings("the proxy", move |dir| settings::set_proxy(dir, &written))
             .await?;
-        crate::connection::proxy::replace_setting(&setting).map_err(|e| e.to_string())?;
+        // A report still waiting for an earlier change goes out now, against the routes that
+        // change loaded, before this one replaces them.
+        self.finish_proxy_report("a newer proxy setting replaced it before it connected");
+        let generation =
+            crate::connection::proxy::replace_setting(&setting).map_err(|e| e.to_string())?;
         tracing::info!("proxy setting replaced; connecting every cluster again");
 
         // Every slot is behind the setting now, so held: no new connection, session or write
@@ -94,10 +105,9 @@ impl ClusterManager {
         self.proxy_change.seq += 1;
         let seq = self.proxy_change.seq;
         let (settled, settled_rx) = tokio::sync::oneshot::channel();
-        // A report still waiting for an earlier change goes out as it stands.
-        self.finish_proxy_report();
         self.proxy_change.pending = Some(Pending {
             seq,
+            generation,
             routes,
             waiting: reconnecting.iter().cloned().collect(),
             report: ProxyReconnectReport::default(),
@@ -139,8 +149,13 @@ impl ClusterManager {
                 Outcome::Failed(why) => pending.report.failed.push((id, why)),
             }
         }
-        if pending.waiting.is_empty() {
-            self.finish_proxy_report();
+        let generation = pending.generation;
+        let routes_loaded = self
+            .clusters
+            .iter()
+            .all(|slot| slot.proxy_generation == generation);
+        if pending.waiting.is_empty() && routes_loaded {
+            self.finish_proxy_report(TIMED_OUT);
         }
     }
 
@@ -152,7 +167,7 @@ impl ClusterManager {
             .as_ref()
             .is_some_and(|pending| pending.seq == change)
         {
-            self.finish_proxy_report();
+            self.finish_proxy_report(TIMED_OUT);
         }
     }
 
@@ -169,15 +184,14 @@ impl ClusterManager {
             .collect()
     }
 
-    /// Sends the pending report, with what it still waits for as failed.
-    fn finish_proxy_report(&mut self) {
+    /// Sends the pending report, with what it still waits for as failed for `why`.
+    fn finish_proxy_report(&mut self, why: &str) {
         let Some(mut pending) = self.proxy_change.pending.take() else {
             return;
         };
         pending.report.rerouted = self.rerouted_since(&pending.routes);
         for id in std::mem::take(&mut pending.waiting) {
-            let why = "did not connect in time on the new proxy setting".to_owned();
-            pending.report.failed.push((id, why));
+            pending.report.failed.push((id, why.to_owned()));
         }
         let _ = pending.settled.send(pending.report);
     }
