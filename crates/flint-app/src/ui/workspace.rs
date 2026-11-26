@@ -196,8 +196,9 @@ fn layout(panes: &PaneWidths, window_width: f32, nav_shown: bool, detail_open: b
 /// The smallest window the layout works at (width, height).
 pub(in crate::ui) const MIN_WINDOW_SIZE: (f32, f32) = (760., 480.);
 
-/// The narrowest list worth showing beside the detail pane.
-const MIN_SPLIT_LIST_WIDTH: f32 = 260.;
+/// The narrowest list worth showing beside the detail pane: the same room the layout keeps for it
+/// ([`MIN_LIST_WIDTH`]), so a window that splits never squeezes the list's status columns away.
+const MIN_SPLIT_LIST_WIDTH: f32 = MIN_LIST_WIDTH;
 
 /// Whether a window this wide is too narrow for the list and the detail side by side, with every
 /// side pane at its minimum.
@@ -1794,6 +1795,7 @@ impl Workspace {
                     model.cluster_tag(cluster),
                     keep,
                     self.can_disconnect(&cluster.info.name, cx),
+                    super::narrow_text::sidebar_subtitle_chars(widths.clusters),
                 ),
                 theme,
             ));
@@ -1860,12 +1862,13 @@ impl Workspace {
         (is_active, ring, set_member, presence, tooltip): (bool, bool, bool, Presence<'_>, String),
         (exposure, ai_scope): (AiExposureState, Option<AiScope>),
         (protection, trust, writes_paused): (Protection, TrustState, bool),
-        (settings_ok, names, tag, (keep, keep_sign_in), can_disconnect): (
+        (settings_ok, names, tag, (keep, keep_sign_in), can_disconnect, subtitle_chars): (
             bool,
             &ClusterNames,
             Option<ClusterTag>,
             (KeepWatching, BackgroundSignIn),
             bool,
+            usize,
         ),
         theme: &Theme,
     ) -> AnyElement {
@@ -1972,7 +1975,12 @@ impl Workspace {
                             .line_height(px(14.))
                             .truncate()
                             .text_color(theme.muted_foreground)
-                            .child(subtitle)
+                            // Cut in the middle, so the port that tells clusters on one host
+                            // apart stays in view; the tooltip has the whole address.
+                            .child(super::narrow_text::fit_end_visible(
+                                &subtitle,
+                                subtitle_chars,
+                            ))
                             .test_support(),
                     )
                     .when_some(keep_watching::badge(keep), |col, badge| {
@@ -4430,6 +4438,30 @@ mod tests {
         // No active cluster: navigation is hidden and takes no room from the sidebar.
         let welcome = layout(&saved, 650., false, false);
         assert_eq!((welcome.clusters, welcome.navigation), (200., 0.));
+    }
+
+    // covers #780: a window that splits always leaves the list its minimum room, with the detail
+    // pane open at any width; a narrower one shows the detail alone.
+    #[test]
+    fn a_split_window_always_leaves_the_list_its_minimum() {
+        let saved = PaneWidths::default();
+        for width in (760..=1700).step_by(10) {
+            let width = width as f32;
+            if super::too_narrow_for_split(width) {
+                continue;
+            }
+            let split = layout(&saved, width, true, true);
+            assert!(
+                list_width(split, width) >= MIN_LIST_WIDTH - 0.01,
+                "{width}: {split:?}"
+            );
+        }
+        // The smallest window that splits sits just where the minimum panes leave the list 360.
+        assert!(super::too_narrow_for_split(949.));
+        assert!(!super::too_narrow_for_split(950.));
+        // With the detail closed, the list has the rest of any window.
+        let closed = layout(&saved, 800., true, false);
+        assert_eq!(list_width(closed, 800.), 800. - 200. - 220.);
     }
 
     // covers UP-55: whatever a context is called, these dialogs show one Context and one Server.
