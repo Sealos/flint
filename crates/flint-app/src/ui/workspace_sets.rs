@@ -24,7 +24,6 @@ use flint_core::handle::{AdmittedMember, LeftOutMember, MemberReport, OpenedSet}
 use flint_core::settings::{ClusterPin, Settings, SettingsError};
 use flint_core::{ClusterId, ClusterSummary, KindId, KindSnapshot, NavEntry, SyncState};
 use gpui_kit::base::TestSupportExt as _;
-use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -858,7 +857,7 @@ impl Workspace {
         if self.sets.leave_confirmed || !self.sets.is_unsaved() {
             return false;
         }
-        if window.has_active_dialog(cx) {
+        if confirm::any_open(window, cx) {
             return true;
         }
         let dialog = DialogText {

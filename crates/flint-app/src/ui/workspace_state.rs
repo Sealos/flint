@@ -114,11 +114,6 @@ impl Workspace {
             },
             Some(_) => Main::Connecting,
         };
-        let main = if self.settings_page.open {
-            Main::Settings
-        } else {
-            main
-        };
         let header = active_cluster.map(|cluster| {
             let name = &cluster.info.name;
             let filter = self.ui_state.namespace_filter(name).to_vec();

@@ -1,13 +1,13 @@
-//! The Settings view (#739, #740): Flint's preferences in the main area, with a section list on
-//! the left. Edits form a [`SettingsDraft`] that waits for Save; Revert drops it. The draft
-//! outlives switching views and clusters until the app quits, and the sidebar's Settings entry
-//! shows a dot while it holds edits.
+//! The Settings view (#739, #740, #854): Flint's preferences in a modal over the main window,
+//! with a section list on the left. Edits form a [`SettingsDraft`] that waits for Save; Revert
+//! drops it. Closing the modal with edits asks Discard / Keep editing, so the draft never
+//! outlives it.
 //!
-//! Opened from Flint > Settings…, `secondary-,` and the command palette. Every control is a
-//! registered action, so the palette, keys and automation reach the same handlers
-//! ([`super::workspace`]'s `workspace_settings.rs`). From the keyboard, Tab and Shift-Tab (or the
-//! arrows) go round the view's own controls ([`stops`]), Enter or Space works the one under the
-//! cursor, and Esc leaves.
+//! Opened from Flint > Settings…, `secondary-,`, the sidebar's Settings entry and the command
+//! palette. Every control is a registered action, so the palette, keys and automation reach the
+//! same handlers ([`super::workspace`]'s `workspace_settings.rs`). From the keyboard, Tab and
+//! Shift-Tab (or the arrows) go round the view's own controls ([`stops`]), Enter or Space works
+//! the one under the cursor, and Esc closes.
 //!
 //! Sections so far: Appearance, Alerts (desktop notifications), Watching (the default watch
 //! mode), Thresholds and Cluster overrides ([`super::settings_thresholds`]), and Logs, Paths and
@@ -25,7 +25,8 @@ use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::{
-    Disableable as _, Selectable as _, Sizable as _, StyledExt as _, Theme, h_flex, v_flex,
+    Disableable as _, IconName, Selectable as _, Sizable as _, StyledExt as _, Theme, h_flex,
+    v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -50,14 +51,14 @@ pub const SETTINGS_INPUT_KEYS: &str = "SettingsView > Input";
 actions!(
     flint,
     [
-        /// Open Settings in the main area.
+        /// Open Settings over the main window.
         OpenSettings
     ]
 );
 actions!(
     settings,
     [
-        /// Leave Settings for the view shown before. The draft stays.
+        /// Close Settings, asking first whether to discard unsaved edits.
         CloseSettings,
         /// Write the edited settings to `settings.toml`, and only those.
         SaveSettings,
@@ -72,7 +73,7 @@ actions!(
     ]
 );
 
-/// Show one of the Settings sections.
+/// Show one of the Settings sections, opening Settings if it is closed.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
 #[action(namespace = settings, no_json)]
 #[serde(deny_unknown_fields)]
@@ -184,7 +185,8 @@ impl Section {
 /// A control the keyboard cursor can stand on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
-    Done,
+    /// The header's close button.
+    Close,
     Reload,
     SaveAnyway,
     Section(Section),
@@ -208,7 +210,7 @@ impl Stop {
     /// The element id of the control.
     pub fn id(self) -> SharedString {
         match self {
-            Stop::Done => "settings-close".into(),
+            Stop::Close => "settings-close".into(),
             Stop::Reload => "settings-reload".into(),
             Stop::SaveAnyway => "settings-save-anyway".into(),
             Stop::Section(section) => section.id().into(),
@@ -238,7 +240,7 @@ pub fn stops(
     overrides: OverridesLayout,
     kubeconfigs: usize,
 ) -> Vec<Stop> {
-    let mut stops = vec![Stop::Done];
+    let mut stops = vec![Stop::Close];
     if banner {
         stops.extend([Stop::Reload, Stop::SaveAnyway]);
     }
@@ -279,25 +281,15 @@ pub struct Saving {
     pub _give_up: Task<()>,
 }
 
-/// What the main area showed when Settings opened, as far as Settings gives way to a change of
-/// it: another cluster or a set.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MainKey {
-    pub cluster: Option<flint_core::ClusterId>,
-    /// The running set's list.
-    pub set: Option<EntityId>,
-}
-
-/// What the Settings view holds while the window is open: whether it is shown, the section,
-/// and the draft, which outlives leaving the view.
+/// What the Settings view holds while the window is open: whether the modal is open, the
+/// section, and the draft, which is empty whenever the modal is closed.
 pub struct SettingsPage {
+    /// Whether the modal is open.
     pub open: bool,
     pub section: Section,
     pub draft: SettingsDraft,
     /// The view's own focus, for its keys.
     pub focus: FocusHandle,
-    /// What the main area showed when Settings opened.
-    pub opened_over: Option<MainKey>,
     /// A Save the core has not answered yet. Its edits stay in the draft meanwhile.
     pub saving: Option<Saving>,
     /// Why the last Save did not go through, until the next edit, Save or Revert.
@@ -321,7 +313,6 @@ impl SettingsPage {
             section: Section::default(),
             draft: SettingsDraft::default(),
             focus: cx.focus_handle(),
-            opened_over: None,
             saving: None,
             save_note: None,
             cursor: None,
@@ -419,14 +410,9 @@ pub const REJECTED: &str = "Some values are not accepted. Fix the fields marked 
 pub const INVALID: &str =
     "settings.toml is invalid. Fix it to save settings; until then Flint uses safe defaults.";
 
-/// The sidebar's entry: Settings, with a dot while the draft holds edits.
+/// The sidebar's entry, which opens Settings. It needs no unsaved-edits dot: closing Settings
+/// never leaves edits behind.
 pub fn render_entry(page: &SettingsPage, theme: &Theme) -> impl IntoElement {
-    let dirty = page.draft.is_dirty();
-    let label = if dirty {
-        "Settings (unsaved changes)"
-    } else {
-        "Settings"
-    };
     h_flex()
         .id("settings-entry")
         .flex_none()
@@ -435,7 +421,7 @@ pub fn render_entry(page: &SettingsPage, theme: &Theme) -> impl IntoElement {
         .py_1()
         .border_t_1()
         .border_color(theme.sidebar_border)
-        .aria_label(label)
+        .aria_label("Settings")
         .child(
             Button::new("open-settings")
                 .xsmall()
@@ -449,14 +435,6 @@ pub fn render_entry(page: &SettingsPage, theme: &Theme) -> impl IntoElement {
                 ))
                 .on_click(registry::on_click(OpenSettings)),
         )
-        .when(dirty, |el| {
-            el.child(
-                super::theme::status_dot(theme.foreground, true)
-                    .id("settings-entry-dot")
-                    .flex_none()
-                    .test_support(),
-            )
-        })
         .test_support()
 }
 
@@ -479,7 +457,7 @@ pub(super) fn ring(
 }
 
 /// The Settings view, over `file` as the core last reported it, with the kubeconfig's
-/// `clusters`.
+/// `clusters`: the modal's content, filling it.
 pub fn render(
     page: &SettingsPage,
     file: &Settings,
@@ -494,9 +472,7 @@ pub fn render(
         .id("settings-view")
         .key_context("SettingsView")
         .track_focus(&page.focus)
-        .flex_1()
-        .min_w_0()
-        .h_full()
+        .size_full()
         .child(header(page, theme))
         .when(invalid, |el| {
             el.child(banner(
@@ -562,28 +538,27 @@ pub fn render(
 }
 
 fn header(page: &SettingsPage, theme: &Theme) -> impl IntoElement {
-    super::theme::moves_window(
-        h_flex()
-            .id("settings-header")
-            .flex_none()
-            .h(px(super::workspace::HEADER_HEIGHT))
-            .px_3()
-            .gap_2()
-            .border_b_1()
-            .border_color(theme.border),
-    )
-    .child(div().flex_1().text_sm().font_semibold().child("Settings"))
-    .child(ring(
-        page,
-        Stop::Done,
-        theme,
-        Button::new("settings-close")
-            .xsmall()
-            .ghost()
-            .label("Done")
-            .tooltip("Leave Settings. Unsaved edits stay until you save or revert them.")
-            .on_click(registry::on_click(CloseSettings)),
-    ))
+    h_flex()
+        .id("settings-header")
+        .flex_none()
+        .h(px(super::workspace::HEADER_HEIGHT))
+        .px_3()
+        .gap_2()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(div().flex_1().text_sm().font_semibold().child("Settings"))
+        .child(ring(
+            page,
+            Stop::Close,
+            theme,
+            Button::new("settings-close")
+                .accessibility_label("Close")
+                .icon(IconName::Close)
+                .xsmall()
+                .ghost()
+                .tooltip("Close Settings (Esc)")
+                .on_click(registry::on_click(CloseSettings)),
+        ))
 }
 
 fn banner(

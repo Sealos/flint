@@ -7,7 +7,6 @@ use std::path::Path;
 
 use flint_core::handle::ProxyReconnectReport;
 use flint_core::settings::ProxySetting;
-use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::TestAppContextExt as _;
 use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
@@ -182,14 +181,18 @@ fn field(cx: &mut TestAppContext, t: &TestWorkspace, stop: NetworkStop) -> Strin
 }
 
 async fn shown_dialog(cx: &mut TestAppContext, t: &TestWorkspace) -> DialogState {
-    cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
-        .await;
+    cx.wait_for(t.window, WAIT, |window, cx| {
+        super::confirm::any_open(window, cx)
+    })
+    .await;
     state(cx, t).dialog.expect("a dialog is open")
 }
 
 async fn no_dialog(cx: &mut TestAppContext, t: &TestWorkspace) {
-    cx.wait_for(t.window, WAIT, |window, cx| !window.has_active_dialog(cx))
-        .await;
+    cx.wait_for(t.window, WAIT, |window, cx| {
+        !super::confirm::any_open(window, cx)
+    })
+    .await;
     cx.executor()
         .advance_clock(std::time::Duration::from_secs(1));
     cx.run_until_parked();
@@ -285,7 +288,7 @@ async fn apply_asks_first_and_cancel_applies_nothing(cx: &mut TestAppContext) {
     assert!(!t.available(cx).contains(&"settings::ApplyProxy"));
     // Nothing applies around the guard either.
     t.dispatch(cx, "settings::ApplyProxy", Value::Null).ok();
-    assert!(!t.has_dialog(cx));
+    assert!(!t.has_confirmation(cx));
 
     t.dispatch(
         cx,

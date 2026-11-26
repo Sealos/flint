@@ -5,7 +5,6 @@
 use flint_core::settings::ClusterPin;
 use flint_core::thresholds::ThresholdMetric;
 use flint_core::{Settings, WatchMode};
-use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::TestAppContextExt as _;
 use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
@@ -454,8 +453,10 @@ async fn quit_with_a_rejected_value_asks_to_discard(cx: &mut TestAppContext) {
         json!({ "metric": "cpu_percent", "value": "0" }),
     );
     t.press_key_of(cx, "flint::Quit");
-    cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
-        .await;
+    cx.wait_for(t.window, WAIT, |window, cx| {
+        super::confirm::any_open(window, cx)
+    })
+    .await;
     let dialog: DialogState = state(cx, &t).dialog.expect("a dialog is open");
     assert_eq!(dialog.title, "Discard unsaved settings?");
     assert!(dialog.text.contains("not accepted"), "{}", dialog.text);
@@ -615,8 +616,10 @@ async fn quit_with_only_a_value_being_typed_asks(cx: &mut TestAppContext) {
     t.type_text(cx, "80");
     assert!(!state(cx, &t).settings.dirty, "not entered yet");
     t.press_key_of(cx, "flint::Quit");
-    cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
-        .await;
+    cx.wait_for(t.window, WAIT, |window, cx| {
+        super::confirm::any_open(window, cx)
+    })
+    .await;
     let dialog: DialogState = state(cx, &t).dialog.expect("a dialog is open");
     assert_eq!(dialog.title, "Save your settings?");
     assert_eq!(

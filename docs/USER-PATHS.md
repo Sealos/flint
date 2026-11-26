@@ -811,19 +811,21 @@ Deferred until cluster sets are scheduled (#199).
 - Tests: e2e (`flint-e2e/tests/proxy.rs`).
 
 ### UP-126 Change settings in Settings
-- **When** I open Settings (Flint > Settings…, Cmd-, on macOS and Ctrl-, on Linux, or the command palette) and change
-  the appearance, desktop notifications, the default watch mode, the warning thresholds or a cluster's overrides
-  (UP-67).
-- **Then** the main area shows Settings with its sections on the left. My edits wait in a draft until I press Save,
-  which writes only the settings I edited to `settings.toml`; Revert drops them. The draft stays while I switch views
-  and clusters, and the sidebar's Settings entry shows a dot meanwhile. If `settings.toml` changes while the draft
+- **When** I open Settings (Flint > Settings…, Cmd-, on macOS and Ctrl-, on Linux, the sidebar's Settings entry, or
+  the command palette) and change the appearance, desktop notifications, the default watch mode, the warning
+  thresholds or a cluster's overrides (UP-67).
+- **Then** Settings opens as a modal over the main window, with its sections on the left; the main area stays as it
+  was. My edits wait in a draft until I press Save, which writes only the settings I edited to `settings.toml` and
+  keeps Settings open; Revert drops them. Esc, the close button or a click outside closes Settings: at once without
+  edits, otherwise after asking Discard or Keep editing, so no draft outlives it. Focus goes back to where it was.
+  If `settings.toml` changes while the draft
   waits (from the Alerts menu, View > Appearance or an editor), a banner says so: Reload shows the file and drops the
   draft, Save anyway writes only my edits. My edits leave the draft only once they are written: a Save that fails or
   cannot be confirmed keeps them and says so. While `settings.toml` is invalid, Save is disabled. Quitting or closing
   the window with a draft asks Save, Discard or Cancel, and a Save still being written is waited for. From the
   keyboard, Tab and Shift-Tab go round the view's own controls, and Enter or Space works the one under the cursor.
-- Tests: unit (draft, revert, save of edited fields, the on-disk banner), ui (shortcut, save, banner, quit and close
-  question), e2e (`flint-e2e/tests/app/settings.rs`).
+- Tests: unit (draft, revert, save of edited fields, the on-disk banner), ui (each way in and out of the modal, the
+  Discard / Keep editing question, save, banner, quit and close question), e2e (`flint-e2e/tests/app/settings.rs`).
 
 ### UP-127 Log limits, paths and local cluster protection in Settings
 - **When** I open the Logs, Paths or Write safety section of Settings and change the log buffer limits, the extra

@@ -386,10 +386,7 @@ impl Workspace {
                 };
                 this.open_view(&open, window, cx);
             }
-            NavEvent::OpenOverview => {
-                this.leave_settings_for_view();
-                this.open_overview(window, cx)
-            }
+            NavEvent::OpenOverview => this.open_overview(window, cx),
         });
         // Quitting right after a drag (or another change) still saves state.toml.
         let on_quit = cx.on_app_quit(|this: &mut Self, cx| {
@@ -2940,9 +2937,6 @@ impl Workspace {
     }
 
     fn render_main(&self, window_width: f32, theme: &Theme, cx: &Context<Self>) -> AnyElement {
-        if let Some(settings) = self.render_settings_page(theme, cx) {
-            return settings;
-        }
         if let Some(set_view) = self.render_set_view(window_width, theme, cx) {
             return set_view;
         }
@@ -3955,8 +3949,7 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_namespace_picker_with_dialog(window, cx);
         self.close_finished_held_edit(window, cx);
-        self.settings_follow_main();
-        self.flush_threshold_entry(cx);
+        self.settings_follow_dialog(window, cx);
         self.follow_threshold_rows(cx);
         self.close_orphaned_threshold_entry(window, cx);
         self.sync_settings_fields(window, cx);
@@ -3991,10 +3984,7 @@ impl Render for Workspace {
                 // the list keeps its room.
                 this.right_selected = right_click && this.detail.is_none();
             }))
-            .capture_action(cx.listener(|this, _: &OpenObject, _, _| {
-                this.list_in_front = false;
-                this.leave_settings_for_view();
-            }))
+            .capture_action(cx.listener(|this, _: &OpenObject, _, _| this.list_in_front = false))
             .capture_action(cx.listener(|this, _: &EditYaml, _, _| this.list_in_front = false))
             .capture_action(cx.listener(|this, _: &FocusFilter, _, _| this.list_in_front = true))
             .child(

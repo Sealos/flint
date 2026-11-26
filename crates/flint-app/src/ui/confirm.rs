@@ -509,6 +509,17 @@ pub fn close_newest(window: &mut Window, cx: &mut App) {
     window.close_dialog(cx);
 }
 
+/// Whether a confirmation opened here is still unanswered in `window`. Unlike
+/// [`WindowExt::has_active_dialog`], the Settings modal does not count: a question asked from
+/// inside it (or a quit over it) opens above it.
+pub fn any_open(window: &mut Window, cx: &mut App) -> bool {
+    window.has_active_dialog(cx)
+        && cx
+            .try_global::<LiveDialogs>()
+            .and_then(|live| live.0.get(&window.window_handle().window_id()))
+            .is_some_and(|stack| stack.iter().any(|d| d.strong_count() > 0))
+}
+
 /// Whether the newest confirmation open in `window` is about a connection that has changed.
 pub(in crate::ui) fn newest_is_stale(window: &mut Window, cx: &mut App) -> bool {
     if !window.has_active_dialog(cx) {

@@ -638,6 +638,22 @@ impl TestWorkspace {
             .unwrap()
     }
 
+    /// Whether a confirmation waits for an answer: a dialog other than the Settings modal.
+    pub fn has_confirmation(&self, cx: &mut TestAppContext) -> bool {
+        cx.update_window(self.window, |_, window, cx| {
+            super::confirm::any_open(window, cx)
+        })
+        .unwrap()
+    }
+
+    /// Waits until no confirmation waits for an answer (Settings may stay open under it).
+    pub async fn wait_for_no_confirmation(&self, cx: &mut TestAppContext) {
+        cx.wait_for(self.window, WAIT, |window, cx| {
+            !super::confirm::any_open(window, cx)
+        })
+        .await;
+    }
+
     /// The ids of the observed elements whose id starts with `prefix`, top to bottom.
     pub fn ids_with_prefix(&self, cx: &mut TestAppContext, prefix: &str) -> Vec<String> {
         use gpui_kit::test::TestQueryExt as _;

@@ -11,7 +11,6 @@
 
 use flint_core::ProxyApplied;
 use flint_core::settings::ProxySetting;
-use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::input::InputEvent;
 use gpui_kit::*;
 
@@ -268,7 +267,7 @@ impl Workspace {
         let Some(setting) = self.proxy_to_apply(cx) else {
             return;
         };
-        if window.has_active_dialog(cx) {
+        if confirm::any_open(window, cx) {
             return;
         }
         let saved = self.saved_proxy(cx);
