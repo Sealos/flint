@@ -8,14 +8,12 @@ use flint_core::display::{
     CUSTOM_NAME_PUNCTUATION, ClusterNames, MAX_CUSTOM_NAME_CHARS, clean_custom_name,
     cluster_name_key, saved_name_key,
 };
-use gpui_kit::base::TestSupportExt as _;
-use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, v_flex};
-use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::component::input::InputState;
 use gpui_kit::*;
 
 use super::clusters::ClustersModel;
 use super::confirm::{self, DialogText};
+use super::validated_field::ValidatedField;
 
 /// Why `typed` cannot be `context`'s name, among `contexts` and the custom `names` they have.
 /// Nothing typed is fine: it removes the name.
@@ -80,32 +78,6 @@ fn dialog(shown: &str, context: &str, server: Option<&str>) -> DialogText {
     }
 }
 
-/// The name field under the dialog's text.
-struct NameField {
-    input: Entity<InputState>,
-    error: Option<String>,
-}
-
-impl Render for NameField {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let danger = cx.theme().danger;
-        v_flex()
-            .gap_1()
-            .child(Input::new(&self.input).id("rename-cluster-input").small())
-            .when_some(self.error.clone(), |el, error| {
-                el.child(
-                    div()
-                        .id("rename-cluster-error")
-                        .aria_label(error.clone())
-                        .text_xs()
-                        .text_color(danger)
-                        .child(error)
-                        .test_support(),
-                )
-            })
-    }
-}
-
 /// Opens the Rename Cluster dialog for `context`.
 pub fn open(
     window: &mut Window,
@@ -131,32 +103,27 @@ pub fn open(
             .placeholder(placeholder)
             .default_value(current)
     });
-    let field = cx.new(|_| NameField {
-        input: input.clone(),
-        error: None,
-    });
+    let field = ValidatedField::new(input, "rename-cluster-input", "rename-cluster-error", cx);
+    let focused = field.clone();
     let content = field.clone().into();
     let shown = model.read(cx).names().with_real(&context);
     let text = dialog(&shown, &context, server.as_deref());
     confirm::open_with(window, cx, text, Some(content), move |_, cx| {
-        let typed = field.read(cx).input.read(cx).value().to_string();
-        let refused = {
+        let checked = ValidatedField::checked(&field, cx, |typed, cx| {
             let m = model.read(cx);
             let contexts: Vec<&str> = m.clusters.iter().map(|c| c.info.name.as_str()).collect();
-            problem(&m.settings.cluster_names, &contexts, &context, &typed)
-        };
-        if let Some(error) = refused {
-            field.update(cx, |f, cx| {
-                f.error = Some(error);
-                cx.notify();
-            });
+            match problem(&m.settings.cluster_names, &contexts, &context, typed) {
+                Some(error) => Err(error),
+                None => Ok(clean_custom_name(typed)),
+            }
+        });
+        let Some(name) = checked else {
             return false;
-        }
-        let name = clean_custom_name(&typed);
+        };
         model.update(cx, |m, _| m.set_cluster_name(context.clone(), name));
         true
     });
-    input.update(cx, |input, cx| input.focus(window, cx));
+    ValidatedField::focus(&focused, window, cx);
 }
 
 #[cfg(test)]
