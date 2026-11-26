@@ -247,14 +247,15 @@ fn up_30_palette_selection_and_steps_by_key() -> Result<()> {
     app.wait_for("/focus", Equals("list".into()))?;
 
     // A scattered query listing only Quit selects nothing, so Enter leaves the app running.
+    // Scattered letters match only at word starts: "qf" is Quit Flint's Q and F.
     open_palette(&app, "secondary-shift-p", "actions")?;
-    app.type_text("qtf")?;
+    app.type_text("qf")?;
     app.wait_for("/palette/rows/0/label", Equals("Quit Flint".into()))?;
     let state = app.wait_for("/palette/total", Equals(1.into()))?;
     assert_eq!(state["palette"]["selected"], Value::Null);
     app.press_key("enter")?;
     let state = app.state()?;
-    assert_eq!(state["palette"]["query"], "qtf", "Enter closed the palette");
+    assert_eq!(state["palette"]["query"], "qf", "Enter closed the palette");
     press(&app, "escape", "/palette", Value::Null)?;
 
     // `quit` fails unless this app was still running to be asked.

@@ -275,7 +275,7 @@ fn up_31_jump_to_a_resource() -> Result<()> {
     app.wait_for("/palette", Equals(Value::Null))?;
 
     // Opening another list is the fence: by the time its watch is up, a request the search had
-    // sent has arrived, and the only new requests are that list's.
+    // sent has arrived, and the only new requests are that list's and the feed's timed polls.
     app.open_view("services")?;
     app.wait_for("/list/kind", Equals("services".into()))?;
     app.wait_for("/list/sync", Equals("live".into()))?;
@@ -283,7 +283,7 @@ fn up_31_jump_to_a_resource() -> Result<()> {
     let arrivals = fake.arrivals();
     let sent: Vec<_> = arrivals[before..]
         .iter()
-        .filter(|r| !r.path.ends_with("/services"))
+        .filter(|r| !r.path.ends_with("/services") && !is_feed_poll(r))
         .collect();
     assert!(sent.is_empty(), "the search sent requests: {sent:?}");
 

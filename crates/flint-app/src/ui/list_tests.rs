@@ -500,6 +500,30 @@ async fn namespace_stays_until_the_scoped_rows_arrive(cx: &mut TestAppContext) {
     .await;
 }
 
+// covers UP-61: in a list as wide as the default window's, a long pod name does not push CPU and
+// Memory out. Their bars go first, then Restarts and Age, while the name narrows to its comfort
+// width and Status stays in view.
+#[gpui_kit::test]
+async fn a_long_name_leaves_room_for_the_usage_columns(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open_sized(cx, core, "Pods", 860.);
+    let long = "podinfo-frontend-canary-7b9c8d5f4-abcde-with-xy";
+    assert_eq!(long.chars().count(), 47);
+    list.update(cx, |list, cx| {
+        list.pin_usage_source(super::list_usage::UsageSource::Unknown, cx);
+    });
+    let pod = pod_like("pods", long, "CrashLoopBackOff");
+    show_narrow(cx, window, &list, pod, &[NARROW_NAMESPACE, "demo"]).await;
+    for column in ["Name", "Namespace", "Status", "CPU", "Memory"] {
+        assert!(has_header(cx, window, column), "{column} is hidden");
+    }
+    for column in ["Restarts", "Age"] {
+        assert!(!has_header(cx, window, column), "{column} is shown");
+    }
+    let memory_end = header_end(cx, window, "Memory");
+    assert!(memory_end <= 860.5, "Memory ends at {memory_end}");
+}
+
 // covers UP-22: a CRD's own Ready printer column is never left out.
 #[gpui_kit::test]
 async fn a_narrow_list_keeps_a_custom_ready_column(cx: &mut TestAppContext) {
