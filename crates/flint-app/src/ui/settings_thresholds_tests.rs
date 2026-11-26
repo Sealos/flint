@@ -50,9 +50,11 @@ async fn wait_for_file(
     t: &TestWorkspace,
     wanted: impl Fn(&Settings) -> bool + 'static,
 ) {
+    // The file as wanted, and the Save that wrote it answered.
     let model = t.model.clone();
+    let workspace = t.workspace.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
-        wanted(&model.read(cx).settings)
+        wanted(&model.read(cx).settings) && !workspace.read(cx).settings_saving()
     })
     .await;
 }
@@ -176,7 +178,7 @@ async fn an_out_of_range_threshold_blocks_save(cx: &mut TestAppContext) {
         t.label(cx, "settings-draft-note").as_deref(),
         Some(REJECTED)
     );
-    assert!(!t.available(cx).contains(&"settings::SaveSettings"));
+    // Save writes nothing: it shows the field holding the rejected value.
     t.click(cx, "settings-save");
     assert!(t.settings_toml().is_empty(), "Save is blocked");
 
@@ -245,8 +247,8 @@ async fn esc_drops_the_typed_text_and_revert_drops_rejected_values(cx: &mut Test
 async fn the_keyboard_alone_sets_a_threshold(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_section(cx, dir.path(), "thresholds").await;
-    // Done, five sections, then the first threshold.
-    for _ in 0..7 {
+    // Done, the sections, then the first threshold.
+    for _ in 0..1 + super::settings_view::Section::ALL.len() + 1 {
         t.press(cx, "tab");
     }
     assert_eq!(
@@ -525,7 +527,7 @@ async fn a_cleared_row_stays_under_the_cursor_until_save(cx: &mut TestAppContext
     assert_eq!(state(cx, &t).settings.thresholds.overrides.len(), 2);
 
     // Watching on kind-alpha's row: On view, then Default, its last override.
-    for _ in 0..21 {
+    for _ in 0..24 {
         t.press(cx, "tab");
         if state(cx, &t).settings.cursor.as_deref() == Some("settings-override-0-watch") {
             break;
@@ -692,7 +694,7 @@ async fn the_cursor_follows_its_cluster_when_rows_change(cx: &mut TestAppContext
     );
     t.click(cx, "settings-save");
     wait_for_file(cx, &t, |s| s.cluster_watch_mode.len() == 1).await;
-    for _ in 0..30 {
+    for _ in 0..33 {
         t.press(cx, "tab");
         if state(cx, &t).settings.cursor.as_deref() == Some("settings-override-0-watch") {
             break;
@@ -732,7 +734,7 @@ async fn the_cursor_follows_its_cluster_when_rows_change(cx: &mut TestAppContext
 async fn switching_section_moves_the_cursor_to_the_section_list(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_section(cx, dir.path(), "thresholds").await;
-    for _ in 0..7 {
+    for _ in 0..1 + super::settings_view::Section::ALL.len() + 1 {
         t.press(cx, "tab");
     }
     assert_eq!(

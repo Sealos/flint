@@ -351,7 +351,7 @@ enum Internal {
     /// Write settings, then say how ([`crate::CoreHandle::write_settings`]).
     WriteSettings {
         writes: Vec<settings::SettingsWrite>,
-        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+        reply: tokio::sync::oneshot::Sender<Result<Arc<Settings>, String>>,
     },
     Connected {
         cluster: ClusterId,
@@ -1582,6 +1582,12 @@ impl ClusterManager {
             }
             Internal::ProxyReportDue { change } => self.proxy_report_due(change),
             Internal::WriteSettings { writes, reply } => {
+                let unprotect = writes.iter().any(|write| {
+                    matches!(
+                        write,
+                        settings::SettingsWrite::ProtectLocalClusters { on: false, .. }
+                    )
+                });
                 // One save for all of them: never some written without the others, and the
                 // settings applied once, so no in-between state takes effect.
                 let result = self
@@ -1589,7 +1595,14 @@ impl ClusterManager {
                         settings::SettingsWrite::write_all(dir, &writes)
                     })
                     .await;
-                let _ = reply.send(result);
+                // Turning protection off refused, perhaps over a file changed since it was
+                // confirmed: read it now, so the confirmation asked again is over the file as is.
+                if unprotect && result.is_err() {
+                    self.reload_settings().await;
+                }
+                // Written, the settings as saved: what the file holds now, outside edits
+                // included, which the front end may not have heard of yet.
+                let _ = reply.send(result.map(|()| self.settings.clone()));
             }
             Internal::LateRead { paths, seq, read } => {
                 let in_order = self.saw_read(&paths, Some(&read));

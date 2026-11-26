@@ -10,8 +10,9 @@
 //! cursor, and Esc leaves.
 //!
 //! Sections so far: Appearance, Alerts (desktop notifications), Watching (the default watch
-//! mode), and Thresholds and Cluster overrides ([`super::settings_thresholds`]). A slice that
-//! adds settings adds a [`Section`] (or a block to one), its
+//! mode), Thresholds and Cluster overrides ([`super::settings_thresholds`]), and Logs, Paths and
+//! Write safety ([`super::settings_logs_paths`]). A slice that adds settings adds a [`Section`]
+//! (or a block to one), its
 //! [`super::settings_draft::Change`]s and its [`Stop`]s.
 
 // module-tests: settings_view_tests.rs
@@ -31,6 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use super::registry;
 use super::settings_draft::{Field, SettingsDraft};
+use super::settings_logs_paths::{self as logs_paths, LogsPathsFields, TextField};
 use super::settings_thresholds::{
     self, KnownCluster, OverridesLayout, ThresholdStop, ThresholdsPage,
 };
@@ -110,15 +112,21 @@ pub enum Section {
     Watching,
     Thresholds,
     ClusterOverrides,
+    Logs,
+    Paths,
+    Safety,
 }
 
 impl Section {
-    pub const ALL: [Section; 5] = [
+    pub const ALL: [Section; 8] = [
         Section::Appearance,
         Section::Alerts,
         Section::Watching,
         Section::Thresholds,
         Section::ClusterOverrides,
+        Section::Logs,
+        Section::Paths,
+        Section::Safety,
     ];
 
     pub fn label(self) -> &'static str {
@@ -128,6 +136,9 @@ impl Section {
             Section::Watching => "Watching",
             Section::Thresholds => "Thresholds",
             Section::ClusterOverrides => "Cluster overrides",
+            Section::Logs => "Logs",
+            Section::Paths => "Paths",
+            Section::Safety => "Write safety",
         }
     }
 
@@ -138,6 +149,9 @@ impl Section {
             Section::Watching => "settings-section-watching",
             Section::Thresholds => "settings-section-thresholds",
             Section::ClusterOverrides => "settings-section-cluster-overrides",
+            Section::Logs => "settings-section-logs",
+            Section::Paths => "settings-section-paths",
+            Section::Safety => "settings-section-safety",
         }
     }
 
@@ -149,6 +163,12 @@ impl Section {
             Section::Watching => *field == Field::WatchMode,
             Section::Thresholds => settings_thresholds::holds(field, false),
             Section::ClusterOverrides => settings_thresholds::holds(field, true),
+            Section::Logs => matches!(
+                field,
+                Field::LogBufferLines | Field::LogBufferMib | Field::LogTotalMib
+            ),
+            Section::Paths => matches!(field, Field::KubeconfigPaths | Field::Path | Field::Helm),
+            Section::Safety => *field == Field::ProtectLocalClusters,
         }
     }
 }
@@ -164,6 +184,12 @@ pub enum Stop {
     DesktopNotifications,
     WatchMode(WatchMode),
     Threshold(ThresholdStop),
+    /// A text field of the Logs or Paths section.
+    Text(TextField),
+    /// The Remove button of the kubeconfig file at this position.
+    RemoveKubeconfig(usize),
+    AddKubeconfig,
+    ProtectLocalClusters,
     Revert,
     Save,
 }
@@ -183,6 +209,10 @@ impl Stop {
             Stop::WatchMode(WatchMode::All) => "settings-watch-all".into(),
             Stop::WatchMode(WatchMode::OnView) => "settings-watch-on-view".into(),
             Stop::Threshold(stop) => stop.id(),
+            Stop::Text(field) => field.id().into(),
+            Stop::RemoveKubeconfig(index) => logs_paths::remove_id(index).into(),
+            Stop::AddKubeconfig => "settings-kubeconfig-add".into(),
+            Stop::ProtectLocalClusters => "settings-protect-local-clusters".into(),
             Stop::Revert => "settings-revert".into(),
             Stop::Save => "settings-save".into(),
         }
@@ -190,8 +220,13 @@ impl Stop {
 }
 
 /// The controls in the order Tab visits them, with `section` shown, the on-disk banner shown or
-/// not, and Cluster overrides drawn as `overrides` says.
-pub fn stops(section: Section, banner: bool, overrides: OverridesLayout) -> Vec<Stop> {
+/// not, Cluster overrides drawn as `overrides` says, and `kubeconfigs` files in the Paths list.
+pub fn stops(
+    section: Section,
+    banner: bool,
+    overrides: OverridesLayout,
+    kubeconfigs: usize,
+) -> Vec<Stop> {
     let mut stops = vec![Stop::Done];
     if banner {
         stops.extend([Stop::Reload, Stop::SaveAnyway]);
@@ -213,6 +248,9 @@ pub fn stops(section: Section, banner: bool, overrides: OverridesLayout) -> Vec<
                 .into_iter()
                 .map(Stop::Threshold),
         ),
+        Section::Logs => stops.extend(logs_paths::logs_stops()),
+        Section::Paths => stops.extend(logs_paths::paths_stops(kubeconfigs)),
+        Section::Safety => stops.push(Stop::ProtectLocalClusters),
     }
     stops.extend([Stop::Revert, Stop::Save]);
     stops
@@ -256,6 +294,8 @@ pub struct SettingsPage {
     pub cursor: Option<Stop>,
     /// Thresholds and Cluster overrides: rows added, the cluster list, the field being typed.
     pub thresholds: ThresholdsPage,
+    /// The Logs and Paths sections' text inputs and the kubeconfig list's note.
+    pub logs_paths: LogsPathsFields,
     /// The scrolling content, so the keyboard cursor can bring a control into view.
     pub scroll: ScrollHandle,
 }
@@ -272,6 +312,7 @@ impl SettingsPage {
             save_note: None,
             cursor: None,
             thresholds: ThresholdsPage::default(),
+            logs_paths: LogsPathsFields::default(),
             scroll: ScrollHandle::new(),
         }
     }
@@ -294,6 +335,25 @@ impl SettingsPage {
             appearance: appearance_name(shown.appearance),
             desktop_notifications: shown.desktop_notifications,
             watch_mode: watch_mode_name(shown.watch_mode),
+            log_buffer_lines: shown.log_buffer_lines,
+            log_buffer_mib: shown.log_buffer_mib,
+            log_total_mib: shown.log_total_mib,
+            kubeconfig_paths: shown
+                .kubeconfig_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            path: shown.path.clone(),
+            helm: shown.helm.as_ref().map(|p| p.display().to_string()),
+            protect_local_clusters: shown.protect_local_clusters,
+            field_errors: TextField::ALL
+                .into_iter()
+                .filter_map(|field| {
+                    let rejected = self.draft.rejected(&field.field())?;
+                    Some((field.id(), rejected.why.clone()))
+                })
+                .collect(),
+            kubeconfig_note: self.logs_paths.kubeconfig_note.clone(),
             thresholds: settings_thresholds::view_state(self, &shown, clusters),
             changed_on_disk: banner_shown(self, file),
             invalid,
@@ -672,6 +732,9 @@ fn section_body(
             let candidates = settings_thresholds::add_candidates(clusters, &rows);
             settings_thresholds::render_overrides(page, shown, &rows, &candidates, theme)
         }
+        Section::Logs => logs_paths::logs_body(page, theme),
+        Section::Paths => logs_paths::paths_body(page, shown, theme),
+        Section::Safety => one(logs_paths::safety_body(page, shown, theme)),
     }
 }
 
@@ -751,7 +814,12 @@ fn footer(page: &SettingsPage, invalid: bool, theme: &Theme) -> impl IntoElement
                 .small()
                 .primary()
                 .label("Save")
-                .disabled(saving || invalid || !(can_save(draft, invalid) || typing))
+                // With a value rejected, Save shows its field rather than writing.
+                .disabled(
+                    saving
+                        || invalid
+                        || !(can_save(draft, invalid) || typing || draft.has_rejected()),
+                )
                 .on_click(registry::on_click(SaveSettings)),
         ))
 }

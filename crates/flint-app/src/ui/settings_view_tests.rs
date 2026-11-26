@@ -407,8 +407,8 @@ async fn the_keyboard_alone_changes_and_saves_a_setting(cx: &mut TestAppContext)
         state(cx, &t).settings.cursor.as_deref(),
         Some("settings-close")
     );
-    // Done, the five sections, then System, Light and Dark.
-    for _ in 0..8 {
+    // Done, the sections, then System, Light and Dark.
+    for _ in 0..super::settings_view::Section::ALL.len() + 3 {
         t.press(cx, "tab");
     }
     let s = state(cx, &t);

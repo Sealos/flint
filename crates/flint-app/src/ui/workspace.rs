@@ -4101,6 +4101,7 @@ impl Render for Workspace {
         self.flush_threshold_entry(cx);
         self.follow_threshold_rows(cx);
         self.close_orphaned_threshold_entry(window, cx);
+        self.sync_settings_fields(window, cx);
         let window_width = f32::from(window.viewport_size().width);
         let window_height = f32::from(window.viewport_size().height);
         self.sync_narrow_layout(window_width, window, cx);
@@ -4312,7 +4313,10 @@ mod keys;
 pub(in crate::ui) mod problems;
 
 #[path = "workspace_settings.rs"]
-mod settings_entry;
+pub(in crate::ui) mod settings_entry;
+
+#[path = "workspace_settings_logs_paths.rs"]
+mod settings_logs_paths;
 
 #[path = "workspace_sets.rs"]
 mod sets;
