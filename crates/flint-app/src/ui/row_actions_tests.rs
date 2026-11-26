@@ -692,14 +692,16 @@ async fn a_workload_rows_logs_merge_its_pods(cx: &mut TestAppContext) {
         open_menu(cx, &t, "web").await,
         ["Logs", "Shell", "", "Scale…", "Rollout Restart…"]
     );
+    assert_eq!(registry::label::<registry::OpenLogs>(), "Open Logs");
+    click_entry(cx, &t, 0);
+    // The pane's button, drawn once the menu has closed.
+    draw(cx, &t);
     let button = cx
         .update_window(t.window, |_, window, _| {
             window.find("detail-logs").label().map(str::to_owned)
         })
         .unwrap();
     assert_eq!(button.as_deref(), Some("Logs"));
-    assert_eq!(registry::label::<registry::OpenLogs>(), "Open Logs");
-    click_entry(cx, &t, 0);
     assert_eq!(
         dock_tabs(cx, &t),
         (vec!["web (Deployment)".to_owned()], Some(0))
@@ -1298,6 +1300,48 @@ async fn a_row_menu_stays_open_while_its_object_loads(cx: &mut TestAppContext) {
     assert!(!open, "escape dismisses the menu");
 }
 
+// covers #399: the arrow keys move the highlight, and a menu rebuilt by a live update keeps it on
+// the same entry, so Enter still acts on it.
+#[gpui_kit::test]
+async fn a_rebuilt_row_menu_keeps_its_highlighted_entry(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "kind-alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    show_loading(cx, &t);
+    right_click(cx, &t, "web").await;
+    assert_eq!(
+        menu(cx, &t),
+        [
+            "Logs",
+            "Previous Logs",
+            "Shell",
+            "Forward Port",
+            "web is still loading"
+        ]
+    );
+    // Logs, Previous Logs, Shell.
+    for _ in 0..3 {
+        press(cx, &t, "down");
+    }
+    let rebuilds = crate::ui::row_menu::tests::REBUILDS.with(|n| n.get());
+    show_fetched(cx, &t, pod_detail("web"));
+    draw(cx, &t);
+    assert_ne!(
+        crate::ui::row_menu::tests::REBUILDS.with(|n| n.get()),
+        rebuilds,
+        "the menu was rebuilt"
+    );
+    // Shell is a container picker now: Enter opens it.
+    press(cx, &t, "enter");
+    assert_eq!(
+        submenu(cx, &t),
+        ["app (default)", "sidecar"],
+        "Enter acted on Shell"
+    );
+}
+
 fn menu_open(cx: &mut TestAppContext, t: &TestWorkspace) -> bool {
     draw(cx, t);
     cx.update_window(t.window, |_, window, _| {
@@ -1432,7 +1476,12 @@ async fn a_row_menu_closes_when_its_row_goes(cx: &mut TestAppContext) {
     list.update(cx, |list, cx| {
         list.set_snapshot(pods(&[("demo", "api", 0)]), cx)
     });
-    cx.run_until_parked();
+    // The rows are recomputed off the main thread and the dismissal is deferred to the draw after
+    // that, so wait for the menu itself to go.
+    cx.wait_for(t.window, WAIT, |window, _| {
+        window.try_find("popup-menu").is_none()
+    })
+    .await;
     assert!(!menu_open(cx, &t));
     assert!(!menu_open(cx, &t), "it stays closed");
     assert_eq!(app_state(cx, &t).focus, Focus::List);

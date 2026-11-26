@@ -65,6 +65,7 @@ use super::startup::StartupView;
 use super::terminal_model::ShellRequest;
 use super::terminal_view::{RestartBlocked, TerminalView};
 use super::theme;
+use super::tooltip_text::{SHOW_DELAY, cap_width};
 use super::ui_state::{self, UiState};
 use super::write_confirm;
 use flint_core::display::{self, ClusterNames};
@@ -283,6 +284,8 @@ pub struct Workspace {
     /// A right-click selected a row whose detail has not opened yet: the list stays in front
     /// when it does.
     menu_row_pending: bool,
+    /// A right-click made the last selection: its open menu keeps the detail from taking room.
+    right_selected: bool,
     /// The detail pane, when it outlived its list to keep an edit.
     held_edit: Option<unapplied::HeldEdit>,
     /// What last had focus in the list or the detail with no dialog open, and the layout that
@@ -481,6 +484,7 @@ impl Workspace {
             list_in_front: false,
             right_press: false,
             menu_row_pending: false,
+            right_selected: false,
             held_edit: None,
             pane_focus: None,
             dock,
@@ -1001,11 +1005,17 @@ impl Workspace {
                         c.provisional || c.paused,
                     )
                 });
+        let thresholds = self
+            .model
+            .read(cx)
+            .settings
+            .thresholds_for(&cluster, server.as_deref());
         detail.update(cx, |d, cx| {
             d.set_sessions_blocked(why, cx);
             d.set_protected(protected, label, cx);
             d.set_row_writes_paused(writes_paused, cx);
             d.set_server(server);
+            d.set_thresholds(thresholds, cx);
             match endpoint {
                 Some(Some(endpoint)) => d.note_endpoint(endpoint, cx),
                 Some(None) => {}
@@ -1730,6 +1740,7 @@ impl Workspace {
     ) -> impl IntoElement {
         let model = self.model.read(cx);
         let active = model.active.clone();
+        let open_members = sets::sidebar_set_members(self.sets.running.as_ref());
 
         // Scrolls by itself, so the keyboard cursor can bring a cluster row into view
         // (`Workspace::move_sidebar_cursor`): its rows are its children.
@@ -1767,6 +1778,9 @@ impl Workspace {
         let states = self.nav.read(cx).states();
         for cluster in &model.clusters {
             let is_active = active.as_deref() == Some(cluster.info.name.as_str());
+            let set_member = open_members
+                .as_deref()
+                .is_some_and(|members| members.contains(&cluster.info.name.as_str()));
             let presence = Presence::of(&cluster.state, is_active, states);
             let exposure = (model.ai_exposure(cluster), model.ai_scope(cluster));
             let settings_ok = model.settings_error.is_none();
@@ -1786,6 +1800,7 @@ impl Workspace {
                 (
                     is_active,
                     ring,
+                    set_member,
                     presence,
                     cluster_details(model, cluster, states),
                 ),
@@ -1848,7 +1863,7 @@ impl Workspace {
             .border_color(theme.sidebar_border)
             .child(pane_title("CLUSTERS", traffic_lights, theme))
             .child(list)
-            .child(self.render_sets_panel(theme, cx))
+            .child(self.render_sets_panel(open_members.as_ref().map(Vec::len), theme, cx))
             .child(self.render_settings_entry(theme))
             .child(pane_handle(
                 "clusters-edge",
@@ -1860,9 +1875,7 @@ impl Workspace {
     fn render_cluster_row(
         &self,
         cluster: &ClusterSummary,
-        // Whether it is the active cluster, whether the sidebar's cursor is on it, its presence
-        // and its full description.
-        (is_active, ring, presence, tooltip): (bool, bool, Presence<'_>, String),
+        (is_active, ring, set_member, presence, tooltip): (bool, bool, bool, Presence<'_>, String),
         (exposure, ai_scope): (AiExposureState, Option<AiScope>),
         (protection, trust, writes_paused): (Protection, TrustState, bool),
         (settings_ok, names, tag, (keep, keep_sign_in), can_disconnect): (
@@ -1915,6 +1928,7 @@ impl Workspace {
             .border_1()
             .border_color(super::theme::cursor_ring(theme, ring))
             .tooltip(move |_, cx| cluster_tooltip(tip.0.clone(), &tip.1, &tip.2, cx))
+            .tooltip_show_delay(SHOW_DELAY)
             // While choosing clusters a click chooses: it must not connect to this one.
             // So does a Cmd-click, which starts choosing.
             .on_click({
@@ -1943,6 +1957,19 @@ impl Workspace {
                         h_flex()
                             .gap_1p5()
                             .min_w_0()
+                            .when(set_member, |line| {
+                                let label = "Member of the open cluster set";
+                                line.child(
+                                    theme::status_dot(theme.list_active_border, false)
+                                        .id(SharedString::from(format!("cluster-set-mark-{name}")))
+                                        .flex_none()
+                                        .aria_label(label)
+                                        .tooltip(move |window, cx| {
+                                            Tooltip::new(label).build(window, cx)
+                                        })
+                                        .test_support(),
+                                )
+                            })
                             .child(
                                 div()
                                     .min_w_0()
@@ -2270,7 +2297,10 @@ impl Workspace {
                     })
                     .child(text)
                     .when(!tip.is_empty(), |el| {
-                        el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        el.tooltip(move |window, cx| {
+                            cap_width(Tooltip::new(tip.clone())).build(window, cx)
+                        })
+                        .tooltip_show_delay(SHOW_DELAY)
                     }),
             );
         }
@@ -2515,7 +2545,8 @@ impl Workspace {
             .text_color(color)
             .child(Icon::new(icon).xsmall())
             .child(if compact { short } else { text })
-            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .tooltip(move |window, cx| cap_width(Tooltip::new(tip.clone())).build(window, cx))
+            .tooltip_show_delay(SHOW_DELAY)
     }
 
     fn render_namespace_filter(
@@ -2792,8 +2823,29 @@ impl Workspace {
     /// pane beside the list: a detail shown alone fills the main area, so the sidebar keeps its
     /// width and its rows can still be told apart.
     fn layout(&self, window_width: f32, cx: &App) -> Layout {
-        let detail_beside = self.detail.is_some() && self.main_panes(cx) == MainPanes::Split;
-        layout(&self.panes, window_width, self.nav_shown(cx), detail_beside)
+        layout(
+            &self.panes,
+            window_width,
+            self.nav_shown(cx),
+            self.detail_beside(cx),
+        )
+    }
+
+    /// Whether the detail takes room beside the list: not while a right-click's menu is open
+    /// on the list, which would reflow under it.
+    fn detail_beside(&self, cx: &App) -> bool {
+        self.detail.is_some()
+            && self.main_panes(cx) == MainPanes::Split
+            && !self.detail_hidden_by_menu(cx)
+    }
+
+    /// Whether a right-click's open menu keeps the detail it opened out of the layout.
+    fn detail_hidden_by_menu(&self, cx: &App) -> bool {
+        self.right_selected
+            && self
+                .list
+                .as_ref()
+                .is_some_and(|l| l.read(cx).has_open_row_menu())
     }
 
     /// Whether the navigation is on screen: for the active cluster, or for an open set, which
@@ -2913,12 +2965,23 @@ impl Workspace {
             return set_view;
         }
         if let Some(detail) = self.edit_shown_alone(cx) {
+            // The pane's own header belongs to the detail view, so a strip over the top edge
+            // drags the window, as with no cluster. It is drawn first: the header's buttons sit
+            // above it and take their presses before it sees them.
             return div()
                 .id("held-edit-pane")
                 .flex_1()
                 .min_w_0()
                 .h_full()
                 .relative()
+                .child(
+                    super::theme::moves_window(div())
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w_full()
+                        .h(px(HEADER_HEIGHT)),
+                )
                 .child(detail)
                 .children(self.detail_tag_strip(theme, cx))
                 .test_support()
@@ -2999,9 +3062,7 @@ impl Workspace {
                 .min_h_0()
                 .child(div().flex_1().min_w_0().h_full().child(list.clone()))
                 .when_some(
-                    self.detail
-                        .clone()
-                        .filter(|_| self.main_panes(cx) == MainPanes::Split),
+                    self.detail.clone().filter(|_| self.detail_beside(cx)),
                     |el, detail| {
                         el.child(
                             div()
@@ -3886,6 +3947,28 @@ fn namespace_button_text(filter: &[String], limit: Option<&flint_core::Namespace
     }
 }
 
+impl Workspace {
+    /// Builds the menu bar again once this render is over, when the active cluster, the clusters
+    /// listed or what an action can do changed (the guards read the workspace, which is being
+    /// updated now).
+    fn sync_menus(&self, cx: &mut Context<Self>) {
+        let model = self.model.read(cx);
+        let cluster = model.active_cluster().map(|c| c.info.name.clone());
+        let names = model.names();
+        let clusters: Vec<(String, String)> = model
+            .clusters
+            .iter()
+            .map(|c| (c.info.name.clone(), names.with_real(&c.info.name)))
+            .collect();
+        cx.defer(move |cx| {
+            super::app_menus::update(cx, |inputs| {
+                inputs.cluster = cluster;
+                inputs.clusters = clusters;
+            })
+        });
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_namespace_picker_with_dialog(window, cx);
@@ -3898,6 +3981,7 @@ impl Render for Workspace {
         let window_height = f32::from(window.viewport_size().height);
         self.sync_narrow_layout(window_width, window, cx);
         self.two_row_header = self.header_has_two_rows(window_width, cx);
+        self.sync_menus(cx);
         let cx: &Context<Self> = cx;
         let theme = cx.theme();
         let has_cluster = self.model.read(cx).active_cluster().is_some();
@@ -3919,6 +4003,9 @@ impl Render for Workspace {
                 let right_click = std::mem::take(&mut this.right_press);
                 this.list_in_front = right_click;
                 this.menu_row_pending = right_click;
+                // Only a detail the right-click opens stays out of the layout: one already beside
+                // the list keeps its room.
+                this.right_selected = right_click && this.detail.is_none();
             }))
             .capture_action(cx.listener(|this, _: &OpenObject, _, _| {
                 this.list_in_front = false;
