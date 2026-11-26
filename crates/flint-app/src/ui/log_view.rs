@@ -1548,6 +1548,11 @@ impl LogView {
                     .when(self.can_pause(), |el| {
                         el.child(
                             Button::new("log-pause")
+                                .accessibility_label(if paused {
+                                    "Resume following"
+                                } else {
+                                    "Pause following"
+                                })
                                 .icon(if paused {
                                     IconName::Play
                                 } else {
@@ -1588,6 +1593,7 @@ impl LogView {
                         if fit.toggles {
                             el.child(
                                 Button::new("log-save")
+                                    .accessibility_label("Save to a file")
                                     .icon(IconName::FileText)
                                     .xsmall()
                                     .ghost()

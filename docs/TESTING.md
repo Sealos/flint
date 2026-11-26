@@ -35,7 +35,7 @@ Whole-window tests open the workspace over kubeconfig contexts on 127.0.0.1 (hel
 default there are two: `alpha`, whose server accepts connections and never answers (so its views stay up), and `beta`,
 whose server refuses them. Nothing outside the test process is reached. The tests drive the app through registered
 actions, clicks and keys, and check that the three agree. Every click handler must perform a registered action;
-`scripts/check-click-actions.sh` enforces this in CI.
+`scripts/check-click-actions.sh` enforces this in CI, and that every button has an accessible name.
 
 What the silent server cannot send, a test feeds in by hand:
 

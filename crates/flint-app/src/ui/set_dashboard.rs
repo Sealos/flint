@@ -712,6 +712,7 @@ fn render_card(card: &SetCard, drawn: u64, focus: &FocusHandle, theme: &Theme) -
     let opens = card.state.counts();
     let header = h_flex()
         .id(SharedString::from(format!("set-card-open-{cluster}")))
+        .aria_label(card.shown.clone())
         .gap_1()
         .min_w_0()
         .font_weight(FontWeight::SEMIBOLD)
