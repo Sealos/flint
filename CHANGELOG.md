@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/Sealos/flint/compare/v0.7.0...v0.8.0) (2026-11-26)
+
+
+### Features
+
+* **core:** reconnect port-forwards and flint mcp after a proxy change ([#876](https://github.com/Sealos/flint/issues/876)) ([66ac42b](https://github.com/Sealos/flint/commit/66ac42b27accb1d9c6f0205576a86c2031d447e0))
+
 ## [0.7.0](https://github.com/Sealos/flint/compare/v0.6.0...v0.7.0) (2026-11-26)
 
 
