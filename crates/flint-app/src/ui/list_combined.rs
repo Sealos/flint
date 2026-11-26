@@ -944,6 +944,7 @@ impl CombinedResourceList {
         let cluster = member.cluster().to_owned();
         h_flex()
             .id(SharedString::from(format!("group-{cluster}")))
+            .aria_label(format!("{} ({})", member.display_name(), group.count))
             .h(px(ROW_HEIGHT))
             .w_full()
             .px_2()
@@ -1133,6 +1134,7 @@ impl CombinedResourceList {
             header = header.child(
                 h_flex()
                     .id(SharedString::from(header_id(&column.key)))
+                    .aria_label(name.clone())
                     .h_full()
                     .px_2()
                     .gap_1()
@@ -1264,6 +1266,7 @@ impl CombinedResourceList {
                 let signs_in = signed_out && !active;
                 h_flex()
                     .id(SharedString::from(format!("member-{cluster}")))
+                    .aria_label(member.display_name().to_owned())
                     .gap_1()
                     .px_1()
                     .rounded_sm()
