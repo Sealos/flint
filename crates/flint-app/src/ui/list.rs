@@ -385,13 +385,15 @@ impl ResourceList {
         });
         let Remembered { sort, widths } = remembered;
         let mut usage = ListUsage::reserving(&kind, &widths);
+        let shown_columns = usage.columns_for(&latest.columns);
         let mut list = ResourceList {
             core,
             cluster,
             kind,
             label: entry.label.clone(),
             namespaced: entry.namespaced,
-            shown_columns: usage.columns_for(&latest.columns),
+            widths: ColumnWidths::seeded(widths.clone(), &shown_columns),
+            shown_columns,
             shown: latest.clone(),
             latest,
             rows: Arc::from(Vec::new()),
@@ -402,7 +404,6 @@ impl ResourceList {
             },
             problems: Default::default(),
             show_wide: false,
-            widths: ColumnWidths::seeded(widths.clone()),
             saved_widths: widths,
             selected: None,
             selected_ix: None,

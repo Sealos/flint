@@ -555,6 +555,10 @@ impl ListUsage {
         if self.source == source {
             return false;
         }
+        // The first poll answered: a feed that restarts later does not reserve the columns again.
+        if !matches!(source, UsageSource::Hidden | UsageSource::NoFeed) {
+            self.reserved = false;
+        }
         if !source.has_readings() {
             self.generation += 1;
             self.values = Arc::default();
@@ -614,6 +618,10 @@ impl ListUsage {
 
     /// The text of a usage column's cell for the row at `row` of the snapshot drawn.
     pub(in crate::ui) fn cell(&self, role: ColumnRole, row: usize) -> Option<String> {
+        // Reserved columns stay blank until the first poll answers: nothing is unknown yet.
+        if self.source == UsageSource::Hidden {
+            return None;
+        }
         self.values.text(role, row)
     }
 
@@ -1136,10 +1144,18 @@ mod tests {
         assert_eq!(usage.source(), &UsageSource::Hidden);
         let reserved = usage.columns_for(&server);
         assert_eq!(reserved.len(), 3);
+        assert_eq!(
+            usage.cell(ColumnRole::CpuUsage, 0),
+            None,
+            "blank, not unknown"
+        );
         // The poll's answer keeps the very columns; "not installed" removes them once.
         assert!(usage.set_source(UsageSource::Unknown));
         assert!(Arc::ptr_eq(&usage.columns_for(&server), &reserved));
         assert!(usage.set_source(UsageSource::NotInstalled));
+        assert_eq!(usage.columns_for(&server).len(), 1);
+        // A feed that restarts later does not bring them back.
+        assert!(usage.set_source(UsageSource::Hidden));
         assert_eq!(usage.columns_for(&server).len(), 1);
 
         // Without both saved keys, or for a kind with no usage, nothing is reserved.

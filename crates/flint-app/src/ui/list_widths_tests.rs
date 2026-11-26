@@ -32,7 +32,6 @@ async fn open_empty_pods(cx: &mut TestAppContext, t: &TestWorkspace) {
     t.connect_alpha(cx, standard_sections()).await;
     t.dispatch(cx, "workspace::OpenView", json!({ "kind": "pods" }))
         .unwrap();
-    cx.run_until_parked();
 }
 
 async fn wait_for_saved(cx: &mut TestAppContext, t: &TestWorkspace, saved: fn(&str) -> bool) {

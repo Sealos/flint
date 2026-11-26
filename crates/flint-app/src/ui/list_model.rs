@@ -300,39 +300,62 @@ pub struct ColumnWidths {
 }
 
 impl ColumnWidths {
-    /// Widths that start from `saved`.
-    pub fn seeded(saved: SavedColumnWidths) -> Self {
-        ColumnWidths {
+    /// Widths that start from `saved`, laid out for `columns` once they are known.
+    pub fn seeded(saved: SavedColumnWidths, columns: &Arc<[Column]>) -> Self {
+        let mut widths = ColumnWidths {
             saved,
             ..Default::default()
-        }
+        };
+        widths.seed(columns);
+        widths
     }
 
-    /// The widths of a measurement of `columns`, by column key, as they are saved.
-    pub fn to_saved(columns: &[Column], measured: &[usize]) -> SavedColumnWidths {
-        columns
+    /// Starts from the saved widths for `columns`, unless there are none yet.
+    fn seed(&mut self, columns: &Arc<[Column]>) {
+        if columns.is_empty() || self.saved.is_empty() {
+            return;
+        }
+        // A column with no saved width is 0: not measured yet.
+        self.chars = ranked_keys(columns)
             .iter()
+            .map(|key| self.saved.get(key).map_or(0, |&saved| saved as usize))
+            .collect();
+        self.columns = Some(columns.clone());
+    }
+
+    /// The widths of a measurement of `columns`, by column key, as they are saved. Columns with
+    /// the same key are told apart by their rank.
+    pub fn to_saved(columns: &[Column], measured: &[usize]) -> SavedColumnWidths {
+        ranked_keys(columns)
+            .into_iter()
             .zip(measured)
-            .map(|(column, &chars)| (column.key(), u32::try_from(chars).unwrap_or(u32::MAX)))
+            .map(|(key, &chars)| (key, u32::try_from(chars).unwrap_or(u32::MAX)))
             .collect()
     }
 
     /// Folds a measurement of `columns` in. `restart` drops the widths so far, for when other
     /// rows are measured (the namespace filter changed), so columns fit them.
     pub fn update(&mut self, columns: &Arc<[Column]>, measured: &[usize], restart: bool) {
+        // The first columns the list has: start from the saved widths, which the measurement
+        // only grows.
+        if !restart && self.chars.is_empty() {
+            self.seed(columns);
+        }
         let same = self
             .columns
             .as_ref()
             .is_some_and(|c| Arc::ptr_eq(c, columns) || **c == **columns);
         if restart || !same || self.chars.len() != measured.len() {
-            let first = !restart && self.columns.as_ref().is_none_or(|c| c.is_empty());
+            let before = self.columns.as_ref().map(|c| ranked_keys(c));
+            let before = before.zip(Some(std::mem::take(&mut self.chars)));
             self.columns = Some(columns.clone());
             self.chars = measured.to_vec();
-            if first {
-                // The saved widths hold until the list is closed: the measurement only grows them.
-                for (have, column) in self.chars.iter_mut().zip(columns.iter()) {
-                    if let Some(&saved) = self.saved.get(&column.key()) {
-                        *have = (*have).max(saved as usize);
+            // Columns that stay when others come or go (usage columns found missing) keep their
+            // widths, so nothing snaps.
+            if let (false, Some((keys, chars))) = (restart, before) {
+                for (have, key) in self.chars.iter_mut().zip(ranked_keys(columns)) {
+                    if let Some(at) = keys.iter().position(|k| *k == key) {
+                        *have = (*have).max(chars[at]);
                     }
                 }
             }
@@ -345,13 +368,12 @@ impl ColumnWidths {
 
     /// Width in characters of column `i`, or a default before anything was measured.
     pub fn chars(&self, i: usize, column: &Column) -> usize {
-        let chars = self.chars.get(i).copied().unwrap_or_else(|| {
-            // Before anything was measured: the saved width, else the header's.
-            self.saved.get(&column.key()).map_or_else(
-                || (column.name.chars().count() + 2).max(8),
-                |&saved| saved as usize,
-            )
-        });
+        let chars = self
+            .chars
+            .get(i)
+            .copied()
+            .filter(|&chars| chars > 0)
+            .unwrap_or_else(|| (column.name.chars().count() + 2).max(8));
         if column.role == ColumnRole::Name {
             return chars.clamp(NAME_MIN_CHARS, MAX_CHARS);
         }
@@ -372,6 +394,25 @@ impl ColumnWidths {
             _ => self.chars(i, column),
         }
     }
+}
+
+/// The keys of `columns` as they are saved: [`Column::key`], and `#n` after it for the n-th
+/// later column with the same key (two columns can share a header, one of them wide).
+fn ranked_keys(columns: &[Column]) -> Vec<String> {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    columns
+        .iter()
+        .map(|column| {
+            let key = column.key();
+            let count = seen.entry(key.clone()).or_insert(0);
+            *count += 1;
+            if *count == 1 {
+                key
+            } else {
+                format!("{key}#{}", *count - 1)
+            }
+        })
+        .collect()
 }
 
 /// The columns to draw when `available` points are free: every default column, plus the
@@ -1462,7 +1503,7 @@ mod tests {
         assert_eq!(saved.len(), 3);
         assert_eq!(saved["flint:name"], 40);
 
-        let mut widths = ColumnWidths::seeded(saved.clone());
+        let mut widths = ColumnWidths::seeded(saved.clone(), &columns);
         // Before any measurement: the saved widths, not the header's.
         assert_eq!(widths.chars(0, &columns[0]), 40);
         assert_eq!(widths.chars(1, &columns[1]), 14);
@@ -1476,10 +1517,29 @@ mod tests {
         assert_eq!(widths.chars(2, &columns[2]), 9, "never shrinks");
 
         // A filter change measures from scratch, without the saved widths.
-        let mut restarted = ColumnWidths::seeded(saved);
+        let mut restarted = ColumnWidths::seeded(saved, &columns);
         restarted.update(&columns, &measured, true);
         assert_eq!(restarted.chars(0, &columns[0]), 20);
         assert_eq!(restarted.chars(2, &columns[2]), 7);
+    }
+
+    #[test]
+    fn same_headed_columns_keep_their_own_widths_and_staying_columns_keep_theirs() {
+        let mut columns = pod_columns()[..3].to_vec();
+        columns.push(col("Ready", 1, ColumnRole::Value, ColumnType::String));
+        let columns: Arc<[Column]> = columns.into();
+        let saved = ColumnWidths::to_saved(&columns, &[40, 14, 9, 30]);
+        assert_eq!(saved.len(), 4, "{saved:?}");
+        let mut widths = ColumnWidths::seeded(saved, &columns);
+        assert_eq!(widths.chars(2, &columns[2]), 9);
+        assert_eq!(widths.chars(3, &columns[3]), 30);
+
+        // Columns that go (metrics found missing) leave the others where they were.
+        let fewer: Arc<[Column]> = columns[..2].to_vec().into();
+        widths.update(&columns, &[10, 10, 10, 10], false);
+        widths.update(&fewer, &[20, 11], false);
+        assert_eq!(widths.chars(0, &fewer[0]), 40);
+        assert_eq!(widths.chars(1, &fewer[1]), 14);
     }
 
     #[test]
