@@ -79,6 +79,9 @@ pub struct Options {
     /// CustomResourceDefinition, and for a `PATCH` of `scale`. Naming a resource the fixtures do
     /// not serve, or a built-in one, fails the server's start.
     pub scaled: Vec<(Gvr, String)>,
+    /// What a stored write to a Deployment, StatefulSet or DaemonSet does to its generation
+    /// and status (`rollouts`). Untouched by default.
+    pub rollouts: Rollouts,
 }
 
 impl Default for Options {
@@ -94,6 +97,7 @@ impl Default for Options {
             version: None,
             hidden: Vec::new(),
             scaled: Vec::new(),
+            rollouts: Rollouts::Untouched,
         }
     }
 }
@@ -1081,6 +1085,7 @@ fn put_object(
         ));
     }
     keep_server_metadata(&mut object, &current, ns);
+    rollouts::after_write(inner.options.rollouts, gvr, Some(&current), &mut object);
     if query.dry_run {
         return Ok(rebased(inner, object));
     }
@@ -1484,6 +1489,10 @@ pub use metrics::{MetricsSample, MetricsTarget};
 
 #[path = "server_variants.rs"]
 mod variants;
+
+#[path = "server_rollouts.rs"]
+mod rollouts;
+pub use rollouts::Rollouts;
 
 #[cfg(test)]
 #[path = "server_tests.rs"]

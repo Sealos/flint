@@ -610,6 +610,8 @@ fn deployment() -> Value {
             "selector": {"matchLabels": {"app": "web"}},
             "template": {"metadata": {"labels": {"app": "web"}}},
         },
+        // Rolled out, so a fleet run that waits for its rollout moves on at once.
+        "status": {"replicas": 2, "updatedReplicas": 2, "availableReplicas": 2},
     })
 }
 

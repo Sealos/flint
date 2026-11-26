@@ -2,40 +2,127 @@ use std::cell::RefCell;
 
 use super::*;
 
-fn step(
-    cluster: &str,
-    dropped: bool,
-    outcome: Result<(), WriteError>,
-) -> Step<(String, Result<(), WriteError>)> {
+/// A step's work: its cluster, and how its write ends, with how its wait ends if it leaves one.
+type Work = (String, Result<Option<FleetStatus>, WriteError>);
+
+fn step(cluster: &str, dropped: bool, outcome: Result<(), WriteError>) -> Step<Work> {
     Step {
         cluster: cluster.to_owned(),
         dropped,
         blocked: false,
-        work: (cluster.to_owned(), outcome),
+        work: (cluster.to_owned(), outcome.map(|()| None)),
+    }
+}
+
+/// A step whose write leaves a wait that ends with `status`.
+fn waited(cluster: &str, status: FleetStatus) -> Step<Work> {
+    Step {
+        work: (cluster.to_owned(), Ok(Some(status))),
+        ..step(cluster, false, Ok(()))
     }
 }
 
 /// Runs `steps`, and returns the report and the clusters whose work started.
 async fn driven(
-    steps: Vec<Step<(String, Result<(), WriteError>)>>,
+    steps: Vec<Step<Work>>,
     cancel: FleetCancel,
     cancel_after: Option<&str>,
 ) -> (FleetReport, Vec<String>) {
+    let (report, started, _) = driven_hearing(steps, cancel, cancel_after).await;
+    (report, started)
+}
+
+/// [`driven`], also returning everything `on_result` heard.
+async fn driven_hearing(
+    steps: Vec<Step<Work>>,
+    cancel: FleetCancel,
+    cancel_after: Option<&str>,
+) -> (FleetReport, Vec<String>, Vec<FleetResult>) {
     let started = RefCell::new(Vec::new());
+    let heard = RefCell::new(Vec::new());
     let report = drive(
         steps,
         cancel.clone(),
-        |_| {},
+        |result| heard.borrow_mut().push(result.clone()),
         |(cluster, outcome)| {
             started.borrow_mut().push(cluster.clone());
             if cancel_after == Some(cluster.as_str()) {
                 cancel.cancel();
             }
-            async move { outcome }
+            async move { outcome.map(|wait| wait.map(std::future::ready)) }
         },
     )
     .await;
-    (report, started.into_inner())
+    (report, started.into_inner(), heard.into_inner())
+}
+
+#[tokio::test]
+async fn a_rollout_is_heard_as_waiting_then_as_its_end() {
+    let (report, started, heard) = driven_hearing(
+        vec![
+            waited("a", FleetStatus::RolledOut),
+            waited("b", FleetStatus::Done),
+        ],
+        FleetCancel::new(),
+        None,
+    )
+    .await;
+    assert_eq!(started, ["a", "b"]);
+    assert_eq!(
+        statuses(&report),
+        [FleetStatus::RolledOut, FleetStatus::Done]
+    );
+    let heard: Vec<_> = heard
+        .iter()
+        .map(|r| (r.cluster.as_str(), r.status.clone()))
+        .collect();
+    assert_eq!(
+        heard,
+        [
+            ("a", FleetStatus::WaitingForRollout),
+            ("a", FleetStatus::RolledOut),
+            ("b", FleetStatus::WaitingForRollout),
+            ("b", FleetStatus::Done),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_rollout_stops_the_run() {
+    let failure = RolloutFailure::TimedOut(Duration::from_secs(600));
+    let (report, started) = driven(
+        vec![
+            waited("a", FleetStatus::RolloutFailed(failure.clone())),
+            step("b", false, Ok(())),
+        ],
+        FleetCancel::new(),
+        None,
+    )
+    .await;
+    assert_eq!(started, ["a"]);
+    assert_eq!(
+        statuses(&report),
+        [
+            FleetStatus::RolloutFailed(failure),
+            FleetStatus::Skipped(FleetSkip::AfterFailure),
+        ]
+    );
+}
+
+#[test]
+fn a_rollout_failure_says_why() {
+    let timed_out = RolloutFailure::TimedOut(Duration::from_secs(600));
+    assert_eq!(
+        timed_out.to_string(),
+        "the rollout did not finish within 10 minutes"
+    );
+    let short = RolloutFailure::TimedOut(Duration::from_millis(1500));
+    assert_eq!(short.to_string(), "the rollout did not finish within 1.5 s");
+    let failed = RolloutFailure::Failed("ReplicaSet \"web-1\" has timed out progressing.".into());
+    assert_eq!(
+        failed.to_string(),
+        "the rollout failed: ReplicaSet \"web-1\" has timed out progressing."
+    );
 }
 
 fn statuses(report: &FleetReport) -> Vec<FleetStatus> {
@@ -226,6 +313,7 @@ fn refused_clusters_are_dropped_and_never_run() {
             refused_entry("a", WriteError::Conflict),
             refused_entry("b", WriteError::Gone),
         ],
+        rollout_timeout: ROLLOUT_TIMEOUT,
     };
     assert!(preview.entries().iter().all(|e| !e.will_run()));
     assert_eq!(preview.unresolved(), ["a", "b"]);

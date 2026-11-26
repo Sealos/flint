@@ -6,14 +6,14 @@ use std::time::Duration;
 
 use flint_core::fleet::{
     FleetAction, FleetCancel, FleetManifest, FleetObject, FleetPlan, FleetPreview, FleetReport,
-    FleetSkip, FleetStatus,
+    FleetResult, FleetSkip, FleetStatus, RolloutFailure,
 };
 use flint_core::handle::{AdmittedMember, Command, MemberStatus};
 use flint_core::settings::ClusterPin;
 use flint_core::write::{ResourceChange, WriteError, WriteWarning};
 use flint_core::{KindId, Settings, WriteRefusal};
 use flint_e2e::fake_api::{
-    FakeApiServer, Fault, Gvr, Options, RequestHold, Verb, write_kubeconfigs,
+    FakeApiServer, Fault, Gvr, Options, RequestHold, Rollouts, Verb, write_kubeconfigs,
 };
 use serde_json::{Value, json};
 
@@ -114,18 +114,29 @@ struct Fleet {
 }
 
 impl Fleet {
-    /// Three connected members, each with the object, unlocked except for `locked`.
+    /// Three connected members, each with the object, unlocked except for `locked`. Each
+    /// rollout a write starts finishes at once.
     async fn start(locked: &[&str]) -> Fleet {
-        Self::start_with(locked, Options::default()).await
+        Self::start_with(locked, finished()).await
     }
 
     /// [`Self::start`], on servers that also create objects.
     async fn start_creating(locked: &[&str]) -> Fleet {
         let options = Options {
             accept_creates: true,
-            ..Options::default()
+            ..finished()
         };
         Self::start_with(locked, options).await
+    }
+
+    /// [`Self::start`], with every member unlocked, on servers where a rollout a write starts
+    /// goes on until the test ends it.
+    async fn start_rolling() -> Fleet {
+        let options = Options {
+            rollouts: Rollouts::Started,
+            ..Options::default()
+        };
+        Self::start_with(&[], options).await
     }
 
     async fn start_with(locked: &[&str], options: Options) -> Fleet {
@@ -183,8 +194,31 @@ impl Fleet {
     }
 
     async fn preview(&self, action: FleetAction) -> FleetPreview {
-        let plan = FleetPlan::new(action, object(), self.members.clone()).unwrap();
+        self.preview_waiting(action, WAIT).await
+    }
+
+    /// [`Self::preview`], waiting up to `timeout` for each rollout.
+    async fn preview_waiting(&self, action: FleetAction, timeout: Duration) -> FleetPreview {
+        let plan = FleetPlan::new(action, object(), self.members.clone())
+            .unwrap()
+            .with_rollout_timeout(timeout);
         self.core.handle.preview_fleet(plan).await
+    }
+
+    /// Starts running `preview`, and returns the run and what it heard as it went.
+    fn start_run(
+        &self,
+        preview: FleetPreview,
+        cancel: FleetCancel,
+    ) -> (
+        tokio::task::JoinHandle<FleetReport>,
+        tokio::sync::mpsc::UnboundedReceiver<FleetResult>,
+    ) {
+        let (sender, heard) = tokio::sync::mpsc::unbounded_channel();
+        let run = self.core.handle.run_fleet(preview, cancel, move |result| {
+            let _ = sender.send(result.clone());
+        });
+        (tokio::spawn(run), heard)
     }
 
     async fn run(&self, preview: FleetPreview) -> FleetReport {
@@ -204,7 +238,15 @@ impl Fleet {
     async fn repoint_b(&self, server: &FakeApiServer) {
         write_config(&self.path, &[&self.servers[0], server, &self.servers[2]]);
         let handle = &self.core.handle;
-        handle.reload_kubeconfig().await.unwrap();
+        // A write check's own read of the files can overtake a reload: ask again until one
+        // applies.
+        tokio::time::timeout(WAIT, async {
+            while handle.reload_kubeconfig().await.is_err() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the kubeconfig reloads");
         handle.unlock("b", &server.url());
         let before = server.arrivals().len();
         handle.send(Command::Activate("a".to_owned()));
@@ -230,8 +272,24 @@ fn is_connection_refusal(status: &FleetStatus) -> bool {
     )
 }
 
+/// Each member's status, a finished rollout counted as done: these tests judge the writes, and
+/// the rollout tests the waits.
 fn statuses(report: &FleetReport) -> Vec<FleetStatus> {
-    report.results.iter().map(|r| r.status.clone()).collect()
+    report
+        .results
+        .iter()
+        .map(|r| match &r.status {
+            FleetStatus::RolledOut => FleetStatus::Done,
+            status => status.clone(),
+        })
+        .collect()
+}
+
+fn finished() -> Options {
+    Options {
+        rollouts: Rollouts::Finished,
+        ..Options::default()
+    }
 }
 
 const AFTER_FAILURE: FleetStatus = FleetStatus::Skipped(FleetSkip::AfterFailure);
@@ -674,7 +732,15 @@ async fn a_locked_member_left_out_of_the_plan_lets_the_others_run() {
             FleetStatus::Done,
         ]
     );
-    assert_eq!(*heard.lock().unwrap(), report.results);
+    // Each member's end, heard after it was heard waiting for its rollout.
+    let ends: Vec<_> = heard
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.status != FleetStatus::WaitingForRollout)
+        .cloned()
+        .collect();
+    assert_eq!(ends, report.results);
     assert_eq!(all_writes(fleet.server("b")), 0, "not even a dry run");
     assert_eq!(replicas(fleet.server("b")), 2);
     assert_eq!(replicas(fleet.server("a")), 5);
@@ -1152,4 +1218,177 @@ async fn the_selected_member_is_bound_to_the_object_it_shows() {
             .with_shown_uid("elsewhere", "uid-1"),
         Err(flint_core::fleet::FleetPlanError::NotAMember(_))
     ));
+}
+
+/// Waits until the run says `cluster` is waiting for its rollout.
+async fn until_waiting(
+    heard: &mut tokio::sync::mpsc::UnboundedReceiver<FleetResult>,
+    cluster: &str,
+) {
+    tokio::time::timeout(WAIT, async {
+        while let Some(result) = heard.recv().await {
+            if result.cluster == cluster && result.status == FleetStatus::WaitingForRollout {
+                return;
+            }
+        }
+        panic!("the run ended before {cluster} waited for its rollout");
+    })
+    .await
+    .expect("the run waits for the rollout");
+}
+
+const STALLED: &str = "ReplicaSet \"web-7d4b9c\" has timed out progressing.";
+
+fn ends(report: &FleetReport) -> Vec<FleetStatus> {
+    report.results.iter().map(|r| r.status.clone()).collect()
+}
+
+// covers #871: each member's rollout finishes before the next member is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_waits_for_each_rollout_before_the_next_cluster() {
+    for action in [FleetAction::RolloutRestart, FleetAction::Scale { to: 5 }] {
+        let fleet = Fleet::start_rolling().await;
+        let preview = fleet.preview(action.clone()).await;
+        let (run, mut heard) = fleet.start_run(preview, FleetCancel::new());
+        for (index, name) in NAMES.iter().enumerate() {
+            until_waiting(&mut heard, name).await;
+            let server = fleet.server(name);
+            assert_eq!(real_writes(server), 1, "{action:?} on {name}");
+            for later in &NAMES[index + 1..] {
+                let writes = real_writes(fleet.server(later));
+                assert_eq!(writes, 0, "{action:?}: nothing before {name} rolls out");
+            }
+            server.finish_rollout(&deployments(), Some("demo"), NAME);
+        }
+        let report = run.await.unwrap();
+        assert_eq!(
+            ends(&report),
+            [const { FleetStatus::RolledOut }; 3],
+            "{action:?}"
+        );
+    }
+}
+
+// covers #871: a rollout the controller gives up on fails its member and stops the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_rollout_stops_the_run() {
+    let fleet = Fleet::start_rolling().await;
+    let preview = fleet.preview(FleetAction::RolloutRestart).await;
+    let (run, mut heard) = fleet.start_run(preview, FleetCancel::new());
+    until_waiting(&mut heard, "a").await;
+    fleet
+        .server("a")
+        .fail_rollout(&deployments(), Some("demo"), NAME, STALLED);
+
+    let report = run.await.unwrap();
+    assert_eq!(
+        ends(&report),
+        [
+            FleetStatus::RolloutFailed(RolloutFailure::Failed(STALLED.to_owned())),
+            AFTER_FAILURE,
+            AFTER_FAILURE,
+        ]
+    );
+    assert_eq!(real_writes(fleet.server("b")), 0);
+    assert_eq!(real_writes(fleet.server("c")), 0);
+}
+
+// covers #871: a rollout that does not finish in time fails its member and stops the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rollout_that_does_not_finish_in_time_stops_the_run() {
+    let fleet = Fleet::start_rolling().await;
+    let timeout = Duration::from_millis(1500);
+    let preview = fleet
+        .preview_waiting(FleetAction::Scale { to: 5 }, timeout)
+        .await;
+
+    let report = fleet.run(preview).await;
+    assert_eq!(
+        ends(&report),
+        [
+            FleetStatus::RolloutFailed(RolloutFailure::TimedOut(timeout)),
+            AFTER_FAILURE,
+            AFTER_FAILURE,
+        ]
+    );
+    assert_eq!(replicas(fleet.server("a")), 5);
+    assert_eq!(real_writes(fleet.server("b")), 0);
+}
+
+// covers #871: a cancel while a rollout is awaited stops the run before the next member.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_while_waiting_stops_before_the_next_cluster() {
+    let fleet = Fleet::start_rolling().await;
+    let preview = fleet.preview(FleetAction::RolloutRestart).await;
+    let cancel = FleetCancel::new();
+    let (run, mut heard) = fleet.start_run(preview, cancel.clone());
+    until_waiting(&mut heard, "a").await;
+    cancel.cancel();
+
+    let report = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("a cancel ends the wait at once")
+        .unwrap();
+    assert_eq!(
+        ends(&report),
+        [
+            FleetStatus::RolloutNotAwaited,
+            FleetStatus::Skipped(FleetSkip::Cancelled),
+            FleetStatus::Skipped(FleetSkip::Cancelled),
+        ]
+    );
+    assert_eq!(real_writes(fleet.server("b")), 0);
+    assert_eq!(real_writes(fleet.server("c")), 0);
+}
+
+// covers #871: a delete has no rollout, so the run moves on as soon as each delete is accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_does_not_wait_for_a_rollout() {
+    let fleet = Fleet::start_rolling().await;
+    let preview = fleet.preview(FleetAction::Delete).await;
+    let (run, mut heard) = fleet.start_run(preview, FleetCancel::new());
+    let report = run.await.unwrap();
+    assert_eq!(ends(&report), [const { FleetStatus::Done }; 3]);
+    while let Ok(result) = heard.try_recv() {
+        assert_ne!(result.status, FleetStatus::WaitingForRollout, "{result:?}");
+    }
+}
+
+// covers #871: the wait reads through the gate the write went through, so a member re-pointed
+// while its rollout is awaited fails its wait and stops the run, and no read of the object
+// reaches the new server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_repointed_while_waiting_fails_its_wait() {
+    let fleet = Fleet::start_rolling().await;
+    let preview = fleet.preview(FleetAction::RolloutRestart).await;
+    let (run, mut heard) = fleet.start_run(preview, FleetCancel::new());
+    until_waiting(&mut heard, "a").await;
+    fleet
+        .server("a")
+        .finish_rollout(&deployments(), Some("demo"), NAME);
+    until_waiting(&mut heard, "b").await;
+    let elsewhere = FakeApiServer::start().await.unwrap();
+    elsewhere.set_object(&deployments(), deployment("uid-elsewhere", 2));
+    fleet.repoint_b(&elsewhere).await;
+
+    let report = run.await.unwrap();
+    let results = ends(&report);
+    assert_eq!(results[0], FleetStatus::RolledOut);
+    assert!(
+        matches!(
+            &results[1],
+            FleetStatus::RolloutFailed(RolloutFailure::Unread(error))
+                if is_connection_refusal(&FleetStatus::Failed(error.clone()))
+        ),
+        "{results:?}"
+    );
+    assert_eq!(results[2], AFTER_FAILURE);
+    let read_elsewhere = elsewhere.arrivals().iter().any(|a| {
+        a.method == http::Method::GET && a.path.ends_with(&format!("/deployments/{NAME}"))
+    });
+    assert!(
+        !read_elsewhere,
+        "no read of the object reached the new server"
+    );
+    assert_eq!(real_writes(fleet.server("c")), 0);
 }

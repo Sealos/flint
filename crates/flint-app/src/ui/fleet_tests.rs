@@ -4,7 +4,7 @@
 
 use flint_core::KindId;
 use flint_core::fleet::{
-    FleetAction, FleetCancel, FleetObject, FleetResult, FleetSkip, FleetStatus,
+    FleetAction, FleetCancel, FleetObject, FleetResult, FleetSkip, FleetStatus, RolloutFailure,
 };
 use flint_core::protection::WriteRefusal;
 use flint_core::write::WriteError;
@@ -198,6 +198,53 @@ fn a_partial_failure_reports_each_member() {
     assert_eq!(
         summary(&lines),
         "Finished: 1 done, 1 failed, 1 not tried, 1 left out."
+    );
+}
+
+// covers #871: a member is shown waiting for its rollout, then rolled out or failed with why,
+// and the next member's turn comes only after.
+#[test]
+fn each_member_says_where_its_rollout_stands() {
+    let mut lines = result_lines(&[acts("a", "x"), acts("b", "x"), acts("c", "x")]);
+    record(&mut lines, &result("a", FleetStatus::WaitingForRollout));
+    assert_eq!(
+        texts(&lines, false),
+        ["a: waiting for rollout…", "b: waiting", "c: waiting"]
+    );
+    record(&mut lines, &result("a", FleetStatus::RolledOut));
+    assert_eq!(texts(&lines, false)[..2], ["a: rolled out", "b: running…"]);
+    let stalled = RolloutFailure::Failed("ReplicaSet \"web-1\" has timed out\nprogressing.".into());
+    record(
+        &mut lines,
+        &result("b", FleetStatus::RolloutFailed(stalled)),
+    );
+    record(
+        &mut lines,
+        &result("c", FleetStatus::Skipped(FleetSkip::AfterFailure)),
+    );
+    let said = texts(&lines, true);
+    assert_eq!(said[0], "a: rolled out");
+    assert!(
+        said[1].starts_with("b: failed: the rollout failed: ReplicaSet \"web-1\" has timed out"),
+        "{said:?}"
+    );
+    assert!(!said[1].contains('\n'), "{said:?}");
+    assert_eq!(summary(&lines), "Finished: 1 done, 1 failed, 1 not tried.");
+
+    let mut lines = result_lines(&[acts("a", "x"), acts("b", "x")]);
+    let timed_out = RolloutFailure::TimedOut(std::time::Duration::from_secs(600));
+    record(
+        &mut lines,
+        &result("a", FleetStatus::RolloutFailed(timed_out)),
+    );
+    assert_eq!(
+        texts(&lines, true)[0],
+        "a: failed: the rollout did not finish within 10 minutes"
+    );
+    record(&mut lines, &result("a", FleetStatus::RolloutNotAwaited));
+    assert_eq!(
+        texts(&lines, true)[0],
+        "a: changed; the run was stopped before its rollout finished"
     );
 }
 
