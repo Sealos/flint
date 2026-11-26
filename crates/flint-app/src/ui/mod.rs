@@ -37,6 +37,7 @@ mod fleet_plan;
 mod fleet_view;
 mod focus;
 mod helm_view;
+mod home;
 mod icons;
 mod keep_watching;
 mod list;

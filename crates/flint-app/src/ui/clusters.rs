@@ -308,6 +308,15 @@ impl ClustersModel {
         self.keep_watching.get(cluster)
     }
 
+    /// Sets the keep-watching toggles as the core would report them.
+    #[cfg(test)]
+    pub fn set_keep_watching_for_test(
+        &mut self,
+        views: std::collections::BTreeMap<ClusterId, KeepWatchView>,
+    ) {
+        self.keep_watching = Arc::new(views);
+    }
+
     /// Turns keeping `cluster` watched on, on `definition`, or off (`None`). This never lets an
     /// exec plugin run: that is [`Self::turn_background_sign_in`].
     pub fn set_keep_watching(&mut self, cluster: ClusterId, definition: Option<u64>) {
