@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use flint_core::redact::safe_error_summary;
-use flint_core::settings::{self, ListSort, PaneWidths, State};
+use flint_core::settings::{self, ListSort, PaneWidths, SavedColumnWidths, State};
 
 pub struct UiState {
     dir: PathBuf,
@@ -110,6 +110,35 @@ impl UiState {
                 }
             }
         }
+        Some(self.to_save())
+    }
+
+    /// The column widths remembered for `kind`'s list on `cluster`: empty if none.
+    pub fn list_widths(&self, cluster: &str, kind: &str) -> SavedColumnWidths {
+        self.state
+            .list_widths
+            .get(cluster)
+            .and_then(|kinds| kinds.get(kind))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Remembers the column widths of `kind`'s list on `cluster`. Returns what to save, or
+    /// `None` if nothing changed.
+    pub fn set_list_widths(
+        &mut self,
+        cluster: &str,
+        kind: &str,
+        widths: SavedColumnWidths,
+    ) -> Option<(PathBuf, State)> {
+        if widths.is_empty() || self.list_widths(cluster, kind) == widths {
+            return None;
+        }
+        self.state
+            .list_widths
+            .entry(cluster.to_owned())
+            .or_default()
+            .insert(kind.to_owned(), widths);
         Some(self.to_save())
     }
 
@@ -238,6 +267,28 @@ mod tests {
         );
         assert_eq!(reloaded.last_view("other"), None);
         assert_eq!(reloaded.panes(), panes);
+    }
+
+    #[test]
+    fn list_widths_are_remembered_per_cluster_and_kind_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = UiState::load(dir.path().to_owned());
+        let arn = "arn:aws:eks:eu-north-1:123456789012:cluster/payments";
+        let widths: SavedColumnWidths = [("flint:name".to_owned(), 40)].into();
+        save(ui.set_list_widths(arn, "pods", widths.clone()).unwrap());
+        assert!(ui.set_list_widths(arn, "pods", widths.clone()).is_none());
+        // Nothing measured is not worth saving.
+        assert!(
+            ui.set_list_widths(arn, "nodes", SavedColumnWidths::new())
+                .is_none()
+        );
+        let wider: SavedColumnWidths = [("flint:name".to_owned(), 44)].into();
+        save(ui.set_list_widths(arn, "pods", wider.clone()).unwrap());
+
+        let reloaded = UiState::load(dir.path().to_owned());
+        assert_eq!(reloaded.list_widths(arn, "pods"), wider);
+        assert!(reloaded.list_widths(arn, "nodes").is_empty());
+        assert!(reloaded.list_widths("other", "pods").is_empty());
     }
 
     // covers UP-21

@@ -51,6 +51,14 @@ pub fn moves_window<E: InteractiveElement>(element: E) -> E {
     })
 }
 
+/// Keeps a press on `element`, or anything in it, from moving the window. For a group of controls
+/// in a [`moves_window`] row: a disabled button or a tab prevents nothing itself, so a press on
+/// one would otherwise drag the window.
+pub fn keeps_press<E: InteractiveElement>(element: E) -> E {
+    // not-an-action: window chrome, tells the drag row above that this press is not for it.
+    element.on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+}
+
 /// Both themes, without the accent.
 pub(super) const THEMES: &str = include_str!("themes/flint.json");
 
@@ -473,6 +481,43 @@ pub(super) mod tests {
         let mut theme = Theme::default();
         theme.apply_config(&Rc::new(config));
         theme
+    }
+
+    /// How far apart two hues are, in degrees (the short way round the wheel).
+    fn hue_distance(a: Hsla, b: Hsla) -> f32 {
+        let d = ((a.h - b.h).abs() * 360.) % 360.;
+        d.min(360. - d)
+    }
+
+    // covers #313: in the light theme the danger red stays visibly apart from every orange
+    // accent, as a fill and as text; a red drifting toward orange would read as the accent.
+    #[test]
+    fn light_danger_red_is_apart_from_the_orange_accent() {
+        const MIN_HUE_DEGREES: f32 = 15.;
+        let (light, _) = themes(&ACCENT);
+        let light = resolved(light);
+        let danger = [
+            ("danger", light.danger),
+            ("danger as a fill", light.button_danger),
+        ];
+        for accent in CANDIDATES {
+            for (what, shade) in [
+                ("fill", accent.light.fill),
+                ("hover", accent.light.hover),
+                ("active", accent.light.active),
+                ("text", accent.light.text),
+            ] {
+                let orange = try_parse_color(shade).unwrap();
+                for (name, red) in danger {
+                    let apart = hue_distance(red, orange);
+                    assert!(
+                        apart >= MIN_HUE_DEGREES,
+                        "{name} and {} {what} are {apart:.1} degrees apart, needs {MIN_HUE_DEGREES}",
+                        accent.name
+                    );
+                }
+            }
+        }
     }
 
     fn rgb(color: Hsla) -> [f32; 4] {

@@ -392,6 +392,77 @@ async fn the_scale_dialog_validates_the_count(cx: &mut TestAppContext) {
     assert!(t.has_dialog(cx), "it stays open");
 }
 
+/// Connects `kind-alpha` with Widgets deletable, and with a `scale` subresource as `scale` says.
+async fn connect_widgets(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+    scale: flint_core::action_kinds::ScaleSubresource,
+) {
+    t.connect_alpha(cx, standard_sections()).await;
+    let mut found = discovery(standard_sections());
+    for kind in &mut found.kinds {
+        kind.verbs.push("delete".into());
+        if kind.plural() == "widgets" {
+            kind.scale = scale.clone();
+        }
+    }
+    t.feed(
+        cx,
+        Event::DiscoveryChanged {
+            cluster: "kind-alpha".into(),
+            generation: CURRENT_GENERATION,
+            discovery: Some(Arc::new(found)),
+            error: None,
+        },
+    );
+    let widgets = objects(
+        KindId::new("example.com", "widgets"),
+        &[("demo", "w1", 0)],
+        SyncState::Synced,
+        1,
+    );
+    t.open_kind(cx, "widgets.example.com", widgets).await;
+    right_click(cx, t, "w1").await;
+}
+
+// covers UP-53: a custom resource offers Scale once its definition's replica paths are read, and
+// the dialog starts from the count at that path.
+#[gpui_kit::test]
+async fn a_custom_resource_offers_scale_with_readable_paths(cx: &mut TestAppContext) {
+    use flint_core::action_kinds::{ScalePaths, ScaleSubresource};
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_alpha(cx, dir.path(), "").await;
+    connect_widgets(cx, &t, ScaleSubresource::Unread).await;
+    assert!(!menu(cx, &t).iter().any(|r| r == "Scale…"));
+    assert!(
+        t.dispatch(cx, "workspace::ScaleObject", Value::Null)
+            .is_err()
+    );
+    t.press(cx, "escape");
+
+    let paths = ScalePaths::from_crd(".spec.size", ".status.size").unwrap();
+    connect_widgets(cx, &t, ScaleSubresource::Paths(paths)).await;
+    let rows = menu(cx, &t);
+    assert!(rows.iter().any(|r| r == "Scale…"), "{rows:?}");
+    assert!(!rows.iter().any(|r| r == "Rollout Restart…"), "{rows:?}");
+    t.press(cx, "escape");
+    show_fetched(
+        cx,
+        &t,
+        fetched(json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": {"name": "w1", "namespace": "demo", "uid": "uid-w1"},
+            "spec": {"size": 4, "replicas": 9},
+        })),
+    );
+    t.dispatch(cx, "workspace::ScaleObject", Value::Null)
+        .unwrap();
+    t.wait_for_element(cx, "scale-input").await;
+    let text = t.label(cx, "scale-description").unwrap();
+    assert!(text.starts_with("Replicas now: 4."), "{text}");
+}
+
 // covers UP-53: a drain's two options start unchecked and each says what is lost.
 #[gpui_kit::test]
 async fn the_drain_dialog_says_what_each_option_loses(cx: &mut TestAppContext) {
@@ -533,7 +604,12 @@ fn deployment() -> Value {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
         "metadata": {"name": "web", "namespace": "demo", "uid": "uid-web", "resourceVersion": "7"},
-        "spec": {"replicas": 2},
+        // The API server requires template labels that match the selector.
+        "spec": {
+            "replicas": 2,
+            "selector": {"matchLabels": {"app": "web"}},
+            "template": {"metadata": {"labels": {"app": "web"}}},
+        },
     })
 }
 
@@ -725,7 +801,9 @@ fn answer(method: &str, path: &str, query: &str, body: &[u8], control: &Control)
     }
 }
 
-/// Waits until an open confirmation's text contains `wanted`, and returns it.
+/// Waits until an open confirmation's text contains `wanted` and its dialog is active, and
+/// returns the text. The last drawn frame alone can still show a dialog that is closing or not
+/// yet active, which `ui::Confirm` would not reach.
 async fn wait_for_confirmation(
     cx: &mut TestAppContext,
     t: &TestWorkspace,
@@ -738,8 +816,10 @@ async fn wait_for_confirmation(
             .filter_map(|e| e.label().map(str::to_owned))
             .find(|l| l.contains(wanted))
     };
-    cx.wait_for(t.window, WAIT, move |window, _| matching(window).is_some())
-        .await;
+    cx.wait_for(t.window, WAIT, move |window, cx| {
+        matching(window).is_some() && gpui_kit::component::WindowExt::has_active_dialog(window, cx)
+    })
+    .await;
     draw(cx, t);
     cx.update_window(t.window, |_, window, _| matching(window))
         .unwrap()
@@ -762,14 +842,16 @@ async fn wait_for_no_dialog(cx: &mut TestAppContext, t: &TestWorkspace) {
     draw(cx, t);
 }
 
-// covers UP-52, UP-53: a write the server answers with a conflict is not run again: a new
-// review opens, saying the object changed, and only its confirmation writes.
-#[gpui_kit::test]
-async fn a_conflict_opens_a_new_review(cx: &mut TestAppContext) {
-    let dir = tempfile::tempdir().unwrap();
-    let api = LocalApi::start(&[409]);
+/// Opens the confirmation of scaling `web` from 2 to 5 on a [`LocalApi`] answering `statuses`,
+/// through the menu's entry, clicked for real.
+async fn confirm_scaling_web(
+    cx: &mut TestAppContext,
+    dir: &std::path::Path,
+    statuses: &[u16],
+) -> (TestWorkspace, LocalApi) {
+    let api = LocalApi::start(statuses);
     let url = api.url.clone();
-    let t = open_workspace_with(cx, dir.path(), move |dir, _| {
+    let t = open_workspace_with(cx, dir, move |dir, _| {
         let path = dir.join("kubeconfig");
         std::fs::write(&path, kubeconfig_yaml(&[("kind-alpha", &url)])).unwrap();
         vec![path]
@@ -792,7 +874,10 @@ async fn a_conflict_opens_a_new_review(cx: &mut TestAppContext) {
     right_click(cx, &t, "web").await;
     let detail = t.detail(cx).unwrap();
     cx.wait_for(t.window, WAIT, move |_, cx| {
-        detail.read(cx).replicas() == Some(2)
+        detail
+            .read(cx)
+            .replicas(&flint_core::action_kinds::ScalePaths::built_in())
+            == Some(2)
     })
     .await;
 
@@ -813,6 +898,15 @@ async fn a_conflict_opens_a_new_review(cx: &mut TestAppContext) {
     let first = wait_for_confirmation(cx, &t, "Replicas: 2 to 5.").await;
     assert!(!first.contains("changed since"), "{first}");
     assert_eq!(api.patches(), 0, "nothing ran yet");
+    (t, api)
+}
+
+// covers UP-52, UP-53: a write the server answers with a conflict is not run again: a new
+// review opens, saying the object changed, and only its confirmation writes.
+#[gpui_kit::test]
+async fn a_conflict_opens_a_new_review(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, api) = confirm_scaling_web(cx, dir.path(), &[409]).await;
 
     wait_for_one_ok(cx, &t).await;
     t.click(cx, "ok");
@@ -834,6 +928,69 @@ async fn a_conflict_opens_a_new_review(cx: &mut TestAppContext) {
     .await;
     draw(cx, &t);
     assert!(!t.has_dialog(cx));
+}
+
+/// `web` as the detail pane fetches it once its review came back, with `replicas` and `uid`.
+fn refetch_web(cx: &mut TestAppContext, t: &TestWorkspace, replicas: u32, uid: &str) {
+    let mut web = deployment();
+    web["spec"]["replicas"] = replicas.into();
+    web["metadata"]["uid"] = uid.into();
+    show_fetched(cx, t, fetched(web));
+    draw(cx, t);
+}
+
+// covers UP-52, UP-53: a confirmation left open closes, unanswered, once a copy fetched after its
+// review shows another count or another object, and says why; a copy that still matches leaves
+// it open. Nothing is written.
+#[gpui_kit::test]
+async fn a_confirmation_closes_when_its_object_changes(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, api) = confirm_scaling_web(cx, dir.path(), &[]).await;
+    refetch_web(cx, &t, 2, "uid-web");
+    assert!(t.has_dialog(cx), "the same count keeps it open");
+    refetch_web(cx, &t, 3, "uid-web");
+    wait_for_no_dialog(cx, &t).await;
+    let said = t
+        .workspace
+        .read_with(cx, |ws, _| ws.action_error().map(str::to_owned));
+    assert_eq!(
+        said.as_deref(),
+        Some(
+            "web changed since it was reviewed, so its confirmation was closed. Nothing was applied."
+        )
+    );
+
+    // Back at the reviewed count, under another uid: the restart's confirmation closes too.
+    refetch_web(cx, &t, 2, "uid-web");
+    t.dispatch(cx, "workspace::RestartObject", Value::Null)
+        .unwrap();
+    wait_for_confirmation(cx, &t, "Replaces its pods").await;
+    refetch_web(cx, &t, 2, "uid-web-2");
+    wait_for_no_dialog(cx, &t).await;
+    assert_eq!(api.patches(), 0);
+}
+
+// covers UP-53: a restart's confirmation left open closes once a copy shows that a restart ran
+// since its review (another `restartedAt`); a status update leaves it open.
+#[gpui_kit::test]
+async fn a_restart_confirmation_closes_after_another_restart(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, api) = confirm_scaling_web(cx, dir.path(), &[]).await;
+    t.press(cx, "escape");
+    wait_for_no_dialog(cx, &t).await;
+    t.dispatch(cx, "workspace::RestartObject", Value::Null)
+        .unwrap();
+    wait_for_confirmation(cx, &t, "Replaces its pods").await;
+    let mut web = deployment();
+    web["status"] = json!({"observedGeneration": 4});
+    show_fetched(cx, &t, fetched(web.clone()));
+    draw(cx, &t);
+    assert!(t.has_dialog(cx), "a status update keeps it open");
+    web["spec"]["template"] =
+        json!({"metadata": {"annotations": {"kubectl.kubernetes.io/restartedAt": "t1"}}});
+    show_fetched(cx, &t, fetched(web));
+    wait_for_no_dialog(cx, &t).await;
+    assert_eq!(api.patches(), 0);
 }
 
 /// The text field that has focus.
@@ -1067,7 +1224,9 @@ async fn select_loaded(cx: &mut TestAppContext, t: &TestWorkspace, name: &str) {
     let detail = t.detail(cx).unwrap();
     cx.wait_for(t.window, WAIT, move |_, cx| {
         let d = detail.read(cx);
-        d.replicas().is_some() || d.node_cordoned().is_ok()
+        d.replicas(&flint_core::action_kinds::ScalePaths::built_in())
+            .is_some()
+            || d.node_cordoned().is_ok()
     })
     .await;
     draw(cx, t);
@@ -1537,4 +1696,38 @@ async fn a_yaml_edit_and_a_row_action_cannot_overlap(cx: &mut TestAppContext) {
         Err("web is being scaled".to_owned())
     );
     cx.update(|cx| release(&web_key(), cx));
+}
+
+// covers UP-53: a review that comes back once its row is no longer selected opens no
+// confirmation: nothing would watch its object while it stayed open.
+#[gpui_kit::test]
+async fn a_review_of_a_row_no_longer_selected_is_not_opened(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let api = LocalApi::start(&[]);
+    let t = connected(cx, dir.path(), &api).await;
+    open_deployments(cx, &t).await;
+    select_loaded(cx, &t, "web").await;
+    let workspace = t.workspace.clone();
+    cx.update_window(t.window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| {
+            request(ws, ResourceAction::RolloutRestart, window, cx);
+            ws.close_detail(window, cx);
+        })
+    })
+    .unwrap();
+    let ws = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        ws.read(cx).action_error().is_some()
+    })
+    .await;
+    draw(cx, &t);
+    assert!(!t.has_dialog(cx));
+    let why = t
+        .workspace
+        .read_with(cx, |ws, _| ws.action_error().map(str::to_owned));
+    assert_eq!(
+        why.as_deref(),
+        Some("web is no longer selected, so its review was not opened. Nothing was applied.")
+    );
+    assert_eq!(api.patches(), 0);
 }

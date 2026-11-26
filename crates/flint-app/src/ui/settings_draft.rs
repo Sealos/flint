@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use flint_core::Settings;
+use flint_core::settings::SettingsRevision;
 pub use flint_core::settings::{SettingsField as Field, SettingsWrite as Change};
 
 /// Text typed for a field that its setting does not accept.
@@ -59,10 +60,17 @@ impl SettingsDraft {
     /// file already has drops that field's edit, so changing a control back leaves nothing to
     /// save. It replaces a value rejected for the field.
     pub fn edit(&mut self, change: Change, file: &Arc<Settings>) {
+        self.edit_over(change, Some(file), file);
+    }
+
+    /// [`Self::edit`], where the value the file holds is not yet known from `file`: `holding` is
+    /// what it holds once writes the core acknowledged land, or `None` when that is unknown and
+    /// the edit is kept whatever its value.
+    pub fn edit_over(&mut self, change: Change, holding: Option<&Settings>, file: &Arc<Settings>) {
         self.start(file);
         let field = change.field();
         self.rejected.remove(&field);
-        if change.holds_in(file) {
+        if holding.is_some_and(|held| change.holds_in(held)) {
             self.edits.remove(&field);
         } else {
             self.edits.insert(field, change);
@@ -135,8 +143,20 @@ impl SettingsDraft {
 
     /// Whether `file` changed since the draft was started over it, while edits wait: the banner
     /// that offers Reload and Save anyway.
+    /// The proxy does not count: it is applied from the Network section on its own, never
+    /// through the draft, and Save leaves it as it is.
     pub fn changed_on_disk(&self, file: &Settings) -> bool {
-        self.base.as_deref().is_some_and(|base| base != file)
+        self.base.as_deref().is_some_and(|base| {
+            // An edit only to keys Flint ignores, or to comments, changes the file too. A proxy
+            // applied from the Network section rewrites it as well, so it is only compared while
+            // the proxy is unchanged.
+            if base.proxy == file.proxy {
+                return base != file || !base.file_stamp.same(&file.file_stamp);
+            }
+            let mut base = base.clone();
+            base.proxy = file.proxy.clone();
+            base != *file
+        })
     }
 
     /// Drops every edit and rejected value (Revert, Reload, Discard).
@@ -149,6 +169,30 @@ impl SettingsDraft {
     /// The edits to write (Save, Save anyway), in a stable order.
     pub fn edits(&self) -> Vec<Change> {
         self.edits.values().cloned().collect()
+    }
+
+    /// Whether saving would turn local cluster protection off: Save asks first, whatever the
+    /// file says now, so an edit made over another file never loosens it unasked.
+    pub fn loosens_protection(&self) -> bool {
+        matches!(
+            self.edits.get(&Field::ProtectLocalClusters),
+            Some(Change::ProtectLocalClusters { on: false, .. })
+        )
+    }
+
+    /// `edits` as the core is to write them: turning protection off carries `confirmed`, the
+    /// settings it was confirmed over, without which the core refuses it.
+    pub fn confirmed(edits: &[Change], confirmed: Option<&SettingsRevision>) -> Vec<Change> {
+        edits
+            .iter()
+            .map(|change| match change {
+                Change::ProtectLocalClusters { on: false, .. } => Change::ProtectLocalClusters {
+                    on: false,
+                    confirmed: confirmed.cloned(),
+                },
+                other => other.clone(),
+            })
+            .collect()
     }
 
     /// Drops `written`, now in the file, from the draft. An edit changed since is kept.

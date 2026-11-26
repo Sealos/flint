@@ -44,7 +44,7 @@ pub struct Kind {
 }
 
 /// An object of a kind, as the list finds it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Object {
     pub namespace: Option<Arc<str>>,
     pub name: Box<str>,
@@ -367,6 +367,49 @@ pub struct Search {
 }
 
 impl Search {
+    /// [`Search::run`]; with no query, the objects in `recent` (latest first) come first, then
+    /// the rest in index order. A recent object the index does not hold is skipped.
+    pub fn run_with_recent(
+        &mut self,
+        index: &Index,
+        query: &str,
+        recent: &[(KindId, Object)],
+    ) -> Found {
+        let mut found = self.run(index, query);
+        if recent.is_empty() || !query.chars().all(char::is_whitespace) {
+            return found;
+        }
+        let mut rank: HashMap<(&KindId, &Object), usize> = HashMap::new();
+        for (at, (kind, object)) in recent.iter().enumerate() {
+            rank.entry((kind, object)).or_insert(at);
+        }
+        let mut first: Vec<(usize, u32)> = Vec::new();
+        for (ix, item) in index.items.iter().enumerate() {
+            if let Some(object) = &item.object
+                && let Some(&at) = rank.get(&(&index.kinds[item.kind as usize].id, object))
+            {
+                first.push((at, ix as u32));
+            }
+        }
+        if first.is_empty() {
+            return found;
+        }
+        first.sort_unstable();
+        let listed: Vec<u32> = first.iter().map(|&(_, ix)| ix).collect();
+        let rest = (0..index.items.len() as u32).filter(|ix| !listed.contains(ix));
+        found.hits = listed
+            .iter()
+            .copied()
+            .chain(rest.take(RESULTS))
+            .take(RESULTS)
+            .map(|item| Hit {
+                item,
+                ranges: Vec::new(),
+            })
+            .collect();
+        found
+    }
+
     /// The items matching `query`, best first. With no query: the kinds, then the objects, in
     /// index order. With one: by score, so a closer match always wins. The name counts most: the
     /// query being the whole name, then its start, then found in the name alone (not across the
@@ -518,7 +561,7 @@ mod tests {
 
     use flint_core::{KindId, KindSnapshot, NavEntry, Row, SyncState};
 
-    use super::{Index, RESULTS, RunFinder, Search, is_separator};
+    use super::{Index, Object, RESULTS, RunFinder, Search, is_separator};
 
     fn entry(group: &str, plural: &str, kind: &str, label: &str) -> NavEntry {
         NavEntry {
@@ -713,6 +756,82 @@ mod tests {
             let fresh = Search::default().run(&index, query);
             assert_eq!(typed.run(&index, query), fresh, "{query}");
         }
+    }
+
+    // covers #313: typing more gives what a fresh search gives, over a few thousand objects
+    // (more than RESULTS match the early prefixes), typed letter by letter, then deleted.
+    #[test]
+    fn typing_more_gives_a_fresh_search_over_thousands_of_objects() {
+        let index = large(4000);
+        assert!(index.objects >= 4000);
+        for target in [
+            "payments-api-0007f-3",
+            "team-17/payments-api-001",
+            "kind 3 team-9 pay",
+            "kind7sx",
+            "zzz",
+        ] {
+            let mut typed = Search::default();
+            let mut queries: Vec<String> = (1..=target.len())
+                .filter(|&n| target.is_char_boundary(n))
+                .map(|n| target[..n].to_owned())
+                .collect();
+            let shorter: Vec<String> = queries.iter().rev().take(4).cloned().collect();
+            queries.extend(shorter);
+            queries.push(String::new());
+            for query in queries {
+                let fresh = Search::default().run(&index, &query);
+                assert_eq!(typed.run(&index, &query), fresh, "{target}: {query}");
+            }
+        }
+    }
+
+    // covers #313: with no query, the objects opened lately come first, latest first; typing
+    // lists what it matches, as before.
+    #[test]
+    fn recent_objects_come_first_while_nothing_is_typed() {
+        let index = sample();
+        let pod = |ns: &str, name: &str| {
+            (
+                KindId::pods(),
+                Object {
+                    namespace: Some(Arc::from(ns)),
+                    name: name.into(),
+                },
+            )
+        };
+        let recent = [
+            pod("kube-system", "coredns"),
+            pod("demo", "gone"),
+            pod("demo", "web-1"),
+        ];
+        let listed = |query: &str, recent: &[(KindId, Object)]| -> Vec<String> {
+            Search::default()
+                .run_with_recent(&index, query, recent)
+                .hits
+                .iter()
+                .map(|h| index.items[h.item as usize].text.to_string())
+                .collect()
+        };
+        let plain = listed("", &[]);
+        let first = listed("", &recent);
+        assert_eq!(
+            &first[..2],
+            ["kube-system/coredns".to_owned(), "demo/web-1".to_owned()]
+        );
+        // The rest keep their index order, nothing is listed twice or lost.
+        let mut rest: Vec<_> = plain
+            .iter()
+            .filter(|t| !first[..2].contains(t))
+            .cloned()
+            .collect();
+        assert_eq!(first[2..], rest[..]);
+        rest.extend(first[..2].iter().cloned());
+        rest.sort();
+        let mut all = plain.clone();
+        all.sort();
+        assert_eq!(rest, all);
+        assert_eq!(listed("web", &recent), listed("web", &[]));
     }
 
     // covers UP-31: at most RESULTS are listed, the best ones, with the count of all matches.

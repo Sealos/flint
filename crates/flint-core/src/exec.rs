@@ -1973,6 +1973,7 @@ mod tests {
                 cluster_sources: Default::default(),
                 user_sources: Default::default(),
                 blank: Vec::new(),
+                proxy_generation: 0,
             }
         }
 

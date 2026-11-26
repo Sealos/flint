@@ -64,6 +64,12 @@ async fn pods_with_detail(cx: &mut TestAppContext, t: &TestWorkspace) {
     assert!(t.detail(cx).is_some());
 }
 
+/// Forgets the places before now, the overview the cluster opened on among them, so a test
+/// of the lists starts with nothing to go back to.
+fn start_history_here(cx: &mut TestAppContext, t: &TestWorkspace) {
+    t.workspace.update(cx, |ws, _| ws.forget_places());
+}
+
 // covers UP-33: Tab moves focus sidebar, navigation, list, detail and around again; Shift-Tab
 // goes the other way. From nowhere in particular, Tab starts at the sidebar.
 #[gpui_kit::test]
@@ -295,12 +301,148 @@ async fn the_navigation_moves_opens_expands_and_collapses(cx: &mut TestAppContex
     assert_eq!(focus(cx, &t), Focus::Navigation);
 }
 
+// covers #313: Cmd-] returns to the place Go Back left, and a new navigation clears it.
+#[gpui_kit::test]
+async fn go_forward_returns_to_the_place_go_back_left(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    pods_with_detail(cx, &t).await;
+    assert!(!t.available(cx).contains(&"workspace::GoForward"));
+    t.dispatch(cx, "workspace::OpenView", json!({"kind": "services"}))
+        .unwrap();
+    t.feed_list(
+        cx,
+        objects(
+            KindId::new("", "services"),
+            &[("demo", "front", 0)],
+            flint_core::SyncState::Synced,
+            1,
+        ),
+    )
+    .await;
+    assert!(!t.available(cx).contains(&"workspace::GoForward"));
+    t.press_key_of(cx, "workspace::GoBack");
+    let list = t.list(cx).expect("a list is open");
+    assert_eq!(list.read_with(cx, |l, _| l.kind().clone()), KindId::pods());
+    t.feed_list(cx, pods(&[("demo", "api", 0), ("demo", "web", 0)]))
+        .await;
+    assert_eq!(t.selected(cx).as_deref(), Some("web"));
+    assert!(t.available(cx).contains(&"workspace::GoForward"));
+    t.press_key_of(cx, "workspace::GoForward");
+    let list = t.list(cx).expect("a list is open");
+    assert_eq!(
+        list.read_with(cx, |l, _| l.kind().clone()),
+        KindId::new("", "services")
+    );
+    assert!(!t.available(cx).contains(&"workspace::GoForward"));
+    t.feed_list(
+        cx,
+        objects(
+            KindId::new("", "services"),
+            &[("demo", "front", 0)],
+            flint_core::SyncState::Synced,
+            1,
+        ),
+    )
+    .await;
+    // Back again, then a new navigation: nothing is left to go forward to.
+    t.press_key_of(cx, "workspace::GoBack");
+    assert!(t.available(cx).contains(&"workspace::GoForward"));
+    t.dispatch(cx, "workspace::OpenView", json!({"kind": "secrets"}))
+        .unwrap();
+    assert!(!t.available(cx).contains(&"workspace::GoForward"));
+}
+
+// covers #313: an object opened by name that has not loaded yet is a place Go Back leaves
+// and Go Forward returns to, shown once it has loaded, as Go Back does the other way.
+#[gpui_kit::test]
+async fn go_forward_returns_to_an_object_opened_before_it_loaded(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    pods_with_detail(cx, &t).await;
+    t.dispatch(cx, "workspace::OpenView", json!({"kind": "services"}))
+        .unwrap();
+    t.feed_list(
+        cx,
+        objects(
+            KindId::new("", "services"),
+            &[("demo", "front", 0)],
+            flint_core::SyncState::Synced,
+            1,
+        ),
+    )
+    .await;
+    // The pods are not listed yet when "api" is asked for.
+    t.dispatch(
+        cx,
+        "workspace::OpenObject",
+        json!({"kind": "pods", "namespace": "demo", "name": "api"}),
+    )
+    .unwrap();
+    assert_eq!(t.selected(cx), None);
+    t.press_key_of(cx, "workspace::GoBack");
+    let list = t.list(cx).expect("a list is open");
+    assert_eq!(
+        list.read_with(cx, |l, _| l.kind().clone()),
+        KindId::new("", "services")
+    );
+    assert!(t.available(cx).contains(&"workspace::GoForward"));
+    t.press_key_of(cx, "workspace::GoForward");
+    t.feed_list(cx, pods(&[("demo", "api", 0), ("demo", "web", 0)]))
+        .await;
+    assert_eq!(t.selected(cx).as_deref(), Some("api"));
+    // And back the same way.
+    assert!(t.available(cx).contains(&"workspace::GoBack"));
+    t.press_key_of(cx, "workspace::GoBack");
+    let list = t.list(cx).expect("a list is open");
+    assert_eq!(
+        list.read_with(cx, |l, _| l.kind().clone()),
+        KindId::new("", "services")
+    );
+}
+
+// covers #313: the cluster overview is a place: Go Back reaches it from a list opened there,
+// and Go Forward returns from it.
+#[gpui_kit::test]
+async fn go_back_and_forward_reach_the_overview(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    cx.run_until_parked();
+    t.dispatch(cx, "workspace::OpenClusterOverview", json!(null))
+        .unwrap();
+    let overview = |cx: &mut TestAppContext| {
+        t.workspace
+            .read_with(cx, |ws, _| ws.dashboard_view().is_some())
+    };
+    assert!(overview(cx));
+    assert!(!t.available(cx).contains(&"workspace::GoBack"));
+    t.dispatch(cx, "workspace::OpenView", json!({"kind": "pods"}))
+        .unwrap();
+    assert!(!overview(cx));
+    assert!(t.available(cx).contains(&"workspace::GoBack"));
+    t.press_key_of(cx, "workspace::GoBack");
+    assert!(overview(cx));
+    assert!(t.list(cx).is_none());
+    assert!(!t.available(cx).contains(&"workspace::GoBack"));
+    assert!(t.available(cx).contains(&"workspace::GoForward"));
+    t.press_key_of(cx, "workspace::GoForward");
+    assert!(!overview(cx));
+    let list = t.list(cx).expect("a list is open");
+    assert_eq!(list.read_with(cx, |l, _| l.kind().clone()), KindId::pods());
+    // Forward from the list has nowhere to go; Back reaches the overview again.
+    assert!(!t.available(cx).contains(&"workspace::GoForward"));
+    t.press_key_of(cx, "workspace::GoBack");
+    assert!(overview(cx));
+}
+
 // covers UP-33: Cmd-[ goes back to the kind and object shown before, then has nowhere to go.
 #[gpui_kit::test]
 async fn go_back_returns_to_the_kind_and_object_shown_before(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     pods_with_detail(cx, &t).await;
+    start_history_here(cx, &t);
     assert!(!t.available(cx).contains(&"workspace::GoBack"));
     t.dispatch(cx, "workspace::OpenView", json!({"kind": "services"}))
         .unwrap();
@@ -754,6 +896,7 @@ async fn go_back_has_nowhere_to_go_from_the_place_remembered_last(cx: &mut TestA
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     t.open_pods(cx, &[("demo", "api", 0)]).await;
+    start_history_here(cx, &t);
     t.dispatch(
         cx,
         "workspace::OpenObject",
@@ -828,6 +971,7 @@ async fn go_back_with_nowhere_to_go_keeps_the_history(cx: &mut TestAppContext) {
     let t = open_workspace(cx, dir.path()).await;
     t.open_pods(cx, &[("demo", "api", 0), ("demo", "web", 0)])
         .await;
+    start_history_here(cx, &t);
     t.dispatch(
         cx,
         "workspace::OpenObject",

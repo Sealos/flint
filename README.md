@@ -447,9 +447,11 @@ cluster until you select one.
 
 Settings live in `~/Library/Application Support/Flint/settings.toml` (or in `$FLINT_CONFIG_DIR` if set). Flint >
 Settings… (Cmd-, on macOS, Ctrl-, on Linux) edits the appearance, desktop notifications, the default watch mode,
-the warning thresholds, and per-cluster overrides of thresholds, alerts and watch mode (Cluster overrides); its edits
-wait for Save, which writes only what you changed, and a threshold out of range blocks Save until it is fixed. Other
-keys are edited in the file:
+the warning thresholds, per-cluster overrides of thresholds, alerts and watch mode (Cluster overrides), the three log
+buffer limits, the extra kubeconfig files, the `path` and `helm` overrides and `protect_local_clusters`. Its edits
+wait for Save, which writes only what you changed, all in one save; a value out of range or a path that cannot be used
+blocks Save until it is fixed. Turning `protect_local_clusters` off asks for confirmation at Save; turning it on does
+not. Other keys are edited in the file:
 
 ```toml
 kubeconfig_paths = ["~/work/kubeconfig"]
@@ -464,7 +466,8 @@ watch_mode = "all"                # or "on_view"
 # log_total_mib = 512             # MiB all log sessions keep together
 
 # Proxy for cluster connections, for an app opened from Finder or the Dock, which sees no HTTPS_PROXY from your
-# shell. A cluster's own proxy-url wins. Read at startup. url is http://, socks5:// or socks5h://.
+# shell. A cluster's own proxy-url wins. url is http://, socks5:// or socks5h://. An edit here applies after a
+# restart.
 # [proxy]
 # url = "http://proxy.example.com:3128"
 # no_proxy = ["localhost", "10.0.0.0/8"]

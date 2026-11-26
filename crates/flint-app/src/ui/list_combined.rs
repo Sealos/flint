@@ -128,8 +128,9 @@ pub struct CombinedResourceList {
     pub(in super::super) label: String,
     /// Which members lack this kind, or can't be confirmed to serve it.
     kind_note: Option<String>,
-    /// Members that need a sign-in: their chip says so, and a click signs in.
+    /// Members that need a sign-in: their chip says so, and a click signs in through this.
     signed_out: HashSet<ClusterId>,
+    member_sign_in: Option<set_members::MemberSignIn>,
     latest: CombinedSource,
     /// The source being drawn and its view. Always replaced together: a [`RowRef`] means
     /// nothing in any other list.
@@ -216,6 +217,7 @@ impl CombinedResourceList {
             label,
             kind_note: None,
             signed_out: HashSet::new(),
+            member_sign_in: None,
             shown: source.clone(),
             latest: source,
             view: Arc::new(CombinedView::default()),
@@ -375,6 +377,20 @@ impl CombinedResourceList {
         self.recompute(cx);
     }
 
+    /// Shows another kind in this list, titled `label`, keeping what the person set up: the text
+    /// filter, the cluster chips, the grouping and the sort, which applies once the new kind
+    /// has its column.
+    /// What belongs to the old kind goes: its selection, its dashboard narrowing and its note.
+    pub fn switch_kind(&mut self, label: String, source: CombinedSource, cx: &mut Context<Self>) {
+        self.end_objects();
+        self.label = label;
+        self.kind_note = None;
+        self.hide_rows(cx);
+        self.remeasure = true;
+        self.set_source(source, cx);
+        cx.notify();
+    }
+
     pub fn set_namespaces(&mut self, namespaces: Vec<String>, cx: &mut Context<Self>) {
         if self.query.namespaces != namespaces {
             self.query.namespaces = namespaces;
@@ -491,7 +507,7 @@ impl CombinedResourceList {
         self.recompute(cx);
     }
 
-    /// Sorts by `column`: ascending, descending, then the default order.
+    /// Cycles the sort for `column`, starting descending for numeric columns.
     pub fn toggle_sort(&mut self, column: &ColumnKey, cx: &mut Context<Self>) {
         let Some(at) = self.latest.list.column_index(column) else {
             return;
@@ -499,7 +515,8 @@ impl CombinedResourceList {
         if self.latest.masked[at] {
             return;
         }
-        self.query.sort = model::next_sort(self.query.sort.as_ref(), column);
+        let numeric = list_model::is_numeric(&self.latest.columns[at]);
+        self.query.sort = model::next_sort(self.query.sort.as_ref(), column, numeric);
         self.recompute(cx);
     }
 
@@ -515,7 +532,16 @@ impl CombinedResourceList {
         let source = self.latest.clone();
         let sort = model::effective_sort(&source, self.query.sort.as_ref(), self.show_wide);
         let mut query = CombinedQuery {
-            sort: sort.clone(),
+            sort: sort.as_ref().and_then(|sort| {
+                let column = source.list.column_index(&sort.column)?;
+                Some(CombinedSort {
+                    column: sort.column.clone(),
+                    descending: list_model::descending_for_cells(
+                        &source.columns[column],
+                        sort.descending,
+                    ),
+                })
+            }),
             ..self.query.clone()
         };
         // A count covers every namespace, whatever the picker holds.
@@ -930,6 +956,7 @@ impl CombinedResourceList {
         let cluster = member.cluster().to_owned();
         h_flex()
             .id(SharedString::from(format!("group-{cluster}")))
+            .aria_label(format!("{} ({})", member.display_name(), group.count))
             .h(px(ROW_HEIGHT))
             .w_full()
             .px_2()
@@ -1119,6 +1146,7 @@ impl CombinedResourceList {
             header = header.child(
                 h_flex()
                     .id(SharedString::from(header_id(&column.key)))
+                    .aria_label(name.clone())
                     .h_full()
                     .px_2()
                     .gap_1()
@@ -1246,27 +1274,21 @@ impl CombinedResourceList {
                 let cluster = member.cluster().to_owned();
                 let active = chosen.contains(&cluster);
                 let signed_out = self.signed_out.contains(&cluster);
-                // A member already in the filter keeps its click for taking it out.
-                let signs_in = signed_out && !active;
                 h_flex()
                     .id(SharedString::from(format!("member-{cluster}")))
+                    .aria_label(member.display_name().to_owned())
                     .gap_1()
                     .px_1()
                     .rounded_sm()
                     .cursor_pointer()
                     .when(active, |el| el.bg(theme.table_active))
                     .hover(|el| el.bg(theme.table_hover))
-                    .when(!signs_in, |el| {
-                        el.on_click(registry::on_click_in(
-                            self.focus.clone(),
-                            ToggleClusterFilter {
-                                cluster: cluster.clone(),
-                            },
-                        ))
-                    })
-                    .when(signs_in, |el| {
-                        el.on_click(registry::on_click(set_members::sign_in_member(&cluster)))
-                    })
+                    .on_click(registry::on_click_in(
+                        self.focus.clone(),
+                        ToggleClusterFilter {
+                            cluster: cluster.clone(),
+                        },
+                    ))
                     .when_some(member.tag(), |el, tag| {
                         el.child(tag_dot(&cluster, tag, theme))
                     })
@@ -1278,7 +1300,7 @@ impl CombinedResourceList {
                             .child(member.row_count().to_string()),
                     )
                     .child(if signed_out {
-                        sign_in_chip(theme)
+                        self.render_member_sign_in(&cluster, theme)
                     } else {
                         state_chip(member.state(), self.shown.feeds[i], theme)
                     })
@@ -1303,8 +1325,32 @@ impl CombinedResourceList {
             }))
     }
 
-    /// Marks the members that need a sign-in on their chips.
-    pub fn set_signed_out(&mut self, members: HashSet<ClusterId>, cx: &mut Context<Self>) {
+    /// A signed-out member's "Sign-in needed", which signs it in when clicked: on its own, so
+    /// the chip's name and count still toggle the filter.
+    fn render_member_sign_in(&self, cluster: &str, theme: &Theme) -> AnyElement {
+        let chip = sign_in_chip(theme);
+        match &self.member_sign_in {
+            Some(sign_in) => div()
+                .id(SharedString::from(format!("member-sign-in-{cluster}")))
+                .cursor_pointer()
+                .aria_label(sign_in.label(cluster))
+                .child(chip)
+                // not-an-action: the click is the consent for one sign-in run.
+                .on_click(sign_in.on_click(cluster))
+                .test_support()
+                .into_any_element(),
+            None => chip,
+        }
+    }
+
+    /// Marks the members that need a sign-in on their chips, whose Sign in runs `sign_in`.
+    pub(in super::super) fn set_signed_out(
+        &mut self,
+        members: HashSet<ClusterId>,
+        sign_in: set_members::MemberSignIn,
+        cx: &mut Context<Self>,
+    ) {
+        self.member_sign_in = Some(sign_in);
         if self.signed_out != members {
             self.signed_out = members;
             cx.notify();

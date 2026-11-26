@@ -34,6 +34,8 @@ use serde::{Deserialize, Deserializer, de};
 use super::focus::cycle_focus_within;
 use super::registry::{Bind, OnView, OpenObject, OpenView};
 
+#[path = "cluster_card.rs"]
+pub(in crate::ui) mod cluster_card;
 #[path = "dashboard_feed.rs"]
 mod feed;
 #[path = "dashboard_overview.rs"]
@@ -49,6 +51,9 @@ mod set_state;
 )]
 #[path = "sparkline.rs"]
 mod sparkline;
+#[cfg(any(test, feature = "automation"))]
+#[path = "dashboard_state.rs"]
+mod state;
 #[path = "dashboard_tiles.rs"]
 mod tiles;
 

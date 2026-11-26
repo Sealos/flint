@@ -43,6 +43,8 @@ mod helm;
 mod history;
 mod keep_watching;
 mod keep_watching_lists;
+mod member_sign_in;
+mod proxy_change;
 mod running_set;
 mod selected_retry;
 mod telemetry;
@@ -106,6 +108,10 @@ pub(crate) struct Cluster {
     /// re-pointed or otherwise changed, one back after being removed) has a new one. Front ends
     /// tell a cluster that started over by it, whatever lists they skipped (#255).
     generation: u64,
+    /// The proxy setting generation of the load that made this slot
+    /// ([`LoadedKubeconfig::proxy_generation`]). Behind the setting in use, the slot is held
+    /// until a load under that setting replaces it ([`ClusterManager::held`]).
+    proxy_generation: u64,
     /// Kept while the cluster is not active (ADR-0008).
     discovery: Option<Arc<ClusterDiscovery>>,
     discovering: bool,
@@ -179,6 +185,7 @@ impl Cluster {
             awaits_selection: false,
             reconnect: false,
             generation: 0,
+            proxy_generation: crate::connection::proxy::generation(),
             discovery: None,
             discovering: false,
             discovery_task: None,
@@ -328,6 +335,16 @@ enum ReadFor {
 }
 
 enum Internal {
+    /// Put a new proxy setting in use, then say what that did ([`crate::CoreHandle::apply_proxy`]).
+    ApplyProxy {
+        setting: settings::ProxySetting,
+        expected: settings::ProxySetting,
+        reply: tokio::sync::oneshot::Sender<Result<crate::handle::ProxyApplied, String>>,
+    },
+    /// Time to report the proxy change `change`, whatever has not settled yet.
+    ProxyReportDue {
+        change: u64,
+    },
     /// Reload kubeconfig, then say so ([`crate::CoreHandle::reload_kubeconfig`]).
     ReloadKubeconfig {
         reply: tokio::sync::oneshot::Sender<bool>,
@@ -335,7 +352,7 @@ enum Internal {
     /// Write settings, then say how ([`crate::CoreHandle::write_settings`]).
     WriteSettings {
         writes: Vec<settings::SettingsWrite>,
-        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+        reply: tokio::sync::oneshot::Sender<Result<Arc<Settings>, String>>,
     },
     Connected {
         cluster: ClusterId,
@@ -375,6 +392,11 @@ enum Internal {
     /// The credential of a member's connection made under consent, attempt `attempt`, failed
     /// or was refused.
     MemberCredentialFailed {
+        cluster: ClusterId,
+        attempt: u64,
+    },
+    /// A member signed in once from the set view needed its sign-in to run again.
+    MemberSignInSpent {
         cluster: ClusterId,
         attempt: u64,
     },
@@ -549,6 +571,8 @@ pub(crate) struct ClusterManager {
     active: Option<ClusterId>,
     /// Clusters kept running beside the active one ([`Command::SetRunningSet`]).
     members: HashMap<ClusterId, Member>,
+    /// Sign-ins of members asked for from the set view, until their next attempt starts.
+    signing_in: HashMap<ClusterId, member_sign_in::PendingSignIn>,
     /// When members' background connection attempts may start.
     schedule: Schedule<ClusterId>,
     /// Automatic retries of the selected cluster.
@@ -592,6 +616,8 @@ pub(crate) struct ClusterManager {
     /// Clusters watched in the background, on connections of their own.
     keep: keep_watching::KeepWatch,
     forwards: forwards::Forwards,
+    /// The last proxy change saved from Settings, and what it still waits for.
+    proxy_change: proxy_change::ProxyChange,
 }
 
 impl ClusterManager {
@@ -640,6 +666,7 @@ impl ClusterManager {
             clusters: Vec::new(),
             active: None,
             members: HashMap::new(),
+            signing_in: HashMap::new(),
             schedule: Schedule::default(),
             retries: Default::default(),
             disconnects: Default::default(),
@@ -662,6 +689,7 @@ impl ClusterManager {
             holds: DefinitionHolds::default(),
             keep: Default::default(),
             forwards: Default::default(),
+            proxy_change: Default::default(),
             reader: KubeconfigReader::default(),
             stalled_on: None,
             read_seq: 0,
@@ -703,6 +731,7 @@ impl ClusterManager {
             self.sync_forwards();
             self.sync_selected_retry();
             self.sync_telemetry();
+            self.sync_proxy_report();
         }
     }
 
@@ -855,6 +884,17 @@ impl ClusterManager {
                 let _ = self
                     .internal_tx
                     .send(Internal::WriteSettings { writes, reply });
+            }
+            Request::ApplyProxy {
+                setting,
+                expected,
+                reply,
+            } => {
+                let _ = self.internal_tx.send(Internal::ApplyProxy {
+                    setting,
+                    expected,
+                    reply,
+                });
             }
             Request::ActivatePinned {
                 cluster,
@@ -1034,6 +1074,14 @@ impl ClusterManager {
             }
             Request::CheckMember { member, reply } => {
                 let _ = reply.send(self.member_changed(&member));
+            }
+            Request::SignInMember {
+                member,
+                definition,
+                shown,
+                reply,
+            } => {
+                let _ = reply.send(self.sign_in_member(&member, definition, shown));
             }
             Request::HelmPin { cluster, reply } => {
                 let _ = reply.send(self.helm_pin(&cluster));
@@ -1502,7 +1550,12 @@ impl ClusterManager {
             &self.settings,
             crate::connection::proxy::setting_unreadable_at_startup(),
         );
-        if *self.settings == settings && self.settings_error == error {
+        // The same settings from a file edited since are new too: a confirmation asked over the
+        // file as it was would not hold for it.
+        if *self.settings == settings
+            && self.settings.file_stamp.same(&settings.file_stamp)
+            && self.settings_error == error
+        {
             return;
         }
         self.settings = Arc::new(settings);
@@ -1535,7 +1588,22 @@ impl ClusterManager {
                 let applied = self.reload_kubeconfig().await;
                 let _ = reply.send(applied);
             }
+            Internal::ApplyProxy {
+                setting,
+                expected,
+                reply,
+            } => {
+                let result = self.apply_proxy(setting, expected).await;
+                let _ = reply.send(result);
+            }
+            Internal::ProxyReportDue { change } => self.proxy_report_due(change),
             Internal::WriteSettings { writes, reply } => {
+                let unprotect = writes.iter().any(|write| {
+                    matches!(
+                        write,
+                        settings::SettingsWrite::ProtectLocalClusters { on: false, .. }
+                    )
+                });
                 // One save for all of them: never some written without the others, and the
                 // settings applied once, so no in-between state takes effect.
                 let result = self
@@ -1543,7 +1611,14 @@ impl ClusterManager {
                         settings::SettingsWrite::write_all(dir, &writes)
                     })
                     .await;
-                let _ = reply.send(result);
+                // Turning protection off refused, perhaps over a file changed since it was
+                // confirmed: read it now, so the confirmation asked again is over the file as is.
+                if unprotect && result.is_err() {
+                    self.reload_settings().await;
+                }
+                // Written, the settings as saved: what the file holds now, outside edits
+                // included, which the front end may not have heard of yet.
+                let _ = reply.send(result.map(|()| self.settings.clone()));
             }
             Internal::LateRead { paths, seq, read } => {
                 let in_order = self.saw_read(&paths, Some(&read));
@@ -1668,6 +1743,9 @@ impl ClusterManager {
                 // Made under consent in the background: like a kept feed, its first failure
                 // waits for a sign-in, with no retry.
                 let unattended = slot.access.unattended() && !active;
+                // Made by one sign-in from the set view: an ended lease means it was used up, or
+                // a file change stopped it, and the member waits for a sign-in, with no retry.
+                let once = slot.access.signed_in_once_access() && !active;
                 // Dropped either way: the load that ends the pause connects again.
                 if paused {
                     slot.access.revoke();
@@ -1685,10 +1763,11 @@ impl ClusterManager {
                 // Its lease ended while it was being made (switched away and back), so what it
                 // returned, an error included, is no answer about the cluster. It is dropped, and
                 // the current selection connects anew under a new grant.
-                if (lease_ended && !unattended)
-                    || result
-                        .as_ref()
-                        .is_ok_and(|(connection, _)| connection.credential.spent())
+                if (lease_ended && !unattended && !once)
+                    || (!once
+                        && result
+                            .as_ref()
+                            .is_ok_and(|(connection, _)| connection.credential.spent()))
                 {
                     self.drop_to_reconnect(&cluster);
                     let now = Instant::now();
@@ -1702,13 +1781,18 @@ impl ClusterManager {
                     return;
                 }
                 let result = match result {
+                    Ok(_) if lease_ended && once => Err(running_set::sign_in_spent()),
                     Ok(_) if lease_ended => Err(running_set::consent_ended()),
+                    // Spent while connecting, as an ended lease is.
+                    Ok((connection, _)) if once && connection.credential.spent() => {
+                        Err(running_set::sign_in_spent())
+                    }
                     result => result,
                 };
                 let connected = result.is_ok();
                 let outcome = match &result {
                     Ok(_) => AttemptOutcome::Connected,
-                    Err(error) if rejected || unattended => {
+                    Err(error) if rejected || unattended || once => {
                         AttemptOutcome::AuthRejected(error.clone())
                     }
                     Err(error) => AttemptOutcome::Failed(error.clone()),
@@ -1780,7 +1864,10 @@ impl ClusterManager {
             // The loop's sync starts what is due.
             Internal::KeepWatchRetry => {}
             Internal::MemberCredentialFailed { cluster, attempt } => {
-                self.member_credential_failed(&cluster, attempt);
+                self.member_credential_failed(&cluster, attempt, running_set::consent_ended());
+            }
+            Internal::MemberSignInSpent { cluster, attempt } => {
+                self.member_credential_failed(&cluster, attempt, running_set::sign_in_spent());
             }
             Internal::Discovered {
                 cluster,
@@ -2366,9 +2453,14 @@ impl ClusterManager {
         }
     }
 
-    /// Whether `id`'s slot is only kept because a file that defined it can't be parsed.
+    /// Whether `id`'s slot is only kept because a file that defined it can't be parsed, or was
+    /// loaded under a proxy setting that is no longer in use: its route is not the one a new
+    /// connection would take, so nothing new starts on it until a load replaces it.
     fn held(&self, id: &str) -> bool {
         self.held.contains(id)
+            || self
+                .cluster(id)
+                .is_some_and(|slot| slot.proxy_generation != crate::connection::proxy::generation())
     }
 
     /// Whether `id` is listed but a file that can't be parsed could still change its definition:
@@ -2574,6 +2666,14 @@ impl ClusterManager {
             self.drop_spent_connections();
         }
         self.apply_member(&id, MemberEvent::Activated, Instant::now());
+        // A member signed in once from the set view connects anew as the selected cluster: the
+        // click covered one start in the background, and nothing more.
+        if self
+            .cluster(&id)
+            .is_some_and(|slot| slot.access.signed_in_once_access())
+        {
+            self.reconnect_selected(&id);
+        }
         self.ensure_connected(&id);
         // A connected cluster whose discovery failed gets another try when selected.
         if let Some(slot) = self.cluster_mut(&id)
@@ -2662,16 +2762,20 @@ impl ClusterManager {
             return;
         }
         self.next_attempt += 1;
-        // A member in the background signs in under its keep-watching consent, if it has one,
-        // and never with a prompt.
-        let consent = (role == Role::Background && self.members.contains_key(id))
+        // A member in the background signs in once if the person just asked for it from the set
+        // view. Otherwise it signs in under its keep-watching consent, if it has one, and never
+        // with a prompt.
+        let once = self.take_member_sign_in(id, role, attempt);
+        let consent = (once.is_none() && role == Role::Background && self.members.contains_key(id))
             .then(|| self.member_consent(id))
             .flatten();
-        let access = match consent {
-            Some(consent) => self.member_access(id, attempt, consent),
-            None => CredentialAccess::new(Arc::new(ForegroundOnly), role),
+        let access = match (once, consent) {
+            (Some(once), _) => once,
+            (None, Some(consent)) => self.member_access(id, attempt, consent),
+            (None, None) => CredentialAccess::new(Arc::new(ForegroundOnly), role),
         };
-        let no_prompt = access.unattended().then(|| {
+        // A kept connection's program and one signed in once from the set view get no input.
+        let no_prompt = access.takes_no_input().then(|| {
             let mut merged = kubeconfig.merged.clone();
             cluster::disable_interactive_exec(&mut merged);
             merged
@@ -2704,11 +2808,16 @@ impl ClusterManager {
         let rejections = internal.clone();
         let attempt_task = tokio::spawn(async move {
             let merged = no_prompt.as_ref().unwrap_or(&kubeconfig.merged);
-            let result = cluster::connect_gated_and_check_with_policy(
-                merged,
-                &name,
-                CONNECT_TIMEOUT,
-                &access,
+            // Under the proxy setting this load chose its routes with, whatever is put in use
+            // while it runs.
+            let result = crate::connection::proxy::pinned_to(
+                kubeconfig.proxy_generation,
+                cluster::connect_gated_and_check_with_policy(
+                    merged,
+                    &name,
+                    CONNECT_TIMEOUT,
+                    &access,
+                ),
             )
             .await;
             result.map_err(|e| {
@@ -2788,7 +2897,7 @@ impl ClusterManager {
     async fn reload_activity(&mut self) {
         let dir = self.config.config_dir.clone();
         let read = tokio::task::spawn_blocking(move || {
-            (activity::read(&dir), activity::ServerKeys::open(&dir))
+            (activity::read(&dir), activity::ServerKeys::read(&dir))
         });
         if let Ok((records, keys)) = read.await {
             self.emit(Event::AgentActivity(Arc::new(records), keys));
@@ -2945,7 +3054,10 @@ impl ClusterManager {
             let fingerprint = cluster::context_fingerprint(&loaded.merged, &info.name);
             let was_paused = paused.contains(&info.name);
             let slot = match old.remove(&info.name) {
-                Some(mut existing) if existing.fingerprint == fingerprint => {
+                Some(mut existing)
+                    if existing.fingerprint == fingerprint
+                        && existing.proxy_generation == loaded.proxy_generation =>
+                {
                     // Back unchanged. No connection starts while paused, so start it now.
                     if was_paused && self.active.as_deref() == Some(&info.name) {
                         changed_active = true;
@@ -2954,9 +3066,9 @@ impl ClusterManager {
                     existing
                 }
                 Some(old) => {
-                    // The context's connection details changed: the client is stale. The fresh
-                    // slot has attempt 0, which no in-flight attempt uses. The front end's
-                    // namespace filter still applies.
+                    // The context's connection details changed, or the proxy setting it was
+                    // loaded under: the client is stale. The fresh slot has attempt 0, which no
+                    // in-flight attempt uses. The front end's namespace filter still applies.
                     if self.active.as_deref() == Some(&info.name) {
                         changed_active = true;
                         if self.retries.retry.has_retried(&info.name, old.generation) {
@@ -2969,6 +3081,7 @@ impl ClusterManager {
                     fresh.namespace_filter = old.namespace_filter.clone();
                     fresh.update_scope();
                     fresh.generation = self.next_generation();
+                    fresh.proxy_generation = loaded.proxy_generation;
                     // A slot that waits for a new selection goes on waiting through later loads.
                     if old.awaits_selection {
                         fresh.awaits_selection = true;
@@ -2987,6 +3100,7 @@ impl ClusterManager {
                     let mut fresh =
                         Cluster::new(info.clone(), fingerprint, &self.hubs, &self.engine_config);
                     fresh.generation = self.next_generation();
+                    fresh.proxy_generation = loaded.proxy_generation;
                     fresh
                 }
             };
@@ -3074,6 +3188,14 @@ impl ClusterManager {
             paths: path_exist,
         };
         self.emit(Event::ClustersChanged(Arc::new(snapshot)));
+        // A read that began before the proxy setting changed: its slots stay held, and the files
+        // are read again under the setting in use.
+        if loaded.proxy_generation != crate::connection::proxy::generation() {
+            let _ = self.internal_tx.send(Internal::FilesChanged(Changed {
+                kubeconfig: true,
+                ..Changed::default()
+            }));
+        }
 
         if let Some(active) = self.active.clone() {
             if old.contains_key(&active) {
@@ -3688,6 +3810,44 @@ mod tests {
         assert_eq!(manager.write_gate("dev").err(), protected);
         manager.reload_settings().await;
         assert_eq!(manager.write_gate("dev").err(), protected);
+    }
+
+    // covers UP-127: an outside edit to a key Flint ignores reaches the front end as new
+    // settings, so the confirmation asked again is over the file as it is and can go through.
+    #[tokio::test]
+    async fn an_edit_to_an_ignored_key_is_reported_as_new_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::events::channel();
+        let config = CoreConfig {
+            config_dir: dir.path().to_owned(),
+            settings: Settings::default(),
+            settings_error: None,
+            kubeconfig_base: kubeconfig_file(dir.path()),
+            home: None,
+            watch_files: false,
+            watch_timing: Default::default(),
+        };
+        let mut manager = ClusterManager::new(
+            config,
+            events,
+            HubRegistry::default(),
+            SessionUnlocks::default(),
+        );
+        settings::set_protect_local_clusters(dir.path(), true, None).unwrap();
+        manager.reload_settings().await;
+        let shown = manager.settings.clone();
+        let file = dir.path().join(settings::SETTINGS_FILE);
+        let mut text = std::fs::read_to_string(&file).unwrap();
+        text.push_str("\nsome_future_key = 1\n");
+        std::fs::write(&file, text).unwrap();
+
+        manager.reload_settings().await;
+        assert!(!Arc::ptr_eq(&shown, &manager.settings), "reported again");
+        let stale = settings::SettingsRevision::of(&shown);
+        assert!(settings::set_protect_local_clusters(dir.path(), false, Some(stale)).is_err());
+        let now = settings::SettingsRevision::of(&manager.settings);
+        let off = settings::set_protect_local_clusters(dir.path(), false, Some(now)).unwrap();
+        assert!(!off.protect_local_clusters);
     }
 
     // covers UP-54: a running port-forward stops being allowed once its context is held

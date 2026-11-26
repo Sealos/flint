@@ -24,14 +24,12 @@ use flint_core::handle::{AdmittedMember, LeftOutMember, MemberReport, OpenedSet}
 use flint_core::settings::{ClusterPin, Settings, SettingsError};
 use flint_core::{ClusterId, ClusterSummary, KindId, KindSnapshot, NavEntry, SyncState};
 use gpui_kit::base::TestSupportExt as _;
-use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Theme,
-    h_flex, v_flex,
+    Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Theme, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -49,8 +47,10 @@ use super::super::registry::{
     ShowClusterSetList, ToggleClusterPicking, TogglePickedCluster,
 };
 use super::super::set_members::{
-    self, MemberAction, MemberCause, MemberLine, failed_cause, paused_text, refusal_cause,
+    self, MemberAction, MemberCause, MemberLine, MemberSignIn, SignInTarget, failed_cause,
+    paused_text, refusal_cause,
 };
+use super::super::validated_field::ValidatedField;
 #[cfg(any(test, feature = "automation"))]
 use super::super::view_state::{ClusterSetsState, OpenSetState, SetGroupState, SetMemberState};
 #[cfg(any(test, feature = "automation"))]
@@ -282,32 +282,6 @@ struct PendingOpen {
 struct SavedOpening {
     name: String,
     id: String,
-}
-
-/// The name field of the Rename Cluster Set dialog.
-struct SetNameField {
-    input: Entity<InputState>,
-    error: Option<String>,
-}
-
-impl Render for SetNameField {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let danger = cx.theme().danger;
-        v_flex()
-            .gap_1()
-            .child(Input::new(&self.input).id("rename-set-input").small())
-            .when_some(self.error.clone(), |el, error| {
-                el.child(
-                    div()
-                        .id("rename-set-error")
-                        .aria_label(error.clone())
-                        .text_xs()
-                        .text_color(danger)
-                        .child(error)
-                        .test_support(),
-                )
-            })
-    }
 }
 
 /// Whether a click on a cluster row chooses it rather than connecting to it.
@@ -621,10 +595,8 @@ impl Workspace {
         };
         let name = action.name.clone();
         let input = cx.new(|cx| InputState::new(window, cx).default_value(name.clone()));
-        let field = cx.new(|_| SetNameField {
-            input: input.clone(),
-            error: None,
-        });
+        let field = ValidatedField::new(input, "rename-set-input", "rename-set-error", cx);
+        let focused = field.clone();
         let dialog = DialogText {
             title: format!("Rename {name}"),
             text: "A new name for this saved set. Its clusters stay the same.".to_owned(),
@@ -636,24 +608,25 @@ impl Workspace {
         let view = cx.weak_entity();
         let content = field.clone().into();
         confirm::open_with(window, cx, dialog, Some(content), move |window, cx| {
-            let typed = field.read(cx).input.read(cx).value().trim().to_owned();
-            let Ok(problem) =
-                view.read_with(cx, |ws, _| rename_problem(&ws.sets.saved, &id, &typed))
-            else {
-                return true;
+            // `Some(None)`: the workspace is gone, and the dialog just closes.
+            let checked = ValidatedField::checked(&field, cx, |typed, cx| {
+                let typed = typed.trim().to_owned();
+                match view.read_with(cx, |ws, _| rename_problem(&ws.sets.saved, &id, &typed)) {
+                    Ok(Some(error)) => Err(error),
+                    Ok(None) => Ok(Some(typed)),
+                    Err(_) => Ok(None),
+                }
+            });
+            let typed = match checked {
+                Some(Some(typed)) => typed,
+                Some(None) => return true,
+                None => return false,
             };
-            if let Some(error) = problem {
-                field.update(cx, |field, cx| {
-                    field.error = Some(error);
-                    cx.notify();
-                });
-                return false;
-            }
             let id = id.clone();
             let _ = view.update(cx, |ws, cx| ws.rename_set(id, typed, window, cx));
             true
         });
-        input.update(cx, |input, cx| input.focus(window, cx));
+        ValidatedField::focus(&focused, window, cx);
     }
 
     /// The id of the saved set shown as `name`.
@@ -858,7 +831,7 @@ impl Workspace {
         if self.sets.leave_confirmed || !self.sets.is_unsaved() {
             return false;
         }
-        if window.has_active_dialog(cx) {
+        if confirm::any_open(window, cx) {
             return true;
         }
         let dialog = DialogText {
@@ -1018,10 +991,10 @@ impl Workspace {
         self.sets.running = None;
         self.close_list(cx);
         self.show_set(
-            label,
-            members,
+            (label, members),
             (KindId::pods(), "Pods".to_owned()),
             Gone::default(),
+            None,
             window,
             cx,
         );
@@ -1039,10 +1012,10 @@ impl Workspace {
     /// empty and they keep their state.
     pub(super) fn show_set(
         &mut self,
-        label: String,
-        members: Vec<AdmittedMember>,
+        (label, members): (String, Vec<AdmittedMember>),
         (kind, kind_label): (KindId, String),
         gone: Gone,
+        reuse: Option<Entity<CombinedResourceList>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1079,7 +1052,14 @@ impl Workspace {
         let source = self.combined_source(&snapshots, cx);
         let title = format!("{kind_label} · {label}");
         let shown_kind = kind_label;
-        let list = cx.new(|cx| CombinedResourceList::new(title, source, Vec::new(), window, cx));
+        // A kind change keeps the list, and with it the sort, filter, chips and grouping.
+        let list = match reuse {
+            Some(list) => {
+                list.update(cx, |list, cx| list.switch_kind(title, source, cx));
+                list
+            }
+            None => cx.new(|cx| CombinedResourceList::new(title, source, Vec::new(), window, cx)),
+        };
         let events = cx.subscribe_in(&list, window, Self::on_combined_event);
         let feeds = subscriptions
             .into_iter()
@@ -1290,6 +1270,67 @@ impl Workspace {
     }
 
     /// Why a row of `cluster` cannot be opened or acted on now, if so.
+    /// What each member's Sign in is drawn for now ([`MemberSignIn`]).
+    pub(super) fn member_sign_in(&self, run: &RunningSet, cx: &Context<Self>) -> MemberSignIn {
+        let model = self.model.read(cx);
+        let active = model.active_cluster().map(|c| c.info.name.clone());
+        let targets = run
+            .members
+            .iter()
+            .map(|member| {
+                let view = model.keep_watching(member.context());
+                // The selected member signs in as the selected cluster, through selecting it.
+                let selected = active.as_deref() == Some(member.context());
+                let target = SignInTarget {
+                    member: member.clone(),
+                    definition: view.and_then(|view| view.definition),
+                    shown: view.and_then(|view| view.shown_sign_in),
+                    in_place: !selected
+                        && view.is_none_or(|view| {
+                            view.sign_in != flint_core::keep_watching::BackgroundSignIn::Unavailable
+                        }),
+                };
+                (member.context().to_owned(), target)
+            })
+            .collect();
+        MemberSignIn::new(cx.entity().downgrade(), targets)
+    }
+
+    /// For a click on a signed-out member's Sign in alone ([`MemberSignIn`]): runs its sign-in
+    /// once, now, for the member as the set admitted it and the definitions its control was
+    /// drawn with. The core refuses it if any of them changed since; why shows in the set's
+    /// error. Its rows come back with the member's next status.
+    pub(in super::super) fn sign_in_set_member(
+        &mut self,
+        target: SignInTarget,
+        cx: &mut Context<Self>,
+    ) {
+        let in_set = self.sets.running.as_ref().is_some_and(|run| {
+            run.members
+                .iter()
+                .any(|m| m.context() == target.member.context())
+        });
+        if !in_set {
+            return;
+        }
+        let asked = self.model.read(cx).core().sign_in_member(
+            &target.member,
+            target.definition,
+            target.shown,
+        );
+        self.sets.error = None;
+        cx.spawn(async move |ws, cx| {
+            if let Err(why) = asked.await {
+                let _ = ws.update(cx, |ws, cx| {
+                    ws.sets.error = Some(why);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
     pub(super) fn set_row_refusal(&self, cluster: &str, cx: &App) -> Option<String> {
         let names = self.cluster_names(cx);
         let shown = names.exact(cluster);
@@ -1460,6 +1501,8 @@ impl Workspace {
             self.clear_action_error(cx);
             self.detail = None;
             self._detail_subscriptions.clear();
+            // The pane that watched a confirmation's object is gone with its row.
+            self.close_changed_confirmations(window, cx);
             let focus = list.read(cx).focus_handle().clone();
             window.focus(&focus, cx);
             release_unfocused_input(window, cx);
@@ -1518,7 +1561,7 @@ impl Workspace {
         let object = ObjectRef {
             cluster: row.cluster,
             kind: run.kind.clone(),
-            kind_label: list.read(cx).label.clone(),
+            kind_label: run.kind_label.clone(),
             namespace: row.namespace,
             name: row.name,
             uid: row.uid,
@@ -1550,25 +1593,29 @@ impl Workspace {
             view.set_connection_guards(guards);
             view
         });
-        self._detail_subscriptions = vec![cx.subscribe_in(
-            &detail,
-            window,
-            move |this, _, event, window, cx| match event {
-                DetailEvent::Close => this.close_detail(window, cx),
-                DetailEvent::OpenLogs(request, focus) => {
-                    let focus = takes_focus(focus, window, cx);
-                    this.open_logs(request.clone(), focus, window, cx)
-                }
-                DetailEvent::OpenShell(request, focus) => {
-                    let focus = takes_focus(focus, window, cx);
-                    this.open_shell(request.clone(), focus, window, cx)
-                }
-                DetailEvent::Refused(why) => this.refuse(why.clone(), cx),
-                DetailEvent::ConfirmWrite(review, reviewed_on) => {
-                    this.confirm_detail_write(review, reviewed_on.clone(), window, cx)
-                }
-            },
-        )];
+        let on_change = Self::close_confirmations_on_change(&detail, window, cx);
+        self._detail_subscriptions = vec![
+            on_change,
+            cx.subscribe_in(
+                &detail,
+                window,
+                move |this, _, event, window, cx| match event {
+                    DetailEvent::Close => this.close_detail(window, cx),
+                    DetailEvent::OpenLogs(request, focus) => {
+                        let focus = takes_focus(focus, window, cx);
+                        this.open_logs(request.clone(), focus, window, cx)
+                    }
+                    DetailEvent::OpenShell(request, focus) => {
+                        let focus = takes_focus(focus, window, cx);
+                        this.open_shell(request.clone(), focus, window, cx)
+                    }
+                    DetailEvent::Refused(why) => this.refuse(why.clone(), cx),
+                    DetailEvent::ConfirmWrite(review, reviewed_on) => {
+                        this.confirm_detail_write(review, reviewed_on.clone(), window, cx)
+                    }
+                },
+            ),
+        ];
         self.detail = Some(detail);
         self.list_in_front = false;
         release_unfocused_input(window, cx);
@@ -1655,15 +1702,27 @@ impl Workspace {
                 .into_any_element(),
         };
         // No member can show rows: the member block replaces the chips, the empty list and notes.
-        let body = self
-            .set_empty_state(run, cx)
-            .map_or(body, |lines| self.render_empty_members(lines, theme));
+        let body = self.set_empty_state(run, cx).map_or(body, |lines| {
+            let sign_in = self.member_sign_in(run, cx);
+            self.render_empty_members(lines, &sign_in, theme)
+        });
         Some(
             v_flex()
                 .id("cluster-set-view")
                 .flex_1()
                 .min_w_0()
                 .h_full()
+                .child(self.render_set_header(
+                    &run.label,
+                    if run.dashboard.is_some() {
+                        "Overview"
+                    } else {
+                        &run.kind_label
+                    },
+                    window_width,
+                    theme,
+                    cx,
+                ))
                 .child(self.render_set_bar(run, theme, cx))
                 .child(body)
                 .test_support()
@@ -1756,7 +1815,12 @@ impl Workspace {
     }
 
     /// The empty-state block: each member by its full name, why it shows nothing, and what to do.
-    fn render_empty_members(&self, lines: Vec<MemberLine>, theme: &Theme) -> AnyElement {
+    fn render_empty_members(
+        &self,
+        lines: Vec<MemberLine>,
+        sign_in: &MemberSignIn,
+        theme: &Theme,
+    ) -> AnyElement {
         v_flex()
             .id("set-members-empty")
             .flex_1()
@@ -1782,11 +1846,14 @@ impl Workspace {
                         .child(div().text_color(theme.muted_foreground).child(line))
                         .children(cause.action().map(|action| {
                             let id = SharedString::from(format!("set-member-action-{cluster}"));
-                            let button = Button::new(id).xsmall().outline().label(action.label());
+                            let label = match action {
+                                MemberAction::SignIn => sign_in.label(&cluster),
+                                MemberAction::Retry => action.label(),
+                            };
+                            let button = Button::new(id).xsmall().outline().label(label);
                             match action {
-                                MemberAction::SignIn => button.on_click(registry::on_click(
-                                    set_members::sign_in_member(&cluster),
-                                )),
+                                // not-an-action: the click is the consent for one sign-in run.
+                                MemberAction::SignIn => button.on_click(sign_in.on_click(&cluster)),
                                 MemberAction::Retry => button.on_click(registry::on_click(
                                     set_members::retry_member(&cluster),
                                 )),
@@ -1852,7 +1919,8 @@ impl Workspace {
     /// The set's name, the members left out of it, and its buttons.
     fn render_set_bar(&self, run: &RunningSet, theme: &Theme, cx: &App) -> impl IntoElement {
         let names = self.cluster_names(cx);
-        h_flex()
+        // The bar is the set view's top edge, so it drags the window like a title bar.
+        super::theme::moves_window(h_flex())
             .flex_none()
             .flex_wrap()
             .gap_2()

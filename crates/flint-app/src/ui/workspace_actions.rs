@@ -43,19 +43,20 @@ use super::super::registry::{
     BackToYamlEdit, Bind, CancelConnection, CancelYamlEdit, ClearSelection, Close, CloseActiveTab,
     CloseDetail, CloseTab, CopyLines, CopyText, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly,
     DragSelection, EditYaml, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp, FocusFilter,
-    FocusNextPane, FocusPreviousPane, FocusSearch, Forward, ForwardCurrent, GoBack, Guards, Hide,
-    HideFromAi, HideOthers, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, NextTab, OnView,
-    OpenContainerLogs, OpenContainerShell, OpenLogs, OpenObject, OpenPreviousLogs, OpenSelectedRow,
-    OpenSelectorLogs, OpenShell, OpenView, PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs,
-    Refresh, ReloadYamlEdit, RestartShell, RetryConnection, ReviewYamlEdit, SaveLines, SaveLogs,
-    SaveMatchingLines, SaveScope, SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom,
-    ScrollToTop, SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext,
-    SelectNextLine, SelectPrev, SelectPrevLine, SelectRow, SelectText, SetDockHeight,
-    SetLogContext, SetNamespaces, SetPaneWidth, ShowAll, ShowAllNamespaces, ShowOverview,
-    ShowTabList, ShowYaml, SortBy, ToggleAnnotations, ToggleCommandPalette, ToggleErrorsOnly,
-    ToggleLabels, ToggleLogRegex, ToggleManagedFields, ToggleMatchingOnly, ToggleNamespace,
-    ToggleNavSection, TogglePause, ToggleProblemsOnly, ToggleResourceSwitcher, ToggleSecretValue,
-    ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
+    FocusNextPane, FocusPreviousPane, FocusSearch, Forward, ForwardCurrent, GoBack, GoForward,
+    Guards, Hide, HideFromAi, HideOthers, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, NextTab,
+    OnView, OpenContainerLogs, OpenContainerShell, OpenHome, OpenLogs, OpenObject,
+    OpenPreviousLogs, OpenSelectedRow, OpenSelectorLogs, OpenShell, OpenView, PaneName, PasteText,
+    PrevMatch, PrevTab, ReconnectLogs, Refresh, ReloadYamlEdit, RestartShell, RetryConnection,
+    ReviewYamlEdit, SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines,
+    ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAllLines, SelectCluster,
+    SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine, SelectPrev, SelectPrevLine,
+    SelectRow, SelectText, SetDockHeight, SetLogContext, SetNamespaces, SetPaneWidth, ShowAll,
+    ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml, SortBy, SortByAscending,
+    SortByDescending, ToggleAnnotations, ToggleCommandPalette, ToggleErrorsOnly, ToggleLabels,
+    ToggleLogRegex, ToggleManagedFields, ToggleMatchingOnly, ToggleNamespace, ToggleNavSection,
+    TogglePause, ToggleProblemsOnly, ToggleResourceSwitcher, ToggleSecretValue, ToggleSources,
+    ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
     WatchOpenViewsOnly,
 };
 use super::super::registry::{ApplyAcrossSet, DeleteAcrossSet, RestartAcrossSet, ScaleAcrossSet};
@@ -122,10 +123,12 @@ impl Workspace {
         .bind::<ToggleResourceSwitcher>(Self::toggle_switcher)
         .bind::<OpenObject>(Self::open_object)
         .bind::<GoBack>(Self::go_back)
+        .bind::<GoForward>(Self::go_forward)
         .bind::<BackToList>(Self::back_to_list)
         .bind::<FocusNextPane>(|this, _, window, cx| this.focus_pane(1, window, cx))
         .bind::<FocusPreviousPane>(|this, _, window, cx| this.focus_pane(-1, window, cx))
         .bind::<About>(Self::about)
+        .bind::<OpenHome>(|ws, _, window, cx| ws.open_home(window, cx))
         .bind::<SelectCluster>(Self::select_cluster)
         .bind::<ExposeToAi>(Self::expose_to_ai)
         .bind::<HideFromAi>(Self::hide_from_ai)
@@ -349,6 +352,7 @@ impl Workspace {
                 |ws, a, cx| ws.check_open_object(a, cx),
             )
             .when::<GoBack>(|ws, cx| ws.can_go_back(cx))
+            .when::<GoForward>(|ws, cx| ws.can_go_forward(cx))
             .add::<SetNamespaces>(
                 |ws, _| ws.namespace_filter_applies(),
                 |_, a, _| match a.namespaces.iter().any(|n| n.trim().is_empty()) {
@@ -400,8 +404,16 @@ impl Workspace {
                 None => Err(ActionError::unavailable::<SelectRow>()),
             })
             .add::<SortBy>(view_open!(list_wide), |ws, a, cx| match &ws.list {
-                Some(l) => l.read(cx).check_sort(a),
+                Some(l) => l.read(cx).check_sort::<SortBy>(a),
                 None => Err(ActionError::unavailable::<SortBy>()),
+            })
+            .add::<SortByAscending>(view_open!(list_wide), |ws, a, cx| match &ws.list {
+                Some(l) => l.read(cx).check_sort::<SortByAscending>(&a.0),
+                None => Err(ActionError::unavailable::<SortByAscending>()),
+            })
+            .add::<SortByDescending>(view_open!(list_wide), |ws, a, cx| match &ws.list {
+                Some(l) => l.read(cx).check_sort::<SortByDescending>(&a.0),
+                None => Err(ActionError::unavailable::<SortByDescending>()),
             })
             // The detail pane's.
             .when::<Refresh>(view_open!(detail))
@@ -905,10 +917,11 @@ impl Workspace {
     /// Says why a confirmation closed by itself, and gives focus back if what held it is gone.
     pub(in crate::ui) fn confirmation_closed(
         &mut self,
+        why: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.refuse_held(super::super::write_binding::connection_changed_text(), cx);
+        self.refuse_held(why, cx);
         if window.focused(cx).is_none() {
             let focus = self
                 .list
@@ -1208,21 +1221,26 @@ impl Workspace {
                 let leaves_set =
                     self.sets.is_open() && !self.sets.has_member(Some(&action.cluster));
                 let again = action.clone();
-                if leaves_set
-                    && self.asks_before_leaving_set(window, cx, {
+                // The edit first, as every other way out of a set asks: after its Discard the
+                // question comes again with nothing left to ask about but the set, which
+                // asking about the set first would ask a second time.
+                if leaves
+                    && self.asks_before_leaving(window, cx, {
                         let again = again.clone();
                         move |ws, window, cx| ws.select_cluster(&again, window, cx)
                     })
                 {
                     return;
                 }
-                if leaves
-                    && self.asks_before_leaving(window, cx, move |ws, window, cx| {
+                if leaves_set
+                    && self.asks_before_leaving_set(window, cx, move |ws, window, cx| {
                         ws.select_cluster(&again, window, cx)
                     })
                 {
                     return;
                 }
+                // Selecting any cluster leaves Home, also for the active one's own view.
+                self.leave_home();
                 let cluster = action.cluster.clone();
                 // The sidebar's cursor follows the cluster picked, however it was picked.
                 self.sidebar_cursor = Some(cluster.clone());
@@ -1537,6 +1555,25 @@ impl Workspace {
             .is_some_and(|k| k.supports("delete"))
     }
 
+    /// Where Scale reads and writes the replica count of `kind` on `cluster`, if it has Scale: a
+    /// built-in kind always, a custom resource once discovery read its definition's paths.
+    pub(in crate::ui) fn kind_scale_paths(
+        &self,
+        cluster: &str,
+        kind: &flint_core::KindId,
+        cx: &App,
+    ) -> Option<flint_core::action_kinds::ScalePaths> {
+        if flint_core::action_kinds::scales_built_in(kind) {
+            return Some(flint_core::action_kinds::ScalePaths::built_in());
+        }
+        self.model
+            .read(cx)
+            .discovered(cluster)
+            .and_then(|d| d.discovery.as_ref())
+            .and_then(|d| d.kind(kind))
+            .and_then(flint_core::KindInfo::scale_paths)
+    }
+
     /// Holds the review being read for a resource action; a newer one replaces it.
     pub(in crate::ui) fn set_write_review(&mut self, review: Task<()>) {
         self._write_review = review;
@@ -1704,8 +1741,8 @@ impl Workspace {
         }
         match self.view_entry(&action.kind, cx) {
             Some(entry) => {
-                // Even the kind shown under Settings: it comes to the front.
-                self.leave_settings_for_view();
+                // Even the kind shown under Home: it comes to the front.
+                self.leave_home();
                 let open_already = match self.sets.running_kind() {
                     Some(kind) => *kind == entry.id,
                     None => self

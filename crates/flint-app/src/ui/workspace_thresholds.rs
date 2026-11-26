@@ -383,19 +383,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Enters the text of a field left open when Settings was left with no window at hand
-    /// (the navigation). Called as the workspace draws.
-    pub(super) fn flush_threshold_entry(&mut self, cx: &mut Context<Self>) {
-        if self.settings_page.open || self.settings_page.saving.is_some() {
-            return;
-        }
-        if let Some(entry) = self.settings_page.thresholds.entry.take()
-            && let Some(text) = entry.typed(cx)
-        {
-            self.enter_threshold(entry.target, &text, Some(&entry.file), cx);
-        }
-    }
-
     fn edit_cluster_watch(
         &mut self,
         context: &str,

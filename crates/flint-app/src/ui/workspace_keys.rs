@@ -1,5 +1,5 @@
 //! The workspace's keyboard paths (UP-31, UP-33): the resource switcher (Cmd-P), going back to
-//! the kind and object shown before (Cmd-[), moving focus between the panes (Tab and
+//! the kind and object shown before (Cmd-[) and forward again (Cmd-]), moving focus between the panes (Tab and
 //! Shift-Tab: clusters, navigation, list, detail, dock), and the cluster sidebar's keys (the
 //! arrows move its cursor, Enter connects to the cluster under it).
 // module-tests: keyboard_tests.rs
@@ -12,14 +12,16 @@ use gpui_kit::*;
 use super::super::focus::release_unfocused_input;
 use super::super::palette::{CommandPalette, Mode, SwitcherScope};
 use super::super::registry::{
-    ActionError, ActivateSelectedCluster, Bind, GoBack, OpenObject, SelectCluster,
+    ActionError, ActivateSelectedCluster, Bind, GoBack, GoForward, OpenObject, SelectCluster,
     SelectNextCluster, SelectPreviousCluster, ToggleResourceSwitcher,
 };
-use super::super::switcher_model::Index;
+use super::super::switcher_model::{Index, Object};
 use super::Workspace;
 
-/// How many places Go Back remembers.
+/// How many places Go Back (and Go Forward) remembers.
 const HISTORY: usize = 50;
+/// How many recently opened objects the resource switcher lists first.
+const RECENT: usize = 10;
 
 /// A place Go Back returns to: a kind's list, and the object selected in it, if any.
 #[derive(Debug, Clone, Eq)]
@@ -33,6 +35,21 @@ pub(in crate::ui) struct Place {
     pub seen: Option<u64>,
 }
 
+impl Place {
+    /// The cluster overview: Go Back and Go Forward reach it like a list.
+    pub fn overview() -> Self {
+        Place {
+            kind: KindId::new("flint.overview", "overview"),
+            object: None,
+            seen: None,
+        }
+    }
+
+    fn is_overview(&self) -> bool {
+        *self == Self::overview()
+    }
+}
+
 /// The same place whatever was known about its object.
 impl PartialEq for Place {
     fn eq(&self, other: &Self) -> bool {
@@ -41,40 +58,96 @@ impl PartialEq for Place {
 }
 
 /// The places shown before on the active cluster, each with the text its list was filtered
-/// by, oldest first, at most [`HISTORY`]. It starts over when another cluster becomes active.
+/// by, oldest first, at most [`HISTORY`]; and the places Go Back stepped away from, for Go
+/// Forward, latest last. It starts over when another cluster becomes active.
 #[derive(Debug, Default, Clone)]
-pub(in crate::ui) struct History(Vec<(Place, String)>);
+pub(in crate::ui) struct History {
+    back: Vec<(Place, String)>,
+    forward: Vec<(Place, String)>,
+    /// The objects opened by name (the switcher), latest first, at most [`RECENT`]: kind,
+    /// namespace and name.
+    opened: Vec<(KindId, Option<String>, String)>,
+}
+
+fn capped(stack: &mut Vec<(Place, String)>, place: Place, filter: String) {
+    match stack.last_mut() {
+        Some((last, text)) if *last == place => *text = filter,
+        _ => stack.push((place, filter)),
+    }
+    if stack.len() > HISTORY {
+        stack.remove(0);
+    }
+}
 
 impl History {
-    /// Remembers `place` and its `filter`. The last place remembered again keeps one entry,
-    /// with the newer filter.
+    /// Remembers `place` and its `filter`, on a new navigation: nothing is left to go forward
+    /// to. The last place remembered again keeps one entry, with the newer filter.
     pub fn push(&mut self, place: Place, filter: String) {
-        match self.0.last_mut() {
-            Some((last, text)) if *last == place => *text = filter,
-            _ => self.0.push((place, filter)),
-        }
-        if self.0.len() > HISTORY {
-            self.0.remove(0);
-        }
+        self.forward.clear();
+        capped(&mut self.back, place, filter);
     }
 
     /// The place shown last and its filter, forgotten.
     pub fn pop(&mut self) -> Option<(Place, String)> {
-        self.0.pop()
+        self.back.pop()
+    }
+
+    /// Remembers the place Go Back leaves, for Go Forward to return to.
+    pub fn push_forward(&mut self, place: Place, filter: String) {
+        capped(&mut self.forward, place, filter);
+    }
+
+    /// The place Go Back left last and its filter, forgotten.
+    pub fn pop_forward(&mut self) -> Option<(Place, String)> {
+        self.forward.pop()
+    }
+
+    /// Remembers the place Go Forward leaves, without ending the forward stack.
+    pub fn push_back(&mut self, place: Place, filter: String) {
+        capped(&mut self.back, place, filter);
     }
 
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.back.is_empty()
     }
 
     /// The places remembered, latest first.
     pub fn places(&self) -> impl Iterator<Item = &Place> {
-        self.0.iter().rev().map(|(place, _)| place)
+        self.back.iter().rev().map(|(place, _)| place)
+    }
+
+    /// The places Go Forward returns to, latest first.
+    pub fn forward_places(&self) -> impl Iterator<Item = &Place> {
+        self.forward.iter().rev().map(|(place, _)| place)
+    }
+
+    /// Remembers that the object was opened: first in [`History::recent`], once.
+    pub fn opened(&mut self, kind: KindId, namespace: Option<String>, name: String) {
+        let object = (kind, namespace, name);
+        self.opened.retain(|o| *o != object);
+        self.opened.insert(0, object);
+        self.opened.truncate(RECENT);
+    }
+
+    /// The objects opened lately, latest first.
+    pub fn recent(&self) -> Vec<(KindId, Object)> {
+        self.opened
+            .iter()
+            .map(|(kind, namespace, name)| {
+                let object = Object {
+                    namespace: namespace.as_deref().map(Arc::from),
+                    name: name.as_str().into(),
+                };
+                (kind.clone(), object)
+            })
+            .collect()
     }
 
     pub fn clear(&mut self) {
-        self.0.clear();
+        self.back.clear();
+        self.forward.clear();
+        self.opened.clear();
     }
 }
 
@@ -146,16 +219,18 @@ impl Workspace {
         if self.nav_shown(cx) {
             panes.push((Pane::Navigation, self.nav.read(cx).focus_handle().clone()));
         }
-        if let Some((overview, _)) = &self.dashboard {
+        // Home covers the overview, the list and the detail.
+        let covered = self.home.open;
+        if let Some((overview, _)) = self.dashboard.as_ref().filter(|_| !covered) {
             panes.push((Pane::Overview, overview.read(cx).focus_handle(cx)));
         }
-        if let Some(list) = &self.list {
+        if let Some(list) = self.list.as_ref().filter(|_| !covered) {
             panes.push((Pane::List, list.read(cx).focus_handle().clone()));
         }
         if let Some(detail) = self
             .detail
             .as_ref()
-            .filter(|_| !self.detail_hidden_by_menu(cx))
+            .filter(|_| !covered && !self.detail_hidden_by_menu(cx))
         {
             panes.push((Pane::Detail, detail.read(cx).focus_handle().clone()));
         }
@@ -203,6 +278,10 @@ impl Workspace {
             window.focus(&self.settings_page.focus, cx);
             return;
         }
+        if self.home.open {
+            window.focus(&self.focus, cx);
+            return;
+        }
         if self.list.is_none()
             && !self.namespace_popover_open
             && let Some((overview, _)) = &self.dashboard
@@ -217,7 +296,10 @@ impl Workspace {
 
     /// Where the main area is: the open kind and its selected object.
     fn place(&self, cx: &App) -> Option<Place> {
-        let list = self.list.as_ref()?.read(cx);
+        let Some(list) = self.list.as_ref() else {
+            return self.dashboard.as_ref().map(|_| Place::overview());
+        };
+        let list = list.read(cx);
         let object = self.detail.as_ref().map(|d| {
             let object = d.read(cx).object();
             (object.namespace.clone(), object.name.clone())
@@ -253,6 +335,26 @@ impl Workspace {
         self.place(cx).filter(|_| !picking)
     }
 
+    /// The object an open by name still waits for, as a place: where Go Back and Go Forward
+    /// return to once it has loaded.
+    fn pending_place(&self, cx: &App) -> Option<Place> {
+        let list = self.list.as_ref()?.read(cx);
+        Some(Place {
+            kind: list.kind().clone(),
+            object: Some(list.pending_object()?.clone()),
+            seen: None,
+        })
+    }
+
+    /// Whether Go Back or Go Forward can show `place`: the overview while the cluster is
+    /// active, a kind the cluster still serves.
+    fn place_served(&self, place: &Place, cx: &App) -> bool {
+        if place.is_overview() {
+            return self.cluster.is_some() && self.generation.is_some();
+        }
+        self.view_entry(place.kind.as_str(), cx).is_some()
+    }
+
     /// Whether Go Back has somewhere to go: a place other than the one shown, of a kind the
     /// cluster still serves.
     pub(super) fn can_go_back(&self, cx: &App) -> bool {
@@ -261,7 +363,18 @@ impl Workspace {
             && self
                 .history
                 .places()
-                .any(|p| here.as_ref() != Some(p) && self.view_entry(p.kind.as_str(), cx).is_some())
+                .any(|p| here.as_ref() != Some(p) && self.place_served(p, cx))
+    }
+
+    /// Whether Go Forward has somewhere to go: a place Go Back left, other than the one shown,
+    /// of a kind the cluster still serves.
+    pub(super) fn can_go_forward(&self, cx: &App) -> bool {
+        let here = self.shown_place(cx);
+        self.cluster.is_some()
+            && self
+                .history
+                .forward_places()
+                .any(|p| here.as_ref() != Some(p) && self.place_served(p, cx))
     }
 
     /// Go Back: shows the kind and object shown before.
@@ -273,16 +386,68 @@ impl Workspace {
         if self.asks_before_leaving(window, cx, |ws, window, cx| ws.go_back(&GoBack, window, cx)) {
             return;
         }
+        self.step_place(false, window, cx);
+    }
+
+    /// Go Forward: shows the place Go Back left, until a new navigation.
+    pub(super) fn go_forward(
+        &mut self,
+        _: &GoForward,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_go_forward(cx) {
+            return;
+        }
+        if self.asks_before_leaving(window, cx, |ws, window, cx| {
+            ws.go_forward(&GoForward, window, cx)
+        }) {
+            return;
+        }
+        self.step_place(true, window, cx);
+    }
+
+    /// Shows the latest place of the back stack, or of the forward stack, and puts the place
+    /// shown on the other one.
+    fn step_place(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         // Selecting a row or clearing the selection records nothing, so the last place
         // remembered can be the one shown; a press never goes there.
         let here = self.shown_place(cx);
-        while let Some((place, filter)) = self.history.pop() {
+        // An object waited for is left too: Back or Forward returns to it once it has loaded.
+        let leaving = here.clone().or_else(|| self.pending_place(cx));
+        let here_filter = self
+            .list
+            .as_ref()
+            .map_or_else(String::new, |list| list.read(cx).filter_text().to_owned());
+        loop {
+            let next = if forward {
+                self.history.pop_forward()
+            } else {
+                self.history.pop()
+            };
+            let Some((place, filter)) = next else {
+                return;
+            };
             if here.as_ref() == Some(&place) {
                 continue;
             }
             // A kind the cluster no longer serves is skipped.
-            let Some(entry) = self.view_entry(place.kind.as_str(), cx) else {
+            if !self.place_served(&place, cx) {
                 continue;
+            }
+            if let Some(leaving) = leaving {
+                if forward {
+                    self.history.push_back(leaving, here_filter);
+                } else {
+                    self.history.push_forward(leaving, here_filter);
+                }
+            }
+            if place.is_overview() {
+                self.show_overview(false, window, cx);
+                return;
+            }
+            let Some(entry) = self.view_entry(place.kind.as_str(), cx) else {
+                return;
             };
             self.show_kind(&entry, false, true, window, cx);
             if let Some(list) = &self.list {
@@ -365,6 +530,8 @@ impl Workspace {
             object: Some((namespace.clone(), name.clone())),
             seen: None,
         };
+        self.history
+            .opened(entry.id.clone(), namespace.clone(), name.clone());
         self.remember_place(&target, cx);
         self.show_kind(&entry, false, true, window, cx);
         if let Some(list) = &self.list {
@@ -434,6 +601,7 @@ impl Workspace {
             loading: self.cluster.is_some() && !entries.is_empty(),
             discovery_failed,
             on_view,
+            recent: self.history.recent(),
         };
         (scope, entries, key)
     }

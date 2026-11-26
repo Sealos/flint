@@ -1,17 +1,19 @@
-//! The Settings view (#739, #740): Flint's preferences in the main area, with a section list on
-//! the left. Edits form a [`SettingsDraft`] that waits for Save; Revert drops it. The draft
-//! outlives switching views and clusters until the app quits, and the sidebar's Settings entry
-//! shows a dot while it holds edits.
+//! The Settings view (#739, #740, #854): Flint's preferences in a modal over the main window,
+//! with a section list on the left. Edits form a [`SettingsDraft`] that waits for Save; Revert
+//! drops it. Closing the modal with edits asks Discard / Keep editing, so the draft never
+//! outlives it.
 //!
-//! Opened from Flint > Settings…, `secondary-,` and the command palette. Every control is a
-//! registered action, so the palette, keys and automation reach the same handlers
-//! ([`super::workspace`]'s `workspace_settings.rs`). From the keyboard, Tab and Shift-Tab (or the
-//! arrows) go round the view's own controls ([`stops`]), Enter or Space works the one under the
-//! cursor, and Esc leaves.
+//! Opened from Flint > Settings…, `secondary-,`, the sidebar's Settings entry and the command
+//! palette. Every control is a registered action, so the palette, keys and automation reach the
+//! same handlers ([`super::workspace`]'s `workspace_settings.rs`). From the keyboard, Tab and
+//! Shift-Tab (or the arrows) go round the view's own controls ([`stops`]), Enter or Space works
+//! the one under the cursor, and Esc closes.
 //!
 //! Sections so far: Appearance, Alerts (desktop notifications), Watching (the default watch
-//! mode), and Thresholds and Cluster overrides ([`super::settings_thresholds`]). A slice that
-//! adds settings adds a [`Section`] (or a block to one), its
+//! mode), Thresholds and Cluster overrides ([`super::settings_thresholds`]), and Logs, Paths and
+//! Write safety ([`super::settings_logs_paths`]), and Network ([`super::settings_network`]), whose
+//! proxy is applied on its own rather than saved with the draft. A slice that adds settings adds a [`Section`]
+//! (or a block to one), its
 //! [`super::settings_draft::Change`]s and its [`Stop`]s.
 
 // module-tests: settings_view_tests.rs
@@ -23,7 +25,8 @@ use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::{
-    Disableable as _, Selectable as _, Sizable as _, StyledExt as _, Theme, h_flex, v_flex,
+    Disableable as _, IconName, Selectable as _, Sizable as _, StyledExt as _, Theme, h_flex,
+    v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -31,6 +34,8 @@ use serde::{Deserialize, Serialize};
 
 use super::registry;
 use super::settings_draft::{Field, SettingsDraft};
+use super::settings_logs_paths::{self as logs_paths, LogsPathsFields, TextField};
+use super::settings_network::{self as network, NetworkFields, NetworkStop};
 use super::settings_thresholds::{
     self, KnownCluster, OverridesLayout, ThresholdStop, ThresholdsPage,
 };
@@ -46,14 +51,14 @@ pub const SETTINGS_INPUT_KEYS: &str = "SettingsView > Input";
 actions!(
     flint,
     [
-        /// Open Settings in the main area.
+        /// Open Settings over the main window.
         OpenSettings
     ]
 );
 actions!(
     settings,
     [
-        /// Leave Settings for the view shown before. The draft stays.
+        /// Close Settings, asking first whether to discard unsaved edits.
         CloseSettings,
         /// Write the edited settings to `settings.toml`, and only those.
         SaveSettings,
@@ -68,7 +73,7 @@ actions!(
     ]
 );
 
-/// Show one of the Settings sections.
+/// Show one of the Settings sections, opening Settings if it is closed.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
 #[action(namespace = settings, no_json)]
 #[serde(deny_unknown_fields)]
@@ -110,15 +115,23 @@ pub enum Section {
     Watching,
     Thresholds,
     ClusterOverrides,
+    Logs,
+    Paths,
+    Safety,
+    Network,
 }
 
 impl Section {
-    pub const ALL: [Section; 5] = [
+    pub const ALL: [Section; 9] = [
         Section::Appearance,
         Section::Alerts,
         Section::Watching,
         Section::Thresholds,
         Section::ClusterOverrides,
+        Section::Logs,
+        Section::Paths,
+        Section::Safety,
+        Section::Network,
     ];
 
     pub fn label(self) -> &'static str {
@@ -128,6 +141,10 @@ impl Section {
             Section::Watching => "Watching",
             Section::Thresholds => "Thresholds",
             Section::ClusterOverrides => "Cluster overrides",
+            Section::Logs => "Logs",
+            Section::Paths => "Paths",
+            Section::Safety => "Write safety",
+            Section::Network => "Network",
         }
     }
 
@@ -138,6 +155,10 @@ impl Section {
             Section::Watching => "settings-section-watching",
             Section::Thresholds => "settings-section-thresholds",
             Section::ClusterOverrides => "settings-section-cluster-overrides",
+            Section::Logs => "settings-section-logs",
+            Section::Paths => "settings-section-paths",
+            Section::Safety => "settings-section-safety",
+            Section::Network => "settings-section-network",
         }
     }
 
@@ -149,6 +170,14 @@ impl Section {
             Section::Watching => *field == Field::WatchMode,
             Section::Thresholds => settings_thresholds::holds(field, false),
             Section::ClusterOverrides => settings_thresholds::holds(field, true),
+            Section::Logs => matches!(
+                field,
+                Field::LogBufferLines | Field::LogBufferMib | Field::LogTotalMib
+            ),
+            Section::Paths => matches!(field, Field::KubeconfigPaths | Field::Path | Field::Helm),
+            Section::Safety => *field == Field::ProtectLocalClusters,
+            // The proxy is applied on its own, never through the draft.
+            Section::Network => false,
         }
     }
 }
@@ -156,7 +185,8 @@ impl Section {
 /// A control the keyboard cursor can stand on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
-    Done,
+    /// The header's close button.
+    Close,
     Reload,
     SaveAnyway,
     Section(Section),
@@ -164,6 +194,14 @@ pub enum Stop {
     DesktopNotifications,
     WatchMode(WatchMode),
     Threshold(ThresholdStop),
+    /// A text field of the Logs or Paths section.
+    Text(TextField),
+    /// The Remove button of the kubeconfig file at this position.
+    RemoveKubeconfig(usize),
+    AddKubeconfig,
+    ProtectLocalClusters,
+    /// A control of the Network section.
+    Network(NetworkStop),
     Revert,
     Save,
 }
@@ -172,7 +210,7 @@ impl Stop {
     /// The element id of the control.
     pub fn id(self) -> SharedString {
         match self {
-            Stop::Done => "settings-close".into(),
+            Stop::Close => "settings-close".into(),
             Stop::Reload => "settings-reload".into(),
             Stop::SaveAnyway => "settings-save-anyway".into(),
             Stop::Section(section) => section.id().into(),
@@ -183,6 +221,11 @@ impl Stop {
             Stop::WatchMode(WatchMode::All) => "settings-watch-all".into(),
             Stop::WatchMode(WatchMode::OnView) => "settings-watch-on-view".into(),
             Stop::Threshold(stop) => stop.id(),
+            Stop::Text(field) => field.id().into(),
+            Stop::RemoveKubeconfig(index) => logs_paths::remove_id(index).into(),
+            Stop::AddKubeconfig => "settings-kubeconfig-add".into(),
+            Stop::ProtectLocalClusters => "settings-protect-local-clusters".into(),
+            Stop::Network(stop) => stop.id().into(),
             Stop::Revert => "settings-revert".into(),
             Stop::Save => "settings-save".into(),
         }
@@ -190,9 +233,14 @@ impl Stop {
 }
 
 /// The controls in the order Tab visits them, with `section` shown, the on-disk banner shown or
-/// not, and Cluster overrides drawn as `overrides` says.
-pub fn stops(section: Section, banner: bool, overrides: OverridesLayout) -> Vec<Stop> {
-    let mut stops = vec![Stop::Done];
+/// not, Cluster overrides drawn as `overrides` says, and `kubeconfigs` files in the Paths list.
+pub fn stops(
+    section: Section,
+    banner: bool,
+    overrides: OverridesLayout,
+    kubeconfigs: usize,
+) -> Vec<Stop> {
+    let mut stops = vec![Stop::Close];
     if banner {
         stops.extend([Stop::Reload, Stop::SaveAnyway]);
     }
@@ -213,6 +261,10 @@ pub fn stops(section: Section, banner: bool, overrides: OverridesLayout) -> Vec<
                 .into_iter()
                 .map(Stop::Threshold),
         ),
+        Section::Logs => stops.extend(logs_paths::logs_stops()),
+        Section::Paths => stops.extend(logs_paths::paths_stops(kubeconfigs)),
+        Section::Safety => stops.push(Stop::ProtectLocalClusters),
+        Section::Network => stops.extend(network::stops()),
     }
     stops.extend([Stop::Revert, Stop::Save]);
     stops
@@ -229,25 +281,15 @@ pub struct Saving {
     pub _give_up: Task<()>,
 }
 
-/// What the main area showed when Settings opened, as far as Settings gives way to a change of
-/// it: another cluster or a set.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MainKey {
-    pub cluster: Option<flint_core::ClusterId>,
-    /// The running set's list.
-    pub set: Option<EntityId>,
-}
-
-/// What the Settings view holds while the window is open: whether it is shown, the section,
-/// and the draft, which outlives leaving the view.
+/// What the Settings view holds while the window is open: whether the modal is open, the
+/// section, and the draft, which is empty whenever the modal is closed.
 pub struct SettingsPage {
+    /// Whether the modal is open.
     pub open: bool,
     pub section: Section,
     pub draft: SettingsDraft,
     /// The view's own focus, for its keys.
     pub focus: FocusHandle,
-    /// What the main area showed when Settings opened.
-    pub opened_over: Option<MainKey>,
     /// A Save the core has not answered yet. Its edits stay in the draft meanwhile.
     pub saving: Option<Saving>,
     /// Why the last Save did not go through, until the next edit, Save or Revert.
@@ -256,6 +298,10 @@ pub struct SettingsPage {
     pub cursor: Option<Stop>,
     /// Thresholds and Cluster overrides: rows added, the cluster list, the field being typed.
     pub thresholds: ThresholdsPage,
+    /// The Logs and Paths sections' text inputs and the kubeconfig list's note.
+    pub logs_paths: LogsPathsFields,
+    /// The Network section's proxy fields and the last Apply.
+    pub network: NetworkFields,
     /// The scrolling content, so the keyboard cursor can bring a control into view.
     pub scroll: ScrollHandle,
 }
@@ -267,11 +313,12 @@ impl SettingsPage {
             section: Section::default(),
             draft: SettingsDraft::default(),
             focus: cx.focus_handle(),
-            opened_over: None,
             saving: None,
             save_note: None,
             cursor: None,
             thresholds: ThresholdsPage::default(),
+            logs_paths: LogsPathsFields::default(),
+            network: NetworkFields::default(),
             scroll: ScrollHandle::new(),
         }
     }
@@ -294,7 +341,27 @@ impl SettingsPage {
             appearance: appearance_name(shown.appearance),
             desktop_notifications: shown.desktop_notifications,
             watch_mode: watch_mode_name(shown.watch_mode),
+            log_buffer_lines: shown.log_buffer_lines,
+            log_buffer_mib: shown.log_buffer_mib,
+            log_total_mib: shown.log_total_mib,
+            kubeconfig_paths: shown
+                .kubeconfig_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            path: shown.path.clone(),
+            helm: shown.helm.as_ref().map(|p| p.display().to_string()),
+            protect_local_clusters: shown.protect_local_clusters,
+            field_errors: TextField::ALL
+                .into_iter()
+                .filter_map(|field| {
+                    let rejected = self.draft.rejected(&field.field())?;
+                    Some((field.id(), rejected.why.clone()))
+                })
+                .collect(),
+            kubeconfig_note: self.logs_paths.kubeconfig_note.clone(),
             thresholds: settings_thresholds::view_state(self, &shown, clusters),
+            network: network::view_state(&self.network, &file.proxy, invalid),
             changed_on_disk: banner_shown(self, file),
             invalid,
             can_save: self.saving.is_none() && can_save(&self.draft, invalid),
@@ -343,14 +410,9 @@ pub const REJECTED: &str = "Some values are not accepted. Fix the fields marked 
 pub const INVALID: &str =
     "settings.toml is invalid. Fix it to save settings; until then Flint uses safe defaults.";
 
-/// The sidebar's entry: Settings, with a dot while the draft holds edits.
+/// The sidebar's entry, which opens Settings. It needs no unsaved-edits dot: closing Settings
+/// never leaves edits behind.
 pub fn render_entry(page: &SettingsPage, theme: &Theme) -> impl IntoElement {
-    let dirty = page.draft.is_dirty();
-    let label = if dirty {
-        "Settings (unsaved changes)"
-    } else {
-        "Settings"
-    };
     h_flex()
         .id("settings-entry")
         .flex_none()
@@ -359,7 +421,7 @@ pub fn render_entry(page: &SettingsPage, theme: &Theme) -> impl IntoElement {
         .py_1()
         .border_t_1()
         .border_color(theme.sidebar_border)
-        .aria_label(label)
+        .aria_label("Settings")
         .child(
             Button::new("open-settings")
                 .xsmall()
@@ -373,14 +435,6 @@ pub fn render_entry(page: &SettingsPage, theme: &Theme) -> impl IntoElement {
                 ))
                 .on_click(registry::on_click(OpenSettings)),
         )
-        .when(dirty, |el| {
-            el.child(
-                super::theme::status_dot(theme.foreground, true)
-                    .id("settings-entry-dot")
-                    .flex_none()
-                    .test_support(),
-            )
-        })
         .test_support()
 }
 
@@ -403,7 +457,7 @@ pub(super) fn ring(
 }
 
 /// The Settings view, over `file` as the core last reported it, with the kubeconfig's
-/// `clusters`.
+/// `clusters`: the modal's content, filling it.
 pub fn render(
     page: &SettingsPage,
     file: &Settings,
@@ -418,9 +472,7 @@ pub fn render(
         .id("settings-view")
         .key_context("SettingsView")
         .track_focus(&page.focus)
-        .flex_1()
-        .min_w_0()
-        .h_full()
+        .size_full()
         .child(header(page, theme))
         .when(invalid, |el| {
             el.child(banner(
@@ -477,7 +529,7 @@ pub fn render(
                         .track_scroll(&page.scroll)
                         .p_4()
                         .gap_3()
-                        .children(section_body(page, &shown, clusters, theme)),
+                        .children(section_body(page, &shown, invalid, clusters, theme)),
                 ),
         )
         .child(footer(page, invalid, theme))
@@ -486,28 +538,27 @@ pub fn render(
 }
 
 fn header(page: &SettingsPage, theme: &Theme) -> impl IntoElement {
-    super::theme::moves_window(
-        h_flex()
-            .id("settings-header")
-            .flex_none()
-            .h(px(super::workspace::HEADER_HEIGHT))
-            .px_3()
-            .gap_2()
-            .border_b_1()
-            .border_color(theme.border),
-    )
-    .child(div().flex_1().text_sm().font_semibold().child("Settings"))
-    .child(ring(
-        page,
-        Stop::Done,
-        theme,
-        Button::new("settings-close")
-            .xsmall()
-            .ghost()
-            .label("Done")
-            .tooltip("Leave Settings. Unsaved edits stay until you save or revert them.")
-            .on_click(registry::on_click(CloseSettings)),
-    ))
+    h_flex()
+        .id("settings-header")
+        .flex_none()
+        .h(px(super::workspace::HEADER_HEIGHT))
+        .px_3()
+        .gap_2()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(div().flex_1().text_sm().font_semibold().child("Settings"))
+        .child(ring(
+            page,
+            Stop::Close,
+            theme,
+            Button::new("settings-close")
+                .accessibility_label("Close")
+                .icon(IconName::Close)
+                .xsmall()
+                .ghost()
+                .tooltip("Close Settings (Esc)")
+                .on_click(registry::on_click(CloseSettings)),
+        ))
 }
 
 fn banner(
@@ -578,6 +629,7 @@ fn section_list(page: &SettingsPage, theme: &Theme) -> impl IntoElement {
 fn section_body(
     page: &SettingsPage,
     shown: &Settings,
+    invalid: bool,
     clusters: &[KnownCluster],
     theme: &Theme,
 ) -> Vec<AnyElement> {
@@ -672,6 +724,10 @@ fn section_body(
             let candidates = settings_thresholds::add_candidates(clusters, &rows);
             settings_thresholds::render_overrides(page, shown, &rows, &candidates, theme)
         }
+        Section::Logs => logs_paths::logs_body(page, theme),
+        Section::Paths => logs_paths::paths_body(page, shown, theme),
+        Section::Safety => one(logs_paths::safety_body(page, shown, theme)),
+        Section::Network => network::body(page, &shown.proxy, invalid, theme),
     }
 }
 
@@ -706,6 +762,8 @@ fn footer(page: &SettingsPage, invalid: bool, theme: &Theme) -> impl IntoElement
     let dirty = draft.is_dirty();
     // A threshold still being typed is entered by Save and dropped by Revert.
     let typing = page.thresholds.entry.is_some();
+    // Revert also drops what is typed in the proxy fields.
+    let proxy_typed = page.network.is_typed();
     let saving = page.saving.is_some();
     let (note, color): (SharedString, Hsla) = match &page.save_note {
         _ if saving => ("Saving…".into(), theme.muted_foreground),
@@ -740,7 +798,7 @@ fn footer(page: &SettingsPage, invalid: bool, theme: &Theme) -> impl IntoElement
             Button::new("settings-revert")
                 .small()
                 .label("Revert")
-                .disabled(saving || !(dirty || typing))
+                .disabled(saving || !(dirty || typing || proxy_typed))
                 .on_click(registry::on_click(RevertSettings)),
         ))
         .child(ring(
@@ -751,7 +809,12 @@ fn footer(page: &SettingsPage, invalid: bool, theme: &Theme) -> impl IntoElement
                 .small()
                 .primary()
                 .label("Save")
-                .disabled(saving || invalid || !(can_save(draft, invalid) || typing))
+                // With a value rejected, Save shows its field rather than writing.
+                .disabled(
+                    saving
+                        || invalid
+                        || !(can_save(draft, invalid) || typing || draft.has_rejected()),
+                )
                 .on_click(registry::on_click(SaveSettings)),
         ))
 }

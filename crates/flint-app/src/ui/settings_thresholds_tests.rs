@@ -5,7 +5,6 @@
 use flint_core::settings::ClusterPin;
 use flint_core::thresholds::ThresholdMetric;
 use flint_core::{Settings, WatchMode};
-use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::TestAppContextExt as _;
 use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
@@ -50,9 +49,11 @@ async fn wait_for_file(
     t: &TestWorkspace,
     wanted: impl Fn(&Settings) -> bool + 'static,
 ) {
+    // The file as wanted, and the Save that wrote it answered.
     let model = t.model.clone();
+    let workspace = t.workspace.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
-        wanted(&model.read(cx).settings)
+        wanted(&model.read(cx).settings) && !workspace.read(cx).settings_saving()
     })
     .await;
 }
@@ -176,7 +177,7 @@ async fn an_out_of_range_threshold_blocks_save(cx: &mut TestAppContext) {
         t.label(cx, "settings-draft-note").as_deref(),
         Some(REJECTED)
     );
-    assert!(!t.available(cx).contains(&"settings::SaveSettings"));
+    // Save writes nothing: it shows the field holding the rejected value.
     t.click(cx, "settings-save");
     assert!(t.settings_toml().is_empty(), "Save is blocked");
 
@@ -245,8 +246,8 @@ async fn esc_drops_the_typed_text_and_revert_drops_rejected_values(cx: &mut Test
 async fn the_keyboard_alone_sets_a_threshold(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_section(cx, dir.path(), "thresholds").await;
-    // Done, five sections, then the first threshold.
-    for _ in 0..7 {
+    // Done, the sections, then the first threshold.
+    for _ in 0..1 + super::settings_view::Section::ALL.len() + 1 {
         t.press(cx, "tab");
     }
     assert_eq!(
@@ -452,8 +453,10 @@ async fn quit_with_a_rejected_value_asks_to_discard(cx: &mut TestAppContext) {
         json!({ "metric": "cpu_percent", "value": "0" }),
     );
     t.press_key_of(cx, "flint::Quit");
-    cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
-        .await;
+    cx.wait_for(t.window, WAIT, |window, cx| {
+        super::confirm::any_open(window, cx)
+    })
+    .await;
     let dialog: DialogState = state(cx, &t).dialog.expect("a dialog is open");
     assert_eq!(dialog.title, "Discard unsaved settings?");
     assert!(dialog.text.contains("not accepted"), "{}", dialog.text);
@@ -525,7 +528,7 @@ async fn a_cleared_row_stays_under_the_cursor_until_save(cx: &mut TestAppContext
     assert_eq!(state(cx, &t).settings.thresholds.overrides.len(), 2);
 
     // Watching on kind-alpha's row: On view, then Default, its last override.
-    for _ in 0..21 {
+    for _ in 0..24 {
         t.press(cx, "tab");
         if state(cx, &t).settings.cursor.as_deref() == Some("settings-override-0-watch") {
             break;
@@ -613,8 +616,10 @@ async fn quit_with_only_a_value_being_typed_asks(cx: &mut TestAppContext) {
     t.type_text(cx, "80");
     assert!(!state(cx, &t).settings.dirty, "not entered yet");
     t.press_key_of(cx, "flint::Quit");
-    cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
-        .await;
+    cx.wait_for(t.window, WAIT, |window, cx| {
+        super::confirm::any_open(window, cx)
+    })
+    .await;
     let dialog: DialogState = state(cx, &t).dialog.expect("a dialog is open");
     assert_eq!(dialog.title, "Save your settings?");
     assert_eq!(
@@ -692,7 +697,7 @@ async fn the_cursor_follows_its_cluster_when_rows_change(cx: &mut TestAppContext
     );
     t.click(cx, "settings-save");
     wait_for_file(cx, &t, |s| s.cluster_watch_mode.len() == 1).await;
-    for _ in 0..30 {
+    for _ in 0..33 {
         t.press(cx, "tab");
         if state(cx, &t).settings.cursor.as_deref() == Some("settings-override-0-watch") {
             break;
@@ -732,7 +737,7 @@ async fn the_cursor_follows_its_cluster_when_rows_change(cx: &mut TestAppContext
 async fn switching_section_moves_the_cursor_to_the_section_list(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_section(cx, dir.path(), "thresholds").await;
-    for _ in 0..7 {
+    for _ in 0..1 + super::settings_view::Section::ALL.len() + 1 {
         t.press(cx, "tab");
     }
     assert_eq!(

@@ -15,7 +15,9 @@ use super::ClusterManager;
 use crate::ClusterId;
 use crate::credential::CredentialId;
 use crate::handle::AdmittedMember;
-use crate::port_forward::{ForwardFailure, ForwardGrant, ForwardState, gate_failure, unauthorized};
+use crate::port_forward::{
+    ForwardFailure, ForwardFailureKind, ForwardGrant, ForwardState, gate_failure, unauthorized,
+};
 use crate::protection::WriteRefusal;
 use crate::recheck::ContextPin;
 use crate::write::WriteError;
@@ -245,6 +247,20 @@ impl ClusterManager {
             let failure = gate_failure(&WriteError::ConnectionChanged);
             self.end_forward(id, ForwardState::Failed(failure));
         }
+    }
+
+    /// The proxy setting changed, so the connection every forward is bound to is going: each one
+    /// ends, saying why. Returns how many did.
+    pub(super) fn end_forwards_for_proxy(&mut self) -> usize {
+        let ids: Vec<u64> = self.forwards.live.keys().copied().collect();
+        for &id in &ids {
+            let failure = ForwardFailure::new(
+                ForwardFailureKind::Refused,
+                "the proxy setting changed; start the forward again",
+            );
+            self.end_forward(id, ForwardState::Failed(failure));
+        }
+        ids.len()
     }
 
     /// Ends the forwards that may not go on, and forgets those that are over.

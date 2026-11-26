@@ -159,6 +159,7 @@ fn deployments() -> KindInfo {
         verbs: Vec::new(),
         singular: "deployment".into(),
         short_names: Vec::new(),
+        scale: Default::default(),
     }
 }
 

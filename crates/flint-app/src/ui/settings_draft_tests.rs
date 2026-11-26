@@ -102,6 +102,34 @@ fn a_change_on_disk_under_a_draft_raises_the_banner() {
     assert!(!draft.changed_on_disk(&outside));
 }
 
+// covers UP-127: an outside edit only to a key Flint ignores changes the file all the same, so
+// the banner says so and the question to turn protection off is asked over the file as it is.
+#[test]
+fn an_edit_to_an_ignored_key_under_a_draft_raises_the_banner() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(flint_core::settings::SETTINGS_FILE);
+    std::fs::write(&path, "protect_local_clusters = true\n").unwrap();
+    let file = Arc::new(flint_core::settings::load_settings(dir.path()).unwrap());
+    let mut draft = SettingsDraft::default();
+    draft.edit(
+        Change::ProtectLocalClusters {
+            on: false,
+            confirmed: None,
+        },
+        &file,
+    );
+    assert!(!draft.changed_on_disk(&file));
+
+    std::fs::write(
+        &path,
+        "protect_local_clusters = true\nsome_future_key = 1\n",
+    )
+    .unwrap();
+    let outside = Arc::new(flint_core::settings::load_settings(dir.path()).unwrap());
+    assert_eq!(outside, file, "the same settings");
+    assert!(draft.changed_on_disk(&outside));
+}
+
 #[test]
 fn reload_discards_the_draft_and_shows_the_file() {
     let file = file();
@@ -136,4 +164,45 @@ fn an_edit_stays_until_the_core_says_it_is_written() {
     assert!(draft.is_edited(&Field::Appearance));
     assert!(!draft.is_edited(&Field::WatchMode));
     assert_eq!(draft.shown(&file).appearance, Appearance::Light);
+}
+
+// covers UP-127: only an edit that turns protection off loosens it; turning it back on leaves
+// nothing to confirm. What is written carries the confirmation only when turning it off.
+#[test]
+fn only_turning_protection_off_loosens_it() {
+    let protect = |on| Change::ProtectLocalClusters {
+        on,
+        confirmed: None,
+    };
+    let protected = Arc::new(Settings {
+        protect_local_clusters: true,
+        ..Settings::default()
+    });
+    let mut draft = SettingsDraft::default();
+    draft.edit(Change::LogBufferLines(5_000), &protected);
+    assert!(!draft.loosens_protection());
+    draft.edit(protect(false), &protected);
+    assert!(draft.loosens_protection());
+    assert!(!draft.shown(&protected).protect_local_clusters);
+
+    let confirmed = flint_core::settings::SettingsRevision::of(&protected);
+    let writes = SettingsDraft::confirmed(&draft.edits(), Some(&confirmed));
+    assert!(writes.contains(&Change::ProtectLocalClusters {
+        on: false,
+        confirmed: Some(confirmed.clone()),
+    }));
+    assert!(writes.contains(&Change::LogBufferLines(5_000)));
+
+    draft.edit(protect(true), &protected);
+    assert!(!draft.loosens_protection());
+    assert!(!draft.is_edited(&Field::ProtectLocalClusters));
+
+    let mut draft = SettingsDraft::default();
+    draft.edit(protect(true), &file());
+    assert!(!draft.loosens_protection(), "turning it on is no loosening");
+    assert_eq!(
+        SettingsDraft::confirmed(&draft.edits(), Some(&confirmed)),
+        [protect(true)],
+        "turning it on needs no confirmation"
+    );
 }

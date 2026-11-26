@@ -34,6 +34,8 @@ pub struct AppState {
     pub nav: Option<NavState>,
     pub list: Option<ListState>,
     pub detail: Option<DetailState>,
+    /// The cluster's own dashboard (the overview), while it is open.
+    pub dashboard: Option<DashboardState>,
     /// The bottom dock and its tabs.
     pub dock: DockState,
     /// The open context menu, if any.
@@ -44,17 +46,50 @@ pub struct AppState {
     pub alerts: Option<super::alert_center::AlertsState>,
     /// Cluster sets: the sidebar's choice, the saved sets and the running set.
     pub sets: ClusterSetsState,
-    /// The Settings view and its draft, which outlives leaving the view.
+    /// The Settings modal and its draft.
     pub settings: SettingsState,
 }
 
-/// The Settings view (#739): whether it is shown, and its draft.
+/// The open dashboard of one cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DashboardState {
+    /// Whether the activity feed could be read at all.
+    pub warnings_available: bool,
+    /// What the feed counted, including rows beyond those shown.
+    pub warnings_total: usize,
+    /// The feed's rows, newest first.
+    pub warnings: Vec<WarningRowState>,
+}
+
+/// One row of the activity feed: a Warning event or a Deployment's rollout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WarningRowState {
+    /// The element id to click: `dashboard-warning-<key>`.
+    pub id: String,
+    pub age: String,
+    pub reason: String,
+    /// The object as the row says it (`Pod shop/web-0`).
+    pub object: String,
+    /// The kind a click opens (`Pod.v1`), `None` when the event names no object exactly.
+    pub kind: Option<String>,
+    pub namespace: Option<String>,
+    pub name: Option<String>,
+    pub message: String,
+    pub occurrences: u32,
+    /// Whether clicking it opens its object.
+    pub opens: bool,
+    /// The rollout's state, for a Deployment's row.
+    pub rollout: Option<&'static str>,
+}
+
+/// The Settings view (#739), a modal over the main window (#854): whether it is open, and its
+/// draft.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SettingsState {
-    /// Whether the main area shows it.
+    /// Whether the modal is open.
     pub open: bool,
     pub section: super::settings_view::Section,
-    /// Whether edits wait for Save (the sidebar entry's dot).
+    /// Whether edits wait for Save.
     pub dirty: bool,
     /// The `settings.toml` keys of the edited fields.
     pub edited: Vec<String>,
@@ -62,8 +97,22 @@ pub struct SettingsState {
     pub appearance: &'static str,
     pub desktop_notifications: bool,
     pub watch_mode: &'static str,
+    pub log_buffer_lines: u32,
+    pub log_buffer_mib: u32,
+    pub log_total_mib: u32,
+    pub kubeconfig_paths: Vec<String>,
+    pub path: Option<String>,
+    pub helm: Option<String>,
+    pub protect_local_clusters: bool,
+    /// Why a text field's value cannot be saved, by the field's element id. Save is disabled
+    /// while any is set.
+    pub field_errors: std::collections::BTreeMap<&'static str, String>,
+    /// Why the last kubeconfig file could not be added.
+    pub kubeconfig_note: Option<String>,
     /// Thresholds and Cluster overrides, as shown.
     pub thresholds: ThresholdsState,
+    /// The Network section's proxy.
+    pub network: NetworkState,
     /// The file changed under the draft: the Reload / Save anyway banner.
     pub changed_on_disk: bool,
     /// `settings.toml` cannot be read; Save is disabled.
@@ -75,6 +124,29 @@ pub struct SettingsState {
     pub note: Option<String>,
     /// The element id of the control under the keyboard cursor.
     pub cursor: Option<String>,
+}
+
+/// Settings' Network section (#743). Never a proxy's password: the saved URL is masked, and
+/// what is typed is not reported, only whether it can be applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NetworkState {
+    /// The saved proxy URL as the field shows it, credentials masked; empty for none.
+    pub saved_url: String,
+    pub saved_no_proxy: Vec<String>,
+    /// The fields were typed in since they showed the file.
+    pub typed: bool,
+    /// Why what is typed cannot be applied.
+    pub error: Option<String>,
+    /// Apply is offered: what is typed is valid and not the saved proxy.
+    pub can_apply: bool,
+    /// An Apply waits for the core's answer.
+    pub applying: bool,
+    /// The last Apply, as the section says it.
+    pub report: Vec<String>,
+    /// The clusters the last Apply reconnected, once all came back or the wait ran out.
+    pub reconnected: Option<Vec<String>>,
+    /// The clusters the last Apply could not reconnect, with why.
+    pub failed: Vec<(String, String)>,
 }
 
 /// Settings' Thresholds and Cluster overrides (#741), as shown: the file with the draft on top.
@@ -390,8 +462,13 @@ pub struct ClusterState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "view", rename_all = "snake_case")]
 pub enum Main {
-    /// "Select a cluster".
-    NoCluster,
+    /// The fleet home screen: on launch, and from the sidebar's Home entry.
+    Home {
+        /// The clusters kept watching, in sidebar order, each with its card.
+        watched: Vec<HomeCardState>,
+        /// The other clusters, in sidebar order.
+        unwatched: Vec<HomeRowState>,
+    },
     /// No kubeconfig file had a context: where Flint looked and what to do.
     NoContexts,
     Connecting,
@@ -407,8 +484,27 @@ pub enum Main {
     AwaitingConfirmation,
     /// A resource list, and maybe the detail pane.
     List,
-    /// The Settings view.
-    Settings,
+}
+
+/// A watched cluster's card on the home screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HomeCardState {
+    pub cluster: String,
+    /// `watching`, `sign-in needed` or `paused`.
+    pub status: &'static str,
+    /// The card in one line, once it has been read from the cluster's feed.
+    pub card: Option<String>,
+    /// The Kubernetes version its feed reported.
+    pub version: Option<String>,
+}
+
+/// A cluster not kept watching, in the home screen's list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HomeRowState {
+    pub cluster: String,
+    pub label: String,
+    /// Whether its Keep Watching button is enabled.
+    pub keep_watching: bool,
 }
 
 /// The header over the list.

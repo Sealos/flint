@@ -302,13 +302,27 @@ impl DetailView {
             subject,
         );
         let cluster_label = flint_core::display::single_line(&object.cluster);
-        let follow_usage = match UsageSubject::of(&object.kind) {
+        let follow_usage = match UsageSubject::of_detail(&object.kind) {
             Some(subject) => {
                 let (core, cluster) = (core.clone(), object.cluster.clone());
                 let mut updates = core.telemetry_updates();
                 cx.spawn(async move |this, cx| {
+                    let mut last: Option<UsageSource> = None;
                     while updates.changed().await {
-                        let source = UsageSource::of(subject, core.telemetry(&cluster).as_ref());
+                        let telemetry = core.telemetry(&cluster);
+                        let previous = last.take();
+                        let (source, previous) = cx
+                            .background_spawn(async move {
+                                let source = UsageSource::after(
+                                    subject,
+                                    telemetry.as_ref(),
+                                    previous.as_ref(),
+                                );
+                                (source, previous)
+                            })
+                            .await;
+                        drop(previous);
+                        last = Some(source.clone());
                         let followed = this.update(cx, |view, cx| {
                             if view.usage.set_source(source) {
                                 cx.notify();
@@ -678,7 +692,7 @@ impl DetailView {
         // A re-render of the previous copy must not land after this one.
         self._yaml = Task::ready(());
         self.usage
-            .set_object(UsageSubject::of(&self.object.kind), &detail.object);
+            .set_object(UsageSubject::of_detail(&self.object.kind), &detail.object);
         self.fetch = Fetch::Loaded { detail, overview };
         self.run_pending(cx);
         if self.show_managed_fields == managed {
@@ -819,6 +833,7 @@ impl DetailView {
                     .children(self.render_shell_button())
                     .child(
                         Button::new("detail-refresh")
+                            .accessibility_label("Fetch again")
                             .icon(IconName::RefreshCw)
                             .xsmall()
                             .ghost()
@@ -827,6 +842,7 @@ impl DetailView {
                     )
                     .child(
                         Button::new("detail-close")
+                            .accessibility_label("Close")
                             .icon(IconName::Close)
                             .xsmall()
                             .ghost()
@@ -1815,6 +1831,11 @@ impl DetailView {
                 )
                 .child(
                     Button::new(SharedString::from(format!("reveal-{}", entry.key)))
+                        .accessibility_label(if revealed {
+                            format!("Hide value of {}", entry.key)
+                        } else {
+                            format!("Reveal value of {}", entry.key)
+                        })
                         .icon(if revealed {
                             IconName::EyeOff
                         } else {

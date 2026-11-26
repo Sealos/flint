@@ -4,10 +4,16 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use flint_core::cluster;
-use flint_e2e::fake_api::{FakeApiServer, arrivals_at};
+use flint_core::port_forward::{
+    ForwardRequest, ForwardState, ForwardTarget, PortForward, wait_for,
+};
+use flint_e2e::fake_api::{CONTEXT, FakeApiServer, arrivals_at};
 use kube::config::Kubeconfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+#[allow(dead_code)]
+mod core_support;
 
 /// What the fake proxy saw.
 #[derive(Default)]
@@ -815,4 +821,148 @@ fn unreadable_settings_child() {
             cluster::server_version(&client).await.unwrap();
             assert!(arrivals(&api) > 0);
         });
+}
+
+/// Set for the child process of [`a_proxy_change_reconnects_through_the_new_proxy`].
+const CHANGE_CHILD: &str = "FLINT_TEST_PROXY_CHANGE_CHILD";
+
+// covers UP-125: a proxy saved from Settings applies without a restart. The cluster connects
+// again through the new proxy, a forward open on the old connection ends saying why, and one
+// started again carries bytes through the new proxy.
+#[test]
+fn a_proxy_change_reconnects_through_the_new_proxy() {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["proxy_change_child", "--exact", "--nocapture"])
+        .env(CHANGE_CHILD, "1")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .env("KUBECONFIG", "/dev/null")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// Waits for `forward` to listen, and returns its local port.
+async fn forward_port(forward: &PortForward) -> u16 {
+    let mut updates = forward.updates();
+    let shown = tokio::time::timeout(
+        core_support::WAIT,
+        wait_for(&mut updates, |s| s.state != ForwardState::Starting),
+    )
+    .await
+    .expect("the forward's state");
+    assert_eq!(shown.state, ForwardState::Listening, "{shown:?}");
+    shown.local_port.expect("a local port")
+}
+
+/// Sends a few bytes through the forward at `port` and reads them back.
+async fn echoes(port: u16) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    let mut back = [0; 4];
+    tokio::time::timeout(core_support::WAIT, stream.read_exact(&mut back))
+        .await
+        .expect("an answer")
+        .unwrap();
+    assert_eq!(&back, b"ping");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_change_child() {
+    if std::env::var_os(CHANGE_CHILD).is_none() {
+        return;
+    }
+    let api = FakeApiServer::start().await.unwrap();
+    let (proxy, seen) = fake_proxy(api.addr()).await;
+    let core = core_support::Core::start_with(&api, Some("demo"), Default::default()).await;
+    let request = ForwardRequest {
+        cluster: CONTEXT.into(),
+        namespace: "demo".into(),
+        target: ForwardTarget::Pod("web-69c6f74b8b-qv4xv".into()),
+        remote_port: 8080,
+        local_port: None,
+        server: None,
+        uid: None,
+    };
+
+    let before = core.handle.port_forward(request.clone());
+    echoes(forward_port(&before).await).await;
+    assert!(seen.lock().unwrap().heads.is_empty(), "direct at first");
+
+    let applied = core
+        .handle
+        .apply_proxy(
+            flint_core::settings::ProxySetting {
+                url: Some(format!("http://user:proxy-secret@{proxy}")),
+                no_proxy: Vec::new(),
+            },
+            // Reviewed over no saved proxy, as settings.toml has none.
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert!(applied.loaded);
+    assert_eq!(applied.rerouted, [CONTEXT]);
+    assert_eq!(applied.reconnecting, [CONTEXT]);
+    assert_eq!(applied.forwards_ended, 1);
+    let report = tokio::time::timeout(core_support::WAIT, applied.settled)
+        .await
+        .expect("the report in time")
+        .expect("a report");
+    assert_eq!(report.reconnected, [CONTEXT], "{report:?}");
+    assert_eq!(report.rerouted, [CONTEXT], "{report:?}");
+    assert!(report.failed.is_empty(), "{report:?}");
+
+    let mut updates = before.updates();
+    let ended = tokio::time::timeout(
+        core_support::WAIT,
+        wait_for(&mut updates, |s| matches!(s.state, ForwardState::Failed(_))),
+    )
+    .await
+    .expect("the old forward ended");
+    let ForwardState::Failed(failure) = ended.state else {
+        unreachable!("waited for a failure")
+    };
+    assert!(failure.message.contains("proxy"), "{}", failure.message);
+    assert!(!failure.message.contains("proxy-secret"));
+
+    let tunnels = seen.lock().unwrap().heads.len();
+    assert!(tunnels > 0, "the cluster connected again through the proxy");
+
+    // Through a proxy the local cluster is no longer exempt, and nothing given on its old
+    // route carries over: a new forward needs an unlock on the new one.
+    let refused = core.handle.port_forward(request.clone());
+    let mut updates = refused.updates();
+    let shown = tokio::time::timeout(
+        core_support::WAIT,
+        wait_for(&mut updates, |s| s.state != ForwardState::Starting),
+    )
+    .await
+    .expect("the forward's state");
+    assert!(
+        matches!(&shown.state, ForwardState::Failed(f) if f.message.contains("protected")),
+        "{shown:?}"
+    );
+    let loaded = flint_core::kubeconfig::load(&[core.dir.path().join("kubeconfig")]);
+    let route = loaded.contexts[0].grant_server().unwrap();
+    assert!(!route.contains("proxy-secret"), "{route}");
+    core.handle.unlock(CONTEXT, &route);
+
+    let again = core.handle.port_forward(request);
+    echoes(forward_port(&again).await).await;
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.heads.len() > tunnels,
+        "the forward went through the proxy"
+    );
+    // base64 of `user:proxy-secret`.
+    assert!(
+        seen.heads
+            .iter()
+            .all(|head| head.contains("dXNlcjpwcm94eS1zZWNyZXQ=")),
+        "{:?}",
+        seen.heads
+    );
 }

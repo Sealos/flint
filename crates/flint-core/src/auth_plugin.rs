@@ -209,7 +209,9 @@ async fn run(
                 .filter_map(|e| Some((e.get("name")?, e.get("value")?))),
         );
     }
-    let mut interactive = exec.interactive_mode != Some(ExecInteractiveMode::Never);
+    // An access that takes no input never prompts, whatever the definition asks for.
+    let mut interactive =
+        exec.interactive_mode != Some(ExecInteractiveMode::Never) && !lease.takes_no_input();
     // Taken before the plugin starts, so a second prompting plugin waits for the first to give
     // the terminal back instead of starting in the background, where reading it stops it. With
     // `IfAvailable` it waits [`TERMINAL_WAIT`] at most: then it runs without prompting (it may
@@ -249,7 +251,7 @@ async fn run(
     if interactive {
         cmd.stdin(Stdio::inherit()).stderr(Stdio::inherit());
     } else {
-        let stdin = if lease.unattended() {
+        let stdin = if lease.takes_no_input() {
             Stdio::null()
         } else {
             Stdio::piped()

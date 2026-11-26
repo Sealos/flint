@@ -1160,6 +1160,16 @@ impl AlertCenter {
         });
     }
 
+    /// What `cluster`'s newest alert of this run says, if it was raised by the cluster as it is
+    /// defined now. A summary over several clusters belongs to none of them.
+    pub(in crate::ui) fn latest_alert(&self, cluster: &ClusterSummary) -> Option<String> {
+        self.tracker
+            .recent()
+            .filter(|r| !matches!(r.event, AlertEvent::FleetSummary(_)))
+            .find(|r| *r.notification.cluster == *cluster.info.name && r.origin.holds(cluster))
+            .map(|r| r.notification.body.clone())
+    }
+
     #[cfg(any(test, feature = "automation"))]
     pub fn view_state(&self) -> AlertsState {
         AlertsState {

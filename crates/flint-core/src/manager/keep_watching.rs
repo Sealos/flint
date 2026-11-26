@@ -180,7 +180,7 @@ impl KeptGrants {
 
     /// Holds a member connection's `access`, in place of the one before it, so that ending the
     /// consent or quitting ends it too.
-    fn admit_member(&self, id: &str, access: &CredentialAccess) {
+    pub(super) fn admit_member(&self, id: &str, access: &CredentialAccess) {
         let mut live = self.live();
         if live.quitting {
             access.revoke();
@@ -358,11 +358,12 @@ impl ClusterManager {
         self.keep.offers.clear();
         self.keep.feeds.retain(|_, kept| !kept.runs_plugin);
         self.keep.grants.revoke_members();
+        self.drop_member_sign_ins();
         self.void_broken_consents();
     }
 
     /// How `id` signs in on the current load. An answer read from an older load is never used.
-    fn sign_in(&self, id: &str) -> Arc<SignIn> {
+    pub(super) fn sign_in(&self, id: &str) -> Arc<SignIn> {
         self.keep
             .sign_ins
             .as_ref()
@@ -530,6 +531,12 @@ impl ClusterManager {
                 slot.access.set_role(Role::Paused);
             }
         }
+        // And one signed in once from the set view: its program stops until the files are read.
+        for id in self.signed_in_once_members() {
+            if let Some(slot) = self.cluster(&id) {
+                slot.access.set_role(Role::Paused);
+            }
+        }
     }
 
     /// Members whose connection was made under consent: up, and also those still connecting
@@ -573,7 +580,11 @@ impl ClusterManager {
             for kept in self.keep.feeds.values().filter(|kept| kept.runs_plugin) {
                 kept.access.set_role(Role::Background);
             }
-            for id in self.consented_members(false) {
+            for id in self
+                .consented_members(false)
+                .into_iter()
+                .chain(self.signed_in_once_members())
+            {
                 if let Some(slot) = self.cluster(&id) {
                     slot.access.set_role(self.connection_role(&id));
                 }
@@ -674,10 +685,32 @@ impl ClusterManager {
     /// not end it: a paused connection runs nothing anyway.
     pub(super) fn member_consent(&self, id: &str) -> Option<Arc<PluginConsent>> {
         let consent = self.keep.consents.get(id).filter(|c| !c.is_void())?;
+        // Given for the route keep watching was turned on for: another proxy is another route,
+        // even before a pass of `sync_keep_watching` voids it.
+        let entry = self.settings.watched_cluster(id)?;
+        if self.cluster(id)?.info.grant_server().as_deref() != Some(entry.server.as_str()) {
+            return None;
+        }
         match &*self.sign_in(id) {
             SignIn::Plugin(definition) if consent.holds(definition) => Some(Arc::clone(consent)),
             _ => None,
         }
+    }
+
+    /// A seal over `id`'s plugin definition and the program it runs now, if `shown` names that
+    /// definition in a view ([`KeepWatchView::shown_sign_in`]): what a view showed is what runs.
+    pub(super) fn seal_shown_plugin(&self, id: &str, shown: u64) -> Result<PluginConsent, String> {
+        let sign_in = self.sign_in(id);
+        let SignIn::Plugin(definition) = &*sign_in else {
+            return Err(format!("\"{id}\" does not sign in through a command."));
+        };
+        if self.keep.view_key.as_ref().map(|key| key.name(definition)) != Some(shown) {
+            return Err(format!(
+                "\"{id}\" changed. Check its sign-in and try again."
+            ));
+        }
+        PluginConsent::seal(definition)
+            .ok_or_else(|| "Flint could not record this choice.".to_owned())
     }
 
     /// Access for a connection of running-set member `id` made in the background under
@@ -750,6 +783,7 @@ impl ClusterManager {
         self.keep.grants.admit(id, attempt, &access);
         let mut kubeconfig = self.kubeconfig.merged.clone();
         cluster::disable_interactive_exec(&mut kubeconfig);
+        let proxy_generation = self.kubeconfig.proxy_generation;
         // Read with the config it connects from: the connection may finish after a reload.
         let shown = self.cluster(id).and_then(|slot| slot.info.server.clone());
         let pin = self.contexts.pin(id, shown.as_deref());
@@ -760,11 +794,15 @@ impl ClusterManager {
             let Ok(_turn) = connects.acquire_owned().await else {
                 return;
             };
-            let result = cluster::connect_read_only_with_policy(
-                &kubeconfig,
-                &name,
-                cluster::CONNECT_TIMEOUT,
-                &task_access,
+            // Under the proxy setting this load chose its routes with.
+            let result = crate::connection::proxy::pinned_to(
+                proxy_generation,
+                cluster::connect_read_only_with_policy(
+                    &kubeconfig,
+                    &name,
+                    cluster::CONNECT_TIMEOUT,
+                    &task_access,
+                ),
             )
             .await
             .map_err(|error| super::running_set::needs_sign_in(&error));
@@ -1018,18 +1056,9 @@ impl ClusterManager {
         let Some(server) = server else {
             return Err(format!("\"{id}\" names no server."));
         };
-        let sign_in = self.sign_in(id);
-        let SignIn::Plugin(definition) = &*sign_in else {
-            return Err(format!("\"{id}\" does not sign in through a command."));
-        };
-        if self.keep.view_key.as_ref().map(|key| key.name(definition)) != Some(shown) {
-            return Err(format!(
-                "\"{id}\" changed. Check its sign-in and try again."
-            ));
-        }
-        let unrecorded = || "Flint could not record this choice.".to_owned();
-        let consent = PluginConsent::seal(definition).ok_or_else(unrecorded)?;
-        let ticket = OfferTicket::new().ok_or_else(unrecorded)?;
+        let consent = self.seal_shown_plugin(id, shown)?;
+        let ticket =
+            OfferTicket::new().ok_or_else(|| "Flint could not record this choice.".to_owned())?;
         self.keep.offers.insert(
             id.to_owned(),
             PendingOffer {

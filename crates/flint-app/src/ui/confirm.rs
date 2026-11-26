@@ -98,7 +98,41 @@ pub fn open_pinned(
         on_ok(window, cx);
         true
     };
-    open_dialog(window, cx, dialog, pinned, None, None, None, on_ok);
+    open_dialog(
+        window,
+        cx,
+        dialog,
+        pinned,
+        None,
+        None,
+        Guards::default(),
+        on_ok,
+    );
+}
+
+/// Says why the object a confirmation is about has changed since its review, if it has: the
+/// confirmation is then closed unanswered ([`close_changed`]).
+#[derive(Clone)]
+pub(in crate::ui) struct ObjectGuard(Rc<Changed>);
+
+/// Why an object changed since its review, if it did.
+type Changed = dyn Fn(&App) -> Option<String>;
+
+impl ObjectGuard {
+    pub(in crate::ui) fn new(changed: impl Fn(&App) -> Option<String> + 'static) -> Self {
+        Self(Rc::new(changed))
+    }
+
+    pub(in crate::ui) fn changed(&self, cx: &App) -> Option<String> {
+        (self.0)(cx)
+    }
+}
+
+/// What an open confirmation must still hold to be answered.
+#[derive(Clone, Default)]
+struct Guards {
+    connection: Option<ConnectionGuard>,
+    object: Option<ObjectGuard>,
 }
 
 /// [`open_pinned`] for a write: it can be answered only while `guard` holds. Once it does not,
@@ -112,16 +146,29 @@ pub(in crate::ui) fn open_pinned_guarded(
     guard: ConnectionGuard,
     on_ok: impl Fn(&mut Window, &mut App) -> bool + 'static,
 ) {
-    open_dialog(
-        window,
-        cx,
-        dialog,
-        pinned,
-        content,
-        None,
-        Some(guard),
-        on_ok,
-    );
+    let guards = Guards {
+        connection: Some(guard),
+        object: None,
+    };
+    open_dialog(window, cx, dialog, pinned, content, None, guards, on_ok);
+}
+
+/// [`open_pinned_guarded`] for a change to one object: it is also closed, unanswered, once
+/// `object` says that object changed ([`close_changed`]).
+pub(in crate::ui) fn open_pinned_watched(
+    window: &mut Window,
+    cx: &mut App,
+    dialog: DialogText,
+    pinned: usize,
+    guard: ConnectionGuard,
+    object: ObjectGuard,
+    on_ok: impl Fn(&mut Window, &mut App) -> bool + 'static,
+) {
+    let guards = Guards {
+        connection: Some(guard),
+        object: Some(object),
+    };
+    open_dialog(window, cx, dialog, pinned, None, None, guards, on_ok);
 }
 
 /// [`open`], with `content` (a view of its own, such as pickers) drawn under the text, and an
@@ -134,7 +181,16 @@ pub fn open_with(
     content: Option<AnyView>,
     on_ok: impl Fn(&mut Window, &mut App) -> bool + 'static,
 ) {
-    open_dialog(window, cx, dialog, 0, content, None, None, on_ok);
+    open_dialog(
+        window,
+        cx,
+        dialog,
+        0,
+        content,
+        None,
+        Guards::default(),
+        on_ok,
+    );
 }
 
 /// [`open_with`], with `state` read from the content: its note is drawn beside the buttons, and
@@ -157,7 +213,7 @@ pub fn open_gated(
         0,
         Some(content),
         Some(gate),
-        None,
+        Guards::default(),
         on_ok,
     );
 }
@@ -181,7 +237,10 @@ pub(in crate::ui) fn open_gated_guarded(
         0,
         Some(content),
         Some(gate),
-        Some(guard),
+        Guards {
+            connection: Some(guard),
+            object: None,
+        },
         on_ok,
     );
 }
@@ -194,7 +253,7 @@ fn open_dialog(
     pinned: usize,
     content: Option<AnyView>,
     gate: Option<Gate>,
-    guard: Option<ConnectionGuard>,
+    guards: Guards,
     on_ok: impl Fn(&mut Window, &mut App) -> bool + 'static,
 ) {
     #[cfg(any(test, feature = "automation"))]
@@ -216,7 +275,7 @@ fn open_dialog(
     let target_height = Rc::new(Cell::new(px(0.)));
     // What a gated footer's buttons answer from: opening the dialog does not focus it.
     let gate_focus = gate.as_ref().map(|_| cx.focus_handle());
-    let live = LiveDialog::open(window, guard, cx);
+    let live = LiveDialog::open(window, guards, cx);
     window.open_alert_dialog(cx, move |alert, window, cx| {
         let on_ok = on_ok.clone();
         let gate = gate.clone();
@@ -364,7 +423,7 @@ pub fn open_with_alternative(
     // The buttons answer from here, inside the dialog, whatever holds focus.
     let focus = cx.focus_handle();
     let answer_from = focus.clone();
-    let live = LiveDialog::open(window, None, cx);
+    let live = LiveDialog::open(window, Guards::default(), cx);
     window.open_alert_dialog(cx, move |alert, _, _| {
         let (on_ok, on_alternative) = (on_ok.clone(), on_alternative.clone());
         let (live_ok, live_cancel, live_alternative) = (live.clone(), live.clone(), live.clone());
@@ -439,18 +498,18 @@ fn alternative_footer(
 /// The confirmations not yet answered, per window, oldest first. A dialog's controls stay on
 /// screen until the next frame, so a press can reach one that was already answered.
 #[derive(Default)]
-struct LiveDialogs(std::collections::HashMap<WindowId, Vec<Weak<Option<ConnectionGuard>>>>);
+struct LiveDialogs(std::collections::HashMap<WindowId, Vec<Weak<Guards>>>);
 
 impl Global for LiveDialogs {}
 
 /// One confirmation's place in [`LiveDialogs`], for as long as the dialog holds it, with the
-/// connection it can be answered on, if it is about one.
+/// connection it can be answered on and the object it is about, if any.
 #[derive(Clone)]
-struct LiveDialog(Rc<Option<ConnectionGuard>>);
+struct LiveDialog(Rc<Guards>);
 
 impl LiveDialog {
-    fn open(window: &Window, guard: Option<ConnectionGuard>, cx: &mut App) -> Self {
-        let dialog = Self(Rc::new(guard));
+    fn open(window: &Window, guards: Guards, cx: &mut App) -> Self {
+        let dialog = Self(Rc::new(guards));
         let live = cx.default_global::<LiveDialogs>();
         live.0.retain(|_, stack| {
             stack.retain(|d| d.strong_count() > 0);
@@ -479,7 +538,12 @@ impl LiveDialog {
 
     /// Whether the connection this dialog is about has changed since it opened.
     fn is_stale(&self, cx: &App) -> bool {
-        self.0.as_ref().as_ref().is_some_and(|g| !g.holds(cx))
+        self.0.connection.as_ref().is_some_and(|g| !g.holds(cx))
+    }
+
+    /// Why the object this dialog is about has changed since its review, if it has.
+    fn object_changed(&self, cx: &App) -> Option<String> {
+        self.0.object.as_ref()?.changed(cx)
     }
 
     /// Marks this dialog answered, if it is the newest one: whether it was.
@@ -509,15 +573,38 @@ pub fn close_newest(window: &mut Window, cx: &mut App) {
     window.close_dialog(cx);
 }
 
-/// Whether the newest confirmation open in `window` is about a connection that has changed.
-pub(in crate::ui) fn newest_is_stale(window: &mut Window, cx: &mut App) -> bool {
+/// Whether a confirmation opened here is still unanswered in `window`. Unlike
+/// [`WindowExt::has_active_dialog`], the Settings modal does not count: a question asked from
+/// inside it (or a quit over it) opens above it.
+pub fn any_open(window: &mut Window, cx: &mut App) -> bool {
+    newest(window, cx).is_some()
+}
+
+/// The newest confirmation open in `window`, if any.
+fn newest(window: &mut Window, cx: &mut App) -> Option<LiveDialog> {
     if !window.has_active_dialog(cx) {
-        return false;
+        return None;
     }
     cx.try_global::<LiveDialogs>()
         .and_then(|live| live.0.get(&window.window_handle().window_id()))
         .and_then(|stack| stack.iter().rev().find_map(Weak::upgrade))
-        .is_some_and(|newest| LiveDialog(newest).is_stale(cx))
+        .map(LiveDialog)
+}
+
+/// Whether the newest confirmation open in `window` is about a connection that has changed.
+pub(in crate::ui) fn newest_is_stale(window: &mut Window, cx: &mut App) -> bool {
+    newest(window, cx).is_some_and(|newest| newest.is_stale(cx))
+}
+
+/// Closes, unanswered, each newest confirmation whose object changed since its review: why the
+/// first one closed, if any did.
+pub(in crate::ui) fn close_changed(window: &mut Window, cx: &mut App) -> Option<String> {
+    let mut first = None;
+    while let Some(why) = newest(window, cx).and_then(|newest| newest.object_changed(cx)) {
+        close_newest(window, cx);
+        first.get_or_insert(why);
+    }
+    first
 }
 
 /// Closes, unanswered, each newest confirmation whose connection has changed: whether any closed.

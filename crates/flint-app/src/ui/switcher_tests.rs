@@ -742,6 +742,62 @@ async fn an_object_missing_only_from_an_old_list_opens(cx: &mut TestAppContext) 
     assert_eq!(t.selected(cx), None, "the cleared pick stayed armed");
 }
 
+// covers #313: with nothing typed, the objects opened lately are listed first, latest first;
+// typing lists what matches as before.
+#[gpui_kit::test]
+async fn recently_opened_objects_come_first_with_nothing_typed(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let _stored = alpha_with_objects(cx, &t).await;
+    for (kind, namespace, name) in [
+        ("pods", "kube-system", "coredns-1"),
+        ("deployments", "demo", "web"),
+    ] {
+        t.dispatch(
+            cx,
+            "workspace::OpenObject",
+            serde_json::json!({ "kind": kind, "namespace": namespace, "name": name }),
+        )
+        .unwrap();
+    }
+    t.focus_workspace(cx);
+    open_switcher(cx, &t).await;
+    let labels_now = labels(&shown(cx, &t))
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        labels_now[..4],
+        ["demo/web", "kube-system/coredns-1", "Pods", "Deployments"]
+    );
+    assert_eq!(labels_now.iter().filter(|l| *l == "demo/web").count(), 1);
+    t.type_text(cx, "web");
+    assert_eq!(labels(&shown(cx, &t)), ["demo/web", "demo/web-7d9f"]);
+}
+
+// covers #313: an object opened by clicking or moving to its row is listed among the recent
+// objects too, not only one opened by name.
+#[gpui_kit::test]
+async fn objects_opened_from_list_rows_are_recent(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let _stored = alpha_with_objects(cx, &t).await;
+    t.open_pods(
+        cx,
+        &[("demo", "web-7d9f", 0), ("kube-system", "coredns-1", 0)],
+    )
+    .await;
+    t.dispatch(
+        cx,
+        "resource_list::SelectRow",
+        serde_json::json!({"namespace": "kube-system", "name": "coredns-1"}),
+    )
+    .unwrap();
+    t.focus_workspace(cx);
+    open_switcher(cx, &t).await;
+    assert_eq!(labels(&shown(cx, &t))[0], "kube-system/coredns-1");
+}
+
 // covers UP-31: another cluster becoming active while the switcher is open lists that
 // cluster anew, keeping what was typed: the first cluster's rows do not stay to be opened on
 // it. An Enter listed on a cluster no longer active is refused.
