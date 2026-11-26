@@ -11,7 +11,8 @@
 //!
 //! Sections so far: Appearance, Alerts (desktop notifications), Watching (the default watch
 //! mode), Thresholds and Cluster overrides ([`super::settings_thresholds`]), and Logs, Paths and
-//! Write safety ([`super::settings_logs_paths`]). A slice that adds settings adds a [`Section`]
+//! Write safety ([`super::settings_logs_paths`]), and Network ([`super::settings_network`]), whose
+//! proxy is applied on its own rather than saved with the draft. A slice that adds settings adds a [`Section`]
 //! (or a block to one), its
 //! [`super::settings_draft::Change`]s and its [`Stop`]s.
 
@@ -33,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use super::registry;
 use super::settings_draft::{Field, SettingsDraft};
 use super::settings_logs_paths::{self as logs_paths, LogsPathsFields, TextField};
+use super::settings_network::{self as network, NetworkFields, NetworkStop};
 use super::settings_thresholds::{
     self, KnownCluster, OverridesLayout, ThresholdStop, ThresholdsPage,
 };
@@ -115,10 +117,11 @@ pub enum Section {
     Logs,
     Paths,
     Safety,
+    Network,
 }
 
 impl Section {
-    pub const ALL: [Section; 8] = [
+    pub const ALL: [Section; 9] = [
         Section::Appearance,
         Section::Alerts,
         Section::Watching,
@@ -127,6 +130,7 @@ impl Section {
         Section::Logs,
         Section::Paths,
         Section::Safety,
+        Section::Network,
     ];
 
     pub fn label(self) -> &'static str {
@@ -139,6 +143,7 @@ impl Section {
             Section::Logs => "Logs",
             Section::Paths => "Paths",
             Section::Safety => "Write safety",
+            Section::Network => "Network",
         }
     }
 
@@ -152,6 +157,7 @@ impl Section {
             Section::Logs => "settings-section-logs",
             Section::Paths => "settings-section-paths",
             Section::Safety => "settings-section-safety",
+            Section::Network => "settings-section-network",
         }
     }
 
@@ -169,6 +175,8 @@ impl Section {
             ),
             Section::Paths => matches!(field, Field::KubeconfigPaths | Field::Path | Field::Helm),
             Section::Safety => *field == Field::ProtectLocalClusters,
+            // The proxy is applied on its own, never through the draft.
+            Section::Network => false,
         }
     }
 }
@@ -190,6 +198,8 @@ pub enum Stop {
     RemoveKubeconfig(usize),
     AddKubeconfig,
     ProtectLocalClusters,
+    /// A control of the Network section.
+    Network(NetworkStop),
     Revert,
     Save,
 }
@@ -213,6 +223,7 @@ impl Stop {
             Stop::RemoveKubeconfig(index) => logs_paths::remove_id(index).into(),
             Stop::AddKubeconfig => "settings-kubeconfig-add".into(),
             Stop::ProtectLocalClusters => "settings-protect-local-clusters".into(),
+            Stop::Network(stop) => stop.id().into(),
             Stop::Revert => "settings-revert".into(),
             Stop::Save => "settings-save".into(),
         }
@@ -251,6 +262,7 @@ pub fn stops(
         Section::Logs => stops.extend(logs_paths::logs_stops()),
         Section::Paths => stops.extend(logs_paths::paths_stops(kubeconfigs)),
         Section::Safety => stops.push(Stop::ProtectLocalClusters),
+        Section::Network => stops.extend(network::stops()),
     }
     stops.extend([Stop::Revert, Stop::Save]);
     stops
@@ -296,6 +308,8 @@ pub struct SettingsPage {
     pub thresholds: ThresholdsPage,
     /// The Logs and Paths sections' text inputs and the kubeconfig list's note.
     pub logs_paths: LogsPathsFields,
+    /// The Network section's proxy fields and the last Apply.
+    pub network: NetworkFields,
     /// The scrolling content, so the keyboard cursor can bring a control into view.
     pub scroll: ScrollHandle,
 }
@@ -313,6 +327,7 @@ impl SettingsPage {
             cursor: None,
             thresholds: ThresholdsPage::default(),
             logs_paths: LogsPathsFields::default(),
+            network: NetworkFields::default(),
             scroll: ScrollHandle::new(),
         }
     }
@@ -355,6 +370,7 @@ impl SettingsPage {
                 .collect(),
             kubeconfig_note: self.logs_paths.kubeconfig_note.clone(),
             thresholds: settings_thresholds::view_state(self, &shown, clusters),
+            network: network::view_state(&self.network, &file.proxy, invalid),
             changed_on_disk: banner_shown(self, file),
             invalid,
             can_save: self.saving.is_none() && can_save(&self.draft, invalid),
@@ -735,6 +751,7 @@ fn section_body(
         Section::Logs => logs_paths::logs_body(page, theme),
         Section::Paths => logs_paths::paths_body(page, shown, theme),
         Section::Safety => one(logs_paths::safety_body(page, shown, theme)),
+        Section::Network => network::body(page, &shown.proxy, theme),
     }
 }
 

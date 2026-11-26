@@ -616,6 +616,7 @@ pub fn content_row(stop: Stop, kubeconfigs: usize) -> Option<usize> {
         Stop::AddKubeconfig => Some(add),
         Stop::Text(TextField::Path) => Some(add + 1),
         Stop::Text(TextField::Helm) => Some(add + 2),
+        Stop::Network(stop) => Some(stop.row()),
         Stop::Appearance(_)
         | Stop::DesktopNotifications
         | Stop::WatchMode(_)
