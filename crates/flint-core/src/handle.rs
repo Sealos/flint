@@ -365,6 +365,11 @@ pub(crate) enum Request {
         writes: Vec<crate::settings::SettingsWrite>,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Save this proxy setting, put it in use and connect everything again on it.
+    ApplyProxy {
+        setting: crate::settings::ProxySetting,
+        reply: oneshot::Sender<Result<ProxyApplied, String>>,
+    },
     /// Activates `cluster` only if it is still the slot and definition given, in the same step.
     ActivatePinned {
         cluster: ClusterId,
@@ -656,6 +661,42 @@ pub enum ReloadError {
     Stopped,
     #[error("the kubeconfig files could not be loaded")]
     Failed,
+}
+
+/// What a proxy change saved from Settings set going ([`CoreHandle::apply_proxy`]).
+#[derive(Debug)]
+pub struct ProxyApplied {
+    /// The clusters connected again on the new setting: the selected one, the running set's
+    /// members and the clusters watched in the background. Each has a new slot.
+    pub reconnecting: Vec<ClusterId>,
+    /// The clusters the new setting reaches another way (another proxy, or none). What was pinned
+    /// to the old route no longer holds for them: their log streams and shells end, and trust,
+    /// unlocks, AI exposure and keep watching given on it must be given again. Known once the
+    /// files were read under the new setting (`loaded`); [`ProxyReconnectReport::rerouted`]
+    /// always has them.
+    pub rerouted: Vec<ClusterId>,
+    /// How many port-forwards ended. Each was bound to a connection that is gone; start it
+    /// again to forward on the new one.
+    pub forwards_ended: usize,
+    /// Whether the kubeconfig files were read under the new setting already. Until they are,
+    /// every cluster is held: nothing new connects and nothing is written.
+    pub loaded: bool,
+    /// Resolves once each cluster in `reconnecting` connected or failed, or after
+    /// [`PROXY_REPORT_AFTER`] with what is still connecting counted as failed.
+    pub settled: oneshot::Receiver<ProxyReconnectReport>,
+}
+
+/// How long a proxy change waits for its reconnections before it reports.
+pub const PROXY_REPORT_AFTER: Duration = Duration::from_secs(60);
+
+/// How the clusters a proxy change connected again came back ([`ProxyApplied::settled`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProxyReconnectReport {
+    /// The clusters the new setting reaches another way, as when the report was made.
+    pub rerouted: Vec<ClusterId>,
+    pub reconnected: Vec<ClusterId>,
+    /// Each with why, in words safe to show: never a proxy's credentials.
+    pub failed: Vec<(ClusterId, String)>,
 }
 
 /// The full cluster list. Sent whole whenever kubeconfig is (re)loaded.
@@ -1220,6 +1261,28 @@ impl CoreHandle {
             }
             rx.await
                 .unwrap_or_else(|_| Err("the settings were not written".to_owned()))
+        }
+    }
+
+    /// Saves `setting` as the `[proxy]` of `settings.toml` and puts it in use without a restart:
+    /// every cluster client, feed and background watch is built again on it, and every
+    /// port-forward ends. Contexts the new setting reaches another way are on another route, so
+    /// sessions and grants pinned to the old one end, as for a re-pointed context. Refused,
+    /// changing nothing, for a setting [`crate::settings::ProxySetting::check`] refuses, while
+    /// `settings.toml` is invalid, or while it was unreadable when Flint started. What it says
+    /// holds none of the proxy's credentials. Works on any executor.
+    pub fn apply_proxy(
+        &self,
+        setting: crate::settings::ProxySetting,
+    ) -> impl Future<Output = Result<ProxyApplied, String>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let sent = self.requests.push(Request::ApplyProxy { setting, reply });
+        async move {
+            if sent.is_err() {
+                return Err("the proxy setting could not be sent to be saved".to_owned());
+            }
+            rx.await
+                .unwrap_or_else(|_| Err("the proxy setting was not saved".to_owned()))
         }
     }
 

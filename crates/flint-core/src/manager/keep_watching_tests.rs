@@ -1543,6 +1543,40 @@ async fn a_sign_in_spent_while_connecting_asks_again_without_a_retry() {
     assert_eq!(manager.cluster("dev").unwrap().attempt, attempt, "no retry");
 }
 
+// A member slot held for a proxy change refuses a click, and a sign-in asked for before the
+// change does not start on it.
+#[tokio::test]
+async fn a_slot_held_for_a_proxy_change_refuses_a_sign_in() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _) = signed_out_set(&plugin, config.path().to_owned());
+    let behind = crate::connection::proxy::generation().wrapping_add(1);
+    manager.cluster_mut("dev").unwrap().proxy_generation = behind;
+
+    let refused = click_sign_in(&mut manager).unwrap_err();
+    assert!(refused.contains("proxy"), "{refused}");
+    assert!(manager.signing_in.is_empty(), "nothing held");
+
+    let current = crate::connection::proxy::generation();
+    manager.cluster_mut("dev").unwrap().proxy_generation = current;
+    click_sign_in(&mut manager).unwrap();
+    manager.cluster_mut("dev").unwrap().proxy_generation = behind;
+    pump_later(&mut manager);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(plugin.starts().is_empty(), "nothing ran on the held slot");
+    // Once the slot is replaced on the new setting, the sign-in asked for on the old route
+    // still holds nothing: the attempt checks the slot again before it takes it.
+    assert!(
+        manager
+            .take_member_sign_in("dev", Role::Background, 0)
+            .is_none()
+    );
+    assert!(
+        manager.signing_in.is_empty(),
+        "the sign-in was used up by the refusal"
+    );
+}
+
 // When the token is due, the refused second start reaches the manager: the member asks for a
 // sign-in again at once.
 #[tokio::test]

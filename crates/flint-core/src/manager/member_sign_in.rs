@@ -64,6 +64,13 @@ impl ClusterManager {
         let Some(slot) = self.cluster(id) else {
             return Err(format!("cluster \"{id}\" no longer exists"));
         };
+        // Loaded under a proxy setting no longer in use: nothing starts on it until a load
+        // replaces it.
+        if slot.proxy_generation != crate::connection::proxy::generation() {
+            return Err(format!(
+                "\"{id}\" is reconnecting under the new proxy setting. Try again once it has."
+            ));
+        }
         if paused
             || self.paused(id)
             || self.unsettled(id)
