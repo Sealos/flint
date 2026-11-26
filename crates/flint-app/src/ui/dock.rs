@@ -981,6 +981,7 @@ impl Dock {
             )
             .child(
                 Button::new(("dock-tab-close", id as usize))
+                    .accessibility_label("Close tab")
                     .icon(IconName::Close)
                     .xsmall()
                     .ghost()
@@ -1032,6 +1033,7 @@ impl Dock {
     /// how to reach a tab scrolled out of the strip ([`ShowTabList`]).
     fn render_tab_list(&self) -> impl IntoElement {
         Button::new("dock-tab-list")
+            .accessibility_label("All tabs")
             .icon(IconName::ChevronsUpDown)
             .xsmall()
             .ghost()
@@ -1045,6 +1047,7 @@ impl Dock {
 
     fn render_hide(&self) -> impl IntoElement {
         Button::new("dock-hide")
+            .accessibility_label("Hide the dock")
             .icon(IconName::ChevronDown)
             .xsmall()
             .ghost()

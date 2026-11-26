@@ -437,6 +437,7 @@ pub(in crate::ui) fn render_card(
     let opens = card.state.counts();
     let header = h_flex()
         .id(SharedString::from(format!("set-card-open-{cluster}")))
+        .aria_label(card.shown.clone())
         .gap_1()
         .min_w_0()
         .font_weight(FontWeight::SEMIBOLD)
