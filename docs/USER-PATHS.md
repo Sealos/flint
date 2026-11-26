@@ -865,32 +865,6 @@ Deferred until cluster sets are scheduled (#199).
   an invalid field, text typed while saving), e2e
   (`flint-e2e/tests/app/settings.rs`).
 
-### UP-127 Log limits, paths and local cluster protection in Settings
-- **When** I open the Logs, Paths or Write safety section of Settings and change the log buffer limits, the extra
-  kubeconfig files, the `PATH` or `helm` override, or whether local clusters are protected.
-- **Then** each log limit is checked as I type it (lines per tab 1,000 to 1,000,000, MiB per tab 8 to 1,024, MiB for
-  all tabs 64 to 16,384); a value out of range shows an error under its field, and Save writes nothing but brings that
-  field into view until I fix it or Revert; quitting or closing with such a field asks to discard it. Text I type while
-  a Save is being written stays in the draft. Save writes every edit in one save, or none of them. Add… opens a file picker and adds the files I choose to the kubeconfig list (a file already listed, or one
-  that is not there, is refused with a note; files already in the list stay accepted), Remove drops the row I chose,
-  and after Save the clusters reload as after a hand edit.
-  `PATH` takes absolute folders separated by colons and applies after a restart; `helm` takes a path, absolute or under
-  `~`, which Flint checks when it runs helm; either left empty uses the default. Turning protection of local clusters on saves without a question.
-  Turning it off asks at Save, whichever way Save is asked for (the button, Save anyway, the keyboard, the palette, or
-  the quit and close question), saying that writes to local clusters will no longer be gated; Enter and Cancel keep the
-  whole draft unsaved, only the button confirms. If my edits or `settings.toml` change while that question is open,
-  confirming saves nothing and the footer says to review and save again; the next Save asks again, and says when the
-  file was changed outside Settings. The core turns protection off only under a real file lock and only over the
-  settings I confirmed it over: if `settings.toml` changed after I confirmed, nothing is written and the question is
-  asked again. Its write gate stays authoritative. From the keyboard, Tab reaches every field and button, puts focus in a text field, and goes on from
-  inside one; Escape leaves a field for the view.
-- Tests: unit (range checks, path checks, the kubeconfig list, `SettingsWrite` setters, the lock needed to unprotect,
-  unprotect refused over a changed file, alone and in one save with other settings, saved kubeconfig entries kept),
-  ui (typing and saving a limit, field errors and Revert, the file picker, path and helm, protection on without a
-  question, off with Enter, Cancel and confirm, a change on disk during the question, the quit question, Save showing
-  an invalid field, text typed while saving), e2e
-  (`flint-e2e/tests/app/settings.rs`).
-
 ## M6: Install
 
 ### UP-80 Install from the DMG
@@ -908,21 +882,23 @@ Deferred until cluster sets are scheduled (#199).
 
 ---
 
-## M7: Fleet actions (v0.7)
+## M7: Fleet actions (v0.8)
 
 ### UP-100 Restart or scale a workload on several clusters
-- **When** I select a Deployment in a combined view and choose Rollout Restart or Scale on 3 clusters.
-- **Then** a preview lists each target cluster with a dry-run result and a checkbox. Restart and scale each run one
-  cluster at a time and stop at the first failure, reporting a partial result that says which clusters were done and
-  which were not. Locked clusters in the list
-  need their name typed first.
-- Tests: unit (sequencing, stop on failure, partial result for restart and scale), e2e.
+- **When** I select a Deployment, StatefulSet or DaemonSet in a cluster set's combined list and choose Rollout Restart
+  Across Set… or Scale Across Set….
+- **Then** Flint dry-runs every member and shows one confirmation that lists each member's change or the reason it is
+  left out. Protected, paused and disconnected members are left out with that reason, and nothing here unlocks a
+  cluster. The run goes one member at a time and stops at the first failure, reporting which members were done and
+  which were not.
+- Tests: unit (sequencing, stop on failure, partial result), e2e (`flint-e2e/tests/fleet_actions.rs`).
 
 ### UP-101 Apply one manifest to several clusters
-- **When** I apply a YAML manifest to a cluster set.
-- **Then** I see a server-side dry-run diff per cluster before anything changes, can drop clusters from the target list,
-  and the apply runs one cluster at a time as above. Delete follows the same flow.
-- Tests: unit, e2e.
+- **When** I choose Apply YAML Across Set… or Delete Across Set… in a cluster set.
+- **Then** I see a server-side dry-run result per member before anything changes. A member whose review or dry run
+  failed is dropped from the list by hand before the run can start. Protected, paused and disconnected members are left
+  out as above, and the run goes one member at a time and stops at the first failure.
+- Tests: unit, e2e (`flint-e2e/tests/fleet_actions.rs`).
 
 ## M8: Recordings (after 1.0)
 

@@ -7,8 +7,13 @@ Behaviour that is accepted for now. Each entry says what happens and what stays 
 - **Up to 32 clusters, with no total memory limit.** Flint refuses a 33rd cluster. Each watched kind is capped at
   50,000 objects per cluster, and a kind over its cap is reported as too large rather than counted in part. There is
   no cap on memory across clusters. At 32 clusters the worst case is about 17.6 million cached entries (32 clusters
-  by 11 sources by 50,000 entries: the seven watched kinds, warning events, pending claims and the two usage reads)
-  and about 62 MB of usage trends.
+  by 11 sources by 50,000 entries: the seven watched kinds, warning events, pending claims and the two usage reads).
+- **CPU and memory history is kept in memory only, per cluster.** It starts empty after Flint restarts, and a cluster
+  that is neither selected, in the open set nor kept watching drops it. Each cluster has its own history, capped at
+  500 nodes, so there is no cap across clusters. The worst case for one cluster with every series full is about
+  44 MiB at 24 hours and 11 MiB at the default 6 hours (240 samples per hour at 8 bytes each, plus 16 bytes per
+  sample for the poll times). With 32 clusters kept watching, that is about 1.4 GiB at 24 hours and 350 MiB at
+  6 hours. A history grows as samples arrive, so it is full only after its whole window has been collected.
 - **Warm resource lists add up to 1.35 million cached objects.** At most 3 watched clusters keep their resource
   lists in the background, each with at most 8 kinds plus its CustomResourceDefinition list, at 50,000 objects
   per kind: 3 clusters by 9 kinds by 50,000 objects, on top of the keep-watching figure above.

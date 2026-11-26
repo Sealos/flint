@@ -142,20 +142,26 @@
           <h3>Several clusters at once</h3>
           <p>Choose two to five clusters, then Open Together for one combined list, or save them as a cluster set with
             a dashboard that shows the unhealthiest cluster first. Keep Watching, in a cluster's row menu, gathers
-            problems in the background.</p>
+            problems in the background. The home screen on launch shows each kept cluster's health at a glance, and a
+            fleet action (restart, scale, apply YAML or delete) can run across a set, one cluster at a time.</p>
+        </article>
+        <article class="card">
+          <h3>Usage against requests and limits</h3>
+          <p>With metrics-server, pod, node and workload lists draw CPU and memory as bars against the row's request and
+            limit, and the detail pane shows rings. Cluster overviews show sparklines over a metrics history of 1 to 24
+            hours, kept in memory while Flint watches the cluster.</p>
         </article>
         <article class="card">
           <h3>Problems and alerts</h3>
           <p>Toggle Problems Only shows just the rows with problems. Desktop notifications for new problems on watched
-            clusters are off by default and need Flint.app. Pod and node lists show CPU and memory from
-            metrics-server.</p>
+            clusters are off by default and need Flint.app.</p>
         </article>
         <article class="card">
           <h3>Port-forward, Helm and regex search</h3>
           <p>Forward Port opens a local port to a pod or service, and Show Port Forwards lists them. Show Helm
-            Releases reads releases for clusters with a static credential (exec-plugin and auth-provider clusters are
-            not supported yet), and a failed release shows Helm's reason. Log search can be a regular expression
-            (⌥⌘R). Clusters behind an HTTP or SOCKS5 proxy connect through it.</p>
+            Releases reads releases, with a failed release's reason from Helm. On an exec-plugin cluster, turn on Keep
+            Watching and its background sign-in first; auth-provider clusters are not supported. Log search can be a regular expression
+            (⌥⌘R). Clusters behind an HTTP or SOCKS5 proxy connect through it, and Settings &gt; Network applies a proxy without a restart.</p>
         </article>
         <article class="card">
           <h3>Follows macOS light and dark</h3>
@@ -189,20 +195,7 @@ claude mcp add flint -- /usr/local/bin/flint mcp
 /usr/local/bin/flint mcp</code></pre>
     </section>
 
-    <section id="compare" class="wrap section">
-      <h2>Compared with other Kubernetes MCP servers</h2>
-      <div class="compare-wrap" role="region" aria-label="Comparison of Kubernetes MCP servers" tabindex="0">
-        <table class="compare">
-          <thead><tr><td></td><th scope="col">Flint</th><th scope="col"><a href="https://docs.lenshq.io/k8slens/mcp-server/">Lens MCP Server</a></th><th scope="col"><a href="https://github.com/containers/kubernetes-mcp-server">kubernetes-mcp-server</a></th></tr></thead>
-          <tbody>
-            <tr><th scope="row">Which clusters</th><td>Only those you expose, one by one, each tied to its API server URL</td><td>Every cluster Lens knows</td><td>The contexts in its kubeconfig</td></tr>
-            <tr><th scope="row">Writes</th><td>None: no tools for them</td><td>Its <code>kubectl</code> tool refuses writes; editors and Helm dialogs it fills in apply changes after you confirm; some tools change Lens itself (port forwards, settings)</td><td>Writes allowed, including delete and pod exec, unless its <code>read_only</code> or <code>disable_destructive</code> setting is on</td></tr>
-            <tr><th scope="row">Credential redaction in results</th><td>Secret values, and credentials in logs, events, messages and container arguments</td><td>Not described</td><td>Not for tool results (only its own log notifications); Secrets can be denied by configuration</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <p class="caption">As their documentation describes them in November 2026.</p>
-    </section>
+    
 
     <section id="roadmap" class="wrap section">
       <h2>Roadmap</h2>
@@ -213,7 +206,7 @@ claude mcp add flint -- /usr/local/bin/flint mcp
         <li class="done"><b>v0.3.0</b><span>Resource switcher, Go Back and pane navigation keys, plus matching-lines-only and errors-only log filters with adjustable context lines</span></li>
         <li class="done"><b>v0.4.0</b><span>YAML editing with inline validation, dry-run and diff; delete, scale, restart, cordon, drain</span></li>
         <li class="done"><b>v0.6.0</b><span>Cluster sets with a dashboard, Keep Watching and desktop alerts, problems-only lists, CPU and memory columns, port-forward panel, read-only Helm releases, regex log search</span></li>
-        <li class="done"><b>Next release</b><span>Guarded fleet actions across a cluster set (restart and scale: a dry run per cluster, one cluster at a time, stop at the first failure), deployment rollouts in recent activity, SOCKS5 proxies, warm lists for kept-watching clusters</span></li>
+        <li class="done"><b>Next release</b><span>Fleet actions across a cluster set (restart, scale, apply YAML and delete: a dry run per cluster, one cluster at a time, stop at the first failure), a home screen, usage bars and rings against request and limit, workload CPU and memory columns, a CPU and memory history, a Settings window and menus, Secret editing, deployment rollouts in recent activity, SOCKS5 proxies, warm lists for kept-watching clusters</span></li>
         <li class="next"><b>Next</b><span>Signed and notarized universal build, Homebrew cask, first signed release</span></li>
         <li><b></b><span>Curated views for core kinds and <a href="https://github.com/Sealos/flint/issues/265">log time ranges</a></span></li>
       </ol>

@@ -3,7 +3,7 @@
 Flint is a fast, native Kubernetes app for your Mac that keeps many clusters in one window: open them together, save
 them as a cluster set, keep them watched in the background, and get a desktop alert when one gets a new problem.
 
-It is in the space of Lens and Freelens. Flint is written in Rust with [GPUI](https://www.gpui.rs/), so it starts
+Flint is written in Rust with [GPUI](https://www.gpui.rs/), so it starts
 fast, stays light on memory, and keeps up with large clusters. It runs on macOS and, best effort, Linux. It also ships
 a read-only [MCP](https://modelcontextprotocol.io/) server, `flint mcp`, that lets Claude Code and other AI agents
 read only the clusters you choose (see [MCP server for AI agents](#mcp-server-for-ai-agents)).
@@ -149,16 +149,6 @@ that array instead; TOML doesn't allow both forms for one key, and an invalid fi
   creates, changes or deletes anything. It reads with the kubeconfig's credentials, so a user with read-only RBAC
   limits it further.
 
-### Compared with other Kubernetes MCP servers
-
-As their documentation describes them in November 2026:
-
-| | Flint (`flint mcp`) | [Lens MCP Server](https://docs.lenshq.io/k8slens/mcp-server/) | [kubernetes-mcp-server](https://github.com/containers/kubernetes-mcp-server) |
-|---|---|---|---|
-| Which clusters | Only those you expose, one by one, each tied to its API server URL, optionally limited to some namespaces and kinds | Every cluster Lens knows | The contexts in its kubeconfig |
-| Writes | None: no tools for them | Its `kubectl` tool refuses writes; editors and Helm dialogs it fills in apply changes after you confirm; some tools change Lens itself (port forwards, settings) | Writes allowed, including delete and pod exec, unless its `read_only` or `disable_destructive` setting is on |
-| Credential redaction in results | Secret values, and credentials in logs, events, messages and container arguments | Not described | Not for tool results (only its own log notifications); Secrets can be denied by configuration |
-
 ## Status
 
 Flint is in early development.
@@ -170,7 +160,12 @@ Flint is in early development.
   columns, a namespace and text filter, and a detail view with metadata, conditions, events and YAML.
 - A watch mode for the active cluster: watch all kinds, or the kinds of open views plus the problem kinds (On view), with a default and per-cluster overrides. On view still detects problems on the selected cluster and on open set members, and a kept-watching cluster keeps its recent lists warm across switches (at most 8 kinds on at most 3 clusters), so reopening it shows rows at once.
 - YAML editing with a server dry-run and diff, plus delete, scale, rollout restart, cordon and drain, all behind the
-  cluster protection.
+  cluster protection. A Secret can be edited too; its masked values are never written back, so a value you leave alone
+  stays as it was.
+- A home screen on launch (and **Go Home** in the sidebar or palette): a card for each cluster kept watching, showing
+  its health and problem counts, and a row with Open and Keep Watching for every other cluster. It connects nothing.
+- File, Cluster and Resource menus in the menu bar, with the same actions as the palette and row menus, disabled when
+  the palette would not list them.
 - A bottom dock with pod and workload logs (follow, search, timestamps, previous logs, save to a file) and shells into
   containers. Open them from a row's context menu, the detail pane or the keyboard.
 - Log filters: Matching Lines Only (M) keeps lines that match your search, and Errors Only (E) keeps warnings and
@@ -189,7 +184,8 @@ Flint is in early development.
 - A command palette (⇧⌘P) that runs any action by name and shows its shortcut (see [Keys](#keys)).
 - A resource switcher (⌘P) that ranks matches for the active cluster's kinds and objects already in memory. Open a
   kind's list or jump straight to an object's details.
-- Go Back (⌘[) returns to the previous kind and object on the active cluster and restores the list's text filter.
+- Go Back (⌘[) returns to the previous kind and object on the active cluster and restores the list's text filter, and
+  Go Forward (⌘]) goes the other way.
   Tab and Shift-Tab cycle through panes outside text fields and shells. Enter opens the selected list row.
 - Light and dark themes that follow the system (View > Appearance, or the `appearance` setting, overrides it).
 - Cluster sets: **Choose Clusters** in the sidebar, then **Open Together** to see two to five clusters in one combined
@@ -204,8 +200,12 @@ Flint is in early development.
   overrides that for one cluster.
 - **Toggle Problems Only** in pod, workload and node lists shows only rows with problems, by the same rules as the
   overview and the alerts.
-- CPU and memory usage columns in pod and node lists, from metrics-server. Without it the columns are hidden and a
-  hint says why.
+- CPU and memory usage from metrics-server: columns in pod, node and workload lists, drawn as bars against the
+  row's request and limit (or the node's allocatable), and rings in the detail pane. A cluster overview and the set
+  dashboard show CPU and memory sparklines over the metrics history, 1 to 24 hours (6 by default, a setting with a
+  per-cluster override). The history is kept in memory while Flint watches the cluster and starts empty after a
+  restart. Without metrics-server the columns are hidden and a hint says why.
+- **Disconnect Cluster…** stops a cluster's watches, log streams and background watching until you select it again.
 - **Forward Port** on a pod or service, and **Show Port Forwards** for the panel that lists, opens and stops them.
   Forwards listen on `127.0.0.1` only.
 - **Show Helm Releases…**: read-only Helm releases with details, history, masked values and manifest. On a
@@ -215,13 +215,16 @@ Flint is in early development.
   reason, with credential-like values masked.
 - Connections through an HTTP CONNECT or SOCKS5 proxy: a kubeconfig cluster's `proxy-url`, the `[proxy]` setting or
   `HTTPS_PROXY` can be `http://`, `socks5://` or `socks5h://`, with TLS to the API server itself. Helm cannot use a
-  SOCKS proxy yet.
+  SOCKS proxy yet. Settings > Network applies a proxy at once, without a restart: Flint reconnects every cluster
+  through it and ends running port forwards, which you start again.
 - Regex search in logs: **Toggle Regex Search** (⌥⌘R) reads the search and the Matching Lines Only filter as a regular
   expression, and says why when it is invalid.
-- **Rollout Restart Across Set…** and **Scale Across Set…**, from a cluster set's Deployment, StatefulSet or
-  DaemonSet row (in the next release): Flint dry-runs every member, shows one confirmation that lists each member's
-  change or why it is left out, then runs one member at a time and stops at the first failure. Protected, paused and
-  disconnected members are left out, and nothing here unlocks a cluster.
+- Fleet actions on a cluster set: **Rollout Restart Across Set…** and **Scale Across Set…** from a Deployment,
+  StatefulSet or DaemonSet row, and **Apply YAML Across Set…** and **Delete Across Set…**. Flint dry-runs every
+  member, shows one confirmation that lists each member's change or why it is left out, then runs one member at a
+  time and stops at the first failure. It does not wait for a cluster's rollout before it moves to the next member.
+  Protected, paused and disconnected members are left out, and nothing here unlocks a cluster.
+- A set member that needs a sign-in can be signed in from the set view.
 - A cluster overview's Recent activity lists Deployment rollouts (started, progressing, complete, stalled) next to
   Warning events. Quit and Close Window ask first while port forwards are running.
 - A read-only MCP server, `flint mcp`, for AI agents, limited to the clusters you expose.
@@ -408,7 +411,8 @@ each filtered match.
 | ⇥, ⇧⇥ | Focus Next Pane, Focus Previous Pane: clusters, navigation, list, detail, dock | outside text fields and shells |
 | ↑ ↓, ⏎ | Move between clusters, connect to the selected one | the cluster sidebar |
 | ↑ ↓, ⏎, → ← | Move, open the kind (or open or close the section), open the section, close it | the navigation |
-| ⌘[ | Go Back to the kind and object shown before | outside text fields |
+| ⌘[, ⌘] | Go Back to the kind and object shown before, Go Forward | outside text fields |
+| ⌘, | Settings (Ctrl-, on Linux) | anywhere |
 | ⌘F | Focus Filter | a list |
 | ↑ ↓, Home, End, ⏎ | Select the previous, next, first, last row; open the selected row | a list |
 | ⇧⌘B | Back to List, keeping the selection | the detail in a narrow window |
@@ -446,9 +450,10 @@ plus any `kubeconfig_paths` from settings. It never writes to kubeconfig files, 
 cluster until you select one.
 
 Settings live in `~/Library/Application Support/Flint/settings.toml` (or in `$FLINT_CONFIG_DIR` if set). Flint >
-Settings… (Cmd-, on macOS, Ctrl-, on Linux) edits the appearance, desktop notifications, the default watch mode,
-the warning thresholds, per-cluster overrides of thresholds, alerts and watch mode (Cluster overrides), the three log
-buffer limits, the extra kubeconfig files, the `path` and `helm` overrides and `protect_local_clusters`. Its edits
+Settings… (Cmd-, on macOS, Ctrl-, on Linux) opens a window over the main one with sections for the appearance, desktop
+notifications, the default watch mode, the warning thresholds and metrics history length, per-cluster overrides of
+thresholds, alerts and watch mode (Cluster overrides), the three log buffer limits, the extra kubeconfig files, the
+`path` and `helm` overrides, `protect_local_clusters` and the proxy (Network: the URL and `no_proxy`). Its edits
 wait for Save, which writes only what you changed, all in one save; a value out of range or a path that cannot be used
 blocks Save until it is fixed. Turning `protect_local_clusters` off asks for confirmation at Save; turning it on does
 not. Other keys are edited in the file:
@@ -466,8 +471,8 @@ watch_mode = "all"                # or "on_view"
 # log_total_mib = 512             # MiB all log sessions keep together
 
 # Proxy for cluster connections, for an app opened from Finder or the Dock, which sees no HTTPS_PROXY from your
-# shell. A cluster's own proxy-url wins. url is http://, socks5:// or socks5h://. An edit here applies after a
-# restart.
+# shell. A cluster's own proxy-url wins. url is http://, socks5:// or socks5h://. Settings > Network applies a
+# change at once and reconnects every cluster; an edit made in this file applies after a restart.
 # [proxy]
 # url = "http://proxy.example.com:3128"
 # no_proxy = ["localhost", "10.0.0.0/8"]
@@ -705,7 +710,7 @@ After every published release:
 1. **The release checklist** ([`docs/RELEASING.md`](docs/RELEASING.md)): the release page is Latest with all six
    binaries and their checksums, and the DMG installs and opens on a clean Mac (UP-80).
 2. **Reviews of the shipped build:** usability (install and use it as a new user), product development (is the
-   roadmap right?) and market fit (against Lens, Freelens, k9s, Headlamp and other tools). Their findings become
+   roadmap right?) and market fit (against the tools people use today). Their findings become
    issues.
 3. **A refactor pass:** behaviour-preserving `refactor(<scope>): …` PRs that work through the
    [refactor backlog](https://github.com/Sealos/flint/issues/87) and the duplication the release added. Existing
