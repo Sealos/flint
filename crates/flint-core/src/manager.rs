@@ -1083,6 +1083,15 @@ impl ClusterManager {
             } => {
                 let _ = reply.send(self.sign_in_member(&member, definition, shown));
             }
+            Request::SignInWatched {
+                cluster,
+                server,
+                definition,
+                shown,
+                reply,
+            } => {
+                let _ = reply.send(self.sign_in_watched(&cluster, &server, definition, shown));
+            }
             Request::HelmPin { cluster, reply } => {
                 let _ = reply.send(self.helm_pin(&cluster));
             }

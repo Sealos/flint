@@ -243,3 +243,116 @@ async fn a_home_card_selects_its_cluster_from_the_keyboard(cx: &mut TestAppConte
     })
     .await;
 }
+
+/// A watched cluster's view that signs in through an exec plugin.
+fn plugin_view(status: KeepWatching, sign_in: BackgroundSignIn) -> KeepWatchView {
+    KeepWatchView {
+        sign_in,
+        command: Some("plugin".to_owned()),
+        shown_sign_in: Some(7),
+        ..view(status)
+    }
+}
+
+fn keep_watching_beta(cx: &mut TestAppContext, t: &TestWorkspace, view: KeepWatchView) {
+    let views = BTreeMap::from([("kind-beta".to_owned(), view)]);
+    t.model.update(cx, |model, cx| {
+        model.set_keep_watching_for_test(views);
+        cx.notify();
+    });
+}
+
+fn offers_sign_in(cx: &mut TestAppContext, t: &TestWorkspace, cluster: &str) -> bool {
+    let Main::Home { watched, .. } = state(cx, t).main else {
+        panic!("not the home screen");
+    };
+    watched
+        .iter()
+        .any(|card| card.cluster == cluster && card.sign_in)
+}
+
+// Only a card that needs a sign-in through an exec plugin offers Sign in: not one signing in
+// through an auth provider (it keeps "select the cluster"), one that runs nothing, or one that
+// watches.
+#[gpui_kit::test]
+async fn only_an_exec_plugin_card_needing_a_sign_in_offers_sign_in(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let cases = [
+        (KeepWatching::NeedsConfirming, BackgroundSignIn::Off, true),
+        (KeepWatching::SignInNeeded, BackgroundSignIn::On, true),
+        (KeepWatching::Watching, BackgroundSignIn::On, false),
+        (KeepWatching::Paused, BackgroundSignIn::Off, false),
+        (
+            KeepWatching::NeedsConfirming,
+            BackgroundSignIn::Unavailable,
+            false,
+        ),
+        (KeepWatching::SignInNeeded, BackgroundSignIn::NotNeeded, false),
+    ];
+    for (status, sign_in, offered) in cases {
+        keep_watching_beta(cx, &t, plugin_view(status, sign_in));
+        render(cx, &t);
+        assert_eq!(
+            offers_sign_in(cx, &t, "kind-beta"),
+            offered,
+            "{status:?} {sign_in:?}"
+        );
+        assert_eq!(shown(cx, &t, "home-sign-in-kind-beta"), offered);
+        assert!(shown(cx, &t, "home-open-kind-beta"), "Open stays");
+    }
+}
+
+// The card's Sign in is a button: Down reaches it as the card's other buttons, and Enter sends
+// the click to the core, which refuses a card it does not recognise and says why on Home.
+#[gpui_kit::test]
+async fn a_cards_sign_in_is_reachable_from_the_keyboard(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    keep_watching_beta(
+        cx,
+        &t,
+        plugin_view(KeepWatching::NeedsConfirming, BackgroundSignIn::Off),
+    );
+    dispatch(cx, &t, "workspace::OpenHome", json!(null));
+    render(cx, &t);
+    assert!(offers_sign_in(cx, &t, "kind-beta"));
+
+    t.press(cx, "down");
+    t.press(cx, "enter");
+
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace.read(cx).home.sign_in_error.is_some()
+    })
+    .await;
+    render(cx, &t);
+    assert!(shown(cx, &t, "home-error"));
+    assert_eq!(state(cx, &t).active_cluster, None, "Enter selected nothing");
+}
+
+// The selected cluster signs in as the selected cluster: its card offers no Sign in.
+#[gpui_kit::test]
+async fn the_selected_clusters_card_offers_no_sign_in(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    dispatch(
+        cx,
+        &t,
+        "workspace::SelectCluster",
+        json!({"cluster": "kind-beta"}),
+    );
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace.read(cx).cluster.as_deref() == Some("kind-beta")
+    })
+    .await;
+    keep_watching_beta(
+        cx,
+        &t,
+        plugin_view(KeepWatching::NeedsConfirming, BackgroundSignIn::Off),
+    );
+    dispatch(cx, &t, "workspace::OpenHome", json!(null));
+    render(cx, &t);
+    assert!(!offers_sign_in(cx, &t, "kind-beta"));
+}

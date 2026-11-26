@@ -496,6 +496,8 @@ pub struct HomeCardState {
     pub card: Option<String>,
     /// The Kubernetes version its feed reported.
     pub version: Option<String>,
+    /// Whether it offers a Sign in that runs its sign-in command once.
+    pub sign_in: bool,
 }
 
 /// A cluster not kept watching, in the home screen's list.

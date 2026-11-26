@@ -267,6 +267,10 @@ struct KeptFeed {
     client: Option<kube::Client>,
     /// The definition its connection was started from, which labels the feed it leads to.
     pin: crate::recheck::ContextPin,
+    /// For a connection signed in once from the cluster's home card
+    /// ([`ClusterManager::start_kept_once`]): the seal of that click. While it holds, the
+    /// cluster counts as watching; it ends with this feed and is never kept or saved.
+    once: Option<Arc<PluginConsent>>,
 }
 
 impl Drop for KeptFeed {
@@ -340,6 +344,11 @@ impl KeepWatch {
     /// Whether `id`'s board entry belongs to a feed here, or to its last values.
     pub(super) fn holds_board_entry(&self, id: &str) -> bool {
         self.stopped.contains_key(id) || self.feeds.get(id).is_some_and(|kept| kept.feed.is_some())
+    }
+
+    /// Whether a kept connection of `id` is up or being made.
+    pub(super) fn has_feed(&self, id: &str) -> bool {
+        self.feeds.contains_key(id)
     }
 }
 
@@ -419,6 +428,10 @@ impl ClusterManager {
         {
             return KeepWatching::NeedsConfirming;
         }
+        // Signed in once from its home card: watching on that connection alone, until it ends.
+        if self.once_feed_holds(id) {
+            return KeepWatching::Watching;
+        }
         let agreed = match &*self.sign_in(id) {
             SignIn::Static => !self.keep.consents.contains_key(id),
             SignIn::Plugin(definition) => self
@@ -435,6 +448,30 @@ impl ClusterManager {
         } else {
             KeepWatching::Watching
         }
+    }
+
+    /// Whether `id` has a kept feed signed in once from its home card that still stands for the
+    /// slot, the definition and the program its click sealed.
+    fn once_feed_holds(&self, id: &str) -> bool {
+        let (Some(kept), Some(slot)) = (self.keep.feeds.get(id), self.cluster(id)) else {
+            return false;
+        };
+        let Some(once) = &kept.once else {
+            return false;
+        };
+        kept.fingerprint == slot.fingerprint
+            && kept.generation == Some(slot.generation)
+            && matches!(&*self.sign_in(id), SignIn::Plugin(definition) if once.holds(definition))
+    }
+
+    /// Whether `id`'s kept feed may run now and its slot needs none of its own: what starting
+    /// one from a click asks before anything starts.
+    pub(super) fn kept_feed_room(&self, id: &str) -> bool {
+        !self.keep.grants.quitting()
+            && !self.disconnects.holds(id)
+            && !self.member_serves_keep(id)
+            && self.active.as_deref() != Some(id)
+            && !self.wants_telemetry(id)
     }
 
     /// Whether `id` is watched and may be read now, selected or not.
@@ -758,9 +795,15 @@ impl ClusterManager {
         }
     }
 
-    fn start_kept(&mut self, id: &str) {
+    /// A new kept connection's attempt number.
+    pub(super) fn next_kept_attempt(&mut self) -> u64 {
         let attempt = self.keep.next_attempt;
         self.keep.next_attempt += 1;
+        attempt
+    }
+
+    fn start_kept(&mut self, id: &str) {
+        let attempt = self.next_kept_attempt();
         let runs_plugin = matches!(&*self.sign_in(id), SignIn::Plugin(_));
         let check = self
             .keep
@@ -780,6 +823,19 @@ impl ClusterManager {
             check,
             self.keep.grants.0.runs.clone(),
         );
+        self.launch_kept(id, attempt, access, None);
+    }
+
+    /// Starts `id`'s kept connection, attempt `attempt`, under `access`, with no input for its
+    /// program. `once` is the seal of a click that signs it in once ([`KeptFeed::once`]).
+    pub(super) fn launch_kept(
+        &mut self,
+        id: &str,
+        attempt: u64,
+        access: CredentialAccess,
+        once: Option<Arc<PluginConsent>>,
+    ) {
+        let runs_plugin = matches!(&*self.sign_in(id), SignIn::Plugin(_));
         self.keep.grants.admit(id, attempt, &access);
         let mut kubeconfig = self.kubeconfig.merged.clone();
         cluster::disable_interactive_exec(&mut kubeconfig);
@@ -829,6 +885,7 @@ impl ClusterManager {
                 feed: None,
                 client: None,
                 pin,
+                once,
             },
         );
     }
@@ -1234,7 +1291,7 @@ impl ClusterManager {
             .collect()
     }
 
-    fn publish_keep_watching(&mut self) {
+    pub(super) fn publish_keep_watching(&mut self) {
         let views = self.keep_watching_views();
         if views != self.keep.shown {
             self.keep.shown = views.clone();
@@ -1246,3 +1303,8 @@ impl ClusterManager {
 #[cfg(test)]
 #[path = "keep_watching_tests.rs"]
 pub(super) mod tests;
+
+// The fleet home card's one sign-in (`member_sign_in.rs`), which runs on a kept connection.
+#[cfg(test)]
+#[path = "watched_sign_in_tests.rs"]
+mod watched_sign_in_tests;

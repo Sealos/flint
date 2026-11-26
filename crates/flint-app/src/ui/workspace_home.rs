@@ -20,7 +20,9 @@ use jiff::Timestamp;
 use super::super::dashboard::FeedId;
 use super::super::dashboard::cluster_card::{CardActions, CardTarget, ClusterRead};
 use super::super::dashboard::set::AGE_OUT_INTERVAL;
-use super::super::home::{self, HomeCard, HomePlan, HomeRead, HomeRow, HomeView};
+use super::super::home::{
+    self, HomeCard, HomePlan, HomeRead, HomeRow, HomeView, OnSignIn, WatchedCard,
+};
 use super::super::registry::{self, OpenHome, SelectCluster};
 use super::Workspace;
 
@@ -50,6 +52,8 @@ pub(in crate::ui) struct HomePage {
     reading: bool,
     /// A feed changed while the cards were being read.
     dirty: bool,
+    /// Why the last card's Sign in was refused, until the next one.
+    pub(in crate::ui) sign_in_error: Option<String>,
     _read: Option<Task<()>>,
     _watch: Vec<Task<()>>,
 }
@@ -242,16 +246,31 @@ impl Workspace {
         let model = self.model.read(cx);
         let names = model.names();
         let settings_ok = model.settings_error.is_none();
+        let active = model.active_cluster().map(|c| c.info.name.as_str());
         HomeView {
             watched: plan
                 .watched
                 .into_iter()
                 .map(|(cluster, status)| {
-                    let card = self.home_card(&cluster, status, cx);
-                    let shown = names.exact(&cluster);
-                    (cluster, shown, status, card)
+                    let server = self
+                        .cluster_summary(&cluster, cx)
+                        .and_then(|summary| summary.info.server.as_deref());
+                    let sign_in = home::card_sign_in(
+                        &cluster,
+                        model.keep_watching(&cluster),
+                        server,
+                        active == Some(cluster.as_str()),
+                    );
+                    WatchedCard {
+                        card: self.home_card(&cluster, status, cx),
+                        shown: names.exact(&cluster),
+                        cluster,
+                        status,
+                        sign_in,
+                    }
                 })
                 .collect(),
+            error: self.home.sign_in_error.clone(),
             unwatched: plan
                 .unwatched
                 .into_iter()
@@ -267,8 +286,36 @@ impl Workspace {
         }
     }
 
+    /// For a click on a card's Sign in alone ([`home::CardSignIn`]): runs the cluster's sign-in
+    /// once, now, for the server and definitions the card was drawn with. The core refuses it if
+    /// any of them changed since, and nothing runs; why shows on the home screen. The card
+    /// comes back with the cluster's next keep-watching state.
+    pub(in crate::ui) fn sign_in_home_card(
+        &mut self,
+        target: home::CardSignIn,
+        cx: &mut Context<Self>,
+    ) {
+        let asked = self.model.read(cx).core().sign_in_watched(
+            &target.cluster,
+            &target.server,
+            target.definition,
+            target.shown,
+        );
+        self.home.sign_in_error = None;
+        cx.spawn(async move |ws, cx| {
+            if let Err(why) = asked.await {
+                let _ = ws.update(cx, |ws, cx| {
+                    ws.home.sign_in_error = Some(why);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// The home screen, when the main area shows it.
-    pub(super) fn render_home(&self, theme: &Theme, cx: &App) -> Option<AnyElement> {
+    pub(super) fn render_home(&self, theme: &Theme, cx: &Context<Self>) -> Option<AnyElement> {
         if !self.home_shown(cx) {
             return None;
         }
@@ -280,9 +327,14 @@ impl Workspace {
             })),
             CardTarget::Problem { .. } => None,
         });
+        let workspace = cx.entity().downgrade();
+        let on_sign_in: OnSignIn = Rc::new(move |target, cx| {
+            let _ = workspace.update(cx, |ws, cx| ws.sign_in_home_card(target, cx));
+        });
         Some(home::render(
             &self.home_view(cx),
             &actions,
+            &on_sign_in,
             &self.focus,
             &self.home_focus,
             theme,
@@ -320,11 +372,12 @@ impl Workspace {
             watched: view
                 .watched
                 .iter()
-                .map(|(cluster, _, status, card)| HomeCardState {
-                    cluster: cluster.clone(),
-                    status: home::status_word(*status),
-                    card: card.map(|card| card.card.description()),
-                    version: card.and_then(|card| card.version.clone()),
+                .map(|watched| HomeCardState {
+                    cluster: watched.cluster.clone(),
+                    status: home::status_word(watched.status),
+                    card: watched.card.map(|card| card.card.description()),
+                    version: watched.card.and_then(|card| card.version.clone()),
+                    sign_in: watched.sign_in.is_some(),
                 })
                 .collect(),
             unwatched: view

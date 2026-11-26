@@ -6,7 +6,9 @@
 //! feed, and Keep Watching goes through the same action as the row menu, so a sign-in command
 //! still waits for its own consent.
 
-use flint_core::keep_watching::{KeepWatchView, KeepWatching};
+use std::rc::Rc;
+
+use flint_core::keep_watching::{BackgroundSignIn, KeepWatchView, KeepWatching};
 use flint_core::settings::ClusterTag;
 use flint_core::telemetry::VersionCheck;
 use gpui_kit::base::TestSupportExt as _;
@@ -67,6 +69,49 @@ pub(super) fn blocked_reason(status: KeepWatching) -> Option<String> {
         }
     }
 }
+
+/// What a card's Sign in was drawn for. The click is the consent to run that cluster's sign-in
+/// command once, now, for exactly this (`Workspace::sign_in_home_card`): the core refuses it if
+/// any of it changed since.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CardSignIn {
+    pub cluster: String,
+    /// The API server the card names.
+    pub server: String,
+    /// [`KeepWatchView::definition`].
+    pub definition: Option<u64>,
+    /// [`KeepWatchView::shown_sign_in`].
+    pub shown: Option<u64>,
+}
+
+/// The Sign in of a watched cluster's card, if it offers one: only for a cluster that needs a
+/// sign-in, is not `selected`, and signs in through an exec plugin. One signing in through an
+/// auth provider keeps "select the cluster to sign in", and the selected cluster signs in as
+/// the selected cluster.
+pub(super) fn card_sign_in(
+    cluster: &str,
+    view: Option<&KeepWatchView>,
+    server: Option<&str>,
+    selected: bool,
+) -> Option<CardSignIn> {
+    let view = view?;
+    let waiting = matches!(
+        view.status,
+        KeepWatching::SignInNeeded | KeepWatching::NeedsConfirming
+    );
+    let plugin = matches!(view.sign_in, BackgroundSignIn::Off | BackgroundSignIn::On);
+    let server = server.filter(|server| !server.is_empty())?;
+    let drawn = view.shown_sign_in.is_some() && view.definition.is_some();
+    (waiting && plugin && drawn && !selected).then(|| CardSignIn {
+        cluster: cluster.to_owned(),
+        server: server.to_owned(),
+        definition: view.definition,
+        shown: view.shown_sign_in,
+    })
+}
+
+/// Runs a card's Sign in.
+pub(super) type OnSignIn = Rc<dyn Fn(CardSignIn, &mut App)>;
 
 /// What a row's Keep Watching button does, as drawn.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,11 +226,24 @@ pub(super) struct HomeRow {
     pub keep: KeepButton,
 }
 
+/// A watched cluster on the home screen.
+pub(super) struct WatchedCard<'a> {
+    pub cluster: String,
+    /// Its name as shown.
+    pub shown: String,
+    pub status: KeepWatching,
+    /// Its card once read; until then its name and state stand in.
+    pub card: Option<&'a HomeCard>,
+    pub sign_in: Option<CardSignIn>,
+}
+
 /// What the home screen draws.
 pub(super) struct HomeView<'a> {
-    /// One per watched cluster, in sidebar order: its card once read, else its name and state.
-    pub watched: Vec<(String, String, KeepWatching, Option<&'a HomeCard>)>,
+    /// One per watched cluster, in sidebar order.
+    pub watched: Vec<WatchedCard<'a>>,
     pub unwatched: Vec<HomeRow>,
+    /// Why the last Sign in was refused.
+    pub error: Option<String>,
 }
 
 fn section_title(text: &'static str, theme: &Theme) -> impl IntoElement {
@@ -209,12 +267,38 @@ fn open_button(id: String, cluster: &str, shown: &str) -> Button {
         }))
 }
 
+/// A card's Sign in. Deliberately not a registered action: no command palette entry, key
+/// binding or automation `dispatch` reaches it, only a click (or Enter or Space on it).
+fn sign_in_button(target: &CardSignIn, shown: &str, on_sign_in: &OnSignIn) -> Button {
+    let (target, on_sign_in) = (target.clone(), Rc::clone(on_sign_in));
+    Button::new(SharedString::from(format!("home-sign-in-{}", target.cluster)))
+        .xsmall()
+        .primary()
+        .label("Sign in")
+        .tooltip(format!(
+            "Run {shown}'s sign-in command once, now. Nothing is saved, and nothing runs it again."
+        ))
+        // not-an-action: the click is the consent for one sign-in run.
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            on_sign_in(target.clone(), cx);
+        })
+}
+
 fn render_watched(
-    (cluster, shown, status, card): &(String, String, KeepWatching, Option<&HomeCard>),
+    watched: &WatchedCard<'_>,
     actions: &CardActions,
+    on_sign_in: &OnSignIn,
     focus: &FocusHandle,
     theme: &Theme,
 ) -> impl IntoElement {
+    let WatchedCard {
+        cluster,
+        shown,
+        status,
+        card,
+        sign_in,
+    } = watched;
     let status_text = status_word(*status);
     let status_color = match status {
         KeepWatching::Watching => theme.success,
@@ -280,7 +364,15 @@ fn render_watched(
                                 .test_support(),
                         ),
                 )
-                .child(open_button(format!("home-open-{cluster}"), cluster, shown)),
+                .child(
+                    h_flex()
+                        .flex_none()
+                        .gap_1()
+                        .when_some(sign_in.as_ref(), |el, target| {
+                            el.child(sign_in_button(target, shown, on_sign_in))
+                        })
+                        .child(open_button(format!("home-open-{cluster}"), cluster, shown)),
+                ),
         )
         .when_some(facts, |el, facts| {
             el.child(
@@ -365,6 +457,7 @@ fn render_row(row: &HomeRow, theme: &Theme) -> impl IntoElement {
 pub(super) fn render(
     view: &HomeView<'_>,
     actions: &CardActions,
+    on_sign_in: &OnSignIn,
     focus: &FocusHandle,
     scope: &FocusHandle,
     theme: &Theme,
@@ -377,7 +470,18 @@ pub(super) fn render(
                     "Clusters kept watching show their health here. Opening this \
                      screen connects nothing.",
                 ),
-            ));
+            ))
+            .when_some(view.error.clone(), |el, error| {
+                el.child(
+                    div()
+                        .id("home-error")
+                        .aria_label(error.clone())
+                        .text_sm()
+                        .text_color(theme.danger)
+                        .child(error)
+                        .test_support(),
+                )
+            });
     if view.watched.is_empty() {
         content = content.child(
             div()
@@ -404,7 +508,9 @@ pub(super) fn render(
                         .children(
                             view.watched
                                 .iter()
-                                .map(|watched| render_watched(watched, actions, focus, theme)),
+                                .map(|watched| {
+                                    render_watched(watched, actions, on_sign_in, focus, theme)
+                                }),
                         )
                         .test_support(),
                 ),
@@ -444,7 +550,10 @@ mod tests {
     use jiff::Timestamp;
 
     use super::super::dashboard::cluster_card::{CardState, ClusterRead};
-    use super::{HomeCard, HomeRead, blocked_reason, build, keep_button, plan, status_word};
+    use super::{
+        CardSignIn, HomeCard, HomeRead, blocked_reason, build, card_sign_in, keep_button, plan,
+        status_word,
+    };
 
     fn view(status: KeepWatching, definition: Option<u64>) -> KeepWatchView {
         KeepWatchView {
@@ -560,6 +669,39 @@ mod tests {
                 .iter()
                 .all(|category| cards[1].card.counts.get(*category).is_none())
         );
+    }
+
+    #[test]
+    fn a_card_offers_sign_in_for_exactly_what_it_shows() {
+        let mut plugin = view(KeepWatching::NeedsConfirming, Some(7));
+        plugin.sign_in = BackgroundSignIn::Off;
+        plugin.shown_sign_in = Some(9);
+        let server = Some("https://127.0.0.1:6443");
+        let target = card_sign_in("eks", Some(&plugin), server, false).expect("offered");
+        assert_eq!(
+            target,
+            CardSignIn {
+                cluster: "eks".to_owned(),
+                server: "https://127.0.0.1:6443".to_owned(),
+                definition: Some(7),
+                shown: Some(9),
+            }
+        );
+        // Selected, no server, or not drawn with a plugin definition: nothing to sign in.
+        assert!(card_sign_in("eks", Some(&plugin), server, true).is_none());
+        assert!(card_sign_in("eks", Some(&plugin), None, false).is_none());
+        assert!(card_sign_in("eks", Some(&plugin), Some(""), false).is_none());
+        assert!(card_sign_in("eks", None, server, false).is_none());
+        let mut unnamed = plugin.clone();
+        unnamed.shown_sign_in = None;
+        assert!(card_sign_in("eks", Some(&unnamed), server, false).is_none());
+        // An auth provider keeps "select the cluster"; a watching card needs nothing.
+        let mut provider = plugin.clone();
+        provider.sign_in = BackgroundSignIn::Unavailable;
+        assert!(card_sign_in("eks", Some(&provider), server, false).is_none());
+        let mut watching = plugin;
+        watching.status = KeepWatching::Watching;
+        assert!(card_sign_in("eks", Some(&watching), server, false).is_none());
     }
 
     #[test]

@@ -174,6 +174,10 @@ mod tests {
             "sign_in_set_member",
             "sign_in_member",
             "MemberSignIn",
+            // A watched cluster's one sign-in: its home card's Sign in click alone.
+            "sign_in_home_card",
+            "sign_in_watched",
+            "CardSignIn",
         ] {
             for source in elsewhere {
                 let code = source.split("#[cfg(test)]").next().unwrap_or(source);
