@@ -1506,7 +1506,7 @@ async fn a_signed_in_once_connection_pauses_for_a_file_change_and_ends_on_quit()
     manager.sync_keep_watching();
     assert!(once.allowed(), "back once they are read");
 
-    let _ = manager.kept_grants().quit();
+    manager.kept_grants().quit().await;
     assert!(!once.allowed(), "a quit ends it");
 }
 
