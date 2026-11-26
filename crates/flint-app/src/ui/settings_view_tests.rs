@@ -639,3 +639,18 @@ async fn enter_does_not_discard_when_the_file_is_invalid(cx: &mut TestAppContext
     assert_eq!(quits(cx), 0);
     assert!(state(cx, &t).settings.dirty);
 }
+
+// covers #854: focus stays in the modal: a view behind it that takes focus (the overview once
+// discovery ends) gives it back.
+#[gpui_kit::test]
+async fn focus_taken_behind_the_modal_comes_back(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_settings(cx, dir.path()).await;
+    assert_eq!(state(cx, &t).focus, Focus::Settings);
+    t.focus_workspace(cx);
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(state(cx, &t).focus, Focus::Settings);
+    assert!(modal_open(cx, &t));
+}

@@ -241,6 +241,15 @@ impl Workspace {
     }
 
     /// Drops what was typed in the proxy fields: they show the saved proxy again.
+    /// Drops what was typed in the proxy fields, even during an Apply, which goes on: closing
+    /// Settings with Discard. The fields show the saved proxy when Settings opens again.
+    pub(super) fn discard_network_fields(&mut self) {
+        let network = &mut self.settings_page.network;
+        network.typed.clear();
+        network.typed_while_applying = false;
+        network.resync = true;
+    }
+
     pub(super) fn revert_network_fields(&mut self) {
         let network = &mut self.settings_page.network;
         if !network.applying() {

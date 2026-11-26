@@ -277,6 +277,7 @@ impl Workspace {
     fn forget_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.finish_threshold_entry(false, window, cx);
         self.revert_settings(cx);
+        self.discard_network_fields();
         self.settings_page.open = false;
         self.settings_page.cursor = None;
         cx.notify();
@@ -285,8 +286,32 @@ impl Workspace {
     /// Forgets the modal when its dialog was closed by something other than Settings itself.
     /// Called as the workspace draws.
     pub(super) fn settings_follow_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings_page.open && !window.has_active_dialog(cx) {
+        if !self.settings_page.open {
+            return;
+        }
+        if !window.has_active_dialog(cx) {
             self.forget_settings(window, cx);
+            return;
+        }
+        // Focus is trapped in the modal: a view behind it that took focus (the overview once
+        // discovery ends, a list restored) gives it back, unless a confirmation holds it.
+        let page = &self.settings_page;
+        // A field just opened is not drawn yet, so the view does not contain it until it is.
+        let in_settings = page.focus.contains_focused(window, cx)
+            || page
+                .thresholds
+                .entry
+                .as_ref()
+                .is_some_and(|entry| entry.input.focus_handle(cx).is_focused(window))
+            || page.logs_paths.focused(window, cx).is_some()
+            || page.network.focused(window, cx).is_some();
+        let focus = page.focus.clone();
+        if !in_settings && !confirm::any_open(window, cx) {
+            window.defer(cx, move |window, cx| {
+                if !confirm::any_open(window, cx) {
+                    window.focus(&focus, cx);
+                }
+            });
         }
     }
 
