@@ -375,33 +375,34 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
     })
 }
 
-/// Shell's availability as the menu draws it: on a protected cluster a short note, since the
-/// Unlock entry right after it names the cluster. Everything else (refusals, the automation
-/// state) keeps [`RowActions::shell`], which names it.
+/// An entry's availability `can` as the menu draws it: refused because the cluster is protected
+/// (`protected`), a short note, since the Unlock entry after it names the cluster. Everything else
+/// (refusals, the automation state) keeps `can`, which names it.
+fn in_menu(a: &RowActions, can: &Availability, protected: bool) -> Availability {
+    match can {
+        Err(_) if protected && a.unlock.is_some() => Err(PROTECTED_NOTE.to_owned()),
+        can => can.clone(),
+    }
+}
+
+/// Whether an entry drawn as `can` shows the short protected note.
+fn says_protected(can: &Availability) -> bool {
+    can.as_ref().err().map(String::as_str) == Some(PROTECTED_NOTE)
+}
+
+/// Shell's availability as the menu draws it.
 fn shell_in_menu(a: &RowActions) -> Availability {
-    match (&a.shell, &a.unlock) {
-        (Err(_), Some(_)) if a.shell_protected => Err(PROTECTED_NOTE.to_owned()),
-        (shell, _) => shell.clone(),
-    }
+    in_menu(a, &a.shell, a.shell_protected)
 }
 
-/// Forward Port's availability as the menu draws it, on a pod or service: on a protected cluster
-/// the short note, as for Shell.
+/// Forward Port's availability as the menu draws it, on a pod or service.
 fn forward_in_menu(a: &RowActions) -> Option<Availability> {
-    let can = a.forward.as_ref()?;
-    Some(match (can, &a.unlock) {
-        (Err(_), Some(_)) if a.forward_protected => Err(PROTECTED_NOTE.to_owned()),
-        (can, _) => can.clone(),
-    })
+    Some(in_menu(a, a.forward.as_ref()?, a.forward_protected))
 }
 
-/// A resource action's availability as the menu draws it: on a protected cluster the short note,
-/// as for Shell.
+/// A resource action's availability as the menu draws it.
 fn write_in_menu(a: &RowActions, write: &WriteEntry) -> Availability {
-    match (&write.can, &a.unlock) {
-        (Err(_), Some(_)) if write.protected => Err(PROTECTED_NOTE.to_owned()),
-        (can, _) => can.clone(),
-    }
+    in_menu(a, &write.can, write.protected)
 }
 
 /// Whether the menu says "protected" once, right above Unlock, rather than under each entry:
@@ -410,7 +411,7 @@ fn protected_once(a: &RowActions) -> bool {
     a.unlock.is_some()
         && a.writes
             .iter()
-            .any(|w| write_in_menu(a, w).err().as_deref() == Some(PROTECTED_NOTE))
+            .any(|w| says_protected(&write_in_menu(a, w)))
 }
 
 /// The menu for the rows of the workspace's list, acting on the row selected.
@@ -534,8 +535,7 @@ fn fill(
         menu = session_entries(menu, &a, once, &workspace, window, cx);
     }
     if let Some(can) = forward_in_menu(&a) {
-        let says =
-            says_why && !(once && can.as_ref().err().map(String::as_str) == Some(PROTECTED_NOTE));
+        let says = says_why && !(once && says_protected(&can));
         menu = entry(
             menu,
             registry::label::<ForwardPort>().into(),
@@ -565,8 +565,7 @@ fn fill(
         for write in &a.writes {
             let can = write_in_menu(&a, write);
             // The protected note is said once, above Unlock.
-            let says = says_why
-                && !(once && can.as_ref().err().map(String::as_str) == Some(PROTECTED_NOTE));
+            let says = says_why && !(once && says_protected(&can));
             menu = entry(
                 menu,
                 write.action.label().into(),
@@ -662,8 +661,7 @@ fn session_entries(
     }
     let label = shell_entry_label_within(a, pod_name_chars(SHELL_POD_NAME, window));
     let shell_shown = shell_in_menu(a);
-    let says_shell = says_why
-        && !(once && shell_shown.as_ref().err().map(String::as_str) == Some(PROTECTED_NOTE));
+    let says_shell = says_why && !(once && says_protected(&shell_shown));
     match a.shell_pod.clone() {
         // The container picker.
         Some(shell) if a.shell_picker && a.blocked.is_none() => {
