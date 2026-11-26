@@ -11,7 +11,7 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use serde_json::Value;
 
 use super::super::list_usage::{UNKNOWN_TEXT, UsageSource, UsageSubject, cpu_text, memory_text};
-use super::super::list_usage_workloads::{self, Totals};
+use super::super::list_usage_workloads::Totals;
 use super::ring::RingSpec;
 
 /// What the object's own definition gives to compare use with.
