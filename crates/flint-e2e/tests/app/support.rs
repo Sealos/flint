@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail};
 use flint_e2e::app::{App, AppOptions, WAIT};
 use flint_e2e::backend::TestCluster;
-use flint_e2e::fake_api::{FakeApiServer, FakePod, Gvr, Options, WriteRecord, write_kubeconfigs};
+use flint_e2e::fake_api::{
+    FakeApiServer, FakePod, Gvr, Options, RequestRecord, Verb, WriteRecord, write_kubeconfigs,
+};
 use flint_e2e::scratch::Scratch;
 use serde_json::{Value, json};
 
@@ -34,6 +36,23 @@ pub fn exit_code(pid: u32) -> Result<Option<i32>> {
     // SAFETY: waitid filled it in; with WNOHANG and no exit, si_pid stays 0.
     let (ended, status) = unsafe { (info.si_pid(), info.si_status()) };
     Ok((ended != 0).then_some(status))
+}
+
+/// The paths the connected cluster's feed lists on a timer, whatever view is open: the metrics
+/// behind the usage columns and trends, Warning events and claims.
+const FEED_POLLS: [&str; 4] = [
+    "/apis/metrics.k8s.io/v1beta1/nodes",
+    "/apis/metrics.k8s.io/v1beta1/pods",
+    "/api/v1/events",
+    "/api/v1/persistentvolumeclaims",
+];
+
+/// Whether `request` is one of the feed's timed list GETs, which run on the read client while the
+/// cluster is connected. A check that an action or a search sent nothing leaves only these out.
+pub fn is_feed_poll(request: &RequestRecord) -> bool {
+    request.method == http::Method::GET
+        && request.verb == Verb::List
+        && FEED_POLLS.contains(&request.path.as_str())
 }
 
 /// Selects `cluster` and waits until it is connected and its kinds are discovered.

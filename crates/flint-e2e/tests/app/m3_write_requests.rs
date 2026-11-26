@@ -910,7 +910,8 @@ fn up_54_refused_actions_send_no_request() -> Result<()> {
 }
 
 /// Dispatches each action, asserts it is refused, and that only list and watch GETs of exactly
-/// `feeds` arrived meanwhile: each a path, with the one label selector it must carry, if any.
+/// `feeds` arrived meanwhile: each a path, with the one label selector it must carry, if any. The
+/// cluster feed's timed list GETs ([`is_feed_poll`]) may land in the window too.
 fn assert_refused_silently(
     app: &App,
     fake: &FakeApiServer,
@@ -930,7 +931,8 @@ fn assert_refused_silently(
             let is_feed = feeds
                 .iter()
                 .any(|(path, wanted)| r.path == *path && selector == *wanted);
-            !(r.method == Method::GET && is_feed && matches!(r.verb, Verb::List | Verb::Watch))
+            let read = r.method == Method::GET && matches!(r.verb, Verb::List | Verb::Watch);
+            !((read && is_feed) || is_feed_poll(r))
         })
         .map(ToString::to_string)
         .collect();
