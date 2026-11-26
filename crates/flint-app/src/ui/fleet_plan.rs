@@ -517,9 +517,11 @@ pub(in crate::ui) fn record(lines: &mut [ResultLine], result: &FleetResult) {
 /// shown on one line, with anything that draws misleadingly escaped.
 fn rollout_failure_text(failure: &RolloutFailure) -> String {
     match failure {
-        RolloutFailure::Unread(error) => {
-            format!("the rollout could not be checked: {}", error_text(error))
-        }
+        // Not the write's wording: the change was made, only the check of it failed.
+        RolloutFailure::Unread(error) => format!(
+            "the change was made, but its rollout could not be checked: {}",
+            single_line(&error.to_string())
+        ),
         other => single_line(&other.to_string()),
     }
 }

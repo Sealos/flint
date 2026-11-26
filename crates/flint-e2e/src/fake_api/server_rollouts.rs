@@ -69,7 +69,7 @@ fn finished_status(gvr: &Gvr, object: &Value) -> Value {
     match gvr.resource.as_str() {
         "statefulsets" => json!({
             "observedGeneration": generation, "replicas": replicas, "readyReplicas": replicas,
-            "currentReplicas": replicas, "updatedReplicas": replicas,
+            "availableReplicas": replicas, "currentReplicas": replicas, "updatedReplicas": replicas,
             "currentRevision": format!("rev-{generation}"),
             "updateRevision": format!("rev-{generation}"),
         }),

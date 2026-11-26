@@ -359,13 +359,18 @@ pub enum RolloutFailure {
     #[error("the rollout did not finish within {}", wait_text(*.0))]
     TimedOut(Duration),
     /// The object could not be read again: refused by the gate, gone, replaced or unanswered.
-    #[error("the rollout could not be checked: {0}")]
+    /// The write itself was accepted.
+    #[error("the change was made, but its rollout could not be checked: {0}")]
     Unread(WriteError),
+    /// The object's spec changed again (by a controller, GitOps or someone else) before the
+    /// rollout of this change finished, so this change's rollout can no longer be judged.
+    #[error("the object was changed again before this change finished rolling out")]
+    Superseded,
 }
 
 fn wait_text(timeout: Duration) -> String {
     let seconds = timeout.as_secs();
-    if seconds >= 60 && seconds % 60 == 0 {
+    if seconds >= 60 && seconds.is_multiple_of(60) {
         let minutes = seconds / 60;
         format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
     } else {
@@ -547,6 +552,8 @@ impl Rollout {
         let deadline = Instant::now() + self.timeout;
         let poll = ROLLOUT_POLL.min(self.timeout / 4).max(CANCEL_TICK);
         let mut uid = self.intent.target.uid.clone();
+        // The generation first read after the write: this change's.
+        let mut generation = None;
         loop {
             if self.cancel.is_cancelled() {
                 return FleetStatus::RolloutNotAwaited;
@@ -555,7 +562,12 @@ impl Rollout {
                 return failed(RolloutFailure::TimedOut(self.timeout));
             }
             let read = self.core.read_written(&self.intent, self.disconnects);
-            let object = match tokio::time::timeout_at(deadline, read).await {
+            // A cancel does not wait for a slow read: the write is done, the read only checks.
+            let read = tokio::select! {
+                read = tokio::time::timeout_at(deadline, read) => read,
+                () = self.cancelled() => return FleetStatus::RolloutNotAwaited,
+            };
+            let object = match read {
                 Err(_) => return failed(RolloutFailure::TimedOut(self.timeout)),
                 Ok(Err(error)) => return failed(RolloutFailure::Unread(error)),
                 Ok(Ok(object)) => object,
@@ -567,6 +579,14 @@ impl Rollout {
                 (None, Some(live)) => uid = Some(live.to_owned()),
                 _ => return failed(RolloutFailure::Unread(WriteError::Replaced)),
             }
+            let live = object
+                .pointer("/metadata/generation")
+                .and_then(Value::as_i64);
+            match generation {
+                None => generation = Some(live),
+                Some(written) if written != live => return failed(RolloutFailure::Superseded),
+                Some(_) => {}
+            }
             match rollout_wait(&self.kind, &object) {
                 None => return FleetStatus::Done,
                 Some(RolloutWait::Finished) => return FleetStatus::RolledOut,
@@ -574,9 +594,17 @@ impl Rollout {
                 Some(RolloutWait::Waiting(_)) => {}
             }
             let next = (Instant::now() + poll).min(deadline);
-            while Instant::now() < next && !self.cancel.is_cancelled() {
-                tokio::time::sleep(CANCEL_TICK.min(next - Instant::now())).await;
+            tokio::select! {
+                () = tokio::time::sleep_until(next) => {}
+                () = self.cancelled() => {}
             }
+        }
+    }
+
+    /// Ends once the run is cancelled.
+    async fn cancelled(&self) {
+        while !self.cancel.is_cancelled() {
+            tokio::time::sleep(CANCEL_TICK).await;
         }
     }
 }

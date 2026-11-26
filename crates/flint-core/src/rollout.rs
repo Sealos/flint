@@ -217,9 +217,9 @@ pub enum RolloutWait {
 }
 
 /// Where `object`'s rollout stands, if `kind` has rollouts: Deployments, StatefulSets and
-/// DaemonSets ([`crate::action_kinds::restarts`]). `None` for any other kind, for a StatefulSet
-/// or DaemonSet updated `OnDelete`, which has no rollout to wait for, and for an object that is
-/// not its kind.
+/// DaemonSets ([`crate::action_kinds::restarts`]). `None` for any other kind, and for an object
+/// that is not its kind. A StatefulSet or DaemonSet updated `OnDelete` is waited for until its
+/// pods are up, not until they run the new revision.
 pub fn rollout_wait(kind: &KindId, object: &Value) -> Option<RolloutWait> {
     if !crate::action_kinds::restarts(kind) {
         return None;
@@ -234,17 +234,21 @@ pub fn rollout_wait(kind: &KindId, object: &Value) -> Option<RolloutWait> {
 
 const NOT_SEEN: &str = "the controller has not seen the change yet";
 
+/// Judged only once the controller has seen the latest spec: a failure or a success it reports
+/// before that is about an earlier change.
 fn deployment_wait(deployment: &Deployment) -> Option<RolloutWait> {
     let Some(status) = deployment.status.as_ref() else {
         return Some(RolloutWait::Waiting(NOT_SEEN.to_owned()));
     };
+    if !has_observed(deployment.metadata.generation, status.observed_generation) {
+        return Some(RolloutWait::Waiting(NOT_SEEN.to_owned()));
+    }
     let reading = Reading::of(deployment, status);
     Some(if reading.stalled {
         let message = reading.progressing.and_then(|c| c.message.clone());
         RolloutWait::Failed(message.unwrap_or_else(|| "progress deadline exceeded".to_owned()))
-    } else if !reading.observed {
-        RolloutWait::Waiting(NOT_SEEN.to_owned())
-    } else if reading.caught_up {
+    } else if reading.caught_up && reading.total <= reading.desired {
+        // Also no replica beyond those asked for: a scale-down has finished too.
         RolloutWait::Finished
     } else {
         RolloutWait::Waiting(format!(
@@ -263,12 +267,15 @@ fn has_observed(generation: Option<i64>, observed: Option<i64>) -> bool {
     }
 }
 
+/// Whether a StatefulSet or DaemonSet replaces its pods only when they are deleted. Its pod
+/// count is still waited for (a create or a scale), its revision is not.
+fn on_delete(strategy: Option<&str>) -> bool {
+    strategy == Some("OnDelete")
+}
+
 fn stateful_set_wait(set: &StatefulSet) -> Option<RolloutWait> {
     let spec = &set.spec;
     let strategy = spec.update_strategy.as_ref();
-    if strategy.and_then(|s| s.type_.as_deref()) == Some("OnDelete") {
-        return None;
-    }
     let Some(status) = set.status.as_ref() else {
         return Some(RolloutWait::Waiting(NOT_SEEN.to_owned()));
     };
@@ -277,8 +284,16 @@ fn stateful_set_wait(set: &StatefulSet) -> Option<RolloutWait> {
     }
     let desired = spec.replicas.unwrap_or(DEFAULT_REPLICAS);
     let ready = status.ready_replicas.unwrap_or(0);
-    if ready < desired {
-        return Some(RolloutWait::Waiting(format!("{ready} of {desired} ready")));
+    // A server without the field counts ready pods only.
+    let available = status.available_replicas.unwrap_or(ready);
+    if ready < desired || available < desired || status.replicas > desired {
+        return Some(RolloutWait::Waiting(format!(
+            "{} of {desired} ready, {available} available",
+            ready.min(status.replicas)
+        )));
+    }
+    if on_delete(strategy.and_then(|s| s.type_.as_deref())) {
+        return Some(RolloutWait::Finished);
     }
     let updated = status.updated_replicas.unwrap_or(0);
     let partition = strategy
@@ -302,9 +317,6 @@ fn stateful_set_wait(set: &StatefulSet) -> Option<RolloutWait> {
 
 fn daemon_set_wait(set: &DaemonSet) -> Option<RolloutWait> {
     let strategy = set.spec.update_strategy.as_ref();
-    if strategy.and_then(|s| s.type_.as_deref()) == Some("OnDelete") {
-        return None;
-    }
     let Some(status) = set.status.as_ref() else {
         return Some(RolloutWait::Waiting(NOT_SEEN.to_owned()));
     };
@@ -312,7 +324,11 @@ fn daemon_set_wait(set: &DaemonSet) -> Option<RolloutWait> {
         return Some(RolloutWait::Waiting(NOT_SEEN.to_owned()));
     }
     let desired = status.desired_number_scheduled;
-    let updated = status.updated_number_scheduled.unwrap_or(0);
+    let updated = if on_delete(strategy.and_then(|s| s.type_.as_deref())) {
+        desired
+    } else {
+        status.updated_number_scheduled.unwrap_or(0)
+    };
     let available = status.number_available.unwrap_or(0);
     Some(if updated < desired || available < desired {
         RolloutWait::Waiting(format!(

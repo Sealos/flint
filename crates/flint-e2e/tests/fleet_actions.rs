@@ -1315,6 +1315,49 @@ async fn a_rollout_that_does_not_finish_in_time_stops_the_run() {
     assert_eq!(real_writes(fleet.server("b")), 0);
 }
 
+// covers #871: a spec changed again while the rollout is awaited (a GitOps revert, say) is not
+// taken for this change rolling out: the member fails and the run stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_superseded_while_waiting_stops_the_run() {
+    let fleet = Fleet::start_rolling().await;
+    let preview = fleet.preview(FleetAction::RolloutRestart).await;
+    let (run, mut heard) = fleet.start_run(preview, FleetCancel::new());
+    until_waiting(&mut heard, "a").await;
+    let a = fleet.server("a");
+    // Once the wait has read the object as written.
+    let reads = || {
+        a.arrivals()
+            .iter()
+            .filter(|r| r.method == http::Method::GET && r.path.ends_with("/deployments/web"))
+            .count()
+    };
+    let before = reads();
+    tokio::time::timeout(WAIT, async {
+        while reads() == before {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the wait reads the object");
+    let mut reverted = live(a);
+    let generation = reverted["metadata"]["generation"].as_i64().unwrap();
+    reverted["metadata"]["generation"] = json!(generation + 1);
+    reverted["spec"]["template"]["metadata"] = json!({});
+    a.set_object(&deployments(), reverted);
+    a.finish_rollout(&deployments(), Some("demo"), NAME);
+
+    let report = run.await.unwrap();
+    assert_eq!(
+        ends(&report),
+        [
+            FleetStatus::RolloutFailed(RolloutFailure::Superseded),
+            AFTER_FAILURE,
+            AFTER_FAILURE,
+        ]
+    );
+    assert_eq!(real_writes(fleet.server("b")), 0);
+}
+
 // covers #871: a cancel while a rollout is awaited stops the run before the next member.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancel_while_waiting_stops_before_the_next_cluster() {

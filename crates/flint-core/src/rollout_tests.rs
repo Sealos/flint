@@ -281,8 +281,68 @@ fn a_stateful_set_wait_follows_ready_replicas_revisions_and_partition() {
         wait_of("statefulsets", set(moving, partitioned)),
         Some(RolloutWait::Finished)
     );
+    // OnDelete: the pods asked for must be up, whatever revision they run.
     let on_delete = json!({"type": "OnDelete"});
-    assert_eq!(wait_of("statefulsets", set(done, on_delete)), None);
+    let old_revision = json!({"observedGeneration": 2, "replicas": 3, "readyReplicas": 3,
+        "availableReplicas": 3, "updatedReplicas": 0, "currentRevision": "r1",
+        "updateRevision": "r2"});
+    assert_eq!(
+        wait_of("statefulsets", set(old_revision, on_delete.clone())),
+        Some(RolloutWait::Finished)
+    );
+    let starting = json!({"observedGeneration": 2, "replicas": 3, "readyReplicas": 1});
+    assert!(matches!(
+        wait_of("statefulsets", set(starting, on_delete)),
+        Some(RolloutWait::Waiting(_))
+    ));
+    // Ready but not yet available (minReadySeconds), or a scale-down with pods still to go.
+    let in_min_ready = json!({"observedGeneration": 2, "replicas": 3, "readyReplicas": 3,
+        "availableReplicas": 2, "updatedReplicas": 3, "currentRevision": "r2",
+        "updateRevision": "r2"});
+    assert!(matches!(
+        wait_of(
+            "statefulsets",
+            set(in_min_ready, json!({"type": "RollingUpdate"}))
+        ),
+        Some(RolloutWait::Waiting(_))
+    ));
+    let scaling_down = json!({"observedGeneration": 2, "replicas": 5, "readyReplicas": 5,
+        "availableReplicas": 5, "updatedReplicas": 5, "currentRevision": "r2",
+        "updateRevision": "r2"});
+    assert!(matches!(
+        wait_of(
+            "statefulsets",
+            set(scaling_down, json!({"type": "RollingUpdate"}))
+        ),
+        Some(RolloutWait::Waiting(_))
+    ));
+}
+
+#[test]
+fn a_deployment_wait_judges_only_the_latest_spec() {
+    // A failure from before the change: not judged until the controller sees the change.
+    let old_failure = deployment_value(json!({"observedGeneration": 1, "updatedReplicas": 1,
+        "availableReplicas": 2, "conditions": [condition("False", "ProgressDeadlineExceeded", 1)]}));
+    assert!(matches!(
+        wait_of("deployments", old_failure),
+        Some(RolloutWait::Waiting(_))
+    ));
+    let mut unobserved = deployment_value(json!({"updatedReplicas": 3, "availableReplicas": 3}));
+    unobserved["status"]
+        .as_object_mut()
+        .unwrap()
+        .remove("observedGeneration");
+    assert!(matches!(
+        wait_of("deployments", unobserved),
+        Some(RolloutWait::Waiting(_))
+    ));
+    // A scale-down from five to three: every replica updated and available, two still to go.
+    let scaling_down = deployment_value(json!({"replicas": 5, "updatedReplicas": 5,
+        "availableReplicas": 5}));
+    assert!(matches!(
+        wait_of("deployments", scaling_down),
+        Some(RolloutWait::Waiting(_))
+    ));
 }
 
 #[test]
