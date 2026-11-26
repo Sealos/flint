@@ -147,8 +147,11 @@ impl SettingsDraft {
     /// through the draft, and Save leaves it as it is.
     pub fn changed_on_disk(&self, file: &Settings) -> bool {
         self.base.as_deref().is_some_and(|base| {
+            // An edit only to keys Flint ignores, or to comments, changes the file too. A proxy
+            // applied from the Network section rewrites it as well, so it is only compared while
+            // the proxy is unchanged.
             if base.proxy == file.proxy {
-                return base != file;
+                return base != file || !base.file_stamp.same(&file.file_stamp);
             }
             let mut base = base.clone();
             base.proxy = file.proxy.clone();

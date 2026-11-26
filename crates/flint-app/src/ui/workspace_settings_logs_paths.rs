@@ -543,7 +543,10 @@ impl Workspace {
     ) {
         let page = &self.settings_page;
         let current = self.model.read(cx).settings.clone();
-        let unchanged = page.draft.edits() == edits && *current == **file;
+        // The file stamp too: an edit only to keys Flint ignores leaves the settings as read.
+        let unchanged = page.draft.edits() == edits
+            && *current == **file
+            && current.file_stamp.same(&file.file_stamp);
         if !unchanged || !page.draft.loosens_protection() || !self.can_save_settings(cx) {
             self.settings_page.save_note = Some(UNPROTECT_STALE.to_owned());
             cx.notify();
