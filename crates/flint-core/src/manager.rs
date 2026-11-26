@@ -1051,10 +1051,11 @@ impl ClusterManager {
             Request::AdmitForward {
                 cluster,
                 server,
+                target,
                 admitted,
                 reply,
             } => {
-                let _ = reply.send(self.admit_forward(cluster, server, admitted.as_ref()));
+                let _ = reply.send(self.admit_forward(cluster, server, target, admitted.as_ref()));
             }
             Request::CheckForward { id, reply } => {
                 let _ = reply.send(self.check_forward(id));

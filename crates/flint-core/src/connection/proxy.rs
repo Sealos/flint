@@ -141,6 +141,28 @@ pub(crate) fn replace_setting(setting: &ProxySetting) -> Result<u64, ReplaceRefu
     Ok(next)
 }
 
+/// Puts `saved`, the setting a `settings.toml` read since startup holds, in use as a process
+/// started now would, unless it is the one in use already: what [`replace_setting`] does for a
+/// process without the manager (`flint mcp`), which notices the file's change itself. Returns
+/// whether it did. Never while the file was unreadable at startup, as for [`replace_setting`].
+pub(crate) fn follow_setting(saved: &ProxySetting) -> bool {
+    let same = |setting: &ProxySetting| setting.normalized() == saved.normalized();
+    let mut settings = SETTINGS.write().unwrap_or_else(|e| e.into_inner());
+    let next = match settings.last() {
+        Some((_, InUse::Unreadable)) => return false,
+        Some((_, InUse::Setting(setting))) if same(setting) => return false,
+        Some((generation, InUse::Setting(_))) => generation + 1,
+        // No setting at startup: the environment decided, as an empty setting does.
+        None if same(&ProxySetting::default()) => return false,
+        None => {
+            settings.push((0, InUse::Setting(ProxySetting::default())));
+            1
+        }
+    };
+    settings.push((next, InUse::Setting(saved.clone())));
+    true
+}
+
 /// How many times the setting in use was replaced while Flint runs ([`replace_setting`]).
 pub(crate) fn generation() -> u64 {
     let settings = SETTINGS.read().unwrap_or_else(|e| e.into_inner());

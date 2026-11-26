@@ -339,7 +339,7 @@ impl Workspace {
             };
             let ProxyApplied {
                 reconnecting,
-                forwards_ended,
+                forwards,
                 settled,
                 ..
             } = applied;
@@ -348,15 +348,12 @@ impl Workspace {
                 network.applied = Some(setting);
                 network.progress = Some(Progress::Reconnecting {
                     waiting: reconnecting,
-                    forwards_ended,
+                    forwards,
                 });
                 cx.notify();
             });
             let progress = match settled.await {
-                Ok(report) => Progress::Done {
-                    report,
-                    forwards_ended,
-                },
+                Ok(report) => Progress::Done(report),
                 Err(_) => Progress::Failed(
                     "the proxy was applied, but how the clusters reconnected is not known".into(),
                 ),

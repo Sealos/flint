@@ -238,8 +238,13 @@ pub fn impact_text(setting: &ProxySetting, forwards: usize, live: LiveSessions) 
     );
     text.push_str(&match forwards {
         0 => String::new(),
-        1 => " 1 port-forward ends; start it again on the new connection.".into(),
-        n => format!(" {n} port-forwards end; start them again on the new connection."),
+        1 => " 1 port-forward keeps its local port and reconnects once its cluster is back; if \
+              it can't, it ends and says why."
+            .into(),
+        n => format!(
+            " {n} port-forwards keep their local ports and reconnect once their clusters are \
+             back; one that can't ends and says why."
+        ),
     });
     if !live.is_empty() {
         text.push_str(&format!(
@@ -258,16 +263,13 @@ pub fn impact_text(setting: &ProxySetting, forwards: usize, live: LiveSessions) 
 pub enum Progress {
     /// Sent to the core, not answered yet.
     Applying,
-    /// Saved and in use; these clusters are connecting again.
+    /// Saved and in use; these clusters and this many port-forwards are connecting again.
     Reconnecting {
         waiting: Vec<ClusterId>,
-        forwards_ended: usize,
+        forwards: usize,
     },
     /// How each came back.
-    Done {
-        report: ProxyReconnectReport,
-        forwards_ended: usize,
-    },
+    Done(ProxyReconnectReport),
     /// Refused: nothing changed.
     Failed(String),
 }
@@ -276,30 +278,26 @@ impl Progress {
     /// The lines the section shows for it.
     pub fn lines(&self) -> Vec<String> {
         let names = |ids: &[ClusterId]| ids.join(", ");
-        let forwards = |n: usize| match n {
+        let waiting_forwards = |n: usize| match n {
             0 => None,
-            1 => Some("1 port-forward ended; start it again.".to_owned()),
-            n => Some(format!("{n} port-forwards ended; start them again.")),
+            1 => Some("Reconnecting 1 port-forward on its local port…".to_owned()),
+            n => Some(format!(
+                "Reconnecting {n} port-forwards on their local ports…"
+            )),
         };
         match self {
             Progress::Applying => vec!["Applying the proxy…".into()],
             Progress::Failed(why) => vec![format!("Not applied: {why}")],
-            Progress::Reconnecting {
-                waiting,
-                forwards_ended,
-            } => {
+            Progress::Reconnecting { waiting, forwards } => {
                 let mut lines = vec![if waiting.is_empty() {
                     "Applied. No cluster was connected, so none reconnects.".to_owned()
                 } else {
                     format!("Applied. Reconnecting: {}…", names(waiting))
                 }];
-                lines.extend(forwards(*forwards_ended));
+                lines.extend(waiting_forwards(*forwards));
                 lines
             }
-            Progress::Done {
-                report,
-                forwards_ended,
-            } => {
+            Progress::Done(report) => {
                 let mut lines = vec![];
                 if report.reconnected.is_empty() && report.failed.is_empty() {
                     lines.push("Applied. No cluster was connected, so none reconnected.".into());
@@ -317,7 +315,16 @@ impl Progress {
                         names(&report.rerouted)
                     ));
                 }
-                lines.extend(forwards(*forwards_ended));
+                for forward in &report.forwards {
+                    let port = forward
+                        .local_port
+                        .map_or(String::new(), |port| format!(" on local port {port}"));
+                    let what = format!("{} of {}{port}", forward.target, forward.cluster);
+                    lines.push(match &forward.ended {
+                        None => format!("Port-forward reconnected: {what}."),
+                        Some(why) => format!("Port-forward ended: {what}: {why}."),
+                    });
+                }
                 lines
             }
         }
@@ -325,7 +332,8 @@ impl Progress {
 
     pub fn failed(&self) -> bool {
         matches!(self, Progress::Failed(_))
-            || matches!(self, Progress::Done { report, .. } if !report.failed.is_empty())
+            || matches!(self, Progress::Done(report)
+                if !report.failed.is_empty() || report.forwards.iter().any(|f| f.ended.is_some()))
     }
 }
 
@@ -590,9 +598,7 @@ pub fn view_state(
     invalid: bool,
 ) -> super::view_state::NetworkState {
     let (reconnected, failed) = match &network.progress {
-        Some(Progress::Done { report, .. }) => {
-            (Some(report.reconnected.clone()), report.failed.clone())
-        }
+        Some(Progress::Done(report)) => (Some(report.reconnected.clone()), report.failed.clone()),
         _ => (None, Vec::new()),
     };
     super::view_state::NetworkState {

@@ -7,8 +7,10 @@ use std::path::{Path, PathBuf};
 use super::{Pending, ProxyChange};
 use crate::cluster::{SafeErrorText, ServerVersion};
 use crate::connection::proxy;
-use crate::handle::{ConnectionState, CoreConfig, ProxyReconnectReport};
+use crate::credential::{CredentialSource, WriteCredential};
+use crate::handle::{ConnectionState, CoreConfig, ForwardReconnect, ProxyReconnectReport};
 use crate::manager::ClusterManager;
+use crate::port_forward::{DialError, ForwardGrant, ForwardState};
 use crate::protection::SessionUnlocks;
 use crate::recheck::Pinned;
 use crate::settings::{ProxySetting, Settings};
@@ -345,7 +347,7 @@ async fn child_every_slot_is_rebuilt_on_the_new_setting() {
 
     assert!(applied.loaded);
     assert_eq!(applied.rerouted, ["dev"]);
-    assert_eq!(applied.forwards_ended, 0);
+    assert_eq!(applied.forwards, 0);
     assert!(!format!("{applied:?}").contains("hunter2"));
     assert_eq!(proxy::generation(), 1);
     for (id, before) in ["dev", "own"].into_iter().zip(generations) {
@@ -419,19 +421,24 @@ async fn child_a_slot_of_the_old_setting_is_held_until_a_load_replaces_it() {
     }
 }
 
-// covers UP-125: every port-forward ends when the proxy changes, saying why.
+// covers UP-125: a port-forward whose cluster does not come back on the new setting ends,
+// saying why, and the report lists it.
 #[test]
-fn every_forward_ends_when_the_proxy_changes() {
-    in_child("child_every_forward_ends_when_the_proxy_changes");
+fn a_forward_whose_cluster_is_not_back_ends_saying_why() {
+    in_child("child_a_forward_whose_cluster_is_not_back_ends_saying_why");
 }
 
 #[tokio::test]
-async fn child_every_forward_ends_when_the_proxy_changes() {
+async fn child_a_forward_whose_cluster_is_not_back_ends_saying_why() {
     if !is_child() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let mut manager = manager_in(dir.path()).await;
+    // Neither was connected, so nothing connects them again.
+    for id in ["dev", "own"] {
+        manager.cluster_mut(id).unwrap().state = ConnectionState::Disconnected;
+    }
     let dev = manager.forward_for_tests("dev");
     let own = manager.forward_for_tests("own");
 
@@ -442,15 +449,200 @@ async fn child_every_forward_ends_when_the_proxy_changes() {
         )
         .await
         .unwrap();
+    assert_eq!(applied.forwards, 2);
+    manager.sync_forwards();
+    manager.sync_proxy_report();
 
-    assert_eq!(applied.forwards_ended, 2);
     for ended in [dev, own] {
         let state = ended.borrow().clone();
-        let Some(crate::port_forward::ForwardState::Failed(failure)) = state else {
+        let Some(ForwardState::Failed(failure)) = state else {
             panic!("the forward did not end: {state:?}");
         };
-        assert!(failure.message.contains("proxy"), "{}", failure.message);
+        assert!(
+            failure
+                .message
+                .contains("did not reconnect on the new proxy setting"),
+            "{}",
+            failure.message
+        );
     }
+    let report = applied.settled.await.unwrap();
+    assert_eq!(report.forwards.len(), 2, "{report:?}");
+    assert!(
+        report.forwards.iter().all(|f| f
+            .ended
+            .as_deref()
+            .is_some_and(|why| why.contains("not connected"))),
+        "{report:?}"
+    );
+}
+
+/// Gives `id`'s slot a connection with a credential of its own, as a connection attempt does.
+fn connect(manager: &mut ClusterManager, id: &str) {
+    let slot = manager.cluster_mut(id).expect("loaded");
+    slot.state = ConnectionState::Connected(version());
+    slot.write_credential = Some(WriteCredential::new(
+        Vec::new(),
+        CredentialSource::Definition,
+        None,
+        None,
+    ));
+}
+
+/// A manager with `own` selected, connected and unlocked, and a forward on it at port 8080.
+async fn forwarding_on_own(dir: &Path) -> (ClusterManager, ForwardGrant) {
+    let mut manager = manager_in(dir).await;
+    manager.active = Some("own".to_owned());
+    manager.sync_forwards();
+    connect(&mut manager, "own");
+    let route = manager.cluster("own").unwrap().info.grant_server().unwrap();
+    manager.unlocks.unlock("own", &route);
+    let grant = manager.bound_forward_for_tests("own", 8080);
+    manager.sync_forwards();
+    assert!(grant.ended.borrow().is_none(), "the forward runs");
+    assert!(manager.check_forward(grant.id).is_ok());
+    (manager, grant)
+}
+
+// covers UP-125: a port-forward waits on its port through a proxy change and goes on with the
+// new connection once its cluster is back, the same definition on the same server.
+#[test]
+fn a_forward_reconnects_on_its_port_once_its_cluster_is_back() {
+    in_child("child_a_forward_reconnects_on_its_port_once_its_cluster_is_back");
+}
+
+#[tokio::test]
+async fn child_a_forward_reconnects_on_its_port_once_its_cluster_is_back() {
+    if !is_child() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (mut manager, grant) = forwarding_on_own(dir.path()).await;
+
+    let applied = manager
+        .apply_proxy(
+            setting("http://proxy.example:3128"),
+            ProxySetting::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.forwards, 1);
+    assert!(grant.binding.borrow().rebinding, "it waits");
+    assert!(matches!(
+        manager.check_forward(grant.id),
+        Err(DialError::Dropped(_))
+    ));
+
+    // Not back yet: it waits on.
+    manager.sync_forwards();
+    assert!(grant.ended.borrow().is_none());
+    assert!(grant.binding.borrow().rebinding);
+
+    connect(&mut manager, "own");
+    manager.sync_forwards();
+    manager.sync_proxy_report();
+
+    let binding = grant.binding.borrow().clone();
+    assert!(!binding.rebinding, "bound again");
+    let connection = manager
+        .cluster("own")
+        .unwrap()
+        .write_credential
+        .as_ref()
+        .unwrap()
+        .id();
+    assert!(binding.connection.is(&connection), "to the new connection");
+    assert!(grant.ended.borrow().is_none());
+    assert!(manager.check_forward(grant.id).is_ok());
+    let report = applied.settled.await.unwrap();
+    assert_eq!(report.reconnected, ["own"]);
+    assert_eq!(
+        report.forwards,
+        [ForwardReconnect {
+            cluster: "own".into(),
+            target: "pod/web port 80 in demo".into(),
+            local_port: Some(8080),
+            ended: None,
+        }]
+    );
+}
+
+// covers UP-125: a forward is bound again only to the definition it started on: one changed
+// while its cluster reconnected ends, saying why.
+#[test]
+fn a_forward_whose_definition_changed_ends_saying_why() {
+    in_child("child_a_forward_whose_definition_changed_ends_saying_why");
+}
+
+#[tokio::test]
+async fn child_a_forward_whose_definition_changed_ends_saying_why() {
+    if !is_child() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (mut manager, grant) = forwarding_on_own(dir.path()).await;
+
+    let applied = manager
+        .apply_proxy(
+            setting("http://proxy.example:3128"),
+            ProxySetting::default(),
+        )
+        .await
+        .unwrap();
+    // Another user for both contexts, on the same servers.
+    let edited = KUBECONFIG.replace("user: {}", "user: {token: other}");
+    std::fs::write(dir.path().join("kubeconfig"), edited).unwrap();
+    manager.reload_kubeconfig().await;
+    connect(&mut manager, "own");
+    manager.sync_forwards();
+    manager.sync_proxy_report();
+
+    let state = grant.ended.borrow().clone();
+    let Some(ForwardState::Failed(failure)) = state else {
+        panic!("the forward did not end: {state:?}");
+    };
+    assert!(
+        failure.message.contains("connection changed"),
+        "{}",
+        failure.message
+    );
+    let report = applied.settled.await.unwrap();
+    assert_eq!(report.forwards.len(), 1, "{report:?}");
+    assert_eq!(report.forwards[0].ended.as_ref(), Some(&failure.message));
+}
+
+// covers UP-125: a forward still waiting when the report is due ends, saying why.
+#[test]
+fn a_forward_still_waiting_when_the_report_is_due_ends() {
+    in_child("child_a_forward_still_waiting_when_the_report_is_due_ends");
+}
+
+#[tokio::test]
+async fn child_a_forward_still_waiting_when_the_report_is_due_ends() {
+    if !is_child() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (mut manager, grant) = forwarding_on_own(dir.path()).await;
+
+    let applied = manager
+        .apply_proxy(
+            setting("http://proxy.example:3128"),
+            ProxySetting::default(),
+        )
+        .await
+        .unwrap();
+    manager.sync_forwards();
+    manager.proxy_report_due(manager.proxy_change.seq);
+
+    let state = grant.ended.borrow().clone();
+    let Some(ForwardState::Failed(failure)) = state else {
+        panic!("the forward did not end: {state:?}");
+    };
+    assert!(failure.message.contains("in time"), "{}", failure.message);
+    let report = applied.settled.await.unwrap();
+    assert_eq!(report.forwards.len(), 1, "{report:?}");
+    assert!(report.forwards[0].ended.is_some(), "{report:?}");
 }
 
 // covers UP-125: a proxy change refused at startup's unreadable settings.toml changes nothing.

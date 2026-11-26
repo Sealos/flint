@@ -3,16 +3,20 @@
 //! The setting is written to `settings.toml`, put in use for every connection made from then on,
 //! and the kubeconfig files are read again under it. A slot loaded under the old setting is held
 //! until a load under the new one replaces it ([`ClusterManager::held`]), and that load replaces
-//! every slot: each client, feed and background watch is built again. Nothing rebinds: a context
-//! the new setting reaches another way is on another route, so sessions and grants pinned to the
-//! old one end as for a re-pointed context, and port-forwards, bound to the connection they
-//! started on, all end. What came back is reported once each reconnection settled.
+//! every slot: each client, feed and background watch is built again. A context the new setting
+//! reaches another way is on another route, so sessions and grants pinned to the old one end as
+//! for a re-pointed context. Port-forwards are the one thing bound again: each keeps its local
+//! port and waits for its cluster, then goes on with the new connection if it is the same
+//! definition and the gate lets it run on its route, or ends saying why
+//! ([`super::forwards`]). What came back is reported once each reconnection settled.
 
 use std::collections::{BTreeSet, HashMap};
 
 use super::ClusterManager;
 use crate::ClusterId;
-use crate::handle::{ConnectionState, PROXY_REPORT_AFTER, ProxyApplied, ProxyReconnectReport};
+use crate::handle::{
+    ConnectionState, ForwardReconnect, PROXY_REPORT_AFTER, ProxyApplied, ProxyReconnectReport,
+};
 use crate::keep_watching::KeepWatching;
 use crate::settings::{self, ProxySetting};
 
@@ -40,8 +44,12 @@ struct Pending {
 /// Why a cluster the report still waits for when its timer runs out failed.
 const TIMED_OUT: &str = "did not connect in time on the new proxy setting";
 
+/// Why a forward still waiting when a newer change replaced the old one's report does not wait:
+/// never, it waits on for the newer one.
+const REPLACED: &str = "a newer proxy setting replaced it before it connected";
+
 /// How a cluster waited on came back, once it did.
-enum Outcome {
+pub(super) enum Outcome {
     Reconnected,
     Failed(String),
 }
@@ -94,16 +102,22 @@ impl ClusterManager {
             return Err(why);
         }
         // A report still waiting for an earlier change goes out now, against the routes that
-        // change loaded, before this one replaces them.
-        self.finish_proxy_report("a newer proxy setting replaced it before it connected");
-        let generation =
-            crate::connection::proxy::replace_setting(&setting).map_err(|e| e.to_string())?;
+        // change loaded, before this one replaces them. Its forwards wait on for this one.
+        self.finish_proxy_report(REPLACED);
+        let generation = match crate::connection::proxy::replace_setting(&setting) {
+            Ok(generation) => generation,
+            Err(refused) => {
+                self.end_rebinding_forwards(TIMED_OUT);
+                return Err(refused.to_string());
+            }
+        };
         tracing::info!("proxy setting replaced; connecting every cluster again");
 
         // Every slot is behind the setting now, so held: no new connection, session or write
         // starts on its old route. A write reviewed on a slot is refused once the load replaces
-        // it, and one on a rerouted context by its moved route too.
-        let forwards_ended = self.end_forwards_for_proxy();
+        // it, and one on a rerouted context by its moved route too. Forwards keep their ports
+        // and wait for their clusters.
+        let forwards = self.hold_forwards_for_proxy();
         self.publish_holds();
         // A member's sign-in asked for and not yet started was for its old route: forgotten.
         self.drop_member_sign_ins();
@@ -138,7 +152,7 @@ impl ClusterManager {
         Ok(ProxyApplied {
             reconnecting,
             rerouted,
-            forwards_ended,
+            forwards,
             loaded,
             settled: settled_rx,
         })
@@ -170,8 +184,15 @@ impl ClusterManager {
             .clusters
             .iter()
             .all(|slot| slot.proxy_generation == generation);
-        if pending.waiting.is_empty() && routes_loaded {
+        if pending.waiting.is_empty() && routes_loaded && !self.forwards_rebinding() {
             self.finish_proxy_report(TIMED_OUT);
+        }
+    }
+
+    /// Puts how a forward came back in the pending report.
+    pub(super) fn note_forward(&mut self, outcome: ForwardReconnect) {
+        if let Some(pending) = &mut self.proxy_change.pending {
+            pending.report.forwards.push(outcome);
         }
     }
 
@@ -200,8 +221,15 @@ impl ClusterManager {
             .collect()
     }
 
-    /// Sends the pending report, with what it still waits for as failed for `why`.
+    /// Sends the pending report, with what it still waits for as failed for `why`. A forward
+    /// still waiting ends for it too, unless a newer change replaced this one: it waits for that.
     fn finish_proxy_report(&mut self, why: &str) {
+        if self.proxy_change.pending.is_none() {
+            return;
+        }
+        if why != REPLACED {
+            self.end_rebinding_forwards(why);
+        }
         let Some(mut pending) = self.proxy_change.pending.take() else {
             return;
         };
@@ -213,7 +241,7 @@ impl ClusterManager {
     }
 
     /// How `id` came back from a proxy change, or None while it still may.
-    fn proxy_outcome(&self, id: &str) -> Option<Outcome> {
+    pub(super) fn proxy_outcome(&self, id: &str) -> Option<Outcome> {
         let Some(slot) = self.cluster(id) else {
             return Some(Outcome::Failed(
                 "it is no longer in your kubeconfig files".to_owned(),

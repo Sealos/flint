@@ -7,7 +7,9 @@ use flint_core::cluster;
 use flint_core::port_forward::{
     ForwardRequest, ForwardState, ForwardTarget, PortForward, wait_for,
 };
-use flint_e2e::fake_api::{CONTEXT, FakeApiServer, arrivals_at};
+use flint_e2e::fake_api::{CONTEXT, FakeApiServer, Options, arrivals_at, write_kubeconfigs};
+use flint_e2e::mcp::Mcp;
+use flint_e2e::scratch::Scratch;
 use kube::config::Kubeconfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -823,16 +825,29 @@ fn unreadable_settings_child() {
         });
 }
 
-/// Set for the child process of [`a_proxy_change_reconnects_through_the_new_proxy`].
+/// Set for the child processes [`run_change_child`] starts.
 const CHANGE_CHILD: &str = "FLINT_TEST_PROXY_CHANGE_CHILD";
 
 // covers UP-125: a proxy saved from Settings applies without a restart. The cluster connects
-// again through the new proxy, a forward open on the old connection ends saying why, and one
-// started again carries bytes through the new proxy.
+// again; a forward whose route the change keeps reconnects on its local port with the new
+// connection. When the change moves the cluster behind a proxy, the forward ends saying why (the
+// new route is not unlocked), and one started again carries bytes through the new proxy.
 #[test]
 fn a_proxy_change_reconnects_through_the_new_proxy() {
+    run_change_child("proxy_change_child");
+}
+
+// covers UP-125: a running `flint mcp` uses a proxy saved in settings.toml without a restart,
+// with the same route checks as a fresh start.
+#[test]
+fn a_running_mcp_server_follows_a_saved_proxy_change() {
+    run_change_child("mcp_proxy_change_child");
+}
+
+/// Runs the test `child` in a child process with no proxy in its environment.
+fn run_change_child(child: &str) {
     let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["proxy_change_child", "--exact", "--nocapture"])
+        .args([child, "--exact", "--nocapture"])
         .env(CHANGE_CHILD, "1")
         .env_remove("HTTPS_PROXY")
         .env_remove("https_proxy")
@@ -888,8 +903,36 @@ async fn proxy_change_child() {
     };
 
     let before = core.handle.port_forward(request.clone());
-    echoes(forward_port(&before).await).await;
+    let port = forward_port(&before).await;
+    echoes(port).await;
     assert!(seen.lock().unwrap().heads.is_empty(), "direct at first");
+
+    // A proxy the fake API server is exempt from: the cluster connects again on the same route,
+    // and the forward goes on with the new connection on its port.
+    let exempt = flint_core::settings::ProxySetting {
+        url: Some(format!("http://user:proxy-secret@{proxy}")),
+        no_proxy: vec!["127.0.0.1".into()],
+    };
+    let applied = core
+        .handle
+        .apply_proxy(exempt.clone(), Default::default())
+        .await
+        .unwrap();
+    assert!(applied.rerouted.is_empty(), "{applied:?}");
+    assert_eq!(applied.forwards, 1);
+    let report = tokio::time::timeout(core_support::WAIT, applied.settled)
+        .await
+        .expect("the report in time")
+        .expect("a report");
+    assert_eq!(report.reconnected, [CONTEXT], "{report:?}");
+    assert_eq!(report.forwards.len(), 1, "{report:?}");
+    assert_eq!(report.forwards[0].ended, None, "{report:?}");
+    assert_eq!(report.forwards[0].local_port, Some(port), "{report:?}");
+    let shown = before.snapshot();
+    assert_eq!(shown.state, ForwardState::Listening, "{shown:?}");
+    assert_eq!(shown.local_port, Some(port));
+    echoes(port).await;
+    assert!(seen.lock().unwrap().heads.is_empty(), "still direct");
 
     let applied = core
         .handle
@@ -898,15 +941,15 @@ async fn proxy_change_child() {
                 url: Some(format!("http://user:proxy-secret@{proxy}")),
                 no_proxy: Vec::new(),
             },
-            // Reviewed over no saved proxy, as settings.toml has none.
-            Default::default(),
+            // Reviewed over the setting saved above.
+            exempt,
         )
         .await
         .unwrap();
     assert!(applied.loaded);
     assert_eq!(applied.rerouted, [CONTEXT]);
     assert_eq!(applied.reconnecting, [CONTEXT]);
-    assert_eq!(applied.forwards_ended, 1);
+    assert_eq!(applied.forwards, 1);
     let report = tokio::time::timeout(core_support::WAIT, applied.settled)
         .await
         .expect("the report in time")
@@ -914,6 +957,12 @@ async fn proxy_change_child() {
     assert_eq!(report.reconnected, [CONTEXT], "{report:?}");
     assert_eq!(report.rerouted, [CONTEXT], "{report:?}");
     assert!(report.failed.is_empty(), "{report:?}");
+    // Through a proxy the local cluster is no longer exempt, and its old unlock does not carry
+    // over: the forward ends rather than reconnect, saying why.
+    assert_eq!(report.forwards.len(), 1, "{report:?}");
+    let why = report.forwards[0].ended.clone().expect("it ended");
+    assert!(why.contains("protected"), "{why}");
+    assert!(!format!("{report:?}").contains("proxy-secret"));
 
     let mut updates = before.updates();
     let ended = tokio::time::timeout(
@@ -925,8 +974,7 @@ async fn proxy_change_child() {
     let ForwardState::Failed(failure) = ended.state else {
         unreachable!("waited for a failure")
     };
-    assert!(failure.message.contains("proxy"), "{}", failure.message);
-    assert!(!failure.message.contains("proxy-secret"));
+    assert_eq!(failure.message, why);
 
     let tunnels = seen.lock().unwrap().heads.len();
     assert!(tunnels > 0, "the cluster connected again through the proxy");
@@ -964,5 +1012,49 @@ async fn proxy_change_child() {
             .all(|head| head.contains("dXNlcjpwcm94eS1zZWNyZXQ=")),
         "{:?}",
         seen.heads
+    );
+}
+
+#[test]
+fn mcp_proxy_change_child() {
+    if std::env::var_os(CHANGE_CHILD).is_none() {
+        return;
+    }
+    let api = FakeApiServer::start_blocking(Options::default()).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (proxy, seen) = runtime.block_on(fake_proxy(api.addr()));
+    let scratch = Scratch::new().unwrap();
+    let kubeconfig = scratch.path().join("kubeconfig");
+    write_kubeconfigs(&kubeconfig, &[(&api, "fake", None)]).unwrap();
+    let settings = scratch.config_dir().join("settings.toml");
+    let exposing = |server: &str| {
+        format!("[[ai_exposed_clusters]]\ncontext = \"fake\"\nserver = \"{server}\"\n")
+    };
+    std::fs::write(&settings, exposing(&api.url())).unwrap();
+    let mut mcp = Mcp::start(&kubeconfig, &scratch.config_dir()).unwrap();
+    let reachable = |mcp: &mut Mcp| {
+        let listed = mcp
+            .call_json("list_clusters", serde_json::json!({}))
+            .unwrap();
+        listed["clusters"][0]["reachable"] == serde_json::json!(true)
+    };
+    assert!(reachable(&mut mcp));
+    assert!(seen.lock().unwrap().heads.is_empty(), "direct at first");
+
+    // Saved while it runs, with the exposure for the route the proxy gives the cluster.
+    let route = format!("{} via http://{proxy}", api.url());
+    std::fs::write(
+        &settings,
+        format!("[proxy]\nurl = \"http://{proxy}\"\n{}", exposing(&route)),
+    )
+    .unwrap();
+    assert!(reachable(&mut mcp));
+    let heads = seen.lock().unwrap().heads.clone();
+    assert!(!heads.is_empty(), "the client was built again on the proxy");
+    assert!(
+        heads
+            .iter()
+            .all(|head| head.starts_with(&format!("CONNECT {} HTTP/1.1", api.addr()))),
+        "{heads:?}"
     );
 }

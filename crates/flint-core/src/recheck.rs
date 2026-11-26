@@ -157,6 +157,18 @@ impl ContextPin {
             && same_endpoint(self.server.as_deref(), other.server.as_deref())
     }
 
+    /// Whether `other` is this pin's definition on the same server, perhaps reached another way:
+    /// all a proxy change may move. Both must be on their context's confirmed route, and no
+    /// fallback may have moved the gate between them.
+    pub(crate) fn same_definition_on_any_route(&self, other: &ContextPin) -> bool {
+        self.generation != 0
+            && other.generation != 0
+            && self.definition.is_some()
+            && self.definition == other.definition
+            && self.server == other.server
+            && self.gate == other.gate
+    }
+
     /// Whether `other` is this pin on another connection definition, and nothing else moved.
     pub fn only_definition_differs(&self, other: &ContextPin) -> bool {
         self.definition != other.definition

@@ -216,7 +216,8 @@ Flint is in early development.
 - Connections through an HTTP CONNECT or SOCKS5 proxy: a kubeconfig cluster's `proxy-url`, the `[proxy]` setting or
   `HTTPS_PROXY` can be `http://`, `socks5://` or `socks5h://`, with TLS to the API server itself. Helm cannot use a
   SOCKS proxy yet. Settings > Network applies a proxy at once, without a restart: Flint reconnects every cluster
-  through it and ends running port forwards, which you start again.
+  through it, and running port forwards reconnect on the same local ports (one that can't ends and says why). A
+  running `flint mcp` picks up a proxy saved in `settings.toml` on its next call.
 - Regex search in logs: **Toggle Regex Search** (⌥⌘R) reads the search and the Matching Lines Only filter as a regular
   expression, and says why when it is invalid.
 - Fleet actions on a cluster set: **Rollout Restart Across Set…** and **Scale Across Set…** from a Deployment,
