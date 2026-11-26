@@ -995,7 +995,7 @@ async fn a_set_list_opens_at_saved_widths_and_reports_the_fresh_measurement(
     cx.run_until_parked();
     let events = events.lock().unwrap();
     let (set, kind, widths) = events.last().expect("the measurement is reported");
-    assert_eq!(set, "ctx-prod,ctx-staging");
+    assert_eq!(set, r#"["ctx-prod","ctx-staging"]"#);
     assert_eq!(*kind, KindId::pods());
     assert!(widths["flint:namespace"] < 25, "{widths:?}");
     assert!(widths.contains_key("flint:name"), "{widths:?}");

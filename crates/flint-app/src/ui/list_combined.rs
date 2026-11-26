@@ -635,17 +635,16 @@ impl CombinedResourceList {
     fn remember_widths(
         &mut self,
         source: &CombinedSource,
-        measured: &[usize],
-        has_rows: bool,
+        measured: &MeasuredWidths,
         cx: &mut Context<Self>,
     ) {
         let Some(kind) = source.kind.clone() else {
             return;
         };
-        if !has_rows {
+        if measured.rows == 0 {
             return;
         }
-        let now = ColumnWidths::to_saved(&source.columns, measured);
+        let now = ColumnWidths::to_saved(&source.columns, &measured.widths);
         if now != self.saved_widths {
             self.saved_widths = now.clone();
             let set = set_key(source.list.members().iter().map(|m| m.cluster()));
@@ -673,12 +672,7 @@ impl CombinedResourceList {
         self.view_ready = true;
         self.widths
             .update(&source.columns, &computed.measured.widths, restart);
-        self.remember_widths(
-            &source,
-            &computed.measured.widths,
-            !computed.view.rows().is_empty(),
-            cx,
-        );
+        self.remember_widths(&source, &computed.measured, cx);
         self.measured = Some(computed.measured);
         self.shown = source;
         self.view = Arc::new(computed.view);

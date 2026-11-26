@@ -793,7 +793,7 @@ pub struct State {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub list_widths: ListWidths,
     /// The same for combined lists of a cluster set, per set key (the member context names,
-    /// sorted, joined by commas) and kind id.
+    /// sorted, as a JSON array) and kind id.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub set_list_widths: ListWidths,
 }

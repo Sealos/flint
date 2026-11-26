@@ -190,13 +190,13 @@ fn remember_widths(
     Some(())
 }
 
-/// The key a cluster set's combined lists are saved under: its members' context names, sorted and
-/// joined by commas.
+/// The key a cluster set's combined lists are saved under: its members' context names, sorted,
+/// as a JSON array, so no name (commas and all) runs into another.
 pub fn set_key<'a>(contexts: impl IntoIterator<Item = &'a str>) -> String {
     let mut contexts: Vec<&str> = contexts.into_iter().collect();
     contexts.sort_unstable();
     contexts.dedup();
-    contexts.join(",")
+    serde_json::to_string(&contexts).expect("strings serialize")
 }
 
 /// Sorted, without duplicates or empty names.
@@ -335,7 +335,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut ui = UiState::load(dir.path().to_owned());
         let set = set_key(["kind-b", "kind-a", "kind-b"]);
-        assert_eq!(set, "kind-a,kind-b");
+        assert_eq!(set, r#"["kind-a","kind-b"]"#);
+        assert_ne!(set_key(["a,b", "c"]), set_key(["a", "b,c"]));
         let widths: SavedColumnWidths = [("flint:name".to_owned(), 40)].into();
         save(
             ui.remember_set_widths(&set, "pods", widths.clone())
