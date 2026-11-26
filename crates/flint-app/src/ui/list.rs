@@ -1425,6 +1425,7 @@ impl ResourceList {
             header = header.child(
                 h_flex()
                     .id(SharedString::from(header_id(&self.shown_columns, col)))
+                    .aria_label(name.clone())
                     .h_full()
                     .px_2()
                     .gap_1()

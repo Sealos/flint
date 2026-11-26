@@ -1852,7 +1852,8 @@ impl Workspace {
     /// The set's name, the members left out of it, and its buttons.
     fn render_set_bar(&self, run: &RunningSet, theme: &Theme, cx: &App) -> impl IntoElement {
         let names = self.cluster_names(cx);
-        h_flex()
+        // The bar is the set view's top edge, so it drags the window like a title bar.
+        super::theme::moves_window(h_flex())
             .flex_none()
             .flex_wrap()
             .gap_2()
