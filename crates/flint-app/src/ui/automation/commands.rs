@@ -584,7 +584,7 @@ mod tests {
         assert_eq!(state["id"], 1);
         assert_eq!(state["ok"], true);
         let result = &state["result"];
-        assert_eq!(result["main"], json!({"view": "no_cluster"}));
+        assert_eq!(result["main"]["view"], "home");
         assert_eq!(result["active_cluster"], Value::Null);
         let names: Vec<&str> = result["clusters"]
             .as_array()

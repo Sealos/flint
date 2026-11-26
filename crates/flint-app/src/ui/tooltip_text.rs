@@ -2,7 +2,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::{Pixels, Styled as _, px};
+use gpui_kit::{Bounds, Pixels, Point, Styled as _, point, px};
 
 pub(super) const SHOW_DELAY: Duration = Duration::from_millis(700);
 const MAX_WIDTH: Pixels = px(280.);
@@ -10,6 +10,26 @@ const PATH_TAIL_COMPONENTS: usize = 3;
 
 pub(super) fn cap_width(tooltip: Tooltip) -> Tooltip {
     tooltip.max_w(MAX_WIDTH).whitespace_normal()
+}
+
+/// The gap between a row's edge and a tooltip placed beside it.
+const BESIDE_GAP: Pixels = px(8.);
+
+/// Margins (left, top) that move a tooltip, which the window draws just below and right of the
+/// pointer, to the right of `row` and level with its top, so it covers none of the rows around it.
+pub(super) fn beside_row_margins(row: Bounds<Pixels>, pointer: Point<Pixels>) -> Point<Pixels> {
+    // The window puts the tooltip's origin one pixel off the pointer.
+    let origin = pointer + point(px(1.), px(1.));
+    point(
+        (row.right() + BESIDE_GAP - origin.x).max(Pixels::ZERO),
+        row.top() - origin.y,
+    )
+}
+
+/// A tooltip placed beside `row` instead of under the pointer.
+pub(super) fn beside_row(tooltip: Tooltip, row: Bounds<Pixels>, pointer: Point<Pixels>) -> Tooltip {
+    let margins = beside_row_margins(row, pointer);
+    cap_width(tooltip).ml(margins.x).mt(margins.y)
 }
 
 pub(super) fn shorten_path(path: &Path, home: Option<&Path>) -> String {
@@ -78,6 +98,21 @@ mod tests {
                 Path::new(expected)
             );
         }
+    }
+
+    #[test]
+    fn a_tooltip_beside_a_row_clears_the_rows_around_it() {
+        let row = Bounds::new(point(px(0.), px(100.)), gpui_kit::size(px(200.), px(24.)));
+        let pointer = point(px(50.), px(110.));
+        let margins = beside_row_margins(row, pointer);
+        // Drawn at the pointer plus one pixel, plus the margins.
+        let left = pointer.x + px(1.) + margins.x;
+        let top = pointer.y + px(1.) + margins.y;
+        assert!(left >= row.right());
+        assert_eq!(top, row.top());
+        // A pointer already beyond the row never moves the tooltip left.
+        let far = beside_row_margins(row, point(px(400.), px(110.)));
+        assert_eq!(far.x, Pixels::ZERO);
     }
 
     #[test]

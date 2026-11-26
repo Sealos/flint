@@ -34,6 +34,8 @@ pub struct AppState {
     pub nav: Option<NavState>,
     pub list: Option<ListState>,
     pub detail: Option<DetailState>,
+    /// The cluster's own dashboard (the overview), while it is open.
+    pub dashboard: Option<DashboardState>,
     /// The bottom dock and its tabs.
     pub dock: DockState,
     /// The open context menu, if any.
@@ -46,6 +48,38 @@ pub struct AppState {
     pub sets: ClusterSetsState,
     /// The Settings modal and its draft.
     pub settings: SettingsState,
+}
+
+/// The open dashboard of one cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DashboardState {
+    /// Whether the activity feed could be read at all.
+    pub warnings_available: bool,
+    /// What the feed counted, including rows beyond those shown.
+    pub warnings_total: usize,
+    /// The feed's rows, newest first.
+    pub warnings: Vec<WarningRowState>,
+}
+
+/// One row of the activity feed: a Warning event or a Deployment's rollout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WarningRowState {
+    /// The element id to click: `dashboard-warning-<key>`.
+    pub id: String,
+    pub age: String,
+    pub reason: String,
+    /// The object as the row says it (`Pod shop/web-0`).
+    pub object: String,
+    /// The kind a click opens (`Pod.v1`), `None` when the event names no object exactly.
+    pub kind: Option<String>,
+    pub namespace: Option<String>,
+    pub name: Option<String>,
+    pub message: String,
+    pub occurrences: u32,
+    /// Whether clicking it opens its object.
+    pub opens: bool,
+    /// The rollout's state, for a Deployment's row.
+    pub rollout: Option<&'static str>,
 }
 
 /// The Settings view (#739), a modal over the main window (#854): whether it is open, and its
@@ -428,8 +462,13 @@ pub struct ClusterState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "view", rename_all = "snake_case")]
 pub enum Main {
-    /// "Select a cluster".
-    NoCluster,
+    /// The fleet home screen: on launch, and from the sidebar's Home entry.
+    Home {
+        /// The clusters kept watching, in sidebar order, each with its card.
+        watched: Vec<HomeCardState>,
+        /// The other clusters, in sidebar order.
+        unwatched: Vec<HomeRowState>,
+    },
     /// No kubeconfig file had a context: where Flint looked and what to do.
     NoContexts,
     Connecting,
@@ -445,6 +484,27 @@ pub enum Main {
     AwaitingConfirmation,
     /// A resource list, and maybe the detail pane.
     List,
+}
+
+/// A watched cluster's card on the home screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HomeCardState {
+    pub cluster: String,
+    /// `watching`, `sign-in needed` or `paused`.
+    pub status: &'static str,
+    /// The card in one line, once it has been read from the cluster's feed.
+    pub card: Option<String>,
+    /// The Kubernetes version its feed reported.
+    pub version: Option<String>,
+}
+
+/// A cluster not kept watching, in the home screen's list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HomeRowState {
+    pub cluster: String,
+    pub label: String,
+    /// Whether its Keep Watching button is enabled.
+    pub keep_watching: bool,
 }
 
 /// The header over the list.

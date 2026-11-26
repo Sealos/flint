@@ -343,6 +343,14 @@ pub(crate) enum Request {
         member: AdmittedMember,
         reply: oneshot::Sender<Option<String>>,
     },
+    /// Signs `member` in once, now, if it is still on the definitions the view showed
+    /// ([`CoreHandle::sign_in_member`]).
+    SignInMember {
+        member: AdmittedMember,
+        definition: Option<u64>,
+        shown: Option<u64>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     /// The read client of `member`, checked in the same step.
     MemberClient {
         member: AdmittedMember,
@@ -1016,6 +1024,36 @@ impl CoreHandle {
     ) -> impl Future<Output = Result<Vec<AdmittedMember>, String>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
         let sent = self.requests.push(Request::AdmitRunningSet { pins, reply });
+        async move {
+            if sent.is_err() {
+                return Err("the core is not running".to_owned());
+            }
+            rx.await
+                .unwrap_or_else(|_| Err("the core stopped before answering".to_owned()))
+        }
+    }
+
+    /// For a click on a member's Sign in alone: runs its sign-in once, now, if it waits for one
+    /// and is still exactly the member the set view showed, on `definition`
+    /// ([`KeepWatchView::definition`](crate::keep_watching::KeepWatchView)) and, for an exec
+    /// plugin, on the plugin definition `shown`
+    /// ([`KeepWatchView::shown_sign_in`](crate::keep_watching::KeepWatchView)). The click is the
+    /// consent for that one start of the program: nothing is saved, nothing retries it, and it
+    /// turns no background sign-in on. A change since refuses it, and nothing runs. Resolves once
+    /// the attempt is asked for; its result arrives as the member's status.
+    pub fn sign_in_member(
+        &self,
+        member: &AdmittedMember,
+        definition: Option<u64>,
+        shown: Option<u64>,
+    ) -> impl Future<Output = Result<(), String>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let sent = self.requests.push(Request::SignInMember {
+            member: member.clone(),
+            definition,
+            shown,
+            reply,
+        });
         async move {
             if sent.is_err() {
                 return Err("the core is not running".to_owned());

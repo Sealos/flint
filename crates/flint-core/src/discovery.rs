@@ -450,6 +450,7 @@ pub(crate) mod tests {
             verbs: verbs.iter().map(|v| (*v).to_owned()).collect(),
             singular: kind.to_ascii_lowercase(),
             short_names: Vec::new(),
+            scale: Default::default(),
         }
     }
 

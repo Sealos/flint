@@ -295,6 +295,58 @@ async fn the_navigation_moves_opens_expands_and_collapses(cx: &mut TestAppContex
     assert_eq!(focus(cx, &t), Focus::Navigation);
 }
 
+// covers #313: Cmd-] returns to the place Go Back left, and a new navigation clears it.
+#[gpui_kit::test]
+async fn go_forward_returns_to_the_place_go_back_left(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    pods_with_detail(cx, &t).await;
+    assert!(!t.available(cx).contains(&"workspace::GoForward"));
+    t.dispatch(cx, "workspace::OpenView", json!({"kind": "services"}))
+        .unwrap();
+    t.feed_list(
+        cx,
+        objects(
+            KindId::new("", "services"),
+            &[("demo", "front", 0)],
+            flint_core::SyncState::Synced,
+            1,
+        ),
+    )
+    .await;
+    assert!(!t.available(cx).contains(&"workspace::GoForward"));
+    t.press_key_of(cx, "workspace::GoBack");
+    let list = t.list(cx).expect("a list is open");
+    assert_eq!(list.read_with(cx, |l, _| l.kind().clone()), KindId::pods());
+    t.feed_list(cx, pods(&[("demo", "api", 0), ("demo", "web", 0)]))
+        .await;
+    assert_eq!(t.selected(cx).as_deref(), Some("web"));
+    assert!(t.available(cx).contains(&"workspace::GoForward"));
+    t.press_key_of(cx, "workspace::GoForward");
+    let list = t.list(cx).expect("a list is open");
+    assert_eq!(
+        list.read_with(cx, |l, _| l.kind().clone()),
+        KindId::new("", "services")
+    );
+    assert!(!t.available(cx).contains(&"workspace::GoForward"));
+    t.feed_list(
+        cx,
+        objects(
+            KindId::new("", "services"),
+            &[("demo", "front", 0)],
+            flint_core::SyncState::Synced,
+            1,
+        ),
+    )
+    .await;
+    // Back again, then a new navigation: nothing is left to go forward to.
+    t.press_key_of(cx, "workspace::GoBack");
+    assert!(t.available(cx).contains(&"workspace::GoForward"));
+    t.dispatch(cx, "workspace::OpenView", json!({"kind": "secrets"}))
+        .unwrap();
+    assert!(!t.available(cx).contains(&"workspace::GoForward"));
+}
+
 // covers UP-33: Cmd-[ goes back to the kind and object shown before, then has nowhere to go.
 #[gpui_kit::test]
 async fn go_back_returns_to_the_kind_and_object_shown_before(cx: &mut TestAppContext) {

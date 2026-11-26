@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::list_usage::{self, ListUsage, UsageSource, UsageSubject};
+use super::list_usage_bar;
 use flint_core::redact::{is_masked_column, is_secret_list};
 use flint_core::table::unix_now;
 use flint_core::{
@@ -636,6 +637,18 @@ impl ResourceList {
         self.set_usage_source(source, cx);
     }
 
+    /// Takes the Settings thresholds in force for the list's cluster: where its usage bars turn
+    /// to a warning.
+    pub(in crate::ui) fn set_thresholds(
+        &mut self,
+        thresholds: flint_core::thresholds::Thresholds,
+        cx: &mut Context<Self>,
+    ) {
+        if self.usage.set_thresholds(thresholds) {
+            cx.notify();
+        }
+    }
+
     /// Takes the metrics poll's newest state.
     fn set_usage_source(&mut self, source: UsageSource, cx: &mut Context<Self>) {
         let generation = self.usage.generation();
@@ -1143,13 +1156,27 @@ impl ResourceList {
         self.clear_selection(cx);
     }
 
-    /// Sorts by the drawn column `action` names, as a header click does, and reports the new
-    /// sort to remember.
-    fn toggle_sort(&mut self, action: &SortBy, cx: &mut Context<Self>) {
-        let Some(key) = self.sort_key(action) else {
+    /// Sets or cycles the sort for the drawn column and reports the new sort to remember.
+    fn toggle_sort(&mut self, action: &SortBy, descending: Option<bool>, cx: &mut Context<Self>) {
+        let Some(column) = self.sortable_column(action) else {
+            tracing::warn!(
+                column = action.key.as_deref().unwrap_or(&action.column),
+                "no sortable column is drawn"
+            );
             return;
         };
-        self.query.sort = list_model::next_sort(self.query.sort.as_ref(), &key);
+        let key = column.key();
+        self.query.sort = match descending {
+            Some(descending) => Some(SortSpec {
+                column: key,
+                descending,
+            }),
+            None => list_model::next_sort(
+                self.query.sort.as_ref(),
+                &key,
+                list_model::is_numeric(column),
+            ),
+        };
         cx.emit(ListEvent::SortChanged(self.query.sort.clone()));
         self.recompute(cx);
         cx.notify();
@@ -1207,6 +1234,7 @@ impl ResourceList {
     fn layout(&self, available: Option<f32>) -> (Vec<(usize, f32)>, usize) {
         let columns = &self.shown_columns;
         let width = |chars: usize| chars as f32 * CHAR_WIDTH + CELL_PADDING;
+        let bar_width = list_usage::BAR_CHARS as f32 * CHAR_WIDTH;
         let (mut drawn, dropped) = list_model::fit_columns(
             columns,
             |i| width(self.widths.chars(i, &columns[i])),
@@ -1217,7 +1245,7 @@ impl ResourceList {
             let name_min = width(list_model::NAME_MIN_CHARS);
             let namespace_min = width(SQUEEZED_NAMESPACE_CHARS);
             let sort = self.query.sort.as_ref();
-            list_usage::shed_usage(&mut drawn, columns, room, |i| {
+            list_usage::shed_usage(&mut drawn, columns, room, bar_width, |i| {
                 sort.is_some_and(|s| columns[i].key() == s.column)
             });
             let rules = list_model::ShedRules {
@@ -1231,6 +1259,20 @@ impl ResourceList {
                 name_min,
                 namespace_min,
                 rules,
+                |i| sort.is_some_and(|s| columns[i].key() == s.column),
+            );
+            let name_target = columns
+                .iter()
+                .position(|c| c.role == ColumnRole::Name)
+                .map_or(name_min, |name| {
+                    let wanted = self.widths.wanted(name, &columns[name]);
+                    width(wanted.min(list_model::NAME_COMFORT_CHARS))
+                });
+            list_model::shed_trailing(
+                &mut drawn,
+                columns,
+                room,
+                (name_target, namespace_min),
                 |i| sort.is_some_and(|s| columns[i].key() == s.column),
             );
             list_model::squeeze_identity(&mut drawn, columns, room, name_min, namespace_min);
@@ -1306,6 +1348,22 @@ impl ResourceList {
             };
             for &(col, width) in &self.drawn {
                 let column = &self.shown_columns[col];
+                let usage_column =
+                    matches!(column.role, ColumnRole::CpuUsage | ColumnRole::MemoryUsage);
+                // A column too narrow for its bar (see `shed_usage`) shows the value alone, and a
+                // usage cell with a bar keeps the bar's room out of its text's.
+                let with_bar = usage_column
+                    && self
+                        .usage
+                        .bar_fits(column.role, width, CHAR_WIDTH, CELL_PADDING);
+                let bar_room = if with_bar {
+                    list_usage::BAR_CHARS as f32 * CHAR_WIDTH
+                } else {
+                    0.
+                };
+                let bar = with_bar
+                    .then(|| self.usage.bar(column.role, row_ix as usize))
+                    .flatten();
                 let list_model::CellStyle {
                     shown,
                     tooltip,
@@ -1315,7 +1373,7 @@ impl ResourceList {
                 } = list_model::CellStyle::of(
                     column,
                     || self.shown_cell(row_ix as usize, col, now),
-                    list_model::text_width(column, row, secrets, width),
+                    list_model::text_width(column, row, secrets, width - bar_room),
                     list_model::RowFlags {
                         masked: is_masked_column(secrets, &self.shown_columns, col),
                         ..flags
@@ -1327,6 +1385,13 @@ impl ResourceList {
                         Some(SharedString::from(format!("{namespace}/{}", row.name)))
                     }
                     _ => tooltip,
+                };
+                let tooltip = match usage_column
+                    .then(|| self.usage.hover(column.role, row_ix as usize))
+                    .flatten()
+                {
+                    Some(hover) => Some(SharedString::from(hover)),
+                    None => tooltip,
                 };
                 let cell = div()
                     .id(("cell", ix * ncols + col))
@@ -1347,6 +1412,8 @@ impl ResourceList {
                     .when(numeric, |el| {
                         el.justify_end().font_features(tabular_figures())
                     })
+                    .gap(px(USAGE_BAR_GAP))
+                    .when_some(bar, |el, bar| el.child(usage_bar(bar, theme)))
                     .child(
                         div()
                             .min_w_0()
@@ -1997,6 +2064,47 @@ pub fn find_row(snapshot: &KindSnapshot, namespace: Option<&str>, name: &str) ->
 }
 
 /// Tabular figures, so digits line up in numeric columns.
+/// The width of a usage bar, and the gap between it and its value.
+const USAGE_BAR_WIDTH: f32 = 48.;
+const USAGE_BAR_GAP: f32 = 8.;
+
+/// A usage bar: the fill is the use, the tick the request, and the end the limit.
+fn usage_bar(bar: list_usage_bar::Bar, theme: &Theme) -> impl IntoElement {
+    let colour = match bar.level {
+        list_usage_bar::BarLevel::Normal => theme.primary,
+        list_usage_bar::BarLevel::Warning => theme.warning,
+        list_usage_bar::BarLevel::Over => theme.danger,
+    };
+    div()
+        .relative()
+        .flex_none()
+        .w(px(USAGE_BAR_WIDTH))
+        .h(px(6.))
+        .rounded(theme.radius)
+        .bg(theme.muted)
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .h_full()
+                .w(relative(bar.fill))
+                .rounded(theme.radius)
+                .bg(colour),
+        )
+        .when_some(bar.tick, |el, tick| {
+            el.child(
+                div()
+                    .absolute()
+                    .top(px(-2.))
+                    .left(relative(tick))
+                    .w(px(1.5))
+                    .h(px(10.))
+                    .bg(theme.foreground),
+            )
+        })
+}
+
 pub fn tabular_figures() -> FontFeatures {
     FontFeatures(Arc::new(vec![("tnum".into(), 1)]))
 }
@@ -2042,7 +2150,7 @@ fn state_chip(state: &SyncState, feed: Feed, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// What a signed-out member's chip says instead of its sync state. Clicking the chip signs in.
+/// What a signed-out member's chip says instead of its sync state. Clicking it signs in.
 fn sign_in_chip(theme: &Theme) -> AnyElement {
     h_flex()
         .id("sync-state")
