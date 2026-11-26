@@ -1305,7 +1305,7 @@ impl ResourceList {
     /// The columns to draw and their widths, for a pane `available` points wide (unknown
     /// before the first layout). Wide columns that do not fit are left out, then the usage bars,
     /// Ready and Namespace as [`list_model::shed_columns`] allows, Restarts and Age, and last
-    /// Memory and CPU; spare width goes to the Name column.
+    /// Memory and CPU ([`list_usage::shed_usage`]); spare width goes to the Name column.
     fn layout(&self, available: Option<f32>) -> (Vec<(usize, f32)>, usize) {
         let columns = &self.shown_columns;
         let width = |chars: usize| chars as f32 * CHAR_WIDTH + CELL_PADDING;
