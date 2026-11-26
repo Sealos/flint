@@ -1208,16 +1208,19 @@ impl Workspace {
                 let leaves_set =
                     self.sets.is_open() && !self.sets.has_member(Some(&action.cluster));
                 let again = action.clone();
-                if leaves_set
-                    && self.asks_before_leaving_set(window, cx, {
+                // The edit first, as every other way out of a set asks: after its Discard the
+                // question comes again with nothing left to ask about but the set, which
+                // asking about the set first would ask a second time.
+                if leaves
+                    && self.asks_before_leaving(window, cx, {
                         let again = again.clone();
                         move |ws, window, cx| ws.select_cluster(&again, window, cx)
                     })
                 {
                     return;
                 }
-                if leaves
-                    && self.asks_before_leaving(window, cx, move |ws, window, cx| {
+                if leaves_set
+                    && self.asks_before_leaving_set(window, cx, move |ws, window, cx| {
                         ws.select_cluster(&again, window, cx)
                     })
                 {
