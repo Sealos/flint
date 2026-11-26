@@ -375,6 +375,20 @@ impl CombinedResourceList {
         self.recompute(cx);
     }
 
+    /// Shows another kind in this list, titled `label`, keeping what the person set up: the text
+    /// filter, the cluster chips, the grouping and the sort, which applies once the new kind
+    /// has its column.
+    /// What belongs to the old kind goes: its selection, its dashboard narrowing and its note.
+    pub fn switch_kind(&mut self, label: String, source: CombinedSource, cx: &mut Context<Self>) {
+        self.end_objects();
+        self.label = label;
+        self.kind_note = None;
+        self.hide_rows(cx);
+        self.remeasure = true;
+        self.set_source(source, cx);
+        cx.notify();
+    }
+
     pub fn set_namespaces(&mut self, namespaces: Vec<String>, cx: &mut Context<Self>) {
         if self.query.namespaces != namespaces {
             self.query.namespaces = namespaces;
@@ -491,7 +505,7 @@ impl CombinedResourceList {
         self.recompute(cx);
     }
 
-    /// Sorts by `column`: ascending, descending, then the default order.
+    /// Cycles the sort for `column`, starting descending for numeric columns.
     pub fn toggle_sort(&mut self, column: &ColumnKey, cx: &mut Context<Self>) {
         let Some(at) = self.latest.list.column_index(column) else {
             return;
@@ -499,7 +513,8 @@ impl CombinedResourceList {
         if self.latest.masked[at] {
             return;
         }
-        self.query.sort = model::next_sort(self.query.sort.as_ref(), column);
+        let numeric = list_model::is_numeric(&self.latest.columns[at]);
+        self.query.sort = model::next_sort(self.query.sort.as_ref(), column, numeric);
         self.recompute(cx);
     }
 
@@ -515,7 +530,16 @@ impl CombinedResourceList {
         let source = self.latest.clone();
         let sort = model::effective_sort(&source, self.query.sort.as_ref(), self.show_wide);
         let mut query = CombinedQuery {
-            sort: sort.clone(),
+            sort: sort.as_ref().and_then(|sort| {
+                let column = source.list.column_index(&sort.column)?;
+                Some(CombinedSort {
+                    column: sort.column.clone(),
+                    descending: list_model::descending_for_cells(
+                        &source.columns[column],
+                        sort.descending,
+                    ),
+                })
+            }),
             ..self.query.clone()
         };
         // A count covers every namespace, whatever the picker holds.

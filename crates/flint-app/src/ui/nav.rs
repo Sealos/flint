@@ -663,6 +663,13 @@ impl Render for NavPanel {
                                     } else {
                                         section.title.to_uppercase()
                                     })
+                                    // A title cut to the sidebar's width shows whole here.
+                                    .tooltip({
+                                        let full = section.title.clone();
+                                        move |window, cx| {
+                                            Tooltip::new(full.clone()).build(window, cx)
+                                        }
+                                    })
                                     .test_support(),
                             )
                             .when(is_collapsed, |el| {

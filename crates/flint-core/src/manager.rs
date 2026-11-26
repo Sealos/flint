@@ -2827,7 +2827,7 @@ impl ClusterManager {
     async fn reload_activity(&mut self) {
         let dir = self.config.config_dir.clone();
         let read = tokio::task::spawn_blocking(move || {
-            (activity::read(&dir), activity::ServerKeys::open(&dir))
+            (activity::read(&dir), activity::ServerKeys::read(&dir))
         });
         if let Ok((records, keys)) = read.await {
             self.emit(Event::AgentActivity(Arc::new(records), keys));

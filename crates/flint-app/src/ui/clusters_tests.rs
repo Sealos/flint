@@ -213,8 +213,8 @@ async fn a_failed_connection_leaves_the_toggles_enabled(cx: &mut TestAppContext)
             .unwrap()
             .starts_with("Hidden from AI agents")
     );
-    // Nothing is watched on a failed cluster, so the header has no watch mode.
-    assert!(t.find(cx, "watch-mode").is_none());
+    // Nothing is watched on a failed cluster, so the header's watch mode is off.
+    assert_eq!(t.find(cx, "watch-mode").unwrap().disabled(), Some(true));
     assert!(t.available(cx).contains(&"workspace::ExposeToAi"));
     assert!(t.find(cx, "settings-error").is_none());
 }

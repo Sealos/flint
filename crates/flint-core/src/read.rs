@@ -4,6 +4,7 @@
 //! These functions apply no policy. Callers decide limits, redaction, and who may see what (the
 //! MCP server does this in `flint-mcp`; the UI will use these directly).
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use kube::api::{Api, ApiResource, DynamicObject, ListParams, LogParams};
 use kube::core::discovery::v2::APIGroupDiscovery;
 use kube::discovery::verbs;
 
+use crate::action_kinds::{self, ScaleSubresource};
 use crate::api_error::{ApiError, Transport};
 use crate::api_path::{self, PathError};
 pub use crate::api_path::{is_dns1123_label, is_dns1123_subdomain, is_path_segment};
@@ -31,6 +33,8 @@ pub struct KindInfo {
     pub singular: String,
     /// The short names discovery suggests (`deploy`, `po`, `svc`), as kubectl accepts them.
     pub short_names: Vec<String>,
+    /// Its `scale` subresource; see [`KindInfo::scale_paths`].
+    pub scale: ScaleSubresource,
 }
 
 impl KindInfo {
@@ -182,6 +186,13 @@ async fn discover_kinds_within(
     let mut found = tokio::time::timeout(overall, discover)
         .await
         .unwrap_or_else(|_| Err(ClusterError::timeout(overall, None)))?;
+    // Bounded on its own, and shorter than a request: a slow definition leaves its kind without
+    // Scale, never fails discovery, and holds up the kinds only briefly.
+    let scale = action_kinds::read_scale_paths(client, &mut found.kinds, per_request);
+    let bound = per_request.min(action_kinds::SCALE_PATHS_TIMEOUT);
+    if tokio::time::timeout(bound, scale).await.is_err() {
+        tracing::debug!("reading scale paths timed out; those kinds have no Scale");
+    }
     // Put the core group first, then sort by group and kind.
     found.kinds.sort_by(|a, b| {
         (!a.group().is_empty(), a.group(), a.kind()).cmp(&(
@@ -309,6 +320,15 @@ fn kinds_from_aggregated(group: APIGroupDiscovery) -> Vec<KindInfo> {
             verbs: r.verbs,
             singular: r.singular_resource.unwrap_or_default(),
             short_names: r.short_names,
+            scale: if r
+                .subresources
+                .iter()
+                .any(|s| s.subresource.as_deref() == Some("scale"))
+            {
+                ScaleSubresource::Unread
+            } else {
+                ScaleSubresource::Absent
+            },
         })
         .collect()
 }
@@ -431,11 +451,21 @@ fn loggable_group(name: &str) -> &str {
 }
 
 fn kinds_from_resource_list(group: &str, version: &str, list: APIResourceList) -> Vec<KindInfo> {
+    let scaled: HashSet<String> = list
+        .resources
+        .iter()
+        .filter_map(|r| r.name.strip_suffix("/scale").map(str::to_owned))
+        .collect();
     list.resources
         .into_iter()
         // `pods/log` and the like are subresources, not kinds.
         .filter(|r| is_routable(group, version, &r.name))
         .map(|r| KindInfo {
+            scale: if scaled.contains(&r.name) {
+                ScaleSubresource::Unread
+            } else {
+                ScaleSubresource::Absent
+            },
             resource: api_resource(group, version, r.kind, r.name),
             namespaced: r.namespaced,
             verbs: r.verbs,
@@ -1057,6 +1087,7 @@ mod tests {
             verbs: vec!["list".into()],
             singular: kind.to_ascii_lowercase(),
             short_names: Vec::new(),
+            scale: Default::default(),
         }
     }
 
@@ -1249,6 +1280,24 @@ mod tests {
         assert_eq!(kinds[0].api_version(), "v1");
         assert_eq!(kinds[0].short_names, ["po"]);
         assert_eq!(kinds[0].singular, "pod");
+        assert_eq!(kinds[0].scale, ScaleSubresource::Absent);
+    }
+
+    #[test]
+    fn resource_lists_note_a_scale_subresource() {
+        let list: APIResourceList = serde_json::from_value(serde_json::json!({
+            "groupVersion": "example.dev/v1",
+            "resources": [
+                {"name": "widgets", "singularName": "widget", "namespaced": true,
+                 "kind": "Widget", "verbs": ["list"]},
+                {"name": "widgets/scale", "singularName": "", "namespaced": true,
+                 "kind": "Scale", "verbs": ["get", "patch"]}
+            ]
+        }))
+        .unwrap();
+        let kinds = kinds_from_resource_list("example.dev", "v1", list);
+        assert_eq!(kinds.len(), 1);
+        assert_eq!(kinds[0].scale, ScaleSubresource::Unread);
     }
 
     // covers UP-10
@@ -1346,8 +1395,8 @@ mod tests {
     }
 
     /// A fake API server: answers each path in `routes` with its status and JSON body, anything
-    /// else with 404, and counts connections. Plain HTTP on 127.0.0.1, one request per
-    /// connection.
+    /// else with 404, and counts connections. A path listed more than once gets its answers in
+    /// order, the last one from then on. Plain HTTP on 127.0.0.1, one request per connection.
     async fn fake_api(
         routes: Vec<(&'static str, u16, serde_json::Value)>,
     ) -> (Client, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
@@ -1357,10 +1406,15 @@ mod tests {
         let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = connections.clone();
         let routes = std::sync::Arc::new(routes);
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            usize,
+        >::new()));
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let routes = routes.clone();
+                let hits = hits.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0u8; 4096];
@@ -1379,9 +1433,15 @@ mod tests {
                         .next()
                         .unwrap_or("/")
                         .to_owned();
-                    let (code, body) = routes
-                        .iter()
-                        .find(|(p, _, _)| *p == path)
+                    let answers: Vec<_> = routes.iter().filter(|(p, _, _)| *p == path).collect();
+                    let hit = {
+                        let mut hits = hits.lock().unwrap();
+                        let hit = hits.entry(path.clone()).or_default();
+                        *hit += 1;
+                        *hit - 1
+                    };
+                    let (code, body) = answers
+                        .get(hit.min(answers.len().saturating_sub(1)))
                         .map(|(_, code, body)| (*code, body.to_string()))
                         .unwrap_or_else(|| {
                             (
@@ -1389,6 +1449,10 @@ mod tests {
                                 serde_json::json!({"kind": "Status", "code": 404}).to_string(),
                             )
                         });
+                    // Code 0: a server that never answers this path.
+                    if code == 0 {
+                        std::future::pending::<()>().await;
+                    }
                     let response = format!(
                         "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
@@ -1468,6 +1532,133 @@ mod tests {
         );
         assert_eq!(id(&found.kinds, "deploy", None), "deployments.apps");
         assert_eq!(id(&found.kinds, "po", None), "pods");
+    }
+
+    // covers UP-53: a custom resource has Scale only with replica paths read from its definition.
+    #[tokio::test]
+    async fn custom_scale_paths_come_from_the_definition() {
+        use serde_json::json;
+        let scaled = |plural: &str, kind: &str| {
+            json!({"resource": plural, "responseKind": {"kind": kind}, "scope": "Namespaced",
+                   "verbs": ["get", "list"],
+                   "subresources": [{"subresource": "scale", "verbs": ["get", "patch"]}]})
+        };
+        let crd = |plural: &str, path: &str| {
+            json!({"apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+                   "metadata": {"name": format!("{plural}.example.dev")},
+                   "spec": {"group": "example.dev", "names": {"plural": plural},
+                            "versions": [{"name": "v1", "served": true, "subresources": {"scale":
+                                {"specReplicasPath": path, "statusReplicasPath": ".status.n"}}}]}})
+        };
+        let (client, _) = fake_api(vec![
+            ("/api", 200, json!({"items": [{"metadata": {"name": ""}, "versions": [
+                {"version": "v1", "resources": [scaled("replicationcontrollers", "ReplicationController")]}]}]})),
+            ("/apis", 200, json!({"items": [{"metadata": {"name": "example.dev"}, "versions": [
+                {"version": "v1", "resources": [
+                    scaled("widgets", "Widget"), scaled("gizmos", "Gizmo"),
+                    scaled("sprockets", "Sprocket"),
+                    {"resource": "plain", "responseKind": {"kind": "Plain"}, "verbs": ["list"]},
+                ]}]}]})),
+            (
+                "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/widgets.example.dev",
+                200,
+                crd("widgets", ".spec.size"),
+            ),
+            (
+                "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/gizmos.example.dev",
+                200,
+                crd("gizmos", ".spec.sizes[0]"),
+            ),
+            // sprockets.example.dev: no definition can be read.
+        ])
+        .await;
+        let found = discover_kinds(&client).await.unwrap();
+        let scale = |plural: &str| {
+            let kind = found.kinds.iter().find(|k| k.plural() == plural).unwrap();
+            (kind.scale.clone(), kind.scale_paths())
+        };
+        assert_eq!(
+            scale("widgets").1,
+            action_kinds::ScalePaths::from_crd(".spec.size", ".status.n")
+        );
+        assert_eq!(scale("gizmos"), (ScaleSubresource::Unread, None));
+        assert_eq!(scale("sprockets"), (ScaleSubresource::Unread, None));
+        assert_eq!(scale("plain"), (ScaleSubresource::Absent, None));
+        assert_eq!(
+            scale("replicationcontrollers").1,
+            Some(action_kinds::ScalePaths::built_in())
+        );
+    }
+
+    // covers UP-53: a definition that never answers costs only its own kind's Scale: what the
+    // others answered before the deadline is kept.
+    #[tokio::test]
+    async fn a_stalled_definition_keeps_the_paths_already_read() {
+        use serde_json::json;
+        let crd = json!({"spec": {"group": "example.dev", "names": {"plural": "widgets"},
+            "versions": [{"name": "v1", "served": true, "subresources": {"scale":
+                {"specReplicasPath": ".spec.size", "statusReplicasPath": ".status.n"}}}]}});
+        let (client, _) = fake_api(vec![
+            (
+                "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/widgets.example.dev",
+                200,
+                crd,
+            ),
+            (
+                "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/gizmos.example.dev",
+                0,
+                json!({}),
+            ),
+        ])
+        .await;
+        let kind = |plural: &str| KindInfo {
+            scale: ScaleSubresource::Unread,
+            ..kind("example.dev", "v1", "Widget", plural)
+        };
+        let mut kinds = vec![kind("widgets"), kind("gizmos")];
+        let read = action_kinds::read_scale_paths(&client, &mut kinds, Duration::from_secs(60));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), read)
+                .await
+                .is_err()
+        );
+        assert!(kinds[0].scale_paths().is_some());
+        assert_eq!(kinds[1].scale, ScaleSubresource::Unread);
+    }
+
+    // covers UP-53: a definition read that fails for a reason that may pass is read again, and
+    // one the server refuses is not.
+    #[tokio::test]
+    async fn a_definition_read_that_may_pass_is_tried_again() {
+        use serde_json::json;
+        let crd = |plural: &str| {
+            json!({"apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+                   "metadata": {"name": format!("{plural}.example.dev")},
+                   "spec": {"group": "example.dev", "names": {"plural": plural},
+                            "versions": [{"name": "v1", "served": true, "subresources": {"scale":
+                                {"specReplicasPath": ".spec.size",
+                                 "statusReplicasPath": ".status.n"}}}]}})
+        };
+        // kube itself tries a 503 again; a 500 it does not.
+        let failed = json!({"kind": "Status", "code": 500, "reason": "InternalError"});
+        let forbidden = json!({"kind": "Status", "code": 403, "reason": "Forbidden"});
+        let widgets = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/widgets.example.dev";
+        let gizmos = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/gizmos.example.dev";
+        let (client, _) = fake_api(vec![
+            (widgets, 500, failed),
+            (widgets, 200, crd("widgets")),
+            (gizmos, 403, forbidden),
+            (gizmos, 200, crd("gizmos")),
+        ])
+        .await;
+        let kind = |plural: &str| KindInfo {
+            scale: ScaleSubresource::Unread,
+            ..kind("example.dev", "v1", "Widget", plural)
+        };
+        let mut kinds = vec![kind("widgets"), kind("gizmos")];
+        action_kinds::read_scale_paths(&client, &mut kinds, Duration::from_secs(5)).await;
+        assert!(kinds[0].scale_paths().is_some(), "read again after a 500");
+        assert_eq!(kinds[1].scale, ScaleSubresource::Unread, "a refusal stands");
     }
 
     // covers UP-10

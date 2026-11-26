@@ -159,17 +159,23 @@ fn up_53_each_action_sends_its_exact_request() -> Result<()> {
     let app = launch_protected(&cluster)?;
     lift_protection(&app, &cluster.context, "UnlockCluster", "unlocked")?;
 
-    // Rollout restart: the timestamp is the one value the test cannot know.
+    // Rollout restart: a JSON Patch that tests the uid and the template's annotations as read,
+    // or their absence by the metadata they would be in. The timestamp is the one value the test
+    // cannot know.
+    let metadata = fake
+        .object(&deployments, Some("demo"), "web")
+        .context("no web")?["spec"]["template"]["metadata"]
+        .clone();
     open_live(&app, "deployments", 5)?;
     select(&app, Some("demo"), "web")?;
     run(&app, "workspace::RestartObject")?;
     let writes = answered(fake, 1)?;
     let mut sent = body(&writes[0]);
-    let annotations = sent
-        .pointer_mut("/spec/template/metadata/annotations")
+    let written = sent
+        .pointer_mut("/2/value")
         .and_then(Value::as_object_mut)
-        .context("no annotations")?;
-    let at = annotations
+        .context("no annotations written")?;
+    let at = written
         .insert(RESTARTED_AT.to_owned(), "at".into())
         .context("no restartedAt")?;
     assert!(
@@ -177,17 +183,28 @@ fn up_53_each_action_sends_its_exact_request() -> Result<()> {
             .is_some_and(|at| at.contains('T') && at.ends_with('Z')),
         "{at}"
     );
-    assert_eq!(
-        sent,
-        json!({
-            "metadata": {"uid": web_uid},
-            "spec": {"template": {"metadata": {"annotations": {RESTARTED_AT: "at"}}}},
-        })
-    );
+    let annotations = "/spec/template/metadata/annotations";
+    let expected = match metadata.get("annotations") {
+        Some(read) => {
+            let mut stamped = read.clone();
+            stamped[RESTARTED_AT] = "at".into();
+            json!([
+                {"op": "test", "path": "/metadata/uid", "value": web_uid},
+                {"op": "test", "path": annotations, "value": read},
+                {"op": "add", "path": annotations, "value": stamped},
+            ])
+        }
+        None => json!([
+            {"op": "test", "path": "/metadata/uid", "value": web_uid},
+            {"op": "test", "path": "/spec/template/metadata", "value": metadata},
+            {"op": "add", "path": annotations, "value": {RESTARTED_AT: "at"}},
+        ]),
+    };
+    assert_eq!(sent, expected);
     assert_eq!(writes[0].method, Method::PATCH);
     assert_eq!(writes[0].path, WEB);
     assert_eq!(writes[0].query, FIELD_MANAGER);
-    assert_eq!(writes[0].content_type, MERGE_PATCH);
+    assert_eq!(writes[0].content_type, JSON_PATCH);
 
     // Scale: the JSON Patch tests the uid and the reviewed count.
     run(&app, "workspace::ScaleObject")?;

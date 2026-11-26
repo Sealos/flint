@@ -356,7 +356,8 @@ fn patch_scale(
         .ok_or_else(|| ApiError::new(400, "BadRequest", "not a JSON Patch"))?;
     let mut state = lock(&inner.state);
     let mut object = state.object(gvr, namespace, name)?;
-    let replicas = object.pointer("/spec/replicas").and_then(Value::as_u64);
+    let pointer = super::variants::replicas_pointer(&inner.options.scaled, gvr);
+    let replicas = object.pointer(&pointer).and_then(Value::as_u64);
     let spec = match replicas {
         Some(count) if count > 0 => json!({ "replicas": count }),
         _ => json!({}),
@@ -378,7 +379,10 @@ fn patch_scale(
         return Ok(rebased(inner, scale));
     }
     let to = scale.pointer("/spec/replicas").cloned().unwrap_or(json!(0));
-    object["spec"]["replicas"] = to;
+    match object.pointer_mut(&pointer) {
+        Some(count) => *count = to,
+        None => return Err(ApiError::new(422, "Invalid", "no replica count to scale")),
+    }
     let version = state.bump();
     object["metadata"]["resourceVersion"] = version.to_string().into();
     scale["metadata"]["resourceVersion"] = version.to_string().into();

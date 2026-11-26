@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use flint_core::access::{Access, AccessCheck};
+use flint_core::action_kinds;
 use flint_core::{KindId, SlotBinding};
 use gpui_kit::*;
 
@@ -46,8 +47,9 @@ const RECHECK: Duration = Duration::from_secs(2);
 /// and `definition`).
 pub(in crate::ui) type ConnectionIdentity = (u64, u64);
 
-/// What the pane of an object of `kind` may need to show.
-fn gated_for(kind: &KindId, subject: Subject) -> Vec<Gated> {
+/// What the pane of an object of `kind` may need to show. `scalable`: its cluster's discovery
+/// gives the kind Scale (`Workspace::kind_scale_paths`).
+fn gated_for(kind: &KindId, subject: Subject, scalable: bool) -> Vec<Gated> {
     let mut gated = vec![Gated::Edit];
     if subject != Subject::Other {
         gated.extend([Gated::Logs, Gated::Shell]);
@@ -56,7 +58,7 @@ fn gated_for(kind: &KindId, subject: Subject) -> Vec<Gated> {
         gated.push(Gated::PortForward);
     }
     gated.extend(
-        resource_actions::offered_for(kind, true, None)
+        resource_actions::offered_for(kind, scalable, true, None)
             .into_iter()
             .map(Gated::Write),
     );
@@ -106,6 +108,8 @@ pub(in crate::ui) struct ObjectAccess {
     namespace: Option<String>,
     name: String,
     subject: Subject,
+    /// Whether the kind has Scale on the object's cluster, as discovery says.
+    scalable: bool,
     targets: Targets,
     connection: Option<ConnectionIdentity>,
     /// The context's definition is in doubt: the core refuses checks, so none is shown.
@@ -127,6 +131,7 @@ impl ObjectAccess {
             namespace: namespace.map(str::to_owned),
             name: name.to_owned(),
             subject,
+            scalable: action_kinds::scales_built_in(kind),
             targets: Targets::default(),
             connection: None,
             unsettled: false,
@@ -177,9 +182,12 @@ impl ObjectAccess {
                 _ => Vec::new(),
             },
             Gated::Write(ResourceAction::Delete) => vec![object("delete")],
-            Gated::Write(ResourceAction::Scale) => {
+            // A built-in kind is scaled through its `scale` subresource, a custom resource by a
+            // patch of the object itself.
+            Gated::Write(ResourceAction::Scale) if action_kinds::scales_built_in(&self.kind) => {
                 vec![on(group, plural, Some("scale"), Some(&self.name), "patch")]
             }
+            Gated::Write(ResourceAction::Scale) => vec![object("patch")],
             Gated::Write(ResourceAction::Drain) => vec![
                 object("patch"),
                 AccessCheck {
@@ -263,6 +271,20 @@ impl DetailView {
         self.follow_access(cx);
     }
 
+    /// Says whether the object's kind has Scale on its cluster now, as discovery says: a custom
+    /// resource's Scale is asked about only then. Another answer asks again.
+    pub(in crate::ui) fn set_access_scalable(&mut self, scalable: bool, cx: &mut Context<Self>) {
+        let scalable = scalable || action_kinds::scales_built_in(&self.object.kind);
+        if self.access.scalable == scalable {
+            return;
+        }
+        self.access.scalable = scalable;
+        // What is asked changed: the next follow asks it all again.
+        self.access.followed = None;
+        cx.notify();
+        self.follow_access(cx);
+    }
+
     /// Keeps the answers to the connection shown: none while no check can run (protected, not
     /// connected, definition in doubt), and new ones when it changes. Cheap when nothing did.
     pub(super) fn follow_access(&mut self, cx: &mut Context<Self>) {
@@ -302,7 +324,8 @@ impl DetailView {
     }
 
     fn ask_access(&self, followed: Followed, cx: &mut Context<Self>) -> Task<()> {
-        let mut wanted: Vec<AccessCheck> = gated_for(&self.object.kind, self.subject)
+        let scalable = self.access.scalable;
+        let mut wanted: Vec<AccessCheck> = gated_for(&self.object.kind, self.subject, scalable)
             .into_iter()
             .flat_map(|what| self.access.checks(what))
             .collect();
@@ -384,7 +407,7 @@ mod tests {
     use flint_core::KindId;
     use flint_core::access::{Access, AccessCheck};
 
-    use super::{Followed, Gated, ObjectAccess, ResourceAction, Subject, Targets};
+    use super::{Followed, Gated, ObjectAccess, ResourceAction, Subject, Targets, gated_for};
 
     fn object(group: &str, plural: &str, namespace: Option<&str>, name: &str) -> ObjectAccess {
         let kind = KindId::new(group, plural);
@@ -430,6 +453,33 @@ mod tests {
         assert_eq!(
             access.forbidden(delete).as_deref(),
             Some("your access does not allow delete on deployments in demo")
+        );
+    }
+
+    // covers UP-121: a custom resource's Scale patches the object itself, so that is what it asks,
+    // and only once discovery gave its kind Scale; a clear refusal disables it.
+    #[test]
+    fn a_custom_resource_scale_asks_for_a_patch_of_the_object() {
+        let kind = KindId::new("example.dev", "widgets");
+        let subject = Subject::of(&kind);
+        let scale = Gated::Write(ResourceAction::Scale);
+        assert!(!gated_for(&kind, subject, false).contains(&scale));
+        assert!(gated_for(&kind, subject, true).contains(&scale));
+        let mut access = object("example.dev", "widgets", Some("demo"), "web");
+        let asked = wanted(&access, scale);
+        assert_eq!(asked.len(), 1);
+        assert_eq!(
+            (
+                asked[0].verb.as_str(),
+                asked[0].subresource.as_deref(),
+                asked[0].name.as_deref()
+            ),
+            ("patch", None, Some("web"))
+        );
+        answer(&mut access, scale, Access::Forbidden);
+        assert_eq!(
+            access.forbidden(scale).as_deref(),
+            Some("your access does not allow patch on widgets in demo")
         );
     }
 
