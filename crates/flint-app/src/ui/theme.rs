@@ -51,6 +51,14 @@ pub fn moves_window<E: InteractiveElement>(element: E) -> E {
     })
 }
 
+/// Keeps a press on `element`, or anything in it, from moving the window. For a group of controls
+/// in a [`moves_window`] row: a disabled button or a tab prevents nothing itself, so a press on
+/// one would otherwise drag the window.
+pub fn keeps_press<E: InteractiveElement>(element: E) -> E {
+    // not-an-action: window chrome, tells the drag row above that this press is not for it.
+    element.on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+}
+
 /// Both themes, without the accent.
 pub(super) const THEMES: &str = include_str!("themes/flint.json");
 
