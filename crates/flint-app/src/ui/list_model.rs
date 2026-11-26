@@ -297,12 +297,15 @@ pub struct ColumnWidths {
     chars: Vec<usize>,
     /// The widths the list was last saved with, by column key.
     saved: SavedColumnWidths,
+    /// The saved widths have not met a column they apply to yet.
+    fresh: bool,
 }
 
 impl ColumnWidths {
     /// Widths that start from `saved`, laid out for `columns` once they are known.
     pub fn seeded(saved: SavedColumnWidths, columns: &Arc<[Column]>) -> Self {
         let mut widths = ColumnWidths {
+            fresh: !saved.is_empty(),
             saved,
             ..Default::default()
         };
@@ -334,8 +337,14 @@ impl ColumnWidths {
     }
 
     /// Folds a measurement of `columns` in. `restart` drops the widths so far, for when other
-    /// rows are measured (the namespace filter changed), so columns fit them.
+    /// rows are measured (the namespace filter changed), so columns fit them. The saved widths
+    /// hold against a restart until they have met a column they apply to: a list opened already
+    /// narrowed still opens at them.
     pub fn update(&mut self, columns: &Arc<[Column]>, measured: &[usize], restart: bool) {
+        let keys = ranked_keys(columns);
+        let applies = self.fresh && keys.iter().any(|key| self.saved.contains_key(key));
+        let restart = restart && !applies;
+        self.fresh &= !applies;
         // The first columns the list has: start from the saved widths, which the measurement
         // only grows.
         if !restart && self.chars.is_empty() {
@@ -350,13 +359,17 @@ impl ColumnWidths {
             let before = before.zip(Some(std::mem::take(&mut self.chars)));
             self.columns = Some(columns.clone());
             self.chars = measured.to_vec();
-            // Columns that stay when others come or go (usage columns found missing) keep their
-            // widths, so nothing snaps.
-            if let (false, Some((keys, chars))) = (restart, before) {
-                for (have, key) in self.chars.iter_mut().zip(ranked_keys(columns)) {
-                    if let Some(at) = keys.iter().position(|k| *k == key) {
-                        *have = (*have).max(chars[at]);
-                    }
+            if !restart {
+                // Columns that stay when others come or go (usage columns found missing) keep
+                // their widths, so nothing snaps; columns that come take their saved ones.
+                let (old_keys, old_chars) = before.unwrap_or_default();
+                for (have, key) in self.chars.iter_mut().zip(&keys) {
+                    let old = old_keys
+                        .iter()
+                        .position(|k| k == key)
+                        .map(|at| old_chars[at]);
+                    let saved = self.saved.get(key).map(|&saved| saved as usize);
+                    *have = (*have).max(old.or(saved).unwrap_or(0));
                 }
             }
             return;
@@ -876,6 +889,8 @@ pub mod combined {
         pub list: Arc<CombinedList>,
         pub namespaces: Vec<String>,
         pub widths: Arc<[usize]>,
+        /// How many rows were measured.
+        pub rows: usize,
     }
 
     /// What a combined list draws from: the merged list, plus what the core keeps private to
@@ -1156,19 +1171,21 @@ pub mod combined {
             && query.objects.is_none()
             && query.sort.is_none()
             && !query.group_by_cluster;
-        let widths = if whole_scope {
-            measure(source, view.rows(), now)
+        let (widths, rows) = if whole_scope {
+            (measure(source, view.rows(), now), view.rows().len())
         } else {
             let scope = CombinedQuery {
                 namespaces: query.namespaces.clone(),
                 ..CombinedQuery::default()
             };
-            measure(source, source.list.compute(&scope, now).rows(), now)
+            let view = source.list.compute(&scope, now);
+            (measure(source, view.rows(), now), view.rows().len())
         };
         MeasuredWidths {
             list: source.list.clone(),
             namespaces: query.namespaces.clone(),
             widths: widths.into(),
+            rows,
         }
     }
 
@@ -1516,11 +1533,29 @@ mod tests {
         assert_eq!(widths.chars(0, &columns[0]), 44);
         assert_eq!(widths.chars(2, &columns[2]), 9, "never shrinks");
 
-        // A filter change measures from scratch, without the saved widths.
+        // A filter change on the opening measurement keeps the saved widths; a later one
+        // measures from scratch.
         let mut restarted = ColumnWidths::seeded(saved, &columns);
+        restarted.update(&columns, &measured, true);
+        assert_eq!(restarted.chars(0, &columns[0]), 40);
         restarted.update(&columns, &measured, true);
         assert_eq!(restarted.chars(0, &columns[0]), 20);
         assert_eq!(restarted.chars(2, &columns[2]), 7);
+    }
+
+    #[test]
+    fn columns_that_arrive_later_take_their_saved_widths() {
+        let all = pod_columns()[..3].to_vec();
+        let saved = ColumnWidths::to_saved(&all, &[40, 14, 9]);
+        // A combined list opens with only its leading column before any member has published.
+        let first: Arc<[Column]> = all[..1].to_vec().into();
+        let mut widths = ColumnWidths::seeded(saved, &first);
+        widths.update(&first, &[6], false);
+        let full: Arc<[Column]> = all.into();
+        widths.update(&full, &[20, 11, 7], false);
+        assert_eq!(widths.chars(0, &full[0]), 40);
+        assert_eq!(widths.chars(1, &full[1]), 14);
+        assert_eq!(widths.chars(2, &full[2]), 9);
     }
 
     #[test]

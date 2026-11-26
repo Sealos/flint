@@ -888,8 +888,15 @@ pub struct State {
     /// The column widths of each list as last measured, per cluster (context name) and kind id,
     /// so a list opens at its final widths. Missing means measure from scratch.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub list_widths: BTreeMap<String, BTreeMap<String, SavedColumnWidths>>,
+    pub list_widths: ListWidths,
+    /// The same for combined lists of a cluster set, per set key (the member context names,
+    /// sorted, as a JSON array) and kind id.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub set_list_widths: ListWidths,
 }
+
+/// Saved column widths by scope (a context name, or a set key) and then kind id.
+pub type ListWidths = BTreeMap<String, BTreeMap<String, SavedColumnWidths>>;
 
 /// A list's column widths as `state.toml` keeps them: characters per column key
 /// ([`crate::Column::key`]).

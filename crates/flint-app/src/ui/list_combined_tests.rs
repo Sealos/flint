@@ -5,7 +5,7 @@ use std::sync::Arc;
 use flint_core::combined::{
     CLUSTER_COLUMN_KEY, ColumnKey, CombinedMember, CombinedObjects, CombinedQuery, CombinedRowId,
 };
-use flint_core::settings::ClusterTag;
+use flint_core::settings::{ClusterTag, SavedColumnWidths};
 use flint_core::{Cell, Column, ColumnRole, ColumnType, KindId, KindSnapshot, Row, SyncState};
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
@@ -109,6 +109,14 @@ fn open(
     cx: &mut TestAppContext,
     source: CombinedSource,
 ) -> (AnyWindowHandle, Entity<CombinedResourceList>) {
+    open_with(cx, source, SavedColumnWidths::new())
+}
+
+fn open_with(
+    cx: &mut TestAppContext,
+    source: CombinedSource,
+    saved: SavedColumnWidths,
+) -> (AnyWindowHandle, Entity<CombinedResourceList>) {
     cx.update(|cx| {
         gpui_kit::init(cx);
         crate::ui::registry::init(cx);
@@ -126,7 +134,7 @@ fn open(
             cx,
             |window, cx| {
                 cx.new(|cx| {
-                    CombinedResourceList::new("Pods".into(), source, Vec::new(), window, cx)
+                    CombinedResourceList::new("Pods".into(), source, Vec::new(), saved, window, cx)
                 })
             },
         )
@@ -816,7 +824,16 @@ async fn a_list_is_loading_until_its_first_view(cx: &mut TestAppContext) {
     });
     let (_window, list) = cx.update(|cx| {
         gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
-            cx.new(|cx| CombinedResourceList::new("Pods".into(), fixture(), Vec::new(), window, cx))
+            cx.new(|cx| {
+                CombinedResourceList::new(
+                    "Pods".into(),
+                    fixture(),
+                    Vec::new(),
+                    Default::default(),
+                    window,
+                    cx,
+                )
+            })
         })
         .unwrap()
     });
@@ -931,4 +948,73 @@ async fn a_dashboard_filter_suspends_the_search_and_collapsed_groups(cx: &mut Te
         assert_eq!(list.query.text, "db");
         assert_eq!(list.view.matched(), 1);
     });
+}
+
+/// The widths in characters of the columns the list draws from, by header.
+fn column_chars(list: &CombinedResourceList) -> Vec<(String, usize)> {
+    list.shown
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, column)| (column.name.to_string(), list.widths.chars(i, column)))
+        .collect()
+}
+
+#[gpui_kit::test]
+async fn a_set_list_opens_at_saved_widths_and_reports_the_fresh_measurement(
+    cx: &mut TestAppContext,
+) {
+    let saved: SavedColumnWidths = [
+        ("flint:name".to_owned(), 30),
+        ("flint:namespace".to_owned(), 25),
+    ]
+    .into();
+    let (_window, list) = open_with(cx, fixture(), saved.clone());
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = events.clone();
+    let _subscription = cx.update(|cx| {
+        cx.subscribe(&list, move |_, event: &CombinedListEvent, _| {
+            if let CombinedListEvent::WidthsChanged { set, kind, widths } = event {
+                seen.lock()
+                    .unwrap()
+                    .push((set.clone(), kind.clone(), widths.clone()));
+            }
+        })
+    });
+    // Grow-only: the measurement does not take the saved widths down while the list is open.
+    cx.run_until_parked();
+    let drawn = list.read_with(cx, |list, _| column_chars(list));
+    let chars = |name: &str| drawn.iter().find(|(n, _)| n == name).unwrap().1;
+    assert_eq!(chars("Name"), 30);
+    assert_eq!(chars("Namespace"), 25);
+
+    // What is reported is the fresh measurement, under the members' set key and the kind.
+    list.update(cx, |list, cx| {
+        list.switch_kind("Pods".into(), fixture(), SavedColumnWidths::new(), cx)
+    });
+    cx.run_until_parked();
+    let events = events.lock().unwrap();
+    let (set, kind, widths) = events.last().expect("the measurement is reported");
+    assert_eq!(set, r#"["ctx-prod","ctx-staging"]"#);
+    assert_eq!(*kind, KindId::pods());
+    assert!(widths["flint:namespace"] < 25, "{widths:?}");
+    assert!(widths.contains_key("flint:name"), "{widths:?}");
+}
+
+#[gpui_kit::test]
+async fn switching_kind_starts_from_the_widths_saved_for_the_new_kind(cx: &mut TestAppContext) {
+    let (_window, list) = open(cx, fixture());
+    cx.run_until_parked();
+    let saved: SavedColumnWidths = [("flint:name".to_owned(), 33)].into();
+    list.update(cx, |list, cx| {
+        list.switch_kind("Pods".into(), fixture(), saved, cx)
+    });
+    let name = list.read_with(cx, |list, _| {
+        column_chars(list)
+            .into_iter()
+            .find(|(name, _)| name == "Name")
+            .unwrap()
+            .1
+    });
+    assert_eq!(name, 33, "the first frame of the new kind");
 }

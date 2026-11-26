@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use flint_core::redact::safe_error_summary;
-use flint_core::settings::{self, ListSort, PaneWidths, SavedColumnWidths, State};
+use flint_core::settings::{self, ListSort, ListWidths, PaneWidths, SavedColumnWidths, State};
 
 pub struct UiState {
     dir: PathBuf,
@@ -115,12 +115,7 @@ impl UiState {
 
     /// The column widths remembered for `kind`'s list on `cluster`: empty if none.
     pub fn list_widths(&self, cluster: &str, kind: &str) -> SavedColumnWidths {
-        self.state
-            .list_widths
-            .get(cluster)
-            .and_then(|kinds| kinds.get(kind))
-            .cloned()
-            .unwrap_or_default()
+        widths_of(&self.state.list_widths, cluster, kind)
     }
 
     /// Remembers the column widths of `kind`'s list on `cluster`. Returns what to save, or
@@ -131,14 +126,25 @@ impl UiState {
         kind: &str,
         widths: SavedColumnWidths,
     ) -> Option<(PathBuf, State)> {
-        if widths.is_empty() || self.list_widths(cluster, kind) == widths {
-            return None;
-        }
-        self.state
-            .list_widths
-            .entry(cluster.to_owned())
-            .or_default()
-            .insert(kind.to_owned(), widths);
+        remember_widths(&mut self.state.list_widths, cluster, kind, widths)?;
+        Some(self.to_save())
+    }
+
+    /// The column widths remembered for `kind`'s combined list over the clusters of `set` (see
+    /// [`set_key`]): empty if none.
+    pub fn set_widths(&self, set: &str, kind: &str) -> SavedColumnWidths {
+        widths_of(&self.state.set_list_widths, set, kind)
+    }
+
+    /// Remembers the column widths of `kind`'s combined list over `set`. Returns what to save,
+    /// or `None` if nothing changed.
+    pub fn remember_set_widths(
+        &mut self,
+        set: &str,
+        kind: &str,
+        widths: SavedColumnWidths,
+    ) -> Option<(PathBuf, State)> {
+        remember_widths(&mut self.state.set_list_widths, set, kind, widths)?;
         Some(self.to_save())
     }
 
@@ -158,6 +164,39 @@ impl UiState {
     fn to_save(&self) -> (PathBuf, State) {
         (self.dir.clone(), self.state.clone())
     }
+}
+
+/// The widths saved under `scope` and `kind`: empty if none.
+fn widths_of(all: &ListWidths, scope: &str, kind: &str) -> SavedColumnWidths {
+    all.get(scope)
+        .and_then(|kinds| kinds.get(kind))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Saves `widths` under `scope` and `kind`. `None` if there are none or they did not change.
+fn remember_widths(
+    all: &mut ListWidths,
+    scope: &str,
+    kind: &str,
+    widths: SavedColumnWidths,
+) -> Option<()> {
+    if widths.is_empty() || widths_of(all, scope, kind) == widths {
+        return None;
+    }
+    all.entry(scope.to_owned())
+        .or_default()
+        .insert(kind.to_owned(), widths);
+    Some(())
+}
+
+/// The key a cluster set's combined lists are saved under: its members' context names, sorted,
+/// as a JSON array, so no name (commas and all) runs into another.
+pub fn set_key<'a>(contexts: impl IntoIterator<Item = &'a str>) -> String {
+    let mut contexts: Vec<&str> = contexts.into_iter().collect();
+    contexts.sort_unstable();
+    contexts.dedup();
+    serde_json::to_string(&contexts).expect("strings serialize")
 }
 
 /// Sorted, without duplicates or empty names.
@@ -289,6 +328,29 @@ mod tests {
         assert_eq!(reloaded.list_widths(arn, "pods"), wider);
         assert!(reloaded.list_widths(arn, "nodes").is_empty());
         assert!(reloaded.list_widths("other", "pods").is_empty());
+    }
+
+    #[test]
+    fn set_list_widths_are_remembered_per_set_and_kind_apart_from_cluster_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = UiState::load(dir.path().to_owned());
+        let set = set_key(["kind-b", "kind-a", "kind-b"]);
+        assert_eq!(set, r#"["kind-a","kind-b"]"#);
+        assert_ne!(set_key(["a,b", "c"]), set_key(["a", "b,c"]));
+        let widths: SavedColumnWidths = [("flint:name".to_owned(), 40)].into();
+        save(
+            ui.remember_set_widths(&set, "pods", widths.clone())
+                .unwrap(),
+        );
+        assert!(
+            ui.remember_set_widths(&set, "pods", widths.clone())
+                .is_none()
+        );
+        let reloaded = UiState::load(dir.path().to_owned());
+        assert_eq!(reloaded.set_widths(&set, "pods"), widths);
+        assert!(reloaded.set_widths(&set, "nodes").is_empty());
+        assert!(reloaded.set_widths("kind-a", "pods").is_empty());
+        assert!(reloaded.list_widths(&set, "pods").is_empty());
     }
 
     // covers UP-21

@@ -18,6 +18,7 @@ use flint_core::combined::{
     CLUSTER_COLUMN, ColumnKey, CombinedCell, CombinedGroup, CombinedLine, CombinedObjects,
     CombinedQuery, CombinedRowId, CombinedSort, CombinedView, RowRef,
 };
+use flint_core::settings::SavedColumnWidths;
 use flint_core::table::unix_now;
 use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -42,6 +43,7 @@ use super::super::registry::{
     SelectLast, SelectNext, SelectPrev,
 };
 use super::super::set_members;
+use super::super::ui_state::set_key;
 use super::problems::{self, ClusterProblems, MemberFilter, ProblemFilter, ProblemListKind};
 use super::{CONTEXT, ROW_HEIGHT, limited_text, notice, sign_in_chip, state_chip, tabular_figures};
 
@@ -120,6 +122,13 @@ pub enum CombinedListEvent {
     Selected(Option<CombinedRowId>),
     /// The selected row was asked for again (Enter, or another click): show its detail.
     Reopened(CombinedRowId),
+    /// The columns' widths as last measured changed, to remember for the cluster set and kind.
+    WidthsChanged {
+        /// The members' contexts, as [`super::super::ui_state::set_key`] joins them.
+        set: String,
+        kind: flint_core::KindId,
+        widths: SavedColumnWidths,
+    },
 }
 
 impl EventEmitter<CombinedListEvent> for CombinedResourceList {}
@@ -152,6 +161,8 @@ pub struct CombinedResourceList {
     pub(in super::super) show_wide: bool,
     pub(in super::super) problems: ProblemFilter,
     widths: ColumnWidths,
+    /// The widths last saved or reported to be: the newest measurement, not the grown ones.
+    saved_widths: SavedColumnWidths,
     pub(in super::super) selected: Option<CombinedRowId>,
     selected_line: Option<usize>,
     /// Where the selected row was last listed, to tell it gone from no longer covered.
@@ -184,6 +195,7 @@ impl CombinedResourceList {
         label: String,
         source: CombinedSource,
         namespaces: Vec<String>,
+        saved_widths: SavedColumnWidths,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -213,6 +225,7 @@ impl CombinedResourceList {
                 }
             }
         });
+        let columns = source.columns.clone();
         let mut list = Self {
             label,
             kind_note: None,
@@ -232,7 +245,8 @@ impl CombinedResourceList {
             applied_sort: None,
             show_wide: false,
             problems: ProblemFilter::default(),
-            widths: ColumnWidths::default(),
+            widths: ColumnWidths::seeded(saved_widths.clone(), &columns),
+            saved_widths,
             selected: None,
             selected_line: None,
             selected_seen: None,
@@ -381,12 +395,20 @@ impl CombinedResourceList {
     /// filter, the cluster chips, the grouping and the sort, which applies once the new kind
     /// has its column.
     /// What belongs to the old kind goes: its selection, its dashboard narrowing and its note.
-    pub fn switch_kind(&mut self, label: String, source: CombinedSource, cx: &mut Context<Self>) {
+    pub fn switch_kind(
+        &mut self,
+        label: String,
+        source: CombinedSource,
+        saved_widths: SavedColumnWidths,
+        cx: &mut Context<Self>,
+    ) {
         self.end_objects();
         self.label = label;
         self.kind_note = None;
         self.hide_rows(cx);
-        self.remeasure = true;
+        // The new kind's columns start from the widths it was saved with, not from the old one's.
+        self.widths = ColumnWidths::seeded(saved_widths.clone(), &source.columns);
+        self.saved_widths = saved_widths;
         self.set_source(source, cx);
         cx.notify();
     }
@@ -608,6 +630,32 @@ impl CombinedResourceList {
         self.install(computed, source, sort, restart, cx)
     }
 
+    /// Reports the newest measurement to be remembered, when rows were measured and it differs
+    /// from the last one.
+    fn remember_widths(
+        &mut self,
+        source: &CombinedSource,
+        measured: &MeasuredWidths,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(kind) = source.kind.clone() else {
+            return;
+        };
+        if measured.rows == 0 {
+            return;
+        }
+        let now = ColumnWidths::to_saved(&source.columns, &measured.widths);
+        if now != self.saved_widths {
+            self.saved_widths = now.clone();
+            let set = set_key(source.list.members().iter().map(|m| m.cluster()));
+            cx.emit(CombinedListEvent::WidthsChanged {
+                set,
+                kind,
+                widths: now,
+            });
+        }
+    }
+
     /// Publishes a finished computation: the source, its view and the selection's line
     /// together, so a key never steps from a line of another view. Returns the window to
     /// select the first row in, once no further computation is due.
@@ -624,6 +672,7 @@ impl CombinedResourceList {
         self.view_ready = true;
         self.widths
             .update(&source.columns, &computed.measured.widths, restart);
+        self.remember_widths(&source, &computed.measured, cx);
         self.measured = Some(computed.measured);
         self.shown = source;
         self.view = Arc::new(computed.view);
