@@ -1054,12 +1054,20 @@ impl Workspace {
         let title = format!("{kind_label} · {label}");
         let shown_kind = kind_label;
         // A kind change keeps the list, and with it the sort, filter, chips and grouping.
+        let saved_widths = self.ui_state.set_widths(
+            &super::super::ui_state::set_key(members.iter().map(|m| m.context())),
+            kind.as_str(),
+        );
         let list = match reuse {
             Some(list) => {
-                list.update(cx, |list, cx| list.switch_kind(title, source, cx));
+                list.update(cx, |list, cx| {
+                    list.switch_kind(title, source, saved_widths, cx)
+                });
                 list
             }
-            None => cx.new(|cx| CombinedResourceList::new(title, source, Vec::new(), window, cx)),
+            None => cx.new(|cx| {
+                CombinedResourceList::new(title, source, Vec::new(), saved_widths, window, cx)
+            }),
         };
         let events = cx.subscribe_in(&list, window, Self::on_combined_event);
         let feeds = subscriptions
@@ -1487,6 +1495,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let CombinedListEvent::WidthsChanged { set, kind, widths } = event {
+            let save = self
+                .ui_state
+                .remember_set_widths(set, kind.as_str(), widths.clone());
+            self.persist(save, cx);
+            return;
+        }
         let cleared = matches!(event, CombinedListEvent::Selected(None));
         if cleared && self.unapplied_edit(cx).is_some() {
             // A row that left the list has nothing to undo: its edit simply stays on show.
