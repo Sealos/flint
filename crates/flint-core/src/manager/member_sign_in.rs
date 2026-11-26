@@ -9,7 +9,7 @@
 //! ([`CredentialAccess::signed_in_once`]): once its token is due, or the server refuses it, the
 //! cluster waits for a sign-in again. It turns no background sign-in on.
 
-// module-tests: keep_watching_tests.rs, watched_sign_in_tests.rs (and flint-e2e's
+// module-tests: keep_watching_tests.rs (and watched_sign_in_tests.rs; flint-e2e's
 // member_sign_in.rs, on the fake API)
 
 use std::sync::Arc;
@@ -149,14 +149,16 @@ impl ClusterManager {
     /// `definition` and the plugin definition `shown`, as its
     /// [`KeepWatchView`](crate::keep_watching::KeepWatchView) names them. Its kept connection
     /// starts at once, with access for that one start of the plugin
-    /// ([`Self::start_kept_once`]). Anything else is refused and runs nothing. A member of the
-    /// open set signs in from the set view ([`Self::sign_in_member`]).
+    /// ([`Self::start_kept_once`]). `revoked` is the count of `id`'s ended grants at the click:
+    /// a stop or disconnect since refuses it. Anything else is refused and runs nothing. A
+    /// member of the open set signs in from the set view ([`Self::sign_in_member`]).
     pub(super) fn sign_in_watched(
         &mut self,
         id: &str,
         server: &str,
         definition: Option<u64>,
         shown: Option<u64>,
+        revoked: u64,
     ) -> Result<(), String> {
         let changed = || format!("\"{id}\" changed. Check its sign-in and try again.");
         let Some(slot) = self.cluster(id) else {
@@ -180,6 +182,19 @@ impl ClusterManager {
         if entry.is_none() || entry != grant_server.as_ref() {
             return Err(changed());
         }
+        // Past the cap, a file edited by hand starts only the first ones.
+        let capped = self
+            .settings
+            .watched_clusters
+            .iter()
+            .take(crate::keep_watching::MAX_WATCHED_CLUSTERS)
+            .any(|entry| entry.context == id);
+        if !capped {
+            return Err(crate::keep_watching::too_many_watched());
+        }
+        if self.kept_grants().revocations(id) != revoked {
+            return Err(format!("\"{id}\" was stopped. Sign in again."));
+        }
         let waiting = matches!(
             self.keep_status(id),
             KeepWatching::NeedsConfirming | KeepWatching::SignInNeeded
@@ -202,7 +217,7 @@ impl ClusterManager {
             }
             SignIn::Unknown => return Err(format!("\"{id}\" has a user Flint can't read.")),
         };
-        if !self.start_kept_once(id, consent, Instant::now()) {
+        if !self.start_kept_once(id, consent, Instant::now(), revoked) {
             return Err(format!("\"{id}\" can't sign in now."));
         }
         Ok(())
@@ -220,6 +235,7 @@ impl ClusterManager {
         id: &str,
         consent: PluginConsent,
         asked: Instant,
+        revoked: u64,
     ) -> bool {
         if !self.kept_feed_room(id) {
             return false;
@@ -232,7 +248,12 @@ impl ClusterManager {
                 if asked.elapsed() >= SIGN_IN_WINDOW {
                     return Err("its sign-in was asked for too long ago; sign in again".to_owned());
                 }
-                launch.refusal().await
+                launch.refusal().await?;
+                // Reading the files may take a while: still in time once they are read.
+                if asked.elapsed() >= SIGN_IN_WINDOW {
+                    return Err("its sign-in was asked for too long ago; sign in again".to_owned());
+                }
+                Ok(())
             })
         });
         let attempt = self.next_kept_attempt();
@@ -248,7 +269,7 @@ impl ClusterManager {
             }),
             self.kept_grants().runs(),
         );
-        self.launch_kept(id, attempt, access, Some(consent));
+        self.launch_kept(id, attempt, access, Some((consent, revoked)));
         self.publish_keep_watching();
         true
     }

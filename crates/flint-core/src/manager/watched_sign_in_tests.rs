@@ -2,8 +2,8 @@
 
 use std::time::{Duration, Instant};
 
-use super::tests::{open_set, set_manager, sync, token_plugin};
 use super::super::{ClusterManager, Internal};
+use super::tests::{open_set, set_manager, sync, token_plugin};
 use crate::auth_plugin::tests::FakePlugin;
 use crate::credential::CredentialSource;
 use crate::keep_watching::{BackgroundSignIn, KeepWatching};
@@ -27,7 +27,13 @@ async fn waiting_dev(plugin: &FakePlugin, config_dir: std::path::PathBuf) -> Clu
 /// What `dev`'s Sign in click sends: the server and definitions its card was drawn with.
 fn click(manager: &mut ClusterManager) -> Result<(), String> {
     let view = manager.keep_watching_views()["dev"].clone();
-    manager.sign_in_watched("dev", SERVER, view.definition, view.shown_sign_in)
+    let revoked = revoked(manager);
+    manager.sign_in_watched("dev", SERVER, view.definition, view.shown_sign_in, revoked)
+}
+
+/// How many times `dev`'s grant was ended, as the handle reads it at a click.
+fn revoked(manager: &ClusterManager) -> u64 {
+    manager.kept_grants().revocations("dev")
 }
 
 async fn wait_for_a_start(plugin: &FakePlugin) {
@@ -115,12 +121,19 @@ async fn a_stale_card_click_is_refused() {
     let mut manager = waiting_dev(&plugin, config.path().to_owned()).await;
     let view = manager.keep_watching_views()["dev"].clone();
     let (definition, shown) = (view.definition.unwrap(), view.shown_sign_in.unwrap());
+    let r = revoked(&manager);
 
     let refused = [
-        manager.sign_in_watched("dev", SERVER, Some(definition), Some(shown ^ 1)),
-        manager.sign_in_watched("dev", SERVER, Some(definition ^ 1), Some(shown)),
-        manager.sign_in_watched("dev", SERVER, Some(definition), None),
-        manager.sign_in_watched("dev", "http://127.0.0.1:2", Some(definition), Some(shown)),
+        manager.sign_in_watched("dev", SERVER, Some(definition), Some(shown ^ 1), r),
+        manager.sign_in_watched("dev", SERVER, Some(definition ^ 1), Some(shown), r),
+        manager.sign_in_watched("dev", SERVER, Some(definition), None, r),
+        manager.sign_in_watched(
+            "dev",
+            "http://127.0.0.1:2",
+            Some(definition),
+            Some(shown),
+            r,
+        ),
     ];
 
     for refused in refused {
@@ -173,11 +186,11 @@ async fn a_click_too_old_at_the_start_runs_nothing() {
     let mut manager = waiting_dev(&plugin, config.path().to_owned()).await;
     let shown = manager.keep_watching_views()["dev"].shown_sign_in.unwrap();
     let consent = manager.seal_shown_plugin("dev", shown).unwrap();
-    let asked = Instant::now()
-        .checked_sub(Duration::from_secs(61))
-        .unwrap();
+    let asked = Instant::now().checked_sub(Duration::from_secs(61)).unwrap();
 
-    assert!(manager.start_kept_once("dev", consent, asked));
+    let r = revoked(&manager);
+
+    assert!(manager.start_kept_once("dev", consent, asked, r));
 
     nothing_starts(&plugin).await;
 }
@@ -229,4 +242,77 @@ async fn disconnecting_ends_a_sign_in_once() {
     assert!(!manager.keep.has_feed("dev"));
     assert!(!access.grant(CredentialSource::Plugin).allowed());
     nothing_starts(&plugin).await;
+}
+
+// A stop or disconnect sent after the click, which ends grants at once outside the queues,
+// refuses a click still queued, or ends the access of one already admitted.
+#[tokio::test]
+async fn a_stop_after_the_click_wins() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = waiting_dev(&plugin, config.path().to_owned()).await;
+    let view = manager.keep_watching_views()["dev"].clone();
+    let at_click = revoked(&manager);
+
+    manager.kept_grants().revoke("dev");
+    let refused =
+        manager.sign_in_watched("dev", SERVER, view.definition, view.shown_sign_in, at_click);
+    assert!(
+        refused.unwrap_err().contains("stopped"),
+        "queued behind the stop"
+    );
+
+    let shown = view.shown_sign_in.unwrap();
+    let consent = manager.seal_shown_plugin("dev", shown).unwrap();
+    let before = revoked(&manager) - 1;
+    assert!(manager.start_kept_once("dev", consent, Instant::now(), before));
+    let access = manager.keep.feeds["dev"].access.clone();
+    assert!(
+        !access.grant(CredentialSource::Plugin).allowed(),
+        "ended at once"
+    );
+    nothing_starts(&plugin).await;
+}
+
+// A token the server refuses ends the access signed in once, as a failure: the feed stops with
+// no retry, and the card needs a sign-in again.
+#[tokio::test]
+async fn a_refused_token_ends_the_sign_in() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = waiting_dev(&plugin, config.path().to_owned()).await;
+    click(&mut manager).unwrap();
+    let access = manager.keep.feeds["dev"].access.clone();
+
+    access.grant(CredentialSource::Plugin).note_refused();
+
+    assert!(!access.grant(CredentialSource::Plugin).allowed());
+    let attempt = manager.keep.feeds["dev"].attempt;
+    manager
+        .handle_internal(Internal::KeepWatchFailed {
+            cluster: "dev".into(),
+            attempt,
+        })
+        .await;
+    sync(&mut manager);
+    assert!(!manager.keep.has_feed("dev"));
+    assert_eq!(manager.keep_status("dev"), KeepWatching::NeedsConfirming);
+}
+
+// Background consent a change voided stays void, and a fresh click still watches on its own
+// connection.
+#[tokio::test]
+async fn a_click_watches_after_voided_consent() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let mut manager = waiting_dev(&plugin, config.path().to_owned()).await;
+    manager.keep.voided.insert("dev".to_owned());
+
+    click(&mut manager).unwrap();
+    sync(&mut manager);
+
+    assert!(manager.keep.has_feed("dev"), "the click's feed stays");
+    assert_eq!(manager.keep_status("dev"), KeepWatching::Watching);
+    assert!(manager.keep.voided.contains("dev"));
+    assert!(!manager.keep.consents.contains_key("dev"));
 }

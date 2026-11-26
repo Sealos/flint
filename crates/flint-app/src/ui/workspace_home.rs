@@ -247,6 +247,7 @@ impl Workspace {
         let names = model.names();
         let settings_ok = model.settings_error.is_none();
         let active = model.active_cluster().map(|c| c.info.name.as_str());
+        let in_set = |cluster: &str| self.sets.has_member(Some(cluster));
         HomeView {
             watched: plan
                 .watched
@@ -259,7 +260,7 @@ impl Workspace {
                         &cluster,
                         model.keep_watching(&cluster),
                         server,
-                        active == Some(cluster.as_str()),
+                        active == Some(cluster.as_str()) || in_set(&cluster),
                     );
                     WatchedCard {
                         card: self.home_card(&cluster, status, cx),

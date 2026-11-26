@@ -358,6 +358,8 @@ pub(crate) enum Request {
         server: String,
         definition: Option<u64>,
         shown: Option<u64>,
+        /// How many times its grant had been ended when clicked.
+        revoked: u64,
         reply: oneshot::Sender<Result<(), String>>,
     },
     /// The read client of `member`, checked in the same step.
@@ -1096,6 +1098,9 @@ impl CoreHandle {
             server: server.to_owned(),
             definition,
             shown,
+            // A stop or disconnect sent after this ends grants at once, outside the queues:
+            // the click is refused if one came first.
+            revoked: self.kept.revocations(cluster),
             reply,
         });
         async move {

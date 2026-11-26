@@ -85,14 +85,14 @@ pub(super) struct CardSignIn {
 }
 
 /// The Sign in of a watched cluster's card, if it offers one: only for a cluster that needs a
-/// sign-in, is not `selected`, and signs in through an exec plugin. One signing in through an
-/// auth provider keeps "select the cluster to sign in", and the selected cluster signs in as
-/// the selected cluster.
+/// sign-in through an exec plugin and does not sign in `elsewhere`: the selected cluster signs
+/// in as the selected cluster, and a member of the open set from the set view. One signing in
+/// through an auth provider keeps "select the cluster to sign in".
 pub(super) fn card_sign_in(
     cluster: &str,
     view: Option<&KeepWatchView>,
     server: Option<&str>,
-    selected: bool,
+    elsewhere: bool,
 ) -> Option<CardSignIn> {
     let view = view?;
     let waiting = matches!(
@@ -102,7 +102,7 @@ pub(super) fn card_sign_in(
     let plugin = matches!(view.sign_in, BackgroundSignIn::Off | BackgroundSignIn::On);
     let server = server.filter(|server| !server.is_empty())?;
     let drawn = view.shown_sign_in.is_some() && view.definition.is_some();
-    (waiting && plugin && drawn && !selected).then(|| CardSignIn {
+    (waiting && plugin && drawn && !elsewhere).then(|| CardSignIn {
         cluster: cluster.to_owned(),
         server: server.to_owned(),
         definition: view.definition,
@@ -271,18 +271,21 @@ fn open_button(id: String, cluster: &str, shown: &str) -> Button {
 /// binding or automation `dispatch` reaches it, only a click (or Enter or Space on it).
 fn sign_in_button(target: &CardSignIn, shown: &str, on_sign_in: &OnSignIn) -> Button {
     let (target, on_sign_in) = (target.clone(), Rc::clone(on_sign_in));
-    Button::new(SharedString::from(format!("home-sign-in-{}", target.cluster)))
-        .xsmall()
-        .primary()
-        .label("Sign in")
-        .tooltip(format!(
-            "Run {shown}'s sign-in command once, now. Nothing is saved, and nothing runs it again."
-        ))
-        // not-an-action: the click is the consent for one sign-in run.
-        .on_click(move |_, _, cx| {
-            cx.stop_propagation();
-            on_sign_in(target.clone(), cx);
-        })
+    Button::new(SharedString::from(format!(
+        "home-sign-in-{}",
+        target.cluster
+    )))
+    .xsmall()
+    .primary()
+    .label("Sign in")
+    .tooltip(format!(
+        "Run {shown}'s sign-in command once, now. Nothing is saved, and nothing runs it again."
+    ))
+    // not-an-action: the click is the consent for one sign-in run.
+    .on_click(move |_, _, cx| {
+        cx.stop_propagation();
+        on_sign_in(target.clone(), cx);
+    })
 }
 
 fn render_watched(
@@ -462,26 +465,25 @@ pub(super) fn render(
     scope: &FocusHandle,
     theme: &Theme,
 ) -> AnyElement {
-    let mut content =
-        v_flex()
-            .gap_4()
-            .child(v_flex().gap_1().child(div().text_lg().child("Home")).child(
-                div().text_sm().text_color(theme.muted_foreground).child(
-                    "Clusters kept watching show their health here. Opening this \
+    let mut content = v_flex()
+        .gap_4()
+        .child(v_flex().gap_1().child(div().text_lg().child("Home")).child(
+            div().text_sm().text_color(theme.muted_foreground).child(
+                "Clusters kept watching show their health here. Opening this \
                      screen connects nothing.",
-                ),
-            ))
-            .when_some(view.error.clone(), |el, error| {
-                el.child(
-                    div()
-                        .id("home-error")
-                        .aria_label(error.clone())
-                        .text_sm()
-                        .text_color(theme.danger)
-                        .child(error)
-                        .test_support(),
-                )
-            });
+            ),
+        ))
+        .when_some(view.error.clone(), |el, error| {
+            el.child(
+                div()
+                    .id("home-error")
+                    .aria_label(error.clone())
+                    .text_sm()
+                    .text_color(theme.danger)
+                    .child(error)
+                    .test_support(),
+            )
+        });
     if view.watched.is_empty() {
         content = content.child(
             div()
@@ -505,13 +507,9 @@ pub(super) fn render(
                         .flex_wrap()
                         .items_start()
                         .gap_3()
-                        .children(
-                            view.watched
-                                .iter()
-                                .map(|watched| {
-                                    render_watched(watched, actions, on_sign_in, focus, theme)
-                                }),
-                        )
+                        .children(view.watched.iter().map(|watched| {
+                            render_watched(watched, actions, on_sign_in, focus, theme)
+                        }))
                         .test_support(),
                 ),
         );
@@ -687,7 +685,7 @@ mod tests {
                 shown: Some(9),
             }
         );
-        // Selected, no server, or not drawn with a plugin definition: nothing to sign in.
+        // Signed in elsewhere, no server, or not drawn with a plugin definition: nothing.
         assert!(card_sign_in("eks", Some(&plugin), server, true).is_none());
         assert!(card_sign_in("eks", Some(&plugin), None, false).is_none());
         assert!(card_sign_in("eks", Some(&plugin), Some(""), false).is_none());

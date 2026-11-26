@@ -151,7 +151,8 @@ impl KeptGrants {
         self.live().quitting
     }
 
-    fn revocations(&self, id: &str) -> u64 {
+    /// How many times `id`'s grant was ended so far.
+    pub(crate) fn revocations(&self, id: &str) -> u64 {
         self.live().revocations.get(id).copied().unwrap_or_default()
     }
 
@@ -423,14 +424,16 @@ impl ClusterManager {
         if self.paused(id) || self.unsettled(id) || !self.contexts.shown(id, shown).confirmed {
             return KeepWatching::Paused;
         }
-        if self.keep.voided.contains(id)
-            || slot.info.grant_server().as_deref() != Some(entry.server.as_str())
-        {
+        if slot.info.grant_server().as_deref() != Some(entry.server.as_str()) {
             return KeepWatching::NeedsConfirming;
         }
         // Signed in once from its home card: watching on that connection alone, until it ends.
+        // Background consent a change voided stays void.
         if self.once_feed_holds(id) {
             return KeepWatching::Watching;
+        }
+        if self.keep.voided.contains(id) {
+            return KeepWatching::NeedsConfirming;
         }
         let agreed = match &*self.sign_in(id) {
             SignIn::Static => !self.keep.consents.contains_key(id),
@@ -827,16 +830,26 @@ impl ClusterManager {
     }
 
     /// Starts `id`'s kept connection, attempt `attempt`, under `access`, with no input for its
-    /// program. `once` is the seal of a click that signs it in once ([`KeptFeed::once`]).
+    /// program. `once` is the seal of a click that signs it in once ([`KeptFeed::once`]), with
+    /// the count of `id`'s ended grants at the click: one ended since, even by a request still
+    /// queued, ends this access before anything starts.
     pub(super) fn launch_kept(
         &mut self,
         id: &str,
         attempt: u64,
         access: CredentialAccess,
-        once: Option<Arc<PluginConsent>>,
+        once: Option<(Arc<PluginConsent>, u64)>,
     ) {
         let runs_plugin = matches!(&*self.sign_in(id), SignIn::Plugin(_));
         self.keep.grants.admit(id, attempt, &access);
+        // After the admission: an end of the grant from now on finds this access there.
+        if once
+            .as_ref()
+            .is_some_and(|(_, revoked)| self.keep.grants.revocations(id) != *revoked)
+        {
+            access.revoke();
+        }
+        let once = once.map(|(consent, _)| consent);
         let mut kubeconfig = self.kubeconfig.merged.clone();
         cluster::disable_interactive_exec(&mut kubeconfig);
         let proxy_generation = self.kubeconfig.proxy_generation;

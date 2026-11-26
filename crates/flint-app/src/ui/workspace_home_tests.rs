@@ -288,7 +288,11 @@ async fn only_an_exec_plugin_card_needing_a_sign_in_offers_sign_in(cx: &mut Test
             BackgroundSignIn::Unavailable,
             false,
         ),
-        (KeepWatching::SignInNeeded, BackgroundSignIn::NotNeeded, false),
+        (
+            KeepWatching::SignInNeeded,
+            BackgroundSignIn::NotNeeded,
+            false,
+        ),
     ];
     for (status, sign_in, offered) in cases {
         keep_watching_beta(cx, &t, plugin_view(status, sign_in));
