@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use flint_core::redact::{is_masked_column, is_secret_list};
+use flint_core::settings::SavedColumnWidths;
 use flint_core::{Column, ColumnRole, ColumnType, KindSnapshot, NamespaceLimit, SortBy};
 
 /// The user's sort choice, by column key ([`Column::key`]), as `state.toml` keeps it per cluster
@@ -288,14 +289,34 @@ pub fn row_count(shown: usize, scoped: usize, total: usize, namespaces: &[String
 }
 
 /// Widths that only grow while the same columns are shown, so columns do not jitter as rows
-/// change. New columns (a different `Arc`) start over.
+/// change. New columns (a different `Arc`) start over. A list that was open before starts from
+/// the widths it was saved with, until the first measurement folds in.
 #[derive(Debug, Default, Clone)]
 pub struct ColumnWidths {
     columns: Option<Arc<[Column]>>,
     chars: Vec<usize>,
+    /// The widths the list was last saved with, by column key.
+    saved: SavedColumnWidths,
 }
 
 impl ColumnWidths {
+    /// Widths that start from `saved`.
+    pub fn seeded(saved: SavedColumnWidths) -> Self {
+        ColumnWidths {
+            saved,
+            ..Default::default()
+        }
+    }
+
+    /// The widths of a measurement of `columns`, by column key, as they are saved.
+    pub fn to_saved(columns: &[Column], measured: &[usize]) -> SavedColumnWidths {
+        columns
+            .iter()
+            .zip(measured)
+            .map(|(column, &chars)| (column.key(), u32::try_from(chars).unwrap_or(u32::MAX)))
+            .collect()
+    }
+
     /// Folds a measurement of `columns` in. `restart` drops the widths so far, for when other
     /// rows are measured (the namespace filter changed), so columns fit them.
     pub fn update(&mut self, columns: &Arc<[Column]>, measured: &[usize], restart: bool) {
@@ -304,8 +325,17 @@ impl ColumnWidths {
             .as_ref()
             .is_some_and(|c| Arc::ptr_eq(c, columns) || **c == **columns);
         if restart || !same || self.chars.len() != measured.len() {
+            let first = !restart && self.columns.as_ref().is_none_or(|c| c.is_empty());
             self.columns = Some(columns.clone());
             self.chars = measured.to_vec();
+            if first {
+                // The saved widths hold until the list is closed: the measurement only grows them.
+                for (have, column) in self.chars.iter_mut().zip(columns.iter()) {
+                    if let Some(&saved) = self.saved.get(&column.key()) {
+                        *have = (*have).max(saved as usize);
+                    }
+                }
+            }
             return;
         }
         for (have, new) in self.chars.iter_mut().zip(measured) {
@@ -315,11 +345,13 @@ impl ColumnWidths {
 
     /// Width in characters of column `i`, or a default before anything was measured.
     pub fn chars(&self, i: usize, column: &Column) -> usize {
-        let chars = self
-            .chars
-            .get(i)
-            .copied()
-            .unwrap_or_else(|| (column.name.chars().count() + 2).max(8));
+        let chars = self.chars.get(i).copied().unwrap_or_else(|| {
+            // Before anything was measured: the saved width, else the header's.
+            self.saved.get(&column.key()).map_or_else(
+                || (column.name.chars().count() + 2).max(8),
+                |&saved| saved as usize,
+            )
+        });
         if column.role == ColumnRole::Name {
             return chars.clamp(NAME_MIN_CHARS, MAX_CHARS);
         }
@@ -1420,6 +1452,34 @@ mod tests {
         // A drawn column that is gone maps to nothing.
         changed.truncate(6);
         assert_eq!(map_drawn(&columns, &drawn, &changed), vec![0, 1, 3, 4, 5]);
+    }
+
+    #[test]
+    fn saved_widths_seed_the_first_frame_and_the_first_measurement_only_grows_them() {
+        let columns: Arc<[Column]> = pod_columns()[..3].to_vec().into();
+        let measured = [20, 11, 7];
+        let saved = ColumnWidths::to_saved(&columns, &[40, 14, 9]);
+        assert_eq!(saved.len(), 3);
+        assert_eq!(saved["flint:name"], 40);
+
+        let mut widths = ColumnWidths::seeded(saved.clone());
+        // Before any measurement: the saved widths, not the header's.
+        assert_eq!(widths.chars(0, &columns[0]), 40);
+        assert_eq!(widths.chars(1, &columns[1]), 14);
+        // The first measurement folds in grow-only: the narrower ones keep the saved width.
+        widths.update(&columns, &measured, false);
+        assert_eq!(widths.chars(0, &columns[0]), 40);
+        assert_eq!(widths.chars(1, &columns[1]), 14);
+        assert_eq!(widths.chars(2, &columns[2]), 9);
+        widths.update(&columns, &[44, 11, 7], false);
+        assert_eq!(widths.chars(0, &columns[0]), 44);
+        assert_eq!(widths.chars(2, &columns[2]), 9, "never shrinks");
+
+        // A filter change measures from scratch, without the saved widths.
+        let mut restarted = ColumnWidths::seeded(saved);
+        restarted.update(&columns, &measured, true);
+        assert_eq!(restarted.chars(0, &columns[0]), 20);
+        assert_eq!(restarted.chars(2, &columns[2]), 7);
     }
 
     #[test]

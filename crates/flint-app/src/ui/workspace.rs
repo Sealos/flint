@@ -45,7 +45,7 @@ use super::dock_model::{LiveSessions, TabCluster, confirmed_servers};
 use super::focus::{cycle_focus_within, release_unfocused_input};
 use super::icons::FlintIcon;
 use super::keep_watching;
-use super::list::{ListEvent, ResourceList};
+use super::list::{ListEvent, Remembered, ResourceList};
 use super::log_view::{LogRequest, LogView};
 use super::nav::{NavEvent, NavPanel};
 use super::notice::{ServerMove, ServerMoves, notice};
@@ -1602,12 +1602,23 @@ impl Workspace {
         self.close_list(cx);
         let core = self.model.read(cx).core().clone();
         let namespaces = self.ui_state.namespace_filter(&cluster).to_vec();
-        let sort = self
-            .ui_state
-            .list_sort(&cluster, entry.id.as_str())
-            .cloned();
+        let remembered = Remembered {
+            sort: self
+                .ui_state
+                .list_sort(&cluster, entry.id.as_str())
+                .cloned(),
+            widths: self.ui_state.list_widths(&cluster, entry.id.as_str()),
+        };
         let list = cx.new(|cx| {
-            ResourceList::new(core, cluster.clone(), entry, namespaces, sort, window, cx)
+            ResourceList::new(
+                core,
+                cluster.clone(),
+                entry,
+                namespaces,
+                remembered,
+                window,
+                cx,
+            )
         });
         // Every kind: any object can be compared, and a menu with no entries never shows.
         let menu = row_menu::row_menu(cx.weak_entity());
@@ -1734,6 +1745,15 @@ impl Workspace {
                 let save =
                     self.ui_state
                         .set_list_sort(list.cluster(), list.kind().as_str(), sort.clone());
+                self.persist(save, cx);
+            }
+            ListEvent::WidthsChanged(widths) => {
+                let list = list.read(cx);
+                let save = self.ui_state.set_list_widths(
+                    list.cluster(),
+                    list.kind().as_str(),
+                    widths.clone(),
+                );
                 self.persist(save, cx);
             }
             ListEvent::SelectedChanged => {

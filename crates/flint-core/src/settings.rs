@@ -788,7 +788,15 @@ pub struct State {
     /// ([`crate::Column::key`]). Missing means the kind's default order.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub list_sorts: BTreeMap<String, BTreeMap<String, ListSort>>,
+    /// The column widths of each list as last measured, per cluster (context name) and kind id,
+    /// so a list opens at its final widths. Missing means measure from scratch.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub list_widths: BTreeMap<String, BTreeMap<String, SavedColumnWidths>>,
 }
+
+/// A list's column widths as `state.toml` keeps them: characters per column key
+/// ([`crate::Column::key`]).
+pub type SavedColumnWidths = BTreeMap<String, u32>;
 
 /// A list's sort as `state.toml` keeps it: the column's key ([`crate::Column::key`]), not its
 /// header, and the direction.
@@ -4552,6 +4560,35 @@ mod tests {
         assert_eq!(loaded, s);
         let text = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
         assert!(text.contains("future_key"), "unknown keys survive: {text}");
+    }
+
+    #[test]
+    fn list_widths_round_trip_per_cluster_and_kind_with_eks_context_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::default();
+        let arn = "arn:aws:eks:eu-north-1:123456789012:cluster/payments";
+        for (cluster, kind, name) in [
+            ("kind-dev", "pods", 40),
+            (arn, "pods", 55),
+            (arn, "widgets.example.com", 33),
+        ] {
+            state.list_widths.entry(cluster.into()).or_default().insert(
+                kind.into(),
+                [
+                    ("flint:name".to_owned(), name),
+                    ("server:Ready".to_owned(), 7),
+                ]
+                .into(),
+            );
+        }
+        save_state(dir.path(), &state).unwrap();
+        assert_eq!(load_state(dir.path()).unwrap(), state);
+        let text = std::fs::read_to_string(dir.path().join(STATE_FILE)).unwrap();
+        assert!(text.contains("server:Ready"), "{text}");
+        // A state saved with no widths leaves the table out.
+        save_state(dir.path(), &State::default()).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(STATE_FILE)).unwrap();
+        assert!(!text.contains("list_widths"), "{text}");
     }
 
     #[test]
