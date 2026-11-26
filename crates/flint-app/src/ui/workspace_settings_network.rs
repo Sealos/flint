@@ -19,7 +19,7 @@ use super::super::confirm::{self, DialogText};
 use super::super::registry::{Bind, Guards};
 use super::super::settings_network::{
     APPLY_TITLE, ApplyProxy, EditNoProxy, EditProxyUrl, NetworkInputs, NetworkStop, Progress,
-    impact_text, new_input, no_proxy_text, proposed, same, url_text,
+    has_credentials, impact_text, new_input, no_proxy_text, proposed, same, url_text,
 };
 use super::super::settings_view::Stop;
 use super::Workspace;
@@ -85,7 +85,9 @@ impl Workspace {
                 window,
                 move |ws: &mut Workspace, _, event, window, cx| match event {
                     InputEvent::Change => {
-                        ws.settings_page.network.typed = true;
+                        let network = &mut ws.settings_page.network;
+                        network.typed.insert(stop);
+                        network.typed_while_applying |= network.applying();
                         ws.recheck_proxy(cx);
                     }
                     InputEvent::Focus => {
@@ -115,6 +117,12 @@ impl Workspace {
         self.network_text(stop, cx)
     }
 
+    /// Whether the URL field masks its text.
+    #[cfg(test)]
+    pub(in crate::ui) fn network_url_masked(&self, _: &App) -> bool {
+        self.settings_page.network.url_masked == Some(true)
+    }
+
     /// Where the last Apply is.
     #[cfg(test)]
     pub(in crate::ui) fn network_progress(&self) -> Option<Progress> {
@@ -139,7 +147,7 @@ impl Workspace {
         let network = &mut self.settings_page.network;
         // Typed back to what is saved: the fields follow the file again.
         if checked.as_ref().is_ok_and(|setting| same(setting, &saved)) {
-            network.typed = false;
+            network.typed.clear();
         }
         if network.checked.as_ref() != Some(&checked) {
             network.checked = Some(checked);
@@ -162,24 +170,24 @@ impl Workspace {
             .is_some_and(|applied| same(applied, &saved))
         {
             network.applied = None;
-            network.typed = false;
-            network.resync = true;
+            // What was typed while it was being applied stays.
+            if !std::mem::take(&mut network.typed_while_applying) {
+                network.typed.clear();
+                network.resync = true;
+            }
         }
         let resync = std::mem::take(&mut network.resync);
-        if network.typed && !resync {
-            self.recheck_proxy(cx);
-            return;
-        }
         let focused = if resync {
             None
         } else {
             network.focused(window, cx)
         };
+        let typed = network.typed.clone();
         let stale: Vec<_> = network
             .inputs
             .iter()
             .flat_map(|inputs| inputs.fields.iter())
-            .filter(|(stop, _)| Some(*stop) != focused)
+            .filter(|(stop, _)| Some(*stop) != focused && !typed.contains(stop))
             .filter_map(|(stop, input)| {
                 let want = match stop {
                     NetworkStop::Url => url_text(&saved),
@@ -192,6 +200,27 @@ impl Workspace {
             input.update(cx, |state, cx| state.set_value(want, window, cx));
         }
         self.recheck_proxy(cx);
+        self.mask_proxy_url(&saved, window, cx);
+    }
+
+    /// Masks the URL field while it holds credentials typed in (the saved ones are already
+    /// masked in its text). Set only when that changes, so the field's eye can still show them.
+    fn mask_proxy_url(
+        &mut self,
+        saved: &ProxySetting,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.settings_page.network.input(NetworkStop::Url).cloned() else {
+            return;
+        };
+        let text = input.read(cx).value().to_string();
+        let masked = has_credentials(&text) && text.trim() != url_text(saved);
+        let network = &mut self.settings_page.network;
+        if network.url_masked != Some(masked) {
+            network.url_masked = Some(masked);
+            input.update(cx, |state, cx| state.set_masked(masked, window, cx));
+        }
     }
 
     /// Sets `stop`'s field to `text`, as typing it would: the palette's and automation's way in.
@@ -208,7 +237,7 @@ impl Workspace {
         if let Some(input) = self.settings_page.network.input(stop).cloned() {
             input.update(cx, |state, cx| state.set_value(text, window, cx));
         }
-        self.settings_page.network.typed = true;
+        self.settings_page.network.typed.insert(stop);
         self.recheck_proxy(cx);
     }
 
@@ -216,7 +245,7 @@ impl Workspace {
     pub(super) fn revert_network_fields(&mut self) {
         let network = &mut self.settings_page.network;
         if !network.applying() {
-            network.typed = false;
+            network.typed.clear();
             network.resync = true;
         }
     }
@@ -315,6 +344,7 @@ impl Workspace {
             });
         });
         let network = &mut self.settings_page.network;
+        network.typed_while_applying = false;
         network.progress = Some(Progress::Applying);
         network.task = Some(task);
         cx.notify();

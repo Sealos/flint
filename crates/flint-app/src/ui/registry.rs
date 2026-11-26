@@ -2534,7 +2534,9 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Set the proxy URL in Settings' Network section; Apply Proxy puts it in use.",
             EDIT_PROXY_URL,
         )
-        .of(C::Flint, S::Settings),
+        .of(C::Flint, S::Settings)
+        // The URL can hold a password, which the palette's argument field would show.
+        .hidden(),
         Spec::with_args::<EditNoProxy>(
             "Edit No Proxy…",
             "Set the servers reached without the proxy in Settings' Network section.",

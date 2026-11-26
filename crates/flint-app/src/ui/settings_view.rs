@@ -553,7 +553,7 @@ pub fn render(
                         .track_scroll(&page.scroll)
                         .p_4()
                         .gap_3()
-                        .children(section_body(page, &shown, clusters, theme)),
+                        .children(section_body(page, &shown, invalid, clusters, theme)),
                 ),
         )
         .child(footer(page, invalid, theme))
@@ -654,6 +654,7 @@ fn section_list(page: &SettingsPage, theme: &Theme) -> impl IntoElement {
 fn section_body(
     page: &SettingsPage,
     shown: &Settings,
+    invalid: bool,
     clusters: &[KnownCluster],
     theme: &Theme,
 ) -> Vec<AnyElement> {
@@ -751,7 +752,7 @@ fn section_body(
         Section::Logs => logs_paths::logs_body(page, theme),
         Section::Paths => logs_paths::paths_body(page, shown, theme),
         Section::Safety => one(logs_paths::safety_body(page, shown, theme)),
-        Section::Network => network::body(page, &shown.proxy, theme),
+        Section::Network => network::body(page, &shown.proxy, invalid, theme),
     }
 }
 
@@ -786,6 +787,8 @@ fn footer(page: &SettingsPage, invalid: bool, theme: &Theme) -> impl IntoElement
     let dirty = draft.is_dirty();
     // A threshold still being typed is entered by Save and dropped by Revert.
     let typing = page.thresholds.entry.is_some();
+    // Revert also drops what is typed in the proxy fields.
+    let proxy_typed = page.network.is_typed();
     let saving = page.saving.is_some();
     let (note, color): (SharedString, Hsla) = match &page.save_note {
         _ if saving => ("Saving…".into(), theme.muted_foreground),
@@ -820,7 +823,7 @@ fn footer(page: &SettingsPage, invalid: bool, theme: &Theme) -> impl IntoElement
             Button::new("settings-revert")
                 .small()
                 .label("Revert")
-                .disabled(saving || !(dirty || typing))
+                .disabled(saving || !(dirty || typing || proxy_typed))
                 .on_click(registry::on_click(RevertSettings)),
         ))
         .child(ring(

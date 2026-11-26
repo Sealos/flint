@@ -83,7 +83,10 @@ fn a_proxy_is_checked_as_typed_without_quoting_its_password() {
 fn the_confirmation_says_what_reconnects_and_what_ends() {
     let text = impact_text(&with_password(), 2, LiveSessions { shells: 1, logs: 3 });
     assert!(text.contains("Every cluster connects again"), "{text}");
-    assert!(text.contains("through http://proxy.example:3128"), "{text}");
+    assert!(
+        text.contains("By default they go through http://proxy.example:3128, except servers matching localhost, .corp"),
+        "{text}"
+    );
     assert!(
         text.contains("writes waiting for review are refused"),
         "{text}"
@@ -214,6 +217,11 @@ async fn the_saved_proxy_is_shown_masked(cx: &mut TestAppContext) {
 
     let masked = format!("http://{MASK}@proxy.example:3128");
     assert_eq!(field(cx, &t, NetworkStop::Url), masked);
+    // Its text already hides the password, so the field shows it.
+    assert!(
+        !t.workspace
+            .read_with(cx, |ws, cx| ws.network_url_masked(cx))
+    );
     assert_eq!(field(cx, &t, NetworkStop::NoProxy), "localhost, .corp");
     assert_eq!(
         t.label(cx, "settings-proxy-saved").as_deref(),
@@ -288,6 +296,11 @@ async fn apply_asks_first_and_cancel_applies_nothing(cx: &mut TestAppContext) {
     let s = state(cx, &t);
     assert_eq!(s.settings.network.error, None);
     assert!(s.settings.network.can_apply && s.settings.network.typed);
+    // A password typed in is masked in the field.
+    assert!(
+        t.workspace
+            .read_with(cx, |ws, cx| ws.network_url_masked(cx))
+    );
     // The Settings draft is not involved: nothing to Save.
     assert!(!s.settings.dirty);
 
@@ -318,14 +331,16 @@ async fn apply_asks_first_and_cancel_applies_nothing(cx: &mut TestAppContext) {
             .is_none()
     );
 
-    // Revert drops what was typed.
-    t.dispatch(cx, "settings::EditLogBufferMib", json!({ "mib": 32 }))
-        .unwrap();
+    // Revert drops what was typed, with no other edit.
     t.dispatch(cx, "settings::RevertSettings", Value::Null)
         .unwrap();
     cx.run_until_parked();
     assert_eq!(field(cx, &t, NetworkStop::Url), "");
     assert!(!state(cx, &t).settings.network.typed);
+    assert!(
+        !t.workspace
+            .read_with(cx, |ws, cx| ws.network_url_masked(cx))
+    );
 }
 
 const APPLY_CHILD: &str = "FLINT_TEST_PROXY_APPLY_CHILD";

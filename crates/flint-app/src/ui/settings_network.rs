@@ -71,7 +71,7 @@ actions!(
 pub const MASK: &str = "•••";
 
 /// A control of the Network section.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NetworkStop {
     Url,
     NoProxy,
@@ -213,15 +213,28 @@ pub const APPLY_TITLE: &str = "Apply the new proxy?";
 
 /// What the confirmation says, with `forwards` port-forwards running and `live` sessions open.
 pub fn impact_text(setting: &ProxySetting, forwards: usize, live: LiveSessions) -> String {
-    let to = match setting.shown_url() {
-        Some(url) => format!("through {url}"),
-        None => "without a proxy of Flint's own (HTTPS_PROXY from the environment, if set)".into(),
+    let route = match setting.shown_url() {
+        Some(url) => format!("By default they go through {url}"),
+        None => "By default they go without a proxy of Flint's own (HTTPS_PROXY from the \
+                 environment, if set)"
+            .into(),
+    };
+    let entries: Vec<&str> = setting
+        .no_proxy
+        .iter()
+        .map(|e| e.trim())
+        .filter(|e| !e.is_empty())
+        .collect();
+    let except = if entries.is_empty() {
+        String::new()
+    } else {
+        format!(", except servers matching {}", entries.join(", "))
     };
     let mut text = format!(
-        "Every cluster connects again, {to}: the selected cluster, the running set's members \
-         and the clusters watched in the background. Until each has reconnected, nothing new \
-         connects on it, and writes waiting for review are refused: review them again once it \
-         is back."
+        "Every cluster connects again: the selected cluster, the running set's members and the \
+         clusters watched in the background. {route}{except}; a cluster with its own proxy-url \
+         in kubeconfig keeps it. Until each has reconnected, nothing new connects on it, and \
+         writes waiting for review are refused: review them again once it is back."
     );
     text.push_str(&match forwards {
         0 => String::new(),
@@ -323,8 +336,12 @@ pub struct NetworkFields {
     pub inputs: Option<NetworkInputs>,
     /// The setting the fields propose, or why they cannot; `None` until checked.
     pub checked: Option<Result<ProxySetting, String>>,
-    /// The fields were typed in since they last showed the file.
-    pub typed: bool,
+    /// The fields typed in since they last showed the file; the others follow it.
+    pub typed: std::collections::BTreeSet<NetworkStop>,
+    /// A field was typed in while an Apply was answered: what it holds is kept.
+    pub typed_while_applying: bool,
+    /// Whether the URL field was last masked for the credentials it holds.
+    pub url_masked: Option<bool>,
     /// Put the file's setting into the fields once, as the workspace next draws.
     pub resync: bool,
     pub progress: Option<Progress>,
@@ -350,6 +367,11 @@ impl NetworkFields {
             .iter()
             .find(|(_, input)| input.read(cx).focus_handle(cx).is_focused(window))
             .map(|(stop, _)| *stop)
+    }
+
+    /// Whether a field was typed in since it last showed the file.
+    pub fn is_typed(&self) -> bool {
+        !self.typed.is_empty()
     }
 
     /// Whether an Apply waits for the core's answer.
@@ -395,7 +417,12 @@ pub fn new_input(
 }
 
 /// The Network section's rows, in [`NetworkStop::row`] order, over the file's `saved` setting.
-pub fn body(page: &SettingsPage, saved: &ProxySetting, theme: &Theme) -> Vec<AnyElement> {
+pub fn body(
+    page: &SettingsPage,
+    saved: &ProxySetting,
+    invalid: bool,
+    theme: &Theme,
+) -> Vec<AnyElement> {
     let network = &page.network;
     let error = network.error().map(str::to_owned);
     vec![
@@ -405,7 +432,7 @@ pub fn body(page: &SettingsPage, saved: &ProxySetting, theme: &Theme) -> Vec<Any
              an optional user:password@. Empty uses HTTPS_PROXY from the environment, if set. A \
              cluster's own proxy-url in kubeconfig still wins. Applies at once with Apply, not \
              with Save.",
-            network.typed,
+            network.typed.contains(&NetworkStop::Url),
             theme,
         )
         .children(field(page, NetworkStop::Url, error.clone(), theme))
@@ -414,12 +441,12 @@ pub fn body(page: &SettingsPage, saved: &ProxySetting, theme: &Theme) -> Vec<Any
             "No proxy",
             "Servers reached without the proxy, separated by commas: host names, domains \
              (.example.com), IP addresses and CIDR ranges, or * for all.",
-            false,
+            network.typed.contains(&NetworkStop::NoProxy),
             theme,
         )
         .children(field(page, NetworkStop::NoProxy, None, theme))
         .into_any_element(),
-        apply_row(page, saved, theme).into_any_element(),
+        apply_row(page, saved, invalid, theme).into_any_element(),
     ]
 }
 
@@ -470,7 +497,13 @@ fn field(
                         view.focus(window, cx);
                         cx.stop_propagation();
                     })
-                    .child(Input::new(input).id(stop.id()).small()),
+                    .child(
+                        Input::new(input)
+                            .id(stop.id())
+                            .small()
+                            // A URL holding a password is masked; the eye shows it on request.
+                            .when(stop == NetworkStop::Url, |input| input.mask_toggle()),
+                    ),
             )
             .when_some(error, |el, error| {
                 el.child(
@@ -487,7 +520,12 @@ fn field(
 }
 
 /// The Apply button, what is in use, and the last Apply's report.
-fn apply_row(page: &SettingsPage, saved: &ProxySetting, theme: &Theme) -> impl IntoElement {
+fn apply_row(
+    page: &SettingsPage,
+    saved: &ProxySetting,
+    invalid: bool,
+    theme: &Theme,
+) -> impl IntoElement {
     let network = &page.network;
     let in_file = match saved.shown_url() {
         Some(url) if saved.url.as_deref().is_some_and(has_credentials) => {
@@ -512,7 +550,7 @@ fn apply_row(page: &SettingsPage, saved: &ProxySetting, theme: &Theme) -> impl I
                         .primary()
                         .label("Apply…")
                         .tooltip("Save this proxy and reconnect every cluster on it")
-                        .disabled(network.to_apply(saved).is_none())
+                        .disabled(invalid || network.to_apply(saved).is_none())
                         .on_click(registry::on_click(ApplyProxy)),
                 ))
                 .child(
@@ -560,7 +598,7 @@ pub fn view_state(
     super::view_state::NetworkState {
         saved_url: url_text(saved),
         saved_no_proxy: saved.no_proxy.clone(),
-        typed: network.typed,
+        typed: network.is_typed(),
         error: network.error().map(str::to_owned),
         can_apply: !invalid && network.to_apply(saved).is_some(),
         applying: network.applying(),

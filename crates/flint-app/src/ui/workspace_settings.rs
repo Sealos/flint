@@ -70,7 +70,9 @@ impl Workspace {
             })
             // Revert also closes a field left open, as its button shows.
             .when::<RevertSettings>(|ws, _| {
-                (ws.settings_page.draft.is_dirty() || ws.settings_page.thresholds.entry.is_some())
+                (ws.settings_page.draft.is_dirty()
+                    || ws.settings_page.thresholds.entry.is_some()
+                    || ws.settings_page.network.is_typed())
                     && ws.settings_page.saving.is_none()
             })
     }
