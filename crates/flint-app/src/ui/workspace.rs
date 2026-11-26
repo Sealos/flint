@@ -390,7 +390,6 @@ impl Workspace {
                 this.open_view(&open, window, cx);
             }
             NavEvent::OpenOverview => {
-                this.leave_settings_for_view();
                 this.leave_home();
                 this.open_overview(window, cx)
             }
@@ -2987,9 +2986,6 @@ impl Workspace {
     }
 
     fn render_main(&self, window_width: f32, theme: &Theme, cx: &Context<Self>) -> AnyElement {
-        if let Some(settings) = self.render_settings_page(theme, cx) {
-            return settings;
-        }
         if self.home.open
             && let Some(home) = self.render_home(theme, cx)
         {
@@ -4139,9 +4135,8 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_namespace_picker_with_dialog(window, cx);
         self.close_finished_held_edit(window, cx);
-        self.settings_follow_main();
+        self.settings_follow_dialog(window, cx);
         self.home_follow_main(cx);
-        self.flush_threshold_entry(cx);
         self.follow_threshold_rows(cx);
         self.close_orphaned_threshold_entry(window, cx);
         self.sync_settings_fields(window, cx);
@@ -4185,7 +4180,6 @@ impl Render for Workspace {
             }))
             .capture_action(cx.listener(|this, _: &OpenObject, _, _| {
                 this.list_in_front = false;
-                this.leave_settings_for_view();
                 this.leave_home();
             }))
             .capture_action(cx.listener(|this, _: &EditYaml, _, _| this.list_in_front = false))

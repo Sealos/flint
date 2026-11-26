@@ -120,13 +120,7 @@ impl Workspace {
             },
             Some(_) => Main::Connecting,
         };
-        let main = if self.settings_page.open {
-            Main::Settings
-        } else if covered {
-            self.home_state(cx)
-        } else {
-            main
-        };
+        let main = if covered { self.home_state(cx) } else { main };
         let header = active_cluster.filter(|_| !covered).map(|cluster| {
             let name = &cluster.info.name;
             let filter = self.ui_state.namespace_filter(name).to_vec();

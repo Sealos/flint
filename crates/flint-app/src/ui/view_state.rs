@@ -46,7 +46,7 @@ pub struct AppState {
     pub alerts: Option<super::alert_center::AlertsState>,
     /// Cluster sets: the sidebar's choice, the saved sets and the running set.
     pub sets: ClusterSetsState,
-    /// The Settings view and its draft, which outlives leaving the view.
+    /// The Settings modal and its draft.
     pub settings: SettingsState,
 }
 
@@ -82,13 +82,14 @@ pub struct WarningRowState {
     pub rollout: Option<&'static str>,
 }
 
-/// The Settings view (#739): whether it is shown, and its draft.
+/// The Settings view (#739), a modal over the main window (#854): whether it is open, and its
+/// draft.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SettingsState {
-    /// Whether the main area shows it.
+    /// Whether the modal is open.
     pub open: bool,
     pub section: super::settings_view::Section,
-    /// Whether edits wait for Save (the sidebar entry's dot).
+    /// Whether edits wait for Save.
     pub dirty: bool,
     /// The `settings.toml` keys of the edited fields.
     pub edited: Vec<String>,
@@ -483,8 +484,6 @@ pub enum Main {
     AwaitingConfirmation,
     /// A resource list, and maybe the detail pane.
     List,
-    /// The Settings view.
-    Settings,
 }
 
 /// A watched cluster's card on the home screen.

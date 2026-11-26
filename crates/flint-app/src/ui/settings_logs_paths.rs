@@ -621,7 +621,7 @@ pub fn content_row(stop: Stop, kubeconfigs: usize) -> Option<usize> {
         | Stop::DesktopNotifications
         | Stop::WatchMode(_)
         | Stop::ProtectLocalClusters => Some(0),
-        Stop::Done
+        Stop::Close
         | Stop::Reload
         | Stop::Revert
         | Stop::SaveAnyway
