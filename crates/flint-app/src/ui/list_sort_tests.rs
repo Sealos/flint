@@ -153,8 +153,8 @@ async fn usage_columns_show_sort_and_keep_unknown_last(cx: &mut TestAppContext) 
         cx,
         &t,
         (
-            sorted("CPU", false),
-            vec!["web".into(), "db".into(), "api".into()],
+            sorted("CPU", true),
+            vec!["db".into(), "web".into(), "api".into()],
         ),
     )
     .await;
@@ -163,8 +163,8 @@ async fn usage_columns_show_sort_and_keep_unknown_last(cx: &mut TestAppContext) 
         cx,
         &t,
         (
-            sorted("CPU", true),
-            vec!["db".into(), "web".into(), "api".into()],
+            sorted("CPU", false),
+            vec!["web".into(), "db".into(), "api".into()],
         ),
     )
     .await;
@@ -265,8 +265,7 @@ async fn a_sort_is_remembered_per_cluster_and_kind(cx: &mut TestAppContext) {
     )
     .await;
 
-    // Two clicks: descending by Restarts, saved by the column's key.
-    t.click(cx, "sort-Restarts");
+    // One click sorts descending by Restarts and saves the column's key.
     t.click(cx, "sort-Restarts");
     cx.run_until_parked();
     wait_for_saved(cx, &t, "server:Restarts").await;
@@ -323,7 +322,17 @@ async fn a_sort_is_remembered_per_cluster_and_kind(cx: &mut TestAppContext) {
     )
     .await;
 
-    // A third click goes back to the default order, and forgets the sort.
+    // The second click sorts ascending. The third clears the saved sort.
+    t.click(cx, "sort-Restarts");
+    expect_rows(
+        cx,
+        &t,
+        (
+            sorted("Restarts", false),
+            vec!["api".into(), "web".into(), "db".into()],
+        ),
+    )
+    .await;
     t.click(cx, "sort-Restarts");
     cx.executor()
         .advance_clock(std::time::Duration::from_secs(1));
@@ -367,8 +376,8 @@ async fn a_saved_sort_on_a_column_that_is_gone_keeps_the_default_order(cx: &mut 
         cx,
         &t,
         (
-            sorted("Restarts", false),
-            vec!["api".into(), "web".into(), "db".into()],
+            sorted("Restarts", true),
+            vec!["db".into(), "web".into(), "api".into()],
         ),
     )
     .await;
@@ -477,8 +486,8 @@ async fn a_saved_sort_on_a_wide_column_waits_for_wide(cx: &mut TestAppContext) {
         cx,
         &t,
         (
-            sorted("Restarts", false),
-            vec!["api".into(), "web".into(), "db".into()],
+            sorted("Restarts", true),
+            vec!["db".into(), "web".into(), "api".into()],
         ),
     )
     .await;

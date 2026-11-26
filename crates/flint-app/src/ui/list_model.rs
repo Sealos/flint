@@ -74,24 +74,28 @@ pub fn resolve_sort(
     let spec = spec?;
     Some(SortBy {
         column,
-        descending: spec.descending,
+        descending: descending_for_cells(&columns[column], spec.descending),
     })
 }
 
-/// The sort after clicking the header of the column with key `clicked`: a new column sorts
-/// ascending, then descending, then back to the default order.
-pub fn next_sort(current: Option<&SortSpec>, clicked: &str) -> Option<SortSpec> {
+fn next_sort_direction(current: Option<bool>, numeric: bool) -> Option<bool> {
     match current {
-        Some(s) if s.column == clicked && !s.descending => Some(SortSpec {
-            column: clicked.to_owned(),
-            descending: true,
-        }),
-        Some(s) if s.column == clicked => None,
-        _ => Some(SortSpec {
-            column: clicked.to_owned(),
-            descending: false,
-        }),
+        None => Some(numeric),
+        Some(descending) if descending == numeric => Some(!descending),
+        Some(_) => None,
     }
+}
+
+/// The sort after clicking the header: numeric columns start descending and others ascending.
+/// The next click reverses the direction, and the third restores the default order.
+pub fn next_sort(current: Option<&SortSpec>, clicked: &str, numeric: bool) -> Option<SortSpec> {
+    let current = current
+        .filter(|s| s.column == clicked)
+        .map(|s| s.descending);
+    next_sort_direction(current, numeric).map(|descending| SortSpec {
+        column: clicked.to_owned(),
+        descending,
+    })
 }
 
 /// Numbers, ages and times: drawn right-aligned with tabular figures.
@@ -101,6 +105,11 @@ pub fn is_numeric(column: &Column) -> bool {
             column.ty,
             ColumnType::Integer | ColumnType::Number | ColumnType::Date
         )
+}
+
+/// The core compares dates by elapsed time, so newest-first uses its ascending order.
+pub fn descending_for_cells(column: &Column, descending: bool) -> bool {
+    descending ^ (column.role == ColumnRole::Age || column.ty == ColumnType::Date)
 }
 
 /// Width limits in characters. The name column is as wide as its longest name, at least
@@ -422,6 +431,54 @@ pub fn shed_columns(
     }
 }
 
+/// The width in characters a name is given before the columns after Status start to go: enough
+/// for a pod's generated name (`podinfo-5d9c7b8d6d-b8chj`) in full.
+pub const NAME_COMFORT_CHARS: usize = 30;
+
+/// Leaves out the columns after Status, the rightmost first, while the drawn columns would leave
+/// the Name column less than `name_target` of `room`, so a name is not cut while a trailing
+/// Restarts or Age could go instead. Only those two can go (a custom printer column stays,
+/// reachable by scrolling), never one for which `keep` holds (the one the list is sorted by).
+/// Namespace counts at `namespace_min`, as it narrows before Name does. A list without Status
+/// sheds nothing, as in [`shed_columns`]: the table scrolls sideways there.
+pub fn shed_trailing(
+    drawn: &mut Vec<(usize, f32)>,
+    columns: &[Column],
+    room: f32,
+    (name_target, namespace_min): (f32, f32),
+    keep: impl Fn(usize) -> bool,
+) {
+    let Some(status) = drawn.iter().position(|&(i, _)| {
+        columns[i].role == ColumnRole::Value && columns[i].name.eq_ignore_ascii_case("Status")
+    }) else {
+        return;
+    };
+    let others = |drawn: &[(usize, f32)]| -> f32 {
+        drawn
+            .iter()
+            .filter(|&&(i, _)| columns[i].role != ColumnRole::Name)
+            .map(|&(i, width)| match columns[i].role {
+                ColumnRole::Namespace => width.min(namespace_min),
+                _ => width,
+            })
+            .sum()
+    };
+    while others(drawn) + name_target > room {
+        let Some(pos) = drawn
+            .iter()
+            .rposition(|&(i, _)| {
+                let optional = columns[i].role == ColumnRole::Age
+                    || columns[i].name.eq_ignore_ascii_case("Restarts");
+                optional && !keep(i)
+            })
+            .filter(|&pos| pos > status)
+        else {
+            return;
+        };
+        drawn.remove(pos);
+    }
+}
+
 /// Narrows the Namespace column, then the Name column, down to their minimums when the drawn
 /// columns are wider than `room`, so the status columns to their right stay in view instead of
 /// scrolling off. Namespaces go first: they repeat down the list and the namespace filter names
@@ -714,7 +771,7 @@ pub mod combined {
     use flint_core::redact::{is_masked_column, is_secret_list};
     use flint_core::{ClusterId, Column, ColumnRole, Feed, KindId, NamespaceLimit, SyncState};
 
-    use super::{listing_proves_gone, visible_columns};
+    use super::{listing_proves_gone, next_sort_direction, visible_columns};
 
     /// What one member's rows cover, which the core keeps private to it.
     #[derive(Debug, Clone, Default)]
@@ -846,19 +903,19 @@ pub mod combined {
         }
     }
 
-    /// The sort after clicking the column `clicked`: ascending, descending, then default.
-    pub fn next_sort(current: Option<&CombinedSort>, clicked: &ColumnKey) -> Option<CombinedSort> {
-        match current {
-            Some(s) if s.column == *clicked && s.descending => None,
-            Some(s) if s.column == *clicked => Some(CombinedSort {
-                column: clicked.clone(),
-                descending: true,
-            }),
-            _ => Some(CombinedSort {
-                column: clicked.clone(),
-                descending: false,
-            }),
-        }
+    /// The combined list follows the same header sort cycle as the single list.
+    pub fn next_sort(
+        current: Option<&CombinedSort>,
+        clicked: &ColumnKey,
+        numeric: bool,
+    ) -> Option<CombinedSort> {
+        let current = current
+            .filter(|s| s.column == *clicked)
+            .map(|s| s.descending);
+        next_sort_direction(current, numeric).map(|descending| CombinedSort {
+            column: clicked.clone(),
+            descending,
+        })
     }
 
     /// The sort to apply: `None` while its column is gone, not drawn, or masked by any member.
@@ -1172,24 +1229,48 @@ mod tests {
 
     // covers UP-21
     #[test]
-    fn header_clicks_cycle_ascending_descending_default() {
-        let asc = next_sort(None, "flint:age");
-        assert_eq!(
-            asc,
-            Some(SortSpec {
-                column: "flint:age".into(),
-                descending: false
-            })
-        );
-        let desc = next_sort(asc.as_ref(), "flint:age");
-        assert_eq!(desc.as_ref().map(|s| s.descending), Some(true));
-        assert_eq!(next_sort(desc.as_ref(), "flint:age"), None);
-        // Another column starts ascending again.
-        let other = next_sort(desc.as_ref(), "flint:name").unwrap();
-        assert_eq!(
-            (other.column.as_str(), other.descending),
-            ("flint:name", false)
-        );
+    fn columns_start_with_their_default_direction_then_reverse_and_clear() {
+        for column in pod_columns() {
+            let key = column.key();
+            let numeric = is_numeric(&column);
+            let previous = SortSpec {
+                column: "server:Other".into(),
+                descending: !numeric,
+            };
+            for current in [None, Some(&previous)] {
+                let first = next_sort(current, &key, numeric).unwrap();
+                assert_eq!(first.column, key);
+                assert_eq!(first.descending, numeric, "{key}");
+                let second = next_sort(Some(&first), &key, numeric).unwrap();
+                assert_eq!(second.column, key);
+                assert_eq!(second.descending, !numeric, "{key}");
+                assert_eq!(next_sort(Some(&second), &key, numeric), None, "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn date_sorts_translate_to_the_cores_age_order() {
+        let columns = [
+            col("Age", 0, ColumnRole::Age, ColumnType::String),
+            col("Last Seen", 0, ColumnRole::Value, ColumnType::Date),
+        ];
+        for (index, column) in columns.iter().enumerate() {
+            assert!(is_numeric(column));
+            for descending in [true, false] {
+                let spec = SortSpec {
+                    column: column.key(),
+                    descending,
+                };
+                assert_eq!(
+                    resolve_sort(&columns, Some(&spec), &[index]),
+                    Some(SortBy {
+                        column: index,
+                        descending: !descending,
+                    })
+                );
+            }
+        }
     }
 
     // covers UP-21, UP-22
@@ -1588,6 +1669,54 @@ mod tests {
             |_| false,
         );
         assert_eq!(drawn.len(), 2);
+    }
+
+    // covers #779: a name is not cut while a trailing column could go instead.
+    #[test]
+    fn trailing_columns_go_before_a_name_is_cut() {
+        let columns = vec![
+            col("Name", 0, ColumnRole::Name, ColumnType::String),
+            col("Status", 0, ColumnRole::Value, ColumnType::String),
+            col("Restarts", 0, ColumnRole::Value, ColumnType::Integer),
+            col("Age", 0, ColumnRole::Age, ColumnType::String),
+        ];
+        let shed = |room: f32, keep: Option<usize>| {
+            let mut drawn = vec![(0, 300.), (1, 152.), (2, 80.), (3, 76.)];
+            shed_trailing(&mut drawn, &columns, room, (270., 110.), |i| {
+                Some(i) == keep
+            });
+            drawn.into_iter().map(|(i, _)| i).collect::<Vec<_>>()
+        };
+        // 152 + 80 + 76 + 270 = 578.
+        assert_eq!(shed(578., None), [0, 1, 2, 3], "everything fits");
+        assert_eq!(shed(577., None), [0, 1, 2], "Age first");
+        assert_eq!(shed(497., None), [0, 1], "then Restarts");
+        assert_eq!(shed(300., None), [0, 1], "Status and Name stay");
+        assert_eq!(shed(300., Some(2)), [0, 1, 2], "the sorted column stays");
+        // A list without Status scrolls instead.
+        let plain = [columns[0].clone(), columns[2].clone(), columns[3].clone()];
+        let mut drawn = vec![(0, 300.), (1, 80.), (2, 76.)];
+        shed_trailing(&mut drawn, &plain, 100., (270., 110.), |_| false);
+        assert_eq!(drawn.len(), 3);
+        // A custom column after Status scrolls instead of going.
+        let custom = [
+            columns[0].clone(),
+            columns[1].clone(),
+            col("Version", 0, ColumnRole::Value, ColumnType::String),
+        ];
+        let mut drawn = vec![(0, 300.), (1, 152.), (2, 80.)];
+        shed_trailing(&mut drawn, &custom, 100., (270., 110.), |_| false);
+        assert_eq!(drawn.len(), 3);
+        // Namespace counts at its minimum: 110 + 152 + 76 + 270 fits 608.
+        let spaced = [
+            columns[0].clone(),
+            col("Namespace", 0, ColumnRole::Namespace, ColumnType::String),
+            columns[1].clone(),
+            columns[3].clone(),
+        ];
+        let mut drawn = vec![(0, 300.), (1, 170.), (2, 152.), (3, 76.)];
+        shed_trailing(&mut drawn, &spaced, 608., (270., 110.), |_| false);
+        assert_eq!(drawn.len(), 4);
     }
 
     // covers UP-20, UP-25, UP-27: a long name must not be cut while the list has room.

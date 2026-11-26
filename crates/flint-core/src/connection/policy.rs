@@ -102,6 +102,19 @@ impl CredentialPolicy for KeptMember {
     }
 }
 
+/// A running-set member the person signed in once from the set view: its credential may run in
+/// the background, but the access's launch check lets its program start only once
+/// ([`CredentialAccess::signed_in_once`]). An auth provider's command can't be stopped once it
+/// runs, so it never runs here.
+pub(crate) struct SignedInOnce;
+
+impl CredentialPolicy for SignedInOnce {
+    fn may_run(&self, source: &CredentialSource, role: Role) -> bool {
+        !source.runs_a_command()
+            || (role == Role::Background && *source != CredentialSource::AuthProvider)
+    }
+}
+
 /// Told once when a kept connection's credential fails or is refused.
 pub(crate) type OnCredentialFailure = Arc<dyn Fn() + Send + Sync>;
 
@@ -157,6 +170,8 @@ pub(crate) struct CredentialAccess {
     on_failure: Option<OnCredentialFailure>,
     /// Counts this connection's running plugins, for a kept connection.
     plugin_runs: Option<PluginRuns>,
+    /// Made by [`Self::signed_in_once`].
+    once: bool,
 }
 
 impl CredentialAccess {
@@ -169,6 +184,7 @@ impl CredentialAccess {
             launch_check: None,
             on_failure: None,
             plugin_runs: None,
+            once: false,
         }
     }
 
@@ -204,6 +220,64 @@ impl CredentialAccess {
             plugin_runs: Some(runs),
             ..Self::new(policy, Role::Background)
         }
+    }
+
+    /// Access for a running-set member's connection the person asked to sign in once, now
+    /// ([`SignedInOnce`]). The person who clicked is there, so its program may open a browser,
+    /// but it runs in the background with no input ([`Self::takes_no_input`]): it can't prompt,
+    /// and its stdin is null. Before its one start, `verify`
+    /// must accept the definition, and that start uses the click up whatever `verify` answers.
+    /// Any later start is refused and retires the access for good, and `on_spent` is told, so
+    /// nothing retries it and the member asks for a sign-in again. The manager never keeps this
+    /// access on a selected cluster or outside the set.
+    /// Its running program is counted in `runs`, so a quit waits for it to be killed.
+    pub(crate) fn signed_in_once(
+        verify: SendCheck,
+        on_spent: OnCredentialFailure,
+        runs: PluginRuns,
+    ) -> Self {
+        let used = AtomicBool::new(false);
+        let mut access = Self::new(Arc::new(SignedInOnce), Role::Background);
+        access.once = true;
+        access.plugin_runs = Some(runs);
+        // Weak: the check is held by the access it looks at.
+        let roles = Arc::downgrade(&access.role);
+        access.launch_check = Some(SendCheck::new(move || {
+            let first = !used.swap(true, Ordering::SeqCst);
+            if !first && let Some(roles) = roles.upgrade() {
+                let retired = roles.send_if_modified(|state| {
+                    let live = state.role != Role::Retired;
+                    if live {
+                        state.role = Role::Retired;
+                        state.entered[Role::Retired as usize] += 1;
+                    }
+                    live
+                });
+                if retired {
+                    on_spent();
+                }
+            }
+            let verify = verify.clone();
+            Box::pin(async move {
+                if first {
+                    verify.refusal().await
+                } else {
+                    Err("its sign-in already ran once; sign in again".to_owned())
+                }
+            })
+        }));
+        access
+    }
+
+    /// Whether this is the access of a member signed in once ([`Self::signed_in_once`]).
+    pub(crate) fn signed_in_once_access(&self) -> bool {
+        self.once
+    }
+
+    /// Whether its program runs with no input: it may not prompt, and its stdin is null. A kept
+    /// connection's ([`Self::unattended`]) and a member's signed in once.
+    pub(crate) fn takes_no_input(&self) -> bool {
+        self.unattended() || self.once
     }
 
     /// Whether this is a kept connection's access: nobody answers its program's prompts.
@@ -337,6 +411,11 @@ impl CredentialGrant {
         self.access.on_failure.is_some()
     }
 
+    /// [`CredentialAccess::takes_no_input`].
+    pub(crate) fn takes_no_input(&self) -> bool {
+        self.access.takes_no_input()
+    }
+
     /// Whether a 401 was recorded since this was last asked.
     pub(crate) fn take_refused(&self) -> bool {
         self.refused.swap(false, Ordering::Relaxed)
@@ -414,6 +493,11 @@ impl CredentialLease {
     /// [`CredentialGrant::unattended`].
     pub(crate) fn unattended(&self) -> bool {
         self.grant.unattended()
+    }
+
+    /// [`CredentialAccess::takes_no_input`].
+    pub(crate) fn takes_no_input(&self) -> bool {
+        self.grant.takes_no_input()
     }
 
     /// Counts a plugin as running until the returned value is dropped, for a kept connection.
