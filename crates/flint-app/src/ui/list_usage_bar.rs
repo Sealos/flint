@@ -49,6 +49,39 @@ pub(in crate::ui) enum BarLevel {
     Over,
 }
 
+/// The theme colour a usage level is drawn in, the same in lists, rings and capacity bars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::ui) enum UsageRole {
+    Success,
+    Warning,
+    Danger,
+}
+
+impl BarLevel {
+    /// The one tone map for usage: Normal is calm, Warning warns, Over is dangerous. The accent
+    /// colour stays for selection and links.
+    pub(in crate::ui) fn role(self) -> UsageRole {
+        match self {
+            Self::Normal => UsageRole::Success,
+            Self::Warning => UsageRole::Warning,
+            Self::Over => UsageRole::Danger,
+        }
+    }
+
+    pub(in crate::ui) fn color(self, theme: &gpui_kit::component::Theme) -> gpui_kit::Hsla {
+        match self.role() {
+            UsageRole::Success => theme.success,
+            UsageRole::Warning => theme.warning,
+            UsageRole::Danger => theme.danger,
+        }
+    }
+
+    /// A mark beside an Over bar, so it is not told from Warning by colour alone.
+    pub(in crate::ui) fn marker(self) -> Option<&'static str> {
+        (self == Self::Over).then_some("!")
+    }
+}
+
 /// What to draw: every number is a fraction of the bar's width, from 0 to 1.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::ui) struct Bar {
@@ -207,6 +240,20 @@ mod tests {
         assert_eq!(level(90), BarLevel::Warning);
         assert_eq!(level(100), BarLevel::Warning);
         assert_eq!(level(101), BarLevel::Over);
+    }
+
+    #[test]
+    fn usage_levels_share_one_tone_map() {
+        assert_eq!(BarLevel::Normal.role(), UsageRole::Success);
+        assert_eq!(BarLevel::Warning.role(), UsageRole::Warning);
+        assert_eq!(BarLevel::Over.role(), UsageRole::Danger);
+    }
+
+    #[test]
+    fn only_over_gets_a_marker() {
+        assert_eq!(BarLevel::Normal.marker(), None);
+        assert_eq!(BarLevel::Warning.marker(), None);
+        assert_eq!(BarLevel::Over.marker(), Some("!"));
     }
 
     #[test]

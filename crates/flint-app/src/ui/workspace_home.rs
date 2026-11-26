@@ -91,8 +91,9 @@ impl Workspace {
     pub(super) fn open_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.home.open = true;
         self.home.opened_over = Some(self.main_key());
-        // Out of a list or detail now hidden, so keys reach the workspace.
-        window.focus(&self.focus, cx);
+        // Out of a list or detail now hidden, onto the home screen, so keys reach the workspace
+        // and Up and Down move between the cards' links.
+        window.focus(&self.home_focus, cx);
         self.refresh_home(cx);
         cx.notify();
     }
@@ -283,6 +284,7 @@ impl Workspace {
             &self.home_view(cx),
             &actions,
             &self.focus,
+            &self.home_focus,
             theme,
         ))
     }

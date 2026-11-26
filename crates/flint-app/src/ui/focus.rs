@@ -1,7 +1,23 @@
 //! Focus housekeeping for views that close others.
 
 use gpui_kit::component::WindowExt as _;
-use gpui_kit::{App, FocusHandle, Window};
+use gpui_kit::{App, FocusHandle, InteractiveElement, Window};
+
+use super::dashboard::{FocusNextLink, FocusPreviousLink};
+
+/// Makes `element` a "Dashboard" scope: Up and Down move focus between the links inside `scope`,
+/// as on the cluster overview. For the set dashboard and Home, whose cards are made of buttons.
+pub fn link_focus<E: InteractiveElement>(element: E, scope: &FocusHandle) -> E {
+    let (next, previous) = (scope.clone(), scope.clone());
+    element
+        .key_context("Dashboard")
+        .on_action(move |_: &FocusNextLink, window, cx| {
+            cycle_focus_within(&next, true, window, cx);
+        })
+        .on_action(move |_: &FocusPreviousLink, window, cx| {
+            cycle_focus_within(&previous, false, window, cx);
+        })
+}
 
 /// Moves focus to the next (or previous) tab stop inside `scope`, wrapping around: the window's
 /// tab order is walked until it comes back inside. With no tab stop inside, focus stays.

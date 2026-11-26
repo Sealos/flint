@@ -11,6 +11,8 @@ use flint_core::thresholds::{ThresholdLevel, ThresholdMetric, Thresholds};
 use gpui_kit::component::{StyledExt as _, Theme};
 use gpui_kit::*;
 
+use crate::ui::list_usage_bar::BarLevel;
+
 /// The side of the ring.
 const RING_SIZE: f32 = 88.;
 /// How thick the ring is.
@@ -104,10 +106,15 @@ pub(super) fn tick_ends(inner: f32, outer: f32, fraction: f32) -> [(f32, f32); 2
 }
 
 fn tone_color(tone: Tone, theme: &Theme) -> Hsla {
+    level(tone).color(theme)
+}
+
+/// The level whose colour `tone` is drawn in, so rings match the list bars.
+pub(super) fn level(tone: Tone) -> BarLevel {
     match tone {
-        Tone::Normal => theme.foreground,
-        Tone::Warning => theme.warning,
-        Tone::Over => theme.danger,
+        Tone::Normal => BarLevel::Normal,
+        Tone::Warning => BarLevel::Warning,
+        Tone::Over => BarLevel::Over,
     }
 }
 
@@ -116,6 +123,7 @@ pub(super) fn usage_ring(spec: RingSpec, center: String, theme: &Theme) -> impl 
     let fill = tone_color(spec.tone, theme);
     let track = theme.border;
     let tick_color = theme.foreground;
+    let tick_outline = theme.background;
     let ring = canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
@@ -144,11 +152,10 @@ pub(super) fn usage_ring(spec: RingSpec, center: String, theme: &Theme) -> impl 
             }
             if let Some(tick) = spec.tick {
                 let half = RING_WIDTH / 2. + TICK_OVERHANG;
-                stroke(
-                    tick_ends(radius - half, radius + half, tick).to_vec(),
-                    TICK_WIDTH,
-                    tick_color,
-                );
+                let ends = tick_ends(radius - half, radius + half, tick).to_vec();
+                // An outline in the background colour keeps the tick visible over any fill.
+                stroke(ends.clone(), TICK_WIDTH + 2., tick_outline);
+                stroke(ends, TICK_WIDTH, tick_color);
             }
         },
     )

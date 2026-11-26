@@ -1487,7 +1487,20 @@ impl ResourceList {
                         el.justify_end().font_features(tabular_figures())
                     })
                     .gap(px(USAGE_BAR_GAP))
-                    .when_some(bar, |el, bar| el.child(usage_bar(bar, theme)))
+                    .when_some(bar, |el, bar| {
+                        el.child(usage_bar(bar, theme)).when_some(
+                            bar.level.marker(),
+                            |el, marker| {
+                                el.child(
+                                    div()
+                                        .flex_none()
+                                        .font_semibold()
+                                        .text_color(theme.danger)
+                                        .child(marker),
+                                )
+                            },
+                        )
+                    })
                     .child(
                         div()
                             .min_w_0()
@@ -2144,11 +2157,7 @@ const USAGE_BAR_GAP: f32 = 8.;
 
 /// A usage bar: the fill is the use, the tick the request, and the end the limit.
 fn usage_bar(bar: list_usage_bar::Bar, theme: &Theme) -> impl IntoElement {
-    let colour = match bar.level {
-        list_usage_bar::BarLevel::Normal => theme.primary,
-        list_usage_bar::BarLevel::Warning => theme.warning,
-        list_usage_bar::BarLevel::Over => theme.danger,
-    };
+    let colour = bar.level.color(theme);
     div()
         .relative()
         .flex_none()

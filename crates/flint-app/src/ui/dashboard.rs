@@ -592,28 +592,7 @@ fn metrics(input: &DashboardInput<'_>) -> MetricsPanel {
     }
 }
 
-/// `nanos` of CPU in millicores, or cores from one core up.
-fn format_cpu(nanos: u64) -> String {
-    let millis = nanos / 1_000_000;
-    if millis < 1000 {
-        format!("{millis}m")
-    } else {
-        format!("{:.2} cores", nanos as f64 / 1e9)
-    }
-}
-
-/// `bytes` in binary units.
-fn format_memory(bytes: u64) -> String {
-    const KIB: f64 = 1024.;
-    let value = bytes as f64;
-    if value < KIB * KIB {
-        format!("{:.0} KiB", value / KIB)
-    } else if value < KIB * KIB * KIB {
-        format!("{:.0} MiB", value / (KIB * KIB))
-    } else {
-        format!("{:.1} GiB", value / (KIB * KIB * KIB))
-    }
-}
+use super::list_usage::{cpu_amount as format_cpu, memory_amount as format_memory};
 
 fn warnings(input: &DashboardInput<'_>, scope: &OpenScope) -> WarningsPanel {
     let Some(events) = input.warning_events else {

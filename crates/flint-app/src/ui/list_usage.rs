@@ -37,7 +37,7 @@ pub(in crate::ui) const BAR_CHARS: usize = 7;
 
 const MIB: u64 = 1024 * 1024;
 
-/// CPU as `kubectl top` prints it, with any non-zero use at least `1m`.
+/// CPU in the list cells, as `kubectl top` prints it, with any non-zero use at least `1m`.
 pub(in crate::ui) fn cpu_text(cpu: Cpu) -> String {
     format!("{}m", cpu.millis())
 }
@@ -45,6 +45,30 @@ pub(in crate::ui) fn cpu_text(cpu: Cpu) -> String {
 /// Memory in MiB, with any non-zero use at least `1Mi`.
 pub(in crate::ui) fn memory_text(memory: Memory) -> String {
     format!("{}Mi", memory.bytes().div_ceil(MIB))
+}
+
+/// `nanos` of CPU in millicores, or cores from one core up. The one formatter for amounts shown
+/// outside the list cells (detail rings, tooltips, the cluster overview).
+pub(in crate::ui) fn cpu_amount(nanos: u64) -> String {
+    let millis = nanos / 1_000_000;
+    if millis < 1000 {
+        format!("{millis}m")
+    } else {
+        format!("{:.2} cores", nanos as f64 / 1e9)
+    }
+}
+
+/// `bytes` in binary units. The memory counterpart of [`cpu_amount`].
+pub(in crate::ui) fn memory_amount(bytes: u64) -> String {
+    const KIB: f64 = 1024.;
+    let value = bytes as f64;
+    if value < KIB * KIB {
+        format!("{:.0} KiB", value / KIB)
+    } else if value < KIB * KIB * KIB {
+        format!("{:.0} MiB", value / (KIB * KIB))
+    } else {
+        format!("{:.1} GiB", value / (KIB * KIB * KIB))
+    }
 }
 
 /// The kinds with usage columns.
@@ -709,6 +733,14 @@ impl ListUsage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn amounts_outside_the_cells_switch_to_cores_and_gib() {
+        assert_eq!(cpu_amount(250_000_000), "250m");
+        assert_eq!(cpu_amount(4_000_000_000), "4.00 cores");
+        assert_eq!(memory_amount(300 << 20), "300 MiB");
+        assert_eq!(memory_amount(3 << 30), "3.0 GiB");
+    }
+
     use super::*;
     use flint_core::metrics::{ContainerMetrics, PodMetrics};
     use flint_core::telemetry::Availability;

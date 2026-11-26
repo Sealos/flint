@@ -352,6 +352,8 @@ pub struct Workspace {
     /// Focused when nothing inside is, so keys and registered actions reach the workspace. It is
     /// tracked by an element nothing can click, so clicks elsewhere keep focus where it was.
     focus: FocusHandle,
+    /// The home screen's scope, so Up and Down move between its links.
+    home_focus: FocusHandle,
     _namespaces: Task<()>,
     _tick: Task<()>,
     _list_subscriptions: Vec<Subscription>,
@@ -495,6 +497,7 @@ impl Workspace {
             palette: None,
             _switcher: Task::ready(()),
             switcher_key: None,
+            home_focus: cx.focus_handle(),
             sidebar_focus: cx.focus_handle(),
             sidebar_cursor: None,
             sidebar_scroll: ScrollHandle::new(),

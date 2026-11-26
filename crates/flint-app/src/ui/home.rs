@@ -20,6 +20,7 @@ use super::cluster_tag::tag_dot;
 use super::dashboard::cluster_card::{
     self, CARD_WIDTH, CardActions, ClusterCard, ClusterRead, render_card,
 };
+use super::focus::link_focus;
 use super::keep_watching;
 use super::registry::{self, SelectCluster, ToggleKeepWatching};
 
@@ -365,6 +366,7 @@ pub(super) fn render(
     view: &HomeView<'_>,
     actions: &CardActions,
     focus: &FocusHandle,
+    scope: &FocusHandle,
     theme: &Theme,
 ) -> AnyElement {
     let mut content =
@@ -423,8 +425,8 @@ pub(super) fn render(
                 ),
         );
     }
-    v_flex()
-        .id("home")
+    link_focus(v_flex().id("home"), scope)
+        .track_focus(scope)
         .flex_1()
         .min_w_0()
         .h_full()

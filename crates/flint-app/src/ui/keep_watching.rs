@@ -48,7 +48,7 @@ pub(super) fn toggle_tip(status: KeepWatching) -> &'static str {
             "Nothing runs until you allow its sign-in, which a change or a restart turns off."
         }
         KeepWatching::Paused => {
-            "Waiting: a kubeconfig file defining this cluster can't be read. Click to stop."
+            "Paused: a kubeconfig file defining this cluster can't be read. Click to stop."
         }
     }
 }
@@ -95,6 +95,11 @@ pub(super) fn sign_in_tip(status: KeepWatching, sign_in: BackgroundSignIn) -> &'
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_paused_cluster_is_called_paused_in_its_tooltip() {
+        assert!(toggle_tip(KeepWatching::Paused).starts_with("Paused:"));
+    }
 
     #[test]
     fn the_sidebar_only_says_watching_or_sign_in_needed() {

@@ -219,3 +219,27 @@ async fn selecting_another_cluster_leaves_home(cx: &mut TestAppContext) {
     render(cx, &t);
     assert!(!matches!(state(cx, &t).main, Main::Home { .. }));
 }
+
+// A card's name is a link: Down reaches it and Enter selects its cluster.
+#[gpui_kit::test]
+async fn a_home_card_selects_its_cluster_from_the_keyboard(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    keep_watching(
+        cx,
+        &t,
+        &[
+            ("kind-alpha", KeepWatching::Off),
+            ("kind-beta", KeepWatching::NeedsConfirming),
+        ],
+    );
+    dispatch(cx, &t, "workspace::OpenHome", json!(null));
+    render(cx, &t);
+    t.press(cx, "down");
+    t.press(cx, "enter");
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace.read(cx).cluster.as_deref() == Some("kind-beta")
+    })
+    .await;
+}

@@ -18,6 +18,7 @@ use flint_core::settings::ClusterTag;
 use flint_core::telemetry::{Availability, ClusterTelemetry, MetricsCheck};
 use flint_core::thresholds::{ThresholdLevel, ThresholdMetric, Thresholds};
 use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -360,6 +361,11 @@ pub(in crate::ui) fn level_color(level: ThresholdLevel, theme: &Theme) -> Hsla {
     }
 }
 
+/// The visible label of a short-workloads row for one kind, such as `Deployments short of replicas`.
+pub(in crate::ui) fn short_kind_label(kind_label: &str) -> String {
+    format!("{kind_label} short of replicas")
+}
+
 pub(in crate::ui) fn count_link(
     id: String,
     label: String,
@@ -369,15 +375,16 @@ pub(in crate::ui) fn count_link(
     focus: &FocusHandle,
     theme: &Theme,
 ) -> impl IntoElement {
-    let row = h_flex()
-        .id(SharedString::from(id))
-        .aria_label(label.clone())
+    let content = h_flex()
+        .w_full()
         .justify_between()
         .gap_2()
-        .px_1()
-        .rounded_sm()
         .text_xs()
-        .child(div().text_color(theme.muted_foreground).child(label))
+        .child(
+            div()
+                .text_color(theme.muted_foreground)
+                .child(label.clone()),
+        )
         .child(
             div()
                 .font_weight(FontWeight::SEMIBOLD)
@@ -385,13 +392,23 @@ pub(in crate::ui) fn count_link(
                 .child(value),
         );
     match action {
-        Some(action) => row
-            .cursor_pointer()
-            .hover(|el| el.bg(theme.table_hover))
+        // A button, so Tab reaches it and Enter or Space opens it.
+        Some(action) => Button::new(SharedString::from(id))
+            .accessibility_label(format!("Open {label}"))
+            .ghost()
+            .compact()
+            .w_full()
+            .child(content)
             .on_click(registry::on_click_dyn_in(focus.clone(), action))
+            .into_any_element(),
+        None => div()
+            .id(SharedString::from(id))
+            .aria_label(label)
+            .px_1()
+            .rounded_sm()
+            .child(content)
             .test_support()
             .into_any_element(),
-        None => row.test_support().into_any_element(),
     }
 }
 
@@ -435,26 +452,32 @@ pub(in crate::ui) fn render_card(
 ) -> impl IntoElement {
     let cluster = &card.cluster;
     let opens = card.state.counts();
-    let header = h_flex()
-        .id(SharedString::from(format!("set-card-open-{cluster}")))
-        .aria_label(card.shown.clone())
+    let title = h_flex()
         .gap_1()
         .min_w_0()
         .font_weight(FontWeight::SEMIBOLD)
         .text_sm()
         .when_some(card.tag, |el, tag| el.child(tag_dot(cluster, tag, theme)))
-        .child(div().truncate().child(card.shown.clone()))
-        .when_some(
-            opens
-                .then(|| actions(cluster, CardTarget::Cluster))
-                .flatten(),
-            |el, action| {
-                el.cursor_pointer()
-                    .hover(|el| el.bg(theme.table_hover))
-                    .on_click(registry::on_click_dyn_in(focus.clone(), action))
-            },
-        )
-        .test_support();
+        .child(div().truncate().child(card.shown.clone()));
+    let open_member = opens
+        .then(|| actions(cluster, CardTarget::Cluster))
+        .flatten();
+    let header = match open_member {
+        // A button, so Tab reaches it and Enter or Space opens the member.
+        Some(action) => Button::new(SharedString::from(format!("set-card-open-{cluster}")))
+            .accessibility_label(card.shown.clone())
+            .ghost()
+            .compact()
+            .child(title)
+            .on_click(registry::on_click_dyn_in(focus.clone(), action))
+            .into_any_element(),
+        None => div()
+            .id(SharedString::from(format!("set-card-open-{cluster}")))
+            .aria_label(card.shown.clone())
+            .child(title)
+            .test_support()
+            .into_any_element(),
+    };
     let rows = card.tiles.iter().flat_map(|tile| {
         let name = category_name(tile.category);
         let links_kinds =
@@ -494,7 +517,7 @@ pub(in crate::ui) fn render_card(
                 Some(
                     count_link(
                         format!("set-card-{cluster}-{name}-{kind}"),
-                        format!("Open short {label}"),
+                        short_kind_label(label),
                         String::new(),
                         theme.foreground,
                         Some(action),
