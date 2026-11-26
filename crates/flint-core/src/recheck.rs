@@ -626,19 +626,18 @@ impl ContextHistory {
             Pinned::Shell => (|r| r.generation, pin.generation),
             Pinned::Logs => (|r| r.endpoint, pin.endpoint),
         };
-        let moved = |r: &Record| {
-            r.proxy != pin.proxy
-                || match session {
-                    Pinned::Shell => r.server != pin.server,
-                    Pinned::Logs => !same_endpoint(r.server.as_deref(), pin.server.as_deref()),
-                }
+        let other_server = |r: &Record| match session {
+            Pinned::Shell => r.server != pin.server,
+            Pinned::Logs => !same_endpoint(r.server.as_deref(), pin.server.as_deref()),
         };
+        let moved = |r: &Record| r.proxy != pin.proxy || other_server(r);
         let change = match self.records.get(context) {
             Some(r) if r.present && current(r) == pinned => return None,
             // Pinned stale at once, with a file still unreadable: opened on what a load showed
             // but did not confirm (a later file's fallback). With every file read, the context
             // has left that server for certain.
             Some(r) if r.present && pinned == 0 && self.failing => Change::Unconfirmed,
+            Some(r) if r.present && moved(r) && !other_server(r) => Change::Rerouted,
             Some(r) if r.present && moved(r) => Change::Repointed,
             // Removed and added back, or re-pointed and put back, since the session opened.
             Some(r) if r.present => Change::Changed,
@@ -918,6 +917,8 @@ pub(crate) enum FreshDefinition {
 pub(crate) enum Change {
     /// It points to another API server now.
     Repointed,
+    /// It is reached through another proxy now, or none: the proxy setting changed, say.
+    Rerouted,
     /// It changed and came back to the same server (removed and added back, say).
     Changed,
     /// A load that no failed file could mask lacks it.
@@ -937,6 +938,9 @@ pub(crate) fn reason(session: Pinned, context: &str, change: Change) -> String {
         Change::Removed => format!("\"{context}\" is no longer in your kubeconfig files"),
         Change::Repointed => {
             format!("\"{context}\" now points to a different API server; {again}")
+        }
+        Change::Rerouted => {
+            format!("\"{context}\" is reached through another proxy now; {again}")
         }
         Change::Changed => format!(
             "\"{context}\" changed in your kubeconfig files since this session opened; {again}"
@@ -1411,6 +1415,7 @@ mod tests {
             cluster_sources: HashMap::new(),
             user_sources: HashMap::new(),
             blank: Vec::new(),
+            proxy_generation: 0,
         }
     }
 
