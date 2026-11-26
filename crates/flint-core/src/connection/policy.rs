@@ -172,6 +172,9 @@ pub(crate) struct CredentialAccess {
     plugin_runs: Option<PluginRuns>,
     /// Made by [`Self::signed_in_once`].
     once: bool,
+    /// Told when a connection signed in once is used up: its refused second start, a refused
+    /// token or a failed run ([`Self::signed_in_once`]).
+    on_spent: Option<OnCredentialFailure>,
 }
 
 impl CredentialAccess {
@@ -185,6 +188,7 @@ impl CredentialAccess {
             on_failure: None,
             plugin_runs: None,
             once: false,
+            on_spent: None,
         }
     }
 
@@ -228,8 +232,9 @@ impl CredentialAccess {
     /// and its stdin is null. Before its one start, `verify`
     /// must accept the definition, and that start uses the click up whatever `verify` answers.
     /// Any later start is refused and retires the access for good, and `on_spent` is told, so
-    /// nothing retries it and the member asks for a sign-in again. The manager never keeps this
-    /// access on a selected cluster or outside the set.
+    /// nothing retries it and the member asks for a sign-in again. A token the server refuses,
+    /// or a failed run, retires it the same way. The manager never keeps this access on a
+    /// selected cluster.
     /// Its running program is counted in `runs`, so a quit waits for it to be killed.
     pub(crate) fn signed_in_once(
         verify: SendCheck,
@@ -240,6 +245,7 @@ impl CredentialAccess {
         let mut access = Self::new(Arc::new(SignedInOnce), Role::Background);
         access.once = true;
         access.plugin_runs = Some(runs);
+        access.on_spent = Some(Arc::clone(&on_spent));
         // Weak: the check is held by the access it looks at.
         let roles = Arc::downgrade(&access.role);
         access.launch_check = Some(SendCheck::new(move || {
@@ -285,10 +291,10 @@ impl CredentialAccess {
         self.on_failure.is_some()
     }
 
-    /// Ends a kept connection's access after a failure, telling its owner the first time. Does
-    /// nothing for any other connection.
+    /// Ends a kept connection's access, or one signed in once, after a failure, telling its
+    /// owner the first time. Does nothing for any other connection.
     fn credential_failed(&self) {
-        let Some(on_failure) = &self.on_failure else {
+        let Some(on_failure) = self.on_failure.as_ref().or(self.on_spent.as_ref()) else {
             return;
         };
         let first = self.role.send_if_modified(|state| {

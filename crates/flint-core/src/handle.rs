@@ -351,6 +351,17 @@ pub(crate) enum Request {
         shown: Option<u64>,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Signs `cluster`, kept watching, in once, now, if it is still at `server` on the
+    /// definitions its home card showed ([`CoreHandle::sign_in_watched`]).
+    SignInWatched {
+        cluster: ClusterId,
+        server: String,
+        definition: Option<u64>,
+        shown: Option<u64>,
+        /// How many times its grant had been ended when clicked.
+        revoked: u64,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     /// The read client of `member`, checked in the same step.
     MemberClient {
         member: AdmittedMember,
@@ -1054,6 +1065,42 @@ impl CoreHandle {
             member: member.clone(),
             definition,
             shown,
+            reply,
+        });
+        async move {
+            if sent.is_err() {
+                return Err("the core is not running".to_owned());
+            }
+            rx.await
+                .unwrap_or_else(|_| Err("the core stopped before answering".to_owned()))
+        }
+    }
+
+    /// For a click on the Sign in of a cluster's fleet home card alone: runs the sign-in of
+    /// `cluster`, kept watching, once, now, if it waits for one and is still at `server` on
+    /// `definition` ([`KeepWatchView::definition`](crate::keep_watching::KeepWatchView)) and the
+    /// plugin definition `shown`
+    /// ([`KeepWatchView::shown_sign_in`](crate::keep_watching::KeepWatchView)), as the card was
+    /// drawn. The same rules as [`Self::sign_in_member`]: the click is the consent for that one
+    /// start of the program, with no input; nothing is saved, nothing retries it, and it turns no
+    /// background sign-in on. A change since refuses it, and nothing runs. Resolves once the
+    /// connection is started; its result arrives as the cluster's keep-watching state.
+    pub fn sign_in_watched(
+        &self,
+        cluster: &str,
+        server: &str,
+        definition: Option<u64>,
+        shown: Option<u64>,
+    ) -> impl Future<Output = Result<(), String>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let sent = self.requests.push(Request::SignInWatched {
+            cluster: cluster.to_owned(),
+            server: server.to_owned(),
+            definition,
+            shown,
+            // A stop or disconnect sent after this ends grants at once, outside the queues:
+            // the click is refused if one came first.
+            revoked: self.kept.revocations(cluster),
             reply,
         });
         async move {

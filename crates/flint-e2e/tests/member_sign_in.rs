@@ -1,13 +1,14 @@
-//! Signing a running-set member in once from the set view, against fake API servers and a fake
-//! exec plugin: the click runs the plugin once, the member comes back live, and nothing is kept
-//! that would run it again. A click on a view that no longer shows the definition runs nothing.
+//! Signing a cluster in once, against fake API servers and a fake exec plugin: a running-set
+//! member from the set view, and a cluster kept watching from its fleet home card. The click
+//! runs the plugin once, the cluster comes back live, and nothing is kept that would run it
+//! again. A click on a view that no longer shows the definition runs nothing.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use flint_core::Settings;
-use flint_core::handle::{AdmittedMember, MemberStatus};
+use flint_core::handle::{AdmittedMember, Command, MemberStatus};
 use flint_core::keep_watching::{BackgroundSignIn, KeepWatching};
 use flint_core::settings::ClusterPin;
 use flint_e2e::fake_api::FakeApiServer;
@@ -190,4 +191,122 @@ async fn a_due_token_is_not_refreshed_in_the_background() {
     assert_eq!(runs(&f.runs), 1, "run once, and no retry");
     f.until_status(|s| matches!(s, MemberStatus::SignInNeeded { .. }))
         .await;
+}
+
+// One sign-in of a cluster kept watching, from its fleet home card.
+
+/// A core on `a` with `b` kept watching and no background sign-in consent: its card needs a
+/// sign-in, and nothing ran.
+struct Watched {
+    core: Core,
+    b: FakeApiServer,
+    runs: PathBuf,
+    _a: FakeApiServer,
+}
+
+async fn watched(expires: &str) -> Watched {
+    let a = FakeApiServer::start().await.unwrap();
+    let b = FakeApiServer::start().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (script, runs) = plugin(dir.path(), expires);
+    let file = dir.path().join("kubeconfig");
+    std::fs::write(&file, config(&a, &b, &script)).unwrap();
+    let core = Core::start_on_context(dir, vec![file], Settings::default(), "a").await;
+    let definition = core.handle.keep_watching().await["b"].definition;
+    core.handle.send(Command::SetKeepWatching {
+        cluster: "b".to_owned(),
+        definition,
+    });
+    let w = Watched {
+        core,
+        b,
+        runs,
+        _a: a,
+    };
+    w.until_status(KeepWatching::NeedsConfirming).await;
+    w
+}
+
+impl Watched {
+    async fn until_status(&self, wanted: KeepWatching) {
+        tokio::time::timeout(WAIT, async {
+            while self.core.handle.keep_watching().await["b"].status != wanted {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("b should reach {wanted:?}"));
+    }
+
+    /// What the card's Sign in click sends.
+    async fn click(&self, shown: impl Fn(Option<u64>) -> Option<u64>) -> Result<(), String> {
+        let view = self.core.handle.keep_watching().await["b"].clone();
+        let server = self.b.url();
+        self.core
+            .handle
+            .sign_in_watched("b", &server, view.definition, shown(view.shown_sign_in))
+            .await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_watched_cluster_signs_in_once_from_its_card() {
+    let w = watched(LASTING).await;
+    assert_eq!(runs(&w.runs), 0, "nothing runs before the click");
+    assert!(w.b.requests().is_empty(), "nothing reached b");
+
+    w.click(|shown| shown).await.expect("b can sign in");
+    w.until_status(KeepWatching::Watching).await;
+    tokio::time::timeout(WAIT, async {
+        while w.core.handle.telemetry("b").is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("b's card has a feed");
+
+    assert_eq!(runs(&w.runs), 1);
+    assert!(w.b.writes().is_empty(), "{:?}", w.b.writes());
+    let view = w.core.handle.keep_watching().await["b"].clone();
+    assert_eq!(view.sign_in, BackgroundSignIn::Off, "no background sign-in");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(runs(&w.runs), 1, "nothing ran it again");
+    assert!(w.click(|shown| shown).await.is_err(), "b no longer waits");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_click_on_a_changed_card_runs_nothing() {
+    let w = watched(LASTING).await;
+
+    let refused = w.click(|shown| shown.map(|s| s ^ 1)).await;
+
+    assert!(refused.unwrap_err().contains("changed"));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(runs(&w.runs), 0);
+    assert!(w.b.requests().is_empty(), "nothing reached b");
+    w.until_status(KeepWatching::NeedsConfirming).await;
+}
+
+// A token that is due needs the plugin again, which the click did not agree to: the start is
+// refused, nothing retries it, and the card needs a sign-in again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_watched_clusters_due_token_is_not_refreshed_in_the_background() {
+    let w = watched(EXPIRED).await;
+
+    w.click(|shown| shown).await.expect("b can sign in");
+    tokio::time::timeout(WAIT, async {
+        while runs(&w.runs) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the plugin should have run");
+    w.until_status(KeepWatching::NeedsConfirming).await;
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(runs(&w.runs), 1, "run once, and no retry");
+    assert_eq!(
+        w.core.handle.keep_watching().await["b"].status,
+        KeepWatching::NeedsConfirming
+    );
 }
