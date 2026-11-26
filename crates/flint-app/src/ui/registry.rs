@@ -147,6 +147,8 @@ actions!(
         DefaultWatchOpenViewsOnly,
         /// Go back to the kind and object shown before.
         GoBack,
+        /// Go forward to the kind and object Go Back left.
+        GoForward,
         /// In a narrow window, return from the detail to the list, keeping the selection.
         BackToList,
         /// Move focus to the next pane: clusters, navigation, list, detail, dock.
@@ -2893,6 +2895,9 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<GoBack>("Go Back", "Go back to the kind and object shown before.")
             .of(C::View, S::Workspace)
             .keys(&["secondary-["], Some(WORKSPACE)),
+        Spec::unit::<GoForward>("Go Forward", "Go forward to the kind and object Go Back left.")
+            .of(C::View, S::Workspace)
+            .keys(&["secondary-]"], Some(WORKSPACE)),
         Spec::unit::<BackToList>(
             "Back to List",
             "In a narrow window, return from the detail to the list, keeping the selection.",

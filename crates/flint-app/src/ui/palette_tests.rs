@@ -601,6 +601,7 @@ async fn the_menus_hold_the_standard_items(cx: &mut TestAppContext) {
             "Show Command Palette",
             "Go to Resource",
             "Go Back",
+            "Go Forward",
             "Appearance"
         ]
     );
@@ -1594,4 +1595,50 @@ async fn a_popover_without_focus_closes_when_the_palette_opens(cx: &mut TestAppC
     t.press(cx, "escape");
     t.click(cx, "namespace-filter-button");
     t.wait_for_element(cx, "ns-all").await;
+}
+
+// covers #313: the palette's and the switcher's keys and menu items do nothing while a dialog
+// is open: neither opens behind it, and the dialog stays.
+#[gpui_kit::test]
+async fn palette_and_switcher_keys_and_menu_items_leave_a_dialog_alone(cx: &mut TestAppContext) {
+    use crate::ui::registry::{ToggleCommandPalette, ToggleResourceSwitcher};
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0)]).await;
+    t.dispatch(cx, "flint::About", Value::Null).unwrap();
+    cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
+        .await;
+    // The keys.
+    t.press_key_of(cx, "palette::ToggleCommandPalette");
+    assert!(
+        palette_closed(cx, &t),
+        "the palette opened behind the dialog"
+    );
+    t.press_key_of(cx, "palette::ToggleResourceSwitcher");
+    assert!(
+        palette_closed(cx, &t),
+        "the switcher opened behind the dialog"
+    );
+    // The menu items: dispatched as a click on them does.
+    cx.update_window(t.window, |_, window, cx| {
+        window.dispatch_action(Box::new(ToggleCommandPalette), cx);
+        window.dispatch_action(Box::new(ToggleResourceSwitcher), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(
+        palette_closed(cx, &t),
+        "a menu item opened behind the dialog"
+    );
+    let still_open = cx
+        .update_window(t.window, |_, window, cx| window.has_active_dialog(cx))
+        .unwrap();
+    assert!(still_open, "the dialog stayed open");
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    cx.wait_for(t.window, WAIT, |window, cx| !window.has_active_dialog(cx))
+        .await;
+    // Without the dialog the same key opens the switcher again.
+    t.press_key_of(cx, "palette::ToggleResourceSwitcher");
+    assert!(palette(cx, &t).is_some());
 }

@@ -176,6 +176,8 @@ pub struct SwitcherScope {
     pub discovery_failed: bool,
     /// The cluster watches only the kinds open in a view.
     pub on_view: bool,
+    /// The objects opened lately, latest first: listed first while nothing is typed.
+    pub recent: Vec<(flint_core::KindId, super::switcher_model::Object)>,
 }
 
 /// Whether two switcher scopes are on one cluster slot, so a selection carries over: a context
@@ -203,6 +205,7 @@ struct Resources {
     discovery_failed: bool,
     on_view: bool,
     search: Search,
+    recent: Vec<(flint_core::KindId, super::switcher_model::Object)>,
     /// How many items the query matched, listed or not.
     matched: usize,
 }
@@ -218,6 +221,7 @@ impl Resources {
             discovery_failed: scope.discovery_failed,
             on_view: scope.on_view,
             search: Search::default(),
+            recent: scope.recent,
             matched: 0,
         }
     }
@@ -622,7 +626,10 @@ impl CommandPalette {
         let query = self.query.read(cx).value().to_string();
         self.query_text = query.clone();
         if let (Step::Resources, Some(resources)) = (&self.step, &mut self.resources) {
-            let found = resources.search.run(&resources.index, &query);
+            let found =
+                resources
+                    .search
+                    .run_with_recent(&resources.index, &query, &resources.recent);
             resources.matched = found.matched;
             self.rows = found
                 .hits
@@ -1528,7 +1535,8 @@ impl Render for CommandPalette {
                         .border_t_1()
                         .border_color(theme.border)
                         .text_xs()
-                        .truncate()
+                        // A long description or refusal wraps onto more lines.
+                        .whitespace_normal()
                         .text_color(if error {
                             theme.danger
                         } else {
