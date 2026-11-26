@@ -764,6 +764,7 @@ pub fn discovery(sections: Vec<NavSection>) -> ClusterDiscovery {
                 verbs: vec!["get".into(), "list".into(), "watch".into()],
                 singular: e.kind.to_lowercase(),
                 short_names: Vec::new(),
+                scale: Default::default(),
             }
         })
         .collect();
@@ -904,6 +905,7 @@ pub fn serve_pods(cx: &mut TestAppContext, t: &TestWorkspace) {
         verbs: ["get", "list", "watch"].map(String::from).to_vec(),
         singular: "pod".into(),
         short_names: vec!["po".into()],
+        scale: Default::default(),
     };
     let discovery = ClusterDiscovery::new(vec![pods]);
     assert!(

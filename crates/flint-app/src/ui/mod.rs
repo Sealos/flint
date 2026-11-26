@@ -48,6 +48,7 @@ mod log_model;
 mod log_view;
 mod menu_fit;
 mod menu_record;
+mod narrow_text;
 mod nav;
 mod notice;
 mod object;
@@ -105,7 +106,7 @@ use gpui_kit::*;
 use clusters::ClustersModel;
 use gpui_kit::component::input;
 use registry::{
-    About, AppearanceDark, AppearanceLight, AppearanceSystem, GoBack, Hide, HideOthers,
+    About, AppearanceDark, AppearanceLight, AppearanceSystem, GoBack, GoForward, Hide, HideOthers,
     MinimizeWindow, OpenHelp, OpenSettings, Quit, ShowAll, ToggleCommandPalette,
     ToggleResourceSwitcher, ZoomWindow,
 };
@@ -369,7 +370,7 @@ fn edit_menu() -> Menu {
     ])
 }
 
-/// View: Show Command Palette, Go to Resource, Go Back, and Appearance.
+/// View: Show Command Palette, Go to Resource, Go Back, Go Forward, and Appearance.
 fn view_menu(appearance: Appearance) -> Menu {
     Menu::new("View").items([
         MenuItem::action(
@@ -381,6 +382,7 @@ fn view_menu(appearance: Appearance) -> Menu {
             ToggleResourceSwitcher,
         ),
         MenuItem::action(registry::label::<GoBack>(), GoBack),
+        MenuItem::action(registry::label::<GoForward>(), GoForward),
         MenuItem::separator(),
         MenuItem::submenu(appearance_menu(appearance)),
     ])

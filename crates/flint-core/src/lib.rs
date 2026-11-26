@@ -5,6 +5,7 @@
 //! in [`cluster`] and [`read`] directly on their own tokio runtime.
 
 pub mod access;
+pub mod action_kinds;
 pub mod activity;
 pub mod alerts;
 pub mod api_error;

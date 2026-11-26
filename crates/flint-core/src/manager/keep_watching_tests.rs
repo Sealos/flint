@@ -3,11 +3,12 @@ use std::path::PathBuf;
 use super::*;
 use crate::auth_plugin::tests::{FakePlugin, live};
 use crate::connection::member::MemberState;
-use crate::handle::CoreConfig;
+use crate::handle::{AdmittedMember, CoreConfig};
 use crate::manager::keep_watching_lists::{WARM_KINDS, WARM_LIST_CLUSTERS};
 use crate::manager::{Changed, Cluster};
 use crate::protection::SessionUnlocks;
 use crate::read::KindId;
+use crate::settings::ClusterPin;
 use crate::settings::Settings;
 use crate::watch::HubRegistry;
 
@@ -349,7 +350,7 @@ async fn a_members_failed_credential_stops_keep_watching_too() {
     land_dev(&mut manager).await;
     let attempt = manager.cluster("dev").unwrap().attempt;
 
-    manager.member_credential_failed("dev", attempt);
+    manager.member_credential_failed("dev", attempt, super::super::running_set::consent_ended());
     manager.sync_keep_watching();
 
     assert!(matches!(
@@ -1249,4 +1250,389 @@ async fn a_kept_feed_failing_in_the_background_waits_for_a_sign_in() {
 
     assert_eq!(manager.keep_status("dev"), KeepWatching::SignInNeeded);
     assert!(!manager.keep.feeds.contains_key("dev"));
+}
+
+// One sign-in of a member, from the set view (`member_sign_in.rs`).
+
+/// A manager with `dev` signing in with `plugin`, `other` and `third` with nothing to run,
+/// `third` selected, and the set of `dev` and `other` open: `dev` waits for a sign-in, and
+/// `other`'s attempt has just started, so the next background one waits for the stagger.
+fn signed_out_set(plugin: &FakePlugin, config_dir: PathBuf) -> (ClusterManager, PathBuf) {
+    let (manager, path, _) = signed_out_members(plugin, config_dir);
+    (manager, path)
+}
+
+/// [`signed_out_set`], with `dev` and `other` as admitted.
+fn signed_out_members(
+    plugin: &FakePlugin,
+    config_dir: PathBuf,
+) -> (ClusterManager, PathBuf, Vec<AdmittedMember>) {
+    let more = "- name: other\n  context:\n    cluster: c\n    user: s\n\
+                - name: third\n  context:\n    cluster: c\n    user: s\n";
+    let (mut manager, path) = manager_on(plugin, config_dir, more);
+    manager.active = Some("third".to_owned());
+    manager.sync_roles();
+    let members = manager
+        .admit_running_set(vec![
+            ClusterPin::new("dev", "http://127.0.0.1:1"),
+            ClusterPin::new("other", "http://127.0.0.1:1"),
+        ])
+        .expect("both members are admitted");
+    assert!(matches!(
+        dev_state(&manager),
+        MemberState::SignInNeeded { .. }
+    ));
+    (manager, path, members)
+}
+
+/// `dev` as admitted to the open set, again: the same as when the set opened.
+fn dev_member(manager: &ClusterManager) -> AdmittedMember {
+    let pin = ClusterPin::new("dev", "http://127.0.0.1:1");
+    let at = manager.contexts.pin_through("dev", Some(&pin.server), None);
+    let endpoint = manager.contexts.shown("dev", Some(&pin.server)).endpoint;
+    AdmittedMember { pin, at, endpoint }
+}
+
+/// What `dev`'s Sign in click sends: the member and the definitions its view shows.
+fn click_sign_in(manager: &mut ClusterManager) -> Result<(), String> {
+    let view = manager.keep_watching_views()["dev"].clone();
+    let member = dev_member(manager);
+    manager.sign_in_member(&member, view.definition, view.shown_sign_in)
+}
+
+// The click runs the member's plugin once, with no input, and grants nothing more: no consent
+// is kept, the background sign-in stays off, and the connection may not run the plugin again.
+#[tokio::test]
+async fn a_signed_out_member_signs_in_once_from_the_set_view() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _) = signed_out_set(&plugin, config.path().to_owned());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(plugin.starts().is_empty(), "nothing runs before the click");
+
+    click_sign_in(&mut manager).expect("the member can sign in");
+    assert!(
+        manager.signing_in.contains_key("dev"),
+        "held for its attempt"
+    );
+    pump_later(&mut manager);
+    wait_for_a_start(&plugin).await;
+
+    assert!(
+        !manager.signing_in.contains_key("dev"),
+        "used by the attempt"
+    );
+    let slot = manager.cluster("dev").unwrap();
+    assert!(
+        !slot.access.unattended(),
+        "not a kept connection: a failure ends nothing kept"
+    );
+    assert!(
+        slot.access.takes_no_input(),
+        "its program can't prompt and gets a null stdin"
+    );
+    let again = slot.access.grant(CredentialSource::Plugin).lease();
+    assert!(again.launch_refusal().await.is_some(), "no second start");
+    assert!(!dev_may_run(&manager), "the access ended with it");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(plugin.starts().len(), 1);
+    assert!(!manager.keep.consents.contains_key("dev"), "nothing kept");
+    let view = &manager.keep_watching_views()["dev"];
+    assert_eq!(view.sign_in, BackgroundSignIn::Off);
+    assert_eq!(manager.keep_status("dev"), KeepWatching::Off);
+}
+
+// A click made on a view that no longer shows the definition is refused, and runs nothing.
+#[tokio::test]
+async fn a_stale_sign_in_click_is_refused() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _) = signed_out_set(&plugin, config.path().to_owned());
+    let view = manager.keep_watching_views()["dev"].clone();
+    let member = dev_member(&manager);
+    let shown = view.shown_sign_in.unwrap();
+    let definition = view.definition.unwrap();
+
+    let stale_plugin = manager.sign_in_member(&member, view.definition, Some(shown ^ 1));
+    let stale_definition = manager.sign_in_member(&member, Some(definition ^ 1), Some(shown));
+    let no_plugin = manager.sign_in_member(&member, view.definition, None);
+
+    for refused in [stale_plugin, stale_definition, no_plugin] {
+        assert!(refused.unwrap_err().contains("changed"));
+    }
+    assert!(manager.signing_in.is_empty());
+    pump_later(&mut manager);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(plugin.starts().is_empty());
+    assert!(matches!(
+        dev_state(&manager),
+        MemberState::SignInNeeded { .. }
+    ));
+}
+
+// A definition changed between the click and the attempt fails closed: the attempt runs nothing
+// and the member waits for a sign-in again.
+#[tokio::test]
+async fn a_change_before_the_attempt_runs_nothing() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _) = signed_out_set(&plugin, config.path().to_owned());
+    click_sign_in(&mut manager).unwrap();
+    assert!(
+        manager.cluster("dev").unwrap().connect_task.is_none(),
+        "the attempt waits for the stagger"
+    );
+
+    let slot = manager.cluster_mut("dev").unwrap();
+    slot.fingerprint = slot.fingerprint.map(|f| f ^ 1);
+    pump_later(&mut manager);
+
+    assert!(!manager.signing_in.contains_key("dev"));
+    assert!(!dev_may_run(&manager), "the attempt has no grant");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(plugin.starts().is_empty());
+}
+
+// The files are read again right before the plugin starts: an edit on disk the manager has not
+// loaded yet refuses the start.
+#[tokio::test]
+async fn an_edit_on_disk_refuses_the_start() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, path) = signed_out_set(&plugin, config.path().to_owned());
+    click_sign_in(&mut manager).unwrap();
+    let original = std::fs::read_to_string(&path).unwrap();
+    let edited = original.replace("user: u\n", "user: u\n    namespace: elsewhere\n");
+    assert_ne!(original, edited);
+    std::fs::write(&path, edited).unwrap();
+
+    pump_later(&mut manager);
+
+    assert!(!manager.signing_in.contains_key("dev"));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(plugin.starts().is_empty(), "the launch check refused it");
+}
+
+// Only a member waiting for a sign-in, not selected and still in the set, can be signed in, and
+// leaving the set forgets a sign-in not yet started.
+#[tokio::test]
+async fn only_a_signed_out_member_in_the_set_signs_in() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _, members) = signed_out_members(&plugin, config.path().to_owned());
+    let other = members[1].clone();
+    let view = manager.keep_watching_views()["other"].clone();
+    let refused = manager.sign_in_member(&other, view.definition, None);
+    assert!(
+        refused.unwrap_err().contains("not waiting"),
+        "other connects"
+    );
+
+    click_sign_in(&mut manager).unwrap();
+    assert!(click_sign_in(&mut manager).is_err(), "already connecting");
+    let member = dev_member(&manager);
+    manager.set_running_set(Vec::new());
+    assert!(manager.signing_in.is_empty(), "leaving forgets it");
+    let view = manager.keep_watching_views()["dev"].clone();
+    let gone = manager.sign_in_member(&member, view.definition, view.shown_sign_in);
+    assert!(gone.is_err(), "no longer a member");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(plugin.starts().is_empty());
+}
+
+/// Clicks `dev`'s Sign in and lands its attempt as connected.
+async fn signed_in_once(manager: &mut ClusterManager) {
+    click_sign_in(manager).unwrap();
+    pump_later(manager);
+    assert!(
+        manager
+            .cluster("dev")
+            .unwrap()
+            .access
+            .signed_in_once_access()
+    );
+    land_dev(manager).await;
+    assert_eq!(dev_state(manager), MemberState::Live);
+}
+
+// The click covers the background only: selecting the member connects it anew as the selected
+// cluster, and leaving the set drops a connection the click made.
+#[tokio::test]
+async fn a_signed_in_once_connection_stays_a_background_members() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _) = signed_out_set(&plugin, config.path().to_owned());
+    signed_in_once(&mut manager).await;
+
+    manager.activate("dev".to_owned());
+    let slot = manager.cluster("dev").unwrap();
+    assert!(
+        !slot.access.signed_in_once_access(),
+        "a selected cluster's own"
+    );
+    assert!(matches!(slot.state, ConnectionState::Connecting));
+
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _) = signed_out_set(&plugin, config.path().to_owned());
+    signed_in_once(&mut manager).await;
+    let once = manager
+        .cluster("dev")
+        .unwrap()
+        .access
+        .grant(CredentialSource::Plugin);
+    manager.set_running_set(Vec::new());
+    assert!(!once.allowed(), "ended with the membership");
+    let slot = manager.cluster("dev").unwrap();
+    assert!(matches!(slot.state, ConnectionState::Disconnected));
+}
+
+// A connection one click made stops its program while changed files are read, and a quit ends
+// it with the kept connections, so its program is killed before Flint exits.
+#[tokio::test]
+async fn a_signed_in_once_connection_pauses_for_a_file_change_and_ends_on_quit() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _) = signed_out_set(&plugin, config.path().to_owned());
+    signed_in_once(&mut manager).await;
+    let once = manager
+        .cluster("dev")
+        .unwrap()
+        .access
+        .grant(CredentialSource::Plugin);
+    assert!(once.allowed());
+
+    manager.suspend_kept_plugins();
+    assert!(!once.allowed(), "paused while the files are read");
+    manager.sync_keep_watching();
+    assert!(once.allowed(), "back once they are read");
+
+    manager.kept_grants().quit().await;
+    assert!(!once.allowed(), "a quit ends it");
+}
+
+// An attempt whose one sign-in was used up before it connected is no reason to retry: the member
+// waits for a sign-in, and nothing tries again.
+#[tokio::test]
+async fn a_sign_in_spent_while_connecting_asks_again_without_a_retry() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _) = signed_out_set(&plugin, config.path().to_owned());
+    click_sign_in(&mut manager).unwrap();
+    pump_later(&mut manager);
+    let slot = manager.cluster("dev").unwrap();
+    assert!(slot.access.signed_in_once_access());
+    let attempt = slot.attempt;
+    slot.access.revoke();
+
+    manager
+        .handle_internal(Internal::Connected {
+            cluster: "dev".into(),
+            attempt,
+            result: Err(cluster::SafeErrorText::reduced(
+                "its sign-in already ran once",
+            )),
+        })
+        .await;
+
+    assert!(
+        matches!(dev_state(&manager), MemberState::SignInNeeded { .. }),
+        "{:?}",
+        dev_state(&manager)
+    );
+    pump_later(&mut manager);
+    assert_eq!(manager.cluster("dev").unwrap().attempt, attempt, "no retry");
+}
+
+// A member slot held for a proxy change refuses a click, and a sign-in asked for before the
+// change does not start on it.
+#[tokio::test]
+async fn a_slot_held_for_a_proxy_change_refuses_a_sign_in() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _) = signed_out_set(&plugin, config.path().to_owned());
+    let behind = crate::connection::proxy::generation().wrapping_add(1);
+    manager.cluster_mut("dev").unwrap().proxy_generation = behind;
+
+    let refused = click_sign_in(&mut manager).unwrap_err();
+    assert!(refused.contains("proxy"), "{refused}");
+    assert!(manager.signing_in.is_empty(), "nothing held");
+
+    let current = crate::connection::proxy::generation();
+    manager.cluster_mut("dev").unwrap().proxy_generation = current;
+    click_sign_in(&mut manager).unwrap();
+    manager.cluster_mut("dev").unwrap().proxy_generation = behind;
+    pump_later(&mut manager);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(plugin.starts().is_empty(), "nothing ran on the held slot");
+    // Once the slot is replaced on the new setting, the sign-in asked for on the old route
+    // still holds nothing: the attempt checks the slot again before it takes it.
+    assert!(
+        manager
+            .take_member_sign_in("dev", Role::Background, 0)
+            .is_none()
+    );
+    assert!(
+        manager.signing_in.is_empty(),
+        "the sign-in was used up by the refusal"
+    );
+}
+
+// When the token is due, the refused second start reaches the manager: the member asks for a
+// sign-in again at once.
+#[tokio::test]
+async fn a_spent_sign_in_asks_again() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _) = signed_out_set(&plugin, config.path().to_owned());
+    signed_in_once(&mut manager).await;
+    let attempt = manager.cluster("dev").unwrap().attempt;
+
+    manager
+        .handle_internal(Internal::MemberSignInSpent {
+            cluster: "dev".into(),
+            attempt,
+        })
+        .await;
+
+    let MemberState::SignInNeeded { reason } = dev_state(&manager) else {
+        panic!("{:?}", dev_state(&manager));
+    };
+    assert!(reason.to_string().contains("sign in again"), "{reason}");
+    assert!(
+        click_sign_in(&mut manager).is_ok(),
+        "Sign in is offered again"
+    );
+}
+
+// A member with background sign-in consent whose sign-in failed signs in attended on a click,
+// rather than run unattended again, and its consent stays as it was.
+#[tokio::test]
+async fn a_consented_member_signs_in_attended_on_a_click() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _) = signed_out_set(&plugin, config.path().to_owned());
+    allow(&mut manager).await;
+    manager.sync_keep_watching();
+    assert!(matches!(
+        dev_state(&manager),
+        MemberState::SignInNeeded { .. }
+    ));
+
+    // Its kept feed stopped after a failure, as `stop_kept` leaves it.
+    let fingerprint = manager.cluster("dev").unwrap().fingerprint;
+    manager.keep.stopped.insert("dev".into(), fingerprint);
+    click_sign_in(&mut manager).unwrap();
+    pump_later(&mut manager);
+
+    assert!(
+        manager.keep.stopped.contains_key("dev"),
+        "a stopped background sign-in stays stopped"
+    );
+    let slot = manager.cluster("dev").unwrap();
+    assert!(slot.access.signed_in_once_access());
+    assert!(!slot.access.unattended());
+    assert!(
+        manager.keep.consents.contains_key("dev"),
+        "consent unchanged"
+    );
 }

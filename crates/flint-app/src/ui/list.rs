@@ -1143,13 +1143,27 @@ impl ResourceList {
         self.clear_selection(cx);
     }
 
-    /// Sorts by the drawn column `action` names, as a header click does, and reports the new
-    /// sort to remember.
-    fn toggle_sort(&mut self, action: &SortBy, cx: &mut Context<Self>) {
-        let Some(key) = self.sort_key(action) else {
+    /// Sets or cycles the sort for the drawn column and reports the new sort to remember.
+    fn toggle_sort(&mut self, action: &SortBy, descending: Option<bool>, cx: &mut Context<Self>) {
+        let Some(column) = self.sortable_column(action) else {
+            tracing::warn!(
+                column = action.key.as_deref().unwrap_or(&action.column),
+                "no sortable column is drawn"
+            );
             return;
         };
-        self.query.sort = list_model::next_sort(self.query.sort.as_ref(), &key);
+        let key = column.key();
+        self.query.sort = match descending {
+            Some(descending) => Some(SortSpec {
+                column: key,
+                descending,
+            }),
+            None => list_model::next_sort(
+                self.query.sort.as_ref(),
+                &key,
+                list_model::is_numeric(column),
+            ),
+        };
         cx.emit(ListEvent::SortChanged(self.query.sort.clone()));
         self.recompute(cx);
         cx.notify();
@@ -1231,6 +1245,20 @@ impl ResourceList {
                 name_min,
                 namespace_min,
                 rules,
+                |i| sort.is_some_and(|s| columns[i].key() == s.column),
+            );
+            let name_target = columns
+                .iter()
+                .position(|c| c.role == ColumnRole::Name)
+                .map_or(name_min, |name| {
+                    let wanted = self.widths.wanted(name, &columns[name]);
+                    width(wanted.min(list_model::NAME_COMFORT_CHARS))
+                });
+            list_model::shed_trailing(
+                &mut drawn,
+                columns,
+                room,
+                (name_target, namespace_min),
                 |i| sort.is_some_and(|s| columns[i].key() == s.column),
             );
             list_model::squeeze_identity(&mut drawn, columns, room, name_min, namespace_min);
@@ -2042,7 +2070,7 @@ fn state_chip(state: &SyncState, feed: Feed, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// What a signed-out member's chip says instead of its sync state. Clicking the chip signs in.
+/// What a signed-out member's chip says instead of its sync state. Clicking it signs in.
 fn sign_in_chip(theme: &Theme) -> AnyElement {
     h_flex()
         .id("sync-state")

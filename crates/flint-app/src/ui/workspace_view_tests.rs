@@ -165,8 +165,8 @@ async fn the_active_cluster_shows_reconnecting_until_a_watch_recovers(cx: &mut T
     }
 }
 
-// covers UP-04: a failed cluster's header has no namespace filter or watch mode (neither can
-// work), and Retry shows once, in the main area.
+// covers UP-04: a failed cluster's header disables its namespace filter and watch mode (neither
+// can work), and Retry shows once, in the main area.
 #[gpui_kit::test]
 async fn a_failed_cluster_offers_one_retry_and_no_dead_controls(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
@@ -195,8 +195,14 @@ async fn a_failed_cluster_offers_one_retry_and_no_dead_controls(cx: &mut TestApp
     let header = s.header.unwrap();
     assert_eq!(header.namespace_button, None);
     assert_eq!(header.watch_mode, None);
-    assert!(!shown(cx, &t, "namespace-filter-button"));
-    assert!(!shown(cx, &t, "watch-mode"));
+    for id in ["namespace-filter-button", "keep-watching", "watch-mode"] {
+        let off = cx
+            .update_window(t.window, |_, window, _| {
+                window.try_find(id).map(|b| b.disabled() == Some(true))
+            })
+            .unwrap();
+        assert_eq!(off, Some(true), "{id} stays in place, off");
+    }
     assert!(shown(cx, &t, "connection-retry"));
     assert!(!shown(cx, &t, "nav-retry"), "Retry shows twice");
 

@@ -2,7 +2,7 @@
 //! counts come from the telemetry feed the overview reads, so these tests read that feed.
 //!
 //! Not here, and why: the click-through to the filtered list and the tiles (the app's automation
-//! state does not expose the dashboard, so `ui/dashboard_tests.rs` covers them), the usage tiles
+//! state shows only the activity feed (UP-68), so `ui/dashboard_tests.rs` covers them), the usage tiles
 //! and thresholds of UP-66 and UP-67 (they need a metrics server and a clock, #129), the diagram
 //! of UP-62 to UP-64 and the cluster summary tool of UP-17 (not built, see docs/USER-PATHS.md).
 //! A short StatefulSet is left out too: it counts only after a hold-down that lasts a minute.
