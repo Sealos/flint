@@ -1476,7 +1476,12 @@ async fn a_row_menu_closes_when_its_row_goes(cx: &mut TestAppContext) {
     list.update(cx, |list, cx| {
         list.set_snapshot(pods(&[("demo", "api", 0)]), cx)
     });
-    cx.run_until_parked();
+    // The rows are recomputed off the main thread and the dismissal is deferred to the draw after
+    // that, so wait for the menu itself to go.
+    cx.wait_for(t.window, WAIT, |window, _| {
+        window.try_find("popup-menu").is_none()
+    })
+    .await;
     assert!(!menu_open(cx, &t));
     assert!(!menu_open(cx, &t), "it stays closed");
     assert_eq!(app_state(cx, &t).focus, Focus::List);
