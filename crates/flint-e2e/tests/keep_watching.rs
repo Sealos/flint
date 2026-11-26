@@ -612,6 +612,13 @@ async fn a_token_that_is_due_is_not_refreshed_for_discovery() {
     f.b.wait_for_watches(&Gvr::core("pods"), 1, WAIT)
         .await
         .unwrap();
+    // The feed's own first reads each take a new token, under the consent. Node metrics waits
+    // for the node list, up to 5 seconds, so it can come last; its next read is 15 seconds away.
+    f.b.wait_for_request(WAIT, |request| {
+        request.path == "/apis/metrics.k8s.io/v1beta1/nodes"
+    })
+    .await
+    .unwrap();
     let runs = runs_once_settled(&f).await;
     // Past discovery's first retries: each would need a new token.
     tokio::time::sleep(Duration::from_secs(4)).await;

@@ -26,6 +26,7 @@ fn kind() -> KindInfo {
         },
         singular: "deployment".into(),
         short_names: Vec::new(),
+        scale: Default::default(),
         namespaced: true,
         verbs: Vec::new(),
     }
@@ -269,6 +270,7 @@ fn secret_kind() -> KindInfo {
         short_names: Vec::new(),
         namespaced: true,
         verbs: Vec::new(),
+        scale: Default::default(),
     }
 }
 

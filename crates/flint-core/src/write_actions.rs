@@ -23,11 +23,12 @@ use kube::core::Status;
 use kube::{Client, Resource, ResourceExt as _};
 use serde_json::{Value, json};
 
+use crate::action_kinds::{self, ScalePaths};
 use crate::api_path::{self, PathError};
 use crate::cluster::ClusterError;
 use crate::gitops::{self, Identity, ManagedBy};
 use crate::protection::WriteRefusal;
-use crate::read::KindInfo;
+use crate::read::{KindId, KindInfo};
 use crate::redact;
 use crate::write::{
     RequestGate, ResourceChange, WriteError, WriteOutcome, WriteProposal, WriteTarget, read_live,
@@ -83,34 +84,21 @@ fn timed_out() -> String {
     )
 }
 
-fn is_scalable(kind: &ApiResource) -> bool {
-    match kind.group.as_str() {
-        "apps" => matches!(
-            kind.plural.as_str(),
-            "deployments" | "statefulsets" | "replicasets"
-        ),
-        "" => kind.plural == "replicationcontrollers",
-        _ => false,
-    }
-}
-
 fn is_restartable(kind: &ApiResource) -> bool {
-    kind.group == "apps"
-        && matches!(
-            kind.plural.as_str(),
-            "deployments" | "daemonsets" | "statefulsets"
-        )
+    action_kinds::restarts(&KindId::new(&kind.group, &kind.plural))
 }
 
 fn is_node(kind: &ApiResource) -> bool {
     kind.group.is_empty() && kind.plural == "nodes"
 }
 
-/// What `proposal` does to the live object, if its kind has that action.
+/// What `proposal` does to the live object, if its kind has that action. A scale reads its count
+/// at `scale`, the paths [`current_scale_paths`] read for it.
 pub(crate) fn review(
     kind: &KindInfo,
     live: &Value,
     proposal: WriteProposal,
+    scale: Option<&ScalePaths>,
 ) -> Result<ResourceChange, WriteError> {
     let resource = &kind.resource;
     let refuse = |action: &str| {
@@ -121,12 +109,19 @@ pub(crate) fn review(
     };
     match proposal {
         WriteProposal::Delete => Ok(ResourceChange::Delete),
-        WriteProposal::Scale { .. } if !is_scalable(resource) => refuse("scaled"),
         WriteProposal::Scale { to } => {
-            let from = live
-                .pointer("/spec/replicas")
-                .and_then(Value::as_u64)
-                .and_then(|replicas| u32::try_from(replicas).ok())
+            let Some(paths) = scale.filter(|_| kind.scale_paths().is_some()) else {
+                return refuse("scaled");
+            };
+            // The API's count is an `int32`: a larger one would be stored as another.
+            if i32::try_from(to).is_err() {
+                return Err(WriteError::Rejected(format!(
+                    "{to} replicas is more than Kubernetes can keep"
+                )));
+            }
+            // Where its `scale` subresource reads it: what the write tests.
+            let from = paths
+                .replicas(live)
                 .ok_or_else(|| WriteError::Failed("the object has no replica count".to_owned()))?;
             Ok(ResourceChange::Scale { from, to })
         }
@@ -168,6 +163,42 @@ pub(crate) struct Reviewed {
     pub(crate) spec: ReviewedSpec,
     /// Whether another `spec` than [`Self::spec`] makes this review stale.
     pub(crate) hold_spec: bool,
+    /// For a scale: where the count was read, which its definition must still say.
+    pub(crate) scale: Option<ScalePaths>,
+    /// For a restart: the pod template's `restartedAt` as reviewed (`Some(None)`: none). Another
+    /// one means a restart ran since, and this one would be a second.
+    pub(crate) restarted_at: Option<Option<String>>,
+}
+
+/// The `restartedAt` annotation of a workload's pod template.
+pub(crate) fn restarted_at(live: &Value) -> Option<String> {
+    live.pointer("/spec/template/metadata/annotations")
+        .and_then(|a| a.get(RESTARTED_AT))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The replica paths a scale of `kind` uses now, if discovery gave it Scale: a built-in kind's,
+/// and for a custom resource what its definition says when read again, whatever discovery read
+/// before. A definition that cannot be read refuses the scale.
+pub(crate) async fn current_scale_paths(
+    gate: &mut impl ActionGate,
+    kind: &KindInfo,
+) -> Result<ScalePaths, WriteError> {
+    let refuse = || WriteError::Rejected(format!("{} cannot be scaled", kind.plural()));
+    let known = kind.scale_paths().ok_or_else(refuse)?;
+    if action_kinds::scales_built_in(&kind.id()) {
+        return Ok(known);
+    }
+    let client = gate.client().await?;
+    match action_kinds::definition_scale_paths(&client, &kind.resource, REQUEST_TIMEOUT).await {
+        Ok(Some(read)) => Ok(read),
+        Ok(None) => Err(refuse()),
+        Err(_) => Err(WriteError::Failed(format!(
+            "the definition of {} could not be read to confirm where it keeps its replica count",
+            kind.plural()
+        ))),
+    }
 }
 
 /// A live object's `spec`. Never printed: it can hold environment values.
@@ -186,22 +217,27 @@ impl std::fmt::Debug for ReviewedSpec {
     }
 }
 
-/// What the review of `change` to the live object `live` must remember.
+/// What the review of `change` to the live object `live` must remember. A scale keeps `scale`,
+/// the paths its count was read at, which its write uses.
 pub(crate) async fn reviewed(
     gate: &mut impl ActionGate,
     name: &str,
     live: &Value,
     change: &ResourceChange,
+    scale: Option<ScalePaths>,
 ) -> Result<Reviewed, WriteError> {
     let pods = match drain_options(change) {
         Some(options) => managed_pods(gate, name, &options).await?,
         None => Vec::new(),
     };
+    let scale = scale.filter(|_| matches!(change, ResourceChange::Scale { .. }));
     Ok(Reviewed {
         managed: gitops::managed_by_live_object(live),
         pods,
         spec: ReviewedSpec::of(live),
         hold_spec: false,
+        scale,
+        restarted_at: (*change == ResourceChange::RolloutRestart).then(|| restarted_at(live)),
     })
 }
 
@@ -220,11 +256,9 @@ fn drain_options(change: &ResourceChange) -> Option<DrainOptions> {
     }
 }
 
-/// What a held write must still find: the version of the last read, and the pod template's
-/// metadata its patch builds on. Not `Debug`: annotations can hold anything.
+/// What a held write must still find: the version of the last read.
 struct Held {
     resource_version: String,
-    template_metadata: Option<Value>,
 }
 
 impl Held {
@@ -234,10 +268,7 @@ impl Held {
             .and_then(Value::as_str)
             .ok_or(WriteError::Conflict)?
             .to_owned();
-        Ok(Self {
-            resource_version,
-            template_metadata: live.pointer("/spec/template/metadata").cloned(),
-        })
+        Ok(Self { resource_version })
     }
 
     fn test(&self) -> Value {
@@ -256,16 +287,22 @@ struct PatchMode<'a> {
     held: Option<&'a Held>,
 }
 
+/// What a recheck read: the live object, and what a review holding it requires of the write.
+struct Rechecked {
+    live: Value,
+    held: Option<Held>,
+}
+
 /// Reads the live object once. Another uid or GitOps manager than the review saw, or a Deployment
-/// paused for a restart, is a conflict, and a failed read refuses the action. Returns what a
-/// review holding the object requires of the write that follows.
+/// paused for a restart, is a conflict, and a failed read refuses the action. Returns that read,
+/// and what a review holding the object requires of the write that follows.
 async fn recheck(
     gate: &mut impl ActionGate,
     kind: &KindInfo,
     target: &WriteTarget,
     change: &ResourceChange,
     reviewed: &Reviewed,
-) -> Result<Option<Held>, WriteError> {
+) -> Result<Rechecked, WriteError> {
     let client = gate.client().await?;
     let live = read_live(&client, kind, target).await?;
     let uid = live.pointer("/metadata/uid").and_then(Value::as_str);
@@ -281,11 +318,23 @@ async fn recheck(
         || gitops::managed_by_live_object(&live) != reviewed.managed
         || (paused && *change == ResourceChange::RolloutRestart)
         || (reviewed.hold_spec && ReviewedSpec::of(&live) != reviewed.spec)
+        || reviewed
+            .restarted_at
+            .as_ref()
+            .is_some_and(|at| *at != restarted_at(&live))
         || changed_before_delete
     {
         return Err(WriteError::Conflict);
     }
-    reviewed.hold_spec.then(|| Held::of(&live)).transpose()
+    if let ResourceChange::Scale { .. } = change {
+        // The write tests and sets the field reviewed; a definition that moved since is a
+        // conflict before it, too.
+        if Some(current_scale_paths(gate, kind).await?) != reviewed.scale {
+            return Err(WriteError::Conflict);
+        }
+    }
+    let held = reviewed.hold_spec.then(|| Held::of(&live)).transpose()?;
+    Ok(Rechecked { live, held })
 }
 
 /// The object `target` names, by the uid its review read.
@@ -311,16 +360,17 @@ pub(crate) async fn dry_run(
     reviewed: &Reviewed,
 ) -> Result<(), WriteError> {
     let object = action_object(kind, target)?;
-    let held = recheck(gate, kind, target, change, reviewed).await?;
+    let checked = recheck(gate, kind, target, change, reviewed).await?;
     let mode = PatchMode {
         dry_run: true,
-        held: held.as_ref(),
+        held: checked.held.as_ref(),
     };
     match change {
         ResourceChange::Scale { from, to } => {
-            send_scale(gate, &object, *from, *to, mode).await?;
+            let paths = reviewed.scale.as_ref();
+            send_scale(gate, kind, &object, paths, *from, *to, mode).await?;
         }
-        ResourceChange::RolloutRestart => send_restart(gate, &object, mode).await?,
+        ResourceChange::RolloutRestart => send_restart(gate, &object, &checked.live, mode).await?,
         ResourceChange::Delete => send_delete(gate, &object, mode).await?,
         _ => {
             return Err(WriteError::Rejected(
@@ -346,15 +396,18 @@ pub(crate) async fn run(
         resource_version: None,
         drain,
     };
-    let held = recheck(gate, kind, target, change, reviewed).await?;
+    let checked = recheck(gate, kind, target, change, reviewed).await?;
     let mode = PatchMode {
         dry_run: false,
-        held: held.as_ref(),
+        held: checked.held.as_ref(),
     };
     match change {
         ResourceChange::Delete => send_delete(gate, &object, mode).await?,
-        ResourceChange::Scale { from, to } => send_scale(gate, &object, *from, *to, mode).await?,
-        ResourceChange::RolloutRestart => send_restart(gate, &object, mode).await?,
+        ResourceChange::Scale { from, to } => {
+            let paths = reviewed.scale.as_ref();
+            send_scale(gate, kind, &object, paths, *from, *to, mode).await?;
+        }
+        ResourceChange::RolloutRestart => send_restart(gate, &object, &checked.live, mode).await?,
         ResourceChange::Cordon => set_cordoned(gate, &object, true).await?,
         ResourceChange::Uncordon => set_cordoned(gate, &object, false).await?,
         ResourceChange::Drain {
@@ -636,27 +689,38 @@ async fn send_delete(
 }
 
 /// Changes a workload's replicas from `from`, the count reviewed, to `to`. A JSON Patch tests the
-/// uid and the count, so another change to either is a conflict and a status update is not. It
-/// goes through the `scale` subresource, which is what a scale-only role may patch. That
-/// subresource omits `replicas` at zero, so a count of zero is tested as an empty `spec`. A `Scale`
-/// carries its workload's `resourceVersion`, so a held scale tests that too.
+/// uid and the count, so another change to either is a conflict and a status update is not. A
+/// held scale tests the version too.
+///
+/// A built-in kind goes through the `scale` subresource, which is what a scale-only role may
+/// patch. That subresource omits `replicas` at zero, so a count of zero is tested as an empty
+/// `spec`. A custom resource is patched itself, at `paths`, the field its review read: the
+/// `scale` subresource writes wherever the definition points when the request arrives, which
+/// may have moved since.
 async fn send_scale(
     gate: &mut impl ActionGate,
+    kind: &KindInfo,
     object: &ActionObject,
+    paths: Option<&ScalePaths>,
     from: u32,
     to: u32,
     mode: PatchMode<'_>,
 ) -> Result<(), ActionError> {
-    let resource = &object.resource;
-    if !is_scalable(resource) {
-        return Err(ActionError::Unsupported(format!(
-            "{} cannot be scaled",
-            resource.plural
-        )));
+    let unsupported =
+        || ActionError::Unsupported(format!("{} cannot be scaled", object.resource.plural));
+    if kind.scale_paths().is_none() || kind.resource != object.resource {
+        return Err(unsupported());
     }
     let mut operations =
         vec![json!({ "op": "test", "path": "/metadata/uid", "value": object.uid })];
     operations.extend(mode.held.map(Held::test));
+    if !action_kinds::scales_built_in(&kind.id()) {
+        let field = paths.ok_or_else(unsupported)?.spec_pointer().to_owned();
+        operations.push(json!({ "op": "test", "path": field, "value": from }));
+        operations.push(json!({ "op": "replace", "path": field, "value": to }));
+        let body = move || PatchBody::Json(Value::Array(operations));
+        return send_patch(gate, object, None, body, mode.dry_run).await;
+    }
     if from == 0 {
         operations.push(json!({ "op": "test", "path": "/spec", "value": {} }));
         operations.push(json!({ "op": "add", "path": "/spec/replicas", "value": to }));
@@ -683,10 +747,13 @@ fn is_failed_patch_test(error: &kube::Error) -> bool {
 }
 
 /// Restarts a Deployment's, DaemonSet's or StatefulSet's pods, as `kubectl rollout restart`. A
-/// held restart is a JSON Patch, whose test of the version applies to the object it changes.
+/// JSON Patch that tests the pod template's annotations are still the ones of `live`, the read
+/// that found its `restartedAt` as reviewed, so a restart that ran since is a conflict. A held
+/// restart tests the version too.
 async fn send_restart(
     gate: &mut impl ActionGate,
     object: &ActionObject,
+    live: &Value,
     mode: PatchMode<'_>,
 ) -> Result<(), ActionError> {
     let resource = &object.resource;
@@ -696,45 +763,45 @@ async fn send_restart(
             resource.plural
         )));
     }
+    // Every workload with Rollout Restart has template metadata: its labels match its selector.
+    let Some(metadata) = live.pointer("/spec/template/metadata").cloned() else {
+        return Err(ActionError::Unsupported(
+            "the pod template has no metadata to restart it by".to_owned(),
+        ));
+    };
+    // Stamped once the gate has answered, not before a slow check.
     let body = || {
         let now = jiff::Timestamp::now().to_string();
-        match mode.held {
-            Some(held) => PatchBody::Json(held_restart(&object.uid, held, &now)),
-            None => PatchBody::Merge(json!({
-                "metadata": { "uid": object.uid },
-                "spec": { "template": { "metadata": { "annotations": { RESTARTED_AT: now } } } },
-            })),
-        }
+        PatchBody::Json(restart_patch(&object.uid, mode.held, &metadata, &now))
     };
     send_patch(gate, object, None, body, mode.dry_run).await
 }
 
-/// The JSON Patch of a held restart. The version test makes the annotations it writes back the
-/// ones it read.
-fn held_restart(uid: &str, held: &Held, now: &str) -> Value {
-    let (path, value) = match &held.template_metadata {
-        Some(metadata) => {
-            let mut annotations = metadata
-                .get("annotations")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
+/// The JSON Patch of a restart of a pod template whose metadata is `metadata`. It tests the
+/// annotations it read, or their absence by the metadata they would be in, and writes them back
+/// with `restartedAt` at `now`.
+fn restart_patch(uid: &str, held: Option<&Held>, metadata: &Value, now: &str) -> Value {
+    let mut operations = vec![json!({ "op": "test", "path": "/metadata/uid", "value": uid })];
+    operations.extend(held.map(Held::test));
+    match metadata.get("annotations").and_then(Value::as_object) {
+        Some(read) => {
+            let mut annotations = read.clone();
             annotations.insert(RESTARTED_AT.to_owned(), now.into());
-            (
-                "/spec/template/metadata/annotations",
-                Value::Object(annotations),
-            )
+            let path = "/spec/template/metadata/annotations";
+            operations.push(json!({ "op": "test", "path": path, "value": read }));
+            operations.push(json!({ "op": "add", "path": path, "value": annotations }));
         }
-        None => (
-            "/spec/template/metadata",
-            json!({ "annotations": { RESTARTED_AT: now } }),
-        ),
-    };
-    json!([
-        { "op": "test", "path": "/metadata/uid", "value": uid },
-        held.test(),
-        { "op": "add", "path": path, "value": value },
-    ])
+        None => {
+            let path = "/spec/template/metadata";
+            operations.push(json!({ "op": "test", "path": path, "value": metadata }));
+            operations.push(json!({
+                "op": "add",
+                "path": format!("{path}/annotations"),
+                "value": { RESTARTED_AT: now },
+            }));
+        }
+    }
+    Value::Array(operations)
 }
 
 /// Marks a node unschedulable, or schedulable again.
@@ -1331,14 +1398,36 @@ mod tests {
         from: u32,
         to: u32,
     ) -> Result<(), ActionError> {
-        send_scale(gate, object, from, to, PatchMode::default()).await
+        let kind = kind_info(object.resource.clone());
+        let paths = kind.scale_paths();
+        send_scale(
+            gate,
+            &kind,
+            object,
+            paths.as_ref(),
+            from,
+            to,
+            PatchMode::default(),
+        )
+        .await
     }
 
+    /// A restart of a workload whose pod template has no annotations yet.
     async fn rollout_restart(
         gate: &mut impl ActionGate,
         object: &ActionObject,
     ) -> Result<(), ActionError> {
-        send_restart(gate, object, PatchMode::default()).await
+        let live = json!({"spec": {"template": {"metadata": {"labels": {"app": "web"}}}}});
+        send_restart(gate, object, &live, PatchMode::default()).await
+    }
+
+    /// [`super::review`] with the paths discovery read for a scale.
+    fn review(
+        kind: &KindInfo,
+        live: &Value,
+        proposal: WriteProposal,
+    ) -> Result<ResourceChange, WriteError> {
+        super::review(kind, live, proposal, kind.scale_paths().as_ref())
     }
 
     /// A request the fake API server saw.
@@ -1467,6 +1556,8 @@ mod tests {
             ("Scale", "uid-web")
         } else if seen.path.contains("/nodes/") {
             ("Node", "uid-node")
+        } else if seen.path.contains("/widgets/") {
+            ("Widget", "uid-web")
         } else {
             ("Deployment", "uid-web")
         };
@@ -1502,6 +1593,7 @@ mod tests {
             verbs: Vec::new(),
             singular: String::new(),
             short_names: Vec::new(),
+            scale: Default::default(),
         }
     }
 
@@ -1515,6 +1607,11 @@ mod tests {
             review(&deployments, &live, WriteProposal::Scale { to: 5 }),
             Ok(ResourceChange::Scale { from: 2, to: 5 })
         );
+        let too_many = i32::MAX as u32 + 1;
+        assert!(matches!(
+            review(&deployments, &live, WriteProposal::Scale { to: too_many }),
+            Err(WriteError::Rejected(_))
+        ));
         assert!(matches!(
             review(
                 &deployments,
@@ -1550,6 +1647,43 @@ mod tests {
             review(&deployments, &live, WriteProposal::Delete),
             Ok(ResourceChange::Delete)
         );
+    }
+
+    // covers UP-53: a custom resource is scaled from the count at its definition's path, and
+    // only once that path is known.
+    #[test]
+    fn a_custom_resource_review_reads_its_own_replica_path() {
+        use crate::action_kinds::{ScalePaths, ScaleSubresource};
+        let unread = KindInfo {
+            scale: ScaleSubresource::Unread,
+            ..kind_info(resource("example.dev", "v1", "Widget", "widgets"))
+        };
+        let paths = ScalePaths::from_crd(".spec.size", ".status.size").unwrap();
+        let widgets = KindInfo {
+            scale: ScaleSubresource::Paths(paths),
+            ..unread.clone()
+        };
+        let live = json!({"spec": {"size": 4, "replicas": 9}});
+        assert_eq!(
+            review(&widgets, &live, WriteProposal::Scale { to: 1 }),
+            Ok(ResourceChange::Scale { from: 4, to: 1 })
+        );
+        assert!(matches!(
+            review(
+                &widgets,
+                &json!({"spec": {"replicas": 9}}),
+                WriteProposal::Scale { to: 1 }
+            ),
+            Err(WriteError::Failed(_))
+        ));
+        assert!(matches!(
+            review(&unread, &live, WriteProposal::Scale { to: 1 }),
+            Err(WriteError::Rejected(_))
+        ));
+        assert!(matches!(
+            review(&widgets, &live, WriteProposal::RolloutRestart),
+            Err(WriteError::Rejected(_))
+        ));
     }
 
     // covers UP-53: delete names the reviewed object by uid.
@@ -1729,6 +1863,50 @@ mod tests {
         );
     }
 
+    // covers UP-53: a custom resource is patched itself, at the field its review read, and not
+    // at all while its replica paths are not known.
+    #[tokio::test]
+    async fn a_custom_resource_is_scaled_at_its_reviewed_field() {
+        use crate::action_kinds::{ScalePaths, ScaleSubresource};
+        let (client, log) = fake(Arc::new(ok));
+        let mut gate = writes(client, open());
+        let widget = ActionObject {
+            resource: resource("example.dev", "v1", "Widget", "widgets"),
+            ..deployment()
+        };
+        let unread = KindInfo {
+            scale: ScaleSubresource::Unread,
+            ..kind_info(widget.resource.clone())
+        };
+        let paths = ScalePaths::from_crd(".spec.size", ".status.size").unwrap();
+        let mode = PatchMode::default();
+        let result = send_scale(&mut gate, &unread, &widget, Some(&paths), 2, 3, mode).await;
+        assert!(matches!(result, Err(ActionError::Unsupported(_))));
+        let widgets = KindInfo {
+            scale: ScaleSubresource::Paths(paths.clone()),
+            ..unread
+        };
+        let result = send_scale(&mut gate, &widgets, &widget, None, 2, 3, mode).await;
+        assert!(matches!(result, Err(ActionError::Unsupported(_))));
+        assert!(log.lock().unwrap().is_empty());
+        send_scale(&mut gate, &widgets, &widget, Some(&paths), 2, 3, mode)
+            .await
+            .unwrap();
+        let seen = log.lock().unwrap();
+        assert_eq!(
+            seen[0].path,
+            "/apis/example.dev/v1/namespaces/demo/widgets/web"
+        );
+        assert_eq!(
+            seen[0].body,
+            json!([
+                {"op": "test", "path": "/metadata/uid", "value": "uid-web"},
+                {"op": "test", "path": "/spec/size", "value": 2},
+                {"op": "replace", "path": "/spec/size", "value": 3},
+            ])
+        );
+    }
+
     // covers UP-53: the scale subresource omits a count of zero, so that is an empty spec.
     #[tokio::test]
     async fn scale_from_zero_tests_an_empty_spec() {
@@ -1767,12 +1945,214 @@ mod tests {
         })
     }
 
+    // covers UP-53: a restart reviewed before another restart ran is a conflict, and sends no
+    // patch; a status update does not change the mark.
+    #[tokio::test]
+    async fn a_restart_after_another_restart_is_a_conflict() {
+        let mut live = held_live();
+        live["spec"]["template"]["metadata"]["annotations"][RESTARTED_AT] = json!("t1");
+        let reviewed = Reviewed {
+            restarted_at: Some(restarted_at(&live)),
+            ..Default::default()
+        };
+        let run_on = |live: Value| {
+            let reviewed = reviewed.clone();
+            async move {
+                let reply: Reply = Arc::new(move |seen| {
+                    if seen.method == "GET" {
+                        (200, live.clone())
+                    } else {
+                        ok(seen)
+                    }
+                });
+                let (client, log) = fake(reply);
+                let kind = kind_info(resource("apps", "v1", "Deployment", "deployments"));
+                let target = held_target();
+                let change = ResourceChange::RolloutRestart;
+                let result = run(
+                    &mut writes(client, open()),
+                    &kind,
+                    &target,
+                    &change,
+                    &reviewed,
+                    None,
+                )
+                .await
+                .map(drop);
+                let patches = log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| s.method == "PATCH")
+                    .count();
+                (result, patches)
+            }
+        };
+        let mut status = live.clone();
+        status["status"] = json!({"observedGeneration": 3});
+        assert_eq!(run_on(status).await, (Ok(()), 1));
+        let mut restarted = live.clone();
+        restarted["spec"]["template"]["metadata"]["annotations"][RESTARTED_AT] = json!("t2");
+        assert_eq!(run_on(restarted).await, (Err(WriteError::Conflict), 0));
+    }
+
+    // covers UP-53: a custom resource's scale reads its definition again before the patch: other
+    // replica paths are a conflict, and a definition that cannot be read refuses it.
+    #[tokio::test]
+    async fn a_custom_scale_is_bound_to_the_reviewed_replica_paths() {
+        use crate::action_kinds::ScaleSubresource;
+        let reviewed_paths = ScalePaths::from_crd(".spec.size", ".status.size").unwrap();
+        let kind = KindInfo {
+            scale: ScaleSubresource::Paths(reviewed_paths.clone()),
+            ..kind_info(resource("example.dev", "v1", "Widget", "widgets"))
+        };
+        let reviewed = Reviewed {
+            scale: Some(reviewed_paths),
+            ..Default::default()
+        };
+        let crd = |path: &str| {
+            json!({"apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+                   "metadata": {"name": "widgets.example.dev"},
+                   "spec": {"group": "example.dev", "names": {"plural": "widgets"},
+                            "versions": [{"name": "v1", "served": true, "subresources": {"scale":
+                                {"specReplicasPath": path, "statusReplicasPath": ".status.size"}}}]}})
+        };
+        let run_with = |definition: Option<Value>| {
+            let (kind, reviewed) = (kind.clone(), reviewed.clone());
+            async move {
+                let reply: Reply = Arc::new(move |seen| {
+                    if seen.method != "GET" {
+                        return ok(seen);
+                    }
+                    if seen.path.contains("customresourcedefinitions") {
+                        return match &definition {
+                            Some(crd) => (200, crd.clone()),
+                            None => (403, status(403, "Forbidden")),
+                        };
+                    }
+                    (
+                        200,
+                        json!({"apiVersion": "example.dev/v1", "kind": "Widget",
+                               "metadata": {"name": "web", "namespace": "demo", "uid": "uid-web"},
+                               "spec": {"size": 2, "other": 2}}),
+                    )
+                });
+                let (client, log) = fake(reply);
+                let change = ResourceChange::Scale { from: 2, to: 3 };
+                let result = run(
+                    &mut writes(client, open()),
+                    &kind,
+                    &held_target(),
+                    &change,
+                    &reviewed,
+                    None,
+                )
+                .await
+                .map(drop);
+                let patches: Vec<String> = log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| s.method == "PATCH")
+                    .map(|s| s.path.clone())
+                    .collect();
+                (result, patches)
+            }
+        };
+        let (result, patches) = run_with(Some(crd(".spec.size"))).await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            patches,
+            ["/apis/example.dev/v1/namespaces/demo/widgets/web"]
+        );
+        let (result, patches) = run_with(Some(crd(".spec.other"))).await;
+        assert_eq!((result, patches.len()), (Err(WriteError::Conflict), 0));
+        let (result, patches) = run_with(None).await;
+        assert!(matches!(result, Err(WriteError::Failed(_))), "{result:?}");
+        assert!(patches.is_empty());
+    }
+
+    // covers UP-53: a definition that moves the replica field after the recheck read it does not
+    // move the write: the patch tests and sets the field reviewed, on the object itself, so the
+    // server applies it there or refuses it.
+    #[tokio::test]
+    async fn a_custom_scale_writes_the_reviewed_field_after_the_definition_moves() {
+        use crate::action_kinds::ScaleSubresource;
+        let reviewed_paths = ScalePaths::from_crd(".spec.size", ".status.size").unwrap();
+        let kind = KindInfo {
+            scale: ScaleSubresource::Paths(reviewed_paths.clone()),
+            ..kind_info(resource("example.dev", "v1", "Widget", "widgets"))
+        };
+        let reviewed = Reviewed {
+            scale: Some(reviewed_paths),
+            ..Default::default()
+        };
+        let definition_reads = Arc::new(AtomicUsize::new(0));
+        let reads = definition_reads.clone();
+        let reply: Reply = Arc::new(move |seen| {
+            if seen.method != "GET" {
+                return ok(seen);
+            }
+            if seen.path.contains("customresourcedefinitions") {
+                // The recheck's read sees the reviewed path; any later one, another.
+                let path = match reads.fetch_add(1, Ordering::SeqCst) {
+                    0 => ".spec.size",
+                    _ => ".spec.other",
+                };
+                return (
+                    200,
+                    json!({"apiVersion": "apiextensions.k8s.io/v1",
+                           "kind": "CustomResourceDefinition",
+                           "metadata": {"name": "widgets.example.dev"},
+                           "spec": {"group": "example.dev", "names": {"plural": "widgets"},
+                                    "versions": [{"name": "v1", "served": true,
+                                        "subresources": {"scale": {"specReplicasPath": path,
+                                            "statusReplicasPath": ".status.size"}}}]}}),
+                );
+            }
+            (
+                200,
+                json!({"apiVersion": "example.dev/v1", "kind": "Widget",
+                       "metadata": {"name": "web", "namespace": "demo", "uid": "uid-web"},
+                       "spec": {"size": 2, "other": 2}}),
+            )
+        });
+        let (client, log) = fake(reply);
+        let change = ResourceChange::Scale { from: 2, to: 3 };
+        run(
+            &mut writes(client, open()),
+            &kind,
+            &held_target(),
+            &change,
+            &reviewed,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(definition_reads.load(Ordering::SeqCst), 1);
+        let seen = log.lock().unwrap();
+        let patch = seen.iter().find(|s| s.method == "PATCH").unwrap();
+        assert_eq!(
+            patch.path,
+            "/apis/example.dev/v1/namespaces/demo/widgets/web"
+        );
+        assert_eq!(
+            patch.body,
+            json!([
+                {"op": "test", "path": "/metadata/uid", "value": "uid-web"},
+                {"op": "test", "path": "/spec/size", "value": 2},
+                {"op": "replace", "path": "/spec/size", "value": 3},
+            ])
+        );
+    }
+
     /// The PATCH a dry run of `change` sends, with the object at [`held_live`].
     async fn dry_run_patch(change: ResourceChange) -> Seen {
         let live = held_live();
         let reviewed = Reviewed {
             spec: ReviewedSpec::of(&live),
             hold_spec: true,
+            scale: matches!(change, ResourceChange::Scale { .. }).then(ScalePaths::built_in),
             ..Default::default()
         };
         let reply: Reply = Arc::new(move |seen| {
@@ -1833,9 +2213,28 @@ mod tests {
                 json!({"op": "test", "path": "/metadata/resourceVersion", "value": "42"}),
             ]
         );
-        assert_eq!(operations[2]["path"], "/spec/template/metadata/annotations");
-        assert_eq!(operations[2]["value"]["keep"], "me");
-        assert!(operations[2]["value"][RESTARTED_AT].is_string());
+        let annotations = "/spec/template/metadata/annotations";
+        assert_eq!(
+            operations[2],
+            json!({"op": "test", "path": annotations, "value": {"keep": "me"}})
+        );
+        assert_eq!(operations[3]["op"], "add");
+        assert_eq!(operations[3]["path"], annotations);
+        assert_eq!(operations[3]["value"]["keep"], "me");
+        assert!(operations[3]["value"][RESTARTED_AT].is_string());
+    }
+
+    /// The `restartedAt` a restart's JSON Patch writes.
+    fn restart_stamp(body: &Value) -> Option<&str> {
+        let added = body.as_array()?.iter().find(|op| op["op"] == "add")?;
+        added["value"]
+            .get(RESTARTED_AT)
+            .or_else(|| {
+                added
+                    .pointer("/value/annotations")
+                    .and_then(|a| a.get(RESTARTED_AT))
+            })?
+            .as_str()
     }
 
     // covers UP-53: a name or namespace that is not one path segment reaches no PATCH.
@@ -1941,6 +2340,27 @@ mod tests {
         }
     }
 
+    // covers UP-53: a restart tests the `restartedAt` its recheck read, so one that ran in
+    // between is a conflict at the server, not a second restart.
+    #[tokio::test]
+    async fn a_restart_tests_the_restart_it_read() {
+        let (client, log) = fake(Arc::new(ok));
+        let mut gated = writes(client, open());
+        let live = json!({"spec": {"template": {"metadata": {
+            "annotations": {RESTARTED_AT: "t1"},
+        }}}});
+        send_restart(&mut gated, &deployment(), &live, PatchMode::default())
+            .await
+            .unwrap();
+        let seen = log.lock().unwrap();
+        assert_eq!(
+            seen[0].body[1],
+            json!({"op": "test", "path": "/spec/template/metadata/annotations",
+                   "value": {RESTARTED_AT: "t1"}})
+        );
+        assert_ne!(restart_stamp(&seen[0].body), Some("t1"));
+    }
+
     // covers UP-53: a restart is stamped once the gate has answered, not before a slow check.
     #[tokio::test]
     async fn a_restart_is_stamped_after_the_gate() {
@@ -1953,12 +2373,7 @@ mod tests {
         rollout_restart(&mut gate, &deployment()).await.unwrap();
         let answered = answered.lock().unwrap().expect("the gate was asked");
         let seen = log.lock().unwrap();
-        let stamp: jiff::Timestamp = seen[0].body["spec"]["template"]["metadata"]["annotations"]
-            [RESTARTED_AT]
-            .as_str()
-            .unwrap()
-            .parse()
-            .unwrap();
+        let stamp: jiff::Timestamp = restart_stamp(&seen[0].body).unwrap().parse().unwrap();
         assert!(stamp >= answered, "{stamp} is before {answered}");
     }
 
@@ -2023,11 +2438,18 @@ mod tests {
                 seen[0].path,
                 "/apis/apps/v1/namespaces/demo/deployments/web"
             );
-            assert_eq!(seen[0].body["metadata"]["uid"], "uid-web");
-            assert!(
-                seen[0].body["spec"]["template"]["metadata"]["annotations"][RESTARTED_AT]
-                    .is_string()
+            let operations = seen[0].body.as_array().expect("a JSON Patch");
+            assert_eq!(
+                operations[..2],
+                [
+                    json!({"op": "test", "path": "/metadata/uid", "value": "uid-web"}),
+                    // No annotations yet: tested by the metadata they would be in.
+                    json!({"op": "test", "path": "/spec/template/metadata",
+                           "value": {"labels": {"app": "web"}}}),
+                ]
             );
+            assert_eq!(operations[2]["path"], "/spec/template/metadata/annotations");
+            assert!(restart_stamp(&seen[0].body).is_some());
         }
         let pod = ActionObject {
             resource: resource("", "v1", "Pod", "pods"),

@@ -49,6 +49,7 @@ mod log_model;
 mod log_view;
 mod menu_fit;
 mod menu_record;
+mod narrow_text;
 mod nav;
 mod notice;
 mod object;

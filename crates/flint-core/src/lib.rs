@@ -5,6 +5,7 @@
 //! in [`cluster`] and [`read`] directly on their own tokio runtime.
 
 pub mod access;
+pub mod action_kinds;
 pub mod activity;
 pub mod alerts;
 pub mod api_error;
@@ -71,8 +72,8 @@ pub use exec::{
 };
 pub use handle::{
     ClusterSummary, ClustersSnapshot, Command, ConnectionProgress, ConnectionState, CoreConfig,
-    CoreHandle, Event, LogSession, LogUpdates, OverviewInterest, ReloadError, SlotBinding,
-    Subscription, WatchTiming,
+    CoreHandle, Event, LogSession, LogUpdates, OverviewInterest, PROXY_REPORT_AFTER, ProxyApplied,
+    ProxyReconnectReport, ReloadError, SlotBinding, Subscription, WatchTiming,
 };
 pub use logs::{
     FilterSpec, Freshness, LineFormat, LineId, LineSelection, LineSource, LogFilter, LogLine,

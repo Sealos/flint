@@ -341,6 +341,7 @@ async fn a_dropped_watch_says_the_connection_dropped() {
         verbs: Vec::new(),
         singular: String::new(),
         short_names: Vec::new(),
+        scale: Default::default(),
     };
     let mut events = source
         .watch(

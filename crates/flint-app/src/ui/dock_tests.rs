@@ -11,7 +11,7 @@ use flint_core::terminal::TerminalSize;
 use flint_core::{CoreConfig, CoreHandle, ExecState, LogSubject, LogTarget, Settings};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::input::InputState;
-use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
+use gpui_kit::test::{TestAppContextExt as _, TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{
     AnyWindowHandle, AppContext as _, Bounds, Entity, Point, TestAppContext, WeakEntity,
     WindowBounds, WindowOptions, px, size,
@@ -1002,4 +1002,23 @@ async fn longer_chips_keep_the_active_tab_in_view(cx: &mut TestAppContext) {
     draw(cx, window);
     assert_eq!(shell_chip(&dock, last, cx).0, "core · p1");
     assert!(tab_in_view(cx, window, last));
+}
+
+// covers #782: an icon-only button has no visible label, so its name is set on it.
+#[gpui_kit::test]
+async fn the_dock_icon_buttons_report_their_names(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, dock) = open_dock(cx);
+    let _logs = open_logs(cx, window, &dock, &core);
+    let (_shell, _fake) = open_shell(cx, window, &dock);
+    draw(cx, window);
+    cx.update_window(window, |_, window, _| {
+        for label in ["All tabs", "Hide the dock", "Copy the selection"] {
+            assert!(
+                window.try_find_by_label(label).is_some(),
+                "no control is named {label:?}"
+            );
+        }
+    })
+    .unwrap();
 }
