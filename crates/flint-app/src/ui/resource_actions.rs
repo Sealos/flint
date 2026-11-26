@@ -26,9 +26,8 @@ use flint_core::write::{
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::InputState;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, Theme, v_flex};
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::confirm::{self, DialogText, ObjectGuard};
@@ -40,6 +39,7 @@ use super::registry::{
     ScaleObject, ShowDrainReport, ToggleDrainOption, UncordonNode,
 };
 use super::row_menu::Availability;
+use super::validated_field::ValidatedField;
 use super::workspace::Workspace;
 use super::write_binding::{ConnectionGuard, connection_changed_text};
 use super::write_confirm;
@@ -1035,30 +1035,12 @@ fn scale_dialog(target: &WriteTarget, current: Option<u32>) -> DialogText {
     }
 }
 
-/// The replica count field under the scale dialog's text.
-pub(in crate::ui) struct ScaleField {
-    pub(in crate::ui) input: Entity<InputState>,
-    pub(in crate::ui) error: Option<String>,
-}
-
-impl Render for ScaleField {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let danger = cx.theme().danger;
-        v_flex()
-            .gap_1()
-            .child(Input::new(&self.input).id("scale-input").small())
-            .when_some(self.error.clone(), |el, error| {
-                el.child(
-                    div()
-                        .id("scale-error")
-                        .aria_label(error.clone())
-                        .text_xs()
-                        .text_color(danger)
-                        .child(error)
-                        .test_support(),
-                )
-            })
-    }
+/// The replica count field under a scale dialog's text.
+pub(in crate::ui) fn scale_field(
+    input: Entity<InputState>,
+    cx: &mut App,
+) -> Entity<ValidatedField> {
+    ValidatedField::new(input, "scale-input", "scale-error", cx)
 }
 
 fn open_scale(
@@ -1077,27 +1059,17 @@ fn open_scale(
             .placeholder("Replicas")
             .default_value(current.map_or(String::new(), |n| n.to_string()))
     });
-    let field = cx.new(|_| ScaleField {
-        input: input.clone(),
-        error: None,
-    });
+    let field = scale_field(input, cx);
     let text = scale_dialog(&target, current);
     let this = cx.weak_entity();
+    let focused = field.clone();
     let content = field.clone().into();
     let pinned = write_confirm::target_lines(&target).len();
     let held = guard.clone();
     let on_ok = move |window: &mut Window, cx: &mut App| {
         let guard = held.clone();
-        let typed = field.read(cx).input.read(cx).value().to_string();
-        let to = match parse_replicas(&typed) {
-            Ok(to) => to,
-            Err(error) => {
-                field.update(cx, |f, cx| {
-                    f.error = Some(error);
-                    cx.notify();
-                });
-                return false;
-            }
+        let Some(to) = ValidatedField::checked(&field, cx, |typed, _| parse_replicas(typed)) else {
+            return false;
         };
         let request = Request {
             core: core.clone(),
@@ -1110,7 +1082,7 @@ fn open_scale(
         true
     };
     confirm::open_pinned_guarded(window, cx, text, pinned, Some(content), guard, on_ok);
-    input.update(cx, |input, cx| input.focus(window, cx));
+    ValidatedField::focus(&focused, window, cx);
 }
 
 fn drain_dialog(target: &WriteTarget) -> DialogText {

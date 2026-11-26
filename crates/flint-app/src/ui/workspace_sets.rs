@@ -30,8 +30,7 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Theme,
-    h_flex, v_flex,
+    Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Theme, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -52,6 +51,7 @@ use super::super::set_members::{
     self, MemberAction, MemberCause, MemberLine, MemberSignIn, SignInTarget, failed_cause,
     paused_text, refusal_cause,
 };
+use super::super::validated_field::ValidatedField;
 #[cfg(any(test, feature = "automation"))]
 use super::super::view_state::{ClusterSetsState, OpenSetState, SetGroupState, SetMemberState};
 #[cfg(any(test, feature = "automation"))]
@@ -283,32 +283,6 @@ struct PendingOpen {
 struct SavedOpening {
     name: String,
     id: String,
-}
-
-/// The name field of the Rename Cluster Set dialog.
-struct SetNameField {
-    input: Entity<InputState>,
-    error: Option<String>,
-}
-
-impl Render for SetNameField {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let danger = cx.theme().danger;
-        v_flex()
-            .gap_1()
-            .child(Input::new(&self.input).id("rename-set-input").small())
-            .when_some(self.error.clone(), |el, error| {
-                el.child(
-                    div()
-                        .id("rename-set-error")
-                        .aria_label(error.clone())
-                        .text_xs()
-                        .text_color(danger)
-                        .child(error)
-                        .test_support(),
-                )
-            })
-    }
 }
 
 /// Whether a click on a cluster row chooses it rather than connecting to it.
@@ -622,10 +596,8 @@ impl Workspace {
         };
         let name = action.name.clone();
         let input = cx.new(|cx| InputState::new(window, cx).default_value(name.clone()));
-        let field = cx.new(|_| SetNameField {
-            input: input.clone(),
-            error: None,
-        });
+        let field = ValidatedField::new(input, "rename-set-input", "rename-set-error", cx);
+        let focused = field.clone();
         let dialog = DialogText {
             title: format!("Rename {name}"),
             text: "A new name for this saved set. Its clusters stay the same.".to_owned(),
@@ -637,24 +609,25 @@ impl Workspace {
         let view = cx.weak_entity();
         let content = field.clone().into();
         confirm::open_with(window, cx, dialog, Some(content), move |window, cx| {
-            let typed = field.read(cx).input.read(cx).value().trim().to_owned();
-            let Ok(problem) =
-                view.read_with(cx, |ws, _| rename_problem(&ws.sets.saved, &id, &typed))
-            else {
-                return true;
+            // `Some(None)`: the workspace is gone, and the dialog just closes.
+            let checked = ValidatedField::checked(&field, cx, |typed, cx| {
+                let typed = typed.trim().to_owned();
+                match view.read_with(cx, |ws, _| rename_problem(&ws.sets.saved, &id, &typed)) {
+                    Ok(Some(error)) => Err(error),
+                    Ok(None) => Ok(Some(typed)),
+                    Err(_) => Ok(None),
+                }
+            });
+            let typed = match checked {
+                Some(Some(typed)) => typed,
+                Some(None) => return true,
+                None => return false,
             };
-            if let Some(error) = problem {
-                field.update(cx, |field, cx| {
-                    field.error = Some(error);
-                    cx.notify();
-                });
-                return false;
-            }
             let id = id.clone();
             let _ = view.update(cx, |ws, cx| ws.rename_set(id, typed, window, cx));
             true
         });
-        input.update(cx, |input, cx| input.focus(window, cx));
+        ValidatedField::focus(&focused, window, cx);
     }
 
     /// The id of the saved set shown as `name`.

@@ -85,6 +85,7 @@ mod terminal_view;
 mod theme;
 mod tooltip_text;
 mod ui_state;
+mod validated_field;
 #[cfg(any(test, feature = "automation"))]
 mod view_state;
 mod workspace;
