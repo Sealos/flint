@@ -193,6 +193,24 @@ fn full_model() -> DashboardModel {
 // View model
 
 #[test]
+fn the_automation_state_lists_the_feed_rows() {
+    let model = full_model();
+    let state = model.view_state();
+    assert!(state.warnings_available);
+    assert_eq!(state.warnings_total, 2);
+    let row = &state.warnings[0];
+    assert_eq!(row.reason, "BackOff");
+    assert_eq!(
+        row.kind.as_deref(),
+        None,
+        "no apiVersion, so no exact object"
+    );
+    assert!(!row.opens);
+    assert!(row.id.starts_with("dashboard-warning-"));
+    assert!(!unavailable_model().view_state().warnings_available);
+}
+
+#[test]
 fn a_healthy_cluster_counts_zero_everywhere() {
     let model = empty_model();
     assert_eq!(model.status, DashboardStatus::Checked);

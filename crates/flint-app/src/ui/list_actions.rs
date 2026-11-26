@@ -2,12 +2,13 @@
 //! checks the workspace's guards share with them. Row and header clicks dispatch
 //! [`SelectRow`] and [`SortBy`], so a click and its action are one path.
 
+use flint_core::Column;
 use gpui_kit::*;
 
 use super::super::registry::{
     ActionError, Bind, CloseDetail, FocusFilter, FocusRows, OnView, OpenSelectedRow, SelectFirst,
-    SelectFromFilter, SelectLast, SelectNext, SelectPrev, SelectRow, SortBy, ToggleProblemsOnly,
-    ToggleWide,
+    SelectFromFilter, SelectLast, SelectNext, SelectPrev, SelectRow, SortBy, SortByAscending,
+    SortByDescending, ToggleProblemsOnly, ToggleWide,
 };
 use super::{ResourceList, find_row, list_model};
 
@@ -21,6 +22,8 @@ impl ResourceList {
             .bind::<CloseDetail>(Self::close_detail)
             .bind::<SelectRow>(Self::select_row)
             .bind::<SortBy>(Self::sort_by)
+            .bind::<SortByAscending>(Self::sort_by_ascending)
+            .bind::<SortByDescending>(Self::sort_by_descending)
             .bind::<ToggleWide>(Self::toggle_wide)
             .bind::<ToggleProblemsOnly>(Self::toggle_problems)
             .bind::<FocusFilter>(Self::focus_filter)
@@ -52,31 +55,30 @@ impl ResourceList {
 
     /// [`SortBy`] takes a column drawn now that is not masked: by its `key`
     /// ([`flint_core::Column::key`]) when given, else by its header.
-    pub(in crate::ui) fn check_sort(&self, action: &SortBy) -> Result<(), ActionError> {
-        if self.sort_key(action).is_some() {
+    pub(in crate::ui) fn check_sort<A: Action>(&self, action: &SortBy) -> Result<(), ActionError> {
+        if self.sortable_column(action).is_some() {
             Ok(())
         } else {
-            Err(ActionError::rejected::<SortBy>(format!(
+            Err(ActionError::rejected::<A>(format!(
                 "no sortable column {} is drawn",
                 action.key.as_deref().unwrap_or(&action.column)
             )))
         }
     }
 
-    /// The key of the drawn, unmasked column `action` names: the one with its `key` when given,
+    /// The drawn, unmasked column `action` names: the one with its `key` when given,
     /// else the first one headed `column`.
-    pub(in crate::ui) fn sort_key(&self, action: &SortBy) -> Option<String> {
+    pub(super) fn sortable_column(&self, action: &SortBy) -> Option<&Column> {
         let columns = &self.shown_columns;
         let mut drawn = self
             .drawn
             .iter()
             .filter(|&&(col, _)| !self.is_masked(columns, col))
             .map(|&(col, _)| &columns[col]);
-        let found = match &action.key {
+        match &action.key {
             Some(key) => drawn.find(|c| c.key() == *key),
             None => drawn.find(|c| *c.name == *action.column),
-        };
-        found.map(|c| c.key())
+        }
     }
 
     /// The names of the unmasked columns drawn, left to right: what [`SortBy`] takes.
@@ -139,10 +141,25 @@ impl ResourceList {
     }
 
     fn sort_by(&mut self, action: &SortBy, _: &mut Window, cx: &mut Context<Self>) {
-        match self.check_sort(action) {
-            Ok(()) => self.toggle_sort(action, cx),
-            Err(e) => tracing::warn!("{e}"),
-        }
+        self.toggle_sort(action, None, cx);
+    }
+
+    fn sort_by_ascending(
+        &mut self,
+        action: &SortByAscending,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_sort(&action.0, Some(false), cx);
+    }
+
+    fn sort_by_descending(
+        &mut self,
+        action: &SortByDescending,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_sort(&action.0, Some(true), cx);
     }
 
     fn toggle_wide(&mut self, _: &ToggleWide, _: &mut Window, cx: &mut Context<Self>) {

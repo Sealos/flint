@@ -49,6 +49,9 @@ mod set_state;
 )]
 #[path = "sparkline.rs"]
 mod sparkline;
+#[cfg(any(test, feature = "automation"))]
+#[path = "dashboard_state.rs"]
+mod state;
 #[path = "dashboard_tiles.rs"]
 mod tiles;
 

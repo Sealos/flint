@@ -7,7 +7,7 @@ use std::time::Duration;
 /// The longest a diff may take: past it, the diff is coarser but still correct.
 const DIFF_DEADLINE: Duration = Duration::from_secs(1);
 
-fn diff<'a>(before: &'a str, after: &'a str) -> similar::TextDiff<'a, 'a, 'a, str> {
+fn diff<'a>(before: &'a str, after: &'a str) -> similar::TextDiff<'a, 'a, str> {
     similar::TextDiff::configure()
         .timeout(DIFF_DEADLINE)
         .diff_lines(before, after)

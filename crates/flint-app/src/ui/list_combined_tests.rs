@@ -351,6 +351,51 @@ async fn sorts_by_cluster_and_keeps_blanks_last(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+async fn header_sort_cycles_start_with_the_columns_default(cx: &mut TestAppContext) {
+    let pods = super::super::super::support_tests::pods(&[
+        ("default", "api", 3),
+        ("default", "db", 9),
+        ("default", "web", 0),
+    ]);
+    let source = CombinedSource::new(vec![member(pods, "prod", None)]).unwrap();
+    let (window, list) = open(cx, source);
+
+    for (id, column, steps) in [
+        (
+            "sort-server:Restarts-0",
+            "Restarts",
+            [
+                (Some(true), ["db", "api", "web"]),
+                (Some(false), ["web", "api", "db"]),
+                (None, ["api", "db", "web"]),
+            ],
+        ),
+        (
+            "sort-flint:name-0",
+            "Name",
+            [
+                (Some(false), ["api", "db", "web"]),
+                (Some(true), ["web", "db", "api"]),
+                (None, ["api", "db", "web"]),
+            ],
+        ),
+    ] {
+        for (descending, names) in steps {
+            click(cx, window, id);
+            let shown = state(cx, &list);
+            assert_eq!(
+                shown
+                    .sort
+                    .as_ref()
+                    .map(|s| (s.column.as_str(), s.descending)),
+                descending.map(|descending| (column, descending)),
+            );
+            assert!(shown.rows.iter().map(|r| r.name.as_str()).eq(names));
+        }
+    }
+}
+
+#[gpui_kit::test]
 async fn filters_on_cluster(cx: &mut TestAppContext) {
     let (_window, list) = open(cx, fixture());
     list.update(cx, |list, cx| list.toggle_cluster_filter("ctx-staging", cx));

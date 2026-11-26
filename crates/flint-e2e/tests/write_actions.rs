@@ -546,6 +546,131 @@ async fn scale_is_bound_to_the_reviewed_count() {
     assert_eq!(patches, 1, "not retried");
 }
 
+fn gadgets() -> Gvr {
+    Gvr::new("fixtures.flint.dev", "v1", "gadgets")
+}
+
+/// A server whose Gadgets declare a `scale` subresource at `.spec.size`.
+async fn scaled_gadgets() -> FakeApiServer {
+    FakeApiServer::start_with(flint_e2e::fake_api::Options {
+        scaled: vec![(gadgets(), ".spec.size".to_owned())],
+        ..Default::default()
+    })
+    .await
+    .unwrap()
+}
+
+fn gadget_target(server: &FakeApiServer) -> WriteTarget {
+    WriteTarget {
+        cluster: CONTEXT.into(),
+        server: Some(server.url()),
+        kind: KindId::new("fixtures.flint.dev", "gadgets"),
+        namespace: Some("demo".to_owned()),
+        name: "gadget-1".to_owned(),
+        uid: None,
+        resource_version: None,
+    }
+}
+
+fn gadget_size(server: &FakeApiServer) -> Value {
+    server
+        .object(&gadgets(), Some("demo"), "gadget-1")
+        .expect("the gadget")["spec"]["size"]
+        .clone()
+}
+
+// covers UP-52, UP-53: a custom resource whose definition declares a scale subresource is scaled
+// from the count at the definition's path, by a patch of that very field, bound to that count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_custom_resource_scales_at_its_definitions_replica_field() {
+    let server = scaled_gadgets().await;
+    let core = Core::start(&server, Settings::default()).await;
+    let review = core
+        .handle
+        .review_write(gadget_target(&server), WriteProposal::Scale { to: 5 })
+        .await
+        .unwrap();
+    let flint_core::write::WriteAction::Resource(action) = review.action() else {
+        panic!("a resource action");
+    };
+    assert_eq!(
+        action.change(),
+        &flint_core::write::ResourceChange::Scale { from: 3, to: 5 }
+    );
+    let before = server.requests().len();
+    core.handle.run_write(review.into_intent()).await.unwrap();
+    assert_eq!(gadget_size(&server), 5);
+    let path = "/apis/fixtures.flint.dev/v1/namespaces/demo/gadgets/gadget-1";
+    let sent = since(&server, before);
+    assert_eq!(writes_in(&sent), 1, "{sent:?}");
+    assert!(
+        sent.contains(&(http::Method::PATCH, path.to_owned())),
+        "{sent:?}"
+    );
+
+    let review = core
+        .handle
+        .review_write(gadget_target(&server), WriteProposal::Scale { to: 9 })
+        .await
+        .unwrap();
+    let mut changed = server.object(&gadgets(), Some("demo"), "gadget-1").unwrap();
+    changed["spec"]["size"] = json!(7);
+    server.set_object(&gadgets(), changed);
+    let result = core.handle.run_write(review.into_intent()).await;
+    assert_eq!(result.unwrap_err(), WriteError::Conflict);
+    assert_eq!(gadget_size(&server), 7);
+}
+
+// covers UP-53: a definition whose replica path changed after the review stops the scale before
+// its patch, even when both fields hold the reviewed count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_custom_resource_scale_stops_when_its_replica_path_changes() {
+    let server = scaled_gadgets().await;
+    let core = Core::start(&server, Settings::default()).await;
+    let review = core
+        .handle
+        .review_write(gadget_target(&server), WriteProposal::Scale { to: 5 })
+        .await
+        .unwrap();
+    let crds = Gvr::new("apiextensions.k8s.io", "v1", "customresourcedefinitions");
+    let mut crd = server
+        .object(&crds, None, "gadgets.fixtures.flint.dev")
+        .unwrap();
+    crd["spec"]["versions"][0]["subresources"]["scale"]["specReplicasPath"] = json!(".spec.other");
+    server.set_object(&crds, crd);
+    let mut gadget = server.object(&gadgets(), Some("demo"), "gadget-1").unwrap();
+    gadget["spec"]["other"] = json!(3);
+    server.set_object(&gadgets(), gadget);
+    let before = server.requests().len();
+    let result = core.handle.run_write(review.into_intent()).await;
+    assert_eq!(result.unwrap_err(), WriteError::Conflict);
+    assert_eq!(writes_in(&since(&server, before)), 0);
+    assert_eq!(gadget_size(&server), 3);
+}
+
+// covers UP-53: a custom resource has no Scale without a scale subresource, or while its
+// definition cannot be read; nothing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_custom_resource_without_readable_scale_paths_is_not_scaled() {
+    let plain = FakeApiServer::start().await.unwrap();
+    let unreadable = scaled_gadgets().await;
+    let crds = Gvr::new("apiextensions.k8s.io", "v1", "customresourcedefinitions");
+    unreadable.inject(Fault::forbidden().on(&crds).verb(Verb::Get));
+    for server in [plain, unreadable] {
+        let core = Core::start(&server, Settings::default()).await;
+        let before = server.requests().len();
+        let result = core
+            .act(gadget_target(&server), WriteProposal::Scale { to: 5 })
+            .await;
+        assert!(
+            matches!(&result, Err(WriteError::Rejected(why)) if why == "gadgets cannot be scaled"),
+            "{result:?}"
+        );
+        assert_eq!(writes_in(&since(&server, before)), 0);
+        assert_eq!(gadget_size(&server), 3);
+    }
+}
+
 // covers UP-53: cordon and uncordon set the node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cordon_and_uncordon() {
