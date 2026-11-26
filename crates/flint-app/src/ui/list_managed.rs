@@ -62,10 +62,10 @@ mod tests {
         px, size,
     };
 
-    use super::super::ResourceList;
     use super::super::list_model::{
         CELL_PADDING, CHAR_WIDTH, CellStyle, MARKER_CHARS, RowFlags, measure_columns, text_width,
     };
+    use super::super::{Remembered, ResourceList};
     use super::{Row, short_name};
 
     const WAIT: Duration = Duration::from_secs(10);
@@ -151,7 +151,7 @@ mod tests {
                             "test".into(),
                             &entry,
                             Vec::new(),
-                            None,
+                            Remembered::default(),
                             window,
                             cx,
                         );

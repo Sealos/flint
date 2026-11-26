@@ -17,7 +17,7 @@ use gpui_kit::{
     WindowOptions, px, size,
 };
 
-use super::ResourceList;
+use super::{Remembered, ResourceList};
 use crate::ui::support_tests::open_workspace_with;
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -136,7 +136,7 @@ fn open_kind(
                         "test".into(),
                         &entry,
                         Vec::new(),
-                        None,
+                        Remembered::default(),
                         window,
                         cx,
                     );

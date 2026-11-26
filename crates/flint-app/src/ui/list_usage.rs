@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use flint_core::metrics::{Cpu, Memory, PodSample, Usage};
+use flint_core::settings::SavedColumnWidths;
 use flint_core::telemetry::{ClusterCapacity, ClusterTelemetry, PodIndex, PodKey, UsageRead};
 use flint_core::thresholds::{ThresholdMetric, Thresholds};
 use flint_core::{Column, ColumnRole, ColumnType, KindId, MetricsError, Row};
@@ -516,7 +517,7 @@ impl UsageValues {
     }
 }
 
-fn is_usage(role: ColumnRole) -> bool {
+pub(in crate::ui) fn is_usage(role: ColumnRole) -> bool {
     matches!(role, ColumnRole::CpuUsage | ColumnRole::MemoryUsage)
 }
 
@@ -577,16 +578,42 @@ pub(in crate::ui) struct ListUsage {
     columns: Option<ColumnPair>,
     /// When a bar turns to a warning: the Settings thresholds in force for the cluster.
     thresholds: Thresholds,
+    /// The columns were open before, so they show blank until the first poll answers rather
+    /// than popping in (see [`ListUsage::reserving`]).
+    reserved: bool,
 }
 
 /// A kind's server columns, and the same with the usage columns.
 type ColumnPair = (Arc<[Column]>, Arc<[Column]>);
 
 impl ListUsage {
+    /// A list whose first poll is pending. With `saved` (the widths it was saved with) holding
+    /// both usage columns, they show blank from the first frame, until the poll says whether
+    /// there are any. The saved keys are the signal: nothing else remembers it.
+    pub(in crate::ui) fn reserving(kind: &KindId, saved: &SavedColumnWidths) -> Self {
+        let has = |role| saved.contains_key(&Column::synthetic("", ColumnType::Number, role).key());
+        ListUsage {
+            reserved: UsageSubject::of(kind).is_some()
+                && has(ColumnRole::CpuUsage)
+                && has(ColumnRole::MemoryUsage),
+            ..Default::default()
+        }
+    }
+
+    /// Whether the usage columns are drawn: the poll has readings, or says the API exists, or
+    /// has not answered and the columns were reserved.
+    fn shows_columns(&self) -> bool {
+        self.source.shows_columns() || (self.reserved && self.source == UsageSource::Hidden)
+    }
+
     /// Takes the poll's newest state. `true` if it changes what the list shows.
     pub(in crate::ui) fn set_source(&mut self, source: UsageSource) -> bool {
         if self.source == source {
             return false;
+        }
+        // The first poll answered: a feed that restarts later does not reserve the columns again.
+        if !matches!(source, UsageSource::Hidden | UsageSource::NoFeed) {
+            self.reserved = false;
         }
         if !source.has_readings() {
             self.generation += 1;
@@ -647,13 +674,19 @@ impl ListUsage {
 
     /// The text of a usage column's cell for the row at `row` of the snapshot drawn.
     pub(in crate::ui) fn cell(&self, role: ColumnRole, row: usize) -> Option<String> {
+        // Reserved columns stay blank until the first poll answers: nothing is unknown yet.
+        if self.source == UsageSource::Hidden {
+            return None;
+        }
         self.values.text(role, row)
     }
 
     /// The columns to draw for `server`'s: with the usage columns while they show. Kept apart
     /// from the snapshot, so that a new snapshot copies no row references.
     pub(in crate::ui) fn columns_for(&mut self, server: &Arc<[Column]>) -> Arc<[Column]> {
-        if !self.source.shows_columns() {
+        // Before the kind is listed there are no server columns, and usage columns alone would
+        // be drawn as the whole table.
+        if !self.shows_columns() || server.is_empty() {
             return Arc::clone(server);
         }
         if let Some((known, with_usage)) = &self.columns
@@ -1210,6 +1243,52 @@ mod tests {
             + std::mem::size_of_val(&*values.cpu_scale)
             + std::mem::size_of_val(&*values.memory_scale);
         assert_eq!(bytes, 49 * rows.len());
+    }
+
+    #[test]
+    fn saved_usage_columns_are_reserved_while_the_first_poll_is_pending() {
+        let server: Arc<[Column]> = vec![Column::synthetic(
+            "Name",
+            ColumnType::String,
+            ColumnRole::Name,
+        )]
+        .into();
+        let key = |role| Column::synthetic("", ColumnType::Number, role).key();
+        let saved: SavedColumnWidths = [
+            (key(ColumnRole::Name), 20),
+            (key(ColumnRole::CpuUsage), 16),
+            (key(ColumnRole::MemoryUsage), 16),
+        ]
+        .into();
+        let mut usage = ListUsage::reserving(&KindId::pods(), &saved);
+        assert_eq!(usage.source(), &UsageSource::Hidden);
+        let reserved = usage.columns_for(&server);
+        assert_eq!(reserved.len(), 3);
+        assert_eq!(
+            usage.cell(ColumnRole::CpuUsage, 0),
+            None,
+            "blank, not unknown"
+        );
+        // The poll's answer keeps the very columns; "not installed" removes them once.
+        assert!(usage.set_source(UsageSource::Unknown));
+        assert!(Arc::ptr_eq(&usage.columns_for(&server), &reserved));
+        assert!(usage.set_source(UsageSource::NotInstalled));
+        assert_eq!(usage.columns_for(&server).len(), 1);
+        // A feed that restarts later does not bring them back.
+        assert!(usage.set_source(UsageSource::Hidden));
+        assert_eq!(usage.columns_for(&server).len(), 1);
+
+        // Without both saved keys, or for a kind with no usage, nothing is reserved.
+        let mut only_cpu = saved.clone();
+        only_cpu.remove(&key(ColumnRole::MemoryUsage));
+        for usage in [
+            ListUsage::reserving(&KindId::pods(), &only_cpu),
+            ListUsage::reserving(&KindId::pods(), &SavedColumnWidths::new()),
+            ListUsage::reserving(&KindId::new("", "services"), &saved),
+        ] {
+            let mut usage = usage;
+            assert_eq!(usage.columns_for(&server).len(), 1);
+        }
     }
 
     #[test]

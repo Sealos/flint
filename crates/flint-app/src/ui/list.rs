@@ -35,6 +35,7 @@ use list_model::{CELL_PADDING, CHAR_WIDTH};
 use super::list_model::{self, ColumnWidths, SortSpec};
 use super::notice::notice;
 use super::row_menu::{OpenRowMenu, RowMenu};
+use flint_core::settings::SavedColumnWidths;
 
 use super::registry::{
     self, CloseDetail, SelectFirst, SelectLast, SelectNext, SelectPrev, SelectRow,
@@ -82,9 +83,18 @@ pub enum ListEvent {
     /// The user changed the sort (`None`: back to the default order), to remember for the
     /// cluster and kind.
     SortChanged(Option<SortSpec>),
+    /// The columns' widths as last measured changed, to remember for the cluster and kind.
+    WidthsChanged(SavedColumnWidths),
 }
 
 impl EventEmitter<ListEvent> for ResourceList {}
+
+/// What a list remembers from the last time it was open.
+#[derive(Debug, Clone, Default)]
+pub struct Remembered {
+    pub sort: Option<SortSpec>,
+    pub widths: SavedColumnWidths,
+}
 
 /// What the list is filtered and sorted by.
 #[derive(Debug, Clone, Default)]
@@ -206,6 +216,8 @@ pub struct ResourceList {
     problems: problems::ProblemFilter,
     show_wide: bool,
     widths: ColumnWidths,
+    /// The widths last saved or reported to be: the newest measurement, not the grown ones.
+    saved_widths: SavedColumnWidths,
     selected: Option<Selected>,
     /// The selected row's position in `rows`, if it is shown.
     selected_ix: Option<usize>,
@@ -299,14 +311,14 @@ pub struct ResourceList {
 }
 
 impl ResourceList {
-    /// A list of `entry`'s kind on `cluster`, filtered to `namespaces` and sorted by `sort` (the
-    /// one remembered for the cluster and kind, if any).
+    /// A list of `entry`'s kind on `cluster`, filtered to `namespaces`, with the sort and column
+    /// widths remembered for the cluster and kind, if any.
     pub fn new(
         core: CoreHandle,
         cluster: ClusterId,
         entry: &NavEntry,
         namespaces: Vec<String>,
-        sort: Option<SortSpec>,
+        remembered: Remembered,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -386,13 +398,17 @@ impl ResourceList {
                 this.recompute(cx);
             }
         });
+        let Remembered { sort, widths } = remembered;
+        let mut usage = ListUsage::reserving(&kind, &widths);
+        let shown_columns = usage.columns_for(&latest.columns);
         let mut list = ResourceList {
             core,
             cluster,
             kind,
             label: entry.label.clone(),
             namespaced: entry.namespaced,
-            shown_columns: latest.columns.clone(),
+            widths: ColumnWidths::seeded(widths.clone(), &shown_columns),
+            shown_columns,
             shown: latest.clone(),
             latest,
             rows: Arc::from(Vec::new()),
@@ -403,7 +419,7 @@ impl ResourceList {
             },
             problems: Default::default(),
             show_wide: false,
-            widths: ColumnWidths::default(),
+            saved_widths: widths,
             selected: None,
             selected_ix: None,
             selected_gone: false,
@@ -443,7 +459,7 @@ impl ResourceList {
             _watch: watch,
             _compute: Task::ready(()),
             _tick: tick,
-            usage: ListUsage::default(),
+            usage,
             _usage: follow_usage,
             _subscriptions: vec![on_filter],
         };
@@ -643,6 +659,16 @@ impl ResourceList {
         if state_changed {
             cx.notify();
         }
+    }
+
+    /// The columns of the list as it would draw them, and the width in characters each takes.
+    #[cfg(test)]
+    pub(in crate::ui) fn column_chars(&self) -> Vec<(String, usize)> {
+        self.shown_columns
+            .iter()
+            .enumerate()
+            .map(|(i, column)| (column.name.to_string(), self.widths.chars(i, column)))
+            .collect()
     }
 
     /// Sets usage for a test, and stops following the feed so that it cannot replace it.
@@ -929,6 +955,7 @@ impl ResourceList {
                 list.rows_namespaces = job_namespaces;
                 list.widths.update(&columns, &widths, restart);
                 list.scoped = scoped;
+                list.remember_widths(&columns, &widths, cx);
                 list.rows_in_one_namespace = one_namespace;
                 list.usage.set_values(usage);
                 list.problems.set_awaiting(awaiting);
@@ -953,6 +980,33 @@ impl ResourceList {
                 });
             }
         });
+    }
+
+    /// Reports the newest measurement of `columns` to be remembered, when rows were measured and
+    /// it differs from the last one. Usage columns whose first poll is pending keep the width
+    /// they had: nothing was measured for them.
+    fn remember_widths(
+        &mut self,
+        columns: &[flint_core::Column],
+        measured: &[usize],
+        cx: &mut Context<Self>,
+    ) {
+        if self.scoped == 0 {
+            return;
+        }
+        let mut now = ColumnWidths::to_saved(columns, measured);
+        if *self.usage.source() == UsageSource::Hidden {
+            for column in columns.iter().filter(|c| list_usage::is_usage(c.role)) {
+                let key = column.key();
+                if let Some(&before) = self.saved_widths.get(&key) {
+                    now.insert(key, before);
+                }
+            }
+        }
+        if now != self.saved_widths {
+            self.saved_widths = now.clone();
+            cx.emit(ListEvent::WidthsChanged(now));
+        }
     }
 
     fn apply(

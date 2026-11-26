@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 
 use crate::ui::detail::{PENDING_TIMEOUT, TestPodLister};
 use crate::ui::dock::DockTab;
-use crate::ui::list::{ListEvent, ResourceList, Selected};
+use crate::ui::list::{ListEvent, Remembered, ResourceList, Selected};
 use crate::ui::registry::{self, ActionError};
 use crate::ui::row_menu::{OpenRowMenu, RowMenu};
 use crate::ui::support_tests::{TestWorkspace, WAIT, open_empty_workspace, open_workspace, pods};
@@ -1421,7 +1421,15 @@ async fn a_replaced_row_menu_returns_focus_to_the_original_view(cx: &mut TestApp
         .update_window(window, |_, window, cx| {
             window.focus(&sidebar_focus, cx);
             cx.new(|cx| {
-                ResourceList::new(core, "test".into(), &pods_entry(), vec![], None, window, cx)
+                ResourceList::new(
+                    core,
+                    "test".into(),
+                    &pods_entry(),
+                    vec![],
+                    Remembered::default(),
+                    window,
+                    cx,
+                )
             })
         })
         .unwrap();
