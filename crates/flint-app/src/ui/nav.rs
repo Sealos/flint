@@ -8,7 +8,9 @@
 //! and closes a section, Right opens a section and Left closes it. The cursor shows with the
 //! theme's focus ring while the navigation has focus.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use flint_core::{
@@ -27,6 +29,7 @@ use super::list::problems::ProblemBadge;
 use super::registry::{self, OpenClusterOverview, OpenView, RetryConnection, ToggleNavSection};
 use super::set_kinds::{MemberKinds, SetKinds};
 use super::theme::status_dot;
+use super::tooltip_text::beside_row;
 
 /// Which sections are open, per cluster. Sections the user never toggled follow
 /// [`collapsed_by_default`].
@@ -424,6 +427,7 @@ impl NavPanel {
             None => tip,
         };
         let open = entry.id.to_string();
+        let row_bounds = Rc::new(Cell::new(Bounds::<Pixels>::default()));
         h_flex()
             .id(SharedString::from(format!("nav-{}", entry.id)))
             // Named for assistive technology (and view tests).
@@ -501,7 +505,21 @@ impl NavPanel {
                 Marker::Reconnecting => dot(theme.warning),
                 Marker::Failed => dot(theme.danger),
             }))
-            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            // Beside the row, not under the pointer, where it would cover the rows below.
+            .child({
+                let bounds = row_bounds.clone();
+                canvas(move |b, _, _| bounds.set(b), |_, _, _, _| {})
+                    .absolute()
+                    .size_full()
+            })
+            .tooltip(move |window, cx| {
+                beside_row(
+                    Tooltip::new(tip.clone()),
+                    row_bounds.get(),
+                    window.mouse_position(),
+                )
+                .build(window, cx)
+            })
             .test_support()
             .into_any_element()
     }

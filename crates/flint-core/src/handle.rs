@@ -343,6 +343,14 @@ pub(crate) enum Request {
         member: AdmittedMember,
         reply: oneshot::Sender<Option<String>>,
     },
+    /// Signs `member` in once, now, if it is still on the definitions the view showed
+    /// ([`CoreHandle::sign_in_member`]).
+    SignInMember {
+        member: AdmittedMember,
+        definition: Option<u64>,
+        shown: Option<u64>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     /// The read client of `member`, checked in the same step.
     MemberClient {
         member: AdmittedMember,
@@ -355,7 +363,7 @@ pub(crate) enum Request {
     /// Write these settings in order, and say how that went.
     WriteSettings {
         writes: Vec<crate::settings::SettingsWrite>,
-        reply: oneshot::Sender<Result<(), String>>,
+        reply: oneshot::Sender<Result<Arc<crate::Settings>, String>>,
     },
     /// Save this proxy setting, put it in use and connect everything again on it.
     ApplyProxy {
@@ -1025,6 +1033,36 @@ impl CoreHandle {
         }
     }
 
+    /// For a click on a member's Sign in alone: runs its sign-in once, now, if it waits for one
+    /// and is still exactly the member the set view showed, on `definition`
+    /// ([`KeepWatchView::definition`](crate::keep_watching::KeepWatchView)) and, for an exec
+    /// plugin, on the plugin definition `shown`
+    /// ([`KeepWatchView::shown_sign_in`](crate::keep_watching::KeepWatchView)). The click is the
+    /// consent for that one start of the program: nothing is saved, nothing retries it, and it
+    /// turns no background sign-in on. A change since refuses it, and nothing runs. Resolves once
+    /// the attempt is asked for; its result arrives as the member's status.
+    pub fn sign_in_member(
+        &self,
+        member: &AdmittedMember,
+        definition: Option<u64>,
+        shown: Option<u64>,
+    ) -> impl Future<Output = Result<(), String>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let sent = self.requests.push(Request::SignInMember {
+            member: member.clone(),
+            definition,
+            shown,
+            reply,
+        });
+        async move {
+            if sent.is_err() {
+                return Err("the core is not running".to_owned());
+            }
+            rx.await
+                .unwrap_or_else(|_| Err("the core stopped before answering".to_owned()))
+        }
+    }
+
     /// Why `member` no longer stands for its context, or `None`. A stopped core counts as changed.
     pub fn check_member(
         &self,
@@ -1206,15 +1244,15 @@ impl CoreHandle {
         async move { reload_outcome(rx.await.ok()) }
     }
 
-    /// Writes `writes` to `settings.toml` one after another, each through its own setter, and
-    /// resolves once they are written and applied, or with the (sanitized) reason the first that
-    /// failed did not; the ones after it are not written. The change also arrives as
+    /// Writes `writes` to `settings.toml` in one save, all of them or none, and resolves once
+    /// they are written and applied, with the settings as saved, or with the (sanitized) reason
+    /// they were not. The change also arrives as
     /// `Event::SettingsChanged`, and a failure as `Event::Error`. Like every settings write it
     /// refuses while `settings.toml` is invalid. Works on any executor.
     pub fn write_settings(
         &self,
         writes: Vec<crate::settings::SettingsWrite>,
-    ) -> impl Future<Output = Result<(), String>> + Send + 'static {
+    ) -> impl Future<Output = Result<Arc<crate::Settings>, String>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
         let sent = self.requests.push(Request::WriteSettings { writes, reply });
         async move {

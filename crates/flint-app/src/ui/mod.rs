@@ -66,6 +66,9 @@ mod scope_picker;
 mod set_kinds;
 mod set_members;
 mod settings_draft;
+mod settings_logs_paths;
+#[cfg(test)]
+mod settings_logs_paths_tests;
 mod settings_thresholds;
 #[cfg(test)]
 mod settings_thresholds_tests;
@@ -101,7 +104,7 @@ use gpui_kit::*;
 use clusters::ClustersModel;
 use gpui_kit::component::input;
 use registry::{
-    About, AppearanceDark, AppearanceLight, AppearanceSystem, GoBack, Hide, HideOthers,
+    About, AppearanceDark, AppearanceLight, AppearanceSystem, GoBack, GoForward, Hide, HideOthers,
     MinimizeWindow, OpenHelp, OpenSettings, Quit, ShowAll, ToggleCommandPalette,
     ToggleResourceSwitcher, ZoomWindow,
 };
@@ -365,7 +368,7 @@ fn edit_menu() -> Menu {
     ])
 }
 
-/// View: Show Command Palette, Go to Resource, Go Back, and Appearance.
+/// View: Show Command Palette, Go to Resource, Go Back, Go Forward, and Appearance.
 fn view_menu(appearance: Appearance) -> Menu {
     Menu::new("View").items([
         MenuItem::action(
@@ -377,6 +380,7 @@ fn view_menu(appearance: Appearance) -> Menu {
             ToggleResourceSwitcher,
         ),
         MenuItem::action(registry::label::<GoBack>(), GoBack),
+        MenuItem::action(registry::label::<GoForward>(), GoForward),
         MenuItem::separator(),
         MenuItem::submenu(appearance_menu(appearance)),
     ])

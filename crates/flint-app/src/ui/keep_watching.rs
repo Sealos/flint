@@ -165,6 +165,10 @@ mod tests {
             "offer_keep_watching",
             "ApproveKeepWatching",
             ".approve()",
+            // A set member's one sign-in: its Sign in click alone.
+            "sign_in_set_member",
+            "sign_in_member",
+            "MemberSignIn",
         ] {
             for source in elsewhere {
                 let code = source.split("#[cfg(test)]").next().unwrap_or(source);

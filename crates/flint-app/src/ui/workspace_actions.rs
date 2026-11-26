@@ -43,15 +43,15 @@ use super::super::registry::{
     BackToYamlEdit, Bind, CancelConnection, CancelYamlEdit, ClearSelection, Close, CloseActiveTab,
     CloseDetail, CloseTab, CopyLines, CopyText, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly,
     DragSelection, EditYaml, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp, FocusFilter,
-    FocusNextPane, FocusPreviousPane, FocusSearch, Forward, ForwardCurrent, GoBack, Guards, Hide,
-    HideFromAi, HideOthers, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, NextTab, OnView,
-    OpenContainerLogs, OpenContainerShell, OpenHome, OpenLogs, OpenObject, OpenPreviousLogs,
-    OpenSelectedRow, OpenSelectorLogs, OpenShell, OpenView, PaneName, PasteText, PrevMatch,
-    PrevTab, ReconnectLogs, Refresh, ReloadYamlEdit, RestartShell, RetryConnection, ReviewYamlEdit,
-    SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines, ScrollPageDown,
-    ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAllLines, SelectCluster, SelectFirst,
-    SelectLast, SelectLine, SelectNext, SelectNextLine, SelectPrev, SelectPrevLine, SelectRow,
-    SelectText, SetDockHeight, SetLogContext, SetNamespaces, SetPaneWidth, ShowAll,
+    FocusNextPane, FocusPreviousPane, FocusSearch, Forward, ForwardCurrent, GoBack, GoForward,
+    Guards, Hide, HideFromAi, HideOthers, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, NextTab,
+    OnView, OpenContainerLogs, OpenContainerShell, OpenHome, OpenLogs, OpenObject,
+    OpenPreviousLogs, OpenSelectedRow, OpenSelectorLogs, OpenShell, OpenView, PaneName, PasteText,
+    PrevMatch, PrevTab, ReconnectLogs, Refresh, ReloadYamlEdit, RestartShell, RetryConnection,
+    ReviewYamlEdit, SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines,
+    ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAllLines, SelectCluster,
+    SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine, SelectPrev, SelectPrevLine,
+    SelectRow, SelectText, SetDockHeight, SetLogContext, SetNamespaces, SetPaneWidth, ShowAll,
     ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml, SortBy, SortByAscending,
     SortByDescending, ToggleAnnotations, ToggleCommandPalette, ToggleErrorsOnly, ToggleLabels,
     ToggleLogRegex, ToggleManagedFields, ToggleMatchingOnly, ToggleNamespace, ToggleNavSection,
@@ -123,6 +123,7 @@ impl Workspace {
         .bind::<ToggleResourceSwitcher>(Self::toggle_switcher)
         .bind::<OpenObject>(Self::open_object)
         .bind::<GoBack>(Self::go_back)
+        .bind::<GoForward>(Self::go_forward)
         .bind::<BackToList>(Self::back_to_list)
         .bind::<FocusNextPane>(|this, _, window, cx| this.focus_pane(1, window, cx))
         .bind::<FocusPreviousPane>(|this, _, window, cx| this.focus_pane(-1, window, cx))
@@ -351,6 +352,7 @@ impl Workspace {
                 |ws, a, cx| ws.check_open_object(a, cx),
             )
             .when::<GoBack>(|ws, cx| ws.can_go_back(cx))
+            .when::<GoForward>(|ws, cx| ws.can_go_forward(cx))
             .add::<SetNamespaces>(
                 |ws, _| ws.namespace_filter_applies(),
                 |_, a, _| match a.namespaces.iter().any(|n| n.trim().is_empty()) {

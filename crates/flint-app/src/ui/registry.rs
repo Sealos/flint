@@ -52,6 +52,10 @@ use super::list::combined::{
     ToggleCombinedProblems, ToggleCombinedWide, ToggleGroupByCluster,
 };
 pub use super::pending_threshold::SetPendingThreshold;
+pub use super::settings_logs_paths::{
+    AddKubeconfigPath, ChooseKubeconfigPaths, EditHelmPath, EditLogBufferLines, EditLogBufferMib,
+    EditLogTotalMib, EditPathOverride, EditProtectLocalClusters, RemoveKubeconfigPath,
+};
 pub use super::settings_thresholds::{
     AddClusterOverride, CancelThresholdEntry, EditClusterAlerts, EditClusterWatchMode,
     EditThreshold, ResetClusterOverrides, TypeThreshold,
@@ -149,6 +153,8 @@ actions!(
         DefaultWatchOpenViewsOnly,
         /// Go back to the kind and object shown before.
         GoBack,
+        /// Go forward to the kind and object Go Back left.
+        GoForward,
         /// In a narrow window, return from the detail to the list, keeping the selection.
         BackToList,
         /// Move focus to the next pane: clusters, navigation, list, detail, dock.
@@ -2136,6 +2142,25 @@ const EDIT_APPEARANCE: &[Arg] = &[arg(
     ArgKind::Choice(&["system", "light", "dark"]),
 )];
 const EDIT_NOTIFICATIONS: &[Arg] = &[arg("enabled", "true or false", ArgKind::Bool)];
+const EDIT_LOG_LINES: &[Arg] = &[arg("lines", "from 1000 to 1000000", ArgKind::Number)];
+const EDIT_LOG_MIB: &[Arg] = &[arg("mib", "from 8 to 1024", ArgKind::Number)];
+const EDIT_LOG_TOTAL: &[Arg] = &[arg("mib", "from 64 to 16384", ArgKind::Number)];
+const EDIT_PATH: &[Arg] = &[arg(
+    "path",
+    "absolute folders separated by colons; empty uses the login shell's",
+    ArgKind::Text,
+)];
+const EDIT_HELM: &[Arg] = &[arg(
+    "path",
+    "the helm binary, absolute or under ~; empty finds it on PATH",
+    ArgKind::Text,
+)];
+const KUBECONFIG_PATH: &[Arg] = &[arg(
+    "path",
+    "a kubeconfig file, absolute or under ~",
+    ArgKind::Text,
+)];
+const EDIT_PROTECT_LOCAL: &[Arg] = &[arg("enabled", "true or false", ArgKind::Bool)];
 const EDIT_WATCH_MODE: &[Arg] = &[arg(
     "mode",
     "all or on_view",
@@ -2461,6 +2486,60 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Edit Default Watch Mode…",
             "Set the default watch mode in the Settings draft.",
             EDIT_WATCH_MODE,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditLogBufferLines>(
+            "Edit Log Lines Per Tab…",
+            "Set the lines each log tab keeps in the Settings draft.",
+            EDIT_LOG_LINES,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditLogBufferMib>(
+            "Edit Log Memory Per Tab…",
+            "Set the MiB each log tab keeps in the Settings draft.",
+            EDIT_LOG_MIB,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditLogTotalMib>(
+            "Edit Total Log Memory…",
+            "Set the MiB all log tabs keep together in the Settings draft.",
+            EDIT_LOG_TOTAL,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::unit::<ChooseKubeconfigPaths>(
+            "Choose Kubeconfig Files",
+            "Choose kubeconfig files to add to the list in the Settings draft.",
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<AddKubeconfigPath>(
+            "Add Kubeconfig Path…",
+            "Add a kubeconfig file to the list in the Settings draft.",
+            KUBECONFIG_PATH,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<RemoveKubeconfigPath>(
+            "Remove Kubeconfig Path…",
+            "Drop a kubeconfig file from the list in the Settings draft.",
+            KUBECONFIG_PATH,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditPathOverride>(
+            "Edit PATH…",
+            "Set the PATH override in the Settings draft.",
+            EDIT_PATH,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditHelmPath>(
+            "Edit Helm Path…",
+            "Set the helm binary in the Settings draft.",
+            EDIT_HELM,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditProtectLocalClusters>(
+            "Edit Local Cluster Protection…",
+            "Turn protection of local clusters on or off in the Settings draft. Turning it off \
+             is confirmed at Save.",
+            EDIT_PROTECT_LOCAL,
         )
         .of(C::Flint, S::Settings),
         Spec::with_args::<EditThreshold>(
@@ -2924,6 +3003,9 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<GoBack>("Go Back", "Go back to the kind and object shown before.")
             .of(C::View, S::Workspace)
             .keys(&["secondary-["], Some(WORKSPACE)),
+        Spec::unit::<GoForward>("Go Forward", "Go forward to the kind and object Go Back left.")
+            .of(C::View, S::Workspace)
+            .keys(&["secondary-]"], Some(WORKSPACE)),
         Spec::unit::<BackToList>(
             "Back to List",
             "In a narrow window, return from the detail to the list, keeping the selection.",

@@ -231,7 +231,7 @@ impl Workspace {
         if self.nav.read(cx).focus_handle().is_focused(window) {
             return Focus::Navigation;
         }
-        if self.settings_page.open && self.settings_page.focus.is_focused(window) {
+        if self.settings_page.open && self.settings_page.focus.contains_focused(window, cx) {
             return Focus::Settings;
         }
         if let Some((overview, _)) = &self.dashboard
