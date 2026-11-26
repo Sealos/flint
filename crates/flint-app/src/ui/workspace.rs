@@ -1466,16 +1466,32 @@ impl Workspace {
             // Connecting from the sidebar leaves focus there, so its arrows keep working.
             let take_focus =
                 self.palette.is_none() && !self.sidebar_focus.contains_focused(window, cx);
-            self.show_dashboard(take_focus, window, cx);
+            self.show_dashboard(take_focus, true, window, cx);
         }
     }
 
     /// Shows the active cluster's overview in place of its list. Go Back returns to the list.
     fn open_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_dashboard(true, window, cx);
+        self.show_dashboard(true, true, window, cx);
     }
 
-    fn show_dashboard(&mut self, take_focus: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// Shows the overview for Go Back and Go Forward, which keep the history themselves.
+    pub(super) fn show_overview(
+        &mut self,
+        remember: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_dashboard(true, remember, window, cx);
+    }
+
+    fn show_dashboard(
+        &mut self,
+        take_focus: bool,
+        remember: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let (Some(cluster), Some(generation)) = (self.cluster.clone(), self.generation) else {
             return;
         };
@@ -1486,16 +1502,14 @@ impl Workspace {
             }
             return;
         }
-        if self.asks_before_leaving(window, cx, |ws, window, cx| ws.open_dashboard(window, cx)) {
+        if self.asks_before_leaving(window, cx, move |ws, window, cx| {
+            ws.show_dashboard(take_focus, remember, window, cx)
+        }) {
             return;
         }
-        // Any place other than the list shown: the overview is not one Go Back returns to.
-        let overview = keys::Place {
-            kind: KindId::new("flint.overview", "overview"),
-            object: None,
-            seen: None,
-        };
-        self.remember_place(&overview, cx);
+        if remember {
+            self.remember_place(&keys::Place::overview(), cx);
+        }
         self.close_list(cx);
         let model = self.model.clone();
         let view = cx.new(|cx| DashboardView::following(model, cluster, generation, cx));
@@ -1693,6 +1707,12 @@ impl Workspace {
                     }
                     return;
                 }
+                // Opened from a row: the switcher lists it among the recent objects.
+                self.history.opened(
+                    object.kind.clone(),
+                    object.namespace.clone(),
+                    object.name.clone(),
+                );
                 // Moving between rows keeps the tab the user was on.
                 let tab = if std::mem::take(&mut self.startup_yaml) {
                     DetailTab::Yaml

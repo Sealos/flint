@@ -486,6 +486,11 @@ impl ResourceList {
 
     /// Whether an object opened by name waits for its row ([`ResourceList::select_listed`]),
     /// or the list says it is missing: either way, not the bare list.
+    /// The object an open by name still waits for.
+    pub fn pending_object(&self) -> Option<&(Option<String>, String)> {
+        self.pending_select.as_ref()
+    }
+
     pub fn picking(&self) -> bool {
         self.pending_select.is_some() || self.missing.is_some()
     }

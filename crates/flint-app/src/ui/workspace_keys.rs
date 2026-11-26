@@ -35,6 +35,21 @@ pub(in crate::ui) struct Place {
     pub seen: Option<u64>,
 }
 
+impl Place {
+    /// The cluster overview: Go Back and Go Forward reach it like a list.
+    pub fn overview() -> Self {
+        Place {
+            kind: KindId::new("flint.overview", "overview"),
+            object: None,
+            seen: None,
+        }
+    }
+
+    fn is_overview(&self) -> bool {
+        *self == Self::overview()
+    }
+}
+
 /// The same place whatever was known about its object.
 impl PartialEq for Place {
     fn eq(&self, other: &Self) -> bool {
@@ -281,7 +296,10 @@ impl Workspace {
 
     /// Where the main area is: the open kind and its selected object.
     fn place(&self, cx: &App) -> Option<Place> {
-        let list = self.list.as_ref()?.read(cx);
+        let Some(list) = self.list.as_ref() else {
+            return self.dashboard.as_ref().map(|_| Place::overview());
+        };
+        let list = list.read(cx);
         let object = self.detail.as_ref().map(|d| {
             let object = d.read(cx).object();
             (object.namespace.clone(), object.name.clone())
@@ -317,6 +335,26 @@ impl Workspace {
         self.place(cx).filter(|_| !picking)
     }
 
+    /// The object an open by name still waits for, as a place: where Go Back and Go Forward
+    /// return to once it has loaded.
+    fn pending_place(&self, cx: &App) -> Option<Place> {
+        let list = self.list.as_ref()?.read(cx);
+        Some(Place {
+            kind: list.kind().clone(),
+            object: Some(list.pending_object()?.clone()),
+            seen: None,
+        })
+    }
+
+    /// Whether Go Back or Go Forward can show `place`: the overview while the cluster is
+    /// active, a kind the cluster still serves.
+    fn place_served(&self, place: &Place, cx: &App) -> bool {
+        if place.is_overview() {
+            return self.cluster.is_some() && self.generation.is_some();
+        }
+        self.view_entry(place.kind.as_str(), cx).is_some()
+    }
+
     /// Whether Go Back has somewhere to go: a place other than the one shown, of a kind the
     /// cluster still serves.
     pub(super) fn can_go_back(&self, cx: &App) -> bool {
@@ -325,7 +363,7 @@ impl Workspace {
             && self
                 .history
                 .places()
-                .any(|p| here.as_ref() != Some(p) && self.view_entry(p.kind.as_str(), cx).is_some())
+                .any(|p| here.as_ref() != Some(p) && self.place_served(p, cx))
     }
 
     /// Whether Go Forward has somewhere to go: a place Go Back left, other than the one shown,
@@ -336,7 +374,7 @@ impl Workspace {
             && self
                 .history
                 .forward_places()
-                .any(|p| here.as_ref() != Some(p) && self.view_entry(p.kind.as_str(), cx).is_some())
+                .any(|p| here.as_ref() != Some(p) && self.place_served(p, cx))
     }
 
     /// Go Back: shows the kind and object shown before.
@@ -375,6 +413,8 @@ impl Workspace {
         // Selecting a row or clearing the selection records nothing, so the last place
         // remembered can be the one shown; a press never goes there.
         let here = self.shown_place(cx);
+        // An object waited for is left too: Back or Forward returns to it once it has loaded.
+        let leaving = here.clone().or_else(|| self.pending_place(cx));
         let here_filter = self
             .list
             .as_ref()
@@ -392,16 +432,23 @@ impl Workspace {
                 continue;
             }
             // A kind the cluster no longer serves is skipped.
-            let Some(entry) = self.view_entry(place.kind.as_str(), cx) else {
+            if !self.place_served(&place, cx) {
                 continue;
-            };
-            if let Some(here) = here {
+            }
+            if let Some(leaving) = leaving {
                 if forward {
-                    self.history.push_back(here, here_filter);
+                    self.history.push_back(leaving, here_filter);
                 } else {
-                    self.history.push_forward(here, here_filter);
+                    self.history.push_forward(leaving, here_filter);
                 }
             }
+            if place.is_overview() {
+                self.show_overview(false, window, cx);
+                return;
+            }
+            let Some(entry) = self.view_entry(place.kind.as_str(), cx) else {
+                return;
+            };
             self.show_kind(&entry, false, true, window, cx);
             if let Some(list) = &self.list {
                 let focus = list.read(cx).focus_handle().clone();
