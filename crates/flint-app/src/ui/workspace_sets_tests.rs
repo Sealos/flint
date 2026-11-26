@@ -2490,7 +2490,11 @@ async fn sign_in_asks_the_core_for_that_member_and_selects_nothing(cx: &mut Test
     t.wait_for_element(cx, "set-member-action-kind-beta").await;
 
     t.click(cx, "set-member-action-kind-beta");
-    cx.run_until_parked();
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace.read(cx).sets.error.is_some()
+    })
+    .await;
 
     let (error, now) = t.workspace.read_with(cx, |ws, cx| {
         (
@@ -2519,7 +2523,11 @@ async fn a_chips_sign_in_is_its_own_control(cx: &mut TestAppContext) {
     );
 
     t.click(cx, "member-sign-in-kind-beta");
-    cx.run_until_parked();
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace.read(cx).sets.error.is_some()
+    })
+    .await;
     let error = t.workspace.read_with(cx, |ws, _| ws.sets.error.clone());
     assert!(
         error.is_some_and(|e| e.contains("kind-beta")),

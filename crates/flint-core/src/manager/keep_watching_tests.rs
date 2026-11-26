@@ -1486,6 +1486,63 @@ async fn a_signed_in_once_connection_stays_a_background_members() {
     assert!(matches!(slot.state, ConnectionState::Disconnected));
 }
 
+// A connection one click made stops its program while changed files are read, and a quit ends
+// it with the kept connections, so its program is killed before Flint exits.
+#[tokio::test]
+async fn a_signed_in_once_connection_pauses_for_a_file_change_and_ends_on_quit() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _) = signed_out_set(&plugin, config.path().to_owned());
+    signed_in_once(&mut manager).await;
+    let once = manager
+        .cluster("dev")
+        .unwrap()
+        .access
+        .grant(CredentialSource::Plugin);
+    assert!(once.allowed());
+
+    manager.suspend_kept_plugins();
+    assert!(!once.allowed(), "paused while the files are read");
+    manager.sync_keep_watching();
+    assert!(once.allowed(), "back once they are read");
+
+    let _ = manager.kept_grants().quit();
+    assert!(!once.allowed(), "a quit ends it");
+}
+
+// An attempt whose one sign-in was used up before it connected is no reason to retry: the member
+// waits for a sign-in, and nothing tries again.
+#[tokio::test]
+async fn a_sign_in_spent_while_connecting_asks_again_without_a_retry() {
+    let plugin = token_plugin();
+    let config = tempfile::tempdir().unwrap();
+    let (mut manager, _) = signed_out_set(&plugin, config.path().to_owned());
+    click_sign_in(&mut manager).unwrap();
+    pump_later(&mut manager);
+    let slot = manager.cluster("dev").unwrap();
+    assert!(slot.access.signed_in_once_access());
+    let attempt = slot.attempt;
+    slot.access.revoke();
+
+    manager
+        .handle_internal(Internal::Connected {
+            cluster: "dev".into(),
+            attempt,
+            result: Err(cluster::SafeErrorText::reduced(
+                "its sign-in already ran once",
+            )),
+        })
+        .await;
+
+    assert!(
+        matches!(dev_state(&manager), MemberState::SignInNeeded { .. }),
+        "{:?}",
+        dev_state(&manager)
+    );
+    pump_later(&mut manager);
+    assert_eq!(manager.cluster("dev").unwrap().attempt, attempt, "no retry");
+}
+
 // When the token is due, the refused second start reaches the manager: the member asks for a
 // sign-in again at once.
 #[tokio::test]
@@ -1527,9 +1584,16 @@ async fn a_consented_member_signs_in_attended_on_a_click() {
         MemberState::SignInNeeded { .. }
     ));
 
+    // Its kept feed stopped after a failure, as `stop_kept` leaves it.
+    let fingerprint = manager.cluster("dev").unwrap().fingerprint;
+    manager.keep.stopped.insert("dev".into(), fingerprint);
     click_sign_in(&mut manager).unwrap();
     pump_later(&mut manager);
 
+    assert!(
+        manager.keep.stopped.contains_key("dev"),
+        "a stopped background sign-in stays stopped"
+    );
     let slot = manager.cluster("dev").unwrap();
     assert!(slot.access.signed_in_once_access());
     assert!(!slot.access.unattended());

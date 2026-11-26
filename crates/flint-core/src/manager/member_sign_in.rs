@@ -13,9 +13,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::{ClusterManager, Internal};
+use super::{ClusterId, ClusterManager, Internal};
 use crate::connection::member::{MemberEvent, MemberState, ServerIdentity};
 use crate::connection::policy::{CredentialAccess, Role};
+use crate::handle::ConnectionState;
 use crate::handle::{AdmittedMember, Event};
 use crate::keep_watching::{PluginConsent, SignIn};
 
@@ -115,7 +116,6 @@ impl ClusterManager {
             }
             SignIn::Unknown => return Err(format!("\"{id}\" has a user Flint can't read.")),
         }
-        self.keep_watching_acted_on(id);
         let now = Instant::now();
         self.apply_member(id, MemberEvent::ConnectionLost, now);
         self.pump_members(now);
@@ -168,8 +168,9 @@ impl ClusterManager {
         // background sign-in's does.
         let check = self.launch_check(id, pending.consent);
         let spent = self.internal_tx.clone();
+        let grants = self.kept_grants();
         let cluster = id.to_owned();
-        Some(CredentialAccess::signed_in_once(
+        let access = CredentialAccess::signed_in_once(
             check,
             Arc::new(move || {
                 let _ = spent.send(Internal::MemberSignInSpent {
@@ -177,7 +178,28 @@ impl ClusterManager {
                     attempt,
                 });
             }),
-        ))
+            grants.runs(),
+        );
+        // Held with the members' grants: a quit or a new kubeconfig file list kills its program.
+        grants.admit_member(id, &access);
+        Some(access)
+    }
+
+    /// Members whose connection one sign-in from the set view made: up, and also those still
+    /// connecting.
+    pub(super) fn signed_in_once_members(&self) -> Vec<ClusterId> {
+        self.clusters
+            .iter()
+            .filter(|slot| {
+                slot.access.signed_in_once_access()
+                    && self.members.contains_key(&slot.info.name)
+                    && matches!(
+                        slot.state,
+                        ConnectionState::Connected(_) | ConnectionState::Connecting
+                    )
+            })
+            .map(|slot| slot.info.name.clone())
+            .collect()
     }
 
     /// Forgets a sign-in asked for `id` and not yet started.

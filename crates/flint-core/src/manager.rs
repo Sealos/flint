@@ -1685,6 +1685,9 @@ impl ClusterManager {
                 // Made under consent in the background: like a kept feed, its first failure
                 // waits for a sign-in, with no retry.
                 let unattended = slot.access.unattended() && !active;
+                // Made by one sign-in from the set view: an ended lease means it was used up, or
+                // a file change stopped it, and the member waits for a sign-in, with no retry.
+                let once = slot.access.signed_in_once_access() && !active;
                 // Dropped either way: the load that ends the pause connects again.
                 if paused {
                     slot.access.revoke();
@@ -1702,10 +1705,11 @@ impl ClusterManager {
                 // Its lease ended while it was being made (switched away and back), so what it
                 // returned, an error included, is no answer about the cluster. It is dropped, and
                 // the current selection connects anew under a new grant.
-                if (lease_ended && !unattended)
-                    || result
-                        .as_ref()
-                        .is_ok_and(|(connection, _)| connection.credential.spent())
+                if (lease_ended && !unattended && !once)
+                    || (!once
+                        && result
+                            .as_ref()
+                            .is_ok_and(|(connection, _)| connection.credential.spent()))
                 {
                     self.drop_to_reconnect(&cluster);
                     let now = Instant::now();
@@ -1719,13 +1723,18 @@ impl ClusterManager {
                     return;
                 }
                 let result = match result {
+                    Ok(_) if lease_ended && once => Err(running_set::sign_in_spent()),
                     Ok(_) if lease_ended => Err(running_set::consent_ended()),
+                    // Spent while connecting, as an ended lease is.
+                    Ok((connection, _)) if once && connection.credential.spent() => {
+                        Err(running_set::sign_in_spent())
+                    }
                     result => result,
                 };
                 let connected = result.is_ok();
                 let outcome = match &result {
                     Ok(_) => AttemptOutcome::Connected,
-                    Err(error) if rejected || unattended => {
+                    Err(error) if rejected || unattended || once => {
                         AttemptOutcome::AuthRejected(error.clone())
                     }
                     Err(error) => AttemptOutcome::Failed(error.clone()),

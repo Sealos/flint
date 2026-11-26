@@ -1294,18 +1294,22 @@ impl Workspace {
     /// What each member's Sign in is drawn for now ([`MemberSignIn`]).
     pub(super) fn member_sign_in(&self, run: &RunningSet, cx: &Context<Self>) -> MemberSignIn {
         let model = self.model.read(cx);
+        let active = model.active_cluster().map(|c| c.info.name.clone());
         let targets = run
             .members
             .iter()
             .map(|member| {
                 let view = model.keep_watching(member.context());
+                // The selected member signs in as the selected cluster, through selecting it.
+                let selected = active.as_deref() == Some(member.context());
                 let target = SignInTarget {
                     member: member.clone(),
                     definition: view.and_then(|view| view.definition),
                     shown: view.and_then(|view| view.shown_sign_in),
-                    in_place: view.is_none_or(|view| {
-                        view.sign_in != flint_core::keep_watching::BackgroundSignIn::Unavailable
-                    }),
+                    in_place: !selected
+                        && view.is_none_or(|view| {
+                            view.sign_in != flint_core::keep_watching::BackgroundSignIn::Unavailable
+                        }),
                 };
                 (member.context().to_owned(), target)
             })

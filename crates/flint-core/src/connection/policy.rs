@@ -230,10 +230,16 @@ impl CredentialAccess {
     /// Any later start is refused and retires the access for good, and `on_spent` is told, so
     /// nothing retries it and the member asks for a sign-in again. The manager never keeps this
     /// access on a selected cluster or outside the set.
-    pub(crate) fn signed_in_once(verify: SendCheck, on_spent: OnCredentialFailure) -> Self {
+    /// Its running program is counted in `runs`, so a quit waits for it to be killed.
+    pub(crate) fn signed_in_once(
+        verify: SendCheck,
+        on_spent: OnCredentialFailure,
+        runs: PluginRuns,
+    ) -> Self {
         let used = AtomicBool::new(false);
         let mut access = Self::new(Arc::new(SignedInOnce), Role::Background);
         access.once = true;
+        access.plugin_runs = Some(runs);
         // Weak: the check is held by the access it looks at.
         let roles = Arc::downgrade(&access.role);
         access.launch_check = Some(SendCheck::new(move || {

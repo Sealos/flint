@@ -730,11 +730,13 @@ async fn a_sign_in_once_starts_once() {
     });
     let spent = Arc::new(AtomicUsize::new(0));
     let told = Arc::clone(&spent);
+    let runs = PluginRuns::default();
     let access = CredentialAccess::signed_in_once(
         verify,
         Arc::new(move || {
             told.fetch_add(1, Ordering::SeqCst);
         }),
+        runs.clone(),
     );
     let grant = access.grant(CredentialSource::Plugin);
     assert!(grant.allowed());
@@ -745,6 +747,15 @@ async fn a_sign_in_once_starts_once() {
         "its program can't prompt and gets a null stdin"
     );
     assert!(!CredentialAccess::new(Arc::new(ForegroundOnly), Role::Foreground).takes_no_input());
+    {
+        let _running = grant.lease().track_run();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), runs.ended())
+                .await
+                .is_err(),
+            "a quit waits for its program"
+        );
+    }
     assert!(!access.grant(CredentialSource::AuthProvider).allowed());
     let first = grant.lease();
     assert!(
@@ -774,7 +785,7 @@ async fn a_sign_in_once_starts_once() {
 #[tokio::test]
 async fn a_refused_sign_in_once_is_used_up() {
     let verify = SendCheck::new(|| Box::pin(async { Err("changed".to_owned()) }));
-    let access = CredentialAccess::signed_in_once(verify, Arc::new(|| {}));
+    let access = CredentialAccess::signed_in_once(verify, Arc::new(|| {}), PluginRuns::default());
     let grant = access.grant(CredentialSource::Plugin);
     assert_eq!(
         grant.lease().launch_refusal().await.as_deref(),

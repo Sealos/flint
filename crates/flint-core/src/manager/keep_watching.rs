@@ -180,7 +180,7 @@ impl KeptGrants {
 
     /// Holds a member connection's `access`, in place of the one before it, so that ending the
     /// consent or quitting ends it too.
-    fn admit_member(&self, id: &str, access: &CredentialAccess) {
+    pub(super) fn admit_member(&self, id: &str, access: &CredentialAccess) {
         let mut live = self.live();
         if live.quitting {
             access.revoke();
@@ -531,6 +531,12 @@ impl ClusterManager {
                 slot.access.set_role(Role::Paused);
             }
         }
+        // And one signed in once from the set view: its program stops until the files are read.
+        for id in self.signed_in_once_members() {
+            if let Some(slot) = self.cluster(&id) {
+                slot.access.set_role(Role::Paused);
+            }
+        }
     }
 
     /// Members whose connection was made under consent: up, and also those still connecting
@@ -574,7 +580,11 @@ impl ClusterManager {
             for kept in self.keep.feeds.values().filter(|kept| kept.runs_plugin) {
                 kept.access.set_role(Role::Background);
             }
-            for id in self.consented_members(false) {
+            for id in self
+                .consented_members(false)
+                .into_iter()
+                .chain(self.signed_in_once_members())
+            {
                 if let Some(slot) = self.cluster(&id) {
                     slot.access.set_role(self.connection_role(&id));
                 }

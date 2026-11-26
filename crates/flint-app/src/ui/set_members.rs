@@ -180,7 +180,7 @@ pub(super) struct SignInTarget {
     pub(super) definition: Option<u64>,
     pub(super) shown: Option<u64>,
     /// Whether its sign-in can run from the set view. An auth provider's runs only for the
-    /// selected cluster, so its control selects it instead.
+    /// selected cluster, so its control selects it instead, as the selected member's does.
     pub(super) in_place: bool,
 }
 
