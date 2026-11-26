@@ -2150,7 +2150,7 @@ fn state_chip(state: &SyncState, feed: Feed, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// What a signed-out member's chip says instead of its sync state. Clicking the chip signs in.
+/// What a signed-out member's chip says instead of its sync state. Clicking it signs in.
 fn sign_in_chip(theme: &Theme) -> AnyElement {
     h_flex()
         .id("sync-state")

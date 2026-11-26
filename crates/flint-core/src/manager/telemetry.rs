@@ -107,8 +107,13 @@ impl ClusterManager {
         match self.connection_role(id) {
             Role::Foreground => true,
             // A member's connection made under background sign-in consent already runs its
-            // plugin: its feed reads through the same client and serves keep watching.
-            Role::Background => !credential.runs_a_command() || slot.access.unattended(),
+            // plugin: its feed reads through the same client and serves keep watching. One a
+            // single sign-in from the set view made reads through it too, and runs nothing more.
+            Role::Background => {
+                !credential.runs_a_command()
+                    || slot.access.unattended()
+                    || slot.access.signed_in_once_access()
+            }
             Role::Paused | Role::Retired => false,
         }
     }

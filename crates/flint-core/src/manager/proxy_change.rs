@@ -91,6 +91,8 @@ impl ClusterManager {
         // it, and one on a rerouted context by its moved route too.
         let forwards_ended = self.end_forwards_for_proxy();
         self.publish_holds();
+        // A member's sign-in asked for and not yet started was for its old route: forgotten.
+        self.drop_member_sign_ins();
 
         self.suspend_kept_plugins();
         self.marks.changed(self.read_seq);
