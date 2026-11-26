@@ -615,6 +615,12 @@ impl Workspace {
                 .is_some_and(|entry| entry.typed(cx).is_some())
     }
 
+    /// Whether closing the app or window would lose something typed in Settings: the draft (see
+    /// [`Self::has_settings_draft`]) or proxy text not applied.
+    pub(in crate::ui) fn has_unsaved_settings(&self, cx: &App) -> bool {
+        self.has_settings_draft(cx) || self.settings_page.network.is_typed()
+    }
+
     /// Asks Save / Discard / Cancel about unsaved settings, if there are any; Save (once
     /// written) and Discard run `then`. While a Save is being written, `then` waits for it
     /// instead. Whether the caller must stop.
@@ -638,7 +644,7 @@ impl Workspace {
     ) -> bool {
         // A threshold still being typed counts as an edit.
         self.finish_threshold_entry(true, window, cx);
-        if !self.has_settings_draft(cx) {
+        if !self.has_unsaved_settings(cx) {
             return false;
         }
         // A Save already on its way: close or quit once it is written, never before.
@@ -652,6 +658,31 @@ impl Workspace {
         let invalid = self.settings_invalid(cx);
         let rejected = self.settings_page.draft.has_rejected();
         let workspace = cx.weak_entity();
+        if self.settings_page.network.is_typed() {
+            // Save cannot apply a proxy (Apply asks first and reconnects the clusters), so the
+            // question can only drop what was typed.
+            let text = DialogText {
+                title: "Discard unsaved settings?".into(),
+                text: if self.settings_page.draft.is_dirty() {
+                    format!(
+                        "The proxy you typed is not applied, and Settings has unsaved edits. \
+                         {ending} drops both."
+                    )
+                } else {
+                    format!("The proxy you typed is not applied. {ending} drops it.")
+                },
+                ok: "Discard".into(),
+                cancel: "Cancel".into(),
+                id: "settings-draft-description",
+                default_cancel: true,
+            };
+            confirm::open(window, cx, text, move |window, cx| {
+                let then = then.clone();
+                let _ = workspace.update(cx, |ws, cx| ws.revert_settings(cx));
+                then(window, cx);
+            });
+            return true;
+        }
         if invalid || rejected {
             let why = if invalid {
                 "settings.toml is invalid"
@@ -679,8 +710,9 @@ impl Workspace {
         let text = DialogText {
             title: "Save your settings?".into(),
             text: format!(
-                "Settings has unsaved edits. Save writes them to settings.toml; Discard drops \
-                 them. {ending} goes on either way."
+                "Settings has unsaved edits. Save writes them to settings.toml, then {ending} goes \
+                 on; if the save fails, Flint stays open and says why. Discard drops them, and \
+                 {ending} goes on."
             ),
             ok: "Save".into(),
             cancel: "Cancel".into(),

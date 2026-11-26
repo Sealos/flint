@@ -2459,13 +2459,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         // Settings (#739): Cmd-, on macOS and Ctrl-, on Linux, as in most apps.
         Spec::unit::<OpenSettings>(
             "Settings",
-            "Open Flint's settings: appearance, notifications and the default watch mode.",
+            "Open Flint's settings: appearance, alerts, watching, thresholds, logs, paths, safety and proxy.",
         )
         .of(C::Flint, S::Settings)
         .keys(&[super::settings_view::OPEN_SETTINGS_KEY], Some(WORKSPACE)),
         Spec::unit::<CloseSettings>(
             "Close Settings",
-            "Leave Settings for the view shown before. Unsaved edits stay.",
+            "Close Settings. With unsaved edits, it asks whether to discard them first.",
         )
         .of(C::Flint, S::Settings)
         .keys(&["escape"], Some(super::settings_view::SETTINGS_KEYS)),
