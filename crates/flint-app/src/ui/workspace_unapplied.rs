@@ -7,7 +7,6 @@
 use std::rc::Rc;
 
 use flint_core::display::single_line;
-use gpui_kit::component::WindowExt as _;
 use gpui_kit::*;
 
 use super::{Workspace, connection_stopped};
@@ -65,7 +64,7 @@ impl Workspace {
         let Some(detail) = self.unapplied_edit(cx) else {
             return false;
         };
-        if window.has_active_dialog(cx) {
+        if confirm::any_open(window, cx) {
             return true;
         }
         self.list_in_front = false;

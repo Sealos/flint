@@ -338,6 +338,7 @@ enum Internal {
     /// Put a new proxy setting in use, then say what that did ([`crate::CoreHandle::apply_proxy`]).
     ApplyProxy {
         setting: settings::ProxySetting,
+        expected: settings::ProxySetting,
         reply: tokio::sync::oneshot::Sender<Result<crate::handle::ProxyApplied, String>>,
     },
     /// Time to report the proxy change `change`, whatever has not settled yet.
@@ -884,10 +885,16 @@ impl ClusterManager {
                     .internal_tx
                     .send(Internal::WriteSettings { writes, reply });
             }
-            Request::ApplyProxy { setting, reply } => {
-                let _ = self
-                    .internal_tx
-                    .send(Internal::ApplyProxy { setting, reply });
+            Request::ApplyProxy {
+                setting,
+                expected,
+                reply,
+            } => {
+                let _ = self.internal_tx.send(Internal::ApplyProxy {
+                    setting,
+                    expected,
+                    reply,
+                });
             }
             Request::ActivatePinned {
                 cluster,
@@ -1543,7 +1550,12 @@ impl ClusterManager {
             &self.settings,
             crate::connection::proxy::setting_unreadable_at_startup(),
         );
-        if *self.settings == settings && self.settings_error == error {
+        // The same settings from a file edited since are new too: a confirmation asked over the
+        // file as it was would not hold for it.
+        if *self.settings == settings
+            && self.settings.file_stamp.same(&settings.file_stamp)
+            && self.settings_error == error
+        {
             return;
         }
         self.settings = Arc::new(settings);
@@ -1576,8 +1588,12 @@ impl ClusterManager {
                 let applied = self.reload_kubeconfig().await;
                 let _ = reply.send(applied);
             }
-            Internal::ApplyProxy { setting, reply } => {
-                let result = self.apply_proxy(setting).await;
+            Internal::ApplyProxy {
+                setting,
+                expected,
+                reply,
+            } => {
+                let result = self.apply_proxy(setting, expected).await;
                 let _ = reply.send(result);
             }
             Internal::ProxyReportDue { change } => self.proxy_report_due(change),
@@ -3794,6 +3810,44 @@ mod tests {
         assert_eq!(manager.write_gate("dev").err(), protected);
         manager.reload_settings().await;
         assert_eq!(manager.write_gate("dev").err(), protected);
+    }
+
+    // covers UP-127: an outside edit to a key Flint ignores reaches the front end as new
+    // settings, so the confirmation asked again is over the file as it is and can go through.
+    #[tokio::test]
+    async fn an_edit_to_an_ignored_key_is_reported_as_new_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::events::channel();
+        let config = CoreConfig {
+            config_dir: dir.path().to_owned(),
+            settings: Settings::default(),
+            settings_error: None,
+            kubeconfig_base: kubeconfig_file(dir.path()),
+            home: None,
+            watch_files: false,
+            watch_timing: Default::default(),
+        };
+        let mut manager = ClusterManager::new(
+            config,
+            events,
+            HubRegistry::default(),
+            SessionUnlocks::default(),
+        );
+        settings::set_protect_local_clusters(dir.path(), true, None).unwrap();
+        manager.reload_settings().await;
+        let shown = manager.settings.clone();
+        let file = dir.path().join(settings::SETTINGS_FILE);
+        let mut text = std::fs::read_to_string(&file).unwrap();
+        text.push_str("\nsome_future_key = 1\n");
+        std::fs::write(&file, text).unwrap();
+
+        manager.reload_settings().await;
+        assert!(!Arc::ptr_eq(&shown, &manager.settings), "reported again");
+        let stale = settings::SettingsRevision::of(&shown);
+        assert!(settings::set_protect_local_clusters(dir.path(), false, Some(stale)).is_err());
+        let now = settings::SettingsRevision::of(&manager.settings);
+        let off = settings::set_protect_local_clusters(dir.path(), false, Some(now)).unwrap();
+        assert!(!off.protect_local_clusters);
     }
 
     // covers UP-54: a running port-forward stops being allowed once its context is held

@@ -112,12 +112,64 @@ struct Running {
     unbudgeted: bool,
 }
 
+/// Every workload's totals, worked out once when the readings arrive, off the UI thread, so that
+/// what draws only looks a workload up and never walks the pods.
+///
+/// The totals follow from the readings and the index they sit beside, so two of them are equal
+/// whenever those are, and comparing them compares nothing.
+#[derive(Debug, Clone, Default)]
+pub(in crate::ui) struct WorkloadTotals(Arc<HashMap<Arc<str>, Totals>>);
+
+impl WorkloadTotals {
+    /// Adds up every pod. Walks them all: not for the UI thread.
+    pub(in crate::ui) fn of(
+        index: &PodIndex,
+        samples: &BTreeMap<PodKey, PodSample>,
+        chain: OwnerChain,
+    ) -> Self {
+        Self(Arc::new(totals_by_owner(index, samples, chain)))
+    }
+
+    /// The totals of the workload with this `uid`, `None` if it has no counted pod.
+    pub(in crate::ui) fn get(&self, uid: &str) -> Option<Totals> {
+        self.0.get(uid).copied()
+    }
+}
+
+impl PartialEq for WorkloadTotals {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for WorkloadTotals {}
+
 /// The totals of every workload that has a counted pod, by the uid of the owner: the key of its
 /// row in the list.
-pub(in crate::ui) fn totals_by_owner(
+fn totals_by_owner(
     index: &PodIndex,
     samples: &BTreeMap<PodKey, PodSample>,
     chain: OwnerChain,
+) -> HashMap<Arc<str>, Totals> {
+    totals(index, samples, chain, None)
+}
+
+/// The totals of the one workload with this `uid`, `None` if it has no counted pod.
+#[cfg(test)]
+fn totals_of(
+    index: &PodIndex,
+    samples: &BTreeMap<PodKey, PodSample>,
+    chain: OwnerChain,
+    uid: &str,
+) -> Option<Totals> {
+    totals(index, samples, chain, Some(uid)).remove(uid)
+}
+
+fn totals(
+    index: &PodIndex,
+    samples: &BTreeMap<PodKey, PodSample>,
+    chain: OwnerChain,
+    only: Option<&str>,
 ) -> HashMap<Arc<str>, Totals> {
     let mut running: HashMap<Arc<str>, Running> = HashMap::new();
     let mut key = PodKey::default();
@@ -125,7 +177,9 @@ pub(in crate::ui) fn totals_by_owner(
         if pod.finished {
             continue;
         }
-        let Some(owner) = owner(index, pod, chain) else {
+        let Some(owner) =
+            owner(index, pod, chain).filter(|o| only.is_none_or(|uid| *o.uid == *uid))
+        else {
             continue;
         };
         key.0.clear();
@@ -451,6 +505,30 @@ mod tests {
         let read = PodIndex::for_tests([], Controllers::new());
         assert!(OwnerChain::ViaReplicaSets.is_known(&read));
         assert!(OwnerChain::ViaJobs.is_known(&read));
+    }
+
+    #[test]
+    fn one_workload_alone_is_the_same_as_its_entry_among_all() {
+        let sts = owner("StatefulSet", "apps", "db", "sts");
+        let other = owner("StatefulSet", "apps", "cache", "other");
+        let (index, samples) = index(
+            vec![
+                ("u1", "a", Some(sts.clone()), limited()),
+                ("u2", "b", Some(sts), limited()),
+                ("u3", "c", Some(other), limited()),
+            ],
+            Controllers::new(),
+        );
+        let all = totals_by_owner(&index, &samples, OwnerChain::Direct);
+        assert_eq!(
+            totals_of(&index, &samples, OwnerChain::Direct, "sts"),
+            Some(all["sts"])
+        );
+        assert_eq!(all["sts"].pods, 2);
+        assert_eq!(
+            totals_of(&index, &samples, OwnerChain::Direct, "none"),
+            None
+        );
     }
 
     #[test]

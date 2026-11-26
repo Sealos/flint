@@ -49,11 +49,18 @@ pub enum SettingsError {
     /// (or with no confirmation at all).
     #[error("{PROTECTION_CONFIRMATION_STALE}")]
     ProtectionConfirmationStale,
+    /// A proxy change reviewed over a `[proxy]` the file no longer holds.
+    #[error("{PROXY_CHANGED_SINCE_REVIEW}")]
+    ProxyChangedSinceReview,
 }
 
 /// Why turning local cluster protection off was refused: the confirmation was for other settings.
 pub const PROTECTION_CONFIRMATION_STALE: &str =
     "settings.toml changed after turning off local cluster protection was confirmed; confirm again";
+
+/// Why applying a proxy was refused: `settings.toml` holds another proxy than the one it was
+/// reviewed over ([`crate::CoreHandle::apply_proxy`]).
+pub const PROXY_CHANGED_SINCE_REVIEW: &str = "settings.toml changed: its proxy is not the one this change was reviewed over; review it again";
 
 /// Which kinds are watched while a cluster is active (ADR-0008).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -450,10 +457,31 @@ impl std::fmt::Debug for ProxySetting {
 }
 
 /// Replaces the `[proxy]` of `settings.toml` with `proxy`, or removes it when `proxy` sets
-/// nothing, and writes the file. Returns the settings as written. Only the core calls it, as it
-/// also puts the setting in use ([`crate::CoreHandle::apply_proxy`]).
-pub(crate) fn set_proxy(dir: &Path, proxy: &ProxySetting) -> Result<Settings, SettingsError> {
-    edit_settings(dir, |table, _| {
+/// nothing, and writes the file. Returns the settings as written. The change was reviewed over
+/// `expected`: if the file, as read for this write, holds another proxy (changed by hand or by
+/// another Flint since), nothing is written and [`SettingsError::ProxyChangedSinceReview`] says
+/// so. That check and the write hold a real file lock: where the folder supports none, nothing is
+/// written. Only the core calls it, as it also puts the setting in use
+/// ([`crate::CoreHandle::apply_proxy`]).
+pub(crate) fn set_proxy(
+    dir: &Path,
+    proxy: &ProxySetting,
+    expected: &ProxySetting,
+) -> Result<Settings, SettingsError> {
+    edit_settings_locked(dir, |table, path| {
+        let held: ProxySetting = match table.get("proxy") {
+            Some(value) => value
+                .clone()
+                .try_into()
+                .map_err(|source| SettingsError::Parse {
+                    path: path.to_owned(),
+                    source,
+                })?,
+            None => ProxySetting::default(),
+        };
+        if held.normalized() != expected.normalized() {
+            return Err(SettingsError::ProxyChangedSinceReview);
+        }
         // Keys of the table this version does not know survive.
         let mut entry = match table.remove("proxy") {
             Some(toml::Value::Table(entry)) => entry,
@@ -482,7 +510,7 @@ pub(crate) fn set_proxy(dir: &Path, proxy: &ProxySetting) -> Result<Settings, Se
         if !entry.is_empty() {
             table.insert("proxy".into(), toml::Value::Table(entry));
         }
-        Ok(())
+        Ok(true)
     })
 }
 
@@ -570,6 +598,72 @@ pub struct Settings {
     /// and put in use again when Settings saves it.
     #[serde(skip_serializing_if = "ProxySetting::is_empty")]
     pub proxy: ProxySetting,
+    /// The file these settings were read from or written as, down to keys this version ignores:
+    /// not a setting, and left out of comparing settings ([`FileStamp`]).
+    #[serde(skip)]
+    pub file_stamp: FileStamp,
+}
+
+/// The exact contents of `settings.toml` that [`Settings`] were read from or written as, as a
+/// digest. Built settings, and those read from no particular file, have no stamp, and match no
+/// file. It is not a setting: settings compare equal whatever their stamps, and a stamp counts
+/// only where [`FileStamp::same`] or [`SettingsRevision`] asks for it.
+#[derive(Clone, Copy, Default)]
+pub struct FileStamp(Stamp);
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Stamp {
+    /// Not read from a file, or read from one no longer known.
+    #[default]
+    Unknown,
+    /// No file: a first run.
+    Missing,
+    /// SHA-256 of the file's bytes.
+    Sha256([u8; 32]),
+}
+
+impl FileStamp {
+    /// The stamp of a file holding `text`, or of no file.
+    fn of(text: Option<&str>) -> Self {
+        FileStamp(match text {
+            None => Stamp::Missing,
+            Some(text) => {
+                let digest = ring::digest::digest(&ring::digest::SHA256, text.as_bytes());
+                let mut bytes = [0; 32];
+                bytes.copy_from_slice(digest.as_ref());
+                Stamp::Sha256(bytes)
+            }
+        })
+    }
+
+    /// Whether both stamp the same file contents, or neither stamps any.
+    pub fn same(&self, other: &FileStamp) -> bool {
+        self.0 == other.0
+    }
+
+    /// Whether `held`, a file just read, is the file this stamps. No stamp matches nothing.
+    fn matches(&self, held: &FileStamp) -> bool {
+        self.0 != Stamp::Unknown && self.0 == held.0
+    }
+}
+
+/// Not a setting: see [`FileStamp`].
+impl PartialEq for FileStamp {
+    fn eq(&self, _: &FileStamp) -> bool {
+        true
+    }
+}
+
+impl Eq for FileStamp {}
+
+impl std::fmt::Debug for FileStamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0 {
+            Stamp::Unknown => "FileStamp::Unknown",
+            Stamp::Missing => "FileStamp::Missing",
+            Stamp::Sha256(_) => "FileStamp::Sha256(..)",
+        })
+    }
 }
 
 impl Default for Settings {
@@ -595,6 +689,7 @@ impl Default for Settings {
             watched_clusters: Vec::new(),
             cluster_alerts: Vec::new(),
             proxy: ProxySetting::default(),
+            file_stamp: FileStamp::default(),
         }
     }
 }
@@ -727,6 +822,8 @@ impl Settings {
             trusted_clusters: Vec::new(),
             protect_local_clusters: true,
             watched_clusters: Vec::new(),
+            // Settings not as the file holds them stand for no file.
+            file_stamp: FileStamp::default(),
             ..self
         }
     }
@@ -886,9 +983,13 @@ fn config_dir_from(
 pub fn load_settings(dir: &Path) -> Result<Settings, SettingsError> {
     let path = dir.join(SETTINGS_FILE);
     let Some(text) = read_settings_text(&path)? else {
-        return Ok(Settings::default());
+        return Ok(Settings {
+            file_stamp: FileStamp::of(None),
+            ..Settings::default()
+        });
     };
-    let (settings, table) = parse_settings(&text, &path)?;
+    let (mut settings, table) = parse_settings(&text, &path)?;
+    settings.file_stamp = FileStamp::of(Some(&text));
     // Unknown keys are ignored, so a newer file still loads; a misspelling of a known key
     // (`protect_local_cluster`) would then fail open without a word. Say so in the log.
     for (unknown, known) in misspelled_keys(&table) {
@@ -1578,8 +1679,9 @@ pub enum SettingsWrite {
 }
 
 /// The settings a confirmation was asked over: what [`load_settings`] read, as the core last
-/// reported it, kept whole (credentials included, which `Debug` leaves out) so any change to the
-/// file since shows. A write that needs that confirmation compares it with the file under the
+/// reported it, kept whole (credentials included, which `Debug` leaves out) with the stamp of
+/// the file they were read from, so any change to the file since shows, keys this version
+/// ignores included. A write that needs that confirmation compares it with the file under the
 /// save lock, so it never applies over a file changed since.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsRevision(std::sync::Arc<Settings>);
@@ -1590,9 +1692,10 @@ impl SettingsRevision {
         SettingsRevision(std::sync::Arc::new(settings.clone()))
     }
 
-    /// Whether `settings` are the ones confirmed.
-    fn holds(&self, settings: &Settings) -> bool {
-        *self.0 == *settings
+    /// Whether `settings`, read from the file stamped `held`, are the ones confirmed, from that
+    /// same file. Settings with no stamp were read from no known file, and match none.
+    fn holds(&self, settings: &Settings, held: &FileStamp) -> bool {
+        *self.0 == *settings && self.0.file_stamp.matches(held)
     }
 }
 
@@ -1779,9 +1882,9 @@ impl SettingsWrite {
             } => Some(confirmed),
             _ => None,
         });
-        let edit = |table: &mut toml::Table, path: &Path| {
+        let edit = |table: &mut toml::Table, path: &Path, held: &FileStamp| {
             if let Some(confirmed) = unprotect {
-                check_confirmed(table, path, confirmed.as_ref())?;
+                check_confirmed(table, held, path, confirmed.as_ref())?;
             }
             let mut changed = false;
             for write in writes {
@@ -1790,11 +1893,11 @@ impl SettingsWrite {
             Ok(changed)
         };
         if unprotect.is_some() {
-            edit_settings_locked_with(dir, try_lock, edit)
+            edit_settings_locked_stamped(dir, try_lock, edit)
         } else {
             let path = dir.join(SETTINGS_FILE);
             let lock = lock_for_save(&path, try_lock)?;
-            edit_locked(&path, &lock, edit)
+            edit_locked_stamped(&path, &lock, edit)
         }
     }
 
@@ -1829,19 +1932,22 @@ impl SettingsWrite {
 }
 
 /// Refuses unless `table`, the file as read under the save lock, holds the settings `confirmed`
-/// stands for: turning protection off was confirmed over those, and over no others.
+/// stands for, and `held`, that file's stamp, is the one they were read from: turning protection
+/// off was confirmed over that file, and over no other, even one differing only in keys this
+/// version ignores.
 fn check_confirmed(
     table: &toml::Table,
+    held: &FileStamp,
     path: &Path,
     confirmed: Option<&SettingsRevision>,
 ) -> Result<(), SettingsError> {
-    let held: Settings = toml::Value::Table(table.clone())
+    let settings: Settings = toml::Value::Table(table.clone())
         .try_into()
         .map_err(|source| SettingsError::Parse {
             path: path.to_owned(),
             source,
         })?;
-    if confirmed.is_some_and(|c| c.holds(&held)) {
+    if confirmed.is_some_and(|c| c.holds(&settings, held)) {
         Ok(())
     } else {
         Err(SettingsError::ProtectionConfirmationStale)
@@ -2132,6 +2238,16 @@ fn edit_settings_locked_with(
     try_lock: TryLock,
     edit: impl FnOnce(&mut toml::Table, &Path) -> Result<bool, SettingsError>,
 ) -> Result<Settings, SettingsError> {
+    edit_settings_locked_stamped(dir, try_lock, |table, path, _| edit(table, path))
+}
+
+/// [`edit_settings_locked_with`] whose `edit` is also given the stamp of the file as read under
+/// the lock.
+fn edit_settings_locked_stamped(
+    dir: &Path,
+    try_lock: TryLock,
+    edit: impl FnOnce(&mut toml::Table, &Path, &FileStamp) -> Result<bool, SettingsError>,
+) -> Result<Settings, SettingsError> {
     let path = dir.join(SETTINGS_FILE);
     let lock = lock_for_save(&path, try_lock)?;
     if lock.file.is_none() {
@@ -2143,7 +2259,7 @@ fn edit_settings_locked_with(
             ),
         });
     }
-    edit_locked(&path, &lock, edit)
+    edit_locked_stamped(&path, &lock, edit)
 }
 
 /// The read, edit and write of [`edit_settings_if_changed`], all on the file `lock` was taken
@@ -2153,18 +2269,31 @@ fn edit_locked(
     lock: &SaveLock,
     edit: impl FnOnce(&mut toml::Table, &Path) -> Result<bool, SettingsError>,
 ) -> Result<Settings, SettingsError> {
-    let mut table = match read_settings_text(&lock.target)? {
-        Some(text) => parse_settings(&text, path)?.1,
+    edit_locked_stamped(path, lock, |table, path, _| edit(table, path))
+}
+
+/// [`edit_locked`] whose `edit` is also given the stamp of the file as read under the lock. The
+/// settings returned carry the stamp of the file as it is after the save.
+fn edit_locked_stamped(
+    path: &Path,
+    lock: &SaveLock,
+    edit: impl FnOnce(&mut toml::Table, &Path, &FileStamp) -> Result<bool, SettingsError>,
+) -> Result<Settings, SettingsError> {
+    let read = read_settings_text(&lock.target)?;
+    let held = FileStamp::of(read.as_deref());
+    let mut table = match &read {
+        Some(text) => parse_settings(text, path)?.1,
         None => toml::Table::new(),
     };
-    let changed = edit(&mut table, path)?;
+    let changed = edit(&mut table, path, &held)?;
     let text = toml::to_string_pretty(&table)?;
-    let settings: Settings = toml::from_str(&text).map_err(|source| SettingsError::Parse {
+    let mut settings: Settings = toml::from_str(&text).map_err(|source| SettingsError::Parse {
         path: path.to_owned(),
         source,
     })?;
     validate(&settings, path)?;
     if !changed {
+        settings.file_stamp = held;
         return Ok(settings);
     }
     let write_error = |source| SettingsError::Write {
@@ -2177,6 +2306,7 @@ fn edit_locked(
         )));
     }
     write_atomic(&lock.target, &text, DanglingLink::Keep)?;
+    settings.file_stamp = FileStamp::of(Some(&text));
     Ok(settings)
 }
 
@@ -3587,6 +3717,107 @@ mod tests {
         .unwrap();
         assert!(!off.protect_local_clusters);
         assert_eq!(off.log_buffer_lines, 6000);
+    }
+
+    // covers UP-127: the confirmation is over the whole file, so an edit to a key this version
+    // ignores, which leaves the settings as read unchanged, still asks again.
+    #[test]
+    fn unprotect_is_refused_after_an_edit_to_an_ignored_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(SETTINGS_FILE);
+        set_protect_local_clusters(dir.path(), true, None).unwrap();
+        let shown = load_settings(dir.path()).unwrap();
+        let confirmed = SettingsRevision::of(&shown);
+        let mut text = std::fs::read_to_string(&file).unwrap();
+        text.push_str("\nsome_future_key = true\n");
+        std::fs::write(&file, &text).unwrap();
+        assert_eq!(
+            load_settings(dir.path()).unwrap(),
+            shown,
+            "the same settings"
+        );
+
+        let refused = set_protect_local_clusters(dir.path(), false, Some(confirmed));
+        assert!(
+            matches!(refused, Err(SettingsError::ProtectionConfirmationStale)),
+            "{refused:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            text,
+            "nothing written"
+        );
+
+        // Asked again over the file as it is now, it goes through.
+        let now = SettingsRevision::of(&load_settings(dir.path()).unwrap());
+        let off = set_protect_local_clusters(dir.path(), false, Some(now)).unwrap();
+        assert!(!off.protect_local_clusters);
+    }
+
+    // covers UP-127: confirmed over the file as it still is, turning protection off goes through,
+    // first run included; settings read from no file match none.
+    #[test]
+    fn unprotect_goes_through_over_an_unchanged_file_and_only_a_read_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_run = SettingsRevision::of(&load_settings(dir.path()).unwrap());
+        let off = set_protect_local_clusters(dir.path(), false, Some(first_run)).unwrap();
+        assert!(!off.protect_local_clusters);
+
+        let on = set_protect_local_clusters(dir.path(), true, None).unwrap();
+        // What a save returns stamps the file it wrote.
+        let off = set_protect_local_clusters(dir.path(), false, Some(SettingsRevision::of(&on)));
+        assert!(!off.unwrap().protect_local_clusters);
+
+        set_protect_local_clusters(dir.path(), true, None).unwrap();
+        let built = Settings {
+            protect_local_clusters: true,
+            ..Settings::default()
+        };
+        assert_eq!(
+            load_settings(dir.path()).unwrap(),
+            built,
+            "the same settings"
+        );
+        let refused =
+            set_protect_local_clusters(dir.path(), false, Some(SettingsRevision::of(&built)));
+        assert!(
+            matches!(refused, Err(SettingsError::ProtectionConfirmationStale)),
+            "{refused:?}"
+        );
+        let fallback = load_settings(dir.path()).unwrap().unreadable_fallback();
+        let refused =
+            set_protect_local_clusters(dir.path(), false, Some(SettingsRevision::of(&fallback)));
+        assert!(refused.is_err());
+        assert!(load_settings(dir.path()).unwrap().protect_local_clusters);
+    }
+
+    // covers UP-127: a file that cannot be read or parsed under the save lock never turns
+    // protection off, whatever was confirmed.
+    #[test]
+    fn unprotect_is_refused_over_an_unreadable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(SETTINGS_FILE);
+        set_protect_local_clusters(dir.path(), true, None).unwrap();
+        let confirmed = SettingsRevision::of(&load_settings(dir.path()).unwrap());
+        let text = std::fs::read(&file).unwrap();
+
+        let mut bad = text.clone();
+        bad.extend_from_slice(b"\nnot toml\n");
+        let mut not_utf8 = text.clone();
+        not_utf8.extend_from_slice(b"\n# \xff\n");
+        for broken in [bad, not_utf8] {
+            std::fs::write(&file, &broken).unwrap();
+            let refused = set_protect_local_clusters(dir.path(), false, Some(confirmed.clone()));
+            assert!(refused.is_err(), "{refused:?}");
+            assert_eq!(std::fs::read(&file).unwrap(), broken, "nothing written");
+        }
+
+        // Gone behind a link that leads nowhere: not a first run, and refused too.
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("elsewhere.toml"), &file).unwrap();
+        let refused = set_protect_local_clusters(dir.path(), false, Some(confirmed));
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(std::fs::read(dir.path().join("elsewhere.toml")).is_err());
     }
 
     // covers UP-127: in one save with other settings, turning protection off is checked against

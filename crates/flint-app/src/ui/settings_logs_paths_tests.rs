@@ -4,7 +4,6 @@
 
 use std::path::{Path, PathBuf};
 
-use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::TestAppContextExt as _;
 use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
@@ -187,24 +186,30 @@ async fn wait_for_file(
 }
 
 async fn shown_dialog(cx: &mut TestAppContext, t: &TestWorkspace) -> DialogState {
-    cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
-        .await;
+    cx.wait_for(t.window, WAIT, |window, cx| {
+        super::confirm::any_open(window, cx)
+    })
+    .await;
     state(cx, t).dialog.expect("a dialog is open")
 }
 
 /// Waits for the dialog to close, and for its exit to finish drawing, so the next one's buttons
 /// are the only ones.
 async fn no_dialog(cx: &mut TestAppContext, t: &TestWorkspace) {
-    cx.wait_for(t.window, WAIT, |window, cx| !window.has_active_dialog(cx))
-        .await;
+    cx.wait_for(t.window, WAIT, |window, cx| {
+        !super::confirm::any_open(window, cx)
+    })
+    .await;
     cx.executor()
         .advance_clock(std::time::Duration::from_secs(1));
     cx.run_until_parked();
 }
 
 fn has_dialog(cx: &mut TestAppContext, t: &TestWorkspace) -> bool {
-    cx.update_window(t.window, |_, window, cx| window.has_active_dialog(cx))
-        .unwrap()
+    cx.update_window(t.window, |_, window, cx| {
+        super::confirm::any_open(window, cx)
+    })
+    .unwrap()
 }
 
 /// The protection the sidebar shows for the loopback `kind-alpha` context, a known local one.

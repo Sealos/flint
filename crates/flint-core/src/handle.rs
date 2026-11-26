@@ -368,6 +368,8 @@ pub(crate) enum Request {
     /// Save this proxy setting, put it in use and connect everything again on it.
     ApplyProxy {
         setting: crate::settings::ProxySetting,
+        /// The saved proxy the change was reviewed over.
+        expected: crate::settings::ProxySetting,
         reply: oneshot::Sender<Result<ProxyApplied, String>>,
     },
     /// Activates `cluster` only if it is still the slot and definition given, in the same step.
@@ -1269,14 +1271,23 @@ impl CoreHandle {
     /// port-forward ends. Contexts the new setting reaches another way are on another route, so
     /// sessions and grants pinned to the old one end, as for a re-pointed context. Refused,
     /// changing nothing, for a setting [`crate::settings::ProxySetting::check`] refuses, while
-    /// `settings.toml` is invalid, or while it was unreadable when Flint started. What it says
-    /// holds none of the proxy's credentials. Works on any executor.
+    /// `settings.toml` is invalid, or while it was unreadable when Flint started. Refused too,
+    /// writing and reconnecting nothing, when the file's proxy is no longer `expected`, the saved
+    /// proxy the change was reviewed over (the error holds
+    /// [`crate::settings::PROXY_CHANGED_SINCE_REVIEW`]); the file is then read again, so its
+    /// proxy is reported. What it says holds none of the proxy's credentials. Works on any
+    /// executor.
     pub fn apply_proxy(
         &self,
         setting: crate::settings::ProxySetting,
+        expected: crate::settings::ProxySetting,
     ) -> impl Future<Output = Result<ProxyApplied, String>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let sent = self.requests.push(Request::ApplyProxy { setting, reply });
+        let sent = self.requests.push(Request::ApplyProxy {
+            setting,
+            expected,
+            reply,
+        });
         async move {
             if sent.is_err() {
                 return Err("the proxy setting could not be sent to be saved".to_owned());

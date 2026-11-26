@@ -390,7 +390,6 @@ impl Workspace {
                 this.open_view(&open, window, cx);
             }
             NavEvent::OpenOverview => {
-                this.leave_settings_for_view();
                 this.leave_home();
                 this.open_overview(window, cx)
             }
@@ -1467,16 +1466,32 @@ impl Workspace {
             // Connecting from the sidebar leaves focus there, so its arrows keep working.
             let take_focus =
                 self.palette.is_none() && !self.sidebar_focus.contains_focused(window, cx);
-            self.show_dashboard(take_focus, window, cx);
+            self.show_dashboard(take_focus, true, window, cx);
         }
     }
 
     /// Shows the active cluster's overview in place of its list. Go Back returns to the list.
     fn open_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_dashboard(true, window, cx);
+        self.show_dashboard(true, true, window, cx);
     }
 
-    fn show_dashboard(&mut self, take_focus: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// Shows the overview for Go Back and Go Forward, which keep the history themselves.
+    pub(super) fn show_overview(
+        &mut self,
+        remember: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_dashboard(true, remember, window, cx);
+    }
+
+    fn show_dashboard(
+        &mut self,
+        take_focus: bool,
+        remember: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let (Some(cluster), Some(generation)) = (self.cluster.clone(), self.generation) else {
             return;
         };
@@ -1487,16 +1502,14 @@ impl Workspace {
             }
             return;
         }
-        if self.asks_before_leaving(window, cx, |ws, window, cx| ws.open_dashboard(window, cx)) {
+        if self.asks_before_leaving(window, cx, move |ws, window, cx| {
+            ws.show_dashboard(take_focus, remember, window, cx)
+        }) {
             return;
         }
-        // Any place other than the list shown: the overview is not one Go Back returns to.
-        let overview = keys::Place {
-            kind: KindId::new("flint.overview", "overview"),
-            object: None,
-            seen: None,
-        };
-        self.remember_place(&overview, cx);
+        if remember {
+            self.remember_place(&keys::Place::overview(), cx);
+        }
         self.close_list(cx);
         let model = self.model.clone();
         let view = cx.new(|cx| DashboardView::following(model, cluster, generation, cx));
@@ -1694,6 +1707,12 @@ impl Workspace {
                     }
                     return;
                 }
+                // Opened from a row: the switcher lists it among the recent objects.
+                self.history.opened(
+                    object.kind.clone(),
+                    object.namespace.clone(),
+                    object.name.clone(),
+                );
                 // Moving between rows keeps the tab the user was on.
                 let tab = if std::mem::take(&mut self.startup_yaml) {
                     DetailTab::Yaml
@@ -1927,6 +1946,7 @@ impl Workspace {
             .text_color(theme.sidebar_foreground)
             .border_r_1()
             .border_color(theme.sidebar_border)
+            .pr(px(HANDLE_GUTTER))
             .child(pane_title("CLUSTERS", traffic_lights, theme))
             .child(self.render_home_entry(theme, cx))
             .child(list)
@@ -2289,6 +2309,7 @@ impl Workspace {
             .text_color(theme.sidebar_foreground)
             .border_r_1()
             .border_color(theme.sidebar_border)
+            .pr(px(HANDLE_GUTTER))
             .child(pane_title("RESOURCES", px(0.), theme))
             .child(div().flex_1().min_h_0().child(self.nav.clone()))
             .child(pane_handle(
@@ -3005,9 +3026,6 @@ impl Workspace {
     }
 
     fn render_main(&self, window_width: f32, theme: &Theme, cx: &Context<Self>) -> AnyElement {
-        if let Some(settings) = self.render_settings_page(theme, cx) {
-            return settings;
-        }
         if self.home.open
             && let Some(home) = self.render_home(theme, cx)
         {
@@ -3116,6 +3134,7 @@ impl Workspace {
                                 .relative()
                                 .border_l_1()
                                 .border_color(theme.border)
+                                .pl(px(HANDLE_GUTTER))
                                 .child(detail)
                                 .children(self.detail_tag_strip(theme, cx))
                                 .child(pane_handle(
@@ -3773,6 +3792,22 @@ fn sidebar_error(
         .into_any_element()
 }
 
+/// The width of a resize handle's band (gpui's 1 px line and 4 px of padding). A pane keeps this
+/// much of its edge free of content, so the band takes the pointer only over empty space.
+const HANDLE_GUTTER: f32 = 5.;
+
+/// Whether the top of the main area needs its own strip to drag the window by: only where nothing
+/// else draws there. The Settings page (with its own title bar), a set's bar and a held edit
+/// have content at the top, and a strip over them would swallow presses meant for it.
+fn window_strip_shown(
+    has_cluster: bool,
+    settings_open: bool,
+    set_running: bool,
+    edit_alone: bool,
+) -> bool {
+    !(has_cluster || settings_open || set_running || edit_alone)
+}
+
 /// The drag handle on one edge of a resizable pane.
 fn pane_handle(id: &'static str, pane: Pane, edge: HandleEdge) -> impl IntoElement {
     resize_handle::<PaneDrag, PaneDrag>(id, Axis::Horizontal)
@@ -3996,7 +4031,7 @@ fn header_shell(
         first_row
             .border_b_1()
             .border_color(theme.border)
-            .children(controls)
+            .child(super::theme::keeps_press(h_flex().flex_none().gap_2()).children(controls))
             .into_any_element()
     }
 }
@@ -4140,9 +4175,8 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_namespace_picker_with_dialog(window, cx);
         self.close_finished_held_edit(window, cx);
-        self.settings_follow_main();
+        self.settings_follow_dialog(window, cx);
         self.home_follow_main(cx);
-        self.flush_threshold_entry(cx);
         self.follow_threshold_rows(cx);
         self.close_orphaned_threshold_entry(window, cx);
         self.sync_settings_fields(window, cx);
@@ -4156,6 +4190,12 @@ impl Render for Workspace {
         let theme = cx.theme();
         // With Home shown there is no header either.
         let has_cluster = self.model.read(cx).active_cluster().is_some() && !self.home_shown(cx);
+        let strip_shown = window_strip_shown(
+            has_cluster,
+            self.settings_page.open,
+            self.sets.running.is_some(),
+            self.edit_shown_alone(cx).is_some(),
+        );
         let widths = self.layout(window_width, cx);
         let traffic_lights = super::theme::traffic_light_inset(window);
         h_flex()
@@ -4180,7 +4220,6 @@ impl Render for Workspace {
             }))
             .capture_action(cx.listener(|this, _: &OpenObject, _, _| {
                 this.list_in_front = false;
-                this.leave_settings_for_view();
                 this.leave_home();
             }))
             .capture_action(cx.listener(|this, _: &EditYaml, _, _| this.list_in_front = false))
@@ -4226,7 +4265,7 @@ impl Render for Workspace {
                     .relative()
                     // With no cluster there is no header, and the window still needs a top to
                     // drag it by.
-                    .when(!has_cluster, |el| {
+                    .when(strip_shown, |el| {
                         el.child(
                             super::theme::moves_window(div())
                                 .absolute()
@@ -4259,6 +4298,7 @@ impl Render for Workspace {
                                 .relative()
                                 .border_t_1()
                                 .border_color(theme.border)
+                                .pt(px(HANDLE_GUTTER))
                                 .child(self.dock.clone())
                                 .child(
                                     resize_handle::<DockDrag, DockDrag>(
@@ -4411,9 +4451,9 @@ mod view_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        Layout, LockEntry, MIN_LIST_WIDTH, ServerMove, access_mode_short_text, control_name,
-        exposure_label, layout, lock_label, lock_menu, mode_name, namespace_summary,
-        no_contexts_text, repointed_text, watch_mode_label,
+        HANDLE_GUTTER, Layout, LockEntry, MIN_LIST_WIDTH, ServerMove, access_mode_short_text,
+        control_name, exposure_label, layout, lock_label, lock_menu, mode_name, namespace_summary,
+        no_contexts_text, repointed_text, watch_mode_label, window_strip_shown,
     };
     use flint_core::settings::{AiExposureState, PaneWidths, TrustState};
     use flint_core::{Protection, WatchMode};
@@ -4819,5 +4859,22 @@ mod tests {
             broken.lines
         );
         assert_eq!(broken.lines[1..], unset.lines[..]);
+    }
+
+    #[test]
+    fn the_window_strip_shows_only_over_an_empty_main_area() {
+        assert!(window_strip_shown(false, false, false, false));
+        // A cluster has its header; Settings has its title bar; a set has its bar; a held edit
+        // has its pane. A strip over any of them would take their presses.
+        assert!(!window_strip_shown(true, false, false, false));
+        assert!(!window_strip_shown(false, true, false, false));
+        assert!(!window_strip_shown(false, false, true, false));
+        assert!(!window_strip_shown(false, false, false, true));
+    }
+
+    #[test]
+    fn the_handle_gutter_covers_the_whole_band() {
+        // gpui's band: a 1 px line and 4 px of padding on the inner side.
+        assert_eq!(HANDLE_GUTTER, 1. + 4.);
     }
 }

@@ -343,8 +343,23 @@ impl ResourceList {
                 let (core, cluster) = (core.clone(), cluster.clone());
                 let mut updates = core.telemetry_updates();
                 cx.spawn(async move |this, cx| {
+                    let mut last: Option<UsageSource> = None;
                     while updates.changed().await {
-                        let source = UsageSource::of(subject, core.telemetry(&cluster).as_ref());
+                        let telemetry = core.telemetry(&cluster);
+                        // Adding up workloads walks every pod: not on the UI thread.
+                        let previous = last.take();
+                        let (source, previous) = cx
+                            .background_spawn(async move {
+                                let source = UsageSource::after(
+                                    subject,
+                                    telemetry.as_ref(),
+                                    previous.as_ref(),
+                                );
+                                (source, previous)
+                            })
+                            .await;
+                        drop(previous);
+                        last = Some(source.clone());
                         if this
                             .update(cx, |list, cx| list.set_usage_source(source, cx))
                             .is_err()
@@ -471,6 +486,11 @@ impl ResourceList {
 
     /// Whether an object opened by name waits for its row ([`ResourceList::select_listed`]),
     /// or the list says it is missing: either way, not the bare list.
+    /// The object an open by name still waits for.
+    pub fn pending_object(&self) -> Option<&(Option<String>, String)> {
+        self.pending_select.as_ref()
+    }
+
     pub fn picking(&self) -> bool {
         self.pending_select.is_some() || self.missing.is_some()
     }

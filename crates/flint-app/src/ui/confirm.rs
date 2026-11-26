@@ -573,6 +573,13 @@ pub fn close_newest(window: &mut Window, cx: &mut App) {
     window.close_dialog(cx);
 }
 
+/// Whether a confirmation opened here is still unanswered in `window`. Unlike
+/// [`WindowExt::has_active_dialog`], the Settings modal does not count: a question asked from
+/// inside it (or a quit over it) opens above it.
+pub fn any_open(window: &mut Window, cx: &mut App) -> bool {
+    newest(window, cx).is_some()
+}
+
 /// The newest confirmation open in `window`, if any.
 fn newest(window: &mut Window, cx: &mut App) -> Option<LiveDialog> {
     if !window.has_active_dialog(cx) {

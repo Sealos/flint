@@ -1,5 +1,6 @@
-//! UP-126 and UP-67: the Settings view (#740, #741), in the running app. Its draft, Revert, the
-//! on-disk banner and the quit question are view-tested in `flint-app` (`settings_view_tests.rs`,
+//! UP-126 and UP-67: the Settings view (#740, #741), a modal over the main window (#854), in the
+//! running app. Its draft, Revert, the on-disk banner, the Discard / Keep editing question and the
+//! quit question are view-tested in `flint-app` (`settings_view_tests.rs`,
 //! `settings_thresholds_tests.rs`); here the shortcut opens it, edits (an appearance, a threshold
 //! and a cluster override) wait for Save, and Save writes `settings.toml`.
 
@@ -23,10 +24,12 @@ fn up_126_settings_opens_from_its_key_and_saves_the_appearance() -> Result<()> {
     let app = App::launch(AppOptions::new(&cluster.kubeconfig))?;
     connect(&app, &cluster.context)?;
 
+    let main = app.state()?["main"]["view"].clone();
     app.press_key("secondary-,")?;
-    app.wait_for("/settings/open", Equals(true.into()))?;
-    app.wait_for("/main/view", Equals("settings".into()))?;
-    assert_eq!(app.state()?["settings"]["appearance"], "system");
+    let state = app.wait_for("/settings/open", Equals(true.into()))?;
+    // A modal over the main window: the main area stays as it was.
+    assert_eq!(state["main"]["view"], main, "{state}");
+    assert_eq!(state["settings"]["appearance"], "system");
 
     // The Dark button's action: an edit, not written yet.
     app.dispatch("settings::EditAppearance", json!({ "appearance": "dark" }))?;
@@ -46,8 +49,11 @@ fn up_126_settings_opens_from_its_key_and_saves_the_appearance() -> Result<()> {
     assert!(!stored.contains("watch_mode"), "{stored}");
     assert!(!stored.contains("desktop_notifications"), "{stored}");
 
+    // Saved: Settings stayed open, and Esc closes it without asking.
+    assert_eq!(app.state()?["settings"]["open"], true);
     app.press_key("escape")?;
     app.wait_for("/settings/open", Equals(false.into()))?;
+    assert_eq!(app.state()?["dialog"], Value::Null);
     Ok(())
 }
 

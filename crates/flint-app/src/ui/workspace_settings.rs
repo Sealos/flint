@@ -1,7 +1,13 @@
-//! The workspace's side of the Settings view ([`settings_view`]): opening and leaving it, its
-//! actions and their guards, Save and Revert, its keyboard cycle, its place in the main area and
-//! the sidebar, and the Save / Discard / Cancel question when the window closes or the app quits
-//! with a draft.
+//! The workspace's side of the Settings view ([`settings_view`]): the modal it is drawn in,
+//! opening and closing it (Discard / Keep editing with unsaved edits), its actions and their
+//! guards, Save and Revert, its keyboard cycle, the sidebar's entry, and the Save / Discard /
+//! Cancel question when the window closes or the app quits with a draft.
+//!
+//! The modal is a gpui-kit dialog, drawn in the window's dialog layer rather than inside the
+//! workspace, so [`SettingsModal`] draws the workspace's page there and forwards the Settings
+//! actions to the workspace ([`Forward`]). Confirmations asked from inside it (turning
+//! protection off, applying a proxy, discarding) open above it, and focus goes back to where it
+//! was once it closes.
 //!
 //! Save hands the edited fields to the core ([`flint_core::CoreHandle::write_settings`]), which
 //! writes them all in one save, each as the setter the View menu, the Alerts menu and the header
@@ -12,16 +18,17 @@
 
 use std::rc::Rc;
 
-use gpui_kit::component::{Theme, WindowExt as _};
+use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::component::{ActiveTheme as _, Theme, WindowExt as _};
 use gpui_kit::*;
 
 use super::super::confirm::{self, DialogText};
-use super::super::registry::{Bind, Guards, OnView};
+use super::super::registry::{Bind, Forward, Guards, OnView};
 use super::super::settings_draft::{Change, SettingsDraft};
 use super::super::settings_view::{
     self, ActivateSettingsControl, CloseSettings, EditAppearance, EditDesktopNotifications,
-    EditWatchMode, MainKey, NextSettingsControl, OpenSettings, PreviousSettingsControl,
-    RevertSettings, SaveSettings, Saving, ShowSettingsSection, Stop, Then,
+    EditWatchMode, NextSettingsControl, OpenSettings, PreviousSettingsControl, RevertSettings,
+    SaveSettings, Saving, ShowSettingsSection, Stop, Then,
 };
 #[cfg(any(test, feature = "automation"))]
 use super::super::view_state::SettingsState;
@@ -40,6 +47,46 @@ const UNCONFIRMED: &str =
 const EDITED_WHILE_SAVING: &str =
     "Saved. Edits made while saving are not saved yet; save or revert them, then try again.";
 
+/// The widest the Settings modal gets; a narrower window narrows it.
+const MODAL_WIDTH: f32 = 960.;
+/// The tallest the Settings modal gets.
+const MODAL_HEIGHT: f32 = 680.;
+/// What the modal leaves of the window above and below it, at least.
+const MODAL_MARGIN: f32 = 48.;
+
+/// What closing Settings with unsaved edits asks.
+pub(in crate::ui) const DISCARD_TITLE: &str = "Close Settings without saving?";
+
+/// The Settings page drawn in its modal, over the workspace that holds it. Drawn again whenever
+/// the workspace changes, since the dialog layer is not part of the workspace's frame.
+struct SettingsModal {
+    workspace: WeakEntity<Workspace>,
+    _redraw: Subscription,
+}
+
+impl Render for SettingsModal {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return div().into_any_element();
+        };
+        let height = (window.viewport_size().height - px(2. * MODAL_MARGIN))
+            .min(px(MODAL_HEIGHT))
+            .max(px(0.));
+        let page = workspace.read(cx).render_settings_page(cx.theme(), cx);
+        let modal = div()
+            .id("settings-modal")
+            .w_full()
+            .h(height)
+            .flex()
+            .children(page)
+            .test_support();
+        // Keys pressed in the modal go up the dialog layer, not the workspace: handled here.
+        Workspace::bind_settings_actions(Forward::new(modal, Some(&workspace)))
+            .into_element()
+            .into_any_element()
+    }
+}
+
 impl Workspace {
     pub(super) fn settings_guards(guards: Guards<Self>) -> Guards<Self> {
         fn open(ws: &Workspace, _: &App) -> bool {
@@ -49,9 +96,9 @@ impl Workspace {
         fn editable(ws: &Workspace, _: &App) -> bool {
             ws.settings_page.open && ws.settings_page.saving.is_none()
         }
+        // Show Settings Section opens Settings when it is closed.
         Self::network_guards(Self::logs_paths_guards(Self::threshold_guards(guards)))
             .when::<CloseSettings>(open)
-            .when::<ShowSettingsSection>(open)
             .when::<NextSettingsControl>(open)
             .when::<PreviousSettingsControl>(open)
             .when::<ActivateSettingsControl>(open)
@@ -117,58 +164,155 @@ impl Workspace {
         Self::bind_settings_actions(OnView::new(element, cx)).into_element()
     }
 
-    /// Shows Settings in the main area, with focus in it.
+    /// Opens the Settings modal, with focus in it; with it open already, focus goes back into
+    /// it. Not over a confirmation still waiting for an answer.
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_page.open {
+            if !confirm::any_open(window, cx) {
+                window.focus(&self.settings_page.focus, cx);
+            }
+            return;
+        }
+        if confirm::any_open(window, cx) {
+            return;
+        }
         self.settings_page.open = true;
-        self.settings_page.opened_over = Some(self.main_key());
         self.settings_page.cursor = None;
         self.ensure_settings_inputs(window, cx);
         self.ensure_network_inputs(window, cx);
+        let workspace = cx.entity();
+        let modal = cx.new(|cx| SettingsModal {
+            workspace: workspace.downgrade(),
+            _redraw: cx.observe(&workspace, |_, _, cx| cx.notify()),
+        });
+        let close = workspace.downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let close = close.clone();
+            #[cfg(feature = "automation")]
+            let dialog = dialog.entrance(gpui_kit::component::dialog::DialogEntrance::None);
+            dialog
+                .w(px(MODAL_WIDTH))
+                .p_0()
+                .close_button(false)
+                .child(modal.clone())
+                // Enter belongs to the control under the cursor, never to the modal.
+                .on_ok(|_, _, _| false)
+                // Esc in a text field, or a click outside: the workspace decides, and closes it.
+                .on_cancel(move |_, window, cx| {
+                    let _ = close.update(cx, |ws, cx| ws.close_settings(window, cx));
+                    false
+                })
+        });
+        // The dialog took focus as it opened: hand it on to the view.
         window.focus(&self.settings_page.focus, cx);
         cx.notify();
     }
 
-    /// Leaves Settings for what the main area showed before. The draft stays.
+    /// Closes Settings: at once without unsaved edits, otherwise after asking Discard / Keep
+    /// editing. A Save under way closes it once written. Only while Settings is the newest
+    /// dialog: a confirmation over it is answered first.
     fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.settings_page.open {
+        if !self.settings_page.open || confirm::any_open(window, cx) {
             return;
         }
-        self.finish_threshold_entry(true, window, cx);
-        self.leave_settings_for_view();
-        window.focus(&self.focus, cx);
-        self.recover_focus(window, cx);
+        if let Some(saving) = &mut self.settings_page.saving {
+            let workspace = cx.weak_entity();
+            // Run inside the workspace's update (finish_save): closing waits for it to end.
+            saving
+                .after
+                .push(Rc::new(move |window: &mut Window, cx: &mut App| {
+                    let workspace = workspace.clone();
+                    window.defer(cx, move |window, cx| {
+                        let _ = workspace.update(cx, |ws, cx| ws.close_settings(window, cx));
+                    });
+                }));
+            return;
+        }
+        if !self.settings_unsaved(cx) {
+            self.dismiss_settings(window, cx);
+            return;
+        }
+        let text = DialogText {
+            title: DISCARD_TITLE.into(),
+            text: "Settings has unsaved edits. Discard drops them and closes Settings.".into(),
+            ok: "Discard".into(),
+            cancel: "Keep editing".into(),
+            id: "settings-discard-description",
+            // Dropping the edits takes the button: Enter keeps editing.
+            default_cancel: true,
+        };
+        let workspace = cx.weak_entity();
+        confirm::open(window, cx, text, move |window, cx| {
+            let workspace = workspace.clone();
+            // Once this confirmation has closed, so that Settings is the newest dialog again.
+            window.defer(cx, move |window, cx| {
+                let _ = workspace.update(cx, |ws, cx| {
+                    if ws.settings_page.open
+                        && ws.settings_page.saving.is_none()
+                        && !confirm::any_open(window, cx)
+                    {
+                        ws.dismiss_settings(window, cx);
+                    }
+                });
+            });
+        });
+    }
+
+    /// Whether closing Settings would lose something: the draft, a field still open, or proxy
+    /// text not applied.
+    fn settings_unsaved(&self, cx: &App) -> bool {
+        self.has_settings_draft(cx)
+            || self.settings_page.thresholds.entry.is_some()
+            || self.settings_page.network.is_typed()
+    }
+
+    /// Drops whatever Settings holds and closes the modal, which gives focus back to where it
+    /// was when Settings opened.
+    fn dismiss_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.forget_settings(window, cx);
+        window.close_dialog(cx);
+    }
+
+    /// Drops the draft and what the sections hold, and marks Settings closed.
+    fn forget_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_threshold_entry(false, window, cx);
+        self.revert_settings(cx);
+        self.discard_network_fields();
+        self.settings_page.open = false;
+        self.settings_page.cursor = None;
         cx.notify();
     }
 
-    /// What the main area shows under Settings, as far as Settings gives way to it: another
-    /// cluster or a set opened meanwhile. Views that open by themselves (a list restored, the
-    /// overview once discovery ends) do not count; the navigation and Open Object leave
-    /// Settings on their own.
-    pub(super) fn main_key(&self) -> MainKey {
-        MainKey {
-            cluster: self.cluster.clone(),
-            set: self.sets.running.as_ref().map(|r| r.list.entity_id()),
-        }
-    }
-
-    /// Leaves Settings when another cluster or a set was opened meanwhile. Called as the
-    /// workspace draws.
-    pub(super) fn settings_follow_main(&mut self) {
+    /// Forgets the modal when its dialog was closed by something other than Settings itself.
+    /// Called as the workspace draws.
+    pub(super) fn settings_follow_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.settings_page.open {
             return;
         }
-        let now = self.main_key();
-        if self.settings_page.opened_over.as_ref() != Some(&now) {
-            self.leave_settings_for_view();
+        if !window.has_active_dialog(cx) {
+            self.forget_settings(window, cx);
+            return;
         }
-    }
-
-    /// Leaves Settings for a view the navigation opens, even the one shown before.
-    pub(super) fn leave_settings_for_view(&mut self) {
-        self.settings_page.open = false;
-        self.settings_page.opened_over = None;
-        self.settings_page.cursor = None;
-        // A field still open is entered as the workspace next draws (flush_threshold_entry).
+        // Focus is trapped in the modal: a view behind it that took focus (the overview once
+        // discovery ends, a list restored) gives it back, unless a confirmation holds it.
+        let page = &self.settings_page;
+        // A field just opened is not drawn yet, so the view does not contain it until it is.
+        let in_settings = page.focus.contains_focused(window, cx)
+            || page
+                .thresholds
+                .entry
+                .as_ref()
+                .is_some_and(|entry| entry.input.focus_handle(cx).is_focused(window))
+            || page.logs_paths.focused(window, cx).is_some()
+            || page.network.focused(window, cx).is_some();
+        let focus = page.focus.clone();
+        if !in_settings && !confirm::any_open(window, cx) {
+            window.defer(cx, move |window, cx| {
+                if !confirm::any_open(window, cx) {
+                    window.focus(&focus, cx);
+                }
+            });
+        }
     }
 
     fn settings_invalid(&self, cx: &App) -> bool {
@@ -186,6 +330,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.settings_page.open {
+            self.open_settings(window, cx);
+        }
         if self.settings_page.open {
             self.finish_threshold_entry(true, window, cx);
             self.settings_page.section = section;
@@ -398,7 +545,7 @@ impl Workspace {
             return;
         }
         match stop {
-            Stop::Done => self.close_settings(window, cx),
+            Stop::Close => self.close_settings(window, cx),
             Stop::Reload | Stop::Revert => {
                 self.finish_threshold_entry(false, window, cx);
                 self.revert_settings(cx)
@@ -426,12 +573,8 @@ impl Workspace {
         settings_view::banner_shown(&self.settings_page, &self.model.read(cx).settings)
     }
 
-    /// The Settings view in the main area, while it is open.
-    pub(super) fn render_settings_page(
-        &self,
-        theme: &Theme,
-        cx: &Context<Self>,
-    ) -> Option<AnyElement> {
+    /// The Settings view, drawn in its modal, while it is open.
+    fn render_settings_page(&self, theme: &Theme, cx: &App) -> Option<AnyElement> {
         if !self.settings_page.open {
             return None;
         }
@@ -503,7 +646,7 @@ impl Workspace {
             saving.after.push(then);
             return true;
         }
-        if window.has_active_dialog(cx) {
+        if confirm::any_open(window, cx) {
             return true;
         }
         let invalid = self.settings_invalid(cx);

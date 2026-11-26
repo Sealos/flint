@@ -1,9 +1,10 @@
-//! View tests for the Settings view (#740): opening it from its key and the palette, the draft
-//! with Save and Revert, the banner when `settings.toml` changes under a draft, and the
+//! View tests for the Settings view (#740) and its modal (#854): opening it from each entry
+//! point, closing it by Esc, its button or a click outside, the Discard / Keep editing question,
+//! the draft with Save and Revert, the banner when `settings.toml` changes under a draft, and the
 //! Save / Discard / Cancel question at quit and window close.
 
 use gpui_kit::component::WindowExt as _;
-use gpui_kit::test::TestAppContextExt as _;
+use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
 
@@ -11,7 +12,7 @@ use super::closing::Quits;
 use super::registry::Scope;
 use super::registry::tests::assert_binds_scope;
 use super::support_tests::{TestWorkspace, WAIT, open_workspace};
-use super::view_state::{AppState, DialogState, Focus, Main};
+use super::view_state::{AppState, DialogState, Focus};
 
 fn state(cx: &mut TestAppContext, t: &TestWorkspace) -> AppState {
     let workspace = t.workspace.clone();
@@ -58,26 +59,42 @@ async fn wait_for_file(
 }
 
 async fn shown_dialog(cx: &mut TestAppContext, t: &TestWorkspace) -> DialogState {
-    cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
-        .await;
+    let window = t.window;
+    cx.wait_for(window, WAIT, |window, cx| {
+        super::confirm::any_open(window, cx)
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
     state(cx, t).dialog.expect("a dialog is open")
 }
 
-// covers UP-126: Cmd-, (Ctrl-, on Linux) opens Settings in the main area with focus in it, and
-// Esc leaves it. The palette offers it too, and the menu item is the same registered action.
+/// Whether the Settings modal is open, as a dialog over the window, and Settings knows it.
+fn modal_open(cx: &mut TestAppContext, t: &TestWorkspace) -> bool {
+    let open = state(cx, t).settings.open;
+    assert_eq!(open, t.has_dialog(cx), "the modal and the view agree");
+    assert_eq!(open, t.find(cx, "settings-modal").is_some());
+    open
+}
+
+// covers UP-126, #854: Cmd-, (Ctrl-, on Linux) opens Settings as a modal over the main window
+// with focus in it, and Esc closes it, giving focus back. The palette offers it too, and the
+// menu item is the same registered action.
 #[gpui_kit::test]
 async fn the_shortcut_opens_settings_and_esc_leaves_it(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     t.focus_workspace(cx);
     assert!(t.available(cx).contains(&"flint::OpenSettings"));
-    assert!(!state(cx, &t).settings.open);
+    assert!(!modal_open(cx, &t));
+    let main = state(cx, &t).main;
 
     t.press_key_of(cx, "flint::OpenSettings");
     let s = state(cx, &t);
-    assert!(s.settings.open);
-    assert_eq!(s.main, Main::Settings);
+    assert!(modal_open(cx, &t));
+    assert_eq!(s.main, main, "Settings never replaces the main area");
     assert_eq!(s.focus, Focus::Settings);
+    assert!(s.dialog.is_none(), "no confirmation: {s:?}");
     assert!(t.find(cx, "settings-view").is_some());
     assert_eq!(
         s.settings.appearance, "system",
@@ -95,9 +112,165 @@ async fn the_shortcut_opens_settings_and_esc_leaves_it(cx: &mut TestAppContext) 
 
     t.press(cx, "escape");
     let s = state(cx, &t);
-    assert!(!s.settings.open);
-    assert_ne!(s.main, Main::Settings);
+    assert!(!modal_open(cx, &t));
+    assert_eq!(s.focus, Focus::Workspace, "focus is back where it was");
     assert!(t.find(cx, "settings-view").is_none());
+}
+
+// covers #854: the sidebar's entry, the menu's action and Show Settings Section each open the
+// modal, the last at its section; with it open, they open no second one.
+#[gpui_kit::test]
+async fn every_entry_point_opens_the_modal(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.focus_workspace(cx);
+
+    t.click(cx, "open-settings");
+    assert!(modal_open(cx, &t));
+    assert_eq!(state(cx, &t).focus, Focus::Settings);
+    t.click(cx, "settings-close");
+    assert!(!modal_open(cx, &t));
+
+    t.focus_workspace(cx);
+    t.dispatch(cx, "flint::OpenSettings", Value::Null).unwrap();
+    assert!(modal_open(cx, &t));
+    t.press(cx, "escape");
+    assert!(!modal_open(cx, &t));
+
+    t.focus_workspace(cx);
+    t.dispatch(
+        cx,
+        "settings::ShowSettingsSection",
+        json!({ "section": "network" }),
+    )
+    .unwrap();
+    assert!(modal_open(cx, &t));
+    let s = state(cx, &t);
+    assert_eq!(s.settings.section, super::settings_view::Section::Network);
+    assert_eq!(s.focus, Focus::Settings);
+
+    // Open already: the same modal, nothing stacked over it.
+    cx.update_window(t.window, |_, window, cx| {
+        super::registry::perform(&super::settings_view::OpenSettings, window, cx).unwrap();
+    })
+    .unwrap();
+    cx.run_until_parked();
+    t.press(cx, "escape");
+    assert!(!modal_open(cx, &t), "one Esc closes the only modal");
+}
+
+// covers #854: a click outside the modal closes it, and the close button does too; without
+// edits nothing is asked.
+#[gpui_kit::test]
+async fn a_click_outside_or_the_close_button_closes_it(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, VisualTestContext, point, px};
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_settings(cx, dir.path()).await;
+    assert!(modal_open(cx, &t));
+    let viewport = cx
+        .update_window(t.window, |_, window, _| window.viewport_size())
+        .unwrap();
+    // Low on the left edge: under the modal's backdrop, clear of the title bar.
+    VisualTestContext::from_window(t.window, cx)
+        .simulate_click(point(px(4.), viewport.height - px(4.)), Modifiers::none());
+    cx.run_until_parked();
+    assert!(!modal_open(cx, &t));
+    assert!(!t.has_confirmation(cx), "nothing to ask");
+
+    t.focus_workspace(cx);
+    t.press_key_of(cx, "flint::OpenSettings");
+    // A click inside does not close it.
+    t.click(cx, "settings-section-alerts");
+    assert!(modal_open(cx, &t));
+    t.click(cx, "settings-close");
+    assert!(!modal_open(cx, &t));
+    assert_eq!(state(cx, &t).focus, Focus::Workspace);
+}
+
+// covers #854: closing with unsaved edits asks Discard / Keep editing, whichever way it is
+// closed. Keep editing keeps the modal and the draft; Discard drops the draft and closes it, and
+// Settings opens again on the file. The sidebar's entry has no unsaved-edits dot.
+#[gpui_kit::test]
+async fn closing_with_edits_asks_discard_or_keep_editing(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, VisualTestContext, point, px};
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_settings(cx, dir.path()).await;
+    t.dispatch(
+        cx,
+        "settings::EditDesktopNotifications",
+        json!({ "enabled": true }),
+    )
+    .unwrap();
+    assert!(t.find(cx, "settings-entry-dot").is_none());
+
+    // Esc: asks; Enter keeps editing.
+    t.press(cx, "escape");
+    let dialog = shown_dialog(cx, &t).await;
+    assert_eq!(
+        dialog.title,
+        super::workspace::settings_entry::DISCARD_TITLE
+    );
+    assert_eq!(dialog.buttons, ["Discard", "Keep editing"]);
+    t.press(cx, "enter");
+    t.wait_for_no_confirmation(cx).await;
+    assert!(modal_open(cx, &t));
+    let s = state(cx, &t);
+    assert!(s.settings.dirty && s.settings.desktop_notifications);
+    assert_eq!(s.focus, Focus::Settings, "focus is back in Settings");
+
+    // The close button: asks; Keep editing.
+    t.click(cx, "settings-close");
+    shown_dialog(cx, &t).await;
+    t.click(cx, "cancel");
+    t.wait_for_no_confirmation(cx).await;
+    assert!(modal_open(cx, &t) && state(cx, &t).settings.dirty);
+
+    // A click outside: asks; Discard.
+    let viewport = cx
+        .update_window(t.window, |_, window, _| window.viewport_size())
+        .unwrap();
+    VisualTestContext::from_window(t.window, cx)
+        .simulate_click(point(px(4.), viewport.height - px(4.)), Modifiers::none());
+    cx.run_until_parked();
+    shown_dialog(cx, &t).await;
+    t.click(cx, "ok");
+    cx.wait_for(t.window, WAIT, |window, cx| !window.has_active_dialog(cx))
+        .await;
+    let s = state(cx, &t);
+    assert!(!s.settings.open && !s.settings.dirty, "{s:?}");
+    assert!(t.settings_toml().is_empty(), "Discard writes nothing");
+
+    t.click(cx, "open-settings");
+    let s = state(cx, &t);
+    assert!(s.settings.open && !s.settings.dirty);
+    assert!(!s.settings.desktop_notifications, "it shows the file again");
+}
+
+// covers #854: a threshold field left open counts as an edit; Discard drops what was typed.
+#[gpui_kit::test]
+async fn an_open_threshold_field_asks_before_closing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_settings(cx, dir.path()).await;
+    t.dispatch(
+        cx,
+        "settings::ShowSettingsSection",
+        json!({ "section": "thresholds" }),
+    )
+    .unwrap();
+    t.click(cx, "settings-threshold-cpu_percent");
+    assert!(state(cx, &t).settings.thresholds.typing.is_some());
+    t.click(cx, "settings-close");
+    assert_eq!(
+        shown_dialog(cx, &t).await.title,
+        super::workspace::settings_entry::DISCARD_TITLE
+    );
+    t.click(cx, "ok");
+    cx.wait_for(t.window, WAIT, |window, cx| !window.has_active_dialog(cx))
+        .await;
+    let s = state(cx, &t);
+    assert!(!s.settings.open && s.settings.thresholds.typing.is_none());
 }
 
 // covers UP-126: edits wait in a draft; Save writes only the edited fields, through the same
@@ -126,16 +299,22 @@ async fn save_writes_only_the_edited_fields(cx: &mut TestAppContext) {
     let s = state(cx, &t);
     assert!(!s.settings.dirty);
     assert_eq!(s.appearance, "dark");
+    assert!(modal_open(cx, &t), "Save keeps Settings open");
+    assert_eq!(s.focus, Focus::Settings);
+    // Saved: nothing to ask, and Esc closes at once.
+    t.press(cx, "escape");
+    assert!(!modal_open(cx, &t));
+    assert!(!t.has_confirmation(cx));
     let written = t.settings_toml();
     assert!(written.contains("appearance = \"dark\""), "{written}");
     assert!(!written.contains("watch_mode"), "{written}");
     assert!(!written.contains("desktop_notifications"), "{written}");
 }
 
-// covers UP-126: Revert drops the draft; the draft outlives leaving Settings, and the sidebar's
-// entry shows a dot meanwhile.
+// covers UP-126: Revert drops the draft and keeps Settings open; with nothing left to lose,
+// closing asks nothing.
 #[gpui_kit::test]
-async fn revert_drops_the_draft_which_survives_leaving_settings(cx: &mut TestAppContext) {
+async fn revert_drops_the_draft(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_settings(cx, dir.path()).await;
     t.dispatch(
@@ -144,25 +323,16 @@ async fn revert_drops_the_draft_which_survives_leaving_settings(cx: &mut TestApp
         json!({ "enabled": true }),
     )
     .unwrap();
-    assert!(t.find(cx, "settings-entry-dot").is_some());
-
-    // Another cluster in the main area: Settings gives way, and the draft stays.
-    t.activate(cx, "kind-alpha").await;
-    let s = state(cx, &t);
-    assert!(!s.settings.open, "{s:?}");
-    assert!(s.settings.dirty);
-    assert!(s.settings.desktop_notifications);
-    assert!(t.find(cx, "settings-entry-dot").is_some());
-
-    t.click(cx, "open-settings");
-    assert!(state(cx, &t).settings.open);
     assert!(state(cx, &t).settings.dirty);
     t.click(cx, "settings-revert");
     let s = state(cx, &t);
     assert!(!s.settings.dirty);
     assert!(!s.settings.desktop_notifications);
-    assert!(t.find(cx, "settings-entry-dot").is_none());
+    assert!(modal_open(cx, &t));
     assert!(t.settings_toml().is_empty());
+    t.press(cx, "escape");
+    assert!(!modal_open(cx, &t));
+    assert!(!t.has_confirmation(cx));
 }
 
 // covers UP-126: a change to settings.toml under a draft (here from the Alerts menu) raises the
@@ -258,10 +428,10 @@ async fn quit_with_a_draft_asks_and_discard_quits(cx: &mut TestAppContext) {
     assert!(dialog.text.contains("Quitting"), "{}", dialog.text);
     assert!(t.find(cx, "alternative").is_some(), "Discard is offered");
     t.dispatch(cx, "ui::Cancel", Value::Null).unwrap();
-    cx.wait_for(t.window, WAIT, |window, cx| !window.has_active_dialog(cx))
-        .await;
+    t.wait_for_no_confirmation(cx).await;
     assert_eq!(quits(cx), 0);
     assert!(state(cx, &t).settings.dirty, "Cancel keeps the draft");
+    assert!(modal_open(cx, &t), "Settings stays open under the question");
 
     t.press_key_of(cx, "flint::Quit");
     shown_dialog(cx, &t).await;
@@ -307,8 +477,7 @@ async fn close_window_with_a_draft_asks(cx: &mut TestAppContext) {
         dialog.text
     );
     t.dispatch(cx, "ui::Cancel", Value::Null).unwrap();
-    cx.wait_for(t.window, WAIT, |window, cx| !window.has_active_dialog(cx))
-        .await;
+    t.wait_for_no_confirmation(cx).await;
     assert!(cx.update_window(t.window, |_, _, _| ()).is_ok());
     assert!(state(cx, &t).settings.dirty);
 }
@@ -321,22 +490,26 @@ fn every_settings_action_is_bound() {
     );
 }
 
-// covers UP-126: opening the kind shown under Settings brings it to the front.
+// covers #854: closing while a Save is being written waits for it, then closes without asking.
 #[gpui_kit::test]
-async fn opening_the_kind_under_settings_leaves_settings(cx: &mut TestAppContext) {
+async fn closing_while_a_save_is_pending_closes_once_written(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
-    t.open_pods(cx, &[("demo", "web", 0)]).await;
-    t.focus_workspace(cx);
-    t.press_key_of(cx, "flint::OpenSettings");
-    edit_appearance(cx, &t, "dark");
-    assert_eq!(state(cx, &t).main, Main::Settings);
-    t.dispatch(cx, "workspace::OpenView", json!({ "kind": "pods" }))
+    let t = open_settings(cx, dir.path()).await;
+    t.dispatch(cx, "settings::EditWatchMode", json!({ "mode": "on_view" }))
         .unwrap();
+    let saving = cx
+        .update_window(t.window, |_, window, cx| {
+            super::registry::dispatch("settings::SaveSettings", Value::Null, window, cx).unwrap();
+            window.press("escape", cx);
+            !super::confirm::any_open(window, cx)
+        })
+        .unwrap();
+    assert!(saving, "nothing asked while the Save is written");
+    cx.wait_for(t.window, WAIT, |window, cx| !window.has_active_dialog(cx))
+        .await;
     let s = state(cx, &t);
-    assert!(!s.settings.open, "{s:?}");
-    assert_eq!(s.main, Main::List);
-    assert!(s.settings.dirty, "the draft stays");
+    assert!(!s.settings.open && !s.settings.dirty, "{s:?}");
+    assert!(t.settings_toml().contains("watch_mode = \"on_view\""));
 }
 
 // covers UP-126: a Save keeps its edits until the core says they are written, and a Quit pressed
@@ -364,10 +537,7 @@ async fn quit_while_a_save_is_pending_waits_for_it(cx: &mut TestAppContext) {
         cx.try_global::<Quits>().is_some_and(|q| q.0 == 1)
     })
     .await;
-    assert!(
-        !cx.update_window(t.window, |_, window, cx| window.has_active_dialog(cx))
-            .unwrap()
-    );
+    assert!(!t.has_confirmation(cx));
     let written = t.settings_toml();
     assert!(written.contains("watch_mode = \"on_view\""), "{written}");
 }
@@ -407,7 +577,7 @@ async fn the_keyboard_alone_changes_and_saves_a_setting(cx: &mut TestAppContext)
         state(cx, &t).settings.cursor.as_deref(),
         Some("settings-close")
     );
-    // Done, the sections, then System, Light and Dark.
+    // Close, the sections, then System, Light and Dark.
     for _ in 0..super::settings_view::Section::ALL.len() + 3 {
         t.press(cx, "tab");
     }
@@ -420,7 +590,7 @@ async fn the_keyboard_alone_changes_and_saves_a_setting(cx: &mut TestAppContext)
     t.press(cx, "enter");
     assert_eq!(state(cx, &t).settings.edited, ["appearance"]);
 
-    // Round to the start and back: Shift-Tab from Done wraps to Save.
+    // Round to the start and back: Shift-Tab from Close wraps to Save.
     t.press(cx, "tab");
     t.press(cx, "tab");
     assert_eq!(
@@ -465,8 +635,22 @@ async fn enter_does_not_discard_when_the_file_is_invalid(cx: &mut TestAppContext
     let dialog = shown_dialog(cx, &t).await;
     assert_eq!(dialog.title, "Discard unsaved settings?");
     t.press(cx, "enter");
-    cx.wait_for(t.window, WAIT, |window, cx| !window.has_active_dialog(cx))
-        .await;
+    t.wait_for_no_confirmation(cx).await;
     assert_eq!(quits(cx), 0);
     assert!(state(cx, &t).settings.dirty);
+}
+
+// covers #854: focus stays in the modal: a view behind it that takes focus (the overview once
+// discovery ends) gives it back.
+#[gpui_kit::test]
+async fn focus_taken_behind_the_modal_comes_back(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_settings(cx, dir.path()).await;
+    assert_eq!(state(cx, &t).focus, Focus::Settings);
+    t.focus_workspace(cx);
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(state(cx, &t).focus, Focus::Settings);
+    assert!(modal_open(cx, &t));
 }

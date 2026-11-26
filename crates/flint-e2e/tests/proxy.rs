@@ -893,10 +893,14 @@ async fn proxy_change_child() {
 
     let applied = core
         .handle
-        .apply_proxy(flint_core::settings::ProxySetting {
-            url: Some(format!("http://user:proxy-secret@{proxy}")),
-            no_proxy: Vec::new(),
-        })
+        .apply_proxy(
+            flint_core::settings::ProxySetting {
+                url: Some(format!("http://user:proxy-secret@{proxy}")),
+                no_proxy: Vec::new(),
+            },
+            // Reviewed over no saved proxy, as settings.toml has none.
+            Default::default(),
+        )
         .await
         .unwrap();
     assert!(applied.loaded);

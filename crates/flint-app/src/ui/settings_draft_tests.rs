@@ -102,6 +102,34 @@ fn a_change_on_disk_under_a_draft_raises_the_banner() {
     assert!(!draft.changed_on_disk(&outside));
 }
 
+// covers UP-127: an outside edit only to a key Flint ignores changes the file all the same, so
+// the banner says so and the question to turn protection off is asked over the file as it is.
+#[test]
+fn an_edit_to_an_ignored_key_under_a_draft_raises_the_banner() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(flint_core::settings::SETTINGS_FILE);
+    std::fs::write(&path, "protect_local_clusters = true\n").unwrap();
+    let file = Arc::new(flint_core::settings::load_settings(dir.path()).unwrap());
+    let mut draft = SettingsDraft::default();
+    draft.edit(
+        Change::ProtectLocalClusters {
+            on: false,
+            confirmed: None,
+        },
+        &file,
+    );
+    assert!(!draft.changed_on_disk(&file));
+
+    std::fs::write(
+        &path,
+        "protect_local_clusters = true\nsome_future_key = 1\n",
+    )
+    .unwrap();
+    let outside = Arc::new(flint_core::settings::load_settings(dir.path()).unwrap());
+    assert_eq!(outside, file, "the same settings");
+    assert!(draft.changed_on_disk(&outside));
+}
+
 #[test]
 fn reload_discards_the_draft_and_shows_the_file() {
     let file = file();

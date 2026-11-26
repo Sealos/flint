@@ -22,8 +22,16 @@ use super::super::dashboard::cluster_card::{CardActions, CardTarget, ClusterRead
 use super::super::dashboard::set::AGE_OUT_INTERVAL;
 use super::super::home::{self, HomeCard, HomePlan, HomeRead, HomeRow, HomeView};
 use super::super::registry::{self, OpenHome, SelectCluster};
-use super::super::settings_view::MainKey;
 use super::Workspace;
+
+/// What the main area shows, as far as the home screen gives way to a change of it: another
+/// cluster or a set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::ui) struct MainKey {
+    cluster: Option<flint_core::ClusterId>,
+    /// The running set's list.
+    set: Option<EntityId>,
+}
 
 /// The home screen's state in the workspace.
 #[derive(Default)]
@@ -68,9 +76,19 @@ impl Workspace {
         self.home._watch = vec![on_update, age_out];
     }
 
+    /// What the main area shows under the home screen, as far as it gives way to it: another
+    /// cluster or a set opened meanwhile. Views that open by themselves (a list restored, the
+    /// overview once discovery ends) do not count; the navigation and Open Object leave the
+    /// home screen on their own.
+    fn main_key(&self) -> MainKey {
+        MainKey {
+            cluster: self.cluster.clone(),
+            set: self.sets.running.as_ref().map(|r| r.list.entity_id()),
+        }
+    }
+
     /// Shows the home screen over the main area. The active cluster stays connected.
     pub(super) fn open_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.leave_settings_for_view();
         self.home.open = true;
         self.home.opened_over = Some(self.main_key());
         // Out of a list or detail now hidden, so keys reach the workspace.
@@ -102,9 +120,6 @@ impl Workspace {
     /// Whether the main area shows the home screen: opened from the Home entry, or in place of
     /// an empty main area.
     pub(in crate::ui) fn home_shown(&self, cx: &App) -> bool {
-        if self.settings_page.open {
-            return false;
-        }
         let model = self.model.read(cx);
         // With no context at all, the main area keeps saying where Flint looked.
         if !model.loaded || model.clusters.is_empty() {
