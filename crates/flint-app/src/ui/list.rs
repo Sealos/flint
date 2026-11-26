@@ -1304,8 +1304,8 @@ impl ResourceList {
 
     /// The columns to draw and their widths, for a pane `available` points wide (unknown
     /// before the first layout). Wide columns that do not fit are left out, then the usage bars,
-    /// Ready and Namespace as [`list_model::shed_columns`] allows, Restarts and Age, and last
-    /// Memory and CPU ([`list_usage::shed_usage`]); spare width goes to the Name column.
+    /// Ready and Namespace as [`list_model::shed_columns`] allows, then Memory and CPU
+    /// ([`list_usage::shed_usage`]), then Age and Restarts; spare width goes to the Name column.
     fn layout(&self, available: Option<f32>) -> (Vec<(usize, f32)>, usize) {
         let columns = &self.shown_columns;
         let width = |chars: usize| chars as f32 * CHAR_WIDTH + CELL_PADDING;
@@ -1327,8 +1327,8 @@ impl ResourceList {
                     let wanted = self.widths.wanted(name, &columns[name]);
                     width(wanted.min(list_model::NAME_COMFORT_CHARS))
                 });
-            // In a narrow list the usage bars go first, then Restarts and Age, then Memory and
-            // CPU: the values say more than a restart count or an age the detail pane shows.
+            // In a narrow list the usage bars go first, then Ready and Namespace where they repeat
+            // something, then the trailing columns rightmost first: Memory, CPU, Age, Restarts.
             let identity = (name_target, namespace_min);
             list_usage::shed_usage_bars(&mut drawn, columns, room, bar_width, identity);
             let rules = list_model::ShedRules {
@@ -1344,10 +1344,10 @@ impl ResourceList {
                 rules,
                 |i| sort.is_some_and(|s| columns[i].key() == s.column),
             );
-            list_model::shed_trailing(&mut drawn, columns, room, identity, |i| {
+            list_usage::shed_usage(&mut drawn, columns, room, identity, |i| {
                 sort.is_some_and(|s| columns[i].key() == s.column)
             });
-            list_usage::shed_usage(&mut drawn, columns, room, identity, |i| {
+            list_model::shed_trailing(&mut drawn, columns, room, identity, |i| {
                 sort.is_some_and(|s| columns[i].key() == s.column)
             });
             list_model::squeeze_identity(&mut drawn, columns, room, name_min, namespace_min);

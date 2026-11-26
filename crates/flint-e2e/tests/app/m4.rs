@@ -20,6 +20,9 @@ use crate::support::*;
 
 const HINT_ID: &str = "list-usage-hint";
 
+/// A window wide enough for the pod list's CPU and Memory beside every fixed column.
+const USAGE_WIDTH: f64 = 1500.0;
+
 fn fake_app(options: Options) -> Result<(TestCluster, App)> {
     let cluster = TestCluster::fake(options)?;
     let app = App::launch(AppOptions::new(&cluster.kubeconfig))?;
@@ -40,6 +43,16 @@ fn has_usage_columns(state: &Value) -> bool {
 #[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
 fn up_61_with_metrics_server_the_pod_and_workload_lists_show_cpu_and_memory() -> Result<()> {
     let (cluster, app) = fake_app(Options::default())?;
+    // At the default width a fixture pod's long name keeps its comfort width, and the usage
+    // columns, rightmost, are the first to go (UP-20 covers that width).
+    let applied = app.request(
+        "resize_window",
+        json!({"width": USAGE_WIDTH, "height": 800}),
+    )?;
+    anyhow::ensure!(
+        applied["width"].as_f64() == Some(USAGE_WIDTH),
+        "the window did not become {USAGE_WIDTH} wide: {applied}"
+    );
     cluster.fake_server().expect("a fake server").set_metrics(
         &MetricsTarget::pod("demo", "crash-loop"),
         "30m",
