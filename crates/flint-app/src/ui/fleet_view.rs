@@ -46,9 +46,10 @@ use super::fleet_plan::{
 };
 use super::registry::{self, Bind, EditFleetManifestAgain, OnView, ToggleFleetTarget};
 use super::resource_actions::{
-    ResourceAction, ScaleField, WriteKey, claim, offered_for, parse_replicas, release,
+    ResourceAction, WriteKey, claim, offered_for, parse_replicas, release, scale_field,
 };
 use super::row_menu::Availability;
+use super::validated_field::ValidatedField;
 use super::workspace::Workspace;
 use super::write_binding::{ConnectionGuard, connection_changed_text};
 
@@ -257,27 +258,17 @@ fn ask_replicas(
     cx: &mut Context<Workspace>,
 ) {
     let input = cx.new(|cx| InputState::new(window, cx).placeholder("Replicas"));
-    let field = cx.new(|_| ScaleField {
-        input: input.clone(),
-        error: None,
-    });
+    let field = scale_field(input, cx);
     let text = scale_dialog(&object, planned.acting.len());
     let pinned = object_lines(&object).len();
     let guard = planned.guard();
     let this = cx.weak_entity();
+    let focused = field.clone();
     let content = field.clone().into();
     let planned = Rc::new(RefCell::new(Some(planned)));
     let on_ok = move |window: &mut Window, cx: &mut App| {
-        let typed = field.read(cx).input.read(cx).value().to_string();
-        let to = match parse_replicas(&typed) {
-            Ok(to) => to,
-            Err(error) => {
-                field.update(cx, |f, cx| {
-                    f.error = Some(error);
-                    cx.notify();
-                });
-                return false;
-            }
+        let Some(to) = ValidatedField::checked(&field, cx, |typed, _| parse_replicas(typed)) else {
+            return false;
         };
         let Some(planned) = planned.borrow_mut().take() else {
             return true;
@@ -290,7 +281,7 @@ fn ask_replicas(
         true
     };
     confirm::open_pinned_guarded(window, cx, text, pinned, Some(content), guard, on_ok);
-    input.update(cx, |input, cx| input.focus(window, cx));
+    ValidatedField::focus(&focused, window, cx);
 }
 
 /// The manifest Apply YAML sends to every member, as typed, and why the last Review could not
