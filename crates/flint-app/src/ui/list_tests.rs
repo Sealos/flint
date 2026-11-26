@@ -674,13 +674,18 @@ async fn a_masked_column_header_does_not_sort(cx: &mut TestAppContext) {
     });
     // The palette and automation refuse it up front instead of reporting a no-op.
     list.read_with(cx, |list, _| {
-        let sort = |column: &str, key: Option<&str>| crate::ui::registry::SortBy {
+        use crate::ui::registry::{SortBy, SortByDescending};
+
+        let sort = |column: &str, key: Option<&str>| SortBy {
             column: column.into(),
             key: key.map(str::to_owned),
         };
-        assert!(list.check_sort(&sort("Token", None)).is_err());
-        assert!(list.check_sort(&sort("", Some("server:Token"))).is_err());
-        assert!(list.check_sort(&sort("Name", None)).is_ok());
+        assert!(list.check_sort::<SortBy>(&sort("Token", None)).is_err());
+        assert!(
+            list.check_sort::<SortByDescending>(&sort("", Some("server:Token")))
+                .is_err()
+        );
+        assert!(list.check_sort::<SortBy>(&sort("Name", None)).is_ok());
         let offered = list.drawn_column_names();
         assert!(offered.iter().any(|c| c == "Name"), "{offered:?}");
         assert!(!offered.iter().any(|c| c == "Token"), "{offered:?}");
@@ -837,13 +842,13 @@ async fn list_sorts_by_header_and_filters_by_namespace_and_text(cx: &mut TestApp
     )
     .await;
 
-    // Header clicks: ascending, descending, back to the default order.
+    // Header clicks: descending, ascending, back to the default order.
     cx.update_window(window, |_, window, cx| window.click("sort-Restarts", cx))
         .unwrap();
     cx.wait_for(
         window,
         WAIT,
-        expect(&["uid-api", "uid-dns", "uid-web", "uid-db"]),
+        expect(&["uid-db", "uid-web", "uid-dns", "uid-api"]),
     )
     .await;
     cx.update_window(window, |_, window, cx| window.click("sort-Restarts", cx))
@@ -851,7 +856,7 @@ async fn list_sorts_by_header_and_filters_by_namespace_and_text(cx: &mut TestApp
     cx.wait_for(
         window,
         WAIT,
-        expect(&["uid-db", "uid-web", "uid-dns", "uid-api"]),
+        expect(&["uid-api", "uid-dns", "uid-web", "uid-db"]),
     )
     .await;
 
@@ -870,7 +875,16 @@ async fn list_sorts_by_header_and_filters_by_namespace_and_text(cx: &mut TestApp
     cx.wait_for(
         window,
         WAIT,
-        expect(&["uid-api", "uid-db", "uid-web", "uid-dns"]),
+        expect(&["uid-dns", "uid-web", "uid-db", "uid-api"]),
+    )
+    .await;
+
+    cx.update_window(window, |_, window, cx| window.click("sort-Restarts", cx))
+        .unwrap();
+    cx.wait_for(
+        window,
+        WAIT,
+        expect(&["uid-db", "uid-api", "uid-web", "uid-dns"]),
     )
     .await;
 
@@ -1395,8 +1409,31 @@ async fn registered_actions_drive_the_list(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(selected(cx).as_deref(), Some("db"));
 
-    // Sorting by a column, as a header click does: ascending restarts.
+    // Sorting by a column, as a header click does: descending restarts.
     dispatch(cx, "resource_list::SortBy", json!({"column": "Restarts"})).unwrap();
+    let expect = ["uid-web", "uid-db", "uid-api"];
+    cx.wait_for(window, WAIT, move |window, _| {
+        visible_rows(window, &expect) == expect
+    })
+    .await;
+
+    // Requesting the current direction leaves it selected instead of cycling.
+    dispatch(
+        cx,
+        "resource_list::SortByDescending",
+        json!({"column": "Restarts"}),
+    )
+    .unwrap();
+    assert!(list.read_with(cx, |list, _| {
+        list.query.sort.as_ref().is_some_and(|sort| sort.descending)
+    }));
+
+    dispatch(
+        cx,
+        "resource_list::SortByAscending",
+        json!({"column": "Restarts", "key": "server:Restarts"}),
+    )
+    .unwrap();
     let expect = ["uid-api", "uid-db", "uid-web"];
     cx.wait_for(window, WAIT, move |window, _| {
         visible_rows(window, &expect) == expect

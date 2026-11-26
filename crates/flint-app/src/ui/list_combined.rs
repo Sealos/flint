@@ -491,7 +491,7 @@ impl CombinedResourceList {
         self.recompute(cx);
     }
 
-    /// Sorts by `column`: ascending, descending, then the default order.
+    /// Cycles the sort for `column`, starting descending for numeric columns.
     pub fn toggle_sort(&mut self, column: &ColumnKey, cx: &mut Context<Self>) {
         let Some(at) = self.latest.list.column_index(column) else {
             return;
@@ -499,7 +499,8 @@ impl CombinedResourceList {
         if self.latest.masked[at] {
             return;
         }
-        self.query.sort = model::next_sort(self.query.sort.as_ref(), column);
+        let numeric = list_model::is_numeric(&self.latest.columns[at]);
+        self.query.sort = model::next_sort(self.query.sort.as_ref(), column, numeric);
         self.recompute(cx);
     }
 
@@ -515,7 +516,16 @@ impl CombinedResourceList {
         let source = self.latest.clone();
         let sort = model::effective_sort(&source, self.query.sort.as_ref(), self.show_wide);
         let mut query = CombinedQuery {
-            sort: sort.clone(),
+            sort: sort.as_ref().and_then(|sort| {
+                let column = source.list.column_index(&sort.column)?;
+                Some(CombinedSort {
+                    column: sort.column.clone(),
+                    descending: list_model::descending_for_cells(
+                        &source.columns[column],
+                        sort.descending,
+                    ),
+                })
+            }),
             ..self.query.clone()
         };
         // A count covers every namespace, whatever the picker holds.

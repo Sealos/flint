@@ -74,24 +74,28 @@ pub fn resolve_sort(
     let spec = spec?;
     Some(SortBy {
         column,
-        descending: spec.descending,
+        descending: descending_for_cells(&columns[column], spec.descending),
     })
 }
 
-/// The sort after clicking the header of the column with key `clicked`: a new column sorts
-/// ascending, then descending, then back to the default order.
-pub fn next_sort(current: Option<&SortSpec>, clicked: &str) -> Option<SortSpec> {
+fn next_sort_direction(current: Option<bool>, numeric: bool) -> Option<bool> {
     match current {
-        Some(s) if s.column == clicked && !s.descending => Some(SortSpec {
-            column: clicked.to_owned(),
-            descending: true,
-        }),
-        Some(s) if s.column == clicked => None,
-        _ => Some(SortSpec {
-            column: clicked.to_owned(),
-            descending: false,
-        }),
+        None => Some(numeric),
+        Some(descending) if descending == numeric => Some(!descending),
+        Some(_) => None,
     }
+}
+
+/// The sort after clicking the header: numeric columns start descending and others ascending.
+/// The next click reverses the direction, and the third restores the default order.
+pub fn next_sort(current: Option<&SortSpec>, clicked: &str, numeric: bool) -> Option<SortSpec> {
+    let current = current
+        .filter(|s| s.column == clicked)
+        .map(|s| s.descending);
+    next_sort_direction(current, numeric).map(|descending| SortSpec {
+        column: clicked.to_owned(),
+        descending,
+    })
 }
 
 /// Numbers, ages and times: drawn right-aligned with tabular figures.
@@ -101,6 +105,11 @@ pub fn is_numeric(column: &Column) -> bool {
             column.ty,
             ColumnType::Integer | ColumnType::Number | ColumnType::Date
         )
+}
+
+/// The core compares dates by elapsed time, so newest-first uses its ascending order.
+pub fn descending_for_cells(column: &Column, descending: bool) -> bool {
+    descending ^ (column.role == ColumnRole::Age || column.ty == ColumnType::Date)
 }
 
 /// Width limits in characters. The name column is as wide as its longest name, at least
@@ -714,7 +723,7 @@ pub mod combined {
     use flint_core::redact::{is_masked_column, is_secret_list};
     use flint_core::{ClusterId, Column, ColumnRole, Feed, KindId, NamespaceLimit, SyncState};
 
-    use super::{listing_proves_gone, visible_columns};
+    use super::{listing_proves_gone, next_sort_direction, visible_columns};
 
     /// What one member's rows cover, which the core keeps private to it.
     #[derive(Debug, Clone, Default)]
@@ -846,19 +855,19 @@ pub mod combined {
         }
     }
 
-    /// The sort after clicking the column `clicked`: ascending, descending, then default.
-    pub fn next_sort(current: Option<&CombinedSort>, clicked: &ColumnKey) -> Option<CombinedSort> {
-        match current {
-            Some(s) if s.column == *clicked && s.descending => None,
-            Some(s) if s.column == *clicked => Some(CombinedSort {
-                column: clicked.clone(),
-                descending: true,
-            }),
-            _ => Some(CombinedSort {
-                column: clicked.clone(),
-                descending: false,
-            }),
-        }
+    /// The combined list follows the same header sort cycle as the single list.
+    pub fn next_sort(
+        current: Option<&CombinedSort>,
+        clicked: &ColumnKey,
+        numeric: bool,
+    ) -> Option<CombinedSort> {
+        let current = current
+            .filter(|s| s.column == *clicked)
+            .map(|s| s.descending);
+        next_sort_direction(current, numeric).map(|descending| CombinedSort {
+            column: clicked.clone(),
+            descending,
+        })
     }
 
     /// The sort to apply: `None` while its column is gone, not drawn, or masked by any member.
@@ -1172,24 +1181,48 @@ mod tests {
 
     // covers UP-21
     #[test]
-    fn header_clicks_cycle_ascending_descending_default() {
-        let asc = next_sort(None, "flint:age");
-        assert_eq!(
-            asc,
-            Some(SortSpec {
-                column: "flint:age".into(),
-                descending: false
-            })
-        );
-        let desc = next_sort(asc.as_ref(), "flint:age");
-        assert_eq!(desc.as_ref().map(|s| s.descending), Some(true));
-        assert_eq!(next_sort(desc.as_ref(), "flint:age"), None);
-        // Another column starts ascending again.
-        let other = next_sort(desc.as_ref(), "flint:name").unwrap();
-        assert_eq!(
-            (other.column.as_str(), other.descending),
-            ("flint:name", false)
-        );
+    fn columns_start_with_their_default_direction_then_reverse_and_clear() {
+        for column in pod_columns() {
+            let key = column.key();
+            let numeric = is_numeric(&column);
+            let previous = SortSpec {
+                column: "server:Other".into(),
+                descending: !numeric,
+            };
+            for current in [None, Some(&previous)] {
+                let first = next_sort(current, &key, numeric).unwrap();
+                assert_eq!(first.column, key);
+                assert_eq!(first.descending, numeric, "{key}");
+                let second = next_sort(Some(&first), &key, numeric).unwrap();
+                assert_eq!(second.column, key);
+                assert_eq!(second.descending, !numeric, "{key}");
+                assert_eq!(next_sort(Some(&second), &key, numeric), None, "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn date_sorts_translate_to_the_cores_age_order() {
+        let columns = [
+            col("Age", 0, ColumnRole::Age, ColumnType::String),
+            col("Last Seen", 0, ColumnRole::Value, ColumnType::Date),
+        ];
+        for (index, column) in columns.iter().enumerate() {
+            assert!(is_numeric(column));
+            for descending in [true, false] {
+                let spec = SortSpec {
+                    column: column.key(),
+                    descending,
+                };
+                assert_eq!(
+                    resolve_sort(&columns, Some(&spec), &[index]),
+                    Some(SortBy {
+                        column: index,
+                        descending: !descending,
+                    })
+                );
+            }
+        }
     }
 
     // covers UP-21, UP-22
