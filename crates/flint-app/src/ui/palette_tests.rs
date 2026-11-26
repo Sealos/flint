@@ -183,6 +183,10 @@ async fn lists_available_actions_with_categories_and_shortcuts(cx: &mut TestAppC
         "no cluster is active: {all:?}"
     );
     assert!(!all.contains(&"Focus Filter"), "no list is open: {all:?}");
+    assert!(
+        !all.iter().any(|l| l.starts_with("Sort by Column")),
+        "{all:?}"
+    );
     assert!(!all.contains(&"Show Command Palette"), "{all:?}");
     assert!(!all.contains(&"Close Command Palette"), "{all:?}");
     // The Edit actions are listed only where they act: a text field, or a shell tab. (Copy is
@@ -212,6 +216,8 @@ async fn lists_available_actions_with_categories_and_shortcuts(cx: &mut TestAppC
     let all = labels(&palette);
     assert!(all.contains(&"Open Kind…"), "{all:?}");
     assert!(all.contains(&"Sort by Column…"), "{all:?}");
+    assert!(all.contains(&"Sort by Column, Ascending…"), "{all:?}");
+    assert!(all.contains(&"Sort by Column, Descending…"), "{all:?}");
     assert!(all.contains(&"Copy"), "{all:?}");
     assert!(all.contains(&"Select All"), "{all:?}");
     assert!(!all.contains(&"Close Detail"), "no detail is open: {all:?}");
@@ -311,6 +317,57 @@ async fn actions_with_arguments_ask_for_them(cx: &mut TestAppContext) {
         .unwrap()
         .expect("sorted");
     assert_eq!(sort.column, "Restarts");
+    assert!(sort.descending);
+}
+
+#[gpui_kit::test]
+async fn palette_sets_the_requested_sort_direction(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0), ("demo", "web", 3)])
+        .await;
+    let list = t.list(cx).unwrap();
+
+    for (query, label, descending, names) in [
+        (
+            "sort asc",
+            "Sort by Column, Ascending…",
+            false,
+            ["api", "web"],
+        ),
+        (
+            "sort desc",
+            "Sort by Column, Descending…",
+            true,
+            ["web", "api"],
+        ),
+        (
+            "sort desc",
+            "Sort by Column, Descending…",
+            true,
+            ["web", "api"],
+        ),
+    ] {
+        open_palette(cx, &t).await;
+        t.type_text(cx, query);
+        assert_eq!(selected(&shown(cx, &t)), label);
+        t.press(cx, "enter");
+        let palette = shown(cx, &t);
+        assert_eq!(palette.argument.as_deref(), Some("column"));
+        assert_eq!(labels(&palette), ["Name", "Namespace", "Restarts"]);
+        t.type_text(cx, "rest");
+        t.press(cx, "enter");
+        assert!(palette_closed(cx, &t));
+        let list = list.clone();
+        cx.wait_for(t.window, WAIT, move |_, cx| {
+            let shown = list.read(cx).view_state();
+            shown
+                .sort
+                .is_some_and(|sort| sort.column == "Restarts" && sort.descending == descending)
+                && shown.rows.iter().map(|r| r.name.as_str()).eq(names)
+        })
+        .await;
+    }
 }
 
 // covers UP-45 (#29): Open Logs by Label Selector… asks for a namespace (one may be typed that

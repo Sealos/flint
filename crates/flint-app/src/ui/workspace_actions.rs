@@ -52,11 +52,11 @@ use super::super::registry::{
     ScrollToTop, SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext,
     SelectNextLine, SelectPrev, SelectPrevLine, SelectRow, SelectText, SetDockHeight,
     SetLogContext, SetNamespaces, SetPaneWidth, ShowAll, ShowAllNamespaces, ShowOverview,
-    ShowTabList, ShowYaml, SortBy, ToggleAnnotations, ToggleCommandPalette, ToggleErrorsOnly,
-    ToggleLabels, ToggleLogRegex, ToggleManagedFields, ToggleMatchingOnly, ToggleNamespace,
-    ToggleNavSection, TogglePause, ToggleProblemsOnly, ToggleResourceSwitcher, ToggleSecretValue,
-    ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
-    WatchOpenViewsOnly,
+    ShowTabList, ShowYaml, SortBy, SortByAscending, SortByDescending, ToggleAnnotations,
+    ToggleCommandPalette, ToggleErrorsOnly, ToggleLabels, ToggleLogRegex, ToggleManagedFields,
+    ToggleMatchingOnly, ToggleNamespace, ToggleNavSection, TogglePause, ToggleProblemsOnly,
+    ToggleResourceSwitcher, ToggleSecretValue, ToggleSources, ToggleTimestamps, ToggleWide,
+    ToggleWrap, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::super::registry::{ApplyAcrossSet, DeleteAcrossSet, RestartAcrossSet, ScaleAcrossSet};
 use super::super::registry::{
@@ -400,8 +400,16 @@ impl Workspace {
                 None => Err(ActionError::unavailable::<SelectRow>()),
             })
             .add::<SortBy>(view_open!(list_wide), |ws, a, cx| match &ws.list {
-                Some(l) => l.read(cx).check_sort(a),
+                Some(l) => l.read(cx).check_sort::<SortBy>(a),
                 None => Err(ActionError::unavailable::<SortBy>()),
+            })
+            .add::<SortByAscending>(view_open!(list_wide), |ws, a, cx| match &ws.list {
+                Some(l) => l.read(cx).check_sort::<SortByAscending>(&a.0),
+                None => Err(ActionError::unavailable::<SortByAscending>()),
+            })
+            .add::<SortByDescending>(view_open!(list_wide), |ws, a, cx| match &ws.list {
+                Some(l) => l.read(cx).check_sort::<SortByDescending>(&a.0),
+                None => Err(ActionError::unavailable::<SortByDescending>()),
             })
             // The detail pane's.
             .when::<Refresh>(view_open!(detail))
@@ -905,10 +913,11 @@ impl Workspace {
     /// Says why a confirmation closed by itself, and gives focus back if what held it is gone.
     pub(in crate::ui) fn confirmation_closed(
         &mut self,
+        why: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.refuse_held(super::super::write_binding::connection_changed_text(), cx);
+        self.refuse_held(why, cx);
         if window.focused(cx).is_none() {
             let focus = self
                 .list
@@ -1208,16 +1217,19 @@ impl Workspace {
                 let leaves_set =
                     self.sets.is_open() && !self.sets.has_member(Some(&action.cluster));
                 let again = action.clone();
-                if leaves_set
-                    && self.asks_before_leaving_set(window, cx, {
+                // The edit first, as every other way out of a set asks: after its Discard the
+                // question comes again with nothing left to ask about but the set, which
+                // asking about the set first would ask a second time.
+                if leaves
+                    && self.asks_before_leaving(window, cx, {
                         let again = again.clone();
                         move |ws, window, cx| ws.select_cluster(&again, window, cx)
                     })
                 {
                     return;
                 }
-                if leaves
-                    && self.asks_before_leaving(window, cx, move |ws, window, cx| {
+                if leaves_set
+                    && self.asks_before_leaving_set(window, cx, move |ws, window, cx| {
                         ws.select_cluster(&again, window, cx)
                     })
                 {
@@ -1535,6 +1547,25 @@ impl Workspace {
             .and_then(|d| d.discovery.as_ref())
             .and_then(|d| d.kind(kind))
             .is_some_and(|k| k.supports("delete"))
+    }
+
+    /// Where Scale reads and writes the replica count of `kind` on `cluster`, if it has Scale: a
+    /// built-in kind always, a custom resource once discovery read its definition's paths.
+    pub(in crate::ui) fn kind_scale_paths(
+        &self,
+        cluster: &str,
+        kind: &flint_core::KindId,
+        cx: &App,
+    ) -> Option<flint_core::action_kinds::ScalePaths> {
+        if flint_core::action_kinds::scales_built_in(kind) {
+            return Some(flint_core::action_kinds::ScalePaths::built_in());
+        }
+        self.model
+            .read(cx)
+            .discovered(cluster)
+            .and_then(|d| d.discovery.as_ref())
+            .and_then(|d| d.kind(kind))
+            .and_then(flint_core::KindInfo::scale_paths)
     }
 
     /// Holds the review being read for a resource action; a newer one replaces it.

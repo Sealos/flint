@@ -203,3 +203,48 @@ fn every_item_is_a_registered_action() {
     );
     all.iter().for_each(check);
 }
+
+#[test]
+fn an_unchanged_menu_bar_is_not_built_again() {
+    use super::app_menus::needs_rebuild;
+    let a = inputs(Some("a"), &["a", "b"]);
+    let states = [true, false, true];
+    assert!(needs_rebuild(None, &a, &states), "the first bar is built");
+    assert!(!needs_rebuild(Some((&a, &states)), &a.clone(), &states));
+}
+
+#[test]
+fn a_changed_input_or_enabled_state_builds_the_menu_bar_again() {
+    use super::app_menus::needs_rebuild;
+    let a = inputs(Some("a"), &["a", "b"]);
+    let states = [true, false, true];
+    let shown = Some((&a, states.as_slice()));
+    assert!(needs_rebuild(
+        shown,
+        &inputs(Some("b"), &["a", "b"]),
+        &states
+    ));
+    assert!(needs_rebuild(shown, &inputs(Some("a"), &["a"]), &states));
+    let mut dark = a.clone();
+    dark.appearance = Appearance::Dark;
+    assert!(needs_rebuild(shown, &dark, &states));
+    assert!(needs_rebuild(shown, &a, &[true, true, true]));
+    assert!(needs_rebuild(shown, &a, &[true, false]));
+}
+
+#[test]
+fn the_standard_menu_items_are_present() {
+    let menus = all_menus(&inputs(None, &[]), &mut |_| true);
+    let find = |name: &str| menus.iter().find(|m| m.name == name).expect(name);
+    let edit = names(find("Edit"));
+    assert!(edit.contains(&"Undo".to_owned()) && edit.contains(&"Redo".to_owned()));
+    let window = names(find("Window"));
+    assert!(window.contains(&"Minimize".to_owned()) && window.contains(&"Zoom".to_owned()));
+    assert!(!names(find("Help")).is_empty());
+    assert!(
+        find("Flint")
+            .items
+            .iter()
+            .any(|i| matches!(i, MenuItem::SystemMenu(m) if m.name == "Services"))
+    );
+}

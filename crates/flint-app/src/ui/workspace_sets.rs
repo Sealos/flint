@@ -1018,10 +1018,10 @@ impl Workspace {
         self.sets.running = None;
         self.close_list(cx);
         self.show_set(
-            label,
-            members,
+            (label, members),
             (KindId::pods(), "Pods".to_owned()),
             Gone::default(),
+            None,
             window,
             cx,
         );
@@ -1039,10 +1039,10 @@ impl Workspace {
     /// empty and they keep their state.
     pub(super) fn show_set(
         &mut self,
-        label: String,
-        members: Vec<AdmittedMember>,
+        (label, members): (String, Vec<AdmittedMember>),
         (kind, kind_label): (KindId, String),
         gone: Gone,
+        reuse: Option<Entity<CombinedResourceList>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1079,7 +1079,14 @@ impl Workspace {
         let source = self.combined_source(&snapshots, cx);
         let title = format!("{kind_label} · {label}");
         let shown_kind = kind_label;
-        let list = cx.new(|cx| CombinedResourceList::new(title, source, Vec::new(), window, cx));
+        // A kind change keeps the list, and with it the sort, filter, chips and grouping.
+        let list = match reuse {
+            Some(list) => {
+                list.update(cx, |list, cx| list.switch_kind(title, source, cx));
+                list
+            }
+            None => cx.new(|cx| CombinedResourceList::new(title, source, Vec::new(), window, cx)),
+        };
         let events = cx.subscribe_in(&list, window, Self::on_combined_event);
         let feeds = subscriptions
             .into_iter()
@@ -1460,6 +1467,8 @@ impl Workspace {
             self.clear_action_error(cx);
             self.detail = None;
             self._detail_subscriptions.clear();
+            // The pane that watched a confirmation's object is gone with its row.
+            self.close_changed_confirmations(window, cx);
             let focus = list.read(cx).focus_handle().clone();
             window.focus(&focus, cx);
             release_unfocused_input(window, cx);
@@ -1518,7 +1527,7 @@ impl Workspace {
         let object = ObjectRef {
             cluster: row.cluster,
             kind: run.kind.clone(),
-            kind_label: list.read(cx).label.clone(),
+            kind_label: run.kind_label.clone(),
             namespace: row.namespace,
             name: row.name,
             uid: row.uid,
@@ -1550,25 +1559,29 @@ impl Workspace {
             view.set_connection_guards(guards);
             view
         });
-        self._detail_subscriptions = vec![cx.subscribe_in(
-            &detail,
-            window,
-            move |this, _, event, window, cx| match event {
-                DetailEvent::Close => this.close_detail(window, cx),
-                DetailEvent::OpenLogs(request, focus) => {
-                    let focus = takes_focus(focus, window, cx);
-                    this.open_logs(request.clone(), focus, window, cx)
-                }
-                DetailEvent::OpenShell(request, focus) => {
-                    let focus = takes_focus(focus, window, cx);
-                    this.open_shell(request.clone(), focus, window, cx)
-                }
-                DetailEvent::Refused(why) => this.refuse(why.clone(), cx),
-                DetailEvent::ConfirmWrite(review, reviewed_on) => {
-                    this.confirm_detail_write(review, reviewed_on.clone(), window, cx)
-                }
-            },
-        )];
+        let on_change = Self::close_confirmations_on_change(&detail, window, cx);
+        self._detail_subscriptions = vec![
+            on_change,
+            cx.subscribe_in(
+                &detail,
+                window,
+                move |this, _, event, window, cx| match event {
+                    DetailEvent::Close => this.close_detail(window, cx),
+                    DetailEvent::OpenLogs(request, focus) => {
+                        let focus = takes_focus(focus, window, cx);
+                        this.open_logs(request.clone(), focus, window, cx)
+                    }
+                    DetailEvent::OpenShell(request, focus) => {
+                        let focus = takes_focus(focus, window, cx);
+                        this.open_shell(request.clone(), focus, window, cx)
+                    }
+                    DetailEvent::Refused(why) => this.refuse(why.clone(), cx),
+                    DetailEvent::ConfirmWrite(review, reviewed_on) => {
+                        this.confirm_detail_write(review, reviewed_on.clone(), window, cx)
+                    }
+                },
+            ),
+        ];
         self.detail = Some(detail);
         self.list_in_front = false;
         release_unfocused_input(window, cx);
@@ -1664,6 +1677,17 @@ impl Workspace {
                 .flex_1()
                 .min_w_0()
                 .h_full()
+                .child(self.render_set_header(
+                    &run.label,
+                    if run.dashboard.is_some() {
+                        "Overview"
+                    } else {
+                        &run.kind_label
+                    },
+                    window_width,
+                    theme,
+                    cx,
+                ))
                 .child(self.render_set_bar(run, theme, cx))
                 .child(body)
                 .test_support()
@@ -1852,7 +1876,8 @@ impl Workspace {
     /// The set's name, the members left out of it, and its buttons.
     fn render_set_bar(&self, run: &RunningSet, theme: &Theme, cx: &App) -> impl IntoElement {
         let names = self.cluster_names(cx);
-        h_flex()
+        // The bar is the set view's top edge, so it drags the window like a title bar.
+        super::theme::moves_window(h_flex())
             .flex_none()
             .flex_wrap()
             .gap_2()

@@ -344,7 +344,10 @@ async fn open_beta_row_answering(
     let detail = t.detail(cx).expect("the row's detail");
     assert_eq!(detail_cluster(cx, &t).as_deref(), Some("kind-beta"));
     cx.wait_for(t.window, WAIT, move |_, cx| {
-        detail.read(cx).replicas() == Some(2)
+        detail
+            .read(cx)
+            .replicas(&flint_core::action_kinds::ScalePaths::built_in())
+            == Some(2)
     })
     .await;
     OpenRow {
@@ -801,6 +804,71 @@ async fn a_selected_row_comes_back_in_front_of_the_list(cx: &mut TestAppContext)
         "Enter reopens it"
     );
     assert_eq!(detail_cluster(cx, &t).as_deref(), Some("kind-beta"));
+}
+
+// A set has a header like a cluster's: the set and its kind, and the controls in their places,
+// off because each belongs to one cluster (#763).
+#[gpui_kit::test]
+async fn a_set_has_a_header_with_its_controls_off(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_quiet_workspace(cx, dir.path()).await;
+    open_both(cx, &t).await;
+    t.wait_for_element(cx, ("crumb", 1usize)).await;
+    assert_eq!(t.label(cx, ("crumb", 1usize)).as_deref(), Some("Pods"));
+    for id in ["namespace-filter-button", "keep-watching", "watch-mode"] {
+        assert_eq!(t.find(cx, id).unwrap().disabled(), Some(true), "{id}");
+    }
+}
+
+// Changing kinds in a set swaps the kind in the same list: the filter text, the grouping and the
+// cluster chips stay, and the old kind's selection does not (#763). A row's detail names its kind,
+// not the list's title.
+#[gpui_kit::test]
+async fn changing_the_kind_of_a_set_keeps_the_list_and_its_view(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_quiet_workspace(cx, dir.path()).await;
+    connect(cx, &t, "kind-alpha");
+    connect(cx, &t, "kind-beta");
+    open_both(cx, &t).await;
+    select_row(cx, &t, "kind-beta");
+    assert_eq!(
+        t.workspace
+            .read_with(cx, |ws, cx| ws.detail_view().map(|d| d
+                .read(cx)
+                .object()
+                .kind_label
+                .clone())),
+        Some("Pods".to_owned())
+    );
+    let list = t
+        .workspace
+        .read_with(cx, |ws, _| ws.sets.running.as_ref().unwrap().list.clone());
+    list.update(cx, |list, cx| {
+        list.set_group_by_cluster(true, cx);
+        list.toggle_cluster_filter("kind-beta", cx);
+    });
+    let (workspace, window) = (t.workspace.clone(), t.window);
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| {
+            assert!(ws.show_kind_in_set(&deployments_entry(), window, cx));
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let same = t.workspace.read_with(cx, |ws, _| {
+        ws.sets.running.as_ref().unwrap().list.entity_id() == list.entity_id()
+    });
+    assert!(same, "the list is the one the set opened with");
+    list.read_with(cx, |list, _| {
+        assert!(list.query.group_by_cluster);
+        assert_eq!(list.query.clusters, ["kind-beta"]);
+        assert!(list.label.starts_with("Deployments"), "{}", list.label);
+        assert!(list.selected().is_none());
+    });
+    assert!(
+        t.workspace
+            .read_with(cx, |ws, _| ws.detail_view().is_none())
+    );
 }
 
 #[gpui_kit::test]
@@ -2211,6 +2279,37 @@ async fn a_paused_set_member_shows_shell_disabled_with_the_reason(cx: &mut TestA
     assert_eq!(guard, None);
 }
 
+// covers UP-53: a row that leaves the selection takes its pane, which watched the object of the
+// open confirmation: the confirmation closes, unanswered, and nothing is written.
+#[gpui_kit::test]
+async fn a_rows_confirmation_closes_when_the_row_leaves_the_selection(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let row = open_beta_row(cx, dir.path()).await;
+    let t = &row.t;
+    offer_restart(cx, t).await;
+    let (workspace, window) = (t.workspace.clone(), t.window);
+    cx.update_window(window, |_, _, cx| {
+        workspace.update(cx, |ws, cx| {
+            let list = ws.sets.running.as_ref().unwrap().list.clone();
+            list.update(cx, |list, cx| list.clear_selection(cx));
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert!(!t.has_dialog(cx), "the confirmation closed");
+    let said = t
+        .workspace
+        .read_with(cx, |ws, _| ws.action_error().map(str::to_owned));
+    assert!(
+        said.as_deref()
+            .is_some_and(|s| s.contains("changed since it was reviewed")),
+        "{said:?}"
+    );
+    assert_eq!(row.beta_writes.load(Ordering::SeqCst), 0);
+}
+
 /// Waits for the unsaved-set question and checks what it offers.
 async fn asked_about_unsaved_set(cx: &mut TestAppContext, t: &TestWorkspace) {
     let workspace = t.workspace.clone();
@@ -2337,6 +2436,49 @@ async fn clicking_the_active_non_member_leaves_the_set(cx: &mut TestAppContext) 
     asked_about_unsaved_set(cx, &t).await;
     t.click(cx, "ok");
     answered(cx, &t).await;
+    assert!(!set_is_open(cx, &t), "the set closed");
+    assert!(t.find(cx, "cluster-set-view").is_none());
+}
+
+// #834: leaving an unsaved set by a cluster outside it, with an edit unapplied, asks about the
+// edit once and then the set once: Discard on the edit does not bring the first question back.
+#[gpui_kit::test]
+async fn leaving_an_unsaved_set_with_an_edit_asks_each_once(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace_with(cx, dir.path(), |dir, servers| {
+        let path = dir.join("kubeconfig");
+        let contexts = [
+            ("kind-alpha", servers.silent.as_str()),
+            ("kind-beta", servers.silent.as_str()),
+            ("kind-gamma", servers.silent.as_str()),
+        ];
+        std::fs::write(&path, kubeconfig_yaml(&contexts)).unwrap();
+        vec![path]
+    })
+    .await;
+    connect(cx, &t, "kind-alpha");
+    connect(cx, &t, "kind-beta");
+    open_both(cx, &t).await;
+    cx.update_window(t.window, |_, window, _| window.activate_window())
+        .unwrap();
+    select_row(cx, &t, "kind-beta");
+    cx.run_until_parked();
+    let detail = t.detail(cx).expect("the row's detail");
+    type_edit(cx, &t, &detail, "default", "web");
+    assert!(has_edit(cx, &detail));
+
+    t.dispatch(
+        cx,
+        "workspace::SelectCluster",
+        json!({ "cluster": "kind-gamma" }),
+    )
+    .unwrap();
+    asked(cx, &t).await;
+    t.click(cx, "ok");
+    asked_about_unsaved_set(cx, &t).await;
+    t.click(cx, "ok");
+    answered(cx, &t).await;
+    cx.run_until_parked();
     assert!(!set_is_open(cx, &t), "the set closed");
     assert!(t.find(cx, "cluster-set-view").is_none());
 }
