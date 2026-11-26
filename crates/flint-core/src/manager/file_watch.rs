@@ -335,11 +335,16 @@ impl Watched {
         let kube: HashSet<PathBuf> = kubeconfig.iter().flat_map(|p| watch_names(p)).collect();
         let settings_path = config_dir.join(settings::SETTINGS_FILE);
         let settings: HashSet<PathBuf> = watch_names(&settings_path).into_iter().collect();
-        // Beside settings.toml, so it needs no directory of its own.
-        let activity = [activity::ACTIVITY_FILE, activity::PREVIOUS_FILE]
-            .iter()
-            .flat_map(|f| watch_names(&config_dir.join(f)))
-            .collect();
+        // Beside settings.toml, so it needs no directory of its own. The key file too: a key
+        // restored while the app is open must replace the one read before.
+        let activity = [
+            activity::ACTIVITY_FILE,
+            activity::PREVIOUS_FILE,
+            activity::KEY_FILE,
+        ]
+        .iter()
+        .flat_map(|f| watch_names(&config_dir.join(f)))
+        .collect();
         let (dirs, pending) = watch_plan(kube.iter().chain(&settings));
         Watched {
             dirs,
@@ -550,6 +555,17 @@ mod tests {
     fn fixed(current: &Arc<Mutex<Watched>>) -> Scan {
         let current = current.clone();
         Box::new(move |_| lock(&current).clone())
+    }
+
+    // covers UP-16: restoring the activity log's key reloads the log with it, and nothing else.
+    #[test]
+    fn the_activity_key_file_reloads_the_activity_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let watched = Watched::for_files(&[], dir.path());
+        let key = dir.path().join(activity::KEY_FILE);
+        assert!(watched.activity.contains(&key), "{:?}", watched.activity);
+        let changed = classify(&[key], false, &watched);
+        assert!(changed.activity && !changed.settings && !changed.kubeconfig && !changed.rearm);
     }
 
     #[test]
