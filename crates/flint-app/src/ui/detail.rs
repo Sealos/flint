@@ -307,13 +307,22 @@ impl DetailView {
                 let (core, cluster) = (core.clone(), object.cluster.clone());
                 let mut updates = core.telemetry_updates();
                 cx.spawn(async move |this, cx| {
+                    let mut last: Option<UsageSource> = None;
                     while updates.changed().await {
                         let telemetry = core.telemetry(&cluster);
-                        let source = cx
+                        let previous = last.take();
+                        let (source, previous) = cx
                             .background_spawn(async move {
-                                UsageSource::of(subject, telemetry.as_ref())
+                                let source = UsageSource::after(
+                                    subject,
+                                    telemetry.as_ref(),
+                                    previous.as_ref(),
+                                );
+                                (source, previous)
                             })
                             .await;
+                        drop(previous);
+                        last = Some(source.clone());
                         let followed = this.update(cx, |view, cx| {
                             if view.usage.set_source(source) {
                                 cx.notify();

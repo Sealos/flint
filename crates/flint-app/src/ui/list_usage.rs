@@ -110,7 +110,18 @@ pub(in crate::ui) enum UsageSource {
 impl UsageSource {
     /// The source `telemetry` gives. A workload kind's totals are added up here, which walks
     /// every pod: run it off the UI thread.
+    #[cfg(test)]
     pub(in crate::ui) fn of(subject: UsageSubject, telemetry: Option<&ClusterTelemetry>) -> Self {
+        Self::after(subject, telemetry, None)
+    }
+
+    /// [`Self::of`], reusing the totals of `previous` when it holds the same readings and pods:
+    /// an update to something else adds nothing up again.
+    pub(in crate::ui) fn after(
+        subject: UsageSubject,
+        telemetry: Option<&ClusterTelemetry>,
+        previous: Option<&Self>,
+    ) -> Self {
         let Some(telemetry) = telemetry else {
             return Self::NoFeed;
         };
@@ -126,7 +137,9 @@ impl UsageSource {
             UsageSubject::Workloads(chain) => {
                 let index = telemetry.snapshot.pods.clone();
                 Self::from_read(&telemetry.reads.pod_usage, current, |usage| match index {
-                    Some(index) if chain.is_known(&index) => Self::workloads(usage, index, chain),
+                    Some(index) if chain.is_known(&index) => {
+                        Self::workloads_after(usage, index, chain, previous)
+                    }
                     // Without the pods, or the ReplicaSets or Jobs that say whose they are, a
                     // workload with no pod found is not a workload with none.
                     _ => Self::Unknown,
@@ -142,12 +155,30 @@ impl UsageSource {
     }
 
     /// Pods' use over the workloads they belong to, with the totals worked out.
+    #[cfg(test)]
     pub(in crate::ui) fn workloads(
         usage: Arc<BTreeMap<PodKey, PodSample>>,
         index: PodIndex,
         chain: OwnerChain,
     ) -> Self {
-        let totals = WorkloadTotals::of(&index, &usage, chain);
+        Self::workloads_after(usage, index, chain, None)
+    }
+
+    fn workloads_after(
+        usage: Arc<BTreeMap<PodKey, PodSample>>,
+        index: PodIndex,
+        chain: OwnerChain,
+        previous: Option<&Self>,
+    ) -> Self {
+        let kept = match previous {
+            Some(Self::Workloads(old_usage, old_index, old_chain, totals))
+                if Arc::ptr_eq(old_usage, &usage) && *old_index == index && *old_chain == chain =>
+            {
+                Some(totals.clone())
+            }
+            _ => None,
+        };
+        let totals = kept.unwrap_or_else(|| WorkloadTotals::of(&index, &usage, chain));
         Self::Workloads(usage, index, chain, totals)
     }
 
