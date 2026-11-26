@@ -49,11 +49,18 @@ pub enum SettingsError {
     /// (or with no confirmation at all).
     #[error("{PROTECTION_CONFIRMATION_STALE}")]
     ProtectionConfirmationStale,
+    /// A proxy change reviewed over a `[proxy]` the file no longer holds.
+    #[error("{PROXY_CHANGED_SINCE_REVIEW}")]
+    ProxyChangedSinceReview,
 }
 
 /// Why turning local cluster protection off was refused: the confirmation was for other settings.
 pub const PROTECTION_CONFIRMATION_STALE: &str =
     "settings.toml changed after turning off local cluster protection was confirmed; confirm again";
+
+/// Why applying a proxy was refused: `settings.toml` holds another proxy than the one it was
+/// reviewed over ([`crate::CoreHandle::apply_proxy`]).
+pub const PROXY_CHANGED_SINCE_REVIEW: &str = "settings.toml changed: its proxy is not the one this change was reviewed over; review it again";
 
 /// Which kinds are watched while a cluster is active (ADR-0008).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -450,10 +457,31 @@ impl std::fmt::Debug for ProxySetting {
 }
 
 /// Replaces the `[proxy]` of `settings.toml` with `proxy`, or removes it when `proxy` sets
-/// nothing, and writes the file. Returns the settings as written. Only the core calls it, as it
-/// also puts the setting in use ([`crate::CoreHandle::apply_proxy`]).
-pub(crate) fn set_proxy(dir: &Path, proxy: &ProxySetting) -> Result<Settings, SettingsError> {
-    edit_settings(dir, |table, _| {
+/// nothing, and writes the file. Returns the settings as written. The change was reviewed over
+/// `expected`: if the file, as read for this write, holds another proxy (changed by hand or by
+/// another Flint since), nothing is written and [`SettingsError::ProxyChangedSinceReview`] says
+/// so. That check and the write hold a real file lock: where the folder supports none, nothing is
+/// written. Only the core calls it, as it also puts the setting in use
+/// ([`crate::CoreHandle::apply_proxy`]).
+pub(crate) fn set_proxy(
+    dir: &Path,
+    proxy: &ProxySetting,
+    expected: &ProxySetting,
+) -> Result<Settings, SettingsError> {
+    edit_settings_locked(dir, |table, path| {
+        let held: ProxySetting = match table.get("proxy") {
+            Some(value) => value
+                .clone()
+                .try_into()
+                .map_err(|source| SettingsError::Parse {
+                    path: path.to_owned(),
+                    source,
+                })?,
+            None => ProxySetting::default(),
+        };
+        if held.normalized() != expected.normalized() {
+            return Err(SettingsError::ProxyChangedSinceReview);
+        }
         // Keys of the table this version does not know survive.
         let mut entry = match table.remove("proxy") {
             Some(toml::Value::Table(entry)) => entry,
@@ -482,7 +510,7 @@ pub(crate) fn set_proxy(dir: &Path, proxy: &ProxySetting) -> Result<Settings, Se
         if !entry.is_empty() {
             table.insert("proxy".into(), toml::Value::Table(entry));
         }
-        Ok(())
+        Ok(true)
     })
 }
 

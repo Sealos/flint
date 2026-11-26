@@ -338,6 +338,7 @@ enum Internal {
     /// Put a new proxy setting in use, then say what that did ([`crate::CoreHandle::apply_proxy`]).
     ApplyProxy {
         setting: settings::ProxySetting,
+        expected: settings::ProxySetting,
         reply: tokio::sync::oneshot::Sender<Result<crate::handle::ProxyApplied, String>>,
     },
     /// Time to report the proxy change `change`, whatever has not settled yet.
@@ -884,10 +885,16 @@ impl ClusterManager {
                     .internal_tx
                     .send(Internal::WriteSettings { writes, reply });
             }
-            Request::ApplyProxy { setting, reply } => {
-                let _ = self
-                    .internal_tx
-                    .send(Internal::ApplyProxy { setting, reply });
+            Request::ApplyProxy {
+                setting,
+                expected,
+                reply,
+            } => {
+                let _ = self.internal_tx.send(Internal::ApplyProxy {
+                    setting,
+                    expected,
+                    reply,
+                });
             }
             Request::ActivatePinned {
                 cluster,
@@ -1581,8 +1588,12 @@ impl ClusterManager {
                 let applied = self.reload_kubeconfig().await;
                 let _ = reply.send(applied);
             }
-            Internal::ApplyProxy { setting, reply } => {
-                let result = self.apply_proxy(setting).await;
+            Internal::ApplyProxy {
+                setting,
+                expected,
+                reply,
+            } => {
+                let result = self.apply_proxy(setting, expected).await;
                 let _ = reply.send(result);
             }
             Internal::ProxyReportDue { change } => self.proxy_report_due(change),

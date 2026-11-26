@@ -346,6 +346,61 @@ async fn apply_asks_first_and_cancel_applies_nothing(cx: &mut TestAppContext) {
     );
 }
 
+// covers #857: a proxy saved on disk while the confirmation was open, and not reported yet, is
+// not overwritten: Apply is refused, nothing reconnects, and the fields show the file's proxy.
+#[gpui_kit::test]
+async fn apply_over_a_proxy_changed_on_disk_is_refused_and_shows_it(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    show_network(cx, &t);
+    t.dispatch(
+        cx,
+        "settings::EditProxyUrl",
+        json!({ "url": "http://127.0.0.1:9" }),
+    )
+    .unwrap();
+    t.dispatch(cx, "settings::ApplyProxy", Value::Null).unwrap();
+    shown_dialog(cx, &t).await;
+
+    // Saved meanwhile, outside this window, which has not heard of it.
+    write_settings(dir.path());
+    let newer = t.settings_toml();
+    t.click(cx, "ok");
+    no_dialog(cx, &t).await;
+
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        matches!(
+            workspace.read(cx).network_progress(),
+            Some(Progress::Failed(_))
+        )
+    })
+    .await;
+    let Some(Progress::Failed(why)) = t.workspace.read_with(cx, |ws, _| ws.network_progress())
+    else {
+        unreachable!("waited for a refusal")
+    };
+    assert!(
+        why.contains(flint_core::settings::PROXY_CHANGED_SINCE_REVIEW),
+        "{why}"
+    );
+    assert!(!why.contains(SECRET), "{why}");
+    assert_eq!(t.settings_toml(), newer, "nothing was written");
+
+    let workspace = t.workspace.clone();
+    let shown = url_text(&with_password());
+    let want = shown.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace.read(cx).network_field_text(NetworkStop::Url, cx) == want
+    })
+    .await;
+    assert_eq!(field(cx, &t, NetworkStop::Url), shown);
+    let s = state(cx, &t);
+    assert!(!s.settings.network.typed && !s.settings.network.can_apply);
+    let everything = serde_json::to_string(&s).unwrap();
+    assert!(!everything.contains(SECRET), "{everything}");
+}
+
 const APPLY_CHILD: &str = "FLINT_TEST_PROXY_APPLY_CHILD";
 
 // Apply saves the proxy, reconnects the selected cluster on it and reports how it came back;

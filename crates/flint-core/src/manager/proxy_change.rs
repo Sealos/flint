@@ -49,10 +49,13 @@ enum Outcome {
 impl ClusterManager {
     /// Saves `setting`, puts it in use, and connects everything again on it ([`ProxyApplied`]).
     /// Refused before anything changes for a setting that does not check out, an invalid
-    /// `settings.toml`, or one that was unreadable at startup.
+    /// `settings.toml`, one that was unreadable at startup, or one whose saved proxy is no longer
+    /// `expected`, the one the change was reviewed over: the file is then read again, so the
+    /// front end hears of the proxy it holds.
     pub(super) async fn apply_proxy(
         &mut self,
         setting: ProxySetting,
+        expected: ProxySetting,
     ) -> Result<ProxyApplied, String> {
         setting.check()?;
         let setting = setting.normalized();
@@ -77,8 +80,19 @@ impl ClusterManager {
             .collect();
 
         let written = setting.clone();
-        self.try_write_settings("the proxy", move |dir| settings::set_proxy(dir, &written))
-            .await?;
+        let written = self
+            .try_write_settings("the proxy", move |dir| {
+                settings::set_proxy(dir, &written, &expected)
+            })
+            .await;
+        if let Err(why) = written {
+            // Perhaps changed on disk since it was reviewed: read it now, before the watcher
+            // reports it, so the change is reviewed again over what the file holds.
+            if why.contains(settings::PROXY_CHANGED_SINCE_REVIEW) {
+                self.reload_settings().await;
+            }
+            return Err(why);
+        }
         // A report still waiting for an earlier change goes out now, against the routes that
         // change loaded, before this one replaces them.
         self.finish_proxy_report("a newer proxy setting replaced it before it connected");

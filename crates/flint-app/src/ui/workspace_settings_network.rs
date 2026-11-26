@@ -6,11 +6,14 @@
 //! that writes waiting for review are refused until their cluster is back. Enter and Escape
 //! cancel it; only its button applies. It holds for the setting and the saved proxy it was asked
 //! over: if either changed before it was answered, nothing is applied and the section says so.
+//! The core checks that saved proxy against `settings.toml` itself, under its save lock, so a
+//! change on disk the watcher has not reported yet is not overwritten either: the section then
+//! shows the proxy the file holds, to be reviewed again.
 
 // module-tests: settings_network_tests.rs
 
 use flint_core::ProxyApplied;
-use flint_core::settings::ProxySetting;
+use flint_core::settings::{PROXY_CHANGED_SINCE_REVIEW, ProxySetting};
 use gpui_kit::component::input::InputEvent;
 use gpui_kit::*;
 
@@ -310,13 +313,25 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let reply = self.model.read(cx).core().apply_proxy(setting.clone());
+        let reply = self
+            .model
+            .read(cx)
+            .core()
+            .apply_proxy(setting.clone(), saved);
         let task = cx.spawn(async move |this, cx| {
             let applied = match reply.await {
                 Ok(applied) => applied,
                 Err(why) => {
                     let _ = this.update(cx, |ws, cx| {
-                        ws.settings_page.network.progress = Some(Progress::Failed(why));
+                        // The file holds another proxy than the one reviewed over, which the
+                        // core has read again: the fields show it, to be reviewed again. What was
+                        // typed while it was being applied stays.
+                        let changed = why.contains(PROXY_CHANGED_SINCE_REVIEW);
+                        let network = &mut ws.settings_page.network;
+                        network.progress = Some(Progress::Failed(why));
+                        if changed && !std::mem::take(&mut network.typed_while_applying) {
+                            ws.revert_network_fields();
+                        }
                         cx.notify();
                     });
                     return;

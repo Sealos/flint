@@ -106,7 +106,10 @@ async fn a_setting_that_does_not_check_out_changes_nothing() {
             no_proxy: vec!["localhost, http://user:hunter2@proxy.example:3128".into()],
         },
     ] {
-        let error = manager.apply_proxy(refused).await.unwrap_err();
+        let error = manager
+            .apply_proxy(refused, ProxySetting::default())
+            .await
+            .unwrap_err();
         assert!(!error.contains("hunter2"), "{error}");
     }
     assert!(!settings_file(dir.path()).exists(), "nothing was saved");
@@ -150,6 +153,8 @@ fn saving_a_setting_replaces_its_keys_and_keeps_the_file_to_its_owner() {
             url: Some(" socks5h://new.example:1080 ".into()),
             no_proxy: vec!["internal.example".into(), " ".into()],
         },
+        // Reviewed over the saved one, as written by hand: the same once trimmed.
+        &setting(" http://old.example:3128"),
     )
     .unwrap();
     assert_eq!(
@@ -173,7 +178,15 @@ fn saving_a_setting_replaces_its_keys_and_keeps_the_file_to_its_owner() {
         );
     }
 
-    let cleared = crate::settings::set_proxy(dir.path(), &ProxySetting::default()).unwrap();
+    let cleared = crate::settings::set_proxy(
+        dir.path(),
+        &ProxySetting::default(),
+        &ProxySetting {
+            url: Some("socks5h://new.example:1080".into()),
+            no_proxy: vec!["internal.example".into()],
+        },
+    )
+    .unwrap();
     assert!(cleared.proxy.is_empty());
     let text = std::fs::read_to_string(settings_file(dir.path())).unwrap();
     assert!(
@@ -190,9 +203,75 @@ fn saving_a_setting_replaces_its_keys_and_keeps_the_file_to_its_owner() {
         "[proxy]\nurl = \"http://a.example:1\"\n",
     )
     .unwrap();
-    crate::settings::set_proxy(dir.path(), &ProxySetting::default()).unwrap();
+    crate::settings::set_proxy(
+        dir.path(),
+        &ProxySetting::default(),
+        &setting("http://a.example:1"),
+    )
+    .unwrap();
     let text = std::fs::read_to_string(settings_file(dir.path())).unwrap();
     assert!(!text.contains("proxy"), "an empty table goes: {text}");
+}
+
+// covers UP-125: a proxy reviewed over a saved one the file no longer holds is not written.
+#[test]
+fn saving_a_setting_reviewed_over_another_saved_one_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = "[proxy]\nurl = \"http://newer.example:3128\"\n";
+    std::fs::write(settings_file(dir.path()), text).unwrap();
+    for reviewed_over in [ProxySetting::default(), setting("http://old.example:3128")] {
+        let refused = crate::settings::set_proxy(
+            dir.path(),
+            &setting("http://mine.example:3128"),
+            &reviewed_over,
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(crate::settings::SettingsError::ProxyChangedSinceReview)
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(settings_file(dir.path())).unwrap(),
+            text
+        );
+    }
+}
+
+// covers UP-125: Apply over a saved proxy changed on disk since it was reviewed (and not yet
+// reported) writes nothing and reconnects nothing, and reports what the file holds.
+#[tokio::test]
+async fn applying_over_a_proxy_changed_on_disk_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = manager_in(dir.path()).await;
+    let generation = proxy::generation();
+    let before = manager.cluster("dev").unwrap().generation;
+    let text = "[proxy]\nurl = \"http://user:hunter2@newer.example:3128\"\n";
+    std::fs::write(settings_file(dir.path()), text).unwrap();
+
+    let error = manager
+        .apply_proxy(setting("http://mine.example:3128"), ProxySetting::default())
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.contains(crate::settings::PROXY_CHANGED_SINCE_REVIEW),
+        "{error}"
+    );
+    assert!(!error.contains("hunter2"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(settings_file(dir.path())).unwrap(),
+        text
+    );
+    assert_eq!(proxy::generation(), generation);
+    assert_eq!(manager.cluster("dev").unwrap().generation, before);
+    assert!(!manager.held("dev"));
+    assert_eq!(
+        manager.settings.proxy.url.as_deref(),
+        Some("http://user:hunter2@newer.example:3128"),
+        "the file was read again"
+    );
 }
 
 // covers UP-125: a connection attempt started before a change goes on under the setting its
@@ -257,7 +336,10 @@ async fn child_every_slot_is_rebuilt_on_the_new_setting() {
     assert_eq!(dev_pin.proxy(), None, "dev starts direct");
 
     let applied = manager
-        .apply_proxy(setting("http://user:hunter2@proxy.example:3128"))
+        .apply_proxy(
+            setting("http://user:hunter2@proxy.example:3128"),
+            ProxySetting::default(),
+        )
         .await
         .unwrap();
 
@@ -354,7 +436,10 @@ async fn child_every_forward_ends_when_the_proxy_changes() {
     let own = manager.forward_for_tests("own");
 
     let applied = manager
-        .apply_proxy(setting("socks5h://proxy.example:1080"))
+        .apply_proxy(
+            setting("socks5h://proxy.example:1080"),
+            ProxySetting::default(),
+        )
         .await
         .unwrap();
 
@@ -384,7 +469,10 @@ async fn child_an_unreadable_start_keeps_the_setting_until_a_restart() {
     let mut manager = manager_in(dir.path()).await;
 
     let error = manager
-        .apply_proxy(setting("http://proxy.example:3128"))
+        .apply_proxy(
+            setting("http://proxy.example:3128"),
+            ProxySetting::default(),
+        )
         .await
         .unwrap_err();
 
@@ -523,14 +611,23 @@ async fn child_a_newer_change_finishes_the_earlier_report_first() {
     manager.active = Some("dev".to_owned());
 
     let first = manager
-        .apply_proxy(setting("http://proxy.example:3128"))
+        .apply_proxy(
+            setting("http://proxy.example:3128"),
+            ProxySetting::default(),
+        )
         .await
         .unwrap();
     assert_eq!(first.reconnecting, ["dev"]);
     let mut first_settled = first.settled;
     assert!(first_settled.try_recv().is_err(), "dev has not connected");
 
-    manager.apply_proxy(ProxySetting::default()).await.unwrap();
+    manager
+        .apply_proxy(
+            ProxySetting::default(),
+            setting("http://proxy.example:3128"),
+        )
+        .await
+        .unwrap();
     let report = first_settled.try_recv().expect("the first report went out");
     assert_eq!(
         report.rerouted,
