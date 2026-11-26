@@ -256,12 +256,25 @@ pub(super) fn build_with(inputs: &MenuInputs, cx: &App) -> (Vec<Menu>, Vec<bool>
     (menus, states)
 }
 
+/// Whether the menu bar must be built again: nothing was shown yet, or its inputs or an item's
+/// enabled state differ from what the bar shows. The inputs and the states determine the whole
+/// model, so comparing them is comparing the menus.
+pub(super) fn needs_rebuild(
+    shown: Option<(&MenuInputs, &[bool])>,
+    inputs: &MenuInputs,
+    enabled: &[bool],
+) -> bool {
+    shown.is_none_or(|(old_inputs, old_enabled)| old_inputs != inputs || old_enabled != enabled)
+}
+
+/// Sets the menu bar when it differs from the last one set. The macOS backend keeps a copy of
+/// every action it is given, so an unchanged bar is never set again (#831).
 fn install(inputs: MenuInputs, cx: &mut App) {
     let (menus, enabled) = build_with(&inputs, cx);
-    let unchanged = cx
+    let shown = cx
         .try_global::<Shown>()
-        .is_some_and(|shown| shown.inputs == inputs && shown.enabled == enabled);
-    if unchanged {
+        .map(|shown| (&shown.inputs, shown.enabled.as_slice()));
+    if !needs_rebuild(shown, &inputs, &enabled) {
         return;
     }
     cx.set_menus(menus);
