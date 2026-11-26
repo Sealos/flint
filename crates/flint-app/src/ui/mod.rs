@@ -60,6 +60,7 @@ mod quit_flush;
 mod registry;
 mod resource_actions;
 mod row_menu;
+mod row_menu_cursor;
 mod scope_picker;
 mod set_kinds;
 mod set_members;
