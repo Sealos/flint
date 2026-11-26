@@ -195,20 +195,7 @@ claude mcp add flint -- /usr/local/bin/flint mcp
 /usr/local/bin/flint mcp</code></pre>
     </section>
 
-    <section id="compare" class="wrap section">
-      <h2>Compared with other Kubernetes MCP servers</h2>
-      <div class="compare-wrap" role="region" aria-label="Comparison of Kubernetes MCP servers" tabindex="0">
-        <table class="compare">
-          <thead><tr><td></td><th scope="col">Flint</th><th scope="col"><a href="https://docs.lenshq.io/k8slens/mcp-server/">Lens MCP Server</a></th><th scope="col"><a href="https://github.com/containers/kubernetes-mcp-server">kubernetes-mcp-server</a></th></tr></thead>
-          <tbody>
-            <tr><th scope="row">Which clusters</th><td>Only those you expose, one by one, each tied to its API server URL</td><td>Every cluster Lens knows</td><td>The contexts in its kubeconfig</td></tr>
-            <tr><th scope="row">Writes</th><td>None: no tools for them</td><td>Its <code>kubectl</code> tool refuses writes; editors and Helm dialogs it fills in apply changes after you confirm; some tools change Lens itself (port forwards, settings)</td><td>Writes allowed, including delete and pod exec, unless its <code>read_only</code> or <code>disable_destructive</code> setting is on</td></tr>
-            <tr><th scope="row">Credential redaction in results</th><td>Secret values, and credentials in logs, events, messages and container arguments</td><td>Not described</td><td>Not for tool results (only its own log notifications); Secrets can be denied by configuration</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <p class="caption">As their documentation describes them in November 2026.</p>
-    </section>
+    
 
     <section id="roadmap" class="wrap section">
       <h2>Roadmap</h2>

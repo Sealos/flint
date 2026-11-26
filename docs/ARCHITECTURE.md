@@ -1296,7 +1296,7 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 | M5 | Port-forward panel with local ports and open in browser, Helm releases |
 | M5.5 | Multi-cluster and AI (history). Cluster sets (super mode), named sets, colour tags and a set dashboard are now scheduled across v0.5 and v0.6. Warm clusters are after 1.0 (#247). AI log analysis is not scheduled |
 | M6 | Universal (arm64 + x86_64) build, signing with hardened runtime, signed DMG, notarization and stapling, Homebrew cask, first public release |
-| M7 | Fleet actions on a cluster set (v0.7): rollout restart, scale, apply YAML and delete, with a per-cluster dry-run preview, one cluster at a time, stopping at the first failure |
+| M7 | Fleet actions on a cluster set (v0.8): rollout restart, scale, apply YAML and delete, with a per-cluster dry-run preview, one cluster at a time, stopping at the first failure |
 | M8 | Recordings: background capture of a workload's logs, events and metrics into SQLite, automatic recording on trouble, a timeline view and export |
 
 ## Risks

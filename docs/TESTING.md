@@ -677,11 +677,11 @@ milestone T; feature tests are in their feature's milestone.
   (#135); M5 port-forward and Helm on kind (#136); M5.5 MCP scope, redaction, activity log
   (#137) and cluster sets (#138), with warm clusters and Claude analysis not scheduled; M6 Homebrew cask smoke (#139).
 
-### v0.7: fleet actions
+### v0.8: fleet actions
 
-UP-100 and UP-101 are release requirements for v0.7: the dry-run diff per cluster, the typed-name confirmation for
-locked clusters, and stopping at the first failure with a report of which clusters were done are each covered by a
-unit test (sequencing) and an e2e test on the fake API.
+UP-100 and UP-101 are release requirements for v0.8: the dry-run result per cluster, protected, paused and disconnected
+members left out with their reason (nothing unlocks them), and stopping at the first failure with a report of which
+clusters were done are each covered by a unit test (sequencing) and an e2e test on the fake API.
 
 ### P2
 

@@ -3,7 +3,7 @@
 Flint is a fast, native Kubernetes app for your Mac that keeps many clusters in one window: open them together, save
 them as a cluster set, keep them watched in the background, and get a desktop alert when one gets a new problem.
 
-It is in the space of Lens and Freelens. Flint is written in Rust with [GPUI](https://www.gpui.rs/), so it starts
+Flint is written in Rust with [GPUI](https://www.gpui.rs/), so it starts
 fast, stays light on memory, and keeps up with large clusters. It runs on macOS and, best effort, Linux. It also ships
 a read-only [MCP](https://modelcontextprotocol.io/) server, `flint mcp`, that lets Claude Code and other AI agents
 read only the clusters you choose (see [MCP server for AI agents](#mcp-server-for-ai-agents)).
@@ -148,16 +148,6 @@ that array instead; TOML doesn't allow both forms for one key, and an invalid fi
 - **Read-only either way.** The entry decides what the server may read, never what it may do: it has no tool that
   creates, changes or deletes anything. It reads with the kubeconfig's credentials, so a user with read-only RBAC
   limits it further.
-
-### Compared with other Kubernetes MCP servers
-
-As their documentation describes them in November 2026:
-
-| | Flint (`flint mcp`) | [Lens MCP Server](https://docs.lenshq.io/k8slens/mcp-server/) | [kubernetes-mcp-server](https://github.com/containers/kubernetes-mcp-server) |
-|---|---|---|---|
-| Which clusters | Only those you expose, one by one, each tied to its API server URL, optionally limited to some namespaces and kinds | Every cluster Lens knows | The contexts in its kubeconfig |
-| Writes | None: no tools for them | Its `kubectl` tool refuses writes; editors and Helm dialogs it fills in apply changes after you confirm; some tools change Lens itself (port forwards, settings) | Writes allowed, including delete and pod exec, unless its `read_only` or `disable_destructive` setting is on |
-| Credential redaction in results | Secret values, and credentials in logs, events, messages and container arguments | Not described | Not for tool results (only its own log notifications); Secrets can be denied by configuration |
 
 ## Status
 
@@ -720,7 +710,7 @@ After every published release:
 1. **The release checklist** ([`docs/RELEASING.md`](docs/RELEASING.md)): the release page is Latest with all six
    binaries and their checksums, and the DMG installs and opens on a clean Mac (UP-80).
 2. **Reviews of the shipped build:** usability (install and use it as a new user), product development (is the
-   roadmap right?) and market fit (against Lens, Freelens, k9s, Headlamp and other tools). Their findings become
+   roadmap right?) and market fit (against the tools people use today). Their findings become
    issues.
 3. **A refactor pass:** behaviour-preserving `refactor(<scope>): …` PRs that work through the
    [refactor backlog](https://github.com/Sealos/flint/issues/87) and the duplication the release added. Existing
