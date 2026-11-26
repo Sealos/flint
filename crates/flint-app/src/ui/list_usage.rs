@@ -540,26 +540,56 @@ pub(in crate::ui) fn fit_widths(widths: &mut Vec<usize>, columns: &[Column], usa
     }
 }
 
-/// Makes room for the other columns while the drawn columns are wider than `room`, so usage never
-/// narrows a name or status: first the usage columns give up their bars (`bar` wide each, and a
-/// column drawn that much narrower than it asks for draws no bar), then Memory goes, then CPU. A
-/// column for which `keep` holds stays: the list is sorted by it.
-pub(in crate::ui) fn shed_usage(
-    drawn: &mut Vec<(usize, f32)>,
+/// The width `drawn` needs once Name and Namespace have narrowed as far as they do before any
+/// column goes: Name to `name_target`, Namespace to `namespace_min` (see
+/// [`list_model::shed_trailing`](super::list_model::shed_trailing)).
+fn needed(
+    drawn: &[(usize, f32)],
+    columns: &[Column],
+    (name_target, namespace_min): (f32, f32),
+) -> f32 {
+    drawn
+        .iter()
+        .map(|&(i, width)| match columns[i].role {
+            ColumnRole::Name => width.min(name_target),
+            ColumnRole::Namespace => width.min(namespace_min),
+            _ => width,
+        })
+        .sum()
+}
+
+/// Takes the bars off the usage columns (`bar` wide each) while the drawn columns need more than
+/// `room` with Name and Namespace narrowed (`identity`, as in [`needed`]). A column drawn that much
+/// narrower than it asks for draws no bar. The first thing to go in a narrow list.
+pub(in crate::ui) fn shed_usage_bars(
+    drawn: &mut [(usize, f32)],
     columns: &[Column],
     room: f32,
     bar: f32,
-    keep: impl Fn(usize) -> bool,
+    identity: (f32, f32),
 ) {
-    if drawn.iter().map(|&(_, width)| width).sum::<f32>() > room {
+    if needed(drawn, columns, identity) > room {
         for (i, width) in drawn.iter_mut() {
             if is_usage(columns[*i].role) {
                 *width -= bar;
             }
         }
     }
+}
+
+/// Leaves out Memory, then CPU, while the drawn columns need more than `room` with Name and
+/// Namespace narrowed (`identity`, as in [`needed`]), so usage never narrows a name below its
+/// target or pushes Status off. Runs after the bars and the trailing Restarts and Age have gone.
+/// A column for which `keep` holds stays: the list is sorted by it.
+pub(in crate::ui) fn shed_usage(
+    drawn: &mut Vec<(usize, f32)>,
+    columns: &[Column],
+    room: f32,
+    identity: (f32, f32),
+    keep: impl Fn(usize) -> bool,
+) {
     for role in [ColumnRole::MemoryUsage, ColumnRole::CpuUsage] {
-        if drawn.iter().map(|&(_, width)| width).sum::<f32>() <= room {
+        if needed(drawn, columns, identity) <= room {
             return;
         }
         drawn.retain(|&(i, _)| columns[i].role != role || keep(i));
@@ -1346,42 +1376,65 @@ mod tests {
         assert_ne!(usage.generation(), before);
     }
 
-    #[test]
-    fn a_narrow_list_drops_memory_then_cpu_but_keeps_the_sorted_one() {
-        let columns = [
+    /// Name, Namespace, CPU and Memory.
+    fn usage_columns() -> [Column; 4] {
+        [
             Column::synthetic("Name", ColumnType::String, ColumnRole::Name),
+            Column::synthetic("Namespace", ColumnType::String, ColumnRole::Namespace),
             Column::synthetic("CPU", ColumnType::Number, ColumnRole::CpuUsage),
             Column::synthetic("Memory", ColumnType::Number, ColumnRole::MemoryUsage),
-        ];
-        let all = vec![(0, 100.), (1, 50.), (2, 50.)];
+        ]
+    }
+
+    /// Name and Namespace never narrower than drawn.
+    const AS_DRAWN: (f32, f32) = (f32::MAX, f32::MAX);
+
+    #[test]
+    fn a_narrow_list_drops_memory_then_cpu_but_keeps_the_sorted_one() {
+        let columns = usage_columns();
+        let all = vec![(0, 100.), (2, 50.), (3, 50.)];
         let kept = |room: f32, sorted: Option<usize>| {
             let mut drawn = all.clone();
-            shed_usage(&mut drawn, &columns, room, 0., |i| Some(i) == sorted);
+            shed_usage(&mut drawn, &columns, room, AS_DRAWN, |i| Some(i) == sorted);
             drawn.iter().map(|&(i, _)| i).collect::<Vec<_>>()
         };
-        assert_eq!(kept(200., None), [0, 1, 2]);
-        assert_eq!(kept(150., None), [0, 1]);
+        assert_eq!(kept(200., None), [0, 2, 3]);
+        assert_eq!(kept(150., None), [0, 2]);
         assert_eq!(kept(100., None), [0]);
-        assert_eq!(kept(100., Some(2)), [0, 2]);
+        assert_eq!(kept(100., Some(3)), [0, 3]);
     }
 
     #[test]
     fn a_narrow_list_drops_the_bars_before_a_usage_column() {
-        let columns = [
-            Column::synthetic("Name", ColumnType::String, ColumnRole::Name),
-            Column::synthetic("CPU", ColumnType::Number, ColumnRole::CpuUsage),
-            Column::synthetic("Memory", ColumnType::Number, ColumnRole::MemoryUsage),
-        ];
-        let all = vec![(0, 100.), (1, 70.), (2, 70.)];
+        let columns = usage_columns();
+        let all = vec![(0, 100.), (2, 70.), (3, 70.)];
         let shed = |room: f32| {
             let mut drawn = all.clone();
-            shed_usage(&mut drawn, &columns, room, 20., |_| false);
+            shed_usage_bars(&mut drawn, &columns, room, 20., AS_DRAWN);
+            shed_usage(&mut drawn, &columns, room, AS_DRAWN, |_| false);
             drawn
         };
         assert_eq!(shed(240.), all);
         // Without bars the columns are 50 wide each and still fit.
-        assert_eq!(shed(200.), [(0, 100.), (1, 50.), (2, 50.)]);
-        assert_eq!(shed(150.), [(0, 100.), (1, 50.)]);
+        assert_eq!(shed(200.), [(0, 100.), (2, 50.), (3, 50.)]);
+        assert_eq!(shed(150.), [(0, 100.), (2, 50.)]);
+    }
+
+    // A long name or namespace does not push the usage out: they narrow first, down to their
+    // targets, as they do before Restarts or Age goes.
+    #[test]
+    fn usage_stays_while_name_and_namespace_can_narrow() {
+        let columns = usage_columns();
+        let all = vec![(0, 400.), (1, 150.), (2, 50.), (3, 50.)];
+        let kept = |room: f32| {
+            let mut drawn = all.clone();
+            shed_usage_bars(&mut drawn, &columns, room, 0., (200., 100.));
+            shed_usage(&mut drawn, &columns, room, (200., 100.), |_| false);
+            drawn.iter().map(|&(i, _)| i).collect::<Vec<_>>()
+        };
+        assert_eq!(kept(400.), [0, 1, 2, 3]);
+        assert_eq!(kept(350.), [0, 1, 2]);
+        assert_eq!(kept(300.), [0, 1]);
     }
 
     #[test]
