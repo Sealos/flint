@@ -375,6 +375,20 @@ impl CombinedResourceList {
         self.recompute(cx);
     }
 
+    /// Shows another kind in this list, titled `label`, keeping what the person set up: the text
+    /// filter, the cluster chips, the grouping and the sort, which applies once the new kind
+    /// has its column.
+    /// What belongs to the old kind goes: its selection, its dashboard narrowing and its note.
+    pub fn switch_kind(&mut self, label: String, source: CombinedSource, cx: &mut Context<Self>) {
+        self.end_objects();
+        self.label = label;
+        self.kind_note = None;
+        self.hide_rows(cx);
+        self.remeasure = true;
+        self.set_source(source, cx);
+        cx.notify();
+    }
+
     pub fn set_namespaces(&mut self, namespaces: Vec<String>, cx: &mut Context<Self>) {
         if self.query.namespaces != namespaces {
             self.query.namespaces = namespaces;

@@ -2251,124 +2251,95 @@ impl Workspace {
             };
             crumbs.push((object.name.clone().into(), full));
         }
-        // The object's name is a resource name: monospace, like the list's names.
-        let mono_last = self.detail.is_some();
-        let crumb_count = crumbs.len();
-        // Clipped: a cluster filling the row leaves no room for the chevrons after it.
-        let mut breadcrumb = h_flex()
-            .flex_1()
-            .min_w_0()
-            .overflow_hidden()
-            .gap_1()
-            .text_sm();
-        for (i, (text, tip)) in crumbs.into_iter().enumerate() {
-            if i > 0 {
-                breadcrumb = breadcrumb.child(
-                    Icon::new(IconName::ChevronRight)
-                        .xsmall()
-                        .text_color(theme.muted_foreground),
-                );
-            }
-            let last = i + 1 == crumb_count;
-            breadcrumb = breadcrumb.child(
-                div()
-                    .id(("crumb", i))
-                    .aria_label(text.clone())
-                    .test_support()
-                    .min_w_0()
-                    .truncate()
-                    // The other crumbs give way first: the cluster is cut only when it alone
-                    // is wider than the breadcrumb.
-                    .when(i == 0, |el| el.flex_none().max_w_full())
-                    .when(!last, |el| el.text_color(theme.muted_foreground))
-                    .when(last, |el| el.font_semibold())
-                    .when(last && mono_last, |el| {
-                        el.font_family(theme.mono_font_family.clone())
-                    })
-                    .child(text)
-                    .when(!tip.is_empty(), |el| {
-                        el.tooltip(move |window, cx| {
-                            cap_width(Tooltip::new(tip.clone())).build(window, cx)
-                        })
-                        .tooltip_show_delay(SHOW_DELAY)
-                    }),
-            );
-        }
-
         let detail_alone = self.main_panes(cx) == MainPanes::DetailAlone;
         let two_rows = self.header_has_two_rows(window_width, cx);
-        let namespaces = controls
-            .namespaces
-            .then(|| self.render_namespace_filter(&ns_summary, ns_label, cx));
-        let watch_mode = controls
-            .watch_mode
-            .then(|| self.render_watch_mode(&name, two_rows, cx));
+        let namespaces =
+            self.render_namespace_filter(&ns_summary, ns_label, controls.namespaces, cx);
         let keep_watching = self
-            .dashboard
-            .is_some()
-            .then(|| self.render_keep_watching(&name, None, cx));
-        let alerts = super::alert_center::render_button(cx);
-        let first_row = super::theme::moves_window(h_flex())
-            .h(px(HEADER_HEIGHT))
-            .flex_none()
-            .px_3()
-            .gap_2()
-            .when(detail_alone, |el| {
-                el.child(
-                    div().flex_none().child(
-                        Button::new("detail-back")
-                            .xsmall()
-                            .ghost()
-                            .icon(IconName::ChevronLeft)
-                            .label("Back")
-                            .tooltip_with_action(
-                                registry::label::<BackToList>(),
-                                &BackToList,
-                                Some(registry::WORKSPACE),
-                            )
-                            .on_click(registry::on_click(BackToList)),
-                    ),
-                )
-            })
-            .child(breadcrumb);
+            .render_keep_watching(&name, None, cx)
+            .disabled(!controls.keep_watching || self.model.read(cx).settings_error.is_some());
+        let watch_mode = self.render_watch_mode(&name, two_rows, controls.watch_mode, cx);
         let access_mode = self.render_access_mode(cluster, two_rows, theme, cx);
-        if two_rows {
-            v_flex()
-                .id("main-header")
-                .w_full()
-                .flex_none()
-                .border_b_1()
-                .border_color(theme.border)
-                .child(first_row.w_full())
-                .child(
-                    h_flex()
-                        .id("header-controls-row")
-                        .w_full()
-                        .h(px(HEADER_HEIGHT))
-                        .flex_none()
-                        .px_3()
-                        .gap_2()
-                        .justify_end()
-                        .child(access_mode)
-                        .children(namespaces)
-                        .children(keep_watching)
-                        .children(watch_mode)
-                        .children(alerts)
-                        .test_support(),
-                )
-                .test_support()
-                .into_any_element()
-        } else {
-            first_row
-                .border_b_1()
-                .border_color(theme.border)
-                .child(access_mode)
-                .children(namespaces)
-                .children(keep_watching)
-                .children(watch_mode)
-                .children(alerts)
-                .into_any_element()
+        header_shell(
+            header_breadcrumb(crumbs, self.detail.is_some(), theme),
+            detail_alone,
+            two_rows,
+            vec![
+                access_mode.into_any_element(),
+                namespaces.into_any_element(),
+                keep_watching.into_any_element(),
+                watch_mode.into_any_element(),
+            ]
+            .into_iter()
+            .chain(super::alert_center::render_button(cx).map(IntoElement::into_any_element))
+            .collect(),
+            theme,
+        )
+    }
+
+    /// The header of a running set: the set and its kind, and the same controls in the same
+    /// places as a cluster's header, off because each applies to one cluster.
+    pub(super) fn render_set_header(
+        &self,
+        label: &str,
+        kind_label: &str,
+        window_width: f32,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let mut crumbs: Vec<(SharedString, String)> = vec![
+            (label.to_owned().into(), label.to_owned()),
+            (kind_label.to_owned().into(), kind_label.to_owned()),
+        ];
+        if let Some(detail) = &self.detail {
+            let object = detail.read(cx).object();
+            crumbs.push((object.name.clone().into(), object.name.clone()));
         }
+        let two_rows = self.header_has_two_rows(window_width, cx);
+        let controls = set_header_controls();
+        let default_mode = self.model.read(cx).settings.watch_mode;
+        let per_cluster = "Applies to one cluster: select a cluster to change it.";
+        let namespaces = Button::new("namespace-filter-button")
+            .xsmall()
+            .outline()
+            .label("All namespaces")
+            .disabled(!controls.namespaces)
+            .tooltip(per_cluster);
+        let keep_watching = Button::new("keep-watching")
+            .xsmall()
+            .ghost()
+            .label(keep_watching::toggle_label(
+                KeepWatching::Off,
+                BackgroundSignIn::NotNeeded,
+            ))
+            .disabled(!controls.keep_watching)
+            .tooltip(per_cluster);
+        let watch_mode = Button::new("watch-mode")
+            .xsmall()
+            .ghost()
+            // As a cluster on the default shows it, so the slot keeps its width.
+            .label(if two_rows {
+                watch_mode_short_label(default_mode)
+            } else {
+                watch_mode_label(default_mode)
+            })
+            .disabled(!controls.watch_mode)
+            .tooltip(per_cluster);
+        header_shell(
+            header_breadcrumb(crumbs, self.detail.is_some(), theme),
+            // Back is the cluster view's: a set keeps its own panes.
+            false,
+            two_rows,
+            vec![
+                namespaces.into_any_element(),
+                keep_watching.into_any_element(),
+                watch_mode.into_any_element(),
+            ]
+            .into_iter()
+            .chain(super::alert_center::render_button(cx).map(IntoElement::into_any_element))
+            .collect(),
+            theme,
+        )
     }
 
     /// The overview's keep-watching toggle, saying what it would do and any state to act on.
@@ -2378,7 +2349,7 @@ impl Workspace {
         cluster: &str,
         member: Option<&str>,
         cx: &Context<Self>,
-    ) -> impl IntoElement {
+    ) -> Button {
         let model = self.model.read(cx);
         let (status, sign_in) = model
             .keep_watching(cluster)
@@ -2543,6 +2514,7 @@ impl Workspace {
         &self,
         summary: &str,
         label: String,
+        enabled: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let this = cx.weak_entity();
@@ -2554,7 +2526,7 @@ impl Workspace {
         Popover::new("namespace-filter")
             .anchor(Anchor::TopRight)
             .track_focus(&picker)
-            .open(self.namespace_popover_open)
+            .open(self.namespace_popover_open && enabled)
             // After the change in hand: it may come while the workspace is being updated (the
             // palette dismissing it).
             .on_open_change(move |open, _, cx| {
@@ -2573,6 +2545,7 @@ impl Workspace {
                     .xsmall()
                     .outline()
                     .label(label)
+                    .disabled(!enabled)
                     // The label is cut to a few characters, so the watch mode button beside it
                     // stays on screen at the minimum width (UP-33). The accessible name and the
                     // tooltip keep the whole name.
@@ -2746,6 +2719,7 @@ impl Workspace {
         &self,
         cluster: &str,
         compact: bool,
+        enabled: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let settings = self.model.read(cx).settings.clone();
@@ -2763,7 +2737,7 @@ impl Workspace {
                 label
             })
             .accessibility_label(label)
-            .disabled(!settings_ok)
+            .disabled(!settings_ok || !enabled)
             .tab_stop(false)
             .tooltip(format!(
                 "{label}\nAll kinds: every kind is watched. On view: the kinds of open views and the problem kinds are watched"
@@ -3837,20 +3811,133 @@ fn no_contexts_text(kubeconfig_env: Option<&std::ffi::OsStr>, unreadable: bool) 
     }
 }
 
+/// The header's breadcrumb: `crumbs` as text and tooltip, the last one in bold. A detail's object
+/// name is a resource name, so monospace like the list's names.
+fn header_breadcrumb(crumbs: Vec<(SharedString, String)>, mono_last: bool, theme: &Theme) -> Div {
+    let crumb_count = crumbs.len();
+    // Clipped: a cluster filling the row leaves no room for the chevrons after it.
+    let mut breadcrumb = h_flex()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .gap_1()
+        .text_sm();
+    for (i, (text, tip)) in crumbs.into_iter().enumerate() {
+        if i > 0 {
+            breadcrumb = breadcrumb.child(
+                Icon::new(IconName::ChevronRight)
+                    .xsmall()
+                    .text_color(theme.muted_foreground),
+            );
+        }
+        let last = i + 1 == crumb_count;
+        breadcrumb = breadcrumb.child(
+            div()
+                .id(("crumb", i))
+                .aria_label(text.clone())
+                .test_support()
+                .min_w_0()
+                .truncate()
+                // The other crumbs give way first: the first is cut only when it alone is wider
+                // than the breadcrumb.
+                .when(i == 0, |el| el.flex_none().max_w_full())
+                .when(!last, |el| el.text_color(theme.muted_foreground))
+                .when(last, |el| el.font_semibold())
+                .when(last && mono_last, |el| {
+                    el.font_family(theme.mono_font_family.clone())
+                })
+                .child(text)
+                .when(!tip.is_empty(), |el| {
+                    el.tooltip(move |window, cx| {
+                        cap_width(Tooltip::new(tip.clone())).build(window, cx)
+                    })
+                    .tooltip_show_delay(SHOW_DELAY)
+                }),
+        );
+    }
+    breadcrumb
+}
+
+/// The main header around `breadcrumb`: `controls` after it on the same row, or on a second row
+/// when the area is narrow. Every view passes its controls in the same order.
+fn header_shell(
+    breadcrumb: Div,
+    detail_alone: bool,
+    two_rows: bool,
+    controls: Vec<AnyElement>,
+    theme: &Theme,
+) -> AnyElement {
+    let first_row = super::theme::moves_window(h_flex())
+        .h(px(HEADER_HEIGHT))
+        .flex_none()
+        .px_3()
+        .gap_2()
+        .when(detail_alone, |el| {
+            el.child(
+                div().flex_none().child(
+                    Button::new("detail-back")
+                        .xsmall()
+                        .ghost()
+                        .icon(IconName::ChevronLeft)
+                        .label("Back")
+                        .tooltip_with_action(
+                            registry::label::<BackToList>(),
+                            &BackToList,
+                            Some(registry::WORKSPACE),
+                        )
+                        .on_click(registry::on_click(BackToList)),
+                ),
+            )
+        })
+        .child(breadcrumb);
+    if two_rows {
+        v_flex()
+            .id("main-header")
+            .w_full()
+            .flex_none()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(first_row.w_full())
+            .child(
+                h_flex()
+                    .id("header-controls-row")
+                    .w_full()
+                    .h(px(HEADER_HEIGHT))
+                    .flex_none()
+                    .px_3()
+                    .gap_2()
+                    .justify_end()
+                    .children(controls)
+                    .test_support(),
+            )
+            .test_support()
+            .into_any_element()
+    } else {
+        first_row
+            .border_b_1()
+            .border_color(theme.border)
+            .children(controls)
+            .into_any_element()
+    }
+}
+
 /// Whether a main area this wide puts the detail-alone header's controls on a second row.
 fn header_needs_two_rows(main_width: f32) -> bool {
     main_width < HEADER_ONE_ROW_MIN_WIDTH
 }
 
-/// Which header controls work for the active cluster: none while its connection failed (no
-/// namespaces to pick, nothing to watch; the main area offers Retry), and the namespace
-/// filter only for a namespaced kind.
+/// Which header controls work in the view shown. The header always draws every control, so
+/// the pointer target of each stays put between views; a control that does not apply is
+/// disabled, not dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HeaderControls {
     namespaces: bool,
+    keep_watching: bool,
     watch_mode: bool,
 }
 
+/// A cluster's header: none works while its connection failed (no namespaces to pick, nothing
+/// to watch; the main area offers Retry), and the namespace filter only for a namespaced kind.
 fn header_controls(
     cluster: &ClusterSummary,
     list: Option<&super::list::ResourceList>,
@@ -3858,7 +3945,17 @@ fn header_controls(
     let stopped = connection_stopped(&cluster.state);
     HeaderControls {
         namespaces: !stopped && list.is_none_or(|l| l.namespaced()),
+        keep_watching: !stopped,
         watch_mode: !stopped,
+    }
+}
+
+/// A set's header: each control is a cluster's own setting, so none applies to the set.
+fn set_header_controls() -> HeaderControls {
+    HeaderControls {
+        namespaces: false,
+        keep_watching: false,
+        watch_mode: false,
     }
 }
 

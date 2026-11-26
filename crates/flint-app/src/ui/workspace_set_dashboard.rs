@@ -479,8 +479,16 @@ impl Workspace {
             disconnected: run.disconnected.clone(),
         };
         let (set_id, left_out) = (run.set_id.clone(), run.left_out.clone());
+        let list = run.list.clone();
         self.close_set_detail(cx);
-        self.show_set(label, members, (kind, kind_label), gone, window, cx);
+        self.show_set(
+            (label, members),
+            (kind, kind_label),
+            gone,
+            Some(list),
+            window,
+            cx,
+        );
         if let Some(run) = &mut self.sets.running {
             run.set_id = set_id;
             run.left_out = left_out;
