@@ -69,7 +69,7 @@ tokio-rustls = { version = "0.26.6", default-features = false }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 # Already in the tree through rustls; HMAC-SHA256 and the key for the activity log's server keys.
 ring = "0.17.14"
-base64 = "0.22.1"
+base64 = "0.23.1"
 # The recordings store (ADR-0018), with SQLite compiled in (github.com/rusqlite/rusqlite).
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 # The server side of the fake exec WebSocket: the same tokio-tungstenite kube's client uses.
