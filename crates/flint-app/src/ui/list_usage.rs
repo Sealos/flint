@@ -945,11 +945,6 @@ mod tests {
             workload("batch", "cronjobs"),
             Some(UsageSubject::Workloads(OwnerChain::ViaJobs))
         );
-        // Their panes show no usage yet.
-        assert_eq!(
-            UsageSubject::of_detail(&KindId::new("apps", "deployments")),
-            None
-        );
         assert_eq!(
             UsageSubject::of_detail(&KindId::pods()),
             Some(UsageSubject::Pods)

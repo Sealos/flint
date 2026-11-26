@@ -11,6 +11,7 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use serde_json::Value;
 
 use super::super::list_usage::{UNKNOWN_TEXT, UsageSource, UsageSubject, cpu_text, memory_text};
+use super::super::list_usage_workloads::{self, Totals};
 use super::ring::RingSpec;
 
 /// What the object's own definition gives to compare use with.
@@ -50,6 +51,22 @@ pub(super) struct DetailUsage {
     created: Option<i64>,
     /// The object was deleted, so a reading under its name is now another object's.
     deleted: bool,
+    /// A workload's uid, which names its pods' owner.
+    uid: Option<Box<str>>,
+    /// A workload's totals over its pods, worked out when the poll or the object changes rather
+    /// than on every frame.
+    workload: WorkloadReading,
+}
+
+/// What the pods of the workload the pane shows add up to.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum WorkloadReading {
+    /// Not worked out: the pane shows no workload, or has no uid for it yet.
+    #[default]
+    Unread,
+    /// No pod is running and reporting.
+    Idle,
+    Totals(Totals),
 }
 
 impl DetailUsage {
@@ -60,7 +77,24 @@ impl DetailUsage {
         }
         let changed = self.source != source;
         self.source = source;
+        // Only when the readings changed: adding up a workload's pods is not free.
+        if changed {
+            self.read_workload();
+        }
         changed
+    }
+
+    /// Adds up the workload's pods, if the pane shows one.
+    fn read_workload(&mut self) {
+        self.workload = match (&self.source, &self.uid) {
+            (UsageSource::Workloads(usage, index, chain), Some(uid)) => {
+                match list_usage_workloads::totals_of(index, usage, *chain, uid) {
+                    Some(totals) => WorkloadReading::Totals(totals),
+                    None => WorkloadReading::Idle,
+                }
+            }
+            _ => WorkloadReading::Unread,
+        };
     }
 
     /// Takes the thresholds in force for the object's cluster. `true` if they change the pane.
@@ -74,6 +108,7 @@ impl DetailUsage {
     pub(super) fn mark_deleted(&mut self) {
         self.deleted = true;
         self.source = UsageSource::Unknown;
+        self.read_workload();
     }
 
     /// Reads the budget from the fetched object. One that cannot be read stays unknown.
@@ -83,6 +118,11 @@ impl DetailUsage {
             .and_then(Value::as_str)
             .and_then(|text| text.parse::<jiff::Timestamp>().ok())
             .map(jiff::Timestamp::as_second);
+        self.uid = object
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .map(Into::into);
+        self.read_workload();
         self.budget = match subject {
             Some(UsageSubject::Pods) => object
                 .get("spec")
@@ -106,15 +146,32 @@ impl DetailUsage {
                 self.source.hint().map(UsagePanel::Hint)
             }
             UsageSource::Unknown => Some(unknown_rings()),
-            // Panes follow only the kinds [`UsageSubject::of_detail`] names.
-            UsageSource::Workloads(..) => None,
-            UsageSource::Nodes(usage, _) => Some(match usage.get(name) {
+            UsageSource::Workloads(..) => Some(match self.workload {
+                WorkloadReading::Totals(totals) => workload_rings(totals, &self.thresholds),
+                WorkloadReading::Idle => idle_rings(),
+                WorkloadReading::Unread => unknown_rings(),
+            }),
+            UsageSource::Nodes(usage, capacity) => Some(match usage.get(name) {
                 Some(&used) => {
                     let allocatable = match self.budget {
                         Some(Budget::Node(amounts)) => Some(amounts),
                         _ => None,
                     };
-                    node_rings(used, allocatable, &self.thresholds)
+                    // What the node's pods request, once the feed has read the pods.
+                    let requests = capacity
+                        .as_ref()
+                        .and_then(|capacity| capacity.node(name))
+                        .map(|node| node.requests)
+                        .unwrap_or_default();
+                    node_rings(
+                        used,
+                        allocatable,
+                        Amounts {
+                            cpu: requests.cpu,
+                            memory: requests.memory,
+                        },
+                        &self.thresholds,
+                    )
                 }
                 None => unknown_rings(),
             }),
@@ -135,6 +192,20 @@ impl DetailUsage {
                 })
             }
         }
+    }
+}
+
+/// A workload with no pod running and reporting.
+fn idle_rings() -> UsagePanel {
+    let idle = |label| UsageRing {
+        label,
+        spec: None,
+        center: "none".to_owned(),
+        lines: vec!["no pod is running and reporting".to_owned()],
+    };
+    UsagePanel::Rings {
+        cpu: idle("CPU"),
+        memory: idle("Memory"),
     }
 }
 
@@ -193,8 +264,15 @@ impl Measure<'_> {
             _ => (self.text)(self.used),
         };
         let mut lines = vec![format!("{} used", (self.text)(self.used))];
-        if request.is_some() || end_word == "limit" {
-            lines.push(against(self.used, request, self.text, "request"));
+        match request {
+            // A node's tick is what its pods ask for, which it does not itself.
+            Some(request) if end_word == "allocatable" => {
+                lines.push(format!("{} requested by pods", (self.text)(request)));
+            }
+            _ if request.is_some() || end_word == "limit" => {
+                lines.push(against(self.used, request, self.text, "request"));
+            }
+            _ => {}
         }
         lines.push(against(self.used, end, self.text, end_word));
         UsageRing {
@@ -256,21 +334,51 @@ fn pod_rings(used: Usage, budget: Option<PodBudget>, thresholds: &Thresholds) ->
     }
 }
 
-/// A node's rings run to allocatable.
-///
-/// TODO(#801): the tick at the total requests of the node's pods needs the per-node requested
-/// totals of #798; until they are read the ring has no tick.
-fn node_rings(used: Usage, allocatable: Option<Amounts>, thresholds: &Thresholds) -> UsagePanel {
+/// A workload's rings, over the totals of its pods: the same rules as a pod's, with its use,
+/// requests and limits summed (a limit total exists only if every pod sets one).
+fn workload_rings(totals: Totals, thresholds: &Thresholds) -> UsagePanel {
+    let (cpu, memory) = measures(totals.usage(), thresholds);
+    if !totals.budgeted {
+        return UsagePanel::Rings {
+            cpu: cpu.text_only("requests and limits"),
+            memory: memory.text_only("requests and limits"),
+        };
+    }
+    UsagePanel::Rings {
+        cpu: cpu.ring(totals.cpu.request, totals.cpu.limit, "limit"),
+        memory: memory.ring(totals.memory.request, totals.memory.limit, "limit"),
+    }
+}
+
+/// A node's rings run to allocatable, with a tick at what its pods request.
+fn node_rings(
+    used: Usage,
+    allocatable: Option<Amounts>,
+    requests: Amounts,
+    thresholds: &Thresholds,
+) -> UsagePanel {
     let (cpu, memory) = measures(used, thresholds);
-    match allocatable {
-        Some(allocatable) => UsagePanel::Rings {
-            cpu: cpu.ring(None, allocatable.cpu.map(Cpu::nanos), "allocatable"),
-            memory: memory.ring(None, allocatable.memory.map(Memory::bytes), "allocatable"),
-        },
-        None => UsagePanel::Rings {
-            cpu: cpu.text_only("allocatable"),
-            memory: memory.text_only("allocatable"),
-        },
+    // A ring needs positive allocatable to be the circle: without it, what pods request would
+    // stand in for the capacity, and a node would look full that has no known size.
+    let ring =
+        |measure: &Measure, requests: Option<u64>, allocatable: Option<u64>| match allocatable
+            .filter(|&amount| amount > 0)
+        {
+            Some(_) => measure.ring(requests, allocatable, "allocatable"),
+            None => measure.text_only("allocatable"),
+        };
+    let allocatable = allocatable.unwrap_or_default();
+    UsagePanel::Rings {
+        cpu: ring(
+            &cpu,
+            requests.cpu.map(Cpu::nanos),
+            allocatable.cpu.map(Cpu::nanos),
+        ),
+        memory: ring(
+            &memory,
+            requests.memory.map(Memory::bytes),
+            allocatable.memory.map(Memory::bytes),
+        ),
     }
 }
 
@@ -515,5 +623,165 @@ mod tests {
         let detail = pod_detail(UsageSource::Unknown);
         let (cpu, memory) = rings(detail.panel(Some("ns"), "web"));
         assert!(unknown_ring(&cpu) && unknown_ring(&memory));
+    }
+
+    #[test]
+    fn a_node_ring_has_a_tick_at_what_its_pods_request() {
+        use flint_core::telemetry::{Allocatable, ClusterCapacity, NodeCapacity, Reserved};
+        let capacity = ClusterCapacity {
+            nodes: Arc::new([NodeCapacity {
+                name: "n1".into(),
+                allocatable: Allocatable::default(),
+                requests: Reserved {
+                    cpu: Some(Cpu::from_nanos(2_000_000_000)),
+                    memory: None,
+                },
+                limits: Reserved::default(),
+                pods: None,
+            }]),
+        };
+        let source = UsageSource::Nodes(
+            Arc::new([("n1".to_owned(), usage(1000, 512))].into_iter().collect()),
+            Some(capacity),
+        );
+        let detail = node_detail(
+            source,
+            &json!({"status": {"allocatable": {"cpu": "4", "memory": "1Gi"}}}),
+        );
+        let (cpu, memory) = rings(detail.panel(None, "n1"));
+        let spec = cpu.spec.unwrap();
+        assert_eq!((spec.fill, spec.tick), (0.25, Some(0.5)));
+        assert_eq!(
+            cpu.lines,
+            [
+                "1000m used",
+                "2000m requested by pods",
+                "25% of 4000m allocatable"
+            ]
+        );
+        // No memory request is known: no tick.
+        assert_eq!(memory.spec.unwrap().tick, None);
+    }
+
+    fn workload_detail(pods: &[(&'static str, &str)], object_uid: &str) -> DetailUsage {
+        use flint_core::telemetry::{Controllers, PodIndex, PodOwner, PodRecord};
+
+        use super::super::super::list_usage_workloads::OwnerChain;
+        let owner = PodOwner {
+            group: "apps".into(),
+            kind: "StatefulSet".into(),
+            name: "db".into(),
+            uid: "sts".into(),
+        };
+        let spec: PodSpec = serde_json::from_value(json!({"containers": [{
+            "name": "app",
+            "resources": {
+                "requests": {"cpu": "100m", "memory": "50Mi"},
+                "limits": {"cpu": "200m", "memory": "100Mi"}
+            }
+        }]}))
+        .unwrap();
+        let records: Vec<_> = pods
+            .iter()
+            .map(|&(uid, name)| {
+                let record = PodRecord {
+                    namespace: "ns".into(),
+                    name: name.into(),
+                    created: Some(985),
+                    budget: PodBudgetCheck::of(&spec),
+                    node: None,
+                    owner: Some(owner.clone()),
+                    finished: false,
+                };
+                (uid, record)
+            })
+            .collect();
+        let samples = pods
+            .iter()
+            .map(|&(_, name)| {
+                let sample = PodMetrics {
+                    namespace: "ns".into(),
+                    name: name.into(),
+                    timestamp: Some(jiff::Timestamp::from_second(1_000).unwrap()),
+                    window: Some(jiff::SignedDuration::from_secs(15)),
+                    containers: vec![ContainerMetrics {
+                        name: "app".into(),
+                        usage: usage(10, 20),
+                    }],
+                }
+                .sample();
+                (("ns".to_owned(), name.to_owned()), sample)
+            })
+            .collect();
+        let source = UsageSource::Workloads(
+            Arc::new(samples),
+            PodIndex::for_tests(records, Controllers::new()),
+            OwnerChain::Direct,
+        );
+        let mut detail = DetailUsage::default();
+        detail.set_object(
+            Some(UsageSubject::Workloads(OwnerChain::Direct)),
+            &json!({"metadata": {"uid": object_uid}}),
+        );
+        detail.set_source(source);
+        detail
+    }
+
+    #[test]
+    fn a_node_with_no_allocatable_for_a_metric_gets_no_ring_for_it() {
+        use flint_core::telemetry::{Allocatable, ClusterCapacity, NodeCapacity, Reserved};
+        let capacity = ClusterCapacity {
+            nodes: Arc::new([NodeCapacity {
+                name: "n1".into(),
+                allocatable: Allocatable::default(),
+                requests: Reserved {
+                    cpu: Some(Cpu::from_nanos(500_000_000)),
+                    memory: None,
+                },
+                limits: Reserved::default(),
+                pods: None,
+            }]),
+        };
+        let source = UsageSource::Nodes(
+            Arc::new([("n1".to_owned(), usage(1000, 512))].into_iter().collect()),
+            Some(capacity),
+        );
+        // Memory is allocatable; CPU is missing, and the node's requests must not stand in.
+        let detail = node_detail(
+            source,
+            &json!({"status": {"allocatable": {"memory": "1Gi"}}}),
+        );
+        let (cpu, memory) = rings(detail.panel(None, "n1"));
+        assert_eq!(cpu.spec, None);
+        assert_eq!(cpu.center, "1000m");
+        assert!(memory.spec.is_some());
+    }
+
+    #[test]
+    fn a_workload_shows_rings_over_the_totals_of_its_pods() {
+        let detail = workload_detail(&[("u1", "a"), ("u2", "b")], "sts");
+        let (cpu, memory) = rings(detail.panel(Some("ns"), "db"));
+        // 20m used of a 400m limit, with 200m requested.
+        assert_eq!(cpu.center, "5%");
+        let spec = cpu.spec.unwrap();
+        assert_eq!(
+            (spec.fill, spec.tick, spec.tone),
+            (0.05, Some(0.5), Tone::Normal)
+        );
+        assert_eq!(
+            cpu.lines,
+            ["20m used", "10% of 200m request", "5% of 400m limit"]
+        );
+        // 40Mi used of a 200Mi limit.
+        assert_eq!(memory.center, "20%");
+    }
+
+    #[test]
+    fn a_workload_with_no_pod_reporting_says_so_and_is_not_unknown() {
+        let detail = workload_detail(&[("u1", "a")], "another");
+        let (cpu, _) = rings(detail.panel(Some("ns"), "other"));
+        assert_eq!(cpu.spec, None);
+        assert_eq!(cpu.center, "none");
+        assert!(!unknown_ring(&cpu));
     }
 }
