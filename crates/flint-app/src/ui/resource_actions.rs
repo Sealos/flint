@@ -16,11 +16,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use flint_core::KindId;
+use flint_core::action_kinds;
 use flint_core::display::{ClusterNames, cluster_name_key, single_line};
 use flint_core::redact::first_line;
 use flint_core::write::{
-    BlockedReason, DrainProgress, DrainReport, PodName, WriteError, WriteOutcome, WriteProposal,
-    WriteReview, WriteTarget,
+    BlockedReason, DrainProgress, DrainReport, PodName, ResourceChange, WriteAction, WriteError,
+    WriteOutcome, WriteProposal, WriteReview, WriteTarget,
 };
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::Button;
@@ -30,7 +31,7 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, Theme, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::confirm::{self, DialogText};
+use super::confirm::{self, DialogText, ObjectGuard};
 use super::detail::access::Gated;
 use super::detail::{DetailView, Opening, Subject, protected_reason, refused};
 use super::notice::{notice, notice_with};
@@ -258,38 +259,26 @@ pub(in crate::ui) fn record_progress(key: &WriteKey, progress: DrainProgress, cx
     });
 }
 
-fn is_scalable(kind: &KindId) -> bool {
-    matches!(
-        kind.as_str(),
-        "deployments.apps" | "statefulsets.apps" | "replicasets.apps" | "replicationcontrollers"
-    )
-}
-
-fn is_restartable(kind: &KindId) -> bool {
-    matches!(
-        kind.as_str(),
-        "deployments.apps" | "daemonsets.apps" | "statefulsets.apps"
-    )
-}
-
 /// Whether rows of `kind` have a resource action, whatever state the object is in. A kind that
-/// can be deleted has one (`deletable`, from discovery's verbs).
-pub(in crate::ui) fn kind_has_actions(kind: &KindId, deletable: bool) -> bool {
-    deletable || is_scalable(kind) || is_restartable(kind) || kind.as_str() == "nodes"
+/// can be deleted has one (`deletable`, from discovery's verbs), and so does one with Scale
+/// (`scalable`: [`Workspace::kind_scale_paths`]).
+pub(in crate::ui) fn kind_has_actions(kind: &KindId, scalable: bool, deletable: bool) -> bool {
+    deletable || scalable || action_kinds::restarts(kind) || kind.as_str() == "nodes"
 }
 
 /// The actions a row of `kind` offers, in menu order, the destructive one last. A node offers
 /// Uncordon when `cordoned`, else Cordon (also while that is not known yet, disabled).
 pub(in crate::ui) fn offered_for(
     kind: &KindId,
+    scalable: bool,
     deletable: bool,
     cordoned: Option<bool>,
 ) -> Vec<ResourceAction> {
     let mut actions = Vec::new();
-    if is_scalable(kind) {
+    if scalable {
         actions.push(ResourceAction::Scale);
     }
-    if is_restartable(kind) {
+    if action_kinds::restarts(kind) {
         actions.push(ResourceAction::RolloutRestart);
     }
     if kind.as_str() == "nodes" {
@@ -310,10 +299,13 @@ pub(in crate::ui) fn offered_for(
 pub(in crate::ui) fn offered(ws: &Workspace, detail: &DetailView, cx: &App) -> Vec<ResourceAction> {
     let object = detail.object();
     let deletable = ws.kind_deletable(&object.cluster, &object.kind, cx);
+    let scalable = ws
+        .kind_scale_paths(&object.cluster, &object.kind, cx)
+        .is_some();
     let cordoned = (object.kind.as_str() == "nodes")
         .then(|| detail.node_cordoned().ok())
         .flatten();
-    offered_for(&object.kind, deletable, cordoned)
+    offered_for(&object.kind, scalable, deletable, cordoned)
 }
 
 /// Whether `action` can run on the selected row now, and why not: what the menu shows, the
@@ -491,11 +483,15 @@ fn start_review(
     let review = request
         .core
         .review_write(request.target.clone(), request.proposal.clone());
+    // A copy fetched after this may already show a change the review's read missed.
+    let asked = jiff::Timestamp::now();
     let handle = window.window_handle();
     let task = cx.spawn(async move |this, cx| {
         let result = review.await;
         let _ = cx.update_window(handle, |_, window, cx| {
-            let _ = this.update(cx, |ws, cx| reviewed(ws, request, note, result, window, cx));
+            let _ = this.update(cx, |ws, cx| {
+                reviewed(ws, request, note, asked, result, window, cx)
+            });
         });
     });
     ws.set_write_review(task);
@@ -505,6 +501,7 @@ fn reviewed(
     ws: &mut Workspace,
     request: Request,
     note: Option<String>,
+    asked: jiff::Timestamp,
     result: Result<WriteReview, WriteError>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
@@ -514,8 +511,17 @@ fn reviewed(
         ws.refuse_held(connection_changed_text(), cx);
         return;
     }
+    // Nor one of a row no longer selected: nothing would watch its object while it is open.
+    if !still_shown(ws, &request.target, cx) {
+        let why = format!(
+            "{} is no longer selected, so its review was not opened. Nothing was applied.",
+            request.target.name
+        );
+        ws.refuse(why, cx);
+        return;
+    }
     match result {
-        Ok(review) => confirm_review(ws, request, review, note, window, cx),
+        Ok(review) => confirm_review(ws, request, review, note, asked, window, cx),
         // Another object has the name now: this review is of that one, and says so.
         Err(WriteError::Replaced) if request.target.uid.is_some() => {
             let note = replaced_note(&request.target.name);
@@ -542,11 +548,24 @@ pub(in crate::ui) fn error_text(error: &WriteError) -> String {
     }
 }
 
+/// Whether the detail pane still shows `target`, by key and, when it names one, uid.
+fn still_shown(ws: &Workspace, target: &WriteTarget, cx: &App) -> bool {
+    ws.detail_view().is_some_and(|detail| {
+        let detail = detail.read(cx);
+        shown_key(detail) == WriteKey::of(target)
+            && target
+                .uid
+                .as_deref()
+                .is_none_or(|uid| uid == &*detail.object().uid)
+    })
+}
+
 fn confirm_review(
     ws: &mut Workspace,
     request: Request,
     review: WriteReview,
     note: Option<String>,
+    asked: jiff::Timestamp,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -556,15 +575,28 @@ fn confirm_review(
     let this = cx.weak_entity();
     let handle = window.window_handle();
     let key = WriteKey::of(&request.target);
+    let object = ReviewedObject::of(ws, &review, asked, cx).guard(this.clone());
+    // A fetch running now began before the review and cannot speak for it: fetch once more.
+    if let Some(detail) = ws.detail_view() {
+        detail.update(cx, |detail, _| detail.fetch_again_after_running());
+    }
     let begin = {
-        let (key, this, action) = (key.clone(), this.clone(), request.action);
-        move |cx: &mut App| match claim(&key, action, cx) {
-            Ok(()) => true,
-            Err(why) => {
-                let _ = this.update(cx, |ws, cx| {
-                    ws.refuse(refused(Opening::Write(action), &why), cx)
-                });
-                false
+        let (key, this, action, object) =
+            (key.clone(), this.clone(), request.action, object.clone());
+        move |cx: &mut App| {
+            // Changed since its review, as this window last fetched it: nothing runs.
+            if let Some(why) = object.changed(cx) {
+                let _ = this.update(cx, |ws, cx| ws.refuse(why, cx));
+                return false;
+            }
+            match claim(&key, action, cx) {
+                Ok(()) => true,
+                Err(why) => {
+                    let _ = this.update(cx, |ws, cx| {
+                        ws.refuse(refused(Opening::Write(action), &why), cx)
+                    });
+                    false
+                }
             }
         }
     };
@@ -576,6 +608,7 @@ fn confirm_review(
         &names,
         note.as_deref(),
         request.guard.clone(),
+        Some(object),
         begin,
         {
             let key = key.clone();
@@ -605,6 +638,138 @@ fn confirm_review(
             });
         },
     );
+    // A copy fetched while the review ran may show a change already: nothing else would ask.
+    ws.close_changed_confirmations(window, cx);
+}
+
+/// What a confirmation saw of its object when its review was asked for. A copy this window
+/// fetches after that and shows another object, or for a scale another count, closes the confirmation:
+/// a second one left open does not run after the first changed the object. The write checks the
+/// uid and the count again on the server whatever this says.
+#[derive(Clone)]
+struct ReviewedObject {
+    key: WriteKey,
+    name: String,
+    uid: Option<String>,
+    /// For a scale: the count reviewed, and where its review read it.
+    count: Option<(u32, Option<action_kinds::ScalePaths>)>,
+    at: jiff::Timestamp,
+    /// For a restart: the pod template's `restartedAt` as reviewed. Another one shows a restart
+    /// ran since, which this one would repeat.
+    restarted_at: Option<Option<String>>,
+    /// Whether the pane showed this very object when the review came back. One that did not (a
+    /// review of an object created again under the name) cannot say it changed: the server's
+    /// checks of the uid and the count still hold.
+    watched: bool,
+}
+
+impl ReviewedObject {
+    /// `asked`: when the review was asked for. A copy fetched since may be newer than its read.
+    fn of(ws: &Workspace, review: &WriteReview, asked: jiff::Timestamp, cx: &App) -> Self {
+        let target = review.target();
+        let (count, restarted_at) = match review.action() {
+            WriteAction::Resource(action) => {
+                let count = match action.change() {
+                    // Read where the review read it, not where discovery said.
+                    ResourceChange::Scale { from, .. } => {
+                        Some((*from, action.scale_paths().cloned()))
+                    }
+                    _ => None,
+                };
+                let restarted = action.restarted_at().map(|at| at.map(str::to_owned));
+                (count, restarted)
+            }
+            _ => (None, None),
+        };
+        let key = WriteKey::of(target);
+        let watched = ws.detail_view().is_some_and(|detail| {
+            let detail = detail.read(cx);
+            let shown = detail.object();
+            shown_key(detail) == key
+                && !detail.is_gone()
+                && target.uid.as_deref() == Some(&*shown.uid)
+        });
+        ReviewedObject {
+            key,
+            name: target.name.clone(),
+            uid: target.uid.clone(),
+            count,
+            at: asked,
+            restarted_at,
+            watched,
+        }
+    }
+
+    /// Why `detail` says the object changed since the review, if it does. A pane that no longer
+    /// shows the object says so too.
+    fn changed(&self, detail: Option<&DetailView>) -> Option<String> {
+        let changed = || Some(object_changed_text(&self.name));
+        // A pane still on another copy cannot say what changed, but it still says whether the
+        // row is selected.
+        if !self.watched {
+            return match detail {
+                Some(detail) if shown_key(detail) == self.key => None,
+                _ => changed(),
+            };
+        }
+        let Some(detail) = detail else {
+            return changed();
+        };
+        if shown_key(detail) != self.key || detail.is_gone() {
+            return changed();
+        }
+        // A copy from before the review was asked for says nothing about what changed since.
+        let object = detail.fetched_since(self.at)?;
+        let uid = object
+            .pointer("/metadata/uid")
+            .and_then(serde_json::Value::as_str);
+        if self.uid.is_some() && uid != self.uid.as_deref() {
+            return changed();
+        }
+        let restarted = object
+            .pointer("/spec/template/metadata/annotations")
+            .and_then(|a| a.get("kubectl.kubernetes.io/restartedAt"))
+            .and_then(serde_json::Value::as_str);
+        if self
+            .restarted_at
+            .as_ref()
+            .is_some_and(|at| at.as_deref() != restarted)
+        {
+            return changed();
+        }
+        match &self.count {
+            Some((from, Some(paths))) if paths.replicas(object) == Some(*from) => None,
+            Some(_) => changed(),
+            None => None,
+        }
+    }
+
+    /// The guard of a confirmation in the window of `ws`.
+    fn guard(self, ws: WeakEntity<Workspace>) -> ObjectGuard {
+        ObjectGuard::new(move |cx| {
+            let ws = ws.upgrade()?;
+            let detail = ws.read(cx).detail_view().map(|d| d.read(cx));
+            self.changed(detail)
+        })
+    }
+}
+
+/// The object `detail` shows, as a write names it.
+fn shown_key(detail: &DetailView) -> WriteKey {
+    let shown = detail.object();
+    WriteKey::new(
+        &shown.cluster,
+        &shown.kind,
+        shown.namespace.as_deref(),
+        &shown.name,
+    )
+}
+
+/// Why a confirmation closed by itself, or did not run.
+fn object_changed_text(name: &str) -> String {
+    format!(
+        "{name} changed since it was reviewed, so its confirmation was closed. Nothing was applied."
+    )
 }
 
 /// What follows a write that ran, in the window it started in. A drain's result is in the strip.
@@ -855,7 +1020,7 @@ fn pre_review_title_name(target: &WriteTarget) -> String {
     confirm::title_name(&flint_core::display::single_line(&target.name))
 }
 
-fn scale_dialog(target: &WriteTarget, current: Option<u64>) -> DialogText {
+fn scale_dialog(target: &WriteTarget, current: Option<u32>) -> DialogText {
     let now = current.map_or("not known yet".to_owned(), |n| n.to_string());
     DialogText {
         title: format!("Scale {}", pre_review_title_name(target)),
@@ -904,7 +1069,9 @@ fn open_scale(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let current = ws.detail_view().and_then(|d| d.read(cx).replicas());
+    let current = ws
+        .kind_scale_paths(&target.cluster, &target.kind, cx)
+        .and_then(|paths| ws.detail_view()?.read(cx).replicas(&paths));
     let input = cx.new(|cx| {
         InputState::new(window, cx)
             .placeholder("Replicas")
@@ -1326,8 +1493,18 @@ mod tests {
                 &[A::Delete],
             ),
         ] {
-            assert_eq!(offered_for(&kind, deletable, cordoned), wanted, "{kind}");
+            let scalable = flint_core::action_kinds::scales_built_in(&kind);
+            assert_eq!(
+                offered_for(&kind, scalable, deletable, cordoned),
+                wanted,
+                "{kind}"
+            );
         }
+        // A custom resource has Scale where its cluster read the paths of its definition.
+        assert_eq!(
+            offered_for(&KindId::new("example.com", "widgets"), true, true, None),
+            [A::Scale, A::Delete]
+        );
     }
 
     // covers UP-53: the replica count is a non-negative whole number the API can hold.

@@ -24,6 +24,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use flint_core::action_kinds;
 use flint_core::fleet::{
     FleetAction, FleetCancel, FleetManifest, FleetObject, FleetPlan, FleetPreview, FleetResult,
 };
@@ -68,7 +69,9 @@ pub(in crate::ui) fn available(ws: &Workspace, choice: FleetChoice, cx: &App) ->
         Some(action) => {
             let deletable = action == ResourceAction::Delete
                 && ws.kind_deletable(&object.cluster, &object.kind, cx);
-            if !offered_for(&object.kind, deletable, None).contains(&action) {
+            // A set's members may define a custom resource differently: built-in kinds only.
+            let scalable = action_kinds::scales_built_in(&object.kind);
+            if !offered_for(&object.kind, scalable, deletable, None).contains(&action) {
                 return Err(format!("{} has no such action", object.kind_label));
             }
         }

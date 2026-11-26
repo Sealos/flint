@@ -49,7 +49,8 @@ use super::super::registry::{
     ShowClusterSetList, ToggleClusterPicking, TogglePickedCluster,
 };
 use super::super::set_members::{
-    self, MemberAction, MemberCause, MemberLine, failed_cause, paused_text, refusal_cause,
+    self, MemberAction, MemberCause, MemberLine, MemberSignIn, SignInTarget, failed_cause,
+    paused_text, refusal_cause,
 };
 #[cfg(any(test, feature = "automation"))]
 use super::super::view_state::{ClusterSetsState, OpenSetState, SetGroupState, SetMemberState};
@@ -1018,10 +1019,10 @@ impl Workspace {
         self.sets.running = None;
         self.close_list(cx);
         self.show_set(
-            label,
-            members,
+            (label, members),
             (KindId::pods(), "Pods".to_owned()),
             Gone::default(),
+            None,
             window,
             cx,
         );
@@ -1039,10 +1040,10 @@ impl Workspace {
     /// empty and they keep their state.
     pub(super) fn show_set(
         &mut self,
-        label: String,
-        members: Vec<AdmittedMember>,
+        (label, members): (String, Vec<AdmittedMember>),
         (kind, kind_label): (KindId, String),
         gone: Gone,
+        reuse: Option<Entity<CombinedResourceList>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1079,7 +1080,14 @@ impl Workspace {
         let source = self.combined_source(&snapshots, cx);
         let title = format!("{kind_label} · {label}");
         let shown_kind = kind_label;
-        let list = cx.new(|cx| CombinedResourceList::new(title, source, Vec::new(), window, cx));
+        // A kind change keeps the list, and with it the sort, filter, chips and grouping.
+        let list = match reuse {
+            Some(list) => {
+                list.update(cx, |list, cx| list.switch_kind(title, source, cx));
+                list
+            }
+            None => cx.new(|cx| CombinedResourceList::new(title, source, Vec::new(), window, cx)),
+        };
         let events = cx.subscribe_in(&list, window, Self::on_combined_event);
         let feeds = subscriptions
             .into_iter()
@@ -1290,6 +1298,67 @@ impl Workspace {
     }
 
     /// Why a row of `cluster` cannot be opened or acted on now, if so.
+    /// What each member's Sign in is drawn for now ([`MemberSignIn`]).
+    pub(super) fn member_sign_in(&self, run: &RunningSet, cx: &Context<Self>) -> MemberSignIn {
+        let model = self.model.read(cx);
+        let active = model.active_cluster().map(|c| c.info.name.clone());
+        let targets = run
+            .members
+            .iter()
+            .map(|member| {
+                let view = model.keep_watching(member.context());
+                // The selected member signs in as the selected cluster, through selecting it.
+                let selected = active.as_deref() == Some(member.context());
+                let target = SignInTarget {
+                    member: member.clone(),
+                    definition: view.and_then(|view| view.definition),
+                    shown: view.and_then(|view| view.shown_sign_in),
+                    in_place: !selected
+                        && view.is_none_or(|view| {
+                            view.sign_in != flint_core::keep_watching::BackgroundSignIn::Unavailable
+                        }),
+                };
+                (member.context().to_owned(), target)
+            })
+            .collect();
+        MemberSignIn::new(cx.entity().downgrade(), targets)
+    }
+
+    /// For a click on a signed-out member's Sign in alone ([`MemberSignIn`]): runs its sign-in
+    /// once, now, for the member as the set admitted it and the definitions its control was
+    /// drawn with. The core refuses it if any of them changed since; why shows in the set's
+    /// error. Its rows come back with the member's next status.
+    pub(in super::super) fn sign_in_set_member(
+        &mut self,
+        target: SignInTarget,
+        cx: &mut Context<Self>,
+    ) {
+        let in_set = self.sets.running.as_ref().is_some_and(|run| {
+            run.members
+                .iter()
+                .any(|m| m.context() == target.member.context())
+        });
+        if !in_set {
+            return;
+        }
+        let asked = self.model.read(cx).core().sign_in_member(
+            &target.member,
+            target.definition,
+            target.shown,
+        );
+        self.sets.error = None;
+        cx.spawn(async move |ws, cx| {
+            if let Err(why) = asked.await {
+                let _ = ws.update(cx, |ws, cx| {
+                    ws.sets.error = Some(why);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
     pub(super) fn set_row_refusal(&self, cluster: &str, cx: &App) -> Option<String> {
         let names = self.cluster_names(cx);
         let shown = names.exact(cluster);
@@ -1460,6 +1529,8 @@ impl Workspace {
             self.clear_action_error(cx);
             self.detail = None;
             self._detail_subscriptions.clear();
+            // The pane that watched a confirmation's object is gone with its row.
+            self.close_changed_confirmations(window, cx);
             let focus = list.read(cx).focus_handle().clone();
             window.focus(&focus, cx);
             release_unfocused_input(window, cx);
@@ -1518,7 +1589,7 @@ impl Workspace {
         let object = ObjectRef {
             cluster: row.cluster,
             kind: run.kind.clone(),
-            kind_label: list.read(cx).label.clone(),
+            kind_label: run.kind_label.clone(),
             namespace: row.namespace,
             name: row.name,
             uid: row.uid,
@@ -1550,25 +1621,29 @@ impl Workspace {
             view.set_connection_guards(guards);
             view
         });
-        self._detail_subscriptions = vec![cx.subscribe_in(
-            &detail,
-            window,
-            move |this, _, event, window, cx| match event {
-                DetailEvent::Close => this.close_detail(window, cx),
-                DetailEvent::OpenLogs(request, focus) => {
-                    let focus = takes_focus(focus, window, cx);
-                    this.open_logs(request.clone(), focus, window, cx)
-                }
-                DetailEvent::OpenShell(request, focus) => {
-                    let focus = takes_focus(focus, window, cx);
-                    this.open_shell(request.clone(), focus, window, cx)
-                }
-                DetailEvent::Refused(why) => this.refuse(why.clone(), cx),
-                DetailEvent::ConfirmWrite(review, reviewed_on) => {
-                    this.confirm_detail_write(review, reviewed_on.clone(), window, cx)
-                }
-            },
-        )];
+        let on_change = Self::close_confirmations_on_change(&detail, window, cx);
+        self._detail_subscriptions = vec![
+            on_change,
+            cx.subscribe_in(
+                &detail,
+                window,
+                move |this, _, event, window, cx| match event {
+                    DetailEvent::Close => this.close_detail(window, cx),
+                    DetailEvent::OpenLogs(request, focus) => {
+                        let focus = takes_focus(focus, window, cx);
+                        this.open_logs(request.clone(), focus, window, cx)
+                    }
+                    DetailEvent::OpenShell(request, focus) => {
+                        let focus = takes_focus(focus, window, cx);
+                        this.open_shell(request.clone(), focus, window, cx)
+                    }
+                    DetailEvent::Refused(why) => this.refuse(why.clone(), cx),
+                    DetailEvent::ConfirmWrite(review, reviewed_on) => {
+                        this.confirm_detail_write(review, reviewed_on.clone(), window, cx)
+                    }
+                },
+            ),
+        ];
         self.detail = Some(detail);
         self.list_in_front = false;
         release_unfocused_input(window, cx);
@@ -1655,15 +1730,27 @@ impl Workspace {
                 .into_any_element(),
         };
         // No member can show rows: the member block replaces the chips, the empty list and notes.
-        let body = self
-            .set_empty_state(run, cx)
-            .map_or(body, |lines| self.render_empty_members(lines, theme));
+        let body = self.set_empty_state(run, cx).map_or(body, |lines| {
+            let sign_in = self.member_sign_in(run, cx);
+            self.render_empty_members(lines, &sign_in, theme)
+        });
         Some(
             v_flex()
                 .id("cluster-set-view")
                 .flex_1()
                 .min_w_0()
                 .h_full()
+                .child(self.render_set_header(
+                    &run.label,
+                    if run.dashboard.is_some() {
+                        "Overview"
+                    } else {
+                        &run.kind_label
+                    },
+                    window_width,
+                    theme,
+                    cx,
+                ))
                 .child(self.render_set_bar(run, theme, cx))
                 .child(body)
                 .test_support()
@@ -1756,7 +1843,12 @@ impl Workspace {
     }
 
     /// The empty-state block: each member by its full name, why it shows nothing, and what to do.
-    fn render_empty_members(&self, lines: Vec<MemberLine>, theme: &Theme) -> AnyElement {
+    fn render_empty_members(
+        &self,
+        lines: Vec<MemberLine>,
+        sign_in: &MemberSignIn,
+        theme: &Theme,
+    ) -> AnyElement {
         v_flex()
             .id("set-members-empty")
             .flex_1()
@@ -1782,11 +1874,14 @@ impl Workspace {
                         .child(div().text_color(theme.muted_foreground).child(line))
                         .children(cause.action().map(|action| {
                             let id = SharedString::from(format!("set-member-action-{cluster}"));
-                            let button = Button::new(id).xsmall().outline().label(action.label());
+                            let label = match action {
+                                MemberAction::SignIn => sign_in.label(&cluster),
+                                MemberAction::Retry => action.label(),
+                            };
+                            let button = Button::new(id).xsmall().outline().label(label);
                             match action {
-                                MemberAction::SignIn => button.on_click(registry::on_click(
-                                    set_members::sign_in_member(&cluster),
-                                )),
+                                // not-an-action: the click is the consent for one sign-in run.
+                                MemberAction::SignIn => button.on_click(sign_in.on_click(&cluster)),
                                 MemberAction::Retry => button.on_click(registry::on_click(
                                     set_members::retry_member(&cluster),
                                 )),

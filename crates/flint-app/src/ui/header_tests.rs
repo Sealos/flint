@@ -121,15 +121,17 @@ async fn the_namespace_filter_narrows_the_list_and_is_remembered(cx: &mut TestAp
     wait_for_rows(cx, &t, 4).await;
 }
 
-// covers UP-21: a cluster-scoped kind has no namespaces to filter, so the header drops the
-// filter while it is open.
+// covers UP-21: a cluster-scoped kind has no namespaces to filter, so the header disables the
+// filter while it is open, where it stands.
 #[gpui_kit::test]
 async fn cluster_scoped_kinds_have_no_namespace_filter(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     t.connect_alpha(cx, standard_sections()).await;
     // Before a list is open, the filter shows.
-    assert!(t.find(cx, "namespace-filter-button").is_some());
+    let ns = t.find(cx, "namespace-filter-button").unwrap();
+    assert_ne!(ns.disabled(), Some(true));
+    let ns_x = ns.bounds().origin.x;
     t.open_kind(
         cx,
         "nodes",
@@ -141,9 +143,45 @@ async fn cluster_scoped_kinds_have_no_namespace_filter(cx: &mut TestAppContext) 
         ),
     )
     .await;
-    assert!(t.find(cx, "namespace-filter-button").is_none());
+    let ns = t.find(cx, "namespace-filter-button").unwrap();
+    assert_eq!(ns.disabled(), Some(true));
+    assert_eq!(ns.bounds().origin.x, ns_x, "the filter does not move");
     t.open_kind(cx, "pods", pods(ROWS)).await;
     assert!(t.find(cx, "namespace-filter-button").is_some());
+}
+
+// The header keeps every control where it is between the overview and the lists, so the pointer
+// target of each stays put (#775).
+#[gpui_kit::test]
+async fn header_controls_keep_their_place_between_views(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    let slots = |cx: &mut TestAppContext| {
+        ["namespace-filter-button", "keep-watching", "watch-mode"].map(|id| {
+            let found = t
+                .find(cx, id)
+                .unwrap_or_else(|| panic!("{id} is in the header"));
+            (found.bounds().origin.x, found.disabled() == Some(true))
+        })
+    };
+    t.open_kind(cx, "pods", pods(ROWS)).await;
+    let on_list = slots(cx);
+    assert!(on_list.iter().all(|(_, disabled)| !disabled));
+    t.open_kind(
+        cx,
+        "nodes",
+        objects(
+            KindId::new("", "nodes"),
+            &[("", "node-1", 0)],
+            SyncState::Synced,
+            1,
+        ),
+    )
+    .await;
+    let on_nodes = slots(cx);
+    assert_eq!(on_nodes.map(|s| s.0), on_list.map(|s| s.0));
+    assert_eq!(on_nodes.map(|s| s.1), [true, false, false]);
 }
 
 // covers UP-25: the watch mode switch sets this cluster's mode or the default, from its menu or
@@ -207,12 +245,13 @@ async fn the_watch_mode_follows_the_menu_and_persists(cx: &mut TestAppContext) {
         .unwrap();
     t.wait_for_label(cx, "watch-mode", "Live: on view").await;
 
-    // On a failed cluster nothing is watched, so its header has no switch; the default can still
+    // On a failed cluster nothing is watched, so its header's switches are off; the default can still
     // be changed from there.
     t.activate(cx, "kind-beta").await;
     t.wait_for_state(cx, "kind-beta", |s| matches!(s, ConnectionState::Failed(_)))
         .await;
-    assert!(t.find(cx, "watch-mode").is_none());
+    assert_eq!(t.find(cx, "watch-mode").unwrap().disabled(), Some(true));
+    assert_eq!(t.find(cx, "keep-watching").unwrap().disabled(), Some(true));
     t.dispatch(cx, "workspace::DefaultWatchOpenViewsOnly", Value::Null)
         .unwrap();
     let model = t.model.clone();
