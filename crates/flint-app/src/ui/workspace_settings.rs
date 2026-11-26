@@ -49,7 +49,7 @@ impl Workspace {
         fn editable(ws: &Workspace, _: &App) -> bool {
             ws.settings_page.open && ws.settings_page.saving.is_none()
         }
-        Self::logs_paths_guards(Self::threshold_guards(guards))
+        Self::network_guards(Self::logs_paths_guards(Self::threshold_guards(guards)))
             .when::<CloseSettings>(open)
             .when::<ShowSettingsSection>(open)
             .when::<NextSettingsControl>(open)
@@ -70,41 +70,43 @@ impl Workspace {
             })
             // Revert also closes a field left open, as its button shows.
             .when::<RevertSettings>(|ws, _| {
-                (ws.settings_page.draft.is_dirty() || ws.settings_page.thresholds.entry.is_some())
+                (ws.settings_page.draft.is_dirty()
+                    || ws.settings_page.thresholds.entry.is_some()
+                    || ws.settings_page.network.is_typed())
                     && ws.settings_page.saving.is_none()
             })
     }
 
     pub(in crate::ui) fn bind_settings_actions<B: Bind<Self>>(bind: B) -> B {
-        Self::bind_logs_paths_actions(Self::bind_threshold_actions(bind))
-            .bind::<OpenSettings>(|ws, _, window, cx| ws.open_settings(window, cx))
-            .bind::<CloseSettings>(|ws, _, window, cx| ws.close_settings(window, cx))
-            .bind::<ShowSettingsSection>(|ws, action, window, cx| {
-                ws.show_settings_section(action.section, window, cx)
-            })
-            .bind::<EditAppearance>(|ws, action, _, cx| {
-                ws.edit_settings(Change::Appearance(action.appearance), cx)
-            })
-            .bind::<EditDesktopNotifications>(|ws, action, _, cx| {
-                ws.edit_settings(Change::DesktopNotifications(action.enabled), cx)
-            })
-            .bind::<EditWatchMode>(|ws, action, _, cx| {
-                ws.edit_settings(Change::WatchMode(action.mode), cx)
-            })
-            .bind::<SaveSettings>(|ws, _, window, cx| ws.save_settings(None, window, cx))
-            .bind::<RevertSettings>(|ws, _, window, cx| {
-                ws.finish_threshold_entry(false, window, cx);
-                ws.revert_settings(cx)
-            })
-            .bind::<NextSettingsControl>(|ws, _, window, cx| {
-                ws.move_settings_cursor(true, window, cx)
-            })
-            .bind::<PreviousSettingsControl>(|ws, _, window, cx| {
-                ws.move_settings_cursor(false, window, cx)
-            })
-            .bind::<ActivateSettingsControl>(|ws, _, window, cx| {
-                ws.activate_settings_control(window, cx)
-            })
+        Self::bind_network_actions(Self::bind_logs_paths_actions(Self::bind_threshold_actions(
+            bind,
+        )))
+        .bind::<OpenSettings>(|ws, _, window, cx| ws.open_settings(window, cx))
+        .bind::<CloseSettings>(|ws, _, window, cx| ws.close_settings(window, cx))
+        .bind::<ShowSettingsSection>(|ws, action, window, cx| {
+            ws.show_settings_section(action.section, window, cx)
+        })
+        .bind::<EditAppearance>(|ws, action, _, cx| {
+            ws.edit_settings(Change::Appearance(action.appearance), cx)
+        })
+        .bind::<EditDesktopNotifications>(|ws, action, _, cx| {
+            ws.edit_settings(Change::DesktopNotifications(action.enabled), cx)
+        })
+        .bind::<EditWatchMode>(|ws, action, _, cx| {
+            ws.edit_settings(Change::WatchMode(action.mode), cx)
+        })
+        .bind::<SaveSettings>(|ws, _, window, cx| ws.save_settings(None, window, cx))
+        .bind::<RevertSettings>(|ws, _, window, cx| {
+            ws.finish_threshold_entry(false, window, cx);
+            ws.revert_settings(cx)
+        })
+        .bind::<NextSettingsControl>(|ws, _, window, cx| ws.move_settings_cursor(true, window, cx))
+        .bind::<PreviousSettingsControl>(|ws, _, window, cx| {
+            ws.move_settings_cursor(false, window, cx)
+        })
+        .bind::<ActivateSettingsControl>(|ws, _, window, cx| {
+            ws.activate_settings_control(window, cx)
+        })
     }
 
     pub(super) fn register_settings_actions<E: InteractiveElement>(
@@ -121,6 +123,7 @@ impl Workspace {
         self.settings_page.opened_over = Some(self.main_key());
         self.settings_page.cursor = None;
         self.ensure_settings_inputs(window, cx);
+        self.ensure_network_inputs(window, cx);
         window.focus(&self.settings_page.focus, cx);
         cx.notify();
     }
@@ -214,6 +217,7 @@ impl Workspace {
         // The text fields show the file again, as the workspace next draws.
         self.settings_page.logs_paths.kubeconfig_note = None;
         self.settings_page.logs_paths.resync = true;
+        self.revert_network_fields();
         cx.notify();
     }
 
@@ -409,6 +413,7 @@ impl Workspace {
             }
             Stop::WatchMode(mode) => self.edit_settings(Change::WatchMode(mode), cx),
             Stop::Threshold(stop) => self.activate_threshold_stop(stop, window, cx),
+            Stop::Network(stop) => self.activate_network_stop(stop, window, cx),
             Stop::Text(_)
             | Stop::RemoveKubeconfig(_)
             | Stop::AddKubeconfig

@@ -143,8 +143,17 @@ impl SettingsDraft {
 
     /// Whether `file` changed since the draft was started over it, while edits wait: the banner
     /// that offers Reload and Save anyway.
+    /// The proxy does not count: it is applied from the Network section on its own, never
+    /// through the draft, and Save leaves it as it is.
     pub fn changed_on_disk(&self, file: &Settings) -> bool {
-        self.base.as_deref().is_some_and(|base| base != file)
+        self.base.as_deref().is_some_and(|base| {
+            if base.proxy == file.proxy {
+                return base != file;
+            }
+            let mut base = base.clone();
+            base.proxy = file.proxy.clone();
+            base != *file
+        })
     }
 
     /// Drops every edit and rejected value (Revert, Reload, Discard).

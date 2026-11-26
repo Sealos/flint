@@ -56,6 +56,7 @@ pub use super::settings_logs_paths::{
     AddKubeconfigPath, ChooseKubeconfigPaths, EditHelmPath, EditLogBufferLines, EditLogBufferMib,
     EditLogTotalMib, EditPathOverride, EditProtectLocalClusters, RemoveKubeconfigPath,
 };
+pub use super::settings_network::{ApplyProxy, EditNoProxy, EditProxyUrl};
 pub use super::settings_thresholds::{
     AddClusterOverride, CancelThresholdEntry, EditClusterAlerts, EditClusterWatchMode,
     EditThreshold, ResetClusterOverrides, TypeThreshold,
@@ -2062,13 +2063,17 @@ const CLUSTER_ALERTS: &[Arg] = &[
 ];
 const SETTINGS_SECTION: &[Arg] = &[arg(
     "section",
-    "appearance, alerts, watching, thresholds or cluster_overrides",
+    "appearance, alerts, watching, thresholds, cluster_overrides, logs, paths, safety or network",
     ArgKind::Choice(&[
         "appearance",
         "alerts",
         "watching",
         "thresholds",
         "cluster_overrides",
+        "logs",
+        "paths",
+        "safety",
+        "network",
     ]),
 )];
 const THRESHOLD_METRICS: &[&str] = &[
@@ -2158,6 +2163,16 @@ const EDIT_HELM: &[Arg] = &[arg(
 const KUBECONFIG_PATH: &[Arg] = &[arg(
     "path",
     "a kubeconfig file, absolute or under ~",
+    ArgKind::Text,
+)];
+const EDIT_PROXY_URL: &[Arg] = &[arg(
+    "url",
+    "http://, socks5:// or socks5h://host:port; empty uses HTTPS_PROXY from the environment",
+    ArgKind::Text,
+)];
+const EDIT_NO_PROXY: &[Arg] = &[arg(
+    "no_proxy",
+    "hosts, domains, addresses or ranges reached without the proxy, separated by commas",
     ArgKind::Text,
 )];
 const EDIT_PROTECT_LOCAL: &[Arg] = &[arg("enabled", "true or false", ArgKind::Bool)];
@@ -2540,6 +2555,25 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Turn protection of local clusters on or off in the Settings draft. Turning it off \
              is confirmed at Save.",
             EDIT_PROTECT_LOCAL,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditProxyUrl>(
+            "Edit Proxy URL…",
+            "Set the proxy URL in Settings' Network section; Apply Proxy puts it in use.",
+            EDIT_PROXY_URL,
+        )
+        .of(C::Flint, S::Settings)
+        // The URL can hold a password, which the palette's argument field would show.
+        .hidden(),
+        Spec::with_args::<EditNoProxy>(
+            "Edit No Proxy…",
+            "Set the servers reached without the proxy in Settings' Network section.",
+            EDIT_NO_PROXY,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::unit::<ApplyProxy>(
+            "Apply Proxy",
+            "Save the proxy typed in Settings and reconnect every cluster on it, after asking.",
         )
         .of(C::Flint, S::Settings),
         Spec::with_args::<EditThreshold>(

@@ -56,6 +56,11 @@ pub(in crate::ui) enum UsageSubject {
 }
 
 impl UsageSubject {
+    /// The kinds whose detail pane shows usage: only pods and nodes so far.
+    pub(in crate::ui) fn of_detail(kind: &KindId) -> Option<Self> {
+        Self::of(kind).filter(|subject| !matches!(subject, Self::Workloads(_)))
+    }
+
     pub(in crate::ui) fn of(kind: &KindId) -> Option<Self> {
         if *kind == KindId::pods() {
             return Some(Self::Pods);
@@ -939,6 +944,10 @@ mod tests {
         assert_eq!(
             workload("batch", "cronjobs"),
             Some(UsageSubject::Workloads(OwnerChain::ViaJobs))
+        );
+        assert_eq!(
+            UsageSubject::of_detail(&KindId::pods()),
+            Some(UsageSubject::Pods)
         );
         assert_eq!(workload("", "services"), None);
         assert_eq!(workload("metrics.k8s.io", "pods"), None);
