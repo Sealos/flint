@@ -45,13 +45,13 @@ use super::super::registry::{
     DragSelection, EditYaml, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp, FocusFilter,
     FocusNextPane, FocusPreviousPane, FocusSearch, Forward, ForwardCurrent, GoBack, GoForward,
     Guards, Hide, HideFromAi, HideOthers, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, NextTab,
-    OnView, OpenContainerLogs, OpenContainerShell, OpenLogs, OpenObject, OpenPreviousLogs,
-    OpenSelectedRow, OpenSelectorLogs, OpenShell, OpenView, PaneName, PasteText, PrevMatch,
-    PrevTab, ReconnectLogs, Refresh, ReloadYamlEdit, RestartShell, RetryConnection, ReviewYamlEdit,
-    SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines, ScrollPageDown,
-    ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAllLines, SelectCluster, SelectFirst,
-    SelectLast, SelectLine, SelectNext, SelectNextLine, SelectPrev, SelectPrevLine, SelectRow,
-    SelectText, SetDockHeight, SetLogContext, SetNamespaces, SetPaneWidth, ShowAll,
+    OnView, OpenContainerLogs, OpenContainerShell, OpenHome, OpenLogs, OpenObject,
+    OpenPreviousLogs, OpenSelectedRow, OpenSelectorLogs, OpenShell, OpenView, PaneName, PasteText,
+    PrevMatch, PrevTab, ReconnectLogs, Refresh, ReloadYamlEdit, RestartShell, RetryConnection,
+    ReviewYamlEdit, SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines,
+    ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAllLines, SelectCluster,
+    SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine, SelectPrev, SelectPrevLine,
+    SelectRow, SelectText, SetDockHeight, SetLogContext, SetNamespaces, SetPaneWidth, ShowAll,
     ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml, SortBy, SortByAscending,
     SortByDescending, ToggleAnnotations, ToggleCommandPalette, ToggleErrorsOnly, ToggleLabels,
     ToggleLogRegex, ToggleManagedFields, ToggleMatchingOnly, ToggleNamespace, ToggleNavSection,
@@ -128,6 +128,7 @@ impl Workspace {
         .bind::<FocusNextPane>(|this, _, window, cx| this.focus_pane(1, window, cx))
         .bind::<FocusPreviousPane>(|this, _, window, cx| this.focus_pane(-1, window, cx))
         .bind::<About>(Self::about)
+        .bind::<OpenHome>(|ws, _, window, cx| ws.open_home(window, cx))
         .bind::<SelectCluster>(Self::select_cluster)
         .bind::<ExposeToAi>(Self::expose_to_ai)
         .bind::<HideFromAi>(Self::hide_from_ai)
@@ -1238,6 +1239,8 @@ impl Workspace {
                 {
                     return;
                 }
+                // Selecting any cluster leaves Home, also for the active one's own view.
+                self.leave_home();
                 let cluster = action.cluster.clone();
                 // The sidebar's cursor follows the cluster picked, however it was picked.
                 self.sidebar_cursor = Some(cluster.clone());
@@ -1738,8 +1741,9 @@ impl Workspace {
         }
         match self.view_entry(&action.kind, cx) {
             Some(entry) => {
-                // Even the kind shown under Settings: it comes to the front.
+                // Even the kind shown under Settings or Home: it comes to the front.
                 self.leave_settings_for_view();
+                self.leave_home();
                 let open_already = match self.sets.running_kind() {
                     Some(kind) => *kind == entry.id,
                     None => self

@@ -338,17 +338,19 @@ impl Render for SetDashboardView {
         let members = self.model.cards.len();
         let drawn = self.drawn_feeds;
         let focus = &self.focus;
-        let open: CardActions = Rc::new(move |cluster, target| match target {
-            CardTarget::Cluster => Box::new(OpenSetMember {
-                cluster: cluster.to_owned(),
-                drawn: Some(drawn),
-            }),
-            CardTarget::Problem { category, kind } => Box::new(OpenSetProblem {
-                category: category.to_owned(),
-                cluster: Some(cluster.to_owned()),
-                kind,
-                drawn: Some(drawn),
-            }),
+        let open: CardActions = Rc::new(move |cluster, target| {
+            Some(match target {
+                CardTarget::Cluster => Box::new(OpenSetMember {
+                    cluster: cluster.to_owned(),
+                    drawn: Some(drawn),
+                }),
+                CardTarget::Problem { category, kind } => Box::new(OpenSetProblem {
+                    category: category.to_owned(),
+                    cluster: Some(cluster.to_owned()),
+                    kind,
+                    drawn: Some(drawn),
+                }),
+            })
         });
         v_flex()
             .id("set-dashboard")

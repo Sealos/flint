@@ -436,8 +436,13 @@ pub struct ClusterState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "view", rename_all = "snake_case")]
 pub enum Main {
-    /// "Select a cluster".
-    NoCluster,
+    /// The fleet home screen: on launch, and from the sidebar's Home entry.
+    Home {
+        /// The clusters kept watching, in sidebar order, each with its card.
+        watched: Vec<HomeCardState>,
+        /// The other clusters, in sidebar order.
+        unwatched: Vec<HomeRowState>,
+    },
     /// No kubeconfig file had a context: where Flint looked and what to do.
     NoContexts,
     Connecting,
@@ -455,6 +460,27 @@ pub enum Main {
     List,
     /// The Settings view.
     Settings,
+}
+
+/// A watched cluster's card on the home screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HomeCardState {
+    pub cluster: String,
+    /// `watching`, `sign-in needed` or `paused`.
+    pub status: &'static str,
+    /// The card in one line, once it has been read from the cluster's feed.
+    pub card: Option<String>,
+    /// The Kubernetes version its feed reported.
+    pub version: Option<String>,
+}
+
+/// A cluster not kept watching, in the home screen's list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HomeRowState {
+    pub cluster: String,
+    pub label: String,
+    /// Whether its Keep Watching button is enabled.
+    pub keep_watching: bool,
 }
 
 /// The header over the list.
