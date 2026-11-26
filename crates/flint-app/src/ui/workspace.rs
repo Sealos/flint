@@ -1010,11 +1010,17 @@ impl Workspace {
                         c.provisional || c.paused,
                     )
                 });
+        let thresholds = self
+            .model
+            .read(cx)
+            .settings
+            .thresholds_for(&cluster, server.as_deref());
         detail.update(cx, |d, cx| {
             d.set_sessions_blocked(why, cx);
             d.set_protected(protected, label, cx);
             d.set_row_writes_paused(writes_paused, cx);
             d.set_server(server);
+            d.set_thresholds(thresholds, cx);
             match endpoint {
                 Some(Some(endpoint)) => d.note_endpoint(endpoint, cx),
                 Some(None) => {}
@@ -2954,12 +2960,23 @@ impl Workspace {
             return set_view;
         }
         if let Some(detail) = self.edit_shown_alone(cx) {
+            // The pane's own header belongs to the detail view, so a strip over the top edge
+            // drags the window, as with no cluster. It is drawn first: the header's buttons sit
+            // above it and take their presses before it sees them.
             return div()
                 .id("held-edit-pane")
                 .flex_1()
                 .min_w_0()
                 .h_full()
                 .relative()
+                .child(
+                    super::theme::moves_window(div())
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w_full()
+                        .h(px(HEADER_HEIGHT)),
+                )
                 .child(detail)
                 .children(self.detail_tag_strip(theme, cx))
                 .test_support()
@@ -3917,6 +3934,28 @@ fn namespace_button_text(filter: &[String], limit: Option<&flint_core::Namespace
     }
 }
 
+impl Workspace {
+    /// Builds the menu bar again once this render is over, when the active cluster, the clusters
+    /// listed or what an action can do changed (the guards read the workspace, which is being
+    /// updated now).
+    fn sync_menus(&self, cx: &mut Context<Self>) {
+        let model = self.model.read(cx);
+        let cluster = model.active_cluster().map(|c| c.info.name.clone());
+        let names = model.names();
+        let clusters: Vec<(String, String)> = model
+            .clusters
+            .iter()
+            .map(|c| (c.info.name.clone(), names.with_real(&c.info.name)))
+            .collect();
+        cx.defer(move |cx| {
+            super::app_menus::update(cx, |inputs| {
+                inputs.cluster = cluster;
+                inputs.clusters = clusters;
+            })
+        });
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_namespace_picker_with_dialog(window, cx);
@@ -3930,6 +3969,7 @@ impl Render for Workspace {
         let window_height = f32::from(window.viewport_size().height);
         self.sync_narrow_layout(window_width, window, cx);
         self.two_row_header = self.header_has_two_rows(window_width, cx);
+        self.sync_menus(cx);
         let cx: &Context<Self> = cx;
         let theme = cx.theme();
         // With Home shown there is no header either.

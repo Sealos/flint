@@ -99,6 +99,9 @@ pub struct Plot {
 #[derive(Clone, Debug)]
 pub struct SparklineShape {
     values: Vec<Option<u64>>,
+    /// When each sample was polled, aligned with `values`; empty or `None` where unknown, which
+    /// reads as `end` minus `step` for each sample after it.
+    times: Vec<Option<Timestamp>>,
     /// When the newest sample was taken.
     end: Timestamp,
     /// The time between two samples.
@@ -114,16 +117,19 @@ impl PartialEq for SparklineShape {
 }
 
 impl SparklineShape {
-    /// The shape of `values`, oldest first, with `None` for each gap. The last one was taken at
-    /// `end` and each one `step` after the one before.
+    /// The shape of `values`, oldest first, with `None` for each gap, and the `times` they were
+    /// polled. Where a time is unknown the last sample was taken at `end` and each one `step`
+    /// after the one before.
     pub fn new(
         values: Vec<Option<u64>>,
+        times: Vec<Option<Timestamp>>,
         end: Timestamp,
         step: Duration,
         format: fn(u64) -> String,
     ) -> Self {
         Self {
             values,
+            times,
             end,
             step,
             format,
@@ -182,6 +188,9 @@ impl SparklineShape {
 
     /// The time of sample `index`.
     fn time_of(&self, index: usize) -> Timestamp {
+        if let Some(Some(polled)) = self.times.get(index) {
+            return *polled;
+        }
         let behind = self.values.len().saturating_sub(1 + index);
         let step = SignedDuration::try_from(self.step).unwrap_or(SignedDuration::ZERO);
         let back = i32::try_from(behind)
@@ -398,6 +407,7 @@ mod tests {
     fn shape(values: &[Option<u64>]) -> SparklineShape {
         SparklineShape::new(
             values.to_vec(),
+            Vec::new(),
             "2026-01-01T12:00:00Z".parse().unwrap(),
             Duration::from_secs(15),
             plain,
@@ -593,6 +603,24 @@ mod tests {
         assert_eq!(
             s.readout(2, 1, &TimeZone::UTC).as_deref(),
             Some("12:00:00  no data")
+        );
+    }
+
+    #[test]
+    fn the_readout_uses_the_time_each_sample_was_polled() {
+        let end: jiff::Timestamp = "2026-01-01T12:00:00Z".parse().unwrap();
+        // A poll that ran 3 s late: the first sample's own time, not 15 s before the next.
+        let first: jiff::Timestamp = "2026-01-01T11:59:42Z".parse().unwrap();
+        let s = SparklineShape::new(
+            series(&[7, 8]),
+            vec![Some(first), Some(end)],
+            end,
+            Duration::from_secs(15),
+            plain,
+        );
+        assert_eq!(
+            s.readout(2, 0, &TimeZone::UTC).as_deref(),
+            Some("11:59:42  7")
         );
     }
 }

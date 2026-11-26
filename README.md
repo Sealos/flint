@@ -495,7 +495,8 @@ watch_mode = "all"                # or "on_view"
 
 # Warning thresholds of the cluster overview, written by Settings > Thresholds and Cluster overrides (and Set Pending
 # Pod Threshold…): percent of allocatable (1 to 100), counts per hour (1 to 10000) and seconds (1 to 86400). Defaults:
-# 90, 90, 5, 10 and 300. A [[thresholds.clusters]] entry (context and server, then any of the same keys) overrides
+# 90, 90, 5, 10 and 300. history_hours (1, 3, 6, 12 or 24, default 6) sets how many hours of CPU and memory
+# history the dashboard keeps. A [[thresholds.clusters]] entry (context and server, then any of the same keys) overrides
 # them for one cluster.
 # [thresholds]
 # cpu_percent = 90
@@ -503,6 +504,7 @@ watch_mode = "all"                # or "on_view"
 # restarts_last_hour = 5
 # warning_events_last_hour = 10
 # pending_pod_seconds = 300      # a pod Pending longer counts as a problem
+# history_hours = 6              # hours of CPU and memory history kept in memory
 
 # Named cluster sets of 2 to 5 clusters, written by Save Cluster Set…. Each member is pinned to its server.
 # [[cluster_sets]]
