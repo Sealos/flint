@@ -500,28 +500,46 @@ async fn namespace_stays_until_the_scoped_rows_arrive(cx: &mut TestAppContext) {
     .await;
 }
 
-// covers UP-61: in a list as wide as the default window's, a long pod name does not push CPU and
-// Memory out. Their bars go first, then Restarts and Age, while the name narrows to its comfort
-// width and Status stays in view.
+// covers UP-20, UP-61, #779: a narrow pod list with usage drops its trailing columns rightmost
+// first (Memory, CPU, Age, Restarts) before a long name narrows below its comfort width, and never
+// Name, Namespace or Status. As wide as the default window's list, Restarts and Age stay; a wider
+// list shows CPU and Memory too.
 #[gpui_kit::test]
-async fn a_long_name_leaves_room_for_the_usage_columns(cx: &mut TestAppContext) {
-    let (core, _dir) = core();
-    let (window, list) = open_sized(cx, core, "Pods", 860.);
+async fn a_narrow_list_drops_usage_before_age_and_restarts(cx: &mut TestAppContext) {
+    const TRAILING: [&str; 4] = ["Memory", "CPU", "Age", "Restarts"];
     let long = "podinfo-frontend-canary-7b9c8d5f4-abcde-with-xy";
     assert_eq!(long.chars().count(), 47);
-    list.update(cx, |list, cx| {
-        list.pin_usage_source(super::list_usage::UsageSource::Unknown, cx);
-    });
-    let pod = pod_like("pods", long, "CrashLoopBackOff");
-    show_narrow(cx, window, &list, pod, &[NARROW_NAMESPACE, "demo"]).await;
-    for column in ["Name", "Namespace", "Status", "CPU", "Memory"] {
-        assert!(has_header(cx, window, column), "{column} is hidden");
+    let mut all_shown = false;
+    for width in (600..=1300).step_by(20) {
+        let width = width as f32;
+        let (core, _dir) = core();
+        let (window, list) = open_sized(cx, core, "Pods", width);
+        list.update(cx, |list, cx| {
+            list.pin_usage_source(super::list_usage::UsageSource::Unknown, cx);
+        });
+        let pod = pod_like("pods", long, "CrashLoopBackOff");
+        show_narrow(cx, window, &list, pod, &[NARROW_NAMESPACE, "demo"]).await;
+        for column in ["Name", "Namespace", "Status"] {
+            assert!(
+                has_header(cx, window, column),
+                "{width}: {column} is hidden"
+            );
+        }
+        let hidden: Vec<bool> = TRAILING
+            .iter()
+            .map(|column| !has_header(cx, window, column))
+            .collect();
+        // The hidden columns lead the order: none goes while one before it stays.
+        assert!(
+            hidden.windows(2).all(|pair| pair[0] || !pair[1]),
+            "{width}: hidden {hidden:?} of {TRAILING:?}"
+        );
+        if width == 860. {
+            assert_eq!(hidden, [true, true, false, false], "{width}");
+        }
+        all_shown |= hidden.iter().all(|h| !h);
     }
-    for column in ["Restarts", "Age"] {
-        assert!(!has_header(cx, window, column), "{column} is shown");
-    }
-    let memory_end = header_end(cx, window, "Memory");
-    assert!(memory_end <= 860.5, "Memory ends at {memory_end}");
+    assert!(all_shown, "no width shows every column");
 }
 
 // covers UP-22: a CRD's own Ready printer column is never left out.

@@ -601,11 +601,12 @@ pub(in crate::ui) fn shed_usage_bars(
     }
 }
 
-/// Leaves out Age, then Memory, then CPU, while the drawn columns need more than `room` with Name
-/// and Namespace narrowed (`identity`, as in [`needed`]), so usage never narrows a name below its
-/// target or pushes Status off. Runs after the bars and a pod list's Restarts and Age have gone;
-/// Age goes here in a list without Status, such as a workload's, and only while a usage column is
-/// drawn. A column for which `keep` holds stays: the list is sorted by it.
+/// Leaves out Memory, then CPU, while the drawn columns need more than `room` with Name and
+/// Namespace narrowed (`identity`, as in [`needed`]), so usage never narrows a name below its
+/// target or pushes Status off. They are the rightmost columns, so in a list with Status they go
+/// before Age and Restarts ([`list_model::shed_trailing`](super::list_model::shed_trailing)), as
+/// any trailing column goes rightmost first. A column for which `keep` holds stays: the list is
+/// sorted by it.
 pub(in crate::ui) fn shed_usage(
     drawn: &mut Vec<(usize, f32)>,
     columns: &[Column],
@@ -613,13 +614,8 @@ pub(in crate::ui) fn shed_usage(
     identity: (f32, f32),
     keep: impl Fn(usize) -> bool,
 ) {
-    for role in [
-        ColumnRole::Age,
-        ColumnRole::MemoryUsage,
-        ColumnRole::CpuUsage,
-    ] {
-        let has_usage = drawn.iter().any(|&(i, _)| is_usage(columns[i].role));
-        if !has_usage || needed(drawn, columns, identity) <= room {
+    for role in [ColumnRole::MemoryUsage, ColumnRole::CpuUsage] {
+        if needed(drawn, columns, identity) <= room {
             return;
         }
         drawn.retain(|&(i, _)| columns[i].role != role || keep(i));
@@ -1440,23 +1436,6 @@ mod tests {
         assert_eq!(kept(150., None), [0, 2]);
         assert_eq!(kept(100., None), [0]);
         assert_eq!(kept(100., Some(3)), [0, 3]);
-    }
-
-    // A list without Status keeps its usage over its Age; one without usage keeps its Age.
-    #[test]
-    fn age_goes_before_the_usage_columns() {
-        let mut columns = usage_columns().to_vec();
-        columns.push(Column::synthetic("Age", ColumnType::Date, ColumnRole::Age));
-        let kept = |all: &[(usize, f32)], room: f32| {
-            let mut drawn = all.to_vec();
-            shed_usage(&mut drawn, &columns, room, AS_DRAWN, |_| false);
-            drawn.iter().map(|&(i, _)| i).collect::<Vec<_>>()
-        };
-        let all = [(0, 100.), (4, 50.), (2, 50.), (3, 50.)];
-        assert_eq!(kept(&all, 250.), [0, 4, 2, 3]);
-        assert_eq!(kept(&all, 200.), [0, 2, 3]);
-        assert_eq!(kept(&all, 150.), [0, 2]);
-        assert_eq!(kept(&[(0, 100.), (4, 50.)], 100.), [0, 4]);
     }
 
     #[test]
