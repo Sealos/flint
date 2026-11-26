@@ -15,7 +15,7 @@ use flint_core::thresholds::{ThresholdMetric, Thresholds};
 use flint_core::{Column, ColumnRole, ColumnType, KindId, MetricsError, Row};
 
 use super::list_usage_bar::{self, Bar, NODE_LABELS, POD_LABELS, Scale};
-use super::list_usage_workloads::{self, OwnerChain};
+use super::list_usage_workloads::{OwnerChain, Totals, WorkloadTotals};
 
 /// What a cell or detail line says for a value the poll did not report.
 pub(in crate::ui) const UNKNOWN_TEXT: &str = "unknown";
@@ -98,12 +98,30 @@ pub(in crate::ui) enum UsageSource {
     Pods(Arc<BTreeMap<PodKey, PodSample>>, Option<PodIndex>),
     /// Nodes' use, and what each offers and its pods request while the feed can say.
     Nodes(Arc<BTreeMap<String, Usage>>, Option<ClusterCapacity>),
-    /// Pods' use, and which pod belongs to which workload.
-    Workloads(Arc<BTreeMap<PodKey, PodSample>>, PodIndex, OwnerChain),
+    /// Pods' use, which pod belongs to which workload, and what each workload's pods add up to.
+    Workloads(
+        Arc<BTreeMap<PodKey, PodSample>>,
+        PodIndex,
+        OwnerChain,
+        WorkloadTotals,
+    ),
 }
 
 impl UsageSource {
+    /// The source `telemetry` gives. A workload kind's totals are added up here, which walks
+    /// every pod: run it off the UI thread.
+    #[cfg(test)]
     pub(in crate::ui) fn of(subject: UsageSubject, telemetry: Option<&ClusterTelemetry>) -> Self {
+        Self::after(subject, telemetry, None)
+    }
+
+    /// [`Self::of`], reusing the totals of `previous` when it holds the same readings and pods:
+    /// an update to something else adds nothing up again.
+    pub(in crate::ui) fn after(
+        subject: UsageSubject,
+        telemetry: Option<&ClusterTelemetry>,
+        previous: Option<&Self>,
+    ) -> Self {
         let Some(telemetry) = telemetry else {
             return Self::NoFeed;
         };
@@ -119,7 +137,9 @@ impl UsageSource {
             UsageSubject::Workloads(chain) => {
                 let index = telemetry.snapshot.pods.clone();
                 Self::from_read(&telemetry.reads.pod_usage, current, |usage| match index {
-                    Some(index) if chain.is_known(&index) => Self::Workloads(usage, index, chain),
+                    Some(index) if chain.is_known(&index) => {
+                        Self::workloads_after(usage, index, chain, previous)
+                    }
                     // Without the pods, or the ReplicaSets or Jobs that say whose they are, a
                     // workload with no pod found is not a workload with none.
                     _ => Self::Unknown,
@@ -131,6 +151,43 @@ impl UsageSource {
                     Self::Nodes(usage, capacity)
                 })
             }
+        }
+    }
+
+    /// Pods' use over the workloads they belong to, with the totals worked out.
+    #[cfg(test)]
+    pub(in crate::ui) fn workloads(
+        usage: Arc<BTreeMap<PodKey, PodSample>>,
+        index: PodIndex,
+        chain: OwnerChain,
+    ) -> Self {
+        Self::workloads_after(usage, index, chain, None)
+    }
+
+    fn workloads_after(
+        usage: Arc<BTreeMap<PodKey, PodSample>>,
+        index: PodIndex,
+        chain: OwnerChain,
+        previous: Option<&Self>,
+    ) -> Self {
+        let kept = match previous {
+            Some(Self::Workloads(old_usage, old_index, old_chain, totals))
+                if Arc::ptr_eq(old_usage, &usage) && *old_index == index && *old_chain == chain =>
+            {
+                Some(totals.clone())
+            }
+            _ => None,
+        };
+        let totals = kept.unwrap_or_else(|| WorkloadTotals::of(&index, &usage, chain));
+        Self::Workloads(usage, index, chain, totals)
+    }
+
+    /// The totals of the workload with this `uid`, as the source holds them: no walk over pods.
+    /// `None` if no pod of it is running and reporting, or the source holds no workloads.
+    pub(in crate::ui) fn workload_totals(&self, uid: &str) -> Option<Totals> {
+        match self {
+            Self::Workloads(.., totals) => totals.get(uid),
+            _ => None,
         }
     }
 
@@ -203,10 +260,9 @@ impl UsageSource {
                 }),
                 true,
             ),
-            Self::Workloads(usage, index, chain) => {
-                let totals = list_usage_workloads::totals_by_owner(index, usage, *chain);
+            Self::Workloads(.., totals) => {
                 UsageValues::collect(
-                    rows.iter().map(|row| match totals.get(&*row.uid) {
+                    rows.iter().map(|row| match totals.get(&row.uid) {
                         // No pod is running or reporting: nothing to show, which is not unknown.
                         None => RowUsage::idle(),
                         Some(totals) if !totals.budgeted => {
@@ -953,6 +1009,75 @@ mod tests {
         assert_eq!(workload("metrics.k8s.io", "pods"), None);
     }
 
+    /// What the UI thread reads of thousands of pods' totals is held by the source: with the pods
+    /// themselves gone, the rows and the detail pane still get the totals, so reading them walks
+    /// no pod.
+    #[test]
+    fn workload_totals_of_thousands_of_pods_are_read_without_walking_them() {
+        use flint_core::telemetry::{Controllers, PodOwner, PodRecord};
+        const PODS: usize = 5_000;
+        const WORKLOADS: usize = 50;
+        let spec = serde_json::from_value(serde_json::json!({"containers": [{
+            "name": "app",
+            "resources": {"requests": {"cpu": "10m"}, "limits": {"cpu": "20m"}}
+        }]}))
+        .unwrap();
+        let names: Vec<String> = (0..PODS).map(|n| format!("pod-{n}")).collect();
+        let records = names.iter().enumerate().map(|(n, name)| {
+            let record = PodRecord {
+                namespace: "a".into(),
+                name: name.as_str().into(),
+                created: Some(SAMPLED_AT - WINDOW_SECS),
+                budget: flint_core::metrics::PodBudgetCheck::of(&spec),
+                node: None,
+                owner: Some(PodOwner {
+                    group: "apps".into(),
+                    kind: "StatefulSet".into(),
+                    name: "db".into(),
+                    uid: format!("sts-{}", n % WORKLOADS).into(),
+                }),
+                finished: false,
+            };
+            (&*Box::leak(format!("uid-{n}").into_boxed_str()), record)
+        });
+        let index = PodIndex::for_tests(records, Controllers::new());
+        let samples: Arc<BTreeMap<PodKey, PodSample>> = Arc::new(
+            names
+                .iter()
+                .map(|name| (("a".to_owned(), name.clone()), sample(10, 10)))
+                .collect(),
+        );
+        let source = UsageSource::workloads(samples.clone(), index, OwnerChain::Direct);
+        let UsageSource::Workloads(_, _, _, totals) = source else {
+            unreachable!()
+        };
+        // The same source, now without a single pod to walk.
+        let source = UsageSource::Workloads(
+            samples,
+            PodIndex::for_tests([], Controllers::new()),
+            OwnerChain::Direct,
+            totals,
+        );
+
+        let per_workload = PODS / WORKLOADS;
+        let total = source.workload_totals("sts-7").unwrap();
+        assert_eq!(total.pods, per_workload);
+        assert_eq!(total.cpu.used, per_workload as u64 * 10_000_000);
+        assert_eq!(total.cpu.limit, Some(per_workload as u64 * 20_000_000));
+        assert_eq!(source.workload_totals("none"), None);
+
+        let rows: Vec<_> = (0..WORKLOADS)
+            .map(|n| {
+                let mut row = row(Some("a"), "w");
+                Arc::get_mut(&mut row).unwrap().uid = format!("sts-{n}").into();
+                row
+            })
+            .collect();
+        let values = source.values(&rows);
+        let shown = format!("{}m", per_workload * 10);
+        assert!((0..WORKLOADS).all(|n| values.text(ColumnRole::CpuUsage, n).unwrap() == shown));
+    }
+
     #[test]
     fn a_workload_with_no_reporting_pod_shows_no_value_and_sorts_after_the_others() {
         use flint_core::telemetry::{Controllers, PodOwner, PodRecord};
@@ -978,7 +1103,7 @@ mod tests {
         };
         let index = PodIndex::for_tests([("web", record)], Controllers::new());
         let key = ("a".to_owned(), "web".to_owned());
-        let source = UsageSource::Workloads(
+        let source = UsageSource::workloads(
             Arc::new([(key, sample(10, 10))].into_iter().collect()),
             index,
             OwnerChain::ViaReplicaSets,

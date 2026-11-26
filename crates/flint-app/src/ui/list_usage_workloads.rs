@@ -112,9 +112,41 @@ struct Running {
     unbudgeted: bool,
 }
 
+/// Every workload's totals, worked out once when the readings arrive, off the UI thread, so that
+/// what draws only looks a workload up and never walks the pods.
+///
+/// The totals follow from the readings and the index they sit beside, so two of them are equal
+/// whenever those are, and comparing them compares nothing.
+#[derive(Debug, Clone, Default)]
+pub(in crate::ui) struct WorkloadTotals(Arc<HashMap<Arc<str>, Totals>>);
+
+impl WorkloadTotals {
+    /// Adds up every pod. Walks them all: not for the UI thread.
+    pub(in crate::ui) fn of(
+        index: &PodIndex,
+        samples: &BTreeMap<PodKey, PodSample>,
+        chain: OwnerChain,
+    ) -> Self {
+        Self(Arc::new(totals_by_owner(index, samples, chain)))
+    }
+
+    /// The totals of the workload with this `uid`, `None` if it has no counted pod.
+    pub(in crate::ui) fn get(&self, uid: &str) -> Option<Totals> {
+        self.0.get(uid).copied()
+    }
+}
+
+impl PartialEq for WorkloadTotals {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for WorkloadTotals {}
+
 /// The totals of every workload that has a counted pod, by the uid of the owner: the key of its
 /// row in the list.
-pub(in crate::ui) fn totals_by_owner(
+fn totals_by_owner(
     index: &PodIndex,
     samples: &BTreeMap<PodKey, PodSample>,
     chain: OwnerChain,
@@ -123,7 +155,8 @@ pub(in crate::ui) fn totals_by_owner(
 }
 
 /// The totals of the one workload with this `uid`, `None` if it has no counted pod.
-pub(in crate::ui) fn totals_of(
+#[cfg(test)]
+fn totals_of(
     index: &PodIndex,
     samples: &BTreeMap<PodKey, PodSample>,
     chain: OwnerChain,
