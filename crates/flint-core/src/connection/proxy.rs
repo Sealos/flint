@@ -14,8 +14,8 @@
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{OnceLock, RwLock};
 
 use http::{HeaderValue, Uri};
 use hyper_util::client::legacy::connect::proxy::{SocksV5, Tunnel};
@@ -52,12 +52,46 @@ enum InUse {
     Unreadable,
 }
 
-/// The proxy setting this process uses, from `settings.toml` at startup. Set once, so the proxy
-/// chosen when kubeconfig loads is the one a client later connects through.
-static SETTING: OnceLock<InUse> = OnceLock::new();
+/// The proxy settings this process used, oldest first, each with its generation: from
+/// `settings.toml` at startup (generation 0), then each one [`replace_setting`] put in use. The
+/// last is in use. Kubeconfig loads record its generation ([`generation`]), so a context loaded
+/// under one setting is never connected under another: the manager holds it until a load under the
+/// new one replaces it, and a connection attempt already running goes on under the setting its
+/// load had ([`pinned_to`]). Changes are made by hand, so the list stays short.
+static SETTINGS: RwLock<Vec<(u64, InUse)>> = RwLock::new(Vec::new());
+
+tokio::task_local! {
+    /// The setting generation a connection attempt runs under ([`pinned_to`]).
+    static PINNED: u64;
+}
+
+/// Runs `attempt` under the proxy setting of generation `generation`, whatever is put in use
+/// meanwhile: a connection attempt takes the route of the load it was started from, from its
+/// first request to its credential plugin. A generation this process never had refuses every
+/// route that takes the setting.
+pub(crate) async fn pinned_to<F: std::future::Future>(generation: u64, attempt: F) -> F::Output {
+    PINNED.scope(generation, attempt).await
+}
+
+/// The setting this task goes by, with its generation: the one it is pinned to, else the one in
+/// use. None before any is.
+fn setting_in_use() -> Option<(u64, InUse)> {
+    let settings = SETTINGS.read().unwrap_or_else(|e| e.into_inner());
+    match PINNED.try_with(|pinned| *pinned) {
+        Ok(pinned) if !settings.is_empty() => Some(
+            settings
+                .iter()
+                .find(|(generation, _)| *generation == pinned)
+                .cloned()
+                .unwrap_or((pinned, InUse::Unreadable)),
+        ),
+        _ => settings.last().cloned(),
+    }
+}
 
 /// Uses `setting` for cluster connections from now on. The first call wins; later ones are
-/// ignored, since contexts loaded under the first are pinned to its route.
+/// ignored, since contexts loaded under the first are pinned to its route. A change made while
+/// Flint runs goes through [`replace_setting`].
 pub(crate) fn use_setting(setting: &ProxySetting) {
     use_in_process(InUse::Setting(setting.clone()));
 }
@@ -70,9 +104,47 @@ pub(crate) fn use_unreadable_setting() {
 }
 
 fn use_in_process(setting: InUse) {
-    if SETTING.set(setting).is_err() {
+    let mut settings = SETTINGS.write().unwrap_or_else(|e| e.into_inner());
+    if !settings.is_empty() {
         tracing::debug!("a proxy setting is already in use; the new one applies after a restart");
+        return;
     }
+    settings.push((0, setting));
+}
+
+/// Why [`replace_setting`] did not replace the setting. Its text holds no credentials.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ReplaceRefused {
+    #[error(
+        "settings.toml could not be read when Flint started, so a new proxy setting applies \
+         only after Flint restarts"
+    )]
+    UnreadableAtStartup,
+}
+
+/// Puts `setting` in place of the one in use, for connections made from now on, and returns the
+/// new [`generation`]. Contexts loaded under the old one keep their route until a kubeconfig load
+/// under the new one replaces them. Refused while `settings.toml` was unreadable at startup: the
+/// proxy every cluster would have taken then stays unknown until a restart.
+pub(crate) fn replace_setting(setting: &ProxySetting) -> Result<u64, ReplaceRefused> {
+    let mut settings = SETTINGS.write().unwrap_or_else(|e| e.into_inner());
+    let next = match settings.last() {
+        Some((_, InUse::Unreadable)) => return Err(ReplaceRefused::UnreadableAtStartup),
+        Some((generation, InUse::Setting(_))) => generation + 1,
+        // No setting at startup: the environment decided, as an empty setting does.
+        None => {
+            settings.push((0, InUse::Setting(ProxySetting::default())));
+            1
+        }
+    };
+    settings.push((next, InUse::Setting(setting.clone())));
+    Ok(next)
+}
+
+/// How many times the setting in use was replaced while Flint runs ([`replace_setting`]).
+pub(crate) fn generation() -> u64 {
+    let settings = SETTINGS.read().unwrap_or_else(|e| e.into_inner());
+    settings.last().map_or(0, |(generation, _)| *generation)
 }
 
 /// `reason`, why `settings.toml` can't be read, saying what that means for the proxy when the
@@ -84,7 +156,8 @@ pub(crate) fn settings_error_with_proxy_note(reason: String) -> String {
 /// Whether `settings.toml` could not be read at startup, so its proxy setting is unknown to this
 /// process ([`use_unreadable_setting`]) however the file reads now.
 pub(crate) fn setting_unreadable_at_startup() -> bool {
-    matches!(SETTING.get(), Some(InUse::Unreadable))
+    let settings = SETTINGS.read().unwrap_or_else(|e| e.into_inner());
+    matches!(settings.first(), Some((_, InUse::Unreadable)))
 }
 
 /// What a `settings.toml` that reads again says while [`setting_unreadable_at_startup`]: its
@@ -123,11 +196,19 @@ impl ProxyEnvironment {
     /// The proxy of this process: the variables of its environment under the setting it uses
     /// ([`use_setting`]).
     pub(crate) fn current() -> Self {
-        match SETTING.get() {
-            Some(InUse::Setting(setting)) => Self::of_process().under(Some(setting)),
+        Self::current_with_generation().1
+    }
+
+    /// [`Self::current`], with the [`generation`] of the setting it was read under, both read in
+    /// one step.
+    pub(crate) fn current_with_generation() -> (u64, Self) {
+        let in_use = setting_in_use();
+        let environment = match &in_use {
+            Some((_, InUse::Setting(setting))) => Self::of_process().under(Some(setting)),
             None => Self::of_process(),
-            Some(InUse::Unreadable) => Self::unreadable_setting(),
-        }
+            Some((_, InUse::Unreadable)) => Self::unreadable_setting(),
+        };
+        (in_use.as_ref().map_or(0, |(g, _)| *g), environment)
     }
 
     /// The environment while `settings.toml` can't be read: every route without a `proxy-url`
@@ -166,7 +247,12 @@ impl ProxyEnvironment {
             return self;
         };
         let no_proxy = setting.no_proxy_list();
-        match setting.url.as_deref().filter(|u| !u.trim().is_empty()) {
+        match setting
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
             Some(url) => ProxyEnvironment {
                 https_proxy: Some(url.to_owned()),
                 no_proxy,
@@ -475,7 +561,8 @@ pub(crate) type PluginVariable = (&'static str, Option<String>);
 /// While `settings.toml` can't be read, only a cluster with a `proxy-url` of its own (`own`)
 /// connects, and its plugin is given that proxy, with no exemptions, as its connection is.
 pub(crate) fn plugin_setting_variables(own: Option<&str>) -> Vec<PluginVariable> {
-    plugin_variables_under(SETTING.get(), own)
+    let in_use = setting_in_use();
+    plugin_variables_under(in_use.as_ref().map(|(_, in_use)| in_use), own)
 }
 
 /// [`plugin_setting_variables`] under the setting `in_use`.

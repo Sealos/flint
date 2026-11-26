@@ -464,7 +464,8 @@ watch_mode = "all"                # or "on_view"
 # log_total_mib = 512             # MiB all log sessions keep together
 
 # Proxy for cluster connections, for an app opened from Finder or the Dock, which sees no HTTPS_PROXY from your
-# shell. A cluster's own proxy-url wins. Read at startup. url is http://, socks5:// or socks5h://.
+# shell. A cluster's own proxy-url wins. url is http://, socks5:// or socks5h://. An edit here applies after a
+# restart.
 # [proxy]
 # url = "http://proxy.example.com:3128"
 # no_proxy = ["localhost", "10.0.0.0/8"]
