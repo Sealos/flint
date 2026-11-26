@@ -15,7 +15,7 @@ use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::Theme;
 use gpui_kit::*;
 
-use super::confirm::{self, DialogText};
+use super::confirm::{self, DialogText, ObjectGuard};
 use super::notice::notice;
 use super::write_binding::ConnectionGuard;
 
@@ -258,9 +258,11 @@ fn take_edit_note(review: &WriteReview, cx: &mut App) -> Option<String> {
 /// Asks to confirm `review`, first saying `note` (why this review was opened again), then runs it
 /// on `core` and calls `on_done` with the result. Cancelling runs nothing and does not call it.
 /// Confirming asks `begin` right before the write: `false` runs nothing and does not call
-/// `on_done`. A drain tells `on_progress` where it is as it runs, always before `on_done`.
+/// `on_done`. A drain tells `on_progress` where it is as it runs, always before `on_done`. With
+/// `object`, the confirmation closes unanswered once that says the object changed
+/// ([`confirm::close_changed`]).
 #[allow(clippy::too_many_arguments)]
-pub fn open_noted(
+pub(in crate::ui) fn open_noted(
     window: &mut Window,
     cx: &mut App,
     core: CoreHandle,
@@ -268,6 +270,7 @@ pub fn open_noted(
     names: &ClusterNames,
     note: Option<&str>,
     guard: ConnectionGuard,
+    object: Option<ObjectGuard>,
     begin: impl Fn(&mut App) -> bool + 'static,
     on_progress: impl Fn(DrainProgress, &mut App) + 'static,
     on_done: impl Fn(Result<WriteOutcome, WriteError>, &mut App) + 'static,
@@ -288,10 +291,16 @@ pub fn open_noted(
     let text = dialog_text_saying(review.target(), worded, review.warnings(), &saying, &shown);
     let pinned = target_lines(review.target()).len();
     let confirmed = confirmation(core, review, begin, on_progress, on_done);
-    confirm::open_pinned_guarded(window, cx, text, pinned, None, guard, move |_, cx| {
+    let on_ok = move |_: &mut Window, cx: &mut App| {
         confirmed(cx);
         true
-    });
+    };
+    match object {
+        Some(object) => {
+            confirm::open_pinned_watched(window, cx, text, pinned, guard, object, on_ok);
+        }
+        None => confirm::open_pinned_guarded(window, cx, text, pinned, None, guard, on_ok),
+    }
 }
 
 /// What confirming `review` does. A confirmation runs once, whatever `begin` or the write answers:

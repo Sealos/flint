@@ -336,7 +336,8 @@ pub const LOG_TOTAL_MIB_RANGE: std::ops::RangeInclusive<u32> = 64..=16_384;
 
 /// The proxy for cluster connections (`[proxy]`), for an app started from Finder or the Dock,
 /// which does not get `HTTPS_PROXY` and `NO_PROXY` from a shell profile. A cluster entry's own
-/// `proxy-url` still wins. Read once at startup: a change applies after a restart.
+/// `proxy-url` still wins. Read at startup; a change made by hand applies after a restart, and one
+/// saved from Settings at once ([`crate::CoreHandle::apply_proxy`]).
 ///
 /// The URL can hold a password. Its `Debug` shows only the proxy's address, and
 /// [`ProxySetting::shown_url`] is what may be displayed.
@@ -376,10 +377,66 @@ impl ProxySetting {
         (!entries.is_empty()).then(|| entries.join(","))
     }
 
+    /// This setting as `settings.toml` saves it: the URL and each no-proxy entry trimmed, and
+    /// blank ones dropped.
+    pub(crate) fn normalized(&self) -> Self {
+        Self {
+            url: self
+                .url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .map(str::to_owned),
+            no_proxy: self
+                .no_proxy
+                .iter()
+                .map(|e| e.trim())
+                .filter(|e| !e.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
+
     /// Uses this setting for this process's cluster connections. The first call wins: contexts
-    /// loaded under it are pinned to its route, so a later setting applies after a restart.
+    /// loaded under it are pinned to its route, so a later setting applies after a restart, or
+    /// through [`crate::CoreHandle::apply_proxy`].
     pub fn use_for_this_process(&self) {
         crate::connection::proxy::use_setting(self);
+    }
+
+    /// Why Flint could not use this setting, if it could not: a URL it can't read or whose scheme
+    /// it does not support, or a no-proxy entry that holds a comma or a space. What it says holds
+    /// no credentials of the URL.
+    pub fn check(&self) -> Result<(), String> {
+        if let Some(url) = self.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+            crate::connection::proxy::ProxyTarget::parse(url).map_err(|refused| match refused {
+                crate::connection::proxy::ProxyRefused::Unsupported { shown, scheme } => {
+                    format!(
+                        "the proxy {shown} uses {scheme}, which Flint does not support; use \
+                             an http://, socks5:// or socks5h:// proxy"
+                    )
+                }
+                crate::connection::proxy::ProxyRefused::SocksCredentialTooLong => {
+                    "the proxy's user name or password is longer than SOCKS5 allows (255 \
+                         bytes)"
+                        .to_owned()
+                }
+                _ => "the proxy URL can't be read; use http://, socks5:// or \
+                          socks5h://host:port"
+                    .to_owned(),
+            })?;
+        }
+        for (n, entry) in self.no_proxy.iter().map(|e| e.trim()).enumerate() {
+            if entry.contains(',') || entry.chars().any(char::is_whitespace) {
+                // The entry itself is not quoted: a URL pasted into it may hold credentials.
+                return Err(format!(
+                    "no-proxy entry {} holds a comma or a space; give one host, domain, \
+                     address or range per entry",
+                    n + 1
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -390,6 +447,43 @@ impl std::fmt::Debug for ProxySetting {
             .field("no_proxy", &self.no_proxy)
             .finish()
     }
+}
+
+/// Replaces the `[proxy]` of `settings.toml` with `proxy`, or removes it when `proxy` sets
+/// nothing, and writes the file. Returns the settings as written. Only the core calls it, as it
+/// also puts the setting in use ([`crate::CoreHandle::apply_proxy`]).
+pub(crate) fn set_proxy(dir: &Path, proxy: &ProxySetting) -> Result<Settings, SettingsError> {
+    edit_settings(dir, |table, _| {
+        // Keys of the table this version does not know survive.
+        let mut entry = match table.remove("proxy") {
+            Some(toml::Value::Table(entry)) => entry,
+            _ => toml::Table::new(),
+        };
+        entry.remove("url");
+        entry.remove("no_proxy");
+        if let Some(url) = proxy
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
+            entry.insert("url".into(), toml::Value::String(url.to_owned()));
+        }
+        let no_proxy: Vec<toml::Value> = proxy
+            .no_proxy
+            .iter()
+            .map(|e| e.trim())
+            .filter(|e| !e.is_empty())
+            .map(|e| toml::Value::String(e.to_owned()))
+            .collect();
+        if !no_proxy.is_empty() {
+            entry.insert("no_proxy".into(), toml::Value::Array(no_proxy));
+        }
+        if !entry.is_empty() {
+            table.insert("proxy".into(), toml::Value::Table(entry));
+        }
+        Ok(())
+    })
 }
 
 /// User settings from `settings.toml`. Unknown keys are ignored so newer files still load.
@@ -472,7 +566,8 @@ pub struct Settings {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub cluster_alerts: Vec<ClusterAlerts>,
-    /// The proxy for cluster connections without a `proxy-url` of their own. Read at startup.
+    /// The proxy for cluster connections without a `proxy-url` of their own. Read at startup,
+    /// and put in use again when Settings saves it.
     #[serde(skip_serializing_if = "ProxySetting::is_empty")]
     pub proxy: ProxySetting,
 }
@@ -2384,8 +2479,25 @@ fn write_atomic(path: &Path, text: &str, dangling: DanglingLink) -> Result<(), S
         Err(source) => return Err(err(source)),
     };
     let tmp = path.with_extension(format!("toml.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, text).map_err(err)?;
+    write_owner_only(&tmp, text).map_err(err)?;
     std::fs::rename(&tmp, path).map_err(err)
+}
+
+/// Writes `text` to a new file at `path` that only its owner can read: `settings.toml` can hold
+/// a proxy's password.
+fn write_owner_only(path: &Path, text: &str) -> io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    // A leftover file of the same name keeps its mode: set it.
+    #[cfg(unix)]
+    file.set_permissions(
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )?;
+    file.write_all(text.as_bytes())
 }
 
 pub(crate) fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
