@@ -363,7 +363,7 @@ pub(crate) enum Request {
     /// Write these settings in order, and say how that went.
     WriteSettings {
         writes: Vec<crate::settings::SettingsWrite>,
-        reply: oneshot::Sender<Result<(), String>>,
+        reply: oneshot::Sender<Result<Arc<crate::Settings>, String>>,
     },
     /// Save this proxy setting, put it in use and connect everything again on it.
     ApplyProxy {
@@ -1244,15 +1244,15 @@ impl CoreHandle {
         async move { reload_outcome(rx.await.ok()) }
     }
 
-    /// Writes `writes` to `settings.toml` one after another, each through its own setter, and
-    /// resolves once they are written and applied, or with the (sanitized) reason the first that
-    /// failed did not; the ones after it are not written. The change also arrives as
+    /// Writes `writes` to `settings.toml` in one save, all of them or none, and resolves once
+    /// they are written and applied, with the settings as saved, or with the (sanitized) reason
+    /// they were not. The change also arrives as
     /// `Event::SettingsChanged`, and a failure as `Event::Error`. Like every settings write it
     /// refuses while `settings.toml` is invalid. Works on any executor.
     pub fn write_settings(
         &self,
         writes: Vec<crate::settings::SettingsWrite>,
-    ) -> impl Future<Output = Result<(), String>> + Send + 'static {
+    ) -> impl Future<Output = Result<Arc<crate::Settings>, String>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
         let sent = self.requests.push(Request::WriteSettings { writes, reply });
         async move {

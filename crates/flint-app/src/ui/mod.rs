@@ -67,6 +67,9 @@ mod scope_picker;
 mod set_kinds;
 mod set_members;
 mod settings_draft;
+mod settings_logs_paths;
+#[cfg(test)]
+mod settings_logs_paths_tests;
 mod settings_thresholds;
 #[cfg(test)]
 mod settings_thresholds_tests;
