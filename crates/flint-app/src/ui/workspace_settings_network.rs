@@ -324,10 +324,12 @@ impl Workspace {
                 Err(why) => {
                     let _ = this.update(cx, |ws, cx| {
                         // The file holds another proxy than the one reviewed over, which the
-                        // core has read again: the fields show it, to be reviewed again.
+                        // core has read again: the fields show it, to be reviewed again. What was
+                        // typed while it was being applied stays.
                         let changed = why.contains(PROXY_CHANGED_SINCE_REVIEW);
-                        ws.settings_page.network.progress = Some(Progress::Failed(why));
-                        if changed {
+                        let network = &mut ws.settings_page.network;
+                        network.progress = Some(Progress::Failed(why));
+                        if changed && !std::mem::take(&mut network.typed_while_applying) {
                             ws.revert_network_fields();
                         }
                         cx.notify();

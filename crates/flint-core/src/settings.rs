@@ -460,14 +460,15 @@ impl std::fmt::Debug for ProxySetting {
 /// nothing, and writes the file. Returns the settings as written. The change was reviewed over
 /// `expected`: if the file, as read for this write, holds another proxy (changed by hand or by
 /// another Flint since), nothing is written and [`SettingsError::ProxyChangedSinceReview`] says
-/// so. Only the core calls it, as it also puts the setting in use
+/// so. That check and the write hold a real file lock: where the folder supports none, nothing is
+/// written. Only the core calls it, as it also puts the setting in use
 /// ([`crate::CoreHandle::apply_proxy`]).
 pub(crate) fn set_proxy(
     dir: &Path,
     proxy: &ProxySetting,
     expected: &ProxySetting,
 ) -> Result<Settings, SettingsError> {
-    edit_settings(dir, |table, path| {
+    edit_settings_locked(dir, |table, path| {
         let held: ProxySetting = match table.get("proxy") {
             Some(value) => value
                 .clone()
@@ -509,7 +510,7 @@ pub(crate) fn set_proxy(
         if !entry.is_empty() {
             table.insert("proxy".into(), toml::Value::Table(entry));
         }
-        Ok(())
+        Ok(true)
     })
 }
 
