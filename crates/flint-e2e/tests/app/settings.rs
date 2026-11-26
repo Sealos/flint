@@ -3,6 +3,10 @@
 //! `settings_thresholds_tests.rs`); here the shortcut opens it, edits (an appearance, a threshold
 //! and a cluster override) wait for Save, and Save writes `settings.toml`.
 
+use std::io::{Read as _, Write as _};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
 use flint_e2e::app::{App, AppOptions};
 use flint_e2e::backend::TestCluster;
@@ -212,5 +216,124 @@ fn up_127_settings_saves_the_log_buffer_and_asks_before_unprotecting() -> Result
         stored.contains("protect_local_clusters = false"),
         "{stored}"
     );
+    Ok(())
+}
+
+/// What the fake proxy saw: each `CONNECT` request's head.
+type Heads = Arc<Mutex<Vec<String>>>;
+
+/// A proxy answering `CONNECT` by tunnelling to `upstream`, wherever the client asked to go.
+/// Returns its `host:port` and what it saw.
+fn connect_proxy(upstream: SocketAddr) -> Result<(String, Heads)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let heads = Heads::default();
+    let log = Arc::clone(&heads);
+    std::thread::spawn(move || {
+        for client in listener.incoming().flatten() {
+            let log = Arc::clone(&log);
+            std::thread::spawn(move || tunnel(client, upstream, &log));
+        }
+    });
+    Ok((addr.to_string(), heads))
+}
+
+fn tunnel(mut client: TcpStream, upstream: SocketAddr, heads: &Mutex<Vec<String>>) {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if client.read_exact(&mut byte).is_err() {
+            return;
+        }
+        head.push(byte[0]);
+    }
+    heads
+        .lock()
+        .unwrap()
+        .push(String::from_utf8_lossy(&head).into_owned());
+    let Ok(mut server) = TcpStream::connect(upstream) else {
+        return;
+    };
+    if client
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .is_err()
+    {
+        return;
+    }
+    let (Ok(mut from_client), Ok(mut to_client)) = (client.try_clone(), server.try_clone()) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut from_client, &mut server);
+        let _ = server.shutdown(Shutdown::Write);
+    });
+    let _ = std::io::copy(&mut to_client, &mut client);
+    let _ = client.shutdown(Shutdown::Write);
+}
+
+// covers #743: a proxy typed in Settings' Network section is applied after the confirmation, and
+// the selected cluster reconnects through it. Its password is never in what the app shows.
+#[test]
+#[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
+fn settings_applies_a_proxy_and_the_cluster_reconnects_through_it() -> Result<()> {
+    let cluster = TestCluster::fake(Options::default())?;
+    let upstream: SocketAddr = cluster
+        .server
+        .trim_start_matches("https://")
+        .trim_end_matches('/')
+        .parse()?;
+    let (proxy, heads) = connect_proxy(upstream)?;
+    let app = App::launch(AppOptions::new(&cluster.kubeconfig))?;
+    connect(&app, &cluster.context)?;
+    assert!(heads.lock().unwrap().is_empty(), "direct at first");
+
+    app.press_key("secondary-,")?;
+    app.wait_for("/settings/open", Equals(true.into()))?;
+    app.dispatch(
+        "settings::ShowSettingsSection",
+        json!({ "section": "network" }),
+    )?;
+    app.dispatch(
+        "settings::EditProxyUrl",
+        json!({ "url": format!("http://user:proxy-secret@{proxy}") }),
+    )?;
+    app.wait_for("/settings/network/can_apply", Equals(true.into()))?;
+
+    app.dispatch("settings::ApplyProxy", Value::Null)?;
+    let state = app.wait_for("/dialog/title", Exists(true))?;
+    assert_eq!(state["dialog"]["title"], "Apply the new proxy?", "{state}");
+    let text = state["dialog"]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("writes waiting for review are refused"),
+        "{text}"
+    );
+    assert!(!state.to_string().contains("proxy-secret"), "{state}");
+    app.screenshot("settings-proxy-apply")?;
+    app.click("ok")?;
+
+    let state = app.wait_for(
+        "/settings/network/reconnected",
+        Equals(json!([cluster.context])),
+    )?;
+    assert!(!state.to_string().contains("proxy-secret"), "{state}");
+    assert_eq!(
+        state["settings"]["network"]["saved_url"],
+        format!("http://•••@{proxy}"),
+        "{state}"
+    );
+    let heads = heads.lock().unwrap().clone();
+    assert!(
+        !heads.is_empty(),
+        "the cluster reconnected through the proxy"
+    );
+    // base64 of `user:proxy-secret`.
+    assert!(
+        heads
+            .iter()
+            .all(|head| head.contains("dXNlcjpwcm94eS1zZWNyZXQ=")),
+        "{heads:?}"
+    );
+    let stored = std::fs::read_to_string(app.config_dir().join("settings.toml"))?;
+    assert!(stored.contains(&proxy), "{stored}");
     Ok(())
 }

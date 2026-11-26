@@ -481,14 +481,18 @@ impl Workspace {
 
     /// Focus follows the keyboard cursor into a text field, and back out to the view from one.
     pub(super) fn focus_settings_stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let input = match self.settings_page.cursor {
-            Some(Stop::Text(field)) => self.settings_page.logs_paths.input(field).cloned(),
+        let page = &self.settings_page;
+        let input = match page.cursor {
+            Some(Stop::Text(field)) => page.logs_paths.input(field).cloned(),
+            Some(Stop::Network(stop)) => page.network.input(stop).cloned(),
             _ => None,
         };
         match input {
             Some(input) => input.update(cx, |state, cx| state.focus(window, cx)),
             None => {
-                if self.settings_page.logs_paths.focused(window, cx).is_some() {
+                if page.logs_paths.focused(window, cx).is_some()
+                    || page.network.focused(window, cx).is_some()
+                {
                     window.focus(&self.settings_page.focus, cx);
                 }
             }

@@ -110,6 +110,8 @@ pub struct SettingsState {
     pub kubeconfig_note: Option<String>,
     /// Thresholds and Cluster overrides, as shown.
     pub thresholds: ThresholdsState,
+    /// The Network section's proxy.
+    pub network: NetworkState,
     /// The file changed under the draft: the Reload / Save anyway banner.
     pub changed_on_disk: bool,
     /// `settings.toml` cannot be read; Save is disabled.
@@ -121,6 +123,29 @@ pub struct SettingsState {
     pub note: Option<String>,
     /// The element id of the control under the keyboard cursor.
     pub cursor: Option<String>,
+}
+
+/// Settings' Network section (#743). Never a proxy's password: the saved URL is masked, and
+/// what is typed is not reported, only whether it can be applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NetworkState {
+    /// The saved proxy URL as the field shows it, credentials masked; empty for none.
+    pub saved_url: String,
+    pub saved_no_proxy: Vec<String>,
+    /// The fields were typed in since they showed the file.
+    pub typed: bool,
+    /// Why what is typed cannot be applied.
+    pub error: Option<String>,
+    /// Apply is offered: what is typed is valid and not the saved proxy.
+    pub can_apply: bool,
+    /// An Apply waits for the core's answer.
+    pub applying: bool,
+    /// The last Apply, as the section says it.
+    pub report: Vec<String>,
+    /// The clusters the last Apply reconnected, once all came back or the wait ran out.
+    pub reconnected: Option<Vec<String>>,
+    /// The clusters the last Apply could not reconnect, with why.
+    pub failed: Vec<(String, String)>,
 }
 
 /// Settings' Thresholds and Cluster overrides (#741), as shown: the file with the draft on top.
