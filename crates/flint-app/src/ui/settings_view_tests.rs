@@ -444,6 +444,76 @@ async fn quit_with_a_draft_asks_and_discard_quits(cx: &mut TestAppContext) {
     assert!(t.settings_toml().is_empty(), "Discard writes nothing");
 }
 
+// covers UP-126: the quit question says a failed Save keeps Flint open.
+#[gpui_kit::test]
+async fn the_quit_question_says_a_failed_save_stops_it(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_settings(cx, dir.path()).await;
+    edit_appearance(cx, &t, "dark");
+    t.press_key_of(cx, "flint::Quit");
+    let dialog = shown_dialog(cx, &t).await;
+    assert!(
+        dialog.text.contains("if the save fails, Flint stays open"),
+        "{}",
+        dialog.text
+    );
+    assert!(!dialog.text.contains("either way"), "{}", dialog.text);
+}
+
+// covers UP-126: a proxy typed and not applied is asked about at quit and window close, with
+// wording that offers no Save, and Discard drops it.
+#[gpui_kit::test]
+async fn quit_and_close_ask_about_an_unapplied_proxy(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_settings(cx, dir.path()).await;
+    t.dispatch(
+        cx,
+        "settings::ShowSettingsSection",
+        json!({ "section": "network" }),
+    )
+    .unwrap();
+    t.dispatch(
+        cx,
+        "settings::EditProxyUrl",
+        json!({ "url": "http://127.0.0.1:9" }),
+    )
+    .unwrap();
+    assert!(!state(cx, &t).settings.dirty, "only the proxy is typed");
+
+    t.press_key_of(cx, "flint::Quit");
+    let dialog = shown_dialog(cx, &t).await;
+    assert_eq!(
+        dialog.text,
+        "The proxy you typed is not applied. Quitting drops it."
+    );
+    assert!(t.find(cx, "alternative").is_none(), "no Save is offered");
+    t.dispatch(cx, "ui::Cancel", Value::Null).unwrap();
+    t.wait_for_no_confirmation(cx).await;
+    assert_eq!(quits(cx), 0);
+    assert!(state(cx, &t).settings.network.typed, "Cancel keeps it");
+
+    t.dispatch(cx, "flint::CloseWindow", Value::Null).unwrap();
+    let dialog = shown_dialog(cx, &t).await;
+    assert!(
+        dialog
+            .text
+            .starts_with("The proxy you typed is not applied."),
+        "{}",
+        dialog.text
+    );
+    t.dispatch(cx, "ui::Cancel", Value::Null).unwrap();
+    t.wait_for_no_confirmation(cx).await;
+
+    t.press_key_of(cx, "flint::Quit");
+    shown_dialog(cx, &t).await;
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    cx.wait_for(t.window, WAIT, |_, cx| {
+        cx.try_global::<Quits>().is_some_and(|q| q.0 == 1)
+    })
+    .await;
+    assert!(!state(cx, &t).settings.network.typed);
+}
+
 // covers UP-126: Save in the quit question writes the draft, then quits.
 #[gpui_kit::test]
 async fn quit_with_a_draft_saves_then_quits(cx: &mut TestAppContext) {
