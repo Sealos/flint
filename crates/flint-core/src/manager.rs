@@ -5192,7 +5192,7 @@ mod tests {
         let unlocks = manager.unlocks.clone();
         unlocks.unlock("dev", "https://remote-a");
         let pin = manager.contexts.pin_confirmed("dev");
-        let (requests, inbox) = async_channel::bounded(8);
+        let (requests, inbox) = crate::core_queue::CoreQueue::new();
         let check = crate::handle::launch_check(requests, "dev".into(), pin);
         let protected = Err(WriteRefusal::Protected {
             cluster: "dev".into(),
