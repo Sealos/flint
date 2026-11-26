@@ -188,7 +188,7 @@ impl ClusterManager {
             return;
         }
         // The cluster's history, which a feed before this one may have written.
-        let trends = self.histories.store(id, self.clusters[index].fingerprint);
+        let trends = self.history_store(id, self.clusters[index].fingerprint);
         let slot: &mut Cluster = &mut self.clusters[index];
         let generation = slot.generation;
         let Some(client) = slot.client.as_ref().map(|clients| clients.read.clone()) else {
